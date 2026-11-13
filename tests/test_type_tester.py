@@ -213,3 +213,47 @@ class TestTypeTester(unittest.TestCase):
 
         self.assertIsInstance(inferred[0], Number)
         self.assertEqual(str(inferred[0].locale), 'de_DE')
+
+    def test_number_grouping_lenient_by_default(self):
+        # The correct, incorrectly grouped and ungrouped forms of the same
+        # value are all inferred as numbers under the default behavior.
+        rows = [
+            ('1,000,000',),
+            ('12,34,567',),
+            ('1000000',),
+            ('',)
+        ]
+
+        inferred = self.tester.run(rows, ['one'])
+
+        self.assertIsInstance(inferred[0], Number)
+
+    def test_number_strict_grouping_inference(self):
+        tester = TypeTester(types=[Number(strict_grouping=True), Text()])
+
+        correct_rows = [('1,000,000',), ('1000000',), ('',)]
+        self.assertIsInstance(tester.run(correct_rows, ['one'])[0], Number)
+
+        ungrouped_rows = [('1000000',), ('2000',), ('',)]
+        self.assertIsInstance(tester.run(ungrouped_rows, ['one'])[0], Number)
+
+        incorrect_rows = [('1,000,000',), ('12,34,567',), ('',)]
+        self.assertIsInstance(tester.run(incorrect_rows, ['one'])[0], Text)
+
+    def test_number_strict_grouping_inference_indian(self):
+        tester = TypeTester(types=[Number(locale='en_IN', strict_grouping=True), Text()])
+
+        correct_rows = [('1,23,456',), ('123456',), ('',)]
+        self.assertIsInstance(tester.run(correct_rows, ['one'])[0], Number)
+
+        incorrect_rows = [('1,23,456',), ('1,234,567',), ('',)]
+        self.assertIsInstance(tester.run(incorrect_rows, ['one'])[0], Text)
+
+    def test_number_strict_grouping_inference_locale(self):
+        tester = TypeTester(types=[Number(locale='de_DE.UTF-8', strict_grouping=True), Text()])
+
+        correct_rows = [('200.000.000',), ('200000000',), ('',)]
+        self.assertIsInstance(tester.run(correct_rows, ['one'])[0], Number)
+
+        incorrect_rows = [('200.000.000',), ('20.00.000',), ('',)]
+        self.assertIsInstance(tester.run(incorrect_rows, ['one'])[0], Text)

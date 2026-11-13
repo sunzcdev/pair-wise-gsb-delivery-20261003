@@ -196,6 +196,117 @@ class TestNumber(unittest.TestCase):
         with self.assertRaises(CastError):
             data_type.cast('00.11')
 
+    def test_strict_grouping_cast(self):
+        data_type = Number(strict_grouping=True)
+
+        values = (
+            '1,000', '1,000.50', '1000', '1000.50',
+            '-1,000', '+1,000', '$1,000', '-$1,000', '$-1,000', '1,000$',
+            '1e3', '1,000e3', '1.5e-3', '1.5E+3',
+            '.5', '1.', 'n/a'
+        )
+        casted = tuple(data_type.cast(v) for v in values)
+        self.assertSequenceEqual(
+            casted,
+            (
+                Decimal('1000'), Decimal('1000.50'), Decimal('1000'), Decimal('1000.50'),
+                Decimal('-1000'), Decimal('1000'), Decimal('1000'), Decimal('-1000'),
+                Decimal('-1000'), Decimal('1000'),
+                Decimal('1E+3'), Decimal('1000E+3'), Decimal('0.0015'), Decimal('1.5E+3'),
+                Decimal('0.5'), Decimal('1'), None
+            )
+        )
+
+    def test_strict_grouping_cast_errors(self):
+        data_type = Number(strict_grouping=True)
+
+        for value in (
+            '12,34,567',  # incorrect secondary grouping
+            '1,2345',  # primary group has four digits
+            '1234,567',  # first group is too long
+            '1,000,00',  # final group is too short
+            '1,00.5',  # grouping symbol inside the fractional part
+            '1.000,50',  # symbols swapped for the locale
+            '1e1,000',  # grouping symbol inside the exponent
+            '1e', 'e1', '1e+',  # malformed exponent
+            '1,0%00', '%1,000%', '%%1,000',  # misplaced percent symbols
+            '$1,0$00',  # currency symbol inside the number
+            '1_000',  # underscores are not grouping symbols
+            '1 000',  # interior whitespace
+            '--1', '+-1', '1-',  # misplaced or repeated signs
+            '1,', ',000',  # empty groups
+            'a'
+        ):
+            with self.assertRaises(CastError, msg=value):
+                data_type.cast(value)
+
+    def test_strict_grouping_indian(self):
+        data_type = Number(locale='en_IN', strict_grouping=True)
+
+        values = ('1,23,456', '12,34,567', '1,234', '12,345', '1234567', '12,34,567.89')
+        casted = tuple(data_type.cast(v) for v in values)
+        self.assertSequenceEqual(
+            casted,
+            (
+                Decimal('123456'), Decimal('1234567'), Decimal('1234'), Decimal('12345'),
+                Decimal('1234567'), Decimal('1234567.89')
+            )
+        )
+
+        for value in (
+            '1,234,567',  # the first group may have one or two digits, not three
+            '12,345,678',  # secondary groups must have two digits
+            '123,45,678',  # first group is too long
+            '1,23,45,678',  # first group of a four-group number must have two digits
+            '12,34,56',  # final group must have three digits
+            '12.34.567'  # decimal symbol used as a grouping symbol
+        ):
+            with self.assertRaises(CastError, msg=value):
+                data_type.cast(value)
+
+    def test_strict_grouping_locale(self):
+        data_type = Number(locale='de_DE.UTF-8', strict_grouping=True)
+
+        self.assertEqual(data_type.cast('200.000.000'), Decimal('200000000'))
+        self.assertEqual(data_type.cast('200000000'), Decimal('200000000'))
+        self.assertEqual(data_type.cast('200.000,5'), Decimal('200000.5'))
+        self.assertEqual(data_type.cast('1,5e3'), Decimal('1.5E+3'))
+
+        for value in ('20.00.000', '200.00.000', '200.000.00', '2,000,5', '1.5e3'):
+            with self.assertRaises(CastError, msg=value):
+                data_type.cast(value)
+
+    def test_strict_grouping_non_breaking_space(self):
+        data_type = Number(locale='fr_FR', strict_grouping=True)
+
+        self.assertEqual(data_type.cast('1\u202f234'), Decimal('1234'))
+        self.assertEqual(data_type.cast('1\u202f234,56'), Decimal('1234.56'))
+        self.assertEqual(data_type.cast('1234'), Decimal('1234'))
+
+        for value in ('12\u202f34,56', '1\u202f23,45', '1 234'):
+            with self.assertRaises(CastError, msg=value):
+                data_type.cast(value)
+
+    def test_strict_grouping_test_matches_cast(self):
+        data_type = Number(strict_grouping=True)
+
+        for value in ('1,000', '12,34,567', '1e1,000'):
+            try:
+                data_type.cast(value)
+            except CastError:
+                self.assertFalse(data_type.test(value))
+            else:
+                self.assertTrue(data_type.test(value))
+
+    def test_strict_grouping_no_leading_zeroes(self):
+        data_type = Number(strict_grouping=True, no_leading_zeroes=True)
+
+        self.assertEqual(data_type.cast('1,000'), Decimal('1000'))
+        self.assertEqual(data_type.cast('0.5'), Decimal('0.5'))
+
+        with self.assertRaises(CastError):
+            data_type.cast('01')
+
 
 class TestDate(unittest.TestCase):
     def setUp(self):

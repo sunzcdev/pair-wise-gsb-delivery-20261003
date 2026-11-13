@@ -1,6 +1,7 @@
 1.14.3 - Unreleased
 -------------------
 
+-  feat: :class:`.Number` accepts a ``strict_grouping`` keyword argument, to require digit grouping to follow the locale's primary and secondary grouping lengths, including Indian-style grouping. Grouping symbols are rejected in fractional and exponent portions of numbers, and the same rules are used for type inference via :class:`.TypeTester`. The lenient behavior remains the default.
 - feat: :class:`.Median`, :class:`.Percentiles`, :class:`.Quartiles`, :class:`.Quintiles`, :class:`.Deciles` and :class:`.IQR` can be applied to :class:`.TimeDelta` columns, like :class:`.Sum` and :class:`.Mean`.
 - fix: :meth:`.Table.distinct` now deduplicates rows when ``key`` is a sequence of column names.
 - fix: :class:`.Rank` ranks null values last when ``reverse=True``.

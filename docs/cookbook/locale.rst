@@ -24,3 +24,31 @@ To correctly parse numbers from non-US locales, you must pass a :code:`locale` p
     column_types = [text_type, dutch_numbers]
 
     table = agate.Table.from_csv('dutch_cities.csv', columns)
+
+Validate digit grouping
+=======================
+
+By default, :class:`.Number` removes grouping symbols without checking their placement, so an incorrectly grouped value such as :code:`12,34,567` is parsed as a number. Pass :code:`strict_grouping=True` to validate the integer portion against the locale's primary and secondary grouping lengths. Ungrouped values are still accepted, but grouping symbols are rejected in the fractional and exponent portions:
+
+.. code-block:: python
+
+    strict_numbers = agate.Number(strict_grouping=True)
+
+    strict_numbers.cast('1,000,000')  # Decimal('1000000')
+    strict_numbers.cast('1000000')    # Decimal('1000000')
+    strict_numbers.cast('12,34,567')  # raises CastError
+
+The locale's pattern drives the rules, so Indian-style grouping works as well:
+
+.. code-block:: python
+
+    indian_numbers = agate.Number(locale='en_IN', strict_grouping=True)
+
+    indian_numbers.cast('1,23,456')    # Decimal('123456')
+    indian_numbers.cast('1,234,567')  # raises CastError
+
+The same rules apply during type inference, because :meth:`.DataType.test` uses :meth:`.Number.cast`:
+
+.. code-block:: python
+
+    tester = agate.TypeTester(types=[agate.Number(strict_grouping=True), agate.Text()])
