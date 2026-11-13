@@ -1,4 +1,5 @@
 from agate import utils
+from agate.exceptions import CastError
 from agate.rows import Row
 
 
@@ -46,17 +47,35 @@ def homogenize(self, key, compare_values, default_row=None):
     if not utils.issequence(key):
         key = [key]
 
-    if len(key) == 1:
-        if any(not utils.issequence(compare_value) for compare_value in compare_values):
-            compare_values = [[compare_value] for compare_value in compare_values]
-
     column_values = [self._columns.get(name) for name in key]
     column_indexes = [self._column_names.index(name) for name in key]
 
-    compare_values = [[column_values[i].data_type.cast(v) for i, v in enumerate(values)] for values in compare_values]
+    existing_values = set(zip(*column_values))
 
-    column_values = zip(*column_values)
-    differences = list(set(map(tuple, compare_values)) - set(column_values))
+    differences = []
+    seen = set()
+
+    for index, compare_value in enumerate(compare_values):
+        if utils.issequence(compare_value):
+            values = list(compare_value)
+        elif len(key) == 1:
+            values = [compare_value]
+        else:
+            raise ValueError('compare_values[%i] is %r, but a sequence of %i values is required.' % (index, compare_value, len(key)))
+
+        if len(values) != len(key):
+            raise ValueError('compare_values[%i] is %r, but exactly %i value(s) are required.' % (index, compare_value, len(key)))
+
+        try:
+            values = tuple(column_values[i].data_type.cast(v) for i, v in enumerate(values))
+        except Exception as e:
+            raise CastError('Error casting compare_values[%i]: %s' % (index, e)) from e
+
+        if values in existing_values or values in seen:
+            continue
+
+        seen.add(values)
+        differences.append(values)
 
     for difference in differences:
         if callable(default_row):
