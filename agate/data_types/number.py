@@ -51,6 +51,16 @@ class Number(DataType):
             self.group_symbol = group_symbol or number_symbols.get('group', ',')
             self.decimal_symbol = decimal_symbol or number_symbols.get('decimal', '.')
 
+    def semantic_config(self):
+        return {
+            'null_values': tuple(self.null_values),
+            'locale': str(self.locale),
+            'group_symbol': self.group_symbol,
+            'decimal_symbol': self.decimal_symbol,
+            'currency_symbols': tuple(self.currency_symbols),
+            'no_leading_zeroes': self.no_leading_zeroes
+        }
+
     def cast(self, d):
         """
         Cast a single value to a :class:`decimal.Decimal`.

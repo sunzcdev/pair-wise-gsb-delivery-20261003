@@ -14,6 +14,12 @@ class Text(DataType):
 
         self.cast_nulls = cast_nulls
 
+    def semantic_config(self):
+        return {
+            'null_values': tuple(self.null_values),
+            'cast_nulls': self.cast_nulls
+        }
+
     def cast(self, d):
         """
         Cast a single value to :func:`unicode` (:func:`str` in Python 3).

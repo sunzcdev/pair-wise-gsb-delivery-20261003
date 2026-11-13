@@ -10,6 +10,11 @@ class TimeDelta(DataType):
     """
     Data representing the interval between two dates and/or times.
     """
+    def semantic_config(self):
+        return {
+            'null_values': tuple(self.null_values)
+        }
+
     def cast(self, d):
         """
         Cast a single value to :class:`datetime.timedelta`.

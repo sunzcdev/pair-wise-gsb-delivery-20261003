@@ -29,6 +29,13 @@ class Boolean(DataType):
         self.true_values = true_values
         self.false_values = false_values
 
+    def semantic_config(self):
+        return {
+            'null_values': tuple(self.null_values),
+            'true_values': tuple(self.true_values),
+            'false_values': tuple(self.false_values)
+        }
+
     def cast(self, d):
         """
         Cast a single value to :class:`bool`.

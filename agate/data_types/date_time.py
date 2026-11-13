@@ -35,6 +35,14 @@ class DateTime(DataType):
         self._constants = parsedatetime.Constants(localeID=self.locale)
         self._parser = parsedatetime.Calendar(constants=self._constants, version=parsedatetime.VERSION_CONTEXT_STYLE)
 
+    def semantic_config(self):
+        return {
+            'null_values': tuple(self.null_values),
+            'datetime_format': self.datetime_format,
+            'timezone': str(self.timezone),
+            'locale': self.locale
+        }
+
     def __getstate__(self):
         """
         Return state values to be pickled. Exclude _parser because parsedatetime
