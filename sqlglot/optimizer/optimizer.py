@@ -18,6 +18,7 @@ from sqlglot.optimizer.pushdown_projections import pushdown_projections
 from sqlglot.optimizer.qualify import qualify
 from sqlglot.optimizer.qualify_columns import quote_identifiers
 from sqlglot.optimizer.simplify import simplify
+from sqlglot.optimizer.trace import OptimizerTrace
 from sqlglot.optimizer.unnest_subqueries import unnest_subqueries
 from sqlglot.schema import ensure_schema
 
@@ -64,6 +65,7 @@ def optimize(
     rules: Sequence[OptimizerFn] = RULES,
     sql: str | None = None,
     copy: bool = True,
+    trace: OptimizerTrace | None = None,
     **kwargs: object,
 ) -> exp.Expr:
     """
@@ -88,6 +90,9 @@ def optimize(
             highlighting. Requires that the expression has position metadata from parsing.
         copy: Whether to copy the input expression before optimizing it. If False, the input tree
             may be mutated. Has no effect on SQL string inputs.
+        trace: Optional :class:`~sqlglot.optimizer.trace.OptimizerTrace` recording every rule
+            application in execution order, including rules that make no changes. When ``None``
+            (the default) no per-step snapshots are taken, so tracing adds no AST copy overhead.
         **kwargs: If a rule has a keyword argument with a same name in **kwargs, it will be passed in.
 
     Returns:
@@ -112,6 +117,19 @@ def optimize(
         rule_kwargs = {
             param: possible_kwargs[param] for param in rule_params if param in possible_kwargs
         }
-        optimized = rule(optimized, **rule_kwargs)
+        if trace is None:
+            optimized = rule(optimized, **rule_kwargs)
+            continue
+
+        before = optimized
+        trace.begin(before, dialect=dialect)
+        try:
+            optimized = rule(optimized, **rule_kwargs)
+        except BaseException as exc:
+            # Only the failed rule is appended; previously completed steps stay untouched.
+            trace.fail(rule, exc)
+            raise
+
+        trace.record(rule, before, optimized, dialect=dialect)
 
     return optimized

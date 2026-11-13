@@ -331,6 +331,110 @@ class TestOptimizer(unittest.TestCase):
         self.assertIsNot(optimized, expression)
         self.assertEqual(optimized.sql(), "2")
 
+    def test_optimize_trace(self):
+        from sqlglot.optimizer.trace import OptimizerTrace
+
+        trace = OptimizerTrace()
+        result = optimizer.optimize(
+            "SELECT a + 1 + 1 AS b FROM x",
+            schema=self.schema,
+            rules=(simplify, simplify),
+            trace=trace,
+        )
+
+        # optimize still returns the optimized expression
+        self.assertEqual(result.sql(), "SELECT a + 2 AS b FROM x")
+
+        # One entry per rule application, including the repeated and no-op rule
+        self.assertEqual([entry.rule for entry in trace], ["simplify", "simplify"])
+        self.assertTrue(trace.entries[0].changed)
+        self.assertFalse(trace.entries[1].changed)
+        self.assertEqual(trace.entries[1].affected_nodes, [])
+
+        first = trace.entries[0]
+        self.assertEqual(first.before_sql, "SELECT a + 1 + 1 AS b FROM x")
+        self.assertEqual(first.after_sql, "SELECT a + 2 AS b FROM x")
+        self.assertTrue(first.affected_nodes)
+        self.assertFalse(first.truncated)
+        # No-op entry is still self-contained and identifiable
+        self.assertEqual(trace.entries[1].before_sql, trace.entries[1].after_sql)
+
+    def test_optimize_trace_snapshot_stability(self):
+        from sqlglot.optimizer.trace import OptimizerTrace
+
+        # simplify mutates the tree in place; recorded fragments must not drift with it
+        trace = OptimizerTrace()
+        expression = parse_one("SELECT a + 1 + 1 AS b FROM x")
+        optimizer.optimize(
+            expression,
+            schema=self.schema,
+            rules=(simplify, simplify),
+            trace=trace,
+            copy=False,
+        )
+
+        self.assertEqual(trace.entries[0].before_sql, "SELECT a + 1 + 1 AS b FROM x")
+        self.assertEqual(trace.entries[0].after_sql, "SELECT a + 2 AS b FROM x")
+        self.assertEqual(trace.entries[1].before_sql, "SELECT a + 2 AS b FROM x")
+
+    def test_optimize_trace_error(self):
+        from sqlglot.optimizer.trace import OptimizerTrace
+
+        def failing_rule(expression, **kwargs):
+            raise OptimizeError("boom")
+
+        trace = OptimizerTrace()
+        with self.assertRaises(OptimizeError):
+            optimizer.optimize(
+                "SELECT 1",
+                rules=(simplify, failing_rule, simplify),
+                trace=trace,
+            )
+
+        # Only completed steps and the failed rule are recorded
+        self.assertEqual([entry.rule for entry in trace], ["simplify", "failing_rule"])
+        self.assertIsNone(trace.entries[0].error)
+        failed = trace.entries[1]
+        self.assertEqual(failed.error, "boom")
+        self.assertIsNone(failed.after_sql)
+        self.assertFalse(failed.changed)
+
+    def test_optimize_trace_limits(self):
+        from sqlglot.optimizer.trace import OptimizerTrace
+
+        trace = OptimizerTrace(max_entries=2, max_fragment_chars=15)
+        optimizer.optimize(
+            "SELECT a + 1 + 1 AS b FROM x",
+            schema=self.schema,
+            rules=(simplify,) * 5,
+            trace=trace,
+        )
+
+        self.assertEqual(len(trace), 2)
+        self.assertTrue(trace.records_truncated)
+        self.assertTrue(trace.fragments_truncated)
+        self.assertTrue(trace.truncated)
+        # The first fragment was cut to the character budget and carries a marker
+        self.assertTrue(trace.entries[0].truncated)
+        self.assertTrue(trace.entries[0].before_sql.endswith("..."))
+
+    def test_optimize_trace_disabled_no_copy(self):
+        from sqlglot.optimizer.trace import OptimizerTrace
+
+        expression = parse_one("SELECT a + 1 + 1 AS b FROM x")
+        with patch("sqlglot.expressions.core.Expression.copy") as copy_mock:
+            copy_mock.side_effect = lambda: expression  # never actually invoked
+            optimizer.optimize(expression, schema=self.schema, rules=(simplify,), copy=False)
+            copy_mock.assert_not_called()
+
+        # Sanity: tracing enabled does take a snapshot copy per rule
+        expression = parse_one("SELECT a + 1 + 1 AS b FROM x")
+        with patch("sqlglot.expressions.core.Expression.copy", wraps=expression.copy) as copy_mock:
+            optimizer.optimize(
+                expression, schema=self.schema, rules=(simplify,), trace=OptimizerTrace()
+            )
+            copy_mock.assert_called()
+
     def test_isolate_table_selects(self):
         self.check_file(
             "isolate_table_selects",

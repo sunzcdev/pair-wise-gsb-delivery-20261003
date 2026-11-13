@@ -32,6 +32,10 @@ if t.TYPE_CHECKING:
         traverse_scope as traverse_scope,
         walk_in_scope as walk_in_scope,
     )
+    from sqlglot.optimizer.trace import (
+        OptimizerTrace as OptimizerTrace,
+        OptimizerTraceEntry as OptimizerTraceEntry,
+    )
 
 # Explicit, because some names collide between optimizer.py and submodules
 # (e.g. `qualify` is both a function and a submodule).
@@ -44,6 +48,8 @@ _LAZY_ATTRS: dict[str, tuple[str, str]] = {
     "find_in_scope": ("sqlglot.optimizer.scope", "find_in_scope"),
     "traverse_scope": ("sqlglot.optimizer.scope", "traverse_scope"),
     "walk_in_scope": ("sqlglot.optimizer.scope", "walk_in_scope"),
+    "OptimizerTrace": ("sqlglot.optimizer.trace", "OptimizerTrace"),
+    "OptimizerTraceEntry": ("sqlglot.optimizer.trace", "OptimizerTraceEntry"),
 }
 
 

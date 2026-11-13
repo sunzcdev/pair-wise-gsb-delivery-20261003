@@ -364,6 +364,20 @@ WHERE
   CAST("x"."z" AS DATE) = CAST('2021-02-01' AS DATE)
 ```
 
+To see which rule changed what, pass an `OptimizerTrace`. It records every rule in
+execution order, including rules that make no changes, with the affected node keys and
+the before/after SQL fragments. Tracing is opt-in and adds no overhead when omitted:
+
+```python
+from sqlglot.optimizer import OptimizerTrace, optimize
+
+trace = OptimizerTrace()
+optimize(sqlglot.parse_one("SELECT 1 + 1"), trace=trace)
+
+for entry in trace:
+    print(entry.rule, entry.changed, entry.affected_nodes, entry.before_sql, entry.after_sql)
+```
+
 ### AST Introspection
 
 You can see the AST version of the parsed SQL by calling `repr`:
