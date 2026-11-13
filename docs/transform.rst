@@ -123,6 +123,7 @@ Unpacking compound values
 
 .. autofunction:: petl.transform.unpacks.unpack
 .. autofunction:: petl.transform.unpacks.unpackdict
+.. autofunction:: petl.transform.unpacks.unpackzip
 
 
 .. module:: petl.transform.maps

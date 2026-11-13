@@ -40,7 +40,7 @@ from petl.transform.reshape import melt, recast, transpose, pivot, flatten, \
 
 from petl.transform.maps import fieldmap, rowmap, rowmapmany, rowgroupmap
 
-from petl.transform.unpacks import unpack, unpackdict
+from petl.transform.unpacks import unpack, unpackdict, unpackzip
 
 from petl.transform.dedup import duplicates, unique, distinct, conflicts, \
     isunique
