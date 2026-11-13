@@ -9,7 +9,8 @@ from petl.compat import Decimal, integer_types, numeric_types
 from petl.util.base import Table, asindices
 
 
-def standardize(table, fields, newfields=None, ddof=0):
+def standardize(table, fields, newfields=None, ddof=0, nonfinite='ignore',
+                missing=None):
     """
     Standardize numeric values under one or more fields to have a mean of 0
     and a standard deviation of 1. E.g.::
@@ -33,15 +34,26 @@ def standardize(table, fields, newfields=None, ddof=0):
     standard deviation. The default, 0, uses the population standard
     deviation; use 1 for the sample standard deviation.
 
-    Non-numeric and non-finite values, including ``None``, booleans, NaN and
-    infinities, are passed through unchanged. Constant fields are standardized
-    to 0.0.
+    Non-numeric values, including ``None`` and booleans, are always passed
+    through unchanged and never contribute to the statistics. Non-finite
+    numbers (NaN and infinities, as ``float`` or ``Decimal``) are handled
+    according to the `nonfinite` argument:
+
+    - ``'ignore'`` (default): excluded from the mean, standard deviation,
+      valid sample count and `ddof` check, and passed through unchanged.
+    - ``'reject'``: raise a ``ValueError`` identifying the field and the
+      data row where the value occurs.
+    - ``'replace'``: excluded from the statistics like ``'ignore'``, and
+      replaced with the `missing` value in the output.
+
+    Constant fields are standardized to 0.0.
 
     Note that the source table is materialized before values are returned.
 
     """
 
-    return StandardizeView(table, fields, newfields=newfields, ddof=ddof)
+    return StandardizeView(table, fields, newfields=newfields, ddof=ddof,
+                           nonfinite=nonfinite, missing=missing)
 
 
 Table.standardize = standardize
@@ -49,21 +61,30 @@ Table.standardize = standardize
 
 class StandardizeView(Table):
 
-    def __init__(self, source, fields, newfields=None, ddof=0):
+    def __init__(self, source, fields, newfields=None, ddof=0,
+                 nonfinite='ignore', missing=None):
         self.source = source
         self.fields = fields
         self.newfields = newfields
         self.ddof = ddof
+        self.nonfinite = nonfinite
+        self.missing = missing
 
     def __iter__(self):
         return iterstandardize(self.source, self.fields, self.newfields,
-                               self.ddof)
+                               self.ddof, self.nonfinite, self.missing)
 
 
-def iterstandardize(source, fields, newfields, ddof):
+NONFINITE_POLICIES = ('ignore', 'reject', 'replace')
+
+
+def iterstandardize(source, fields, newfields, ddof, nonfinite, missing):
     if (not isinstance(ddof, integer_types) or isinstance(ddof, bool) or
             ddof < 0):
         raise ValueError('ddof must be a non-negative integer')
+    if nonfinite not in NONFINITE_POLICIES:
+        raise ValueError("nonfinite must be one of 'ignore', 'reject' or "
+                         "'replace'")
 
     rows = list(iter(source))
     if not rows:
@@ -83,9 +104,15 @@ def iterstandardize(source, fields, newfields, ddof):
 
     stats = []
     for index in indices:
-        values = [row[index] for row in data
-                  if _has_index(row, index) and
-                  _is_finite_number(row[index])]
+        values = []
+        for rownum, row in enumerate(data, start=1):
+            if not _has_index(row, index):
+                continue
+            value = row[index]
+            if _is_finite_number(value):
+                values.append(value)
+            elif _is_number(value):
+                _handle_nonfinite(nonfinite, hdr, index, rownum, value)
         stats.append(_mean_std(values, ddof))
 
     yield outhdr
@@ -100,6 +127,8 @@ def iterstandardize(source, fields, newfields, ddof):
                 value = None
             if _is_finite_number(value):
                 value = _standardize_value(value, field_stats)
+            elif _is_number(value) and nonfinite == 'replace':
+                value = missing
             standardized.append(value)
 
         if newfields is None:
@@ -134,6 +163,12 @@ def _is_finite_number(value):
 
 def _has_index(row, index):
     return -len(row) <= index < len(row)
+
+
+def _handle_nonfinite(nonfinite, hdr, index, rownum, value):
+    if nonfinite == 'reject':
+        raise ValueError('non-finite value %r in field %r at data row %d'
+                         % (value, hdr[index], rownum))
 
 
 def _as_decimal(value):

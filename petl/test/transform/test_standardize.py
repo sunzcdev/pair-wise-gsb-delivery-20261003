@@ -94,6 +94,114 @@ def test_standardize_preserves_non_finite_values():
     assert values[4:] == [float('inf'), float('-inf')]
 
 
+def test_standardize_nonfinite_ignore_is_default():
+    table = (('value',),
+             (Decimal('1'),),
+             (Decimal('2'),),
+             (Decimal('3'),),
+             (Decimal('NaN'),),
+             (Decimal('Infinity'),),
+             (Decimal('-Infinity'),))
+
+    for nonfinite in (None, 'ignore'):
+        if nonfinite is None:
+            values = standardize(table, 'value').values('value').list()
+        else:
+            values = standardize(table, 'value',
+                                 nonfinite=nonfinite).values('value').list()
+        assert values[:3] == pytest.approx((-1.224744871391589,
+                                            0,
+                                            1.224744871391589))
+        assert values[3].is_nan()
+        assert values[4:] == [Decimal('Infinity'), Decimal('-Infinity')]
+
+
+def test_standardize_nonfinite_reject_locates_field_and_row():
+    table = (('id', 'value'),
+             (1, 1.0),
+             (2, float('nan')),
+             (3, float('inf')))
+
+    with pytest.raises(ValueError) as excinfo:
+        standardize(table, 'value', nonfinite='reject').list()
+    message = str(excinfo.value)
+    assert "'value'" in message
+    assert 'row 2' in message
+
+    decimal_table = (('score',),
+                     (Decimal('1'),),
+                     (Decimal('2'),),
+                     (Decimal('Infinity'),))
+    with pytest.raises(ValueError) as excinfo:
+        standardize(decimal_table, 'score', nonfinite='reject').list()
+    message = str(excinfo.value)
+    assert "'score'" in message
+    assert 'row 3' in message
+
+
+def test_standardize_nonfinite_replace_with_missing():
+    table = (('value',),
+             (1.0,),
+             (2.0,),
+             (3.0,),
+             (float('nan'),),
+             (float('inf'),))
+
+    values = standardize(table, 'value', nonfinite='replace',
+                         missing=None).values('value').list()
+    assert values[:3] == pytest.approx((-1.224744871391589,
+                                        0,
+                                        1.224744871391589))
+    assert values[3:] == [None, None]
+
+    decimal_table = (('value',),
+                     (Decimal('1'),),
+                     (Decimal('2'),),
+                     (Decimal('3'),),
+                     (Decimal('NaN'),),
+                     (Decimal('-Infinity'),))
+    values = standardize(decimal_table, 'value', nonfinite='replace',
+                         missing='N/A').values('value').list()
+    assert values[:3] == pytest.approx((-1.224744871391589,
+                                        0,
+                                        1.224744871391589))
+    assert values[3:] == ['N/A', 'N/A']
+
+
+def test_standardize_nonfinite_replaced_values_do_not_count_for_ddof():
+    table = (('value',),
+             (10.0,),
+             (float('nan'),))
+
+    for nonfinite in ('ignore', 'replace'):
+        with pytest.raises(ValueError):
+            standardize(table, 'value', ddof=1,
+                        nonfinite=nonfinite).list()
+
+    values = standardize(table, 'value', ddof=1,
+                         nonfinite='reject').values('value')
+    with pytest.raises(ValueError):
+        values.list()
+
+
+def test_standardize_nonfinite_all_missing_field():
+    table = (('value',),
+             (float('nan'),),
+             (Decimal('Infinity'),))
+
+    rows = standardize(table, 'value', nonfinite='replace').list()
+    assert rows == [('value',), (None,), (None,)]
+
+    with pytest.raises(ValueError):
+        standardize(table, 'value', nonfinite='reject').list()
+
+
+def test_standardize_invalid_nonfinite_policy():
+    table = (('value',), (1.0,), (float('nan'),))
+    with pytest.raises(ValueError):
+        standardize(table, 'value', nonfinite='drop').list()
+
+
 def test_standardize_field_without_finite_numbers():
     table = (('value',),
              (None,),
