@@ -21,7 +21,9 @@ from petl.transform.selects import select, selectop, selectcontains, \
     selectusingcontext, rowlenselect, facet, biselect
 
 from petl.transform.joins import join, leftjoin, rightjoin, outerjoin, \
-    crossjoin, antijoin, lookupjoin, unjoin
+    crossjoin, antijoin, lookupjoin, unjoin, CARDINALITY_ONE_TO_ONE, \
+    CARDINALITY_ONE_TO_MANY, CARDINALITY_MANY_TO_ONE, \
+    CARDINALITY_MANY_TO_MANY
 
 from petl.transform.hashjoins import hashjoin, hashleftjoin, hashrightjoin, \
     hashantijoin, hashlookupjoin

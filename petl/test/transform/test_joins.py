@@ -1,6 +1,12 @@
 from __future__ import absolute_import, division, print_function
 
+import pytest
+
+from petl.errors import ArgumentError, CardinalityViolation
 from petl import (
+    CARDINALITY_ONE_TO_ONE,
+    CARDINALITY_ONE_TO_MANY,
+    CARDINALITY_MANY_TO_ONE,
     antijoin,
     crossjoin,
     cut,
@@ -1555,3 +1561,200 @@ def test_joins_negative_key_indices():
     for join_impl in (join, leftjoin, rightjoin, outerjoin, hashjoin,
                       hashleftjoin, hashrightjoin, lookupjoin, hashlookupjoin):
         ieq(expected, join_impl(left, right, lkey=-1, rkey=-1))
+
+
+_JOIN_IMPLS = (join, leftjoin, rightjoin, outerjoin)
+
+
+@pytest.mark.parametrize('join_impl', _JOIN_IMPLS)
+@pytest.mark.parametrize('cardinality', [
+    None, 'many-to-many', '1:1', 'one-to-one',
+    '1:n', 'one-to-many', 'n:1', 'many-to-one',
+])
+def test_join_cardinality_accepted(join_impl, cardinality):
+    left = [('id', 'a'), (1, 'x'), (2, 'y')]
+    right = [('id', 'b'), (1, 'p'), (2, 'q')]
+    # unique keys on both sides, so every cardinality is satisfied
+    result = join_impl(left, right, key='id', cardinality=cardinality)
+    assert result.header() == ('id', 'a', 'b')
+
+
+@pytest.mark.parametrize('join_impl', _JOIN_IMPLS)
+def test_join_cardinality_invalid_argument(join_impl):
+    left = [('id', 'a'), (1, 'x')]
+    right = [('id', 'b'), (1, 'p')]
+    with pytest.raises(ArgumentError):
+        list(join_impl(left, right, key='id', cardinality='bogus'))
+
+
+@pytest.mark.parametrize('join_impl', _JOIN_IMPLS)
+@pytest.mark.parametrize('cardinality, expect_side', [
+    ('one-to-one', 'left'),
+    ('1:1', 'left'),
+    ('one-to-many', 'left'),
+    ('1:n', 'left'),
+])
+def test_join_cardinality_left_violation(join_impl, cardinality, expect_side):
+    left = [('id', 'a'), (1, 'x'), (1, 'y')]
+    right = [('id', 'b'), (1, 'p'), (2, 'q')]
+    with pytest.raises(CardinalityViolation) as excinfo:
+        list(join_impl(left, right, key='id', cardinality=cardinality))
+    err = excinfo.value
+    assert err.side == expect_side
+    assert err.key == 1
+    assert err.count == 2
+
+
+@pytest.mark.parametrize('join_impl', _JOIN_IMPLS)
+@pytest.mark.parametrize('cardinality', ['one-to-one', '1:1', 'many-to-one',
+                                         'n:1'])
+def test_join_cardinality_right_violation(join_impl, cardinality):
+    left = [('id', 'a'), (1, 'x'), (2, 'y')]
+    right = [('id', 'b'), (1, 'p'), (1, 'q')]
+    with pytest.raises(CardinalityViolation) as excinfo:
+        list(join_impl(left, right, key='id', cardinality=cardinality))
+    err = excinfo.value
+    assert err.side == 'right'
+    assert err.key == 1
+    assert err.count == 2
+
+
+@pytest.mark.parametrize('join_impl', _JOIN_IMPLS)
+def test_join_cardinality_one_to_many_allows_right_duplicates(join_impl):
+    left = [('id', 'a'), (1, 'x')]
+    right = [('id', 'b'), (1, 'p'), (1, 'q')]
+    expect = [('id', 'a', 'b'), (1, 'x', 'p'), (1, 'x', 'q')]
+    ieq(expect, join_impl(left, right, key='id',
+                          cardinality='one-to-many'))
+
+
+@pytest.mark.parametrize('join_impl', _JOIN_IMPLS)
+def test_join_cardinality_many_to_one_allows_left_duplicates(join_impl):
+    left = [('id', 'a'), (1, 'x'), (1, 'y')]
+    right = [('id', 'b'), (1, 'p')]
+    expect = [('id', 'a', 'b'), (1, 'x', 'p'), (1, 'y', 'p')]
+    ieq(expect, join_impl(left, right, key='id',
+                          cardinality='many-to-one'))
+
+
+@pytest.mark.parametrize('join_impl', _JOIN_IMPLS)
+def test_join_cardinality_checks_unmatched_duplicate_keys(join_impl):
+    # duplicates on a "one" side are violations even if the key never
+    # matches the other side
+    left = [('id', 'a'), (3, 'x'), (3, 'y')]
+    right = [('id', 'b'), (1, 'p'), (2, 'q')]
+    with pytest.raises(CardinalityViolation) as excinfo:
+        list(join_impl(left, right, key='id', cardinality='one-to-one'))
+    assert excinfo.value.side == 'left'
+    assert excinfo.value.key == 3
+    assert excinfo.value.count == 2
+
+    left = [('id', 'a'), (1, 'x'), (2, 'y')]
+    right = [('id', 'b'), (9, 'p'), (9, 'q')]
+    with pytest.raises(CardinalityViolation) as excinfo:
+        list(join_impl(left, right, key='id', cardinality='many-to-one'))
+    assert excinfo.value.side == 'right'
+    assert excinfo.value.key == 9
+    assert excinfo.value.count == 2
+
+
+@pytest.mark.parametrize('join_impl, _outer_flag', [
+    (join, None),
+    (leftjoin, 'left'),
+    (rightjoin, 'right'),
+    (outerjoin, 'both'),
+])
+def test_join_cardinality_unmatched_duplicates_outer(join_impl, _outer_flag):
+    left = [('id', 'a'), (3, 'x'), (3, 'y')]
+    right = [('id', 'b'), (9, 'p'), (9, 'q')]
+    with pytest.raises(CardinalityViolation):
+        list(join_impl(left, right, key='id', cardinality='one-to-one'))
+
+
+def test_join_cardinality_compound_and_different_key_names():
+    left = [('id', 'time', 'v'), (1, 1, 'a'), (1, 1, 'b')]
+    right = [('k', 'tm', 'w'), (1, 1, 'z')]
+    with pytest.raises(CardinalityViolation) as excinfo:
+        list(join(left, right, lkey=['id', 'time'], rkey=['k', 'tm'],
+                  cardinality='one-to-one'))
+    err = excinfo.value
+    assert err.side == 'left'
+    assert err.key == (1, 1)
+    assert err.count == 2
+
+    # the same data is fine when the left side is allowed to repeat
+    expect = [('id', 'time', 'v', 'w'), (1, 1, 'a', 'z'), (1, 1, 'b', 'z')]
+    ieq(expect, join(left, right, lkey=['id', 'time'], rkey=['k', 'tm'],
+                     cardinality='many-to-one'))
+
+
+def test_join_cardinality_streams_valid_keys_before_violation():
+    left = [('id', 'a'), (1, 'x'), (2, 'y'), (2, 'z')]
+    right = [('id', 'b'), (1, 'p'), (2, 'q'), (3, 'r')]
+    result = iter(join(left, right, key='id', cardinality='one-to-one'))
+    assert next(result) == ('id', 'a', 'b')
+    assert next(result) == (1, 'x', 'p')
+    with pytest.raises(CardinalityViolation) as excinfo:
+        next(result)
+    assert excinfo.value.key == 2
+
+
+def test_join_cardinality_no_partial_product_for_violating_key():
+    left = [('id', 'a'), (1, 'x'), (2, 'y'), (2, 'z')]
+    right = [('id', 'b'), (1, 'p'), (2, 'q'), (2, 'r')]
+    emitted = []
+    with pytest.raises(CardinalityViolation):
+        for row in join(left, right, key='id', cardinality='one-to-one'):
+            emitted.append(row)
+    # header plus the valid key 1 row only; nothing for the violating key 2
+    assert emitted == [('id', 'a', 'b'), (1, 'x', 'p')]
+
+
+class _CountingSource(object):
+
+    def __init__(self, rows):
+        self.rows = rows
+        self.passes = 0
+
+    def __iter__(self):
+        self.passes += 1
+        return iter(self.rows)
+
+
+@pytest.mark.parametrize('cardinality', [None, 'one-to-one'])
+def test_join_cardinality_presorted_single_pass(cardinality):
+    left = _CountingSource([('id', 'a'), (1, 'x'), (2, 'y'), (3, 'z')])
+    right = _CountingSource([('id', 'b'), (1, 'p'), (2, 'q'), (3, 'r')])
+    result = join(left, right, key='id', presorted=True,
+                  cardinality=cardinality)
+    rows = list(result)
+    # one pass for the header plus a single pass over the data; no extra
+    # full scan is added either for checking or for the default behaviour
+    assert left.passes == 2
+    assert right.passes == 2
+    assert len(rows) == 4
+
+
+def test_join_cardinality_none_key_duplicate_detected():
+    left = [('id', 'a'), (None, 'x'), (None, 'y')]
+    right = [('id', 'b'), (None, 'p')]
+    with pytest.raises(CardinalityViolation) as excinfo:
+        list(join(left, right, key='id', cardinality='one-to-one'))
+    assert excinfo.value.side == 'left'
+    assert excinfo.value.key is None
+    assert excinfo.value.count == 2
+
+
+def test_join_cardinality_public_constants():
+    left = [('id', 'a'), (1, 'x'), (1, 'y')]
+    right = [('id', 'b'), (1, 'p')]
+
+    # many-to-one permits the repeated left key
+    expect = [('id', 'a', 'b'), (1, 'x', 'p'), (1, 'y', 'p')]
+    ieq(expect, join(left, right, key='id',
+                     cardinality=CARDINALITY_MANY_TO_ONE))
+
+    # one-to-many and one-to-one both forbid it on the left
+    for constraint in (CARDINALITY_ONE_TO_MANY, CARDINALITY_ONE_TO_ONE):
+        with pytest.raises(CardinalityViolation):
+            list(join(left, right, key='id', cardinality=constraint))

@@ -4,11 +4,45 @@ import itertools
 
 from petl.comparison import Comparable, comparable_itemgetter
 from petl.compat import next, text_type
-from petl.errors import ArgumentError
+from petl.errors import ArgumentError, CardinalityViolation
 from petl.transform.basics import cut, cutout, stack
 from petl.transform.dedup import distinct
 from petl.transform.sorts import sort
 from petl.util.base import Table, asindices, data, header, rowgetter, rowgroupby
+
+
+# cardinality constraints for equi-joins: the side marked as "one" must have
+# at most one row per join key
+CARDINALITY_ONE_TO_ONE = 'one-to-one'
+CARDINALITY_ONE_TO_MANY = 'one-to-many'
+CARDINALITY_MANY_TO_ONE = 'many-to-one'
+CARDINALITY_MANY_TO_MANY = 'many-to-many'
+
+_CARDINALITY_ALIASES = {
+    None: (False, False),
+    CARDINALITY_MANY_TO_MANY: (False, False),
+    '1:1': (True, True),
+    CARDINALITY_ONE_TO_ONE: (True, True),
+    '1:n': (True, False),
+    CARDINALITY_ONE_TO_MANY: (True, False),
+    'n:1': (False, True),
+    CARDINALITY_MANY_TO_ONE: (False, True),
+}
+
+
+def _cardinality_flags(cardinality):
+    """Translate a cardinality argument into ``(left_unique, right_unique)``.
+
+    A side marked as unique may contain at most one row per join key.
+    """
+    try:
+        return _CARDINALITY_ALIASES[cardinality]
+    except KeyError:
+        raise ArgumentError(
+            'bad cardinality argument: expected one of %r, got %r'
+            % (sorted(v for v in _CARDINALITY_ALIASES if v is not None),
+               cardinality)
+        )
 
 
 def natural_key(left, right):
@@ -54,7 +88,8 @@ def _nonkey_indices(hdr, indices):
 
 
 def join(left, right, key=None, lkey=None, rkey=None, presorted=False,
-         buffersize=None, tempdir=None, cache=True, lprefix=None, rprefix=None):
+         buffersize=None, tempdir=None, cache=True, lprefix=None,
+         rprefix=None, cardinality=None):
     """
     Perform an equi-join on the given tables. E.g.::
 
@@ -141,9 +176,26 @@ def join(left, right, key=None, lkey=None, rkey=None, presorted=False,
     Left and right tables with different key fields can be handled via the
     `lkey` and `rkey` arguments.
 
+    The `cardinality` argument optionally constrains how many rows each side
+    may contain per join key. It accepts one of:
+
+    * ``'one-to-one'`` (or ``'1:1'``): at most one row per key on each side;
+    * ``'one-to-many'`` (or ``'1:n'``): at most one row per key on the left;
+    * ``'many-to-one'`` (or ``'n:1'``): at most one row per key on the right;
+    * ``'many-to-many'`` (or `None`, the default): no constraint.
+
+    The "one" side must have at most one row per key, including keys that do
+    not match any row on the other side. A violation raises a
+    :class:`petl.errors.CardinalityViolation` reporting the offending side,
+    key and the number of rows observed; no rows are emitted for the
+    offending key, while rows streamed for earlier, valid keys are retained.
+
     .. versionchanged:: 1.7.16
         To ensure correct results for tables with uneven rows, tables will be
         squared up before joining to ensure correct results.
+
+    .. versionadded:: 1.8.0
+        Added the `cardinality` argument.
 
     """
 
@@ -151,7 +203,8 @@ def join(left, right, key=None, lkey=None, rkey=None, presorted=False,
     lkey, rkey = keys_from_args(left, right, key, lkey, rkey)
     return JoinView(left, right, lkey=lkey, rkey=rkey,
                     presorted=presorted, buffersize=buffersize, tempdir=tempdir,
-                    cache=cache, lprefix=lprefix, rprefix=rprefix)
+                    cache=cache, lprefix=lprefix, rprefix=rprefix,
+                    cardinality=cardinality)
 
 
 Table.join = join
@@ -162,7 +215,7 @@ class JoinView(Table):
     def __init__(self, left, right, lkey, rkey,
                  presorted=False, leftouter=False, rightouter=False,
                  missing=None, buffersize=None, tempdir=None, cache=True,
-                 lprefix=None, rprefix=None):
+                 lprefix=None, rprefix=None, cardinality=None):
         self.lkey = lkey
         self.rkey = rkey
         self.left = stack(left, missing=missing)
@@ -177,17 +230,18 @@ class JoinView(Table):
         self.missing = missing
         self.lprefix = lprefix
         self.rprefix = rprefix
+        self.cardinality = cardinality
 
     def __iter__(self):
         return iterjoin(self.left, self.right, self.lkey, self.rkey,
                         leftouter=self.leftouter, rightouter=self.rightouter,
                         missing=self.missing, lprefix=self.lprefix,
-                        rprefix=self.rprefix)
+                        rprefix=self.rprefix, cardinality=self.cardinality)
 
 
 def leftjoin(left, right, key=None, lkey=None, rkey=None, missing=None,
              presorted=False, buffersize=None, tempdir=None, cache=True,
-             lprefix=None, rprefix=None):
+             lprefix=None, rprefix=None, cardinality=None):
     """
     Perform a left outer join on the given tables. E.g.::
 
@@ -221,9 +275,16 @@ def leftjoin(left, right, key=None, lkey=None, rkey=None, missing=None,
     Left and right tables with different key fields can be handled via the
     `lkey` and `rkey` arguments.
 
+    The optional `cardinality` argument constrains how many rows each side may
+    contain per join key; see :func:`petl.transform.joins.join` for the
+    accepted values and the behaviour when the constraint is violated.
+
     .. versionchanged:: 1.7.16
         To ensure correct results for tables with uneven rows, tables will be
         squared up before joining to ensure correct results.
+
+    .. versionadded:: 1.8.0
+        Added the `cardinality` argument.
 
     """
 
@@ -232,7 +293,8 @@ def leftjoin(left, right, key=None, lkey=None, rkey=None, missing=None,
     return JoinView(left, right, lkey=lkey, rkey=rkey,
                     presorted=presorted, leftouter=True, rightouter=False,
                     missing=missing, buffersize=buffersize, tempdir=tempdir,
-                    cache=cache, lprefix=lprefix, rprefix=rprefix)
+                    cache=cache, lprefix=lprefix, rprefix=rprefix,
+                    cardinality=cardinality)
 
 
 Table.leftjoin = leftjoin
@@ -240,7 +302,7 @@ Table.leftjoin = leftjoin
 
 def rightjoin(left, right, key=None, lkey=None, rkey=None, missing=None,
               presorted=False, buffersize=None, tempdir=None, cache=True,
-              lprefix=None, rprefix=None):
+              lprefix=None, rprefix=None, cardinality=None):
     """
     Perform a right outer join on the given tables. E.g.::
 
@@ -274,9 +336,16 @@ def rightjoin(left, right, key=None, lkey=None, rkey=None, missing=None,
     Left and right tables with different key fields can be handled via the
     `lkey` and `rkey` arguments.
 
+    The optional `cardinality` argument constrains how many rows each side may
+    contain per join key; see :func:`petl.transform.joins.join` for the
+    accepted values and the behaviour when the constraint is violated.
+
     .. versionchanged:: 1.7.16
         To ensure correct results for tables with uneven rows, tables will be
         squared up before joining to ensure correct results.
+
+    .. versionadded:: 1.8.0
+        Added the `cardinality` argument.
 
     """
 
@@ -286,7 +355,7 @@ def rightjoin(left, right, key=None, lkey=None, rkey=None, missing=None,
                     presorted=presorted, leftouter=False, rightouter=True,
                     missing=missing, buffersize=buffersize,
                     tempdir=tempdir, cache=cache, lprefix=lprefix,
-                    rprefix=rprefix)
+                    rprefix=rprefix, cardinality=cardinality)
 
 
 Table.rightjoin = rightjoin
@@ -294,7 +363,7 @@ Table.rightjoin = rightjoin
 
 def outerjoin(left, right, key=None, lkey=None, rkey=None, missing=None,
               presorted=False, buffersize=None, tempdir=None, cache=True,
-              lprefix=None, rprefix=None):
+              lprefix=None, rprefix=None, cardinality=None):
     """
     Perform a full outer join on the given tables. E.g.::
 
@@ -330,9 +399,16 @@ def outerjoin(left, right, key=None, lkey=None, rkey=None, missing=None,
     Left and right tables with different key fields can be handled via the
     `lkey` and `rkey` arguments.
 
+    The optional `cardinality` argument constrains how many rows each side may
+    contain per join key; see :func:`petl.transform.joins.join` for the
+    accepted values and the behaviour when the constraint is violated.
+
     .. versionchanged:: 1.7.16
         To ensure correct results for tables with uneven rows, tables will be
         squared up before joining to ensure correct results.
+
+    .. versionadded:: 1.8.0
+        Added the `cardinality` argument.
 
     """
 
@@ -341,16 +417,19 @@ def outerjoin(left, right, key=None, lkey=None, rkey=None, missing=None,
     return JoinView(left, right, lkey=lkey, rkey=rkey,
                     presorted=presorted, leftouter=True, rightouter=True,
                     missing=missing, buffersize=buffersize, tempdir=tempdir,
-                    cache=cache, lprefix=lprefix, rprefix=rprefix)
+                    cache=cache, lprefix=lprefix, rprefix=rprefix,
+                    cardinality=cardinality)
 
 
 Table.outerjoin = outerjoin
 
 
 def iterjoin(left, right, lkey, rkey, leftouter=False, rightouter=False,
-             missing=None, lprefix=None, rprefix=None):
+             missing=None, lprefix=None, rprefix=None, cardinality=None):
     lit = iter(left)
     rit = iter(right)
+
+    left_unique, right_unique = _cardinality_flags(cardinality)
 
     lhdr = next(lit)
     rhdr = next(rit)
@@ -414,6 +493,30 @@ def iterjoin(left, right, lkey, rkey, leftouter=False, rightouter=False,
     lrowgrp = []
     rrowgrp = []
 
+    def prepare_lgroup(key, rowgrp):
+        # materialising the group counts the rows while still making a single
+        # pass over the source, so the presorted path is never re-traversed.
+        # the "one" side must hold at most one row per key; unmatched keys
+        # are checked too, so the whole group is counted
+        if left_unique:
+            rowgrp = list(rowgrp)
+            if len(rowgrp) > 1:
+                raise CardinalityViolation('left', key.inner, len(rowgrp))
+        return rowgrp
+
+    def prepare_rgroup(key, rowgrp):
+        if right_unique:
+            rowgrp = list(rowgrp)
+            if len(rowgrp) > 1:
+                raise CardinalityViolation('right', key.inner, len(rowgrp))
+        return rowgrp
+
+    # whether the most recently picked-off group has not yet been consumed;
+    # tracked explicitly because no key value can stand in for
+    # "iterator exhausted" - None is itself a valid key
+    lgrp_pending = False
+    rgrp_pending = False
+
     # loop until *either* of the iterators is exhausted
     # initialise here to handle empty tables
     lkval, rkval = Comparable(None), Comparable(None)
@@ -421,50 +524,72 @@ def iterjoin(left, right, lkey, rkey, leftouter=False, rightouter=False,
 
         # pick off initial row groups
         lkval, lrowgrp = next(lgit)
+        lgrp_pending = True
         rkval, rrowgrp = next(rgit)
+        rgrp_pending = True
 
         while True:
             if lkval < rkval:
+                lrowgrp = prepare_lgroup(lkval, lrowgrp)
                 if leftouter:
                     for row in joinrows(lrowgrp, None):
                         yield tuple(row)
                 # advance left
+                lgrp_pending = False
                 lkval, lrowgrp = next(lgit)
+                lgrp_pending = True
             elif lkval > rkval:
+                rrowgrp = prepare_rgroup(rkval, rrowgrp)
                 if rightouter:
                     for row in joinrows(None, rrowgrp):
                         yield tuple(row)
                 # advance right
+                rgrp_pending = False
                 rkval, rrowgrp = next(rgit)
+                rgrp_pending = True
             else:
+                # check both sides before emitting anything, so a violating
+                # key never produces a partial cartesian product
+                lrowgrp = prepare_lgroup(lkval, lrowgrp)
+                rrowgrp = prepare_rgroup(rkval, rrowgrp)
                 for row in joinrows(lrowgrp, rrowgrp):
                     yield tuple(row)
                 # advance both
+                lgrp_pending = False
+                rgrp_pending = False
                 lkval, lrowgrp = next(lgit)
+                lgrp_pending = True
                 rkval, rrowgrp = next(rgit)
+                rgrp_pending = True
 
     except StopIteration:
         pass
 
-    # make sure any left rows remaining are yielded
-    if leftouter:
-        if lkval > rkval:
+    # the main loop stops as soon as either side is exhausted; drain whatever
+    # remains, checking cardinality (including for unmatched keys) and, where
+    # this is an outer join, emitting the unmatched rows. Each source is
+    # traversed only once in total.
+    if lgrp_pending:
+        lrowgrp = prepare_lgroup(lkval, lrowgrp)
+        if leftouter and lkval > rkval:
             # yield anything that got left hanging
             for row in joinrows(lrowgrp, None):
                 yield tuple(row)
-        # yield the rest
-        for lkval, lrowgrp in lgit:
+    for lkval, lrowgrp in lgit:
+        lrowgrp = prepare_lgroup(lkval, lrowgrp)
+        if leftouter:
             for row in joinrows(lrowgrp, None):
                 yield tuple(row)
 
-    # make sure any right rows remaining are yielded
-    if rightouter:
-        if lkval < rkval:
+    if rgrp_pending:
+        rrowgrp = prepare_rgroup(rkval, rrowgrp)
+        if rightouter and lkval < rkval:
             # yield anything that got left hanging
             for row in joinrows(None, rrowgrp):
                 yield tuple(row)
-        # yield the rest
-        for rkval, rrowgrp in rgit:
+    for rkval, rrowgrp in rgit:
+        rrowgrp = prepare_rgroup(rkval, rrowgrp)
+        if rightouter:
             for row in joinrows(None, rrowgrp):
                 yield tuple(row)
 

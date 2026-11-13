@@ -10,6 +10,25 @@ class DuplicateKeyError(Exception):
         return 'duplicate key: %r' % (self.key,)
 
 
+class CardinalityViolation(Exception):
+    """Raised when an equi-join cardinality constraint is violated.
+
+    `side` is the side of the join (``'left'`` or ``'right'``) where more
+    than one row was observed for `key`, and `count` is the number of rows
+    observed for that key.
+    """
+
+    def __init__(self, side, key, count):
+        self.side = side
+        self.key = key
+        self.count = count
+
+    def __str__(self):
+        return ('cardinality violation on the %s side: key %r is '
+                'observed %d times, at most one is allowed'
+                % (self.side, self.key, self.count))
+
+
 class FieldSelectionError(Exception):
 
     def __init__(self, value):
