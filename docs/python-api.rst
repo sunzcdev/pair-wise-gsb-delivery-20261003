@@ -451,6 +451,78 @@ Connections using ``autocommit=False`` are not supported because Python keeps a 
 
 Connections using ``autocommit=True`` are also currently rejected because sqlite-utils has not formally exposed that as a supported configuration.
 
+.. _python_api_batch_importer:
+
+Incremental batch importer
+==========================
+
+When importing data incrementally from an external source you need to persist two things together: the records written from the current batch and how far through the source you have read. Writing the data but crashing before recording the position means records get re-read; recording the position but losing the data means records are skipped.
+
+``db.import_batch()`` writes the records, advances the source cursor and records an idempotency ledger entry inside a single transaction, so the two can never diverge:
+
+.. code-block:: python
+
+    db = Database("sync.db")
+    result = db.import_batch(
+        source="github-issues",
+        table="issues",
+        batch_id="batch-0042",
+        expected_old_cursor=db.read_import_cursor("github-issues"),
+        new_cursor="2026-11-13T10:00:00Z",
+        records=iter_records_from_source(),
+        pk="id",
+    )
+
+Arguments:
+
+- ``source`` - a string identifying the upstream system, so several sources can import into the same database independently.
+- ``table`` - the table the records are written to (created on first use, like ``insert_all()``).
+- ``batch_id`` - a caller-chosen idempotency key for this batch, unique per source.
+- ``expected_old_cursor`` - the cursor the caller believes is currently stored. Pass ``None`` for a source that has never been imported.
+- ``new_cursor`` - the cursor to persist once the batch has been written.
+- ``records`` - any iterable of record dictionaries. It is consumed eagerly, so an iterator that raises partway through cannot leave partial data behind.
+- Any extra keyword arguments (``pk``, ``upsert``, ``alter``, ...) are forwarded to ``insert_all()``.
+
+Cursors are treated as opaque strings: they are only ever compared for equality, never sorted or parsed as numbers, so tokens, watermarks or opaque continuation strings all work.
+
+The method returns a ``BatchImportResult`` with the ``source``, ``batch_id``, ``table``, ``old_cursor``, ``new_cursor``, content ``digest``, ``rows_written`` and a ``replayed`` flag.
+
+Idempotent retries and conflicts
+--------------------------------
+
+Each batch's contents are reduced to a SHA-256 digest and stored alongside the batch id. Re-importing the same ``(source, batch_id)`` pair:
+
+- with the same contents returns the original result with ``replayed=True``, writes nothing again and leaves the cursor untouched - this is safe even if the cursor has since advanced, for example when retrying after a crash that happened after the commit;
+- with different contents raises ``BatchConflictError`` and changes nothing.
+
+.. code-block:: python
+    from sqlite_utils import BatchConflictError
+
+    try:
+        db.import_batch(
+            source="github-issues",
+            table="issues",
+            batch_id="batch-0042",
+            expected_old_cursor=stored_cursor,
+            new_cursor=new_cursor,
+            records=records,
+            pk="id",
+        )
+    except BatchConflictError as error:
+        # batch_id was reused for genuinely different records
+        ...
+
+If the cursor stored for the source does not equal ``expected_old_cursor`` the write is refused with ``CursorMismatchError``, which usually means another worker or process imported a competing batch. Both exceptions derive from ``BatchImportError``.
+
+Transaction behavior
+--------------------
+
+With no transaction open, ``import_batch()`` opens one and commits it only once every statement has succeeded. If a constraint fails halfway through a batch, the iterator raises, or any other error occurs, the whole batch - records, ledger entry and cursor update - is rolled back and the cursor stays where it was.
+
+If the caller already has a transaction open (``db.begin()`` or an outer ``db.atomic()``), the method uses a SQLite savepoint instead. It never commits the caller's transaction: rolling back the outer transaction undoes the imported batch as well.
+
+The checkpoints live in two internal tables, ``_sqlite_utils_import_cursors`` and ``_sqlite_utils_import_batches``, so they survive the connection closing. Reopening the database file and calling ``db.read_import_cursor(source)`` and ``db.read_imported_batch(source, batch_id)`` lets a new process verify its checkpoint and resume from it.
+
 .. _python_api_table:
 
 Accessing tables

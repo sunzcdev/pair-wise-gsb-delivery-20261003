@@ -18,6 +18,7 @@ from dataclasses import dataclass, field
 from types import TracebackType
 from typing import (
     Any,
+    TYPE_CHECKING,
     TypeVar,
     Union,
     cast,
@@ -40,6 +41,13 @@ from .create_table_parser import (
     rewrite_check_expression,
     sql_ends_in_line_comment,
 )
+from .importer import (
+    import_batch as _import_batch,
+    read_import_cursor as _read_import_cursor,
+    read_imported_batch as _read_imported_batch,
+)
+if TYPE_CHECKING:
+    from .importer import BatchImportResult
 from .utils import (
     ANY,
     OperationalError,
@@ -715,6 +723,53 @@ class Database:
         """
         if self.conn.in_transaction:
             self.conn.execute("ROLLBACK")
+
+    def import_batch(
+        self,
+        *,
+        source: str,
+        table: str,
+        batch_id: str,
+        expected_old_cursor: str | None,
+        new_cursor: str,
+        records: Iterable[dict[str, Any]],
+        **insert_kwargs: Any,
+    ) -> "BatchImportResult":
+        """
+        Atomically write a batch of records and advance an import cursor.
+
+        Records, the source cursor and the idempotency ledger are updated in a
+        single transaction (a savepoint if the connection already has an open
+        transaction, so a caller transaction is never committed here).
+
+        Reusing ``batch_id`` for ``source`` with identical record contents
+        replays the original result without writing anything; reusing it with
+        different contents raises an error, as does a stored cursor that does
+        not equal ``expected_old_cursor``. Cursors are opaque strings compared
+        by equality only.
+
+        See :ref:`python_api_batch_importer`.
+        """
+        return _import_batch(
+            self,
+            source=source,
+            table=table,
+            batch_id=batch_id,
+            expected_old_cursor=expected_old_cursor,
+            new_cursor=new_cursor,
+            records=records,
+            **insert_kwargs,
+        )
+
+    def read_import_cursor(self, source: str) -> str | None:
+        """Return the persisted cursor for ``source``, or ``None``."""
+        return _read_import_cursor(self, source)
+
+    def read_imported_batch(
+        self, source: str, batch_id: str
+    ) -> "BatchImportResult | None":
+        """Return the recorded result of a previously imported batch, if any."""
+        return _read_imported_batch(self, source, batch_id)
 
     @contextlib.contextmanager
     def ensure_autocommit_on(self) -> Generator[None, None, None]:
