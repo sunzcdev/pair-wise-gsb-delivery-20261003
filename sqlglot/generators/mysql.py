@@ -7,6 +7,7 @@ from sqlglot.dialects.dialect import (
     arrow_json_extract_sql,
     build_date_delta,
     build_date_delta_with_interval,
+    check_date_delta_precision,
     date_add_interval_sql,
     datestrtodate_sql,
     length_or_char_length_sql,
@@ -27,6 +28,21 @@ from sqlglot.dialects.dialect import (
 )
 from sqlglot.generator import unsupported_args
 from collections import defaultdict
+
+# Simple INTERVAL units supported by MySQL's DATE_ADD/DATE_SUB/TIMESTAMPADD/TIMESTAMPDIFF
+INTERVAL_UNITS = frozenset(
+    {
+        "YEAR",
+        "QUARTER",
+        "MONTH",
+        "WEEK",
+        "DAY",
+        "HOUR",
+        "MINUTE",
+        "SECOND",
+        "MICROSECOND",
+    }
+)
 
 
 def _date_trunc_sql(self: MySQLGenerator, expression: exp.DateTrunc) -> str:
@@ -82,6 +98,8 @@ def date_add_sql(
     kind: str,
 ) -> t.Callable[[generator.Generator, exp.Expr], str]:
     def func(self: generator.Generator, expression: exp.Expr) -> str:
+        check_date_delta_precision(self, expression, INTERVAL_UNITS)
+
         return self.func(
             f"DATE_{kind}",
             expression.this,
@@ -89,6 +107,19 @@ def date_add_sql(
         )
 
     return func
+
+
+def _date_diff_sql(self: MySQLGenerator, expression: exp.Expr) -> str:
+    # MySQL's DATEDIFF only computes the number of days between its arguments
+    check_date_delta_precision(self, expression, {"DAY"})
+    return self.func("DATEDIFF", expression.this, expression.expression)
+
+
+def _timestamp_diff_sql(self: MySQLGenerator, expression: exp.Expr) -> str:
+    check_date_delta_precision(self, expression, INTERVAL_UNITS)
+    return self.func(
+        "TIMESTAMPDIFF", unit_to_var(expression), expression.expression, expression.this
+    )
 
 
 _MAKE_INTERVAL_UNIT_ALIASES = {
@@ -164,9 +195,7 @@ class MySQLGenerator(generator.Generator):
         exp.Chr: lambda self, e: self.chr_sql(e, "CHAR"),
         exp.CurrentDate: no_paren_current_date_sql,
         exp.CurrentVersion: rename_func("VERSION"),
-        exp.DateDiff: remove_ts_or_ds_to_date(
-            lambda self, e: self.func("DATEDIFF", e.this, e.expression), ("this", "expression")
-        ),
+        exp.DateDiff: remove_ts_or_ds_to_date(_date_diff_sql, ("this", "expression")),
         exp.DateAdd: date_add_sql("ADD"),
         exp.DateStrToDate: datestrtodate_sql,
         exp.DateSub: date_add_sql("SUB"),
@@ -211,11 +240,9 @@ class MySQLGenerator(generator.Generator):
         exp.SessionUser: lambda *_: "SESSION_USER()",
         exp.TableSample: no_tablesample_sql,
         exp.TimeFromParts: rename_func("MAKETIME"),
-        exp.TimestampAdd: date_add_interval_sql("DATE", "ADD"),
-        exp.TimestampDiff: lambda self, e: self.func(
-            "TIMESTAMPDIFF", unit_to_var(e), e.expression, e.this
-        ),
-        exp.TimestampSub: date_add_interval_sql("DATE", "SUB"),
+        exp.TimestampAdd: date_add_interval_sql("DATE", "ADD", supported_units=INTERVAL_UNITS),
+        exp.TimestampDiff: _timestamp_diff_sql,
+        exp.TimestampSub: date_add_interval_sql("DATE", "SUB", supported_units=INTERVAL_UNITS),
         exp.TimeStrToUnix: rename_func("UNIX_TIMESTAMP"),
         exp.TimeStrToTime: lambda self, e: timestrtotime_sql(
             self,
@@ -231,7 +258,7 @@ class MySQLGenerator(generator.Generator):
         ),
         exp.TryCast: no_trycast_sql,
         exp.TsOrDsAdd: date_add_sql("ADD"),
-        exp.TsOrDsDiff: lambda self, e: self.func("DATEDIFF", e.this, e.expression),
+        exp.TsOrDsDiff: _date_diff_sql,
         exp.TsOrDsToDate: _ts_or_ds_to_date_sql,
         exp.Unicode: lambda self, e: f"ORD(CONVERT({self.sql(e.this)} USING utf32))",
         exp.UnixToTime: _unix_to_time_sql,

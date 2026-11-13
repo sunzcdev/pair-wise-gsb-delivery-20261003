@@ -6,6 +6,7 @@ from sqlglot import exp, generator, transforms
 from sqlglot.dialects.dialect import (
     any_value_to_max_sql,
     arrow_json_extract_sql,
+    check_date_delta_precision,
     count_if_to_sum,
     groupconcat_sql,
     no_ilike_sql,
@@ -17,6 +18,13 @@ from sqlglot.dialects.dialect import (
 )
 from sqlglot.generator import unsupported_args
 from sqlglot.tokens import TokenType
+
+# Modifiers accepted by SQLite's DATE/DATETIME functions
+DATE_MODIFIER_UNITS = frozenset({"YEAR", "MONTH", "DAY", "HOUR", "MINUTE", "SECOND"})
+
+# Units for which the JULIANDAY-based DATEDIFF is exact; coarser calendar units are
+# approximated by a fixed number of days and finer units exceed REAL precision
+DATE_DIFF_UNITS = frozenset({"DAY", "HOUR", "MINUTE", "SECOND", "MILLISECOND"})
 
 
 def _transform_create(expression: exp.Expr) -> exp.Expr:
@@ -266,6 +274,10 @@ class SQLiteGenerator(generator.Generator):
         return arrow_json_extract_sql(self, expression)
 
     def dateadd_sql(self, expression: exp.DateAdd) -> str:
+        check_date_delta_precision(
+            self, expression, DATE_MODIFIER_UNITS, date_input_truncates=True
+        )
+
         modifier = expression.expression
         unit = expression.args.get("unit")
         # An INTERVAL amount carries its own unit, e.g. DATE_ADD(d, INTERVAL 1 DAY);
@@ -363,6 +375,8 @@ class SQLiteGenerator(generator.Generator):
         return sql
 
     def datediff_sql(self, expression: exp.DateDiff) -> str:
+        check_date_delta_precision(self, expression, DATE_DIFF_UNITS)
+
         unit = expression.args.get("unit")
         unit = unit.name.upper() if unit else "DAY"
 

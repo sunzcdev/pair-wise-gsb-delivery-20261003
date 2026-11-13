@@ -52,6 +52,23 @@ DATE_ADD_OR_SUB = t.Union[
     exp.TimestampSub,
     exp.TsOrDsAdd,
 ]
+
+# Interval units whose length depends on the calendar, so they can't be losslessly
+# expressed as a fixed count of smaller units (e.g. a month is not a fixed number of days)
+CALENDAR_INTERVAL_UNITS = frozenset({"YEAR", "QUARTER", "MONTH"})
+
+# Fixed-duration interval units and their length in nanoseconds
+FIXED_INTERVAL_UNITS = {
+    "WEEK": 604800000000000,
+    "DAY": 86400000000000,
+    "HOUR": 3600000000000,
+    "MINUTE": 60000000000,
+    "SECOND": 1000000000,
+    "MILLISECOND": 1000000,
+    "MICROSECOND": 1000,
+    "NANOSECOND": 1,
+}
+
 JSON_EXTRACT_TYPE = t.Union[
     exp.JSONExtract, exp.JSONExtractScalar, exp.JSONBExtract, exp.JSONBExtractScalar
 ]
@@ -1975,13 +1992,84 @@ def date_trunc_to_time(args: BuilderArgs) -> exp.DateTrunc | exp.TimestampTrunc:
     return exp.TimestampTrunc(this=this, unit=unit)
 
 
-def date_add_interval_sql(data_type: str, kind: str) -> t.Callable[[Generator, exp.Expr], str]:
+def date_add_interval_sql(
+    data_type: str, kind: str, supported_units: t.Container[str] | None = None
+) -> t.Callable[[Generator, exp.Expr], str]:
     def func(self: Generator, expression: exp.Expr) -> str:
+        if supported_units is not None:
+            check_date_delta_precision(self, expression, supported_units)
+
         this = self.sql(expression, "this")
         interval = exp.Interval(this=expression.expression, unit=unit_to_var(expression))
         return f"{data_type}_{kind}({this}, {self.sql(interval)})"
 
     return func
+
+
+def check_date_delta_precision(
+    self: Generator,
+    expression: exp.Expr,
+    supported_units: t.Container[str],
+    date_input_truncates: bool = False,
+) -> None:
+    """
+    Flags date arithmetic that can only be approximated when targeting a dialect.
+
+    Emits an unsupported diagnostic (raised in strict mode, i.e. when the generator's
+    unsupported_level is ErrorLevel.RAISE) if the interval unit of a date add/subtract
+    or difference can't be preserved: calendar units (e.g. MONTH) must not degrade to
+    a fixed number of days and fractional-second precision must not be silently
+    truncated. Parameterized units and amounts are not evaluated at transpile time,
+    and inputs of unknown type are not assumed to be dates.
+
+    Args:
+        self: the generator instance.
+        expression: the date delta/diff expression being generated.
+        supported_units: the interval units the target expression can represent exactly.
+        date_input_truncates: whether the target expression truncates sub-day offsets
+            when its input is known to be a DATE.
+    """
+    unit = expression.args.get("unit")
+    delta = expression.args.get("expression")
+    if unit is None and isinstance(delta, exp.Interval):
+        # e.g. DATE_ADD(x, INTERVAL 1 DAY) parsed with the unit inside the interval
+        unit = delta.args.get("unit")
+
+    if not isinstance(unit, (exp.Var, exp.Literal)):
+        return
+
+    unit_name = unit.name.upper()
+    if unit_name not in CALENDAR_INTERVAL_UNITS and unit_name not in FIXED_INTERVAL_UNITS:
+        singular = unit_name.removesuffix("S")
+        if singular in CALENDAR_INTERVAL_UNITS or singular in FIXED_INTERVAL_UNITS:
+            unit_name = singular
+        else:
+            return
+
+    dialect_name = self.dialect.__class__.__name__
+    if unit_name not in supported_units:
+        if unit_name in CALENDAR_INTERVAL_UNITS:
+            self.unsupported(
+                f"Calendar interval unit '{unit_name}' cannot be preserved when targeting "
+                f"{dialect_name}; it would be approximated by a fixed number of days"
+            )
+        else:
+            self.unsupported(
+                f"Interval unit '{unit_name}' cannot be preserved when targeting "
+                f"{dialect_name}; its precision would be lost"
+            )
+
+    if (
+        date_input_truncates
+        and unit_name in FIXED_INTERVAL_UNITS
+        and FIXED_INTERVAL_UNITS[unit_name] < FIXED_INTERVAL_UNITS["DAY"]
+    ):
+        this = expression.args.get("this")
+        if this is not None and this.is_type(exp.DType.DATE):
+            self.unsupported(
+                f"Interval unit '{unit_name}' cannot be preserved when targeting "
+                f"{dialect_name}; the input is a DATE, so the sub-day offset would be truncated"
+            )
 
 
 def timestamptrunc_sql(

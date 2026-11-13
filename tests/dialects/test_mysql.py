@@ -1,7 +1,7 @@
 import unittest
 import sys
 
-from sqlglot import UnsupportedError, expressions as exp
+from sqlglot import ErrorLevel, UnsupportedError, expressions as exp, parse_one
 from sqlglot.dialects.mysql import MySQL
 from sqlglot.optimizer.annotate_types import annotate_types
 from tests.dialects.test_dialect import Validator
@@ -56,6 +56,42 @@ class TestMySQL(Validator):
                 "mysql": "SELECT DATE_ADD('2024-01-01', INTERVAL 1 DAY) - DATE_ADD('2024-01-01', INTERVAL 1 DAY)",
                 "duckdb": "SELECT CAST('2024-01-01' AS TIMESTAMP) + INTERVAL 1 DAY - (CAST('2024-01-01' AS TIMESTAMP) + INTERVAL 1 DAY)",
             },
+        )
+
+    def test_date_delta_precision(self):
+        # Calendar units are preserved as-is: a month is never rewritten as a fixed
+        # number of days, so month-end arithmetic keeps its meaning
+        self.validate_identity("SELECT DATE_ADD('2024-01-31', INTERVAL '1' MONTH)")
+        self.validate_identity("SELECT DATE_SUB('2024-03-31', INTERVAL '1' MONTH)")
+
+        # Negative interval amounts round-trip unchanged
+        self.validate_identity("SELECT DATE_ADD(x, INTERVAL '-1' DAY)")
+        self.validate_identity("SELECT DATE_SUB(x, INTERVAL '-1' DAY)")
+
+        # Parameterized microsecond amounts are emitted without being evaluated
+        self.validate_identity("SELECT DATE_ADD(x, INTERVAL (?) MICROSECOND)")
+        self.validate_identity("SELECT TIMESTAMPDIFF(MICROSECOND, a, b)")
+
+        # Units MySQL can't express are rejected in strict mode, indicating the
+        # precision that would be lost
+        for unit in ("NANOSECOND", "MILLISECOND"):
+            with self.subTest(unit), self.assertRaises(UnsupportedError) as cm:
+                parse_one(f"SELECT DATEADD({unit.lower()}, 1, x)", read="tsql").sql(
+                    "mysql", unsupported_level=ErrorLevel.RAISE
+                )
+            self.assertIn(unit, str(cm.exception))
+
+        # A DATEDIFF unit other than DAY would be silently dropped by MySQL's DATEDIFF
+        with self.assertRaises(UnsupportedError) as cm:
+            parse_one("SELECT DATEDIFF(hour, a, b)", read="tsql").sql(
+                "mysql", unsupported_level=ErrorLevel.RAISE
+            )
+        self.assertIn("HOUR", str(cm.exception))
+
+        # Outside strict mode the approximation is still generated
+        self.assertEqual(
+            parse_one("SELECT DATEDIFF(hour, a, b)", read="tsql").sql("mysql"),
+            "SELECT DATEDIFF(CAST(b AS DATETIME), CAST(a AS DATETIME))",
         )
 
     def test_xor_precedence(self):
