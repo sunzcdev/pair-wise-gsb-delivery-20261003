@@ -15,6 +15,10 @@ import typing as t
 
 from sqlglot import expressions as exp
 from sqlglot.dialects.dialect import Dialect as Dialect, Dialects as Dialects
+from sqlglot.dialect_compare import (
+    DialectComparisonReport as DialectComparisonReport,
+    compare_dialects as compare_dialects,
+)
 from sqlglot.diff import diff as diff
 from sqlglot.errors import (
     ErrorLevel as ErrorLevel,
