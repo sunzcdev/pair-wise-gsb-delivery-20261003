@@ -1,6 +1,17 @@
 Changes
 =======
 
+Version 1.7.33
+--------------
+
+* Add an optional atomic publishing mode to the ``tee...()`` functions
+  writing local files. With ``atomic=True``, rows are written to an
+  independent temporary file that is only moved into place once the table
+  has been fully iterated and the file has been closed without error, so
+  early abandonment or upstream or serialization failures never leave a
+  truncated target file or clobber an existing one. Supported by
+  ``teecsv()``, ``teetsv()``, ``teetext()`` and the new ``teejson()``.
+
 Version 1.7.32
 --------------
 

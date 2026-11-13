@@ -164,6 +164,7 @@ JSON files
 .. autofunction:: petl.io.json.fromdicts
 .. autofunction:: petl.io.json.tojson
 .. autofunction:: petl.io.json.tojsonarrays
+.. autofunction:: petl.io.json.teejson
 
 .. module:: petl.io.streams
 .. _io_helpers:

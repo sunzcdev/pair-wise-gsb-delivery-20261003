@@ -167,16 +167,28 @@ Table.appendtsv = appendtsv
 
 
 def teecsv(table, source=None, encoding=None, errors='strict', write_header=True,
-           **csvargs):
+           atomic=False, **csvargs):
     """
     Returns a table that writes rows to a CSV file as they are iterated over.
+
+    If `atomic` is True and `source` is a local file, rows are written to a
+    temporary file which is only moved into place once the table has been
+    fully iterated and the file has been closed without error, so the target
+    file never appears truncated. If iteration is abandoned early or fails,
+    the temporary file is removed and any existing target file is left
+    untouched. Each iteration of the returned table uses an independent
+    temporary file.
+
+    .. versionchanged:: 1.7.33
+
+    Added the `atomic` keyword argument.
 
     """
 
     source = write_source_from_arg(source)
     csvargs.setdefault('dialect', 'excel')
     return teecsv_impl(table, source=source, encoding=encoding,
-                       errors=errors, write_header=write_header,
+                       errors=errors, write_header=write_header, atomic=atomic,
                        **csvargs)
 
 
@@ -184,7 +196,7 @@ Table.teecsv = teecsv
 
 
 def teetsv(table, source=None, encoding=None, errors='strict', write_header=True,
-           **csvargs):
+           atomic=False, **csvargs):
     """
     Convenience function, as :func:`petl.io.csv.teecsv` but with different
     default dialect (tab delimited).
@@ -193,7 +205,7 @@ def teetsv(table, source=None, encoding=None, errors='strict', write_header=True
 
     csvargs.setdefault('dialect', 'excel-tab')
     return teecsv(table, source=source, encoding=encoding, errors=errors,
-                  write_header=write_header, **csvargs)
+                  write_header=write_header, atomic=atomic, **csvargs)
 
 
 Table.teetsv = teetsv

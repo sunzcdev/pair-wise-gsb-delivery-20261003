@@ -10,7 +10,8 @@ from petl.compat import next, PY2, text_type
 # internal dependencies
 from petl.util.base import Table, asdict
 from petl.io.base import getcodec
-from petl.io.sources import read_source_from_arg, write_source_from_arg
+from petl.io.sources import read_source_from_arg, write_source_from_arg, \
+    open_for_write
 
 
 def fromtext(source=None, encoding=None, errors='strict', strip=None,
@@ -218,15 +219,28 @@ def _writetext(table, source, mode, encoding, errors, template, prologue,
 
 
 def teetext(table, source=None, encoding=None, errors='strict', template=None,
-            prologue=None, epilogue=None):
+            prologue=None, epilogue=None, atomic=False):
     """
     Return a table that writes rows to a text file as they are iterated over.
+
+    If `atomic` is True and `source` is a local file, rows are written to a
+    temporary file which is only moved into place once the table has been
+    fully iterated and the file has been closed without error, so the target
+    file never appears truncated. If iteration is abandoned early or fails,
+    the temporary file is removed and any existing target file is left
+    untouched. Each iteration of the returned table uses an independent
+    temporary file.
+
+    .. versionchanged:: 1.7.33
+
+    Added the `atomic` keyword argument.
 
     """
 
     assert template is not None, 'template is required'
     return TeeTextView(table, source=source, encoding=encoding, errors=errors,
-                       template=template, prologue=prologue, epilogue=epilogue)
+                       template=template, prologue=prologue, epilogue=epilogue,
+                       atomic=atomic)
 
 
 Table.teetext = teetext
@@ -235,7 +249,7 @@ Table.teetext = teetext
 class TeeTextView(Table):
 
     def __init__(self, table, source=None, encoding=None, errors='strict',
-                 template=None, prologue=None, epilogue=None):
+                 template=None, prologue=None, epilogue=None, atomic=False):
         self.table = table
         self.source = source
         self.encoding = encoding
@@ -243,14 +257,16 @@ class TeeTextView(Table):
         self.template = template
         self.prologue = prologue
         self.epilogue = epilogue
+        self.atomic = atomic
 
     def __iter__(self):
         return _iterteetext(self.table, self.source, self.encoding,
                             self.errors, self.template, self.prologue,
-                            self.epilogue)
+                            self.epilogue, self.atomic)
 
 
-def _iterteetext(table, source, encoding, errors, template, prologue, epilogue):
+def _iterteetext(table, source, encoding, errors, template, prologue, epilogue,
+                 atomic=False):
 
     # guard conditions
     assert template is not None, 'template is required'
@@ -258,7 +274,7 @@ def _iterteetext(table, source, encoding, errors, template, prologue, epilogue):
     # prepare source
     source = write_source_from_arg(source)
 
-    with source.open('wb') as buf:
+    with open_for_write(source, 'wb', atomic) as buf:
 
         # deal with text encoding
         if PY2:

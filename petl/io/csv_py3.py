@@ -5,6 +5,7 @@ import logging
 
 
 from petl.util.base import Table, data
+from petl.io.sources import open_for_write
 
 
 logger = logging.getLogger(__name__)
@@ -70,16 +71,17 @@ def teecsv_impl(table, source, **kwargs):
 class TeeCSVView(Table):
 
     def __init__(self, table, source=None, encoding=None,
-                 errors='strict', write_header=True, **csvargs):
+                 errors='strict', write_header=True, atomic=False, **csvargs):
         self.table = table
         self.source = source
         self.write_header = write_header
         self.encoding = encoding
         self.errors = errors
+        self.atomic = atomic
         self.csvargs = csvargs
 
     def __iter__(self):
-        with self.source.open('wb') as buf:
+        with open_for_write(self.source, 'wb', self.atomic) as buf:
             # wrap buffer for text IO
             csvfile = io.TextIOWrapper(buf, encoding=self.encoding,
                                        errors=self.errors, newline='')

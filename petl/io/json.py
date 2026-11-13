@@ -12,9 +12,10 @@ from tempfile import NamedTemporaryFile
 
 from petl.compat import PY2
 from petl.compat import pickle
-from petl.io.sources import read_source_from_arg, write_source_from_arg
+from petl.io.sources import read_source_from_arg, write_source_from_arg, \
+    open_for_write
 # internal dependencies
-from petl.util.base import data, Table, dicts as _dicts
+from petl.util.base import data, Table, asdict, dicts as _dicts
 
 
 def fromjson(source, *args, **kwargs):
@@ -494,3 +495,112 @@ def _writeobj(encoder, obj, f, prefix, suffix, lines=False):
             f.write(chunk)
     if suffix is not None:
         f.write(suffix)
+
+
+def teejson(table, source=None, prefix=None, suffix=None, atomic=False,
+            *args, **kwargs):
+    """
+    Return a table that writes rows to a JSON file as they are iterated
+    over, with rows output as JSON objects. E.g.::
+
+        >>> import petl as etl
+        >>> table1 = [['foo', 'bar'],
+        ...           ['a', 1],
+        ...           ['b', 2],
+        ...           ['c', 2]]
+        >>> table2 = etl.teejson(table1, 'example.file5.json', sort_keys=True)
+        >>> # consume table2 so the file gets written
+        ... for row in table2:
+        ...     pass
+        >>> # see what was written
+        ... print(open('example.file5.json').read())
+        [{"bar": 1, "foo": "a"}, {"bar": 2, "foo": "b"}, {"bar": 2, "foo": "c"}]
+
+    Setting argument `lines` to `True` will enable writing as a JSON lines
+    document, one JSON object per line. For more details about JSON lines
+    please visit https://jsonlines.org/.
+
+    If `atomic` is True and `source` is a local file, rows are written to a
+    temporary file which is only moved into place once the table has been
+    fully iterated and the file has been closed without error, so the target
+    file never appears truncated. If iteration is abandoned early or fails,
+    the temporary file is removed and any existing target file is left
+    untouched. Each iteration of the returned table uses an independent
+    temporary file.
+
+    Additional keyword arguments are passed to
+    :class:`json.encoder.JSONEncoder`.
+
+    .. versionadded:: 1.7.33
+
+    """
+
+    return TeeJsonView(table, source=source, prefix=prefix, suffix=suffix,
+                       atomic=atomic, *args, **kwargs)
+
+
+Table.teejson = teejson
+
+
+class TeeJsonView(Table):
+
+    def __init__(self, table, source=None, prefix=None, suffix=None,
+                 atomic=False, *args, **kwargs):
+        self.table = table
+        self.source = source
+        self.prefix = prefix
+        self.suffix = suffix
+        self.atomic = atomic
+        self.args = args
+        self.kwargs = kwargs
+
+    def __iter__(self):
+        source = write_source_from_arg(self.source)
+        kwargs = dict(self.kwargs)
+        lines = kwargs.pop('lines', False)
+        encoder = JSONEncoder(*self.args, **kwargs)
+        with open_for_write(source, 'wb', self.atomic) as buf:
+            if PY2:
+                f = buf
+            else:
+                # wrap buffer for text IO
+                f = io.TextIOWrapper(buf, encoding='utf-8', newline='',
+                                     write_through=True)
+            try:
+                if self.prefix is not None:
+                    f.write(self.prefix)
+                it = iter(self.table)
+                try:
+                    hdr = next(it)
+                except StopIteration:
+                    hdr = None
+                if hdr is None:
+                    if not lines:
+                        f.write('[]')
+                else:
+                    yield tuple(hdr)
+                    if not lines:
+                        f.write('[')
+                    first = True
+                    for row in it:
+                        rec = asdict(hdr, row)
+                        if lines:
+                            for chunk in encoder.iterencode(rec):
+                                f.write(chunk)
+                            f.write('\n')
+                        else:
+                            if first:
+                                first = False
+                            else:
+                                f.write(', ')
+                            for chunk in encoder.iterencode(rec):
+                                f.write(chunk)
+                        yield tuple(row)
+                    if not lines:
+                        f.write(']')
+                if self.suffix is not None:
+                    f.write(self.suffix)
+                f.flush()
+            finally:
+                if not PY2:
+                    f.detach()

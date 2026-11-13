@@ -6,6 +6,7 @@ import os
 import io
 import gzip
 import sys
+import tempfile
 import zipfile
 from contextlib import closing, contextmanager
 import subprocess
@@ -26,6 +27,15 @@ logger = logging.getLogger(__name__)
 warning = logger.warning
 info = logger.info
 debug = logger.debug
+
+
+if PY2:
+    def _replace(src, dst):
+        if os.path.exists(dst):
+            os.remove(dst)
+        os.rename(src, dst)
+else:
+    _replace = os.replace
 
 
 class FileSource(object):
@@ -338,6 +348,69 @@ class CompressedSource(object):
             transcoder = self.codec(filehandle)
             with transcoder.open(mode=mode) as stream:
                 yield stream
+
+
+def _remove_quietly(filename):
+    try:
+        os.remove(filename)
+    except OSError:
+        pass
+
+
+@contextmanager
+def atomic_open(source, mode='wb'):
+    '''
+    Open a local file source for writing via a temporary file, so the final
+    file only appears if the block completes without error.
+
+    The data is written to an independent temporary file in the same
+    directory as the target file. Only when the block exits normally, i.e.,
+    the upstream data was fully consumed and the stream was flushed and
+    closed without error, is the temporary file moved into place, replacing
+    any previous file at the target location. If the block is abandoned
+    early or raises an exception, the temporary file is removed and any
+    existing target file is left untouched.
+
+    .. versionadded:: 1.7.33
+    '''
+    filename = getattr(source, 'filename', None)
+    remote = getattr(source, 'remote', False)
+    if not filename or remote:
+        raise ArgumentError('atomic publishing is only supported for local '
+                            'file sources, found %r' % (source,))
+    dirname = os.path.dirname(os.path.abspath(filename))
+    fd, tmpname = tempfile.mkstemp(
+        prefix=os.path.basename(filename) + '.', suffix='.tmp', dir=dirname)
+    os.close(fd)
+    kwargs = getattr(source, 'kwargs', {})
+    tmp_source = type(source)(tmpname, **kwargs)
+    completed = False
+    try:
+        with tmp_source.open(mode) as buf:
+            yield buf
+        completed = True
+    finally:
+        if completed:
+            try:
+                _replace(tmpname, filename)
+            except Exception:
+                _remove_quietly(tmpname)
+                raise
+        else:
+            _remove_quietly(tmpname)
+
+
+def open_for_write(source, mode='wb', atomic=False):
+    '''
+    Return a context manager opening `source` for writing.
+
+    If `atomic` is True, the write goes through a temporary file that is
+    only moved into place on successful completion, see
+    :func:`atomic_open`. Otherwise the source is opened directly.
+    '''
+    if atomic:
+        return atomic_open(source, mode)
+    return source.open(mode)
 
 
 _invalid_source_msg = 'invalid source argument, expected None or a string or ' \
