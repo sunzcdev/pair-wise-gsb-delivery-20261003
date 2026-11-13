@@ -29,6 +29,10 @@ class Node:
     source_name: str = ""
     reference_node_name: str = ""
 
+    # False when the node depends on an unresolved star, i.e. the catalog was
+    # incomplete (partial_catalog mode) so the lineage is known to be incomplete
+    complete: bool = True
+
     # Caller-injected per-node data, populated via the `on_node` hook on lineage()
     payload: dict[str, t.Any] = field(default_factory=dict)
 

@@ -4,6 +4,7 @@ import itertools
 import re
 import typing as t
 from collections import Counter
+from dataclasses import dataclass
 
 from sqlglot import alias, exp
 from sqlglot.dialects.dialect import AliasPrecedence, Dialect, DialectType, UsingColumnOrder
@@ -28,6 +29,37 @@ if t.TYPE_CHECKING:
 
 GROUPING_CONTAINERS = (exp.Group, exp.GroupingSets, exp.Cube, exp.Rollup, exp.Tuple, exp.Paren)
 
+# Meta key under which partial-catalog qualification records the stars it couldn't expand
+UNRESOLVED_STARS_META_KEY = "unresolved_stars"
+
+
+@dataclass
+class UnresolvedStar:
+    """
+    A star that couldn't be expanded because the catalog is missing entries.
+
+    Attributes:
+        scope: The scope containing the unresolved star.
+        source: The name of the source the star belongs to in that scope.
+        expression: The star expression preserved in the AST, e.g. `tbl.*`.
+        missing: Catalog entries (qualified table names) needed to resolve the star.
+    """
+
+    scope: Scope
+    source: str
+    expression: exp.Expr
+    missing: list[str]
+
+    def __deepcopy__(self, memo: t.Any) -> UnresolvedStar:
+        # Records point back into the analyzed AST through `scope`; copying them would
+        # recurse through the whole tree, so they are shared instead
+        return self
+
+
+def unresolved_stars(expression: exp.Expr) -> list[UnresolvedStar]:
+    """Return the unresolved stars recorded on `expression` by a partial-catalog qualification."""
+    return expression.meta_get(UNRESOLVED_STARS_META_KEY) or []
+
 
 def qualify_columns(
     expression: E,
@@ -35,6 +67,7 @@ def qualify_columns(
     expand_alias_refs: bool = True,
     expand_stars: bool = True,
     allow_partial_qualification: bool = False,
+    partial_catalog: bool = False,
     dialect: DialectType = None,
 ) -> E:
     """
@@ -55,6 +88,17 @@ def qualify_columns(
             for most of the optimizer's rules to work; do not set to False unless you
             know what you're doing!
         allow_partial_qualification: Whether to allow partial qualification.
+        partial_catalog: Whether to tolerate an incomplete catalog when expanding stars.
+            When True, columns of sources present in the catalog are qualified and
+            expanded normally, while stars over sources missing from the catalog are
+            preserved as unresolved parts (e.g. `tbl.*`) instead of blocking the
+            expansion. The unresolved parts are reported as `UnresolvedStar` records in
+            the root expression's meta under "unresolved_stars", and each affected SELECT
+            is marked with its own records, so output schema and lineage consumers can
+            flag the incompleteness. Stars guarded by USING, EXCEPT, RENAME, REPLACE or
+            ILIKE are never expanded partially, since that would require guessing column
+            order or attribution. Re-running with a completed catalog re-expands the
+            preserved stars; no state from the partial run leaks into the later analysis.
 
     Returns:
         The qualified expression.
@@ -73,12 +117,19 @@ def qualify_columns(
     # Qualified scopes that still lack types, in traversal order (sources precede dependents)
     unannotated_scopes: list[Scope] = []
 
+    # Stars that couldn't be expanded because the catalog is missing entries
+    unresolved: list[UnresolvedStar] = []
+
     for scope in traverse_scope(expression):
         if dialect.PREFER_CTE_ALIAS_COLUMN:
             pushdown_cte_alias_columns(scope)
 
         scope_expression = scope.expression
         is_select = isinstance(scope_expression, exp.Select)
+
+        if is_select and scope_expression.meta_get(UNRESOLVED_STARS_META_KEY) is not None:
+            # Drop markers left by a previous partial-catalog run over the same AST
+            scope_expression.meta.pop(UNRESOLVED_STARS_META_KEY, None)
 
         _separate_pseudocolumns(scope, pseudocolumns)
 
@@ -89,7 +140,9 @@ def qualify_columns(
         _pop_table_column_aliases(scope.ctes)
         _pop_table_column_aliases(scope.derived_tables)
 
-        using_column_tables, using_columns = _expand_using(scope, resolver)
+        using_column_tables, using_columns = _expand_using(
+            scope, resolver, partial_catalog=partial_catalog
+        )
 
         if dialect.FORCE_EARLY_ALIAS_REF_EXPANSION and expand_alias_refs:
             _expand_alias_refs(
@@ -118,6 +171,8 @@ def qualify_columns(
                 pseudocolumns,
                 annotator,
                 unannotated_scopes,
+                partial_catalog=partial_catalog,
+                unresolved_stars=unresolved if partial_catalog else None,
             )
 
         # HAVING precedence can depend on positional GROUP BY targets within a star.
@@ -137,6 +192,11 @@ def qualify_columns(
             annotator.annotate_scope(scope)
         elif dialect.SUPPORTS_STRUCT_STAR_EXPANSION:
             unannotated_scopes.append(scope)
+
+    if unresolved:
+        expression.meta[UNRESOLVED_STARS_META_KEY] = unresolved
+    elif expression.meta_get(UNRESOLVED_STARS_META_KEY) is not None:
+        expression.meta.pop(UNRESOLVED_STARS_META_KEY, None)
 
     return expression
 
@@ -222,7 +282,9 @@ def _pop_table_column_aliases(derived_tables: Iterable[exp.Expr]) -> None:
             table_alias.set("columns", None)
 
 
-def _expand_using(scope: Scope, resolver: Resolver) -> tuple[dict[str, t.Any], list[str]]:
+def _expand_using(
+    scope: Scope, resolver: Resolver, partial_catalog: bool = False
+) -> tuple[dict[str, t.Any], list[str]]:
     columns = {}
 
     def _update_source_columns(source_name: str) -> None:
@@ -232,6 +294,11 @@ def _expand_using(scope: Scope, resolver: Resolver) -> tuple[dict[str, t.Any], l
 
     joins = list(scope.find_all(exp.Join))
     if not joins:
+        return {}, []
+
+    if partial_catalog and resolver.has_unknown_sources:
+        # Without the full catalog, USING columns can't be attributed or ordered
+        # reliably, so leave the joins untouched for a later, complete analysis
         return {}, []
 
     names = {join.alias_or_name for join in joins}
@@ -1151,6 +1218,8 @@ def _expand_stars(
     pseudocolumns: set[str],
     annotator: TypeAnnotator,
     unannotated_scopes: list[Scope],
+    partial_catalog: bool = False,
+    unresolved_stars: list[UnresolvedStar] | None = None,
 ) -> None:
     """Expand stars to lists of column selections"""
 
@@ -1181,6 +1250,29 @@ def _expand_stars(
         for pivot in scope.pivots
     ):
         return
+
+    def record_unresolved_star(
+        source_name: str, source: exp.Table | Scope | None, star_expression: exp.Expr
+    ) -> None:
+        if unresolved_stars is None:
+            return
+        missing = [exp.table_name(source)] if isinstance(source, exp.Table) else []
+        record = UnresolvedStar(
+            scope=scope, source=source_name, expression=star_expression, missing=missing
+        )
+        unresolved_stars.append(record)
+        marked = scope_expression.meta_get(UNRESOLVED_STARS_META_KEY) or []
+        scope_expression.meta[UNRESOLVED_STARS_META_KEY] = [*marked, record]
+
+    if partial_catalog:
+        # USING/NATURAL joins left unconverted because of the incomplete catalog can't
+        # contribute their column ordering or coalescing to a partial expansion either
+        has_unexpanded_using = any(
+            join.args.get("using") or join.method == "NATURAL"
+            for join in scope_expression.find_all(exp.Join)
+        )
+    else:
+        has_unexpanded_using = False
 
     for expression in scope_expression.selects:
         tables: list[str] = []
@@ -1231,7 +1323,15 @@ def _expand_stars(
             new_selections.append(expression)
             continue
 
+        # Stars guarded by these operators can't be expanded partially: without the full
+        # catalog, applying them would mean guessing column order or attribution
+        star_args = (
+            expression.args if is_unqualified_star else getattr(expression.this, "args", {})
+        )
+        guarded_star = any(star_args.get(arg) for arg in ("except_", "replace", "rename", "ilike"))
+
         start = len(new_selections)
+        keep_whole_star = False
         # The selections of the USING columns, which go first, in order
         using_selections: dict[str, exp.Expr | None] = (
             dict.fromkeys(using_columns) if is_unqualified_star else {}
@@ -1270,6 +1370,7 @@ def _expand_stars(
                 if source is None:
                     # An unknown source may own the star, so it's preserved instead of expanded
                     new_selections.append(expression)
+                    record_unresolved_star(table, None, expression)
                     break
 
             columns = source_resolver.get_source_columns(source_table, only_visible=True)
@@ -1282,7 +1383,29 @@ def _expand_stars(
             # colliding star-expanded columns), expanding this star would produce ambiguous
             # projections, so we leave it unexpanded.
             if not columns or "*" in columns or len(columns) != len(set(columns)):
-                return
+                if not partial_catalog:
+                    return
+
+                if guarded_star or (
+                    is_unqualified_star
+                    and (using_columns or using_column_tables or has_unexpanded_using)
+                ):
+                    # Roll back this star's partial expansion and keep it untouched
+                    del new_selections[start:]
+                    new_selections.append(expression)
+                    record_unresolved_star(table, source, expression)
+                    keep_whole_star = True
+                    break
+
+                # Keep the unknown source's star as an unresolved part, expanding the rest
+                kept_star: exp.Expr = (
+                    exp.Column(this=exp.Star(), table=exp.to_identifier(table))
+                    if is_unqualified_star
+                    else expression
+                )
+                new_selections.append(kept_star)
+                record_unresolved_star(table, source, kept_star)
+                continue
 
             table_id = id(table)
             columns_to_exclude = except_columns.get(table_id) or set()
@@ -1367,7 +1490,8 @@ def _expand_stars(
                 else:
                     new_selections.append(selection)
 
-        new_selections[start:start] = [s for s in using_selections.values() if s is not None]
+        if not keep_whole_star:
+            new_selections[start:start] = [s for s in using_selections.values() if s is not None]
 
     # Ensures we don't overwrite the initial selections with an empty list
     if new_selections and isinstance(scope_expression, exp.Select):

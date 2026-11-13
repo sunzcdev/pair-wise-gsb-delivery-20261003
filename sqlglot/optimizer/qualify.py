@@ -27,6 +27,7 @@ def qualify(
     isolate_tables: bool = False,
     qualify_columns: bool = True,
     allow_partial_qualification: bool = False,
+    partial_catalog: bool = False,
     validate_qualify_columns: bool = True,
     quote_identifiers: bool = True,
     identify: bool = True,
@@ -58,6 +59,10 @@ def qualify(
         isolate_tables: Whether to isolate table selects.
         qualify_columns: Whether to qualify columns.
         allow_partial_qualification: Whether to allow partial qualification.
+        partial_catalog: Whether to tolerate an incomplete catalog when expanding stars.
+            Stars over sources missing from the catalog are preserved as unresolved parts
+            and reported as `UnresolvedStar` records in the returned expression's meta
+            under "unresolved_stars"; each affected SELECT is marked likewise.
         validate_qualify_columns: Whether to validate columns.
         quote_identifiers: Whether to run the quote_identifiers step.
             This step is necessary to ensure correctness for case sensitive queries.
@@ -99,6 +104,7 @@ def qualify(
             expand_alias_refs=expand_alias_refs,
             expand_stars=expand_stars,
             allow_partial_qualification=allow_partial_qualification,
+            partial_catalog=partial_catalog,
         )
 
     if quote_identifiers:
