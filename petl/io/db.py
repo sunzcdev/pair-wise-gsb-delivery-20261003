@@ -233,7 +233,7 @@ def _iter_sqlalchemy_session(session, query, *args, **kwargs):
 
 def todb(table, dbo, tablename, schema=None, commit=True,
          create=False, drop=False, constraints=True, metadata=None,
-         dialect=None, sample=1000, truncate=True):
+         dialect=None, sample=1000, truncate=True, max_params=None):
     """
     Load data into an existing database table via a DB-API 2.0
     connection or cursor. By default the database table will be truncated,
@@ -323,6 +323,18 @@ def todb(table, dbo, tablename, schema=None, commit=True,
         If True (the default) truncate the table before loading, deleting any
         existing rows. Set to False to keep existing rows and append the new
         data instead.
+    max_params : int, optional
+        Maximum number of bind parameters (placeholders) allowed in a single
+        insert statement, e.g., to stay within a database driver's limit.
+        When given, rows are inserted in batches sized from the number of
+        columns actually written and the placeholders in each insert
+        statement, so that no statement exceeds this budget. Fields not
+        written to the database are not counted. An
+        :class:`petl.errors.ArgumentError` is raised before any SQL is
+        executed if a single row already exceeds the budget. Batching does
+        not change transaction ownership: the load is still committed (or
+        not) according to `commit`, and a caller-owned transaction is never
+        committed or rolled back on its behalf.
 
     .. note::
 
@@ -376,7 +388,7 @@ def todb(table, dbo, tablename, schema=None, commit=True,
                          constraints=constraints, metadata=metadata,
                          dialect=dialect, sample=sample)
         _todb(table, dbo, tablename, schema=schema, commit=commit,
-              truncate=truncate)
+              truncate=truncate, max_params=max_params)
 
     finally:
         if needs_closing:
@@ -386,7 +398,8 @@ def todb(table, dbo, tablename, schema=None, commit=True,
 Table.todb = todb
 
 
-def _todb(table, dbo, tablename, schema=None, commit=True, truncate=False):
+def _todb(table, dbo, tablename, schema=None, commit=True, truncate=False,
+          max_params=None):
 
     # need to deal with polymorphic dbo argument
     # what sort of duck is it?
@@ -394,43 +407,48 @@ def _todb(table, dbo, tablename, schema=None, commit=True, truncate=False):
     if _is_clikchouse_dbapi_connection(dbo):
         debug('assuming %r is clickhosue DB-API 2.0 connection', dbo)
         _todb_clikchouse_dbapi_connection(table, dbo, tablename, schema=schema,
-                               commit=commit, truncate=truncate)
+                               commit=commit, truncate=truncate,
+                               max_params=max_params)
 
     # does it quack like a standard DB-API 2.0 connection?
     elif _is_dbapi_connection(dbo):
         debug('assuming %r is standard DB-API 2.0 connection', dbo)
         _todb_dbapi_connection(table, dbo, tablename, schema=schema,
-                               commit=commit, truncate=truncate)
+                               commit=commit, truncate=truncate,
+                               max_params=max_params)
 
     # does it quack like a standard DB-API 2.0 cursor?
     elif _is_dbapi_cursor(dbo):
         debug('assuming %r is standard DB-API 2.0 cursor')
         _todb_dbapi_cursor(table, dbo, tablename, schema=schema, commit=commit,
-                           truncate=truncate)
+                           truncate=truncate, max_params=max_params)
 
     # does it quack like an SQLAlchemy engine?
     elif _is_sqlalchemy_engine(dbo):
         debug('assuming %r instance of sqlalchemy.engine.base.Engine', dbo)
         _todb_sqlalchemy_engine(table, dbo, tablename, schema=schema,
-                                commit=commit, truncate=truncate)
+                                commit=commit, truncate=truncate,
+                                max_params=max_params)
 
     # does it quack like an SQLAlchemy session?
     elif _is_sqlalchemy_session(dbo):
         debug('assuming %r instance of sqlalchemy.orm.session.Session', dbo)
         _todb_sqlalchemy_session(table, dbo, tablename, schema=schema,
-                                 commit=commit, truncate=truncate)
+                                 commit=commit, truncate=truncate,
+                                 max_params=max_params)
 
     # does it quack like an SQLAlchemy connection?
     elif _is_sqlalchemy_connection(dbo):
         debug('assuming %r instance of sqlalchemy.engine.base.Connection', dbo)
         _todb_sqlalchemy_connection(table, dbo, tablename, schema=schema,
-                                    commit=commit, truncate=truncate)
+                                    commit=commit, truncate=truncate,
+                                    max_params=max_params)
 
     elif callable(dbo):
         debug('assuming %r is a function returning standard DB-API 2.0 cursor '
               'objects', dbo)
         _todb_dbapi_mkcurs(table, dbo, tablename, schema=schema, commit=commit,
-                           truncate=truncate)
+                           truncate=truncate, max_params=max_params)
 
     # some other sort of duck...
     else:
@@ -439,6 +457,35 @@ def _todb(table, dbo, tablename, schema=None, commit=True, truncate=False):
 
 SQL_TRUNCATE_QUERY = 'DELETE FROM %s'
 SQL_INSERT_QUERY = 'INSERT INTO %s (%s) VALUES (%s)'
+
+
+def _resolve_insert_batch_size(max_params, colnames, tablename):
+    # Number of rows per insert statement under the bind parameter budget,
+    # based on the columns actually written and the placeholders each
+    # statement needs. Returns None when there is no budget.
+    if max_params is None:
+        return None
+    ncols = len(colnames)
+    if ncols > max_params:
+        raise ArgumentError(
+            'cannot load table %s: a single row needs %d bind parameters, '
+            'which exceeds the parameter budget max_params=%r'
+            % (tablename, ncols, max_params))
+    return max_params // ncols
+
+
+def _executemany_batched(cursor, query, it, batch_size):
+    if batch_size is None:
+        cursor.executemany(query, it)
+        return
+    batch = []
+    for row in it:
+        batch.append(row)
+        if len(batch) >= batch_size:
+            cursor.executemany(query, batch)
+            batch = []
+    if batch:
+        cursor.executemany(query, batch)
 
 
 def _close_load_cursor(cursor, load_failed):
@@ -451,7 +498,7 @@ def _close_load_cursor(cursor, load_failed):
 
 
 def _todb_dbapi_connection(table, connection, tablename, schema=None,
-                           commit=True, truncate=False):
+                           commit=True, truncate=False, max_params=None):
 
     # sanitise table name
     tablename = _quote(tablename)
@@ -469,6 +516,10 @@ def _todb_dbapi_connection(table, connection, tablename, schema=None,
     # determine paramstyle and build placeholders string
     placeholders = _placeholders(connection, colnames)
     debug('placeholders: %r', placeholders)
+
+    # check the parameter budget before any SQL is executed
+    batch_size = _resolve_insert_batch_size(max_params, colnames, tablename)
+    debug('insert batch size: %r', batch_size)
 
     # get a cursor
     cursor = connection.cursor()
@@ -489,7 +540,7 @@ def _todb_dbapi_connection(table, connection, tablename, schema=None,
         insertcolnames = ', '.join(colnames)
         insertquery = SQL_INSERT_QUERY % (tablename, insertcolnames, placeholders)
         debug('insert data via query %r' % insertquery)
-        cursor.executemany(insertquery, it)
+        _executemany_batched(cursor, insertquery, it, batch_size)
         load_failed = False
     finally:
         if cursor is not None:
@@ -502,7 +553,7 @@ def _todb_dbapi_connection(table, connection, tablename, schema=None,
 
 
 def _todb_clikchouse_dbapi_connection(table, connection, tablename, schema=None,
-                           commit=True, truncate=False):
+                           commit=True, truncate=False, max_params=None):
 
     # sanitise table name
     tablename = _quote(tablename)
@@ -520,6 +571,10 @@ def _todb_clikchouse_dbapi_connection(table, connection, tablename, schema=None,
     # determine paramstyle and build placeholders string
     placeholders = _placeholders(connection, colnames)
     debug('placeholders: %r', placeholders)
+
+    # check the parameter budget before any SQL is executed
+    batch_size = _resolve_insert_batch_size(max_params, colnames, tablename)
+    debug('insert batch size: %r', batch_size)
 
     # get a cursor
     cursor = connection.cursor()
@@ -540,7 +595,7 @@ def _todb_clikchouse_dbapi_connection(table, connection, tablename, schema=None,
         insertcolnames = ', '.join(colnames)
         insertquery = 'INSERT INTO %s (%s) VALUES' % (tablename, insertcolnames)
         debug('insert data via query %r' % insertquery)
-        cursor.executemany(insertquery, it)
+        _executemany_batched(cursor, insertquery, it, batch_size)
         load_failed = False
     finally:
         if cursor is not None:
@@ -553,7 +608,7 @@ def _todb_clikchouse_dbapi_connection(table, connection, tablename, schema=None,
 
 
 def _todb_dbapi_mkcurs(table, mkcurs, tablename, schema=None, commit=True,
-                       truncate=False):
+                       truncate=False, max_params=None):
 
     # sanitise table name
     tablename = _quote(tablename)
@@ -567,6 +622,10 @@ def _todb_dbapi_mkcurs(table, mkcurs, tablename, schema=None, commit=True,
     flds = list(map(text_type, hdr))
     colnames = [_quote(n) for n in flds]
     debug('column names: %r', colnames)
+
+    # check the parameter budget before any SQL is executed
+    batch_size = _resolve_insert_batch_size(max_params, colnames, tablename)
+    debug('insert batch size: %r', batch_size)
 
     debug('obtain cursor and connection')
     cursor = mkcurs()
@@ -596,7 +655,7 @@ def _todb_dbapi_mkcurs(table, mkcurs, tablename, schema=None, commit=True,
         insertcolnames = ', '.join(colnames)
         insertquery = SQL_INSERT_QUERY % (tablename, insertcolnames, placeholders)
         debug('insert data via query %r' % insertquery)
-        cursor.executemany(insertquery, it)
+        _executemany_batched(cursor, insertquery, it, batch_size)
         load_failed = False
     finally:
         if cursor is not None:
@@ -608,7 +667,7 @@ def _todb_dbapi_mkcurs(table, mkcurs, tablename, schema=None, commit=True,
 
 
 def _todb_dbapi_cursor(table, cursor, tablename, schema=None, commit=True,
-                       truncate=False):
+                       truncate=False, max_params=None):
 
     # sanitise table name
     tablename = _quote(tablename)
@@ -633,6 +692,10 @@ def _todb_dbapi_cursor(table, cursor, tablename, schema=None, commit=True,
     placeholders = _placeholders(connection, colnames)
     debug('placeholders: %r', placeholders)
 
+    # check the parameter budget before any SQL is executed
+    batch_size = _resolve_insert_batch_size(max_params, colnames, tablename)
+    debug('insert batch size: %r', batch_size)
+
     if truncate:
         # TRUNCATE is not supported in some databases and causing locks with
         # MySQL used via SQLAlchemy, fall back to DELETE FROM for now
@@ -643,7 +706,7 @@ def _todb_dbapi_cursor(table, cursor, tablename, schema=None, commit=True,
     insertcolnames = ', '.join(colnames)
     insertquery = SQL_INSERT_QUERY % (tablename, insertcolnames, placeholders)
     debug('insert data via query %r' % insertquery)
-    cursor.executemany(insertquery, it)
+    _executemany_batched(cursor, insertquery, it, batch_size)
 
     # N.B., don't close the cursor, leave that to the application
 
@@ -653,15 +716,16 @@ def _todb_dbapi_cursor(table, cursor, tablename, schema=None, commit=True,
 
 
 def _todb_sqlalchemy_engine(table, engine, tablename, schema=None, commit=True,
-                            truncate=False):
+                            truncate=False, max_params=None):
 
     with engine.connect() as connection:
         _todb_sqlalchemy_connection(table, connection, tablename,
-                                    schema=schema, commit=commit, truncate=truncate)
+                                    schema=schema, commit=commit,
+                                    truncate=truncate, max_params=max_params)
 
 
 def _todb_sqlalchemy_connection(table, connection, tablename, schema=None,
-                                commit=True, truncate=False):
+                                commit=True, truncate=False, max_params=None):
 
     debug('connection: %r', connection)
 
@@ -677,6 +741,10 @@ def _todb_sqlalchemy_connection(table, connection, tablename, schema=None,
     flds = list(map(text_type, hdr))
     colnames = [_quote(n) for n in flds]
     debug('column names: %r', colnames)
+
+    # rows are inserted one per statement, so check the parameter budget
+    # against a single row before any SQL is executed
+    _resolve_insert_batch_size(max_params, colnames, tablename)
 
     # N.B., we need to obtain a reference to the underlying DB-API connection so
     # we can import the module and determine the paramstyle
@@ -707,20 +775,23 @@ def _todb_sqlalchemy_connection(table, connection, tablename, schema=None,
 
 
 def _todb_sqlalchemy_session(table, session, tablename, schema=None,
-                             commit=True, truncate=False):
+                             commit=True, truncate=False, max_params=None):
 
     with _sqlalchemy_transaction(session, commit):
         _todb_sqlalchemy_connection(table, session.connection(), tablename,
                                     schema=schema, commit=False,
-                                    truncate=truncate)
+                                    truncate=truncate, max_params=max_params)
 
 
-def appenddb(table, dbo, tablename, schema=None, commit=True):
+def appenddb(table, dbo, tablename, schema=None, commit=True, max_params=None):
     """
     Load data into an existing database table via a DB-API 2.0
     connection or cursor. As :func:`petl.io.db.todb` except that the database
     table will be appended, i.e., the new data will be inserted into the
     table, and any existing rows will remain.
+
+    The optional `max_params` argument limits the number of bind parameters
+    per insert statement, see :func:`petl.io.db.todb` for details.
 
     """
 
@@ -734,7 +805,7 @@ def appenddb(table, dbo, tablename, schema=None, commit=True):
 
     try:
         _todb(table, dbo, tablename, schema=schema, commit=commit,
-              truncate=False)
+              truncate=False, max_params=max_params)
 
     finally:
         if needs_closing:

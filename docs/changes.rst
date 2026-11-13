@@ -4,6 +4,14 @@ Changes
 Version 1.7.32
 --------------
 
+* Add an optional ``max_params`` parameter budget to ``todb()`` and
+  ``appenddb()`` so loads into wide tables batch rows by the number of
+  columns actually written and the placeholders in each insert statement,
+  keeping every statement within the driver's bind parameter limit. A single
+  row exceeding the budget raises an error before any SQL is executed, and
+  transaction ownership is unchanged: a caller's transaction is never
+  committed or rolled back on its behalf.
+
 * Preserve explicit iterator headers across repeated passes in ``fromtext()``.
   By :user:`IlyaKhalafi`.
 
