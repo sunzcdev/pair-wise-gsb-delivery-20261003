@@ -3,6 +3,7 @@ from __future__ import annotations
 import unittest
 
 import sqlglot
+from sqlglot.errors import SqlglotError
 from sqlglot.lineage import lineage
 from sqlglot.schema import MappingSchema
 
@@ -1379,3 +1380,168 @@ class TestLineage(unittest.TestCase):
                 seen.add(id(node))
         for nid in seen:
             self.assertEqual(counts.get(nid, 0), 1)
+
+    def test_lineage_insert_select(self) -> None:
+        # Explicit target column list: binding is positional, so swapped
+        # output aliases still map to the right target columns.
+        result = lineage(
+            None,
+            "INSERT INTO t (a, b) SELECT y AS x, x AS y FROM s",
+            schema={"s": {"x": "int", "y": "int"}},
+        )
+        self.assertEqual(set(result), {"a", "b"})
+        self.assertEqual([d.name for d in result["a"].downstream], ["s.y"])
+        self.assertEqual([d.name for d in result["b"].downstream], ["s.x"])
+
+        # Single column form: the root node is named after the target column.
+        node = lineage(
+            "b",
+            "INSERT INTO t (a, b) SELECT x, y FROM s",
+            schema={"s": {"x": "int", "y": "int"}},
+        )
+        self.assertEqual(node.name, "b")
+        self.assertEqual(node.source.sql(), "SELECT s.y AS y FROM s AS s")
+        self.assertEqual([d.name for d in node.downstream], ["s.y"])
+
+        # The passed-in AST is not modified.
+        sql = "INSERT INTO t (a) SELECT x FROM s"
+        ast = sqlglot.parse_one(sql)
+        lineage("a", ast, schema={"s": {"x": "int"}})
+        self.assertEqual(ast.sql(), sql)
+
+    def test_lineage_insert_select_target_schema(self) -> None:
+        # Without an explicit column list, the target columns come from the schema.
+        result = lineage(
+            None,
+            "INSERT INTO t SELECT x, y FROM s",
+            schema={"t": {"a": "int", "b": "int"}, "s": {"x": "int", "y": "int"}},
+        )
+        self.assertEqual(set(result), {"a", "b"})
+        self.assertEqual([d.name for d in result["a"].downstream], ["s.x"])
+
+        with self.assertRaises(SqlglotError) as ctx:
+            lineage(None, "INSERT INTO t SELECT x, y FROM s", schema={"s": {"x": "int"}})
+        self.assertIn("Cannot infer the target columns of 't'", str(ctx.exception))
+
+    def test_lineage_insert_select_errors(self) -> None:
+        schema = {"t": {"a": "int", "b": "int"}, "s": {"x": "int", "y": "int"}}
+
+        # Column count mismatch between the target list and the query output.
+        with self.assertRaises(SqlglotError) as ctx:
+            lineage(None, "INSERT INTO t (a) SELECT x, y FROM s", schema=schema)
+        self.assertIn("2 query output column(s) to 1 target column(s)", str(ctx.exception))
+
+        # Unexpandable star: the output columns can't be counted or named.
+        with self.assertRaises(SqlglotError) as ctx:
+            lineage(None, "INSERT INTO t SELECT * FROM s", schema={"t": {"a": "int"}})
+        self.assertIn("unexpanded '*'", str(ctx.exception))
+
+        # Unknown target column.
+        with self.assertRaises(SqlglotError) as ctx:
+            lineage("c", "INSERT INTO t (a, b) SELECT x, y FROM s", schema=schema)
+        self.assertIn("Cannot find column 'c' in the target columns of 't'", str(ctx.exception))
+
+    def test_lineage_create_table_as_select(self) -> None:
+        # CTAS needs no target schema: the query output names become the columns.
+        result = lineage(
+            None,
+            "CREATE TABLE t AS SELECT x AS a, y AS b FROM s",
+            schema={"s": {"x": "int", "y": "int"}},
+        )
+        self.assertEqual(set(result), {"a", "b"})
+        self.assertEqual([d.name for d in result["a"].downstream], ["s.x"])
+
+        # An explicit column list binds positionally instead.
+        result = lineage(
+            None,
+            "CREATE TABLE t (a, b) AS SELECT y, x FROM s",
+            schema={"s": {"x": "int", "y": "int"}},
+        )
+        self.assertEqual([d.name for d in result["a"].downstream], ["s.y"])
+        self.assertEqual([d.name for d in result["b"].downstream], ["s.x"])
+
+        # Duplicate output names are ambiguous as target columns.
+        with self.assertRaises(SqlglotError) as ctx:
+            lineage(
+                None,
+                "CREATE TABLE t AS SELECT x AS c, y AS c FROM s",
+                schema={"s": {"x": "int", "y": "int"}},
+            )
+        self.assertIn("duplicate target column name(s)", str(ctx.exception))
+
+        with self.assertRaises(SqlglotError) as ctx:
+            lineage(
+                None,
+                "CREATE TABLE t (a) AS SELECT x, y FROM s",
+                schema={"s": {"x": "int", "y": "int"}},
+            )
+        self.assertIn("2 query output column(s) to 1 target column(s)", str(ctx.exception))
+
+    def test_lineage_insert_values(self) -> None:
+        # VALUES is a write with no query source: no source tables are attached.
+        result = lineage(None, "INSERT INTO t (a, b) VALUES (1, 2)", schema={})
+        self.assertEqual(set(result), {"a", "b"})
+        for name, value in (("a", "1"), ("b", "2")):
+            node = result[name]
+            self.assertEqual(node.expression.sql(), value)
+            self.assertEqual(node.source.sql(), "VALUES (1, 2)")
+            self.assertEqual(node.downstream, [])
+
+        # Without a column list the target columns come from the schema.
+        node = lineage(
+            "b", "INSERT INTO t VALUES (1, 2)", schema={"t": {"a": "int", "b": "int"}}
+        )
+        self.assertEqual(node.name, "b")
+        self.assertEqual(node.expression.sql(), "2")
+
+        with self.assertRaises(SqlglotError) as ctx:
+            lineage(None, "INSERT INTO t (a, b) VALUES (1)", schema={})
+        self.assertIn("1 value(s) to 2 target column(s)", str(ctx.exception))
+
+    def test_lineage_insert_default_values(self) -> None:
+        # DEFAULT VALUES is a write with no query source either.
+        result = lineage(None, "INSERT INTO t DEFAULT VALUES", schema={"t": {"a": "int"}})
+        self.assertEqual(set(result), {"a"})
+        self.assertEqual(result["a"].downstream, [])
+
+        with self.assertRaises(SqlglotError) as ctx:
+            lineage(None, "INSERT INTO t DEFAULT VALUES", schema={})
+        self.assertIn("Cannot infer the target columns of 't'", str(ctx.exception))
+
+    def test_lineage_insert_select_cte_shadowing(self) -> None:
+        # The CTE shadows the schema table of the same name.
+        node = lineage(
+            "a",
+            "WITH s AS (SELECT 1 AS x) INSERT INTO t (a) SELECT x FROM s",
+            schema={"s": {"x": "int"}},
+        )
+        self.assertEqual(node.name, "a")
+        self.assertEqual(node.downstream[0].source.sql(), "SELECT 1 AS x")
+
+    def test_lineage_insert_select_union(self) -> None:
+        # UNION branches are bound by column position, not by name.
+        result = lineage(
+            None,
+            "INSERT INTO t (a, b) SELECT x, y FROM s1 UNION SELECT y, x FROM s2",
+            schema={
+                "s1": {"x": "int", "y": "int"},
+                "s2": {"x": "int", "y": "int"},
+            },
+        )
+        self.assertEqual(set(result), {"a", "b"})
+        self.assertEqual(
+            sorted(d.name for d in result["a"].walk()), ["0", "0", "a", "s1.x", "s2.y"]
+        )
+        self.assertEqual(
+            sorted(d.name for d in result["b"].walk()), ["1", "1", "b", "s1.y", "s2.x"]
+        )
+
+    def test_lineage_insert_select_duplicate_aliases(self) -> None:
+        # Duplicate aliases in the source query are handled positionally.
+        result = lineage(
+            None,
+            "INSERT INTO t (a, b) SELECT x AS c, y AS c FROM s",
+            schema={"s": {"x": "int", "y": "int"}},
+        )
+        self.assertEqual([d.name for d in result["a"].downstream], ["s.x"])
+        self.assertEqual([d.name for d in result["b"].downstream], ["s.y"])

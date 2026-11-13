@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import logging
 import typing as t
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 
 from sqlglot import Schema, exp, maybe_parse
 from sqlglot.errors import SqlglotError
@@ -108,6 +108,14 @@ def lineage(
     If `column` is None, returns a dict mapping every top-level output column name
     to its lineage Node (with a shared cache so cross-column work is deduplicated).
 
+    INSERT ... SELECT and CREATE TABLE ... AS SELECT statements are also supported:
+    the target table's columns are bound to the query's output columns by position,
+    so each returned Node is named after a target column and its downstream is the
+    source graph of the corresponding output column. When the target column list is
+    not explicit, it is taken from the target table's schema (for INSERT) or from
+    the query's output column names (for CREATE TABLE AS SELECT). INSERT ... VALUES
+    and INSERT ... DEFAULT VALUES are represented as writes with no query source.
+
     Args:
         column: The column to build the lineage for. Pass None to get all output columns.
         sql: The SQL string or expression.
@@ -127,7 +135,39 @@ def lineage(
     """
     expression = maybe_parse(sql, copy=copy, dialect=dialect)
 
-    if sources:
+    write: exp.Insert | exp.Create | None = None
+    target_table: exp.Table | None = None
+    target_columns: list[str] | None = None
+
+    if isinstance(expression, exp.Insert) or (
+        isinstance(expression, exp.Create)
+        and expression.kind == "TABLE"
+        and expression.expression is not None
+    ):
+        target = expression.this
+        if isinstance(target, exp.Schema):
+            target_table = t.cast(exp.Table, target.this)
+            target_columns = [
+                normalize_identifiers.normalize_identifiers(e.name, dialect=dialect).name
+                for e in target.expressions
+            ]
+        elif isinstance(target, exp.Table):
+            target_table = target
+
+        if target_table is not None:
+            write = expression
+            query = expression.expression
+            if isinstance(query, exp.Query):
+                # A leading WITH is attached to the INSERT, not to the query itself
+                with_ = write.args.get("with_")
+                if with_ is not None and not query.args.get("with_"):
+                    query.set("with_", with_)
+                expression = query
+            else:
+                # VALUES or DEFAULT VALUES: a write with no query source
+                expression = None
+
+    if sources and expression is not None:
         expression = exp.expand(
             expression,
             {
@@ -139,6 +179,21 @@ def lineage(
         )
 
     schema = ensure_schema(schema, dialect=dialect)
+
+    if write is not None:
+        return _write_lineage(
+            column,
+            write,
+            t.cast(t.Optional[exp.Query], expression),
+            target_table,
+            target_columns,
+            schema=schema,
+            dialect=dialect,
+            scope=scope,
+            trim_selects=trim_selects,
+            on_node=on_node,
+            **kwargs,
+        )
 
     if not scope:
         expression = qualify.qualify(
@@ -195,6 +250,165 @@ def lineage(
         )
 
     return result
+
+
+def _write_lineage(
+    column: str | exp.Column | None,
+    write: exp.Insert | exp.Create,
+    query: exp.Query | None,
+    target_table: exp.Table,
+    target_columns: list[str] | None,
+    schema: Schema,
+    dialect: DialectType,
+    scope: Scope | None,
+    trim_selects: bool,
+    on_node: t.Callable[[Node], None] | None,
+    **kwargs,
+) -> Node | dict[str, Node]:
+    """Build the lineage graph for an INSERT or CREATE TABLE AS SELECT write.
+
+    Target columns are bound to the query's output columns by position, following
+    SQL semantics, so each returned Node is named after a target column and its
+    downstream is the source graph of the corresponding output column.
+    """
+    target_name = target_table.name
+
+    if query is None:
+        # VALUES or DEFAULT VALUES: a write with no query source, so no source
+        # tables are attached to the graph
+        columns = target_columns or schema.column_names(target_table, dialect=dialect)
+        if not columns:
+            raise SqlglotError(
+                f"Cannot infer the target columns of '{target_name}': provide an explicit "
+                "target column list or add the table to the schema."
+            )
+
+        values = write.expression if isinstance(write.expression, exp.Values) else None
+        rows = values.expressions if values else []
+
+        for row in rows:
+            if len(row.expressions) != len(columns):
+                raise SqlglotError(
+                    f"Cannot map {len(row.expressions)} value(s) to "
+                    f"{len(columns)} target column(s) of '{target_name}'."
+                )
+
+        def value_node(index: int) -> Node:
+            if values and rows:
+                source: exp.Expr = values
+                value = rows[0].expressions[index]
+            else:
+                source = write
+                value = exp.Null()
+
+            node = Node(name=columns[index], source=source, expression=value)
+            for row in rows:
+                for c in find_all_in_scope(row.expressions[index], exp.Column):
+                    placeholder = exp.Placeholder()
+                    leaf = Node(
+                        name=c.sql(comments=False), source=placeholder, expression=placeholder
+                    )
+                    node.downstream.append(leaf)
+                    if on_node:
+                        on_node(leaf)
+
+            if on_node:
+                on_node(node)
+            return node
+
+        if column is not None:
+            column_name = normalize_identifiers.normalize_identifiers(
+                column, dialect=dialect
+            ).name
+            if column_name not in columns:
+                raise SqlglotError(
+                    f"Cannot find column '{column_name}' in the target columns of '{target_name}'."
+                )
+            return value_node(columns.index(column_name))
+
+        return {name: value_node(index) for index, name in enumerate(columns)}
+
+    if not scope:
+        query = qualify.qualify(
+            query,
+            dialect=dialect,
+            schema=schema,
+            **{"validate_qualify_columns": False, "identify": False, **kwargs},  # type: ignore
+        )
+        scope = build_scope(query)
+
+    if not scope:
+        raise SqlglotError("Cannot build lineage, sql must be a query")
+
+    selectable = t.cast(exp.Selectable, scope.expression)
+    selects = selectable.selects
+
+    if selectable.is_star:
+        raise SqlglotError(
+            f"Cannot map the target columns of '{target_name}': the query contains an "
+            "unexpanded '*', provide the source schema so it can be resolved."
+        )
+
+    columns = target_columns
+    if columns is None:
+        if isinstance(write, exp.Insert):
+            columns = schema.column_names(target_table, dialect=dialect)
+            if not columns:
+                raise SqlglotError(
+                    f"Cannot infer the target columns of '{target_name}': provide an explicit "
+                    "target column list or add the table to the schema."
+                )
+        else:
+            # CREATE TABLE AS SELECT without an explicit column list: the query's
+            # output column names become the target table's columns
+            columns = [select.alias_or_name for select in selects]
+            unnamed = [
+                select.sql(dialect=dialect) for select, name in zip(selects, columns) if not name
+            ]
+            if unnamed:
+                raise SqlglotError(
+                    f"Cannot fetch lineage for unnamed projection: {', '.join(unnamed)}."
+                )
+
+    if len(columns) != len(selects):
+        raise SqlglotError(
+            f"Cannot map {len(selects)} query output column(s) to "
+            f"{len(columns)} target column(s) of '{target_name}'."
+        )
+
+    duplicates = {name for name in columns if columns.count(name) > 1}
+    if duplicates:
+        raise SqlglotError(
+            f"Cannot map to duplicate target column name(s) of '{target_name}': "
+            f"{', '.join(sorted(duplicates))}."
+        )
+
+    cache: dict[tuple, Node] = {}
+    scope_meta: dict[int, tuple[bool, dict[str, exp.Expr]]] = {}
+
+    def query_node(index: int) -> Node:
+        node = to_node(
+            index,
+            t.cast(Scope, scope),
+            dialect,
+            trim_selects=trim_selects,
+            schema=schema,
+            _cache=cache,
+            _scope_meta=scope_meta,
+            on_node=on_node,
+        )
+        # Rename the root after the target column it feeds
+        return replace(node, name=columns[index])
+
+    if column is not None:
+        column_name = normalize_identifiers.normalize_identifiers(column, dialect=dialect).name
+        if column_name not in columns:
+            raise SqlglotError(
+                f"Cannot find column '{column_name}' in the target columns of '{target_name}'."
+            )
+        return query_node(columns.index(column_name))
+
+    return {name: query_node(index) for index, name in enumerate(columns)}
 
 
 def to_node(
