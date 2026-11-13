@@ -197,6 +197,15 @@ Deduplicating rows
 .. autofunction:: petl.transform.dedup.isunique
 
 
+.. module:: petl.transform.runs
+.. _transform_runs:
+
+Run-length encoding
+-------------------
+
+.. autofunction:: petl.transform.runs.runlength
+
+
 .. module:: petl.transform.reductions
 .. _transform_reductions:
 
