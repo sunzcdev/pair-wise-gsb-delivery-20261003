@@ -7,7 +7,7 @@ from decimal import Decimal
 from agate import Table
 from agate.aggregations import (IQR, MAD, All, Any, Count, Deciles, First, HasNulls, Max, MaxLength, MaxPrecision,
                                 Mean, Median, Min, Mode, Percentiles, PopulationStDev, PopulationVariance, Quartiles,
-                                Quintiles, StDev, Sum, Summary, Variance)
+                                Quintiles, StDev, Sum, Summary, Variance, WeightedQuantile)
 from agate.data_types import Boolean, DateTime, Number, Text, TimeDelta
 from agate.exceptions import DataTypeError
 from agate.utils import Quantiles
@@ -797,6 +797,128 @@ class TestNumberAggregation(unittest.TestCase):
 
     def test_deciles_all_nulls(self):
         self.assertEqual(Deciles('four').run(self.table), Quantiles([None] * 11))
+
+    def test_weighted_quantile(self):
+        rows = [
+            (Decimal('3'), Decimal('1')),
+            (Decimal('1'), Decimal('1')),
+            (Decimal('2'), Decimal('1')),
+            (Decimal('2'), Decimal('2')),
+        ]
+
+        table = Table(rows, ['value', 'weight'], [self.number_type, self.number_type])
+        aggregation = WeightedQuantile('value', 'weight', 0.5)
+
+        self.assertIsInstance(aggregation.get_aggregate_data_type(table), Number)
+        self.assertEqual(aggregation.run(table), Decimal('2'))
+        self.assertEqual(WeightedQuantile('value', 'weight', 0).run(table), Decimal('1'))
+        self.assertEqual(WeightedQuantile('value', 'weight', 1).run(table), Decimal('3'))
+        self.assertEqual(WeightedQuantile('value', 'weight', 0.2).run(table), Decimal('1'))
+        self.assertEqual(WeightedQuantile('value', 'weight', 0.21).run(table), Decimal('2'))
+        self.assertEqual(WeightedQuantile('value', 'weight', 0.8).run(table), Decimal('2'))
+        self.assertEqual(WeightedQuantile('value', 'weight', 0.81).run(table), Decimal('3'))
+
+    def test_weighted_quantile_zero_weights(self):
+        rows = [
+            (Decimal('1'), Decimal('0')),
+            (Decimal('2'), Decimal('0')),
+            (Decimal('3'), Decimal('1')),
+        ]
+
+        table = Table(rows, ['value', 'weight'], [self.number_type, self.number_type])
+
+        self.assertEqual(WeightedQuantile('value', 'weight', 0).run(table), Decimal('3'))
+        self.assertEqual(WeightedQuantile('value', 'weight', 0.5).run(table), Decimal('3'))
+        self.assertEqual(WeightedQuantile('value', 'weight', 1).run(table), Decimal('3'))
+
+    def test_weighted_quantile_no_usable_rows(self):
+        rows = [
+            (Decimal('1'), Decimal('0')),
+            (None, Decimal('1')),
+            (Decimal('2'), None),
+        ]
+
+        table = Table(rows, ['value', 'weight'], [self.number_type, self.number_type])
+
+        with warnings.catch_warnings():
+            warnings.simplefilter('ignore')
+            self.assertIsNone(WeightedQuantile('value', 'weight').validate(table))
+
+        self.assertIsNone(WeightedQuantile('value', 'weight').run(table))
+
+    def test_weighted_quantile_invalid_weights(self):
+        for weight in [Decimal('-1'), Decimal('Infinity'), Decimal('-Infinity'), Decimal('NaN')]:
+            table = Table(
+                [(Decimal('1'), weight)],
+                ['value', 'weight'],
+                [self.number_type, self.number_type]
+            )
+
+            with self.assertRaises(ValueError):
+                WeightedQuantile('value', 'weight').run(table)
+
+    def test_weighted_quantile_null_policy(self):
+        rows = [
+            (Decimal('1'), Decimal('1')),
+            (None, Decimal('1')),
+            (Decimal('2'), None),
+            (Decimal('3'), Decimal('1')),
+        ]
+
+        table = Table(rows, ['value', 'weight'], [self.number_type, self.number_type])
+
+        with self.assertWarns(NullCalculationWarning):
+            WeightedQuantile('value', 'weight', 0.5).validate(table)
+
+        self.assertEqual(WeightedQuantile('value', 'weight', 0.5).run(table), Decimal('1'))
+
+        with self.assertRaises(ValueError):
+            WeightedQuantile('value', 'weight', 0.5, missing='error').validate(table)
+
+        with self.assertRaises(ValueError):
+            WeightedQuantile('value', 'weight', 0.5, missing='error').run(table)
+
+    def test_weighted_quantile_invalid_quantile(self):
+        for quantile in [-0.1, 1.1, Decimal('NaN'), Decimal('Infinity')]:
+            with self.assertRaises(ValueError):
+                WeightedQuantile('value', 'weight', quantile)
+
+    def test_weighted_quantile_invalid_columns(self):
+        table = Table(
+            [('a', Decimal('1'))],
+            ['value', 'weight'],
+            [self.text_type, self.number_type]
+        )
+
+        with self.assertRaises(DataTypeError):
+            WeightedQuantile('value', 'weight').validate(table)
+
+        table = Table(
+            [(Decimal('1'), 'a')],
+            ['value', 'weight'],
+            [self.number_type, self.text_type]
+        )
+
+        with self.assertRaises(DataTypeError):
+            WeightedQuantile('value', 'weight').validate(table)
+
+    def test_weighted_quantile_time_delta(self):
+        rows = [
+            (datetime.timedelta(seconds=30), Decimal('1')),
+            (datetime.timedelta(seconds=10), Decimal('1')),
+            (datetime.timedelta(seconds=20), Decimal('2')),
+        ]
+
+        table = Table(
+            rows,
+            ['value', 'weight'],
+            [TimeDelta(), self.number_type]
+        )
+        aggregation = WeightedQuantile('value', 'weight', 0.5)
+
+        self.assertIsInstance(aggregation.get_aggregate_data_type(table), TimeDelta)
+        self.assertIsInstance(aggregation.run(table), datetime.timedelta)
+        self.assertEqual(aggregation.run(table), datetime.timedelta(seconds=20))
 
 
 class TestTextAggregation(unittest.TestCase):

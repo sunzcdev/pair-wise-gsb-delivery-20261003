@@ -2,7 +2,7 @@ from collections import OrderedDict
 from decimal import Decimal
 
 from agate import Table, TableSet
-from agate.aggregations import Count, MaxLength, Mean, Min, Sum
+from agate.aggregations import Count, MaxLength, Mean, Min, Sum, WeightedQuantile
 from agate.data_types import Number, Text
 from agate.exceptions import DataTypeError
 from agate.testcase import AgateTestCase
@@ -92,6 +92,54 @@ class TestAggregate(AgateTestCase):
             ('table1', 3, 6),
             ('table2', 3, 7),
             ('table3', 3, 6)
+        ])
+
+    def test_aggregate_weighted_quantile_reuses_aggregation_without_state(self):
+        tables = OrderedDict([
+            ('one', Table(
+                [(Decimal('1'), Decimal('1')), (Decimal('2'), Decimal('1'))],
+                ['value', 'weight'],
+                [self.number_type, self.number_type]
+            )),
+            ('two', Table(
+                [(Decimal('101'), Decimal('1')), (Decimal('102'), Decimal('1'))],
+                ['value', 'weight'],
+                [self.number_type, self.number_type]
+            ))
+        ])
+
+        tableset = TableSet(tables.values(), tables.keys())
+        aggregation = WeightedQuantile('value', 'weight', 0.5)
+
+        new_table = tableset.aggregate([
+            ('weighted_quantile', aggregation)
+        ])
+
+        self.assertRows(new_table, [
+            ('one', 1),
+            ('two', 101)
+        ])
+
+    def test_aggregate_weighted_quantile_empty_groups_return_none(self):
+        tables = OrderedDict([
+            ('empty', Table([], ['value', 'weight'], [self.number_type, self.number_type])),
+            ('zero', Table(
+                [(Decimal('1'), Decimal('0'))],
+                ['value', 'weight'],
+                [self.number_type, self.number_type]
+            ))
+        ])
+
+        tableset = TableSet(tables.values(), tables.keys())
+        aggregation = WeightedQuantile('value', 'weight', 0.5)
+
+        new_table = tableset.aggregate([
+            ('weighted_quantile', aggregation)
+        ])
+
+        self.assertRows(new_table, [
+            ('empty', None),
+            ('zero', None)
         ])
 
     def test_aggregate_min(self):

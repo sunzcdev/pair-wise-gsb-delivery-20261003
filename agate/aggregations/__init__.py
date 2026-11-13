@@ -29,7 +29,7 @@ from agate.aggregations.mean import Mean
 from agate.aggregations.median import Median
 from agate.aggregations.min import Min
 from agate.aggregations.mode import Mode
-from agate.aggregations.percentiles import Percentiles
+from agate.aggregations.percentiles import Percentiles, WeightedQuantile
 from agate.aggregations.quartiles import Quartiles
 from agate.aggregations.quintiles import Quintiles
 from agate.aggregations.stdev import PopulationStDev, StDev

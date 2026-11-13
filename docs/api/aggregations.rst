@@ -45,6 +45,7 @@ Statistical aggregations
     agate.StDev
     agate.Sum
     agate.Variance
+    agate.WeightedQuantile
 
 Text aggregations
 -----------------
@@ -81,3 +82,4 @@ Detailed list
 .. autoclass:: agate.Sum
 .. autoclass:: agate.Summary
 .. autoclass:: agate.Variance
+.. autoclass:: agate.WeightedQuantile
