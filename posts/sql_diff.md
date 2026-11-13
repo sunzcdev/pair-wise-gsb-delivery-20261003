@@ -350,6 +350,33 @@ The implementation works especially well when coupled with the SQLGlot’s query
 0
 ```
 
+### Symbolic Renames
+
+When two versions of an ETL query differ only by a table (or derived-table / CTE) alias, the
+plain edit script is noisy: every column qualified with that alias, together with the surrounding
+subtree, is reported as removed and re-inserted even though the logic is unchanged. Pass
+`rename_sources=True` to consolidate such changes into a single `Rename` edit:
+
+```python
+>>> from sqlglot.diff import Rename
+>>> source = parse_one("SELECT a.x, a.y FROM tbl a")
+>>> target = parse_one("SELECT b.x, b.y FROM tbl b")
+>>> diff(source, target, delta_only=True, rename_sources=True)
+[Rename(...)]
+```
+
+The consolidation is scope-aware: an alias introduced in one subquery is never conflated with an
+alias that happens to share the same name in a different subquery, and each scope produces its own
+`Rename`. A rename is only collapsed when every reference to the old symbol within the scope is
+updated consistently. A partially updated reference, or any genuine expression change, is still
+reported through the regular edits, while a changed physical table is never mistaken for an alias
+rename. Each `Rename` keeps the definition node and every merged reference node from both trees
+(aligned by index in its `old` / `new` attributes), so the location of every merged node stays
+traceable. Swapping the two inputs reverses the direction of the rename.
+
+This behavior is opt-in: the default `diff` output is unchanged, and `Rename` edits only appear
+when `rename_sources=True` is passed.
+
 ### Optimizations
 
 The worst case runtime complexity of this algorithm is not exactly stellar: O(n^2 * log n^2). This is because of the leaf matching process, which involves ranking a cartesian product between all leaf nodes of compared trees. Unsurprisingly, the algorithm takes a considerable time to finish for bigger queries.

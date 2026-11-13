@@ -18,6 +18,7 @@ from sqlglot.helper import seq_get
 if t.TYPE_CHECKING:
     from collections.abc import Iterator, Sequence
     from sqlglot.dialects.dialect import DialectType
+    from sqlglot.optimizer.scope import Scope
 
 
 @dataclass(frozen=True)
@@ -58,10 +59,28 @@ class Keep:
     target: exp.Expr
 
 
+@dataclass(frozen=True)
+class Rename:
+    """Indicates that a source symbol (e.g. a table alias) was renamed within a scope.
+
+    Attributes:
+        source: the definition node carrying the old symbol name.
+        target: the definition node carrying the new symbol name.
+        old: the ``(definition, reference)`` pairs that use the old name in the source tree.
+        new: the corresponding ``(definition, reference)`` pairs that use the new name in the
+            target tree; pairs are aligned by index with `old`.
+    """
+
+    source: exp.Expr
+    target: exp.Expr
+    old: tuple[tuple[exp.Expr, exp.Expr | None], ...]
+    new: tuple[tuple[exp.Expr, exp.Expr | None], ...]
+
+
 if t.TYPE_CHECKING:
     from sqlglot._typing import T
 
-    Edit = t.Union[Insert, Remove, Move, Update, Keep]
+    Edit = t.Union[Insert, Remove, Move, Update, Keep, Rename]
 
 
 def diff(
@@ -69,6 +88,7 @@ def diff(
     target: exp.Expr,
     matchings: list[tuple[exp.Expr, exp.Expr]] | None = None,
     delta_only: bool = False,
+    rename_sources: bool = False,
     **kwargs: t.Any,
 ) -> list[Edit]:
     """
@@ -87,6 +107,12 @@ def diff(
             Note: expression references in this list must refer to the same node objects that are
             referenced in the source / target trees.
         delta_only: excludes all `Keep` nodes from the diff.
+        rename_sources: enables the symbolic rename detection. Consistent renames of source
+            symbols (e.g. table aliases) within the same scope are consolidated into a single
+            `Rename` edit each instead of being reported as a cascade of `Remove` / `Insert`
+            edits. A rename is only consolidated when every reference to the old symbol is
+            updated consistently; partially updated references are still reported as regular
+            diffs. Physical table changes are never treated as renames.
         kwargs: additional arguments to pass to the ChangeDistiller instance.
 
     Returns:
@@ -123,12 +149,51 @@ def diff(
     target_copy = target.copy() if copy else target
 
     try:
+        rename_edits: list[Rename] = []
+        rename_matchings_set: set[tuple[int, int]] = set()
+        rename_matchings: list[tuple[exp.Expr, exp.Expr]] = []
+        if rename_sources:
+            rename_edits, detected_matchings = _detect_renames(source, target)
+            # Match the ancestors of the renamed nodes as well. The leaf similarity heuristic
+            # can't match them on its own once the alias-bearing leaves diverge, which would
+            # leave the surrounding subtrees reported as removed and inserted.
+            detected_matchings.extend(_ancestor_matchings(detected_matchings, source, target))
+            for matched_source, matched_target in detected_matchings:
+                pair = (id(matched_source), id(matched_target))
+                if pair not in rename_matchings_set:
+                    rename_matchings_set.add(pair)
+                    rename_matchings.append((matched_source, matched_target))
+
         # We cache the hash of each new node here to speed up equality comparisons. If the input
         # trees aren't copied, these hashes will be evicted before returning the edit script.
-        if copy and matchings:
+        if copy and (matchings or rename_matchings):
             source_mapping = compute_node_mappings(source_nodes, tuple(source_copy.walk()))
             target_mapping = compute_node_mappings(target_nodes, tuple(target_copy.walk()))
-            matchings = [(source_mapping[id(s)], target_mapping[id(t)]) for s, t in matchings]
+            matchings = [
+                (source_mapping[id(s)], target_mapping[id(t)])
+                for s, t in chain(matchings, rename_matchings)
+            ]
+            rename_edits = [
+                Rename(
+                    source=source_mapping[id(edit.source)],
+                    target=target_mapping[id(edit.target)],
+                    old=tuple(
+                        (
+                            source_mapping[id(definition)],
+                            source_mapping[id(reference)] if reference else None,
+                        )
+                        for definition, reference in edit.old
+                    ),
+                    new=tuple(
+                        (
+                            target_mapping[id(definition)],
+                            target_mapping[id(reference)] if reference else None,
+                        )
+                        for definition, reference in edit.new
+                    ),
+                )
+                for edit in rename_edits
+            ]
         else:
             for node in chain(reversed(source_nodes), reversed(target_nodes)):
                 node._hash = hash(node)
@@ -136,9 +201,11 @@ def diff(
         edit_script = ChangeDistiller(**kwargs).diff(
             source_copy,
             target_copy,
-            matchings=matchings,
+            matchings=matchings + rename_matchings,
             delta_only=delta_only,
         )
+        if rename_edits:
+            edit_script = _merge_renames(edit_script, rename_edits)
     finally:
         if not copy:
             for node in chain(source_nodes, target_nodes):
@@ -409,6 +476,253 @@ def _get_expression_leaves(expression: exp.Expr) -> Iterator[exp.Expr]:
 
     if not has_child_exprs:
         yield expression
+
+
+def _detect_renames(
+    source: exp.Expr, target: exp.Expr
+) -> tuple[list[Rename], list[tuple[exp.Expr, exp.Expr]]]:
+    """
+    Detects consistent source-symbol renames (e.g. table aliases) between the two trees.
+
+    Returns the consolidated `Rename` edits together with the node pair pre-matchings that let
+    the Change Distiller algorithm match the renamed subtrees instead of removing / re-inserting
+    them. Renames are scoped: an alias defined in one subquery is never conflated with an alias
+    that happens to share the same name in a different subquery.
+    """
+    from sqlglot.optimizer.scope import traverse_scope
+
+    try:
+        source_scopes = traverse_scope(source)
+        target_scopes = traverse_scope(target)
+    except Exception:
+        # Rename detection is best-effort: fall back to the regular edit script on ASTs the
+        # scope traversal doesn't support rather than failing the whole diff.
+        return [], []
+
+    if len(source_scopes) != len(target_scopes):
+        return [], []
+
+    rename_edits: list[Rename] = []
+    rename_matchings: list[tuple[exp.Expr, exp.Expr]] = []
+
+    for source_scope, target_scope in zip(source_scopes, target_scopes):
+        if type(source_scope.expression) is not type(target_scope.expression):
+            continue
+
+        source_refs = _rename_references(source_scope)
+        target_refs = _rename_references(target_scope)
+        if len(source_refs) != len(target_refs):
+            continue
+
+        for (old_name, source_node), (new_name, target_node) in zip(source_refs, target_refs):
+            edit = _detect_rename(
+                source_scope,
+                target_scope,
+                old_name,
+                new_name,
+                source_node,
+                target_node,
+            )
+            if edit is None:
+                continue
+
+            rename_edits.append(edit)
+            rename_matchings.extend(
+                (old_node, new_node)
+                for old_pair, new_pair in zip(edit.old, edit.new)
+                for old_node, new_node in (
+                    (old_pair[0], new_pair[0]),
+                    (old_pair[1], new_pair[1]),
+                )
+                if old_node is not None and new_node is not None
+            )
+
+    return rename_edits, rename_matchings
+
+
+def _detect_rename(
+    source_scope: Scope,
+    target_scope: Scope,
+    old_name: str,
+    new_name: str,
+    source_node: exp.Expr,
+    target_node: exp.Expr,
+) -> Rename | None:
+    if not old_name or not new_name or old_name == new_name:
+        return None
+
+    if type(source_node) is not type(target_node):
+        return None
+
+    source_alias = _alias_node(source_node)
+    target_alias = _alias_node(target_node)
+    if source_alias is None or target_alias is None:
+        return None
+
+    if isinstance(source_node, exp.Table) and source_node.alias:
+        # A changed physical table name is a real change, not an alias rename.
+        if tuple(part.name for part in source_node.parts) != tuple(
+            part.name for part in target_node.parts
+        ):
+            return None
+
+    # The rename must be unambiguous within both scopes: no other source keeps the old name and
+    # no other source already used the new one.
+    source_names = [name for name, _ in source_scope.references]
+    target_names = [name for name, _ in target_scope.references]
+    if source_names.count(old_name) != 1 or target_names.count(new_name) != 1:
+        return None
+    if new_name in source_names or old_name in target_names:
+        return None
+
+    old_columns = [
+        column for column in source_scope.local_columns if column.text("table") == old_name
+    ]
+    new_columns = [
+        column for column in target_scope.local_columns if column.text("table") == new_name
+    ]
+    if len(old_columns) != len(new_columns):
+        return None
+
+    old_pairs: list[tuple[exp.Expr, exp.Expr | None]] = [(source_alias, None)]
+    new_pairs: list[tuple[exp.Expr, exp.Expr | None]] = [(target_alias, None)]
+    for old_column, new_column in zip(old_columns, new_columns):
+        if old_column.name != new_column.name:
+            return None
+
+        old_qualifier = old_column.args.get("table")
+        new_qualifier = new_column.args.get("table")
+        if old_qualifier is None or new_qualifier is None:
+            return None
+
+        old_pairs.append((old_column, old_qualifier))
+        new_pairs.append((new_column, new_qualifier))
+
+    # Prematch the source definition nodes as well so that the surrounding subtrees stay
+    # aligned. For a CTE the symbol is referenced through an unaliased Table node in addition to
+    # the CTE definition that carries the alias.
+    if isinstance(source_node, exp.CTE):
+        old_reference = next(
+            (node for name, node in source_scope.references if name == old_name), None
+        )
+        new_reference = next(
+            (node for name, node in target_scope.references if name == new_name), None
+        )
+        if not isinstance(old_reference, exp.Table) or not isinstance(new_reference, exp.Table):
+            return None
+        old_pairs.append((source_node, old_reference))
+        new_pairs.append((target_node, new_reference))
+    elif source_node is not source_alias:
+        old_pairs.append((source_node, None))
+        new_pairs.append((target_node, None))
+
+    return Rename(
+        source=source_alias,
+        target=target_alias,
+        old=tuple(old_pairs),
+        new=tuple(new_pairs),
+    )
+
+
+def _alias_node(node: exp.Expr) -> exp.Expr | None:
+    alias = node.args.get("alias")
+    if isinstance(alias, exp.TableAlias):
+        return alias
+    return None
+
+
+def _reference_node(node: exp.Expr) -> exp.Expr:
+    """Returns the source-defining node: the table itself or the subquery wrapping a derived table."""
+    if isinstance(node, exp.UNWRAPPED_QUERIES) and isinstance(node.parent, exp.Subquery):
+        return node.parent
+    return node
+
+
+def _rename_references(scope: Scope) -> list[tuple[str, exp.Expr]]:
+    """Returns the `(symbol name, definition node)` pairs eligible for rename detection in `scope`."""
+    references: list[tuple[str, exp.Expr]] = []
+    cte_definitions = {
+        cte.alias: cte
+        for cte in scope.expression.find_all(exp.CTE)
+        if isinstance(_alias_node(cte), exp.TableAlias)
+    }
+    for name, node in scope.references:
+        definition = _reference_node(node)
+        if _alias_node(definition) is not None:
+            references.append((name, definition))
+        elif (
+            isinstance(definition, exp.Table)
+            and not definition.alias
+            and name in scope.cte_sources
+            and name in cte_definitions
+        ):
+            # A CTE is referenced through an unaliased Table node, while its alias lives on the
+            # CTE definition itself.
+            references.append((name, cte_definitions[name]))
+
+    return references
+
+
+def _ancestor_matchings(
+    seed_matchings: list[tuple[exp.Expr, exp.Expr]], source: exp.Expr, target: exp.Expr
+) -> list[tuple[exp.Expr, exp.Expr]]:
+    """Pairs the ancestors of each seeded matching node up to the tree roots."""
+    ancestor_matchings: list[tuple[exp.Expr, exp.Expr]] = []
+    seen: set[tuple[int, int]] = set()
+
+    for seed_source, seed_target in seed_matchings:
+        source_chain: list[exp.Expr] = []
+        node = seed_source.parent
+        while node is not None:
+            source_chain.append(node)
+            if node is source:
+                break
+            node = node.parent
+
+        target_chain: list[exp.Expr] = []
+        node = seed_target.parent
+        while node is not None:
+            target_chain.append(node)
+            if node is target:
+                break
+            node = node.parent
+
+        if len(source_chain) != len(target_chain):
+            continue
+
+        for source_ancestor, target_ancestor in zip(source_chain, target_chain):
+            if type(source_ancestor) is not type(target_ancestor):
+                break
+            pair = (id(source_ancestor), id(target_ancestor))
+            if pair not in seen:
+                seen.add(pair)
+                ancestor_matchings.append((source_ancestor, target_ancestor))
+
+    return ancestor_matchings
+
+
+def _merge_renames(edit_script: list[Edit], rename_edits: list[Rename]) -> list[Edit]:
+    """Replaces the per-node updates induced by a rename with a single consolidated `Rename`."""
+    renamed_node_ids: set[int] = set()
+    for edit in rename_edits:
+        renamed_node_ids.update(
+            id(node)
+            for pair in (*edit.old, *edit.new)
+            for node in pair
+            if node is not None
+        )
+
+    merged_script = [
+        edit
+        for edit in edit_script
+        if not (
+            isinstance(edit, Update)
+            and id(edit.source) in renamed_node_ids
+            and id(edit.target) in renamed_node_ids
+        )
+    ]
+    merged_script.extend(rename_edits)
+    return merged_script
 
 
 def _get_non_expression_leaves(expression: exp.Expr) -> Iterator[tuple[str, t.Any]]:

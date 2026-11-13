@@ -1,14 +1,20 @@
 import unittest
 
 from sqlglot import exp, parse_one
-from sqlglot.diff import Insert, Move, Remove, Update, diff
+from sqlglot.diff import Insert, Keep, Move, Remove, Rename, Update, diff
 
 
 def diff_delta_only(source, target, matchings=None, **kwargs):
     return diff(source, target, matchings=matchings, delta_only=True, **kwargs)
 
 
+def diff_renames(source, target, **kwargs):
+    return diff(source, target, delta_only=True, rename_sources=True, **kwargs)
+
+
 def _edit_sql(edit):
+    if isinstance(edit, Rename):
+        return (edit.source.sql(), edit.target.sql())
     if isinstance(edit, Move):
         return (edit.source.sql(), edit.target.sql())
     if isinstance(edit, Update):
@@ -397,6 +403,222 @@ class TestDiff(unittest.TestCase):
 
         self.assertEqual(expr_tgt.args["from_"].this.comments, [" this is comment"])
         self._validate_delta_only(diff_delta_only(expr_src, expr_tgt), [])
+
+    def test_rename_sources_disabled_by_default(self):
+        expr_src = parse_one("SELECT a.x, a.y FROM tbl a")
+        expr_tgt = parse_one("SELECT b.x, b.y FROM tbl b")
+
+        default_edits = diff_delta_only(expr_src, expr_tgt)
+        self.assertTrue(default_edits)
+        self.assertFalse(any(isinstance(edit, Rename) for edit in default_edits))
+        self.assertTrue(
+            any(isinstance(edit, (Insert, Remove)) for edit in default_edits)
+        )
+
+    def test_rename_table_alias(self):
+        expr_src = parse_one("SELECT a.x, a.y FROM tbl a")
+        expr_tgt = parse_one("SELECT b.x, b.y FROM tbl b")
+
+        rename = Rename(
+            source=expr_src.find(exp.TableAlias),
+            target=expr_tgt.find(exp.TableAlias),
+            old=(
+                (expr_src.find(exp.TableAlias), None),
+                (expr_src.selects[0], expr_src.selects[0].args["table"]),
+                (expr_src.selects[1], expr_src.selects[1].args["table"]),
+                (expr_src.find(exp.Table), None),
+            ),
+            new=(
+                (expr_tgt.find(exp.TableAlias), None),
+                (expr_tgt.selects[0], expr_tgt.selects[0].args["table"]),
+                (expr_tgt.selects[1], expr_tgt.selects[1].args["table"]),
+                (expr_tgt.find(exp.Table), None),
+            ),
+        )
+        self._validate_delta_only(diff_renames(expr_src, expr_tgt), [rename])
+
+        # Every merged node remains traceable back to a node in its respective tree.
+        source_ids = {id(node) for node in expr_src.walk()}
+        target_ids = {id(node) for node in expr_tgt.walk()}
+        for definition, reference in rename.old:
+            self.assertIn(id(definition), source_ids)
+            if reference is not None:
+                self.assertIn(id(reference), source_ids)
+        for definition, reference in rename.new:
+            self.assertIn(id(definition), target_ids)
+            if reference is not None:
+                self.assertIn(id(reference), target_ids)
+
+    def test_rename_keeps_real_expression_changes(self):
+        expr_src = parse_one("SELECT a.x + 1 FROM tbl a")
+        expr_tgt = parse_one("SELECT b.x + 2 FROM tbl b")
+
+        self._validate_delta_only(
+            diff_renames(expr_src, expr_tgt),
+            [
+                Remove(expression=exp.Literal.number(1)),
+                Insert(expression=exp.Literal.number(2)),
+                Rename(
+                    source=expr_src.find(exp.TableAlias),
+                    target=expr_tgt.find(exp.TableAlias),
+                    old=(
+                        (expr_src.find(exp.TableAlias), None),
+                        (expr_src.selects[0].this, expr_src.selects[0].this.args["table"]),
+                        (expr_src.find(exp.Table), None),
+                    ),
+                    new=(
+                        (expr_tgt.find(exp.TableAlias), None),
+                        (expr_tgt.selects[0].this, expr_tgt.selects[0].this.args["table"]),
+                        (expr_tgt.find(exp.Table), None),
+                    ),
+                ),
+            ],
+        )
+
+    def test_rename_partial_reference_update_is_not_merged(self):
+        expr_src = parse_one("SELECT a.x, a.y FROM tbl a")
+        expr_tgt = parse_one("SELECT b.x, a.y FROM tbl b")
+
+        edits = diff_renames(expr_src, expr_tgt)
+        self.assertFalse(any(isinstance(edit, Rename) for edit in edits))
+        self.assertTrue(any(isinstance(edit, Remove) for edit in edits))
+        self.assertTrue(any(isinstance(edit, Insert) for edit in edits))
+        # The reference that kept the old qualifier is still represented as a move.
+        self.assertTrue(
+            any(
+                isinstance(edit, Move)
+                and edit.source == expr_src.selects[1]
+                and edit.target == expr_tgt.selects[1]
+                for edit in edits
+            )
+        )
+
+    def test_rename_does_not_conflate_physical_table_change(self):
+        expr_src = parse_one("SELECT a.x FROM tbl a")
+        expr_tgt = parse_one("SELECT a.x FROM other a")
+
+        edits = diff_renames(expr_src, expr_tgt)
+        self.assertFalse(any(isinstance(edit, Rename) for edit in edits))
+        self._validate_delta_only(
+            edits,
+            [
+                Update(
+                    source=expr_src.find(exp.Table),
+                    target=expr_tgt.find(exp.Table),
+                )
+            ],
+        )
+
+    def test_rename_is_scoped(self):
+        expr_src = parse_one(
+            "SELECT a.x FROM (SELECT 1 AS x) a "
+            "UNION ALL SELECT a.y FROM (SELECT 2 AS y) a"
+        )
+        expr_tgt = parse_one(
+            "SELECT c.x FROM (SELECT 1 AS x) c "
+            "UNION ALL SELECT c.y FROM (SELECT 2 AS y) c"
+        )
+
+        edits = diff_renames(expr_src, expr_tgt)
+        self.assertEqual([type(edit) for edit in edits], [Rename, Rename])
+        for edit in edits:
+            self.assertEqual(edit.source.name, "a")
+            self.assertEqual(edit.target.name, "c")
+
+        # Renaming the alias in only one of the two subqueries yields a single rename, while the
+        # untouched subquery produces no edits at all.
+        expr_tgt = parse_one(
+            "SELECT c.x FROM (SELECT 1 AS x) c "
+            "UNION ALL SELECT a.y FROM (SELECT 2 AS y) a"
+        )
+        edits = diff_renames(expr_src, expr_tgt)
+        self.assertEqual([type(edit) for edit in edits], [Rename])
+
+    def test_rename_nested_subquery(self):
+        expr_src = parse_one("SELECT x FROM (SELECT a.x FROM t a) s")
+        expr_tgt = parse_one("SELECT x FROM (SELECT b.x FROM t b) s")
+        src_column = next(c for c in expr_src.find_all(exp.Column) if c.args.get("table"))
+        tgt_column = next(c for c in expr_tgt.find_all(exp.Column) if c.args.get("table"))
+        src_table = next(t for t in expr_src.find_all(exp.Table) if t.alias == "a")
+        tgt_table = next(t for t in expr_tgt.find_all(exp.Table) if t.alias == "b")
+
+        self._validate_delta_only(
+            diff_renames(expr_src, expr_tgt),
+            [
+                Rename(
+                    source=src_table.args["alias"],
+                    target=tgt_table.args["alias"],
+                    old=(
+                        (src_table.args["alias"], None),
+                        (
+                            src_column,
+                            src_column.args["table"],
+                        ),
+                        (src_table, None),
+                    ),
+                    new=(
+                        (tgt_table.args["alias"], None),
+                        (
+                            tgt_column,
+                            tgt_column.args["table"],
+                        ),
+                        (tgt_table, None),
+                    ),
+                )
+            ],
+        )
+
+    def test_rename_derived_table_and_cte(self):
+        expr_src = parse_one("SELECT s.x FROM (SELECT x FROM t) s")
+        expr_tgt = parse_one("SELECT q.x FROM (SELECT x FROM t) q")
+        self.assertEqual(
+            [type(edit) for edit in diff_renames(expr_src, expr_tgt)], [Rename]
+        )
+
+        expr_src = parse_one("WITH c AS (SELECT x FROM t) SELECT c.x FROM c")
+        expr_tgt = parse_one("WITH d AS (SELECT x FROM t) SELECT d.x FROM d")
+        edits = diff_renames(expr_src, expr_tgt)
+        self.assertEqual([type(edit) for edit in edits], [Rename])
+        self.assertEqual(edits[0].source.name, "c")
+        self.assertEqual(edits[0].target.name, "d")
+
+        # A change inside the CTE body must still be reported alongside the rename.
+        expr_tgt = parse_one("WITH d AS (SELECT y FROM t) SELECT d.x FROM d")
+        edits = diff_renames(expr_src, expr_tgt)
+        self.assertEqual(sum(isinstance(edit, Rename) for edit in edits), 1)
+        self.assertTrue(any(isinstance(edit, (Insert, Remove)) for edit in edits))
+
+    def test_rename_direction_reverses_with_inputs(self):
+        expr_src = parse_one("SELECT a.x, a.y FROM tbl a")
+        expr_tgt = parse_one("SELECT b.x, b.y FROM tbl b")
+
+        forward = diff_renames(expr_src, expr_tgt)
+        reverse = diff_renames(expr_tgt, expr_src)
+
+        self.assertEqual(len(forward), 1)
+        self.assertEqual(len(reverse), 1)
+        self.assertEqual(forward[0].source, reverse[0].target)
+        self.assertEqual(forward[0].target, reverse[0].source)
+
+    def test_rename_keeps_keep_edits_outside_delta_mode(self):
+        expr_src = parse_one("SELECT a.x FROM tbl a")
+        expr_tgt = parse_one("SELECT b.x FROM tbl b")
+
+        edits = diff(expr_src, expr_tgt, rename_sources=True)
+        self.assertTrue(any(isinstance(edit, Rename) for edit in edits))
+        self.assertTrue(any(isinstance(edit, Keep) for edit in edits))
+
+    def test_rename_is_deterministic(self):
+        source_sql = "SELECT a.x + 1 AS p, b.y FROM t1 a JOIN t2 b ON a.id = b.id"
+        target_sql = "SELECT z.x + 2 AS p, q.y FROM t1 z JOIN t2 q ON z.id = q.id"
+
+        scripts = []
+        for _ in range(3):
+            edits = diff_renames(parse_one(source_sql), parse_one(target_sql))
+            scripts.append([(type(edit).__name__, _edit_sql(edit)) for edit in edits])
+
+        self.assertEqual(scripts[0], scripts[1])
+        self.assertEqual(scripts[1], scripts[2])
 
     def _validate_delta_only(self, actual_delta, expected_delta):
         self.assertEqual(set(actual_delta), set(expected_delta))
