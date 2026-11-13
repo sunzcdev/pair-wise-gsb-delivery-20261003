@@ -331,6 +331,68 @@ class TestOptimizer(unittest.TestCase):
         self.assertIsNot(optimized, expression)
         self.assertEqual(optimized.sql(), "2")
 
+    def test_optimize_budget(self):
+        from sqlglot.errors import OptimizeBudgetExceeded
+        from sqlglot.optimizer.optimizer import RULES
+
+        sql = "SELECT a FROM x WHERE a = 1 + 1"
+        expected = optimizer.optimize(sql, schema=self.schema)
+
+        # A generous budget does not change the result
+        self.assertEqual(optimizer.optimize(sql, schema=self.schema, max_work=100000), expected)
+
+        # A tiny budget is exhausted between rules, before any rule completes
+        with self.assertRaises(OptimizeBudgetExceeded) as ctx:
+            optimizer.optimize(sql, schema=self.schema, max_work=1)
+        error = ctx.exception
+        self.assertIsInstance(error, OptimizeError)
+        self.assertEqual(error.completed_rules, [])
+        self.assertEqual(error.stopped_at, "qualify")
+        self.assertEqual(error.budget, 1)
+        self.assertGreater(error.consumed, error.budget)
+        self.assertFalse(error.input_mutated)
+
+        # The budget stops a rule that expands the tree combinatorially
+        connector = " OR ".join(f"(a = {i} AND b = {i})" for i in range(6))
+        sql = f"SELECT * FROM x WHERE {connector}"
+        with self.assertRaises(OptimizeBudgetExceeded) as ctx:
+            optimizer.optimize(sql, schema=self.schema, max_work=1000, max_distance=1024)
+        error = ctx.exception
+        rule_names = [rule.__name__ for rule in RULES]
+        self.assertIn(error.stopped_at, rule_names)
+        self.assertEqual(
+            error.completed_rules, rule_names[: rule_names.index(error.stopped_at)]
+        )
+
+        # The failure is deterministic: same input and budget, same stop position
+        with self.assertRaises(OptimizeBudgetExceeded) as ctx:
+            optimizer.optimize(sql, schema=self.schema, max_work=1000, max_distance=1024)
+        self.assertEqual(ctx.exception.stopped_at, error.stopped_at)
+        self.assertEqual(ctx.exception.consumed, error.consumed)
+
+        # copy=True: the input tree is left untouched by the failed optimization
+        expression = parse_one(sql)
+        with self.assertRaises(OptimizeBudgetExceeded):
+            optimizer.optimize(expression, schema=self.schema, max_work=1000, max_distance=1024)
+        self.assertEqual(expression.sql(), sql)
+
+        # copy=False: the failure records that the input may have been mutated
+        with self.assertRaises(OptimizeBudgetExceeded) as ctx:
+            optimizer.optimize(
+                parse_one(sql), schema=self.schema, max_work=1000, max_distance=1024, copy=False
+            )
+        self.assertTrue(ctx.exception.input_mutated)
+
+        # In-rule cancellation: the budget is checked inside a single expanding rule
+        from sqlglot.optimizer.normalize import normalize
+
+        expression = parse_one(connector)
+        with self.assertRaises(OptimizeBudgetExceeded) as ctx:
+            optimizer.optimize(expression, rules=[normalize], max_work=50, max_distance=1024)
+        self.assertEqual(ctx.exception.stopped_at, "normalize")
+        self.assertEqual(ctx.exception.completed_rules, [])
+        self.assertEqual(expression.sql(), connector)
+
     def test_isolate_table_selects(self):
         self.check_file(
             "isolate_table_selects",

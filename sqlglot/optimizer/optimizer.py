@@ -6,6 +6,7 @@ from collections.abc import Sequence
 from sqlglot import Schema, exp
 from sqlglot.dialects.dialect import DialectType
 from sqlglot.optimizer.annotate_types import annotate_types
+from sqlglot.optimizer.budget import OptimizerBudget
 from sqlglot.optimizer.canonicalize import canonicalize
 from sqlglot.optimizer.eliminate_ctes import eliminate_ctes
 from sqlglot.optimizer.eliminate_joins import eliminate_joins
@@ -64,6 +65,7 @@ def optimize(
     rules: Sequence[OptimizerFn] = RULES,
     sql: str | None = None,
     copy: bool = True,
+    max_work: int | None = None,
     **kwargs: object,
 ) -> exp.Expr:
     """
@@ -88,18 +90,26 @@ def optimize(
             highlighting. Requires that the expression has position metadata from parsing.
         copy: Whether to copy the input expression before optimizing it. If False, the input tree
             may be mutated. Has no effect on SQL string inputs.
+        max_work: Maximum number of deterministic work units the optimizer may consume, counted
+            in expression nodes visited or produced. If the budget is exhausted, an
+            ``OptimizeBudgetExceeded`` error is raised instead of returning a partially
+            rewritten tree. ``None`` (the default) means no limit.
         **kwargs: If a rule has a keyword argument with a same name in **kwargs, it will be passed in.
 
     Returns:
         The optimized expression, which may be a new root even if copy is False.
     """
     schema = ensure_schema(schema, dialect=dialect)
+    budget = OptimizerBudget(
+        max_work, input_mutated=not copy and isinstance(expression, exp.Expr)
+    )
     possible_kwargs = {
         "db": db,
         "catalog": catalog,
         "schema": schema,
         "dialect": dialect,
         "sql": sql,
+        "budget": budget,
         "isolate_tables": True,  # needed for other optimizations to perform well
         "quote_identifiers": False,
         **kwargs,
@@ -107,11 +117,14 @@ def optimize(
 
     optimized = exp.maybe_parse(expression, dialect=dialect, copy=copy)
     for rule in rules:
+        budget.start_rule(getattr(rule, "__name__", rule.__class__.__name__), optimized)
+
         # Find any additional rule parameters, beyond `expression`
         rule_params = inspect.getfullargspec(rule).args
         rule_kwargs = {
             param: possible_kwargs[param] for param in rule_params if param in possible_kwargs
         }
         optimized = rule(optimized, **rule_kwargs)
+        budget.finish_rule()
 
     return optimized

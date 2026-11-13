@@ -93,6 +93,35 @@ class OptimizeError(SqlglotError):
     pass
 
 
+class OptimizeBudgetExceeded(OptimizeError):
+    """Raised when the optimizer exhausts its deterministic work budget.
+
+    Attributes:
+        budget: the configured work-unit limit.
+        consumed: work units consumed when the budget was exceeded.
+        completed_rules: names of the optimizer rules that ran to completion.
+        stopped_at: name of the rule that was running when the budget was exhausted.
+        input_mutated: whether the input expression may have been partially mutated.
+            This is only possible when the optimizer was called with ``copy=False``.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        budget: int | None = None,
+        consumed: int | None = None,
+        completed_rules: Sequence[str] = (),
+        stopped_at: str | None = None,
+        input_mutated: bool = False,
+    ):
+        super().__init__(message)
+        self.budget = budget
+        self.consumed = consumed
+        self.completed_rules = list(completed_rules)
+        self.stopped_at = stopped_at
+        self.input_mutated = input_mutated
+
+
 class SchemaError(SqlglotError):
     pass
 

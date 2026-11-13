@@ -4,15 +4,21 @@ from collections.abc import Callable, Iterator
 import logging
 
 from sqlglot import exp
-from sqlglot.errors import OptimizeError
+from sqlglot.errors import OptimizeBudgetExceeded, OptimizeError
 from sqlglot.helper import while_changing
+from sqlglot.optimizer.budget import OptimizerBudget
 from sqlglot.optimizer.scope import find_all_in_scope
 from sqlglot.optimizer.simplify import Simplifier, flatten
 
 logger = logging.getLogger("sqlglot")
 
 
-def normalize(expression: exp.Expr, dnf: bool = False, max_distance: int = 128) -> exp.Expr:
+def normalize(
+    expression: exp.Expr,
+    dnf: bool = False,
+    max_distance: int = 128,
+    budget: OptimizerBudget | None = None,
+) -> exp.Expr:
     """
     Rewrite sqlglot AST into conjunctive normal form or disjunctive normal form.
 
@@ -26,13 +32,18 @@ def normalize(expression: exp.Expr, dnf: bool = False, max_distance: int = 128) 
         expression: expression to normalize
         dnf: rewrite in disjunctive normal form instead.
         max_distance (int): the maximal estimated distance from cnf/dnf to attempt conversion
+        budget: optional work budget; consumed as connectors are visited and expanded.
+            Raises ``OptimizeBudgetExceeded`` if it runs out mid-rule.
     Returns:
         sqlglot.Expr: normalized expression
     """
-    simplifier = Simplifier(annotate_new_expressions=False)
+    simplifier = Simplifier(annotate_new_expressions=False, budget=budget)
 
     for node in tuple(expression.walk(prune=lambda e: isinstance(e, exp.Connector))):
         if isinstance(node, exp.Connector):
+            if budget:
+                budget.consume()
+
             if normalized(node, dnf=dnf):
                 continue
             root = node is expression
@@ -51,9 +62,13 @@ def normalize(expression: exp.Expr, dnf: bool = False, max_distance: int = 128) 
                 node = node.replace(
                     while_changing(
                         node,
-                        lambda e: distributive_law(e, dnf, max_distance, simplifier=simplifier),
+                        lambda e: distributive_law(
+                            e, dnf, max_distance, simplifier=simplifier, budget=budget
+                        ),
                     )
                 )
+            except OptimizeBudgetExceeded:
+                raise
             except OptimizeError as e:
                 logger.info(e)
                 node.replace(original)
@@ -155,12 +170,19 @@ def _predicate_lengths(
 
 
 def distributive_law(
-    expression: exp.Expr, dnf: bool, max_distance: float, simplifier: Simplifier | None = None
+    expression: exp.Expr,
+    dnf: bool,
+    max_distance: float,
+    simplifier: Simplifier | None = None,
+    budget: OptimizerBudget | None = None,
 ):
     """
     x OR (y AND z) -> (x OR y) AND (x OR z)
     (x AND y) OR (y AND z) -> (x OR y) AND (x OR z) AND (y OR y) AND (y OR z)
     """
+    if budget:
+        budget.consume()
+
     if normalized(expression, dnf=dnf):
         return expression
 
@@ -169,7 +191,9 @@ def distributive_law(
     if distance > max_distance:
         raise OptimizeError(f"Normalization distance {distance} exceeds max {max_distance}")
 
-    exp.replace_children(expression, lambda e: distributive_law(e, dnf, max_distance))
+    exp.replace_children(
+        expression, lambda e: distributive_law(e, dnf, max_distance, budget=budget)
+    )
     to_exp, from_exp = (exp.Or, exp.And) if dnf else (exp.And, exp.Or)
 
     if isinstance(expression, from_exp):

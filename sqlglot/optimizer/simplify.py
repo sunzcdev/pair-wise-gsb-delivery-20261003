@@ -20,6 +20,7 @@ from sqlglot.schema import ensure_schema
 if t.TYPE_CHECKING:
     from dateutil.relativedelta import relativedelta
     from sqlglot.dialects.dialect import DialectType
+    from sqlglot.optimizer.budget import OptimizerBudget
     from typing_extensions import TypeIs
 
     DateRange = tuple[date, date]
@@ -47,6 +48,7 @@ def simplify(
     constant_propagation: bool = False,
     coalesce_simplification: bool = False,
     dialect: DialectType = None,
+    budget: OptimizerBudget | None = None,
 ):
     """
     Rewrite sqlglot AST to simplify expressions.
@@ -63,10 +65,12 @@ def simplify(
         coalesce_simplification: whether the simplify coalesce rule should be used.
             This rule tries to remove coalesce functions, which can be useful in certain analyses but
             can leave the query more verbose.
+        budget: optional work budget; consumed as nodes are visited and rewritten.
+            Raises ``OptimizeBudgetExceeded`` if it runs out mid-rule.
     Returns:
         sqlglot.Expr: simplified expression
     """
-    return Simplifier(dialect=dialect).simplify(
+    return Simplifier(dialect=dialect, budget=budget).simplify(
         expression,
         constant_propagation=constant_propagation,
         coalesce_simplification=coalesce_simplification,
@@ -579,9 +583,15 @@ def boolean_literal(condition: bool | exp.Predicate) -> exp.Boolean:
 
 
 class Simplifier:
-    def __init__(self, dialect: DialectType = None, annotate_new_expressions: bool = True):
+    def __init__(
+        self,
+        dialect: DialectType = None,
+        annotate_new_expressions: bool = True,
+        budget: OptimizerBudget | None = None,
+    ):
         self.dialect = Dialect.get_or_raise(dialect)
         self.annotate_new_expressions = annotate_new_expressions
+        self.budget = budget
 
         self._annotator: TypeAnnotator = TypeAnnotator(
             schema=ensure_schema(None, dialect=self.dialect), overwrite_types=False
@@ -681,6 +691,9 @@ class Simplifier:
         for node in expression.walk(
             prune=lambda n: bool(isinstance(n, exp.Condition) or n.meta_get(FINAL))
         ):
+            if self.budget:
+                self.budget.consume()
+
             if node.meta_get(FINAL):
                 continue
 
@@ -752,6 +765,9 @@ class Simplifier:
         post_transformation_stack = []
 
         while pre_transformation_stack:
+            if self.budget:
+                self.budget.consume()
+
             original = pre_transformation_stack.pop()
             node = original
 
@@ -781,6 +797,9 @@ class Simplifier:
             post_transformation_stack.append((node, parent))
 
         while post_transformation_stack:
+            if self.budget:
+                self.budget.consume()
+
             original, parent = post_transformation_stack.pop()
             root = original is expression
 
