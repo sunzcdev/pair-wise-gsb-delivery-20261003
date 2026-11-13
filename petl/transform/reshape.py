@@ -4,14 +4,15 @@ from __future__ import absolute_import, print_function, division
 import itertools
 import collections
 import operator
-from petl.compat import next, text_type
+from tempfile import NamedTemporaryFile
+from petl.compat import pickle, next, text_type
 
 
 from petl.errors import ArgumentError
 from petl.comparison import Comparable, comparable_itemgetter
 from petl.util.base import Table, rowgetter, values, itervalues, \
-    header, data, asindices
-from petl.transform.sorts import sort
+    data, asindices
+from petl.transform.sorts import sort, _NamedTempFileDeleteOnGC
 
 
 def melt(table, key=None, variables=None, variablefield='variable',
@@ -460,7 +461,7 @@ def iterrecast(source, key, variablefield, valuefield,
         yield tuple(out_row)
 
 
-def transpose(table):
+def transpose(table, buffersize=None, tempdir=None, cache=True):
     """
     Transpose rows into columns. E.g.::
 
@@ -481,9 +482,32 @@ def transpose(table):
 
     See also :func:`petl.transform.reshape.recast`.
 
+    The source table is read exactly once, so one-shot (iterator) sources
+    are supported.
+
+    The `buffersize` argument should be an `int` or `None`. If it is an
+    `int`, at most `buffersize` rows of the source table are held in memory
+    at any one time; further rows are transposed in chunks of up to
+    `buffersize` rows and buffered in a temporary file on disk, to be read
+    back when the output rows are yielded. If `buffersize` is `None` (the
+    default), the whole table is buffered in memory.
+
+    Note that the budget applies to the intermediate buffer only. Each
+    output row spans all rows of the input table, so a single output row
+    may be much wider than `buffersize` and is always yielded whole.
+
+    The `tempdir` argument is passed as the `dir` argument to
+    `tempfile.NamedTemporaryFile` when buffering chunks on disk.
+
+    By default the result of the first pass is cached (in memory if it fits
+    within `buffersize`, otherwise in the temporary spill file), so
+    iterating over the transposed table again does not re-read the source
+    table. Set the `cache` argument to `False` to disable this.
+
     """
 
-    return TransposeView(table)
+    return TransposeView(table, buffersize=buffersize, tempdir=tempdir,
+                         cache=cache)
 
 
 Table.transpose = transpose
@@ -491,18 +515,139 @@ Table.transpose = transpose
 
 class TransposeView(Table):
 
-    def __init__(self, source):
+    def __init__(self, source, buffersize=None, tempdir=None, cache=True):
         self.source = source
+        if buffersize is not None and buffersize < 1:
+            raise ArgumentError('buffersize must be None or an int >= 1')
+        self.buffersize = buffersize
+        self.tempdir = tempdir
+        self._cache = cache
+        self._hdrcache = None
+        self._memcache = None
+        self._filecache = None
+        self._spillindex = None
+        self._tailcache = None
+
+    def clearcache(self):
+        self._hdrcache = None
+        self._memcache = None
+        self._filecache = None
+        self._spillindex = None
+        self._tailcache = None
 
     def __iter__(self):
-        return itertranspose(self.source)
+        if self._cache and self._memcache is not None:
+            return self._iterfrommemcache()
+        elif self._cache and self._filecache is not None:
+            return _iterspilled(self._filecache, self._spillindex,
+                                self._tailcache, len(self._hdrcache))
+        else:
+            return self._iternocache()
+
+    def _iterfrommemcache(self):
+        rows = self._memcache
+        for i in range(len(self._hdrcache)):
+            yield tuple(row[i] for row in rows)
+
+    def _iternocache(self):
+        # N.B., a pass triggered by __len__ (e.g., via list()) after this
+        # iterator was created may already have populated the cache, in
+        # which case serve from the cache rather than re-reading the source
+        if self._cache and self._memcache is not None:
+            for row in self._iterfrommemcache():
+                yield row
+            return
+        elif self._cache and self._filecache is not None:
+            for row in _iterspilled(self._filecache, self._spillindex,
+                                    self._tailcache, len(self._hdrcache)):
+                yield row
+            return
+        self.clearcache()
+        it = iter(self.source)
+        hdr = tuple(next(it))
+        ncols = len(hdr)
+        buffersize = self.buffersize
+        if buffersize is None:
+            # no budget, buffer the whole table in memory
+            rows = [hdr]
+            rows.extend(it)
+            if self._cache:
+                self._hdrcache = hdr
+                self._memcache = rows
+            for i in range(ncols):
+                yield tuple(row[i] for row in rows)
+            return
+        # spill transposed chunks of at most buffersize rows to a single
+        # temporary file, remembering the offset of each column segment so
+        # the output rows can be read back one at a time
+        chunk = [hdr]
+        index = []
+        wrapper = None
+        spillfile = None
+        try:
+            for row in it:
+                if len(chunk) >= buffersize:
+                    if spillfile is None:
+                        wrapper, spillfile = self._openspill()
+                    self._spillchunk(spillfile, chunk, ncols, index)
+                    chunk = []
+                chunk.append(row)
+        finally:
+            # never leave the spill file open, even if the source or a
+            # spill fails part-way
+            if spillfile is not None:
+                spillfile.close()
+        if not index:
+            # the whole table fits within the buffer, no need to spill
+            if self._cache:
+                self._hdrcache = hdr
+                self._memcache = chunk
+            for i in range(ncols):
+                yield tuple(row[i] for row in chunk)
+            return
+        if self._cache:
+            self._hdrcache = hdr
+            self._filecache = wrapper
+            self._spillindex = index
+            self._tailcache = chunk
+        rows = _iterspilled(wrapper, index, chunk, ncols)
+        try:
+            for row in rows:
+                yield row
+        finally:
+            # ensure the spill file is closed if iteration is abandoned
+            rows.close()
+
+    def _openspill(self):
+        f = NamedTemporaryFile(dir=self.tempdir, delete=False, mode='wb')
+        # N.B., the file is deleted when the wrapper is garbage collected
+        return _NamedTempFileDeleteOnGC(f.name), f
+
+    def _spillchunk(self, spillfile, chunk, ncols, index):
+        # write one pickled column segment per output row, remembering the
+        # offset of each segment so it can be read back directly
+        offsets = []
+        for i in range(ncols):
+            offsets.append(spillfile.tell())
+            pickle.dump(tuple(row[i] for row in chunk), spillfile,
+                        protocol=-1)
+        spillfile.flush()
+        index.append(offsets)
 
 
-def itertranspose(source):
-    hdr = header(source)
-    its = [iter(source) for _ in hdr]
-    for i in range(len(hdr)):
-        yield tuple(row[i] for row in its[i])
+def _iterspilled(wrapper, index, tail, ncols):
+    f = open(wrapper.name, 'rb')
+    try:
+        for i in range(ncols):
+            segments = []
+            for offsets in index:
+                f.seek(offsets[i])
+                segments.append(pickle.load(f))
+            if tail:
+                segments.append(tuple(row[i] for row in tail))
+            yield tuple(itertools.chain.from_iterable(segments))
+    finally:
+        f.close()
 
 
 def pivot(table, f1, f2, f3, aggfun, missing=None,

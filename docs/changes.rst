@@ -4,6 +4,17 @@ Changes
 Version 1.7.32
 --------------
 
+* Add an optional `buffersize` row budget to ``transpose()``. When the
+  number of input rows exceeds the budget, transposed chunks of at most
+  `buffersize` rows are buffered in a temporary spill file instead of
+  memory, and output rows are read back one at a time, so the intermediate
+  buffer stays bounded by the budget regardless of input size (only a
+  single output row, which spans all input rows, grows with the input).
+  The source is now read exactly once, so one-shot (iterator) sources are
+  supported, and repeated passes over a completed result are served from
+  the cache without re-reading the source.
+  By :user:`wynneyin`.
+
 * Preserve explicit iterator headers across repeated passes in ``fromtext()``.
   By :user:`IlyaKhalafi`.
 

@@ -695,6 +695,223 @@ def test_transpose_empty():
     ieq(expect2, table2)
 
 
+def test_transpose_short_rows():
+    # N.B., short rows currently raise IndexError, preserve this behaviour
+    table1 = (('id', 'colour', 'size'),
+              (1, 'blue'),
+              (2, 'red', 10))
+    for buffersize in (None, 1, 2, 100):
+        table2 = transpose(table1, buffersize=buffersize)
+        with pytest.raises(IndexError):
+            list(table2)
+
+
+def test_transpose_long_rows():
+    # N.B., cells beyond the header width are ignored, preserve this
+    table1 = (('id', 'colour'),
+              (1, 'blue', 'ignored'),
+              (2, 'red', 'ignored'))
+    expect2 = (('id', 1, 2),
+               ('colour', 'blue', 'red'))
+    for buffersize in (None, 1, 2, 100):
+        table2 = transpose(table1, buffersize=buffersize)
+        ieq(expect2, table2)
+        ieq(expect2, table2)
+
+
+def test_transpose_oneshot():
+    # a one-shot (iterator) source is read exactly once
+    table1 = [('id', 'colour'),
+              (1, 'blue'),
+              (2, 'red'),
+              (3, 'purple')]
+    expect2 = [('id', 1, 2, 3),
+               ('colour', 'blue', 'red', 'purple')]
+    for buffersize in (None, 2):
+        reads = []
+
+        def source():
+            reads.append(1)
+            for row in table1:
+                yield row
+
+        table2 = transpose(source(), buffersize=buffersize)
+        assert list(table2) == expect2
+        # repeated passes are served from the cache, not the source
+        assert list(table2) == expect2
+        assert len(reads) == 1
+
+
+def test_transpose_buffersize():
+    table1 = [('id', 'colour', 'size')] + \
+             [(i, 'c%s' % i, i * 3) for i in range(11)]
+    expect2 = [tuple(row) for row in transpose(table1)]
+    # content is identical however many spill chunks are needed
+    for buffersize in (1, 2, 3, 5, 100):
+        table2 = transpose(table1, buffersize=buffersize)
+        assert [tuple(row) for row in table2] == expect2
+        assert [tuple(row) for row in table2] == expect2
+
+
+def test_transpose_buffersize_spill_file(monkeypatch):
+    import petl.transform.reshape as reshape
+
+    spills = []
+    original_tempfile = reshape.NamedTemporaryFile
+
+    def tempfile(*args, **kwargs):
+        f = original_tempfile(*args, **kwargs)
+        spills.append(f.name)
+        return f
+
+    monkeypatch.setattr(reshape, 'NamedTemporaryFile', tempfile)
+    table1 = [('id', 'colour')] + [(i, 'c%s' % i) for i in range(11)]
+    table2 = transpose(table1, buffersize=3)
+    expect2 = [tuple(row) for row in transpose(table1)]
+    assert [tuple(row) for row in table2] == expect2
+    # 12 rows in chunks of at most 3 rows spill across 4 chunks in a single
+    # temporary file, which is retained as the cache while the view is alive
+    assert len(spills) == 1
+    assert os.path.exists(spills[0])
+    # a second pass is served from the spill file and gives the same rows
+    assert [tuple(row) for row in table2] == expect2
+    table2.clearcache()
+    gc.collect()
+    assert not os.path.exists(spills[0])
+
+
+def test_transpose_buffersize_cache():
+    table1 = [('id', 'colour')] + [(i, 'c%s' % i) for i in range(10)]
+
+    class CountingSource(object):
+
+        def __init__(self):
+            self.iters = 0
+
+        def __iter__(self):
+            self.iters += 1
+            return iter(table1)
+
+    # by default the source is read once, repeat passes use the cache
+    source = CountingSource()
+    table2 = transpose(source, buffersize=3)
+    list(table2)
+    list(table2)
+    assert source.iters == 1
+
+    # caching can be turned off
+    source = CountingSource()
+    table2 = transpose(source, buffersize=3, cache=False)
+    for row in table2:
+        pass
+    for row in table2:
+        pass
+    assert source.iters == 2
+
+
+def test_transpose_buffersize_invalid():
+    with pytest.raises(ArgumentError):
+        transpose([('a', 'b'), (1, 2)], buffersize=0)
+
+
+def test_transpose_spill_failure_leaves_no_files(monkeypatch):
+    import petl.transform.reshape as reshape
+
+    original_tempfile = reshape.NamedTemporaryFile
+    spills = []
+
+    class FailingFile(object):
+
+        def __init__(self, real):
+            self._real = real
+            self.name = real.name
+            spills.append(real.name)
+
+        def write(self, data):
+            raise IOError('simulated spill failure')
+
+        def tell(self):
+            return self._real.tell()
+
+        def flush(self):
+            pass
+
+        def close(self):
+            self._real.close()
+
+    def failing_tempfile(*args, **kwargs):
+        return FailingFile(original_tempfile(*args, **kwargs))
+
+    monkeypatch.setattr(reshape, 'NamedTemporaryFile', failing_tempfile)
+    table1 = [('id', 'colour')] + [(i, 'c%s' % i) for i in range(10)]
+    table2 = transpose(table1, buffersize=3)
+    with pytest.raises(IOError):
+        list(table2)
+    # the failed spill file is closed and does not outlive the view
+    assert spills
+    gc.collect()
+    assert not os.path.exists(spills[0])
+
+
+def test_transpose_abandoned_iteration_closes_files(monkeypatch):
+    import petl.transform.reshape as reshape
+
+    real_open = open
+    opened = []
+
+    def tracking_open(*args, **kwargs):
+        f = real_open(*args, **kwargs)
+        opened.append(f)
+        return f
+
+    monkeypatch.setattr(reshape, 'open', tracking_open, raising=False)
+    table1 = [('id', 'colour')] + [(i, 'c%s' % i) for i in range(10)]
+    table2 = transpose(table1, buffersize=3)
+    it = iter(table2)
+    next(it)
+    assert opened
+    assert not all(f.closed for f in opened)
+    # abandoning the iteration part-way closes the spill file
+    it.close()
+    assert all(f.closed for f in opened)
+
+
+def test_transpose_buffersize_memory_scaling():
+    # record how memory beyond the output rows grows with input size under
+    # a fixed row budget; the intermediate buffer must stay bounded by the
+    # budget, only a single (wide) output row is allowed to grow
+    import tracemalloc
+
+    def run(n, buffersize=50):
+        row = ('x', 'y')  # shared row object, isolates container memory
+
+        def source():
+            yield ('a', 'b')
+            for _ in range(n):
+                yield row
+
+        tracemalloc.start()
+        try:
+            table = transpose(source(), buffersize=buffersize)
+            count = sum(1 for _ in table)
+            peak = tracemalloc.get_traced_memory()[1]
+        finally:
+            tracemalloc.stop()
+        assert count == 2
+        return peak
+
+    peaks = [(n, run(n)) for n in (1000, 4000, 16000)]
+    for n, peak in peaks:
+        print('transpose buffersize=50: input rows=%d peak bytes=%d'
+              % (n, peak))
+    # input volume grows 16x; an output row holds one reference per input
+    # row (8 bytes each), so allow growth proportional to the widest output
+    # row plus slack, but nothing near the 16x growth of the input
+    (n1, p1), (n2, p2), (n3, p3) = peaks
+    assert p2 - p1 < (n2 - n1) * 8 * 4 + 100000
+    assert p3 - p1 < (n3 - n1) * 8 * 4 + 100000
+
+
 def test_pivot():
 
     table1 = (('region', 'gender', 'style', 'units'),
