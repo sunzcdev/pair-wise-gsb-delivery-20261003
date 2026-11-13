@@ -93,6 +93,10 @@ class OptimizeError(SqlglotError):
     pass
 
 
+class MaskingError(SqlglotError):
+    pass
+
+
 class SchemaError(SqlglotError):
     pass
 
