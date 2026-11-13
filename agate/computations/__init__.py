@@ -19,3 +19,31 @@ from agate.computations.percent_change import PercentChange
 from agate.computations.percentile_rank import PercentileRank
 from agate.computations.rank import Rank
 from agate.computations.slug import Slug
+from agate.computations.spec import (
+    AUTO,
+    COMPUTED,
+    FROM_COMPUTED,
+    FROM_ORIGINAL,
+    NEW,
+    ORIGINAL,
+    SOURCE_AUTO,
+    SOURCE_COMPUTED,
+    SOURCE_ORIGINAL,
+    CircularDependencyError,
+    ColumnComputation,
+    ComputationColumn,
+    ComputationDependency,
+    ComputationDependencyError,
+    ComputationDependencySpec,
+    ComputationError,
+    ComputationOutputError,
+    ComputationSpec,
+    ComputeColumn,
+    ComputeSpec,
+    ComputedColumn,
+    Dependency,
+    DependencySpec,
+    DuplicateComputationColumnError,
+    MissingDependencyError,
+    normalize_dependency_source,
+)

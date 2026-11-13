@@ -23,6 +23,36 @@ class Computation:  # pragma: no cover
         """
         raise NotImplementedError()
 
+    def get_dependencies(self, table=None):
+        """
+        Returns the names of the columns read by this computation.
+
+        Dependency-aware computation plans use this when a
+        :class:`.ComputationSpec` does not declare dependencies explicitly.
+        Custom computations may override this method or define a
+        :code:`dependencies` attribute.
+        """
+        for name in ('_dependencies', 'dependencies', 'depends_on', 'deps', 'inputs', 'source_columns'):
+            dependencies = getattr(self, name, None)
+
+            if dependencies is not None and not callable(dependencies):
+                return dependencies
+
+        dependencies = []
+
+        for attribute in ('_column_name', '_column_names', '_before_column_name', '_after_column_name'):
+            value = getattr(self, attribute, None)
+
+            if value is None:
+                continue
+
+            if isinstance(value, str):
+                dependencies.append(value)
+            else:
+                dependencies.extend(value)
+
+        return dependencies
+
     def validate(self, table):
         """
         Perform any checks necessary to verify this computation can run on the

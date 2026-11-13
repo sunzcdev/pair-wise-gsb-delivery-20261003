@@ -64,6 +64,7 @@ Calculating new data
 
     agate.Table.aggregate
     agate.Table.compute
+    agate.Table.compute_dependencies
 
 Advanced processing
 -------------------

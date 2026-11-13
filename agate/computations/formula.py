@@ -14,11 +14,16 @@ class Formula(Computation):
         If :code:`True`, each return value will be cast to the specified
         :code:`data_type` to ensure it is valid. Only disable this if you are
         certain your formula always returns the correct type.
+    :param dependencies:
+        An optional sequence of column names read by this formula. It is used
+        by dependency-aware computations when dependencies are not specified
+        in the plan.
     """
-    def __init__(self, data_type, func, cast=True):
+    def __init__(self, data_type, func, cast=True, dependencies=None):
         self._data_type = data_type
         self._func = func
         self._cast = cast
+        self._dependencies = dependencies
 
     def get_computed_data_type(self, table):
         return self._data_type

@@ -99,6 +99,35 @@ Need your change indexed to a starting year? Just fix the first argument:
 
 Of course you can also use :class:`.PercentChange` if you need percents rather than values.
 
+Dependent computations
+======================
+
+Use :meth:`.Table.compute_dependencies` when a computed column reads another
+column produced in the same call. Dependencies are declared explicitly, the
+graph is checked before any computation runs, and results are produced in
+dependency order:
+
+.. code-block:: python
+
+    new_table = table.compute_dependencies([
+        ('profit', agate.Formula(number_type, lambda r: r['revenue'] - r['cost']), ['revenue', 'cost']),
+        ('margin', agate.Formula(number_type, lambda r: r['profit'] / r['revenue']), ['profit', 'revenue'])
+    ])
+
+When replacing an existing column, declare whether a dependency reads the
+original value or the value produced earlier in the plan:
+
+.. code-block:: python
+
+    new_table = table.compute_dependencies([
+        ('price', agate.Formula(number_type, lambda r: r['price'] * 1.1), [
+            agate.Dependency('price', agate.ORIGINAL)
+        ], True),
+        ('price_with_tax', agate.Formula(number_type, lambda r: r['price'] * 1.2), [
+            agate.Dependency('price', agate.COMPUTED)
+        ])
+    ], replace=True)
+
 Round to two decimal places
 ===========================
 

@@ -165,8 +165,8 @@ from agate.tableset.having import having
 from agate.tableset.line_chart import line_chart
 from agate.tableset.merge import merge
 from agate.tableset.print_structure import print_structure
-from agate.tableset.proxy_methods import (bins, compute, denormalize, distinct, exclude, find, group_by, homogenize,
-                                          join, limit, normalize, order_by, pivot, select, where)
+from agate.tableset.proxy_methods import (bins, compute, compute_dependencies, denormalize, distinct, exclude, find,
+                                          group_by, homogenize, join, limit, normalize, order_by, pivot, select, where)
 from agate.tableset.scatterplot import scatterplot
 from agate.tableset.to_csv import to_csv
 from agate.tableset.to_json import to_json
@@ -176,6 +176,7 @@ TableSet.bar_chart = bar_chart
 TableSet.bins = bins
 TableSet.column_chart = column_chart
 TableSet.compute = compute
+TableSet.compute_dependencies = compute_dependencies
 TableSet.denormalize = denormalize
 TableSet.distinct = distinct
 TableSet.exclude = exclude

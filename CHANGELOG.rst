@@ -1,6 +1,7 @@
 1.14.3 - Unreleased
 -------------------
 
+- feat: :meth:`.Table.compute_dependencies` computes columns in dependency order, with explicit original/computed dependency sources and pre-run graph validation. :meth:`.Table.compute` keeps its original independent-computation behavior.
 - feat: :class:`.Median`, :class:`.Percentiles`, :class:`.Quartiles`, :class:`.Quintiles`, :class:`.Deciles` and :class:`.IQR` can be applied to :class:`.TimeDelta` columns, like :class:`.Sum` and :class:`.Mean`.
 - fix: :meth:`.Table.distinct` now deduplicates rows when ``key`` is a sequence of column names.
 - fix: :class:`.Rank` ranks null values last when ``reverse=True``.

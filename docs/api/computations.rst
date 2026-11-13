@@ -9,6 +9,8 @@ Computations
     :nosignatures:
 
     agate.Computation
+    agate.ComputationSpec
+    agate.Dependency
     agate.Formula
 
 Mathematical computations
@@ -28,6 +30,8 @@ Detailed list
 
 .. autoclass:: agate.Change
 .. autoclass:: agate.Computation
+.. autoclass:: agate.ComputationSpec
+.. autoclass:: agate.Dependency
 .. autoclass:: agate.Formula
 .. autoclass:: agate.Percent
 .. autoclass:: agate.PercentChange

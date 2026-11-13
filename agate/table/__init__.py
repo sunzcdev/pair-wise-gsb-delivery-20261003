@@ -303,7 +303,19 @@ from agate.table.aggregate import aggregate
 from agate.table.bar_chart import bar_chart
 from agate.table.bins import bins
 from agate.table.column_chart import column_chart
-from agate.table.compute import compute
+from agate.table.compute import (
+    compute,
+    compute_columns,
+    compute_dependencies,
+    compute_dependency,
+    compute_dependency_graph,
+    compute_dependency_plan,
+    compute_graph,
+    compute_ordered,
+    compute_plan,
+    compute_with_dependencies,
+    compute_with_dependency_graph,
+)
 from agate.table.denormalize import denormalize
 from agate.table.distinct import distinct
 from agate.table.exclude import exclude
@@ -337,6 +349,16 @@ Table.bar_chart = bar_chart
 Table.bins = bins
 Table.column_chart = column_chart
 Table.compute = compute
+Table.compute_columns = compute_columns
+Table.compute_dependency = compute_dependency
+Table.compute_dependencies = compute_dependencies
+Table.compute_dependency_graph = compute_dependency_graph
+Table.compute_dependency_plan = compute_dependency_plan
+Table.compute_graph = compute_graph
+Table.compute_ordered = compute_ordered
+Table.compute_plan = compute_plan
+Table.compute_with_dependencies = compute_with_dependencies
+Table.compute_with_dependency_graph = compute_with_dependency_graph
 Table.denormalize = denormalize
 Table.distinct = distinct
 Table.exclude = exclude

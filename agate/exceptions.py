@@ -10,6 +10,48 @@ class DataTypeError(TypeError):  # pragma: no cover
     pass
 
 
+class ComputationError(Exception):  # pragma: no cover
+    """
+    Base class for errors raised by dependency-aware computations.
+    """
+    pass
+
+
+class ComputationDependencyError(ComputationError, ValueError):  # pragma: no cover
+    """
+    A computation dependency graph is structurally invalid.
+    """
+    pass
+
+
+class MissingDependencyError(ComputationDependencyError, KeyError):  # pragma: no cover
+    """
+    A computation declared a dependency that does not exist.
+    """
+    pass
+
+
+class CircularDependencyError(ComputationDependencyError, RuntimeError):  # pragma: no cover
+    """
+    A computation dependency graph contains a cycle.
+    """
+    pass
+
+
+class DuplicateComputationColumnError(ComputationDependencyError):  # pragma: no cover
+    """
+    Two computations in the same plan target the same column.
+    """
+    pass
+
+
+class ComputationOutputError(ValueError, DataTypeError):  # pragma: no cover
+    """
+    A computation returned the wrong number of values or the wrong type.
+    """
+    pass
+
+
 class UnsupportedAggregationError(TypeError):  # pragma: no cover
     """
     An :class:`.Aggregation` was attempted which is not supported.

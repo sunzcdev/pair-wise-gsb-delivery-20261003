@@ -12,6 +12,13 @@ def compute(self, *args, **kwargs):
     return self._proxy('compute', *args, **kwargs)
 
 
+def compute_dependencies(self, *args, **kwargs):
+    """
+    Calls :meth:`.Table.compute_dependencies` on each table in the TableSet.
+    """
+    return self._proxy('compute_dependencies', *args, **kwargs)
+
+
 def denormalize(self, *args, **kwargs):
     """
     Calls :meth:`.Table.denormalize` on each table in the TableSet.
