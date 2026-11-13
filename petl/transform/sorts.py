@@ -23,7 +23,7 @@ debug = logger.debug
 
 
 def sort(table, key=None, reverse=False, buffersize=None, tempdir=None,
-         cache=True):
+         cache=True, maxfanin=None):
     """
     Sort the table. Field names or indices (from zero) can be used to specify
     the key. E.g.::
@@ -120,6 +120,14 @@ def sort(table, key=None, reverse=False, buffersize=None, tempdir=None,
     If `petl.config.sort_buffersize` is set to `None`, this forces
     all sorting to be done entirely in memory.
 
+    The `maxfanin` argument should be an `int` or `None`. If the number of
+    temporary chunk files exceeds `maxfanin`, the chunk files are merged in
+    multiple rounds, reading at most `maxfanin` files at a time, so the
+    number of simultaneously open file handles stays bounded no matter how
+    many chunks are written. If `maxfanin` is `None`, the value of
+    `petl.config.sort_maxfanin` will be used, which defaults to `None`,
+    i.e., all chunk files are merged in a single pass.
+
     By default the results of the sort will be cached, and so a second pass over
     the sorted table will yield rows from the cache and will not repeat the
     sort operation. To turn off caching, set the `cache` argument to `False`.
@@ -127,7 +135,7 @@ def sort(table, key=None, reverse=False, buffersize=None, tempdir=None,
     """
 
     return SortView(table, key=key, reverse=reverse, buffersize=buffersize,
-                    tempdir=tempdir, cache=cache)
+                    tempdir=tempdir, cache=cache, maxfanin=maxfanin)
 
 
 Table.sort = sort
@@ -236,9 +244,80 @@ def _mergesorted(key=None, reverse=False, *iterables):
         return _heapqmergesorted(key, *iterables)
 
 
+def _merge_chunk_files(getkey, reverse, filenames, tempdir):
+    # merge sorted chunk files into a single temporary file, returning the
+    # wrapper for the new file
+    chunkiters = [_iterchunk(fn) for fn in filenames]
+    wrapper = None
+    try:
+        with NamedTemporaryFile(dir=tempdir, delete=False, mode='wb') as f:
+            wrapper = _NamedTempFileDeleteOnGC(f.name)
+            debug('created temporary merge file %s' % f.name)
+            for row in _mergesorted(getkey, reverse, *chunkiters):
+                pickle.dump(row, f, protocol=-1)
+            f.flush()
+    except Exception:
+        # remove the partially written merge file
+        if wrapper is not None:
+            try:
+                wrapper.delete()
+            except Exception:
+                pass
+        raise
+    finally:
+        # ensure the input chunk files are closed
+        del chunkiters
+    return wrapper
+
+
+def _itermergedchunks(getkey, reverse, filenames, maxfanin, tempdir):
+    # yield rows merged from sorted chunk files; if there are more than
+    # maxfanin files, merge in multiple rounds so that no more than maxfanin
+    # files are open for reading at any one time; intermediate merge files
+    # are deleted as soon as they have been consumed
+    transient = dict()  # name -> wrapper for intermediate merge files
+    try:
+        current = list(filenames)
+        while maxfanin is not None and len(current) > maxfanin:
+            merged = []
+            for i in range(0, len(current), maxfanin):
+                batch = current[i:i + maxfanin]
+                if len(batch) == 1:
+                    # nothing to merge, carry over to the next round
+                    merged.append(batch[0])
+                else:
+                    wrapper = _merge_chunk_files(getkey, reverse, batch,
+                                                 tempdir)
+                    transient[wrapper.name] = wrapper
+                    merged.append(wrapper.name)
+                    # inputs to this batch have been fully consumed
+                    for fn in batch:
+                        consumed = transient.pop(fn, None)
+                        if consumed is not None:
+                            try:
+                                consumed.delete()
+                            except Exception:
+                                pass
+            current = merged
+        chunkiters = [_iterchunk(fn) for fn in current]
+        try:
+            for row in _mergesorted(getkey, reverse, *chunkiters):
+                yield row
+        finally:
+            # ensure chunk files are closed, even if the downstream
+            # consumer closes this generator early
+            del chunkiters
+    finally:
+        for wrapper in transient.values():
+            try:
+                wrapper.delete()
+            except Exception:
+                pass
+
+
 class SortView(Table):
     def __init__(self, source, key=None, reverse=False, buffersize=None,
-                 tempdir=None, cache=True):
+                 tempdir=None, cache=True, maxfanin=None):
         self.source = source
         self.key = key
         self.reverse = reverse
@@ -246,6 +325,13 @@ class SortView(Table):
             self.buffersize = config.sort_buffersize
         else:
             self.buffersize = buffersize
+        if maxfanin is None:
+            self.maxfanin = config.sort_maxfanin
+        else:
+            self.maxfanin = maxfanin
+        if self.maxfanin is not None and self.maxfanin < 2:
+            raise ValueError('maxfanin must be at least 2, got %r'
+                             % (self.maxfanin,))
         self.tempdir = tempdir
         self._cache = cache
         self._hdrcache = None
@@ -284,8 +370,8 @@ class SortView(Table):
         filenames = list(map(operator.attrgetter('name'), filecache))
         debug('iterate from file cache: %r', filenames)
         yield tuple(self._hdrcache)
-        chunkiters = [_iterchunk(fn) for fn in filenames]
-        rows = _mergesorted(self._getkey, self.reverse, *chunkiters)
+        rows = _itermergedchunks(self._getkey, self.reverse, filenames,
+                                 self.maxfanin, self.tempdir)
         try:
             for row in rows:
                 yield tuple(row)
@@ -294,7 +380,6 @@ class SortView(Table):
             # N.B., need to ensure that any open files are closed **before**
             # temporary files are deleted, as deletion will fail on Windows
             # if file is in use (i.e., still open)
-            del chunkiters
             del rows
             del filecache
             debug('exiting generator')
@@ -372,9 +457,16 @@ class SortView(Table):
                 self._filecache = chunkfiles
                 self._getkey = getkey
 
-            chunkiters = [_iterchunk(f.name) for f in chunkfiles]
-            for row in _mergesorted(getkey, reverse, *chunkiters):
-                yield tuple(row)
+            filenames = list(map(operator.attrgetter('name'), chunkfiles))
+            merged = _itermergedchunks(getkey, reverse, filenames,
+                                       self.maxfanin, self.tempdir)
+            try:
+                for row in merged:
+                    yield tuple(row)
+            finally:
+                # ensure chunk files are closed if the downstream consumer
+                # closes this generator early
+                del merged
 
 
 class _NamedTempFileDeleteOnGC(object):
@@ -384,6 +476,9 @@ class _NamedTempFileDeleteOnGC(object):
 
     def delete(self, unlink=os.unlink, log=logger.debug):
         name = self.name
+        if name is None:
+            # already deleted
+            return
         try:
             log('deleting %s' % name)
             unlink(name)
@@ -392,15 +487,16 @@ class _NamedTempFileDeleteOnGC(object):
             raise
         else:
             log('deleted %s' % name)
+            self.name = None
 
     def __del__(self):
         self.delete()
 
     def __str__(self):
-        return self.name
+        return str(self.name)
 
     def __repr__(self):
-        return self.name
+        return str(self.name)
 
 
 def mergesort(*tables, **kwargs):

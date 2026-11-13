@@ -82,6 +82,17 @@ default. Pass an explicit positive integer to override it for one sort.
 In particular, passing ``buffersize=None`` alone does not force an
 in-memory sort when the configured default is an integer.
 
+``sort_maxfanin`` defaults to ``None``. It controls the default maximum
+merge fan-in for :func:`petl.transform.sorts.sort`, i.e., how many
+temporary chunk files may be read at the same time when merging. If more
+chunks were written than this limit, they are merged in multiple rounds,
+so the number of simultaneously open file handles stays bounded. ``None``
+means all chunk files are merged in a single pass.
+
+An omitted ``maxfanin``, or ``maxfanin=None``, uses the configured
+default. Pass an explicit integer of at least 2 to override it for one
+sort.
+
 Error handling
 --------------
 

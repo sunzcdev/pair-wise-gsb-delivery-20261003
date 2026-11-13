@@ -609,3 +609,259 @@ def test_sort_missing_cell_text():
 
     tbl_sorted = sort(tbl)
     ieq(expect, tbl_sorted)
+
+
+def test_sort_maxfanin_invalid():
+
+    table = (('foo', 'bar'),
+             ('C', 2),
+             ('A', 9))
+    # a fan-in of less than 2 cannot reduce the number of chunk files
+    with pytest.raises(ValueError):
+        sort(table, 'bar', buffersize=1, maxfanin=1)
+    with pytest.raises(ValueError):
+        sort(table, 'bar', buffersize=1, maxfanin=0)
+
+
+def test_sort_maxfanin():
+
+    table = (('foo', 'bar'),
+             ('C', 2),
+             ('A', 9),
+             ('A', 6),
+             ('F', 1),
+             ('D', 10),
+             ('B', 4),
+             ('E', 8),
+             ('A', 3),
+             ('G', 5))
+
+    # sort forwards
+    expectation = (('foo', 'bar'),
+                   ('F', 1),
+                   ('C', 2),
+                   ('A', 3),
+                   ('B', 4),
+                   ('G', 5),
+                   ('A', 6),
+                   ('E', 8),
+                   ('A', 9),
+                   ('D', 10))
+    # tiny buffersize and fan-in force multiple merge rounds
+    result = sort(table, 'bar', buffersize=2, maxfanin=2)
+    ieq(expectation, result)
+    debug('second pass should come from the file cache')
+    ieq(expectation, result)
+    result = sort(table, 'bar', buffersize=2, maxfanin=2, cache=False)
+    ieq(expectation, result)
+    ieq(expectation, result)
+
+    # sort in reverse
+    expectation = (('foo', 'bar'),
+                   ('D', 10),
+                   ('A', 9),
+                   ('E', 8),
+                   ('A', 6),
+                   ('G', 5),
+                   ('B', 4),
+                   ('A', 3),
+                   ('C', 2),
+                   ('F', 1))
+    result = sort(table, 'bar', reverse=True, buffersize=2, maxfanin=2)
+    ieq(expectation, result)
+    ieq(expectation, result)
+    result = sort(table, 'bar', reverse=True, buffersize=2, maxfanin=2,
+                  cache=False)
+    ieq(expectation, result)
+
+
+def test_sort_maxfanin_stable():
+
+    # rows with equal keys must keep their input order, and reverse must
+    # only change the direction of the key comparison
+    rows = [(i % 4, i) for i in range(25)]
+    table = [('key', 'seq')] + rows
+    expect_fwd = [tuple(table[0])] + \
+        [tuple(r) for r in sorted(rows, key=lambda r: r[0])]
+    expect_rev = [tuple(table[0])] + \
+        [tuple(r) for r in sorted(rows, key=lambda r: r[0], reverse=True)]
+
+    for reverse, expect in ((False, expect_fwd), (True, expect_rev)):
+        debug('in-memory sort')
+        eq_(expect, list(sort(table, 'key', reverse=reverse)))
+        debug('buffered sort with multi-round merging')
+        result = sort(table, 'key', reverse=reverse, buffersize=2, maxfanin=2)
+        eq_(expect, list(result))
+        debug('second pass from the file cache')
+        eq_(expect, list(result))
+        debug('buffered sort without cache')
+        result = sort(table, 'key', reverse=reverse, buffersize=2, maxfanin=2,
+                      cache=False)
+        eq_(expect, list(result))
+
+
+class _CountingOpen(object):
+    # wrap the builtin open to track the number of simultaneously open files
+
+    def __init__(self, wrapped):
+        self.wrapped = wrapped
+        self.current = 0
+        self.peak = 0
+
+    def __call__(self, *args, **kwargs):
+        f = self.wrapped(*args, **kwargs)
+        self.current += 1
+        self.peak = max(self.peak, self.current)
+        return _CountedFile(f, self)
+
+
+class _CountedFile(object):
+
+    def __init__(self, f, counter):
+        self._f = f
+        self._counter = counter
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        self.close()
+        return False
+
+    def close(self):
+        f = self._f
+        self._f = None
+        if f is not None:
+            f.close()
+            self._counter.current -= 1
+
+    def __getattr__(self, name):
+        return getattr(self._f, name)
+
+
+def test_sort_maxfanin_limits_open_files(monkeypatch):
+
+    import petl.transform.sorts as sorts
+    counter = _CountingOpen(open)
+    monkeypatch.setattr(sorts, 'open', counter, raising=False)
+
+    # count temporary files created, to prove multiple merge rounds happen
+    created = []
+    real_namedtemporaryfile = sorts.NamedTemporaryFile
+
+    def counting_namedtemporaryfile(*args, **kwargs):
+        f = real_namedtemporaryfile(*args, **kwargs)
+        created.append(f.name)
+        return f
+
+    monkeypatch.setattr(sorts, 'NamedTemporaryFile',
+                        counting_namedtemporaryfile)
+
+    table = [('foo', 'bar')] + [(i % 5, i) for i in range(21)]
+    expect = list(sort(table, 'bar'))
+    result = sort(table, 'bar', buffersize=2, maxfanin=3, cache=False)
+    eq_(expect, list(result))
+
+    # 21 rows in chunks of 2 make 11 chunk files, more than the fan-in
+    nchunks = 11
+    debug('temporary files created: %d', len(created))
+    assert len(created) > nchunks, 'expected intermediate merge files'
+    debug('peak open read handles: %d', counter.peak)
+    assert 1 < counter.peak <= 3
+    eq_(0, counter.current)
+
+
+class _FailingPickle(object):
+    # shim for the pickle module that fails after a number of dump calls
+
+    def __init__(self, real, fail_after):
+        self._real = real
+        self._fail_after = fail_after
+        self.dumps = 0
+
+    def dump(self, row, f, protocol=None):
+        self.dumps += 1
+        if self.dumps > self._fail_after:
+            raise IOError('simulated merge write failure')
+        return self._real.dump(row, f, protocol=protocol)
+
+    def load(self, f):
+        return self._real.load(f)
+
+
+def _maketempdir():
+    # N.B., do not use tempfile.mkdtemp() here, the directories it creates
+    # are not writable in some sandboxed environments
+    import uuid
+    name = 'tmp_sort_maxfanin_' + uuid.uuid4().hex
+    os.mkdir(name)
+    return name
+
+
+def test_sort_maxfanin_merge_write_failure(monkeypatch):
+
+    import petl.transform.sorts as sorts
+
+    table = [('foo', 'bar')] + [(i % 5, i) for i in range(9)]
+    tempdir = _maketempdir()
+
+    # 9 rows in chunks of 2 take 9 dump calls, so the first write of an
+    # intermediate merge file will fail
+    monkeypatch.setattr(sorts, 'pickle', _FailingPickle(sorts.pickle, 9))
+
+    result = sort(table, 'bar', buffersize=2, maxfanin=2, tempdir=tempdir,
+                  cache=False)
+    try:
+        nrows(result)
+        raise AssertionError('expected the merge write failure')
+    except IOError:
+        pass
+    del result
+    gc.collect()
+    debug('tempdir contents after failure: %r', os.listdir(tempdir))
+    eq_([], os.listdir(tempdir))
+    os.rmdir(tempdir)
+
+
+@pytest.mark.skipif(platform.python_implementation() == 'PyPy', reason='SKIP sort cleanup test (PyPy)')
+def test_sort_maxfanin_early_close():
+
+    table = [('foo', 'bar')] + [(i % 5, i) for i in range(20)]
+    tempdir = _maketempdir()
+
+    # without cache, closing the iterator after a few rows must release all
+    # handles and remove all temporary files
+    result = sort(table, 'bar', buffersize=2, maxfanin=2, tempdir=tempdir,
+                  cache=False)
+    it = iter(result)
+    next(it)
+    next(it)
+    next(it)
+    it.close()
+    del it
+    del result
+    gc.collect()
+    eq_([], os.listdir(tempdir))
+    os.rmdir(tempdir)
+
+    # with cache, the cached chunk files survive until the view is released,
+    # but intermediate merge files are removed when the iterator is closed
+    tempdir = _maketempdir()
+    result = sort(table, 'bar', buffersize=2, maxfanin=2, tempdir=tempdir)
+    eq_(20, nrows(result))
+    filenames = _get_names(result._filecache)
+    it = iter(result)
+    next(it)
+    next(it)
+    it.close()
+    del it
+    gc.collect()
+    debug('tempdir contents after close: %r', os.listdir(tempdir))
+    eq_(len(filenames), len(os.listdir(tempdir)))
+    for fn in filenames:
+        assert os.path.exists(fn), fn
+    del result
+    gc.collect()
+    for fn in filenames:
+        assert not os.path.exists(fn), fn
+    os.rmdir(tempdir)
