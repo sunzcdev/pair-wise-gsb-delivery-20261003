@@ -41,6 +41,9 @@ Header manipulations
 .. autofunction:: petl.transform.headers.sortheader
 .. autofunction:: petl.transform.headers.skip
 .. autofunction:: petl.transform.headers.skiplast
+.. autofunction:: petl.transform.headers.normalizeheader
+.. autoclass:: petl.transform.headers.HeaderNormalizer
+.. autoclass:: petl.transform.headers.HeaderMapping
 
 
 .. module:: petl.transform.conversions
