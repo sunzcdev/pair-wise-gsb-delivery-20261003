@@ -46,7 +46,8 @@ from petl.transform.dedup import duplicates, unique, distinct, conflicts, \
     isunique
 
 from petl.transform.setops import complement, intersection, \
-    recordcomplement, diff, recorddiff, hashintersection, hashcomplement
+    recordcomplement, recordintersection, diff, recorddiff, \
+    hashintersection, hashcomplement
 
 from petl.transform.intervals import intervaljoin, intervalleftjoin, \
     intervaljoinvalues, intervalantijoin, intervallookup, intervallookupone, \

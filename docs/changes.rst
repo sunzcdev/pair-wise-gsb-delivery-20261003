@@ -1,6 +1,27 @@
 Changes
 =======
 
+Version 1.7.33
+--------------
+
+* Add an explicit multiset (bag) mode to the set operations.
+  ``complement()``, ``intersection()``, ``hashcomplement()`` and
+  ``hashintersection()`` now accept ``multiset=True`` to cancel rows by
+  occurrence, and ``intersection()``/``hashintersection()`` accept
+  ``strict=True`` for set semantics. With neither flag given the historical
+  behaviour is unchanged, and ``strict`` and ``multiset`` are mutually
+  exclusive.
+
+* Add ``recordintersection()``, the field-aligned counterpart to
+  ``intersection()``. The record operations compare rows by field name while
+  the ordinary operations keep comparing by position, following the standard
+  petl table semantics for missing values, mixed comparable types and empty
+  headers.
+
+* Stream the sorted complement and intersection merges a run at a time so
+  tables with many duplicate rows are processed in a single merge without
+  buffering an entire duplicate group.
+
 Version 1.7.32
 --------------
 

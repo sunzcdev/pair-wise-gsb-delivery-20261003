@@ -2,11 +2,13 @@ from __future__ import absolute_import, print_function, division
 
 
 from datetime import datetime
+from collections import Counter
 
 
 from petl.test.helpers import ieq
 from petl.transform.setops import complement, intersection, diff, \
-    recordcomplement, recorddiff, hashcomplement, hashintersection
+    recordcomplement, recordintersection, recorddiff, hashcomplement, \
+    hashintersection
 
 
 def _test_complement_1(complement_impl):
@@ -429,3 +431,153 @@ def test_hashcomplement():
 
 def test_hashintersection():
     _test_intersection(hashintersection)
+
+
+def _multiset_tables():
+    # row x occurs three times on the left and once on the right
+    a = (('foo', 'bar'),
+         ('A', 1),
+         ('B', 2), ('B', 2), ('B', 2),
+         ('C', 7))
+    b = (('foo', 'bar'),
+         ('B', 2))
+    return a, b
+
+
+def _test_multiset_complement(impl):
+    a, b = _multiset_tables()
+    # multiset: the single right-hand B cancels one of the three left rows
+    expectation = (('foo', 'bar'),
+                   ('A', 1),
+                   ('B', 2), ('B', 2),
+                   ('C', 7))
+    ieq(expectation, impl(a, b))
+    ieq(expectation, impl(a, b, multiset=True))
+    # strict set mode: B is found on the right, so every B is removed
+    strict_expectation = (('foo', 'bar'),
+                          ('A', 1),
+                          ('C', 7))
+    ieq(strict_expectation, impl(a, b, strict=True))
+
+
+def test_multiset_complement():
+    _test_multiset_complement(complement)
+
+
+def test_hash_multiset_complement():
+    _test_multiset_complement(hashcomplement)
+
+
+def _test_strict_intersection(impl):
+    a = (('foo', 'bar'),
+         ('B', 2), ('B', 2), ('B', 2),
+         ('C', 7))
+    b = (('foo', 'bar'),
+         ('B', 2), ('B', 2))
+    # default and explicit multiset keep the minimum multiplicity
+    multiset_expectation = (('foo', 'bar'),
+                            ('B', 2), ('B', 2))
+    ieq(multiset_expectation, impl(a, b))
+    ieq(multiset_expectation, impl(a, b, multiset=True))
+    # strict set mode keeps each matching row only once
+    strict_expectation = (('foo', 'bar'),
+                          ('B', 2))
+    ieq(strict_expectation, impl(a, b, strict=True))
+
+
+def test_strict_intersection():
+    _test_strict_intersection(intersection)
+
+
+def test_hash_strict_intersection():
+    _test_strict_intersection(hashintersection)
+
+
+def _test_exclusive_flags(impl):
+    a, b = _multiset_tables()
+    import pytest
+    with pytest.raises(ValueError):
+        impl(a, b, strict=True, multiset=True)
+
+
+def test_exclusive_flags():
+    for impl in (complement, intersection, hashcomplement, hashintersection,
+                 recordcomplement, recordintersection, diff, recorddiff):
+        _test_exclusive_flags(impl)
+
+
+def test_recordintersection_field_alignment():
+    # columns are in a different order; record versions align by field name
+    a = (('foo', 'bar'),
+         ('A', 1),
+         ('B', 2), ('B', 2), ('B', 2),
+         ('C', 7))
+    b = (('bar', 'foo'),
+         (2, 'B'), (2, 'B'),
+         (1, 'A'))
+    multiset_expectation = (('foo', 'bar'),
+                            ('A', 1),
+                            ('B', 2), ('B', 2))
+    ieq(multiset_expectation, recordintersection(a, b))
+    ieq(multiset_expectation, recordintersection(a, b, multiset=True))
+    strict_expectation = (('foo', 'bar'),
+                          ('A', 1),
+                          ('B', 2))
+    ieq(strict_expectation, recordintersection(a, b, strict=True))
+
+
+def test_positional_intersection_ignores_field_names():
+    # the ordinary version compares by position, so reordered columns do not
+    # match even when the records are equal by field name
+    a = (('foo', 'bar'),
+         ('B', 2), ('B', 2))
+    b = (('bar', 'foo'),
+         (2, 'B'), (2, 'B'))
+    expectation = (('foo', 'bar'),)
+    ieq(expectation, intersection(a, b))
+    ieq(expectation, intersection(a, b, strict=True))
+
+
+def test_multiset_reconstruction_identity():
+    # multiplicity must be conserved across both directions:
+    # A == (A - B) + intersection(A, B) and likewise for B
+    a = (('k',),
+         ('p',), ('p',),
+         ('q',), ('q',), ('q',),
+         ('r',))
+    b = (('k',),
+         ('q',), ('q',),
+         ('r',), ('r',),
+         ('s',))
+
+    def counts(table):
+        return Counter(row for row in table)
+
+    for cmpl, inter in ((complement, intersection),
+                        (hashcomplement, hashintersection)):
+        a_only = counts(list(cmpl(a, b))[1:])
+        b_only = counts(list(cmpl(b, a))[1:])
+        common_ab = counts(list(inter(a, b))[1:])
+        common_ba = counts(list(inter(b, a))[1:])
+        assert a_only + common_ab == counts(list(a)[1:])
+        assert b_only + common_ba == counts(list(b)[1:])
+        # multiset intersection is symmetric
+        assert common_ab == common_ba
+        # strict set mode reconstructs the de-duplicated inputs
+        assert (set(list(cmpl(a, b, strict=True))[1:])
+                | set(list(inter(a, b, strict=True))[1:])) \
+            == set(list(a)[1:])
+
+
+def test_large_duplicate_run_presorted():
+    # a single merge must handle a very large repeated group without keeping
+    # the whole group in memory
+    n = 10000
+    a = (('k',),) + (('x',),) * n + (('z',),)
+    b = (('k',),) + (('x',),) * (n - 3)
+    ieq((('k',),) + (('x',),) * 3 + (('z',),),
+        complement(a, b, presorted=True))
+    ieq((('k',),) + (('x',),) * (n - 3),
+        intersection(a, b, presorted=True))
+    ieq((('k',), ('x',)),
+        intersection(a, b, presorted=True, strict=True))
