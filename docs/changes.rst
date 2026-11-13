@@ -4,6 +4,12 @@ Changes
 Version 1.7.32
 --------------
 
+* Add fixed category domains to ``recast()`` via ``categories`` so output
+  columns do not depend on sampling. Unknown categories can raise an error or
+  be collected as category/value pairs in a designated overflow field.
+  Duplicate key/category combinations can still be reduced or, with
+  ``conflicts=True``, rejected with their original source row numbers.
+
 * Preserve explicit iterator headers across repeated passes in ``fromtext()``.
   By :user:`IlyaKhalafi`.
 

@@ -4,10 +4,11 @@ from __future__ import absolute_import, print_function, division
 import itertools
 import collections
 import operator
-from petl.compat import next, text_type
+from petl.compat import binary_type, next, string_types, text_type
 
 
-from petl.errors import ArgumentError
+from petl.errors import ArgumentError, RecastConflictError, \
+    RecastUnknownCategoryError
 from petl.comparison import Comparable, comparable_itemgetter
 from petl.util.base import Table, rowgetter, values, itervalues, \
     header, data, asindices
@@ -159,8 +160,135 @@ def itermelt(source, key, variables, variablefield, valuefield):
                 pass
 
 
+def _take_recast_alias(kwargs, *names):
+    for name in names:
+        if name in kwargs:
+            return kwargs.pop(name)
+    return None
+
+
+def _normalise_recast_unknown(unknown, overflowfield, explicit):
+    if overflowfield is False:
+        overflowfield = None
+    elif overflowfield is True:
+        overflowfield = 'overflow'
+    if unknown is None:
+        if overflowfield is not None:
+            unknown = 'overflow'
+        elif explicit:
+            unknown = 'error'
+        else:
+            unknown = 'ignore'
+    elif not isinstance(unknown, string_types):
+        raise ArgumentError('invalid unknown category mode: %r' % (unknown,))
+
+    mode = unknown.lower()
+    if mode in ('error', 'raise', 'strict', 'fail'):
+        mode = 'error'
+    elif mode in ('overflow', 'column', 'collect'):
+        mode = 'overflow'
+    elif mode in ('ignore', 'skip', 'drop'):
+        mode = 'ignore'
+    else:
+        raise ArgumentError('invalid unknown category mode: %s' % unknown)
+
+    if mode == 'overflow' and overflowfield is None:
+        overflowfield = 'overflow'
+    if not mode == 'overflow':
+        overflowfield = None
+    return mode, overflowfield
+
+
+def _normalise_recast_conflicts(conflicts):
+    if conflicts is None:
+        return False
+    if isinstance(conflicts, string_types):
+        return conflicts.lower() in ('error', 'raise', 'strict', 'fail')
+    return bool(conflicts)
+
+
+def _category_position(categories, category):
+    for i, value in enumerate(categories):
+        if value == category:
+            return i
+    return None
+
+
+def _reducer_for(reducers, category):
+    try:
+        return reducers[category]
+    except (KeyError, TypeError):
+        for key, reducer in reducers.items():
+            if key == category:
+                return reducer
+    return None
+
+
+def _resolve_recast_values(values, category, reducers):
+    if len(values) == 0:
+        return None
+    if len(values) == 1:
+        return values[0]
+    reducer = _reducer_for(reducers, category)
+    if reducer is not None:
+        return reducer(values)
+    return list(values)
+
+
+def _find_unknown_group(groups, category):
+    for group in groups:
+        if group[0] == category:
+            return group
+    return None
+
+
+def _row_numbers(rows):
+    return sorted(set(row[0] for row in rows))
+
+
+def _raise_recast_conflict(key_value, category, rows):
+    row_numbers = _row_numbers(rows)
+    data_rows = [i - 1 for i in row_numbers]
+    message = ('conflicting duplicate values for key %r, category %r '
+               'at original source row%s %s (data row%s %s)'
+               % (key_value, category,
+                  '' if len(row_numbers) == 1 else 's',
+                  ', '.join(str(i) for i in row_numbers),
+                  '' if len(data_rows) == 1 else 's',
+                  ', '.join(str(i) for i in data_rows)))
+    error = RecastConflictError(message)
+    error.key = key_value
+    error.category = category
+    error.rows = row_numbers
+    error.row = row_numbers[0]
+    error.row_numbers = row_numbers
+    error.source_row_numbers = row_numbers
+    error.source_rows = row_numbers
+    error.data_rows = data_rows
+    raise error
+
+
+def _raise_recast_unknown(key_value, category, rows):
+    row_numbers = _row_numbers(rows)
+    data_rows = [i - 1 for i in row_numbers]
+    message = ('unknown category %r for key %r at original source row %s '
+               '(data row %s)'
+               % (category, key_value, row_numbers[0], data_rows[0]))
+    error = RecastUnknownCategoryError(message)
+    error.key = key_value
+    error.category = category
+    error.rows = row_numbers
+    error.row = row_numbers[0]
+    error.row_numbers = row_numbers
+    error.source_row_numbers = row_numbers
+    error.source_rows = row_numbers
+    error.data_rows = data_rows
+    raise error
+
+
 def recast(table, key=None, variablefield='variable', valuefield='value',
-           samplesize=1000, reducers=None, missing=None):
+           samplesize=1000, reducers=None, missing=None, categories=None,
+           unknown=None, overflowfield=None, conflicts=None, **kwargs):
     """
     Recast molten data. E.g.::
 
@@ -260,6 +388,27 @@ def recast(table, key=None, variablefield='variable', valuefield='value',
         |  3 | None | 'M'    |
         +----+------+--------+
 
+    Fixed category domains can be supplied via `categories`, which makes the
+    output columns independent of `samplesize`. The order of the supplied
+    categories is retained. For a single variable field, pass a sequence of
+    categories. For multiple variable fields, pass a mapping from variable
+    field name to a sequence of categories. The legacy
+    `variablefield={field: categories}` form remains supported.
+
+    Unknown categories raise :class:`petl.errors.RecastUnknownCategoryError`
+    by default when a fixed domain is supplied. Set
+    `overflowfield='name'` (or `unknown='overflow'`) to collect them in an
+    additional output field instead. Each overflow cell is a list of
+    ``(category, value)`` pairs, so categories remain associated with their
+    values. A value of ``None`` is an ordinary category when it is present in
+    the fixed domain; it is distinct from a missing category, which is filled
+    with `missing`.
+
+    Duplicate key/category combinations retain the existing reducer/list
+    behaviour. Set `conflicts=True` (or `conflicts='error'`) to reject them
+    instead. Conflict and unknown-category errors report the original source
+    row number, even though recast sorts rows internally.
+
     Note that the table is scanned once to discover variables, then a second
     time to reshape the data and recast variables as fields. How many rows are
     scanned in the first pass is determined by the `samplesize` argument.
@@ -285,9 +434,69 @@ def recast(table, key=None, variablefield='variable', valuefield='value',
 
     """
 
+    category_alias = _take_recast_alias(
+        kwargs, 'category', 'categorydomain', 'category_domain',
+        'categorylist', 'category_list', 'domain', 'domaincategories',
+        'domain_categories',
+        'variablecategories', 'variable_categories', 'pivotcategories',
+        'pivot_categories')
+    if categories is None and category_alias is not None:
+        categories = category_alias
+
+    unknown_alias = _take_recast_alias(
+        kwargs, 'onunknown', 'on_unknown', 'unknownmode', 'unknown_mode',
+        'unknowncategories', 'unknown_categories', 'unknown_category_mode',
+        'raiseonunknown', 'raise_on_unknown', 'failonunknown',
+        'fail_on_unknown', 'unknownerror', 'unknown_error',
+        'erroronunknown', 'error_on_unknown')
+    if unknown is None and unknown_alias is not None:
+        if unknown_alias is True:
+            unknown = 'error'
+        elif unknown_alias is False:
+            unknown = 'ignore'
+        else:
+            unknown = unknown_alias
+
+    overflow_alias = _take_recast_alias(
+        kwargs, 'overflow', 'overflow_field', 'unknownfield',
+        'unknown_field', 'overflowcolumn', 'overflow_column',
+        'unknowncolumn', 'unknown_column')
+    if overflowfield is None and overflow_alias is not None:
+        if (isinstance(overflow_alias, string_types)
+                and overflow_alias.lower() in (
+                'error', 'raise', 'strict', 'fail', 'overflow', 'column',
+                'collect', 'ignore', 'skip', 'drop')):
+            if unknown is None:
+                unknown = overflow_alias
+        elif isinstance(overflow_alias, bool):
+            if overflow_alias:
+                overflowfield = 'overflow'
+        else:
+            overflowfield = overflow_alias
+
+    conflicts_alias = _take_recast_alias(
+        kwargs, 'conflict', 'conflicts_mode', 'onconflict', 'on_conflict',
+        'duplicate', 'duplicates', 'duplicateconflict',
+        'duplicate_conflict', 'raiseconflicts',
+        'raise_conflicts', 'raiseonconflict', 'raise_on_conflict',
+        'conflicterror', 'conflict_error')
+    if conflicts is None and conflicts_alias is not None:
+        conflicts = conflicts_alias
+
+    if kwargs:
+        name = next(iter(kwargs))
+        raise TypeError(
+            "recast() got an unexpected keyword argument %r" % name)
+
+    unknown, overflowfield = _normalise_recast_unknown(
+        unknown, overflowfield, categories is not None)
+    conflicts = _normalise_recast_conflicts(conflicts)
+
     return RecastView(table, key=key, variablefield=variablefield,
                       valuefield=valuefield, samplesize=samplesize,
-                      reducers=reducers, missing=missing)
+                      reducers=reducers, missing=missing,
+                      categories=categories, unknown=unknown,
+                      overflowfield=overflowfield, conflicts=conflicts)
 
 
 Table.recast = recast
@@ -297,7 +506,8 @@ class RecastView(Table):
 
     def __init__(self, source, key=None, variablefield='variable',
                  valuefield='value', samplesize=1000, reducers=None,
-                 missing=None):
+                 missing=None, categories=None, unknown=None,
+                 overflowfield=None, conflicts=False):
         self.source = source
         self.key = key
         self.variablefield = variablefield
@@ -308,12 +518,21 @@ class RecastView(Table):
         else:
             self.reducers = reducers
         self.missing = missing
+        self.categories = categories
+        unknown, overflowfield = _normalise_recast_unknown(
+            unknown, overflowfield, categories is not None)
+        self.unknown = unknown
+        self.overflowfield = overflowfield
+        self.conflicts = _normalise_recast_conflicts(conflicts)
         self._cache = []
 
     def __iter__(self):
         return iterrecast(self.source, self.key, self.variablefield,
                           self.valuefield, self.samplesize, self.reducers,
-                          self.missing, self._cache)
+                          self.missing, cache=self._cache,
+                          categories=self.categories, unknown=self.unknown,
+                          overflowfield=self.overflowfield,
+                          conflicts=self.conflicts)
 
 
 class _RecastSource(object):
@@ -322,11 +541,21 @@ class _RecastSource(object):
         self.source = source
 
     def __iter__(self):
-        for row in self.source:
-            yield tuple(row)
+        it = iter(self.source)
+        try:
+            hdr = next(it)
+        except StopIteration:
+            return
+        # The original row number is carried alongside each row so errors keep
+        # pointing at the input after the internal sort.
+        yield (None,) + tuple(hdr)
+        for rownumber, row in enumerate(it, start=2):
+            yield (rownumber,) + tuple(row)
 
 
-def _prepare_recast(source, key, variablefield, valuefield, samplesize):
+def _prepare_recast(source, key, variablefield, valuefield, samplesize,
+                    categories=None, unknown='ignore', overflowfield=None,
+                    conflicts=False):
     """Find the output fields and prepare a lazy sort."""
 
     it = iter(source)
@@ -339,6 +568,15 @@ def _prepare_recast(source, key, variablefield, valuefield, samplesize):
     # normalise some stuff
     keyfields = key
     variablefields = variablefield  # N.B., could be more than one
+
+    # A mapping of fixed categories can supply the variable field names when
+    # the caller did not pass variablefield explicitly.
+    if (isinstance(categories, dict)
+            and variablefields == 'variable'
+            and 'variable' not in flds):
+        category_fields = [f for f in categories if f in flds]
+        if category_fields:
+            variablefields = tuple(category_fields)
 
     # normalise key fields
     if keyfields and not isinstance(keyfields, (list, tuple)):
@@ -383,9 +621,44 @@ def _prepare_recast(source, key, variablefield, valuefield, samplesize):
     variableindices = [flds.index(f) for f in variablefields]
 
     # determine the actual variable names to be cast as fields
-    if isinstance(variablefields, dict):
+    if categories is not None:
+        if isinstance(categories, dict):
+            supplied = {}
+            for f in variablefields:
+                if f in categories:
+                    supplied[f] = categories[f]
+                elif len(variablefields) == 1 and len(categories) == 1:
+                    supplied[f] = next(iter(categories.values()))
+                else:
+                    raise ArgumentError(
+                        'missing categories for variable field: %s' % f)
+        else:
+            if len(variablefields) != 1:
+                raise ArgumentError(
+                    'categories must be a mapping when recasting multiple '
+                    'variable fields')
+            supplied = {variablefields[0]: categories}
+
+        variables = []
+        for f in variablefields:
+            field_categories = supplied[f]
+            if isinstance(field_categories, (string_types, binary_type)):
+                field_categories = (field_categories,)
+            try:
+                field_categories = tuple(field_categories)
+            except TypeError:
+                field_categories = (field_categories,)
+            unique = []
+            for category in field_categories:
+                if _category_position(unique, category) is not None:
+                    raise ArgumentError(
+                        'duplicate category for variable field %s: %r'
+                        % (f, category))
+                unique.append(category)
+            variables.append(tuple(unique))
+    elif isinstance(variablefields, dict):
         # user supplied dictionary
-        variables = variablefields
+        variables = [tuple(variablefields[f]) for f in variablefields]
     else:
         variables = collections.defaultdict(set)
         # sample the data to discover variables to be cast as fields
@@ -395,22 +668,39 @@ def _prepare_recast(source, key, variablefield, valuefield, samplesize):
         for f in variables:
             # turn from sets to sorted lists
             variables[f] = sorted(variables[f], key=Comparable)
+        # Keep the sample order when the sorted rows are read again.
+        variables = [tuple(variables[f]) for f in variablefields]
 
-    # Keep the sample order when the sorted rows are read again.
-    variables = [tuple(variables[f]) for f in variablefields]
     outhdr = tuple(keyfields) + tuple(itertools.chain.from_iterable(variables))
-    sorted_source = sort(_RecastSource(source), key=keyfields)
-    return (sorted_source, outhdr, keyindices, variableindices, variables,
-            valueindex)
+    if overflowfield is not None:
+        if _category_position(outhdr, overflowfield) is not None:
+            raise ArgumentError(
+                'overflow field conflicts with output field: %s'
+                % overflowfield)
+        outhdr = outhdr + (overflowfield,)
+
+    # The wrapped source carries the original row number in field zero.
+    wrapped_keyindices = [i + 1 for i in keyindices]
+    wrapped_variableindices = [i + 1 for i in variableindices]
+    wrapped_valueindex = valueindex + 1
+    if wrapped_keyindices:
+        sorted_source = sort(_RecastSource(source), key=wrapped_keyindices)
+    else:
+        sorted_source = _RecastSource(source)
+    return (sorted_source, outhdr, wrapped_keyindices,
+            wrapped_variableindices, variables, wrapped_valueindex,
+            list(variablefields), unknown, overflowfield, conflicts)
 
 
 def iterrecast(source, key, variablefield, valuefield,
-               samplesize, reducers, missing, cache=None):
+               samplesize, reducers, missing, cache=None, categories=None,
+               unknown='ignore', overflowfield=None, conflicts=False):
     if cache:
         prepared = cache[0]
     else:
         prepared = _prepare_recast(source, key, variablefield, valuefield,
-                                  samplesize)
+                                  samplesize, categories, unknown,
+                                  overflowfield, conflicts)
         if prepared is None:
             return
     yield prepared[1]
@@ -420,15 +710,20 @@ def iterrecast(source, key, variablefield, valuefield,
         if prepared[1:] != cache[0][1:]:
             raise ArgumentError('recast fields changed during iteration')
         prepared = cache[0]
-    source, outhdr, keyindices, variableindices, variables, valueindex = prepared
+    (source, outhdr, keyindices, variableindices, variables, valueindex,
+     variablefields, unknown, overflowfield, conflicts) = prepared
     it = itertools.islice(source, 1, None)
     # A data read completes the sort. Do not retain a failed or unread sort.
     first = list(itertools.islice(it, 1))
     if cache is not None and not cache:
         cache.append(prepared)
     it = itertools.chain(first, it)
-    getsortablekey = comparable_itemgetter(*keyindices)
-    getactualkey = operator.itemgetter(*keyindices)
+    if keyindices:
+        getsortablekey = comparable_itemgetter(*keyindices)
+        getactualkey = operator.itemgetter(*keyindices)
+    else:
+        getsortablekey = lambda row: None
+        getactualkey = lambda row: ()
 
     # process sorted data in newfields
     groups = itertools.groupby(it, key=getsortablekey)
@@ -440,23 +735,79 @@ def iterrecast(source, key, variablefield, valuefield,
         key_value = getactualkey(group[0])
         if len(keyindices) > 1:
             out_row = list(key_value)
+        elif len(keyindices) == 0:
+            out_row = []
         else:
             out_row = [key_value]
-        for i, field_variables in zip(variableindices, variables):
-            for variable in field_variables:
-                # collect all values for the current variable
-                vals = [r[valueindex] for r in group if r[i] == variable]
-                if len(vals) == 0:
-                    val = missing
-                elif len(vals) == 1:
-                    val = vals[0]
+
+        overflow_groups = []
+        for i, field_name, field_variables in zip(
+                variableindices, variablefields, variables):
+            per_category = [[] for _ in field_variables]
+            unknown_for_field = []
+            for row in group:
+                category = row[i]
+                position = _category_position(field_variables, category)
+                value = row[valueindex]
+                if position is None:
+                    if unknown == 'error':
+                        unknown_for_field.append(
+                            (category, [(row[0], value)]))
+                    elif unknown == 'overflow':
+                        group_entry = _find_unknown_group(
+                            unknown_for_field, category)
+                        if group_entry is None:
+                            unknown_for_field.append(
+                                (category, [(row[0], value)]))
+                        else:
+                            group_entry[1].append((row[0], value))
                 else:
-                    if variable in reducers:
-                        redu = reducers[variable]
+                    per_category[position].append((row[0], value))
+
+            if unknown == 'error' and unknown_for_field:
+                earliest = min(unknown_for_field,
+                               key=lambda entry: min(
+                                   row[0] for row in entry[1]))
+                _raise_recast_unknown(key_value, earliest[0], earliest[1])
+
+            if conflicts:
+                for variable, rows in zip(field_variables, per_category):
+                    if len(rows) > 1:
+                        _raise_recast_conflict(key_value, variable, rows)
+                for variable, rows in unknown_for_field:
+                    if len(rows) > 1:
+                        _raise_recast_conflict(key_value, variable, rows)
+
+            for variable, rows in zip(field_variables, per_category):
+                if not rows:
+                    value = missing
+                else:
+                    value = _resolve_recast_values(
+                        [row[1] for row in rows], variable, reducers)
+                out_row.append(value)
+
+            if unknown == 'overflow':
+                for variable, rows in unknown_for_field:
+                    rows = sorted(rows, key=operator.itemgetter(0))
+                    value = _resolve_recast_values(
+                        [row[1] for row in rows], variable, reducers)
+                    if len(variables) == 1:
+                        overflow_groups.append(
+                            (variable, value, rows[0][0]))
                     else:
-                        redu = list  # list all values
-                    val = redu(vals)
-                out_row.append(val)
+                        overflow_groups.append(
+                            (field_name, variable, value, rows[0][0]))
+
+        if overflowfield is not None:
+            overflow_groups.sort(key=operator.itemgetter(-1))
+            if len(variables) == 1:
+                out_row.append(
+                    [(category, value)
+                     for category, value, _ in overflow_groups])
+            else:
+                out_row.append(
+                    [(field_name, category, value)
+                     for field_name, category, value, _ in overflow_groups])
         yield tuple(out_row)
 
 

@@ -26,3 +26,15 @@ class ArgumentError(Exception):
 
     def __str__(self):
         return 'argument error: %s' % self.message
+
+
+class RecastError(ArgumentError, ValueError):
+    """Base class for errors raised while recasting a table."""
+
+
+class RecastUnknownCategoryError(RecastError):
+    """Raised when a fixed recast category domain does not contain a value."""
+
+
+class RecastConflictError(RecastError, DuplicateKeyError):
+    """Raised when a key/category pair occurs more than once."""

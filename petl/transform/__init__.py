@@ -37,6 +37,8 @@ from petl.transform.regex import capture, split, search, searchcomplement, \
 
 from petl.transform.reshape import melt, recast, transpose, pivot, flatten, \
     unflatten
+from petl.errors import RecastError, RecastUnknownCategoryError, \
+    RecastConflictError
 
 from petl.transform.maps import fieldmap, rowmap, rowmapmany, rowgroupmap
 

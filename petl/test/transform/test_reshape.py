@@ -9,7 +9,8 @@ import sys
 
 import pytest
 
-from petl.errors import ArgumentError, FieldSelectionError
+from petl.errors import ArgumentError, FieldSelectionError, \
+    RecastConflictError, RecastUnknownCategoryError
 from petl.test.helpers import ieq
 from petl.transform.reshape import melt, recast, transpose, pivot, flatten, \
     unflatten
@@ -320,6 +321,75 @@ def test_recast4():
               (1, 12, 'F'),
               (2, 17, None),
               (3, None, 'M'))
+    ieq(expect, result)
+
+
+def test_recast_explicit_categories_control_columns_and_order():
+    table = (('id', 'variable', 'value'),
+             (2, 'b', 20),
+             (1, 'a', 10),
+             (2, 'a', 2),
+             (1, 'b', 1))
+    expect = (('id', 'b', 'a'),
+              (1, 1, 10),
+              (2, 20, 2))
+    result = recast(table, key='id', categories=['b', 'a'], samplesize=1)
+    ieq(expect, result)
+
+
+def test_recast_unknown_category_reports_original_row():
+    table = (('id', 'variable', 'value'),
+             (2, 'a', 20),
+             (2, 'late', 21),
+             (1, 'a', 10))
+    with pytest.raises(RecastUnknownCategoryError, match='row 3'):
+        list(recast(table, key='id', categories=['a']))
+
+
+def test_recast_overflow_preserves_category_value_pairs():
+    table = (('id', 'variable', 'value'),
+             (2, 'a', 20),
+             (1, 'a', 10),
+             (1, 'x', 1),
+             (1, 'y', 2))
+    expect = (('id', 'a', 'other'),
+              (1, 10, [('x', 1), ('y', 2)]),
+              (2, 20, []))
+    result = recast(table, key='id', categories=['a'],
+                    overflowfield='other')
+    ieq(expect, result)
+
+
+def test_recast_overflow_reduces_duplicate_unknown_categories():
+    table = (('id', 'variable', 'value'),
+             (1, 'a', 10),
+             (1, 'x', 1),
+             (1, 'x', 2))
+    expect = (('id', 'a', 'other'),
+              (1, 10, [('x', 3)]))
+    result = recast(table, key='id', categories=['a'],
+                    overflowfield='other', reducers={'x': sum})
+    ieq(expect, result)
+
+
+def test_recast_conflict_reports_original_rows_not_sort_positions():
+    table = (('id', 'variable', 'value'),
+             (2, 'a', 20),
+             (1, 'a', 10),
+             (1, 'a', 11))
+    with pytest.raises(RecastConflictError, match='rows 3, 4'):
+        list(recast(table, key='id', categories=['a'], conflicts=True))
+
+
+def test_recast_none_category_is_distinct_from_missing_category():
+    table = (('id', 'variable', 'value'),
+             (1, None, 7),
+             (1, 'a', 10),
+             (2, 'a', 20))
+    expect = (('id', None, 'a'),
+              (1, 7, 10),
+              (2, -1, 20))
+    result = recast(table, key='id', categories=[None, 'a'], missing=-1)
     ieq(expect, result)
 
 
