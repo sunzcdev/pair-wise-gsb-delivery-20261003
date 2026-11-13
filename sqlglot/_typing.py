@@ -12,6 +12,17 @@ if t.TYPE_CHECKING:
 
     P = ParamSpec("P")
 
+    # A single ordered output column of a table-valued function: (name, type). The type may be
+    # a `sqlglot.exp.DataType`, a type string, or None when the type is unknown.
+    TableFunctionColumn = tuple[str, exp.DataType | str | None]
+
+    # The ordered output columns of a table-valued function. Returning None (or an empty
+    # sequence) signals that the output schema could not be determined.
+    TableFunctionResult = t.Union[
+        t.Mapping[str, exp.DataType | str | None],
+        t.Sequence[TableFunctionColumn],
+    ]
+
 B = t.TypeVar("B", bound="sqlglot.exp.Binary")
 E = t.TypeVar("E", bound="sqlglot.exp.Expr")
 F = t.TypeVar("F", bound="sqlglot.exp.Func")
@@ -73,3 +84,4 @@ class SchemaArgs(t.TypedDict, total=False):
     dialect: DialectType
     normalize: bool
     udf_mapping: dict[str, object] | None
+    table_function_resolver: t.Callable[[exp.Func, DialectType], TableFunctionResult | None] | None

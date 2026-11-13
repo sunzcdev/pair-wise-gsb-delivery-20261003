@@ -3,7 +3,7 @@ import unittest
 import weakref
 
 from sqlglot import exp, parse_one, to_table
-from sqlglot.errors import SchemaError
+from sqlglot.errors import OptimizeError, SchemaError
 from sqlglot.optimizer.annotate_types import annotate_types
 from sqlglot.optimizer.qualify import qualify
 from sqlglot.optimizer.scope import build_scope
@@ -523,3 +523,206 @@ class TestSchema(unittest.TestCase):
         )
         self.assertEqual(expression.sql(), 'SELECT "t"."a" AS "a" FROM "t" AS "t"')
         self.assertEqual(expression.selects[0].type.sql(), "INT")
+
+    def test_table_function_resolver_columns(self):
+        def resolver(func, dialect):
+            self.assertIsInstance(func, exp.Func)
+            return [("a", "INT"), ("b", "VARCHAR")]
+
+        schema = MappingSchema(dialect="duckdb", table_function_resolver=resolver)
+
+        # Star expansion uses the resolver's ordered output columns
+        expression = qualify(
+            parse_one("SELECT * FROM my_func(1) AS f", dialect="duckdb"),
+            schema=schema,
+            dialect="duckdb",
+            validate_qualify_columns=False,
+        )
+        self.assertEqual(
+            expression.sql(),
+            'SELECT "f"."a" AS "a", "f"."b" AS "b" FROM MY_FUNC(1) AS "f"',
+        )
+
+        # Explicit columns are qualified against the resolved output
+        expression = qualify(
+            parse_one("SELECT a, b FROM my_func(1) AS f", dialect="duckdb"),
+            schema=schema,
+            dialect="duckdb",
+        )
+        self.assertEqual(
+            expression.sql(),
+            'SELECT "f"."a" AS "a", "f"."b" AS "b" FROM MY_FUNC(1) AS "f"',
+        )
+
+    def test_table_function_resolver_types(self):
+        schema = MappingSchema(
+            dialect="duckdb",
+            table_function_resolver=lambda func, dialect: [("a", "INT"), ("b", None)],
+        )
+        expression = annotate_types(
+            qualify(
+                parse_one("SELECT a, b FROM my_func(1) AS f", dialect="duckdb"),
+                schema=schema,
+                dialect="duckdb",
+            ),
+            schema=schema,
+            dialect="duckdb",
+        )
+        self.assertEqual(expression.selects[0].type.sql(), "INT")
+        self.assertTrue(expression.selects[1].type.is_type(exp.DataType.Type.UNKNOWN))
+
+    def test_table_function_resolver_mapping_result(self):
+        schema = MappingSchema(
+            dialect="duckdb",
+            table_function_resolver=lambda func, dialect: {"a": "INT", "b": "VARCHAR"},
+        )
+        expression = qualify(
+            parse_one("SELECT * FROM my_func(1) AS f", dialect="duckdb"),
+            schema=schema,
+            dialect="duckdb",
+            validate_qualify_columns=False,
+        )
+        self.assertEqual(expression.named_selects, ["a", "b"])
+
+    def test_table_function_resolver_caches_per_analysis(self):
+        calls = []
+
+        def resolver(func, dialect):
+            calls.append(id(func))
+            return [("a", "INT")]
+
+        schema = MappingSchema(dialect="duckdb", table_function_resolver=resolver)
+
+        # The same function node (a CTE referenced twice) is resolved once within an analysis
+        qualify(
+            parse_one(
+                "WITH f AS (SELECT * FROM my_func(1)) "
+                "SELECT * FROM f CROSS JOIN f AS f2",
+                dialect="duckdb",
+            ),
+            schema=schema,
+            dialect="duckdb",
+            validate_qualify_columns=False,
+        )
+        self.assertEqual(len(calls), 1)
+
+        # Distinct function nodes are resolved independently
+        calls.clear()
+        qualify(
+            parse_one("SELECT * FROM my_func(1) m1, my_func(1) m2", dialect="duckdb"),
+            schema=schema,
+            dialect="duckdb",
+            validate_qualify_columns=False,
+        )
+        self.assertEqual(len(calls), 2)
+
+        # A new analysis does not reuse the previous run's mutable cache
+        calls.clear()
+        qualify(
+            parse_one("SELECT * FROM my_func(1)", dialect="duckdb"),
+            schema=schema,
+            dialect="duckdb",
+            validate_qualify_columns=False,
+        )
+        qualify(
+            parse_one("SELECT * FROM my_func(1)", dialect="duckdb"),
+            schema=schema,
+            dialect="duckdb",
+            validate_qualify_columns=False,
+        )
+        self.assertEqual(len(calls), 2)
+
+    def test_table_function_resolver_correlated_not_cached(self):
+        from sqlglot.optimizer.resolver import Resolver
+        from sqlglot.optimizer.scope import traverse_scope
+
+        invocations = []
+
+        def resolver(func, dialect):
+            invocations.append(id(func))
+            return [("z", "INT")]
+
+        schema = MappingSchema(
+            {"t": {"x": "INT"}}, dialect="duckdb", table_function_resolver=resolver
+        )
+        tree = parse_one(
+            "SELECT (SELECT z FROM my_func(t.x) LIMIT 1) FROM t", dialect="duckdb"
+        )
+        build_scope(tree)
+        cache = {}
+        for scope in traverse_scope(tree):
+            column_resolver = Resolver(scope, schema, cache)
+            for source in scope.sources.values():
+                if isinstance(source, exp.Table) and isinstance(source.this, exp.Func):
+                    column_resolver.resolve_table_function(source)
+                    column_resolver.resolve_table_function(source)
+
+        # Correlated calls bypass the cache and are re-invoked every time
+        self.assertEqual(len(invocations), 2)
+        self.assertEqual(cache, {})
+
+    def test_table_function_resolver_failure_keeps_query_scope(self):
+        def resolver(func, dialect):
+            raise RuntimeError("boom")
+
+        schema = MappingSchema(dialect="duckdb", table_function_resolver=resolver)
+        with self.assertRaises(OptimizeError) as ctx:
+            qualify(
+                parse_one("SELECT a FROM my_func(1) AS f", dialect="duckdb"),
+                schema=schema,
+                dialect="duckdb",
+            )
+        message = str(ctx.exception)
+        self.assertIn("MY_FUNC(1)", message)
+        self.assertIn("query scope", message)
+        self.assertIsInstance(ctx.exception.__cause__, RuntimeError)
+
+    def test_table_function_resolver_unknown_is_not_empty_table(self):
+        for result in (None, [], {}):
+            with self.subTest(result=result):
+                schema = MappingSchema(
+                    dialect="duckdb",
+                    table_function_resolver=lambda func, dialect, result=result: result,
+                )
+                # An unresolvable TVF stays an unknown source instead of an empty table
+                expression = qualify(
+                    parse_one("SELECT r FROM range(3) AS r", dialect="duckdb"),
+                    schema=schema,
+                    dialect="duckdb",
+                    validate_qualify_columns=False,
+                )
+                self.assertEqual(
+                    expression.sql(),
+                    'SELECT "r" AS "r" FROM GENERATE_SERIES(0, 3) AS "r"',
+                )
+
+    def test_table_function_resolver_preserves_physical_lookup(self):
+        schema = MappingSchema(
+            {"t": {"x": "INT"}},
+            dialect="duckdb",
+            table_function_resolver=lambda func, dialect: [("a", "INT")],
+        )
+        # Physical tables keep their existing mapping-based resolution
+        expression = qualify(
+            parse_one("SELECT x FROM t", dialect="duckdb"),
+            schema=schema,
+            dialect="duckdb",
+        )
+        self.assertEqual(expression.sql(), 'SELECT "t"."x" AS "x" FROM "t" AS "t"')
+
+    def test_table_function_resolver_optional_default(self):
+        # Without a callback the base behavior (unknown source) is unchanged
+        schema = MappingSchema(dialect="duckdb")
+        func = parse_one("SELECT * FROM my_func(1)", dialect="duckdb").find(exp.Func)
+        self.assertIsNone(schema.resolve_table_function(func, dialect="duckdb"))
+
+        # The abstract base Schema also returns None by default
+        self.assertIsNone(Schema.resolve_table_function(schema, func, dialect="duckdb"))
+
+    def test_table_function_resolver_copy(self):
+        resolver = lambda func, dialect: [("a", "INT")]
+        schema = MappingSchema(dialect="duckdb", table_function_resolver=resolver)
+        self.assertIs(schema.copy().table_function_resolver, resolver)
+        self.assertIs(
+            MappingSchema.from_mapping_schema(schema).table_function_resolver, resolver
+        )

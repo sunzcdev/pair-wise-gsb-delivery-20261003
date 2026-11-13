@@ -73,6 +73,10 @@ def qualify_columns(
     # Qualified scopes that still lack types, in traversal order (sources precede dependents)
     unannotated_scopes: list[Scope] = []
 
+    # Shared across every resolver of this analysis so identical table-function calls are
+    # resolved once; the cache is local and never leaks onto the schema.
+    table_function_cache: dict[int, list[tuple[str, exp.DataType | None]] | None] = {}
+
     for scope in traverse_scope(expression):
         if dialect.PREFER_CTE_ALIAS_COLUMN:
             pushdown_cte_alias_columns(scope)
@@ -82,7 +86,7 @@ def qualify_columns(
 
         _separate_pseudocolumns(scope, pseudocolumns)
 
-        resolver = Resolver(scope, schema)
+        resolver = Resolver(scope, schema, table_function_cache)
 
         _qualify_comprehensions(scope, resolver)
 

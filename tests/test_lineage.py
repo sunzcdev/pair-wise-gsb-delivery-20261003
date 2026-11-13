@@ -1379,3 +1379,24 @@ class TestLineage(unittest.TestCase):
                 seen.add(id(node))
         for nid in seen:
             self.assertEqual(counts.get(nid, 0), 1)
+
+    def test_lineage_table_function_resolver(self) -> None:
+        schema = MappingSchema(
+            dialect="duckdb",
+            table_function_resolver=lambda func, dialect: [
+                ("a", "INT"),
+                ("b", "VARCHAR"),
+            ],
+        )
+
+        node = lineage(
+            "a",
+            "SELECT a FROM my_func(1) AS f",
+            schema=schema,
+            dialect="duckdb",
+        )
+
+        self.assertEqual(node.name, "a")
+        downstream = node.downstream[0]
+        self.assertEqual(downstream.name, "f.a")
+        self.assertEqual(downstream.source.sql(), "MY_FUNC(1) AS f")

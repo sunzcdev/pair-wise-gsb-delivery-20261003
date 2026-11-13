@@ -11,12 +11,15 @@ from sqlglot.trie import TrieResult, in_trie, new_trie
 
 
 if t.TYPE_CHECKING:
-    from sqlglot._typing import SchemaArgs
+    from sqlglot._typing import SchemaArgs, TableFunctionResult
     from sqlglot.dialects.dialect import DialectType
     from collections.abc import Sequence
     from typing_extensions import Unpack
 
     ColumnMapping = t.Union[dict[str, t.Any], str, list[str]]
+    TableFunctionResolver = t.Callable[
+        [exp.Func, DialectType], TableFunctionResult | None
+    ]
 
 
 class Schema(abc.ABC):
@@ -133,6 +136,25 @@ class Schema(abc.ABC):
             The return type as a DataType, or UNKNOWN if not found.
         """
         return exp.DType.UNKNOWN.into_expr()
+
+    def resolve_table_function(
+        self,
+        func: exp.Func,
+        dialect: DialectType = None,
+    ) -> list[tuple[str, exp.DataType | None]] | None:
+        """
+        Resolve the ordered output columns of a table-valued function.
+
+        Args:
+            func: the table-valued function expression (e.g. the `this` of a `Table` source).
+            dialect: the SQL dialect used to interpret the function.
+
+        Returns:
+            A list of `(column_name, column_type)` pairs in output order, or None when the
+            output schema cannot be determined. Implementations without a table-function
+            resolver return None so callers fall back to an unknown source.
+        """
+        return None
 
     @property
     @abc.abstractmethod
@@ -316,10 +338,12 @@ class MappingSchema(AbstractMappingSchema, Schema):
         dialect: DialectType = None,
         normalize: bool = True,
         udf_mapping: dict[str, object] | None = None,
+        table_function_resolver: TableFunctionResolver | None = None,
     ) -> None:
         self.visible: dict[str, object] = {} if visible is None else visible
         self.normalize: bool = normalize
         self._dialect: Dialect = Dialect.get_or_raise(dialect)
+        self.table_function_resolver: TableFunctionResolver | None = table_function_resolver
         self._type_mapping_cache: dict[str, exp.DataType] = {}
         self._normalized_table_cache: dict[
             tuple[tuple[tuple[str, bool | None], ...], DialectType, bool], tuple[str, ...]
@@ -348,6 +372,7 @@ class MappingSchema(AbstractMappingSchema, Schema):
             dialect=mapping_schema.dialect,
             normalize=mapping_schema.normalize,
             udf_mapping=mapping_schema.udf_mapping,
+            table_function_resolver=mapping_schema.table_function_resolver,
         )
 
     def _find(
@@ -375,6 +400,7 @@ class MappingSchema(AbstractMappingSchema, Schema):
             "dialect": self.dialect,
             "normalize": self.normalize,
             "udf_mapping": self.udf_mapping.copy(),
+            "table_function_resolver": self.table_function_resolver,
             **kwargs,
         }
         return MappingSchema(self.mapping.copy() if schema is None else schema, **mapping_kwargs)
@@ -522,6 +548,50 @@ class MappingSchema(AbstractMappingSchema, Schema):
 
         table_schema: dict[str, object] | None = self._find(parts, raise_on_missing=False)
         return normalized_column_name in table_schema if table_schema else False
+
+    def resolve_table_function(
+        self,
+        func: exp.Func,
+        dialect: DialectType = None,
+    ) -> list[tuple[str, exp.DataType | None]] | None:
+        """
+        Resolve the ordered output columns of a table-valued function through the configured
+        `table_function_resolver` callback.
+
+        Args:
+            func: the table-valued function expression.
+            dialect: the SQL dialect used to interpret the function.
+
+        Returns:
+            A list of `(column_name, column_type)` pairs in output order, or None when no
+            resolver is configured or it could not determine the output schema.
+        """
+        if not self.table_function_resolver:
+            return None
+
+        result = self.table_function_resolver(func, dialect or self.dialect)
+        if not result:
+            return None
+
+        columns: list[tuple[str, exp.DataType | None]] = []
+        if isinstance(result, t.Mapping):
+            result = result.items()
+
+        for column in result:
+            name, column_type = column
+            if isinstance(column_type, str):
+                column_type = self._to_data_type(column_type, dialect=dialect)
+            elif column_type is None:
+                column_type = exp.DType.UNKNOWN.into_expr()
+
+            columns.append(
+                (
+                    self._normalize_name(name, dialect=dialect, normalize=True),
+                    column_type,
+                )
+            )
+
+        return columns or None
 
     def _normalize(self, schema: dict[str, object]) -> dict[str, object]:
         """

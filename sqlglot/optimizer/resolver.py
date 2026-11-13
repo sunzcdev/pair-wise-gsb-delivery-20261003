@@ -21,7 +21,13 @@ class Resolver:
     This is a class so we can lazily load some things and easily share them across functions.
     """
 
-    def __init__(self, scope: Scope, schema: Schema) -> None:
+    def __init__(
+        self,
+        scope: Scope,
+        schema: Schema,
+        table_function_cache: dict[int, list[tuple[str, exp.DataType | None]] | None]
+        | None = None,
+    ) -> None:
         self.scope: Scope = scope
         self.schema: Schema = schema
         self.dialect: Dialect = schema.dialect or Dialect()
@@ -33,6 +39,12 @@ class Resolver:
         self._column_type_from_scope_cache: dict[tuple[int, str], exp.DataType | None] = {}
         self._outer_resolvers: list[Resolver] | None = None
         self._select_aliases: set[str] | None = None
+        # Per-analysis memo of table-function resolutions, keyed by the function node's id.
+        # It is shared across every resolver of a single qualify/lineage run but is never
+        # stored on the schema, so distinct analyses or user sessions cannot observe it.
+        self.table_function_cache: dict[
+            int, list[tuple[str, exp.DataType | None]] | None
+        ] = table_function_cache if table_function_cache is not None else {}
 
     def get_table(
         self,
@@ -119,7 +131,9 @@ class Resolver:
             scope = self.scope
             while scope.can_be_correlated and scope.parent:
                 scope = scope.parent
-                self._outer_resolvers.append(Resolver(scope, self.schema))
+                self._outer_resolvers.append(
+                    Resolver(scope, self.schema, self.table_function_cache)
+                )
         return self._outer_resolvers
 
     def _get_unknown_tvf_table(self, source_columns: dict[str, Sequence[str]]) -> str | None:
@@ -145,6 +159,52 @@ class Resolver:
         return any(
             not columns or "*" in columns for columns in self._get_all_source_columns().values()
         )
+
+    def _table_function_references_outer_columns(self, func: exp.Func) -> bool:
+        """
+        Whether `func`'s arguments reference columns outside its enclosing query.
+
+        Such a call is correlated, so its output can change from row to row and must not be
+        memoized as if it were a constant invocation.
+        """
+        local_sources = set(self.scope.sources)
+        return any(
+            column.text("table") not in local_sources
+            for column in func.find_all(exp.Column)
+        )
+
+    def resolve_table_function(
+        self, table: exp.Table
+    ) -> list[tuple[str, exp.DataType | None]] | None:
+        """
+        Resolve the ordered `(name, type)` output columns of a table-valued function.
+
+        The result is memoized per analysis for constant invocations only. A call whose
+        arguments reference outer columns is re-resolved on every use and is never cached.
+        Failures are surfaced with the enclosing query scope rather than swallowed as empty.
+        """
+        func = table.this
+
+        if self._table_function_references_outer_columns(func):
+            return self._invoke_table_function_resolver(func)
+
+        cache_key = id(func)
+        if cache_key not in self.table_function_cache:
+            self.table_function_cache[cache_key] = self._invoke_table_function_resolver(func)
+
+        return self.table_function_cache[cache_key]
+
+    def _invoke_table_function_resolver(
+        self, func: exp.Func
+    ) -> list[tuple[str, exp.DataType | None]] | None:
+        try:
+            return self.schema.resolve_table_function(func, dialect=self.dialect)
+        except Exception as exc:  # noqa: BLE001 - re-raised with query scope context
+            scope_sql = self.scope.expression.sql(dialect=self.dialect)
+            raise OptimizeError(
+                f"Failed to resolve table function {func.sql(dialect=self.dialect)} "
+                f"in query scope: {scope_sql}"
+            ) from exc
 
     @property
     def all_columns(self) -> set[str]:
@@ -224,7 +284,11 @@ class Resolver:
                 source = self.scope.cte_sources[source.name]
 
             if isinstance(source, exp.Table):
-                columns = self.schema.column_names(source, only_visible)
+                if isinstance(source.this, exp.Func):
+                    resolved = self.resolve_table_function(source)
+                    columns = [name for name, _ in resolved] if resolved else []
+                else:
+                    columns = self.schema.column_names(source, only_visible)
             elif isinstance(source, Scope) and isinstance(
                 source_expr := source.expression, (exp.Values, exp.Unnest, exp.Lateral)
             ):
@@ -499,7 +563,7 @@ class Resolver:
             table_name = column.table
         else:
             # use the parent scope's resolver to disambiguate the column
-            parent_resolver = Resolver(scope, self.schema)
+            parent_resolver = Resolver(scope, self.schema, self.table_function_cache)
             table_identifier = parent_resolver.get_table(column)
             if not table_identifier:
                 return None
@@ -532,8 +596,20 @@ class Resolver:
         # None is a valid result if DataType could not be determined!
         result: exp.DataType | None = None
         if isinstance(source, exp.Table):
-            # base table - get the column type from schema
-            col_type = self.schema.get_column_type(source, column)
+            if isinstance(source.this, exp.Func):
+                # Reuse the same per-analysis table-function resolution as column qualification
+                resolved = self.resolve_table_function(source)
+                col_type = next(
+                    (
+                        column_type
+                        for name, column_type in (resolved or [])
+                        if name == column.name and column_type is not None
+                    ),
+                    None,
+                )
+            else:
+                # base table - get the column type from schema
+                col_type = self.schema.get_column_type(source, column)
             if col_type and not col_type.is_type(exp.DType.UNKNOWN):
                 result = col_type
         elif isinstance(source, Scope):

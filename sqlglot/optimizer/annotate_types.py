@@ -230,12 +230,19 @@ class TypeAnnotator:
             tuple[Scope, str], dict[str, exp.DataType | exp.DType]
         ] = {}
 
+        # Per-analysis memo of table-function resolutions, keyed by the function node's id.
+        # Correlated calls (arguments referencing outer columns) are never cached.
+        self._table_function_cache: dict[
+            int, list[tuple[str, exp.DataType | None]] | None
+        ] = {}
+
     def clear(self) -> None:
         self._visited.clear()
         self._null_expressions.clear()
         self._setop_column_types.clear()
         self._table_column_aliases.clear()
         self._scope_source_selects.clear()
+        self._table_function_cache.clear()
 
     # TODO (mypyc): should be expression: E -> E but mypyc resolves the TypeVar
     # to the isinstance-narrowed type, causing runtime type check failures.
@@ -479,6 +486,19 @@ class TypeAnnotator:
                         source_scope = source_scope.parent
 
                 if isinstance(source, exp.Table):
+                    if isinstance(source.this, exp.Func):
+                        resolved = self._resolve_table_function(source, source_scope or scope)
+                        table_col_type = next(
+                            (
+                                column_type
+                                for name, column_type in (resolved or [])
+                                if name == expr.name and column_type is not None
+                            ),
+                            exp.DType.UNKNOWN,
+                        )
+                        self._set_type(expr, table_col_type)
+                        continue
+
                     source_id = id(source)
                     if source_id not in self._table_column_aliases:
                         column_aliases: dict[str, str] = {}
@@ -550,6 +570,43 @@ class TypeAnnotator:
                 self._set_type(expr, exp.DType.UNKNOWN)
 
             self._restore_dot_parts(expr)
+
+    def _resolve_table_function(
+        self, table: exp.Table, scope: Scope
+    ) -> list[tuple[str, exp.DataType | None]] | None:
+        """
+        Resolve a table-valued function's ordered output columns through the schema callback.
+
+        Constant invocations are memoized per analysis; correlated calls whose arguments
+        reference outer columns are re-resolved and never cached. Errors carry the query scope.
+        """
+        func = table.this
+        local_sources = set(scope.sources)
+        references_outer_columns = any(
+            column.text("table") not in local_sources
+            for column in func.find_all(exp.Column)
+        )
+
+        if references_outer_columns:
+            return self._invoke_table_function_resolver(func, scope)
+
+        cache_key = id(func)
+        if cache_key not in self._table_function_cache:
+            self._table_function_cache[cache_key] = self._invoke_table_function_resolver(
+                func, scope
+            )
+        return self._table_function_cache[cache_key]
+
+    def _invoke_table_function_resolver(
+        self, func: exp.Func, scope: Scope
+    ) -> list[tuple[str, exp.DataType | None]] | None:
+        try:
+            return self.schema.resolve_table_function(func, dialect=self.dialect)
+        except Exception as exc:  # noqa: BLE001 - re-raised with query scope context
+            raise OptimizeError(
+                f"Failed to resolve table function {func.sql(dialect=self.dialect)} "
+                f"in query scope: {scope.expression.sql(dialect=self.dialect)}"
+            ) from exc
 
     def _annotate_table_column(self, expression: exp.TableColumn, scope: Scope) -> None:
         source = scope.sources.get(expression.name)
