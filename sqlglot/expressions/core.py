@@ -35,6 +35,7 @@ if t.TYPE_CHECKING:
     from sqlglot.dialects.dialect import DialectType
     from sqlglot.expressions.datatypes import DATA_TYPE, DataType, DType, Interval
     from sqlglot.expressions.query import Select
+    from sqlglot.parameterizer import ParameterizedQuery
 
     R = t.TypeVar("R")
 
@@ -1257,6 +1258,23 @@ class Expression(Expr):
         from sqlglot.dialects.dialect import Dialect
 
         return Dialect.get_or_raise(dialect).generate(self, copy=copy, **opts)
+
+    def parameterize(
+        self, dialect: DialectType = None, **opts: Unpack[GeneratorNoDialectArgs]
+    ) -> ParameterizedQuery:
+        """
+        Returns a parameterized SQL string and its bound values.
+
+        Args:
+            dialect: the target dialect of the generated SQL string.
+            **opts: other `sqlglot.parameterizer.Parameterizer` options.
+
+        Returns:
+            The generated SQL and its bound values.
+        """
+        from sqlglot.parameterizer import parameterize
+
+        return parameterize(self, dialect=dialect, **opts)
 
     def transform(
         self, fun: t.Callable[..., T], *args: object, copy: bool = True, **kwargs: object

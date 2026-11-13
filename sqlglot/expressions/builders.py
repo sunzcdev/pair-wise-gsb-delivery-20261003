@@ -941,6 +941,52 @@ def replace_placeholders(expression: Expr, *args: object, **kwargs: t.Any) -> Ex
     return expression.transform(_replace_placeholders, iter(args), **kwargs)
 
 
+def parameterize(
+    expression: Expr,
+    dialect: DialectType = None,
+    read: DialectType = None,
+    *,
+    named: bool | str | None = None,
+    reuse: bool = False,
+    prefix: str = "p",
+    start: int = 0,
+    **opts: t.Any,
+):
+    """
+    Converts bindable literals in an expression into driver parameters.
+
+    Args:
+        expression: the expression to parameterize.
+        dialect: the target dialect used to generate and validate the SQL.
+        read: the dialect used to parse a SQL string.
+        named: whether to use named placeholders and return a dictionary.
+        reuse: whether equal values of the same type share a named parameter.
+        prefix: the prefix used for generated named parameters.
+        start: the first number used for generated named parameters.
+        opts: additional options forwarded to :func:`sqlglot.parameterize`.
+
+    Returns:
+        The generated SQL and its bound values.
+    """
+    from sqlglot.parameterizer import parameterize as _parameterize
+
+    return _parameterize(
+        expression,
+        dialect=dialect,
+        read=read,
+        named=named,
+        reuse=reuse,
+        prefix=prefix,
+        start=start,
+        **opts,
+    )
+
+
+parameterize_sql = parameterize
+parameterize_literals = parameterize
+parameterized_sql = parameterize
+
+
 def expand(
     expression: Expr,
     sources: dict[str, Query | t.Callable[[], Query]],

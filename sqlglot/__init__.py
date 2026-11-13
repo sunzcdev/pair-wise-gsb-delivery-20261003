@@ -50,6 +50,16 @@ from sqlglot.expressions import (
     union as union,
 )
 from sqlglot.generator import Generator as Generator
+from sqlglot.parameterizer import (
+    ParameterizedQuery as ParameterizedQuery,
+    ParameterizedSQL as ParameterizedSQL,
+    Parameterizer as Parameterizer,
+    extract_parameters as extract_parameters,
+    parameterize as parameterize,
+    parameterize_literals as parameterize_literals,
+    parameterize_sql as parameterize_sql,
+    parameterized_sql as parameterized_sql,
+)
 from sqlglot.parser import Parser as Parser
 from sqlglot.schema import MappingSchema as MappingSchema, Schema as Schema
 from sqlglot.tokens import Token as Token, Tokenizer as Tokenizer, TokenType as TokenType

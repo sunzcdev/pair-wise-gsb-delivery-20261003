@@ -1356,6 +1356,11 @@ class Dialect(metaclass=_Dialect):
     ) -> str:
         return self.generator(**opts).generate(expression, copy=copy)
 
+    def parameterize(self, expression: str | exp.Expr, **opts):
+        from sqlglot.parameterizer import parameterize
+
+        return parameterize(expression, dialect=self, **opts)
+
     def transpile(self, sql: str, **opts: Unpack[GeneratorArgs]) -> list[str]:
         return [
             self.generate(expression, copy=False, **opts) if expression else ""
