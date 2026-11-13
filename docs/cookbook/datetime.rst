@@ -39,7 +39,26 @@ The second way is to specify a timezone as an argument to the type constructor:
     eastern = ZoneInfo('US/Eastern')
     datetime_type = agate.DateTime(timezone=eastern)
 
-In this case all timezones that are processed will be set to have the Eastern timezone. Note, the timezone will be **set**, not converted. You cannot use this method to convert your timezones from UTC to another timezone. To do that see :ref:`convert_timezones`.
+In this case all datetimes that are processed will be set to have the Eastern timezone. Note, the timezone will be **set**, not converted. You cannot use this method to convert your timezones from UTC to another timezone. To do that see :ref:`convert_timezones`.
+
+Values that already carry their own offset, such as ISO 8601 strings with a ``+06:00`` suffix, keep that offset and are never re-interpreted as local wall times in the specified timezone. This convention applies equally to values parsed with a ``datetime_format``, with the natural-language parser and with ISO 8601 auto-detection.
+
+Daylight saving time
+====================
+
+When a ``timezone`` is specified, local times are interpreted as wall-clock times in that timezone, which requires an explicit decision at daylight saving time transitions. Two arguments control this:
+
+- ``ambiguous``: a local time that occurs twice when clocks are turned back. ``'earlier'`` (the default) picks the first occurrence, ``'later'`` picks the second occurrence and ``'reject'`` raises a :class:`.CastError`.
+- ``nonexistent``: a local time that never occurs when clocks are turned forward. ``'reject'`` (the default) raises a :class:`.CastError`, ``'shift_forward'`` moves the time forward past the gap and ``'shift_backward'`` moves it backward before the gap.
+
+.. code-block:: python
+
+    from zoneinfo import ZoneInfo
+
+    eastern = ZoneInfo('US/Eastern')
+    datetime_type = agate.DateTime(timezone=eastern, ambiguous='later', nonexistent='shift_forward')
+
+The resulting :class:`datetime.datetime` instances carry the resolved ``fold`` attribute, so downstream code can tell which side of a transition was chosen. Timezones that do not observe daylight saving time, such as ``Asia/Shanghai``, are unaffected by these options.
 
 Calculate a time difference
 =============================

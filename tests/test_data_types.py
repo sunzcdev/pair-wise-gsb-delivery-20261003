@@ -397,6 +397,119 @@ class TestDateTime(unittest.TestCase):
             None
         ))
 
+    def test_cast_format_timezone(self):
+        tzinfo = ZoneInfo('America/New_York')
+        datetime_type = DateTime(datetime_format='%m-%d-%Y %I:%M %p', timezone=tzinfo)
+
+        casted = datetime_type.cast('03-01-1994 12:30 PM')
+        self.assertEqual(casted, datetime.datetime(1994, 3, 1, 12, 30, 0, 0, tzinfo=tzinfo))
+        self.assertEqual(casted.utcoffset(), datetime.timedelta(hours=-5))
+
+    def test_cast_format_timezone_aware_kept(self):
+        tzinfo = ZoneInfo('America/New_York')
+        datetime_type = DateTime(datetime_format='%Y-%m-%d %H:%M %z', timezone=tzinfo)
+
+        casted = datetime_type.cast('2021-06-01 12:30 +0600')
+        self.assertEqual(casted.utcoffset(), datetime.timedelta(hours=6))
+
+    def test_cast_iso_timezone_naive(self):
+        tzinfo = ZoneInfo('America/New_York')
+        datetime_type = DateTime(timezone=tzinfo)
+
+        casted = datetime_type.cast('2021-06-01T12:30:00')
+        self.assertEqual(casted, datetime.datetime(2021, 6, 1, 12, 30, 0, 0, tzinfo=tzinfo))
+        self.assertEqual(casted.utcoffset(), datetime.timedelta(hours=-4))
+
+    def test_cast_iso_timezone_aware_kept(self):
+        tzinfo = ZoneInfo('America/New_York')
+        datetime_type = DateTime(timezone=tzinfo)
+
+        casted = datetime_type.cast('2016-12-29T11:43:30+06:00')
+        self.assertEqual(casted.utcoffset(), datetime.timedelta(hours=6))
+
+        casted = datetime_type.cast('2016-12-29T11:43:30Z')
+        self.assertEqual(casted.utcoffset(), datetime.timedelta(0))
+
+    def test_cast_paths_consistent(self):
+        tzinfo = ZoneInfo('America/New_York')
+        expected = datetime.datetime(2021, 6, 1, 12, 30, 0, 0, tzinfo=tzinfo)
+
+        from_parser = DateTime(timezone=tzinfo).cast('6/1/2021 12:30 PM')
+        from_format = DateTime(datetime_format='%m/%d/%Y %H:%M', timezone=tzinfo).cast('06/01/2021 12:30')
+        from_iso = DateTime(timezone=tzinfo).cast('2021-06-01T12:30:00')
+
+        self.assertEqual(from_parser, expected)
+        self.assertEqual(from_format, expected)
+        self.assertEqual(from_iso, expected)
+
+    def test_cast_ambiguous_earlier(self):
+        tzinfo = ZoneInfo('America/New_York')
+        datetime_type = DateTime(timezone=tzinfo, ambiguous='earlier')
+
+        casted = datetime_type.cast('2021-11-07 01:30')
+        self.assertEqual(casted.fold, 0)
+        self.assertEqual(casted.utcoffset(), datetime.timedelta(hours=-4))
+
+    def test_cast_ambiguous_later(self):
+        tzinfo = ZoneInfo('America/New_York')
+        datetime_type = DateTime(timezone=tzinfo, ambiguous='later')
+
+        casted = datetime_type.cast('2021-11-07 01:30')
+        self.assertEqual(casted.fold, 1)
+        self.assertEqual(casted.utcoffset(), datetime.timedelta(hours=-5))
+
+    def test_cast_ambiguous_reject(self):
+        tzinfo = ZoneInfo('America/New_York')
+        datetime_type = DateTime(timezone=tzinfo, ambiguous='reject')
+
+        with self.assertRaises(CastError) as context:
+            datetime_type.cast('2021-11-07 01:30')
+
+        message = str(context.exception)
+        self.assertIn('2021-11-07 01:30', message)
+        self.assertIn('America/New_York', message)
+
+    def test_cast_nonexistent_reject(self):
+        tzinfo = ZoneInfo('America/New_York')
+        datetime_type = DateTime(timezone=tzinfo)
+
+        with self.assertRaises(CastError) as context:
+            datetime_type.cast('2021-03-14 02:30')
+
+        message = str(context.exception)
+        self.assertIn('2021-03-14 02:30', message)
+        self.assertIn('America/New_York', message)
+
+    def test_cast_nonexistent_shift_forward(self):
+        tzinfo = ZoneInfo('America/New_York')
+        datetime_type = DateTime(timezone=tzinfo, nonexistent='shift_forward')
+
+        casted = datetime_type.cast('2021-03-14 02:30')
+        self.assertEqual(casted.replace(tzinfo=None), datetime.datetime(2021, 3, 14, 3, 30))
+        self.assertEqual(casted.utcoffset(), datetime.timedelta(hours=-4))
+
+    def test_cast_nonexistent_shift_backward(self):
+        tzinfo = ZoneInfo('America/New_York')
+        datetime_type = DateTime(timezone=tzinfo, nonexistent='shift_backward')
+
+        casted = datetime_type.cast('2021-03-14 02:30')
+        self.assertEqual(casted.replace(tzinfo=None), datetime.datetime(2021, 3, 14, 1, 30))
+        self.assertEqual(casted.utcoffset(), datetime.timedelta(hours=-5))
+
+    def test_cast_no_dst_timezone(self):
+        tzinfo = ZoneInfo('Asia/Shanghai')
+        datetime_type = DateTime(timezone=tzinfo)
+
+        casted = datetime_type.cast('2021-06-01 12:30')
+        self.assertEqual(casted.utcoffset(), datetime.timedelta(hours=8))
+        self.assertEqual(casted.fold, 0)
+
+    def test_invalid_policies(self):
+        with self.assertRaises(ValueError):
+            DateTime(ambiguous='bogus')
+        with self.assertRaises(ValueError):
+            DateTime(nonexistent='bogus')
+
     def test_cast_format_locale(self):
         date_type = DateTime(datetime_format='%Y-%m-%d %I:%M %p', locale='ko_KR.UTF-8')
 

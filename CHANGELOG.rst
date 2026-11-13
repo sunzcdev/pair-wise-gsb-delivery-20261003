@@ -1,6 +1,7 @@
 1.14.3 - Unreleased
 -------------------
 
+- feat: :class:`.DateTime` handles daylight saving time transitions when a ``timezone`` is specified: the new ``ambiguous`` (``'earlier'``/``'later'``/``'reject'``) and ``nonexistent`` (``'reject'``/``'shift_forward'``/``'shift_backward'``) arguments control how repeated and skipped local times are resolved. The timezone is now applied consistently across the ``datetime_format``, natural-language and ISO 8601 parsing paths, and values that already carry an offset are no longer re-interpreted as local wall times.
 - feat: :class:`.Median`, :class:`.Percentiles`, :class:`.Quartiles`, :class:`.Quintiles`, :class:`.Deciles` and :class:`.IQR` can be applied to :class:`.TimeDelta` columns, like :class:`.Sum` and :class:`.Mean`.
 - fix: :meth:`.Table.distinct` now deduplicates rows when ``key`` is a sequence of column names.
 - fix: :class:`.Rank` ranks null values last when ``reverse=True``.
