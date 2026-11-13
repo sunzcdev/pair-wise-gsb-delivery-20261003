@@ -6,7 +6,7 @@ from agate import utils
 from agate.aggregations import Max, Min
 
 
-def bins(self, column_name, count=10, start=None, end=None):
+def bins(self, column_name, count=10, start=None, end=None, bins=None, on_bad='bucket'):
     """
     Generates (approximately) evenly sized bins for the values in a column.
     Bins may not be perfectly even if the spread of the data does not divide
@@ -28,16 +28,32 @@ def bins(self, column_name, count=10, start=None, end=None):
     :param end:
         The maximum value to end the bins at. If not specified the maximum
         value in the column will be used.
+    :param bins:
+        A reusable :class:`.Bins` definition whose exact boundaries,
+        open/closed rule and labels are used instead of inferring bins from
+        the data. When provided, :code:`count`, :code:`start` and
+        :code:`end` are ignored. The same definition can be applied to every
+        table in a :class:`.TableSet` so that partitions share identical
+        bins. Values outside of the boundaries never widen the first or last
+        bin; they are handled according to :code:`on_bad`.
+    :param on_bad:
+        How to treat values outside of a provided :class:`.Bins` definition.
+        :code:`'bucket'` (the default) places them in explicit underflow and
+        overflow buckets, :code:`'raise'` raises a
+        :class:`.BinOutOfRangeError`, and :code:`'drop'` discards them.
     :returns:
         A new :class:`Table`.
     """
+    if bins is not None:
+        return bins.count(self, column_name, on_bad=on_bad)
+
     minimum, maximum = utils.round_limits(
         Min(column_name).run(self),
         Max(column_name).run(self)
     )
     # Infer bin start/end positions
-    start = minimum if not start else Decimal(start)
-    end = maximum if not end else Decimal(end)
+    start = minimum if start is None else Decimal(start)
+    end = maximum if end is None else Decimal(end)
 
     # Calculate bin size
     spread = abs(end - start)

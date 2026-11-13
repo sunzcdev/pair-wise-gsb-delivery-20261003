@@ -1,5 +1,6 @@
 import agate.csv_py3 as csv
 from agate.aggregations import *
+from agate.bins import Bins
 from agate.columns import Column
 from agate.computations import *
 from agate.config import get_option, set_option, set_options

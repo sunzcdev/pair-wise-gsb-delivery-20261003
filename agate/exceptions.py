@@ -37,3 +37,13 @@ class FieldSizeLimitError(Exception):  # pragma: no cover
             'CSV contains a field longer than the maximum length of %i characters on line %i. Try raising the maximum '
             'with the field_size_limit parameter, or try setting quoting=csv.QUOTE_NONE.' % (limit, line_number)
         )
+
+
+class BinOutOfRangeError(ValueError):
+    """
+    A value falls outside of the boundaries of a :class:`.Bins` definition.
+
+    Raised when a :class:`.Bins` is applied with :code:`on_bad='raise'` and a
+    value is less than the first boundary or greater than the last boundary.
+    """
+    pass

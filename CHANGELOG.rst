@@ -1,6 +1,8 @@
 1.14.3 - Unreleased
 -------------------
 
+- feat: Added the :class:`.Bins` class, a reusable bin definition that stores exact :class:`decimal.Decimal` boundaries, the open/closed rule and labels independently of any data. It can be passed to :meth:`.Table.bins` (and therefore :meth:`.TableSet.bins`) so that separate partitions are counted against identical bins in a fixed order. Out-of-range values go into explicit underflow/overflow buckets (``on_bad='bucket'``), raise :class:`.BinOutOfRangeError` (``on_bad='raise'``) or are dropped (``on_bad='drop'``); null values are counted separately.
+- fix: :meth:`.Table.bins` no longer treats an explicit ``start=0`` (or ``end=0``) as an unset argument.
 - feat: :class:`.Median`, :class:`.Percentiles`, :class:`.Quartiles`, :class:`.Quintiles`, :class:`.Deciles` and :class:`.IQR` can be applied to :class:`.TimeDelta` columns, like :class:`.Sum` and :class:`.Mean`.
 - fix: :meth:`.Table.distinct` now deduplicates rows when ``key`` is a sequence of column names.
 - fix: :class:`.Rank` ranks null values last when ``reverse=True``.
