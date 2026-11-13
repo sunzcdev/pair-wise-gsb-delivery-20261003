@@ -30,7 +30,7 @@ from petl.transform.reductions import rowreduce, mergeduplicates,\
     aggregate, groupcountdistinctvalues, groupselectfirst, groupselectmax, \
     groupselectmin, merge, fold, Conflict, groupselectlast
 
-from petl.transform.fills import filldown, fillright, fillleft
+from petl.transform.fills import filldown, fillright, fillleft, filllinear
 
 from petl.transform.regex import capture, split, search, searchcomplement, \
     sub, splitdown

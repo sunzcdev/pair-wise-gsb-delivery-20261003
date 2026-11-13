@@ -238,6 +238,7 @@ Filling missing values
 .. autofunction:: petl.transform.fills.filldown
 .. autofunction:: petl.transform.fills.fillright
 .. autofunction:: petl.transform.fills.fillleft
+.. autofunction:: petl.transform.fills.filllinear
 
 
 .. module:: petl.transform.validation
