@@ -12,7 +12,7 @@ from petl.errors import DuplicateKeyError
 from petl.transform.intervals import intervallookup, intervallookupone, \
     facetintervallookup, facetintervallookupone, intervaljoin, \
     intervalleftjoin, intervaljoinvalues, intervalsubtract, \
-    collapsedintervals, _Interval, intervalantijoin
+    collapsedintervals, _Interval, intervalantijoin, coverageintervals
 
 
 logger = logging.getLogger(__name__)
@@ -537,6 +537,178 @@ else:
                   (1, 8, 'j', 4, 9, 'baz'))
         ieq(expect, actual)
         ieq(expect, actual)
+
+
+def _assert_coverage_conserved(table, segments, key=None, weight=None):
+    # total weighted coverage is conserved by the transform
+    if key is None:
+        expect = sum((row[1] - row[0]) * (row[2] if weight else 1)
+                     for row in table[1:] if row[1] > row[0])
+        actual = sum((stop - start) * w for start, stop, w in segments)
+    else:
+        expect = sum((row[2] - row[1]) * (row[3] if weight else 1)
+                     for row in table[1:] if row[2] > row[1])
+        actual = sum((stop - start) * w for _, start, stop, w in segments)
+    eq_(expect, actual)
+
+
+def test_coverageintervals():
+
+    # overlapping and abutting intervals, unordered input
+    tbl = (('start', 'stop'),
+           (4, 9),
+           (1, 4),
+           (3, 7))
+    expect = [(1, 3, 1), (3, 7, 2), (7, 9, 1)]
+    actual = list(coverageintervals(tbl))
+    ieq(expect, actual)
+    _assert_coverage_conserved(tbl, actual)
+
+    # nested intervals
+    tbl = (('start', 'stop'),
+           (1, 10),
+           (3, 5),
+           (4, 8))
+    expect = [(1, 3, 1), (3, 4, 2), (4, 5, 3), (5, 8, 2), (8, 10, 1)]
+    actual = list(coverageintervals(tbl))
+    ieq(expect, actual)
+    _assert_coverage_conserved(tbl, actual)
+
+    # identical intervals stack up
+    tbl = (('start', 'stop'),
+           (1, 5),
+           (1, 5),
+           (1, 5))
+    expect = [(1, 5, 3)]
+    actual = list(coverageintervals(tbl))
+    ieq(expect, actual)
+    _assert_coverage_conserved(tbl, actual)
+
+    # abutting intervals with the same coverage are merged
+    tbl = (('start', 'stop'),
+           (1, 4),
+           (4, 9))
+    expect = [(1, 9, 1)]
+    actual = list(coverageintervals(tbl))
+    ieq(expect, actual)
+    _assert_coverage_conserved(tbl, actual)
+
+    # end and start at the same coordinate are settled together, so the
+    # zero net delta at that coordinate does not split the output
+    tbl = (('start', 'stop'),
+           (1, 4),
+           (4, 9),
+           (2, 6))
+    actual = list(coverageintervals(tbl))
+    eq_([(1, 2, 1), (2, 6, 2), (6, 9, 1)], actual)
+    _assert_coverage_conserved(tbl, actual)
+
+    # gap between intervals is not covered
+    tbl = (('start', 'stop'),
+           (1, 3),
+           (5, 8))
+    expect = [(1, 3, 1), (5, 8, 1)]
+    actual = list(coverageintervals(tbl))
+    ieq(expect, actual)
+    _assert_coverage_conserved(tbl, actual)
+
+    # empty intervals are ignored
+    tbl = (('start', 'stop'),
+           (1, 4),
+           (2, 2),
+           (4, 4))
+    expect = [(1, 4, 1)]
+    actual = list(coverageintervals(tbl))
+    ieq(expect, actual)
+    _assert_coverage_conserved(tbl, actual)
+
+    # empty input
+    tbl = (('start', 'stop'),)
+    ieq([], coverageintervals(tbl))
+
+
+def test_coverageintervals_weight():
+
+    tbl = (('start', 'stop', 'weight'),
+           (1, 4, 2),
+           (3, 7, 3),
+           (4, 9, -2))
+    expect = [(1, 3, 2), (3, 4, 5), (4, 7, 1), (7, 9, -2)]
+    actual = list(coverageintervals(tbl, weight='weight'))
+    ieq(expect, actual)
+    _assert_coverage_conserved(tbl, actual, weight=True)
+
+    # zero-weight regions are not emitted, adjacent equal weights merge
+    tbl = (('start', 'stop', 'weight'),
+           (1, 5, 2),
+           (3, 8, -2),
+           (5, 9, 2))
+    # coverage: [1,3)->2, [3,5)->0, [5,8)->0, [8,9)->2
+    expect = [(1, 3, 2), (8, 9, 2)]
+    actual = list(coverageintervals(tbl, weight='weight'))
+    ieq(expect, actual)
+    _assert_coverage_conserved(tbl, actual, weight=True)
+
+    # zero-weight intervals contribute nothing
+    tbl = (('start', 'stop', 'weight'),
+           (1, 4, 0),
+           (2, 6, 1))
+    expect = [(2, 6, 1)]
+    actual = list(coverageintervals(tbl, weight='weight'))
+    ieq(expect, actual)
+    _assert_coverage_conserved(tbl, actual, weight=True)
+
+
+def test_coverageintervals_key():
+
+    tbl = (('region', 'start', 'stop'),
+           ('south', 12, 14),
+           ('north', 5, 9),
+           ('north', 1, 6),
+           ('south', 13, 17))
+    expect = [('north', 1, 5, 1), ('north', 5, 6, 2), ('north', 6, 9, 1),
+              ('south', 12, 13, 1), ('south', 13, 14, 2), ('south', 14, 17, 1)]
+    actual = list(coverageintervals(tbl, key='region'))
+    ieq(expect, actual)
+    _assert_coverage_conserved(tbl, actual, key='region')
+
+    # with weights
+    tbl = (('region', 'start', 'stop', 'weight'),
+           ('north', 1, 4, 2),
+           ('south', 1, 4, 5),
+           ('north', 3, 6, 1))
+    expect = [('north', 1, 3, 2), ('north', 3, 4, 3), ('north', 4, 6, 1),
+              ('south', 1, 4, 5)]
+    actual = list(coverageintervals(tbl, key='region', weight='weight'))
+    ieq(expect, actual)
+    _assert_coverage_conserved(tbl, actual, key='region', weight=True)
+
+
+def test_coverageintervals_invalid():
+
+    # reversed intervals are rejected
+    tbl = (('start', 'stop'),
+           (1, 4),
+           (5, 2))
+    with pytest.raises(ValueError):
+        list(coverageintervals(tbl))
+
+    # non-finite endpoints are rejected
+    tbl = (('start', 'stop'),
+           (1, float('inf')))
+    with pytest.raises(ValueError):
+        list(coverageintervals(tbl))
+
+    tbl = (('start', 'stop'),
+           (float('nan'), 4))
+    with pytest.raises(ValueError):
+        list(coverageintervals(tbl))
+
+    # non-finite weights are rejected
+    tbl = (('start', 'stop', 'weight'),
+           (1, 4, float('nan')))
+    with pytest.raises(ValueError):
+        list(coverageintervals(tbl, weight='weight'))
 
     def test_intervaljoin_prefixes():
 

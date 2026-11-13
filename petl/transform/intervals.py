@@ -1,6 +1,8 @@
 from __future__ import absolute_import, print_function, division
 
 
+import math
+import numbers
 from operator import itemgetter, attrgetter
 from petl.compat import text_type
 
@@ -1038,3 +1040,156 @@ def _subtract(start, stop, intervals):
         remainder_start = sub_stop
     if sub_stop is not None and sub_stop < stop:
         yield _Interval(sub_stop, stop)
+
+
+def coverageintervals(table, start='start', stop='stop', weight=None,
+                      key=None, buffersize=None, tempdir=None):
+    """
+    Compute coverage segments for the intervals in a table.
+
+    Intervals are treated as left-closed, right-open, i.e., `[start, stop)`.
+    The input rows are broken up into a set of non-overlapping segments, where
+    each segment is annotated with the cumulative weight of all intervals
+    covering it. E.g.::
+
+        >>> import petl as etl
+        >>> table = [['start', 'stop'],
+        ...          [1, 4],
+        ...          [3, 7],
+        ...          [4, 9]]
+        >>> list(etl.coverageintervals(table))
+        [(1, 3, 1), (3, 7, 2), (7, 9, 1)]
+
+    If the `weight` argument is given, it should be the name of a field
+    holding a numeric weight for each interval, and the cumulative weight of
+    each segment is reported instead of the number of covering intervals.
+
+    If the `key` argument is given, coverage is computed separately for each
+    distinct value of the key field(s), and the output rows are prefixed with
+    the key value.
+
+    Segments where the cumulative weight is zero are not emitted, and adjacent
+    segments with equal cumulative weight are merged. Intervals where `start`
+    equals `stop` are ignored. Intervals where `stop` is less than `start`,
+    or with non-finite endpoints, raise a `ValueError`.
+
+    The input does not need to be sorted. Interval endpoints are sorted using
+    an external sort, so the `buffersize` and `tempdir` arguments are passed
+    through to `petl.transform.sorts.sort` to control how many endpoint events
+    are cached in memory.
+
+    """
+
+    it = iter(table)
+    hdr = next(it)
+    flds = list(map(text_type, hdr))
+    assert start in flds, 'start field not recognised'
+    assert stop in flds, 'stop field not recognised'
+    getstart = itemgetter(flds.index(start))
+    getstop = itemgetter(flds.index(stop))
+    if weight is None:
+        getweight = lambda row: 1
+    else:
+        assert weight in flds, 'weight field not recognised'
+        getweight = itemgetter(flds.index(weight))
+    if key is None:
+        getkey = None
+    else:
+        keyindices = asindices(hdr, key)
+        assert len(keyindices) > 0, 'invalid key'
+        getkey = itemgetter(*keyindices)
+
+    def events():
+        if getkey is None:
+            yield ('coord', 'delta')
+        else:
+            yield ('key', 'coord', 'delta')
+        for row in it:
+            s = getstart(row)
+            e = getstop(row)
+            _validate_endpoint(s)
+            _validate_endpoint(e)
+            if e < s:
+                raise ValueError(
+                    'interval stop %r is less than start %r' % (e, s))
+            if s == e:
+                # empty interval, ignore
+                continue
+            w = getweight(row)
+            _validate_weight(w)
+            if w == 0:
+                # contributes nothing to the coverage
+                continue
+            if getkey is None:
+                yield (s, w)
+                yield (e, -w)
+            else:
+                k = getkey(row)
+                yield (k, s, w)
+                yield (k, e, -w)
+
+    if getkey is None:
+        sorted_events = sort(events(), key='coord', buffersize=buffersize,
+                             tempdir=tempdir)
+        for segment in _coverage(values(sorted_events, ('coord', 'delta'))):
+            yield segment
+    else:
+        sorted_events = sort(events(), key=('key', 'coord'),
+                             buffersize=buffersize, tempdir=tempdir)
+        for segment in _coverage(values(sorted_events,
+                                        ('key', 'coord', 'delta'))):
+            yield segment
+
+
+Table.coverageintervals = coverageintervals
+
+
+def _validate_endpoint(value):
+    if isinstance(value, numbers.Real) and not math.isfinite(value):
+        raise ValueError('interval endpoint is not finite: %r' % (value,))
+
+
+def _validate_weight(value):
+    if isinstance(value, numbers.Real) and not math.isfinite(value):
+        raise ValueError('interval weight is not finite: %r' % (value,))
+
+
+def _coverage(events):
+    """
+    Sweep an iterable of `(coord, delta)` or `(key, coord, delta)` events
+    sorted by `(key, coord)`, yielding non-overlapping coverage segments.
+
+    All events at the same coordinate are settled together before the next
+    segment is emitted. Segments with zero cumulative weight are skipped and
+    adjacent segments with equal weight are merged.
+
+    """
+    pending = None  # segment being built: [start, stop, weight] prefixed
+    group = None  # current group key (the events prefix)
+    coord = None  # coordinate of the last settled event
+    total = 0  # cumulative weight between coord and the next event
+    for event in events:
+        prefix, c, delta = event[:-2], event[-2], event[-1]
+        if prefix != group:
+            # group boundary, flush any pending segment and reset the sweep
+            if pending is not None:
+                yield tuple(pending)
+                pending = None
+            group = prefix
+            coord = None
+            total = 0
+        if coord is not None and coord < c and total != 0:
+            segment = list(prefix) + [coord, c, total]
+            if pending is not None and pending[-1] == total \
+                    and pending[-2] == coord:
+                # same weight as the pending segment, merge
+                pending[-2] = c
+            else:
+                if pending is not None:
+                    yield tuple(pending)
+                pending = segment
+        # settle all events at this coordinate together
+        total += delta
+        coord = c
+    if pending is not None:
+        yield tuple(pending)
