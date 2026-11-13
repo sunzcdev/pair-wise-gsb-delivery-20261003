@@ -144,6 +144,7 @@ Sorting
 -------
 
 .. autofunction:: petl.transform.sorts.sort
+.. autofunction:: petl.transform.sorts.topk
 .. autofunction:: petl.transform.sorts.mergesort
 .. autofunction:: petl.transform.sorts.issorted
 

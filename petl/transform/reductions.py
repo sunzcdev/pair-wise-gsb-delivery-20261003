@@ -11,9 +11,13 @@ from petl.errors import ArgumentError, FieldSelectionError
 from petl.util.base import Table, iterpeek, rowgroupby, asindices
 from petl.util.base import values, records
 from petl.util.counting import nrows
-from petl.transform.sorts import sort, mergesort
+from petl.transform.sorts import sort, mergesort, topk, top_k
 from petl.transform.basics import cut
 from petl.transform.dedup import distinct
+
+
+groupselecttopk = topk
+Table.groupselecttopk = topk
 
 
 def rowreduce(table, key, reducer, header=None, presorted=False,

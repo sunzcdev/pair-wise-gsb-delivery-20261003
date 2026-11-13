@@ -8,11 +8,11 @@ import itertools
 import logging
 from collections import namedtuple
 import operator
-from petl.compat import pickle, next, text_type
+from petl.compat import pickle, next, string_types, text_type
 
 
 import petl.config as config
-from petl.comparison import comparable_itemgetter
+from petl.comparison import Comparable, comparable_itemgetter
 from petl.util.base import Table, asindices
 
 
@@ -401,6 +401,399 @@ class _NamedTempFileDeleteOnGC(object):
 
     def __repr__(self):
         return self.name
+
+
+def _check_topk(k):
+    try:
+        k = operator.index(k)
+    except TypeError:
+        raise TypeError('k must be an integer')
+    if k < 0:
+        raise ValueError('k must be non-negative')
+    return k
+
+
+_NO_ALIAS = object()
+
+
+def _take_alias(kwargs, *names):
+    found = [name for name in names if name in kwargs]
+    if len(found) > 1:
+        raise TypeError('multiple aliases supplied: %s' % ', '.join(found))
+    if found:
+        return kwargs.pop(found[0])
+    return _NO_ALIAS
+
+
+def _normalise_direction(direction):
+    if isinstance(direction, bool):
+        return direction
+    if isinstance(direction, string_types):
+        value = direction.strip().lower()
+        if value in ('asc', 'ascending', 'up'):
+            return False
+        if value in ('desc', 'descending', 'down'):
+            return True
+    if direction in (1, -1):
+        return direction == -1
+    raise ValueError('direction must be a bool, 1, -1 or one of '
+                     '"asc"/"desc"')
+
+
+def _is_direction(value):
+    if isinstance(value, bool):
+        return True
+    if isinstance(value, string_types):
+        try:
+            _normalise_direction(value)
+        except ValueError:
+            return False
+        return True
+    return False
+
+
+def _parse_rank_spec(spec):
+    if isinstance(spec, dict):
+        fields = list(spec.keys())
+        directions = [_normalise_direction(spec[field]) for field in fields]
+        return fields, directions
+
+    if isinstance(spec, (list, tuple)):
+        items = list(spec)
+    else:
+        items = [spec]
+
+    if not items:
+        return [], []
+
+    if len(items) == 2 and _is_direction(items[1]) \
+            and not _is_direction(items[0]):
+        return [items[0]], [_normalise_direction(items[1])]
+
+    if all(isinstance(item, (list, tuple)) and len(item) == 2
+           and _is_direction(item[1]) for item in items):
+        fields = [item[0] for item in items]
+        directions = [_normalise_direction(item[1]) for item in items]
+        return fields, directions
+
+    return items, None
+
+
+def _normalise_reverse(reverse, fields):
+    if reverse is None:
+        reverse = False
+    if isinstance(reverse, dict):
+        directions = []
+        for field in fields:
+            if field in reverse:
+                directions.append(_normalise_direction(reverse[field]))
+            elif text_type(field) in reverse:
+                directions.append(
+                    _normalise_direction(reverse[text_type(field)])
+                )
+            else:
+                directions.append(False)
+        return directions
+
+    if isinstance(reverse, (list, tuple)):
+        if len(reverse) != len(fields):
+            raise ValueError('one direction is required per ranking field')
+        return [_normalise_direction(direction) for direction in reverse]
+
+    direction = _normalise_direction(reverse)
+    return [direction] * len(fields)
+
+
+def _normalise_none_position(none_position):
+    if none_position is None:
+        return 'last'
+    if isinstance(none_position, bool):
+        return 'first' if none_position else 'last'
+    if isinstance(none_position, string_types):
+        value = none_position.strip().lower()
+        if value in ('first', 'before'):
+            return 'first'
+        if value in ('last', 'after'):
+            return 'last'
+    raise ValueError('none_position must be "first" or "last"')
+
+
+def _safe_itemgetter(*indices):
+    getter = operator.itemgetter(*indices)
+
+    def _get(row):
+        try:
+            return getter(row)
+        except (IndexError, KeyError):
+            if len(indices) == 1:
+                return None
+            return tuple(None for _ in indices)
+
+    return _get
+
+
+def _value_getter(hdr, field):
+    if callable(field):
+        return field
+    return _safe_itemgetter(*asindices(hdr, field))
+
+
+def _group_getter(hdr, key):
+    if key is None:
+        return None
+    if callable(key):
+        return key
+    return comparable_itemgetter(*asindices(hdr, key))
+
+
+def _resolve_rank_fields(rank, hdr, key):
+    if rank is not None:
+        return _parse_rank_spec(rank)
+    if key is None or callable(key):
+        return list(range(len(hdr))), None
+    key_indices = set(asindices(hdr, key))
+    fields = [index for index in range(len(hdr))
+              if index not in key_indices]
+    return fields, None
+
+
+def _rank_getter(hdr, fields, directions, none_position):
+    getters = [_value_getter(hdr, field) for field in fields]
+
+    def _getrank(row):
+        return tuple(_RankValue(getter(row), reverse, none_position)
+                     for getter, reverse in zip(getters, directions))
+
+    return _getrank
+
+
+class _RankValue(object):
+    __slots__ = ('value', 'reverse', 'none_position')
+
+    def __init__(self, value, reverse, none_position):
+        self.value = None if value is None else Comparable(value)
+        self.reverse = reverse
+        self.none_position = none_position
+
+    def _compare(self, other):
+        if self.value is None and other.value is None:
+            return 0
+        if self.value is None:
+            return -1 if self.none_position == 'first' else 1
+        if other.value is None:
+            return 1 if self.none_position == 'first' else -1
+        if self.value < other.value:
+            result = -1
+        elif self.value == other.value:
+            result = 0
+        else:
+            result = 1
+        return -result if self.reverse else result
+
+    def __lt__(self, other):
+        return self._compare(other) < 0
+
+    def __le__(self, other):
+        return self._compare(other) <= 0
+
+    def __eq__(self, other):
+        if not isinstance(other, _RankValue):
+            return NotImplemented
+        return self._compare(other) == 0
+
+    def __ne__(self, other):
+        result = self.__eq__(other)
+        if result is NotImplemented:
+            return result
+        return not result
+
+    def __gt__(self, other):
+        return self._compare(other) > 0
+
+    def __ge__(self, other):
+        return self._compare(other) >= 0
+
+
+class _TopKItem(object):
+    __slots__ = ('rank', 'sequence', 'row')
+
+    def __init__(self, rank, sequence, row):
+        self.rank = rank
+        self.sequence = sequence
+        self.row = row
+
+    def better_than(self, other):
+        if self.rank == other.rank:
+            return self.sequence < other.sequence
+        return self.rank < other.rank
+
+    def __lt__(self, other):
+        # heapq is a min-heap, so reverse the comparison to keep the
+        # worst candidate at the root.
+        if self.rank == other.rank:
+            return self.sequence > other.sequence
+        return other.rank < self.rank
+
+
+def _select_topk(rows, getrank, k):
+    heap = []
+    for sequence, row in enumerate(rows):
+        candidate = _TopKItem(getrank(row), sequence, row)
+        if len(heap) < k:
+            heapq.heappush(heap, candidate)
+        elif candidate.better_than(heap[0]):
+            heapq.heapreplace(heap, candidate)
+    heap.sort(key=lambda item: (item.rank, item.sequence))
+    return heap
+
+
+def topk(table, key, k, rank=None, reverse=False, none_position=None,
+         presorted=False, buffersize=None, tempdir=None, cache=True,
+         **kwargs):
+    """
+    Select the top `k` rows within each group under `key`.
+
+    The grouping key and the ranking fields are independent. The `rank`
+    argument may be a single field or a sequence of fields. Each ranking field
+    can have its own direction, supplied as a sequence to `reverse`, e.g.
+    ``reverse=[True, False]`` means descending on the first ranking field and
+    ascending on the second. A dictionary mapping fields to directions is also
+    accepted. Ties are resolved by input order.
+
+    The output is ordered first by group, then by rank. In the default mode,
+    groups are sorted by `key` ascending and rows within each group are
+    returned in rank order. With ``presorted=True`` the input is assumed to be
+    grouped by `key`, and the group order of the input is preserved.
+
+    ``none_position`` controls where ``None`` values appear in the ranking,
+    independently of the ascending/descending direction. It must be either
+    ``'first'`` or ``'last'`` (the default is ``'last'``). Numeric values are
+    compared numerically, including across numeric types.
+
+    ``k`` must be a non-negative integer. A negative value raises
+    :class:`ValueError` immediately; ``k=0`` returns only the header.
+
+    In ``presorted=True`` mode only the current group's best `k` candidates
+    are retained. In the normal mode the table is sorted by group key first,
+    using the usual :func:`petl.transform.sorts.sort` buffering options.
+
+    The `rank` argument can also be supplied as `order`, and `none_position`
+    as `nulls`, `null_position`, `na_position` or `none_order`.
+
+    """
+
+    k = _check_topk(k)
+
+    rank_alias = _take_alias(kwargs, 'order', 'rankkey', 'sortkey',
+                             'sort_by', 'orderby', 'order_by', 'by', 'field',
+                             'fields', 'value')
+    if rank_alias is not _NO_ALIAS:
+        if rank is not None:
+            raise TypeError('rank and its alias cannot both be supplied')
+        rank = rank_alias
+
+    direction_alias = _take_alias(kwargs, 'directions', 'direction')
+    if direction_alias is not _NO_ALIAS:
+        if reverse not in (False, None):
+            raise TypeError('reverse and its alias cannot both be supplied')
+        reverse = direction_alias
+
+    none_alias = _take_alias(kwargs, 'nulls', 'null_position',
+                             'na_position', 'none_order', 'none', 'missing')
+    if none_alias is not _NO_ALIAS:
+        if none_position is not None:
+            raise TypeError(
+                'none_position and its alias cannot both be supplied'
+            )
+        none_position = none_alias
+
+    none_first = _take_alias(kwargs, 'none_first', 'nulls_first',
+                             'na_first')
+    none_last = _take_alias(kwargs, 'none_last', 'nulls_last', 'na_last')
+    if none_first is not _NO_ALIAS or none_last is not _NO_ALIAS:
+        if none_position is not None:
+            raise TypeError(
+                'none_position and its alias cannot both be supplied'
+            )
+        if none_first is not _NO_ALIAS and none_last is not _NO_ALIAS:
+            raise TypeError('none_first and none_last cannot both be supplied')
+        if none_first is not _NO_ALIAS:
+            none_position = 'first' if none_first else 'last'
+        else:
+            none_position = 'last' if none_last else 'first'
+
+    if kwargs:
+        name = next(iter(kwargs))
+        raise TypeError("topk() got an unexpected keyword argument %r" % name)
+
+    none_position = _normalise_none_position(none_position)
+    return TopKView(table, key=key, k=k, rank=rank, reverse=reverse,
+                    none_position=none_position, presorted=presorted,
+                    buffersize=buffersize, tempdir=tempdir, cache=cache)
+
+
+Table.topk = topk
+top_k = topk
+groupselecttopk = topk
+Table.top_k = topk
+Table.groupselecttopk = topk
+
+
+class TopKView(Table):
+
+    def __init__(self, source, key, k, rank=None, reverse=False,
+                 none_position='last', presorted=False, buffersize=None,
+                 tempdir=None, cache=True):
+        self.k = _check_topk(k)
+        self.key = key
+        self.rank = rank
+        self.reverse = reverse
+        self.none_position = _normalise_none_position(none_position)
+        self.presorted = presorted
+        if presorted or key is None:
+            self.source = source
+        else:
+            self.source = sort(source, key, buffersize=buffersize,
+                               tempdir=tempdir, cache=cache)
+
+    def __iter__(self):
+        return itertopk(self.source, self.key, self.k, self.rank,
+                        self.reverse, self.none_position)
+
+
+def itertopk(source, key, k, rank, reverse, none_position):
+    it = iter(source)
+    try:
+        hdr = next(it)
+    except StopIteration:
+        return
+    yield tuple(hdr)
+
+    if k == 0:
+        return
+
+    rank_fields, embedded_directions = _resolve_rank_fields(rank, hdr,
+                                                             key)
+    if embedded_directions is None:
+        directions = _normalise_reverse(reverse, rank_fields)
+    else:
+        if reverse not in (False, None):
+            raise TypeError('reverse cannot be combined with per-field '
+                            'rank directions')
+        directions = embedded_directions
+    getrank = _rank_getter(hdr, rank_fields, directions, none_position)
+
+    if key is None:
+        heap = _select_topk(it, getrank, k)
+        for item in heap:
+            yield tuple(item.row)
+        return
+
+    getkey = _group_getter(hdr, key)
+    for _, rows in itertools.groupby(it, key=getkey):
+        heap = _select_topk(rows, getrank, k)
+        for item in heap:
+            yield tuple(item.row)
 
 
 def mergesort(*tables, **kwargs):
