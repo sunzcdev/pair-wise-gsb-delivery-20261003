@@ -1,6 +1,10 @@
 1.14.3 - Unreleased
 -------------------
 
+- feat: :class:`.fixed.Reader`, :class:`.fixed.DictReader` and :meth:`.Table.from_fixed` accept a ``layout`` argument. With ``layout="byte"``, the schema's ``start`` and ``length`` are interpreted as byte offsets: each field range is sliced from the raw bytes and decoded independently, so multibyte characters no longer shift field boundaries. The default ``layout="character"`` keeps the previous behavior. ``encoding``, ``short_records`` and ``trailing_bytes`` options are shared by all three entry points.
+- feat: :class:`.fixed.Reader` rejects schemas with negative field lengths, duplicate column names, or overlapping field ranges.
+- fix: in the byte layout, a field boundary that falls in the middle of a multibyte character raises a :class:`ValueError` naming the record and field, instead of silently producing replacement characters.
+- fix: line-ending newline and carriage return characters are excluded from the fixed-width data. Short records and extra trailing bytes now follow independent ``short_records`` and ``trailing_bytes`` strategies.
 - feat: :class:`.Median`, :class:`.Percentiles`, :class:`.Quartiles`, :class:`.Quintiles`, :class:`.Deciles` and :class:`.IQR` can be applied to :class:`.TimeDelta` columns, like :class:`.Sum` and :class:`.Mean`.
 - fix: :meth:`.Table.distinct` now deduplicates rows when ``key`` is a sequence of column names.
 - fix: :class:`.Rank` ranks null values last when ``reverse=True``.

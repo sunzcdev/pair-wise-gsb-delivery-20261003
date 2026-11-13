@@ -120,6 +120,23 @@ This is the same as the previous example, but in this case we specify that the d
 
     table = agate.Table.from_csv('filename.csv', delimiter='\t')
 
+From a fixed-width file
+=======================
+
+Fixed-width files are described by a separate "ffs" schema that names each column with its ``start`` and ``length``. By default these offsets are counted in characters, exactly like slicing a string:
+
+.. code-block:: python
+
+    table = agate.Table.from_fixed('filename.txt', 'schema.csv')
+
+Some files define the offsets in bytes instead. When the content uses a multibyte encoding such as UTF-8, slicing the decoded text by character position then shifts every field. Pass ``layout="byte"`` to slice the raw bytes and decode each field independently:
+
+.. code-block:: python
+
+    table = agate.Table.from_fixed('filename.txt', 'schema.csv', layout='byte')
+
+The byte layout accepts an ``encoding`` argument (UTF-8 by default). Use ``short_records="error"`` to fail on records shorter than the schema and ``trailing_bytes="error"`` to fail when records contain data after the last field. Both default to the tolerant, backward-compatible behavior.
+
 From JSON
 =========
 
