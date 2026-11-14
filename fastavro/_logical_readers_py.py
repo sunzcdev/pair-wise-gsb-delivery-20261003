@@ -11,7 +11,6 @@ from .const import (
     DAYS_SHIFT,
 )
 
-decimal_context = Context()
 epoch = datetime(1970, 1, 1, tzinfo=timezone.utc)
 epoch_naive = datetime(1970, 1, 1)
 
@@ -54,7 +53,10 @@ def read_decimal(data, writer_schema=None, reader_schema=None):
 
     unscaled_datum = int.from_bytes(data, byteorder="big", signed=True)
 
-    decimal_context.prec = precision
+    # Create a fresh context per call so that concurrent readers decoding
+    # schemas with different precisions never mutate shared state, and the
+    # caller's own decimal context is left untouched.
+    decimal_context = Context(prec=precision)
     return decimal_context.create_decimal(unscaled_datum).scaleb(
         -scale, decimal_context
     )

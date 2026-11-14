@@ -10,7 +10,6 @@ import lzma
 import sys
 import zlib
 from datetime import datetime, timezone
-from decimal import Context
 from io import BytesIO
 from struct import error as StructError
 from typing import IO, Union, Optional, Generic, TypeVar, Iterator, Dict
@@ -38,7 +37,6 @@ from .const import NAMED_TYPES, AVRO_TYPES
 
 T = TypeVar("T")
 
-decimal_context = Context()
 epoch = datetime(1970, 1, 1, tzinfo=timezone.utc)
 epoch_naive = datetime(1970, 1, 1)
 

@@ -313,6 +313,199 @@ def test_fixed_decimal_binary():
     assert Decimal("-2.80") == data2
 
 
+@pytest.mark.parametrize(
+    "value,expected",
+    [
+        # zero keeps the schema scale (and sign of zero is normalized away)
+        (Decimal("0"), Decimal("0.0000")),
+        (Decimal("0.0000"), Decimal("0.0000")),
+        # trailing zeros are preserved
+        (Decimal("1.2300"), Decimal("1.2300")),
+        (Decimal("-2.90"), Decimal("-2.9000")),
+        # negatives and small values
+        (Decimal("-0.0001"), Decimal("-0.0001")),
+        (Decimal("0.0001"), Decimal("0.0001")),
+        # values at (or one digit below) the declared precision
+        (Decimal("99999999.9999"), Decimal("99999999.9999")),
+        (Decimal("-99999999.9999"), Decimal("-99999999.9999")),
+        (Decimal("1234567.8901"), Decimal("1234567.8901")),
+    ],
+)
+def test_decimal_bytes_and_fixed_read_identically(value, expected):
+    """The bytes and fixed decimal entries must interpret precision/scale
+    the same way, including negatives, zero, trailing zeros and values at
+    the declared precision."""
+    precision = 12
+    scale = 4
+    bytes_schema = {
+        "type": "bytes",
+        "logicalType": "decimal",
+        "precision": precision,
+        "scale": scale,
+    }
+    fixed_schema = {
+        "type": "fixed",
+        "name": "decimal_fixed",
+        "size": 6,
+        "logicalType": "decimal",
+        "precision": precision,
+        "scale": scale,
+    }
+
+    bytes_result = deserialize(bytes_schema, serialize(bytes_schema, value))
+    fixed_result = deserialize(fixed_schema, serialize(fixed_schema, value))
+
+    # compare tuples so exponent (trailing zeros) must match exactly
+    assert bytes_result.as_tuple() == expected.as_tuple()
+    assert fixed_result.as_tuple() == expected.as_tuple()
+
+
+def test_decimal_read_does_not_touch_caller_decimal_context():
+    """The caller's own (thread-local) decimal context must not be modified
+    by reading decimal logical types."""
+    from decimal import getcontext
+
+    caller_context = getcontext()
+    original_prec = caller_context.prec
+    caller_context.prec = 3  # deliberately small and unusual
+    try:
+        schema = {
+            "type": "bytes",
+            "logicalType": "decimal",
+            "precision": 20,
+            "scale": 10,
+        }
+        value = Decimal("1234567890.1234567890")
+        result = deserialize(schema, serialize(schema, value))
+        assert result.as_tuple() == value.as_tuple()
+        assert getcontext() is caller_context
+        assert getcontext().prec == 3
+    finally:
+        caller_context.prec = original_prec
+
+
+def test_decimal_readers_have_no_shared_module_context():
+    """Regression guard: the pure python reader must not keep a module-level
+    decimal Context whose prec is mutated per call (cross-call shared
+    state)."""
+    from fastavro import _logical_readers_py
+    from fastavro import _read_py
+
+    assert not hasattr(_logical_readers_py, "decimal_context")
+    assert not hasattr(_read_py, "decimal_context")
+
+
+def test_decimal_read_error_leaves_no_state(monkeypatch):
+    """An error mid-decode must not leave behind state that affects the next
+    call."""
+    from decimal import getcontext
+    from fastavro import _logical_readers_py
+
+    read_decimal = _logical_readers_py.LOGICAL_READERS["bytes-decimal"]
+    schema = {"logicalType": "decimal", "precision": 6, "scale": 2}
+    data = (123456).to_bytes(3, byteorder="big", signed=True)
+    expected = Decimal("1234.56")
+
+    # a schema missing "precision" must fail without side effects
+    with pytest.raises(KeyError):
+        read_decimal(data, {"logicalType": "decimal", "scale": 2})
+    assert read_decimal(data, schema).as_tuple() == expected.as_tuple()
+
+    # an exception raised while constructing the Decimal must not leak state
+    real_context = _logical_readers_py.Context
+
+    class ExplodingContext(real_context):
+        def create_decimal(self, num):
+            raise RuntimeError("boom")
+
+    monkeypatch.setattr(_logical_readers_py, "Context", ExplodingContext)
+    with pytest.raises(RuntimeError):
+        read_decimal(data, schema)
+    monkeypatch.undo()
+
+    caller_prec = getcontext().prec
+    assert read_decimal(data, schema).as_tuple() == expected.as_tuple()
+    assert getcontext().prec == caller_prec
+
+
+def test_decimal_readers_concurrent_controlled_interleaving(monkeypatch):
+    """Concurrency probe with controlled interleaving.
+
+    Two threads decode decimals with different precisions. A synchronizing
+    Context subclass forces both threads to be inside read_decimal at the
+    same time (a rendezvous), so any shared precision state would
+    deterministically corrupt one of the results. The concurrent results
+    are compared against a sequential baseline. This must not rely on
+    repeatedly running threads and hoping to hit the race.
+    """
+    import threading
+    from fastavro import _logical_readers_py
+
+    read_bytes_decimal = _logical_readers_py.LOGICAL_READERS["bytes-decimal"]
+    read_fixed_decimal = _logical_readers_py.LOGICAL_READERS["fixed-decimal"]
+
+    schema_lo = {"logicalType": "decimal", "precision": 4, "scale": 2}
+    schema_hi = {
+        "logicalType": "decimal",
+        "precision": 20,
+        "scale": 10,
+        "type": "fixed",
+        "name": "d",
+        "size": 9,
+    }
+    data_lo = (1234).to_bytes(2, byteorder="big", signed=True)
+    data_hi = (12345678901234567890).to_bytes(9, byteorder="big", signed=True)
+
+    # sequential baseline
+    baseline_lo = read_bytes_decimal(data_lo, schema_lo)
+    baseline_hi = read_fixed_decimal(data_hi, schema_hi)
+    assert baseline_lo == Decimal("12.34")
+    assert baseline_hi == Decimal("1234567890.1234567890")
+
+    barrier = threading.Barrier(2)
+    create_calls = []
+    real_context = _logical_readers_py.Context
+
+    class SynchronizingContext(real_context):
+        def create_decimal(self, num):
+            create_calls.append(num)
+            # rendezvous: both threads must be inside read_decimal before
+            # either is allowed to construct its Decimal
+            barrier.wait(timeout=10)
+            return super().create_decimal(num)
+
+    monkeypatch.setattr(_logical_readers_py, "Context", SynchronizingContext)
+
+    results = {}
+    errors = []
+
+    def worker(name, reader, data, schema):
+        try:
+            results[name] = reader(data, schema)
+        except Exception as e:  # pragma: no cover - failure path
+            errors.append(e)
+
+    threads = [
+        threading.Thread(
+            target=worker, args=("lo", read_bytes_decimal, data_lo, schema_lo)
+        ),
+        threading.Thread(
+            target=worker, args=("hi", read_fixed_decimal, data_hi, schema_hi)
+        ),
+    ]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=30)
+
+    assert not errors
+    # both decodes really went through the synchronizing probe
+    assert len(create_calls) == 2
+    # concurrent results must match the sequential baseline exactly
+    assert results["lo"].as_tuple() == baseline_lo.as_tuple()
+    assert results["hi"].as_tuple() == baseline_hi.as_tuple()
+
+
 def test_clean_json_list():
     values = [
         datetime.datetime.now(),
