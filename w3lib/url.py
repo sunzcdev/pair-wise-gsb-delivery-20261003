@@ -11,6 +11,7 @@ import os
 import posixpath
 import re
 import warnings
+from collections.abc import Iterable, Iterator
 from ipaddress import IPv6Address, ip_address
 from pathlib import Path
 from typing import TYPE_CHECKING, NamedTuple, cast, overload
@@ -32,6 +33,7 @@ from ._url import (
     RFC3986_USERINFO_SAFE_CHARS as RFC3986_USERINFO_SAFE_CHARS,
     _check_domain,
     _domain,
+    _hex_decode_table,
     _idna_bytes,
     _ipv4_host,
     _opaque_host,
@@ -641,6 +643,7 @@ del _char, _token, _quoted_string
 
 _base64_pattern = re.compile(rb"[A-Za-z0-9+/]*")
 _ASCII_WHITESPACE_BYTES = _ASCII_WHITESPACE.encode()
+_HEX_DECODE_TABLE = _hex_decode_table()
 
 
 def _forgiving_base64_decode(data: bytes) -> bytes:
@@ -730,17 +733,440 @@ def parse_data_uri(uri: str | bytes) -> ParseDataURIResult:
     return ParseDataURIResult(media_type, media_type_params, data)
 
 
+class DataURIError(ValueError):
+    """Raised when a data: URI is malformed.
+
+    Subclasses :exc:`ValueError`, so code catching :exc:`ValueError` keeps
+    working. :attr:`position` is the index of the offending byte in the
+    percent-encoded URI input, independent of how the input is split into
+    chunks.
+    """
+
+    def __init__(self, message: str, position: int) -> None:
+        self.position = position
+        super().__init__(f"{message} at position {position}")
+
+
+class DataURILimitError(DataURIError):
+    """Raised when the decoded data exceeds the configured size limit.
+
+    Iteration stops as soon as the limit is crossed, without ever building
+    the full decoded payload. :attr:`limit` is the configured maximum size in
+    bytes, and :attr:`position` points at the first input byte that would
+    make the output exceed it.
+    """
+
+    def __init__(self, limit: int, position: int) -> None:
+        self.limit = limit
+        super().__init__(
+            f"decoded data exceeds the limit of {limit} bytes", position
+        )
+
+
+def _normalize_uri_chunk(chunk: str | bytes | bytearray) -> bytes:
+    if isinstance(chunk, str):
+        chunk = safe_url_string(chunk).encode("ascii")
+    elif isinstance(chunk, bytearray):
+        chunk = bytes(chunk)
+    elif not isinstance(chunk, bytes):
+        raise TypeError("data URI chunks must be bytes or str")
+    return chunk
+
+
+_BASE64_DECODE_TABLE = {
+    character: value
+    for value, character in enumerate(
+        b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+    )
+}
+
+
+class _PercentDecoder:
+    """Incremental percent decoder with source-position tracking.
+
+    Percent escapes spanning two or three input chunks are kept pending
+    instead of being emitted as literal characters. Malformed escapes,
+    including a trailing ``%`` or ``%H``, stay literal, mirroring
+    :func:`w3lib._url._unquote`.
+    """
+
+    def __init__(self) -> None:
+        self._pending = bytearray()
+        self._pending_position = 0
+
+    def feed(self, data: bytes, base_position: int) -> list[tuple[int, int]]:
+        pairs: list[tuple[int, int]] = []
+        if self._pending:
+            base_position = self._pending_position
+            data = bytes(self._pending) + data
+            self._pending.clear()
+        index = 0
+        length = len(data)
+        while index < length:
+            position = base_position + index
+            byte = data[index]
+            if byte == 0x25:  # percent sign
+                if index + 2 >= length:
+                    self._pending.extend(data[index:])
+                    self._pending_position = position
+                    return pairs
+                high = _HEX_DECODE_TABLE[data[index + 1]]
+                low = _HEX_DECODE_TABLE[data[index + 2]]
+                if (high | low) != 255:
+                    pairs.append(((high << 4) | low, position))
+                    index += 3
+                    continue
+            pairs.append((byte, position))
+            index += 1
+        return pairs
+
+    def finish(self) -> list[tuple[int, int]]:
+        if not self._pending:
+            return []
+        pairs = [
+            (byte, self._pending_position + offset)
+            for offset, byte in enumerate(self._pending)
+        ]
+        self._pending.clear()
+        return pairs
+
+
+class DataURIStream:
+    """Incremental parser for data: URIs.
+
+    The media type and its parameters are parsed first, from the leading
+    chunks, and exposed as attributes. The payload is then decoded lazily by
+    iterating over the object, one :class:`bytes` chunk at a time, so large
+    embedded resources never have to be held in memory at once.
+
+    Use :func:`stream_data_uri` instead of instantiating this class directly.
+    Both base64 quartets and percent-escaped sequences may span input chunks,
+    and the positions reported on errors always refer to the original,
+    percent-encoded URI regardless of the chunk boundaries.
+    """
+
+    def __init__(
+        self,
+        chunks: Iterable[bytes | str],
+        max_size: int | None = None,
+    ) -> None:
+        if max_size is not None and max_size < 0:
+            raise ValueError("max_size must not be negative")
+        self._max_size = max_size
+        self._offset = 0
+        self._decoded_size = 0
+        self._closed = False
+        self._decoder = _PercentDecoder()
+
+        self._chunks = (_normalize_uri_chunk(chunk) for chunk in chunks)
+        self._pairs = self._pull_pairs()
+
+        scheme, saw_colon = self._read_scheme()
+        if not scheme or not saw_colon:
+            raise DataURIError("invalid URI", 0)
+        if scheme.lower() != b"data":
+            raise DataURIError("not a data URI", 0)
+
+        header, comma_position = self._read_header()
+
+        media_type = "text/plain"
+        media_type_params: dict[str, str] = {"charset": "US-ASCII"}
+
+        mediatype_match = _mediatype_pattern.match(header)
+        if mediatype_match:
+            media_type = mediatype_match.group().decode()
+            header = header[mediatype_match.end() :]
+            media_type_params = {}
+
+        while parameter_match := _mediatype_parameter_pattern.match(header):
+            attribute, value, value_quoted = parameter_match.groups()
+            if value_quoted is not None:
+                value = re.sub(rb"\\(.)", rb"\1", value_quoted)
+            media_type_params[attribute.decode()] = value.decode()
+            header = header[parameter_match.end() :]
+
+        if not header:
+            is_base64 = False
+        elif header == b";base64":
+            is_base64 = True
+        else:
+            raise DataURIError("invalid data URI", comma_position)
+
+        self.media_type: str = media_type
+        self.media_type_parameters: dict[str, str] = media_type_params
+        self.is_base64: bool = is_base64
+
+    def _next_raw_chunk(self) -> bytes:
+        try:
+            chunk = next(self._chunks)
+        except StopIteration:
+            return b""
+        self._offset += len(chunk)
+        return chunk
+
+    def _pull_pairs(self) -> Iterator[tuple[int, int]]:
+        """Yield every percent-decoded byte with its source position.
+
+        Each input chunk is decoded exactly once, so percent escapes and
+        base64 quartets that span chunk boundaries are reassembled before
+        header scanning and payload decoding consume the pairs.
+        """
+        while True:
+            chunk = self._next_raw_chunk()
+            if not chunk:
+                yield from self._decoder.finish()
+                return
+            yield from self._decoder.feed(
+                chunk, self._offset - len(chunk)
+            )
+
+    def _read_scheme(self) -> tuple[bytes, bool]:
+        scheme = bytearray()
+        while True:
+            try:
+                byte, _ = next(self._pairs)
+            except StopIteration:
+                return bytes(scheme), False
+            if byte == 0x3A:  # colon
+                return bytes(scheme), True
+            scheme.append(byte)
+
+    def _read_header(self) -> tuple[bytes, int]:
+        """Read up to and including the data-separating comma.
+
+        Scanning happens on percent-decoded bytes so that quotes,
+        semicolons, equals signs and commas hidden behind percent escapes
+        are handled the same way as literal ones, while every decoded byte
+        keeps the position of its first source byte in the original URI.
+
+        Return the decoded header and the comma position in the original
+        URI. Decoded pairs past the comma stay buffered in ``self._pairs``
+        and are consumed later as the payload.
+        """
+        decoded = bytearray()
+        positions: list[int] = []
+        in_quotes = False
+        escaped = False
+        while True:
+            try:
+                byte, position = next(self._pairs)
+            except StopIteration:
+                if not decoded:
+                    raise DataURIError("invalid URI", self._offset) from None
+                raise DataURIError(
+                    "invalid data URI", self._offset
+                ) from None
+            decoded.append(byte)
+            positions.append(position)
+            if in_quotes:
+                if escaped:
+                    escaped = False
+                elif byte == 0x5C:  # backslash
+                    escaped = True
+                elif byte == 0x22:  # quotation mark
+                    in_quotes = False
+            elif byte == 0x22:
+                in_quotes = True
+            elif byte == 0x2C:  # comma
+                comma_index = len(decoded) - 1
+                header = bytes(decoded[:comma_index])
+                comma_position = positions[comma_index]
+                return header, comma_position
+
+    def _check_size(self, size: int, position: int) -> None:
+        if self._max_size is not None and size > self._max_size:
+            self._closed = True
+            raise DataURILimitError(self._max_size, position)
+
+    def _emit_base64_triplet(
+        self,
+        slots: list[int],
+        output: bytearray,
+        position: int,
+        padding: int,
+    ) -> None:
+        triple = (
+            (slots[0] << 18)
+            | (slots[1] << 12)
+            | (slots[2] << 6)
+            | slots[3]
+        )
+        output.append((triple >> 16) & 0xFF)
+        if padding < 2:
+            output.append((triple >> 8) & 0xFF)
+        if padding == 0:
+            output.append(triple & 0xFF)
+
+    def _flush_output(
+        self, output: bytearray, position: int
+    ) -> Iterable[bytes]:
+        self._check_size(self._decoded_size + len(output), position)
+        if len(output) >= 4096:
+            self._decoded_size += len(output)
+            chunk = bytes(output)
+            output.clear()
+            yield chunk
+
+    def _payload_pairs(self) -> Iterable[tuple[int, int]]:
+        yield from self._pairs
+
+    def _iter_urlencoded(self) -> Iterable[bytes]:
+        output = bytearray()
+        for byte, position in self._payload_pairs():
+            output.append(byte)
+            yield from self._flush_output(output, position)
+        if output:
+            self._decoded_size += len(output)
+            yield bytes(output)
+
+    def _iter_base64(self) -> Iterable[bytes]:
+        output = bytearray()
+        slots: list[int] = []
+        data_chars = 0
+        padding = 0
+        finished = False
+        for byte, position in self._payload_pairs():
+            if byte in _ASCII_WHITESPACE_BYTES:
+                continue
+            if finished:
+                raise DataURIError("invalid data URI", position)
+            if padding:
+                if byte != 0x3D:  # equals sign
+                    raise DataURIError("invalid data URI", position)
+                padding += 1
+                if padding > 2:
+                    raise DataURIError("invalid data URI", position)
+                slots.append(0)
+                if len(slots) == 4:
+                    self._emit_base64_triplet(
+                        slots, output, position, padding
+                    )
+                    slots = []
+                    finished = True
+                    yield from self._flush_output(output, position)
+                continue
+            if byte == 0x3D:
+                padding = 1
+                slots.append(0)
+                if len(slots) == 4:
+                    self._emit_base64_triplet(
+                        slots, output, position, padding
+                    )
+                    slots = []
+                    finished = True
+                    yield from self._flush_output(output, position)
+                continue
+            value = _BASE64_DECODE_TABLE.get(byte)
+            if value is None:
+                raise DataURIError("invalid data URI", position)
+            slots.append(value)
+            data_chars += 1
+            if len(slots) == 4:
+                self._emit_base64_triplet(slots, output, position, 0)
+                slots = []
+                yield from self._flush_output(output, position)
+
+        # Match the forgiving-base64 validation performed on the full input.
+        # A closed quartet (with or without padding) was already emitted;
+        # only an unfinished, unpadded tail reaches the code below.
+        if slots:
+            remainder = data_chars % 4
+            if remainder == 1:
+                raise DataURIError("invalid data URI", self._offset)
+            value = 0
+            for digit in slots:
+                value = (value << 6) | digit
+            value <<= 6 * (4 - remainder)
+            tail_length = remainder - 1
+            for shift in (16, 8):
+                if tail_length:
+                    output.append((value >> shift) & 0xFF)
+                    tail_length -= 1
+
+        if output:
+            self._check_size(
+                self._decoded_size + len(output), self._offset
+            )
+            self._decoded_size += len(output)
+            yield bytes(output)
+
+    def __iter__(self) -> Iterator[bytes]:
+        if self._closed:
+            return
+        self._closed = True
+        if self.is_base64:
+            iterator = self._iter_base64()
+        else:
+            iterator = self._iter_urlencoded()
+        for chunk in iterator:
+            yield chunk
+
+    def read(self) -> bytes:
+        """Return the whole remaining payload as a single :class:`bytes`."""
+        return b"".join(self)
+
+    def close(self) -> None:
+        """Release the underlying chunk iterator."""
+        self._closed = True
+        self._chunks.close()
+
+    def __enter__(self) -> "DataURIStream":
+        return self
+
+    def __exit__(self, *args: object) -> None:
+        self.close()
+
+
+def stream_data_uri(
+    uri: str | bytes | Iterable[str | bytes],
+    max_size: int | None = None,
+) -> DataURIStream:
+    """Parse a data: URI incrementally.
+
+    *uri* is either the full URI as :class:`str` or :class:`bytes`, or an
+    iterable of URI chunks, which is useful when scraping a page containing a
+    large embedded resource. Unlike :func:`parse_data_uri`, the payload is
+    never fully decoded up front: the returned :class:`DataURIStream` exposes
+    :attr:`~DataURIStream.media_type` and
+    :attr:`~DataURIStream.media_type_parameters` immediately, and yields
+    decoded :class:`bytes` chunks only when iterated.
+
+    *max_size*, when given, is the maximum accepted size of the decoded
+    payload in bytes. As soon as the output would exceed it, iteration raises
+    :class:`DataURILimitError` and stops, without allocating the full
+    decoded payload.
+
+    Malformed URIs raise :class:`DataURIError` (a :class:`ValueError`
+    subclass), whose ``position`` attribute locates the offending byte in the
+    original URI independently of chunk boundaries.
+    """
+    if isinstance(uri, (str, bytes, bytearray)):
+        chunks: Iterable[str | bytes] = (uri,)
+    else:
+        chunks = uri
+    return DataURIStream(chunks, max_size=max_size)
+
+
+# Descriptive alias kept alongside the terse name.
+parse_data_uri_stream = stream_data_uri
+
+
 __all__ = [
     "add_http_if_no_scheme",
     "add_or_replace_parameter",
     "add_or_replace_parameters",
     "any_to_uri",
     "canonicalize_url",
+    "DataURIError",
+    "DataURILimitError",
+    "DataURIStream",
     "file_uri_to_path",
     "is_url",
+    "parse_data_uri_stream",
     "parse_data_uri",
     "path_to_file_uri",
     "safe_url_string",
+    "stream_data_uri",
     "url_query_cleaner",
     "url_query_parameter",
 ]

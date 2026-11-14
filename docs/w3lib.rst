@@ -29,3 +29,12 @@ w3lib Package
 
     .. autoclass:: ParseDataURIResult
        :members:
+
+    .. autoclass:: DataURIStream
+       :members:
+
+    .. autoclass:: DataURIError
+       :members:
+
+    .. autoclass:: DataURILimitError
+       :members:

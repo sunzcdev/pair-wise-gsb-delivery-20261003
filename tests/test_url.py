@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import os
 from inspect import isclass
 from pathlib import Path
@@ -47,14 +48,18 @@ from w3lib.url import (
     add_or_replace_parameters,
     any_to_uri,
     canonicalize_url,
+    DataURIError,
+    DataURILimitError,
     file_uri_to_path,
     is_url,
+    parse_data_uri_stream,
     parse_data_uri,
     parse_qsl_to_bytes,
     parse_url,
     path_to_file_uri,
     safe_download_url,
     safe_url_string,
+    stream_data_uri,
     url_query_cleaner,
     url_query_parameter,
 )
@@ -2413,6 +2418,219 @@ class TestDataURI:
         assert result.data == b"A brief note"
         result = parse_data_uri("DaTa:,A%20brief%20note")
         assert result.data == b"A brief note"
+
+
+class TestStreamDataURI:
+    URI_LIST = [
+        "data:,A%20brief%20note",
+        "data:;charset=iso-8859-7,%be%d3%be",
+        "data:text/plain;charset=iso-8859-7,%be%d3%be",
+        (
+            "data:text/plain;"
+            "foo=%22foo;bar%5C%22%22;"
+            "charset=utf-8;"
+            "bar=%22foo;%5C%22foo%20;/%20,%22,"
+            "%CE%8E%CE%A3%CE%8E"
+        ),
+        'data:text/plain;foo="",AAA',
+        "data:text/plain;base64,SGVsbG8sIHdvcmxkLg%3D%3D",
+        "data:text/plain;base64,SGVsb%20G8sIH%0A%20%20dvcm%20%20%20xk%20Lg%3D%0A%3D",
+        "data:text/plain;base64,SGVsb G8sIH\n  dvcm   xk Lg%3D\n%3D",
+        "data:;base64,SGVsbG8=",
+        "data:;base64,SGVs bG8=",
+        "data:;base64,SGVsbG8",
+        "data:,",
+        "data:text/plain,",
+        "data:,%%",
+        "data:,%zz%4",
+        "data:,100%%done",
+        "DATA:,upper",
+        "data:application/octet-stream;base64,",
+        "data:;base64,",
+        "data:,caf\u00e9",
+    ]
+
+    INVALID_URI_LIST = [
+        "data:;base64,S!G@V$b G8=",
+        "data:;base64,!!!! ",
+        "data:;base64,SGVsbG8==",
+        "data:;base64,SGV=bG8",
+        "data:;base64,SGVsb",
+        "data:text/plain;baes64,SGVsbG8sIHdvcmxkLg%3D%3D",
+        "data:A%20brief%20note",
+        "data:text/plain",
+        "text/plain,A%20brief%20note",
+        "http://example.com/",
+        "datax:,A",
+    ]
+
+    @staticmethod
+    def _ascii(uri: str | bytes) -> bytes:
+        if isinstance(uri, bytes):
+            return uri
+        return safe_url_string(uri).encode("ascii")
+
+    @staticmethod
+    def _chunk(raw: bytes, size: int) -> list[bytes]:
+        return [raw[index : index + size] for index in range(0, len(raw), size)]
+
+    def test_aliases(self):
+        assert parse_data_uri_stream is stream_data_uri
+
+    @pytest.mark.parametrize("uri", URI_LIST)
+    def test_matches_parse_data_uri(self, uri):
+        expected = parse_data_uri(uri)
+        raw = self._ascii(uri)
+        for size in range(1, len(raw) + 2):
+            stream = stream_data_uri(iter(self._chunk(raw, size)))
+            assert stream.media_type == expected.media_type
+            assert (
+                stream.media_type_parameters == expected.media_type_parameters
+            )
+            assert stream.read() == expected.data
+
+    def test_full_uri_without_iterable(self):
+        uri = "data:text/plain;charset=utf-8,Hi%20there"
+        for value in (uri, uri.encode()):
+            stream = stream_data_uri(value)
+            assert stream.media_type == "text/plain"
+            assert stream.media_type_parameters == {"charset": "utf-8"}
+            assert b"".join(stream) == b"Hi there"
+
+    def test_iteration_yields_multiple_chunks(self):
+        raw = b"data:," + b"A" * 10_000
+        stream = stream_data_uri(iter([raw]))
+        chunks = list(stream)
+        assert len(chunks) > 1
+        assert b"".join(chunks) == b"A" * 10_000
+
+    def test_is_base64_flag(self):
+        assert stream_data_uri("data:;base64,SGVsbG8=").is_base64
+        assert not stream_data_uri("data:,abc").is_base64
+
+    def test_percent_escape_split_across_chunks(self):
+        raw = b"data:,A%20B%2fC%41"
+        expected = parse_data_uri(raw.decode()).data
+        for size in range(1, len(raw) + 2):
+            assert (
+                stream_data_uri(iter(self._chunk(raw, size))).read() == expected
+            )
+
+    def test_base64_quartet_split_across_chunks(self):
+        raw = b"data:;base64,SGVsbG8sIHdvcmxkLg=="
+        expected = parse_data_uri(raw.decode()).data
+        for size in range(1, len(raw) + 2):
+            assert (
+                stream_data_uri(iter(self._chunk(raw, size))).read() == expected
+            )
+
+    def test_quoted_delimiters_are_not_the_data_start(self):
+        uri = 'data:text/plain;name="a,b;c=\\"d";base64,SGVsbG8='
+        raw = self._ascii(uri)
+        for size in range(1, len(raw) + 2):
+            stream = stream_data_uri(iter(self._chunk(raw, size)))
+            assert stream.media_type_parameters == {"name": 'a,b;c="d'}
+            assert stream.is_base64
+            assert stream.read() == b"Hello"
+
+    @pytest.mark.parametrize("uri", INVALID_URI_LIST)
+    def test_error_position_is_chunking_independent(self, uri):
+        raw = self._ascii(uri)
+        positions = set()
+        for size in range(1, len(raw) + 2):
+            with pytest.raises(DataURIError) as exc_info:
+                stream_data_uri(iter(self._chunk(raw, size))).read()
+            positions.add(exc_info.value.position)
+        assert len(positions) == 1
+        with pytest.raises(ValueError):
+            parse_data_uri(uri)
+
+    def test_error_position_points_into_uri(self):
+        raw = b"data:;base64,SGV=bG8"
+        with pytest.raises(DataURIError) as exc_info:
+            stream_data_uri(iter(self._chunk(raw, 2))).read()
+        assert 0 <= exc_info.value.position <= len(raw)
+
+    def test_error_is_value_error(self):
+        with pytest.raises(ValueError, match="invalid data URI at position"):
+            stream_data_uri(iter([b"data:;base64,!!!"])).read()
+
+    def test_missing_comma_position(self):
+        raw = b"data:text/plain"
+        with pytest.raises(DataURIError) as exc_info:
+            stream_data_uri(iter(self._chunk(raw, 3))).read()
+        assert exc_info.value.position == len(raw)
+
+    def test_limit_urlencoded(self):
+        raw = b"data:," + b"A" * 1000
+        positions = set()
+        for size in range(1, 40):
+            stream = stream_data_uri(iter(self._chunk(raw, size)), max_size=100)
+            seen = 0
+            with pytest.raises(DataURILimitError) as exc_info:
+                for chunk in stream:
+                    seen += len(chunk)
+            assert exc_info.value.limit == 100
+            assert seen <= 100 + 4096
+            positions.add(exc_info.value.position)
+        assert len(positions) == 1
+
+    def test_limit_base64(self):
+        payload = bytes(range(256)) * 20
+        raw = b"data:application/octet-stream;base64," + base64.b64encode(payload)
+        for size in (1, 2, 3, 4, 5, 7, 16, 64, 1000):
+            stream = stream_data_uri(
+                iter(self._chunk(raw, size)), max_size=500
+            )
+            seen = 0
+            with pytest.raises(DataURILimitError):
+                for chunk in stream:
+                    seen += len(chunk)
+            assert seen <= 500 + 4096
+
+    def test_limit_not_exceeded(self):
+        payload = bytes(range(256)) * 20
+        raw = b"data:application/octet-stream;base64," + base64.b64encode(payload)
+        for size in (1, 2, 3, 4, 5, 7, 16, 64, 1000):
+            stream = stream_data_uri(iter(self._chunk(raw, size)))
+            assert stream.read() == payload
+
+    def test_data_after_closing_padding_rejected(self):
+        raw = b"data:;base64,YWJj==ZGQ"
+        for size in range(1, len(raw) + 2):
+            with pytest.raises(DataURIError):
+                stream_data_uri(
+                    iter(self._chunk(raw, size))
+                ).read()
+
+    def test_unpadded_tail_all_chunkings(self):
+        payload = b"Hello, world!!"
+        encoded = base64.b64encode(payload).rstrip(b"=")
+        raw = b"data:;base64," + encoded
+        for size in range(1, len(raw) + 2):
+            assert (
+                stream_data_uri(iter(self._chunk(raw, size))).read() == payload
+            )
+
+    def test_limit_zero_allows_empty_payload(self):
+        assert stream_data_uri("data:,", max_size=0).read() == b""
+        with pytest.raises(DataURILimitError):
+            stream_data_uri("data:,A", max_size=0).read()
+
+    def test_negative_limit_rejected(self):
+        with pytest.raises(ValueError):
+            stream_data_uri("data:,A", max_size=-1)
+
+    def test_close_and_context_manager(self):
+        stream = stream_data_uri("data:,abc")
+        stream.close()
+        assert list(stream) == []
+        with stream_data_uri("data:,abc") as managed:
+            assert managed.read() == b"abc"
+
+    def test_bad_chunk_type(self):
+        with pytest.raises(TypeError):
+            stream_data_uri(iter([123])).read()
 
 
 class TestParseQsl:

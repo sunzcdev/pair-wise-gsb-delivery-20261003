@@ -1,6 +1,24 @@
 w3lib release notes
 ===================
 
+Unreleased
+----------
+
+New features:
+
+- Added :func:`~w3lib.url.stream_data_uri` (aliased as
+  ``parse_data_uri_stream``) and the :class:`~w3lib.url.DataURIStream`
+  class to parse data: URIs incrementally. The media type and its
+  parameters are returned first, while the payload is decoded lazily one
+  chunk at a time, so large embedded resources do not have to be held in
+  memory at once. Base64 quartets and percent escapes may span input
+  chunks. A ``max_size`` argument bounds the decoded payload: iteration
+  raises :class:`~w3lib.url.DataURILimitError` as soon as the limit is
+  crossed without allocating the full decoded result. Malformed URIs raise
+  :class:`~w3lib.url.DataURIError`, whose ``position`` attribute locates
+  the offending byte in the original URI independently of chunk
+  boundaries. :func:`~w3lib.url.parse_data_uri` is unchanged.
+
 2.6.0 (2026-11-05)
 ------------------
 
