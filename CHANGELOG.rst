@@ -10,6 +10,7 @@
 - fix: :class:`.MAD` returns the correct median absolute deviation.
 - fix: :meth:`.Table.join` accepts ``right_key`` as a sequence containing column indices, like ``[0, 1]``. Previously, it raised a ``ValueError``.
 - fix: :meth:`.Table.join`, if the right table has any columns with values identical to the ``right_key`` column, omits the ``right_key`` column from the output, instead of the first of the identical columns.
+- fix: :meth:`.Table.from_csv` reads CSV from non-seekable, sequential-only streams when ``sniff_limit`` is set. The bytes read for sniffing are buffered and replayed to the CSV reader instead of using ``tell()``/``seek()``, so the source no longer needs to be seekable or resemble ``sys.stdin``. If the dialect cannot be sniffed from the sample, the caller-supplied dialect is retained and the buffered sample is still parsed.
 - fix: :meth:`.Table.join`, with ``require_match=True`` and a composite key, raises a ``ValueError`` for an unmatched key, instead of a ``TypeError``.
 
 1.14.2 - February 27, 2026
