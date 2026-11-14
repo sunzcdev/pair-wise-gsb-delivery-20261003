@@ -1,6 +1,14 @@
 1.8.2
 ~~~~~
 
+- Parse leading 1xx (informational, e.g. ``100 Continue``, ``103 Early Hints``)
+  HTTP response header blocks: the final (non-1xx) response is returned as the
+  main response, the body begins after it, and the preceding header blocks are
+  preserved verbatim and in order (``StatusAndHeaders.informational_headers``)
+  for digest verification. Missing final responses, truncated informational
+  header blocks, and ``101 Switching Protocols`` each raise a distinct error
+  instead of being misread as a body; an HTTP status line appearing in the body
+  is never re-parsed. Ordinary single-response records are unchanged.
 - Replace unmaintained brotlipy with brotlicffi>=1.2.1.0 by @ato https://github.com/webrecorder/warcio/pull/211
 - Add Content-Encoding: x-gzip as an alias for gzip by @sammist2 in https://github.com/webrecorder/warcio/pull/210
 

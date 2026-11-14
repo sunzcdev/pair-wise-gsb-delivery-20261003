@@ -30,6 +30,10 @@ class StatusAndHeaders(object):
         self.protocol = protocol
         self.total_len = total_len
         self.headers_buff = None
+        # Raw bytes of any leading 1xx (informational) response header blocks,
+        # in the order they were received and terminated by their blank lines.
+        # Empty for an ordinary record with a single status line + headers.
+        self.informational_headers = []
 
     def get_header(self, name, default_value=None):
         """
@@ -229,9 +233,13 @@ class StatusAndHeadersParser(object):
     Parser which consumes a stream support readline() to read
     status and headers and return a StatusAndHeaders object
     """
-    def __init__(self, statuslist, verify=True):
+    def __init__(self, statuslist, verify=True, is_http_response=False):
         self.statuslist = statuslist
         self.verify = verify
+        # When true, treat leading 1xx (informational) status lines as
+        # preliminary response header blocks and keep parsing until the
+        # final (non-1xx) response. Only meaningful for HTTP responses.
+        self.is_http_response = is_http_response
 
     def parse(self, stream, full_statusline=None):
         """
@@ -239,6 +247,12 @@ class StatusAndHeadersParser(object):
         return a StatusAndHeaders object
 
         support continuation headers starting with space or tab
+
+        For HTTP responses (is_http_response=True), any number of leading
+        1xx informational response header blocks are consumed and preserved
+        in order; the last non-1xx response is returned as the main
+        StatusAndHeaders and the body begins after it. The informational
+        blocks are kept verbatim for digest verification.
         """
 
         # status line w newlines intact
@@ -259,6 +273,74 @@ class StatusAndHeadersParser(object):
                                     headers=headers,
                                     protocol='',
                                     total_len=total_read)
+
+        # Collapse any leading 1xx informational responses (e.g. HTTP/1.1 100
+        # Continue, 103 Early Hints) so that the final response is parsed as
+        # the main response. Only the raw header bytes are retained; parsing
+        # resumes strictly at the status line that follows each blank line.
+        informational = []
+
+        if self.is_http_response:
+            while True:
+                protocol_status = self._parse_statusline(statusline)
+                status_code = self._get_status_code(protocol_status)
+
+                # A 101 Switching Protocols response is terminal: the
+                # remainder of the stream is no longer HTTP framing, so it
+                # must not be parsed as another response (nor treated as a
+                # preliminary response to be collapsed).
+                if status_code == 101:
+                    raise ProtocolSwitchStatusAndHeadersException(
+                        'HTTP 101 Switching Protocols response terminates the '
+                        'HTTP header stream; the tunneled data cannot be '
+                        'parsed as another response',
+                        statusline,
+                        b''.join(informational))
+
+                if not self._is_informational(protocol_status):
+                    break
+
+                # preserve the exact bytes of the informational status line
+                informational_buff = self._raw_line(full_statusline)
+
+                # consume the informational header block up to its blank line
+                blank_seen = True
+                while True:
+                    raw_line = stream.readline()
+                    if not raw_line:
+                        blank_seen = False
+                        break
+
+                    total_read += len(raw_line)
+                    informational_buff += raw_line
+
+                    if not self.decode_header(raw_line).rstrip():
+                        break
+
+                if not blank_seen:
+                    raise TruncatedStatusAndHeadersException(
+                        'Informational response header block is truncated '
+                        '(missing terminating blank line)',
+                        statusline,
+                        informational_buff)
+
+                informational.append(informational_buff)
+
+                # read the next status line; this must be another response,
+                # never body bytes (body parsing only starts after the final
+                # header block is returned)
+                full_statusline = stream.readline()
+                total_read += len(full_statusline)
+
+                if not full_statusline:
+                    raise MissingFinalStatusAndHeadersException(
+                        'Informational response(s) not followed by a final '
+                        'response status line',
+                        statusline,
+                        b''.join(informational))
+
+                full_statusline = self.decode_header(full_statusline)
+                statusline = full_statusline.rstrip()
 
         # validate only if verify is set
         if self.verify:
@@ -302,10 +384,58 @@ class StatusAndHeadersParser(object):
         else:
             statusline = ''
 
-        return StatusAndHeaders(statusline=statusline,
-                                headers=headers,
-                                protocol=protocol_status[0],
-                                total_len=total_read)
+        parsed = StatusAndHeaders(statusline=statusline,
+                                  headers=headers,
+                                  protocol=protocol_status[0],
+                                  total_len=total_read)
+
+        # keep the verbatim informational response header blocks in order
+        parsed.informational_headers = informational
+
+        return parsed
+
+    def _parse_statusline(self, statusline):
+        """
+        split a status line into (protocol, remainder) without raising,
+        using the configured prefixes when verifying, else a simple split
+        """
+        if self.verify:
+            protocol_status = self.split_prefix(statusline, self.statuslist)
+            if not protocol_status:
+                return None
+            return protocol_status
+        return statusline.split(' ', 1)
+
+    @staticmethod
+    def _get_status_code(protocol_status):
+        """
+        extract the numeric status code from a (protocol, remainder) tuple,
+        returning None when it is missing or not numeric
+        """
+        if not protocol_status or len(protocol_status) < 2:
+            return None
+
+        code = protocol_status[1].strip().split(' ', 1)[0]
+        try:
+            return int(code)
+        except ValueError:
+            return None
+
+    def _is_informational(self, protocol_status):
+        """
+        True when the status line holds a 1xx informational response
+        """
+        code = self._get_status_code(protocol_status)
+        return code is not None and 100 <= code < 200
+
+    @staticmethod
+    def _raw_line(line):
+        """
+        return the original bytes for a (possibly decoded) readline() result
+        """
+        if isinstance(line, bytes):
+            return line
+        return line.encode('iso-8859-1')
 
     @staticmethod
     def split_prefix(key, prefixs):
@@ -344,3 +474,37 @@ class StatusAndHeadersParserException(Exception):
     def __init__(self, msg, statusline):
         super(StatusAndHeadersParserException, self).__init__(msg)
         self.statusline = statusline
+
+
+#=================================================================
+class MissingFinalStatusAndHeadersException(StatusAndHeadersParserException):
+    """
+    Raised when one or more 1xx informational responses are present but the
+    stream ends before a final (non-1xx) response status line.
+    """
+    def __init__(self, msg, statusline, raw_headers=b''):
+        super(MissingFinalStatusAndHeadersException, self).__init__(msg, statusline)
+        self.raw_headers = raw_headers
+
+
+#=================================================================
+class TruncatedStatusAndHeadersException(StatusAndHeadersParserException):
+    """
+    Raised when an informational response header block is cut off before its
+    terminating blank line.
+    """
+    def __init__(self, msg, statusline, raw_headers=b''):
+        super(TruncatedStatusAndHeadersException, self).__init__(msg, statusline)
+        self.raw_headers = raw_headers
+
+
+#=================================================================
+class ProtocolSwitchStatusAndHeadersException(StatusAndHeadersParserException):
+    """
+    Raised when an HTTP 101 Switching Protocols response is encountered among
+    leading responses. The tunneled bytes are not HTTP framing and must not be
+    parsed as another response.
+    """
+    def __init__(self, msg, statusline, raw_headers=b''):
+        super(ProtocolSwitchStatusAndHeadersException, self).__init__(msg, statusline)
+        self.raw_headers = raw_headers

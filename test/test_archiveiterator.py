@@ -377,3 +377,143 @@ Content-Length: 1303\r\n'
         # record 2: b64 digest; record 3: b64 filename safe digest
         assert self._load_archive('example-digest.warc', offset=922, check_digests=True) == expected_t
         assert self._load_archive('example-digest.warc', offset=922, check_digests=False) == expected_t
+
+    # ------------------------------------------------------------------
+    # Leading 1xx (informational) HTTP responses
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _build_raw_response_warc(block, extra_headers=None):
+        """Build a single uncompressed WARC response record holding an
+        arbitrary (possibly multi-status-line) HTTP block."""
+        headers = [
+            ('WARC-Type', 'response'),
+            ('WARC-Record-ID', '<urn:uuid:12345678-1234-1234-1234-1234567890ab>'),
+            ('WARC-Target-URI', 'http://example.com/'),
+            ('WARC-Date', '2026-01-01T00:00:00Z'),
+            ('Content-Type', 'application/http; msgtype=response'),
+            ('Content-Length', str(len(block))),
+        ]
+        if extra_headers:
+            headers.extend(extra_headers)
+
+        warc_headers = StatusAndHeaders('', headers, protocol='WARC/1.0')
+        out = BytesIO()
+        out.write(warc_headers.to_bytes(encoding='utf-8'))
+        out.write(block)
+        out.write(b'\r\n\r\n')
+        out.seek(0)
+        return out
+
+    def test_response_with_100_continue(self):
+        info = b'HTTP/1.1 100 Continue\r\n\r\n'
+        final = (b'HTTP/1.1 200 OK\r\n'
+                 b'Content-Type: text/plain\r\n'
+                 b'Content-Length: 13\r\n\r\n')
+        body = b'hello, world!'
+
+        stream = self._build_raw_response_warc(info + final + body)
+        record = next(iter(ArchiveIterator(stream)))
+
+        assert record.http_headers.statusline == '200 OK'
+        assert record.http_headers.protocol == 'HTTP/1.1'
+        assert record.http_headers.informational_headers == [info]
+        # body begins after the final header block, 1xx bytes excluded
+        assert record.content_stream().read() == body
+
+    def test_response_with_multiple_informational(self):
+        block = (
+            b'HTTP/1.1 100 Continue\r\n\r\n'
+            b'HTTP/1.1 103 Early Hints\r\nLink: </a>; rel=preload\r\n\r\n'
+            b'HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n'
+            b'ok')
+
+        stream = self._build_raw_response_warc(block)
+        record = next(iter(ArchiveIterator(stream)))
+
+        assert record.http_headers.statusline == '200 OK'
+        assert len(record.http_headers.informational_headers) == 2
+        assert record.content_stream().read() == b'ok'
+
+    def test_informational_digests_verify(self):
+        from warcio.utils import Digester
+
+        info = b'HTTP/1.1 100 Continue\r\n\r\n'
+        final = b'HTTP/1.1 200 OK\r\nContent-Length: 13\r\n\r\n'
+        body = b'hello, world!'
+        block = info + final + body
+
+        block_digester = Digester('sha1')
+        block_digester.update(block)
+        payload_digester = Digester('sha1')
+        payload_digester.update(body)
+
+        stream = self._build_raw_response_warc(
+            block,
+            extra_headers=[
+                ('WARC-Block-Digest', str(block_digester)),
+                ('WARC-Payload-Digest', str(payload_digester)),
+            ])
+
+        record = next(iter(ArchiveIterator(stream, check_digests=True)))
+        # read the whole payload so the digests are finalized
+        assert record.content_stream().read() == body
+        assert record.digest_checker.passed is True
+        assert record.digest_checker.problems == []
+
+    def test_informational_missing_final_response_fails_cleanly(self):
+        from warcio.statusandheaders import (
+            MissingFinalStatusAndHeadersException)
+
+        block = b'HTTP/1.1 100 Continue\r\nFoo: bar\r\n\r\n'
+        stream = self._build_raw_response_warc(block)
+
+        with pytest.raises(MissingFinalStatusAndHeadersException):
+            next(iter(ArchiveIterator(stream)))
+
+    def test_informational_truncated_fails_cleanly(self):
+        from warcio.statusandheaders import (
+            TruncatedStatusAndHeadersException)
+
+        block = b'HTTP/1.1 100 Continue\r\nFoo: bar\r\n'
+        stream = self._build_raw_response_warc(block)
+
+        with pytest.raises(TruncatedStatusAndHeadersException):
+            next(iter(ArchiveIterator(stream)))
+
+    def test_protocol_switch_fails_cleanly(self):
+        from warcio.statusandheaders import (
+            ProtocolSwitchStatusAndHeadersException)
+
+        block = (b'HTTP/1.1 100 Continue\r\n\r\n'
+                 b'HTTP/1.1 101 Switching Protocols\r\n'
+                 b'Upgrade: websocket\r\n\r\nraw-tunnel')
+        stream = self._build_raw_response_warc(block)
+
+        with pytest.raises(ProtocolSwitchStatusAndHeadersException):
+            next(iter(ArchiveIterator(stream)))
+
+    def test_http_status_line_in_body_not_reparsed(self):
+        body = b'HTTP/1.1 200 OK\r\nX: body\r\n\r\n'
+        block = (b'HTTP/1.1 200 OK\r\n'
+                 b'Content-Length: ' + str(len(body)).encode('ascii') +
+                 b'\r\n\r\n' + body)
+
+        stream = self._build_raw_response_warc(block)
+        record = next(iter(ArchiveIterator(stream)))
+
+        assert record.http_headers.statusline == '200 OK'
+        assert record.http_headers.informational_headers == []
+        assert record.content_stream().read() == body
+
+    def test_plain_response_unchanged(self):
+        body = b'plain body'
+        block = (b'HTTP/1.1 200 OK\r\n'
+                 b'Content-Length: ' + str(len(body)).encode('ascii') +
+                 b'\r\n\r\n' + body)
+
+        stream = self._build_raw_response_warc(block)
+        record = next(iter(ArchiveIterator(stream)))
+
+        assert record.http_headers.statusline == '200 OK'
+        assert record.http_headers.informational_headers == []
+        assert record.content_stream().read() == body

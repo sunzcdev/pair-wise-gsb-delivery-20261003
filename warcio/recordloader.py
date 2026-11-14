@@ -70,7 +70,9 @@ class ArcWarcRecordLoader(object):
             self.arc_parser = ARCHeadersParser()
 
         self.warc_parser = StatusAndHeadersParser(self.WARC_TYPES)
-        self.http_parser = StatusAndHeadersParser(self.HTTP_TYPES, verify_http)
+        # responses may contain leading 1xx informational header blocks
+        self.http_parser = StatusAndHeadersParser(self.HTTP_TYPES, verify_http,
+                                                  is_http_response=True)
 
         self.http_req_parser = StatusAndHeadersParser(self.HTTP_VERBS, verify_http)
 
@@ -148,6 +150,11 @@ class ArcWarcRecordLoader(object):
             http_headers = self.load_http_headers(rec_type, uri, stream, length)
             if length and http_headers:
                 payload_length = length - (stream.tell() - start)
+
+        # Leading 1xx informational header blocks are read via the (possibly
+        # digest-verifying) stream during parsing, so the block digester
+        # already accounts for their verbatim bytes, while the payload digest
+        # correctly starts at the body following the final response.
 
         # generate validate http headers (eg. for replay)
         if not http_headers and ensure_http_headers:

@@ -91,7 +91,14 @@ StatusAndHeaders(protocol = 'HTTP/1.0', statusline = '204 empty', headers = [('C
 
 
 from warcio.statusandheaders import StatusAndHeadersParser, StatusAndHeaders
+from warcio.statusandheaders import StatusAndHeadersParserException
+from warcio.statusandheaders import (
+    MissingFinalStatusAndHeadersException,
+    TruncatedStatusAndHeadersException,
+    ProtocolSwitchStatusAndHeadersException,
+)
 from six import StringIO
+from io import BytesIO
 import pytest
 
 
@@ -237,3 +244,207 @@ def test_non_ascii_3():
 Custom-Header: %E2%80%9Cmax-age%3D31536000%E2%80%B3\r\n\
 \r\n\
 "
+
+
+# ============================================================================
+# Leading 1xx (informational) response handling
+# ============================================================================
+
+HTTP_TYPES = ['HTTP/1.0', 'HTTP/1.1']
+
+
+def _response_parser(verify=True):
+    return StatusAndHeadersParser(HTTP_TYPES, verify=verify,
+                                  is_http_response=True)
+
+
+def test_single_100_then_final_response():
+    data = (b'HTTP/1.1 100 Continue\r\n\r\n'
+            b'HTTP/1.1 200 OK\r\n'
+            b'Content-Type: text/plain\r\n'
+            b'Content-Length: 5\r\n\r\n'
+            b'hello')
+
+    stream = BytesIO(data)
+    sh = _response_parser().parse(stream)
+
+    assert sh.protocol == 'HTTP/1.1'
+    assert sh.statusline == '200 OK'
+    assert sh.headers == [('Content-Type', 'text/plain'),
+                          ('Content-Length', '5')]
+
+    # raw informational block is preserved verbatim, in order
+    assert sh.informational_headers == [b'HTTP/1.1 100 Continue\r\n\r\n']
+
+    # body starts exactly after the final header block
+    assert stream.read() == b'hello'
+    assert sh.total_len == len(data) - len(b'hello')
+
+
+def test_multiple_informational_responses_in_order():
+    data = (b'HTTP/1.1 100 Continue\r\n\r\n'
+            b'HTTP/1.1 103 Early Hints\r\n'
+            b'Link: </style.css>; rel=preload\r\n\r\n'
+            b'HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\n'
+            b'body')
+
+    stream = BytesIO(data)
+    sh = _response_parser().parse(stream)
+
+    assert sh.statusline == '200 OK'
+    assert sh.headers == [('Content-Length', '4')]
+    assert sh.informational_headers == [
+        b'HTTP/1.1 100 Continue\r\n\r\n',
+        b'HTTP/1.1 103 Early Hints\r\n'
+        b'Link: </style.css>; rel=preload\r\n\r\n',
+    ]
+    assert stream.read() == b'body'
+
+
+def test_informational_with_headers_and_continuation_lines():
+    data = (b'HTTP/1.1 102 Processing\r\n'
+            b'X-Progress: step one\r\n'
+            b'    continued\r\n\r\n'
+            b'HTTP/1.0 204 No Content\r\n\r\n')
+
+    stream = BytesIO(data)
+    sh = _response_parser().parse(stream)
+
+    assert sh.protocol == 'HTTP/1.0'
+    assert sh.statusline == '204 No Content'
+    assert sh.informational_headers == [
+        b'HTTP/1.1 102 Processing\r\n'
+        b'X-Progress: step one\r\n'
+        b'    continued\r\n\r\n'
+    ]
+    assert stream.read() == b''
+
+
+def test_no_informational_response_is_unchanged():
+    # an ordinary single response must produce exactly the old result
+    data = b'HTTP/1.0 200 OK\r\nContent-Type: ABC\r\n\r\nBody'
+
+    new = _response_parser().parse(BytesIO(data))
+    old = StatusAndHeadersParser(HTTP_TYPES).parse(BytesIO(data))
+
+    assert new.statusline == old.statusline
+    assert new.protocol == old.protocol
+    assert new.headers == old.headers
+    assert new.total_len == old.total_len
+    assert new.informational_headers == []
+
+    stream = BytesIO(data)
+    sh = _response_parser().parse(stream)
+    assert stream.read() == b'Body'
+
+
+def test_http_status_line_in_body_is_not_reparsed():
+    # an HTTP/1.1 line inside the body must never start another parse
+    body = b'HTTP/1.1 200 OK\r\nX-Not-A-Header: value\r\n\r\n'
+    data = (b'HTTP/1.1 200 OK\r\n'
+            b'Content-Length: ' + str(len(body)).encode('ascii') +
+            b'\r\n\r\n' + body)
+
+    stream = BytesIO(data)
+    sh = _response_parser().parse(stream)
+
+    assert sh.statusline == '200 OK'
+    assert sh.informational_headers == []
+    assert stream.read() == body
+
+
+def test_second_non_1xx_response_is_treated_as_body():
+    body = b'HTTP/1.1 404 Not Found\r\n\r\n'
+    data = (b'HTTP/1.1 200 OK\r\n'
+            b'Content-Length: ' + str(len(body)).encode('ascii') +
+            b'\r\n\r\n' + body)
+
+    stream = BytesIO(data)
+    sh = _response_parser().parse(stream)
+
+    assert sh.statusline == '200 OK'
+    assert sh.informational_headers == []
+    assert stream.read() == body
+
+
+def test_missing_final_response_raises():
+    data = b'HTTP/1.1 100 Continue\r\nFoo: bar\r\n\r\n'
+
+    with pytest.raises(MissingFinalStatusAndHeadersException) as exc:
+        _response_parser().parse(BytesIO(data))
+
+    # the consumed informational bytes are retained for diagnostics/digests
+    assert exc.value.raw_headers == data
+    assert issubclass(MissingFinalStatusAndHeadersException,
+                      StatusAndHeadersParserException)
+
+
+def test_missing_final_after_multiple_responses_keeps_all_blocks():
+    first = b'HTTP/1.1 100 Continue\r\n\r\n'
+    second = b'HTTP/1.1 103 Early Hints\r\nLink: </a>\r\n\r\n'
+
+    with pytest.raises(MissingFinalStatusAndHeadersException) as exc:
+        _response_parser().parse(BytesIO(first + second))
+
+    assert exc.value.raw_headers == first + second
+
+
+def test_truncated_informational_header_raises():
+    data = b'HTTP/1.1 100 Continue\r\nFoo: bar\r\n'
+
+    with pytest.raises(TruncatedStatusAndHeadersException) as exc:
+        _response_parser().parse(BytesIO(data))
+
+    assert exc.value.raw_headers == data
+    assert issubclass(TruncatedStatusAndHeadersException,
+                      StatusAndHeadersParserException)
+
+
+def test_101_switching_protocols_as_first_response_raises():
+    data = (b'HTTP/1.1 101 Switching Protocols\r\n'
+            b'Upgrade: websocket\r\n\r\n'
+            b'raw-tunnel-bytes')
+
+    with pytest.raises(ProtocolSwitchStatusAndHeadersException):
+        _response_parser().parse(BytesIO(data))
+
+
+def test_101_switching_protocols_after_informational_raises():
+    info = b'HTTP/1.1 100 Continue\r\n\r\n'
+    data = (info +
+            b'HTTP/1.1 101 Switching Protocols\r\n'
+            b'Upgrade: websocket\r\n\r\n'
+            b'raw-tunnel-bytes')
+
+    with pytest.raises(ProtocolSwitchStatusAndHeadersException) as exc:
+        _response_parser().parse(BytesIO(data))
+
+    # the leading informational block that was read is retained
+    assert exc.value.raw_headers == info
+    assert issubclass(ProtocolSwitchStatusAndHeadersException,
+                      StatusAndHeadersParserException)
+
+
+def test_informational_verify_false():
+    data = (b'HTTP/1.1 100 Continue\r\n\r\n'
+            b'HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\nbody')
+
+    stream = BytesIO(data)
+    sh = StatusAndHeadersParser([], verify=False,
+                                is_http_response=True).parse(stream)
+
+    assert sh.statusline == '200 OK'
+    assert sh.informational_headers == [b'HTTP/1.1 100 Continue\r\n\r\n']
+    assert stream.read() == b'body'
+
+
+def test_response_flag_does_not_affect_non_response_parser():
+    # a parser without is_http_response keeps the legacy behaviour: a leading
+    # 1xx status line is simply parsed as the (single) response
+    data = b'HTTP/1.1 100 Continue\r\nFoo: bar\r\n\r\n'
+    sh = StatusAndHeadersParser(HTTP_TYPES).parse(BytesIO(data))
+
+    assert sh.statusline == '100 Continue'
+    assert sh.headers == [('Foo', 'bar')]
+    assert sh.informational_headers == []
+
