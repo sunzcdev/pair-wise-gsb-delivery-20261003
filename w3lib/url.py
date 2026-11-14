@@ -13,7 +13,7 @@ import re
 import warnings
 from ipaddress import IPv6Address, ip_address
 from pathlib import Path
-from typing import TYPE_CHECKING, NamedTuple, cast, overload
+from typing import TYPE_CHECKING, Literal, NamedTuple, cast, overload
 from urllib.parse import ParseResult, urljoin
 from urllib.request import pathname2url
 
@@ -42,6 +42,7 @@ from ._url import (
     _split_params,
     _strip,
     _unquote,
+    _unquote_plus,
     _url2pathname,
     _urlencode,
     _urlparse,
@@ -52,7 +53,7 @@ from ._url import (
 from ._util import to_unicode
 
 if TYPE_CHECKING:
-    from collections.abc import Sequence
+    from collections.abc import Mapping, Sequence
 
     from ._types import AnyUnicodeError
 
@@ -561,6 +562,174 @@ def add_or_replace_parameters(
     )
 
 
+class QueryParameterDecodeError(ValueError):
+    """Raised by :func:`edit_query_parameters` when the percent-encoded name
+    of a query parameter cannot be decoded.
+
+    Attributes:
+        segment (str): Raw query segment whose name could not be decoded.
+        position (int): Offset of *segment* within the query string.
+        encoding (str): Encoding that failed to decode the name.
+    """
+
+    def __init__(self, segment: str, position: int, encoding: str) -> None:
+        super().__init__(
+            f"cannot decode the name of query segment {segment!r} "
+            f"(query offset {position}) as {encoding!r}"
+        )
+        self.segment = segment
+        self.position = position
+        self.encoding = encoding
+
+
+_WhichParameter = Literal["first", "last", "all"]
+
+
+def edit_query_parameters(
+    url: str | bytes,
+    replacements: Mapping[str, str],
+    *,
+    plus_as_space: bool,
+    which: _WhichParameter = "all",
+    separator: str = "&",
+    encoding: str = "utf-8",
+) -> str:
+    """Return *url* with the given query parameters replaced, changing nothing
+    else.
+
+    Unlike :func:`add_or_replace_parameters`, which parses the query string
+    and serializes a new one, this function edits the query string in place:
+    parameters not in *replacements* keep their original bytes, including
+    their percent-encoding case, their order, empty query segments and the
+    URL fragment. This makes it suitable for URLs whose query is signed,
+    where re-encoding an untouched parameter would break the signature.
+
+    *replacements* maps parameter names to their new values. Names are
+    matched against the percent-decoded names of the existing parameters.
+    *plus_as_space* (required, keyword-only) selects the form semantics used
+    both to decode existing names for matching and to encode new keys and
+    values: if ``True``, ``+`` decodes as a space and spaces encode as
+    ``+``; if ``False``, ``+`` is a literal plus and spaces encode as
+    ``%20``.
+
+    If a name appears multiple times in the query, *which* selects the
+    occurrences to replace: ``"first"``, ``"last"`` or ``"all"`` (the
+    default). Replaced parameters keep their original, raw name; only the
+    value is rewritten. Names missing from the query are appended, in
+    *replacements* order, with their keys and values percent-encoded using
+    *encoding*, leaving only RFC 3986 unreserved characters unencoded.
+
+    *encoding* is used to decode existing parameter names and to encode new
+    keys and values. If the name of a query parameter cannot be decoded,
+    :exc:`QueryParameterDecodeError` is raised, reporting the position of the
+    offending segment, instead of silently rewriting it.
+
+    Editing two different keys in a row gives the same result as editing them
+    in a single call.
+
+    >>> import w3lib.url
+    >>> w3lib.url.edit_query_parameters('http://example.com/?A=%2f&b=2&&#frag', {'b': '3'}, plus_as_space=True)
+    'http://example.com/?A=%2f&b=3&&#frag'
+    >>> w3lib.url.edit_query_parameters('http://example.com/?x=1&x=2', {'x': '9'}, plus_as_space=True, which='last')
+    'http://example.com/?x=1&x=9'
+    >>> w3lib.url.edit_query_parameters('http://example.com/', {'a b': 'c d'}, plus_as_space=True)
+    'http://example.com/?a+b=c+d'
+    >>> w3lib.url.edit_query_parameters('http://example.com/', {'a b': 'c d'}, plus_as_space=False)
+    'http://example.com/?a%20b=c%20d'
+    >>>
+
+    """
+    if which not in ("first", "last", "all"):
+        msg = f"which must be 'first', 'last' or 'all', got {which!r}"
+        raise ValueError(msg)
+    if isinstance(url, bytes):
+        url = url.decode(encoding)
+    base, hash_mark, fragment = url.partition("#")
+    base, question_mark, query = base.partition("?")
+
+    replacements = dict(replacements)
+    if not replacements:
+        return url
+
+    def quote_param(text: str) -> str:
+        return _quote(text.encode(encoding), quote_plus=plus_as_space).decode("ascii")
+
+    quoted_values = {name: quote_param(value) for name, value in replacements.items()}
+
+    appended: list[str] = []
+    if query:
+        segments = query.split(separator)
+        matches: dict[str, list[int]] = {name: [] for name in replacements}
+        position = 0
+        for index, segment in enumerate(segments):
+            raw_name = segment.partition("=")[0]
+            data = _unquote_plus(raw_name) if plus_as_space else _unquote(raw_name)
+            try:
+                decoded_name = data.decode(encoding)
+            except UnicodeDecodeError as error:
+                raise QueryParameterDecodeError(
+                    segment, position, encoding
+                ) from error
+            if decoded_name in matches:
+                matches[decoded_name].append(index)
+            position += len(segment) + len(separator)
+
+        replaced: dict[int, str] = {}
+        for name, indices in matches.items():
+            if not indices:
+                appended.append(f"{quote_param(name)}={quoted_values[name]}")
+                continue
+            if which == "first":
+                indices = indices[:1]
+            elif which == "last":
+                indices = indices[-1:]
+            for index in indices:
+                replaced[index] = quoted_values[name]
+
+        for index, quoted_value in replaced.items():
+            segments[index] = f"{segments[index].partition('=')[0]}={quoted_value}"
+        new_query = separator.join([*segments, *appended])
+    else:
+        new_query = separator.join(
+            f"{quote_param(name)}={quoted_values[name]}" for name in replacements
+        )
+        if not question_mark:
+            question_mark = "?"
+
+    return f"{base}{question_mark}{new_query}{hash_mark}{fragment}"
+
+
+def edit_query_parameter(
+    url: str | bytes,
+    name: str,
+    value: str,
+    *,
+    plus_as_space: bool,
+    which: _WhichParameter = "all",
+    separator: str = "&",
+    encoding: str = "utf-8",
+) -> str:
+    """Return *url* with the given query parameter replaced, changing nothing
+    else.
+
+    Like :func:`edit_query_parameters`, but for a single parameter.
+
+    >>> import w3lib.url
+    >>> w3lib.url.edit_query_parameter('http://example.com/?a=1&b=2', 'b', '3', plus_as_space=True)
+    'http://example.com/?a=1&b=3'
+    >>>
+
+    """
+    return edit_query_parameters(
+        url,
+        {name: value},
+        plus_as_space=plus_as_space,
+        which=which,
+        separator=separator,
+        encoding=encoding,
+    )
+
+
 def path_to_file_uri(path: str | os.PathLike[str]) -> str:
     """Convert local filesystem path to legal File URIs as described in:
     http://en.wikipedia.org/wiki/File_URI_scheme
@@ -736,10 +905,13 @@ __all__ = [
     "add_or_replace_parameters",
     "any_to_uri",
     "canonicalize_url",
+    "edit_query_parameter",
+    "edit_query_parameters",
     "file_uri_to_path",
     "is_url",
     "parse_data_uri",
     "path_to_file_uri",
+    "QueryParameterDecodeError",
     "safe_url_string",
     "url_query_cleaner",
     "url_query_parameter",

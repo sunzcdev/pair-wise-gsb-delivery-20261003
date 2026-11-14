@@ -40,6 +40,7 @@ from w3lib._url import (
     _urlunsplit,
 )
 from w3lib.url import (
+    QueryParameterDecodeError,
     _normalize_ipv6_host,
     _remove_dot_segments,
     add_http_if_no_scheme,
@@ -47,6 +48,8 @@ from w3lib.url import (
     add_or_replace_parameters,
     any_to_uri,
     canonicalize_url,
+    edit_query_parameter,
+    edit_query_parameters,
     file_uri_to_path,
     is_url,
     parse_data_uri,
@@ -1308,6 +1311,183 @@ class TestUrl:
         input_param = {"arg": "value"}
         add_or_replace_parameters(url, input_param)
         assert input_param == {"arg": "value"}
+
+    def test_edit_query_parameter(self):
+        url = "http://domain/test"
+        assert (
+            edit_query_parameter(url, "arg", "v", plus_as_space=True)
+            == "http://domain/test?arg=v"
+        )
+        url = "http://domain/test?arg1=v1&arg2=v2&arg3=v3"
+        assert (
+            edit_query_parameter(url, "arg3", "nv3", plus_as_space=True)
+            == "http://domain/test?arg1=v1&arg2=v2&arg3=nv3"
+        )
+        assert (
+            edit_query_parameter(url, "arg4", "v4", plus_as_space=True)
+            == "http://domain/test?arg1=v1&arg2=v2&arg3=v3&arg4=v4"
+        )
+
+    def test_edit_query_parameters_lossless(self):
+        # Untouched parameters keep their original bytes: percent-encoding
+        # case, separator order, empty segments and the fragment.
+        url = "http://domain/test?A=%2f&b=%2F&c=1&&d=#Fr%61g"
+        assert (
+            edit_query_parameters(url, {"c": "2"}, plus_as_space=True)
+            == "http://domain/test?A=%2f&b=%2F&c=2&&d=#Fr%61g"
+        )
+        # A replaced parameter keeps its raw name; only the value changes.
+        assert (
+            edit_query_parameters(url, {"A": "1"}, plus_as_space=True)
+            == "http://domain/test?A=1&b=%2F&c=1&&d=#Fr%61g"
+        )
+        assert (
+            edit_query_parameters(
+                "http://domain/test?%61=1", {"a": "2"}, plus_as_space=True
+            )
+            == "http://domain/test?%61=2"
+        )
+        # A parameter without a value gets one.
+        assert (
+            edit_query_parameters(
+                "http://domain/test?a&b=2", {"a": "1"}, plus_as_space=True
+            )
+            == "http://domain/test?a=1&b=2"
+        )
+        # Nothing to replace returns the URL unmodified.
+        assert edit_query_parameters(url, {}, plus_as_space=True) == url
+        # bytes URLs are decoded with the given encoding.
+        assert (
+            edit_query_parameters(
+                b"http://domain/test?a=1", {"a": "2"}, plus_as_space=True
+            )
+            == "http://domain/test?a=2"
+        )
+
+    def test_edit_query_parameters_empty_query(self):
+        assert (
+            edit_query_parameters("http://domain/test?", {"a": "1"}, plus_as_space=True)
+            == "http://domain/test?a=1"
+        )
+        assert (
+            edit_query_parameters(
+                "http://domain/test?#f", {"a": "1"}, plus_as_space=True
+            )
+            == "http://domain/test?a=1#f"
+        )
+        assert (
+            edit_query_parameters(
+                "http://domain/test?&b=2", {"a": "1"}, plus_as_space=True
+            )
+            == "http://domain/test?&b=2&a=1"
+        )
+
+    def test_edit_query_parameters_which(self):
+        url = "http://domain/test?x=1&y=2&x=3&x=4"
+        assert (
+            edit_query_parameters(url, {"x": "9"}, plus_as_space=True, which="first")
+            == "http://domain/test?x=9&y=2&x=3&x=4"
+        )
+        assert (
+            edit_query_parameters(url, {"x": "9"}, plus_as_space=True, which="last")
+            == "http://domain/test?x=1&y=2&x=3&x=9"
+        )
+        assert (
+            edit_query_parameters(url, {"x": "9"}, plus_as_space=True, which="all")
+            == "http://domain/test?x=9&y=2&x=9&x=9"
+        )
+        # "all" is the default.
+        assert edit_query_parameters(
+            url, {"x": "9"}, plus_as_space=True
+        ) == edit_query_parameters(url, {"x": "9"}, plus_as_space=True, which="all")
+        with pytest.raises(ValueError, match="which"):
+            edit_query_parameters(  # type: ignore[arg-type]
+                url, {"x": "9"}, plus_as_space=True, which="bad"
+            )
+
+    def test_edit_query_parameters_encoding(self):
+        # New keys and values are percent-encoded, leaving only RFC 3986
+        # unreserved characters unencoded.
+        assert (
+            edit_query_parameters(
+                "http://domain/test", {"a&b": "c=d"}, plus_as_space=True
+            )
+            == "http://domain/test?a%26b=c%3Dd"
+        )
+        assert (
+            edit_query_parameters(
+                "http://domain/test", {"k": "résumé"}, plus_as_space=True
+            )
+            == "http://domain/test?k=r%C3%A9sum%C3%A9"
+        )
+        # Spaces in new keys and values follow the form semantics.
+        assert (
+            edit_query_parameters(
+                "http://domain/test", {"a b": "c d"}, plus_as_space=True
+            )
+            == "http://domain/test?a+b=c+d"
+        )
+        assert (
+            edit_query_parameters(
+                "http://domain/test", {"a b": "c d"}, plus_as_space=False
+            )
+            == "http://domain/test?a%20b=c%20d"
+        )
+
+    def test_edit_query_parameters_plus_as_space(self):
+        url = "http://domain/test?a+b=1&a%20c=2"
+        # With form semantics, "+" matches a space in the parameter name.
+        assert (
+            edit_query_parameters(url, {"a b": "3"}, plus_as_space=True)
+            == "http://domain/test?a+b=3&a%20c=2"
+        )
+        # Without them, "+" is a literal plus and does not match a space.
+        assert (
+            edit_query_parameters(url, {"a b": "3"}, plus_as_space=False)
+            == "http://domain/test?a+b=1&a%20c=2&a%20b=3"
+        )
+        # "%20" matches a space under both semantics.
+        assert (
+            edit_query_parameters(url, {"a c": "3"}, plus_as_space=False)
+            == "http://domain/test?a+b=1&a%20c=3"
+        )
+
+    def test_edit_query_parameters_decode_error(self):
+        url = "http://domain/test?ok=1&%FFx=2&ok2=3"
+        with pytest.raises(QueryParameterDecodeError) as exc_info:
+            edit_query_parameters(url, {"ok": "0"}, plus_as_space=True)
+        assert exc_info.value.segment == "%FFx=2"
+        assert exc_info.value.position == 5
+        assert exc_info.value.encoding == "utf-8"
+        # The error is also raised when the undecodable name would not match.
+        with pytest.raises(QueryParameterDecodeError):
+            edit_query_parameters(
+                "http://domain/test?%FF=1", {"a": "1"}, plus_as_space=True
+            )
+
+    def test_edit_query_parameters_composition(self):
+        # Editing two keys in a row equals editing them in a single call.
+        url = "http://domain/test?b=2&a=1&&c=%2f#frag"
+        once = edit_query_parameters(
+            url, {"a": "A", "c": "C", "d": "D"}, plus_as_space=True
+        )
+        twice = edit_query_parameters(
+            edit_query_parameters(url, {"a": "A"}, plus_as_space=True),
+            {"c": "C", "d": "D"},
+            plus_as_space=True,
+        )
+        assert twice == once == "http://domain/test?b=2&a=A&&c=C&d=D#frag"
+
+    def test_edit_query_parameters_separator(self):
+        url = "http://domain/test?arg1=v1;arg2=v2"
+        assert (
+            edit_query_parameters(url, {"arg2": "nv2"}, plus_as_space=True, separator=";")
+            == "http://domain/test?arg1=v1;arg2=nv2"
+        )
+        assert (
+            edit_query_parameters(url, {"arg3": "v3"}, plus_as_space=True, separator=";")
+            == "http://domain/test?arg1=v1;arg2=v2;arg3=v3"
+        )
 
     def test_url_query_cleaner(self):
         assert url_query_cleaner("product.html?") == "product.html"
