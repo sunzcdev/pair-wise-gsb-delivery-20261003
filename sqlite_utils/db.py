@@ -1,3 +1,4 @@
+import base64
 import binascii
 import contextlib
 import datetime
@@ -466,6 +467,10 @@ class InvalidColumns(Exception):
 
 class TransactionError(Exception):
     "Operation cannot be performed while a transaction is open"
+
+
+class InvalidCursor(Exception):
+    "Keyset pagination cursor does not match this table or sort definition"
 
 
 class DescIndex(str):
@@ -2094,6 +2099,363 @@ class Database:
         return result and bool(result[0])
 
 
+def _keyset_json_default(value: Any) -> Any:
+    if isinstance(value, bytes):
+        return {"__type__": "bytes", "b64": base64.b64encode(value).decode("ascii")}
+    if isinstance(value, (datetime.date, datetime.datetime, datetime.time)):
+        return value.isoformat()
+    raise TypeError(
+        f"Object of type {type(value).__name__!r} is not serializable in a keyset cursor"
+    )
+
+
+def _keyset_json_object_hook(obj: dict[str, Any]) -> Any:
+    if obj.get("__type__") == "bytes" and "b64" in obj:
+        return base64.b64decode(obj["b64"].encode("ascii"))
+    return obj
+
+
+class KeysetCursor:
+    """
+    An opaque, JSON-encoded position in a :class:`KeysetPaginator`.
+
+    A cursor records the last row seen on a previous run together with the
+    table name and sort definition that produced it. Passing it back to
+    :meth:`Table.keyset_pages` resumes iteration from that point. A cursor is
+    rejected (with :class:`InvalidCursor`) if it is replayed against a
+    different table or a different sort definition.
+
+    Instances are immutable. Use :meth:`encode` to turn one into a portable
+    string and :meth:`decode` to reconstruct it.
+    """
+
+    def __init__(
+        self,
+        table: str,
+        sort: tuple[tuple[str, str], ...],
+        last_values: tuple[Any, ...],
+    ) -> None:
+        self._table = table
+        self._sort = tuple(sort)
+        self._last_values = tuple(last_values)
+
+    @property
+    def table(self) -> str:
+        return self._table
+
+    @property
+    def sort(self) -> tuple[tuple[str, str], ...]:
+        return self._sort
+
+    @property
+    def last_values(self) -> tuple[Any, ...]:
+        return self._last_values
+
+    def __eq__(self, other: object) -> bool:
+        if not isinstance(other, KeysetCursor):
+            return NotImplemented
+        return (
+            self._table == other._table
+            and self._sort == other._sort
+            and self._last_values == other._last_values
+        )
+
+    def __repr__(self) -> str:
+        return f"<KeysetCursor table={self._table!r} sort={list(self._sort)!r}>"
+
+    def encode(self) -> str:
+        "Return a base64-encoded JSON string representing this cursor."
+        payload = {
+            "table": self._table,
+            "sort": [list(pair) for pair in self._sort],
+            "last_values": list(self._last_values),
+        }
+        raw = json.dumps(payload, default=_keyset_json_default, ensure_ascii=False)
+        return base64.urlsafe_b64encode(raw.encode("utf-8")).decode("ascii")
+
+    @classmethod
+    def decode(cls, encoded: str) -> "KeysetCursor":
+        """
+        Reconstruct a cursor previously produced by :meth:`encode`.
+
+        :raises InvalidCursor: if the string is malformed or not a cursor
+        """
+        try:
+            raw = base64.urlsafe_b64decode(encoded.encode("ascii")).decode("utf-8")
+            payload = json.loads(raw, object_hook=_keyset_json_object_hook)
+            table = payload["table"]
+            sort = tuple((column, direction) for column, direction in payload["sort"])
+            last_values = tuple(payload["last_values"])
+        except Exception as ex:
+            raise InvalidCursor("Malformed keyset cursor") from ex
+        for column, direction in sort:
+            if direction not in ("asc", "desc"):
+                raise InvalidCursor("Malformed keyset cursor")
+        return cls(table, sort, last_values)
+
+    def _check_matches(
+        self, table: str, sort: tuple[tuple[str, str], ...]
+    ) -> None:
+        if self._table != table or self._sort != sort:
+            raise InvalidCursor(
+                "Cursor was created for a different table or sort definition"
+            )
+        if len(self._last_values) != len(sort):
+            raise InvalidCursor("Cursor does not match the sort definition")
+
+
+class KeysetPaginator:
+    """
+    Keyset (seek) pagination over a table, avoiding the cost of large
+    ``OFFSET`` clauses.
+
+    Each page is found with a ``WHERE (col1, col2, ...)`` lexicographic seek
+    built from the values of the last row of the previous page, so the cost is
+    independent of how many pages have already been read. An explicit unique
+    tiebreaker column (or the table's primary key, when there is exactly one)
+    is always appended to the sort so the order is fully deterministic even
+    when the chosen sort columns contain duplicates or ``NULL``.
+
+    Comparison uses typed SQL expressions rather than concatenated strings, so
+    numeric and text values never collide. ``NULL`` sorts last in ascending
+    order and first in descending order.
+
+    Iterate with ``for page in paginator`` (each page is a list of row
+    dictionaries) or flatten it with :meth:`rows`. When ``snapshot=True`` and
+    the caller does not already have a transaction open, the paginator opens
+    its own read transaction on the first page and guarantees it is released
+    on normal exhaustion, early :meth:`close` (also via ``with``) or a query
+    error. A caller-managed transaction is never committed or rolled back.
+    """
+
+    def __init__(
+        self,
+        table: "Queryable",
+        sort_by: Sequence[str | tuple[str, str]],
+        page_size: int = 100,
+        unique_column: str | None = None,
+        snapshot: bool = False,
+        cursor: KeysetCursor | str | None = None,
+    ) -> None:
+        if not isinstance(page_size, int) or page_size < 1:
+            raise ValueError("page_size must be a positive integer")
+        self._table_obj: "Queryable" = table
+        self._table_name = table.name
+        self.page_size = page_size
+
+        sort: list[tuple[str, str]] = []
+        for item in sort_by:
+            if isinstance(item, str):
+                parts = item.split()
+                if len(parts) == 1:
+                    column, direction = parts[0], "asc"
+                elif len(parts) == 2 and parts[1].lower() in ("asc", "desc"):
+                    column, direction = parts[0], parts[1].lower()
+                else:
+                    raise ValueError(
+                        f"Invalid sort specification {item!r} - use 'column' or "
+                        "'column asc'/'column desc'"
+                    )
+            else:
+                column, direction = item
+                direction = direction.lower()
+                if direction not in ("asc", "desc"):
+                    raise ValueError(
+                        f"Sort direction for {column!r} must be 'asc' or 'desc'"
+                    )
+            if (column, direction) in sort or any(
+                existing == column for existing, _ in sort
+            ):
+                raise ValueError(f"Sort column {column!r} is listed more than once")
+            sort.append((column, direction))
+
+        if unique_column is None:
+            pk_columns = [column.name for column in table.columns if column.is_pk]
+            if len(pk_columns) == 1:
+                unique_column = pk_columns[0]
+        if unique_column is None:
+            raise PrimaryKeyRequired(
+                "Keyset pagination needs an explicit unique_column for tables "
+                "without a single-column primary key"
+            )
+        self._unique_column = unique_column
+        if not any(column == unique_column for column, _ in sort):
+            sort.append((unique_column, "asc"))
+        self._sort: tuple[tuple[str, str], ...] = tuple(sort)
+
+        available = {column.name for column in table.columns}
+        missing = [column for column, _ in self._sort if column not in available]
+        if missing:
+            raise InvalidColumns(f"Unknown sort column(s): {', '.join(missing)}")
+
+        if cursor is None:
+            self._cursor: KeysetCursor | None = None
+        elif isinstance(cursor, str):
+            self._cursor = KeysetCursor.decode(cursor)
+        else:
+            self._cursor = cursor
+        if self._cursor is not None:
+            self._cursor._check_matches(self._table_name, self._sort)
+
+        self._snapshot_requested = snapshot
+        self._owns_snapshot = False
+        self._closed = False
+        self._started = False
+        self._exhausted = False
+
+    @property
+    def sort(self) -> tuple[tuple[str, str], ...]:
+        "The effective ``(column, direction)`` sort, including the tiebreaker."
+        return self._sort
+
+    @property
+    def cursor(self) -> KeysetCursor | None:
+        "Cursor positioned at the last yielded row, or ``None`` before iteration."
+        return self._cursor
+
+    def _begin_snapshot_if_needed(self) -> None:
+        if self._started:
+            return
+        self._started = True
+        if self._snapshot_requested and not self._table_obj.db.conn.in_transaction:
+            # Open the read transaction directly: a read-only BEGIN never
+            # triggers the driver's implicit-transaction handling, and using
+            # conn means db.execute() will not auto-commit it on later reads.
+            self._table_obj.db.conn.execute("BEGIN")
+            self._owns_snapshot = True
+
+    def _seek_sql_and_params(
+        self,
+    ) -> tuple[str | None, list[Any]]:
+        if self._cursor is None:
+            return None, []
+        columns = [column for column, _ in self._sort]
+        values = list(self._cursor.last_values)
+        clauses: list[str] = []
+        params: list[Any] = []
+        for index, (column, direction) in enumerate(self._sort):
+            quoted = quote_identifier(column)
+            value = values[index]
+            # Each entry keeps an SQL fragment together with the parameters it
+            # introduces, in the exact order its "?" placeholders appear, so
+            # flattening them cannot misalign text and values.
+            fragments: list[tuple[str, list[Any]]] = []
+            # Earlier columns must equal the cursor value. "IS ?" matches
+            # NULL-to-NULL as well as ordinary equality.
+            for prior_column, prior_value in zip(columns[:index], values[:index]):
+                fragments.append(
+                    (f"{quote_identifier(prior_column)} is ?", [prior_value])
+                )
+            if value is None:
+                # NULL sits at one end of the order. In ASC it is last, so no
+                # row sorts after a NULL on this column; in DESC it is first, so
+                # every non-NULL row sorts after it. A row that is also NULL
+                # stays tied here and is advanced by a later-column OR branch.
+                if direction == "asc":
+                    fragments.append(("0", []))
+                else:
+                    fragments.append((f"{quoted} is not null", []))
+            else:
+                if direction == "asc":
+                    # A greater value, or a NULL (which sorts last in ASC).
+                    fragments.append(
+                        (f"({quoted} > ? or {quoted} is null)", [value])
+                    )
+                else:
+                    # A smaller value. NULLs sort first in DESC, so a NULL is
+                    # already behind us and never qualifies.
+                    fragments.append((f"{quoted} < ?", [value]))
+            clauses.append(
+                "(" + " and ".join(sql for sql, _ in fragments) + ")"
+            )
+            for _, fragment_params in fragments:
+                params.extend(fragment_params)
+        return " or ".join(clauses), params
+
+    def _next_page(self) -> list[dict[str, Any]]:
+        self._begin_snapshot_if_needed()
+        order_terms: list[str] = []
+        for column, direction in self._sort:
+            quoted = quote_identifier(column)
+            # Pin NULL position explicitly so ordering matches the seek
+            # predicates: NULL last when ascending, first when descending.
+            null_term = f"{quoted} is null"
+            if direction == "desc":
+                null_term += " desc"
+            order_terms.append(
+                f"{null_term}, {quoted} {direction.upper()}"
+            )
+        order_by = ", ".join(order_terms)
+        sql = f"select * from {quote_identifier(self._table_name)}"
+        where, params = self._seek_sql_and_params()
+        if where is not None:
+            sql += " where " + where
+        sql += f" order by {order_by} limit {int(self.page_size)}"
+        cursor_obj = self._table_obj.db.execute(sql, params)
+        columns = dedupe_keys(description[0] for description in cursor_obj.description)
+        page = [dict(zip(columns, row)) for row in cursor_obj.fetchall()]
+        if page:
+            last_row = page[-1]
+            self._cursor = KeysetCursor(
+                self._table_name,
+                self._sort,
+                tuple(last_row[column] for column, _ in self._sort),
+            )
+        return page
+
+    def __iter__(self) -> Generator[list[dict[str, Any]], None, None]:
+        if self._closed:
+            raise RuntimeError("This KeysetPaginator has already been closed")
+        try:
+            while True:
+                page = self._next_page()
+                if not page:
+                    self._exhausted = True
+                    break
+                yield page
+        finally:
+            self.close()
+
+    def rows(self) -> Generator[dict[str, Any], None, None]:
+        "Yield individual row dictionaries, flattening across pages."
+        for page in self:
+            yield from page
+
+    def close(self) -> None:
+        """
+        Release resources held by the paginator.
+
+        If the paginator opened its own snapshot transaction it is committed
+        here; a transaction owned by the caller is left untouched. Safe to call
+        more than once.
+        """
+        if self._closed:
+            return
+        self._closed = True
+        if self._owns_snapshot:
+            self._owns_snapshot = False
+            conn = self._table_obj.db.conn
+            try:
+                if conn.in_transaction:
+                    conn.execute("COMMIT")
+            except sqlite3.Error:
+                # The error that ended iteration may already have destroyed
+                # the transaction - roll back rather than masking it.
+                if conn.in_transaction:
+                    conn.execute("ROLLBACK")
+
+    def __enter__(self) -> "KeysetPaginator":
+        return self
+
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc_val: BaseException | None,
+        exc_tb: TracebackType | None,
+    ) -> None:
+        self.close()
+
+
 class Queryable:
     db: "Database"
     name: str
@@ -2226,6 +2588,42 @@ class Queryable:
             if len(row_pk) == 1:
                 row_pk = row_pk[0]
             yield row_pk, row
+
+    def keyset_pages(
+        self,
+        sort_by: Sequence[str | tuple[str, str]],
+        page_size: int = 100,
+        unique_column: str | None = None,
+        snapshot: bool = False,
+        cursor: "KeysetCursor | str | None" = None,
+    ) -> "KeysetPaginator":
+        """
+        Return a :class:`KeysetPaginator` that pages through this table using
+        keyset (seek) pagination instead of ``LIMIT``/``OFFSET``.
+
+        ``sort_by`` is the ordered list of columns to sort on. Each entry is a
+        column name (``"age"``), a ``"column asc"``/``"column desc"`` string,
+        or a ``(column, direction)`` tuple. An explicit ``unique_column``
+        tiebreaker is appended to make the ordering fully unique; for a table
+        with a single-column primary key that column is used automatically when
+        ``unique_column`` is omitted.
+
+        :param sort_by: columns and directions defining the page order
+        :param page_size: maximum number of rows returned per page
+        :param unique_column: unique column used as the final tiebreaker
+        :param snapshot: if True and no transaction is open, hold a read
+          snapshot for the whole iteration so concurrent writes are not visible
+        :param cursor: a :class:`KeysetCursor` (or its encoded string) from a
+          previous run, used to resume mid-table
+        """
+        return KeysetPaginator(
+            self,
+            sort_by,
+            page_size=page_size,
+            unique_column=unique_column,
+            snapshot=snapshot,
+            cursor=cursor,
+        )
 
     @property
     def columns(self) -> list["Column"]:

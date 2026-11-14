@@ -15,6 +15,9 @@ venv
 .schema
 .vscode
 .hypothesis
+.keyset_pagination_tmp/
+.pytest-tmp/
+keyset_pagination_*/
 .claude/
 Pipfile
 Pipfile.lock
@@ -22,3 +25,4 @@ uv.lock
 tests/*.dylib
 tests/*.so
 tests/*.dll
+keyset_demo.db*

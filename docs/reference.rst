@@ -77,6 +77,22 @@ sqlite_utils.db.ForeignKey
 
 .. autoclass:: sqlite_utils.db.ForeignKey
 
+.. _reference_db_other_keyset_cursor:
+
+sqlite_utils.db.KeysetCursor
+----------------------------
+
+.. autoclass:: sqlite_utils.db.KeysetCursor
+    :members:
+
+.. _reference_db_other_keyset_paginator:
+
+sqlite_utils.db.KeysetPaginator
+-------------------------------
+
+.. autoclass:: sqlite_utils.db.KeysetPaginator
+    :members:
+
 sqlite_utils.utils
 ==================
 

@@ -4,6 +4,13 @@
  Changelog
 ===========
 
+.. _v4_3_keyset_pagination:
+
+Unreleased
+----------
+
+- New ``table.keyset_pages()`` method and :class:`~sqlite_utils.db.KeysetPaginator` class provide keyset (seek) pagination as an alternative to the large ``OFFSET`` clauses used by ``rows_where()``. It accepts an ordered list of sort columns with per-column directions and an explicit unique tiebreaker column (a single-column primary key is used automatically), and can optionally hold a read-only snapshot for the whole iteration. The returned :class:`~sqlite_utils.db.KeysetCursor` carries the last row's sort values plus the sort definition and is rejected with ``InvalidCursor`` if replayed against another table or sort order. ``NULL`` positions are fixed (last ascending, first descending) and typed SQL comparisons avoid text/numeric collisions.
+
 .. _v4_2_1:
 
 4.2.1 (2026-08-13)

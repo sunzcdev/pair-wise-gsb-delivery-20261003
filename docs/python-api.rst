@@ -593,6 +593,47 @@ This method also accepts ``offset=`` and ``limit=`` arguments, for specifying an
 .. note::
     In the CLI: :ref:`sqlite-utils rows <cli_rows>`
 
+.. _python_api_keyset_pagination:
+
+Keyset pagination
+-----------------
+
+``rows_where()`` supports ``limit`` and ``offset``, but a large ``OFFSET`` makes SQLite scan and discard every preceding row on each page. For exporting or walking a large table, keyset (seek) pagination instead remembers the values of the last row on a page and uses them in a ``WHERE`` clause to jump straight to the next page, at a cost that stays constant no matter how many pages have been read.
+
+Use ``table.keyset_pages(...)`` to get a :class:`~sqlite_utils.db.KeysetPaginator`. Iterating it yields lists (pages) of row dictionaries, each no larger than ``page_size``::
+
+    paginator = db.table("dogs").keyset_pages(
+        [("age", "desc"), ("name", "asc")], page_size=50
+    )
+    for page in paginator:
+        export(page)
+
+``sort_by`` is an ordered list of columns. Each entry can be a column name (``"age"``), a ``"column asc"``/``"column desc"`` string, or a ``(column, direction)`` tuple.
+
+Because duplicate sort values make a page boundary ambiguous, the ordering must end with a unique column. Pass one explicitly using ``unique_column=``; a table with a single-column primary key uses that key automatically when you omit it. A table without a single-column primary key (or a view) requires ``unique_column`` to be supplied.
+
+``NULL`` has a fixed position: it sorts last in ascending order and first in descending order. Comparisons use typed SQL expressions rather than concatenated strings, so numeric values and text that looks numeric never collide.
+
+**Resuming with a cursor.** After a page is produced, ``paginator.cursor`` holds an opaque :class:`~sqlite_utils.db.KeysetCursor` containing the last row's sort values together with the table name and sort definition. Encode it to hand to another process, then pass it back to resume from that position::
+
+    token = paginator.cursor.encode()
+    # ...later, possibly in a different request...
+    resumed = db.table("dogs").keyset_pages(
+        [("age", "desc"), ("name", "asc")], page_size=50, cursor=token
+    )
+
+A cursor is rejected with :class:`~sqlite_utils.db.InvalidCursor` if it is replayed against a different table or a different sort definition, so it cannot silently produce the wrong rows.
+
+**Holding a consistent snapshot.** By default each page is a fresh statement, so rows committed by other connections between pages become visible. Pass ``snapshot=True`` to hold one read-only transaction for the whole iteration and keep a single consistent view::
+
+    with db.table("dogs").keyset_pages(
+        [("id", "asc")], page_size=100, snapshot=True
+    ) as paginator:
+        for page in paginator:
+            export(page)
+
+If the caller already has a transaction open, the paginator uses it and never commits or rolls it back. Otherwise it opens its own snapshot and guarantees it is released when iteration finishes, when the paginator is closed early, or if a query raises. WAL journal mode is recommended when another connection needs to write while the snapshot is held.
+
 .. _python_api_rows_count_where:
 
 Counting rows
