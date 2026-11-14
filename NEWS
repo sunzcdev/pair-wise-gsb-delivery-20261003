@@ -1,6 +1,27 @@
 w3lib release notes
 ===================
 
+2.7.0 (unreleased)
+------------------
+
+New features:
+
+- Added :func:`w3lib.http.parse_raw_headers`, a raw HTTP header parser that
+  preserves the original order and spelling of headers, tracks the line
+  number of each header, and reports rejected lines. In strict mode (the
+  default) ambiguous input — missing ``:`` separators, empty or invalid
+  field names, control characters, bare CR line endings, obsolete line
+  folding, data after the terminating blank line — raises a
+  :class:`w3lib.http.HeadersParseError` subclass; in lenient mode
+  (``strict=False``) problems are collected in ``result.issues`` instead,
+  and folded continuation lines are unfolded into the previous header
+  instead of being mistaken for new headers. The resulting
+  :class:`w3lib.http.RawHeaders` object offers case-insensitive multi-value
+  lookup that never comma-joins values (keeping ``Set-Cookie`` intact), and
+  a ``to_raw()`` serializer that cannot inject extra lines. The lenient
+  :func:`w3lib.http.headers_raw_to_dict` and
+  :func:`w3lib.http.headers_dict_to_raw` behavior is unchanged.
+
 2.6.0 (2026-11-05)
 ------------------
 
