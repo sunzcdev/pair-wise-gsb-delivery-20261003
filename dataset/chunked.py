@@ -94,8 +94,10 @@ class ChunkedUpdate(_Chunker):
         keys: Sequence[str],
         chunksize: int = 1000,
         callback: _Callback | None = None,
+        strict: bool = False,
     ) -> None:
         self.keys: Sequence[str] = keys
+        self.strict: bool = strict
         super().__init__(table, chunksize, callback)
 
     def update(self, item: WriteRow) -> None:
@@ -106,5 +108,5 @@ class ChunkedUpdate(_Chunker):
             self.callback(self.queue)
         self.queue.sort(key=dict.keys)
         for _fields, items in itertools.groupby(self.queue, key=dict.keys):
-            self.table.update_many(list(items), self.keys)
+            self.table.update_many(list(items), self.keys, strict=self.strict)
         super().flush()

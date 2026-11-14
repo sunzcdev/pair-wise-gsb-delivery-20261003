@@ -8,7 +8,7 @@ from sqlalchemy import false, func, select
 from sqlalchemy.exc import NoSuchTableError
 from sqlalchemy.schema import Column, Index
 from sqlalchemy.schema import Table as SQLATable
-from sqlalchemy.sql import and_, expression
+from sqlalchemy.sql import and_, expression, or_
 from sqlalchemy.sql.expression import (
     ClauseElement,
     ColumnElement,
@@ -20,6 +20,7 @@ from dataset.types import MYSQL_LENGTH_TYPES, ColumnType, Types
 from dataset.util import (
     QUERY_STEP,
     DatasetError,
+    MissingKeyError,
     MutableRow,
     OutRow,
     QueryError,
@@ -167,6 +168,7 @@ class Table:
         keys: Sequence[str],
         ensure: bool | None = None,
         types: dict[str, ColumnType] | None = None,
+        strict: bool = False,
     ) -> Any:
         """Add a ``row`` dict into the table if the row does not exist.
 
@@ -174,6 +176,15 @@ class Table:
 
         Setting ``ensure`` results in automatically creating missing columns,
         i.e., keys of the row are not table columns.
+
+        When ``strict`` is ``True``, every name in ``keys`` must denote an
+        existing table column and must be present in ``row`` (a key whose
+        value is explicitly ``None`` is still accepted and matches rows where
+        the column is ``NULL``). Locating keys that collide after name
+        normalization are rejected as well. The checks run before any data is
+        written or the schema is changed. With ``strict=False`` (the default)
+        the historical, lenient behavior is preserved and a key missing from
+        ``row`` is treated as if it had been given as ``None``.
 
         During column creation, ``types`` will be checked for a key
         matching the name of a column to be created, and the given
@@ -185,10 +196,13 @@ class Table:
             data = dict(id=10, title='I am a banana!')
             table.insert_ignore(data, ['id'])
         """
+        if strict:
+            resolved_keys = self._resolve_keys(keys, strict=True)
+            self._check_strict_keys(row, resolved_keys)
         row = self._sync_columns(row, ensure, types=types)
         if self._check_ensure(ensure):
             self.create_index(keys)
-        args, _ = self._keys_to_args(row, keys)
+        args, _ = self._keys_to_args(row, keys, strict=strict)
         if self.count(**args) == 0:
             return self.insert(row, ensure=False)
         return False
@@ -244,6 +258,7 @@ class Table:
         ensure: bool | None = None,
         types: dict[str, ColumnType] | None = None,
         return_count: bool = False,
+        strict: bool = False,
     ) -> bool | int:
         """Update a row in the table.
 
@@ -260,9 +275,23 @@ class Table:
         If keys in ``row`` update columns not present in the table, they will
         be created based on the settings of ``ensure`` and ``types``, matching
         the behavior of :py:meth:`insert() <dataset.Table.insert>`.
+
+        With ``strict=True``, each name in ``keys`` must reference an
+        existing table column and must actually occur in ``row``. An
+        explicit ``None`` remains a valid value (it produces an
+        ``IS NULL`` filter), while a missing key raises
+        :class:`~dataset.util.MissingKeyError` instead of silently matching
+        every row with a ``NULL`` in that column. Locating keys that collapse
+        onto the same column after name normalization are also rejected.
+        Validation happens before any data or schema changes, so a failed call
+        has no side effects. ``strict=False`` (the default) keeps the old,
+        lenient behavior where a missing locating key is treated as ``None``.
         """
+        if strict:
+            resolved_keys = self._resolve_keys(keys, strict=True)
+            self._check_strict_keys(row, resolved_keys)
         row = self._sync_columns(row, ensure, types=types)
-        args, row = self._keys_to_args(row, keys)
+        args, row = self._keys_to_args(row, keys, strict=strict)
         clause = self._args_to_clause(args)
         if not len(row):
             return self.count(clause)
@@ -282,6 +311,7 @@ class Table:
         chunk_size: int = 1000,
         ensure: bool | None = None,
         types: dict[str, ColumnType] | None = None,
+        strict: bool = False,
     ) -> None:
         """Update many rows in the table at a time.
 
@@ -291,11 +321,60 @@ class Table:
 
         See :py:meth:`update() <dataset.Table.update>` for details on
         the other parameters.
-        """
-        keys = ensure_strings(keys)
 
-        chunk: list[MutableRow] = []
-        columns: list[str] = []
+        With ``strict=True``, the complete batch is validated before any
+        statement is executed: every locating key must name an existing
+        column, locating keys must not collide after name normalization, and
+        every row must carry each locating key (explicit ``None`` values are
+        permitted and match ``NULL`` columns). Any violation aborts the call
+        without writing a single row, including rows processed in earlier
+        chunks. The default ``strict=False`` retains the historical behavior.
+        """
+        raw_keys = ensure_strings(keys)
+
+        if strict:
+            resolved_keys = self._resolve_keys(raw_keys, strict=True)
+            self._check_strict_keys_many(rows, resolved_keys)
+            key_norms = {
+                normalize_column_key(normalize_column_name(k)) for k in resolved_keys
+            }
+
+            chunk: list[MutableRow] = []
+            columns: list[str] = []
+            for index, row in enumerate(rows):
+                for col in row:
+                    if (
+                        col not in columns
+                        and normalize_column_key(normalize_column_name(col))
+                        not in key_norms
+                    ):
+                        columns.append(col)
+
+                # bindparam requires names to not conflict (cannot be "id"
+                # for id). Strict validation guarantees each key is present.
+                row_ = dict(row)
+                for key in resolved_keys:
+                    row_[f"_{key}"] = self._row_pop(row_, key)
+                chunk.append(row_)
+
+                # Update when chunk_size is fulfilled or this is the last row
+                if len(chunk) == chunk_size or index == len(rows) - 1:
+                    cl = self._bulk_key_clauses(resolved_keys)
+                    stmt = (
+                        self.table.update()
+                        .where(and_(True, *cl))
+                        .values(
+                            {col: bindparam(col, required=False) for col in columns}
+                        )
+                    )
+                    self.db.executable.execute(stmt, chunk)
+                    self.db._auto_commit()
+                    chunk = []
+            return
+
+        keys = raw_keys
+        chunk = []
+        columns = []
         for index, row in enumerate(rows):
             columns.extend(
                 col for col in row if (col not in columns) and (col not in keys)
@@ -310,7 +389,7 @@ class Table:
 
             # Update when chunk_size is fulfilled or this is the last row
             if len(chunk) == chunk_size or index == len(rows) - 1:
-                cl = [self.table.c[k] == bindparam(f"_{k}") for k in keys]
+                cl = self._bulk_key_clauses(keys)
                 stmt = (
                     self.table.update()
                     .where(and_(True, *cl))
@@ -326,6 +405,7 @@ class Table:
         keys: Sequence[str],
         ensure: bool | None = None,
         types: dict[str, ColumnType] | None = None,
+        strict: bool = False,
     ) -> Any:
         """An UPSERT is a smart combination of insert and update.
 
@@ -335,11 +415,23 @@ class Table:
 
             data = dict(id=10, title='I am a banana!')
             table.upsert(data, ['id'])
+
+        With ``strict=True`` the locating keys are validated before any write
+        (see :py:meth:`update() <dataset.Table.update>`): missing locating
+        keys, non-existent key columns and normalized key collisions raise an
+        error rather than matching ``NULL`` rows. Note that because no row is
+        written on validation failure, strict mode never auto-creates a
+        missing table or key column.
         """
+        if strict:
+            resolved_keys = self._resolve_keys(keys, strict=True)
+            self._check_strict_keys(row, resolved_keys)
         row = self._sync_columns(row, ensure, types=types)
         if self._check_ensure(ensure):
             self.create_index(keys)
-        row_count = self.update(row, keys, ensure=False, return_count=True)
+        row_count = self.update(
+            row, keys, ensure=False, return_count=True, strict=strict
+        )
         if row_count == 0:
             return self.insert(row, ensure=False)
         return True
@@ -351,6 +443,7 @@ class Table:
         chunk_size: int = 1000,
         ensure: bool | None = None,
         types: dict[str, ColumnType] | None = None,
+        strict: bool = False,
     ) -> None:
         """
         Sorts multiple input rows into upserts and inserts. Inserts are passed
@@ -358,11 +451,19 @@ class Table:
 
         See :py:meth:`upsert() <dataset.Table.upsert>` and
         :py:meth:`insert_many() <dataset.Table.insert_many>`.
+
+        With ``strict=True`` every row of the batch is validated before the
+        first row is written, so a single row with a missing locating key
+        aborts the whole batch instead of partially overwriting rows whose
+        key columns happen to be ``NULL``.
         """
         # Removing a bulk implementation in 5e09aba401. Doing this one by one
         # is incredibly slow, but doesn't run into issues with column creation.
+        if strict:
+            resolved_keys = self._resolve_keys(keys, strict=True)
+            self._check_strict_keys_many(rows, resolved_keys)
         for row in rows:
-            self.upsert(row, keys, ensure=ensure, types=types)
+            self.upsert(row, keys, ensure=ensure, types=types, strict=strict)
 
     def delete(self, *clauses: ColumnElement[bool], **filters: SQLWriteValue) -> bool:
         """Delete rows from the table.
@@ -570,12 +671,118 @@ class Table:
                 orderings.append(self.table.c[column].asc())
         return orderings
 
+    def _resolve_keys(self, keys: Sequence[str], strict: bool) -> list[str]:
+        """Normalize locating key names to the table's actual column names.
+
+        In strict mode, names that normalize to the same column (e.g.
+        ``"place"`` and ``"PLACE"``) are rejected instead of silently
+        overwriting each other, and every key must reference an existing
+        column. In lenient mode the historical first-wins de-duplication is
+        kept.
+        """
+        resolved: list[str] = []
+        seen: set[str] = set()
+        for raw_key in ensure_strings(keys):
+            name = self._get_column_name(raw_key)
+            norm = normalize_column_key(name)
+            if norm is None:
+                if strict:
+                    raise DatasetError(f"Invalid locating key: {raw_key!r}")
+                continue
+            if strict:
+                if norm in seen:
+                    raise DatasetError(
+                        f"Duplicate locating key after normalization: {raw_key!r} "
+                        f"collides with another key in {list(keys)!r}"
+                    )
+                if not self.has_column(name):
+                    raise DatasetError(
+                        f"Locating key column does not exist: {raw_key!r}"
+                    )
+                seen.add(norm)
+                resolved.append(name)
+            elif norm not in seen:
+                seen.add(norm)
+                resolved.append(name)
+        return resolved
+
+    def _row_has_key(self, row: WriteRow, column: str) -> bool:
+        """Check whether a row carries a column, using normalized matching."""
+        target = normalize_column_key(column)
+        for name in row:
+            if normalize_column_key(self._get_column_name(name)) == target:
+                return True
+        return False
+
+    def _row_pop(self, row: MutableRow, column: str) -> SQLWriteValue:
+        """Pop a locating key from a mutable row via normalized matching."""
+        target = normalize_column_key(column)
+        for name in row:
+            if normalize_column_key(self._get_column_name(name)) == target:
+                return row.pop(name)
+        raise MissingKeyError(f"Locating key missing from row: {column!r}")
+
+    def _check_strict_keys(self, row: WriteRow, resolved_keys: Sequence[str]) -> None:
+        """Validate locating keys for a single row before any write happens.
+
+        Every resolved key must be present in the row. A key present with an
+        explicit ``None`` value is valid and will produce an ``IS NULL``
+        filter; only a completely missing key raises ``MissingKeyError``.
+        """
+        for column in resolved_keys:
+            if not self._row_has_key(row, column):
+                raise MissingKeyError(f"Locating key missing from row: {column!r}")
+
+    def _check_strict_keys_many(
+        self, rows: Sequence[WriteRow], resolved_keys: Sequence[str]
+    ) -> None:
+        """Validate all rows of a batch up front, before any statement runs."""
+        for index, row in enumerate(rows):
+            for column in resolved_keys:
+                if not self._row_has_key(row, column):
+                    raise MissingKeyError(
+                        f"Locating key missing from row {index}: {column!r}"
+                    )
+
+    def _bulk_key_clauses(
+        self, resolved_keys: Sequence[str]
+    ) -> list[ColumnElement[bool]]:
+        """Build bulk-update equality clauses for the locating keys.
+
+        A plain ``column == bindparam`` never matches ``NULL`` rows (SQL uses
+        three-valued logic), so each clause is extended with an explicit
+        ``IS NULL`` branch. This keeps explicit ``None`` locating keys working
+        the same way as in single-row :meth:`update` calls.
+        """
+        clauses: list[ColumnElement[bool]] = []
+        for key in resolved_keys:
+            param: ColumnElement[Any] = bindparam(f"_{key}")
+            column = self.table.c[key]
+            clauses.append(or_(column == param, column.is_(param)))
+        return clauses
+
     def _keys_to_args(
-        self, row: WriteRow, keys: Sequence[str]
+        self,
+        row: WriteRow,
+        keys: Sequence[str],
+        strict: bool = False,
     ) -> tuple[MutableRow, MutableRow]:
-        keys = [self._get_column_name(k) for k in ensure_strings(keys)]
+        """Split a row into locating-key filters and the values to write.
+
+        In lenient mode (the default) a locating key absent from the row is
+        treated as ``None``, matching the historical behavior. In strict mode
+        missing keys raise :class:`~dataset.util.MissingKeyError` while keys
+        whose value is explicitly ``None`` are returned as normal and match
+        rows where the column is ``NULL``.
+        """
+        resolved_keys = self._resolve_keys(keys, strict)
         row_ = dict(row)
-        args = {k: row_.pop(k, None) for k in keys}
+        args: MutableRow = {}
+        for key in resolved_keys:
+            if strict:
+                args[key] = self._row_pop(row_, key)
+            else:
+                args[key] = row_.pop(key, None)
         return args, row_
 
     def create_column(

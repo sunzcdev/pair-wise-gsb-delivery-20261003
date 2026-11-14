@@ -52,6 +52,17 @@ class QueryError(DatasetError):
     pass
 
 
+class MissingKeyError(DatasetError):
+    """Raised in strict key mode when a locating key is absent from a row.
+
+    An explicit ``None`` value for a locating key is still valid (it maps to
+    a SQL ``IS NULL`` filter); this error is only raised when the key is not
+    present in the row at all.
+    """
+
+    pass
+
+
 def iter_result_proxy(
     rp: ResultProxy[Any], step: int | None = None
 ) -> Iterator[Row[Any]]:

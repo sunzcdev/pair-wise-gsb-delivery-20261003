@@ -4,7 +4,7 @@ import pytest
 from sqlalchemy.exc import ArgumentError
 from sqlalchemy.types import BIGINT, TEXT
 
-from dataset import chunked
+from dataset import DatasetError, MissingKeyError, chunked
 
 from .conftest import TEST_CITY_1, TEST_DATA
 
@@ -449,3 +449,311 @@ def test_key_order(db, table):
 def test_empty_query(table):
     empty = list(table.find(place="not in data"))
     assert len(empty) == 0, empty
+
+
+# ---------------------------------------------------------------------------
+# Strict locating-key mode
+# ---------------------------------------------------------------------------
+
+
+def test_strict_update_missing_key_raises(table):
+    # The row has no "place" key at all: strict mode must refuse rather than
+    # treating it as a NULL filter.
+    with pytest.raises(MissingKeyError):
+        table.update({"temperature": 99}, ["place"], strict=True)
+    # Nothing was written.
+    assert (
+        table.find_one(place=TEST_CITY_1, date=datetime(2011, 1, 1))["temperature"] == 6
+    )
+
+
+def test_strict_update_explicit_none_matches_nulls(db):
+    tbl = db["strict_nulls"]
+    tbl.insert_many(
+        [
+            {"group": "a", "place": None, "temperature": 1},
+            {"group": "a", "place": None, "temperature": 2},
+            {"group": "a", "place": "Berlin", "temperature": 3},
+            {"group": "b", "place": None, "temperature": 4},
+        ]
+    )
+    # Explicit None is allowed and must only touch rows that are actually
+    # NULL for *both* parts of the composite key.
+    result = tbl.update(
+        {"group": "a", "place": None, "temperature": 0},
+        ["group", "place"],
+        strict=True,
+    )
+    assert result == 2
+    rows = list(tbl.find(group="a", place=None))
+    assert {row["temperature"] for row in rows} == {0}
+    # The non-NULL row and the other group are untouched.
+    assert tbl.find_one(group="a", place="Berlin")["temperature"] == 3
+    assert tbl.find_one(group="b", place=None)["temperature"] == 4
+
+
+def test_lenient_update_missing_key_matches_nulls(db):
+    # Documents the legacy behavior: a missing key behaves like an explicit
+    # NULL filter and can overwrite unrelated NULL-keyed rows.
+    tbl = db["lenient_nulls"]
+    tbl.insert_many(
+        [
+            {"group": "a", "place": None, "temperature": 1},
+            {"group": "b", "place": None, "temperature": 2},
+        ]
+    )
+    # "place" is missing from the row -> lenient mode treats it as None.
+    result = tbl.update({"group": "a", "temperature": 0}, ["group", "place"])
+    assert result == 1
+    # Only the (a, NULL) row is hit; the (b, NULL) row is protected by group.
+    assert tbl.find_one(group="a", place=None)["temperature"] == 0
+    assert tbl.find_one(group="b", place=None)["temperature"] == 2
+
+    # With a single key that is missing, every NULL-keyed row is in scope.
+    tbl2 = db["lenient_nulls_single"]
+    tbl2.insert_many([{"place": None, "v": 1}, {"place": None, "v": 2}])
+    result = tbl2.update({"v": 9}, ["place"])
+    assert result == 2
+    assert {row["v"] for row in tbl2.find()} == {9}
+
+    # The same call is rejected in strict mode.
+    with pytest.raises(MissingKeyError):
+        tbl2.update({"v": 10}, ["place"], strict=True)
+    assert {row["v"] for row in tbl2.find()} == {9}
+
+
+def test_strict_update_nonexistent_key_column(db):
+    tbl = db["strict_bad_column"]
+    tbl.insert_many([{"place": "Berlin", "v": 1}])
+    with pytest.raises(DatasetError):
+        tbl.update({"v": 2}, ["does_not_exist"], strict=True)
+    # No data change, and strict mode did not auto-create the column.
+    assert "does_not_exist" not in tbl.columns
+    assert tbl.find_one(place="Berlin")["v"] == 1
+
+
+def test_lenient_update_nonexistent_key_column(db):
+    tbl = db["lenient_bad_column"]
+    tbl.insert_many([{"place": "Berlin", "v": 1}])
+    # Lenient mode builds an impossible filter and matches nothing, without
+    # raising.
+    result = tbl.update({"v": 2}, ["does_not_exist"])
+    assert result == 0
+    assert tbl.find_one(place="Berlin")["v"] == 1
+
+
+def test_strict_update_composite_key_checked_item_by_item(table):
+    # "date" is present but "place" is missing: every component is checked.
+    with pytest.raises(MissingKeyError):
+        table.update(
+            {"date": datetime(2011, 1, 1), "temperature": 99},
+            ["place", "date"],
+            strict=True,
+        )
+    unchanged = table.find_one(place=TEST_CITY_1, date=datetime(2011, 1, 1))
+    assert unchanged["temperature"] == 6
+
+
+def test_strict_rejects_normalized_key_collision(table):
+    with pytest.raises(DatasetError):
+        table.update(
+            {"place": "Berlin", "PLACE": "Berlin", "temperature": 1},
+            ["place", "PLACE"],
+            strict=True,
+        )
+    # No write happened.
+    assert (
+        table.find_one(place=TEST_CITY_1, date=datetime(2011, 1, 1))["temperature"] == 6
+    )
+
+
+def test_strict_update_accepts_case_insensitive_row_keys(table):
+    target_date = datetime(2011, 1, 1)
+    result = table.update(
+        {"PLACE": TEST_CITY_1, "Date": target_date, "temperature": 42},
+        ["place", "date"],
+        strict=True,
+    )
+    assert result == 1
+    assert table.find_one(place=TEST_CITY_1, date=target_date)["temperature"] == 42
+
+
+def test_strict_upsert_missing_key_raises(db):
+    tbl = db["strict_upsert"]
+    tbl.insert_many([{"place": None, "v": 1}])
+    with pytest.raises(MissingKeyError):
+        tbl.upsert({"v": 2}, ["place"], strict=True)
+    assert tbl.find_one(place=None)["v"] == 1
+
+
+def test_strict_upsert_explicit_none_updates_null_row(db):
+    tbl = db["strict_upsert_nulls"]
+    tbl.insert_many([{"place": None, "v": 1}, {"place": "Berlin", "v": 2}])
+    tbl.upsert({"place": None, "v": 9}, ["place"], strict=True)
+    assert len(tbl) == 2
+    assert tbl.find_one(place=None)["v"] == 9
+    assert tbl.find_one(place="Berlin")["v"] == 2
+
+
+def test_strict_upsert_inserts_when_no_match(db):
+    tbl = db["strict_upsert_insert"]
+    tbl.insert_many([{"place": "Berlin", "v": 1}])
+    tbl.upsert({"place": "Galway", "v": 2}, ["place"], strict=True)
+    assert len(tbl) == 2
+    assert tbl.find_one(place="Galway")["v"] == 2
+
+
+def test_strict_update_many_whole_batch_validated(db):
+    tbl = db["strict_update_many"]
+    tbl.insert_many([{"id": 1, "v": 1}, {"id": 2, "v": 2}, {"id": 3, "v": 3}])
+    rows = [
+        {"id": 1, "v": 10},
+        {"v": 20},  # missing "id": invalid even though it is not the first row
+        {"id": 3, "v": 30},
+    ]
+    with pytest.raises(MissingKeyError):
+        tbl.update_many(rows, "id", chunk_size=1, strict=True)
+    # chunk_size=1 would have flushed row 0 first in a naive implementation;
+    # upfront validation guarantees nothing was written.
+    assert tbl.find_one(id=1)["v"] == 1
+    assert tbl.find_one(id=2)["v"] == 2
+    assert tbl.find_one(id=3)["v"] == 3
+
+
+def test_strict_update_many_explicit_none_scope(db):
+    tbl = db["strict_update_many_nulls"]
+    tbl.insert_many(
+        [
+            {"group": "a", "place": None, "v": 1},
+            {"group": "a", "place": None, "v": 2},
+            {"group": "a", "place": "Berlin", "v": 3},
+        ]
+    )
+    tbl.update_many(
+        [
+            {"group": "a", "place": None, "v": 0},
+        ],
+        ["group", "place"],
+        strict=True,
+    )
+    assert {row["v"] for row in tbl.find(group="a", place=None)} == {0}
+    assert tbl.find_one(place="Berlin")["v"] == 3
+
+
+def test_strict_update_many_happy_path(db):
+    tbl = db["strict_update_many_ok"]
+    tbl.insert_many([{"id": 1, "v": 1}, {"id": 2, "v": 2}])
+    tbl.update_many([{"ID": 1, "v": 10}, {"id": 2, "v": 20}], "id", strict=True)
+    assert tbl.find_one(id=1)["v"] == 10
+    assert tbl.find_one(id=2)["v"] == 20
+
+
+def test_strict_update_many_missing_chunk_boundary(db):
+    # A bad row behind the chunk boundary must still abort the whole batch.
+    tbl = db["strict_update_many_boundary"]
+    tbl.insert_many([{"id": i, "v": i} for i in range(1, 6)])
+    rows = [{"id": i, "v": i * 10} for i in range(1, 5)]
+    rows.append({"v": 50})  # row index 4 has no id
+    with pytest.raises(MissingKeyError):
+        tbl.update_many(rows, "id", chunk_size=2, strict=True)
+    for i in range(1, 6):
+        assert tbl.find_one(id=i)["v"] == i
+
+
+def test_strict_upsert_many_batch_rejected(db):
+    tbl = db["strict_upsert_many"]
+    tbl.insert_many([{"id": 1, "v": 1}])
+    with pytest.raises(MissingKeyError):
+        tbl.upsert_many(
+            [{"id": 1, "v": 10}, {"v": 20}], "id", chunk_size=1, strict=True
+        )
+    assert tbl.find_one(id=1)["v"] == 1
+    assert len(tbl) == 1
+
+
+def test_strict_insert_ignore_missing_key_raises(table):
+    with pytest.raises(MissingKeyError):
+        table.insert_ignore(
+            {"temperature": 1, "date": datetime(2011, 1, 1)},
+            ["place", "date"],
+            strict=True,
+        )
+
+
+def test_strict_insert_ignore_explicit_none(db):
+    tbl = db["strict_insert_ignore_nulls"]
+    tbl.insert_many([{"place": None, "v": 1}])
+    # Matches the existing NULL row, so nothing is inserted.
+    result = tbl.insert_ignore({"place": None, "v": 2}, ["place"], strict=True)
+    assert result is False
+    assert len(tbl) == 1
+    # A new non-NULL value does not match, so it gets inserted.
+    result = tbl.insert_ignore({"place": "Berlin", "v": 3}, ["place"], strict=True)
+    assert result is not False
+    assert len(tbl) == 2
+
+
+def test_strict_chunked_update_rejects_missing_key(db):
+    tbl = db["strict_chunked"]
+    tbl.insert_many([{"id": 1, "v": 1}, {"id": 2, "v": 2}])
+    # With a chunk size larger than the queue, flush() validates both queued
+    # rows together before any statement is executed.
+    with (
+        pytest.raises(MissingKeyError),
+        chunked.ChunkedUpdate(tbl, ["id"], chunksize=100, strict=True) as upd,
+    ):
+        upd.update({"id": 1, "v": 10})
+        upd.update({"v": 20})
+    assert tbl.find_one(id=1)["v"] == 1
+    assert tbl.find_one(id=2)["v"] == 2
+
+
+def test_strict_chunked_update_happy_path(db):
+    tbl = db["strict_chunked_ok"]
+    tbl.insert_many([{"id": 1, "v": 1}, {"id": 2, "v": 2}])
+    with chunked.ChunkedUpdate(tbl, ["id"], strict=True) as upd:
+        upd.update({"id": 1, "v": 10})
+        upd.update({"id": 2, "v": 20})
+    assert tbl.find_one(id=1)["v"] == 10
+    assert tbl.find_one(id=2)["v"] == 20
+
+
+def test_strict_update_validates_before_schema_change(db):
+    # A fresh table does not exist yet; strict mode must fail validation
+    # instead of auto-creating it.
+    tbl = db["strict_no_table"]
+    with pytest.raises(DatasetError):
+        tbl.update({"id": 1, "v": 1}, ["id"], strict=True)
+    assert not tbl.exists
+
+
+def test_strict_update_no_schema_change_on_missing_key(db):
+    tbl = db["strict_no_schema_change"]
+    tbl.insert_many([{"id": 1, "v": 1}])
+    with pytest.raises(MissingKeyError):
+        tbl.update({"new_col": 2, "v": 3}, ["id"], ensure=True, strict=True)
+    # The failed strict call must not have created "new_col".
+    assert "new_col" not in tbl.columns
+    assert tbl.find_one(id=1)["v"] == 1
+
+
+def test_strict_update_inside_transaction_commits_and_rolls_back(db):
+    tbl = db["strict_tx"]
+    tbl.insert_many([{"id": 1, "v": 1}, {"id": 2, "v": 2}])
+    with db:
+        tbl.update_many([{"id": 1, "v": 10}, {"id": 2, "v": 20}], "id", strict=True)
+    assert tbl.find_one(id=1)["v"] == 10
+    assert tbl.find_one(id=2)["v"] == 20
+
+    try:
+        with db:
+            tbl.update({"id": 1, "v": 30}, ["id"], strict=True)
+            raise RuntimeError("boom")
+    except RuntimeError:
+        pass
+    assert tbl.find_one(id=1)["v"] == 10
+
+
+def test_missing_key_error_is_dataset_error():
+    assert issubclass(MissingKeyError, DatasetError)
+    assert issubclass(MissingKeyError, Exception)

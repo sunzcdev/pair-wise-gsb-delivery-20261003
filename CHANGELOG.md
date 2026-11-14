@@ -3,6 +3,17 @@
 *The changelog has only been started with version 0.3.12, previous
 changes must be reconstructed from revision history.*
 
+* **Unreleased**
+  - **Strict locating keys**: `update`, `update_many`, `upsert`,
+    `upsert_many` and `insert_ignore` now accept `strict=True`. In strict
+    mode a locating key missing from a row raises `MissingKeyError` instead
+    of being treated as an explicit `NULL` filter, non-existent key columns
+    and locating keys that collide after name normalization are rejected,
+    and composite keys are validated component by component. Validation runs
+    before any data or schema change; batch methods validate the whole batch
+    up front so no partial writes occur. Explicit `None` values remain valid
+    and match `IS NULL`. Bulk updates now generate NULL-aware key clauses.
+    The default (`strict=False`) preserves the historical lenient behavior.
 * **2.0.0**: Major modernization and type annotations
   - **Type annotations**: Full `mypy --strict` compliance across all modules
   - **PEP 561**: Added `py.typed` marker for downstream type checking

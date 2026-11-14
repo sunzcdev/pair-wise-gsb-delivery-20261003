@@ -64,6 +64,32 @@ The list of filter columns given as the second argument filter using the
 values in the first column. If you don't want to update over a
 particular value, just use the auto-generated ``id`` column.
 
+Strict locating keys
+~~~~~~~~~~~~~~~~~~~~
+
+By default, a locating key that is missing from a row is treated as if
+it had been passed as ``None``. Combined with SQL's ``NULL`` semantics
+this means an update can silently match every row whose key column is
+``NULL``. Pass ``strict=True`` to distinguish a genuinely missing key
+from an allowed ``NULL`` key::
+
+   # raises dataset.MissingKeyError because "name" is absent from the row
+   table.update(dict(age=47), ['name'], strict=True)
+
+   # allowed: the explicit None only matches rows where name IS NULL
+   table.update(dict(name=None, age=47), ['name'], strict=True)
+
+In strict mode every locating key must name an existing table column,
+composite keys are checked component by component, and locating keys that
+collapse onto the same column after case/whitespace normalization are
+rejected. All of these checks run *before* any data is written or the
+schema is changed. Batch operations (:meth:`~dataset.Table.update_many`,
+:meth:`~dataset.Table.upsert_many`) validate the entire batch up front,
+so one invalid row aborts the whole batch instead of partially updating
+earlier rows. The default ``strict=False`` keeps the historical, lenient
+behavior. The same flag is available on ``update``, ``update_many``,
+``upsert``, ``upsert_many`` and ``insert_ignore``.
+
 Using Transactions
 ------------------
 
