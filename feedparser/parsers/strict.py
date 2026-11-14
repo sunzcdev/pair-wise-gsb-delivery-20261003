@@ -46,11 +46,11 @@ class StrictXMLParser:
         return k, v
 
     def startPrefixMapping(self, prefix, uri):
-        if not uri:
-            return
         # Jython uses '' instead of None; standardize on None
         prefix = prefix or None
-        self.track_namespace(prefix, uri)
+        # Un-declarations (xmlns="") are tracked too: they remove the
+        # binding for the scope of the element that declares them.
+        self.track_namespace(prefix, uri or "")
         if prefix and uri == "http://www.w3.org/1999/xlink":
             self.decls["xmlns:" + prefix] = uri
 
@@ -69,7 +69,7 @@ class StrictXMLParser:
         if (
             givenprefix
             and (prefix is None or (prefix == "" and lowernamespace == ""))
-            and givenprefix not in self.namespaces_in_use
+            and givenprefix not in self._inscope_namespaces
         ):
             raise UndeclaredNamespace(
                 "'%s' is not associated with a namespace" % givenprefix
@@ -92,7 +92,7 @@ class StrictXMLParser:
         if prefix:
             localname = prefix.lower() + ":" + localname
         elif namespace and not qname:  # Expat
-            for name, value in self.namespaces_in_use.items():
+            for name, value in self._inscope_namespaces.items():
                 if name and value == namespace:
                     localname = name + ":" + localname
                     break
@@ -122,7 +122,7 @@ class StrictXMLParser:
         if prefix:
             localname = prefix + ":" + localname
         elif namespace and not qname:  # Expat
-            for name, value in self.namespaces_in_use.items():
+            for name, value in self._inscope_namespaces.items():
                 if name and value == namespace:
                     localname = name + ":" + localname
                     break

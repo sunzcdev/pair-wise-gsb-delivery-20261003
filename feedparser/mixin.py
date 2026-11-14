@@ -44,6 +44,10 @@ email_pattern = re.compile(
     r"(\?subject=\S+)?"
 )
 
+# Sentinel marking that a namespace mapping did not exist before an
+# element-scoped binding was recorded.
+_MISSING = object()
+
 
 class XMLParserMixin(
     _base.Namespace,
@@ -180,6 +184,27 @@ class XMLParserMixin(
         self.resolve_relative_uris = False
         self.sanitize_html = False
 
+        # Namespace bindings are element-scoped in XML: a prefix (or the
+        # default namespace) may be rebound on any element, and the binding
+        # only applies to that element and its descendants.  The following
+        # attributes track the bindings that are in scope at the current
+        # parse position so that local (re)bindings are restored when the
+        # element that declared them ends.  `namespaces_in_use` above remains
+        # a document-level summary of every namespace seen in the feed; it
+        # is not used for routing elements to handlers.
+        #
+        # Routed-name/tag pairs plus undo records, one frame per open element:
+        self._namespace_scope_stack = []
+        # Undo records for bindings declared on the element being started
+        # (the strict SAX parser reports them before the start tag):
+        self._namespace_scope_changes = []
+        # The prefix -> namespace URI bindings currently in scope:
+        self._inscope_namespaces = {}
+        # Conflicting bindings that the `namespaces` summary cannot
+        # represent (e.g. one prefix bound to different URIs in different
+        # scopes) are recorded here as human-readable diagnostics:
+        self.namespace_diagnostics = []
+
         # the following are used internally to track state;
         # this is really out of control and should be refactored
         self.infeed = 0
@@ -252,12 +277,38 @@ class XMLParserMixin(
         self.basestack.append(self.baseuri)
         self.langstack.append(lang)
 
+        # A new entry/item starting while a previous entry/item element is
+        # still open means the feed is ill-formed and the previous element's
+        # end tag was lost.  Discard the stale element's namespace scope so
+        # that bindings local to the previous entry cannot pollute this one.
+        # (Tags inside inline XHTML content are not entry boundaries.)
+        if tag in ("entry", "item") and not self.incontent:
+            self._close_stale_entry_namespace_scopes()
+
         # track namespaces
         for prefix, uri in attrs:
             if prefix.startswith("xmlns:"):
                 self.track_namespace(prefix[6:], uri)
             elif prefix == "xmlns":
                 self.track_namespace(None, uri)
+
+        # match namespaces
+        if tag.find(":") != -1:
+            prefix, suffix = tag.split(":", 1)
+        else:
+            prefix, suffix = "", tag
+        prefix = self.namespacemap.get(prefix, prefix)
+        if prefix:
+            prefix = prefix + "_"
+
+        # Namespace bindings declared on this element go out of scope when
+        # the element ends; push a frame recording the element's tag, its
+        # routed name, and the undo records for its declarations so the
+        # previous bindings can be restored in unknown_endtag.
+        self._namespace_scope_stack.append(
+            (tag, prefix + suffix, self._namespace_scope_changes)
+        )
+        self._namespace_scope_changes = []
 
         # track inline content
         if self.incontent and not self.contentparams.get("type", "xml").endswith("xml"):
@@ -268,7 +319,7 @@ class XMLParserMixin(
         if self.incontent and self.contentparams.get("type") == "application/xhtml+xml":
             if tag.find(":") != -1:
                 prefix, tag = tag.split(":", 1)
-                namespace = self.namespaces_in_use.get(prefix, "")
+                namespace = self._inscope_namespaces.get(prefix, "")
                 if tag == "math" and namespace == "http://www.w3.org/1998/Math/MathML":
                     attrs.append(("xmlns", namespace))
                 if tag == "svg" and namespace == "http://www.w3.org/2000/svg":
@@ -276,15 +327,6 @@ class XMLParserMixin(
             if tag == "svg":
                 self.svgOK += 1
             return self.handle_data(f"<{tag}{self.strattrs(attrs)}>", escape=0)
-
-        # match namespaces
-        if tag.find(":") != -1:
-            prefix, suffix = tag.split(":", 1)
-        else:
-            prefix, suffix = "", tag
-        prefix = self.namespacemap.get(prefix, prefix)
-        if prefix:
-            prefix = prefix + "_"
 
         # Special hack for better tracking of empty textinput/image elements in
         # illformed feeds.
@@ -326,6 +368,13 @@ class XMLParserMixin(
         prefix = self.namespacemap.get(prefix, prefix)
         if prefix:
             prefix = prefix + "_"
+
+        # Restore the namespace bindings that were in effect before this
+        # element started.  This must happen after computing the routed
+        # name above (which uses the bindings that were in scope while the
+        # element was open) and before any sibling element is processed.
+        self._pop_namespace_scopes(tag)
+
         if suffix == "svg" and self.svgOK:
             self.svgOK -= 1
 
@@ -442,10 +491,59 @@ class XMLParserMixin(
             content_type = "application/xhtml+xml"
         return content_type
 
+    def _close_stale_entry_namespace_scopes(self):
+        # Ill-formed feeds may start a new entry/item without closing the
+        # previous one.  Find the innermost still-open entry/item frame and
+        # restore the bindings that were in effect before it started.
+        for index in range(len(self._namespace_scope_stack) - 1, -1, -1):
+            if self._namespace_scope_stack[index][1] in ("entry", "item"):
+                self._restore_namespace_scopes(index)
+                break
+
+    def _pop_namespace_scopes(self, tag):
+        # Find the innermost open element with this tag and restore the
+        # namespace bindings that were in effect before it started.  Any
+        # frames above it belong to descendants whose end tags were lost
+        # (which can happen in ill-formed feeds); they are restored too.
+        for index in range(len(self._namespace_scope_stack) - 1, -1, -1):
+            if self._namespace_scope_stack[index][0] == tag:
+                self._restore_namespace_scopes(index)
+                break
+
+    def _restore_namespace_scopes(self, index):
+        frames = self._namespace_scope_stack[index:]
+        del self._namespace_scope_stack[index:]
+        for _, _, changes in reversed(frames):
+            for mapping, key, old_value in reversed(changes):
+                if old_value is _MISSING:
+                    mapping.pop(key, None)
+                else:
+                    mapping[key] = old_value
+
+    def _record_namespace_summary(self, prefix, uri):
+        # `namespaces_in_use` is a document-level summary of the namespaces
+        # defined by the feed; it cannot represent bindings that only apply
+        # to part of the document.  The first (outermost) binding for a
+        # prefix wins so that a local re-binding cannot masquerade as the
+        # document-level binding, and conflicting re-bindings are recorded
+        # separately as diagnostics.
+        existing = self.namespaces_in_use.get(prefix)
+        if existing is None:
+            self.namespaces_in_use[prefix] = uri
+        elif existing != uri:
+            self.namespace_diagnostics.append(
+                "namespace prefix %r was rebound to %r; keeping %r in the "
+                "namespaces summary" % (prefix, uri, existing)
+            )
+
     def track_namespace(self, prefix, uri):
+        # The default namespace is tracked with an empty-string prefix
+        # (the SAX parser and Jython may report it as None instead).
+        prefix = prefix or ""
+        uri = uri or ""
         loweruri = uri.lower()
-        if not self.version:
-            if (prefix, loweruri) == (None, "http://my.netscape.com/rdf/simple/0.9/"):
+        if not self.version and loweruri:
+            if (prefix, loweruri) == ("", "http://my.netscape.com/rdf/simple/0.9/"):
                 self.version = "rss090"
             elif loweruri == "http://purl.org/rss/1.0/":
                 self.version = "rss10"
@@ -455,11 +553,30 @@ class XMLParserMixin(
             # match any backend.userland.com namespace
             uri = "http://backend.userland.com/rss"
             loweruri = uri
-        if loweruri in self._matchnamespaces:
-            self.namespacemap[prefix] = self._matchnamespaces[loweruri]
-            self.namespaces_in_use[self._matchnamespaces[loweruri]] = uri
+
+        # Record how to restore the previous bindings when the scope of
+        # this declaration ends, then apply the new binding.
+        self._namespace_scope_changes.append(
+            (self.namespacemap, prefix, self.namespacemap.get(prefix, _MISSING))
+        )
+        self._namespace_scope_changes.append(
+            (
+                self._inscope_namespaces,
+                prefix,
+                self._inscope_namespaces.get(prefix, _MISSING),
+            )
+        )
+        self._inscope_namespaces[prefix] = uri
+        if loweruri and loweruri in self._matchnamespaces:
+            standard_prefix = self._matchnamespaces[loweruri]
+            self.namespacemap[prefix] = standard_prefix
+            self._record_namespace_summary(standard_prefix, uri)
         else:
-            self.namespaces_in_use[prefix or ""] = uri
+            # Unknown namespaces and un-declarations (xmlns="") must not
+            # inherit a mapping that an outer scope gave this prefix.
+            self.namespacemap.pop(prefix, None)
+            if loweruri:
+                self._record_namespace_summary(prefix, uri)
 
     def resolve_uri(self, uri):
         return _urljoin(self.baseuri or "", uri)

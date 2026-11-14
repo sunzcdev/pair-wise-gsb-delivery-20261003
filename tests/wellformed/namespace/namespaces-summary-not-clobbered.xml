@@ -1,0 +1,11 @@
+<!--
+Description:  local default namespace rebinding does not clobber the namespaces summary
+Expect:       not bozo and namespaces[''] == 'http://www.w3.org/2005/Atom' and entries[0]['title'] == 'inner'
+-->
+<feed xmlns="http://www.w3.org/2005/Atom">
+  <entry>
+    <wrapper xmlns="http://example.com/other">
+      <title>inner</title>
+    </wrapper>
+  </entry>
+</feed>

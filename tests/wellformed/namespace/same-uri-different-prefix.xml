@@ -1,0 +1,12 @@
+<!--
+Description:  the same namespace URI bound to different prefixes in different scopes routes identically
+Expect:       not bozo and entries[0]['itunes_block'] == 1 and entries[1]['itunes_block'] == 1
+-->
+<feed xmlns="http://www.w3.org/2005/Atom">
+  <entry xmlns:a="http://www.itunes.com/DTDs/Podcast-1.0.dtd">
+    <a:block>yes</a:block>
+  </entry>
+  <entry xmlns:b="http://www.itunes.com/DTDs/Podcast-1.0.dtd">
+    <b:block>yes</b:block>
+  </entry>
+</feed>

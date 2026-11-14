@@ -1,0 +1,13 @@
+<!--
+Description:  xmlns="" undeclares the default namespace only within its element
+Expect:       not bozo and entries[0]['title'] == 'outer' and entries[1]['title'] == 'second' and namespaces[''] == 'http://www.w3.org/2005/Atom'
+-->
+<feed xmlns="http://www.w3.org/2005/Atom">
+  <entry>
+    <c xmlns=""><title>inner</title></c>
+    <title>outer</title>
+  </entry>
+  <entry>
+    <title>second</title>
+  </entry>
+</feed>

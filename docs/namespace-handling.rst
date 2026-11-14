@@ -15,6 +15,24 @@ The namespaces defined in the feed are available in the parsed results as
 ``namespaces``, a dictionary of {prefix: namespaceURI}.  If the feed defines a
 default namespace, it is listed as ``namespaces['']``.
 
+Namespace bindings are element-scoped
+-------------------------------------
+
+XML allows a prefix -- or the default namespace -- to be rebound on any
+element.  Such a local binding applies only to the element that declares it
+and its descendants.  :program:`Universal Feed Parser` tracks these scopes:
+when the element that declared a local binding ends, the enclosing scope's
+binding is restored, so elements in following entries are routed to the
+extension handlers that their *own* in-scope bindings indicate.  This applies
+to rebinding the default namespace, binding the same URI to different
+prefixes, undeclaring the default namespace with ``xmlns=""``, and nested
+overrides several levels deep.
+
+The ``namespaces`` dictionary is only a document-level summary of the
+namespaces defined by the feed; it cannot represent bindings that apply to
+just one part of the document.  If a prefix is bound to different URIs in
+different scopes, the first (outermost) binding is kept in the summary.
+
 
 Accessing namespaced elements
 -----------------------------

@@ -1,0 +1,14 @@
+<!--
+Description:  default namespace rebound inside an entry is restored when the element ends
+Expect:       not bozo and entries[0]['itunes_block'] == 1 and entries[1]['itunes_block'] == 1 and namespaces[''] == 'http://www.w3.org/2005/Atom'
+-->
+<feed xmlns="http://www.w3.org/2005/Atom">
+  <entry>
+    <wrapper xmlns="http://www.itunes.com/DTDs/Podcast-1.0.dtd">
+      <block>yes</block>
+    </wrapper>
+  </entry>
+  <entry xmlns:itunes="http://www.itunes.com/DTDs/Podcast-1.0.dtd">
+    <itunes:block>yes</itunes:block>
+  </entry>
+</feed>

@@ -1,0 +1,18 @@
+<!--
+Description:  two nested prefix overrides restore the enclosing bindings level by level
+Expect:       not bozo and entries[0]['itunes_block'] == 1 and entries[0]['x_block'] == 'inner' and entries[1]['itunes_block'] == 1 and 'x_block' not in entries[1]
+-->
+<feed xmlns="http://www.w3.org/2005/Atom" xmlns:x="http://www.itunes.com/DTDs/Podcast-1.0.dtd">
+  <entry>
+    <x:block>yes</x:block>
+    <level1 xmlns:x="http://example.com/other">
+      <level2 xmlns:x="http://www.itunes.com/DTDs/Podcast-1.0.dtd">
+        <x:block>yes</x:block>
+      </level2>
+      <x:block>inner</x:block>
+    </level1>
+  </entry>
+  <entry>
+    <x:block>yes</x:block>
+  </entry>
+</feed>
