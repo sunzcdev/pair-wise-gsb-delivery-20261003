@@ -7,13 +7,20 @@ from collections import OrderedDict
 from petl.compat import next, string_types, reduce, text_type
 
 
-from petl.errors import ArgumentError, FieldSelectionError
+from petl.errors import ArgumentError, FieldSelectionError, WindowDataError, \
+    WindowOrderError, WindowTimezoneError, WindowTimeTypeError
 from petl.util.base import Table, iterpeek, rowgroupby, asindices
 from petl.util.base import values, records
 from petl.util.counting import nrows
 from petl.transform.sorts import sort, mergesort
 from petl.transform.basics import cut
 from petl.transform.dedup import distinct
+from petl.transform.windows import windowaggregate, iterwindowaggregate, \
+    timewindow, timewindowaggregate, slidingwindow, slidingwindowaggregate, \
+    windowedaggregate, eventtimewindow, eventtimewindowaggregate, \
+    window_aggregate, sliding_window_aggregate, time_window_aggregate, \
+    event_time_window, event_time_window_aggregate, \
+    WindowAggregateView, WindowAggregateIterator, WindowAggregateState
 
 
 def rowreduce(table, key, reducer, header=None, presorted=False,

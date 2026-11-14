@@ -30,6 +30,15 @@ from petl.transform.reductions import rowreduce, mergeduplicates,\
     aggregate, groupcountdistinctvalues, groupselectfirst, groupselectmax, \
     groupselectmin, merge, fold, Conflict, groupselectlast
 
+from petl.transform.windows import windowaggregate, iterwindowaggregate, \
+    timewindow, timewindowaggregate, slidingwindow, slidingwindowaggregate, \
+    windowedaggregate, eventtimewindow, eventtimewindowaggregate, \
+    window_aggregate, sliding_window_aggregate, time_window_aggregate, \
+    event_time_window, event_time_window_aggregate, \
+    WindowAggregateView, WindowAggregateIterator, WindowAggregateState, \
+    WindowDataError, WindowOrderError, WindowTimezoneError, \
+    WindowTimeTypeError
+
 from petl.transform.fills import filldown, fillright, fillleft
 
 from petl.transform.regex import capture, split, search, searchcomplement, \
