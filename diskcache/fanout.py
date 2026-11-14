@@ -7,7 +7,6 @@ import operator
 import os.path as op
 import sqlite3
 import tempfile
-import time
 
 from .core import DEFAULT_SETTINGS, ENOVAL, Cache, Disk, Timeout
 from .persistent import Deque, Index
@@ -17,7 +16,13 @@ class FanoutCache:
     """Cache that shards keys and values."""
 
     def __init__(
-        self, directory=None, shards=8, timeout=0.010, disk=Disk, **settings
+        self,
+        directory=None,
+        shards=8,
+        timeout=0.010,
+        disk=Disk,
+        clock=None,
+        **settings,
     ):
         """Initialize cache instance.
 
@@ -25,6 +30,8 @@ class FanoutCache:
         :param int shards: number of shards to distribute writes
         :param float timeout: SQLite connection timeout
         :param disk: `Disk` instance for serialization
+        :param clock: `Clock` instance for monotonic TTL policy
+            (default None, wall clock used)
         :param settings: any of `DEFAULT_SETTINGS`
 
         """
@@ -45,6 +52,7 @@ class FanoutCache:
                 directory=op.join(directory, '%03d' % num),
                 timeout=timeout,
                 disk=disk,
+                clock=clock,
                 size_limit=size_limit,
                 **settings,
             )
@@ -418,7 +426,7 @@ class FanoutCache:
         :return: count of items removed
 
         """
-        return self._remove('expire', args=(time.time(),), retry=retry)
+        return self._remove('expire', retry=retry)
 
     def create_tag_index(self):
         """Create tag index on cache database.

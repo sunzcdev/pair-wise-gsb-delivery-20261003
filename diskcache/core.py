@@ -100,6 +100,32 @@ EVICTION_POLICY = {
 }
 
 
+class Clock:
+    """Clock policy pairing a wall clock with a monotonic clock.
+
+    When a `Clock` is given to :class:`Cache`, relative time-to-live
+    (TTL) values are measured against the monotonic clock while the
+    cache is open. Wall-clock changes, like NTP adjustments or manual
+    changes to the system time, therefore do not extend or shorten the
+    lifetime of items in the current process. An absolute expiration
+    time is still stored for each item so that the remaining TTL may be
+    restored from the wall clock when the cache is re-opened. Monotonic
+    timing is not preserved across restarts.
+
+    Custom clocks may be injected for testing by providing `time` and
+    `monotonic` methods that return seconds as floats.
+
+    """
+
+    def time(self):
+        """Return the current wall-clock time in seconds."""
+        return time.time()
+
+    def monotonic(self):
+        """Return the current monotonic time in seconds."""
+        return time.monotonic()
+
+
 class Disk:
     """Cache key and value serialization for SQLite database and files."""
 
@@ -417,12 +443,16 @@ def args_to_key(base, args, kwargs, typed, ignore):
 class Cache:
     """Disk and file backed cache."""
 
-    def __init__(self, directory=None, timeout=60, disk=Disk, **settings):
+    def __init__(
+        self, directory=None, timeout=60, disk=Disk, clock=None, **settings
+    ):
         """Initialize cache instance.
 
         :param str directory: cache directory
         :param float timeout: SQLite connection timeout
         :param disk: Disk type or subclass for serialization
+        :param clock: Clock instance for monotonic TTL policy
+            (default None, wall clock used)
         :param settings: any of DEFAULT_SETTINGS
 
         """
@@ -430,6 +460,15 @@ class Cache:
             assert issubclass(disk, Disk)
         except (TypeError, AssertionError):
             raise ValueError('disk must subclass diskcache.Disk') from None
+
+        if clock is None:
+            self._clock = None
+            self._wall_anchor = None
+            self._mono_anchor = None
+        else:
+            self._clock = clock
+            self._wall_anchor = clock.time()
+            self._mono_anchor = clock.monotonic()
 
         if directory is None:
             directory = tempfile.mkdtemp(prefix='diskcache-')
@@ -606,6 +645,28 @@ class Cache:
         return self._disk
 
     @property
+    def clock(self):
+        """Clock policy used for expiry or None."""
+        return self._clock
+
+    def _now(self):
+        """Return the current time for expiration comparisons.
+
+        When a clock policy is enabled, the returned value is anchored
+        to the wall clock at initialization and advanced by the
+        monotonic clock thereafter. Wall-clock changes therefore do not
+        alter the remaining lifetime of items in the current process.
+        Otherwise, the wall clock (``time.time()``) is returned.
+
+        """
+        clock = self._clock
+
+        if clock is None:
+            return time.time()
+
+        return self._wall_anchor + (clock.monotonic() - self._mono_anchor)
+
+    @property
     def _con(self):
         # Check process ID to support process forking. If the process
         # ID changes, close the connection and update the process ID.
@@ -766,7 +827,7 @@ class Cache:
         :raises Timeout: if database timeout occurs
 
         """
-        now = time.time()
+        now = self._now()
         db_key, raw = self._disk.put(key)
         expire_time = None if expire is None else now + expire
         size, mode, filename, db_value = self._disk.store(value, read, key=key)
@@ -938,7 +999,7 @@ class Cache:
         :raises Timeout: if database timeout occurs
 
         """
-        now = time.time()
+        now = self._now()
         db_key, raw = self._disk.put(key)
         expire_time = None if expire is None else now + expire
 
@@ -986,7 +1047,7 @@ class Cache:
         :raises Timeout: if database timeout occurs
 
         """
-        now = time.time()
+        now = self._now()
         db_key, raw = self._disk.put(key)
         expire_time = None if expire is None else now + expire
         size, mode, filename, db_value = self._disk.store(value, read, key=key)
@@ -1040,7 +1101,7 @@ class Cache:
         :raises Timeout: if database timeout occurs
 
         """
-        now = time.time()
+        now = self._now()
         db_key, raw = self._disk.put(key)
         select = (
             'SELECT rowid, expire_time, filename, value FROM Cache'
@@ -1162,7 +1223,7 @@ class Cache:
         if not self.statistics and update_column is None:
             # Fast path, no transaction necessary.
 
-            rows = self._sql(select, (db_key, raw, time.time())).fetchall()
+            rows = self._sql(select, (db_key, raw, self._now())).fetchall()
 
             if not rows:
                 return default
@@ -1184,7 +1245,7 @@ class Cache:
             )
 
             with self._transact(retry) as (sql, _):
-                rows = sql(select, (db_key, raw, time.time())).fetchall()
+                rows = sql(select, (db_key, raw, self._now())).fetchall()
 
                 if not rows:
                     if self.statistics:
@@ -1206,7 +1267,7 @@ class Cache:
                 if self.statistics:
                     sql(cache_hit)
 
-                now = time.time()
+                now = self._now()
                 update = 'UPDATE Cache SET %s WHERE rowid = ?'
 
                 if update_column is not None:
@@ -1267,7 +1328,7 @@ class Cache:
             ' AND (expire_time IS NULL OR expire_time > ?)'
         )
 
-        rows = sql(select, (db_key, raw, time.time())).fetchall()
+        rows = sql(select, (db_key, raw, self._now())).fetchall()
 
         return bool(rows)
 
@@ -1306,7 +1367,7 @@ class Cache:
             default = default, None
 
         with self._transact(retry) as (sql, _):
-            rows = sql(select, (db_key, raw, time.time())).fetchall()
+            rows = sql(select, (db_key, raw, self._now())).fetchall()
 
             if not rows:
                 return default
@@ -1352,7 +1413,7 @@ class Cache:
                 'SELECT rowid, filename FROM Cache'
                 ' WHERE key = ? AND raw = ?'
                 ' AND (expire_time IS NULL OR expire_time > ?)',
-                (db_key, raw, time.time()),
+                (db_key, raw, self._now()),
             ).fetchall()
 
             if not rows:
@@ -1443,7 +1504,7 @@ class Cache:
             min_key = prefix + '-000000000000000'
             max_key = prefix + '-999999999999999'
 
-        now = time.time()
+        now = self._now()
         raw = True
         expire_time = None if expire is None else now + expire
         size, mode, filename, db_value = self._disk.store(value, read)
@@ -1579,7 +1640,7 @@ class Cache:
 
                     sql('DELETE FROM Cache WHERE rowid = ?', (rowid,))
 
-                    if db_expire is not None and db_expire < time.time():
+                    if db_expire is not None and db_expire < self._now():
                         cleanup(name)
                     else:
                         break
@@ -1692,7 +1753,7 @@ class Cache:
                         (rowid, key, db_expire, db_tag, mode, name, db_value),
                     ) = rows
 
-                    if db_expire is not None and db_expire < time.time():
+                    if db_expire is not None and db_expire < self._now():
                         sql('DELETE FROM Cache WHERE rowid = ?', (rowid,))
                         cleanup(name)
                     else:
@@ -1768,7 +1829,7 @@ class Cache:
                         ),
                     ) = rows
 
-                    if db_expire is not None and db_expire < time.time():
+                    if db_expire is not None and db_expire < self._now():
                         sql('DELETE FROM Cache WHERE rowid = ?', (rowid,))
                         cleanup(name)
                     else:
@@ -2084,7 +2145,8 @@ class Cache:
         Raises :exc:`Timeout` error when database timeout occurs and `retry` is
         `False` (default).
 
-        :param float now: current time (default None, ``time.time()`` used)
+        :param float now: current time (default None, current time per the
+            cache's clock policy is used)
         :param bool retry: retry if database timeout occurs (default False)
         :return: count of items removed
         :raises Timeout: if database timeout occurs
@@ -2095,7 +2157,7 @@ class Cache:
             ' WHERE ? < expire_time AND expire_time < ?'
             ' ORDER BY expire_time LIMIT ?'
         )
-        args = [0, now or time.time(), 100]
+        args = [0, now or self._now(), 100]
         return self._select_delete(select, args, row_index=1, retry=retry)
 
     def cull(self, retry=False):
@@ -2116,7 +2178,7 @@ class Cache:
         :raises Timeout: if database timeout occurs
 
         """
-        now = time.time()
+        now = self._now()
 
         # Remove expired items.
 

@@ -13,6 +13,16 @@ Read the :ref:`Cache tutorial <tutorial-cache>` for example usage.
    :special-members:
    :exclude-members: __weakref__
 
+Clock
+-----
+
+Pass a ``Clock`` instance to :class:`Cache` or :class:`FanoutCache` as the
+``clock`` argument to measure relative time-to-live values against a
+monotonic clock while the cache is open.
+
+.. autoclass:: diskcache.Clock
+   :members:
+
 FanoutCache
 -----------
 
