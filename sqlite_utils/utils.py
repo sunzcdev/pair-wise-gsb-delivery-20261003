@@ -23,6 +23,20 @@ from typing import (
 import click
 
 from . import recipes
+from .importing import (  # noqa: F401
+    ColumnInference,
+    ColumnTypeInference,
+    InferenceResult,
+    LateValuePolicy,
+    SampleResult,
+    SourceRow,
+    TypeInference,
+    ValueMismatch,
+    apply_inferred_types,
+    infer_column_types,
+    sample_and_infer,
+    take_sample,
+)
 
 if TYPE_CHECKING:
     import sqlite3

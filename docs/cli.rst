@@ -1423,6 +1423,44 @@ To import them as ``NULL`` values instead, use the ``--empty-null`` option:
 
     sqlite-utils insert creatures.db creatures creatures.csv --csv --empty-null
 
+Type detection uses a bounded sample and then keeps that schema fixed for the
+whole import. The sample defaults to 100 rows for CSV and TSV. Use
+``--sample-size`` to choose a different number. This option also enables
+sampling for JSON and newline-delimited JSON input:
+
+.. code-block:: bash
+
+    sqlite-utils insert creatures.db creatures creatures.csv --csv \
+        --sample-size 500
+
+The inferred type for each column is chosen from the sample only; later rows
+never cause a column type to be changed. Values that do not fit the selected
+type are handled by ``--on-late-mismatch``:
+
+.. code-block:: bash
+
+    # Skip rows that contain incompatible values (the default)
+    sqlite-utils insert creatures.db creatures creatures.csv --csv \
+        --sample-size 100 --on-late-mismatch reject
+
+    # Keep the row, set the incompatible column to NULL, and preserve the
+    # original value (plus source row and column) in a JSON error column
+    sqlite-utils insert creatures.db creatures creatures.csv --csv \
+        --sample-size 100 --on-late-mismatch error-column \
+        --error-column import_error
+
+Use ``--show-type-inference`` to print the selected type and the evidence used
+for each column:
+
+.. code-block:: bash
+
+    sqlite-utils insert creatures.db creatures creatures.csv --csv \
+        --sample-size 100 --show-type-inference
+
+The sample is not read twice. The sampled rows are replayed into the normal
+import before the remaining rows are streamed through, so no rows from the
+first batch are lost.
+
 .. _cli_insert_csv_tsv_delimiter:
 
 Alternative delimiters and quote characters

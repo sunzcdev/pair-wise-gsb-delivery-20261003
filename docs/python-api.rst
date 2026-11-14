@@ -3479,6 +3479,54 @@ We can then apply those types to our new table using the :ref:`table.transform()
     #    "name" TEXT
     # );
 
+Sampling and late-value policies
+--------------------------------
+
+For streaming imports, use ``sample_and_infer()`` to inspect a bounded number
+of rows and then replay those rows into the normal iterator. The returned
+object exposes the selected types and a per-column reason for each choice:
+
+.. code-block:: python
+
+    from sqlite_utils.utils import (
+        LateValuePolicy,
+        apply_inferred_types,
+        sample_and_infer,
+    )
+
+    sample = sample_and_infer(rows, sample_size=2)
+    print(sample.types)
+    # {'id': 'INTEGER', 'name': 'TEXT'}
+    print(sample.reasons["id"])
+    # all 2 non-null sampled value(s) are integers within SQLite's signed
+    # 64-bit range
+
+    typed_rows = apply_inferred_types(
+        sample,
+        sample.inference,
+        late_value_policy=LateValuePolicy.ERROR_COLUMN,
+        error_column="import_error",
+    )
+    db.table("creatures").insert_all(
+        typed_rows,
+        columns={"id": "INTEGER", "name": "TEXT", "import_error": "TEXT"},
+    )
+
+The sampled rows are yielded first, followed by the unread remainder of the
+source iterator; the source is never iterated a second time.
+
+Late-value policies are explicit:
+
+* ``LateValuePolicy.REJECT`` skips a row containing an incompatible value.
+* ``LateValuePolicy.ERROR_COLUMN`` keeps the row, sets the offending column to
+  ``NULL`` and stores the original value together with its source row number,
+  column name, expected type and reason in the error column.
+
+Empty strings are treated as text unless ``empty_is_null=True``. Missing
+fields and explicit ``None`` values are treated as ``NULL`` and do not influence
+type inference. Booleans map to ``INTEGER`` (0/1). Integers outside SQLite's
+signed 64-bit range select ``TEXT`` so their exact value can be preserved.
+
 .. _python_api_gis:
 
 SpatiaLite helpers

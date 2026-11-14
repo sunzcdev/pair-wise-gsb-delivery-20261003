@@ -36,10 +36,15 @@ from sqlite_utils.plugins import ensure_plugins_loaded, get_plugins, pm
 from sqlite_utils.utils import maximize_csv_field_size_limit
 
 from .utils import (
+    ColumnInference,
     Format,
+    LateValuePolicy,
     OperationalError,
+    SourceRow,
+    TypeInference,
     TypeTracker,
     _compile_code,
+    apply_inferred_types,
     chunks,
     decode_base64_values,
     dedupe_keys,
@@ -47,6 +52,7 @@ from .utils import (
     find_spatialite,
     progressbar,
     rows_from_file,
+    sample_and_infer,
     sqlite3,
 )
 from .utils import (
@@ -1038,6 +1044,45 @@ def insert_upsert_options(*, require_pk=False):
                     help="Treat all CSV/TSV columns as TEXT",
                 ),
                 click.option(
+                    "--sample-size",
+                    "--type-sample-size",
+                    "sample_size",
+                    type=click.IntRange(min=1),
+                    default=None,
+                    help=(
+                        "Rows to use for type inference (CSV/TSV default: 100; "
+                        "JSON defaults to 100 when sampling or late-value "
+                        "options are used)"
+                    ),
+                ),
+                click.option(
+                    "--on-late-mismatch",
+                    "--late-value-policy",
+                    "on_late_mismatch",
+                    type=click.Choice(
+                        ["reject", "error-column", "error"],
+                        case_sensitive=False,
+                    ),
+                    default=None,
+                    help=(
+                        "What to do with values that do not match the sampled "
+                        "type: reject the row or move the value to --error-column"
+                    ),
+                ),
+                click.option(
+                    "--error-column",
+                    default=None,
+                    help=(
+                        "Column used to preserve incompatible values "
+                        "(default: _import_error)"
+                    ),
+                ),
+                click.option(
+                    "--show-type-inference",
+                    is_flag=True,
+                    help="Show the inferred type and evidence for every column",
+                ),
+                click.option(
                     "--analyze",
                     is_flag=True,
                     help="Run ANALYZE at the end of this operation",
@@ -1056,6 +1101,59 @@ def insert_upsert_options(*, require_pk=False):
         return fn
 
     return inner
+
+
+def _inference_from_existing_table(table) -> TypeInference:
+    columns = []
+    for column in table.columns:
+        declared_type = (column.type or "").strip().upper()
+        if "INT" in declared_type:
+            sqlite_type = "INTEGER"
+        elif declared_type == "ANY":
+            sqlite_type = "ANY"
+        elif "CHAR" in declared_type or "CLOB" in declared_type or "TEXT" in declared_type:
+            sqlite_type = "TEXT"
+        elif "BLOB" in declared_type:
+            sqlite_type = "BLOB"
+        elif "REAL" in declared_type or "FLOA" in declared_type or "DOUB" in declared_type:
+            sqlite_type = "REAL"
+        elif declared_type:
+            sqlite_type = "REAL"
+        else:
+            sqlite_type = "TEXT"
+        python_type = {
+            "INTEGER": int,
+            "REAL": float,
+            "BLOB": bytes,
+            "ANY": object,
+            "TEXT": str,
+        }[sqlite_type]
+        columns.append(
+            ColumnInference(
+                name=column.name,
+                sqlite_type=sqlite_type,
+                python_type=python_type,
+                reason="existing table schema declares {}".format(
+                    column.type or "TEXT"
+                ),
+                sample_count=0,
+                non_null_count=0,
+                missing_count=0,
+                null_count=0,
+                empty_count=0,
+                boolean_count=0,
+                integer_count=0,
+                float_count=0,
+                text_count=0,
+                bytes_count=0,
+                oversized_integer_count=0,
+            )
+        )
+    return TypeInference(
+        columns=tuple(columns),
+        sample_row_count=0,
+        sample_size=0,
+    )
 
 
 def insert_upsert_implementation(
@@ -1088,6 +1186,10 @@ def insert_upsert_implementation(
     default=None,
     types=None,
     no_detect_types=False,
+    sample_size=None,
+    on_late_mismatch=None,
+    error_column=None,
+    show_type_inference=False,
     analyze=False,
     load_extension=None,
     silent=False,
@@ -1102,7 +1204,7 @@ def insert_upsert_implementation(
     _maybe_register_functions(db, functions)
     column_type_overrides = {column: ctype.upper() for column, ctype in (types or [])}
 
-    def _insert_docs(docs, tracker=None):
+    def _insert_docs(docs, columns=None):
         extra_kwargs: dict[str, Any] = {
             "ignore": ignore,
             "replace": replace,
@@ -1114,8 +1216,10 @@ def insert_upsert_implementation(
             extra_kwargs["not_null"] = set(not_null)
         if default:
             extra_kwargs["defaults"] = dict(default)
-        if column_type_overrides:
-            extra_kwargs["columns"] = column_type_overrides
+        effective_columns = dict(columns or {})
+        effective_columns.update(column_type_overrides)
+        if effective_columns:
+            extra_kwargs["columns"] = effective_columns
         if upsert:
             extra_kwargs["upsert"] = upsert
 
@@ -1136,9 +1240,6 @@ def insert_upsert_implementation(
                     db.conn.cursor().executemany(bulk_sql, doc_chunk)
             return
 
-        # table_names() rather than db.table(), which raises NoTable for
-        # views before the error handling below can deal with them
-        table_existed_before_insert = table in db.table_names()
         try:
             db.table(table).insert_all(
                 docs, pk=pk, batch_size=batch_size, alter=alter, **extra_kwargs
@@ -1166,17 +1267,6 @@ def insert_upsert_implementation(
                 )
             else:
                 raise
-        # Apply detected types only to a table this command created -
-        # transforming a pre-existing table would rewrite its column types
-        # and corrupt values such as TEXT zip codes with leading zeros
-        if (
-            tracker is not None
-            and not table_existed_before_insert
-            and db.table(table).exists()
-        ):
-            detected_types = tracker.types
-            detected_types.update(column_type_overrides)
-            db.table(table).transform(types=detected_types)
 
     if code is not None:
         if file is not None:
@@ -1232,7 +1322,47 @@ def insert_upsert_implementation(
     else:
         decoded_buffer = io.TextIOWrapper(file, encoding=encoding)
 
-    tracker = None
+    table_existed_before_insert = table is not None and table in db.table_names()
+    if sample_size is not None and sample_size < 1:
+        raise click.ClickException("--sample-size must be at least 1")
+    if on_late_mismatch is None:
+        late_value_policy = (
+            LateValuePolicy.ERROR_COLUMN
+            if error_column
+            else LateValuePolicy.REJECT
+        )
+    else:
+        try:
+            late_value_policy = LateValuePolicy.from_value(on_late_mismatch)
+        except ValueError as ex:
+            raise click.ClickException(str(ex))
+    if late_value_policy == LateValuePolicy.ERROR_COLUMN and not error_column:
+        error_column = "_import_error"
+
+    def _decode_with_source(doc):
+        decoded_doc = decode_base64_values(doc)
+        if decoded_doc is doc:
+            return doc
+        if isinstance(doc, SourceRow) and isinstance(decoded_doc, dict):
+            return SourceRow(
+                decoded_doc,
+                source_row=doc.source_row,
+                source_name=doc.source_name,
+            )
+        return decoded_doc
+
+    def _report_rejections(mismatches):
+        for mismatch in mismatches:
+            click.echo(
+                "Rejected source row {} column {} ({}): {}".format(
+                    mismatch.source_row,
+                    mismatch.column,
+                    mismatch.expected_type,
+                    mismatch.reason,
+                ),
+                err=True,
+            )
+
     with file_progress(decoded_buffer, silent=silent) as decoded:
         if csv or tsv:
             if sniff:
@@ -1251,22 +1381,29 @@ def insert_upsert_implementation(
                 csv_reader_args["quotechar"] = quotechar
             reader = csv_std.reader(decoded, **csv_reader_args)  # type: ignore
             first_row = next(reader)
+            first_row_number = reader.line_num
             if no_headers:
                 headers = [f"untitled_{i + 1}" for i in range(len(first_row))]
-                reader = itertools.chain([first_row], reader)
             else:
                 headers = first_row
-            if empty_null:
-                docs = (
-                    dict(zip(headers, [None if cell == "" else cell for cell in row]))
-                    for row in reader
-                )
-            else:
-                docs = (dict(zip(headers, row)) for row in reader)
-            # Type detection is the default, unless --no-detect-types is passed
-            if not no_detect_types:
-                tracker = TypeTracker()
-                docs = tracker.wrap(docs)
+
+            def _csv_source_rows():
+                if no_headers:
+                    yield first_row, first_row_number
+                for csv_row in reader:
+                    yield csv_row, reader.line_num
+
+            def _csv_docs():
+                for csv_row, source_row in _csv_source_rows():
+                    values = dict(zip(headers, csv_row))
+                    if empty_null:
+                        values = {
+                            key: None if value == "" else value
+                            for key, value in values.items()
+                        }
+                    yield SourceRow(values, source_row=source_row)
+
+            docs = _csv_docs()
         elif lines:
             docs = ({"line": line.strip()} for line in decoded)
         elif text:
@@ -1274,17 +1411,39 @@ def insert_upsert_implementation(
         else:
             try:
                 if nl:
-                    docs = (json.loads(line) for line in decoded if line.strip())
+                    def _json_nl_docs():
+                        for line_number, line in enumerate(decoded, start=1):
+                            if not line.strip():
+                                continue
+                            value = json.loads(line)
+                            if isinstance(value, dict):
+                                value = SourceRow(value, source_row=line_number)
+                            yield value
+
+                    docs = _json_nl_docs()
                 else:
                     docs = json.load(decoded)
                     if isinstance(docs, dict):
                         docs = [docs]
+                    docs = [
+                        SourceRow(value, source_row=index)
+                        if isinstance(value, dict)
+                        else value
+                        for index, value in enumerate(docs, start=1)
+                    ]
             except json.decoder.JSONDecodeError as ex:
                 raise click.ClickException(
                     f"Invalid JSON - use --csv for CSV or --tsv for TSV files\n\nJSON error: {ex}"
                 )
             if flatten:
-                docs = (_flatten(doc) for doc in docs)
+                docs = (
+                    SourceRow(
+                        _flatten(verify_is_dict(doc)),
+                        source_row=getattr(doc, "source_row", None),
+                        source_name=getattr(doc, "source_name", None),
+                    )
+                    for doc in docs
+                )
 
         if stop_after:
             docs = itertools.islice(docs, stop_after)
@@ -1312,9 +1471,107 @@ def insert_upsert_implementation(
                             "--convert must return dict or iterator"
                         )
             else:
-                docs = (fn(doc) or doc for doc in docs)
+                def _convert_row(doc):
+                    converted = fn(doc) or doc
+                    if isinstance(doc, SourceRow) and isinstance(converted, dict):
+                        return SourceRow(
+                            converted,
+                            source_row=doc.source_row,
+                            source_name=doc.source_name,
+                        )
+                    return converted
 
-        _insert_docs(docs, tracker=tracker)
+                docs = (_convert_row(doc) for doc in docs)
+
+        # Every structured path must produce dictionaries before inference.
+        if csv or tsv or nl or not (lines or text):
+            docs = (verify_is_dict(doc) for doc in docs)
+            docs = (_decode_with_source(doc) for doc in docs)
+
+        columns = None
+        inference = None
+        structured_input = csv or tsv or nl or not (lines or text)
+        if structured_input and not no_detect_types and table is not None:
+            if not table_existed_before_insert:
+                # CSV/TSV keep their existing default of type detection. JSON
+                # input opts in via --sample-size or one of the late-value
+                # options, preserving the old JSON behavior otherwise.
+                if (csv or tsv) and sample_size is None:
+                    sample_size = 100
+                elif (
+                    sample_size is None
+                    and (
+                        on_late_mismatch is not None
+                        or error_column is not None
+                        or show_type_inference
+                    )
+                ):
+                    sample_size = 100
+                if (csv or tsv) or sample_size is not None:
+                    sampled = sample_and_infer(
+                        docs,
+                        sample_size,
+                        empty_is_null=empty_null,
+                        parse_numbers_in_strings=(csv or tsv),
+                    )
+                    inference = sampled.inference.with_overrides(
+                        column_type_overrides
+                    )
+                    if show_type_inference:
+                        for column in inference.columns:
+                            click.echo(
+                                "{}: {} - {}".format(
+                                    column.name,
+                                    column.sqlite_type,
+                                    column.reason,
+                                ),
+                                err=True,
+                            )
+                    if (
+                        late_value_policy == LateValuePolicy.ERROR_COLUMN
+                        and error_column
+                        and error_column in inference.types
+                    ):
+                        raise click.ClickException(
+                            f"Error column {error_column!r} conflicts with an input column"
+                        )
+                    docs = apply_inferred_types(
+                        sampled,
+                        inference,
+                        late_value_policy=late_value_policy,
+                        error_column=error_column,
+                        on_reject=_report_rejections,
+                    )
+                    columns = dict(inference.types)
+                    if late_value_policy == LateValuePolicy.ERROR_COLUMN:
+                        assert error_column is not None
+                        columns[error_column] = "TEXT"
+            elif (
+                sample_size is not None
+                or error_column is not None
+                or on_late_mismatch is not None
+            ):
+                # Existing tables keep their declared schema.  When the
+                # caller explicitly asks for sampling or an error column,
+                # enforce that schema over the same streaming input.
+                inference = _inference_from_existing_table(db.table(table))
+                if (
+                    late_value_policy == LateValuePolicy.ERROR_COLUMN
+                    and error_column
+                    and error_column not in db.table(table).columns_dict
+                ):
+                    # insert_chunk() adds missing columns and retries inside
+                    # the same atomic block as the failed insert.
+                    alter = True
+                docs = apply_inferred_types(
+                    docs,
+                    inference,
+                    late_value_policy=late_value_policy,
+                    error_column=error_column,
+                    on_reject=_report_rejections,
+                )
+
+        _insert_docs(docs, columns=columns)
 
         # Clean up open file-like objects
         if sniff_buffer:
@@ -1376,6 +1633,10 @@ def insert(
     stop_after,
     alter,
     no_detect_types,
+    sample_size,
+    on_late_mismatch,
+    error_column,
+    show_type_inference,
     analyze,
     load_extension,
     silent,
@@ -1473,6 +1734,10 @@ def insert(
             replace=replace,
             truncate=truncate,
             no_detect_types=no_detect_types,
+            sample_size=sample_size,
+            on_late_mismatch=on_late_mismatch,
+            error_column=error_column,
+            show_type_inference=show_type_inference,
             analyze=analyze,
             load_extension=load_extension,
             silent=silent,
@@ -1515,6 +1780,10 @@ def upsert(
     default,
     types,
     no_detect_types,
+    sample_size,
+    on_late_mismatch,
+    error_column,
+    show_type_inference,
     analyze,
     load_extension,
     silent,
@@ -1566,6 +1835,10 @@ def upsert(
             default=default,
             types=types,
             no_detect_types=no_detect_types,
+            sample_size=sample_size,
+            on_late_mismatch=on_late_mismatch,
+            error_column=error_column,
+            show_type_inference=show_type_inference,
             analyze=analyze,
             load_extension=load_extension,
             silent=silent,
