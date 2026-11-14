@@ -21,6 +21,81 @@ class UnexpectedSymbol(common.JSONError):
         )
 
 
+def _string_limit_info(limits):
+    if not limits or 'max_string_length' not in limits:
+        return None, 'max_string_length'
+    return limits['max_string_length']
+
+
+def _scan_string_length(buf, pos, end, decoded_len, pending_high_surrogate,
+                        limit, limit_name, token_pos):
+    '''
+    Advance over the raw contents of a string token, keeping track of the
+    number of *decoded* characters seen so far.
+
+    The scan stops in front of an escape sequence that is not complete yet so
+    it can be resumed when more input arrives. Surrogate pairs expressed as
+    two ``\\uXXXX`` escapes count as a single character.
+    '''
+    i = pos
+    while i < end:
+        char = buf[i]
+        if char != '\\':
+            decoded_len += 1
+            pending_high_surrogate = False
+            i += 1
+        else:
+            if i + 1 >= end:
+                break
+            escape = buf[i + 1]
+            if escape == 'u':
+                if i + 6 > end:
+                    break
+                try:
+                    codepoint = int(buf[i + 2:i + 6], 16)
+                except ValueError:
+                    # Leave the actual validation to scanstring(); for the
+                    # purpose of the budget this is still one character.
+                    decoded_len += 1
+                    pending_high_surrogate = False
+                    i += 2
+                    continue
+                if 0xD800 <= codepoint <= 0xDBFF:
+                    decoded_len += 1
+                    pending_high_surrogate = True
+                elif 0xDC00 <= codepoint <= 0xDFFF:
+                    if not pending_high_surrogate:
+                        decoded_len += 1
+                    pending_high_surrogate = False
+                else:
+                    decoded_len += 1
+                    pending_high_surrogate = False
+                i += 6
+            else:
+                decoded_len += 1
+                pending_high_surrogate = False
+                i += 2
+
+        if limit is not None and decoded_len > limit:
+            raise common.JSONLimitError(
+                limit_name, token_pos, limit, actual=decoded_len
+            )
+
+    return i, decoded_len, pending_high_surrogate
+
+
+def _check_number_length(lexeme, pos, limit, limit_name):
+    if limit is None or not lexeme:
+        return
+    # Only numeric-looking tokens are subject to this budget. Keywords such
+    # as true/false/null share the lexer's character class but aren't numbers.
+    if lexeme[0].isdigit() or lexeme[0] in '-+':
+        if len(lexeme) > limit:
+            raise common.JSONLimitError(
+                limit_name, pos, limit, actual=len(lexeme)
+            )
+
+
 @utils.coroutine
 def utf8_encoder(target):
     decoder = codecs.getincrementaldecoder('utf-8')()
@@ -54,7 +129,7 @@ def utf8_encoder(target):
             break
 
 @utils.coroutine
-def Lexer(target):
+def Lexer(target, limits=None):
     """
     Parses lexemes out of the incoming content, and sends them to parse_value.
     A special EOF result is sent when the data source has been exhausted to
@@ -69,6 +144,10 @@ def Lexer(target):
     pos = 0
     discarded = 0
     send = target.send
+    string_limit, string_limit_name = _string_limit_info(limits)
+    number_limit, number_limit_name = (None, 'max_number_length')
+    if limits and 'max_number_length' in limits:
+        number_limit, number_limit_name = limits['max_number_length']
     while True:
         match = LEXEME_RE.search(buf, pos)
         if match:
@@ -76,17 +155,30 @@ def Lexer(target):
             if lexeme == '"':
                 pos = match.start()
                 start = pos + 1
+                token_pos = discarded + pos
+                scan_pos = start
+                decoded_len = 0
+                pending_high_surrogate = False
                 while True:
                     try:
                         end = buf.index('"', start)
                         escpos = end - 1
                         while buf[escpos] == '\\':
                             escpos -= 1
-                        if (end - escpos) % 2 == 0:
-                            start = end + 1
-                        else:
-                            break
+                        escaped = (end - escpos) % 2 == 0
                     except ValueError:
+                        end = len(buf)
+                        escaped = None
+
+                    if string_limit is not None:
+                        scan_pos, decoded_len, pending_high_surrogate = \
+                            _scan_string_length(
+                                buf, scan_pos, end, decoded_len,
+                                pending_high_surrogate, string_limit,
+                                string_limit_name, token_pos
+                            )
+
+                    if escaped is None:
                         try:
                             data = (yield)
                         except GeneratorExit:
@@ -94,9 +186,18 @@ def Lexer(target):
                         if not data:
                             raise common.IncompleteJSONError('Incomplete string lexeme')
                         buf += data
+                    elif escaped:
+                        start = end + 1
+                    else:
+                        break
                 send((discarded + pos, buf[pos:end + 1]))
                 pos = end + 1
             else:
+                if number_limit is not None:
+                    _check_number_length(
+                        lexeme, discarded + match.start(),
+                        number_limit, number_limit_name
+                    )
                 while lexeme not in UNARY_LEXEMES and match.end() == len(buf):
                     try:
                         data = (yield)
@@ -107,6 +208,11 @@ def Lexer(target):
                     buf += data
                     match = LEXEME_RE.search(buf, pos)
                     lexeme = match.group()
+                    if number_limit is not None:
+                        _check_number_length(
+                            lexeme, discarded + match.start(),
+                            number_limit, number_limit_name
+                        )
                 send((discarded + match.start(), lexeme))
                 pos = match.end()
         else:
@@ -140,7 +246,7 @@ inf = float("inf")
 neg_inf = float("-inf")
 
 @utils.coroutine
-def parse_value(target, multivalue, use_float):
+def parse_value(target, multivalue, use_float, limits=None):
     """
     Parses results coming out of the Lexer into ijson events, which are sent to
     `target`. A stack keeps track of the type of object being parsed at the time
@@ -160,6 +266,10 @@ def parse_value(target, multivalue, use_float):
     send = target.send
     prev_pos, prev_symbol = None, None
     to_number = common.integer_or_float if use_float else common.integer_or_decimal
+    depth_limit, depth_limit_name = (None, 'max_depth')
+    if limits and 'max_depth' in limits:
+        depth_limit, depth_limit_name = limits['max_depth']
+    container_depth = 0
     while True:
 
         if prev_pos is None:
@@ -197,12 +307,19 @@ def parse_value(target, multivalue, use_float):
                 pop()
             # Array start
             elif symbol == '[':
+                new_depth = container_depth + 1
+                if depth_limit is not None and new_depth > depth_limit:
+                    raise common.JSONLimitError(
+                        depth_limit_name, pos, depth_limit, actual=new_depth
+                    )
+                container_depth = new_depth
                 send(('start_array', None))
                 pos, symbol = (yield)
                 if (pos, symbol) == EOF:
                     raise common.IncompleteJSONError('Incomplete JSON content')
                 if symbol == ']':
                     send(('end_array', None))
+                    container_depth -= 1
                     pop()
                 else:
                     prev_pos, prev_symbol = pos, symbol
@@ -210,12 +327,19 @@ def parse_value(target, multivalue, use_float):
                     push(_PARSE_VALUE)
             # Object start
             elif symbol == '{':
+                new_depth = container_depth + 1
+                if depth_limit is not None and new_depth > depth_limit:
+                    raise common.JSONLimitError(
+                        depth_limit_name, pos, depth_limit, actual=new_depth
+                    )
+                container_depth = new_depth
                 send(('start_map', None))
                 pos, symbol = (yield)
                 if (pos, symbol) == EOF:
                     raise common.IncompleteJSONError('Incomplete JSON content')
                 if symbol == '}':
                     send(('end_map', None))
+                    container_depth -= 1
                     pop()
                 else:
                     prev_pos, prev_symbol = pos, symbol
@@ -269,6 +393,7 @@ def parse_value(target, multivalue, use_float):
                 raise UnexpectedSymbol(symbol, pos)
             else:
                 send(('end_map', None))
+                container_depth -= 1
                 pop()
                 pop()
 
@@ -280,6 +405,7 @@ def parse_value(target, multivalue, use_float):
                 raise UnexpectedSymbol(symbol, pos)
             else:
                 send(('end_array', None))
+                container_depth -= 1
                 pop()
                 pop()
 
@@ -289,7 +415,8 @@ def parse_string(symbol):
 
 
 def basic_parse_basecoro(target, multiple_values=False, allow_comments=False,
-                         use_float=False):
+                         use_float=False, max_string_length=None,
+                         max_number_length=None, max_depth=None, **config):
     '''
     Iterator yielding unprefixed events.
 
@@ -299,7 +426,35 @@ def basic_parse_basecoro(target, multiple_values=False, allow_comments=False,
     '''
     if allow_comments:
         raise ValueError("Comments are not supported by the python backend")
-    return utf8_encoder(Lexer(parse_value(target, multiple_values, use_float)))
+
+    limits = common._resolve_resource_limits(config)
+    if config:
+        unexpected = next(iter(config))
+        raise TypeError(
+            "basic_parse_basecoro() got an unexpected keyword argument %r"
+            % (unexpected,)
+        )
+    for name, value in (
+        ('max_string_length', max_string_length),
+        ('max_number_length', max_number_length),
+        ('max_depth', max_depth),
+    ):
+        if value is not None:
+            value = common._validate_limit_value(name, value)
+            previous = limits.get(name)
+            if previous is not None and previous[0] != value:
+                raise ValueError(
+                    'Conflicting values for resource limit %s' % (name,)
+                )
+            limits[name] = (value, name)
+
+    return utf8_encoder(
+        Lexer(
+            parse_value(target, multiple_values, use_float, limits),
+            limits
+        )
+    )
 
 
-common.enrich_backend(globals(), c_comments=False)
+common.enrich_backend(globals(), c_comments=False, resource_limits=True,
+                      limits=True)

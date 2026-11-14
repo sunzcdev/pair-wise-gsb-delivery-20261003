@@ -407,6 +407,14 @@ to give users more fine-grained control over certain operations:
   controls whether C-style comments (e.g., ``/* a comment */``),
   which are not supported by the JSON standard,
   are allowed in the content or not.
+- The ``python`` backend supports the optional
+  ``max_string_length``, ``max_number_length`` and ``max_depth`` limits.
+  String lengths are counted in decoded characters,
+  number lengths in characters of the input token,
+  and the root container has depth one.
+  Limits are checked while tokens are accumulated across input chunks,
+  raising ``JSONLimitError`` with the limit name, position and value.
+  Other backends reject these options.
 - For functions taking a file-like object,
   an additional ``buf_size`` option (defaults to ``65536`` or 64KB)
   specifies the amount of bytes the library
@@ -524,6 +532,8 @@ It contains the following members:
   raising an ``IncompleteJSONError``.
 * ``int64``: when using ``use_float=True``,
     values greater than or equal to ``2^32`` are correctly returned.
+* ``resource_limits``: per-token string/number length and nesting depth
+  limits are supported.
 
 These capabilities are supported by all backends,
 with the following exceptions:
@@ -533,7 +543,8 @@ with the following exceptions:
   It also doesn't support ``int64``
   in platforms with a 32-bit C ``long`` type.
 
-* The ``python`` backend doesn't support ``c_comments``.
+* The ``python`` backend doesn't support ``c_comments``,
+  and it is the only backend supporting ``resource_limits``.
 
 
 Performance tips

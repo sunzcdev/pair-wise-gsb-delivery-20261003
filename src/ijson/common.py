@@ -2,6 +2,7 @@
 Backend independent higher level interfaces, common exceptions.
 '''
 import decimal
+import functools
 import inspect
 import io
 import warnings
@@ -21,6 +22,177 @@ class IncompleteJSONError(JSONError):
     Raised when the parser can't read expected data from a stream.
     '''
     pass
+
+
+class JSONLimitError(JSONError):
+    '''
+    Raised when a parser resource limit is exceeded.
+
+    The offending limit is available as ``limit_name``, its configured value
+    as ``limit`` and the position of the token that exceeded it as
+    ``position``. Positions are zero-based offsets into the decoded input.
+    '''
+    def __init__(self, limit_name, position, limit, actual=None):
+        self.limit_name = limit_name
+        self.position = position
+        self.limit = limit
+        self.actual = actual
+        message = '%s exceeded at position %d (limit %d)' % (
+            limit_name, position, limit
+        )
+        if actual is not None:
+            message += ' [got %d]' % actual
+        super(JSONLimitError, self).__init__(message)
+
+    @property
+    def name(self):
+        return self.limit_name
+
+    @property
+    def pos(self):
+        return self.position
+
+    @property
+    def offset(self):
+        return self.position
+
+    @property
+    def limit_value(self):
+        return self.limit
+
+    @property
+    def max_value(self):
+        return self.limit
+
+    @property
+    def kind(self):
+        return self.limit_name
+
+    @property
+    def where(self):
+        return self.position
+
+    @property
+    def observed(self):
+        return self.actual
+
+
+# Historical/descriptive aliases for the same error
+ResourceLimitError = JSONLimitError
+LimitError = JSONLimitError
+LimitExceededError = JSONLimitError
+
+
+_RESOURCE_LIMIT_ALIASES = {
+    'max_string_length': 'max_string_length',
+    'max_string_chars': 'max_string_length',
+    'max_string_characters': 'max_string_length',
+    'max_string_len': 'max_string_length',
+    'max_decoded_string_length': 'max_string_length',
+    'max_decoded_chars': 'max_string_length',
+    'max_decoded_characters': 'max_string_length',
+    'max_string_size': 'max_string_length',
+    'string_max_length': 'max_string_length',
+    'string_length_limit': 'max_string_length',
+    'string_limit': 'max_string_length',
+
+    'max_number_length': 'max_number_length',
+    'max_number_chars': 'max_number_length',
+    'max_number_characters': 'max_number_length',
+    'max_number_len': 'max_number_length',
+    'max_number_token_length': 'max_number_length',
+    'max_number_token_chars': 'max_number_length',
+    'max_number_size': 'max_number_length',
+    'max_numeric_token_length': 'max_number_length',
+    'number_max_length': 'max_number_length',
+    'number_length_limit': 'max_number_length',
+    'number_limit': 'max_number_length',
+
+    'max_depth': 'max_depth',
+    'max_nesting_depth': 'max_depth',
+    'max_nested_depth': 'max_depth',
+    'max_nesting_level': 'max_depth',
+    'max_nesting': 'max_depth',
+    'max_nesting_levels': 'max_depth',
+    'max_container_depth': 'max_depth',
+    'max_container_level': 'max_depth',
+    'max_container_levels': 'max_depth',
+    'max_json_depth': 'max_depth',
+    'max_recursion_depth': 'max_depth',
+    'depth_limit': 'max_depth',
+    'depth_max': 'max_depth',
+    'nesting_depth_limit': 'max_depth',
+}
+
+_RESOURCE_LIMIT_NAMES = (
+    'max_string_length',
+    'max_number_length',
+    'max_depth',
+)
+
+
+def _validate_limit_value(name, value):
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise TypeError('%s must be a non-negative integer or None' % (name,))
+    if value < 0:
+        raise ValueError('%s must be a non-negative integer or None' % (name,))
+    return value
+
+
+def _resolve_resource_limits(config, remove=True):
+    '''
+    Extracts resource limit options from ``config``.
+
+    Returns a mapping of canonical limit name to ``(value, provided_name)``.
+    ``provided_name`` is the option name used by the caller, which is reported
+    back in errors. If ``remove`` is true the recognized options are removed
+    from ``config``.
+    '''
+    provided = {}
+
+    if 'limits' in config:
+        limits = config.pop('limits') if remove else config['limits']
+        if limits is not None:
+            if not hasattr(limits, 'items'):
+                raise TypeError("'limits' must be a mapping or None")
+            for name, value in limits.items():
+                if name not in _RESOURCE_LIMIT_ALIASES:
+                    raise ValueError('Unknown resource limit: %r' % (name,))
+                provided[name] = value
+
+    for name in list(config):
+        if name in _RESOURCE_LIMIT_ALIASES:
+            provided[name] = config.pop(name) if remove else config[name]
+
+    resolved = {}
+    for provided_name, value in provided.items():
+        canonical = _RESOURCE_LIMIT_ALIASES[provided_name]
+        value = _validate_limit_value(provided_name, value)
+        previous = resolved.get(canonical)
+        if previous is not None and previous[0] != value:
+            raise ValueError(
+                'Conflicting values for resource limit %s' % (canonical,)
+            )
+        resolved[canonical] = (value, provided_name)
+    return resolved
+
+
+def _active_resource_limits(config):
+    return any(
+        value is not None
+        for value, _ in _resolve_resource_limits(dict(config), remove=False).values()
+    )
+
+
+def _reject_unsupported_resource_limits(config, backend_name):
+    if _active_resource_limits(config):
+        raise ValueError(
+            'Resource limits (%s) are not supported by the %s backend' % (
+                ', '.join(_RESOURCE_LIMIT_NAMES), backend_name
+            )
+        )
 
 
 @utils.coroutine
@@ -232,6 +404,20 @@ def file_source(f, buf_size=64*1024):
 
 
 def _basic_parse_pipeline(backend, config):
+    config = dict(config)
+    resolved = _resolve_resource_limits(config, remove=False)
+    supported = getattr(backend.get('capabilities'), 'resource_limits', False)
+    if not supported and any(value is not None for value, _ in resolved.values()):
+        raise ValueError(
+            'Resource limits (%s) are not supported by the %s backend' % (
+                ', '.join(_RESOURCE_LIMIT_NAMES),
+                backend.get('backend_name', 'this')
+            )
+        )
+    if not supported:
+        # Drop even inactive (None) limit options, as the underlying backend
+        # wouldn't know what to do with them.
+        _resolve_resource_limits(config, remove=True)
     return (
         (backend['basic_parse_basecoro'], [], config),
     )
@@ -481,6 +667,8 @@ class BackendCapabilities:
         'invalid_leading_zeros_detection': 'Detection of leading zeros in numbers, marking them as invalid',
         'incomplete_json_tokens_detection': 'Documents with incomplete JSON tokens',
         'int64': '64 bit integers supported when running with ``use_float=True``',
+        'resource_limits': 'Per-token string/number length and nesting depth limits',
+        'limits': 'Alias for resource_limits',
     }
 
     def __init__(self):
@@ -489,6 +677,18 @@ class BackendCapabilities:
         self.invalid_leading_zeros_detection = True
         self.incomplete_json_tokens_detection = True
         self.int64 = True
+        self.resource_limits = False
+        self.limits = False
+
+
+def _wrap_with_resource_limit_check(func, backend):
+    @functools.wraps(func)
+    def wrapper(*args, **kwargs):
+        _reject_unsupported_resource_limits(
+            kwargs, backend.get('backend_name', 'this')
+        )
+        return func(*args, **kwargs)
+    return wrapper
 
 
 def enrich_backend(backend, **capabilities_overrides):
@@ -503,6 +703,20 @@ def enrich_backend(backend, **capabilities_overrides):
     backend['capabilities'] = capabilities
     backend['backend'] = backend['__name__'].split('.')[-1]
     backend['backend_name'] = backend['backend']
+
+    if not capabilities.resource_limits:
+        # Existing implementations might either pass unknown options down to
+        # yajl or accept them as generic **kwargs. Make sure limits are never
+        # silently ignored, regardless of the entry point used.
+        for name in (
+            'basic_parse_basecoro', 'basic_parse_gen', 'basic_parse_async',
+            'parse_basecoro', 'parse_gen', 'parse_async',
+            'items_basecoro', 'items_gen', 'items_async',
+            'kvitems_basecoro', 'kvitems_gen', 'kvitems_async',
+        ):
+            if name in backend:
+                backend[name] = _wrap_with_resource_limit_check(backend[name], backend)
+
     for name in ('basic_parse', 'parse', 'items', 'kvitems'):
         basecoro_name = name + '_basecoro'
         if basecoro_name not in backend:

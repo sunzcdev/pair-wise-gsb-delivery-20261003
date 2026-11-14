@@ -2,6 +2,9 @@
 
 ## Development
 
+* The `python` backend supports optional `max_string_length`,
+  `max_number_length` and `max_depth` limits, enforced while tokens are
+  accumulated across chunks. Other backends reject these options explicitly.
 * Fixed handling of integers longer than `sys.get_int_max_str_digits()`:
   the `yajl2_c` backend no longer crashes on them, and all backends
   now raise the `ValueError` produced by `int()` (#188).
