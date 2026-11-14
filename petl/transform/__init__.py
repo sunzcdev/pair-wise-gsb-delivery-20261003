@@ -9,7 +9,7 @@ from petl.transform.headers import rename, setheader, extendheader, \
 
 from petl.transform.conversions import convert, convertall, replace, \
     replaceall, update, convertnumbers, format, formatall, interpolate, \
-    interpolateall
+    interpolateall, convertsplit
 
 from petl.transform.sorts import sort, mergesort, issorted
 

@@ -50,6 +50,7 @@ Converting values
 -----------------
 
 .. autofunction:: petl.transform.conversions.convert
+.. autofunction:: petl.transform.conversions.convertsplit
 .. autofunction:: petl.transform.conversions.convertall
 .. autofunction:: petl.transform.conversions.convertnumbers
 .. autofunction:: petl.transform.conversions.replace

@@ -1,6 +1,12 @@
 from __future__ import absolute_import, print_function, division
 
 
+import os
+import pickle
+import tempfile
+import weakref
+from collections import deque
+
 from petl.compat import next, integer_types, string_types, text_type
 
 
@@ -481,6 +487,464 @@ def iterfieldconvert(source, converters, failonerror, errorvalue, where,
                 yield transform_row(row)
             else:
                 yield row
+
+
+def convertsplit(table, *args, **kwargs):
+    """Convert values and split the rows into a success table and a
+    rejection table in a single pass over the source.
+
+    Unlike :func:`convert`, which silently replaces failed conversions with
+    ``None`` (or the given ``errorvalue``) and so mixes bad values together
+    with genuine empty values, ``convertsplit`` routes every row on which at
+    least one field conversion raises an exception into a separate rejection
+    table. Rows on which every conversion succeeds, including rows skipped by
+    a ``where`` predicate, are returned unchanged apart from the successful
+    conversions in the success table. E.g.::
+
+        >>> import petl as etl
+        >>> table1 = [['foo', 'bar'],
+        ...           ['a', '1'],
+        ...           ['b', 'x'],
+        ...           ['c', '2']]
+        >>> success, reject = etl.convertsplit(table1, 'bar', int)
+        >>> success
+        +-----+-----+
+        | foo | bar |
+        +=====+=====+
+        | 'a' |   1 |
+        +-----+-----+
+        | 'c' |   2 |
+        +-----+-----+
+        >>> reject
+        +--------+------------+----------+-----------------+
+        | rownum | row        | field    | error           |
+        +========+============+==========+=================+
+        |      2 | ('b', 'x') | ('bar',) | ('ValueError',) |
+        +--------+------------+----------+-----------------+
+
+    The source is traversed only once and each converter is called only once
+    per value, so sources that support a single iteration and converters with
+    side effects (e.g. counters) work correctly. The two returned tables may
+    be consumed in either order and interleaved; rows waiting for the slower
+    consumer are buffered in memory up to ``buffersize`` rows per table (the
+    default is 1000) and then spilled to pickled temporary files. The
+    temporary files and buffers are released by calling ``close()`` on either
+    returned table, or automatically once the tables and their underlying
+    split are garbage collected.
+
+    The success table has the same header as the source and contains the
+    fully converted row. The rejection table has the header
+    ``('rownum', 'row', 'field', 'error')`` where:
+
+    * ``rownum`` is the one-based data row number in the original source
+      (the header is not counted),
+    * ``row`` is the original, unconverted row,
+    * ``field`` is a tuple of the fields whose conversions failed,
+    * ``error`` is a tuple of the corresponding exception type names.
+
+    A row with several failing fields produces exactly one rejection record.
+
+    The conversion arguments are interpreted exactly as for :func:`convert`.
+    The ``where`` keyword argument behaves as for :func:`convert`: rows for
+    which the predicate returns false bypass every conversion and pass into
+    the success table unchanged. The ``failonerror`` and ``errorvalue``
+    arguments are not accepted, because failures are reported via the
+    rejection table.
+
+    """
+
+    buffersize = kwargs.pop('buffersize', 1000)
+    if 'failonerror' in kwargs or 'errorvalue' in kwargs:
+        raise ArgumentError(
+            'convertsplit does not accept "failonerror" or "errorvalue"; '
+            'failed conversions are reported in the rejection table'
+        )
+
+    converters = None
+    if len(args) == 0:
+        # no conversion specified, can be set afterwards via suffix notation
+        pass
+    elif len(args) == 1:
+        converters = args[0]
+    elif len(args) > 1:
+        converters = dict()
+        # assume first arg is field name or spec
+        field = args[0]
+        if len(args) == 2:
+            conv = args[1]
+        else:
+            conv = args[1:]
+        if isinstance(field, (list, tuple)):  # allow for multiple fields
+            for f in field:
+                converters[f] = conv
+        else:
+            converters[field] = conv
+
+    return _ConvertSplitter(table, converters=converters,
+                            buffersize=buffersize, **kwargs).tables()
+
+
+Table.convertsplit = convertsplit
+
+
+REJECT_HEADER = ('rownum', 'row', 'field', 'error')
+
+
+REJECT_KIND_SUCCESS = 'success'
+REJECT_KIND_REJECT = 'reject'
+
+
+class _ConvertSplitter(object):
+
+    def __init__(self, source, converters=None, buffersize=1000,
+                 where=None, pass_row=False, trusted=True):
+        self.source = source
+        if converters is None:
+            self.converters = dict()
+        elif isinstance(converters, dict):
+            self.converters = converters
+        elif isinstance(converters, (tuple, list)):
+            self.converters = dict([(i, v) for i, v in enumerate(converters)])
+        else:
+            raise ArgumentError('unexpected converters: %r' % converters)
+        self.buffersize = buffersize
+        self.where = where
+        self.pass_row = pass_row
+        self.trusted = trusted
+        self._driver = None
+        self.success = _SplitTableView(self, REJECT_KIND_SUCCESS)
+        self.reject = _SplitTableView(self, REJECT_KIND_REJECT)
+
+    def tables(self):
+        return self.success, self.reject
+
+    def get_driver(self):
+        # A driver owns one traversal of the source. Once it is exhausted and
+        # both branches have been consumed it is discarded, so re-iterating
+        # either table starts a fresh traversal (as every petl view does).
+        driver = self._driver
+        if driver is None or driver.closed:
+            driver = _ConvertSplitDriver(
+                self.source, self.converters, self.buffersize, self.where,
+                self.pass_row, self.trusted
+            )
+            self._driver = driver
+        return driver
+
+
+class _SplitTableView(Table):
+
+    def __init__(self, splitter, kind):
+        self.splitter = splitter
+        self.kind = kind
+
+    def __iter__(self):
+        driver = self.splitter.get_driver()
+        if self.kind == REJECT_KIND_SUCCESS:
+            if not driver._has_header:
+                return
+            yield tuple(driver.header)
+            queue = driver.success_queue
+        else:
+            yield REJECT_HEADER
+            queue = driver.reject_queue
+        queue.rewind()
+        while True:
+            item = queue.get()
+            if driver.producer_error is not None:
+                raise driver.producer_error
+            if item is _QUEUE_SENTINEL:
+                break
+            yield item
+
+    def close(self):
+        """Release any buffered rows and temporary files held for this
+        split."""
+
+        driver = self.splitter._driver
+        if driver is not None:
+            driver.close()
+
+
+class _QueueSentinel(object):
+    """Singleton marker for the end of a :class:`_SpillableQueue`.
+
+    A plain object would lose its identity when round-tripped through the
+    spill pickle file, so unpickling always restores the singleton.
+
+    """
+
+    _instance = None
+
+    def __new__(cls):
+        if cls._instance is None:
+            cls._instance = super(_QueueSentinel, cls).__new__(cls)
+        return cls._instance
+
+    def __reduce__(self):
+        return (_QueueSentinel, ())
+
+    def __repr__(self):
+        return '<end of queue>'
+
+
+_QUEUE_SENTINEL = _QueueSentinel()
+
+
+class _SpillableQueue(object):
+    """A FIFO queue that holds up to ``buffersize`` items in memory and
+    appends further items to a pickled temporary file.
+
+    The first ``buffersize`` items are kept in a frozen in-memory buffer.
+    Every later item (including the end sentinel) is appended to a pickled
+    temporary file. The reader walks the memory buffer first and then the
+    file; :meth:`rewind` moves both cursors back to the start so a branch can
+    be iterated several times within the life of the owning driver.
+
+    """
+
+    def __init__(self, buffersize):
+        self.buffersize = buffersize
+        self._memory = deque()
+        self._mem_cursor = 0
+        self._spill_path = None
+        self._spill_write = None
+        self._spill_read = None
+        self._closed = False
+        # total number of items stored in the spill file, including any
+        # end sentinel
+        self._spill_count = 0
+        # number of spill-file items already read in this pass
+        self._spill_cursor = 0
+
+    def put(self, item):
+        if self._spill_path is None and len(self._memory) < self.buffersize:
+            self._memory.append(item)
+            return
+        if self._spill_path is None:
+            spill = tempfile.NamedTemporaryFile(
+                mode='wb', suffix='.petl-split', delete=False
+            )
+            self._spill_path = spill.name
+            self._spill_write = spill
+        pickle.dump(item, self._spill_write,
+                    protocol=pickle.HIGHEST_PROTOCOL)
+        self._spill_count += 1
+
+    def get(self):
+        if self._mem_cursor < len(self._memory):
+            item = self._memory[self._mem_cursor]
+            self._mem_cursor += 1
+            return item
+        if self._spill_cursor >= self._spill_count:
+            return _QUEUE_SENTINEL
+        if self._spill_read is None:
+            self._spill_write.flush()
+            self._spill_read = open(self._spill_path, 'rb')
+        item = pickle.load(self._spill_read)
+        self._spill_cursor += 1
+        return item
+
+    def rewind(self):
+        """Move the read cursors back to the first item.
+
+        Petl views are expected to be re-iterable, and helpers such as
+        ``len()`` consume a full pass before the real iteration starts.
+        Re-reading the in-memory buffer is free; spilled items are re-read
+        from the temporary file from the beginning. Items appended after a
+        rewind become visible once the reader reaches their position.
+
+        """
+        if self._spill_read is not None:
+            try:
+                self._spill_read.close()
+            except Exception:
+                pass
+            self._spill_read = None
+        self._mem_cursor = 0
+        self._spill_cursor = 0
+
+    def close(self):
+        if self._closed:
+            return
+        self._closed = True
+        self._memory.clear()
+        self._mem_cursor = 0
+        self._spill_count = 0
+        self._spill_cursor = 0
+        for handle in (self._spill_write, self._spill_read):
+            if handle is not None:
+                try:
+                    handle.close()
+                except Exception:
+                    pass
+        self._spill_write = None
+        self._spill_read = None
+        if self._spill_path is not None:
+            try:
+                os.remove(self._spill_path)
+            except OSError:
+                pass
+            self._spill_path = None
+
+
+class _ConvertSplitDriver(object):
+
+    def __init__(self, source, converters, buffersize, where, pass_row,
+                 trusted):
+        self.source = source
+        self.converters = converters
+        self.buffersize = buffersize
+        self.where = where
+        self.pass_row = pass_row
+        self.trusted = trusted
+        self.success_queue = _SpillableQueue(buffersize)
+        self.reject_queue = _SpillableQueue(buffersize)
+        self.header = ()
+        self._has_header = False
+        self._producer_done = False
+        self.producer_error = None
+        self.closed = False
+        self._finalizer = None
+        self._run()
+
+    def _build_converter_functions(self, flds):
+        converter_functions = dict()
+        for k, c in self.converters.items():
+            # turn field names into row indices
+            if not isinstance(k, integer_types):
+                try:
+                    k = flds.index(k)
+                except ValueError:  # not in list
+                    raise FieldSelectionError(k)
+            assert isinstance(k, int), 'expected integer, found %r' % k
+
+            # is converter a function?
+            if callable(c):
+                converter_functions[k] = c
+
+            # is converter a method name?
+            elif isinstance(c, string_types):
+                converter_functions[k] = methodcaller(c)
+
+            # is converter a method name with arguments?
+            elif isinstance(c, (tuple, list)) and isinstance(c[0],
+                                                             string_types):
+                methnm = c[0]
+                methargs = c[1:]
+                converter_functions[k] = methodcaller(methnm, *methargs)
+
+            # is converter a dictionary?
+            elif isinstance(c, dict):
+                converter_functions[k] = dictconverter(c)
+
+            # is it something else?
+            elif c is None:
+                pass  # ignore
+            else:
+                raise ArgumentError(
+                    'unexpected converter specification on field %r: %r'
+                    % (k, c)
+                )
+        return converter_functions
+
+    def _run(self):
+        # Normalise the source once and evaluate every converter exactly once
+        # per value, routing each resulting row to exactly one queue.
+        it = iter(self.source)
+        try:
+            hdr = next(it)
+        except StopIteration:
+            self.header = ()
+            self._has_header = False
+            self._finish()
+            return
+        flds = list(map(text_type, hdr))
+        self.header = tuple(hdr)
+        self._has_header = True
+
+        converter_functions = self._build_converter_functions(flds)
+
+        def attempt(i, v, row):
+            if i not in converter_functions:
+                return v, None
+            try:
+                if self.pass_row:
+                    return converter_functions[i](v, row), None
+                return converter_functions[i](v), None
+            except Exception as e:
+                return None, e
+
+        where = self.where
+        if isinstance(where, string_types):
+            where = expr(where, trusted=self.trusted)
+        elif where is not None:
+            assert callable(where), 'expected callable for "where" ' \
+                                    'argument, found %r' % where
+
+        use_records = self.pass_row or where is not None
+
+        try:
+            for rownum, raw_row in enumerate(it, start=1):
+                row = tuple(raw_row)
+                record = Record(row, flds) if use_records else row
+
+                if where is not None and not where(record):
+                    # rows that do not match the predicate are untouched
+                    self.success_queue.put(row)
+                    continue
+
+                converted = list(row)
+                failed_fields = []
+                failed_errors = []
+                for i, v in enumerate(row):
+                    new_value, error = attempt(i, v, record)
+                    if error is None:
+                        converted[i] = new_value
+                    else:
+                        failed_fields.append(flds[i] if i < len(flds) else i)
+                        failed_errors.append(type(error).__name__)
+
+                if failed_errors:
+                    self.reject_queue.put(
+                        (rownum, row, tuple(failed_fields),
+                         tuple(failed_errors))
+                    )
+                else:
+                    self.success_queue.put(tuple(converted))
+        except BaseException as error:
+            # remember the failure so either consumer sees it, but make sure
+            # buffered rows and temp files do not leak meanwhile
+            self.producer_error = error
+            self._finish()
+            return
+
+        self._finish()
+
+    def _finish(self):
+        self._producer_done = True
+        self.success_queue.put(_QUEUE_SENTINEL)
+        self.reject_queue.put(_QUEUE_SENTINEL)
+        # last resort cleanup if the caller never iterates either table;
+        # reference the queues rather than the driver so the finalizer does
+        # not keep the driver alive through a bound-method reference cycle
+        self._finalizer = weakref.finalize(
+            self, _finalize_split_queues,
+            self.success_queue, self.reject_queue
+        )
+
+    def close(self):
+        if self.closed:
+            return
+        self.closed = True
+        if self._finalizer is not None:
+            self._finalizer.detach()
+        _finalize_split_queues(self.success_queue, self.reject_queue)
+
+
+def _finalize_split_queues(success_queue, reject_queue):
+    success_queue.close()
+    reject_queue.close()
 
 
 def methodcaller(nm, *args):
