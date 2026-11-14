@@ -543,6 +543,7 @@ def read_record(
             for alias in f.get("aliases", []):
                 aliases_field_dict[alias] = f
 
+        strict_skip = options.get("strict_skip")
         for field in writer_schema["fields"]:
             readers_field = readers_field_dict.get(
                 field["name"],
@@ -550,16 +551,39 @@ def read_record(
             )
             if readers_field:
                 readers_field_name = readers_field["name"]
-                record[readers_field_name] = read_data(
+                if strict_skip:
+                    # Track the path of the fields being read so that a
+                    # truncation while skipping a nested field further down
+                    # can be reported with the full field path.
+                    path_stack = options.setdefault("_skip_path_stack", [])
+                    path_stack.append(field["name"])
+                    try:
+                        record[readers_field_name] = read_data(
+                            decoder,
+                            field["type"],
+                            named_schemas,
+                            readers_field["type"],
+                            options,
+                        )
+                    finally:
+                        path_stack.pop()
+                else:
+                    record[readers_field_name] = read_data(
+                        decoder,
+                        field["type"],
+                        named_schemas,
+                        readers_field["type"],
+                        options,
+                    )
+                del readers_field_dict[readers_field_name]
+            else:
+                skip_data(
                     decoder,
                     field["type"],
                     named_schemas,
-                    readers_field["type"],
                     options,
+                    path=(field["name"],),
                 )
-                del readers_field_dict[readers_field_name]
-            else:
-                skip_data(decoder, field["type"], named_schemas)
 
         # fill in default values
         for f_name, field in readers_field_dict.items():
@@ -616,6 +640,208 @@ SKIPS = {
     "error": skip_record,
     "request": skip_record,
 }
+
+
+class StrictSkipTruncationError(EOFError):
+    """Raised when the input ends in the middle of a field being skipped.
+
+    The message always contains the path of the field that was being skipped
+    when the truncation was detected.
+    """
+
+
+def _format_skip_path(path):
+    """Format a skip path (tuple of field names / subscripts) for messages."""
+    if not path:
+        return "<unknown>"
+    parts = []
+    for part in path:
+        if part.startswith("[") and parts:
+            parts[-1] += part
+        else:
+            parts.append(part)
+    return ".".join(parts)
+
+
+def _strict_skip_block_bytes(decoder, size, path):
+    """Skip a collection block declared to be ``size`` bytes long.
+
+    The byte boundary of the block is checked: after the skip the decoder
+    must have advanced by exactly ``size`` bytes. Truncated input raises
+    :class:`StrictSkipTruncationError` including the field path.
+    """
+    fo = decoder.fo
+    seekable = getattr(fo, "seekable", None)
+    if seekable is not None and seekable():
+        start = fo.tell()
+        try:
+            decoder.skip_exact(size)
+        except EOFError as exc:
+            raise StrictSkipTruncationError(
+                f"Truncated data while skipping field "
+                f"'{_format_skip_path(path)}': {exc}"
+            ) from exc
+        end = fo.tell()
+        if end - start != size:
+            raise ValueError(
+                f"Block boundary mismatch while skipping field "
+                f"'{_format_skip_path(path)}': expected to advance {size} "
+                f"bytes, advanced {end - start}"
+            )
+    else:
+        try:
+            decoder.skip_exact(size)
+        except EOFError as exc:
+            raise StrictSkipTruncationError(
+                f"Truncated data while skipping field "
+                f"'{_format_skip_path(path)}': {exc}"
+            ) from exc
+
+
+def _strict_skip_bytes(decoder, writer_schema, named_schemas, path):
+    size = decoder.read_long()
+    if size < 0:
+        raise ValueError(
+            f"Negative bytes length {size} while skipping field "
+            f"'{_format_skip_path(path)}'"
+        )
+    _strict_skip_block_bytes(decoder, size, path)
+
+
+def _strict_skip_fixed(decoder, writer_schema, named_schemas, path):
+    _strict_skip_block_bytes(decoder, writer_schema["size"], path)
+
+
+def _strict_skip_array(decoder, writer_schema, named_schemas, path):
+    # Block counts and sizes are kept in local variables so that skipping
+    # nested collections (or unions containing collections) cannot clobber
+    # the state of an enclosing level.
+    block_count = decoder.read_long()
+    while block_count != 0:
+        if block_count < 0:
+            block_count = -block_count
+            block_size = decoder.read_long()
+            if block_size < 0:
+                raise ValueError(
+                    f"Negative block byte size {block_size} while skipping "
+                    f"field '{_format_skip_path(path)}'"
+                )
+            # The writer declared the byte size of this block, so the whole
+            # block can be jumped over without constructing the items.
+            _strict_skip_block_bytes(decoder, block_size, path)
+        else:
+            for index in range(block_count):
+                _strict_skip_data(
+                    decoder,
+                    writer_schema["items"],
+                    named_schemas,
+                    path + (f"[{index}]",),
+                )
+        block_count = decoder.read_long()
+
+
+def _strict_skip_map(decoder, writer_schema, named_schemas, path):
+    block_count = decoder.read_long()
+    while block_count != 0:
+        if block_count < 0:
+            block_count = -block_count
+            block_size = decoder.read_long()
+            if block_size < 0:
+                raise ValueError(
+                    f"Negative block byte size {block_size} while skipping "
+                    f"field '{_format_skip_path(path)}'"
+                )
+            _strict_skip_block_bytes(decoder, block_size, path)
+        else:
+            for _ in range(block_count):
+                key = decoder.read_utf8()
+                _strict_skip_data(
+                    decoder,
+                    writer_schema["values"],
+                    named_schemas,
+                    path + (f"[{key!r}]",),
+                )
+        block_count = decoder.read_long()
+
+
+def _strict_skip_union(decoder, writer_schema, named_schemas, path):
+    index = decoder.read_index()
+    if index < 0 or index >= len(writer_schema):
+        raise ValueError(
+            f"Union index {index} out of range while skipping field "
+            f"'{_format_skip_path(path)}'"
+        )
+    _strict_skip_data(decoder, writer_schema[index], named_schemas, path)
+
+
+def _strict_skip_record(decoder, writer_schema, named_schemas, path):
+    for field in writer_schema["fields"]:
+        _strict_skip_data(
+            decoder,
+            field["type"],
+            named_schemas,
+            path + (field["name"],),
+        )
+
+
+def _strict_skip_passthrough(read_method):
+    """Adapt a small fixed-size decoder read method to a strict skip fn."""
+
+    def skip(decoder, writer_schema, named_schemas, path):
+        read_method(decoder)
+
+    return skip
+
+
+STRICT_SKIPS = {
+    "null": _strict_skip_passthrough(lambda decoder: decoder.read_null()),
+    "boolean": _strict_skip_passthrough(lambda decoder: decoder.read_boolean()),
+    "int": _strict_skip_passthrough(lambda decoder: decoder.read_int()),
+    "long": _strict_skip_passthrough(lambda decoder: decoder.read_long()),
+    "float": _strict_skip_passthrough(lambda decoder: decoder.read_float()),
+    "double": _strict_skip_passthrough(lambda decoder: decoder.read_double()),
+    "enum": _strict_skip_passthrough(lambda decoder: decoder.read_enum()),
+    "string": _strict_skip_bytes,
+    "bytes": _strict_skip_bytes,
+    "fixed": _strict_skip_fixed,
+    "array": _strict_skip_array,
+    "map": _strict_skip_map,
+    "union": _strict_skip_union,
+    "error_union": _strict_skip_union,
+    "record": _strict_skip_record,
+    "error": _strict_skip_record,
+    "request": _strict_skip_record,
+}
+
+
+def _strict_skip_data(decoder, writer_schema, named_schemas, path):
+    """Skip data according to ``writer_schema`` validating the input.
+
+    Unlike :func:`skip_data`, this never constructs the skipped values:
+    collection blocks that declare their byte size are jumped over directly
+    and their byte boundaries are verified. Any truncation is reported with
+    the path of the field being skipped.
+    """
+    record_type = extract_record_type(writer_schema)
+
+    skip_fn = STRICT_SKIPS.get(record_type)
+    try:
+        if skip_fn:
+            skip_fn(decoder, writer_schema, named_schemas, path)
+        else:
+            _strict_skip_data(
+                decoder,
+                named_schemas["writer"][record_type],
+                named_schemas,
+                path,
+            )
+    except StrictSkipTruncationError:
+        raise
+    except EOFError as exc:
+        raise StrictSkipTruncationError(
+            f"Truncated data while skipping field "
+            f"'{_format_skip_path(path)}': {exc}"
+        ) from exc
 
 
 def maybe_promote(data, writer_type, reader_type):
@@ -684,7 +910,21 @@ def read_data(
         )
 
 
-def skip_data(decoder, writer_schema, named_schemas):
+def skip_data(decoder, writer_schema, named_schemas, options=None, path=None):
+    """Skip data on the decoder according to the writer schema.
+
+    When the ``strict_skip`` option is enabled, the skip is validated:
+    collection blocks that declare a byte size are jumped over directly and
+    their byte boundaries are checked, and truncated input is reported with
+    the path of the field being skipped. Otherwise the default fast path is
+    used.
+    """
+    if options and options.get("strict_skip"):
+        path_stack = options.get("_skip_path_stack") or ()
+        full_path = tuple(path_stack) + tuple(path or ())
+        _strict_skip_data(decoder, writer_schema, named_schemas, full_path)
+        return
+
     record_type = extract_record_type(writer_schema)
 
     reader_fn = SKIPS.get(record_type)
@@ -1050,6 +1290,13 @@ class reader(file_reader[AvroMessage]):
         Default `strict`. Should be set to a valid string that can be used in
         the errors argument of the string decode() function. Examples include
         `replace` and `ignore`
+    strict_skip
+        If true, fields that are skipped because they are not present in the
+        reader schema are validated while being skipped. Collection blocks
+        that declare their byte size are jumped over directly and their byte
+        boundaries are checked; truncated input raises an error that includes
+        the path of the field being skipped. If false (the default), skipped
+        fields are read with the usual fast path.
 
 
     Example::
@@ -1098,6 +1345,7 @@ class reader(file_reader[AvroMessage]):
         handle_unicode_errors: str = "strict",
         return_named_type: bool = False,
         return_named_type_override: bool = False,
+        strict_skip: bool = False,
     ):
         options = {
             "return_record_name": return_record_name,
@@ -1105,6 +1353,7 @@ class reader(file_reader[AvroMessage]):
             "handle_unicode_errors": handle_unicode_errors,
             "return_named_type": return_named_type,
             "return_named_type_override": return_named_type_override,
+            "strict_skip": strict_skip,
         }
         super().__init__(fo, reader_schema, options)
 
@@ -1177,6 +1426,13 @@ class block_reader(file_reader[Block]):
         Default `strict`. Should be set to a valid string that can be used in
         the errors argument of the string decode() function. Examples include
         `replace` and `ignore`
+    strict_skip
+        If true, fields that are skipped because they are not present in the
+        reader schema are validated while being skipped. Collection blocks
+        that declare their byte size are jumped over directly and their byte
+        boundaries are checked; truncated input raises an error that includes
+        the path of the field being skipped. If false (the default), skipped
+        fields are read with the usual fast path.
 
 
     Example::
@@ -1213,6 +1469,7 @@ class block_reader(file_reader[Block]):
         handle_unicode_errors: str = "strict",
         return_named_type: bool = False,
         return_named_type_override: bool = False,
+        strict_skip: bool = False,
     ):
         options = {
             "return_record_name": return_record_name,
@@ -1220,6 +1477,7 @@ class block_reader(file_reader[Block]):
             "handle_unicode_errors": handle_unicode_errors,
             "return_named_type": return_named_type,
             "return_named_type_override": return_named_type_override,
+            "strict_skip": strict_skip,
         }
         super().__init__(fo, reader_schema, options)
 
@@ -1245,6 +1503,7 @@ def schemaless_reader(
     handle_unicode_errors: str = "strict",
     return_named_type: bool = False,
     return_named_type_override: bool = False,
+    strict_skip: bool = False,
 ) -> AvroMessage:
     """Reads a single record written using the
     :meth:`~fastavro._write_py.schemaless_writer`
@@ -1283,6 +1542,13 @@ def schemaless_reader(
         Default `strict`. Should be set to a valid string that can be used in
         the errors argument of the string decode() function. Examples include
         `replace` and `ignore`
+    strict_skip
+        If true, fields that are skipped because they are not present in the
+        reader schema are validated while being skipped. Collection blocks
+        that declare their byte size are jumped over directly and their byte
+        boundaries are checked; truncated input raises an error that includes
+        the path of the field being skipped. If false (the default), skipped
+        fields are read with the usual fast path.
 
 
     Example::
@@ -1311,6 +1577,7 @@ def schemaless_reader(
         "handle_unicode_errors": handle_unicode_errors,
         "return_named_type": return_named_type,
         "return_named_type_override": return_named_type_override,
+        "strict_skip": strict_skip,
     }
 
     return read_data(

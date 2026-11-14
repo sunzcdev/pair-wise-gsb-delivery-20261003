@@ -1147,7 +1147,12 @@ class reader(file_reader):
         handle_unicode_errors="strict",
         return_named_type=False,
         return_named_type_override=False,
+        strict_skip=False,
     ):
+        if strict_skip:
+            raise NotImplementedError(
+                "strict_skip is only supported by the pure python backend"
+            )
         options = {
             "return_record_name": return_record_name,
             "return_record_name_override": return_record_name_override,
@@ -1176,7 +1181,12 @@ class block_reader(file_reader):
         handle_unicode_errors="strict",
         return_named_type=False,
         return_named_type_override=False,
+        strict_skip=False,
     ):
+        if strict_skip:
+            raise NotImplementedError(
+                "strict_skip is only supported by the pure python backend"
+            )
         options = {
             "return_record_name": return_record_name,
             "return_record_name_override": return_record_name_override,
@@ -1204,7 +1214,12 @@ cpdef schemaless_reader(
     handle_unicode_errors="strict",
     return_named_type=False,
     return_named_type_override=False,
+    strict_skip=False,
 ):
+    if strict_skip:
+        raise NotImplementedError(
+            "strict_skip is only supported by the pure python backend"
+        )
     if writer_schema == reader_schema:
         # No need for the reader schema if they are the same
         reader_schema = None

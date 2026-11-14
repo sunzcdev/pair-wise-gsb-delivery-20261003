@@ -1,5 +1,10 @@
 from struct import unpack
 
+# Maximum number of bytes discarded in a single read() call when skipping
+# data on a non-seekable (sequential only) stream. Skipping must never
+# require buffering the whole skipped region in memory.
+SKIP_BUFFER_SIZE = 8192
+
 
 class BinaryDecoder:
     """Decoder for the avro binary format.
@@ -101,6 +106,45 @@ class BinaryDecoder:
         if len(out) < size:
             raise EOFError(f"Expected {size} bytes, read {len(out)}")
         return out
+
+    def skip_exact(self, size):
+        """Skip exactly ``size`` bytes of input without materializing them.
+
+        If the underlying stream is seekable, the skip is performed by
+        seeking and the end position is verified against the stream length so
+        that truncated input is detected instead of silently seeking past the
+        end. On sequential (non-seekable) streams the bytes are discarded
+        using a bounded buffer of at most ``SKIP_BUFFER_SIZE`` bytes, so
+        arbitrarily large regions can be skipped in constant memory.
+
+        Raises EOFError if the stream ends before ``size`` bytes have been
+        skipped.
+        """
+        if size < 0:
+            raise ValueError(f"cannot skip a negative number of bytes: {size}")
+        fo = self.fo
+        seekable = getattr(fo, "seekable", None)
+        if seekable is not None and seekable():
+            start = fo.tell()
+            fo.seek(0, 2)
+            end = fo.tell()
+            remaining = end - start
+            if size > remaining:
+                fo.seek(end)
+                raise EOFError(
+                    f"Expected to skip {size} bytes, only {remaining} remain"
+                )
+            fo.seek(start + size)
+        else:
+            remaining = size
+            while remaining > 0:
+                chunk = fo.read(min(remaining, SKIP_BUFFER_SIZE))
+                if not chunk:
+                    raise EOFError(
+                        f"Expected to skip {size} bytes, "
+                        f"stream ended with {remaining} bytes left"
+                    )
+                remaining -= len(chunk)
 
     def read_enum(self):
         """An enum is encoded by a int, representing the zero-based position of the
