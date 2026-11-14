@@ -8,6 +8,13 @@ __email__ = "info@scrapy.org"
 __version__ = "1.12.1"
 __all__ = [
     "AbsoluteXPathWarning",
+    "Field",
+    "FieldDefinitionError",
+    "FieldProblem",
+    "FieldResult",
+    "ProblemCode",
+    "RecordResult",
+    "RecordSchema",
     "Selector",
     "SelectorList",
     "css2xpath",
@@ -16,6 +23,15 @@ __all__ = [
 
 from parsel import xpathfuncs
 from parsel.csstranslator import css2xpath
+from parsel.extraction import (
+    Field,
+    FieldDefinitionError,
+    FieldProblem,
+    FieldResult,
+    ProblemCode,
+    RecordResult,
+    RecordSchema,
+)
 from parsel.selector import AbsoluteXPathWarning, Selector, SelectorList
 
 xpathfuncs.setup()

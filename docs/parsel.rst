@@ -10,6 +10,15 @@ parsel.csstranslator
     :show-inheritance:
 
 
+parsel.extraction
+-----------------
+
+.. automodule:: parsel.extraction
+    :members:
+    :undoc-members:
+    :show-inheritance:
+
+
 .. _topics-selectors-ref:
 
 parsel.selector

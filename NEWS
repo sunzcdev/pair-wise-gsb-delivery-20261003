@@ -3,6 +3,18 @@
 History
 -------
 
+(unreleased)
+~~~~~~~~~~~~
+
+* Added a declarative record extraction interface, ``parsel.RecordSchema``
+  and ``parsel.Field``: each field declares a CSS, XPath or JMESPath query,
+  a single-value or multi-value cardinality and a default policy, and
+  extraction results report the field values, in field definition order,
+  along with field-level problems that distinguish missing values, empty
+  strings, JSON ``null`` values, unexpected multiple matches and run-time
+  query errors. Field queries are validated when the schema is defined,
+  before any record is scanned.
+
 1.12.1 (2026-09-28)
 ~~~~~~~~~~~~~~~~~~~
 

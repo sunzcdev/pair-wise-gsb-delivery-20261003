@@ -1303,6 +1303,67 @@ get right (or legible) without a variable reference::
     '<p>He said: "I don\'t know why, but I like mixing single and double quotes!"</p>'
 
 
+.. _declarative-extraction:
+
+Extracting records declaratively
+--------------------------------
+
+When scraping a page you usually extract the same set of fields from every
+record node, and each field needs its own handling of missing or multiple
+values. :class:`~parsel.extraction.RecordSchema` lets you declare those
+fields once and extract them, with per-field problem reporting, from any
+selector used as the record context:
+
+::
+
+    >>> from parsel import Field, RecordSchema, Selector
+    >>> schema = RecordSchema(
+    ...     {
+    ...         "name": Field(css="h1::text"),
+    ...         "price": Field(css="span.price::text", default="0"),
+    ...         "tags": Field(css="a.tag::text", many=True),
+    ...     }
+    ... )
+
+Each :class:`~parsel.extraction.Field` takes exactly one query (``css``,
+``xpath`` or ``jmespath``), a cardinality (``many=False`` for a single
+value, ``many=True`` for a list) and an optional ``default`` used as a
+fallback value. Queries are validated when the field is defined, so an
+invalid CSS, XPath or JMESPath expression raises
+:class:`~parsel.extraction.FieldDefinitionError` before any record is
+scanned.
+
+Extracting a schema from a selector returns a
+:class:`~parsel.extraction.RecordResult` with the field values, in field
+definition order, and the field-level problems found:
+
+::
+
+    >>> html = "<h1>Example</h1><a class='tag'>news</a><a class='tag'>docs</a>"
+    >>> result = schema.extract(Selector(text=html))
+    >>> result.values
+    {'name': 'Example', 'price': '0', 'tags': ['news', 'docs']}
+    >>> result.problems
+    {'price': [FieldProblem(field='price', code='missing', message="css query 'span.price::text' matched no node")]}
+    >>> result.ok
+    False
+
+Problems distinguish the different ways a field can go wrong, through the
+codes of :class:`~parsel.extraction.ProblemCode`:
+
+-   ``"missing"``: the query matched no node.
+-   ``"empty"``: a matched node serialized to an empty string.
+-   ``"null"``: a matched node holds a JSON ``null``.
+-   ``"multiple"``: a single-value field matched more than one node. The
+    first match is *not* silently kept; the default policy fallback is used
+    as the value instead.
+-   ``"error"``: the query failed at run time. By default
+    (``on_error="collect"``) such a failure is isolated to its field and
+    recorded as a problem; pass ``on_error="raise"`` to
+    :class:`~parsel.extraction.RecordSchema` to propagate the exception
+    instead.
+
+
 Converting CSS to XPath
 -----------------------
 
