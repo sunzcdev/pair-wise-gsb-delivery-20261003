@@ -11,6 +11,7 @@ from sqlglot.dialects.dialect import (
     regexp_capture_group_count,
 )
 from sqlglot.helper import seq_get, split_num_words
+from sqlglot.source_map import SOURCE_META_KEY
 from sqlglot.tokens import TokenType
 
 if t.TYPE_CHECKING:
@@ -441,16 +442,21 @@ class BigQueryParser(parser.Parser):
 
                 table_name += self._find_sql(start, self._prev)
 
-            this = exp.Identifier(this=table_name, quoted=this.args.get("quoted")).update_positions(
-                this
+            source = this
+            this = (
+                exp.Identifier(this=table_name, quoted=source.args.get("quoted"))
+                .update_positions(source)
             )
+            self._track_source(this, source)
         elif isinstance(this, exp.Literal):
             table_name = this.name
 
             if self._is_connected() and self._parse_var(any_token=True):
                 table_name += self._prev.text
 
-            this = exp.Identifier(this=table_name, quoted=True).update_positions(this)
+            source = this
+            this = exp.Identifier(this=table_name, quoted=True).update_positions(source)
+            self._track_source(this, source)
 
         return this
 
@@ -474,16 +480,22 @@ class BigQueryParser(parser.Parser):
                 previous_db = table.args["db"]
                 parts = table.db.split(".")
                 if len(parts) == 2 and not table.args["db"].quoted:
-                    table.set(
-                        "catalog", exp.Identifier(this=parts[0]).update_positions(previous_db)
-                    )
-                    table.set("db", exp.Identifier(this=parts[1]).update_positions(previous_db))
+                    catalog = exp.Identifier(this=parts[0]).update_positions(previous_db)
+                    db = exp.Identifier(this=parts[1]).update_positions(previous_db)
+                    self._track_source(catalog, previous_db)
+                    self._track_source(db, previous_db)
+                    table.set("catalog", catalog)
+                    table.set("db", db)
             else:
                 previous_this = table.this
                 parts = table.name.split(".")
                 if len(parts) == 2 and not table.this.quoted:
-                    table.set("db", exp.Identifier(this=parts[0]).update_positions(previous_this))
-                    table.set("this", exp.Identifier(this=parts[1]).update_positions(previous_this))
+                    db = exp.Identifier(this=parts[0]).update_positions(previous_this)
+                    this_id = exp.Identifier(this=parts[1]).update_positions(previous_this)
+                    self._track_source(db, previous_this)
+                    self._track_source(this_id, previous_this)
+                    table.set("db", db)
+                    table.set("this", this_id)
 
         if isinstance(table.this, exp.Identifier) and any("." in p.name for p in table.parts):
             alias = table.this
@@ -495,6 +507,7 @@ class BigQueryParser(parser.Parser):
             for part in (catalog, db, this_id):
                 if part:
                     part.update_positions(table.this)
+                    self._track_source(part, table.this)
 
             this: exp.Expr | None = this_id
             if rest and this:
@@ -535,6 +548,10 @@ class BigQueryParser(parser.Parser):
                 start=table_parts[-2].meta_get("start"),
                 end=table_parts[-1].meta_get("end"),
             )
+            start = table_parts[-2].meta_get("start")
+            end = table_parts[-1].meta_get("end")
+            if self.track_sources and start is not None:
+                new_this.meta[SOURCE_META_KEY] = (start, end + 1)
             table.set("this", new_this)
             table.set("db", seq_get(table_parts, -3))
             table.set("catalog", seq_get(table_parts, -4))

@@ -52,6 +52,13 @@ from sqlglot.expressions import (
 from sqlglot.generator import Generator as Generator
 from sqlglot.parser import Parser as Parser
 from sqlglot.schema import MappingSchema as MappingSchema, Schema as Schema
+from sqlglot.source_map import (
+    SourceMap as SourceMap,
+    SourceMapKind as SourceMapKind,
+    SourceRange as SourceRange,
+    build_source_map as build_source_map,
+    source_map as get_source_map,
+)
 from sqlglot.tokens import Token as Token, Tokenizer as Tokenizer, TokenType as TokenType
 
 if t.TYPE_CHECKING:

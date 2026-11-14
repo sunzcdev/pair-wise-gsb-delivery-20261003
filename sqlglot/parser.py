@@ -22,6 +22,7 @@ from sqlglot.errors import (
 from sqlglot.expressions import apply_index_offset
 from sqlglot.helper import ensure_list, i64, seq_get
 from sqlglot.optimizer.scope import find_in_scope
+from sqlglot.source_map import SOURCE_META_KEY
 from sqlglot.time import format_time
 from sqlglot.tokens import Token, Tokenizer, TokenType
 from sqlglot.trie import TrieResult, in_trie, new_trie
@@ -382,6 +383,7 @@ class Parser:
         "error_message_context",
         "max_errors",
         "max_nodes",
+        "track_sources",
         "dialect",
         "sql",
         "errors",
@@ -2033,12 +2035,14 @@ class Parser:
         error_message_context: int = 100,
         max_errors: int = 3,
         max_nodes: int = -1,
+        track_sources: bool = False,
         dialect: DialectType = None,
     ):
         self.error_level: ErrorLevel = error_level or ErrorLevel.IMMEDIATE
         self.error_message_context: int = error_message_context
         self.max_errors: int = max_errors
         self.max_nodes: int = max_nodes
+        self.track_sources: bool = track_sources
         self.dialect: t.Any = _resolve_dialect(dialect)
         self.sql: str = ""
         self.errors: list[ParseError] = []
@@ -2068,6 +2072,27 @@ class Parser:
         self._chunks = []
         self._chunk_index = 0
         self._node_count = 0
+
+    def _track_source(self, expression: exp.Expr, token: Token | exp.Expr) -> None:
+        """
+        Records the originating source range of a parsed node when source tracking is on.
+
+        The range is stored under a dedicated meta key, separate from the position keys, so
+        nodes synthesized later (even ones that copy an existing node's position) never
+        inherit a source they don't have.
+        """
+        if not self.track_sources:
+            return
+
+        if isinstance(token, Token):
+            start, end = token.start, token.end + 1
+        else:
+            other_meta = token._meta
+            if other_meta is None or "start" not in other_meta:
+                return
+            start, end = other_meta["start"], other_meta["end"] + 1
+
+        expression.meta[SOURCE_META_KEY] = (start, end)
 
     def _advance(self, times: i64 = 1) -> None:
         index = self._index + times
@@ -2282,6 +2307,7 @@ class Parser:
     ) -> E:
         if token:
             instance.update_positions(token)
+            self._track_source(instance, token)
         instance.add_comments(comments) if comments else self._add_comments(instance)
         if not instance.is_primitive:
             instance = self.validate_expression(instance)
@@ -7530,7 +7556,9 @@ class Parser:
             if self._is_connected() and self._parse_var(any_token=True):
                 name += self._prev.text
 
-            field = exp.Identifier(this=name, quoted=True).update_positions(field)
+            source = field
+            field = exp.Identifier(this=name, quoted=True).update_positions(source)
+            self._track_source(field, source)
 
         return field
 
@@ -7678,10 +7706,12 @@ class Parser:
             else:
                 if token_type == TokenType.IDENTIFIER:
                     this = exp.Identifier(this=this, quoted=True).update_positions(token)
+                    self._track_source(this, token)
 
                 result = self.expression(exp.Anonymous(this=this, expressions=args))
 
             result = result.update_positions(token)
+            self._track_source(result, token)
 
         if isinstance(result, exp.Expr):
             result.add_comments(comments)
@@ -9244,6 +9274,7 @@ class Parser:
             return None
         output = exp.to_identifier(self._prev.text, quoted=True)
         output.update_positions(self._prev)
+        self._track_source(output, self._prev)
         return output
 
     def _parse_number(self) -> exp.Expr | None:
@@ -10514,7 +10545,7 @@ class Parser:
             # ILIKE without a string pattern is not a star filter, e.g. `* ILIKE (foo)`
             self._retreat(index)
 
-        return self.expression(
+        star = self.expression(
             exp.Star(
                 ilike=ilike,
                 except_=self._parse_star_op("EXCEPT", "EXCLUDE"),
@@ -10522,6 +10553,8 @@ class Parser:
                 rename=self._parse_star_op("RENAME"),
             )
         ).update_positions(star_token)
+        self._track_source(star, star_token)
+        return star
 
     def _parse_grant_privilege(self) -> exp.GrantPrivilege | None:
         privilege_parts = []
