@@ -8,6 +8,7 @@ import io
 import itertools
 import json
 import os
+import re
 import sys
 from collections.abc import Callable, Generator, Iterable, Iterator
 from typing import (
@@ -202,6 +203,129 @@ def decode_base64_values(doc: dict[str, Any]) -> dict[str, Any]:
     return dict(
         doc, **{k: base64.b64decode(cast(dict, doc[k])["encoded"]) for k in to_fix}
     )
+
+
+# Typed JSON export format: values that JSON cannot represent losslessly are
+# wrapped in single-key marker objects:
+#   {"$blob": "<base64>"}      - bytes (BLOB) values
+#   {"$int": "<decimal>"}      - integers outside the JSON safe range
+#   {"$escape": {...}}         - a literal object whose keys start with "$"
+TYPED_JSON_BLOB_KEY = "$blob"
+TYPED_JSON_INT_KEY = "$int"
+TYPED_JSON_ESCAPE_KEY = "$escape"
+
+# Integers with an absolute value larger than this cannot be represented
+# exactly by a JSON number consumer using IEEE-754 doubles
+JSON_MAX_SAFE_INTEGER = 2**53 - 1
+
+# SQLite INTEGER is a signed 64-bit value
+SQLITE_MIN_INTEGER = -(2**63)
+SQLITE_MAX_INTEGER = 2**63 - 1
+
+_typed_json_int_re = re.compile(r"-?\d+")
+
+
+class TypedJsonDecodeError(ValueError):
+    "Raised when typed JSON markers cannot be decoded"
+
+    def __init__(self, message: str, field: str = "") -> None:
+        super().__init__(message)
+        self.field = field
+
+
+def _is_marker_key(key: Any) -> bool:
+    return isinstance(key, str) and key.startswith("$")
+
+
+def typed_json_encode(value: Any) -> Any:
+    "Encode bytes and unsafe integers as typed JSON marker objects"
+    if isinstance(value, bytes):
+        return {
+            TYPED_JSON_BLOB_KEY: base64.b64encode(value).decode("ascii"),
+        }
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, int):
+        if abs(value) > JSON_MAX_SAFE_INTEGER:
+            return {TYPED_JSON_INT_KEY: str(value)}
+        return value
+    if isinstance(value, (list, tuple)):
+        return [typed_json_encode(item) for item in value]
+    if isinstance(value, dict):
+        encoded = {key: typed_json_encode(item) for key, item in value.items()}
+        if any(_is_marker_key(key) for key in encoded):
+            # Escape objects that could collide with the marker format
+            return {TYPED_JSON_ESCAPE_KEY: encoded}
+        return encoded
+    return value
+
+
+def typed_json_decode(value: Any, field: str = "") -> Any:
+    """
+    Decode typed JSON marker objects back to bytes and integers.
+
+    Raises TypedJsonDecodeError for unknown markers, corrupt encodings
+    and out-of-range integers - the offending field is available as
+    the .field attribute of the exception.
+    """
+    if isinstance(value, list):
+        return [
+            typed_json_decode(item, f"{field}[{i}]" if field else f"[{i}]")
+            for i, item in enumerate(value)
+        ]
+    if isinstance(value, dict):
+        if any(_is_marker_key(key) for key in value):
+            keys = set(value)
+            if keys == {TYPED_JSON_BLOB_KEY}:
+                encoded = value[TYPED_JSON_BLOB_KEY]
+                if not isinstance(encoded, str):
+                    raise TypedJsonDecodeError(
+                        f"{TYPED_JSON_BLOB_KEY} marker value must be a base64 string",
+                        field,
+                    )
+                try:
+                    return base64.b64decode(encoded.encode("ascii"), validate=True)
+                except (ValueError, UnicodeEncodeError):
+                    raise TypedJsonDecodeError(
+                        f"invalid base64 in {TYPED_JSON_BLOB_KEY} marker: {encoded[:50]!r}",
+                        field,
+                    )
+            if keys == {TYPED_JSON_INT_KEY}:
+                text = value[TYPED_JSON_INT_KEY]
+                if not isinstance(text, str) or not _typed_json_int_re.fullmatch(text):
+                    raise TypedJsonDecodeError(
+                        f"{TYPED_JSON_INT_KEY} marker value must be a decimal integer string",
+                        field,
+                    )
+                number = int(text)
+                if not (SQLITE_MIN_INTEGER <= number <= SQLITE_MAX_INTEGER):
+                    raise TypedJsonDecodeError(
+                        f"integer {number} is outside the SQLite 64-bit range",
+                        field,
+                    )
+                return number
+            if keys == {TYPED_JSON_ESCAPE_KEY} and isinstance(
+                value[TYPED_JSON_ESCAPE_KEY], dict
+            ):
+                # Literal object - its keys are not markers, but nested
+                # values still need decoding
+                return {
+                    key: typed_json_decode(
+                        item, f"{field}.{key}" if field else str(key)
+                    )
+                    for key, item in value[TYPED_JSON_ESCAPE_KEY].items()
+                }
+            raise TypedJsonDecodeError(
+                "unknown typed JSON marker: {{{}}}".format(
+                    ", ".join(sorted(repr(key) for key in value))
+                ),
+                field,
+            )
+        return {
+            key: typed_json_decode(item, f"{field}.{key}" if field else str(key))
+            for key, item in value.items()
+        }
+    return value
 
 
 class UpdateWrapper:

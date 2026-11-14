@@ -4,6 +4,13 @@
  Changelog
 ===========
 
+.. _v4_3:
+
+Unreleased
+----------
+
+- New ``--typed-json`` option for JSON output commands (``query``, ``rows``, ``search``, ``memory`` and others) encodes BLOBs as ``{"$blob": "..."}`` markers and integers outside the safe JSON range as ``{"$int": "..."}`` markers, escaping user objects that would collide as ``{"$escape": {...}}``. Passing the same option to ``insert`` or ``upsert`` decodes these markers again, with strict errors reporting the line number and field for unknown markers, corrupt base64 and out-of-range integers. See :ref:`cli_typed_json`.
+
 .. _v4_2_1:
 
 4.2.1 (2026-08-13)

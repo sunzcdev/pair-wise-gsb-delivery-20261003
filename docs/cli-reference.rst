@@ -134,6 +134,8 @@ See :ref:`cli_query`.
                                   simple_outline, textile, tsv, unsafehtml, youtrack
       --json-cols                 Detect JSON cols and output them as JSON, not
                                   escaped strings
+      --typed-json                Encode BLOBs and out-of-safe-range integers as
+                                  typed JSON markers
       --ascii                     Escape non-ASCII characters in JSON output as
                                   \uXXXX
       -r, --raw                   Raw output, first column of first row
@@ -205,6 +207,8 @@ See :ref:`cli_memory`.
                                   simple_outline, textile, tsv, unsafehtml, youtrack
       --json-cols                 Detect JSON cols and output them as JSON, not
                                   escaped strings
+      --typed-json                Encode BLOBs and out-of-safe-range integers as
+                                  typed JSON markers
       --ascii                     Escape non-ASCII characters in JSON output as
                                   \uXXXX
       -r, --raw                   Raw output, first column of first row
@@ -293,6 +297,8 @@ See :ref:`cli_inserting_data`, :ref:`cli_insert_csv_tsv`, :ref:`cli_insert_unstr
       --flatten                 Flatten nested JSON objects, so {"a": {"b": 1}}
                                 becomes {"a_b": 1}
       --nl                      Expect newline-delimited JSON
+      --typed-json              Decode typed JSON markers ($blob, $int, $escape) in
+                                JSON input
       -c, --csv                 Expect CSV input
       --tsv                     Expect TSV input
       --empty-null              Treat empty strings as NULL
@@ -357,6 +363,8 @@ See :ref:`cli_upsert`.
       --flatten                 Flatten nested JSON objects, so {"a": {"b": 1}}
                                 becomes {"a_b": 1}
       --nl                      Expect newline-delimited JSON
+      --typed-json              Decode typed JSON markers ($blob, $int, $escape) in
+                                JSON input
       -c, --csv                 Expect CSV input
       --tsv                     Expect TSV input
       --empty-null              Treat empty strings as NULL
@@ -412,6 +420,8 @@ See :ref:`cli_bulk`.
       --flatten              Flatten nested JSON objects, so {"a": {"b": 1}} becomes
                              {"a_b": 1}
       --nl                   Expect newline-delimited JSON
+      --typed-json           Decode typed JSON markers ($blob, $int, $escape) in
+                             JSON input
       -c, --csv              Expect CSV input
       --tsv                  Expect TSV input
       --empty-null           Treat empty strings as NULL
@@ -468,6 +478,8 @@ See :ref:`cli_search`.
                              youtrack
       --json-cols            Detect JSON cols and output them as JSON, not escaped
                              strings
+      --typed-json           Encode BLOBs and out-of-safe-range integers as typed
+                             JSON markers
       --ascii                Escape non-ASCII characters in JSON output as \uXXXX
       --load-extension TEXT  Path to SQLite extension, with optional :entrypoint
       -h, --help             Show this message and exit.
@@ -740,6 +752,8 @@ See :ref:`cli_tables`.
                              youtrack
       --json-cols            Detect JSON cols and output them as JSON, not escaped
                              strings
+      --typed-json           Encode BLOBs and out-of-safe-range integers as typed
+                             JSON markers
       --ascii                Escape non-ASCII characters in JSON output as \uXXXX
       --columns              Include list of columns for each table
       --schema               Include schema for each table
@@ -783,6 +797,8 @@ See :ref:`cli_views`.
                              youtrack
       --json-cols            Detect JSON cols and output them as JSON, not escaped
                              strings
+      --typed-json           Encode BLOBs and out-of-safe-range integers as typed
+                             JSON markers
       --ascii                Escape non-ASCII characters in JSON output as \uXXXX
       --columns              Include list of columns for each view
       --schema               Include schema for each view
@@ -831,6 +847,8 @@ See :ref:`cli_rows`.
                                   simple_outline, textile, tsv, unsafehtml, youtrack
       --json-cols                 Detect JSON cols and output them as JSON, not
                                   escaped strings
+      --typed-json                Encode BLOBs and out-of-safe-range integers as
+                                  typed JSON markers
       --ascii                     Escape non-ASCII characters in JSON output as
                                   \uXXXX
       --load-extension TEXT       Path to SQLite extension, with optional
@@ -873,6 +891,8 @@ See :ref:`cli_triggers`.
                              youtrack
       --json-cols            Detect JSON cols and output them as JSON, not escaped
                              strings
+      --typed-json           Encode BLOBs and out-of-safe-range integers as typed
+                             JSON markers
       --ascii                Escape non-ASCII characters in JSON output as \uXXXX
       --load-extension TEXT  Path to SQLite extension, with optional :entrypoint
       -h, --help             Show this message and exit.
@@ -914,6 +934,8 @@ See :ref:`cli_indexes`.
                              youtrack
       --json-cols            Detect JSON cols and output them as JSON, not escaped
                              strings
+      --typed-json           Encode BLOBs and out-of-safe-range integers as typed
+                             JSON markers
       --ascii                Escape non-ASCII characters in JSON output as \uXXXX
       --load-extension TEXT  Path to SQLite extension, with optional :entrypoint
       -h, --help             Show this message and exit.

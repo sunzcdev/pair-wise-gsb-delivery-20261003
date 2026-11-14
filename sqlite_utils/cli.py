@@ -38,6 +38,7 @@ from sqlite_utils.utils import maximize_csv_field_size_limit
 from .utils import (
     Format,
     OperationalError,
+    TypedJsonDecodeError,
     TypeTracker,
     _compile_code,
     chunks,
@@ -48,6 +49,8 @@ from .utils import (
     progressbar,
     rows_from_file,
     sqlite3,
+    typed_json_decode,
+    typed_json_encode,
 )
 from .utils import (
     flatten as _flatten,
@@ -139,6 +142,12 @@ def output_options(fn):
                 default=False,
             ),
             click.option(
+                "--typed-json",
+                help="Encode BLOBs and out-of-safe-range integers as typed JSON markers",
+                is_flag=True,
+                default=False,
+            ),
+            click.option(
                 "--ascii",
                 "ascii_",
                 help="Escape non-ASCII characters in JSON output as \\uXXXX",
@@ -223,6 +232,7 @@ def tables(
     table,
     fmt,
     json_cols,
+    typed_json,
     ascii_,
     columns,
     schema,
@@ -283,7 +293,9 @@ def tables(
         for row in _iter():
             writer.writerow(row)
     else:
-        for line in output_rows(_iter(), headers, nl, arrays, json_cols, ascii_):
+        for line in output_rows(
+            _iter(), headers, nl, arrays, json_cols, ascii_, typed_json=typed_json
+        ):
             click.echo(line)
 
 
@@ -321,6 +333,7 @@ def views(
     table,
     fmt,
     json_cols,
+    typed_json,
     ascii_,
     columns,
     schema,
@@ -347,6 +360,7 @@ def views(
         table=table,
         fmt=fmt,
         json_cols=json_cols,
+        typed_json=typed_json,
         ascii_=ascii_,
         columns=columns,
         schema=schema,
@@ -938,6 +952,11 @@ _import_options = (
         help='Flatten nested JSON objects, so {"a": {"b": 1}} becomes {"a_b": 1}',
     ),
     click.option("--nl", is_flag=True, help="Expect newline-delimited JSON"),
+    click.option(
+        "--typed-json",
+        is_flag=True,
+        help="Decode typed JSON markers ($blob, $int, $escape) in JSON input",
+    ),
     click.option("-c", "--csv", is_flag=True, help="Expect CSV input"),
     click.option("--tsv", is_flag=True, help="Expect TSV input"),
     click.option("--empty-null", is_flag=True, help="Treat empty strings as NULL"),
@@ -1095,6 +1114,7 @@ def insert_upsert_implementation(
     functions=None,
     strict=False,
     code=None,
+    typed_json=False,
 ):
     db = sqlite_utils.Database(path)
     _register_db_for_cleanup(db)
@@ -1185,6 +1205,7 @@ def insert_upsert_implementation(
             [
                 flatten,
                 nl,
+                typed_json,
                 csv,
                 tsv,
                 empty_null,
@@ -1217,6 +1238,8 @@ def insert_upsert_implementation(
         raise click.ClickException("--flatten cannot be used with --csv or --tsv")
     if empty_null and not (csv or tsv):
         raise click.ClickException("--empty-null can only be used with --csv or --tsv")
+    if typed_json and (csv or tsv or lines or text):
+        raise click.ClickException("--typed-json can only be used with JSON input")
     if encoding and not (csv or tsv):
         raise click.ClickException("--encoding must be used with --csv or --tsv")
     if pk and len(pk) == 1:
@@ -1274,11 +1297,16 @@ def insert_upsert_implementation(
         else:
             try:
                 if nl:
-                    docs = (json.loads(line) for line in decoded if line.strip())
+                    if typed_json:
+                        docs = _typed_json_nl_docs(decoded)
+                    else:
+                        docs = (json.loads(line) for line in decoded if line.strip())
                 else:
                     docs = json.load(decoded)
                     if isinstance(docs, dict):
                         docs = [docs]
+                    if typed_json:
+                        docs = _typed_json_docs(docs)
             except json.decoder.JSONDecodeError as ex:
                 raise click.ClickException(
                     f"Invalid JSON - use --csv for CSV or --tsv for TSV files\n\nJSON error: {ex}"
@@ -1360,6 +1388,7 @@ def insert(
     code,
     flatten,
     nl,
+    typed_json,
     csv,
     tsv,
     empty_null,
@@ -1481,6 +1510,7 @@ def insert(
             types=types,
             strict=strict,
             code=code,
+            typed_json=typed_json,
         )
     except UnicodeDecodeError as ex:
         raise click.ClickException(UNICODE_ERROR.format(ex))
@@ -1496,6 +1526,7 @@ def upsert(
     code,
     flatten,
     nl,
+    typed_json,
     csv,
     tsv,
     empty_null,
@@ -1571,6 +1602,7 @@ def upsert(
             silent=silent,
             strict=strict,
             code=code,
+            typed_json=typed_json,
         )
     except UnicodeDecodeError as ex:
         raise click.ClickException(UNICODE_ERROR.format(ex))
@@ -1596,6 +1628,7 @@ def bulk(
     functions,
     flatten,
     nl,
+    typed_json,
     csv,
     tsv,
     empty_null,
@@ -1631,6 +1664,7 @@ def bulk(
             pk=None,
             flatten=flatten,
             nl=nl,
+            typed_json=typed_json,
             csv=csv,
             tsv=tsv,
             empty_null=empty_null,
@@ -1998,6 +2032,7 @@ def query(
     table,
     fmt,
     json_cols,
+    typed_json,
     ascii_,
     raw,
     raw_lines,
@@ -2046,6 +2081,7 @@ def query(
         arrays,
         json_cols,
         ascii_,
+        typed_json,
     )
 
 
@@ -2116,6 +2152,7 @@ def memory(
     table,
     fmt,
     json_cols,
+    typed_json,
     ascii_,
     raw,
     raw_lines,
@@ -2257,6 +2294,7 @@ def memory(
         arrays,
         json_cols,
         ascii_,
+        typed_json,
     )
 
 
@@ -2275,6 +2313,7 @@ def _execute_query(
     arrays,
     json_cols,
     ascii_,
+    typed_json=False,
 ):
     with db.conn:
         try:
@@ -2317,7 +2356,9 @@ def _execute_query(
             for row in cursor:
                 writer.writerow(row)
         else:
-            for line in output_rows(cursor, headers, nl, arrays, json_cols, ascii_):
+            for line in output_rows(
+                cursor, headers, nl, arrays, json_cols, ascii_, typed_json=typed_json
+            ):
                 click.echo(line)
 
 
@@ -2361,6 +2402,7 @@ def search(
     table,
     fmt,
     json_cols,
+    typed_json,
     ascii_,
     load_extension,
 ):
@@ -2406,6 +2448,7 @@ def search(
             table=table,
             fmt=fmt,
             json_cols=json_cols,
+            typed_json=typed_json,
             ascii_=ascii_,
             param=[("query", q)],
             load_extension=load_extension,
@@ -2467,6 +2510,7 @@ def rows(
     table,
     fmt,
     json_cols,
+    typed_json,
     ascii_,
     load_extension,
 ):
@@ -2504,6 +2548,7 @@ def rows(
         fmt=fmt,
         param=param,
         json_cols=json_cols,
+        typed_json=typed_json,
         ascii_=ascii_,
         load_extension=load_extension,
     )
@@ -2531,6 +2576,7 @@ def triggers(
     table,
     fmt,
     json_cols,
+    typed_json,
     ascii_,
     load_extension,
 ):
@@ -2561,6 +2607,7 @@ def triggers(
         table=table,
         fmt=fmt,
         json_cols=json_cols,
+        typed_json=typed_json,
         ascii_=ascii_,
         load_extension=load_extension,
     )
@@ -2590,6 +2637,7 @@ def indexes(
     table,
     fmt,
     json_cols,
+    typed_json,
     ascii_,
     load_extension,
 ):
@@ -2632,6 +2680,7 @@ def indexes(
         table=table,
         fmt=fmt,
         json_cols=json_cols,
+        typed_json=typed_json,
         ascii_=ascii_,
         load_extension=load_extension,
     )
@@ -3680,7 +3729,9 @@ FILE_COLUMNS = {
 }
 
 
-def output_rows(iterator, headers, nl, arrays, json_cols, ascii_=False):
+def output_rows(
+    iterator, headers, nl, arrays, json_cols, ascii_=False, typed_json=False
+):
     # Duplicate column names would collide as dictionary keys, so rename
     # later occurrences id, id -> id, id_2 - CSV and table output keep
     # the original duplicate headers since they never build dictionaries
@@ -3697,6 +3748,9 @@ def output_rows(iterator, headers, nl, arrays, json_cols, ascii_=False):
         if json_cols:
             # Any value that is a valid JSON string should be treated as JSON
             data = [maybe_json(value) for value in data]
+        if typed_json:
+            # Encode bytes and unsafe integers as typed JSON markers
+            data = [typed_json_encode(value) for value in data]
         if not arrays:
             data = dict(zip(headers, data))
         line = "{firstchar}{serialized}{maybecomma}{lastchar}".format(
@@ -3737,6 +3791,26 @@ def verify_is_dict(doc):
             f"Rows must all be dictionaries, got: {repr(doc)[:1000]}"
         )
     return doc
+
+
+def _decode_typed_json_doc(doc, location):
+    try:
+        return typed_json_decode(doc)
+    except TypedJsonDecodeError as ex:
+        field = f" field {ex.field!r}" if ex.field else ""
+        raise click.ClickException(f"Invalid typed JSON at {location}{field}: {ex}")
+
+
+def _typed_json_nl_docs(lines):
+    for line_number, line in enumerate(lines, start=1):
+        if not line.strip():
+            continue
+        yield _decode_typed_json_doc(json.loads(line), f"line {line_number}")
+
+
+def _typed_json_docs(docs):
+    for index, doc in enumerate(docs, start=1):
+        yield _decode_typed_json_doc(doc, f"item {index}")
 
 
 def _load_extensions(db, load_extension):

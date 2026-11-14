@@ -171,6 +171,60 @@ Binary strings are not valid JSON, so BLOB columns containing binary data will b
         }
     ]
 
+.. _cli_typed_json:
+
+Typed JSON export and import
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+The default JSON output is lossy for some values: BLOBs become base64 objects
+that are indistinguishable from regular JSON objects, and integers larger than
+2**53 can lose precision when consumed by systems that parse JSON numbers as
+IEEE-754 doubles.
+
+Pass ``--typed-json`` to commands that output JSON (``query``, ``rows``,
+``search``, ``memory`` and friends) to encode these values as unambiguous
+marker objects instead:
+
+.. code-block:: bash
+
+    sqlite-utils dogs.db "select * from images" --typed-json
+
+.. code-block:: output
+
+    [
+        {
+            "id": 1,
+            "content": {
+                "$blob": "R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7"
+            },
+            "rowid_big": {
+                "$int": "4611686018427387904"
+            }
+        }
+    ]
+
+The markers are:
+
+- ``{"$blob": "..."}`` for BLOB values, base64 encoded (an empty BLOB becomes ``{"$blob": ""}``)
+- ``{"$int": "..."}`` for integers outside the safe JSON range of ±(2**53 - 1), encoded as a decimal string - integers within the safe range stay plain JSON numbers
+
+If a JSON value detected by ``--json-cols`` is itself an object with keys
+starting with ``$``, it is wrapped in an escape marker so it cannot collide
+with the typed markers: ``{"$escape": {...}}``.
+
+To import data produced by ``--typed-json``, pass the same option to
+``insert`` or ``upsert`` - it works for both regular and newline-delimited
+JSON:
+
+.. code-block:: bash
+
+    sqlite-utils dogs.db "select * from images" --typed-json --nl \
+        | sqlite-utils insert dogs2.db images - --nl --typed-json
+
+Decoding is strict: unknown markers, malformed base64 and integers outside
+the SQLite 64-bit range are reported as errors including the line number (or
+item number, for JSON arrays) and the field that caused the problem.
+
 .. _cli_json_values:
 
 Nested JSON values
@@ -1218,6 +1272,14 @@ You can insert binary data into a BLOB column by first encoding it using base64 
             }
         }
     ]
+
+Data exported with ``--typed-json`` (see :ref:`cli_typed_json`) can be
+imported by passing the same option, which also restores large integers
+encoded as ``{"$int": "..."}`` markers:
+
+.. code-block:: bash
+
+    sqlite-utils insert dogs.db images images.json --typed-json
 
 .. _cli_inserting_data_nl_json:
 
