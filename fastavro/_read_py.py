@@ -9,10 +9,11 @@ import json
 import lzma
 import sys
 import zlib
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from decimal import Context
 from io import BytesIO
-from struct import error as StructError
+from struct import error as StructError, pack, unpack
 from typing import IO, Union, Optional, Generic, TypeVar, Iterator, Dict
 from warnings import warn
 
@@ -45,6 +46,40 @@ epoch_naive = datetime(1970, 1, 1)
 
 def _default_named_schemas() -> Dict[str, NamedSchemas]:
     return {"writer": {}, "reader": {}}
+
+
+_FIELD_PATH_KEY = "_fastavro_field_path"
+
+
+@contextmanager
+def _maybe_track_field_path(options, segment):
+    """Track the current field path while reading.
+
+    The path is only tracked when the strict_numeric_promotion option is
+    enabled so that errors can report where a lossy promotion happened.
+    """
+    if options.get("strict_numeric_promotion"):
+        path = options.setdefault(_FIELD_PATH_KEY, [])
+        path.append(segment)
+        try:
+            yield
+        finally:
+            path.pop()
+    else:
+        yield
+
+
+def _current_field_path(options):
+    parts = options.get(_FIELD_PATH_KEY) or []
+    if not parts:
+        return "<root>"
+    path = parts[0]
+    for part in parts[1:]:
+        if part.startswith("["):
+            path += part
+        else:
+            path += f".{part}"
+    return path
 
 
 def match_types(writer_type, reader_type, named_schemas):
@@ -334,15 +369,16 @@ def read_array(
 
     decoder.read_array_start()
 
-    for item in decoder.iter_array():
-        read_items.append(
-            item_reader(
-                decoder,
-                writer_schema,
-                reader_schema,
-                options,
+    for index, _ in enumerate(decoder.iter_array()):
+        with _maybe_track_field_path(options, f"[{index}]"):
+            read_items.append(
+                item_reader(
+                    decoder,
+                    writer_schema,
+                    reader_schema,
+                    options,
+                )
             )
-        )
 
     decoder.read_array_end()
 
@@ -393,7 +429,8 @@ def read_map(
 
     for item in decoder.iter_map():
         key = decoder.read_utf8()
-        read_items[key] = item_reader(decoder, writer_schema, reader_schema)
+        with _maybe_track_field_path(options, key):
+            read_items[key] = item_reader(decoder, writer_schema, reader_schema)
 
     decoder.read_map_end()
 
@@ -550,13 +587,14 @@ def read_record(
             )
             if readers_field:
                 readers_field_name = readers_field["name"]
-                record[readers_field_name] = read_data(
-                    decoder,
-                    field["type"],
-                    named_schemas,
-                    readers_field["type"],
-                    options,
-                )
+                with _maybe_track_field_path(options, readers_field_name):
+                    record[readers_field_name] = read_data(
+                        decoder,
+                        field["type"],
+                        named_schemas,
+                        readers_field["type"],
+                        options,
+                    )
                 del readers_field_dict[readers_field_name]
             else:
                 skip_data(decoder, field["type"], named_schemas)
@@ -618,13 +656,52 @@ SKIPS = {
 }
 
 
-def maybe_promote(data, writer_type, reader_type):
+def _is_exact_float32(value):
+    """Return True if an integer value is exactly representable as an avro
+    float (IEEE 754 single precision).
+
+    Note that a Python float is a double, so ``float(value) == value`` is
+    not sufficient to check avro float precision.
+    """
+    try:
+        return unpack("f", pack("f", value))[0] == value
+    except OverflowError:
+        return False
+
+
+def _is_exact_float64(value):
+    """Return True if an integer value is exactly representable as an avro
+    double (IEEE 754 double precision)."""
+    try:
+        return int(float(value)) == value
+    except OverflowError:
+        return False
+
+
+def _check_lossless_promotion(data, writer_type, reader_type, options):
+    if not options.get("strict_numeric_promotion"):
+        return
+    if reader_type == "float":
+        exact = _is_exact_float32(data)
+    else:
+        exact = _is_exact_float64(data)
+    if not exact:
+        raise SchemaResolutionError(
+            f"Schema resolution error at {_current_field_path(options)}: "
+            f"cannot promote {writer_type} value {data} to {reader_type} "
+            f"without losing precision"
+        )
+
+
+def maybe_promote(data, writer_type, reader_type, options={}):
     if writer_type == "int":
         # No need to promote to long since they are the same type in Python
         if reader_type == "float" or reader_type == "double":
+            _check_lossless_promotion(data, writer_type, reader_type, options)
             return float(data)
     if writer_type == "long":
         if reader_type == "float" or reader_type == "double":
+            _check_lossless_promotion(data, writer_type, reader_type, options)
             return float(data)
     if writer_type == "string" and reader_type == "bytes":
         return data.encode()
@@ -671,7 +748,9 @@ def read_data(
                 return fn(data, writer_schema, reader_schema)
 
         if reader_schema is not None:
-            return maybe_promote(data, record_type, extract_record_type(reader_schema))
+            return maybe_promote(
+                data, record_type, extract_record_type(reader_schema), options
+            )
         else:
             return data
     else:
@@ -1050,6 +1129,13 @@ class reader(file_reader[AvroMessage]):
         Default `strict`. Should be set to a valid string that can be used in
         the errors argument of the string decode() function. Examples include
         `replace` and `ignore`
+    strict_numeric_promotion
+        If true, int/long to float/double promotions are only performed when
+        the value can be represented exactly in the target type (keeping in
+        mind that avro floats are 32-bit). If the value would lose precision,
+        a SchemaResolutionError is raised that includes the field path, the
+        writer type, and the reader type. Defaults to False which keeps the
+        standard avro promotion behavior.
 
 
     Example::
@@ -1098,6 +1184,7 @@ class reader(file_reader[AvroMessage]):
         handle_unicode_errors: str = "strict",
         return_named_type: bool = False,
         return_named_type_override: bool = False,
+        strict_numeric_promotion: bool = False,
     ):
         options = {
             "return_record_name": return_record_name,
@@ -1105,6 +1192,7 @@ class reader(file_reader[AvroMessage]):
             "handle_unicode_errors": handle_unicode_errors,
             "return_named_type": return_named_type,
             "return_named_type_override": return_named_type_override,
+            "strict_numeric_promotion": strict_numeric_promotion,
         }
         super().__init__(fo, reader_schema, options)
 
@@ -1177,6 +1265,13 @@ class block_reader(file_reader[Block]):
         Default `strict`. Should be set to a valid string that can be used in
         the errors argument of the string decode() function. Examples include
         `replace` and `ignore`
+    strict_numeric_promotion
+        If true, int/long to float/double promotions are only performed when
+        the value can be represented exactly in the target type (keeping in
+        mind that avro floats are 32-bit). If the value would lose precision,
+        a SchemaResolutionError is raised that includes the field path, the
+        writer type, and the reader type. Defaults to False which keeps the
+        standard avro promotion behavior.
 
 
     Example::
@@ -1213,6 +1308,7 @@ class block_reader(file_reader[Block]):
         handle_unicode_errors: str = "strict",
         return_named_type: bool = False,
         return_named_type_override: bool = False,
+        strict_numeric_promotion: bool = False,
     ):
         options = {
             "return_record_name": return_record_name,
@@ -1220,6 +1316,7 @@ class block_reader(file_reader[Block]):
             "handle_unicode_errors": handle_unicode_errors,
             "return_named_type": return_named_type,
             "return_named_type_override": return_named_type_override,
+            "strict_numeric_promotion": strict_numeric_promotion,
         }
         super().__init__(fo, reader_schema, options)
 
@@ -1245,6 +1342,7 @@ def schemaless_reader(
     handle_unicode_errors: str = "strict",
     return_named_type: bool = False,
     return_named_type_override: bool = False,
+    strict_numeric_promotion: bool = False,
 ) -> AvroMessage:
     """Reads a single record written using the
     :meth:`~fastavro._write_py.schemaless_writer`
@@ -1283,6 +1381,13 @@ def schemaless_reader(
         Default `strict`. Should be set to a valid string that can be used in
         the errors argument of the string decode() function. Examples include
         `replace` and `ignore`
+    strict_numeric_promotion
+        If true, int/long to float/double promotions are only performed when
+        the value can be represented exactly in the target type (keeping in
+        mind that avro floats are 32-bit). If the value would lose precision,
+        a SchemaResolutionError is raised that includes the field path, the
+        writer type, and the reader type. Defaults to False which keeps the
+        standard avro promotion behavior.
 
 
     Example::
@@ -1311,6 +1416,7 @@ def schemaless_reader(
         "handle_unicode_errors": handle_unicode_errors,
         "return_named_type": return_named_type,
         "return_named_type_override": return_named_type_override,
+        "strict_numeric_promotion": strict_numeric_promotion,
     }
 
     return read_data(
