@@ -11,6 +11,7 @@ import os
 import os.path as op
 import pickle
 import pickletools
+import secrets
 import sqlite3
 import struct
 import tempfile
@@ -521,8 +522,23 @@ class Cache:
             ' size INTEGER DEFAULT 0,'
             ' mode INTEGER DEFAULT 0,'
             ' filename TEXT,'
-            ' value BLOB)'
+            ' value BLOB,'
+            ' lease_token TEXT,'
+            ' lease_expire_time REAL)'
         )
+
+        # 2026-11-14 Migrate existing databases to add lease columns
+        # used by Cache.claim and friends. CREATE TABLE IF NOT EXISTS
+        # does not alter the schema of existing tables.
+
+        lease_columns = sql('PRAGMA table_info(Cache)').fetchall()
+        lease_names = {column[1] for column in lease_columns}
+
+        if 'lease_token' not in lease_names:
+            sql('ALTER TABLE Cache ADD COLUMN lease_token TEXT')
+
+        if 'lease_expire_time' not in lease_names:
+            sql('ALTER TABLE Cache ADD COLUMN lease_expire_time REAL')
 
         sql(
             'CREATE UNIQUE INDEX IF NOT EXISTS Cache_key_raw ON'
@@ -1602,6 +1618,299 @@ class Cache:
             return (key, value), db_tag
         else:
             return key, value
+
+    def claim(
+        self,
+        prefix=None,
+        default=(None, None, None, None),
+        side='front',
+        lease=60,
+        expire_time=False,
+        tag=False,
+        retry=False,
+    ):
+        """Claim key and value item pair from `side` of queue in cache.
+
+        Unlike `Cache.pull`, claiming an item does not remove it from the
+        cache. Instead the item is leased to the caller until the returned
+        deadline. The item is deleted only after the caller acknowledges
+        processing with `Cache.ack`. If the caller crashes, the item becomes
+        claimable again once the lease expires. Items may also be made
+        claimable immediately with `Cache.release` and leases may be extended
+        with `Cache.renew`.
+
+        Delivery is therefore at-least-once: an item may be claimed more
+        than once when a consumer fails after processing but before
+        acknowledging. External side effects are not guaranteed to occur
+        exactly once.
+
+        When prefix is None, integer keys are used. Otherwise, string keys
+        are used in the format "prefix-integer". Integer starts at 500
+        trillion.
+
+        If no item is claimable, return default.
+
+        Defaults to claiming items from front of queue. Set side to 'back'
+        to claim from back of queue. Side must be one of 'front' or 'back'.
+
+        The lease token uniquely identifies the caller as the current owner
+        of the item. Once a lease expires, another consumer may claim the
+        same item and receive a new token. Tokens held by previous consumers
+        can no longer acknowledge, release, or renew the item.
+
+        Operation is atomic. Concurrent operations will be serialized.
+
+        Raises :exc:`Timeout` error when database timeout occurs and `retry`
+        is `False` (default).
+
+        See also `Cache.ack`, `Cache.release`, `Cache.renew`, and
+        `Cache.pull`.
+
+        >>> cache = Cache()
+        >>> cache.claim()
+        (None, None, None, None)
+        >>> for letter in 'abc':
+        ...     print(cache.push(letter))
+        500000000000000
+        500000000000001
+        500000000000002
+        >>> key, value, token, deadline = cache.claim(lease=60)
+        >>> print(key)
+        500000000000000
+        >>> value
+        'a'
+        >>> deadline > time.time()
+        True
+        >>> cache.claim()[1]  # 'a' is leased, next item is claimed
+        'b'
+        >>> cache.ack(key, token)
+        True
+        >>> key, value, token, _ = cache.claim(side='back')
+        >>> value
+        'c'
+        >>> cache.renew(key, token, lease=60)
+        True
+        >>> cache.release(key, token)
+        True
+        >>> key, value, token, _ = cache.claim()
+        >>> value
+        'c'
+        >>> cache.ack(key, 'wrong-token')
+        False
+        >>> cache.ack(key, token)
+        True
+
+        :param str prefix: key prefix (default None, key is integer)
+        :param default: value to return if no item is claimable
+            (default (None, None, None, None))
+        :param str side: either 'front' or 'back' (default 'front')
+        :param float lease: seconds until the lease expires (default 60)
+        :param bool expire_time: if True, return expire_time in tuple
+            (default False)
+        :param bool tag: if True, return tag in tuple (default False)
+        :param bool retry: retry if database timeout occurs (default False)
+        :return: key, value, lease token, and lease deadline or default if
+            no item is claimable
+        :raises Timeout: if database timeout occurs
+
+        """
+        # Caution: Nearly identical code exists in Cache.pull
+        if prefix is None:
+            min_key = 0
+            max_key = 999999999999999
+        else:
+            min_key = prefix + '-000000000000000'
+            max_key = prefix + '-999999999999999'
+
+        order = {'front': 'ASC', 'back': 'DESC'}
+        select = (
+            'SELECT rowid, key, expire_time, tag, mode, filename, value'
+            ' FROM Cache WHERE ? < key AND key < ? AND raw = 1'
+            ' AND (lease_expire_time IS NULL OR lease_expire_time < ?)'
+            ' ORDER BY key %s LIMIT 1'
+        ) % order[side]
+
+        if expire_time and tag:
+            default = default, None, None
+        elif expire_time or tag:
+            default = default, None
+
+        while True:
+            with self._transact(retry) as (sql, cleanup):
+                now = time.time()
+                rows = sql(select, (min_key, max_key, now)).fetchall()
+
+                if not rows:
+                    return default
+
+                (
+                    (rowid, key, db_expire, db_tag, mode, name, db_value),
+                ) = rows
+
+                if db_expire is not None and db_expire < now:
+                    sql('DELETE FROM Cache WHERE rowid = ?', (rowid,))
+                    cleanup(name)
+                    continue
+
+                try:
+                    value = self._disk.fetch(mode, name, db_value, False)
+                except IOError:
+                    # Value file is missing. Delete the corrupt row and
+                    # retry with the next item.
+                    sql('DELETE FROM Cache WHERE rowid = ?', (rowid,))
+                    cleanup(name)
+                    continue
+
+                token = secrets.token_hex(16)
+                lease_expire_time = now + lease
+                sql(
+                    'UPDATE Cache SET lease_token = ?, lease_expire_time = ?'
+                    ' WHERE rowid = ?',
+                    (token, lease_expire_time, rowid),
+                )
+
+            break
+
+        item = key, value, token, lease_expire_time
+
+        if expire_time and tag:
+            return item, db_expire, db_tag
+        elif expire_time:
+            return item, db_expire
+        elif tag:
+            return item, db_tag
+        else:
+            return item
+
+    def ack(self, key, token, retry=False):
+        """Acknowledge claimed item and delete it from the queue in cache.
+
+        The item is deleted only when `token` matches the token of the
+        current lease. Tokens held by previous consumers cannot acknowledge
+        an item that has since been claimed by another consumer.
+
+        Raises :exc:`Timeout` error when database timeout occurs and `retry`
+        is `False` (default).
+
+        See also `Cache.claim`.
+
+        >>> cache = Cache()
+        >>> cache.push('first')
+        500000000000000
+        >>> key, value, token, _ = cache.claim()
+        >>> cache.ack(key, token)
+        True
+        >>> cache.ack(key, token)
+        False
+        >>> len(cache)
+        0
+
+        :param key: key for item returned by `Cache.claim`
+        :param str token: lease token returned by `Cache.claim`
+        :param bool retry: retry if database timeout occurs (default False)
+        :return: True if item was acknowledged and deleted
+        :raises Timeout: if database timeout occurs
+
+        """
+        db_key, raw = self._disk.put(key)
+
+        with self._transact(retry) as (sql, cleanup):
+            rows = sql(
+                'SELECT rowid, filename FROM Cache'
+                ' WHERE key = ? AND raw = ? AND lease_token = ?',
+                (db_key, raw, token),
+            ).fetchall()
+
+            if not rows:
+                return False
+
+            ((rowid, name),) = rows
+            sql('DELETE FROM Cache WHERE rowid = ?', (rowid,))
+            cleanup(name)
+            return True
+
+    def release(self, key, token, retry=False):
+        """Release claimed item and make it claimable again in cache.
+
+        The lease is cleared only when `token` matches the token of the
+        current lease. Tokens held by previous consumers cannot release an
+        item that has since been claimed by another consumer.
+
+        Raises :exc:`Timeout` error when database timeout occurs and `retry`
+        is `False` (default).
+
+        See also `Cache.claim`.
+
+        >>> cache = Cache()
+        >>> cache.push('first')
+        500000000000000
+        >>> key, value, token, _ = cache.claim()
+        >>> cache.release(key, token)
+        True
+        >>> cache.release(key, token)
+        False
+        >>> cache.claim()[1]
+        'first'
+
+        :param key: key for item returned by `Cache.claim`
+        :param str token: lease token returned by `Cache.claim`
+        :param bool retry: retry if database timeout occurs (default False)
+        :return: True if item lease was released
+        :raises Timeout: if database timeout occurs
+
+        """
+        db_key, raw = self._disk.put(key)
+
+        with self._transact(retry) as (sql, _):
+            cursor = sql(
+                'UPDATE Cache SET lease_token = NULL, lease_expire_time = NULL'
+                ' WHERE key = ? AND raw = ? AND lease_token = ?',
+                (db_key, raw, token),
+            )
+            return cursor.rowcount > 0
+
+    def renew(self, key, token, lease=60, retry=False):
+        """Renew lease on claimed item in cache.
+
+        The lease deadline is extended by `lease` seconds only when `token`
+        matches the token of the current lease and the lease has not yet
+        expired. Only the current owner of the item may renew its lease.
+        Tokens held by previous consumers cannot renew an item that has
+        since been claimed by another consumer.
+
+        Raises :exc:`Timeout` error when database timeout occurs and `retry`
+        is `False` (default).
+
+        See also `Cache.claim`.
+
+        >>> cache = Cache()
+        >>> cache.push('first')
+        500000000000000
+        >>> key, value, token, _ = cache.claim(lease=60)
+        >>> cache.renew(key, token, lease=60)
+        True
+        >>> cache.renew(key, 'wrong-token', lease=60)
+        False
+
+        :param key: key for item returned by `Cache.claim`
+        :param str token: lease token returned by `Cache.claim`
+        :param float lease: seconds until the lease expires (default 60)
+        :param bool retry: retry if database timeout occurs (default False)
+        :return: True if item lease was renewed
+        :raises Timeout: if database timeout occurs
+
+        """
+        now = time.time()
+        db_key, raw = self._disk.put(key)
+
+        with self._transact(retry) as (sql, _):
+            cursor = sql(
+                'UPDATE Cache SET lease_expire_time = ?'
+                ' WHERE key = ? AND raw = ? AND lease_token = ?'
+                ' AND lease_expire_time > ?',
+                (now + lease, db_key, raw, token, now),
+            )
+            return cursor.rowcount > 0
 
     def peek(
         self,

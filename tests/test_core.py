@@ -979,7 +979,249 @@ def test_peek_ioerror(cache):
         assert value == 0
 
 
-def test_peekitem_extras(cache):
+def test_claim_ack(cache):
+    for value in range(10):
+        cache.push(value)
+
+    for value in range(10):
+        key, claim_value, token, deadline = cache.claim()
+        assert claim_value == value
+        assert deadline > time.time()
+        # Item is leased, not removed.
+        assert len(cache) == 10 - value
+        assert cache.ack(key, token)
+
+    assert len(cache) == 0
+    assert cache.claim() == (None, None, None, None)
+    assert cache.claim(default=(0, 1, 2, 3)) == (0, 1, 2, 3)
+    assert len(cache.check()) == 0
+
+
+def test_claim_prefix(cache):
+    for value in range(10):
+        cache.push(value, prefix='key')
+
+    for value in range(10):
+        key, claim_value, token, _ = cache.claim(prefix='key')
+        assert key.startswith('key')
+        assert claim_value == value
+        assert cache.ack(key, token)
+
+    assert len(cache) == 0
+    assert len(cache.check()) == 0
+
+
+def test_claim_side_back(cache):
+    for value in range(3):
+        cache.push(value)
+
+    key, value, token, _ = cache.claim(side='back')
+    assert value == 2
+    assert cache.ack(key, token)
+
+
+def test_claim_leased_not_reclaimable(cache):
+    cache.push('value')
+    key, value, token, _ = cache.claim(lease=60)
+    assert value == 'value'
+    # Leased item is not claimable by another consumer.
+    assert cache.claim() == (None, None, None, None)
+    assert cache.ack(key, token)
+    assert len(cache) == 0
+
+
+def test_claim_lease_expires(cache):
+    cache.push('value')
+    key, value, token, _ = cache.claim(lease=0.1)
+    assert value == 'value'
+
+    time.sleep(0.2)
+
+    # Lease expired; item is claimable again with a new token.
+    key2, value2, token2, _ = cache.claim(lease=60)
+    assert key2 == key
+    assert value2 == 'value'
+    assert token2 != token
+
+    # Old consumer's token cannot acknowledge the reclaimed item.
+    assert not cache.ack(key, token)
+    assert len(cache) == 1
+
+    # New owner's token acknowledges and deletes the item.
+    assert cache.ack(key2, token2)
+    assert len(cache) == 0
+    assert len(cache.check()) == 0
+
+
+def test_claim_release(cache):
+    cache.push('value')
+    key, _, token, _ = cache.claim(lease=60)
+
+    # Wrong token cannot release the lease.
+    assert not cache.release(key, 'wrong-token')
+    assert cache.claim() == (None, None, None, None)
+
+    # Owner releases the lease; item is claimable again immediately.
+    assert cache.release(key, token)
+    key2, value2, token2, _ = cache.claim(lease=60)
+    assert key2 == key
+    assert value2 == 'value'
+    assert token2 != token
+
+    # Old token cannot acknowledge after re-claim.
+    assert not cache.ack(key, token)
+    assert cache.ack(key2, token2)
+    assert len(cache) == 0
+
+
+def test_claim_renew(cache):
+    cache.push('value')
+    key, _, token, deadline = cache.claim(lease=0.2)
+
+    # Wrong token cannot renew the lease.
+    assert not cache.renew(key, 'wrong-token', lease=60)
+
+    # Owner renews the lease.
+    assert cache.renew(key, token, lease=60)
+
+    time.sleep(0.3)
+
+    # Renewed lease is still valid; item not claimable.
+    assert cache.claim() == (None, None, None, None)
+    assert cache.ack(key, token)
+    assert len(cache) == 0
+
+
+def test_claim_renew_expired(cache):
+    cache.push('value')
+    key, _, token, _ = cache.claim(lease=0.1)
+    time.sleep(0.2)
+
+    # Lease expired; old owner is no longer the current owner.
+    assert not cache.renew(key, token, lease=60)
+
+    # Item is claimable again by a new consumer.
+    _, _, token2, _ = cache.claim(lease=60)
+    assert token2 != token
+    assert not cache.renew(key, token, lease=60)
+    assert cache.renew(key, token2, lease=60)
+    assert cache.ack(key, token2)
+    assert len(cache) == 0
+
+
+def test_claim_expire(cache):
+    cache.push(0, expire=0.1)
+    cache.push(0, expire=0.1)
+    cache.push(1)
+    time.sleep(0.2)
+
+    # Expired items are deleted; claim skips them.
+    key, value, token, _ = cache.claim()
+    assert key == 500000000000002
+    assert value == 1
+    assert cache.ack(key, token)
+    assert len(cache) == 0
+    assert len(cache.check()) == 0
+
+
+def test_claim_extras(cache):
+    cache.push('test', expire=10, tag='foo')
+    (key, value, token, deadline), expire_time, tag = cache.claim(
+        expire_time=True, tag=True
+    )
+    assert key == 500000000000000
+    assert value == 'test'
+    assert deadline > time.time()
+    assert expire_time > time.time()
+    assert tag == 'foo'
+    assert cache.ack(key, token)
+
+    cache.push('test', expire=10)
+    (key, value, token, _), expire_time = cache.claim(expire_time=True)
+    assert expire_time > time.time()
+    assert cache.ack(key, token)
+
+    cache.push('test', tag='foo')
+    (key, value, token, _), tag = cache.claim(tag=True)
+    assert tag == 'foo'
+    assert cache.ack(key, token)
+
+    # Empty queue returns extended default.
+    assert cache.claim(expire_time=True, tag=True) == (
+        (None, None, None, None),
+        None,
+        None,
+    )
+    assert len(cache) == 0
+    assert len(cache.check()) == 0
+
+
+def test_claim_large_value(cache):
+    value = b'test' * (2**20)
+    cache.push(value)
+    key, claim_value, token, _ = cache.claim()
+    assert claim_value == value
+    assert cache.ack(key, token)
+    assert len(cache) == 0
+    assert len(cache.check()) == 0
+
+
+def test_claim_ioerror(cache):
+    assert cache.push(0) == 500000000000000
+    assert cache.push(1) == 500000000000001
+
+    disk = mock.Mock()
+    put = mock.Mock()
+    fetch = mock.Mock()
+
+    disk.put = put
+    put.side_effect = [(0, True)]
+    disk.fetch = fetch
+    io_error = IOError()
+    io_error.errno = errno.ENOENT
+    fetch.side_effect = [io_error, 1]
+
+    with mock.patch.object(cache, '_disk', disk):
+        _, value, _, _ = cache.claim()
+        assert value == 1
+
+
+def test_claim_reopen(cache):
+    # Unacknowledged items survive cache close and re-open.
+    directory = cache.directory
+    cache.push('value')
+    key, _, token, _ = cache.claim(lease=0.1)
+    cache.close()
+
+    other = dc.Cache(directory)
+    try:
+        # Lease has not expired; item is not claimable.
+        assert other.claim() == (None, None, None, None)
+        time.sleep(0.2)
+        # Lease expired; item is claimable again after re-open.
+        key2, value2, token2, _ = other.claim(lease=60)
+        assert key2 == key
+        assert value2 == 'value'
+        assert token2 != token
+        assert not other.ack(key, token)
+        assert other.ack(key2, token2)
+        assert len(other) == 0
+    finally:
+        other.close()
+
+
+def test_pull_unchanged_by_claim(cache):
+    # Original pull interface still removes items immediately.
+    cache.push('value')
+    key, value, token, _ = cache.claim()
+    assert value == 'value'
+    # pull removes the leased item like any other queue item.
+    assert cache.pull() == (500000000000000, 'value')
+    assert len(cache) == 0
+    # Token can no longer acknowledge the deleted item.
+    assert not cache.ack(key, token)
+
+
     with pytest.raises(KeyError):
         cache.peekitem()
 
