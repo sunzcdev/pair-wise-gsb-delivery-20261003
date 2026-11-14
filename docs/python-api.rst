@@ -1332,6 +1332,44 @@ The ``.convert()`` method accepts optional ``where=`` and ``where_args=`` parame
 
 These behave the same as the corresponding parameters to the :ref:`.rows_where() <python_api_rows>` method, so you can use ``?`` placeholders and a list of values instead of ``:named`` placeholders with a dictionary.
 
+Previewing a conversion
+-----------------------
+
+Before running a conversion that modifies data, pass ``preview=True`` to inspect what would happen without changing the database:
+
+.. code-block:: python
+
+    report = table.convert(
+        ["name", "twitter"],
+        lambda value: value.upper() if value else value,
+        preview=True,
+        preview_limit=5,
+    )
+
+The return value is a ``ConvertPreview`` dictionary with these keys:
+
+- ``matched`` - the number of rows that match the optional ``where=`` clause.
+- ``changed`` - the number of matching rows where at least one converted value differs from the value currently stored.
+- ``samples`` - at most ``preview_limit`` before/after samples, in primary key order. Each sample has ``pk``, ``before`` and ``after``.
+- ``errors`` - at most ``preview_limit`` conversion failure samples, each with ``pk``, ``column``, ``value``, ``error`` and ``error_type``. The total number of failed values is available as ``error_count``.
+
+``preview_limit`` defaults to 10. It only limits how many samples are kept in memory: every matching row is still scanned so that the counts and failure samples include rows beyond the first page. ``preview=<integer>``, ``sample_limit=`` and ``limit=`` are accepted as aliases for setting that limit.
+
+For a multi-column conversion the ``before`` and ``after`` mappings contain every converted column. With ``multi=True`` the ``after`` mapping contains exactly the keys returned by the function: a key that was omitted remains absent, while a key explicitly set to ``None`` is shown as ``None``. This preserves the difference between a missing key and a null value. Values are converted using the same JSON encoding that ``.convert()`` would store.
+
+When ``output=`` names a column that does not exist yet, preview mode does not create it. The sample's ``after`` mapping still shows the value that the new column would receive. Likewise, ``drop=True`` is not applied during a preview.
+
+A preview is implemented using a streaming ``SELECT``. It never runs the ``UPDATE`` statement, never opens a write transaction and never rolls one back, so table data, schema, indexes, counts triggers and other change triggers are left untouched. Because the conversion function runs during the preview, any side effects that the function itself performs still happen. Preview results are not cached or reused: calling ``.convert()`` afterwards runs the function again for every value. Functions that are non-deterministic or that depend on external state can therefore produce different results on the second run.
+
+.. code-block:: python
+
+    report = db.table("dogs").convert("name", lambda value: value.upper(), preview=True)
+    for sample in report["samples"]:
+        print(sample["pk"], sample["before"], "->", sample["after"])
+    if report["errors"]:
+        print("First conversion error:", report["errors"][0]["error"])
+    # The dogs table has not been modified by any of the code above.
+
 .. _python_api_lookup_tables:
 
 Working with lookup tables

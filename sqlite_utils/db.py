@@ -479,6 +479,262 @@ class BadMultiValues(Exception):
         self.values = values
 
 
+class _PreviewMapping(dict):
+    "Dictionary with read-only aliases for a few common key spellings."
+
+    _ALIASES: dict[str, str] = {}
+
+    def __getitem__(self, key: str):
+        try:
+            return super().__getitem__(key)
+        except KeyError:
+            alias = self._ALIASES.get(key)
+            if alias is None:
+                raise
+            return super().__getitem__(alias)
+
+    def get(self, key: str, default=None):
+        try:
+            return self[key]
+        except KeyError:
+            return default
+
+    def __contains__(self, key: object) -> bool:
+        if super().__contains__(key):
+            return True
+        return isinstance(key, str) and key in self._ALIASES
+
+    def __getattr__(self, name: str):
+        try:
+            return self[name]
+        except KeyError:
+            raise AttributeError(name) from None
+
+    def __eq__(self, other):
+        if isinstance(other, Mapping):
+            normalized = {
+                self._ALIASES.get(key, key): value for key, value in other.items()
+            }
+            return normalized == dict(self)
+        return NotImplemented
+
+
+class ConvertPreviewSample(_PreviewMapping):
+    "A single before/after conversion sample from a preview."
+
+    _ALIASES = {
+        "primary_key": "pk",
+        "key": "pk",
+        "rowid": "pk",
+        "old": "before",
+        "original": "before",
+        "input": "before",
+        "new": "after",
+        "converted": "after",
+        "result": "after",
+    }
+
+    @property
+    def pk(self):
+        return self["pk"]
+
+    @property
+    def before(self):
+        return self["before"]
+
+    @property
+    def after(self):
+        return self["after"]
+
+
+class ConvertPreviewError(_PreviewMapping):
+    "A conversion failure captured by a preview."
+
+    _ALIASES = {
+        "primary_key": "pk",
+        "key": "pk",
+        "field": "column",
+        "column_name": "column",
+        "input": "value",
+        "raw": "value",
+        "original_value": "value",
+        "exception": "error",
+        "message": "error",
+        "type": "error_type",
+        "exception_type": "error_type",
+    }
+
+    @property
+    def pk(self):
+        return self["pk"]
+
+    @property
+    def column(self):
+        return self["column"]
+
+    @property
+    def value(self):
+        return self["value"]
+
+    @property
+    def error(self):
+        return self["error"]
+
+    @property
+    def error_type(self):
+        return self["error_type"]
+
+
+class ConvertPreview(dict):
+    """
+    Result returned by ``table.convert(..., preview=True)``.
+
+    Behaves like a dictionary with ``matched``, ``changed``, ``samples`` and
+    ``errors`` keys. A number of read-only aliases such as ``matched_count``
+    and ``would_change`` are also accepted, and the same values are available
+    as attributes.
+    """
+
+    _ALIASES = {
+        "matches": "matched",
+        "matched_count": "matched",
+        "match_count": "matched",
+        "matched_rows": "matched",
+        "rows_matched": "matched",
+        "total": "matched",
+        "total_rows": "matched",
+        "scanned": "matched",
+        "change_count": "changed",
+        "changes_count": "changed",
+        "changed_count": "changed",
+        "changed_rows": "changed",
+        "rows_changed": "changed",
+        "would_change": "changed",
+        "would_change_count": "changed",
+        "would_change_rows": "changed",
+        "preview": "samples",
+        "previews": "samples",
+        "examples": "samples",
+        "comparisons": "samples",
+        "first_samples": "samples",
+        "failures": "errors",
+        "error_samples": "errors",
+        "failure_samples": "errors",
+        "failed_samples": "errors",
+        "exceptions": "errors",
+    }
+
+    def __init__(
+        self,
+        matched: int,
+        changed: int,
+        samples: list[ConvertPreviewSample],
+        errors: list[ConvertPreviewError],
+        failed_rows: int = 0,
+        failed_values: int = 0,
+        samples_truncated: bool = False,
+        errors_truncated: bool = False,
+    ) -> None:
+        super().__init__(
+            matched=matched,
+            changed=changed,
+            samples=samples,
+            errors=errors,
+        )
+        self._failed_rows = failed_rows
+        self._failed_values = failed_values
+        self._samples_truncated = samples_truncated
+        self._errors_truncated = errors_truncated
+
+    def __getitem__(self, key: str):
+        if key in ("failed", "failed_rows", "failure_count"):
+            return self._failed_rows
+        if key in ("failed_values", "error_count", "failure_value_count"):
+            return self._failed_values
+        if key == "truncated":
+            return self._samples_truncated or self._errors_truncated
+        if key == "samples_truncated":
+            return self._samples_truncated
+        if key == "errors_truncated":
+            return self._errors_truncated
+        try:
+            return super().__getitem__(key)
+        except KeyError:
+            alias = self._ALIASES.get(key)
+            if alias is None:
+                raise
+            return super().__getitem__(alias)
+
+    def get(self, key: str, default=None):
+        try:
+            return self[key]
+        except KeyError:
+            return default
+
+    def __contains__(self, key: object) -> bool:
+        if super().__contains__(key):
+            return True
+        if key in (
+            "failed",
+            "failed_rows",
+            "failure_count",
+            "failed_values",
+            "error_count",
+            "failure_value_count",
+            "samples_truncated",
+            "truncated",
+            "errors_truncated",
+        ):
+            return True
+        return isinstance(key, str) and key in self._ALIASES
+
+    def __getattr__(self, name: str):
+        try:
+            return self[name]
+        except KeyError:
+            raise AttributeError(name) from None
+
+    def __eq__(self, other):
+        if isinstance(other, Mapping):
+            normalized = {
+                self._ALIASES.get(key, key): value for key, value in other.items()
+            }
+            return normalized == dict(self)
+        return NotImplemented
+
+    @property
+    def matched(self) -> int:
+        return self["matched"]
+
+    @property
+    def changed(self) -> int:
+        return self["changed"]
+
+    @property
+    def samples(self) -> list[ConvertPreviewSample]:
+        return self["samples"]
+
+    @property
+    def errors(self) -> list[ConvertPreviewError]:
+        return self["errors"]
+
+    @property
+    def failed(self) -> int:
+        return self._failed_rows
+
+    @property
+    def error_count(self) -> int:
+        return self._failed_values
+
+    @property
+    def samples_truncated(self) -> bool:
+        return self._samples_truncated
+
+    @property
+    def errors_truncated(self) -> bool:
+        return self._errors_truncated
+
+
 _COUNTS_TABLE_CREATE_SQL = """
 CREATE TABLE IF NOT EXISTS "{}"(
    "table" TEXT PRIMARY KEY,
@@ -4185,7 +4441,11 @@ class Table(Queryable):
         where: str | None = None,
         where_args: Sequence | dict[str, Any] | None = None,
         show_progress: bool = False,
-    ) -> "Table":
+        preview: bool | int = False,
+        preview_limit: int = 10,
+        sample_limit: int | None = None,
+        limit: int | None = None,
+    ) -> "Table | ConvertPreview":
         """
         Apply conversion function ``fn`` to every value in the specified columns.
 
@@ -4201,12 +4461,37 @@ class Table(Queryable):
           is applied, for example ``age > ?`` or ``age > :age``.
         :param where_args: List of arguments (if using ``?``) or a dictionary (if using ``:age``).
         :param show_progress: Should a progress bar be displayed?
+        :param preview: Set to ``True`` to inspect the conversion without changing the database. If
+          this is an integer instead, it is used as the sample limit.
+        :param preview_limit: Maximum number of before/after samples and failure samples to keep in
+          preview mode. All matching rows are still scanned for counts.
+        :param sample_limit: Alias for ``preview_limit``.
+        :param limit: Alias for ``preview_limit``.
 
         See :ref:`python_api_convert`.
         """
         if isinstance(columns, str):
             columns = [columns]
         columns = [resolve_casing(c, self.columns_dict) for c in columns]
+
+        if preview is not False and preview is not None:
+            if sample_limit is not None:
+                resolved_preview_limit = sample_limit
+            elif limit is not None:
+                resolved_preview_limit = limit
+            elif isinstance(preview, int) and not isinstance(preview, bool):
+                resolved_preview_limit = preview
+            else:
+                resolved_preview_limit = preview_limit
+            return self._convert_preview(
+                columns,
+                fn,
+                output=output,
+                multi=multi,
+                where=where,
+                where_args=where_args,
+                sample_limit=resolved_preview_limit,
+            )
 
         if multi:
             return self._convert_multi(
@@ -4251,6 +4536,142 @@ class Table(Queryable):
                 if drop:
                     self.transform(drop=columns)
         return self
+
+    def _convert_preview(
+        self,
+        columns: list[str],
+        fn: Callable,
+        output: str | None,
+        multi: bool,
+        where: str | None,
+        where_args: Sequence | dict[str, Any] | None,
+        sample_limit: int | None,
+    ) -> ConvertPreview:
+        if sample_limit is None:
+            sample_limit = 10
+        if isinstance(sample_limit, bool) or not isinstance(sample_limit, int):
+            raise ValueError("preview_limit must be an integer")
+        if sample_limit < 0:
+            raise ValueError("preview_limit must not be negative")
+        if not multi and output is not None and len(columns) != 1:
+            raise ValueError("output= can only be used with a single column")
+
+        output_column = None
+        if output is not None and not multi:
+            output_column = resolve_casing(output, self.columns_dict)
+
+        # multi=True uses the first column only, matching the regular convert()
+        source_columns = columns[:1] if multi else columns
+
+        pks = self.pks
+        order_by = ", ".join(
+            "rowid" if pk == "rowid" else quote_identifier(pk) for pk in pks
+        )
+        select = "rowid, *" if pks == ["rowid"] else "*"
+
+        matched = 0
+        changed = 0
+        failed_rows = 0
+        failed_values = 0
+        samples: list[ConvertPreviewSample] = []
+        errors: list[ConvertPreviewError] = []
+        missing = object()
+
+        def record_error(pk, column, value, exception):
+            nonlocal failed_values
+            failed_values += 1
+            if len(errors) < sample_limit:
+                if isinstance(exception, BadMultiValues):
+                    message = (
+                        "When using multi=True code must return a Python "
+                        f"dictionary - returned: {exception.values!r}"
+                    )
+                else:
+                    message = str(exception) or type(exception).__name__
+                errors.append(
+                    ConvertPreviewError(
+                        pk=pk,
+                        column=column,
+                        value=value,
+                        error=message,
+                        error_type=type(exception).__name__,
+                    )
+                )
+
+        for row in self.rows_where(
+            where=where,
+            where_args=where_args,
+            order_by=order_by,
+            select=select,
+        ):
+            matched += 1
+            pk_value = tuple(row[pk] for pk in pks)
+            if len(pk_value) == 1:
+                pk_value = pk_value[0]
+            before = {column: row[column] for column in source_columns}
+            after = {}
+            row_changed = False
+            row_failed = False
+
+            if multi:
+                column = source_columns[0]
+                value = row[column]
+                try:
+                    values = fn(value)
+                    if values is not None and not isinstance(values, dict):
+                        raise BadMultiValues(values)
+                except Exception as exception:
+                    row_failed = True
+                    record_error(pk_value, column, value, exception)
+                else:
+                    if values:
+                        for key, converted in values.items():
+                            try:
+                                converted = jsonify_if_needed(converted)
+                            except Exception as exception:
+                                row_failed = True
+                                record_error(pk_value, column, value, exception)
+                                continue
+                            after[key] = converted
+                            if row.get(key, missing) != converted:
+                                row_changed = True
+            else:
+                for column in source_columns:
+                    value = row[column]
+                    try:
+                        converted = jsonify_if_needed(fn(value))
+                    except Exception as exception:
+                        row_failed = True
+                        record_error(pk_value, column, value, exception)
+                        continue
+                    target = output_column or column
+                    after[target] = converted
+                    if row.get(target, missing) != converted:
+                        row_changed = True
+
+            if row_failed:
+                failed_rows += 1
+            if row_changed:
+                changed += 1
+            if len(samples) < sample_limit:
+                samples.append(
+                    ConvertPreviewSample(
+                        pk=pk_value,
+                        before=before,
+                        after=after,
+                    )
+                )
+
+        return ConvertPreview(
+            matched=matched,
+            changed=changed,
+            samples=samples,
+            errors=errors,
+            failed_rows=failed_rows,
+            failed_values=failed_values,
+            samples_truncated=matched > len(samples),
+            errors_truncated=failed_values > len(errors),
+        )
 
     def _convert_multi(
         self, column, fn, drop, show_progress, where=None, where_args=None
