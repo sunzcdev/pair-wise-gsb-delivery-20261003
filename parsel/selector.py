@@ -29,6 +29,7 @@ from .utils import extract_regex, flatten, iflatten, shorten
 
 if TYPE_CHECKING:
     from collections.abc import Mapping
+    from os import PathLike
     from re import Pattern
 
 
@@ -39,6 +40,10 @@ _TostringMethodType = Literal[
     "html",
     "xml",
 ]
+# A file name or a binary, file-like object accepted by lxml.etree.iterparse.
+_XMLSource: TypeAlias = (
+    "str | bytes | PathLike[str] | PathLike[bytes] | typing.IO[bytes]"
+)
 
 
 class CannotRemoveElementWithoutRoot(Exception):
@@ -161,6 +166,133 @@ def create_root_node(
     if root is None:
         root = etree.fromstring(b"<html/>", parser=parser, base_url=base_url)
     return root
+
+
+def _normalize_record_tag(
+    record: str | tuple[str | None, str],
+) -> tuple[str | None, str]:
+    """Return the ``(namespace URI, local name)`` pair of *record*.
+
+    A bare local name matches elements without a namespace. An element name in
+    Clark notation (``{namespace-uri}local-name``) matches by URI and local
+    name, independently of the namespace prefix used in the document.
+    """
+    if isinstance(record, tuple):
+        namespace, local_name = record
+        if not local_name:
+            raise ValueError("The record local name must not be empty")
+        return namespace, local_name
+    if record.startswith("{"):
+        namespace, separator, local_name = record[1:].partition("}")
+        if not separator or not namespace or not local_name:
+            raise ValueError(
+                "Record names with a namespace must use Clark notation: "
+                "'{namespace-uri}local-name'"
+            )
+        return namespace, local_name
+    if not record:
+        raise ValueError("The record local name must not be empty")
+    return None, record
+
+
+def iter_xml_records(
+    source: _XMLSource,
+    record: str | tuple[str | None, str],
+    *,
+    namespaces: Mapping[str, str] | None = None,
+    base_url: str | None = None,
+    huge_tree: bool = True,
+) -> typing.Iterator[Selector]:
+    """Yield one :class:`Selector` per matching record, without building a DOM.
+
+    Large XML collection files are parsed incrementally with
+    :func:`lxml.etree.iterparse`. Only the record element and its descendants
+    are kept in memory at a time, so the whole document never has to fit in
+    memory.
+
+    ``source`` is a file name or a binary, file-like object with a
+    ``.read()`` method (text streams are not supported by the underlying
+    parser, open files in binary mode). When ``source`` is a file-like object,
+    it is never closed here: the caller keeps ownership of it.
+
+    ``record`` identifies the elements to yield. It is either a local name for
+    elements without a namespace (``"item"``), a name in Clark notation that
+    matches by namespace URI and local name (``"{http://example.org}item"``),
+    or a ``(namespace URI, local name)`` tuple where the URI may be ``None``
+    for elements without a namespace. Matching ignores the namespace prefixes
+    used in the document, so the same record under different prefixes is
+    matched as long as the URI and local name agree.
+
+    Each yielded selector wraps a fully parsed record that has been detached
+    from the streaming tree. It can be queried independently with
+    :meth:`Selector.xpath`, :meth:`Selector.css` and the other selector
+    methods, and it stays usable after iteration continues and after the input
+    source is closed. It never points at a node that the parser reuses or
+    clears.
+
+    When a matching record contains another matching record, only the
+    outermost record is yielded: the nested one is part of its parent record
+    and is not emitted separately. Records are yielded in document order.
+
+    External entities are not resolved and network access is disabled. A
+    truncated document or any other malformed XML raises
+    :class:`lxml.etree.XMLSyntaxError` with the underlying parsing error,
+    instead of silently recovering.
+
+    ``namespaces`` registers prefixes for XPath and CSS queries on the yielded
+    selectors. ``base_url`` is stored on each yielded selector and
+    ``huge_tree`` controls the parser's large-document protection, see
+    :class:`Selector` for their meaning.
+
+    .. versionadded:: 1.13.0
+    """
+    namespace, local_name = _normalize_record_tag(record)
+    tag = f"{{{namespace}}}{local_name}" if namespace else local_name
+    context = etree.iterparse(
+        source,
+        events=("start", "end"),
+        tag=(tag,),
+        resolve_entities=False,
+        no_network=True,
+        load_dtd=False,
+        huge_tree=huge_tree,
+    )
+    depth = 0
+    try:
+        for event, element in context:
+            if event == "start":
+                depth += 1
+                continue
+            depth -= 1
+            if depth:
+                # A nested matching record closes as part of its ancestor
+                # record, which is emitted as a whole.
+                continue
+            root = context.root
+            parent = element.getparent()
+            if parent is not None:
+                # Detach before any clearing so the selector owns an
+                # independent subtree that survives further parsing and
+                # source closure. A record that is the document root already
+                # owns its whole tree.
+                parent.remove(element)
+                ancestor = parent
+                while ancestor is not None and ancestor is not root:
+                    grandparent = ancestor.getparent()
+                    for sibling in list(ancestor.itersiblings(preceding=True)):
+                        grandparent.remove(sibling)
+                    ancestor = grandparent
+            yield Selector(
+                root=element,
+                type="xml",
+                namespaces=namespaces,
+                base_url=base_url,
+                huge_tree=huge_tree,
+            )
+    finally:
+        # iterparse never closes a file-like object it did not open; del only
+        # releases the parser and the buffered tree.
+        del context
 
 
 class SelectorList(list[_SelectorType]):

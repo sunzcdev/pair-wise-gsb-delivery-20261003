@@ -2,8 +2,9 @@
 from __future__ import annotations
 
 import re
+from io import BytesIO
 
-from parsel import Selector
+from parsel import Selector, iter_xml_records
 
 
 def correct() -> None:
@@ -25,6 +26,20 @@ def correct() -> None:
     res: int = my_selector.my_own_func()
     sub_res: int = my_selector.xpath("//somens:a/text()")[0].my_own_func()
     jsonpath_res: int = my_selector.jsonpath("$.a")[0].my_own_func()
+
+
+def streaming_xml_records() -> None:
+    source = BytesIO(b"<root><record/></root>")
+    for record in iter_xml_records(
+        source,
+        ("http://example.org", "record"),
+        namespaces={"ex": "http://example.org"},
+    ):
+        value: str | None = record.xpath("ex:item/text()").get()
+        record.css("ex|item").getall()
+
+    for namespaceless in iter_xml_records(source, "record"):
+        namespaceless.get()
 
 
 # Negative checks: all the code lines below have typing errors.

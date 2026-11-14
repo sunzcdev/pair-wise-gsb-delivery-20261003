@@ -3,6 +3,20 @@
 History
 -------
 
+1.13.0 (unreleased)
+~~~~~~~~~~~~~~~~~~~
+
+* Added :func:`parsel.iter_xml_records`, a streaming entry point for large
+  XML collection files. It parses incrementally with ``lxml.etree.iterparse``
+  and yields an independent :class:`~parsel.selector.Selector` for each
+  complete record element matched by namespace URI and local name, without
+  building a DOM for the whole document. Yielded selectors stay queryable
+  while iteration continues and after the input source is closed; nested
+  records with the same name yield only the outermost one; external entities
+  are not resolved and malformed or truncated XML raises the underlying
+  parsing error. The caller keeps ownership of any file-like object passed
+  in.
+
 1.12.1 (2026-09-28)
 ~~~~~~~~~~~~~~~~~~~
 

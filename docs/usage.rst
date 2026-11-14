@@ -1252,6 +1252,58 @@ You can pass several namespaces (here we're using shorter 1-letter prefixes)::
      'https://img1.blogblog.com/img/b16-rounded.gif',
      ...]
 
+.. _topics-streaming-xml:
+
+Streaming large XML files
+--------------------------
+
+Building a :class:`~parsel.selector.Selector` for a very large XML collection
+file loads the whole document into a DOM, which can exhaust the available
+memory. :func:`~parsel.selector.iter_xml_records` instead parses the file
+incrementally and yields one selector per matching record element, keeping
+only that record in memory at a time::
+
+    >>> from io import BytesIO
+    >>> from parsel import iter_xml_records
+    >>> xml = b'''<?xml version="1.0"?>
+    ... <catalog xmlns="http://example.org/shop">
+    ...   <product id="1"><name>Keyboard</name></product>
+    ...   <product id="2"><name>Mouse</name></product>
+    ... </catalog>'''
+    >>> for product in iter_xml_records(
+    ...     BytesIO(xml),
+    ...     "{http://example.org/shop}product",
+    ...     namespaces={"shop": "http://example.org/shop"},
+    ... ):
+    ...     print(product.xpath("@id").get(), product.xpath("shop:name/text()").get())
+    1 Keyboard
+    2 Mouse
+
+The record name is matched by namespace URI and local name, so it works no
+matter which namespace prefixes the document uses. A bare local name
+(``"product"``) matches elements without a namespace, a name in Clark notation
+(``"{uri}product"``) matches namespaced elements, and a
+``(namespace URI, local name)`` tuple, with the URI set to ``None`` for
+namespaceless elements, is also accepted.
+
+Each yielded selector wraps a record that is detached from the streaming
+tree. It can be queried on its own and stays valid after iteration continues
+and after the input source is closed; it never references a node that the
+parser reuses or clears. When a matching record contains another matching
+record, only the outermost record is yielded, and the nested one remains
+queryable inside it. Records are yielded in document order.
+
+The source is a file name or a binary, file-like object (open files in
+binary mode; text streams are not supported). A file-like object is never
+closed by the function, so the caller keeps ownership of it::
+
+    >>> with open("collection.xml", "rb") as stream:
+    ...     records = list(iter_xml_records(stream, "record"))
+
+External entities are not resolved and network access is disabled. Truncated
+or otherwise malformed XML raises :class:`lxml.etree.XMLSyntaxError` instead
+of being silently repaired.
+
 .. _topics-xpath-variables:
 
 Variables in XPath expressions

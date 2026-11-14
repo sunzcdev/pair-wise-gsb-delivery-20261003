@@ -11,11 +11,17 @@ __all__ = [
     "Selector",
     "SelectorList",
     "css2xpath",
+    "iter_xml_records",
     "xpathfuncs",
 ]
 
 from parsel import xpathfuncs
 from parsel.csstranslator import css2xpath
-from parsel.selector import AbsoluteXPathWarning, Selector, SelectorList
+from parsel.selector import (
+    AbsoluteXPathWarning,
+    Selector,
+    SelectorList,
+    iter_xml_records,
+)
 
 xpathfuncs.setup()
