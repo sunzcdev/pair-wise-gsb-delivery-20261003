@@ -154,6 +154,7 @@ def parse(
     resolve_relative_uris: bool | None = None,
     sanitize_html: bool | None = None,
     optimistic_encoding_detection: bool | None = None,
+    tolerant_entries: bool = False,
 ) -> FeedParserDict:
     """Parse a feed from a URL, file, stream, or string.
 
@@ -188,6 +189,14 @@ def parse(
         (uses less memory, but the wrong encoding may be detected in rare cases).
         Defaults to the value of
         :data:`feedparser.OPTIMISTIC_ENCODING_DETECTION`, which is ``True``.
+    :param tolerant_entries:
+        Only applies to JSON feeds. When ``True``, entries whose structure
+        or field types do not conform to the JSON Feed format are skipped
+        instead of aborting the parse; each skipped entry is reported in
+        ``result.skipped_entries`` with its source index, path and reason.
+        Feed-level errors and JSON syntax errors still stop parsing.
+        Defaults to ``False``, which preserves the default exception
+        behavior.
 
     """
 
@@ -230,6 +239,7 @@ def parse(
             resolve_relative_uris=resolve_relative_uris,
             sanitize_html=sanitize_html,
             optimistic_encoding_detection=optimistic_encoding_detection,
+            tolerant_entries=tolerant_entries,
         )
     finally:
         if not hasattr(url_file_stream_or_string, "read"):
@@ -246,6 +256,7 @@ def _parse_file_inplace(
     resolve_relative_uris: bool | None = None,
     sanitize_html: bool | None = None,
     optimistic_encoding_detection: bool | None = None,
+    tolerant_entries: bool = False,
 ) -> None:
     # Avoid a cyclic import.
     import feedparser
@@ -360,7 +371,12 @@ def _parse_file_inplace(
 
     if use_json_parser:
         result["version"] = None
-        feed_parser = JSONParser(baseuri, baselang, "utf-8")
+        feed_parser = JSONParser(
+            baseuri,
+            baselang,
+            "utf-8",
+            tolerant_entries=tolerant_entries,
+        )
         try:
             feed_parser.feed(stream_factory.get_file())
         except Exception as e:
@@ -372,5 +388,6 @@ def _parse_file_inplace(
     result["version"] = result["version"] or feed_parser.version
     if isinstance(feed_parser, JSONParser):
         result["namespaces"] = {}
+        result["skipped_entries"] = feed_parser.skipped_entries
     else:
         result["namespaces"] = feed_parser.namespaces_in_use

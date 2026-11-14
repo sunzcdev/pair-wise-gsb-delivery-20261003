@@ -12,3 +12,4 @@ Advanced Features
     version-detection
     character-encoding
     bozo
+    json-tolerant-entries

@@ -30,6 +30,7 @@ __all__ = [
     "FeedparserError",
     "CharacterEncodingOverride",
     "CharacterEncodingUnknown",
+    "JSONFeedValidationError",
     "NonXMLContentType",
     "UndeclaredNamespace",
 ]
@@ -45,6 +46,20 @@ class CharacterEncodingOverride(FeedparserError):
 
 class CharacterEncodingUnknown(FeedparserError):
     pass
+
+
+class JSONFeedValidationError(FeedparserError):
+    """A JSON Feed document or entry does not match the required structure.
+
+    :param path: Location of the offending value using JSON Pointer-like
+        notation, for example ``items/3/attachments/0/url``.
+    :param reason: Human-readable explanation of why the value is invalid.
+    """
+
+    def __init__(self, path: str, reason: str):
+        self.path = path
+        self.reason = reason
+        super().__init__(f"{path}: {reason}")
 
 
 class NonXMLContentType(FeedparserError):
