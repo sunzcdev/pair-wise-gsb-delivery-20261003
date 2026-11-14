@@ -2026,6 +2026,41 @@ A view that references a column which the transform renamed or dropped will rema
 
 To achieve this, the SQL produced by ``transform_sql()`` turns on ``PRAGMA legacy_alter_table`` for its ``ALTER TABLE ... RENAME TO`` statements, then restores the pragma to the value it had when the SQL was generated - without this, SQLite would attempt to rewrite references to the renamed table in every view definition, which fails when a view references the table that was just dropped.
 
+.. _python_api_rename_column_plan:
+
+Planning a column rename
+------------------------
+
+Column renames can affect indexes, views and triggers, and changes to a view
+can propagate to views that depend on it. Use
+``table.rename_column_plan()`` to review those effects before changing
+anything:
+
+.. code-block:: python
+
+    plan = db["dogs"].rename_column_plan("name", "dog_name")
+    print(plan.to_dict())
+    # plan.actions lists the table change, affected indexes/views/triggers,
+    # direct and transitive dependencies, and proposed SQL
+    plan.apply()
+
+The plan is read-only. It is bound to a fingerprint of the current schema;
+``plan.apply()`` raises ``sqlite_utils.db.RenamePlanError`` without changing
+anything if the schema was modified after the plan was generated. It also
+refuses to run - again before making any changes - if any object cannot be
+rewritten safely, which is reported by ``plan.unsupported`` together with a
+reason.
+
+Renames are applied atomically. If recreating any affected object fails,
+SQLite rolls the transaction back and restores the table, indexes, views and
+triggers. Referenced identifiers are parsed rather than replaced as raw text,
+so comments, string literals and identically named columns on other tables are
+left untouched.
+
+An existing call such as ``table.transform(rename={"name": "dog_name"})``
+continues to work as a single step. A reviewed plan can also be passed to it:
+``table.transform(rename={"name": "dog_name"}, plan=plan)``.
+
 .. _python_api_transform_sql:
 
 Custom transformations with .transform_sql()

@@ -2725,6 +2725,25 @@ def schema(
     help="Enable or disable STRICT mode (default: preserve current mode)",
 )
 @click.option("--sql", is_flag=True, help="Output SQL without executing it")
+@click.option(
+    "--plan",
+    "--dry-run",
+    "plan_only",
+    is_flag=True,
+    help="Output a read-only column rename plan as JSON without executing it",
+)
+@click.option(
+    "--plan-fingerprint",
+    type=str,
+    default=None,
+    help="Only apply a rename if this schema fingerprint still matches",
+)
+@click.option(
+    "--apply-plan",
+    type=click.Path(file_okay=True, dir_okay=False, exists=True),
+    default=None,
+    help="Apply a rename plan previously written as JSON",
+)
 @load_extension_option
 def transform(
     path,
@@ -2743,6 +2762,9 @@ def transform(
     drop_foreign_keys,
     strict,
     sql,
+    plan_only,
+    plan_fingerprint,
+    apply_plan,
     load_extension,
 ):
     """Transform a table beyond the capabilities of ALTER TABLE
@@ -2792,6 +2814,40 @@ def transform(
         pk_value = None
 
     table_obj = db.table(table)
+    plan = None
+    if apply_plan:
+        try:
+            with open(apply_plan, encoding="utf-8") as fp:
+                plan_data = json.load(fp)
+        except (OSError, ValueError) as ex:
+            raise click.ClickException(f"Could not read rename plan: {ex}")
+        from sqlite_utils.db import RenamePlan
+
+        plan = RenamePlan.from_dict(db, plan_data)
+        if not rename_dict:
+            rename_dict = dict(plan.rename)
+    if plan_only:
+        if not rename_dict:
+            raise click.ClickException("--plan requires at least one --rename")
+        click.echo(
+            json.dumps(
+                table_obj.rename_column_plan(rename_dict).to_dict(),
+                indent=2,
+                ensure_ascii=False,
+            )
+        )
+        return
+    if plan_fingerprint is not None:
+        if not rename_dict:
+            raise click.ClickException(
+                "--plan-fingerprint requires at least one --rename"
+            )
+        plan = table_obj.rename_column_plan(rename_dict)
+        if plan_fingerprint != plan.fingerprint:
+            raise click.ClickException(
+                "Schema fingerprint does not match the rename plan; "
+                "no changes have been applied"
+            )
     if sql:
         for line in table_obj.transform_sql(
             types=types,
@@ -2804,6 +2860,7 @@ def transform(
             drop_foreign_keys=drop_foreign_keys_value,
             add_foreign_keys=add_foreign_keys_value,
             strict=strict,
+            plan=plan,
         ):
             click.echo(line)
     else:
@@ -2818,6 +2875,7 @@ def transform(
             drop_foreign_keys=drop_foreign_keys_value,
             add_foreign_keys=add_foreign_keys_value,
             strict=strict,
+            plan=plan,
         )
 
 

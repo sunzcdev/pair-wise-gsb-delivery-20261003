@@ -2,6 +2,7 @@ import binascii
 import contextlib
 import datetime
 import decimal
+import hashlib
 import importlib
 import inspect
 import itertools
@@ -32,6 +33,12 @@ from .create_table_parser import (
     ParseError,
     Unique,
     UniqueColumn,
+    _lex,
+    _matching_paren,
+    _meaningful,
+    _quote_replacement,
+    _SQLITE_KEYWORDS,
+    _unquote,
     check_references_identifier,
     parse_autoincrement,
     parse_checks,
@@ -324,6 +331,1865 @@ Trigger = namedtuple("Trigger", ("name", "table", "sql"))
 
 class TransformError(Exception):
     pass
+
+
+class RenamePlanError(TransformError):
+    "A column rename plan cannot be used against the current schema"
+
+
+class _CallableList(list):
+    "A list that can also be called, for convenient ``plan.sql`` access."
+
+    def __call__(self) -> list[Any]:
+        return list(self)
+
+
+class _CallableStr(str):
+    "A string that can also be called, for convenient fingerprint access."
+
+    def __call__(self) -> str:
+        return str(self)
+
+
+@dataclass(frozen=True, eq=False)
+class RenameAction:
+    """
+    A single object-level action in a :class:`RenamePlan`.
+
+    ``object_type`` is one of ``table``, ``index``, ``view`` or ``trigger``.
+    ``direct`` is true when the object refers to the table being changed
+    directly; transitive view/trigger dependencies have ``direct=False``.
+    """
+
+    object_type: str
+    object_name: str
+    action: str
+    direct: bool = True
+    supported: bool = True
+    reason: str | None = None
+    sql_before: str | None = None
+    sql_after: str | None = None
+    dependencies: tuple[str, ...] = ()
+    depth: int = 0
+
+    def __eq__(self, other: object) -> bool:
+        if isinstance(other, RenameAction):
+            return self.to_dict() == other.to_dict()
+        if isinstance(other, str):
+            return self.object_name == other
+        if isinstance(other, Mapping):
+            own = self.to_dict()
+            return all(own.get(key) == value for key, value in other.items())
+        return NotImplemented
+
+    def __hash__(self) -> int:
+        return hash((self.object_type, self.object_name, self.action))
+
+    def __getitem__(self, key: str) -> Any:
+        aliases = {
+            "type": "object_type",
+            "name": "object_name",
+            "sql": "sql_after",
+            "proposed_action": "action",
+            "affected": "direct",
+            "can_rewrite": "supported",
+        }
+        return getattr(self, aliases.get(key, key))
+
+    def get(self, key: str, default: Any = None) -> Any:
+        try:
+            return self[key]
+        except AttributeError:
+            return default
+
+    @property
+    def can_rewrite(self) -> bool:
+        return self.supported
+
+    @property
+    def type(self) -> str:
+        return self.object_type
+
+    @property
+    def name(self) -> str:
+        return self.object_name
+
+    @property
+    def object(self) -> str:
+        return self.object_name
+
+    @property
+    def sql(self) -> str | None:
+        return self.sql_after
+
+    @property
+    def affected(self) -> bool:
+        return self.direct
+
+    @property
+    def proposed_action(self) -> str:
+        return self.action
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "object_type": self.object_type,
+            "object_name": self.object_name,
+            "type": self.object_type,
+            "name": self.object_name,
+            "action": self.action,
+            "proposed_action": self.action,
+            "direct": self.direct,
+            "supported": self.supported,
+            "can_rewrite": self.supported,
+            "reason": self.reason,
+            "sql_before": self.sql_before,
+            "sql_after": self.sql_after,
+            "sql": self.sql_after,
+            "dependencies": list(self.dependencies),
+            "depth": self.depth,
+        }
+
+    def keys(self) -> Any:
+        return self.to_dict().keys()
+
+    as_dict = to_dict
+
+    def items(self) -> Any:
+        return self.to_dict().items()
+
+    def values(self) -> Any:
+        return self.to_dict().values()
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> "RenameAction":
+        return cls(
+            object_type=str(data["object_type"]),
+            object_name=str(data["object_name"]),
+            action=str(data["action"]),
+            direct=bool(data.get("direct", True)),
+            supported=bool(data.get("supported", True)),
+            reason=data.get("reason"),
+            sql_before=data.get("sql_before"),
+            sql_after=data.get("sql_after"),
+            dependencies=tuple(data.get("dependencies", ())),
+            depth=int(data.get("depth", 0)),
+        )
+
+
+@dataclass
+class RenamePlan:
+    """
+    A read-only description of a column rename and the schema objects it
+    affects. Call :meth:`apply` after reviewing the plan; the schema
+    fingerprint is checked again immediately before any changes are made.
+    """
+
+    table: str
+    rename: dict[str, str]
+    fingerprint: str
+    db: "Database" = field(repr=False, compare=False)
+    schema_version: int | None = None
+    actions: list[RenameAction] = field(default_factory=list)
+
+    def __getitem__(self, key: str) -> Any:
+        aliases = {
+            "schema_fingerprint": "fingerprint",
+            "objects": "actions",
+            "changes": "actions",
+        }
+        return getattr(self, aliases.get(key, key))
+
+    def get(self, key: str, default: Any = None) -> Any:
+        try:
+            return self[key]
+        except AttributeError:
+            return default
+
+    @property
+    def schema_fingerprint(self) -> str:
+        return _CallableStr(self.fingerprint)
+
+    @property
+    def table_name(self) -> str:
+        return self.table
+
+    @property
+    def rename_map(self) -> dict[str, str]:
+        return dict(self.rename)
+
+    @property
+    def dependencies(self) -> list[RenameAction]:
+        return _CallableList(
+            action for action in self.actions if action.object_type != "table"
+        )
+
+    @property
+    def objects(self) -> list[RenameAction]:
+        return self.actions
+
+    @property
+    def changes(self) -> list[RenameAction]:
+        return self.actions
+
+    @property
+    def direct_dependencies(self) -> list[RenameAction]:
+        return _CallableList(
+            action for action in self.dependencies if action.direct
+        )
+
+    @property
+    def transitive_dependencies(self) -> list[RenameAction]:
+        return _CallableList(
+            action for action in self.dependencies if not action.direct
+        )
+
+    @property
+    def direct(self) -> list[RenameAction]:
+        return self.direct_dependencies
+
+    @property
+    def transitive(self) -> list[RenameAction]:
+        return self.transitive_dependencies
+
+    @property
+    def affected(self) -> list[RenameAction]:
+        return self.dependencies
+
+    @property
+    def affected_objects(self) -> list[str]:
+        return _CallableList(
+            action.object_name for action in self.dependencies
+        )
+
+    @property
+    def dependencies_by_object(self) -> dict[str, RenameAction]:
+        return {action.object_name: action for action in self.dependencies}
+
+    @property
+    def unsupported(self) -> list[RenameAction]:
+        return _CallableList(
+            action for action in self.actions if not action.supported
+        )
+
+    @property
+    def supported(self) -> bool:
+        return not self.unsupported
+
+    @property
+    def is_supported(self) -> bool:
+        return self.supported
+
+    @property
+    def ok(self) -> bool:
+        return self.supported
+
+    @property
+    def sql(self) -> list[str]:
+        "SQL statements that will be executed, in order."
+        return _CallableList(_rename_plan_sql(self))
+
+    def validate(self) -> None:
+        """
+        Raise :class:`RenamePlanError` unless the database schema still
+        matches the schema this plan was generated against.
+        """
+        current = _schema_fingerprint(self.db)
+        if current != self.fingerprint:
+            raise RenamePlanError(
+                "Schema has changed since this rename plan was generated; "
+                "the schema fingerprint no longer matches. "
+                "No changes have been applied. Generate a new plan and review "
+                "it before applying changes."
+            )
+
+    def matches_schema(self) -> bool:
+        "Return ``True`` if the current schema still matches this plan."
+        try:
+            self.validate()
+        except RenamePlanError:
+            return False
+        return True
+
+    @property
+    def is_current(self) -> bool:
+        return self.matches_schema()
+
+    @property
+    def valid(self) -> bool:
+        return self.matches_schema()
+
+    def apply(
+        self,
+        *,
+        expected_fingerprint: str | None = None,
+        confirm: bool | str | None = None,
+        fingerprint: str | None = None,
+        schema_fingerprint: str | None = None,
+        confirm_fingerprint: str | None = None,
+        expected_schema_fingerprint: str | None = None,
+    ) -> "Table":
+        """
+        Apply this plan atomically after checking the schema fingerprint.
+
+        :param expected_fingerprint: Optional fingerprint supplied by the
+          caller who reviewed the plan. It must match both the database's
+          current schema and the fingerprint stored in this plan.
+        """
+        for supplied_fingerprint in (
+            expected_fingerprint,
+            fingerprint,
+            schema_fingerprint,
+            confirm_fingerprint,
+            expected_schema_fingerprint,
+            confirm if isinstance(confirm, str) else None,
+        ):
+            if (
+                supplied_fingerprint is not None
+                and supplied_fingerprint != self.fingerprint
+            ):
+                raise RenamePlanError(
+                    "The supplied fingerprint does not match this rename plan "
+                    "or the current schema."
+                )
+        if confirm is False:
+            raise RenamePlanError(
+                "The rename plan has not been confirmed; no changes were applied."
+            )
+        self.validate()
+        if not self.supported:
+            reasons = "; ".join(
+                "{object_type} {object_name}: {reason}".format(
+                    object_type=action.object_type,
+                    object_name=action.object_name,
+                    reason=action.reason or "cannot be rewritten safely",
+                )
+                for action in self.unsupported
+            )
+            raise RenamePlanError(
+                "Rename plan contains objects that cannot be automatically "
+                f"rewritten; no changes have been applied. {reasons}"
+            )
+        return _apply_rename_plan(self)
+
+    execute = apply
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "table": self.table,
+            "rename": dict(self.rename),
+            "fingerprint": self.fingerprint,
+            "schema_fingerprint": self.fingerprint,
+            "schema_version": self.schema_version,
+            "supported": self.supported,
+            "actions": [action.to_dict() for action in self.actions],
+            "dependencies": [
+                action.to_dict() for action in self.dependencies
+            ],
+            "direct_dependencies": [
+                action.to_dict() for action in self.direct_dependencies
+            ],
+            "transitive_dependencies": [
+                action.to_dict() for action in self.transitive_dependencies
+            ],
+            "unsupported": [
+                action.to_dict() for action in self.unsupported
+            ],
+        }
+
+    as_dict = to_dict
+
+    def keys(self) -> Any:
+        return self.to_dict().keys()
+
+    def items(self) -> Any:
+        return self.to_dict().items()
+
+    def values(self) -> Any:
+        return self.to_dict().values()
+
+    def to_json(self, **kwargs: Any) -> str:
+        return json.dumps(self.to_dict(), ensure_ascii=False, **kwargs)
+
+    @classmethod
+    def from_dict(
+        cls, db: "Database", data: Mapping[str, Any]
+    ) -> "RenamePlan":
+        return cls(
+            table=str(data["table"]),
+            rename={
+                str(key): str(value)
+                for key, value in dict(data["rename"]).items()
+            },
+            fingerprint=str(
+                data.get("fingerprint") or data["schema_fingerprint"]
+            ),
+            db=db,
+            schema_version=data.get("schema_version"),
+            actions=[
+                RenameAction.from_dict(action)
+                for action in data.get("actions", [])
+            ],
+        )
+
+
+@dataclass(frozen=True)
+class _SchemaObject:
+    type: str
+    name: str
+    table_name: str
+    sql: str | None
+
+
+def _schema_objects(db: "Database") -> list[_SchemaObject]:
+    return [
+        _SchemaObject(*row)
+        for row in db.execute(
+            """
+            select type, name, tbl_name, sql
+            from sqlite_master
+            where name not like 'sqlite_%'
+            order by
+                case type
+                    when 'table' then 0
+                    when 'index' then 1
+                    when 'view' then 2
+                    when 'trigger' then 3
+                    else 4
+                end,
+                name
+            """
+        ).fetchall()
+    ]
+
+
+def _schema_fingerprint(db: "Database") -> str:
+    rows = db.execute(
+        """
+        select type, name, tbl_name, sql
+        from sqlite_master
+        where name not like 'sqlite_%'
+        order by type, name
+        """
+    ).fetchall()
+    schema_version = db.execute("PRAGMA schema_version").fetchone()[0]
+    payload = json.dumps(
+        {"objects": [list(row) for row in rows], "schema_version": schema_version},
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _rename_plan_sql(plan: RenamePlan) -> list[str]:
+    sql = _rename_plan_drop_sql(plan)
+    for action in plan.actions:
+        if (
+            action.object_type == "table"
+            and action.action == "rename_column"
+            and action.sql_after
+        ):
+            sql.append(action.sql_after)
+    sql.extend(_rename_plan_create_sql(plan))
+    return [statement for statement in sql if statement]
+
+
+def _rename_plan_drop_sql(plan: RenamePlan) -> list[str]:
+    sql: list[str] = []
+    triggers = [
+        action
+        for action in plan.actions
+        if action.supported
+        and action.object_type == "trigger"
+        and action.sql_after is not None
+    ]
+    views = [
+        action
+        for action in plan.actions
+        if action.supported
+        and action.object_type == "view"
+        and action.sql_after is not None
+    ]
+    for action in sorted(
+        triggers, key=lambda action: (-action.depth, action.object_name)
+    ):
+        sql.append(f"DROP TRIGGER IF EXISTS {quote_identifier(action.object_name)};")
+    for action in reversed(_order_view_actions(views)):
+        sql.append(f"DROP VIEW IF EXISTS {quote_identifier(action.object_name)};")
+    return sql
+
+
+def _order_view_actions(actions: list[RenameAction]) -> list[RenameAction]:
+    if not actions:
+        return []
+    by_name = {
+        fold_identifier_case(action.object_name): action for action in actions
+    }
+    result: list[RenameAction] = []
+    pending = list(actions)
+    done: set[str] = set()
+    while pending:
+        progressed = False
+        for action in sorted(
+            pending, key=lambda item: (item.depth, item.object_name)
+        ):
+            view_dependencies = {
+                fold_identifier_case(dependency)
+                for dependency in action.dependencies
+                if fold_identifier_case(dependency) in by_name
+            }
+            if view_dependencies - done:
+                continue
+            result.append(action)
+            done.add(fold_identifier_case(action.object_name))
+            pending.remove(action)
+            progressed = True
+        if not progressed:
+            result.extend(
+                sorted(
+                    pending,
+                    key=lambda item: (item.depth, item.object_name),
+                )
+            )
+            break
+    return result
+
+
+def _rename_plan_create_sql(plan: RenamePlan) -> list[str]:
+    views = [
+        action
+        for action in plan.actions
+        if action.supported
+        and action.object_type == "view"
+        and action.sql_after is not None
+    ]
+    triggers = [
+        action
+        for action in plan.actions
+        if action.supported
+        and action.object_type == "trigger"
+        and action.sql_after is not None
+    ]
+    sql = [
+        action.sql_after or ""
+        for action in _order_view_actions(views)
+    ]
+    sql.extend(
+        action.sql_after or ""
+        for action in sorted(
+            triggers, key=lambda action: (action.depth, action.object_name)
+        )
+    )
+    return [statement for statement in sql if statement]
+
+
+def _apply_rename_plan(plan: RenamePlan) -> "Table":
+    # ALTER TABLE and the DROP/CREATE statements below are all transactional.
+    # atomic() uses a savepoint when the caller already has a transaction open,
+    # so a failure restores every affected object without committing.
+    with plan.db.atomic():
+        for statement in _rename_plan_sql(plan):
+            plan.db.execute(statement)
+    return plan.db.table(plan.table)
+
+
+_RELATION_TERMINATORS = frozenset(
+    (
+        "WHERE",
+        "GROUP",
+        "ORDER",
+        "HAVING",
+        "LIMIT",
+        "WINDOW",
+        "UNION",
+        "EXCEPT",
+        "INTERSECT",
+        "RETURNING",
+        "SET",
+        "VALUES",
+    )
+)
+
+
+def _token_depths(tokens: Iterable[Any]) -> list[int]:
+    depths = []
+    depth = 0
+    for token in tokens:
+        if token.text == ")":
+            depth = max(0, depth - 1)
+        depths.append(depth)
+        if token.text == "(":
+            depth += 1
+    return depths
+
+
+def _relation_name_at(
+    tokens: list[Any], index: int
+) -> tuple[str | None, int]:
+    if index >= len(tokens):
+        return None, index
+    token = tokens[index]
+    if token.kind not in ("word", "identifier"):
+        return None, index
+    name = _unquote(token.text)
+    next_index = index + 1
+    while (
+        next_index + 1 < len(tokens)
+        and tokens[next_index].text == "."
+        and tokens[next_index + 1].kind in ("word", "identifier")
+    ):
+        name = _unquote(tokens[next_index + 1].text)
+        next_index += 2
+    return name, next_index
+
+
+def _relation_references(
+    sql: str | None,
+    known_relations: dict[str, str],
+    fallback_table: str | None = None,
+) -> set[str]:
+    if not sql:
+        return {fallback_table} if fallback_table else set()
+    try:
+        tokens = _meaningful(_lex(sql))
+    except ParseError:
+        return {fallback_table} if fallback_table else set()
+    references: set[str] = set()
+    if fallback_table and fallback_table in known_relations.values():
+        references.add(fallback_table)
+    depth = 0
+    from_depth: int | None = None
+    in_from = False
+    in_condition = False
+    expect_relation = False
+    for index, token in enumerate(tokens):
+        if token.text == ")":
+            depth = max(0, depth - 1)
+        if token.text == "(":
+            depth += 1
+            if expect_relation:
+                expect_relation = False
+            continue
+        if token.is_keyword("FROM"):
+            expect_relation = True
+            in_from = True
+            in_condition = False
+            from_depth = depth
+            continue
+        if token.is_keyword("JOIN"):
+            expect_relation = True
+            in_condition = False
+            continue
+        if token.is_keyword("INTO"):
+            expect_relation = True
+            continue
+        if token.is_keyword("UPDATE"):
+            # CREATE TRIGGER ... UPDATE OF col ON table is an event, not DML.
+            if index + 1 >= len(tokens) or not tokens[index + 1].is_keyword("OF"):
+                expect_relation = True
+            continue
+        if token.text == "," and in_from and not in_condition:
+            if from_depth is None or depth == from_depth:
+                expect_relation = True
+                continue
+        if in_from and depth == from_depth and (
+            token.text == ";"
+            or (token.kind == "word" and token.text.upper() in _RELATION_TERMINATORS)
+        ):
+            in_from = False
+            in_condition = False
+            expect_relation = False
+            continue
+        if in_from and depth == from_depth and (
+            token.is_keyword("ON") or token.is_keyword("USING")
+        ):
+            in_condition = True
+            continue
+        if expect_relation:
+            if token.kind == "word" and token.text.upper() in {
+                "OR",
+                "REPLACE",
+                "IGNORE",
+                "ABORT",
+                "FAIL",
+                "ROLLBACK",
+            }:
+                continue
+            name, next_index = _relation_name_at(tokens, index)
+            if name is not None:
+                actual = known_relations.get(fold_identifier_case(name))
+                if actual is not None:
+                    references.add(actual)
+                expect_relation = False
+            elif token.kind == "word" and token.text.upper() in {
+                "SELECT",
+                "WITH",
+            }:
+                expect_relation = False
+    return references
+
+
+def _known_relations(objects: list[_SchemaObject]) -> dict[str, str]:
+    return {
+        fold_identifier_case(obj.name): obj.name
+        for obj in objects
+        if obj.type in ("table", "view")
+    }
+
+
+def _object_dependencies(
+    objects: list[_SchemaObject],
+) -> dict[tuple[str, str], set[str]]:
+    known = _known_relations(objects)
+    dependencies: dict[tuple[str, str], set[str]] = {}
+    for obj in objects:
+        if obj.type not in ("view", "trigger"):
+            continue
+        dependencies[(obj.type, obj.name)] = _relation_references(
+            obj.sql,
+            known,
+            fallback_table=obj.table_name if obj.type == "trigger" else None,
+        )
+    return dependencies
+
+
+def _clone_schema(
+    objects: list[_SchemaObject],
+    dependencies: dict[tuple[str, str], set[str]],
+) -> "sqlite3.Connection":
+    connection = sqlite3.connect(":memory:")
+    connection.execute("PRAGMA foreign_keys=OFF")
+    virtual_prefixes: set[str] = set()
+    for obj in objects:
+        if obj.type != "table" or not obj.sql:
+            continue
+        match = _virtual_table_using_re.match(obj.sql)
+        if match is None:
+            continue
+        for key, value in match.groupdict().items():
+            if key != "using" and value:
+                virtual_prefixes.add(fold_identifier_case(value) + "_")
+                break
+
+    def is_shadow_object(obj: _SchemaObject) -> bool:
+        names = (
+            fold_identifier_case(obj.name),
+            fold_identifier_case(obj.table_name),
+        )
+        return any(
+            name.startswith(prefix)
+            for name in names
+            for prefix in virtual_prefixes
+        )
+
+    tables = [
+        obj
+        for obj in objects
+        if obj.type == "table" and obj.sql and not is_shadow_object(obj)
+    ]
+    indexes = [
+        obj
+        for obj in objects
+        if obj.type == "index" and obj.sql and not is_shadow_object(obj)
+    ]
+    views = [obj for obj in objects if obj.type == "view" and obj.sql]
+    triggers = [obj for obj in objects if obj.type == "trigger" and obj.sql]
+    for obj in tables:
+        connection.execute(obj.sql)
+    for obj in indexes:
+        connection.execute(obj.sql)
+
+    created_views: set[str] = set()
+    pending = list(views)
+    last_error: Exception | None = None
+    while pending:
+        progressed = False
+        for obj in list(pending):
+            deps = {
+                fold_identifier_case(dep)
+                for dep in dependencies.get(("view", obj.name), set())
+                if fold_identifier_case(dep) not in created_views
+            }
+            if any(
+                dep in {fold_identifier_case(item.name) for item in views}
+                for dep in deps
+            ):
+                continue
+            try:
+                connection.execute(obj.sql or "")
+            except sqlite3.Error as ex:
+                last_error = ex
+                continue
+            created_views.add(fold_identifier_case(obj.name))
+            pending.remove(obj)
+            progressed = True
+        if not progressed:
+            if pending:
+                if last_error is None:
+                    last_error = sqlite3.OperationalError(
+                        "Could not resolve view creation order"
+                    )
+                raise last_error
+            break
+    for obj in triggers:
+        connection.execute(obj.sql or "")
+    return connection
+
+
+def _table_columns(connection: "sqlite3.Connection", name: str) -> list[str]:
+    return [
+        row[1]
+        for row in connection.execute(
+            f"PRAGMA table_info({quote_identifier(name)})"
+        ).fetchall()
+    ]
+
+
+def _safe_table_columns(
+    connection: "sqlite3.Connection", name: str
+) -> tuple[list[str] | None, str | None]:
+    try:
+        return _table_columns(connection, name), None
+    except sqlite3.Error as ex:
+        return None, str(ex)
+
+
+def _output_rename_map(
+    before_columns: list[str], after_columns: list[str]
+) -> dict[str, str]:
+    if len(before_columns) != len(after_columns):
+        return {}
+    changes: dict[str, str] = {}
+    for before, after in zip(before_columns, after_columns):
+        if fold_identifier_case(before) != fold_identifier_case(after):
+            changes[before] = after
+    return changes
+
+
+def _rename_alter_statements(
+    table: "Table", rename: dict[str, str]
+) -> list[str]:
+    folded_old = {fold_identifier_case(old) for old in rename}
+    needs_temporary_names = any(
+        fold_identifier_case(new) in folded_old for new in rename.values()
+    )
+    if not needs_temporary_names:
+        return [
+            f"ALTER TABLE {quote_identifier(table.name)} "
+            f"RENAME COLUMN {quote_identifier(old)} TO {quote_identifier(new)};"
+            for old, new in rename.items()
+        ]
+    used = {
+        fold_identifier_case(column) for column in table.columns_dict
+    } | {fold_identifier_case(new) for new in rename.values()}
+    temporary_names: dict[str, str] = {}
+    for index, old in enumerate(rename, 1):
+        candidate = f"__sqlite_utils_rename_{index}"
+        while fold_identifier_case(candidate) in used:
+            candidate += "_"
+        used.add(fold_identifier_case(candidate))
+        temporary_names[old] = candidate
+    statements = [
+        f"ALTER TABLE {quote_identifier(table.name)} "
+        f"RENAME COLUMN {quote_identifier(old)} "
+        f"TO {quote_identifier(temporary_names[old])};"
+        for old in rename
+    ]
+    statements.extend(
+        f"ALTER TABLE {quote_identifier(table.name)} "
+        f"RENAME COLUMN {quote_identifier(temporary_names[old])} "
+        f"TO {quote_identifier(new)};"
+        for old, new in rename.items()
+    )
+    return statements
+
+
+def _object_sql(
+    objects: list[_SchemaObject], object_type: str, name: str
+) -> str | None:
+    for obj in objects:
+        if obj.type == object_type and obj.name == name:
+            return obj.sql
+    return None
+
+
+def _dml_target_relation(
+    tokens: list[Any], depths: list[int], index: int
+) -> str | None:
+    target: str | None = None
+    target_depth: int | None = None
+    for current in range(index - 1, -1, -1):
+        token = tokens[current]
+        if depths[current] > depths[index]:
+            continue
+        if token.is_keyword("INTO") or token.is_keyword("UPDATE"):
+            if token.is_keyword("UPDATE") and current + 1 < len(tokens):
+                if tokens[current + 1].is_keyword("OF"):
+                    continue
+            name, _ = _relation_name_at(tokens, current + 1)
+            if name is not None:
+                target = name
+                target_depth = depths[current]
+                break
+        if token.text == ";" and depths[current] <= depths[index]:
+            break
+    if target is None:
+        return None
+    if target_depth is not None and target_depth > depths[index]:
+        return None
+    return target
+
+
+def _rewrite_columns(
+    sql: str,
+    changes: dict[str, dict[str, str]],
+    columns_by_relation: dict[str, set[str]],
+    trigger_table: str | None = None,
+) -> tuple[str, list[str]]:
+    """
+    Rewrite column identifiers using token spans, never string replacement.
+
+    ``changes`` maps folded relation names to ``{folded_old: new}``. Comments,
+    string literals and identifiers belonging to other relations are left
+    untouched. If an unqualified reference is ambiguous the rewrite is
+    refused and an explanation is returned in the second element.
+    """
+    if not changes or not sql:
+        return sql, []
+    try:
+        raw_tokens = _lex(sql)
+    except ParseError as ex:
+        return sql, [f"could not parse SQL: {ex}"]
+    tokens = _meaningful(raw_tokens)
+    depths = _token_depths(tokens)
+    issues: list[str] = []
+    edits: list[tuple[int, int, str]] = []
+
+    def candidate_for(relation: str | None, old_folded: str) -> str | None:
+        if relation is None:
+            return None
+        mapping = changes.get(fold_identifier_case(relation))
+        if not mapping:
+            return None
+        return mapping.get(old_folded)
+
+    # Build SELECT scopes and the aliases visible in each FROM clause.
+    scopes: list[dict[str, Any]] = []
+    for index, token in enumerate(tokens):
+        if not token.is_keyword("SELECT"):
+            continue
+        scope_depth = depths[index]
+        end = len(tokens)
+        for current in range(index + 1, len(tokens)):
+            if depths[current] < scope_depth:
+                end = current
+                break
+            if depths[current] == scope_depth and tokens[current].text == ";":
+                end = current
+                break
+            if depths[current] == scope_depth and tokens[current].kind == "word":
+                if tokens[current].text.upper() in {"UNION", "EXCEPT", "INTERSECT"}:
+                    end = current
+                    break
+        from_index = None
+        for current in range(index + 1, end):
+            if depths[current] == scope_depth and tokens[current].is_keyword("FROM"):
+                from_index = current
+                break
+        aliases: dict[str, str | None] = {}
+        if from_index is not None:
+            expect_relation = True
+            in_condition = False
+            current = from_index + 1
+            while current < end:
+                current_token = tokens[current]
+                if depths[current] != scope_depth:
+                    current += 1
+                    continue
+                if current_token.kind == "word" and (
+                    current_token.text.upper() in _RELATION_TERMINATORS
+                    or current_token.text.upper() in {"UNION", "EXCEPT", "INTERSECT"}
+                ):
+                    break
+                if current_token.is_keyword("JOIN"):
+                    expect_relation = True
+                    in_condition = False
+                    current += 1
+                    continue
+                if current_token.text == "," and not in_condition:
+                    expect_relation = True
+                    current += 1
+                    continue
+                if current_token.is_keyword("ON") or current_token.is_keyword("USING"):
+                    in_condition = True
+                    current += 1
+                    continue
+                if not expect_relation:
+                    current += 1
+                    continue
+                if current_token.text == "(":
+                    try:
+                        close = _matching_paren(tokens, current)
+                    except ParseError:
+                        break
+                    next_index = close + 1
+                    alias = None
+                    if next_index < end and tokens[next_index].is_keyword("AS"):
+                        next_index += 1
+                    if next_index < end:
+                        alias_token = tokens[next_index]
+                        if alias_token.kind in ("word", "identifier"):
+                            alias = _unquote(alias_token.text)
+                    if alias:
+                        aliases[fold_identifier_case(alias)] = None
+                    current = next_index + 1
+                    expect_relation = False
+                    continue
+                relation, next_index = _relation_name_at(tokens, current)
+                if relation is None:
+                    current += 1
+                    continue
+                aliases[fold_identifier_case(relation)] = relation
+                alias_index = next_index
+                if alias_index < end and tokens[alias_index].is_keyword("AS"):
+                    alias_index += 1
+                if alias_index < end:
+                    alias_token = tokens[alias_index]
+                    if alias_token.kind in ("word", "identifier"):
+                        if not (
+                            alias_token.kind == "word"
+                            and alias_token.text.upper() in _SQLITE_KEYWORDS
+                        ):
+                            aliases[fold_identifier_case(_unquote(alias_token.text))] = (
+                                relation
+                            )
+                current = next_index + 1
+                expect_relation = False
+        scopes.append(
+            {
+                "start": index,
+                "end": end,
+                "depth": scope_depth,
+                "aliases": aliases,
+            }
+        )
+
+    def scope_for(index: int) -> dict[str, Any] | None:
+        candidates = [
+            scope
+            for scope in scopes
+            if scope["start"] <= index < scope["end"]
+        ]
+        if not candidates:
+            return None
+        return max(candidates, key=lambda scope: (scope["depth"], scope["start"]))
+
+    # CREATE TRIGGER ... UPDATE OF old ON target uses a bare column name.
+    if trigger_table:
+        for index, token in enumerate(tokens):
+            if not token.is_keyword("UPDATE"):
+                continue
+            if index + 2 >= len(tokens) or not tokens[index + 1].is_keyword("OF"):
+                continue
+            for event_token in tokens[index + 2 :]:
+                if event_token.is_keyword("ON") or event_token.text == ";":
+                    break
+                if event_token.kind not in ("word", "identifier"):
+                    continue
+                old_name = _unquote(event_token.text)
+                replacement = candidate_for(
+                    trigger_table, fold_identifier_case(old_name)
+                )
+                if replacement is not None:
+                    edits.append(
+                        (
+                            event_token.start,
+                            event_token.end,
+                            _quote_replacement(event_token.text, replacement),
+                        )
+                    )
+
+    all_old = {
+        old for mapping in changes.values() for old in mapping
+    }
+    object_context_keywords = {
+        "FROM",
+        "JOIN",
+        "INTO",
+        "UPDATE",
+        "TABLE",
+        "VIEW",
+        "TRIGGER",
+        "INDEX",
+        "AS",
+        "COLLATE",
+    }
+    for index, token in enumerate(tokens):
+        if token.kind not in ("word", "identifier"):
+            continue
+        old_name = _unquote(token.text)
+        old_folded = fold_identifier_case(old_name)
+        if old_folded not in all_old:
+            continue
+        previous = tokens[index - 1] if index else None
+        following = tokens[index + 1] if index + 1 < len(tokens) else None
+        if following is not None and following.text in (".", "("):
+            continue
+        if previous is not None and previous.kind == "word":
+            if previous.text.upper() in object_context_keywords:
+                continue
+        if previous is not None and previous.text == ".":
+            qualifier_token = tokens[index - 2] if index >= 2 else None
+            if qualifier_token is None or qualifier_token.kind not in (
+                "word",
+                "identifier",
+            ):
+                continue
+            qualifier = _unquote(qualifier_token.text)
+            scope = scope_for(index)
+            relation: str | None = None
+            if scope is not None:
+                relation = scope["aliases"].get(fold_identifier_case(qualifier))
+            if relation is None:
+                for candidate_scope in scopes:
+                    relation = candidate_scope["aliases"].get(
+                        fold_identifier_case(qualifier)
+                    )
+                    if relation is not None:
+                        break
+            if relation is None and fold_identifier_case(qualifier) in columns_by_relation:
+                relation = qualifier
+            if (
+                trigger_table
+                and fold_identifier_case(qualifier) in {"new", "old"}
+            ):
+                relation = trigger_table
+            replacement = candidate_for(relation, old_folded)
+            if replacement is not None:
+                edits.append(
+                    (
+                        token.start,
+                        token.end,
+                        _quote_replacement(token.text, replacement),
+                    )
+                )
+            continue
+
+        scope = scope_for(index)
+        if scope is not None:
+            present = {
+                relation
+                for relation in scope["aliases"].values()
+                if relation is not None
+            }
+            affected = [
+                relation
+                for relation in present
+                if candidate_for(relation, old_folded) is not None
+            ]
+            unrelated = [
+                relation
+                for relation in present
+                if relation not in affected
+                and old_folded
+                in {
+                    fold_identifier_case(column)
+                    for column in columns_by_relation.get(
+                        fold_identifier_case(relation), set()
+                    )
+                }
+            ]
+            unknown = any(
+                relation is None for relation in scope["aliases"].values()
+            )
+            if affected and (len(affected) > 1 or unrelated or unknown):
+                issues.append(
+                    f"unqualified column {old_name!r} is ambiguous in a query scope"
+                )
+                continue
+            if len(affected) == 1:
+                replacement = candidate_for(affected[0], old_folded)
+                if replacement is not None:
+                    edits.append(
+                        (
+                            token.start,
+                            token.end,
+                            _quote_replacement(token.text, replacement),
+                        )
+                    )
+                continue
+
+        dml_target = _dml_target_relation(tokens, depths, index)
+        replacement = candidate_for(dml_target, old_folded)
+        if replacement is not None:
+            edits.append(
+                (
+                    token.start,
+                    token.end,
+                    _quote_replacement(token.text, replacement),
+                )
+            )
+
+    for start, end, replacement_text in reversed(edits):
+        sql = sql[:start] + replacement_text + sql[end:]
+    return sql, issues
+
+
+def _index_sql_references_identifier(
+    sql: str | None, identifier: str
+) -> bool:
+    if not sql:
+        return False
+    try:
+        tokens = _meaningful(_lex(sql))
+    except ParseError:
+        return False
+    on_index = None
+    for index, token in enumerate(tokens):
+        if token.is_keyword("ON"):
+            on_index = index
+            break
+    start = 0
+    if on_index is not None:
+        for index in range(on_index + 1, len(tokens)):
+            if tokens[index].text == "(":
+                start = index
+                break
+    folded = fold_identifier_case(identifier)
+    return any(
+        token.kind in ("word", "identifier")
+        and fold_identifier_case(_unquote(token.text)) == folded
+        for token in tokens[start:]
+    )
+
+
+def _column_map_for_matching(
+    db: "Database", objects: list[_SchemaObject]
+) -> dict[str, set[str]]:
+    columns: dict[str, set[str]] = {}
+    for obj in objects:
+        if obj.type not in ("table", "view"):
+            continue
+        names, _ = _safe_table_columns(db.conn, obj.name)
+        columns[fold_identifier_case(obj.name)] = {
+            fold_identifier_case(name) for name in (names or [])
+        }
+    return columns
+
+
+def _generate_rename_plan(
+    table: "Table", rename: dict[str, str]
+) -> RenamePlan:
+    db = table.db
+    target = table.name
+    target_folded = fold_identifier_case(target)
+    objects = _schema_objects(db)
+    known = _known_relations(objects)
+    dependencies = _object_dependencies(objects)
+    columns_by_relation = _column_map_for_matching(db, objects)
+    fingerprint = _schema_fingerprint(db)
+    schema_version = db.execute("PRAGMA schema_version").fetchone()[0]
+    plan = RenamePlan(
+        table=target,
+        rename=dict(rename),
+        fingerprint=fingerprint,
+        db=db,
+        schema_version=schema_version,
+    )
+
+    if not table.exists():
+        plan.actions.append(
+            RenameAction(
+                "table",
+                target,
+                "rename_column",
+                supported=False,
+                reason="table does not exist",
+                sql_before=None,
+                sql_after=None,
+            )
+        )
+        return plan
+
+    # Build the dependency graph, including the depth at which each object
+    # depends on the table being changed.
+    dependents: dict[str, list[tuple[str, str]]] = {}
+    for key, relation_names in dependencies.items():
+        for relation_name in relation_names:
+            dependents.setdefault(
+                fold_identifier_case(relation_name), []
+            ).append(key)
+
+    depths: dict[tuple[str, str], int] = {}
+    direct_keys: set[tuple[str, str]] = set()
+    for key, relation_names in dependencies.items():
+        if target_folded in {
+            fold_identifier_case(relation_name) for relation_name in relation_names
+        }:
+            direct_keys.add(key)
+            depths[key] = 1
+    pending = list(direct_keys)
+    while pending:
+        key = pending.pop(0)
+        depth = depths[key]
+        for dependent in dependents.get(fold_identifier_case(key[1]), []):
+            if dependent not in depths:
+                depths[dependent] = depth + 1
+                pending.append(dependent)
+
+    try:
+        clone = _clone_schema(objects, dependencies)
+    except sqlite3.Error as ex:
+        plan.actions.append(
+            RenameAction(
+                "table",
+                target,
+                "rename_column",
+                supported=False,
+                reason=f"could not build a read-only schema copy: {ex}",
+                sql_before=table.schema,
+                sql_after=None,
+            )
+        )
+        for key, depth in sorted(depths.items(), key=lambda item: item[1]):
+            plan.actions.append(
+                RenameAction(
+                    key[0],
+                    key[1],
+                    "manual",
+                    direct=key in direct_keys,
+                    supported=False,
+                    reason="dependency could not be analysed without a schema copy",
+                    dependencies=tuple(sorted(dependencies.get(key, set()))),
+                    depth=depth,
+                )
+            )
+        return plan
+
+    # SQLite's own ALTER TABLE ... RENAME COLUMN parser performs the rewrite
+    # for directly dependent schema objects. We run it against the disposable
+    # copy and read the resulting SQL back, which keeps comments, string
+    # literals and unrelated columns untouched.
+    transitive_keys = {
+        key for key, depth in depths.items() if depth > 1
+    }
+    view_names_folded = {
+        fold_identifier_case(obj.name)
+        for obj in objects
+        if obj.type == "view"
+    }
+    manual_view_keys = {
+        key
+        for key in transitive_keys
+        if key[0] == "view"
+    }
+    # A directly-dependent view can also depend on another view. It has to be
+    # dropped before ALTER TABLE, otherwise SQLite tries to rewrite it through
+    # the old output name of that upstream view.
+    manual_view_keys.update(
+        key
+        for key in direct_keys
+        if key[0] == "view"
+        and any(
+            fold_identifier_case(dependency) in view_names_folded
+            for dependency in dependencies.get(key, set())
+        )
+    )
+    manual_trigger_keys = {
+        key
+        for key in transitive_keys
+        if key[0] == "trigger"
+    }
+    manual_trigger_keys.update(
+        key
+        for key in direct_keys
+        if key[0] == "trigger"
+        and any(
+            fold_identifier_case(dependency) in view_names_folded
+            for dependency in dependencies.get(key, set())
+        )
+    )
+    for key in sorted(
+        (key for key in manual_trigger_keys if key[0] == "trigger"),
+        key=lambda item: -depths[item],
+    ):
+        clone.execute(f"DROP TRIGGER IF EXISTS {quote_identifier(key[1])}")
+    for key in sorted(
+        (key for key in manual_view_keys if key[0] == "view"),
+        key=lambda item: -depths[item],
+    ):
+        clone.execute(f"DROP VIEW IF EXISTS {quote_identifier(key[1])}")
+
+    alter_actions: list[RenameAction] = []
+    for statement in _rename_alter_statements(table, rename):
+        try:
+            clone.execute(statement)
+        except sqlite3.Error as ex:
+            plan.actions.append(
+                RenameAction(
+                    "table",
+                    target,
+                    "rename_column",
+                    supported=False,
+                    reason=f"SQLite could not rewrite the dependent schema: {ex}",
+                    sql_before=table.schema,
+                    sql_after=statement,
+                )
+            )
+            for key, depth in sorted(depths.items(), key=lambda item: item[1]):
+                plan.actions.append(
+                    RenameAction(
+                        key[0],
+                        key[1],
+                        "manual",
+                        direct=key in direct_keys,
+                        supported=False,
+                        reason=(
+                            "SQLite could not safely rewrite this object when "
+                            "the column was renamed"
+                        ),
+                        dependencies=tuple(
+                            sorted(dependencies.get(key, set()))
+                        ),
+                        depth=depth,
+                    )
+                )
+            clone.close()
+            return plan
+        alter_actions.append(
+            RenameAction(
+                "table",
+                target,
+                "rename_column",
+                direct=True,
+                supported=True,
+                sql_before=table.schema,
+                sql_after=statement,
+            )
+        )
+    plan.actions.extend(alter_actions)
+
+    changes: dict[str, dict[str, str]] = {
+        target_folded: {
+            fold_identifier_case(old): new for old, new in rename.items()
+        }
+    }
+
+    def clone_sql(object_type: str, name: str) -> str | None:
+        row = clone.execute(
+            "select sql from sqlite_master where type = ? and name = ?",
+            (object_type, name),
+        ).fetchone()
+        return row[0] if row else None
+
+    # Indexes that belong to the table are handled by SQLite's ALTER TABLE.
+    plan.actions.extend(
+        _rename_index_actions(
+            table, objects, clone, rename
+        )
+    )
+    for obj in objects:
+        if obj.type != "table" or not obj.sql:
+            continue
+        if _virtual_table_using_re.match(obj.sql) is None:
+            continue
+        if target_folded not in fold_identifier_case(obj.sql):
+            continue
+        virtual_columns = {
+            fold_identifier_case(column)
+            for column in _table_columns(db.conn, obj.name)
+        }
+        if virtual_columns & set(changes[target_folded]):
+            plan.actions.append(
+                RenameAction(
+                    "virtual_table",
+                    obj.name,
+                    "manual",
+                    direct=True,
+                    supported=False,
+                    reason=(
+                        "virtual table stores its own copy of the renamed "
+                        "column and cannot be rebuilt automatically"
+                    ),
+                    sql_before=obj.sql,
+                    sql_after=obj.sql,
+                    dependencies=(target,),
+                    depth=1,
+                )
+            )
+
+    # Direct views and triggers are rewritten by SQLite in the clone.
+    direct_views = sorted(
+        (
+            key
+            for key in direct_keys
+            if key[0] == "view" and key not in manual_view_keys
+        ),
+        key=lambda item: (depths[item], item[1]),
+    )
+    direct_triggers = sorted(
+        (
+            key
+            for key in direct_keys
+            if key[0] == "trigger" and key not in manual_trigger_keys
+        ),
+        key=lambda item: (depths[item], item[1]),
+    )
+    for key in direct_views:
+        name = key[1]
+        before_sql = _object_sql(objects, "view", name)
+        after_sql = clone_sql("view", name)
+        before_columns, before_error = _safe_table_columns(db.conn, name)
+        after_columns, after_error = _safe_table_columns(clone, name)
+        if before_error or after_error:
+            plan.actions.append(
+                RenameAction(
+                    "view",
+                    name,
+                    "manual",
+                    direct=True,
+                    supported=False,
+                    reason=(
+                        f"could not determine the view columns: "
+                        f"{before_error or after_error}"
+                    ),
+                    sql_before=before_sql,
+                    sql_after=after_sql,
+                    dependencies=tuple(
+                        sorted(dependencies.get(key, set()))
+                    ),
+                    depth=depths[key],
+                )
+            )
+            continue
+        output_changes = _output_rename_map(
+            before_columns or [], after_columns or []
+        )
+        if after_sql != before_sql or output_changes:
+            plan.actions.append(
+                RenameAction(
+                    "view",
+                    name,
+                    "recreate_view",
+                    direct=True,
+                    supported=True,
+                    sql_before=before_sql,
+                    sql_after=after_sql,
+                    dependencies=tuple(
+                        sorted(dependencies.get(key, set()))
+                    ),
+                    depth=depths[key],
+                )
+            )
+        if output_changes:
+            changes[fold_identifier_case(name)] = {
+                fold_identifier_case(old): new
+                for old, new in output_changes.items()
+            }
+    views_requiring_recreate = {
+        fold_identifier_case(action.object_name)
+        for action in plan.actions
+        if action.object_type == "view" and action.supported
+    }
+
+    for key in direct_triggers:
+        name = key[1]
+        before_sql = _object_sql(objects, "trigger", name)
+        after_sql = clone_sql("trigger", name)
+        if after_sql != before_sql:
+            plan.actions.append(
+                RenameAction(
+                    "trigger",
+                    name,
+                    "recreate_trigger",
+                    direct=True,
+                    supported=True,
+                    sql_before=before_sql,
+                    sql_after=after_sql,
+                    dependencies=tuple(
+                        sorted(dependencies.get(key, set()))
+                    ),
+                    depth=depths[key],
+                )
+            )
+
+    blocked_views: set[str] = set()
+    pending_manual_views = list(manual_view_keys)
+    manual_views: list[tuple[str, str]] = []
+    while pending_manual_views:
+        progressed = False
+        for key in sorted(
+            pending_manual_views, key=lambda item: (depths[item], item[1])
+        ):
+            pending_manual_folded = {
+                fold_identifier_case(item[1]) for item in pending_manual_views
+            }
+            if any(
+                fold_identifier_case(dependency) in pending_manual_folded
+                for dependency in dependencies.get(key, set())
+                if fold_identifier_case(dependency) in view_names_folded
+            ):
+                continue
+            manual_views.append(key)
+            pending_manual_views.remove(key)
+            progressed = True
+        if not progressed:
+            # A cycle is invalid SQLite schema, but do not hang the planner.
+            manual_views.extend(pending_manual_views)
+            break
+    for key in manual_views:
+        name = key[1]
+        before_sql = _object_sql(objects, "view", name)
+        if before_sql is None:
+            continue
+        direct = key in direct_keys
+        must_recreate = any(
+            fold_identifier_case(dependency) in views_requiring_recreate
+            for dependency in dependencies.get(key, set())
+        )
+        if any(
+            fold_identifier_case(dependency) in blocked_views
+            for dependency in dependencies.get(key, set())
+        ):
+            blocked_views.add(fold_identifier_case(name))
+            plan.actions.append(
+                RenameAction(
+                    "view",
+                    name,
+                    "manual",
+                    direct=direct,
+                    supported=False,
+                    reason="depends on another object that cannot be rewritten",
+                    sql_before=before_sql,
+                    dependencies=tuple(
+                        sorted(dependencies.get(key, set()))
+                    ),
+                    depth=depths[key],
+                )
+            )
+            continue
+        rewritten, issues = _rewrite_columns(
+            before_sql,
+            changes,
+            columns_by_relation,
+            trigger_table=None,
+        )
+        if issues:
+            blocked_views.add(fold_identifier_case(name))
+            plan.actions.append(
+                RenameAction(
+                    "view",
+                    name,
+                    "manual",
+                    direct=direct,
+                    supported=False,
+                    reason="; ".join(sorted(set(issues))),
+                    sql_before=before_sql,
+                    dependencies=tuple(
+                        sorted(dependencies.get(key, set()))
+                    ),
+                    depth=depths[key],
+                )
+            )
+            continue
+        try:
+            clone.execute(rewritten)
+        except sqlite3.Error as ex:
+            blocked_views.add(fold_identifier_case(name))
+            plan.actions.append(
+                RenameAction(
+                    "view",
+                    name,
+                    "manual",
+                    direct=direct,
+                    supported=False,
+                    reason=f"could not safely recreate the view: {ex}",
+                    sql_before=before_sql,
+                    dependencies=tuple(
+                        sorted(dependencies.get(key, set()))
+                    ),
+                    depth=depths[key],
+                )
+            )
+            continue
+        before_columns, before_error = _safe_table_columns(db.conn, name)
+        after_columns, after_error = _safe_table_columns(clone, name)
+        if before_error or after_error:
+            blocked_views.add(fold_identifier_case(name))
+            plan.actions.append(
+                RenameAction(
+                    "view",
+                    name,
+                    "manual",
+                    direct=direct,
+                    supported=False,
+                    reason=(
+                        f"could not determine the view columns: "
+                        f"{before_error or after_error}"
+                    ),
+                    sql_before=before_sql,
+                    sql_after=rewritten,
+                    dependencies=tuple(
+                        sorted(dependencies.get(key, set()))
+                    ),
+                    depth=depths[key],
+                )
+            )
+            continue
+        output_changes = _output_rename_map(
+            before_columns or [], after_columns or []
+        )
+        if rewritten != before_sql or output_changes or must_recreate:
+            plan.actions.append(
+                RenameAction(
+                    "view",
+                    name,
+                    "recreate_view",
+                    direct=direct,
+                    supported=True,
+                    sql_before=before_sql,
+                    sql_after=rewritten,
+                    dependencies=tuple(
+                        sorted(dependencies.get(key, set()))
+                    ),
+                    depth=depths[key],
+                )
+            )
+            views_requiring_recreate.add(fold_identifier_case(name))
+        if output_changes:
+            changes[fold_identifier_case(name)] = {
+                fold_identifier_case(old): new
+                for old, new in output_changes.items()
+            }
+
+    for key in sorted(
+        (key for key in manual_trigger_keys if key[0] == "trigger"),
+        key=lambda item: (depths[item], item[1]),
+    ):
+        name = key[1]
+        before_sql = _object_sql(objects, "trigger", name)
+        if before_sql is None:
+            continue
+        direct = key in direct_keys
+        must_recreate = any(
+            fold_identifier_case(dependency) in views_requiring_recreate
+            for dependency in dependencies.get(key, set())
+        )
+        rewritten, issues = _rewrite_columns(
+            before_sql,
+            changes,
+            columns_by_relation,
+            trigger_table=key[1],
+        )
+        if issues:
+            plan.actions.append(
+                RenameAction(
+                    "trigger",
+                    name,
+                    "manual",
+                    direct=direct,
+                    supported=False,
+                    reason="; ".join(sorted(set(issues))),
+                    sql_before=before_sql,
+                    dependencies=tuple(
+                        sorted(dependencies.get(key, set()))
+                    ),
+                    depth=depths[key],
+                )
+            )
+            continue
+        try:
+            clone.execute(rewritten)
+        except sqlite3.Error as ex:
+            plan.actions.append(
+                RenameAction(
+                    "trigger",
+                    name,
+                    "manual",
+                    direct=direct,
+                    supported=False,
+                    reason=f"could not safely recreate the trigger: {ex}",
+                    sql_before=before_sql,
+                    dependencies=tuple(
+                        sorted(dependencies.get(key, set()))
+                    ),
+                    depth=depths[key],
+                )
+            )
+            continue
+        if rewritten != before_sql or must_recreate:
+            plan.actions.append(
+                RenameAction(
+                    "trigger",
+                    name,
+                    "recreate_trigger",
+                    direct=direct,
+                    supported=True,
+                    sql_before=before_sql,
+                    sql_after=rewritten,
+                    dependencies=tuple(
+                        sorted(dependencies.get(key, set()))
+                    ),
+                    depth=depths[key],
+                )
+            )
+
+    clone.close()
+    return plan
+
+
+def _rename_index_actions(
+    table: "Table",
+    objects: list[_SchemaObject],
+    clone: "sqlite3.Connection",
+    rename: dict[str, str],
+) -> list[RenameAction]:
+    actions: list[RenameAction] = []
+    target_folded = fold_identifier_case(table.name)
+    old_folded = {fold_identifier_case(old) for old in rename}
+    xindexes = {index.name: index for index in table.xindexes}
+    for index in table.indexes:
+        index_sql = _object_sql(objects, "index", index.name)
+        column_names = {
+            fold_identifier_case(column)
+            for column in index.columns
+            if column is not None
+        }
+        complex_index = index.partial or any(
+            column.name is None
+            for column in xindexes.get(index.name, XIndex("", [])).columns
+            if column.key
+        )
+        mentions_old = bool(column_names & old_folded) or any(
+            _index_sql_references_identifier(index_sql, old) for old in rename
+        )
+        if not mentions_old:
+            continue
+        row = clone.execute(
+            "select sql from sqlite_master where type = 'index' and name = ?",
+            (index.name,),
+        ).fetchone()
+        after_sql = row[0] if row else None
+        reason = None
+        if complex_index:
+            reason = (
+                f"Index {index.name!r} is a partial or expression index, so "
+                "it cannot be safely recreated automatically"
+            )
+        actions.append(
+            RenameAction(
+                "index",
+                index.name,
+                "recreate_index" if index_sql is not None else "preserve_index",
+                direct=True,
+                supported=not complex_index,
+                reason=reason,
+                sql_before=index_sql,
+                sql_after=after_sql,
+                dependencies=(table.name,),
+                depth=1,
+            )
+        )
+    return actions
 
 
 # A single column name, or a tuple of columns for a compound foreign key
@@ -1016,6 +2882,36 @@ class Database:
         kwargs.setdefault("strict", self.strict)
         return Table(self, table_name, **kwargs)
 
+    def rename_column_plan(
+        self,
+        table: str,
+        rename: Mapping[str, str] | str | None = None,
+        new: str | None = None,
+        *,
+        old: str | None = None,
+    ) -> RenamePlan:
+        "Return a read-only column rename plan for the specified table."
+        return self.table(table).rename_column_plan(
+            rename=rename, new=new, old=old
+        )
+
+    plan_rename = rename_column_plan
+    rename_plan = rename_column_plan
+    plan_column_rename = rename_column_plan
+    plan_rename_column = rename_column_plan
+
+    def apply_rename_plan(self, plan: RenamePlan, **kwargs: Any) -> "Table":
+        "Validate and atomically apply a column rename plan."
+        return plan.apply(**kwargs)
+
+    execute_rename_plan = apply_rename_plan
+    apply_plan = apply_rename_plan
+    execute_plan = apply_rename_plan
+
+    def rename_column(self, table: str, old: str, new: str) -> "Table":
+        "Create and apply a safe column rename plan in one call."
+        return self.table(table).rename_column(old, new)
+
     def view(self, view_name: str) -> "View":
         """
         Return a view object.
@@ -1111,6 +3007,11 @@ class Database:
                 "select name from sqlite_master where type = 'view'"
             ).fetchall()
         ]
+
+    @property
+    def schema_fingerprint(self) -> str:
+        "SHA-256 fingerprint of the current ``sqlite_master`` schema."
+        return _CallableStr(_schema_fingerprint(self))
 
     @property
     def tables(self) -> list["Table"]:
@@ -2249,6 +4150,11 @@ class Queryable:
             "select sql from sqlite_master where name = ?", (self.name,)
         ).fetchone()[0]
 
+    @property
+    def schema_fingerprint(self) -> str:
+        "SHA-256 fingerprint of the current database schema."
+        return self.db.schema_fingerprint
+
 
 class Table(Queryable):
     """
@@ -2640,6 +4546,104 @@ class Table(Queryable):
             self.db.execute(sql)
         return self.db.table(new_name)
 
+    def rename_column_plan(
+        self,
+        rename: Mapping[str, str] | str | None = None,
+        new: str | None = None,
+        *,
+        old: str | None = None,
+    ) -> RenamePlan:
+        """
+        Return a read-only plan for renaming one or more columns.
+
+        The plan lists affected indexes, views and triggers (including
+        transitive view dependencies), the SQL that would be executed and any
+        objects that cannot be rewritten safely. It is bound to a fingerprint
+        of the current schema; :meth:`RenamePlan.apply` refuses to run if the
+        schema has changed since the plan was generated.
+
+        ``rename`` can be a ``{old: new}`` mapping, or pass a single old name
+        as the first argument and the new name as the second.
+        """
+        if old is not None:
+            if rename is not None:
+                raise ValueError("Pass either rename or old, not both")
+            rename = old
+        if isinstance(rename, str):
+            if new is None:
+                raise ValueError("A new column name is required")
+            rename = {rename: new}
+        elif new is not None:
+            raise ValueError("new can only be used with a single old column name")
+        if not rename:
+            raise ValueError("At least one column rename is required")
+        if not isinstance(rename, Mapping):
+            raise TypeError("rename must be a mapping of old names to new names")
+        existing_columns = self.columns_dict
+        resolved: dict[str, str] = {}
+        for old_name, new_name in rename.items():
+            if not isinstance(old_name, str) or not isinstance(new_name, str):
+                raise TypeError("rename keys and values must be strings")
+            resolved_name = resolve_casing(old_name, existing_columns)
+            if resolved_name not in existing_columns:
+                raise ValueError(
+                    f"Column {old_name!r} does not exist on table {self.name!r}"
+                )
+            if not new_name:
+                raise ValueError("New column names cannot be empty")
+            resolved[resolved_name] = new_name
+        folded_new = {fold_identifier_case(value) for value in resolved.values()}
+        if len(folded_new) != len(resolved):
+            raise ValueError("Two columns cannot be renamed to the same name")
+        existing_folded = {
+            fold_identifier_case(name): name for name in existing_columns
+        }
+        renamed_old_folded = {
+            fold_identifier_case(name) for name in resolved
+        }
+        for old_name, new_name in resolved.items():
+            if (
+                fold_identifier_case(new_name) in existing_folded
+                and fold_identifier_case(new_name) not in renamed_old_folded
+            ):
+                raise ValueError(
+                    f"Column {new_name!r} already exists on table {self.name!r}"
+                )
+        return _generate_rename_plan(self, resolved)
+
+    plan_rename = rename_column_plan
+    rename_plan = rename_column_plan
+    plan_column_rename = rename_column_plan
+    plan_rename_column = rename_column_plan
+    transform_plan = rename_column_plan
+
+    def apply_rename_plan(self, plan: RenamePlan, **kwargs: Any) -> "Table":
+        "Validate and atomically apply a :class:`RenamePlan`."
+        if plan.table != self.name:
+            raise RenamePlanError(
+                f"Plan is for table {plan.table!r}, not {self.name!r}"
+            )
+        return plan.apply(**kwargs)
+
+    execute_rename_plan = apply_rename_plan
+    apply_plan = apply_rename_plan
+    execute_plan = apply_rename_plan
+
+    def rename_column(
+        self,
+        old: str,
+        new: str,
+        *,
+        plan: RenamePlan | None = None,
+    ) -> "Table":
+        """
+        Rename a column, optionally after reviewing a plan.
+
+        When ``plan`` is omitted this creates and applies a plan in one call.
+        """
+        plan = plan or self.rename_column_plan(old, new)
+        return self.apply_rename_plan(plan)
+
     def transform(
         self,
         *,
@@ -2655,6 +4659,12 @@ class Table(Queryable):
         column_order: list[str] | None = None,
         keep_table: str | None = None,
         strict: bool | None = None,
+        plan: RenamePlan | bool | None = None,
+        rename_plan: RenamePlan | bool | None = None,
+        plan_fingerprint: str | None = None,
+        confirm_fingerprint: str | None = None,
+        plan_only: bool = False,
+        dry_run: bool = False,
     ) -> "Table":
         """
         Apply an advanced alter table, including operations that are not supported by
@@ -2684,9 +4694,108 @@ class Table(Queryable):
           dropped
         :param strict: Set to ``True`` to make the table strict or ``False`` to make it
           non-strict. Defaults to ``None``, which preserves the existing strict mode.
+        :param plan: Optional :class:`RenamePlan` to validate and apply. Supplying
+          a plan does not require callers that do not use plans to change their
+          existing ``transform(rename=...)`` call.
+        :param rename_plan: Alias for ``plan``.
+        :param plan_fingerprint: A fingerprint the caller reviewed. A rename
+          plan is generated (or the supplied plan checked) and the operation
+          refuses to run unless this value matches.
+        :param confirm_fingerprint: Alias for ``plan_fingerprint``.
+        :param plan_only: Return a read-only :class:`RenamePlan` instead of
+          applying the rename. Requires ``rename=``.
+        :param dry_run: Alias for ``plan_only``.
         """
         if not self.exists():
             raise ValueError("Cannot transform a table that doesn't exist yet")
+        if dry_run or plan_only:
+            if not rename:
+                raise ValueError("dry_run/plan_only requires rename=")
+            return self.rename_column_plan(rename)  # type: ignore[return-value]
+        if plan is not None and rename_plan is not None:
+            raise ValueError("Specify either plan or rename_plan, not both")
+        plan = plan or rename_plan
+        if plan is True:
+            if not rename:
+                raise ValueError("plan=True requires rename=")
+            plan = self.rename_column_plan(rename)
+        if plan is False:
+            plan = None
+        supplied_fingerprint = plan_fingerprint or confirm_fingerprint
+        if supplied_fingerprint is not None:
+            if plan is None:
+                if not rename:
+                    raise ValueError(
+                        "plan_fingerprint requires rename= or plan="
+                    )
+                plan = self.rename_column_plan(rename)
+            if supplied_fingerprint != plan.fingerprint:
+                raise RenamePlanError(
+                    "The supplied fingerprint does not match the current "
+                    "rename plan; no changes have been applied."
+                )
+        if plan is not None:
+            if plan.table != self.name:
+                raise RenamePlanError(
+                    f"Plan is for table {plan.table!r}, not {self.name!r}"
+                )
+            plan.validate()
+            if not plan.supported:
+                plan.apply()
+            if rename is None:
+                rename = dict(plan.rename)
+            else:
+                resolved_rename = {
+                    resolve_casing(key, self.columns_dict): value
+                    for key, value in rename.items()
+                }
+                if {
+                    fold_identifier_case(key): value
+                    for key, value in resolved_rename.items()
+                } != {
+                    fold_identifier_case(key): value
+                    for key, value in plan.rename.items()
+                }:
+                    raise RenamePlanError(
+                        "The rename argument does not match the reviewed plan."
+                    )
+            pure_rename = (
+                types is None
+                and drop is None
+                and pk is DEFAULT
+                and not_null is None
+                and defaults is None
+                and drop_foreign_keys is None
+                and add_foreign_keys is None
+                and foreign_keys is None
+                and column_order is None
+                and keep_table is None
+                and strict is None
+            )
+            if pure_rename:
+                return plan.apply()
+            with self.db.atomic():
+                for statement in _rename_plan_drop_sql(plan):
+                    self.db.execute(statement)
+                self.transform(
+                    types=types,
+                    rename=rename,
+                    drop=drop,
+                    pk=pk,
+                    not_null=not_null,
+                    defaults=defaults,
+                    drop_foreign_keys=drop_foreign_keys,
+                    add_foreign_keys=add_foreign_keys,
+                    foreign_keys=foreign_keys,
+                    column_order=column_order,
+                    keep_table=keep_table,
+                    strict=strict,
+                )
+                for statement in _rename_plan_create_sql(plan):
+                    self.db.execute(statement)
+            if strict is not None:
+                self._defaults["strict"] = strict
+            return self
         sqls = self.transform_sql(
             types=types,
             rename=rename,
@@ -2786,6 +4895,10 @@ class Table(Queryable):
         tmp_suffix: str | None = None,
         keep_table: str | None = None,
         strict: bool | None = None,
+        plan: RenamePlan | bool | None = None,
+        rename_plan: RenamePlan | bool | None = None,
+        plan_fingerprint: str | None = None,
+        confirm_fingerprint: str | None = None,
     ) -> list[str]:
         """
         Return a list of SQL statements that should be executed in order to apply this transformation.
@@ -2808,9 +4921,77 @@ class Table(Queryable):
           dropped
         :param strict: Set to ``True`` to make the table strict or ``False`` to make it
           non-strict. Defaults to ``None``, which preserves the existing strict mode.
+        :param plan: Optional reviewed :class:`RenamePlan`. For a pure rename this
+          returns the plan's complete, standalone SQL statements.
+        :param rename_plan: Alias for ``plan``.
+        :param plan_fingerprint: Only return SQL if this reviewed fingerprint
+          still matches the generated or supplied rename plan.
+        :param confirm_fingerprint: Alias for ``plan_fingerprint``.
         """
         if strict is True and not self.db.supports_strict:
             raise TransformError("SQLite does not support STRICT tables")
+        if plan is not None and rename_plan is not None:
+            raise ValueError("Specify either plan or rename_plan, not both")
+        plan = plan or rename_plan
+        if plan is True:
+            if not rename:
+                raise ValueError("plan=True requires rename=")
+            plan = self.rename_column_plan(rename)
+        if plan is False:
+            plan = None
+        supplied_fingerprint = plan_fingerprint or confirm_fingerprint
+        if supplied_fingerprint is not None:
+            if plan is None:
+                if not rename:
+                    raise ValueError(
+                        "plan_fingerprint requires rename= or plan="
+                    )
+                plan = self.rename_column_plan(rename)
+            if supplied_fingerprint != plan.fingerprint:
+                raise RenamePlanError(
+                    "The supplied fingerprint does not match the current "
+                    "rename plan; no SQL was generated."
+                )
+        plan_with_object_changes = plan
+        if plan is not None:
+            if plan.table != self.name:
+                raise RenamePlanError(
+                    f"Plan is for table {plan.table!r}, not {self.name!r}"
+                )
+            plan.validate()
+            if not plan.supported:
+                plan.apply()
+            if rename is None:
+                rename = dict(plan.rename)
+            else:
+                resolved_rename = {
+                    resolve_casing(key, self.columns_dict): value
+                    for key, value in rename.items()
+                }
+                if {
+                    fold_identifier_case(key): value
+                    for key, value in resolved_rename.items()
+                } != {
+                    fold_identifier_case(key): value
+                    for key, value in plan.rename.items()
+                }:
+                    raise RenamePlanError(
+                        "The rename argument does not match the reviewed plan."
+                    )
+            if (
+                types is None
+                and drop is None
+                and pk is DEFAULT
+                and not_null is None
+                and defaults is None
+                and drop_foreign_keys is None
+                and add_foreign_keys is None
+                and foreign_keys is None
+                and column_order is None
+                and keep_table is None
+                and strict is None
+            ):
+                return plan.sql
         types = types or {}
         rename = rename or {}
         drop = drop or set()
@@ -3251,6 +5432,12 @@ class Table(Queryable):
             )
         # Re-add existing indexes
         sqls.extend(index_create_sqls)
+        if plan_with_object_changes is not None:
+            return (
+                _rename_plan_drop_sql(plan_with_object_changes)
+                + sqls
+                + _rename_plan_create_sql(plan_with_object_changes)
+            )
         return sqls
 
     def extract(

@@ -4,6 +4,11 @@
  Changelog
 ===========
 
+Unreleased
+----------
+
+- New ``table.rename_column_plan()`` returns a read-only, fingerprint-bound plan for renaming columns. It lists affected indexes, views and triggers along with transitive dependencies and proposed SQL, and reports objects that cannot be rewritten safely before changes are made. Plans apply atomically, so a failure restores every affected object. Existing ``table.transform(rename=...)`` calls continue to work in one step, and can optionally accept a reviewed ``plan=`` argument.
+
 .. _v4_2_1:
 
 4.2.1 (2026-08-13)

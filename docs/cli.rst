@@ -2277,6 +2277,15 @@ Every option for this table (with the exception of ``--pk-none``) can be specifi
 ``--no-strict``
     Convert a strict table back to a regular non-strict table.
 
+``--plan``
+    Output a read-only JSON rename plan instead of changing the table. The plan lists affected indexes, views and triggers, including transitive view dependencies, the SQL that would run and any objects that cannot be rewritten automatically.
+
+``--plan-fingerprint fingerprint``
+    Use with one or more ``--rename`` options. Generate a rename plan, then fail without changing anything unless its schema fingerprint matches the supplied value.
+
+``--apply-plan plan.json``
+    Apply a rename plan written by ``--plan``. The plan's schema fingerprint is checked again before any changes are made.
+
 If you want to see the SQL that will be executed to make the change without actually executing it, add the ``--sql`` flag. For example:
 
 .. code-block:: bash

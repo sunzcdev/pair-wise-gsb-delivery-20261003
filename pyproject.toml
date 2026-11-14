@@ -91,3 +91,6 @@ extend-exclude = [
 
 [tool.setuptools.package-data]
 sqlite_utils = ["py.typed"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
