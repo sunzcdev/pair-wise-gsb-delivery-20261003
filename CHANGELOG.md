@@ -3,6 +3,16 @@ Changelog
 
 ## Master
 
+* Periodic tasks can specify a `timezone` (IANA key or tzinfo) so the
+  schedule is evaluated against local wall-clock time in that timezone
+  rather than the machine/UTC clock. New `dst_ambiguous` ('once'/'twice')
+  and `dst_nonexistent` ('skip'/'shift') options control how DST
+  transitions are handled.
+* Timezone-aware periodic task occurrences are claimed atomically in
+  storage (keyed by task and scheduled occurrence), so a scheduler restart
+  or system clock rollback will not enqueue the same occurrence twice.
+  Tasks without a timezone keep the previous behavior.
+
 [View commits](https://github.com/coleifer/huey/compare/3.5.4...master)
 
 ## 3.5.4

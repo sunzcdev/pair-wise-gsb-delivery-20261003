@@ -39,6 +39,9 @@ from huey.storage import RedisStorage
 from huey.storage import SqliteStorage
 from huey.utils import ChordConfig
 from huey.utils import Error
+from huey.utils import local_to_utc
+from huey.utils import periodic_occurrences
+from huey.utils import resolve_timezone
 from huey.utils import SKIPPED
 from huey.utils import noop_context
 from huey.utils import normalize_expire_time
@@ -91,6 +94,11 @@ class Huey(object):
             generate_nightly_report()
     """
     storage_class = None
+
+    # How long claimed periodic-task occurrences are remembered, so that a
+    # scheduler restart or a system clock rollback does not cause the same
+    # occurrence of a timezone-aware periodic task to be enqueued again.
+    periodic_occurrence_ttl = 60 * 60 * 48
 
     def __init__(self, name='huey', results=True, store_none=False, utc=True,
                  immediate=False, serializer=None, compression=False,
@@ -188,7 +196,33 @@ class Huey(object):
 
     def periodic_task(self, validate_datetime, retries=0, retry_delay=0,
                       retry_backoff=0, priority=None, context=False, name=None,
-                      expires=None, timeout=None, **kwargs):
+                      expires=None, timeout=None, timezone=None,
+                      dst_ambiguous='once', dst_nonexistent='skip', **kwargs):
+        """
+        Decorator for registering a periodic task.
+
+        :param validate_datetime: predicate (typically built with
+            :py:func:`crontab`) returning whether the task should run at a
+            given datetime.
+        :param timezone: an IANA timezone key (e.g. ``"America/New_York"``)
+            or tzinfo. When specified, the schedule is evaluated against the
+            local wall-clock time in this timezone rather than the Huey
+            instance's own (UTC or system-local) clock.
+        :param dst_ambiguous: ``'once'`` (default) to run only on the first
+            occurrence when a wall-clock time is repeated by a DST
+            transition, or ``'twice'`` to run on both occurrences. Only
+            meaningful when ``timezone`` is specified.
+        :param dst_nonexistent: ``'skip'`` (default) to not run when the
+            scheduled wall-clock time never occurs due to a DST transition,
+            or ``'shift'`` to run at the first valid minute after the gap.
+            Only meaningful when ``timezone`` is specified.
+        """
+        if dst_ambiguous not in ('once', 'twice'):
+            raise ValueError('dst_ambiguous must be "once" or "twice"')
+        if dst_nonexistent not in ('skip', 'shift'):
+            raise ValueError('dst_nonexistent must be "skip" or "shift"')
+        tz = resolve_timezone(timezone)
+
         TaskWrapper = self.task_wrapper_class
         def decorator(func):
             def method_validate(self, timestamp):
@@ -206,6 +240,9 @@ class Huey(object):
                 default_expires=expires,
                 default_timeout=timeout,
                 validate_datetime=method_validate,
+                task_timezone=tz,
+                dst_ambiguous=dst_ambiguous,
+                dst_nonexistent=dst_nonexistent,
                 task_base=PeriodicTask,
                 **kwargs)
 
@@ -719,8 +756,45 @@ class Huey(object):
     def read_periodic(self, timestamp):
         if timestamp is None:
             timestamp = self._get_timestamp()
-        return [task for task in self._registry.periodic_tasks
-                if task.validate_datetime(timestamp)]
+        tasks = []
+        for task in self._registry.periodic_tasks:
+            if task.task_timezone is None:
+                # Legacy behavior: validate against the Huey instance's own
+                # (UTC or system-local) timestamp, with no de-duplication.
+                if task.validate_datetime(timestamp):
+                    tasks.append(task)
+                continue
+
+            # Timezone-aware task: determine which scheduled occurrences are
+            # due and claim them, so a scheduler restart or a system clock
+            # rollback cannot cause the same occurrence to be enqueued twice.
+            due = False
+            for occurrence in task.get_occurrences(timestamp, self.utc):
+                if self._claim_periodic_occurrence(task, occurrence):
+                    due = True
+            if due:
+                tasks.append(task)
+        return tasks
+
+    def _claim_periodic_occurrence(self, task, occurrence):
+        """
+        Atomically claim a scheduled occurrence of a timezone-aware periodic
+        task. The claim key includes the task's identity and the actual
+        scheduled wall-clock occurrence (and fold, for repeated times), so
+        tasks using different timezones do not interfere with one another.
+
+        :return: True if the occurrence was newly claimed, False if it had
+            already been claimed.
+        """
+        wall, fold = occurrence
+        task_str = self._registry.task_to_string(type(task))
+        key = 'huey.periodic.%s.%s.%d' % (task_str, wall.isoformat(), fold)
+        try:
+            return self.put_if_empty(key, True,
+                                     ttl=self.periodic_occurrence_ttl)
+        except NotImplementedError:
+            # Storage does not support key TTLs - claim without an expiry.
+            return self.put_if_empty(key, True)
 
     def ready_to_run(self, task, timestamp=None):
         if timestamp is None:
@@ -929,8 +1003,38 @@ def _signature(task, args=(), kwargs=None):
 
 
 class PeriodicTask(Task):
+    # When set (via periodic_task(..., timezone=...)), the schedule is
+    # evaluated against the local wall-clock time in this timezone.
+    task_timezone = None
+    # How to handle wall-clock times that occur twice ("once" or "twice")
+    # and times that never occur ("skip" or "shift") due to DST transitions.
+    dst_ambiguous = 'once'
+    dst_nonexistent = 'skip'
+
     def validate_datetime(self, timestamp):
         return False
+
+    def get_occurrences(self, timestamp, utc=True):
+        """
+        Return the list of scheduled occurrences due at the given (naive)
+        timestamp, evaluating the schedule against the wall-clock time in
+        the task's configured timezone. Each occurrence is a ``(wall_minute,
+        fold)`` tuple that uniquely identifies the scheduled occurrence.
+        """
+        if self.task_timezone is None:
+            return []
+        if utc:
+            now_utc = timestamp.replace(tzinfo=datetime.timezone.utc)
+        else:
+            # The timestamp is in the system's local time - convert to UTC.
+            now_utc = local_to_utc(timestamp).replace(
+                tzinfo=datetime.timezone.utc)
+        return periodic_occurrences(
+            self.validate_datetime,
+            self.task_timezone,
+            now_utc,
+            on_ambiguous=self.dst_ambiguous,
+            on_nonexistent=self.dst_nonexistent)
 
 
 class TaskWrapper(object):

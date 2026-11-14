@@ -169,6 +169,64 @@ Huey also provides shortcuts for :py:func:`crontab.daily` and
         # This task runs every hour, on the hour.
         ...
 
+Periodic tasks and timezones
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+By default a periodic task's schedule is evaluated against the Huey
+instance's own clock (UTC when ``utc=True``, the system-local time
+otherwise). An individual periodic task can instead be scheduled against the
+local wall-clock time of a specific IANA timezone, regardless of the
+timezone of the machine the consumer runs on:
+
+.. code-block:: python
+
+    @huey.periodic_task(crontab(minute='0', hour='9'),
+                        timezone='America/New_York')
+    def morning_report():
+        # Runs every day at 9:00 AM in New York.
+        ...
+
+The ``timezone`` argument accepts an IANA key (resolved with
+:py:class:`zoneinfo.ZoneInfo`) or a :py:class:`datetime.tzinfo` instance.
+
+Because the schedule follows local wall-clock time, daylight-saving
+transitions need explicit handling. Two options control this:
+
+* ``dst_ambiguous`` - what to do when the scheduled wall-clock time occurs
+  *twice* because the clock was set back:
+
+  * ``'once'`` (default) - run only on the first occurrence.
+  * ``'twice'`` - run on both occurrences.
+
+* ``dst_nonexistent`` - what to do when the scheduled wall-clock time
+  *never occurs* because the clock jumped forward:
+
+  * ``'skip'`` (default) - do not run.
+  * ``'shift'`` - run at the first valid minute after the gap.
+
+.. code-block:: python
+
+    @huey.periodic_task(crontab(minute='30', hour='2'),
+                        timezone='America/New_York',
+                        dst_ambiguous='twice',
+                        dst_nonexistent='shift')
+    def dst_proof_task():
+        ...
+
+Each scheduled occurrence of a timezone-aware periodic task is claimed
+atomically in storage (keyed by the task and the actual scheduled
+wall-clock occurrence), so a scheduler restart or a system clock rollback
+will not cause an occurrence that was already enqueued to be enqueued
+again. Tasks using different timezones are tracked independently and do not
+interfere with one another. Tasks that do not specify a ``timezone`` keep
+the previous behavior and are not de-duplicated.
+
+.. note::
+    Claimed occurrences are remembered for 48 hours by default (see
+    ``Huey.periodic_occurrence_ttl``). The TTL is only applied by storage
+    backends that support expiring keys (Redis); other backends retain the
+    claim keys indefinitely.
+
 For more information see the following API documentation:
 
 * :py:meth:`~Huey.periodic_task`

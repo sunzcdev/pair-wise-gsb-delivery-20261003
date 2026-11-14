@@ -21,6 +21,11 @@ else:
                 .now(datetime.timezone.utc)
                 .replace(tzinfo=None))
 
+try:
+    from zoneinfo import ZoneInfo
+except ImportError:
+    ZoneInfo = None
+
 
 Error = namedtuple('Error', ('metadata',))
 
@@ -76,6 +81,77 @@ def local_to_utc(dt):
     Converts a naive local datetime.datetime in UTC time zone.
     """
     return datetime.datetime(*time.gmtime(time.mktime(dt.timetuple()))[:6])
+
+
+def resolve_timezone(tz):
+    """
+    Resolve a timezone given as an IANA key (e.g. "America/New_York") or a
+    ``datetime.tzinfo`` instance into a ``tzinfo``. ``None`` is returned as-is.
+    """
+    if tz is None or isinstance(tz, datetime.tzinfo):
+        return tz
+    elif isinstance(tz, str):
+        if ZoneInfo is None:
+            raise ValueError('zoneinfo is not available, cannot resolve '
+                             'timezone %r' % tz)
+        return ZoneInfo(tz)
+    raise ValueError('timezone must be None, a string, or a tzinfo instance, '
+                     'got %r' % (tz,))
+
+
+def is_ambiguous_wall_time(wall, tz):
+    """
+    Whether the naive wall-clock time occurs twice (due to a DST transition
+    setting the clock back) in the given timezone.
+    """
+    return (wall.replace(tzinfo=tz, fold=0).utcoffset() !=
+            wall.replace(tzinfo=tz, fold=1).utcoffset())
+
+
+def periodic_occurrences(validate_date, tz, now_utc, on_ambiguous='once',
+                         on_nonexistent='skip', lookback=60):
+    """
+    Determine which occurrences of a periodic schedule fall due at the given
+    instant, evaluating ``validate_date`` against the wall-clock time in the
+    timezone ``tz``.
+
+    :param validate_date: predicate accepting a datetime and returning bool.
+    :param tz: tzinfo the schedule is expressed in.
+    :param now_utc: aware UTC datetime for the current instant.
+    :param on_ambiguous: 'once' to fire only on the first occurrence of a
+        repeated wall-clock time, 'twice' to fire on both.
+    :param on_nonexistent: 'skip' to ignore wall-clock times that never occur,
+        'shift' to fire them at the first valid minute after the gap.
+    :param lookback: seconds since the previous check, used to detect
+        nonexistent wall-clock minutes that were skipped over.
+    :return: list of ``(wall_minute, fold)`` tuples identifying each due
+        occurrence, where ``wall_minute`` is the naive scheduled wall-clock
+        time (truncated to the minute) in ``tz``.
+    """
+    now_utc = now_utc.replace(second=0, microsecond=0)
+    curr = now_utc.astimezone(tz)
+    curr_wall = curr.replace(tzinfo=None)
+    occurrences = []
+
+    if validate_date(curr):
+        fold = curr.fold
+        if fold and not is_ambiguous_wall_time(curr_wall, tz):
+            fold = 0
+        if fold == 0 or on_ambiguous == 'twice':
+            occurrences.append((curr_wall, fold))
+
+    if on_nonexistent == 'shift':
+        # Detect wall-clock minutes that never occurred because the clock
+        # jumped forward between the previous check and this one.
+        prev = (now_utc - datetime.timedelta(seconds=lookback)).astimezone(tz)
+        prev_wall = prev.replace(tzinfo=None)
+        missing = prev_wall + datetime.timedelta(minutes=1)
+        while missing < curr_wall:
+            if validate_date(missing):
+                occurrences.append((missing, 0))
+            missing += datetime.timedelta(minutes=1)
+
+    return occurrences
 
 
 def normalize_expire_time(expires, utc=True):

@@ -453,7 +453,7 @@ Huey object
         revocation, etc.), see :py:class:`TaskWrapper`, :py:class:`Task`,
         and :py:class:`Result`.
 
-    .. py:method:: periodic_task(validate_datetime, retries=0, retry_delay=0, retry_backoff=0, priority=None, context=False, name=None, expires=None, timeout=None, **kwargs)
+    .. py:method:: periodic_task(validate_datetime, retries=0, retry_delay=0, retry_backoff=0, priority=None, context=False, name=None, expires=None, timeout=None, timezone=None, dst_ambiguous='once', dst_nonexistent='skip', **kwargs)
 
         :param function validate_datetime: function which accepts a
             ``datetime`` instance and returns whether the task should be
@@ -483,6 +483,16 @@ Huey object
             ``gevent.Timeout``. When using with threads it is necessary to use
             cooperative timeout checking. See :ref:`cooperative-timeout` for
             example.
+        :param timezone: an IANA timezone key (e.g. ``"America/New_York"``)
+            or a :py:class:`datetime.tzinfo` instance. When specified, the
+            schedule is evaluated against the local wall-clock time in this
+            timezone instead of the Huey instance's own clock.
+        :param str dst_ambiguous: ``'once'`` (default) to run only on the
+            first occurrence when the scheduled wall-clock time is repeated
+            by a DST transition, or ``'twice'`` to run on both occurrences.
+        :param str dst_nonexistent: ``'skip'`` (default) to not run when the
+            scheduled wall-clock time never occurs due to a DST transition,
+            or ``'shift'`` to run at the first valid minute after the gap.
         :param kwargs: arbitrary key/value arguments that are passed to the
             :py:class:`TaskWrapper` instance.
         :returns: a :py:class:`TaskWrapper` that wraps the decorated function
