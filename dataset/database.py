@@ -1,5 +1,7 @@
 import logging
+import re
 import threading
+from collections.abc import Iterator
 from typing import Any, Literal
 from urllib.parse import parse_qs, urlparse
 
@@ -7,14 +9,18 @@ from alembic.migration import MigrationContext
 from alembic.operations import Operations
 from sqlalchemy import Connection, Engine, create_engine, event, inspect
 from sqlalchemy.engine.reflection import Inspector
+from sqlalchemy.exc import DBAPIError
 from sqlalchemy.schema import MetaData
 from sqlalchemy.sql import text
-from sqlalchemy.sql.expression import Executable
+from sqlalchemy.sql.expression import Executable, Select, TextClause
 
 from dataset.table import Table
 from dataset.types import ColumnType, Types
 from dataset.util import (
     QUERY_STEP,
+    BufferedResultIter,
+    DatasetError,
+    OutRow,
     ResultIter,
     RowFactory,
     normalize_table_name,
@@ -23,6 +29,38 @@ from dataset.util import (
 )
 
 log = logging.getLogger(__name__)
+
+# Conservative check for statements that are safe to re-run: a plain SELECT,
+# possibly preceded by SQL comments. Anything else (writes, WITH clauses that
+# may hide writes, PRAGMA, SHOW, ...) is not confirmed read-only and is never
+# retried automatically.
+_READ_ONLY_RE = re.compile(
+    r"^\s*(?:--[^\n]*\n|/\*.*?\*/|\s)*SELECT\b", re.IGNORECASE | re.DOTALL
+)
+
+
+def _read_only_statement(query: str | Executable) -> Executable:
+    """Return the statement to execute, or refuse if not clearly read-only."""
+    if isinstance(query, str):
+        if _READ_ONLY_RE.match(query) is None:
+            raise DatasetError(
+                "query_retry() only retries plain SELECT statements; "
+                "refusing a query that is not confirmed read-only."
+            )
+        return text(query)
+    if isinstance(query, Select):
+        return query
+    if isinstance(query, TextClause):
+        if _READ_ONLY_RE.match(query.text) is None:
+            raise DatasetError(
+                "query_retry() only retries plain SELECT statements; "
+                "refusing a query that is not confirmed read-only."
+            )
+        return query
+    raise DatasetError(
+        "query_retry() cannot confirm that this statement is read-only; "
+        "pass a SELECT string or a sqlalchemy Select expression."
+    )
 
 
 class Database:
@@ -376,6 +414,90 @@ class Database:
         else:
             rp = self.executable.execute(query)
         return ResultIter(rp, row_type=self.row_type, step=_step)
+
+    def query_retry(
+        self, query: str | Executable, retries: int = 1, **kwargs: Any
+    ) -> Iterator[OutRow]:
+        """Run a read-only query, retrying if the connection is lost.
+
+        This is an explicit, bounded retry entry point for statements the
+        caller declares to be safely re-runnable. Only plain ``SELECT``
+        statements (strings, text clauses, or SQLAlchemy ``Select``
+        expressions) are accepted; write statements and anything that
+        cannot be confirmed read-only raise :py:class:`DatasetError`
+        instead of being executed. The method also refuses to run inside
+        an explicit transaction, because re-running a statement on a fresh
+        connection would escape the caller's transaction.
+
+        The retry boundary is the delivery of the first row: the statement
+        is re-executed at most ``retries`` times, and only if the driver
+        reports the connection as invalidated *before* the first row has
+        been handed to the caller. Once a row has been delivered, a
+        disconnect raises immediately -- re-running the query at that
+        point would produce duplicate rows. Statement-level errors (e.g.
+        syntax errors) are never retried.
+
+        Keyword arguments are used for parameter binding exactly as in
+        :py:meth:`query`. The parameter values are frozen once before the
+        first attempt and the same snapshot is bound on every retry. The
+        ``row_type`` factory is applied lazily per delivered row, so its
+        side effects never run more than once per row.
+        ::
+
+            statement = 'SELECT user, COUNT(*) c FROM photos GROUP BY user'
+            for row in db.query_retry(statement, retries=2):
+                print(row['user'], row['c'])
+
+        The returned iterator yields each result sequentially.
+        """
+        if retries < 0:
+            raise ValueError("retries must be >= 0")
+        if self.in_transaction:
+            raise DatasetError(
+                "query_retry() cannot be used inside an explicit "
+                "transaction: re-running the statement on a fresh "
+                "connection would escape the caller's transaction."
+            )
+        statement = _read_only_statement(query)
+        _step = kwargs.pop("_step", QUERY_STEP)
+        if _step is False or _step == 0:
+            _step = None
+        # Freeze the parameter values exactly once; every attempt binds
+        # the same snapshot.
+        params = dict(kwargs)
+        attempt = 0
+        while True:
+            try:
+                if params:
+                    rp = self.executable.execute(statement, params)
+                else:
+                    rp = self.executable.execute(statement)
+                result = ResultIter(rp, row_type=self.row_type, step=_step)
+                # Pull the first row inside the retry boundary: a
+                # disconnect before the first row is delivered can be
+                # retried safely, because no converted row has been
+                # observed by the caller yet.
+                first = next(result, None)
+                if first is None:
+                    return result
+                return BufferedResultIter(first, result)
+            except DBAPIError as exc:
+                if not exc.connection_invalidated:
+                    # A statement-level error (e.g. a syntax error), not
+                    # a lost connection: never re-run.
+                    raise
+                # Drop the dead connection from this thread's cache so
+                # the next attempt opens a fresh one.
+                self._release_connection()
+                if attempt >= retries:
+                    raise
+                attempt += 1
+                log.info(
+                    "Connection lost before first row, retrying query (%s/%s): %s",
+                    attempt,
+                    retries,
+                    exc,
+                )
 
     def __repr__(self) -> str:
         """Text representation contains the URL."""

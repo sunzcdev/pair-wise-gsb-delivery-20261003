@@ -146,6 +146,35 @@ class ResultIter(Iterator[OutRow]):
             self._conn = None
 
 
+class BufferedResultIter(Iterator[OutRow]):
+    """Iterator that re-yields one eagerly fetched row before the rest.
+
+    Used by retryable queries: the first row is fetched inside the retry
+    loop so that a disconnect before the first row can still be retried.
+    The buffered row is then delivered ahead of the remaining results.
+    """
+
+    def __init__(self, first: OutRow, rest: ResultIter) -> None:
+        self.keys = rest.keys
+        self._first: OutRow | None = first
+        self._rest = rest
+
+    def __next__(self) -> OutRow:
+        if self._first is not None:
+            first = self._first
+            self._first = None
+            return first
+        return next(self._rest)
+
+    next = __next__
+
+    def __iter__(self) -> Iterator[OutRow]:
+        return self
+
+    def close(self) -> None:
+        self._rest.close()
+
+
 def ensure_strings(value: str | Iterable[str] | None) -> list[str]:
     """Normalize a string-or-list-of-strings argument to a list."""
     if value is None:
