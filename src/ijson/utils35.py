@@ -90,3 +90,11 @@ def _make_kvitems_async(backend):
             *common._kvitems_pipeline(backend, prefix, map_type, config)
         )
     return kvitems_async
+
+
+def _make_multi_items_async(backend):
+    def multi_items_async(f, prefixes, map_type=None, buf_size=64*1024, **config):
+        return async_iterable(f, buf_size,
+            *common._multi_items_pipeline(backend, prefixes, map_type, config)
+        )
+    return multi_items_async

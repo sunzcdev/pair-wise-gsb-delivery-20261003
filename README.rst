@@ -115,6 +115,35 @@ In that case one can use the ``kvitems`` function instead:
     for name in names:
         do_something_with(name)
 
+Extracting several locations from the same document by calling ``items``
+multiple times reads the whole stream once per call. The ``multi_items``
+function instead traverses the document a single time while matching several
+prefixes at once. It yields ``(prefix, value)`` pairs, where ``prefix`` is the
+selector that matched and ``value`` is the object (or scalar) found at that
+location. Results are produced in the order in which they appear in the
+document, regardless of the order in which the prefixes were given:
+
+.. code-block:: python
+
+    import ijson
+
+    f = urlopen('http://.../')
+    for prefix, value in ijson.multi_items(
+        f, ['earth.europe.item', 'earth.america.item']
+    ):
+        do_something_with(prefix, value)
+
+Selectors work exactly like the prefix used by ``items``: object members are
+selected by their name and array elements by the literal ``item`` part.
+Several selectors matching the same location each produce a result, and a
+selector nested inside another matched object is not lost -- its contents are
+still delivered as part of the enclosing object. The whole document is always
+parsed (so malformed JSON is detected even on branches no selector points to),
+but only matched branches are turned into Python objects; memory usage is
+therefore bounded by the matched objects that are being built at any given
+time. Prefixes are validated before the source is read, and duplicate prefixes
+are collapsed while preserving their original order.
+
 
 Lower-level interfaces
 ----------------------
@@ -411,7 +440,8 @@ to give users more fine-grained control over certain operations:
   an additional ``buf_size`` option (defaults to ``65536`` or 64KB)
   specifies the amount of bytes the library
   should attempt to read each time.
-- The ``items`` and ``kvitems`` functions, and all their variants,
+- The ``items``, ``kvitems`` and ``multi_items`` functions,
+  and all their variants,
   have an optional ``map_type`` argument (defaults to ``dict``)
   used to construct objects from the JSON stream.
   This should be a dict-like type supporting item assignment.

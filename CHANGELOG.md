@@ -2,6 +2,13 @@
 
 ## Development
 
+* Added the `multi_items` routine (plus its `*_coro`, `*_gen`, `*_async` and
+  `ijson.common` variants). It extracts the objects found under several prefixes
+  in a single traversal of the document, yielding `(prefix, value)` pairs in
+  document order. Selectors support object keys and array elements, overlapping
+  and duplicate selectors are handled without losing nested items, only matched
+  branches are materialized into Python objects, prefixes are validated before
+  the source is read, and JSON errors on unmatched branches are still detected.
 * Fixed handling of integers longer than `sys.get_int_max_str_digits()`:
   the `yajl2_c` backend no longer crashes on them, and all backends
   now raise the `ValueError` produced by `int()` (#188).

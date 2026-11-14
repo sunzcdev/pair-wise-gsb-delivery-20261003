@@ -199,6 +199,112 @@ def kvitems_basecoro(target, prefix, map_type=None):
             target.send((key, builder.value))
 
 
+def _validate_prefixes(prefixes):
+    '''
+    Validates the ``prefixes`` argument accepted by the ``multi_items``
+    routines. It must be an iterable of prefix strings (not a single string),
+    containing at least one element. Duplicate prefixes are collapsed while
+    preserving their original order. Validation happens before any data is
+    read from the source so that bad configuration fails eagerly.
+    '''
+    if isinstance(prefixes, (str, bytes)) or not hasattr(prefixes, '__iter__'):
+        raise ValueError(
+            "prefixes must be an iterable of prefix strings, got %r"
+            % type(prefixes)
+        )
+    validated = []
+    for prefix in prefixes:
+        if not isinstance(prefix, str):
+            raise ValueError(
+                "each prefix must be a string, got %r" % type(prefix)
+            )
+        if prefix not in validated:
+            validated.append(prefix)
+    if not validated:
+        raise ValueError("at least one prefix must be given")
+    return validated
+
+
+@utils.coroutine
+def multi_items_basecoro(target, prefixes, map_type=None):
+    '''
+    A coroutine dispatching native Python objects found under any of the given
+    prefixes during a single traversal of the document. Each result is sent as
+    a ``(prefix, value)`` tuple, where ``prefix`` is the selector that matched
+    and ``value`` is the object (or scalar) found at that location.
+
+    Results are emitted in the order in which they appear in the document.
+    Several selectors matching the same location each produce a result, and a
+    selector nested inside another one is not lost: its values are delivered
+    as part of the enclosing object while the enclosing object is emitted on
+    its own once complete.
+
+    The whole document is always parsed, so JSON errors inside branches that no
+    selector points to are still detected. Only branches matched by a selector
+    are materialized into Python objects, hence memory consumption is bounded
+    by the objects that are simultaneously being built.
+    '''
+    prefixes = _validate_prefixes(prefixes)
+    matched_prefixes = set(prefixes)
+
+    def is_captured(prefix):
+        # True when an open matched container strictly encloses this prefix,
+        # meaning the value is already being built as part of another hit.
+        for active_prefix in active_prefixes:
+            if prefix == active_prefix or prefix.startswith(active_prefix + '.'):
+                return True
+        return False
+
+    # Builders of matched containers currently being built. Each builder
+    # receives every event while it remains open; its lifetime is tied to the
+    # document nesting through the ``frames`` stack below.
+    active = set()
+    # Prefixes of the matched containers currently being built.
+    active_prefixes = set()
+    # One entry per open container, holding the (prefix, builder) pairs of the
+    # builders that were started by that very container (empty otherwise).
+    frames = []
+    while True:
+        current, event, value = (yield)
+
+        if event in ('start_map', 'start_array'):
+            frame_builders = []
+            for builder in active:
+                builder.event(event, value)
+            if current in matched_prefixes:
+                for prefix in prefixes:
+                    if prefix == current:
+                        builder = ObjectBuilder(map_type=map_type)
+                        builder.event(event, value)
+                        active.add(builder)
+                        active_prefixes.add(prefix)
+                        frame_builders.append((prefix, builder))
+            frames.append(frame_builders)
+
+        elif event in ('end_map', 'end_array'):
+            frame_builders = frames.pop()
+            # All open builders see the closing event; those started at this
+            # level are finalized afterwards.
+            for builder in active:
+                builder.event(event, value)
+            for prefix, builder in frame_builders:
+                target.send((prefix, builder.value))
+                active.remove(builder)
+                active_prefixes.discard(prefix)
+
+        else:
+            for builder in active:
+                builder.event(event, value)
+            # A scalar is an independent hit only when it is not being
+            # captured by an enclosing matched container.
+            if (
+                event != 'map_key'
+                and current in matched_prefixes
+                and not is_captured(current)
+            ):
+                target.send((current, value))
+
+
 def integer_or_decimal(str_value):
     '''
     Converts string with a numeric value into an int or a Decimal.
@@ -260,6 +366,14 @@ def _kvitems_pipeline(backend, prefix, map_type, config):
     )
 
 
+def _multi_items_pipeline(backend, prefixes, map_type, config):
+    return (
+        (backend['multi_items_basecoro'], (prefixes,), {'map_type': map_type}),
+        (backend['parse_basecoro'], [], {}),
+        (backend['basic_parse_basecoro'], [], config)
+    )
+
+
 def _make_basic_parse_coro(backend):
     def basic_parse_coro(target, **config):
         return utils.chain(
@@ -294,6 +408,16 @@ def _make_kvitems_coro(backend):
             *_kvitems_pipeline(backend, prefix, map_type, config)
         )
     return kvitems_coro
+
+
+def _make_multi_items_coro(backend):
+    def multi_items_coro(target, prefixes, map_type=None, **config):
+        prefixes = _validate_prefixes(prefixes)
+        return utils.chain(
+            target,
+            *_multi_items_pipeline(backend, prefixes, map_type, config)
+        )
+    return multi_items_coro
 
 
 def is_awaitablefunction(func):
@@ -364,6 +488,16 @@ def _make_kvitems_gen(backend):
             *_kvitems_pipeline(backend, prefix, map_type, config)
         )
     return kvitems_gen
+
+
+def _make_multi_items_gen(backend):
+    def multi_items_gen(file_obj, prefixes, map_type=None, buf_size=64*1024, **config):
+        prefixes = _validate_prefixes(prefixes)
+        return utils.coros2gen(
+            file_source(file_obj, buf_size=buf_size),
+            *_multi_items_pipeline(backend, prefixes, map_type, config)
+        )
+    return multi_items_gen
 
 
 def _make_basic_parse(backend):
@@ -438,6 +572,26 @@ def _make_kvitems(backend):
     return kvitems
 
 
+def _make_multi_items(backend):
+    def multi_items(source, prefixes, map_type=None, buf_size=64*1024, **config):
+        prefixes = _validate_prefixes(prefixes)
+        source = _get_source(source)
+        if is_async_file(source):
+            return backend['multi_items_async'](
+                source, prefixes, map_type=map_type, buf_size=buf_size, **config
+            )
+        elif is_file(source):
+            return backend['multi_items_gen'](
+                source, prefixes, map_type=map_type, buf_size=buf_size, **config
+            )
+        elif is_iterable(source):
+            return utils.coros2gen(source,
+                (backend['multi_items_basecoro'], (prefixes,), {'map_type': map_type})
+            )
+        raise ValueError("Unknown source type: %r" % type(source))
+    return multi_items
+
+
 _common_functions_warn = '''
 Don't use the ijson.common.* functions; instead go directly with the ijson.* ones.
 See the documentation for more information.
@@ -467,6 +621,15 @@ def items(events, prefix, map_type=None):
     warnings.warn(_common_functions_warn, DeprecationWarning)
     return utils.coros2gen(events,
         (items_basecoro, (prefix,), {'map_type': map_type})
+    )
+
+
+def multi_items(events, prefixes, map_type=None):
+    """Like ijson.multi_items, but takes events generated via ijson.parse
+    instead of a file"""
+    warnings.warn(_common_functions_warn, DeprecationWarning)
+    return utils.coros2gen(events,
+        (multi_items_basecoro, (prefixes,), {'map_type': map_type})
     )
 
 
@@ -503,7 +666,7 @@ def enrich_backend(backend, **capabilities_overrides):
     backend['capabilities'] = capabilities
     backend['backend'] = backend['__name__'].split('.')[-1]
     backend['backend_name'] = backend['backend']
-    for name in ('basic_parse', 'parse', 'items', 'kvitems'):
+    for name in ('basic_parse', 'parse', 'items', 'kvitems', 'multi_items'):
         basecoro_name = name + '_basecoro'
         if basecoro_name not in backend:
             backend[basecoro_name] = globals()[basecoro_name]
