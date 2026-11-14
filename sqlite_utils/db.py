@@ -3770,24 +3770,7 @@ class Table(Queryable):
         :param tokenize: Custom SQLite tokenizer to use, for example ``"porter"`` to enable Porter stemming.
         :param replace: Should any existing FTS index for this table be replaced by the new one?
         """
-        create_fts_sql = (
-            textwrap.dedent("""
-            CREATE VIRTUAL TABLE {table_fts} USING {fts_version} (
-                {columns},{tokenize}
-                content={table}
-            )
-        """)
-            .strip()
-            .format(
-                table=quote_identifier(self.name),
-                table_fts=quote_identifier(self.name + "_fts"),
-                columns=", ".join(quote_identifier(c) for c in columns),
-                fts_version=fts_version,
-                tokenize=(
-                    f"\n    tokenize={self.db.quote(tokenize)}," if tokenize else ""
-                ),
-            )
-        )
+        create_fts_sql = self._fts_create_sql(columns, fts_version, tokenize)
         should_recreate = False
         if replace and self.db[f"{self.name}_fts"].exists():
             # Does the table need to be recreated?
@@ -3810,37 +3793,147 @@ class Table(Queryable):
         self.populate_fts(columns)
 
         if create_triggers:
-            old_cols = ", ".join(f"old.{quote_identifier(c)}" for c in columns)
-            new_cols = ", ".join(f"new.{quote_identifier(c)}" for c in columns)
-            columns_quoted = ", ".join(quote_identifier(c) for c in columns)
-            table = quote_identifier(self.name)
-            table_fts = quote_identifier(self.name + "_fts")
-            triggers = (
-                textwrap.dedent("""
-                CREATE TRIGGER {table_ai} AFTER INSERT ON {table} BEGIN
-                  INSERT INTO {table_fts} (rowid, {columns}) VALUES (new.rowid, {new_cols});
-                END;
-                CREATE TRIGGER {table_ad} AFTER DELETE ON {table} BEGIN
-                  INSERT INTO {table_fts} ({table_fts}, rowid, {columns}) VALUES('delete', old.rowid, {old_cols});
-                END;
-                CREATE TRIGGER {table_au} AFTER UPDATE ON {table} BEGIN
-                  INSERT INTO {table_fts} ({table_fts}, rowid, {columns}) VALUES('delete', old.rowid, {old_cols});
-                  INSERT INTO {table_fts} (rowid, {columns}) VALUES (new.rowid, {new_cols});
-                END;
-            """)
-                .strip()
-                .format(
-                    table=table,
-                    table_fts=table_fts,
-                    table_ai=quote_identifier(self.name + "_ai"),
-                    table_ad=quote_identifier(self.name + "_ad"),
-                    table_au=quote_identifier(self.name + "_au"),
-                    columns=columns_quoted,
-                    old_cols=old_cols,
-                    new_cols=new_cols,
+            self.db.executescript(self._fts_triggers_sql(columns))
+        return self
+
+    def _fts_create_sql(
+        self,
+        columns: Iterable[str],
+        fts_version: str = "FTS5",
+        tokenize: str | None = None,
+        fts_table_name: str | None = None,
+    ) -> str:
+        return (
+            textwrap.dedent("""
+            CREATE VIRTUAL TABLE {table_fts} USING {fts_version} (
+                {columns},{tokenize}
+                content={table}
+            )
+        """)
+            .strip()
+            .format(
+                table=quote_identifier(self.name),
+                table_fts=quote_identifier(fts_table_name or (self.name + "_fts")),
+                columns=", ".join(quote_identifier(c) for c in columns),
+                fts_version=fts_version,
+                tokenize=(
+                    f"\n    tokenize={self.db.quote(tokenize)}," if tokenize else ""
+                ),
+            )
+        )
+
+    def _fts_triggers_sql(self, columns: Iterable[str]) -> str:
+        old_cols = ", ".join(f"old.{quote_identifier(c)}" for c in columns)
+        new_cols = ", ".join(f"new.{quote_identifier(c)}" for c in columns)
+        columns_quoted = ", ".join(quote_identifier(c) for c in columns)
+        return (
+            textwrap.dedent("""
+            CREATE TRIGGER {table_ai} AFTER INSERT ON {table} BEGIN
+              INSERT INTO {table_fts} (rowid, {columns}) VALUES (new.rowid, {new_cols});
+            END;
+            CREATE TRIGGER {table_ad} AFTER DELETE ON {table} BEGIN
+              INSERT INTO {table_fts} ({table_fts}, rowid, {columns}) VALUES('delete', old.rowid, {old_cols});
+            END;
+            CREATE TRIGGER {table_au} AFTER UPDATE ON {table} BEGIN
+              INSERT INTO {table_fts} ({table_fts}, rowid, {columns}) VALUES('delete', old.rowid, {old_cols});
+              INSERT INTO {table_fts} (rowid, {columns}) VALUES (new.rowid, {new_cols});
+            END;
+        """)
+            .strip()
+            .format(
+                table=quote_identifier(self.name),
+                table_fts=quote_identifier(self.name + "_fts"),
+                table_ai=quote_identifier(self.name + "_ai"),
+                table_ad=quote_identifier(self.name + "_ad"),
+                table_au=quote_identifier(self.name + "_au"),
+                columns=columns_quoted,
+                old_cols=old_cols,
+                new_cols=new_cols,
+            )
+        )
+
+    def _fts_trigger_names(self, fts_table: str | None) -> list[str]:
+        sql = textwrap.dedent("""
+            SELECT name FROM sqlite_master
+                WHERE type = 'trigger'
+                AND (sql LIKE '% INSERT INTO [{}]%' OR sql LIKE '% INSERT INTO "{}"%')
+        """).strip().format(fts_table, fts_table)
+        return [row[0] for row in self.db.execute(sql).fetchall()]
+
+    def reconfigure_fts(
+        self,
+        columns: Iterable[str],
+        fts_version: str = "FTS5",
+        create_triggers: bool = False,
+        tokenize: str | None = None,
+    ) -> "Table":
+        """
+        Reconfigure the SQLite full-text search index for this table, changing the
+        indexed columns, FTS version or tokenizer.
+
+        The new index is built and populated with the existing table contents in a
+        single transaction, then swapped into place along with its maintenance
+        triggers - so if anything fails the previous index and triggers are left
+        untouched and search keeps working. The source table is never modified and
+        the mapping between index rows and source table ``rowid``\\ s is preserved.
+
+        If the existing configuration already matches, no rebuild occurs.
+
+        See :ref:`python_api_fts` for more details.
+
+        :param columns: List of column names to include in the search index.
+        :param fts_version: FTS version to use - defaults to ``FTS5`` but you may want ``FTS4`` for older SQLite versions.
+        :param create_triggers: Should triggers be created to keep the search index up-to-date? Defaults to ``False``.
+        :param tokenize: Custom SQLite tokenizer to use, for example ``"porter"`` to enable Porter stemming.
+        """
+        columns = list(columns)
+        if not self.exists():
+            raise NoTable(f"Table {self.name} does not exist")
+        if not set(columns).issubset(self.columns_dict.keys()):
+            raise InvalidColumns(
+                f"Invalid columns {columns} for table with columns {list(self.columns_dict.keys())}"
+            )
+        fts_table_name = f"{self.name}_fts"
+        create_fts_sql = self._fts_create_sql(columns, fts_version, tokenize)
+        existing_fts = self.detect_fts()
+        if existing_fts is not None and self.db[existing_fts].schema == create_fts_sql:
+            expected_triggers = {self.name + suffix for suffix in ("_ai", "_ad", "_au")}
+            existing_triggers = {t.name for t in self.triggers}
+            if existing_triggers.issuperset(expected_triggers) == create_triggers:
+                # Existing configuration already matches, nothing to do
+                return self
+        temp_fts_table = f"{fts_table_name}_new"
+        columns_quoted = ", ".join(quote_identifier(c) for c in columns)
+        with self.db.atomic():
+            # Build and populate the new index next to the existing one
+            self.db.execute(f"DROP TABLE IF EXISTS {quote_identifier(temp_fts_table)}")
+            self.db.execute(
+                self._fts_create_sql(
+                    columns, fts_version, tokenize, fts_table_name=temp_fts_table
                 )
             )
-            self.db.executescript(triggers)
+            self.db.execute(
+                "INSERT INTO {} (rowid, {}) SELECT rowid, {} FROM {}".format(
+                    quote_identifier(temp_fts_table),
+                    columns_quoted,
+                    columns_quoted,
+                    quote_identifier(self.name),
+                )
+            )
+            # Switch over: drop the old triggers and index, move the new one into place
+            if existing_fts is not None:
+                for trigger_name in self._fts_trigger_names(existing_fts):
+                    self.db.execute(
+                        f"DROP TRIGGER IF EXISTS {quote_identifier(trigger_name)}"
+                    )
+                self.db.execute(f"DROP TABLE {quote_identifier(existing_fts)}")
+            self.db.execute(
+                "ALTER TABLE {} RENAME TO {}".format(
+                    quote_identifier(temp_fts_table), quote_identifier(fts_table_name)
+                )
+            )
+            if create_triggers:
+                self.db.executescript(self._fts_triggers_sql(columns))
         return self
 
     def populate_fts(self, columns: Iterable[str]) -> "Table":
@@ -3872,16 +3965,8 @@ class Table(Queryable):
         if fts_table:
             self.db[fts_table].drop()
         # Now delete the triggers that related to that table
-        sql = textwrap.dedent("""
-            SELECT name FROM sqlite_master
-                WHERE type = 'trigger'
-                AND (sql LIKE '% INSERT INTO [{}]%' OR sql LIKE '% INSERT INTO "{}"%')
-        """).strip().format(fts_table, fts_table)
-        trigger_names = []
-        for row in self.db.execute(sql).fetchall():
-            trigger_names.append(row[0])
         with self.db.atomic():
-            for trigger_name in trigger_names:
+            for trigger_name in self._fts_trigger_names(fts_table):
                 self.db.execute(
                     f"DROP TRIGGER IF EXISTS {quote_identifier(trigger_name)}"
                 )

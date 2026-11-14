@@ -2752,6 +2752,14 @@ To set a custom FTS tokenizer, e.g. to enable Porter stemming, use ``--tokenize=
 
     sqlite-utils populate-fts mydb.db documents title summary --tokenize=porter
 
+To change the configuration of an existing FTS table - the indexed columns, the FTS version or the tokenizer - use ``reconfigure-fts``:
+
+.. code-block:: bash
+
+    sqlite-utils reconfigure-fts mydb.db documents title summary --tokenize=porter
+
+This builds and populates the new index in a single transaction, then swaps it into place along with its triggers. If anything fails the previous index is left untouched, so search keeps working. If the configuration already matches, the command does nothing.
+
 To remove the FTS tables and triggers you created, use ``disable-fts``:
 
 .. code-block:: bash

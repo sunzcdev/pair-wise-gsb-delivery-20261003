@@ -20,7 +20,7 @@ This page lists the ``--help`` for every ``sqlite-utils`` CLI sub-command.
         "query", "memory", "insert", "upsert", "bulk", "search", "transform", "extract",
         "schema", "insert-files", "analyze-tables", "convert", "tables", "views", "rows",
         "triggers", "indexes", "create-database", "create-table", "create-index", "drop-index",
-        "migrate", "enable-fts", "populate-fts", "rebuild-fts", "disable-fts"
+        "migrate", "enable-fts", "reconfigure-fts", "populate-fts", "rebuild-fts", "disable-fts"
     ]
     refs = {
         "query": "cli_query",
@@ -36,6 +36,7 @@ This page lists the ``--help`` for every ``sqlite-utils`` CLI sub-command.
         "triggers": "cli_triggers",
         "indexes": "cli_indexes",
         "enable-fts": "cli_fts",
+        "reconfigure-fts": "cli_fts",
         "analyze": "cli_analyze",
         "vacuum": "cli_vacuum",
         "dump": "cli_dump",
@@ -1094,6 +1095,36 @@ See :ref:`cli_fts`.
       --create-triggers      Create triggers to update the FTS tables when the
                              parent table changes.
       --replace              Replace existing FTS configuration if it exists
+      --load-extension TEXT  Path to SQLite extension, with optional :entrypoint
+      -h, --help             Show this message and exit.
+
+
+.. _cli_ref_reconfigure_fts:
+
+reconfigure-fts
+===============
+
+See :ref:`cli_fts`.
+
+::
+
+    Usage: sqlite-utils reconfigure-fts [OPTIONS] PATH TABLE COLUMN...
+
+      Reconfigure full-text search for specific table and columns
+
+      Rebuilds the search index with the new configuration in a single transaction,
+      leaving the existing index in place if anything fails.
+
+      Example:
+
+          sqlite-utils reconfigure-fts chickens.db chickens name --tokenize porter
+
+    Options:
+      --fts4                 Use FTS4
+      --fts5                 Use FTS5
+      --tokenize TEXT        Tokenizer to use, e.g. porter
+      --create-triggers      Create triggers to update the FTS tables when the
+                             parent table changes.
       --load-extension TEXT  Path to SQLite extension, with optional :entrypoint
       -h, --help             Show this message and exit.
 

@@ -789,6 +789,58 @@ def enable_fts(
         raise click.ClickException(str(ex))
 
 
+@cli.command(name="reconfigure-fts")
+@click.argument(
+    "path",
+    type=click.Path(exists=True, file_okay=True, dir_okay=False, allow_dash=False),
+    required=True,
+)
+@click.argument("table")
+@click.argument("column", nargs=-1, required=True)
+@click.option("--fts4", help="Use FTS4", default=False, is_flag=True)
+@click.option("--fts5", help="Use FTS5", default=False, is_flag=True)
+@click.option("--tokenize", help="Tokenizer to use, e.g. porter")
+@click.option(
+    "--create-triggers",
+    help="Create triggers to update the FTS tables when the parent table changes.",
+    default=False,
+    is_flag=True,
+)
+@load_extension_option
+def reconfigure_fts(
+    path, table, column, fts4, fts5, tokenize, create_triggers, load_extension
+):
+    """Reconfigure full-text search for specific table and columns
+
+    Rebuilds the search index with the new configuration in a single
+    transaction, leaving the existing index in place if anything fails.
+
+    Example:
+
+    \b
+        sqlite-utils reconfigure-fts chickens.db chickens name --tokenize porter
+    """
+    fts_version = "FTS5"
+    if fts4 and fts5:
+        click.echo("Can only use one of --fts4 or --fts5", err=True)
+        return
+    elif fts4:
+        fts_version = "FTS4"
+
+    db = sqlite_utils.Database(path)
+    _register_db_for_cleanup(db)
+    _load_extensions(db, load_extension)
+    try:
+        db.table(table).reconfigure_fts(
+            column,
+            fts_version=fts_version,
+            tokenize=tokenize,
+            create_triggers=create_triggers,
+        )
+    except (NoTable, InvalidColumns, OperationalError) as ex:
+        raise click.ClickException(str(ex))
+
+
 @cli.command(name="populate-fts")
 @click.argument(
     "path",

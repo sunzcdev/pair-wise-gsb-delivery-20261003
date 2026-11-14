@@ -2845,6 +2845,14 @@ You can replace the existing table with a new configuration using ``replace=True
 
 This will have no effect if the FTS table already exists, otherwise it will drop and recreate the table with the new settings. This takes into consideration the columns, the tokenizer, the FTS version used and whether or not the table has triggers.
 
+Alternatively you can use ``reconfigure_fts()`` to change the configuration of an existing FTS table:
+
+.. code-block:: python
+
+    db.table("articles").reconfigure_fts(["headline", "body"], tokenize="porter")
+
+This builds and populates the new index in a single transaction, then swaps it into place along with its maintenance triggers - if anything fails the previous index and triggers are left untouched, so search keeps working. The source table is never modified and the mapping between index rows and source table ``rowid`` values is preserved. Columns that do not exist on the table are rejected before any changes are made. If the configuration already matches, the call does nothing.
+
 To remove the FTS tables and triggers you created, use the ``disable_fts()`` table method:
 
 .. code-block:: python

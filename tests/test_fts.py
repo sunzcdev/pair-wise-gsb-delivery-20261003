@@ -3,6 +3,7 @@ from unittest.mock import ANY
 import pytest
 
 from sqlite_utils import Database
+from sqlite_utils.db import InvalidColumns, NoTable
 from sqlite_utils.utils import sqlite3
 
 search_records = [
@@ -777,3 +778,147 @@ def test_enable_fts_cli_on_view_errors(tmpdir):
     result = CliRunner().invoke(cli_module.cli, ["enable-fts", db_path, "v", "text"])
     assert result.exit_code == 1
     assert result.output.strip() == "Error: Table v is actually a view"
+
+
+@pytest.mark.parametrize("fts_version", ["FTS4", "FTS5"])
+@pytest.mark.parametrize("create_triggers", [False, True])
+def test_reconfigure_fts(fresh_db, fts_version, create_triggers):
+    table = fresh_db.table("searchable")
+    table.insert_all(search_records)
+    table.enable_fts(["text"], fts_version=fts_version)
+    assert list(table.search("tanuki"))[0]["rowid"] == 1
+    assert [] == list(table.search("usa"))
+    # Reconfigure to index a different set of columns with a tokenizer
+    table.reconfigure_fts(
+        ["text", "country"],
+        fts_version=fts_version,
+        tokenize="porter",
+        create_triggers=create_triggers,
+    )
+    assert fresh_db.table("searchable_fts").columns_dict.keys() == {"text", "country"}
+    schema = fresh_db.table("searchable_fts").schema
+    assert fts_version in schema
+    assert "porter" in schema
+    # Existing content was backfilled, preserving rowids
+    assert list(table.search("usa"))[0]["rowid"] == 2
+    assert list(table.search("tanuki"))[0]["rowid"] == 1
+    # Source table was not modified
+    assert [r["rowid"] for r in fresh_db.query("select rowid from searchable")] == [
+        1,
+        2,
+    ]
+    expected_triggers = {"searchable_ai", "searchable_ad", "searchable_au"}
+    actual_triggers = {t.name for t in table.triggers}
+    if create_triggers:
+        assert expected_triggers.issubset(actual_triggers)
+    else:
+        assert not expected_triggers.intersection(actual_triggers)
+
+
+def test_reconfigure_fts_triggers_track_source_table(fresh_db):
+    table = fresh_db.table("searchable")
+    table.insert_all(search_records)
+    table.enable_fts(["text"], create_triggers=True)
+    table.reconfigure_fts(["text", "country"], create_triggers=True)
+    # Insert
+    table.insert(
+        {"text": "pandas are cute", "country": "China", "not_searchable": "baz"}
+    )
+    assert list(table.search("china"))[0]["rowid"] == 3
+    # Update
+    table.update(3, {"country": "Vietnam"})
+    assert [] == list(table.search("china"))
+    assert list(table.search("vietnam"))[0]["rowid"] == 3
+    # Delete
+    table.delete(3)
+    assert [] == list(table.search("vietnam"))
+    # Only one set of maintenance triggers exists
+    fts_triggers = [
+        t.name for t in table.triggers if t.name.startswith("searchable_a")
+    ]
+    assert sorted(fts_triggers) == ["searchable_ad", "searchable_ai", "searchable_au"]
+
+
+def test_reconfigure_fts_invalid_column_rejected(fresh_db):
+    table = fresh_db.table("searchable")
+    table.insert_all(search_records)
+    table.enable_fts(["text"])
+    with pytest.raises(InvalidColumns):
+        table.reconfigure_fts(["text", "does_not_exist"])
+    # Original search still works
+    assert list(table.search("tanuki"))[0]["rowid"] == 1
+    assert fresh_db.table("searchable_fts").columns_dict.keys() == {"text"}
+
+
+def test_reconfigure_fts_missing_table(fresh_db):
+    with pytest.raises(NoTable):
+        fresh_db.table("missing").reconfigure_fts(["text"])
+
+
+def test_reconfigure_fts_rolls_back_on_trigger_error(fresh_db):
+    table = fresh_db.table("searchable")
+    table.insert_all(search_records)
+    table.enable_fts(["text"])
+    # A conflicting trigger name will make CREATE TRIGGER fail mid-transaction
+    fresh_db.table("other").insert({"id": 1}, pk="id")
+    fresh_db.execute(
+        "CREATE TRIGGER searchable_ai AFTER INSERT ON other BEGIN SELECT 1; END"
+    )
+    with pytest.raises(sqlite3.OperationalError):
+        table.reconfigure_fts(["text", "country"], create_triggers=True)
+    # Original index and search are untouched
+    assert list(table.search("tanuki"))[0]["rowid"] == 1
+    assert fresh_db.table("searchable_fts").columns_dict.keys() == {"text"}
+    # No leftover half-built index or duplicate triggers
+    assert "searchable_fts_new" not in fresh_db.table_names()
+    trigger_names = [
+        row["name"]
+        for row in fresh_db.query("select name from sqlite_master where type='trigger'")
+    ]
+    assert trigger_names == ["searchable_ai"]
+
+
+def test_reconfigure_fts_noop_if_config_unchanged():
+    queries = []
+    db = Database(memory=True, tracer=lambda sql, params: queries.append((sql, params)))
+    db.table("books").insert(
+        {
+            "id": 1,
+            "title": "Habits of Australian Marsupials",
+            "author": "Marlee Hawkins",
+        },
+        pk="id",
+    )
+    db.table("books").enable_fts(["title", "author"], create_triggers=True)
+    queries.clear()
+    db.table("books").reconfigure_fts(["title", "author"], create_triggers=True)
+    # The only SQL that executed should be read-only queries
+    assert all(
+        q[0].lower().startswith(("select ", "pragma ")) for q in queries
+    ), queries
+
+
+def test_reconfigure_fts_cli(tmpdir):
+    db_path = str(tmpdir / "test.db")
+    db = Database(db_path)
+    db.table("t").insert({"text": "hello world", "country": "Japan"})
+    db.table("t").enable_fts(["text"])
+    db.close()
+    from click.testing import CliRunner
+
+    from sqlite_utils import cli as cli_module
+
+    result = CliRunner().invoke(
+        cli_module.cli,
+        ["reconfigure-fts", db_path, "t", "text", "country", "--create-triggers"],
+    )
+    assert result.exit_code == 0, result.output
+    db = Database(db_path)
+    assert list(db.table("t").search("japan"))[0]["rowid"] == 1
+    assert {t.name for t in db.table("t").triggers} == {"t_ai", "t_ad", "t_au"}
+    # Invalid columns are rejected
+    result = CliRunner().invoke(
+        cli_module.cli, ["reconfigure-fts", db_path, "t", "nope"]
+    )
+    assert result.exit_code == 1
+    assert "Invalid columns" in result.output
