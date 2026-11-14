@@ -12,6 +12,13 @@ The glom team's approach to updates can be summed up as:
 Check this page when upgrading, we strive to keep the updates
 summarized and well-linked.
 
+## 25.12.1
+
+_(unreleased)_
+
+- Add `Atomic` and `atomic()` for all-or-nothing batches of `Assign`
+  and `Delete` operations on built-in dictionaries and lists.
+
 ## 25.12.0
 
 _(December 28, 2025)_

@@ -499,6 +499,13 @@ def test_all_public_errors():
 
     _test_exc(glom.PathDeleteError, object(), glom.Delete('a'))
 
+    _test_exc(glom.AtomicMutationError, {'b': {}},
+              glom.Atomic([glom.Assign('a', glom.Spec('b')),
+                           glom.Assign('a.x', 1)]))
+
+    _test_exc(glom.UnsupportedAtomicMutation, object(),
+              glom.Atomic([glom.Assign('a', 1)]))
+
     _test_exc(MatchError, 1, M == 2)
 
     _test_exc(TypeMatchError, 1, Match(str))

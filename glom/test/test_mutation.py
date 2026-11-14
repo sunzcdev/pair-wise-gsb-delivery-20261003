@@ -1,7 +1,10 @@
 import pytest
 
-from glom import glom, Path, T, S, Spec, Glommer, PathAssignError, PathAccessError
-from glom import assign, Assign, delete, Delete, PathDeleteError, Or
+from glom import (glom, Path, T, S, Spec, Glommer, PathAssignError,
+                  PathAccessError, Invoke)
+from glom import (assign, Assign, delete, Delete, PathDeleteError, Or,
+                  atomic, Atomic, AtomicMutationError,
+                  UnsupportedAtomicMutation)
 from glom import core
 from glom.core import UnregisteredTarget
 
@@ -323,3 +326,133 @@ def test_star_broadcast():
     glom(val, Delete('a.*.b.*.d'))
     assert 'c' in val['a'][0]['b'][0]
     assert 'd' not in val['a'][0]['b'][0]
+
+
+def test_atomic_success():
+    target = {'doc': {'status': 'draft', 'tags': ['a', 'b']}}
+    doc_alias = target['doc']
+    tag_alias = target['doc']['tags']
+
+    assert atomic(target, [Assign('doc.status', 'ready'),
+                           Delete('doc.tags.0')]) is target
+    assert target == {'doc': {'status': 'ready', 'tags': ['b']}}
+    assert target['doc'] is doc_alias
+    assert target['doc']['tags'] is tag_alias
+
+    # operation iterables and positional operations are both accepted
+    assert Atomic(Assign('doc.owner', 'ops')).operations
+    assert glom(target, Atomic(Assign('doc.owner', 'ops'),
+                               Delete('doc.tags.0'))) is target
+    assert target['doc'] == {'status': 'ready', 'tags': [],
+                             'owner': 'ops'}
+
+    # tuple shorthand
+    target = {'a': {'b': 1}}
+    atomic(target, ('assign', 'a.c', 2), ('delete', 'a.b'))
+    assert target == {'a': {'c': 2}}
+
+
+def test_atomic_rollback_alias_and_list_indexes():
+    shared_list = [1, 2, 3]
+    shared = {'items': shared_list}
+    old_value = {'nested': True}
+    target = {'left': shared, 'right': shared, 'doc': {'value': old_value}}
+    left_alias = target['left']
+    doc_alias = target['doc']
+
+    with pytest.raises(PathDeleteError):
+        atomic(target, [
+            Assign('left.items.0', 9),
+            Delete('right.items.0'),
+            Delete('doc.value'),
+            Assign('doc.value', {'replacement': True}),
+            Delete('does_not_exist'),
+        ])
+
+    assert target['left'] is left_alias
+    assert target['right'] is left_alias
+    assert target['doc'] is doc_alias
+    assert target['left']['items'] is shared_list
+    assert shared_list == [1, 2, 3]
+    assert target['doc']['value'] is old_value
+    assert old_value == {'nested': True}
+
+
+def test_atomic_rejects_unsupported_before_mutating():
+    class Custom:
+        pass
+
+    custom = Custom()
+    target = {'keep': 'before', 'custom': custom}
+
+    with pytest.raises(UnsupportedAtomicMutation):
+        atomic(target, [Assign('keep', 'after'),
+                        Assign('custom.value', 1)])
+
+    assert target == {'keep': 'before', 'custom': custom}
+
+    with pytest.raises(UnsupportedAtomicMutation):
+        atomic(target, [Assign('keep', 'after'),
+                        Assign('value', 1, missing=dict)])
+    assert target['keep'] == 'before'
+
+    with pytest.raises(UnsupportedAtomicMutation):
+        atomic(target, [Assign('keep', 'after'), Assign(T.custom.value, 1)])
+    assert target['keep'] == 'before'
+
+    class CustomRoot:
+        def __setattr__(self, name, value):
+            raise AssertionError('setter should not be called')
+
+    with pytest.raises(UnsupportedAtomicMutation):
+        atomic(CustomRoot(), [Assign('value', 1)])
+
+
+def test_atomic_rejects_dynamic_intermediate_value():
+    target = {'source': {}, 'keep': 'before'}
+
+    with pytest.raises(AtomicMutationError):
+        atomic(target, [Assign('keep', 'after'),
+                        Assign('computed', Spec('source')),
+                        Assign('computed.value', 1)])
+
+    assert target == {'source': {}, 'keep': 'before'}
+
+
+def test_atomic_values_and_failure_during_apply():
+    target = {'a': 1}
+    atomic(target, [Assign('b', 1), Assign('c', Spec('b'))])
+    assert target['c'] == 1
+
+    target = {'a': 1}
+
+    def fail(_target):
+        raise ValueError('expected failure')
+
+    with pytest.raises(ValueError, match='expected failure'):
+        atomic(target, [Assign('a', 2),
+                        Assign('b', Spec(Invoke(fail).specs(T)))])
+    assert target == {'a': 1}
+
+
+def test_atomic_ignore_missing():
+    target = {'a': [1]}
+    assert atomic(target, [Delete('missing', ignore_missing=True),
+                           Delete('a.5', ignore_missing=True),
+                           Assign('a.0', 2)]) is target
+    assert target == {'a': [2]}
+
+
+def test_atomic_repr():
+    spec = Atomic([Assign('a', 1), Delete('b')])
+    assert repr(spec) == "Atomic([Assign(Path('a'), 1), Delete(Path('b'))])"
+    assert repr(eval(repr(spec))) == repr(spec)
+
+
+def test_assign_delete_remain_in_place():
+    target = {'doc': {'value': 1}}
+    alias = target['doc']
+    assert assign(target, 'doc.value', 2) is target
+    assert delete(target, 'doc.value') is target
+    assert target['doc'] is alias
+    assert target == {'doc': {}}
