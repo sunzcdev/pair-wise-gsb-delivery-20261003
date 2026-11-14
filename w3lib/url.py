@@ -13,7 +13,7 @@ import re
 import warnings
 from ipaddress import IPv6Address, ip_address
 from pathlib import Path
-from typing import TYPE_CHECKING, NamedTuple, cast, overload
+from typing import TYPE_CHECKING, Literal, NamedTuple, cast, overload
 from urllib.parse import ParseResult, urljoin
 from urllib.request import pathname2url
 
@@ -561,40 +561,307 @@ def add_or_replace_parameters(
     )
 
 
-def path_to_file_uri(path: str | os.PathLike[str]) -> str:
-    """Convert local filesystem path to legal File URIs as described in:
-    http://en.wikipedia.org/wiki/File_URI_scheme
+#: Explicit path styles accepted by the File URI conversion functions.
+#:
+#: ``"auto"`` keeps the historical, platform-dependent behavior. ``"windows"``
+#: and ``"posix"`` select the corresponding path syntax unconditionally, so the
+#: same strings can be converted on any platform.
+PathStyle = Literal["auto", "windows", "posix"]
+
+_PATH_STYLES = frozenset(("auto", "windows", "posix"))
+
+# A Windows drive letter followed by a colon, e.g. the ``C:`` of ``C:\foo``.
+_WINDOWS_DRIVE_RE = re.compile(r"^[A-Za-z]:")
+
+
+def _check_path_style(path_style: str) -> None:
+    if path_style not in _PATH_STYLES:
+        raise ValueError(
+            f"invalid path style {path_style!r}; "
+            "expected one of 'auto', 'windows' or 'posix'"
+        )
+
+
+def _encode_path_segment(segment: str) -> str:
+    """Percent-encode one path segment, leaving separators to the caller.
+
+    Every character that has a meaning in a URI (``#``, ``?``, ``%`` ...) is
+    encoded, so spaces, non-ASCII text, percent signs and hash marks keep
+    their literal path meaning through a round trip.
     """
-    absolute_path = Path(path).absolute()
-    if os.name == "nt" and absolute_path.drive.startswith("\\\\"):
-        return absolute_path.as_uri()
-    return f"file:///{pathname2url(str(absolute_path)).lstrip('/')}"
+    return _quote(segment.encode("utf-8"), safe=b":").decode("ascii")
 
 
-def file_uri_to_path(uri: str) -> str:
-    """Convert File URI to local filesystem path according to:
-    http://en.wikipedia.org/wiki/File_URI_scheme
+def _decode_path_segment(segment: str, *, separators: str) -> str:
+    """Decode one percent-encoded path segment.
 
-    A host other than ``localhost`` names a file on that host: on Windows the
-    result is a UNC path, and elsewhere :exc:`OSError` is raised, as
-    :func:`urllib.request.url2pathname` does since Python 3.14.
+    *separators* lists the path separators of the target style; their
+    percent-encoded forms (and any encoded form of a backslash) raise
+    :exc:`ValueError`, so encoded separators can never turn into directory
+    levels while parsing.
     """
-    parsed = _urlparse(uri)
-    path = parsed.path
-    if parsed.netloc and parsed.netloc.lower() != "localhost":
-        if os.name != "nt":
-            raise OSError(f"Bad URL: {uri} has a non-local host")
-        path = f"//{parsed.netloc}{path}"
-    return _url2pathname(path)
+    lowered = segment.lower()
+    if "%5c" in lowered or any(
+        f"%{ord(separator):02X}".lower() in lowered for separator in separators
+    ):
+        raise ValueError(
+            f"path segment {segment!r} contains an encoded path separator"
+        )
+    try:
+        return _unquote(segment).decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise ValueError(f"path segment {segment!r} is not valid UTF-8") from exc
 
 
-def any_to_uri(uri_or_path: str) -> str:
-    """If given a path name, return its File URI, otherwise return it
-    unmodified
+def _path_to_file_uri_windows(path: str) -> str:
+    r"""Pure-string Windows path to File URI conversion."""
+    if path.startswith("\\\\"):
+        # UNC path: \\server\share\... -> file://server/share/...
+        unc_parts = re.split(r"[\\/]+", path.lstrip("\\"))
+        if len(unc_parts) < 2 or not unc_parts[0] or not unc_parts[1]:
+            raise ValueError(f"invalid UNC path: {path!r}")
+        host = _encode_path_segment(
+            _decode_path_segment(unc_parts[0], separators="\\/")
+        )
+        uri_path = "/".join(_encode_path_segment(part) for part in unc_parts[1:])
+        return f"file://{host}/{uri_path}"
+
+    drive = ""
+    body = path
+    if _WINDOWS_DRIVE_RE.match(path):
+        drive = f"{path[0].upper()}:"
+        body = path[2:]
+
+    absolute = body[:1] in ("\\", "/")
+    segments = re.split(r"[\\/]", body.lstrip("\\/"))
+    uri_path = "/".join(_encode_path_segment(segment) for segment in segments)
+    if drive:
+        # Drive-absolute (``C:\foo``) and drive-relative (``C:foo``) paths
+        # stay distinct through the presence of the leading slash.
+        if absolute:
+            return f"file:///{drive}/{uri_path}"
+        return f"file:{drive}{uri_path}"
+    if absolute:
+        # A root-relative path without a drive, e.g. ``\foo\bar``.
+        return f"file:///{uri_path}"
+    # A relative path is emitted as a relative File URI, without a host.
+    return f"file:{uri_path}"
+
+
+def _path_to_file_uri_posix(path: str) -> str:
+    """Pure-string POSIX path to File URI conversion."""
+    if "\\" in path:
+        raise ValueError(
+            f"POSIX path {path!r} contains a backslash, which is not a "
+            "POSIX path separator"
+        )
+    segments = path.split("/")
+    uri_path = "/".join(_encode_path_segment(segment) for segment in segments)
+    if path.startswith("/"):
+        # The two authority slashes of "file://" are followed by the path,
+        # including its leading slash.
+        return "file://" + uri_path
+    return f"file:{uri_path}"
+
+
+def _validate_file_uri(parsed: _SplitResult, uri: str) -> None:
+    """Reject File URIs that cannot round-trip to an unambiguous path."""
+    if "\\" in uri:
+        raise ValueError(
+            f"file URI {uri!r} contains a raw backslash"
+        )
+    if parsed.username is not None or parsed.password is not None:
+        raise ValueError(f"file URI {uri!r} must not contain user information")
+    if parsed.port is not None:
+        raise ValueError(f"file URI {uri!r} must not contain a port")
+    if parsed.query:
+        raise ValueError(f"file URI {uri!r} must not contain a query")
+    if parsed.fragment:
+        raise ValueError(f"file URI {uri!r} must not contain a fragment")
+
+
+def _file_uri_to_path_windows(uri: str) -> str:
+    r"""Pure-string File URI to Windows path conversion."""
+    parsed = _urlsplit(uri)
+    _validate_file_uri(parsed, uri)
+    host = parsed.hostname
+    if host:
+        if host.lower() != "localhost":
+            unc_parts = [_decode_path_segment(host, separators="\\/")]
+            unc_parts.extend(
+                _decode_path_segment(segment, separators="\\/")
+                for segment in parsed.path.lstrip("/").split("/")
+            )
+            return "\\\\" + "\\".join(unc_parts)
+        # localhost names the local machine, the path below is handled below.
+    raw_path = parsed.path
+    drive_match = re.match(r"^/([A-Za-z]):(?:/|$)", raw_path)
+    if drive_match:
+        drive = f"{drive_match.group(1).upper()}:\\"
+        tail = raw_path[drive_match.end() :]
+        decoded_tail = [
+            _decode_path_segment(segment, separators="\\/")
+            for segment in tail.split("/")
+        ]
+        return drive + "\\".join(decoded_tail)
+    if "|" in raw_path:
+        raise ValueError(
+            f"file URI {uri!r} uses the legacy pipe drive notation"
+        )
+    # Drive-relative File URIs have no authority and no leading slash,
+    # e.g. "file:C:foo/bar.txt".
+    drive_relative_match = re.match(r"^([A-Za-z]):", raw_path)
+    if not parsed.netloc and drive_relative_match:
+        drive = f"{drive_relative_match.group(1).upper()}:"
+        return drive + "\\".join(
+            _decode_path_segment(segment, separators="\\/")
+            for segment in raw_path[2:].split("/")
+        )
+    decoded = [
+        _decode_path_segment(segment, separators="\\/")
+        for segment in raw_path.lstrip("/").split("/")
+    ]
+    if raw_path[:1] == "/":
+        # Drive-less absolute path, e.g. file:///foo/bar -> \foo\bar.
+        return "\\" + "\\".join(decoded)
+    return "\\".join(decoded)
+
+
+def _file_uri_to_path_posix(uri: str) -> str:
+    """Pure-string File URI to POSIX path conversion."""
+    parsed = _urlsplit(uri)
+    _validate_file_uri(parsed, uri)
+    host = parsed.hostname
+    if host and host.lower() != "localhost":
+        raise ValueError(
+            f"file URI {uri!r} has a non-local host {host!r}; "
+            "POSIX paths cannot name a remote host"
+        )
+    raw_path = parsed.path
+    return "/".join(
+        _decode_path_segment(segment, separators="/")
+        for segment in raw_path.split("/")
+    )
+
+
+def path_to_file_uri(
+    path: str | os.PathLike[str], *, path_style: PathStyle = "auto"
+) -> str:
+    """Convert a local filesystem path to a legal File URI.
+
+    See http://en.wikipedia.org/wiki/File_URI_scheme
+
+    *path_style* selects the path syntax used for the conversion:
+
+    -   ``"auto"`` (the default) preserves the historical behavior: the path
+        is made absolute against the current working directory and converted
+        for the current platform, including UNC paths on Windows.
+    -   ``"windows"`` interprets *path* as a Windows path. Drive-absolute
+        paths, drive-relative paths, UNC paths and relative paths stay
+        distinct. Relative paths produce relative File URIs.
+    -   ``"posix"`` interprets *path* as a POSIX path. A backslash is an
+        ordinary file name character, not a separator, so a path containing
+        one raises :exc:`ValueError`.
+
+    The explicit ``"windows"`` and ``"posix"`` styles are pure string
+    operations: they never touch the filesystem, so they work identically on
+    every platform. Spaces, non-ASCII characters, percent signs and hash
+    marks are percent-encoded, and a round trip through
+    :func:`file_uri_to_path` restores the original path.
+
+    :class:`~os.PathLike` objects are converted with :func:`os.fspath`.
     """
-    if os.path.splitdrive(uri_or_path)[0]:
+    _check_path_style(path_style)
+    if path_style == "auto":
+        absolute_path = Path(path).absolute()
+        if os.name == "nt" and absolute_path.drive.startswith("\\\\"):
+            return absolute_path.as_uri()
+        return f"file:///{pathname2url(str(absolute_path)).lstrip('/')}"
+    path = os.fspath(path)
+    if not isinstance(path, str):
+        raise TypeError("path must be a str or a str-backed os.PathLike")
+    if path_style == "windows":
+        return _path_to_file_uri_windows(path)
+    return _path_to_file_uri_posix(path)
+
+
+def file_uri_to_path(uri: str, *, path_style: PathStyle = "auto") -> str:
+    """Convert a File URI to a local filesystem path.
+
+    See http://en.wikipedia.org/wiki/File_URI_scheme
+
+    *path_style* selects the path syntax of the result:
+
+    -   ``"auto"`` (the default) preserves the historical behavior and uses
+        the current platform's conventions. A host other than ``localhost``
+        names a file on that host: on Windows the result is a UNC path, and
+        elsewhere :exc:`OSError` is raised, as
+        :func:`urllib.request.url2pathname` does since Python 3.14.
+    -   ``"windows"`` always builds a Windows path, mapping a non-local host
+        to a UNC path and a drive letter to a ``C:`` style path.
+    -   ``"posix"`` always builds a POSIX path and rejects a non-local host,
+        a backslash or an encoded path separator.
+
+    The explicit ``"windows"`` and ``"posix"`` styles are pure string
+    operations: they never touch the filesystem or the network. A File URI
+    with user information, a port, a non-empty query or a fragment, or one
+    whose percent-encoded path separators would create new directory levels,
+    raises :exc:`ValueError`.
+    """
+    _check_path_style(path_style)
+    if path_style == "auto":
+        parsed = _urlparse(uri)
+        path = parsed.path
+        if parsed.netloc and parsed.netloc.lower() != "localhost":
+            if os.name != "nt":
+                raise OSError(f"Bad URL: {uri} has a non-local host")
+            path = f"//{parsed.netloc}{path}"
+        return _url2pathname(path)
+    if path_style == "windows":
+        return _file_uri_to_path_windows(uri)
+    return _file_uri_to_path_posix(uri)
+
+
+def any_to_uri(uri_or_path: str, *, path_style: PathStyle = "auto") -> str:
+    """Return a File URI for a path, or the input unchanged if it is a URL.
+
+    Input with a URL scheme is returned unmodified, so genuine remote URLs
+    such as ``http://example.com/file`` are never mistaken for paths.
+    Otherwise the input is treated as a filesystem path and converted with
+    :func:`path_to_file_uri`.
+
+    *path_style* has the same meaning as in :func:`path_to_file_uri`. With
+    the explicit ``"windows"`` style, a leading Windows drive (e.g.
+    ``C:\\foo``) is always recognized as a path even on non-Windows
+    platforms; with ``"posix"`` and the default ``"auto"`` style, a string
+    containing a scheme is treated as a URL. Relative paths and
+    scheme-relative references (``//host/...``) stay distinct in the explicit
+    ``"windows"`` and ``"posix"`` styles, where only paths are made into File
+    URIs and such a reference is returned unchanged. The default ``"auto"``
+    style keeps its historical, platform-dependent handling of such strings.
+
+    The explicit ``"windows"`` and ``"posix"`` styles never touch the
+    filesystem or the network.
+    """
+    _check_path_style(path_style)
+    if path_style == "windows":
+        if _WINDOWS_DRIVE_RE.match(uri_or_path) or uri_or_path.startswith("\\\\"):
+            return _path_to_file_uri_windows(uri_or_path)
+        if uri_or_path.startswith("//"):
+            # A scheme-relative network-path reference names another host,
+            # it is not a Windows filesystem path.
+            return uri_or_path
+    if path_style == "auto" and os.path.splitdrive(uri_or_path)[0]:
         return path_to_file_uri(uri_or_path)
-    return uri_or_path if _urlparse(uri_or_path)[0] else path_to_file_uri(uri_or_path)
+    if path_style == "posix" and uri_or_path.startswith("//"):
+        # Same distinction for the explicit POSIX style; the "auto" style
+        # keeps its historical platform-dependent behavior.
+        return uri_or_path
+    return (
+        uri_or_path
+        if _urlparse(uri_or_path)[0]
+        else path_to_file_uri(uri_or_path, path_style=path_style)
+    )
 
 
 def add_http_if_no_scheme(url: str) -> str:

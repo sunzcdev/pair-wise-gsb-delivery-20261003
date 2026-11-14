@@ -1,6 +1,23 @@
 w3lib release notes
 ===================
 
+Unreleased
+----------
+
+New features:
+
+- :func:`~w3lib.url.path_to_file_uri`, :func:`~w3lib.url.file_uri_to_path`
+  and :func:`~w3lib.url.any_to_uri` now take a keyword-only *path_style*
+  parameter (``"auto"``, ``"windows"`` or ``"posix"``). The default
+  ``"auto"`` keeps the historical, platform-dependent behavior. The explicit
+  ``"windows"`` and ``"posix"`` styles are pure string operations that work
+  identically on every platform, keep drive-absolute paths, UNC paths,
+  relative paths and remote URLs distinct, round-trip spaces, non-ASCII
+  characters, percent signs and hash marks, and reject File URIs with user
+  information, a port, a non-empty query or a fragment, as well as
+  percent-encoded path separators that would otherwise create new directory
+  levels.
+
 2.6.0 (2026-11-05)
 ------------------
 

@@ -1548,6 +1548,274 @@ class TestUrl:
             == "http://www.example.com/some/path.txt"
         )
 
+    @pytest.mark.parametrize(
+        ("path", "uri"),
+        [
+            (r"C:\windows\clock.avi", "file:///C:/windows/clock.avi"),
+            (r"c:\temp\50%.txt", "file:///C:/temp/50%25.txt"),
+            (
+                r"C:\shared folder\café #1.txt",
+                "file:///C:/shared%20folder/caf%C3%A9%20%231.txt",
+            ),
+            (
+                r"C:\中文 目录\文件 名.txt",
+                "file:///C:/%E4%B8%AD%E6%96%87%20%E7%9B%AE%E5%BD%95/"
+                "%E6%96%87%E4%BB%B6%20%E5%90%8D.txt",
+            ),
+            (r"\\server\share\file.txt", "file://server/share/file.txt"),
+            (
+                r"\\server\shared folder\café #1.txt",
+                "file://server/shared%20folder/caf%C3%A9%20%231.txt",
+            ),
+            (r"relative\path.txt", "file:relative/path.txt"),
+            ("relative/path.txt", "file:relative/path.txt"),
+            ("C:relative.txt", "file:C:relative.txt"),
+            ("C:", "file:C:"),
+            (r"\rootless\path", "file:///rootless/path"),
+            ("a#b%c d.txt", "file:a%23b%25c%20d.txt"),
+        ],
+    )
+    def test_path_to_file_uri_windows_style(self, path, uri):
+        assert path_to_file_uri(path, path_style="windows") == uri
+        assert path_to_file_uri(Path(path), path_style="windows") == uri
+
+    @pytest.mark.parametrize(
+        ("path", "uri", "expected"),
+        [
+            (
+                r"C:\windows\clock.avi",
+                "file:///C:/windows/clock.avi",
+                r"C:\windows\clock.avi",
+            ),
+            (
+                r"C:\shared folder\café #1.txt",
+                "file:///C:/shared%20folder/caf%C3%A9%20%231.txt",
+                r"C:\shared folder\café #1.txt",
+            ),
+            (
+                r"\\server\shared folder\café #1.txt",
+                "file://server/shared%20folder/caf%C3%A9%20%231.txt",
+                r"\\server\shared folder\café #1.txt",
+            ),
+            ("relative/path.txt", "file:relative/path.txt", r"relative\path.txt"),
+            ("C:relative.txt", "file:C:relative.txt", r"C:relative.txt"),
+            ("C:", "file:C:", "C:"),
+            (r"\rootless\path", "file:///rootless/path", r"\rootless\path"),
+            ("a#b%c d.txt", "file:a%23b%25c%20d.txt", "a#b%c d.txt"),
+        ],
+    )
+    def test_file_uri_roundtrip_windows_style(self, path, uri, expected):
+        assert path_to_file_uri(path, path_style="windows") == uri
+        assert file_uri_to_path(uri, path_style="windows") == expected
+
+    @pytest.mark.parametrize(
+        ("path", "uri"),
+        [
+            ("/some/path.txt", "file:///some/path.txt"),
+            ("/dir/50%.txt", "file:///dir/50%25.txt"),
+            ("/dir/a#b c.txt", "file:///dir/a%23b%20c.txt"),
+            (
+                "/中文/空格 文件.txt",
+                "file:///%E4%B8%AD%E6%96%87/"
+                "%E7%A9%BA%E6%A0%BC%20%E6%96%87%E4%BB%B6.txt",
+            ),
+            ("relative/path.txt", "file:relative/path.txt"),
+            ("a#b%c d.txt", "file:a%23b%25c%20d.txt"),
+            ("", "file:"),
+        ],
+    )
+    def test_path_to_file_uri_posix_style(self, path, uri):
+        assert path_to_file_uri(path, path_style="posix") == uri
+        assert file_uri_to_path(uri, path_style="posix") == path
+
+    @pytest.mark.parametrize(
+        "uri",
+        [
+            "file:///C:/a%2Fb",
+            "file:///C:/a%5Cb",
+            "file://server/a%2Fb",
+            "file:relative%5Cpath",
+        ],
+    )
+    def test_file_uri_to_path_windows_style_rejects_encoded_separator(self, uri):
+        with pytest.raises(ValueError, match="encoded path separator"):
+            file_uri_to_path(uri, path_style="windows")
+
+    @pytest.mark.parametrize(
+        "uri",
+        [
+            "file:///a%2Fb",
+            "file:relative%2Fpath",
+            "file:///a%5Cb",
+        ],
+    )
+    def test_file_uri_to_path_posix_style_rejects_encoded_separator(self, uri):
+        with pytest.raises(ValueError, match="encoded path separator"):
+            file_uri_to_path(uri, path_style="posix")
+
+    @pytest.mark.parametrize("path_style", ["windows", "posix"])
+    @pytest.mark.parametrize(
+        "uri",
+        [
+            "file://user:pass@localhost/a",
+            "file://user@localhost/a",
+            "file://localhost:8080/a",
+            "file:///a?bar=baz",
+            "file:///a?query",
+            "file:///a#fragment",
+        ],
+    )
+    def test_file_uri_to_path_explicit_rejects_userinfo_query_fragment(
+        self, path_style, uri
+    ):
+        with pytest.raises(ValueError):
+            file_uri_to_path(uri, path_style=path_style)
+
+    @pytest.mark.parametrize(
+        ("uri", "path"),
+        [
+            ("file://server/share/file.txt", r"\\server\share\file.txt"),
+            (
+                "file://server/shared%20folder/caf%C3%A9%20%231.txt",
+                r"\\server\shared folder\café #1.txt",
+            ),
+            ("file://localhost/foo/bar", r"\foo\bar"),
+            ("file://LOCALHOST/foo/bar", r"\foo\bar"),
+            ("file:///foo/bar", r"\foo\bar"),
+            ("file:relative/path.txt", r"relative\path.txt"),
+        ],
+    )
+    def test_file_uri_to_path_windows_style_hosts(self, uri, path):
+        assert file_uri_to_path(uri, path_style="windows") == path
+
+    def test_file_uri_to_path_posix_style_rejects_non_local_host(self):
+        with pytest.raises(ValueError, match="non-local host"):
+            file_uri_to_path("file://example.com/etc/passwd", path_style="posix")
+        assert (
+            file_uri_to_path("file://localhost/foo/bar", path_style="posix")
+            == "/foo/bar"
+        )
+
+    def test_explicit_styles_reject_legacy_pipe_drive(self):
+        with pytest.raises(ValueError, match="pipe drive"):
+            file_uri_to_path("file:///C|/a", path_style="windows")
+
+    def test_path_to_file_uri_posix_style_rejects_backslash(self):
+        with pytest.raises(ValueError, match="backslash"):
+            path_to_file_uri(r"a\b", path_style="posix")
+
+    def test_path_to_file_uri_windows_style_rejects_bad_unc(self):
+        with pytest.raises(ValueError, match="invalid UNC path"):
+            path_to_file_uri(r"\\server", path_style="windows")
+
+    def test_unc_host_special_characters_roundtrip_windows_style(self):
+        for path in (r"\\serv er\share\f", r"\\服务 器\share\café.txt"):
+            uri = path_to_file_uri(path, path_style="windows")
+            assert " " not in uri
+            assert file_uri_to_path(uri, path_style="windows") == path
+
+    @pytest.mark.parametrize("path_style", ["windows", "posix"])
+    def test_file_uri_to_path_explicit_rejects_raw_backslash(self, path_style):
+        with pytest.raises(ValueError, match="backslash"):
+            file_uri_to_path("file://ser\\ver/a", path_style=path_style)
+
+    def test_invalid_path_style(self):
+        with pytest.raises(ValueError, match="invalid path style"):
+            path_to_file_uri("a", path_style="nope")
+        with pytest.raises(ValueError, match="invalid path style"):
+            file_uri_to_path("file:///a", path_style="nope")
+        with pytest.raises(ValueError, match="invalid path style"):
+            any_to_uri("a", path_style="nope")
+
+    @pytest.mark.parametrize("path_style", ["windows", "posix"])
+    def test_explicit_styles_do_not_touch_the_filesystem(self, monkeypatch, path_style):
+        def fail(*args, **kwargs):
+            raise AssertionError("the filesystem must not be accessed")
+
+        monkeypatch.setattr("w3lib.url.Path", fail)
+        monkeypatch.setattr("w3lib.url.pathname2url", fail)
+        monkeypatch.setattr("os.getcwd", fail)
+        path_to_file_uri("relative/path.txt", path_style=path_style)
+        file_uri_to_path("file:relative/path.txt", path_style=path_style)
+
+    @pytest.mark.parametrize(
+        ("value", "expected"),
+        [
+            (r"C:\windows\clock.avi", "file:///C:/windows/clock.avi"),
+            (r"\\server\share\f", "file://server/share/f"),
+            (r"relative\path.txt", "file:relative/path.txt"),
+            ("file:///some/path.txt", "file:///some/path.txt"),
+            (
+                "http://www.example.com/some/path.txt",
+                "http://www.example.com/some/path.txt",
+            ),
+            ("//example.com/x", "//example.com/x"),
+        ],
+    )
+    def test_any_to_uri_windows_style(self, value, expected):
+        assert any_to_uri(value, path_style="windows") == expected
+
+    @pytest.mark.parametrize(
+        ("value", "expected"),
+        [
+            ("/some/path.txt", "file:///some/path.txt"),
+            ("relative/path.txt", "file:relative/path.txt"),
+            ("file:///some/path.txt", "file:///some/path.txt"),
+            (
+                "http://www.example.com/some/path.txt",
+                "http://www.example.com/some/path.txt",
+            ),
+            ("//example.com/x", "//example.com/x"),
+        ],
+    )
+    def test_any_to_uri_posix_style(self, value, expected):
+        assert any_to_uri(value, path_style="posix") == expected
+
+    def test_windows_style_is_platform_independent(self, monkeypatch):
+        # The explicit Windows style must give identical results regardless of
+        # the platform the code runs on.
+        monkeypatch.setattr("w3lib._url._IS_WINDOWS", False)
+        monkeypatch.setattr("os.name", "posix")
+        assert (
+            path_to_file_uri(r"C:\windows\clock.vi", path_style="windows")
+            == "file:///C:/windows/clock.vi"
+        )
+        assert (
+            file_uri_to_path(
+                "file:///C:/windows/clock.vi", path_style="windows"
+            )
+            == r"C:\windows\clock.vi"
+        )
+        assert (
+            file_uri_to_path("file://server/share/f", path_style="windows")
+            == r"\\server\share\f"
+        )
+
+    def test_special_characters_roundtrip_both_styles(self):
+        tricky = "sp ace#hash%pct中 文"
+        for style in ("windows", "posix"):
+            uri = path_to_file_uri(tricky, path_style=style)
+            assert file_uri_to_path(uri, path_style=style) == tricky
+
+    def test_drive_relative_path_windows_style(self):
+        # A single letter followed by a colon is a Windows drive-relative
+        # path, not a URL scheme; the drive letter is upper-cased and the
+        # forward slash is normalized to a backslash on the way back.
+        assert path_to_file_uri("a:b/c", path_style="windows") == "file:A:b/c"
+        assert (
+            file_uri_to_path("file:A:b/c", path_style="windows") == r"A:b\c"
+        )
+        # The same string stays an ordinary POSIX file name.
+        assert path_to_file_uri("a:b/c", path_style="posix") == "file:a:b/c"
+        assert (
+            file_uri_to_path("file:a:b/c", path_style="posix") == "a:b/c"
+        )
+
+    def test_explicit_posix_roundtrip_preserves_double_slashes(self):
+        for path in ("/", "//", "///", "/a//b/"):
+            uri = path_to_file_uri(path, path_style="posix")
+            assert file_uri_to_path(uri, path_style="posix") == path
+
 
 class TestSafeDownloadUrlProperties:
     @pytest.mark.filterwarnings("ignore::FutureWarning")
