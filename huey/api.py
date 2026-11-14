@@ -4,12 +4,14 @@ import inspect
 import itertools
 import logging
 import re
+import threading
 import time
 import traceback
 import uuid
 import warnings
 
 from collections import deque
+from collections import namedtuple
 from functools import partial
 from functools import wraps
 
@@ -20,11 +22,14 @@ from huey.exceptions import CancelExecution
 from huey.exceptions import ConfigurationError
 from huey.exceptions import RateLimitExceeded
 from huey.exceptions import RETRYING_EXCEPTIONS
+from huey.exceptions import ResultExpired
+from huey.exceptions import ResultPending
 from huey.exceptions import ResultTimeout
 from huey.exceptions import RetryTask
 from huey.exceptions import TaskException
 from huey.exceptions import TaskLockedException
 from huey.exceptions import TaskTimeout
+from huey.exceptions import WaitCancelled
 from huey.registry import Registry
 from huey.serializer import Serializer
 from huey.storage import BlackHoleStorage
@@ -63,6 +68,13 @@ class Huey(object):
         any ``on_error`` handler. When ``False``, the error is withheld until
         the task's retries are exhausted. Defaults to ``True`` for backwards
         compatibility.
+    :param bool multi_waiter: default for the ``multi_waiter`` option of tasks.
+        When enabled, tasks return a :py:class:`SharedResult` whose result can
+        be read repeatedly by any number of independent waiters.
+    :param retention: default retention period (seconds, or a
+        ``datetime.timedelta``) for shared (multi-waiter) results. When
+        ``None``, shared results are retained until read past their deadline or
+        explicitly discarded.
     :param bool utc: use UTC internally by converting from local time.
     :param bool immediate: useful for debugging; causes tasks to be executed
         synchronously in the application.
@@ -95,12 +107,15 @@ class Huey(object):
     def __init__(self, name='huey', results=True, store_none=False, utc=True,
                  immediate=False, serializer=None, compression=False,
                  use_zlib=False, immediate_use_memory=True, storage_class=None,
-                 store_intermediate_errors=True, **storage_kwargs):
+                 store_intermediate_errors=True, multi_waiter=False,
+                 result_retention=None, **storage_kwargs):
 
         self.name = name
         self.results = results
         self.store_none = store_none
         self.store_intermediate_errors = store_intermediate_errors
+        self.multi_waiter = multi_waiter
+        self.result_retention = normalize_retention(result_retention)
         self.utc = utc
         self._immediate = immediate
         self.immediate_use_memory = immediate_use_memory
@@ -169,8 +184,12 @@ class Huey(object):
         return Consumer(self, **options)
 
     def task(self, retries=0, retry_delay=0, retry_backoff=0, priority=None,
-             context=False, name=None, expires=None, timeout=None, **kwargs):
+             context=False, name=None, expires=None, timeout=None,
+             multi_waiter=None, result_retention=None, **kwargs):
         TaskWrapper = self.task_wrapper_class
+        multi_waiter = self.multi_waiter if multi_waiter is None else multi_waiter
+        result_retention = (self.result_retention
+                            if result_retention is None else result_retention)
         def decorator(func):
             return TaskWrapper(
                 self,
@@ -183,13 +202,19 @@ class Huey(object):
                 default_priority=priority,
                 default_expires=expires,
                 default_timeout=timeout,
+                multi_waiter=multi_waiter,
+                result_retention=result_retention,
                 **kwargs)
         return decorator
 
     def periodic_task(self, validate_datetime, retries=0, retry_delay=0,
                       retry_backoff=0, priority=None, context=False, name=None,
-                      expires=None, timeout=None, **kwargs):
+                      expires=None, timeout=None, multi_waiter=None,
+                      result_retention=None, **kwargs):
         TaskWrapper = self.task_wrapper_class
+        multi_waiter = self.multi_waiter if multi_waiter is None else multi_waiter
+        result_retention = (self.result_retention
+                            if result_retention is None else result_retention)
         def decorator(func):
             def method_validate(self, timestamp):
                 return validate_datetime(timestamp)
@@ -207,6 +232,8 @@ class Huey(object):
                 default_timeout=timeout,
                 validate_datetime=method_validate,
                 task_base=PeriodicTask,
+                multi_waiter=multi_waiter,
+                result_retention=result_retention,
                 **kwargs)
 
         return decorator
@@ -303,13 +330,21 @@ class Huey(object):
 
     def enqueue(self, task):
         if isinstance(task, group):
-            return ResultGroup([self.enqueue(t) for t in task.tasks])
+            results = [self.enqueue(t) for t in task.tasks]
+            if results and all(isinstance(r, SharedResult) for r in results):
+                return SharedResultGroup(results)
+            return ResultGroup(results)
         elif isinstance(task, chord):
             return self._enqueue_chord(task)
 
         # Resolve the expiration time when the task is enqueued.
         if task.expires:
             task.resolve_expires(self.utc)
+
+        # Register the pending marker(s) before the task can run, so "not
+        # finished yet" can be told apart from "never registered / expired".
+        if task.multi_waiter:
+            self._register_pipeline(task, 'register_pending')
 
         self._emit(S.SIGNAL_ENQUEUED, task)
 
@@ -322,7 +357,11 @@ class Huey(object):
             return
 
         results = self._pipeline_results(task)
-        return ResultGroup(results) if len(results) > 1 else results[0]
+        if len(results) > 1:
+            if all(isinstance(r, SharedResult) for r in results):
+                return SharedResultGroup(results)
+            return ResultGroup(results)
+        return results[0]
 
     def _enqueue_chord(self, chord_obj):
         cid = str(uuid.uuid4())
@@ -341,9 +380,19 @@ class Huey(object):
             callback.extend_data(([],))
             self.enqueue(callback)
 
+        # Register pending markers for the callback (and its pipeline) so a
+        # waiter that starts before the chord completes sees STATE_PENDING.
+        if chord_obj.callback.multi_waiter:
+            self._register_pipeline(chord_obj.callback, 'register_pending')
+
         pipeline = self._pipeline_results(chord_obj.callback)
-        return ChordResult(results, pipeline[0],
-                           ResultGroup(pipeline) if len(pipeline) > 1 else None)
+        pipeline_result = None
+        if len(pipeline) > 1:
+            if all(isinstance(r, SharedResult) for r in pipeline):
+                pipeline_result = SharedResultGroup(pipeline)
+            else:
+                pipeline_result = ResultGroup(pipeline)
+        return ChordResult(results, pipeline[0], pipeline_result)
 
     def _enqueue_chord_member(self, task, config):
         if isinstance(task, chord):
@@ -361,14 +410,23 @@ class Huey(object):
         else:
             self.enqueue(head)
 
-        return Result(self, tail)
+        return self._result_handle(tail)
 
     def _pipeline_results(self, task):
         results = []
         while task is not None:
-            results.append(Result(self, task))
+            results.append(self._result_handle(task))
             task = task.on_complete
         return results
+
+    def _register_pipeline(self, task, method, *args):
+        # Apply the given SharedResult lifecycle method to every task in the
+        # pipeline (the task itself plus any on_complete successors).
+        while task is not None:
+            if task.multi_waiter:
+                handle = self._result_handle(task)
+                getattr(handle, method)(*args)
+            task = task.on_complete
 
     def dequeue(self):
         data = self.storage.dequeue()
@@ -512,6 +570,10 @@ class Huey(object):
         if exception is None:
             if store and (task_value is not None or self.store_none):
                 self.put_result(task.id, task_value)
+            if store and task.multi_waiter:
+                # Shared results are always stored (even for a successful
+                # ``None``) in a separate, non-destructive namespace.
+                self._result_handle(task).store_success(task_value)
             self._run_post_execute(task, task_value, exception)
             self._emit(S.SIGNAL_COMPLETE, task)
             if task.on_complete:
@@ -528,6 +590,9 @@ class Huey(object):
                 next_task = task if store else None
                 while next_task is not None:
                     self.put_result(next_task.id, error)
+                    if next_task.multi_waiter:
+                        self._result_handle(next_task).store_failure(
+                            error.metadata)
                     next_task = next_task.on_complete if final else None
             self._run_post_execute(task, task_value, exception)
             if surface and task.on_error:
@@ -778,7 +843,39 @@ class Huey(object):
         return RateLimit(self, name, limit, per, retry=retry)
 
     def _result_handle(self, task):
+        if task.multi_waiter:
+            return SharedResult(self, task, task.result_retention)
         return Result(self, task)
+
+    def shared_result(self, id, retention=None):
+        """
+        Return a :py:class:`SharedResult` handle for the task with the given id.
+
+        Unlike the handle returned by :py:meth:`Huey.result`, the result is
+        read non-destructively and may be awaited by any number of independent
+        waiters, each with its own timeout and cancellation. Waiting may begin
+        before or after the task completes; the task itself is never re-run.
+
+        :param id: the task's unique identifier.
+        :param retention: optional retention period (seconds or
+            ``datetime.timedelta``) applied to the handle. When omitted, the
+            default configured on the Huey instance is used.
+        """
+        if retention is None:
+            retention = self.result_retention
+        return SharedResult(self, Task(id=id), normalize_retention(retention))
+
+    def shared_result_group(self, ids, retention=None):
+        """
+        Return a :py:class:`SharedResultGroup` for the given task ids, keeping
+        the order of the input. Each entry is an independent
+        :py:class:`SharedResult`.
+        """
+        if retention is None:
+            retention = self.result_retention
+        retention = normalize_retention(retention)
+        results = [SharedResult(self, Task(id=id), retention) for id in ids]
+        return SharedResultGroup(results)
 
     def result(self, id, blocking=False, timeout=None, backoff=1.15,
                max_delay=1.0, revoke_on_timeout=False, preserve=False):
@@ -799,11 +896,14 @@ class Task(object):
     default_retry_delay = 0
     default_retry_backoff = 0
     default_timeout = None
+    multi_waiter = False
+    result_retention = None
 
     def __init__(self, args=None, kwargs=None, id=None, eta=None, retries=None,
                  retry_delay=None, priority=None, expires=None,
                  on_complete=None, on_error=None, expires_resolved=None,
-                 timeout=None, chord_config=None, retry_backoff=None):
+                 timeout=None, chord_config=None, retry_backoff=None,
+                 multi_waiter=None, result_retention=None):
         self.name = type(self).__name__
         self.args = () if args is None else args
         self.kwargs = {} if kwargs is None else kwargs
@@ -821,6 +921,11 @@ class Task(object):
         self.expires_resolved = expires_resolved
         self.timeout = timeout if timeout is not None else self.default_timeout
         self.chord_config = chord_config
+        self.multi_waiter = (self.multi_waiter if multi_waiter is None
+                             else multi_waiter)
+        self.result_retention = (normalize_retention(
+            self.result_retention if result_retention is None
+            else result_retention))
         self._deadline = None
 
         self.on_complete = on_complete
@@ -998,7 +1103,8 @@ class TaskWrapper(object):
 
     def schedule(self, args=None, kwargs=None, eta=None, delay=None,
                  priority=None, retries=None, retry_delay=None,
-                 retry_backoff=None, expires=None, timeout=None, id=None):
+                 retry_backoff=None, expires=None, timeout=None, id=None,
+                 multi_waiter=None, result_retention=None):
         if eta is None and delay is None:
             if isinstance(args, (int, float)):
                 delay = args
@@ -1024,7 +1130,9 @@ class TaskWrapper(object):
             retry_backoff=retry_backoff,
             priority=priority,
             expires=expires,
-            timeout=timeout)
+            timeout=timeout,
+            multi_waiter=multi_waiter,
+            result_retention=result_retention)
         return self.huey.enqueue(task)
 
     def _apply(self, it):
@@ -1033,6 +1141,8 @@ class TaskWrapper(object):
     def map(self, it):
         results = [self.huey.enqueue(t) for t in self._apply(it)]
         if self.huey.results:
+            if results and all(isinstance(r, SharedResult) for r in results):
+                return SharedResultGroup(results)
             return ResultGroup(results)
 
     def __call__(self, *args, **kwargs):
@@ -1057,7 +1167,10 @@ class TaskWrapper(object):
                                retry_backoff=kwargs.pop('retry_backoff', None),
                                priority=kwargs.pop('priority', None),
                                expires=kwargs.pop('expires', None),
-                               timeout=kwargs.pop('timeout', None))
+                               timeout=kwargs.pop('timeout', None),
+                               multi_waiter=kwargs.pop('multi_waiter', None),
+                               result_retention=kwargs.pop(
+                                   'result_retention', None))
 
 
 class TaskLock(object):
@@ -1298,7 +1411,9 @@ class Result(object):
             timeout=self.task.timeout,
             chord_config=self.task.chord_config,
             on_complete=on_complete,
-            on_error=on_error)
+            on_error=on_error,
+            multi_waiter=self.task.multi_waiter,
+            result_retention=self.task.result_retention)
         return self.huey.enqueue(task)
 
     def reset(self):
@@ -1335,7 +1450,11 @@ class ResultGroup(object):
 
 class ChordResult(object):
     def __init__(self, results, callback_result, pipeline=None):
-        self.results = ResultGroup(results)
+        results = list(results)
+        if results and all(isinstance(r, SharedResult) for r in results):
+            self.results = SharedResultGroup(results)
+        else:
+            self.results = ResultGroup(results)
         self.callback = callback_result
         self.pipeline_results = pipeline
 
@@ -1345,6 +1464,465 @@ class ChordResult(object):
 
     def reset(self):
         self.callback.reset()
+
+
+# States reported by :class:`SharedResult` and :class:`WaitResult`. A
+# successful task whose return value is ``None`` is STATE_SUCCESS, which is
+# deliberately distinct from STATE_PENDING (task not finished) and
+# STATE_EXPIRED (result no longer retained).
+STATE_PENDING = 'pending'
+STATE_SUCCESS = 'success'
+STATE_FAILURE = 'failure'
+STATE_EXPIRED = 'expired'
+
+# Storage keys for shared (multi-waiter) results. These are kept in a separate
+# namespace from the task-id keys used by the ordinary, destructive result
+# store, so the semantics of ``Result.get`` / ``Huey.get`` / peek are unchanged.
+shared_result_key = 'shared:result:%s'
+shared_pending_key = 'shared:pending:%s'
+
+
+class WaitResult(object):
+    """
+    The outcome of a single wait (or non-blocking inspection) for a task whose
+    result is shared among multiple waiters.
+
+    ``state`` is one of :data:`STATE_PENDING`, :data:`STATE_SUCCESS`,
+    :data:`STATE_FAILURE` or :data:`STATE_EXPIRED`:
+
+    * ``STATE_SUCCESS`` -- the task finished. ``value`` is the return value and
+      may legitimately be ``None``.
+    * ``STATE_FAILURE`` -- the task raised. ``metadata`` holds the error dict
+      that would normally be passed to :py:class:`TaskException`.
+    * ``STATE_PENDING`` -- the task has not finished yet. ``timed_out`` is
+      ``True`` when a blocking wait gave up because its own timeout elapsed.
+    * ``STATE_EXPIRED`` -- there is no live result and no live pending marker,
+      so the result was never registered or is past its retention period.
+
+    Instances are immutable value objects.
+    """
+    __slots__ = ('state', 'value', 'metadata', 'task_id', 'timed_out')
+
+    def __init__(self, state, value=None, metadata=None, task_id=None,
+                 timed_out=False):
+        self.state = state
+        self.value = value
+        self.metadata = metadata
+        self.task_id = task_id
+        self.timed_out = timed_out
+
+    @property
+    def pending(self):
+        return self.state == STATE_PENDING
+
+    @property
+    def ok(self):
+        return self.state == STATE_SUCCESS
+
+    @property
+    def failed(self):
+        return self.state == STATE_FAILURE
+
+    @property
+    def expired(self):
+        return self.state == STATE_EXPIRED
+
+    def get(self):
+        """
+        Return the task's return value, or raise for any non-success state.
+
+        :raises TaskException: the task failed (see ``metadata``).
+        :raises ResultPending: the task has not finished yet.
+        :raises ResultExpired: the result is past its retention period.
+        """
+        if self.state == STATE_FAILURE:
+            raise TaskException(self.metadata)
+        if self.state == STATE_PENDING:
+            raise ResultPending('task %s has not finished' % self.task_id)
+        if self.state == STATE_EXPIRED:
+            raise ResultExpired('result for task %s has expired' % self.task_id)
+        return self.value
+
+    def __repr__(self):
+        return '<WaitResult: %s task=%s>' % (self.state, self.task_id)
+
+    def __eq__(self, other):
+        if isinstance(other, WaitResult):
+            return (self.state == other.state and
+                    self.value == other.value and
+                    self.metadata == other.metadata and
+                    self.task_id == other.task_id and
+                    self.timed_out == other.timed_out)
+        return NotImplemented
+
+    def __ne__(self, other):
+        result = self.__eq__(other)
+        return result if result is NotImplemented else not result
+
+    def __hash__(self):
+        return hash((self.state, self.task_id))
+
+
+class Waiter(object):
+    """
+    An independent waiter on a :py:class:`SharedResult`.
+
+    Every waiter owns its own cancellation flag and applies its own timeout, so
+    cancelling or timing out one waiter has no effect on any other waiter, and
+    none of them can consume the result.
+    """
+    def __init__(self, result, waiter_id=None):
+        self.result = result
+        self.id = waiter_id if waiter_id is not None else id(self)
+        self._cancel = threading.Event()
+
+    def wait(self, timeout=None, backoff=1.15, max_delay=1.0):
+        """
+        Block until the task reaches a terminal state, this waiter is
+        cancelled, or ``timeout`` seconds elapse.
+
+        :param timeout: maximum number of seconds to wait, or ``None`` to wait
+            indefinitely. The timeout is local to this waiter.
+        :param backoff: multiplier applied to the polling delay each iteration.
+        :param max_delay: maximum polling delay.
+        :return: a :py:class:`WaitResult`. A timeout yields a ``STATE_PENDING``
+            result with ``timed_out=True``.
+        :raises WaitCancelled: if this waiter was cancelled.
+        """
+        result = self.result
+        deadline = None if timeout is None else time.monotonic() + timeout
+        delay = 0.05
+        while True:
+            if self._cancel.is_set():
+                raise WaitCancelled('waiter %s was cancelled' % (self.id,))
+
+            snapshot = result._snapshot()
+            if snapshot.state != STATE_PENDING:
+                return snapshot
+
+            if deadline is None:
+                sleep_for = delay
+            else:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return WaitResult(STATE_PENDING, task_id=result.id,
+                                      timed_out=True)
+                sleep_for = min(delay, remaining)
+
+            # Sleeping on the event lets cancel() wake the waiter immediately,
+            # without disturbing any other waiter.
+            if self._cancel.wait(sleep_for):
+                raise WaitCancelled('waiter %s was cancelled' % (self.id,))
+            delay = min(delay * backoff, max_delay)
+
+    __call__ = wait
+
+    def cancel(self):
+        """Cancel *this* waiter only. Other waiters are unaffected."""
+        self._cancel.set()
+
+    def is_cancelled(self):
+        return self._cancel.is_set()
+
+    def reset(self):
+        """Clear the cancellation flag so the waiter can be used again."""
+        self._cancel.clear()
+
+    def __repr__(self):
+        return '<Waiter: %s task=%s>' % (self.id, self.result.id)
+
+
+class SharedResult(object):
+    """
+    Multi-waiter handle for a task result.
+
+    Unlike :py:class:`Result`, reads are **non-destructive**: the result is
+    stored in a dedicated namespace and stays readable by any number of
+    independent waiters until its retention period elapses. Obtaining a handle
+    or waiting on it never re-executes the task, so waiting may begin before or
+    after the task completes.
+
+    Handles are normally obtained by enqueuing a task declared with
+    ``multi_waiter=True``, by enqueuing a group of such tasks (which yields a
+    :py:class:`SharedResultGroup`), or via :py:meth:`Huey.shared_result`.
+
+    :param huey: the :py:class:`Huey` instance.
+    :param task: the :py:class:`Task` whose result is shared.
+    :param retention: how long (in seconds) the result remains readable after
+        the task completes, or ``None`` to retain it indefinitely.
+    """
+    def __init__(self, huey, task, retention=None):
+        self.huey = huey
+        self.task = task
+        self.revoke_id = task.revoke_id
+        self.retention = normalize_retention(retention)
+        self._waiters = {}
+        self._lock = threading.Lock()
+        self._result_key = shared_result_key % self.id
+        self._pending_key = shared_pending_key % self.id
+
+    def __repr__(self):
+        return '<SharedResult: task %s>' % self.id
+
+    @property
+    def id(self):
+        return self.task.id
+
+    # -- storage helpers ---------------------------------------------------
+
+    def _now(self):
+        return time.time()
+
+    def _read_envelope(self):
+        data = self.huey.storage.peek_data(self._result_key)
+        if data is EmptyData:
+            return EmptyData
+
+        envelope = self.huey.serializer.deserialize(data)
+        deadline = envelope.get('deadline')
+        if deadline is not None and self._now() >= deadline:
+            # Expired: lazily remove the record. Every reader applies the same
+            # check, so failing to delete it is harmless.
+            try:
+                self.huey.storage.delete_data(self._result_key)
+            except Exception:
+                logger.exception('Unable to delete expired result %s', self.id)
+            return EmptyData
+        return envelope
+
+    def _deadline(self):
+        if self.retention is None:
+            return None
+        return self._now() + self.retention
+
+    def _store(self, envelope):
+        self.huey.storage.put_data(
+            self._result_key,
+            self.huey.serializer.serialize(envelope),
+            is_result=True)
+        # The terminal result supersedes the pending marker.
+        self.huey.storage.delete_data(self._pending_key)
+
+    # -- lifecycle (used by the consumer) ----------------------------------
+
+    def register_pending(self, retention=None):
+        """
+        Record that the task is in flight, so "not finished" can be told apart
+        from "no such result". Called automatically when a multi-waiter task is
+        enqueued. ``put_if_empty`` makes this idempotent.
+        """
+        if retention is not None:
+            self.retention = normalize_retention(retention)
+        marker = {'created': self._now()}
+        self.huey.storage.put_if_empty(
+            self._pending_key, self.huey.serializer.serialize(marker))
+
+    def store_success(self, value):
+        """Store a successful return value (``None`` included)."""
+        self._store({'error': False,
+                     'value': value,
+                     'metadata': None,
+                     'created': self._now(),
+                     'deadline': self._deadline()})
+
+    def store_failure(self, metadata):
+        """Store a task failure, preserving the error metadata."""
+        self._store({'error': True,
+                     'value': None,
+                     'metadata': metadata,
+                     'created': self._now(),
+                     'deadline': self._deadline()})
+
+    # -- inspection --------------------------------------------------------
+
+    def _snapshot(self):
+        envelope = self._read_envelope()
+        if envelope is not EmptyData:
+            if envelope['error']:
+                return WaitResult(STATE_FAILURE, metadata=envelope['metadata'],
+                                  task_id=self.id)
+            return WaitResult(STATE_SUCCESS, value=envelope['value'],
+                              task_id=self.id)
+
+        if self.huey.storage.has_data_for_key(self._pending_key):
+            return WaitResult(STATE_PENDING, task_id=self.id)
+
+        return WaitResult(STATE_EXPIRED, task_id=self.id)
+
+    def state(self):
+        """
+        Return the current state without blocking. See :data:`STATE_PENDING`
+        and friends.
+        """
+        return self._snapshot().state
+
+    def is_ready(self):
+        """
+        Return whether a terminal (success or failure) result is available.
+
+        Unlike :py:meth:`Result.is_ready`, this is non-destructive: the value
+        remains readable by every waiter.
+        """
+        return self.state() in (STATE_SUCCESS, STATE_FAILURE)
+
+    def inspect(self):
+        """Return a non-blocking :class:`WaitResult` snapshot."""
+        return self._snapshot()
+
+    # -- waiting -----------------------------------------------------------
+
+    def waiter(self, waiter_id=None):
+        """
+        Return a waiter. When ``waiter_id`` is given, repeated calls with the
+        same id return the same waiter (useful for a stable per-consumer
+        identity); otherwise a new, independent waiter is created.
+        """
+        with self._lock:
+            if waiter_id is not None:
+                existing = self._waiters.get(waiter_id)
+                if existing is not None:
+                    return existing
+            waiter = Waiter(self, waiter_id)
+            if waiter_id is not None:
+                self._waiters[waiter_id] = waiter
+            return waiter
+
+    def new_waiter(self):
+        """Create a fresh, independent waiter."""
+        return Waiter(self)
+
+    def wait(self, timeout=None, backoff=1.15, max_delay=1.0):
+        """
+        Block for the result using an anonymous, independent waiter.
+
+        See :py:meth:`Waiter.wait` for the meaning of the parameters. Returns a
+        :py:class:`WaitResult`; timeouts return a pending result rather than
+        raising.
+        """
+        return self.new_waiter().wait(timeout, backoff, max_delay)
+
+    def get(self, timeout=None, blocking=True, backoff=1.15, max_delay=1.0):
+        """
+        Return the task's value, or raise for non-success states.
+
+        :param timeout: seconds to block (when ``blocking=True``).
+        :param bool blocking: when ``False``, return immediately, raising
+            :py:class:`ResultPending` if the task has not finished.
+        :raises TaskException: the task failed.
+        :raises ResultTimeout: a blocking wait timed out.
+        :raises ResultPending: not finished and ``blocking=False``.
+        :raises ResultExpired: the result is past its retention period.
+        """
+        if blocking:
+            result = self.wait(timeout, backoff, max_delay)
+            if result.pending:
+                raise ResultTimeout('timed out waiting for result')
+        else:
+            result = self.inspect()
+            if result.pending:
+                raise ResultPending('task %s has not finished' % self.id)
+        return result.get()
+
+    def discard(self):
+        """Remove all shared state (pending marker and result) for this task."""
+        self.huey.storage.delete_data(self._result_key)
+        self.huey.storage.delete_data(self._pending_key)
+
+    def reset(self):
+        """Forget locally-cached waiters (storage is left untouched)."""
+        with self._lock:
+            self._waiters.clear()
+
+
+class SharedResultGroup(object):
+    """
+    A group of :py:class:`SharedResult` handles.
+
+    The original task order is preserved. Each item is waited on independently
+    (with its own timeout/cancellation), and failures are expressed per item
+    rather than aborting the whole group.
+    """
+    def __init__(self, results):
+        self._results = list(results)
+
+    def __repr__(self):
+        return '<SharedResultGroup: %d tasks>' % len(self._results)
+
+    def __iter__(self):
+        return iter(self._results)
+
+    def __len__(self):
+        return len(self._results)
+
+    def __getitem__(self, idx):
+        return self._results[idx]
+
+    @property
+    def results(self):
+        return list(self._results)
+
+    @property
+    def ids(self):
+        return [result.id for result in self._results]
+
+    def is_ready(self):
+        """Return ``True`` when every item has a terminal result."""
+        return all(result.is_ready() for result in self._results)
+
+    def states(self):
+        """Return the states of the items, in task order."""
+        return [result.state() for result in self._results]
+
+    def inspect(self):
+        """Return non-blocking :class:`WaitResult` snapshots, in task order."""
+        return [result.inspect() for result in self._results]
+
+    def wait(self, timeout=None, backoff=1.15, max_delay=1.0):
+        """
+        Wait for every item, returning a :class:`WaitResult` per item in task
+        order. Each item is given its own ``timeout`` budget, so one item
+        timing out does not prevent the others from being reported.
+        """
+        return [result.wait(timeout, backoff, max_delay)
+                for result in self._results]
+
+    def get(self, timeout=None, backoff=1.15, max_delay=1.0):
+        """
+        Return the raw values of every item, in task order.
+
+        A failed item is represented by an :py:class:`~huey.utils.Error`
+        wrapper (as with chord callbacks), so failures are expressed per item.
+        A pending (timed out) or expired item raises ``ResultTimeout`` /
+        ``ResultExpired`` respectively -- use :py:meth:`wait` if a fully
+        non-raising, per-item result is required.
+        """
+        accum = []
+        for idx, item in enumerate(self.wait(timeout, backoff, max_delay)):
+            if item.failed:
+                accum.append(Error(item.metadata))
+            elif item.pending:
+                raise ResultTimeout(
+                    'timed out waiting for result item %d' % idx)
+            elif item.expired:
+                raise ResultExpired(
+                    'result for item %d has expired' % idx)
+            else:
+                accum.append(item.value)
+        return accum
+    __call__ = get
+
+    def values(self, timeout=None, backoff=1.15, max_delay=1.0):
+        """Alias for :py:meth:`get`."""
+        return self.get(timeout, backoff, max_delay)
+
+    def discard(self):
+        """Discard the shared state of every item."""
+        for result in self._results:
+            result.discard()
+
+    def reset(self):
+        for result in self._results:
+            result.reset()
 
 
 dash_re = re.compile(r'(\d+)-(\d+)(?:/(\d+))?')

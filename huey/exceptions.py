@@ -4,6 +4,18 @@ class TaskLockedException(HueyException): pass
 class ResultTimeout(HueyException): pass
 class TaskTimeout(HueyException): pass
 
+class ResultPending(HueyException):
+    """The task has not produced a terminal result yet."""
+    pass
+
+class ResultExpired(HueyException):
+    """The result existed but is no longer within its retention period."""
+    pass
+
+class WaitCancelled(HueyException):
+    """This individual waiter was cancelled."""
+    pass
+
 class RateLimitExceeded(HueyException):
     def __init__(self, key, delay, retry=True):
         self.key, self.delay, self.retry = key, delay, retry

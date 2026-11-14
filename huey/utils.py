@@ -84,6 +84,21 @@ def normalize_expire_time(expires, utc=True):
     return normalize_time(delay=expires, utc=utc)
 
 
+def normalize_retention(retention):
+    """
+    Normalize a result-retention specification into a number of seconds.
+
+    ``None`` means "no deadline" (retain indefinitely). An int/float is
+    interpreted as seconds, while a ``datetime.timedelta`` is converted to
+    seconds.
+    """
+    if retention is None:
+        return None
+    if isinstance(retention, datetime.timedelta):
+        retention = retention.total_seconds()
+    return max(0, float(retention))
+
+
 def normalize_time(eta=None, delay=None, utc=True):
     if (delay is None) == (eta is None):
         raise ValueError('Specify either an eta (datetime) or delay (seconds)')
