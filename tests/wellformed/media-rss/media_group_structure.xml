@@ -1,0 +1,29 @@
+<!--
+Description: media_group structure keeps group defaults and effective metadata
+Expect:      len(entries[0]['media_groups']) == 2 and entries[0]['media_groups'][0]['media_defaults']['title'] == 'Group One' and entries[0]['media_groups'][0]['media_defaults']['summary'] == 'Group one description' and entries[0]['media_groups'][1]['media_defaults']['title'] == 'Group Two' and [c['role'] for c in entries[0]['media_groups'][0]['media_content'][0]['media_effective']['media_credit']] == ['group-one-credit', 'content-a-credit'] and [t['url'] for t in entries[0]['media_groups'][0]['media_content'][0]['media_effective']['media_thumbnail']] == ['http://example.com/g1-thumb.jpg', 'http://example.com/a-thumb.jpg'] and entries[0]['media_groups'][0]['media_content'][0]['media_effective']['title'] == 'Group One' and entries[0]['media_groups'][0]['media_content'][0]['media_effective']['summary'] == 'Group one description' and entries[0]['media_groups'][0]['media_content'][1]['media_effective']['summary'] == '' and entries[0]['media_groups'][0]['media_content'][1]['media_effective']['title'] == 'Group One' and entries[0]['media_groups'][1]['media_content'][0]['media_effective']['summary'] == 'Group two description' and len(entries[0]['media_content']) == 3 and entries[0]['media_content'][0] == {'url': 'http://example.com/g1-a.mp4', 'type': 'video/mp4', 'width': '640'} and entries[0]['media_groups'][0]['media_content'][0] is not entries[0]['media_content'][0] and entries[0]['media_groups'][0]['media_content'][0]['media_effective']['media_credit'] is not entries[0]['media_credit']
+-->
+<rss version="2.0" xmlns:media="http://search.yahoo.com/mrss/">
+<channel>
+<item>
+  <media:group>
+    <media:title>Group One</media:title>
+    <media:description>Group one description</media:description>
+    <media:credit role="group-one-credit">G1 Credit</media:credit>
+    <media:thumbnail url="http://example.com/g1-thumb.jpg" width="100"/>
+    <media:content url="http://example.com/g1-a.mp4" type="video/mp4" width="640">
+      <media:credit role="content-a-credit">A Credit</media:credit>
+      <media:thumbnail url="http://example.com/a-thumb.jpg"/>
+    </media:content>
+    <media:content url="http://example.com/g1-b.mp4" type="video/mp4">
+      <media:description></media:description>
+    </media:content>
+  </media:group>
+  <media:group>
+    <media:title>Group Two</media:title>
+    <media:description>Group two description</media:description>
+    <media:credit role="group-two-credit">G2 Credit</media:credit>
+    <media:content url="http://example.com/g2-c.mp4" type="video/mp4"/>
+  </media:group>
+</item>
+</channel>
+</rss>

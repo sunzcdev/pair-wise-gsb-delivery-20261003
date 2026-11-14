@@ -1,0 +1,19 @@
+<!--
+Description: media content outside a group does not inherit the ended group defaults
+Expect:      len(entries[0]['media_groups']) == 1 and len(entries[0]['media_ungrouped_content']) == 1 and entries[0]['media_ungrouped_content'][0]['url'] == 'http://example.com/outside.mp4' and set(entries[0]['media_ungrouped_content'][0]['media_effective']) == {'title'} and entries[0]['media_ungrouped_content'][0]['media_effective']['title'] == 'Outside title' and 'summary' not in entries[0]['media_ungrouped_content'][0]['media_effective'] and 'media_credit' not in entries[0]['media_ungrouped_content'][0]['media_effective'] and len(entries[0]['media_content']) == 2 and entries[0]['media_content'][-1] == {'url': 'http://example.com/outside.mp4', 'type': 'video/mp4'}
+-->
+<rss version="2.0" xmlns:media="http://search.yahoo.com/mrss/">
+<channel>
+<item>
+  <media:group>
+    <media:title>Group One</media:title>
+    <media:description>Group one description</media:description>
+    <media:credit role="group-one-credit">G1 Credit</media:credit>
+    <media:content url="http://example.com/g1-a.mp4" type="video/mp4"/>
+  </media:group>
+  <media:content url="http://example.com/outside.mp4" type="video/mp4">
+    <media:title>Outside title</media:title>
+  </media:content>
+</item>
+</channel>
+</rss>
