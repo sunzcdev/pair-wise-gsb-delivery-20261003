@@ -97,6 +97,10 @@ class SchemaError(SqlglotError):
     pass
 
 
+class GeneratedColumnError(SqlglotError):
+    """Raised when a generated column expression has an invalid dependency graph."""
+
+
 class ExecuteError(SqlglotError):
     pass
 

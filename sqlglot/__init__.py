@@ -14,10 +14,20 @@ import logging
 import typing as t
 
 from sqlglot import expressions as exp
+from sqlglot.ddl import (
+    GeneratedColumnAnalysis as GeneratedColumnAnalysis,
+    GeneratedColumnDependency as GeneratedColumnDependency,
+    GeneratedColumnIssue as GeneratedColumnIssue,
+    TableSchemaError as TableSchemaError,
+    TableSchemaExtraction as TableSchemaExtraction,
+    analyze_generated_columns as analyze_generated_columns,
+    extract_table_schemas as extract_table_schemas,
+)
 from sqlglot.dialects.dialect import Dialect as Dialect, Dialects as Dialects
 from sqlglot.diff import diff as diff
 from sqlglot.errors import (
     ErrorLevel as ErrorLevel,
+    GeneratedColumnError as GeneratedColumnError,
     ParseError as ParseError,
     TokenError as TokenError,
     UnsupportedError as UnsupportedError,
