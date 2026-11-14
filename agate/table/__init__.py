@@ -302,6 +302,7 @@ class Table:
 from agate.table.aggregate import aggregate
 from agate.table.bar_chart import bar_chart
 from agate.table.bins import bins
+from agate.table.candidate_keys import candidate_keys
 from agate.table.column_chart import column_chart
 from agate.table.compute import compute
 from agate.table.denormalize import denormalize
@@ -335,6 +336,7 @@ from agate.table.where import where
 Table.aggregate = aggregate
 Table.bar_chart = bar_chart
 Table.bins = bins
+Table.candidate_keys = candidate_keys
 Table.column_chart = column_chart
 Table.compute = compute
 Table.denormalize = denormalize

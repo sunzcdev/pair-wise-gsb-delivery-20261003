@@ -72,6 +72,7 @@ Advanced processing
     :nosignatures:
 
     agate.Table.bins
+    agate.Table.candidate_keys
     agate.Table.denormalize
     agate.Table.group_by
     agate.Table.homogenize
