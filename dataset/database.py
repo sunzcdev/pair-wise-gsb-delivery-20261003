@@ -364,18 +364,49 @@ class Database:
             for row in db.query(statement):
                 print(row['user'], row['c'])
 
-        The returned iterator will yield each result sequentially.
+        The returned iterator will yield each result sequentially. It owns
+        the underlying cursor and should be exhausted or closed (it is a
+        context manager) to release resources promptly::
+
+            with db.query('SELECT * FROM photos') as rows:
+                for row in rows:
+                    ...
+
+        Outside of an explicit transaction, the query runs on a dedicated
+        connection owned by the returned iterator, which is returned to
+        the connection pool when the iterator is exhausted or closed.
+        Inside a transaction (``with db:``), the query runs on the
+        transaction's shared connection, which the iterator never closes.
         """
         if isinstance(query, str):
             query = text(query)
         _step = kwargs.pop("_step", QUERY_STEP)
         if _step is False or _step == 0:
             _step = None
-        if kwargs:
-            rp = self.executable.execute(query, kwargs)
+        conn: Connection | None = None
+        if self.in_transaction:
+            # Run on the shared connection of the caller's transaction.
+            # The iterator does not own it and must never close it, since
+            # that would roll back the caller's transaction.
+            executable = self.executable
         else:
-            rp = self.executable.execute(query)
-        return ResultIter(rp, row_type=self.row_type, step=_step)
+            # Use a dedicated connection owned by the returned iterator,
+            # so that it is released back to the pool once the iterator
+            # is exhausted or closed — even if only partially consumed.
+            if self.engine is None:
+                raise RuntimeError("Database is closed")
+            conn = self.engine.connect()
+            executable = conn
+        try:
+            if kwargs:
+                rp = executable.execute(query, kwargs)
+            else:
+                rp = executable.execute(query)
+        except Exception:
+            if conn is not None:
+                conn.close()
+            raise
+        return ResultIter(rp, row_type=self.row_type, step=_step, connection=conn)
 
     def __repr__(self) -> str:
         """Text representation contains the URL."""

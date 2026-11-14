@@ -1,8 +1,10 @@
+import logging
 from collections import OrderedDict
 from collections.abc import Callable, Iterable, Iterator, Mapping
 from datetime import date, datetime
 from decimal import Decimal
 from hashlib import sha1
+from types import TracebackType
 from typing import Any
 from urllib.parse import urlencode, urlparse
 
@@ -11,6 +13,8 @@ from sqlalchemy.engine import Row
 from sqlalchemy.exc import ResourceClosedError
 
 QUERY_STEP = 1000
+
+log = logging.getLogger(__name__)
 
 # Type definitions for SQL values and rows
 SQLPlainValue = (
@@ -103,7 +107,28 @@ def make_sqlite_url(
 
 class ResultIter(Iterator[OutRow]):
     """SQLAlchemy ResultProxies are not iterable to get a
-    list of dictionaries. This is to wrap them."""
+    list of dictionaries. This is to wrap them.
+
+    The iterator owns the result proxy (i.e. the cursor) it wraps and
+    releases it as soon as the iterator is exhausted, closed, or hits an
+    error during row conversion. If a dedicated ``connection`` is passed
+    in, the iterator takes ownership of that connection as well and
+    returns it to the connection pool on :py:meth:`close`. Connections
+    shared with the caller — such as the connection backing an open
+    transaction — must not be passed in and are never closed here, so
+    closing one iterator can neither invalidate other results on the
+    same connection nor end the caller's transaction.
+
+    The iterator can be used as a context manager to guarantee release
+    of the underlying resources::
+
+        with db.query('SELECT * FROM tbl') as rows:
+            for row in rows:
+                ...
+
+    :py:meth:`close` is idempotent: it may be called repeatedly, after
+    normal exhaustion, early exit, or conversion errors.
+    """
 
     def __init__(
         self,
@@ -115,6 +140,7 @@ class ResultIter(Iterator[OutRow]):
         self.row_type = row_type
         self.result_proxy = result_proxy
         self._conn = connection
+        self._closed = False
         if result_proxy is None:
             self.keys: list[str] = []
             self._iter: Iterator[Row[Any]] = iter([])
@@ -128,9 +154,19 @@ class ResultIter(Iterator[OutRow]):
 
     def __next__(self) -> OutRow:
         try:
-            return convert_row(self.row_type, next(self._iter))
+            row = next(self._iter)
         except StopIteration:
-            self.close()
+            self._close_safely()
+            raise
+        except Exception:
+            self._close_safely()
+            raise
+        try:
+            return convert_row(self.row_type, row)
+        except Exception:
+            # Release resources, but never let a cleanup failure mask the
+            # original conversion error.
+            self._close_safely()
             raise
 
     next = __next__
@@ -138,12 +174,42 @@ class ResultIter(Iterator[OutRow]):
     def __iter__(self) -> Iterator[OutRow]:
         return self
 
+    def __enter__(self) -> "ResultIter":
+        return self
+
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc_value: BaseException | None,
+        traceback: TracebackType | None,
+    ) -> None:
+        self.close()
+
+    def _close_safely(self) -> None:
+        """Close without raising, logging cleanup failures instead."""
+        try:
+            self.close()
+        except Exception:
+            log.warning("Failed to close result iterator cleanly", exc_info=True)
+
     def close(self) -> None:
-        if self.result_proxy is not None:
-            self.result_proxy.close()
-        if self._conn is not None:
-            self._conn.close()
-            self._conn = None
+        """Release the cursor and any connection owned by this iterator.
+
+        Only the result proxy and a connection explicitly handed to this
+        iterator are released; shared connections and their transactions
+        are left untouched. This method is idempotent.
+        """
+        if self._closed:
+            return
+        self._closed = True
+        result_proxy, self.result_proxy = self.result_proxy, None
+        conn, self._conn = self._conn, None
+        try:
+            if result_proxy is not None:
+                result_proxy.close()
+        finally:
+            if conn is not None:
+                conn.close()
 
 
 def ensure_strings(value: str | Iterable[str] | None) -> list[str]:

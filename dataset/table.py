@@ -773,8 +773,15 @@ class Table:
             stream_conn = self.db.engine.connect()
             conn = stream_conn.execution_options(stream_results=True)
 
+        try:
+            rp = conn.execute(query)
+        except Exception:
+            # Don't leak the dedicated streaming connection on failure.
+            if stream_conn is not None:
+                stream_conn.close()
+            raise
         return ResultIter(
-            conn.execute(query),
+            rp,
             row_type=self.db.row_type,
             step=_step,
             connection=stream_conn,
