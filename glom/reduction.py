@@ -1,5 +1,7 @@
 import operator
 import itertools
+import sys
+from collections.abc import Iterator
 from pprint import pprint
 
 from boltons.typeutils import make_sentinel
@@ -20,6 +22,65 @@ class FoldError(GlomError):
     """Error raised when Fold() is called on non-iterable
     targets, and possibly other uses in the future."""
     pass
+
+
+class FoldStop:
+    """The ``FoldStop`` type lets an :class:`Fold` *op* function end
+    reduction early, as soon as the final accumulator value is known,
+    instead of reading the remaining records of the target iterable.
+
+    Returning a ``FoldStop`` (or a subclass) from a *op* immediately
+    halts the fold, and the wrapped value is unwrapped and returned as
+    the final accumulator. Termination is decided by type, so an
+    ordinary value which merely looks like a ``FoldStop`` never halts
+    the fold::
+
+       >>> def stop_at_three(acc, val):
+       ...     if val >= 3:
+       ...         return FoldStop(acc + val)
+       ...     return acc + val
+       >>> glom([1, 2, 3, 4, 5], Fold(T, int, op=stop_at_three))
+       6
+
+    The :data:`~glom.STOP` and :data:`~glom.SKIP` sentinels keep their
+    existing meanings and are deliberately distinct from
+    ``FoldStop``; none of them are reused as the early-termination
+    signal.
+    """
+    def __init__(self, value):
+        self.value = value
+
+    def unwrap(self):
+        return self.value
+
+    def __repr__(self):
+        return 'FoldStop(%r)' % (self.value,)
+
+
+# canonical name for the "reduced value" idiom; FoldStop remains the
+# glom-named primary type.
+Reduced = FoldStop
+FoldResult = FoldStop
+
+
+def _release_iterator(iterator, owned):
+    # Owned iterators were created inside the fold and are closed on
+    # the way out (including early termination and errors). Borrowed
+    # iterators belong to the caller and are left positioned exactly
+    # where the fold stopped. A failure while closing must never mask
+    # an exception already raised by the fold itself.
+    if not owned:
+        return
+    close = getattr(iterator, 'close', None)
+    if close is None:
+        return
+    if sys.exc_info()[0] is not None:
+        try:
+            close()
+        except Exception:
+            pass
+    else:
+        close()
 
 
 class Fold:
@@ -53,6 +114,13 @@ class Fold:
     While :class:`~glom.Fold` is powerful, :class:`~glom.Flatten` and
     :class:`~glom.Sum` are subtypes with more convenient defaults for
     day-to-day use.
+
+    When *op* already has its final answer before the target is fully
+    consumed, it can return :class:`FoldStop` wrapping the result. The
+    fold stops immediately, without reading any more records, and the
+    wrapped value is unwrapped as the fold's result. Only a real
+    :class:`FoldStop` triggers this; a plain value which happens to
+    resemble one is treated as an ordinary accumulator.
     """
     def __init__(self, subspec, init, op=operator.iadd):
         self.subspec = subspec
@@ -76,17 +144,30 @@ class Fold:
 
         if is_agg:
             return self._agg(target, scope[ACC_TREE])
+        # Ownership is determined from the *target*, before it is
+        # converted to an iterator: an iterator passed in directly is
+        # borrowed from the caller, whereas an iterable target has a
+        # fresh iterator created for it, which the fold owns.
+        borrowed = isinstance(target, Iterator)
         try:
-            return self._fold(target_iter(target, scope))
+            iterator = target_iter(target, scope)
         except UnregisteredTarget as ut:
             raise FoldError('can only %s on iterable targets, not %s type (%s)'
                             % (self.__class__.__name__, type(target).__name__, ut))
+        owned = not borrowed
+        try:
+            return self._fold(iterator, owned=owned)
+        finally:
+            _release_iterator(iterator, owned)
 
-    def _fold(self, iterator):
+    def _fold(self, iterator, owned=True):
         ret, op = self.init(), self.op
 
         for v in iterator:
-            ret = op(ret, v)
+            result = op(ret, v)
+            if isinstance(result, FoldStop):
+                return result.unwrap()
+            ret = result
 
         return ret
 
@@ -170,10 +251,10 @@ class Flatten(Fold):
             self.lazy = False
         super().__init__(subspec=subspec, init=init, op=operator.iadd)
 
-    def _fold(self, iterator):
+    def _fold(self, iterator, owned=True):
         if self.lazy:
             return itertools.chain.from_iterable(iterator)
-        return super()._fold(iterator)
+        return super()._fold(iterator, owned=owned)
 
     def __repr__(self):
         cn = self.__class__.__name__
@@ -299,13 +380,15 @@ class Merge(Fold):
                              ' method not %r and %r' % (op, init))
         super().__init__(subspec=subspec, init=init, op=op)
 
-    def _fold(self, iterator):
+    def _fold(self, iterator, owned=True):
         # the difference here is that ret is mutated in-place, the
         # variable not being reassigned, as in base Fold.
         ret, op = self.init(), self.op
 
         for v in iterator:
-            op(ret, v)
+            result = op(ret, v)
+            if isinstance(result, FoldStop):
+                return result.unwrap()
 
         return ret
 

@@ -27,6 +27,20 @@ specifier types and two convenience functions:
 
 .. autoclass:: glom.Fold
 
+Ending a fold early with FoldStop
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Sometimes a fold's *op* function reaches its final result before the
+whole iterable has been consumed. Returning a :class:`~glom.FoldStop`
+wrapping that result ends the fold immediately, without reading any
+remaining records, and the wrapped value is returned as the fold's
+result. Because termination is decided by type, an ordinary
+accumulator value that merely looks like a ``FoldStop`` does not stop
+anything. ``FoldStop`` is distinct from :data:`~glom.STOP` and
+:data:`~glom.SKIP`, which keep their usual meanings.
+
+.. autoclass:: glom.FoldStop
+
 Exceptions
 ----------
 

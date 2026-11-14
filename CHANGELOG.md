@@ -12,6 +12,17 @@ The glom team's approach to updates can be summed up as:
 Check this page when upgrading, we strive to keep the updates
 summarized and well-linked.
 
+## Unreleased
+
+- Add `FoldStop`, a dedicated early-termination result type for `Fold`:
+  returning one from a fold's *op* immediately halts reduction and unwraps
+  the wrapped value as the final accumulator, without reading the remaining
+  records. Type-based detection means lookalike values do not terminate, and
+  `STOP`/`SKIP` retain their existing meanings. Fold-owned iterators are
+  closed on exit (cleanup failures never mask the main exception), while
+  iterator targets passed in directly are treated as borrowed and keep their
+  current position.
+
 ## 25.12.0
 
 _(December 28, 2025)_

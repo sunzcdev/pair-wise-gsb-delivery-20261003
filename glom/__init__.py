@@ -27,7 +27,8 @@ from glom.core import (glom,
                        UnregisteredTarget,
                        T, S, A)
 
-from glom.reduction import Sum, Fold, Flatten, flatten, FoldError, Merge, merge
+from glom.reduction import (Sum, Fold, Flatten, flatten, FoldError, FoldStop,
+                            Reduced, FoldResult, Merge, merge)
 from glom.matching import (M,
                            Or,
                            And,
