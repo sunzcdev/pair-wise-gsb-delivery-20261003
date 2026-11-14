@@ -12,6 +12,14 @@ The glom team's approach to updates can be summed up as:
 Check this page when upgrading, we strive to keep the updates
 summarized and well-linked.
 
+## Unreleased
+
+- Add `Group.export_state()` and `Group.restore_state()` for portable,
+  batch-to-batch persistence of built-in Count, Sum and Avg aggregations
+  and nested groupings, including a format version and grouping-spec
+  fingerprint, lossless key/numeric typing, and `GroupStateError` for
+  unsupported aggregations or incompatible state.
+
 ## 25.12.0
 
 _(December 28, 2025)_
