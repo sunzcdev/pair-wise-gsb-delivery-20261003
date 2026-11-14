@@ -383,10 +383,25 @@ class Table:
         self.db._auto_commit()
         return rp.rowcount > 0
 
+    def _reset_cache(self) -> None:
+        """Invalidate all cached reflection state for this table.
+
+        Forces the table definition, the column names and the index
+        information to be re-read from the database on next access. This
+        is required after transaction rollbacks, where the database may
+        have undone schema changes (added columns, created indexes, or
+        even created/dropped the table itself), as well as after the
+        table has been dropped.
+        """
+        self._table = None
+        self._columns = None
+        self._indexes = []
+
     def _reflect_table(self) -> None:
         """Load the tables definition from the database."""
         with self.db.lock:
             self._columns = None
+            self._indexes = []
             try:
                 self._table = SQLATable(
                     self.name,
@@ -649,8 +664,7 @@ class Table:
             if self.exists:
                 self._threading_warn()
                 self.table.drop(self.db.executable, checkfirst=True)
-                self._table = None
-                self._columns = None
+                self._reset_cache()
                 self.db._tables.pop(self.name, None)
                 self.db._auto_commit()
 

@@ -134,9 +134,14 @@ class Database:
                 conn.close()
 
     def _flush_tables(self) -> None:
-        """Clear the table metadata after transaction rollbacks."""
+        """Clear the table metadata after transaction rollbacks.
+
+        Only tables registered on *this* ``Database`` instance are
+        affected; other instances connected to the same database keep
+        their own reflection caches.
+        """
         for table in self._tables.values():
-            table._table = None
+            table._reset_cache()
 
     def _auto_commit(self) -> None:
         """Commit pending changes when not in an explicit transaction.
