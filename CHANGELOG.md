@@ -3,6 +3,14 @@ Changelog
 
 ## Master
 
+* Add optional weighted task-group scheduling to `MemoryHuey` and
+  `SqliteHuey`. Tasks can be assigned to a group (e.g. per-source), and
+  groups share the queue in proportion to their configured weights using
+  smooth weighted round-robin. Within a group, tasks are still ordered by
+  priority and FIFO. Enable by passing `group_weights={...}` to the huey
+  instance and assign groups via `@huey.task(group=...)` or
+  `task(..., group=...)`.
+
 [View commits](https://github.com/coleifer/huey/compare/3.5.4...master)
 
 ## 3.5.4

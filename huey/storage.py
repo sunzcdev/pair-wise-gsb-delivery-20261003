@@ -37,6 +37,63 @@ from huey.exceptions import ConfigurationError
 from huey.utils import FileLock
 
 
+# Group name used for tasks that are not assigned to an explicit group when
+# weighted group scheduling is enabled.
+DEFAULT_GROUP = ''
+
+
+def normalize_group(group):
+    if group is None:
+        return DEFAULT_GROUP
+    if not isinstance(group, str) or not group:
+        raise ValueError('task group must be a non-empty string.')
+    return group
+
+
+def validate_group_weights(group_weights, default_group_weight=1):
+    if default_group_weight <= 0:
+        raise ValueError('default group weight must be a positive number.')
+    weights = {}
+    for group, weight in group_weights.items():
+        group = normalize_group(group)
+        if weight <= 0:
+            raise ValueError('group weights must be positive numbers.')
+        weights[group] = float(weight)
+    weights.setdefault(DEFAULT_GROUP, float(default_group_weight))
+    return weights
+
+
+def select_group(active, weights, cw):
+    """
+    Choose a group using the smooth weighted round-robin algorithm.
+
+    :param active: iterable of group names that currently have tasks.
+    :param weights: mapping of group name to configured weight.
+    :param cw: mutable mapping of group name to current (smooth) weight. This
+        is updated in-place and represents the scheduler state.
+    :return: the selected group name.
+
+    Groups without tasks do not accrue any credit, and state for groups that
+    are no longer active is discarded, so a group that becomes active again
+    starts fresh rather than accumulating unlimited historical quota.
+    """
+    total = 0.0
+    for group in sorted(active):
+        weight = weights.get(group, 1.0)
+        cw[group] = cw.get(group, 0.0) + weight
+        total += weight
+
+    # Deterministic: highest current weight, ties broken by group name.
+    selected = min(active, key=lambda group: (-cw[group], group))
+    cw[selected] -= total
+
+    # Discard state for groups that are no longer active.
+    for group in list(cw):
+        if group not in active:
+            del cw[group]
+    return selected
+
+
 class BaseStorage(object):
     """
     Base storage-layer interface. Subclasses should implement all methods.
@@ -55,17 +112,23 @@ class BaseStorage(object):
         """
         pass
 
-    def enqueue(self, data, priority=None):
+    def enqueue(self, data, priority=None, group=None):
         """
         Given an opaque chunk of data, add it to the queue.
 
         :param bytes data: Task data.
         :param float priority: Priority, higher priorities processed first.
                                Defaults to 0.
+        :param str group: Optional task group name. When the storage is
+                          configured with per-group weights, groups are
+                          scheduled using weighted round-robin. Within a
+                          group, tasks are ordered by priority and FIFO.
         :return: No return value.
 
         Some storage may not implement support for priority. In that case, the
         storage may raise a NotImplementedError for non-None priority values.
+        Likewise, storage that does not implement task groups may raise a
+        NotImplementedError for non-None group values.
         """
         raise NotImplementedError
 
@@ -309,7 +372,7 @@ class BaseStorage(object):
 
 
 class BlackHoleStorage(BaseStorage):
-    def enqueue(self, data, priority=None): pass
+    def enqueue(self, data, priority=None, group=None): pass
     def dequeue(self): pass
     def queue_size(self): return 0
     def enqueued_items(self, limit=None): return []
@@ -334,6 +397,8 @@ class BlackHoleStorage(BaseStorage):
 
 class MemoryStorage(BaseStorage):
     def __init__(self, *args, **kwargs):
+        group_weights = kwargs.pop('group_weights', None)
+        self._default_group_weight = kwargs.pop('default_group_weight', 1)
         super(MemoryStorage, self).__init__(*args, **kwargs)
         self._c = 0  # Counter to ensure FIFO behavior for queue.
         self._queue = []
@@ -342,14 +407,36 @@ class MemoryStorage(BaseStorage):
         self._counters = {}
         self._lock = threading.RLock()
 
-    def enqueue(self, data, priority=None):
+        # Optional weighted group scheduling. When group_weights is not
+        # specified, the storage behaves as a simple priority queue.
+        self._group_weights = None
+        if group_weights is not None:
+            self._group_weights = validate_group_weights(
+                group_weights, self._default_group_weight)
+        self._groups = {}  # group -> heap of (priority, counter, data).
+        self._group_cw = {}  # group -> smooth weighted round-robin state.
+
+    def enqueue(self, data, priority=None, group=None):
         with self._lock:
             self._c += 1
             priority = 0 if priority is None else -priority
-            heapq.heappush(self._queue, (priority, self._c, data))
+            if self._group_weights is None:
+                if group is not None:
+                    raise ConfigurationError(
+                        'Task groups require the storage to be configured '
+                        'with group_weights.')
+                heapq.heappush(self._queue, (priority, self._c, data))
+            else:
+                group = normalize_group(group)
+                if group not in self._groups:
+                    self._groups[group] = []
+                heapq.heappush(self._groups[group],
+                               (priority, self._c, data))
 
     def dequeue(self):
         with self._lock:
+            if self._group_weights is not None:
+                return self._dequeue_group()
             try:
                 _, _, data = heapq.heappop(self._queue)
             except IndexError:
@@ -357,17 +444,58 @@ class MemoryStorage(BaseStorage):
             else:
                 return data
 
+    def _dequeue_group(self):
+        # Select a group and remove the task in a single atomic step (the
+        # lock is held by the caller), so competing consumers cannot claim
+        # the same task.
+        active = set(group for group, heap in self._groups.items() if heap)
+        if not active:
+            return None
+
+        group = select_group(active, self._group_weights, self._group_cw)
+        _, _, data = heapq.heappop(self._groups[group])
+        if not self._groups[group]:
+            # Group is now empty: discard its scheduler state so that it
+            # does not accumulate quota while inactive.
+            del self._groups[group]
+            self._group_cw.pop(group, None)
+        return data
+
     def queue_size(self):
+        if self._group_weights is not None:
+            return sum(len(heap) for heap in self._groups.values())
         return len(self._queue)
 
     def enqueued_items(self, limit=None):
-        items = [data for _, _, data in sorted(self._queue)]
-        if limit:
-            items = items[:limit]
-        return items
+        if self._group_weights is None:
+            items = [data for _, _, data in sorted(self._queue)]
+            if limit:
+                items = items[:limit]
+            return items
+
+        with self._lock:
+            # Simulate the scheduler on copies of the per-group heaps to
+            # produce the exact order in which tasks would be dequeued.
+            groups = dict((group, sorted(heap))
+                          for group, heap in self._groups.items() if heap)
+            cw = dict((group, weight)
+                      for group, weight in self._group_cw.items()
+                      if group in groups)
+            items = []
+            while groups:
+                group = select_group(set(groups), self._group_weights, cw)
+                items.append(groups[group].pop(0)[2])
+                if not groups[group]:
+                    del groups[group]
+                    cw.pop(group, None)
+                if limit and len(items) >= limit:
+                    break
+            return items
 
     def flush_queue(self):
         self._queue = []
+        self._groups = {}
+        self._group_cw = {}
 
     def add_to_schedule(self, data, ts):
         with self._lock:
@@ -522,9 +650,12 @@ class RedisStorage(BaseStorage):
     def convert_ts(self, ts):
         return time.mktime(ts.timetuple()) + (ts.microsecond * 1e-6)
 
-    def enqueue(self, data, priority=None):
+    def enqueue(self, data, priority=None, group=None):
         if priority:
             raise NotImplementedError('Task priorities are not supported by '
+                                      'this storage.')
+        if group is not None:
+            raise NotImplementedError('Task groups are not supported by '
                                       'this storage.')
         self.conn.lpush(self.queue_key, data)
 
@@ -746,7 +877,10 @@ class RedisExpireStorage(RedisStorage):
 class RedisPriorityQueue(object):
     priority = True
 
-    def enqueue(self, data, priority=None):
+    def enqueue(self, data, priority=None, group=None):
+        if group is not None:
+            raise NotImplementedError('Task groups are not supported by '
+                                      'this storage.')
         priority = 0 if priority is None else -priority
         # Prefix the message with an encoded timestamp to ensure that messages
         # created with the same priority are stored in the correct order. Since
@@ -862,10 +996,18 @@ class SqliteStorage(BaseSqlStorage):
                    'on schedule (queue, timestamp)')
     table_task = ('create table if not exists task ('
                   'id integer not null primary key, queue text not null, '
-                  'data blob not null, priority real not null default 0.0)')
+                  'data blob not null, priority real not null default 0.0, '
+                  'grp text)')
     index_task = ('create index if not exists task_queue_priority_id on task '
                   '(queue, priority desc, id)')
     drop_index_task = 'drop index if exists task_priority_id'  # Old index.
+    table_group_state = ('create table if not exists task_group_state ('
+                         'queue text not null, grp text not null, '
+                         'cw real not null default 0.0, '
+                         'primary key(queue, grp))')
+    index_task_group = ('create index if not exists '
+                        'task_queue_grp_priority_id on task '
+                        '(queue, grp, priority desc, id)')
     table_counter = ('create table if not exists counter ('
                      'queue text not null, key text not null, '
                      'value integer not null default 0, '
@@ -875,13 +1017,22 @@ class SqliteStorage(BaseSqlStorage):
 
     def __init__(self, name='huey', filename='huey.db', cache_mb=8,
                  fsync=None, journal_mode='wal', timeout=5, strict_fifo=False,
-                 create_tables=True, **kwargs):
+                 create_tables=True, group_weights=None,
+                 default_group_weight=1, **kwargs):
         self.filename = filename
         self._cache_mb = cache_mb
         self._fsync = fsync
         self._journal_mode = journal_mode
         self._timeout = timeout  # Busy timeout in seconds, default is 5.
         self._conn_kwargs = kwargs
+
+        # Optional weighted group scheduling. When group_weights is not
+        # specified, the storage behaves as a simple priority queue.
+        self._default_group_weight = default_group_weight
+        self._group_weights = None
+        if group_weights is not None:
+            self._group_weights = validate_group_weights(
+                group_weights, default_group_weight)
 
         # By default Sqlite may reuse rowids when rows are removed. This means
         # that SqliteHuey may not strictly be a FIFO. If strict FIFO ordering
@@ -899,6 +1050,27 @@ class SqliteStorage(BaseSqlStorage):
         self.to_blob = memoryview
 
         super(SqliteStorage, self).__init__(name, create_tables=create_tables)
+
+    def initialize_schema(self):
+        super(SqliteStorage, self).initialize_schema()
+        if self._group_weights is not None:
+            self.initialize_group_schema()
+
+    def initialize_group_schema(self):
+        # Set up the objects needed for weighted group scheduling. The grp
+        # column is part of the task table DDL, but databases created by
+        # older versions need to be migrated.
+        with self.db(commit=True, close=True) as curs:
+            curs.execute(self.table_group_state)
+            columns = [row[1] for row in curs.execute('pragma table_info'
+                                                      '(task)')]
+            if 'grp' not in columns:
+                curs.execute('alter table task add column grp text')
+            curs.execute(self.index_task_group)
+            # Ungrouped tasks enqueued before group scheduling was enabled
+            # are treated as belonging to the default group.
+            curs.execute('update task set grp = ? where grp is null',
+                         (DEFAULT_GROUP,))
 
     def _create_connection(self):
         conn = sqlite3.connect(self.filename, timeout=self._timeout,
@@ -929,11 +1101,26 @@ class SqliteStorage(BaseSqlStorage):
                     raise
                 time.sleep(0.01)
 
-    def enqueue(self, data, priority=None):
-        self.sql('insert into task (queue, data, priority) values (?, ?, ?)',
-                 (self.name, self.to_blob(data), priority or 0), commit=True)
+    def enqueue(self, data, priority=None, group=None):
+        if self._group_weights is None:
+            if group is not None:
+                raise ConfigurationError(
+                    'Task groups require the storage to be configured with '
+                    'group_weights.')
+            self.sql('insert into task (queue, data, priority) '
+                     'values (?, ?, ?)',
+                     (self.name, self.to_blob(data), priority or 0),
+                     commit=True)
+        else:
+            self.sql('insert into task (queue, data, priority, grp) '
+                     'values (?, ?, ?, ?)',
+                     (self.name, self.to_blob(data), priority or 0,
+                      normalize_group(group)), commit=True)
 
     def dequeue(self):
+        if self._group_weights is not None:
+            return self._dequeue_group()
+
         # Quick check without the full exclusive lock.
         if not self.sql('select 1 from task where queue = ? limit 1',
                         (self.name,), results=True):
@@ -949,11 +1136,62 @@ class SqliteStorage(BaseSqlStorage):
                 if curs.rowcount == 1:
                     return data
 
+    def _dequeue_group(self):
+        # Quick check without the full exclusive lock.
+        if not self.sql('select 1 from task where queue = ? limit 1',
+                        (self.name,), results=True):
+            return
+
+        # The group selection, scheduler-state update and task removal are
+        # performed in a single exclusive transaction, so multiple consumers
+        # cannot claim the same task.
+        with self.db(commit=True) as curs:
+            curs.execute('select grp from task where queue = ? group by grp',
+                         (self.name,))
+            active = set(grp for grp, in curs.fetchall())
+            if not active:
+                return
+
+            curs.execute('select grp, cw from task_group_state '
+                         'where queue = ?', (self.name,))
+            cw = dict(curs.fetchall())
+
+            group = select_group(active, self._group_weights, cw)
+
+            curs.execute('select id, data from task '
+                         'where queue = ? and grp = ? '
+                         'order by priority desc, id limit 1',
+                         (self.name, group))
+            result = curs.fetchone()
+            if result is None:
+                return
+            tid, data = result
+            curs.execute('delete from task where id = ?', (tid,))
+            if curs.rowcount != 1:
+                return
+
+            # Persist the scheduler state, keeping only groups that still
+            # have tasks. A group that becomes active again starts fresh
+            # rather than accumulating unlimited historical quota.
+            curs.execute('select grp from task where queue = ? '
+                         'group by grp', (self.name,))
+            remaining = set(grp for grp, in curs.fetchall())
+            curs.execute('delete from task_group_state where queue = ?',
+                         (self.name,))
+            curs.executemany(
+                'insert into task_group_state (queue, grp, cw) '
+                'values (?, ?, ?)',
+                [(self.name, grp, cw[grp]) for grp in sorted(remaining)])
+            return data
+
     def queue_size(self):
         return self.sql('select count(id) from task where queue=?',
                         (self.name,), results=True)[0][0]
 
     def enqueued_items(self, limit=None):
+        if self._group_weights is not None:
+            return self._enqueued_items_group(limit)
+
         sql = 'select data from task where queue=? order by priority desc, id'
         params = (self.name,)
         if limit is not None:
@@ -962,8 +1200,37 @@ class SqliteStorage(BaseSqlStorage):
 
         return [i for i, in self.sql(sql, params, results=True)]
 
+    def _enqueued_items_group(self, limit=None):
+        # Simulate the scheduler on a snapshot of the queue to produce the
+        # exact order in which tasks would be dequeued.
+        rows = self.sql('select grp, data from task where queue = ? '
+                        'order by grp, priority desc, id', (self.name,),
+                        results=True)
+        groups = {}
+        for grp, data in rows:
+            groups.setdefault(grp, []).append(data)
+
+        cw = dict(self.sql('select grp, cw from task_group_state '
+                           'where queue = ?', (self.name,), results=True))
+        cw = dict((grp, weight) for grp, weight in cw.items()
+                  if grp in groups)
+
+        items = []
+        while groups:
+            group = select_group(set(groups), self._group_weights, cw)
+            items.append(groups[group].pop(0))
+            if not groups[group]:
+                del groups[group]
+                cw.pop(group, None)
+            if limit and len(items) >= limit:
+                break
+        return items
+
     def flush_queue(self):
         self.sql('delete from task where queue=?', (self.name,), commit=True)
+        if self._group_weights is not None:
+            self.sql('delete from task_group_state where queue=?',
+                     (self.name,), commit=True)
 
     def add_to_schedule(self, data, ts):
         params = (self.name, self.to_blob(data), ts.timestamp())
@@ -1212,7 +1479,10 @@ class PostgresStorage(BaseSqlStorage):
             local.conn = conn
         return conn
 
-    def enqueue(self, data, priority=None):
+    def enqueue(self, data, priority=None, group=None):
+        if group is not None:
+            raise NotImplementedError('Task groups are not supported by '
+                                      'this storage.')
         with self.db(commit=True) as curs:
             curs.execute('insert into {} (queue, data, priority) '
                          'values (%s, %s, %s)'.format(self.table_task),
@@ -1414,7 +1684,10 @@ class FileStorage(BaseStorage):
             shutil.rmtree(path)
             os.makedirs(path)
 
-    def enqueue(self, data, priority=None):
+    def enqueue(self, data, priority=None, group=None):
+        if group is not None:
+            raise NotImplementedError('Task groups are not supported by '
+                                      'this storage.')
         priority = int(priority or 0)
         if priority < 0: raise ValueError('priority must be a positive number')
         if priority > self.MAX_PRIORITY:

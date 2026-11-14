@@ -129,7 +129,10 @@ class SqlStorage(BaseStorage):
             self.database.close()
             self.database.connect()
 
-    def enqueue(self, data, priority=None):
+    def enqueue(self, data, priority=None, group=None):
+        if group is not None:
+            raise NotImplementedError('Task groups are not supported by '
+                                      'this storage.')
         self.check_conn()
         self.Task.create(queue=self.name, data=data, priority=priority or 0)
 

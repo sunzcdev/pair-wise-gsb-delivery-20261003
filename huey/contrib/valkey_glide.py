@@ -54,9 +54,12 @@ class ValkeyGlideStorage(RedisStorage):
                                      'properly with blocking operations.')
         self.read_timeout = read_timeout
 
-    def enqueue(self, data, priority=None):
+    def enqueue(self, data, priority=None, group=None):
         if priority:
             raise NotImplementedError('Task priorities are not supported by '
+                                      'this storage.')
+        if group is not None:
+            raise NotImplementedError('Task groups are not supported by '
                                       'this storage.')
         self.conn.lpush(self.queue_key, [data])
 

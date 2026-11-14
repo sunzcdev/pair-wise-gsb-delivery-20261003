@@ -607,6 +607,67 @@ For more information:
 * :py:class:`PriorityRedisHuey`
 * :py:meth:`~Huey.task` and :py:meth:`~Huey.periodic_task`
 
+.. _task-groups:
+
+Task groups
+-----------
+
+.. note::
+    Task groups are supported by :py:class:`MemoryHuey` and
+    :py:class:`SqliteHuey` (including :py:class:`CySqliteHuey`).
+
+When one source continuously enqueues high-priority tasks, tasks from other
+sources may not get a chance to run for a long time. Task groups address
+this by partitioning the queue into per-source groups that are scheduled
+using weighted round-robin. Within a group, tasks are still ordered by
+priority (and FIFO for equal priorities).
+
+Group scheduling is opt-in, and is enabled by passing a mapping of group
+names to weights to the storage layer:
+
+.. code-block:: python
+
+    from huey import SqliteHuey
+
+    # "webhook" tasks get, on average, 3 out of every 4 turns; "import"
+    # tasks get 1 out of 4.
+    huey = SqliteHuey('my-app', group_weights={'webhook': 3, 'import': 1})
+
+Tasks are assigned to a group when they are declared or called:
+
+.. code-block:: python
+
+    @huey.task(group='webhook')
+    def deliver_webhook(payload):
+        ...
+
+    @huey.task()
+    def run_import(name):
+        ...
+
+    deliver_webhook(payload)                # Uses default group "webhook".
+    run_import('users', group='import')     # Per-call group override.
+    run_import.schedule(('users',), delay=60, group='import')
+
+Tasks that are not assigned to a group are placed in a default group whose
+weight is ``1`` (configurable with the ``default_group_weight=`` storage
+keyword argument).
+
+Some properties of the scheduler:
+
+* Groups share the queue in proportion to their weights, using a smooth
+  weighted round-robin algorithm, so even over short windows each active
+  group receives close to its share of turns.
+* Groups without any pending tasks do not consume turns, and a group that
+  becomes active again starts fresh -- it does not accumulate quota for the
+  time it was empty.
+* Retried tasks remain in their original group, and delayed (scheduled)
+  tasks only participate in group scheduling once their eta arrives.
+* Group selection and task removal happen as a single atomic storage
+  operation, so multiple consumers cannot claim the same task.
+* When ``group_weights`` is not specified, the storage behaves exactly like
+  a regular priority queue.
+
 Canceling or pausing tasks
 --------------------------
 

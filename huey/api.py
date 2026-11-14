@@ -169,7 +169,8 @@ class Huey(object):
         return Consumer(self, **options)
 
     def task(self, retries=0, retry_delay=0, retry_backoff=0, priority=None,
-             context=False, name=None, expires=None, timeout=None, **kwargs):
+             group=None, context=False, name=None, expires=None, timeout=None,
+             **kwargs):
         TaskWrapper = self.task_wrapper_class
         def decorator(func):
             return TaskWrapper(
@@ -181,14 +182,16 @@ class Huey(object):
                 default_retry_delay=retry_delay,
                 default_retry_backoff=retry_backoff,
                 default_priority=priority,
+                default_group=group,
                 default_expires=expires,
                 default_timeout=timeout,
                 **kwargs)
         return decorator
 
     def periodic_task(self, validate_datetime, retries=0, retry_delay=0,
-                      retry_backoff=0, priority=None, context=False, name=None,
-                      expires=None, timeout=None, **kwargs):
+                      retry_backoff=0, priority=None, group=None,
+                      context=False, name=None, expires=None, timeout=None,
+                      **kwargs):
         TaskWrapper = self.task_wrapper_class
         def decorator(func):
             def method_validate(self, timestamp):
@@ -203,6 +206,7 @@ class Huey(object):
                 default_retry_delay=retry_delay,
                 default_retry_backoff=retry_backoff,
                 default_priority=priority,
+                default_group=group,
                 default_expires=expires,
                 default_timeout=timeout,
                 validate_datetime=method_validate,
@@ -315,6 +319,9 @@ class Huey(object):
 
         if self._immediate:
             self.execute(task)
+        elif task.group is not None:
+            self.storage.enqueue(self.serialize_task(task), task.priority,
+                                 group=task.group)
         else:
             self.storage.enqueue(self.serialize_task(task), task.priority)
 
@@ -794,6 +801,7 @@ class Huey(object):
 
 class Task(object):
     default_expires = None
+    default_group = None
     default_priority = None
     default_retries = 0
     default_retry_delay = 0
@@ -803,7 +811,8 @@ class Task(object):
     def __init__(self, args=None, kwargs=None, id=None, eta=None, retries=None,
                  retry_delay=None, priority=None, expires=None,
                  on_complete=None, on_error=None, expires_resolved=None,
-                 timeout=None, chord_config=None, retry_backoff=None):
+                 timeout=None, chord_config=None, retry_backoff=None,
+                 group=None):
         self.name = type(self).__name__
         self.args = () if args is None else args
         self.kwargs = {} if kwargs is None else kwargs
@@ -817,6 +826,7 @@ class Task(object):
                 self.default_retry_backoff
         self.priority = priority if priority is not None else \
                 self.default_priority
+        self.group = group if group is not None else self.default_group
         self.expires = expires if expires is not None else self.default_expires
         self.expires_resolved = expires_resolved
         self.timeout = timeout if timeout is not None else self.default_timeout
@@ -841,6 +851,8 @@ class Task(object):
                 rep += ' exp=%s' % self.expires
         if self.priority:
             rep += ' p=%s' % self.priority
+        if self.group:
+            rep += ' g=%s' % self.group
         if self.retries:
             rep += ' %s retries' % self.retries
         if self.timeout:
@@ -998,7 +1010,8 @@ class TaskWrapper(object):
 
     def schedule(self, args=None, kwargs=None, eta=None, delay=None,
                  priority=None, retries=None, retry_delay=None,
-                 retry_backoff=None, expires=None, timeout=None, id=None):
+                 retry_backoff=None, expires=None, timeout=None, id=None,
+                 group=None):
         if eta is None and delay is None:
             if isinstance(args, (int, float)):
                 delay = args
@@ -1024,7 +1037,8 @@ class TaskWrapper(object):
             retry_backoff=retry_backoff,
             priority=priority,
             expires=expires,
-            timeout=timeout)
+            timeout=timeout,
+            group=group)
         return self.huey.enqueue(task)
 
     def _apply(self, it):
@@ -1057,7 +1071,8 @@ class TaskWrapper(object):
                                retry_backoff=kwargs.pop('retry_backoff', None),
                                priority=kwargs.pop('priority', None),
                                expires=kwargs.pop('expires', None),
-                               timeout=kwargs.pop('timeout', None))
+                               timeout=kwargs.pop('timeout', None),
+                               group=kwargs.pop('group', None))
 
 
 class TaskLock(object):
@@ -1297,6 +1312,7 @@ class Result(object):
             expires=expires if expires is not None else self.task.expires,
             timeout=self.task.timeout,
             chord_config=self.task.chord_config,
+            group=self.task.group,
             on_complete=on_complete,
             on_error=on_error)
         return self.huey.enqueue(task)
