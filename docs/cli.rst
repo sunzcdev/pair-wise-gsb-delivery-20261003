@@ -2396,7 +2396,7 @@ The ``sqlite-utils extract`` command can be used to extract specified columns in
 
 Take a look at the Python API documentation for :ref:`python_api_extract` for a detailed description of how this works, including examples of table schemas before and after running an extraction operation.
 
-Rows where every extracted column is ``null`` are not extracted - those rows get a ``null`` value in their new foreign key column and no record is created for them in the lookup table.
+By default, rows where every extracted column is ``null`` are not extracted - those rows get a ``null`` value in their new foreign key column and no record is created for them in the lookup table. Pass ``--null-strategy lookup_row`` to instead create an all-``null`` record in the lookup table and point those rows at it. An empty string is always treated as a real value rather than ``null``.
 
 The command takes a database, table and one or more columns that should be extracted. To extract the ``species`` column from the ``trees`` table you would run:
 
@@ -2431,6 +2431,9 @@ The command takes the following options:
 
 ``--rename <TEXT TEXT>``
     Use this option to rename the columns created in the new lookup table.
+
+``--null-strategy [leave_null|lookup_row]``
+    How to handle rows where every extracted column is ``null``. ``leave_null`` (the default) keeps their foreign key unset, while ``lookup_row`` stores an all-``null`` row in the lookup table and references it.
 
 ``--silent``
     Don't display the progress bar.

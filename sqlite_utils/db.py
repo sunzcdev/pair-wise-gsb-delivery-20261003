@@ -18,6 +18,7 @@ from dataclasses import dataclass, field
 from types import TracebackType
 from typing import (
     Any,
+    Literal,
     TypeVar,
     Union,
     cast,
@@ -3259,6 +3260,7 @@ class Table(Queryable):
         table: str | None = None,
         fk_column: str | None = None,
         rename: dict[str, str] | None = None,
+        null_strategy: Literal["leave_null", "lookup_row"] = "leave_null",
     ) -> "Table":
         """
         Extract specified columns into a separate table.
@@ -3269,6 +3271,13 @@ class Table(Queryable):
         :param table: Name of table in which the new records should be created
         :param fk_column: Name of the foreign key column to populate in the original table
         :param rename: Dictionary of columns that should be renamed when populating the new table
+        :param null_strategy: How to handle rows where every extracted column is
+          ``NULL``. The default, ``leave_null``, keeps them out of the lookup
+          table and leaves their foreign key unset. ``lookup_row`` creates a
+          real all-null row in the lookup table and points those rows at it.
+          Empty strings are always treated as ordinary values, and rows where
+          only some of the extracted columns are null are deduplicated using
+          the original values of every column.
         """
         rename = rename or {}
         if isinstance(columns, str):
@@ -3278,6 +3287,10 @@ class Table(Queryable):
         if not set(columns).issubset(self.columns_dict.keys()):
             raise InvalidColumns(
                 f"Invalid columns {columns} for table with columns {list(self.columns_dict.keys())}"
+            )
+        if null_strategy not in ("leave_null", "lookup_row"):
+            raise ValueError(
+                "null_strategy must be either 'leave_null' or 'lookup_row'"
             )
         with self.db.atomic():
             table = table or "_".join(columns)
@@ -3317,9 +3330,22 @@ class Table(Queryable):
                     strict=self.strict,
                 )
             lookup_columns = [(rename.get(col) or col) for col in columns]
+            # SQLite identifiers are case-insensitive: the new foreign key
+            # column must not shadow an existing column that will survive the
+            # rewrite (extracted columns are dropped, so they are allowed)
+            surviving_columns_folded = {
+                fold_identifier_case(name)
+                for name in self.columns_dict
+                if name not in columns
+            }
+            if fold_identifier_case(fk_column) in surviving_columns_folded:
+                raise InvalidColumns(
+                    f"Column {fk_column} already exists on table {self.name}"
+                )
             lookup_table.create_index(lookup_columns, unique=True, if_not_exists=True)
-            # Rows where every extracted column is null are left alone - they
-            # get a null foreign key and no lookup table record, see #186
+            # Rows where every extracted column is null are either left alone
+            # (null foreign key, no lookup table record, see #186) or pointed
+            # at a real all-null lookup row, depending on null_strategy
             all_columns_are_null = " AND ".join(
                 f"{quote_identifier(c)} IS NULL" for c in columns
             )
@@ -3331,16 +3357,20 @@ class Table(Queryable):
                 f"{quote_identifier(table)}.{quote_identifier(rename.get(column) or column)} IS {quote_identifier(self.name)}.{quote_identifier(column)}"
                 for column in columns
             )
+            if null_strategy == "leave_null":
+                all_null_filter = f"NOT ({all_columns_are_null}) AND "
+            else:
+                all_null_filter = ""
             self.db.execute(
                 "INSERT OR IGNORE INTO {} ({lookup_columns}) SELECT DISTINCT {table_cols} FROM {} "
-                "WHERE NOT ({all_null}) AND NOT EXISTS (SELECT 1 FROM {lookup} WHERE {already_in_lookup})".format(
+                "WHERE {all_null_filter}NOT EXISTS (SELECT 1 FROM {lookup} WHERE {already_in_lookup})".format(
                     quote_identifier(table),
                     quote_identifier(self.name),
                     lookup_columns=", ".join(
                         quote_identifier(c) for c in lookup_columns
                     ),
                     table_cols=", ".join(quote_identifier(c) for c in columns),
-                    all_null=all_columns_are_null,
+                    all_null_filter=all_null_filter,
                     lookup=quote_identifier(table),
                     already_in_lookup=already_in_lookup,
                 )
@@ -3351,7 +3381,7 @@ class Table(Queryable):
 
             # And populate it
             self.db.execute(
-                "UPDATE {} SET {} = (SELECT id FROM {} WHERE {where}) WHERE NOT ({all_null})".format(
+                "UPDATE {} SET {} = (SELECT id FROM {} WHERE {where}){all_null_where}".format(
                     quote_identifier(self.name),
                     quote_identifier(magic_lookup_column),
                     quote_identifier(table),
@@ -3362,7 +3392,11 @@ class Table(Queryable):
                         f"{quote_identifier(rename.get(column) or column)}"
                         for column in columns
                     ),
-                    all_null=all_columns_are_null,
+                    all_null_where=(
+                        f" WHERE NOT ({all_columns_are_null})"
+                        if null_strategy == "leave_null"
+                        else ""
+                    ),
                 )
             )
             # Figure out the right column order

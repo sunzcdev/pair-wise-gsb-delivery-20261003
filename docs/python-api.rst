@@ -2223,7 +2223,20 @@ This produces a lookup table like so:
         "latin" TEXT
     )
 
-Rows where every extracted column is ``null`` are not extracted: no record is created for them in the lookup table and their foreign key column is left as ``null``. When extracting multiple columns, rows where at least one of the extracted columns has a value will be extracted as usual.
+Rows where every extracted column is ``null`` are not extracted by default: no record is created for them in the lookup table and their foreign key column is left as ``null``. When extracting multiple columns, rows where at least one of the extracted columns has a value will be extracted as usual, with the ``null`` columns keeping their original values when the combinations are de-duplicated.
+
+An empty string is treated as an ordinary value, not as ``null``: it always produces a lookup table record, even when ``null`` rows are left alone.
+
+Use the ``null_strategy=`` argument to change how rows where every extracted column is ``null`` are handled:
+
+- ``null_strategy="leave_null"`` (the default) keeps those rows out of the lookup table and leaves their foreign key unset.
+- ``null_strategy="lookup_row"`` creates a real all-``null`` row in the lookup table and points those rows at it.
+
+.. code-block:: python
+
+    db.table("Trees").extract("Species", null_strategy="lookup_row")
+
+When the lookup table already exists, existing combinations - including combinations that contain ``null`` - are re-used rather than inserted again, so extracting overlapping batches keeps the lookup table stable.
 
 .. note::
     In the CLI: :ref:`sqlite-utils extract <cli_extract>`

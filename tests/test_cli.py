@@ -2981,3 +2981,54 @@ def test_extract_view_clean_error(db_path):
     assert result.exit_code == 1
     assert result.exception is None or isinstance(result.exception, SystemExit)
     assert result.output.startswith("Error:")
+
+
+@pytest.mark.parametrize(
+    "null_strategy,expected_species_rows",
+    [
+        ("leave_null", [{"id": 1, "species": "Palm"}]),
+        (
+            "lookup_row",
+            [{"id": 1, "species": "Palm"}, {"id": 2, "species": None}],
+        ),
+    ],
+)
+def test_extract_null_strategy(db_path, null_strategy, expected_species_rows):
+    db = Database(db_path)
+    db.table("trees").insert_all(
+        [
+            {"id": 1, "species": "Palm"},
+            {"id": 2, "species": None},
+        ],
+        pk="id",
+    )
+    result = CliRunner().invoke(
+        cli.cli,
+        [
+            "extract",
+            db_path,
+            "trees",
+            "species",
+            "--null-strategy",
+            null_strategy,
+        ],
+    )
+    assert result.exit_code == 0
+    assert list(db.table("species").rows) == expected_species_rows
+
+
+def test_extract_bad_null_strategy(db_path):
+    db = Database(db_path)
+    db.table("trees").insert({"id": 1, "species": "Palm"}, pk="id")
+    result = CliRunner().invoke(
+        cli.cli,
+        [
+            "extract",
+            db_path,
+            "trees",
+            "species",
+            "--null-strategy",
+            "bogus",
+        ],
+    )
+    assert result.exit_code != 0

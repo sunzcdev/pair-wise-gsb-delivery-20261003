@@ -537,6 +537,11 @@ See :ref:`cli_extract`.
       --table TEXT             Name of the other table to extract columns to
       --fk-column TEXT         Name of the foreign key column to add to the table
       --rename <TEXT TEXT>...  Rename this column in extracted table
+      --null-strategy [leave_null|lookup_row]
+                               How to handle rows where every extracted column is
+                               NULL: leave_null keeps a null foreign key (default),
+                               lookup_row stores an all-null row in the other table
+                               and references it
       --load-extension TEXT    Path to SQLite extension, with optional :entrypoint
       -h, --help               Show this message and exit.
 

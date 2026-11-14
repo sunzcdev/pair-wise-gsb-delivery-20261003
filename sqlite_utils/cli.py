@@ -2839,6 +2839,16 @@ def transform(
     multiple=True,
     help="Rename this column in extracted table",
 )
+@click.option(
+    "--null-strategy",
+    type=click.Choice(["leave_null", "lookup_row"]),
+    default="leave_null",
+    help=(
+        "How to handle rows where every extracted column is NULL: "
+        "leave_null keeps a null foreign key (default), lookup_row stores "
+        "an all-null row in the other table and references it"
+    ),
+)
 @load_extension_option
 def extract(
     path,
@@ -2847,6 +2857,7 @@ def extract(
     other_table,
     fk_column,
     rename,
+    null_strategy,
     load_extension,
 ):
     """Extract one or more columns into a separate table
@@ -2864,6 +2875,7 @@ def extract(
         "table": other_table,
         "fk_column": fk_column,
         "rename": dict(rename),
+        "null_strategy": null_strategy,
     }
     try:
         db.table(table).extract(**kwargs)
