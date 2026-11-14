@@ -24,6 +24,101 @@ from boltons.funcutils import FunctionBuilder
 from .core import glom, T, STOP, SKIP, _MISSING, Path, TargetRegistry, Call, Spec, Pipe, S, bbrepr, format_invocation
 from .matching import Check
 
+
+WEIGHTED_CHUNK_OVERSIZE_SEPARATE = 'separate'
+WEIGHTED_CHUNK_OVERSIZE_REJECT = 'reject'
+_WEIGHTED_CHUNK_OVERSIZE_MODES = (
+    WEIGHTED_CHUNK_OVERSIZE_SEPARATE,
+    WEIGHTED_CHUNK_OVERSIZE_REJECT,
+)
+
+
+def _validate_positive_int(value, name):
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        raise ValueError('expected %s to be a positive integer, got: %r' % (name, value))
+    return value
+
+
+def weighted_chunked_iter(iterable, rfile, budget, count=None,
+                          oversize=WEIGHTED_CHUNK_OVERSIZE_SEPARATE):
+    """Yield lists of items from *iterable*, keeping each chunk within a
+    weight *budget* (and optionally a maximum item *count*).
+
+    *rfile* is called once per item with the item as its sole argument
+    and must return that item's weight as a non-negative integer. The
+    weights of the items in any yielded chunk never sum to more than
+    *budget*, and an item is never split across chunks.
+
+    *oversize* controls what happens when a single item's weight
+    exceeds *budget*: ``'separate'`` (the default) emits the item in a
+    chunk by itself, while ``'reject'`` raises a :exc:`ValueError`.
+
+    The stream is pulled lazily: at most the first item of the next
+    chunk is looked at ahead of time, so an infinite source is not
+    consumed up front.
+
+    >>> list(weighted_chunked_iter([1, 2, 3, 4], rfile=lambda x: x, budget=5))
+    [[1, 2], [3], [4]]
+    >>> list(weighted_chunked_iter([1, 2, 3, 4], rfile=lambda x: x, budget=5, count=2))
+    [[1, 2], [3], [4]]
+    >>> list(weighted_chunked_iter([], rfile=lambda x: x, budget=5))
+    []
+    """
+    budget = _validate_positive_int(budget, 'weight budget')
+    if count is not None:
+        count = _validate_positive_int(count, 'chunk count')
+    if oversize not in _WEIGHTED_CHUNK_OVERSIZE_MODES:
+        raise ValueError("expected oversize to be one of %r, got: %r"
+                         % (_WEIGHTED_CHUNK_OVERSIZE_MODES, oversize))
+
+    return _weighted_chunked_iter(iterable, rfile, budget, count, oversize)
+
+
+def _weighted_chunked_iter(iterable, rfile, budget, count, oversize):
+    iterator = iter(enumerate(iterable))
+    chunk = []
+    chunk_weight = 0
+
+    while True:
+        try:
+            index, item = next(iterator)
+        except StopIteration:
+            break
+
+        weight = rfile(item)
+        if isinstance(weight, bool) or not isinstance(weight, int):
+            raise ValueError('expected rfile() result at source index %d to be an '
+                             'integer, got: %r' % (index, weight))
+        if weight < 0:
+            raise ValueError('expected rfile() result at source index %d to be a '
+                             'non-negative integer, got: %d' % (index, weight))
+
+        if weight > budget:
+            if oversize == WEIGHTED_CHUNK_OVERSIZE_REJECT:
+                raise ValueError('item at source index %d has weight %d, which '
+                                 'exceeds the budget of %d' % (index, weight, budget))
+            if chunk:
+                yield chunk
+                chunk = []
+                chunk_weight = 0
+            yield [item]
+            continue
+
+        exceeds_budget = chunk_weight + weight > budget
+        exceeds_count = count is not None and len(chunk) >= count
+        if chunk and (exceeds_budget or exceeds_count):
+            yield chunk
+            chunk = []
+            chunk_weight = 0
+
+        chunk.append(item)
+        chunk_weight += weight
+
+    if chunk:
+        yield chunk
+    return
+
+
 class Iter:
     """``Iter()`` is glom's counterpart to Python's built-in :func:`iter()`
     function. Given an iterable target, ``Iter()`` yields the result
@@ -70,14 +165,14 @@ class Iter:
             base_args = (self.subspec,)
         base = format_invocation(self.__class__.__name__, base_args, repr=bbrepr)
         chunks = [base]
-        for fname, args, _ in reversed(self._iter_stack):
+        for fname, args, op_kwargs, _ in reversed(self._iter_stack):
             meth = getattr(self, fname)
             fb = FunctionBuilder.from_func(meth)
             fb.args = fb.args[1:]  # drop self
             arg_names = fb.get_arg_names()
             # TODO: something fancier with defaults:
-            kwargs = []
-            if len(args) > 1 and arg_names:
+            kwargs = list(op_kwargs.items())
+            if not op_kwargs and len(args) > 1 and arg_names:
                 args, kwargs = (), zip(arg_names, args)
             chunks.append('.' + format_invocation(fname, args, kwargs, repr=bbrepr))
         return ''.join(chunks)
@@ -85,7 +180,7 @@ class Iter:
     def glomit(self, target, scope):
         iterator = self._iterate(target, scope)
 
-        for _, _, callback in reversed(self._iter_stack):
+        for _, _, _, callback in reversed(self._iter_stack):
             iterator = callback(iterator, scope)
 
         return iter(iterator)
@@ -112,8 +207,9 @@ class Iter:
             yield yld
         return
 
-    def _add_op(self, opname, args, callback):
-        return type(self)(subspec=self.subspec, _iter_stack=[(opname, args, callback)] + self._iter_stack)
+    def _add_op(self, opname, args, callback, kwargs=()):
+        return type(self)(subspec=self.subspec,
+                          _iter_stack=[(opname, args, dict(kwargs), callback)] + self._iter_stack)
 
     def map(self, subspec):
         """Return a new :class:`Iter()` spec which will apply the provided
@@ -184,6 +280,59 @@ class Iter:
             args += (fill,)
         return self._add_op(
             'chunked', args, lambda it, scope: chunked_iter(it, **kw))
+
+    def weighted_chunked(self, rfile, budget, count=None,
+                         oversize=WEIGHTED_CHUNK_OVERSIZE_SEPARATE):
+        """Return a new :class:`Iter()` spec which groups elements into
+        chunks constrained by a serialized-size *budget* instead of a
+        fixed element count.
+
+        *rfile* is a spec or callable applied to each element to get
+        its weight (e.g. its serialized byte length). It is evaluated
+        exactly once per element, and each weight must be a
+        non-negative integer; a negative or non-integer result raises
+        a :exc:`ValueError` carrying the element's source index.
+
+        The weights of the elements in every yielded chunk sum to at
+        most *budget*; an element is never split across chunks. The
+        optional *count* additionally caps the number of elements per
+        chunk.
+
+        If a single element weighs more than *budget*, *oversize*
+        decides the outcome: ``'separate'`` (the default) emits it as
+        its own chunk, while ``'reject'`` raises a
+        :exc:`ValueError`.
+
+        Chunking is lazy — only the first element of the upcoming
+        chunk is read ahead — so it works with streaming and even
+        infinite sources. Elements filtered out earlier in the chain
+        (e.g. with :meth:`filter` or :data:`SKIP`) never count toward
+        the budget, an empty input yields no chunks, and a final
+        under-full chunk is yielded as-is.
+
+        >>> target = [1, 2, 3, 4]
+        >>> list(glom(target, Iter().weighted_chunked(lambda x: x, 5)))
+        [[1, 2], [3], [4]]
+        >>> list(glom(target, Iter().weighted_chunked(lambda x: x, 5, count=1)))
+        [[1], [2], [3], [4]]
+        >>> list(glom([], Iter().weighted_chunked(lambda x: x, 5)))
+        []
+        """
+        args = (rfile, budget)
+        kw = {}
+        if count is not None:
+            kw['count'] = count
+        if oversize != WEIGHTED_CHUNK_OVERSIZE_SEPARATE:
+            kw['oversize'] = oversize
+        return self._add_op(
+            'weighted_chunked',
+            args,
+            lambda it, scope: weighted_chunked_iter(
+                it,
+                rfile=lambda t: scope[glom](t, rfile, scope),
+                budget=budget,
+                **kw),
+            kwargs=kw)
 
     def windowed(self, size):
         """Return a new :class:`Iter()` spec which will yield a sliding window of

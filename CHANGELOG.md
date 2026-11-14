@@ -12,6 +12,12 @@ The glom team's approach to updates can be summed up as:
 Check this page when upgrading, we strive to keep the updates
 summarized and well-linked.
 
+## Unreleased
+
+- Add `Iter.weighted_chunked()` for chunking streams by a per-item
+  weight budget (e.g. serialized byte size), with an optional item
+  count cap and configurable handling of over-budget items.
+
 ## 25.12.0
 
 _(December 28, 2025)_

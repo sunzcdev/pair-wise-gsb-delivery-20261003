@@ -13,6 +13,7 @@ Streaming & Iteration
    .. automethod:: map
    .. automethod:: filter
    .. automethod:: chunked
+   .. automethod:: weighted_chunked
    .. automethod:: split
    .. automethod:: flatten
    .. automethod:: unique
