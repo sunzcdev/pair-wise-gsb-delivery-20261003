@@ -341,6 +341,121 @@ class TestTableComputation(unittest.TestCase):
         self.assertEqual(len(new_table.columns), 5)
         self.assertSequenceEqual(new_table.columns['rank'], (1, 4, 1, 3))
 
+    def test_rank_comparer_equivalence_groups_distinct_values(self):
+        """Values the comparer treats as equal share a competition rank."""
+        rows = (
+            ('a',),
+            ('B',),
+            ('A',),
+            ('c',),
+            ('b',)
+        )
+        table = Table(rows, ['letter'], [self.text_type])
+
+        def compare_case_insensitive(x, y):
+            return (x.lower() > y.lower()) - (x.lower() < y.lower())
+
+        new_table = table.compute([
+            ('rank', Rank('letter', comparer=compare_case_insensitive))
+        ])
+
+        # 'a' == 'A' -> 1, 'b' == 'B' -> 3, 'c' -> 5
+        self.assertSequenceEqual(new_table.columns['rank'], (1, 3, 1, 5, 3))
+        self.assertIsInstance(new_table.columns['rank'][0], Decimal)
+
+    def test_rank_comparer_equivalence_duplicate_rows(self):
+        """Duplicate rows and distinct-but-equal values all land in one group."""
+        rows = (
+            (Decimal(2),),
+            (Decimal(-2),),
+            (Decimal(1),),
+            (Decimal(3),),
+            (Decimal(-3),),
+            (Decimal(2),)
+        )
+        table = Table(rows, ['n'], [self.number_type])
+
+        def compare_absolute_value(x, y):
+            ax, ay = abs(x), abs(y)
+
+            return (ax > ay) - (ax < ay)
+
+        new_table = table.compute([
+            ('rank', Rank('n', comparer=compare_absolute_value))
+        ])
+
+        # |1| -> 1; the three |2| rows -> 2; the two |3| rows -> 5
+        self.assertSequenceEqual(new_table.columns['rank'], (2, 2, 1, 5, 5, 2))
+
+    def test_rank_comparer_reverse_keeps_group_order(self):
+        """Reverse flips group direction but keeps each group's original order."""
+        rows = (
+            (Decimal(2),),
+            (Decimal(-2),),
+            (Decimal(1),),
+            (Decimal(3),),
+            (Decimal(-3),),
+            (Decimal(2),)
+        )
+        table = Table(rows, ['n'], [self.number_type])
+
+        def compare_absolute_value(x, y):
+            ax, ay = abs(x), abs(y)
+
+            return (ax > ay) - (ax < ay)
+
+        new_table = table.compute([
+            ('rank', Rank('n', comparer=compare_absolute_value, reverse=True))
+        ])
+
+        # |3| rows -> 1; |2| rows -> 3; |1| -> 6; within-group order preserved
+        self.assertSequenceEqual(new_table.columns['rank'], (3, 3, 6, 1, 1, 3))
+
+    def test_rank_comparer_with_row_names(self):
+        """Ranks are backfilled onto the original rows when row names exist."""
+        rows = (
+            ('a', Decimal(2)),
+            ('B', Decimal(-2)),
+            ('A', Decimal(1)),
+            ('c', Decimal(3))
+        )
+        table = Table(rows, ['letter', 'n'], [self.text_type, self.number_type], row_names='letter')
+
+        def compare_absolute_value(x, y):
+            ax, ay = abs(x), abs(y)
+
+            return (ax > ay) - (ax < ay)
+
+        new_table = table.compute([
+            ('rank', Rank('n', comparer=compare_absolute_value))
+        ])
+
+        self.assertSequenceEqual(new_table.row_names, ('a', 'B', 'A', 'c'))
+        self.assertSequenceEqual(new_table.columns['rank'], (2, 2, 1, 4))
+
+    def test_rank_comparer_defines_null_handling(self):
+        """A comparer that orders nulls itself is honored, including ties."""
+        rows = (
+            (None,),
+            (Decimal(2),),
+            (Decimal(-2),),
+            (Decimal(1),)
+        )
+        table = Table(rows, ['n'], [self.number_type])
+
+        def compare_null_first(x, y):
+            ax = -1 if x is None else abs(x)
+            ay = -1 if y is None else abs(y)
+
+            return (ax > ay) - (ax < ay)
+
+        new_table = table.compute([
+            ('rank', Rank('n', comparer=compare_null_first))
+        ])
+
+        # None sorts first -> 1; |1| -> 2; the two |2| rows -> 3
+        self.assertSequenceEqual(new_table.columns['rank'], (1, 3, 3, 2))
+
     def test_percentile_rank(self):
         rows = [(n,) for n in range(1, 1001)]
 
@@ -398,6 +513,92 @@ class TestTableComputation(unittest.TestCase):
         self.assertSequenceEqual(
             [r[1] for r in new_table.rows[:100]],
             [r[1] for r in without_null.rows]
+        )
+
+    def test_percentile_rank_comparer_equivalence(self):
+        """PercentileRank groups by the comparer's equivalence relation."""
+        rows = (
+            (Decimal(2),),
+            (Decimal(-2),),
+            (Decimal(1),),
+            (Decimal(3),),
+            (Decimal(-3),),
+            (Decimal(2),)
+        )
+        table = Table(rows, ['n'], [self.number_type])
+
+        def compare_absolute_value(x, y):
+            ax, ay = abs(x), abs(y)
+
+            return (ax > ay) - (ax < ay)
+
+        new_table = table.compute([
+            ('percentiles', PercentileRank('n', comparer=compare_absolute_value))
+        ])
+
+        # Distinct groups in comparer order are |1|, |2|, |3|. Equal absolute
+        # values must receive the same percentile even though the raw values
+        # differ (e.g. 2 and -2), and duplicate rows stay aligned.
+        self.assertSequenceEqual(
+            new_table.columns['percentiles'],
+            (Decimal('66'), Decimal('66'), Decimal('33'), Decimal('100'), Decimal('100'), Decimal('66'))
+        )
+        self.assertIsInstance(new_table.columns['percentiles'][0], Decimal)
+
+    def test_percentile_rank_comparer_reverse(self):
+        """Reverse reverses the percentile direction without splitting groups."""
+        rows = (
+            (Decimal(2),),
+            (Decimal(-2),),
+            (Decimal(1),),
+            (Decimal(3),),
+            (Decimal(-3),),
+            (Decimal(2),)
+        )
+        table = Table(rows, ['n'], [self.number_type])
+
+        def compare_absolute_value(x, y):
+            ax, ay = abs(x), abs(y)
+
+            return (ax > ay) - (ax < ay)
+
+        new_table = table.compute([
+            ('percentiles', PercentileRank('n', comparer=compare_absolute_value, reverse=True))
+        ])
+
+        # In reverse the boundaries are built over the reversed groups
+        # (|3|, |2|, |1|), so |3| -> 33, |2| -> 66 and |1| -> 100 while tied
+        # values keep sharing a percentile.
+        self.assertSequenceEqual(
+            new_table.columns['percentiles'],
+            (Decimal('66'), Decimal('66'), Decimal('100'), Decimal('33'), Decimal('33'), Decimal('66'))
+        )
+
+    def test_percentile_rank_comparer_with_row_names(self):
+        """Comparer-based percentile ranks are backfilled onto named rows."""
+        rows = (
+            ('a', Decimal(2)),
+            ('b', Decimal(-2)),
+            ('c', Decimal(1)),
+            ('d', Decimal(3))
+        )
+        table = Table(
+            rows, ['letter', 'n'], [self.text_type, self.number_type], row_names='letter'
+        )
+
+        def compare_absolute_value(x, y):
+            ax, ay = abs(x), abs(y)
+
+            return (ax > ay) - (ax < ay)
+
+        new_table = table.compute([
+            ('percentiles', PercentileRank('n', comparer=compare_absolute_value))
+        ])
+
+        self.assertSequenceEqual(new_table.row_names, ('a', 'b', 'c', 'd'))
+        self.assertSequenceEqual(
+            new_table.columns['percentiles'],
+            (Decimal('66'), Decimal('66'), Decimal('33'), Decimal('100'))
         )
 
     def test_percentile_rank_invalid_types(self):
