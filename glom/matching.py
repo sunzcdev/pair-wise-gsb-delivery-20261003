@@ -9,12 +9,13 @@ step, you can do these checks inline with your glom spec, using
 
 import re
 import sys
+from collections.abc import Mapping
 from pprint import pprint
 
 from boltons.iterutils import is_iterable
 from boltons.typeutils import make_sentinel
 
-from .core import GlomError, glom, T, MODE, bbrepr, bbformat, format_invocation, Path, chain_child, Val, arg_val
+from .core import GlomError, glom, T, MODE, AUTO, bbrepr, bbformat, format_invocation, Path, chain_child, Val, arg_val
 
 
 _MISSING = make_sentinel('_MISSING')
@@ -858,6 +859,112 @@ class Switch:
 
     def __repr__(self):
         return f'{self.__class__.__name__}({bbrepr(self.cases)})'
+
+
+class Dispatch:
+    r"""The :class:`Dispatch` specifier type routes processing to one of
+    several branches, selected by a discriminator value found at a
+    specified location in the target.
+
+    When many event types arrive through a single entry point, trying
+    each structure in turn with :class:`Or` repeats the same
+    conversions for every record.  :class:`Dispatch` evaluates the
+    discriminator *key* once, then runs only the selected branch:
+
+      >>> spec = Dispatch('kind', {
+      ...     'user': Match({'kind': 'user', 'id': int}),
+      ...     'order': (T['items'], len),
+      ... })
+      >>> glom({'kind': 'user', 'id': 7}, spec)
+      {'kind': 'user', 'id': 7}
+      >>> glom({'kind': 'order', 'items': [1, 2, 3]}, spec)
+      3
+
+    The constructor accepts a :class:`dict` of ``{value: spec}`` or a
+    list of ``(value, spec)`` pairs.  Case keys must be hashable, and
+    duplicate keys are rejected when the spec is constructed.
+
+    A missing discriminator field, an explicit ``None`` value, and a
+    value absent from the case table are three distinct situations:
+
+    * a missing field raises the usual :exc:`~glom.PathAccessError`
+    * ``None`` is an ordinary case key and may have its own branch
+    * a value with no case falls through to *default* when one was
+      passed, and otherwise raises :class:`MatchError`
+
+      >>> glom({'kind': None}, Dispatch('kind', {None: Val('none')}))
+      'none'
+      >>> glom({'kind': 'other'}, Dispatch('kind', {'user': Val('u')}, default=Val('fallback')))
+      'fallback'
+
+    Errors raised while evaluating the discriminator or the selected
+    branch are propagated, never treated as a non-match.  Branches are
+    evaluated against the original target, so they may use the full
+    range of specs, including :class:`Match`, :class:`Optional`, and
+    transformation specs, and error messages stay rooted at the
+    original document.
+
+    .. note::
+
+       :class:`~glom.Dispatch` is one of several *branching* specifier
+       types in glom. See ":ref:`branched-exceptions`" for details on
+       interpreting its exception messages.
+
+    """
+    def __init__(self, key, cases, default=_MISSING):
+        if isinstance(cases, Mapping):
+            case_items = list(cases.items())
+        elif isinstance(cases, (list, tuple)):
+            case_items = list(cases)
+        else:
+            raise TypeError(
+                "expected cases argument to be a mapping or a sequence of"
+                " (value, spec) pairs, not: %r" % (cases,))
+        if not case_items:
+            raise ValueError('expected at least one case in %s, got: %r'
+                             % (self.__class__.__name__, cases))
+        seen = set()
+        for item in case_items:
+            if not isinstance(item, (list, tuple)) or len(item) != 2:
+                raise TypeError(
+                    "expected cases argument to contain (value, spec)"
+                    " pairs, got: %r" % (item,))
+            case_key = item[0]
+            try:
+                hash(case_key)
+            except TypeError:
+                raise TypeError("case keys must be hashable, got: %r"
+                                % (case_key,)) from None
+            if case_key in seen:
+                raise ValueError("duplicate case key: %r" % (case_key,))
+            seen.add(case_key)
+        self.key = key
+        self.cases = case_items
+        self.case_map = dict(case_items)
+        self.default = default
+        return
+
+    def glomit(self, target, scope):
+        scope[MODE] = AUTO  # key and branches are regular specs, even under Match()
+        disc_value = scope[glom](target, self.key, scope)
+        try:
+            branch_spec = self.case_map[disc_value]
+        except (KeyError, TypeError):
+            # unknown or unhashable discriminator values have no branch
+            branch_spec = _MISSING
+        if branch_spec is not _MISSING:
+            return scope[glom](target, branch_spec, chain_child(scope))
+        if self.default is not _MISSING:
+            return arg_val(target, self.default, scope)
+        raise MatchError(
+            "no case for discriminator value %r in %s"
+            % (disc_value, self.__class__.__name__))
+
+    def __repr__(self):
+        cn = self.__class__.__name__
+        if self.default is _MISSING:
+            return f'{cn}({bbrepr(self.key)}, {bbrepr(self.cases)})'
+        return f'{cn}({bbrepr(self.key)}, {bbrepr(self.cases)}, default={bbrepr(self.default)})'
 
 
 RAISE = make_sentinel('RAISE')  # flag object for "raise on check failure"

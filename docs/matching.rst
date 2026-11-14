@@ -79,6 +79,15 @@ branch spec execution.
 
 .. autoclass:: glom.Switch
 
+Control flow with ``Dispatch``
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+When the branch can be chosen by a discriminator value at a known
+path, ``Dispatch`` evaluates that value once and runs only the
+selected branch.
+
+.. autoclass:: glom.Dispatch
+
 Exceptions
 ~~~~~~~~~~
 

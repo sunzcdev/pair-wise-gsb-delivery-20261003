@@ -12,6 +12,14 @@ The glom team's approach to updates can be summed up as:
 Check this page when upgrading, we strive to keep the updates
 summarized and well-linked.
 
+## 25.12.1
+
+_(unreleased)_
+
+- Add :class:`~glom.Dispatch`, a branching specifier which selects a
+  single branch based on a discriminator value found at a specified
+  path, with support for an explicit default branch.
+
 ## 25.12.0
 
 _(December 28, 2025)_

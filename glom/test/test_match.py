@@ -3,7 +3,8 @@ import json
 
 import pytest
 
-from glom import glom, S, Val, T, A, Fill, Ref, Coalesce, STOP, Switch
+from glom import glom, S, Val, T, A, Fill, Ref, Coalesce, STOP, Switch, Dispatch
+from glom import Path, PathAccessError, GlomError
 from glom.matching import (
     Match, M, MatchError, TypeMatchError, And, Or, Not,
     Optional, Required, Regex)
@@ -504,6 +505,117 @@ def test_switch():
     	Switch("wrong type")
     assert glom(None, Switch({S(a=1): S['a']})) == 1
     repr(Switch(cases))
+
+
+def test_dispatch():
+    calls = []
+
+    def make_branch(name):
+        def branch(target):
+            calls.append(name)
+            return target['payload']
+        return branch
+
+    cases = {
+        'user': make_branch('user'),
+        'order': make_branch('order'),
+        None: Val('none'),
+    }
+    spec = Dispatch('meta.kind', cases)
+
+    # only the selected branch runs for each record
+    assert glom({'meta': {'kind': 'user'}, 'payload': 'u'}, spec) == 'u'
+    assert calls == ['user']
+    calls[:] = []
+    assert glom({'meta': {'kind': 'order'}, 'payload': 'o'}, spec) == 'o'
+    assert calls == ['order']
+    calls[:] = []
+
+    # a present-but-None discriminator is an ordinary case key
+    assert glom({'meta': {'kind': None}, 'payload': 'n'}, spec) == 'none'
+    assert calls == []
+
+    # cases may also be passed as a sequence of pairs
+    pair_spec = Dispatch('kind', [('a', Val(1)), ('b', Val(2))])
+    assert glom({'kind': 'b'}, pair_spec) == 2
+
+    # discriminator key may be any glom spec
+    assert glom({'kind': 'a'}, Dispatch(T['kind'], {'a': Val(1)})) == 1
+
+    repr(spec)
+    repr(Dispatch('kind', {'a': Val(1)}, default=Val('d')))
+
+
+def test_dispatch_missing_none_and_unknown():
+    spec = Dispatch('meta.kind', {'user': Val('u')})
+    default_spec = Dispatch('meta.kind', {'user': Val('u')}, default=Val('default'))
+
+    # missing discriminator field raises a path error, even with a default
+    with pytest.raises(PathAccessError):
+        glom({'meta': {}}, spec)
+    with pytest.raises(PathAccessError):
+        glom({'meta': {}}, default_spec)
+
+    # unknown discriminator value uses the default, or raises MatchError
+    assert glom({'meta': {'kind': 'other'}}, default_spec) == 'default'
+    with pytest.raises(MatchError):
+        glom({'meta': {'kind': 'other'}}, spec)
+
+    # unhashable discriminator values count as "not in the case table"
+    assert glom({'meta': {'kind': []}}, default_spec) == 'default'
+    with pytest.raises(MatchError):
+        glom({'meta': {'kind': []}}, spec)
+
+    # literal defaults are returned as-is
+    assert glom({'kind': 'z'}, Dispatch('kind', {'a': Val(1)}, default=42)) == 42
+
+
+def test_dispatch_case_validation():
+    # duplicate keys are rejected eagerly
+    with pytest.raises(ValueError):
+        Dispatch('kind', [('a', Val(1)), ('a', Val(2))])
+    # unhashable keys are rejected eagerly
+    with pytest.raises(TypeError):
+        Dispatch('kind', [(['a'], Val(1))])
+    # empty cases are rejected
+    with pytest.raises(ValueError):
+        Dispatch('kind', {})
+    # malformed cases are rejected
+    with pytest.raises(TypeError):
+        Dispatch('kind', 'not cases')
+    with pytest.raises(TypeError):
+        Dispatch('kind', [('a', Val(1), Val(2))])
+
+
+def test_dispatch_branch_specs_and_errors():
+    # branches compose with Match, Optional, and transformation specs
+    match_spec = Dispatch('kind', {
+        'user': Match({'kind': 'user', 'id': int, Optional('name'): str}),
+        'converted': (T['id'], int),
+    })
+    assert glom({'kind': 'user', 'id': 1}, match_spec) == {'kind': 'user', 'id': 1}
+    assert glom({'kind': 'converted', 'id': '2'}, match_spec) == 2
+
+    # Dispatch nested in a Match still treats key and branches as regular specs
+    nested = Match({
+        'kind': str,
+        'value': Dispatch('kind', {'a': T['num']}),
+    })
+    assert glom({'kind': 'a', 'value': {'kind': 'a', 'num': 3}}, nested) == {
+        'kind': 'a', 'value': 3}
+
+    # branch errors propagate (rooted at the original document), never
+    # falling through to the default branch
+    branch_error = Dispatch('kind', {'user': 'name'}, default=Val('default'))
+    with pytest.raises(PathAccessError) as exc_info:
+        glom({'kind': 'user'}, branch_error)
+    assert exc_info.value.path == Path('name')
+
+    # discriminator evaluation errors propagate, never matching the default
+    path_error = Dispatch(lambda target: 1 / 0, {'zero': Val('zero')},
+                          default=Val('default'))
+    with pytest.raises(ZeroDivisionError):
+        glom({'kind': 'user'}, path_error)
 
 
 def test_nested_dict():
