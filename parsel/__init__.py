@@ -8,6 +8,7 @@ __email__ = "info@scrapy.org"
 __version__ = "1.12.1"
 __all__ = [
     "AbsoluteXPathWarning",
+    "NamespaceConflictError",
     "Selector",
     "SelectorList",
     "css2xpath",
@@ -16,6 +17,11 @@ __all__ = [
 
 from parsel import xpathfuncs
 from parsel.csstranslator import css2xpath
-from parsel.selector import AbsoluteXPathWarning, Selector, SelectorList
+from parsel.selector import (
+    AbsoluteXPathWarning,
+    NamespaceConflictError,
+    Selector,
+    SelectorList,
+)
 
 xpathfuncs.setup()

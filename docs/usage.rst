@@ -1213,6 +1213,64 @@ of relevance, are:
 .. _requests: https://www.python-requests.org/
 
 
+.. _namespace-free-views:
+
+Namespace-free views
+~~~~~~~~~~~~~~~~~~~~
+
+:meth:`Selector.remove_namespaces
+<parsel.selector.Selector.remove_namespaces>` modifies the underlying
+document. When different extraction rules share the same document, and only
+some of them want namespace-less queries, modifying the document is not an
+option.
+
+.. invisible-code-block: python
+
+   from parsel import Selector
+   sel = load_selector('python-insider.xml', type='xml')
+
+For those cases, use :meth:`Selector.view
+<parsel.selector.Selector.view>` instead, which returns an isolated copy of
+the subtree that never affects the original document::
+
+    >>> sel.xpath("//link")
+    []
+    >>> view = sel.view(strip_namespaces=True)
+    >>> len(view.xpath("//link")) > 0
+    True
+    >>> len(view.css("link")) > 0
+    True
+    >>> sel.xpath("//link")
+    []
+
+Both views coexist: the original selector keeps answering regular,
+namespace-aware queries, while the view answers simplified, namespace-less
+queries. Querying the view, serializing it with :meth:`get
+<parsel.selector.Selector.get>`, or dropping nodes from it with :meth:`drop
+<parsel.selector.Selector.drop>` only affects the view, and changes to the
+original document do not affect the view either.
+
+You can also create a view of a specific subtree only, by calling
+:meth:`~parsel.selector.Selector.view` on a nested selector, and you can call
+it without ``strip_namespaces=True`` to get an isolated view that keeps the
+original namespaces.
+
+Elements with the same local name in different namespaces are all kept in the
+view. However, if two attributes of the same element would end up with the
+same name after removing namespaces, the view cannot keep both values, so
+:class:`~parsel.selector.NamespaceConflictError` is raised instead of
+silently dropping one of them::
+
+    >>> conflicting = Selector(
+    ...     text='<e xmlns:a="http://example.com/a" a:id="1" id="2"/>',
+    ...     type='xml',
+    ... )
+    >>> conflicting.view(strip_namespaces=True)
+    Traceback (most recent call last):
+    ...
+    parsel.selector.NamespaceConflictError: Cannot remove namespaces: ...
+
+
 Ad-hoc namespaces references
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 

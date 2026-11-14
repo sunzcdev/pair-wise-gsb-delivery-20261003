@@ -4,6 +4,7 @@ packages."""
 from __future__ import annotations
 
 import codecs
+import copy
 import json
 import re
 import typing
@@ -51,6 +52,14 @@ class CannotRemoveElementWithoutParent(Exception):
 
 class CannotDropElementWithoutParent(CannotRemoveElementWithoutParent):
     pass
+
+
+class NamespaceConflictError(ValueError):
+    """Raised when removing namespaces from a document copy would map two
+    attributes of the same element to the same name.
+
+    .. versionadded:: VERSION
+    """
 
 
 class AbsoluteXPathWarning(UserWarning):
@@ -163,6 +172,40 @@ def create_root_node(
     return root
 
 
+def _namespace_free_copy(root: etree._Element) -> etree._Element:
+    """Return a deep copy of *root* with all namespaces removed.
+
+    Raise :class:`NamespaceConflictError` if removing namespaces would map
+    two attributes of the same element to the same name.
+    """
+    new_root = copy.deepcopy(root)
+    for el in new_root.iter("*"):
+        if not isinstance(el.tag, str):
+            # comments and processing instructions
+            continue
+        original_tag = el.tag
+        if el.tag.startswith("{"):
+            el.tag = el.tag.split("}", 1)[1]
+        namespaced_attributes: dict[str, list[str]] = {}
+        for attr_name in el.attrib:
+            if attr_name.startswith("{"):
+                local_name = attr_name.split("}", 1)[1]
+                namespaced_attributes.setdefault(local_name, []).append(attr_name)
+        for local_name, namespaced_names in namespaced_attributes.items():
+            conflicting_names = list(namespaced_names)
+            if local_name in el.attrib:
+                conflicting_names.append(local_name)
+            if len(conflicting_names) > 1:
+                raise NamespaceConflictError(
+                    f"Cannot remove namespaces: attributes "
+                    f"{', '.join(sorted(conflicting_names))} of element "
+                    f"{original_tag!r} would all become {local_name!r}."
+                )
+            el.attrib[local_name] = el.attrib.pop(namespaced_names[0])
+    etree.cleanup_namespaces(new_root)
+    return new_root
+
+
 class SelectorList(list[_SelectorType]):
     """
     The :class:`SelectorList` class is a subclass of the builtin ``list``
@@ -251,6 +294,20 @@ class SelectorList(list[_SelectorType]):
         ``query`` is the same argument as the one in :meth:`Selector.css`
         """
         return self.__class__(flatten([x.css(query) for x in self]))
+
+    def view(self, strip_namespaces: bool = False) -> SelectorList[_SelectorType]:
+        """
+        Call the ``.view()`` method for each element in this list and return
+        their results as another :class:`SelectorList`.
+
+        .. versionadded:: VERSION
+
+        ``strip_namespaces`` is the same argument as the one in
+        :meth:`Selector.view`.
+        """
+        return self.__class__(
+            [x.view(strip_namespaces=strip_namespaces) for x in self]
+        )
 
     def re(self, regex: str | Pattern[str], replace_entities: bool = True) -> list[str]:
         """
@@ -939,6 +996,50 @@ class Selector:
                     el.attrib[an.split("}", 1)[1]] = el.attrib.pop(an)
         # remove namespace declarations
         etree.cleanup_namespaces(self.root)
+
+    def view(self, strip_namespaces: bool = False) -> Self:
+        """
+        Return a new :class:`Selector` that is an isolated, queryable view
+        of the subtree rooted at this selector, leaving the original
+        document untouched.
+
+        .. versionadded:: VERSION
+
+        The view is a deep copy of the underlying subtree, so querying it,
+        serializing it with :meth:`get`, or dropping nodes from it with
+        :meth:`drop` never affects the original document, and the other
+        way around. This allows keeping two coexisting views of the same
+        document, e.g. the original selector for regular namespace-aware
+        queries and a simplified view for namespace-less queries.
+
+        If ``strip_namespaces`` is ``True``, namespaces are removed from
+        the copied subtree, allowing to traverse it using namespace-less
+        XPath and CSS expressions, without the side effects that
+        :meth:`remove_namespaces` would have on the original document.
+        Elements with the same local name in different namespaces are all
+        kept. If removing namespaces would map two attributes of the same
+        element to the same name, :class:`NamespaceConflictError` is
+        raised instead of silently dropping one of the values.
+
+        For JSON and text selectors, ``strip_namespaces`` has no effect,
+        and the view is a copy of the underlying data.
+        """
+        if isinstance(self.root, etree._Element):
+            root = (
+                _namespace_free_copy(self.root)
+                if strip_namespaces
+                else copy.deepcopy(self.root)
+            )
+        elif self.type == "json":
+            root = copy.deepcopy(self.root)
+        else:
+            root = self.root
+        return self.__class__(
+            root=root,
+            namespaces=self.namespaces,
+            type=self.type,
+            huge_tree=self._huge_tree,
+        )
 
     def drop(self) -> None:
         """

@@ -16,6 +16,7 @@ from parsel.selector import (
     _NOT_SET,
     CannotRemoveElementWithoutParent,
     CannotRemoveElementWithoutRoot,
+    NamespaceConflictError,
 )
 
 if TYPE_CHECKING:
@@ -854,6 +855,203 @@ class TestSelector:
         assert len(sel.xpath("//link/@type")) == 0
         sel.remove_namespaces()
         assert len(sel.xpath("//link/@type")) == 3
+
+    def test_view_without_strip_namespaces(self) -> None:
+        xml = """<?xml version="1.0" encoding="UTF-8"?>
+<feed xmlns="http://www.w3.org/2005/Atom">
+  <link type="text/html"/>
+  <entry>
+    <link type="text/html"/>
+  </entry>
+</feed>
+"""
+        sel = self.sscls(text=xml, type="xml")
+        view = sel.view()
+        assert len(view.xpath("//link")) == 0
+        assert (
+            len(view.xpath("//f:link", namespaces={"f": "http://www.w3.org/2005/Atom"}))
+            == 2
+        )
+        # the original document is untouched
+        assert len(sel.xpath("//link")) == 0
+        assert len(sel.xpath("./namespace::*")) == 2
+
+    def test_view_strip_namespaces(self) -> None:
+        xml = """<?xml version="1.0" encoding="UTF-8"?>
+<feed xmlns="http://www.w3.org/2005/Atom" xml:lang="en-US" xmlns:media="http://search.yahoo.com/mrss/">
+  <link type="text/html"/>
+  <entry>
+    <link media:type="text/html"/>
+  </entry>
+  <link type="application/atom+xml"/>
+</feed>
+"""
+        sel = self.sscls(text=xml, type="xml")
+        view = sel.view(strip_namespaces=True)
+        # the view is queried with namespace-less XPath and CSS expressions
+        assert len(view.xpath("//link")) == 3
+        assert len(view.css("link")) == 3
+        assert len(view.xpath("//link/@type")) == 3
+        assert len(view.xpath("./namespace::*")) == 1
+        # the original document keeps its namespaces
+        assert len(sel.xpath("//link")) == 0
+        assert len(sel.xpath("./namespace::*")) == 3
+        # both views coexist and can be queried independently
+        assert (
+            len(sel.xpath("//f:link", namespaces={"f": "http://www.w3.org/2005/Atom"}))
+            == 3
+        )
+
+    def test_view_strip_namespaces_matches_remove_namespaces(self) -> None:
+        xml = """<?xml version="1.0" encoding="UTF-8"?>
+<feed xmlns="http://www.w3.org/2005/Atom" xmlns:media="http://search.yahoo.com/mrss/">
+  <entry media:id="1">
+    <title>Some title</title>
+  </entry>
+</feed>
+"""
+        sel = self.sscls(text=xml, type="xml")
+        stripped = self.sscls(text=xml, type="xml")
+        stripped.remove_namespaces()
+        view = sel.view(strip_namespaces=True)
+        assert view.get() == stripped.get()
+        assert view.xpath("//entry").get() == stripped.xpath("//entry").get()
+
+    def test_view_strip_namespaces_keeps_same_local_name_elements(self) -> None:
+        xml = """<?xml version="1.0" encoding="UTF-8"?>
+<feed xmlns="http://www.w3.org/2005/Atom" xmlns:s="http://www.w3.org/2000/svg">
+  <link type="text/html"/>
+  <s:link type="image/svg+xml"/>
+</feed>
+"""
+        sel = self.sscls(text=xml, type="xml")
+        view = sel.view(strip_namespaces=True)
+        # elements with the same local name in different namespaces are all kept
+        assert view.xpath("//link/@type").getall() == [
+            "text/html",
+            "image/svg+xml",
+        ]
+
+    def test_view_strip_namespaces_attribute_conflict(self) -> None:
+        xml = """<?xml version="1.0" encoding="UTF-8"?>
+<feed xmlns:a="http://example.com/a" xmlns:b="http://example.com/b">
+  <entry a:id="1" b:id="2"/>
+</feed>
+"""
+        sel = self.sscls(text=xml, type="xml")
+        with pytest.raises(NamespaceConflictError, match="would all become 'id'"):
+            sel.view(strip_namespaces=True)
+        # the original document is untouched
+        assert sel.xpath("//entry")[0].attrib == {
+            "{http://example.com/a}id": "1",
+            "{http://example.com/b}id": "2",
+        }
+
+    def test_view_strip_namespaces_attribute_conflict_with_plain_attribute(
+        self,
+    ) -> None:
+        xml = """<?xml version="1.0" encoding="UTF-8"?>
+<feed xmlns:a="http://example.com/a">
+  <entry a:id="1" id="2"/>
+</feed>
+"""
+        sel = self.sscls(text=xml, type="xml")
+        with pytest.raises(NamespaceConflictError) as excinfo:
+            sel.view(strip_namespaces=True)
+        message = str(excinfo.value)
+        assert "{http://example.com/a}id" in message
+        assert "entry" in message
+
+    def test_view_of_subtree(self) -> None:
+        xml = """<?xml version="1.0" encoding="UTF-8"?>
+<feed xmlns="http://www.w3.org/2005/Atom">
+  <entry>
+    <title>Some title</title>
+  </entry>
+  <entry>
+    <title>Other title</title>
+  </entry>
+</feed>
+"""
+        sel = self.sscls(text=xml, type="xml")
+        entry = sel.xpath(
+            "//f:entry", namespaces={"f": "http://www.w3.org/2005/Atom"}
+        )[0]
+        view = entry.view(strip_namespaces=True)
+        assert view.xpath("./title/text()").getall() == ["Some title"]
+        # nested queries from view results work with stripped names
+        assert view.xpath("//title").xpath("./text()").getall() == ["Some title"]
+        # the original document is untouched
+        assert len(sel.xpath("//title")) == 0
+
+    def test_view_drop_does_not_affect_original(self) -> None:
+        xml = """<?xml version="1.0" encoding="UTF-8"?>
+<feed xmlns="http://www.w3.org/2005/Atom">
+  <entry>
+    <title>Some title</title>
+    <author>Some author</author>
+  </entry>
+</feed>
+"""
+        sel = self.sscls(text=xml, type="xml")
+        view = sel.view(strip_namespaces=True)
+        view.xpath("//author").drop()
+        assert view.xpath("//author").getall() == []
+        assert view.xpath("//title").getall() == ["<title>Some title</title>"]
+        # dropping from the view does not affect the original document
+        assert (
+            len(
+                sel.xpath(
+                    "//f:author", namespaces={"f": "http://www.w3.org/2005/Atom"}
+                )
+            )
+            == 1
+        )
+        # and dropping from the original document does not affect the view
+        sel.xpath("//f:title", namespaces={"f": "http://www.w3.org/2005/Atom"}).drop()
+        assert view.xpath("//title").getall() == ["<title>Some title</title>"]
+
+    def test_view_drop_root_raises(self) -> None:
+        xml = """<?xml version="1.0" encoding="UTF-8"?>
+<feed xmlns="http://www.w3.org/2005/Atom">
+  <entry/>
+</feed>
+"""
+        sel = self.sscls(text=xml, type="xml")
+        view = sel.view(strip_namespaces=True)
+        with pytest.raises(CannotRemoveElementWithoutParent):
+            view.drop()
+
+    def test_view_selector_list(self) -> None:
+        xml = """<?xml version="1.0" encoding="UTF-8"?>
+<feed xmlns="http://www.w3.org/2005/Atom">
+  <entry>
+    <title>Some title</title>
+  </entry>
+  <entry>
+    <title>Other title</title>
+  </entry>
+</feed>
+"""
+        sel = self.sscls(text=xml, type="xml")
+        views = sel.xpath(
+            "//f:entry", namespaces={"f": "http://www.w3.org/2005/Atom"}
+        ).view(strip_namespaces=True)
+        self.assertIsSelectorList(views)
+        assert views.xpath("./title/text()").getall() == [
+            "Some title",
+            "Other title",
+        ]
+        # the original document is untouched
+        assert len(sel.xpath("//title")) == 0
+
+    def test_view_json(self) -> None:
+        sel = self.sscls(text='{"a": {"b": 1}}', type="json")
+        view = sel.view(strip_namespaces=True)
+        assert view.jmespath("a.b").getall() == [1]
+        # the view holds a copy of the data
+        assert view.root is not sel.root
+        assert view.root == sel.root
 
     def test_smart_strings(self) -> None:
         """Lxml smart strings return values"""
