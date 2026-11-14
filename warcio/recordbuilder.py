@@ -119,6 +119,76 @@ class RecordBuilder(object):
 
         return record
 
+    def create_replaced_body_record(self, record, stream,
+                                    content_encoded=True, length=None):
+        """Create a new record from an existing ``record``, replacing its
+        payload body with the contents of ``stream``.
+
+        The new record keeps the source record's WARC-Target-URI, WARC-Date
+        and record linkage (WARC-Record-ID, WARC-Concurrent-To, ...), while
+        stale Content-Length and digest fields are dropped and recomputed
+        from the new body.
+
+        If ``content_encoded`` is False, the new body has already been
+        decoded, so any Content-Encoding (and Transfer-Encoding) HTTP
+        headers which no longer apply are removed from the new record.
+        Transfer-Encoding is always removed, as the new body is written
+        as a single block with a computed Content-Length.
+
+        If ``length`` is None (unknown), the stream is buffered with a
+        bounded in-memory window to determine the length. Any failure
+        while reading the stream is raised and no record is returned.
+
+        The source record is not modified and remains readable.
+        """
+        # copy WARC headers, keeping uri, date and record association,
+        # but dropping stale length and digest fields (recomputed below)
+        warc_headers = StatusAndHeaders(record.rec_headers.statusline,
+                                        list(record.rec_headers.headers),
+                                        protocol=record.rec_headers.protocol)
+        warc_headers.remove_header('Content-Length')
+        warc_headers.remove_header('WARC-Block-Digest')
+        warc_headers.remove_header('WARC-Payload-Digest')
+
+        http_headers = None
+        if record.http_headers:
+            http_headers = StatusAndHeaders(record.http_headers.statusline,
+                                            list(record.http_headers.headers),
+                                            protocol=record.http_headers.protocol)
+            # new body is written as a single block, so any framing
+            # and length headers no longer apply
+            http_headers.remove_header('Transfer-Encoding')
+            http_headers.remove_header('Content-Length')
+            if not content_encoded:
+                http_headers.remove_header('Content-Encoding')
+
+        if length is None:
+            # buffer the new body to determine its length,
+            # spilling to disk past a bounded in-memory window
+            buff = self._create_temp_file()
+            try:
+                for data in self._iter_stream(stream):
+                    buff.write(data)
+            except Exception:
+                buff.close()
+                raise
+
+            length = buff.tell()
+            buff.seek(0)
+            stream = buff
+
+        if http_headers:
+            http_headers.replace_header('Content-Length', str(length))
+
+        new_record = ArcWarcRecord('warc', record.rec_type, warc_headers,
+                                   stream, http_headers,
+                                   record.content_type, length)
+        new_record.payload_length = length
+
+        self.ensure_digest(new_record, block=True, payload=True)
+
+        return new_record
+
     def _init_warc_headers(self, uri, record_type, warc_headers_dict):
         warc_headers = StatusAndHeaders('', list(warc_headers_dict.items()), protocol=self.warc_version)
         warc_headers.replace_header('WARC-Type', record_type)

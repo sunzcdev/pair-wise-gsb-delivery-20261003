@@ -1,3 +1,12 @@
+Unreleased
+~~~~~~~~~~
+
+- Add RecordBuilder.create_replaced_body_record() for replacing a record's
+  payload body with a new stream, rebuilding HTTP and WARC metadata
+  (lengths, digests, content-encoding) while preserving source URI, date
+  and record association
+
+
 1.8.2
 ~~~~~
 
