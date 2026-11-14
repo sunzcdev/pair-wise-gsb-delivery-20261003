@@ -361,6 +361,8 @@ def _parse_file_inplace(
     if use_json_parser:
         result["version"] = None
         feed_parser = JSONParser(baseuri, baselang, "utf-8")
+        feed_parser.resolve_relative_uris = resolve_relative_uris
+        feed_parser.sanitize_html = sanitize_html
         try:
             feed_parser.feed(stream_factory.get_file())
         except Exception as e:

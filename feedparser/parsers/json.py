@@ -29,6 +29,7 @@ import json
 
 from ..datetimes import _parse_date
 from ..sanitizer import sanitize_html
+from ..urls import resolve_relative_uris
 from ..util import FeedParserDict
 
 
@@ -55,6 +56,8 @@ class JSONParser:
         self.baseuri = baseuri or ""
         self.lang = baselang or None
         self.encoding = encoding or "utf-8"  # character encoding
+        self.resolve_relative_uris = False
+        self.sanitize_html = False
 
         self.version = None
         self.feeddata = FeedParserDict()
@@ -85,16 +88,26 @@ class JSONParser:
             if src in e:
                 entry[dst] = e[src]
 
+        # Content is exposed as a list of dicts, like RSS/Atom entries.
+        # Plain text is never treated as HTML: it is neither sanitized
+        # nor scanned for relative URIs. HTML content is processed
+        # according to the resolve_relative_uris and sanitize_html flags.
+        # When both representations are present, both are kept,
+        # with the text representation first.
+        content = []
         if "content_text" in e:
-            entry["content"] = c = FeedParserDict()
-            c["value"] = e["content_text"]
-            c["type"] = "text"
-        elif "content_html" in e:
-            entry["content"] = c = FeedParserDict()
-            c["value"] = sanitize_html(
-                e["content_html"], self.encoding, "application/json"
-            )
-            c["type"] = "html"
+            content.append(FeedParserDict(value=e["content_text"], type="text"))
+        if "content_html" in e:
+            value = e["content_html"]
+            if self.resolve_relative_uris:
+                value = resolve_relative_uris(
+                    value, self.baseuri, self.encoding, "text/html"
+                )
+            if self.sanitize_html:
+                value = sanitize_html(value, self.encoding, "text/html")
+            content.append(FeedParserDict(value=value, type="html"))
+        if content:
+            entry["content"] = content
 
         if "date_published" in e:
             entry["published"] = e["date_published"]
