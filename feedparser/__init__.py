@@ -49,6 +49,18 @@ SANITIZE_HTML = 1
 # (uses less memory), set this to 1.
 OPTIMISTIC_ENCODING_DETECTION = 1
 
+# If you want feedparser to preserve custom XML extension elements
+# (elements not consumed by the built-in namespace handlers) as ordered,
+# nested structures keyed by namespace URI and local name, set this to 1.
+PRESERVE_EXTENSIONS = 0
+
+# Limits that apply when extension preservation is enabled.
+# EXTENSION_MAX_DEPTH caps how deeply preserved extension elements may nest;
+# EXTENSION_MAX_TEXT_LENGTH caps the total amount of character data (in
+# characters) preserved across all extension elements in the feed.
+EXTENSION_MAX_DEPTH = 8
+EXTENSION_MAX_TEXT_LENGTH = 32768
+
 
 __all__ = (
     "parse",

@@ -8,6 +8,7 @@ Advanced Features
     html-sanitization
     content-normalization
     namespace-handling
+    extension-preservation
     resolving-relative-links
     version-detection
     character-encoding

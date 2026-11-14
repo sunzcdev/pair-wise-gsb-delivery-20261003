@@ -204,6 +204,29 @@ class XMLParserMixin(
         self.title_depth = -1
         self.depth = 0
         self.hasContent = 0
+
+        # Extension preservation state (only active when
+        # self.preserve_extensions is enabled by the API layer).
+        self.preserve_extensions = False
+        self.extension_max_depth = 8
+        self.extension_max_text_length = 32768
+        self.extension_diagnostics = []
+        # Stack of (node, context) pairs for extension elements being built.
+        self._extension_stack = []
+        # Namespace URI of the element currently being dispatched.
+        # The strict parser sets this before each start tag; it stays
+        # None in the loose parser, which resolves URIs from scoped
+        # prefix bindings instead.
+        self._extension_ns = None
+        self._extension_text_used = 0
+        # Non-zero while inside a handled element nested in an extension
+        # element, or inside an extension element skipped due to limits.
+        self._extension_suspend = 0
+        self._extension_skip = 0
+        # Per-element scoped prefix -> namespace URI bindings, used by
+        # the loose parser to resolve extension element namespaces.
+        self._prefix_uri_stack = []
+
         if self.lang:
             self.feeddata["language"] = self.lang.replace("_", "-")
 
@@ -221,6 +244,17 @@ class XMLParserMixin(
         raise NotImplementedError
 
     def unknown_starttag(self, tag, attrs):
+        # Track scoped namespace prefix bindings (used to resolve the
+        # namespace URIs of preserved extension elements in loose mode).
+        declared = {}
+        for attr_name, attr_value in attrs:
+            lower_name = attr_name.lower()
+            if lower_name == "xmlns":
+                declared[""] = attr_value
+            elif lower_name.startswith("xmlns:"):
+                declared[lower_name[6:]] = attr_value
+        self._prefix_uri_stack.append(declared)
+
         # increment depth counter
         self.depth += 1
 
@@ -282,6 +316,7 @@ class XMLParserMixin(
             prefix, suffix = tag.split(":", 1)
         else:
             prefix, suffix = "", tag
+        document_prefix = prefix
         prefix = self.namespacemap.get(prefix, prefix)
         if prefix:
             prefix = prefix + "_"
@@ -305,8 +340,14 @@ class XMLParserMixin(
         methodname = "_start_" + prefix + suffix
         try:
             method = getattr(self, methodname)
+            if self._extension_stack:
+                # A handled element nested inside an extension element;
+                # its text must not be attributed to the extension.
+                self._extension_suspend += 1
             return method(attrs_d)
         except AttributeError:
+            if self.preserve_extensions:
+                self._start_extension(suffix, document_prefix, attrs_d)
             # Since there's no handler or something has gone wrong we
             # explicitly add the element and its attributes.
             unknown_tag = prefix + suffix
@@ -335,9 +376,13 @@ class XMLParserMixin(
             if self.svgOK:
                 raise AttributeError()
             method = getattr(self, methodname)
+            if self._extension_suspend:
+                self._extension_suspend -= 1
             method()
         except AttributeError:
             self.pop(prefix + suffix)
+            if self.preserve_extensions:
+                self._end_extension(suffix)
 
         # track inline content
         if self.incontent and not self.contentparams.get("type", "xml").endswith("xml"):
@@ -360,10 +405,96 @@ class XMLParserMixin(
                 self.lang = self.langstack[-1]
 
         self.depth -= 1
+        if self._prefix_uri_stack:
+            self._prefix_uri_stack.pop()
+
+    def _resolve_document_prefix(self, prefix):
+        # Resolve a document prefix to a namespace URI using the scoped
+        # bindings tracked by the loose parser. Rebindings of the same
+        # prefix to a different URI are kept distinct by scoping.
+        for scope in reversed(self._prefix_uri_stack):
+            if prefix in scope:
+                return scope[prefix]
+        return ""
+
+    def _extension_diagnostic(self, message):
+        if message not in self.extension_diagnostics:
+            self.extension_diagnostics.append(message)
+
+    def _start_extension(self, name, document_prefix, attrs_d):
+        if self._extension_skip:
+            # Inside an extension element that was skipped due to limits.
+            self._extension_skip += 1
+            return
+        if len(self._extension_stack) >= self.extension_max_depth:
+            self._extension_skip = 1
+            self._extension_diagnostic(
+                "extension depth limit of %d exceeded; "
+                "deeper extension elements were not preserved"
+                % self.extension_max_depth
+            )
+            return
+        namespace = self._extension_ns
+        if namespace is None:
+            namespace = self._resolve_document_prefix(document_prefix)
+        node = FeedParserDict(
+            name=name,
+            namespace=namespace,
+            attributes=FeedParserDict(
+                (key, value)
+                for key, value in attrs_d.items()
+                if not key.startswith("xmlns")
+            ),
+            text="",
+            children=[],
+        )
+        self._extension_stack.append((node, self._get_context()))
+
+    def _end_extension(self, name):
+        if self._extension_skip:
+            self._extension_skip -= 1
+            return
+        if not self._extension_stack:
+            return
+        node, context = self._extension_stack[-1]
+        if node["name"] != name:
+            # Mismatched end tag (only possible in ill-formed feeds
+            # parsed by the loose parser); leave the stack alone.
+            return
+        self._extension_stack.pop()
+        if self._extension_stack:
+            # Repeated sibling elements accumulate in document order;
+            # later occurrences never overwrite earlier ones.
+            self._extension_stack[-1][0]["children"].append(node)
+        else:
+            context.setdefault("extensions", []).append(node)
+
+    def _capture_extension_text(self, text):
+        if not self._extension_stack or self._extension_skip:
+            return
+        if isinstance(text, bytes):
+            text = text.decode("utf-8", "replace")
+        remaining = self.extension_max_text_length - self._extension_text_used
+        if remaining <= 0:
+            self._extension_diagnostic(
+                "extension text limit of %d characters exceeded; "
+                "further extension text was not preserved"
+                % self.extension_max_text_length
+            )
+            return
+        if len(text) > remaining:
+            text = text[:remaining]
+            self._extension_diagnostic(
+                "extension text limit of %d characters exceeded; "
+                "further extension text was not preserved"
+                % self.extension_max_text_length
+            )
+        self._extension_stack[-1][0]["text"] += text
+        self._extension_text_used += len(text)
 
     def handle_charref(self, ref):
         # Called for each character reference, e.g. for '&#160;', ref is '160'
-        if not self.elementstack:
+        if not self.elementstack and not self._extension_stack:
             return
         ref = ref.lower()
         if ref in ("34", "38", "39", "60", "62", "x22", "x26", "x27", "x3c", "x3e"):
@@ -374,11 +505,14 @@ class XMLParserMixin(
             else:
                 c = int(ref)
             text = chr(c).encode("utf-8")
-        self.elementstack[-1][2].append(text)
+        if not self._extension_suspend:
+            self._capture_extension_text(text)
+        if self.elementstack:
+            self.elementstack[-1][2].append(text)
 
     def handle_entityref(self, ref):
         # Called for each entity reference, e.g. for '&copy;', ref is 'copy'
-        if not self.elementstack:
+        if not self.elementstack and not self._extension_stack:
             return
         if ref in ("lt", "gt", "quot", "amp", "apos"):
             text = "&%s;" % ref
@@ -393,11 +527,16 @@ class XMLParserMixin(
                 text = "&%s;" % ref
             else:
                 text = chr(html.entities.name2codepoint[ref]).encode("utf-8")
-        self.elementstack[-1][2].append(text)
+        if not self._extension_suspend:
+            self._capture_extension_text(text)
+        if self.elementstack:
+            self.elementstack[-1][2].append(text)
 
     def handle_data(self, text, escape=1):
         # Called for each block of plain text, i.e. outside of any tag and
         # not containing any character or entity references
+        if not self._extension_suspend:
+            self._capture_extension_text(text)
         if not self.elementstack:
             return
         if escape and self.contentparams.get("type") == "application/xhtml+xml":

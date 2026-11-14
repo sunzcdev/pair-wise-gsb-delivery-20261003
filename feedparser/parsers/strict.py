@@ -61,6 +61,11 @@ class StrictXMLParser:
             # match any backend.userland.com namespace
             namespace = "http://backend.userland.com/rss"
             lowernamespace = namespace
+        # Remember the element's namespace URI so that preserved extension
+        # elements are keyed by URI (never by prefix, which may be rebound
+        # to a different URI elsewhere in the document). This must be
+        # captured here because the loops below rebind `name`/`namespace`.
+        self._extension_ns = str(namespace or "")
         if qname and qname.find(":") > 0:
             givenprefix = qname.split(":")[0]
         else:

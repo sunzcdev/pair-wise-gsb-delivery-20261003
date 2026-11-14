@@ -154,6 +154,9 @@ def parse(
     resolve_relative_uris: bool | None = None,
     sanitize_html: bool | None = None,
     optimistic_encoding_detection: bool | None = None,
+    preserve_extensions: bool | None = None,
+    extension_max_depth: int | None = None,
+    extension_max_text_length: int | None = None,
 ) -> FeedParserDict:
     """Parse a feed from a URL, file, stream, or string.
 
@@ -188,6 +191,22 @@ def parse(
         (uses less memory, but the wrong encoding may be detected in rare cases).
         Defaults to the value of
         :data:`feedparser.OPTIMISTIC_ENCODING_DETECTION`, which is ``True``.
+    :param preserve_extensions:
+        Should feedparser preserve custom XML extension elements (elements
+        not consumed by the built-in namespace handlers) as ordered, nested
+        structures keyed by namespace URI and local name? Preserved elements
+        are stored in ``extensions`` lists on the feed and entry dictionaries.
+        Defaults to the value of
+        :data:`feedparser.PRESERVE_EXTENSIONS`, which is ``False``.
+    :param extension_max_depth:
+        Maximum nesting depth of preserved extension elements. Deeper
+        elements are skipped and a diagnostic is recorded. Defaults to the
+        value of :data:`feedparser.EXTENSION_MAX_DEPTH`, which is ``8``.
+    :param extension_max_text_length:
+        Maximum total number of characters of text preserved across all
+        extension elements in the feed. Further text is dropped and a
+        diagnostic is recorded. Defaults to the value of
+        :data:`feedparser.EXTENSION_MAX_TEXT_LENGTH`, which is ``32768``.
 
     """
 
@@ -230,6 +249,9 @@ def parse(
             resolve_relative_uris=resolve_relative_uris,
             sanitize_html=sanitize_html,
             optimistic_encoding_detection=optimistic_encoding_detection,
+            preserve_extensions=preserve_extensions,
+            extension_max_depth=extension_max_depth,
+            extension_max_text_length=extension_max_text_length,
         )
     finally:
         if not hasattr(url_file_stream_or_string, "read"):
@@ -246,6 +268,9 @@ def _parse_file_inplace(
     resolve_relative_uris: bool | None = None,
     sanitize_html: bool | None = None,
     optimistic_encoding_detection: bool | None = None,
+    preserve_extensions: bool | None = None,
+    extension_max_depth: int | None = None,
+    extension_max_text_length: int | None = None,
 ) -> None:
     # Avoid a cyclic import.
     import feedparser
@@ -256,6 +281,12 @@ def _parse_file_inplace(
         resolve_relative_uris = bool(feedparser.RESOLVE_RELATIVE_URIS)
     if optimistic_encoding_detection is None:
         optimistic_encoding_detection = bool(feedparser.OPTIMISTIC_ENCODING_DETECTION)
+    if preserve_extensions is None:
+        preserve_extensions = bool(feedparser.PRESERVE_EXTENSIONS)
+    if extension_max_depth is None:
+        extension_max_depth = feedparser.EXTENSION_MAX_DEPTH
+    if extension_max_text_length is None:
+        extension_max_text_length = feedparser.EXTENSION_MAX_TEXT_LENGTH
 
     stream_factory = convert_file_to_utf8(
         result["headers"], file, result, optimistic_encoding_detection
@@ -305,11 +336,20 @@ def _parse_file_inplace(
         feed_parser = StrictFeedParser(baseuri, baselang, "utf-8")
         feed_parser.resolve_relative_uris = resolve_relative_uris
         feed_parser.sanitize_html = sanitize_html
+        feed_parser.preserve_extensions = preserve_extensions
+        feed_parser.extension_max_depth = extension_max_depth
+        feed_parser.extension_max_text_length = extension_max_text_length
         saxparser = xml.sax.make_parser(PREFERRED_XML_PARSERS)
         saxparser.setFeature(xml.sax.handler.feature_namespaces, 1)
         try:
             # Disable downloading external doctype references, if possible.
             saxparser.setFeature(xml.sax.handler.feature_external_ges, 0)
+        except xml.sax.SAXNotSupportedException:
+            pass
+        try:
+            # Disable loading external parameter entities as well, so that
+            # extension preservation can never trigger external entity reads.
+            saxparser.setFeature(xml.sax.handler.feature_external_pes, 0)
         except xml.sax.SAXNotSupportedException:
             pass
         saxparser.setContentHandler(feed_parser)
@@ -336,6 +376,9 @@ def _parse_file_inplace(
         feed_parser = LooseFeedParser(baseuri, baselang, "utf-8", entities)
         feed_parser.resolve_relative_uris = resolve_relative_uris
         feed_parser.sanitize_html = sanitize_html
+        feed_parser.preserve_extensions = preserve_extensions
+        feed_parser.extension_max_depth = extension_max_depth
+        feed_parser.extension_max_text_length = extension_max_text_length
 
         # If an encoding was detected, use it; otherwise, assume utf-8 and do your best.
         # Will raise io.UnsupportedOperation if the underlying file is not seekable.
@@ -370,6 +413,8 @@ def _parse_file_inplace(
     result["feed"] = feed_parser.feeddata
     result["entries"] = feed_parser.entries
     result["version"] = result["version"] or feed_parser.version
+    if preserve_extensions and not isinstance(feed_parser, JSONParser):
+        result["extension_diagnostics"] = feed_parser.extension_diagnostics
     if isinstance(feed_parser, JSONParser):
         result["namespaces"] = {}
     else:

@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="utf-8"?>
+<rss version="2.0" xmlns:x="http://example.com/x">
+  <channel>
+    <title>Extension preservation sample</title>
+    <link>http://example.com/</link>
+    <description>Demonstrates preservation of custom XML extensions.</description>
+    <x:rating scheme="stars">4</x:rating>
+    <item>
+      <title>Item 1</title>
+      <link>http://example.com/1</link>
+      <x:meta>
+        <x:tag>alpha</x:tag>
+        <x:tag>beta</x:tag>
+        <x:note xmlns:x="http://example.com/other">rebound prefix</x:note>
+      </x:meta>
+    </item>
+  </channel>
+</rss>
