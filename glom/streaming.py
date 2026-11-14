@@ -21,8 +21,37 @@ except ImportError:
 from boltons.iterutils import split_iter, chunked_iter, windowed_iter, unique_iter, first
 from boltons.funcutils import FunctionBuilder
 
-from .core import glom, T, STOP, SKIP, _MISSING, Path, TargetRegistry, Call, Spec, Pipe, S, bbrepr, format_invocation
+from .core import (glom, T, STOP, SKIP, _MISSING, Path, TargetRegistry, Call,
+                   Spec, Pipe, S, GlomError, MODE, MIN_MODE, CHILD_ERRORS, UP,
+                   bbrepr, format_invocation)
 from .matching import Check
+
+
+def _iter_scope(scope):
+    """Build a private scope for a single lazy iterator.
+
+    ``Iter()`` results are generators which may outlive the glom call
+    that built them and be consumed interleaved with sibling iterators.
+    Mutating the shared parent scope (notably ``scope[Path]``) would let
+    one iterator's current position and local bindings leak into another.
+
+    A fresh child map gives each iterator its own Path and any scope
+    assignments made during iteration, while the parent chain keeps
+    intentionally shared objects (the target registry, ``S`` globals,
+    user-provided scope values) at their original reference identity --
+    nothing here deep-copies the target or any scope values.
+    """
+    iter_scope = scope.new_child({Path: list(scope[Path]),
+                                  MODE: scope[MODE],
+                                  MIN_MODE: scope[MIN_MODE],
+                                  CHILD_ERRORS: []})
+    # mirror the bookkeeping keys _glom() puts on a child scope so
+    # lazy errors can be finalized into a full target-spec trace
+    iter_scope[T] = scope[T]
+    iter_scope[Spec] = scope[Spec]
+    iter_scope[UP] = scope
+    return iter_scope
+
 
 class Iter:
     """``Iter()`` is glom's counterpart to Python's built-in :func:`iter()`
@@ -83,14 +112,25 @@ class Iter:
         return ''.join(chunks)
 
     def glomit(self, target, scope):
-        iterator = self._iterate(target, scope)
+        # Each lazy result gets its own scope so interleaved
+        # consumption of multiple Iter results cannot share Path
+        # position or per-iteration scope bindings.
+        iter_scope = _iter_scope(scope)
+        iterator = self._iterate(target, iter_scope)
 
         for _, _, callback in reversed(self._iter_stack):
-            iterator = callback(iterator, scope)
+            iterator = callback(iterator, iter_scope)
 
         return iter(iterator)
 
     def _iterate(self, target, scope):
+        base_path = list(scope[Path])
+        return self._gen(target, scope, base_path)
+
+    def _gen(self, target, scope, base_path):
+        # Everything in this generator is deferred until the first
+        # next(), including looking up the iterate handler, so that
+        # merely building the Iter result never touches the target.
         iterate = scope[TargetRegistry].get_handler('iterate', target, path=scope[Path])
         try:
             iterator = iterate(target)
@@ -98,18 +138,39 @@ class Iter:
             raise TypeError('failed to iterate on instance of type %r at %r (got %r)'
                             % (target.__class__.__name__, Path(*scope[Path]), e))
 
-        base_path = scope[Path]
-        for i, t in enumerate(iterator):
-            scope[Path] = base_path + [i]
-            yld = (t if self.subspec is T else scope[glom](t, self.subspec, scope))
-            if yld is SKIP:
-                continue
-            elif yld is self.sentinel or yld is STOP:
-                # NB: sentinel defaults to STOP so I was torn whether
-                # to also check for STOP, and landed on the side of
-                # never letting STOP through.
-                return
-            yield yld
+        try:
+            for i, t in enumerate(iterator):
+                # Write into this iterator's own scope map so a paused
+                # and later-resumed iterator always sees its own path,
+                # even when an outer or sibling iterator has advanced.
+                scope[Path] = base_path + [i]
+                yld = (t if self.subspec is T else scope[glom](t, self.subspec, scope))
+                if yld is SKIP:
+                    continue
+                elif yld is self.sentinel or yld is STOP:
+                    # NB: sentinel defaults to STOP so I was torn whether
+                    # to also check for STOP, and landed on the side of
+                    # never letting STOP through.
+                    return
+                yield yld
+        except Exception as raised:
+            # Lazy iteration happens outside the top-level glom() call
+            # which normally finalizes errors. Attach the target-spec
+            # trace here so the path includes the owning outer element
+            # when this Iter is nested inside another.
+            e = raised
+            if not isinstance(e, GlomError):
+                e = GlomError.wrap(e)
+                if not isinstance(e, GlomError):
+                    raise  # wrapping failed, fall back to default behavior
+            if getattr(e, '_scope', None) is None:
+                # PathAccessError and friends are not wrapped errors,
+                # so GlomError.__str__ would look for a nonexistent
+                # __wrapped; point it at the error itself.
+                e._finalize(scope)
+                if not hasattr(e, '_GlomError__wrapped'):
+                    setattr(e, '_GlomError__wrapped', e)
+            raise e
         return
 
     def _add_op(self, opname, args, callback):
