@@ -1408,3 +1408,30 @@ def test_namespace_respected():
     }
 
     fastavro.parse_schema(schema)
+
+
+def test_load_schema_with_cross_file_cycle(tmp_path):
+    """Recursive references that form a cycle across schema files (A refers to
+    B and B refers back to A) should load successfully"""
+    import json
+
+    schema_a = {
+        "type": "record",
+        "name": "A",
+        "fields": [{"name": "b", "type": "B"}],
+    }
+    schema_b = {
+        "type": "record",
+        "name": "B",
+        "fields": [{"name": "a", "type": "A"}],
+    }
+    for name, schema in (("A", schema_a), ("B", schema_b)):
+        with open(tmp_path / f"{name}.avsc", "w") as schema_file:
+            json.dump(schema, schema_file)
+
+    parsed = fastavro.schema.load_schema(str(tmp_path / "A.avsc"))
+
+    assert parsed["name"] == "A"
+    field_b = parsed["fields"][0]["type"]
+    assert field_b["name"] == "B"
+    assert field_b["fields"][0]["type"] == "A"

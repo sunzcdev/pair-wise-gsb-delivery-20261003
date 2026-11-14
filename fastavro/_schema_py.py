@@ -724,7 +724,6 @@ def _parse_schema_with_repo(
     injected_schemas,
 ):
     try:
-        schema_copy = deepcopy(named_schemas)
         return parse_schema(
             schema,
             named_schemas=named_schemas,
@@ -732,6 +731,12 @@ def _parse_schema_with_repo(
         )
     except UnknownType as error:
         missing_subject = error.name
+        # Take the snapshot of the named schemas after the failed parse so
+        # that any partially registered named schemas (like the schema being
+        # parsed itself) are visible. This is required to support recursive
+        # references that form a cycle across schemas (A refers to B and B
+        # refers back to A)
+        schema_copy = deepcopy(named_schemas)
         try:
             sub_schema = _load_schema(
                 missing_subject,

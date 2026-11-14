@@ -6,3 +6,4 @@ fastavro.repository
    :maxdepth: 1
 
    base
+   packaged
