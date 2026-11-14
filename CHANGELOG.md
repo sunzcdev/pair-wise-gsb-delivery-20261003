@@ -3,6 +3,15 @@ Changelog
 
 ## Master
 
+* Add an independent per-task context mapping (`Task.context`) for metadata
+  such as source identifiers, collection batches and trace ids. The mapping
+  is kept separate from the task's business args/kwargs, is inherited (by
+  copy) by pipeline children, error handlers and chord callbacks, is
+  preserved across retries and serialization, and is validated for
+  serializability before the task is enqueued (`SerializationError` raised
+  otherwise). `Task.get_context(*keys)` allows callers to select specific
+  fields for logging.
+
 [View commits](https://github.com/coleifer/huey/compare/3.5.4...master)
 
 ## 3.5.4

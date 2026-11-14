@@ -22,6 +22,7 @@ from huey.exceptions import RateLimitExceeded
 from huey.exceptions import RETRYING_EXCEPTIONS
 from huey.exceptions import ResultTimeout
 from huey.exceptions import RetryTask
+from huey.exceptions import SerializationError
 from huey.exceptions import TaskException
 from huey.exceptions import TaskLockedException
 from huey.exceptions import TaskTimeout
@@ -311,6 +312,9 @@ class Huey(object):
         if task.expires:
             task.resolve_expires(self.utc)
 
+        # Reject non-serializable context values before anything is stored.
+        self._validate_context(task)
+
         self._emit(S.SIGNAL_ENQUEUED, task)
 
         if self._immediate:
@@ -324,9 +328,50 @@ class Huey(object):
         results = self._pipeline_results(task)
         return ResultGroup(results) if len(results) > 1 else results[0]
 
+    def _validate_context(self, task):
+        # Verify that every context mapping that will be serialized as part
+        # of this message (the task, its pipeline, error handlers and any
+        # chord callback) contains only serializable values. Raises
+        # SerializationError before the task is stored, so a bad context
+        # value never makes it into the queue.
+        seen = set()
+        stack = [task]
+        while stack:
+            node = stack.pop()
+            if node is None or id(node) in seen:
+                continue
+            seen.add(id(node))
+            if node.context:
+                try:
+                    self.serializer.serialize(node.context)
+                except Exception as exc:
+                    raise SerializationError(
+                        'Task %s context contains a value that cannot be '
+                        'serialized: %s' % (node.id, exc))
+            stack.append(node.on_complete)
+            stack.append(node.on_error)
+            if node.chord_config is not None:
+                stack.append(node.chord_config.callback)
+
     def _enqueue_chord(self, chord_obj):
         cid = str(uuid.uuid4())
         size = len(chord_obj.tasks)
+
+        # The chord callback inherits the merged context of its members:
+        # members are merged in order (later members' keys override earlier
+        # ones), and keys explicitly set on the callback itself always take
+        # precedence. The merge produces a new mapping, so neither the
+        # members' nor any sibling branch's context is modified.
+        merged = {}
+        for member in chord_obj.tasks:
+            member_ctx = getattr(member, 'context', None)
+            if member_ctx is None and isinstance(member, chord):
+                member_ctx = member.callback.context
+            if member_ctx:
+                merged.update(member_ctx)
+        if merged:
+            chord_obj.callback.inherit_context(merged)
+
         results = []
         for i, task in enumerate(chord_obj.tasks):
             if isinstance(task, group):
@@ -515,6 +560,9 @@ class Huey(object):
             self._run_post_execute(task, task_value, exception)
             self._emit(S.SIGNAL_COMPLETE, task)
             if task.on_complete:
+                # The next task in the pipeline inherits a copy of this
+                # task's context; its own keys take precedence.
+                task.on_complete.inherit_context(task.context)
                 task.on_complete.extend_data(task_value)
                 self.enqueue(task.on_complete)
             if task.chord_config is not None:
@@ -531,8 +579,10 @@ class Huey(object):
                     next_task = next_task.on_complete if final else None
             self._run_post_execute(task, task_value, exception)
             if surface and task.on_error:
-                # Copy, as on_error is shared across retries.
+                # Copy, as on_error is shared across retries. The handler
+                # inherits a copy of the failed task's context.
                 handler = copy.copy(task.on_error)
+                handler.inherit_context(task.context)
                 handler.extend_data(exception)
                 self.enqueue(handler)
             if final:
@@ -803,7 +853,8 @@ class Task(object):
     def __init__(self, args=None, kwargs=None, id=None, eta=None, retries=None,
                  retry_delay=None, priority=None, expires=None,
                  on_complete=None, on_error=None, expires_resolved=None,
-                 timeout=None, chord_config=None, retry_backoff=None):
+                 timeout=None, chord_config=None, retry_backoff=None,
+                 context=None):
         self.name = type(self).__name__
         self.args = () if args is None else args
         self.kwargs = {} if kwargs is None else kwargs
@@ -822,6 +873,12 @@ class Task(object):
         self.timeout = timeout if timeout is not None else self.default_timeout
         self.chord_config = chord_config
         self._deadline = None
+
+        # Independent context mapping (e.g. source identifiers, collection
+        # batch ids, trace ids). This is carried alongside the task rather
+        # than being mixed into the business kwargs. The mapping is copied
+        # so the caller's dict is never shared with (or mutated by) the task.
+        self.context = dict(context) if context else {}
 
         self.on_complete = on_complete
         self.on_error = on_error
@@ -877,6 +934,35 @@ class Task(object):
     def check_timeout(self):
         if self.is_timed_out:
             raise TaskTimeout('timeout %ss' % self.timeout)
+
+    def inherit_context(self, context):
+        """
+        Merge an inherited context mapping (from a parent task in a pipeline,
+        a failed task's error handler, or a chord's members) into this task's
+        context.
+
+        Keys explicitly set on this task take precedence over inherited ones.
+        The inherited mapping is always copied, so the parent's (or any
+        sibling's) context is never modified, and subsequent changes to this
+        task's context do not leak back into them.
+        """
+        if context:
+            merged = dict(context)
+            merged.update(self.context)
+            self.context = merged
+        return self.context
+
+    def get_context(self, *keys):
+        """
+        Return a copy of the task's context mapping, optionally restricted to
+        the given keys. This is the supported way to include context in log
+        output: the caller explicitly selects the fields to log rather than
+        dumping the entire mapping. The returned dict is a copy, so mutating
+        it does not affect the task.
+        """
+        if not keys:
+            return dict(self.context)
+        return dict((k, self.context[k]) for k in keys if k in self.context)
 
     def extend_data(self, data):
         if data is None or data == ():
@@ -970,13 +1056,12 @@ class TaskWrapper(object):
 
         def execute(self):
             args, kwargs = self.data
-            if self.context:
+            if context:
                 # Copy, so a retry doesn't serialize the task into its kwargs.
                 kwargs = dict(kwargs, task=self)
             return func(*args, **kwargs)
 
         attrs = {
-            'context': context,
             'execute': execute,
             '__module__': func.__module__,
             '__doc__': func.__doc__}
@@ -998,7 +1083,8 @@ class TaskWrapper(object):
 
     def schedule(self, args=None, kwargs=None, eta=None, delay=None,
                  priority=None, retries=None, retry_delay=None,
-                 retry_backoff=None, expires=None, timeout=None, id=None):
+                 retry_backoff=None, expires=None, timeout=None, id=None,
+                 context=None):
         if eta is None and delay is None:
             if isinstance(args, (int, float)):
                 delay = args
@@ -1024,7 +1110,8 @@ class TaskWrapper(object):
             retry_backoff=retry_backoff,
             priority=priority,
             expires=expires,
-            timeout=timeout)
+            timeout=timeout,
+            context=context)
         return self.huey.enqueue(task)
 
     def _apply(self, it):
@@ -1057,7 +1144,8 @@ class TaskWrapper(object):
                                retry_backoff=kwargs.pop('retry_backoff', None),
                                priority=kwargs.pop('priority', None),
                                expires=kwargs.pop('expires', None),
-                               timeout=kwargs.pop('timeout', None))
+                               timeout=kwargs.pop('timeout', None),
+                               context=kwargs.pop('context', None))
 
 
 class TaskLock(object):
@@ -1298,7 +1386,8 @@ class Result(object):
             timeout=self.task.timeout,
             chord_config=self.task.chord_config,
             on_complete=on_complete,
-            on_error=on_error)
+            on_error=on_error,
+            context=self.task.context or None)
         return self.huey.enqueue(task)
 
     def reset(self):

@@ -1465,6 +1465,73 @@ For more information, see the following API docs:
 * :py:class:`ResultGroup` and :py:class:`ChordResult`
 
 
+Task context
+------------
+
+Metadata that describes *where a task came from* -- a source identifier, a
+collection batch, a trace id, and so on -- usually should not be passed
+through the task's business arguments. Tasks carry an independent *context
+mapping* for this purpose, exposed as :py:attr:`Task.context`:
+
+.. code-block:: python
+
+    @huey.task()
+    def process_record(record_id):
+        ...
+
+    # The context travels alongside the task; the business arguments
+    # (args/kwargs) are left untouched.
+    process_record.s(42, context={'source': 'webhook', 'batch': 'b-101',
+                                  'trace_id': '4f9c2...'})
+
+The mapping is copied when the task is created, so later changes to the
+caller's dictionary do not affect the task (and vice-versa). Context values
+must be serializable: if any value cannot be serialized, a
+:py:class:`SerializationError` is raised *before* the task is placed on the
+queue, and nothing is stored.
+
+Context inheritance
+^^^^^^^^^^^^^^^^^^^
+
+Context propagates along the execution graph according to explicit rules:
+
+* **Pipelines** -- when a task finishes, the next task in the pipeline
+  (``on_complete``) inherits a *copy* of its context.
+* **Error handlers** -- an ``on_error`` handler inherits a copy of the failed
+  task's context.
+* **Retries** -- a retried task keeps its context unchanged.
+* **Chord callbacks** -- the callback inherits the merged context of all
+  chord members (members are merged in order, so a later member's keys
+  override an earlier member's).
+
+In every case, keys set explicitly on the receiving task take precedence over
+inherited ones, and inheritance always produces a new mapping: a subtask's
+explicit overrides affect only its own branch and never modify the parent's
+or any sibling's context.
+
+Reading context
+^^^^^^^^^^^^^^^
+
+Pre-/post-execute hooks and signal handlers receive the task instance, so
+they can read ``task.context`` directly:
+
+.. code-block:: python
+
+    import logging
+    logger = logging.getLogger('myapp.tasks')
+
+    @huey.post_execute()
+    def log_task_completion(task, task_value, exception):
+        # Select exactly the fields to log - huey never dumps the whole
+        # mapping into its own log output.
+        logger.info('task finished', extra=task.get_context('source',
+                                                            'trace_id'))
+
+:py:meth:`Task.get_context` returns a copy of the mapping, optionally
+restricted to the given keys, so the caller chooses which fields end up in
+log output.
+
+
 Signals
 -------
 

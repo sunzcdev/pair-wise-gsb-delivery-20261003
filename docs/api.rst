@@ -1187,7 +1187,7 @@ Huey object
         directly. The :py:meth:`Huey.task` and :py:meth:`Huey.periodic_task`
         decorators will create the appropriate TaskWrapper automatically.
 
-    .. py:method:: schedule(args=None, kwargs=None, eta=None, delay=None, priority=None, retries=None, retry_delay=None, retry_backoff=None, expires=None, timeout=None, id=None)
+    .. py:method:: schedule(args=None, kwargs=None, eta=None, delay=None, priority=None, retries=None, retry_delay=None, retry_backoff=None, expires=None, timeout=None, id=None, context=None)
 
         :param tuple args: arguments for decorated function.
         :param dict kwargs: keyword arguments for decorated function.
@@ -1212,6 +1212,8 @@ Huey object
             cooperative timeout checking. See :ref:`cooperative-timeout` for
             example.
         :param id: assign the given ``id`` to the Task being scheduled.
+        :param dict context: independent context mapping (e.g. source
+            identifiers, batch ids, trace ids) carried alongside the task.
         :returns: a :py:class:`Result` handle for the task.
 
         Use the ``schedule`` method to schedule the execution of the queue task
@@ -1301,6 +1303,10 @@ Huey object
             ``gevent.Timeout``. When using with threads it is necessary to use
             cooperative timeout checking. See :ref:`cooperative-timeout` for
             example.
+        :param dict context: independent context mapping (e.g. source
+            identifiers, batch ids, trace ids) carried alongside the task.
+            Stored separately from the business ``args``/``kwargs`` and must
+            contain only serializable values.
         :returns: a :py:class:`Task` instance representing the execution of the
             task function with the given arguments.
 
@@ -1313,7 +1319,8 @@ Huey object
             The following keyword argument names are reserved and will be
             intercepted by Huey rather than passed to your task function:
             ``id``, ``eta``, ``delay``, ``retries``, ``retry_delay``,
-            ``retry_backoff``, ``priority``, ``expires``, and ``timeout``. If your task function has a parameter
+            ``retry_backoff``, ``priority``, ``expires``, ``timeout``, and
+            ``context``. If your task function has a parameter
             with one of these names, rename the parameter or pass the value
             positionally.
 
@@ -1393,7 +1400,7 @@ Huey object
 
 
 
-.. py:class:: Task(args=None, kwargs=None, id=None, eta=None, retries=None, retry_delay=None, priority=None, expires=None, on_complete=None, on_error=None, expires_resolved=None, timeout=None, chord_config=None, retry_backoff=None)
+.. py:class:: Task(args=None, kwargs=None, id=None, eta=None, retries=None, retry_delay=None, priority=None, expires=None, on_complete=None, on_error=None, expires_resolved=None, timeout=None, chord_config=None, retry_backoff=None, context=None)
 
     :param tuple args: arguments for the function call.
     :param dict kwargs: keyword arguments for the function call.
@@ -1421,6 +1428,10 @@ Huey object
     :param datetime expires_resolved: absolute expiration time, set by huey
         from ``expires`` when the task is enqueued.
     :param chord_config: set by huey on members of a :py:class:`chord`.
+    :param dict context: independent context mapping (e.g. source identifiers,
+        batch ids, trace ids) carried alongside the task. The mapping is
+        copied, is kept separate from the business ``args``/``kwargs``, and
+        must contain only serializable values.
 
     The ``Task`` class represents the execution of a function. Instances of the
     task are serialized and enqueued for execution by the consumer, which
@@ -1447,8 +1458,38 @@ Huey object
         ret = huey.enqueue(task_instance)  # Enqueue the queue task.
         print(ret.get(blocking=True))  # "3".
 
-    .. py:attribute:: is_timed_out
+    .. py:attribute:: context
 
+        A ``dict`` of contextual metadata (source identifiers, batch ids,
+        trace ids, etc.) carried alongside the task, kept separate from the
+        business ``args``/``kwargs``. The mapping is serialized with the task
+        and is inherited by pipeline children, error handlers and chord
+        callbacks according to the rules described in the guide. Values must
+        be serializable; otherwise enqueuing the task raises
+        :py:class:`SerializationError`.
+
+    .. py:method:: inherit_context(context)
+
+        :param dict context: context mapping inherited from a parent task,
+            failed task, or chord members.
+
+        Merge an inherited context mapping into this task's context. Keys
+        explicitly set on this task take precedence. The inherited mapping is
+        copied, so neither the parent's nor any sibling's context is
+        modified. Called automatically by huey when propagating context
+        through pipelines, error handlers and chords.
+
+    .. py:method:: get_context(*keys)
+
+        :param keys: optional keys to restrict the result to.
+        :returns: a copy of the task's context mapping.
+
+        Return a copy of the task's context, optionally restricted to the
+        given keys. This is the supported way to include context in log
+        output: the caller explicitly selects which fields to log rather
+        than dumping the entire mapping.
+
+    .. py:attribute:: is_timed_out
         If task was configured with a ``timeout``, returns True if the task has
         exceeded the timeout. The task timer starts when the task begins to
         execute (after any pre-execute hooks are fired).
@@ -2279,6 +2320,12 @@ Exceptions
 .. py:class:: ConfigurationError
 
     Raised when Huey encounters a configuration problem.
+
+.. py:class:: SerializationError
+
+    Raised when a task's context mapping contains a value that cannot be
+    serialized. Raised before the task is placed on the queue, so nothing
+    is stored.
 
 .. py:class:: TaskLockedException
 
