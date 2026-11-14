@@ -469,6 +469,13 @@ def test_all_public_errors():
     err_types = [t for t in
                  [getattr(glom, name) for name in dir(glom)]
                  if isinstance(t, type) and issubclass(t, Exception)]
+    # spec JSON encode/decode errors are raised outside glom() processing
+    # and carry in-spec paths rather than target/spec traces; they have
+    # their own coverage in test_spec_json.py.
+    from glom import spec_json
+    spec_json_err_types = (spec_json.SpecJSONError, spec_json.SpecEncodeError,
+                           spec_json.SpecDecodeError)
+    err_types = [t for t in err_types if not issubclass(t, spec_json.SpecJSONError)]
     non_glomerrors = [t for t in err_types if not issubclass(t, glom.GlomError)]
     assert not non_glomerrors, "expected all public exception types to subclass GlomError"
 

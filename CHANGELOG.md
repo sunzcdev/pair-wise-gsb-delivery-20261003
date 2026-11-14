@@ -12,6 +12,16 @@ The glom team's approach to updates can be summed up as:
 Check this page when upgrading, we strive to keep the updates
 summarized and well-linked.
 
+## Unreleased
+
+- Add `glom.spec_json`: a versioned, JSON-serializable subset of glom
+  specs (literals, paths, object/list projections, `Coalesce` defaults,
+  and type checks) with `encode_spec`/`dumps_spec`/`dump_spec` and
+  `load_spec`/`loads_spec`/`load_spec_file`. Unsupported specs report an
+  in-spec path on export; loading rejects unknown versions, unknown
+  operations, and duplicate fields, without `eval`, dynamic imports, or
+  `pickle`.
+
 ## 25.12.0
 
 _(December 28, 2025)_

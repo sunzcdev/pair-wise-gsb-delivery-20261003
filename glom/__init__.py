@@ -49,3 +49,17 @@ from glom.mutation import Assign, Delete, assign, delete, PathDeleteError
 from glom.streaming import Iter
 
 from glom._version import __version__
+
+from glom.spec_json import (SPEC_JSON_VERSION,
+                            TYPE_REGISTRY,
+                            register_spec_type,
+                            encode_spec,
+                            dumps_spec,
+                            dump_spec,
+                            load_spec,
+                            loads_spec,
+                            load_spec_file,
+                            render_spec_path,
+                            SpecJSONError,
+                            SpecEncodeError,
+                            SpecDecodeError)
