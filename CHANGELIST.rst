@@ -1,3 +1,12 @@
+Unreleased
+~~~~~~~~~~
+
+- Add resumable indexing: ``warcio index --checkpoint <file>`` persists an
+  exportable resume position (source file identity, physical offset of the
+  next record, and format info) after each fully consumed and written record,
+  and resumes from it on the next run. Resume is refused (``ResumeError``)
+  if the source file was replaced or truncated, or the input is not seekable.
+
 1.8.2
 ~~~~~
 

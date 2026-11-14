@@ -33,6 +33,11 @@ def main(args=None):
                  '(arbitrary http header), and "{warc-header}" (arbitrary warc '
                  'record header)')
     index.add_argument('-o', '--output', help='output file; default is stdout')
+    index.add_argument('--checkpoint',
+                       help='checkpoint file used to make indexing resumable; '
+                            'the resume position is persisted after each record '
+                            'and, if the file already exists, indexing resumes '
+                            'from the last recorded position')
     index.set_defaults(func=indexer)
 
     recompress = subparsers.add_parser('recompress', help='Recompress an existing WARC or ARC',
@@ -70,7 +75,8 @@ def get_version():
 # ============================================================================
 def indexer(cmd):
     inputs = cmd.inputs or ('-',)  # default to stdin
-    _indexer = Indexer(cmd.fields, inputs, cmd.output)
+    _indexer = Indexer(cmd.fields, inputs, cmd.output,
+                       checkpoint=cmd.checkpoint)
     _indexer.process_all()
 
 
