@@ -3,6 +3,7 @@
 
 - Replace unmaintained brotlipy with brotlicffi>=1.2.1.0 by @ato https://github.com/webrecorder/warcio/pull/211
 - Add Content-Encoding: x-gzip as an alias for gzip by @sammist2 in https://github.com/webrecorder/warcio/pull/210
+- Add MemberPreservingExtractor (warcio.memberextract): filter records by metadata and copy the original gzip members of selected records verbatim, avoiding a decompress/recompress round trip for chunked (one-record-per-member) gzip input; uncompressed input uses the regular read path, and non-chunked gzip input is rejected unless explicit fallback is enabled
 
 1.8.1
 ~~~~~
