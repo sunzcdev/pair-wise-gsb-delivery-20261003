@@ -29,6 +29,7 @@ import json
 
 from ..datetimes import _parse_date
 from ..sanitizer import sanitize_html
+from ..urls import _urljoin, make_uri_detail
 from ..util import FeedParserDict
 
 
@@ -111,6 +112,9 @@ class JSONParser:
 
         if "attachments" in e:
             entry["enclosures"] = [self.parse_attachment(a) for a in e["attachments"]]
+            entry["enclosure_details"] = [
+                self.parse_attachment_detail(a) for a in e["attachments"]
+            ]
 
         return entry
 
@@ -125,11 +129,24 @@ class JSONParser:
             else:
                 detail["href"] = parent["url"]
 
-    @staticmethod
-    def parse_attachment(attachment):
+    def parse_attachment(self, attachment):
         enc = FeedParserDict()
-        enc["href"] = attachment["url"]
+        enc["href"] = self.resolve_attachment_uri(attachment.get("url"))
         enc["type"] = attachment["mime_type"]
         if "size_in_bytes" in attachment:
             enc["length"] = attachment["size_in_bytes"]
         return enc
+
+    def parse_attachment_detail(self, attachment):
+        return FeedParserDict(
+            make_uri_detail(
+                self.baseuri,
+                attachment.get("url"),
+                self.resolve_attachment_uri(attachment.get("url")),
+            )
+        )
+
+    def resolve_attachment_uri(self, uri):
+        if uri is None:
+            return ""
+        return _urljoin(self.baseuri, uri)

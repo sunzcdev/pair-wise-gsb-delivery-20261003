@@ -29,7 +29,7 @@
 import copy
 
 from ..datetimes import _parse_date
-from ..urls import make_safe_absolute_uri
+from ..urls import make_safe_absolute_uri, make_uri_detail
 from ..util import FeedParserDict
 
 
@@ -358,9 +358,13 @@ class Namespace:
         else:
             attrs_d.setdefault("type", "text/html")
         context = self._get_context()
+        baseuri = self.baseuri
         attrs_d = self._enforce_href(attrs_d)
+        source_href = attrs_d.get("href")
+        resolved_href = ""
         if "href" in attrs_d:
             attrs_d["href"] = self.resolve_uri(attrs_d["href"])
+            resolved_href = attrs_d["href"]
         if (
             attrs_d.get("rel") == "alternate"
             and self.map_content_type(attrs_d.get("type")) in self.html_types
@@ -370,6 +374,12 @@ class Namespace:
         context.setdefault("links", [])
         if not (self.inentry and self.inimage):
             context["links"].append(FeedParserDict(attrs_d))
+            if attrs_d.get("rel") == "enclosure":
+                context.setdefault("enclosure_details", []).append(
+                    FeedParserDict(
+                        make_uri_detail(baseuri, source_href, resolved_href)
+                    )
+                )
         if "href" in attrs_d:
             if self.isentrylink:
                 context["link"] = attrs_d["href"]
@@ -482,10 +492,19 @@ class Namespace:
         self._summaryKey = None
 
     def _start_enclosure(self, attrs_d):
-        attrs_d = self._enforce_href(attrs_d)
         context = self._get_context()
+        baseuri = self.baseuri
+        attrs_d = self._enforce_href(attrs_d)
+        source_href = attrs_d.get("href", attrs_d.get("url", attrs_d.get("uri")))
+        resolved_href = None
+        if "href" in attrs_d:
+            attrs_d["href"] = self.resolve_uri(attrs_d["href"])
+            resolved_href = attrs_d["href"]
         attrs_d["rel"] = "enclosure"
         context.setdefault("links", []).append(FeedParserDict(attrs_d))
+        context.setdefault("enclosure_details", []).append(
+            FeedParserDict(make_uri_detail(baseuri, source_href, resolved_href))
+        )
 
     def _start_source(self, attrs_d):
         if "url" in attrs_d:

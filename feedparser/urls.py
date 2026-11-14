@@ -116,6 +116,18 @@ def make_safe_absolute_uri(base, rel=None):
     return uri
 
 
+def make_uri_detail(base, uri, resolved=None):
+    """Record the source value, effective base, and resolved value of a URI."""
+
+    if resolved is None:
+        resolved = _urljoin(base or "", uri) if uri is not None else ""
+    return {
+        "value": uri,
+        "base": base or "",
+        "href": resolved,
+    }
+
+
 class RelativeURIResolver(BaseHTMLProcessor):
     relative_uris = {
         ("a", "href"),

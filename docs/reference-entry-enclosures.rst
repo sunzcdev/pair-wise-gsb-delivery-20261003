@@ -18,6 +18,7 @@ as a list.
 
 - /atom10:feed/atom10:entry/atom10:link[@rel="enclosure"]
 - /rss/channel/item/enclosure
+- /json/items/attachments
 
 
 .. _reference.entry.enclosures.href:
@@ -29,6 +30,49 @@ The :abbr:`URL (Uniform Resource Locator)` of the linked file.
 
 If this is a relative :abbr:`URI (Uniform Resource Identifier)`, it is
 :ref:`resolved according to a set of rules <advanced.base>`.
+
+
+.. _reference.entry.enclosure_details:
+
+``entries[i].enclosure_details``
+----------------------------------------
+
+A list of URI details for the attachments.  This list is parallel to
+``entries[i].enclosures``, so ``enclosure_details[j]`` describes
+``enclosures[j]``.  The existing ``enclosures`` structure is unchanged.
+
+The details are always present for RSS enclosures, Atom enclosure links, and
+JSON Feed attachments, including when relative URI resolution is disabled.
+
+
+.. _reference.entry.enclosure_details.value:
+
+``entries[i].enclosure_details[j].value``
+--------------------------------------------------
+
+The value of the attachment URI exactly as it appeared in the source feed.
+An absent URI is represented by ``None``; an explicitly empty URI is ``""``.
+
+
+.. _reference.entry.enclosure_details.base:
+
+``entries[i].enclosure_details[j].base``
+-------------------------------------------------
+
+The effective base :abbr:`URI (Uniform Resource Identifier)` used to resolve
+the attachment.  It reflects the response's final address, ``Content-Location``
+header, and the ``xml:base`` attributes on the attachment and its ancestors.
+An ``xml:base`` declared locally only applies to that element's subtree.
+
+
+.. _reference.entry.enclosure_details.href:
+
+``entries[i].enclosure_details[j].href``
+-------------------------------------------------
+
+The result of resolving ``value`` against ``base``.  Invalid values are
+preserved in ``value`` and resolve to an empty string.  URIs that differ only
+by fragment remain separate attachments and retain their fragments here.
 
 
 .. _reference.entry.enclosures.length:

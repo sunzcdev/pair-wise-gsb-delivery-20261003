@@ -59,6 +59,8 @@ class FeedParserDict(dict):
             except IndexError:
                 raise KeyError("object doesn't have key 'category'")
         elif key == "enclosures":
+            if dict.__contains__(self, "enclosures"):
+                return dict.__getitem__(self, "enclosures")
             return [
                 FeedParserDict(
                     [(name, value) for (name, value) in link.items() if name != "rel"]
