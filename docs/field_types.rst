@@ -134,3 +134,69 @@ You can also tell from the ``repr()`` string::
 
     >>> value
     InvalidData(b'not a number')
+
+
+Exact Numeric Parsing
+---------------------
+
+The default parser returns floats for numeric (``N``) fields with a
+decimal point. Floats can not represent all decimal values exactly,
+so migrating fixed-point data this way loses precision::
+
+    >>> 0.1
+    0.1000000000000000055511151231257827021181583404541015625
+
+If you need exact values you can use
+``dbfread.DecimalFieldParser``, which parses ``N`` fields using the
+declared field width and ``decimal_count``::
+
+    from dbfread import DBF, DecimalFieldParser
+
+    table = DBF('people.dbf', parserclass=DecimalFieldParser)
+
+The returned values are defined as follows:
+
+* pure integer fields (``decimal_count == 0``) return ``int``
+* other fields return ``decimal.Decimal`` carrying exactly
+  ``decimal_count`` decimal places (``3.1`` in a field with
+  ``decimal_count == 2`` becomes ``Decimal('3.10')``)
+* all-empty fields (only spaces) return ``None``
+* historical files using ``,`` as the decimal separator are accepted
+  (``3,14`` becomes ``Decimal('3.14')``)
+* negative zero keeps its sign in decimal fields
+  (``Decimal('-0.00')``) and becomes ``0`` in integer fields
+
+Unlike the default parser, ``*`` overflow padding is never stripped,
+since that could turn an overflowed value into a valid-looking
+number. Format problems raise dedicated exceptions, all subclasses of
+``NumericFormatError`` (which is a subclass of ``ValueError``):
+
+``DecimalPlacesError``
+  the value has more decimal places than the declared
+  ``decimal_count``
+
+``NumericOverflowError``
+  the field contains ``*`` overflow padding
+
+``IllegalSignError``
+  the field contains a misplaced or repeated sign character
+
+``NumericFormatError``
+  anything else that is not a number
+
+The original field data is kept in the ``data`` attribute of the
+exception, so no information is lost::
+
+    from dbfread import DBF, DecimalFieldParser, InvalidValue
+    from dbfread import NumericFormatError
+
+    class MyFieldParser(DecimalFieldParser):
+        def parse(self, field, data):
+            try:
+                return DecimalFieldParser.parse(self, field, data)
+            except NumericFormatError:
+                return InvalidValue(data)
+
+Since fields are read as fixed-width byte strings before they are
+parsed, a format error never changes the read boundary of the next
+field.

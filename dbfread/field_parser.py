@@ -26,6 +26,38 @@ class InvalidValue(bytes):
         return 'InvalidValue({})'.format(text)
 
 
+class NumericFormatError(ValueError):
+    """Base class for errors raised by the exact numeric parser.
+
+    This is a subclass of ``ValueError``, so existing error handlers
+    keep working. The original field data is available in the
+    ``data`` attribute, so no information is lost when a value can
+    not be parsed.
+    """
+    def __init__(self, message, data=None):
+        ValueError.__init__(self, message)
+        self.data = data
+
+
+class NumericOverflowError(NumericFormatError):
+    """The field contains '*' overflow padding.
+
+    Some programs fill a numeric field with '*' when a value does not
+    fit in the declared field width. These bytes are never stripped,
+    since that could turn an overflowed value into a valid-looking
+    number.
+    """
+
+
+class DecimalPlacesError(NumericFormatError):
+    """The value has more decimal places than the declared
+    ``decimal_count`` of the field."""
+
+
+class IllegalSignError(NumericFormatError):
+    """The field contains a misplaced or repeated sign character."""
+
+
 class FieldParser:
     def __init__(self, table, memofile=None):
         """Create a new field parser
@@ -255,3 +287,107 @@ class FieldParser:
 
     # Varchar field ('V') (Visual FoxPro)
     parseV = parseC
+
+
+class DecimalFieldParser(FieldParser):
+    """Field parser that parses numeric (N) fields exactly.
+
+    The default parser returns floats for non-integer N fields, which
+    loses precision when fixed-point data is migrated. This parser
+    instead uses the declared field width and ``decimal_count``:
+
+    * fields with ``decimal_count == 0`` (pure integers) are returned
+      as ``int``
+    * other fields are returned as ``decimal.Decimal`` carrying
+      exactly ``decimal_count`` decimal places
+    * all-empty fields (only spaces and/or NUL bytes) return ``None``
+    * historical files using ``,`` as the decimal separator are
+      accepted (``3,14`` becomes ``Decimal('3.14')``)
+    * negative zero keeps its sign in decimal fields
+      (``Decimal('-0.00')``) and becomes ``0`` in integer fields
+
+    Unlike the default parser, '*' overflow padding is never
+    stripped, since that could turn an overflowed value into a
+    valid-looking number. Format problems raise dedicated exceptions
+    (all subclasses of ``NumericFormatError`` and ``ValueError``):
+
+    * ``DecimalPlacesError`` -- more decimal places than the declared
+      ``decimal_count``
+    * ``NumericOverflowError`` -- '*' overflow padding in the field
+    * ``IllegalSignError`` -- misplaced or repeated sign character
+    * ``NumericFormatError`` -- anything else that is not a number
+
+    Since fields are read as fixed-width byte strings before they are
+    parsed, a format error never changes the read boundary of the
+    next field.
+    """
+
+    def parseN(self, field, data):
+        """Parse numeric field (N) and return int, Decimal or None."""
+        decimals = field.decimal_count
+
+        # An all-empty field (only spaces and/or NUL bytes) is NULL.
+        if not data.strip(b' \0'):
+            return None
+
+        # In some files '*' is used as overflow padding. Unlike the
+        # default parser we never strip these, since that could turn
+        # an overflowed value into a valid-looking number.
+        if b'*' in data:
+            raise NumericOverflowError(
+                'numeric field contains overflow padding: '
+                '{!r}'.format(data),
+                data)
+
+        # Strip leading and trailing padding.
+        text = data.strip(b' \0')
+
+        # The sign must be a single leading '+' or '-'.
+        sign = b''
+        if text[:1] in (b'+', b'-'):
+            sign, text = text[:1], text[1:]
+        if b'+' in text or b'-' in text:
+            raise IllegalSignError(
+                'misplaced or repeated sign in numeric field: '
+                '{!r}'.format(data),
+                data)
+
+        # Some historical files use ',' as the decimal separator.
+        text = text.replace(b',', b'.')
+        if text.count(b'.') > 1:
+            raise NumericFormatError(
+                'multiple decimal separators in numeric field: '
+                '{!r}'.format(data),
+                data)
+
+        if b'.' in text:
+            intpart, fracpart = text.split(b'.')
+        else:
+            intpart, fracpart = text, b''
+
+        if not (intpart or fracpart):
+            # Only a sign and/or a decimal point.
+            raise NumericFormatError(
+                'not a number: {!r}'.format(data), data)
+
+        if ((intpart and not intpart.isdigit()) or
+                (fracpart and not fracpart.isdigit())):
+            raise NumericFormatError(
+                'not a number: {!r}'.format(data), data)
+
+        if len(fracpart) > decimals:
+            raise DecimalPlacesError(
+                'value has {} decimal places but field declares '
+                '{}: {!r}'.format(len(fracpart), decimals, data),
+                data)
+
+        if decimals:
+            # Normalize the fraction to the declared number of
+            # decimal places, so the returned Decimal carries the
+            # declared scale. (Negative zero keeps its sign.)
+            text = (sign + (intpart or b'0') + b'.' +
+                    fracpart.ljust(decimals, b'0'))
+            return Decimal(text.decode('ascii'))
+        else:
+            # Pure integer field. (Negative zero becomes int 0.)
+            return int(sign + (intpart or b'0'))

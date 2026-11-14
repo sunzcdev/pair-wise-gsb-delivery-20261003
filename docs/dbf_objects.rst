@@ -63,7 +63,9 @@ ignorecase=True
 parserclass=FieldParser
   The parser to use when parsing field values. You can use this to add
   new field types or do custom parsing by subclassing
-  ``dbfread.FieldParser``. (See :doc:`field_types`.)
+  ``dbfread.FieldParser``. (See :doc:`field_types`.) Pass
+  ``dbfread.DecimalFieldParser`` to parse numeric (N) fields exactly
+  as ``int`` or ``decimal.Decimal`` instead of ``float``.
 
 ignore_missing_memofile=False
   If you don't have the memo field you can pass

@@ -7,6 +7,13 @@ Release History
 (Next Version)
 ^^^^^^^^^^^^^^^^^^
 
+* added ``DecimalFieldParser``, an optional field parser which parses
+  numeric (N) fields exactly as ``int`` or ``decimal.Decimal`` based
+  on the declared field width and ``decimal_count``. Format problems
+  raise dedicated exceptions (``DecimalPlacesError``,
+  ``NumericOverflowError``, ``IllegalSignError``), all subclasses of
+  the new ``NumericFormatError`` (and of ``ValueError``).
+
 * records are now returned ``dict`` instead of ``collections.OrderedDict``
   in Python 3.7 and up (as well as CPython 3.6) since normal Python
   dictionaries are now ordered.
