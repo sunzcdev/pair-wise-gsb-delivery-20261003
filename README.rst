@@ -411,6 +411,11 @@ to give users more fine-grained control over certain operations:
   an additional ``buf_size`` option (defaults to ``65536`` or 64KB)
   specifies the amount of bytes the library
   should attempt to read each time.
+- Async functions accept a ``max_pending_events`` option
+  to limit how many results are produced ahead of the consumer.
+  Production pauses until the consumer makes room,
+  allowing a single oversized source chunk to be processed incrementally.
+  The default, ``None``, preserves the previous unbounded behaviour.
 - The ``items`` and ``kvitems`` functions, and all their variants,
   have an optional ``map_type`` argument (defaults to ``dict``)
   used to construct objects from the JSON stream.

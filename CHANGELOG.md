@@ -24,6 +24,9 @@
   when the result  of `read()` method fails to be decoded as a utf8 byte sequence.
 * The `yajl2_c` backend now releases the result returned by the user-provided async `read()` method
   when parsing that buffer fails.
+* Async iterators accept a `max_pending_events` option that bounds how far
+  parsing runs ahead of the consumer, including when `read()` returns more
+  data than requested.
 
 ## [3.6.0]
 
