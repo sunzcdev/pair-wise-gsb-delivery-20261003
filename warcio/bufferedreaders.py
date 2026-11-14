@@ -3,7 +3,7 @@ import re
 import zlib
 import sys
 
-from warcio.utils import BUFF_SIZE
+from warcio.utils import BUFF_SIZE, to_native_str
 
 import logging
 logger = logging.getLogger(__name__)
@@ -293,14 +293,43 @@ class ChunkedDataReader(BufferedReader):
 
     If at any point the chunked header is not available, the stream is
     assumed to not be chunked and no more dechunking occurs.
+
+    Any http trailer fields sent after the final zero-length chunk are
+    parsed and exposed separately as 'trailers', a list of (name, value)
+    tuples. They are never mixed into the message body. The trailers are
+    only complete ('trailers_complete' is True) once the terminating
+    chunk and the full trailer section have been read.
     """
+
+    # fields which affect message framing and so must not appear
+    # in a trailer section (rfc 9110, section 6.5.1)
+    FORBIDDEN_TRAILER_FIELDS = (b'content-length',
+                                b'transfer-encoding',
+                                b'trailer')
+
     def __init__(self, stream, raise_exceptions=False, **kwargs):
         super(ChunkedDataReader, self).__init__(stream, **kwargs)
         self.all_chunks_read = False
         self.not_chunked = False
 
+        # trailer fields as list of (name, value) tuples,
+        # only valid once trailers_complete is True
+        self.trailers = []
+        self.trailers_complete = False
+
         # if False, we'll use best-guess fallback for parse errors
         self.raise_chunked_data_exceptions = raise_exceptions
+
+    def get_trailers(self):
+        """
+        Return the parsed trailer fields as a list of (name, value)
+        tuples, or None if the end of the chunked message (and thus
+        the trailer section) has not been fully read yet.
+        """
+        if not self.trailers_complete:
+            return None
+
+        return self.trailers
 
     def _fillbuff(self, block_size=None):
         if self.not_chunked:
@@ -344,12 +373,9 @@ class ChunkedDataReader(BufferedReader):
                                        length_header)
 
         if not chunk_size:
-            # chunk_size 0 indicates end of file. read final bytes to compute digest.
-            final_data = self.stream.read(2)
-            try:
-                assert(final_data == b'\r\n')
-            except AssertionError:
-                raise ChunkedDataException(b"Incorrect \r\n after length header of 0")
+            # chunk_size 0 indicates end of the chunks.
+            # read any trailer fields up to the final blank line
+            self._read_trailers()
             self.all_chunks_read = True
             self._process_read(b'')
             return
@@ -385,6 +411,43 @@ class ChunkedDataReader(BufferedReader):
 
         # hand to base class for further processing
         self._process_read(data)
+
+    def _read_trailers(self):
+        trailers = []
+        data = b''
+
+        while True:
+            line = self.stream.readline()
+            data += line
+
+            if not line or not line.endswith(b'\n'):
+                raise ChunkedDataException(
+                    b'Truncated trailer: stream ended before terminating blank line',
+                    data)
+
+            line = line.rstrip(b'\r\n')
+
+            # blank line: end of trailer section
+            if not line:
+                break
+
+            # split on first colon only, value may contain colons
+            name, sep, value = line.partition(b':')
+            name = name.strip()
+            value = value.strip()
+
+            if not sep or not name:
+                raise ChunkedDataException(b'Malformed trailer field: ' +
+                                           line, data)
+
+            if name.lower() in self.FORBIDDEN_TRAILER_FIELDS:
+                raise ChunkedDataException(
+                    b'Framing field not allowed in trailer: ' + name, data)
+
+            trailers.append((to_native_str(name), to_native_str(value)))
+
+        self.trailers = trailers
+        self.trailers_complete = True
 
 
 #=================================================================

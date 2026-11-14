@@ -175,6 +175,119 @@ def test_err_chunk_cut_off():
     #ChunkedDataException: Ran out of data before end of chunk
 
 
+# Trailer Tests
+#=================================================================
+
+def test_trailers_basic():
+    # trailers parsed separately, not mixed into the body
+    c = ChunkedDataReader(BytesIO(b"4\r\n1234\r\n0\r\nX-Checksum: abc123\r\nX-Extra: hello\r\n\r\n"))
+    assert c.read() == b'1234'
+    assert c.read() == b''
+    assert c.trailers_complete
+    assert c.get_trailers() == [('X-Checksum', 'abc123'), ('X-Extra', 'hello')]
+    assert c.trailers == c.get_trailers()
+
+
+def test_trailers_empty_when_none():
+    # no trailer fields: empty but complete
+    c = ChunkedDataReader(BytesIO(b"4\r\n1234\r\n0\r\n\r\n"))
+    assert c.read() == b'1234'
+    assert c.trailers_complete
+    assert c.get_trailers() == []
+
+
+def test_trailers_not_complete_until_fully_read():
+    # reading only part of the body: trailers not yet available
+    c = ChunkedDataReader(BytesIO(b"8\r\n12345678\r\n0\r\nX-A: b\r\n\r\n"))
+    assert c.read(4) == b'1234'
+    assert not c.trailers_complete
+    assert c.get_trailers() is None
+
+    # unbounded read consumes the rest of the body,
+    # the terminating chunk and the trailer section
+    assert c.read() == b'5678'
+    assert c.trailers_complete
+    assert c.get_trailers() == [('X-A', 'b')]
+
+
+def test_trailers_chunk_extensions():
+    # chunk extensions on data chunks and on the terminating chunk
+    c = ChunkedDataReader(BytesIO(b"4;foo=bar\r\n1234\r\n0;done=yes\r\nX-A: b\r\n\r\n"))
+    assert c.read() == b'1234'
+    assert c.trailers_complete
+    assert c.get_trailers() == [('X-A', 'b')]
+
+
+def test_trailers_colon_in_value_and_duplicates():
+    # values may contain colons, duplicate fields are all kept
+    data = (b"1\r\nx\r\n0\r\n"
+            b"X-Url: http://example.com:8080/path\r\n"
+            b"X-Dup: 1\r\n"
+            b"X-Dup: 2\r\n"
+            b"\r\n")
+    c = ChunkedDataReader(BytesIO(data))
+    assert c.read() == b'x'
+    assert c.read() == b''
+    assert c.get_trailers() == [('X-Url', 'http://example.com:8080/path'),
+                                ('X-Dup', '1'),
+                                ('X-Dup', '2')]
+
+
+def test_trailers_across_read_boundaries():
+    # trailer lines split across tiny underlying buffer fills
+    from warcio.bufferedreaders import BufferedReader
+    data = b"4\r\n1234\r\n0\r\nX-Long-Trailer-Name: some longer value\r\n\r\n"
+    stream = BufferedReader(BytesIO(data), block_size=3)
+    c = ChunkedDataReader(stream)
+    assert c.read() == b'1234'
+    assert c.read() == b''
+    assert c.trailers_complete
+    assert c.get_trailers() == [('X-Long-Trailer-Name', 'some longer value')]
+
+
+def test_trailer_malformed_field():
+    # trailer line without a colon
+    c = ChunkedDataReader(BytesIO(b"1\r\nx\r\n0\r\nnot-a-field\r\n\r\n"),
+                          raise_exceptions=True)
+    with pytest.raises(ChunkedDataException):
+        c.read()
+
+
+def test_trailer_truncated():
+    # stream ends before the terminating blank line
+    c = ChunkedDataReader(BytesIO(b"1\r\nx\r\n0\r\nX-A: b\r\n"),
+                          raise_exceptions=True)
+    with pytest.raises(ChunkedDataException):
+        c.read()
+
+
+def test_trailer_missing_final_crlf():
+    # no bytes at all after the zero chunk
+    c = ChunkedDataReader(BytesIO(b"1\r\nx\r\n0\r\n"),
+                          raise_exceptions=True)
+    with pytest.raises(ChunkedDataException):
+        c.read()
+
+
+@pytest.mark.parametrize('field', [b'Content-Length', b'Transfer-Encoding', b'Trailer',
+                                   b'content-length', b'TRANSFER-ENCODING'])
+def test_trailer_forbidden_framing_fields(field):
+    # framing fields must not appear in trailers
+    c = ChunkedDataReader(BytesIO(b"1\r\nx\r\n0\r\n" + field + b": 5\r\n\r\n"),
+                          raise_exceptions=True)
+    with pytest.raises(ChunkedDataException):
+        c.read()
+
+
+def test_trailer_error_fallback_not_chunked():
+    # without raise_exceptions, a broken trailer falls back to
+    # treating the remainder as non-chunked data
+    c = ChunkedDataReader(BytesIO(b"1\r\nx\r\n0\r\nnot-a-field\r\n\r\n"))
+    data = c.read()
+    assert data.startswith(b'x')
+    assert b'not-a-field' in data
+    assert not c.trailers_complete
+
 
 def print_str(string):
     return string.decode('utf-8') if six.PY3 else string
