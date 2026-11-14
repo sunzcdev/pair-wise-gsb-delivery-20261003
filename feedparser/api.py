@@ -27,6 +27,7 @@
 # POSSIBILITY OF SUCH DAMAGE.
 
 import io
+import tempfile
 import urllib.error
 import urllib.parse
 import xml.sax
@@ -49,6 +50,18 @@ from .util import FeedParserDict
 PREFERRED_XML_PARSERS = ["drv_libxml2"]
 
 _XML_AVAILABLE = True
+
+# Maximum amount of a non-seekable stream's content that is kept in memory;
+# anything larger gets spooled to a temporary file on disk.
+SPOOL_MEMORY_LIMIT = 2**20  # 1 MiB
+
+# How much content is read from a non-seekable stream in a single read() call.
+SPOOL_READ_CHUNK_SIZE = 2**16  # 64 KiB
+
+# Attribute set on readable objects that _open_resource() creates itself,
+# so parse() knows it is allowed to close them. Objects supplied by the
+# caller (which may be returned as-is) never carry this marker.
+_LIBRARY_OWNED_MARKER = "_feedparser_library_owned"
 
 SUPPORTED_VERSIONS = {
     "": "unknown",
@@ -98,14 +111,18 @@ def _open_resource(
     # (to reduce memory usage, see convert_file_to_utf8() for details).
     # However, to accommodate parse() needing the content twice,
     # the returned file is guaranteed to be seekable.
-    # (If the underlying resource is not seekable,
-    # the content is read and wrapped in a io.BytesIO/StringIO.)
+    # If the underlying resource is not seekable, its content is copied
+    # in chunks into a spooled file that stays in memory while it is small
+    # (at most SPOOL_MEMORY_LIMIT bytes/characters) and is transparently
+    # rolled over to a temporary file on disk once it grows larger,
+    # so both the strict and the loose parse passes see identical content
+    # without unbounded memory usage.
 
     if callable(getattr(url_file_stream_or_string, "read", None)):
         if callable(getattr(url_file_stream_or_string, "seekable", None)):
             if url_file_stream_or_string.seekable():
                 return url_file_stream_or_string
-        return _to_in_memory_file(url_file_stream_or_string.read())
+        return _spool_non_seekable_stream(url_file_stream_or_string, result)
 
     looks_like_url = isinstance(
         url_file_stream_or_string, str
@@ -115,11 +132,11 @@ def _open_resource(
     )
     if looks_like_url:
         data = http.get(url_file_stream_or_string, result)
-        return io.BytesIO(data)
+        return _mark_library_owned(io.BytesIO(data))
 
     # try to open with native open function (if url_file_stream_or_string is a filename)
     try:
-        return open(url_file_stream_or_string, "rb")
+        return _mark_library_owned(open(url_file_stream_or_string, "rb"))
     except (OSError, TypeError, ValueError):
         # if url_file_stream_or_string is a str object that
         # cannot be converted to the encoding returned by
@@ -134,10 +151,66 @@ def _open_resource(
     return _to_in_memory_file(url_file_stream_or_string)
 
 
+def _mark_library_owned(file):
+    """Mark *file* as created by feedparser, so parse() may close it."""
+
+    setattr(file, _LIBRARY_OWNED_MARKER, True)
+    return file
+
+
+def _spool_non_seekable_stream(stream, result):
+    """Copy a non-seekable *stream* into a seekable, library-owned spool.
+
+    The source is read in chunks because a single read() call may return
+    only part of the data. Both byte and text streams are supported.
+    The resulting :class:`tempfile.SpooledTemporaryFile` stays in memory
+    until its size reaches :data:`SPOOL_MEMORY_LIMIT`, then rolls over to
+    a temporary file on disk, and is rewound so the content can be replayed
+    for both the strict and the loose parse passes.
+
+    The caller's stream is only read from, never closed.
+
+    If writing to the temporary file fails, the partial spool is discarded
+    and the failure is reported through the regular bozo error convention;
+    the truncated content is never handed to the parsers.
+    """
+
+    first_chunk = stream.read(SPOOL_READ_CHUNK_SIZE)
+    if isinstance(first_chunk, str):
+        spool = tempfile.SpooledTemporaryFile(
+            mode="w+",
+            max_size=SPOOL_MEMORY_LIMIT,
+            encoding="utf-8",
+            newline="",
+        )
+        empty_file: IO[str] | IO[bytes] = io.StringIO()
+    else:
+        spool = tempfile.SpooledTemporaryFile(
+            mode="w+b",
+            max_size=SPOOL_MEMORY_LIMIT,
+        )
+        empty_file = io.BytesIO()
+
+    try:
+        chunk = first_chunk
+        while chunk:
+            spool.write(chunk)
+            chunk = stream.read(SPOOL_READ_CHUNK_SIZE)
+        # Rewind so the full content can be read again, possibly twice.
+        spool.seek(0)
+    except OSError as error:
+        spool.close()
+        result["bozo"] = True
+        result["bozo_exception"] = error
+        return _mark_library_owned(empty_file)
+
+    return _mark_library_owned(spool)
+
+
 def _to_in_memory_file(data):
     if isinstance(data, str):
-        return io.StringIO(data)
-    return io.BytesIO(data)
+        return _mark_library_owned(io.StringIO(data))
+    return _mark_library_owned(io.BytesIO(data))
 
 
 class LooseFeedParser(LooseXMLParser, XMLParserMixin, BaseHTMLProcessor):
@@ -217,6 +290,9 @@ def parse(
     # (this preserves the behavior in 6.0.8)
     initial_file_offset = file.tell()
     if not file.read(1):
+        # Empty input: release a spool or other library-owned object.
+        if getattr(file, _LIBRARY_OWNED_MARKER, False):
+            file.close()
         return result
     file.seek(initial_file_offset)
 
@@ -232,8 +308,10 @@ def parse(
             optimistic_encoding_detection=optimistic_encoding_detection,
         )
     finally:
-        if not hasattr(url_file_stream_or_string, "read"):
-            # the file does not come from the user, close it
+        if getattr(file, _LIBRARY_OWNED_MARKER, False):
+            # The file was created by feedparser (an in-memory buffer,
+            # spooled temporary file, or open local file); close it.
+            # Sources supplied by the caller are never closed here.
             file.close()
 
     return result
