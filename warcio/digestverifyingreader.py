@@ -8,18 +8,72 @@ from warcio.exceptions import ArchiveLoadFailed
 
 # ============================================================================
 class DigestChecker(object):
+    """Tracks the verification status of each digest a record may declare.
+
+    Each digest (block and payload) has its own status, one of:
+
+    - ``STATUS_NOT_DECLARED``: the record did not declare this digest
+    - ``STATUS_UNSUPPORTED``: declared, but the hash algorithm is not
+      supported (never counts as a pass)
+    - ``STATUS_PENDING``: declared, but the corresponding record bytes
+      have not been (fully) read yet
+    - ``STATUS_PASSED``: declared and verified successfully
+    - ``STATUS_FAILED``: declared and did not match
+    - ``STATUS_NOT_APPLICABLE``: declared, but not applicable to this
+      record (e.g. the payload digest of a revisit record or of a
+      record segment)
+    """
+
+    STATUS_NOT_DECLARED = 'not_declared'
+    STATUS_UNSUPPORTED = 'unsupported'
+    STATUS_PENDING = 'pending'
+    STATUS_PASSED = 'passed'
+    STATUS_FAILED = 'failed'
+    STATUS_NOT_APPLICABLE = 'not_applicable'
+
+    STATUS_NOT_CHECKED = 'not_checked'
+
     def __init__(self, kind=None):
         self._problem = []
         self._passed = None
         self.kind = kind
+        self.block_status = self.STATUS_NOT_DECLARED
+        self.payload_status = self.STATUS_NOT_DECLARED
 
     @property
     def passed(self):
+        """Overall digest verification result.
+
+        - ``False`` if any digest failed or uses an unsupported algorithm
+        - ``None`` if any digest is still pending, or no digest was checked
+        - ``True`` only if every declared digest was actually checked and
+          passed -- one passing digest never masks another digest which
+          failed or is still pending
+        """
+        status = self.status
+        if status == self.STATUS_FAILED:
+            return False
+        if status == self.STATUS_PASSED:
+            return True
         return self._passed
 
     @passed.setter
     def passed(self, value):
         self._passed = value
+
+    @property
+    def status(self):
+        """Overall result as a string: one of ``'passed'``, ``'failed'``,
+        ``'pending'`` or ``'not_checked'``.
+        """
+        statuses = (self.block_status, self.payload_status)
+        if self.STATUS_FAILED in statuses or self.STATUS_UNSUPPORTED in statuses:
+            return self.STATUS_FAILED
+        if self.STATUS_PENDING in statuses:
+            return self.STATUS_PENDING
+        if self.STATUS_PASSED in statuses:
+            return self.STATUS_PASSED
+        return self.STATUS_NOT_CHECKED
 
     @property
     def problems(self):
@@ -47,11 +101,14 @@ class DigestVerifyingReader(LimitReader):
 
         self.digest_checker = digest_checker
 
+        block_applicable = True
+        payload_applicable = True
+
         if record_type == 'revisit':
-            block_digest = None
-            payload_digest = None
+            block_applicable = False
+            payload_applicable = False
         if segment_number is not None:  #pragma: no cover
-            payload_digest = None
+            payload_applicable = False
 
         self.payload_digest = payload_digest
         self.block_digest = block_digest
@@ -60,30 +117,36 @@ class DigestVerifyingReader(LimitReader):
         self.payload_digester_obj = None
         self.block_digester = None
 
-        if block_digest:
+        if not block_digest:
+            self.digest_checker.block_status = DigestChecker.STATUS_NOT_DECLARED
+        elif not block_applicable:
+            self.digest_checker.block_status = DigestChecker.STATUS_NOT_APPLICABLE
+        else:
             try:
                 algo, _ = _parse_digest(block_digest)
                 self.block_digester = Digester(algo)
+                self.digest_checker.block_status = DigestChecker.STATUS_PENDING
             except ValueError:
+                self.digest_checker.block_status = DigestChecker.STATUS_UNSUPPORTED
                 self.digest_checker.problem('unknown hash algorithm name in block digest')
-                self.block_digester = None
-        if payload_digest:
+
+        if not payload_digest:
+            self.digest_checker.payload_status = DigestChecker.STATUS_NOT_DECLARED
+        elif not payload_applicable:
+            self.digest_checker.payload_status = DigestChecker.STATUS_NOT_APPLICABLE
+        else:
             try:
-                algo, _ = _parse_digest(self.payload_digest)
+                algo, _ = _parse_digest(payload_digest)
                 self.payload_digester_obj = Digester(algo)
+                self.digest_checker.payload_status = DigestChecker.STATUS_PENDING
             except ValueError:
+                self.digest_checker.payload_status = DigestChecker.STATUS_UNSUPPORTED
                 self.digest_checker.problem('unknown hash algorithm name in payload digest')
-                self.payload_digester_obj = None
 
     def begin_payload(self):
         self.payload_digester = self.payload_digester_obj
         if self.limit == 0:
-            check = _compare_digest_rfc_3548(self.payload_digester, self.payload_digest)
-            if check is False:
-                self.digest_checker.problem('payload digest failed: {}'.format(self.payload_digest))
-                self.payload_digester = None  # prevent double-fire
-            elif check is True and self.digest_checker.passed is not False:
-                self.digest_checker.passed = True
+            self._check_payload_digest()
 
     def _update(self, buff):
         super(DigestVerifyingReader, self)._update(buff)
@@ -94,18 +157,35 @@ class DigestVerifyingReader(LimitReader):
             self.block_digester.update(buff)
 
         if self.limit == 0:
-            check = _compare_digest_rfc_3548(self.block_digester, self.block_digest)
-            if check is False:
-                self.digest_checker.problem('block digest failed: {}'.format(self.block_digest))
-            elif check is True and self.digest_checker.passed is not False:
-                self.digest_checker.passed = True
-            check = _compare_digest_rfc_3548(self.payload_digester, self.payload_digest)
-            if check is False:
-                self.digest_checker.problem('payload digest failed {}'.format(self.payload_digest))
-            elif check is True and self.digest_checker.passed is not False:
-                self.digest_checker.passed = True
+            self._check_block_digest()
+            self._check_payload_digest()
 
         return buff
+
+    def _check_block_digest(self):
+        # only finalize once the whole block has actually been read,
+        # and only ever finalize once (e.g. repeated reads at EOF must
+        # not register the same failure again)
+        if self.digest_checker.block_status != DigestChecker.STATUS_PENDING:
+            return
+
+        check = _compare_digest_rfc_3548(self.block_digester, self.block_digest)
+        if check is False:
+            self.digest_checker.block_status = DigestChecker.STATUS_FAILED
+            self.digest_checker.problem('block digest failed: {}'.format(self.block_digest))
+        elif check is True:
+            self.digest_checker.block_status = DigestChecker.STATUS_PASSED
+
+    def _check_payload_digest(self):
+        if self.digest_checker.payload_status != DigestChecker.STATUS_PENDING:
+            return
+
+        check = _compare_digest_rfc_3548(self.payload_digester, self.payload_digest)
+        if check is False:
+            self.digest_checker.payload_status = DigestChecker.STATUS_FAILED
+            self.digest_checker.problem('payload digest failed: {}'.format(self.payload_digest))
+        elif check is True:
+            self.digest_checker.payload_status = DigestChecker.STATUS_PASSED
 
 
 def _compare_digest_rfc_3548(digester, digest):

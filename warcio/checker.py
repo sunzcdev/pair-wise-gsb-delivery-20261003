@@ -46,12 +46,14 @@ class Checker(object):
                 rec_type = record.rec_headers.get_header('WARC-Type')
                 rec_offset = it.get_record_offset()
 
-                if record.digest_checker.passed is False:
+                digest_checker = record.digest_checker
+
+                if digest_checker.passed is False:
                     self.exit_value = 1
-                    output = list(record.digest_checker.problems) 
-                elif record.digest_checker.passed is True and self.verbose:
+                    output = list(digest_checker.problems)
+                elif digest_checker.passed is True and self.verbose:
                     d_msg = 'digest pass'
-                elif record.digest_checker.passed is None and self.verbose:
+                elif digest_checker.passed is None and self.verbose:
                     if digest_present and rec_type == 'revisit':
                         d_msg = 'digest present but not checked (revisit)'
                     elif digest_present:  # pragma: no cover
@@ -67,5 +69,9 @@ class Checker(object):
                     print(' ', 'offset', rec_offset, 'WARC-Record-ID', rec_id, rec_type)
                     if d_msg:
                         print('   ', d_msg)
+                    if self.verbose:
+                        print('   ', 'block digest: {0}, payload digest: {1}'.format(
+                              digest_checker.block_status,
+                              digest_checker.payload_status))
                     for o in output:
                         print('   ', o)

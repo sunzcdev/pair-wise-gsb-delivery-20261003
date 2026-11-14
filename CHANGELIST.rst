@@ -1,3 +1,19 @@
+Unreleased
+~~~~~~~~~~
+
+- Track per-digest verification status on ``DigestChecker``: ``block_status``
+  and ``payload_status`` now distinguish ``not_declared``, ``unsupported``,
+  ``pending``, ``passed``, ``failed`` and ``not_applicable`` (payload digest
+  of revisit records/record segments), with a clear overall ``status``
+  (``passed``/``failed``/``pending``/``not_checked``). ``passed`` is now
+  derived from the per-item statuses: one passing digest no longer masks
+  another digest which failed or is still pending, and an unsupported
+  algorithm never counts as a pass. Statuses are finalized only once the
+  corresponding record bytes have actually been read (partial reads,
+  ``ArchiveIterator.read_to_end()`` and explicit full reads alike), and
+  repeated reads at EOF no longer register the same failure twice. The
+  ``check -v`` CLI output now includes the per-digest breakdown.
+
 1.8.2
 ~~~~~
 
