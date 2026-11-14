@@ -5,6 +5,7 @@ import logging
 logger = logging.getLogger('huey')
 
 SIGNAL_CANCELED = 'canceled'
+SIGNAL_CANCELLED = 'cancelled'
 SIGNAL_COMPLETE = 'complete'
 SIGNAL_ERROR = 'error'
 SIGNAL_EXECUTING = 'executing'

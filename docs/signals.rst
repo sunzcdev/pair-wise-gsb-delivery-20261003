@@ -39,6 +39,13 @@ handler beyond the standard ``(signal, task)`` pair.
        raising :py:class:`CancelExecution`, or by the task function itself
        raising ``CancelExecution``.
      - None
+   * - ``SIGNAL_CANCELLED``
+     - Task observed a cooperative cancellation request
+       (:py:meth:`Huey.cancel`), either at a ``task.check_cancelled()``
+       checkpoint while running, or before it began executing. Cancellation
+       is terminal: the task is not retried and neither the success nor the
+       error pipelines run.
+     - None
    * - ``SIGNAL_RETRYING``
      - Task failed but will be retried (retries remaining, or
        :py:class:`RetryTask` was raised).
@@ -112,6 +119,13 @@ Signals are emitted in a deterministic order.
 
 1. ``SIGNAL_ENQUEUED``
 2. ``SIGNAL_REVOKED``
+
+**Cancelled task (cooperative cancellation):**
+
+1. ``SIGNAL_ENQUEUED``
+2. ``SIGNAL_EXECUTING`` (omitted if the task was cancelled before it began
+   executing)
+3. ``SIGNAL_CANCELLED``
 
 **Rate-limited task (with automatic retry):**
 

@@ -4,6 +4,20 @@ class TaskLockedException(HueyException): pass
 class ResultTimeout(HueyException): pass
 class TaskTimeout(HueyException): pass
 
+class TaskCancelled(HueyException):
+    """
+    Raised (by a task, at a cooperative checkpoint) when a cancellation
+    request for the task is observed. Cancellation is a terminal state: the
+    task is not retried and neither the success nor the error handlers run.
+    """
+    def __init__(self, task_id=None):
+        self.task_id = task_id
+        if task_id is not None:
+            msg = 'task %s was cancelled' % task_id
+        else:
+            msg = 'task was cancelled'
+        super(TaskCancelled, self).__init__(msg)
+
 class RateLimitExceeded(HueyException):
     def __init__(self, key, delay, retry=True):
         self.key, self.delay, self.retry = key, delay, retry

@@ -864,6 +864,42 @@ Huey object
 
             For task functions, use :py:meth:`TaskWrapper.is_revoked`.
 
+    .. py:method:: cancel(task)
+
+        :param task: a :py:class:`Task` instance, :py:class:`Result` handle,
+            or task id.
+
+        Request cooperative cancellation of the given task. Unlike
+        revocation, which only prevents a not-yet-started task from running,
+        a cancellation request is observed by a *running* task at its
+        cooperative checkpoints (see :py:meth:`Task.check_cancelled`), where
+        it surfaces as a :py:class:`TaskCancelled` exception. A task that is
+        cancelled before it begins executing will not be run at all.
+
+        Cancellation is a terminal state: the task is not retried, and
+        neither the ``on_complete`` nor ``on_error`` pipelines are triggered.
+
+        .. seealso:: :py:meth:`Result.cancel`.
+
+    .. py:method:: cancel_by_id(id)
+
+        :param str id: task instance id.
+
+        Request cooperative cancellation of a :py:class:`Task` instance using
+        the task id. Equivalent to :py:meth:`~Huey.cancel`.
+
+    .. py:method:: is_cancelled(task, peek=True)
+
+        :param task: a :py:class:`Task` instance, :py:class:`Result` handle,
+            or task id.
+        :param bool peek: when ``False``, a pending cancellation flag is
+            cleared by the check. The consumer uses this before executing a
+            task.
+        :returns: bool indicating whether cancellation was requested.
+
+        Check whether a cooperative cancellation request is pending for the
+        given task.
+
     .. py:method:: result(id, blocking=False, timeout=None, backoff=1.15, max_delay=1.0, revoke_on_timeout=False, preserve=False)
 
         :param id: the task's unique identifier.
@@ -1475,6 +1511,30 @@ Huey object
 
         See :ref:`cooperative-timeout` for discussion.
 
+    .. py:method:: is_cancelled()
+
+        :returns: bool indicating whether cancellation was requested.
+
+        Check whether a cooperative cancellation request is pending for this
+        task (see :py:meth:`Huey.cancel`). Intended to be called from within
+        a running task, at safe points, via the ``context=True`` task
+        instance.
+
+    .. py:method:: check_cancelled()
+
+        Cooperative cancellation checkpoint. If cancellation was requested
+        for this task (via :py:meth:`Huey.cancel` or :py:meth:`Result.cancel`),
+        raises :py:class:`TaskCancelled`. Cancellation is terminal: the task
+        is not retried and neither the success nor error pipelines run.
+
+        .. code-block:: python
+
+            @huey.task(context=True)
+            def generate_report(report_id, task=None):
+                for chunk in iter_chunks(report_id):
+                    process_chunk(chunk)
+                    task.check_cancelled()
+
     .. py:method:: then(task, *args, **kwargs)
 
         :param TaskWrapper task: A ``task()``-decorated function.
@@ -2068,6 +2128,20 @@ Result
 
         .. seealso:: :py:meth:`TaskWrapper.is_revoked`.
 
+    .. py:method:: cancel()
+
+        Request cooperative cancellation of this task instance. A running
+        task observes the request at its :py:meth:`Task.check_cancelled`
+        checkpoints; a task that has not started will not be run. If the task
+        already finished, its terminal state is unchanged.
+
+        .. seealso:: :py:meth:`Huey.cancel`.
+
+    .. py:method:: is_cancelled()
+
+        Return a boolean value indicating whether cancellation was requested
+        for this task instance.
+
     .. py:method:: reschedule(eta=None, delay=None, expires=None, priority=None, preserve_pipeline=True)
 
         :param datetime eta: execute function at the given time.
@@ -2292,6 +2366,17 @@ Exceptions
 .. py:class:: TaskTimeout
 
     Raised when a task exceeds its specified execution time.
+
+.. py:class:: TaskCancelled(task_id=None)
+
+    :param str task_id: id of the cancelled task.
+
+    Raised by :py:meth:`Task.check_cancelled` when a cooperative cancellation
+    request (see :py:meth:`Huey.cancel`) is observed by a running task, and
+    raised by :py:class:`Result` handles when reading the result of a
+    cancelled task. Unlike :py:class:`TaskException`, this indicates a
+    terminal cancellation rather than a failure: the task is not retried and
+    neither the success nor error pipelines are triggered.
 
 .. py:class:: RateLimitExceeded(key, delay, retry=True)
 

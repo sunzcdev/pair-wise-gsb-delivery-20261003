@@ -690,6 +690,59 @@ either within a :py:meth:`~Huey.pre_execute` hook or within the body of a
 
 For more information, see: :py:class:`CancelExecution`.
 
+Canceling a running task
+^^^^^^^^^^^^^^^^^^^^^^^^
+
+Revocation only prevents a task that has *not yet started* from executing --
+it has no effect on a task that is already running, and workers never kill a
+running task forcibly. To stop a running task, Huey provides *cooperative
+cancellation*: the caller requests cancellation by task id, and the running
+task observes the request at explicit checkpoints.
+
+Callers use :py:meth:`Huey.cancel` (or :py:meth:`Result.cancel`), and tasks
+declared with ``context=True`` check for requests at safe points using
+:py:meth:`Task.check_cancelled`, which raises :py:class:`TaskCancelled`:
+
+.. code-block:: python
+
+    @huey.task(context=True)
+    def generate_report(report_id, task=None):
+        for chunk in iter_chunks(report_id):
+            process_chunk(chunk)
+            # Cooperative checkpoint: raises TaskCancelled if the caller
+            # has requested cancellation of this task.
+            task.check_cancelled()
+
+.. code-block:: pycon
+
+    >>> res = generate_report(42)
+    >>> res.cancel()  # Or: huey.cancel(res.id)
+
+Cancellation is a terminal state, distinct from both success and failure:
+
+* The task is **not** retried, and does not consume its retry budget.
+* Neither the ``on_complete`` (success) nor ``on_error`` (failure) pipelines
+  are triggered.
+* Waiting result handles raise :py:class:`TaskCancelled` (rather than
+  :py:class:`~huey.exceptions.TaskException`), so callers can distinguish a
+  cancellation from an ordinary error. This applies to downstream tasks in a
+  pipeline as well, which will not run.
+* A cancelled chord member contributes a cancellation marker to the chord
+  callback, so the chord still completes instead of waiting forever on the
+  missing member.
+* If a cancellation request races with normal completion, exactly one
+  terminal state is recorded: a task that finishes without observing the
+  request completes successfully, and the stale request is discarded.
+
+A task cancelled before it begins executing will not be run at all.
+
+For more information, see the following API docs:
+
+* :py:meth:`Huey.cancel` and :py:meth:`Huey.is_cancelled`.
+* :py:meth:`Result.cancel` and :py:meth:`Result.is_cancelled`.
+* :py:meth:`Task.check_cancelled` and :py:meth:`Task.is_cancelled`.
+* :py:class:`TaskCancelled`.
+
 Canceling or pausing periodic tasks
 -----------------------------------
 

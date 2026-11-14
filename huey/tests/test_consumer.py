@@ -18,10 +18,13 @@ from huey.consumer import Scheduler
 from huey.consumer import WORKER_TO_ENVIRONMENT
 from huey.consumer_options import ConsumerConfig
 from huey.consumer_options import OptionParserHandler
+from huey.exceptions import TaskCancelled
 from huey.exceptions import TaskException
 from huey.exceptions import TaskTimeout
+from huey.signals import SIGNAL_CANCELLED
 from huey.signals import SIGNAL_COMPLETE
 from huey.signals import SIGNAL_ERROR
+from huey.signals import SIGNAL_EXECUTING
 from huey.signals import SIGNAL_INTERRUPTED
 from huey.tests.base import BaseTestCase
 from huey.tests.base import slow_test
@@ -45,6 +48,50 @@ class TestConsumerIntegration(BaseTestCase):
         with self.consumer_context():
             result = task_a(1)
             self.assertEqual(result.get(blocking=True, timeout=2), 2)
+
+    def test_thread_worker_cooperative_cancel(self):
+        # Thread workers are never force-killed; a running task observes the
+        # cancellation request cooperatively at its checkpoints.
+        events = []
+        started = threading.Event()
+
+        @self.huey.task(context=True)
+        def task_a(task=None):
+            events.append('start')
+            started.set()
+            for _ in range(300):
+                if task.is_cancelled():
+                    break
+                time.sleep(0.01)
+            events.append('checkpoint')
+            task.check_cancelled()
+            events.append('unreachable')
+
+        order = []
+        @self.huey.signal(SIGNAL_EXECUTING, SIGNAL_COMPLETE, SIGNAL_CANCELLED)
+        def recorder(signal, task, *args):
+            order.append(signal)
+
+        consumer = self.consumer(workers=1)
+        consumer.start()
+        try:
+            r = task_a()
+            self.assertTrue(started.wait(5))
+            r.cancel()  # Request cancellation by task id, from the caller.
+            exc = self.trap_exception(
+                lambda: r.get(blocking=True, timeout=5), TaskCancelled)
+            self.assertEqual(exc.task_id, r.id)
+
+            # The worker thread survived; nothing was terminated forcibly.
+            _, worker_t = consumer.worker_threads[0]
+            self.assertTrue(worker_t.is_alive())
+        finally:
+            consumer.stop(graceful=True)
+
+        # Propagation order: the task ran up to its checkpoint, then the
+        # cancellation (not completion) was signaled.
+        self.assertEqual(events, ['start', 'checkpoint'])
+        self.assertEqual(order, [SIGNAL_EXECUTING, SIGNAL_CANCELLED])
 
     def work_on_tasks(self, consumer, n=1, now=None):
         worker, _ = consumer.worker_threads[0]

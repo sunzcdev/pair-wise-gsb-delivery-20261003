@@ -20,10 +20,14 @@ from huey.exceptions import RateLimitExceeded
 from huey.exceptions import ResultTimeout
 from huey.exceptions import ConfigurationError
 from huey.exceptions import RetryTask
+from huey.exceptions import TaskCancelled
 from huey.exceptions import TaskException
 from huey.exceptions import TaskLockedException
 from huey.exceptions import TaskTimeout
 from huey.serializer import SignedSerializer
+from huey.signals import SIGNAL_CANCELLED
+from huey.signals import SIGNAL_COMPLETE
+from huey.signals import SIGNAL_ERROR
 from huey.tests.base import BaseTestCase
 from huey.utils import Error
 from huey.utils import SKIPPED
@@ -1337,6 +1341,252 @@ class TestQueue(BaseTestCase):
         assertPeriodic(21, 0, ['sleep', 'first_half'])
         assertPeriodic(21, 30, ['first_half'])
         assertPeriodic(21, 31, [])
+
+
+class TestCooperativeCancellation(BaseTestCase):
+    def test_cancel_before_execution(self):
+        state = []
+        @self.huey.task(context=True)
+        def task_a(n, task=None):
+            state.append(n)
+            return n + 1
+
+        r = task_a(1)
+        self.huey.cancel(r.id)
+        self.assertTrue(r.is_cancelled())
+
+        # The task is not executed at all, and the flag is consumed.
+        self.assertTrue(self.execute_next() is None)
+        self.assertEqual(state, [])
+        self.assertFalse(r.is_cancelled())
+
+        # The result handle raises a distinguishable exception.
+        exc = self.trap_exception(r, TaskCancelled)
+        self.assertEqual(exc.task_id, r.id)
+        self.assertEqual(self.huey.result_count(), 0)
+        self.assertEqual(len(self.huey), 0)
+
+    def test_cancel_accepts_task_result_and_id(self):
+        @self.huey.task()
+        def task_a(n):
+            return n
+
+        r1, r2, r3 = task_a(1), task_a(2), task_a(3)
+        t1 = self.huey.dequeue()
+        self.huey.cancel(t1)             # Task instance.
+        self.huey.cancel(r2)             # Result handle.
+        self.huey.cancel_by_id(r3.id)    # Task id.
+        self.assertTrue(self.huey.is_cancelled(t1))
+        self.assertTrue(r1.is_cancelled())  # t1 is r1's task.
+        self.assertTrue(r2.is_cancelled())
+        self.assertTrue(self.huey.is_cancelled(r3.id))
+
+    def test_cancel_at_checkpoint(self):
+        state = []
+        @self.huey.task(context=True)
+        def task_a(n, task=None):
+            state.append('start')
+            # Cancellation request arrives while the task is running.
+            self.huey.cancel(task.id)
+            task.check_cancelled()
+            state.append('after-check')
+            return n
+
+        r = task_a(1)
+        self.assertTrue(self.execute_next() is None)
+
+        # Task began executing but stopped at the checkpoint.
+        self.assertEqual(state, ['start'])
+        self.trap_exception(r, TaskCancelled)
+
+    def test_cancel_mid_run_no_retry(self):
+        attempts = []
+        @self.huey.task(retries=2, context=True)
+        def task_a(task=None):
+            attempts.append(1)
+            # Simulate an external cancellation request arriving mid-run.
+            self.huey.cancel(task.id)
+            task.check_cancelled()
+            attempts.append(1)
+            return True
+
+        r = task_a()
+        self.assertTrue(self.execute_next() is None)
+
+        # Cancellation is terminal: no retry was enqueued or scheduled, and
+        # the retry budget was not consumed.
+        self.assertEqual(len(attempts), 1)
+        self.assertEqual(len(self.huey), 0)
+        self.assertEqual(self.huey.scheduled_count(), 0)
+
+        raw = r.get_raw_result()
+        self.assertTrue(isinstance(raw, Error))
+        self.assertTrue(raw.metadata['cancelled'])
+        self.assertEqual(raw.metadata['retries'], 2)
+        self.assertEqual(raw.metadata['task_id'], r.id)
+
+    def test_cancel_no_success_chain(self):
+        state = []
+        @self.huey.task(context=True)
+        def task_a(task=None):
+            self.huey.cancel(task.id)
+            task.check_cancelled()
+            state.append('unreachable')
+
+        @self.huey.task()
+        def task_b(n=None):
+            state.append('b')
+
+        r1, r2 = self.huey.enqueue(task_a.s().then(task_b))
+        self.assertTrue(self.execute_next() is None)
+
+        # The success pipeline was not triggered.
+        self.assertEqual(state, [])
+        self.assertEqual(len(self.huey), 0)
+
+        # Both the cancelled task and its (unrun) successor surface the
+        # cancellation to waiting callers.
+        self.trap_exception(r1, TaskCancelled)
+        self.trap_exception(r2, TaskCancelled)
+
+    def test_cancel_no_error_chain(self):
+        state = []
+        @self.huey.task(context=True)
+        def task_a(task=None):
+            self.huey.cancel(task.id)
+            task.check_cancelled()
+
+        @self.huey.task()
+        def task_e(n, err):
+            state.append('e')
+
+        r = self.huey.enqueue(task_a.s().error(task_e))
+        self.assertTrue(self.execute_next() is None)
+
+        # Cancellation is not a failure: on_error is not triggered.
+        self.assertEqual(state, [])
+        self.assertEqual(len(self.huey), 0)
+        self.trap_exception(r, TaskCancelled)
+
+    def test_cancel_chord_member(self):
+        @self.huey.task(context=True)
+        def prod(n, task=None):
+            if n == 1:
+                self.huey.cancel(task.id)
+                task.check_cancelled()
+            return n + 1
+
+        @self.huey.task()
+        def agg(ns):
+            return ns
+
+        c = chord([prod.s(i) for i in range(3)], agg.s())
+        r = self.huey.enqueue(c)
+
+        self.assertEqual(self.execute_next(), 1)
+        self.assertTrue(self.execute_next() is None)  # Cancelled mid-run.
+        self.assertEqual(self.execute_next(), 3)
+
+        # The chord does not wait forever on the cancelled member; the
+        # callback fires with a distinguishable placeholder.
+        self.assertEqual(len(self.huey), 1)
+        v1, err, v3 = self.execute_next()
+        self.assertEqual(v1, 1)
+        self.assertTrue(isinstance(err, Error))
+        self.assertTrue(err.metadata['cancelled'])
+        self.assertEqual(v3, 3)
+        self.assertEqual(r(), [1, err, 3])
+
+    def test_cancel_chord_member_before_execution(self):
+        @self.huey.task()
+        def prod(n):
+            return n + 1
+
+        @self.huey.task()
+        def agg(ns):
+            return ns
+
+        c = chord([prod.s(i) for i in range(3)], agg.s())
+        r = self.huey.enqueue(c)
+        list(r.results)[1].cancel()
+
+        self.assertEqual(self.execute_next(), 1)
+        self.assertTrue(self.execute_next() is None)  # Cancelled, not run.
+        self.assertEqual(self.execute_next(), 3)
+
+        self.assertEqual(len(self.huey), 1)
+        v1, err, v3 = self.execute_next()
+        self.assertTrue(isinstance(err, Error))
+        self.assertTrue(err.metadata['cancelled'])
+        self.assertEqual(r(), [1, err, 3])
+
+    def test_cancel_after_completion_keeps_success(self):
+        @self.huey.task()
+        def task_a(n):
+            return n + 1
+
+        r = task_a(1)
+        self.assertEqual(self.execute_next(), 2)
+
+        # A cancellation request racing with (losing to) normal completion
+        # does not change the terminal state.
+        self.huey.cancel(r.id)
+        self.assertEqual(r.get(), 2)
+
+    def test_cancel_flag_cleared_on_completion(self):
+        @self.huey.task(context=True)
+        def task_a(task=None):
+            task.check_cancelled()  # No request pending yet.
+            self.huey.cancel(task.id)  # Arrives too late to be observed.
+            return 1
+
+        r = task_a()
+        self.assertEqual(self.execute_next(), 1)
+
+        # The stale request was consumed when the task finished, so exactly
+        # one terminal state (success) is observable.
+        self.assertFalse(r.is_cancelled())
+        self.assertEqual(r.get(), 1)
+
+    def test_cancel_signal(self):
+        sigs = []
+        @self.huey.signal(SIGNAL_CANCELLED, SIGNAL_COMPLETE, SIGNAL_ERROR)
+        def recorder(signal, task, *args):
+            sigs.append(signal)
+
+        @self.huey.task(context=True)
+        def task_a(task=None):
+            self.huey.cancel(task.id)
+            task.check_cancelled()
+
+        r = task_a()
+        self.assertTrue(self.execute_next() is None)
+        self.assertEqual(sigs, [SIGNAL_CANCELLED])
+        self.trap_exception(r, TaskCancelled)
+
+    def test_cancelled_exception_distinguishable(self):
+        # TaskCancelled is not a TaskException and carries the task id.
+        exc = TaskCancelled('abc')
+        self.assertFalse(isinstance(exc, TaskException))
+        self.assertEqual(exc.task_id, 'abc')
+        self.assertIn('abc', str(exc))
+        self.assertEqual(TaskCancelled().task_id, None)
+
+    def test_revoke_still_prevents_execution(self):
+        # The older revoke() behavior is unchanged: it prevents execution of
+        # tasks that have not started, and stores no result.
+        state = []
+        @self.huey.task(context=True)
+        def task_a(n, task=None):
+            state.append(n)
+            return n
+
+        r = task_a(1)
+        r.revoke()
+        self.assertTrue(self.execute_next() is None)
+        self.assertEqual(state, [])
+        self.assertTrue(r.get() is None)
+        self.assertEqual(self.huey.result_count(), 0)
 
 
 class TestAsyncTasks(BaseTestCase):

@@ -3,6 +3,14 @@ Changelog
 
 ## Master
 
+* Add cooperative task cancellation: `Huey.cancel()` / `Result.cancel()`
+  request cancellation by task id, and running tasks observe the request at
+  `task.check_cancelled()` checkpoints (raising `TaskCancelled`).
+  Cancellation is a terminal state: the task is not retried, neither the
+  success nor error pipelines run, waiting result handles raise
+  `TaskCancelled`, and cancelled chord members report a cancellation marker
+  so the chord still completes. The older `revoke()` behavior is unchanged.
+
 [View commits](https://github.com/coleifer/huey/compare/3.5.4...master)
 
 ## 3.5.4

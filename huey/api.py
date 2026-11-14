@@ -22,6 +22,7 @@ from huey.exceptions import RateLimitExceeded
 from huey.exceptions import RETRYING_EXCEPTIONS
 from huey.exceptions import ResultTimeout
 from huey.exceptions import RetryTask
+from huey.exceptions import TaskCancelled
 from huey.exceptions import TaskException
 from huey.exceptions import TaskLockedException
 from huey.exceptions import TaskTimeout
@@ -420,6 +421,10 @@ class Huey(object):
             logger.warning('Task %s was revoked, not executing', task)
             self._emit(S.SIGNAL_REVOKED, task)
             self._abort_chord_member(task, SKIPPED)
+        elif self.is_cancelled(task, peek=False):
+            logger.info('Task %s was cancelled, not executing.', task)
+            self._emit(S.SIGNAL_CANCELLED, task)
+            self._handle_cancelled(task, TaskCancelled(task.id))
         elif task.expires_resolved and task.expires_resolved < timestamp:
             logger.info('Task %s expired, not executing.', task)
             self._emit(S.SIGNAL_EXPIRED, task)
@@ -440,8 +445,13 @@ class Huey(object):
 
         start = time.monotonic()
         exception = None
+        cancelled = False
         retry_eta = None
         task_value = None
+
+        # Bind the executing Huey instance so context-tasks can check for
+        # cooperative cancellation requests via task.check_cancelled().
+        task.huey = self
 
         if task.timeout:
             task._deadline = start + task.timeout
@@ -492,6 +502,13 @@ class Huey(object):
             logger.warning('Task %s raised CancelExecution %s.', task.id, msg)
             self._emit(S.SIGNAL_CANCELED, task)
             exception = exc
+        except TaskCancelled as exc:
+            # Cooperative cancellation observed at a task checkpoint. This is
+            # a terminal state: no retry, no success or error handlers.
+            logger.info('Task %s cancelled: %s.', task.id, exc)
+            exception = exc
+            cancelled = True
+            self._emit(S.SIGNAL_CANCELLED, task)
         except KeyboardInterrupt:
             logger.warning('Received exit signal, %s did not finish.', task.id)
             self._emit(S.SIGNAL_INTERRUPTED, task)
@@ -505,8 +522,12 @@ class Huey(object):
 
         # Clear the flag if this instance of the task was revoked after it
         # began executing. Expiring storages implement pop_data as a peek.
+        # Any cancellation request is likewise consumed: the terminal state
+        # (success, failure or cancellation) has been determined, so a stale
+        # flag must not affect a subsequent run of this task instance.
         if not isinstance(task, PeriodicTask):
             self.delete(task.revoke_id)
+            self.delete(task.cancel_id)
 
         store = self.results and not isinstance(task, PeriodicTask)
         if exception is None:
@@ -519,6 +540,9 @@ class Huey(object):
                 self.enqueue(task.on_complete)
             if task.chord_config is not None:
                 self._check_chord(task.chord_config, task_value)
+        elif cancelled:
+            self._run_post_execute(task, task_value, exception)
+            self._handle_cancelled(task, exception)
         else:
             final = not task.retries
             surface = final or (self.store_intermediate_errors and
@@ -549,6 +573,19 @@ class Huey(object):
             if task.chord_config is not None:
                 return self._check_chord(task.chord_config, value)
             task = task.on_complete
+
+    def _handle_cancelled(self, task, exc):
+        # Cancellation is a terminal state. The remainder of the pipeline
+        # will not run, so surface the cancellation to any waiting results
+        # (distinguishable via the "cancelled" metadata) and report to an
+        # enclosing chord so it does not wait forever on a missing member.
+        error = Error(self.build_error_result(task, exc))
+        if self.results and not isinstance(task, PeriodicTask):
+            next_task = task
+            while next_task is not None:
+                self.put_result(next_task.id, error)
+                next_task = next_task.on_complete
+        self._abort_chord_member(task, error)
 
     def _check_chord(self, cc, value):
         chord_key = 'chord:%s' % cc.cid
@@ -614,12 +651,17 @@ class Huey(object):
         else:
             error = repr(exception)
 
-        return {
+        metadata = {
             'error': error,
             'retries': task.retries,
             'traceback': tb,
             'task_id': task.id,
         }
+        if isinstance(exception, TaskCancelled):
+            # Distinguishable from an ordinary failure: cancellation does not
+            # consume retry budget and does not trigger the error pipeline.
+            metadata['cancelled'] = True
+        return metadata
 
     def _task_key(self, task_class, key):
         if isinstance(task_class, TaskWrapper):
@@ -648,6 +690,45 @@ class Huey(object):
 
     def restore_by_id(self, id):
         return self.restore(Task(id=id))
+
+    def _cancel_task_arg(self, task):
+        if isinstance(task, Result):
+            task = task.task
+        if not isinstance(task, Task):
+            task = Task(id=task)
+        return task
+
+    def cancel(self, task):
+        """
+        Request cooperative cancellation of the given task (a ``Task``
+        instance, ``Result`` handle, or task id).
+
+        Unlike ``revoke()``, which only prevents a not-yet-started task from
+        executing, a cancellation request is observed by a *running* task at
+        its cooperative checkpoints (``task.check_cancelled()`` /
+        ``task.is_cancelled()``), where it surfaces as a ``TaskCancelled``
+        exception. Cancellation is a terminal state: the task is not retried
+        and neither the success nor error pipelines are triggered. A task
+        cancelled before it begins executing will not be run at all.
+        """
+        task = self._cancel_task_arg(task)
+        self.put(task.cancel_id, True)
+
+    def cancel_by_id(self, id):
+        return self.cancel(Task(id=id))
+
+    def is_cancelled(self, task, peek=True):
+        """
+        Check whether a cancellation request is pending for the given task
+        (a ``Task`` instance, ``Result`` handle, or task id). Unless ``peek``
+        is ``True``, the cancellation flag is cleared by this check.
+        """
+        task = self._cancel_task_arg(task)
+        if self.get_raw(task.cancel_id, peek=True) is EmptyData:
+            return False
+        if not peek:
+            self.delete(task.cancel_id)
+        return True
 
     def _check_revoked(self, data, timestamp=None, peek=True):
         """
@@ -799,6 +880,7 @@ class Task(object):
     default_retry_delay = 0
     default_retry_backoff = 0
     default_timeout = None
+    huey = None  # Bound by the TaskWrapper and at execution time.
 
     def __init__(self, args=None, kwargs=None, id=None, eta=None, retries=None,
                  retry_delay=None, priority=None, expires=None,
@@ -809,6 +891,7 @@ class Task(object):
         self.kwargs = {} if kwargs is None else kwargs
         self.id = id or self.create_id()
         self.revoke_id = 'r:%s' % self.id
+        self.cancel_id = 'c:%s' % self.id
         self.eta = eta
         self.retries = retries if retries is not None else self.default_retries
         self.retry_delay = retry_delay if retry_delay is not None else \
@@ -877,6 +960,25 @@ class Task(object):
     def check_timeout(self):
         if self.is_timed_out:
             raise TaskTimeout('timeout %ss' % self.timeout)
+
+    def is_cancelled(self):
+        """
+        Check whether a cooperative cancellation request is pending for this
+        task. Intended to be called from within a running task (see the
+        ``context=True`` task option) at safe points.
+        """
+        huey = self.huey
+        return huey is not None and huey.is_cancelled(self)
+
+    def check_cancelled(self):
+        """
+        Cooperative cancellation checkpoint. If cancellation was requested
+        for this task (via ``Huey.cancel()`` / ``Result.cancel()``), raises
+        ``TaskCancelled``. Cancellation is terminal: the task will not be
+        retried and neither the success nor error pipelines will run.
+        """
+        if self.is_cancelled():
+            raise TaskCancelled(self.id)
 
     def extend_data(self, data):
         if data is None or data == ():
@@ -978,6 +1080,7 @@ class TaskWrapper(object):
         attrs = {
             'context': context,
             'execute': execute,
+            'huey': self.huey,
             '__module__': func.__module__,
             '__doc__': func.__doc__}
         attrs.update(settings)
@@ -1259,11 +1362,21 @@ class Result(object):
         result = self.get_raw_result(blocking, timeout, backoff, max_delay,
                                      revoke_on_timeout, preserve)
         if result is not None and isinstance(result, Error):
+            if result.metadata.get('cancelled'):
+                raise TaskCancelled(result.metadata.get('task_id'))
             raise TaskException(result.metadata)
         return result
 
     def is_revoked(self):
         return self.huey.is_revoked(self.task, peek=True)
+
+    def is_cancelled(self):
+        return self.huey.is_cancelled(self.task)
+
+    def cancel(self):
+        # Request cooperative cancellation of a (possibly running) task. The
+        # task observes the request at its check_cancelled() checkpoints.
+        self.huey.cancel(self.task)
 
     def revoke(self, revoke_once=True):
         self.huey.revoke(self.task, revoke_once=revoke_once)

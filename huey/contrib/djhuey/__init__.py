@@ -108,6 +108,9 @@ revoke = HUEY.revoke
 revoke_all = HUEY.revoke_all
 revoke_by_id = HUEY.revoke_by_id
 is_revoked = HUEY.is_revoked
+cancel = HUEY.cancel
+cancel_by_id = HUEY.cancel_by_id
+is_cancelled = HUEY.is_cancelled
 result = HUEY.result
 scheduled = HUEY.scheduled
 
