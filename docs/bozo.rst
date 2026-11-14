@@ -34,3 +34,19 @@ Detecting a non-well-formed feed
 There are many reasons an :abbr:`XML (Extensible Markup Language)` document
 could be non-well-formed besides this example (incomplete end tags)  See
 :ref:`advanced.encoding` for some other ways to trip the bozo bit.
+
+Ordered diagnostics
+-------------------
+
+``bozo_exception`` records only one problem.  If a feed needs an encoding
+fallback and also fails strict XML parsing, the later error can hide the
+earlier one.  When a problem is recorded, the parse result includes an
+optional :ref:`bozo_diagnostics <reference.bozo_diagnostics>` list in
+occurrence order.  Items distinguish the ``fetch``, ``encoding``, ``strict``,
+and ``loose`` phases (with ``json`` used for JSON parsing), and
+:ref:`parse_path <reference.parse_path>` records the parser that was finally
+used.
+
+The legacy ``bozo`` and ``bozo_exception`` fields keep their existing meaning.
+In particular, a successful loose recovery leaves ``bozo`` set and does not
+discard diagnostics from earlier phases.

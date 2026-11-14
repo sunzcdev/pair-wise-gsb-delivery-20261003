@@ -33,6 +33,13 @@ import xml.sax
 from typing import IO
 
 from . import http
+from .diagnostics import (
+    PHASE_FETCH,
+    PHASE_JSON,
+    PHASE_LOOSE,
+    PHASE_STRICT,
+    record_diagnostic,
+)
 from .encodings import MissingEncoding, convert_file_to_utf8
 from .html import BaseHTMLProcessor
 from .mixin import XMLParserMixin
@@ -210,6 +217,7 @@ def parse(
                 "bozo_exception": error,
             }
         )
+        record_diagnostic(result, PHASE_FETCH, error)
         return result
 
     # at this point, the file is guaranteed to be seekable;
@@ -328,7 +336,12 @@ def _parse_file_inplace(
         except xml.sax.SAXException as e:
             result["bozo"] = 1
             result["bozo_exception"] = feed_parser.exc or e
+            record_diagnostic(result, PHASE_STRICT, feed_parser.exc or e)
             use_strict_parser = False
+        else:
+            result["parse_path"] = "strict"
+            if feed_parser.exc is not None:
+                record_diagnostic(result, PHASE_STRICT, feed_parser.exc)
 
     # The loose XML parser will be tried if the strict XML parser was not used
     # (or if it failed to parse the feed).
@@ -351,21 +364,33 @@ def _parse_file_inplace(
         # When/if LooseFeedParser will support being fed chunks,
         # replace the read() call above with read(size)/feed() calls in a loop.
 
-        feed_parser.feed(data)
+        try:
+            feed_parser.feed(data)
+        except Exception as e:
+            result["bozo"] = 1
+            result["bozo_exception"] = e
+            record_diagnostic(result, PHASE_LOOSE, e)
+            use_json_parser = True
 
         # If parsing with the loose XML parser resulted in no information,
         # flag that the JSON parser should be tried.
-        if not (feed_parser.entries or feed_parser.feeddata or feed_parser.version):
+        if not use_json_parser and not (
+            feed_parser.entries or feed_parser.feeddata or feed_parser.version
+        ):
             use_json_parser = True
+        elif not use_json_parser:
+            result["parse_path"] = "loose"
 
     if use_json_parser:
         result["version"] = None
+        result["parse_path"] = "json"
         feed_parser = JSONParser(baseuri, baselang, "utf-8")
         try:
             feed_parser.feed(stream_factory.get_file())
         except Exception as e:
             result["bozo"] = 1
             result["bozo_exception"] = e
+            record_diagnostic(result, PHASE_JSON, e)
 
     result["feed"] = feed_parser.feeddata
     result["entries"] = feed_parser.entries

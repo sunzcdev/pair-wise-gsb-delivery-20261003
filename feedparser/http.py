@@ -32,6 +32,7 @@ import typing
 import requests
 
 from .datetimes import _parse_date
+from .diagnostics import PHASE_FETCH, record_diagnostic
 
 # HTTP "Accept" header to send to servers when downloading feeds.
 ACCEPT_HEADER: str = (
@@ -56,6 +57,7 @@ def get(url: str, result: dict[str, typing.Any]) -> bytes:
     except requests.RequestException as exception:
         result["bozo"] = True
         result["bozo_exception"] = exception
+        record_diagnostic(result, PHASE_FETCH, exception)
         return b""
 
     # Lowercase the HTTP header keys for comparisons per RFC 2616.

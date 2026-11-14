@@ -46,6 +46,7 @@ else:
         return chardet.detect(data)["encoding"] or ""
 
 
+from .diagnostics import PHASE_ENCODING, clear_phase_diagnostics, record_diagnostic
 from .exceptions import (
     CharacterEncodingOverride,
     CharacterEncodingUnknown,
@@ -331,6 +332,7 @@ def convert_to_utf8(
     if error:
         result["bozo"] = True
         result["bozo_exception"] = error
+        record_diagnostic(result, PHASE_ENCODING, error)
     return data
 
 
@@ -411,6 +413,7 @@ def convert_file_to_utf8(
         except UnicodeDecodeError:
             # fall back to convert_to_utf8()
             file = factory.get_binary_file()
+            clear_phase_diagnostics(result, PHASE_ENCODING)
         else:
             return factory
 

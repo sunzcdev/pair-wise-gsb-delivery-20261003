@@ -8,3 +8,7 @@ See :ref:`advanced.bozo` for more details.
 .. tip::
 
     ``bozo_exception`` will only be present if ``bozo`` is ``1``.
+
+    This field retains only one exception for compatibility.  Use
+    :ref:`reference.bozo_diagnostics` to inspect all recorded problems in
+    order.
