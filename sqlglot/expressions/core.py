@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import datetime
+import enum
 import logging
 import math
 import numbers
@@ -1653,6 +1654,22 @@ class Connector(Binary):
     pass
 
 
+class Volatility(enum.Enum):
+    """
+    Call-level stability of a function's result.
+
+    PURE: deterministic and side-effect free; calls may be freely duplicated, moved, or removed.
+    STABLE: constant within a single statement (e.g. CURRENT_TIMESTAMP); calls may be duplicated
+        within a statement, but not moved across statement boundaries.
+    VOLATILE: may return a different value on every call (e.g. RAND) or have side effects; the
+        number and placement of evaluations must be preserved.
+    """
+
+    PURE = "pure"
+    STABLE = "stable"
+    VOLATILE = "volatile"
+
+
 @trait
 class Func(Condition):
     """
@@ -1668,11 +1685,15 @@ class Func(Condition):
             function expression. These values are used to map this node to a name during parsing as
             well as to provide the function's name during SQL string generation. By default the SQL
             name is set to the expression's class name transformed to snake case.
+        volatility (Volatility): the call-level stability of the function's result. Known
+            functions default to `Volatility.PURE`; volatile or statement-stable functions
+            override this. Unknown (anonymous) functions are conservatively volatile.
     """
 
     is_var_len_args: t.ClassVar[bool] = False
     var_len_arg_key: t.ClassVar[str] = "expressions"
     _sql_names: t.ClassVar[list[str]] = []
+    volatility: t.ClassVar[Volatility] = Volatility.PURE
 
     @classmethod
     def from_arg_list(cls, args: Sequence[object]) -> Self:
@@ -2016,6 +2037,8 @@ class ParameterizedAgg(Expression, AggFunc):
 class Anonymous(Expression, Func):
     arg_types = {"this": True, "expressions": False}
     is_var_len_args = True
+    # Unknown functions are conservatively treated as per-call volatile.
+    volatility: t.ClassVar[Volatility] = Volatility.VOLATILE
 
     @property
     def name(self) -> str:
@@ -2026,6 +2049,7 @@ class AnonymousAggFunc(Expression, AggFunc):
     arg_types = {"this": True, "expressions": False}
     is_var_len_args = True
     _hash_raw_args = True
+    volatility: t.ClassVar[Volatility] = Volatility.VOLATILE
 
 
 class CombinedAggFunc(AnonymousAggFunc):

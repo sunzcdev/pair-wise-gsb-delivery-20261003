@@ -10,6 +10,7 @@ from sqlglot.expressions.core import (
     Binary,
     SubqueryPredicate,
     ExpOrStr,
+    Volatility,
     maybe_parse,
     maybe_copy,
 )
@@ -236,94 +237,117 @@ class ToVariant(Expression, Func):
 
 class CurrentAccount(Expression, Func):
     arg_types = {}
+    volatility = Volatility.STABLE
 
 
 class CurrentAccountName(Expression, Func):
     arg_types = {}
+    volatility = Volatility.STABLE
 
 
 class CurrentAvailableRoles(Expression, Func):
     arg_types = {}
+    volatility = Volatility.STABLE
 
 
 class CurrentCatalog(Expression, Func):
     arg_types = {}
+    volatility = Volatility.STABLE
 
 
 class CurrentClient(Expression, Func):
     arg_types = {}
+    volatility = Volatility.STABLE
 
 
 class CurrentDatabase(Expression, Func):
     arg_types = {}
+    volatility = Volatility.STABLE
 
 
 class CurrentIpAddress(Expression, Func):
     arg_types = {}
+    volatility = Volatility.STABLE
 
 
 class CurrentOrganizationName(Expression, Func):
     arg_types = {}
+    volatility = Volatility.STABLE
 
 
 class CurrentOrganizationUser(Expression, Func):
     arg_types = {}
+    volatility = Volatility.STABLE
 
 
 class CurrentRegion(Expression, Func):
     arg_types = {}
+    volatility = Volatility.STABLE
 
 
 class CurrentRole(Expression, Func):
     arg_types = {}
+    volatility = Volatility.STABLE
 
 
 class CurrentRoleType(Expression, Func):
     arg_types = {}
+    volatility = Volatility.STABLE
 
 
 class CurrentSchema(Expression, Func):
     arg_types = {"this": False}
+    volatility = Volatility.STABLE
 
 
 class CurrentSchemas(Expression, Func):
     arg_types = {"this": False}
+    volatility = Volatility.STABLE
 
 
 class CurrentSecondaryRoles(Expression, Func):
     arg_types = {}
+    volatility = Volatility.STABLE
 
 
 class CurrentSession(Expression, Func):
     arg_types = {}
+    volatility = Volatility.STABLE
 
 
 class CurrentStatement(Expression, Func):
     arg_types = {}
+    volatility = Volatility.STABLE
 
 
 class CurrentTransaction(Expression, Func):
     arg_types = {}
+    volatility = Volatility.STABLE
 
 
 class CurrentUser(Expression, Func):
     arg_types = {"this": False}
+    volatility = Volatility.STABLE
 
 
 class CurrentUserId(Expression, Func):
     arg_types = {}
+    volatility = Volatility.STABLE
 
 
 class CurrentVersion(Expression, Func):
     arg_types = {}
+    volatility = Volatility.STABLE
 
 
 class CurrentWarehouse(Expression, Func):
     arg_types = {}
+    volatility = Volatility.STABLE
 
 
 class SessionUser(Expression, Func):
     arg_types = {}
+    volatility = Volatility.STABLE
 
 
 # ML / AI
@@ -488,19 +512,23 @@ class Columns(Expression, Func):
 
 class Normal(Expression, Func):
     arg_types = {"this": True, "stddev": True, "gen": True}
+    volatility = Volatility.VOLATILE
 
 
 class Rand(Expression, Func):
     _sql_names = ["RAND", "RANDOM"]
     arg_types = {"this": False, "lower": False, "upper": False}
+    volatility = Volatility.VOLATILE
 
 
 class Randn(Expression, Func):
     arg_types = {"this": False}
+    volatility = Volatility.VOLATILE
 
 
 class Randstr(Expression, Func):
     arg_types = {"this": True, "generator": False}
+    volatility = Volatility.VOLATILE
 
 
 class RangeBucket(Expression, Func):
@@ -513,28 +541,34 @@ class RangeN(Expression, Func):
 
 class Seq1(Expression, Func):
     arg_types = {"this": False}
+    volatility = Volatility.VOLATILE
 
 
 class Seq2(Expression, Func):
     arg_types = {"this": False}
+    volatility = Volatility.VOLATILE
 
 
 class Seq4(Expression, Func):
     arg_types = {"this": False}
+    volatility = Volatility.VOLATILE
 
 
 class Seq8(Expression, Func):
     arg_types = {"this": False}
+    volatility = Volatility.VOLATILE
 
 
 class Uniform(Expression, Func):
     arg_types = {"this": True, "expression": True, "gen": False, "seed": False}
+    volatility = Volatility.VOLATILE
 
 
 class Uuid(Expression, Func):
     _sql_names = ["UUID", "GEN_RANDOM_UUID", "GENERATE_UUID", "UUID_STRING"]
 
     arg_types = {"this": False, "name": False, "is_string": False}
+    volatility = Volatility.VOLATILE
 
 
 class WeekStart(Expression, Func):

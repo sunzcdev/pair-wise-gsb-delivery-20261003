@@ -5,7 +5,7 @@ from __future__ import annotations
 import typing as t
 
 from sqlglot.helper import trait
-from sqlglot.expressions.core import Expression, Expr, Func
+from sqlglot.expressions.core import Expression, Expr, Func, Volatility
 from sqlglot.expressions.query import Query, Selectable
 
 if t.TYPE_CHECKING:
@@ -441,6 +441,7 @@ class Use(Expression):
 
 class NextValueFor(Expression, Func):
     arg_types = {"this": True, "order": False}
+    volatility = Volatility.VOLATILE
 
 
 class Execute(Expression):

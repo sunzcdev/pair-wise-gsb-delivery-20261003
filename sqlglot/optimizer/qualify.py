@@ -33,6 +33,7 @@ def qualify(
     canonicalize_table_aliases: bool = False,
     on_qualify: t.Callable[[exp.Table], None] | None = None,
     sql: str | None = None,
+    function_volatilities: t.Mapping[str, str | exp.Volatility] | None = None,
 ) -> E:
     """
     Rewrite sqlglot AST to have normalized and qualified tables and columns.
@@ -68,6 +69,8 @@ def qualify(
         on_qualify: Callback after a table has been qualified.
         sql: Original SQL string for error highlighting. If not provided, errors will not include
             highlighting. Requires that the expression has position metadata from parsing.
+        function_volatilities: call-level volatility declarations for functions, keyed by
+            function name; see `sqlglot.optimizer.helpers.normalize_function_volatilities`.
 
     Returns:
         The qualified expression.
@@ -99,6 +102,7 @@ def qualify(
             expand_alias_refs=expand_alias_refs,
             expand_stars=expand_stars,
             allow_partial_qualification=allow_partial_qualification,
+            function_volatilities=function_volatilities,
         )
 
     if quote_identifiers:

@@ -9,6 +9,11 @@ from sqlglot import alias, exp
 from sqlglot.dialects.dialect import AliasPrecedence, Dialect, DialectType, UsingColumnOrder
 from sqlglot.errors import OptimizeError, highlight_sql
 from sqlglot.optimizer.annotate_types import TypeAnnotator
+from sqlglot.optimizer.helpers import (
+    FunctionVolatilities,
+    contains_volatile,
+    normalize_function_volatilities,
+)
 from sqlglot.optimizer.resolver import Resolver
 from sqlglot.optimizer.scope import (
     Scope,
@@ -28,6 +33,10 @@ if t.TYPE_CHECKING:
 
 GROUPING_CONTAINERS = (exp.Group, exp.GroupingSets, exp.Cube, exp.Rollup, exp.Tuple, exp.Paren)
 
+# Meta key marking a column that intentionally references a projection alias holding a
+# per-call volatile function; it must not be expanded, so validation accepts it unqualified.
+UNEXPANDED_ALIAS_REF = "unexpanded_alias_ref"
+
 
 def qualify_columns(
     expression: E,
@@ -36,6 +45,7 @@ def qualify_columns(
     expand_stars: bool = True,
     allow_partial_qualification: bool = False,
     dialect: DialectType = None,
+    function_volatilities: FunctionVolatilities | None = None,
 ) -> E:
     """
     Rewrite sqlglot AST to have fully qualified columns.
@@ -55,6 +65,10 @@ def qualify_columns(
             for most of the optimizer's rules to work; do not set to False unless you
             know what you're doing!
         allow_partial_qualification: Whether to allow partial qualification.
+        function_volatilities: call-level volatility declarations for functions, keyed by
+            function name; see `sqlglot.optimizer.helpers.normalize_function_volatilities`.
+            Aliases holding a per-call volatile function (e.g. RAND) are not expanded into
+            their references, since that would evaluate them once per reference.
 
     Returns:
         The qualified expression.
@@ -69,6 +83,7 @@ def qualify_columns(
     annotator = TypeAnnotator(schema)
     dialect = schema.dialect or Dialect()
     pseudocolumns = dialect.PSEUDOCOLUMNS
+    volatilities = normalize_function_volatilities(function_volatilities)
 
     # Qualified scopes that still lack types, in traversal order (sources precede dependents)
     unannotated_scopes: list[Scope] = []
@@ -97,6 +112,7 @@ def qualify_columns(
                 resolver,
                 dialect,
                 expand_only_groupby=dialect.EXPAND_ONLY_GROUP_ALIAS_REF,
+                function_volatilities=volatilities,
             )
 
         _convert_columns_to_dots(scope, resolver)
@@ -122,7 +138,7 @@ def qualify_columns(
 
         # HAVING precedence can depend on positional GROUP BY targets within a star.
         if expand_alias_refs:
-            _expand_alias_refs(scope, resolver, dialect)
+            _expand_alias_refs(scope, resolver, dialect, function_volatilities=volatilities)
 
         if is_select:
             qualify_outputs(scope, dialect=dialect)
@@ -146,10 +162,15 @@ def validate_qualify_columns(expression: E, sql: str | None = None) -> E:
     all_unqualified_columns = []
     for scope in traverse_scope(expression):
         if isinstance(scope.expression, exp.Select):
-            unqualified_columns = scope.unqualified_columns
+            unqualified_columns = [
+                c for c in scope.unqualified_columns if not c.meta_get(UNEXPANDED_ALIAS_REF)
+            ]
+            external_columns = [
+                c for c in scope.external_columns if not c.meta_get(UNEXPANDED_ALIAS_REF)
+            ]
 
-            if scope.external_columns and not scope.is_correlated_subquery and not scope.pivots:
-                column = scope.external_columns[0]
+            if external_columns and not scope.is_correlated_subquery and not scope.pivots:
+                column = external_columns[0]
                 for_table = f" for table: '{column.table}'" if column.table else ""
                 line = column.this.meta_get("line")
                 col = column.this.meta_get("col")
@@ -367,7 +388,11 @@ def _expand_using(scope: Scope, resolver: Resolver) -> tuple[dict[str, t.Any], l
 
 
 def _expand_alias_refs(
-    scope: Scope, resolver: Resolver, dialect: Dialect, expand_only_groupby: bool = False
+    scope: Scope,
+    resolver: Resolver,
+    dialect: Dialect,
+    expand_only_groupby: bool = False,
+    function_volatilities: dict[str, exp.Volatility] | None = None,
 ) -> None:
     """
     Expand references to aliases.
@@ -408,6 +433,7 @@ def _expand_alias_refs(
                 continue
 
             skip_replace = False
+            volatile_alias_ref = False
             table = resolver.get_table(column) if resolve_table and not column.table else None
             alias_expr, i = alias_to_expression.get(column.name, (None, 1))
 
@@ -435,6 +461,14 @@ def _expand_alias_refs(
                         node.parts[0].name in projections
                         for node in alias_expr.find_all(exp.Column)
                     )
+
+                if contains_volatile(alias_expr, function_volatilities):
+                    # Expanding a per-call volatile alias (e.g. RAND() AS r) into each
+                    # reference would evaluate it once per reference instead of once per
+                    # row, changing both the call count and the produced values.
+                    skip_replace = True
+                    volatile_alias_ref = True
+
             prefer_column = precedence in (AliasPrecedence.SOURCE, AliasPrecedence.MERGED_SOURCE)
             if table and precedence == AliasPrecedence.GROUPED_SOURCE:
                 prefer_column = (
@@ -475,6 +509,10 @@ def _expand_alias_refs(
                                 and (inner_table := resolver.get_table(inner))
                             ):
                                 inner.set("table", inner_table)
+            elif volatile_alias_ref and not column.table:
+                # The reference must be evaluated against the projection's single result,
+                # so keep the bare alias name and let validation accept it.
+                column.meta[UNEXPANDED_ALIAS_REF] = True
 
     for i, projection in enumerate(expression.selects):
         replace_columns(projection)

@@ -6,7 +6,13 @@ from collections import defaultdict, deque
 from sqlglot import alias, exp
 from sqlglot.errors import OptimizeError
 from sqlglot.helper import seq_get
-from sqlglot.optimizer.helpers import is_implicit_group_by_all, projection_has_aggregate
+from sqlglot.optimizer.helpers import (
+    FunctionVolatilities,
+    contains_volatile,
+    is_implicit_group_by_all,
+    normalize_function_volatilities,
+    projection_has_aggregate,
+)
 from sqlglot.optimizer.journal import Journal, record
 from sqlglot.optimizer.scope import Scope, find_all_in_scope, traverse_scope
 
@@ -14,7 +20,11 @@ if t.TYPE_CHECKING:
     from sqlglot._typing import E
 
 
-def pushdown_projections(expression: E, journal: Journal | None = None) -> E:
+def pushdown_projections(
+    expression: E,
+    journal: Journal | None = None,
+    function_volatilities: FunctionVolatilities | None = None,
+) -> E:
     """
     Remove unused projections and CTEs while preserving all outermost outputs.
 
@@ -31,12 +41,21 @@ def pushdown_projections(expression: E, journal: Journal | None = None) -> E:
     Args:
         expression: the expression to optimize, mutated in place.
         journal: if given, records every mutation so that `revert(journal)` undoes this rule.
+        function_volatilities: call-level volatility declarations for functions, keyed by
+            function name; see `sqlglot.optimizer.helpers.normalize_function_volatilities`.
+            Unreferenced CTEs holding per-call volatile functions (e.g. RAND) are kept,
+            since removing them would drop their evaluations.
 
     Returns:
         The optimized expression.
     """
     reachability = projection_reachability(expression, whole_query=True)
-    prune_projections(reachability, root=0, journal=journal)
+    prune_projections(
+        reachability,
+        root=0,
+        journal=journal,
+        function_volatilities=normalize_function_volatilities(function_volatilities),
+    )
     return expression
 
 
@@ -418,6 +437,7 @@ def prune_projections(
     root: int,
     journal: Journal | None = None,
     remove_ctes: bool = True,
+    function_volatilities: dict[str, exp.Volatility] | None = None,
 ) -> None:
     """Prune the analyzed tree to the scopes and projections reachable from root output index root.
 
@@ -427,6 +447,7 @@ def prune_projections(
     This edits SELECT projection lists, renumbers bare GROUP BY ordinals, and removes
     unused CTEs unless remove_ctes is false. Other clauses remain in their containing
     expressions; their dependencies keep the outputs those clauses reference.
+    CTEs holding per-call volatile functions are never removed.
 
     Grouping ordinals and set-operation names were saved during analysis, before pruning.
     Mutations are recorded in journal, if given, so the original tree can be restored before
@@ -436,7 +457,11 @@ def prune_projections(
     bit = 1 << root
     for scope in reversed(reachability.scopes):
         if not reachability.live[scope] & bit:
-            if remove_ctes and scope.is_cte:
+            if (
+                remove_ctes
+                and scope.is_cte
+                and not contains_volatile(scope.expression, function_volatilities)
+            ):
                 cte_node = scope.expression.parent
                 if isinstance(cte_node, exp.CTE):
                     with_node = cte_node.parent

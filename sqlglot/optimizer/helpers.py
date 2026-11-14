@@ -1,9 +1,65 @@
 from __future__ import annotations
 
+import typing as t
+
 from sqlglot import exp
 from sqlglot.optimizer.scope import find_in_scope, walk_in_scope
 
 WINDOW_HAS_AGGREGATE = "window_has_aggregate"
+
+# User-supplied, call-level function volatility declarations: SQL function name
+# (case-insensitive) -> "pure" | "stable" | "volatile" (or a `exp.Volatility`).
+FunctionVolatilities = t.Mapping[str, "str | exp.Volatility"]
+
+
+def normalize_function_volatilities(
+    function_volatilities: FunctionVolatilities | None,
+) -> dict[str, exp.Volatility]:
+    """Normalize call-level volatility declarations for case-insensitive lookup."""
+    if not function_volatilities:
+        return {}
+    return {
+        name.upper(): exp.Volatility(volatility)
+        for name, volatility in function_volatilities.items()
+    }
+
+
+def function_volatility(
+    func: exp.Func, function_volatilities: dict[str, exp.Volatility] | None = None
+) -> exp.Volatility:
+    """
+    Resolve the volatility of a function call.
+
+    Call-level declarations (normalized by `normalize_function_volatilities`) take
+    precedence over the function's declared volatility. Unknown (anonymous) functions
+    are conservatively volatile; volatility is never inferred from the function's name.
+    """
+    if function_volatilities:
+        if isinstance(func, (exp.Anonymous, exp.AnonymousAggFunc)):
+            names = [func.text("this")]
+        else:
+            names = func.sql_names()
+        for name in names:
+            volatility = function_volatilities.get(name.upper())
+            if volatility is not None:
+                return volatility
+    return func.volatility
+
+
+def contains_volatile(
+    expression: exp.Expr, function_volatilities: dict[str, exp.Volatility] | None = None
+) -> bool:
+    """
+    Whether an expression contains a per-call volatile function call, so that
+    duplicating, removing, or reordering its evaluations could change results.
+    Statement-stable and pure functions don't count: within a statement they may
+    be freely duplicated.
+    """
+    return any(
+        isinstance(node, exp.Func)
+        and function_volatility(node, function_volatilities) is exp.Volatility.VOLATILE
+        for node in expression.walk()
+    )
 
 
 def is_implicit_group_by_all(select: exp.Select) -> bool:

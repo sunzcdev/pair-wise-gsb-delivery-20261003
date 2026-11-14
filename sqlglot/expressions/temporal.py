@@ -11,6 +11,7 @@ from sqlglot.expressions.core import (
     IntervalOp,
     Literal,
     Column,
+    Volatility,
     TIMESTAMP_PARTS,
 )
 from sqlglot.expressions.datatypes import DataType, DType
@@ -24,50 +25,62 @@ if t.TYPE_CHECKING:
 
 class CurrentDate(Expression, Func):
     arg_types = {"this": False}
+    volatility = Volatility.STABLE
 
 
 class CurrentDatetime(Expression, Func):
     arg_types = {"this": False}
+    volatility = Volatility.STABLE
 
 
 class CurrentTime(Expression, Func):
     arg_types = {"this": False}
+    volatility = Volatility.STABLE
 
 
 class CurrentTimestamp(Expression, Func):
     arg_types = {"this": False, "sysdate": False}
+    volatility = Volatility.STABLE
 
 
 class CurrentTimestampLTZ(Expression, Func):
     arg_types = {}
+    volatility = Volatility.STABLE
 
 
 class CurrentTimezone(Expression, Func):
     arg_types = {}
+    volatility = Volatility.STABLE
 
 
 class Localtime(Expression, Func):
     arg_types = {"this": False}
+    volatility = Volatility.STABLE
 
 
 class Localtimestamp(Expression, Func):
     arg_types = {"this": False}
+    volatility = Volatility.STABLE
 
 
 class Systimestamp(Expression, Func):
     arg_types = {"this": False}
+    volatility = Volatility.STABLE
 
 
 class UtcDate(Expression, Func):
     arg_types = {}
+    volatility = Volatility.STABLE
 
 
 class UtcTime(Expression, Func):
     arg_types = {"this": False}
+    volatility = Volatility.STABLE
 
 
 class UtcTimestamp(Expression, Func):
     arg_types = {"this": False}
+    volatility = Volatility.STABLE
 
 
 # Date arithmetic

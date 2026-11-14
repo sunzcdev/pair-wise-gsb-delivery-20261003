@@ -6,7 +6,13 @@ from collections import Counter, defaultdict
 
 from sqlglot import expressions as exp
 from sqlglot.helper import find_new_name, seq_get
-from sqlglot.optimizer.helpers import is_implicit_group_by_all, projection_has_aggregate
+from sqlglot.optimizer.helpers import (
+    FunctionVolatilities,
+    contains_volatile,
+    is_implicit_group_by_all,
+    normalize_function_volatilities,
+    projection_has_aggregate,
+)
 from sqlglot.optimizer.scope import Scope, find_all_in_scope, traverse_scope
 
 if t.TYPE_CHECKING:
@@ -69,6 +75,7 @@ def merge_subqueries(
     leave_tables_isolated: bool = False,
     max_copy_factor: int | None = CopyBudget.MAX_COPY_FACTOR,
     min_copy_budget: int = CopyBudget.MIN_COPY_BUDGET,
+    function_volatilities: FunctionVolatilities | None = None,
 ) -> E:
     """
     Rewrite sqlglot AST to merge derived tables into the outer query.
@@ -94,9 +101,16 @@ def merge_subqueries(
         leave_tables_isolated (bool):
         max_copy_factor: see `CopyBudget.MAX_COPY_FACTOR`; `None` disables the copy budget.
         min_copy_budget: see `CopyBudget.MIN_COPY_BUDGET`.
+        function_volatilities: call-level volatility declarations for functions, keyed by
+            function name; see `sqlglot.optimizer.helpers.normalize_function_volatilities`.
+            A projection holding a per-call volatile function (e.g. RAND) is not merged
+            into an outer query that references it more than once, since merging would
+            evaluate it once per reference instead of once.
     Returns:
         sqlglot.Expr: optimized expression
     """
+    volatilities = normalize_function_volatilities(function_volatilities)
+
     # Shared across both passes so the scope tree is only built once, as long as merge_ctes
     # doesn't mutate the AST; if it does, the scopes it was given are no longer valid, so the
     # scope tree needs to be rebuilt before merge_derived_tables runs.
@@ -106,14 +120,22 @@ def merge_subqueries(
         expression, max_copy_factor=max_copy_factor, min_copy_budget=min_copy_budget
     )
     expression, merged_ctes = merge_ctes(
-        expression, leave_tables_isolated, scopes=scopes, copy_budget=copy_budget
+        expression,
+        leave_tables_isolated,
+        scopes=scopes,
+        copy_budget=copy_budget,
+        function_volatilities=volatilities,
     )
 
     if merged_ctes:
         scopes = traverse_scope(expression)
 
     expression = merge_derived_tables(
-        expression, leave_tables_isolated, scopes=scopes, copy_budget=copy_budget
+        expression,
+        leave_tables_isolated,
+        scopes=scopes,
+        copy_budget=copy_budget,
+        function_volatilities=volatilities,
     )
     return expression
 
@@ -161,6 +183,7 @@ def merge_ctes(
     leave_tables_isolated: bool = False,
     scopes: list[Scope] | None = None,
     copy_budget: CopyBudget | None = None,
+    function_volatilities: dict[str, exp.Volatility] | None = None,
 ) -> tuple[E, bool]:
     copy_budget = copy_budget or CopyBudget(expression)
 
@@ -186,7 +209,12 @@ def merge_ctes(
             continue
         alias = table.alias_or_name
         if _mergeable(
-            outer_scope, inner_scope, leave_tables_isolated, from_or_join, table
+            outer_scope,
+            inner_scope,
+            leave_tables_isolated,
+            from_or_join,
+            table,
+            function_volatilities,
         ) and copy_budget.consume(outer_scope, inner_scope, alias):
             _rename_inner_sources(outer_scope, inner_scope, alias)
             _merge_from(outer_scope, inner_scope, table, alias)
@@ -206,6 +234,7 @@ def merge_derived_tables(
     leave_tables_isolated: bool = False,
     scopes: list[Scope] | None = None,
     copy_budget: CopyBudget | None = None,
+    function_volatilities: dict[str, exp.Volatility] | None = None,
 ) -> E:
     copy_budget = copy_budget or CopyBudget(expression)
 
@@ -219,7 +248,12 @@ def merge_derived_tables(
             if not isinstance(inner_scope, Scope):
                 continue
             if _mergeable(
-                outer_scope, inner_scope, leave_tables_isolated, from_or_join, subquery
+                outer_scope,
+                inner_scope,
+                leave_tables_isolated,
+                from_or_join,
+                subquery,
+                function_volatilities,
             ) and copy_budget.consume(outer_scope, inner_scope, alias):
                 _rename_inner_sources(outer_scope, inner_scope, alias)
                 _merge_from(outer_scope, inner_scope, subquery, alias)
@@ -239,6 +273,7 @@ def _mergeable(
     leave_tables_isolated: bool,
     from_or_join: FromOrJoin,
     source: exp.Selectable,
+    function_volatilities: dict[str, exp.Volatility] | None = None,
 ) -> bool:
     """
     Return True if `inner_select` can be merged into outer query.
@@ -375,6 +410,21 @@ def _mergeable(
             node = node.parent
         return False
 
+    def _volatile_projection_duplicated(projections: dict[str, exp.Expr]) -> bool:
+        """
+        Merging copies an inner projection into every outer reference to it, so a
+        projection holding a per-call volatile function (e.g. RAND) would be evaluated
+        once per reference instead of once per row, changing both the call count and
+        the produced values. Statement-stable and pure functions may be duplicated.
+        """
+        references = Counter(c.name for c in outer_scope.columns if c.table == inner_name)
+        return any(
+            count > 1
+            and (projection := projections.get(name)) is not None
+            and contains_volatile(projection, function_volatilities)
+            for name, count in references.items()
+        )
+
     def _literal_in_order_by(number_literal_aliases: set[str]) -> bool:
         """A numeric-literal projection under a bare ORDER BY key can't merge (would become positional)."""
         order = outer_args.get("order")
@@ -484,6 +534,7 @@ def _mergeable(
     return (
         not _constant_projection_empties_group_by_all(column_free_aliases)
         and not _outer_select_joins_on_inner_select_join(projections)
+        and not _volatile_projection_duplicated(projections)
         and not _window_projection_blocks_merge(window_aliases)
         and not _literal_group_unmergeable(number_literal_aliases)
         and not _literal_in_order_by(number_literal_aliases)

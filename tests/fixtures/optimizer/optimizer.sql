@@ -527,6 +527,7 @@ SELECT
 FROM "db1"."tbl" AS "tbl"
 CROSS JOIN "db2"."tbl" AS "tbl_2";
 
+# title: unknown (conservatively volatile) function alias is not expanded into QUALIFY
 # execute: false
 # schema: {"unioned": {"uploaded_at": "TIMESTAMP", "source_system": "TEXT", "unique_filter_key": "TEXT"}}
 SELECT
@@ -569,14 +570,7 @@ FROM "unioned" AS "unioned"
 WHERE
   "unioned"."source_system" = 'bamboohr' OR "unioned"."source_system" = 'workday'
 QUALIFY
-  ROW_NUMBER() OVER (
-    PARTITION BY "unioned"."unique_filter_key"
-    ORDER BY IFF(
-      IFF("unioned"."uploaded_at" >= CAST('2022-06-16' AS TIMESTAMP), 'workday', 'bamboohr') = "unioned"."source_system",
-      1,
-      0
-    ) DESC, 1
-  ) = 1;
+  ROW_NUMBER() OVER (PARTITION BY "unioned"."unique_filter_key" ORDER BY "sort_order" DESC, 1) = 1;
 
 # title: pivoted source with explicit selections
 # execute: false
