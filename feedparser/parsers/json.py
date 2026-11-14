@@ -60,6 +60,7 @@ class JSONParser:
         self.feeddata = FeedParserDict()
         self.namespacesInUse = []
         self.entries = []
+        self.errors = []
 
     def feed(self, file):
         data = json.load(file)
@@ -73,13 +74,15 @@ class JSONParser:
         for src, dst in self.FEED_FIELDS:
             if src in data:
                 self.feeddata[dst] = data[src]
-        if "author" in data:
-            self.parse_author(data["author"], self.feeddata)
+        self.parse_authors(data, self.feeddata, "feed")
         # TODO: hubs; expired has no RSS equivalent
 
-        self.entries = [self.parse_entry(e) for e in data["items"]]
+        self.entries = [self.parse_entry(e, i) for i, e in enumerate(data["items"])]
 
-    def parse_entry(self, e):
+        if self.errors:
+            raise ValueError("; ".join(self.errors))
+
+    def parse_entry(self, e, index=None):
         entry = FeedParserDict()
         for src, dst in self.ITEM_FIELDS:
             if src in e:
@@ -106,24 +109,100 @@ class JSONParser:
         if "tags" in e:
             entry["category"] = e["tags"]
 
-        if "author" in e:
-            self.parse_author(e["author"], entry)
+        if "authors" in e or "author" in e:
+            self.parse_authors(e, entry, "items[%s]" % index)
+        else:
+            self.inherit_authors(entry)
 
         if "attachments" in e:
             entry["enclosures"] = [self.parse_attachment(a) for a in e["attachments"]]
 
         return entry
 
+    def parse_authors(self, parent, dest, source):
+        if "authors" in parent:
+            authors = parent["authors"]
+            if not isinstance(authors, list):
+                self.errors.append("%s.authors must be a list" % source)
+                self._set_authors(dest, [])
+                return
+
+            details = []
+            for index, author in enumerate(authors):
+                try:
+                    details.append(self.parse_author(author))
+                except ValueError as error:
+                    self.errors.append(
+                        "%s.authors[%d]: %s" % (source, index, error)
+                    )
+            self._set_authors(dest, details)
+            return
+
+        if "author" in parent:
+            try:
+                details = [self.parse_author(parent["author"])]
+            except ValueError as error:
+                self.errors.append("%s.author: %s" % (source, error))
+                details = []
+            self._set_authors(dest, details)
+
+    def inherit_authors(self, dest):
+        if "authors" not in self.feeddata:
+            return
+
+        authors = [FeedParserDict(author) for author in self.feeddata["authors"]]
+        self._set_authors(dest, authors)
+
     @staticmethod
-    def parse_author(parent, dest):
-        dest["author_detail"] = detail = FeedParserDict()
+    def parse_author(parent, dest=None):
+        if not isinstance(parent, dict):
+            raise ValueError("author must be an object")
+
+        detail = FeedParserDict()
+        has_detail = False
+
         if "name" in parent:
-            dest["author"] = detail["name"] = parent["name"]
+            if not isinstance(parent["name"], str):
+                raise ValueError("author name must be a string")
+            detail["name"] = parent["name"]
+            has_detail = True
+
         if "url" in parent:
+            if not isinstance(parent["url"], str):
+                raise ValueError("author url must be a string")
             if parent["url"].startswith("mailto:"):
                 detail["email"] = parent["url"][7:]
             else:
                 detail["href"] = parent["url"]
+            has_detail = True
+
+        if "avatar" in parent:
+            if not isinstance(parent["avatar"], str):
+                raise ValueError("author avatar must be a string")
+            detail["avatar"] = parent["avatar"]
+            has_detail = True
+
+        if not has_detail:
+            raise ValueError("author has no name, url, or avatar")
+
+        if dest is not None:
+            dest["author_detail"] = detail
+            if "name" in detail:
+                dest["author"] = detail["name"]
+            return None
+
+        return detail
+
+    @staticmethod
+    def _set_authors(dest, authors):
+        dest["authors"] = authors
+        if not authors:
+            return
+
+        detail = authors[-1]
+        dest["author_detail"] = detail
+        if "name" in detail:
+            dest["author"] = detail["name"]
 
     @staticmethod
     def parse_attachment(attachment):
