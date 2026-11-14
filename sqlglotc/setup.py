@@ -68,6 +68,7 @@ def _source_files(src_dir):
                 "qualify_columns.py",
                 "simplify.py",
                 "annotate_types.py",
+                "refresh_types.py",
                 "canonicalize_internal_names.py",
             ],
         ),

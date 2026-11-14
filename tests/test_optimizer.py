@@ -3519,6 +3519,167 @@ SELECT :with_,WITH :expressions,CTE :this,UNION :this,SELECT :expressions,1,:exp
         for _ in range(100):
             self.assertTrue(annotator.annotate(parse_one("1")).is_type(exp.DType.INT))
 
+    def test_refresh_types_matches_full_annotation(self):
+        from sqlglot.optimizer.refresh_types import is_stale, refresh_types
+
+        schema = {"t": {"a": "INT", "b": "VARCHAR"}, "u": {"e": "BIGINT", "f": "VARCHAR"}}
+        cases = (
+            "SELECT a + 1 AS z FROM t",
+            "SELECT a + 1 AS x FROM t ORDER BY x + 2",
+            "WITH c AS (SELECT a + 1 AS x FROM t) SELECT c.x FROM c",
+            "SELECT s.x FROM (SELECT a + 1 AS x FROM t) AS s",
+            "SELECT a + 1 FROM t AS t1 WHERE a IN (SELECT e FROM u AS u1 WHERE u1.f = t1.b)",
+            "SELECT (SELECT max(e) + 1 FROM u WHERE u.f = t.b) AS m FROM t",
+            "SELECT a + 1 AS x FROM t UNION ALL SELECT e FROM u",
+            "WITH c AS (SELECT a + 1 AS a, b FROM t) SELECT c.b, (SELECT count(*) FROM c) FROM c",
+        )
+
+        for sql in cases:
+            with self.subTest(sql=sql):
+                tree = qualify(parse_one(sql), schema=schema, validate_qualify_columns=False)
+                annotate_types(tree, schema=schema)
+
+                literal = tree.find(exp.Literal)
+                self.assertIsNotNone(literal)
+                replacement = parse_one("1.5")
+                literal.replace(replacement)
+
+                result = refresh_types(tree, replacement, schema=schema)
+                expected = tree.copy()
+                annotate_types(expected, schema=schema)
+
+                for node, expected_node in zip(tree.walk(), expected.walk()):
+                    self.assertEqual(node.type, expected_node.type)
+                    self.assertFalse(is_stale(node))
+
+                self.assertIn(replacement, result.invalidated)
+                self.assertTrue(result.scopes)
+
+    def test_refresh_types_reuses_unaffected_branches(self):
+        from sqlglot.optimizer.refresh_types import refresh_types
+
+        schema = {"t": {"a": "INT", "b": "VARCHAR"}}
+        tree = qualify(
+            parse_one("SELECT a + 1 AS changed, b AS untouched FROM t"),
+            schema=schema,
+            validate_qualify_columns=False,
+        )
+        annotate_types(tree, schema=schema)
+
+        untouched = tree.selects[1]
+        untouched_type = untouched.type
+        literal = tree.selects[0].find(exp.Literal)
+        replacement = parse_one("1.5")
+        literal.replace(replacement)
+
+        result = refresh_types(tree, replacement, schema=schema)
+
+        self.assertEqual(untouched.type, untouched_type)
+        self.assertNotIn(untouched, result.invalidated)
+        self.assertTrue(tree.selects[0].is_type(exp.DType.DOUBLE))
+
+    def test_refresh_types_propagation(self):
+        from sqlglot.optimizer.refresh_types import refresh_types
+
+        schema = {"t": {"a": "INT", "b": "VARCHAR"}, "u": {"e": "BIGINT", "f": "VARCHAR"}}
+
+        # Alias reference inside the same scope.
+        tree = qualify(
+            parse_one("SELECT a + 1 AS x FROM t ORDER BY x"),
+            schema=schema,
+            validate_qualify_columns=False,
+        )
+        annotate_types(tree, schema=schema)
+        replacement = parse_one("1.5")
+        tree.find(exp.Literal).replace(replacement)
+        refresh_types(tree, replacement, schema=schema)
+        self.assertTrue(tree.args["order"].find(exp.Column).is_type(exp.DType.DOUBLE))
+
+        # CTE output propagates to every consumer.
+        tree = qualify(
+            parse_one("WITH c AS (SELECT a + 1 AS x FROM t) SELECT c.x FROM c"),
+            schema=schema,
+            validate_qualify_columns=False,
+        )
+        annotate_types(tree, schema=schema)
+        replacement = parse_one("1.5")
+        tree.find(exp.CTE).this.find(exp.Literal).replace(replacement)
+        refresh_types(tree, replacement, schema=schema)
+        self.assertTrue(tree.selects[0].is_type(exp.DType.DOUBLE))
+
+        # A correlated subquery reading an outer column is re-annotated too.
+        tree = qualify(
+            parse_one("SELECT a + 1 FROM t AS t1 WHERE a IN (SELECT e FROM u WHERE u.f = t1.b)"),
+            schema=schema,
+            validate_qualify_columns=False,
+        )
+        annotate_types(tree, schema=schema)
+        replacement = parse_one("'q'")
+        correlated = next(c for c in tree.find_all(exp.Column) if c.name == "f")
+        correlated.replace(replacement)
+        expected = tree.copy()
+        annotate_types(expected, schema=schema)
+        refresh_types(tree, replacement, schema=schema)
+        self.assertEqual(tree.find(exp.Subquery).type, expected.find(exp.Subquery).type)
+
+    def test_refresh_types_edge_cases(self):
+        from sqlglot.optimizer.refresh_types import is_stale, refresh_types
+
+        schema = {"t": {"a": "INT"}}
+
+        # Detached node: strict mode raises, lenient mode reports it as skipped.
+        tree = qualify(
+            parse_one("SELECT a + 1 FROM t"), schema=schema, validate_qualify_columns=False
+        )
+        annotate_types(tree, schema=schema)
+        detached = parse_one("1 + 2")
+        with self.assertRaises(OptimizeError):
+            refresh_types(tree, detached, schema=schema)
+        result = refresh_types(tree, detached, schema=schema, strict=False)
+        self.assertEqual(result.skipped, [detached])
+
+        # Repeated submissions are de-duplicated.
+        replacement = parse_one("2")
+        tree.find(exp.Literal).replace(replacement)
+        once = refresh_types(tree, replacement, schema=schema)
+        twice = refresh_types(tree, [replacement, replacement], schema=schema)
+        self.assertEqual(len(twice.invalidated), len(once.invalidated))
+        self.assertEqual(twice.skipped, [])
+
+        # Unknown schema resolves to UNKNOWN and is surfaced, without raising.
+        tree = qualify(
+            parse_one("SELECT a + 1 FROM t"), schema=schema, validate_qualify_columns=False
+        )
+        annotate_types(tree, schema=schema)
+        unknown_col = parse_one("missing")
+        tree.find(exp.Column).replace(unknown_col)
+        result = refresh_types(tree, unknown_col, schema=schema)
+        self.assertIn(unknown_col, result.unknown)
+        self.assertTrue(tree.selects[0].is_type(exp.DType.UNKNOWN))
+        self.assertFalse(any(is_stale(node) for node in tree.walk()))
+
+        # Refreshing a never-annotated tree behaves like a full annotation.
+        fresh = qualify(
+            parse_one("SELECT a + 1 FROM t"), schema=schema, validate_qualify_columns=False
+        )
+        replacement = parse_one("2")
+        fresh.find(exp.Literal).replace(replacement)
+        expected = fresh.copy()
+        annotate_types(expected, schema=schema)
+        refresh_types(fresh, replacement, schema=schema)
+        for node, expected_node in zip(fresh.walk(), expected.walk()):
+            self.assertEqual(node.type, expected_node.type)
+
+        # A non-traversable expression (no scopes) is refreshed as a single unit.
+        bare = annotate_types(parse_one("1 + 2"))
+        replacement = parse_one("1.5")
+        bare.find(exp.Literal).replace(replacement)
+        expected = bare.copy()
+        annotate_types(expected)
+        refresh_types(bare, replacement)
+        self.assertEqual(bare.type, expected.type)
+        self.assertTrue(bare.is_type(exp.DType.DOUBLE))
+
     def test_annotate_struct_subquery_values(self):
         for sql, expected in (
             ("SELECT (SELECT AS STRUCT 1 AS x) AS value", "STRUCT<x INT64>"),

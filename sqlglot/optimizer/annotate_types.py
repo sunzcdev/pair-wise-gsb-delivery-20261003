@@ -272,14 +272,17 @@ class TypeAnnotator:
         # This takes care of non-traversable expressions
         self.annotate_expression(expression)
 
+        self._apply_default_null_types()
+
+        return expression
+
+    def _apply_default_null_types(self) -> None:
         # Replace NULL type with the default type of the targeted dialect, since the former is not an actual type;
         # it is mostly used to aid type coercion, e.g. in query set operations.
         # TODO (mypyc): uses list() + _set_type instead of direct expr.type = ... because
         # mypyc's property setter bypass rejects DType, and _set_type modifies the dict.
         for expr in list(self._null_expressions.values()):
             self._set_type(expr, self.dialect.DEFAULT_NULL_TYPE)
-
-        return expression
 
     def _get_scope_source_selects(
         self, scope: Scope, source_name: str
