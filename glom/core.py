@@ -25,6 +25,7 @@ import copy
 import warnings
 import weakref
 import operator
+import inspect
 from abc import ABCMeta
 from pprint import pprint
 import string
@@ -117,6 +118,18 @@ CUR_ERROR = make_sentinel('CUR_ERROR')
 CUR_ERROR.__doc__ = """
 ``CUR_ERROR`` is used by glom internals to keep track of
 thrown exceptions.
+"""
+
+KEY_CONFLICT_OPTIONS = make_sentinel('KEY_CONFLICT_OPTIONS')
+KEY_CONFLICT_OPTIONS.__doc__ = """
+Internal scope key containing the normalized output-key conflict policy
+for the current mapping projection.
+"""
+
+_SPEC_PATH_STACK = make_sentinel('_SPEC_PATH_STACK')
+_SPEC_PATH_STACK.__doc__ = """
+Internal scope key containing the stack of mapping field specs currently
+being evaluated. Used to make output-key errors point at both specs.
 """
 
 _PKG_DIR_PATH = os.path.dirname(os.path.abspath(__file__))
@@ -447,6 +460,164 @@ class CoalesceError(GlomError):
 class BadSpec(GlomError, TypeError):
     """Raised when a spec structure is malformed, e.g., when a specifier
     type is invalid for the current mode."""
+
+
+class KeyConflict:
+    """Constants for the ``key_conflict`` output-key policy.
+
+    ``OVERWRITE`` preserves glom's historical behavior: later fields
+    silently replace earlier values for the same computed output key.
+    ``STRICT`` raises :class:`KeyConflictError` before the conflicting
+    field's value spec is evaluated. A merge spec may be supplied
+    instead of either constant.
+    """
+    OVERWRITE = 'overwrite'
+    STRICT = 'strict'
+    MERGE = 'merge'
+    LAST = OVERWRITE
+    ERROR = STRICT
+
+
+KEY_CONFLICT_OVERWRITE = KeyConflict.OVERWRITE
+KEY_CONFLICT_STRICT = KeyConflict.STRICT
+KEY_CONFLICT_MERGE = KeyConflict.MERGE
+
+
+class _SpecPath(tuple):
+    """A path of mapping field specs, used in output-key errors.
+
+    This is a plain tuple for easy comparison, with a readable repr for
+    error messages.
+    """
+    def __str__(self):
+        if not self:
+            return '<mapping>'
+        return ' -> '.join(repr(part) for part in self)
+
+    __repr__ = __str__
+
+
+class OutputError(GlomError):
+    """Base class for errors which carry output-field context."""
+
+
+class KeyConflictError(OutputError):
+    """Raised when multiple mapping fields compute the same output key
+    while a strict ``key_conflict`` policy is active.
+
+    The error is raised before the conflicting value spec is evaluated,
+    so it is safe to use value-producing specs with side effects.
+    """
+    def __init__(self, key, first_spec, second_spec,
+                 first_spec_path=(), second_spec_path=(),
+                 existing_value=_MISSING, target_path=None):
+        self.key = self.output_key = key
+        self.first_spec = self.previous_spec = self.existing_spec = first_spec
+        self.second_spec = self.conflicting_spec = second_spec
+        self.first_spec_path = _SpecPath(first_spec_path)
+        self.second_spec_path = _SpecPath(second_spec_path)
+        self.paths = (self.first_spec_path, self.second_spec_path)
+        self.first_path = Path(*first_spec_path) if first_spec_path else Path()
+        self.second_path = Path(*second_spec_path) if second_spec_path else Path()
+        self.existing_value = existing_value
+        self.target_path = Path(*target_path) if target_path else Path()
+
+    def get_message(self):
+        msg = ("output key conflict for key %r: %s would overwrite the value"
+               " from %s" % (self.key, self.second_spec_path,
+                             self.first_spec_path))
+        if self.target_path:
+            msg += " at target path %r" % (self.target_path,)
+        msg += ("; use key_conflict='overwrite' to keep the last value,"
+                " or provide a conflict merge spec")
+        return msg
+
+    def __repr__(self):
+        cn = self.__class__.__name__
+        return (f'{cn}({self.key!r}, {self.first_spec!r}, {self.second_spec!r},'
+                f' {self.first_spec_path!r}, {self.second_spec_path!r})')
+
+
+class KeySpecError(OutputError):
+    """Raised when an output field name spec fails to evaluate.
+
+    This is distinct from :class:`ValueSpecError`, which describes a
+    failure evaluating the value for a field whose key was computed
+    successfully.
+    """
+    def __init__(self, field_spec, spec_path, exc):
+        self.field = self.key_spec = self.field_spec = self.spec = field_spec
+        self.spec_path = _SpecPath(spec_path)
+        self.path = Path(*spec_path) if spec_path else Path()
+        self.exc = self.original_error = exc
+
+    def get_message(self):
+        return ("could not compute output key from %r at spec path %s,"
+                " got error: %r" % (self.field, self.spec_path, self.exc))
+
+    def __repr__(self):
+        cn = self.__class__.__name__
+        return f'{cn}({self.field!r}, {self.spec_path!r}, {self.exc!r})'
+
+
+class ValueSpecError(OutputError):
+    """Raised when a mapping field's value spec fails to evaluate.
+
+    The field's output key has already been computed and checked for
+    conflicts when this error is raised.
+    """
+    def __init__(self, field_spec, value_spec, spec_path, exc, key=_MISSING):
+        self.field = self.key_spec = self.field_spec = field_spec
+        self.value_spec = self.subspec = value_spec
+        self.key = self.output_key = key
+        self.spec_path = _SpecPath(spec_path)
+        self.path = Path(*spec_path) if spec_path else Path()
+        self.exc = self.original_error = exc
+
+    def get_message(self):
+        msg = ("could not compute value for output key %r from %r at spec path"
+               " %s, got error: %r"
+               % (self.key, self.value_spec, self.spec_path, self.exc))
+        return msg
+
+    def __repr__(self):
+        cn = self.__class__.__name__
+        return (f'{cn}({self.field!r}, {self.value_spec!r},'
+                f' {self.spec_path!r}, {self.exc!r})')
+
+
+class ConflictMergeError(OutputError):
+    """Raised when a caller-supplied conflict merge spec fails."""
+    def __init__(self, key, merge_spec, spec_path, exc,
+                 result_spec_path=()):
+        self.key = self.output_key = key
+        self.merge_spec = merge_spec
+        self.spec_path = _SpecPath(spec_path)
+        self.result_spec_path = _SpecPath(result_spec_path)
+        self.exc = self.original_error = exc
+
+    def get_message(self):
+        return ("conflict merge spec %r failed for output key %r at spec path"
+                " %s, got error: %r"
+                % (self.merge_spec, self.key, self.spec_path, self.exc))
+
+    def __repr__(self):
+        cn = self.__class__.__name__
+        return (f'{cn}({self.key!r}, {self.merge_spec!r},'
+                f' {self.spec_path!r}, {self.exc!r})')
+
+
+# Compatibility-friendly aliases for callers which use more explicit names.
+OutputKeyConflictError = KeyConflictError
+DuplicateKeyError = KeyConflictError
+KeyCollisionError = KeyConflictError
+KeyComputationError = KeySpecError
+OutputKeyComputationError = KeySpecError
+ValueComputationError = ValueSpecError
+OutputValueComputationError = ValueSpecError
+OutputKeyError = KeySpecError
+OutputValueError = ValueSpecError
+KeyConflictPolicy = KeyConflict
 
 
 class UnregisteredTarget(GlomError):
@@ -1878,17 +2049,117 @@ class Auto:
     if Spec() could help define the interface for new "modes" or dialects
     that would also help make match mode feel less duct-taped on
     """
-    def __init__(self, spec=None):
+    def __init__(self, spec=None, key_conflict=_MISSING,
+                 conflict_merge=_MISSING, **kwargs):
+        alias_key_conflict, alias_merge = _pop_conflict_kwargs(kwargs)
+        if kwargs:
+            raise TypeError('unexpected keyword args: %r'
+                            % sorted(kwargs.keys()))
+        if alias_key_conflict is not _MISSING:
+            if key_conflict is not _MISSING:
+                raise TypeError("got both key_conflict and"
+                                " on_key_conflict")
+            key_conflict = alias_key_conflict
+        if alias_merge is not _MISSING:
+            if conflict_merge is not _MISSING:
+                raise TypeError("got multiple conflict merge specs")
+            conflict_merge = alias_merge
         self.spec = spec
+        self.key_conflict = key_conflict
+        self.conflict_merge = conflict_merge
+        self._key_conflict_options = _resolve_key_conflict(
+            key_conflict, conflict_merge)
 
     def glomit(self, target, scope):
         scope[MODE] = AUTO
+        if self._key_conflict_options is not _MISSING:
+            return _call_with_key_conflict_options(
+                target, self.spec, scope, self._key_conflict_options)
         return scope[glom](target, self.spec, scope)
 
     def __repr__(self):
         cn = self.__class__.__name__
         rpr = '' if self.spec is None else bbrepr(self.spec)
+        opts = []
+        if self.key_conflict is not _MISSING:
+            opts.append(f'key_conflict={self.key_conflict!r}')
+        if self.conflict_merge is not _MISSING:
+            opts.append(f'conflict_merge={self.conflict_merge!r}')
+        if not opts:
+            return f'{cn}({rpr})'
+        if rpr:
+            opts.insert(0, rpr)
+        return f'{cn}({", ".join(opts)})'
+
+
+class Dict:
+    """A mapping projection with an optional output-key conflict policy.
+
+    A plain ``dict`` spec keeps glom's historical behavior: later
+    fields overwrite earlier fields when their computed keys collide.
+    This wrapper makes the policy explicit, either for one mapping or
+    for a nested projection:
+
+    >>> target = {'left': 'same', 'right': 'same'}
+    >>> spec = Dict({Spec('left'): 'left', Spec('right'): 'right'},
+    ...             key_conflict='strict')
+    >>> glom(target, spec)  # doctest: +SKIP
+    Traceback (most recent call last):
+    ...
+    KeyConflictError: output key conflict ...
+
+    *key_conflict* accepts ``'overwrite'`` (default), ``'strict'``,
+    or a callable/glom spec to merge conflicting values. A merge spec
+    may be passed directly as *key_conflict*, or separately with
+    *conflict_merge*.
+    """
+    def __init__(self, spec=None, key_conflict=_MISSING,
+                 conflict_merge=_MISSING, **kwargs):
+        if spec is None:
+            spec = {}
+        alias_key_conflict, alias_merge = _pop_conflict_kwargs(kwargs)
+        if kwargs:
+            raise TypeError('unexpected keyword args: %r'
+                            % sorted(kwargs.keys()))
+        if alias_key_conflict is not _MISSING:
+            if key_conflict is not _MISSING:
+                raise TypeError("got both key_conflict and"
+                                " on_key_conflict")
+            key_conflict = alias_key_conflict
+        if alias_merge is not _MISSING:
+            if conflict_merge is not _MISSING:
+                raise TypeError("got multiple conflict merge specs")
+            conflict_merge = alias_merge
+        self.spec = spec
+        self.key_conflict = key_conflict
+        self.conflict_merge = conflict_merge
+        self._key_conflict_options = _resolve_key_conflict(
+            key_conflict, conflict_merge)
+
+    def glomit(self, target, scope):
+        scope[MODE] = AUTO
+        if self._key_conflict_options is _MISSING:
+            return scope[glom](target, self.spec, scope)
+        return _call_with_key_conflict_options(
+            target, self.spec, scope, self._key_conflict_options)
+
+    def __repr__(self):
+        cn = self.__class__.__name__
+        rpr = bbrepr(self.spec)
+        opts = []
+        if self.key_conflict is not _MISSING:
+            opts.append(f'key_conflict={self.key_conflict!r}')
+        if self.conflict_merge is not _MISSING:
+            opts.append(f'conflict_merge={self.conflict_merge!r}')
+        if opts:
+            return f'{cn}({rpr}, {", ".join(opts)})'
         return f'{cn}({rpr})'
+
+
+# Descriptive aliases for the same explicit mapping-projection wrapper.
+Projection = Dict
+Mapping = Dict
+KeyedDict = Dict
 
 
 class _AbstractIterable(_AbstractIterableBase):
@@ -1918,10 +2189,193 @@ def _get_sequence_item(target, index):
     return target[int(index)]
 
 
+def _resolve_key_conflict(key_conflict=_MISSING, conflict_merge=_MISSING):
+    """Normalize the public conflict options to an internal form.
+
+    Returns ``_MISSING`` when the caller did not configure a policy,
+    ``None`` for the historical overwrite behavior, or a
+    ``(policy, merge_spec)`` tuple.
+    """
+    if conflict_merge is None:
+        conflict_merge = _MISSING
+    if key_conflict is _MISSING and conflict_merge is _MISSING:
+        return _MISSING
+    if conflict_merge is not _MISSING:
+        if isinstance(key_conflict, basestring):
+            valid_policies = ('overwrite', 'last', 'default', 'keep_last',
+                              'none', 'strict', 'error', 'raise', 'reject',
+                              KeyConflict.MERGE)
+            if key_conflict.strip().lower() not in valid_policies:
+                raise ValueError(
+                    "unexpected key_conflict policy: %r" % (key_conflict,))
+        elif key_conflict not in (_MISSING, None):
+            raise ValueError(
+                "key_conflict=%r cannot be combined with conflict_merge"
+                % (key_conflict,))
+        if conflict_merge is None:
+            raise ValueError("conflict_merge must be a callable or glom spec")
+        return (KeyConflict.MERGE, conflict_merge)
+    if key_conflict is None or key_conflict is False:
+        return None
+    if key_conflict is True:
+        return (KeyConflict.STRICT, _MISSING)
+    if isinstance(key_conflict, basestring):
+        policy = key_conflict.strip().lower()
+        if policy in ('overwrite', 'last', 'default', 'keep_last', 'none'):
+            return None
+        if policy in ('strict', 'error', 'raise', 'reject'):
+            return (KeyConflict.STRICT, _MISSING)
+        if policy == KeyConflict.MERGE:
+            raise ValueError(
+                "key_conflict='merge' requires a conflict_merge spec")
+        raise ValueError("unexpected key_conflict policy: %r" % (key_conflict,))
+    if (callable(key_conflict) or _looks_like_glom_spec(key_conflict)
+            or isinstance(key_conflict, (dict, list, tuple))):
+        return (KeyConflict.MERGE, key_conflict)
+    raise TypeError("key_conflict must be a policy string, callable, glom"
+                    " spec, or None, not: %r" % (key_conflict,))
+
+
+def _pop_conflict_kwargs(kwargs):
+    """Pop the supported conflict keyword aliases from *kwargs*."""
+    key_conflict = kwargs.pop('key_conflict', _MISSING)
+    for alias in ('on_key_conflict', 'key_conflict_policy',
+                  'output_key_conflict'):
+        if alias in kwargs:
+            if key_conflict is not _MISSING:
+                raise TypeError("got both key_conflict and %s" % (alias,))
+            key_conflict = kwargs.pop(alias)
+
+    conflict_merge = kwargs.pop('conflict_merge', _MISSING)
+    for alias in ('key_conflict_merge', 'conflict_merge_spec',
+                  'key_merge', 'merge_spec', 'merge'):
+        if alias in kwargs:
+            if conflict_merge is not _MISSING:
+                raise TypeError("got multiple conflict merge specs:"
+                                " conflict_merge and %s" % (alias,))
+            conflict_merge = kwargs.pop(alias)
+    return key_conflict, conflict_merge
+
+
+def _get_key_conflict_options(scope):
+    try:
+        options = scope[KEY_CONFLICT_OPTIONS]
+    except KeyError:
+        return None
+    if options is _MISSING:
+        return None
+    return options
+
+
+def _get_spec_path_stack(scope):
+    try:
+        return scope[_SPEC_PATH_STACK]
+    except KeyError:
+        stack = []
+        scope.maps[0][_SPEC_PATH_STACK] = stack
+        return stack
+
+
+def _call_with_key_conflict_options(target, spec, scope, options):
+    """Evaluate *spec* with a temporary mapping-policy override."""
+    old_options = scope.maps[0].get(KEY_CONFLICT_OPTIONS, _MISSING)
+    scope.maps[0][KEY_CONFLICT_OPTIONS] = options
+    try:
+        return scope[glom](target, spec, scope)
+    finally:
+        if old_options is _MISSING:
+            scope.maps[0].pop(KEY_CONFLICT_OPTIONS, None)
+        else:
+            scope.maps[0][KEY_CONFLICT_OPTIONS] = old_options
+
+
+class _ConflictPair(tuple):
+    """The target passed to one-argument conflict merge callables.
+
+    It behaves like ``(old, new)`` while also exposing the conflicting
+    key and spec paths as attributes and string keys.
+    """
+    def __new__(cls, key, old, new, first_spec_path=(), second_spec_path=()):
+        self = tuple.__new__(cls, (old, new))
+        self.key = self.output_key = key
+        self.old = self.first = old
+        self.new = self.second = new
+        self.first_spec_path = _SpecPath(first_spec_path)
+        self.second_spec_path = _SpecPath(second_spec_path)
+        return self
+
+    def __getitem__(self, index):
+        if isinstance(index, basestring):
+            if index in ('old', 'first', '0'):
+                return self[0]
+            if index in ('new', 'second', '1'):
+                return self[1]
+            if index in ('key', 'output_key'):
+                return self.key
+            if index == 'first_spec_path':
+                return self.first_spec_path
+            if index == 'second_spec_path':
+                return self.second_spec_path
+            raise KeyError(index)
+        return tuple.__getitem__(self, index)
+
+
+def _looks_like_glom_spec(obj):
+    return (isinstance(obj, (Spec, Path, TType))
+            or callable(getattr(obj, 'glomit', None)))
+
+
+def _callable_takes_two(func):
+    """Return True/False for a two-argument callable, None if unknown."""
+    try:
+        sig = inspect.signature(func)
+    except (TypeError, ValueError):
+        return None
+    params = list(sig.parameters.values())
+    if any(p.kind == p.VAR_POSITIONAL for p in params):
+        return True
+    positional = [p for p in params
+                  if p.kind in (p.POSITIONAL_ONLY,
+                                p.POSITIONAL_OR_KEYWORD)]
+    required = [p for p in positional if p.default is p.empty]
+    return len(required) >= 2
+
+
+def _make_merge_target(key, old, new, first_spec_path, second_spec_path):
+    return {
+        'old': old, 'new': new, 'key': key,
+        'first': old, 'second': new,
+        0: old, 1: new,
+        'first_spec_path': first_spec_path,
+        'second_spec_path': second_spec_path,
+    }
+
+
+def _apply_conflict_merge(merge_spec, old, new, key,
+                          first_spec_path, second_spec_path, scope):
+    pair = _ConflictPair(key, old, new, first_spec_path, second_spec_path)
+    if _looks_like_glom_spec(merge_spec):
+        target = _make_merge_target(
+            key, old, new, first_spec_path, second_spec_path)
+        return scope[glom](target, merge_spec, scope)
+    if callable(merge_spec):
+        takes_two = _callable_takes_two(merge_spec)
+        if takes_two:
+            return merge_spec(old, new)
+        return merge_spec(pair)
+
+    # Non-callable values, including dict/list/str specs, are valid
+    # glom specs evaluated against the conflict context.
+    target = _make_merge_target(
+        key, old, new, first_spec_path, second_spec_path)
+    return scope[glom](target, merge_spec, scope)
+
+
 # handlers are 3-arg callables, with args (spec, target, scope)
 # spec is the first argument for convenience in the case
 # that the handler is a method of the spec type
-def _handle_dict(target, spec, scope):
+def _handle_dict_default(target, spec, scope):
+    """The historical (and default) mapping projection behavior."""
     ret = type(spec)()  # TODO: works for dict + ordereddict, but sufficient for all?
     for field, subspec in spec.items():
         val = scope[glom](target, subspec, scope)
@@ -1930,6 +2384,79 @@ def _handle_dict(target, spec, scope):
         if type(field) in (Spec, TType):
             field = scope[glom](target, field, scope)
         ret[field] = val
+    return ret
+
+
+def _handle_dict(target, spec, scope):
+    options = _get_key_conflict_options(scope)
+    if options is None:
+        return _handle_dict_default(target, spec, scope)
+
+    policy, merge_spec = options
+    ret = type(spec)()
+    seen = {}
+    spec_path_stack = _get_spec_path_stack(scope)
+    for field, subspec in spec.items():
+        field_path = tuple(spec_path_stack + [field])
+        if type(field) in (Spec, TType):
+            spec_path_stack.append(field)
+            try:
+                try:
+                    key = scope[glom](target, field, scope)
+                except OutputError:
+                    raise
+                except Exception as e:
+                    raise KeySpecError(field, field_path, e) from e
+            finally:
+                spec_path_stack.pop()
+        else:
+            key = field
+
+        if key is SKIP:
+            # A skipped key never contributes an output field.
+            continue
+
+        try:
+            conflict = key in seen
+        except TypeError as e:
+            raise KeySpecError(field, field_path, e) from e
+        if conflict and policy == KeyConflict.STRICT:
+            existing = seen[key]
+            raise KeyConflictError(
+                key, existing['field'], field,
+                existing['path'], field_path, existing['value'],
+                target_path=list(scope[Path]))
+
+        spec_path_stack.append(field)
+        try:
+            try:
+                val = scope[glom](target, subspec, scope)
+            except OutputError:
+                raise
+            except Exception as e:
+                raise ValueSpecError(field, subspec, field_path, e, key) from e
+        finally:
+            spec_path_stack.pop()
+
+        if val is SKIP:
+            # A skipped value never participates in a key conflict.
+            continue
+
+        if conflict:
+            existing = seen[key]
+            try:
+                val = _apply_conflict_merge(
+                    merge_spec, existing['value'], val, key,
+                    existing['path'], field_path, scope)
+            except OutputError:
+                raise
+            except Exception as e:
+                raise ConflictMergeError(
+                    key, merge_spec, field_path, e,
+                    existing['path']) from e
+
+        ret[key] = val
+        seen[key] = {'field': field, 'path': field_path, 'value': val}
     return ret
 
 
@@ -2248,6 +2775,19 @@ def glom(target, spec, **kwargs):
          glom raises errors through.
        scope (dict): Additional data that can be accessed
          via S inside the glom-spec. Read more: :ref:`scope`.
+       key_conflict (str or spec): Policy for duplicate output keys in
+         mapping specs. ``'overwrite'`` (the default) keeps the last
+         value, while ``'strict'`` raises :class:`KeyConflictError`
+         before evaluating the conflicting value. A callable or glom
+         spec may be supplied to merge conflicting values instead.
+       conflict_merge (callable or spec): A conflict merge spec, used
+         as an alternative to passing it as *key_conflict*.
+
+    By default, mapping specs retain their historical behavior: later
+    fields overwrite earlier fields when computed output keys collide.
+    Passing ``key_conflict='strict'`` makes those collisions an error
+    before the losing value spec runs. ``glom.Dict`` provides the same
+    controls for a single nested projection.
 
     It's a small API with big functionality, and glom's power is
     only surpassed by its intuitiveness. Give it a whirl!
@@ -2257,6 +2797,9 @@ def glom(target, spec, **kwargs):
     default = kwargs.pop('default', None if 'skip_exc' in kwargs else _MISSING)
     skip_exc = kwargs.pop('skip_exc', () if default is _MISSING else GlomError)
     glom_debug = kwargs.pop('glom_debug', GLOM_DEBUG)
+    key_conflict, conflict_merge = _pop_conflict_kwargs(kwargs)
+    key_conflict_options = _resolve_key_conflict(
+        key_conflict, conflict_merge)
     scope = _DEFAULT_SCOPE.new_child({
         Path: kwargs.pop('path', []),
         Inspect: kwargs.pop('inspector', None),
@@ -2268,6 +2811,8 @@ def glom(target, spec, **kwargs):
     scope[UP] = scope
     scope[ROOT] = scope
     scope[T] = target
+    if key_conflict_options is not _MISSING:
+        scope[KEY_CONFLICT_OPTIONS] = key_conflict_options
     scope.update(kwargs.pop('scope', {}))
     err = None
     if kwargs:

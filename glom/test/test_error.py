@@ -5,7 +5,8 @@ import traceback
 
 import pytest
 
-from glom import glom, S, T, GlomError, PathAccessError, Switch, Coalesce, Or, Path
+from glom import (glom, S, T, GlomError, PathAccessError, Switch, Coalesce,
+                  Or, Path, Spec)
 from glom.core import format_oneline_trace, format_target_spec_trace, bbrepr, ROOT, LAST_CHILD_SCOPE
 from glom.matching import M, MatchError, TypeMatchError, Match
 
@@ -477,9 +478,9 @@ def test_all_public_errors():
 
     results = []
 
-    def _test_exc(exc_type, target, spec):
+    def _test_exc(exc_type, target, spec, **kwargs):
         with pytest.raises(exc_type) as exc_info:
-            glom.glom(target, spec)
+            glom.glom(target, spec, **kwargs)
         results.append((target, spec, exc_info.value))
         return exc_info.value
 
@@ -502,6 +503,27 @@ def test_all_public_errors():
     _test_exc(MatchError, 1, M == 2)
 
     _test_exc(TypeMatchError, 1, Match(str))
+
+    _test_exc(glom.KeyConflictError,
+              {'left': 'same', 'right': 'same'},
+              {Spec('left'): 'left', Spec('right'): 'right'},
+              key_conflict='strict')
+
+    _test_exc(glom.KeySpecError,
+              {},
+              {Spec('missing'): 'a'},
+              key_conflict='strict')
+
+    _test_exc(glom.ValueSpecError,
+              {},
+              {'a': 'missing'},
+              key_conflict='strict')
+
+    _test_exc(glom.ConflictMergeError,
+              {'left': 'same', 'right': 'same'},
+              {Spec('left'): 'left', Spec('right'): 'right'},
+              key_conflict='strict',
+              conflict_merge=lambda old, new: 1 / 0)
 
     for (target, spec, exc) in results:
         assert copy.copy(exc) is not exc

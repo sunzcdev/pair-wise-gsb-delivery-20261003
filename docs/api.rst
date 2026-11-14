@@ -52,6 +52,30 @@ types that can be used with the basic set of Python builtins.
 .. autoclass:: glom.Val
 .. autoclass:: glom.Spec
 
+
+Output Key Conflicts
+--------------------
+
+Mapping specs may compute their output field names with
+:class:`~glom.Spec` or :class:`~glom.T`. After normalization, two
+different source fields can produce the same key. The default behavior
+is unchanged: the later field overwrites the earlier one.
+
+Pass ``key_conflict='strict'`` to :func:`~glom.glom` to raise
+:class:`~glom.KeyConflictError` before the conflicting value is evaluated,
+or pass a callable/glom spec as ``key_conflict`` (or
+``conflict_merge``) to merge the two values. :class:`~glom.Dict` applies the
+same policy to one nested projection, and :class:`~glom.Auto` accepts the
+same options.
+
+.. autoclass:: glom.Dict
+.. autoclass:: glom.KeyConflict
+.. autoclass:: glom.KeyConflictError
+.. autoclass:: glom.KeySpecError
+.. autoclass:: glom.ValueSpecError
+.. autoclass:: glom.ConflictMergeError
+
+
 .. _advanced-specifiers:
 
 .. seealso::
