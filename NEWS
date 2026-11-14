@@ -3,6 +3,22 @@
 History
 -------
 
+Unreleased
+~~~~~~~~~~
+
+* XPath variables now accept :class:`~parsel.Selector`,
+  :class:`~parsel.SelectorList`, lxml element, and list/tuple values in
+  addition to plain scalars. Selectors and elements are bound as nodes, and
+  lists and selector lists as node sets, keeping the node objects instead of
+  serializing them to strings.
+* XPath variable values are now validated and adapted before the query runs.
+  JSON selectors and selectors for text or attribute values cannot be used as
+  XML/HTML node variables, and node variables must belong to the document the
+  query runs on; cross-document nodes raise
+  :class:`~parsel.selector.CrossDocumentXPathVariable`. Unsupported values
+  raise :class:`~parsel.selector.UnsupportedXPathVariable`, naming the
+  variable and, for collections, the position of the offending member.
+
 1.12.1 (2026-09-28)
 ~~~~~~~~~~~~~~~~~~~
 

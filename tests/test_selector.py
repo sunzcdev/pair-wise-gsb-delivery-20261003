@@ -16,6 +16,8 @@ from parsel.selector import (
     _NOT_SET,
     CannotRemoveElementWithoutParent,
     CannotRemoveElementWithoutRoot,
+    CrossDocumentXPathVariable,
+    UnsupportedXPathVariable,
 )
 
 if TYPE_CHECKING:
@@ -147,6 +149,168 @@ class TestSelector:
         assert [
             x.extract() for x in sel.xpath("//p[normalize-space()=$lng]//@name", lng=lt)
         ] == ["a"]
+
+    def test_xpath_variable_selector_keeps_node_identity(self) -> None:
+        """A Selector variable binds its underlying node, not its string form."""
+        body = "<root><a id='1'>x</a><a id='2'>y</a></root>"
+        sel = self.sscls(text=body)
+        node = sel.xpath("//a[@id='2']")[0]
+
+        result = sel.xpath("//a[count(.|$node)=count($node)]", node=node)
+
+        assert result.getall() == ['<a id="2">y</a>']
+        assert result[0].root is node.root
+
+    def test_xpath_variable_selector_list_becomes_node_set(self) -> None:
+        """A SelectorList variable binds a node set, keeping node identity."""
+        body = "<root><a id='1'>x</a><a id='2'>y</a><a id='3'>z</a></root>"
+        sel = self.sscls(text=body)
+        nodes = sel.xpath("//a[@id='1' or @id='3']")
+
+        assert sel.xpath("count($nodes)", nodes=nodes).extract() == ["2.0"]
+        matched = sel.xpath("//a[count(.|$nodes)=count($nodes)]", nodes=nodes)
+        assert [s.root for s in matched] == [s.root for s in nodes]
+
+        # A plain list and a tuple of element selectors work the same way.
+        assert sel.xpath("count($nodes)", nodes=list(nodes)).extract() == ["2.0"]
+        assert sel.xpath(
+            "count($nodes)", nodes=tuple(s.root for s in nodes)
+        ).extract() == ["2.0"]
+
+    def test_xpath_variable_empty_selector_list_is_empty_node_set(self) -> None:
+        sel = self.sscls(text="<root><a/></root>")
+        empty = sel.xpath("//missing")
+
+        assert sel.xpath("count($nodes)", nodes=empty).extract() == ["0.0"]
+
+    def test_xpath_variable_raw_element_keeps_identity(self) -> None:
+        body = "<root><a id='1'>x</a></root>"
+        sel = self.sscls(text=body)
+        element = sel.xpath("//a")[0].root
+        assert isinstance(element, etree._Element)
+
+        result = sel.xpath("//a[count(.|$node)=count($node)]", node=element)
+
+        assert result[0].root is element
+
+    def test_xpath_variable_scalars(self) -> None:
+        """Plain scalar values are passed through unchanged."""
+        body = "<root><a id='1'>x</a></root>"
+        sel = self.sscls(text=body)
+
+        assert sel.xpath("//a[@id=$id]", id="1").getall() == ['<a id="1">x</a>']
+        assert sel.xpath("count(//a)=$count", count=1).extract() == ["1"]
+        assert sel.xpath("count(//a)=$count", count=1.0).extract() == ["1"]
+        assert sel.xpath("boolean(//a)=$flag", flag=True).extract() == ["1"]
+        assert sel.xpath("boolean(//a)=$flag", flag=False).extract() == ["0"]
+        assert sel.xpath("$value", value=b"bytes").extract() == ["bytes"]
+        # None maps to an empty node set.
+        assert sel.xpath("count($value)", value=None).extract() == ["0.0"]
+
+    def test_xpath_variable_used_from_selector_list(self) -> None:
+        """Variables adapt against each selector's own document."""
+        body = "<root><a id='1'>x</a><a id='2'>y</a></root>"
+        sel = self.sscls(text=body)
+        anchors = sel.xpath("//a")
+        node = anchors[1]
+
+        assert anchors.xpath(
+            "self::a[count(.|$node)=count($node)]", node=node
+        ).getall() == ['<a id="2">y</a>']
+
+    def test_xpath_variable_json_selector_rejected(self) -> None:
+        sel = self.sscls(text="<root><a/></root>")
+        json_selector = self.sscls(text='{"a": 1}', type="json")
+
+        with pytest.raises(UnsupportedXPathVariable, match=r"\$node"):
+            sel.xpath("count($node)", node=json_selector)
+
+    def test_xpath_variable_text_selector_rejected(self) -> None:
+        sel = self.sscls(text="<root><a id='1'>some text</a></root>")
+        text_selector = sel.xpath("//a/text()")[0]
+
+        with pytest.raises(UnsupportedXPathVariable, match=r"\$node"):
+            sel.xpath("count($node)", node=text_selector)
+
+        attribute_selector = sel.xpath("//a/@id")
+        with pytest.raises(UnsupportedXPathVariable, match=r"\$node"):
+            sel.xpath("count($node)", node=attribute_selector)
+
+    def test_xpath_variable_cross_document_rejected_before_execution(self) -> None:
+        sel = self.sscls(text="<root><a id='1'>x</a></root>")
+        other = self.sscls(text="<root><a id='9'>z</a></root>")
+        foreign_node = other.xpath("//a")[0]
+
+        with pytest.raises(CrossDocumentXPathVariable, match=r"\$node"):
+            sel.xpath("//a[count(.|$node)=count($node)]", node=foreign_node)
+
+    def test_xpath_variable_cross_document_in_list_reports_member(self) -> None:
+        sel = self.sscls(text="<root><a id='1'>x</a></root>")
+        other = self.sscls(text="<root><a id='9'>z</a></root>")
+
+        with pytest.raises(
+            CrossDocumentXPathVariable, match=r"member 1 of \$nodes"
+        ):
+            sel.xpath(
+                "count($nodes)",
+                nodes=[sel.xpath("//a")[0], other.xpath("//a")[0]],
+            )
+
+    def test_xpath_variable_list_with_unsupported_member_not_partial(self) -> None:
+        """A list with an unsupported member fails without partial conversion."""
+        body = "<root><a id='1'>x</a></root>"
+        sel = self.sscls(text=body)
+        node = sel.xpath("//a")[0]
+
+        with pytest.raises(UnsupportedXPathVariable, match=r"member 1 of \$nodes"):
+            sel.xpath("count($nodes)", nodes=[node, "scalar"])
+
+        with pytest.raises(UnsupportedXPathVariable, match=r"member 0 of \$nodes"):
+            sel.xpath("count($nodes)", nodes=[1, node])
+
+    def test_xpath_variable_unsupported_scalar_type(self) -> None:
+        sel = self.sscls(text="<root><a/></root>")
+
+        for value in ({"a": 1}, object(), {1, 2}):
+            with pytest.raises(UnsupportedXPathVariable, match=r"\$value"):
+                sel.xpath("$value", value=value)
+
+    def test_xpath_variable_error_names_the_variable(self) -> None:
+        sel = self.sscls(text="<root><a/></root>")
+
+        with pytest.raises(UnsupportedXPathVariable, match=r"\$my_variable"):
+            sel.xpath("$my_variable", my_variable=object())
+
+    def test_xpath_variable_distinct_from_namespaces(self) -> None:
+        """Namespace mappings and XPath variables stay separate channels."""
+        body = (
+            '<test xmlns:somens="http://scrapy.org">'
+            "<somens:a id='foo'>take this</somens:a>"
+            "<a id='bar'>found</a></test>"
+        )
+        sel = self.sscls(text=body, type="xml")
+
+        assert sel.xpath(
+            "//somens:a/following-sibling::a[@id=$identifier]/text()",
+            namespaces={"somens": "http://scrapy.org"},
+            identifier="bar",
+        ).extract() == ["found"]
+
+    def test_xpath_variable_compilation_reused_but_not_evaluation(self) -> None:
+        """The same query with different values never reuses a cached result."""
+        body = "<root><a id='1'>x</a><a id='2'>y</a></root>"
+        sel = self.sscls(text=body)
+        query = "//a[@id=$id]"
+
+        first = sel.xpath(query, id="1")
+        info_before = selector_module._compile_xpath.cache_info()
+        second = sel.xpath(query, id="2")
+        info_after = selector_module._compile_xpath.cache_info()
+
+        assert first.getall() == ['<a id="1">x</a>']
+        assert second.getall() == ['<a id="2">y</a>']
+        # The compiled expression was reused, no new entry for the second value.
+        assert info_after.currsize == info_before.currsize
 
     def test_accessing_attributes(self) -> None:
         body = """

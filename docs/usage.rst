@@ -1302,6 +1302,33 @@ get right (or legible) without a variable reference::
     ...                mystring='''He said: "I don't know''').get()
     '<p>He said: "I don\'t know why, but I like mixing single and double quotes!"</p>'
 
+Variable values are adapted to XPath types explicitly, so you can also pass
+the nodes selected by a previous query. A :class:`~parsel.Selector` is bound
+as a single node and a :class:`~parsel.SelectorList` (or a list or tuple) as
+a node set, keeping the node objects themselves instead of serializing them
+to strings::
+
+    >>> selector = Selector(text='<root><a id="1">x</a><a id="2">y</a></root>')
+    >>> picked = selector.xpath('//a[@id="2"]')
+    >>> selector.xpath(
+    ...     '//a[count(.|$node)=count($node)]', node=picked[0]
+    ... ).getall()
+    ['<a id="2">y</a>']
+    >>> selector.xpath('count($nodes)', nodes=selector.xpath('//a')).getall()
+    ['2.0']
+
+Plain scalar values (strings, bytes, booleans, integers, floats and
+``None``) are passed as XPath scalars, and ``None`` maps to an empty node
+set. Node variables must wrap XML/HTML nodes and belong to the document the
+query runs on. A JSON :class:`~parsel.Selector`, a selector for a text or
+attribute value, or a node from another document cannot be used as a node
+variable, and raises an error before the query is evaluated. A list that
+contains a value that is not a node is rejected as a whole, without partial
+conversion.
+
+Variable names are independent from the ``namespaces`` argument: namespace
+prefixes are never interpreted as variable values.
+
 
 Converting CSS to XPath
 -----------------------

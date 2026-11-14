@@ -57,6 +57,27 @@ class AbsoluteXPathWarning(UserWarning):
     """Emitted when an absolute XPath is used on a nested selector."""
 
 
+class XPathVariableError(Exception):
+    """Base class for errors raised while adapting an XPath variable value.
+
+    .. versionadded:: VERSION
+    """
+
+
+class UnsupportedXPathVariable(TypeError, XPathVariableError):
+    """Raised when an XPath variable value cannot be adapted to an XPath type.
+
+    .. versionadded:: VERSION
+    """
+
+
+class CrossDocumentXPathVariable(ValueError, XPathVariableError):
+    """Raised when an XPath variable binds a node from another document.
+
+    .. versionadded:: VERSION
+    """
+
+
 class SafeXMLParser(etree.XMLParser):
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         kwargs.setdefault("resolve_entities", False)
@@ -234,6 +255,9 @@ class SelectorList(list[_SelectorType]):
         variables in the XPath expression, e.g.::
 
             selector.xpath('//a[href=$url]', url="http://www.example.com")
+
+        See :meth:`Selector.xpath` for the supported XPath variable value
+        types and their adaptation.
         """
         if xpath[:1] == "/":
             for sel in self:
@@ -436,6 +460,123 @@ def _get_xpath_evaluator(
     if _EXSLT_NAMESPACES.intersection(namespaces.values()):
         return etree.XPath(query, namespaces=namespaces, smart_strings=smart_strings)
     return _compile_xpath(query, tuple(sorted(namespaces.items())), smart_strings)
+
+
+def _same_document(node: etree._Element, context_root: etree._Element) -> bool:
+    """Return whether *node* belongs to the same document as *context_root*.
+
+    The XPath context may be a nested node rather than the document root, so
+    the document roots are compared instead of the nodes themselves.
+    """
+    return (
+        node.getroottree().getroot() is context_root.getroottree().getroot()
+    )
+
+
+def _unsupported_variable(
+    name: str, value: Any, position: int | None
+) -> UnsupportedXPathVariable:
+    location = f"member {position} of " if position is not None else ""
+    return UnsupportedXPathVariable(
+        f"Unsupported XPath variable {location}${name}: "
+        f"{value.__class__.__name__} is not a Selector, SelectorList, "
+        "element, string, bytes, boolean, integer, float, or None."
+    )
+
+
+def _non_node_member(
+    name: str, value: Any, position: int
+) -> UnsupportedXPathVariable:
+    return UnsupportedXPathVariable(
+        f"Unsupported XPath variable member {position} of ${name}: "
+        f"{value.__class__.__name__} is not an XML/HTML node. Node-set "
+        "variables (lists and SelectorLists) can only contain Selectors or "
+        "elements that wrap nodes."
+    )
+
+
+def _adapt_xpath_node(
+    name: str,
+    value: Any,
+    context_root: etree._Element,
+    position: int | None = None,
+) -> etree._Element:
+    """Adapt a single Selector or element variable value to an lxml node.
+
+    Node identity is preserved: the underlying element object is returned as
+    is, never serialized to a string. JSON selectors are rejected because
+    they do not wrap XML/HTML nodes, and nodes from another document are
+    rejected before the query runs.
+    """
+    if isinstance(value, Selector):
+        if value.type not in ("html", "xml") or not isinstance(
+            value.root, etree._Element
+        ):
+            location = f"member {position} of " if position is not None else ""
+            raise UnsupportedXPathVariable(
+                f"XPath variable {location}${name} is a {value.type!r} Selector "
+                f"wrapping a {value.root.__class__.__name__}, not an XML/HTML "
+                "node, so it cannot be bound as an XPath node. Pass a scalar "
+                "value, or select an element from an HTML/XML document instead."
+            )
+        node = value.root
+    elif isinstance(value, etree._Element):
+        node = value
+    else:
+        if position is not None:
+            raise _non_node_member(name, value, position)
+        raise _unsupported_variable(name, value, None)
+    if not _same_document(node, context_root):
+        location = f"member {position} of " if position is not None else ""
+        raise CrossDocumentXPathVariable(
+            f"XPath variable {location}${name} binds a node from a different "
+            "document than the one the query runs on. XPath node variables "
+            "must belong to the queried document."
+        )
+    return node
+
+
+def _adapt_xpath_variable(
+    name: str, value: Any, context_root: etree._Element
+) -> Any:
+    """Adapt one XPath variable value to the types lxml evaluates directly.
+
+    Scalars (strings, bytes, booleans, numbers and None) pass through
+    unchanged. Selectors and elements become their underlying element while
+    keeping node identity. SelectorLists and lists become lists of elements.
+
+    Every member of a collection is validated before anything is returned,
+    so a collection containing an unsupported member is never partially
+    converted or evaluated.
+    """
+    if isinstance(value, (SelectorList, list, tuple)):
+        # Validate every member first: never evaluate a partially converted
+        # collection.
+        nodes: list[etree._Element] = []
+        for position, member in enumerate(value):
+            nodes.append(
+                _adapt_xpath_node(name, member, context_root, position),
+            )
+        return nodes
+    if isinstance(value, (Selector, etree._Element)):
+        return _adapt_xpath_node(name, value, context_root)
+    if isinstance(value, (str, bytes, bool, int, float)) or value is None:
+        return value
+    raise _unsupported_variable(name, value, None)
+
+
+def _adapt_xpath_variables(
+    variables: Mapping[str, Any], context_root: etree._Element
+) -> dict[str, Any]:
+    """Adapt all XPath variable values, keeping variable names as keys.
+
+    Namespace prefixes never reach this mapping: they are passed separately
+    through the ``namespaces`` argument.
+    """
+    return {
+        name: _adapt_xpath_variable(name, value, context_root)
+        for name, value in variables.items()
+    }
 
 
 def _get_root_type(root: Any, *, input_type: str | None) -> str:
@@ -742,6 +883,17 @@ class Selector:
         variables in the XPath expression, e.g.::
 
             selector.xpath('//a[href=$url]', url="http://www.example.com")
+
+        Variable values are adapted to XPath types explicitly. Strings,
+        bytes, booleans, integers, floats and ``None`` are passed as XPath
+        scalars. A :class:`Selector` or an lxml element is bound as a node,
+        keeping the node itself rather than its serialized string form, and
+        a :class:`SelectorList`, list or tuple is bound as a node set. Node
+        variables must wrap XML/HTML nodes and belong to the document the
+        query runs on: JSON selectors and nodes from another document raise
+        :class:`UnsupportedXPathVariable` and
+        :class:`CrossDocumentXPathVariable` respectively, before the query
+        runs.
         """
         if query[:1] == "/":
             self._warn_if_nested(query, stacklevel=3)
@@ -789,9 +941,10 @@ class Selector:
         nsp = dict(self.namespaces)
         if namespaces is not None:
             nsp.update(namespaces)
+        adapted_kwargs = _adapt_xpath_variables(kwargs, root)
         try:
             xpathev = _get_xpath_evaluator(query, nsp, self._lxml_smart_strings)
-            result = xpathev(root, **kwargs)
+            result = xpathev(root, **adapted_kwargs)
         except etree.XPathError as exc:
             raise ValueError(f"XPath error: {exc} in {query}")
 
