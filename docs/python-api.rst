@@ -1107,6 +1107,36 @@ You can delete all the existing rows in the table before inserting the new recor
 
 Pass ``analyze=True`` to run ``ANALYZE`` against the table after inserting the new records.
 
+.. _python_api_insert_reject:
+
+Rejecting invalid rows
+----------------------
+
+By default a constraint failure aborts the whole batch and raises ``sqlite3.IntegrityError``. Pass ``reject=True`` to insert rows individually inside savepoints instead. Recoverable row-level constraint errors are recorded and the remaining rows are still attempted:
+
+.. code-block:: python
+
+    table = db.table("dogs")
+    table.insert_all([
+        {"id": 1, "name": "Cleo"},
+        {"id": 2, "name": None},  # name is NOT NULL
+        {"id": 3, "name": "Marnie"},
+    ], pk="id", reject=True)
+
+    assert table.count == 2
+    rejection = table.rejections[0]
+    assert rejection.index == 1
+    assert rejection.row_number == 2
+    assert rejection.pk == 2
+    assert rejection.error_type == "IntegrityError"
+    assert rejection.error_category == "SQLITE_CONSTRAINT_NOTNULL"
+
+Each rejection is a :class:`sqlite_utils.db.RejectedRow`, a dictionary that also supports attribute access such as ``rejection.pk`` and ``rejection.error_category``. ``index`` is the zero-based position in the source data (the list-mode column header is not counted), ``row_number`` is the same position counted from one, and ``input_index`` is the position in the original iterable including the list-mode header.
+
+Only SQLite constraint failures are rejected. ``sqlite3.OperationalError`` and other errors - including database locks, disk errors and malformed SQL - are always raised. Each row is attempted inside its own savepoint, so a failed row cannot leave a partial or duplicate write behind, and conversions are not retried after an earlier attempt in the same batch.
+
+Accepted rows from a rejected batch are not a claim that the entire input was committed atomically. If ``insert_all(..., reject=True)`` runs inside ``db.atomic()`` or a caller-managed transaction, that outer transaction still controls whether the accepted rows are committed or rolled back.
+
 .. note::
     In the CLI: :ref:`sqlite-utils insert <cli_inserting_data>`
 

@@ -479,6 +479,66 @@ class BadMultiValues(Exception):
         self.values = values
 
 
+class RejectedRow(dict):
+    """
+    Details of a row rejected by ``insert_all(..., reject=True)``.
+
+    This is a dictionary with attribute access, so both
+    ``rejection["pk"]`` and ``rejection.pk`` work.
+    """
+
+    def __getattr__(self, name: str) -> Any:
+        try:
+            return self[name]
+        except KeyError:
+            raise AttributeError(name) from None
+
+
+def _sqlite_constraint_category(error: sqlite3.IntegrityError) -> tuple[Any, str]:
+    "Return the SQLite extension result code and its symbolic name."
+    code = getattr(error, "sqlite_errorcode", None)
+    name = getattr(error, "sqlite_errorname", None)
+    if name:
+        return code, name
+    message = str(error).lower()
+    if "unique constraint failed" in message:
+        return code, "SQLITE_CONSTRAINT_UNIQUE"
+    if "not null constraint failed" in message:
+        return code, "SQLITE_CONSTRAINT_NOTNULL"
+    if "check constraint failed" in message:
+        return code, "SQLITE_CONSTRAINT_CHECK"
+    if "foreign key constraint failed" in message:
+        return code, "SQLITE_CONSTRAINT_FOREIGNKEY"
+    if "datatype mismatch" in message:
+        return code, "SQLITE_CONSTRAINT_DATATYPE"
+    return code, "SQLITE_CONSTRAINT"
+
+
+def _is_recoverable_constraint_error(error: BaseException) -> bool:
+    """
+    Only SQLite constraint failures may be rejected row-by-row.
+
+    In particular OperationalError must not be swallowed: it also covers
+    database locks, disk I/O failures and malformed SQL.
+    """
+    if not isinstance(error, sqlite3.IntegrityError):
+        return False
+    code = getattr(error, "sqlite_errorcode", None)
+    if code is not None:
+        primary_code = code & 0xFF
+        sqlite_constraint = getattr(sqlite3, "SQLITE_CONSTRAINT", 19)
+        if primary_code != sqlite_constraint:
+            return False
+    return True
+
+
+def _is_missing_column_error(error: OperationalError) -> bool:
+    message = str(error).lower()
+    return "no such column" in message or (
+        " column" in message and "has no column named" in message
+    )
+
+
 _COUNTS_TABLE_CREATE_SQL = """
 CREATE TABLE IF NOT EXISTS "{}"(
    "table" TEXT PRIMARY KEY,
@@ -2303,6 +2363,8 @@ class Table(Queryable):
         strict: bool = False,
     ):
         super().__init__(db, name)
+        #: Rows rejected by the most recent ``insert_all(..., reject=True)``.
+        self.rejections: list[RejectedRow] = []
         self._defaults = {
             "pk": pk,
             "foreign_keys": foreign_keys,
@@ -2320,6 +2382,26 @@ class Table(Queryable):
             "columns": columns,
             "strict": strict,
         }
+
+    @property
+    def rejected_rows(self) -> list[RejectedRow]:
+        "Alias for :attr:`rejections`."
+        return self.rejections
+
+    @property
+    def rejected(self) -> list[RejectedRow]:
+        "Alias for :attr:`rejections`."
+        return self.rejections
+
+    @property
+    def last_rejections(self) -> list[RejectedRow]:
+        "Alias for :attr:`rejections`."
+        return self.rejections
+
+    @property
+    def rejected_count(self) -> int:
+        "Number of rows rejected by the most recent insert."
+        return len(self.rejections)
 
     def __repr__(self) -> str:
         return "<Table {}{}>".format(
@@ -4533,7 +4615,27 @@ class Table(Queryable):
         replace,
         ignore,
         list_mode=False,
+        reject=False,
+        first_source_index=0,
     ) -> sqlite3.Cursor | None:
+        if reject:
+            return self._insert_chunk_reject(
+                alter,
+                extracts,
+                chunk,
+                all_columns,
+                hash_id,
+                hash_id_columns,
+                upsert,
+                pk,
+                not_null,
+                conversions,
+                num_records_processed,
+                replace,
+                ignore,
+                list_mode,
+                first_source_index,
+            )
         queries_and_params = self.build_insert_queries_and_params(
             extracts,
             chunk,
@@ -4600,6 +4702,154 @@ class Table(Queryable):
                     else:
                         raise
         return result
+
+    def _insert_chunk_reject(
+        self,
+        alter,
+        extracts,
+        chunk,
+        all_columns,
+        hash_id,
+        hash_id_columns,
+        upsert,
+        pk,
+        not_null,
+        conversions,
+        num_records_processed,
+        replace,
+        ignore,
+        list_mode,
+        first_source_index,
+    ) -> sqlite3.Cursor | None:
+        """
+        Insert a chunk one row at a time, using a savepoint for each row.
+
+        A recoverable constraint error rolls back only that row's savepoint
+        and records the rejection. Any other error propagates and rolls back
+        the rest of the chunk.
+        """
+        result = None
+        with self.db.atomic():
+            for offset, record in enumerate(chunk):
+                source_index = first_source_index + offset
+                record_dict = (
+                    dict(zip(all_columns, cast(Sequence[Any], record)))
+                    if list_mode
+                    else cast(dict[str, Any], record)
+                )
+                for attempt in range(2):
+                    try:
+                        # The inner atomic() is a savepoint when the chunk
+                        # transaction (or a caller's transaction) is open.
+                        with self.db.atomic():
+                            queries_and_params = self.build_insert_queries_and_params(
+                                extracts,
+                                [record],
+                                all_columns,
+                                hash_id,
+                                hash_id_columns,
+                                upsert,
+                                pk,
+                                not_null,
+                                conversions,
+                                num_records_processed,
+                                replace,
+                                ignore,
+                                list_mode,
+                            )
+                            for query, params in queries_and_params:
+                                result = self.db.execute(query, params)
+                    except sqlite3.IntegrityError as error:
+                        if not _is_recoverable_constraint_error(error):
+                            raise
+                        # RAISE(ROLLBACK) and similar failures destroy every
+                        # savepoint in the transaction. There is no safe point
+                        # to resume from, so the caller must see the error.
+                        if not self.db.conn.in_transaction:
+                            raise
+                        self.rejections.append(
+                            self._make_rejection(
+                                source_index,
+                                source_index + (1 if list_mode else 0),
+                                record,
+                                record_dict,
+                                pk,
+                                hash_id,
+                                hash_id_columns,
+                                error,
+                            )
+                        )
+                        break
+                    except OperationalError as error:
+                        if (
+                            attempt == 0
+                            and alter
+                            and _is_missing_column_error(error)
+                        ):
+                            self.add_missing_columns([record_dict])
+                            continue
+                        raise
+                    break
+        return result
+
+    def _make_rejection(
+        self,
+        source_index: int,
+        input_index: int,
+        record: Any,
+        record_dict: dict[str, Any],
+        pk: Any,
+        hash_id: str | None,
+        hash_id_columns: Iterable[str] | None,
+        error: sqlite3.IntegrityError,
+    ) -> RejectedRow:
+        error_code, error_category = _sqlite_constraint_category(error)
+        constraint_type = error_category.removeprefix("SQLITE_CONSTRAINT_")
+        pk_value = None
+        try:
+            if hash_id:
+                pk_value = hash_record(record_dict, hash_id_columns)
+            else:
+                pk_columns: list[str]
+                if isinstance(pk, str):
+                    pk_columns = [pk]
+                elif pk:
+                    pk_columns = list(pk)
+                elif self.exists():
+                    pk_columns = self.pks
+                else:
+                    pk_columns = []
+                if pk_columns:
+                    pk_values = [
+                        record_dict[resolve_casing(column, record_dict)]
+                        for column in pk_columns
+                    ]
+                    pk_value = (
+                        pk_values[0] if len(pk_values) == 1 else tuple(pk_values)
+                    )
+        except (KeyError, TypeError, ValueError):
+            pk_value = None
+        return RejectedRow(
+            index=source_index,
+            source_index=source_index,
+            input_index=input_index,
+            row_index=source_index,
+            row_number=source_index + 1,
+            pk=pk_value,
+            primary_key=pk_value,
+            error=error,
+            error_type=type(error).__name__,
+            error_category=error_category,
+            category=error_category,
+            error_name=error_category,
+            constraint_type=constraint_type,
+            sqlite_errorcode=error_code,
+            sqlite_errorname=error_category,
+            sqlite_error_name=error_category,
+            error_code=error_code,
+            message=str(error),
+            record=record,
+        )
 
     def insert(
         self,
@@ -4691,13 +4941,20 @@ class Table(Queryable):
         upsert: bool = False,
         analyze: bool = False,
         strict: bool | Default | None = DEFAULT,
+        reject: bool = False,
     ) -> "Table":
         """
         Like ``.insert()`` but takes a list of records and ensures that the table
         that it creates (if table does not exist) has columns for ALL of that data.
 
         Use ``analyze=True`` to run ``ANALYZE`` after the insert has completed.
+
+        Pass ``reject=True`` to insert each row inside its own savepoint. Rows
+        that fail with a recoverable SQLite constraint error are added to
+        ``self.rejections`` and the remaining rows are still attempted. Other
+        errors, including lock, disk and SQL syntax errors, are raised.
         """
+        self.rejections = []
         pk = self.value_or_default("pk", pk)
         foreign_keys = self.value_or_default("foreign_keys", foreign_keys)
         column_order = self.value_or_default("column_order", column_order)
@@ -4902,10 +5159,12 @@ class Table(Queryable):
                 replace,
                 ignore,
                 list_mode,
+                reject,
+                num_records_processed - len(chunk),
             )
 
         # If we only handled a single row populate self.last_pk
-        if num_records_processed == 1:
+        if num_records_processed == 1 and result is not None:
             # For an insert we need to use result.lastrowid
             if not upsert and result is not None:
                 ignored_insert = ignore and result.rowcount == 0
@@ -5043,6 +5302,7 @@ class Table(Queryable):
         conversions: dict[str, str] | Default | None = DEFAULT,
         columns: dict[str, Any] | Default | None = DEFAULT,
         strict: bool | Default | None = DEFAULT,
+        reject: bool = False,
     ) -> "Table":
         """
         Like ``.insert()`` but performs an ``UPSERT``, where records are inserted if they do
@@ -5060,6 +5320,7 @@ class Table(Queryable):
             hash_id=hash_id,
             hash_id_columns=hash_id_columns,
             alter=alter,
+            reject=reject,
             extracts=extracts,
             conversions=conversions,
             columns=columns,
@@ -5083,6 +5344,7 @@ class Table(Queryable):
         columns: dict[str, Any] | Default | None = DEFAULT,
         analyze: bool = False,
         strict: bool | Default | None = DEFAULT,
+        reject: bool = False,
     ) -> "Table":
         """
         Like ``.upsert()`` but can be applied to a list of records.
@@ -5098,6 +5360,7 @@ class Table(Queryable):
             hash_id=hash_id,
             hash_id_columns=hash_id_columns,
             alter=alter,
+            reject=reject,
             extracts=extracts,
             conversions=conversions,
             columns=columns,
