@@ -2,6 +2,7 @@ from warcio.statusandheaders import StatusAndHeaders
 from warcio.statusandheaders import StatusAndHeadersParser
 from warcio.statusandheaders import StatusAndHeadersParserException
 from warcio.exceptions import ArchiveLoadFailed
+from warcio.exceptions import RecordStreamInvalidated
 
 from warcio.limitreader import LimitReader
 from warcio.digestverifyingreader import DigestVerifyingReader, DigestChecker
@@ -17,36 +18,105 @@ logger = logging.getLogger(__name__)
 
 
 #=================================================================
+class RecordStreamToken(object):
+    """ A lifecycle token shared by all payload streams (raw_stream and
+    any content_stream()) belonging to a single record.
+
+    The token is valid only while the owning ArchiveIterator is positioned
+    on that record. Advancing the iterator to the next record, or closing
+    the iterator, invalidates the token.
+    """
+    __slots__ = ('valid',)
+
+    def __init__(self):
+        self.valid = True
+
+    def invalidate(self):
+        self.valid = False
+
+
+#=================================================================
+class GuardedRecordStream(object):
+    """ Wraps a record payload stream to enforce a strict stream lifecycle.
+
+    Once the owning ArchiveIterator has advanced past the record (or has
+    been closed), reading a stream which was not fully consumed raises
+    RecordStreamInvalidated, instead of silently returning data belonging
+    to a later record or a misleading empty result.
+
+    If the stream was fully consumed (EOF reached) before being
+    invalidated, subsequent reads continue to return b'' as usual.
+    """
+    def __init__(self, stream, token):
+        self.stream = stream
+        self.token = token
+        self.eof_seen = False
+
+    def _check_valid(self):
+        if not self.token.valid and not self.eof_seen:
+            msg = ('Record stream is no longer valid: the ArchiveIterator '
+                   'has advanced past this record or has been closed '
+                   '(strict_stream_lifecycle=True)')
+            raise RecordStreamInvalidated(msg)
+
+    def _track_eof(self, buff, length):
+        if not buff and length != 0:
+            self.eof_seen = True
+        return buff
+
+    def read(self, length=None):
+        self._check_valid()
+        return self._track_eof(self.stream.read(length), length)
+
+    def readline(self, length=None):
+        self._check_valid()
+        return self._track_eof(self.stream.readline(length), length)
+
+    def tell(self):
+        return self.stream.tell()
+
+    def close(self):
+        self.stream.close()
+
+
+#=================================================================
 class ArcWarcRecord(object):
     def __init__(self, *args, **kwargs):
         (self.format, self.rec_type, self.rec_headers, self.raw_stream,
          self.http_headers, self.content_type, self.length) = args
         self.payload_length = kwargs.get('payload_length', -1)
         self.digest_checker = kwargs.get('digest_checker')
+        self.stream_token = kwargs.get('stream_token')
 
     def content_stream(self):
         if not self.http_headers:
-            return self.raw_stream
-
-        encoding = self.http_headers.get_header('content-encoding')
-
-        if encoding:
-            encoding = encoding.lower()
-
-            # 'x-gzip' is a legacy alias for 'gzip' (RFC 7230 4.2.3, RFC 2616
-            # 3.5); treat it the same so an x-gzip payload is still decompressed.
-            if encoding == 'x-gzip':
-                encoding = 'gzip'
-
-            if encoding not in BufferedReader.get_supported_decompressors():
-                encoding = None
-
-        if self.http_headers.get_header('transfer-encoding') == 'chunked':
-            return ChunkedDataReader(self.raw_stream, decomp_type=encoding)
-        elif encoding:
-            return BufferedReader(self.raw_stream, decomp_type=encoding)
+            stream = self.raw_stream
         else:
-            return self.raw_stream
+            encoding = self.http_headers.get_header('content-encoding')
+
+            if encoding:
+                encoding = encoding.lower()
+
+                # 'x-gzip' is a legacy alias for 'gzip' (RFC 7230 4.2.3, RFC 2616
+                # 3.5); treat it the same so an x-gzip payload is still decompressed.
+                if encoding == 'x-gzip':
+                    encoding = 'gzip'
+
+                if encoding not in BufferedReader.get_supported_decompressors():
+                    encoding = None
+
+            if self.http_headers.get_header('transfer-encoding') == 'chunked':
+                stream = ChunkedDataReader(self.raw_stream, decomp_type=encoding)
+            elif encoding:
+                stream = BufferedReader(self.raw_stream, decomp_type=encoding)
+            else:
+                stream = self.raw_stream
+
+        # enforce the same lifecycle check on the content stream
+        if self.stream_token is not None:
+            stream = GuardedRecordStream(stream, self.stream_token)
+
+        return stream
 
 
 #=================================================================

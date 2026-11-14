@@ -72,6 +72,37 @@ A special ``ArcWarcRecord.content_stream()`` function provides a stream that
 automatically decompresses and de-chunks the HTTP payload, if it is
 compressed and/or transfer-encoding chunked.
 
+Strict Stream Lifecycle
+~~~~~~~~~~~~~~~~~~~~~~~
+
+Because the iterator reads the archive in a single pass, a record's payload
+streams share the underlying input with the records that follow. By default,
+reading a previous record's ``raw_stream`` or ``content_stream()`` after the
+iterator has already advanced may silently return data belonging to a later
+record (or a misleading empty result).
+
+Passing ``strict_stream_lifecycle=True`` to ``ArchiveIterator`` enables an
+explicit stream lifecycle: once the iterator advances to the next record (or
+is closed), reading a payload stream that was not fully consumed raises
+``warcio.exceptions.RecordStreamInvalidated``. A stream that was fully read
+beforehand keeps returning ``b''`` (normal EOF), and record header metadata
+remains accessible at all times. Both ``raw_stream`` and ``content_stream()``
+follow the same lifecycle check.
+
+.. code:: python
+
+    from warcio.archiveiterator import ArchiveIterator
+    from warcio.exceptions import RecordStreamInvalidated
+
+    with open('path/to/file', 'rb') as stream:
+        iterator = ArchiveIterator(stream, strict_stream_lifecycle=True)
+        record = next(iterator)      # first record
+        next(iterator)               # iterator advances, record 1 is invalidated
+        try:
+            record.raw_stream.read()
+        except RecordStreamInvalidated:
+            print('record payload is no longer readable')
+
 ARC Files
 ~~~~~~~~~
 

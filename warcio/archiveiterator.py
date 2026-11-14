@@ -2,6 +2,7 @@ from warcio.bufferedreaders import DecompressingBufferedReader
 
 from warcio.exceptions import ArchiveLoadFailed
 from warcio.recordloader import ArcWarcRecordLoader
+from warcio.recordloader import RecordStreamToken, GuardedRecordStream
 
 from warcio.utils import BUFF_SIZE
 
@@ -30,6 +31,19 @@ class ArchiveIterator(six.Iterator):
     The indexer will automatically detect format, and decompress
     if necessary.
 
+    If strict_stream_lifecycle is set to True, a record's payload
+    streams (raw_stream and content_stream()) are only valid while the
+    iterator is positioned on that record. Once the iterator advances to
+    the next record, or is closed, reading a payload stream that was not
+    fully consumed raises RecordStreamInvalidated, instead of silently
+    returning data belonging to a later record (or a misleading empty
+    result). Streams that were fully consumed keep returning b'' (EOF).
+    Record header metadata remains accessible at all times.
+
+    By default (strict_stream_lifecycle=False), the previous, lenient
+    behaviour is kept: record payload streams share the underlying input
+    and are not invalidated when the iterator advances.
+
     """
 
     GZIP_ERR_MSG = """
@@ -56,7 +70,7 @@ class ArchiveIterator(six.Iterator):
     def __init__(self, fileobj, no_record_parse=False,
                  verify_http=False, arc2warc=False,
                  ensure_http_headers=False, block_size=BUFF_SIZE,
-                 check_digests=False):
+                 check_digests=False, strict_stream_lifecycle=False):
 
         self.fh = fileobj
 
@@ -69,6 +83,10 @@ class ArchiveIterator(six.Iterator):
         self.member_info = None
         self.no_record_parse = no_record_parse
         self.ensure_http_headers = ensure_http_headers
+
+        self.strict_stream_lifecycle = strict_stream_lifecycle
+        self.stream_token = None
+        self.unguarded_record_stream = None
 
         try:
             self.offset = self.fh.tell()
@@ -95,9 +113,21 @@ class ArchiveIterator(six.Iterator):
 
     def close(self):
         self.record = None
+        self._invalidate_record_stream()
         if self.reader:
             self.reader.close_decompressor()
             self.reader = None
+
+    def _invalidate_record_stream(self):
+        """ Invalidate the current record's payload stream token, if any.
+        Called when the iterator advances to the next record and when
+        the iterator is closed.
+        """
+        if self.stream_token is not None:
+            self.stream_token.invalidate()
+            self.stream_token = None
+
+        self.unguarded_record_stream = None
 
     def _iterate_records(self):
         """ iterate over each record
@@ -208,8 +238,13 @@ class ArchiveIterator(six.Iterator):
 
         curr_offset = self.offset
 
+        # in strict lifecycle mode, consume the remainder via the unguarded
+        # stream: the iterator finishing the record must not mark the
+        # user-facing guarded stream as fully consumed (EOF)
+        stream = self.unguarded_record_stream or self.record.raw_stream
+
         while True:
-            b = self.record.raw_stream.read(BUFF_SIZE)
+            b = stream.read(BUFF_SIZE)
             if not b:
                 break
 
@@ -254,6 +289,10 @@ class ArchiveIterator(six.Iterator):
         """ Use loader to parse the record from the reader stream
         Supporting warc and arc records
         """
+        # advancing to a new record invalidates the previous record's
+        # payload streams (strict lifecycle mode only)
+        self._invalidate_record_stream()
+
         record = self.loader.parse_record_stream(self.reader,
                                                  next_line,
                                                  self.known_format,
@@ -262,6 +301,16 @@ class ArchiveIterator(six.Iterator):
                                                  self.check_digests)
 
         self.member_info = None
+
+        if self.strict_stream_lifecycle:
+            # guard the record's payload streams with a new lifecycle token:
+            # once this token is invalidated (iterator advanced or closed),
+            # reading an unconsumed stream raises RecordStreamInvalidated
+            self.stream_token = RecordStreamToken()
+            self.unguarded_record_stream = record.raw_stream
+            record.raw_stream = GuardedRecordStream(record.raw_stream,
+                                                    self.stream_token)
+            record.stream_token = self.stream_token
 
         # Track known format for faster parsing of other records
         if not self.mixed_arc_warc:

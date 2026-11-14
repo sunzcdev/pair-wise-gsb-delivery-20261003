@@ -1,5 +1,6 @@
 from warcio.archiveiterator import ArchiveIterator, WARCIterator, ARCIterator
 from warcio.exceptions import ArchiveLoadFailed
+from warcio.exceptions import RecordStreamInvalidated
 from warcio.bufferedreaders import DecompressingBufferedReader, BufferedReader
 
 from warcio.warcwriter import BufferWARCWriter
@@ -377,3 +378,192 @@ Content-Length: 1303\r\n'
         # record 2: b64 digest; record 3: b64 filename safe digest
         assert self._load_archive('example-digest.warc', offset=922, check_digests=True) == expected_t
         assert self._load_archive('example-digest.warc', offset=922, check_digests=False) == expected_t
+
+    #==========================================================================
+    # strict stream lifecycle tests
+    #==========================================================================
+
+    def test_strict_lifecycle_load_archives(self):
+        """ strict_stream_lifecycle does not change iteration results """
+        expected = ['warcinfo', 'warcinfo', 'response', 'request', 'revisit', 'request']
+        assert self._load_archive('example.warc', strict_stream_lifecycle=True) == expected
+        assert self._load_archive('example.warc.gz', strict_stream_lifecycle=True) == expected
+        assert self._load_archive('example.warc', strict_stream_lifecycle=True,
+                                  check_digests=True) == expected
+
+        expected = ['arc_header', 'response']
+        assert self._load_archive('example.arc', strict_stream_lifecycle=True) == expected
+
+    def test_strict_lifecycle_full_read(self):
+        """ Reading each record fully while it is current works as usual """
+        expected = ['warcinfo', 'response', 'request']
+        with open(get_test_file('example-iana.org-chunked.warc'), 'rb') as fh:
+            with closing(ArchiveIterator(fh, strict_stream_lifecycle=True)) as a:
+                rec_types = []
+                for record in a:
+                    rec_types.append(record.rec_type)
+                    # fully consume the content while the record is current
+                    record.content_stream().read()
+
+        assert rec_types == expected
+
+    def test_strict_lifecycle_stale_raw_stream(self):
+        """ After the iterator advances, reading the previous record's
+        raw_stream raises RecordStreamInvalidated, rather than returning
+        the next record's data or a misleading empty result.
+        Header metadata remains accessible.
+        """
+        with open(get_test_file('example-iana.org-chunked.warc'), 'rb') as fh:
+            with closing(ArchiveIterator(fh, strict_stream_lifecycle=True)) as a:
+                record_1 = next(a)
+                assert record_1.rec_type == 'warcinfo'
+
+                record_2 = next(a)
+                assert record_2.rec_type == 'response'
+
+                # iterator has advanced: record_1 body is no longer readable
+                with pytest.raises(RecordStreamInvalidated):
+                    record_1.raw_stream.read()
+
+                with pytest.raises(RecordStreamInvalidated):
+                    record_1.raw_stream.readline()
+
+                # header metadata is still available
+                assert record_1.rec_headers.get_header('WARC-Type') == 'warcinfo'
+                assert record_1.rec_headers.get_header('WARC-Record-ID')
+
+                # current record reads fine
+                assert b'Internet Assigned Numbers Authority' in record_2.content_stream().read()
+
+    def test_strict_lifecycle_stale_content_stream(self):
+        """ content_stream() of a previous record is invalidated as well """
+        with open(get_test_file('example-iana.org-chunked.warc'), 'rb') as fh:
+            with closing(ArchiveIterator(fh, strict_stream_lifecycle=True)) as a:
+                record_1 = next(a)
+                record_2 = next(a)
+
+                # content_stream created before advancing
+                content = record_1.content_stream()
+                # content_stream created after advancing
+                content_2 = record_1.content_stream()
+
+                record_3 = next(a)
+
+                with pytest.raises(RecordStreamInvalidated):
+                    content.read()
+
+                with pytest.raises(RecordStreamInvalidated):
+                    content_2.read()
+
+                with pytest.raises(RecordStreamInvalidated):
+                    record_1.content_stream().read()
+
+                # record_2 is stale now as well
+                with pytest.raises(RecordStreamInvalidated):
+                    record_2.raw_stream.read()
+
+                # current record content stream is unaffected (reads normally)
+                record_3.content_stream().read()
+
+    def test_strict_lifecycle_partial_read_stale(self):
+        """ A partially-read record body is invalidated once the
+        iterator advances
+        """
+        with open(get_test_file('example-iana.org-chunked.warc'), 'rb') as fh:
+            with closing(ArchiveIterator(fh, strict_stream_lifecycle=True)) as a:
+                record_1 = next(a)
+                assert record_1.raw_stream.read(10)
+
+                next(a)
+
+                with pytest.raises(RecordStreamInvalidated):
+                    record_1.raw_stream.read()
+
+    def test_strict_lifecycle_fully_read_eof_ok(self):
+        """ A record body that was fully consumed keeps returning b''
+        (normal EOF) even after the iterator advances
+        """
+        with open(get_test_file('example-iana.org-chunked.warc'), 'rb') as fh:
+            with closing(ArchiveIterator(fh, strict_stream_lifecycle=True)) as a:
+                record_1 = next(a)
+                body = record_1.content_stream().read()
+                assert body
+
+                # repeated reads at EOF while current: normal b''
+                assert record_1.raw_stream.read() == b''
+                assert record_1.raw_stream.read() == b''
+
+                record_2 = next(a)
+
+                # fully consumed before advancing: still normal EOF, no error
+                assert record_1.raw_stream.read() == b''
+                assert record_1.raw_stream.read(100) == b''
+                assert record_1.raw_stream.readline() == b''
+
+                # current record unaffected
+                assert record_2.content_stream().read()
+
+    def test_strict_lifecycle_close_invalidates(self):
+        """ Closing the iterator invalidates an unconsumed record body """
+        with open(get_test_file('example-iana.org-chunked.warc'), 'rb') as fh:
+            a = ArchiveIterator(fh, strict_stream_lifecycle=True)
+            record = next(a)
+            a.close()
+
+            with pytest.raises(RecordStreamInvalidated):
+                record.raw_stream.read()
+
+            with pytest.raises(RecordStreamInvalidated):
+                record.content_stream().read()
+
+    def test_strict_lifecycle_gz(self):
+        """ Strict lifecycle also applies to gzipped (multi-member) archives """
+        with open(get_test_file('example.warc.gz'), 'rb') as fh:
+            with closing(ArchiveIterator(fh, strict_stream_lifecycle=True)) as a:
+                record_1 = next(a)
+                record_2 = next(a)
+
+                with pytest.raises(RecordStreamInvalidated):
+                    record_1.raw_stream.read()
+
+                with pytest.raises(RecordStreamInvalidated):
+                    record_1.content_stream().read()
+
+                # current record reads fine
+                assert record_2.content_stream().read()
+
+    def test_strict_lifecycle_offsets(self):
+        """ get_record_offset()/get_record_length() still work in strict mode """
+        with open(get_test_file('example-iana.org-chunked.warc'), 'rb') as fh:
+            with closing(ArchiveIterator(fh, strict_stream_lifecycle=True)) as a:
+                for record in a:
+                    assert record.rec_type == 'warcinfo'
+                    assert a.get_record_offset() == 0
+                    break
+
+                record = next(a)
+                assert record.rec_type == 'response'
+                assert a.get_record_offset() == 405
+
+                for record in a:
+                    assert record.rec_type == 'request'
+                    assert a.get_record_offset() == 8379
+                    break
+
+                with pytest.raises(StopIteration):
+                    next(a)
+
+    def test_lenient_lifecycle_default_compat(self):
+        """ Default (strict_stream_lifecycle=False): old streams are not
+        invalidated, preserving the previous lenient behaviour
+        """
+        with open(get_test_file('example-iana.org-chunked.warc'), 'rb') as fh:
+            with closing(ArchiveIterator(fh)) as a:
+                record_1 = next(a)
+                record_2 = next(a)
+
+                # no RecordStreamInvalidated is raised when option is off
+                record_1.raw_stream.read()
+                record_1.content_stream().read()
+
+                assert record_2.content_stream().read()

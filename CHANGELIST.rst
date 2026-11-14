@@ -1,6 +1,13 @@
 1.8.2
 ~~~~~
 
+- Add ``strict_stream_lifecycle`` option to ``ArchiveIterator``: when enabled,
+  reading a record's ``raw_stream``/``content_stream()`` after the iterator
+  has advanced past that record (or has been closed) raises
+  ``RecordStreamInvalidated`` instead of silently returning a later record's
+  data or a misleading empty result. Fully-consumed streams keep returning
+  ``b''`` and record header metadata remains accessible. Disabled by default
+  to preserve existing behaviour.
 - Replace unmaintained brotlipy with brotlicffi>=1.2.1.0 by @ato https://github.com/webrecorder/warcio/pull/211
 - Add Content-Encoding: x-gzip as an alias for gzip by @sammist2 in https://github.com/webrecorder/warcio/pull/210
 
