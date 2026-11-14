@@ -10,6 +10,7 @@ import codecs
 
 LEXEME_RE = re.compile(r'[a-z0-9eE\.\+-]+|\S')
 INTEGER_RE = re.compile(r'-?[0-9]+')
+NUMBER_RE = re.compile(r'-?(?:0|[1-9][0-9]*)(?:\.[0-9]+)?(?:[eE][+-]?[0-9]+)?')
 UNARY_LEXEMES = set('[]{},')
 EOF = -1, None
 
@@ -140,7 +141,7 @@ inf = float("inf")
 neg_inf = float("-inf")
 
 @utils.coroutine
-def parse_value(target, multivalue, use_float):
+def parse_value(target, multivalue, use_float, number_converter=None):
     """
     Parses results coming out of the Lexer into ijson events, which are sent to
     `target`. A stack keeps track of the type of object being parsed at the time
@@ -233,22 +234,41 @@ def parse_value(target, multivalue, use_float):
                 dot = symbol.find('.')
                 if dot != -1 and not (symbol[dot - 1:dot].isdigit() and symbol[dot + 1:dot + 2].isdigit()):
                     raise common.JSONError('Invalid JSON number: %s' % (symbol,))
-                try:
-                    number = to_number(symbol)
-                    if number == inf or number == neg_inf:
-                        raise common.JSONError("float overflow: %s" % (symbol,))
-                except:
-                    if 'true'.startswith(symbol) or 'false'.startswith(symbol) or 'null'.startswith(symbol):
-                        raise common.IncompleteJSONError('Incomplete JSON content')
-                    # a well-formed integer that int() still refused is one
-                    # longer than sys.get_int_max_str_digits(); let that
-                    # error through as the other backends do
-                    if INTEGER_RE.fullmatch(symbol):
-                        raise
-                    raise UnexpectedSymbol(symbol, pos)
+                if number_converter is not None:
+                    # A converter must only ever see a complete, valid JSON
+                    # number. In particular, don't rely on int()/Decimal()
+                    # to reject malformed tokens before calling it.
+                    if not NUMBER_RE.fullmatch(symbol):
+                        if 'true'.startswith(symbol) or 'false'.startswith(symbol) or 'null'.startswith(symbol):
+                            raise common.IncompleteJSONError('Incomplete JSON content')
+                        raise UnexpectedSymbol(symbol, pos)
+                    try:
+                        number = number_converter(symbol)
+                    except Exception as exc:
+                        error = common.JSONError(
+                            'Number conversion callback failed at position %d '
+                            'for token %r: %s' % (pos, symbol, exc)
+                        )
+                        error.position = pos
+                        error.pos = pos
+                        error.token = symbol
+                        raise error from exc
                 else:
-                    send(('number', number))
-                    pop()
+                    try:
+                        number = to_number(symbol)
+                        if number == inf or number == neg_inf:
+                            raise common.JSONError("float overflow: %s" % (symbol,))
+                    except:
+                        if 'true'.startswith(symbol) or 'false'.startswith(symbol) or 'null'.startswith(symbol):
+                            raise common.IncompleteJSONError('Incomplete JSON content')
+                        # a well-formed integer that int() still refused is one
+                        # longer than sys.get_int_max_str_digits(); let that
+                        # error through as the other backends do
+                        if INTEGER_RE.fullmatch(symbol):
+                            raise
+                        raise UnexpectedSymbol(symbol, pos)
+                send(('number', number))
+                pop()
 
         elif state == _PARSE_OBJECT_KEY:
             if symbol[0] != '"':
@@ -289,17 +309,39 @@ def parse_string(symbol):
 
 
 def basic_parse_basecoro(target, multiple_values=False, allow_comments=False,
-                         use_float=False):
+                         use_float=False, number_converter=None,
+                         number_callback=None, numeric_callback=None,
+                         number_parser=None):
     '''
     Iterator yielding unprefixed events.
 
     Parameters:
 
-    - file: a readable file-like object with JSON input
+    - multiple_values: allow multiple top-level values
+    - allow_comments: unsupported by this backend
+    - use_float: convert non-integer numbers to float instead of Decimal
+    - number_converter: callable receiving the complete text of each valid
+      JSON number and returning the value to publish
     '''
     if allow_comments:
         raise ValueError("Comments are not supported by the python backend")
-    return utf8_encoder(Lexer(parse_value(target, multiple_values, use_float)))
+    converters = [
+        converter for converter in (
+            number_converter, number_callback, numeric_callback, number_parser
+        )
+        if converter is not None
+    ]
+    if len(converters) > 1:
+        raise ValueError("Only one number conversion callback can be specified")
+    if converters:
+        number_converter = converters[0]
+        if use_float:
+            raise ValueError("use_float and number_converter are mutually exclusive")
+        if not callable(number_converter):
+            raise TypeError("number_converter must be callable")
+    return utf8_encoder(
+        Lexer(parse_value(target, multiple_values, use_float, number_converter))
+    )
 
 
 common.enrich_backend(globals(), c_comments=False)

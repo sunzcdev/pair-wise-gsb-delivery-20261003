@@ -393,6 +393,19 @@ to give users more fine-grained control over certain operations:
   Future versions of ijson
   might change the default value of this option
   to ``True``.
+- The ``number_converter`` option is available on the ``python`` backend
+  and accepts a callable that receives the complete, valid text of each
+  JSON number token.
+  Its return value is published to consumers instead of the default
+  ``int``/``Decimal`` (or ``float``) conversion,
+  which lets applications preserve lexical details such as the difference
+  between ``1.00`` and ``1e0``.
+  The callable is never invoked for an invalid number,
+  is invoked once for a number spanning multiple input chunks,
+  and any exception it raises is chained to a ``JSONError`` that includes
+  the token position.
+  It cannot be combined with ``use_float``.
+  Other backends are not required to provide the original token text.
 - The ``multiple_values`` option (defaults to ``False``)
   controls whether multiple top-level values are supported.
   JSON content should contain a single top-level value
@@ -593,6 +606,8 @@ FAQ
    This is mostly because of historical reasons.
    Since 3.1 a new ``use_float`` option (defaults to ``False``)
    is available to return ``float`` values instead.
+   The ``python`` backend additionally accepts a ``number_converter``
+   callback to receive the original text of each valid number token.
    See the options_ section for details.
 
 #. **Q**: I'm getting an ``UnicodeDecodeError``, or an ``IncompleteJSONError`` with no message

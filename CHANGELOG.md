@@ -2,6 +2,13 @@
 
 ## Development
 
+* The `python` backend now supports an optional `number_converter` callback
+  that receives the original text of valid, complete JSON number tokens and
+  returns the value published to consumers. This allows callers to preserve
+  lexical details such as `1.00` versus `1e0`. Invalid numbers never reach the
+  callback, cross-chunk tokens invoke it once, callback failures keep their
+  exception chain and report the token position, and combining the option with
+  `use_float` raises a configuration error.
 * Fixed handling of integers longer than `sys.get_int_max_str_digits()`:
   the `yajl2_c` backend no longer crashes on them, and all backends
   now raise the `ValueError` produced by `int()` (#188).

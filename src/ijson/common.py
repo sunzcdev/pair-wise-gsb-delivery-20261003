@@ -221,6 +221,33 @@ def number(str_value):
     warnings.warn("number() function will be removed in a later release", DeprecationWarning)
     return integer_or_decimal(str_value)
 
+
+NUMBER_CONVERTER_OPTION = 'number_converter'
+NUMBER_CONVERTER_ALIASES = (
+    'number_callback', 'numeric_callback', 'number_parser'
+)
+
+
+def _validate_number_converter_config(config):
+    provided = [
+        (name, config[name])
+        for name in (NUMBER_CONVERTER_OPTION,) + NUMBER_CONVERTER_ALIASES
+        if config.get(name) is not None
+    ]
+    if len(provided) > 1:
+        raise ValueError("Only one number conversion callback can be specified")
+    if not provided:
+        return
+    name, converter = provided[0]
+    if name != NUMBER_CONVERTER_OPTION:
+        config.pop(name)
+        config[NUMBER_CONVERTER_OPTION] = converter
+    if config.get('use_float'):
+        raise ValueError("use_float and number_converter are mutually exclusive")
+    if not callable(converter):
+        raise TypeError("number_converter must be callable")
+
+
 def file_source(f, buf_size=64*1024):
     '''A generator that yields data from a file-like object'''
     f = compat.bytes_reader(f)
@@ -232,12 +259,14 @@ def file_source(f, buf_size=64*1024):
 
 
 def _basic_parse_pipeline(backend, config):
+    _validate_number_converter_config(config)
     return (
         (backend['basic_parse_basecoro'], [], config),
     )
 
 
 def _parse_pipeline(backend, config):
+    _validate_number_converter_config(config)
     return (
         (backend['parse_basecoro'], [], {}),
         (backend['basic_parse_basecoro'], [], config)
@@ -245,6 +274,7 @@ def _parse_pipeline(backend, config):
 
 
 def _items_pipeline(backend, prefix, map_type, config):
+    _validate_number_converter_config(config)
     return (
         (backend['items_basecoro'], (prefix,), {'map_type': map_type}),
         (backend['parse_basecoro'], [], {}),
@@ -253,6 +283,7 @@ def _items_pipeline(backend, prefix, map_type, config):
 
 
 def _kvitems_pipeline(backend, prefix, map_type, config):
+    _validate_number_converter_config(config)
     return (
         (backend['kvitems_basecoro'], (prefix,), {'map_type': map_type}),
         (backend['parse_basecoro'], [], {}),
