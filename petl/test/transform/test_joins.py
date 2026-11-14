@@ -1,7 +1,10 @@
 from __future__ import absolute_import, division, print_function
 
+import pytest
+
 from petl import (
     antijoin,
+    asofjoin,
     crossjoin,
     cut,
     hashantijoin,
@@ -17,6 +20,7 @@ from petl import (
     sort,
     unjoin,
 )
+from petl.errors import ArgumentError
 from petl.test.helpers import ieq
 
 
@@ -1555,3 +1559,259 @@ def test_joins_negative_key_indices():
     for join_impl in (join, leftjoin, rightjoin, outerjoin, hashjoin,
                       hashleftjoin, hashrightjoin, lookupjoin, hashlookupjoin):
         ieq(expected, join_impl(left, right, lkey=-1, rkey=-1))
+
+
+def test_asofjoin():
+
+    table1 = (('id', 'time', 'value'),
+              ('a', 1, 'foo'),
+              ('a', 4, 'bar'),
+              ('a', 7, 'baz'),
+              ('b', 2, 'qux'))
+    table2 = (('id', 'time', 'config'),
+              ('a', 2, 'c1'),
+              ('a', 5, 'c2'),
+              ('b', 3, 'c3'))
+
+    # default (unsorted) mode
+    table3 = asofjoin(table1, table2, key='id', time='time')
+    expect3 = (('id', 'time', 'value', 'time', 'config'),
+               ('a', 1, 'foo', None, None),
+               ('a', 4, 'bar', 2, 'c1'),
+               ('a', 7, 'baz', 5, 'c2'),
+               ('b', 2, 'qux', None, None))
+    ieq(expect3, table3)
+    ieq(expect3, table3)  # check twice
+
+    # presorted mode gives the same result on sorted input
+    table4 = asofjoin(table1, table2, key='id', time='time', presorted=True)
+    ieq(expect3, table4)
+    ieq(expect3, table4)
+
+    # custom missing value
+    table5 = asofjoin(table1, table2, key='id', time='time', missing='NA')
+    expect5 = (('id', 'time', 'value', 'time', 'config'),
+               ('a', 1, 'foo', 'NA', 'NA'),
+               ('a', 4, 'bar', 2, 'c1'),
+               ('a', 7, 'baz', 5, 'c2'),
+               ('b', 2, 'qux', 'NA', 'NA'))
+    ieq(expect5, table5)
+
+
+def test_asofjoin_unsorted_input():
+
+    # rows arrive out of order, default mode sorts before matching
+    table1 = (('id', 'time', 'value'),
+              ('a', 7, 'baz'),
+              ('b', 2, 'qux'),
+              ('a', 1, 'foo'),
+              ('a', 4, 'bar'))
+    table2 = (('id', 'time', 'config'),
+              ('b', 3, 'c3'),
+              ('a', 5, 'c2'),
+              ('a', 2, 'c1'))
+    table3 = asofjoin(table1, table2, key='id', time='time')
+    expect3 = (('id', 'time', 'value', 'time', 'config'),
+               ('a', 1, 'foo', None, None),
+               ('a', 4, 'bar', 2, 'c1'),
+               ('a', 7, 'baz', 5, 'c2'),
+               ('b', 2, 'qux', None, None))
+    ieq(expect3, table3)
+
+
+def test_asofjoin_duplicate_times():
+
+    # several right rows share the same time, the last one in the original
+    # input order wins
+    table1 = (('id', 'time', 'value'),
+              ('a', 5, 'foo'))
+    table2 = (('id', 'time', 'config'),
+              ('a', 3, 'first'),
+              ('a', 3, 'second'),
+              ('a', 3, 'third'))
+    expect = (('id', 'time', 'value', 'time', 'config'),
+              ('a', 5, 'foo', 3, 'third'))
+    table3 = asofjoin(table1, table2, key='id', time='time')
+    ieq(expect, table3)
+    # also under presorted mode
+    table4 = asofjoin(table1, table2, key='id', time='time', presorted=True)
+    ieq(expect, table4)
+
+    # exact time match is allowed
+    table5 = (('id', 'time', 'config'),
+              ('a', 5, 'early'),
+              ('a', 5, 'late'))
+    table6 = asofjoin(table1, table5, key='id', time='time')
+    expect6 = (('id', 'time', 'value', 'time', 'config'),
+               ('a', 5, 'foo', 5, 'late'))
+    ieq(expect6, table6)
+
+
+def test_asofjoin_tolerance():
+
+    table1 = (('id', 'time', 'value'),
+              ('a', 5, 'foo'),
+              ('a', 8, 'bar'))
+    table2 = (('id', 'time', 'config'),
+              ('a', 3, 'c1'))
+
+    # difference of exactly the tolerance still matches
+    table3 = asofjoin(table1, table2, key='id', time='time', tolerance=2)
+    expect3 = (('id', 'time', 'value', 'time', 'config'),
+               ('a', 5, 'foo', 3, 'c1'),
+               ('a', 8, 'bar', None, None))
+    ieq(expect3, table3)
+
+    # one beyond the tolerance does not match
+    table4 = asofjoin(table1, table2, key='id', time='time', tolerance=1)
+    expect4 = (('id', 'time', 'value', 'time', 'config'),
+               ('a', 5, 'foo', None, None),
+               ('a', 8, 'bar', None, None))
+    ieq(expect4, table4)
+
+    # a later right row within tolerance is preferred over an earlier one
+    table5 = (('id', 'time', 'config'),
+              ('a', 1, 'old'),
+              ('a', 4, 'new'))
+    table6 = asofjoin(table1, table5, key='id', time='time', tolerance=2)
+    expect6 = (('id', 'time', 'value', 'time', 'config'),
+               ('a', 5, 'foo', 4, 'new'),
+               ('a', 8, 'bar', None, None))
+    ieq(expect6, table6)
+
+
+def test_asofjoin_empty():
+
+    table1 = (('id', 'time', 'value'),
+              ('a', 1, 'foo'))
+    table2 = (('id', 'time', 'config'),)
+
+    # empty right table, all left rows unmatched
+    table3 = asofjoin(table1, table2, key='id', time='time')
+    expect3 = (('id', 'time', 'value', 'time', 'config'),
+               ('a', 1, 'foo', None, None))
+    ieq(expect3, table3)
+
+    # empty left table, only the header is yielded
+    table4 = asofjoin(table2, table1, key='id', time='time')
+    expect4 = (('id', 'time', 'config', 'time', 'value'),)
+    ieq(expect4, table4)
+
+    # both tables empty
+    table5 = asofjoin(table2, table2, key='id', time='time')
+    expect5 = (('id', 'time', 'config', 'time', 'config'),)
+    ieq(expect5, table5)
+
+
+def test_asofjoin_missing_key_or_time():
+
+    table1 = (('id', 'time', 'value'),
+              (None, 1, 'nokey'),
+              ('a', None, 'notime'),
+              ('a', 5, 'foo'))
+    table2 = (('id', 'time', 'config'),
+              (None, 1, 'nokey'),
+              ('a', None, 'notime'),
+              ('a', 3, 'c1'))
+
+    # rows missing the key or the time never match, even with each other
+    table3 = asofjoin(table1, table2, key='id', time='time')
+    expect3 = (('id', 'time', 'value', 'time', 'config'),
+               (None, 1, 'nokey', None, None),
+               ('a', None, 'notime', None, None),
+               ('a', 5, 'foo', 3, 'c1'))
+    ieq(expect3, table3)
+    ieq(expect3, table3)
+
+
+def test_asofjoin_key_switching():
+
+    # state from one key group must not leak into the next group
+    table1 = (('id', 'time', 'value'),
+              ('a', 5, 'foo'),
+              ('b', 1, 'bar'),
+              ('b', 9, 'baz'),
+              ('c', 4, 'qux'))
+    table2 = (('id', 'time', 'config'),
+              ('a', 3, 'c1'),
+              ('b', 7, 'c2'))
+    table3 = asofjoin(table1, table2, key='id', time='time')
+    expect3 = (('id', 'time', 'value', 'time', 'config'),
+               ('a', 5, 'foo', 3, 'c1'),
+               ('b', 1, 'bar', None, None),
+               ('b', 9, 'baz', 7, 'c2'),
+               ('c', 4, 'qux', None, None))
+    ieq(expect3, table3)
+    ieq(expect3, table3)
+
+
+def test_asofjoin_presorted_not_sorted():
+
+    table1 = (('id', 'time', 'value'),
+              ('a', 5, 'foo'),
+              ('a', 2, 'bar'))
+    table2 = (('id', 'time', 'config'),
+              ('a', 1, 'c1'))
+
+    # left table out of order
+    table3 = asofjoin(table1, table2, key='id', time='time', presorted=True)
+    with pytest.raises(ArgumentError) as excinfo:
+        list(table3)
+    assert 'left' in str(excinfo.value)
+
+    # right table out of order (the inversion is detected as soon as the
+    # out-of-order row is read)
+    table_left_ok = (('id', 'time', 'value'),
+                     ('a', 9, 'foo'))
+    table_right_bad = (('id', 'time', 'config'),
+                       ('a', 5, 'c1'),
+                       ('a', 2, 'c2'))
+    table4 = asofjoin(table_left_ok, table_right_bad, key='id', time='time',
+                      presorted=True)
+    with pytest.raises(ArgumentError) as excinfo:
+        list(table4)
+    assert 'right' in str(excinfo.value)
+
+    # key out of order is also detected
+    table5 = (('id', 'time', 'value'),
+              ('b', 1, 'foo'),
+              ('a', 2, 'bar'))
+    table6 = asofjoin(table5, table2, key='id', time='time', presorted=True)
+    with pytest.raises(ArgumentError) as excinfo:
+        list(table6)
+    assert 'left' in str(excinfo.value)
+
+
+def test_asofjoin_compound_key_and_prefixes():
+
+    table1 = (('id', 'site', 'time', 'value'),
+              ('a', 'x', 5, 'foo'),
+              ('a', 'y', 5, 'bar'))
+    table2 = (('id', 'site', 'time', 'config'),
+              ('a', 'x', 3, 'c1'),
+              ('a', 'y', 4, 'c2'))
+    table3 = asofjoin(table1, table2, key=['id', 'site'], time='time',
+                      lprefix='l_', rprefix='r_')
+    expect3 = (('l_id', 'l_site', 'l_time', 'l_value', 'r_time', 'r_config'),
+               ('a', 'x', 5, 'foo', 3, 'c1'),
+               ('a', 'y', 5, 'bar', 4, 'c2'))
+    ieq(expect3, table3)
+
+
+def test_asofjoin_different_field_names():
+
+    table1 = (('id', 'ts', 'value'),
+              ('a', 5, 'foo'))
+    table2 = (('key', 'since', 'config'),
+              ('a', 3, 'c1'))
+    table3 = asofjoin(table1, table2, lkey='id', rkey='key',
+                      ltime='ts', rtime='since')
+    expect3 = (('id', 'ts', 'value', 'since', 'config'),
+               ('a', 5, 'foo', 3, 'c1'))
+    ieq(expect3, table3)
+
+    # bad time arguments are rejected
+    with pytest.raises(ArgumentError):
+        asofjoin(table1, table2, key='id')
+    with pytest.raises(ArgumentError):
+        asofjoin(table1, table2, key='id', time='ts', ltime='ts', rtime='since')

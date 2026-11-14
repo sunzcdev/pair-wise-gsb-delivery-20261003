@@ -841,6 +841,309 @@ def iterlookupjoin(left, right, lkey, rkey, missing=None, lprefix=None,
             yield tuple(row)
 
 
+def _times_from_args(time, ltime, rtime):
+
+    if time is not None and ltime is rtime is None:
+        # common time field specified
+        ltime = rtime = time
+    elif time is None and ltime is not None and rtime is not None:
+        # left and right time fields specified
+        pass
+    else:
+        raise ArgumentError(
+            'bad time arguments: either specify time, or specify both ltime '
+            'and rtime'
+        )
+    return ltime, rtime
+
+
+def _as_field_list(fields):
+    if isinstance(fields, (list, tuple)):
+        return list(fields)
+    return [fields]
+
+
+def asofjoin(left, right, key=None, lkey=None, rkey=None, time=None,
+             ltime=None, rtime=None, tolerance=None, missing=None,
+             presorted=False, buffersize=None, tempdir=None, cache=True,
+             lprefix=None, rprefix=None):
+    """
+    Perform a left outer "as-of" join, matching each row from the `left`
+    table with the most recent row from the `right` table having the same
+    key and a time value less than or equal to the time value of the left
+    row. E.g.::
+
+        >>> import petl as etl
+        >>> table1 = [['id', 'time', 'value'],
+        ...           ['a', 1, 'foo'],
+        ...           ['a', 4, 'bar'],
+        ...           ['a', 7, 'baz'],
+        ...           ['b', 2, 'qux']]
+        >>> table2 = [['id', 'time', 'config'],
+        ...           ['a', 2, 'c1'],
+        ...           ['a', 5, 'c2'],
+        ...           ['b', 3, 'c3']]
+        >>> table3 = etl.asofjoin(table1, table2, key='id', time='time')
+        >>> table3.lookall()
+        +-----+------+-------+------+--------+
+        | id  | time | value | time | config |
+        +=====+======+=======+======+========+
+        | 'a' |    1 | 'foo' | None | None   |
+        +-----+------+-------+------+--------+
+        | 'a' |    4 | 'bar' |    2 | 'c1'   |
+        +-----+------+-------+------+--------+
+        | 'a' |    7 | 'baz' |    5 | 'c2'   |
+        +-----+------+-------+------+--------+
+        | 'b' |    2 | 'qux' | None | None   |
+        +-----+------+-------+------+--------+
+
+    Note that the time field of the right table is retained in the output
+    (along with any other non-key fields of the right table), so it is
+    possible to see exactly which right row each left row was matched with.
+
+    The `tolerance` argument sets the maximum allowed difference between
+    the left and right time values; a right row is only matched if
+    ``ltime - rtime <= tolerance``. E.g.::
+
+        >>> table4 = etl.asofjoin(table1, table2, key='id', time='time',
+        ...                       tolerance=1)
+        >>> table4.lookall()
+        +-----+------+-------+------+--------+
+        | id  | time | value | time | config |
+        +=====+======+=======+======+========+
+        | 'a' |    1 | 'foo' | None | None   |
+        +-----+------+-------+------+--------+
+        | 'a' |    4 | 'bar' | None | None   |
+        +-----+------+-------+------+--------+
+        | 'a' |    7 | 'baz' | None | None   |
+        +-----+------+-------+------+--------+
+        | 'b' |    2 | 'qux' | None | None   |
+        +-----+------+-------+------+--------+
+
+    If the right table contains more than one row with the same key and
+    time, the row appearing last in the original input is used.
+
+    Rows where the key or the time value is `None` are never matched with
+    each other; unmatched rows from the left table are kept in the output,
+    with `missing` used to fill in the values of the right table fields.
+
+    If `presorted` is True, it is assumed that the data are already sorted
+    ascending by the key and time fields, an error is raised if an
+    out-of-order row is found, and the `buffersize`, `tempdir` and `cache`
+    arguments are ignored. Otherwise, the data are sorted, see also the
+    discussion of the `buffersize`, `tempdir` and `cache` arguments under
+    the :func:`petl.transform.sorts.sort` function.
+
+    Left and right tables with different key fields can be handled via the
+    `lkey` and `rkey` arguments, and different time fields via the `ltime`
+    and `rtime` arguments.
+
+    Only the rows of the current key group are held in memory while
+    streaming, the right table is never loaded as a whole.
+
+    """
+
+    lkey, rkey = keys_from_args(left, right, key, lkey, rkey)
+    ltime, rtime = _times_from_args(time, ltime, rtime)
+    return AsOfJoinView(left, right, lkey=lkey, rkey=rkey, ltime=ltime,
+                        rtime=rtime, tolerance=tolerance, missing=missing,
+                        presorted=presorted, buffersize=buffersize,
+                        tempdir=tempdir, cache=cache, lprefix=lprefix,
+                        rprefix=rprefix)
+
+
+Table.asofjoin = asofjoin
+
+
+class AsOfJoinView(Table):
+
+    def __init__(self, left, right, lkey, rkey, ltime, rtime, tolerance=None,
+                 missing=None, presorted=False, buffersize=None, tempdir=None,
+                 cache=True, lprefix=None, rprefix=None):
+        self.left = stack(left, missing=missing)
+        self.right = stack(right, missing=missing)
+        self.presorted = presorted
+        if not presorted:
+            lsortkey = _as_field_list(lkey) + [ltime]
+            rsortkey = _as_field_list(rkey) + [rtime]
+            self.left = sort(self.left, lsortkey, buffersize=buffersize,
+                             tempdir=tempdir, cache=cache)
+            self.right = sort(self.right, rsortkey, buffersize=buffersize,
+                              tempdir=tempdir, cache=cache)
+        self.lkey = lkey
+        self.rkey = rkey
+        self.ltime = ltime
+        self.rtime = rtime
+        self.tolerance = tolerance
+        self.missing = missing
+        self.lprefix = lprefix
+        self.rprefix = rprefix
+
+    def __iter__(self):
+        return iterasofjoin(self.left, self.right, self.lkey, self.rkey,
+                            self.ltime, self.rtime, tolerance=self.tolerance,
+                            missing=self.missing, presorted=self.presorted,
+                            lprefix=self.lprefix, rprefix=self.rprefix)
+
+
+def _check_sorted_order(rows, kind, tind, side):
+    # verify rows are ordered ascending by (key, time), raising an error
+    # naming the offending side if an inversion is found
+    getkt = comparable_itemgetter(*(list(kind) + [tind]))
+    prev = None
+    for row in rows:
+        cur = getkt(row)
+        if prev is not None and cur < prev:
+            raise ArgumentError(
+                '%s table is not sorted ascending by key and time, found '
+                'out-of-order row: %r' % (side, tuple(row))
+            )
+        prev = cur
+        yield row
+
+
+def iterasofjoin(left, right, lkey, rkey, ltime, rtime, tolerance=None,
+                 missing=None, presorted=False, lprefix=None, rprefix=None):
+    lit = iter(left)
+    rit = iter(right)
+
+    lhdr = next(lit)
+    rhdr = next(rit)
+
+    # determine indices of the key and time fields in both tables
+    lkind = asindices(lhdr, lkey)
+    rkind = asindices(rhdr, rkey)
+    ltind = asindices(lhdr, ltime)[0]
+    rtind = asindices(rhdr, rtime)[0]
+
+    # construct functions to extract key values from both tables
+    lgetk = comparable_itemgetter(*lkind)
+    rgetk = comparable_itemgetter(*rkind)
+
+    # determine indices of non-key fields in the right table
+    # (in the output, we only include key fields from the left table - we
+    # don't want to duplicate fields; the right time field is kept so that
+    # the matched right row can be identified)
+    rvind = _nonkey_indices(rhdr, rkind)
+    rgetv = rowgetter(*rvind)
+
+    # determine the output fields
+    if lprefix is None:
+        outhdr = list(lhdr)
+    else:
+        outhdr = [(text_type(lprefix) + text_type(f)) for f in lhdr]
+    if rprefix is None:
+        outhdr.extend(rgetv(rhdr))
+    else:
+        outhdr.extend([(text_type(rprefix) + text_type(f)) for f in rgetv(rhdr)])
+    yield tuple(outhdr)
+
+    if presorted:
+        lit = _check_sorted_order(lit, lkind, ltind, 'left')
+        rit = _check_sorted_order(rit, rkind, rtind, 'right')
+
+    def row_key_missing(row, kind):
+        return any(row[i] is None for i in kind)
+
+    # define a function to join two groups of rows sharing the same key;
+    # only a single candidate row from the right group is kept in memory
+    # at any time
+    def joinrows(_lrowgrp, _rrowgrp):
+        if _rrowgrp is None:
+            for lrow in _lrowgrp:
+                outrow = list(lrow)  # start with the left row
+                # extend with missing values in place of the right row
+                outrow.extend([missing] * len(rvind))
+                yield tuple(outrow)
+        else:
+            rrows = iter(_rrowgrp)
+            sentinel = object()
+            rnext = next(rrows, sentinel)
+            best = None  # most recent eligible right row seen so far
+            for lrow in _lrowgrp:
+                lt = lrow[ltind]
+                if lt is None or row_key_missing(lrow, lkind):
+                    # rows missing a key or time value never match
+                    outrow = list(lrow)
+                    outrow.extend([missing] * len(rvind))
+                    yield tuple(outrow)
+                    continue
+                # advance over right rows with time not after the left row,
+                # keeping the most recent one; rows appearing later in the
+                # input overwrite earlier rows with the same time
+                while rnext is not sentinel:
+                    rt = rnext[rtind]
+                    if rt is None or row_key_missing(rnext, rkind):
+                        # right rows missing a key or time value are never
+                        # eligible
+                        rnext = next(rrows, sentinel)
+                    elif rt <= lt:
+                        best = rnext
+                        rnext = next(rrows, sentinel)
+                    else:
+                        break
+                if best is not None and (tolerance is None
+                                         or lt - best[rtind] <= tolerance):
+                    outrow = list(lrow)
+                    outrow.extend(rgetv(best))
+                    yield tuple(outrow)
+                else:
+                    outrow = list(lrow)
+                    outrow.extend([missing] * len(rvind))
+                    yield tuple(outrow)
+
+    # construct group iterators for both tables
+    lgit = itertools.groupby(lit, key=lgetk)
+    rgit = itertools.groupby(rit, key=rgetk)
+    lrowgrp = []
+
+    # whether lrowgrp holds a group that has been picked off lgit but not yet
+    # yielded; tracked explicitly because no key value can stand in for
+    # "iterator exhausted" - None is itself a valid key
+    lgrp_pending = False
+
+    # loop until *either* of the iterators is exhausted
+    try:
+
+        # pick off initial row groups
+        lkval, lrowgrp = next(lgit)
+        lgrp_pending = True
+        rkval, rrowgrp = next(rgit)
+
+        while True:
+            if lkval < rkval:
+                for row in joinrows(lrowgrp, None):
+                    yield tuple(row)
+                # advance left
+                lgrp_pending = False
+                lkval, lrowgrp = next(lgit)
+                lgrp_pending = True
+            elif lkval > rkval:
+                # no left rows for this key, discard the right group
+                rkval, rrowgrp = next(rgit)
+            else:
+                for row in joinrows(lrowgrp, rrowgrp):
+                    yield tuple(row)
+                # advance both
+                lgrp_pending = False
+                lkval, lrowgrp = next(lgit)
+                lgrp_pending = True
+                rkval, rrowgrp = next(rgit)
+
+    except StopIteration:
+        pass
+
+    # make sure any left rows remaining are yielded
+    if lgrp_pending:
+        # yield anything that got left hanging
+        for row in joinrows(lrowgrp, None):
+            yield tuple(row)
+    # yield the rest
+    for lkval, lrowgrp in lgit:
+        for row in joinrows(lrowgrp, None):
+            yield tuple(row)
+
+
 def unjoin(table, value, key=None, autoincrement=(1, 1), presorted=False,
            buffersize=None, tempdir=None, cache=True):
     """

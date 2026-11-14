@@ -157,6 +157,7 @@ Joins
 .. autofunction:: petl.transform.joins.join
 .. autofunction:: petl.transform.joins.leftjoin
 .. autofunction:: petl.transform.joins.lookupjoin
+.. autofunction:: petl.transform.joins.asofjoin
 .. autofunction:: petl.transform.joins.rightjoin
 .. autofunction:: petl.transform.joins.outerjoin
 .. autofunction:: petl.transform.joins.crossjoin
