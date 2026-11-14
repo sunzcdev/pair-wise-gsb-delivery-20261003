@@ -2,6 +2,16 @@
 
 ## Development
 
+* Added a configurable duplicate-key policy for object construction.
+  `ObjectBuilder` and the `items`/`kvitems` routines (sync, async and
+  push/coroutine entry points) now accept a `duplicate_keys` argument taking
+  an `ijson.DuplicateKeyPolicy` (or its name as a string): `KEEP_LAST`
+  (default, unchanged last-write-wins behavior), `KEEP_FIRST` (keep the
+  first value and ignore the rest while still validating the whole
+  document) and `REJECT` (raise `ijson.DuplicateKeyError`). Duplicates are
+  decided on the decoded key, each nested object is tracked independently,
+  and objects inside an array never interfere. The check also applies when a
+  custom `map_type` is supplied.
 * Fixed handling of integers longer than `sys.get_int_max_str_digits()`:
   the `yajl2_c` backend no longer crashes on them, and all backends
   now raise the `ValueError` produced by `int()` (#188).

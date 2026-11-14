@@ -6,6 +6,59 @@ import sys
 
 import pytest
 
+import ijson
+from ijson import DuplicateKeyError, DuplicateKeyPolicy
+
+
+DUPLICATE_JSON = (
+    b'{"o": {"m": 1, "m": 2, "inner": {"m": 3, "m": 4}}, '
+    b'"arr": [{"z": 1, "z": 2}, {"z": 7}]}'
+)
+
+
+def test_kvitems_duplicate_keys_keep_last_is_default(adaptor):
+    result = adaptor.kvitems(DUPLICATE_JSON, "o")
+    assert result == [("m", 1), ("m", 2), ("inner", {"m": 4})]
+
+
+@pytest.mark.parametrize("policy", [DuplicateKeyPolicy.KEEP_FIRST, "keep_first"])
+def test_kvitems_duplicate_keys_keep_first(adaptor, policy):
+    assert adaptor.kvitems(DUPLICATE_JSON, "o", duplicate_keys=policy) == [
+        ("m", 1),
+        ("inner", {"m": 3}),
+    ]
+
+
+def test_kvitems_duplicate_keys_array_objects_independent(adaptor):
+    assert adaptor.kvitems(
+        DUPLICATE_JSON, "arr.item", duplicate_keys=DuplicateKeyPolicy.KEEP_FIRST
+    ) == [("z", 1), ("z", 7)]
+
+
+@pytest.mark.parametrize("policy", [DuplicateKeyPolicy.REJECT, "reject"])
+def test_kvitems_duplicate_keys_reject(adaptor, policy):
+    with pytest.raises(DuplicateKeyError):
+        adaptor.kvitems(DUPLICATE_JSON, "o", duplicate_keys=policy)
+
+
+def test_kvitems_duplicate_keys_decoded_key(adaptor):
+    json = b'{"o": {"a": 1, "\\u0061": 2}}'
+    assert adaptor.kvitems(json, "o", duplicate_keys=DuplicateKeyPolicy.KEEP_FIRST) == [("a", 1)]
+    with pytest.raises(DuplicateKeyError):
+        adaptor.kvitems(json, "o", duplicate_keys=DuplicateKeyPolicy.REJECT)
+
+
+def test_kvitems_keep_first_validates_ignored_value(adaptor):
+    bad_json = b'{"o": {"m": 1, "m": [1, 2,]}}'
+    with pytest.raises(ijson.JSONError):
+        adaptor.kvitems(bad_json, "o", duplicate_keys=DuplicateKeyPolicy.KEEP_FIRST)
+
+
+def test_kvitems_duplicate_inside_value(adaptor):
+    json = b'{"o": {"v": {"k": 1, "k": 2}}}'
+    assert adaptor.kvitems(json, "o", duplicate_keys=DuplicateKeyPolicy.KEEP_FIRST) == [
+        ("v", {"k": 1})
+    ]
 
 def test_kvitems(adaptor):
     assert JSON_KVITEMS == adaptor.kvitems(JSON, 'docs.item')

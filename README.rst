@@ -415,6 +415,22 @@ to give users more fine-grained control over certain operations:
   have an optional ``map_type`` argument (defaults to ``dict``)
   used to construct objects from the JSON stream.
   This should be a dict-like type supporting item assignment.
+- The same functions accept an optional ``duplicate_keys`` argument
+  controlling how repeated members of a JSON object
+  (two members whose decoded keys are equal) are handled.
+  It takes an ``ijson.DuplicateKeyPolicy`` value
+  (or its name as a string):
+  ``KEEP_LAST`` (the default, keeps the last value
+  and preserves the historical last-write-wins behavior),
+  ``KEEP_FIRST`` (keeps the first value, ignoring later ones,
+  while still parsing and validating the whole document),
+  and ``REJECT`` (raises ``ijson.DuplicateKeyError``).
+  Duplicates are judged on the decoded key,
+  so differently escaped but equivalent names still collide;
+  each nested object is tracked independently,
+  and separate objects inside an array never interfere.
+  The same argument is available
+  on the low-level ``ijson.common.ObjectBuilder``.
 
 
 Events

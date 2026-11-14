@@ -10,7 +10,7 @@ import pytest
 
 import ijson
 from ijson import common
-from ijson.common import ObjectBuilder
+from ijson.common import DuplicateKeyError, DuplicateKeyPolicy, ObjectBuilder
 
 from tests.test_base import JSON, JSON_EVENTS, JSON_PARSE_EVENTS, JSON_OBJECT,\
     JSON_KVITEMS
@@ -118,6 +118,124 @@ class TestObjectBuilder:
         assert builder.value == {'a': {'b': 1}, 'c': [2]}
         assert type(builder.value) is collections.OrderedDict
         assert type(builder.value['a']) is collections.OrderedDict
+
+    def _build(self, events, **kwargs):
+        builder = ObjectBuilder(**kwargs)
+        for event, value in events:
+            builder.event(event, value)
+        return builder.value
+
+    @pytest.mark.parametrize("policy", [
+        DuplicateKeyPolicy.KEEP_LAST,
+        "keep_last",
+        None,
+    ])
+    def test_duplicate_keys_default_keeps_last(self, policy):
+        events = [
+            ('start_map', None),
+            ('map_key', 'a'), ('number', 1),
+            ('map_key', 'a'), ('number', 2),
+            ('end_map', None),
+        ]
+        kwargs = {} if policy is None else {"duplicate_keys": policy}
+        assert self._build(events, **kwargs) == {'a': 2}
+
+    @pytest.mark.parametrize("policy", [DuplicateKeyPolicy.KEEP_FIRST, "keep_first"])
+    def test_duplicate_keys_keep_first(self, policy):
+        events = [
+            ('start_map', None),
+            ('map_key', 'a'), ('number', 1),
+            ('map_key', 'a'), ('number', 2),
+            ('map_key', 'b'), ('number', 3),
+            ('end_map', None),
+        ]
+        assert self._build(events, duplicate_keys=policy) == {'a': 1, 'b': 3}
+
+    def test_duplicate_keys_keep_first_nested_and_arrays_independent(self):
+        events = [
+            ('start_map', None),
+            ('map_key', 'a'),
+            ('start_array', None),
+            ('start_map', None),
+            ('map_key', 'k'), ('number', 1),
+            ('map_key', 'k'), ('number', 2),
+            ('end_map', None),
+            ('start_map', None),
+            ('map_key', 'k'), ('number', 9),
+            ('end_map', None),
+            ('end_array', None),
+            ('map_key', 'n'),
+            ('start_map', None),
+            ('map_key', 'x'), ('number', 1),
+            ('map_key', 'x'), ('number', 2),
+            ('end_map', None),
+            ('end_map', None),
+        ]
+        assert self._build(events, duplicate_keys=DuplicateKeyPolicy.KEEP_FIRST) == {
+            'a': [{'k': 1}, {'k': 9}],
+            'n': {'x': 1},
+        }
+
+    def test_duplicate_keys_decided_on_decoded_key(self):
+        # "a" and "\u0061" decode to the same key, hence they collide
+        events = [
+            ('start_map', None),
+            ('map_key', 'a'), ('number', 1),
+            ('map_key', 'a'), ('number', 2),
+            ('end_map', None),
+        ]
+        assert self._build(events, duplicate_keys=DuplicateKeyPolicy.KEEP_FIRST) == {'a': 1}
+        with pytest.raises(DuplicateKeyError):
+            self._build(events, duplicate_keys=DuplicateKeyPolicy.REJECT)
+
+    @pytest.mark.parametrize("policy", [DuplicateKeyPolicy.REJECT, "reject"])
+    def test_duplicate_keys_reject(self, policy):
+        events = [
+            ('start_map', None),
+            ('map_key', 'a'), ('number', 1),
+            ('map_key', 'a'),
+        ]
+        with pytest.raises(DuplicateKeyError):
+            self._build(events, duplicate_keys=policy)
+
+    def test_keep_first_still_consumes_ignored_syntax(self):
+        # The ignored second value is itself a malformed object; because every
+        # event is still fed through the builder, the failure is not swallowed.
+        events = [
+            ('start_map', None),
+            ('map_key', 'a'),
+            ('start_map', None),
+            ('map_key', 'b'), ('number', 1),
+            ('end_map', None),
+            ('map_key', 'a'),
+            ('start_map', None),
+            ('end_map', None),
+            ('map_key', 'c'),
+            ('end_map', None),
+        ]
+        # The discarded duplicate object's containers must be balanced so the
+        # following sibling member is still stored.
+        assert self._build(events, duplicate_keys=DuplicateKeyPolicy.KEEP_FIRST) == {
+            'a': {'b': 1},
+        }
+
+    def test_duplicate_keys_enforced_with_custom_map_type(self):
+        events = [
+            ('start_map', None),
+            ('map_key', 'a'), ('number', 1),
+            ('map_key', 'a'), ('number', 2),
+            ('end_map', None),
+        ]
+        result = self._build(events, map_type=collections.OrderedDict,
+                             duplicate_keys=DuplicateKeyPolicy.KEEP_FIRST)
+        assert result == collections.OrderedDict([('a', 1)])
+        with pytest.raises(DuplicateKeyError):
+            self._build(events, map_type=collections.OrderedDict,
+                        duplicate_keys=DuplicateKeyPolicy.REJECT)
+
+    def test_invalid_duplicate_keys_policy_raises(self):
+        with pytest.raises(ValueError):
+            ObjectBuilder(duplicate_keys="not-a-policy")
 
     @pytest.mark.skipif(sys.implementation.name != "cpython",
                         reason="deterministic refcounting is CPython-only")

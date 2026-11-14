@@ -7,7 +7,74 @@ import pytest
 
 from .test_base import ARRAY_JSON, ARRAY_JSON_OBJECT, EMPTY_MEMBER_TEST_CASES, JSON, JSON_OBJECT
 
-from ijson import JSONError
+from ijson import DuplicateKeyError, DuplicateKeyPolicy, JSONError
+
+
+DUPLICATE_JSON = (
+    b'{"a": 1, "a": 2, "n": {"x": 1, "x": 2}, '
+    b'"arr": [{"k": 1, "k": 2}, {"k": 9}]}'
+)
+DUPLICATE_KEEP_FIRST = {
+    "a": 1,
+    "n": {"x": 1},
+    "arr": [{"k": 1}, {"k": 9}],
+}
+
+
+@pytest.mark.parametrize("policy", [
+    DuplicateKeyPolicy.KEEP_FIRST,
+    "keep_first",
+    "KEEP_FIRST",
+])
+def test_items_duplicate_keys_keep_first(adaptor, policy):
+    result = adaptor.items(DUPLICATE_JSON, "", duplicate_keys=policy)
+    assert result == [DUPLICATE_KEEP_FIRST]
+
+
+def test_items_duplicate_keys_keep_last_is_default(adaptor):
+    default = adaptor.items(DUPLICATE_JSON, "")
+    explicit = adaptor.items(
+        DUPLICATE_JSON, "", duplicate_keys=DuplicateKeyPolicy.KEEP_LAST
+    )
+    assert default == explicit
+    assert default == [{
+        "a": 2,
+        "n": {"x": 2},
+        "arr": [{"k": 2}, {"k": 9}],
+    }]
+
+
+@pytest.mark.parametrize("policy", [DuplicateKeyPolicy.REJECT, "reject"])
+def test_items_duplicate_keys_reject(adaptor, policy):
+    with pytest.raises(DuplicateKeyError):
+        adaptor.items(DUPLICATE_JSON, "", duplicate_keys=policy)
+
+
+def test_items_duplicate_keys_uses_decoded_key(adaptor):
+    json = b'{"a": 1, "\\u0061": 2}'
+    assert adaptor.items(json, "", duplicate_keys=DuplicateKeyPolicy.KEEP_FIRST) == [{"a": 1}]
+    with pytest.raises(DuplicateKeyError):
+        adaptor.items(json, "", duplicate_keys=DuplicateKeyPolicy.REJECT)
+
+
+def test_items_keep_first_validates_ignored_value(adaptor):
+    bad_json = b'{"a": 1, "a": [1, 2,]}'
+    with pytest.raises(JSONError):
+        adaptor.items(bad_json, "", duplicate_keys=DuplicateKeyPolicy.KEEP_FIRST)
+
+
+def test_items_duplicate_keys_with_custom_map_type(adaptor):
+    result = adaptor.items(
+        DUPLICATE_JSON, "", map_type=collections.OrderedDict,
+        duplicate_keys=DuplicateKeyPolicy.KEEP_FIRST,
+    )[0]
+    assert isinstance(result, collections.OrderedDict)
+    assert result == DUPLICATE_KEEP_FIRST
+    with pytest.raises(DuplicateKeyError):
+        adaptor.items(
+            DUPLICATE_JSON, "", map_type=collections.OrderedDict,
+            duplicate_keys=DuplicateKeyPolicy.REJECT,
+        )
 
 def test_items(adaptor):
     assert [JSON_OBJECT] == adaptor.items(JSON, '')
