@@ -99,6 +99,249 @@ def quote_identifier(identifier: str) -> str:
     return '"{}"'.format(identifier.replace('"', '""'))
 
 
+def _qualified_identifier(database: str, name: str) -> str:
+    """
+    Quote a database alias and object name as two separate identifiers.
+
+    This deliberately never treats a dotted string as a single identifier.
+    """
+    return f"{quote_identifier(database)}.{quote_identifier(name)}"
+
+
+_SQL_IDENTIFIER_RE = (
+    r'(?:"(?:[^"]|"")*"'
+    r"|`(?:[^`]|``)*`"
+    r"|\[[^\]]*\]"
+    r"|'(?:[^']|'')*'"
+    r"|[A-Za-z_\u0080-\uffff][A-Za-z0-9_$\u0080-\uffff]*)"
+)
+
+_CREATE_TABLE_SQL_RE = re.compile(
+    r"^\s*CREATE\s+(?:TEMP(?:ORARY)?\s+)?TABLE\s+"
+    r"(?:IF\s+NOT\s+EXISTS\s+)?"
+    rf"(?P<name>{_SQL_IDENTIFIER_RE})",
+    re.IGNORECASE | re.DOTALL,
+)
+_CREATE_INDEX_SQL_RE = re.compile(
+    r"^\s*CREATE\s+(?P<unique>UNIQUE\s+)?INDEX\s+"
+    r"(?:IF\s+NOT\s+EXISTS\s+)?"
+    rf"{_SQL_IDENTIFIER_RE}\s+ON\s+"
+    rf"(?P<table>{_SQL_IDENTIFIER_RE})"
+    r"(?P<rest>.*)$",
+    re.IGNORECASE | re.DOTALL,
+)
+_CREATE_TRIGGER_SQL_RE = re.compile(
+    r"^\s*CREATE\s+(?:TEMP(?:ORARY)?\s+)?TRIGGER\s+"
+    r"(?:IF\s+NOT\s+EXISTS\s+)?"
+    rf"{_SQL_IDENTIFIER_RE}"
+    r"(?P<after>\s+(?:(?:BEFORE|AFTER)\s+|INSTEAD\s+OF\s+)"
+    r"(?:INSERT|UPDATE|DELETE).*?\s+ON\s+)"
+    rf"(?P<table>{_SQL_IDENTIFIER_RE})"
+    r"(?P<rest>.*)$",
+    re.IGNORECASE | re.DOTALL,
+)
+
+
+def _unquote_sql_identifier(value: str) -> str:
+    "Return the unquoted value of a SQLite identifier."
+    if len(value) < 2:
+        return value
+    quote = value[0]
+    if quote == '"':
+        return value[1:-1].replace('""', '"')
+    if quote == "`":
+        return value[1:-1].replace("``", "`")
+    if quote == "[":
+        return value[1:-1]
+    if quote == "'":
+        return value[1:-1].replace("''", "'")
+    return value
+
+
+def _next_sql_significant_character(sql: str, start: int) -> str | None:
+    "Return the next non-whitespace, non-comment character in a SQL string."
+    i = start
+    while i < len(sql):
+        if sql[i].isspace():
+            i += 1
+        elif sql.startswith("--", i):
+            newline = sql.find("\n", i)
+            if newline == -1:
+                return None
+            i = newline + 1
+        elif sql.startswith("/*", i):
+            end = sql.find("*/", i + 2)
+            if end == -1:
+                return None
+            i = end + 2
+        else:
+            return sql[i]
+    return None
+
+
+def _rewrite_qualified_table_references(
+    sql: str, source_table: str, target_table: str
+) -> str:
+    """
+    Rewrite ``source_table.column`` references to use the copied table name.
+
+    Only identifiers followed by a dot are rewritten, so unrelated column
+    names that happen to match the source table name are left alone.
+    """
+    result = []
+    i = 0
+    source_folded = fold_identifier_case(source_table)
+    while i < len(sql):
+        char = sql[i]
+        if char.isspace():
+            result.append(char)
+            i += 1
+            continue
+        if sql.startswith("--", i):
+            end = sql.find("\n", i)
+            if end == -1:
+                result.append(sql[i:])
+                break
+            result.append(sql[i : end + 1])
+            i = end + 1
+            continue
+        if sql.startswith("/*", i):
+            end = sql.find("*/", i + 2)
+            if end == -1:
+                result.append(sql[i:])
+                break
+            result.append(sql[i : end + 2])
+            i = end + 2
+            continue
+        if char in ("(", ")", ",", ";", "."):
+            result.append(char)
+            i += 1
+            continue
+        if char in ('"', "`", "[", "'"):
+            end = i + 1
+            while end < len(sql):
+                if char == "[":
+                    if sql[end] == "]":
+                        end += 1
+                        break
+                elif sql[end] == char:
+                    if end + 1 < len(sql) and sql[end + 1] == char:
+                        end += 2
+                        continue
+                    end += 1
+                    break
+                end += 1
+            token = sql[i:end]
+        else:
+            end = i
+            while end < len(sql) and not (
+                sql[end].isspace()
+                or sql[end] in ("(", ")", ",", ";", ".")
+                or sql.startswith("--", end)
+                or sql.startswith("/*", end)
+            ):
+                end += 1
+            token = sql[i:end]
+        if (
+            fold_identifier_case(_unquote_sql_identifier(token)) == source_folded
+            and _next_sql_significant_character(sql, end) == "."
+        ):
+            result.append(quote_identifier(target_table))
+        else:
+            result.append(token)
+        i = end
+    return "".join(result)
+
+
+def _rewrite_self_foreign_keys(
+    sql: str, source_table: str, target_table: str
+) -> str:
+    """
+    Rewrite REFERENCES clauses that point at the table being copied.
+
+    Foreign keys to other tables are handled separately - they are never
+    rewritten automatically.
+    """
+    result = []
+    i = 0
+    pending_references = False
+    source_folded = fold_identifier_case(source_table)
+    while i < len(sql):
+        char = sql[i]
+        if char.isspace():
+            result.append(char)
+            i += 1
+            continue
+        if sql.startswith("--", i):
+            end = sql.find("\n", i)
+            if end == -1:
+                result.append(sql[i:])
+                break
+            result.append(sql[i : end + 1])
+            i = end + 1
+            continue
+        if sql.startswith("/*", i):
+            end = sql.find("*/", i + 2)
+            if end == -1:
+                result.append(sql[i:])
+                break
+            result.append(sql[i : end + 2])
+            i = end + 2
+            continue
+        if char in ('"', "`", "[", "'"):
+            end = i + 1
+            while end < len(sql):
+                if char == "[":
+                    if sql[end] == "]":
+                        end += 1
+                        break
+                elif sql[end] == char:
+                    if end + 1 < len(sql) and sql[end + 1] == char:
+                        end += 2
+                        continue
+                    end += 1
+                    break
+                end += 1
+            token = sql[i:end]
+            if pending_references:
+                token_value = _unquote_sql_identifier(token)
+                if fold_identifier_case(token_value) == source_folded:
+                    result.append(quote_identifier(target_table))
+                else:
+                    result.append(token)
+                pending_references = False
+            else:
+                result.append(token)
+            i = end
+            continue
+        if char in ("(", ")", ",", ";"):
+            result.append(char)
+            pending_references = False
+            i += 1
+            continue
+        end = i
+        while end < len(sql) and not (
+            sql[end].isspace()
+            or sql[end] in ("(", ")", ",", ";")
+            or sql.startswith("--", end)
+            or sql.startswith("/*", end)
+        ):
+            end += 1
+        token = sql[i:end]
+        if pending_references and fold_identifier_case(token) == source_folded:
+            result.append(quote_identifier(target_table))
+            token = ""
+        elif pending_references:
+            pending_references = False
+        result.append(token)
+        if token and fold_identifier_case(token) == "references":
+            pending_references = True
+        elif token:
+            pending_references = False
+        i = end
+    return "".join(result)
+
+
 def _check_constraint_sql(check: Check) -> str:
     prefix = f"CONSTRAINT {quote_identifier(check.name)} " if check.name else ""
     newline = "\n" if sql_ends_in_line_comment(check.check) else ""
@@ -466,6 +709,55 @@ class InvalidColumns(Exception):
 
 class TransactionError(Exception):
     "Operation cannot be performed while a transaction is open"
+
+
+class TableCopyError(Exception):
+    "Base class for errors raised by Database.copy_table()"
+
+
+class TableAlreadyExists(TableCopyError, OperationalError):
+    "The copy target already exists and replace was not requested"
+
+
+class TableCopyDependencyError(TableCopyError, AlterError):
+    "A copied table depends on an object that was not copied"
+
+
+class TableCopyResult:
+    """
+    Details of a completed :meth:`Database.copy_table` operation.
+    """
+
+    def __init__(
+        self,
+        source_database: str,
+        source_table: str,
+        target_database: str,
+        target_table: str,
+        rows_copied: int,
+        indexes: Iterable[str],
+        triggers: Iterable[str],
+    ):
+        self.source_database = source_database
+        self.source_table = source_table
+        self.target_database = target_database
+        self.target_table = target_table
+        self.rows_copied = rows_copied
+        self.indexes = tuple(indexes)
+        self.triggers = tuple(triggers)
+
+    def __repr__(self) -> str:
+        return (
+            "<TableCopyResult {}.{} -> {}.{}: {} rows, {} indexes, {} triggers>".format(
+                quote_identifier(self.source_database),
+                quote_identifier(self.source_table),
+                quote_identifier(self.target_database),
+                quote_identifier(self.target_table),
+                self.rows_copied,
+                len(self.indexes),
+                len(self.triggers),
+            )
+        )
 
 
 class DescIndex(str):
@@ -863,6 +1155,350 @@ class Database:
             ATTACH DATABASE '{pathlib.Path(filepath).resolve()!s}' AS {quote_identifier(alias)};
         """.strip()
         self.execute(attach_sql)
+
+    def _database_aliases(self) -> dict[str, str]:
+        return {
+            fold_identifier_case(name): name
+            for _, name, _ in self.execute("PRAGMA database_list").fetchall()
+        }
+
+    def _resolve_database_alias(self, alias: str) -> str:
+        aliases = self._database_aliases()
+        try:
+            return aliases[fold_identifier_case(alias)]
+        except KeyError:
+            raise ValueError(
+                f"Unknown database alias {alias!r} - use db.attach() first"
+            )
+
+    def _database_object(
+        self, database: str, name: str, types: tuple[str, ...] = ("table", "view")
+    ) -> tuple[str, str, str | None] | None:
+        rows = self.execute(
+            "select type, name, sql from {}.sqlite_master "
+            "where name = ? collate nocase".format(quote_identifier(database)),
+            (name,),
+        ).fetchall()
+        for object_type, object_name, sql in rows:
+            if object_type in types:
+                return object_type, object_name, sql
+        return None
+
+    def _unique_object_name(self, database: str, name: str) -> str:
+        existing = {
+            fold_identifier_case(row[0])
+            for row in self.execute(
+                "select name from {}.sqlite_master".format(
+                    quote_identifier(database)
+                )
+            ).fetchall()
+        }
+        if fold_identifier_case(name) not in existing:
+            return name
+        suffix = 1
+        while True:
+            candidate = (
+                f"{name}_copy" if suffix == 1 else f"{name}_copy_{suffix}"
+            )
+            if fold_identifier_case(candidate) not in existing:
+                return candidate
+            suffix += 1
+
+    def _copy_table_indexes(
+        self,
+        source_database: str,
+        source_table: str,
+        target_database: str,
+        target_table: str,
+    ) -> list[str]:
+        rows = self.execute(
+            "select name, sql from {}.sqlite_master "
+            "where type = 'index' and tbl_name = ? collate nocase "
+            "and sql is not null order by name".format(
+                quote_identifier(source_database)
+            ),
+            (source_table,),
+        ).fetchall()
+        copied = []
+        for index_name, index_sql in rows:
+            match = _CREATE_INDEX_SQL_RE.match(index_sql)
+            if match is None:
+                continue
+            target_index = self._unique_object_name(target_database, index_name)
+            index_tail = _rewrite_qualified_table_references(
+                match.group("rest"), source_table, target_table
+            )
+            create_sql = "CREATE {}INDEX {} ON {}{}".format(
+                "UNIQUE " if match.group("unique") else "",
+                _qualified_identifier(target_database, target_index),
+                quote_identifier(target_table),
+                index_tail,
+            )
+            self.execute(create_sql)
+            copied.append(target_index)
+        return copied
+
+    def _copy_table_triggers(
+        self,
+        source_database: str,
+        source_table: str,
+        target_database: str,
+        target_table: str,
+    ) -> list[str]:
+        rows = self.execute(
+            "select name, sql from {}.sqlite_master "
+            "where type = 'trigger' and tbl_name = ? collate nocase "
+            "and sql is not null order by name".format(
+                quote_identifier(source_database)
+            ),
+            (source_table,),
+        ).fetchall()
+        copied = []
+        for trigger_name, trigger_sql in rows:
+            trigger_sql = _rewrite_qualified_table_references(
+                trigger_sql, source_table, target_table
+            )
+            match = _CREATE_TRIGGER_SQL_RE.match(trigger_sql)
+            if match is None:
+                continue
+            target_trigger = self._unique_object_name(target_database, trigger_name)
+            create_sql = "CREATE TRIGGER {}{}{}{}".format(
+                _qualified_identifier(target_database, target_trigger),
+                match.group("after"),
+                quote_identifier(target_table),
+                match.group("rest"),
+            )
+            self.execute(create_sql)
+            copied.append(target_trigger)
+        return copied
+
+    def copy_table(
+        self,
+        source_database: str | None = None,
+        source_table: str | None = None,
+        target_database: str | None = None,
+        target_table: str | None = None,
+        *,
+        source_db: str | None = None,
+        target_db: str | None = None,
+        replace: bool = False,
+        copy_triggers: bool = False,
+        triggers: bool | None = None,
+        include_triggers: bool | None = None,
+    ) -> TableCopyResult:
+        """
+        Copy a table between databases attached to this connection.
+
+        The source and target database aliases and table names are always
+        supplied as separate arguments and quoted independently. The copy
+        preserves the table's column definitions (including generated
+        columns), data, and explicitly-created indexes, including partial and
+        expression indexes. Triggers are copied only when ``copy_triggers`` is
+        true.
+
+        The target must not exist unless ``replace=True``, in which case the
+        old table is dropped and the replacement is created in the same
+        transaction as the data and index copy. Any failure rolls the target
+        back and leaves the source database unchanged.
+
+        A foreign key which references a table in the source database that is
+        not the table being copied raises :class:`TableCopyDependencyError`
+        when copying to a different database. It is never silently redirected
+        at a same-named table in the target database.
+
+        :param source_database: Source database alias, for example ``"main"``
+          or the alias passed to :meth:`attach`
+        :param source_table: Source table name
+        :param target_database: Target database alias
+        :param target_table: Target table name
+        :param replace: Set to ``True`` to replace an existing target
+        :param copy_triggers: Set to ``True`` to copy triggers for the table
+        :param triggers: Alias for ``copy_triggers``
+        :param include_triggers: Alias for ``copy_triggers``
+        """
+        if source_database is not None and source_db is not None:
+            raise TypeError("Use one of source_database or source_db, not both")
+        if target_database is not None and target_db is not None:
+            raise TypeError("Use one of target_database or target_db, not both")
+        source_database = source_database if source_database is not None else source_db
+        target_database = target_database if target_database is not None else target_db
+        if source_database is None or source_table is None:
+            raise TypeError("copy_table() requires a source database and table")
+        if target_database is None or target_table is None:
+            raise TypeError("copy_table() requires a target database and table")
+        if triggers is not None:
+            if include_triggers is not None:
+                raise TypeError("Use one of triggers or include_triggers, not both")
+            copy_triggers = triggers
+        elif include_triggers is not None:
+            copy_triggers = include_triggers
+        source_database = self._resolve_database_alias(source_database)
+        target_database = self._resolve_database_alias(target_database)
+        if source_database == target_database and (
+            fold_identifier_case(source_table) == fold_identifier_case(target_table)
+        ):
+            raise ValueError("Source and target table must be different")
+        source_object = self._database_object(
+            source_database, source_table, types=("table",)
+        )
+        if source_object is None:
+            raise NoTable(
+                f'Table "{source_table}" does not exist in database '
+                f'"{source_database}"'
+            )
+        _, actual_source_table, source_sql = source_object
+        if source_sql is None or _CREATE_TABLE_SQL_RE.match(source_sql) is None:
+            raise ValueError(
+                f'Cannot copy virtual table "{source_table}" from database '
+                f'"{source_database}"'
+            )
+        source_qualified = _qualified_identifier(
+            source_database, actual_source_table
+        )
+        target_qualified = _qualified_identifier(target_database, target_table)
+        with self.atomic():
+            target_object = self._database_object(
+                target_database, target_table, types=("table", "view")
+            )
+            if target_object is not None:
+                if not replace:
+                    raise TableAlreadyExists(
+                        f'Table "{target_table}" already exists in database '
+                        f'"{target_database}". Use replace=True to delete and '
+                        "replace it."
+                    )
+                target_type = target_object[0]
+                self.execute(
+                    "DROP {} {}".format(
+                        "VIEW" if target_type == "view" else "TABLE",
+                        target_qualified,
+                    )
+                )
+            foreign_key_rows = self.execute(
+                "PRAGMA {}.foreign_key_list({})".format(
+                    quote_identifier(source_database),
+                    quote_identifier(actual_source_table),
+                )
+            ).fetchall()
+            dependencies = {
+                row[2]
+                for row in foreign_key_rows
+                if fold_identifier_case(row[2])
+                != fold_identifier_case(actual_source_table)
+            }
+            if source_database != target_database and dependencies:
+                raise TableCopyDependencyError(
+                    'Cannot copy table "{}" from database "{}" to database '
+                    '"{}": foreign key references {} which {} not part of this '
+                    "copy. The reference will not be redirected at a table "
+                    'with the same name in database "{}".'.format(
+                        actual_source_table,
+                        source_database,
+                        target_database,
+                        ", ".join(
+                            quote_identifier(dependency)
+                            for dependency in sorted(dependencies)
+                        ),
+                        "was" if len(dependencies) == 1 else "were",
+                        target_database,
+                    )
+                )
+            match = _CREATE_TABLE_SQL_RE.match(source_sql)
+            assert match is not None
+            create_sql = "CREATE TABLE {}{}".format(
+                target_qualified, source_sql[match.end() :]
+            )
+            create_sql = _rewrite_self_foreign_keys(
+                create_sql, actual_source_table, target_table
+            )
+            self.execute(create_sql)
+            column_rows = self.execute(
+                "PRAGMA {}.table_xinfo({})".format(
+                    quote_identifier(source_database),
+                    quote_identifier(actual_source_table),
+                )
+            ).fetchall()
+            insert_columns = [
+                row[1]
+                for row in column_rows
+                if len(row) < 7 or row[6] == 0
+            ]
+            if insert_columns:
+                columns_sql = ", ".join(
+                    quote_identifier(column) for column in insert_columns
+                )
+                cursor = self.execute(
+                    "INSERT INTO {} ({}) SELECT {} FROM {}".format(
+                        target_qualified,
+                        columns_sql,
+                        columns_sql,
+                        source_qualified,
+                    )
+                )
+                rows_copied = cursor.rowcount
+                if rows_copied < 0:
+                    rows_copied = self.execute("select changes()").fetchone()[0]
+            else:
+                rows_copied = self.execute(
+                    f"select count(*) from {source_qualified}"
+                ).fetchone()[0]
+                for _ in range(rows_copied):
+                    self.execute(
+                        f"INSERT INTO {target_qualified} DEFAULT VALUES"
+                    )
+            copied_indexes = self._copy_table_indexes(
+                source_database,
+                actual_source_table,
+                target_database,
+                target_table,
+            )
+            copied_triggers = (
+                self._copy_table_triggers(
+                    source_database,
+                    actual_source_table,
+                    target_database,
+                    target_table,
+                )
+                if copy_triggers
+                else []
+            )
+        return TableCopyResult(
+            source_database,
+            actual_source_table,
+            target_database,
+            target_table,
+            rows_copied,
+            copied_indexes,
+            copied_triggers,
+        )
+
+    def duplicate_table(
+        self,
+        source_database: str | None = None,
+        source_table: str | None = None,
+        target_database: str | None = None,
+        target_table: str | None = None,
+        *,
+        source_db: str | None = None,
+        target_db: str | None = None,
+        replace: bool = False,
+        copy_triggers: bool = False,
+        triggers: bool | None = None,
+        include_triggers: bool | None = None,
+    ) -> TableCopyResult:
+        "Alias for :meth:`copy_table`."
+        return self.copy_table(
+            source_database,
+            source_table,
+            target_database,
+            target_table,
+            source_db=source_db,
+            target_db=target_db,
+            replace=replace,
+            copy_triggers=copy_triggers,
+            triggers=triggers,
+            include_triggers=include_triggers,
+        )
 
     def query(
         self, sql: str, params: Sequence | dict[str, Any] | None = None
@@ -2627,18 +3263,84 @@ class Table(Queryable):
             )
         return self
 
-    def duplicate(self, new_name: str) -> "Table":
+    def duplicate(
+        self,
+        new_name: str,
+        *,
+        source_db: str = "main",
+        target_db: str = "main",
+        target_database: str | None = None,
+        replace: bool = False,
+        copy_triggers: bool = False,
+        triggers: bool | None = None,
+        include_triggers: bool | None = None,
+    ) -> "Table | TableCopyResult":
         """
-        Create a duplicate of this table, copying across the schema and all row data.
+        Create a duplicate of this table, copying schema, data and indexes.
 
         :param new_name: Name of the new table
+        :param source_db: Database alias containing this table
+        :param target_db: Database alias to copy into, defaults to ``"main"``
+        :param target_database: Alias for ``target_db``
+        :param replace: Set to ``True`` to replace an existing target table
+        :param copy_triggers: Set to ``True`` to copy triggers for the table
+        :param triggers: Alias for ``copy_triggers``
+        :param include_triggers: Alias for ``copy_triggers``
         """
         if not self.exists():
             raise NoTable(f"Table {self.name} does not exist")
-        with self.db.atomic():
-            sql = f"CREATE TABLE {quote_identifier(new_name)} AS SELECT * FROM {quote_identifier(self.name)};"
-            self.db.execute(sql)
-        return self.db.table(new_name)
+        if target_database is not None:
+            if target_db != "main":
+                raise TypeError("Use one of target_db or target_database, not both")
+            target_db = target_database
+        needs_exact_copy = bool(
+            self.strict
+            or any(
+                column.is_pk
+                or column.notnull
+                or column.default_value is not None
+                for column in self.columns
+            )
+            or any(index.origin == "c" for index in self.indexes)
+            or re.search(
+                r"\b(?:AUTOINCREMENT|CHECK|CONSTRAINT|FOREIGN\s+KEY|GENERATED"
+                r"|REFERENCES|UNIQUE|WITHOUT\s+ROWID)\b",
+                self.schema,
+                re.IGNORECASE,
+            )
+        )
+        if (
+            source_db == "main"
+            and target_db == "main"
+            and not needs_exact_copy
+            and not replace
+            and not copy_triggers
+            and triggers is not True
+            and include_triggers is not True
+        ):
+            # Preserve the historical CREATE TABLE AS behavior for the
+            # same-database convenience method. Database.copy_table() always
+            # preserves the original column definitions and indexes.
+            with self.db.atomic():
+                sql = (
+                    f"CREATE TABLE {quote_identifier(new_name)} AS "
+                    f"SELECT * FROM {quote_identifier(self.name)}"
+                )
+                self.db.execute(sql)
+            return self.db.table(new_name)
+        result = self.db.copy_table(
+            source_db,
+            self.name,
+            target_db,
+            new_name,
+            replace=replace,
+            copy_triggers=copy_triggers,
+            triggers=triggers,
+            include_triggers=include_triggers,
+        )
+        if result.target_database == "main":
+            return self.db.table(new_name)
+        return result
 
     def transform(
         self,

@@ -1065,6 +1065,46 @@ This method raises ``sqlite_utils.db.NoTable`` if the table does not exist.
 .. note::
     In the CLI: :ref:`sqlite-utils duplicate <cli_duplicate_table>`
 
+.. _python_api_copy_table:
+
+Copying tables between attached databases
+=========================================
+
+The ``db.copy_table()`` method copies a table from one attached SQLite
+database to another. The source and target database aliases and table names
+are always passed as separate values - a string containing a dot is treated as
+a literal table name, not as a ``database.table`` reference:
+
+.. code-block:: python
+
+    db = Database("source.db")
+    db.attach("archive", "archive.db")
+    result = db.copy_table(
+        "main",
+        "authors",
+        "archive",
+        "authors_copy",
+    )
+
+The copy preserves column definitions such as generated columns, constraints
+and defaults, along with the table data and explicitly-created indexes.
+Partial and expression indexes are included. Use ``copy_triggers=True`` to
+also copy the table's triggers.
+
+The target table must not exist unless ``replace=True`` is passed. Replacement,
+schema creation, data copying and index/trigger creation all happen inside one
+transaction, so a failure - including a failure while reading from the source -
+leaves both the source and any previous target table unchanged.
+
+Foreign keys which reference another table in the source database raise
+``sqlite_utils.db.TableCopyDependencyError`` when copying to a different
+database. They are never silently redirected to a table with the same name in
+the target database. Self-referential foreign keys are rewritten to point at
+the copied table.
+
+The method returns a ``TableCopyResult`` with ``rows_copied``, ``indexes`` and
+``triggers`` attributes.
+
 .. _python_api_bulk_inserts:
 
 Bulk inserts
