@@ -49,6 +49,8 @@ This page lists the ``--help`` for every ``sqlite-utils`` CLI sub-command.
         "drop-index": "cli_drop_index",
         "enable-wal": "cli_wal",
         "enable-counts": "cli_enable_counts",
+        "check-counts": "cli_enable_counts",
+        "repair-counts": "cli_enable_counts",
         "bulk": "cli_bulk",
         "migrate": "cli_migrate",
         "create-database": "cli_create_database",
@@ -1423,6 +1425,57 @@ reset-counts
       Example:
 
           sqlite-utils reset-counts chickens.db
+
+    Options:
+      --load-extension TEXT  Path to SQLite extension, with optional :entrypoint
+      -h, --help             Show this message and exit.
+
+
+.. _cli_ref_check_counts:
+
+check-counts
+============
+
+See :ref:`cli_enable_counts`.
+
+::
+
+    Usage: sqlite-utils check-counts [OPTIONS] PATH
+
+      Check cached counts and triggers without changing anything
+
+      Reports missing cache rows, count mismatches, missing or altered maintenance
+      triggers and stale cache rows separately. Exits with a non-zero status if
+      any problems are found.
+
+      Example:
+
+          sqlite-utils check-counts chickens.db
+
+    Options:
+      --load-extension TEXT  Path to SQLite extension, with optional :entrypoint
+      -h, --help             Show this message and exit.
+
+
+.. _cli_ref_repair_counts:
+
+repair-counts
+=============
+
+See :ref:`cli_enable_counts`.
+
+::
+
+    Usage: sqlite-utils repair-counts [OPTIONS] PATH
+
+      Repair cached counts and their maintenance triggers
+
+      Recreates missing or altered triggers, recalculates missing or drifted
+      counts and removes stale cache rows, all in a single transaction.
+
+      Example:
+
+          sqlite-utils repair-counts chickens.db
 
     Options:
       --load-extension TEXT  Path to SQLite extension, with optional :entrypoint

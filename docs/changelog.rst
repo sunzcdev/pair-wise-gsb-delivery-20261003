@@ -4,6 +4,16 @@
  Changelog
 ===========
 
+.. _v4_3:
+
+4.3 (unreleased)
+----------------
+
+- New ``db.check_counts()`` method audits the trigger-maintained ``_counts`` cache without modifying anything, returning per-table ``CountsCheck`` results that distinguish missing cache rows (``missing-cache``), drifted counts (``count-mismatch``), missing or redefined triggers (``trigger-missing``) and stale rows for dropped tables (``stale-cache``).
+- New ``db.repair_counts()`` method fixes every problem reported by ``check_counts()`` inside a single transaction, recreating triggers, recalculating counts and deleting stale rows; a failure rolls back and leaves the previous state untouched.
+- New ``sqlite-utils check-counts`` and ``sqlite-utils repair-counts`` commands expose the same read-only audit and transactional repair on the CLI.
+- Views, virtual tables, SQLite internal tables and the ``_counts`` table itself are excluded from ordinary data-table checks and repairs. Quoted table names and stale cache rows left behind by dropped tables are now handled explicitly.
+
 .. _v4_2_1:
 
 4.2.1 (2026-08-13)

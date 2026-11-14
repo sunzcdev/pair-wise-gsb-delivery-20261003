@@ -321,6 +321,22 @@ XIndexColumn = namedtuple(
 )
 Trigger = namedtuple("Trigger", ("name", "table", "sql"))
 
+# Result of checking the cached count for a single table (or a stale
+# ``_counts`` row). ``issues`` holds zero or more of the COUNTS_* codes below.
+CountsCheck = namedtuple(
+    "CountsCheck",
+    ("table", "exists", "actual_count", "cached_count", "issues"),
+)
+
+# The ``_counts`` table has no row for a table that should have one.
+COUNTS_MISSING_CACHE = "missing-cache"
+# The cached count does not match the real number of rows.
+COUNTS_COUNT_MISMATCH = "count-mismatch"
+# One or both of the maintenance triggers are missing or have been changed.
+COUNTS_TRIGGER_MISSING = "trigger-missing"
+# The cached row refers to a table that no longer exists (or is not eligible).
+COUNTS_STALE_CACHE = "stale-cache"
+
 
 class TransformError(Exception):
     pass
@@ -1281,6 +1297,98 @@ class Database:
                 {"table": table.name, "count": table.execute_count()}
                 for table in tables
             )
+
+    def _counts_eligible_tables(self) -> list["Table"]:
+        """
+        Ordinary data tables that count caching applies to: real (non-virtual)
+        tables, excluding the ``_counts`` cache table itself. Views and system
+        tables are never returned.
+        """
+        return [
+            table
+            for table in self.tables
+            if table.virtual_table_using is None
+            and table.name != self._counts_table_name
+        ]
+
+    def check_counts(self) -> list[CountsCheck]:
+        """
+        Audit the cached table counts without modifying anything.
+
+        Each ordinary data table is compared against the ``_counts`` cache and
+        the count-maintenance triggers. A returned :class:`CountsCheck` carries
+        an ``issues`` list using these codes, which are reported separately
+        rather than collapsed into a single mismatch:
+
+        * ``missing-cache`` - no ``_counts`` row exists for the table
+        * ``count-mismatch`` - the cached count differs from the real row count
+        * ``trigger-missing`` - an expected trigger is absent or was redefined
+        * ``stale-cache`` - a ``_counts`` row names a table that no longer
+          exists (a dropped table, a view, or a non-eligible object)
+
+        This is a read-only check; use :meth:`repair_counts` to fix anything it
+        finds.
+        """
+        cached = self.cached_counts()
+        eligible = {table.name: table for table in self._counts_eligible_tables()}
+        checks: list[CountsCheck] = []
+        for name in sorted(eligible):
+            table = eligible[name]
+            actual_count = table.execute_count()
+            cached_count = cached.get(name)
+            issues: list[str] = []
+            if cached_count is None:
+                issues.append(COUNTS_MISSING_CACHE)
+            elif cached_count != actual_count:
+                issues.append(COUNTS_COUNT_MISMATCH)
+            if table.counts_trigger_issues:
+                issues.append(COUNTS_TRIGGER_MISSING)
+            checks.append(
+                CountsCheck(name, True, actual_count, cached_count, issues)
+            )
+        # Rows in _counts that do not map to an eligible table are stale -
+        # leftovers from dropped tables, views or virtual tables.
+        for name in sorted(set(cached) - set(eligible)):
+            checks.append(
+                CountsCheck(name, False, None, cached[name], [COUNTS_STALE_CACHE])
+            )
+        return checks
+
+    def repair_counts(self) -> list[CountsCheck]:
+        """
+        Audit the cached counts and repair every problem found.
+
+        Missing or altered triggers are recreated, missing or drifted counts are
+        recalculated from the real tables, and stale rows left behind by dropped
+        tables are removed. All changes run inside a single transaction, so a
+        failure rolls back and leaves the previous state untouched. Returns the
+        list of problems that were repaired.
+        """
+        problems = [check for check in self.check_counts() if check.issues]
+        if not problems:
+            return problems
+        with self.atomic():
+            self._ensure_counts_table()
+            counts_table = quote_identifier(self._counts_table_name)
+            for check in problems:
+                if COUNTS_STALE_CACHE in check.issues:
+                    self.execute(
+                        f'delete from {counts_table} where "table" = ?',
+                        [check.table],
+                    )
+                    continue
+                table = self.table(check.table)
+                for name, sql in table._counts_trigger_sqls().items():
+                    self.execute(
+                        f"drop trigger if exists {quote_identifier(name)}"
+                    )
+                    self.execute(sql)
+                self.execute(
+                    f"insert or replace into {counts_table} "
+                    '("table", count) values (?, ?)',
+                    [check.table, table.execute_count()],
+                )
+        return problems
 
     def execute_returning_dicts(
         self, sql: str, params: Sequence | dict[str, Any] | None = None
@@ -3695,61 +3803,88 @@ class Table(Queryable):
 
         See :ref:`python_api_cached_table_counts` for details.
         """
-        sql = (
-            textwrap.dedent("""
-        {create_counts_table}
-        CREATE TRIGGER IF NOT EXISTS {trigger_insert} AFTER INSERT ON {table}
-        BEGIN
-            INSERT OR REPLACE INTO {counts_table}
-            VALUES (
-                {table_quoted},
-                COALESCE(
-                    (SELECT count FROM {counts_table} WHERE "table" = {table_quoted}),
-                0
-                ) + 1
-            );
-        END;
-        CREATE TRIGGER IF NOT EXISTS {trigger_delete} AFTER DELETE ON {table}
-        BEGIN
-            INSERT OR REPLACE INTO {counts_table}
-            VALUES (
-                {table_quoted},
-                COALESCE(
-                    (SELECT count FROM {counts_table} WHERE "table" = {table_quoted}),
-                0
-                ) - 1
-            );
-        END;
-        INSERT OR REPLACE INTO _counts VALUES ({table_quoted}, (select count(*) from {table}));
-        """)
-            .strip()
-            .format(
-                create_counts_table=_COUNTS_TABLE_CREATE_SQL.format(
-                    self.db._counts_table_name
-                ),
+        statements = [
+            _COUNTS_TABLE_CREATE_SQL.format(self.db._counts_table_name),
+            *[
+                sql.replace(
+                    "CREATE TRIGGER ",
+                    "CREATE TRIGGER IF NOT EXISTS ",
+                    1,
+                )
+                + ";"
+                for sql in self._counts_trigger_sqls().values()
+            ],
+            "INSERT OR REPLACE INTO {counts_table} VALUES ({table_quoted},"
+            " (select count(*) from {table}));".format(
                 counts_table=quote_identifier(self.db._counts_table_name),
-                table=quote_identifier(self.name),
                 table_quoted=self.db.quote(self.name),
-                trigger_insert=quote_identifier(
-                    self.name + self.db._counts_table_name + "_insert"
-                ),
-                trigger_delete=quote_identifier(
-                    self.name + self.db._counts_table_name + "_delete"
-                ),
-            )
-        )
+                table=quote_identifier(self.name),
+            ),
+        ]
+        sql = "\n".join(statements)
         with self.db.atomic():
             self.db._executescript(sql)
         self.db.use_counts_table = True
 
     @property
+    def _counts_trigger_names(self) -> tuple[str, str]:
+        "Names of the insert/delete triggers that maintain the cached count."
+        return (
+            f"{self.name}{self.db._counts_table_name}_insert",
+            f"{self.name}{self.db._counts_table_name}_delete",
+        )
+
+    def _counts_trigger_sqls(self) -> dict[str, str]:
+        """
+        Mapping of trigger name to the canonical ``CREATE TRIGGER`` statement
+        that sqlite-utils expects to find stored in ``sqlite_master``.
+        """
+        template = textwrap.dedent(
+            """
+            CREATE TRIGGER {trigger} AFTER {event} ON {table}
+            BEGIN
+                INSERT OR REPLACE INTO {counts_table}
+                VALUES (
+                    {table_quoted},
+                    COALESCE(
+                        (SELECT count FROM {counts_table} WHERE "table" = {table_quoted}),
+                    0
+                    ) {sign} 1
+                );
+            END
+            """
+        ).strip()
+        events = (("insert", "+"), ("delete", "-"))
+        names = self._counts_trigger_names
+        return {
+            name: template.format(
+                trigger=quote_identifier(name),
+                event=event.upper(),
+                table=quote_identifier(self.name),
+                counts_table=quote_identifier(self.db._counts_table_name),
+                table_quoted=self.db.quote(self.name),
+                sign=sign,
+            )
+            for name, (event, sign) in zip(names, events)
+        }
+
+    @property
+    def counts_trigger_issues(self) -> list[str]:
+        """
+        Names of the expected count-maintenance triggers that are missing or
+        whose definition no longer matches the canonical sqlite-utils trigger.
+        """
+        existing = self.triggers_dict
+        return [
+            name
+            for name, sql in self._counts_trigger_sqls().items()
+            if existing.get(name) != sql
+        ]
+
+    @property
     def has_counts_triggers(self) -> bool:
         "Does this table have triggers setup to update cached counts?"
-        trigger_names = {
-            f"{self.name}{self.db._counts_table_name}_{suffix}"
-            for suffix in ["insert", "delete"]
-        }
-        return trigger_names.issubset(self.triggers_dict.keys())
+        return not self.counts_trigger_issues
 
     def enable_fts(
         self,

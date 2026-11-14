@@ -3088,6 +3088,30 @@ If the ``_counts`` table ever becomes out-of-sync with the actual table counts y
 
     db.reset_counts()
 
+Checking and repairing the cached counts
+-----------------------------------------
+
+External tools can change a table or drop a maintenance trigger, leaving the ``_counts`` cache inconsistent. The ``db.check_counts()`` method audits every ordinary data table without modifying anything, comparing the real row count, the cached value and the expected trigger definitions. It returns a list of ``CountsCheck`` named tuples, each with an ``issues`` list that distinguishes the different kinds of problem:
+
+* ``missing-cache`` - the table has no row in ``_counts``
+* ``count-mismatch`` - the cached count differs from the real number of rows
+* ``trigger-missing`` - an insert/delete trigger is missing or has been redefined
+* ``stale-cache`` - a ``_counts`` row names a table that no longer exists (a dropped table, a view or a virtual table)
+
+.. code-block:: python
+
+    >>> db.check_counts()
+    [CountsCheck(table='dogs', exists=True, actual_count=12, cached_count=10, issues=['count-mismatch']),
+     CountsCheck(table='old_table', exists=False, actual_count=None, cached_count=4, issues=['stale-cache'])]
+
+This is a read-only check. To fix everything it finds, call ``db.repair_counts()``. This recreates missing or altered triggers, recalculates missing or drifted counts and removes stale rows, all inside a single transaction - if anything fails the database is rolled back to its previous state. It returns the list of problems that were repaired:
+
+.. code-block:: python
+
+    db.repair_counts()
+
+Both methods operate on ordinary data tables only: views, virtual tables, SQLite internal tables and the ``_counts`` table itself are never treated as tables to repair. Table names containing quotes or other special characters are handled correctly, and a stale ``_counts`` row left behind after a table is dropped is reported as ``stale-cache`` and removed by a repair.
+
 .. note::
     In the CLI: :ref:`sqlite-utils enable-counts <cli_enable_counts>`
 

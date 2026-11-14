@@ -22,3 +22,10 @@ uv.lock
 tests/*.dylib
 tests/*.so
 tests/*.dll
+tests/_counts_check_tmp/
+# Sandbox scratch directories (restrictive-permission dirs on Windows)
+.pttmp/
+ptbase/
+runbase/
+tmp*/
+pytest-cache-files-*/

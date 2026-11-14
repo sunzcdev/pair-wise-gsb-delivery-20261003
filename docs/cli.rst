@@ -2855,6 +2855,25 @@ If the ``_counts`` table ever becomes out-of-sync with the actual table counts y
 
     sqlite-utils reset-counts mydb.db
 
+The ``check-counts`` command audits the cached counts without changing anything. It compares each ordinary data table against its real row count, its cached value and the expected maintenance triggers, reporting the following problems separately rather than lumping them together:
+
+* a ``missing-cache`` row for a table that has no ``_counts`` entry
+* a ``count-mismatch`` where the cached value differs from the real row count
+* a ``missing or altered count trigger`` where an expected trigger is absent or has been redefined
+* a ``stale cache row`` left behind by a table that has been dropped (or pointing at a view)
+
+.. code-block:: bash
+
+    sqlite-utils check-counts mydb.db
+
+It exits with a non-zero status if any problems are found and never modifies the database. The ``repair-counts`` command runs the same audit and fixes every problem in a single transaction - recreating triggers, recalculating counts and deleting stale rows - leaving the previous state intact if the repair fails:
+
+.. code-block:: bash
+
+    sqlite-utils repair-counts mydb.db
+
+Views, virtual tables, SQLite internal tables and the ``_counts`` table itself are never treated as ordinary data tables by either command.
+
 .. note::
     In Python: :ref:`table.enable_counts() <python_api_cached_table_counts>`  CLI reference: :ref:`sqlite-utils enable-counts <cli_ref_enable_counts>`
 

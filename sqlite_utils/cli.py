@@ -22,6 +22,10 @@ from click_default_group import DefaultGroup
 import sqlite_utils
 from sqlite_utils import recipes
 from sqlite_utils.db import (
+    COUNTS_COUNT_MISMATCH,
+    COUNTS_MISSING_CACHE,
+    COUNTS_STALE_CACHE,
+    COUNTS_TRIGGER_MISSING,
     DEFAULT,
     AlterError,
     BadMultiValues,
@@ -929,6 +933,85 @@ def reset_counts(path, load_extension):
     _register_db_for_cleanup(db)
     _load_extensions(db, load_extension)
     db.reset_counts()
+
+
+def _describe_counts_issue(check, issue):
+    if issue == COUNTS_MISSING_CACHE:
+        return "missing cache row (actual={})".format(check.actual_count)
+    if issue == COUNTS_COUNT_MISMATCH:
+        return "count mismatch (cached={}, actual={})".format(
+            check.cached_count, check.actual_count
+        )
+    if issue == COUNTS_TRIGGER_MISSING:
+        return "missing or altered count trigger(s)"
+    return issue
+
+
+@cli.command(name="check-counts")
+@click.argument(
+    "path",
+    type=click.Path(exists=True, file_okay=True, dir_okay=False, allow_dash=False),
+    required=True,
+)
+@load_extension_option
+def check_counts(path, load_extension):
+    """Check cached counts and triggers without changing anything
+
+    Reports missing cache rows, count mismatches, missing or altered
+    maintenance triggers and stale cache rows separately. Exits with a
+    non-zero status if any problems are found.
+
+    Example:
+
+    \b
+        sqlite-utils check-counts chickens.db
+    """
+    db = sqlite_utils.Database(path)
+    _register_db_for_cleanup(db)
+    _load_extensions(db, load_extension)
+    problems = [check for check in db.check_counts() if check.issues]
+    for check in problems:
+        if COUNTS_STALE_CACHE in check.issues:
+            click.echo(
+                "{}: stale cache row (table no longer exists), cached={}".format(
+                    check.table, check.cached_count
+                )
+            )
+            continue
+        details = ", ".join(
+            _describe_counts_issue(check, issue) for issue in check.issues
+        )
+        click.echo(f"{check.table}: {details}")
+    if problems:
+        raise click.ClickException(
+            f"Found {len(problems)} table(s) with cached count problems"
+        )
+
+
+@cli.command(name="repair-counts")
+@click.argument(
+    "path",
+    type=click.Path(exists=True, file_okay=True, dir_okay=False, allow_dash=False),
+    required=True,
+)
+@load_extension_option
+def repair_counts(path, load_extension):
+    """Repair cached counts and their maintenance triggers
+
+    Recreates missing or altered triggers, recalculates missing or drifted
+    counts and removes stale cache rows, all in a single transaction.
+
+    Example:
+
+    \b
+        sqlite-utils repair-counts chickens.db
+    """
+    db = sqlite_utils.Database(path)
+    _register_db_for_cleanup(db)
+    _load_extensions(db, load_extension)
+    repaired = db.repair_counts()
+    for check in repaired:
+        click.echo(f"{check.table}: repaired {', '.join(check.issues)}")
 
 
 _import_options = (
