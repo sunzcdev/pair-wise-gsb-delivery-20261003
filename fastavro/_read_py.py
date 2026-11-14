@@ -34,6 +34,7 @@ from ._read_common import (
     HEADER_SCHEMA,
     missing_codec_lib,
 )
+from ._schema_common import PRIMITIVES
 from .const import NAMED_TYPES, AVRO_TYPES
 
 T = TypeVar("T")
@@ -564,12 +565,146 @@ def read_record(
         # fill in default values
         for f_name, field in readers_field_dict.items():
             if "default" in field:
-                record[field["name"]] = field["default"]
+                record[field["name"]] = _materialize_default(
+                    field["default"],
+                    field["type"],
+                    named_schemas,
+                    {},
+                )
             else:
                 msg = f"No default value for field {field['name']} in {reader_schema['name']}"
                 raise SchemaResolutionError(msg)
 
     return record
+
+
+def _default_branch_match_level(default, branch_schema):
+    """Rank how well a JSON-encoded default value fits a union branch.
+
+    Returns 0 for an exact type match, 1 for a type whose Avro JSON encoding
+    happens to use the same Python type (bytes/fixed/enum encoded as JSON
+    strings), and ``None`` when the branch cannot accept the default."""
+    record_type = extract_record_type(branch_schema)
+    if record_type == "null":
+        return 0 if default is None else None
+    elif record_type == "boolean":
+        return 0 if isinstance(default, bool) else None
+    elif record_type in ("int", "long"):
+        if isinstance(default, int) and not isinstance(default, bool):
+            return 0
+        return None
+    elif record_type in ("float", "double"):
+        if isinstance(default, (int, float)) and not isinstance(default, bool):
+            return 0
+        return None
+    elif record_type == "string":
+        return 0 if isinstance(default, str) else None
+    elif record_type in ("bytes", "fixed", "enum"):
+        # These Avro types encode their JSON default values as strings.
+        return 1 if isinstance(default, str) else None
+    elif record_type == "array":
+        return 0 if isinstance(default, list) else None
+    elif record_type == "map":
+        return 0 if isinstance(default, dict) else None
+    elif record_type in NAMED_TYPES:
+        return 0 if isinstance(default, dict) else None
+    else:
+        # A named type reference that could not be resolved; don't claim a
+        # match so that the caller falls back to the first union branch.
+        return None
+
+
+def _materialize_default(default, schema, named_schemas, memo):
+    """Build a fresh, type-correct value for a field's JSON-encoded default.
+
+    Default values in an Avro schema are JSON values, so ``bytes`` and
+    ``fixed`` defaults arrive as strings and logical type defaults arrive as
+    their underlying representation rather than as the Python types produced
+    while reading. This recursively converts the default into the same kind of
+    value the readers produce while making sure mutable containers are never
+    shared between records, readers or the parsed schema itself.
+    """
+    original_id = id(default)
+    if original_id in memo:
+        return memo[original_id]
+
+    # Union schemas are lists. Per the Avro specification, a union default is
+    # interpreted using the first branch whose type matches the default; fall
+    # back to the first branch for defaults that were accepted while parsing.
+    # Exact type matches take precedence over JSON-encoded representations
+    # (e.g. a string default matches a string branch before a bytes branch).
+    if isinstance(schema, list):
+        branch_schema = schema[0]
+        best_match_level = None
+        for candidate in schema:
+            match_level = _default_branch_match_level(default, candidate)
+            if match_level is None:
+                continue
+            if best_match_level is None or match_level < best_match_level:
+                branch_schema = candidate
+                best_match_level = match_level
+        return _materialize_default(default, branch_schema, named_schemas, memo)
+
+    # Named type references are resolved so that dict schemas (record, enum,
+    # fixed, ...) always carry their actual "type" below.
+    if not isinstance(schema, dict):
+        if schema in PRIMITIVES:
+            schema = {"type": schema}
+        else:
+            resolved_schema = named_schemas["reader"].get(schema)
+            if resolved_schema is None:
+                # Keep the JSON value if the named type cannot be resolved.
+                memo[original_id] = default
+                return default
+            schema = resolved_schema
+
+    record_type = schema["type"]
+
+    if record_type == "null":
+        value = None
+    elif record_type in ("boolean", "int", "long", "float", "double", "string"):
+        value = default
+    elif record_type in ("bytes", "fixed"):
+        value = default.encode("iso-8859-1")
+    elif record_type == "enum":
+        value = default
+    elif record_type == "array":
+        value = [
+            _materialize_default(item, schema["items"], named_schemas, memo)
+            for item in default
+        ]
+    elif record_type == "map":
+        value = {
+            key: _materialize_default(item, schema["values"], named_schemas, memo)
+            for key, item in default.items()
+        }
+    elif record_type in ("record", "error", "request"):
+        value = {}
+        memo[original_id] = value
+        field_schemas = {
+            field["name"]: field["type"] for field in schema.get("fields", [])
+        }
+        for key, item in default.items():
+            field_schema = field_schemas.get(key)
+            if field_schema is None:
+                value[key] = item
+            else:
+                value[key] = _materialize_default(
+                    item, field_schema, named_schemas, memo
+                )
+    else:
+        # Unknown schema type; keep the JSON value rather than guessing.
+        value = default
+
+    memo[original_id] = value
+
+    logical_type = extract_logical_type(schema)
+    if logical_type:
+        logical_reader = LOGICAL_READERS.get(logical_type)
+        if logical_reader is not None:
+            return logical_reader(value, schema, None)
+
+    return value
 
 
 def skip_record(decoder, writer_schema, named_schemas):

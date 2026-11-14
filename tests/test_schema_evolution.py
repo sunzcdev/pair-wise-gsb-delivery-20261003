@@ -871,3 +871,350 @@ def test_named_type_inline_writer_named_reference_reader():
             bio, parsed_writer, parsed_reader, return_record_name=True
         )
         assert decoded == record
+
+
+WRITER_SCHEMA = {
+    "type": "record",
+    "name": "default_evolution",
+    "fields": [{"name": "a", "type": "int"}],
+}
+
+
+def _avro_file(schema=WRITER_SCHEMA, records=None, num_records=2):
+    if records is None:
+        records = [{"a": index} for index in range(num_records)]
+    bio = BytesIO()
+    fastavro_writer(bio, schema, records)
+    bio.seek(0)
+    return bio
+
+
+def test_mutable_array_default_is_not_shared_between_records():
+    reader_schema = {
+        "type": "record",
+        "name": "default_evolution",
+        "fields": [
+            {"name": "a", "type": "int"},
+            {
+                "name": "arr",
+                "type": {"type": "array", "items": "int"},
+                "default": [1, 2],
+            },
+        ],
+    }
+
+    records = list(fastavro.reader(_avro_file(), reader_schema))
+
+    records[0]["arr"].append(99)
+    assert records[1]["arr"] == [1, 2]
+
+
+def test_mutable_map_default_is_not_shared_between_records():
+    reader_schema = {
+        "type": "record",
+        "name": "default_evolution",
+        "fields": [
+            {"name": "a", "type": "int"},
+            {
+                "name": "mp",
+                "type": {"type": "map", "values": "int"},
+                "default": {"x": 1},
+            },
+        ],
+    }
+
+    records = list(fastavro.reader(_avro_file(), reader_schema))
+
+    records[0]["mp"]["y"] = 7
+    assert records[1]["mp"] == {"x": 1}
+
+
+def test_mutable_default_does_not_mutate_parsed_schema():
+    reader_schema = {
+        "type": "record",
+        "name": "default_evolution",
+        "fields": [
+            {"name": "a", "type": "int"},
+            {
+                "name": "arr",
+                "type": {"type": "array", "items": "int"},
+                "default": [1, 2],
+            },
+            {
+                "name": "mp",
+                "type": {"type": "map", "values": "int"},
+                "default": {"x": 1},
+            },
+        ],
+    }
+    parsed_reader_schema = fastavro.parse_schema(reader_schema)
+
+    record = next(fastavro.reader(_avro_file(num_records=1), parsed_reader_schema))
+    record["arr"].append(99)
+    record["mp"]["y"] = 7
+
+    fields = {
+        field["name"]: field for field in parsed_reader_schema["fields"]
+    }
+    assert fields["arr"]["default"] == [1, 2]
+    assert fields["mp"]["default"] == {"x": 1}
+
+
+def test_mutable_default_is_not_shared_between_two_readers():
+    reader_schema = {
+        "type": "record",
+        "name": "default_evolution",
+        "fields": [
+            {"name": "a", "type": "int"},
+            {
+                "name": "arr",
+                "type": {"type": "array", "items": "int"},
+                "default": [1, 2],
+            },
+        ],
+    }
+    parsed_reader_schema = fastavro.parse_schema(reader_schema)
+
+    first_record = next(
+        fastavro.reader(_avro_file(num_records=1), parsed_reader_schema)
+    )
+    second_record = next(
+        fastavro.reader(_avro_file(num_records=1), parsed_reader_schema)
+    )
+
+    first_record["arr"].append(99)
+    assert second_record["arr"] == [1, 2]
+
+
+def test_nested_mutable_defaults_are_independent():
+    reader_schema = {
+        "type": "record",
+        "name": "default_evolution",
+        "fields": [
+            {"name": "a", "type": "int"},
+            {
+                "name": "nested",
+                "type": {
+                    "type": "record",
+                    "name": "nested_default_record",
+                    "fields": [
+                        {"name": "x", "type": "int"},
+                        {
+                            "name": "arr",
+                            "type": {"type": "array", "items": "int"},
+                        },
+                        {
+                            "name": "mp",
+                            "type": {"type": "map", "values": "int"},
+                        },
+                    ],
+                },
+                "default": {"x": 1, "arr": [1], "mp": {"k": 1}},
+            },
+            {
+                "name": "array_of_records",
+                "type": {
+                    "type": "array",
+                    "items": {
+                        "type": "record",
+                        "name": "array_item_record",
+                        "fields": [
+                            {
+                                "name": "arr",
+                                "type": {"type": "array", "items": "int"},
+                            }
+                        ],
+                    },
+                },
+                "default": [{"arr": [1, 2]}],
+            },
+        ],
+    }
+
+    first_record = next(
+        fastavro.reader(
+            _avro_file(num_records=1), fastavro.parse_schema(reader_schema)
+        )
+    )
+    second_record = next(
+        fastavro.reader(
+            _avro_file(num_records=1), fastavro.parse_schema(reader_schema)
+        )
+    )
+
+    first_record["nested"]["arr"].append(99)
+    first_record["nested"]["mp"]["new"] = 2
+    first_record["array_of_records"][0]["arr"].append(99)
+
+    assert second_record["nested"] == {"x": 1, "arr": [1], "mp": {"k": 1}}
+    assert second_record["array_of_records"] == [{"arr": [1, 2]}]
+
+
+def test_bytes_and_fixed_defaults_are_decoded_without_json_roundtrip():
+    reader_schema = {
+        "type": "record",
+        "name": "default_evolution",
+        "fields": [
+            {"name": "a", "type": "int"},
+            {"name": "blob", "type": "bytes", "default": "abc"},
+            {
+                "name": "fixed_blob",
+                "type": {"type": "fixed", "name": "fixed_default", "size": 3},
+                "default": "xyz",
+            },
+            {
+                "name": "nested",
+                "type": {
+                    "type": "record",
+                    "name": "bytes_nested_record",
+                    "fields": [
+                        {"name": "blob", "type": "bytes"},
+                    ],
+                },
+                "default": {"blob": "nested"},
+            },
+            {
+                "name": "array_of_bytes",
+                "type": {"type": "array", "items": "bytes"},
+                "default": ["ab", "cd"],
+            },
+            {
+                "name": "map_of_bytes",
+                "type": {"type": "map", "values": "bytes"},
+                "default": {"key": "value"},
+            },
+        ],
+    }
+
+    record = bytes_with_schema_to_avro(
+        fastavro.parse_schema(reader_schema),
+        avro_to_bytes_with_schema(WRITER_SCHEMA, {"a": 1}),
+    )
+
+    assert record["blob"] == b"abc"
+    assert isinstance(record["blob"], bytes)
+    assert record["fixed_blob"] == b"xyz"
+    assert record["nested"]["blob"] == b"nested"
+    assert record["array_of_bytes"] == [b"ab", b"cd"]
+    assert record["map_of_bytes"] == {"key": b"value"}
+
+
+def test_union_default_uses_matching_branch_type():
+    reader_schema = {
+        "type": "record",
+        "name": "default_evolution",
+        "fields": [
+            {"name": "a", "type": "int"},
+            {
+                "name": "null_union",
+                "type": ["null", "string", "bytes"],
+                "default": None,
+            },
+            {
+                "name": "string_union",
+                "type": ["null", "string", "int"],
+                "default": "text",
+            },
+            {
+                "name": "bytes_union",
+                "type": ["null", "bytes", "int"],
+                "default": "blob",
+            },
+            {
+                "name": "record_union",
+                "type": [
+                    "null",
+                    {
+                        "type": "record",
+                        "name": "union_default_record",
+                        "fields": [
+                            {"name": "x", "type": "int"},
+                            {"name": "blob", "type": "bytes"},
+                        ],
+                    },
+                ],
+                "default": {"x": 1, "blob": "ab"},
+            },
+        ],
+    }
+
+    record = bytes_with_schema_to_avro(
+        fastavro.parse_schema(reader_schema),
+        avro_to_bytes_with_schema(WRITER_SCHEMA, {"a": 1}),
+    )
+
+    assert record["null_union"] is None
+    assert record["string_union"] == "text"
+    assert record["bytes_union"] == b"blob"
+    assert record["record_union"] == {"x": 1, "blob": b"ab"}
+
+
+def test_logical_type_defaults_are_converted_to_python_types():
+    import datetime
+    import uuid
+
+    reader_schema = {
+        "type": "record",
+        "name": "default_evolution",
+        "fields": [
+            {"name": "a", "type": "int"},
+            {
+                "name": "day",
+                "type": {"type": "int", "logicalType": "date"},
+                "default": 0,
+            },
+            {
+                "name": "timestamp",
+                "type": {"type": "long", "logicalType": "timestamp-micros"},
+                "default": 0,
+            },
+            {
+                "name": "identifier",
+                "type": {"type": "string", "logicalType": "uuid"},
+                "default": "12345678-1234-5678-1234-567812345678",
+            },
+        ],
+    }
+
+    record = bytes_with_schema_to_avro(
+        fastavro.parse_schema(reader_schema),
+        avro_to_bytes_with_schema(WRITER_SCHEMA, {"a": 1}),
+    )
+
+    assert record["day"] == datetime.date(1970, 1, 1)
+    assert record["timestamp"] == datetime.datetime(
+        1970, 1, 1, tzinfo=datetime.timezone.utc
+    )
+    assert record["identifier"] == uuid.UUID(
+        "12345678-1234-5678-1234-567812345678"
+    )
+
+
+def test_schemaless_reader_mutable_default_isolation():
+    reader_schema = {
+        "type": "record",
+        "name": "default_evolution",
+        "fields": [
+            {"name": "a", "type": "int"},
+            {
+                "name": "arr",
+                "type": {"type": "array", "items": "bytes"},
+                "default": ["ab"],
+            },
+        ],
+    }
+    parsed_reader_schema = fastavro.parse_schema(reader_schema)
+
+    def read_one():
+        bio = BytesIO()
+        fastavro.schemaless_writer(bio, WRITER_SCHEMA, {"a": 1})
+        bio.seek(0)
+        return fastavro.schemaless_reader(
+            bio, WRITER_SCHEMA, parsed_reader_schema
+        )
+
+    first_record = read_one()
+    second_record = read_one()
+
+    first_record["arr"].append(b"zz")
+    assert second_record["arr"] == [b"ab"]
