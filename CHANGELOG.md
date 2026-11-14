@@ -2,6 +2,13 @@
 
 ## Development
 
+* The `python` backend now honors `allow_comments=True`, accepting both block
+  comments (`/* ... */`) and line comments (`// ...`) wherever whitespace is
+  allowed. Comments are ignored inside strings, never join two number
+  fragments into a single number, preserve the original positions used in
+  error reporting, and are handled across input chunks without buffering the
+  whole document. An unterminated block comment raises
+  `IncompleteJSONError`, while a line comment running to EOF is valid.
 * Fixed handling of integers longer than `sys.get_int_max_str_digits()`:
   the `yajl2_c` backend no longer crashes on them, and all backends
   now raise the `ValueError` produced by `int()` (#188).

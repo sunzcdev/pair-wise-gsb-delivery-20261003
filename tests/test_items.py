@@ -60,6 +60,18 @@ def test_multiple_values_raises_if_not_supported(adaptor):
             adaptor.items("", "", multiple_values=True)
 
 
+def test_items_with_comments(adaptor):
+    """allow_comments is propagated through the items entry point"""
+    if not adaptor.backend.capabilities.c_comments:
+        pytest.skip("backend does not support comments")
+    json = b'[ // header\n {"id": 1 /* x */, "name": "a"},\n' \
+           b' {"id": 2, "name": /* block */ "b"} // tail\n]'
+    result = adaptor.items(json, 'item', allow_comments=True)
+    assert [{"id": 1, "name": "a"}, {"id": 2, "name": "b"}] == result
+    with pytest.raises(JSONError):
+        adaptor.items(json, 'item')
+
+
 def test_multiple_values(adaptor):
     """Test that multiple_values are supported"""
     multiple_json = JSON + JSON + JSON

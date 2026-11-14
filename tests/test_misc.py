@@ -227,3 +227,17 @@ class TestMainEntryPoints:
 
     def test_rich_kvitems(self, backend):
         self._assert_entry_point(JSON_KVITEMS, backend.parse, backend.kvitems, 'docs.item')
+
+
+def test_top_level_entry_points_honor_allow_comments():
+    """The option flows from the top-level ijson entry points to the backend"""
+    backend = ijson.get_backend(ijson.backend)
+    if not backend.capabilities.c_comments:
+        pytest.skip("default backend does not support comments")
+    json = b'/* c */ [{"id": 1 // line\n}, {"id": 2}]'
+    assert [{"id": 1}, {"id": 2}] == list(ijson.items(json, 'item',
+                                                       allow_comments=True))
+    events = list(ijson.basic_parse(json, allow_comments=True))
+    assert ('start_array', None) == events[0]
+    with pytest.raises(common.JSONError):
+        list(ijson.basic_parse(json))

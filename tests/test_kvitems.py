@@ -11,6 +11,15 @@ def test_kvitems(adaptor):
     assert JSON_KVITEMS == adaptor.kvitems(JSON, 'docs.item')
 
 
+def test_kvitems_with_comments(adaptor):
+    """allow_comments is propagated through the kvitems entry point"""
+    if not adaptor.backend.capabilities.c_comments:
+        pytest.skip("backend does not support comments")
+    json = b'{ // head\n "item": {"a": /* c */ 1, "b": 2} // tail\n}'
+    result = adaptor.kvitems(json, 'item', allow_comments=True)
+    assert [("a", 1), ("b", 2)] == result
+
+
 def test_kvitems_toplevel(adaptor):
     kvitems = adaptor.kvitems(JSON, '')
     assert 1 == len(kvitems)

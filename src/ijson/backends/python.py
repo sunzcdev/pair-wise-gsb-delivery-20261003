@@ -129,6 +129,175 @@ def Lexer(target):
             pos = 0
 
 
+@utils.coroutine
+def CommentableLexer(target):
+    """
+    Like ``Lexer``, but transparently skips JavaScript-style line comments
+    (``// ...``) and block comments (``/* ... */``) wherever whitespace is
+    allowed. Comments are only recognized outside of strings, and their bytes
+    are never joined into surrounding lexemes (so two number fragments can't
+    be merged into a single number). Positions reported for the surviving
+    lexemes are the same positions they would have in the original input.
+    """
+    try:
+        data = (yield)
+    except GeneratorExit:
+        data = ''
+    buf = data
+    pos = 0
+    discarded = 0
+    send = target.send
+    # Whether the source has already produced an empty chunk. The first chunk
+    # is obtained above, so an empty first chunk means exhaustion from the
+    # start; later chunks (and a GeneratorExit on close) update this as data
+    # flows through the coroutine.
+    exhausted = not data
+
+    while True:
+        match = LEXEME_RE.search(buf, pos)
+        if not match:
+            # Everything before pos has already been consumed (whitespace or
+            # a comment), so drop it rather than growing the buffer forever
+            if pos:
+                discarded += pos
+                buf = buf[pos:]
+                pos = 0
+            if not exhausted:
+                try:
+                    data = (yield)
+                except GeneratorExit:
+                    data = ''
+                exhausted = not data
+            if not data:
+                try:
+                    target.send(EOF)
+                except StopIteration:
+                    pass
+                break
+            buf += data
+            continue
+
+        if match.group() == '/':
+            start = match.start()
+            if start + 1 >= len(buf):
+                if exhausted:
+                    raise common.JSONError(
+                        'Unexpected symbol %r at %d' % ('/', discarded + start))
+                try:
+                    data = (yield)
+                except GeneratorExit:
+                    data = ''
+                exhausted = not data
+                if not data:
+                    raise common.JSONError(
+                        'Unexpected symbol %r at %d' % ('/', discarded + start))
+                buf += data
+            if buf[start + 1] == '/':
+                # Line comment: everything up to (but excluding) the newline
+                search_from = start + 2
+                end = buf.find('\n', search_from)
+                while end == -1:
+                    if exhausted:
+                        # A line comment running into EOF closes normally
+                        try:
+                            target.send(EOF)
+                        except StopIteration:
+                            pass
+                        return
+                    try:
+                        data = (yield)
+                    except GeneratorExit:
+                        data = ''
+                    exhausted = not data
+                    if not data:
+                        try:
+                            target.send(EOF)
+                        except StopIteration:
+                            pass
+                        return
+                    search_from = len(buf)
+                    buf += data
+                    end = buf.find('\n', search_from)
+                else:
+                    pos = end
+                continue
+            elif buf[start + 1] == '*':
+                # Block comment: must be closed before the stream ends
+                end = buf.find('*/', start + 2)
+                while end == -1:
+                    if exhausted:
+                        raise common.IncompleteJSONError('Incomplete block comment')
+                    try:
+                        data = (yield)
+                    except GeneratorExit:
+                        data = ''
+                    exhausted = not data
+                    if not data:
+                        raise common.IncompleteJSONError('Incomplete block comment')
+                    # A trailing '*' in the old buffer could start the closing
+                    # '*/' together with the first byte of the incoming data
+                    # (but the '*' that opens the comment can't also close it)
+                    trailing_star = buf.endswith('*') and not (
+                        len(buf) == start + 2 and buf[start:start + 2] == '/*')
+                    previous_len = len(buf)
+                    buf += data
+                    if trailing_star and buf[previous_len:previous_len + 1] == '/':
+                        end = previous_len - 1
+                    else:
+                        end = buf.find('*/', previous_len)
+                pos = end + 2
+                continue
+            else:
+                # A lone slash is not the start of a comment
+                send((discarded + start, '/'))
+                pos = start + 1
+                continue
+
+        lexeme = match.group()
+        if lexeme == '"':
+            pos = match.start()
+            start = pos + 1
+            while True:
+                try:
+                    end = buf.index('"', start)
+                    escpos = end - 1
+                    while buf[escpos] == '\\':
+                        escpos -= 1
+                    if (end - escpos) % 2 == 0:
+                        start = end + 1
+                    else:
+                        break
+                except ValueError:
+                    if exhausted:
+                        raise common.IncompleteJSONError('Incomplete string lexeme')
+                    try:
+                        data = (yield)
+                    except GeneratorExit:
+                        data = ''
+                    exhausted = not data
+                    if not data:
+                        raise common.IncompleteJSONError('Incomplete string lexeme')
+                    buf += data
+            send((discarded + pos, buf[pos:end + 1]))
+            pos = end + 1
+        else:
+            while lexeme not in UNARY_LEXEMES and match.end() == len(buf):
+                if exhausted:
+                    break
+                try:
+                    data = (yield)
+                except GeneratorExit:
+                    data = ''
+                exhausted = not data
+                if not data:
+                    break
+                buf += data
+                match = LEXEME_RE.search(buf, pos)
+                lexeme = match.group()
+            send((discarded + match.start(), lexeme))
+            pos = match.end()
+
+
 # Parsing states
 _PARSE_VALUE = 0
 _PARSE_ARRAY_ELEMENT_END = 1
@@ -297,9 +466,8 @@ def basic_parse_basecoro(target, multiple_values=False, allow_comments=False,
 
     - file: a readable file-like object with JSON input
     '''
-    if allow_comments:
-        raise ValueError("Comments are not supported by the python backend")
-    return utf8_encoder(Lexer(parse_value(target, multiple_values, use_float)))
+    lexer = CommentableLexer if allow_comments else Lexer
+    return utf8_encoder(lexer(parse_value(target, multiple_values, use_float)))
 
 
-common.enrich_backend(globals(), c_comments=False)
+common.enrich_backend(globals())

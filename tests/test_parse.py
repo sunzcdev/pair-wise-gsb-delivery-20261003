@@ -12,6 +12,20 @@ def test_parse(adaptor):
 def test_parse_array(adaptor):
     assert ARRAY_JSON_PARSE_EVENTS == adaptor.parse(ARRAY_JSON)
 
+
+def test_parse_with_comments(adaptor):
+    """allow_comments is propagated through the parse entry point"""
+    if not adaptor.backend.capabilities.c_comments:
+        pytest.skip("backend does not support comments")
+    json = b'// header\n{"a": /* c */ 1} // tail'
+    expected = [
+        ('', 'start_map', None),
+        ('', 'map_key', 'a'),
+        ('a', 'number', 1),
+        ('', 'end_map', None),
+    ]
+    assert expected == adaptor.parse(json, allow_comments=True)
+
 def test_coro_needs_input_with_two_elements(backend):
     int_element_basic_parse_events = list(backend.basic_parse(b'0', use_float=True))
     # all good

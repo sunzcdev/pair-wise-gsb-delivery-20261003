@@ -6,7 +6,7 @@ import threading
 from decimal import Decimal
 
 import pytest
-from ijson import common
+from ijson import common, utils
 
 from .test_base import ARRAY_JSON, EMBEDDED_NUL_JSON, ARRAY_JSON_EVENTS, INCOMPLETE_JSONS, INCOMPLETE_JSON_TOKENS, INVALID_JSONS, JSON, JSON_EVENTS, SCALAR_JSON, SURROGATE_PAIRS_JSON, STRINGS_JSON
 
@@ -177,6 +177,169 @@ def test_comments(adaptor):
     else:
         with pytest.raises(ValueError):
             adaptor.basic_parse(json, allow_comments=True)
+
+
+@pytest.mark.parametrize("json, expected", (
+    # line comments
+    (b'// header\n1', [('number', 1)]),
+    (b'1 // line comment to EOF', [('number', 1)]),
+    (b'{"a": 1, // tail\n "b": 2}',
+     [('start_map', None), ('map_key', 'a'), ('number', 1),
+      ('map_key', 'b'), ('number', 2), ('end_map', None)]),
+    (b'[1// c\r\n, 2// c\n]',
+     [('start_array', None), ('number', 1), ('number', 2),
+      ('end_array', None)]),
+    # block comments
+    (b'/* before */[1, /* middle */ 2]/* after */',
+     [('start_array', None), ('number', 1), ('number', 2),
+      ('end_array', None)]),
+    (b'/**/1/**/', [('number', 1)]),
+    (b'/* multi\nline\r\ncomment */null', [('null', None)]),
+    # comments are allowed wherever whitespace is
+    (b'/*a*/{/*b*/"k"/*c*/:/*d*/[/*e*/1/*f*/]/*g*/}/*h*/',
+     [('start_map', None), ('map_key', 'k'), ('start_array', None),
+      ('number', 1), ('end_array', None), ('end_map', None)]),
+))
+def test_comments_allowed(adaptor, json, expected):
+    if not adaptor.backend.capabilities.c_comments:
+        pytest.skip("backend does not support comments")
+    assert expected == adaptor.basic_parse(json, allow_comments=True)
+
+
+def test_comments_disabled_by_default(adaptor):
+    """Comments must be rejected unless explicitly enabled"""
+    for json in (b'1 // c', b'1 /* c */', b'// c\n1', b'/* c */1'):
+        _raises_json_error(adaptor, json)
+        _raises_json_error(adaptor, json, allow_comments=False)
+
+
+def test_comments_inside_strings_are_literal(adaptor):
+    """Slashes and comment-like text inside strings is parsed verbatim"""
+    if not adaptor.backend.capabilities.c_comments:
+        pytest.skip("backend does not support comments")
+    json = b'["// not a comment", "/* neither */", "a/b", "escaped\\/slash"]'
+    events = adaptor.basic_parse(json, allow_comments=True)
+    strings = [value for event, value in events if event == 'string']
+    assert ['// not a comment', '/* neither */', 'a/b', 'escaped/slash'] == strings
+    # the same string content must parse identically without the option
+    assert events == adaptor.basic_parse(json)
+
+
+def test_comments_do_not_join_numbers(adaptor):
+    """A comment can't glue two number fragments into a single number"""
+    if not adaptor.backend.capabilities.c_comments:
+        pytest.skip("backend does not support comments")
+    # two complete values separated by a comment are two values, not one
+    events = adaptor.basic_parse(
+        b'1/* comment */2', allow_comments=True, multiple_values=True)
+    assert [('number', 1), ('number', 2)] == events
+    # a comment inside a single number leaves it invalid
+    for json in (b'1/* c */2', b'-/* c */1', b'1./* c */5', b'1e/* c */2'):
+        with pytest.raises(common.JSONError):
+            adaptor.basic_parse(json, allow_comments=True)
+
+
+def test_unterminated_block_comment(adaptor):
+    """An unterminated block comment is reported as truncated content"""
+    if not adaptor.backend.capabilities.c_comments:
+        pytest.skip("backend does not support comments")
+    for json in (b'1 /* never ends', b'/* never ends', b'{"a": 1}/* nope',
+                 b'/*x*', b'1 /*/ still open'):
+        with pytest.raises(common.IncompleteJSONError):
+            adaptor.basic_parse(json, allow_comments=True)
+
+
+def test_empty_and_comment_only_inputs(adaptor):
+    """Inputs without any JSON value are incomplete, even with comments"""
+    if not adaptor.backend.capabilities.c_comments:
+        pytest.skip("backend does not support comments")
+    for json in (b'', b'   ', b'// only a comment', b'/* only a comment */',
+                 b' // c\n '):
+        with pytest.raises(common.IncompleteJSONError):
+            adaptor.basic_parse(json, allow_comments=True)
+
+
+def test_opening_star_does_not_close_block_comment(adaptor):
+    """The '*' opening a block comment can't simultaneously close it"""
+    if not adaptor.backend.capabilities.c_comments:
+        pytest.skip("backend does not support comments")
+    # '/*/' is still an open block comment; the real close comes later
+    events = adaptor.basic_parse(
+        b'1 /*/ not closed yet */ 2', allow_comments=True,
+        multiple_values=True)
+    assert [('number', 1), ('number', 2)] == events
+    with pytest.raises(common.IncompleteJSONError):
+        adaptor.basic_parse(b'1 /*/', allow_comments=True)
+
+
+@pytest.mark.pull_only
+@pytest.mark.parametrize("buf_size", [1, 2, 3, 5, 7, 16, 64 * 1024])
+def test_comment_boundaries_across_chunks(adaptor, buf_size):
+    """Comment delimiters split across input chunks are handled correctly"""
+    if not adaptor.backend.capabilities.c_comments:
+        pytest.skip("backend does not support comments")
+    json = (b'/* head */ {"a": [1, /* mid */ 2],'
+            b' "b": "// literal"} // tail\n')
+    expected = [
+        ('start_map', None), ('map_key', 'a'),
+        ('start_array', None), ('number', 1), ('number', 2),
+        ('end_array', None), ('map_key', 'b'), ('string', '// literal'),
+        ('end_map', None),
+    ]
+    result = adaptor.basic_parse(json, allow_comments=True, buf_size=buf_size)
+    assert expected == result
+
+
+def test_comments_are_streamed_without_buffering_whole_input(backend):
+    """A long comment must not force the whole input to be buffered"""
+    if not backend.capabilities.c_comments:
+        pytest.skip("backend does not support comments")
+    # tens of thousands of small chunks forming one long block comment; a
+    # whole-input implementation (e.g. regex substitution) would have to keep
+    # every chunk alive before seeing the closing delimiter
+    chunks = [b'/* padding '] * 5_000
+    events = utils.sendable_list()
+    coro = backend.basic_parse_coro(events, allow_comments=True)
+    for chunk in chunks:
+        coro.send(chunk)
+    with pytest.raises(common.IncompleteJSONError):
+        coro.close()
+
+
+def test_lone_slash_is_not_a_comment(adaptor):
+    """A slash that doesn't start a comment is still invalid JSON"""
+    if not adaptor.backend.capabilities.c_comments:
+        pytest.skip("backend does not support comments")
+    _raises_json_error(adaptor, b'1 / 2', allow_comments=True)
+
+
+def test_comment_positions_are_original(adaptor):
+    """Removing comments must not shift the positions reported for lexemes"""
+    if adaptor.backend.backend_name != 'python':
+        pytest.skip("position introspection targets the python lexer")
+    if not adaptor.backend.capabilities.c_comments:
+        pytest.skip("backend does not support comments")
+    plain = b'[1, 2]'
+    commented = b'[/* x */1, /* y */ 2]'
+
+    # compare against the low-level lexer positions directly
+    plain_positions = _lexer_positions(
+        adaptor.backend, plain, allow_comments=False)
+    commented_positions = _lexer_positions(
+        adaptor.backend, commented, allow_comments=True)
+    assert plain_positions == commented_positions
+
+
+def _lexer_positions(backend, json, allow_comments):
+    from ijson import utils
+    from ijson.backends.python import utf8_encoder
+    sink = utils.sendable_list()
+    lexer = backend.CommentableLexer if allow_comments else backend.Lexer
+    coro = utf8_encoder(lexer(backend.parse_value(sink, False, False)))
+    for index in range(len(json)):
+        coro.send(json[index:index + 1])
+    coro.close()
+    return [pos for pos, symbol in sink if symbol is not None]
 
 
 def test_multiple_values_raises_if_not_supported(adaptor):

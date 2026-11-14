@@ -404,9 +404,15 @@ to give users more fine-grained control over certain operations:
   with a ``parse error: trailing garbage`` error
   unless ``multiple_values=True`` is specified.
 - Similarly the ``allow_comments`` option (defaults to ``False``)
-  controls whether C-style comments (e.g., ``/* a comment */``),
+  controls whether comments,
   which are not supported by the JSON standard,
   are allowed in the content or not.
+  Both block comments (``/* a comment */``)
+  and line comments (``// a comment``) are accepted,
+  in any position where whitespace is allowed.
+  Comments are never recognized inside strings,
+  and an unterminated block comment is reported
+  as an incomplete JSON document.
 - For functions taking a file-like object,
   an additional ``buf_size`` option (defaults to ``65536`` or 64KB)
   specifies the amount of bytes the library
@@ -514,7 +520,8 @@ all of which can be queried by inspecting
 the ``capabilities`` module constant.
 It contains the following members:
 
-* ``c_comments``: C-style comments are supported.
+* ``c_comments``: comments (both ``/* block */`` and ``// line``) are supported
+  when the ``allow_comments`` option is enabled.
 * ``multiple_values``: multiple top-level JSON values are supported.
 * ``detects_invalid_leading_zeros``: numbers with leading zeroes
   are reported as invalid (as they should, as pert the JSON standard),
@@ -532,9 +539,6 @@ with the following exceptions:
   ``detects_invalid_leading_zeros`` and ``detects_incomplete_json_tokens``.
   It also doesn't support ``int64``
   in platforms with a 32-bit C ``long`` type.
-
-* The ``python`` backend doesn't support ``c_comments``.
-
 
 Performance tips
 ================
