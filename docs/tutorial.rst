@@ -682,6 +682,11 @@ cross-thread and cross-process communication:
 * :func:`memoize_stampede <.memoize_stampede>` -- memoizing function decorator
   with cache stampede protection. Read :doc:`case-study-landing-page-caching`
   for a comparison of memoization strategies.
+* :class:`.SoftExpiringCache` -- soft-expiring values with single-flight
+  refresh. Values stay readable until a separate hard deadline while exactly
+  one thread or process refreshes them using an exclusive generational token.
+  A late refresher cannot overwrite a newer result, and a failed refresh
+  preserves the old value without extending its hard deadline.
 
 .. _threading: https://docs.python.org/3/library/threading.html
 .. _multiprocessing: https://docs.python.org/3/library/multiprocessing.html

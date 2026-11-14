@@ -7,8 +7,9 @@ import os
 import random
 import threading
 import time
+from collections import namedtuple
 
-from .core import ENOVAL, args_to_key, full_name
+from .core import ENOVAL, Timeout, args_to_key, full_name
 
 
 class Averager:
@@ -486,3 +487,400 @@ def memoize_stampede(
         return wrapper
 
     return decorator
+
+
+SoftEntry = namedtuple(
+    'SoftEntry',
+    ('value', 'soft_expire_time', 'hard_expire_time', 'generation'),
+)
+
+
+class RefreshToken(namedtuple('RefreshToken', ('key', 'generation', 'nonce'))):
+    """Exclusive generational token for a soft-expiry refresh.
+
+    Tokens are created by :meth:`SoftExpiringCache.begin_refresh` and name the
+    single thread or process that is allowed to refresh a key. The token must
+    be passed back to :meth:`SoftExpiringCache.commit_refresh` or
+    :meth:`SoftExpiringCache.abort_refresh`.
+
+    The `generation` is the generation of the cached value the refresher
+    intends to replace and the `nonce` distinguishes refreshers from each
+    other. A commit is rejected when the cached value has advanced past the
+    token's generation, so a late refresher cannot overwrite a newer result.
+
+    """
+
+    __slots__ = ()
+
+    @property
+    def marker(self):
+        """Return the value used to identify the refresh marker."""
+        return (self.generation, self.nonce)
+
+
+class SoftExpiringCache:
+    """Recipe for soft-expiring values with single-flight refresh.
+
+    Every cached value has two deadlines. The *soft* deadline marks when the
+    value becomes stale: it can still be read but should be refreshed. The
+    *hard* deadline marks when the value is evicted entirely. Between the two
+    deadlines readers get the old value while exactly one thread or process
+    refreshes it.
+
+    The refresher receives an exclusive :class:`RefreshToken` which records
+    the generation of the value being replaced. Computations always run
+    outside of any cache write transaction. A commit only succeeds while the
+    token still names the newest generation, so a slow refresher cannot
+    overwrite a newer result. A failed refresh leaves the old value untouched:
+    it remains readable until its hard deadline but the deadline is never
+    extended, so repeated failures cannot keep a value alive forever.
+
+    When no value has been stored yet, callers that did not win the refresh
+    marker wait for the winner to commit. Waiters may give up after
+    `wait_timeout` seconds by raising :exc:`diskcache.Timeout` (or by
+    returning `default` when one is given) and never delete another
+    refresher's marker.
+
+    Assumes keys will not be evicted by the eviction policy before their hard
+    deadline. Set the eviction policy to 'none' on the cache to guarantee keys
+    are not evicted early.
+
+    >>> import diskcache
+    >>> cache = diskcache.Cache()
+    >>> soft = SoftExpiringCache(cache, soft_expire=60, hard_expire=300)
+    >>> calls = []
+    >>> def fetch():
+    ...     calls.append(1)
+    ...     return 'v1'
+    >>> soft.get_or_compute('meta', fetch)
+    'v1'
+    >>> soft.get_or_compute('meta', fetch)  # Fresh value, no recompute.
+    'v1'
+    >>> len(calls)
+    1
+
+    The refresh marker is exclusive and the token it hands out is
+    generational:
+
+    >>> token = soft.begin_refresh('meta')
+    >>> soft.begin_refresh('meta') is None
+    True
+    >>> (token.generation, soft.commit_refresh(token, 'v2'))
+    (1, True)
+    >>> soft.get('meta')
+    'v2'
+
+    A token naming a superseded generation cannot overwrite a newer result:
+
+    >>> soft.commit_refresh(token, 'late')
+    False
+    >>> soft.get('meta')
+    'v2'
+
+    """
+
+    def __init__(
+        self,
+        cache,
+        soft_expire,
+        hard_expire,
+        lease=None,
+        wait_timeout=10.0,
+        poll_interval=0.05,
+        name=None,
+        tag=None,
+        time_func=time.time,
+        sleep_func=time.sleep,
+    ):
+        """Initialize soft-expiring cache recipe.
+
+        :param cache: cache to store values and refresh markers
+        :param float soft_expire: seconds until a value becomes stale
+        :param float hard_expire: seconds until a value is evicted
+            (default None, never evicted)
+        :param float lease: seconds the refresh marker is held before another
+            refresher may take over (default None, same as `hard_expire`
+            when set, else `soft_expire`); should exceed the slowest
+            expected computation
+        :param float wait_timeout: seconds a waiter on a missing value waits
+            before giving up (default 10, None waits forever)
+        :param float poll_interval: seconds between polls while waiting
+            (default 0.05)
+        :param str name: namespace for the stored keys (default None,
+            automatic)
+        :param str tag: text to associate with stored values (default None)
+        :param time_func: function returning the current time in seconds
+        :param sleep_func: function sleeping a number of seconds
+
+        """
+        if soft_expire is None or soft_expire < 0:
+            raise ValueError('soft_expire must be non-negative')
+
+        if hard_expire is not None:
+            if hard_expire <= soft_expire:
+                raise ValueError(
+                    'hard_expire must be greater than soft_expire'
+                )
+
+        if lease is not None and lease <= 0:
+            raise ValueError('lease must be positive')
+
+        self._cache = cache
+        self._soft_expire = soft_expire
+        self._hard_expire = hard_expire
+
+        if lease is None:
+            lease = soft_expire if hard_expire is None else hard_expire
+
+        self._lease = lease
+        self._wait_timeout = wait_timeout
+        self._poll_interval = poll_interval
+        prefix = (SoftExpiringCache.__name__,) if name is None else (name,)
+        self._prefix = prefix
+        self._tag = tag
+        self._time_func = time_func
+        self._sleep_func = sleep_func
+
+    def _value_key(self, key):
+        return self._prefix + ('value', key)
+
+    def _refresh_key(self, key):
+        return self._prefix + ('refresh', key)
+
+    def peek(self, key):
+        """Return :class:`SoftEntry` for `key`, or `None` if missing.
+
+        The entry includes the current value, the absolute soft deadline, the
+        absolute hard deadline and the current generation.
+
+        """
+        entry, expire_time = self._cache.get(
+            self._value_key(key),
+            default=ENOVAL,
+            expire_time=True,
+            retry=True,
+        )
+        if entry is ENOVAL:
+            return None
+        value, soft_expire_time, generation = entry
+        return SoftEntry(value, soft_expire_time, expire_time, generation)
+
+    def get(self, key, default=None):
+        """Return value for `key`, whether fresh or stale, else `default`."""
+        entry = self._cache.get(
+            self._value_key(key), default=ENOVAL, retry=True
+        )
+        return default if entry is ENOVAL else entry[0]
+
+    def set(self, key, value):
+        """Unconditionally store `value` for `key` and reset the soft deadline.
+
+        The stored generation advances so any in-flight refresher's commit is
+        rejected rather than overwriting this value. Returns the new
+        generation.
+
+        """
+        cache = self._cache
+        value_key = self._value_key(key)
+
+        with cache.transact(retry=True):
+            entry = cache.get(value_key, default=ENOVAL)
+            generation = 0 if entry is ENOVAL else entry[2]
+            cache.set(
+                value_key,
+                (value, self._time_func() + self._soft_expire, generation + 1),
+                expire=self._hard_expire,
+                tag=self._tag,
+            )
+
+        return generation + 1
+
+    def begin_refresh(self, key):
+        """Try to become the exclusive refresher for `key`.
+
+        Returns a :class:`RefreshToken` on success and `None` when another
+        thread or process already holds the refresh marker. The marker is
+        held for at most `lease` seconds so a crashed refresher cannot block
+        refreshes forever.
+
+        """
+        cache = self._cache
+        nonce = '{}-{}'.format(os.getpid(), os.urandom(8).hex())
+
+        with cache.transact(retry=True):
+            entry = cache.get(self._value_key(key), default=ENOVAL)
+            generation = 0 if entry is ENOVAL else entry[2]
+            token = RefreshToken(key, generation, nonce)
+            added = cache.add(
+                self._refresh_key(key),
+                token.marker,
+                expire=self._lease,
+                retry=True,
+            )
+
+        return token if added else None
+
+    def refreshing(self, key):
+        """Return `True` when a refresher currently holds the marker."""
+        return self._refresh_key(key) in self._cache
+
+    def commit_refresh(self, token, value):
+        """Commit `value` for the key named by `token`.
+
+        Returns `True` when the value was committed. Returns `False` when a
+        newer generation was already committed or when another refresher
+        took over the refresh marker, so a late refresher cannot overwrite a
+        newer result. The refresh marker is released only while it is still
+        held by `token`.
+
+        """
+        cache = self._cache
+        value_key = self._value_key(token.key)
+        refresh_key = self._refresh_key(token.key)
+
+        with cache.transact(retry=True):
+            marker = cache.get(refresh_key, default=ENOVAL, retry=True)
+
+            if marker is not ENOVAL and marker != token.marker:
+                return False  # Another refresher took over the marker.
+
+            ours = marker == token.marker
+            entry = cache.get(value_key, default=ENOVAL, retry=True)
+
+            if entry is not ENOVAL and entry[2] != token.generation:
+                # A newer result was already committed by someone else.
+                if ours:
+                    cache.delete(refresh_key, retry=True)
+                return False
+
+            generation = token.generation if entry is ENOVAL else entry[2]
+            cache.set(
+                value_key,
+                (
+                    value,
+                    self._time_func() + self._soft_expire,
+                    generation + 1,
+                ),
+                expire=self._hard_expire,
+                tag=self._tag,
+                retry=True,
+            )
+
+            if ours:
+                cache.delete(refresh_key, retry=True)
+
+            return True
+
+    def abort_refresh(self, token):
+        """Release the refresh marker named by `token` after a failure.
+
+        Returns `True` when the marker was released. A marker acquired by
+        another refresher is never deleted.
+
+        """
+        cache = self._cache
+        refresh_key = self._refresh_key(token.key)
+
+        with cache.transact(retry=True):
+            marker = cache.get(refresh_key, default=ENOVAL, retry=True)
+
+            if marker != token.marker:
+                return False
+
+            cache.delete(refresh_key, retry=True)
+            return True
+
+    def get_or_compute(self, key, compute, default=ENOVAL, wait_timeout=None):
+        """Return value for `key`, refreshing it with `compute` when needed.
+
+        A fresh value is returned immediately. When the value is stale, one
+        caller recomputes it while every other caller keeps reading the stale
+        value. When no value exists, one caller computes it while the others
+        wait up to `wait_timeout` seconds. `compute` is always called outside
+        of any cache write transaction.
+
+        When `compute` raises, the exception is re-raised unless a stale value
+        is still readable; in that case the stale value is returned and is
+        preserved until its hard deadline. When a waiter times out, `default`
+        is returned if one is given, else :exc:`diskcache.Timeout` is raised.
+        Waiters never delete another refresher's marker.
+
+        :param key: key to look up
+        :param compute: callable returning a new value
+        :param default: value returned when a waiter times out (default
+            ENOVAL, raise :exc:`diskcache.Timeout`)
+        :param float wait_timeout: seconds to wait for a missing value
+            (default None, use the instance value)
+        :return: value for key
+
+        """
+        cache = self._cache
+        value_key = self._value_key(key)
+        wait = self._wait_timeout if wait_timeout is None else wait_timeout
+        start = self._time_func()
+        stale = ENOVAL
+
+        while True:
+            entry = cache.get(value_key, default=ENOVAL, retry=True)
+            now = self._time_func()
+
+            if entry is not ENOVAL:
+                value, soft_expire_time, _ = entry
+
+                if now < soft_expire_time:
+                    return value  # Cache hit, value is fresh.
+
+                stale = value
+
+            token = self.begin_refresh(key)
+
+            if token is None:
+                # Another thread or process is refreshing the key.
+                if stale is not ENOVAL:
+                    return stale  # Serve the stale value meanwhile.
+
+                if wait is not None and (now - start) >= wait:
+                    # Re-check once: the winner may have just committed.
+                    entry = cache.get(value_key, default=ENOVAL, retry=True)
+
+                    if entry is not ENOVAL:
+                        return entry[0]
+
+                    if default is not ENOVAL:
+                        return default
+
+                    raise Timeout(
+                        'timed out waiting for value of key: %r' % (key,)
+                    )
+
+                self._sleep_func(self._poll_interval)
+                continue
+
+            try:
+                value = compute()
+            except Exception:
+                # Keep the old value untouched but never renew it: it is
+                # gone as soon as its hard deadline passes.
+                self.abort_refresh(token)
+                entry = cache.get(value_key, default=ENOVAL, retry=True)
+
+                if entry is not ENOVAL:
+                    return entry[0]
+
+                # The old value is gone, so a failed refresh must raise.
+                raise
+            except BaseException:
+                self.abort_refresh(token)
+                raise
+
+            if self.commit_refresh(token, value):
+                return value
+
+            # The commit was rejected: a newer result exists or the marker
+            # was taken over. Prefer the newest committed value.
+            entry = cache.get(value_key, default=ENOVAL, retry=True)
+
+            if entry is not ENOVAL:
+                return entry[0]
+
+            return value
