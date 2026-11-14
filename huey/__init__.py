@@ -18,5 +18,8 @@ from huey.api import crontab
 from huey.api import group
 from huey.exceptions import CancelExecution
 from huey.exceptions import RetryTask
+from huey.saga import CompensationChain
+from huey.saga import CompensationError
+from huey.saga import Saga
 from huey.utils import Error
 from huey.utils import SKIPPED

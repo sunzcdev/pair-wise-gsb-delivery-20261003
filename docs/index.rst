@@ -126,6 +126,7 @@ Table of contents
    monitoring
    imports
    shared_resources
+   saga
    signals
    api
    contrib
