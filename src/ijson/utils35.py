@@ -36,6 +36,7 @@ class async_iterable:
         self.events = sendable_deque()
         self.coro = utils.chain(self.events, *coro_pipeline)
         self.coro_finished = False
+        self.exception = None
         self.f = f
         self.buf_size = buf_size
         self.read = None
@@ -48,6 +49,9 @@ class async_iterable:
             self.read = await _get_read(self.f)
         if self.events:
             return self.events.popleft()
+        if self.exception is not None:
+            exception, self.exception = self.exception, None
+            raise exception
         if self.coro_finished:
             raise StopAsyncIteration
         while True:
@@ -61,6 +65,12 @@ class async_iterable:
                 if self.events:
                     return self.events.popleft()
                 raise StopAsyncIteration
+            except BaseException as exception:
+                self.coro_finished = True
+                self.exception = exception
+                if self.events:
+                    return self.events.popleft()
+                raise
 
 
 def _make_basic_parse_async(backend):

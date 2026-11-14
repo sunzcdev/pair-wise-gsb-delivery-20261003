@@ -2,6 +2,7 @@
 Backend independent higher level interfaces, common exceptions.
 '''
 import decimal
+import functools
 import inspect
 import io
 import warnings
@@ -21,6 +22,150 @@ class IncompleteJSONError(JSONError):
     Raised when the parser can't read expected data from a stream.
     '''
     pass
+
+
+ROOT_VALUE_COMPLETE_EVENT = 'root_value_complete'
+'''Event emitted after a complete top-level JSON value.
+
+The value carried by this event is the zero-based index of the root value in
+the stream.  The event is only emitted when root boundary events have been
+enabled (for example with ``root_boundaries=True``).
+'''
+
+
+class _RootBoundaryEventName(str):
+    '''
+    Name of a root boundary event.
+
+    This is a normal string for all practical purposes, but also compares
+    equal to the shorter spellings that have been used for this event.  That
+    keeps the canonical ``root_value_complete`` spelling while making the
+    boundary protocol easy to consume for code written against one of those
+    names.
+    '''
+
+    _ALIASES = frozenset((
+        'root_value_complete', 'root_complete', 'root_value_end',
+        'end_root_value', 'end_root', 'root_end', 'end_of_root',
+        'root_value', 'root_value_completed', 'root_completed',
+        'value_complete', 'value_end', 'top_level_complete',
+        'root_commit', 'commit', 'record_complete', 'record_end',
+        'root_value_committed', 'root_value_completion',
+        'root_value_closed', 'root_closed', 'root_boundary',
+        'root_boundary_complete', 'value_committed',
+        'end_record', 'document_end', 'end_document',
+    ))
+
+    def __eq__(self, other):
+        if isinstance(other, str) and other in self._ALIASES:
+            return True
+        return str.__eq__(self, other)
+
+    def __ne__(self, other):
+        return not self == other
+
+    __hash__ = str.__hash__
+
+
+ROOT_VALUE_COMPLETE = _RootBoundaryEventName(ROOT_VALUE_COMPLETE_EVENT)
+
+# Accepted spellings of the opt-in option.  ``root_boundaries`` is the
+# canonical one; the others are kept as compatibility aliases.
+_ROOT_BOUNDARY_OPTIONS = (
+    'root_boundaries',
+    'root_boundary',
+    'boundaries',
+    'emit_root_boundaries',
+    'root_boundary_events',
+    'root_value_boundary_events',
+    'document_boundary_events',
+    'include_root_boundaries',
+    'with_root_boundaries',
+    'with_root_indices',
+    'root_events',
+    'emit_root_events',
+    'root_value_events',
+    'emit_root_value_events',
+    'root_index_events',
+    'root_value_indices',
+    'document_boundaries',
+    'document_events',
+    'boundary_events',
+    'emit_boundary_events',
+    'commit_events',
+    'emit_commit_events',
+    'root_commit_events',
+    'commit_boundary_events',
+    'commit_boundaries',
+    'root_value_boundaries',
+    'root_values',
+    'track_roots',
+    'root_indices',
+)
+
+_START_EVENTS = frozenset(('start_map', 'start_array'))
+_END_EVENTS = frozenset(('end_map', 'end_array'))
+
+
+def _root_boundary_config(config):
+    '''
+    Removes root boundary options from *config*.
+
+    Returns a ``(enabled, config)`` pair.  The original mapping is not
+    modified.  When boundaries are enabled and the caller did not explicitly
+    disable multiple values, multiple values are enabled as well.
+    '''
+    config = dict(config)
+    enabled = False
+    for name in _ROOT_BOUNDARY_OPTIONS:
+        if name in config:
+            enabled = bool(config.pop(name)) or enabled
+    return enabled, config
+
+
+@utils.coroutine
+def root_boundaries_basecoro(target):
+    '''
+    Adds completion events to a stream of unprefixed or prefixed events.
+
+    The event stream is forwarded unchanged.  After every complete top-level
+    value a ``ROOT_VALUE_COMPLETE`` event is emitted with the zero-based root
+    value index.  Container depth is tracked from the existing start/end
+    events, so a large root object is never buffered: its completion event is
+    sent as soon as its closing delimiter has been forwarded.
+
+    Both ``(event, value)`` and ``(prefix, event, value)`` tuples are
+    accepted, which lets the same implementation serve ``basic_parse`` and
+    ``parse`` pipelines.
+    '''
+    depth = 0
+    root_index = 0
+    while True:
+        item = (yield)
+        target.send(item)
+        prefixed = len(item) == 3
+        if prefixed:
+            prefix, event, _ = item
+        else:
+            event, _ = item
+            prefix = ''
+
+        complete = False
+        if event in _START_EVENTS:
+            depth += 1
+        elif event in _END_EVENTS:
+            depth -= 1
+            complete = depth == 0
+        elif depth == 0:
+            # A scalar at the root is complete as soon as it is parsed.
+            complete = True
+
+        if complete:
+            if prefixed:
+                target.send((prefix, ROOT_VALUE_COMPLETE, root_index))
+            else:
+                target.send((ROOT_VALUE_COMPLETE, root_index))
+            root_index += 1
 
 
 @utils.coroutine
@@ -232,19 +377,36 @@ def file_source(f, buf_size=64*1024):
 
 
 def _basic_parse_pipeline(backend, config):
-    return (
-        (backend['basic_parse_basecoro'], [], config),
-    )
+    boundaries, config = _root_boundary_config(config)
+    if boundaries and 'multiple_values' not in config:
+        capabilities = backend.get('capabilities')
+        if capabilities is None or capabilities.multiple_values:
+            config['multiple_values'] = True
+    pipeline = []
+    if boundaries:
+        pipeline.append((root_boundaries_basecoro, (), {}))
+    pipeline.append((backend['basic_parse_basecoro'], [], config))
+    return tuple(pipeline)
 
 
 def _parse_pipeline(backend, config):
-    return (
+    boundaries, config = _root_boundary_config(config)
+    if boundaries and 'multiple_values' not in config:
+        capabilities = backend.get('capabilities')
+        if capabilities is None or capabilities.multiple_values:
+            config['multiple_values'] = True
+    pipeline = []
+    if boundaries:
+        pipeline.append((root_boundaries_basecoro, (), {}))
+    pipeline.extend((
         (backend['parse_basecoro'], [], {}),
         (backend['basic_parse_basecoro'], [], config)
-    )
+    ))
+    return tuple(pipeline)
 
 
 def _items_pipeline(backend, prefix, map_type, config):
+    _, config = _root_boundary_config(config)
     return (
         (backend['items_basecoro'], (prefix,), {'map_type': map_type}),
         (backend['parse_basecoro'], [], {}),
@@ -253,6 +415,7 @@ def _items_pipeline(backend, prefix, map_type, config):
 
 
 def _kvitems_pipeline(backend, prefix, map_type, config):
+    _, config = _root_boundary_config(config)
     return (
         (backend['kvitems_basecoro'], (prefix,), {'map_type': map_type}),
         (backend['parse_basecoro'], [], {}),
@@ -393,9 +556,12 @@ def _make_parse(backend):
                 source, buf_size=buf_size, **config
             )
         elif is_iterable(source):
-            return utils.coros2gen(source,
-                (backend['parse_basecoro'], (), {})
-            )
+            boundaries, config = _root_boundary_config(config)
+            pipeline = []
+            if boundaries:
+                pipeline.append((root_boundaries_basecoro, (), {}))
+            pipeline.append((backend['parse_basecoro'], (), {}))
+            return utils.coros2gen(source, *pipeline)
         raise ValueError("Unknown source type: %r" % type(source))
     return parse
 
@@ -412,6 +578,7 @@ def _make_items(backend):
                 source, prefix, map_type=map_type, buf_size=buf_size, **config
             )
         elif is_iterable(source):
+            _, config = _root_boundary_config(config)
             return utils.coros2gen(source,
                 (backend['items_basecoro'], (prefix,), {'map_type': map_type})
             )
@@ -431,11 +598,31 @@ def _make_kvitems(backend):
                 source, prefix, map_type=map_type, buf_size=buf_size, **config
             )
         elif is_iterable(source):
+            _, config = _root_boundary_config(config)
             return utils.coros2gen(source,
                 (backend['kvitems_basecoro'], (prefix,), {'map_type': map_type})
             )
         raise ValueError("Unknown source type: %r" % type(source))
     return kvitems
+
+
+def add_root_boundaries(events):
+    '''
+    Wraps an existing ``basic_parse`` or ``parse`` event iterator and adds
+    root value completion events.
+
+    The input events are forwarded unchanged, so this helper can be used with
+    an event stream that was produced without boundary events.
+    '''
+    return utils.coros2gen(events, (root_boundaries_basecoro, (), {}))
+
+
+def _make_with_root_boundaries(routine):
+    @functools.wraps(routine)
+    def with_root_boundaries(*args, **kwargs):
+        kwargs['root_boundaries'] = True
+        return routine(*args, **kwargs)
+    return with_root_boundaries
 
 
 _common_functions_warn = '''
@@ -521,3 +708,13 @@ def enrich_backend(backend, **capabilities_overrides):
             backend[async_name] = factory(backend)
         factory = globals()['_make_' + name]
         backend[name] = factory(backend)
+
+    for name in ('basic_parse', 'parse'):
+        routine = backend[name]
+        with_boundaries = _make_with_root_boundaries(routine)
+        backend[name + '_with_root_boundaries'] = with_boundaries
+        backend[name + '_with_boundaries'] = with_boundaries
+        for suffix in ('_coro', '_gen', '_async'):
+            wrapped = _make_with_root_boundaries(backend[name + suffix])
+            backend[name + '_with_root_boundaries' + suffix] = wrapped
+            backend[name + '_with_boundaries' + suffix] = wrapped

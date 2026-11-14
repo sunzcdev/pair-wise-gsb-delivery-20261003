@@ -403,6 +403,20 @@ to give users more fine-grained control over certain operations:
   By default ijson will fail to process these
   with a ``parse error: trailing garbage`` error
   unless ``multiple_values=True`` is specified.
+- The ``root_boundaries`` option (defaults to ``False``)
+  adds a ``root_value_complete`` event after every complete top-level
+  value. Its value is the zero-based index of that root value.
+  This makes it possible to distinguish, for example, the ``end_map`` of
+  an object nested inside a record from the end of the record itself.
+  Root scalars and empty containers are delimited too.
+  A root value that is truncated by an error or by the end of the input
+  does not produce a completion event, while earlier complete root values
+  keep their already-delivered events and completion events.
+  When enabled without an explicit ``multiple_values`` setting,
+  multiple values are enabled automatically.
+  ``ijson.basic_parse_with_root_boundaries`` and
+  ``ijson.parse_with_root_boundaries`` are equivalent standalone entry
+  points (``..._with_boundaries`` aliases are also available).
 - Similarly the ``allow_comments`` option (defaults to ``False``)
   controls whether C-style comments (e.g., ``/* a comment */``),
   which are not supported by the JSON standard,
@@ -435,6 +449,9 @@ Events will be one of the following:
   Its associated value is the name itself.
 - ``null``, ``boolean``, ``integer``, ``double``, ``number`` and ``string``
   all indicate actual content, which is stored in the associated value.
+- ``root_value_complete`` is only emitted when the ``root_boundaries``
+  option is enabled. It indicates that the top-level value has been fully
+  parsed, and its value is the zero-based index of that root value.
 
 
 Prefix

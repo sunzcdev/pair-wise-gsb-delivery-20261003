@@ -2,6 +2,12 @@
 
 ## Development
 
+* Added opt-in root value completion events for multi-value streams through
+  the `root_boundaries` option and the `basic_parse_with_root_boundaries` /
+  `parse_with_root_boundaries` entry points. Each completed top-level value
+  emits a `root_value_complete` event carrying its zero-based index, while
+  truncated final values do not. The existing event streams are unchanged
+  when the option is not enabled.
 * Fixed handling of integers longer than `sys.get_int_max_str_digits()`:
   the `yajl2_c` backend no longer crashes on them, and all backends
   now raise the `ValueError` produced by `int()` (#188).
