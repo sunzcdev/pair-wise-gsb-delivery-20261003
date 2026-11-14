@@ -5,6 +5,17 @@ Changelog
 
 [View commits](https://github.com/coleifer/huey/compare/3.5.4...master)
 
+* Serialized tasks and results are now wrapped in a versioned envelope that
+  records the serialization format, compression codec, original/stored length
+  and a SHA-256 checksum. Decoding follows the envelope metadata instead of
+  the reader's compression settings, so switching between gzip and zlib no
+  longer breaks reads of existing messages. Unknown versions, truncation,
+  length mismatches and checksum failures raise a new `SerializerError`
+  (a `ValueError` subclass) before any object is unpickled. Legacy
+  un-enveloped messages remain readable by default (`allow_legacy=True`) and
+  are only recognized via an explicit magic prefix; the
+  `SignedSerializer` HMAC now covers the complete envelope.
+
 ## 3.5.4
 
 * Fix possible hang if worker holding the stop flag was killed while holding

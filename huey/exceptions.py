@@ -4,6 +4,14 @@ class TaskLockedException(HueyException): pass
 class ResultTimeout(HueyException): pass
 class TaskTimeout(HueyException): pass
 
+class SerializerError(HueyException, ValueError):
+    """Raised when a message cannot be decoded from its versioned envelope.
+
+    Inherits from :class:`ValueError` for backwards-compatibility with code
+    that previously expected a plain ``ValueError`` from the (de)serializers.
+    """
+    pass
+
 class RateLimitExceeded(HueyException):
     def __init__(self, key, delay, retry=True):
         self.key, self.delay, self.retry = key, delay, retry

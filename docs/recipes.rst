@@ -324,7 +324,9 @@ Signed Serializer for Untrusted Environments
 By default Huey uses ``pickle`` to serialize tasks and results. If your Redis
 instance is shared or network-exposed, a malicious actor could inject a crafted
 pickle payload. The :py:class:`SignedSerializer` adds an HMAC signature to
-every message, so tampered data is rejected:
+every message, so tampered data is rejected. The signature is computed over
+the complete versioned envelope (including the format, compression, length and
+checksum fields), so no part of the message can be altered undetected:
 
 .. code-block:: python
 

@@ -2211,19 +2211,38 @@ Consumer
 Serializer
 ----------
 
-.. py:class:: Serializer(compression=False, compression_level=6, use_zlib=False, pickle_protocol=pickle.HIGHEST_PROTOCOL)
+.. py:class:: Serializer(compression=False, compression_level=6, use_zlib=False, pickle_protocol=pickle.HIGHEST_PROTOCOL, allow_legacy=True)
 
     :param bool compression: use gzip compression
     :param int compression_level: 0 for least, 9 for most.
     :param bool use_zlib: use zlib for compression instead of gzip.
     :param int pickle_protocol: pickle protocol version.
+    :param bool allow_legacy: allow reading messages written by older Huey
+        releases that do not carry a versioned envelope (default ``True``).
 
     The Serializer class implements a simple interface that can be extended to
     provide your own serialization format. The default implementation uses
     ``pickle``.
 
-    To override, the following methods should be implemented. Compression is
-    handled transparently elsewhere in the API.
+    Every serialized message is wrapped in a **versioned envelope** that
+    explicitly records the serialization format, the compression codec, the
+    original (uncompressed) length, the stored length and a SHA-256 checksum
+    of the uncompressed payload. On reading, the envelope is inspected to
+    select the correct decoding path, so switching between gzip and zlib (or
+    disabling compression) no longer affects the ability to read older
+    messages. An unknown version, a truncated message, a length mismatch or a
+    failed checksum raises :py:class:`SerializerError` *before* any object is
+    unpickled.
+
+    Envelopes are identified by a fixed multi-byte magic prefix. Legacy,
+    un-enveloped messages are only read when ``allow_legacy=True`` **and** the
+    magic prefix is absent; matching the full prefix (rather than a single
+    byte) ensures a new message can never be mistaken for a legacy one. Set
+    ``allow_legacy=False`` to reject any message that is not a valid envelope.
+
+    To override the object encoding, the following methods may be implemented.
+    Compression and envelope handling are performed transparently elsewhere in
+    the API.
 
     .. py:method:: _serialize(data)
 
@@ -2241,11 +2260,15 @@ Serializer
     :param str secret: secret key used to generate HMAC signatures.
     :param str salt: salt combined with the secret (default ``'huey'``).
     :param kwargs: additional keyword arguments passed to the base
-        :py:class:`Serializer` (e.g. ``compression``, ``use_zlib``).
+        :py:class:`Serializer` (e.g. ``compression``, ``use_zlib``,
+        ``allow_legacy``).
 
     A subclass of :py:class:`Serializer` that adds an HMAC-SHA1 signature to
-    every serialized message. When deserializing, the signature is verified and
-    a ``ValueError`` is raised if the message has been tampered with.
+    every serialized message. The signature is computed over the **complete
+    envelope**, including its magic, version, format flags, lengths and
+    checksum, so no format field can be altered outside of the signature.
+    When deserializing, the signature is verified and a ``ValueError`` is
+    raised if the message has been tampered with.
 
     This is useful when the storage backend (e.g. Redis) is shared or
     network-exposed and you want to prevent malicious injection of crafted
@@ -2279,6 +2302,14 @@ Exceptions
 .. py:class:: ConfigurationError
 
     Raised when Huey encounters a configuration problem.
+
+.. py:class:: SerializerError
+
+    Raised when a message cannot be decoded from its versioned envelope, for
+    example because the version is unknown, the message is truncated, a
+    recorded length does not match, or the checksum fails. Subclasses
+    :class:`ValueError`, so existing code that catches ``ValueError``
+    continues to work.
 
 .. py:class:: TaskLockedException
 
