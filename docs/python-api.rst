@@ -1814,6 +1814,24 @@ This method raises a ``sqlite_utils.db.TransformError`` exception if the table c
 .. note::
     In the CLI: :ref:`sqlite-utils transform <cli_transform_table>`
 
+.. _python_api_transform_transaction_mode:
+
+Composable transactions
+-----------------------
+
+Pass ``transaction=True`` - or the equivalent ``mode="savepoint"`` - to compose a transform with a transaction that the caller already has open:
+
+.. code-block:: python
+
+    with db.atomic():
+        db.table("events").insert({"id": 1, "payload": "before"})
+        db.table("events").transform(types={"payload": str}, transaction=True)
+        db.table("events").insert({"id": 2, "payload": "after"})
+
+In this mode the whole rebuild - creating and populating the replacement table, restoring indexes and triggers and swapping the old table out - runs inside a savepoint. A failure rolls back only the transform, leaving earlier writes in the caller's transaction untouched. The caller still decides whether to commit or roll back at the end. ``PRAGMA foreign_keys`` is never changed by this mode.
+
+Tables referenced by foreign keys are handled without dropping the referenced table while those keys are active. This includes destructive ``ON DELETE`` actions such as ``CASCADE``. Compound primary keys, compound inbound foreign keys and quoted table, column, index and trigger names are supported. Restored partial indexes keep their ``WHERE`` clauses, and triggers are recreated from their original stored SQL rather than from a simplified definition.
+
 .. _python_api_transform_alter_column_types:
 
 Altering column types
@@ -2066,6 +2084,8 @@ To transform such a table either call ``.transform()`` outside of the transactio
     db.execute("PRAGMA foreign_keys = on")
 
 Tables referenced by foreign keys without a destructive action (the default ``NO ACTION``, or ``RESTRICT``) can still be transformed inside a transaction - sqlite-utils uses ``PRAGMA defer_foreign_keys`` to postpone the foreign key checks until the transaction commits.
+
+Passing ``transaction=True`` avoids changing ``PRAGMA foreign_keys`` altogether. In that mode the old table is renamed out of the way, the replacement is put in its place and any inbound foreign key definitions are repointed before the old table is dropped - so destructive actions never fire. See :ref:`python_api_transform_transaction_mode`.
 
 .. _python_api_extract:
 

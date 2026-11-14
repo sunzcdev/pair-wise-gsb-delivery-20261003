@@ -1472,3 +1472,216 @@ def test_transform_refuses_to_drop_column_used_by_remaining_check(fresh_db):
     ):
         ranges.transform(drop={"maximum"})
     assert ranges.schema == schema_before
+
+
+def _create_transform_transaction_fixture(db):
+    db.execute("PRAGMA foreign_keys=ON")
+    db.executescript("""
+        CREATE TABLE "parent""table" (
+            "a""x" INTEGER NOT NULL,
+            "b y" TEXT NOT NULL,
+            payload TEXT,
+            PRIMARY KEY ("a""x", "b y")
+        );
+        CREATE INDEX "idx""pred" ON "parent""table" (payload)
+            WHERE payload IS NOT NULL;
+        CREATE TABLE "log""table" (msg TEXT);
+        CREATE TRIGGER "trg""one" AFTER INSERT ON "parent""table"
+        BEGIN
+            INSERT INTO "log""table"(msg)
+            VALUES (new.payload || '; trigger');
+        END;
+        CREATE TABLE "child""table" (
+            id INTEGER PRIMARY KEY,
+            pa INTEGER,
+            pb TEXT,
+            FOREIGN KEY (pa, pb)
+                REFERENCES "parent""table"("a""x", "b y")
+        );
+        """)
+    db.execute(
+        'INSERT INTO "parent""table" VALUES (?, ?, ?)', [1, "x", "baseline"]
+    )
+    db.execute('INSERT INTO "child""table" VALUES (?, ?, ?)', [1, 1, "x"])
+
+
+def _transform_transaction_objects(db):
+    return {
+        "schema": db.table('parent"table').schema,
+        "index": db.execute(
+            "SELECT sql FROM sqlite_master WHERE name = 'idx\"pred'"
+        ).fetchone()[0],
+        "trigger": db.execute(
+            "SELECT sql FROM sqlite_master WHERE name = 'trg\"one'"
+        ).fetchone()[0],
+        "child_schema": db.execute(
+            "SELECT sql FROM sqlite_master WHERE name = 'child\"table'"
+        ).fetchone()[0],
+        "parent_rows": db.execute(
+            'SELECT * FROM "parent""table" ORDER BY 1'
+        ).fetchall(),
+        "child_rows": db.execute('SELECT * FROM "child""table"').fetchall(),
+    }
+
+
+def test_transform_transaction_mode_composes_with_outer_transaction(fresh_db):
+    _create_transform_transaction_fixture(fresh_db)
+    before = _transform_transaction_objects(fresh_db)
+
+    with fresh_db.atomic():
+        fresh_db.execute(
+            'INSERT INTO "parent""table" VALUES (?, ?, ?)',
+            [2, "y", "outer"],
+        )
+        fresh_db.table('parent"table').transform(
+            types={"payload": str}, mode="savepoint"
+        )
+        assert fresh_db.conn.in_transaction
+        assert fresh_db.execute("PRAGMA foreign_keys").fetchone()[0]
+        fresh_db.execute(
+            'INSERT INTO "parent""table" VALUES (?, ?, ?)',
+            [3, "z", "after"],
+        )
+
+    after = _transform_transaction_objects(fresh_db)
+    assert after["index"] == before["index"]
+    assert after["trigger"] == before["trigger"]
+    assert after["child_schema"] == before["child_schema"]
+    assert after["child_rows"] == before["child_rows"]
+    assert after["parent_rows"] == [
+        (1, "x", "baseline"),
+        (2, "y", "outer"),
+        (3, "z", "after"),
+    ]
+    assert fresh_db.execute("PRAGMA foreign_keys").fetchone()[0]
+    assert fresh_db.execute("PRAGMA foreign_key_check").fetchall() == []
+    assert fresh_db.execute('SELECT * FROM "log""table"').fetchall() == [
+        ("baseline; trigger",),
+        ("outer; trigger",),
+        ("after; trigger",),
+    ]
+
+
+def test_transform_transaction_mode_outer_rollback_restores_structure(fresh_db):
+    _create_transform_transaction_fixture(fresh_db)
+    before = _transform_transaction_objects(fresh_db)
+
+    with pytest.raises(RuntimeError), fresh_db.atomic():
+        fresh_db.execute(
+            'INSERT INTO "parent""table" VALUES (?, ?, ?)',
+            [2, "y", "outer"],
+        )
+        fresh_db.table('parent"table').transform(
+            types={"payload": str}, transaction=True
+        )
+        raise RuntimeError("outer rollback")
+
+    after = _transform_transaction_objects(fresh_db)
+    assert after == before
+    assert fresh_db.execute("PRAGMA foreign_keys").fetchone()[0]
+    assert fresh_db.execute("PRAGMA foreign_key_check").fetchall() == []
+
+
+def test_transform_transaction_mode_copy_failure_preserves_outer_state(fresh_db):
+    _create_transform_transaction_fixture(fresh_db)
+    before = _transform_transaction_objects(fresh_db)
+
+    with fresh_db.atomic():
+        fresh_db.execute(
+            'INSERT INTO "parent""table" VALUES (?, ?, ?)',
+            [2, "y", None],
+        )
+        with pytest.raises(sqlite3.IntegrityError, match="NOT NULL"):
+            fresh_db.table('parent"table').transform(
+                not_null={"payload"}, transaction=True
+            )
+        fresh_db.execute(
+            'INSERT INTO "parent""table" VALUES (?, ?, ?)',
+            [3, "z", "after"],
+        )
+
+    after = _transform_transaction_objects(fresh_db)
+    assert after["schema"] == before["schema"]
+    assert after["index"] == before["index"]
+    assert after["trigger"] == before["trigger"]
+    assert after["child_schema"] == before["child_schema"]
+    assert after["child_rows"] == before["child_rows"]
+    assert after["parent_rows"] == [
+        (1, "x", "baseline"),
+        (2, "y", None),
+        (3, "z", "after"),
+    ]
+    assert fresh_db.execute("PRAGMA foreign_keys").fetchone()[0]
+
+
+def test_transform_transaction_mode_restore_failure_preserves_outer_state(
+    fresh_db, monkeypatch
+):
+    _create_transform_transaction_fixture(fresh_db)
+    before = _transform_transaction_objects(fresh_db)
+    original_execute = fresh_db.execute
+
+    def failing_execute(sql, parameters=None):
+        if sql.lstrip().startswith("CREATE TRIGGER"):
+            raise RuntimeError("trigger restore failed")
+        return original_execute(sql, parameters)
+
+    monkeypatch.setattr(fresh_db, "execute", failing_execute)
+    with fresh_db.atomic():
+        fresh_db.execute(
+            'INSERT INTO "parent""table" VALUES (?, ?, ?)',
+            [2, "y", "outer"],
+        )
+        with pytest.raises(RuntimeError, match="trigger restore failed"):
+            fresh_db.table('parent"table').transform(
+                types={"payload": str}, transaction=True
+            )
+        fresh_db.execute(
+            'INSERT INTO "parent""table" VALUES (?, ?, ?)',
+            [3, "z", "after"],
+        )
+
+    after = _transform_transaction_objects(fresh_db)
+    assert after["schema"] == before["schema"]
+    assert after["index"] == before["index"]
+    assert after["trigger"] == before["trigger"]
+    assert after["child_schema"] == before["child_schema"]
+    assert after["child_rows"] == before["child_rows"]
+    assert after["parent_rows"] == [
+        (1, "x", "baseline"),
+        (2, "y", "outer"),
+        (3, "z", "after"),
+    ]
+    assert fresh_db.execute("PRAGMA foreign_keys").fetchone()[0]
+
+
+def test_transform_transaction_mode_with_destructive_inbound_foreign_key(fresh_db):
+    fresh_db.execute("PRAGMA foreign_keys=ON")
+    fresh_db.executescript("""
+        CREATE TABLE authors (id INTEGER PRIMARY KEY, name TEXT);
+        CREATE TABLE books (
+            id INTEGER PRIMARY KEY,
+            author_id INTEGER REFERENCES authors(id) ON DELETE CASCADE
+        );
+        INSERT INTO authors VALUES (1, 'Ursula');
+        INSERT INTO books VALUES (1, 1);
+        """)
+    child_schema = fresh_db.execute(
+        "SELECT sql FROM sqlite_master WHERE name = 'books'"
+    ).fetchone()[0]
+
+    with fresh_db.atomic():
+        fresh_db.table("authors").transform(
+            rename={"name": "full_name"}, transaction=True
+        )
+        assert fresh_db.execute("PRAGMA foreign_keys").fetchone()[0]
+
+    assert list(fresh_db.table("books").rows) == [{"id": 1, "author_id": 1}]
+    assert (
+        fresh_db.execute(
+            "SELECT sql FROM sqlite_master WHERE name = 'books'"
+        ).fetchone()[0]
+        == child_schema
+    )
+    assert fresh_db.execute("PRAGMA foreign_keys").fetchone()[0]
+    assert fresh_db.execute("PRAGMA foreign_key_check").fetchall() == []

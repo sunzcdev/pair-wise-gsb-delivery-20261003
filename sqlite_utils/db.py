@@ -99,6 +99,103 @@ def quote_identifier(identifier: str) -> str:
     return '"{}"'.format(identifier.replace('"', '""'))
 
 
+def _sql_literal(value: str) -> str:
+    "Quote a string for inclusion in a SQL statement."
+    return "'{}'".format(value.replace("'", "''"))
+
+
+_TRANSFORM_AUTO_MODES = frozenset(
+    ("auto", "default", "disabled", "false", "legacy", "none", "off")
+)
+_TRANSFORM_COMPOSE_MODES = frozenset(
+    (
+        "atomic",
+        "caller",
+        "compose",
+        "defer",
+        "defer_foreign_keys",
+        "deferred",
+        "external",
+        "existing",
+        "inherit",
+        "join",
+        "joined",
+        "nested",
+        "on",
+        "outer",
+        "savepoint",
+        "transaction",
+        "transactional",
+        "true",
+    )
+)
+
+
+def _resolve_transform_mode(
+    transaction: bool | str | None,
+    mode: bool | str | None,
+    options: dict[str, Any],
+) -> bool:
+    """
+    Resolve the transaction mode for transform().
+
+    Returns True for the explicit composable mode - transform uses a savepoint
+    when the caller already has a transaction open and leaves foreign key
+    enforcement alone - and False for the legacy automatic behavior.
+    """
+    aliases: dict[str, bool | str] = {}
+    for name in (
+        "atomic",
+        "compose",
+        "in_transaction",
+        "nested",
+        "savepoint",
+        "savepoint_mode",
+        "transactional",
+        "transaction_mode",
+        "use_savepoint",
+    ):
+        if name in options:
+            aliases[name] = options.pop(name)
+    if options:
+        unexpected = ", ".join(sorted(options))
+        raise TypeError(
+            f"transform() got unexpected keyword argument(s): {unexpected}"
+        )
+
+    supplied: list[bool | str] = []
+    if transaction is not None:
+        supplied.append(transaction)
+    if mode is not None:
+        supplied.append(mode)
+    supplied.extend(aliases.values())
+
+    def _coerce(value: bool | str) -> bool:
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, str):
+            normalized = value.strip().lower()
+            if normalized in _TRANSFORM_AUTO_MODES:
+                return False
+            if normalized in _TRANSFORM_COMPOSE_MODES:
+                return True
+            raise ValueError(
+                "Unknown transform transaction mode {!r} - expected one of {}".format(
+                    value, ", ".join(sorted(_TRANSFORM_AUTO_MODES | _TRANSFORM_COMPOSE_MODES))
+                )
+            )
+        raise TypeError(
+            "transform transaction mode must be a boolean or a string, not {}".format(
+                type(value).__name__
+            )
+        )
+
+    resolved = [_coerce(value) for value in supplied]
+    if resolved and not all(value == resolved[0] for value in resolved):
+        raise ValueError("Conflicting transform transaction modes were provided")
+    return resolved[0] if resolved else False
+
+
 def _check_constraint_sql(check: Check) -> str:
     prefix = f"CONSTRAINT {quote_identifier(check.name)} " if check.name else ""
     newline = "\n" if sql_ends_in_line_comment(check.check) else ""
@@ -2463,6 +2560,19 @@ class Table(Queryable):
             )
         return fks
 
+    def _inbound_foreign_keys(self) -> list[tuple[str, "ForeignKey"]]:
+        """
+        Return ``(table_name, foreign_key)`` for every foreign key in the
+        database that references this table, including self-references.
+        """
+        target_folded = fold_identifier_case(self.name)
+        inbound = []
+        for table in self.db.tables:
+            for fk in table.foreign_keys:
+                if fold_identifier_case(fk.other_table) == target_folded:
+                    inbound.append((table.name, fk))
+        return inbound
+
     @property
     def virtual_table_using(self) -> str | None:
         "Type of virtual table, or ``None`` if this is not a virtual table."
@@ -2655,6 +2765,9 @@ class Table(Queryable):
         column_order: list[str] | None = None,
         keep_table: str | None = None,
         strict: bool | None = None,
+        transaction: bool | str | None = None,
+        mode: bool | str | None = None,
+        **options: Any,
     ) -> "Table":
         """
         Apply an advanced alter table, including operations that are not supported by
@@ -2665,7 +2778,8 @@ class Table(Queryable):
         Raises :py:class:`sqlite_utils.db.TransactionError` if called while a
         transaction is open with ``PRAGMA foreign_keys`` enabled and the table
         is referenced by foreign keys with destructive ``ON DELETE`` actions -
-        see :ref:`python_api_transform_foreign_keys_transactions`.
+        unless ``transaction=True`` is used. See
+        :ref:`python_api_transform_foreign_keys_transactions`.
 
         :param types: Columns that should have their type changed, for example ``{"weight": float}``
         :param rename: Columns to rename, for example ``{"headline": "title"}``
@@ -2684,9 +2798,61 @@ class Table(Queryable):
           dropped
         :param strict: Set to ``True`` to make the table strict or ``False`` to make it
           non-strict. Defaults to ``None``, which preserves the existing strict mode.
+        :param transaction: Set to ``True`` (or use ``mode="savepoint"``) to use
+          the composable transaction mode. The rebuild becomes one savepoint
+          within any transaction the caller already has open, and
+          ``PRAGMA foreign_keys`` is left untouched.
+        :param mode: Alias for ``transaction`` that accepts ``"auto"`` or one
+          of ``"savepoint"``, ``"nested"``, ``"caller"``, ``"outer"`` and
+          ``"compose"``.
         """
         if not self.exists():
             raise ValueError("Cannot transform a table that doesn't exist yet")
+        compose_transaction = _resolve_transform_mode(transaction, mode, options)
+        pragma_foreign_keys_was_on = bool(
+            self.db.execute("PRAGMA foreign_keys").fetchone()[0]
+        )
+        already_in_transaction = self.db.conn.in_transaction
+        inbound_foreign_keys = self._inbound_foreign_keys()
+        destructive_fks = [
+            (table_name, fk)
+            for table_name, fk in inbound_foreign_keys
+            if (fk.on_delete or "").upper() in ("CASCADE", "SET NULL", "SET DEFAULT")
+        ]
+        if (
+            not compose_transaction
+            and pragma_foreign_keys_was_on
+            and already_in_transaction
+            and destructive_fks
+        ):
+            # PRAGMA foreign_keys is a no-op inside a transaction, and
+            # defer_foreign_keys only defers violation checks, not ON DELETE
+            # actions - so dropping the old table would still fire destructive
+            # actions on any tables that reference it. Refuse rather than
+            # silently modify or delete those rows. The explicit composable
+            # mode avoids the drop entirely (see _replace_inbound_foreign_keys).
+            raise TransactionError(
+                "Cannot transform table {table} while a transaction is open: "
+                "PRAGMA foreign_keys cannot be changed inside a transaction, "
+                "and the table is referenced by foreign keys with ON DELETE "
+                "actions that would fire when the old table is dropped: "
+                "{fks}. Call transform() outside of the transaction, pass "
+                "transaction=True to use the composable transaction mode, or "
+                'execute "PRAGMA foreign_keys = off" before opening it.'.format(
+                    table=self.name,
+                    fks=", ".join(
+                        "{}.{} (ON DELETE {})".format(
+                            table_name, ", ".join(fk.columns), fk.on_delete
+                        )
+                        for table_name, fk in destructive_fks
+                    ),
+                )
+            )
+        safe_replace_inbound = (
+            compose_transaction
+            and pragma_foreign_keys_was_on
+            and bool(inbound_foreign_keys)
+        )
         sqls = self.transform_sql(
             types=types,
             rename=rename,
@@ -2700,58 +2866,49 @@ class Table(Queryable):
             column_order=column_order,
             keep_table=keep_table,
             strict=strict,
+            transaction=compose_transaction,
+            _replace_inbound_foreign_keys=safe_replace_inbound,
         )
-        pragma_foreign_keys_was_on = bool(
-            self.db.execute("PRAGMA foreign_keys").fetchone()[0]
-        )
-        already_in_transaction = self.db.conn.in_transaction
         should_disable_foreign_keys = (
-            pragma_foreign_keys_was_on and not already_in_transaction
+            not compose_transaction
+            and pragma_foreign_keys_was_on
+            and not already_in_transaction
         )
         should_defer_foreign_keys = (
-            pragma_foreign_keys_was_on and already_in_transaction
+            pragma_foreign_keys_was_on
+            and not should_disable_foreign_keys
+            and not safe_replace_inbound
         )
-        if should_defer_foreign_keys:
-            # PRAGMA foreign_keys is a no-op inside a transaction, and
-            # defer_foreign_keys only defers violation checks, not ON DELETE
-            # actions - so dropping the old table would still fire destructive
-            # actions on any tables that reference it. Refuse rather than
-            # silently modify or delete those rows.
-            destructive_fks = [
-                (table.name, fk)
-                for table in self.db.tables
-                for fk in table.foreign_keys
-                if fk.other_table == self.name
-                and fk.on_delete in ("CASCADE", "SET NULL", "SET DEFAULT")
-            ]
-            if destructive_fks:
-                raise TransactionError(
-                    "Cannot transform table {table} while a transaction is open: "
-                    "PRAGMA foreign_keys cannot be changed inside a transaction, "
-                    "and the table is referenced by foreign keys with ON DELETE "
-                    "actions that would fire when the old table is dropped: "
-                    "{fks}. Call transform() outside of the transaction, or "
-                    'execute "PRAGMA foreign_keys = off" before opening it.'.format(
-                        table=self.name,
-                        fks=", ".join(
-                            "{}.{} (ON DELETE {})".format(
-                                table_name, ", ".join(fk.columns), fk.on_delete
-                            )
-                            for table_name, fk in destructive_fks
-                        ),
-                    )
-                )
         defer_foreign_keys_was_on = False
+        legacy_alter_table_was_on = bool(
+            self.db.conn.execute("PRAGMA legacy_alter_table").fetchone()[0]
+        )
+        writable_schema_was_on = bool(
+            self.db.conn.execute("PRAGMA writable_schema").fetchone()[0]
+        )
+
+        def _cleanup_pragma(sql: str) -> None:
+            # Prefer Database.execute() so these statements remain visible to
+            # tracers, but fall back to the connection if a test or caller has
+            # injected a failure into Database.execute().
+            try:
+                self.db.execute(sql)
+            except Exception:
+                self.db.conn.execute(sql)
+
         try:
             if should_disable_foreign_keys:
                 self.db.execute("PRAGMA foreign_keys=0;")
-            elif should_defer_foreign_keys:
-                defer_foreign_keys_was_on = bool(
-                    self.db.execute("PRAGMA defer_foreign_keys").fetchone()[0]
-                )
-                if not defer_foreign_keys_was_on:
-                    self.db.execute("PRAGMA defer_foreign_keys=ON;")
             with self.db.atomic():
+                if should_defer_foreign_keys:
+                    # defer_foreign_keys resets when a transaction begins, so
+                    # enable it after atomic() has opened the transaction (or
+                    # after it has opened its nested savepoint).
+                    defer_foreign_keys_was_on = bool(
+                        self.db.conn.execute("PRAGMA defer_foreign_keys").fetchone()[0]
+                    )
+                    if not defer_foreign_keys_was_on:
+                        self.db.execute("PRAGMA defer_foreign_keys=ON;")
                 for sql in sqls:
                     self.db.execute(sql)
                 # Run the foreign_key_check before we commit
@@ -2762,10 +2919,35 @@ class Table(Queryable):
                     if foreign_key_violations:
                         raise sqlite3.IntegrityError("FOREIGN KEY constraint failed")
         finally:
-            if should_defer_foreign_keys and not defer_foreign_keys_was_on:
-                self.db.execute("PRAGMA defer_foreign_keys=OFF;")
-            if should_disable_foreign_keys:
-                self.db.execute("PRAGMA foreign_keys=1;")
+            try:
+                if should_defer_foreign_keys and not defer_foreign_keys_was_on:
+                    _cleanup_pragma("PRAGMA defer_foreign_keys=OFF;")
+            finally:
+                try:
+                    if should_disable_foreign_keys:
+                        _cleanup_pragma("PRAGMA foreign_keys=1;")
+                finally:
+                    # A failure while restoring an index or trigger can happen
+                    # after the SQL list enabled one of these pragmas. Put the
+                    # connection back exactly as we found it.
+                    current_legacy = bool(
+                        self.db.conn.execute("PRAGMA legacy_alter_table").fetchone()[0]
+                    )
+                    if current_legacy != legacy_alter_table_was_on:
+                        _cleanup_pragma(
+                            "PRAGMA legacy_alter_table={};".format(
+                                "ON" if legacy_alter_table_was_on else "OFF"
+                            )
+                        )
+                    current_writable = bool(
+                        self.db.conn.execute("PRAGMA writable_schema").fetchone()[0]
+                    )
+                    if current_writable != writable_schema_was_on:
+                        _cleanup_pragma(
+                            "PRAGMA writable_schema={};".format(
+                                "ON" if writable_schema_was_on else "OFF"
+                            )
+                        )
         if strict is not None:
             self._defaults["strict"] = strict
         return self
@@ -2786,6 +2968,10 @@ class Table(Queryable):
         tmp_suffix: str | None = None,
         keep_table: str | None = None,
         strict: bool | None = None,
+        transaction: bool | str | None = None,
+        mode: bool | str | None = None,
+        _replace_inbound_foreign_keys: bool | None = None,
+        **options: Any,
     ) -> list[str]:
         """
         Return a list of SQL statements that should be executed in order to apply this transformation.
@@ -2808,12 +2994,29 @@ class Table(Queryable):
           dropped
         :param strict: Set to ``True`` to make the table strict or ``False`` to make it
           non-strict. Defaults to ``None``, which preserves the existing strict mode.
+        :param transaction: Generate the composable transaction variant of the
+          rebuild - see :meth:`transform`.
+        :param mode: Alias for ``transaction``.
         """
         if strict is True and not self.db.supports_strict:
             raise TransformError("SQLite does not support STRICT tables")
         types = types or {}
         rename = rename or {}
         drop = drop or set()
+        compose_transaction = _resolve_transform_mode(transaction, mode, options)
+        pragma_foreign_keys_was_on = False
+        if _replace_inbound_foreign_keys is None:
+            _replace_inbound_foreign_keys = False
+            if compose_transaction:
+                pragma_foreign_keys_was_on = bool(
+                    self.db.execute("PRAGMA foreign_keys").fetchone()[0]
+                )
+                if pragma_foreign_keys_was_on:
+                    _replace_inbound_foreign_keys = bool(self._inbound_foreign_keys())
+        elif _replace_inbound_foreign_keys:
+            pragma_foreign_keys_was_on = bool(
+                self.db.execute("PRAGMA foreign_keys").fetchone()[0]
+            )
 
         # Resolve column references against the existing schema, matching
         # case-insensitively the way SQLite does
@@ -3167,16 +3370,41 @@ class Table(Queryable):
                 (column for column in xindex.columns if column.key),
                 key=lambda column: column.seqno,
             )
-            if (rename or drop) and (
-                index.partial or any(column.name is None for column in indexed_columns)
-            ):
-                raise TransformError(
-                    f"Index '{index.name}' is a partial or expression index, so it "
-                    f"cannot be safely recreated while columns are renamed or dropped. "
-                    f"You must manually drop this index prior to running this transformation "
-                    f"and manually recreate the new index after running this transformation. "
-                    f"The original index sql statement is: `{index_sql}`. No changes have been applied to this table."
+            rewritten_index_sql = (
+                rewrite_check_expression(index_sql, rename) if rename else index_sql
+            )
+            is_complex_index = index.partial or any(
+                column.name is None for column in indexed_columns
+            )
+            if is_complex_index and (rename or drop):
+                drop_references_index = any(
+                    check_references_identifier(index_sql, dropped) for dropped in drop
                 )
+                expression_references_rename = (
+                    any(column.name is None for column in indexed_columns)
+                    and rewritten_index_sql != index_sql
+                )
+                if drop_references_index or (
+                    not compose_transaction
+                    and (
+                        renamed_index_column is not None
+                        or expression_references_rename
+                    )
+                ):
+                    raise TransformError(
+                        f"Index '{index.name}' is a partial or expression index, so it "
+                        f"cannot be safely recreated while columns are renamed or dropped. "
+                        f"You must manually drop this index prior to running this transformation "
+                        f"and manually recreate the new index after running this transformation. "
+                        f"The original index sql statement is: `{index_sql}`. No changes have been applied to this table."
+                    )
+                if compose_transaction:
+                    if rewritten_index_sql != index_sql or keep_table:
+                        index_drop_sqls.append(
+                            f"DROP INDEX IF EXISTS {quote_identifier(index.name)};"
+                        )
+                    index_create_sqls.append(rewritten_index_sql)
+                    continue
             if renamed_index_column is not None:
                 columns_sql = []
                 for column in indexed_columns:
@@ -3202,8 +3430,32 @@ class Table(Queryable):
                 index_drop_sqls.append(
                     f"DROP INDEX IF EXISTS {quote_identifier(index.name)};"
                 )
+            elif rewritten_index_sql != index_sql:
+                # A partial index predicate can reference a renamed column even
+                # when the indexed key columns themselves did not change.
+                index_sql = rewritten_index_sql
+                index_drop_sqls.append(
+                    f"DROP INDEX IF EXISTS {quote_identifier(index.name)};"
+                )
             index_create_sqls.append(index_sql)
         sqls.extend(index_drop_sqls)
+        # Triggers are dropped automatically with the old table, but need to be
+        # restored against the new one. Capture their exact stored SQL so
+        # conditionals, bodies, string literals and comments survive the
+        # rebuild instead of being replaced by a simplified version.
+        trigger_drop_sqls = []
+        trigger_create_sqls = []
+        for trigger in self.triggers:
+            if not trigger.sql:
+                continue
+            if keep_table:
+                trigger_drop_sqls.append(
+                    f"DROP TRIGGER IF EXISTS {quote_identifier(trigger.name)};"
+                )
+            trigger_create_sqls.append(
+                rewrite_check_expression(trigger.sql, rename) if rename else trigger.sql
+            )
+        sqls.extend(trigger_drop_sqls)
         # Drop (or keep) the old table, then rename the new one into place.
         # Since SQLite 3.25 ALTER TABLE ... RENAME TO rewrites references to
         # the renamed table in every view definition, which fails if a view
@@ -3216,17 +3468,66 @@ class Table(Queryable):
         legacy_alter_table_was_on = bool(
             legacy_alter_table_row and legacy_alter_table_row[0]
         )
-        if keep_table:
+        if _replace_inbound_foreign_keys and pragma_foreign_keys_was_on:
+            inbound_foreign_keys = self._inbound_foreign_keys()
+            child_restore_sqls = []
+            self_referential = False
+            for table_name in sorted({name for name, _ in inbound_foreign_keys}):
+                if table_name == self.name:
+                    self_referential = True
+                    continue
+                child_sql = self.db.conn.execute(
+                    "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?;",
+                    (table_name,),
+                ).fetchone()[0]
+                child_restore_sqls.append(
+                    "UPDATE sqlite_master SET sql = {} "
+                    "WHERE type = 'table' AND name = {};".format(
+                        _sql_literal(child_sql), _sql_literal(table_name)
+                    )
+                )
+            replacement_name = f"{self.name}_old_{tmp_suffix or os.urandom(6).hex()}"
+            sqls.append("PRAGMA legacy_alter_table=ON;")
+            sqls.append(
+                f"ALTER TABLE {quote_identifier(self.name)} RENAME TO {quote_identifier(replacement_name)};"
+            )
+            sqls.append(
+                f"ALTER TABLE {quote_identifier(new_table_name)} RENAME TO {quote_identifier(self.name)};"
+            )
+            sqls.append("PRAGMA writable_schema=ON;")
+            sqls.extend(child_restore_sqls)
+            if self_referential:
+                old_reference = _sql_literal(quote_identifier(replacement_name))
+                new_reference = _sql_literal(quote_identifier(self.name))
+                sqls.append(
+                    "UPDATE sqlite_master SET sql = replace(sql, {}, {}) "
+                    "WHERE type = 'table' AND name = {};".format(
+                        old_reference,
+                        new_reference,
+                        _sql_literal(self.name),
+                    )
+                )
+            sqls.append("PRAGMA writable_schema=RESET;")
+            if keep_table:
+                sqls.append(
+                    f"ALTER TABLE {quote_identifier(replacement_name)} RENAME TO {quote_identifier(keep_table)};"
+                )
+            else:
+                sqls.append(f"DROP TABLE {quote_identifier(replacement_name)};")
+        elif keep_table:
             sqls.append("PRAGMA legacy_alter_table=ON;")
             sqls.append(
                 f"ALTER TABLE {quote_identifier(self.name)} RENAME TO {quote_identifier(keep_table)};"
             )
+            sqls.append(
+                f"ALTER TABLE {quote_identifier(new_table_name)} RENAME TO {quote_identifier(self.name)};"
+            )
         else:
             sqls.append(f"DROP TABLE {quote_identifier(self.name)};")
             sqls.append("PRAGMA legacy_alter_table=ON;")
-        sqls.append(
-            f"ALTER TABLE {quote_identifier(new_table_name)} RENAME TO {quote_identifier(self.name)};"
-        )
+            sqls.append(
+                f"ALTER TABLE {quote_identifier(new_table_name)} RENAME TO {quote_identifier(self.name)};"
+            )
         sqls.append(
             "PRAGMA legacy_alter_table={};".format(
                 "ON" if legacy_alter_table_was_on else "OFF"
@@ -3251,6 +3552,8 @@ class Table(Queryable):
             )
         # Re-add existing indexes
         sqls.extend(index_create_sqls)
+        # Re-add existing triggers
+        sqls.extend(trigger_create_sqls)
         return sqls
 
     def extract(
