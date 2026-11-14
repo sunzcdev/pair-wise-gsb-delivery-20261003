@@ -1,6 +1,21 @@
 w3lib release notes
 ===================
 
+2.7.0 (unreleased)
+------------------
+
+New features:
+
+- Added :mod:`w3lib.robots`, with :func:`~w3lib.robots.robots_directives`,
+  which combines the ``robots`` meta tags of a page and the
+  ``X-Robots-Tag`` response headers into the rules that apply to a given
+  crawler. Generic rules and the crawler-specific rules apply together while
+  rules named after other crawlers are ignored, ``all`` and ``none``
+  shorthands are expanded, the strictest declaration of every directive
+  family wins, and unrecognized directives are reported as diagnostics
+  without being interpreted. Meta tags written inside comments, ``<script>``
+  elements or attribute text are not treated as declarations.
+
 2.6.0 (2026-11-05)
 ------------------
 

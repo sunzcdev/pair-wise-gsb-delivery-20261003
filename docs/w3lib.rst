@@ -21,6 +21,12 @@ w3lib Package
 .. automodule:: w3lib.http
     :members:
 
+:mod:`~w3lib.robots` Module
+---------------------------
+
+.. automodule:: w3lib.robots
+    :members:
+
 :mod:`~w3lib.url` Module
 ------------------------
 
