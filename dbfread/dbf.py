@@ -13,7 +13,7 @@ from .field_parser import FieldParser
 from .memo import find_memofile, open_memofile, FakeMemoFile
 from .codepages import guess_encoding
 from .dbversions import get_dbversion_string
-from .exceptions import DBFNotFound, MissingMemoFile
+from .exceptions import DBFNotFound, MissingMemoFile, MemoError
 
 _py_version = (sys.version_info.major, sys.version_info.minor)
 _py_impl = platform.python_implementation()
@@ -92,7 +92,8 @@ class DBF(object):
                  load=False,
                  raw=False,
                  ignore_missing_memofile=False,
-                 char_decode_errors='strict'):
+                 char_decode_errors='strict',
+                 strict_memo=False):
 
         self.encoding = encoding
         self.ignorecase = ignorecase
@@ -101,6 +102,7 @@ class DBF(object):
         self.raw = raw
         self.ignore_missing_memofile = ignore_missing_memofile
         self.char_decode_errors = char_decode_errors
+        self.strict_memo = strict_memo
 
         if recfactory is None:
             self.recfactory = lambda items: items
@@ -251,7 +253,8 @@ class DBF(object):
 
     def _open_memofile(self):
         if self.memofilename and not self.raw:
-            return open_memofile(self.memofilename, self.header.dbversion)
+            return open_memofile(self.memofilename, self.header.dbversion,
+                                 strict=self.strict_memo)
         else:
             return FakeMemoFile(self.memofilename)
 
@@ -315,14 +318,29 @@ class DBF(object):
             skip_record = self._skip_record
             read = infile.read
 
+            # 1-based number of the current record, used to give memo
+            # errors a context. Counts all records, including deleted
+            # ones.
+            record_number = 0
+
             while True:
                 sep = read(1)
 
+                if sep in (b' ', b'*'):
+                    record_number += 1
+
                 if sep == record_type:
-                    items = [
-                        (field.name, parse(field, read(field.length)))
-                        for field in self.fields
-                    ]
+                    try:
+                        items = [
+                            (field.name, parse(field, read(field.length)))
+                            for field in self.fields
+                        ]
+                    except MemoError as error:
+                        # Attach the record number so the error can be
+                        # traced back to the offending DBF record.
+                        if error.record is None:
+                            error.record = record_number
+                        raise
                     yield self.recfactory(items)
 
                 elif sep in (b'\x1a', b''):

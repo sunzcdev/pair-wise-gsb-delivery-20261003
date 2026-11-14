@@ -70,6 +70,16 @@ ignore_missing_memofile=False
   ``ignore_missing_memofile=True``. All memo fields will then be
   returned as ``None``, so you at least get the rest of the data.
 
+strict_memo=False
+  If ``True``, memo block references are checked strictly while
+  reading. Out of range block numbers, corrupt block headers and
+  truncated memo data raise ``MemoBlockOutOfRange``,
+  ``MemoHeaderCorrupt`` and ``MemoTruncated`` respectively (all
+  subclasses of ``MemoError``). The exceptions carry ``record``,
+  ``field`` and ``block`` attributes identifying the DBF record and
+  field the bad reference came from. The default ``False`` keeps the
+  historic, lenient behaviour.
+
 raw=False
   Returns all data values as byte strings. This can be used for
   debugging or for doing your own decoding.

@@ -141,9 +141,29 @@ exception. If you still want the rest of the data you can pass
 returned as ``None``, as would be the case if there was no memo.
 
 dbfread has full support for Visual FoxPro (``.FPT``) and dBase III
-(``.DBT``) memo files. It reads dBase IV (also ``.DBT``) memo files,
-but only if they use the default block size of 512 bytes. (This will
-be fixed if I can find more files to study.)
+(``.DBT``) memo files. It also reads dBase IV (also ``.DBT``) memo
+files, using the block size stored in the file header.
+
+By default memo references are read leniently, the way older versions
+of dbfread did. If you pass ``strict_memo=True`` the block numbers
+found in the DBF file are checked before they are followed, and a
+specific exception is raised if something is wrong:
+
+* ``MemoBlockOutOfRange`` -- the block number points outside the memo
+  file.
+* ``MemoHeaderCorrupt`` -- the block header is damaged or contains
+  invalid values.
+* ``MemoTruncated`` -- the memo data ends before the declared length
+  (or, for dBase III, before the terminator).
+
+An empty reference (block number 0) is not an error and returns
+``None`` in both modes. All three exceptions are subclasses of
+``MemoError`` (which again subclasses ``IOError``) and carry
+``record``, ``field`` and ``block`` attributes so the error can be
+traced back to the DBF record and field it came from. In strict mode
+the memo length stored in the block header (Visual FoxPro and dBase
+IV) is authoritative, so binary memos are never cut short by
+terminator bytes.
 
 
 Record Factories

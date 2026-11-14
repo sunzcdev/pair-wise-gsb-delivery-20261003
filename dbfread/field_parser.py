@@ -6,6 +6,7 @@ import datetime
 import struct
 from decimal import Decimal
 from .memo import BinaryMemo
+from .exceptions import MemoError
 
 PY2 = sys.version_info[0] == 2
 
@@ -77,7 +78,14 @@ class FieldParser:
         except KeyError:
             raise ValueError('Unknown field type: {!r}'.format(field.type))
         else:
-            return func(field, data)
+            try:
+                return func(field, data)
+            except MemoError as error:
+                # Attach the field name so the error can be traced
+                # back to the offending DBF field.
+                if error.field is None:
+                    error.field = field.name
+                raise
 
     def parse0(self, field, data):
         """Parse flags field and return as byte string"""
