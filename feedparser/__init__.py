@@ -26,6 +26,7 @@
 # POSSIBILITY OF SUCH DAMAGE."""
 
 from .api import parse
+from .content import ContentSelection, select_content
 from .datetimes import registerDateHandler
 from .exceptions import (
     CharacterEncodingOverride,
@@ -52,6 +53,8 @@ OPTIMISTIC_ENCODING_DETECTION = 1
 
 __all__ = (
     "parse",
+    "select_content",
+    "ContentSelection",
     "registerDateHandler",
     "FeedParserDict",
     "FeedparserError",
