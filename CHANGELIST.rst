@@ -1,6 +1,13 @@
 1.8.2
 ~~~~~
 
+- Add ``WARCWriter.write_request_response_pair_atomic()``: writes a
+  request/response pair all-or-nothing on positionable streams
+  (tell/seek/truncate), rolling back to the pre-write position if either
+  record fails so no unpaired record is left behind, validating matching
+  ``WARC-Date``/``WARC-Target-URI`` and ``WARC-Concurrent-To``, and never
+  modifying the caller's records. The original
+  ``write_request_response_pair()`` direct write is unchanged.
 - Replace unmaintained brotlipy with brotlicffi>=1.2.1.0 by @ato https://github.com/webrecorder/warcio/pull/211
 - Add Content-Encoding: x-gzip as an alias for gzip by @sammist2 in https://github.com/webrecorder/warcio/pull/210
 

@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 
 from warcio.statusandheaders import StatusAndHeaders
-from warcio.warcwriter import BufferWARCWriter, GzippingWrapper
+from warcio.warcwriter import BufferWARCWriter, GzippingWrapper, WARCWriter
 from warcio.recordbuilder import RecordBuilder
 from warcio.recordloader import ArcWarcRecordLoader
 from warcio.archiveiterator import ArchiveIterator
@@ -36,6 +36,67 @@ class FixedTestRecordBuilder(FixedTestRecordMixin, RecordBuilder):
 
 class FixedTestWARCWriter(FixedTestRecordMixin, BufferWARCWriter):
     pass
+
+class FixedTestFileWARCWriter(FixedTestRecordMixin, WARCWriter):
+    pass
+
+
+# ============================================================================
+class FailingBytesIO(BytesIO):
+    """ Positionable stream that raises IOError once `fail_after` total bytes
+    have been written to it, keeping the partial write that precedes it, the
+    way a real file that dies mid-write would. """
+
+    def __init__(self, initial=b'', fail_after=None):
+        super(FailingBytesIO, self).__init__(initial)
+        # start at the end, as if the stream already held `initial`
+        self.seek(0, 2)
+        self.bytes_written = len(initial)
+        self.fail_after = fail_after
+
+    def write(self, buff):
+        if self.fail_after is not None:
+            room = self.fail_after - self.bytes_written
+            if len(buff) > room:
+                if room > 0:
+                    written = super(FailingBytesIO, self).write(buff[:room])
+                    self.bytes_written += written
+                raise IOError('simulated write failure')
+
+        written = super(FailingBytesIO, self).write(buff)
+        self.bytes_written += written
+        return written
+
+
+class WriteOnlyStream(object):
+    """ Output with no tell/seek/truncate: not positionable. """
+    def __init__(self):
+        self.buffer = BytesIO()
+        self.written = 0
+
+    def write(self, buff):
+        written = self.buffer.write(buff)
+        self.written += written
+        return written
+
+    def flush(self):
+        pass
+
+
+class TellOnlyStream(WriteOnlyStream):
+    """ Has tell(), but still no seek()/truncate(): not positionable. """
+    def tell(self):
+        return self.written
+
+
+def _contents_of_file_writer(writer):
+    stream = writer.out
+    pos = stream.tell()
+    stream.seek(0)
+    buff = stream.read()
+    stream.seek(pos)
+    return buff
+
 
 # ============================================================================
 WARCINFO_RECORD = '\
@@ -843,4 +904,194 @@ Content-Length: {0}\r\n\
             assert new_rec.length == record.length
             assert new_rec.http_headers == record.http_headers
             assert new_rec.raw_stream.read() == payload
+
+    def test_atomic_pair_success(self, is_gzip, builder_factory):
+        writer = BufferWARCWriter(gzip=is_gzip)
+        builder = builder_factory(writer, builder_cls=RecordBuilder)
+
+        resp = sample_response(builder)
+        req = sample_request(builder)
+
+        # request does not carry the pairing headers up-front
+        assert req.rec_headers.get_header('WARC-Concurrent-To') is None
+
+        writer.write_request_response_pair_atomic(req, resp)
+
+        records = list(ArchiveIterator(writer.get_stream()))
+        assert len(records) == 2
+
+        resp_rec, req_rec = records
+
+        resp_id = resp_rec.rec_headers.get_header('WARC-Record-ID')
+        assert resp_id != req_rec.rec_headers.get_header('WARC-Record-ID')
+
+        assert req_rec.rec_headers.get_header('WARC-Concurrent-To') == resp_id
+        assert (req_rec.rec_headers.get_header('WARC-Target-URI') ==
+                resp_rec.rec_headers.get_header('WARC-Target-URI'))
+        assert (req_rec.rec_headers.get_header('WARC-Date') ==
+                resp_rec.rec_headers.get_header('WARC-Date'))
+
+        # caller's records are left alone by the metadata preparation
+        assert req.rec_headers.get_header('WARC-Concurrent-To') is None
+
+    def test_atomic_pair_leaves_legacy_write_unchanged(self):
+        writer = FixedTestWARCWriter(gzip=False)
+
+        resp = sample_response(writer)
+        req = sample_request(writer)
+
+        # the original direct-write path still mutates and writes both records
+        writer.write_request_response_pair(req, resp)
+
+        assert req.rec_headers.get_header('WARC-Concurrent-To') is not None
+
+        records = list(ArchiveIterator(writer.get_stream()))
+        assert [record.rec_type for record in records] == ['response', 'request']
+
+    def test_atomic_pair_appends_after_existing_record(self, is_gzip):
+        scratch = FixedTestFileWARCWriter(BytesIO(), gzip=is_gzip)
+        scratch.write_record(sample_response(scratch))
+        preexisting = _contents_of_file_writer(scratch)
+
+        stream = FailingBytesIO(initial=preexisting)
+        writer = FixedTestFileWARCWriter(stream, gzip=is_gzip)
+        builder = FixedTestRecordBuilder()
+
+        resp = sample_response(builder)
+        req = sample_request(builder)
+
+        writer.write_request_response_pair_atomic(req, resp)
+
+        stream.seek(0)
+        records = list(ArchiveIterator(stream))
+        assert [record.rec_type for record in records] == \
+            ['response', 'response', 'request']
+
+        # the earlier record's bytes are still the exact same prefix
+        assert stream.getvalue()[:len(preexisting)] == preexisting
+
+    def test_atomic_pair_accepts_already_paired_request(self, is_gzip):
+        writer = BufferWARCWriter(gzip=is_gzip)
+        builder = RecordBuilder()
+
+        resp = sample_response(builder)
+        req = sample_request(builder)
+
+        resp_id = resp.rec_headers.get_header('WARC-Record-ID')
+        req.rec_headers.add_header('WARC-Concurrent-To', resp_id)
+
+        # a request that already points at the response is accepted as-is
+        writer.write_request_response_pair_atomic(req, resp)
+
+        records = list(ArchiveIterator(writer.get_stream()))
+        assert [record.rec_type for record in records] == ['response', 'request']
+        assert records[1].rec_headers.get_header('WARC-Concurrent-To') == resp_id
+
+    def test_atomic_pair_rolls_back_on_second_record_failure(self, is_gzip):
+        builder = FixedTestFileWARCWriter(BytesIO(), gzip=is_gzip)
+
+        resp = sample_response(builder)
+        req = sample_request(builder)
+
+        # write the records standalone to learn their exact serialized size
+        scratch = FixedTestFileWARCWriter(BytesIO(), gzip=is_gzip)
+        scratch.write_record(sample_response(scratch))
+        preexisting = _contents_of_file_writer(scratch)
+
+        scratch = FixedTestFileWARCWriter(BytesIO(), gzip=is_gzip)
+        scratch.write_record(sample_request(scratch))
+        request_len = len(_contents_of_file_writer(scratch))
+
+        # fail in the middle of the second (request) record
+        fail_after = len(preexisting) + request_len // 2
+        stream = FailingBytesIO(initial=preexisting, fail_after=fail_after)
+
+        writer = FixedTestFileWARCWriter(stream, gzip=is_gzip)
+
+        with pytest.raises(IOError):
+            writer.write_request_response_pair_atomic(req, resp)
+
+        # back exactly where the pair started, no partial record left behind
+        assert stream.tell() == len(preexisting)
+        assert stream.getvalue() == preexisting
+
+        # the pre-existing complete record survives and still parses
+        stream.seek(0)
+        records = list(ArchiveIterator(stream))
+        assert len(records) == 1
+        assert records[0].rec_type == 'response'
+
+        # and the writer remains usable for a retry of the pair
+        retry = FailingBytesIO(initial=stream.getvalue())
+        retry_writer = FixedTestFileWARCWriter(retry, gzip=is_gzip)
+        retry_writer.write_request_response_pair_atomic(sample_request(retry_writer),
+                                                        sample_response(retry_writer))
+
+        retry.seek(0)
+        records = list(ArchiveIterator(retry))
+        assert [record.rec_type for record in records] == ['response',
+                                                           'response',
+                                                           'request']
+        assert records[1].rec_headers.get_header('WARC-Concurrent-To') is None
+        assert records[2].rec_headers.get_header('WARC-Concurrent-To') == \
+            records[1].rec_headers.get_header('WARC-Record-ID')
+
+    def test_atomic_pair_rolls_back_on_first_record_failure(self, is_gzip):
+        builder = FixedTestFileWARCWriter(BytesIO(), gzip=is_gzip)
+
+        resp = sample_response(builder)
+        req = sample_request(builder)
+
+        scratch = FixedTestFileWARCWriter(BytesIO(), gzip=is_gzip)
+        scratch.write_record(sample_response(scratch))
+        preexisting = _contents_of_file_writer(scratch)
+
+        # fail partway through the very first (response) record
+        stream = FailingBytesIO(initial=preexisting,
+                                fail_after=len(preexisting) + 10)
+        writer = FixedTestFileWARCWriter(stream, gzip=is_gzip)
+
+        with pytest.raises(IOError):
+            writer.write_request_response_pair_atomic(req, resp)
+
+        assert stream.getvalue() == preexisting
+
+    def test_atomic_pair_rejects_non_positionable_stream(self, is_gzip):
+        for stream_cls in (WriteOnlyStream, TellOnlyStream):
+            writer = WARCWriter(stream_cls(), gzip=is_gzip)
+            builder = RecordBuilder()
+
+            resp = sample_response(builder)
+            req = sample_request(builder)
+
+            # rejected before anything is written
+            with pytest.raises(ValueError):
+                writer.write_request_response_pair_atomic(req, resp)
+
+            assert writer.out.written == 0
+
+    @pytest.mark.parametrize('mutate', ['uri', 'date', 'concurrent'])
+    def test_atomic_pair_rejects_inconsistent_records(self, is_gzip, mutate):
+        writer = BufferWARCWriter(gzip=is_gzip)
+
+        resp = sample_response(writer)
+        req = sample_request(writer)
+
+        if mutate == 'uri':
+            req.rec_headers.replace_header('WARC-Target-URI',
+                                           'http://different.example.com/')
+        elif mutate == 'date':
+            req.rec_headers.replace_header('WARC-Date',
+                                           '1999-01-01T00:00:00Z')
+        else:
+            req.rec_headers.add_header('WARC-Concurrent-To',
+                                       '<urn:uuid:00000000-0000-0000-0000-000000000000>')
+
+        with pytest.raises(ValueError):
+            writer.write_request_response_pair_atomic(req, resp)
+
+        # nothing written, caller's records untouched
+        assert writer.get_contents() == b''
+        assert req.rec_headers.get_header('WARC-Concurrent-To') in (
+            None, '<urn:uuid:00000000-0000-0000-0000-000000000000>')
 
