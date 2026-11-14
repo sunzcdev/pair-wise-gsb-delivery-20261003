@@ -184,7 +184,10 @@ class Scheduler(BaseProcess):
             for task in task_list:
                 self._logger.debug('Enqueueing %s', task)
                 try:
-                    self.huey.enqueue(task)
+                    # Internal re-enqueue of an already-bound task instance
+                    # (e.g. a delayed retry or an eta task): do not re-acquire
+                    # its dedupe binding.
+                    self.huey.enqueue(task, _is_dedupe=True)
                 except Exception:
                     self._logger.exception('Error enqueueing %s.', task)
 

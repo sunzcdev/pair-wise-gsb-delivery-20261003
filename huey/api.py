@@ -1,5 +1,6 @@
 import copy
 import datetime
+import hashlib
 import inspect
 import itertools
 import logging
@@ -18,6 +19,7 @@ from huey.constants import EmptyData
 from huey.consumer import Consumer
 from huey.exceptions import CancelExecution
 from huey.exceptions import ConfigurationError
+from huey.exceptions import DedupeConflict
 from huey.exceptions import RateLimitExceeded
 from huey.exceptions import RETRYING_EXCEPTIONS
 from huey.exceptions import ResultTimeout
@@ -301,7 +303,7 @@ class Huey(object):
         message = self.serializer.deserialize(data)
         return self._registry.create_task(message)
 
-    def enqueue(self, task):
+    def enqueue(self, task, _is_dedupe=False):
         if isinstance(task, group):
             return ResultGroup([self.enqueue(t) for t in task.tasks])
         elif isinstance(task, chord):
@@ -311,18 +313,126 @@ class Huey(object):
         if task.expires:
             task.resolve_expires(self.utc)
 
+        # In-flight deduplication. A task submitted with a dedupe_key is merged
+        # into an existing, not-yet-finished task submitted with the same key
+        # (and identical parameter fingerprint). The binding lives until the
+        # task reaches a terminal state, so queued, scheduled and retrying
+        # submissions are all coalesced into a single in-flight task.
+        dedupe_binding = None
+        if task.dedupe_key is not None and not _is_dedupe:
+            existing = self._dedupe_acquire(task)
+            if existing is not None:
+                return self._dedupe_existing_handle(task, existing)
+            dedupe_binding = self._dedupe_storage_key(task.dedupe_key)
+
         self._emit(S.SIGNAL_ENQUEUED, task)
 
         if self._immediate:
-            self.execute(task)
+            try:
+                self.execute(task)
+            except BaseException:
+                # execute() normally releases the binding at a terminal state
+                # (including a handled failure). This covers the rare case of
+                # an exception (e.g. KeyboardInterrupt, or an error in a
+                # lifecycle hook) that escaped before that handling ran; the
+                # delete is a no-op when the binding is already gone.
+                if dedupe_binding is not None:
+                    self._dedupe_release_binding(dedupe_binding)
+                raise
         else:
-            self.storage.enqueue(self.serialize_task(task), task.priority)
+            # Serialize before the storage write. Both serialization and broker
+            # failures happen before the task is accepted, so the binding must
+            # be released rather than left behind as a permanent placeholder.
+            try:
+                message = self.serialize_task(task)
+                self.storage.enqueue(message, task.priority)
+            except Exception:
+                if dedupe_binding is not None:
+                    self._dedupe_release_binding(dedupe_binding)
+                raise
 
         if not self.results:
             return
 
         results = self._pipeline_results(task)
         return ResultGroup(results) if len(results) > 1 else results[0]
+
+    def _dedupe_storage_key(self, dedupe_key):
+        return '%s.dedupe.%s' % (self.name, dedupe_key)
+
+    def _dedupe_fingerprint(self, task):
+        # The fingerprint identifies the work represented by the task, i.e. the
+        # task type plus its arguments. Submission metadata such as the id, eta,
+        # retries, priority or expiration are deliberately excluded so that a
+        # retried/rescheduled run of the same work shares the fingerprint.
+        payload = (self._registry.task_to_string(type(task)),
+                   task.args, task.kwargs)
+        return hashlib.sha256(repr(payload).encode('utf-8')).hexdigest()
+
+    def _dedupe_acquire(self, task):
+        """
+        Atomically bind the dedupe key to this task, or return the binding of
+        the task already in-flight for that key. Returns None when the binding
+        was successfully acquired.
+        """
+        key = self._dedupe_storage_key(task.dedupe_key)
+        fingerprint = self._dedupe_fingerprint(task)
+        # Serialize the binding payload up-front so an unpicklable parameter
+        # raises before any storage state is created.
+        payload = self.serializer.serialize((task.id, fingerprint))
+
+        # put_if_empty() is atomic on every backend. The retry loop covers the
+        # narrow window where a terminal task's binding was deleted between the
+        # failed insertion and our read, so callers never observe a dangling
+        # placeholder.
+        for _ in range(5):
+            if self.storage.put_if_empty(key, payload):
+                return None
+            data = self.storage.peek_data(key)
+            if data is EmptyData:
+                continue  # Binding was released concurrently; try again.
+            existing_id, existing_fingerprint = self.serializer.deserialize(data)
+            if existing_fingerprint != fingerprint:
+                raise DedupeConflict(task.dedupe_key, existing_id, fingerprint,
+                                     existing_fingerprint)
+            return existing_id, existing_fingerprint
+        raise DedupeConflict(task.dedupe_key, None, fingerprint, None)
+
+    def _dedupe_existing_handle(self, task, existing):
+        # The same work is already in-flight: return a result handle pointing at
+        # the existing task instead of enqueueing a duplicate. A bare Task with
+        # the existing id is enough to build a result handle (and any pipeline),
+        # since result lookups are keyed solely by task id.
+        existing_task = Task(id=existing[0])
+        if not self.results:
+            return
+        results = self._pipeline_results(existing_task)
+        return ResultGroup(results) if len(results) > 1 else results[0]
+
+    def _dedupe_release(self, task):
+        if task.dedupe_key is None:
+            return False
+        key = self._dedupe_storage_key(task.dedupe_key)
+        # Only remove the binding when it still points at this task, so a
+        # re-submission that won a new slot after expiry is never disturbed.
+        data = self.storage.peek_data(key)
+        if data is EmptyData:
+            return False
+        try:
+            existing_id, _ = self.serializer.deserialize(data)
+        except Exception:
+            logger.exception('Unable to deserialize dedupe binding for key %s',
+                             task.dedupe_key)
+            return False
+        if existing_id != task.id:
+            return False
+        return self.storage.delete_data(key)
+
+    def _dedupe_release_binding(self, key):
+        try:
+            self.storage.delete_data(key)
+        except Exception:
+            logger.exception('Unable to release dedupe binding %s', key)
 
     def _enqueue_chord(self, chord_obj):
         cid = str(uuid.uuid4())
@@ -419,10 +529,14 @@ class Huey(object):
         elif self.is_revoked(task, timestamp, False):
             logger.warning('Task %s was revoked, not executing', task)
             self._emit(S.SIGNAL_REVOKED, task)
+            # Revocation is a terminal state for this task instance.
+            self._dedupe_release(task)
             self._abort_chord_member(task, SKIPPED)
         elif task.expires_resolved and task.expires_resolved < timestamp:
             logger.info('Task %s expired, not executing.', task)
             self._emit(S.SIGNAL_EXPIRED, task)
+            # Expiration is a terminal state for this task instance.
+            self._dedupe_release(task)
             self._abort_chord_member(task, SKIPPED)
         else:
             logger.info('Executing %s', task)
@@ -435,6 +549,9 @@ class Huey(object):
                 self._run_pre_execute(task)
             except CancelExecution:
                 self._emit(S.SIGNAL_CANCELED, task)
+                # Cancelled before execution: the task will not run, so this is
+                # a terminal state for the current instance.
+                self._dedupe_release(task)
                 self._abort_chord_member(task, SKIPPED)
                 return
 
@@ -495,6 +612,10 @@ class Huey(object):
         except KeyboardInterrupt:
             logger.warning('Received exit signal, %s did not finish.', task.id)
             self._emit(S.SIGNAL_INTERRUPTED, task)
+            # The task was interrupted before reaching a terminal state. The
+            # dedupe binding is intentionally retained: releasing it would let
+            # a new submission reuse a result that will never be produced. The
+            # task must be explicitly re-enqueued (see notify_interrupted_tasks).
             return
         except Exception as exc:
             logger.exception('Unhandled exception in task %s.', task.id)
@@ -519,6 +640,8 @@ class Huey(object):
                 self.enqueue(task.on_complete)
             if task.chord_config is not None:
                 self._check_chord(task.chord_config, task_value)
+            # The task reached a successful terminal state.
+            self._dedupe_release(task)
         else:
             final = not task.retries
             surface = final or (self.store_intermediate_errors and
@@ -537,6 +660,8 @@ class Huey(object):
                 self.enqueue(handler)
             if final:
                 self._abort_chord_member(task, error)
+                # Retries exhausted: the task reached a (failed) terminal state.
+                self._dedupe_release(task)
             else:
                 self._emit(S.SIGNAL_RETRYING, task)
                 self._requeue_task(task, self._get_timestamp(), retry_eta)
@@ -582,7 +707,9 @@ class Huey(object):
                 task.retry_delay *= task.retry_backoff
             self.add_schedule(task)
         else:
-            self.enqueue(task)
+            # Same task instance keeps its dedupe binding for the full retry
+            # chain, so the internal re-enqueue must not try to re-acquire it.
+            self.enqueue(task, _is_dedupe=True)
 
     def _run_pre_execute(self, task):
         for name, callback in self._pre_execute.items():
@@ -803,7 +930,8 @@ class Task(object):
     def __init__(self, args=None, kwargs=None, id=None, eta=None, retries=None,
                  retry_delay=None, priority=None, expires=None,
                  on_complete=None, on_error=None, expires_resolved=None,
-                 timeout=None, chord_config=None, retry_backoff=None):
+                 timeout=None, chord_config=None, retry_backoff=None,
+                 dedupe_key=None):
         self.name = type(self).__name__
         self.args = () if args is None else args
         self.kwargs = {} if kwargs is None else kwargs
@@ -822,6 +950,7 @@ class Task(object):
         self.timeout = timeout if timeout is not None else self.default_timeout
         self.chord_config = chord_config
         self._deadline = None
+        self.dedupe_key = dedupe_key
 
         self.on_complete = on_complete
         self.on_error = on_error
@@ -998,7 +1127,8 @@ class TaskWrapper(object):
 
     def schedule(self, args=None, kwargs=None, eta=None, delay=None,
                  priority=None, retries=None, retry_delay=None,
-                 retry_backoff=None, expires=None, timeout=None, id=None):
+                 retry_backoff=None, expires=None, timeout=None, id=None,
+                 dedupe_key=None):
         if eta is None and delay is None:
             if isinstance(args, (int, float)):
                 delay = args
@@ -1024,7 +1154,8 @@ class TaskWrapper(object):
             retry_backoff=retry_backoff,
             priority=priority,
             expires=expires,
-            timeout=timeout)
+            timeout=timeout,
+            dedupe_key=dedupe_key)
         return self.huey.enqueue(task)
 
     def _apply(self, it):
@@ -1057,7 +1188,8 @@ class TaskWrapper(object):
                                retry_backoff=kwargs.pop('retry_backoff', None),
                                priority=kwargs.pop('priority', None),
                                expires=kwargs.pop('expires', None),
-                               timeout=kwargs.pop('timeout', None))
+                               timeout=kwargs.pop('timeout', None),
+                               dedupe_key=kwargs.pop('dedupe_key', None))
 
 
 class TaskLock(object):
@@ -1298,7 +1430,8 @@ class Result(object):
             timeout=self.task.timeout,
             chord_config=self.task.chord_config,
             on_complete=on_complete,
-            on_error=on_error)
+            on_error=on_error,
+            dedupe_key=self.task.dedupe_key)
         return self.huey.enqueue(task)
 
     def reset(self):

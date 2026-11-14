@@ -4,6 +4,17 @@ class TaskLockedException(HueyException): pass
 class ResultTimeout(HueyException): pass
 class TaskTimeout(HueyException): pass
 
+class DedupeConflict(HueyException):
+    def __init__(self, dedupe_key, existing_id, fingerprint, existing_fingerprint):
+        self.dedupe_key = dedupe_key
+        self.existing_id = existing_id
+        self.fingerprint = fingerprint
+        self.existing_fingerprint = existing_fingerprint
+        super(DedupeConflict, self).__init__(
+            'A task with dedupe_key %r is already in-flight (%s) but was '
+            'submitted with a different parameter fingerprint.' % (
+                dedupe_key, existing_id))
+
 class RateLimitExceeded(HueyException):
     def __init__(self, key, delay, retry=True):
         self.key, self.delay, self.retry = key, delay, retry

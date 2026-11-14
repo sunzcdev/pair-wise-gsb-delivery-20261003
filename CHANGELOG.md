@@ -5,6 +5,15 @@ Changelog
 
 [View commits](https://github.com/coleifer/huey/compare/3.5.4...master)
 
+* Add optional in-flight task deduplication via a per-call `dedupe_key`.
+  Submissions sharing a key and parameter fingerprint while a task is queued,
+  scheduled or retrying are coalesced into a single in-flight task and return a
+  handle to its result; the binding is only released when the task reaches a
+  terminal state. A reused key with a different fingerprint raises
+  `DedupeConflict`. Serialization/enqueue failures and terminal states release
+  the binding, so no permanent placeholder is left behind. Plain enqueues
+  without a key are unchanged.
+
 ## 3.5.4
 
 * Fix possible hang if worker holding the stop flag was killed while holding

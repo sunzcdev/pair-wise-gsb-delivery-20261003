@@ -797,6 +797,15 @@ Huey object
             :py:meth:`~Huey.enqueue` directly when working with pipelines,
             groups, or chords.
 
+        .. note::
+            A task created with a ``dedupe_key`` (see
+            :ref:`in-flight-deduplication`) is coalesced with any still
+            in-flight task sharing the same key and parameter fingerprint:
+            instead of enqueueing a duplicate, ``enqueue`` returns a
+            :py:class:`Result` handle bound to the existing task. A reused key
+            with a different fingerprint raises
+            :py:class:`~huey.exceptions.DedupeConflict`.
+
     .. py:method:: revoke(task, revoke_until=None, revoke_once=False)
 
         .. seealso:: Use :py:meth:`Result.revoke` instead.
@@ -1187,7 +1196,7 @@ Huey object
         directly. The :py:meth:`Huey.task` and :py:meth:`Huey.periodic_task`
         decorators will create the appropriate TaskWrapper automatically.
 
-    .. py:method:: schedule(args=None, kwargs=None, eta=None, delay=None, priority=None, retries=None, retry_delay=None, retry_backoff=None, expires=None, timeout=None, id=None)
+    .. py:method:: schedule(args=None, kwargs=None, eta=None, delay=None, priority=None, retries=None, retry_delay=None, retry_backoff=None, expires=None, timeout=None, id=None, dedupe_key=None)
 
         :param tuple args: arguments for decorated function.
         :param dict kwargs: keyword arguments for decorated function.
@@ -1212,6 +1221,9 @@ Huey object
             cooperative timeout checking. See :ref:`cooperative-timeout` for
             example.
         :param id: assign the given ``id`` to the Task being scheduled.
+        :param str dedupe_key: optional in-flight deduplication key. When set,
+            enqueueing coalesces with an unfinished task sharing the same key
+            and parameter fingerprint. See :ref:`in-flight-deduplication`.
         :returns: a :py:class:`Result` handle for the task.
 
         Use the ``schedule`` method to schedule the execution of the queue task
@@ -1301,6 +1313,9 @@ Huey object
             ``gevent.Timeout``. When using with threads it is necessary to use
             cooperative timeout checking. See :ref:`cooperative-timeout` for
             example.
+        :param str dedupe_key: optional in-flight deduplication key. When set,
+            enqueueing coalesces with an unfinished task sharing the same key
+            and parameter fingerprint. See :ref:`in-flight-deduplication`.
         :returns: a :py:class:`Task` instance representing the execution of the
             task function with the given arguments.
 
@@ -1313,9 +1328,9 @@ Huey object
             The following keyword argument names are reserved and will be
             intercepted by Huey rather than passed to your task function:
             ``id``, ``eta``, ``delay``, ``retries``, ``retry_delay``,
-            ``retry_backoff``, ``priority``, ``expires``, and ``timeout``. If your task function has a parameter
-            with one of these names, rename the parameter or pass the value
-            positionally.
+            ``retry_backoff``, ``priority``, ``expires``, ``timeout``, and
+            ``dedupe_key``. If your task function has a parameter with one of
+            these names, rename the parameter or pass the value positionally.
 
         To illustrate the distinction, when you call a ``task()``-decorated
         function, behind-the-scenes, Huey is doing something like this:
@@ -2283,6 +2298,13 @@ Exceptions
 .. py:class:: TaskLockedException
 
     Raised by the consumer when a task lock cannot be acquired.
+
+.. py:class:: DedupeConflict(dedupe_key, existing_id, fingerprint, existing_fingerprint)
+
+    Raised when a task is enqueued with a ``dedupe_key`` that is already bound
+    to an in-flight task, but the new submission has a different parameter
+    fingerprint. The existing task is left untouched and no duplicate is
+    enqueued. See :ref:`in-flight-deduplication`.
 
 .. py:class:: ResultTimeout
 

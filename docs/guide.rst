@@ -900,6 +900,60 @@ Examples:
 
 See :py:meth:`Huey.lock_task` for API documentation.
 
+.. _in-flight-deduplication:
+
+In-flight task deduplication
+----------------------------
+
+Sometimes submitting the same unit of work twice while the first submission is
+still running should not produce two tasks - instead the second caller should
+receive a handle to the result of the work already in-flight. Huey supports
+this with an optional ``dedupe_key``:
+
+.. code-block:: python
+
+    @huey.task()
+    def process_partition(partition_id):
+        return do_expensive_work(partition_id)
+
+    # Both calls return a result handle bound to the *same* task, and only one
+    # message ever lands in the queue.
+    r1 = process_partition(42, dedupe_key='partition:42')
+    r2 = process_partition(42, dedupe_key='partition:42')
+    assert r1.id == r2.id
+
+A binding is created when the keyed task is enqueued and is held for the whole
+life of the task - while it is queued, while it waits in the schedule (an
+``eta``/``delay`` task or a delayed retry) and across every retry. The binding
+is only released once the task reaches a *terminal state*: successful
+completion, a failure after retries are exhausted, revocation, expiration, or a
+pre-execute cancellation. Until then, further submissions with the same key
+coalesce onto the existing task.
+
+A parameter *fingerprint* (task name plus positional and keyword arguments) is
+stored alongside the binding. A submission that reuses a key but carries a
+different fingerprint cannot safely share the existing result, so it raises
+:py:class:`~huey.exceptions.DedupeConflict` instead of enqueueing - the
+original task and its binding are left untouched:
+
+.. code-block:: python
+
+    process_partition(42, dedupe_key='partition:42')
+    process_partition(43, dedupe_key='partition:42')  # raises DedupeConflict
+
+The fingerprint deliberately excludes submission metadata such as ``eta``,
+priority, retries and expiration, so a retried or re-scheduled run of the same
+work keeps the same fingerprint.
+
+Bindings are stored using the atomic ``put_if_empty`` storage primitive, so
+deduplication is safe with multiple producers and consumers. If serialization
+or the broker enqueue fails before the task is accepted, the binding is
+released automatically and never becomes a permanent placeholder. Tasks
+submitted without a ``dedupe_key`` behave exactly as before.
+
+The key can also be passed to :py:meth:`TaskWrapper.schedule` or to the
+:py:meth:`TaskWrapper.s` signature builder (``dedupe_key=...``).
+
 .. _rate-limiting:
 
 Rate-Limiting
