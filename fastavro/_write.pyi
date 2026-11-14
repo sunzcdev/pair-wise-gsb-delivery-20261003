@@ -17,6 +17,7 @@ def writer(
     strict: bool = ...,
     strict_allow_default: bool = ...,
     disable_tuple_notation: bool = ...,
+    strict_append: bool = ...,
 ) -> None: ...
 
 class GenericWriter:
@@ -42,6 +43,7 @@ class Writer(GenericWriter):
         sync_marker: bytes = ...,
         compression_level: Optional[int] = ...,
         options: Dict[str, bool] = ...,
+        strict_append: bool = ...,
     ): ...
     def dump(self) -> None: ...
     def write(self, record: AvroMessage) -> None: ...

@@ -17,6 +17,7 @@ from warnings import warn
 
 from .const import NAMED_TYPES
 from .io.binary_encoder import BinaryEncoder
+from .io.binary_decoder import BinaryDecoder
 from .io.json_encoder import AvroJSONEncoder
 from .validation import _validate
 from .read import HEADER_SCHEMA, SYNC_SIZE, MAGIC, reader
@@ -449,6 +450,118 @@ else:
     BLOCK_WRITERS["lz4"] = lz4_write_block
 
 
+# Schema attributes that do not affect the binary encoding of data and are
+# therefore ignored when checking whether a schema is identical for the
+# purpose of appending. `__fastavro_parsed` and `__named_schemas` are private
+# markers added by parse_schema; `doc` and `aliases` are descriptive only.
+_NON_ENCODING_SCHEMA_KEYS = frozenset(
+    {"__fastavro_parsed", "__named_schemas", "doc", "aliases"}
+)
+
+
+def _encoding_identity(schema):
+    """Reduce a parsed schema to a canonical structural identity that captures
+    exactly what determines the binary encoding of appended records.
+
+    The comparison is structural: JSON object key order is irrelevant, the
+    `{"type": X}` and `"X"` forms are treated as equivalent, and descriptive
+    attributes (doc, aliases) are dropped. However, everything that influences
+    the encoded bytes must match exactly - field names, field order, field
+    defaults, union branch order, enum symbol order, logical types, and named
+    type references. This is intentionally stricter than reader/writer schema
+    resolution: a schema that is merely read-compatible is not identical for
+    append encoding.
+    """
+    if isinstance(schema, dict):
+        items = tuple(
+            sorted(
+                (key, _encoding_identity(value))
+                for key, value in schema.items()
+                if key not in _NON_ENCODING_SCHEMA_KEYS
+            )
+        )
+        if len(items) == 1 and items[0][0] == "type":
+            # {"type": "string"} is equivalent to the shorthand "string"
+            return items[0][1]
+        return ("schema", items)
+    if isinstance(schema, list):
+        # Union branch order matters for encoding
+        return ("union", tuple(_encoding_identity(s) for s in schema))
+    return schema
+
+
+def _check_strict_append_target(fo):
+    """Validate that `fo` is a usable target for a strict append.
+
+    Raises a ValueError with a specific message when the target is not
+    seekable, not readable, or empty. Nothing is written to `fo`.
+    """
+    if not fo.seekable():
+        raise ValueError(
+            "Cannot append to the avro file: the stream is not seekable. "
+            "Appending requires a seekable stream (for example a file opened "
+            "in 'a+' mode)"
+        )
+    if not fo.readable():
+        raise ValueError(
+            "Cannot append to the avro file: the stream is not readable. "
+            "When appending to an avro file you must use the 'a+' mode, not "
+            "just 'a'"
+        )
+    fo.seek(0, 2)
+    if fo.tell() == 0:
+        raise ValueError(
+            "Cannot append to the avro file: the file is empty and does not "
+            "contain an avro container header to append to"
+        )
+
+
+def _verify_intact_blocks(fo, sync_marker):
+    """Scan the data blocks of an avro container file and raise a ValueError
+    if the file does not end cleanly on a block boundary (for example because
+    the tail of the file was truncated).
+
+    `fo` must be positioned right after the container header. On success, `fo`
+    is left positioned at the end of the file. Nothing is written to `fo`.
+    """
+    decoder = BinaryDecoder(fo)
+    while True:
+        offset = fo.tell()
+        try:
+            decoder.read_long()  # number of records in the block
+            block_size = decoder.read_long()  # block size in bytes
+        except EOFError:
+            if fo.tell() == offset:
+                # Clean end of file exactly on a block boundary
+                return
+            raise ValueError(
+                "Cannot append to the avro file: the file appears to be "
+                "truncated (partial block header at the end of the file)"
+            )
+        if block_size < 0:
+            raise ValueError(
+                "Cannot append to the avro file: the file appears to be "
+                "corrupt (negative block size)"
+            )
+        block = fo.read(block_size)
+        if len(block) != block_size:
+            raise ValueError(
+                "Cannot append to the avro file: the file appears to be "
+                "truncated (the last block is incomplete)"
+            )
+        sync = fo.read(SYNC_SIZE)
+        if sync != sync_marker:
+            if len(sync) != SYNC_SIZE:
+                raise ValueError(
+                    "Cannot append to the avro file: the file appears to be "
+                    "truncated (missing sync marker at the end of the file)"
+                )
+            raise ValueError(
+                "Cannot append to the avro file: the file appears to be "
+                "corrupt (sync marker mismatch)"
+            )
+
+
 class GenericWriter(ABC):
     def __init__(self, schema, metadata=None, validator=None, options={}):
         self._named_schemas = {}
@@ -509,6 +622,7 @@ class Writer(GenericWriter):
         sync_marker: bytes = b"",
         compression_level: Optional[int] = None,
         options: Dict[str, bool] = {},
+        strict_append: bool = False,
     ):
         super().__init__(schema, metadata, validator, options)
 
@@ -522,16 +636,51 @@ class Writer(GenericWriter):
         self.sync_interval = sync_interval
         self.compression_level = compression_level
 
-        if _is_appendable(self.encoder._fo):
+        if strict_append:
+            # In strict append mode the target must be an existing, readable
+            # and seekable avro container file. All validation happens before
+            # anything is written to the file.
+            _check_strict_append_target(self.encoder._fo)
+            appendable = True
+        else:
+            appendable = _is_appendable(self.encoder._fo)
+
+        if appendable:
             # Seed to the beginning to read the header
             self.encoder._fo.seek(0)
             avro_reader = reader(self.encoder._fo)
             header = avro_reader._header
 
+            file_codec = avro_reader.metadata.get("avro.codec", "null")
+
+            if strict_append:
+                if codec != file_codec:
+                    raise ValueError(
+                        f"Cannot append to the avro file: the provided codec "
+                        f"{codec!r} does not match the codec {file_codec!r} "
+                        f"stored in the file header"
+                    )
+                if sync_marker and sync_marker != header["sync"]:
+                    raise ValueError(
+                        "Cannot append to the avro file: the provided sync "
+                        "marker does not match the sync marker stored in the "
+                        "file header"
+                    )
+                if schema is not None:
+                    provided_identity = _encoding_identity(parse_schema(schema, {}))
+                    file_identity = _encoding_identity(avro_reader.writer_schema)
+                    if provided_identity != file_identity:
+                        raise ValueError(
+                            "Cannot append to the avro file: the provided "
+                            "schema does not match the schema stored in the "
+                            "file header"
+                        )
+                _verify_intact_blocks(self.encoder._fo, header["sync"])
+
             self._named_schemas = {}
             self.schema = parse_schema(avro_reader.writer_schema, self._named_schemas)
 
-            codec = avro_reader.metadata.get("avro.codec", "null")
+            codec = file_codec
 
             self.sync_marker = header["sync"]
 
@@ -628,6 +777,7 @@ def writer(
     strict: bool = False,
     strict_allow_default: bool = False,
     disable_tuple_notation: bool = False,
+    strict_append: bool = False,
 ):
     """Write records to fo (stream) according to schema
 
@@ -664,6 +814,16 @@ def writer(
     disable_tuple_notation
         If set to True, tuples will not be treated as a special case. Therefore,
         using a tuple to indicate the type of a record will not work
+    strict_append
+        If set to True and the output stream is an existing avro file being
+        appended to, the provided schema, codec, and sync marker are checked
+        against the values stored in the file header and any conflict raises a
+        ValueError before anything is written to the file. The schema
+        comparison is a structural identity check of what determines the
+        binary encoding (JSON key order is irrelevant, but a schema that is
+        only read-compatible is rejected). A ValueError is also raised if the
+        target is empty, not readable, not seekable, or appears truncated.
+        This option only applies to the binary writer.
 
 
     Example::
@@ -717,7 +877,9 @@ def writer(
 
     Note: When appending, any schema provided will be ignored since the schema
     in the avro file will be re-used. Therefore it is convenient to just use
-    None as the schema.
+    None as the schema. If `strict_append` is set to True, a provided schema
+    is not ignored; instead it is checked against the schema stored in the
+    file and a mismatch raises a ValueError before anything is written.
     """
     # Sanity check that records is not a single dictionary (as that is a common
     # mistake and the exception that gets raised is not helpful)
@@ -756,6 +918,7 @@ def writer(
                 "strict_allow_default": strict_allow_default,
                 "disable_tuple_notation": disable_tuple_notation,
             },
+            strict_append=strict_append,
         )
 
     for record in records:
