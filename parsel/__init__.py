@@ -10,12 +10,24 @@ __all__ = [
     "AbsoluteXPathWarning",
     "Selector",
     "SelectorList",
+    "TableCell",
+    "TableDiagnostic",
+    "TableGrid",
+    "TableRowGroup",
     "css2xpath",
+    "parse_table",
     "xpathfuncs",
 ]
 
 from parsel import xpathfuncs
 from parsel.csstranslator import css2xpath
 from parsel.selector import AbsoluteXPathWarning, Selector, SelectorList
+from parsel.table import (
+    TableCell,
+    TableDiagnostic,
+    TableGrid,
+    TableRowGroup,
+    parse_table,
+)
 
 xpathfuncs.setup()

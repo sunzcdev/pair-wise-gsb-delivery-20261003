@@ -3,6 +3,16 @@
 History
 -------
 
+1.13.0 (unreleased)
+~~~~~~~~~~~~~~~~~~~
+
+* Added the new :mod:`parsel.table` module with the ``parse_table()``
+  function, which expands the ``rowspan`` and ``colspan`` attributes of an
+  HTML table into a rectangular grid. Every grid position keeps the identity
+  of its source cell, rows of nested tables are excluded, and issues found
+  in malformed tables (invalid spans, overlapping cells, missing cells) are
+  reported through diagnostics.
+
 1.12.1 (2026-09-28)
 ~~~~~~~~~~~~~~~~~~~
 

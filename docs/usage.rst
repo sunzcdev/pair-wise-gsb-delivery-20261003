@@ -626,6 +626,43 @@ Example removing an ad from a blog post:
     ['Content paragraph', '\n        \n    ', 'More content']
 
 
+Extracting tables
+-----------------
+
+The :func:`parsel.parse_table` function expands the ``rowspan`` and
+``colspan`` attributes of an HTML table into a rectangular grid where every
+position points to the source cell that covers it::
+
+    >>> from parsel import Selector, parse_table
+    >>> doc = """
+    ... <table>
+    ...   <tr><th>Name</th><th>Price</th></tr>
+    ...   <tr><td rowspan="2">Apple</td><td>1.0</td></tr>
+    ...   <tr><td>1.5</td></tr>
+    ... </table>
+    ... """
+    >>> grid = parse_table(Selector(text=doc).css("table"))
+    >>> grid.values()
+    [['Name', 'Price'], ['Apple', '1.0'], ['Apple', '1.5']]
+
+Positions covered by a spanning cell keep the identity of the source cell,
+so you can also use a placeholder instead of repeating its value::
+
+    >>> grid.values(repeat=False, placeholder="")
+    [['Name', 'Price'], ['Apple', '1.0'], ['', '1.5']]
+    >>> grid.rows[2][0] is grid.rows[1][0]  # same source cell
+    True
+    >>> grid.rows[2][0].row, grid.rows[2][0].col  # its origin coordinates
+    (1, 0)
+
+Only the direct row groups and rows of the selected table are processed;
+rows of nested tables are never included. Row groups are reported through
+``grid.groups`` and ``grid.header_rows``, and issues found in malformed
+tables (invalid spans, overlapping cells, missing cells) are reported
+through ``grid.diagnostics``. See the :mod:`parsel.table` module
+documentation for details.
+
+
 Using EXSLT extensions
 ----------------------
 
