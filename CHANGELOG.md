@@ -12,6 +12,15 @@ The glom team's approach to updates can be summed up as:
 Check this page when upgrading, we strive to keep the updates
 summarized and well-linked.
 
+## Unreleased
+
+- Add `Glommer.derive()` and the `Glommer.register_context()` context
+  manager for localized type registration. A derived glommer snapshots
+  the parent registry at creation time (including fuzzy type trees and
+  an empty lookup cache), so local `get`/`iterate` overrides and nested
+  glom/lazy `Iter` evaluation stay scoped without mutating the parent
+  or global registry.
+
 ## 25.12.0
 
 _(December 28, 2025)_

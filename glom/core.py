@@ -25,6 +25,7 @@ import copy
 import warnings
 import weakref
 import operator
+from contextlib import contextmanager
 from abc import ABCMeta
 from pprint import pprint
 import string
@@ -2175,6 +2176,35 @@ class TargetRegistry:
         self._op_type_tree[op_name] = type_tree
         self._op_auto_map[op_name] = auto_func
 
+    def snapshot(self):
+        """Return an independent copy of this registry.
+
+        The mapping of registered types/handlers, the fuzzy type trees,
+        and the auto-discovery functions are all copied (recursively in
+        the case of the trees), so later registration on either the
+        original or the copy can never mutate the other.
+
+        The lookup cache is intentionally *not* copied: a derived
+        registry starts with an empty cache so that any handler
+        resolved against an ancestor's configuration cannot shadow a
+        freshly-registered override.
+        """
+        new_registry = self.__class__(register_default_types=False)
+
+        new_registry._op_type_map = {
+            op: OrderedDict(type_map) for op, type_map in self._op_type_map.items()}
+
+        def _copy_tree(type_tree):
+            return OrderedDict(
+                (cur_type, _copy_tree(sub_tree)) for cur_type, sub_tree in type_tree.items())
+
+        new_registry._op_type_tree = {
+            op: _copy_tree(type_tree) for op, type_tree in self._op_type_tree.items()}
+
+        new_registry._op_auto_map = OrderedDict(self._op_auto_map)
+        new_registry._type_cache = {}
+        return new_registry
+
     def _register_builtin_ops(self):
         def _get_iterable_handler(type_obj):
             return iter if callable(getattr(type_obj, '__iter__', None)) else False
@@ -2506,6 +2536,51 @@ class Glommer:
 
     def glom(self, target, spec, **kwargs):
         return glom(target, spec, scope=self.scope, **kwargs)
+
+    def derive(self, **kwargs):
+        """Return a new :class:`Glommer` with an independent copy of this
+        glommer's type registry.
+
+        The registry is snapshotted at the time of the call, meaning:
+
+        * registrations made on either glommer afterwards never affect
+          the other, so the parent configuration is left untouched;
+        * type-inheritance (fuzzy) relationships and already-registered
+          handlers are carried over;
+        * the derived registry's lookup cache starts empty, so a new
+          override always takes effect instead of being bypassed by a
+          handler cached against the parent configuration.
+
+        Nested glom calls and lazy specifiers (such as :class:`~glom.Iter`)
+        resolve their handlers through whatever glommer evaluates them,
+        so they follow the registration context they were created in.
+        """
+        new_glommer = self.__class__(**kwargs)
+        new_glommer.scope = ChainMap(dict(self.scope))
+        new_glommer.scope[TargetRegistry] = self.scope[TargetRegistry].snapshot()
+        return new_glommer
+
+    @contextmanager
+    def register_context(self, **kwargs):
+        """Context manager yielding a derived :class:`Glommer` for
+        localized type registration.
+
+        The yielded glommer starts from a snapshot of this glommer's
+        registry, so :meth:`~Glommer.register` calls made inside the
+        ``with`` block only affect the derived glommer. Exiting the
+        block leaves this glommer's configuration exactly as it was on
+        entry, even when an exception is raised.
+
+        >>> glommer = Glommer()
+        >>> with glommer.register_context() as local:
+        ...     local.register(str, iterate=iter)
+        ...     local.glom('ab', [str])
+        ['a', 'b']
+        >>> # the parent glommer keeps its original, unchanged behavior
+        """
+        derived = self.derive(**kwargs)
+        yield derived
+        return
 
 
 class Fill:
