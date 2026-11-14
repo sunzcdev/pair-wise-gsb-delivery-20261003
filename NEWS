@@ -1,6 +1,21 @@
 w3lib release notes
 ===================
 
+unreleased
+----------
+
+New features:
+
+- Added :class:`~w3lib.url.IdentityKeyConfig` and
+  :func:`~w3lib.url.url_identity_key`, which build a crawl deduplication key
+  with an explicit, per-call configuration of the query parameters that can
+  be sorted, the parameters whose relative order must be preserved, and the
+  tracking parameters that can be removed. Parameters without an equal sign
+  stay distinct from parameters with an empty value, percent-encoding is only
+  normalized where the equivalence is certain, and the result is used as an
+  identity key only: the URL used for the request is left untouched.
+  :func:`~w3lib.url.canonicalize_url` is unchanged.
+
 2.6.0 (2026-11-05)
 ------------------
 

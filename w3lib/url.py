@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import base64
 import codecs
+import dataclasses
 import os
 import posixpath
 import re
@@ -42,6 +43,7 @@ from ._url import (
     _split_params,
     _strip,
     _unquote,
+    _unquote_plus,
     _url2pathname,
     _urlencode,
     _urlparse,
@@ -52,7 +54,7 @@ from ._url import (
 from ._util import to_unicode
 
 if TYPE_CHECKING:
-    from collections.abc import Sequence
+    from collections.abc import Iterable, Sequence
 
     from ._types import AnyUnicodeError
 
@@ -731,6 +733,7 @@ def parse_data_uri(uri: str | bytes) -> ParseDataURIResult:
 
 
 __all__ = [
+    "IdentityKeyConfig",
     "add_http_if_no_scheme",
     "add_or_replace_parameter",
     "add_or_replace_parameters",
@@ -741,6 +744,7 @@ __all__ = [
     "parse_data_uri",
     "path_to_file_uri",
     "safe_url_string",
+    "url_identity_key",
     "url_query_cleaner",
     "url_query_parameter",
 ]
@@ -847,6 +851,196 @@ def _urljoin(base: str, url: str) -> str:
     return f"{scheme}:{path}{tail}"
 
 
+@dataclasses.dataclass(frozen=True, slots=True)
+class IdentityKeyConfig:
+    """Configuration of the identity key built by :func:`url_identity_key`.
+
+    The configuration only affects the identity key used to compare or
+    deduplicate URLs: it never changes the URL that is actually requested.
+
+    *sortable_parameters* names the query parameters whose order does not
+    carry meaning: occurrences of each of them are sorted by value. All other
+    parameters keep their original relative order, so that repeated
+    parameters whose order is meaningful (e.g. ``?tag=a&tag=b`` versus
+    ``?tag=b&tag=a``) are not merged.
+
+    *order_preserved_parameters* is documentation of parameters whose order
+    is significant; they are never sorted. A parameter cannot be listed both
+    here and in *sortable_parameters*.
+
+    *removed_parameters* names tracking parameters (e.g. ``utm_source``) that
+    are dropped from the identity key. Only parameters explicitly listed here
+    are removed, so signature and other security-sensitive parameters are
+    never stripped by surprise.
+
+    Parameter names are matched after percent-decoding, the way they appear in
+    a parsed query string.
+    """
+
+    sortable_parameters: frozenset[str] = frozenset()
+    order_preserved_parameters: frozenset[str] = frozenset()
+    removed_parameters: frozenset[str] = frozenset()
+
+    def __init__(
+        self,
+        sortable_parameters: Iterable[str] = (),
+        order_preserved_parameters: Iterable[str] = (),
+        removed_parameters: Iterable[str] = (),
+    ) -> None:
+        sortable = frozenset(sortable_parameters)
+        order_preserved = frozenset(order_preserved_parameters)
+        removed = frozenset(removed_parameters)
+        conflicting = sortable & order_preserved
+        if conflicting:
+            raise ValueError(
+                "Parameters cannot be both sortable and order-preserved: "
+                + ", ".join(sorted(conflicting))
+            )
+        object.__setattr__(self, "sortable_parameters", sortable)
+        object.__setattr__(self, "order_preserved_parameters", order_preserved)
+        object.__setattr__(self, "removed_parameters", removed)
+
+
+def _parse_identity_qsl(
+    query: str,
+    keep_blank_values: bool,
+    separator: bytes,
+) -> list[tuple[bytes, bytes, bool]]:
+    """Parse *query* into (name, value, has_equal_sign) triples.
+
+    Unlike :func:`_parse_qsl`, a parameter without an equal sign
+    (``?flag``) is kept distinct from one with an empty value (``?flag=``)
+    through the *has_equal_sign* flag, and empty values are only dropped
+    when *keep_blank_values* is false.
+    """
+    if not query:
+        return []
+    raw_query = query.encode() if isinstance(query, str) else query
+    result: list[tuple[bytes, bytes, bool]] = []
+    for field in raw_query.split(separator):
+        if not field:
+            continue
+        raw_name, has_sep, raw_value = field.partition(b"=")
+        if not keep_blank_values and (not has_sep or not raw_value):
+            continue
+        result.append(
+            (_unquote_plus(raw_name), _unquote_plus(raw_value), bool(has_sep))
+        )
+    return result
+
+
+def _encode_identity_qsl(
+    pairs: Sequence[tuple[bytes, bytes, bool]],
+    separator: bytes,
+) -> str:
+    """Serialize the triples produced by :func:`_parse_identity_qsl`.
+
+    Parameters without an equal sign are written back without one, and empty
+    values keep a trailing equal sign, so the two forms can never be merged.
+    """
+    if not pairs:
+        return ""
+    result: list[bytes] = []
+    buffer = bytearray()
+    for name, value, has_equal_sign in pairs:
+        _quote_into(name, output=buffer, quote_plus=True)
+        if has_equal_sign:
+            buffer.append(61)  # ord("=")
+            _quote_into(value, output=buffer, quote_plus=True)
+        result.append(bytes(buffer))
+        buffer.clear()
+    return separator.join(result).decode()
+
+
+def _identity_query(
+    query: str,
+    config: IdentityKeyConfig,
+    keep_blank_values: bool,
+    query_separator: str,
+) -> str:
+    separator = query_separator.encode()
+    pairs = _parse_identity_qsl(query, keep_blank_values, separator)
+    removed = {name.encode() for name in config.removed_parameters}
+    sortable = {name.encode() for name in config.sortable_parameters}
+
+    # Tracking parameters are dropped explicitly; everything else survives,
+    # including parameters with empty or missing values.
+    pairs = [pair for pair in pairs if pair[0] not in removed]
+
+    # Parameters whose order is meaningful (every parameter not listed as
+    # sortable) act as barriers: sortable parameters only move within the
+    # region between two barriers, where they are sorted by key, value and the
+    # has_equal_sign flag. The flag participates so that "flag" and "flag="
+    # never compare equal. Barriers and the regions they delimit keep their
+    # original relative order, so neither a barrier nor a repeated parameter
+    # can cross a meaningful boundary. Every region is already sorted after
+    # one application, which makes repeated canonicalization idempotent.
+    result: list[tuple[bytes, bytes, bool]] = []
+    region: list[tuple[bytes, bytes, bool]] = []
+    for pair in pairs:
+        if pair[0] in sortable:
+            region.append(pair)
+            continue
+        result.extend(sorted(region, key=lambda item: (item[0], item[1], item[2])))
+        region.clear()
+        result.append(pair)
+    result.extend(sorted(region, key=lambda item: (item[0], item[1], item[2])))
+
+    return _encode_identity_qsl(result, separator)
+
+
+def url_identity_key(
+    url: str | bytes | ParseResult,
+    config: IdentityKeyConfig | None = None,
+    *,
+    keep_blank_values: bool = True,
+    keep_fragments: bool = False,
+    encoding: str | None = None,
+    query_separator: str = "&",
+) -> str:
+    """Return an identity key for *url*, to compare or deduplicate crawl URLs.
+
+    Unlike :func:`canonicalize_url`, which sorts every query parameter, this
+    function leaves query ordering alone except for the parameters explicitly
+    listed as sortable in *config*, so URLs where repeated parameters have a
+    meaningful order get distinct keys. The other normalizations of
+    :func:`canonicalize_url` (a safe percent-encoding with upper-case
+    percent escapes, a lower-cased host, resolved dot segments and dropped
+    default ports) are still applied.
+
+    The return value is only an identity key: the URL used for the actual
+    request is left untouched. Percent-encoding is only normalized where the
+    equivalence is certain: path case and reserved characters such as
+    ``%2F`` and ``%3F`` are not decoded, and signature parameters are neither
+    sorted nor removed unless *config* says so.
+
+    With *config* left as :data:`None` the query is preserved as written,
+    including blank values and parameters without an equal sign, which stay
+    distinct from each other. Repeated calls on the result return the same
+    key, including when different :class:`IdentityKeyConfig` objects are used
+    on different calls.
+    """
+    config = config or IdentityKeyConfig()
+    if isinstance(url, ParseResult):
+        url = _urlunparse(*url)
+    query = _identity_query(
+        _urlsplit(
+            _strip(to_unicode(url, encoding=encoding or "utf8", errors="percentencode"))
+        ).query,
+        config,
+        keep_blank_values,
+        query_separator,
+    )
+    return _canonicalize_url(
+        url,
+        keep_blank_values=keep_blank_values,
+        keep_fragments=keep_fragments,
+        encoding=encoding,
+        query_separator=query_separator,
+        query=query,
+    )
+
+
 def canonicalize_url(
     url: str | bytes | ParseResult,
     keep_blank_values: bool = True,
@@ -898,6 +1092,25 @@ def canonicalize_url(
 
     For more examples, see the tests in `tests/test_url.py`.
     """
+    return _canonicalize_url(
+        url,
+        keep_blank_values=keep_blank_values,
+        keep_fragments=keep_fragments,
+        encoding=encoding,
+        query_separator=query_separator,
+        query=None,
+    )
+
+
+def _canonicalize_url(
+    url: str | bytes | ParseResult,
+    *,
+    keep_blank_values: bool,
+    keep_fragments: bool,
+    encoding: str | None,
+    query_separator: str,
+    query: str | None,
+) -> str:
     # If supplied `encoding` is not compatible with all characters in `url`,
     # fallback to UTF-8 as safety net.
     # UTF-8 can handle all Unicode characters,
@@ -906,11 +1119,14 @@ def canonicalize_url(
     if isinstance(url, ParseResult):
         url = _urlunparse(*url)
     try:
-        scheme, netloc, path, query, fragment = _safe_url_split(
+        scheme, netloc, path, parsed_query, fragment = _safe_url_split(
             url, encoding=encoding or "utf8"
         )
     except UnicodeEncodeError:
-        scheme, netloc, path, query, fragment = _safe_url_split(url, encoding="utf8")
+        scheme, netloc, path, parsed_query, fragment = _safe_url_split(
+            url, encoding="utf8"
+        )
+    prebuilt_query = query
     path, params = _split_params(scheme, path)
 
     # 1. decode query-string as UTF-8 (or keep raw bytes),
@@ -940,9 +1156,13 @@ def canonicalize_url(
     # Similar considerations apply to query parts.  The functionality of
     # IRIs (namely, to be able to include non-ASCII characters) can only be
     # used if the query part is encoded in UTF-8.
-    if query:
+    if prebuilt_query is not None:
+        # The caller has already parsed and encoded the query, preserving
+        # distinctions such as "flag" versus "flag="; do not parse it again.
+        query = prebuilt_query
+    elif parsed_query:
         keyvals = _parse_qsl(
-            query, keep_blank_values, separator=query_separator.encode()
+            parsed_query, keep_blank_values, separator=query_separator.encode()
         )
 
         if len(keyvals) > 1:
@@ -950,6 +1170,8 @@ def canonicalize_url(
 
         query = _urlencode(keyvals, query_separator.encode()).decode()
         del keyvals
+    else:
+        query = ""
 
     # 2. decode percent-encoded sequences in path as UTF-8 (or keep raw bytes)
     #    and percent-encode path again (this normalizes to upper-case %XX)

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import dataclasses
 import os
 from inspect import isclass
 from pathlib import Path
@@ -40,6 +41,7 @@ from w3lib._url import (
     _urlunsplit,
 )
 from w3lib.url import (
+    IdentityKeyConfig,
     _normalize_ipv6_host,
     _remove_dot_segments,
     add_http_if_no_scheme,
@@ -55,6 +57,7 @@ from w3lib.url import (
     path_to_file_uri,
     safe_download_url,
     safe_url_string,
+    url_identity_key,
     url_query_cleaner,
     url_query_parameter,
 )
@@ -2272,6 +2275,255 @@ class TestCanonicalizeUrl:
         ):
             with pytest.raises(ValueError, match="Invalid IPv6 URL"):
                 canonicalize_url(url)
+
+
+class TestUrlIdentityKey:
+    CONFIG = IdentityKeyConfig(
+        sortable_parameters=["page", "sort"],
+        order_preserved_parameters=["tag"],
+        removed_parameters=["utm_source", "utm_campaign"],
+    )
+
+    def test_default_config_does_not_reorder_or_remove(self):
+        url = "https://example.com/p?b=2&a=1&utm_source=newsletter"
+        assert url_identity_key(url) == url
+
+    def test_canonicalize_url_still_sorts_everything(self):
+        # The default behavior of canonicalize_url() is left untouched.
+        assert (
+            canonicalize_url("https://example.com/do?c=3&b=5&b=2&a=50")
+            == "https://example.com/do?a=50&b=2&b=5&c=3"
+        )
+
+    def test_sortable_parameters_merge(self):
+        # URLs that only differ in the order of sortable parameters get the
+        # same identity key, even when another parameter sits in between.
+        left = "https://example.com/p?page=2&page=1&sort=asc"
+        right = "https://example.com/p?sort=asc&page=1&page=2"
+        key = "https://example.com/p?page=1&page=2&sort=asc"
+        assert url_identity_key(left, self.CONFIG) == key
+        assert url_identity_key(right, self.CONFIG) == key
+
+    def test_repeated_sortable_values_are_sorted(self):
+        left = "https://example.com/p?page=3&page=1&page=2"
+        right = "https://example.com/p?page=1&page=2&page=3"
+        key = "https://example.com/p?page=1&page=2&page=3"
+        assert url_identity_key(left, self.CONFIG) == key
+        assert url_identity_key(right, self.CONFIG) == key
+
+    def test_order_preserved_parameters_stay_distinct(self):
+        left = "https://example.com/p?tag=a&tag=b"
+        right = "https://example.com/p?tag=b&tag=a"
+        assert url_identity_key(left, self.CONFIG) != url_identity_key(
+            right, self.CONFIG
+        )
+        assert url_identity_key(left, self.CONFIG) == left
+        assert url_identity_key(right, self.CONFIG) == right
+
+    def test_barriers_keep_their_relative_order(self):
+        # The order-sensitive "tag" parameters delimit regions: sortable
+        # parameters cannot cross them, so a different tag sequence still
+        # yields a different key.
+        one = "https://example.com/p?page=2&tag=a&page=1&tag=b"
+        two = "https://example.com/p?page=1&tag=a&page=2&tag=b"
+        swapped = "https://example.com/p?page=2&tag=b&page=1&tag=a"
+        # Every region here contains a single "page" occurrence, so the
+        # barriers keep both URLs unchanged; only the swapped tag order gives
+        # a different identity key.
+        assert url_identity_key(one, self.CONFIG) == one
+        assert url_identity_key(two, self.CONFIG) == two
+        assert url_identity_key(one, self.CONFIG) != url_identity_key(
+            two, self.CONFIG
+        )
+        assert url_identity_key(swapped, self.CONFIG) == swapped
+        assert url_identity_key(swapped, self.CONFIG) != url_identity_key(
+            one, self.CONFIG
+        )
+
+    def test_sortable_parameters_reorder_within_a_region(self):
+        # Two sortable occurrences in the same region are sorted, but neither
+        # of them crosses the "tag" barrier.
+        one = "https://example.com/p?page=2&page=1&tag=a&page=2"
+        two = "https://example.com/p?page=1&page=2&tag=a&page=2"
+        key = "https://example.com/p?page=1&page=2&tag=a&page=2"
+        assert url_identity_key(one, self.CONFIG) == key
+        assert url_identity_key(two, self.CONFIG) == key
+
+    def test_tracking_parameters_are_removed(self):
+        url = "https://example.com/p?page=2&page=1&utm_source=mail&a=1"
+        assert (
+            url_identity_key(url, self.CONFIG)
+            == "https://example.com/p?page=1&page=2&a=1"
+        )
+
+    def test_all_tracking_parameters_removed_leaves_no_query(self):
+        assert (
+            url_identity_key("https://example.com/p?utm_source=mail", self.CONFIG)
+            == "https://example.com/p"
+        )
+
+    def test_signature_parameters_are_never_touched(self):
+        # Signature-like parameters are not sorted or removed unless the
+        # configuration says so, and their percent-encoded values survive.
+        url = "https://example.com/p?sig=ab%2Fcd&sign=1%3F2"
+        assert url_identity_key(url, self.CONFIG) == url
+
+    def test_blank_value_and_no_equal_sign_are_distinct(self):
+        with_equal = "https://example.com/p?flag="
+        without_equal = "https://example.com/p?flag"
+        assert url_identity_key(with_equal) == with_equal
+        assert url_identity_key(without_equal) == without_equal
+        assert url_identity_key(with_equal) != url_identity_key(without_equal)
+
+    def test_no_equal_sign_survives_sorting(self):
+        url = "https://example.com/p?sort&sort=1&sort="
+        # The has_equal_sign flag participates in the sort key, so the bare
+        # "sort" stays first while "sort=" and "sort=1" are ordered by value.
+        assert url_identity_key(url, self.CONFIG) == (
+            "https://example.com/p?sort&sort=&sort=1"
+        )
+
+    def test_blank_values_can_be_dropped(self):
+        url = "https://example.com/p?a=1&b=&c"
+        assert (
+            url_identity_key(url, IdentityKeyConfig(), keep_blank_values=False)
+            == "https://example.com/p?a=1"
+        )
+
+    def test_blank_values_are_kept_by_default(self):
+        url = "https://example.com/p?a=1&b=&c"
+        assert url_identity_key(url) == url
+
+    def test_percent_encoding_only_normalizes_certain_equivalences(self):
+        # Lower-case percent escapes of an unreserved character are
+        # upper-cased (or decoded for an unreserved byte such as "-"), but
+        # reserved characters and path case are untouched.
+        url = "https://example.com/Path%2FA%2fa?x=%2f%3F%2f&y=a%2db"
+        assert url_identity_key(url) == (
+            "https://example.com/Path%2FA%2Fa?x=%2F%3F%2F&y=a-b"
+        )
+
+    def test_path_case_and_reserved_characters_are_guessed_at_never(self):
+        assert url_identity_key("https://example.com/AbC%2Fd") == (
+            "https://example.com/AbC%2Fd"
+        )
+
+    def test_idempotent_with_same_config(self):
+        for url in (
+            "https://example.com/p?tag=b&tag=a&page=2&page=1&utm_source=x&z=",
+            "https://example.com/p?flag",
+            "https://example.com/p?flag=",
+        ):
+            once = url_identity_key(url, self.CONFIG)
+            assert url_identity_key(once, self.CONFIG) == once
+
+    def test_idempotent_across_configs(self):
+        # Applying the default configuration to an already built key must
+        # not change it.
+        once = url_identity_key(
+            "https://example.com/p?page=2&page=1&utm_source=x&tag=b&tag=a",
+            self.CONFIG,
+        )
+        assert url_identity_key(once) == once
+
+    def test_configs_are_isolated_between_calls(self):
+        remove_a = IdentityKeyConfig(removed_parameters=["a"])
+        remove_b = IdentityKeyConfig(removed_parameters=["b"])
+        url = "https://example.com/p?a=1&b=2"
+        assert url_identity_key(url, remove_a) == "https://example.com/p?b=2"
+        assert url_identity_key(url, remove_b) == "https://example.com/p?a=1"
+        assert url_identity_key(url) == url
+
+    def test_config_is_frozen(self):
+        config = IdentityKeyConfig(sortable_parameters=["a"])
+        with pytest.raises((AttributeError, dataclasses.FrozenInstanceError)):
+            config.sortable_parameters = frozenset(("b",))
+
+    def test_conflicting_parameter_raises(self):
+        with pytest.raises(ValueError, match="sortable and order-preserved"):
+            IdentityKeyConfig(
+                sortable_parameters=["shared"],
+                order_preserved_parameters=["shared"],
+            )
+
+    def test_parameter_names_match_after_percent_decoding(self):
+        config = IdentityKeyConfig(removed_parameters=["utm"])
+        assert url_identity_key("https://example.com/p?%75tm=1&a=2", config) == (
+            "https://example.com/p?a=2"
+        )
+
+    def test_query_separator(self):
+        config = IdentityKeyConfig(sortable_parameters=["a"])
+        assert (
+            url_identity_key(
+                "https://example.com/p?a=2;a=1;b=1", config, query_separator=";"
+            )
+            == "https://example.com/p?a=1;a=2;b=1"
+        )
+
+    def test_bytes_input(self):
+        assert url_identity_key(b"https://example.com/p?b=1&a=2") == (
+            "https://example.com/p?b=1&a=2"
+        )
+
+    def test_fragments_are_removed_by_default(self):
+        assert url_identity_key("https://example.com/p?a=1#frag") == (
+            "https://example.com/p?a=1"
+        )
+        assert url_identity_key(
+            "https://example.com/p?a=1#frag", keep_fragments=True
+        ) == "https://example.com/p?a=1#frag"
+
+    def test_identity_key_does_not_modify_input(self):
+        url = "https://example.com/p?b=1&a=2&utm_source=x"
+        original = url
+        url_identity_key(url, self.CONFIG)
+        assert url == original
+
+    def test_shares_other_canonical_normalizations(self):
+        assert (
+            url_identity_key("http://www.EXAMPLE.com/a/../b?b=1&a=2")
+            == "http://www.example.com/b?b=1&a=2"
+        )
+
+    def test_parse_result_input(self):
+        parsed = urlparse("https://example.com/p?b=1&a=2")
+        assert url_identity_key(parsed) == "https://example.com/p?b=1&a=2"
+
+    def test_merge_group_and_distinct_group_together(self):
+        # A single configuration applied to a collection of crawl URLs:
+        # order-insensitive parameters collapse into one key while
+        # order-sensitive, tracking and signature-bearing URLs stay apart.
+        config = IdentityKeyConfig(
+            sortable_parameters=["page"],
+            order_preserved_parameters=["tag"],
+            removed_parameters=["utm_source"],
+        )
+
+        def key(url: str) -> str:
+            return url_identity_key(url, config)
+
+        # URLs that must be treated as the same crawl target.
+        merge_group = [
+            "https://shop.example.com/list?tag=books&page=2&page=1",
+            "https://shop.example.com/list?tag=books&page=1&page=2",
+            "https://shop.example.com/list?tag=books&page=2&utm_source=mail&page=1",
+        ]
+        assert len({key(url) for url in merge_group}) == 1
+
+        # URLs that must keep a distinct identity key.
+        distinct_group = [
+            # the tag order is meaningful
+            "https://shop.example.com/list?tag=a&tag=b&page=1",
+            "https://shop.example.com/list?tag=b&tag=a&page=1",
+            # a signature parameter changes the identity
+            "https://shop.example.com/list?page=1&sig=abc",
+            "https://shop.example.com/list?page=1&sig=abd",
+            # a bare flag is not the same as an empty value
+            "https://shop.example.com/list?page=1&debug",
+            "https://shop.example.com/list?page=1&debug=",
+        ]
+        assert len({key(url) for url in distinct_group}) == len(distinct_group)
 
 
 class TestCanonicalizeUrlProperties:
