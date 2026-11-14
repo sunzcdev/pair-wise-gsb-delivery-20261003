@@ -8,6 +8,7 @@ from abc import ABC, abstractmethod
 import json
 from io import BytesIO
 from os import urandom, SEEK_SET
+from collections.abc import Mapping
 import bz2
 import lzma
 import sys
@@ -134,6 +135,47 @@ def write_map(encoder, datum, schema, named_schemas, fname, options):
     encoder.write_map_end()
 
 
+def _union_branch_name(candidate):
+    """Return the fully qualified name of a union branch.
+
+    Named types (records, enums, fixed types and errors) are identified by
+    their full name while primitive branches use their avro type name.
+    """
+    extracted_type = extract_record_type(candidate)
+    if extracted_type in NAMED_TYPES:
+        return candidate["name"]
+    return extracted_type
+
+
+def _matching_record_branches(datum, schema, named_schemas, options):
+    """Return the full names of every record branch that the datum matches.
+
+    Matching is decided solely by ``_validate`` so that default values, extra
+    fields and the strict / strict_allow_default options are all taken into
+    account. No data is converted here; logical type conversion only happens
+    once a branch has been selected and the value is encoded.
+    """
+    matches = []
+    for candidate in schema:
+        record_type = extract_record_type(candidate)
+        if record_type in named_schemas:
+            # Resolve named references so that record branches are recognized
+            candidate = named_schemas[record_type]
+            record_type = extract_record_type(candidate)
+        if record_type != "record":
+            continue
+        if _validate(
+            datum,
+            candidate,
+            named_schemas,
+            raise_errors=False,
+            field="",
+            options=options,
+        ):
+            matches.append(candidate["name"])
+    return matches
+
+
 def write_union(encoder, datum, schema, named_schemas, fname, options):
     """A union is encoded by first writing a long value indicating the
     zero-based position within the union of the schema of its value. The value
@@ -142,13 +184,9 @@ def write_union(encoder, datum, schema, named_schemas, fname, options):
     best_match_index = -1
     if isinstance(datum, tuple) and not options.get("disable_tuple_notation"):
         name, datum = datum
+        available_names = [_union_branch_name(candidate) for candidate in schema]
         for index, candidate in enumerate(schema):
-            extracted_type = extract_record_type(candidate)
-            if extracted_type in NAMED_TYPES:
-                schema_name = candidate["name"]
-            else:
-                schema_name = extracted_type
-            if name == schema_name:
+            if name == _union_branch_name(candidate):
                 best_match_index = index
                 break
 
@@ -156,11 +194,31 @@ def write_union(encoder, datum, schema, named_schemas, fname, options):
             field = f"on field {fname}" if fname else ""
             msg = (
                 f"provided union type name {name} not found in schema "
-                + f"{schema} {field}"
+                + f"{schema} {field}. Available union type names: "
+                + ", ".join(available_names)
             )
             raise ValueError(msg)
         index = best_match_index
     else:
+        # When ambiguity is rejected, figure out every record branch that the
+        # datum could be encoded as *before* writing anything. If more than one
+        # record matches, the caller must disambiguate with the tuple notation
+        # or the ``-type`` record hint.
+        if options.get("reject_ambiguous_union"):
+            matching_records = _matching_record_branches(
+                datum, schema, named_schemas, options
+            )
+            if len(matching_records) > 1:
+                field = f"on field {fname}" if fname else ""
+                raise ValueError(
+                    f"{repr(datum)} (type {type(datum)}) matches multiple "
+                    f"record branches in the union {field}: "
+                    + ", ".join(matching_records)
+                    + ". Specify the branch explicitly using the tuple "
+                    "notation, e.g. (\"namespace.RecordName\", datum), or the "
+                    "\"-type\" hint on the record."
+                )
+
         pytype = type(datum)
         most_fields = -1
 
@@ -200,15 +258,23 @@ def write_union(encoder, datum, schema, named_schemas, fname, options):
                     record_type = extract_record_type(candidate)
 
                 if record_type == "record":
-                    logical_type = extract_logical_type(candidate)
-                    if logical_type:
-                        prepare = LOGICAL_WRITERS.get(logical_type)
-                        if prepare:
-                            datum = prepare(datum, candidate)
-
-                    candidate_fields = set(f["name"] for f in candidate["fields"])
-                    datum_fields = set(datum)
-                    fields = len(candidate_fields.intersection(datum_fields))
+                    # Do not run any logical type conversion while choosing a
+                    # branch. That would change (or fail to convert) the datum
+                    # before a branch has actually been selected. The datum is
+                    # converted a single time, and only after a branch has been
+                    # picked, below.
+                    if isinstance(datum, Mapping):
+                        candidate_fields = set(
+                            f["name"] for f in candidate["fields"]
+                        )
+                        datum_fields = set(datum)
+                        fields = len(candidate_fields.intersection(datum_fields))
+                    else:
+                        # Non-mapping datums (for example a custom object that a
+                        # record logical type turns into a mapping) have no
+                        # fields to compare, so simply treat the record as a
+                        # valid candidate without advancing "most_fields".
+                        fields = 0
                     if fields > most_fields:
                         best_match_index = index
                         most_fields = fields
@@ -227,10 +293,14 @@ def write_union(encoder, datum, schema, named_schemas, fname, options):
             )
         index = best_match_index
 
-    # write data
+    selected_schema = schema[index]
+
+    # write data. No logical type conversion happens while choosing a branch;
+    # the datum is converted a single time by write_data, now that the branch
+    # has been selected.
     # TODO: There should be a way to give just the index
-    encoder.write_index(index, schema[index])
-    write_data(encoder, datum, schema[index], named_schemas, fname, options)
+    encoder.write_index(index, selected_schema)
+    write_data(encoder, datum, selected_schema, named_schemas, fname, options)
 
 
 def write_record(encoder, datum, schema, named_schemas, fname, options):
@@ -628,6 +698,7 @@ def writer(
     strict: bool = False,
     strict_allow_default: bool = False,
     disable_tuple_notation: bool = False,
+    reject_ambiguous_union: bool = False,
 ):
     """Write records to fo (stream) according to schema
 
@@ -664,6 +735,13 @@ def writer(
     disable_tuple_notation
         If set to True, tuples will not be treated as a special case. Therefore,
         using a tuple to indicate the type of a record will not work
+    reject_ambiguous_union
+        If set to True, an error will be raised when a dictionary could be
+        written against more than one record branch of a union. The error lists
+        the fully namespaced names of every matching record and the branch must
+        then be chosen explicitly with the tuple notation or the ``-type``
+        record hint. When False (the default), the branch is chosen
+        automatically as before
 
 
     Example::
@@ -739,6 +817,7 @@ def writer(
                 "strict": strict,
                 "strict_allow_default": strict_allow_default,
                 "disable_tuple_notation": disable_tuple_notation,
+                "reject_ambiguous_union": reject_ambiguous_union,
             },
         )
     else:
@@ -755,6 +834,7 @@ def writer(
                 "strict": strict,
                 "strict_allow_default": strict_allow_default,
                 "disable_tuple_notation": disable_tuple_notation,
+                "reject_ambiguous_union": reject_ambiguous_union,
             },
         )
 
@@ -771,6 +851,7 @@ def schemaless_writer(
     strict: bool = False,
     strict_allow_default: bool = False,
     disable_tuple_notation: bool = False,
+    reject_ambiguous_union: bool = False,
 ):
     """Write a single record without the schema or header information
 
@@ -792,6 +873,13 @@ def schemaless_writer(
     disable_tuple_notation
         If set to True, tuples will not be treated as a special case. Therefore,
         using a tuple to indicate the type of a record will not work
+    reject_ambiguous_union
+        If set to True, an error will be raised when a dictionary could be
+        written against more than one record branch of a union. The error lists
+        the fully namespaced names of every matching record and the branch must
+        then be chosen explicitly with the tuple notation or the ``-type``
+        record hint. When False (the default), the branch is chosen
+        automatically as before
 
 
     Example::
@@ -816,6 +904,7 @@ def schemaless_writer(
             "strict": strict,
             "strict_allow_default": strict_allow_default,
             "disable_tuple_notation": disable_tuple_notation,
+            "reject_ambiguous_union": reject_ambiguous_union,
         },
     )
     encoder.flush()

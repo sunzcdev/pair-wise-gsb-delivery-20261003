@@ -17,6 +17,7 @@ def writer(
     strict: bool = ...,
     strict_allow_default: bool = ...,
     disable_tuple_notation: bool = ...,
+    reject_ambiguous_union: bool = ...,
 ) -> None: ...
 
 class GenericWriter:
@@ -56,4 +57,5 @@ def schemaless_writer(
     strict: bool = ...,
     strict_allow_default: bool = ...,
     disable_tuple_notation: bool = ...,
+    reject_ambiguous_union: bool = ...,
 ) -> None: ...

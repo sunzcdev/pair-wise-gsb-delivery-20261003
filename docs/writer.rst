@@ -121,3 +121,53 @@ Unlike the tuple notation which can be used with any avro type in a union, this
 `-type` hint can only be used with records. However, this can be useful if you
 want to make a single record dictionary that can be used both in and out of
 unions.
+
+Rejecting ambiguous unions
+--------------------------
+
+By default, when a dictionary fits more than one record in a union the writer
+silently picks a branch for you. If you would rather be forced to make the
+choice explicit, pass ``reject_ambiguous_union=True`` to ``writer`` or
+``schemaless_writer``::
+
+    from fastavro import writer
+
+    with open("household.avro", "wb") as out:
+        writer(
+            out,
+            household_schema,
+            records,
+            reject_ambiguous_union=True,
+        )
+
+With that option enabled, writing a dictionary that matches more than one
+record branch of a union raises a ``ValueError``. The error lists the fully
+namespaced name of every record that the datum could be encoded as, for
+example::
+
+    ValueError: {'name': 'Son'} (type <class 'dict'>) matches multiple record
+    branches in the union on field family_members: Child, Pet. Specify the
+    branch explicitly using the tuple notation, e.g.
+    ("namespace.RecordName", datum), or the "-type" hint on the record.
+
+To make the write succeed you then disambiguate the value with one of the
+explicit branch notations described above::
+
+    records = [
+        {
+            "address": "123 Drive Street",
+            "family_members": [
+                ("Child", {"name": "Son"}),
+                {"-type": "Pet", "name": "Dog"},
+            ]
+        }
+    ]
+
+Whether a record "matches" is decided by the same validation logic that is used
+for ordinary writes, so default values, extra fields and the ``strict`` /
+``strict_allow_default`` options are all taken into account. Matching is only
+used to select a branch; no logical type conversion is performed until the
+branch has been chosen, and the value is encoded exactly once. When the option
+is left at its default of ``False``, the historical automatic branch selection
+behavior is preserved.
+

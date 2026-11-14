@@ -16,6 +16,7 @@ def json_writer(
     strict: bool = False,
     strict_allow_default: bool = False,
     disable_tuple_notation: bool = False,
+    reject_ambiguous_union: bool = False,
 ) -> None:
     """Write records to fo (stream) according to schema
 
@@ -47,6 +48,13 @@ def json_writer(
     disable_tuple_notation
         If set to True, tuples will not be treated as a special case. Therefore,
         using a tuple to indicate the type of a record will not work
+    reject_ambiguous_union
+        If set to True, an error will be raised when a dictionary could be
+        written against more than one record branch of a union. The error lists
+        the fully namespaced names of every matching record and the branch must
+        then be chosen explicitly with the tuple notation or the ``-type``
+        record hint. When False (the default), the branch is chosen
+        automatically as before
 
 
     Example::
@@ -84,4 +92,5 @@ def json_writer(
         strict=strict,
         strict_allow_default=strict_allow_default,
         disable_tuple_notation=disable_tuple_notation,
+        reject_ambiguous_union=reject_ambiguous_union,
     )

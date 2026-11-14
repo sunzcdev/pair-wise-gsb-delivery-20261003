@@ -3401,6 +3401,341 @@ def test_disable_tuple_notation_option():
     assert new_records == [{"foo": ["string", "0"]}]
 
 
+AMBIGUOUS_RECORD_SCHEMA = {
+    "type": "record",
+    "name": "Household",
+    "namespace": "home",
+    "fields": [
+        {
+            "name": "member",
+            "type": [
+                {
+                    "name": "Child",
+                    "namespace": "home",
+                    "type": "record",
+                    "fields": [
+                        {"name": "name", "type": "string"},
+                        {
+                            "name": "favorite_color",
+                            "type": ["null", "string"],
+                            "default": None,
+                        },
+                    ],
+                },
+                {
+                    "name": "Pet",
+                    "namespace": "home",
+                    "type": "record",
+                    "fields": [
+                        {"name": "name", "type": "string"},
+                        {
+                            "name": "favorite_toy",
+                            "type": ["null", "string"],
+                            "default": None,
+                        },
+                    ],
+                },
+            ],
+        }
+    ],
+}
+
+
+def test_reject_ambiguous_union_keeps_auto_selection_by_default():
+    """Without the option the branch is still chosen automatically."""
+    records = [{"member": {"name": "Son"}}]
+    new_records = roundtrip(AMBIGUOUS_RECORD_SCHEMA, records)
+    assert new_records == [
+        {"member": {"name": "Son", "favorite_color": None}}
+    ]
+
+
+def test_reject_ambiguous_union_raises_with_full_record_names():
+    records = [{"member": {"name": "Son"}}]
+    with pytest.raises(ValueError) as exc:
+        roundtrip(
+            AMBIGUOUS_RECORD_SCHEMA,
+            records,
+            writer_kwargs={"reject_ambiguous_union": True},
+        )
+    message = str(exc.value)
+    assert "matches multiple record branches" in message
+    # The fully namespaced names of every matching branch are listed
+    assert "home.Child" in message
+    assert "home.Pet" in message
+    assert "on field member" in message
+
+
+def test_reject_ambiguous_union_tuple_notation_selects_branch():
+    records = [{"member": ("home.Pet", {"name": "Rex"})}]
+    new_records = roundtrip(
+        AMBIGUOUS_RECORD_SCHEMA,
+        records,
+        writer_kwargs={"reject_ambiguous_union": True},
+    )
+    assert new_records == [
+        {"member": {"name": "Rex", "favorite_toy": None}}
+    ]
+
+
+def test_reject_ambiguous_union_type_hint_selects_branch():
+    records = [{"member": {"-type": "home.Child", "name": "Son"}}]
+    new_records = roundtrip(
+        AMBIGUOUS_RECORD_SCHEMA,
+        records,
+        writer_kwargs={"reject_ambiguous_union": True},
+    )
+    assert new_records == [
+        {"member": {"name": "Son", "favorite_color": None}}
+    ]
+
+
+def test_reject_ambiguous_union_single_match_is_allowed():
+    """A datum that only validates against one record is not ambiguous."""
+    schema = {
+        "type": "record",
+        "name": "Root",
+        "fields": [
+            {
+                "name": "u",
+                "type": [
+                    {
+                        "name": "A",
+                        "type": "record",
+                        "fields": [{"name": "x", "type": "string"}],
+                    },
+                    {
+                        "name": "B",
+                        "type": "record",
+                        "fields": [{"name": "y", "type": "string"}],
+                    },
+                ],
+            }
+        ],
+    }
+    records = [{"u": {"x": "value"}}]
+    new_records = roundtrip(
+        schema,
+        records,
+        writer_kwargs={"reject_ambiguous_union": True},
+    )
+    assert new_records == records
+
+
+def test_reject_ambiguous_union_respects_strict_and_extra_fields():
+    """strict/strict_allow_default must participate in matching through
+    _validate, rather than just counting the field intersection."""
+    # A has a default for its extra field; B does not.
+    schema = {
+        "type": "record",
+        "name": "Root",
+        "fields": [
+            {
+                "name": "u",
+                "type": [
+                    {
+                        "name": "A",
+                        "type": "record",
+                        "fields": [
+                            {"name": "x", "type": "string"},
+                            {"name": "a_only", "type": "int", "default": 0},
+                        ],
+                    },
+                    {
+                        "name": "B",
+                        "type": "record",
+                        "fields": [
+                            {"name": "x", "type": "string"},
+                            {"name": "b_only", "type": "int"},
+                        ],
+                    },
+                ],
+            }
+        ],
+    }
+
+    datum = {"x": "value"}
+
+    # In normal mode the missing field of B is implicitly treated as null,
+    # which is not an int, so B does not match; A matches via its default.
+    new_records = roundtrip(
+        schema,
+        [{"u": datum}],
+        writer_kwargs={"reject_ambiguous_union": True},
+    )
+    assert new_records == [{"u": {"x": "value", "a_only": 0}}]
+
+    # In strict mode B does not validate either (the missing non-defaulted
+    # field is NoValue), so there is still no ambiguity. A is selected through
+    # validation, but write_record itself rejects the missing defaulted field
+    # under strict mode before encoding.
+    with pytest.raises(ValueError, match="Field a_only is specified"):
+        roundtrip(
+            schema,
+            [{"u": datum}],
+            writer_kwargs={"reject_ambiguous_union": True, "strict": True},
+        )
+
+    # When both branches carry defaults, the same datum matches both and the
+    # ambiguity is rejected even under strict mode (defaults satisfy strict).
+    schema_both_defaults = {
+        "type": "record",
+        "name": "Root2",
+        "fields": [
+            {
+                "name": "u",
+                "type": [
+                    {
+                        "name": "A",
+                        "type": "record",
+                        "fields": [
+                            {"name": "x", "type": "string"},
+                            {"name": "a_only", "type": "int", "default": 0},
+                        ],
+                    },
+                    {
+                        "name": "B",
+                        "type": "record",
+                        "fields": [
+                            {"name": "x", "type": "string"},
+                            {"name": "b_only", "type": "int", "default": 0},
+                        ],
+                    },
+                ],
+            }
+        ],
+    }
+    with pytest.raises(ValueError, match="matches multiple record branches"):
+        roundtrip(
+            schema_both_defaults,
+            [{"u": {"x": "value"}}],
+            writer_kwargs={"reject_ambiguous_union": True, "strict": True},
+        )
+
+    # Extra fields make the record fail while encoding under
+    # strict_allow_default, after a single unambiguous branch (A) has been
+    # selected through validation.
+    with pytest.raises(ValueError, match="record contains more fields"):
+        roundtrip(
+            schema,
+            [{"u": {"x": "value", "a_only": 1, "extra": "nope"}}],
+            writer_kwargs={
+                "reject_ambiguous_union": True,
+                "strict_allow_default": True,
+            },
+        )
+
+
+def test_reject_ambiguous_union_respects_default_values():
+    """Whether a record matches depends on default values as well."""
+    schema = {
+        "type": "record",
+        "name": "Root",
+        "fields": [
+            {
+                "name": "u",
+                "type": [
+                    {
+                        "name": "A",
+                        "type": "record",
+                        "fields": [
+                            {"name": "x", "type": "string"},
+                            {"name": "a_only", "type": "int", "default": 0},
+                        ],
+                    },
+                    {
+                        "name": "B",
+                        "type": "record",
+                        # No default: a datum missing "y" cannot match B
+                        "fields": [{"name": "y", "type": "string"}],
+                    },
+                ],
+            }
+        ],
+    }
+    # Only A validates because B requires the missing field "y"
+    new_records = roundtrip(
+        schema,
+        [{"u": {"x": "value"}}],
+        writer_kwargs={"reject_ambiguous_union": True},
+    )
+    assert new_records == [{"u": {"x": "value", "a_only": 0}}]
+
+
+def test_reject_ambiguous_union_bad_tuple_name_fails_before_writing():
+    new_file = BytesIO()
+    writer = Writer(
+        new_file,
+        AMBIGUOUS_RECORD_SCHEMA,
+        options={"reject_ambiguous_union": True},
+    )
+    header_size = len(new_file.getvalue())
+    with pytest.raises(ValueError) as exc:
+        writer.write({"member": ("home.Dog", {"name": "Rex"})})
+    message = str(exc.value)
+    assert "provided union type name home.Dog not found" in message
+    assert "home.Child" in message
+    assert "home.Pet" in message
+    # Nothing beyond the file header was written
+    assert len(new_file.getvalue()) == header_size
+
+
+def test_reject_ambiguous_union_requires_namespaced_tuple_name():
+    """The existing fully-namespaced name requirement is unchanged."""
+    with pytest.raises(ValueError, match="provided union type name Child"):
+        roundtrip(
+            AMBIGUOUS_RECORD_SCHEMA,
+            [{"member": ("Child", {"name": "Son"})}],
+            writer_kwargs={"reject_ambiguous_union": True},
+        )
+
+
+def test_reject_ambiguous_union_does_not_mutate_datum():
+    """Branch validation must not convert the datum; conversion happens once
+    after the branch is selected."""
+    schema = {
+        "type": "record",
+        "name": "Root",
+        "fields": [
+            {
+                "name": "d",
+                "type": [
+                    {
+                        "name": "D1",
+                        "type": "record",
+                        "fields": [
+                            {
+                                "name": "day",
+                                "type": {"type": "int", "logicalType": "date"},
+                            }
+                        ],
+                    },
+                    {
+                        "name": "D2",
+                        "type": "record",
+                        "fields": [
+                            {
+                                "name": "day",
+                                "type": {"type": "int", "logicalType": "date"},
+                            }
+                        ],
+                    },
+                ],
+            }
+        ],
+    }
+    record = {"d": ("D1", {"day": datetime.date(2019, 5, 6)})}
+    original = copy.deepcopy(record)
+    new_records = roundtrip(
+        schema,
+        [record],
+        writer_kwargs={"reject_ambiguous_union": True},
+    )
+    # The caller's datum is untouched while the encoded data round trips
+    assert record == original
+    assert new_records == [{"d": {"day": datetime.date(2019, 5, 6)}}]
+
+
 def test_strict_allow_default_bug():
     """https://github.com/fastavro/fastavro/issues/638"""
     schema = {

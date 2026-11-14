@@ -1,3 +1,6 @@
+Unreleased
+* Add a reject_ambiguous_union writer option that raises when a dictionary matches multiple record branches of a union, listing the fully namespaced names of every matching record; branch selection no longer performs logical type conversion before a branch is chosen
+
 2026-10-07 version 1.13.1
 * Match reader named schema reference with inline writer schema (@AnkitaAdvitot)
 

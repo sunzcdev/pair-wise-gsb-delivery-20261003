@@ -1034,6 +1034,49 @@ def test_disable_tuple_notation_option():
     assert new_records == [{"foo": ["string", "0"]}]
 
 
+def test_reject_ambiguous_union_json():
+    schema = {
+        "type": "record",
+        "name": "Household",
+        "namespace": "home",
+        "fields": [
+            {
+                "name": "member",
+                "type": [
+                    {
+                        "name": "Child",
+                        "namespace": "home",
+                        "type": "record",
+                        "fields": [{"name": "name", "type": "string"}],
+                    },
+                    {
+                        "name": "Pet",
+                        "namespace": "home",
+                        "type": "record",
+                        "fields": [{"name": "name", "type": "string"}],
+                    },
+                ],
+            }
+        ],
+    }
+
+    # Ambiguous dictionaries are rejected before any json is emitted
+    with pytest.raises(ValueError, match="matches multiple record branches"):
+        roundtrip(
+            schema,
+            [{"member": {"name": "Son"}}],
+            writer_kwargs={"reject_ambiguous_union": True},
+        )
+
+    # The tuple notation still lets the caller choose a branch explicitly
+    new_records = roundtrip(
+        schema,
+        [{"member": ("home.Pet", {"name": "Rex"})}],
+        writer_kwargs={"reject_ambiguous_union": True},
+    )
+    assert new_records == [{"member": {"name": "Rex"}}]
+
+
 def test_strict_allow_default_bug():
     """https://github.com/fastavro/fastavro/issues/638"""
     schema = {
