@@ -3,6 +3,18 @@
 History
 -------
 
+Unreleased
+~~~~~~~~~~
+
+* ``SelectorList.drop()`` now removes the selected nodes as a batch: each
+  underlying node is processed at most once, nodes covered by a selected
+  ancestor are not processed again, and the remaining nodes are removed in
+  document order so the result no longer depends on the list ordering. Nodes
+  from different documents are handled independently, and all nodes are
+  validated before any modification, so an invalid item such as a root node
+  or a non-element result no longer leaves the tree partially modified.
+  ``Selector.drop()`` on a single selector is unchanged.
+
 1.12.1 (2026-09-28)
 ~~~~~~~~~~~~~~~~~~~
 

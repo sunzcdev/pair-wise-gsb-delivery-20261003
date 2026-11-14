@@ -603,6 +603,23 @@ classes.
     content of the selector is removed from the elements tree. This could be useful
     when trying to reduce the memory footprint of Responses.
 
+When called on a :class:`~parsel.selector.SelectorList`, the nodes are removed
+as a single batch:
+
+*   each underlying node is removed at most once, so duplicated selection
+    results are handled only once;
+*   a node whose ancestor is also selected is not removed separately, the
+    ancestor removal already takes it, together with its tail text, away;
+*   the remaining nodes are removed in document order regardless of the order
+    in which they appear in the list;
+*   nodes that belong to different documents are handled independently;
+*   every node is validated before any modification, so a root node or a
+    non-element result, such as one from ``::text``, raises an exception and
+    leaves every document untouched.
+
+Calling :meth:`~parsel.selector.Selector.drop` on a single
+:class:`~parsel.selector.Selector` keeps its existing behavior.
+
 Example removing an ad from a blog post:
 
     >>> from parsel import Selector

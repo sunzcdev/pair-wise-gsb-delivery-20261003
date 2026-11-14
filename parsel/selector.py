@@ -163,6 +163,60 @@ def create_root_node(
     return root
 
 
+_NO_ROOT_DROP_MESSAGE = (
+    "The node you're trying to drop has no root, "
+    "are you trying to drop a pseudo-element? "
+    "Try to use 'li' as a selector instead of 'li::text' or "
+    "'//li' instead of '//li/text()', for example."
+)
+_NO_PARENT_DROP_MESSAGE = (
+    "The node you're trying to remove has no parent, "
+    "are you trying to remove a root element?"
+)
+
+
+def _document_root(node: Any) -> Any:
+    """Return the topmost ancestor of *node*, which is *node* itself for a
+    document root."""
+    root = node
+    while root.getparent() is not None:
+        root = root.getparent()
+    return root
+
+
+def _prepare_drop_plan(
+    selectors: SelectorList[Selector],
+) -> dict[Any, dict[Any, Selector]]:
+    """Build the batch drop plan for *selectors* without modifying any tree.
+
+    Every selector is validated first, so a non-element result or a document
+    root raises before anything is removed. Selectors are then grouped by
+    document, duplicates are collapsed into a single entry, and nodes covered
+    by a selected ancestor are skipped. Each document maps to a dictionary of
+    the remaining nodes keyed by the underlying lxml node, which lets the
+    caller remove them in document order.
+    """
+    plan: dict[Any, dict[Any, Selector]] = {}
+    for selector in selectors:
+        try:
+            parent = selector.root.getparent()
+        except AttributeError:
+            # 'str' object has no attribute 'getparent'
+            raise CannotRemoveElementWithoutRoot(_NO_ROOT_DROP_MESSAGE)
+        if parent is None:
+            raise CannotDropElementWithoutParent(_NO_PARENT_DROP_MESSAGE)
+        document = _document_root(selector.root)
+        plan.setdefault(document, {})[selector.root] = selector
+
+    for nodes in plan.values():
+        selected_descendants: set[Any] = set()
+        for node in nodes:
+            selected_descendants.update(node.iterdescendants())
+        for covered_node in selected_descendants.intersection(nodes):
+            del nodes[covered_node]
+    return plan
+
+
 class SelectorList(list[_SelectorType]):
     """
     The :class:`SelectorList` class is a subclass of the builtin ``list``
@@ -344,10 +398,32 @@ class SelectorList(list[_SelectorType]):
 
     def drop(self) -> None:
         """
-        Drop matched nodes from the parent for each element in this list.
+        Drop matched nodes from their parent elements.
+
+        The nodes are processed as a single batch:
+
+        *   Each node is processed at most once: duplicate results, i.e.
+            selectors wrapping the same underlying node, are handled once.
+        *   A selected node whose ancestor is also selected is not processed
+            again; dropping the ancestor already removes it together with its
+            tail text.
+        *   The remaining nodes are removed in document order, so the
+            :class:`SelectorList` ordering cannot change the result.
+        *   Nodes from different documents are handled independently.
+
+        All nodes are validated before any modification happens, so an invalid
+        node, such as a root node or a non-element result, never leaves the
+        tree partially modified. The tail text conventions of
+        :meth:`Selector.drop` are preserved.
         """
-        for x in self:
-            x.drop()
+        for document_root, nodes in _prepare_drop_plan(self).items():
+            # Materialize the nodes first: removing nodes while iterating the
+            # tree makes lxml skip subsequent siblings.
+            ordered_selectors = [
+                nodes[node] for node in document_root.iter() if node in nodes
+            ]
+            for selector in ordered_selectors:
+                selector.drop()
 
 
 _NOT_SET = object()
@@ -948,21 +1024,11 @@ class Selector:
             parent = self.root.getparent()
         except AttributeError:
             # 'str' object has no attribute 'getparent'
-            raise CannotRemoveElementWithoutRoot(
-                "The node you're trying to drop has no root, "
-                "are you trying to drop a pseudo-element? "
-                "Try to use 'li' as a selector instead of 'li::text' or "
-                "'//li' instead of '//li/text()', for example."
-            )
-
-        no_parent_message = (
-            "The node you're trying to remove has no parent, "
-            "are you trying to remove a root element?"
-        )
+            raise CannotRemoveElementWithoutRoot(_NO_ROOT_DROP_MESSAGE)
         try:
             if self.type == "xml":
                 if parent is None:
-                    raise CannotDropElementWithoutParent(no_parent_message)
+                    raise CannotDropElementWithoutParent(_NO_PARENT_DROP_MESSAGE)
                 # Unlike HtmlElement.drop_tree(), _Element.remove() also
                 # removes the tail text, so we need to preserve it manually
                 if self.root.tail:
@@ -976,7 +1042,7 @@ class Selector:
                 typing.cast("html.HtmlElement", self.root).drop_tree()
         except (AttributeError, AssertionError):
             # 'NoneType' object has no attribute 'drop_tree'
-            raise CannotDropElementWithoutParent(no_parent_message)
+            raise CannotDropElementWithoutParent(_NO_PARENT_DROP_MESSAGE)
 
     @property
     def attrib(self) -> dict[str, str]:

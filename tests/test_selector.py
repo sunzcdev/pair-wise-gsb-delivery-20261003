@@ -1394,6 +1394,108 @@ class TestExslt:
         sel.xpath("//b").drop()
         assert sel.get() == expected
 
+    @pytest.mark.parametrize("ancestor_first", [False, True])
+    def test_drop_ancestor_covers_descendants(self, ancestor_first: bool) -> None:
+        sel = self.sscls(
+            text=(
+                "<root>head<wrap>x<item>y</item>itail</wrap>"
+                "wtail<keep>k</keep>end</root>"
+            ),
+            type="xml",
+        )
+        ancestor = list(sel.xpath("//wrap"))
+        descendants = list(sel.xpath("//item"))
+        nodes = SelectorList(
+            ancestor + descendants if ancestor_first else descendants + ancestor
+        )
+        nodes.drop()
+        assert sel.get() == "<root>headwtail<keep>k</keep>end</root>"
+
+    def test_drop_processes_duplicate_nodes_once(self) -> None:
+        sel = self.sscls(
+            text="<root>head<wrap>x<item>y</item>itail</wrap>wtail</root>",
+            type="xml",
+        )
+        duplicates = SelectorList(
+            list(sel.xpath("//wrap"))
+            + list(sel.xpath("//wrap"))
+            + list(sel.xpath("//item"))
+        )
+        duplicates.drop()
+        assert sel.get() == "<root>headwtail</root>"
+
+    @pytest.mark.parametrize("reverse", [False, True])
+    def test_drop_batch_with_nested_html_and_mixed_text(self, reverse: bool) -> None:
+        sel = self.sscls(
+            text=(
+                "<html><body>head "
+                "<div>a<p>p1</p>mid<p>p2</p>b</div> "
+                "<span>s</span> tail</body></html>"
+            )
+        )
+        nodes = (
+            list(sel.css("div"))
+            + list(sel.css("p"))
+            + list(sel.css("span"))
+            + list(sel.css("span"))
+        )
+        if reverse:
+            nodes.reverse()
+        SelectorList(nodes).drop()
+        assert sel.get() == "<html><body>head   tail</body></html>"
+
+    def test_drop_is_independent_of_list_order(self) -> None:
+        markup = (
+            "<root><a>1</a><b><c>2</c>ctail</b>btail"
+            "<d>3</d>dtail</root>"
+        )
+        results = []
+        for reverse in (False, True):
+            sel = self.sscls(text=markup, type="xml")
+            nodes = list(sel.xpath("//a | //b | //c | //d"))
+            if reverse:
+                nodes.reverse()
+            SelectorList(nodes).drop()
+            results.append(sel.get())
+        assert results[0] == results[1] == "<root>btaildtail</root>"
+
+    def test_drop_validates_all_nodes_before_modifying(self) -> None:
+        markup = "<root>head<wrap>x<item>y</item>itail</wrap>wtail</root>"
+        # A root element anywhere in the list must block every removal.
+        sel = self.sscls(text=markup, type="xml")
+        with pytest.raises(CannotRemoveElementWithoutParent):
+            SelectorList(
+                list(sel.xpath("//wrap")) + list(sel.xpath("/root"))
+            ).drop()
+        assert sel.get() == markup
+
+        # A non-element (text) result must block every removal as well.
+        sel = self.sscls(text=markup, type="xml")
+        with pytest.raises(CannotRemoveElementWithoutRoot):
+            SelectorList(
+                list(sel.xpath("//wrap")) + list(sel.xpath("//text()"))
+            ).drop()
+        assert sel.get() == markup
+
+    def test_drop_handles_separate_documents_independently(self) -> None:
+        first = self.sscls(text="<root><a>1</a><a>2</a></root>", type="xml")
+        second = self.sscls(text="<root><b>x</b><b>y</b></root>", type="xml")
+        SelectorList(list(first.xpath("//a")) + list(second.xpath("//b"))).drop()
+        assert first.get() == "<root/>"
+        assert second.get() == "<root/>"
+
+    def test_drop_invalid_node_in_one_document_blocks_all_documents(self) -> None:
+        first_markup = "<root><a>1</a><a>2</a></root>"
+        second_markup = "<root><b>x</b><b>y</b></root>"
+        first = self.sscls(text=first_markup, type="xml")
+        second = self.sscls(text=second_markup, type="xml")
+        with pytest.raises(CannotRemoveElementWithoutParent):
+            SelectorList(
+                list(first.xpath("//a")) + list(second.xpath("/root"))
+            ).drop()
+        assert first.get() == first_markup
+        assert second.get() == second_markup
+
 
 class SelectorBytesInput(Selector):
     def __init__(
