@@ -5,7 +5,8 @@ import traceback
 
 import pytest
 
-from glom import glom, S, T, GlomError, PathAccessError, Switch, Coalesce, Or, Path
+from glom import (glom, S, T, GlomError, PathAccessError, Switch, Coalesce,
+                  Or, Path, CycleError, MaxDepthError)
 from glom.core import format_oneline_trace, format_target_spec_trace, bbrepr, ROOT, LAST_CHILD_SCOPE
 from glom.matching import M, MatchError, TypeMatchError, Match
 
@@ -502,6 +503,18 @@ def test_all_public_errors():
     _test_exc(MatchError, 1, M == 2)
 
     _test_exc(TypeMatchError, 1, Match(str))
+
+    class CycleTarget:
+        def __init__(self):
+            self.self = self
+
+        def __repr__(self):
+            return '<CycleTarget>'
+
+    _test_exc(CycleError, CycleTarget(), T.__starstar__(cycle_policy='raise'))
+
+    _test_exc(MaxDepthError, {'a': {'b': {'c': 1}}},
+              T.__starstar__(max_depth=1))
 
     for (target, spec, exc) in results:
         assert copy.copy(exc) is not exc

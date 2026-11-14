@@ -119,6 +119,18 @@ CUR_ERROR.__doc__ = """
 thrown exceptions.
 """
 
+CYCLE_POLICY = make_sentinel('CYCLE_POLICY')
+CYCLE_POLICY.__doc__ = """
+``CYCLE_POLICY`` controls how recursive (``**``) traversal handles
+back edges in the target object graph.
+"""
+
+MAX_DEPTH = make_sentinel('MAX_DEPTH')
+MAX_DEPTH.__doc__ = """
+``MAX_DEPTH`` limits the depth of recursive (``**``) traversal, with
+the root at depth zero.
+"""
+
 _PKG_DIR_PATH = os.path.dirname(os.path.abspath(__file__))
 
 class GlomError(Exception):
@@ -229,7 +241,16 @@ def _unpack_stack(scope, only_errors=True):
 
 
 def _format_trace_value(value, maxlen):
-    s = bbrepr(value).replace("\\'", "'")
+    try:
+        s = bbrepr(value).replace("\\'", "'")
+    except Exception:
+        # bbrepr can recurse into a genuinely cyclic target before
+        # reprlib's depth limit kicks in. Fall back to the builtin,
+        # which renders cycles as ``{...}``/``[...]``.
+        try:
+            s = repr(value).replace("\\'", "'")
+        except Exception:
+            s = '<unrepresentable %s>' % type(value).__name__
     if len(s) > maxlen:
         try:
             suffix = '... (len=%s)' % len(value)
@@ -499,6 +520,113 @@ class UnregisteredTarget(GlomError):
         return msg
 
 
+_DEFAULT_CYCLE_POLICY = 'raise'
+_CYCLE_POLICY_ALIASES = {
+    'raise': 'raise',
+    'error': 'raise',
+    'skip': 'skip',
+    'ignore': 'skip',
+}
+
+
+def _normalize_cycle_policy(cycle_policy):
+    if cycle_policy is None:
+        return _DEFAULT_CYCLE_POLICY
+    if isinstance(cycle_policy, str):
+        cycle_policy = cycle_policy.lower()
+    try:
+        return _CYCLE_POLICY_ALIASES[cycle_policy]
+    except (KeyError, TypeError):
+        raise ValueError(
+            "cycle_policy must be one of 'raise' or 'skip', not: %r"
+            % (cycle_policy,))
+
+
+def _normalize_max_depth(max_depth):
+    if max_depth is None:
+        return None
+    if isinstance(max_depth, bool) or not isinstance(max_depth, int):
+        raise TypeError('max_depth expected an integer or None, not: %r'
+                        % (max_depth,))
+    if max_depth < 0:
+        raise ValueError('max_depth expected a non-negative integer, not: %r'
+                         % (max_depth,))
+    return max_depth
+
+
+class _RecursiveConfig:
+    """Per-``**`` traversal settings carried on a TType operation."""
+    __slots__ = ('cycle_policy', 'max_depth')
+
+    def __init__(self, cycle_policy=None, max_depth=None, **kwargs):
+        if cycle_policy is None:
+            cycle_policy = kwargs.pop('on_cycle', kwargs.pop('cycle', None))
+        if kwargs:
+            raise TypeError('unexpected recursive traversal keyword args: %r'
+                            % sorted(kwargs))
+        self.cycle_policy = (None if cycle_policy is None
+                             else _normalize_cycle_policy(cycle_policy))
+        self.max_depth = _normalize_max_depth(max_depth)
+
+    def is_empty(self):
+        return self.cycle_policy is None and self.max_depth is None
+
+    def __eq__(self, other):
+        return (isinstance(other, _RecursiveConfig)
+                and self.cycle_policy == other.cycle_policy
+                and self.max_depth == other.max_depth)
+
+    def __hash__(self):
+        return hash((self.cycle_policy, self.max_depth))
+
+    def __repr__(self):
+        return ('_RecursiveConfig(cycle_policy=%r, max_depth=%r)'
+                % (self.cycle_policy, self.max_depth))
+
+
+class CycleError(GlomError):
+    """Raised when recursive traversal encounters a back edge.
+
+    ``path`` points at the back edge (the repeated child), while
+    ``repeated_path`` points at the first occurrence of that object on
+    the current traversal path.
+    """
+    def __init__(self, path, repeated_path=None):
+        self.path = path
+        self.cycle_path = path
+        self.repeated_path = repeated_path
+
+    def get_message(self):
+        msg = 'cycle detected during recursive traversal at %r' % (self.path,)
+        if self.repeated_path is not None:
+            msg += ' (repeats %r)' % (self.repeated_path,)
+        return msg
+
+    def __repr__(self):
+        cn = self.__class__.__name__
+        return f'{cn}({self.path!r}, {self.repeated_path!r})'
+
+
+class MaxDepthError(GlomError):
+    """Raised when recursive traversal exceeds ``max_depth``."""
+    def __init__(self, path, max_depth, depth=None):
+        self.path = path
+        self.max_depth = max_depth
+        self.depth = depth
+
+    def get_message(self):
+        return ('maximum recursive traversal depth %r exceeded at %r'
+                % (self.max_depth, self.path))
+
+    def __repr__(self):
+        cn = self.__class__.__name__
+        return f'{cn}({self.path!r}, {self.max_depth!r}, {self.depth!r})'
+
+
+CycleDetectedError = CycleError
+MaxDepthExceededError = MaxDepthError
+
+
 if getattr(__builtins__, '__dict__', None) is not None:
     # pypy's __builtins__ is a module, as is CPython's REPL, but at
     # normal execution time it's a dict?
@@ -610,7 +738,10 @@ class Path:
     This is the default behavior when the top-level :func:`~glom.glom` 
     function gets a string spec.
     """
-    def __init__(self, *path_parts):
+    def __init__(self, *path_parts, **kwargs):
+        cycle_policy = kwargs.pop('cycle_policy', None)
+        max_depth = kwargs.pop('max_depth', None)
+        config = _RecursiveConfig(cycle_policy, max_depth, **kwargs)
         if not path_parts:
             self.path_t = T
             return
@@ -630,10 +761,22 @@ class Path:
                                      % sub_parts[0])
                 i = 1
                 while i < len(sub_parts):
-                    path_t = _t_child(path_t, sub_parts[i], sub_parts[i + 1])
+                    op, arg = sub_parts[i], sub_parts[i + 1]
+                    if op == 'X' and not config.is_empty():
+                        if not isinstance(arg, _RecursiveConfig) or arg.is_empty():
+                            arg = config
+                    path_t = _t_child(path_t, op, arg)
                     i += 2
             else:
                 path_t = _t_child(path_t, 'P', part)
+        if not config.is_empty():
+            ops = path_t.__ops__
+            configured_ops = [ops[0]]
+            for i in range(1, len(ops), 2):
+                op, arg = ops[i], ops[i + 1]
+                configured_ops.extend((op, config if op == 'X' else arg))
+            path_t = TType()
+            path_t.__ops__ = tuple(configured_ops)
         self.path_t = path_t
 
     _CACHE = {True: {}, False: {}}
@@ -641,20 +784,28 @@ class Path:
     _STAR_WARNED = False
 
     @classmethod
-    def from_text(cls, text):
+    def from_text(cls, text, cycle_policy=None, max_depth=None, **kwargs):
         """Make a Path from .-delimited text:
 
         >>> Path.from_text('a.b.c')
         Path('a', 'b', 'c')
 
         This is the default behavior when :func:`~glom.glom` gets a string spec.
+
+        Recursive (``**``) segments accept ``cycle_policy`` and
+        ``max_depth`` in the same way as ``T.__starstar__()``.
         """
+        config = _RecursiveConfig(cycle_policy, max_depth, **kwargs)
+
         def create():
             segs = text.split('.')
             if PATH_STAR:
                 segs = [
                     _T_STAR if seg == '*' else
-                    _T_STARSTAR if seg == '**' else seg
+                    (T.__starstar__(cycle_policy=config.cycle_policy,
+                                    max_depth=config.max_depth)
+                     if seg == '**' and not config.is_empty() else
+                     _T_STARSTAR if seg == '**' else seg)
                     for seg in segs]
             elif not cls._STAR_WARNED:
                 if '*' in segs or '**' in segs:
@@ -664,6 +815,8 @@ class Path:
                     cls._STAR_WARNED = True
             return cls(*segs)
 
+        if not config.is_empty():
+            return create()
         cache = cls._CACHE[PATH_STAR]  # remove this when PATH_STAR is default
         if text not in cache:
             if len(cache) > cls._MAX_CACHE:
@@ -1451,8 +1604,9 @@ class TType:
     def __star__(self):
         return _t_child(self, 'x', None)
 
-    def __starstar__(self):
-        return _t_child(self, 'X', None)
+    def __starstar__(self, cycle_policy=None, max_depth=None, **kwargs):
+        config = _RecursiveConfig(cycle_policy, max_depth, **kwargs)
+        return _t_child(self, 'X', config)
 
     def __stars__(self):
         """how many times the result will be wrapped in extra lists"""
@@ -1538,11 +1692,14 @@ def _s_first_magic(scope, key, _t):
     return cur
 
 
-def _t_eval(target, _t, scope):
+def _t_eval(target, _t, scope, _depth=0, _path_parts=(), _ancestor_ids=()):
     t_path = _t.__ops__
     i = 1
     fetch_till = len(t_path)
     root = t_path[0]
+    cur_depth = _depth
+    cur_parts = tuple(_path_parts)
+    cur_ancestors = tuple(_ancestor_ids)
     if root is T:
         cur = target
     elif root is S or root is A:
@@ -1568,14 +1725,18 @@ def _t_eval(target, _t, scope):
     while i < fetch_till:
         op, arg = t_path[i], t_path[i + 1]
         arg = arg_val(target, arg, scope)
+        prev_cur = cur
+        advanced = False
         if op == '.':
             try:
                 cur = getattr(cur, arg)
+                advanced = True
             except AttributeError as e:
                 pae = PathAccessError(e, Path(_t), i // 2)
         elif op == '[':
             try:
                 cur = cur[arg]
+                advanced = True
             except (KeyError, IndexError, TypeError) as e:
                 pae = PathAccessError(e, Path(_t), i // 2)
         elif op == 'P':
@@ -1583,31 +1744,43 @@ def _t_eval(target, _t, scope):
             get = scope[TargetRegistry].get_handler('get', cur, path=t_path[2:i+2:2])
             try:
                 cur = get(cur, arg)
+                advanced = True
             except Exception as e:
                 pae = PathAccessError(e, Path(_t), i // 2)
         elif op in 'xX':
-            nxt = []
             get_handler = scope[TargetRegistry].get_handler
-            if op == 'x':  # increases arity of cur each time through
-                # TODO: so many try/except -- could scope[TargetRegistry] stuff be cached on type?
-                _extend_children(nxt, cur, get_handler)
-            elif op == 'X':
-                sofar = set()
-                _extend_children(nxt, cur, get_handler)
-                for item in nxt:
-                    if id(item) not in sofar:
-                        sofar.add(id(item))
-                        _extend_children(nxt, item, get_handler)
-                nxt.insert(0, cur)
-            # handle the rest of the t_path in recursive calls
-            cur = []
             todo = TType()
             todo.__ops__ = (root,) + t_path[i+2:]
-            for child in nxt:
-                try:
-                    cur.append(_t_eval(child, todo, scope))
-                except PathAccessError:
-                    pass
+            cur = []
+            if op == 'x':  # increases arity of cur each time through
+                # TODO: so many try/except -- could scope[TargetRegistry] stuff be cached on type?
+                for child, child_part in _iter_children(prev_cur, get_handler):
+                    try:
+                        cur.append(_t_eval(
+                            child, todo, scope,
+                            cur_depth + 1,
+                            cur_parts + (child_part,),
+                            cur_ancestors + (id(prev_cur),)))
+                    except PathAccessError:
+                        pass
+            elif op == 'X':
+                config = arg if isinstance(arg, _RecursiveConfig) else None
+                cycle_policy, max_depth = _resolve_traversal_settings(
+                    scope, config)
+                for child, child_parts, child_depth, child_ancestors in (
+                        _walk_descendants(
+                            prev_cur, get_handler,
+                            cycle_policy=cycle_policy,
+                            max_depth=max_depth,
+                            path_parts=cur_parts,
+                            depth=cur_depth,
+                            ancestor_ids=cur_ancestors)):
+                    try:
+                        cur.append(_t_eval(
+                            child, todo, scope,
+                            child_depth, child_parts, child_ancestors))
+                    except PathAccessError:
+                        pass
             break  # we handled the rest in recursive call, break loop
         elif op == '(':
             args, kwargs = arg
@@ -1649,6 +1822,10 @@ def _t_eval(target, _t, scope):
                 pae = PathAccessError(e, Path(_t), i // 2)
         if pae:
             raise pae
+        if advanced:
+            cur_ancestors = cur_ancestors + (id(prev_cur),)
+            cur_parts = cur_parts + (arg,)
+            cur_depth += 1
         i += 2
     if root is A:
         op, arg = t_path[-2:]
@@ -1675,7 +1852,12 @@ def _assign_op(dest, op, arg, val, path, scope):
         raise ValueError('unsupported T operation for assignment')
 
 
-def _extend_children(children, item, get_handler):
+def _iter_children(item, get_handler):
+    """Yield ``(child, path_part)`` for each traversable child of *item*.
+
+    Errors reading individual children are ignored, matching the
+    historical behavior of recursive wildcards.
+    """
     try:  # dict or obj-like
         keys = get_handler('keys', item)
         get = get_handler('get', item)
@@ -1683,21 +1865,74 @@ def _extend_children(children, item, get_handler):
         try:
             iterate = get_handler('iterate', item)
         except UnregisteredTarget:
-            pass
-        else:
-            try:  # list-like
-                children.extend(iterate(item))
-            except Exception:
-                pass
+            return
+        try:  # list-like
+            for index, child in enumerate(iterate(item)):
+                yield child, index
+        except Exception:
+            return
     else:
         try:
             for key in keys(item):
                 try:
-                    children.append(get(item, key))
+                    yield get(item, key), key
                 except Exception:
                     pass
         except Exception:
-            pass
+            return
+
+
+def _extend_children(children, item, get_handler):
+    children.extend(child for child, _ in _iter_children(item, get_handler))
+
+
+def _resolve_traversal_settings(scope, config):
+    if config is not None and config.cycle_policy is not None:
+        cycle_policy = config.cycle_policy
+    else:
+        cycle_policy = scope.get(CYCLE_POLICY, _DEFAULT_CYCLE_POLICY)
+    if config is not None and config.max_depth is not None:
+        max_depth = config.max_depth
+    else:
+        max_depth = scope.get(MAX_DEPTH, None)
+    return (_normalize_cycle_policy(cycle_policy),
+            _normalize_max_depth(max_depth))
+
+
+def _walk_descendants(root, get_handler, cycle_policy, max_depth,
+                      path_parts=(), depth=0, ancestor_ids=()):
+    """Walk *root* and its descendants breadth-first.
+
+    Only identities on the current root-to-node path are considered
+    visited. This distinguishes a true back edge from a shared object
+    reached through another, acyclic path.
+    """
+    path_parts = tuple(path_parts)
+    ancestor_ids = tuple(ancestor_ids)
+    if max_depth is not None and depth > max_depth:
+        raise MaxDepthError(Path(*path_parts), max_depth, depth)
+
+    queue = [(root, path_parts, depth, ancestor_ids)]
+    index = 0
+    while index < len(queue):
+        node, node_parts, node_depth, node_ancestors = queue[index]
+        index += 1
+        yield node, node_parts, node_depth, node_ancestors
+
+        child_ancestors = node_ancestors + (id(node),)
+        for child, path_part in _iter_children(node, get_handler):
+            child_parts = node_parts + (path_part,)
+            child_depth = node_depth + 1
+            child_path = Path(*child_parts)
+            if id(child) in child_ancestors:
+                if cycle_policy == 'raise':
+                    repeated_idx = child_ancestors.index(id(child))
+                    repeated_path = Path(*child_parts[:repeated_idx])
+                    raise CycleError(child_path, repeated_path)
+                continue
+            if max_depth is not None and child_depth > max_depth:
+                raise MaxDepthError(child_path, max_depth, child_depth)
+            queue.append((child, child_parts, child_depth, child_ancestors))
 
 
 T = TType()  # target aka Mr. T aka "this"
@@ -1745,7 +1980,17 @@ def _format_t(path, root=T):
         elif op == 'x':
             prepr.append(".__star__()")
         elif op == 'X':
-            prepr.append(".__starstar__()")
+            config = arg if isinstance(arg, _RecursiveConfig) else None
+            if config is None or config.is_empty():
+                prepr.append(".__starstar__()")
+            else:
+                config_kwargs = []
+                if config.cycle_policy is not None:
+                    config_kwargs.append(('cycle_policy', config.cycle_policy))
+                if config.max_depth is not None:
+                    config_kwargs.append(('max_depth', config.max_depth))
+                prepr.append(format_invocation(
+                    '.__starstar__', kwargs=config_kwargs, repr=bbrepr))
         elif op in ('_', '~'):  # unary arithmetic operators
             if any([o in path[:i] for o in '+-/%:&|^~_']):
                 prepr = ['('] + prepr + [')']
@@ -2209,6 +2454,19 @@ def glom(target, spec, **kwargs):
     >>> target = {'a': [{'k': 'v3'}, {'k': 'v4'}], 'k': 'v0'}
     >>> glom(target, '**.k')
     ['v0', 'v3', 'v4']
+
+    Recursive traversal applies a cycle policy to object graphs.
+    ``cycle_policy='raise'`` (the default) reports the path of the back
+    edge with a :class:`CycleError`; ``cycle_policy='skip'`` omits that
+    edge and continues. Objects reached by separate, acyclic paths are
+    still visited once per path. ``max_depth`` limits recursion depth,
+    with the target at depth zero.
+
+    >>> target = {'a': {'b': 'c'}}
+    >>> glom(target, T.__starstar__(max_depth=0))
+    Traceback (most recent call last):
+    ...
+    MaxDepthError: maximum recursive traversal depth 0 exceeded at Path('a')
     
     The next example shows how to use nested data to 
     access many fields at once, and make a new nested structure.
@@ -2248,6 +2506,12 @@ def glom(target, spec, **kwargs):
          glom raises errors through.
        scope (dict): Additional data that can be accessed
          via S inside the glom-spec. Read more: :ref:`scope`.
+       cycle_policy (str): How recursive (``**``) traversal handles
+         cycles. ``'raise'`` (default) raises :class:`CycleError`;
+         ``'skip'`` skips the back edge.
+       max_depth (int): Maximum recursive (``**``) traversal depth,
+         with the target at depth zero. Exceeding it raises
+         :class:`MaxDepthError`.
 
     It's a small API with big functionality, and glom's power is
     only surpassed by its intuitiveness. Give it a whirl!
@@ -2257,12 +2521,21 @@ def glom(target, spec, **kwargs):
     default = kwargs.pop('default', None if 'skip_exc' in kwargs else _MISSING)
     skip_exc = kwargs.pop('skip_exc', () if default is _MISSING else GlomError)
     glom_debug = kwargs.pop('glom_debug', GLOM_DEBUG)
+    cycle_policy = kwargs.pop('cycle_policy', None)
+    if cycle_policy is None:
+        cycle_policy = kwargs.pop('on_cycle', kwargs.pop('cycle', None))
+    else:
+        kwargs.pop('on_cycle', None)
+        kwargs.pop('cycle', None)
+    max_depth = kwargs.pop('max_depth', None)
     scope = _DEFAULT_SCOPE.new_child({
         Path: kwargs.pop('path', []),
         Inspect: kwargs.pop('inspector', None),
         MODE: AUTO,
         MIN_MODE: None,
         CHILD_ERRORS: [],
+        CYCLE_POLICY: _normalize_cycle_policy(cycle_policy),
+        MAX_DEPTH: _normalize_max_depth(max_depth),
         'globals': ScopeVars({}, {}),
     })
     scope[UP] = scope

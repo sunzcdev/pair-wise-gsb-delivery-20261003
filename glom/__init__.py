@@ -25,6 +25,10 @@ from glom.core import (glom,
                        PathAssignError,
                        CoalesceError,
                        UnregisteredTarget,
+                       CycleError,
+                       CycleDetectedError,
+                       MaxDepthError,
+                       MaxDepthExceededError,
                        T, S, A)
 
 from glom.reduction import Sum, Fold, Flatten, flatten, FoldError, Merge, merge

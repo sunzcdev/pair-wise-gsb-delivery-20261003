@@ -37,6 +37,8 @@ Here is a short list of links to all public exception types in glom.
      * :exc:`~glom.TypeMatchError`
      * :exc:`~glom.CheckError`
      * :exc:`~glom.UnregisteredTarget`
+     * :exc:`~glom.CycleError`
+     * :exc:`~glom.MaxDepthError`
      * :exc:`~glom.BadSpec`
 
 .. _reading-exceptions:

@@ -1,6 +1,7 @@
 from pytest import raises
 
-from glom import glom, Path, S, T, A, PathAccessError, GlomError, BadSpec, Or, Assign, Delete
+from glom import (glom, Path, S, T, A, PathAccessError, GlomError, BadSpec,
+                  Or, Assign, Delete, CycleError, MaxDepthError)
 from glom import core
 
 def test_list_path_access():
@@ -266,6 +267,47 @@ def test_star_broadcast():
     assert glom(val, Path.from_text('a.*').path_t + 1) == [2, 3, 4]
     val = {'a': [{'b': [{'c': 1}, {'c': 2}, {'c': 3}]}]}
     assert glom(val, Path.from_text('**.c').path_t + 1) == [2, 3, 4]
+
+
+def test_recursive_cycle_policy():
+    target = {'value': 1}
+    target['self'] = target
+
+    assert glom(target, '**', cycle_policy='skip') == [target, 1]
+    assert glom(target, T.__starstar__(cycle_policy='skip')) == [target, 1]
+    assert glom(target, Path.from_text('**', cycle_policy='skip')) == [target, 1]
+
+    with raises(CycleError) as exc_info:
+        glom(target, T.__starstar__(cycle_policy='raise'))
+    assert exc_info.value.path == Path('self')
+    assert exc_info.value.repeated_path == Path()
+
+    # ordinary (non-recursive) paths do not apply cycle policy
+    assert glom(target, 'self', cycle_policy='raise') is target
+
+
+def test_recursive_shared_reference():
+    shared = {'value': 1}
+    target = {'left': {'shared': shared}, 'right': {'shared': shared}}
+
+    result = glom(target, T.__starstar__(cycle_policy='skip'))
+    assert sum(item is shared for item in result) == 2
+    assert sum(item is shared['value'] for item in result) == 2
+
+
+def test_recursive_max_depth():
+    target = {'a': {'b': {'c': 1}}}
+
+    with raises(MaxDepthError) as exc_info:
+        glom(target, T.__starstar__(max_depth=1))
+    assert exc_info.value.path == Path('a', 'b')
+    assert exc_info.value.max_depth == 1
+    assert "Path('a', 'b')" in str(exc_info.value)
+
+    result = glom(target, T.__starstar__(max_depth=3))
+    assert len(result) == 4
+    assert result[0] is target
+    assert result[-1] == 1
 
 
 def test_star_warning():

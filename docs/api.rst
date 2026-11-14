@@ -239,6 +239,10 @@ and debugging exceptions, see ":doc:`debugging`".
 
 .. autoclass:: glom.UnregisteredTarget
 
+.. autoclass:: glom.CycleError
+
+.. autoclass:: glom.MaxDepthError
+
 .. autoclass:: glom.BadSpec
 
 .. autoclass:: glom.GlomError
