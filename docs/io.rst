@@ -92,6 +92,7 @@ Delimited files
 ^^^^^^^^^^^^^^^
 
 .. autofunction:: petl.io.csv.fromcsv
+.. autofunction:: petl.io.csv.fromcsv_with_diagnostics
 .. autofunction:: petl.io.csv.tocsv
 .. autofunction:: petl.io.csv.appendcsv
 .. autofunction:: petl.io.csv.teecsv

@@ -7,7 +7,11 @@ from petl.io.sources import FileSource, GzipSource, BZ2Source, ZipSource, \
     MemorySource
 
 from petl.io.csv import fromcsv, fromtsv, tocsv, appendcsv, totsv, appendtsv, \
-    teecsv, teetsv
+    teecsv, teetsv, fromcsv_with_diagnostics, fromcsv_diagnostics, \
+    fromcsv_diag, CSVRecordDiagnostic, CSVDiagnosticResult, \
+    CSVDiagnosticError, CSVRecordError, CSVStructureError, CSVDecodeError, \
+    CSVColumnError, CSVColumnMismatchError, CSVBadRecordError, \
+    CSVParseError, CSVDecodingError, CSVDiagnostic, CSVError
 
 from petl.io.pickle import frompickle, topickle, appendpickle, teepickle
 

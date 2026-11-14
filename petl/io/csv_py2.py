@@ -18,12 +18,14 @@ def fromcsv_impl(source, **kwargs):
 
 class CSVView(Table):
 
-    def __init__(self, source=None, encoding=None, errors='strict', header=None, **csvargs):
+    def __init__(self, source=None, encoding=None, errors='strict', header=None,
+                 skip=0, **csvargs):
         self.source = source
         self.encoding = encoding
         self.errors = errors
         self.csvargs = csvargs
         self._header = header
+        self.skip = skip or 0
 
     def __iter__(self):
         if self._header is not None:
@@ -36,6 +38,9 @@ class CSVView(Table):
         if codec.name == 'ascii':
             # bypass encoding
             with self.source.open('rU') as csvfile:
+                for _ in range(self.skip):
+                    if not csvfile.readline():
+                        break
                 reader = csv.reader(csvfile, **self.csvargs)
                 for row in reader:
                     yield tuple(row)
@@ -43,6 +48,9 @@ class CSVView(Table):
         # non-ascii
         else:
             with self.source.open('rb') as buf:
+                for _ in range(self.skip):
+                    if not buf.readline():
+                        break
                 reader = UnicodeReader(buf, encoding=self.encoding,
                                        errors=self.errors, **self.csvargs)
                 for row in reader:
