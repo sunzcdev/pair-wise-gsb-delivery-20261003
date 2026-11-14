@@ -77,6 +77,13 @@ def _make_parse_async(backend):
         )
     return parse_async
 
+def _make_structured_parse_async(backend):
+    def structured_parse_async(f, buf_size=64*1024, **config):
+        return async_iterable(f, buf_size,
+            *common._structured_parse_pipeline(backend, config)
+        )
+    return structured_parse_async
+
 def _make_items_async(backend):
     def items_async(f, prefix, map_type=None, buf_size=64*1024, **config):
         return async_iterable(f, buf_size,

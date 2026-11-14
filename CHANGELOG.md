@@ -2,6 +2,13 @@
 
 ## Development
 
+* Added a structured-path event interface: the new `structured_parse`
+  function (with its `_coro`/`_async` variants, available on all backends)
+  yields `(path, event, value)` tuples where the path is a tuple of typed
+  segments (`str` object keys, `int` array positions) instead of an ambiguous
+  dot-separated string prefix. `items` and `kvitems` (and their variants)
+  also accept such a tuple/list path for exact matching;
+  string prefixes keep working as before.
 * Fixed handling of integers longer than `sys.get_int_max_str_digits()`:
   the `yajl2_c` backend no longer crashes on them, and all backends
   now raise the `ValueError` produced by `int()` (#188).

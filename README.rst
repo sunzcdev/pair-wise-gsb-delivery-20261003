@@ -458,6 +458,66 @@ the prefix works as the selection
 for which objects should be automatically built and returned by ijson.
 
 
+Structured paths
+================
+
+String prefixes are ambiguous:
+a key containing a dot is indistinguishable from a hierarchy separator,
+the literal key ``item`` clashes with the array element marker,
+and individual array elements cannot be told apart.
+As an alternative, the ``ijson.structured_parse`` function
+(and its ``structured_parse_coro`` and ``structured_parse_async`` variants)
+generates ``(path, event, value)`` tuples
+where the path is a tuple of typed segments instead of a string:
+
+- object members are represented by their key as a ``str``
+  (even if it is empty, contains dots, or looks like a number), and
+- array elements are represented by their 0-based position as an ``int``.
+
+The root of the document is represented by the empty tuple ``()``.
+Container-related events carry the path of the container itself:
+``start_map``/``end_map`` and ``start_array``/``end_array``
+carry the path of the map or array being started or ended,
+and ``map_key`` carries the path of the map containing the key.
+Scalar events carry the full path of the value.
+Array positions are tracked with a running counter while parsing,
+so array contents are never buffered to compute them.
+
+For example, given this document::
+
+    {
+      "array": [1, 2],
+      "map": {
+        "key": "value"
+      }
+    }
+
+``ijson.structured_parse`` would yield these events::
+
+    ((), 'start_map', None)
+    ((), 'map_key', 'array')
+    (('array',), 'start_array', None)
+    (('array', 0), 'number', 1)
+    (('array', 1), 'number', 2)
+    (('array',), 'end_array', None)
+    ((), 'map_key', 'map')
+    (('map',), 'start_map', None)
+    (('map',), 'map_key', 'key')
+    (('map', 'key'), 'string', 'value')
+    (('map',), 'end_map', None)
+    ((), 'end_map', None)
+
+The ``items`` and ``kvitems`` functions
+(and all their variants)
+also accept a structured path
+(a tuple or list of segments)
+instead of a string prefix,
+in which case matches are exact:
+``('0.1',)`` selects the member literally named ``0.1``,
+and ``('a', 0, 'b')`` selects ``b`` within the *first* element of ``a``.
+String prefixes keep working as before.
+
+
 Backends
 ========
 
