@@ -1,5 +1,7 @@
 import operator
 import itertools
+import copy
+from collections.abc import Mapping
 from pprint import pprint
 
 from boltons.typeutils import make_sentinel
@@ -345,4 +347,509 @@ def merge(target, **kwargs):
     if kwargs:
         raise TypeError('unexpected keyword args: %r' % sorted(kwargs.keys()))
     spec = Merge(subspec, init, op)
+    return glom(target, spec)
+
+
+class DeepMergeError(FoldError):
+    """Base error raised for invalid or impossible deep merges."""
+
+    def __init__(self, message, path=None, **context):
+        self.path = path
+        self.context = context
+        super().__init__(message)
+
+
+class DeepMergeConflictError(DeepMergeError):
+    """Raised when scalar values conflict and ``conflict='error'``."""
+
+
+class DeepMergeTypeError(DeepMergeError):
+    """Raised when mapping, list, and scalar structures cannot be merged."""
+
+
+class DeepMergeCycleError(DeepMergeError):
+    """Raised when a circular reference is found at a specific path."""
+
+    def __init__(self, path, first_path=None):
+        if first_path is None:
+            super().__init__(path)
+        else:
+            super().__init__(
+                'circular reference at %s (already seen at %s)'
+                % (path, first_path), path, first_path=first_path)
+
+    def __str__(self):
+        # Rendering glom's target trace would recurse into the very
+        # cycle this error is reporting.
+        try:
+            return super().__str__()
+        except RecursionError:
+            return '%s: %s' % (
+                type(self).__name__, Exception.__str__(self))
+
+
+class DeepMergeKeyError(DeepMergeError):
+    """Raised for invalid element keys during keyed list merging."""
+
+
+_SCALAR_POLICIES = {
+    'first': 'first',
+    'keep_first': 'first',
+    'keep-first': 'first',
+    'prefer_first': 'first',
+    'first_wins': 'first',
+    'last': 'last',
+    'keep_last': 'last',
+    'keep-last': 'last',
+    'prefer_last': 'last',
+    'last_wins': 'last',
+    'error': 'error',
+    'raise': 'error',
+}
+
+_LIST_POLICIES = {
+    'replace': 'replace',
+    'concat': 'concat',
+    'concatenate': 'concat',
+    'append': 'concat',
+    'extend': 'concat',
+    'by_key': 'by_key',
+    'by-key': 'by_key',
+    'keyed': 'by_key',
+    'merge': 'by_key',
+    'merge_by_key': 'by_key',
+    'merge-by-key': 'by_key',
+}
+
+_MISSING_KEY_POLICIES = {
+    'error': 'error',
+    'raise': 'error',
+    'append': 'append',
+    'keep': 'append',
+    'preserve': 'append',
+    'skip': 'skip',
+    'exclude': 'skip',
+    'ignore': 'skip',
+}
+
+_DUPLICATE_KEY_POLICIES = {
+    'merge': 'merge',
+    'error': 'error',
+    'raise': 'error',
+    'first': 'first',
+    'keep_first': 'first',
+    'keep-first': 'first',
+    'last': 'last',
+    'replace': 'last',
+    'keep_last': 'last',
+    'keep-last': 'last',
+}
+
+
+def _normalize_choice(value, choices, option_name):
+    if isinstance(value, str):
+        normalized = choices.get(value.lower())
+        if normalized is not None:
+            return normalized
+    allowed = sorted(set(choices.values()))
+    raise ValueError('expected %s to be one of %r, not %r'
+                     % (option_name, allowed, value))
+
+
+def _resolve_option(name, value, default, aliases, kwargs):
+    alias_values = []
+    for alias in aliases:
+        if alias in kwargs:
+            alias_values.append((alias, kwargs.pop(alias)))
+
+    if alias_values:
+        first_alias, first_value = alias_values[0]
+        for alias, alias_value in alias_values[1:]:
+            if alias_value != first_value:
+                raise TypeError('conflicting values for %s and %s'
+                                % (first_alias, alias))
+        if value != default and value != first_value:
+            raise TypeError('conflicting values for %s and %s'
+                            % (name, first_alias))
+        value = first_value
+    return value
+
+
+def _path_key(path, key):
+    if isinstance(key, str) and key.isidentifier():
+        return '%s.%s' % (path, key)
+    if path == '$':
+        return '$[%r]' % (key,)
+    return '%s[%r]' % (path, key)
+
+
+def _path_index(path, index):
+    return '%s[%d]' % (path, index)
+
+
+class DeepMerge(Fold):
+    """Recursively merge an iterable of mapping documents.
+
+    Unlike :class:`Merge`, which performs a shallow
+    :meth:`~dict.update`, ``DeepMerge`` descends into nested mappings
+    and lists. Every input layer is copied, so the result never shares
+    mutable containers with the source documents.
+
+    Args:
+       subspec: A spec for locating the iterable of documents. Defaults
+          to ``T``.
+       conflict (str): What to do when two scalar values differ:
+          ``"last"`` (the default), ``"first"``, or ``"error"``.
+       lists (str): How to merge two lists. There is deliberately no
+          default: callers must choose ``"replace"``, ``"concat"``, or
+          ``"by_key"`` when lists are present.
+       key: The mapping key used to identify list elements when
+          ``lists="by_key"``. May also be a callable returning an
+          element's identity.
+       missing_key (str): Policy for keyed list elements without
+          *key*: ``"error"`` (the default), ``"append"``, or ``"skip"``.
+       duplicate_key (str): Policy for repeated element keys:
+          ``"merge"`` (the default), ``"error"``, ``"first"``, or
+          ``"last"``.
+       reject_cycles (bool): Circular references are rejected by
+          default, with the offending and original paths included in
+          the error.
+
+    Keyed merges retain the order in which element keys first appear.
+    Repeated keys merge recursively in place, so their original list
+    position is retained.
+
+    A mapping value may never be merged into a list value, or vice
+    versa. Such structural changes raise :class:`DeepMergeTypeError`
+    with the full path, rather than being silently coerced.
+
+    Circular references are always rejected with
+    :class:`DeepMergeCycleError`, which includes both the path at which
+    the cycle was detected and the path where the container was first
+    seen.
+    """
+
+    def __init__(self, subspec=T, conflict='last', lists=None, key=None,
+                 missing_key='error', duplicate_key='merge',
+                 reject_cycles=True, **kwargs):
+        conflict = _resolve_option(
+            'conflict', conflict, 'last',
+            ('on_conflict', 'on_scalar_conflict', 'scalar_conflict',
+             'scalar_policy', 'scalar'), kwargs)
+        lists = _resolve_option(
+            'lists', lists, None,
+            ('list_strategy', 'list_merge', 'list_mode', 'on_list',
+             'list_policy'),
+            kwargs)
+        key = _resolve_option(
+            'key', key, None,
+            ('list_key', 'element_key', 'key_field', 'by_key'), kwargs)
+        missing_key = _resolve_option(
+            'missing_key', missing_key, 'error',
+            ('on_missing_key', 'on_missing', 'missing_key_policy',
+             'missing'), kwargs)
+        duplicate_key = _resolve_option(
+            'duplicate_key', duplicate_key, 'merge',
+            ('on_duplicate_key', 'on_duplicate', 'duplicate_key_policy',
+             'duplicate', 'duplicates'), kwargs)
+        reject_cycles = _resolve_option(
+            'reject_cycles', reject_cycles, True,
+            ('reject_cycle',), kwargs)
+        if kwargs:
+            raise TypeError('unexpected keyword args: %r'
+                            % sorted(kwargs.keys()))
+
+        self.subspec = subspec
+        self.conflict = _normalize_choice(
+            conflict, _SCALAR_POLICIES, 'conflict')
+        if lists is not None:
+            lists = _normalize_choice(lists, _LIST_POLICIES, 'lists')
+        self.lists = lists
+        self.key = key
+        self.missing_key = _normalize_choice(
+            missing_key, _MISSING_KEY_POLICIES, 'missing_key')
+        self.duplicate_key = _normalize_choice(
+            duplicate_key, _DUPLICATE_KEY_POLICIES, 'duplicate_key')
+        if reject_cycles is not True:
+            raise ValueError(
+                'reject_cycles must be True; circular references are '
+                'always rejected')
+
+        if lists == 'by_key' and key is None:
+            raise ValueError('lists="by_key" requires an element key')
+        if lists != 'by_key' and key is not None:
+            raise ValueError('the element key is only used with lists="by_key"')
+
+    def glomit(self, target, scope):
+        is_agg = False
+        if scope[MODE] is GROUP and scope.get(CUR_AGG) is None:
+            scope[CUR_AGG] = self
+            is_agg = True
+
+        if self.subspec is not T:
+            target = scope[glom](target, self.subspec, scope)
+
+        if is_agg:
+            return self._agg(target, scope[ACC_TREE])
+
+        if isinstance(target, Mapping):
+            iterator = (target,)
+        else:
+            try:
+                iterator = target_iter(target, scope)
+            except UnregisteredTarget as ut:
+                raise FoldError(
+                    'can only DeepMerge on iterable targets, not %s type (%s)'
+                    % (type(target).__name__, ut))
+        return self._fold(iterator)
+
+    def _fold(self, iterator):
+        result = {}
+        for document in iterator:
+            if not isinstance(document, Mapping):
+                raise DeepMergeError(
+                    'expected each document to be a mapping, not %s'
+                    % type(document).__name__, '$')
+            self._merge_mapping(result, document, '$', {})
+        return result
+
+    def _agg(self, target, tree):
+        if self not in tree:
+            tree[self] = {}
+        if not isinstance(target, Mapping):
+            raise DeepMergeError(
+                'expected each document to be a mapping, not %s'
+                % type(target).__name__, '$')
+        self._merge_mapping(tree[self], target, '$', {})
+        return tree[self]
+
+    def _enter(self, value, path, active):
+        first_path = active.get(id(value))
+        if first_path is not None:
+            raise DeepMergeCycleError(path, first_path)
+        active[id(value)] = path
+
+    def _clone(self, value, path, active):
+        if isinstance(value, Mapping):
+            self._enter(value, path, active)
+            try:
+                result = {}
+                for key, child in value.items():
+                    result[key] = self._clone(
+                        child, _path_key(path, key), active)
+                return result
+            finally:
+                del active[id(value)]
+
+        if isinstance(value, list):
+            return self._merge_lists([], value, path, active)
+
+        if isinstance(value, tuple):
+            self._enter(value, path, active)
+            try:
+                return tuple(self._clone(
+                    child, _path_index(path, index), active)
+                    for index, child in enumerate(value))
+            finally:
+                del active[id(value)]
+
+        try:
+            return copy.deepcopy(value)
+        except Exception as exc:
+            raise DeepMergeError(
+                'could not copy value at %s: %s' % (path, exc),
+                path) from exc
+
+    def _merge_mapping(self, destination, source, path, active):
+        self._enter(source, path, active)
+        try:
+            for key, source_value in source.items():
+                child_path = _path_key(path, key)
+                if key not in destination:
+                    destination[key] = self._clone(
+                        source_value, child_path, active)
+                else:
+                    destination[key] = self._merge_value(
+                        destination[key], source_value, child_path, active)
+        finally:
+            del active[id(source)]
+        return destination
+
+    def _merge_value(self, left, right, path, active):
+        if isinstance(left, Mapping):
+            if isinstance(right, Mapping):
+                return self._merge_mapping(left, right, path, active)
+            raise DeepMergeTypeError(
+                'cannot merge %s into mapping at %s'
+                % (type(right).__name__, path), path)
+
+        if isinstance(left, list):
+            if isinstance(right, list):
+                return self._merge_lists(left, right, path, active)
+            raise DeepMergeTypeError(
+                'cannot merge %s into list at %s'
+                % (type(right).__name__, path), path)
+
+        if isinstance(right, (Mapping, list)):
+            raise DeepMergeTypeError(
+                'cannot merge %s into %s at %s'
+                % (type(right).__name__, type(left).__name__, path), path)
+
+        return self._merge_scalars(left, right, path, active)
+
+    def _merge_scalars(self, left, right, path, active):
+        if type(left) is type(right) and _values_equal(left, right):
+            return left
+        if self.conflict == 'first':
+            return left
+        if self.conflict == 'last':
+            return self._clone(right, path, active)
+        raise DeepMergeConflictError(
+            'scalar conflict at %s: %r != %r' % (path, left, right),
+            path, left=left, right=right)
+
+    def _merge_lists(self, left, right, path, active):
+        if self.lists is None:
+            raise DeepMergeError(
+                'list merge strategy required at %s; pass lists="replace", '
+                '"concat", or "by_key"' % path, path)
+
+        self._enter(right, path, active)
+        try:
+            if self.lists == 'replace':
+                return [self._clone(
+                    item, _path_index(path, index), active)
+                    for index, item in enumerate(right)]
+
+            if self.lists == 'concat':
+                result = list(left)
+                result.extend(
+                    self._clone(item, _path_index(path, index), active)
+                    for index, item in enumerate(right))
+                return result
+
+            return self._merge_keyed_lists(left, right, path, active)
+        finally:
+            del active[id(right)]
+
+    def _element_key(self, item, path):
+        if not isinstance(item, Mapping):
+            raise DeepMergeTypeError(
+                'keyed list elements must be mappings, not %s at %s'
+                % (type(item).__name__, path), path)
+        try:
+            if callable(self.key):
+                return self.key(item)
+            return item[self.key]
+        except KeyError:
+            return _MISSING
+
+    def _check_element_key(self, key, path):
+        try:
+            hash(key)
+        except TypeError:
+            raise DeepMergeKeyError(
+                'unhashable element key %r at %s' % (key, path), path)
+
+    def _merge_keyed_lists(self, left, right, path, active):
+        result = list(left)
+        positions = {}
+        for index, item in enumerate(result):
+            item_path = _path_index(path, index)
+            key = self._element_key(item, item_path)
+            if key is _MISSING:
+                raise DeepMergeKeyError(
+                    'element at %s is missing key %r'
+                    % (item_path, self.key), item_path, key=self.key)
+            self._check_element_key(key, item_path)
+            positions[key] = index
+
+        for source_index, item in enumerate(right):
+            item_path = _path_index(path, source_index)
+            key = self._element_key(item, item_path)
+            if key is _MISSING:
+                if self.missing_key == 'error':
+                    raise DeepMergeKeyError(
+                        'element at %s is missing key %r'
+                        % (item_path, self.key), item_path, key=self.key)
+                if self.missing_key == 'skip':
+                    continue
+                result.append(self._clone(item, item_path, active))
+                continue
+
+            self._check_element_key(key, item_path)
+            if key not in positions:
+                positions[key] = len(result)
+                result.append(self._clone(item, item_path, active))
+                continue
+
+            destination_index = positions[key]
+            destination_path = _path_index(path, destination_index)
+            if self.duplicate_key == 'error':
+                raise DeepMergeKeyError(
+                    'duplicate element key %r at %s'
+                    % (key, item_path), item_path, key=key)
+            if self.duplicate_key == 'first':
+                continue
+            if self.duplicate_key == 'last':
+                result[destination_index] = self._clone(
+                    item, destination_path, active)
+                continue
+
+            destination = result[destination_index]
+            if not isinstance(destination, Mapping):
+                raise DeepMergeTypeError(
+                    'cannot merge repeated key %r into %s at %s'
+                    % (key, type(destination).__name__, destination_path),
+                    destination_path)
+            result[destination_index] = self._merge_mapping(
+                destination, item, destination_path, active)
+
+        return result
+
+    def __repr__(self):
+        cn = self.__class__.__name__
+        args = () if self.subspec is T else (self.subspec,)
+        kwargs = {}
+        if self.conflict != 'last':
+            kwargs['conflict'] = self.conflict
+        if self.lists is not None:
+            kwargs['lists'] = self.lists
+        if self.key is not None:
+            kwargs['key'] = self.key
+        if self.missing_key != 'error':
+            kwargs['missing_key'] = self.missing_key
+        if self.duplicate_key != 'merge':
+            kwargs['duplicate_key'] = self.duplicate_key
+        return format_invocation(cn, args, kwargs, repr=bbrepr)
+
+
+def _values_equal(left, right):
+    try:
+        return bool(left == right)
+    except Exception:
+        return False
+
+
+def deep_merge(target, *documents, **kwargs):
+    """Recursively merge mappings without modifying any input value.
+
+    The *target* is an iterable of mapping documents. Additional
+    mappings may be passed positionally for convenience.
+
+    >>> docs = [{'user': {'name': 'A', 'tags': ['x']}},
+    ...         {'user': {'id': 1, 'tags': ['y']}}]
+    >>> deep_merge(docs, lists='concat')
+    {'user': {'name': 'A', 'tags': ['x', 'y'], 'id': 1}}
+
+    For scalar conflict handling, list strategies, and keyed list
+    options, see :class:`DeepMerge`.
+    """
+    subspec = kwargs.pop('spec', T)
+    if documents:
+        if subspec is not T:
+            raise TypeError('spec cannot be combined with positional documents')
+        target = [target]
+        target.extend(documents)
+    spec = DeepMerge(subspec, **kwargs)
     return glom(target, spec)

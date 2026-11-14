@@ -503,6 +503,32 @@ def test_all_public_errors():
 
     _test_exc(TypeMatchError, 1, Match(str))
 
+    _test_exc(glom.DeepMergeError,
+              [{'items': []}],
+              glom.DeepMerge())
+
+    _test_exc(glom.DeepMergeConflictError,
+              [{'a': 1}, {'a': 2}],
+              glom.DeepMerge(conflict='error'))
+
+    _test_exc(glom.DeepMergeTypeError,
+              [{'a': []}, {'a': {}}],
+              glom.DeepMerge(lists='replace'))
+
+    _test_exc(glom.DeepMergeKeyError,
+              [{'items': [{}]}],
+              glom.DeepMerge(lists='by_key', key='id'))
+
+    class _CycleDocument(dict):
+        def __repr__(self):
+            return '<cyclic document>'
+
+    cycle_document = _CycleDocument()
+    cycle_document['self'] = cycle_document
+    _test_exc(glom.DeepMergeCycleError,
+              [cycle_document],
+              glom.DeepMerge(lists='replace'))
+
     for (target, spec, exc) in results:
         assert copy.copy(exc) is not exc
         exc_str = str(exc)

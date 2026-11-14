@@ -27,6 +27,29 @@ specifier types and two convenience functions:
 
 .. autoclass:: glom.Fold
 
+Deep-merging documents
+----------------------
+
+:func:`~glom.deep_merge` and :class:`~glom.DeepMerge` recursively
+combine heterogeneous mapping documents. Nested mappings merge by
+key, while scalar conflicts and every list merge have explicit
+policies. Inputs are copied at every level, and circular references
+are rejected with the full path.
+
+.. autofunction:: glom.deep_merge
+
+.. autoclass:: glom.DeepMerge
+
+.. autoclass:: glom.DeepMergeError
+
+.. autoclass:: glom.DeepMergeConflictError
+
+.. autoclass:: glom.DeepMergeTypeError
+
+.. autoclass:: glom.DeepMergeCycleError
+
+.. autoclass:: glom.DeepMergeKeyError
+
 Exceptions
 ----------
 
