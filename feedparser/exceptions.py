@@ -28,8 +28,10 @@
 
 __all__ = [
     "FeedparserError",
+    "BodyTooLargeError",
     "CharacterEncodingOverride",
     "CharacterEncodingUnknown",
+    "ContentDecodingError",
     "NonXMLContentType",
     "UndeclaredNamespace",
 ]
@@ -39,11 +41,19 @@ class FeedparserError(Exception):
     pass
 
 
+class BodyTooLargeError(FeedparserError):
+    pass
+
+
 class CharacterEncodingOverride(FeedparserError):
     pass
 
 
 class CharacterEncodingUnknown(FeedparserError):
+    pass
+
+
+class ContentDecodingError(FeedparserError):
     pass
 
 

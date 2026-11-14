@@ -28,8 +28,10 @@
 from .api import parse
 from .datetimes import registerDateHandler
 from .exceptions import (
+    BodyTooLargeError,
     CharacterEncodingOverride,
     CharacterEncodingUnknown,
+    ContentDecodingError,
     FeedparserError,
     NonXMLContentType,
     UndeclaredNamespace,
@@ -55,8 +57,10 @@ __all__ = (
     "registerDateHandler",
     "FeedParserDict",
     "FeedparserError",
+    "BodyTooLargeError",
     "CharacterEncodingOverride",
     "CharacterEncodingUnknown",
+    "ContentDecodingError",
     "NonXMLContentType",
     "UndeclaredNamespace",
 )
