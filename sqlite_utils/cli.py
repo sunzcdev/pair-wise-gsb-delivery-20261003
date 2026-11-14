@@ -2901,6 +2901,15 @@ def extract(
     "--encoding",
     help="Character encoding for input, defaults to utf-8",
 )
+@click.option(
+    "--dedupe",
+    is_flag=True,
+    help=(
+        "Deduplicate file contents into a separate content table. Identical "
+        "contents from different paths are stored once, while each path keeps "
+        "its own metadata row. Content rows are never overwritten."
+    ),
+)
 @click.option("-s", "--silent", is_flag=True, help="Don't show a progress bar")
 @load_extension_option
 def insert_files(
@@ -2915,6 +2924,7 @@ def insert_files(
     name,
     text,
     encoding,
+    dedupe,
     silent,
     load_extension,
 ):
@@ -2933,6 +2943,12 @@ def insert_files(
             -c size:size \\
             --pk name
     """
+    if dedupe and (column or pks or alter or replace or upsert or text or encoding):
+        raise click.ClickException(
+            "--dedupe cannot be combined with -c/--column, --pk, --alter, "
+            "--replace, --upsert, --text or --encoding"
+        )
+
     if not column:
         if text:
             column = ["path:path", "content_text:content_text", "size:size"]
@@ -2955,6 +2971,17 @@ def insert_files(
 
     # Load all paths so we can show a progress bar
     paths_and_relative_paths = list(yield_paths_and_relative_paths())
+
+    db = sqlite_utils.Database(path)
+    _register_db_for_cleanup(db)
+    _load_extensions(db, load_extension)
+
+    if dedupe:
+        try:
+            _insert_files_dedupe(db, table, paths_and_relative_paths, name, silent)
+        except FileChangedDuringReadError as e:
+            raise click.ClickException(str(e))
+        return
 
     with progressbar(paths_and_relative_paths, silent=silent) as bar:
 
@@ -3006,9 +3033,6 @@ def insert_files(
                         row[colname] = name
                 yield row
 
-        db = sqlite_utils.Database(path)
-        _register_db_for_cleanup(db)
-        _load_extensions(db, load_extension)
         try:
             with db.conn:
                 db.table(table).insert_all(
@@ -3678,6 +3702,175 @@ FILE_COLUMNS = {
     "stem": lambda p: p.stem,
     "suffix": lambda p: p.suffix,
 }
+
+
+class FileChangedDuringReadError(Exception):
+    def __init__(self, path):
+        self.path = path
+        super().__init__(
+            f"File '{path}' changed while it was being read; no row was written"
+        )
+
+
+_FILE_READ_CHUNK_SIZE = 1024 * 1024
+
+
+def _iso_utc(timestamp):
+    return (
+        datetime.fromtimestamp(timestamp, timezone.utc)
+        .replace(tzinfo=None)
+        .isoformat()
+    )
+
+
+def _read_file_snapshot(file_path):
+    """
+    Read a file in a single pass, calculating its hashes from the exact bytes
+    that are stored. Re-stat the file afterwards and refuse to return if it
+    changed during the read, so metadata can never describe different bytes.
+    """
+    resolved = file_path.resolve()
+    before = resolved.stat()
+    hasher_sha256 = hashlib.sha256()
+    hasher_md5 = hashlib.md5()
+    chunks = []
+    total = 0
+    with open(resolved, "rb") as fp:
+        fd_before = os.fstat(fp.fileno())
+        while True:
+            chunk = fp.read(_FILE_READ_CHUNK_SIZE)
+            if not chunk:
+                break
+            hasher_sha256.update(chunk)
+            hasher_md5.update(chunk)
+            chunks.append(chunk)
+            total += len(chunk)
+        fd_after = os.fstat(fp.fileno())
+    after = resolved.stat()
+    identity_fields = ("st_dev", "st_ino", "st_mtime_ns", "st_size")
+    if (
+        any(getattr(before, field) != getattr(after, field) for field in identity_fields)
+        or any(
+            getattr(fd_before, field) != getattr(fd_after, field)
+            for field in identity_fields
+        )
+        or total != before.st_size
+    ):
+        raise FileChangedDuringReadError(resolved)
+    return {
+        "content": b"".join(chunks),
+        "sha256": hasher_sha256.hexdigest(),
+        "md5": hasher_md5.hexdigest(),
+        "size": total,
+        "stat": after,
+        "fullpath": str(resolved),
+    }
+
+
+def _read_stdin_snapshot(name):
+    data = sys.stdin.buffer.read()
+    return {
+        "content": data,
+        "sha256": hashlib.sha256(data).hexdigest(),
+        "md5": hashlib.md5(data).hexdigest(),
+        "size": len(data),
+        "stat": None,
+        "fullpath": None,
+        "name": name or "-",
+    }
+
+
+def _insert_files_dedupe(db, table, paths_and_relative_paths, name, silent):
+    """
+    Content-addressed storage mode: byte contents live once in an immutable
+    "<table>_content" table, keyed by sha256, while every path keeps its own
+    metadata row in "<table>" pointing at that content. Each file is committed
+    in its own transaction, so an interrupted batch leaves an explicit boundary
+    between committed and uncommitted files, and re-running the same batch only
+    ever updates existing rows rather than accumulating duplicates.
+    """
+    content_table = f"{table}_content"
+    quoted_table = quote_identifier(table)
+    quoted_content_table = quote_identifier(content_table)
+    db.conn.execute("PRAGMA foreign_keys=ON")
+    with db.conn:
+        db.conn.execute(
+            f"CREATE TABLE IF NOT EXISTS {quoted_content_table} ("
+            "  sha256 TEXT PRIMARY KEY,"
+            "  content BLOB NOT NULL,"
+            "  size INTEGER NOT NULL,"
+            "  md5 TEXT NOT NULL"
+            ")"
+        )
+        db.conn.execute(
+            f"CREATE TABLE IF NOT EXISTS {quoted_table} ("
+            "  path TEXT PRIMARY KEY,"
+            "  name TEXT,"
+            "  fullpath TEXT,"
+            "  sha256 TEXT NOT NULL REFERENCES "
+            f"{quoted_content_table}(sha256),"
+            "  size INTEGER NOT NULL,"
+            "  md5 TEXT,"
+            "  mtime REAL,"
+            "  ctime REAL,"
+            "  mtime_iso TEXT,"
+            "  ctime_iso TEXT,"
+            "  mode INTEGER"
+            ")"
+        )
+
+    with progressbar(paths_and_relative_paths, silent=silent) as bar:
+        for file_path, relative_path in bar:
+            if file_path == "-":
+                snapshot = _read_stdin_snapshot(name)
+                row_path = name or "-"
+            else:
+                snapshot = _read_file_snapshot(file_path)
+                row_path = str(relative_path)
+            stat = snapshot["stat"]
+            # One transaction per file: a failure rolls this file back without
+            # touching the files already committed earlier in the batch.
+            with db.conn:
+                db.conn.execute(
+                    f"INSERT OR IGNORE INTO {quoted_content_table}"
+                    " (sha256, content, size, md5) VALUES (?, ?, ?, ?)",
+                    (
+                        snapshot["sha256"],
+                        snapshot["content"],
+                        snapshot["size"],
+                        snapshot["md5"],
+                    ),
+                )
+                db.conn.execute(
+                    f"INSERT INTO {quoted_table} ("
+                    "  path, name, fullpath, sha256, size, md5, mtime, ctime,"
+                    "  mtime_iso, ctime_iso, mode"
+                    ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
+                    "ON CONFLICT(path) DO UPDATE SET "
+                    "  name=excluded.name,"
+                    "  fullpath=excluded.fullpath,"
+                    "  sha256=excluded.sha256,"
+                    "  size=excluded.size,"
+                    "  md5=excluded.md5,"
+                    "  mtime=excluded.mtime,"
+                    "  ctime=excluded.ctime,"
+                    "  mtime_iso=excluded.mtime_iso,"
+                    "  ctime_iso=excluded.ctime_iso,"
+                    "  mode=excluded.mode",
+                    (
+                        row_path,
+                        name if file_path == "-" else file_path.name,
+                        snapshot["fullpath"],
+                        snapshot["sha256"],
+                        snapshot["size"],
+                        snapshot["md5"],
+                        None if stat is None else stat.st_mtime,
+                        None if stat is None else stat.st_ctime,
+                        None if stat is None else _iso_utc(stat.st_mtime),
+                        None if stat is None else _iso_utc(stat.st_ctime),
+                        None if stat is None else stat.st_mode,
+                    ),
+                )
 
 
 def output_rows(iterator, headers, nl, arrays, json_cols, ascii_=False):

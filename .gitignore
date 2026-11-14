@@ -22,3 +22,4 @@ uv.lock
 tests/*.dylib
 tests/*.so
 tests/*.dll
+.pytest-basetemp/

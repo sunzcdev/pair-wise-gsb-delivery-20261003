@@ -596,6 +596,10 @@ See :ref:`cli_insert_files`.
       --name TEXT            File name to use
       --text                 Store file content as TEXT, not BLOB
       --encoding TEXT        Character encoding for input, defaults to utf-8
+      --dedupe               Deduplicate file contents into a separate content
+                             table. Identical contents from different paths are
+                             stored once, while each path keeps its own
+                             metadata row. Content rows are never overwritten.
       -s, --silent           Don't show a progress bar
       --load-extension TEXT  Path to SQLite extension, with optional :entrypoint
       -h, --help             Show this message and exit.

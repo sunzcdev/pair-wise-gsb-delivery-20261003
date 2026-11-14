@@ -1803,6 +1803,52 @@ The ``-`` argument indicates data should be read from standard input. The string
 
 When inserting data from standard input only the following column definitions are supported: ``name``, ``path``, ``content``, ``content_text``, ``sha256``, ``md5`` and ``size``.
 
+Deduplicating file contents
+---------------------------
+
+By default every inserted row stores its own copy of the file bytes, so inserting the same file from two different paths stores the content twice. The ``--dedupe`` option switches to an explicit content-addressed layout instead:
+
+.. code-block:: bash
+
+    sqlite-utils insert-files gifs.db images path/to/my-gifs --dedupe
+
+This creates two tables. The byte contents live once in an immutable ``images_content`` table, keyed by their SHA256 hash:
+
+.. code-block:: sql
+
+    CREATE TABLE "images_content" (
+        "sha256" TEXT PRIMARY KEY,
+        "content" BLOB NOT NULL,
+        "size" INTEGER NOT NULL,
+        "md5" TEXT NOT NULL
+    )
+
+Each path keeps its own metadata row in the ``images`` table, pointing at the shared content via a foreign key:
+
+.. code-block:: sql
+
+    CREATE TABLE "images" (
+        "path" TEXT PRIMARY KEY,
+        "name" TEXT,
+        "fullpath" TEXT,
+        "sha256" TEXT NOT NULL REFERENCES "images_content" ("sha256"),
+        "size" INTEGER NOT NULL,
+        "md5" TEXT,
+        "mtime" REAL,
+        "ctime" REAL,
+        "mtime_iso" TEXT,
+        "ctime_iso" TEXT,
+        "mode" INTEGER
+    )
+
+Identical contents from different paths are therefore stored as a single BLOB, while every path retains its own metadata. The SHA256 and MD5 hashes are calculated from the exact same byte stream that is read and stored, in a single pass over the file. If a file changes while it is being read, the command errors out and no row describing the inconsistent bytes is written.
+
+Content rows are never modified or overwritten. When a path is updated to contain new bytes, its metadata row is re-pointed at a new content row, leaving the previous content in place for as long as any other path still references it.
+
+Each file is committed in its own transaction. If the batch is interrupted, the files processed before the failure remain committed while every later file is absent, so the boundary between committed and uncommitted files is explicit. Re-running the same batch is idempotent: existing rows are updated in place and no duplicate path or content associations accumulate.
+
+The ``--dedupe`` mode uses this fixed two-table schema, so it cannot be combined with ``-c``/``--column``, ``--pk``, ``--alter``, ``--replace``, ``--upsert``, ``--text`` or ``--encoding``.
+
 .. _cli_convert:
 
 Converting data in columns
