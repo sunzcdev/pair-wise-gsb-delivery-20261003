@@ -562,7 +562,23 @@ class Writer(GenericWriter):
             self.validate_fn(
                 record, self.schema, self._named_schemas, "", True, self.options
             )
-        write_data(self.io, record, self.schema, self._named_schemas, "", self.options)
+        # Snapshot the current block state so that a record which fails
+        # partway through encoding can be rolled back, leaving the block
+        # buffer exactly as it was before this record was attempted. This
+        # allows callers to catch the exception and keep writing records.
+        block_offset = self.io._fo.tell()
+        block_count = self.block_count
+        try:
+            write_data(
+                self.io, record, self.schema, self._named_schemas, "", self.options
+            )
+        except Exception:
+            # Remove any partially written data for this record so that the
+            # block buffer only ever contains complete records.
+            self.io._fo.truncate(block_offset)
+            self.io._fo.seek(block_offset, SEEK_SET)
+            self.block_count = block_count
+            raise
         self.block_count += 1
         if self.io._fo.tell() >= self.sync_interval:
             self.dump()
