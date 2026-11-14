@@ -1,6 +1,22 @@
 w3lib release notes
 ===================
 
+unreleased
+----------
+
+New features:
+
+- :func:`~w3lib.encoding.html_to_unicode` now accepts a *diagnostic*
+  keyword argument. With ``diagnostic=True`` it returns an
+  :class:`~w3lib.encoding.EncodingDiagnosis` as a third element, recording
+  for the BOM, the HTTP charset, the body declaration, the detection
+  callback and the default encoding the raw candidate label, its normalized
+  codec and the reason it was adopted, skipped or left unused. Aliases of
+  the same codec never count as a conflict, an invalid label does not hide
+  the sources that follow it, and the diagnostic run uses the same single
+  pipeline, so it neither calls *auto_detect_fun* an extra time nor changes
+  the returned encoding or text.
+
 2.6.0 (2026-11-05)
 ------------------
 

@@ -9,6 +9,9 @@ import pytest
 
 import w3lib.encoding
 from w3lib.encoding import (
+    EncodingCandidate,
+    EncodingCandidateStatus,
+    EncodingDiagnosis,
     html_body_declared_encoding,
     html_encoding,
     html_to_unicode,
@@ -624,3 +627,304 @@ class TestHtmlConversion:
     def test_empty_body(self):
         # if no other method available, the default encoding of utf-8 is used
         self._assert_encoding_detected(None, "utf-8", b"")
+
+
+def _by_source(diagnosis: EncodingDiagnosis) -> dict[str, EncodingCandidate]:
+    return {candidate.source: candidate for candidate in diagnosis.candidates}
+
+
+class TestHtmlToUnicodeDiagnosis:
+    def test_two_tuple_return_is_unchanged(self) -> None:
+        result = html_to_unicode(None, b"plain body")
+        assert isinstance(result, tuple)
+        assert len(result) == 2
+        encoding, text = result
+        assert encoding == "utf-8"
+        assert text == "plain body"
+        # the flag can also be passed explicitly
+        assert html_to_unicode(None, b"plain body", diagnostic=False) == result
+
+    def test_diagnostic_return_shape(self) -> None:
+        result = html_to_unicode(None, b"plain body", diagnostic=True)
+        assert len(result) == 3
+        encoding, text, diagnosis = result
+        assert isinstance(diagnosis, EncodingDiagnosis)
+        assert diagnosis.encoding == encoding
+        assert text == "plain body"
+        # frozen and fully populated
+        with pytest.raises((AttributeError, Exception)):
+            diagnosis.encoding = "gbk"  # type: ignore[misc]
+        assert tuple(c.source for c in diagnosis.candidates) == (
+            "http",
+            "meta",
+            "auto_detect",
+            "default",
+        )
+
+    def test_every_candidate_has_label_normalized_value_and_reason(self) -> None:
+        _, _, diagnosis = html_to_unicode(
+            "text/html; charset=ISO-8859-1",
+            b'<meta charset="latin1">caf\xe9',
+            diagnostic=True,
+        )
+        for candidate in diagnosis.candidates:
+            assert isinstance(candidate, EncodingCandidate)
+            assert candidate.reason
+            if candidate.label is not None:
+                assert candidate.encoding is not None
+                assert candidate.encoding == resolve_encoding(candidate.label)
+            if candidate.status is EncodingCandidateStatus.SKIPPED:
+                assert candidate.status.value == "skipped"
+        http = _by_source(diagnosis)["http"]
+        assert http.label == "ISO-8859-1"
+        assert http.encoding == "cp1252"
+        assert http.status is EncodingCandidateStatus.ADOPTED
+
+    def test_aliases_of_same_codec_are_not_conflicts(self) -> None:
+        _, _, diagnosis = html_to_unicode(
+            "text/html; charset=latin1",
+            b'<meta charset="iso-8859-1">caf\xe9',
+            diagnostic=True,
+        )
+        assert diagnosis.conflicts is False
+        sources = _by_source(diagnosis)
+        assert sources["http"].encoding == sources["meta"].encoding == "cp1252"
+        assert sources["http"].status is EncodingCandidateStatus.ADOPTED
+        assert sources["meta"].status is EncodingCandidateStatus.UNUSED
+
+    def test_conflicting_sources_are_flagged_and_explained(self) -> None:
+        body = b'<meta charset="big5">\xa4\xa4'
+        encoding, text, diagnosis = html_to_unicode(
+            "text/html; charset=utf-8", body, diagnostic=True
+        )
+        assert diagnosis.conflicts is True
+        sources = _by_source(diagnosis)
+        assert sources["http"].encoding == "utf-8"
+        assert sources["meta"].encoding == "big5hkscs"
+        # the actual choice and the adopted candidate always agree
+        adopted = [
+            c
+            for c in diagnosis.candidates
+            if c.status is EncodingCandidateStatus.ADOPTED
+        ]
+        assert adopted[0].source == "http"
+        assert diagnosis.encoding == encoding == adopted[0].encoding == "utf-8"
+        # the same body decoded without the diagnostic flag is identical
+        plain_encoding, plain_text = html_to_unicode(
+            "text/html; charset=utf-8", body
+        )
+        assert (plain_encoding, plain_text) == (encoding, text)
+
+    def test_invalid_label_does_not_hide_later_valid_source(self) -> None:
+        body = b'<meta charset="big5">\xa4\xa4'
+        encoding, _, diagnosis = html_to_unicode(
+            "text/html; charset=utf-7", body, diagnostic=True
+        )
+        assert encoding == "big5hkscs"
+        assert diagnosis.conflicts is False
+        sources = _by_source(diagnosis)
+        assert sources["http"].status is EncodingCandidateStatus.SKIPPED
+        assert sources["http"].encoding is None
+        assert sources["meta"].status is EncodingCandidateStatus.ADOPTED
+        assert sources["meta"].encoding == "big5hkscs"
+
+    def test_diagnostic_does_not_change_output(self) -> None:
+        cases = [
+            (None, b"\xef\xbb\xbfWORD\xe3\xab"),
+            ("text/html; charset=utf-8", b"PREFIX\xe3\xabSUFFIX"),
+            (None, "日本語のテキスト".encode("shift_jis")),
+            ("text/html; charset=iso-2022-kr", b"caf\xe9 ok"),
+            (None, b""),
+        ]
+        for content_type, body in cases:
+            plain = html_to_unicode(content_type, body)
+            _, text, diagnosis = html_to_unicode(
+                content_type, body, diagnostic=True
+            )
+            assert diagnosis.encoding == plain[0]
+            assert text == plain[1]
+
+    def test_diagnostic_calls_callback_once(self) -> None:
+        calls = []
+
+        def detector(body: bytes) -> str:
+            calls.append(body)
+            return "koi8-r"
+
+        with pytest.warns(DeprecationWarning, match="auto_detect_fun"):
+            encoding, text, diagnosis = html_to_unicode(
+                None,
+                b"no encoding info",
+                auto_detect_fun=detector,
+                diagnostic=True,
+            )
+        assert len(calls) == 1
+        candidate = _by_source(diagnosis)["auto_detect"]
+        assert candidate.status is EncodingCandidateStatus.ADOPTED
+        assert candidate.encoding == "koi8-r"
+        assert encoding == "koi8-r"
+
+        # the plain return form invokes the callback the same number of times
+        calls.clear()
+        with pytest.warns(DeprecationWarning, match="auto_detect_fun"):
+            html_to_unicode(None, b"no encoding info", auto_detect_fun=detector)
+        assert len(calls) == 1
+
+    def test_callback_is_not_called_when_earlier_source_wins(self) -> None:
+        def boom(body: bytes) -> str:
+            raise AssertionError("the callback must not run")
+
+        with pytest.warns(DeprecationWarning, match="auto_detect_fun"):
+            _, _, diagnosis = html_to_unicode(
+                "text/html; charset=utf-8",
+                b"hi",
+                auto_detect_fun=boom,
+                diagnostic=True,
+            )
+        candidate = _by_source(diagnosis)["auto_detect"]
+        assert candidate.status is EncodingCandidateStatus.SKIPPED
+        assert "not called" in candidate.reason
+
+    def test_legacy_callback_invalid_label_is_kept_as_raw_label(self) -> None:
+        # The deprecated legacy pipeline adopted any non-None callback label,
+        # even one that names no web encoding, and decoded it through
+        # to_unicode(); the diagnosis keeps that raw label while showing its
+        # normalized codec is unavailable. This preserves the historical
+        # behavior rather than silently switching to the default encoding.
+        with pytest.warns(DeprecationWarning):
+            encoding, _, diagnosis = html_to_unicode(
+                None,
+                b"no encoding info",
+                auto_detect_fun=lambda body: "utf-7",
+                default_encoding="ascii",
+                diagnostic=True,
+            )
+        sources = _by_source(diagnosis)
+        assert encoding == "utf-7"
+        assert diagnosis.encoding == "utf-7"
+        assert sources["auto_detect"].label == "utf-7"
+        assert sources["auto_detect"].encoding is None
+        assert sources["auto_detect"].status is EncodingCandidateStatus.SKIPPED
+        assert sources["default"].status is EncodingCandidateStatus.UNUSED
+
+    def test_callback_returning_none_falls_through_to_default(self) -> None:
+        with pytest.warns(DeprecationWarning):
+            encoding, _, diagnosis = html_to_unicode(
+                None,
+                b"no encoding info",
+                auto_detect_fun=lambda body: None,
+                default_encoding="ascii",
+                diagnostic=True,
+            )
+        sources = _by_source(diagnosis)
+        assert encoding == "ascii"
+        assert sources["auto_detect"].status is EncodingCandidateStatus.SKIPPED
+        assert sources["default"].status is EncodingCandidateStatus.ADOPTED
+        assert sources["default"].label == "ascii"
+        assert sources["default"].encoding == "cp1252"
+
+    def test_default_encoding_candidate_is_recorded(self) -> None:
+        with pytest.warns(DeprecationWarning, match="default_encoding"):
+            _, _, diagnosis = html_to_unicode(
+                None,
+                b"no encoding info",
+                default_encoding="cp1251",
+                diagnostic=True,
+            )
+        candidate = _by_source(diagnosis)["default"]
+        assert candidate.status is EncodingCandidateStatus.ADOPTED
+        assert candidate.label == "cp1251"
+        assert candidate.encoding == "cp1251"
+
+    def test_bom_candidate_is_adopted_and_recorded(self) -> None:
+        body = codecs.BOM_UTF8 + b"hi"
+        encoding, text, diagnosis = html_to_unicode(
+            "text/html; charset=gbk", body, diagnostic=True
+        )
+        assert encoding == "utf-8"
+        assert text == "hi"
+        assert diagnosis.bom == ("utf-8", codecs.BOM_UTF8)
+        bom_candidate = diagnosis.candidates[0]
+        assert bom_candidate.source == "bom"
+        assert bom_candidate.status is EncodingCandidateStatus.ADOPTED
+        assert diagnosis.conflicts is False
+
+    def test_bomless_utf16_xml_recognized_with_empty_bom_bytes(self) -> None:
+        body = '<?xml version="1.0"?>'.encode("utf-16-le")
+        encoding, _, diagnosis = html_to_unicode(None, body, diagnostic=True)
+        assert encoding == "utf-16-le"
+        assert diagnosis.bom == ("utf-16-le", b"")
+        assert "without a BOM" in diagnosis.candidates[0].reason
+
+    @pytest.mark.parametrize(
+        "body",
+        [
+            b"\xef",
+            b"\xef\xbb",
+            b"\xfe",
+            b"\xff",
+            b"\x00\x00\xfe",
+        ],
+    )
+    def test_half_bom_short_input_is_explained(self, body: bytes) -> None:
+        _, _, diagnosis = html_to_unicode(None, body, diagnostic=True)
+        assert diagnosis.bom is None
+        assert any("BOM" in note and "truncated" in note for note in diagnosis.notes)
+
+    def test_full_bom_does_not_get_truncation_note(self) -> None:
+        _, _, diagnosis = html_to_unicode(
+            None, b"\xef\xbb\xbfhi", diagnostic=True
+        )
+        assert all("truncated" not in note for note in diagnosis.notes)
+
+    def test_empty_body_note_and_default(self) -> None:
+        encoding, text, diagnosis = html_to_unicode(None, b"", diagnostic=True)
+        assert encoding == "utf-8"
+        assert text == ""
+        assert any("empty" in note for note in diagnosis.notes)
+        candidate = _by_source(diagnosis)["default"]
+        assert candidate.status is EncodingCandidateStatus.ADOPTED
+        assert candidate.encoding == "utf-8"
+
+    def test_already_decoded_text_note_and_unchanged_output(self) -> None:
+        text_in = "already decoded \u2603"
+        encoding, text, diagnosis = html_to_unicode(
+            None, text_in, diagnostic=True
+        )
+        assert text is text_in or text == text_in
+        assert text == text_in
+        assert encoding == "utf-8"
+        assert any("already decoded text" in note for note in diagnosis.notes)
+
+    def test_detection_candidate_for_valid_and_invalid_utf8(self) -> None:
+        _, _, valid = html_to_unicode(None, b"plain ascii", diagnostic=True)
+        valid_candidate = _by_source(valid)["auto_detect"]
+        assert valid_candidate.encoding == "utf-8"
+        assert valid_candidate.status is EncodingCandidateStatus.ADOPTED
+
+        _, _, invalid = html_to_unicode(
+            None, b"\x82\xa0", url="https://example.jp/", diagnostic=True
+        )
+        invalid_candidate = _by_source(invalid)["auto_detect"]
+        assert invalid_candidate.status is EncodingCandidateStatus.ADOPTED
+        assert invalid.encoding == "cp932"
+
+    def test_conflicting_legacy_sources(self) -> None:
+        with pytest.warns(DeprecationWarning):
+            encoding, _, diagnosis = html_to_unicode(
+                "text/html; charset=koi8-r",
+                b'<meta charset="utf-8">x',
+                auto_detect_fun=lambda body: "cp1251",
+                diagnostic=True,
+            )
+        assert encoding == "koi8-r"
+        assert diagnosis.conflicts is True
+        sources = _by_source(diagnosis)
+        assert sources["http"].status is EncodingCandidateStatus.ADOPTED
+        assert sources["meta"].status is EncodingCandidateStatus.UNUSED
+        assert sources["auto_detect"].status is EncodingCandidateStatus.SKIPPED
+
+    def test_status_values_are_strings(self) -> None:
+        _, _, diagnosis = html_to_unicode(None, b"x", diagnostic=True)
+        for candidate in diagnosis.candidates:
+            assert candidate.status.value in {"adopted", "skipped", "unused"}
