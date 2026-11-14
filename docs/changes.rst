@@ -1,6 +1,15 @@
 Changes
 =======
 
+Version 1.8.0
+-------------
+
+* Add an optional stateful aggregation protocol
+  (``StatefulAggregator``) to ``aggregate()``, together with
+  ``partial_aggregate()`` and ``merge_aggregate()`` so per-group states
+  can be accumulated over separate input chunks and merged later.
+  Includes ready-made ``Count``, ``Mean`` and ``Variance`` aggregators.
+
 Version 1.7.32
 --------------
 

@@ -8,10 +8,11 @@ import pytest
 
 from collections import OrderedDict
 from petl.test.helpers import ieq
-from petl.errors import FieldSelectionError
+from petl.errors import ArgumentError, FieldSelectionError
 from petl.util import strjoin
 from petl.transform.reductions import rowreduce, aggregate, \
-    mergeduplicates, merge, Conflict, fold
+    mergeduplicates, merge, Conflict, fold, partial_aggregate, \
+    merge_aggregate, StatefulAggregator, Count, Mean, Variance
 
 
 def test_rowreduce():
@@ -728,3 +729,371 @@ def test_fold():
     expect = (('key', 'value'), (1, 8), (2, 12))
     ieq(expect, t2)
     ieq(expect, t2)
+
+
+def _assert_close(e, a, tol=1e-9):
+    # floating point results of merged partial states may differ from a
+    # one-shot computation by a small rounding error
+    if e is None or a is None:
+        assert e is a
+    elif isinstance(e, tuple) and isinstance(a, tuple):
+        assert len(e) == len(a)
+        for x, y in zip(e, a):
+            _assert_close(x, y, tol)
+    elif isinstance(e, float) or isinstance(a, float):
+        assert abs(e - a) <= tol * max(1.0, abs(e)), (e, a)
+    else:
+        assert e == a
+
+
+def _ieq_close(expect, actual, tol=1e-9):
+    expect = [tuple(row) for row in expect]
+    actual = [tuple(row) for row in actual]
+    assert expect[0] == actual[0]
+    assert len(expect) == len(actual)
+    for erow, arow in zip(expect[1:], actual[1:]):
+        assert len(erow) == len(arow)
+        for e, a in zip(erow, arow):
+            _assert_close(e, a, tol)
+
+
+def test_aggregate_stateful_simple():
+
+    table1 = (('foo', 'bar'),
+              ('a', 3),
+              ('a', 7),
+              ('b', 2),
+              ('b', 1),
+              ('b', 9),
+              ('c', 4))
+
+    # count
+    table2 = aggregate(table1, 'foo', Count(), 'bar')
+    expect2 = (('foo', 'value'),
+               ('a', 2),
+               ('b', 3),
+               ('c', 1))
+    ieq(expect2, table2)
+    ieq(expect2, table2)
+
+    # mean
+    table3 = aggregate(table1, 'foo', Mean(), 'bar')
+    expect3 = (('foo', 'value'),
+               ('a', 5.0),
+               ('b', 4.0),
+               ('c', 4.0))
+    ieq(expect3, table3)
+
+    # variance, reported together with the sample count
+    table4 = aggregate(table1, 'foo', Variance(), 'bar')
+    expect4 = (('foo', 'value'),
+               ('a', (8.0, 2)),
+               ('b', (19.0, 3)),
+               ('c', (None, 1)))
+    ieq(expect4, table4)
+
+    # population variance
+    table5 = aggregate(table1, 'foo', Variance(sample=False), 'bar')
+    expect5 = (('foo', 'value'),
+               ('a', (4.0, 2)),
+               ('b', (38.0 / 3, 3)),
+               ('c', (0.0, 1)))
+    _ieq_close(expect5, table5)
+
+    # whole rows, no value selector
+    table6 = aggregate(table1, 'foo', Count())
+    ieq(expect2, table6)
+
+    # no key
+    ieq((('value',), (6,)), aggregate(table1, None, Count(), 'bar'))
+    ieq((('value',), (26 / 6.0,)), aggregate(table1, None, Mean(), 'bar'))
+
+    # singleton list key
+    ieq(expect3, aggregate(table1, ['foo'], Mean(), 'bar'))
+
+
+def test_aggregate_stateful_multi():
+
+    table1 = (('foo', 'bar', 'baz'),
+              ('a', 3, True),
+              ('a', 7, False),
+              ('b', 2, True),
+              ('b', 2, False),
+              ('b', 9, False),
+              ('c', 4, True))
+
+    # stateful aggregators mix freely with plain callables
+    aggregation = OrderedDict()
+    aggregation['count'] = 'bar', Count()
+    aggregation['meanbar'] = 'bar', Mean()
+    aggregation['varbar'] = 'bar', Variance()
+    aggregation['sumbar'] = 'bar', sum
+    aggregation['nrows'] = Count()
+    table2 = aggregate(table1, 'foo', aggregation)
+    expect2 = (('foo', 'count', 'meanbar', 'varbar', 'sumbar', 'nrows'),
+               ('a', 2, 5.0, (8.0, 2), 10, 2),
+               ('b', 3, 13 / 3.0, (16.333333333333336, 3), 13, 3),
+               ('c', 1, 4.0, (None, 1), 4, 1))
+    _ieq_close(expect2, table2)
+    _ieq_close(expect2, table2)
+
+
+def test_aggregate_stateful_empty():
+
+    table = (('foo', 'bar'),)
+
+    # keyed aggregation of an empty table yields only the header
+    ieq((('foo', 'value'),), aggregate(table, 'foo', Count(), 'bar'))
+    ieq((('foo', 'state'),), partial_aggregate(table, 'foo', Mean(), 'bar'))
+
+    # without a key a single row is emitted from the empty state
+    ieq((('value',), (0,)), aggregate(table, None, Count(), 'bar'))
+    ieq((('value',), (None,)), aggregate(table, None, Mean(), 'bar'))
+    ieq((('value',), ((None, 0),)),
+        aggregate(table, None, Variance(), 'bar'))
+
+    # merging empty partials
+    p = partial_aggregate(table, 'foo', Mean(), 'bar')
+    ieq((('foo', 'value'),), merge_aggregate([p], 'foo', Mean()))
+    ieq((('foo', 'value'),), merge_aggregate([], 'foo', Mean()))
+    ieq((('value',), (0,)), merge_aggregate([], None, Count()))
+    ieq((('value',), (None,)), merge_aggregate([], None, Mean()))
+    ieq((('value',), ((None, 0),)), merge_aggregate([], None, Variance()))
+
+
+def test_aggregate_stateful_missing():
+
+    # group 'a' has only missing values
+    table = (('foo', 'bar'),
+             ('a', None),
+             ('a', None),
+             ('b', 1))
+
+    ieq((('foo', 'value'), ('a', None), ('b', 1.0)),
+        aggregate(table, 'foo', Mean(), 'bar'))
+    ieq((('foo', 'value'), ('a', (None, 0)), ('b', (None, 1))),
+        aggregate(table, 'foo', Variance(), 'bar'))
+    # Count counts all values by default, optionally skipping missing
+    ieq((('foo', 'value'), ('a', 2), ('b', 1)),
+        aggregate(table, 'foo', Count(), 'bar'))
+    ieq((('foo', 'value'), ('a', 0), ('b', 1)),
+        aggregate(table, 'foo', Count(skip_missing=True), 'bar'))
+
+    # same results when computed via partial states
+    p = partial_aggregate(table, 'foo', Mean(), 'bar')
+    ieq((('foo', 'value'), ('a', None), ('b', 1.0)),
+        merge_aggregate([p], 'foo', Mean()))
+
+
+def test_aggregate_stateful_decimal():
+
+    from decimal import Decimal
+
+    table = (('foo', 'bar'),
+             ('a', Decimal('1.5')),
+             ('a', Decimal('2.5')),
+             ('b', Decimal('4')))
+
+    actual = list(aggregate(table, 'foo', Mean(), 'bar'))
+    assert actual[0] == ('foo', 'value')
+    assert actual[1] == ('a', Decimal('2.0'))
+    assert actual[2] == ('b', Decimal('4'))
+    assert isinstance(actual[1][1], Decimal)
+
+    # chunked computation merges to the same exact Decimal result
+    oneshot = list(aggregate(table, 'foo', Variance(), 'bar'))
+    assert oneshot[1] == ('a', (Decimal('0.5'), 2))
+    assert oneshot[2] == ('b', (None, 1))
+    for cut in range(len(table) + 1):
+        p1, p2 = [partial_aggregate(chunk, 'foo', Variance(), 'bar')
+                  for chunk in _chunked(table, (cut,))]
+        assert oneshot == list(merge_aggregate([p1, p2], 'foo', Variance()))
+
+
+def _floattable(n=60):
+    table = [('foo', 'bar')]
+    for i in range(n):
+        table.append(('abc'[i % 3], (i * 7 % 13) + 0.1 * (i % 7)))
+    return tuple(map(tuple, table))
+
+
+def _chunked(table, cuts):
+    # split the data rows of a table at the given positions
+    rows = table[1:]
+    chunks = []
+    prev = 0
+    for cut in list(cuts) + [len(rows)]:
+        chunks.append(table[:1] + tuple(rows[prev:cut]))
+        prev = cut
+    return chunks
+
+
+def test_partial_merge_equivalence():
+
+    table = _floattable()
+    aggregators = [Count(), Mean(), Variance(), Variance(sample=False)]
+
+    for agg in aggregators:
+        oneshot = list(aggregate(table, 'foo', agg, 'bar'))
+        # various split positions
+        for cuts in [(0,), (1,), (17,), (59,), (60,), (10, 40), (1, 2, 59)]:
+            partials = [partial_aggregate(chunk, 'foo', agg, 'bar')
+                        for chunk in _chunked(table, cuts)]
+            _ieq_close(oneshot, merge_aggregate(partials, 'foo', agg))
+            # merge order does not matter for commutative aggregators
+            _ieq_close(oneshot,
+                       merge_aggregate(partials[::-1], 'foo', agg))
+        # a single partial table may be passed directly
+        p = partial_aggregate(table, 'foo', agg, 'bar')
+        _ieq_close(oneshot, merge_aggregate(p, 'foo', agg))
+
+
+def test_partial_merge_equivalence_nokey():
+
+    table = _floattable()
+    for agg in [Count(), Mean(), Variance()]:
+        oneshot = list(aggregate(table, None, agg, 'bar'))
+        for cuts in [(0,), (23,), (60,), (10, 40)]:
+            partials = [partial_aggregate(chunk, None, agg, 'bar')
+                        for chunk in _chunked(table, cuts)]
+            _ieq_close(oneshot, merge_aggregate(partials, None, agg))
+            _ieq_close(oneshot, merge_aggregate(partials[::-1], None, agg))
+
+
+def test_partial_merge_multi():
+
+    table = _floattable()
+    aggregation = OrderedDict()
+    aggregation['count'] = 'bar', Count()
+    aggregation['meanbar'] = 'bar', Mean()
+    aggregation['varbar'] = 'bar', Variance()
+
+    oneshot = list(aggregate(table, 'foo', aggregation))
+    for cuts in [(0,), (1,), (33,), (60,), (10, 40)]:
+        partials = [partial_aggregate(chunk, 'foo', aggregation)
+                    for chunk in _chunked(table, cuts)]
+        _ieq_close(oneshot, merge_aggregate(partials, 'foo', aggregation))
+        _ieq_close(oneshot,
+                   merge_aggregate(partials[::-1], 'foo', aggregation))
+
+    # without a key
+    oneshot = list(aggregate(table, None, aggregation))
+    partials = [partial_aggregate(chunk, None, aggregation)
+                for chunk in _chunked(table, (20, 40))]
+    _ieq_close(oneshot, merge_aggregate(partials, None, aggregation))
+
+
+def test_partial_aggregate_requires_stateful():
+
+    table = (('foo', 'bar'), ('a', 1))
+    with pytest.raises(ArgumentError):
+        partial_aggregate(table, 'foo', sum, 'bar')
+    with pytest.raises(ArgumentError):
+        partial_aggregate(table, 'foo', {'s': ('bar', sum)})
+    with pytest.raises(ArgumentError):
+        merge_aggregate([], 'foo', sum)
+    with pytest.raises(ArgumentError):
+        merge_aggregate([], 'foo', {'s': ('bar', len)})
+
+
+def test_merge_aggregate_mismatched_headers():
+
+    table = (('foo', 'bar'), ('a', 1), ('b', 2))
+    p1 = partial_aggregate(table, 'foo', Mean(), 'bar')
+    p2 = partial_aggregate(table, 'foo', Mean(), 'bar', field='other')
+    with pytest.raises(ArgumentError):
+        list(merge_aggregate([p1, p2], 'foo', Mean()))
+
+
+class _MutListAgg(StatefulAggregator):
+    # deliberately mutates the framework-owned state in place
+
+    def initial(self):
+        return []
+
+    def accumulate(self, state, value):
+        state.append(value)
+        return state
+
+    def merge(self, state, other):
+        state.extend(other)
+        return state
+
+    def finalize(self, state):
+        return len(state)
+
+
+def test_stateful_state_isolation():
+
+    table = (('foo', 'bar'),
+             ('a', 1),
+             ('a', 2),
+             ('b', 3))
+    expect = (('foo', 'value'),
+              ('a', 2),
+              ('b', 1))
+
+    # each group and each iteration accumulates from a fresh state
+    t = aggregate(table, 'foo', _MutListAgg(), 'bar')
+    ieq(expect, t)
+    ieq(expect, t)
+
+    # user-supplied state objects are not mutated by merging
+    p = [list(row) for row in partial_aggregate(table, 'foo',
+                                                _MutListAgg(), 'bar')]
+    snapshot = [list(row[1]) for row in p[1:]]
+    m = merge_aggregate([p], 'foo', _MutListAgg())
+    ieq(expect, m)
+    ieq(expect, m)
+    assert [list(row[1]) for row in p[1:]] == snapshot
+
+
+class _Concat(StatefulAggregator):
+    # string concatenation is not commutative
+
+    commutative = False
+
+    def initial(self):
+        return ''
+
+    def accumulate(self, state, value):
+        return state + str(value)
+
+    def merge(self, state, other):
+        return state + other
+
+    def finalize(self, state):
+        return state
+
+
+def test_merge_aggregate_noncommutative():
+
+    table = (('foo', 'bar'),
+             ('a', 'x'),
+             ('a', 'y'),
+             ('b', 'z'))
+
+    # one-shot use is fine, values arrive in input order
+    ieq((('foo', 'value'), ('a', 'xy'), ('b', 'z')),
+        aggregate(table, 'foo', _Concat(), 'bar', presorted=True))
+
+    p1 = partial_aggregate(table[:2], 'foo', _Concat(), 'bar',
+                           presorted=True)
+    p2 = partial_aggregate(table[:1] + table[2:], 'foo', _Concat(), 'bar',
+                           presorted=True)
+
+    # unordered merging of a non-commutative aggregator is rejected
+    with pytest.raises(ArgumentError):
+        merge_aggregate([p1, p2], 'foo', _Concat())
+
+    # ordered merging preserves the chunk order
+    m = merge_aggregate([p1, p2], 'foo', _Concat(), ordered=True)
+    ieq((('foo', 'value'), ('a', 'xy'), ('b', 'z')), m)
+
+    # ... also without a key
+    c1 = partial_aggregate(table[:3], None, _Concat(), 'bar')
+    c2 = partial_aggregate(table[:1] + table[3:], None, _Concat(), 'bar')
+    with pytest.raises(ArgumentError):
+        merge_aggregate([c1, c2], None, _Concat())
+    ieq((('value',), ('xyz',)),
+        merge_aggregate([c1, c2], None, _Concat(), ordered=True))

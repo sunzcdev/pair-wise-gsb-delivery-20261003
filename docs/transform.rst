@@ -204,6 +204,12 @@ Reducing rows (aggregation)
 ---------------------------
 
 .. autofunction:: petl.transform.reductions.aggregate
+.. autofunction:: petl.transform.reductions.partial_aggregate
+.. autofunction:: petl.transform.reductions.merge_aggregate
+.. autoclass:: petl.transform.reductions.StatefulAggregator
+.. autoclass:: petl.transform.reductions.Count
+.. autoclass:: petl.transform.reductions.Mean
+.. autoclass:: petl.transform.reductions.Variance
 .. autofunction:: petl.transform.reductions.rowreduce
 .. autofunction:: petl.transform.reductions.mergeduplicates
 .. autofunction:: petl.transform.reductions.merge

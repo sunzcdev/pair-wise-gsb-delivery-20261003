@@ -220,9 +220,25 @@ def aggregate(table, key, aggregation=None, value=None, presorted=False,
     A single-field key may also be specified as a one-item list or tuple,
     for both simple and multiple aggregations.
 
+    The `aggregation` argument also accepts instances of
+    :class:`petl.transform.reductions.StatefulAggregator` (e.g.,
+    :class:`petl.transform.reductions.Count`,
+    :class:`petl.transform.reductions.Mean`,
+    :class:`petl.transform.reductions.Variance`), both for simple and for
+    multiple aggregations. Stateful aggregators can also be computed
+    incrementally over separate input chunks, see
+    :func:`petl.transform.reductions.partial_aggregate` and
+    :func:`petl.transform.reductions.merge_aggregate`.
+
     """
 
-    if callable(aggregation):
+    if isinstance(aggregation, StatefulAggregator):
+        return SimpleAggregateView(table, key,
+                                   aggregation=_stateful_apply(aggregation),
+                                   value=value, presorted=presorted,
+                                   buffersize=buffersize, tempdir=tempdir,
+                                   cache=cache, field=field)
+    elif callable(aggregation):
         return SimpleAggregateView(table, key, aggregation=aggregation, 
                                    value=value, presorted=presorted, 
                                    buffersize=buffersize, tempdir=tempdir, 
@@ -313,9 +329,12 @@ class MultiAggregateView(Table):
         elif isinstance(aggregation, (list, tuple)):
             self.aggregation = OrderedDict()
             for t in aggregation:
-                self.aggregation[t[0]] = t[1:]
+                self.aggregation[t[0]] = _finalise_stateful_spec(t[1:])
         elif isinstance(aggregation, dict):
-            self.aggregation = aggregation
+            self.aggregation = OrderedDict(
+                (outfld, _finalise_stateful_spec(spec))
+                for outfld, spec in aggregation.items()
+            )
         else:
             raise ArgumentError(
                 'expected aggregation is None, list, tuple or dict, found %r'
@@ -402,6 +421,735 @@ def itermultiaggregate(source, key, aggregation):
                 aggval = aggfun(vals)
                 outrow.append(aggval)
         yield tuple(outrow)
+
+
+class StatefulAggregator(object):
+    """
+    Protocol for stateful, two-phase aggregation.
+
+    A stateful aggregator accumulates the values of a group into an
+    intermediate *state*, instead of directly producing a result. States
+    from different input chunks can then be combined via :meth:`merge`,
+    and the final result is produced from the merged state via
+    :meth:`finalize`. This allows large extraction jobs to compute and
+    store per-group partial states separately (e.g., per input chunk),
+    then merge them later without re-reading the raw data.
+
+    Subclasses must implement four methods:
+
+    * ``initial()`` - return a fresh state object. Called once per group
+      per iteration, so each group and each pass over the data always
+      starts from an independent state. The initial state must be an
+      identity for :meth:`merge`, i.e., ``merge(initial(), s)`` must be
+      equivalent to ``s``.
+
+    * ``accumulate(state, value)`` - fold a single value into the state
+      and return the updated state. The ``state`` argument is always
+      framework-owned (produced by ``initial()``, ``accumulate()`` or
+      ``merge()`` during the current group), so it may be mutated and
+      returned, or replaced by a new object.
+
+    * ``merge(state, other)`` - combine two partial states and return the
+      merged state. Must *not* mutate ``other``, which may be a
+      user-supplied state object shared with other computations.
+
+    * ``finalize(state)`` - produce the output value from a state. Must
+      not mutate the state.
+
+    Merging must be associative, and is assumed to be commutative unless
+    the class attribute ``commutative`` is set to ``False``. Aggregators
+    that are not commutative (i.e., the merge result depends on the order
+    of the chunks) are rejected by
+    :func:`petl.transform.reductions.merge_aggregate` unless ``ordered``
+    is explicitly set to ``True``.
+
+    Instances of this protocol can be used anywhere an aggregation
+    function is accepted by
+    :func:`petl.transform.reductions.aggregate`, e.g.::
+
+        >>> import petl as etl
+        >>> table1 = [['foo', 'bar'],
+        ...           ['a', 3],
+        ...           ['a', 7],
+        ...           ['b', 2]]
+        >>> etl.aggregate(table1, 'foo', etl.Mean(), 'bar')
+        +-----+-------+
+        | foo | value |
+        +=====+=======+
+        | 'a' |   5.0 |
+        +-----+-------+
+        | 'b' |   2.0 |
+        +-----+-------+
+
+    See also :class:`Count`, :class:`Mean`, :class:`Variance`,
+    :func:`petl.transform.reductions.partial_aggregate` and
+    :func:`petl.transform.reductions.merge_aggregate`.
+
+    .. versionadded:: 1.8.0
+
+    """
+
+    commutative = True
+
+    def initial(self):
+        """Return a fresh, empty state object."""
+        raise NotImplementedError
+
+    def accumulate(self, state, value):
+        """Fold `value` into `state`, return the updated state."""
+        raise NotImplementedError
+
+    def merge(self, state, other):
+        """Merge partial state `other` into `state`, return the merged
+        state. Must not mutate `other`."""
+        raise NotImplementedError
+
+    def finalize(self, state):
+        """Produce the output value from `state`."""
+        raise NotImplementedError
+
+
+class Count(StatefulAggregator):
+    """
+    Stateful aggregator counting the values in a group. E.g.::
+
+        >>> import petl as etl
+        >>> table1 = [['foo', 'bar'],
+        ...           ['a', 3],
+        ...           ['a', None],
+        ...           ['b', 2]]
+        >>> etl.aggregate(table1, 'foo', etl.Count(), 'bar')
+        +-----+-------+
+        | foo | value |
+        +=====+=======+
+        | 'a' |     2 |
+        +-----+-------+
+        | 'b' |     1 |
+        +-----+-------+
+
+    If `skip_missing` is True, missing values (``None``) are not counted.
+
+    .. versionadded:: 1.8.0
+
+    """
+
+    def __init__(self, skip_missing=False):
+        self.skip_missing = skip_missing
+
+    def initial(self):
+        return 0
+
+    def accumulate(self, state, value):
+        if self.skip_missing and value is None:
+            return state
+        return state + 1
+
+    def merge(self, state, other):
+        return state + other
+
+    def finalize(self, state):
+        return state
+
+
+class Mean(StatefulAggregator):
+    """
+    Stateful aggregator computing the arithmetic mean of the non-missing
+    values in a group. Missing values (``None``) are skipped; if a group
+    contains no non-missing values, the result is ``None``. E.g.::
+
+        >>> import petl as etl
+        >>> table1 = [['foo', 'bar'],
+        ...           ['a', 3],
+        ...           ['a', 7],
+        ...           ['b', None],
+        ...           ['c', 2]]
+        >>> etl.aggregate(table1, 'foo', etl.Mean(), 'bar')
+        +-----+-------+
+        | foo | value |
+        +=====+=======+
+        | 'a' |   5.0 |
+        +-----+-------+
+        | 'b' |  None |
+        +-----+-------+
+        | 'c' |   2.0 |
+        +-----+-------+
+
+    Works with any numeric type supporting addition and division,
+    including :class:`decimal.Decimal`.
+
+    .. versionadded:: 1.8.0
+
+    """
+
+    def initial(self):
+        # (total, count)
+        return 0, 0
+
+    def accumulate(self, state, value):
+        if value is None:
+            return state
+        total, count = state
+        return total + value, count + 1
+
+    def merge(self, state, other):
+        total, count = state
+        ototal, ocount = other
+        return total + ototal, count + ocount
+
+    def finalize(self, state):
+        total, count = state
+        if count == 0:
+            return None
+        return total / count
+
+
+class Variance(StatefulAggregator):
+    """
+    Stateful aggregator computing the variance of the non-missing values
+    in a group, together with the number of values seen. Missing values
+    (``None``) are skipped. The result is a ``(variance, n)`` tuple, where
+    `n` is the number of non-missing values and `variance` is ``None`` if
+    `n` is too small to compute it. E.g.::
+
+        >>> import petl as etl
+        >>> table1 = [['foo', 'bar'],
+        ...           ['a', 3],
+        ...           ['a', 7],
+        ...           ['b', None],
+        ...           ['c', 2]]
+        >>> etl.aggregate(table1, 'foo', etl.Variance(), 'bar')
+        +-----+-----------+
+        | foo | value     |
+        +=====+===========+
+        | 'a' | (8.0, 2)  |
+        +-----+-----------+
+        | 'b' | (None, 0) |
+        +-----+-----------+
+        | 'c' | (None, 1) |
+        +-----+-----------+
+
+    By default the sample variance (divisor ``n - 1``) is computed; pass
+    ``sample=False`` for the population variance (divisor ``n``).
+
+    States are combined using the parallel variance algorithm of Chan et
+    al., so partial states computed over separate chunks of a group merge
+    to the same result (up to floating point rounding) as a single pass.
+
+    .. versionadded:: 1.8.0
+
+    """
+
+    def __init__(self, sample=True):
+        self.sample = sample
+
+    def initial(self):
+        # (count, mean, m2) - Welford's algorithm
+        return 0, 0, 0
+
+    def accumulate(self, state, value):
+        if value is None:
+            return state
+        count, mean, m2 = state
+        count += 1
+        delta = value - mean
+        mean += delta / count
+        m2 += delta * (value - mean)
+        return count, mean, m2
+
+    def merge(self, state, other):
+        count, mean, m2 = state
+        ocount, omean, om2 = other
+        if ocount == 0:
+            return count, mean, m2
+        if count == 0:
+            return ocount, omean, om2
+        total = count + ocount
+        delta = omean - mean
+        mean = mean + delta * ocount / total
+        m2 = m2 + om2 + delta * delta * count * ocount / total
+        return total, mean, m2
+
+    def finalize(self, state):
+        count, mean, m2 = state
+        if self.sample:
+            variance = m2 / (count - 1) if count > 1 else None
+        else:
+            variance = m2 / count if count > 0 else None
+        return variance, count
+
+
+def _stateful_accumulate(aggregator):
+    """Wrap a StatefulAggregator as a callable mapping an iterable of
+    values to a partial state. A fresh state is created on each call, so
+    states are never shared between groups or between iterations."""
+    def accumulate_all(vals):
+        state = aggregator.initial()
+        for v in vals:
+            state = aggregator.accumulate(state, v)
+        return state
+    return accumulate_all
+
+
+def _stateful_apply(aggregator):
+    """Wrap a StatefulAggregator as a plain aggregation function mapping
+    an iterable of values to a final result."""
+    accumulate_all = _stateful_accumulate(aggregator)
+
+    def apply(vals):
+        return aggregator.finalize(accumulate_all(vals))
+    return apply
+
+
+def _finalise_stateful_spec(spec):
+    """Replace any StatefulAggregator found in a multi-aggregation spec
+    with an equivalent plain callable."""
+    if isinstance(spec, StatefulAggregator):
+        return _stateful_apply(spec)
+    elif isinstance(spec, (list, tuple)):
+        if len(spec) == 1 and isinstance(spec[0], StatefulAggregator):
+            return _stateful_apply(spec[0]),
+        elif len(spec) == 2 and isinstance(spec[1], StatefulAggregator):
+            return spec[0], _stateful_apply(spec[1])
+    return spec
+
+
+def _normalise_stateful_spec(spec):
+    """Normalise a multi-aggregation spec to a (source field,
+    StatefulAggregator) pair, raising ArgumentError if the spec does not
+    contain a StatefulAggregator."""
+    if isinstance(spec, StatefulAggregator):
+        return None, spec
+    elif isinstance(spec, (list, tuple)):
+        if len(spec) == 1 and isinstance(spec[0], StatefulAggregator):
+            return None, spec[0]
+        elif len(spec) == 2 and isinstance(spec[1], StatefulAggregator):
+            return spec[0], spec[1]
+    raise ArgumentError(
+        'expected a StatefulAggregator specification, found %r' % (spec,)
+    )
+
+
+def partial_aggregate(table, key, aggregation, value=None, presorted=False,
+                      buffersize=None, tempdir=None, cache=True,
+                      field='state'):
+    """
+    Compute per-group partial aggregation states, for later merging via
+    :func:`petl.transform.reductions.merge_aggregate`. E.g.::
+
+        >>> import petl as etl
+        >>> table1 = [['foo', 'bar'],
+        ...           ['a', 3],
+        ...           ['a', 7],
+        ...           ['b', 2]]
+        >>> p = etl.partial_aggregate(table1, 'foo', etl.Mean(), 'bar')
+        >>> p
+        +-----+---------+
+        | foo | state   |
+        +=====+=========+
+        | 'a' | (10, 2) |
+        +-----+---------+
+        | 'b' | (2, 1)  |
+        +-----+---------+
+
+    The `aggregation` argument must be a
+    :class:`petl.transform.reductions.StatefulAggregator` instance, or -
+    as with :func:`petl.transform.reductions.aggregate` - a dict, list or
+    tuple of aggregation specifications, in which case one state column
+    per output field is emitted.
+
+    Each group is accumulated from a fresh state on every iteration, so
+    state objects in the output are never shared between groups or
+    between passes over the table.
+
+    .. versionadded:: 1.8.0
+
+    """
+
+    if isinstance(aggregation, StatefulAggregator):
+        return SimplePartialAggregateView(table, key, aggregation,
+                                          value=value, presorted=presorted,
+                                          buffersize=buffersize,
+                                          tempdir=tempdir, cache=cache,
+                                          field=field)
+    elif isinstance(aggregation, (list, tuple, dict)):
+        return MultiPartialAggregateView(table, key, aggregation,
+                                         presorted=presorted,
+                                         buffersize=buffersize,
+                                         tempdir=tempdir, cache=cache)
+    else:
+        raise ArgumentError(
+            'expected a StatefulAggregator or a collection of '
+            'StatefulAggregator specifications, found %r' % (aggregation,)
+        )
+
+
+Table.partial_aggregate = partial_aggregate
+
+
+class SimplePartialAggregateView(Table):
+
+    def __init__(self, table, key, aggregation, value=None,
+                 presorted=False, buffersize=None, tempdir=None,
+                 cache=True, field='state'):
+        if presorted or key is None:
+            self.table = table
+        else:
+            self.table = sort(table, key, buffersize=buffersize,
+                              tempdir=tempdir, cache=cache)
+        self.key = key
+        self.aggregation = aggregation
+        self.value = value
+        self.field = field
+
+    def __iter__(self):
+        return itersimplepartial(self.table, self.key, self.aggregation,
+                                 self.value, self.field)
+
+
+def itersimplepartial(table, key, aggregator, value, field):
+
+    # special case where length of key is 1
+    if isinstance(key, (list, tuple)) and len(key) == 1:
+        key = key[0]
+
+    accumulate = _stateful_accumulate(aggregator)
+
+    # determine output header
+    if isinstance(key, (list, tuple)):
+        outhdr = tuple(key) + (field,)
+    elif callable(key):
+        outhdr = ('key', field)
+    elif key is None:
+        outhdr = field,
+    else:
+        outhdr = (key, field)
+    yield outhdr
+
+    # generate data
+    if isinstance(key, (list, tuple)):
+        for k, grp in rowgroupby(table, key, value):
+            yield tuple(k) + (accumulate(grp),)
+    elif key is None:
+        if value is None:
+            yield accumulate(iter(records(table))),
+        else:
+            yield accumulate(values(table, value)),
+    else:
+        for k, grp in rowgroupby(table, key, value):
+            yield k, accumulate(grp)
+
+
+class MultiPartialAggregateView(Table):
+
+    def __init__(self, source, key, aggregation, presorted=False,
+                 buffersize=None, tempdir=None, cache=True):
+        if presorted or key is None:
+            self.source = source
+        else:
+            self.source = sort(source, key, buffersize=buffersize,
+                               tempdir=tempdir, cache=cache)
+        self.key = key
+        if isinstance(aggregation, dict):
+            items = list(aggregation.items())
+        else:
+            items = [(t[0], t[1:]) for t in aggregation]
+        self.aggregation = OrderedDict()
+        for outfld, spec in items:
+            srcfld, aggregator = _normalise_stateful_spec(spec)
+            self.aggregation[outfld] = srcfld, _stateful_accumulate(aggregator)
+
+    def __iter__(self):
+        return itermultiaggregate(self.source, self.key, self.aggregation)
+
+
+def merge_aggregate(partials, key, aggregation, ordered=False,
+                    presorted=False, buffersize=None, tempdir=None,
+                    cache=True, field='value'):
+    """
+    Merge partial aggregation states computed by
+    :func:`petl.transform.reductions.partial_aggregate` and produce final
+    results. E.g.::
+
+        >>> import petl as etl
+        >>> chunk1 = [['foo', 'bar'], ['a', 3], ['b', 2]]
+        >>> chunk2 = [['foo', 'bar'], ['a', 7], ['b', 4], ['b', 1]]
+        >>> p1 = etl.partial_aggregate(chunk1, 'foo', etl.Mean(), 'bar')
+        >>> p2 = etl.partial_aggregate(chunk2, 'foo', etl.Mean(), 'bar')
+        >>> etl.merge_aggregate([p1, p2], 'foo', etl.Mean())
+        +-----+--------------------+
+        | foo | value              |
+        +=====+====================+
+        | 'a' |                5.0 |
+        +-----+--------------------+
+        | 'b' | 2.3333333333333335 |
+        +-----+--------------------+
+
+    The `partials` argument may be a single table of partial states or a
+    sequence of such tables, e.g., one per input chunk. States for the
+    same group are merged with the
+    :meth:`petl.transform.reductions.StatefulAggregator.merge` method of
+    `aggregation`, which must be a
+    :class:`petl.transform.reductions.StatefulAggregator` instance, or a
+    dict, list or tuple of aggregation specifications as accepted by
+    :func:`petl.transform.reductions.partial_aggregate`.
+
+    Unless `presorted` is True, the merged input is sorted by `key`
+    before grouping. If `ordered` is True, the input is assumed to be
+    already grouped by `key` and the states within each group are merged
+    in the order they are encountered; this is required for aggregators
+    whose merge is not commutative (``commutative = False``), which are
+    otherwise rejected with an
+    :exc:`petl.errors.ArgumentError`.
+
+    For floating point aggregations, results may differ slightly from a
+    one-shot computation because values are combined in a different
+    association order; expect agreement within a relative tolerance of
+    about 1e-9.
+
+    .. versionadded:: 1.8.0
+
+    """
+
+    if isinstance(aggregation, StatefulAggregator):
+        return MergeAggregateView(partials, key, aggregation,
+                                  ordered=ordered, presorted=presorted,
+                                  buffersize=buffersize, tempdir=tempdir,
+                                  cache=cache, field=field)
+    elif isinstance(aggregation, (list, tuple, dict)):
+        return MultiMergeAggregateView(partials, key, aggregation,
+                                       ordered=ordered, presorted=presorted,
+                                       buffersize=buffersize, tempdir=tempdir,
+                                       cache=cache)
+    else:
+        raise ArgumentError(
+            'expected a StatefulAggregator or a collection of '
+            'StatefulAggregator specifications, found %r' % (aggregation,)
+        )
+
+
+Table.merge_aggregate = merge_aggregate
+
+
+def _as_table_list(partials):
+    """Normalise the `partials` argument of merge_aggregate to a list of
+    tables."""
+    if isinstance(partials, Table):
+        return [partials]
+    elif isinstance(partials, (list, tuple)):
+        if len(partials) == 0:
+            return []
+        first = partials[0]
+        if isinstance(first, Table):
+            return list(partials)
+        elif isinstance(first, (list, tuple)) and len(first) > 0 \
+                and isinstance(first[0], (list, tuple, Table)):
+            # a sequence of tables, each given as a sequence of rows
+            return list(partials)
+        else:
+            # a single table given as a sequence of rows
+            return [partials]
+    else:
+        # some other iterable, assume a single table
+        return [partials]
+
+
+def _iterchaintables(tables):
+    """Chain the data rows of several tables, verifying that all headers
+    are identical."""
+    hdr = None
+    for table in tables:
+        it = iter(table)
+        try:
+            thdr = tuple(next(it))
+        except StopIteration:
+            continue
+        if hdr is None:
+            hdr = thdr
+            yield hdr
+        elif thdr != hdr:
+            raise ArgumentError(
+                'partial tables have mismatched headers: %r and %r'
+                % (hdr, thdr)
+            )
+        for row in it:
+            yield row
+
+
+def _check_commutative(aggregators, ordered):
+    if ordered:
+        return
+    for aggregator in aggregators:
+        if not aggregator.commutative:
+            raise ArgumentError(
+                'aggregator %r is not commutative, pass ordered=True to '
+                'merge states in input order' % (aggregator,)
+            )
+
+
+class MergeAggregateView(Table):
+
+    def __init__(self, partials, key, aggregation, ordered=False,
+                 presorted=False, buffersize=None, tempdir=None,
+                 cache=True, field='value'):
+        _check_commutative([aggregation], ordered)
+        self.tables = _as_table_list(partials)
+        self.key = key
+        self.aggregation = aggregation
+        self.field = field
+        self.presorted = presorted or ordered or key is None
+        self._buffersize = buffersize
+        self._tempdir = tempdir
+        self._cache = cache
+
+    def __iter__(self):
+        source = _iterchaintables(self.tables)
+        if not self.presorted:
+            source = sort(source, self.key, buffersize=self._buffersize,
+                          tempdir=self._tempdir, cache=self._cache)
+        return itersimplemerge(source, self.key, self.aggregation,
+                               self.field)
+
+
+def itersimplemerge(table, key, aggregator, field):
+
+    # special case where length of key is 1
+    if isinstance(key, (list, tuple)) and len(key) == 1:
+        key = key[0]
+
+    it = iter(table)
+    hdr = next(it, None)
+    if hdr is not None and len(hdr) == 0:
+        hdr = None  # sorting an empty table yields an empty header
+    if hdr is not None:
+        # push back header
+        it = itertools.chain([hdr], it)
+
+    # determine output header
+    if isinstance(key, (list, tuple)):
+        outhdr = tuple(key) + (field,)
+    elif callable(key):
+        outhdr = ('key', field)
+    elif key is None:
+        outhdr = field,
+    else:
+        outhdr = (key, field)
+    yield outhdr
+
+    if hdr is None:
+        # no partial data at all
+        if key is None:
+            yield aggregator.finalize(aggregator.initial()),
+        return
+
+    # states are expected in the last column
+    stateidx = len(hdr) - 1
+
+    if key is None:
+        state = aggregator.initial()
+        datait = iter(it)
+        next(datait, None)  # skip header
+        for row in datait:
+            state = aggregator.merge(state, row[stateidx])
+        yield aggregator.finalize(state),
+    else:
+        for k, grp in rowgroupby(it, key, stateidx):
+            state = aggregator.initial()
+            for other in grp:
+                state = aggregator.merge(state, other)
+            if isinstance(key, (list, tuple)):
+                yield tuple(k) + (aggregator.finalize(state),)
+            else:
+                yield k, aggregator.finalize(state)
+
+
+class MultiMergeAggregateView(Table):
+
+    def __init__(self, partials, key, aggregation, ordered=False,
+                 presorted=False, buffersize=None, tempdir=None,
+                 cache=True):
+        self.tables = _as_table_list(partials)
+        self.key = key
+        if isinstance(aggregation, dict):
+            items = list(aggregation.items())
+        else:
+            items = [(t[0], t[1:]) for t in aggregation]
+        self.aggregation = OrderedDict()
+        for outfld, spec in items:
+            srcfld, aggregator = _normalise_stateful_spec(spec)
+            # source fields are only used when computing partials, at
+            # merge time states are located by output field name
+            self.aggregation[outfld] = aggregator
+        _check_commutative(self.aggregation.values(), ordered)
+        self.presorted = presorted or ordered or key is None
+        self._buffersize = buffersize
+        self._tempdir = tempdir
+        self._cache = cache
+
+    def __iter__(self):
+        source = _iterchaintables(self.tables)
+        if not self.presorted:
+            source = sort(source, self.key, buffersize=self._buffersize,
+                          tempdir=self._tempdir, cache=self._cache)
+        return itermultimerge(source, self.key, self.aggregation)
+
+
+def itermultimerge(table, key, aggregation):
+
+    # special case where length of key is 1
+    if isinstance(key, (list, tuple)) and len(key) == 1:
+        key = key[0]
+
+    it = iter(table)
+    hdr = next(it, None)
+    if hdr is not None and len(hdr) == 0:
+        hdr = None  # sorting an empty table yields an empty header
+    if hdr is not None:
+        # push back header
+        it = itertools.chain([hdr], it)
+
+    outflds = list(aggregation.keys())
+    aggregators = list(aggregation.values())
+
+    # determine output header
+    if isinstance(key, (list, tuple)):
+        outhdr = list(key)
+    elif callable(key):
+        outhdr = ['key']
+    elif key is None:
+        outhdr = []
+    else:
+        outhdr = [key]
+    outhdr += outflds
+    yield tuple(outhdr)
+
+    if hdr is None:
+        # no partial data at all
+        if key is None:
+            yield tuple(a.finalize(a.initial()) for a in aggregators)
+        return
+
+    stateidxs = [list(hdr).index(outfld) for outfld in outflds]
+
+    if key is None:
+        states = [a.initial() for a in aggregators]
+        datait = iter(it)
+        next(datait, None)  # skip header
+        for row in datait:
+            for i, idx in enumerate(stateidxs):
+                states[i] = aggregators[i].merge(states[i], row[idx])
+        yield tuple(a.finalize(s) for a, s in zip(aggregators, states))
+    else:
+        for k, rows in rowgroupby(it, key):
+            states = [a.initial() for a in aggregators]
+            for row in rows:
+                for i, idx in enumerate(stateidxs):
+                    states[i] = aggregators[i].merge(states[i], row[idx])
+            if isinstance(key, (list, tuple)):
+                outrow = list(k)
+            else:
+                outrow = [k]
+            outrow += [a.finalize(s) for a, s in zip(aggregators, states)]
+            yield tuple(outrow)
 
 
 def groupcountdistinctvalues(table, key, value):
