@@ -147,6 +147,82 @@ class StorageTests(object):
         self.assertEqual(self.s.schedule_size(), 0)
         self.assertEqual(self.s.read_schedule(datetime.datetime.now()), [])
 
+    def test_in_place_reschedule(self):
+        from huey.constants import RESCHEDULE_NOT_FOUND
+        from huey.constants import RESCHEDULE_OK
+        ts = datetime.datetime(2000, 1, 2, 3, 4, 5)
+        hour = datetime.timedelta(seconds=3600)
+
+        # Queue -> schedule.
+        self.s.enqueue(b'q1')
+        self.assertEqual(self.s.queue_size(), 1)
+        status = self.s.reschedule_from_queue(b'q1', b'q1-new', ts + hour)
+        self.assertEqual(status, RESCHEDULE_OK)
+        self.assertEqual(self.s.queue_size(), 0)
+        self.assertEqual(self.s.schedule_size(), 1)
+        self.assertEqual(self.s.scheduled_items(), [b'q1-new'])
+
+        # Moving a missing queue item reports not found.
+        self.assertEqual(
+            self.s.reschedule_from_queue(b'q1', b'x', ts),
+            RESCHEDULE_NOT_FOUND)
+
+        # Schedule -> schedule (re-score / replace).
+        status = self.s.reschedule_from_schedule(
+            b'q1-new', b'q1-newer', ts + (hour * 2))
+        self.assertEqual(status, RESCHEDULE_OK)
+        self.assertEqual(self.s.schedule_size(), 1)
+        self.assertEqual(self.s.scheduled_items(), [b'q1-newer'])
+
+        # Re-scoring a missing schedule item reports not found.
+        self.assertEqual(
+            self.s.reschedule_from_schedule(b'q1-new', b'x', ts),
+            RESCHEDULE_NOT_FOUND)
+
+        # Remove from schedule (without re-adding).
+        status = self.s.remove_from_schedule(b'q1-newer')
+        self.assertEqual(status, RESCHEDULE_OK)
+        self.assertEqual(self.s.schedule_size(), 0)
+        self.assertEqual(self.s.remove_from_schedule(b'q1-newer'),
+                         RESCHEDULE_NOT_FOUND)
+
+        # In-place replacement within the queue preserves a single entry.
+        self.s.enqueue(b'q2')
+        self.s.enqueue(b'q3')
+        self.assertEqual(
+            self.s.replace_in_queue(b'q2', b'q2-x'), RESCHEDULE_OK)
+        self.assertEqual(self.s.queue_size(), 2)
+        self.assertIn(b'q2-x', self.s.enqueued_items())
+        self.assertNotIn(b'q2', self.s.enqueued_items())
+        self.assertEqual(self.s.replace_in_queue(b'q2', b'x'),
+                         RESCHEDULE_NOT_FOUND)
+        self.s.flush_queue()
+
+    def test_in_place_reschedule_transitions(self):
+        from huey.constants import RESCHEDULE_NOT_FOUND
+        from huey.constants import RESCHEDULE_OK
+        ts = datetime.datetime(2000, 1, 2, 3, 4, 5)
+        hour = datetime.timedelta(seconds=3600)
+
+        # An item moved to the schedule and then back to the queue exists in
+        # exactly one place at every step (no double execution).
+        self.s.enqueue(b'task')
+        self.assertEqual(self.s.reschedule_from_queue(b'task', b'task',
+                                                       ts + hour),
+                         RESCHEDULE_OK)
+        self.assertEqual(self.s.queue_size(), 0)
+        self.assertEqual(self.s.schedule_size(), 1)
+
+        self.assertEqual(self.s.remove_from_schedule(b'task'),
+                         RESCHEDULE_OK)
+        self.s.enqueue(b'task')
+        self.assertEqual(self.s.queue_size(), 1)
+        self.assertEqual(self.s.schedule_size(), 0)
+
+        # dequeue returns the single surviving item.
+        self.assertEqual(self.s.dequeue(), b'task')
+        self.assertEqual(self.s.dequeue(), None)
+
     def test_result_store_methods(self):
         # Put and peek at data. Verify missing keys return EmptyData sentinel.
         self.s.put_data(b'k1', b'v1')

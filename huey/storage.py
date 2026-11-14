@@ -33,6 +33,8 @@ except ImportError:
     psycopg = None
 
 from huey.constants import EmptyData
+from huey.constants import RESCHEDULE_NOT_FOUND
+from huey.constants import RESCHEDULE_OK
 from huey.exceptions import ConfigurationError
 from huey.utils import FileLock
 
@@ -148,6 +150,83 @@ class BaseStorage(object):
         Delete all scheduled tasks.
 
         :return: No return value.
+        """
+        raise NotImplementedError
+
+    def reschedule_from_queue(self, old_data, new_data, ts):
+        """
+        Atomically move a pending (ready-to-run) task out of the queue and
+        into the schedule at the given timestamp ``ts``. The entry is only
+        moved when its stored message exactly matches ``old_data``, which
+        prevents moving a task that has already been claimed and replaced.
+        The replacement message ``new_data`` (which carries the new ETA but
+        preserves the task ID) is what gets stored in the schedule.
+
+        This must be atomic with respect to :py:meth:`dequeue` so that a task
+        can only ever exist in one place - either the queue or the schedule.
+
+        :param bytes old_data: The serialized message currently expected in
+                               the queue.
+        :param bytes new_data: The serialized task carrying the new ETA.
+        :param datetime ts: The new scheduled timestamp.
+        :return: ``RESCHEDULE_OK`` if the task was moved, or
+                 ``RESCHEDULE_NOT_FOUND`` if the task is no longer in the
+                 queue (e.g. it was already claimed by a worker).
+        """
+        raise NotImplementedError
+
+    def reschedule_from_schedule(self, old_data, new_data, ts):
+        """
+        Atomically change the scheduled time of a task that currently resides
+        in the schedule. The entry is only updated when its stored message
+        exactly matches ``old_data``. The task remains in the schedule but is
+        re-scored to the given timestamp ``ts``.
+
+        This must be atomic with respect to :py:meth:`read_schedule` so that a
+        task can only ever exist in one place and is never executed twice with
+        different ETAs.
+
+        :param bytes old_data: The serialized message currently expected in
+                               the schedule.
+        :param bytes new_data: The serialized task carrying the new ETA.
+        :param datetime ts: The new scheduled timestamp.
+        :return: ``RESCHEDULE_OK`` if the task was updated, or
+                 ``RESCHEDULE_NOT_FOUND`` if the task is no longer scheduled
+                 (e.g. it was already claimed and moved to the queue).
+        """
+        raise NotImplementedError
+
+    def replace_in_queue(self, old_data, new_data):
+        """
+        Atomically replace the message of a task that remains in the ready
+        queue (e.g. its ETA changed but it is still due immediately). The
+        entry is only replaced when its stored message exactly matches
+        ``old_data``.
+
+        :param bytes old_data: The serialized message currently expected in
+                               the queue.
+        :param bytes new_data: The serialized task carrying the new ETA.
+        :return: ``RESCHEDULE_OK`` or ``RESCHEDULE_NOT_FOUND``.
+        """
+        raise NotImplementedError
+
+    def replace_in_schedule(self, old_data, new_data, ts):
+        """
+        Atomically replace the message (and re-score) a task that remains in
+        the schedule. Equivalent to :py:meth:`reschedule_from_schedule`, kept
+        as a distinct, descriptive name for the in-place (non-transitioning)
+        case.
+        """
+        return self.reschedule_from_schedule(old_data, new_data, ts)
+
+    def remove_from_schedule(self, old_data):
+        """
+        Atomically remove a task whose stored message exactly matches
+        ``old_data`` from the schedule, without re-adding it anywhere. Used
+        when transitioning a due scheduled task directly into the ready queue.
+
+        :return: ``RESCHEDULE_OK`` if the entry was removed, or
+                 ``RESCHEDULE_NOT_FOUND`` if it is no longer scheduled.
         """
         raise NotImplementedError
 
@@ -319,6 +398,14 @@ class BlackHoleStorage(BaseStorage):
     def schedule_size(self): return 0
     def scheduled_items(self, limit=None): return []
     def flush_schedule(self): pass
+    def reschedule_from_queue(self, old_data, new_data, ts):
+        return RESCHEDULE_NOT_FOUND
+    def reschedule_from_schedule(self, old_data, new_data, ts):
+        return RESCHEDULE_NOT_FOUND
+    def replace_in_queue(self, old_data, new_data):
+        return RESCHEDULE_NOT_FOUND
+    def remove_from_schedule(self, old_data):
+        return RESCHEDULE_NOT_FOUND
     def put_data(self, key, value, is_result=False): pass
     def peek_data(self, key): return EmptyData
     def pop_data(self, key): return EmptyData
@@ -398,6 +485,50 @@ class MemoryStorage(BaseStorage):
     def flush_schedule(self):
         self._schedule = []
 
+    def reschedule_from_queue(self, old_data, new_data, ts):
+        # Move the matching task from the ready queue into the schedule. The
+        # storage lock makes this atomic w/respect to dequeue().
+        with self._lock:
+            for i, (priority, counter, data) in enumerate(self._queue):
+                if data == old_data:
+                    del self._queue[i]
+                    heapq.heapify(self._queue)
+                    heapq.heappush(self._schedule, (ts, new_data))
+                    return RESCHEDULE_OK
+        return RESCHEDULE_NOT_FOUND
+
+    def reschedule_from_schedule(self, old_data, new_data, ts):
+        # Re-score the matching task within the schedule. The storage lock
+        # makes this atomic w/respect to read_schedule().
+        with self._lock:
+            for i, (old_ts, data) in enumerate(self._schedule):
+                if data == old_data:
+                    self._schedule[i] = (ts, new_data)
+                    heapq.heapify(self._schedule)
+                    return RESCHEDULE_OK
+        return RESCHEDULE_NOT_FOUND
+
+    def replace_in_queue(self, old_data, new_data):
+        # Replace the message of a task that remains in the ready queue,
+        # preserving its priority and FIFO ordering.
+        with self._lock:
+            for i, (priority, counter, data) in enumerate(self._queue):
+                if data == old_data:
+                    self._queue[i] = (priority, counter, new_data)
+                    heapq.heapify(self._queue)
+                    return RESCHEDULE_OK
+        return RESCHEDULE_NOT_FOUND
+
+    def remove_from_schedule(self, old_data):
+        # Remove the matching entry from the schedule without re-adding it.
+        with self._lock:
+            for i, (old_ts, data) in enumerate(self._schedule):
+                if data == old_data:
+                    del self._schedule[i]
+                    heapq.heapify(self._schedule)
+                    return RESCHEDULE_OK
+        return RESCHEDULE_NOT_FOUND
+
     def put_data(self, key, value, is_result=False):
         self._results[key] = value
 
@@ -450,6 +581,85 @@ if #res and redis.call('zremrangebyscore', KEYS[1], '-inf', unix_ts) == #res the
 end"""
 
 
+# Move a task that exactly matches OLD from the list-backed ready queue into
+# the schedule sorted-set at the given score. Atomicity guarantees the task
+# exists in at most one place.
+QUEUE_TO_SCHEDULE_LUA = """\
+local removed = redis.call('lrem', KEYS[1], 1, ARGV[1])
+if removed == 1 then
+    redis.call('zadd', KEYS[2], ARGV[3], ARGV[2])
+    return 1
+end
+return 0"""
+
+
+# Move a task that exactly matches OLD from the sorted-set ready queue
+# (priority queue stores an 8-byte timestamp prefix + message) into the
+# schedule sorted-set at the given score. The prefix scan happens inside the
+# same atomic script so there is no window for a race with a dequeue.
+PQUEUE_TO_SCHEDULE_LUA = """\
+local members = redis.call('zrange', KEYS[1], 0, -1)
+for i = 1, #members do
+    if string.sub(members[i], 9) == ARGV[1] then
+        redis.call('zrem', KEYS[1], members[i])
+        redis.call('zadd', KEYS[2], ARGV[3], ARGV[2])
+        return 1
+    end
+end
+return 0"""
+
+
+# Re-score (reschedule) a task that exactly matches OLD within the schedule
+# sorted-set, replacing it with NEW at the given score.
+SCHEDULE_RESCHEDULE_LUA = """\
+local removed = redis.call('zrem', KEYS[1], ARGV[1])
+if removed == 1 then
+    redis.call('zadd', KEYS[1], ARGV[3], ARGV[2])
+    return 1
+end
+return 0"""
+
+
+# Remove a task that exactly matches OLD from the schedule sorted-set.
+SCHEDULE_REMOVE_LUA = """\
+return redis.call('zrem', KEYS[1], ARGV[1])"""
+
+
+# Replace a task that exactly matches OLD within the list-backed ready queue
+# with NEW, preserving its position.
+QUEUE_REPLACE_LUA = """\
+local idx = nil
+local items = redis.call('lrange', KEYS[1], 0, -1)
+for i = 1, #items do
+    if items[i] == ARGV[1] then
+        idx = i - 1
+        break
+    end
+end
+if idx == nil then
+    return 0
+end
+redis.call('lset', KEYS[1], idx, ARGV[2])
+return 1"""
+
+
+# Replace a task whose wrapped message matches OLD in the sorted-set ready
+# queue (priority queue), preserving its score/ordering.
+PQUEUE_REPLACE_LUA = """\
+local members = redis.call('zrange', KEYS[1], 0, -1, 'withscores')
+for i = 1, #members, 2 do
+    local member = members[i]
+    if string.sub(member, 9) == ARGV[1] then
+        local score = members[i + 1]
+        redis.call('zrem', KEYS[1], member)
+        local prefix = string.sub(member, 1, 8)
+        redis.call('zadd', KEYS[1], score, prefix .. ARGV[2])
+        return 1
+    end
+end
+return 0"""
+
+
 class RedisStorage(BaseStorage):
     priority = False  # Use PriorityRedisStorage instead. Requires Redis>=5.0.
     redis_client = Redis
@@ -484,6 +694,15 @@ class RedisStorage(BaseStorage):
         self.conn = self.redis_client(connection_pool=connection_pool)
         self.connection_params = connection_params
         self._pop = self.conn.register_script(SCHEDULE_POP_LUA)
+        self._queue_to_schedule = self.conn.register_script(
+            QUEUE_TO_SCHEDULE_LUA)
+        self._pqueue_to_schedule = self.conn.register_script(
+            PQUEUE_TO_SCHEDULE_LUA)
+        self._schedule_reschedule = self.conn.register_script(
+            SCHEDULE_RESCHEDULE_LUA)
+        self._schedule_remove = self.conn.register_script(SCHEDULE_REMOVE_LUA)
+        self._queue_replace = self.conn.register_script(QUEUE_REPLACE_LUA)
+        self._pqueue_replace = self.conn.register_script(PQUEUE_REPLACE_LUA)
 
         self.name = self.clean_name(name) if clean_name else name
         self.queue_key = 'huey.redis.%s' % self.name
@@ -571,6 +790,38 @@ class RedisStorage(BaseStorage):
 
     def flush_schedule(self):
         self.conn.delete(self.schedule_key)
+
+    def reschedule_from_queue(self, old_data, new_data, ts):
+        score = self.convert_ts(ts)
+        if self.priority:
+            # The priority queue prefixes each message with an 8-byte
+            # timestamp; the lua script matches the wrapped message atomically.
+            script = self._pqueue_to_schedule
+        else:
+            script = self._queue_to_schedule
+        moved = script(keys=[self.queue_key, self.schedule_key],
+                       args=[old_data, new_data, score])
+        return RESCHEDULE_OK if moved else RESCHEDULE_NOT_FOUND
+
+    def reschedule_from_schedule(self, old_data, new_data, ts):
+        score = self.convert_ts(ts)
+        updated = self._schedule_reschedule(
+            keys=[self.schedule_key],
+            args=[old_data, new_data, score])
+        return RESCHEDULE_OK if updated else RESCHEDULE_NOT_FOUND
+
+    def replace_in_queue(self, old_data, new_data):
+        if self.priority:
+            script = self._pqueue_replace
+        else:
+            script = self._queue_replace
+        replaced = script(keys=[self.queue_key], args=[old_data, new_data])
+        return RESCHEDULE_OK if replaced else RESCHEDULE_NOT_FOUND
+
+    def remove_from_schedule(self, old_data):
+        removed = self._schedule_remove(keys=[self.schedule_key],
+                                        args=[old_data])
+        return RESCHEDULE_OK if removed else RESCHEDULE_NOT_FOUND
 
     def _notify(self, key):
         if isinstance(key, bytes):
@@ -1002,6 +1253,59 @@ class SqliteStorage(BaseSqlStorage):
     def flush_schedule(self):
         self.sql('delete from schedule where queue = ?', (self.name,), True)
 
+    def reschedule_from_queue(self, old_data, new_data, ts):
+        with self.db(commit=True) as curs:
+            curs.execute('select id, priority from task where queue = ? '
+                         'and data = ? limit 1',
+                         (self.name, self.to_blob(old_data)))
+            row = curs.fetchone()
+            if row is None:
+                return RESCHEDULE_NOT_FOUND
+            task_id, priority = row
+            curs.execute('delete from task where id = ?', (task_id,))
+            if curs.rowcount != 1:
+                return RESCHEDULE_NOT_FOUND
+            curs.execute('insert into schedule (queue, data, timestamp) '
+                         'values (?, ?, ?)',
+                         (self.name, self.to_blob(new_data), ts.timestamp()))
+        return RESCHEDULE_OK
+
+    def reschedule_from_schedule(self, old_data, new_data, ts):
+        with self.db(commit=True) as curs:
+            curs.execute('select id from schedule where queue = ? and data = ? '
+                         'limit 1', (self.name, self.to_blob(old_data)))
+            row = curs.fetchone()
+            if row is None:
+                return RESCHEDULE_NOT_FOUND
+            schedule_id = row[0]
+            curs.execute('update schedule set data = ?, timestamp = ? '
+                         'where id = ?',
+                         (self.to_blob(new_data), ts.timestamp(), schedule_id))
+            if curs.rowcount != 1:
+                return RESCHEDULE_NOT_FOUND
+        return RESCHEDULE_OK
+
+    def replace_in_queue(self, old_data, new_data):
+        # Update the message in place, preserving the row id (FIFO order) and
+        # priority.
+        with self.db(commit=True) as curs:
+            curs.execute('update task set data = ? where id = ('
+                         'select id from task where queue = ? and data = ? '
+                         'limit 1)',
+                         (self.to_blob(new_data), self.name,
+                          self.to_blob(old_data)))
+            if curs.rowcount != 1:
+                return RESCHEDULE_NOT_FOUND
+        return RESCHEDULE_OK
+
+    def remove_from_schedule(self, old_data):
+        with self.db(commit=True) as curs:
+            curs.execute('delete from schedule where queue = ? and data = ?',
+                         (self.name, self.to_blob(old_data)))
+            if curs.rowcount != 1:
+                return RESCHEDULE_NOT_FOUND
+        return RESCHEDULE_OK
+
     def put_data(self, key, value, is_result=False):
         self.sql('insert or replace into kv (queue, key, value) '
                  'values (?, ?, ?)',
@@ -1301,6 +1605,52 @@ class PostgresStorage(BaseSqlStorage):
         self.sql('delete from {} where queue = %s'.format(
             self.table_schedule), (self.name,))
 
+    def reschedule_from_queue(self, old_data, new_data, ts):
+        with self.db() as curs:
+            curs.execute('delete from {t} where id = ('
+                         'select id from {t} where queue = %s and data = %s '
+                         'for update skip locked limit 1) '
+                         'returning id'.format(t=self.table_task),
+                         (self.name, old_data))
+            row = curs.fetchone()
+            if row is None:
+                return RESCHEDULE_NOT_FOUND
+            curs.execute('insert into {t} (queue, data, timestamp) '
+                         'values (%s, %s, %s)'.format(
+                             t=self.table_schedule),
+                         (self.name, new_data, ts.timestamp()))
+        return RESCHEDULE_OK
+
+    def reschedule_from_schedule(self, old_data, new_data, ts):
+        with self.db() as curs:
+            curs.execute('update {t} set data = %s, timestamp = %s where id = ('
+                         'select id from {t} where queue = %s and data = %s '
+                         'for update skip locked limit 1) '
+                         'returning id'.format(t=self.table_schedule),
+                         (new_data, ts.timestamp(), self.name, old_data))
+            row = curs.fetchone()
+        return RESCHEDULE_OK if row is not None else RESCHEDULE_NOT_FOUND
+
+    def replace_in_queue(self, old_data, new_data):
+        with self.db() as curs:
+            curs.execute('update {t} set data = %s where id = ('
+                         'select id from {t} where queue = %s and data = %s '
+                         'for update skip locked limit 1) '
+                         'returning id'.format(t=self.table_task),
+                         (new_data, self.name, old_data))
+            row = curs.fetchone()
+        return RESCHEDULE_OK if row is not None else RESCHEDULE_NOT_FOUND
+
+    def remove_from_schedule(self, old_data):
+        with self.db() as curs:
+            curs.execute('delete from {t} where id = ('
+                         'select id from {t} where queue = %s and data = %s '
+                         'for update skip locked limit 1) '
+                         'returning id'.format(t=self.table_schedule),
+                         (self.name, old_data))
+            row = curs.fetchone()
+        return RESCHEDULE_OK if row is not None else RESCHEDULE_NOT_FOUND
+
     def _key(self, key):
         return key.decode('utf-8') if isinstance(key, bytes) else key
 
@@ -1525,6 +1875,71 @@ class FileStorage(BaseStorage):
 
     def flush_schedule(self):
         self._flush_dir(self.schedule_path)
+
+    def _read_file(self, filename):
+        with open(filename, 'rb') as fh:
+            return fh.read()
+
+    def reschedule_from_queue(self, old_data, new_data, ts):
+        with self.lock:
+            # Find the queue entry whose contents match the expected message.
+            for basename in self._get_sorted_filenames(self.queue_path):
+                filename = os.path.join(self.queue_path, basename)
+                if self._read_file(filename) != old_data:
+                    continue
+                # Atomically (under the global lock) remove it from the queue
+                # and write it into the schedule with the new timestamp.
+                os.unlink(filename)
+                self._write_schedule_file(new_data, ts)
+                return RESCHEDULE_OK
+        return RESCHEDULE_NOT_FOUND
+
+    def reschedule_from_schedule(self, old_data, new_data, ts):
+        with self.lock:
+            for basename in self._get_sorted_filenames(self.schedule_path):
+                filename = os.path.join(self.schedule_path, basename)
+                if self._read_file(filename) != old_data:
+                    continue
+                # Remove the old entry and write the re-scored replacement.
+                os.unlink(filename)
+                self._write_schedule_file(new_data, ts)
+                return RESCHEDULE_OK
+        return RESCHEDULE_NOT_FOUND
+
+    def replace_in_queue(self, old_data, new_data):
+        with self.lock:
+            for basename in self._get_sorted_filenames(self.queue_path):
+                filename = os.path.join(self.queue_path, basename)
+                if self._read_file(filename) != old_data:
+                    continue
+                # Overwrite in place, preserving the filename (and thus the
+                # priority/FIFO ordering).
+                with open(filename, 'wb') as fh:
+                    fh.write(new_data)
+                return RESCHEDULE_OK
+        return RESCHEDULE_NOT_FOUND
+
+    def remove_from_schedule(self, old_data):
+        with self.lock:
+            for basename in self._get_sorted_filenames(self.schedule_path):
+                filename = os.path.join(self.schedule_path, basename)
+                if self._read_file(filename) != old_data:
+                    continue
+                os.unlink(filename)
+                return RESCHEDULE_OK
+        return RESCHEDULE_NOT_FOUND
+
+    def _write_schedule_file(self, data, ts):
+        if not os.path.exists(self.schedule_path):
+            os.makedirs(self.schedule_path)
+        ts_prefix = self._timestamp_to_prefix(ts)
+        base = filename = os.path.join(self.schedule_path, ts_prefix)
+        conflict = 0
+        while os.path.exists(filename):
+            conflict += 1
+            filename = '%s.%03d' % (base, conflict)
+        with open(filename, 'wb') as fh:
+            fh.write(data)
 
     def path_for_key(self, key):
         if isinstance(key, str):

@@ -108,6 +108,50 @@ What happens when we schedule a task?
 
 For more details, see the :py:meth:`~TaskWrapper.schedule` API documentation.
 
+In-place rescheduling
+~~~~~~~~~~~~~~~~~~~~~
+
+Sometimes a task that has not run yet needs its execution time changed while
+keeping the *same* task identity. Huey provides
+:py:meth:`Result.change_eta` (and the lower-level
+:py:meth:`Huey.change_task_eta`) for this. Unlike
+:py:meth:`Result.reschedule`, which revokes the original task and enqueues a
+brand-new task with a new ID, ``change_eta`` moves the existing task in place
+and preserves its task ID.
+
+.. code-block:: pycon
+
+    >>> r = add.schedule((3, 4), delay=60)
+    >>> r.change_eta(delay=120)       # Push it back by another minute.
+    'ok'
+    >>> r.change_eta(eta=eta)         # Or set an absolute time.
+    'ok'
+
+The task is moved atomically between the ready queue and the delayed schedule
+depending on whether the new ETA is due:
+
+* a ready task given a future ETA is moved into the schedule,
+* a scheduled task given a due (or past) ETA is moved into the ready queue,
+* otherwise the task stays where it is and only its ETA is updated.
+
+Because the move is atomic with respect to the worker dequeueing and the
+scheduler reading due tasks, a task can only ever exist in one place - the old
+ETA and the new ETA will never each cause an execution. The retry count,
+arguments/context, follow-up pipeline (``on_complete`` / ``on_error``), chord
+configuration and expiration are all preserved.
+
+Only tasks that have not yet been claimed by a worker can be rescheduled. The
+method returns a status code rather than raising:
+
+* ``huey.RESCHEDULE_OK`` - the task was found and rescheduled,
+* ``huey.RESCHEDULE_NOT_FOUND`` - the task was already claimed, has completed,
+  or does not exist (this also covers tasks currently executing, which can
+  never be disguised as rescheduled).
+
+An invalid ETA (for example a non-datetime value, or supplying both ``eta`` and
+``delay``) raises ``ValueError`` *before* anything is changed. The original
+:py:meth:`Result.reschedule` "create a new task" semantics remain available.
+
 Periodic tasks
 --------------
 

@@ -15,6 +15,8 @@ from huey.api import chord
 from huey.api import crontab
 from huey.api import group
 from huey.constants import EmptyData
+from huey.constants import RESCHEDULE_NOT_FOUND
+from huey.constants import RESCHEDULE_OK
 from huey.exceptions import CancelExecution
 from huey.exceptions import RateLimitExceeded
 from huey.exceptions import ResultTimeout
@@ -705,6 +707,238 @@ class TestQueue(BaseTestCase):
         self.assertTrue(self.huey.execute(task) is None)
 
         self.assertEqual(state, [res2.id])
+
+    def test_change_eta_queue_to_schedule(self):
+        state = []
+
+        @self.huey.task(context=True, retries=2, retry_delay=5)
+        def task_a(n, task=None):
+            state.append((n, task.id))
+            return n + 1
+
+        res = task_a(1)
+        self.assertEqual(self.huey.pending_count(), 1)
+        self.assertEqual(self.huey.scheduled_count(), 0)
+
+        # Move a ready task into the delayed schedule, in place.
+        future = datetime.datetime.now() + datetime.timedelta(seconds=3600)
+        status = res.change_eta(eta=future)
+        self.assertEqual(status, RESCHEDULE_OK)
+
+        # The task moved: no longer queued, now scheduled, and keeps its ID.
+        self.assertEqual(self.huey.pending_count(), 0)
+        self.assertEqual(self.huey.scheduled_count(), 1)
+        scheduled = self.huey.scheduled()[0]
+        self.assertEqual(scheduled.id, res.id)
+        # Retry settings are preserved.
+        self.assertEqual(scheduled.retries, 2)
+        self.assertEqual(scheduled.retry_delay, 5)
+        self.assertEqual(scheduled.args, (1,))
+
+    def test_change_eta_schedule_to_schedule(self):
+        @self.huey.task()
+        def task_a(n):
+            return n + 1
+
+        res = task_a.schedule((1,), delay=60)
+        self.huey.execute(self.huey.dequeue())  # Parks it in the schedule.
+        self.assertEqual(self.huey.scheduled_count(), 1)
+
+        later = datetime.datetime.now() + datetime.timedelta(seconds=7200)
+        status = res.change_eta(eta=later)
+        self.assertEqual(status, RESCHEDULE_OK)
+
+        # Still exactly one scheduled entry with the same ID and new ETA.
+        self.assertEqual(self.huey.scheduled_count(), 1)
+        self.assertEqual(self.huey.pending_count(), 0)
+        scheduled = self.huey.scheduled()[0]
+        self.assertEqual(scheduled.id, res.id)
+        self.assertEqual(scheduled.eta, later)
+
+    def test_change_eta_schedule_to_queue(self):
+        state = []
+
+        @self.huey.task(context=True)
+        def task_a(n, task=None):
+            state.append((n, task.id))
+            return n + 1
+
+        res = task_a.schedule((1,), delay=3600)
+        self.huey.execute(self.huey.dequeue())  # Parks it in the schedule.
+        self.assertEqual(self.huey.scheduled_count(), 1)
+
+        # A due (past) ETA moves the task back into the ready queue.
+        past = datetime.datetime.now() - datetime.timedelta(seconds=5)
+        status = res.change_eta(eta=past)
+        self.assertEqual(status, RESCHEDULE_OK)
+        self.assertEqual(self.huey.scheduled_count(), 0)
+        self.assertEqual(self.huey.pending_count(), 1)
+
+        task = self.huey.dequeue()
+        self.assertEqual(task.id, res.id)
+        self.assertEqual(self.huey.execute(task), 2)
+        self.assertEqual(state, [(1, res.id)])
+
+    def test_change_eta_queue_replace(self):
+        @self.huey.task()
+        def task_a(n):
+            return n + 1
+
+        res = task_a(1)
+        # A still-due ETA keeps the task in the queue (single entry).
+        status = res.change_eta(delay=0)
+        self.assertEqual(status, RESCHEDULE_OK)
+        self.assertEqual(self.huey.pending_count(), 1)
+        self.assertEqual(self.huey.scheduled_count(), 0)
+        self.assertEqual(self.huey.pending()[0].id, res.id)
+
+    def test_change_eta_round_trip_and_single_execution(self):
+        state = []
+
+        @self.huey.task(context=True)
+        def task_a(n, task=None):
+            state.append((n, task.id))
+            return n
+
+        res = task_a(7)
+        tid = res.id
+
+        # Queue -> schedule -> schedule -> queue, repeatedly.
+        self.assertEqual(res.change_eta(delay=3600), RESCHEDULE_OK)
+        self.assertEqual(res.change_eta(delay=7200), RESCHEDULE_OK)
+        self.assertEqual(res.change_eta(
+            eta=datetime.datetime.now() - datetime.timedelta(seconds=1)),
+            RESCHEDULE_OK)
+
+        # Exactly one copy exists, and it runs exactly once with the same ID.
+        self.assertEqual(self.huey.pending_count(), 1)
+        self.assertEqual(self.huey.scheduled_count(), 0)
+        task = self.huey.dequeue()
+        self.assertEqual(task.id, tid)
+        self.huey.execute(task)
+        self.assertEqual(state, [(7, tid)])
+
+        # After execution the task can no longer be rescheduled.
+        self.assertEqual(res.change_eta(delay=60), RESCHEDULE_NOT_FOUND)
+
+    def test_change_eta_unknown_and_running(self):
+        @self.huey.task()
+        def task_a(n):
+            return n
+
+        # A task ID that was never enqueued.
+        self.assertEqual(
+            self.huey.change_task_eta(Task(id='missing'), delay=60),
+            RESCHEDULE_NOT_FOUND)
+
+        # A task currently executing (in-flight) cannot be disguised as
+        # rescheduled.
+        res = task_a(1)
+        self.huey._tasks_in_flight.add(res.task)
+        try:
+            self.assertEqual(res.change_eta(delay=60),
+                             RESCHEDULE_NOT_FOUND)
+        finally:
+            self.huey._tasks_in_flight.discard(res.task)
+        # Once no longer in-flight, it is reschedulable again.
+        self.assertEqual(res.change_eta(delay=60), RESCHEDULE_OK)
+
+    def test_change_eta_invalid_rejected_before_change(self):
+        @self.huey.task()
+        def task_a(n):
+            return n
+
+        res = task_a(1)
+        # Neither eta nor delay, or a bad type.
+        self.assertRaises(ValueError, lambda: res.change_eta())
+        self.assertRaises(ValueError, lambda: res.change_eta(eta='nope'))
+        # The queue is untouched after the rejected calls.
+        self.assertEqual(self.huey.pending_count(), 1)
+        self.assertEqual(self.huey.scheduled_count(), 0)
+        self.assertEqual(self.huey.pending()[0].id, res.id)
+
+    def test_change_eta_preserves_pipeline_and_expires(self):
+        @self.huey.task()
+        def task_a(n):
+            return n + 1
+
+        @self.huey.task()
+        def task_b(v):
+            return v * 10
+
+        task = task_a.s(1)
+        task.then(task_b.s())
+        task.error(task_b.s())
+        self.huey.enqueue(task)
+
+        exp_task = task_a.s(2, expires=30)
+        self.huey.enqueue(exp_task)
+
+        self.assertEqual(
+            self.huey.change_task_eta(task, delay=600), RESCHEDULE_OK)
+        stored = [t for t in self.huey.scheduled() if t.id == task.id][0]
+        self.assertIsNotNone(stored.on_complete)
+        self.assertIn('task_b', stored.on_complete.name)
+        self.assertIsNotNone(stored.on_error)
+        self.assertIn('task_b', stored.on_error.name)
+
+        self.assertEqual(
+            self.huey.change_task_eta(exp_task, delay=600), RESCHEDULE_OK)
+        stored_exp = [t for t in self.huey.scheduled()
+                      if t.id == exp_task.id][0]
+        self.assertEqual(stored_exp.expires, 30)
+
+    def test_change_eta_preserves_priority(self):
+        @self.huey.task()
+        def task_a(n):
+            return n
+
+        task = task_a.s(1, priority=99)
+        self.huey.enqueue(task)
+        future = datetime.datetime.now() + datetime.timedelta(seconds=3600)
+        self.assertEqual(
+            self.huey.change_task_eta(task, eta=future), RESCHEDULE_OK)
+        self.assertEqual(self.huey.scheduled()[0].priority, 99)
+
+        # Moving it back into the ready queue retains the priority, and it
+        # dequeues ahead of a lower-priority task.
+        past = datetime.datetime.now() - datetime.timedelta(seconds=1)
+        self.assertEqual(self.huey.change_task_eta(task, eta=past),
+                         RESCHEDULE_OK)
+        self.assertEqual(self.huey.pending()[0].priority, 99)
+
+        low = task_a.s(2, priority=1)
+        self.huey.enqueue(low)
+        self.assertEqual(self.huey.dequeue().id, task.id)
+
+    def test_change_eta_accepts_task_and_result(self):
+        @self.huey.task()
+        def task_a(n):
+            return n
+
+        res = task_a(1)
+        # Both the Result wrapper and the underlying Task are accepted.
+        self.assertEqual(
+            self.huey.change_task_eta(res, delay=60), RESCHEDULE_OK)
+        self.assertEqual(
+            self.huey.change_task_eta(res.task, delay=120), RESCHEDULE_OK)
+        self.assertEqual(self.huey.scheduled_count(), 1)
+        self.assertRaises(ValueError,
+                          lambda: self.huey.change_task_eta('not-a-task'))
+
+    def test_change_eta_legacy_reschedule_still_creates_task(self):
+        state = []
+
+        @self.huey.task(context=True)
+        def task_s(task=None):
+            state.append(task.id)
+            return True
+
+        res = task_s()
+        # The original reschedule() semantics (revoke + new task) still work.
+        new_res = res.reschedule(delay=60)
+        self.assertNotEqual(res.id, new_res.id)
+        self.assertEqual(len(self.huey), 2)
 
     def test_timeout(self):
         state = []

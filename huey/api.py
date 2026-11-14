@@ -15,6 +15,8 @@ from functools import wraps
 
 from huey import signals as S
 from huey.constants import EmptyData
+from huey.constants import RESCHEDULE_NOT_FOUND
+from huey.constants import RESCHEDULE_OK
 from huey.consumer import Consumer
 from huey.exceptions import CancelExecution
 from huey.exceptions import ConfigurationError
@@ -727,6 +729,137 @@ class Huey(object):
             timestamp = self._get_timestamp()
         return task.eta is None or task.eta <= timestamp
 
+    def is_task_in_flight(self, task_id):
+        """
+        Return whether a task with the given ID is currently executing on
+        this consumer (i.e. it has already been dequeued and is running).
+        """
+        return any(task.id == task_id for task in self._tasks_in_flight)
+
+    def change_task_eta(self, task, eta=None, delay=None):
+        """
+        Reschedule a not-yet-executed task *in place*, preserving its task ID
+        and moving it atomically between the ready queue and the delayed
+        schedule as needed.
+
+        Unlike :py:meth:`Result.reschedule`, this never creates a new task and
+        never revokes the original invocation. The task's retry count,
+        context/arguments, follow-up pipeline (``on_complete``/``on_error``),
+        chord configuration and expiration are all preserved - only the ETA is
+        changed.
+
+        :param task: A ``Task`` instance (or object exposing a ``task``
+                     attribute, such as a ``Result``).
+        :param eta: Absolute datetime for the new execution time. Provide
+                    either ``eta`` or ``delay``, but not both.
+        :param delay: Relative delay in seconds (or a ``timedelta``).
+        :return: One of ``RESCHEDULE_OK`` (the task was moved),
+                 ``RESCHEDULE_NOT_FOUND`` (the task has already been claimed
+                 by a worker, completed, or does not exist).
+        :raises ValueError: if the new ETA is invalid.
+        """
+        if hasattr(task, 'task'):
+            task = task.task
+        if not isinstance(task, Task):
+            raise ValueError('change_task_eta() requires a Task instance.')
+
+        # Validate the new ETA before touching any shared state so an invalid
+        # value is rejected before anything is changed.
+        new_eta = normalize_time(eta, delay, self.utc)
+
+        if self._immediate:
+            # The immediate mode has no persistent queue/schedule to move
+            # within; enqueued tasks run inline. Nothing can be rescheduled.
+            return RESCHEDULE_NOT_FOUND
+
+        # A running task can never be disguised as rescheduled.
+        if self.is_task_in_flight(task.id):
+            return RESCHEDULE_NOT_FOUND
+
+        # Locate the currently-stored version of the task. The caller may hold
+        # a stale snapshot (e.g. a previous reschedule already changed its
+        # ETA), so the stored message is the source of truth for the match.
+        found = self._find_stored_task(task.id)
+        if found is None:
+            return RESCHEDULE_NOT_FOUND
+        current, location = found
+
+        old_data = self.serialize_task(current)
+        new_task = copy.copy(current)
+        new_task.eta = new_eta
+        new_data = self.serialize_task(new_task)
+        due = self.ready_to_run(new_task)
+
+        # The task was found either in the delayed schedule or the ready queue.
+        # Each storage operation is atomic and matches on the exact serialized
+        # message, so a task that a worker claims concurrently is reported as
+        # not found rather than moved or executed twice.
+        if location == 'schedule':
+            return self._reschedule_scheduled(old_data, new_data, new_eta,
+                                              new_task, due)
+        return self._reschedule_queued(old_data, new_data, new_eta, new_task,
+                                       due)
+
+    def _find_stored_task(self, task_id):
+        """
+        Return a ``(task, location)`` tuple for the not-yet-claimed task with
+        the given ID, where ``location`` is either ``'schedule'`` or
+        ``'queue'``. Return ``None`` if the task cannot be found in either
+        place (it was already claimed, completed, or never existed).
+        """
+        for stored in self._deserialize_all(self.storage.scheduled_items()):
+            if stored.id == task_id:
+                return stored, 'schedule'
+        for stored in self._deserialize_all(self.storage.enqueued_items()):
+            if stored.id == task_id:
+                return stored, 'queue'
+        return None
+
+    def _reschedule_scheduled(self, old_data, new_data, new_eta, new_task, due):
+        if old_data not in self.storage.scheduled_items():
+            return RESCHEDULE_NOT_FOUND
+
+        if due:
+            # The new ETA is due: atomically remove the task from the schedule
+            # and enqueue it into the ready queue.
+            status = self.storage.remove_from_schedule(old_data)
+            if status == RESCHEDULE_OK:
+                self.storage.enqueue(new_data, new_task.priority)
+                logger.info('Moved task %s from schedule to queue, eta %s',
+                            new_task.id, new_eta)
+                self._emit(S.SIGNAL_ENQUEUED, new_task)
+        else:
+            # Keep the task in the schedule with a new timestamp.
+            status = self.storage.reschedule_from_schedule(
+                old_data, new_data, new_eta)
+            if status == RESCHEDULE_OK:
+                logger.info('Rescheduled task %s to eta %s',
+                            new_task.id, new_eta)
+                self._emit(S.SIGNAL_SCHEDULED, new_task)
+        return status
+
+    def _reschedule_queued(self, old_data, new_data, new_eta, new_task, due):
+        if old_data not in self.storage.enqueued_items():
+            return RESCHEDULE_NOT_FOUND
+
+        if due:
+            # The task remains ready-to-run, so just replace its message in
+            # the queue while preserving its ordering and priority.
+            status = self.storage.replace_in_queue(old_data, new_data)
+            if status == RESCHEDULE_OK:
+                logger.info('Updated eta of queued task %s to %s',
+                            new_task.id, new_eta)
+                self._emit(S.SIGNAL_ENQUEUED, new_task)
+        else:
+            # Move the task from the ready queue into the delayed schedule.
+            status = self.storage.reschedule_from_queue(
+                old_data, new_data, new_eta)
+            if status == RESCHEDULE_OK:
+                logger.info('Moved task %s from queue to schedule, eta %s',
+                            new_task.id, new_eta)
+                self._emit(S.SIGNAL_SCHEDULED, new_task)
+        return status
+
     def pending(self, limit=None):
         return self._deserialize_all(self.storage.enqueued_items(limit))
 
@@ -1300,6 +1433,28 @@ class Result(object):
             on_complete=on_complete,
             on_error=on_error)
         return self.huey.enqueue(task)
+
+    def change_eta(self, eta=None, delay=None):
+        """
+        Reschedule this task *in place*, keeping its task ID. The task is
+        moved atomically between the ready queue and the delayed schedule as
+        needed. Unlike :py:meth:`reschedule`, no new task is created and the
+        original is not revoked - its retry count, context/arguments,
+        follow-up pipeline and expiration are all preserved.
+
+        Only tasks that have not yet been claimed by a worker can be
+        rescheduled. A running or already-completed task cannot be disguised
+        as rescheduled.
+
+        :param eta: Absolute datetime for the new execution time. Provide
+                    either ``eta`` or ``delay``, but not both.
+        :param delay: Relative delay in seconds (or a ``timedelta``).
+        :return: ``RESCHEDULE_OK`` if rescheduled, otherwise
+                 ``RESCHEDULE_NOT_FOUND`` if the task was already claimed,
+                 has completed, or no longer exists.
+        :raises ValueError: if the new ETA is invalid.
+        """
+        return self.huey.change_task_eta(self.task, eta=eta, delay=delay)
 
     def reset(self):
         self._result = EmptyData

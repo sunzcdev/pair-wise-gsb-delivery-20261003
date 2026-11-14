@@ -9,9 +9,16 @@ from glide_sync import Transaction
 
 from huey.api import RedisHuey
 from huey.constants import EmptyData
+from huey.constants import RESCHEDULE_NOT_FOUND
+from huey.constants import RESCHEDULE_OK
 from huey.exceptions import ConfigurationError
+from huey.storage import PQUEUE_TO_SCHEDULE_LUA
+from huey.storage import QUEUE_REPLACE_LUA
+from huey.storage import QUEUE_TO_SCHEDULE_LUA
 from huey.storage import RedisStorage
 from huey.storage import SCHEDULE_POP_LUA
+from huey.storage import SCHEDULE_REMOVE_LUA
+from huey.storage import SCHEDULE_RESCHEDULE_LUA
 
 
 class ValkeyGlideStorage(RedisStorage):
@@ -35,6 +42,11 @@ class ValkeyGlideStorage(RedisStorage):
             self.conn = GlideClient.create(config)
 
         self._pop = Script(SCHEDULE_POP_LUA)
+        self._queue_to_schedule = Script(QUEUE_TO_SCHEDULE_LUA)
+        self._pqueue_to_schedule = Script(PQUEUE_TO_SCHEDULE_LUA)
+        self._schedule_reschedule = Script(SCHEDULE_RESCHEDULE_LUA)
+        self._schedule_remove = Script(SCHEDULE_REMOVE_LUA)
+        self._queue_replace = Script(QUEUE_REPLACE_LUA)
 
         self.name = self.clean_name(name)
         self.queue_key = 'huey.redis.%s' % self.name
@@ -77,6 +89,45 @@ class ValkeyGlideStorage(RedisStorage):
         stop = limit - 1 if limit else -1
         tasks = self.conn.zrange(self.schedule_key, RangeByIndex(0, stop))
         return [base64.b64decode(t) for t in tasks]
+
+    def reschedule_from_queue(self, old_data, new_data, ts):
+        # The queue stores raw bytes while the schedule stores base64-encoded
+        # messages, so encode the replacement before invoking the lua script.
+        new_encoded = base64.b64encode(new_data).decode('utf8')
+        score = str(self.convert_ts(ts))
+        moved = self.conn.invoke_script(
+            self._queue_to_schedule,
+            keys=[self.queue_key, self.schedule_key],
+            args=[old_data, new_encoded, score])
+        return RESCHEDULE_OK if moved else RESCHEDULE_NOT_FOUND
+
+    def reschedule_from_schedule(self, old_data, new_data, ts):
+        # Messages in the schedule are base64-encoded.
+        old_encoded = base64.b64encode(old_data).decode('utf8')
+        new_encoded = base64.b64encode(new_data).decode('utf8')
+        score = str(self.convert_ts(ts))
+        updated = self.conn.invoke_script(
+            self._schedule_reschedule,
+            keys=[self.schedule_key],
+            args=[old_encoded, new_encoded, score])
+        return RESCHEDULE_OK if updated else RESCHEDULE_NOT_FOUND
+
+    def replace_in_queue(self, old_data, new_data):
+        # The ready queue stores raw (unencoded) messages.
+        replaced = self.conn.invoke_script(
+            self._queue_replace,
+            keys=[self.queue_key],
+            args=[old_data, new_data])
+        return RESCHEDULE_OK if replaced else RESCHEDULE_NOT_FOUND
+
+    def remove_from_schedule(self, old_data):
+        # Messages in the schedule are base64-encoded.
+        old_encoded = base64.b64encode(old_data).decode('utf8')
+        removed = self.conn.invoke_script(
+            self._schedule_remove,
+            keys=[self.schedule_key],
+            args=[old_encoded])
+        return RESCHEDULE_OK if removed else RESCHEDULE_NOT_FOUND
 
     def put_data(self, key, value, is_result=False):
         self.conn.hset(self.result_key, {key: value})

@@ -6,6 +6,8 @@ from playhouse.db_url import connect as db_url_connect
 
 from huey.api import Huey
 from huey.constants import EmptyData
+from huey.constants import RESCHEDULE_NOT_FOUND
+from huey.constants import RESCHEDULE_OK
 from huey.exceptions import ConfigurationError
 from huey.storage import BaseStorage
 
@@ -207,6 +209,82 @@ class SqlStorage(BaseStorage):
          .delete()
          .where(self.Schedule.queue == self.name)
          .execute())
+
+    def reschedule_from_queue(self, old_data, new_data, ts):
+        self.check_conn()
+        query = (self.tasks(self.Task.id)
+                 .where(self.Task.data == old_data)
+                 .order_by(self.Task.id))
+        if self.for_update:
+            query = query.for_update(self.for_update)
+        with self.atomic():
+            try:
+                task_id = query.get()
+            except self.Task.DoesNotExist:
+                return RESCHEDULE_NOT_FOUND
+            deleted = (self.Task
+                       .delete()
+                       .where(self.Task.id == task_id)
+                       .execute())
+            if deleted != 1:
+                return RESCHEDULE_NOT_FOUND
+            self.Schedule.create(queue=self.name, data=new_data,
+                                 timestamp=ts)
+        return RESCHEDULE_OK
+
+    def reschedule_from_schedule(self, old_data, new_data, ts):
+        self.check_conn()
+        query = (self.schedule(self.Schedule.id)
+                 .where(self.Schedule.data == old_data)
+                 .order_by(self.Schedule.id))
+        if self.for_update:
+            query = query.for_update(self.for_update)
+        with self.atomic():
+            try:
+                schedule_id = query.get()
+            except self.Schedule.DoesNotExist:
+                return RESCHEDULE_NOT_FOUND
+            updated = (self.Schedule
+                       .update(data=new_data, timestamp=ts)
+                       .where(self.Schedule.id == schedule_id)
+                       .execute())
+        return RESCHEDULE_OK if updated == 1 else RESCHEDULE_NOT_FOUND
+
+    def replace_in_queue(self, old_data, new_data):
+        self.check_conn()
+        query = (self.tasks(self.Task.id)
+                 .where(self.Task.data == old_data)
+                 .order_by(self.Task.id))
+        if self.for_update:
+            query = query.for_update(self.for_update)
+        with self.atomic():
+            try:
+                task_id = query.get()
+            except self.Task.DoesNotExist:
+                return RESCHEDULE_NOT_FOUND
+            updated = (self.Task
+                       .update(data=new_data)
+                       .where(self.Task.id == task_id)
+                       .execute())
+        return RESCHEDULE_OK if updated == 1 else RESCHEDULE_NOT_FOUND
+
+    def remove_from_schedule(self, old_data):
+        self.check_conn()
+        query = (self.schedule(self.Schedule.id)
+                 .where(self.Schedule.data == old_data)
+                 .order_by(self.Schedule.id))
+        if self.for_update:
+            query = query.for_update(self.for_update)
+        with self.atomic():
+            try:
+                schedule_id = query.get()
+            except self.Schedule.DoesNotExist:
+                return RESCHEDULE_NOT_FOUND
+            deleted = (self.Schedule
+                       .delete()
+                       .where(self.Schedule.id == schedule_id)
+                       .execute())
+        return RESCHEDULE_OK if deleted == 1 else RESCHEDULE_NOT_FOUND
 
     def put_data(self, key, value, is_result=False):
         self.check_conn()

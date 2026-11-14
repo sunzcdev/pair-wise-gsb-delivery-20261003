@@ -5,6 +5,16 @@ Changelog
 
 [View commits](https://github.com/coleifer/huey/compare/3.5.4...master)
 
+* Add in-place task rescheduling via `Huey.change_task_eta()` and
+  `Result.change_eta()`. Unlike `Result.reschedule()`, which revokes the
+  original invocation and enqueues a new task with a new ID, `change_eta()`
+  keeps the task ID and atomically moves the task between the ready queue and
+  the delayed schedule. Retries, arguments/context, follow-up pipeline, chord
+  configuration and expiration are preserved. Returns `RESCHEDULE_OK` or
+  `RESCHEDULE_NOT_FOUND` (already claimed, running, completed or missing); an
+  invalid ETA raises `ValueError` before any change. The original
+  `reschedule()` semantics are unchanged.
+
 ## 3.5.4
 
 * Fix possible hang if worker holding the stop flag was killed while holding

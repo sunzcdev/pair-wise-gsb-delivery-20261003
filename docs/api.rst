@@ -1142,6 +1142,28 @@ Huey object
         :returns: the number of tasks currently in the schedule, without
             deserializing them.
 
+    .. py:method:: change_task_eta(task, eta=None, delay=None)
+
+        :param task: a :py:class:`Task` instance, or an object such as a
+            :py:class:`Result` that exposes a ``task`` attribute.
+        :param datetime eta: new absolute execution time.
+        :param int delay: new relative delay, in seconds (a ``timedelta`` is
+            also accepted). Provide exactly one of ``eta`` / ``delay``.
+        :returns: ``huey.RESCHEDULE_OK`` if the task was rescheduled, or
+            ``huey.RESCHEDULE_NOT_FOUND`` if the task has already been claimed
+            by a worker, has completed, or does not exist.
+        :raises ValueError: if the new ETA is invalid, or ``task`` is not a
+            :py:class:`Task`. The invalid value is rejected before any change
+            is made.
+
+        Move a not-yet-executed task atomically between the ready queue and
+        the delayed schedule, preserving its task ID and all other attributes
+        (retries, arguments/context, follow-up pipeline, chord configuration
+        and expiration). This is the lower-level API behind
+        :py:meth:`Result.change_eta`. The operation is atomic with respect to
+        task dequeueing and schedule reads, so a task can only ever occupy one
+        location and will never execute once per ETA.
+
     .. py:method:: all_results()
 
         :returns: a dict of task-id to the serialized result data for all
@@ -2087,6 +2109,25 @@ Result
 
         If neither an ``eta`` nor a ``delay`` is specified, the task will be
         run as soon as it is received by a worker.
+
+    .. py:method:: change_eta(eta=None, delay=None)
+
+        :param datetime eta: new absolute execution time.
+        :param int delay: new relative delay, in seconds (a ``timedelta`` is
+            also accepted). Provide exactly one of ``eta`` / ``delay``.
+        :returns: ``huey.RESCHEDULE_OK`` if the task was rescheduled, or
+            ``huey.RESCHEDULE_NOT_FOUND`` if the task has already been claimed
+            by a worker, has completed, or does not exist.
+        :raises ValueError: if the new ETA is invalid (checked before any
+            change is made).
+
+        Reschedule a not-yet-executed task *in place*, keeping its task ID.
+        Unlike :py:meth:`~Result.reschedule`, no new task is created and the
+        original is not revoked. The task is moved atomically between the
+        ready queue and the delayed schedule as needed, and its retry count,
+        arguments/context, follow-up pipeline, chord configuration and
+        expiration are all preserved. A task that is currently running can
+        never be reported as rescheduled.
 
     .. py:method:: reset()
 
