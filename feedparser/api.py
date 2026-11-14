@@ -33,6 +33,7 @@ import xml.sax
 from typing import IO
 
 from . import http
+from .dedup import deduplicate_entries
 from .encodings import MissingEncoding, convert_file_to_utf8
 from .html import BaseHTMLProcessor
 from .mixin import XMLParserMixin
@@ -197,6 +198,7 @@ def parse(
         feed=FeedParserDict(),
         headers={},
     )
+    result["dedup"] = deduplicate_entries(result["entries"])
 
     try:
         file = _open_resource(
@@ -236,6 +238,7 @@ def parse(
             # the file does not come from the user, close it
             file.close()
 
+    result["dedup"] = deduplicate_entries(result["entries"])
     return result
 
 

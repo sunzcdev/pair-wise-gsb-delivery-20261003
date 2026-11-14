@@ -27,6 +27,7 @@
 
 from .api import parse
 from .datetimes import registerDateHandler
+from .dedup import deduplicate_entries
 from .exceptions import (
     CharacterEncodingOverride,
     CharacterEncodingUnknown,
@@ -52,6 +53,7 @@ OPTIMISTIC_ENCODING_DETECTION = 1
 
 __all__ = (
     "parse",
+    "deduplicate_entries",
     "registerDateHandler",
     "FeedParserDict",
     "FeedparserError",

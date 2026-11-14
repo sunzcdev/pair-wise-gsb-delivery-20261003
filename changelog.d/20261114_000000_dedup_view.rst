@@ -1,0 +1,9 @@
+Added
+-----
+
+*   Add a ``dedup`` view to the parse result, deduplicating entries that
+    share an explicit ``id``/``guid``. Entries without an identity are
+    kept as-is, the newest entry wins when update times are comparable,
+    and unresolvable content conflicts are recorded with the indices of
+    the original entries. The original ``entries`` list is never
+    modified. Also available as ``feedparser.deduplicate_entries()``.
