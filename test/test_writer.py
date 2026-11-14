@@ -7,6 +7,7 @@ from warcio.recordbuilder import RecordBuilder
 from warcio.recordloader import ArcWarcRecordLoader
 from warcio.archiveiterator import ArchiveIterator
 from warcio.bufferedreaders import DecompressingBufferedReader
+from warcio.exceptions import ContentEncodingError
 
 from . import get_test_file
 
@@ -603,8 +604,18 @@ class TestWarcWriter(object):
         stream = DecompressingBufferedReader(writer.get_stream())
         parsed_record = ArcWarcRecordLoader().parse_record_stream(stream)
 
-        content_buff = parsed_record.content_stream().read().decode('utf-8')
-        assert content_buff in record_string
+        if record_maker.__name__ == 'sample_response_2':
+            # 'Content-Encoding: x-unknown' is not a supported encoding,
+            # so decoding must fail loudly, identifying the layer, rather
+            # than silently returning the still-encoded payload
+            with pytest.raises(ContentEncodingError) as exc_info:
+                parsed_record.content_stream().read()
+            assert exc_info.value.encoding == 'x-unknown'
+            assert exc_info.value.layer == 1
+            content_buff = ''
+        else:
+            content_buff = parsed_record.content_stream().read().decode('utf-8')
+            assert content_buff in record_string
 
         rec_type = parsed_record.rec_type
 

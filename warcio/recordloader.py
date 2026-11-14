@@ -1,7 +1,7 @@
 from warcio.statusandheaders import StatusAndHeaders
 from warcio.statusandheaders import StatusAndHeadersParser
 from warcio.statusandheaders import StatusAndHeadersParserException
-from warcio.exceptions import ArchiveLoadFailed
+from warcio.exceptions import ArchiveLoadFailed, ContentEncodingError
 
 from warcio.limitreader import LimitReader
 from warcio.digestverifyingreader import DigestVerifyingReader, DigestChecker
@@ -28,25 +28,67 @@ class ArcWarcRecord(object):
         if not self.http_headers:
             return self.raw_stream
 
-        encoding = self.http_headers.get_header('content-encoding')
+        stream = self.raw_stream
 
-        if encoding:
-            encoding = encoding.lower()
+        # First, restore the HTTP message body by undoing the transfer
+        # codings (eg. de-chunking), then undo the content codings.
+        # Both are listed in the order in which they were applied, so
+        # they are removed in reverse order. Duplicate codings are
+        # significant (eg. 'gzip, gzip' means the payload was gzipped
+        # twice) and are therefore kept.
+        transfer_encodings = self._get_encodings(self.http_headers,
+                                                 'transfer-encoding')
+        for layer in range(len(transfer_encodings) - 1, -1, -1):
+            encoding = transfer_encodings[layer]
+            if encoding == 'chunked':
+                stream = ChunkedDataReader(stream)
+            else:
+                stream = self._decoding_layer(stream, encoding, layer + 1,
+                                              'Transfer-Encoding')
 
-            # 'x-gzip' is a legacy alias for 'gzip' (RFC 7230 4.2.3, RFC 2616
-            # 3.5); treat it the same so an x-gzip payload is still decompressed.
-            if encoding == 'x-gzip':
-                encoding = 'gzip'
+        content_encodings = self._get_encodings(self.http_headers,
+                                                'content-encoding')
+        for layer in range(len(content_encodings) - 1, -1, -1):
+            encoding = content_encodings[layer]
+            stream = self._decoding_layer(stream, encoding, layer + 1,
+                                          'Content-Encoding')
 
-            if encoding not in BufferedReader.get_supported_decompressors():
-                encoding = None
+        return stream
 
-        if self.http_headers.get_header('transfer-encoding') == 'chunked':
-            return ChunkedDataReader(self.raw_stream, decomp_type=encoding)
-        elif encoding:
-            return BufferedReader(self.raw_stream, decomp_type=encoding)
-        else:
-            return self.raw_stream
+    @staticmethod
+    def _get_encodings(http_headers, header):
+        """ Parse the ordered list of codings from (possibly repeated)
+        encoding headers. Names are normalized (case and surrounding
+        whitespace are ignored), but duplicates are kept since repeated
+        codings mean the payload was encoded multiple times.
+        """
+        encodings = []
+        header = header.lower()
+        for name, value in http_headers.headers:
+            if name.lower() != header:
+                continue
+            for encoding in value.split(','):
+                encoding = encoding.strip().lower()
+                # 'x-gzip' is a legacy alias for 'gzip' (RFC 7230 4.2.3,
+                # RFC 2616 3.5); treat it the same so an x-gzip payload
+                # is still decompressed.
+                if encoding == 'x-gzip':
+                    encoding = 'gzip'
+                if encoding:
+                    encodings.append(encoding)
+        return encodings
+
+    @staticmethod
+    def _decoding_layer(stream, encoding, layer, header):
+        if encoding == 'identity':
+            return stream
+
+        if encoding not in BufferedReader.get_supported_decompressors():
+            raise ContentEncodingError(encoding, layer,
+                                       'unsupported encoding', header)
+
+        return BufferedReader(stream, decomp_type=encoding,
+                              decomp_layer=(encoding, layer, header))
 
 
 #=================================================================

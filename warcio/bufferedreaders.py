@@ -3,6 +3,8 @@ import re
 import zlib
 import sys
 
+from warcio.exceptions import ContentEncodingError
+
 from warcio.utils import BUFF_SIZE
 
 import logging
@@ -65,6 +67,11 @@ class BufferedReader(object):
     If a failure occurs after data has been
     partially decompressed, the exception is propagated.
 
+    If decomp_layer is set to a (encoding, layer, header) tuple, the
+    reader operates in strict layered-decoding mode: any decompression
+    failure raises a ContentEncodingError identifying that layer instead
+    of silently returning un-decompressed or truncated data.
+
     """
 
     DECOMPRESSORS = {'gzip': gzip_decompressor,
@@ -75,10 +82,12 @@ class BufferedReader(object):
     def __init__(self, stream, block_size=BUFF_SIZE,
                  decomp_type=None,
                  starting_data=None,
-                 read_all_members=False):
+                 read_all_members=False,
+                 decomp_layer=None):
 
         self.stream = stream
         self.block_size = block_size
+        self.decomp_layer = decomp_layer
 
         self._init_decomp(decomp_type)
 
@@ -152,13 +161,21 @@ class BufferedReader(object):
                     if self.decomp_type == 'deflate':
                         self._init_decomp('deflate_alt')
                         data = self._decompress(data)
+                    elif self.decomp_layer:
+                        self._raise_layer_error(e)
                     else:
                         self.decompressor = None
                 # otherwise (partly decompressed), something is wrong
+                elif self.decomp_layer:
+                    self._raise_layer_error(e)
                 else:
                     sys.stderr.write(str(e) + '\n')
                     return b''
         return data
+
+    def _raise_layer_error(self, err):
+        encoding, layer, header = self.decomp_layer
+        raise ContentEncodingError(encoding, layer, str(err), header)
 
     def read(self, length=None):
         """

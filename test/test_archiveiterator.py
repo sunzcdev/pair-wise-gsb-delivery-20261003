@@ -1,5 +1,5 @@
 from warcio.archiveiterator import ArchiveIterator, WARCIterator, ARCIterator
-from warcio.exceptions import ArchiveLoadFailed
+from warcio.exceptions import ArchiveLoadFailed, ContentEncodingError
 from warcio.bufferedreaders import DecompressingBufferedReader, BufferedReader
 
 from warcio.warcwriter import BufferWARCWriter
@@ -7,6 +7,7 @@ from warcio.statusandheaders import StatusAndHeaders
 
 import pytest
 import gzip
+import zlib
 from io import BytesIO
 import sys
 
@@ -279,6 +280,151 @@ Content-Length: 1303\r\n'
         stream.seek(0)
         record = next(iter(ArchiveIterator(stream)))
         assert record.content_stream().read() == original
+
+    @staticmethod
+    def _make_encoded_record(payload, http_headers, check_digests=False,
+                             add_block_digest=False):
+        writer = BufferWARCWriter(gzip=False)
+        headers = StatusAndHeaders(
+            '200 OK',
+            [('Content-Type', 'text/plain')] + http_headers,
+            protocol='HTTP/1.0')
+        record = writer.create_warc_record('http://example.com/', 'response',
+                                           payload=BytesIO(payload),
+                                           length=len(payload),
+                                           http_headers=headers)
+        if add_block_digest:
+            writer.ensure_digest(record, block=True, payload=True)
+        writer.write_record(record)
+
+        stream = writer.get_stream()
+        stream.seek(0)
+        return next(iter(ArchiveIterator(stream, check_digests=check_digests)))
+
+    @staticmethod
+    def _chunk_encode(data, chunk_size=7):
+        buff = b''
+        for i in range(0, len(data), chunk_size):
+            chunk = data[i:i + chunk_size]
+            buff += ('%x' % len(chunk)).encode('ascii') + b'\r\n' + chunk + b'\r\n'
+        return buff + b'0\r\n\r\n'
+
+    def test_content_stream_decodes_multiple_encodings(self):
+        # 'Content-Encoding: gzip, deflate' lists the codings in the order
+        # they were applied, so decoding undoes them in reverse order
+        original = b'multi-layer encoded payload\n' * 8
+        compressed = zlib.compress(gzip.compress(original))
+
+        record = self._make_encoded_record(
+            compressed, [('Content-Encoding', 'gzip, deflate')])
+        assert record.content_stream().read() == original
+
+    def test_content_stream_encoding_names_normalized(self):
+        # encoding names are case-insensitive and may be padded by whitespace
+        original = b'case and whitespace normalized\n' * 8
+        compressed = gzip.compress(original)
+
+        record = self._make_encoded_record(
+            compressed, [('Content-Encoding', '  X-GZip  ')])
+        assert record.content_stream().read() == original
+
+    def test_content_stream_duplicate_encodings_not_deduped(self):
+        # 'gzip, gzip' means the payload was gzipped twice, duplicates
+        # must not be collapsed into a single decoding layer
+        original = b'gzipped twice\n' * 8
+        compressed = gzip.compress(gzip.compress(original))
+
+        record = self._make_encoded_record(
+            compressed, [('Content-Encoding', 'gzip, GZIP')])
+        assert record.content_stream().read() == original
+
+    def test_content_stream_multiple_encoding_headers(self):
+        # repeated Content-Encoding headers extend the ordered coding list
+        original = b'repeated encoding headers\n' * 8
+        compressed = zlib.compress(gzip.compress(original))
+
+        record = self._make_encoded_record(
+            compressed, [('Content-Encoding', 'gzip'),
+                         ('Content-Encoding', 'deflate')])
+        assert record.content_stream().read() == original
+
+    def test_content_stream_chunked_transfer_multiple_encodings(self):
+        # the message body is first restored per the transfer coding
+        # (de-chunked), then the content codings are undone in reverse
+        original = b'chunked and doubly encoded payload\n' * 8
+        compressed = gzip.compress(zlib.compress(original))
+        chunked = self._chunk_encode(compressed)
+
+        record = self._make_encoded_record(
+            chunked, [('Transfer-Encoding', 'chunked'),
+                      ('Content-Encoding', 'deflate, gzip')])
+        assert record.content_stream().read() == original
+
+    def test_content_stream_unsupported_encoding_identifies_layer(self):
+        original = b'payload with unknown outer coding\n' * 8
+        compressed = gzip.compress(original)
+
+        record = self._make_encoded_record(
+            compressed, [('Content-Encoding', 'gzip, x-unknown')])
+        with pytest.raises(ContentEncodingError) as exc_info:
+            record.content_stream().read()
+        assert exc_info.value.encoding == 'x-unknown'
+        assert exc_info.value.layer == 2
+
+    def test_content_stream_corrupt_intermediate_layer(self):
+        original = b'payload with corrupt inner layer\n' * 8
+        inner = gzip.compress(original)
+        # corrupt the trailer of the inner gzip stream, then wrap it
+        # in a valid outer gzip layer
+        inner = inner[:-4] + b'\xde\xad\xbe\xef'
+        compressed = gzip.compress(inner)
+
+        record = self._make_encoded_record(
+            compressed, [('Content-Encoding', 'gzip, gzip')])
+        with pytest.raises(ContentEncodingError) as exc_info:
+            record.content_stream().read()
+        assert exc_info.value.encoding == 'gzip'
+        assert exc_info.value.layer == 1
+
+    def test_content_stream_raw_stream_still_encoded(self):
+        # the raw archived bytes remain available via raw_stream
+        original = b'raw stream access\n' * 8
+        compressed = gzip.compress(original)
+
+        record = self._make_encoded_record(
+            compressed, [('Content-Encoding', 'gzip')])
+        assert record.raw_stream.read() == compressed
+
+    def test_content_stream_partial_reads_match_full_read(self):
+        original = b'partial reads\n' * 100
+        compressed = gzip.compress(zlib.compress(original))
+        headers = [('Content-Encoding', 'deflate, gzip')]
+
+        record = self._make_encoded_record(compressed, headers)
+        full = record.content_stream().read()
+
+        record = self._make_encoded_record(compressed, headers)
+        stream = record.content_stream()
+        parts = []
+        while True:
+            part = stream.read(7)
+            if not part:
+                break
+            parts.append(part)
+
+        assert b''.join(parts) == full == original
+
+    def test_content_stream_decoding_preserves_digests(self):
+        # content decoding must not change what the WARC block/payload
+        # digests are verified against: the raw archived bytes
+        original = b'digest checked payload\n' * 8
+        compressed = gzip.compress(zlib.compress(original))
+
+        record = self._make_encoded_record(
+            compressed, [('Content-Encoding', 'deflate, gzip')],
+            check_digests=True, add_block_digest=True)
+        assert record.content_stream().read() == original
+        assert record.digest_checker.passed is True
 
     def test_bad_warc(self):
         with pytest.raises(ArchiveLoadFailed):
