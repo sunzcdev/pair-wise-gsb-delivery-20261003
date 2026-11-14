@@ -297,6 +297,150 @@ def test_alias_in_union():
     assert output_records == expected_records
 
 
+def test_ambiguous_alias_in_reader_schema():
+    """Two reader fields declare the same alias for a writer field"""
+    schema = {
+        "type": "record",
+        "name": "test_ambiguous_alias_in_reader_schema",
+        "fields": [{"name": "test", "type": "int"}],
+    }
+
+    new_schema = {
+        "type": "record",
+        "name": "test_ambiguous_alias_in_reader_schema",
+        "fields": [
+            {"name": "newtest1", "type": "int", "aliases": ["test"]},
+            {"name": "newtest2", "type": "int", "aliases": ["test"]},
+        ],
+    }
+
+    records = [{"test": 1}]
+
+    with pytest.raises(fastavro.read.SchemaResolutionError):
+        roundtrip(schema, records, new_schema)
+
+
+def test_ambiguous_alias_not_used_by_writer():
+    """An alias shared by multiple reader fields is only an error when a
+    writer field actually resolves through it"""
+    schema = {
+        "type": "record",
+        "name": "test_ambiguous_alias_not_used_by_writer",
+        "fields": [{"name": "test", "type": "int"}],
+    }
+
+    new_schema = {
+        "type": "record",
+        "name": "test_ambiguous_alias_not_used_by_writer",
+        "fields": [
+            {"name": "test", "type": "int"},
+            {"name": "newtest1", "type": "int", "default": 1, "aliases": ["old"]},
+            {"name": "newtest2", "type": "int", "default": 2, "aliases": ["old"]},
+        ],
+    }
+
+    records = [{"test": 1}]
+
+    new_records = roundtrip(schema, records, new_schema)
+    assert new_records == [{"test": 1, "newtest1": 1, "newtest2": 2}]
+
+
+def test_alias_shadowed_by_real_field_name():
+    """A real reader field name takes priority over another field's alias"""
+    schema = {
+        "type": "record",
+        "name": "test_alias_shadowed_by_real_field_name",
+        "fields": [{"name": "test", "type": "int"}],
+    }
+
+    new_schema = {
+        "type": "record",
+        "name": "test_alias_shadowed_by_real_field_name",
+        "fields": [
+            {"name": "newtest", "type": "int", "default": 0, "aliases": ["test"]},
+            {"name": "test", "type": "int"},
+        ],
+    }
+
+    records = [{"test": 1}]
+
+    new_records = roundtrip(schema, records, new_schema)
+    # The writer field maps to the real "test" field, not to the alias
+    assert new_records == [{"newtest": 0, "test": 1}]
+
+
+def test_alias_scopes_are_per_record():
+    """The same alias in nested record scopes is not ambiguous"""
+    schema = {
+        "type": "record",
+        "name": "test_alias_scopes_are_per_record",
+        "fields": [
+            {"name": "outer", "type": "int"},
+            {
+                "name": "inner",
+                "type": {
+                    "type": "record",
+                    "name": "inner_record",
+                    "fields": [{"name": "inner_field", "type": "int"}],
+                },
+            },
+        ],
+    }
+
+    new_schema = {
+        "type": "record",
+        "name": "test_alias_scopes_are_per_record",
+        "fields": [
+            {"name": "new_outer", "type": "int", "aliases": ["outer"]},
+            {
+                "name": "inner",
+                "type": {
+                    "type": "record",
+                    "name": "inner_record",
+                    "fields": [
+                        {
+                            "name": "new_inner_field",
+                            "type": "int",
+                            "aliases": ["inner_field"],
+                        }
+                    ],
+                },
+            },
+        ],
+    }
+
+    records = [{"outer": 1, "inner": {"inner_field": 2}}]
+
+    new_records = roundtrip(schema, records, new_schema)
+    assert new_records == [{"new_outer": 1, "inner": {"new_inner_field": 2}}]
+
+
+def test_alias_in_recursive_record():
+    """Aliases resolve on every level of a recursive named type"""
+    schema = {
+        "type": "record",
+        "name": "Node",
+        "fields": [
+            {"name": "value", "type": "int"},
+            {"name": "next", "type": ["null", "Node"], "default": None},
+        ],
+    }
+
+    new_schema = {
+        "type": "record",
+        "name": "Node",
+        "fields": [
+            {"name": "new_value", "type": "int", "aliases": ["value"]},
+            {"name": "next", "type": ["null", "Node"], "default": None},
+        ],
+    }
+
+    records = [{"value": 1, "next": {"value": 2, "next": None}}]
+
+    new_records = roundtrip(schema, records, new_schema)
+    assert new_records == [{"new_value": 1, "next": {"new_value": 2, "next": None}}]
+
+
 @pytest.mark.parametrize(
     "reader_options", [{"return_record_name": True}, {"return_named_type": True}]
 )

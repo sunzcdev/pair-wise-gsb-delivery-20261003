@@ -524,6 +524,16 @@ def read_record(
      * if the reader's record schema has a field with no default value, and
          writer's schema does not have a field with the same name, then the
          field's value is unset.
+
+    Field matching priority (a writer field maps to at most one reader
+    field):
+     * a reader field whose real name equals the writer field name always
+         wins, even if another reader field declares that name as an alias.
+     * only when no reader field has that real name are aliases consulted.
+     * if more than one reader field declares the same matching alias, the
+         mapping is ambiguous and a SchemaResolutionError is raised before
+         any record data is read (rather than letting dictionary overwrite
+         order decide the result).
     """
     record = {}
     if reader_schema is None:
@@ -541,13 +551,32 @@ def read_record(
         for f in reader_schema["fields"]:
             readers_field_dict[f["name"]] = f
             for alias in f.get("aliases", []):
-                aliases_field_dict[alias] = f
+                # Keep every field that declares an alias so that ambiguous
+                # aliases (multiple reader fields claiming the same alias)
+                # can be detected instead of silently overwritten.
+                aliases_field_dict.setdefault(alias, []).append(f)
 
+        # Resolve every writer field to at most one reader field up front so
+        # that ambiguity is reported before any record data is read.
+        resolved_fields = []
         for field in writer_schema["fields"]:
-            readers_field = readers_field_dict.get(
-                field["name"],
-                aliases_field_dict.get(field["name"]),
-            )
+            field_name = field["name"]
+            readers_field = readers_field_dict.get(field_name)
+            if readers_field is None:
+                alias_matches = aliases_field_dict.get(field_name, [])
+                if len(alias_matches) > 1:
+                    matching_names = ", ".join(f["name"] for f in alias_matches)
+                    msg = (
+                        f"Ambiguous alias {field_name} in "
+                        f"{reader_schema['name']}: matches reader fields "
+                        f"{matching_names}"
+                    )
+                    raise SchemaResolutionError(msg)
+                elif alias_matches:
+                    readers_field = alias_matches[0]
+            resolved_fields.append((field, readers_field))
+
+        for field, readers_field in resolved_fields:
             if readers_field:
                 readers_field_name = readers_field["name"]
                 record[readers_field_name] = read_data(
