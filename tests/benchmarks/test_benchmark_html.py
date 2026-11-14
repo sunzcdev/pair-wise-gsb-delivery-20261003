@@ -10,6 +10,7 @@ from w3lib.html import (
     get_base_url,
     get_meta_refresh,
     has_entities,
+    parse_srcset,
     remove_comments,
     remove_tags,
     remove_tags_with_content,
@@ -236,6 +237,15 @@ BENCHMARK_CASES: CasesMapType = {
         (("plain text",), {}),
         (("",), {}),
         ((b"&#169;",), {}),
+    ],
+    parse_srcset: [
+        (("small.jpg 320w, big.jpg 640w",), {}),
+        (("a.jpg 1x, b.jpg 2x, c.jpg 3x",), {}),
+        (("data:image/gif;base64,AAAA,BBBB,CCCC 2x, next.jpg 1x",), {}),
+        (("a 1w 2w, b 2w, , c 3w",), {}),
+        ((", ".join([f"image-{index}.jpg {index}w" for index in range(100)]),), {}),
+        ((b"a 1w, b 2w",), {}),
+        (("data:" + (",x" * 5000) + " 2x",), {}),
     ],
 }
 

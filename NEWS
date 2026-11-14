@@ -1,6 +1,19 @@
 w3lib release notes
 ===================
 
+2.7.0 (unreleased)
+------------------
+
+New features:
+
+- Added :func:`~w3lib.html.parse_srcset`, which parses a ``srcset`` attribute
+  into image candidates. Each :class:`~w3lib.html.SrcsetCandidate` keeps its
+  raw URL (the commas of a ``data:`` URI are preserved), its width or pixel
+  density descriptor and its source span, while bad candidates are reported as
+  :class:`~w3lib.html.SrcsetError` entries with their own spans without
+  dropping the candidates that follow. Entities are not decoded and relative
+  URLs are not resolved: both are left to the caller as explicit steps.
+
 2.6.0 (2026-11-05)
 ------------------
 

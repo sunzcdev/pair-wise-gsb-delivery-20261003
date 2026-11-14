@@ -4,9 +4,12 @@ from collections.abc import Callable
 import pytest
 
 from w3lib.html import (
+    SrcsetCandidate,
+    SrcsetError,
     get_base_url,
     get_meta_refresh,
     has_entities,
+    parse_srcset,
     remove_comments,
     remove_tags,
     remove_tags_with_content,
@@ -1863,3 +1866,243 @@ def test_max_scan_deprecated(func: Callable[..., object]) -> None:
         assert func("a" * 10 + BASE_TAG + META_TAG, max_scan=5) == func(
             BASE_TAG + META_TAG
         )
+
+
+def _candidate(
+    url: str,
+    width: int | None = None,
+    density: float | None = None,
+    *,
+    span: tuple[int, int],
+    descriptor_span: tuple[int, int] | None = None,
+) -> SrcsetCandidate:
+    return SrcsetCandidate(url, width, density, span, descriptor_span)
+
+
+class TestParseSrcset:
+    def test_returns_named_tuples(self):
+        result = parse_srcset("a 1w")
+        assert isinstance(result.candidates, tuple)
+        assert isinstance(result.errors, tuple)
+        assert result.errors == ()
+        candidate = result.candidates[0]
+        assert isinstance(candidate, SrcsetCandidate)
+        assert candidate.url == "a"
+        assert candidate.width == 1
+        assert candidate.density is None
+
+    def test_descriptor_defaults_to_none(self):
+        result = parse_srcset("a.jpg, b.jpg , c.jpg")
+        assert result.candidates == (
+            _candidate("a.jpg", span=(0, 5)),
+            _candidate("b.jpg", span=(7, 12)),
+            _candidate("c.jpg", span=(15, 20)),
+        )
+        assert result.errors == ()
+
+    def test_width_descriptors(self):
+        result = parse_srcset("small.jpg 320w, big.jpg 2000w")
+        assert [
+            (c.url, c.width, c.density) for c in result.candidates
+        ] == [("small.jpg", 320, None), ("big.jpg", 2000, None)]
+
+    def test_density_descriptors(self):
+        result = parse_srcset("a.jpg 1x, b.jpg 2.5x, c.jpg .5x")
+        assert [
+            (c.url, c.width, c.density) for c in result.candidates
+        ] == [
+            ("a.jpg", None, 1.0),
+            ("b.jpg", None, 2.5),
+            ("c.jpg", None, 0.5),
+        ]
+
+    @pytest.mark.parametrize(
+        "descriptor",
+        [
+            "-1w",
+            "0w",
+            "-2x",
+            "0x",
+            "0.0x",
+            "+1w",
+            "1.x",
+            "1.5e3x",
+            "100W",
+            "2X",
+            "w",
+            "x",
+        ],
+    )
+    def test_bad_descriptors(self, descriptor):
+        text = f"a.jpg {descriptor}, b.jpg 1w"
+        result = parse_srcset(text)
+        good_start = len(f"a.jpg {descriptor}, ")
+        descriptor_start = len(f"a.jpg {descriptor}, b.jpg ")
+        assert result.candidates == (
+            _candidate(
+                "b.jpg",
+                width=1,
+                span=(good_start, len(text)),
+                descriptor_span=(descriptor_start, len(text)),
+            ),
+        )
+        assert len(result.errors) == 1
+        error = result.errors[0]
+        assert isinstance(error, SrcsetError)
+        assert error.source_span == (0, len(f"a.jpg {descriptor}"))
+        assert text[error.source_span[0] : error.source_span[1]] == (
+            f"a.jpg {descriptor}"
+        )
+
+    def test_zero_and_negative_keep_their_code(self):
+        assert parse_srcset("a 0w").errors[0].code == "negative_descriptor"
+        assert parse_srcset("a -1w").errors[0].code == "bad_descriptor"
+        assert parse_srcset("a 0x").errors[0].code == "negative_descriptor"
+        assert parse_srcset("a -2x").errors[0].code == "bad_descriptor"
+
+    def test_duplicate_descriptor_same_kind(self):
+        for text in ("a 1w 2w", "a 1x 2x"):
+            result = parse_srcset(text)
+            assert result.candidates == ()
+            assert result.errors[0].code == "duplicate_descriptor"
+
+    def test_mixed_descriptor_within_candidate(self):
+        result = parse_srcset("a 1w 2x")
+        assert result.candidates == ()
+        assert result.errors[0].code == "mixed_descriptor"
+        result = parse_srcset("a 2x 1w")
+        assert result.errors[0].code == "mixed_descriptor"
+
+    def test_mixed_descriptor_across_candidates(self):
+        result = parse_srcset("a 1w, b 2x, c 3w")
+        assert [c.url for c in result.candidates] == ["a", "c"]
+        assert [e.code for e in result.errors] == ["mixed_descriptor"]
+        assert result.errors[0].source_span == (6, 10)
+
+    def test_bad_candidate_does_not_swallow_following_ones(self):
+        result = parse_srcset("a 1w 2w, b 3w, , c 4w")
+        assert [c.url for c in result.candidates] == ["b", "c"]
+        assert [e.code for e in result.errors] == [
+            "duplicate_descriptor",
+            "empty",
+        ]
+
+    def test_empty_candidates(self):
+        result = parse_srcset(", a, ,")
+        assert [c.url for c in result.candidates] == ["a"]
+        # The string splits into four candidates: two empty ones at the ends,
+        # "a" and a whitespace-only one that trims to empty.
+        assert [e.code for e in result.errors] == ["empty", "empty"]
+
+    def test_whitespace_only_and_empty(self):
+        assert parse_srcset("").candidates == ()
+        assert parse_srcset("").errors == ()
+        assert parse_srcset("   \t\n\r\f  ").candidates == ()
+
+    def test_data_uri_keeps_its_commas(self):
+        result = parse_srcset("data:image/gif;base64,AAAA,BBBB 2x, next.jpg")
+        assert result.candidates[0].url == "data:image/gif;base64,AAAA,BBBB"
+        assert result.candidates[0].density == 2.0
+        assert result.candidates[1].url == "next.jpg"
+        assert result.errors == ()
+
+    def test_data_uri_without_descriptor(self):
+        result = parse_srcset("data:,hello,world, other.jpg")
+        assert result.candidates[0].url == "data:,hello,world"
+        assert result.candidates[1].url == "other.jpg"
+
+    def test_data_uri_case_insensitive_scheme(self):
+        result = parse_srcset("DATA:,a,b 2x")
+        assert result.candidates[0].url == "DATA:,a,b"
+        assert result.candidates[0].density == 2.0
+
+    def test_non_data_url_still_splits_on_comma(self):
+        result = parse_srcset("http://example.org/a,b, c")
+        assert [c.url for c in result.candidates] == [
+            "http://example.org/a",
+            "b",
+            "c",
+        ]
+
+    def test_source_spans_point_at_the_candidate(self):
+        text = "  a.jpg  2x , b.jpg "
+        result = parse_srcset(text)
+        first, second = result.candidates
+        assert text[first.source_span[0] : first.source_span[1]] == "a.jpg  2x"
+        assert text[first.descriptor_span[0] : first.descriptor_span[1]] == "2x"
+        assert text[second.source_span[0] : second.source_span[1]] == "b.jpg"
+        assert second.descriptor_span is None
+
+    def test_error_span_locates_the_bad_candidate(self):
+        text = "good.jpg 1w, bad.jpg 1w 2w, fine.jpg 2w"
+        result = parse_srcset(text)
+        error = result.errors[0]
+        start, end = error.source_span
+        assert text[start:end] == "bad.jpg 1w 2w"
+        assert [c.url for c in result.candidates] == ["good.jpg", "fine.jpg"]
+
+    def test_raw_urls_are_not_entity_decoded_or_resolved(self):
+        result = parse_srcset("a?x=1&amp;y=2 1w, ../relative.jpg 2w")
+        assert result.candidates[0].url == "a?x=1&amp;y=2"
+        assert result.candidates[1].url == "../relative.jpg"
+
+    def test_entity_decoding_and_resolution_are_separate_steps(self):
+        from urllib.parse import urljoin
+
+        from w3lib.url import safe_url_string
+
+        result = parse_srcset("../img?a=1&amp;b=2 2x")
+        raw_url = result.candidates[0].url
+        # Entity decoding is the caller's first explicit step.
+        decoded = replace_entities(raw_url)
+        assert decoded == "../img?a=1&b=2"
+
+        # Relative URL resolution is a separate, later explicit step.
+        absolute = "https://example.org/dir/page"
+        assert urljoin(absolute, decoded) == "https://example.org/img?a=1&b=2"
+        assert safe_url_string(urljoin(absolute, decoded)) == (
+            "https://example.org/img?a=1&b=2"
+        )
+
+    def test_bytes_input(self):
+        result = parse_srcset(b"a 1w, b 2w")
+        assert [c.url for c in result.candidates] == ["a", "b"]
+        assert [c.width for c in result.candidates] == [1, 2]
+        assert all(isinstance(c.url, str) for c in result.candidates)
+
+    def test_bytes_input_with_encoding(self):
+        result = parse_srcset("imäge.jpg 1w".encode("latin-1"), encoding="latin-1")
+        assert result.candidates[0].url == "imäge.jpg"
+
+    @pytest.mark.parametrize(
+        "text",
+        [
+            "a" * 100000,
+            "data:" + ",x" * 50000 + " 2x",
+            ", ".join(["a 1w 2w"] * 10000),
+            " , " * 50000,
+        ],
+    )
+    def test_linear_time_on_long_inputs(self, text):
+        start = time.process_time()
+        parse_srcset(text)
+        assert time.process_time() - start < 2
+
+    def test_html_whitespace_separators(self):
+        result = parse_srcset("a\t1w\n,\f b\r2w")
+        assert [c.url for c in result.candidates] == ["a", "b"]
+        assert [c.width for c in result.candidates] == [1, 2]
+
+    def test_non_ascii_whitespace_is_not_a_separator(self):
+        # Only HTML whitespace (tab, LF, FF, CR, space) separates the URL and
+        # the descriptors; U+00A0 stays part of the token.
+        result = parse_srcset("a\u00a01w, b 1w")
+        assert result.candidates[0].url == "a\u00a01w"
+        assert result.candidates[0].width is None
+        assert result.candidates[1].url == "b"
+
+    def test_data_prefix_at_end_of_input(self):
+        # A trailing "data:" with no comma and no descriptor is one candidate.
+        result = parse_srcset("data:")
+        assert [c.url for c in result.candidates] == ["data:"]
+        assert result.errors == ()

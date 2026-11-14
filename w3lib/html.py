@@ -8,7 +8,7 @@ import functools
 import re
 import warnings
 from html.entities import html5
-from typing import TYPE_CHECKING, Any, AnyStr
+from typing import TYPE_CHECKING, Any, AnyStr, NamedTuple
 
 from frostwork import navigation
 
@@ -791,3 +791,282 @@ def strip_html5_whitespace(text: str) -> str:
     'hello'
     """
     return text.strip(HTML5_WHITESPACE)
+
+
+class SrcsetCandidate(NamedTuple):
+    """One image candidate of a ``srcset`` attribute.
+
+    The candidate keeps the URL and the descriptor exactly as written, before
+    entity decoding and relative URL resolution, which are left to the caller.
+    """
+
+    #: The raw URL of the candidate, e.g. ``"image.jpg"`` or a ``data:`` URI.
+    url: str
+    #: The width descriptor in CSS pixels, or ``None`` when the candidate has
+    #: no width descriptor.
+    width: int | None
+    #: The pixel density descriptor, or ``None`` when the candidate has no
+    #: pixel density descriptor.
+    density: float | None
+    #: The half-open span of the whole candidate in the source attribute, as
+    #: ``(start, end)`` character offsets, excluding the surrounding
+    #: whitespace and the separating comma.
+    source_span: tuple[int, int]
+    #: The half-open span of the descriptor in the source attribute, as
+    #: ``(start, end)`` character offsets, or ``None`` when the candidate has
+    #: no descriptor.
+    descriptor_span: tuple[int, int] | None
+
+
+class SrcsetError(NamedTuple):
+    """An image candidate that could not be parsed.
+
+    Bad candidates never stop the scan: the candidates that follow a bad one
+    are still parsed and returned.
+    """
+
+    #: The machine-readable reason the candidate was rejected:
+    #: ``"empty"``, ``"bad_descriptor"``, ``"duplicate_descriptor"``,
+    #: ``"negative_descriptor"`` or ``"mixed_descriptor"``.
+    code: str
+    #: A human-readable description of the error.
+    message: str
+    #: The half-open span of the bad candidate in the source attribute, as
+    #: ``(start, end)`` character offsets, excluding the surrounding
+    #: whitespace and the separating comma.
+    source_span: tuple[int, int]
+
+
+class SrcsetParseResult(NamedTuple):
+    """The result of :func:`parse_srcset`."""
+
+    #: The valid image candidates, in source order.
+    candidates: tuple[SrcsetCandidate, ...]
+    #: The bad image candidates, in source order.
+    errors: tuple[SrcsetError, ...]
+
+
+# A width descriptor is one or more ASCII digits followed by "w"; a density
+# descriptor is a floating-point number (no sign, no exponent) followed by
+# "x". They match whole tokens, so a negative sign, an exponent or another
+# suffix keeps the token from matching and makes the descriptor invalid
+# rather than being read with another value.
+_WIDTH_DESCRIPTOR_RE = re.compile(r"[0-9]+w", re.ASCII)
+_DENSITY_DESCRIPTOR_RE = re.compile(
+    r"(?:[0-9]+(?:\.[0-9]+)?|\.[0-9]+)x", re.ASCII
+)
+
+# Descriptor tokens are runs of non-whitespace characters, read one after
+# another so the descriptor of a candidate is walked a single time. The set is
+# explicit HTML whitespace, not "\S", so a non-ASCII space stays part of a
+# token instead of separating two tokens.
+_DESCRIPTOR_TOKEN_RE = re.compile(r"[^\t\n\f\r ]+", re.ASCII)
+
+
+def _skip_whitespace(text: str, pos: int) -> int:
+    """Return the position after the run of HTML whitespace at *pos*."""
+    while pos < len(text) and text[pos] in HTML5_WHITESPACE:
+        pos += 1
+    return pos
+
+
+def _is_data_url_start(text: str, pos: int) -> bool:
+    """Return whether *text* at *pos* starts a ``data:`` URL.
+
+    The scheme check is ASCII and case-insensitive, as scheme matching is.
+    """
+    prefix = "data:"
+    return text[pos : pos + len(prefix)].lower() == prefix
+
+
+def _parse_srcset_candidate(
+    text: str, start: int, end: int, descriptor_kind: str | None
+) -> tuple[SrcsetCandidate | None, SrcsetError | None, str | None]:
+    """Parse one image candidate spanning *text*[*start*:*end*], already
+    stripped of its surrounding whitespace.
+
+    Return the candidate (or ``None``), the error (or ``None``) and the
+    descriptor kind of the candidate (``"w"``, ``"x"`` or ``None``), which
+    updates the kind shared by every candidate of the attribute.
+    """
+
+    def error(code: str, message: str) -> tuple[None, SrcsetError, None]:
+        return None, SrcsetError(code, message, (start, end)), None
+
+    if start >= end:
+        return error("empty", "empty image candidate")
+
+    # The URL ends at the first run of HTML whitespace. The scanner keeps the
+    # commas of a data: URL inside the candidate, so the first whitespace run
+    # here separates the URL from its descriptor for every URL kind.
+    pos = start
+    while pos < end and text[pos] not in HTML5_WHITESPACE:
+        pos += 1
+    url = text[start:pos]
+
+    width: int | None = None
+    density: float | None = None
+    kind: str | None = None
+    descriptor_span: tuple[int, int] | None = None
+
+    # Walk the descriptor tokens one at a time, each from where the previous
+    # one ended, so the descriptor is read in a single linear pass.
+    for match in _DESCRIPTOR_TOKEN_RE.finditer(text, pos, end):
+        token = match.group(0)
+        token_start, token_end = match.span()
+        if kind is None:
+            descriptor_span = (token_start, token_end)
+
+        if _WIDTH_DESCRIPTOR_RE.fullmatch(token):
+            token_kind = "w"
+        elif _DENSITY_DESCRIPTOR_RE.fullmatch(token):
+            token_kind = "x"
+        else:
+            return error(
+                "bad_descriptor",
+                f"invalid descriptor {token!r}",
+            )
+
+        if kind is not None and token_kind == kind:
+            # Two descriptors of the same kind repeat a descriptor, which the
+            # HTML standard rejects as an invalid candidate.
+            return error(
+                "duplicate_descriptor",
+                f"duplicate {token_kind!r} descriptor {token!r}",
+            )
+        if kind is not None:
+            # A further descriptor can only differ in kind here, which mixes
+            # width and density descriptors in one candidate.
+            return error(
+                "mixed_descriptor",
+                f"mixed descriptors in one candidate: {token!r}",
+            )
+        if descriptor_kind is not None and token_kind != descriptor_kind:
+            return error(
+                "mixed_descriptor",
+                f"candidate mixes {token_kind!r} descriptors with earlier "
+                f"{descriptor_kind!r} descriptors",
+            )
+
+        if token_kind == "w":
+            value = int(token[:-1])
+            if value <= 0:
+                return error(
+                    "negative_descriptor",
+                    f"width descriptor must be positive, got {token!r}",
+                )
+            width = value
+        else:
+            value = float(token[:-1])
+            if value <= 0:
+                return error(
+                    "negative_descriptor",
+                    f"density descriptor must be positive, got {token!r}",
+                )
+            density = value
+        kind = token_kind
+
+    return (
+        SrcsetCandidate(
+            url,
+            width,
+            density,
+            (start, end),
+            descriptor_span,
+        ),
+        None,
+        kind,
+    )
+
+
+def parse_srcset(
+    text: str | bytes, encoding: str = "utf-8"
+) -> SrcsetParseResult:
+    """Parse the value of a ``srcset`` attribute into image candidates.
+
+    Each candidate is returned with its raw URL, its width or pixel density
+    descriptor (if any) and the character offsets it occupies in *text*. The
+    candidates are only parsed: no entity is decoded and no relative URL is
+    resolved, so a ``data:`` URI keeps the commas it contains instead of being
+    split on them. Apply :func:`replace_entities` to a candidate URL and then
+    resolve it against the document URL with :func:`urllib.parse.urljoin` and
+    :func:`w3lib.url.safe_url_string` as explicit further steps.
+
+    Descriptors are validated the way the HTML standard validates them: a
+    candidate may have no descriptor, one width descriptor (``"100w"``) or one
+    pixel density descriptor (``"2x"``). A bad or duplicate descriptor, a
+    non-positive value or width and density descriptors mixed across
+    candidates are reported as :class:`SrcsetError` entries and do not stop the
+    parsing of the candidates that follow.
+
+    *text* can be a unicode string or a byte string decoded with *encoding*,
+    following the same encoding convention as the other functions of this
+    module.
+
+    The scan walks *text* once, without backtracking, so its time stays linear
+    in the length of even a very long attribute.
+
+    .. versionadded:: 2.7.0
+
+    >>> result = parse_srcset("small.jpg 320w, big.jpg 640w")
+    >>> [(candidate.url, candidate.width, candidate.density)
+    ...     for candidate in result.candidates]
+    [('small.jpg', 320, None), ('big.jpg', 640, None)]
+    >>> parse_srcset(
+    ...     "data:image/gif;base64,AAAA, 2x"
+    ... ).candidates[0].url
+    'data:image/gif;base64,AAAA'
+    """
+    utext = to_unicode(text, encoding)
+
+    candidates: list[SrcsetCandidate] = []
+    errors: list[SrcsetError] = []
+    descriptor_kind: str | None = None
+
+    length = len(utext)
+    pos = 0
+    while True:
+        # Leading whitespace, including the whitespace after a comma.
+        pos = _skip_whitespace(utext, pos)
+        if pos >= length:
+            break
+
+        start = pos
+        if _is_data_url_start(utext, pos):
+            # A data: URL is opaque and may hold commas, so only the comma
+            # that follows HTML whitespace (the one before the next
+            # candidate) can separate candidates.
+            while pos < length:
+                if utext[pos] == ",":
+                    ahead = pos + 1
+                    if ahead >= length or utext[ahead] in HTML5_WHITESPACE:
+                        break
+                pos += 1
+        else:
+            while pos < length and utext[pos] != ",":
+                pos += 1
+
+        # Trim the HTML whitespace trailing the candidate, while the span
+        # still covers only the text of the candidate.
+        end = pos
+        while end > start and utext[end - 1] in HTML5_WHITESPACE:
+            end -= 1
+
+        candidate, candidate_error, kind = _parse_srcset_candidate(
+            utext, start, end, descriptor_kind
+        )
+        if candidate is not None:
+            candidates.append(candidate)
+            if kind is not None:
+                descriptor_kind = kind
+        else:
+            assert candidate_error is not None
+            errors.append(candidate_error)
+
+        if pos >= length:
+            break
+        # Skip the separating comma; the next loop iteration skips the
+        # whitespace that follows it.
+        pos += 1
+
+    return SrcsetParseResult(tuple(candidates), tuple(errors))
