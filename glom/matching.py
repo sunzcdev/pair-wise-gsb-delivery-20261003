@@ -9,6 +9,7 @@ step, you can do these checks inline with your glom spec, using
 
 import re
 import sys
+from contextlib import contextmanager
 from pprint import pprint
 
 from boltons.iterutils import is_iterable
@@ -18,6 +19,18 @@ from .core import GlomError, glom, T, MODE, bbrepr, bbformat, format_invocation,
 
 
 _MISSING = make_sentinel('_MISSING')
+
+#: scope key under which the active :class:`_MatchCollector` is stored when
+#: a :class:`Match` is being evaluated in multi-error mode.
+MATCH_COLLECTOR = make_sentinel('MATCH_COLLECTOR')
+
+#: scope key holding a suspension depth. While positive, multi-error
+#: collection is hidden inside speculative branches, restoring raise
+#: semantics so failure can be detected via exceptions.
+MATCH_SUSPEND = make_sentinel('MATCH_SUSPEND')
+
+#: default cap on the number of problems collected before traversal stops.
+DEFAULT_MAX_PROBLEMS = 10
 
 
 # NOTE: it is important that MatchErrors be cheap to construct,
@@ -67,6 +80,232 @@ class TypeMatchError(MatchError, TypeError):
         # __init__ args = (actual, expected)
         # self.args = (fmt_str, expected, actual)
         return TypeMatchError(self.args[2], self.args[1])
+
+
+class MatchProblem:
+    """A single, structured description of why one location of a target
+    did not match its :class:`Match` spec.
+
+    Instances are produced in multi-error mode (see :meth:`Match.collect`
+    and ``Match(..., multi_error=True)``). Only structural, non-sensitive
+    information is retained:
+
+    Args:
+       path (tuple): location of the problem within the target, made up of
+         dict keys and sequence indexes. An empty tuple means the root.
+       expected (str): description of what the spec expected, such as a
+         type name (``'int'``) or a safe rendition of a spec/key.
+       actual_type (str): name of the type found at *path*, or
+         ``'missing'`` when an expected key was absent.
+
+    The actual target value is deliberately **not** stored, so sensitive
+    payloads never leak into a structured report.
+
+    >>> p = MatchProblem(('id',), 'int', 'str')
+    >>> p.path
+    ('id',)
+    >>> p.expected, p.actual_type
+    ('int', 'str')
+    """
+    __slots__ = ('path', 'expected', 'actual_type')
+
+    def __init__(self, path, expected, actual_type):
+        self.path = tuple(path)
+        self.expected = expected
+        self.actual_type = actual_type
+
+    def as_dict(self):
+        """Return a plain ``dict`` rendition, handy for serializing reports."""
+        return {'path': list(self.path),
+                'expected': self.expected,
+                'actual_type': self.actual_type}
+
+    def __iter__(self):
+        # allow ``path, expected, actual_type = problem`` style unpacking
+        yield self.path
+        yield self.expected
+        yield self.actual_type
+
+    def __eq__(self, other):
+        if type(other) is not MatchProblem:
+            return NotImplemented
+        return (self.path == other.path
+                and self.expected == other.expected
+                and self.actual_type == other.actual_type)
+
+    def __hash__(self):
+        return hash((self.path, self.expected, self.actual_type))
+
+    def __repr__(self):
+        return 'MatchProblem(path={0!r}, expected={1!r}, actual_type={2!r})'.format(
+            list(self.path), self.expected, self.actual_type)
+
+
+class MultiMatchError(MatchError):
+    """:exc:`MatchError` subtype raised by ``Match(..., multi_error=True)``
+    when one or more :class:`MatchProblem` objects were collected.
+
+    The structured details live on :attr:`problems` (an ordered list) and
+    :attr:`truncated` (a flag indicating that the problem cap was reached).
+    The rendered message summarizes counts and locations without embedding
+    actual target values.
+    """
+    def __init__(self, problems, truncated=False):
+        self.problems = list(problems)
+        self.truncated = truncated
+        super().__init__("match failed with {0} problem(s)", len(self.problems))
+
+    def get_message(self):
+        lines = []
+        for problem in self.problems:
+            location = '.'.join([bbrepr(part) for part in problem.path]) or '<root>'
+            lines.append('  - at {0}: expected {1}, got {2}'.format(
+                location, problem.expected, problem.actual_type))
+        suffix = ''
+        if self.truncated:
+            suffix = '\n  (problem limit reached; further checks were skipped)'
+        return 'match failed with {0} problem(s):\n{1}{2}'.format(
+            len(self.problems), '\n'.join(lines), suffix)
+
+
+class MatchReport:
+    """The result of :meth:`Match.collect`.
+
+    Attributes:
+       problems (list[MatchProblem]): ordered, structured problems found.
+       truncated (bool): ``True`` when *max_problems* was reached and
+         traversal was cut short.
+
+    A report is truthy when the target matched without problems.
+    """
+    __slots__ = ('problems', 'truncated')
+
+    def __init__(self, problems, truncated=False):
+        self.problems = list(problems)
+        self.truncated = truncated
+
+    @property
+    def ok(self):
+        """``True`` when no problems were collected."""
+        return not self.problems
+
+    def as_dicts(self):
+        """Return the problems as a list of plain ``dict`` objects."""
+        return [problem.as_dict() for problem in self.problems]
+
+    def __bool__(self):
+        return self.ok
+
+    def __iter__(self):
+        return iter(self.problems)
+
+    def __len__(self):
+        return len(self.problems)
+
+    def __repr__(self):
+        return 'MatchReport({0!r}, truncated={1!r})'.format(
+            self.problems, self.truncated)
+
+
+def _describe_expected(spec):
+    """Safe, value-free description of what a spec expected."""
+    if isinstance(spec, type):
+        return spec.__name__
+    if isinstance(spec, Or):
+        return ' or '.join(_describe_expected(child) for child in spec.children)
+    return bbrepr(spec)
+
+
+def _type_name(value):
+    return type(value).__name__
+
+
+class _MatchCollector:
+    """Accumulates :class:`MatchProblem` objects during a multi-error match.
+
+    Also tracks the current target path (dict keys / sequence indexes) and
+    provides checkpoints so branching specs (:class:`Or`, list alternative
+    patterns) can discard problems from branches that ultimately do not
+    apply. Actual values are never retained.
+    """
+    __slots__ = ('max_problems', 'problems', 'truncated', '_path')
+
+    def __init__(self, max_problems=DEFAULT_MAX_PROBLEMS):
+        self.max_problems = max_problems
+        self.problems = []
+        self.truncated = False
+        self._path = []
+
+    def full(self):
+        return (self.max_problems is not None
+                and len(self.problems) >= self.max_problems)
+
+    def record(self, expected, actual_type):
+        if self.full():
+            self.truncated = True
+            return False
+        self.problems.append(
+            MatchProblem(tuple(self._path), expected, actual_type))
+        if self.full():
+            self.truncated = True
+        return True
+
+    def record_error(self, spec, error):
+        """Convert a raised :class:`GlomError` into a structured problem.
+
+        :class:`TypeMatchError` carries type names directly; every other
+        failure is described by its spec, since its free-form message may
+        embed actual (sensitive) values.
+        """
+        if isinstance(error, TypeMatchError):
+            # TypeMatchError args = (fmt, expected_type, actual_type)
+            expected_type, actual_type = error.args[1], error.args[2]
+            return self.record(expected_type.__name__, actual_type.__name__)
+        # free-form MatchError messages may contain actual values, so only
+        # describe the spec and mark the outcome as a generic mismatch.
+        return self.record(_describe_expected(spec), 'mismatch')
+
+    def checkpoint(self):
+        return len(self.problems)
+
+    def rollback(self, checkpoint):
+        del self.problems[checkpoint:]
+
+    @contextmanager
+    def at(self, segment):
+        self._path.append(segment)
+        try:
+            yield
+        finally:
+            self._path.pop()
+
+
+@contextmanager
+def _without_collector(scope):
+    """Run a speculative branch with multi-error collection suspended.
+
+    Restores the default raise-on-first-failure semantics inside the branch,
+    so branching specs (Or, list alternatives, dict-key probes) can detect
+    failure via exceptions without recording problems. The suspension is
+    scoped to this context manager and unwinds cleanly however nested the
+    scope becomes.
+    """
+    depth = scope.get(MATCH_SUSPEND, 0)
+    scope[MATCH_SUSPEND] = depth + 1
+    try:
+        yield
+    finally:
+        if depth == 0:
+            del scope.maps[0][MATCH_SUSPEND]
+        else:
+            scope.maps[0][MATCH_SUSPEND] = depth
+
+
+def _collection_active(scope):
+    """Return the active collector, or None when collection is suspended."""
+    if scope.get(MATCH_SUSPEND, 0):
+        return None
+    return scope.get(MATCH_COLLECTOR)
 
 
 class Match:
@@ -139,21 +378,91 @@ class Match:
        spec: The glomspec representing the pattern to match data against.
        default: The default value to be returned if a match fails. If not
          set, a match failure will raise a :class:`MatchError`.
+       multi_error: When ``True``, independent sibling fields are all
+          checked instead of stopping at the first failure, and a
+          :class:`MultiMatchError` (carrying an ordered list of
+          :class:`MatchProblem` objects) is raised if anything fails.
+          Defaults to ``False``, preserving the original
+          first-failure behavior.
+       max_problems: Optional cap on the number of problems collected in
+          multi-error mode. Once the cap is reached, remaining traversal is
+          skipped and the result is flagged as truncated. ``None`` removes
+          the cap. Defaults to :data:`DEFAULT_MAX_PROBLEMS`.
 
     """
-    def __init__(self, spec, default=_MISSING):
+    def __init__(self, spec, default=_MISSING, multi_error=False,
+                 max_problems=DEFAULT_MAX_PROBLEMS):
         self.spec = spec
         self.default = default
+        self.multi_error = multi_error
+        self.max_problems = max_problems
+
+    def _run(self, target, scope):
+        if not self.multi_error:
+            return scope[glom](target, self.spec, scope), None
+        collector = _collection_active(scope)
+        if collector is None:
+            # Write the collector into the current top map (which already
+            # carries MODE and friends) rather than adding an empty child
+            # map, which would shadow them for _glom's pmap lookups.
+            collector = _MatchCollector(max_problems=self.max_problems)
+            scope.maps[0][MATCH_COLLECTOR] = collector
+        child_scope = scope
+        try:
+            result = child_scope[glom](target, self.spec, child_scope)
+        except GlomError as error:
+            # Only record here when nothing deeper handled the failure.
+            # Container handlers record their own problems and should not
+            # reach this path, but a leaf/scalar failure at the root does.
+            if not collector.problems:
+                collector.record_error(self.spec, error)
+            result = target
+        return result, collector
 
     def glomit(self, target, scope):
         scope[MODE] = _glom_match
+        collector = None
         try:
-            ret = scope[glom](target, self.spec, scope)
+            ret, collector = self._run(target, scope)
         except GlomError:
             if self.default is _MISSING:
                 raise
             ret = arg_val(target, self.default, scope)
+        if collector is not None and collector.problems:
+            if self.default is not _MISSING:
+                return arg_val(target, self.default, scope)
+            raise MultiMatchError(collector.problems, collector.truncated)
         return ret
+
+    def collect(self, target, max_problems=_MISSING):
+        """Run the match in multi-error mode without raising.
+
+        Args:
+          target: Target value or data structure to match against.
+          max_problems: Optional override for the maximum number of
+            :class:`MatchProblem` objects to collect. Once reached, further
+            traversal stops and the returned :class:`MatchReport` is marked
+            truncated. Pass ``None`` to disable the cap.
+
+        Returns:
+          MatchReport: an ordered list of problems plus a truncation flag.
+          Actual target values are never included.
+
+        >>> report = Match({'id': int, 'name': str}).collect(
+        ...     {'id': 'x', 'name': 1})
+        >>> report.ok
+        False
+        >>> [p.as_dict() for p in report.problems]
+        [{'path': ['id'], 'expected': 'int', 'actual_type': 'str'}, {'path': ['name'], 'expected': 'str', 'actual_type': 'int'}]
+        """
+        cap = self.max_problems if max_problems is _MISSING else max_problems
+        spec = Match(self.spec, multi_error=True, max_problems=cap)
+        collector = _MatchCollector(max_problems=cap)
+        try:
+            spec.glomit(target, _new_match_scope(target, collector))
+        except MultiMatchError as error:
+            return MatchReport(error.problems, error.truncated)
+        return MatchReport(collector.problems, collector.truncated)
 
     def verify(self, target):
         """A convenience function a :class:`Match` instance which returns the
@@ -187,6 +496,28 @@ class Match:
 
     def __repr__(self):
         return f'{self.__class__.__name__}({bbrepr(self.spec)})'
+
+
+def _new_match_scope(target, collector):
+    # Mirror the scope that the top-level glom() builds, but start directly
+    # in match mode so the collector is visible from the root. Imported
+    # lazily because several of these names are defined later in core.
+    from .core import (
+        _DEFAULT_SCOPE, Path, Inspect, AUTO, MIN_MODE, CHILD_ERRORS,
+        ScopeVars, UP, ROOT)
+    scope = _DEFAULT_SCOPE.new_child({
+        Path: [],
+        Inspect: None,
+        MODE: AUTO,
+        MIN_MODE: None,
+        CHILD_ERRORS: [],
+        MATCH_COLLECTOR: collector,
+        'globals': ScopeVars({}, {}),
+    })
+    scope[UP] = scope
+    scope[ROOT] = scope
+    scope[T] = target
+    return scope
 
 
 _RE_FULLMATCH = getattr(re, "fullmatch", None)
@@ -316,6 +647,19 @@ class And(_Bool):
     def _glomit(self, target, scope):
         # all children must match without exception
         result = target  # so that And() == True, similar to all([]) == True
+        collector = _collection_active(scope)
+        if collector is not None:
+            # And short-circuits like the default raise mode: the first
+            # failing child is reported once, remaining children are skipped.
+            for child in self.children:
+                try:
+                    with _without_collector(scope):
+                        result = scope[glom](target, child, scope)
+                except GlomError:
+                    collector.record(_describe_expected(child),
+                                     type(target).__name__)
+                    return target
+            return result
         for child in self.children:
             result = scope[glom](target, child, scope)
         return result
@@ -335,6 +679,25 @@ class Or(_Bool):
     __slots__ = ('children',)
 
     def _glomit(self, target, scope):
+        collector = _collection_active(scope)
+        if collector is not None:
+            # An Or is a single decision at this path: if any child succeeds,
+            # the whole Or succeeds and no branch's failures may leak. Probe
+            # each child with the collector hidden (restoring raise
+            # semantics); if all fail, record one summary problem here.
+            successful = False
+            for child in self.children:
+                try:
+                    with _without_collector(scope):
+                        result = scope[glom](target, child, scope)
+                except GlomError:
+                    continue
+                successful = True
+                break
+            if successful:
+                return result
+            collector.record(_describe_expected(self), _type_name(target))
+            return target
         for child in self.children[:-1]:
             try:  # one child must match without exception
                 return scope[glom](target, child, scope)
@@ -675,7 +1038,13 @@ def _precedence(match):
 
 
 def _handle_dict(target, spec, scope):
+    collector = _collection_active(scope)
     if not isinstance(target, dict):
+        if collector is not None:
+            # Record the parent type problem and stop descending: inventing
+            # missing-child errors for a non-dict parent would be misleading.
+            collector.record('dict', type(target).__name__)
+            return target
         raise TypeMatchError(type(target), dict)
     spec_keys = spec  # cheating a little bit here, list-vs-dict, but saves an object copy sometimes
 
@@ -687,6 +1056,9 @@ def _handle_dict(target, spec, scope):
         key.key: key.default for key in spec_keys
         if type(key) is Optional and key.default is not _MISSING}
     result = {}
+    if collector is not None:
+        return _handle_dict_collect(
+            target, spec, scope, spec_keys, required, defaults, result, collector)
     for key, val in target.items():
         for maybe_spec_key in spec_keys:
             # handle Required as a special case here rather than letting it be a stand-alone spec
@@ -711,52 +1083,191 @@ def _handle_dict(target, spec, scope):
     return result
 
 
+def _handle_dict_collect(target, spec, scope, spec_keys, required,
+                         defaults, result, collector):
+    if collector.full():
+        collector.truncated = True
+        return result
+    # Each target key and each required spec key is an independent sibling,
+    # so failures are recorded and matching continues with the next sibling.
+    for key, val in target.items():
+        if collector.full():
+            collector.truncated = True
+            break
+        matched = False
+        for maybe_spec_key in spec_keys:
+            spec_key = maybe_spec_key.key if type(maybe_spec_key) is Required else maybe_spec_key
+            try:
+                with _without_collector(scope):
+                    matched_key = scope[glom](key, spec_key, scope)
+            except GlomError:
+                continue
+            with collector.at(matched_key):
+                try:
+                    matched_val = scope[glom](
+                        val, spec[maybe_spec_key], scope)
+                except GlomError as error:
+                    collector.record_error(spec[maybe_spec_key], error)
+                    result[matched_key] = val
+                else:
+                    result[matched_key] = matched_val
+            required.discard(maybe_spec_key)
+            matched = True
+            break
+        if not matched:
+            collector.record('one of ' + bbrepr(list(spec_keys)), type(key).__name__)
+    if not collector.full():
+        for key in set(defaults) - set(result):
+            result[key] = arg_val(target, defaults[key], scope)
+    if not collector.full():
+        for missing in spec_keys:
+            if missing not in required:
+                continue
+            key = missing.key if type(missing) is Required else missing
+            with collector.at(key):
+                collector.record(_describe_expected(key), 'missing')
+            if collector.full():
+                collector.truncated = True
+                break
+    return result
+
+
 def _glom_match(target, spec, scope):
+    collector = _collection_active(scope)
     if isinstance(spec, type):
         if not isinstance(target, spec):
+            if collector is not None:
+                collector.record(spec.__name__, type(target).__name__)
+                return target
             raise TypeMatchError(type(target), spec)
     elif isinstance(spec, dict):
         return _handle_dict(target, spec, scope)
     elif isinstance(spec, (list, set, frozenset)):
         if not isinstance(target, type(spec)):
+            if collector is not None:
+                collector.record(type(spec).__name__, type(target).__name__)
+                return target
             raise TypeMatchError(type(target), type(spec))
         result = []
-        for item in target:
-            for child in spec:
-                try:
-                    result.append(scope[glom](item, child, scope))
+        if collector is not None:
+            for index, item in enumerate(target):
+                if collector.full():
+                    collector.truncated = True
                     break
-                except GlomError as e:
-                    last_error = e
-            else:  # did not break, something went wrong
-                if target and not spec:
-                    raise MatchError(
-                        "{0!r} does not match empty {1}", target, type(spec).__name__)
-                # NOTE: unless error happens above, break will skip else branch
-                # so last_error will have been assigned
-                raise last_error
+                with collector.at(index):
+                    matched = False
+                    children = list(spec)
+                    successful_child = None
+                    for child in children:
+                        try:
+                            with _without_collector(scope):
+                                scope[glom](item, child, scope)
+                            successful_child = child
+                            break
+                        except GlomError:
+                            pass
+                    if successful_child is not None:
+                        # Re-run the clean effective branch with collection
+                        # active so its nested problems still get reported.
+                        result.append(scope[glom](item, successful_child, scope))
+                        matched = True
+                    if not matched:
+                        if not spec:
+                            collector.record(
+                                'non-empty ' + type(spec).__name__, type(item).__name__)
+                        else:
+                            # Every candidate failed under raise semantics.
+                            # For a single structural (container) candidate,
+                            # re-run with collection active so its internal
+                            # problems are reported; otherwise emit one
+                            # summary without leaking each alternative.
+                            first_child = children[0]
+                            if len(children) == 1 and isinstance(
+                                    first_child, (dict, list, tuple,
+                                                  set, frozenset)):
+                                before = collector.checkpoint()
+                                try:
+                                    result.append(scope[glom](
+                                        item, first_child, scope))
+                                except GlomError as error:
+                                    collector.rollback(before)
+                                    collector.record_error(first_child, error)
+                                if collector.checkpoint() == before:
+                                    result.append(item)
+                                    collector.record(
+                                        'one of ' + bbrepr(children),
+                                        type(item).__name__)
+                            else:
+                                result.append(item)
+                                collector.record(
+                                    'one of ' + bbrepr(children),
+                                    type(item).__name__)
+        else:
+            for item in target:
+                for child in spec:
+                    try:
+                        result.append(scope[glom](item, child, scope))
+                        break
+                    except GlomError as e:
+                        last_error = e
+                else:  # did not break, something went wrong
+                    if target and not spec:
+                        raise MatchError(
+                            "{0!r} does not match empty {1}", target, type(spec).__name__)
+                    # NOTE: unless error happens above, break will skip else branch
+                    # so last_error will have been assigned
+                    raise last_error
         if type(spec) is not list:
             return type(spec)(result)
         return result
     elif isinstance(spec, tuple):
         if not isinstance(target, tuple):
+            if collector is not None:
+                collector.record('tuple', type(target).__name__)
+                return target
             raise TypeMatchError(type(target), tuple)
         if len(target) != len(spec):
+            if collector is not None:
+                collector.record(
+                    'tuple of length %d' % len(spec),
+                    'tuple of length %d' % len(target))
+                return target
             raise MatchError("{0!r} does not match {1!r}", target, spec)
         result = []
-        for sub_target, sub_spec in zip(target, spec):
-            result.append(scope[glom](sub_target, sub_spec, scope))
+        if collector is not None:
+            for index, (sub_target, sub_spec) in enumerate(zip(target, spec)):
+                if collector.full():
+                    collector.truncated = True
+                    break
+                with collector.at(index):
+                    try:
+                        result.append(scope[glom](sub_target, sub_spec, scope))
+                    except GlomError as error:
+                        collector.record_error(sub_spec, error)
+                        result.append(sub_target)
+        else:
+            for sub_target, sub_spec in zip(target, spec):
+                result.append(scope[glom](sub_target, sub_spec, scope))
         return tuple(result)
     elif callable(spec):
         try:
             if spec(target):
                 return target
         except Exception as e:
+            if collector is not None:
+                collector.record(_describe_expected(spec), type(target).__name__)
+                return target
             raise MatchError(
                 "{0}({1!r}) did not validate (got exception {2!r})", spec.__name__, target, e)
+        if collector is not None:
+            collector.record(_describe_expected(spec), type(target).__name__)
+            return target
         raise MatchError(
             "{0}({1!r}) did not validate (non truthy return)", spec.__name__, target)
     elif target != spec:
+        if collector is not None:
+            collector.record(_describe_expected(spec), type(target).__name__)
+            return target
         raise MatchError("{0!r} does not match {1!r}", target, spec)
     return target
 
@@ -846,14 +1357,22 @@ class Switch:
 
 
     def glomit(self, target, scope):
+        collector = _collection_active(scope)
         for keyspec, valspec in self.cases:
             try:
-                scope[glom](target, keyspec, scope)
+                if collector is not None:
+                    with _without_collector(scope):
+                        scope[glom](target, keyspec, scope)
+                else:
+                    scope[glom](target, keyspec, scope)
             except GlomError as ge:
                 continue
             return scope[glom](target, valspec, chain_child(scope))
         if self.default is not _MISSING:
             return arg_val(target, self.default, scope)
+        if collector is not None:
+            collector.record(_describe_expected(self), type(target).__name__)
+            return target
         raise MatchError("no matches for target in %s"  % self.__class__.__name__)
 
     def __repr__(self):

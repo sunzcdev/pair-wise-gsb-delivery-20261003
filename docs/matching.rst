@@ -47,6 +47,47 @@ and :class:`~glom.Optional`.
 
 .. autoclass:: glom.Required
 
+Collecting multiple errors
+~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+By default a :class:`~glom.Match` stops at the first failing location and
+raises a single :class:`~glom.MatchError`. When validating a large or nested
+payload it is often more useful to keep checking the independent sibling
+fields and report every problem at once.
+
+Call :meth:`~glom.Match.collect` to run a match in multi-error mode without
+raising. It returns a :class:`~glom.MatchReport` holding an ordered list of
+:class:`~glom.MatchProblem` objects, each with a ``path``, an ``expected``
+description, and an ``actual_type``:
+
+  >>> report = Match({'id': int, 'name': str}).collect({'id': 'x', 'name': 1})
+  >>> report.ok
+  False
+  >>> [problem.as_dict() for problem in report.problems]
+  [{'path': ['id'], 'expected': 'int', 'actual_type': 'str'}, {'path': ['name'], 'expected': 'str', 'actual_type': 'int'}]
+
+A few rules keep the report actionable and safe:
+
+- A parent whose type is wrong is reported once; its would-be children are
+  not fabricated as missing.
+- :class:`~glom.Optional`, optional defaults, and :class:`~glom.Or` keep
+  their usual meaning. An :class:`~glom.Or` with any successful branch leaks
+  none of its failed branches.
+- ``max_problems`` caps how many problems are collected. Once reached,
+  further traversal stops and the report is marked ``truncated`` (pass
+  ``None`` to remove the cap).
+- Actual target values are never included, only type names and safe spec
+  descriptions, so sensitive payloads do not appear in the structured report.
+
+The same mode is available as a raising spec through
+``Match(spec, multi_error=True)``, which raises :class:`~glom.MultiMatchError`.
+
+.. autoclass:: glom.MatchProblem
+
+.. autoclass:: glom.MatchReport
+
+.. autoclass:: glom.MultiMatchError
+
 ``M`` Expressions
 ~~~~~~~~~~~~~~~~~
 

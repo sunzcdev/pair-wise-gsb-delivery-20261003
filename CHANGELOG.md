@@ -12,6 +12,18 @@ The glom team's approach to updates can be summed up as:
 Check this page when upgrading, we strive to keep the updates
 summarized and well-linked.
 
+## Unreleased
+
+- Add optional multi-error mode to `Match`. `Match.collect()` returns a
+  `MatchReport` with an ordered list of `MatchProblem` objects (path,
+  expected type/spec, actual type) instead of stopping at the first failure.
+  `Match(..., multi_error=True)` raises the structured `MultiMatchError`.
+  Independent sibling fields are all checked, a wrong parent type no longer
+  fabricates missing children, `Optional`/defaults/`Or` keep their semantics
+  (an `Or` with a successful branch leaks no branch failures), and a
+  configurable `max_problems` cap marks results truncated and stops traversal.
+  Structured reports never include actual target values.
+
 ## 25.12.0
 
 _(December 28, 2025)_
