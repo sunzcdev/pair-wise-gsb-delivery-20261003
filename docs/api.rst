@@ -126,6 +126,30 @@ Read the :ref:`Disk tutorial <tutorial-disk>` for details.
    :special-members:
    :exclude-members: __weakref__
 
+VersionedDisk
+-------------
+
+Disk with an explicit versioned encoding adaptation layer. New entries are
+tagged with an encoding version and callers register readers for old
+versions. Use :meth:`Cache.get <diskcache.Cache.get>` with ``migrate=True``,
+:meth:`Cache.migrate_key <diskcache.Cache.migrate_key>`, or
+:meth:`Cache.migrate <diskcache.Cache.migrate>` to re-encode stale entries.
+
+.. autoclass:: diskcache.VersionedDisk
+   :members:
+   :special-members:
+   :exclude-members: __weakref__
+
+EncodingVersionError
+--------------------
+
+.. autoexception:: diskcache.EncodingVersionError
+
+MigrationReport
+---------------
+
+.. autoclass:: diskcache.MigrationReport
+
 Timeout
 -------
 

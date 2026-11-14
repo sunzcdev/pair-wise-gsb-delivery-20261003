@@ -2,6 +2,7 @@
 """
 
 import codecs
+import collections
 import contextlib as cl
 import errno
 import functools as ft
@@ -370,6 +371,348 @@ class JSONDisk(Disk):
         if not read:
             data = json.loads(zlib.decompress(data).decode('utf-8'))
         return data
+
+
+class EncodingVersionError(Exception):
+    """No reader registered for the encoding version of a stored value.
+
+    Raised when a cache entry was written with an encoding version for which
+    no reader has been registered on the disk. Unlike :exc:`IOError`, this
+    error is never treated as a cache miss: it propagates to the caller so
+    the missing reader may be diagnosed rather than the entry being silently
+    overwritten.
+
+    The `version`, `readers`, and `key` attributes are available for
+    diagnostics:
+
+    .. attribute:: version
+
+        Encoding version recorded in the stored entry.
+
+    .. attribute:: readers
+
+        Tuple of versions for which a reader is registered.
+
+    .. attribute:: key
+
+        Cache key of the entry, when known.
+
+    """
+
+    def __init__(self, version, readers=(), key=UNKNOWN):
+        self.version = version
+        self.readers = tuple(readers)
+        self.key = key
+        super().__init__(version, self.readers, key)
+
+    def __str__(self):
+        return (
+            'no encoding reader registered for version %r'
+            ' (registered readers: %r, key: %r)'
+        ) % (self.version, self.readers, self.key)
+
+
+class MigrationReport(
+    collections.namedtuple('MigrationReport', 'migrated conflicted failed')
+):
+    """Report returned by :meth:`Cache.migrate <diskcache.Cache.migrate>`.
+
+    .. attribute:: migrated
+
+        List of keys re-encoded to the current encoding version.
+
+    .. attribute:: conflicted
+
+        List of keys skipped because a concurrent writer replaced the value
+        before the migration could commit.
+
+    .. attribute:: failed
+
+        List of ``(key, error)`` pairs for entries that could not be read or
+        re-encoded, for example due to a missing version reader.
+
+    """
+
+    __slots__ = ()
+
+
+class VersionedDisk(Disk):
+    """Cache value serialization with explicit encoding versions.
+
+    Disk may be customized for serialization, but entries written with an old
+    encoding often become unreadable after the encoding is changed.
+    `VersionedDisk` tags every new entry with a header recording the encoding
+    `version`. The version is identified from the header alone; the content
+    format is never guessed. Callers register readers for old versions so
+    that entries written by previous encodings remain readable:
+
+    >>> import json
+    >>> def writer(value):
+    ...     return json.dumps(value).encode('utf-8')
+    >>> def reader(data):
+    ...     return json.loads(data.decode('utf-8'))
+    >>> class JsonDiskV1(VersionedDisk):
+    ...     def __init__(self, directory, **kwargs):
+    ...         super().__init__(
+    ...             directory, version=1, writer=writer, reader=reader,
+    ...             **kwargs
+    ...         )
+    >>> cache = Cache(disk=JsonDiskV1)
+    >>> cache['key'] = [1, 2, 3]
+    >>> cache['key']
+    [1, 2, 3]
+    >>> directory = cache.directory
+    >>> cache.close()
+
+    Reopening the cache with a new encoding version requires registering a
+    reader for the old version:
+
+    >>> class JsonDiskV2(VersionedDisk):
+    ...     def __init__(self, directory, **kwargs):
+    ...         super().__init__(
+    ...             directory, version=2, writer=writer, reader=reader,
+    ...             readers={1: reader}, **kwargs
+    ...         )
+    >>> cache = Cache(directory, disk=JsonDiskV2)
+    >>> cache['key']
+    [1, 2, 3]
+    >>> report = cache.migrate()
+    >>> report.migrated
+    ['key']
+    >>> cache.close()
+
+    Without a registered reader, a diagnosable error is raised rather than
+    treating the entry as a cache miss:
+
+    >>> class JsonDiskV3(VersionedDisk):
+    ...     def __init__(self, directory, **kwargs):
+    ...         super().__init__(
+    ...             directory, version=3, writer=writer, reader=reader,
+    ...             **kwargs
+    ...         )
+    >>> cache = Cache(directory, disk=JsonDiskV3)
+    >>> cache['key']
+    Traceback (most recent call last):
+        ...
+    diskcache.core.EncodingVersionError: no encoding reader registered for version 2 (registered readers: (3,), key: 'key')
+    >>> 'key' in cache
+    True
+    >>> cache.disk.register_reader(2, reader)
+    >>> cache['key']
+    [1, 2, 3]
+    >>> cache.close()
+
+    Entries written by the base :class:`Disk` class (or legacy modes of
+    older databases) have no version header. They are read with the base
+    implementation and reported as version 0, which makes them eligible for
+    migration to the current version.
+
+    Values stored with ``read=True`` are opaque bytes and are stored without
+    a version header, matching the base :class:`Disk` behavior.
+
+    """
+
+    MAGIC = b'DCEV'
+    HEADER = struct.Struct('>4sI')
+
+    def __init__(
+        self,
+        directory,
+        version=1,
+        writer=None,
+        reader=None,
+        readers=None,
+        **kwargs,
+    ):
+        """Initialize versioned disk instance.
+
+        :param str directory: directory path
+        :param int version: encoding version tagged on new entries
+        :param callable writer: encoder for new entries, ``value -> bytes``
+            (default None, pickle with `pickle_protocol`)
+        :param callable reader: decoder for entries at `version`,
+            ``bytes -> value`` (default None, ``pickle.loads``)
+        :param dict readers: mapping of old encoding versions to decoder
+            callables
+        :param kwargs: super class arguments
+
+        """
+        if version < 1:
+            raise ValueError('version must be >= 1 (0 is reserved for legacy)')
+        self.version = version
+        self._writer = writer
+        self._readers = dict(readers) if readers else {}
+        self._readers[version] = reader if reader is not None else pickle.loads
+        super().__init__(directory, **kwargs)
+
+    @property
+    def readers(self):
+        """Mapping of encoding version to registered decoder."""
+        return dict(self._readers)
+
+    def register_reader(self, version, reader):
+        """Register `reader` to decode entries tagged with `version`.
+
+        :param int version: encoding version of stored entries
+        :param callable reader: decoder, ``bytes -> value``
+        :raises ValueError: if `version` is invalid or `reader` not callable
+
+        """
+        if version < 1:
+            raise ValueError('version must be >= 1 (0 is reserved for legacy)')
+        if not callable(reader):
+            raise ValueError('reader must be callable')
+        self._readers[version] = reader
+
+    def _encode(self, value):
+        """Encode `value` with the current writer and version header."""
+        writer = self._writer
+
+        if writer is None:
+            payload = pickle.dumps(value, protocol=self.pickle_protocol)
+        else:
+            payload = writer(value)
+
+        return self.HEADER.pack(self.MAGIC, self.version) + payload
+
+    def _decode(self, version, payload):
+        """Decode `payload` with the reader registered for `version`.
+
+        :raises EncodingVersionError: if no reader is registered
+
+        """
+        reader = self._readers.get(version)
+
+        if reader is None:
+            raise EncodingVersionError(version, sorted(self._readers))
+
+        return reader(payload)
+
+    def _split_header(self, data):
+        """Split `data` into (version, payload) pair.
+
+        Data without the explicit magic header is legacy data and reported
+        as version 0. The content itself is never inspected to guess the
+        encoding format.
+
+        """
+        if len(data) >= self.HEADER.size and data[:4] == self.MAGIC:
+            _, version = self.HEADER.unpack(data[: self.HEADER.size])
+            return version, data[self.HEADER.size :]
+        return 0, data
+
+    def store(self, value, read, key=UNKNOWN):
+        """Convert `value` to fields size, mode, filename, and value for Cache
+        table.
+
+        Values are encoded with the current writer and prefixed with an
+        explicit version header. Values stored with `read` set to True are
+        opaque bytes and stored without a header, like the base Disk.
+
+        :param value: value to convert
+        :param bool read: True when value is file-like object
+        :param key: key for item (default UNKNOWN)
+        :return: (size, mode, filename, value) tuple for Cache table
+
+        """
+        if read:
+            return super().store(value, read, key=key)
+
+        data = self._encode(value)
+
+        if len(data) < self.min_file_size:
+            return 0, MODE_RAW, None, sqlite3.Binary(data)
+
+        filename, full_path = self.filename(key, value)
+        self._write(full_path, io.BytesIO(data), 'xb')
+        return len(data), MODE_BINARY, filename, None
+
+    def fetch(self, mode, filename, value, read):
+        """Convert fields `mode`, `filename`, and `value` from Cache table to
+        value.
+
+        Entries without a version header (written by the base Disk or legacy
+        modes) are read with the base implementation. Tagged entries are
+        decoded by the reader registered for their version.
+
+        :param int mode: value mode raw, binary, text, or pickle
+        :param str filename: filename of corresponding value
+        :param value: database value
+        :param bool read: when True, return an open file handle
+        :return: corresponding Python value
+        :raises EncodingVersionError: if no reader is registered for the
+            entry's encoding version
+        :raises: IOError if the value cannot be read
+
+        """
+        # pylint: disable=consider-using-with
+        if mode == MODE_BINARY:
+            full_path = op.join(self._directory, filename)
+
+            if read:
+                handle = open(full_path, 'rb')
+                header = handle.read(self.HEADER.size)
+
+                if len(header) != self.HEADER.size or header[:4] != self.MAGIC:
+                    # Legacy untagged file, return raw contents.
+                    handle.seek(0)
+
+                return handle
+
+            with open(full_path, 'rb') as reader:
+                data = reader.read()
+
+            version, payload = self._split_header(data)
+
+            if version == 0:
+                # Legacy untagged file, return raw contents.
+                return payload
+
+            return self._decode(version, payload)
+
+        if mode == MODE_RAW and isinstance(
+            value, (bytes, bytearray, memoryview)
+        ):
+            version, payload = self._split_header(bytes(value))
+
+            if version == 0:
+                # Legacy raw bytes stored directly by Disk.
+                return payload
+
+            return self._decode(version, payload)
+
+        # Legacy modes: raw scalars, text files, and pickles.
+        return super().fetch(mode, filename, value, read)
+
+    def peek_version(self, mode, filename, value):
+        """Return the encoding version of stored fields without decoding.
+
+        Legacy entries without a version header are reported as version 0.
+
+        :param int mode: value mode raw, binary, text, or pickle
+        :param str filename: filename of corresponding value
+        :param value: database value
+        :return: encoding version
+
+        """
+        if mode == MODE_BINARY:
+            full_path = op.join(self._directory, filename)
+
+            with open(full_path, 'rb') as reader:
+                header = reader.read(self.HEADER.size)
+
+            if len(header) == self.HEADER.size and header[:4] == self.MAGIC:
+                return self.HEADER.unpack(header)[1]
+
+            return 0
+
+        if mode == MODE_RAW and isinstance(
+            value, (bytes, bytearray, memoryview)
+        ):
+            version, _ = self._split_header(bytes(value))
+            return version
+
+        return 0
 
 
 class Timeout(Exception):
@@ -1128,11 +1471,19 @@ class Cache:
         expire_time=False,
         tag=False,
         retry=False,
+        migrate=False,
     ):
         """Retrieve value from cache. If `key` is missing, return `default`.
 
         Raises :exc:`Timeout` error when database timeout occurs and `retry` is
         `False` (default).
+
+        When `migrate` is True, a successful read of an entry stored with a
+        stale encoding version is followed by a best-effort migration to the
+        current encoding version. The migration commits only if no other
+        writer replaced the value in the meantime, and preserves the entry's
+        expire time and tag. Requires the disk to be a
+        :class:`VersionedDisk`.
 
         :param key: key for item
         :param default: value to return if key is missing (default None)
@@ -1142,10 +1493,19 @@ class Cache:
             (default False)
         :param bool tag: if True, return tag in tuple (default False)
         :param bool retry: retry if database timeout occurs (default False)
+        :param bool migrate: migrate stale encodings after read
+            (default False)
         :return: value for item or default if key not found
         :raises Timeout: if database timeout occurs
+        :raises EncodingVersionError: if no reader is registered for the
+            entry's encoding version
+        :raises ValueError: if `migrate` is True and disk is not a
+            VersionedDisk
 
         """
+        if migrate and not isinstance(self._disk, VersionedDisk):
+            raise ValueError('migrate requires disk to be a VersionedDisk')
+
         db_key, raw = self._disk.put(key)
         update_column = EVICTION_POLICY[self.eviction_policy]['get']
         select = (
@@ -1174,6 +1534,11 @@ class Cache:
             except IOError:
                 # Key was deleted before we could retrieve result.
                 return default
+            except EncodingVersionError as error:
+                # Never treated as a cache miss; attach key and propagate.
+                if error.key is UNKNOWN:
+                    error.key = key
+                raise
 
         else:  # Slow path, transaction required.
             cache_hit = (
@@ -1202,6 +1567,11 @@ class Cache:
                     if self.statistics:
                         sql(cache_miss)
                     return default
+                except EncodingVersionError as error:
+                    # Never treated as a cache miss; attach key and propagate.
+                    if error.key is UNKNOWN:
+                        error.key = key
+                    raise
 
                 if self.statistics:
                     sql(cache_hit)
@@ -1211,6 +1581,13 @@ class Cache:
 
                 if update_column is not None:
                     sql(update % update_column.format(now=now), (rowid,))
+
+        if migrate:
+            # Best-effort re-encode of stale entries. Conflicts with
+            # concurrent writers and transient errors must not fail the read
+            # itself; encoding errors were already raised by fetch above.
+            with cl.suppress(Exception):
+                self.migrate_key(key, retry=True)
 
         if expire_time and tag:
             return (value, db_expire_time, db_tag)
@@ -2018,6 +2395,152 @@ class Cache:
                         )
 
             return warns
+
+    def migrate_key(self, key, retry=False):
+        """Migrate the stored encoding of `key` to the current disk version.
+
+        The entry is decoded with the reader registered for its stored
+        encoding version and re-encoded with the current writer. The update
+        commits only if the original value has not been replaced by another
+        writer (compare-and-swap on the row's store time, mode, and
+        filename). The expire time and tag of the entry are preserved.
+
+        File-backed values are re-encoded to a new file so that, when the
+        migration fails or conflicts, the old file remains in place and
+        readable with the old reader.
+
+        Raises :exc:`Timeout` error when database timeout occurs and `retry` is
+        `False` (default).
+
+        :param key: key for item
+        :param bool retry: retry if database timeout occurs (default False)
+        :return: one of 'migrated', 'conflict', 'current', or 'missing'
+        :raises EncodingVersionError: if no reader is registered for the
+            entry's encoding version
+        :raises Timeout: if database timeout occurs
+        :raises ValueError: if disk is not a VersionedDisk
+
+        """
+        disk = self._disk
+
+        if not isinstance(disk, VersionedDisk):
+            raise ValueError('migrate_key requires disk to be a VersionedDisk')
+
+        now = time.time()
+        db_key, raw = disk.put(key)
+
+        with self._transact(retry) as (sql, cleanup):
+            rows = sql(
+                'SELECT rowid, store_time, mode, filename, value FROM Cache'
+                ' WHERE key = ? AND raw = ?'
+                ' AND (expire_time IS NULL OR expire_time > ?)',
+                (db_key, raw, now),
+            ).fetchall()
+
+            if not rows:
+                return 'missing'
+
+            (rowid, store_time, mode, filename, db_value) = rows[0]
+
+            if disk.peek_version(mode, filename, db_value) == disk.version:
+                return 'current'
+
+            # Decode with the reader registered for the stored version.
+            # Raises EncodingVersionError when no reader is registered.
+            value = disk.fetch(mode, filename, db_value, False)
+
+            # Re-encode with the current version. File values are written to
+            # a new file so the old file remains readable until commit.
+            size, new_mode, new_filename, new_db_value = disk.store(
+                value, False, key=key
+            )
+
+            # Compare-and-swap: commit only if no other writer replaced the
+            # value. The expire_time and tag columns are left untouched so
+            # the TTL and tag are preserved.
+            cursor = sql(
+                'UPDATE Cache SET size = ?, mode = ?, filename = ?, value = ?'
+                ' WHERE rowid = ? AND store_time = ? AND mode = ?'
+                ' AND COALESCE(filename, "") = COALESCE(?, "")',
+                (
+                    size,
+                    new_mode,
+                    new_filename,
+                    new_db_value,
+                    rowid,
+                    store_time,
+                    mode,
+                    filename,
+                ),
+            )
+
+            if cursor.rowcount == 0:
+                # Another writer replaced the value. Discard the new file
+                # and leave the old entry (and file) untouched.
+                cleanup(new_filename)
+                return 'conflict'
+
+            # Commit succeeded; the old file is no longer referenced.
+            cleanup(filename)
+            return 'migrated'
+
+    def migrate(self, batch_size=100, retry=False):
+        """Migrate entries with stale encodings to the current disk version.
+
+        Entries are scanned in small batches of `batch_size` rows and each
+        stale entry is migrated like :meth:`Cache.migrate_key`. Concurrent
+        writes may occur between batches.
+
+        The returned report distinguishes migrated keys, keys skipped due to
+        conflicting concurrent writes, and keys that failed to read or
+        re-encode (for example due to a missing version reader).
+
+        :param int batch_size: number of rows scanned per batch
+            (default 100)
+        :param bool retry: retry if database timeout occurs (default False)
+        :return: MigrationReport with migrated, conflicted, and failed items
+        :raises Timeout: if database timeout occurs
+        :raises ValueError: if disk is not a VersionedDisk
+
+        """
+        disk = self._disk
+
+        if not isinstance(disk, VersionedDisk):
+            raise ValueError('migrate requires disk to be a VersionedDisk')
+
+        migrated = []
+        conflicted = []
+        failed = []
+        rowid = 0
+        select = (
+            'SELECT rowid, key, raw FROM Cache'
+            ' WHERE rowid > ? ORDER BY rowid LIMIT ?'
+        )
+
+        while True:
+            rows = self._sql(select, (rowid, batch_size)).fetchall()
+
+            if not rows:
+                break
+
+            for rowid, db_key, raw in rows:
+                key = disk.get(db_key, raw)
+
+                try:
+                    status = self.migrate_key(key, retry=retry)
+                except Timeout:
+                    raise
+                except Exception as error:  # pylint: disable=broad-except
+                    # Includes EncodingVersionError for missing readers and
+                    # IOError for unreadable files.
+                    failed.append((key, error))
+                else:
+                    if status == 'migrated':
+                        migrated.append(key)
+                    elif status == 'conflict':
+                        conflicted.append(key)
+
+        return MigrationReport(migrated, conflicted, failed)
 
     def create_tag_index(self):
         """Create tag index on cache database.
