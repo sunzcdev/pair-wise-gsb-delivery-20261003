@@ -71,6 +71,27 @@ def expand_year(year):
         return 1900 + year
 
 
+# Visual FoxPro field flags. These are found in byte 18 of the field
+# descriptor, which the DBFField struct stores in the low byte of
+# 'reserved1'.
+VFP_FLAG_SYSTEM = 0x01
+VFP_FLAG_NULLABLE = 0x02
+VFP_FLAG_BINARY = 0x04
+
+# Name of the hidden Visual FoxPro field that stores the null bit map.
+# (Compared case-insensitively.)
+NULLFLAGS_FIELD_NAME = '_nullflags'
+
+
+def _null_bit_is_set(bitmap, index):
+    """Check if bit ``index`` is set in a Visual FoxPro null bit map.
+
+    ``bitmap`` is a ``bytearray`` where bit 0 of byte 0 belongs to the
+    first field in the table.
+    """
+    return bool(bitmap[index >> 3] & (1 << (index & 7)))
+
+
 class RecordIterator(object):
     def __init__(self, table, record_type):
         self._record_type = record_type
@@ -125,6 +146,12 @@ class DBF(object):
         self.header = None
         self.fields = []       # namedtuples
         self.field_names = []  # strings
+
+        # Filled in by self._read_field_headers(). These describe the
+        # Visual FoxPro null bit map (the hidden '_NullFlags' field).
+        self._all_fields = []       # all fields, including '_NullFlags'
+        self._nullflags_index = None
+        self._nullable_indices = set()
 
         with open(self.filename, mode='rb') as infile:
             self._read_header(infile)
@@ -245,9 +272,68 @@ class DBF(object):
             if self.lowernames:
                 field.name = field.name.lower()
 
-            self.field_names.append(field.name)
+            self._all_fields.append(field)
 
-            self.fields.append(field)
+        self._setup_null_flags()
+
+    def _setup_null_flags(self):
+        """Look for the Visual FoxPro null flags field.
+
+        Visual FoxPro stores null values in a hidden system field
+        named '_NullFlags' (type '0'). The field is a bit map with one
+        bit per field in the table (including itself). A set bit means
+        the value of the corresponding field is NULL. A field can only
+        be NULL if it is marked as nullable in its field flags.
+
+        The '_NullFlags' field is an implementation detail and is
+        removed from ``self.fields`` so it doesn't show up as a normal
+        data column. (It is still available in ``self._all_fields``
+        and is included in records in raw mode.)
+        """
+        for index, field in enumerate(self._all_fields):
+            # The Visual FoxPro field flags are stored in the low byte
+            # of 'reserved1' (byte 18 of the field descriptor).
+            flags = field.reserved1 & 0xff
+
+            if (field.type == '0' and
+                    field.name.lower() == NULLFLAGS_FIELD_NAME and
+                    self._nullflags_index is None):
+                self._nullflags_index = index
+            elif flags & VFP_FLAG_NULLABLE:
+                self._nullable_indices.add(index)
+
+        for index, field in enumerate(self._all_fields):
+            if index != self._nullflags_index:
+                self.fields.append(field)
+                self.field_names.append(field.name)
+
+    def _check_nullflags(self, record_number, bitmap):
+        """Check the null flags layout for a record.
+
+        Raises ValueError (with the position of the record) if the
+        field layout or the length of the null bit map is invalid.
+        """
+        offset = self.header.headerlen + record_number * self.header.recordlen
+        where = 'record {} (byte offset {})'.format(record_number, offset)
+
+        if self._nullflags_index is None:
+            if self._nullable_indices:
+                raise ValueError(
+                    '{}: table has nullable fields but no '
+                    '_NullFlags field'.format(where))
+            else:
+                # No null flags in this table.
+                return
+
+        # The bit map must have room for one bit per field in the
+        # table (including the _NullFlags field itself).
+        expected = (len(self._all_fields) + 7) // 8
+        if len(bitmap) < expected:
+            raise ValueError(
+                '{}: _NullFlags field is too short: '
+                'expected at least {} byte(s) for {} fields, '
+                'got {}'.format(where, expected,
+                                len(self._all_fields), len(bitmap)))
 
     def _open_memofile(self):
         if self.memofilename and not self.raw:
@@ -315,14 +401,61 @@ class DBF(object):
             skip_record = self._skip_record
             read = infile.read
 
+            # In raw mode the record is returned exactly as stored,
+            # including the '_NullFlags' field.
+            if self.raw:
+                fields = self._all_fields
+            else:
+                fields = self.fields
+            nullflags_index = self._nullflags_index
+            nullable_indices = self._nullable_indices
+            nullflags_checked = False
+
+            record_number = 0
             while True:
                 sep = read(1)
 
                 if sep == record_type:
-                    items = [
-                        (field.name, parse(field, read(field.length)))
-                        for field in self.fields
-                    ]
+                    if self.raw or nullflags_index is None:
+                        if not (self.raw or nullflags_checked):
+                            # Nullable fields without a '_NullFlags'
+                            # field is an invalid layout.
+                            self._check_nullflags(record_number, b'')
+                            nullflags_checked = True
+
+                        items = [
+                            (field.name, parse(field, read(field.length)))
+                            for field in fields
+                        ]
+                    else:
+                        # The record is read according to the full
+                        # field layout, which includes the hidden
+                        # '_NullFlags' field.
+                        data = [read(field.length)
+                                for field in self._all_fields]
+
+                        if not nullflags_checked:
+                            self._check_nullflags(record_number,
+                                                  data[nullflags_index])
+                            nullflags_checked = True
+
+                        # bytearray is used because indexing it returns
+                        # an integer in both Python 2 and 3.
+                        bitmap = bytearray(data[nullflags_index])
+                        items = []
+                        for index, field in enumerate(self._all_fields):
+                            if index == nullflags_index:
+                                continue
+                            elif (index in nullable_indices and
+                                    _null_bit_is_set(bitmap, index)):
+                                # The null bit map says this value is
+                                # NULL, no matter what is stored in the
+                                # field.
+                                value = None
+                            else:
+                                value = parse(field, data[index])
+                            items.append((field.name, value))
+
                     yield self.recfactory(items)
 
                 elif sep in (b'\x1a', b''):
@@ -330,6 +463,8 @@ class DBF(object):
                     break
                 else:
                     skip_record(infile)
+
+                record_number += 1
 
     def __iter__(self):
         if self.loaded:

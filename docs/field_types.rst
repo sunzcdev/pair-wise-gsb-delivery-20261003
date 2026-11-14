@@ -41,6 +41,16 @@ The '0' field type is used for '_NullFlags' in Visual FoxPro.  It was
 mistakenly though to always be one byte long and was interpreted as an
 integer. From 2.0.1 on it is returned as a byte string.
 
+Visual FoxPro stores null values in the hidden '_NullFlags' system
+field, which is a bit map with one bit per field. If a field is marked
+as nullable in its field flags and its bit is set in the bit map, the
+value is returned as ``None`` no matter what is stored in the
+field. Values that are not flagged as null keep their normal meaning,
+so 0, empty strings and empty dates are not affected. The
+'_NullFlags' field itself is not included in records or in
+``field_names``. (In raw mode records are returned exactly as stored,
+including the '_NullFlags' field.)
+
 The 'V' field is an alternative character field used by Visual
 FoxPro. The binary version of this field is not yet supported. (See
 https://msdn.microsoft.com/en-us/library/st4a0s68%28VS.80%29.aspx for

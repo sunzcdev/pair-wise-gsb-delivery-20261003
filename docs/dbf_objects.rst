@@ -121,7 +121,8 @@ date
 
 field_names
   A list of field names in the order they appear in the file. This can
-  for example be used to produce the header line in a CSV file.
+  for example be used to produce the header line in a CSV file. The
+  hidden Visual FoxPro '_NullFlags' field is not included.
 
 encoding
   Character encoding used in the file. This is determined by the

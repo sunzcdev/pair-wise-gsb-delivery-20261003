@@ -7,6 +7,13 @@ Release History
 (Next Version)
 ^^^^^^^^^^^^^^^^^^
 
+* added support for Visual FoxPro null flags. Values of nullable
+  fields whose bit is set in the hidden '_NullFlags' bit map field are
+  now returned as ``None``. The '_NullFlags' field no longer shows up
+  as a normal data column (it is still included in records in raw
+  mode). Invalid field layouts and null bit maps that are too short
+  now raise ``ValueError`` with the position of the offending record.
+
 * records are now returned ``dict`` instead of ``collections.OrderedDict``
   in Python 3.7 and up (as well as CPython 3.6) since normal Python
   dictionaries are now ordered.
