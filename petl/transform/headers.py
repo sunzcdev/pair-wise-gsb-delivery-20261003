@@ -8,7 +8,7 @@ from petl.compat import next, text_type
 from petl.errors import FieldSelectionError
 
 
-from petl.util.base import Table, asindices, rowgetter
+from petl.util.base import Table, asindices, rowgetter, FieldOccurrence
 
 
 def rename(table, *args, **kwargs):
@@ -52,6 +52,13 @@ def rename(table, *args, **kwargs):
     If any nonexistent fields are specified, the default behaviour is to raise
     a `FieldSelectionError`. However, if `strict` keyword argument is `False`, any
     nonexistent fields specified will be silently ignored.
+
+    For headers with duplicated field names, a
+    :class:`petl.util.base.FieldOccurrence` (e.g.
+    ``FieldOccurrence('foo', 2)``) renames only that specific occurrence,
+    whereas a plain field name still renames every column with that name.
+    Renaming one occurrence onto an existing name creates another duplicate
+    header, which is preserved rather than removed.
     """
 
     return RenameView(table, *args, **kwargs)
@@ -86,16 +93,35 @@ def iterrename(source, spec, strict):
     except StopIteration:
         hdr = []
     flds = list(map(text_type, hdr))
-    if strict:
-        for x in spec:
-            if isinstance(x, int):
-                if x < 0 or x >= len(hdr):
-                    raise FieldSelectionError(x)
-            elif x not in flds:
-                raise FieldSelectionError(x)
-    outhdr = [spec[i] if i in spec
-              else spec[f] if f in spec
-              else f
+    # index of each field that should be given a new name
+    renames = dict()
+    for selector, newname in spec.items():
+        if isinstance(selector, (int, FieldOccurrence)) and \
+                not isinstance(selector, bool):
+            # integer positions (including negative positions) and
+            # FieldOccurrence references point at a single concrete field
+            try:
+                selected = asindices(hdr, (selector,))
+            except FieldSelectionError:
+                if strict:
+                    raise
+                continue
+            for idx in selected:
+                if idx < 0:
+                    idx += len(hdr)
+                renames[idx] = newname
+        else:
+            # field names keep their historical behaviour and rename every
+            # column carrying that name, including duplicated headers
+            name = text_type(selector)
+            matched = False
+            for idx, f in enumerate(flds):
+                if f == name:
+                    renames[idx] = newname
+                    matched = True
+            if not matched and strict:
+                raise FieldSelectionError(selector)
+    outhdr = [renames[i] if i in renames else f
               for i, f in enumerate(flds)]
     yield tuple(outhdr)
     for row in it:

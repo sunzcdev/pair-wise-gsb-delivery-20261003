@@ -19,6 +19,8 @@ Basic utilities
 .. autofunction:: petl.util.base.rowgroupby
 .. autofunction:: petl.util.base.empty
 
+.. autoclass:: petl.util.base.FieldOccurrence
+
 
 Visualising tables
 ------------------

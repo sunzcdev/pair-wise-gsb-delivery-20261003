@@ -4,6 +4,13 @@ Changes
 Version 1.7.32
 --------------
 
+* Add :class:`petl.util.base.FieldOccurrence`, an unambiguous field selector
+  pairing a field name with a 1-based occurrence number for tables with
+  duplicated headers. It is accepted by ``cut()``, ``cutout()``,
+  ``rename()`` and the field conversions alongside field names and integer
+  (including negative) positions; an unknown occurrence raises
+  ``FieldSelectionError``.
+
 * Preserve explicit iterator headers across repeated passes in ``fromtext()``.
   By :user:`IlyaKhalafi`.
 

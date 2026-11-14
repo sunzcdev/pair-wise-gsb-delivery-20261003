@@ -2,7 +2,8 @@ from __future__ import absolute_import, print_function, division
 
 
 from petl.util.base import Table, Record, values, distinctvalues, header, data, \
-    fieldnames, records, dicts, namedtuples, expr, rowgroupby, empty, wrap
+    fieldnames, records, dicts, namedtuples, expr, rowgroupby, empty, wrap, \
+    FieldOccurrence
 
 from petl.util.lookups import lookup, lookupone, dictlookup, dictlookupone, \
     recordlookup, recordlookupone

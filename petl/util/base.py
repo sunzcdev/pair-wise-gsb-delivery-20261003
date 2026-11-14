@@ -12,7 +12,7 @@ from petl.compat import imap, izip, izip_longest, ifilter, ifilterfalse, \
     reduce, next, string_types, text_type, PY3
 
 
-from petl.errors import FieldSelectionError
+from petl.errors import ArgumentError, FieldSelectionError
 from petl.comparison import comparable_itemgetter
 
 
@@ -282,16 +282,85 @@ class TableWrapper(Table):
 wrap = TableWrapper
 
 
+class FieldOccurrence(tuple):
+    """Reference a field by its name together with an occurrence number.
+
+    Field names are not guaranteed to be unique. Where a header contains more
+    than one field with the same name, a plain field name can only address the
+    first unused occurrence. Pairing the name with a 1-based occurrence number
+    makes the selection unambiguous, e.g. ``FieldOccurrence('foo', 2)`` selects
+    the second field named ``'foo'``.
+
+    Instances behave like the equivalent ``(name, occurrence)`` tuple, so they
+    can be combined freely with field names and integer (including negative)
+    positions anywhere a field selection is accepted.
+
+    E.g.::
+
+        >>> import petl as etl
+        >>> from petl import FieldOccurrence
+        >>> table = [['foo', 'bar', 'foo'],
+        ...          [1, 2, 3],
+        ...          [4, 5]]
+        >>> list(etl.cut(table, FieldOccurrence('foo', 2)))
+        [('foo',), (3,), (None,)]
+
+    A plain field name keeps its existing behaviour (the first unused
+    occurrence), while the occurrence number makes duplicated headers
+    unambiguous. A missing occurrence raises a
+    :class:`petl.errors.FieldSelectionError`.
+
+    """
+
+    def __new__(cls, field, occurrence):
+        if not isinstance(occurrence, int) or isinstance(occurrence, bool):
+            raise ArgumentError(
+                'field occurrence must be an integer, found %r' % (occurrence,)
+            )
+        if occurrence < 1:
+            raise ArgumentError(
+                'field occurrence must be at least 1, found %r' % (occurrence,)
+            )
+        return tuple.__new__(cls, (field, occurrence))
+
+    @property
+    def field(self):
+        return self[0]
+
+    @property
+    def occurrence(self):
+        return self[1]
+
+    def __repr__(self):
+        return 'FieldOccurrence(%r, %r)' % (self.field, self.occurrence)
+
+
 def asindices(hdr, spec):
-    """Convert the given field `spec` into a list of field indices."""
+    """Convert the given field `spec` into a list of field indices.
+
+    Each element of `spec` may be a field name, an integer field position
+    (including negative positions counted from the end) or a
+    :class:`FieldOccurrence` selecting a specific occurrence of a duplicated
+    field name.
+
+    """
 
     flds = list(map(text_type, hdr))
     indices = list()
-    if not isinstance(spec, (list, tuple)):
+    if isinstance(spec, FieldOccurrence) or not isinstance(spec, (list, tuple)):
         spec = (spec,)
     for s in spec:
-        # spec could be a field index (takes priority)
-        if isinstance(s, int) and s < len(hdr):
+        # spec could be an unambiguous duplicated field reference
+        if isinstance(s, FieldOccurrence):
+            name, occurrence = s
+            name = text_type(name)
+            matches = [i for i, f in enumerate(flds) if f == name]
+            if occurrence > len(matches):
+                raise FieldSelectionError(s)
+            indices.append(matches[occurrence - 1])
+        # spec could be a field index (takes priority); negative indices
+        # count from the end and are normalised by the caller
+        elif isinstance(s, int) and s < len(hdr):
             indices.append(s)  # index fields from 0
         # spec could be a field
         elif s in flds:

@@ -9,7 +9,8 @@ from petl.compat import izip, izip_longest, next, string_types, text_type
 
 
 # internal dependencies
-from petl.util.base import asindices, rowgetter, Record, Table
+from petl.util.base import asindices, rowgetter, Record, Table, \
+    FieldOccurrence
 
 
 import logging
@@ -97,6 +98,12 @@ def cut(table, *args, **kwargs):
         | 'E' |  12 |
         +-----+-----+
 
+    Where a header contains duplicated field names, use
+    :class:`petl.util.base.FieldOccurrence` to select a specific occurrence
+    unambiguously, e.g. ``FieldOccurrence('foo', 2)`` selects the second
+    field named ``'foo'``. It can be mixed with field names and integer
+    (including negative) positions.
+
     Note that any short rows will be padded with `None` values (or whatever is
     provided via the `missing` keyword argument).
 
@@ -104,8 +111,10 @@ def cut(table, *args, **kwargs):
 
     """
 
-    # support passing a single list or tuple of fields
-    if len(args) == 1 and isinstance(args[0], (list, tuple)):
+    # support passing a single list or tuple of fields (a FieldOccurrence
+    # is itself a tuple but represents one selector, not a field sequence)
+    if len(args) == 1 and isinstance(args[0], (list, tuple)) and \
+            not isinstance(args[0], FieldOccurrence):
         args = args[0]
 
     return CutView(table, args, **kwargs)
@@ -185,7 +194,8 @@ def cutout(table, *args, **kwargs):
 
     """
 
-    if len(args) == 1 and isinstance(args[0], (list, tuple)):
+    if len(args) == 1 and isinstance(args[0], (list, tuple)) and \
+            not isinstance(args[0], FieldOccurrence):
         args = args[0]
 
     return CutOutView(table, args, **kwargs)
@@ -215,6 +225,8 @@ def itercutout(source, spec, missing=None):
     except StopIteration:
         hdr = []
     indicesout = asindices(hdr, spec)
+    # normalise negative positions so they compare correctly
+    indicesout = [i + len(hdr) if i < 0 else i for i in indicesout]
     indices = [i for i in range(len(hdr)) if i not in indicesout]
 
     # define a function to transform each row in the source data

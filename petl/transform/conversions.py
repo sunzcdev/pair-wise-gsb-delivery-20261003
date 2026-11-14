@@ -6,7 +6,8 @@ from petl.compat import next, integer_types, string_types, text_type
 
 import petl.config as config
 from petl.errors import ArgumentError, FieldSelectionError
-from petl.util.base import Table, expr, fieldnames, Record
+from petl.util.base import Table, expr, fieldnames, Record, \
+    FieldOccurrence, asindices
 from petl.util.parsers import numparser
 
 
@@ -250,7 +251,9 @@ def convert(table, *args, **kwargs):
             conv = args[1]
         else:
             conv = args[1:]
-        if isinstance(field, (list, tuple)):  # allow for multiple fields
+        # a FieldOccurrence is itself a tuple but selects a single field
+        if isinstance(field, (list, tuple)) and \
+                not isinstance(field, FieldOccurrence):  # multiple fields
             for f in field:
                 converters[f] = conv
         else:
@@ -398,12 +401,16 @@ def iterfieldconvert(source, converters, failonerror, errorvalue, where,
     for k, c in converters.items():
 
         # turn field names into row indices
-        if not isinstance(k, integer_types):
+        if isinstance(k, FieldOccurrence):
+            k = asindices(hdr, (k,))[0]
+        elif not isinstance(k, integer_types):
             try:
                 k = flds.index(k)
             except ValueError:  # not in list
                 raise FieldSelectionError(k)
         assert isinstance(k, int), 'expected integer, found %r' % k
+        if k < 0:
+            k += len(hdr)
 
         # is converter a function?
         if callable(c):
