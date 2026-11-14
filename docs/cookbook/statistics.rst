@@ -53,6 +53,21 @@ You can roll up by multiple columns by chaining agate's :meth:`.Table.group_by` 
 
     doctors_by_state = patients.group_by("state").group_by('doctor')
 
+To compute several levels of subtotals at once, pass ``grouping_sets`` to :meth:`.TableSet.aggregate`. Each entry is a combination of grouping key names, and an empty combination ``()`` requests the grand total. Rows where a dimension is rolled up have ``None`` in that key column, and a boolean ``grouping_<key>`` column marks each level so that real null groups stay distinguishable from unused dimensions.
+
+.. code-block:: python
+
+    rollups = doctors_by_state.aggregate([
+        ('patient_count', agate.Count()),
+        ('age_mean', agate.Mean('age'))
+    ], grouping_sets=[
+        ('state',),
+        ('state', 'doctor'),
+        ()
+    ])
+
+Subtotals are recomputed from the underlying rows rather than from already aggregated values, so the grand-total mean is the mean of all rows, not the mean of the group means.
+
 Distribution by count (frequency)
 =================================
 

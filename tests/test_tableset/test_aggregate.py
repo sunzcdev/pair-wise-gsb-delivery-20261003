@@ -3,7 +3,7 @@ from decimal import Decimal
 
 from agate import Table, TableSet
 from agate.aggregations import Count, MaxLength, Mean, Min, Sum
-from agate.data_types import Number, Text
+from agate.data_types import Boolean, Number, Text
 from agate.exceptions import DataTypeError
 from agate.testcase import AgateTestCase
 
@@ -205,3 +205,321 @@ class TestAggregate(AgateTestCase):
         ])
         self.assertSequenceEqual(results.rows[('table1', 'a')], ('table1', 'a', 2, 4))
         self.assertSequenceEqual(results.rows[('table2', 'c')], ('table2', 'c', 1, 5))
+
+    def test_grouping_sets_structure(self):
+        tableset = TableSet(self.tables.values(), self.tables.keys(), key_name='test')
+
+        nested = tableset.group_by('letter')
+
+        results = nested.aggregate([
+            ('count', Count()),
+            ('number_sum', Sum('number'))
+        ], grouping_sets=[
+            ('test',),
+            ('test', 'letter'),
+            ()
+        ])
+
+        self.assertColumnNames(results, (
+            'test', 'letter', 'grouping_test', 'grouping_letter', 'count', 'number_sum'
+        ))
+        self.assertColumnTypes(results, [
+            Text, Text, Boolean, Boolean, Number, Number
+        ])
+
+    def test_grouping_sets_rows(self):
+        tableset = TableSet(self.tables.values(), self.tables.keys(), key_name='test')
+
+        nested = tableset.group_by('letter')
+
+        results = nested.aggregate([
+            ('count', Count()),
+            ('number_sum', Sum('number'))
+        ], grouping_sets=[
+            ('test',),
+            ('test', 'letter'),
+            ()
+        ])
+
+        self.assertRows(results, [
+            ('table1', None, False, True, 3, 6),
+            ('table2', None, False, True, 3, 7),
+            ('table3', None, False, True, 3, 6),
+            ('table1', 'a', False, False, 2, 4),
+            ('table1', 'b', False, False, 1, 2),
+            ('table2', 'b', False, False, 1, 0),
+            ('table2', 'a', False, False, 1, 2),
+            ('table2', 'c', False, False, 1, 5),
+            ('table3', 'a', False, False, 2, 3),
+            ('table3', 'c', False, False, 1, 3),
+            (None, None, True, True, 9, 19)
+        ])
+
+    def test_grouping_sets_row_names(self):
+        tableset = TableSet(self.tables.values(), self.tables.keys(), key_name='test')
+
+        nested = tableset.group_by('letter')
+
+        results = nested.aggregate([
+            ('count', Count())
+        ], grouping_sets=[
+            ('test',),
+            ()
+        ])
+
+        self.assertRowNames(results, [
+            ('table1', None),
+            ('table2', None),
+            ('table3', None),
+            (None, None)
+        ])
+
+    def test_grouping_sets_grand_total_recomputes_mean(self):
+        # Unequal group sizes so a mean of group means would be wrong.
+        table = Table((
+            ('a', 1),
+            ('a', 3),
+            ('a', 5),
+            ('b', 10)
+        ), ['letter', 'number'], [self.text_type, self.number_type])
+
+        tableset = table.group_by('letter')
+
+        results = tableset.aggregate([
+            ('count', Count()),
+            ('number_mean', Mean('number'))
+        ], grouping_sets=[
+            ('letter',),
+            ()
+        ])
+
+        self.assertRows(results, [
+            ('a', False, 3, Decimal(3)),
+            ('b', False, 1, Decimal(10)),
+            (None, True, 4, Decimal(19) / 4)
+        ])
+
+    def test_grouping_sets_null_group_distinct_from_rollup(self):
+        table = Table((
+            (None, 1),
+            (None, 3),
+            ('a', 2)
+        ), ['letter', 'number'], [self.text_type, self.number_type])
+
+        tableset = table.group_by('letter')
+
+        results = tableset.aggregate([
+            ('count', Count()),
+            ('number_sum', Sum('number'))
+        ], grouping_sets=[
+            ('letter',),
+            ()
+        ])
+
+        # A real null group keeps its None key but is marked as not rolled up,
+        # while the grand total has a rolled-up marker.
+        self.assertRows(results, [
+            (None, False, 2, 4),
+            ('a', False, 1, 2),
+            (None, True, 3, 6)
+        ])
+
+    def test_grouping_sets_empty_input_grand_total(self):
+        table = Table((), ['letter', 'number'], [self.text_type, self.number_type])
+
+        tableset = table.group_by('letter')
+
+        results = tableset.aggregate([
+            ('count', Count()),
+            ('number_sum', Sum('number')),
+            ('number_mean', Mean('number')),
+            ('number_min', Min('number'))
+        ], grouping_sets=[
+            ('letter',),
+            ()
+        ])
+
+        self.assertRows(results, [
+            (None, True, 0, 0, None, None)
+        ])
+
+    def test_grouping_sets_does_not_mutate_tableset(self):
+        tableset = TableSet(self.tables.values(), self.tables.keys(), key_name='test')
+
+        nested = tableset.group_by('letter')
+
+        def leaf_counts(tableset):
+            counts = []
+
+            for key, value in tableset.items():
+                if isinstance(value, TableSet):
+                    counts.extend((key,) + item for item in leaf_counts(value))
+                else:
+                    counts.append((key, len(value.rows)))
+
+            return counts
+
+        before = leaf_counts(nested)
+
+        nested.aggregate([
+            ('count', Count())
+        ], grouping_sets=[('test',), ()])
+
+        after = leaf_counts(nested)
+
+        self.assertEqual(before, after)
+
+    def test_grouping_sets_order_follows_request(self):
+        tableset = TableSet(self.tables.values(), self.tables.keys(), key_name='test')
+
+        nested = tableset.group_by('letter')
+
+        results = nested.aggregate([
+            ('count', Count())
+        ], grouping_sets=[
+            (),
+            ('test', 'letter'),
+            ('test',)
+        ])
+
+        self.assertSequenceEqual(
+            [tuple(row[2:4]) for row in results.rows],
+            [
+                (True, True),
+                (False, False),
+                (False, False),
+                (False, False),
+                (False, False),
+                (False, False),
+                (False, False),
+                (False, False),
+                (False, True),
+                (False, True),
+                (False, True)
+            ]
+        )
+
+    def test_grouping_sets_dimensions_normalized_to_hierarchy_order(self):
+        tableset = TableSet(self.tables.values(), self.tables.keys(), key_name='test')
+
+        nested = tableset.group_by('letter')
+
+        results = nested.aggregate([
+            ('count', Count())
+        ], grouping_sets=[
+            ('letter', 'test')
+        ])
+
+        first_row = tuple(results.rows[0])
+
+        self.assertEqual(first_row[0], 'table1')
+        self.assertEqual(first_row[1], 'a')
+
+    def test_grouping_sets_duplicate_rejected(self):
+        tableset = TableSet(self.tables.values(), self.tables.keys(), key_name='test')
+
+        nested = tableset.group_by('letter')
+
+        with self.assertRaises(ValueError):
+            nested.aggregate([
+                ('count', Count())
+            ], grouping_sets=[
+                ('test',),
+                ('test',)
+            ])
+
+    def test_grouping_sets_duplicate_after_normalization_rejected(self):
+        tableset = TableSet(self.tables.values(), self.tables.keys(), key_name='test')
+
+        nested = tableset.group_by('letter')
+
+        with self.assertRaises(ValueError):
+            nested.aggregate([
+                ('count', Count())
+            ], grouping_sets=[
+                ('test', 'letter'),
+                ('letter', 'test')
+            ])
+
+    def test_grouping_sets_unknown_key(self):
+        tableset = TableSet(self.tables.values(), self.tables.keys(), key_name='test')
+
+        nested = tableset.group_by('letter')
+
+        with self.assertRaises(KeyError):
+            nested.aggregate([
+                ('count', Count())
+            ], grouping_sets=[
+                ('nope',)
+            ])
+
+    def test_grouping_sets_non_sequence_member(self):
+        tableset = TableSet(self.tables.values(), self.tables.keys(), key_name='test')
+
+        nested = tableset.group_by('letter')
+
+        with self.assertRaises(ValueError):
+            nested.aggregate([
+                ('count', Count())
+            ], grouping_sets=[
+                'test'
+            ])
+
+    def test_grouping_sets_empty_sequence_rejected(self):
+        tableset = TableSet(self.tables.values(), self.tables.keys(), key_name='test')
+
+        nested = tableset.group_by('letter')
+
+        with self.assertRaises(ValueError):
+            nested.aggregate([
+                ('count', Count())
+            ], grouping_sets=[])
+
+    def test_grouping_sets_marker_name_collision_rejected(self):
+        tableset = TableSet(self.tables.values(), self.tables.keys(), key_name='test')
+
+        nested = tableset.group_by('letter')
+
+        with self.assertRaises(ValueError):
+            nested.aggregate([
+                ('grouping_letter', Count())
+            ], grouping_sets=[
+                ()
+            ])
+
+    def test_grouping_sets_single_level_tableset(self):
+        tableset = TableSet(self.tables.values(), self.tables.keys())
+
+        results = tableset.aggregate([
+            ('count', Count()),
+            ('number_sum', Sum('number'))
+        ], grouping_sets=[
+            ('group',),
+            ()
+        ])
+
+        self.assertColumnNames(results, (
+            'group', 'grouping_group', 'count', 'number_sum'
+        ))
+        self.assertRows(results, [
+            ('table1', False, 3, 6),
+            ('table2', False, 3, 7),
+            ('table3', False, 3, 6),
+            (None, True, 9, 19)
+        ])
+
+    def test_grouping_sets_default_behavior_unchanged(self):
+        tableset = TableSet(self.tables.values(), self.tables.keys())
+
+        new_table = tableset.aggregate([
+            ('count', Count()),
+            ('number_sum', Sum('number'))
+        ])
+
+        self.assertColumnNames(new_table, ('group', 'count', 'number_sum'))
+        self.assertColumnTypes(new_table, [Text, Number, Number])
+        self.assertRows(new_table, [
+            ('table1', 3, 6),
+            ('table2', 3, 7),
+            ('table3', 3, 6)
+        ])
