@@ -8,11 +8,26 @@ class LimitReader(object):
         self.stream = stream
         self.limit = limit
         self._orig_limit = limit
+        # set to True when the underlying stream ends before the full
+        # declared limit could be read (a short read / truncated record)
+        self.truncated = False
 
     def _update(self, buff):
         length = len(buff)
         self.limit -= length
+
+        # a read that returns nothing while bytes were still expected
+        # means the underlying stream ended before the declared length
+        if length == 0 and self.limit > 0:
+            self.truncated = True
+
         return buff
+
+    def _note_short_read(self, requested, buff):
+        # the underlying stream returned fewer bytes than asked for while
+        # the declared limit has not been exhausted: it ended early
+        if len(buff) < requested and self.limit > 0:
+            self.truncated = True
 
     def read(self, length=None):
         if length is not None:
@@ -24,6 +39,7 @@ class LimitReader(object):
             return b''
 
         buff = self.stream.read(length)
+        self._note_short_read(length, buff)
         return self._update(buff)
 
     def readline(self, length=None):
@@ -36,6 +52,13 @@ class LimitReader(object):
             return b''
 
         buff = self.stream.readline(length)
+        # readline returns early on a newline (normal), but a result that
+        # does not end in a newline means the underlying stream ended first:
+        # that is a short read while declared bytes remain
+        if buff and not buff.endswith(b'\n') and self.limit - len(buff) > 0:
+            self.truncated = True
+        elif len(buff) == 0 and self.limit > 0:
+            self.truncated = True
         return self._update(buff)
 
     def close(self):

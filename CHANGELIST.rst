@@ -1,6 +1,7 @@
 1.8.2
 ~~~~~
 
+- Add optional strict record length mode: ``ArcWarcRecordLoader`` and ``ArchiveIterator`` now accept a ``strict_length`` flag. In strict mode a missing, non-integer, negative or conflicting (duplicate) WARC/ARC length field raises ``StrictLengthError`` instead of being treated as a zero-length record, while a legitimate ``Content-Length: 0`` remains valid. Short reads (truncated bodies) and over-long declared lengths that cross the real record boundary are also errors, so parsing never guesses the next record or mistakes ``WARC/1.1`` text inside a body for a separator. Errors carry the record id and the archive offset. The default (lenient) behavior is unchanged. Note that the HTTP ``Content-Length`` is independent of the enclosing WARC record length and the two are not required to match.
 - Replace unmaintained brotlipy with brotlicffi>=1.2.1.0 by @ato https://github.com/webrecorder/warcio/pull/211
 - Add Content-Encoding: x-gzip as an alias for gzip by @sammist2 in https://github.com/webrecorder/warcio/pull/210
 

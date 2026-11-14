@@ -1,7 +1,7 @@
 from warcio.statusandheaders import StatusAndHeaders
 from warcio.statusandheaders import StatusAndHeadersParser
 from warcio.statusandheaders import StatusAndHeadersParserException
-from warcio.exceptions import ArchiveLoadFailed
+from warcio.exceptions import ArchiveLoadFailed, StrictLengthError
 
 from warcio.limitreader import LimitReader
 from warcio.digestverifyingreader import DigestVerifyingReader, DigestChecker
@@ -63,7 +63,16 @@ class ArcWarcRecordLoader(object):
     NON_HTTP_SCHEMES = ('dns:', 'whois:', 'ntp:')
     HTTP_SCHEMES = ('http:', 'https:')
 
-    def __init__(self, verify_http=True, arc2warc=True):
+    def __init__(self, verify_http=True, arc2warc=True, strict_length=False):
+        """
+        :param verify_http: verify the HTTP status line while parsing
+        :param arc2warc: present ARC records using WARC-style header names
+        :param strict_length: when True, raise :class:`StrictLengthError`
+            instead of silently treating a missing, non-integer, negative
+            or conflicting length as a zero-length record. Also enables
+            strict boundary checks (short reads, over-long declared
+            lengths and duplicate length fields) driven by the iterator.
+        """
         if arc2warc:
             self.arc_parser = ARC2WARCHeadersParser()
         else:
@@ -73,6 +82,8 @@ class ArcWarcRecordLoader(object):
         self.http_parser = StatusAndHeadersParser(self.HTTP_TYPES, verify_http)
 
         self.http_req_parser = StatusAndHeadersParser(self.HTTP_VERBS, verify_http)
+
+        self.strict_length = strict_length
 
     def parse_record_stream(self, stream,
                             statusline=None,
@@ -87,14 +98,21 @@ class ArcWarcRecordLoader(object):
         Pass statusline and known_format to detect_type_loader_headers()
         to facilitate parsing.
         """
+        # archive offset of the start of this record in the (decompressed)
+        # stream; used to annotate strict length errors. A stream that is
+        # not tell-able simply yields an offset of None.
+        record_offset = self._get_stream_offset(stream)
+
         (the_format, rec_headers) = (self.
                                      _detect_type_load_headers(stream,
                                                                statusline,
                                                                known_format))
 
+        record_id = self._get_record_id(the_format, rec_headers)
+
         if the_format == 'arc':
             uri = rec_headers.get_header('uri')
-            length = rec_headers.get_header('length')
+            length_header = 'length'
             content_type = rec_headers.get_header('content-type')
             sub_len = rec_headers.total_len
             if uri and uri.startswith('filedesc://'):
@@ -105,7 +123,7 @@ class ArcWarcRecordLoader(object):
         elif the_format in ('warc', 'arc2warc'):
             rec_type = rec_headers.get_header('WARC-Type')
             uri = self._ensure_target_uri_format(rec_headers)
-            length = rec_headers.get_header('Content-Length')
+            length_header = 'Content-Length'
             content_type = rec_headers.get_header('Content-Type')
             if the_format == 'warc':
                 sub_len = 0
@@ -113,20 +131,8 @@ class ArcWarcRecordLoader(object):
                 sub_len = rec_headers.total_len
                 the_format = 'warc'
 
-        is_err = False
-
-        try:
-            if length is not None:
-                length = int(length) - sub_len
-                if length < 0:
-                    is_err = True
-
-        except (ValueError, TypeError):
-            is_err = True
-
-        # err condition
-        if is_err:
-            length = 0
+        length = self._resolve_record_length(rec_headers, length_header,
+                                             sub_len, record_id, record_offset)
 
         is_verifying = False
         digest_checker = DigestChecker(check_digests)
@@ -159,6 +165,102 @@ class ArcWarcRecordLoader(object):
         return ArcWarcRecord(the_format, rec_type,
                              rec_headers, stream, http_headers,
                              content_type, length, payload_length=payload_length, digest_checker=digest_checker)
+
+    @staticmethod
+    def _get_stream_offset(stream):
+        """ Return the current position of stream, or None if the stream
+        does not support ``tell()``. The position marks where the record
+        begins in the (decompressed) archive stream.
+        """
+        try:
+            return stream.tell()
+        except Exception:
+            return None
+
+    @staticmethod
+    def _get_record_id(the_format, rec_headers):
+        """ Best-effort identifier for a record, used to annotate errors.
+
+        WARC records and ARC records presented as WARC use their
+        ``WARC-Record-ID``. Plain ARC records have no record id, so their
+        target URI is used instead.
+        """
+        record_id = rec_headers.get_header('WARC-Record-ID')
+        if record_id is not None:
+            return record_id
+
+        if the_format == 'arc':
+            return rec_headers.get_header('uri')
+
+        return None
+
+    def _strict_length_error(self, reason, record_id, offset):
+        raise StrictLengthError(reason, record_id=record_id, offset=offset)
+
+    def _resolve_record_length(self, rec_headers, length_header, sub_len,
+                               record_id, offset):
+        """ Resolve the record body length from its length header field.
+
+        In lenient mode the historical behavior is preserved: a missing,
+        non-integer or negative length is treated as a zero length so that
+        parsing can continue.
+
+        In strict mode each of those conditions is a distinct error, as is
+        a duplicated length field carrying conflicting values. A valid
+        ``Content-Length: 0`` is always accepted and remains distinguishable
+        from a missing or invalid field.
+        """
+        values = [value for name, value in rec_headers.headers
+                  if name.lower() == length_header.lower()]
+
+        if not values:
+            if self.strict_length:
+                self._strict_length_error(
+                    'missing {0} header'.format(length_header),
+                    record_id, offset)
+            # lenient: unknown length, read until end of stream
+            return None
+
+        # a length field must appear exactly once; two different values
+        # make the record boundary ambiguous
+        if len(values) > 1:
+            unique_values = set(values)
+            if len(unique_values) > 1:
+                if self.strict_length:
+                    self._strict_length_error(
+                        'conflicting {0} header values: {1}'.format(
+                            length_header, values),
+                        record_id, offset)
+                return 0
+            # identical duplicates are redundant but unambiguous; keep the
+            # single value and warn in lenient mode as well
+            logger.warning('duplicate %s header with identical value %s',
+                           length_header, values[0])
+
+        raw_length = values[0]
+
+        try:
+            declared_length = int(raw_length)
+        except (ValueError, TypeError):
+            if self.strict_length:
+                self._strict_length_error(
+                    'invalid {0} header value: {1!r}'.format(
+                        length_header, raw_length),
+                    record_id, offset)
+            return 0
+
+        length = declared_length - sub_len
+
+        if length < 0:
+            if self.strict_length:
+                self._strict_length_error(
+                    'negative record length: {0} header {1!r} is smaller '
+                    'than the {2} consumed header bytes'.format(
+                        length_header, raw_length, sub_len),
+                    record_id, offset)
+            return 0
+
+        return length
 
     def wrap_digest_verifying_stream(self, stream, rec_type, rec_headers, digest_checker, length=None):
         payload_digest = rec_headers.get_header('WARC-Payload-Digest')
