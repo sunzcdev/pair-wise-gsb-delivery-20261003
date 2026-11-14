@@ -28,18 +28,29 @@ def _to_bytes(chunk, warned: bool):
     raise TypeError("from_iter expects an iterable of bytes or str")
 
 
+_EOF = object()
+
+
 class IterReader:
     """File-like object backed by a byte iterator."""
 
     def __init__(self, byte_iter):
         self._iter = byte_iter
+        self._buffer = bytearray()
         self._warned = False
 
     def read(self, n: int) -> bytes:
         if n == 0:
             return b""
-        chunk, self._warned = _to_bytes(next(self._iter, b""), self._warned)
-        return chunk
+        while not self._buffer:
+            chunk = next(self._iter, _EOF)
+            if chunk is _EOF:
+                return b""
+            chunk, self._warned = _to_bytes(chunk, self._warned)
+            self._buffer.extend(chunk)
+        result = bytes(self._buffer[:n])
+        del self._buffer[:n]
+        return result
 
 
 class AiterReader:
@@ -47,13 +58,21 @@ class AiterReader:
 
     def __init__(self, byte_aiter):
         self._aiter = byte_aiter
+        self._buffer = bytearray()
         self._warned = False
 
     async def read(self, n: int) -> bytes:
         if n == 0:
             return b""
-        chunk, self._warned = _to_bytes(await anext(self._aiter, b""), self._warned)
-        return chunk
+        while not self._buffer:
+            chunk = await anext(self._aiter, _EOF)
+            if chunk is _EOF:
+                return b""
+            chunk, self._warned = _to_bytes(chunk, self._warned)
+            self._buffer.extend(chunk)
+        result = bytes(self._buffer[:n])
+        del self._buffer[:n]
+        return result
 
 
 def from_iter(byte_iter):
