@@ -93,6 +93,14 @@ class OptimizeError(SqlglotError):
     pass
 
 
+class TableRewriteError(SqlglotError):
+    pass
+
+
+class AmbiguousTableMappingError(TableRewriteError):
+    pass
+
+
 class SchemaError(SqlglotError):
     pass
 

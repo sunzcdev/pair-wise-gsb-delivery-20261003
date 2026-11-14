@@ -4,10 +4,11 @@ import itertools
 import logging
 import typing as t
 from collections import defaultdict
+from collections.abc import Mapping, Sequence
 from enum import Enum, auto
 
 from sqlglot import exp
-from sqlglot.errors import OptimizeError
+from sqlglot.errors import AmbiguousTableMappingError, OptimizeError, TableRewriteError
 from sqlglot.helper import find_new_name, mypyc_attr, seq_get
 from builtins import type as Type
 
@@ -15,6 +16,7 @@ logger = logging.getLogger("sqlglot")
 
 if t.TYPE_CHECKING:
     from sqlglot._typing import E
+    from sqlglot.dialects.dialect import DialectType
     from collections.abc import Iterator
 
 TRAVERSABLES = (exp.Query, exp.DDL, exp.DML)
@@ -716,6 +718,705 @@ def build_scope(expression: exp.Expr) -> Scope | None:
         The root scope
     """
     return seq_get(traverse_scope(expression), -1)
+
+
+class TableReferenceChange:
+    """A physical table reference that was rewritten."""
+
+    __slots__ = (
+        "old",
+        "new",
+        "path",
+        "line",
+        "column",
+        "start",
+        "end",
+        "old_expression",
+        "new_expression",
+    )
+
+    def __init__(
+        self,
+        old_expression: exp.Table,
+        new_expression: exp.Table,
+        path: tuple[tuple[str, int | None], ...],
+        dialect: DialectType = None,
+        source_sql: str | None = None,
+    ) -> None:
+        self.old_expression = old_expression
+        self.new_expression = new_expression
+        self.old = _table_name_sql(old_expression, dialect)
+        self.new = _table_name_sql(new_expression, dialect)
+        self.path = path
+
+        parts = old_expression.parts
+        first_meta = parts[0].meta if parts else {}
+        last_meta = parts[-1].meta if parts else {}
+        self.line = first_meta.get("line")
+        self.column = first_meta.get("col")
+        self.start = first_meta.get("start")
+        self.end = last_meta.get("end")
+
+        if source_sql is not None and self.start is not None:
+            self.line = source_sql.count("\n", 0, self.start) + 1
+            line_start = source_sql.rfind("\n", 0, self.start) + 1
+            self.column = self.start - line_start + 1
+
+    @property
+    def old_name(self) -> str:
+        return self.old
+
+    @property
+    def new_name(self) -> str:
+        return self.new
+
+    @property
+    def old_table(self) -> exp.Table:
+        return self.old_expression
+
+    @property
+    def new_table(self) -> exp.Table:
+        return self.new_expression
+
+    @property
+    def position(self) -> tuple[int | None, int | None]:
+        return self.line, self.column
+
+    def __iter__(self) -> Iterator[str | tuple[tuple[str, int | None], ...]]:
+        yield self.old
+        yield self.new
+        yield self.path
+
+    def __repr__(self) -> str:
+        return f"TableReferenceChange<{self.old} -> {self.new}>"
+
+    def __eq__(self, other: object) -> bool:
+        if isinstance(other, TableReferenceChange):
+            return (
+                self.old == other.old
+                and self.new == other.new
+                and self.path == other.path
+                and self.line == other.line
+                and self.column == other.column
+            )
+        return False
+
+
+class TableRewriteResult:
+    """The rewritten expression and the table references that changed."""
+
+    __slots__ = ("expression", "changes", "dialect", "source_sql")
+
+    def __init__(
+        self,
+        expression: exp.Expr,
+        changes: list[TableReferenceChange],
+        dialect: DialectType = None,
+        source_sql: str | None = None,
+    ) -> None:
+        self.expression = expression
+        self.changes = changes
+        self.dialect = dialect
+        self.source_sql = source_sql
+
+    @property
+    def sql(self) -> str:
+        if not self.changes and self.source_sql is not None:
+            return self.source_sql
+        return self.expression.sql(dialect=self.dialect)
+
+    @property
+    def rewritten_sql(self) -> str:
+        return str(self.sql)
+
+    @property
+    def changed_tables(self) -> list[TableReferenceChange]:
+        return self.changes
+
+    def to_sql(self, dialect: DialectType = None, **opts: t.Any) -> str:
+        return self.expression.sql(dialect=dialect or self.dialect, **opts)
+
+    def __iter__(self) -> Iterator[str | list[TableReferenceChange]]:
+        yield str(self.sql)
+        yield self.changes
+
+    def __str__(self) -> str:
+        return str(self.sql)
+
+    def __eq__(self, other: object) -> bool:
+        if isinstance(other, str):
+            return str(self) == other
+        if isinstance(other, exp.Expr):
+            return self.expression == other
+        if isinstance(other, TableRewriteResult):
+            return self.expression == other.expression and self.changes == other.changes
+        return False
+
+    def __repr__(self) -> str:
+        return f"TableRewriteResult<{str(self.sql)!r}, changes={len(self.changes)}>"
+
+
+def _table_from_parts(parts: Sequence[exp.Expr]) -> exp.Table:
+    if not 1 <= len(parts) <= 3:
+        raise TableRewriteError(
+            f"Expected a table path with 1 to 3 parts, got {len(parts)}: {parts}"
+        )
+
+    identifiers = [t.cast(exp.Identifier, part.copy()) for part in parts]
+    if len(identifiers) == 1:
+        return exp.Table(this=identifiers[0])
+    if len(identifiers) == 2:
+        return exp.Table(this=identifiers[1], db=identifiers[0])
+    return exp.Table(this=identifiers[2], db=identifiers[1], catalog=identifiers[0])
+
+
+def _identifier(value: str | exp.Identifier, dialect: DialectType) -> exp.Identifier:
+    if isinstance(value, exp.Identifier):
+        return value.copy()
+    return exp.parse_identifier(value, dialect=dialect)
+
+
+def _is_target_spec(value: object) -> bool:
+    return isinstance(value, Mapping) and ("table" in value or "name" in value)
+
+
+def _table_from_value(value: t.Any, dialect: DialectType, role: str) -> exp.Table:
+    if isinstance(value, exp.Table):
+        table = value.copy()
+    elif isinstance(value, exp.Identifier):
+        table = exp.Table(this=value.copy())
+    elif isinstance(value, str):
+        if not value.strip():
+            raise TableRewriteError(f"Empty {role} table name")
+        table = exp.to_table(value, dialect=dialect)
+    elif isinstance(value, Mapping):
+        catalog = value.get("catalog")
+        db = value.get("schema", value.get("db"))
+        name = value.get("table", value.get("name"))
+
+        if name is None:
+            raise TableRewriteError(f"The {role} table mapping is missing a table name")
+        if catalog is not None and db is None:
+            raise TableRewriteError(f"The {role} table mapping has a catalog but no schema")
+
+        identifiers: list[exp.Identifier] = []
+        for part in (catalog, db, name):
+            if part is not None:
+                identifiers.append(_identifier(part, dialect))
+        table = _table_from_parts(identifiers)
+    elif isinstance(value, (tuple, list)):
+        identifiers = [_identifier(part, dialect) for part in value if part is not None]
+        table = _table_from_parts(identifiers)
+    else:
+        raise TableRewriteError(f"Invalid {role} table name: {value!r}")
+
+    if not isinstance(table.this, exp.Identifier):
+        raise TableRewriteError(f"Expected an identifier for {role} table: {value!r}")
+    if len(table.parts) > 3:
+        raise TableRewriteError(f"Expected at most 3 parts for {role} table: {value!r}")
+
+    return table
+
+
+def _iter_mapping_entries(
+    mapping: Mapping[t.Any, t.Any] | Sequence[tuple[t.Any, t.Any]],
+    dialect: DialectType,
+    prefix: Sequence[exp.Identifier] = (),
+) -> Iterator[tuple[exp.Table, exp.Table]]:
+    if isinstance(mapping, Mapping):
+        for key, value in mapping.items():
+            source = _table_from_value(key, dialect, "source")
+            source_parts = [part.copy() for part in prefix] + [
+                part.copy() for part in source.parts
+            ]
+
+            if isinstance(value, Mapping) and not _is_target_spec(value):
+                if len(source_parts) >= 3:
+                    raise TableRewriteError(
+                        f"Table mapping path is too deeply nested: {source_parts}"
+                    )
+                yield from _iter_mapping_entries(value, dialect, source_parts)
+            else:
+                target = _table_from_value(value, dialect, "target")
+                yield _table_from_parts(source_parts), target
+        return
+
+    if isinstance(mapping, Sequence) and not isinstance(mapping, str):
+        for entry in mapping:
+            if isinstance(entry, Mapping) and "source" in entry and "target" in entry:
+                yield (
+                    _table_from_value(entry["source"], dialect, "source"),
+                    _table_from_value(entry["target"], dialect, "target"),
+                )
+                continue
+
+            if not isinstance(entry, (tuple, list)) or len(entry) != 2:
+                raise TableRewriteError(
+                    "Table mapping sequences must contain (source, target) pairs"
+                )
+            yield (
+                _table_from_value(entry[0], dialect, "source"),
+                _table_from_value(entry[1], dialect, "target"),
+            )
+        return
+
+    raise TableRewriteError(f"Invalid table mapping: {mapping!r}")
+
+
+def _normalize_identifier(
+    identifier: exp.Identifier, dialect: DialectType, is_table: bool = True
+) -> str:
+    from sqlglot.dialects.dialect import Dialect
+
+    identifier = identifier.copy()
+    identifier.meta["is_table"] = is_table
+    return Dialect.get_or_raise(dialect).normalize_identifier(identifier).this
+
+
+def _table_key(table: exp.Table, dialect: DialectType) -> tuple[str, ...]:
+    return tuple(
+        _normalize_identifier(t.cast(exp.Identifier, part), dialect) for part in table.parts
+    )
+
+
+def _identifier_signature(identifier: exp.Identifier) -> tuple[str, bool]:
+    return identifier.this, identifier.quoted
+
+
+def _table_signature(table: exp.Table) -> tuple[tuple[str, bool], ...]:
+    return tuple(
+        _identifier_signature(t.cast(exp.Identifier, part)) for part in table.parts
+    )
+
+
+def _display_table(table: exp.Table, dialect: DialectType) -> str:
+    return table.sql(dialect=dialect)
+
+
+def _table_name_sql(table: exp.Table, dialect: DialectType) -> str:
+    db = table.args.get("db")
+    catalog = table.args.get("catalog")
+    return exp.Table(
+        this=t.cast(exp.Identifier, table.this).copy() if table.this is not None else None,
+        db=t.cast(exp.Identifier, db).copy() if isinstance(db, exp.Expr) else None,
+        catalog=(
+            t.cast(exp.Identifier, catalog).copy()
+            if isinstance(catalog, exp.Expr)
+            else None
+        ),
+    ).sql(dialect=dialect)
+
+
+def _compile_table_mapping(
+    mapping: Mapping[t.Any, t.Any] | Sequence[tuple[t.Any, t.Any]],
+    dialect: DialectType,
+) -> dict[tuple[str, ...], tuple[exp.Table, exp.Table]]:
+    compiled: dict[tuple[str, ...], tuple[exp.Table, exp.Table]] = {}
+
+    for source, target in _iter_mapping_entries(mapping, dialect):
+        source_key = _table_key(source, dialect)
+        target_key = _table_key(target, dialect)
+        previous = compiled.get(source_key)
+
+        if previous is not None:
+            if _table_key(previous[1], dialect) != target_key or _table_signature(
+                previous[1]
+            ) != _table_signature(target):
+                raise AmbiguousTableMappingError(
+                    "Ambiguous table mapping: "
+                    f"{_display_table(previous[0], dialect)} maps to both "
+                    f"{_display_table(previous[1], dialect)} and "
+                    f"{_display_table(target, dialect)}"
+                )
+            continue
+
+        compiled[source_key] = (source, target)
+
+    for source_key, (source, target) in compiled.items():
+        target_key = _table_key(target, dialect)
+        chained = compiled.get(target_key)
+        if chained is not None and _table_signature(chained[1]) != _table_signature(target):
+            raise AmbiguousTableMappingError(
+                "Ambiguous table mapping: "
+                f"{_display_table(source, dialect)} maps to "
+                f"{_display_table(target, dialect)}, which is also a mapping source"
+            )
+
+    return compiled
+
+
+def _expression_path(expression: exp.Expr) -> tuple[tuple[str, int | None], ...]:
+    path: list[tuple[str, int | None]] = []
+    node = expression
+
+    while node.parent:
+        parent = node.parent
+        key = node.arg_key
+        if key:
+            value = parent.args.get(key)
+            if isinstance(value, list):
+                index = next(
+                    (i for i, candidate in enumerate(value) if candidate is node), None
+                )
+                path.append((key, index))
+            else:
+                path.append((key, None))
+        node = parent
+
+    path.reverse()
+    return tuple(path)
+
+
+def _same_table(left: exp.Table, right: exp.Table) -> bool:
+    return _table_signature(left) == _table_signature(right)
+
+
+def _set_table_name(table: exp.Table, target: exp.Table) -> None:
+    for arg in ("catalog", "db", "this"):
+        part = target.args.get(arg)
+        table.set(arg, part.copy() if isinstance(part, exp.Expr) else None)
+
+
+def _normalize_name(name: str, dialect: DialectType) -> str:
+    return _normalize_identifier(exp.parse_identifier(name, dialect=dialect), dialect, False)
+
+
+def _column_qualifier(column: exp.Column) -> tuple[exp.Identifier, ...]:
+    if not column.args.get("table"):
+        return ()
+
+    parts: list[exp.Identifier] = []
+    for arg in ("catalog", "db", "table"):
+        part = column.args.get(arg)
+        if part is None:
+            continue
+        if not isinstance(part, exp.Identifier):
+            return ()
+        parts.append(part)
+    return tuple(parts)
+
+
+def _qualifier_matches(
+    table: exp.Table, qualifier: Sequence[exp.Identifier], dialect: DialectType
+) -> bool:
+    table_parts = table.parts
+    if len(qualifier) > len(table_parts):
+        return False
+
+    return all(
+        _normalize_identifier(t.cast(exp.Identifier, left), dialect)
+        == _normalize_identifier(right, dialect)
+        for left, right in zip(table_parts[-len(qualifier) :], qualifier)
+    )
+
+
+def _column_qualifier_target(
+    column: exp.Column,
+    scope: Scope | None,
+    plans_by_table: dict[int, tuple[exp.Table, exp.Table, Scope | None]],
+    dialect: DialectType,
+) -> tuple[exp.Identifier, ...] | None:
+    qualifier = _column_qualifier(column)
+    if not qualifier or scope is None:
+        return None
+
+    qualifier_name = _normalize_identifier(qualifier[-1], dialect)
+    current: Scope | None = scope
+
+    while current is not None:
+        if len(qualifier) > 1:
+            sources = {
+                id(source): source
+                for source in current.sources.values()
+                if isinstance(source, exp.Table)
+                and _qualifier_matches(source, qualifier, dialect)
+            }
+            if sources:
+                if len(sources) != 1:
+                    return None
+
+                source = next(iter(sources.values()))
+                plan = plans_by_table.get(id(source))
+                if plan is None or source.alias:
+                    return None
+
+                target = plan[1]
+                target_parts = target.parts
+                count = min(len(qualifier), len(target_parts))
+                return tuple(
+                    t.cast(exp.Identifier, part)
+                    for part in target_parts[len(target_parts) - count :]
+                )
+
+            current = current.parent
+            continue
+
+        sources = [
+            source
+            for name, source in current.sources.items()
+            if _normalize_name(name, dialect) == qualifier_name
+        ]
+        if sources:
+            if len(sources) != 1 or not isinstance(sources[0], exp.Table):
+                return None
+
+            source = sources[0]
+            plan = plans_by_table.get(id(source))
+            if plan is None or source.alias or not _qualifier_matches(source, qualifier, dialect):
+                return None
+
+            target = plan[1]
+            target_parts = target.parts
+            count = min(len(qualifier), len(target_parts))
+            return tuple(
+                t.cast(exp.Identifier, part) for part in target_parts[len(target_parts) - count :]
+            )
+
+        current = current.parent
+
+    return None
+
+
+def _set_column_qualifier(column: exp.Column, qualifier: Sequence[exp.Identifier]) -> None:
+    column.set("catalog", qualifier[0].copy() if len(qualifier) == 3 else None)
+    column.set("db", qualifier[-2].copy() if len(qualifier) >= 2 else None)
+    column.set("table", qualifier[-1].copy())
+
+
+def _scope_tables(
+    expression: exp.Expr,
+) -> tuple[list[Scope], dict[int, Scope], dict[int, Scope]]:
+    scopes: list[Scope] = []
+    if isinstance(expression, exp.Block):
+        for statement in expression.expressions:
+            scopes.extend(traverse_scope(statement))
+    else:
+        scopes.extend(traverse_scope(expression))
+
+    by_table: dict[int, Scope] = {}
+    by_column: dict[int, Scope] = {}
+    for scope in scopes:
+        for table in scope.tables:
+            by_table[id(table)] = scope
+        for node in scope.walk():
+            if isinstance(node, exp.Column):
+                by_column[id(node)] = scope
+    return scopes, by_table, by_column
+
+
+def _validate_scope_ambiguities(
+    plans: Sequence[tuple[exp.Table, exp.Table, Scope | None]],
+    dialect: DialectType,
+) -> None:
+    by_scope: dict[int, list[tuple[exp.Table, exp.Table]]] = defaultdict(list)
+    scope_by_id: dict[int, Scope] = {}
+
+    for table, target, scope in plans:
+        if scope is not None:
+            by_scope[id(scope)].append((table, target))
+            scope_by_id[id(scope)] = scope
+
+    for scope_id, scope_plans in by_scope.items():
+        scope = scope_by_id[scope_id]
+        nonphysical_sources: dict[str, str] = {
+            _normalize_name(name, dialect): "CTE"
+            for name, source in scope.sources.items()
+            if isinstance(source, Scope) and source.is_cte
+        }
+
+        for table, target in scope_plans:
+            target_parts = target.parts
+            if len(target_parts) != 1:
+                continue
+
+            target_name = _normalize_identifier(t.cast(exp.Identifier, target_parts[0]), dialect)
+            source_kind = nonphysical_sources.get(target_name)
+            if source_kind:
+                raise AmbiguousTableMappingError(
+                    "Ambiguous table mapping target: "
+                    f"{_display_table(table, dialect)} maps to unqualified "
+                    f"{_display_table(target, dialect)}, which is also a visible "
+                    f"{source_kind} source"
+                )
+
+        planned_targets = {id(table): target for table, target in scope_plans}
+        target_counts: dict[tuple[str, ...], int] = defaultdict(int)
+        for _, node in scope.references:
+            if isinstance(node, exp.Table) and not node.alias:
+                target = planned_targets.get(id(node), node)
+                target_counts[_table_key(target, dialect)] += 1
+
+        for table, target in scope_plans:
+            if not table.alias and target_counts[_table_key(target, dialect)] > 1:
+                raise AmbiguousTableMappingError(
+                    "Ambiguous table mapping target: multiple unaliased sources in the "
+                    f"same scope map to {_display_table(target, dialect)}"
+                )
+
+        plans_by_name: dict[str, list[tuple[exp.Expr, exp.Expr]]] = defaultdict(list)
+        for name, node in scope.references:
+            final_name = _normalize_name(name, dialect)
+            target: exp.Table | None = None
+
+            if isinstance(node, exp.Table):
+                matching = next(
+                    (
+                        planned_target
+                        for planned_table, planned_target in scope_plans
+                        if planned_table is node
+                    ),
+                    None,
+                )
+                if matching is not None:
+                    target = matching
+                    if not node.alias:
+                        final_name = _normalize_identifier(
+                            t.cast(exp.Identifier, matching.parts[-1]), dialect
+                        )
+
+            plans_by_name[final_name].append((node, target if target is not None else node))
+
+        for final_name, entries in plans_by_name.items():
+            if len(entries) < 2:
+                continue
+
+            for node, target in entries:
+                if (
+                    isinstance(node, exp.Table)
+                    and target is not node
+                    and _table_key(t.cast(exp.Table, target), dialect)
+                    != _table_key(node, dialect)
+                ):
+                    raise AmbiguousTableMappingError(
+                        "Ambiguous table mapping target: multiple sources in the same "
+                        f"scope expose the name {final_name!r}"
+                    )
+
+
+def rewrite_table_references(
+    expression: exp.Expr | str | TableRewriteResult,
+    mapping: Mapping[t.Any, t.Any] | Sequence[tuple[t.Any, t.Any]] | None = None,
+    dialect: DialectType = None,
+    copy: bool = True,
+    *,
+    table_mapping: Mapping[t.Any, t.Any] | Sequence[tuple[t.Any, t.Any]] | None = None,
+) -> TableRewriteResult:
+    """Rewrite physical table references using catalog/schema/table mappings.
+
+    Mapping keys and values can be table paths, tuple/list paths, ``exp.Table``
+    instances, or target dictionaries with ``catalog``, ``schema`` and ``table``
+    keys. Nested ``{catalog: {schema: {table: target}}}`` mappings are supported.
+
+    Only physical tables are rewritten. CTE references, recursive CTE
+    self-references, derived table aliases and column identifiers are left
+    untouched. Qualified column prefixes bound to rewritten unaliased tables
+    are updated, while bare column names are never matched against table names.
+    Mapping and target ambiguities are checked before mutation.
+    """
+    from sqlglot import parse_one
+    from sqlglot.dialects.dialect import Dialect
+
+    if mapping is None:
+        mapping = table_mapping
+    elif table_mapping is not None:
+        raise TableRewriteError("Specify either mapping or table_mapping, not both")
+
+    if mapping is None:
+        raise TableRewriteError("A table mapping is required")
+
+    dialect = Dialect.get_or_raise(dialect)
+    compiled = _compile_table_mapping(mapping, dialect)
+
+    if isinstance(expression, TableRewriteResult):
+        expression = expression.expression
+
+    source_sql: str | None = None
+    if isinstance(expression, str):
+        source_sql = expression
+        root = parse_one(expression, read=dialect)
+        copy = False
+    else:
+        root = expression.copy() if copy else expression
+
+    _, table_scopes, column_scopes = _scope_tables(root)
+    plans: list[tuple[exp.Table, exp.Table, Scope | None]] = []
+
+    for table in root.find_all(exp.Table):
+        if not isinstance(table.this, exp.Identifier):
+            continue
+        if isinstance(table.parent, exp.JoinHint):
+            continue
+
+        scope = table_scopes.get(id(table))
+        if (
+            scope is not None
+            and not table.db
+            and not table.catalog
+            and isinstance(scope.sources.get(table.alias_or_name), Scope)
+        ):
+            continue
+
+        entry = compiled.get(_table_key(table, dialect))
+        if entry is None:
+            continue
+
+        target = entry[1]
+        if _same_table(table, target):
+            continue
+
+        plans.append((table, target, scope))
+
+    _validate_scope_ambiguities(plans, dialect)
+
+    plans_by_table = {id(table): (table, target, scope) for table, target, scope in plans}
+    column_plans: list[tuple[exp.Column, tuple[exp.Identifier, ...]]] = []
+    for column in root.find_all(exp.Column):
+        qualifier = _column_qualifier_target(
+            column,
+            column_scopes.get(id(column)),
+            plans_by_table,
+            dialect,
+        )
+        if qualifier is not None and _column_qualifier(column) != qualifier:
+            column_plans.append((column, qualifier))
+
+    changes: list[TableReferenceChange] = []
+    for table, target, _ in plans:
+        old_table = table.copy()
+        path = _expression_path(table)
+        _set_table_name(table, target)
+        changes.append(
+            TableReferenceChange(old_table, table.copy(), path, dialect, source_sql)
+        )
+
+    for column, qualifier in column_plans:
+        _set_column_qualifier(column, qualifier)
+
+    return TableRewriteResult(root, changes, dialect, source_sql)
+
+
+rewrite_tables = rewrite_table_references
+rewrite_table_names = rewrite_table_references
+
+
+def rewrite_table_sql(
+    sql: str,
+    mapping: Mapping[t.Any, t.Any] | Sequence[tuple[t.Any, t.Any]] | None = None,
+    dialect: DialectType = None,
+    copy: bool = True,
+    *,
+    table_mapping: Mapping[t.Any, t.Any] | Sequence[tuple[t.Any, t.Any]] | None = None,
+) -> str:
+    """Rewrite table references in SQL and return the generated SQL string."""
+    return str(
+        rewrite_table_references(
+            sql,
+            mapping,
+            dialect=dialect,
+            copy=copy,
+            table_mapping=table_mapping,
+        ).sql
+    )
 
 
 def _traverse_scope(scope: Scope) -> Iterator[Scope]:

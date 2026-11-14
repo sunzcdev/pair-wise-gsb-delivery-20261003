@@ -17,8 +17,10 @@ from sqlglot import expressions as exp
 from sqlglot.dialects.dialect import Dialect as Dialect, Dialects as Dialects
 from sqlglot.diff import diff as diff
 from sqlglot.errors import (
+    AmbiguousTableMappingError as AmbiguousTableMappingError,
     ErrorLevel as ErrorLevel,
     ParseError as ParseError,
+    TableRewriteError as TableRewriteError,
     TokenError as TokenError,
     UnsupportedError as UnsupportedError,
 )
@@ -50,6 +52,14 @@ from sqlglot.expressions import (
     union as union,
 )
 from sqlglot.generator import Generator as Generator
+from sqlglot.optimizer.scope import (
+    TableReferenceChange as TableReferenceChange,
+    TableRewriteResult as TableRewriteResult,
+    rewrite_table_names as rewrite_table_names,
+    rewrite_table_references as rewrite_table_references,
+    rewrite_table_sql as rewrite_table_sql,
+    rewrite_tables as rewrite_tables,
+)
 from sqlglot.parser import Parser as Parser
 from sqlglot.schema import MappingSchema as MappingSchema, Schema as Schema
 from sqlglot.tokens import Token as Token, Tokenizer as Tokenizer, TokenType as TokenType

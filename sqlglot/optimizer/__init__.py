@@ -23,12 +23,22 @@ _import_lock = threading.RLock()
 
 # Only for type checkers and IDEs; runtime resolution goes through __getattr__.
 if t.TYPE_CHECKING:
+    from sqlglot.errors import (
+        AmbiguousTableMappingError as AmbiguousTableMappingError,
+        TableRewriteError as TableRewriteError,
+    )
     from sqlglot.optimizer.optimizer import RULES as RULES, optimize as optimize
     from sqlglot.optimizer.scope import (
         Scope as Scope,
+        TableReferenceChange as TableReferenceChange,
+        TableRewriteResult as TableRewriteResult,
         build_scope as build_scope,
         find_all_in_scope as find_all_in_scope,
         find_in_scope as find_in_scope,
+        rewrite_table_names as rewrite_table_names,
+        rewrite_table_references as rewrite_table_references,
+        rewrite_table_sql as rewrite_table_sql,
+        rewrite_tables as rewrite_tables,
         traverse_scope as traverse_scope,
         walk_in_scope as walk_in_scope,
     )
@@ -37,11 +47,19 @@ if t.TYPE_CHECKING:
 # (e.g. `qualify` is both a function and a submodule).
 _LAZY_ATTRS: dict[str, tuple[str, str]] = {
     "RULES": ("sqlglot.optimizer.optimizer", "RULES"),
+    "AmbiguousTableMappingError": ("sqlglot.errors", "AmbiguousTableMappingError"),
     "optimize": ("sqlglot.optimizer.optimizer", "optimize"),
     "Scope": ("sqlglot.optimizer.scope", "Scope"),
+    "TableReferenceChange": ("sqlglot.optimizer.scope", "TableReferenceChange"),
+    "TableRewriteResult": ("sqlglot.optimizer.scope", "TableRewriteResult"),
+    "TableRewriteError": ("sqlglot.errors", "TableRewriteError"),
     "build_scope": ("sqlglot.optimizer.scope", "build_scope"),
     "find_all_in_scope": ("sqlglot.optimizer.scope", "find_all_in_scope"),
     "find_in_scope": ("sqlglot.optimizer.scope", "find_in_scope"),
+    "rewrite_table_names": ("sqlglot.optimizer.scope", "rewrite_table_names"),
+    "rewrite_table_references": ("sqlglot.optimizer.scope", "rewrite_table_references"),
+    "rewrite_table_sql": ("sqlglot.optimizer.scope", "rewrite_table_sql"),
+    "rewrite_tables": ("sqlglot.optimizer.scope", "rewrite_tables"),
     "traverse_scope": ("sqlglot.optimizer.scope", "traverse_scope"),
     "walk_in_scope": ("sqlglot.optimizer.scope", "walk_in_scope"),
 }
