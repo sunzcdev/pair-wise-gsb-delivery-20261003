@@ -12,6 +12,17 @@ The glom team's approach to updates can be summed up as:
 Check this page when upgrading, we strive to keep the updates
 summarized and well-linked.
 
+## Unreleased
+
+- Add ``GlomError.to_dict()`` / ``GlomError.to_json()`` for structured
+  logging: a stable, JSON-compatible representation of glom errors,
+  including the operation, spec/target paths (with integer indices
+  distinguished from string keys), error category, and ordered
+  sub-errors (e.g. ``Coalesce``/``Or`` branch errors). Error tree depth
+  and string length are limited with explicit truncation markers, cyclic
+  error references are collapsed to a marker, and target values and
+  callable reprs are never included by default.
+
 ## 25.12.0
 
 _(December 28, 2025)_

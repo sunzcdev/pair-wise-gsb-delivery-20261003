@@ -20,6 +20,7 @@ semantics.
 
 import os
 import sys
+import json
 import pdb
 import copy
 import warnings
@@ -121,6 +122,132 @@ thrown exceptions.
 
 _PKG_DIR_PATH = os.path.dirname(os.path.abspath(__file__))
 
+
+_ERROR_JSON_DEFAULT_MAX_DEPTH = 8
+_ERROR_JSON_DEFAULT_MAX_STR_LEN = 256
+_ERROR_JSON_TRUNCATION_MARKER = '...[truncated]'
+
+
+def _truncate_json_str(text, max_len):
+    """Return (text, truncated), cutting *text* off at *max_len* and
+    marking the cut point when it exceeds the limit."""
+    text = str(text)
+    if len(text) <= max_len:
+        return text, False
+    marker = '%s(%d chars total)' % (_ERROR_JSON_TRUNCATION_MARKER, len(text))
+    return text[:max_len] + marker, True
+
+
+def _json_path_segment(op, value, max_str_len):
+    """Serialize a single path segment to a JSON-compatible dict.
+
+    Integer indices and string keys are kept distinct. Callables are
+    never repr'd by default: their reprs are unstable (memory
+    addresses) and can leak implementation details into logs.
+    """
+    seg = {}
+    if op is not None:
+        seg['op'] = str(op)
+    if value is _T_STAR or value is _T_STARSTAR:
+        seg['kind'] = 'star'
+    elif isinstance(value, bool):
+        seg['kind'] = 'value'
+        seg['value'] = repr(value)
+    elif isinstance(value, int):
+        seg['kind'] = 'index'
+        seg['value'] = value
+    elif isinstance(value, str):
+        seg['kind'] = 'key'
+        seg['value'] = _truncate_json_str(value, max_str_len)[0]
+    elif callable(value):
+        seg['kind'] = 'callable'
+    else:
+        seg['kind'] = 'value'
+        seg['value'] = _truncate_json_str(bbrepr(value), max_str_len)[0]
+    return seg
+
+
+def _json_path_segments(path, max_str_len):
+    """Serialize a :class:`Path` (or sequence of ``(op, value)`` pairs)
+    to a JSON-compatible list of segments."""
+    if path is None:
+        return None
+    if isinstance(path, Path):
+        try:
+            items = list(path.items())
+        except Exception:
+            items = [(None, v) for v in path.values()]
+    elif (isinstance(path, (list, tuple))
+          and all(isinstance(i, tuple) and len(i) == 2 for i in path)):
+        items = list(path)
+    elif isinstance(path, (list, tuple)):
+        items = [(None, v) for v in path]
+    else:
+        items = [(None, path)]
+    return [_json_path_segment(op, value, max_str_len) for op, value in items]
+
+
+def _error_to_json_dict(exc, max_depth, max_str_len, _depth=0, _seen=None):
+    """Recursively serialize *exc* to a JSON-compatible dict.
+
+    Cycles in the error graph (e.g. an error referencing itself as a
+    branch error) are replaced with a ``cyclic_ref`` marker, and
+    subtrees beyond *max_depth* are replaced with a truncation marker,
+    so serialization can never recurse without bound.
+    """
+    if _seen is None:
+        _seen = set()
+    exc_type_name = type(exc).__name__
+    if not isinstance(exc, Exception):
+        # e.g. a skipped value from a Coalesce branch; the value itself
+        # may be sensitive, so only its type is recorded
+        return {'type': exc_type_name, 'value_omitted': True}
+    if id(exc) in _seen:
+        return {'type': exc_type_name, 'cyclic_ref': True}
+    if _depth >= max_depth:
+        return {'type': exc_type_name, 'truncated': 'max_depth_exceeded'}
+    _seen.add(id(exc))
+    try:
+        ret = {'type': exc_type_name}
+        if isinstance(exc, GlomError):
+            ret['category'] = exc._get_error_category()
+            op = exc._get_error_op()
+            if op is not None:
+                ret['op'] = op
+            get_message = exc._get_log_message
+        else:
+            ret['category'] = 'external'
+            get_message = lambda: Exception.__str__(exc)
+        try:
+            message = get_message()
+        except Exception:
+            message = '<exception str() failed>'
+        message, truncated = _truncate_json_str(message, max_str_len)
+        ret['message'] = message
+        if truncated:
+            ret['message_truncated'] = True
+        children = []
+        if isinstance(exc, GlomError):
+            for path_key, path in exc._get_error_paths().items():
+                segments = _json_path_segments(path, max_str_len)
+                if segments is not None:
+                    ret[path_key] = segments
+            ret.update(exc._get_error_extra(max_str_len))
+            children = exc._get_error_children()
+            cause = exc._get_error_cause()
+            if cause is not None:
+                ret['cause'] = _error_to_json_dict(cause, max_depth, max_str_len,
+                                                   _depth=_depth + 1, _seen=_seen)
+        if children:
+            ret['children'] = [
+                _error_to_json_dict(child, max_depth, max_str_len,
+                                    _depth=_depth + 1, _seen=_seen)
+                for child in children]
+        return ret
+    finally:
+        _seen.discard(id(exc))
+
+
 class GlomError(Exception):
     """The base exception for all the errors that might be raised from
     :func:`glom` processing logic.
@@ -146,6 +273,74 @@ class GlomError(Exception):
 
     def _set_wrapped(self, exc):
         self.__wrapped = exc
+
+    _error_category = 'glom'
+    _error_op = None
+
+    def to_dict(self, max_depth=_ERROR_JSON_DEFAULT_MAX_DEPTH,
+                max_str_len=_ERROR_JSON_DEFAULT_MAX_STR_LEN):
+        """Return a stable, JSON-compatible dict representing this error,
+        suitable for structured logging.
+
+        The dict always includes the exception ``type``, a ``category``,
+        and a (possibly truncated) ``message``. Depending on the error
+        it may also include an ``op``, a ``spec_path`` and/or
+        ``target_path`` (with integer indices distinguished from string
+        keys), and an ordered list of ``children`` sub-errors (e.g. the
+        branch errors of a :class:`Coalesce` or :class:`~glom.Or`).
+
+        Args:
+           max_depth (int): Maximum depth of the sub-error tree; deeper
+              errors are replaced with a truncation marker.
+           max_str_len (int): Maximum length of included strings;
+              longer strings are cut off and marked as truncated.
+
+        Target values and callable reprs are never included, so the
+        result is safe to emit to logs. Cyclic error references are
+        replaced with a ``cyclic_ref`` marker.
+        """
+        return _error_to_json_dict(self, max_depth=max_depth, max_str_len=max_str_len)
+
+    def to_json(self, **kwargs):
+        """Return :meth:`to_dict` serialized to a JSON string. Accepts
+        the same keyword arguments."""
+        return json.dumps(self.to_dict(**kwargs))
+
+    def _get_log_message(self):
+        get_message = getattr(self, 'get_message', None)
+        if get_message is not None:
+            return get_message()
+        return Exception.__str__(self)
+
+    def _get_error_category(self):
+        return self._error_category
+
+    def _get_error_op(self):
+        return self._error_op
+
+    def _get_error_paths(self):
+        return {}
+
+    def _get_error_children(self):
+        branch_errors = getattr(self, '_branch_errors', None)
+        if not branch_errors:
+            return []
+        try:
+            wrapped = self.__wrapped
+        except AttributeError:
+            wrapped = None
+        if wrapped is None:
+            return list(branch_errors)
+        # the top-level glom() call raises a shallow copy of the original
+        # error; fold references to the original back into this error so
+        # the branch tree reflects the true (cyclic) structure
+        return [self if child is wrapped else child for child in branch_errors]
+
+    def _get_error_cause(self):
+        return None
+
+    def _get_error_extra(self, max_str_len):
+        return {}
 
     def _finalize(self, scope):
         # careful when changing how this functionality works; pytest seems to mess with
@@ -344,6 +539,36 @@ class PathAccessError(GlomError, AttributeError, KeyError, IndexError):
         self.path = path
         self.part_idx = part_idx
 
+    _error_category = 'access'
+    _error_op = 'get'
+
+    def _get_error_paths(self):
+        try:
+            items = list(self.path.items())
+        except Exception:
+            return {'spec_path': self.path}
+        return {'spec_path': items,
+                'target_path': items[:self.part_idx]}
+
+    def _get_error_cause(self):
+        return self.exc
+
+    def _get_error_extra(self, max_str_len):
+        return {'part_idx': self.part_idx}
+
+    def _get_log_message(self):
+        # like get_message(), but with callable reprs replaced by a
+        # placeholder, keeping structured output stable and log-safe
+        safe_repr = lambda v: '<callable>' if callable(v) else repr(v)
+        try:
+            path_part = self.path.values()[self.part_idx]
+            path_repr = 'Path(%s)' % ', '.join(safe_repr(v) for v in self.path.values())
+        except (AttributeError, IndexError):
+            path_part = self.path
+            path_repr = safe_repr(self.path)
+        return ('could not access %s, part %r of %s, got error: %r'
+                % (safe_repr(path_part), self.part_idx, path_repr, self.exc))
+
     def get_message(self):
         try:
             path_part = self.path.values()[self.part_idx]
@@ -377,6 +602,18 @@ class PathAssignError(GlomError):
         self.exc = exc
         self.path = path
         self.dest_name = dest_name
+
+    _error_category = 'assign'
+    _error_op = 'assign'
+
+    def _get_error_paths(self):
+        return {'spec_path': self.path}
+
+    def _get_error_cause(self):
+        return self.exc
+
+    def _get_error_extra(self, max_str_len):
+        return {'dest': _json_path_segment(None, self.dest_name, max_str_len)}
 
     def get_message(self):
         return ('could not assign %r on object at %r, got error: %r'
@@ -423,6 +660,45 @@ class CoalesceError(GlomError):
         self.skipped = skipped
         self.path = path
 
+    _error_category = 'coalesce'
+    _error_op = 'coalesce'
+
+    def _get_error_paths(self):
+        return {'target_path': self.path}
+
+    def _get_error_children(self):
+        # skipped holds a mix of exceptions and skipped values, in the
+        # order their respective subspecs appear in the Coalesce
+        return list(self.skipped) + GlomError._get_error_children(self)
+
+    def _get_error_extra(self, max_str_len):
+        extra = {}
+        if self.coal_obj.skip is not _MISSING:
+            extra['skip'] = _json_path_segment(None, self.coal_obj.skip, max_str_len)
+        if self.coal_obj.skip_exc is not GlomError:
+            extra['skip_exc'] = self.coal_obj.skip_exc.__name__
+        return extra
+
+    def _get_log_message(self):
+        # like get_message(), but without callable reprs, keeping
+        # structured output stable and log-safe
+        missed_specs = tuple('<callable>' if callable(s) else s
+                             for s in self.coal_obj.subspecs)
+        skipped_vals = [v.__class__.__name__
+                        if isinstance(v, self.coal_obj.skip_exc)
+                        else '<skipped %s>' % v.__class__.__name__
+                        for v in self.skipped]
+        msg = ('no valid values found. Tried %r and got (%s)'
+               % (missed_specs, ', '.join(skipped_vals)))
+        if self.coal_obj.skip is not _MISSING:
+            skip_repr = '<callable>' if callable(self.coal_obj.skip) else repr(self.coal_obj.skip)
+            msg += f', skip set to {skip_repr}'
+        if self.coal_obj.skip_exc is not GlomError:
+            msg += f', skip_exc set to {self.coal_obj.skip_exc.__name__}'
+        if self.path is not None:
+            msg += f' (at path {self.path!r})'
+        return msg
+
     def __repr__(self):
         cn = self.__class__.__name__
         return f'{cn}({self.coal_obj!r}, {self.skipped!r}, {self.path!r})'
@@ -447,6 +723,8 @@ class CoalesceError(GlomError):
 class BadSpec(GlomError, TypeError):
     """Raised when a spec structure is malformed, e.g., when a specifier
     type is invalid for the current mode."""
+    _error_category = 'spec'
+
 
 
 class UnregisteredTarget(GlomError):
@@ -478,6 +756,18 @@ class UnregisteredTarget(GlomError):
         self.type_map = type_map
         self.path = path
         super().__init__(op, target_type, type_map, path)
+
+    _error_category = 'unregistered_target'
+
+    def _get_error_op(self):
+        return self.op
+
+    def _get_error_paths(self):
+        return {'target_path': self.path}
+
+    def _get_error_extra(self, max_str_len):
+        return {'target_type': self.target_type.__name__,
+                'registered_types': [t.__name__ for t in self.type_map]}
 
     def __repr__(self):
         cn = self.__class__.__name__

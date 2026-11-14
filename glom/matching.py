@@ -15,6 +15,7 @@ from boltons.iterutils import is_iterable
 from boltons.typeutils import make_sentinel
 
 from .core import GlomError, glom, T, MODE, bbrepr, bbformat, format_invocation, Path, chain_child, Val, arg_val
+from .core import _truncate_json_str
 
 
 _MISSING = make_sentinel('_MISSING')
@@ -36,6 +37,9 @@ class MatchError(GlomError):
     """
     def __init__(self, fmt, *args):
         super().__init__(fmt, *args)
+
+    _error_category = 'match'
+    _error_op = 'match'
 
     def get_message(self):
         fmt, args = self.args[0], self.args[1:]
@@ -62,6 +66,13 @@ class TypeMatchError(MatchError, TypeError):
     def __init__(self, actual, expected):
         super().__init__(
             "expected type {0.__name__}, not {1.__name__}", expected, actual)
+
+    def _get_error_extra(self, max_str_len):
+        # self.args = (fmt_str, expected, actual); only type names are
+        # recorded, never the values themselves
+        expected, actual = self.args[1], self.args[2]
+        return {'expected_type': getattr(expected, '__name__', str(expected)),
+                'actual_type': getattr(actual, '__name__', str(actual))}
 
     def __copy__(self):
         # __init__ args = (actual, expected)
@@ -335,12 +346,20 @@ class Or(_Bool):
     __slots__ = ('children',)
 
     def _glomit(self, target, scope):
+        branch_errors = []
         for child in self.children[:-1]:
             try:  # one child must match without exception
                 return scope[glom](target, child, scope)
-            except GlomError:
-                pass
-        return scope[glom](target, self.children[-1], scope)
+            except GlomError as e:
+                branch_errors.append(e)
+        try:
+            return scope[glom](target, self.children[-1], scope)
+        except GlomError as e:
+            if not hasattr(e, '_branch_errors'):
+                # record the branch errors, in order, for structured
+                # error output; the last error still propagates unchanged
+                e._branch_errors = branch_errors + [e]
+            raise
 
     def __or__(self, other):
         # reduce number of layers of spec
@@ -1038,6 +1057,16 @@ class CheckError(GlomError):
         self.msgs = msgs
         self.check_obj = check
         self.path = path
+
+    _error_category = 'check'
+    _error_op = 'check'
+
+    def _get_error_paths(self):
+        return {'target_path': self.path}
+
+    def _get_error_extra(self, max_str_len):
+        msgs = [_truncate_json_str(msg, max_str_len)[0] for msg in self.msgs]
+        return {'msgs': msgs}
 
     def get_message(self):
         msg = 'target at path %s failed check,' % self.path

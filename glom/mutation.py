@@ -51,6 +51,8 @@ class PathDeleteError(PathAssignError):
     ``@property`` or exception being raised inside a ``__delattr__()``.
 
     """
+    _error_op = 'delete'
+
     def get_message(self):
         return ('could not delete %r on object at %r, got error: %r'
                 % (self.dest_name, self.path, self.exc))
