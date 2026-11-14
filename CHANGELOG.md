@@ -2,6 +2,15 @@
 
 ## Development
 
+* The `python` backend now reports the location of syntax and truncation
+  errors in the original utf-8 input: errors raised by it carry `pos`
+  (zero-based byte offset), `line` and `column` (both one-based)
+  attributes, plus a bounded `context` snippet of the input surrounding
+  the error, and their messages include the same information.
+  Positions are unaffected by multi-byte characters, CRLF line endings,
+  chunk boundaries or a missing trailing newline, and truncation errors
+  point at the actual end of the input. The context snippet can be
+  disabled with the new `error_context=False` option.
 * Fixed handling of integers longer than `sys.get_int_max_str_digits()`:
   the `yajl2_c` backend no longer crashes on them, and all backends
   now raise the `ValueError` produced by `int()` (#188).
