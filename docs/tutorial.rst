@@ -259,6 +259,52 @@ Likewise, the tag index may be created or dropped using methods::
 But prefer initializing the cache with a tag index rather than explicitly
 creating or dropping the tag index.
 
+.. _tutorial-tags:
+
+A single tag is sometimes not enough to describe everything that invalidates a
+result. For example, a collected item may depend on its source, the date it was
+collected, and the format version. Use the ``tags`` parameter of :meth:`set
+<diskcache.Cache.set>` and :meth:`add <diskcache.Cache.add>` to associate any
+number of string tags with a key. Repeating a tag does not create a duplicate
+association.
+
+    >>> cache.clear()
+    50
+    >>> cache.set('report', b'...', tags=['source:web', '2026-11-14', 'v1'])
+    True
+    >>> cache.get_tags('report')
+    ['2026-11-14', 'source:web', 'v1']
+
+The value and its tag associations are written in a single transaction. If the
+transaction fails, the previous value and tags remain and any newly written
+file is removed so no dangling reference is left behind. Setting a key again
+replaces both the value and the whole tag set, and an empty collection simply
+associates no tags.
+
+Two matching modes are available for invalidation. :meth:`evict_any
+<diskcache.Cache.evict_any>` removes an item when any of the given tags matches
+while :meth:`evict_all <diskcache.Cache.evict_all>` removes an item only when
+all of them match.
+
+    >>> cache.set('other', b'...', tags=['source:web', 'v1'])
+    True
+    >>> cache.evict_any(['2026-11-14'])
+    1
+    >>> cache.evict_all(['source:web', 'v1'])
+    1
+
+An empty collection never matches and therefore never clears the cache. This
+guards against a missing predicate accidentally removing every row.
+
+    >>> cache.evict_any([])
+    0
+    >>> cache.evict_all(set())
+    0
+
+The legacy single ``tag`` argument and :meth:`evict <diskcache.Cache.evict>`
+continue to work unchanged. A string ``tag`` is also included in the multi-tag
+associations when both forms are used together.
+
 To manually enforce the cache's size limit, use the :meth:`cull
 <diskcache.Cache.cull>` method. :meth:`Cull <diskcache.Cache.cull>` begins by
 removing expired items from the cache and then uses the eviction policy to

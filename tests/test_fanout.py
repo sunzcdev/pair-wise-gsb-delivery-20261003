@@ -391,6 +391,37 @@ def test_evict(cache):
     assert len(cache.check()) == 0
 
 
+def test_multi_tags(cache):
+    for value in range(60):
+        tags = ['source', 'day-%d' % (value % 3), 'v1']
+        assert cache.set(value, value, tags=tags)
+
+    # Repeated tags do not duplicate associations across shards.
+    assert cache.set('dup', 1, tags=['x', 'x'])
+    assert cache.get_tags('dup') == ['x']
+
+    assert cache.evict_any(['day-0']) == 20
+    assert len(cache) == 41
+    assert cache.evict_all(['source', 'v1']) == 40
+    assert len(cache) == 1
+    assert cache.get_tags('dup') == ['x']
+    assert len(cache.check()) == 0
+
+
+def test_multi_tags_empty_is_noop(cache):
+    for value in range(10):
+        cache.set(value, value, tags=['t'])
+    assert cache.evict_any([]) == 0
+    assert cache.evict_all(set()) == 0
+    assert len(cache) == 10
+
+
+def test_multi_tags_validation(cache):
+    with pytest.raises(ValueError):
+        cache.set('a', 1, tags=['ok', 2])
+    assert len(cache) == 0
+
+
 def test_size_limit_with_files(cache):
     shards = 8
     cache.reset('cull_limit', 0)

@@ -681,6 +681,227 @@ def test_tag(cache):
     assert cache.get(3, tag=True) == (None, b'three')
 
 
+def test_multi_tags_set_get(cache):
+    assert cache.set('a', 1, tags=['source', '2026-11-14', 'v1'])
+    assert cache.get_tags('a') == ['2026-11-14', 'source', 'v1']
+
+    # Repeated tags do not create duplicate associations.
+    assert cache.set('b', 2, tags=['x', 'x', 'y'])
+    assert cache.get_tags('b') == ['x', 'y']
+    rows = cache._sql(
+        "SELECT tag FROM Tags WHERE rowid = (SELECT rowid FROM Cache"
+        " WHERE key = 'b') ORDER BY tag"
+    ).fetchall()
+    assert rows == [('x',), ('y',)]
+
+    # No tags means an empty association list.
+    assert cache.set('c', 3)
+    assert cache.get_tags('c') == []
+    assert cache.set('d', 4, tags=[])
+    assert cache.get_tags('d') == []
+
+    # Missing and expired keys report no tags.
+    assert cache.get_tags('missing') == []
+    cache.set('e', 5, tags=['exp'], expire=0.01)
+    time.sleep(0.03)
+    assert cache.get_tags('e') == []
+
+
+def test_multi_tags_combine(cache):
+    # A string legacy tag is combined with the multi-tag collection.
+    assert cache.set('k', 1, tag='legacy', tags=['new', 'legacy'])
+    assert cache.get_tags('k') == ['legacy', 'new']
+    # The legacy single-tag column keeps working.
+    assert cache.get('k', tag=True) == (1, 'legacy')
+
+    # A non-string legacy tag stays only in the single-tag column and does
+    # not raise while string multi-tags are still recorded.
+    assert cache.set('m', 2, tag=1234, tags=['str'])
+    assert cache.get('m', tag=True) == (2, 1234)
+    assert cache.get_tags('m') == ['str']
+
+
+def test_multi_tags_replace(cache):
+    assert cache.set('k', 1, tags=['a', 'b'])
+    assert cache.get_tags('k') == ['a', 'b']
+
+    # Replacing the value replaces the associations in the same operation.
+    assert cache.set('k', 2, tags=['c'])
+    assert cache.get('k') == 2
+    assert cache.get_tags('k') == ['c']
+
+    # Replacing with no tags clears previous associations.
+    assert cache.set('k', 3)
+    assert cache.get_tags('k') == []
+    assert cache.check() == []
+
+
+def test_multi_tags_validation(cache):
+    with pytest.raises(ValueError):
+        cache.set('a', 1, tags='bare-string')
+    for bad in ([1], [1.0], [b'bytes'], ['ok', 2]):
+        with pytest.raises(ValueError):
+            cache.set('a', 1, tags=bad)
+    # Nothing was written for the rejected calls.
+    assert len(cache) == 0
+
+
+def test_multi_tags_add(cache):
+    assert cache.add('k', 1, tags=['a', 'b'])
+    assert cache.get_tags('k') == ['a', 'b']
+    # Existing live key is not replaced.
+    assert not cache.add('k', 2, tags=['c'])
+    assert cache.get('k') == 1
+    assert cache.get_tags('k') == ['a', 'b']
+    # Expired key is replaced along with its associations.
+    assert cache.add('e', 1, tags=['old'], expire=0.01)
+    time.sleep(0.03)
+    assert cache.add('e', 2, tags=['new'])
+    assert cache.get('e') == 2
+    assert cache.get_tags('e') == ['new']
+    assert cache.check() == []
+
+
+def test_evict_any(cache):
+    cache.set('a', 1, tags=['source', 'day-1'])
+    cache.set('b', 2, tags=['source', 'day-2'])
+    cache.set('c', 3, tags=['day-1'])
+    cache.set('d', 4)
+
+    assert cache.evict_any(['day-1']) == 2  # a and c
+    assert sorted(cache) == ['b', 'd']
+    assert cache.get_tags('a') == []
+    assert cache.check() == []
+
+
+def test_evict_all(cache):
+    cache.set('a', 1, tags=['source', 'day-1', 'v1'])
+    cache.set('b', 2, tags=['source', 'v1'])
+    cache.set('c', 3, tags=['source', 'day-1'])
+    cache.set('d', 4)
+
+    assert cache.evict_all(['source', 'v1']) == 2  # a and b
+    assert sorted(cache) == ['c', 'd']
+    # Requiring a tag nobody has removes nothing.
+    assert cache.evict_all(['source', 'nope']) == 0
+    assert cache.check() == []
+
+
+def test_evict_tags_empty_is_noop(cache):
+    for num in range(5):
+        cache.set(num, num, tags=['t'])
+    # Empty collections must never be interpreted as "match everything".
+    assert cache.evict_any([]) == 0
+    assert cache.evict_any(set()) == 0
+    assert cache.evict_all(()) == 0
+    assert len(cache) == 5
+
+
+def test_multi_tags_remove_paths(cache):
+    # delete, pop, clear, expire, and cull all drop the associations.
+    cache.set('del', 1, tags=['a'])
+    cache.set('pop', 2, tags=['a', 'b'])
+    assert cache.delete('del')
+    assert cache.pop('pop') == 2
+    assert cache._sql('SELECT COUNT(*) FROM Tags').fetchall()[0][0] == 0
+
+    cache.set('exp', 3, tags=['e'], expire=0.01)
+    time.sleep(0.03)
+    assert cache.expire() == 1
+    assert cache._sql('SELECT COUNT(*) FROM Tags').fetchall()[0][0] == 0
+
+    cache.set('c1', 1, tags=['c'])
+    cache.set('c2', 2, tags=['c'])
+    assert cache.clear() == 2
+    assert cache._sql('SELECT COUNT(*) FROM Tags').fetchall()[0][0] == 0
+    assert cache.check() == []
+
+
+def test_multi_tags_cull(cache):
+    big = b'x' * 4096
+    cache.reset('size_limit', 1)
+    cache.set('g1', big, tags=['g'])
+    cache.set('g2', big, tags=['g'])
+    cache.cull()
+    orphans = cache._sql(
+        'SELECT COUNT(*) FROM Tags'
+        ' LEFT JOIN Cache ON Tags.rowid = Cache.rowid'
+        ' WHERE Cache.rowid IS NULL'
+    ).fetchall()[0][0]
+    assert orphans == 0
+    assert cache.check() == []
+
+
+def test_multi_tags_set_rollback(cache):
+    # Force a failure after the value file has been written. The old value
+    # and old tags must survive and no dangling file may remain.
+    cache.reset('disk_min_file_size', 1024)
+    big = b'x' * 4096
+    cache.set('k', big, tags=['t1', 't2'])
+    original = cache._row_update
+
+    class Boom(Exception):
+        pass
+
+    def boom(*args, **kwargs):
+        raise Boom('forced failure')
+
+    cache._row_update = boom
+    try:
+        with pytest.raises(Boom):
+            cache.set('k', big + b'y', tags=['t9'])
+    finally:
+        cache._row_update = original
+
+    assert cache.get('k') == big
+    assert cache.get_tags('k') == ['t1', 't2']
+    assert cache.check() == []
+
+
+def test_multi_tags_incr_replaces(cache):
+    # incr on an expired row drops the previous tag associations.
+    cache.set('k', 1, tags=['old'], expire=0.01)
+    time.sleep(0.03)
+    assert cache.incr('k', default=0) == 1
+    assert cache.get_tags('k') == []
+
+    # incr creating a brand-new row starts with no associations.
+    assert cache.incr('fresh', default=0) == 1
+    assert cache.get_tags('fresh') == []
+    assert cache.check() == []
+
+
+def test_multi_tags_add_rollback(cache):
+    # add() replacing an expired key must roll back atomically: the existing
+    # row keeps its tags and no dangling file is left behind.
+    cache.reset('disk_min_file_size', 1024)
+    big = b'x' * 4096
+    cache.set('k', big, tags=['t1'], expire=0.01)
+    old_rowid = cache._sql(
+        "SELECT rowid FROM Cache WHERE key = 'k'"
+    ).fetchall()[0][0]
+    old_tags = cache._sql(
+        'SELECT tag FROM Tags WHERE rowid = ?', (old_rowid,)
+    ).fetchall()
+    time.sleep(0.03)
+
+    class Boom(Exception):
+        pass
+
+    cache._row_update = mock.Mock(side_effect=Boom('forced'))
+    with pytest.raises(Boom):
+        cache.add('k', big + b'y', tags=['t2'])
+
+    assert cache._sql(
+        "SELECT rowid FROM Cache WHERE key = 'k'"
+    ).fetchall() == [(old_rowid,)]
+    assert cache._sql(
+        'SELECT tag FROM Tags WHERE rowid = ?', (old_rowid,)
+    ).fetchall() == old_tags
+    assert cache._sql('SELECT COUNT(*) FROM Tags').fetchall()[0][0] == 1
+    assert cache.check() == []
+
+
 def test_with(cache):
     with dc.Cache(cache.directory) as tmp:
         tmp['a'] = 0
@@ -839,6 +1060,24 @@ def test_push_pull(cache):
         assert pull_value == value
 
     assert len(cache) == 0
+
+
+def test_push_tags(cache):
+    key = cache.push('job', tags=['queue', 'pri'])
+    assert cache.get_tags(key) == ['pri', 'queue']
+
+    # Pulling removes the row and its tag associations.
+    pulled_key, value = cache.pull()
+    assert pulled_key == key and value == 'job'
+    assert cache._sql('SELECT COUNT(*) FROM Tags').fetchall()[0][0] == 0
+    assert cache.check() == []
+
+    # Expired items removed by peek also drop their associations.
+    cache.push('job2', tags=['queue'], expire=0.01)
+    time.sleep(0.03)
+    assert cache.peek() == (None, None)
+    assert cache._sql('SELECT COUNT(*) FROM Tags').fetchall()[0][0] == 0
+    assert cache.check() == []
 
 
 def test_push_pull_prefix(cache):

@@ -577,6 +577,31 @@ class Cache:
             ' WHERE key = "size"; END'
         )
 
+        # Setup Tags table. A cache row may be associated with zero or more
+        # tags through this table. Tags are always strings. The pair of
+        # (rowid, tag) is unique so repeated tags never create duplicate
+        # associations. A trigger removes tag associations whenever a Cache
+        # row is deleted. This keeps relations synchronized for every removal
+        # path including replacement, deletion, expiry, cull, and clear.
+
+        sql(
+            'CREATE TABLE IF NOT EXISTS Tags ('
+            ' rowid INTEGER NOT NULL,'
+            ' tag TEXT NOT NULL,'
+            ' UNIQUE(rowid, tag))'
+        )
+
+        sql(
+            'CREATE INDEX IF NOT EXISTS Tags_tag_rowid ON'
+            ' Tags (tag, rowid)'
+        )
+
+        sql(
+            'CREATE TRIGGER IF NOT EXISTS Tags_cache_delete'
+            ' AFTER DELETE ON Cache FOR EACH ROW BEGIN'
+            ' DELETE FROM Tags WHERE rowid = OLD.rowid; END'
+        )
+
         # Create tag index if requested.
 
         if self.tag_index:  # pylint: disable=no-member
@@ -746,11 +771,28 @@ class Cache:
                 if name is not None:
                     _disk_remove(name)
 
-    def set(self, key, value, expire=None, read=False, tag=None, retry=False):
+    def set(
+        self,
+        key,
+        value,
+        expire=None,
+        read=False,
+        tag=None,
+        retry=False,
+        tags=None,
+    ):
         """Set `key` and `value` item in cache.
 
         When `read` is `True`, `value` should be a file-like object opened
         for reading in binary mode.
+
+        An item may be associated with multiple tags through the `tags`
+        parameter. Tags must be strings. Passing the same tag more than once
+        only creates a single association. A string `tag` argument, if given,
+        is combined with `tags`; non-string legacy tags remain stored only in
+        the single-tag column. An empty collection associates no tags. The
+        value and its tag associations are updated together in a single
+        transaction.
 
         Raises :exc:`Timeout` error when database timeout occurs and `retry` is
         `False` (default).
@@ -762,13 +804,17 @@ class Cache:
         :param bool read: read value as bytes from file (default False)
         :param str tag: text to associate with key (default None)
         :param bool retry: retry if database timeout occurs (default False)
+        :param tags: iterable of string tags to associate with key
+            (default None)
         :return: True if item was set
         :raises Timeout: if database timeout occurs
+        :raises ValueError: if a tag is not a string
 
         """
         now = time.time()
         db_key, raw = self._disk.put(key)
         expire_time = None if expire is None else now + expire
+        tag_list = self._valid_tags(tags, tag)
         size, mode, filename, db_value = self._disk.store(value, read, key=key)
         columns = (expire_time, tag, size, mode, filename, db_value)
 
@@ -793,23 +839,36 @@ class Cache:
         # INSERT OR REPLACE aka UPSERT is not used because the old filename may
         # need cleanup.
 
-        with self._transact(retry, filename) as (sql, cleanup):
-            rows = sql(
-                'SELECT rowid, filename FROM Cache'
-                ' WHERE key = ? AND raw = ?',
-                (db_key, raw),
-            ).fetchall()
+        try:
+            with self._transact(retry, filename) as (sql, cleanup):
+                rows = sql(
+                    'SELECT rowid, filename FROM Cache'
+                    ' WHERE key = ? AND raw = ?',
+                    (db_key, raw),
+                ).fetchall()
 
-            if rows:
-                ((rowid, old_filename),) = rows
-                cleanup(old_filename)
-                self._row_update(rowid, now, columns)
-            else:
-                self._row_insert(db_key, raw, now, columns)
+                if rows:
+                    ((rowid, old_filename),) = rows
+                    cleanup(old_filename)
+                    self._row_update(rowid, now, columns)
+                else:
+                    rowid = self._row_insert(db_key, raw, now, columns)
 
-            self._cull(now, sql, cleanup)
+                # Replace the tag associations for this row within the same
+                # transaction as the value update so they succeed or fail
+                # together.
+                self._set_tags(sql, rowid, tag_list)
 
-            return True
+                self._cull(now, sql, cleanup)
+
+                return True
+        except BaseException:
+            # The transaction was rolled back. Remove the newly written file
+            # so no dangling reference is left behind. The previous value and
+            # its tag associations remain untouched.
+            if filename is not None:
+                self._disk.remove(filename)
+            raise
 
     def __setitem__(self, key, value):
         """Set corresponding `value` for `key` in cache.
@@ -854,7 +913,7 @@ class Cache:
     def _row_insert(self, key, raw, now, columns):
         sql = self._sql
         expire_time, tag, size, mode, filename, value = columns
-        sql(
+        cursor = sql(
             'INSERT INTO Cache('
             ' key, raw, store_time, expire_time, access_time,'
             ' access_count, tag, size, mode, filename, value'
@@ -873,6 +932,57 @@ class Cache:
                 value,
             ),
         )
+        return cursor.lastrowid
+
+    @staticmethod
+    def _valid_tags(tags, tag=None):
+        """Normalize `tags` (and optional legacy `tag`) into a unique list.
+
+        Multi-tag values must be strings. Repeated tags are collapsed so
+        duplicate associations are never created. A string is rejected to
+        avoid iterating its characters. The legacy single `tag` argument is
+        intentionally not type-checked because it historically accepts any
+        value (integer, float, bytes, string, None); it is only combined when
+        it is itself a string.
+
+        :param tags: iterable of string tags or None
+        :param str tag: optional legacy single tag
+        :return: list of unique string tags
+        :raises ValueError: if a multi-tag is not a string
+
+        """
+        if tags is None:
+            result = []
+        elif isinstance(tags, str):
+            raise ValueError('tags must be a non-string iterable of strings')
+        else:
+            result = list(tags)
+
+        for value in result:
+            if not isinstance(value, str):
+                raise ValueError('tags must be strings')
+
+        # A string legacy tag participates in the multi-tag relations.
+        if isinstance(tag, str):
+            result.append(tag)
+
+        # Preserve order while removing duplicates.
+        return list(dict.fromkeys(result))
+
+    def _set_tags(self, sql, rowid, tag_list):
+        """Replace tag associations for `rowid` with `tag_list`.
+
+        Existing associations are deleted and recreated within the caller's
+        transaction. Repeated tags never produce duplicate rows thanks to the
+        UNIQUE constraint and prior normalization.
+
+        """
+        sql('DELETE FROM Tags WHERE rowid = ?', (rowid,))
+        for value in tag_list:
+            sql(
+                'INSERT INTO Tags(rowid, tag) VALUES (?, ?)',
+                (rowid, value),
+            )
 
     def _cull(self, now, sql, cleanup, limit=None):
         cull_limit = self.cull_limit if limit is None else limit
@@ -961,7 +1071,16 @@ class Cache:
 
         return False
 
-    def add(self, key, value, expire=None, read=False, tag=None, retry=False):
+    def add(
+        self,
+        key,
+        value,
+        expire=None,
+        read=False,
+        tag=None,
+        retry=False,
+        tags=None,
+    ):
         """Add `key` and `value` item to cache.
 
         Similar to `set`, but only add to cache if key not present.
@@ -971,6 +1090,10 @@ class Cache:
 
         When `read` is `True`, `value` should be a file-like object opened
         for reading in binary mode.
+
+        Tags may be associated with the item through the `tags` parameter.
+        Tags must be strings. A string `tag` is combined with `tags`; see
+        :meth:`set`.
 
         Raises :exc:`Timeout` error when database timeout occurs and `retry` is
         `False` (default).
@@ -982,38 +1105,48 @@ class Cache:
         :param bool read: read value as bytes from file (default False)
         :param str tag: text to associate with key (default None)
         :param bool retry: retry if database timeout occurs (default False)
+        :param tags: iterable of string tags to associate with key
+            (default None)
         :return: True if item was added
         :raises Timeout: if database timeout occurs
+        :raises ValueError: if a tag is not a string
 
         """
         now = time.time()
         db_key, raw = self._disk.put(key)
         expire_time = None if expire is None else now + expire
+        tag_list = self._valid_tags(tags, tag)
         size, mode, filename, db_value = self._disk.store(value, read, key=key)
         columns = (expire_time, tag, size, mode, filename, db_value)
 
-        with self._transact(retry, filename) as (sql, cleanup):
-            rows = sql(
-                'SELECT rowid, filename, expire_time FROM Cache'
-                ' WHERE key = ? AND raw = ?',
-                (db_key, raw),
-            ).fetchall()
+        try:
+            with self._transact(retry, filename) as (sql, cleanup):
+                rows = sql(
+                    'SELECT rowid, filename, expire_time FROM Cache'
+                    ' WHERE key = ? AND raw = ?',
+                    (db_key, raw),
+                ).fetchall()
 
-            if rows:
-                ((rowid, old_filename, old_expire_time),) = rows
+                if rows:
+                    ((rowid, old_filename, old_expire_time),) = rows
 
-                if old_expire_time is None or old_expire_time > now:
-                    cleanup(filename)
-                    return False
+                    if old_expire_time is None or old_expire_time > now:
+                        cleanup(filename)
+                        return False
 
-                cleanup(old_filename)
-                self._row_update(rowid, now, columns)
-            else:
-                self._row_insert(db_key, raw, now, columns)
+                    cleanup(old_filename)
+                    self._row_update(rowid, now, columns)
+                else:
+                    rowid = self._row_insert(db_key, raw, now, columns)
 
-            self._cull(now, sql, cleanup)
+                self._set_tags(sql, rowid, tag_list)
+                self._cull(now, sql, cleanup)
 
-            return True
+                return True
+        except BaseException:
+            if filename is not None:
+                self._disk.remove(filename)
+            raise
 
     def incr(self, key, delta=1, default=0, retry=False):
         """Increment value by delta for item with key.
@@ -1058,7 +1191,8 @@ class Cache:
                 columns = (None, None) + self._disk.store(
                     value, False, key=key
                 )
-                self._row_insert(db_key, raw, now, columns)
+                rowid = self._row_insert(db_key, raw, now, columns)
+                self._set_tags(sql, rowid, [])
                 self._cull(now, sql, cleanup)
                 return value
 
@@ -1073,6 +1207,8 @@ class Cache:
                     value, False, key=key
                 )
                 self._row_update(rowid, now, columns)
+                # Replacement drops the previous tag associations.
+                self._set_tags(sql, rowid, [])
                 self._cull(now, sql, cleanup)
                 cleanup(filename)
                 return value
@@ -1393,6 +1529,7 @@ class Cache:
         read=False,
         tag=None,
         retry=False,
+        tags=None,
     ):
         """Push `value` onto `side` of queue identified by `prefix` in cache.
 
@@ -1406,6 +1543,9 @@ class Cache:
 
         When `read` is `True`, `value` should be a file-like object opened
         for reading in binary mode.
+
+        String tags may be associated with the item through the `tags`
+        parameter. A string `tag` is combined with `tags`. See :meth:`set`.
 
         Raises :exc:`Timeout` error when database timeout occurs and `retry` is
         `False` (default).
@@ -1432,8 +1572,11 @@ class Cache:
         :param bool read: read value as bytes from file (default False)
         :param str tag: text to associate with key (default None)
         :param bool retry: retry if database timeout occurs (default False)
+        :param tags: iterable of string tags to associate with key
+            (default None)
         :return: key for item in cache
         :raises Timeout: if database timeout occurs
+        :raises ValueError: if a tag is not a string
 
         """
         if prefix is None:
@@ -1446,6 +1589,7 @@ class Cache:
         now = time.time()
         raw = True
         expire_time = None if expire is None else now + expire
+        tag_list = self._valid_tags(tags, tag)
         size, mode, filename, db_value = self._disk.store(value, read)
         columns = (expire_time, tag, size, mode, filename, db_value)
         order = {'back': 'DESC', 'front': 'ASC'}
@@ -1455,34 +1599,40 @@ class Cache:
             ' ORDER BY key %s LIMIT 1'
         ) % order[side]
 
-        with self._transact(retry, filename) as (sql, cleanup):
-            rows = sql(select, (min_key, max_key, raw)).fetchall()
+        try:
+            with self._transact(retry, filename) as (sql, cleanup):
+                rows = sql(select, (min_key, max_key, raw)).fetchall()
 
-            if rows:
-                ((key,),) = rows
+                if rows:
+                    ((key,),) = rows
+
+                    if prefix is not None:
+                        num = int(key[(key.rfind('-') + 1) :])
+                    else:
+                        num = key
+
+                    if side == 'back':
+                        num += 1
+                    else:
+                        assert side == 'front'
+                        num -= 1
+                else:
+                    num = 500000000000000
 
                 if prefix is not None:
-                    num = int(key[(key.rfind('-') + 1) :])
+                    db_key = '{0}-{1:015d}'.format(prefix, num)
                 else:
-                    num = key
+                    db_key = num
 
-                if side == 'back':
-                    num += 1
-                else:
-                    assert side == 'front'
-                    num -= 1
-            else:
-                num = 500000000000000
+                rowid = self._row_insert(db_key, raw, now, columns)
+                self._set_tags(sql, rowid, tag_list)
+                self._cull(now, sql, cleanup)
 
-            if prefix is not None:
-                db_key = '{0}-{1:015d}'.format(prefix, num)
-            else:
-                db_key = num
-
-            self._row_insert(db_key, raw, now, columns)
-            self._cull(now, sql, cleanup)
-
-            return db_key
+                return db_key
+        except BaseException:
+            if filename is not None:
+                self._disk.remove(filename)
+            raise
 
     def pull(
         self,
@@ -2017,6 +2167,27 @@ class Cache:
                             (size, 'size'),
                         )
 
+                # Check Tags table against Cache rows. Every tag association
+                # must reference an existing Cache row.
+
+                select_orphan = (
+                    'SELECT Tags.rowid FROM Tags'
+                    ' LEFT JOIN Cache ON Tags.rowid = Cache.rowid'
+                    ' WHERE Cache.rowid IS NULL'
+                )
+                orphans = sql(select_orphan).fetchall()
+
+                if orphans:
+                    for (orphan_rowid,) in orphans:
+                        message = 'orphan tag reference: %s' % orphan_rowid
+                        warnings.warn(message)
+
+                    if fix:
+                        sql(
+                            'DELETE FROM Tags WHERE rowid NOT IN'
+                            ' (SELECT rowid FROM Cache)'
+                        )
+
             return warns
 
     def create_tag_index(self):
@@ -2070,6 +2241,117 @@ class Cache:
         )
         args = [tag, 0, 100]
         return self._select_delete(select, args, arg_index=1, retry=retry)
+
+    def evict_any(self, tags, retry=False):
+        """Remove items associated with any of the given `tags`.
+
+        An item is removed when at least one of its multi-tag associations
+        matches any tag in `tags`.
+
+        Passing an empty collection removes nothing. This guards against
+        accidentally clearing the whole cache because an omitted predicate
+        would otherwise match every row.
+
+        Removing items is an iterative process. In each iteration, a subset of
+        items is removed. Concurrent writes may occur between iterations.
+
+        If a :exc:`Timeout` occurs, the first element of the exception's
+        `args` attribute will be the number of items removed before the
+        exception occurred.
+
+        :param tags: iterable of string tags
+        :param bool retry: retry if database timeout occurs (default False)
+        :return: count of rows removed
+        :raises Timeout: if database timeout occurs
+        :raises ValueError: if a tag is not a string
+
+        """
+        tag_list = self._valid_tags(tags)
+        if not tag_list:
+            return 0
+
+        placeholders = ','.join('?' * len(tag_list))
+        select = (
+            'SELECT DISTINCT Cache.rowid, Cache.filename FROM Cache'
+            ' JOIN Tags ON Cache.rowid = Tags.rowid'
+            ' WHERE Tags.tag IN (%s) AND Cache.rowid > ?'
+            ' ORDER BY Cache.rowid LIMIT ?'
+        ) % placeholders
+        # args layout: tags..., rowid cursor, limit. The rowid cursor lives
+        # at index len(tag_list) and is updated between iterations.
+        args = [*tag_list, 0, 100]
+        return self._select_delete(
+            select, args, arg_index=len(tag_list), retry=retry
+        )
+
+    def evict_all(self, tags, retry=False):
+        """Remove items associated with every one of the given `tags`.
+
+        An item is removed only when it is associated with all the tags in
+        `tags`.
+
+        Passing an empty collection removes nothing. This guards against
+        accidentally clearing the whole cache because an omitted predicate
+        would otherwise match every row.
+
+        Removing items is an iterative process. In each iteration, a subset of
+        items is removed. Concurrent writes may occur between iterations.
+
+        If a :exc:`Timeout` occurs, the first element of the exception's
+        `args` attribute will be the number of items removed before the
+        exception occurred.
+
+        :param tags: iterable of string tags
+        :param bool retry: retry if database timeout occurs (default False)
+        :return: count of rows removed
+        :raises Timeout: if database timeout occurs
+        :raises ValueError: if a tag is not a string
+
+        """
+        tag_list = self._valid_tags(tags)
+        if not tag_list:
+            return 0
+
+        placeholders = ','.join('?' * len(tag_list))
+        select = (
+            'SELECT Cache.rowid, Cache.filename FROM Cache'
+            ' JOIN Tags ON Cache.rowid = Tags.rowid'
+            ' WHERE Tags.tag IN (%s) AND Cache.rowid > ?'
+            ' GROUP BY Cache.rowid'
+            ' HAVING COUNT(DISTINCT Tags.tag) = ?'
+            ' ORDER BY Cache.rowid LIMIT ?'
+        ) % placeholders
+        # args layout: tags..., rowid cursor, required count, limit. The
+        # rowid cursor lives at index len(tag_list) and is updated between
+        # iterations by _select_delete via arg_index.
+        args = [*tag_list, 0, len(tag_list), 100]
+        return self._select_delete(
+            select, args, arg_index=len(tag_list), retry=retry
+        )
+
+    def get_tags(self, key, retry=False):
+        """Return the list of string tags associated with `key`.
+
+        Expired items are treated as missing and return an empty list. The
+        returned list is a copy; mutating it does not affect the cache.
+
+        :param key: key for item
+        :param bool retry: retry if database timeout occurs (default False)
+        :return: list of string tags associated with key
+        :raises Timeout: if database timeout occurs
+
+        """
+        db_key, raw = self._disk.put(key)
+        select = (
+            'SELECT Tags.tag FROM Tags'
+            ' JOIN Cache ON Tags.rowid = Cache.rowid'
+            ' WHERE Cache.key = ? AND Cache.raw = ?'
+            ' AND (Cache.expire_time IS NULL OR Cache.expire_time > ?)'
+            ' ORDER BY Tags.tag'
+        )
+        with self._transact(retry) as (sql, _):
+            rows = sql(select, (db_key, raw, time.time())).fetchall()
+        return [row[0] for row in rows]
 
     def expire(self, now=None, retry=False):
         """Remove expired items from cache.

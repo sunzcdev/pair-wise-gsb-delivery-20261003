@@ -99,11 +99,24 @@ class FanoutCache:
                 stack.enter_context(shard_transaction)
             yield
 
-    def set(self, key, value, expire=None, read=False, tag=None, retry=False):
+    def set(
+        self,
+        key,
+        value,
+        expire=None,
+        read=False,
+        tag=None,
+        retry=False,
+        tags=None,
+    ):
         """Set `key` and `value` item in cache.
 
         When `read` is `True`, `value` should be a file-like object opened
         for reading in binary mode.
+
+        Tags may be associated with the item through the `tags` parameter.
+        Tags must be strings. A string `tag` is combined with `tags`; see
+        :meth:`Cache.set`.
 
         If database timeout occurs then fails silently unless `retry` is set to
         `True` (default `False`).
@@ -115,13 +128,17 @@ class FanoutCache:
         :param bool read: read value as raw bytes from file (default False)
         :param str tag: text to associate with key (default None)
         :param bool retry: retry if database timeout occurs (default False)
+        :param tags: iterable of string tags to associate with key
+            (default None)
         :return: True if item was set
 
         """
         index = self._hash(key) % self._count
         shard = self._shards[index]
         try:
-            return shard.set(key, value, expire, read, tag, retry)
+            return shard.set(
+                key, value, expire, read, tag, retry, tags=tags
+            )
         except Timeout:
             return False
 
@@ -158,7 +175,16 @@ class FanoutCache:
         except Timeout:
             return False
 
-    def add(self, key, value, expire=None, read=False, tag=None, retry=False):
+    def add(
+        self,
+        key,
+        value,
+        expire=None,
+        read=False,
+        tag=None,
+        retry=False,
+        tags=None,
+    ):
         """Add `key` and `value` item to cache.
 
         Similar to `set`, but only add to cache if key not present.
@@ -168,6 +194,10 @@ class FanoutCache:
 
         When `read` is `True`, `value` should be a file-like object opened
         for reading in binary mode.
+
+        Tags may be associated with the item through the `tags` parameter.
+        Tags must be strings. A string `tag` is combined with `tags`; see
+        :meth:`Cache.add`.
 
         If database timeout occurs then fails silently unless `retry` is set to
         `True` (default `False`).
@@ -179,13 +209,17 @@ class FanoutCache:
         :param bool read: read value as bytes from file (default False)
         :param str tag: text to associate with key (default None)
         :param bool retry: retry if database timeout occurs (default False)
+        :param tags: iterable of string tags to associate with key
+            (default None)
         :return: True if item was added
 
         """
         index = self._hash(key) % self._count
         shard = self._shards[index]
         try:
-            return shard.add(key, value, expire, read, tag, retry)
+            return shard.add(
+                key, value, expire, read, tag, retry, tags=tags
+            )
         except Timeout:
             return False
 
@@ -452,6 +486,48 @@ class FanoutCache:
 
         """
         return self._remove('evict', args=(tag,), retry=retry)
+
+    def evict_any(self, tags, retry=False):
+        """Remove items associated with any of the given `tags`.
+
+        Passing an empty collection removes nothing. See
+        :meth:`Cache.evict_any`.
+
+        :param tags: iterable of string tags
+        :param bool retry: retry if database timeout occurs (default False)
+        :return: count of items removed
+        :raises ValueError: if a tag is not a string
+
+        """
+        return self._remove('evict_any', args=(tags,), retry=retry)
+
+    def evict_all(self, tags, retry=False):
+        """Remove items associated with every one of the given `tags`.
+
+        Passing an empty collection removes nothing. See
+        :meth:`Cache.evict_all`.
+
+        :param tags: iterable of string tags
+        :param bool retry: retry if database timeout occurs (default False)
+        :return: count of items removed
+        :raises ValueError: if a tag is not a string
+
+        """
+        return self._remove('evict_all', args=(tags,), retry=retry)
+
+    def get_tags(self, key, retry=False):
+        """Return the list of string tags associated with `key`.
+
+        Expired items are treated as missing and return an empty list.
+
+        :param key: key for item
+        :param bool retry: retry if database timeout occurs (default False)
+        :return: list of string tags associated with key
+
+        """
+        index = self._hash(key) % self._count
+        shard = self._shards[index]
+        return shard.get_tags(key, retry=retry)
 
     def cull(self, retry=False):
         """Cull items from cache until volume is less than size limit.
