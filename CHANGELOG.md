@@ -12,6 +12,18 @@ The glom team's approach to updates can be summed up as:
 Check this page when upgrading, we strive to keep the updates
 summarized and well-linked.
 
+## Unreleased
+
+- Added explicit provenance tracing via ``glom.trace()`` (and
+  ``Glommer.trace()``), returning a ``TraceResult`` with the normal
+  glom value plus a source map of ``PathSource``, ``LiteralSource``,
+  and ``SyntheticSource`` entries. Nested list elements are traced
+  separately, ``Coalesce`` records only the adopted branch, ``SKIP``
+  leaves no ghost output paths, callables are treated as opaque
+  synthesis steps, and errors retain confirmed sources with an
+  ``incomplete`` marker. Ordinary ``glom()`` behavior and its hot path
+  are unchanged.
+
 ## 25.12.0
 
 _(December 28, 2025)_

@@ -2507,6 +2507,17 @@ class Glommer:
     def glom(self, target, spec, **kwargs):
         return glom(target, spec, scope=self.scope, **kwargs)
 
+    def trace(self, target, spec, **kwargs):
+        """Tracing counterpart of :meth:`glom`: evaluate *spec* and return
+        a :class:`~glom.TraceResult` containing the normal value plus a
+        source map. See :func:`glom.trace` for details."""
+        from glom.tracing import trace as _trace
+        extra_scope = kwargs.pop('scope', None)
+        if kwargs:
+            raise TypeError('unexpected keyword args: %r' % sorted(kwargs.keys()))
+        scope = ChainMap(dict(extra_scope), self.scope) if extra_scope else self.scope
+        return _trace(target, spec, scope=scope)
+
 
 class Fill:
     """A specifier type which switches to glom into "fill-mode". For the

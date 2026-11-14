@@ -48,4 +48,12 @@ from glom.mutation import Assign, Delete, assign, delete, PathDeleteError
 # elsewhere. (maybe procrastination :P)
 from glom.streaming import Iter
 
+from glom.tracing import (trace,
+                          TraceResult,
+                          Source,
+                          PathSource,
+                          LiteralSource,
+                          SyntheticSource,
+                          INCOMPLETE)
+
 from glom._version import __version__
