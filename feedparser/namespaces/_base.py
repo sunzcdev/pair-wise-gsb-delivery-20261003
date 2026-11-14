@@ -28,7 +28,7 @@
 
 import copy
 
-from ..datetimes import _parse_date
+from ..datetimes import _parse_date_detailed
 from ..urls import make_safe_absolute_uri
 from ..util import FeedParserDict
 
@@ -294,7 +294,9 @@ class Namespace:
 
     def _end_published(self):
         value = self.pop("published")
-        self._save("published_parsed", _parse_date(value), overwrite=True)
+        details = _parse_date_detailed(value)
+        self._save("published_parsed", details["parsed"], overwrite=True)
+        self._save("published_parsed_detail", details, overwrite=True)
 
     _end_issued = _end_published
     _end_pubdate = _end_published
@@ -307,8 +309,9 @@ class Namespace:
 
     def _end_updated(self):
         value = self.pop("updated")
-        parsed_value = _parse_date(value)
-        self._save("updated_parsed", parsed_value, overwrite=True)
+        details = _parse_date_detailed(value)
+        self._save("updated_parsed", details["parsed"], overwrite=True)
+        self._save("updated_parsed_detail", details, overwrite=True)
 
     _end_modified = _end_updated
     _end_lastbuilddate = _end_updated
@@ -318,13 +321,17 @@ class Namespace:
 
     def _end_created(self):
         value = self.pop("created")
-        self._save("created_parsed", _parse_date(value), overwrite=True)
+        details = _parse_date_detailed(value)
+        self._save("created_parsed", details["parsed"], overwrite=True)
+        self._save("created_parsed_detail", details, overwrite=True)
 
     def _start_expirationdate(self, attrs_d):
         self.push("expired", 1)
 
     def _end_expirationdate(self):
-        self._save("expired_parsed", _parse_date(self.pop("expired")), overwrite=True)
+        details = _parse_date_detailed(self.pop("expired"))
+        self._save("expired_parsed", details["parsed"], overwrite=True)
+        self._save("expired_parsed_detail", details, overwrite=True)
 
     def _start_category(self, attrs_d):
         term = attrs_d.get("term")

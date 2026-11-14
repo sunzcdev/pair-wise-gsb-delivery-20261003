@@ -22,6 +22,43 @@ The following elements are parsed as dates:
 - :ref:`reference.entry.expired` is parsed into :ref:`reference.entry.expired_parsed`.
 
 
+Date Parsing Details
+--------------------
+
+Each ``*_parsed`` value has a companion ``*_parsed_detail`` mapping
+(for example, ``published_parsed_detail`` next to ``published_parsed``)
+that records how the date was interpreted. This is useful for things like
+incremental synchronization, which cannot treat a date-only value like
+``2026-11-14`` as a timestamp with second precision.
+
+Each detail mapping contains the following keys:
+
+-   ``raw``: the original date text, exactly as it appeared in the feed.
+
+-   ``parsed``: the legacy 9-tuple in UTC, identical to the companion
+    ``*_parsed`` value (or ``None``).
+
+-   ``precision``: the recognized precision of the value. One of
+    ``"date"`` (no time of day was declared), ``"minute"``, ``"second"``,
+    or ``"subsecond"`` (the time included fractional seconds).
+
+-   ``timezone_explicit``: ``True`` if the date text explicitly declared
+    a timezone (a ``Z``, a numeric offset, or a named timezone), else
+    ``False``.
+
+-   ``utc``: a timezone-aware :class:`datetime.datetime` normalized to
+    UTC, or ``None``. This is only set when the timezone was explicitly
+    declared in the date text; it is never derived from the machine's
+    local timezone settings. Date-only values and values without a
+    declared timezone therefore have no ``utc`` value.
+
+-   ``error``: a string describing why the value could not be parsed,
+    or ``None`` if there was no error. Invalid values -- for example,
+    February 29 on a non-leap year, or an hour of 25 -- are never
+    silently corrected to another date; the original text remains in
+    ``raw`` and the failure reason is available here.
+
+
 History of Date Formats
 -----------------------
 

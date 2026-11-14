@@ -27,7 +27,7 @@
 
 import json
 
-from ..datetimes import _parse_date
+from ..datetimes import _parse_date_detailed
 from ..sanitizer import sanitize_html
 from ..util import FeedParserDict
 
@@ -98,10 +98,14 @@ class JSONParser:
 
         if "date_published" in e:
             entry["published"] = e["date_published"]
-            entry["published_parsed"] = _parse_date(e["date_published"])
-        if "date_updated" in e:
+            details = _parse_date_detailed(e["date_published"])
+            entry["published_parsed"] = details["parsed"]
+            entry["published_parsed_detail"] = details
+        if "date_modified" in e:
             entry["updated"] = e["date_modified"]
-            entry["updated_parsed"] = _parse_date(e["date_modified"])
+            details = _parse_date_detailed(e["date_modified"])
+            entry["updated_parsed"] = details["parsed"]
+            entry["updated_parsed_detail"] = details
 
         if "tags" in e:
             entry["category"] = e["tags"]

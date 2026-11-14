@@ -29,6 +29,7 @@ from collections.abc import Callable
 from time import struct_time
 
 from .asctime import _parse_date_asctime
+from .details import build_date_details
 from .greek import _parse_date_greek
 from .hungarian import _parse_date_hungarian
 from .iso8601 import _parse_date_iso8601
@@ -60,6 +61,22 @@ def _parse_date(date_string):
             continue
         return date9tuple
     return None
+
+
+def _parse_date_detailed(date_string):
+    """Parse a date string and return details about the parsed value.
+
+    The returned :class:`FeedParserDict` records the original text
+    (``raw``), the legacy 9-tuple in GMT (``parsed``), the recognized
+    ``precision`` (``"date"``, ``"minute"``, ``"second"``, or
+    ``"subsecond"``), whether a timezone was explicitly declared
+    (``timezone_explicit``), a timezone-aware ``datetime`` normalized to
+    UTC (``utc``, only set when a timezone was explicitly declared), and
+    the failure reason (``error``) when the value cannot be parsed or
+    contains invalid or out-of-range components.
+    """
+
+    return build_date_details(date_string, _parse_date(date_string))
 
 
 registerDateHandler(_parse_date_onblog)
