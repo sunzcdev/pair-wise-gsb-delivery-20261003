@@ -1,6 +1,19 @@
 w3lib release notes
 ===================
 
+2.7.0 (unreleased)
+------------------
+
+New features:
+
+- Added :func:`w3lib.http.parse_link_headers`, which parses ``Link``
+  response headers (RFC 8288), e.g. to find the ``next``, ``prev`` and
+  ``alternate`` links of a page. It returns the links in order of
+  appearance, resolves relative targets against a given base URL, supports
+  multiple ``rel`` values and quoted parameter values, and reports
+  link-values with duplicate parameters or broken syntax instead of
+  silently dropping them.
+
 2.6.0 (2026-11-05)
 ------------------
 
