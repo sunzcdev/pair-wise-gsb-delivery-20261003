@@ -2776,6 +2776,54 @@ This property on the database object returns ``True`` if the available SQLite ve
     >>> db.supports_strict
     True
 
+.. _python_api_schema_compatibility:
+
+Checking schema compatibility
+=============================
+
+``sqlite_utils.check_schema_compatibility(contract, target)`` compares the
+schema of a *contract* database - the schema an ingestion writer is built
+against - with a *target* database, and reports whether the writer can keep
+writing to the target as-is:
+
+.. code-block:: python
+
+    import sqlite_utils
+
+    report = sqlite_utils.check_schema_compatibility("contract.db", "target.db")
+    print(report.verdict)
+    for finding in report.findings:
+        print(finding.level.value, finding.object_name, finding.reason)
+
+Both arguments accept a file path, a ``sqlite3.Connection`` or a
+:class:`Database` instance. Paths are opened with the SQLite ``mode=ro``
+read-only flag, so the check never modifies either database.
+
+The comparison is structural - it uses ``PRAGMA`` introspection rather than
+the text of the ``CREATE TABLE`` statements, so differences in whitespace,
+quoting and statement layout are ignored. Column affinities, ``NOT NULL``
+constraints, default values, primary key order, unique constraints and
+foreign keys are all compared.
+
+Every finding is classified into one of four levels:
+
+- ``compatible`` - the contract can be used against the target unchanged.
+- ``conversion_required`` - a well-defined, data-preserving schema
+  conversion (such as adding a column that has a default) can reconcile the
+  two. A new ``NOT NULL`` column *with* a default falls in this category,
+  while a new ``NOT NULL`` column *without* a default on a table that
+  already holds rows is reported as incompatible instead.
+- ``incompatible`` - no safe conversion exists, for example a ``NOT NULL``
+  column without a default would have to be populated for existing rows, or
+  a foreign key references a table that does not exist in the target.
+- ``unknown`` - the structure could not be verified safely, for example
+  expression indexes, generated columns or virtual tables. Unknown
+  structures are never assumed to be safe.
+
+``report.verdict`` is the most severe level found. Findings are grouped by
+level via ``report.conversion_required``, ``report.incompatible`` and
+``report.unknown``; ``report.compatible_tables`` lists the tables that
+matched completely.
 .. _python_api_fts:
 
 Full-text search

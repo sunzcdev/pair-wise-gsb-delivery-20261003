@@ -77,6 +77,46 @@ sqlite_utils.db.ForeignKey
 
 .. autoclass:: sqlite_utils.db.ForeignKey
 
+sqlite_utils.schema_compat
+==========================
+
+.. _reference_schema_compat_check:
+
+sqlite_utils.schema_compat.check_schema_compatibility
+-----------------------------------------------------
+
+.. autofunction:: sqlite_utils.schema_compat.check_schema_compatibility
+
+.. _reference_schema_compat_report:
+
+sqlite_utils.schema_compat.SchemaCompatibilityReport
+----------------------------------------------------
+
+.. autoclass:: sqlite_utils.schema_compat.SchemaCompatibilityReport
+   :members: findings, compatible_tables, findings_by_level, conversion_required, incompatible, unknown, verdict
+
+.. _reference_schema_compat_finding:
+
+sqlite_utils.schema_compat.Finding
+----------------------------------
+
+.. autoclass:: sqlite_utils.schema_compat.Finding
+
+.. _reference_schema_compat_levels:
+
+sqlite_utils.schema_compat.CompatibilityLevel
+---------------------------------------------
+
+.. autoclass:: sqlite_utils.schema_compat.CompatibilityLevel
+   :members:
+
+.. _reference_schema_compat_object_type:
+
+sqlite_utils.schema_compat.ObjectType
+-------------------------------------
+
+.. autoclass:: sqlite_utils.schema_compat.ObjectType
+   :members:
 sqlite_utils.utils
 ==================
 
