@@ -7,6 +7,7 @@ from agate.data_types import *
 from agate.exceptions import *
 # import agate.fixed as fixed
 from agate.mapped_sequence import MappedSequence
+from agate.normalization import NormalizationSchema, describe_data_type, register_data_type, restore_data_type
 from agate.rows import Row
 from agate.table import Table
 from agate.tableset import TableSet

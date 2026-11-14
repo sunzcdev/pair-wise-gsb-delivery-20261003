@@ -1,6 +1,7 @@
 1.14.3 - Unreleased
 -------------------
 
+- feat: :meth:`.Table.normalize` and :meth:`.Table.denormalize` now support an explicitly round-trippable mode. Pass ``record_schema=True`` to :meth:`.Table.normalize` to record the identity, order and type definitions of the original columns in a :class:`.NormalizationSchema` (attached to the new table as :attr:`.Table.normalization_schema` and serializable via :meth:`.NormalizationSchema.to_dict`). :meth:`.Table.denormalize` uses the schema to restore the original column types and exact cell values, raising :class:`.NormalizationError` if the data does not match the metadata. Custom :class:`.DataType` subclasses can take part once a restorer is registered with :func:`.register_data_type`. The default type-inference mode is unchanged.
 - feat: :class:`.Median`, :class:`.Percentiles`, :class:`.Quartiles`, :class:`.Quintiles`, :class:`.Deciles` and :class:`.IQR` can be applied to :class:`.TimeDelta` columns, like :class:`.Sum` and :class:`.Mean`.
 - fix: :meth:`.Table.distinct` now deduplicates rows when ``key`` is a sequence of column names.
 - fix: :class:`.Rank` ranks null values last when ``reverse=True``.

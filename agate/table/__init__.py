@@ -232,6 +232,17 @@ class Table:
         return self._row_names
 
     @property
+    def normalization_schema(self):
+        """
+        A :class:`.NormalizationSchema` describing how to exactly reverse
+        the wide-to-long transformation that produced this table, if it was
+        created by :meth:`.Table.normalize` with :code:`record_schema=True`.
+
+        If this table does not carry such metadata, then :code:`None`.
+        """
+        return getattr(self, '_normalization_schema', None)
+
+    @property
     def columns(self):
         """
         A :class:`.MappedSequence` with column names for keys and

@@ -26,6 +26,18 @@ class CastError(Exception):  # pragma: no cover
     pass
 
 
+class NormalizationError(ValueError):
+    """
+    An explicit wide/long table transformation could not be completed.
+
+    This is raised when the metadata recorded by a round-trippable
+    transformation (see :class:`.NormalizationSchema`) does not match the
+    data it is applied to, for example when cells are duplicated, properties
+    are unknown or described column types can not be restored.
+    """
+    pass
+
+
 class FieldSizeLimitError(Exception):  # pragma: no cover
     """
     A field in a CSV file exceeds the maximum length.

@@ -21,6 +21,7 @@ Properties
     agate.Table.column_types
     agate.Table.rows
     agate.Table.row_names
+    agate.Table.normalization_schema
 
 Creating
 --------
