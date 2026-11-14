@@ -4,6 +4,15 @@ Changes
 Version 1.7.32
 --------------
 
+* Make ``sort()`` cache invalidation generational. ``clearcache()`` retires
+  the current snapshot without disturbing iterators already open, which keep
+  reading their own snapshot; later iterators re-read the source and build a
+  fresh cache. Retired temporary chunk files are reclaimed only once the last
+  reader closes, a failed re-sort never publishes a partial cache or damages a
+  snapshot still in use, and the same rules apply to in-memory and file-backed
+  caches. Interleaved single-threaded consumption only; no thread-safety
+  guarantee is added.
+
 * Preserve explicit iterator headers across repeated passes in ``fromtext()``.
   By :user:`IlyaKhalafi`.
 

@@ -124,6 +124,17 @@ def sort(table, key=None, reverse=False, buffersize=None, tempdir=None,
     the sorted table will yield rows from the cache and will not repeat the
     sort operation. To turn off caching, set the `cache` argument to `False`.
 
+    Cache invalidation is generational. Calling :meth:`SortView.clearcache`
+    drops the current generation: iterators already open keep reading their own
+    snapshot, while iterators created afterwards re-read the source and build a
+    fresh cache. Old temporary chunk files are deleted only once every iterator
+    of the retired generation has been closed. A failed re-sort never publishes
+    a partial cache, so any snapshot still in use remains intact and valid.
+    These guarantees hold for interleaved consumption within a single thread;
+    concurrent access from multiple threads is not supported.
+    The same rules apply whether the snapshot is held in memory or in temporary
+    files.
+
     """
 
     return SortView(table, key=key, reverse=reverse, buffersize=buffersize,
@@ -248,60 +259,41 @@ class SortView(Table):
             self.buffersize = buffersize
         self.tempdir = tempdir
         self._cache = cache
-        self._hdrcache = None
-        self._memcache = None
-        self._filecache = None
-        self._getkey = None
+        # The published cache generation, or None if there is none. Retired
+        # generations stay alive until the last iterator reading them closes.
+        self._generation = None
 
     def clearcache(self):
+        # Drop the current generation only. Open iterators captured their own
+        # reference to it and keep reading the old snapshot; later iterators
+        # see no published generation and re-read the source.
         debug('clear cache')
-        self._hdrcache = None
-        self._memcache = None
-        self._filecache = None
-        self._getkey = None
+        generation = self._generation
+        self._generation = None
+        if generation is not None:
+            generation.retire()
 
     def __iter__(self):
+        generation = self._generation
+        if self._cache and generation is not None:
+            # Snapshot the generation for the whole life of this iterator.
+            return _SortCacheIterator(generation)
+        return self._builditer()
+
+    def _publish(self, generation):
+        # Atomically install a fully built generation, retiring the previous
+        # one. Only complete generations are ever published, so a failed sort
+        # can never leave a half-built cache visible to later iterators.
+        previous = self._generation
+        self._generation = generation
+        if previous is not None:
+            previous.retire()
+
+    def _builditer(self):
+        debug('iterate without cache')
         source = self.source
         key = self.key
         reverse = self.reverse
-        if self._cache and self._memcache is not None:
-            return self._iterfrommemcache()
-        elif self._cache and self._filecache is not None:
-            return self._iterfromfilecache()
-        else:
-            return self._iternocache(source, key, reverse)
-
-    def _iterfrommemcache(self):
-        debug('iterate from memory cache')
-        yield tuple(self._hdrcache)
-        for row in self._memcache:
-            yield tuple(row)
-
-    def _iterfromfilecache(self):
-        # create a reference to the filecache here, so cleanup happens in the
-        # correct order
-        filecache = self._filecache
-        filenames = list(map(operator.attrgetter('name'), filecache))
-        debug('iterate from file cache: %r', filenames)
-        yield tuple(self._hdrcache)
-        chunkiters = [_iterchunk(fn) for fn in filenames]
-        rows = _mergesorted(self._getkey, self.reverse, *chunkiters)
-        try:
-            for row in rows:
-                yield tuple(row)
-        finally:
-            debug('attempt cleanup from generator')
-            # N.B., need to ensure that any open files are closed **before**
-            # temporary files are deleted, as deletion will fail on Windows
-            # if file is in use (i.e., still open)
-            del chunkiters
-            del rows
-            del filecache
-            debug('exiting generator')
-
-    def _iternocache(self, source, key, reverse):
-        debug('iterate without cache')
-        self.clearcache()
         it = iter(source)
 
         try:
@@ -332,11 +324,8 @@ class SortView(Table):
 
             if self._cache:
                 debug('caching mem')
-                self._hdrcache = hdr
-                self._memcache = rows
-                # actually not needed to iterate from memcache
-                self._getkey = getkey
-
+                self._publish(_SortCacheGeneration(hdr, rows, None, getkey,
+                                                    reverse))
             for row in rows:
                 yield tuple(row)
 
@@ -345,44 +334,173 @@ class SortView(Table):
 
             chunkfiles = []
 
-            while rows:
+            try:
+                while rows:
 
-                # dump the chunk
-                with NamedTemporaryFile(dir=self.tempdir, delete=False,
-                                        mode='wb') as f:
-                    # N.B., we **don't** want the file to be deleted on close,
-                    # but we **do** want the file to be deleted when self
-                    # is garbage collected, or when the program exits. When
-                    # all references to the wrapper are gone, the file should
-                    # get deleted.
-                    wrapper = _NamedTempFileDeleteOnGC(f.name)
-                    debug('created temporary chunk file %s' % f.name)
-                    for row in rows:
-                        pickle.dump(row, f, protocol=-1)
-                    f.flush()
-                    chunkfiles.append(wrapper)
+                    # dump the chunk
+                    with NamedTemporaryFile(dir=self.tempdir, delete=False,
+                                            mode='wb') as f:
+                        # N.B., we **don't** want the file to be deleted on
+                        # close, but we **do** want the file to be deleted when
+                        # the last reader of this generation is gone, or when
+                        # the program exits.
+                        wrapper = _NamedTempFileDeleteOnGC(f.name)
+                        debug('created temporary chunk file %s' % f.name)
+                        for row in rows:
+                            pickle.dump(row, f, protocol=-1)
+                        f.flush()
+                        chunkfiles.append(wrapper)
 
-                # grab the next chunk
-                rows = list(itertools.islice(it, 0, self.buffersize))
-                rows.sort(key=getkey, reverse=reverse)
+                    # grab the next chunk
+                    rows = list(itertools.islice(it, 0, self.buffersize))
+                    rows.sort(key=getkey, reverse=reverse)
+            except BaseException:
+                # Never publish a half-built cache: discard the chunks written
+                # so far and propagate the failure, leaving any older snapshot
+                # untouched.
+                for wrapper in chunkfiles:
+                    wrapper.delete()
+                raise
 
             if self._cache:
                 debug('caching files')
-                self._hdrcache = hdr
-                self._filecache = chunkfiles
-                self._getkey = getkey
+                self._publish(_SortCacheGeneration(hdr, None, chunkfiles,
+                                                    getkey, reverse))
 
-            chunkiters = [_iterchunk(f.name) for f in chunkfiles]
-            for row in _mergesorted(getkey, reverse, *chunkiters):
+            filenames = [f.name for f in chunkfiles]
+            chunkiters = [_iterchunk(fn) for fn in filenames]
+            try:
+                for row in _mergesorted(getkey, reverse, *chunkiters):
+                    yield tuple(row)
+            finally:
+                # Close open chunk files before their temporary files can be
+                # deleted; deletion fails on Windows while a handle is open.
+                for chunkiter in chunkiters:
+                    chunkiter.close()
+
+
+class _SortCacheGeneration(object):
+    """One immutable, self-contained snapshot of a sort result.
+
+    Holds either an in-memory row list or a list of temporary chunk files,
+    together with the header and key function. Generations are never mutated
+    once published; invalidation creates a brand new generation instead, so an
+    iterator that captured an older generation keeps reading a valid snapshot.
+
+    A reader count tracks live iterators. When a generation has been retired
+    (via :meth:`retire`) its backing files are reclaimed as soon as the final
+    reader closes; while readers remain, the snapshot is kept alive.
+
+    """
+
+    def __init__(self, header, memcache, filecache, getkey, reverse=False):
+        self.header = header
+        self.memcache = memcache
+        self.filecache = filecache
+        self.getkey = getkey
+        self.reverse = reverse
+        self._readers = 0
+        self._retired = False
+
+    def acquire(self):
+        self._readers += 1
+        return self
+
+    def release(self):
+        self._readers -= 1
+        if self._retired and self._readers == 0:
+            self._discard(suppress_errors=True)
+
+    def retire(self):
+        # Mark the generation as no longer reachable for new iterators. Its
+        # data survives until every in-flight reader has finished.
+        already_retired = self._retired
+        self._retired = True
+        if not already_retired and self._readers == 0:
+            self._discard(suppress_errors=True)
+
+    def _discard(self, suppress_errors=False):
+        # Reclaim temporary chunk files. Memory snapshots simply drop out of
+        # scope. Safe to call more than once.
+        if self.filecache is None:
+            return
+        for wrapper in self.filecache:
+            try:
+                wrapper.delete()
+            except Exception:
+                if not suppress_errors:
+                    raise
+        self.filecache = None
+
+    def __del__(self):
+        # Backstop in case a reader is dropped without being closed.
+        self._discard()
+
+
+class _SortCacheIterator(object):
+    """Iterator over a single, fixed cache generation.
+
+    Registers as a reader for the generation's whole lifetime, including the
+    period before the first row is requested, so retiring a generation can
+    never reclaim files that an un-started iterator still needs.
+
+    """
+
+    def __init__(self, generation):
+        self._generation = generation.acquire()
+        self._closed = False
+        self._rows = self._iterrows(generation)
+
+    @staticmethod
+    def _iterrows(generation):
+        yield tuple(generation.header)
+        if generation.memcache is not None:
+            for row in generation.memcache:
                 yield tuple(row)
+        else:
+            filenames = [f.name for f in generation.filecache]
+            debug('iterate from file cache: %r', filenames)
+            chunkiters = [_iterchunk(fn) for fn in filenames]
+            try:
+                rows = _mergesorted(generation.getkey, generation.reverse,
+                                    *chunkiters)
+                for row in rows:
+                    yield tuple(row)
+            finally:
+                # Close handles before the generation may delete the files.
+                for chunkiter in chunkiters:
+                    chunkiter.close()
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        return next(self._rows)
+
+    next = __next__
+
+    def close(self):
+        if self._closed:
+            return
+        self._closed = True
+        try:
+            self._rows.close()
+        finally:
+            self._generation.release()
+
+    def __del__(self):
+        self.close()
 
 
 class _NamedTempFileDeleteOnGC(object):
 
     def __init__(self, name):
         self.name = name
+        self._deleted = False
 
     def delete(self, unlink=os.unlink, log=logger.debug):
+        if self._deleted:
+            return
         name = self.name
         try:
             log('deleting %s' % name)
@@ -391,6 +509,7 @@ class _NamedTempFileDeleteOnGC(object):
             log('exception deleting %s: %s' % (name, e))
             raise
         else:
+            self._deleted = True
             log('deleted %s' % name)
 
     def __del__(self):

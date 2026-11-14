@@ -244,10 +244,11 @@ def test_hashjoin_cache_option_still_honoured():
 def test_sort_cache_option_still_honoured():
     cached = etl.sort(TABLE, 'foo')
     list(cached)
-    assert cached._memcache is not None
+    assert cached._generation is not None
+    assert cached._generation.memcache is not None
     uncached = etl.sort(TABLE, 'foo', cache=False)
     list(uncached)
-    assert uncached._memcache is None
+    assert uncached._generation is None
 
 
 def test_cacheview_clearcache_still_works():
