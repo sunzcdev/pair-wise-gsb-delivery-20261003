@@ -24,6 +24,10 @@ else:
 
 Error = namedtuple('Error', ('metadata',))
 
+# Record of a hook failure, in the order in which hooks were executed.
+# Included in the error metadata as the "hook_errors" list.
+HookFailure = namedtuple('HookFailure', ('type', 'hook', 'error'))
+
 
 class _Skipped(object):
     def __repr__(self):

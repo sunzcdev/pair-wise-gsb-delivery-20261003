@@ -1619,6 +1619,252 @@ class TestTaskHooks(BaseTestCase):
         self.assertEqual(post_state, [r.id])
 
 
+class TestTaskHookFailurePolicies(BaseTestCase):
+    def test_invalid_hook_policy(self):
+        self.assertRaises(ConfigurationError,
+                          self.huey.pre_execute, on_failure='bogus')
+        self.assertRaises(ConfigurationError,
+                          self.huey.post_execute, on_failure='bogus')
+
+        # Valid policies (and the default) are accepted.
+        self.huey.pre_execute(on_failure='abort')(lambda t: None)
+        self.huey.post_execute(on_failure='ignore')(lambda t, v, e: None)
+        self.huey.pre_execute()(lambda t: None)
+
+    def test_required_pre_execute_hook(self):
+        # A required pre-execute hook that fails prevents the task function
+        # (and any subsequent pre-execute hooks) from running. Post-execute
+        # cleanup hooks are still attempted and the task fails.
+        state = []
+        posts = []
+
+        @self.huey.task()
+        def task_a(n):
+            state.append(n)
+            return n + 1
+
+        @self.huey.pre_execute(on_failure='abort')
+        def init_conn(task):
+            raise ValueError('cannot connect')
+
+        @self.huey.pre_execute()
+        def audit(task):
+            state.append('audit')
+
+        @self.huey.post_execute()
+        def cleanup(task, value, exc):
+            posts.append(type(exc).__name__ if exc is not None else None)
+
+        r = task_a(1)
+        self.assertTrue(self.execute_next() is None)
+        self.assertEqual(state, [])  # Task function never ran.
+        self.assertEqual(posts, ['TaskHookError'])  # Cleanup still attempted.
+
+        exc = self.trap_exception(r)
+        self.assertIn('init_conn', exc.metadata['error'])
+        self.assertIn('cannot connect', exc.metadata['error'])
+        self.assertEqual(exc.metadata['hook_errors'], [
+            {'type': 'pre_execute', 'hook': 'init_conn',
+             'error': "ValueError('cannot connect')"}])
+
+    def test_required_pre_execute_hook_retries(self):
+        # Hook call counts are verifiable across retries: the pre and post
+        # hooks run once per attempt, the task function never runs.
+        calls = {'pre': 0, 'post': 0, 'task': 0}
+
+        @self.huey.task(retries=1)
+        def task_a():
+            calls['task'] += 1
+
+        @self.huey.pre_execute(on_failure='abort')
+        def init_conn(task):
+            calls['pre'] += 1
+            raise ValueError('cannot connect')
+
+        @self.huey.post_execute()
+        def cleanup(task, value, exc):
+            calls['post'] += 1
+
+        r = task_a()
+        self.assertTrue(self.execute_next() is None)  # 1st attempt, retried.
+        self.assertEqual(calls, {'pre': 1, 'post': 1, 'task': 0})
+        self.assertTrue(self.execute_next() is None)  # 2nd attempt, final.
+        self.assertEqual(calls, {'pre': 2, 'post': 2, 'task': 0})
+        self.assertRaises(TaskException, r.get)
+
+    def test_required_post_execute_hook_after_success(self):
+        # A successful task whose required post-execute hook fails is a
+        # failure: the error chain runs, the success chain does not.
+        state = []
+
+        @self.huey.task()
+        def task_a(n):
+            return n + 1
+
+        @self.huey.task()
+        def on_comp(v):
+            state.append(('complete', v))
+
+        @self.huey.task()
+        def on_err(e):
+            state.append(('error', type(e).__name__))
+
+        @self.huey.post_execute(on_failure='abort')
+        def audit(task, value, exc):
+            raise ValueError('audit failed')
+
+        r = self.huey.enqueue(task_a.s(1).then(on_comp).error(on_err))
+        self.assertEqual(self.execute_next(), 2)  # Task function itself ran.
+
+        # Only the on_error handler was enqueued -- not on_complete.
+        self.assertEqual(len(self.huey), 1)
+        self.execute_next()
+        self.assertEqual(state, [('error', 'TaskHookError')])
+
+        exc = self.trap_exception(r)
+        self.assertIn('audit', exc.metadata['error'])
+        self.assertEqual(exc.metadata['hook_errors'], [
+            {'type': 'post_execute', 'hook': 'audit',
+             'error': "ValueError('audit failed')"}])
+
+    def test_required_post_hook_terminal_state_signals(self):
+        # The terminal state is unambiguous: SIGNAL_ERROR is emitted and
+        # SIGNAL_COMPLETE is not.
+        seen = []
+
+        @self.huey.signal()
+        def sig(signal, task, *args):
+            seen.append(signal)
+
+        @self.huey.task()
+        def task_a():
+            return 1
+
+        @self.huey.post_execute(on_failure='abort')
+        def cleanup(task, value, exc):
+            raise ValueError('cleanup failed')
+
+        task_a()
+        self.assertEqual(self.execute_next(), 1)
+        self.assertEqual(seen, ['enqueued', 'executing', 'error'])
+
+    def test_task_exception_not_masked_by_post_hook(self):
+        # When the task itself fails, a required post-execute hook failure
+        # does not replace the task's exception, but is still recorded.
+        @self.huey.task()
+        def task_a():
+            raise TestError('task failed')
+
+        @self.huey.post_execute(on_failure='abort')
+        def cleanup(task, value, exc):
+            raise ValueError('cleanup failed')
+
+        r = task_a()
+        self.assertTrue(self.execute_next() is None)
+        exc = self.trap_exception(r)
+        self.assertEqual(exc.metadata['error'], 'TestError(task failed)')
+        self.assertEqual(exc.metadata['hook_errors'], [
+            {'type': 'post_execute', 'hook': 'cleanup',
+             'error': "ValueError('cleanup failed')"}])
+
+    def test_cleanup_hooks_run_after_hook_failure(self):
+        # Every post-execute hook is attempted, even when a previous
+        # post-execute hook failed.
+        calls = []
+
+        @self.huey.task()
+        def task_a():
+            return 1
+
+        @self.huey.post_execute(on_failure='abort')
+        def hook1(task, value, exc):
+            calls.append('hook1')
+            raise ValueError('h1')
+
+        @self.huey.post_execute()
+        def hook2(task, value, exc):
+            calls.append('hook2')
+            raise ValueError('h2')
+
+        @self.huey.post_execute()
+        def hook3(task, value, exc):
+            calls.append('hook3')
+
+        r = task_a()
+        self.assertEqual(self.execute_next(), 1)
+        self.assertEqual(calls, ['hook1', 'hook2', 'hook3'])
+
+        # Hook problems are recorded in execution order.
+        exc = self.trap_exception(r)
+        self.assertEqual(
+            [(h['type'], h['hook']) for h in exc.metadata['hook_errors']],
+            [('post_execute', 'hook1'), ('post_execute', 'hook2')])
+
+    def test_hook_errors_ordered_across_phases(self):
+        # Problems from pre-execute and post-execute hooks appear in the
+        # final error result in the order the hooks were executed.
+        @self.huey.task()
+        def task_a():
+            raise TestError('boom')
+
+        @self.huey.pre_execute()
+        def pre1(task):
+            raise ValueError('p1')
+
+        @self.huey.pre_execute()
+        def pre2(task):
+            raise ValueError('p2')
+
+        @self.huey.post_execute()
+        def post1(task, value, exc):
+            raise ValueError('x1')
+
+        r = task_a()
+        self.assertTrue(self.execute_next() is None)
+        exc = self.trap_exception(r)
+        self.assertEqual(exc.metadata['error'], 'TestError(boom)')
+        self.assertEqual(
+            [(h['type'], h['hook']) for h in exc.metadata['hook_errors']],
+            [('pre_execute', 'pre1'), ('pre_execute', 'pre2'),
+             ('post_execute', 'post1')])
+
+    def test_required_post_execute_hook_retries(self):
+        # With a failing required post-execute hook, each retry attempt
+        # re-runs the task function and all hooks.
+        calls = {'pre': 0, 'post': 0, 'task': 0}
+
+        @self.huey.task(retries=1)
+        def task_a():
+            calls['task'] += 1
+            return 1
+
+        @self.huey.pre_execute()
+        def pre(task):
+            calls['pre'] += 1
+
+        @self.huey.post_execute(on_failure='abort')
+        def audit(task, value, exc):
+            calls['post'] += 1
+            raise ValueError('audit failed')
+
+        r = task_a()
+        self.assertEqual(self.execute_next(), 1)  # 1st attempt, retried.
+        self.assertEqual(self.execute_next(), 1)  # 2nd attempt, final.
+        self.assertEqual(calls, {'pre': 2, 'post': 2, 'task': 2})
+        self.assertRaises(TaskException, r.get)
+
+    def test_hook_errors_empty_by_default(self):
+        # A task that fails without any hook problems has an empty list.
+        @self.huey.task()
+        def task_a():
+            raise TestError('x')
+
+        r = task_a()
+        self.assertTrue(self.execute_next() is None)
+        exc = self.trap_exception(r)
+        self.assertEqual(exc.metadata['hook_errors'], [])
+
+
 class TestGroupPrimitive(BaseTestCase):
     def test_group(self):
         @self.huey.task()

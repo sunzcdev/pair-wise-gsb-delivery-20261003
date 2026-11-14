@@ -15,6 +15,9 @@ from functools import wraps
 
 from huey import signals as S
 from huey.constants import EmptyData
+from huey.constants import HOOK_ABORT
+from huey.constants import HOOK_IGNORE
+from huey.constants import HOOK_POLICIES
 from huey.consumer import Consumer
 from huey.exceptions import CancelExecution
 from huey.exceptions import ConfigurationError
@@ -23,6 +26,7 @@ from huey.exceptions import RETRYING_EXCEPTIONS
 from huey.exceptions import ResultTimeout
 from huey.exceptions import RetryTask
 from huey.exceptions import TaskException
+from huey.exceptions import TaskHookError
 from huey.exceptions import TaskLockedException
 from huey.exceptions import TaskTimeout
 from huey.registry import Registry
@@ -39,6 +43,7 @@ from huey.storage import RedisStorage
 from huey.storage import SqliteStorage
 from huey.utils import ChordConfig
 from huey.utils import Error
+from huey.utils import HookFailure
 from huey.utils import SKIPPED
 from huey.utils import noop_context
 from huey.utils import normalize_expire_time
@@ -225,9 +230,16 @@ class Huey(object):
             return self.task(**kwargs)(context_decorator(func))
         return task_decorator
 
-    def pre_execute(self, name=None):
+    def _validate_hook_policy(self, on_failure):
+        if on_failure is not None and on_failure not in HOOK_POLICIES:
+            raise ConfigurationError(
+                'invalid hook failure policy "%s", valid policies are: %s'
+                % (on_failure, ', '.join(HOOK_POLICIES)))
+
+    def pre_execute(self, name=None, on_failure=None):
+        self._validate_hook_policy(on_failure)
         def decorator(fn):
-            self._pre_execute[name or fn.__name__] = fn
+            self._pre_execute[name or fn.__name__] = (fn, on_failure)
             return fn
         return decorator
 
@@ -237,9 +249,10 @@ class Huey(object):
             name = name.__name__
         return self._pre_execute.pop(name, None) is not None
 
-    def post_execute(self, name=None):
+    def post_execute(self, name=None, on_failure=None):
+        self._validate_hook_policy(on_failure)
         def decorator(fn):
-            self._post_execute[name or fn.__name__] = fn
+            self._post_execute[name or fn.__name__] = (fn, on_failure)
             return fn
         return decorator
 
@@ -430,6 +443,15 @@ class Huey(object):
             return self._execute(task, timestamp)
 
     def _execute(self, task, timestamp):
+        # Reset the record of hook failures for this execution attempt. The
+        # failures are preserved, in execution order, in the error metadata
+        # should this attempt fail.
+        task.hook_failures = []
+
+        exception = None
+        retry_eta = None
+        task_value = None
+
         if self._pre_execute:
             try:
                 self._run_pre_execute(task)
@@ -437,82 +459,100 @@ class Huey(object):
                 self._emit(S.SIGNAL_CANCELED, task)
                 self._abort_chord_member(task, SKIPPED)
                 return
+            except TaskHookError as exc:
+                # A required pre-execute hook failed: the task function is
+                # not run and the hook failure becomes the task's error.
+                logger.error('Task %s not run, %s', task.id, exc)
+                exception = exc
+                self._emit(S.SIGNAL_ERROR, task, exc)
 
         start = time.monotonic()
-        exception = None
-        retry_eta = None
-        task_value = None
 
         if task.timeout:
             task._deadline = start + task.timeout
 
-        try:
-            self._tasks_in_flight.add(task)
+        if exception is None:
             try:
-                with self._timeout_context(task):
-                    task_value = task.execute()
-            finally:
-                # notify_interrupted_tasks() may have already popped it.
-                self._tasks_in_flight.discard(task)
-                duration = time.monotonic() - start
-        except TaskTimeout as exc:
-            logger.warning('Task %s timed out after %ss.', task.id,
-                           task.timeout)
-            exception = exc
-            self._emit(S.SIGNAL_TIMEOUT, task)
-        except RateLimitExceeded as exc:
-            delay = task.retry_delay or exc.delay
-            if exc.retry or task.retries:
-                logger.info('Task %s rate-limited on "%s", retrying in %s',
-                            task.id, exc.key, delay)
-                retry_eta = normalize_time(None, delay, self.utc)
-                if exc.retry:
-                    task.retries += 1
+                self._tasks_in_flight.add(task)
+                try:
+                    with self._timeout_context(task):
+                        task_value = task.execute()
+                finally:
+                    # notify_interrupted_tasks() may have already popped it.
+                    self._tasks_in_flight.discard(task)
+                    duration = time.monotonic() - start
+            except TaskTimeout as exc:
+                logger.warning('Task %s timed out after %ss.', task.id,
+                               task.timeout)
+                exception = exc
+                self._emit(S.SIGNAL_TIMEOUT, task)
+            except RateLimitExceeded as exc:
+                delay = task.retry_delay or exc.delay
+                if exc.retry or task.retries:
+                    logger.info('Task %s rate-limited on "%s", retrying in %s',
+                                task.id, exc.key, delay)
+                    retry_eta = normalize_time(None, delay, self.utc)
+                    if exc.retry:
+                        task.retries += 1
+                else:
+                    logger.info('Task %s rate-limited on "%s"', task.id,
+                                exc.key)
+                exception = exc
+                self._emit(S.SIGNAL_RATE_LIMITED, task)
+            except TaskLockedException as exc:
+                logger.warning('Task %s not run, %s.', task.id, exc)
+                exception = exc
+                self._emit(S.SIGNAL_LOCKED, task)
+            except RetryTask as exc:
+                logger.info('Task %s raised RetryTask, retrying.', task.id)
+                task.retries += 1
+                if exc.eta or exc.delay is not None:
+                    retry_eta = normalize_time(exc.eta, exc.delay, self.utc)
+                exception = exc
+            except CancelExecution as exc:
+                if exc.retry or (exc.retry is None and task.retries):
+                    task.retries = max(task.retries, 1)
+                    msg = '(task will be retried)'
+                else:
+                    task.retries = 0
+                    msg = '(aborted, will not be retried)'
+                logger.warning('Task %s raised CancelExecution %s.', task.id,
+                               msg)
+                self._emit(S.SIGNAL_CANCELED, task)
+                exception = exc
+            except KeyboardInterrupt:
+                logger.warning('Received exit signal, %s did not finish.',
+                               task.id)
+                self._emit(S.SIGNAL_INTERRUPTED, task)
+                return
+            except Exception as exc:
+                logger.exception('Unhandled exception in task %s.', task.id)
+                exception = exc
+                self._emit(S.SIGNAL_ERROR, task, exc)
             else:
-                logger.info('Task %s rate-limited on "%s"', task.id, exc.key)
-            exception = exc
-            self._emit(S.SIGNAL_RATE_LIMITED, task)
-        except TaskLockedException as exc:
-            logger.warning('Task %s not run, %s.', task.id, exc)
-            exception = exc
-            self._emit(S.SIGNAL_LOCKED, task)
-        except RetryTask as exc:
-            logger.info('Task %s raised RetryTask, retrying.', task.id)
-            task.retries += 1
-            if exc.eta or exc.delay is not None:
-                retry_eta = normalize_time(exc.eta, exc.delay, self.utc)
-            exception = exc
-        except CancelExecution as exc:
-            if exc.retry or (exc.retry is None and task.retries):
-                task.retries = max(task.retries, 1)
-                msg = '(task will be retried)'
-            else:
-                task.retries = 0
-                msg = '(aborted, will not be retried)'
-            logger.warning('Task %s raised CancelExecution %s.', task.id, msg)
-            self._emit(S.SIGNAL_CANCELED, task)
-            exception = exc
-        except KeyboardInterrupt:
-            logger.warning('Received exit signal, %s did not finish.', task.id)
-            self._emit(S.SIGNAL_INTERRUPTED, task)
-            return
-        except Exception as exc:
-            logger.exception('Unhandled exception in task %s.', task.id)
-            exception = exc
-            self._emit(S.SIGNAL_ERROR, task, exc)
-        else:
-            logger.info('%s executed in %0.3fs', task, duration)
+                logger.info('%s executed in %0.3fs', task, duration)
 
         # Clear the flag if this instance of the task was revoked after it
         # began executing. Expiring storages implement pop_data as a peek.
         if not isinstance(task, PeriodicTask):
             self.delete(task.revoke_id)
 
+        # Post-execute hooks run whether the task succeeded, failed, or was
+        # not run due to a required pre-execute hook failure. Cleanup-type
+        # hooks are each attempted even when a previous post-execute hook
+        # failed. A required post-execute hook failure turns an otherwise
+        # successful execution into a failure, but a hook failure never
+        # masks an exception raised by the task function itself.
+        hook_error = self._run_post_execute(task, task_value, exception)
+        if hook_error is not None and exception is None:
+            logger.error('Task %s failed, %s', task.id, hook_error)
+            exception = hook_error
+            self._emit(S.SIGNAL_ERROR, task, hook_error)
+
         store = self.results and not isinstance(task, PeriodicTask)
         if exception is None:
             if store and (task_value is not None or self.store_none):
                 self.put_result(task.id, task_value)
-            self._run_post_execute(task, task_value, exception)
             self._emit(S.SIGNAL_COMPLETE, task)
             if task.on_complete:
                 task.on_complete.extend_data(task_value)
@@ -529,7 +569,6 @@ class Huey(object):
                 while next_task is not None:
                     self.put_result(next_task.id, error)
                     next_task = next_task.on_complete if final else None
-            self._run_post_execute(task, task_value, exception)
             if surface and task.on_error:
                 # Copy, as on_error is shared across retries.
                 handler = copy.copy(task.on_error)
@@ -585,7 +624,7 @@ class Huey(object):
             self.enqueue(task)
 
     def _run_pre_execute(self, task):
-        for name, callback in self._pre_execute.items():
+        for name, (callback, on_failure) in self._pre_execute.items():
             logger.debug('Pre-execute hook %s for %s.', name, task)
             try:
                 callback(task)
@@ -593,18 +632,38 @@ class Huey(object):
                 logger.warning('Task %s cancelled by %s (pre-execute).',
                                task, name)
                 raise
-            except Exception:
+            except Exception as exc:
+                task.hook_failures.append(
+                    HookFailure('pre_execute', name, repr(exc)))
+                if on_failure == HOOK_ABORT:
+                    # Required hook failed: the task function will not be
+                    # run and remaining pre-execute hooks are skipped.
+                    raise TaskHookError('pre_execute', name, exc)
                 logger.exception('Unhandled exception calling pre-execute '
                                  'hook %s for %s.', name, task)
 
     def _run_post_execute(self, task, task_value, exception):
-        for name, callback in self._post_execute.items():
+        # Every post-execute hook is attempted, even when a previous hook
+        # failed, so that cleanup-type hooks always get a chance to run.
+        # The first failure of a required hook is returned to the caller.
+        hook_error = None
+        for name, (callback, on_failure) in self._post_execute.items():
             logger.debug('Post-execute hook %s for %s.', name, task)
             try:
                 callback(task, task_value, exception)
-            except Exception:
-                logger.exception('Unhandled exception calling post-execute '
-                                 'hook %s for %s.', name, task)
+            except Exception as exc:
+                task.hook_failures.append(
+                    HookFailure('post_execute', name, repr(exc)))
+                if on_failure == HOOK_ABORT:
+                    logger.error('Required post-execute hook %s failed for '
+                                 '%s: %r', name, task, exc)
+                    if hook_error is None:
+                        hook_error = TaskHookError('post_execute', name, exc)
+                else:
+                    logger.exception('Unhandled exception calling '
+                                     'post-execute hook %s for %s.',
+                                     name, task)
+        return hook_error
 
     def build_error_result(self, task, exception):
         tb = ''.join(traceback.format_exception(
@@ -619,6 +678,9 @@ class Huey(object):
             'retries': task.retries,
             'traceback': tb,
             'task_id': task.id,
+            # Hook problems preserved in the order the hooks were executed.
+            'hook_errors': [hf._asdict() for hf in
+                            getattr(task, 'hook_failures', ())],
         }
 
     def _task_key(self, task_class, key):
@@ -822,6 +884,7 @@ class Task(object):
         self.timeout = timeout if timeout is not None else self.default_timeout
         self.chord_config = chord_config
         self._deadline = None
+        self.hook_failures = []
 
         self.on_complete = on_complete
         self.on_error = on_error

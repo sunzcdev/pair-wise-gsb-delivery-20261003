@@ -577,16 +577,27 @@ Huey object
                 # conn is the value returned by db.__enter__()
                 return conn.execute(n)
 
-    .. py:method:: pre_execute(name=None)
+    .. py:method:: pre_execute(name=None, on_failure=None)
 
         :param name: (optional) name for the hook.
+        :param str on_failure: (optional) failure policy for the hook, one of:
+
+            * ``None`` or ``'ignore'`` (default): an uncaught exception is
+              logged and recorded, but does not affect task execution.
+            * ``'abort'``: the hook is required. If it fails, the task
+              function is **not** run and the task fails with a
+              :py:class:`TaskHookError` (the task's normal retry policy
+              applies). Remaining pre-execute hooks are skipped, but
+              post-execute hooks still run.
+
         :returns: a decorator used to wrap the actual pre-execute function.
 
         Decorator for registering a pre-execute hook. The callback will be
         executed before the execution of every task. Execution of the task can
         be cancelled by raising a :py:class:`CancelExecution` exception.
         Uncaught exceptions will be logged but will not cause the task itself
-        to be cancelled.
+        to be cancelled, unless the hook was registered with
+        ``on_failure='abort'``.
 
         The callback function should accept a single task instance, the return
         value is ignored.
@@ -602,6 +613,12 @@ Huey object
                 if datetime.datetime.now().weekday() == 6:
                     raise CancelExecution('Sunday, no work will be done.')
 
+            # Required hook: if the connection cannot be established, the
+            # task will not run and is treated as failed.
+            @huey.pre_execute(on_failure='abort')
+            def init_connection(task):
+                conn.connect()
+
     .. py:method:: unregister_pre_execute(name)
 
         :param name: the name given to the pre-execute hook, or the
@@ -610,14 +627,30 @@ Huey object
 
         Unregister the specified pre-execute hook.
 
-    .. py:method:: post_execute(name=None)
+    .. py:method:: post_execute(name=None, on_failure=None)
 
         :param name: (optional) name for the hook.
+        :param str on_failure: (optional) failure policy for the hook, one of:
+
+            * ``None`` or ``'ignore'`` (default): an uncaught exception is
+              logged and recorded, but does not affect the task's outcome.
+            * ``'abort'``: the hook is required. If it fails and the task
+              function itself succeeded, the task is treated as failed with a
+              :py:class:`TaskHookError` -- the success chain (``on_complete``,
+              ``SIGNAL_COMPLETE``) does not run and the error chain
+              (``on_error``, ``SIGNAL_ERROR``) runs instead. A hook failure
+              never masks an exception raised by the task function itself.
+
         :returns: a decorator used to wrap the actual post-execute function.
 
         Register a post-execute hook. The callback will be executed after the
         execution of every task. Uncaught exceptions will be logged but will
-        have no other effect on the overall operation of the consumer.
+        have no other effect on the overall operation of the consumer, unless
+        the hook was registered with ``on_failure='abort'``.
+
+        Every post-execute hook is attempted, even when a previous
+        post-execute hook failed, so cleanup-type hooks always get a chance
+        to run.
 
         The callback function should accept:
 
@@ -637,6 +670,11 @@ Huey object
             @huey.post_execute()
             def my_post_execute_hook(task, task_value, exc):
                 do_something()
+
+            # Cleanup hook: always attempted, failure marks the task failed.
+            @huey.post_execute(on_failure='abort')
+            def release_connection(task, task_value, exc):
+                conn.close()
 
     .. py:method:: unregister_post_execute(name)
 
@@ -767,8 +805,11 @@ Huey object
 
         Build the metadata stored when a task fails. The default implementation
         returns the exception's ``repr()``, the formatted traceback, the retry
-        count and the task id. Override it on a :py:class:`Huey` subclass to
-        record additional context. See :ref:`recipe-custom-error-metadata`.
+        count, the task id, and a ``hook_errors`` list recording any hook
+        problems in the order the hooks were executed (each entry is a dict
+        with ``type``, ``hook`` and ``error`` keys). Override it on a
+        :py:class:`Huey` subclass to record additional context. See
+        :ref:`recipe-custom-error-metadata`.
 
     .. py:method:: enqueue(task)
 
@@ -2296,6 +2337,20 @@ Exceptions
 .. py:class:: RateLimitExceeded(key, delay, retry=True)
 
     Raised when a rate-limit has been exceeded.
+
+.. py:class:: TaskHookError(hook_type, name, exc)
+
+    Raised when a hook registered with ``on_failure='abort'`` fails. The
+    failing hook's phase (``'pre_execute'`` or ``'post_execute'``), name and
+    original exception are available as the ``hook_type``, ``hook_name`` and
+    ``exc`` attributes.
+
+    * When raised by a required :py:meth:`~Huey.pre_execute` hook, the task
+      function is not run and the task fails (its normal retry policy
+      applies).
+    * When raised by a required :py:meth:`~Huey.post_execute` hook after an
+      otherwise-successful task, the task is treated as failed: the error
+      chain runs and the success chain does not.
 
 .. py:class:: CancelExecution(msg=None, retry=None)
 

@@ -3,6 +3,21 @@ Changelog
 
 ## Master
 
+* Add explicit failure policies to `pre_execute` and `post_execute` hooks via
+  a new `on_failure` parameter. Hooks registered with `on_failure='abort'`
+  are required: a failing required pre-execute hook prevents the task
+  function from running, and a failing required post-execute hook turns an
+  otherwise-successful task into a failure (the error chain runs, the success
+  chain does not). A post-execute hook failure never masks an exception
+  raised by the task function itself, and every post-execute hook is
+  attempted even when a previous one failed. Hooks registered without a
+  policy behave as before (log and continue). Hook problems are preserved,
+  in execution order, in the `hook_errors` list of the error metadata. Adds
+  the `huey.TaskHookError` exception.
+* Post-execute hooks now run before the task's result is stored, so that a
+  required post-execute hook failure does not leave a stale success value in
+  the result store.
+
 [View commits](https://github.com/coleifer/huey/compare/3.5.4...master)
 
 ## 3.5.4

@@ -4,6 +4,21 @@ class TaskLockedException(HueyException): pass
 class ResultTimeout(HueyException): pass
 class TaskTimeout(HueyException): pass
 
+class TaskHookError(HueyException):
+    """
+    Raised when a "required" hook (registered with on_failure='abort')
+    fails. Carries information about the hook that failed.
+    """
+    def __init__(self, hook_type, name, exc):
+        self.hook_type = hook_type
+        self.hook_name = name
+        self.exc = exc
+        super(TaskHookError, self).__init__(
+            '%s hook "%s" failed: %r' % (hook_type, name, exc))
+
+    def __reduce__(self):
+        return (TaskHookError, (self.hook_type, self.hook_name, self.exc))
+
 class RateLimitExceeded(HueyException):
     def __init__(self, key, delay, retry=True):
         self.key, self.delay, self.retry = key, delay, retry
