@@ -74,6 +74,10 @@ SUPPORTED_VERSIONS = {
 def _open_resource(
     url_file_stream_or_string,
     result,
+    *,
+    etag=None,
+    modified=None,
+    previous_result=None,
 ):
     """URL, filename, or string --> stream
 
@@ -114,7 +118,13 @@ def _open_resource(
         "https",
     )
     if looks_like_url:
-        data = http.get(url_file_stream_or_string, result)
+        data = http.get(
+            url_file_stream_or_string,
+            result,
+            etag=etag,
+            modified=modified,
+            previous_result=previous_result,
+        )
         return io.BytesIO(data)
 
     # try to open with native open function (if url_file_stream_or_string is a filename)
@@ -154,6 +164,9 @@ def parse(
     resolve_relative_uris: bool | None = None,
     sanitize_html: bool | None = None,
     optimistic_encoding_detection: bool | None = None,
+    etag: str | None = None,
+    modified=None,
+    previous_result: FeedParserDict | None = None,
 ) -> FeedParserDict:
     """Parse a feed from a URL, file, stream, or string.
 
@@ -188,6 +201,16 @@ def parse(
         (uses less memory, but the wrong encoding may be detected in rare cases).
         Defaults to the value of
         :data:`feedparser.OPTIMISTIC_ENCODING_DETECTION`, which is ``True``.
+    :param etag:
+        An ETag returned by a previous request. It is sent in an
+        ``If-None-Match`` header. Weak ETags are sent unchanged.
+    :param modified:
+        A Last-Modified value returned by a previous request. It is sent in
+        an ``If-Modified-Since`` header.
+    :param previous_result:
+        A previously parsed result. If the server responds with HTTP 304,
+        its feed and entries are reused in the returned result. The supplied
+        object is not modified.
 
     """
 
@@ -202,6 +225,9 @@ def parse(
         file = _open_resource(
             url_file_stream_or_string,
             result,
+            etag=etag,
+            modified=modified,
+            previous_result=previous_result,
         )
     except urllib.error.URLError as error:
         result.update(
@@ -210,6 +236,9 @@ def parse(
                 "bozo_exception": error,
             }
         )
+        return result
+
+    if result.get("status") == 304:
         return result
 
     # at this point, the file is guaranteed to be seekable;

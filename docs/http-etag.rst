@@ -24,13 +24,18 @@ Using ETags to reduce bandwidth
     >>> d = feedparser.parse('$READTHEDOCS_CANONICAL_URL/examples/atom10.xml')
     >>> d.etag
     '"6c132-941-ad7e3080"'
-    >>> d2 = feedparser.parse('$READTHEDOCS_CANONICAL_URL/examples/atom10.xml', etag=d.etag)
+    >>> d2 = feedparser.parse(
+    ...     '$READTHEDOCS_CANONICAL_URL/examples/atom10.xml',
+    ...     etag=d.etag,
+    ...     modified=d.modified,
+    ...     previous_result=d,
+    ... )
     >>> d2.status
     304
-    >>> d2.feed
-    {}
-    >>> d2.entries
-    []
+    >>> d2.not_modified
+    True
+    >>> d2.entries == d.entries
+    True
     >>> d2.debug_message
     'The feed has not changed since you last checked, so
     the server sent no data.  This is a feature, not a bug!'
@@ -54,13 +59,17 @@ Using Last-Modified headers to reduce bandwidth
     Fri, 11 Jun 2012 23:00:34 GMT
     >>> d.modified_parsed
     (2004, 6, 11, 23, 0, 34, 4, 163, 0)
-    >>> d2 = feedparser.parse('$READTHEDOCS_CANONICAL_URL/examples/atom10.xml', modified=d.modified)
+    >>> d2 = feedparser.parse(
+    ...     '$READTHEDOCS_CANONICAL_URL/examples/atom10.xml',
+    ...     modified=d.modified,
+    ...     previous_result=d,
+    ... )
     >>> d2.status
     304
-    >>> d2.feed
-    {}
-    >>> d2.entries
-    []
+    >>> d2.not_modified
+    True
+    >>> d2.entries == d.entries
+    True
     >>> d2.debug_message
     'The feed has not changed since you last checked, so
     the server sent no data.  This is a feature, not a bug!'
