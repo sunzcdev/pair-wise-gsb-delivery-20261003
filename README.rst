@@ -72,9 +72,59 @@ A special ``ArcWarcRecord.content_stream()`` function provides a stream that
 automatically decompresses and de-chunks the HTTP payload, if it is
 compressed and/or transfer-encoding chunked.
 
+Resolving ``revisit`` Records
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+A ``revisit`` record does not store its payload a second time: it keeps the
+HTTP metadata of the capture and points at an earlier record whose payload is
+identical. ``warcio.revisit`` turns such a record into readable content.
+
+The library never goes looking for the referenced record itself. Instead, the
+caller supplies a lookup callback which is invoked with a
+``RevisitReference`` (either a WARC record id, or a target URI plus date) and
+returns the corresponding record, or ``None``.
+
+.. code:: python
+
+    from warcio.revisit import RevisitResolver
+
+    def lookup(reference):
+        # caller-defined: find the record in an index, a local file, etc.
+        return index.get(reference.key)
+
+    with RevisitResolver(lookup) as resolver:
+        content = resolver.resolve(revisit_record)
+
+        # HTTP metadata still belongs to the revisit record itself
+        print(content.statusline)
+
+        # the payload comes from the earlier record:
+        print(content.read_payload())     # bytes as stored
+        print(content.read_content())     # with Content-Encoding etc. applied
+
+The lookup may also be split into ``by_record_id`` / ``by_uri_date`` callbacks,
+or given as a mapping keyed by record id or ``(uri, date)``. The callback owns
+the records and streams it returns; the resolver copies the payload it needs
+and never closes them, so they can be closed as soon as ``resolve()`` returns.
+
+Resolved content keeps its sources separate: ``content.rec_headers`` and
+``content.http_headers`` are the revisit's own metadata, while
+``content.payload_record`` is the earlier record the payload came from. A
+revisit is never replaced by the referenced record as a whole.
+
+Revisit chains are followed up to ``max_chain_length`` (default 10). Every
+failure raises a ``RevisitResolveError`` subclass instead of returning content:
+a cycle, a missing reference, an unsupported ``WARC-Profile``, a referenced
+record type that cannot supply a payload (``RevisitTargetTypeError``), or a
+payload which does not match the revisit's ``WARC-Payload-Digest``
+(``RevisitDigestError``). Use ``require_digest=True`` to reject revisits with
+no digest at all.
+
+Readers from ``content.open_payload()`` / ``content.open_content()`` are
+independent cursors, so a record can be resolved and read more than once.
+
 ARC Files
 ~~~~~~~~~
-
 The library provides support for reading (but not writing ARC) files.
 The ARC format is legacy but is important to support in a consistent
 matter. The ``ArchiveIterator`` can equally iterate over ARC and WARC

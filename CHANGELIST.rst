@@ -1,3 +1,12 @@
+Unreleased
+~~~~~~~~~~
+
+- Add ``warcio.revisit`` for explicit resolution of ``revisit`` records:
+  caller-provided lookup by record id or URI+date, bounded revisit chains with
+  cycle/missing-reference/wrong-target-type detection, payload digest
+  verification, and re-readable payloads which keep the revisit's own HTTP
+  metadata separate from the referenced record.
+
 1.8.2
 ~~~~~
 

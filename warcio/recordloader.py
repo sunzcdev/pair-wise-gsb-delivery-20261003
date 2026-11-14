@@ -17,6 +17,38 @@ logger = logging.getLogger(__name__)
 
 
 #=================================================================
+def content_stream_for(http_headers, raw_stream):
+    """ Return a readable stream for the payload of a record, applying
+    any transfer/content decoding indicated by its HTTP headers.
+
+    If no decoding is needed, or if the headers are missing, the passed
+    in raw_stream is returned unaltered.
+    """
+    if not http_headers:
+        return raw_stream
+
+    encoding = http_headers.get_header('content-encoding')
+
+    if encoding:
+        encoding = encoding.lower()
+
+        # 'x-gzip' is a legacy alias for 'gzip' (RFC 7230 4.2.3, RFC 2616
+        # 3.5); treat it the same so an x-gzip payload is still decompressed.
+        if encoding == 'x-gzip':
+            encoding = 'gzip'
+
+        if encoding not in BufferedReader.get_supported_decompressors():
+            encoding = None
+
+    if http_headers.get_header('transfer-encoding') == 'chunked':
+        return ChunkedDataReader(raw_stream, decomp_type=encoding)
+    elif encoding:
+        return BufferedReader(raw_stream, decomp_type=encoding)
+    else:
+        return raw_stream
+
+
+#=================================================================
 class ArcWarcRecord(object):
     def __init__(self, *args, **kwargs):
         (self.format, self.rec_type, self.rec_headers, self.raw_stream,
@@ -25,28 +57,18 @@ class ArcWarcRecord(object):
         self.digest_checker = kwargs.get('digest_checker')
 
     def content_stream(self):
-        if not self.http_headers:
-            return self.raw_stream
+        return content_stream_for(self.http_headers, self.raw_stream)
 
-        encoding = self.http_headers.get_header('content-encoding')
+    def resolve_revisit(self, *args, **kwargs):
+        """ Resolve this ``revisit`` record into readable content.
 
-        if encoding:
-            encoding = encoding.lower()
-
-            # 'x-gzip' is a legacy alias for 'gzip' (RFC 7230 4.2.3, RFC 2616
-            # 3.5); treat it the same so an x-gzip payload is still decompressed.
-            if encoding == 'x-gzip':
-                encoding = 'gzip'
-
-            if encoding not in BufferedReader.get_supported_decompressors():
-                encoding = None
-
-        if self.http_headers.get_header('transfer-encoding') == 'chunked':
-            return ChunkedDataReader(self.raw_stream, decomp_type=encoding)
-        elif encoding:
-            return BufferedReader(self.raw_stream, decomp_type=encoding)
-        else:
-            return self.raw_stream
+        Convenience wrapper around :func:`warcio.revisit.resolve_revisit`.
+        All lookups are delegated to the callbacks supplied by the caller;
+        this library never goes to the network or opens archive files itself.
+        """
+        # imported lazily to avoid a circular import
+        from warcio.revisit import resolve_revisit
+        return resolve_revisit(self, *args, **kwargs)
 
 
 #=================================================================
