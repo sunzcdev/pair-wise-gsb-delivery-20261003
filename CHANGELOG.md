@@ -3,6 +3,25 @@ Changelog
 
 ## Master
 
+* Fix a chord race where processing a member's completion notification twice
+  could advance the completion counter twice and fire the callback early. A
+  member's result is now recorded first-writer-wins under a key derived from
+  its position, and the counter only advances when a new member result is
+  recorded, so duplicate notifications no longer move the barrier.
+
+* Ensure a chord callback is enqueued exactly once when multiple consumers
+  process the last members concurrently. The callback is only enqueued by the
+  consumer that observes the final distinct member; late notifications for a
+  completed chord are discarded.
+
+* Transient errors from a member that will be retried no longer claim the
+  member's chord result slot, so the eventual (successful) result is what the
+  callback receives. Conflicting terminal results for the same member are
+  logged as a warning so a double execution can be diagnosed.
+
+* Chord member results are always passed to the callback ordered by the
+  member's original position, regardless of completion order.
+
 [View commits](https://github.com/coleifer/huey/compare/3.5.4...master)
 
 ## 3.5.4

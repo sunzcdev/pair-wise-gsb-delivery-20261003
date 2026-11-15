@@ -1786,6 +1786,16 @@ Huey object
     the guide for patterns on handling mixed results.
 
     .. note::
+        The callback fires once every *distinct* member has reached a terminal
+        state. A member's result is recorded with a first-writer-wins write,
+        and the completion counter only advances when a new member result is
+        recorded, so a duplicate completion notification for a member cannot
+        advance the barrier or replace the recorded result. Conflicting
+        terminal values for the same member are logged as a warning. If
+        multiple consumers finish the last members concurrently, only one
+        enqueues the callback.
+
+    .. note::
         Revoking a chord member prevents it from running, but the chord still
         completes. If you need to cancel a chord, revoke the callback task
         instead.

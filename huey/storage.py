@@ -252,6 +252,17 @@ class BaseStorage(object):
         self.put_data(key, value)
         return True
 
+    def put_if_empty_result(self, key, value):
+        """
+        Atomically write a (volatile) task result only if the key is not
+        already set. Returns whether the value was written.
+
+        This is used for internal bookkeeping (chord member results), so it is
+        treated like :py:meth:`put_data` with ``is_result=True`` by storages
+        that expire results.
+        """
+        return self.put_if_empty(key, value)
+
     def incr(self, key, amount=1):
         """
         Atomically increment a counter, returning the new value. If the key
@@ -704,6 +715,12 @@ class RedisExpireStorage(RedisStorage):
     def put_if_empty(self, key, value, ttl=None):
         return bool(self.conn.set(self.result_key(key), value, nx=True,
                                   ex=ttl))
+
+    def put_if_empty_result(self, key, value):
+        # Mirrors put_data(is_result=True): the value expires like any other
+        # volatile task result.
+        return bool(self.conn.set(self.result_key(key), value, nx=True,
+                                  ex=self._expire_time))
 
     def incr(self, key, amount=1):
         pipe = self.conn.pipeline()

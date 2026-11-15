@@ -328,6 +328,16 @@ class Huey(object):
         cid = str(uuid.uuid4())
         size = len(chord_obj.tasks)
         results = []
+
+        if size:
+            # Mark the chord as open before any member is enqueued. It is
+            # removed when the chord completes, so a notification arriving for
+            # an already-completed chord can be recognized and ignored rather
+            # than resurrecting its bookkeeping. Stored as a result so that
+            # storages which expire results will also reap this marker if the
+            # chord is abandoned (e.g. a member was lost on shutdown).
+            self.put_result(self._chord_open_key(cid), True)
+
         for i, task in enumerate(chord_obj.tasks):
             if isinstance(task, group):
                 raise ValueError('cannot use `group` as a chord member - '
@@ -550,24 +560,118 @@ class Huey(object):
                 return self._check_chord(task.chord_config, value)
             task = task.on_complete
 
+    def _chord_result_key(self, cid, idx):
+        return 'chord:%s:%s' % (cid, idx)
+
+    def _chord_counter_key(self, cid):
+        return 'chord:%s' % cid
+
+    def _chord_open_key(self, cid):
+        return 'chord:%s:open' % cid
+
+    def _chord_conflict(self, cc, key, serialized):
+        # This member's slot is already occupied, so the member has already
+        # reported a terminal result. An equal value is a duplicate completion
+        # notification and is harmless -- the member was accounted for, and
+        # counted, by the first notification. Different data means two
+        # distinct terminal outcomes were reported for the same member: the
+        # first result is retained (tasks are delivered at-most-once) and the
+        # discrepancy is logged with both values so it can be diagnosed.
+        raw = self.get_raw(key, peek=True)
+        if raw is EmptyData:
+            logger.debug('Ignoring terminal notification for chord %s member '
+                         '%s: the chord already completed.', cc.cid, cc.idx)
+            return
+
+        try:
+            recorded = self.serializer.deserialize(raw)
+            incoming = self.serializer.deserialize(serialized)
+            duplicate = bool(recorded == incoming)
+        except Exception:
+            recorded = incoming = _sentinel
+            duplicate = bool(raw == serialized)
+
+        if duplicate:
+            logger.debug('Ignoring duplicate terminal notification for chord '
+                         '%s member %s.', cc.cid, cc.idx)
+        else:
+            logger.warning('Conflicting terminal results for chord %s member '
+                           '%s: recorded %r, ignoring %r.', cc.cid, cc.idx,
+                           recorded, incoming)
+
     def _check_chord(self, cc, value):
-        chord_key = 'chord:%s' % cc.cid
-        result_key = 'chord:%s:%s' % (cc.cid, cc.idx)
-        self.put_result(result_key, value)
+        """
+        Record a chord member's terminal result and, once the terminal state
+        of every *distinct* member has arrived, enqueue the callback once.
 
-        if self.storage.incr(chord_key) == cc.size:
-            self.storage.delete_counter(chord_key)
+        Member results live under keys derived from their position in the
+        chord, so the callback receives them in the original member order.
+        Each member's slot is written with ``put_if_empty``: the first
+        terminal result for a member wins, and a repeat notification for that
+        member fails the write. Because the completion counter is incremented
+        only after a *successful* slot write, a duplicate notification cannot
+        advance the barrier -- so it cannot fire the callback early, nor
+        replace the recorded result.
 
-            # Expiring storages implement pop_data as a peek.
-            results = []
-            for idx in range(cc.size):
-                key = 'chord:%s:%s' % (cc.cid, idx)
-                results.append(self.get(key, peek=True))
-                self.delete(key)
+        The counter therefore counts distinct finished members, and ``incr()``
+        returns a distinct value to every caller: exactly one consumer can
+        tally the final member, so when two consumers process the last few
+        members simultaneously only one of them claims the callback.
 
-            callback = cc.callback
-            callback.extend_data((results,))
-            self.enqueue(callback)
+        Only terminal outcomes reach this method. A member that is going to be
+        retried is re-queued instead, so a transient error never claims a slot
+        and cannot shadow the member's eventual result.
+
+        :return: boolean indicating whether the callback was enqueued.
+        """
+        open_key = self._chord_open_key(cc.cid)
+        result_key = self._chord_result_key(cc.cid, cc.idx)
+
+        if not self.storage.has_data_for_key(open_key):
+            # The chord has completed and its results were collected. This is
+            # a late duplicate notification; it must not resurrect the chord.
+            logger.debug('Ignoring terminal notification for chord %s member '
+                         '%s: the chord already completed.', cc.cid, cc.idx)
+            return False
+
+        serialized = self.serializer.serialize(value)
+        if not self.storage.put_if_empty_result(result_key, serialized):
+            self._chord_conflict(cc, result_key, serialized)
+            return False
+
+        counter_key = self._chord_counter_key(cc.cid)
+        count = self.storage.incr(counter_key)
+        if not self.storage.has_data_for_key(open_key):
+            # The chord was completed by another consumer between the check at
+            # the top of this method and now, so the slot (and possibly the
+            # counter) recorded here are stale. Remove them so no bookkeeping
+            # lingers and the callback cannot fire again.
+            self.delete(result_key)
+            self.storage.delete_counter(counter_key)
+            logger.debug('Discarded late terminal notification for chord %s '
+                         'member %s.', cc.cid, cc.idx)
+            return False
+
+        if count != cc.size:
+            return False  # Not every distinct member is terminal yet.
+
+        # Read all member results, in member order. Expiring storages
+        # implement pop_data as a peek, so read non-destructively.
+        results = [self.get(self._chord_result_key(cc.cid, idx), peek=True)
+                   for idx in range(cc.size)]
+
+        # Retire the in-progress marker first, then remove the member results
+        # and counter. Clearing the marker first means a duplicate that races
+        # this section finds the chord closed and is discarded.
+        self.storage.delete_data(open_key)
+        for idx in range(cc.size):
+            self.delete(self._chord_result_key(cc.cid, idx))
+        self.storage.delete_counter(counter_key)
+
+        callback = cc.callback
+        callback.extend_data((results,))
+        self.enqueue(callback)
+        return True
 
     def _requeue_task(self, task, timestamp, retry_eta=None):
         task.retries -= 1

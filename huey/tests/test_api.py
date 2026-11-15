@@ -25,6 +25,7 @@ from huey.exceptions import TaskLockedException
 from huey.exceptions import TaskTimeout
 from huey.serializer import SignedSerializer
 from huey.tests.base import BaseTestCase
+from huey.tests.base import ChordBarrierTests
 from huey.utils import Error
 from huey.utils import SKIPPED
 
@@ -2450,6 +2451,180 @@ class TestChordPrimitive(BaseTestCase):
         self.assertEqual(self.execute_next(), -1)
         self.assertEqual(len(self.huey), 0)
         self.assertEqual(state, [99])
+
+    def test_chord_duplicate_member_notification(self):
+        # A member's completion notification delivered twice must not advance
+        # the barrier a second time (which could fire the callback early) nor
+        # replace the recorded result.
+        @self.huey.task()
+        def ident(v):
+            return v
+
+        @self.huey.task()
+        def agg(vs):
+            return vs
+
+        r = self.huey.enqueue(chord([ident.s('a'), ident.s('b')], agg))
+        self.assertEqual(len(self.huey), 2)
+
+        task_a, task_b = [self.huey.dequeue() for _ in range(2)]
+        self.assertEqual(self.huey.execute(task_a), 'a')
+
+        # Re-dispatch the notification for member 0. The slot is occupied, so
+        # this must be a no-op: the chord is still waiting on member 1.
+        cc = task_a.chord_config
+        self.assertFalse(self.huey._check_chord(cc, 'a'))
+        self.assertEqual(len(self.huey), 0)
+
+        # The slot still holds the original value; the callback has not fired.
+        self.assertEqual(self.huey.get('chord:%s:0' % cc.cid, peek=True), 'a')
+        self.assertIsNone(r.callback.get_raw_result())
+
+        self.assertEqual(self.huey.execute(task_b), 'b')
+        self.assertEqual(len(self.huey), 1)
+        self.assertEqual(self.execute_next(), ['a', 'b'])
+        self.assertEqual(r(), ['a', 'b'])
+
+    def test_chord_duplicate_final_member(self):
+        # The same state must hold for the last member: a duplicate for the
+        # final member cannot enqueue a second callback.
+        @self.huey.task()
+        def ident(v):
+            return v
+
+        @self.huey.task()
+        def agg(vs):
+            return vs
+
+        r = self.huey.enqueue(chord([ident.s('a'), ident.s('b')], agg))
+        tasks = [self.huey.dequeue() for _ in range(2)]
+        for task in tasks:
+            self.huey.execute(task)
+
+        self.assertEqual(len(self.huey), 1)  # Callback only.
+        cc = tasks[-1].chord_config
+        self.assertFalse(self.huey._check_chord(cc, 'b'))
+        self.assertEqual(len(self.huey), 1)  # Still just one callback.
+
+        self.assertEqual(self.execute_next(), ['a', 'b'])
+        self.assertEqual(len(self.huey), 0)
+        self.assertEqual(r(), ['a', 'b'])
+
+    def test_chord_conflicting_results_are_logged(self):
+        # Two *different* terminal results for the same member: the first is
+        # retained and the conflict is surfaced in the logs.
+        @self.huey.task()
+        def ident(v):
+            return v
+
+        @self.huey.task()
+        def agg(vs):
+            return vs
+
+        r = self.huey.enqueue(chord([ident.s('a'), ident.s('b')], agg))
+        tasks = [self.huey.dequeue() for _ in range(2)]
+        self.huey.execute(tasks[0])
+
+        cc = tasks[0].chord_config
+        with self.assertLogs('huey', 'WARNING') as logs:
+            self.assertFalse(self.huey._check_chord(cc, 'zzz'))
+        self.assertIn('Conflicting terminal results', logs.records[0].getMessage())
+        self.assertIn("'a'", logs.records[0].getMessage())
+        self.assertIn("'zzz'", logs.records[0].getMessage())
+
+        # The original value is retained.
+        self.assertEqual(self.huey.get('chord:%s:0' % cc.cid, peek=True), 'a')
+        self.huey.execute(tasks[1])
+        self.assertEqual(self.execute_next(), ['a', 'b'])
+        self.assertEqual(r(), ['a', 'b'])
+
+    def test_chord_member_order_not_completion_order(self):
+        # Members finishing out of order are still reported to the callback in
+        # their original index order.
+        @self.huey.task()
+        def ident(v):
+            return v
+
+        @self.huey.task()
+        def agg(vs):
+            return vs
+
+        r = self.huey.enqueue(chord([ident.s('a'), ident.s('b')], agg))
+        task_a, task_b = [self.huey.dequeue() for _ in range(2)]
+        self.assertEqual(self.huey.execute(task_b), 'b')  # Member 1 first.
+        self.assertEqual(self.huey.execute(task_a), 'a')  # Member 0 second.
+
+        self.assertEqual(self.execute_next(), ['a', 'b'])
+        self.assertEqual(r(), ['a', 'b'])
+
+    def test_chord_retry_does_not_claim_slot(self):
+        # A retrying member is not in a terminal state, so a transient error
+        # must never occupy the member's slot and shadow the final result.
+        attempts = {}
+
+        @self.huey.task(retries=2)
+        def flaky(n):
+            attempts[n] = attempts.get(n, 0) + 1
+            if attempts[n] < 3:
+                raise TestError('transient')
+            return 'ok-%s' % n
+
+        @self.huey.task()
+        def agg(vs):
+            return vs
+
+        r = self.huey.enqueue(chord([flaky.s(1)], agg))
+
+        task = self.huey.dequeue()
+        cc = task.chord_config
+        self.assertTrue(self.huey.execute(task) is None)  # Attempt 1 fails.
+        self.assertFalse(self.huey.storage.has_data_for_key(
+            'chord:%s:0' % cc.cid))
+
+        task = self.huey.dequeue()
+        self.assertTrue(self.huey.execute(task) is None)  # Attempt 2 fails.
+        self.assertFalse(self.huey.storage.has_data_for_key(
+            'chord:%s:0' % cc.cid))
+
+        self.assertEqual(self.execute_next(), 'ok-1')  # Attempt 3 succeeds.
+        self.assertEqual(self.execute_next(), ['ok-1'])
+        self.assertEqual(r(), ['ok-1'])
+        self.assertEqual(attempts, {1: 3})
+
+    def test_chord_skipped_and_failed_members(self):
+        # Revoked/expired members contribute SKIPPED, failed members an Error,
+        # and the list stays ordered by the member's original index.
+        @self.huey.task()
+        def ident(v):
+            return v
+
+        @self.huey.task()
+        def bad():
+            raise TestError('boom')
+
+        @self.huey.task()
+        def agg(vs):
+            return vs
+
+        tasks = [ident.s('a'), bad.s(), ident.s('c')]
+        r = self.huey.enqueue(chord(tasks, agg))
+        list(r.results)[0].revoke()
+
+        self.assertTrue(self.execute_next() is None)  # Revoked -> SKIPPED.
+        self.assertTrue(self.execute_next() is None)  # Failed -> Error.
+        self.assertEqual(self.execute_next(), 'c')
+
+        self.assertEqual(len(self.huey), 1)
+        values = self.execute_next()
+        self.assertIs(values[0], SKIPPED)
+        self.assertTrue(isinstance(values[1], Error))
+        self.assertEqual(values[2], 'c')
+        self.assertEqual(r(), values)
+
+
+class TestChordBarrierMemory(ChordBarrierTests, BaseTestCase):
+    def chord_counter_count(self, huey):
+        return len(huey.storage._counters)
 
 
 class TestTaskChaining(BaseTestCase):

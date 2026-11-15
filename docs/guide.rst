@@ -1214,12 +1214,27 @@ What happens when a :py:class:`chord` is enqueued?
 
 1. All sub-tasks are placed on the queue. Workers begin executing them as they
    are dequeued.
-2. As each sub-task completes (or fails permanently), its return value (or
-   error) is stored and an internal completion counter is atomically
-   incremented.
-3. When the last sub-task is complete, all sub-task results are collected in
-   order. The final callback is then enqueued with the sub-task results.
+2. As each sub-task reaches a terminal state -- it succeeds, exhausts its
+   retries, or is skipped without running -- its return value (or error) is
+   stored under a key derived from its position in the chord, and an internal
+   completion counter is atomically incremented.
+3. When the counter shows that every distinct sub-task has reached a terminal
+   state, the results are collected in member order and the final callback is
+   enqueued exactly once.
 4. The callback is executed by a worker and the final result is made available.
+
+.. note::
+    A sub-task's result is recorded with a first-writer-wins write, and the
+    completion counter only advances when a *new* member result is recorded.
+    If a member's completion notification is processed twice, the second
+    notification is ignored: it can neither advance the barrier (and fire the
+    callback early, with results missing) nor overwrite the result that was
+    already recorded. Conflicting terminal values for the same member are
+    logged as a warning so a double execution can be diagnosed.
+
+    If several consumers process the last sub-tasks at the same time, the
+    atomic counter guarantees that only one of them collects the results and
+    enqueues the callback.
 
 .. note::
     A sub-task that is skipped without executing (because it was revoked,

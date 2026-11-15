@@ -36,6 +36,7 @@ from huey.constants import EmptyData
 from huey.exceptions import ConfigurationError
 from huey.storage import FileStorage
 from huey.tests.base import BaseTestCase
+from huey.tests.base import ChordBarrierTests
 from huey.tests.base import CI
 from huey.tests.base import slow_test
 
@@ -610,6 +611,29 @@ class TestSqliteStorage(StorageTests, BaseTestCase):
                                    ('index', 'task'))
         self.assertEqual([r[0] for r in curs.fetchall()],
                          ['task_queue_priority_id'])
+
+
+class TestSqliteChordBarrier(ChordBarrierTests, BaseTestCase):
+    filename = 'huey_chord_barrier.db'
+
+    def get_huey(self):
+        return SqliteHuey(filename=self.filename, timeout=3)
+
+    def chord_counter_count(self, huey):
+        rows = huey.storage.sql(
+            "select key from counter where queue = ? and key like 'chord:%'",
+            (huey.name,), results=True)
+        return len(rows)
+
+    def _teardown_chord_huey(self):
+        self.huey.storage.close()
+        for suffix in ('', '-wal', '-shm'):
+            path = self.filename + suffix
+            if os.path.exists(path):
+                try:
+                    os.unlink(path)
+                except OSError:  # pragma: no cover
+                    pass
 
 
 @unittest.skipIf(cysqlite is None, 'requires cysqlite')
