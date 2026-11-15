@@ -43,6 +43,17 @@ To enable this behavior, use the `cache_control` option:
 >>> session = CachedSession(cache_control=True)
 ```
 
+## Cache Invalidation
+After a successful unsafe request (`POST`, `PUT`, `PATCH`, or `DELETE`), cached responses for the
+request URI are invalidated. This also applies to same-origin resources referenced by the response's
+`Location` and `Content-Location` headers. All stored variants for those resources, including every
+`Vary` variant, are removed. Failed responses do not invalidate cached responses.
+
+This behavior is enabled by default and can be disabled with the `cache_invalidation` option:
+```python
+>>> session = CachedSession(cache_invalidation=False)
+```
+
 ## Supported Headers
 Requests-cache implements the majority of private cache behaviors specified by the following RFCs,
 with some minor variations:
@@ -50,6 +61,7 @@ with some minor variations:
 * [RFC 5861](https://datatracker.ietf.org/doc/html/rfc5861)
 * [RFC 7234](https://datatracker.ietf.org/doc/html/rfc7234)
 * [RFC 8246](https://datatracker.ietf.org/doc/html/rfc8246)
+* [RFC 9111](https://datatracker.ietf.org/doc/html/rfc9111)
 
 The following headers are currently supported:
 
@@ -77,4 +89,5 @@ The following headers are currently supported:
 - `Expires`: Used as an absolute expiration datetime
 - `ETag`: Validator used for conditional requests
 - `Last-Modified`: Validator used for conditional requests
+- `Location`, `Content-Location`: Same-origin linked resources to invalidate after unsafe requests
 - `Vary`: Used to indicate which request headers to match. See {ref}`matching-headers` for details.

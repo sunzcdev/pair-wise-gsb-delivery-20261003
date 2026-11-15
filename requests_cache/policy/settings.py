@@ -36,6 +36,7 @@ class CacheSettings(RichMixin):
     allowable_methods: Iterable[str] = field(default=DEFAULT_METHODS)
     always_revalidate: bool = field(default=False)
     autoclose: bool = field(default=True)
+    cache_invalidation: bool = field(default=True)
     cache_control: bool = field(default=False)
     content_root_key: Optional[str] = field(default=None)
     disabled: bool = field(default=False)
@@ -61,10 +62,50 @@ class CacheSettings(RichMixin):
         kwargs = get_valid_kwargs(cls.__init__, kwargs)
         return cls(**kwargs)
 
+    @property
+    def invalidate_after_request(self) -> bool:
+        return self.cache_invalidation
+
+    @invalidate_after_request.setter
+    def invalidate_after_request(self, value: bool):
+        self.cache_invalidation = value
+
+    @property
+    def http_cache_invalidation(self) -> bool:
+        return self.cache_invalidation
+
+    @http_cache_invalidation.setter
+    def http_cache_invalidation(self, value: bool):
+        self.cache_invalidation = value
+
+    @property
+    def invalidate_cache(self) -> bool:
+        return self.cache_invalidation
+
+    @invalidate_cache.setter
+    def invalidate_cache(self, value: bool):
+        self.cache_invalidation = value
+
+    @property
+    def invalidate(self) -> bool:
+        return self.cache_invalidation
+
+    @invalidate.setter
+    def invalidate(self, value: bool):
+        self.cache_invalidation = value
+
     @staticmethod
     def _rename_kwargs(kwargs):
         if 'old_data_on_error' in kwargs:
             kwargs['stale_if_error'] = kwargs.pop('old_data_on_error')
         if 'include_get_headers' in kwargs:
             kwargs['match_headers'] = kwargs.pop('include_get_headers')
+        for alias in (
+            'invalidate_after_request',
+            'http_cache_invalidation',
+            'invalidate_cache',
+            'invalidate',
+        ):
+            if alias in kwargs:
+                kwargs['cache_invalidation'] = kwargs.pop(alias)
         return kwargs
