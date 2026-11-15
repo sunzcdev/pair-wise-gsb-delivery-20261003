@@ -1,6 +1,19 @@
 Changelog
 =========
 
+4.5.0 (unreleased)
+------------------
+
+Features:
+
+- Add experimental :mod:`marshmallow.experimental.reference_preparation`
+  module with ``prepare_references`` and ``check_references`` to inspect
+  string-based :class:`fields.Nested <marshmallow.fields.Nested>` references.
+  Each reference reports its registry candidates and final binding, missing or
+  ambiguous references raise with their declaration path, and self references
+  and mutual recursion are recorded as back edges. The check is read-only and
+  does not instantiate nested schemas.
+
 4.4.0 (2026-11-03)
 ------------------
 

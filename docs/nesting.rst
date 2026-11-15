@@ -261,6 +261,42 @@ This is useful for avoiding circular imports when your schemas are located in di
 
         author = fields.Nested("authors.BookSchema", only=("id", "title"))
 
+.. _preparing-nested-references:
+
+Preparing string references
+---------------------------
+
+String references are resolved lazily, the first time the nested schema is
+instantiated. In large code bases this can make missing names, ambiguous bare
+class names, and circular references hard to track down. The experimental
+:mod:`~marshmallow.experimental.reference_preparation` module performs an
+explicit preparation check: it walks the declared fields without
+instantiating nested schemas and reports, for every nested reference, the
+candidate definitions registered for the name and the class it ultimately
+binds to.
+
+.. code-block:: python
+
+    from marshmallow.experimental.reference_preparation import (
+        check_references,
+        prepare_references,
+    )
+
+    # Non-strict: inspect every candidate and final binding.
+    report = prepare_references(BookSchema)
+    for reference in report.references:
+        print(reference.declaration_path, reference.ref, reference.bound)
+
+    # Strict: raise if any reference is missing or ambiguous.
+    check_references(BookSchema)
+
+Missing and ambiguous references are reported together with their declaration
+path (for example ``"author.books[]"``). A reference that points back to an
+already visited schema is recorded as a back edge, so self references and
+mutual recursion are not errors. The check is read-only: it never changes
+:mod:`marshmallow.class_registry` and never eagerly instantiates the nested
+schema graph, so references that already load keep binding to the same class.
+
 .. _self-nesting:
 
 Nesting a schema within itself
