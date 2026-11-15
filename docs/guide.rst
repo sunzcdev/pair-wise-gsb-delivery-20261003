@@ -1799,6 +1799,73 @@ to your task function:
 If you need a parameter with one of these names, rename it or pass it
 positionally.
 
+Renaming tasks and migrating old messages
+-----------------------------------------
+
+A task's identity is its fully-qualified ``module.function`` name. If you
+rename a function or move it to another module, messages that were enqueued
+before the rename still carry the old name and would otherwise fail to
+deserialize. The registry supports explicit **aliases** so those old names
+continue to resolve to the current task:
+
+.. code-block:: python
+
+    @huey.task()
+    def send_email(address):
+        ...
+
+    # Messages produced by the old "notifications.dispatch_email" task are
+    # still recognized and delivered to send_email.
+    huey.add_task_alias(send_email, 'notifications.dispatch_email')
+
+Aliases must point at a registered task, and an alias can never reuse the name
+of a real task or of another alias -- this guarantees aliases cannot form a
+cycle or silently shadow a real task. Resolution is a pure registry lookup;
+huey never dynamically imports a module while reading a message.
+
+When a task's parameters change, declare **message migrations**. Each migration
+is a single, explicitly-declared version step that receives a ``Message`` and
+returns an updated one. Migrations may only be traversed along the declared
+edges, and edges that would form a version cycle are rejected:
+
+.. code-block:: python
+
+    from huey.registry import Message
+
+    # Bump the task to a new message version (the default version is 1).
+    send_email.task_class.message_version = 2
+
+    def migrate_1_to_2(message):
+        # Version 1 passed the subject positionally; version 2 expects it as
+        # a keyword argument instead.
+        (address, subject) = message.args
+        return message._replace(args=(address,),
+                                kwargs=dict(message.kwargs, subject=subject))
+
+    huey.add_task_migration(send_email, 1, 2, migrate_1_to_2)
+
+Messages written before versioning existed have no version and are treated as
+version ``0``. When an old message is read, the registry first identifies the
+target task (resolving aliases), then walks the declared migration path to
+bring the parameters up to the task's current version. The same upgrade is
+applied recursively to ``on_complete``, ``on_error`` and chord callback
+messages, so pipelines and chords containing renamed tasks keep working.
+
+Freshly-enqueued messages are always written with the current task name and
+version -- aliases and migrations only affect how old messages are read. If a
+message cannot be read (unknown name, no migration path, a migration hook
+raising, or corrupt data), the original bytes pulled from the broker are
+retained verbatim in the registry's dead-letter store rather than being
+re-serialized or discarded:
+
+.. code-block:: python
+
+    for record in huey._registry.dead_letters:
+        print(record.id, record.error, record.timestamp)
+        # record.raw is the exact message as it came off the queue.
+        # record.message is the decoded Message, when decoding succeeded.
+    huey._registry.clear_dead_letters()
+
 Reading more
 ------------
 

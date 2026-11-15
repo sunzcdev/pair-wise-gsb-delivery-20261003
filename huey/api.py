@@ -25,6 +25,7 @@ from huey.exceptions import RetryTask
 from huey.exceptions import TaskException
 from huey.exceptions import TaskLockedException
 from huey.exceptions import TaskTimeout
+from huey.registry import CURRENT_TASK_VERSION
 from huey.registry import Registry
 from huey.serializer import Serializer
 from huey.storage import BlackHoleStorage
@@ -297,9 +298,35 @@ class Huey(object):
         message = self._registry.create_message(task)
         return self.serializer.serialize(message)
 
-    def deserialize_task(self, data):
-        message = self.serializer.deserialize(data)
-        return self._registry.create_task(message)
+    def deserialize_task(self, data, record_dead_letter=False):
+        # Note that the registry resolves names and migrates versions itself;
+        # arbitrary modules are never imported during deserialization.
+        try:
+            message = self.serializer.deserialize(data)
+            return self._registry.create_task(message)
+        except Exception as exc:
+            if record_dead_letter:
+                # The raw bytes are retained verbatim (never re-serialized),
+                # alongside whatever was decoded, so the original evidence is
+                # available for diagnostics.
+                decoded = None
+                try:
+                    decoded = self.serializer.deserialize(data)
+                except Exception:
+                    pass
+                logger.exception('Unable to deserialize task, retaining the '
+                                 'original message for diagnostics.')
+                self._registry.add_dead_letter(data, decoded, exc,
+                                               self._get_timestamp())
+            raise
+    def add_task_alias(self, task, alias):
+        """Declare a legacy task name that should resolve to ``task``."""
+        return self._registry.add_alias(task, alias)
+
+    def add_task_migration(self, task, from_version, to_version, migrator):
+        """Declare a single message-parameter migration step for ``task``."""
+        return self._registry.add_message_migration(
+            task, from_version, to_version, migrator)
 
     def enqueue(self, task):
         if isinstance(task, group):
@@ -373,7 +400,12 @@ class Huey(object):
     def dequeue(self):
         data = self.storage.dequeue()
         if data is not None:
-            return self.deserialize_task(data)
+            try:
+                return self.deserialize_task(data, record_dead_letter=True)
+            except Exception:
+                # The original message has already been retained as a dead
+                # letter, so do not propagate it and keep consuming.
+                return
 
     def put(self, key, data):
         return self.storage.put_data(key, self.serializer.serialize(data))
@@ -711,7 +743,8 @@ class Huey(object):
         accum = []
         for msg in messages:
             try:
-                accum.append(self.deserialize_task(msg))
+                accum.append(self.deserialize_task(
+                    msg, record_dead_letter=True))
             except Exception:
                 logger.exception('Unable to deserialize task.')
         return accum
@@ -799,6 +832,9 @@ class Task(object):
     default_retry_delay = 0
     default_retry_backoff = 0
     default_timeout = None
+    # Version of the on-the-wire message understood by this task. Messages
+    # carrying an older version are upgraded via registered migration hooks.
+    message_version = CURRENT_TASK_VERSION
 
     def __init__(self, args=None, kwargs=None, id=None, eta=None, retries=None,
                  retry_delay=None, priority=None, expires=None,

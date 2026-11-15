@@ -5,6 +5,14 @@ Changelog
 
 [View commits](https://github.com/coleifer/huey/compare/3.5.4...master)
 
+* Add explicit task-name aliases and declared message-version migrations to
+  the registry. Old messages are read by first resolving the target task
+  (including `on_complete`, `on_error` and chord callbacks) and then upgrading
+  their parameters along the registered migration path. Aliases cannot shadow
+  real tasks or form cycles, and migrations may only follow declared edges.
+  Messages that cannot be read are retained verbatim as dead letters instead
+  of being re-serialized or discarded.
+
 ## 3.5.4
 
 * Fix possible hang if worker holding the stop flag was killed while holding
