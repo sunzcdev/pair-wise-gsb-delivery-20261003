@@ -175,6 +175,54 @@ Here's an example of using an unstructure hook factory to handle unstructuring [
 [1, 2]
 ```
 
+## Diagnosing Hook Resolution
+
+When a converter has exact-type hooks, base-class (``singledispatch``) hooks
+and predicate hook factories all targeting overlapping types, it can be hard
+to tell which rule actually wins. The methods
+{meth}`explain_structure_hook() <cattrs.BaseConverter.explain_structure_hook>`
+and
+{meth}`explain_unstructure_hook() <cattrs.BaseConverter.explain_unstructure_hook>`
+produce a {class}`~cattrs.HookResolutionReport` describing the full
+resolution, without performing any conversion.
+
+A report contains one {class}`~cattrs.HookCandidate` per considered rule, in
+dispatch order: the exact-class ``singledispatch`` registry first, then
+generated ``direct`` hooks, then predicate rules in registration order, and
+finally the fallback factory. Each candidate records whether it matches the
+requested type, whether it is a hook factory (the factory is never called by
+diagnostics), and the reason it did not win (``shadowed_by``). The adopted
+candidate is available as ``report.adopted``.
+
+Predicates that raise an exception are not silently skipped: the exception is
+kept on the candidate (``candidate.error``) and the candidate is listed in
+``report.errored_candidates``.
+
+Passing ``reject_ambiguity=True`` raises an
+{class}`~cattrs.AmbiguousHookError` when several same-priority predicate
+rules match the same type; the partially built report is attached to the
+error. This never changes ordinary (non-diagnostic) conversion behavior.
+
+```python
+>>> from cattrs import BaseConverter
+
+>>> class Base: ...
+>>> class Sub(Base): ...
+
+>>> c = BaseConverter()
+>>> c.register_unstructure_hook(Base, lambda o: "base")
+>>> c.register_unstructure_hook_func(lambda t: issubclass(t, Base), lambda o: "predicate")
+
+>>> report = c.explain_unstructure_hook(Sub)
+>>> report.adopted.tier
+'singledispatch'
+>>> report.adopted.rule.__name__
+'Base'
+>>> [(candidate.tier, candidate.shadowed_by)
+...  for candidate in report.candidates if candidate.matches]
+[('singledispatch', None), ('predicate', 'shadowed_by_higher_priority'), ('fallback', 'shadowed_by_higher_priority')]
+```
+
 ## Using `cattrs.gen` Hook Factories
 
 The {mod}`cattrs.gen` module contains [hook factories](#hook-factories) for un/structuring _attrs_ classes, dataclasses and typed dicts.

@@ -35,6 +35,14 @@ cattrs.disambiguators module
    :undoc-members:
    :show-inheritance:
 
+cattrs.diagnostics module
+-------------------------
+
+.. automodule:: cattrs.diagnostics
+   :members:
+   :undoc-members:
+   :show-inheritance:
+
 cattrs.dispatch module
 ----------------------
 

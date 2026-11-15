@@ -75,6 +75,7 @@ from .cols import (
     namedtuple_unstructure_factory,
 )
 from .disambiguators import create_default_dis_func, is_supported_union
+from .diagnostics import HookResolutionReport
 from .dispatch import (
     HookFactory,
     MultiStrategyDispatch,
@@ -509,6 +510,26 @@ class BaseConverter:
             else self._unstructure_func.dispatch_without_caching(type)
         )
 
+    def explain_unstructure_hook(
+        self, type: Any, reject_ambiguity: bool = False
+    ) -> HookResolutionReport:
+        """Explain how an unstructure hook would be resolved for ``type``.
+
+        The returned report lists every registered candidate in dispatch
+        order, identifies the rule that would be adopted and why each other
+        rule is shadowed. Predicates that raise are reported with their
+        exception instead of being silently skipped.
+
+        No unstructure hook or hook factory is invoked; the fallback factory
+        is reported as a candidate but never called.
+
+        :param type: The type to resolve a hook for.
+        :param reject_ambiguity: When true, raise
+            :class:`~cattrs.diagnostics.AmbiguousHookError` if several
+            same-priority predicate rules match ``type``.
+        """
+        return self._unstructure_func.explain(type, reject_ambiguity)
+
     @overload
     def register_structure_hook(self, cl: StructureHookT) -> StructureHookT: ...
 
@@ -661,6 +682,26 @@ class BaseConverter:
             if cache_result
             else self._structure_func.dispatch_without_caching(type)
         )
+
+    def explain_structure_hook(
+        self, type: Any, reject_ambiguity: bool = False
+    ) -> HookResolutionReport:
+        """Explain how a structure hook would be resolved for ``type``.
+
+        The returned report lists every registered candidate in dispatch
+        order, identifies the rule that would be adopted and why each other
+        rule is shadowed. Predicates that raise are reported with their
+        exception instead of being silently skipped.
+
+        No structure hook or hook factory is invoked; the fallback factory
+        is reported as a candidate but never called.
+
+        :param type: The type to resolve a hook for.
+        :param reject_ambiguity: When true, raise
+            :class:`~cattrs.diagnostics.AmbiguousHookError` if several
+            same-priority predicate rules match ``type``.
+        """
+        return self._structure_func.explain(type, reject_ambiguity)
 
     # Classes to Python primitives.
     def unstructure_attrs_asdict(self, obj: Any) -> dict[str, Any]:
