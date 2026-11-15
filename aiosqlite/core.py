@@ -9,6 +9,7 @@ import asyncio
 import logging
 import sqlite3
 from collections.abc import AsyncIterator, Generator, Iterable
+from contextlib import asynccontextmanager
 from functools import partial
 from pathlib import Path
 from queue import Empty, Queue, SimpleQueue
@@ -43,6 +44,10 @@ def set_exception(fut: asyncio.Future, e: BaseException) -> None:
 
 _STOP_RUNNING_SENTINEL = object()
 _TxQueue = SimpleQueue[tuple[Optional[asyncio.Future], Callable[[], Any]]]
+
+
+def _queue_barrier() -> None:
+    """No-op queued behind pending operations to prove the queue is drained."""
 
 
 def _connection_worker_thread(tx: _TxQueue):
@@ -88,6 +93,12 @@ class Connection:
         self._tx: _TxQueue = SimpleQueue()
         self._iter_chunk_size = iter_chunk_size
         self._thread = Thread(target=_connection_worker_thread, args=(self._tx,))
+        # Serializes exclusive reservations of this connection.
+        self._reservation_lock = asyncio.Lock()
+        # Cleared while an exclusive reservation is held, blocking newly
+        # queued operations until the reservation is released again.
+        self._reservation_free = asyncio.Event()
+        self._reservation_free.set()
 
         if loop is not None:
             warn(
@@ -152,12 +163,45 @@ class Connection:
         if not self._running or not self._connection:
             raise ValueError("Connection closed")
 
+        # Wait while another coroutine (eg, a backup) holds an exclusive
+        # reservation on this connection. When the event is set (the common
+        # case) this returns immediately without blocking.
+        await self._reservation_free.wait()
+
         function = partial(fn, *args, **kwargs)
         future = asyncio.get_event_loop().create_future()
 
         self._tx.put_nowait((future, function))
 
         return await future
+
+    @asynccontextmanager
+    async def _reserved(self) -> AsyncIterator[None]:
+        """
+        Hold an exclusive reservation on this connection.
+
+        Waits for all operations already queued on the connection's worker
+        thread to complete, then blocks any newly queued operations until
+        the reservation is released. While reserved, the holder may safely
+        use the underlying sqlite3 connection object from another thread,
+        because the connection's own worker thread is idle and no new work
+        can be queued.
+
+        The reservation is always released again, even if the waiting or
+        the reserved operation is cancelled or raises.
+        """
+        async with self._reservation_lock:
+            self._reservation_free.clear()
+            try:
+                # Queue a barrier behind everything already queued. When it
+                # completes, the worker thread has drained all prior work.
+                future = asyncio.get_event_loop().create_future()
+                self._tx.put_nowait((future, _queue_barrier))
+                await future
+
+                yield
+            finally:
+                self._reservation_free.set()
 
     async def _connect(self) -> "Connection":
         """Connect to the actual sqlite database."""
@@ -426,18 +470,57 @@ class Connection:
         Make a backup of the current database to the target database.
 
         Takes either a standard sqlite3 or aiosqlite Connection object as the target.
+
+        When the target is an aiosqlite Connection, both ends are exclusively
+        reserved before the backup starts: operations already queued on either
+        connection complete first, and newly queued operations are blocked
+        until the backup finishes. The target's underlying sqlite3 connection
+        is therefore never used by the source's worker thread while the
+        target's own work queue could still be active.
+
+        Reservations on the two connections are acquired in a deterministic
+        order, so simultaneous backups in opposite directions (A -> B and
+        B -> A) cannot deadlock; they are serialized instead. Backing up a
+        connection to itself is rejected immediately. If the backup fails,
+        its progress callback raises, or the wait is cancelled, the
+        reservations are released and both connections remain usable.
         """
         if isinstance(target, Connection):
-            target = target._conn
+            if target is self:
+                raise ValueError("cannot back up a connection to itself")
 
-        await self._execute(
-            self._conn.backup,
-            target,
-            pages=pages,
-            progress=progress,
-            name=name,
-            sleep=sleep,
-        )
+            # Raises ValueError if the target connection is closed.
+            target_conn = target._conn
+
+            # Reserve both ends in a deterministic (id) order so that
+            # concurrent backups in opposite directions cannot deadlock.
+            first, second = (
+                (self, target) if id(self) < id(target) else (target, self)
+            )
+            async with first._reserved(), second._reserved():
+                # Both connections are reserved here, so queue the backup
+                # directly instead of using self._execute(), which would
+                # block on our own reservation.
+                function = partial(
+                    self._conn.backup,
+                    target_conn,
+                    pages=pages,
+                    progress=progress,
+                    name=name,
+                    sleep=sleep,
+                )
+                future = asyncio.get_event_loop().create_future()
+                self._tx.put_nowait((future, function))
+                await future
+        else:
+            await self._execute(
+                self._conn.backup,
+                target,
+                pages=pages,
+                progress=progress,
+                name=name,
+                sleep=sleep,
+            )
 
 
 def connect(

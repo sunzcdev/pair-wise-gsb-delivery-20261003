@@ -4,6 +4,8 @@
 import asyncio
 import sqlite3
 import sys
+import threading
+import time
 from pathlib import Path
 from sqlite3 import OperationalError
 from tempfile import TemporaryDirectory
@@ -509,6 +511,182 @@ class SmokeTest(IsolatedAsyncioTestCase):
 
                 cursor = db2.execute("select * from foo")
                 rows = cursor.fetchall()
+                self.assertEqual(rows, [(1, "hello"), (2, "world")])
+
+    async def test_backup_aiosqlite_reservation_and_thread_ownership(self):
+        """Backup to another aiosqlite connection reserves both ends.
+
+        Uses two temporary database files. Verifies that operations already
+        queued on the target complete before the backup touches it, that the
+        contents are copied correctly, and that both connections keep running
+        their queries on their own worker threads afterwards.
+        """
+        db2_path = self.db.with_name("test_backup_target.db")
+
+        async with (
+            aiosqlite.connect(self.db) as db1,
+            aiosqlite.connect(db2_path) as db2,
+        ):
+            # Each connection reports the thread its queries actually run on.
+            await db1.create_function("worker_tid", 0, threading.get_ident)
+            await db2.create_function("worker_tid", 0, threading.get_ident)
+
+            async def worker_tid(db):
+                async with db.execute("select worker_tid()") as cursor:
+                    row = await cursor.fetchone()
+                    return row[0]
+
+            tid1 = await worker_tid(db1)
+            tid2 = await worker_tid(db2)
+            self.assertNotEqual(tid1, tid2)
+
+            await db1.execute("create table foo (i integer, k varchar(250))")
+            await db1.executemany(
+                "insert into foo values (?, ?)", [(1, "hello"), (2, "world")]
+            )
+            await db1.commit()
+
+            # Queue a slow operation on the target; the backup must wait for
+            # it to finish before touching the target's connection.
+            events = []
+
+            def slow_marker():
+                time.sleep(0.25)
+                events.append("marker")
+                return 1
+
+            await db2.create_function("slow_marker", 0, slow_marker)
+            marker = asyncio.ensure_future(db2.execute("select slow_marker()"))
+            await asyncio.sleep(0)  # give the marker a chance to get queued
+
+            def progress(status, remaining, total):
+                events.append("backup")
+
+            await db1.backup(db2, progress=progress)
+            async with await marker as cursor:
+                await cursor.fetchall()
+
+            # The queued target operation finished before the backup ran.
+            self.assertEqual(events[0], "marker")
+            self.assertIn("backup", events)
+
+            # Contents were copied to the target.
+            async with db2.execute("select * from foo order by i") as cursor:
+                rows = await cursor.fetchall()
+                self.assertEqual(rows, [(1, "hello"), (2, "world")])
+
+            # Both connections still execute on their own worker threads.
+            self.assertEqual(await worker_tid(db1), tid1)
+            self.assertEqual(await worker_tid(db2), tid2)
+
+    async def test_backup_both_directions_no_deadlock(self):
+        """Simultaneous A -> B and B -> A backups serialize, not deadlock."""
+        db2_path = self.db.with_name("test_backup_reverse.db")
+
+        async with (
+            aiosqlite.connect(self.db) as db1,
+            aiosqlite.connect(db2_path) as db2,
+        ):
+            await db1.execute("create table from_one (v text)")
+            await db1.execute("insert into from_one values ('one')")
+            await db1.commit()
+
+            await db2.execute("create table from_two (v text)")
+            await db2.execute("insert into from_two values ('two')")
+            await db2.commit()
+
+            await asyncio.wait_for(
+                asyncio.gather(db1.backup(db2), db2.backup(db1)),
+                timeout=30,
+            )
+
+            async def table_names(db):
+                async with db.execute(
+                    "select name from sqlite_master where type = 'table'"
+                ) as cursor:
+                    return [row[0] for row in await cursor.fetchall()]
+
+            # The backups are serialized by the reservations, so whichever
+            # direction ran second wins and both ends end up identical.
+            tables1 = await table_names(db1)
+            tables2 = await table_names(db2)
+            self.assertEqual(tables1, tables2)
+            self.assertIn(tables1, (["from_one"], ["from_two"]))
+
+            # Both connections remain usable.
+            async with db1.execute("select 1") as cursor:
+                self.assertEqual((await cursor.fetchone())[0], 1)
+            async with db2.execute("select 1") as cursor:
+                self.assertEqual((await cursor.fetchone())[0], 1)
+
+    async def test_backup_to_self_rejected(self):
+        async with aiosqlite.connect(self.db) as db:
+            with self.assertRaisesRegex(ValueError, "itself"):
+                await db.backup(db)
+
+            # The connection was not reserved or otherwise disturbed.
+            async with db.execute("select 1") as cursor:
+                self.assertEqual((await cursor.fetchone())[0], 1)
+
+    async def test_backup_cancelled_while_waiting_releases_reservations(self):
+        """Cancelling a backup waiting on a reservation releases both ends."""
+        db2_path = self.db.with_name("test_backup_cancel.db")
+
+        async with (
+            aiosqlite.connect(self.db) as db1,
+            aiosqlite.connect(db2_path) as db2,
+        ):
+            # Hold the target's reservation so the backup must wait for it.
+            async with db2._reserved():
+                task = asyncio.ensure_future(db1.backup(db2))
+                await asyncio.sleep(0.1)
+                self.assertFalse(task.done())
+
+                task.cancel()
+                with self.assertRaises(asyncio.CancelledError):
+                    await task
+
+            # Both reservations were released; both connections are usable.
+            async with db1.execute("select 1") as cursor:
+                self.assertEqual((await cursor.fetchone())[0], 1)
+            async with db2.execute("select 1") as cursor:
+                self.assertEqual((await cursor.fetchone())[0], 1)
+
+    async def test_backup_failure_keeps_both_connections_usable(self):
+        """Failures and progress exceptions don't close the borrowed target."""
+        db2_path = self.db.with_name("test_backup_failure.db")
+
+        async with (
+            aiosqlite.connect(self.db) as db1,
+            aiosqlite.connect(db2_path) as db2,
+        ):
+            await db1.execute("create table foo (i integer, k varchar(250))")
+            await db1.executemany(
+                "insert into foo values (?, ?)", [(1, "hello"), (2, "world")]
+            )
+            await db1.commit()
+
+            # A failing progress callback aborts the backup.
+            def bad_progress(status, remaining, total):
+                raise RuntimeError("progress exploded")
+
+            with self.assertRaisesRegex(RuntimeError, "progress exploded"):
+                await db1.backup(db2, progress=bad_progress)
+
+            # A bogus source database name fails inside the worker thread.
+            with self.assertRaises(OperationalError):
+                await db1.backup(db2, name="nonexistent")
+
+            # Neither end was closed or left reserved; both still work.
+            async with db1.execute("select 1") as cursor:
+                self.assertEqual((await cursor.fetchone())[0], 1)
+            async with db2.execute("select 1") as cursor:
+                self.assertEqual((await cursor.fetchone())[0], 1)
+
+            # And a later clean backup still succeeds.
+            await db1.backup(db2)
+            async with db2.execute("select * from foo order by i") as cursor:
+                rows = await cursor.fetchall()
                 self.assertEqual(rows, [(1, "hello"), (2, "world")])
 
     async def test_emits_warning_when_left_open(self):
