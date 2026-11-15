@@ -15,7 +15,7 @@ import typing
 import uuid
 from abc import ABCMeta
 from collections import defaultdict
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from itertools import zip_longest
 
 from marshmallow import class_registry, types
@@ -30,7 +30,13 @@ from marshmallow.decorators import (
     VALIDATES_SCHEMA,
 )
 from marshmallow.error_store import ErrorStore
-from marshmallow.exceptions import SCHEMA, StringNotCollectionError, ValidationError
+from marshmallow.exceptions import (
+    SCHEMA,
+    IdentityLoadError,
+    MarshmallowError,
+    StringNotCollectionError,
+    ValidationError,
+)
 from marshmallow.orderedset import OrderedSet
 from marshmallow.utils import (
     get_value,
@@ -41,6 +47,48 @@ from marshmallow.utils import (
 
 if typing.TYPE_CHECKING:
     from marshmallow.fields import Field
+
+
+class IdentityItem(typing.NamedTuple):
+    """Pairs a single record with the opaque identity supplied for it.
+
+    Collection-level load processors registered with ``preserve_identities=True``
+    receive and must return iterables of these items when the schema is used with
+    `Schema.load_with_identities`.
+
+    .. versionadded:: 4.5.0
+    """
+
+    #: The opaque identity supplied by the caller for the record.
+    identity: typing.Hashable
+    #: The record being (de)serialized.
+    data: typing.Any
+
+
+class IdentityLoadResult(typing.NamedTuple):
+    """Result of a successful `Schema.load_with_identities` call.
+
+    .. versionadded:: 4.5.0
+    """
+
+    #: Deserialized records, keyed by the identity supplied for each record.
+    data: dict[typing.Hashable, typing.Any]
+    #: Identities of records that were filtered out by load processors.
+    filtered: list[typing.Hashable]
+
+
+def _remap_error_identities(
+    errors: dict[typing.Any, typing.Any], identities: Sequence[typing.Hashable]
+) -> dict[typing.Any, typing.Any]:
+    """Replace top-level positional error keys with their corresponding identities."""
+    return {
+        (
+            identities[key]
+            if isinstance(key, int) and 0 <= key < len(identities)
+            else key
+        ): value
+        for key, value in errors.items()
+    }
 
 
 def _get_fields(attrs) -> list[tuple[str, Field]]:
@@ -735,6 +783,96 @@ class Schema(metaclass=SchemaMeta):
             data, many=many, partial=partial, unknown=unknown, postprocess=True
         )
 
+    def load_with_identities(
+        self,
+        tagged_data: Mapping[typing.Hashable, Mapping[str, typing.Any]]
+        | Iterable[tuple[typing.Hashable, Mapping[str, typing.Any]]],
+        *,
+        partial: bool | types.StrSequenceOrSet | None = None,
+        unknown: types.UnknownOption | None = None,
+    ) -> IdentityLoadResult:
+        """Deserialize a batch of records, each tagged with an opaque identity.
+
+        Unlike :meth:`load` with ``many=True``, every record is paired with a
+        caller-supplied identity so that results and errors can be mapped back
+        to their source even when collection-level ``pre_load``/``post_load``
+        processors filter or reorder records.
+
+        :param tagged_data: Either a mapping of identity to record, or an
+            iterable of ``(identity, record)`` pairs. Identities are opaque
+            (they are never inspected) but must be hashable and unique.
+        :param partial: Whether to ignore missing fields and not require
+            any fields declared. Propagates down to ``Nested`` fields as well. If
+            its value is an iterable, only missing fields listed in that iterable
+            will be ignored. Use dot delimiters to specify nested fields.
+        :param unknown: Whether to exclude, include, or raise an error for unknown
+            fields in the data. Use `EXCLUDE`, `INCLUDE` or `RAISE`.
+            If `None`, the value for `self.unknown` is used.
+        :return: An `IdentityLoadResult` whose ``data`` maps each identity to its
+            deserialized record and whose ``filtered`` lists the identities of
+            records that were filtered out by load processors.
+        :raises ValueError: If the same identity is supplied more than once.
+            Raised before any processing happens.
+        :raises MarshmallowError: If the schema registers collection-level
+            ``pre_load``/``post_load`` processors that do not declare
+            ``preserve_identities=True``.
+        :raises IdentityLoadError: If validation fails. ``messages`` and
+            ``valid_data`` are keyed by identity, and ``filtered`` lists the
+            identities of records that were filtered out before the failure.
+
+        .. versionadded:: 4.5.0
+        """
+        if isinstance(tagged_data, Mapping):
+            pairs = list(tagged_data.items())
+        else:
+            pairs = list(tagged_data)
+        identities: list[typing.Hashable] = []
+        records: list[Mapping[str, typing.Any]] = []
+        for pair in pairs:
+            identity, record = pair
+            identities.append(identity)
+            records.append(record)
+        # Reject duplicate identities before any processing happens.
+        seen: set[typing.Hashable] = set()
+        duplicates: list[typing.Hashable] = []
+        for identity in identities:
+            if identity in seen:
+                if identity not in duplicates:
+                    duplicates.append(identity)
+            else:
+                seen.add(identity)
+        if duplicates:
+            raise ValueError(
+                "Duplicate identities passed to load_with_identities: "
+                + ", ".join(repr(duplicate) for duplicate in duplicates)
+            )
+        if not self.opts.index_errors:
+            raise MarshmallowError(
+                "load_with_identities requires per-record error indexes; "
+                "the 'index_errors' Meta option must be enabled."
+            )
+        # Collection-level processors may filter or reorder records, so they
+        # are only compatible if they explicitly declare identity preservation.
+        for tag in (PRE_LOAD, POST_LOAD):
+            for attr_name, hook_many, processor_kwargs in self._hooks[tag]:
+                if hook_many and not processor_kwargs.get(
+                    "preserve_identities", False
+                ):
+                    raise MarshmallowError(
+                        f"Cannot use load_with_identities with {self}: "
+                        f"processor {attr_name!r} is registered with "
+                        f"{tag}(pass_collection=True) but does not declare "
+                        "preserve_identities=True."
+                    )
+        return self._do_load(
+            records,
+            many=True,
+            partial=partial,
+            unknown=unknown,
+            postprocess=True,
+            identities=identities,
+        )
+
     def loads(
         self,
         s: str | bytes | bytearray,
@@ -847,6 +985,7 @@ class Schema(metaclass=SchemaMeta):
         partial: bool | types.StrSequenceOrSet | None = None,
         unknown: types.UnknownOption | None = None,
         postprocess: bool = True,
+        identities: list[typing.Hashable] | None = None,
     ):
         """Deserialize `data`, returning the deserialized result.
         This method is private API.
@@ -862,6 +1001,8 @@ class Schema(metaclass=SchemaMeta):
             fields in the data. Use `EXCLUDE`, `INCLUDE` or `RAISE`.
             If `None`, the value for `self.unknown` is used.
         :param postprocess: Whether to run post_load methods.
+        :param identities: Opaque identities aligned with the items of `data`,
+            used to key results and errors by identity rather than position.
         :return: Deserialized data
         """
         error_store = ErrorStore()
@@ -870,19 +1011,29 @@ class Schema(metaclass=SchemaMeta):
         unknown = self.unknown if unknown is None else unknown
         if partial is None:
             partial = self.partial
+        if identities is not None:
+            identities = list(identities)
+            all_identities = list(identities)
         # Run preprocessors
         if self._hooks[PRE_LOAD]:
             try:
-                processed_data = self._invoke_load_processors(
+                processed = self._invoke_load_processors(
                     PRE_LOAD,
                     data,
                     many=many,
                     original_data=data,
                     partial=partial,
                     unknown=unknown,
+                    identities=identities,
                 )
+                if identities is not None:
+                    processed_data, identities = processed
+                else:
+                    processed_data = processed
             except ValidationError as err:
                 errors = err.normalized_messages()
+                if identities is not None:
+                    errors = _remap_error_identities(errors, identities)
                 result: list | dict | None = None
         else:
             processed_data = data
@@ -923,23 +1074,61 @@ class Schema(metaclass=SchemaMeta):
                     field_errors=field_errors,
                 )
             errors = error_store.errors
+            if identities is not None:
+                errors = _remap_error_identities(errors, identities)
             # Run post processors
             if not errors and postprocess and self._hooks[POST_LOAD]:
                 try:
-                    result = self._invoke_load_processors(
+                    processed = self._invoke_load_processors(
                         POST_LOAD,
                         result,
                         many=many,
                         original_data=data,
                         partial=partial,
                         unknown=unknown,
+                        identities=identities,
                     )
+                    if identities is not None:
+                        result, identities = processed
+                    else:
+                        result = processed
                 except ValidationError as err:
                     errors = err.normalized_messages()
+                    if identities is not None:
+                        errors = _remap_error_identities(errors, identities)
         if errors:
-            exc = ValidationError(errors, data=data, valid_data=result)
+            if identities is not None:
+                filtered = [
+                    identity
+                    for identity in all_identities
+                    if identity not in identities
+                ]
+                valid_data = (
+                    {
+                        identity: value
+                        for identity, value in zip(identities, result)
+                        if identity not in errors
+                    }
+                    if result is not None
+                    else {}
+                )
+                exc: ValidationError = IdentityLoadError(
+                    errors, data=data, valid_data=valid_data, filtered=filtered
+                )
+            else:
+                exc = ValidationError(errors, data=data, valid_data=result)
             self.handle_error(exc, data, many=many, partial=partial)
             raise exc
+
+        if identities is not None:
+            filtered = [
+                identity
+                for identity in all_identities
+                if identity not in identities
+            ]
+            return IdentityLoadResult(
+                data=dict(zip(identities, result)), filtered=filtered
+            )
 
         return result
 
@@ -1099,19 +1288,31 @@ class Schema(metaclass=SchemaMeta):
         original_data,
         partial: bool | types.StrSequenceOrSet | None,
         unknown: types.UnknownOption | None,
+        identities: list[typing.Hashable] | None = None,
     ):
         # This has to invert the order of the dump processors, so run the pass_collection
         # processors first.
+        if identities is None:
+            data = self._invoke_processors(
+                tag,
+                pass_collection=True,
+                data=data,
+                many=many,
+                original_data=original_data,
+                partial=partial,
+                unknown=unknown,
+            )
+        else:
+            data, identities = self._invoke_identity_collection_processors(
+                tag,
+                data,
+                identities=identities,
+                many=many,
+                original_data=original_data,
+                partial=partial,
+                unknown=unknown,
+            )
         data = self._invoke_processors(
-            tag,
-            pass_collection=True,
-            data=data,
-            many=many,
-            original_data=original_data,
-            partial=partial,
-            unknown=unknown,
-        )
-        return self._invoke_processors(
             tag,
             pass_collection=False,
             data=data,
@@ -1120,6 +1321,63 @@ class Schema(metaclass=SchemaMeta):
             partial=partial,
             unknown=unknown,
         )
+        if identities is not None:
+            return data, identities
+        return data
+
+    def _invoke_identity_collection_processors(
+        self,
+        tag: str,
+        data: Sequence[Mapping[str, typing.Any]],
+        *,
+        identities: list[typing.Hashable],
+        many: bool,
+        original_data,
+        partial: bool | types.StrSequenceOrSet | None,
+        unknown: types.UnknownOption | None,
+    ) -> tuple[list, list[typing.Hashable]]:
+        """Run pass_collection processors while tracking item identities.
+
+        Processors receive and must return iterables of `IdentityItem`, so
+        records may be filtered or reordered without losing their identities.
+        This method is private API.
+        """
+        for attr_name, hook_many, processor_kwargs in self._hooks[tag]:
+            if not hook_many:
+                continue
+            if not processor_kwargs.get("preserve_identities", False):
+                raise MarshmallowError(
+                    f"Cannot use load_with_identities with {self}: "
+                    f"processor {attr_name!r} is registered with "
+                    f"{tag}(pass_collection=True) but does not declare "
+                    "preserve_identities=True."
+                )
+            # This will be a bound method.
+            processor = getattr(self, attr_name)
+            pass_original = processor_kwargs.get("pass_original", False)
+
+            tagged = [
+                IdentityItem(identity, item)
+                for identity, item in zip(identities, data, strict=True)
+            ]
+            if pass_original:
+                tagged = processor(
+                    tagged, original_data, many=many, partial=partial, unknown=unknown
+                )
+            else:
+                tagged = processor(tagged, many=many, partial=partial, unknown=unknown)
+            identities = []
+            data = []
+            for item in tagged:
+                identity, item_data = item
+                identities.append(identity)
+                data.append(item_data)
+            if len(set(identities)) != len(identities):
+                raise MarshmallowError(
+                    f"Processor {attr_name!r} returned duplicate identities "
+                    "during load_with_identities."
+                )
+        return data, identities
 
     def _invoke_field_validators(self, *, error_store: ErrorStore, data, many: bool):
         for attr_name, _, validator_kwargs in self._hooks[VALIDATES]:

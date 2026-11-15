@@ -7,3 +7,7 @@ Schema
     :exclude-members: OPTIONS_CLASS
 
 .. autoclass:: marshmallow.schema.SchemaOpts
+
+.. autoclass:: marshmallow.schema.IdentityItem
+
+.. autoclass:: marshmallow.schema.IdentityLoadResult

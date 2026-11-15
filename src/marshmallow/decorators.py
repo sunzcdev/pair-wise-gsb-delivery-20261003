@@ -176,6 +176,7 @@ def pre_load(
     fn: typing.Callable[..., typing.Any] | None = None,
     *,
     pass_collection: bool = False,
+    preserve_identities: bool = False,
 ) -> typing.Callable[..., typing.Any]:
     """Register a method to invoke before deserializing an object. The method
     receives the data to be deserialized and returns the processed data.
@@ -184,13 +185,23 @@ def pre_load(
     argument passed to the `Schema <marshmallow.Schema>`'s :func:`~marshmallow.Schema.load` call.
     If ``pass_collection=True``, the raw data (which may be a collection) is passed.
 
+    If ``preserve_identities=True`` (only meaningful with ``pass_collection=True``),
+    the method declares that it keeps track of item identities, so it may be used
+    with `Schema.load_with_identities <marshmallow.Schema.load_with_identities>`.
+    In that case the method receives and must return an iterable of
+    `IdentityItem <marshmallow.IdentityItem>` instead of raw items, and it may
+    filter or reorder them.
+
     .. versionchanged:: 3.0.0 ``partial`` and ``many`` are always passed as keyword arguments to
         the decorated method.
     .. versionchanged:: 4.0.0 ``pass_many`` is renamed to ``pass_collection``.
     .. versionchanged:: 4.0.0 ``pass_collection`` is a keyword-only argument.
     .. versionchanged:: 4.0.0 ``unknown`` is passed as a keyword argument to the decorated method.
+    .. versionchanged:: 4.5.0 Added ``preserve_identities`` keyword argument.
     """
-    return set_hook(fn, PRE_LOAD, many=pass_collection)
+    return set_hook(
+        fn, PRE_LOAD, many=pass_collection, preserve_identities=preserve_identities
+    )
 
 
 def post_load(
@@ -198,6 +209,7 @@ def post_load(
     *,
     pass_collection: bool = False,
     pass_original: bool = False,
+    preserve_identities: bool = False,
 ) -> typing.Callable[..., typing.Any]:
     """Register a method to invoke after deserializing an object. The method
     receives the deserialized data and returns the processed data.
@@ -209,13 +221,27 @@ def post_load(
     If ``pass_original=True``, the original data (before deserializing) will be passed as
     an additional argument to the method.
 
+    If ``preserve_identities=True`` (only meaningful with ``pass_collection=True``),
+    the method declares that it keeps track of item identities, so it may be used
+    with `Schema.load_with_identities <marshmallow.Schema.load_with_identities>`.
+    In that case the method receives and must return an iterable of
+    `IdentityItem <marshmallow.IdentityItem>` instead of raw items, and it may
+    filter or reorder them.
+
     .. versionchanged:: 3.0.0 ``partial`` and ``many`` are always passed as keyword arguments to
         the decorated method.
     .. versionchanged:: 4.0.0 ``pass_many`` is renamed to ``pass_collection``.
     .. versionchanged:: 4.0.0 ``pass_collection`` and ``pass_original`` are keyword-only arguments.
     .. versionchanged:: 4.0.0 ``unknown`` is passed as a keyword argument to the decorated method.
+    .. versionchanged:: 4.5.0 Added ``preserve_identities`` keyword argument.
     """
-    return set_hook(fn, POST_LOAD, many=pass_collection, pass_original=pass_original)
+    return set_hook(
+        fn,
+        POST_LOAD,
+        many=pass_collection,
+        pass_original=pass_original,
+        preserve_identities=preserve_identities,
+    )
 
 
 def set_hook(

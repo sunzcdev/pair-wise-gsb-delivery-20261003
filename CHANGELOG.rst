@@ -1,6 +1,26 @@
 Changelog
 =========
 
+4.5.0 (unreleased)
+------------------
+
+Features:
+
+- Add `Schema.load_with_identities <marshmallow.Schema.load_with_identities>`,
+  a batch load entry point where the caller tags each record with an opaque
+  identity. Successful values (in the returned
+  `IdentityLoadResult <marshmallow.IdentityLoadResult>`) and errors (in the
+  raised `IdentityLoadError <marshmallow.exceptions.IdentityLoadError>`,
+  including partial ``valid_data``) are keyed by identity rather than by
+  position, so they can be mapped back to the source batch even when
+  collection-level ``pre_load``/``post_load`` processors filter or reorder
+  records. Filtered-out records are reported separately, duplicate identities
+  are rejected before processing, and collection-level load processors must
+  opt in with the new ``preserve_identities`` argument of
+  `pre_load <marshmallow.decorators.pre_load>` and
+  `post_load <marshmallow.decorators.post_load>` to be used with this entry
+  point.
+
 4.4.0 (2026-11-03)
 ------------------
 

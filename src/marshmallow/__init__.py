@@ -7,8 +7,8 @@ from marshmallow.decorators import (
     validates,
     validates_schema,
 )
-from marshmallow.exceptions import ValidationError
-from marshmallow.schema import Schema, SchemaOpts
+from marshmallow.exceptions import IdentityLoadError, ValidationError
+from marshmallow.schema import IdentityItem, IdentityLoadResult, Schema, SchemaOpts
 
 from . import fields
 
@@ -16,6 +16,9 @@ __all__ = [
     "EXCLUDE",
     "INCLUDE",
     "RAISE",
+    "IdentityItem",
+    "IdentityLoadError",
+    "IdentityLoadResult",
     "Schema",
     "SchemaOpts",
     "ValidationError",

@@ -62,6 +62,31 @@ class RegistryError(NameError):
     """
 
 
+class IdentityLoadError(ValidationError):
+    """Raised when `Schema.load_with_identities <marshmallow.Schema.load_with_identities>`
+    fails to deserialize one or more records.
+
+    Unlike a plain `ValidationError` raised from a ``many=True`` load,
+    ``messages`` and ``valid_data`` are keyed by the opaque identity supplied
+    for each record rather than by the record's position after preprocessing.
+    The identities of records that were filtered out by pre-load processors
+    are available on ``filtered``.
+
+    .. versionadded:: 4.5.0
+    """
+
+    def __init__(
+        self,
+        message: str | list | dict,
+        *,
+        filtered: typing.Iterable[typing.Hashable] | None = None,
+        **kwargs,
+    ):
+        super().__init__(message, **kwargs)
+        #: Identities of records that were filtered out by pre-load processors.
+        self.filtered = list(filtered) if filtered is not None else []
+
+
 class StringNotCollectionError(MarshmallowError, TypeError):
     """Raised when a string is passed when a list of strings is expected."""
 

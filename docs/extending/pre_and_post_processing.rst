@@ -97,6 +97,61 @@ One common use case is to wrap data in a namespace upon serialization and unwrap
     user_objs = user_schema.load(users_data, many=True)
     # [<User(name='Keith Richards')>, <User(name='Charlie Watts')>]
 
+Tracking identities across batch loads
+--------------------------------------
+
+Collection-level ``pre_load`` processors may filter or reorder records, which
+means the integer indexes in error messages no longer correspond to the
+original input batch. `Schema.load_with_identities
+<marshmallow.Schema.load_with_identities>` avoids this by letting the caller
+attach an opaque identity to each record. Results and errors are then keyed by
+identity rather than by position, and filtered-out records are reported
+separately.
+
+Collection-level load processors that should be usable with
+``load_with_identities`` must declare ``preserve_identities=True``. Such
+processors receive and must return an iterable of `IdentityItem
+<marshmallow.IdentityItem>` (named tuples of ``identity`` and ``data``), which
+they may filter or reorder. Schemas with collection-level load processors that
+do not declare ``preserve_identities=True`` cannot be used with
+``load_with_identities``.
+
+.. code-block:: python
+
+    from marshmallow import IdentityLoadError, Schema, fields, pre_load
+
+
+    class UserSchema(Schema):
+        name = fields.Str(required=True)
+
+        @pre_load(pass_collection=True, preserve_identities=True)
+        def drop_deactivated(self, items, many, **kwargs):
+            return [item for item in items if not item.data.get("deactivated")]
+
+
+    schema = UserSchema()
+    result = schema.load_with_identities(
+        [
+            ("req-1", {"name": "Mick"}),
+            ("req-2", {"name": "Keith", "deactivated": True}),
+            ("req-3", {"name": "Charlie"}),
+        ]
+    )
+    result.data  # => {'req-1': {'name': 'Mick'}, 'req-3': {'name': 'Charlie'}}
+    result.filtered  # => ['req-2']
+
+    try:
+        schema.load_with_identities(
+            [("req-4", {"deactivated": True}), ("req-5", {})]
+        )
+    except IdentityLoadError as err:
+        err.messages  # => {'req-5': {'name': ['Missing data for required field.']}}
+        err.valid_data  # => {}
+        err.filtered  # => ['req-4']
+
+Identities must be unique; duplicates are rejected before any processing
+happens.
+
 .. _field_level_processing:
 
 Field-level pre- and post-processing
