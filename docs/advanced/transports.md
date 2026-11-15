@@ -35,6 +35,50 @@ connecting via a Unix Domain Socket that is only available via this low-level AP
 {"ID": "...", "Containers": 4, "Images": 74, ...}
 ```
 
+## Borrowing transports
+
+By default a client owns the transport instance it is given and closes it when
+the client itself is closed. This is convenient when each client has its own
+transport, but it makes sharing a single transport between several clients
+unsafe: closing one client would tear the transport down for every other
+client still using it.
+
+To share a transport, explicitly mark it as *borrowed*. A client never closes
+transport it borrows, leaving the caller in charge of its lifetime and
+availability. The main transport and the mounted transports are declared
+separately through `borrow_transport` and `borrow_mounts`:
+
+```python
+transport = httpx.HTTPTransport()
+
+# Neither client closes the shared transport.
+first = httpx.Client(transport=transport, borrow_transport=True)
+second = httpx.Client(transport=transport, borrow_transport=True)
+
+first.close()
+second.close()
+transport.close()  # The caller manages the shared transport's lifetime.
+```
+
+Mounted transports accept the same treatment:
+
+```python
+mount = httpx.HTTPTransport()
+client = httpx.Client(
+    mounts={"http://example.org": mount},
+    borrow_mounts=True,
+)
+client.close()
+# The borrowed mount stays open and is closed later by its owner.
+mount.close()
+```
+
+The same transport object may be attached as the main transport and/or on
+several routes. When it is owned it is still closed at most once, even if it
+appears in multiple places. Borrowing is an explicit, per-client declaration
+rather than a global reference count, so the code that shares a transport
+remains responsible for keeping it usable while any client relies on it.
+
 ## WSGI Transport
 
 You can configure an `httpx` client to call directly into a Python web application using the WSGI protocol.

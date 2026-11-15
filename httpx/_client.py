@@ -629,6 +629,14 @@ class Client(BaseClient):
     request URLs.
     * **transport** - *(optional)* A transport class to use for sending requests
     over the network.
+    * **borrow_transport** - *(optional)* A boolean indicating if the transport
+    passed in via the `transport` argument is borrowed rather than owned by
+    the client. Borrowed transports are not closed when the client closes, so
+    they can be safely shared between several clients. Defaults to `False`.
+    * **borrow_mounts** - *(optional)* A boolean indicating if the transports
+    passed in via the `mounts` argument are borrowed rather than owned by the
+    client. Borrowed transports are not closed when the client closes.
+    Defaults to `False`.
     * **trust_env** - *(optional)* Enables or disables usage of environment
     variables for configuration.
     * **default_encoding** - *(optional)* The default encoding to use for decoding
@@ -657,6 +665,8 @@ class Client(BaseClient):
         event_hooks: None | (typing.Mapping[str, list[EventHook]]) = None,
         base_url: URL | str = "",
         transport: BaseTransport | None = None,
+        borrow_transport: bool = False,
+        borrow_mounts: bool = False,
         default_encoding: str | typing.Callable[[bytes], str] = "utf-8",
     ) -> None:
         super().__init__(
@@ -685,6 +695,13 @@ class Client(BaseClient):
         allow_env_proxies = trust_env and transport is None
         proxy_map = self._get_proxy_map(proxy, allow_env_proxies)
 
+        # Track every transport that this client is responsible for closing.
+        # Keying by object identity guarantees that the same transport being
+        # attached as the main transport and/or on several routes is closed
+        # at most once. Transports explicitly marked as borrowed are omitted
+        # and are left for the caller to manage.
+        self._owned_transports: dict[int, BaseTransport] = {}
+
         self._transport = self._init_transport(
             verify=verify,
             cert=cert,
@@ -694,24 +711,35 @@ class Client(BaseClient):
             limits=limits,
             transport=transport,
         )
-        self._mounts: dict[URLPattern, BaseTransport | None] = {
-            URLPattern(key): None
-            if proxy is None
-            else self._init_proxy_transport(
-                proxy,
-                verify=verify,
-                cert=cert,
-                trust_env=trust_env,
-                http1=http1,
-                http2=http2,
-                limits=limits,
-            )
-            for key, proxy in proxy_map.items()
-        }
+        if not borrow_transport:
+            self._owned_transports[id(self._transport)] = self._transport
+
+        self._mounts: dict[URLPattern, BaseTransport | None] = {}
+        for key, proxy in proxy_map.items():
+            if proxy is None:
+                self._mounts[URLPattern(key)] = None
+            else:
+                proxy_transport = self._init_proxy_transport(
+                    proxy,
+                    verify=verify,
+                    cert=cert,
+                    trust_env=trust_env,
+                    http1=http1,
+                    http2=http2,
+                    limits=limits,
+                )
+                self._mounts[URLPattern(key)] = proxy_transport
+                self._owned_transports.setdefault(
+                    id(proxy_transport), proxy_transport
+                )
         if mounts is not None:
             self._mounts.update(
                 {URLPattern(key): transport for key, transport in mounts.items()}
             )
+            if not borrow_mounts:
+                for mounted in mounts.values():
+                    if mounted is not None:
+                        self._owned_transports.setdefault(id(mounted), mounted)
 
         self._mounts = dict(sorted(self._mounts.items()))
 
@@ -1267,10 +1295,8 @@ class Client(BaseClient):
         if self._state != ClientState.CLOSED:
             self._state = ClientState.CLOSED
 
-            self._transport.close()
-            for transport in self._mounts.values():
-                if transport is not None:
-                    transport.close()
+            for transport in self._owned_transports.values():
+                transport.close()
 
     def __enter__(self: T) -> T:
         if self._state != ClientState.UNOPENED:
@@ -1284,10 +1310,15 @@ class Client(BaseClient):
 
         self._state = ClientState.OPENED
 
-        self._transport.__enter__()
-        for transport in self._mounts.values():
-            if transport is not None:
+        entered: list[BaseTransport] = []
+        try:
+            for transport in self._owned_transports.values():
                 transport.__enter__()
+                entered.append(transport)
+        except BaseException:
+            for transport in reversed(entered):
+                transport.__exit__(None, None, None)
+            raise
         return self
 
     def __exit__(
@@ -1298,10 +1329,8 @@ class Client(BaseClient):
     ) -> None:
         self._state = ClientState.CLOSED
 
-        self._transport.__exit__(exc_type, exc_value, traceback)
-        for transport in self._mounts.values():
-            if transport is not None:
-                transport.__exit__(exc_type, exc_value, traceback)
+        for transport in self._owned_transports.values():
+            transport.__exit__(exc_type, exc_value, traceback)
 
 
 class AsyncClient(BaseClient):
@@ -1343,6 +1372,14 @@ class AsyncClient(BaseClient):
     request URLs.
     * **transport** - *(optional)* A transport class to use for sending requests
     over the network.
+    * **borrow_transport** - *(optional)* A boolean indicating if the transport
+    passed in via the `transport` argument is borrowed rather than owned by
+    the client. Borrowed transports are not closed when the client closes, so
+    they can be safely shared between several clients. Defaults to `False`.
+    * **borrow_mounts** - *(optional)* A boolean indicating if the transports
+    passed in via the `mounts` argument are borrowed rather than owned by the
+    client. Borrowed transports are not closed when the client closes.
+    Defaults to `False`.
     * **trust_env** - *(optional)* Enables or disables usage of environment
     variables for configuration.
     * **default_encoding** - *(optional)* The default encoding to use for decoding
@@ -1370,6 +1407,8 @@ class AsyncClient(BaseClient):
         event_hooks: None | (typing.Mapping[str, list[EventHook]]) = None,
         base_url: URL | str = "",
         transport: AsyncBaseTransport | None = None,
+        borrow_transport: bool = False,
+        borrow_mounts: bool = False,
         trust_env: bool = True,
         default_encoding: str | typing.Callable[[bytes], str] = "utf-8",
     ) -> None:
@@ -1399,6 +1438,13 @@ class AsyncClient(BaseClient):
         allow_env_proxies = trust_env and transport is None
         proxy_map = self._get_proxy_map(proxy, allow_env_proxies)
 
+        # Track every transport that this client is responsible for closing.
+        # Keying by object identity guarantees that the same transport being
+        # attached as the main transport and/or on several routes is closed
+        # at most once. Transports explicitly marked as borrowed are omitted
+        # and are left for the caller to manage.
+        self._owned_transports: dict[int, AsyncBaseTransport] = {}
+
         self._transport = self._init_transport(
             verify=verify,
             cert=cert,
@@ -1408,25 +1454,35 @@ class AsyncClient(BaseClient):
             limits=limits,
             transport=transport,
         )
+        if not borrow_transport:
+            self._owned_transports[id(self._transport)] = self._transport
 
-        self._mounts: dict[URLPattern, AsyncBaseTransport | None] = {
-            URLPattern(key): None
-            if proxy is None
-            else self._init_proxy_transport(
-                proxy,
-                verify=verify,
-                cert=cert,
-                trust_env=trust_env,
-                http1=http1,
-                http2=http2,
-                limits=limits,
-            )
-            for key, proxy in proxy_map.items()
-        }
+        self._mounts: dict[URLPattern, AsyncBaseTransport | None] = {}
+        for key, proxy in proxy_map.items():
+            if proxy is None:
+                self._mounts[URLPattern(key)] = None
+            else:
+                proxy_transport = self._init_proxy_transport(
+                    proxy,
+                    verify=verify,
+                    cert=cert,
+                    trust_env=trust_env,
+                    http1=http1,
+                    http2=http2,
+                    limits=limits,
+                )
+                self._mounts[URLPattern(key)] = proxy_transport
+                self._owned_transports.setdefault(
+                    id(proxy_transport), proxy_transport
+                )
         if mounts is not None:
             self._mounts.update(
                 {URLPattern(key): transport for key, transport in mounts.items()}
             )
+            if not borrow_mounts:
+                for mounted in mounts.values():
+                    if mounted is not None:
+                        self._owned_transports.setdefault(id(mounted), mounted)
         self._mounts = dict(sorted(self._mounts.items()))
 
     def _init_transport(
@@ -1982,10 +2038,8 @@ class AsyncClient(BaseClient):
         if self._state != ClientState.CLOSED:
             self._state = ClientState.CLOSED
 
-            await self._transport.aclose()
-            for proxy in self._mounts.values():
-                if proxy is not None:
-                    await proxy.aclose()
+            for transport in self._owned_transports.values():
+                await transport.aclose()
 
     async def __aenter__(self: U) -> U:
         if self._state != ClientState.UNOPENED:
@@ -1999,10 +2053,15 @@ class AsyncClient(BaseClient):
 
         self._state = ClientState.OPENED
 
-        await self._transport.__aenter__()
-        for proxy in self._mounts.values():
-            if proxy is not None:
-                await proxy.__aenter__()
+        entered: list[AsyncBaseTransport] = []
+        try:
+            for transport in self._owned_transports.values():
+                await transport.__aenter__()
+                entered.append(transport)
+        except BaseException:
+            for transport in reversed(entered):
+                await transport.__aexit__(None, None, None)
+            raise
         return self
 
     async def __aexit__(
@@ -2013,7 +2072,5 @@ class AsyncClient(BaseClient):
     ) -> None:
         self._state = ClientState.CLOSED
 
-        await self._transport.__aexit__(exc_type, exc_value, traceback)
-        for proxy in self._mounts.values():
-            if proxy is not None:
-                await proxy.__aexit__(exc_type, exc_value, traceback)
+        for transport in self._owned_transports.values():
+            await transport.__aexit__(exc_type, exc_value, traceback)

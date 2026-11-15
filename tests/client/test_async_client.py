@@ -252,6 +252,166 @@ async def test_context_managed_transport_and_mount():
     ]
 
 
+class CloseCountingTransport(httpx.AsyncBaseTransport):
+    """
+    A stand-in transport that records how many times it is closed and can
+    optionally fail when entered, to exercise ownership and rollback.
+    """
+
+    def __init__(self, *, fail_enter: bool = False) -> None:
+        self.close_count = 0
+        self.enter_count = 0
+        self.fail_enter = fail_enter
+
+    async def handle_async_request(
+        self, request: httpx.Request
+    ) -> httpx.Response:
+        return httpx.Response(200)
+
+    async def aclose(self) -> None:
+        self.close_count += 1
+
+    async def __aenter__(self) -> "CloseCountingTransport":
+        self.enter_count += 1
+        if self.fail_enter:
+            raise RuntimeError("transport failed to open")
+        return self
+
+
+@pytest.mark.anyio
+async def test_borrowed_transport_is_not_closed():
+    shared = CloseCountingTransport()
+
+    owner = httpx.AsyncClient(transport=shared)
+    borrower = httpx.AsyncClient(transport=shared, borrow_transport=True)
+
+    await owner.aclose()
+    await borrower.aclose()
+
+    # The owning client closes it exactly once; the borrower leaves it alone.
+    assert shared.close_count == 1
+
+
+@pytest.mark.anyio
+async def test_borrowed_mounts_are_not_closed():
+    shared = CloseCountingTransport()
+
+    client = httpx.AsyncClient(
+        mounts={"http://www.example.org": shared},
+        borrow_mounts=True,
+    )
+    await client.aclose()
+
+    assert shared.close_count == 0
+
+
+@pytest.mark.anyio
+async def test_same_transport_mounted_on_several_routes_closes_once():
+    shared = CloseCountingTransport()
+
+    client = httpx.AsyncClient(
+        mounts={
+            "http://a.example.org": shared,
+            "http://b.example.org": shared,
+        }
+    )
+    await client.aclose()
+
+    assert shared.close_count == 1
+
+
+@pytest.mark.anyio
+async def test_same_transport_as_main_and_mount_closes_once():
+    shared = CloseCountingTransport()
+
+    client = httpx.AsyncClient(
+        transport=shared,
+        mounts={"http://www.example.org": shared},
+    )
+    await client.aclose()
+
+    assert shared.close_count == 1
+
+
+@pytest.mark.anyio
+async def test_closing_client_twice_closes_owned_transport_once():
+    transport = CloseCountingTransport()
+    client = httpx.AsyncClient(transport=transport)
+
+    await client.aclose()
+    await client.aclose()
+
+    assert transport.close_count == 1
+
+
+@pytest.mark.anyio
+async def test_borrowed_transport_kept_open_across_context_exit():
+    shared = CloseCountingTransport()
+
+    async with httpx.AsyncClient(transport=shared, borrow_transport=True):
+        pass
+
+    assert shared.close_count == 0
+
+    # The caller is still responsible for the lifetime of the borrowed
+    # transport, which remains usable for another client.
+    async with httpx.AsyncClient(transport=shared):
+        pass
+
+    assert shared.close_count == 1
+
+
+@pytest.mark.anyio
+async def test_context_entry_failure_respects_ownership():
+    main = CloseCountingTransport()
+    already_entered = CloseCountingTransport()
+    failing = CloseCountingTransport(fail_enter=True)
+
+    with pytest.raises(RuntimeError, match="failed to open"):
+        async with httpx.AsyncClient(
+            transport=main,
+            mounts={
+                "http://good-long.example.org": already_entered,
+                "http://x-owned.example.org": failing,
+            },
+        ):
+            pass  # pragma: no cover
+
+    # Owned transports that were already opened are rolled back...
+    assert main.enter_count == 1
+    assert main.close_count == 1
+    assert already_entered.enter_count == 1
+    assert already_entered.close_count == 1
+    # ...the transport that failed is not closed a second time by the client...
+    assert failing.enter_count == 1
+    assert failing.close_count == 0
+
+
+@pytest.mark.anyio
+async def test_borrowed_mounts_are_not_entered_on_rollback():
+    # The main transport is owned and fails on entry; the mounted transport
+    # is borrowed, so the client must never enter or close it.
+    failing = CloseCountingTransport(fail_enter=True)
+    borrowed = CloseCountingTransport()
+
+    with pytest.raises(RuntimeError, match="failed to open"):
+        async with httpx.AsyncClient(
+            transport=failing,
+            mounts={
+                "http://www.example.org": borrowed,
+            },
+            borrow_mounts=True,
+        ):
+            pass  # pragma: no cover
+
+    # The owned main transport failed while opening...
+    assert failing.enter_count == 1
+    assert failing.close_count == 0
+    # ...and the borrowed mount is never entered or closed by the client.
+    assert borrowed.enter_count == 0
+    assert borrowed.close_count == 0
+
+
 def hello_world(request):
     return httpx.Response(200, text="Hello, world!")
 
