@@ -412,6 +412,10 @@ class CachedSession(CacheMixin, OriginalSession):
         stale_while_revalidate: Return a stale response initially, while a non-blocking request is
             sent to refresh the response for the next time it's requested
         autoclose: Close the cache backend when the session is closed
+        corruption_policy: How to handle cache entries that can't be deserialized: ``report``
+            (default), ``delete`` (also removes redirect aliases), or ``raise``
+        on_corruption: Optional callback that receives a
+            :py:class:`.CorruptEntryError` when an entry can't be deserialized
         filter_fn: Response filtering function that indicates whether or not a given response should
             be cached. See :ref:`custom-filtering` for details.
         key_fn: Request matching function for generating custom cache keys. See

@@ -12,6 +12,7 @@ from collections import UserDict
 from datetime import datetime
 from logging import getLogger
 from pickle import PickleError
+from threading import local
 from typing import TYPE_CHECKING, Iterable, Iterator, List, MutableMapping, Optional, TypeVar, Union
 from warnings import warn
 
@@ -21,7 +22,14 @@ from requests import Request, Response
 
 from ..cache_keys import create_key, redact_response
 from ..models import AnyRequest, CachedResponse
-from ..policy import DEFAULT_CACHE_NAME, CacheSettings, ExpirationTime
+from ..policy import (
+    DEFAULT_CACHE_NAME,
+    CacheSettings,
+    CorruptionPolicy,
+    CorruptEntryError,
+    ExpirationTime,
+    notify_corruption,
+)
 from ..serializers import SerializerType, init_serializer
 
 # Specific exceptions that may be raised during deserialization
@@ -48,6 +56,9 @@ class BaseCache:
     Args:
         cache_name: Cache prefix or namespace, depending on backend
         serializer: Serializer name or instance
+        corruption_policy: How to handle entries that cannot be deserialized: ``report``,
+            ``delete``, or ``raise``. See :py:class:`.CorruptionPolicy`.
+        on_corruption: Optional callback that receives a :py:class:`.CorruptEntryError`
         kwargs: Additional backend-specific keyword arguments
     """
 
@@ -55,7 +66,91 @@ class BaseCache:
         self.cache_name = cache_name
         self.responses: BaseStorage[str, CachedResponse] = DictStorage()
         self.redirects: BaseStorage[str, str] = DictStorage()
-        self._settings = CacheSettings()  # Init and public access is done in CachedSession
+        # Init and public access is done in CachedSession
+        self._settings = CacheSettings.from_kwargs(**kwargs)
+        self._configure_storages()
+
+    def _configure_storages(self):
+        """Connect storage instances to policy that is managed at the cache level."""
+        for storage in (self.responses, self.redirects):
+            storage.corruption_handler = self._handle_corruption
+
+    @property
+    def corruption_policy(self) -> CorruptionPolicy:
+        """How to handle cache entries that cannot be deserialized."""
+        return self._settings.corruption_policy
+
+    @corruption_policy.setter
+    def corruption_policy(self, value):
+        self._settings.corruption_policy = CorruptionPolicy.parse(value)
+
+    def _handle_corruption(self, event: CorruptEntryError) -> Optional[CachedResponse]:
+        """Apply the configured policy to a single corrupted entry."""
+        notify_corruption(self._settings.on_corruption, event, logger)
+
+        if self._settings.corruption_policy == CorruptionPolicy.RAISE:
+            raise event from event.error
+
+        if self._settings.corruption_policy == CorruptionPolicy.DELETE:
+            if self._settings.read_only:
+                logger.info(
+                    'Not deleting corrupt cache entry in read-only mode '
+                    '(key=%r, stage=delete, error=%s)',
+                    event.key,
+                    event.exception_name,
+                    extra={
+                        'cache_key': event.key,
+                        'stage': 'delete',
+                        'exception_type': event.exception_name,
+                    },
+                )
+                return None
+            try:
+                self._delete_corrupted_entry(event.key)
+            except Exception as delete_error:
+                # A failed recovery must not fall back to clearing the database or recursively
+                # re-entering corruption handling.
+                logger.exception(
+                    'Failed to isolate corrupt cache entry '
+                    '(key=%r, stage=delete, error=%s): %s',
+                    event.key,
+                    type(delete_error).__name__,
+                    delete_error,
+                    extra={
+                        'cache_key': event.key,
+                        'stage': 'delete',
+                        'exception_type': type(delete_error).__name__,
+                    },
+                )
+        return None
+
+    def _delete_corrupted_entry(self, key: str):
+        """Delete a corrupted response and any aliases that resolve to it."""
+        self.responses.bulk_delete([key])
+        aliases = self._get_redirect_aliases({key})
+        if aliases:
+            self.redirects.bulk_delete(aliases)
+
+    def _get_redirect_aliases(self, target_keys: Iterable[str]) -> List[str]:
+        """Get all redirect aliases that resolve to the given target key(s).
+
+        This follows reverse redirect links so a dangling multi-hop alias is removed in the same
+        isolation operation. Iteration is bounded by the number of stored aliases, so self-loops
+        and cycles cannot recurse indefinitely.
+        """
+        redirects = dict(self.redirects.items())
+        aliases: List[str] = []
+        targets = set(target_keys)
+        while targets:
+            next_targets = set()
+            for alias, target in redirects.items():
+                if alias not in aliases and target in targets:
+                    aliases.append(alias)
+                    next_targets.add(alias)
+            if not next_targets:
+                break
+            targets = next_targets
+        return aliases
 
     @property
     def db_path(self) -> Union[str, Path]:
@@ -77,6 +172,7 @@ class BaseCache:
             default: Value to return if `key` is not in the cache
         """
         try:
+            self._configure_storages()
             response = self.responses.get(key)
             if response is None:  # Note: bool(requests.Response) is False if status > 400
                 response = self.responses[self.redirects[key]]
@@ -181,6 +277,7 @@ class BaseCache:
             urls: Remove matching GET requests for the specified URL(s)
             verify: Set to ``False`` to remove responses without SSL verification
         """
+        self._configure_storages()
         delete_keys: List[str] = list(keys) if keys else []
         if urls:
             requests = list(requests or []) + [Request('GET', url).prepare() for url in urls]
@@ -226,7 +323,10 @@ class BaseCache:
         """
         if not any([valid, expired, invalid, older_than]):
             return
-        for key in self.responses.keys():
+        # Materialize keys first, so recovery (which may delete the current item) cannot disturb
+        # an in-progress backend cursor and make later items disappear from this batch.
+        self._configure_storages()
+        for key in list(self.responses.keys()):
             response = self.get_response(key)
 
             # Use an empty response as a placeholder for an invalid response, if specified
@@ -317,6 +417,9 @@ class BaseStorage(MutableMapping[KT, VT], ABC):
         serializer: Custom serializer that provides ``loads`` and ``dumps`` methods.
             If not provided, values will be written as-is.
         decode_content: Decode response body JSON or text into a human-readable format
+        corruption_policy: How to handle entries that cannot be deserialized: ``report``,
+            ``delete``, or ``raise``. See :py:class:`.CorruptionPolicy`.
+        on_corruption: Optional callback that receives a :py:class:`.CorruptEntryError`
         kwargs: Additional backend-specific keyword arguments
     """
 
@@ -324,9 +427,28 @@ class BaseStorage(MutableMapping[KT, VT], ABC):
         self,
         serializer: Optional[SerializerType] = None,
         decode_content: bool = False,
+        corruption_policy: Optional[CorruptionPolicy] = None,
+        on_corruption=None,
+        read_only: bool = False,
         **kwargs,
     ):
+        corruption_policy = kwargs.pop('corrupt_entry_policy', corruption_policy)
+        corruption_policy = kwargs.pop('invalid_response_policy', corruption_policy)
+        for alias in (
+            'on_corrupt',
+            'on_corrupt_entry',
+            'corruption_callback',
+            'on_error',
+            'on_invalid_response',
+        ):
+            if alias in kwargs:
+                on_corruption = kwargs.pop(alias)
         self.serializer = init_serializer(serializer, decode_content)
+        self.corruption_policy = CorruptionPolicy.parse(corruption_policy)
+        self.on_corruption = on_corruption
+        self.read_only = read_only
+        self.corruption_handler = None
+        self._corruption_local = local()
         logger.debug(f'Initialized {type(self).__name__} with serializer: {self.serializer}')
 
     def bulk_delete(self, keys: Iterable[KT]):
@@ -354,7 +476,7 @@ class BaseStorage(MutableMapping[KT, VT], ABC):
         """Deserialize a value, if a serializer is available.
 
         If deserialization fails (usually due to a value saved in an older requests-cache version),
-        ``None`` will be returned.
+        the configured :py:class:`.CorruptionPolicy` is applied.
         """
         if not self.serializer:
             return value
@@ -369,10 +491,75 @@ class BaseStorage(MutableMapping[KT, VT], ABC):
             except AttributeError:
                 pass
             return obj
-        except DESERIALIZE_ERRORS as e:
-            logger.error(f'Unable to deserialize response: {str(e)}')
-            logger.debug(e, exc_info=True)
+        except Exception as e:
+            return self._handle_corrupt_entry(key, 'deserialize', e)
+
+    def _handle_corrupt_entry(self, key, stage: str, error: BaseException):
+        """Log, report, and optionally isolate a single corrupt cache entry."""
+        event = CorruptEntryError(key, stage, error, policy=self.corruption_policy)
+        logger.error(
+            'Unable to deserialize cache entry (key=%r, stage=%s, error=%s): %s',
+            event.key,
+            event.stage,
+            event.exception_name,
+            event.error,
+            extra={
+                'cache_key': event.key,
+                'stage': event.stage,
+                'exception_type': event.exception_name,
+            },
+        )
+        logger.debug(error, exc_info=True)
+
+        # A callback or recovery operation must not recursively re-enter this handler.
+        if getattr(self._corruption_local, 'handling', False):
+            if self.corruption_policy == CorruptionPolicy.RAISE:
+                raise event from error
             return None
+
+        self._corruption_local.handling = True
+        try:
+            if self.corruption_handler is not None:
+                return self.corruption_handler(event)
+            return self._apply_corruption_policy(event)
+        finally:
+            self._corruption_local.handling = False
+
+    def _apply_corruption_policy(self, event: CorruptEntryError):
+        """Apply the policy configured directly on this storage."""
+        notify_corruption(self.on_corruption, event, logger)
+        if self.corruption_policy == CorruptionPolicy.RAISE:
+            raise event from event.error
+        if self.corruption_policy == CorruptionPolicy.DELETE:
+            if self.read_only:
+                logger.info(
+                    'Not deleting corrupt cache entry in read-only mode '
+                    '(key=%r, stage=delete, error=%s)',
+                    event.key,
+                    event.exception_name,
+                    extra={
+                        'cache_key': event.key,
+                        'stage': 'delete',
+                        'exception_type': event.exception_name,
+                    },
+                )
+                return None
+            try:
+                self.bulk_delete([event.key])
+            except Exception as delete_error:
+                logger.exception(
+                    'Failed to isolate corrupt cache entry '
+                    '(key=%r, stage=delete, error=%s): %s',
+                    event.key,
+                    type(delete_error).__name__,
+                    delete_error,
+                    extra={
+                        'cache_key': event.key,
+                        'stage': 'delete',
+                        'exception_type': type(delete_error).__name__,
+                    },
+                )
+        return None
 
     def __str__(self):
         return str(list(self.keys()))

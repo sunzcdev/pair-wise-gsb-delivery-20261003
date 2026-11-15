@@ -66,6 +66,7 @@ class SQLiteCache(BaseCache):
             serializer=None,
             **kwargs,
         )
+        self._configure_storages()
 
     @property
     def db_path(self) -> StrOrPath:
@@ -144,6 +145,22 @@ class SQLiteCache(BaseCache):
                 ')'
             )
 
+    def _delete_corrupted_entry(self, key: str):
+        """Delete a corrupted response and its redirect aliases in one transaction."""
+        with self.responses._lock:
+            aliases = self._get_redirect_aliases({key})
+            with self.responses.connection(commit=True) as con:
+                con.execute(
+                    f'DELETE FROM {self.responses.table_name} WHERE key=?',
+                    (key,),
+                )
+                for chunk in chunkify(aliases, max_size=SQLITE_MAX_VARIABLE_NUMBER):
+                    marks, args = _format_sequence(chunk)
+                    con.execute(
+                        f'DELETE FROM {self.redirects.table_name} WHERE key IN ({marks})',
+                        args,
+                    )
+
     def count(self, expired: bool = True) -> int:
         """Count number of responses, optionally excluding expired
 
@@ -160,6 +177,7 @@ class SQLiteCache(BaseCache):
         invalid: bool = False,
         older_than: ExpirationTime = None,
     ) -> Iterator[CachedResponse]:
+        self._configure_storages()
         if valid and not invalid:
             return self.responses.sorted(expired=expired)
         else:
@@ -187,6 +205,7 @@ class SQLiteCache(BaseCache):
             limit: Maximum number of responses to return
             expired: Set to ``False`` to exclude expired responses
         """
+        self._configure_storages()
         return self.responses.sorted(key, reversed, limit, expired)
 
 

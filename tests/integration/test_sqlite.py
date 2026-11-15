@@ -13,7 +13,7 @@ from platformdirs import user_cache_dir
 from requests_cache.backends import BaseCache, SQLiteCache, SQLiteDict
 from requests_cache.backends.sqlite import MEMORY_URI
 from requests_cache.models import CachedRequest, CachedResponse
-from requests_cache.policy import utcnow
+from requests_cache.policy import CorruptEntryError, utcnow
 from tests.conftest import skip_pypy
 from tests.integration.base_cache_test import BaseCacheTest
 from tests.integration.base_storage_test import CACHE_NAME, BaseStorageTest
@@ -451,3 +451,120 @@ class TestSQLiteCache(BaseCacheTest):
             assert prev_item is None or prev_item.expires < item.expires
             assert item.cache_key
             assert not item.is_expired
+
+    def _init_corrupt_cache(
+        self,
+        corruption_policy='report',
+        read_only=False,
+        on_corruption=None,
+    ):
+        """Create a cache with two valid responses and one valid response with corrupt raw data."""
+        session = self.init_session(
+            corruption_policy=corruption_policy,
+            read_only=read_only,
+            on_corruption=on_corruption,
+        )
+        session.cache.responses['key_a'] = CachedResponse(
+            status_code=200, url='https://example.com/a'
+        )
+        session.cache.responses['key_c'] = CachedResponse(
+            status_code=200, url='https://example.com/c'
+        )
+        with session.cache.responses.connection(commit=True) as con:
+            con.execute(
+                "INSERT OR REPLACE INTO responses (key, value, expires) VALUES (?, ?, ?)",
+                ('key_bad', sqlite3.Binary(b'not a valid pickled response'), None),
+            )
+
+        # Add direct and multi-hop aliases to the corrupt response, plus an unrelated alias
+        session.cache.redirects['alias_bad'] = 'key_bad'
+        session.cache.redirects['alias_alias_bad'] = 'alias_bad'
+        session.cache.redirects['alias_c'] = 'key_c'
+        return session
+
+    def test_corrupt_entry__report_only_continues_batch(self):
+        session = self._init_corrupt_cache()
+
+        items = list(session.cache.sorted(key='key'))
+
+        # The valid entries before and after the corrupt one must still be readable
+        assert [item.cache_key for item in items] == ['key_a', 'key_c']
+        assert session.cache.get_response('key_a').url == 'https://example.com/a'
+
+        # Report-only leaves the corrupt entry and its aliases in place
+        assert 'key_bad' in session.cache.responses
+        assert session.cache.redirects['alias_bad'] == 'key_bad'
+
+    def test_corrupt_entry__delete_removes_entry_and_aliases(self, caplog):
+        session = self._init_corrupt_cache(corruption_policy='delete')
+
+        items = list(session.cache.sorted(key='key'))
+
+        assert [item.cache_key for item in items] == ['key_a', 'key_c']
+        assert 'key_bad' not in session.cache.responses
+        assert 'alias_bad' not in session.cache.redirects
+        assert 'alias_alias_bad' not in session.cache.redirects
+        assert session.cache.redirects['alias_c'] == 'key_c'
+
+        # Subsequent reads should continue normally
+        assert session.cache.get_response('key_c').url == 'https://example.com/c'
+
+        # Diagnostics should identify the key, stage, and exception category
+        assert 'key_bad' in caplog.text
+        assert 'stage=deserialize' in caplog.text
+        assert 'UnpicklingError' in caplog.text
+
+    def test_corrupt_entry__raise(self):
+        session = self._init_corrupt_cache(corruption_policy='raise')
+
+        with pytest.raises(CorruptEntryError) as exc_info:
+            session.cache.get_response('key_bad')
+
+        assert exc_info.value.key == 'key_bad'
+        assert exc_info.value.stage == 'deserialize'
+        assert exc_info.value.exception_type is not None
+        assert exc_info.value.exception_category == 'UnpicklingError'
+
+        # A strict failure is isolated to the bad entry; other entries remain readable
+        assert session.cache.get_response('key_a').url == 'https://example.com/a'
+
+    def test_corrupt_entry__read_only_never_deletes(self):
+        session = self._init_corrupt_cache(corruption_policy='delete', read_only=True)
+
+        assert session.cache.get_response('key_bad') is None
+        assert 'key_bad' in session.cache.responses
+        assert session.cache.redirects['alias_bad'] == 'key_bad'
+        assert session.cache.get_response('key_a').url == 'https://example.com/a'
+
+    def test_corrupt_entry__callback_failure_is_not_recursive(self):
+        events = []
+
+        def on_corruption(event):
+            events.append(event)
+            raise RuntimeError('callback failed')
+
+        session = self._init_corrupt_cache(
+            corruption_policy='delete', on_corruption=on_corruption
+        )
+
+        assert session.cache.get_response('key_bad') is None
+
+        # The callback is called once, and its error does not trigger another recovery attempt
+        assert len(events) == 1
+        assert events[0].key == 'key_bad'
+        assert 'key_bad' not in session.cache.responses
+        assert session.cache.get_response('key_a').url == 'https://example.com/a'
+
+    def test_corrupt_entry__connection_error_is_not_isolation(self):
+        session = self._init_corrupt_cache(corruption_policy='delete')
+
+        with patch.object(
+            session.cache.responses,
+            'connection',
+            side_effect=sqlite3.OperationalError('unable to open database file'),
+        ):
+            with pytest.raises(sqlite3.OperationalError):
+                session.cache.get_response('key_a')
+
+        # A connection failure must not be treated as a corrupt entry or clear the database
+        assert len(session.cache.responses) == 3
