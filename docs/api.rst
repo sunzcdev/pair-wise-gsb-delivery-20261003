@@ -11,7 +11,7 @@ Database
 --------
 
 .. autoclass:: dataset.Database
-   :members: tables, views, has_table, get_table, create_table, load_table, query, begin, commit, rollback, close
+   :members: tables, views, get_table_names, get_view_names, has_table, get_table, create_table, load_table, query, begin, commit, rollback, close
    :special-members:
 
 

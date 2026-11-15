@@ -7,6 +7,7 @@ from alembic.migration import MigrationContext
 from alembic.operations import Operations
 from sqlalchemy import Connection, Engine, create_engine, event, inspect
 from sqlalchemy.engine.reflection import Inspector
+from sqlalchemy.exc import OperationalError
 from sqlalchemy.schema import MetaData
 from sqlalchemy.sql import text
 from sqlalchemy.sql.expression import Executable
@@ -17,6 +18,7 @@ from dataset.util import (
     QUERY_STEP,
     ResultIter,
     RowFactory,
+    normalize_schema_name,
     normalize_table_name,
     row_factory,
     safe_url,
@@ -59,7 +61,7 @@ class Database:
                 if len(schema_qs):
                     schema = schema_qs.pop()
 
-        self.schema = schema
+        self.schema = normalize_schema_name(schema)
         self.engine: Engine | None = create_engine(url, **engine_kwargs)
         assert self.engine is not None
         self.is_postgres = self.engine.dialect.name == "postgresql"
@@ -86,7 +88,9 @@ class Database:
         self.url = url
         self.row_type: RowFactory = row_type
         self.ensure_schema = ensure_schema
-        self._tables: dict[str, Table] = {}
+        # Table handles are cached by (schema, table name) so that equally
+        # named tables in different schemas do not share metadata.
+        self._tables: dict[tuple[str | None, str], Table] = {}
 
     @property
     def executable(self) -> Connection:
@@ -110,8 +114,31 @@ class Database:
         """Get a SQLAlchemy inspector."""
         return inspect(self.executable)
 
-    def has_table(self, name: str) -> bool:
-        return self.inspect.has_table(name, schema=self.schema)
+    def has_table(self, name: str, schema: str | None = None) -> bool:
+        """Check if a table or view exists, optionally in a specific schema.
+
+        If no ``schema`` is given, the database's default schema is used. An
+        unknown schema is reported as "not present" rather than raising an
+        error.
+        """
+        schema = normalize_schema_name(schema if schema is not None else self.schema)
+        try:
+            if self.inspect.has_table(name, schema=schema):
+                return True
+            return name in self.inspect.get_view_names(schema=schema)
+        except OperationalError:
+            # Some dialects raise when asked about a schema that does not
+            # exist on this connection (e.g. a detached SQLite database).
+            return False
+
+    def metadata_for(self, schema: str | None = None) -> MetaData:
+        """Return a fresh SQLAlchemy schema cache for the given schema.
+
+        The schema name is passed to SQLAlchemy as an identifier, it is never
+        interpolated into SQL text.
+        """
+        schema = normalize_schema_name(schema if schema is not None else self.schema)
+        return MetaData(schema=schema)
 
     @property
     def metadata(self) -> MetaData:
@@ -237,6 +264,22 @@ class Database:
         """Get a listing of all views that exist in the database."""
         return self.inspect.get_view_names(schema=self.schema)
 
+    def get_table_names(self, schema: str | None = None) -> list[str]:
+        """Get a listing of all tables in the given schema.
+
+        Without ``schema``, the default schema of this database is used.
+        """
+        schema = normalize_schema_name(schema if schema is not None else self.schema)
+        return self.inspect.get_table_names(schema=schema)
+
+    def get_view_names(self, schema: str | None = None) -> list[str]:
+        """Get a listing of all views in the given schema.
+
+        Without ``schema``, the default schema of this database is used.
+        """
+        schema = normalize_schema_name(schema if schema is not None else self.schema)
+        return self.inspect.get_view_names(schema=schema)
+
     def __contains__(self, table_name: str) -> bool:
         """Check if the given table name exists in the database."""
         try:
@@ -253,6 +296,7 @@ class Database:
         primary_id: str | Literal[False] | None = None,
         primary_type: ColumnType | None = None,
         primary_increment: bool | None = None,
+        schema: str | None = None,
     ) -> Table:
         """Create a new table.
 
@@ -263,6 +307,12 @@ class Database:
         The caller will be responsible for the uniqueness of ``primary_id`` if
         it is defined as a text type. You can disable auto-increment behaviour
         for numeric primary keys by setting `primary_increment` to `False`.
+
+        Pass ``schema`` to address a table in a specific schema, e.g. a
+        database attached to a SQLite connection. The schema name is used as
+        an identifier by SQLAlchemy, so names containing spaces or quotes are
+        quoted correctly. If ``schema`` is omitted, the database's default
+        schema is used.
 
         Returns a :py:class:`Table <dataset.Table>` instance.
         ::
@@ -281,40 +331,51 @@ class Database:
             # no primary key
             table5 = db.create_table('population5',
                                      primary_id=False)
+            # in a specific schema
+            table6 = db.create_table('population6', schema='other')
         """
         assert not isinstance(primary_type, str), (
             "Text-based primary_type support is dropped, use db.types."
         )
         table_name = normalize_table_name(table_name)
+        schema = normalize_schema_name(schema if schema is not None else self.schema)
         with self.lock:
-            if table_name not in self._tables:
-                self._tables[table_name] = Table(
+            cache_key = (schema, table_name)
+            if cache_key not in self._tables:
+                self._tables[cache_key] = Table(
                     self,
                     table_name,
                     primary_id=primary_id,
                     primary_type=primary_type,
                     primary_increment=primary_increment,
                     auto_create=True,
+                    schema=schema,
                 )
-            return self._tables[table_name]
+            return self._tables[cache_key]
 
-    def load_table(self, table_name: str) -> Table:
+    def load_table(self, table_name: str, schema: str | None = None) -> Table:
         """Load a table.
 
         This will fail if the tables does not already exist in the database. If
         the table exists, its columns will be reflected and are available on
         the :py:class:`Table <dataset.Table>` object.
 
+        Pass ``schema`` to load a table from a specific schema. If it is
+        omitted, the database's default schema is used.
+
         Returns a :py:class:`Table <dataset.Table>` instance.
         ::
 
             table = db.load_table('population')
+            table = db.load_table('population', schema='other')
         """
         table_name = normalize_table_name(table_name)
+        schema = normalize_schema_name(schema if schema is not None else self.schema)
         with self.lock:
-            if table_name not in self._tables:
-                self._tables[table_name] = Table(self, table_name)
-            return self._tables[table_name]
+            cache_key = (schema, table_name)
+            if cache_key not in self._tables:
+                self._tables[cache_key] = Table(self, table_name, schema=schema)
+            return self._tables[cache_key]
 
     def get_table(
         self,
@@ -322,6 +383,7 @@ class Database:
         primary_id: str | Literal[False] | None = None,
         primary_type: ColumnType | None = None,
         primary_increment: bool | None = None,
+        schema: str | None = None,
     ) -> Table:
         """Load or create a table.
 
@@ -331,11 +393,13 @@ class Database:
             table = db.get_table('population')
             # you can also use the short-hand syntax:
             table = db['population']
+            # or address a table in a specific schema:
+            table = db.get_table('population', schema='other')
         """
         if not self.ensure_schema:
-            return self.load_table(table_name)
+            return self.load_table(table_name, schema=schema)
         return self.create_table(
-            table_name, primary_id, primary_type, primary_increment
+            table_name, primary_id, primary_type, primary_increment, schema=schema
         )
 
     def __getitem__(self, table_name: str) -> Table:

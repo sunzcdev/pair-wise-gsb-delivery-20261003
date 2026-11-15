@@ -130,6 +130,40 @@ Using ``len()`` we can get the total number of rows in a table:
    >>> print(len(db['user']))
    2
 
+Tables in multiple schemas
+--------------------------
+
+By default a table handle addresses a table in the default schema of the
+connection. When several schemas are reachable through the same connection —
+for example databases attached to a SQLite connection, or multiple schemas in
+PostgreSQL — you can pass ``schema`` to select a table explicitly::
+
+   # SQLite: attach a second database file
+   db.query('ATTACH DATABASE "other.db" AS "archive"')
+
+   table = db['user']
+   archive_table = db.get_table('user', schema='archive')
+
+   table.insert(dict(name='John Doe', age=46))         # main schema
+   archive_table.insert(dict(name='Jane Doe', age=37)) # archive schema
+
+   db.tables                      # tables in the default schema
+   db.get_table_names('archive')  # tables in the archive schema
+
+The schema is part of the table handle's identity, so ``db['user']`` and
+``db.get_table('user', schema='archive')`` are distinct handles with distinct
+cached columns. Automatic table creation, column creation, index creation and
+all queries are scoped to the handle's own schema. Schema names are always
+passed to SQLAlchemy as identifiers, so names containing spaces or quotes are
+quoted correctly instead of being spliced into SQL::
+
+   db.get_table('user', schema='my archive')
+
+Note that in SQLite a schema only exists for the connection it was attached
+to. Attach it on the connection returned by ``db.executable`` (which is kept
+per thread), or via the ``on_connect_statements`` argument of
+``dataset.connect``.
+
 Reading data from tables
 ------------------------
 

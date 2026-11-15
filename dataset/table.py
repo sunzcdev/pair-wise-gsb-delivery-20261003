@@ -30,6 +30,7 @@ from dataset.util import (
     index_name,
     normalize_column_key,
     normalize_column_name,
+    normalize_schema_name,
     normalize_table_name,
     pad_chunk_columns,
 )
@@ -53,10 +54,18 @@ class Table:
         primary_type: ColumnType | None = None,
         primary_increment: bool | None = None,
         auto_create: bool = False,
+        schema: str | None = None,
     ):
         """Initialise the table from database schema."""
         self.db = database
         self.name = normalize_table_name(table_name)
+        # Schema this handle is bound to. ``None`` means the default schema of
+        # the connection. Every operation goes through ``self.schema`` so that
+        # two handles for equally named tables in different schemas never
+        # leak into each other.
+        self.schema = normalize_schema_name(
+            schema if schema is not None else database.schema
+        )
         self._table: SQLATable | None = None
         self._columns: dict[str, str] | None = None
         self._indexes: list[set[str]] = []
@@ -76,7 +85,7 @@ class Table:
         """Check to see if the table currently exists in the database."""
         if self._table is not None:
             return True
-        return self.name in self.db
+        return self.db.has_table(self.name, schema=self.schema)
 
     @property
     def table(self) -> SQLATable:
@@ -390,8 +399,8 @@ class Table:
             try:
                 self._table = SQLATable(
                     self.name,
-                    self.db.metadata,
-                    schema=self.db.schema,
+                    self.db.metadata_for(self.schema),
+                    schema=self.schema,
                     autoload_with=self.db.executable,
                 )
             except NoSuchTableError:
@@ -425,7 +434,7 @@ class Table:
             with self.db.lock:
                 self._threading_warn()
                 self._table = SQLATable(
-                    self.name, self.db.metadata, schema=self.db.schema
+                    self.name, self.db.metadata_for(self.schema), schema=self.schema
                 )
                 if self._primary_id is not False:
                     # This can go wrong on DBMS like MySQL and SQLite where
@@ -449,7 +458,7 @@ class Table:
                 self._threading_warn()
                 for column in columns:
                     if not self.has_column(column.name):
-                        self.db.op.add_column(self.name, column, schema=self.db.schema)
+                        self.db.op.add_column(self.name, column, schema=self.schema)
                 self._reflect_table()
                 self.db._auto_commit()
 
@@ -651,7 +660,7 @@ class Table:
                 self.table.drop(self.db.executable, checkfirst=True)
                 self._table = None
                 self._columns = None
-                self.db._tables.pop(self.name, None)
+                self.db._tables.pop((self.schema, self.name), None)
                 self.db._auto_commit()
 
     def has_index(self, columns: Iterable[str]) -> bool:
@@ -664,7 +673,7 @@ class Table:
         for column in columns_:
             if not self.has_column(column):
                 return False
-        indexes = self.db.inspect.get_indexes(self.name, schema=self.db.schema)
+        indexes = self.db.inspect.get_indexes(self.name, schema=self.schema)
         for index in indexes:
             idx_columns = index.get("column_names", [])
             if len(columns_.intersection(idx_columns)) == len(columns_):
@@ -769,7 +778,10 @@ class Table:
 
         stream_conn = None
         conn = self.db.executable
-        if _streamed:
+        if _streamed and not (self.db.is_sqlite and self.schema is not None):
+            # A new pooled connection cannot see schemas that are attached to
+            # a single SQLite connection, so stream on the handle's own
+            # connection in that case.
             stream_conn = self.db.engine.connect()
             conn = stream_conn.execution_options(stream_results=True)
 
@@ -884,4 +896,6 @@ class Table:
 
     def __repr__(self) -> str:
         """Get table representation."""
+        if self.schema is not None and self.schema != self.db.schema:
+            return f"<Table({self.schema}.{self.table.name})>"
         return f"<Table({self.table.name})>"

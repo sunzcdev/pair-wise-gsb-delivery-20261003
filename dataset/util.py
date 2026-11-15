@@ -189,6 +189,23 @@ def normalize_table_name(name: str) -> str:
     return name
 
 
+def normalize_schema_name(name: str | None) -> str | None:
+    """Validate a schema (database) name.
+
+    The name is returned verbatim: it is never spliced into SQL text, but
+    always passed to SQLAlchemy as an identifier so that characters like
+    spaces or quotes are quoted correctly.
+    """
+    if name is None:
+        return None
+    if not isinstance(name, str):
+        raise ValueError(f"Invalid schema name: {name!r}")
+    name = name.strip()
+    if not len(name):
+        raise ValueError(f"Invalid schema name: {name!r}")
+    return name
+
+
 def safe_url(url: str) -> str:
     """Remove password from printed connection URLs."""
     parsed = urlparse(url)

@@ -4,6 +4,13 @@
 changes must be reconstructed from revision history.*
 
 * **2.0.0**: Major modernization and type annotations
+  - **Schema-aware table access**: `get_table`, `create_table` and `load_table`
+    accept a `schema` argument, and the table cache is keyed by
+    `(schema, table_name)`. Handles for equally named tables in different
+    schemas (e.g. SQLite databases attached to one connection) no longer share
+    reflected columns, and automatic table/column/index creation and queries
+    stay within the handle's schema. Schema names are always passed through
+    SQLAlchemy's identifier quoting.
   - **Type annotations**: Full `mypy --strict` compliance across all modules
   - **PEP 561**: Added `py.typed` marker for downstream type checking
   - **New types**: Exported `OutRow`, `RowFactory`, `QueryError` for downstream use

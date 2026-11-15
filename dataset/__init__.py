@@ -50,6 +50,11 @@ def connect(
     the `ensure_schema` argument. It can also be overridden in a lot of the
     data manipulation methods using the `ensure` flag.
 
+    *schema* sets the default schema for table handles created by this
+    database. Individual handles can be pointed at another schema through the
+    ``schema`` argument of :py:meth:`Database.get_table()
+    <dataset.Database.get_table>`.
+
     If you want to run custom SQLite pragmas on database connect, you can add them
     to on_connect_statements as a set of strings. You can view a full
     `list of PRAGMAs here`_.
