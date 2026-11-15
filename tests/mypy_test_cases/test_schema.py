@@ -1,12 +1,12 @@
 import json
 
-from marshmallow import EXCLUDE, Schema
+from marshmallow import ACCEPT, EXCLUDE, Schema
 from marshmallow.fields import Integer, String
 
 
 # Test that valid `Meta` class attributes pass type checking
 class MySchema(Schema):
-    foo = String()
+    foo = String(load_aliases=("legacy_foo",))
     bar = Integer()
 
     class Meta(Schema.Meta):
@@ -26,4 +26,5 @@ class MySchema(Schema):
         load_only = ("foo", "bar")
         dump_only = ("baz", "qux")
         unknown = EXCLUDE
+        alias_duplicates = ACCEPT
         register = False

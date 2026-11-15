@@ -553,6 +553,36 @@ If you are consuming and producing data that does not match your schema, you can
     # 'email': 'foo@bar.com'}
 
 
+Handling multiple input names with load_aliases
+-----------------------------------------------
+
+Different producers of the same data may use different key names, for example
+when migrating from a legacy field name. The ``load_aliases`` argument declares
+extra keys that are accepted on `load <marshmallow.Schema.load>`. Aliases only
+affect deserialization: `dump <marshmallow.Schema.dump>` keeps using the
+canonical ``data_key`` (or the field name).
+
+.. code-block:: python
+
+    class UserSchema(Schema):
+        name = fields.String(load_aliases=("full_name", "username"))
+
+
+    s = UserSchema()
+    s.load({"full_name": "Grace"})  # {'name': 'Grace'}
+    s.load({"username": "Grace"})  # {'name': 'Grace'}
+    s.dump({"name": "Grace"})  # {'name': 'Grace'}
+
+When more than one of the canonical key and its aliases is present, the
+default ``RAISE`` behavior reports an error on every participating key even
+when the raw values are identical. Set the schema-level ``alias_duplicates``
+option to ``ACCEPT`` to accept identical values; unequal values always raise
+an error on every participating key.
+
+An alias may not collide with another field's name, ``data_key``, or alias:
+such a schema raises a ``ValueError`` when it is created.
+
+
 Next steps
 ----------
 - Need to represent relationships between objects? See the :doc:`nesting` page.

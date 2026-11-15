@@ -1,4 +1,4 @@
-from marshmallow.constants import EXCLUDE, INCLUDE, RAISE, missing
+from marshmallow.constants import ACCEPT, EXCLUDE, INCLUDE, RAISE, missing
 from marshmallow.decorators import (
     post_dump,
     post_load,
@@ -13,6 +13,7 @@ from marshmallow.schema import Schema, SchemaOpts
 from . import fields
 
 __all__ = [
+    "ACCEPT",
     "EXCLUDE",
     "INCLUDE",
     "RAISE",

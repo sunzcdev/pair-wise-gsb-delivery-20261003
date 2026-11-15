@@ -1297,6 +1297,49 @@ def test_attribute_collision(attribute):
             MySchema()
 
 
+def test_load_alias_colliding_with_canonical_field_name_is_rejected():
+    class MySchema(Schema):
+        name = fields.Raw(load_aliases=("age",))
+        age = fields.Raw()
+
+    with pytest.raises(ValueError, match="age"):
+        MySchema()
+
+
+def test_load_alias_colliding_with_data_key_is_rejected():
+    class MySchema(Schema):
+        name = fields.Raw(load_aliases=("Years",))
+        age = fields.Raw(data_key="Years")
+
+    with pytest.raises(ValueError, match="Years"):
+        MySchema()
+
+
+def test_load_alias_claimed_by_two_fields_is_rejected():
+    class MySchema(Schema):
+        name = fields.Raw(load_aliases=("legacy",))
+        age = fields.Raw(load_aliases=("legacy",))
+
+    with pytest.raises(ValueError, match="legacy"):
+        MySchema()
+
+
+def test_load_alias_colliding_with_dump_only_field_name_is_rejected():
+    class MySchema(Schema):
+        name = fields.Raw(load_aliases=("read_only",))
+        read_only = fields.Raw(dump_only=True)
+
+    with pytest.raises(ValueError, match="read_only"):
+        MySchema()
+
+
+def test_load_alias_equal_to_own_canonical_key_is_allowed():
+    class MySchema(Schema):
+        name = fields.Raw(data_key="Name", load_aliases=("Name", "Legacy"))
+
+    MySchema()
+
+
 class TestDeeplyNestedLoadOnly:
     @pytest.fixture
     def schema(self):

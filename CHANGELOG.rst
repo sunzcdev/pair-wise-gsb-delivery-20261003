@@ -1,6 +1,17 @@
 Changelog
 =========
 
+4.5.0 (unreleased)
+------------------
+
+Features:
+
+- Add ``load_aliases`` field parameter to accept additional load-only keys
+  while ``dump`` keeps using the canonical ``data_key``. Add the
+  ``alias_duplicates`` schema option (``RAISE``/``ACCEPT``) to control input
+  that provides several aliases of the same field, and reject aliases that
+  collide with another field's canonical name when the schema is created.
+
 4.4.0 (2026-11-03)
 ------------------
 

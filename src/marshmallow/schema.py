@@ -20,7 +20,7 @@ from itertools import zip_longest
 
 from marshmallow import class_registry, types
 from marshmallow import fields as ma_fields
-from marshmallow.constants import EXCLUDE, INCLUDE, RAISE, missing
+from marshmallow.constants import ACCEPT, EXCLUDE, INCLUDE, RAISE, missing
 from marshmallow.decorators import (
     POST_DUMP,
     POST_LOAD,
@@ -218,6 +218,7 @@ class SchemaOpts:
         self.load_only = getattr(meta, "load_only", ())
         self.dump_only = getattr(meta, "dump_only", ())
         self.unknown = getattr(meta, "unknown", RAISE)
+        self.alias_duplicates = getattr(meta, "alias_duplicates", RAISE)
         self.register = getattr(meta, "register", True)
         self.many = getattr(meta, "many", False)
 
@@ -268,6 +269,11 @@ class Schema(metaclass=SchemaMeta):
         will be ignored. Use dot delimiters to specify nested fields.
     :param unknown: Whether to exclude, include, or raise an error for unknown
         fields in the data. Use `EXCLUDE`, `INCLUDE` or `RAISE`.
+    :param alias_duplicates: How to handle input data where more than one of a
+        field's ``data_key`` and ``load_aliases`` is present. With `RAISE`
+        (the default) an error is raised even when the values are equal. With
+        `ACCEPT` equal values are accepted while unequal values raise an error
+        on every key involved.
 
     .. versionchanged:: 3.0.0
         Remove ``prefix`` parameter.
@@ -302,6 +308,8 @@ class Schema(metaclass=SchemaMeta):
     _default_error_messages: dict[str, str] = {
         "type": "Invalid input type.",
         "unknown": "Unknown field.",
+        "alias_duplicate": "Same value provided under multiple aliases.",
+        "alias_conflict": "Conflicting values provided under multiple aliases.",
     }
 
     OPTIONS_CLASS: type = SchemaOpts
@@ -398,6 +406,10 @@ class Schema(metaclass=SchemaMeta):
         """Whether to exclude, include, or raise an error for unknown fields in the data.
         Use `EXCLUDE`, `INCLUDE` or `RAISE`.
         """
+        alias_duplicates: typing.ClassVar[types.AliasDuplicatesOption]
+        """How to handle data containing more than one of a field's ``data_key``
+        and ``load_aliases``. Use `RAISE` (the default) or `ACCEPT`.
+        """
         register: typing.ClassVar[bool]
         """Whether to register the `Schema <marshmallow.Schema>` with marshmallow's internal
         class registry. Must be `True` if you intend to refer to this `Schema <marshmallow.Schema>`
@@ -415,6 +427,7 @@ class Schema(metaclass=SchemaMeta):
         dump_only: types.StrSequenceOrSet = (),
         partial: bool | types.StrSequenceOrSet | None = None,
         unknown: types.UnknownOption | None = None,
+        alias_duplicates: types.AliasDuplicatesOption | None = None,
     ):
         # Raise error if only or exclude is passed as string, not list of strings
         if only is not None and not is_collection(only):
@@ -433,6 +446,9 @@ class Schema(metaclass=SchemaMeta):
         self.partial = partial
         self.unknown: types.UnknownOption = (
             self.opts.unknown if unknown is None else unknown
+        )
+        self.alias_duplicates: types.AliasDuplicatesOption = (
+            self.opts.alias_duplicates if alias_duplicates is None else alias_duplicates
         )
         self._normalize_nested_options()
         #: Dictionary mapping field_names -> :class:`Field` objects
@@ -644,11 +660,32 @@ class Schema(metaclass=SchemaMeta):
             error_store.store_error([self.error_messages["type"]], index=index)
         else:
             partial_is_collection = is_collection(partial)
+            consumed_keys: set[str] = set()
             for attr_name, field_obj in self.load_fields.items():
                 field_name = (
                     field_obj.data_key if field_obj.data_key is not None else attr_name
                 )
+                candidate_keys = tuple(
+                    dict.fromkeys((field_name, *field_obj.load_aliases))
+                )
+                present = [key for key in candidate_keys if key in data]
+                consumed_keys.update(present)
+                if len(present) > 1:
+                    values = [data[key] for key in present]
+                    if any(value != values[0] for value in values[1:]):
+                        message = self.error_messages["alias_conflict"]
+                        for key in present:
+                            error_store.store_error([message], key, index)
+                        continue
+                    if self.alias_duplicates == RAISE:
+                        message = self.error_messages["alias_duplicate"]
+                        for key in present:
+                            error_store.store_error([message], key, index)
+                        continue
                 raw_value = data.get(field_name, missing)
+                if raw_value is missing and present:
+                    # The value was provided through a load alias.
+                    raw_value = data[present[0]]
                 if raw_value is missing:
                     # Ignore missing field if we're allowed to.
                     if partial is True or (
@@ -688,11 +725,7 @@ class Schema(metaclass=SchemaMeta):
                     key = field_obj.attribute or attr_name
                     set_value(ret_d, key, value)
             if unknown != EXCLUDE:
-                fields = {
-                    field_obj.data_key if field_obj.data_key is not None else field_name
-                    for field_name, field_obj in self.load_fields.items()
-                }
-                for key in set(data) - fields:
+                for key in set(data) - consumed_keys:
                     value = data[key]
                     if unknown == INCLUDE:
                         ret_d[key] = value
@@ -1046,6 +1079,35 @@ class Schema(metaclass=SchemaMeta):
                 "with another field's name or attribute argument. "
                 "Check the following field names and "
                 f"attribute arguments: {list(attributes_duplicates)}"
+            )
+
+        # Canonical load keys (data_key or field name) of every active field,
+        # including dump-only ones whose names must not be claimed as aliases.
+        canonical_keys = {
+            field_obj.data_key if field_obj.data_key is not None else name
+            for name, field_obj in fields_dict.items()
+        }
+        # Alias key -> canonical field name that owns it.
+        alias_owners: dict[str, str] = {}
+        alias_collisions: set[str] = set()
+        for field_name, field_obj in load_fields.items():
+            field_canonical = (
+                field_obj.data_key if field_obj.data_key is not None else field_name
+            )
+            for alias in field_obj.load_aliases:
+                if alias in canonical_keys and alias != field_canonical:
+                    alias_collisions.add(alias)
+                owner = alias_owners.get(alias)
+                if owner is not None and owner != field_name:
+                    alias_collisions.add(alias)
+                else:
+                    alias_owners[alias] = field_name
+        if alias_collisions:
+            raise ValueError(
+                "The load_aliases argument for one or more fields collides "
+                "with another field's name, data_key argument, or load_aliases "
+                "argument. Check the following keys: "
+                f"{sorted(alias_collisions)}"
             )
 
         self.fields = fields_dict

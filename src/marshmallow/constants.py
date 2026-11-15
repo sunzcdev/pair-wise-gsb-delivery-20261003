@@ -3,6 +3,7 @@ import typing
 EXCLUDE: typing.Final = "exclude"
 INCLUDE: typing.Final = "include"
 RAISE: typing.Final = "raise"
+ACCEPT: typing.Final = "accept"
 
 
 class _Missing:

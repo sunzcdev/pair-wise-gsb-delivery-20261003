@@ -80,6 +80,7 @@ class _BaseFieldKwargs(typing.TypedDict, total=False):
     load_default: typing.Any
     dump_default: typing.Any
     data_key: str | None
+    load_aliases: types.StrSequenceOrSet | None
     attribute: str | None
     validate: types.Validator | typing.Iterable[types.Validator] | None
     pre_load: types.PreLoadCallable | typing.Iterable[types.PreLoadCallable] | None
@@ -118,6 +119,11 @@ class Field(typing.Generic[_InternalT]):
     :param data_key: The name of the dict key in the external representation, i.e.
         the input of `load` and the output of `dump`.
         If `None`, the key will match the name of the field.
+    :param load_aliases: Additional dict keys that are accepted as inputs of
+        `load` in addition to ``data_key``. Aliases are only used for
+        deserialization; `dump` always uses the canonical ``data_key`` (or the
+        field name). An alias must not collide with another field's canonical
+        name or data_key.
     :param attribute: The name of the key/attribute in the internal representation, i.e.
         the output of `load` and the input of `dump`.
         If `None`, the key/attribute will match the name of the field.
@@ -161,6 +167,8 @@ class Field(typing.Generic[_InternalT]):
         Remove ``context`` property.
     .. versionchanged:: 4.3.0
         Add ``pre_load`` and ``post_load``.
+    .. versionchanged:: 4.5.0
+        Add ``load_aliases`` parameter for accepting additional load-only keys.
     """
 
     # Some fields, such as Method fields and Function fields, are not expected
@@ -183,6 +191,7 @@ class Field(typing.Generic[_InternalT]):
         load_default: typing.Any = missing_,
         dump_default: typing.Any = missing_,
         data_key: str | None = None,
+        load_aliases: types.StrSequenceOrSet | None = None,
         attribute: str | None = None,
         validate: types.Validator | typing.Iterable[types.Validator] | None = None,
         pre_load: (
@@ -203,6 +212,7 @@ class Field(typing.Generic[_InternalT]):
 
         self.attribute = attribute
         self.data_key = data_key
+        self.load_aliases: tuple[str, ...] = tuple(load_aliases or ())
         self.validate = validate
         self.validators = self._normalize_processors(validate, param="validate")
         self.pre_load = self._normalize_processors(pre_load, param="pre_load")

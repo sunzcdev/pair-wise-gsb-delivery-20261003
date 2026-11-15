@@ -10,6 +10,7 @@ from unittest.mock import patch
 import pytest
 
 from marshmallow import (
+    ACCEPT,
     EXCLUDE,
     INCLUDE,
     RAISE,
@@ -2397,3 +2398,156 @@ def test_deserialize_raises_exception_if_input_type_is_incorrect(data, unknown):
     exc = excinfo.value
     assert isinstance(exc.messages, dict)
     assert list(exc.messages.keys()) == ["_schema"]
+
+
+class TestLoadAliases:
+    def test_alias_is_accepted_on_load(self):
+        class MySchema(Schema):
+            name = fields.String(load_aliases=("Name", "username"))
+
+        schema = MySchema()
+        assert schema.load({"Name": "Grace"}) == {"name": "Grace"}
+        assert schema.load({"username": "Grace"}) == {"name": "Grace"}
+        assert schema.load({"name": "Grace"}) == {"name": "Grace"}
+
+    def test_alias_works_alongside_data_key(self):
+        class MySchema(Schema):
+            name = fields.String(data_key="Name", load_aliases=("username",))
+
+        assert MySchema().load({"username": "Grace"}) == {"name": "Grace"}
+        assert MySchema().load({"Name": "Grace"}) == {"name": "Grace"}
+
+    def test_aliases_are_not_used_on_dump(self):
+        class MySchema(Schema):
+            name = fields.String(load_aliases=("Name",))
+
+        assert MySchema().dump({"name": "Grace"}) == {"name": "Grace"}
+
+        class DataKeySchema(Schema):
+            name = fields.String(data_key="Name", load_aliases=("username",))
+
+        assert DataKeySchema().dump({"name": "Grace"}) == {"Name": "Grace"}
+
+    def test_alias_is_consumed_by_unknown_handling(self):
+        class MySchema(Schema):
+            name = fields.String(load_aliases=("Name",))
+
+        with pytest.raises(ValidationError) as excinfo:
+            MySchema(unknown=RAISE).load({"Name": "Grace", "extra": "x"})
+        assert "Name" not in excinfo.value.messages
+        assert excinfo.value.messages["extra"] == ["Unknown field."]
+
+        result = MySchema(unknown=EXCLUDE).load({"Name": "Grace", "extra": "x"})
+        assert result == {"name": "Grace"}
+
+        result = MySchema(unknown=INCLUDE).load({"Name": "Grace", "extra": "x"})
+        assert result == {"name": "Grace", "extra": "x"}
+
+    def test_required_and_partial_still_use_canonical_field_identity(self):
+        class MySchema(Schema):
+            name = fields.String(required=True, load_aliases=("Name",))
+
+        with pytest.raises(ValidationError) as excinfo:
+            MySchema().load({})
+        assert "name" in excinfo.value.messages
+
+        assert MySchema().load({"Name": "Grace"}) == {"name": "Grace"}
+        assert MySchema().load({}, partial=True) == {}
+        assert MySchema().load({}, partial=("name",)) == {}
+
+    def test_field_validation_error_reports_canonical_key(self):
+        class MySchema(Schema):
+            age = fields.Integer(load_aliases=("Years",))
+
+        with pytest.raises(ValidationError) as excinfo:
+            MySchema().load({"Years": "abc"})
+        assert "age" in excinfo.value.messages
+        assert "Years" not in excinfo.value.messages
+
+    def test_equal_values_raise_by_default_but_report_every_participating_key(self):
+        class MySchema(Schema):
+            name = fields.String(load_aliases=("Name", "username"))
+
+        with pytest.raises(ValidationError) as excinfo:
+            MySchema().load({"name": "Grace", "Name": "Grace"})
+        messages = excinfo.value.messages
+        assert set(messages) == {"name", "Name"}
+
+        with pytest.raises(ValidationError) as excinfo:
+            MySchema().load({"Name": "Grace", "username": "Grace"})
+        assert set(excinfo.value.messages) == {"Name", "username"}
+
+    def test_equal_values_accepted_with_accept_policy(self):
+        class MySchema(Schema):
+            name = fields.String(load_aliases=("Name", "username"))
+
+        result = MySchema(alias_duplicates=ACCEPT).load(
+            {"name": "Grace", "Name": "Grace"}
+        )
+        assert result == {"name": "Grace"}
+
+    def test_accept_policy_still_rejects_conflicting_values(self):
+        class MySchema(Schema):
+            name = fields.String(load_aliases=("Name", "username"))
+
+        with pytest.raises(ValidationError) as excinfo:
+            MySchema(alias_duplicates=ACCEPT).load(
+                {"Name": "Grace", "username": "Hopper"}
+            )
+        assert set(excinfo.value.messages) == {"Name", "username"}
+
+    def test_conflicting_values_always_raise(self):
+        class MySchema(Schema):
+            name = fields.String(load_aliases=("Name",))
+
+        with pytest.raises(ValidationError) as excinfo:
+            MySchema().load({"name": "Grace", "Name": "Hopper"})
+        assert set(excinfo.value.messages) == {"name", "Name"}
+
+    def test_meta_alias_duplicates_option(self):
+        class MySchema(Schema):
+            name = fields.String(load_aliases=("Name",))
+
+            class Meta:
+                alias_duplicates = ACCEPT
+
+        assert MySchema().load({"name": "Grace", "Name": "Grace"}) == {
+            "name": "Grace"
+        }
+
+    def test_alias_duplicates_argument_overrides_meta_option(self):
+        class MySchema(Schema):
+            name = fields.String(load_aliases=("Name",))
+
+            class Meta:
+                alias_duplicates = ACCEPT
+
+        with pytest.raises(ValidationError):
+            MySchema(alias_duplicates=RAISE).load(
+                {"name": "Grace", "Name": "Grace"}
+            )
+
+    def test_alias_works_in_nested_and_many_schemas(self):
+        class Child(Schema):
+            city = fields.String(load_aliases=("City",))
+
+        class Parent(Schema):
+            address = fields.Nested(Child, load_aliases=("addr",))
+
+        assert Parent().load({"addr": {"City": "Springfield"}}) == {
+            "address": {"city": "Springfield"}
+        }
+        assert Parent(many=True).load(
+            [{"addr": {"City": "a"}}, {"addr": {"City": "b"}}]
+        ) == [{"address": {"city": "a"}}, {"address": {"city": "b"}}]
+
+    def test_alias_conflict_in_many_reports_index(self):
+        class MySchema(Schema):
+            name = fields.String(load_aliases=("Name",))
+
+        with pytest.raises(ValidationError) as excinfo:
+            MySchema().load(
+                [{"name": "a", "Name": "a"}, {"name": "b"}], many=True
+            )
+        assert 0 in excinfo.value.messages
+        assert set(excinfo.value.messages[0]) == {"name", "Name"}
