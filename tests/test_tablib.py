@@ -14,6 +14,7 @@ from pathlib import Path
 from uuid import uuid4
 
 import xlrd
+import yaml
 from odf import opendocument, table
 from openpyxl.reader.excel import load_workbook
 
@@ -1847,6 +1848,138 @@ class YAMLTests(BaseTestCase):
         with yaml_source.open('rb') as fh:
             with self.assertRaises(UnsupportedFormat):
                 tablib.Dataset().load(fh, 'yaml')
+
+    def test_yaml_import_keeps_implicit_types_by_default(self):
+        """The default YAML parsing mode still applies PyYAML's implicit typing."""
+        source = '- {id: 001, joined: 2021-01-01, active: yes, count: 3}\n'
+        dset = tablib.Dataset().load(StringIO(source), 'yaml')
+        self.assertEqual(dset.headers, ['id', 'joined', 'active', 'count'])
+        self.assertEqual(dset[0], (1, dt.date(2021, 1, 1), True, 3))
+
+    def test_yaml_preserve_text_keeps_plain_scalars(self):
+        """Plain scalars are imported as text when preserving scalar text."""
+        source = '- {id: 001, joined: 2021-01-01, active: yes, count: 3}\n'
+        dset = tablib.Dataset().load(StringIO(source), 'yaml', preserve_text=True)
+        self.assertEqual(dset[0], ('001', '2021-01-01', 'yes', '3'))
+
+    def test_yaml_preserve_text_converts_explicit_types_only(self):
+        """Only scalars with an explicit YAML tag are converted."""
+        source = (
+            '- id: 001\n'
+            '  count: !!int 3\n'
+            '  ratio: !!float 1.50\n'
+            '  active: !!bool yes\n'
+            '  joined: !!timestamp 2021-01-01\n'
+            '  quoted: "yes"\n'
+        )
+        dset = tablib.Dataset().load(StringIO(source), 'yaml', preserve_text=True)
+        self.assertEqual(
+            dset.headers, ['id', 'count', 'ratio', 'active', 'joined', 'quoted']
+        )
+        self.assertEqual(
+            dset[0],
+            ('001', 3, 1.5, True, dt.date(2021, 1, 1), 'yes'),
+        )
+
+    def test_yaml_preserve_text_keeps_key_order_and_explicit_null(self):
+        """Column order follows the document and explicit nulls stay ``None``."""
+        source = '- {zebra: 1, empty: null, tilde: ~, word: "null", apple: 2}\n'
+        dset = tablib.Dataset().load(StringIO(source), 'yaml', preserve_text=True)
+        self.assertEqual(dset.headers, ['zebra', 'empty', 'tilde', 'word', 'apple'])
+        self.assertEqual(dset[0], ('1', None, None, 'null', '2'))
+
+    def test_yaml_preserve_text_rejects_unsafe_tags(self):
+        """Object-constructing tags are refused in both parsing modes."""
+        source = '- !!python/object/apply:os.system ["echo pwned"]\n'
+        for kwargs in ({}, {'preserve_text': True}):
+            with self.subTest(**kwargs):
+                with self.assertRaises(yaml.constructor.ConstructorError):
+                    tablib.Dataset().load(StringIO(source), 'yaml', **kwargs)
+
+    def test_yaml_preserve_text_rejects_unknown_tags(self):
+        """Unknown local tags are rejected as well."""
+        with self.assertRaises(yaml.constructor.ConstructorError):
+            tablib.Dataset().load(StringIO('- !custom 1\n'), 'yaml', preserve_text=True)
+
+    def test_yaml_import_copies_anchored_values(self):
+        """Aliased mutable cell values are independent in the imported Dataset."""
+        source = (
+            '- {id: a, tags: &tags [x, y], meta: &meta {source: feed}}\n'
+            '- {id: b, tags: *tags, meta: *meta}\n'
+        )
+        dset = tablib.Dataset().load(StringIO(source), 'yaml', preserve_text=True)
+
+        self.assertEqual(dset[0], ('a', ['x', 'y'], {'source': 'feed'}))
+        self.assertEqual(dset[1], ('b', ['x', 'y'], {'source': 'feed'}))
+        self.assertIsNot(dset[0][1], dset[1][1])
+        self.assertIsNot(dset[0][2], dset[1][2])
+
+        # Mutating the cell of one row must not change the other row.
+        dset[0][1].append('z')
+        dset[0][2]['source'] = 'changed'
+        self.assertEqual(dset[1][1], ['x', 'y'])
+        self.assertEqual(dset[1][2], {'source': 'feed'})
+
+    def test_yaml_import_copies_aliased_rows(self):
+        """A whole row referenced through an anchor is copied per row."""
+        source = '- &row {id: a, tags: [x]}\n- *row\n'
+        dset = tablib.Dataset().load(StringIO(source), 'yaml', preserve_text=True)
+        self.assertIsNot(dset[0][1], dset[1][1])
+        dset[0][1].append('y')
+        self.assertEqual(dset[1][1], ['x'])
+
+    def test_yaml_import_checks_top_level_structure(self):
+        """A non-list document is rejected instead of being read as a row."""
+        with self.assertRaises(UnsupportedFormat):
+            tablib.Dataset().load(StringIO('id: 001\n'), 'yaml', preserve_text=True)
+        with self.assertRaises(UnsupportedFormat):
+            tablib.Dataset().load(StringIO('just some text\n'), 'yaml')
+
+    def test_yaml_import_checks_row_structure(self):
+        """Ragged sequences and mappings with mismatched keys are rejected."""
+        ragged = '- [1, 2]\n- [3]\n'
+        with self.assertRaises(tablib.InvalidDimensions):
+            tablib.Dataset().load(StringIO(ragged), 'yaml', preserve_text=True)
+
+        mismatched_keys = '- {a: 1}\n- {a: 1, b: 2}\n'
+        with self.assertRaises(tablib.InvalidDimensions):
+            tablib.Dataset().load(StringIO(mismatched_keys), 'yaml', preserve_text=True)
+
+        non_mapping_row = '- {a: 1}\n- 2\n'
+        with self.assertRaises(UnsupportedFormat):
+            tablib.Dataset().load(StringIO(non_mapping_row), 'yaml', preserve_text=True)
+
+    def test_yaml_invalid_import_leaves_dataset_untouched(self):
+        """Structure is checked before the Dataset is wiped or filled."""
+        dset = tablib.Dataset(headers=['keep'])
+        dset.append(['me'])
+        with self.assertRaises(tablib.InvalidDimensions):
+            dset.load(StringIO('- [1, 2]\n- [3]\n'), 'yaml')
+        self.assertEqual(dset.headers, ['keep'])
+        self.assertEqual(dset[0], ('me',))
+
+    def test_yaml_book_import_preserve_text(self):
+        """Book import accepts the same text-preserving mode."""
+        source = (
+            '- title: People\n'
+            '  data:\n'
+            '  - {id: 001, name: yes}\n'
+            '  - {id: 002, name: no}\n'
+        )
+        dbook = tablib.Databook().load(StringIO(source), 'yaml', preserve_text=True)
+        sheet = dbook.sheets()[0]
+        self.assertEqual(sheet.title, 'People')
+        self.assertEqual(sheet[0], ('001', 'yes'))
+        self.assertEqual(sheet[1], ('002', 'no'))
+
+    def test_yaml_book_import_checks_structure(self):
+        """Malformed sheets are rejected before any sheet is added."""
+        dbook = tablib.Databook()
+        with self.assertRaises(UnsupportedFormat):
+            dbook.load(StringIO('- {title: People}\n'), 'yaml')
+        with self.assertRaises(tablib.InvalidDimensions):
+            dbook.load(StringIO('- {title: People, data: [{a: 1}, {b: 2}]}\n'), 'yaml')
+        self.assertEqual(dbook.size, 0)
 
 
 class LatexTests(BaseTestCase):

@@ -303,6 +303,40 @@ returned instead.
 
 Import assumes (for now) that headers exist.
 
+By default, imported scalar values are converted the way YAML implicitly types
+them: ``001`` becomes the integer ``1``, ``2021-01-01`` becomes a
+:class:`datetime.date` and ``yes`` becomes ``True``. That is convenient for
+typed data but rewrites values that are identifiers in the source, so an
+import can request that the scalar text be preserved::
+
+    data = tablib.Dataset()
+    data.load(stream, 'yaml', preserve_text=True)
+
+With ``preserve_text=True``, plain scalars are imported exactly as they were
+written. Only scalars whose type is explicitly declared in the document are
+converted, using YAML tags::
+
+    - {id: 001, joined: 2021-01-01, active: yes, count: !!int 3}
+
+For that document, ``preserve_text=True`` imports ``id``, ``joined`` and
+``active`` as text while ``count`` becomes the integer ``3``. With the default
+mode the same document yields ``1``, a :class:`datetime.date`, ``True`` and
+``3``. Quoted scalars are always text, and the null markers (an empty value,
+``~`` and ``null``) are still imported as ``None``. Both modes use a safe
+loader: tags that construct arbitrary Python objects (``!!python/object``,
+unknown local tags) are rejected with a ``yaml.constructor.ConstructorError``.
+
+The document structure is checked before the Dataset is modified, so an invalid
+document does not leave a partially filled Dataset behind. The top level must
+be a sequence of rows; mapping rows must all provide the same keys as the first
+row, and sequence rows must all have the same length. Column order is the key
+order of the document, and explicit nulls are kept as ``None``.
+
+Anchors and aliases resolve to the same object in YAML. Since a Dataset cell
+must not share mutable state with another cell, mutable values (lists, dicts,
+sets) coming from an alias are copied on import: changing one cell never
+changes another row.
+
 This format is optional, install Tablib with ``pip install "tablib[yaml]"`` to
 make the format available.
 
