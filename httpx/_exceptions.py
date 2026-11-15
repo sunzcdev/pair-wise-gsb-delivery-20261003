@@ -9,6 +9,7 @@ Our exception hierarchy:
         · ReadTimeout
         · WriteTimeout
         · PoolTimeout
+        · TotalTimeout
       - NetworkError
         · ConnectError
         · ReadError
@@ -63,6 +64,7 @@ __all__ = [
     "StreamConsumed",
     "StreamError",
     "TimeoutException",
+    "TotalTimeout",
     "TooManyRedirects",
     "TransportError",
     "UnsupportedProtocol",
@@ -159,6 +161,32 @@ class PoolTimeout(TimeoutException):
     """
     Timed out waiting to acquire a connection from the pool.
     """
+
+
+class TotalTimeout(TimeoutException):
+    """
+    Timed out because the overall request deadline was reached.
+
+    Unlike the per-stage timeouts, the overall deadline spans the whole
+    request lifecycle -- from the first send until the response body has
+    been fully read -- and is not reset by redirects or authentication
+    challenges. It is raised even though no single connect/read/write
+    operation individually exceeded its own stage timeout.
+
+    ``request`` is the original request that started the exchange, while
+    ``last_request`` is the request actually in flight when the deadline
+    expired (they differ across redirect/auth chains).
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        request: Request | None = None,
+        last_request: Request | None = None,
+    ) -> None:
+        super().__init__(message, request=request)
+        self.last_request: Request | None = last_request
 
 
 # Core networking exceptions...
@@ -372,6 +400,9 @@ def request_context(
     try:
         yield
     except RequestError as exc:
-        if request is not None:
+        # A `TotalTimeout` already carries the *original* request of the
+        # exchange. Don't replace it with the per-hop request that happens to
+        # be active when the overall deadline expires.
+        if request is not None and exc._request is None:
             exc.request = request
         raise exc

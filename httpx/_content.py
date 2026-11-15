@@ -71,18 +71,53 @@ class AsyncIteratorByteStream(AsyncByteStream):
         self._stream = stream
         self._is_stream_consumed = False
         self._is_generator = inspect.isasyncgen(stream)
+        self._iterator: _AsyncIteratorByteStreamIterator | None = None
 
-    async def __aiter__(self) -> AsyncIterator[bytes]:
+    def __aiter__(self) -> AsyncIterator[bytes]:
         if self._is_stream_consumed and self._is_generator:
             raise StreamConsumed()
 
         self._is_stream_consumed = True
+        self._iterator = _AsyncIteratorByteStreamIterator(self._stream, self.CHUNK_SIZE)
+        return self._iterator
+
+    async def aclose(self) -> None:
+        # Finalize the active iterator (and any underlying async generator)
+        # when the response is closed before its body has been fully consumed.
+        if self._iterator is not None:
+            await self._iterator.aclose()
+        aclose = getattr(self._stream, "aclose", None)
+        if aclose is not None:
+            await aclose()
+
+
+class _AsyncIteratorByteStreamIterator:
+    def __init__(self, stream: AsyncIterable[bytes], chunk_size: int) -> None:
+        self._stream = stream
+        self._chunk_size = chunk_size
+        self._generator = self._iterate()
+
+    def __aiter__(self) -> AsyncIterator[bytes]:
+        return self
+
+    async def __anext__(self) -> bytes:
+        return await self._generator.__anext__()
+
+    async def aclose(self) -> None:
+        await self._generator.aclose()
+        aclose = getattr(self._stream, "aclose", None)
+        if aclose is not None:
+            await aclose()
+
+    async def _iterate(self) -> AsyncIterator[bytes]:
+        # `self._generator` is the tracked instance of this async generator
+        # that `aclose()` finalizes on early termination.
         if hasattr(self._stream, "aread"):
             # File-like interfaces should use 'aread' directly.
-            chunk = await self._stream.aread(self.CHUNK_SIZE)
+            chunk = await self._stream.aread(self._chunk_size)
             while chunk:
                 yield chunk
-                chunk = await self._stream.aread(self.CHUNK_SIZE)
+                chunk = await self._stream.aread(self._chunk_size)
         else:
             # Otherwise iterate.
             async for part in self._stream:

@@ -15,14 +15,18 @@ from ._config import (
     DEFAULT_LIMITS,
     DEFAULT_MAX_REDIRECTS,
     DEFAULT_TIMEOUT_CONFIG,
+    Clock,
+    Deadline,
     Limits,
     Proxy,
+    SystemClock,
     Timeout,
 )
 from ._decoders import SUPPORTED_DECODERS
 from ._exceptions import (
     InvalidURL,
     RemoteProtocolError,
+    TotalTimeout,
     TooManyRedirects,
     request_context,
 )
@@ -140,20 +144,51 @@ class BoundSyncStream(SyncByteStream):
     """
     A byte stream that is bound to a given response instance, and that
     ensures the `response.elapsed` is set once the response is closed.
+
+    When an overall :class:`Deadline` is in force it is also checked before
+    each chunk is yielded. If the deadline has been reached mid-body the
+    current response is closed and a `TotalTimeout` is raised.
     """
 
     def __init__(
-        self, stream: SyncByteStream, response: Response, start: float
+        self,
+        stream: SyncByteStream,
+        response: Response,
+        start: float,
+        deadline: Deadline | None = None,
     ) -> None:
         self._stream = stream
         self._response = response
         self._start = start
+        self._deadline = deadline
+        self._closed = False
 
     def __iter__(self) -> typing.Iterator[bytes]:
-        for chunk in self._stream:
-            yield chunk
+        try:
+            if self._deadline is not None and self._deadline.has_expired():
+                self._raise_total_timeout()
+            for chunk in self._stream:
+                if self._deadline is not None and self._deadline.has_expired():
+                    self._raise_total_timeout()
+                yield chunk
+        except BaseException:
+            # Ensure the current response is released when the deadline (or
+            # any other error) interrupts an in-progress body read.
+            self.close()
+            raise
+
+    def _raise_total_timeout(self) -> None:
+        raise TotalTimeout(
+            "The overall request deadline was exceeded while "
+            "reading the response body.",
+            request=self._deadline.origin,
+            last_request=self._response.request,
+        )
 
     def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
         elapsed = time.perf_counter() - self._start
         self._response.elapsed = datetime.timedelta(seconds=elapsed)
         self._stream.close()
@@ -163,20 +198,51 @@ class BoundAsyncStream(AsyncByteStream):
     """
     An async byte stream that is bound to a given response instance, and that
     ensures the `response.elapsed` is set once the response is closed.
+
+    When an overall :class:`Deadline` is in force it is also checked before
+    each chunk is yielded. If the deadline has been reached mid-body the
+    current response is closed and a `TotalTimeout` is raised.
     """
 
     def __init__(
-        self, stream: AsyncByteStream, response: Response, start: float
+        self,
+        stream: AsyncByteStream,
+        response: Response,
+        start: float,
+        deadline: Deadline | None = None,
     ) -> None:
         self._stream = stream
         self._response = response
         self._start = start
+        self._deadline = deadline
+        self._closed = False
 
     async def __aiter__(self) -> typing.AsyncIterator[bytes]:
-        async for chunk in self._stream:
-            yield chunk
+        try:
+            if self._deadline is not None and self._deadline.has_expired():
+                await self._raise_total_timeout()
+            async for chunk in self._stream:
+                if self._deadline is not None and self._deadline.has_expired():
+                    await self._raise_total_timeout()
+                yield chunk
+        except BaseException:
+            # Ensure the current response is released when the deadline (or
+            # any other error) interrupts an in-progress body read.
+            await self.aclose()
+            raise
+
+    async def _raise_total_timeout(self) -> None:
+        raise TotalTimeout(
+            "The overall request deadline was exceeded while "
+            "reading the response body.",
+            request=self._deadline.origin,
+            last_request=self._response.request,
+        )
 
     async def aclose(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
         elapsed = time.perf_counter() - self._start
         self._response.elapsed = datetime.timedelta(seconds=elapsed)
         await self._stream.aclose()
@@ -200,6 +266,7 @@ class BaseClient:
         base_url: URL | str = "",
         trust_env: bool = True,
         default_encoding: str | typing.Callable[[bytes], str] = "utf-8",
+        clock: Clock | None = None,
     ) -> None:
         event_hooks = {} if event_hooks is None else event_hooks
 
@@ -218,6 +285,7 @@ class BaseClient:
         }
         self._trust_env = trust_env
         self._default_encoding = default_encoding
+        self._clock = SystemClock() if clock is None else clock
         self._state = ClientState.UNOPENED
 
     @property
@@ -590,6 +658,70 @@ class BaseClient:
             )
             request.extensions = dict(**request.extensions, timeout=timeout.as_dict())
 
+    def _init_deadline(self, request: Request) -> Deadline:
+        """
+        Create the overall deadline for a request exchange, based on the
+        `total` component of its timeout configuration.
+
+        The deadline is stored on the request extensions so that every
+        redirect / authentication challenge request inherits the *same*
+        absolute deadline, rather than being granted a fresh budget.
+        """
+        total = request.extensions["timeout"].get("total")
+        deadline = Deadline(total, clock=self._clock, origin=request)
+        request.extensions = dict(request.extensions, deadline=deadline)
+        return deadline
+
+    def _get_deadline(self, request: Request) -> Deadline | None:
+        deadline = request.extensions.get("deadline")
+        if deadline is None:
+            return None
+        assert isinstance(deadline, Deadline)
+        return deadline
+
+    def _apply_deadline(self, request: Request, deadline: Deadline) -> None:
+        """
+        Apply the remaining overall budget to a single request hop.
+
+        Each per-stage timeout is capped at the time still available, so that
+        the stage timeouts and the overall deadline are both enforced and
+        whichever fires first wins. The `total` key is dropped here because
+        it is a client-level concern and must not be passed to transports.
+        """
+        if deadline.has_expired():
+            raise TotalTimeout(
+                "The overall request deadline was exceeded before the "
+                "next request could be sent.",
+                request=deadline.origin,
+                last_request=request,
+            )
+
+        timeouts = {
+            key: deadline.cap(value)
+            for key, value in request.extensions["timeout"].items()
+            if key != "total"
+        }
+        request.extensions = dict(request.extensions, timeout=timeouts)
+
+    def _check_response_deadline(
+        self, response: Response, deadline: Deadline
+    ) -> None:
+        """
+        Enforce the overall deadline once the response body has been read.
+
+        Some transports may have buffered the entire body before returning,
+        in which case the stream wrapper never gets a chance to observe the
+        deadline. Checking again here guarantees the deadline still applies
+        up to the point the body has been fully consumed.
+        """
+        if deadline.has_expired():
+            raise TotalTimeout(
+                "The overall request deadline was exceeded before the "
+                "response body was fully read.",
+                request=deadline.origin,
+                last_request=response.request,
+            )
+
 
 class Client(BaseClient):
     """
@@ -658,6 +790,7 @@ class Client(BaseClient):
         base_url: URL | str = "",
         transport: BaseTransport | None = None,
         default_encoding: str | typing.Callable[[bytes], str] = "utf-8",
+        clock: Clock | None = None,
     ) -> None:
         super().__init__(
             auth=auth,
@@ -671,6 +804,7 @@ class Client(BaseClient):
             base_url=base_url,
             trust_env=trust_env,
             default_encoding=default_encoding,
+            clock=clock,
         )
 
         if http2:
@@ -908,6 +1042,7 @@ class Client(BaseClient):
         )
 
         self._set_timeout(request)
+        deadline = self._init_deadline(request)
 
         auth = self._build_request_auth(request, auth)
 
@@ -916,10 +1051,12 @@ class Client(BaseClient):
             auth=auth,
             follow_redirects=follow_redirects,
             history=[],
+            deadline=deadline,
         )
         try:
             if not stream:
                 response.read()
+                self._check_response_deadline(response, deadline)
 
             return response
 
@@ -933,6 +1070,7 @@ class Client(BaseClient):
         auth: Auth,
         follow_redirects: bool,
         history: list[Response],
+        deadline: Deadline,
     ) -> Response:
         auth_flow = auth.sync_auth_flow(request)
         try:
@@ -943,6 +1081,7 @@ class Client(BaseClient):
                     request,
                     follow_redirects=follow_redirects,
                     history=history,
+                    deadline=deadline,
                 )
                 try:
                     try:
@@ -952,6 +1091,11 @@ class Client(BaseClient):
 
                     response.history = list(history)
                     response.read()
+                    # Authentication challenges issue further requests; they
+                    # must share the original overall deadline.
+                    next_request.extensions = dict(
+                        next_request.extensions, deadline=deadline
+                    )
                     request = next_request
                     history.append(response)
 
@@ -966,6 +1110,7 @@ class Client(BaseClient):
         request: Request,
         follow_redirects: bool,
         history: list[Response],
+        deadline: Deadline,
     ) -> Response:
         while True:
             if len(history) > self.max_redirects:
@@ -976,6 +1121,9 @@ class Client(BaseClient):
             for hook in self._event_hooks["request"]:
                 hook(request)
 
+            # Hand the remaining overall budget to this hop. Raises
+            # `TotalTimeout` if the deadline is already exhausted.
+            self._apply_deadline(request, deadline)
             response = self._send_single_request(request)
             try:
                 for hook in self._event_hooks["response"]:
@@ -986,6 +1134,9 @@ class Client(BaseClient):
                     return response
 
                 request = self._build_redirect_request(request, response)
+                # Redirects must not reset the overall deadline: reuse the
+                # same absolute deadline for the next hop.
+                request.extensions = dict(request.extensions, deadline=deadline)
                 history = history + [response]
 
                 if follow_redirects:
@@ -1004,6 +1155,7 @@ class Client(BaseClient):
         """
         transport = self._transport_for_url(request.url)
         start = time.perf_counter()
+        deadline = self._get_deadline(request)
 
         if not isinstance(request.stream, SyncByteStream):
             raise RuntimeError(
@@ -1017,7 +1169,10 @@ class Client(BaseClient):
 
         response.request = request
         response.stream = BoundSyncStream(
-            response.stream, response=response, start=start
+            response.stream,
+            response=response,
+            start=start,
+            deadline=deadline,
         )
         self.cookies.extract_cookies(response)
         response.default_encoding = self._default_encoding
@@ -1372,6 +1527,7 @@ class AsyncClient(BaseClient):
         transport: AsyncBaseTransport | None = None,
         trust_env: bool = True,
         default_encoding: str | typing.Callable[[bytes], str] = "utf-8",
+        clock: Clock | None = None,
     ) -> None:
         super().__init__(
             auth=auth,
@@ -1385,6 +1541,7 @@ class AsyncClient(BaseClient):
             base_url=base_url,
             trust_env=trust_env,
             default_encoding=default_encoding,
+            clock=clock,
         )
 
         if http2:
@@ -1623,6 +1780,7 @@ class AsyncClient(BaseClient):
         )
 
         self._set_timeout(request)
+        deadline = self._init_deadline(request)
 
         auth = self._build_request_auth(request, auth)
 
@@ -1631,10 +1789,12 @@ class AsyncClient(BaseClient):
             auth=auth,
             follow_redirects=follow_redirects,
             history=[],
+            deadline=deadline,
         )
         try:
             if not stream:
                 await response.aread()
+                self._check_response_deadline(response, deadline)
 
             return response
 
@@ -1648,6 +1808,7 @@ class AsyncClient(BaseClient):
         auth: Auth,
         follow_redirects: bool,
         history: list[Response],
+        deadline: Deadline,
     ) -> Response:
         auth_flow = auth.async_auth_flow(request)
         try:
@@ -1658,6 +1819,7 @@ class AsyncClient(BaseClient):
                     request,
                     follow_redirects=follow_redirects,
                     history=history,
+                    deadline=deadline,
                 )
                 try:
                     try:
@@ -1667,6 +1829,11 @@ class AsyncClient(BaseClient):
 
                     response.history = list(history)
                     await response.aread()
+                    # Authentication challenges issue further requests; they
+                    # must share the original overall deadline.
+                    next_request.extensions = dict(
+                        next_request.extensions, deadline=deadline
+                    )
                     request = next_request
                     history.append(response)
 
@@ -1681,6 +1848,7 @@ class AsyncClient(BaseClient):
         request: Request,
         follow_redirects: bool,
         history: list[Response],
+        deadline: Deadline,
     ) -> Response:
         while True:
             if len(history) > self.max_redirects:
@@ -1691,6 +1859,9 @@ class AsyncClient(BaseClient):
             for hook in self._event_hooks["request"]:
                 await hook(request)
 
+            # Hand the remaining overall budget to this hop. Raises
+            # `TotalTimeout` if the deadline is already exhausted.
+            self._apply_deadline(request, deadline)
             response = await self._send_single_request(request)
             try:
                 for hook in self._event_hooks["response"]:
@@ -1702,6 +1873,9 @@ class AsyncClient(BaseClient):
                     return response
 
                 request = self._build_redirect_request(request, response)
+                # Redirects must not reset the overall deadline: reuse the
+                # same absolute deadline for the next hop.
+                request.extensions = dict(request.extensions, deadline=deadline)
                 history = history + [response]
 
                 if follow_redirects:
@@ -1720,6 +1894,7 @@ class AsyncClient(BaseClient):
         """
         transport = self._transport_for_url(request.url)
         start = time.perf_counter()
+        deadline = self._get_deadline(request)
 
         if not isinstance(request.stream, AsyncByteStream):
             raise RuntimeError(
@@ -1732,7 +1907,10 @@ class AsyncClient(BaseClient):
         assert isinstance(response.stream, AsyncByteStream)
         response.request = request
         response.stream = BoundAsyncStream(
-            response.stream, response=response, start=start
+            response.stream,
+            response=response,
+            start=start,
+            deadline=deadline,
         )
         self.cookies.extract_cookies(response)
         response.default_encoding = self._default_encoding

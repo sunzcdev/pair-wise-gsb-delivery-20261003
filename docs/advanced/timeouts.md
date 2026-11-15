@@ -69,3 +69,39 @@ client = httpx.Client(timeout=timeout)
 
 response = client.get('http://example.com/')
 ```
+
+## Setting an overall deadline
+
+The `connect`, `read`, `write` and `pool` timeouts each constrain a single
+operation. They are measured independently on every request, so the wait is
+renewed for each hop when following redirects or answering authentication
+challenges.
+
+In addition to those per-stage timeouts you can set an overall `total`
+deadline. It starts ticking when the first request is sent and keeps running
+until the response body has been fully read. The same absolute deadline is
+shared by every request in the exchange, so a redirect or an authentication
+challenge never resets the remaining budget.
+
+```python
+# 5 seconds for each individual stage, but 10 seconds for the whole exchange.
+timeout = httpx.Timeout(5.0, total=10.0)
+client = httpx.Client(timeout=timeout)
+```
+
+When both are configured the remaining overall budget is used to cap each
+per-stage timeout, so whichever limit is reached first fires. If the overall
+deadline expires the current response is closed and an `httpx.TotalTimeout`
+exception is raised. The exception exposes both the original request
+(`exc.request`) and the request that was actually in flight when the deadline
+was reached (`exc.last_request`); the two differ across redirect/auth chains.
+
+Because the deadline is an absolute point in time it still applies when no
+single operation is slow: a chain of quick redirects can individually stay
+within every stage timeout while the cumulative exchange outlives the total
+deadline.
+
+The deadline is enforced at the client level. A custom clock can be supplied
+to the client through the `clock` argument (any object exposing a `now()`
+method returning monotonic seconds) to make deadline behaviour deterministic
+in tests.

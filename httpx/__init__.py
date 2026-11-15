@@ -90,6 +90,7 @@ __all__ = [
     "Timeout",
     "TimeoutException",
     "TooManyRedirects",
+    "TotalTimeout",
     "TransportError",
     "UnsupportedProtocol",
     "URL",
