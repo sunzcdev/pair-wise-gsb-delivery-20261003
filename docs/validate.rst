@@ -209,6 +209,78 @@ Or if you want to avoid GPL dependencies, a second extra is available:
 
     $ pip install jsonschema[format-nongpl]
 
+
+.. _validating-content:
+
+Validating String Content
+-------------------------
+
+JSON Schema defines the :kw:`contentEncoding`, :kw:`contentMediaType` and
+:kw:`contentSchema` keywords for describing the contents of a ``string``
+instance.
+Like :kw:`format`, these keywords are purely *annotational* by default:
+ordinary validation never decodes a string field on their behalf.
+
+Content validation can be enabled explicitly by extending a validator with
+`jsonschema.content.enable_content_validation`.
+The first supported combination is base64-encoded JSON, optionally checked
+against a :kw:`contentSchema`:
+
+.. doctest::
+
+    >>> import base64
+    >>> from jsonschema.content import enable_content_validation
+    >>> ValidatingValidator = enable_content_validation(Draft202012Validator)
+    >>> schema = {
+    ...     "contentEncoding": "base64",
+    ...     "contentMediaType": "application/json",
+    ...     "contentSchema": {
+    ...         "type": "object",
+    ...         "required": ["foo"],
+    ...     },
+    ... }
+    >>> payload = base64.b64encode(b'{"foo": "bar"}').decode("ascii")
+    >>> ValidatingValidator(schema).validate(payload)
+
+Validation always proceeds from the outside in.
+The outer instance type and the declared :kw:`contentEncoding` are checked
+first, and only successfully decoded content is parsed as the declared
+:kw:`contentMediaType` and then checked against :kw:`contentSchema`.
+
+Errors therefore keep the location of the string field in the original
+document on their :attr:`~jsonschema.exceptions.ValidationError.path`, while
+the location of a failure *within* the decoded content is reported separately
+on :attr:`~jsonschema.exceptions.ContentValidationError.inner_path`, so the
+two are never confused.
+
+Declared encodings or media types which are not supported are reported via
+`jsonschema.exceptions.ContentEncodingError` or
+`jsonschema.exceptions.ContentMediaTypeError`; this behavior can instead be
+configured to silently skip the affected field using
+`UnsupportedContentPolicy`.
+The maximum number of decoded bytes allowed for any single field is
+controlled independently per field by the ``byte_budget`` argument of
+`jsonschema.content.ContentValidator`.
+
+.. autoclass:: jsonschema.content.ContentValidator
+    :noindex:
+    :members:
+
+.. autofunction:: jsonschema.content.enable_content_validation
+    :noindex:
+
+.. autoexception:: jsonschema.exceptions.ContentValidationError
+    :noindex:
+
+.. autoexception:: jsonschema.exceptions.ContentEncodingError
+    :noindex:
+
+.. autoexception:: jsonschema.exceptions.ContentMediaTypeError
+    :noindex:
+
+.. autoexception:: jsonschema.exceptions.ContentSchemaValidationError
+    :noindex:
+
 .. warning::
 
     It is your own responsibility ultimately to ensure you are license-compliant, so you should be double checking your own dependencies if you rely on this extra.

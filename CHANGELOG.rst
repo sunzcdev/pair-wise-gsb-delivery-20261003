@@ -1,6 +1,10 @@
 v4.27.0
 =======
 
+* Add explicitly opt-in validation of the :kw:`contentEncoding`, :kw:`contentMediaType` and :kw:`contentSchema` keywords via the new `jsonschema.content` module.
+  By default these keywords remain purely annotational, but `jsonschema.content.enable_content_validation` returns a validator class which actually decodes and checks string content.
+  The first supported combination is base64-encoded JSON validated against a :kw:`contentSchema`.
+  Content errors keep the outer field location on their ``path`` and report any location within the decoded content separately on ``inner_path``; unsupported encodings or media types are reported according to a configurable policy, and decoded sizes are bounded by an independent per-field byte budget.
 * Support for Python 3.10 and 3.11 has been dropped.
 * Improve ``best_match`` for ``anyOf`` / ``oneOf`` errors: the most relevant error is now found within each subschema separately before the deepest of those is picked (#1257, #1300).
   In particular an applicator with a single subschema now produces the same best match as the bare subschema would.

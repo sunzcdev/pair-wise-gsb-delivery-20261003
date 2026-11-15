@@ -333,6 +333,92 @@ class FormatError(Exception):
         return self.message
 
 
+class ContentValidationError(ValidationError):
+    """
+    An error raised while validating the content of a string instance.
+
+    These errors are only produced when content validation has explicitly
+    been enabled (see `jsonschema.content.enable_content_validation`).
+
+    The :attr:`~ValidationError.path` of such an error always points at the
+    string field in the original (outer) document. When the error originates
+    from within the decoded content, :attr:`inner_path` carries the path of
+    the offending value *inside* the decoded instance, and must not be
+    confused with the location in the original document.
+
+    Attributes:
+
+        inner_path:
+            the path within the decoded content at which the error
+            originated; empty for errors which concern the encoding or
+            media type themselves rather than the decoded content
+
+        inner_error:
+            the original `ValidationError` produced while validating the
+            decoded content, if any. Its path is an *inner* path and is
+            reproduced here as :attr:`inner_path`
+
+    """
+
+    #: the stage of content validation the error was raised at
+    stage: ClassVar[str]
+
+    def __init__(
+        self,
+        message: str,
+        inner_path: Iterable[str | int] = (),
+        inner_error: ValidationError | None = None,
+        **kwargs: Any,
+    ) -> None:
+        super().__init__(message, **kwargs)
+        self.inner_path = deque(inner_path)
+        self.inner_error = inner_error
+
+    def __str__(self) -> str:
+        rendered = super().__str__()
+        if self.inner_path:
+            location = "/".join(str(each) for each in self.inner_path)
+            rendered = (
+                f"{rendered}\n\nWithin the decoded content at: /{location}"
+            )
+        return rendered
+
+
+class ContentEncodingError(ContentValidationError):
+    """
+    A string failed its declared :kw:`contentEncoding`.
+
+    Either it was not valid for the declared encoding, or the declared
+    encoding is not supported.
+    """
+
+    stage = "encoding"
+
+
+class ContentMediaTypeError(ContentValidationError):
+    """
+    Decoded content failed its declared :kw:`contentMediaType`.
+
+    Either the content did not parse as the declared media type, or the
+    declared media type is not supported.
+    """
+
+    stage = "media_type"
+
+
+class ContentSchemaValidationError(ContentValidationError):
+    """
+    Decoded content failed validation against :kw:`contentSchema`.
+
+    The wrapped :attr:`~ContentValidationError.inner_error` is the error
+    produced against the decoded instance, and
+    :attr:`~ContentValidationError.inner_path` is its location within that
+    decoded content.
+    """
+
+    stage = "content_schema"
+
+
 class ErrorTree:
     """
     ErrorTrees make it easier to check which validations failed.

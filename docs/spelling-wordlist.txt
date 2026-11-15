@@ -51,6 +51,15 @@ validator
 validators
 versioned
 schemas
+annotational
+base64
+byte
+contentEncoding
+contentMediaType
+contentSchema
+decoded
+media
+payload
 
 Zac
 HD

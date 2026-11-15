@@ -8,6 +8,7 @@ Submodules
    :titlesonly:
 
    /api/jsonschema/validators/index
+   /api/jsonschema/content/index
    /api/jsonschema/exceptions/index
    /api/jsonschema/protocols/index
 

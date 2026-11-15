@@ -82,6 +82,15 @@ class Validator(Protocol):
             its `extra (optional) dependencies <index:extras>` when
             invoking ``pip``.
 
+        content_validator:
+
+            if provided, a `jsonschema.content.ContentValidator` which will
+            be used to validate :kw:`contentEncoding`,
+            :kw:`contentMediaType` and :kw:`contentSchema`. These keywords
+            remain purely annotational unless content validation has been
+            enabled (via
+            `jsonschema.content.enable_content_validation`).
+
     .. deprecated:: v4.12.0
 
         Subclassing validator classes now explicitly warns this is not part of
@@ -119,6 +128,7 @@ class Validator(Protocol):
         format_checker: jsonschema.FormatChecker | None = None,
         *,
         registry: referencing.jsonschema.SchemaRegistry = ...,
+        content_validator: jsonschema.content.ContentValidator | None = None,
     ) -> None: ...
 
     @classmethod
@@ -211,6 +221,22 @@ class Validator(Protocol):
             ...
         ValidationError: [2, 3, 4] is too long
 
+        """
+
+    def descend(
+        self,
+        instance: Any,
+        schema: Any,
+        path: Any = None,
+        schema_path: Any = None,
+        resolver: Any = None,
+    ) -> Iterable[ValidationError]:
+        """
+        Validate ``instance`` against the given subschema.
+
+        Any errors produced are returned with their paths adjusted so that
+        they remain relative to the instance being validated by the
+        validator the method is called on.
         """
 
     def evolve(self, **kwargs) -> Self:

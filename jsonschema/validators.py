@@ -23,6 +23,7 @@ import referencing.exceptions
 import referencing.jsonschema
 
 from jsonschema import (
+    _content,
     _format,
     _keywords,
     _legacy_keywords,
@@ -229,14 +230,31 @@ def create(
         META_SCHEMA = dict(meta_schema)  # noqa: RUF012
         TYPE_CHECKER = type_checker
         FORMAT_CHECKER = format_checker_arg
+        # Opt-in content validation strategy. ``None`` means the content
+        # keywords remain purely annotational; see `jsonschema.content`.
+        CONTENT_VALIDATOR = None
         ID_OF = staticmethod(id_of)
 
         _APPLICABLE_VALIDATORS = applicable_validators
         _validators = field(init=False, repr=False, eq=False)
+        _content_cache: dict[
+            tuple[int, int],
+            list[exceptions.ValidationError],
+        ] = field(
+            init=False,
+            repr=False,
+            eq=False,
+            factory=dict,
+        )
 
         schema: referencing.jsonschema.Schema = field(repr=reprlib.repr)
         _ref_resolver = field(default=None, repr=False, alias="resolver")
         format_checker: _format.FormatChecker | None = field(default=None)
+        content_validator: _content.ContentValidator | None = field(
+            default=None,
+            kw_only=True,
+            repr=False,
+        )
         # TODO: include new meta-schemas added at runtime
         _registry: referencing.jsonschema.SchemaRegistry = field(
             default=_REMOTE_WARNING_REGISTRY,
@@ -283,6 +301,9 @@ def create(
             cls.evolve = evolve
 
         def __attrs_post_init__(self):
+            if self.content_validator is None:
+                self.content_validator = self.CONTENT_VALIDATOR
+
             if self._resolver is None:
                 registry = self._registry
                 if registry is not _REMOTE_WARNING_REGISTRY:
