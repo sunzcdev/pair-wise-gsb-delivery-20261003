@@ -7,7 +7,7 @@
 
 """filter"""
 
-from sqlparse import lexer
+from sqlparse import lexer, protection
 from sqlparse.engine import grouping
 from sqlparse.engine.statement_splitter import StatementSplitter
 from sqlparse.exceptions import SQLParseError
@@ -19,6 +19,7 @@ class FilterStack:
         self.preprocess = []
         self.stmtprocess = []
         self.postprocess = []
+        self.protected_regions = None
         self._grouping = False
         if strip_semicolon:
             self.stmtprocess.append(StripTrailingSemicolonFilter())
@@ -29,6 +30,12 @@ class FilterStack:
     def run(self, sql, encoding=None):
         try:
             stream = lexer.tokenize(sql, encoding)
+            if self.protected_regions:
+                # Validates region boundaries and flags protected tokens.
+                # Raises SQLParseError before any filter runs when a
+                # boundary does not coincide with a token boundary.
+                stream = protection.protect_stream(
+                    stream, self.protected_regions)
             # Process token stream
             for filter_ in self.preprocess:
                 stream = filter_.process(stream)

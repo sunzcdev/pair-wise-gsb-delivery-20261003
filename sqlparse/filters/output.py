@@ -46,6 +46,12 @@ class OutputPythonFilter(OutputFilter):
 
         # Print the tokens on the quote
         for token in stream:
+            # Protected tokens are emitted verbatim: no escaping and no
+            # line splitting (see sqlparse.protection).
+            if token.is_protected:
+                yield sql.Token(T.Text, token.value)
+                continue
+
             # Token is a new line separator
             if token.is_whitespace and '\n' in token.value:
                 # Close quote and add a new line
@@ -94,6 +100,12 @@ class OutputPHPFilter(OutputFilter):
 
         # Print the tokens on the quote
         for token in stream:
+            # Protected tokens are emitted verbatim: no escaping and no
+            # line splitting (see sqlparse.protection).
+            if token.is_protected:
+                yield sql.Token(T.Text, token.value)
+                continue
+
             # Token is a new line separator
             if token.is_whitespace and '\n' in token.value:
                 # Close quote and add a new line

@@ -7,7 +7,7 @@
 
 """SQL formatter"""
 
-from sqlparse import filters
+from sqlparse import filters, protection
 from sqlparse.exceptions import SQLParseError
 
 
@@ -131,6 +131,11 @@ def validate_options(options):
             raise SQLParseError('right_margin requires an integer > 10')
     options['right_margin'] = right_margin
 
+    protected_regions = options.get('protected_regions')
+    if protected_regions is not None:
+        options['protected_regions'] = protection.normalize_regions(
+            protected_regions)
+
     return options
 
 
@@ -142,6 +147,9 @@ def build_filter_stack(stack, options):
       options: Dictionary with options validated by validate_options.
     """
     # Token filter
+    if options.get('protected_regions'):
+        stack.protected_regions = options['protected_regions']
+
     if options.get('keyword_case'):
         stack.preprocess.append(
             filters.KeywordCaseFilter(options['keyword_case']))

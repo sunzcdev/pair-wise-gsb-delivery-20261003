@@ -5,7 +5,7 @@
 # This module is part of python-sqlparse and is released under
 # the BSD License: https://opensource.org/licenses/BSD-3-Clause
 
-from sqlparse import sql
+from sqlparse import protection, sql
 from sqlparse import tokens as T
 from sqlparse.utils import indent, offset
 
@@ -40,7 +40,7 @@ class AlignedIndentFilter:
 
     def _process_statement(self, tlist):
         if len(tlist.tokens) > 0 and tlist.tokens[0].is_whitespace \
-                and self.indent == 0:
+                and self.indent == 0 and not tlist.tokens[0].is_protected:
             tlist.tokens.pop(0)
 
         # process the main query body
@@ -62,7 +62,11 @@ class AlignedIndentFilter:
         # columns being selected
         identifiers = list(tlist.get_identifiers())
         identifiers.pop(0)
-        [tlist.insert_before(token, self.nl()) for token in identifiers]
+        for token in identifiers:
+            # Never insert a line break inside a protected region.
+            tidx = tlist.token_index(token)
+            if not protection.splits_protected_region(tlist, tidx):
+                tlist.insert_before(tidx, self.nl())
         self._process_default(tlist)
 
     def _process_case(self, tlist):
@@ -83,9 +87,16 @@ class AlignedIndentFilter:
             # cond is None when 'else or end'
             stmt = cond[0] if cond else value[0]
 
+            # Never insert a line break inside a protected region.
             if i > 0:
-                tlist.insert_before(stmt, self.nl(offset_ - len(str(stmt))))
+                tidx = tlist.token_index(stmt)
+                if not protection.splits_protected_region(tlist, tidx):
+                    tlist.insert_before(
+                        tidx, self.nl(offset_ - len(str(stmt))))
             if cond:
+                idx = tlist.token_index(cond[-1]) + 1
+                if protection.splits_protected_region(tlist, idx):
+                    continue
                 ws = sql.Token(T.Whitespace, self.char * (
                     max_cond_width - condition_width[i]))
                 tlist.insert_after(cond[-1], ws)
@@ -112,8 +123,10 @@ class AlignedIndentFilter:
                 token_indent = token.value.split()[0]
             else:
                 token_indent = str(token)
-            tlist.insert_before(token, self.nl(token_indent))
-            tidx += 1
+            # Never insert a line break inside a protected region.
+            if not protection.splits_protected_region(tlist, tidx):
+                tlist.insert_before(token, self.nl(token_indent))
+                tidx += 1
             tidx, token = self._next_token(tlist, tidx)
 
     def _process_default(self, tlist):

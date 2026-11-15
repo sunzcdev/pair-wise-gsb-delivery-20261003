@@ -5,7 +5,7 @@
 # This module is part of python-sqlparse and is released under
 # the BSD License: https://opensource.org/licenses/BSD-3-Clause
 
-from sqlparse import sql
+from sqlparse import protection, sql
 from sqlparse import tokens as T
 from sqlparse.utils import indent, offset
 
@@ -113,11 +113,14 @@ class ReindentFilter:
             pidx, prev_ = tlist.token_prev(tidx, skip_ws=False)
             uprev = str(prev_)
 
-            if prev_ and prev_.is_whitespace:
+            if prev_ and prev_.is_whitespace and not prev_.is_protected:
                 del tlist.tokens[pidx]
                 tidx -= 1
 
-            if not (uprev.endswith('\n') or uprev.endswith('\r')):
+            # Never insert a line break inside a protected region.
+            if not (uprev.endswith('\n') or uprev.endswith('\r')) \
+                    and not (prev_ is not None and prev_.is_protected
+                             and token.is_protected):
                 tlist.insert_before(tidx, self.nl())
                 tidx += 1
 
@@ -128,11 +131,12 @@ class ReindentFilter:
         tidx, token = tlist.token_next_by(t=ttypes)
         while token:
             pidx, prev_ = tlist.token_prev(tidx, skip_ws=False)
-            if prev_ and prev_.is_whitespace:
+            if prev_ and prev_.is_whitespace and not prev_.is_protected:
                 del tlist.tokens[pidx]
                 tidx -= 1
             # only break if it's not the first token
-            if prev_:
+            # and the break wouldn't fall inside a protected region
+            if prev_ and not (prev_.is_protected and token.is_protected):
                 tlist.insert_before(tidx, self.nl())
                 tidx += 1
             tidx, token = tlist.token_next_by(t=ttypes, idx=tidx)
@@ -147,7 +151,11 @@ class ReindentFilter:
         if not token:
             return
         # issue121, errors in statement fixed??
-        tlist.insert_before(tidx, self.nl())
+        _, prev_ = tlist.token_prev(tidx, skip_ws=False)
+        # Never insert a line break inside a protected region.
+        if not (prev_ is not None and prev_.is_protected
+                and token.is_protected):
+            tlist.insert_before(tidx, self.nl())
         with indent(self):
             self._process_default(tlist)
 
@@ -191,7 +199,12 @@ class ReindentFilter:
                             if comma is None:
                                 continue
                             token = comma
-                        tlist.insert_before(token, self.nl(offset=adjust))
+                        # Never insert a line break inside a protected
+                        # region.
+                        tidx = tlist.token_index(token)
+                        if not protection.splits_protected_region(tlist,
+                                                                  tidx):
+                            tlist.insert_before(tidx, self.nl(offset=adjust))
                         if self.comma_first:
                             _, ws = tlist.token_next(
                                 tlist.token_index(token), skip_ws=False)
@@ -218,7 +231,9 @@ class ReindentFilter:
 
             with offset(self, adjusted_offset), indent(self):
                 if adjusted_offset < 0:
-                    tlist.insert_before(identifiers[0], self.nl())
+                    tidx = tlist.token_index(identifiers[0])
+                    if not protection.splits_protected_region(tlist, tidx):
+                        tlist.insert_before(tidx, self.nl())
                 position = 0
                 for token in identifiers:
                     # Add 1 for the "," separator
@@ -226,7 +241,12 @@ class ReindentFilter:
                     if (self.wrap_after > 0
                             and position > (self.wrap_after - self.offset)):
                         adjust = 0
-                        tlist.insert_before(token, self.nl(offset=adjust))
+                        # Never insert a line break inside a protected
+                        # region.
+                        tidx = tlist.token_index(token)
+                        if not protection.splits_protected_region(tlist,
+                                                                  tidx):
+                            tlist.insert_before(tidx, self.nl(offset=adjust))
                         position = 0
         self._process_default(tlist)
 
@@ -243,14 +263,21 @@ class ReindentFilter:
                     end_pos = self.offset + 1 + len(str_cond) + len(str_value)
                     if (not self.compact and end_pos > self.wrap_after):
                         token = value[0] if cond is None else cond[0]
-                        tlist.insert_before(token, self.nl())
+                        # Never insert a line break inside a protected
+                        # region.
+                        tidx = tlist.token_index(token)
+                        if not protection.splits_protected_region(tlist,
+                                                                  tidx):
+                            tlist.insert_before(tidx, self.nl())
 
                 # Line breaks on group level are done. let's add an offset of
                 # len "when ", "then ", "else "
                 with offset(self, len("WHEN ")):
                     self._process_default(tlist)
             end_idx, end = tlist.token_next_by(m=sql.Case.M_CLOSE)
-            if end_idx is not None and not self.compact:
+            if end_idx is not None and not self.compact \
+                    and not protection.splits_protected_region(tlist,
+                                                               end_idx):
                 tlist.insert_before(end_idx, self.nl())
 
     def _process_values(self, tlist):
@@ -261,13 +288,18 @@ class ReindentFilter:
             ptidx, ptoken = tlist.token_next_by(m=(T.Punctuation, ','),
                                                 idx=tidx)
             if ptoken:
+                # Never insert a line break inside a protected region.
+                pidx = tlist.token_index(ptoken)
                 if self.comma_first:
                     adjust = -2
                     offset = self._get_offset(first_token) + adjust
-                    tlist.insert_before(ptoken, self.nl(offset))
+                    if not protection.splits_protected_region(tlist, pidx):
+                        tlist.insert_before(pidx, self.nl(offset))
                 else:
-                    tlist.insert_after(ptoken,
-                                       self.nl(self._get_offset(token)))
+                    if not protection.splits_protected_region(
+                            tlist, pidx + 1):
+                        tlist.insert_after(pidx,
+                                           self.nl(self._get_offset(token)))
             tidx, token = tlist.token_next_by(i=sql.Parenthesis, idx=tidx)
 
     def _process_default(self, tlist, stmts=True):

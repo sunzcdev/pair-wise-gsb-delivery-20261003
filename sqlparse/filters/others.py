@@ -7,7 +7,7 @@
 
 import re
 
-from sqlparse import sql
+from sqlparse import protection, sql
 from sqlparse import tokens as T
 from sqlparse.utils import split_unquoted_newlines
 
@@ -35,6 +35,11 @@ class StripCommentsFilter:
         sql_hints = (T.Comment.Multiline.Hint, T.Comment.Single.Hint)
         tidx, token = get_next_comment()
         while token:
+            # Protected comments are emitted verbatim.
+            if protection.token_is_protected(token):
+                tidx, token = get_next_comment(idx=tidx)
+                continue
+
             # skipping token remove if token is a SQL-Hint. issue262
             is_sql_hint = False
             if token.ttype in sql_hints:
@@ -92,7 +97,7 @@ class StripWhitespaceFilter:
         last_was_ws = False
         is_first_char = True
         for token in tlist.tokens:
-            if token.is_whitespace:
+            if token.is_whitespace and not token.is_protected:
                 token.value = '' if last_was_ws or is_first_char else ' '
             last_was_ws = token.is_whitespace
             is_first_char = False
@@ -101,7 +106,8 @@ class StripWhitespaceFilter:
         # Removes newlines before commas, see issue140
         last_nl = None
         for token in list(tlist.tokens):
-            if last_nl and token.ttype is T.Punctuation and token.value == ',':
+            if last_nl and not last_nl.is_protected \
+                    and token.ttype is T.Punctuation and token.value == ',':
                 tlist.tokens.remove(last_nl)
             last_nl = token if token.is_whitespace else None
 
@@ -118,20 +124,24 @@ class StripWhitespaceFilter:
                 and tlist.tokens[0].match(T.Punctuation, '(')
                 and tlist.tokens[-1].match(T.Punctuation, ')')):
             return self._stripws_default(tlist)
-        while tlist.tokens[1].is_whitespace:
+        while tlist.tokens[1].is_whitespace \
+                and not tlist.tokens[1].is_protected:
             tlist.tokens.pop(1)
-        while tlist.tokens[-2].is_whitespace:
+        while tlist.tokens[-2].is_whitespace \
+                and not tlist.tokens[-2].is_protected:
             tlist.tokens.pop(-2)
         if tlist.tokens[-2].is_group:
             # save to remove the last whitespace
-            while tlist.tokens[-2].tokens[-1].is_whitespace:
+            while tlist.tokens[-2].tokens[-1].is_whitespace \
+                    and not tlist.tokens[-2].tokens[-1].is_protected:
                 tlist.tokens[-2].tokens.pop(-1)
         self._stripws_default(tlist)
 
     def process(self, stmt, depth=0):
         [self.process(sgroup, depth + 1) for sgroup in stmt.get_sublists()]
         self._stripws(stmt)
-        if depth == 0 and stmt.tokens and stmt.tokens[-1].is_whitespace:
+        if depth == 0 and stmt.tokens and stmt.tokens[-1].is_whitespace \
+                and not stmt.tokens[-1].is_protected:
             stmt.tokens.pop(-1)
         return stmt
 
@@ -143,12 +153,19 @@ class SpacesAroundOperatorsFilter:
         ttypes = (T.Operator, T.Comparison)
         tidx, token = tlist.token_next_by(t=ttypes)
         while token:
+            if token.is_protected:
+                # Protected tokens are emitted verbatim.
+                tidx, token = tlist.token_next_by(t=ttypes, idx=tidx)
+                continue
+
             nidx, next_ = tlist.token_next(tidx, skip_ws=False)
-            if next_ and next_.ttype != T.Whitespace:
+            if next_ and next_.ttype != T.Whitespace \
+                    and not protection.token_is_protected(next_):
                 tlist.insert_after(tidx, sql.Token(T.Whitespace, ' '))
 
             pidx, prev_ = tlist.token_prev(tidx, skip_ws=False)
-            if prev_ and prev_.ttype != T.Whitespace:
+            if prev_ and prev_.ttype != T.Whitespace \
+                    and not protection.token_is_protected(prev_):
                 tlist.insert_before(tidx, sql.Token(T.Whitespace, ' '))
                 tidx += 1  # has to shift since token inserted before it
 
@@ -177,4 +194,10 @@ class SerializerUnicode:
     @staticmethod
     def process(stmt):
         lines = split_unquoted_newlines(stmt)
+        spans = protection.protected_spans(stmt)
+        if spans:
+            # Protected characters (including protected line breaks and
+            # protected trailing whitespace) are emitted verbatim.
+            return protection.join_lines_preserving_protected(
+                str(stmt), lines, spans)
         return '\n'.join(line.rstrip() for line in lines)

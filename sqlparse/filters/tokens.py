@@ -6,6 +6,7 @@
 # the BSD License: https://opensource.org/licenses/BSD-3-Clause
 
 from sqlparse import tokens as T
+from sqlparse.protection import ProtectedStreamItem
 
 
 class _CaseFilter:
@@ -16,7 +17,12 @@ class _CaseFilter:
         self.convert = getattr(str, case)
 
     def process(self, stream):
-        for ttype, value in stream:
+        for item in stream:
+            if isinstance(item, ProtectedStreamItem):
+                # Protected tokens are emitted verbatim.
+                yield item
+                continue
+            ttype, value = item
             if ttype in self.ttype:
                 value = self.convert(value)
             yield ttype, value
@@ -30,7 +36,12 @@ class IdentifierCaseFilter(_CaseFilter):
     ttype = T.Name, T.String.Symbol
 
     def process(self, stream):
-        for ttype, value in stream:
+        for item in stream:
+            if isinstance(item, ProtectedStreamItem):
+                # Protected tokens are emitted verbatim.
+                yield item
+                continue
+            ttype, value = item
             if ttype in self.ttype and value.strip()[0] != '"':
                 value = self.convert(value)
             yield ttype, value
@@ -42,7 +53,12 @@ class TruncateStringFilter:
         self.char = char
 
     def process(self, stream):
-        for ttype, value in stream:
+        for item in stream:
+            if isinstance(item, ProtectedStreamItem):
+                # Protected tokens are emitted verbatim.
+                yield item
+                continue
+            ttype, value = item
             if ttype != T.Literal.String.Single:
                 yield ttype, value
                 continue

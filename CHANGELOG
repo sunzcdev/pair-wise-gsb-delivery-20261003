@@ -1,3 +1,17 @@
+Development Version
+-------------------
+
+New Features
+
+* The `format()` function now accepts a `protected_regions` option: a list
+  of non-overlapping `(start, end)` character intervals of the original
+  statement whose content is emitted verbatim.  Formatting options such as
+  `keyword_case`, `reindent`, `strip_comments` and `output_format` still
+  apply outside the intervals.  Interval boundaries must coincide with
+  token boundaries, otherwise `SQLParseError` is raised before any
+  processing takes place.
+
+
 Release 0.6.1 (Nov 01, 2026)
 ----------------------------
 

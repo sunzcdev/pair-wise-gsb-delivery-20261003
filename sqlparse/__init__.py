@@ -51,6 +51,14 @@ def format(sql: str, encoding: str | None = None, **options: Any) -> str:
     In addition to the formatting options this function accepts the
     keyword "encoding" which determines the encoding of the statement.
 
+    The optional keyword "protected_regions" accepts a list of
+    non-overlapping ``(start, end)`` character intervals of the
+    original statement.  Characters inside those intervals are emitted
+    verbatim while everything outside is formatted as usual.  Interval
+    boundaries must coincide with token boundaries, otherwise
+    :class:`~sqlparse.exceptions.SQLParseError` is raised before any
+    processing takes place.
+
     :returns: The formatted SQL statement as string.
     """
     stack = engine.FilterStack()

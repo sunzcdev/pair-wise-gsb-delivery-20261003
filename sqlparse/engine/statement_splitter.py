@@ -5,7 +5,7 @@
 # This module is part of python-sqlparse and is released under
 # the BSD License: https://opensource.org/licenses/BSD-3-Clause
 
-from sqlparse import sql
+from sqlparse import protection, sql
 from sqlparse import tokens as T
 
 
@@ -153,7 +153,8 @@ class StatementSplitter:
         EOS_TTYPE = T.Whitespace, T.Comment.Single
 
         # Run over all stream tokens
-        for ttype, value in stream:
+        for item in stream:
+            ttype, value = item
             # Yield token if we finished a statement and there's no whitespaces
             # It will count newline token as a non whitespace. In this context
             # whitespace ignores newlines.
@@ -168,7 +169,10 @@ class StatementSplitter:
             self.level += self._change_splitlevel(ttype, value)
 
             # Append the token to the current statement
-            self.tokens.append(sql.Token(ttype, value))
+            token = sql.Token(ttype, value)
+            if isinstance(item, protection.ProtectedStreamItem):
+                token.is_protected = True
+            self.tokens.append(token)
 
             # Check if we get the end of a statement
             # Issue762: Allow GO (or "GO 2") as statement splitter.

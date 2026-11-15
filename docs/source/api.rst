@@ -84,6 +84,18 @@ The :meth:`~sqlparse.format` function accepts the following keyword arguments.
 ``comma_first``
   If ``True`` comma-first notation for column names is used.
 
+``protected_regions``
+  A list of non-overlapping ``(start, end)`` character intervals of the
+  original statement whose content must be emitted verbatim.  Formatting
+  options (e.g. ``keyword_case``, ``reindent``, ``strip_comments`` or
+  ``output_format``) still apply outside the intervals, but characters
+  inside them are passed through unchanged.  Interval boundaries must
+  coincide with token boundaries, otherwise
+  :class:`~sqlparse.exceptions.SQLParseError` is raised before any
+  processing takes place.  This is useful when a caller, e.g. a
+  collection script, needs certain fragments of the original text to
+  survive formatting byte-for-byte.
+
 
 Security and Performance Considerations
 ---------------------------------------

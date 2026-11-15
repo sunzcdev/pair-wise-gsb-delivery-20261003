@@ -51,6 +51,7 @@ class Token:
         'is_group',
         'is_keyword',
         'is_newline',
+        'is_protected',
         'is_whitespace',
         'normalized',
         'parent',
@@ -67,6 +68,9 @@ class Token:
         self.is_keyword = ttype in T.Keyword
         self.is_whitespace = self.ttype in T.Whitespace
         self.is_newline = self.ttype in T.Newline
+        # True if the token is covered by a protected region and must be
+        # emitted verbatim (see sqlparse.protection).
+        self.is_protected = False
         self.normalized = value.upper() if self.is_keyword else value
 
     def __str__(self):
