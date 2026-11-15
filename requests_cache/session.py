@@ -8,22 +8,32 @@ from typing import TYPE_CHECKING, Iterable, Mapping, Optional, Union
 from requests import PreparedRequest
 from requests import Session as OriginalSession
 from requests.hooks import dispatch_hook
+from requests.structures import CaseInsensitiveDict
 
 from ._utils import get_valid_kwargs, patch_form_boundary
 from .backends import BackendSpecifier, StrOrPath, init_backend
-from .models import AnyResponse, CachedResponse, OriginalResponse
+from .models import (
+    AnyResponse,
+    CachedHTTPResponse,
+    CachedRequest,
+    CachedResponse,
+    OriginalResponse,
+)
 from .policy import (
     DEFAULT_CACHE_NAME,
     DEFAULT_IGNORED_PARAMS,
     DEFAULT_METHODS,
     DEFAULT_STATUS_CODES,
     CacheActions,
+    CacheDirectives,
     CacheSettings,
     ExpirationPatterns,
     ExpirationTime,
     FilterCallback,
     KeyCallback,
+    can_freshen_from_head,
     set_request_headers,
+    utcnow,
 )
 from .serializers import SerializerType
 
@@ -56,12 +66,17 @@ class CacheMixin(MIXIN_BASE):
         ignored_parameters: Iterable[str] = DEFAULT_IGNORED_PARAMS,
         match_headers: Union[Iterable[str], bool] = False,
         filter_fn: Optional[FilterCallback] = None,
+        head_coordination: Union[bool, str] = True,
         key_fn: Optional[KeyCallback] = None,
         read_only: bool = False,
         stale_if_error: Union[bool, int] = False,
         autoclose: bool = True,
         **kwargs,
     ):
+        for alias in ('head_policy', 'head_cache_policy', 'head_coordination_policy'):
+            if alias in kwargs:
+                head_coordination = kwargs.pop(alias)
+
         self.cache = init_backend(cache_name, backend, serializer=serializer, **kwargs)
         self.settings = CacheSettings.from_kwargs(
             expire_after=expire_after,
@@ -74,6 +89,7 @@ class CacheMixin(MIXIN_BASE):
             ignored_parameters=ignored_parameters,
             match_headers=match_headers,
             filter_fn=filter_fn,
+            head_coordination=head_coordination,
             key_fn=key_fn,
             read_only=read_only,
             stale_if_error=stale_if_error,
@@ -257,6 +273,11 @@ class CacheMixin(MIXIN_BASE):
             response = self._send_and_cache(request, actions, cached_response, **kwargs)
         else:
             response = cached_response  # type: ignore  # Guaranteed to be non-None by this point
+            if (request.method or '').upper() == 'HEAD' and self.settings.head_coordination:
+                head_get_key = self.cache.create_key(_as_get_request(request), **kwargs)
+                self._coordinate_head_response(
+                    head_get_key, request, response, actions, **kwargs
+                )
 
         # If the request has been filtered out and was previously cached, delete it
         if self.settings.filter_fn is not None and not self.settings.filter_fn(response):
@@ -277,9 +298,18 @@ class CacheMixin(MIXIN_BASE):
         """Send a request and cache the response, unless disabled by settings or headers.
         If applicable, also handle conditional requests.
         """
+        head_get_key = None
+        if (request.method or '').upper() == 'HEAD' and self.settings.head_coordination:
+            head_get_key = self.cache.create_key(_as_get_request(request), **kwargs)
+
         request = actions.update_request(request)
         response = super().send(request, **kwargs)
         actions.update_from_response(response)
+
+        if head_get_key is not None and not isinstance(response, CachedResponse):
+            self._coordinate_head_response(
+                head_get_key, request, response, actions, **kwargs
+            )
 
         if not actions.skip_write:
             self.cache.save_response(response, actions.cache_key, actions.expires)
@@ -288,6 +318,10 @@ class CacheMixin(MIXIN_BASE):
                 response, CachedResponse.from_response(cached_response)
             )
             cached_response.cache_key = actions.cache_key
+            if head_get_key is not None:
+                self._coordinate_head_response(
+                    head_get_key, request, cached_response, actions, **kwargs
+                )
             if not actions.skip_write:
                 self.cache.save_response(cached_response, actions.cache_key, actions.expires)  # type: ignore[unreachable]
             return cached_response
@@ -300,6 +334,146 @@ class CacheMixin(MIXIN_BASE):
             return response
         else:
             return OriginalResponse.wrap_response(response, actions)
+
+    def _coordinate_head_response(
+        self,
+        get_key: str,
+        head_request: PreparedRequest,
+        head_response: AnyResponse,
+        actions: CacheActions,
+        **kwargs,
+    ):
+        """Use a HEAD response to freshen or invalidate a stored GET response.
+
+        The GET body is never modified here. Only its non-representation metadata and freshness
+        can be updated, and only when validators (and, when provided, Content-Length) prove that
+        the entity is unchanged. If the response proves that it changed, the GET entry is deleted.
+        """
+        if not self.settings.head_coordination:
+            return
+        if getattr(head_response, 'from_cache', False) and head_response.is_expired:
+            return
+
+        get_request = _as_get_request(head_request)
+        candidates = self._get_head_candidates(get_key, get_request, **kwargs)
+        if not candidates:
+            return
+
+        # A response that cannot be reused for this request (or a missing resource) makes the
+        # selected GET variants stale. Other Vary variants are left alone.
+        if head_response.status_code in (404, 410) or _vary_star(head_response):
+            for key, cached_response in candidates:
+                self._invalidate_head_candidate(
+                    get_key, key, cached_response, actions, head_response
+                )
+            return
+        elif not 200 <= head_response.status_code < 300:
+            return
+
+        for key, cached_response in candidates:
+            can_freshen = can_freshen_from_head(cached_response, head_response)
+            if can_freshen is True:
+                self._freshen_head_candidate(key, cached_response, head_response, actions)
+            elif can_freshen is False:
+                self._invalidate_head_candidate(
+                    get_key, key, cached_response, actions, head_response
+                )
+
+    def _get_head_candidates(
+        self, get_key: str, get_request: PreparedRequest, **kwargs
+    ) -> list:
+        """Get the stored GET response(s) that could be selected by the HEAD request.
+
+        This checks the primary cache key and, when its ``Vary`` headers don't match, the
+        Vary-qualified secondary key. A different Vary variant is never touched.
+        """
+        candidates = []
+        cached_response = self.cache.get_response(get_key)
+        if cached_response is not None and _is_get_response(cached_response):
+            vary_matches, vary_key = self._get_vary_status(cached_response, get_request, **kwargs)
+            if vary_matches:
+                candidates.append((cached_response.cache_key or get_key, cached_response))
+            elif vary_key:
+                vary_response = self.cache.get_response(vary_key)
+                if vary_response is not None and _is_get_response(vary_response):
+                    vary_matches, _ = self._get_vary_status(vary_response, get_request, **kwargs)
+                    if vary_matches:
+                        candidates.append(
+                            (vary_response.cache_key or vary_key, vary_response)
+                        )
+        return candidates
+
+    def _get_vary_status(
+        self, cached_response: CachedResponse, get_request: PreparedRequest, **kwargs
+    ):
+        """Check Vary matching and get the secondary cache key, if any."""
+        actions = CacheActions.from_request(
+            self.cache.create_key(get_request, **kwargs), get_request, self.settings
+        )
+        actions.update_from_cached_response(
+            cached_response, self.cache.create_key, **kwargs
+        )
+        return actions._vary_matched, actions.vary_cache_key
+
+    def _freshen_head_candidate(
+        self,
+        key: str,
+        cached_response: CachedResponse,
+        head_response: AnyResponse,
+        actions: CacheActions,
+    ):
+        """Update a stored GET response's headers and expiration, but not its body."""
+        if not self._can_modify_cache(actions, head_response):
+            return
+
+        updated_response = CachedResponse.from_response(cached_response)
+        updated_response.headers = CaseInsensitiveDict(cached_response.headers)
+        updated_response.expires = actions.expires
+        updated_response.headers.update(head_response.headers)
+        if (
+            'Content-Length' in updated_response.headers
+            and 'Transfer-Encoding' in updated_response.headers
+        ):
+            del updated_response.headers['Content-Length']
+        updated_response.revalidated = True
+        updated_response.has_content_changed = False
+        updated_response.raw = CachedHTTPResponse.from_cached_response(updated_response)
+        self.cache.save_response(updated_response, key, actions.expires)
+        logger.debug(f'Freshened cached GET response for URL: {cached_response.url}')
+
+    def _invalidate_head_candidate(
+        self,
+        get_key: str,
+        key: str,
+        cached_response: CachedResponse,
+        actions: CacheActions,
+        response: Optional[AnyResponse] = None,
+    ):
+        """Invalidate a stored GET response that the HEAD response shows is stale."""
+        if not self._can_modify_cache(actions, response):
+            return
+        logger.debug(f'Invalidating cached GET response for key: {key}')
+        if key == get_key and _has_vary(cached_response):
+            # Keep the primary variant as an expired anchor so other Vary variants remain
+            # discoverable through the normal primary -> secondary lookup.
+            updated_response = CachedResponse.from_response(cached_response)
+            updated_response.headers = CaseInsensitiveDict(cached_response.headers)
+            for header in ('ETag', 'Last-Modified'):
+                updated_response.headers.pop(header, None)
+            updated_response.expires = utcnow()
+            updated_response.has_content_changed = True
+            self.cache.save_response(updated_response, key, updated_response.expires)
+        else:
+            self.cache.delete(key)
+
+    def _can_modify_cache(
+        self, actions: CacheActions, response: Optional[AnyResponse] = None
+    ) -> bool:
+        if self.settings.read_only or self.settings.disabled or actions._directives.no_store:
+            return False
+        if response is not None:
+            return not CacheDirectives.from_headers(response.headers).no_store
+        return True
 
     def _resend(
         self,
@@ -404,6 +578,9 @@ class CachedSession(CacheMixin, OriginalSession):
             is not expired
         match_headers: Request headers to match, when `Vary` response header is not available. May
             be a list of headers, or ``True`` to match all.
+        head_coordination: Use successful HEAD responses to freshen metadata (but not content)
+            for matching cached GET responses. Enabled by default; set to ``False`` to treat
+            HEAD requests with ordinary, independent caching behavior.
         ignored_parameters: Request parameters, headers, and/or JSON body params to exclude from both
             request matching and cached request data
         read_only: Read existing cached responses, but do not write any new responses to the cache
@@ -427,3 +604,39 @@ def get_504_response(request: PreparedRequest) -> CachedResponse:
         reason='Not Cached',
         request=request,  # type: ignore
     )
+
+
+def _as_get_request(request: PreparedRequest) -> PreparedRequest:
+    """Make a GET-like request for looking up the stored GET response matching a HEAD request.
+
+    Conditional and range headers are request-specific and should not affect which stored
+    representation is selected.
+    """
+    cached_request = CachedRequest.from_request(request)
+    cached_request.method = 'GET'
+    for header in (
+        'Cache-Control',
+        'If-None-Match',
+        'If-Modified-Since',
+        'If-Range',
+        'Range',
+        'X-ACTUAL-NO-CACHE',
+    ):
+        cached_request.headers.pop(header, None)
+    return cached_request.prepare()
+
+
+def _is_get_response(response: CachedResponse) -> bool:
+    method = getattr(getattr(response, 'request', None), 'method', None)
+    return method is None or method.upper() == 'GET'
+
+
+def _vary_star(response: AnyResponse) -> bool:
+    vary = response.headers.get('Vary', '')
+    return any(value.strip() == '*' for value in vary.split(','))
+
+
+def _has_vary(response: AnyResponse) -> bool:
+    """Whether this response participates in Vary-based variant selection."""
+    vary = response.headers.get('Vary', '')
+    return bool(vary and not _vary_star(response))

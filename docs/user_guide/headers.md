@@ -30,6 +30,28 @@ True
 Also see {ref}`stale-while-revalidate` for a variation of this behavior.
 ```
 
+(head-coordination)=
+## HEAD Coordination
+When a server only permits cheap `HEAD` probes, a successful `HEAD` response can be used to extend
+the freshness of a previously cached `GET` response without replacing its body. This is enabled by
+default and can be disabled with:
+```python
+>>> session = CachedSession(head_coordination=False)
+```
+
+A stored `GET` response is only freshened when the `HEAD` response proves that the entity is
+unchanged:
+- An `ETag` or `Last-Modified` validator that is present in the `HEAD` response must match the
+  stored validator.
+- If the `HEAD` response has a `Content-Length`, it must match the stored representation length.
+- Responses without a usable validator never extend `GET` freshness, since the cache cannot
+  assume that the content is unchanged.
+
+If a validator or `Content-Length` differs, or the resource is reported missing, the matching cached
+`GET` response is invalidated. `Vary` variants are checked independently, so probing one variant
+does not modify another. A `HEAD` response is never stored as the body of a `GET` response, and if
+there is no cached `GET` response the request follows the normal `HEAD` caching rules.
+
 (cache-control)=
 ## Cache-Control
 `Cache-Control` **request** headers will always be used if present. This is mainly useful if you are

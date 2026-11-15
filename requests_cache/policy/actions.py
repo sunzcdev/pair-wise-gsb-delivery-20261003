@@ -6,9 +6,10 @@ from attrs import define, field
 from requests import PreparedRequest, Response
 from requests.structures import CaseInsensitiveDict
 
-from .._utils import coalesce
+from .._utils import coalesce, try_int
 from ..cache_keys import normalize_headers
 from ..models import RichMixin
+from .expiration import _parse_http_date
 from . import (
     DO_NOT_CACHE,
     EXPIRE_IMMEDIATELY,
@@ -34,6 +35,9 @@ METHOD_OVERRIDE_HEADERS = [
 ]
 
 logger = getLogger(__name__)
+
+# Validators that a HEAD response can use to prove an entity is unchanged
+HEAD_VALIDATOR_HEADERS = ('ETag', 'Last-Modified')
 
 
 @define(repr=False)
@@ -440,6 +444,82 @@ def _validate_expires_header(expires: Optional[str]) -> ExpirationTime:
         logger.debug(f'Invalid Expires header: {expires!r}; treating as expired')
         return EXPIRE_IMMEDIATELY
     return expires
+
+
+def can_freshen_from_head(
+    cached_response: 'CachedResponse', head_response: Response
+) -> Optional[bool]:
+    """Determine whether a HEAD response proves that a stored GET response is unchanged.
+
+    This implements the entity-equivalence checks from RFC 9111 section 4.3.5. The result is
+    three-valued so callers can distinguish "verified unchanged" from "verified changed" and
+    "cannot tell":
+
+    * ``True``: a received validator matches and, if the HEAD response has ``Content-Length``,
+      the stored representation length matches. The stored response may be freshened.
+    * ``False``: a validator or representation length differs, so the stored response must be
+      invalidated.
+    * ``None``: there isn't enough metadata to compare (for example, HEAD has no validator), so
+      the cache must not assume the entity is unchanged.
+    """
+    cached_headers = cached_response.headers or {}
+    head_headers = head_response.headers or {}
+    head_length = _content_length(head_headers)
+    cached_length = _content_length(cached_headers)
+
+    # A known representation length mismatch is evidence that the entity changed, even if the
+    # response doesn't include a validator.
+    if head_length is not None and cached_length is not None and head_length != cached_length:
+        logger.debug('HEAD response has a different Content-Length; stored GET response is stale')
+        return False
+
+    received_validators = [
+        (name, head_headers.get(name))
+        for name in HEAD_VALIDATOR_HEADERS
+        if head_headers.get(name) is not None
+    ]
+    if not received_validators:
+        logger.debug('HEAD response has no validator; cannot freshen stored GET response')
+        return None
+
+    for name, head_value in received_validators:
+        cached_value = cached_headers.get(name)
+        if cached_value is None or not _validator_matches(name, cached_value, head_value):
+            logger.debug(f'HEAD response has a different {name}; stored GET response is stale')
+            return False
+
+    # If the HEAD response declares a representation length, it must match as well. If it
+    # doesn't declare one, the matching validator is sufficient (RFC 9111 section 4.3.5).
+    if head_length is not None:
+        if cached_length is None or cached_length != head_length:
+            logger.debug(
+                'HEAD response has a different Content-Length; stored GET response is stale'
+            )
+            return False
+
+    return True
+
+
+def _validator_matches(name: str, cached_value: str, head_value: str) -> bool:
+    """Compare validator values, with a little tolerance for HTTP date formatting."""
+    cached_value = str(cached_value).strip()
+    head_value = str(head_value).strip()
+    if name == 'ETag':
+        # GET/HEAD use weak comparison, so the W/ prefix doesn't make equal tags differ
+        cached_value = cached_value[2:] if cached_value.startswith('W/') else cached_value
+        head_value = head_value[2:] if head_value.startswith('W/') else head_value
+    elif name == 'Last-Modified':
+        cached_date = _parse_http_date(cached_value)
+        head_date = _parse_http_date(head_value)
+        if cached_date is not None and head_date is not None:
+            return cached_date == head_date
+    return cached_value == head_value
+
+
+def _content_length(headers: Mapping[str, str]) -> Optional[int]:
+    """Get a valid Content-Length value, if present."""
+    value = headers.get('Content-Length')
+    return try_int(value) if value is not None else None
 
 
 def _is_method_allowed(request: PreparedRequest, settings: CacheSettings) -> bool:
