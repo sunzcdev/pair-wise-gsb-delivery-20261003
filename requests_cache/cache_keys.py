@@ -38,6 +38,8 @@ __all__ = [
     'normalize_request',
     'normalize_params',
     'normalize_url',
+    'redact_request',
+    'redact_response',
 ]
 if TYPE_CHECKING:
     from .models import AnyPreparedRequest, AnyRequest, CachedResponse
@@ -236,8 +238,16 @@ def normalize_params(value: Union[str, bytes], ignored_parameters: ParamList = N
     return query_str
 
 
-def redact_response(response: CachedResponse, ignored_parameters: ParamList) -> CachedResponse:
-    """Redact any ignored parameters (potentially containing sensitive info) from a cached request"""
+def redact_response(
+    response: CachedResponse,
+    ignored_parameters: ParamList,
+    redacted_parameters: ParamList = None,
+    content_root_key: Optional[str] = None,
+) -> CachedResponse:
+    """Redact any ignored parameters (potentially containing sensitive info) from a cached request.
+    Additionally redact ``redacted_parameters`` from all persisted request data, including redirect
+    history; unlike ``ignored_parameters``, this has no effect on request matching.
+    """
     if ignored_parameters:
         response.url = filter_url(response.url, ignored_parameters)
         response.request.url = filter_url(response.request.url, ignored_parameters)
@@ -248,7 +258,154 @@ def redact_response(response: CachedResponse, ignored_parameters: ParamList) -> 
             filter_sort_dict(response.request.headers, ignored_parameters)
         )
         response.request.body = normalize_body(response.request, ignored_parameters)
+    if redacted_parameters:
+        # Skip any params already redacted via ignored_parameters
+        redacted = set(redacted_parameters) - set(ignored_parameters or [])
+        _redact_response_details(response, redacted, content_root_key)
     return response
+
+
+def _redact_response_details(
+    response: CachedResponse,
+    redacted_parameters: ParamList,
+    content_root_key: Optional[str] = None,
+):
+    """Redact sensitive info from a cached response, its redirect history, and any subsequent
+    request in a redirect chain. Values are replaced with an irreversible, value-dependent
+    placeholder so that distinct values remain distinguishable (e.g., for ``Vary`` validation).
+    """
+    response.url = redact_url(response.url, redacted_parameters)
+    request = getattr(response, 'request', None)
+    if request:
+        redact_request(request, redacted_parameters, content_root_key)
+    next_request = getattr(response, '_next', None)
+    if next_request:
+        redact_request(next_request, redacted_parameters, content_root_key)
+    for prev_response in getattr(response, 'history', None) or []:
+        _redact_response_details(prev_response, redacted_parameters, content_root_key)
+
+
+def redact_request(
+    request: AnyPreparedRequest,
+    redacted_parameters: ParamList,
+    content_root_key: Optional[str] = None,
+) -> AnyPreparedRequest:
+    """Redact sensitive info from a request object (URL, headers, and body), in place"""
+    if not redacted_parameters:
+        return request
+    request.body = redact_body(request, redacted_parameters, content_root_key)
+    request.url = redact_url(request.url or '', redacted_parameters)
+    request.headers = CaseInsensitiveDict(
+        redact_sort_dict({k: decode(v) for k, v in request.headers.items()}, redacted_parameters)
+    )
+    return request
+
+
+def redact_url(url: str, redacted_parameters: ParamList) -> str:
+    """Redact sensitive request parameters from a URL"""
+    url_tokens = urlparse(url)
+    return urlunparse(
+        (
+            url_tokens.scheme,
+            url_tokens.netloc,
+            url_tokens.path,
+            url_tokens.params,
+            redact_params(url_tokens.query, redacted_parameters),
+            url_tokens.fragment,
+        )
+    )
+
+
+def redact_body(
+    request: AnyPreparedRequest,
+    redacted_parameters: ParamList,
+    content_root_key: Optional[str] = None,
+) -> bytes:
+    """Redact sensitive values from a request body, if possible, depending on Content-Type"""
+    if not request.body or hasattr(request.body, 'read'):
+        return request.body
+
+    try:
+        content_type = request.headers['Content-Type'].split(';')[0].lower()
+    except (AttributeError, KeyError):
+        content_type = ''
+
+    if is_json_content_type(content_type):
+        return encode(redact_json_body(request.body, redacted_parameters, content_root_key))
+    elif content_type == 'application/x-www-form-urlencoded':
+        return encode(redact_params(request.body, redacted_parameters))
+    return request.body
+
+
+def redact_json_body(
+    original_body: Union[str, bytes],
+    redacted_parameters: ParamList,
+    content_root_key: Optional[str] = None,
+) -> Union[str, bytes]:
+    """Redact sensitive values from a request body with serialized JSON data"""
+    if len(original_body) <= 2 or len(original_body) > MAX_NORM_BODY_SIZE:
+        return original_body
+
+    try:
+        body = json.loads(decode(original_body))
+        if content_root_key and isinstance(body, dict) and content_root_key in body:
+            body[content_root_key] = redact_sort_json(body[content_root_key], redacted_parameters)
+        else:
+            body = redact_sort_json(body, redacted_parameters)
+        return json.dumps(body)
+    # If it's invalid JSON, then don't mess with it
+    except (AttributeError, TypeError, ValueError):
+        logger.debug('Invalid JSON body')
+        return original_body
+
+
+def redact_params(value: Union[str, bytes], redacted_parameters: ParamList = None) -> str:
+    """Redact sensitive urlencoded params from either a URL or request body with form data"""
+    value = decode(value)
+    params = parse_qsl(value)
+    params = redact_sort_multidict(params, redacted_parameters)
+    query_str = urlencode(params)
+
+    # parse_qsl doesn't handle key-only params, so add those here
+    key_only_params = [k for k in value.split('&') if k and '=' not in k]
+    if key_only_params:
+        key_only_param_str = '&'.join(sorted(key_only_params))
+        query_str = f'{query_str}&{key_only_param_str}' if query_str else key_only_param_str
+
+    return query_str
+
+
+def redact_value(value: Any) -> str:
+    """Generate an irreversible, value-dependent placeholder for a redacted value, so that
+    distinct sensitive values remain distinguishable without persisting them
+    """
+    if not isinstance(value, (str, bytes)):
+        value = json.dumps(value, sort_keys=True)
+    return f'REDACTED-{sha256(encode(value)).hexdigest()[:16]}'
+
+
+def redact_sort_json(data: Union[List, Mapping], redacted_parameters: ParamList):
+    if isinstance(data, Mapping):
+        return redact_sort_dict(data, redacted_parameters)
+    else:
+        return redact_sort_list(data, redacted_parameters)
+
+
+def redact_sort_dict(data: Mapping[str, str], redacted_parameters: ParamList = None) -> Dict:
+    redacted_parameters = set(redacted_parameters or [])
+    return {
+        k: (redact_value(v) if k in redacted_parameters else v) for k, v in sorted(data.items())
+    }
+
+
+def redact_sort_multidict(data: KVList, redacted_parameters: ParamList = None) -> KVList:
+    redacted_parameters = set(redacted_parameters or [])
+    return [(k, redact_value(v) if k in redacted_parameters else v) for k, v in sorted(data)]
+
+
+def redact_sort_list(data: List, redacted_parameters: ParamList = None) -> List:
+    redacted_parameters = set(redacted_parameters or [])
+    return [redact_value(k) if k in redacted_parameters else k for k in sorted(data)]
 
 
 def filter_sort_json(data: Union[List, Mapping], ignored_parameters: ParamList):

@@ -1,6 +1,8 @@
 # History
 
 ## Unreleased
+* Add `redacted_parameters` option to redact sensitive request info (params, headers, and body)
+  from cached data only, without affecting request matching
 * Fix `ValueError` when a response has an invalid `Expires` date (for example `Expires: garbage`); it is now treated as already expired
 * Fix JSON refresh comparisons for mixed-case `Content-Type` values
 * Keep caller-supplied MongoDB clients open when closing MongoDB or GridFS caches

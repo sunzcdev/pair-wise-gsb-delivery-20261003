@@ -53,6 +53,11 @@ Since `ignored_parameters` is most often used for sensitive info like credential
 ```
 
 ```{tip}
+If you want to hide sensitive values from the cache *without* excluding them from request
+matching, use the `redacted_parameters` option instead. See {ref}`redact-params` for details.
+```
+
+```{tip}
 Variations in headers can be introduced by the libraries used by CacheSession.
 These variations can be eliminated by calling CachedSession request functions
 with a fixed header value. For example, always passing `"Accept-Encoding": "gzip,

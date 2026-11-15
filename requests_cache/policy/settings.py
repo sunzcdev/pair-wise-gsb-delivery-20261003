@@ -46,6 +46,7 @@ class CacheSettings(RichMixin):
     match_headers: Union[Iterable[str], bool] = field(default=False)
     only_if_cached: bool = field(default=False)
     read_only: bool = field(default=False)
+    redacted_parameters: Optional[Iterable[str]] = field(default=None)
     stale_if_error: Union[bool, ExpirationTime] = field(default=False)
     stale_while_revalidate: Union[bool, ExpirationTime] = field(default=False)
     urls_expire_after: Dict[ExpirationPattern, ExpirationTime] = field(factory=dict)

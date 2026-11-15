@@ -199,6 +199,113 @@ def test_all_methods__ignored_parameters__redacted(field, method, mock_session):
         assert body['ignored'] == 'REDACTED'
 
 
+@pytest.mark.parametrize('method', ALL_METHODS)
+@pytest.mark.parametrize('field', ['params', 'headers', 'data', 'json'])
+def test_all_methods__redacted_parameters__still_matched(field, method, mock_session):
+    """Redacted parameters should not affect request matching: requests that differ only in a
+    redacted param must still be cached under different keys.
+    """
+    mock_session.settings.redacted_parameters = ['secret']
+    mock_session.settings.match_headers = True
+    params_1 = {'secret': 'secret-value-1', 'param': 'value_1'}
+    params_2 = {'secret': 'secret-value-2', 'param': 'value_1'}
+
+    assert mock_session.request(method, MOCKED_URL, **{field: params_1}).from_cache is False
+    assert mock_session.request(method, MOCKED_URL, **{field: params_1}).from_cache is True
+    # A different secret value is a different identity, and must not be a cache hit
+    assert mock_session.request(method, MOCKED_URL, **{field: params_2}).from_cache is False
+    assert mock_session.request(method, MOCKED_URL, **{field: params_2}).from_cache is True
+
+
+@pytest.mark.parametrize('method', ALL_METHODS)
+@pytest.mark.parametrize('field', ['params', 'headers', 'data', 'json'])
+def test_all_methods__redacted_parameters__redacted(field, method, mock_session):
+    """Redacted parameters should be removed from persisted request data, with distinct values
+    getting distinct irreversible placeholders.
+    """
+    mock_session.settings.redacted_parameters = ['secret']
+    mock_session.settings.match_headers = True
+    params_1 = {'secret': 'secret-value-1', 'param': 'value_1'}
+    params_2 = {'secret': 'secret-value-2', 'param': 'value_1'}
+
+    mock_session.request(method, MOCKED_URL, **{field: params_1})
+    mock_session.request(method, MOCKED_URL, **{field: params_2})
+    cached_response_1 = mock_session.request(method, MOCKED_URL, **{field: params_1})
+    cached_response_2 = mock_session.request(method, MOCKED_URL, **{field: params_2})
+    assert cached_response_1.from_cache and cached_response_2.from_cache
+
+    persisted = {}
+    for label, cached_response in [('1', cached_response_1), ('2', cached_response_2)]:
+        persisted_content = (
+            f'{cached_response.url}{cached_response.request.url}'
+            f'{cached_response.request.headers}{cached_response.request.body}'
+        )
+        assert 'secret-value' not in persisted_content
+        assert 'REDACTED-' in persisted_content
+        persisted[label] = persisted_content
+
+    # Different identities must not be merged into the same placeholder
+    assert persisted['1'] != persisted['2']
+
+
+def test_redacted_parameters__ignored_parameters_precedence(mock_session):
+    """A param in both ignored_parameters and redacted_parameters should use ignored_parameters
+    semantics (excluded from matching, constant placeholder).
+    """
+    mock_session.settings.ignored_parameters = ['secret']
+    mock_session.settings.redacted_parameters = ['secret']
+    params_1 = {'secret': 'secret-value-1', 'param': 'value_1'}
+    params_2 = {'secret': 'secret-value-2', 'param': 'value_1'}
+
+    assert mock_session.get(MOCKED_URL, params=params_1).from_cache is False
+    assert mock_session.get(MOCKED_URL, params=params_2).from_cache is True
+    cached_response = mock_session.get(MOCKED_URL, params=params_1)
+    assert 'secret-value' not in cached_response.request.url
+    assert 'secret=REDACTED' in cached_response.request.url
+
+
+def test_redacted_parameters__redirect_history(mock_session):
+    """Sensitive values must not be persisted in redirect history or redirect aliases"""
+    mock_session.settings.redacted_parameters = ['token']
+    params = {'token': 'secret-value-1'}
+
+    assert mock_session.get(MOCKED_URL_REDIRECT, params=params).from_cache is False
+    cached_response = mock_session.get(MOCKED_URL_REDIRECT, params=params)
+    assert cached_response.from_cache is True
+    assert len(cached_response.history) == 1
+
+    persisted_content = ''
+    for response in mock_session.cache.filter():
+        persisted_content += response.url + response.request.url
+        for prev_response in response.history:
+            persisted_content += prev_response.url + prev_response.request.url
+    assert 'secret-value-1' not in persisted_content
+    assert 'REDACTED-' in cached_response.history[0].request.url
+
+
+def test_redacted_parameters__vary(mock_session):
+    """A redacted header required by Vary should still distinguish variants, via irreversible
+    placeholders rather than the persisted sensitive values.
+    """
+    url = f'{MOCKED_URL}/vary-redacted'
+    mock_session.mock_adapter.register_uri(
+        'GET', url, headers={'Vary': 'X-Token'}, text='mock response', status_code=200
+    )
+    mock_session.settings.redacted_parameters = ['X-Token']
+    headers_1 = {'X-Token': 'secret-value-1'}
+    headers_2 = {'X-Token': 'secret-value-2'}
+
+    assert mock_session.get(url, headers=headers_1).from_cache is False
+    assert mock_session.get(url, headers=headers_1).from_cache is True
+    # A different identity must not be served the first identity's cached response
+    assert mock_session.get(url, headers=headers_2).from_cache is False
+    assert mock_session.get(url, headers=headers_2).from_cache is True
+
+    for response in mock_session.cache.filter():
+        assert 'secret-value' not in str(response.request.headers)
+        assert 'X-Token' in response.request.headers
+
+
 # Variations of relevant request arguments
 # -----------------------------------------------------
 

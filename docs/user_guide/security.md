@@ -41,6 +41,24 @@ To append to the default list instead of replacing it:
 >>> session = CachedSession(ignored_parameters=ignored_parameters)
 ```
 
+(redact-params)=
+### Redacting Sensitive Info Without Affecting Matching
+The `ignored_parameters` option above excludes parameters from request matching, so requests with
+different values (for example, different users' tokens) will be treated as identical. If you instead
+want to keep matching on those values but avoid persisting them, use the `redacted_parameters`
+option:
+```python
+>>> session = CachedSession(redacted_parameters=['X-Nonstandard-Credential'])
+```
+
+This applies to request parameters, request headers, and request body params (JSON or form
+encoding). Redacted values are replaced with an irreversible, value-dependent placeholder (a hash
+of the original value) before being saved to the cache, including redirect history. Because the
+placeholder is derived from the original value, distinct values remain distinguishable, so
+request matching and {ref}`Vary <headers>` validation still work as if the original values were
+used. If a parameter is listed in both `ignored_parameters` and `redacted_parameters`,
+`ignored_parameters` takes precedence.
+
 However, there are cases where you would _not_ want to exclude this information from the cache;
 see section below.
 

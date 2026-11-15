@@ -7,7 +7,7 @@ from requests import PreparedRequest, Response
 from requests.structures import CaseInsensitiveDict
 
 from .._utils import coalesce
-from ..cache_keys import normalize_headers
+from ..cache_keys import normalize_headers, redact_request
 from ..models import RichMixin
 from . import (
     DO_NOT_CACHE,
@@ -393,7 +393,8 @@ class CacheActions(RichMixin):
 
         key_kwargs['match_headers'] = match_headers
         vary_key_cached = create_key(vary_request, **key_kwargs)
-        vary_key_current = create_key(self._request, **key_kwargs)
+        current_request = self._redacted_request()
+        vary_key_current = create_key(current_request, **key_kwargs)
         headers_match = vary_key_current == vary_key_cached
         if not headers_match:
             _log_vary_diff(
@@ -404,8 +405,21 @@ class CacheActions(RichMixin):
             # Compute secondary cache key with merged Vary + user match_headers
             merged = self._merge_match_headers(match_headers)
             key_kwargs['match_headers'] = merged
-            self.vary_cache_key = create_key(self._request, **key_kwargs)
+            self.vary_cache_key = create_key(current_request, **key_kwargs)
         return headers_match
+
+    def _redacted_request(self) -> PreparedRequest:
+        """Get a copy of the current request with any ``redacted_parameters`` transformed the same
+        way as persisted requests, so ``Vary`` validation compares equivalent values
+        """
+        redacted_parameters = self._settings.redacted_parameters
+        if not redacted_parameters:
+            return self._request
+        # Skip any params already transformed via ignored_parameters
+        redacted = set(redacted_parameters) - set(self._settings.ignored_parameters or [])
+        if not redacted:
+            return self._request
+        return redact_request(self._request.copy(), redacted, self._settings.content_root_key)
 
     def _cookies_match(self, cached_request: 'CachedRequest') -> bool:
         """Compare cookies between the current request and cached request for Vary: Cookie"""

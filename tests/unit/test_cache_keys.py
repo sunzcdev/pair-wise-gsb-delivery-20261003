@@ -15,8 +15,10 @@ from requests_cache.cache_keys import (
     create_key,
     normalize_headers,
     normalize_request,
+    redact_request,
     redact_response,
 )
+from requests_cache._utils import decode
 
 CACHE_KEY = 'e25f7e6326966e82'
 
@@ -108,6 +110,87 @@ def test_redact_response__escaped_params():
     )
     if hasattr(redacted_response.raw, 'url'):
         assert redacted_response.raw.url == 'https://img.site.com/base/img.jpg?where=code%3D123'
+
+
+def _mock_response(url, headers=None, body=None):
+    request = Request(method='GET', url=url, headers=headers, data=body).prepare()
+    response = Response()
+    response.url = url
+    response.request = request
+    response.raw = HTTPResponse(request_url=url)
+    return response
+
+
+def test_redact_response__redacted_parameters():
+    """redacted_parameters should be replaced with irreversible placeholders in persisted data"""
+    url = 'https://img.site.com/base/img.jpg?token=secret-value-1&param=1'
+    response = _mock_response(url, headers={'X-Token': 'secret-value-1'})
+    redacted_response = redact_response(response, [], ['token', 'X-Token'])
+
+    assert 'secret-value-1' not in redacted_response.url
+    assert 'secret-value-1' not in redacted_response.request.url
+    assert 'token=REDACTED-' in redacted_response.request.url
+    assert 'param=1' in redacted_response.request.url
+    assert redacted_response.request.headers['X-Token'].startswith('REDACTED-')
+
+
+def test_redact_response__redacted_parameters__distinct_placeholders():
+    """Different sensitive values must get different placeholders, and identical values must get
+    identical placeholders"""
+    url_1 = 'https://img.site.com/base/img.jpg?token=secret-value-1'
+    url_2 = 'https://img.site.com/base/img.jpg?token=secret-value-2'
+    redacted_1 = redact_response(_mock_response(url_1), [], ['token'])
+    redacted_2 = redact_response(_mock_response(url_2), [], ['token'])
+    redacted_1_again = redact_response(_mock_response(url_1), [], ['token'])
+
+    assert redacted_1.request.url != redacted_2.request.url
+    assert redacted_1.request.url == redacted_1_again.request.url
+
+
+def test_redact_response__redacted_parameters__history():
+    """Sensitive values must not be persisted in redirect history"""
+    prev_response = _mock_response('https://img.site.com/redirect?token=secret-value-1')
+    response = _mock_response('https://img.site.com/base/img.jpg?token=secret-value-1')
+    response.history = [prev_response]
+
+    redacted_response = redact_response(response, [], ['token'])
+    assert 'secret-value-1' not in redacted_response.history[0].url
+    assert 'secret-value-1' not in redacted_response.history[0].request.url
+    assert 'token=REDACTED-' in redacted_response.history[0].request.url
+
+
+def test_redact_request__json_body():
+    request = Request(
+        method='POST',
+        url='https://img.site.com/base/img.jpg',
+        data=b'{"token": "secret-value-1", "param": "1"}',
+        headers={'Content-Type': 'application/json'},
+    ).prepare()
+    redact_request(request, ['token'])
+    body = json.loads(request.body)
+    assert body['token'].startswith('REDACTED-')
+    assert body['param'] == '1'
+
+
+def test_redact_request__form_body():
+    request = Request(
+        method='POST',
+        url='https://img.site.com/base/img.jpg',
+        data={'token': 'secret-value-1', 'param': '1'},
+    ).prepare()
+    redact_request(request, ['token'])
+    body = decode(request.body)
+    assert 'secret-value-1' not in body
+    assert 'token=REDACTED-' in body
+    assert 'param=1' in body
+
+
+def test_redact_request__no_redacted_parameters():
+    request = Request(
+        method='GET',
+        url='https://img.site.com/base/img.jpg?token=secret-value-1',
+    ).prepare()
+    assert redact_request(request, None).url == request.url
 
 
 @pytest.mark.parametrize(
