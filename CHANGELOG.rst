@@ -1,6 +1,22 @@
 Changelog
 =========
 
+4.5.0 (unreleased)
+------------------
+
+Features:
+
+- Add ``partial_construct`` parameter to `Schema <marshmallow.Schema>`.
+  When enabled for collection loads, field-level and schema-level validation
+  run for all items first, then ``post_load`` processors run per item on the
+  valid items only. If any item fails, the ``valid_data`` of the raised
+  `ValidationError <marshmallow.exceptions.ValidationError>` is a
+  `marshmallow.PartialConstructResult` that maps the original indices of the
+  valid items to their constructed objects or canonical dictionaries.
+  Collection-level ``post_load`` processors (``pass_collection=True``) are
+  rejected at configuration time since they cannot be isolated per item.
+  Side effects of user-defined constructors are not rolled back.
+
 4.4.0 (2026-11-03)
 ------------------
 

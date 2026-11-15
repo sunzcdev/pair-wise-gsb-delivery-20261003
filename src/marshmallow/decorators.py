@@ -209,6 +209,11 @@ def post_load(
     If ``pass_original=True``, the original data (before deserializing) will be passed as
     an additional argument to the method.
 
+    .. note::
+        Methods using ``pass_collection=True`` are incompatible with the
+        ``partial_construct`` mode of `Schema <marshmallow.Schema>` because
+        collection-level processors cannot be isolated per item.
+
     .. versionchanged:: 3.0.0 ``partial`` and ``many`` are always passed as keyword arguments to
         the decorated method.
     .. versionchanged:: 4.0.0 ``pass_many`` is renamed to ``pass_collection``.

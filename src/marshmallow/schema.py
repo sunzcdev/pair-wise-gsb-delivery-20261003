@@ -43,6 +43,59 @@ if typing.TYPE_CHECKING:
     from marshmallow.fields import Field
 
 
+class PartialConstructResult(Mapping):
+    """Valid items from a collection load with ``partial_construct=True``,
+    keyed by the original index of each item in the input collection.
+
+    This is the type of ``valid_data`` on the
+    `ValidationError <marshmallow.exceptions.ValidationError>` raised when a
+    load with ``partial_construct=True`` reports errors.
+
+    .. attribute:: constructed
+
+        Items that were fully constructed by ``post_load`` processors,
+        as a `dict` mapping the original index to the constructed object.
+
+    .. attribute:: canonical
+
+        Validated dictionaries that were not constructed, either because the
+        schema defines no ``post_load`` processors or because construction
+        raised an error for that item. Keyed by original index.
+
+    Iteration, membership tests, and item access operate on the merged view
+    of both mappings, with constructed objects taking precedence.
+
+    .. versionadded:: 4.5.0
+    """
+
+    def __init__(
+        self,
+        *,
+        constructed: dict[int, typing.Any] | None = None,
+        canonical: dict[int, typing.Any] | None = None,
+    ):
+        self.constructed: dict[int, typing.Any] = dict(constructed or {})
+        self.canonical: dict[int, typing.Any] = dict(canonical or {})
+
+    def __getitem__(self, index: int) -> typing.Any:
+        try:
+            return self.constructed[index]
+        except KeyError:
+            return self.canonical[index]
+
+    def __iter__(self) -> typing.Iterator[int]:
+        return iter(self.constructed.keys() | self.canonical.keys())
+
+    def __len__(self) -> int:
+        return len(self.constructed.keys() | self.canonical.keys())
+
+    def __repr__(self) -> str:
+        return (
+            f"<{self.__class__.__name__}(constructed={self.constructed}, "
+            f"canonical={self.canonical})>"
+        )
+
+
 def _get_fields(attrs) -> list[tuple[str, Field]]:
     """Get fields from a class
 
@@ -268,12 +321,26 @@ class Schema(metaclass=SchemaMeta):
         will be ignored. Use dot delimiters to specify nested fields.
     :param unknown: Whether to exclude, include, or raise an error for unknown
         fields in the data. Use `EXCLUDE`, `INCLUDE` or `RAISE`.
+    :param partial_construct: If `True`, enable partial construction for
+        collection loads. Field-level and schema-level validation run for all
+        items first, then ``post_load`` processors run per item on the valid
+        items only. If any item fails validation or construction, a
+        `ValidationError <marshmallow.exceptions.ValidationError>` is raised
+        whose ``valid_data`` is a `PartialConstructResult` mapping the
+        original indices of the valid items to their constructed objects or
+        canonical dictionaries. Requires ``index_errors`` to be enabled and is
+        incompatible with ``post_load`` processors using
+        ``pass_collection=True``. Side effects of user-defined constructors
+        are not rolled back when a later item fails.
 
     .. versionchanged:: 3.0.0
         Remove ``prefix`` parameter.
 
     .. versionchanged:: 4.0.0
         Remove ``context`` parameter.
+
+    .. versionadded:: 4.5.0
+        Add ``partial_construct`` parameter.
     """
 
     TYPE_MAPPING: dict[type, type[Field]] = {
@@ -415,6 +482,7 @@ class Schema(metaclass=SchemaMeta):
         dump_only: types.StrSequenceOrSet = (),
         partial: bool | types.StrSequenceOrSet | None = None,
         unknown: types.UnknownOption | None = None,
+        partial_construct: bool = False,
     ):
         # Raise error if only or exclude is passed as string, not list of strings
         if only is not None and not is_collection(only):
@@ -434,6 +502,19 @@ class Schema(metaclass=SchemaMeta):
         self.unknown: types.UnknownOption = (
             self.opts.unknown if unknown is None else unknown
         )
+        self.partial_construct = partial_construct
+        if self.partial_construct:
+            if not self.opts.index_errors:
+                raise ValueError(
+                    "`partial_construct` requires `index_errors` to be enabled "
+                    "so that errors can be attributed to individual items."
+                )
+            if any(hook_many for _, hook_many, _ in self._hooks[POST_LOAD]):
+                raise ValueError(
+                    "`partial_construct` is incompatible with "
+                    "`@post_load(pass_collection=True)` because collection-level "
+                    "processors cannot be isolated per item."
+                )
         self._normalize_nested_options()
         #: Dictionary mapping field_names -> :class:`Field` objects
         self.fields: dict[str, Field] = {}
@@ -924,7 +1005,16 @@ class Schema(metaclass=SchemaMeta):
                 )
             errors = error_store.errors
             # Run post processors
-            if not errors and postprocess and self._hooks[POST_LOAD]:
+            if many and self.partial_construct and postprocess:
+                result = self._load_partial_construct(
+                    result,
+                    original_data=data,
+                    partial=partial,
+                    unknown=unknown,
+                    error_store=error_store,
+                )
+                errors = error_store.errors
+            elif not errors and postprocess and self._hooks[POST_LOAD]:
                 try:
                     result = self._invoke_load_processors(
                         POST_LOAD,
@@ -942,6 +1032,85 @@ class Schema(metaclass=SchemaMeta):
             raise exc
 
         return result
+
+    def _load_partial_construct(
+        self,
+        result: list[typing.Any],
+        *,
+        original_data,
+        partial: bool | types.StrSequenceOrSet | None,
+        unknown: types.UnknownOption | None,
+        error_store: ErrorStore,
+    ) -> list[typing.Any] | PartialConstructResult:
+        """Run per-item ``post_load`` processors on the valid items of a
+        collection, isolating construction failures per item.
+        This method is private API.
+
+        Returns the loaded collection if every valid item was constructed
+        successfully, otherwise a `PartialConstructResult` with the valid
+        items keyed by their original indices.
+        """
+        invalid_indices = {key for key in error_store.errors if isinstance(key, int)}
+        has_hooks = bool(self._hooks[POST_LOAD])
+        constructed: dict[int, typing.Any] = {}
+        canonical: dict[int, typing.Any] = {}
+        for index, item in enumerate(result):
+            if index in invalid_indices:
+                continue
+            if not has_hooks:
+                canonical[index] = item
+                continue
+            try:
+                constructed[index] = self._invoke_item_load_processors(
+                    item,
+                    index=index,
+                    original_data=original_data,
+                    partial=partial,
+                    unknown=unknown,
+                )
+            except ValidationError as err:
+                # Keep the construction error for this item. Already
+                # constructed items are left untouched and are not
+                # constructed again.
+                error_store.store_error(err.normalized_messages(), index=index)
+                canonical[index] = item
+        if error_store.errors:
+            return PartialConstructResult(constructed=constructed, canonical=canonical)
+        if has_hooks:
+            return [constructed[index] for index in range(len(result))]
+        return result
+
+    def _invoke_item_load_processors(
+        self,
+        item,
+        *,
+        index: int,
+        original_data,
+        partial: bool | types.StrSequenceOrSet | None,
+        unknown: types.UnknownOption | None,
+    ):
+        """Invoke per-item ``post_load`` processors on a single item of a
+        collection.
+        This method is private API.
+        """
+        try:
+            original_item = original_data[index]
+        except (IndexError, KeyError, TypeError):
+            original_item = None
+        data = item
+        for attr_name, hook_many, processor_kwargs in self._hooks[POST_LOAD]:
+            if hook_many:
+                # Collection-level processors are rejected at configuration
+                # time when `partial_construct` is enabled.
+                continue
+            processor = getattr(self, attr_name)
+            if processor_kwargs.get("pass_original", False):
+                data = processor(
+                    data, original_item, many=True, partial=partial, unknown=unknown
+                )
+            else:
+                data = processor(data, many=True, partial=partial, unknown=unknown)
+        return data
 
     def _normalize_nested_options(self) -> None:
         """Apply then flatten nested schema options.
