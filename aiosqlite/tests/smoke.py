@@ -535,3 +535,133 @@ class SmokeTest(IsolatedAsyncioTestCase):
         loop.close()
 
         db.stop()
+
+    async def test_executemany_async(self):
+        async def source():
+            for i in range(100):
+                yield (i, f"value-{i}")
+
+        async with aiosqlite.connect(self.db) as db:
+            await db.execute("create table foo (i integer primary key, k text)")
+            completed = await db.executemany_async(
+                "insert into foo (i, k) values (?, ?)", source(), chunk_size=8
+            )
+            self.assertEqual(completed, 100)
+
+            # implicitly opened transaction was committed for us
+            self.assertFalse(db.in_transaction)
+
+            async with db.execute("select count(*), sum(i) from foo") as cursor:
+                self.assertEqual(await cursor.fetchone(), (100, 4950))
+
+            # connection is still usable afterwards
+            async with db.execute("select k from foo where i = 42") as cursor:
+                self.assertEqual(await cursor.fetchone(), ("value-42",))
+
+    async def test_executemany_async_empty_source(self):
+        async def source():
+            return
+            yield  # pragma: no cover
+
+        async with aiosqlite.connect(self.db) as db:
+            await db.execute("create table foo (i integer)")
+            completed = await db.executemany_async(
+                "insert into foo (i) values (?)", source()
+            )
+            self.assertEqual(completed, 0)
+
+    async def test_executemany_async_source_error(self):
+        async def source():
+            for i in range(10):
+                yield (i,)
+            raise RuntimeError("source blew up")
+
+        async with aiosqlite.connect(self.db) as db:
+            await db.execute("create table foo (i integer)")
+            with self.assertRaises(aiosqlite.BulkExecuteError) as ctx:
+                await db.executemany_async(
+                    "insert into foo (i) values (?)", source(), chunk_size=4
+                )
+
+            # source failed while filling the third chunk, so only the two
+            # fully executed chunks (2 * chunk_size) count as progress
+            self.assertEqual(ctx.exception.completed, 8)
+            self.assertIsInstance(ctx.exception.__cause__, RuntimeError)
+
+            # connection is still usable afterwards
+            await db.rollback()
+            async with db.execute("select 1") as cursor:
+                self.assertEqual(await cursor.fetchone(), (1,))
+
+    async def test_executemany_async_integrity_error(self):
+        async def source():
+            for i in list(range(7)) + [3]:  # 3 violates the primary key
+                yield (i,)
+
+        async with aiosqlite.connect(self.db) as db:
+            await db.execute("create table foo (i integer primary key)")
+            with self.assertRaises(aiosqlite.BulkExecuteError) as ctx:
+                await db.executemany_async(
+                    "insert into foo (i) values (?)", source(), chunk_size=4
+                )
+
+            # exact record at which the constraint failed is reported
+            self.assertEqual(ctx.exception.completed, 7)
+            self.assertIsInstance(ctx.exception.__cause__, sqlite3.IntegrityError)
+
+            # nothing was committed automatically; caller owns the outcome
+            await db.rollback()
+            async with db.execute("select count(*) from foo") as cursor:
+                self.assertEqual(await cursor.fetchone(), (0,))
+
+    async def test_executemany_async_caller_transaction_not_committed(self):
+        async def source():
+            for i in range(5):
+                yield (i,)
+
+        async with aiosqlite.connect(self.db) as db:
+            await db.execute("create table foo (i integer)")
+            await db.execute("begin")
+            completed = await db.executemany_async(
+                "insert into foo (i) values (?)", source(), chunk_size=2
+            )
+            self.assertEqual(completed, 5)
+
+            # caller-held transaction is left untouched
+            self.assertTrue(db.in_transaction)
+            await db.rollback()
+            async with db.execute("select count(*) from foo") as cursor:
+                self.assertEqual(await cursor.fetchone(), (0,))
+
+    async def test_executemany_async_cancelled(self):
+        started = asyncio.Event()
+
+        async def source():
+            for i in range(1000):
+                if i == 0:
+                    started.set()
+                await asyncio.sleep(0.001)
+                yield (i,)
+
+        async with aiosqlite.connect(self.db) as db:
+            await db.execute("create table foo (i integer)")
+            task = asyncio.ensure_future(
+                db.executemany_async(
+                    "insert into foo (i) values (?)", source(), chunk_size=4
+                )
+            )
+            await started.wait()
+            task.cancel()
+
+            with self.assertRaises(asyncio.CancelledError) as ctx:
+                await task
+
+            # accurate progress is reported on the cancellation
+            completed = ctx.exception.completed
+            self.assertGreaterEqual(completed, 0)
+            self.assertLess(completed, 1000)
+
+            # connection is still usable afterwards
+            await db.rollback()
+            async with db.execute("select 1") as cursor:
+                self.assertEqual(await cursor.fetchone(), (1,))

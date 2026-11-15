@@ -8,7 +8,7 @@ Core implementation of aiosqlite proxies
 import asyncio
 import logging
 import sqlite3
-from collections.abc import AsyncIterator, Generator, Iterable
+from collections.abc import AsyncIterable, AsyncIterator, Generator, Iterable
 from functools import partial
 from pathlib import Path
 from queue import Empty, Queue, SimpleQueue
@@ -19,7 +19,7 @@ from warnings import warn
 from .context import contextmanager
 from .cursor import Cursor
 
-__all__ = ["connect", "Connection", "Cursor"]
+__all__ = ["connect", "Connection", "Cursor", "BulkExecuteError"]
 
 AuthorizerCallback = Callable[[int, str, str, str, str], int]
 
@@ -27,6 +27,24 @@ LOG = logging.getLogger("aiosqlite")
 
 
 IsolationLevel = Optional[Literal["DEFERRED", "IMMEDIATE", "EXCLUSIVE"]]
+
+
+class BulkExecuteError(Exception):
+    """
+    Error raised by :meth:`Connection.executemany_async` when the source
+    async iterable or the database fails partway through a bulk operation.
+
+    ``completed`` is the number of records successfully executed before the
+    failure, and the original exception is available as ``original`` (and as
+    ``__cause__``).
+    """
+
+    def __init__(self, completed: int, original: BaseException) -> None:
+        self.completed = completed
+        self.original = original
+        super().__init__(
+            f"bulk execution failed after {completed} record(s): {original!r}"
+        )
 
 
 def set_result(fut: asyncio.Future, result: Any) -> None:
@@ -147,6 +165,28 @@ class Connection:
         cursor = self._conn.execute(sql, parameters)
         return cursor.fetchall()
 
+    def _execute_many_chunk(self, sql: str, chunk: list) -> int:
+        """
+        Execute a chunk of parameter sets, one record at a time, on the
+        connection thread. Returns the number of records executed.
+
+        If a record fails, the raised exception gets a ``chunk_completed``
+        attribute with the number of records executed within this chunk
+        before the failure, so the caller can report accurate progress.
+        """
+        cursor = self._conn.cursor()
+        completed = 0
+        try:
+            for parameters in chunk:
+                cursor.execute(sql, parameters)
+                completed += 1
+        except BaseException as e:  # noqa B036
+            e.chunk_completed = completed  # type: ignore[attr-defined]
+            raise
+        finally:
+            cursor.close()
+        return completed
+
     async def _execute(self, fn, *args, **kwargs):
         """Queue a function with the given arguments for execution."""
         if not self._running or not self._connection:
@@ -248,6 +288,100 @@ class Connection:
         """Helper to create a cursor and execute the given multiquery."""
         cursor = await self._execute(self._conn.executemany, sql, parameters)
         return Cursor(self, cursor)
+
+    async def executemany_async(
+        self,
+        sql: str,
+        parameters: AsyncIterable[Iterable[Any]],
+        *,
+        chunk_size: Optional[int] = None,
+    ) -> int:
+        """
+        Execute the given query against records pulled from an async iterable.
+
+        Records are collected from the async iterable on the event loop in
+        bounded chunks of at most ``chunk_size`` records (defaulting to the
+        connection's ``iter_chunk_size``), and each chunk is handed to the
+        connection thread for execution. The source is never awaited on the
+        sqlite thread, and records are never fully materialized in memory.
+
+        Returns the total number of records successfully executed.
+
+        If the source iterable or the database fails partway through, a
+        :class:`BulkExecuteError` is raised whose ``completed`` attribute
+        gives the exact number of records executed before the failure; the
+        original exception is available as ``__cause__``. If the operation
+        is cancelled, the ``asyncio.CancelledError`` is re-raised with a
+        ``completed`` attribute after any in-flight chunk has settled, and
+        the connection remains usable for further operations.
+
+        Transactions are left to the caller: if a transaction was already
+        open when this method was called, it is neither committed nor rolled
+        back automatically. Otherwise, an implicitly opened transaction is
+        committed once all records have been executed successfully.
+        """
+        if chunk_size is None:
+            chunk_size = self._iter_chunk_size
+        if chunk_size < 1:
+            raise ValueError("chunk_size must be a positive integer")
+
+        completed = 0
+        caller_owns_transaction = self._conn.in_transaction
+        iterator = parameters.__aiter__()
+        exhausted = False
+
+        try:
+            while not exhausted:
+                # Collect a bounded chunk of records on the event loop.
+                chunk: list = []
+                try:
+                    while len(chunk) < chunk_size:
+                        chunk.append(await iterator.__anext__())
+                except StopAsyncIteration:
+                    exhausted = True
+                except asyncio.CancelledError:
+                    raise
+                except BaseException as e:  # noqa B036
+                    raise BulkExecuteError(completed, e) from e
+
+                if not chunk:
+                    break
+
+                # Hand the chunk to the connection thread. Shield it so that
+                # cancellation does not abandon an in-flight chunk, letting
+                # us report accurate progress before re-raising.
+                task = asyncio.ensure_future(
+                    self._execute(self._execute_many_chunk, sql, chunk)
+                )
+                try:
+                    completed += await asyncio.shield(task)
+                except asyncio.CancelledError:
+                    try:
+                        completed += await task
+                    except asyncio.CancelledError:
+                        pass
+                    except BaseException as e:  # noqa B036
+                        completed += getattr(e, "chunk_completed", 0)
+                    raise
+                except BaseException as e:  # noqa B036
+                    completed += getattr(e, "chunk_completed", 0)
+                    raise BulkExecuteError(completed, e) from e
+
+            if not caller_owns_transaction and self._conn.in_transaction:
+                await self.commit()
+
+            return completed
+
+        except asyncio.CancelledError as cancel:
+            cancel.completed = completed  # type: ignore[attr-defined]
+            raise
+        finally:
+            aclose = getattr(iterator, "aclose", None)
+            if aclose is not None:
+                try:
+                    await aclose()
+                except Exception:
+                    LOG.debug("exception while closing source iterable", exc_info=True)
 
     @contextmanager
     async def executescript(self, sql_script: str) -> Cursor:
