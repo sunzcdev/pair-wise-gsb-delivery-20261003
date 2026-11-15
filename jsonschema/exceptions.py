@@ -231,6 +231,124 @@ class SchemaError(_Error):
     _word_for_instance_in_error_message = "schema"
 
 
+class ValidationIncomplete(Exception):
+    """
+    Validation stopped before a definite verdict could be reached.
+
+    Unlike `ValidationError`, this is not a statement that the instance is
+    invalid. It indicates that the validator ran out of budget or observed a
+    cancellation request, so the result is unknown.
+
+    ``errors`` contains any business errors which had already been produced
+    before validation stopped. They are a partial result, not a complete list
+    of validation failures.
+    """
+
+    def __init__(
+        self,
+        message: str | None = None,
+        *,
+        reason: str,
+        budget=None,
+        errors=(),
+        keyword: str | None = None,
+        reference: str | None = None,
+    ) -> None:
+        self.reason = reason
+        self.budget = budget
+        self.errors = self.partial_errors = list(errors)
+        self.keyword = keyword
+        self.reference = reference
+        self.complete = False
+        self.incomplete = True
+        self.status = "incomplete"
+
+        if message is None:
+            if reason == "cancelled":
+                message = "Validation is incomplete: it was cancelled"
+            else:
+                message = (
+                    "Validation is incomplete: the work budget was exhausted"
+                )
+        self.message = message
+        super().__init__(message)
+
+    @property
+    def cancelled(self) -> bool:
+        return self.reason == "cancelled"
+
+    @property
+    def canceled(self) -> bool:
+        return self.cancelled
+
+    @property
+    def stop_reason(self) -> str:
+        return self.reason
+
+    @property
+    def context(self):
+        return self.errors
+
+    @property
+    def exhausted(self) -> bool:
+        return self.reason == "budget"
+
+    @property
+    def keyword_steps(self) -> int | None:
+        if self.budget is None:
+            return None
+        return self.budget.keyword_steps
+
+    @property
+    def reference_edges(self) -> int | None:
+        if self.budget is None:
+            return None
+        return self.budget.reference_edges
+
+    def __str__(self) -> str:
+        details = []
+        if self.keyword is not None:
+            details.append(f"next keyword: {self.keyword!r}")
+        if self.reference is not None:
+            details.append(f"next reference: {self.reference!r}")
+        if self.budget is not None:
+            details.append(
+                "keyword steps: "
+                f"{self.budget.keyword_steps}/{self.budget.max_keyword_steps}",
+            )
+            details.append(
+                "reference edges: "
+                f"{self.budget.reference_edges}/"
+                f"{self.budget.max_reference_edges}",
+            )
+        if self.errors:
+            details.append(f"partial errors: {len(self.errors)}")
+        if details:
+            return f"{self.message} ({'; '.join(details)})"
+        return self.message
+
+
+class BudgetExceeded(ValidationIncomplete):
+    """Validation stopped because its work budget was exhausted."""
+
+    def __init__(self, message: str | None = None, **kwargs) -> None:
+        super().__init__(message, reason="budget", **kwargs)
+
+
+class ValidationCancelled(ValidationIncomplete):
+    """Validation stopped because a cancellation check requested it."""
+
+    def __init__(self, message: str | None = None, **kwargs) -> None:
+        super().__init__(message, reason="cancelled", **kwargs)
+
+
+# Useful spellings for callers which name these outcomes differently.
+ValidationAborted = ValidationIncomplete
+ValidationInterrupted = ValidationIncomplete
+BudgetExhausted = BudgetExceeded
+ValidationCanceled = ValidationCancelled
+
+
 @define(slots=False)
 class _RefResolutionError(Exception):  # noqa: PLW1641
     """

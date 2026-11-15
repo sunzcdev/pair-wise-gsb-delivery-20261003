@@ -41,6 +41,314 @@ _VALIDATORS: dict[str, Validator] = {}
 _META_SCHEMAS = _utils.URIDict()
 
 
+class ValidationBudget:
+    """
+    A deterministic work budget for one validation invocation.
+
+    Budgets are shared by all validators which are descended into during a
+    single call, including validators created for references and combinators.
+
+    Arguments:
+
+        max_keyword_steps:
+
+            the maximum number of keyword validator steps which may be
+            executed, or `None` for no limit
+
+        max_reference_edges:
+
+            the maximum number of reference edges which may be entered, or
+            `None` for no limit
+
+        cancel_check:
+
+            an optional callable which is consulted before each step and
+            reference edge. A truthy result stops validation with a
+            `jsonschema.exceptions.ValidationCancelled` terminal state.
+            Objects with an ``is_set()`` method (such as
+            :class:`threading.Event`) and constant booleans are also accepted.
+
+    ``max_steps`` and ``max_refs`` are accepted as shorter aliases for the
+    two limits. Counters are exposed as `keyword_steps` and
+    `reference_edges`; `steps` and `refs` are aliases for convenience.
+    """
+
+    def __init__(
+        self,
+        max_keyword_steps=None,
+        max_reference_edges=None,
+        cancel_check=None,
+        *,
+        max_steps=None,
+        max_refs=None,
+        is_cancelled=None,
+        should_cancel=None,
+    ):
+        max_keyword_steps = self._coalesce(
+            "max_keyword_steps",
+            max_keyword_steps,
+            max_steps,
+        )
+        max_reference_edges = self._coalesce(
+            "max_reference_edges",
+            max_reference_edges,
+            max_refs,
+        )
+        for name, value in (
+            ("max_keyword_steps", max_keyword_steps),
+            ("max_reference_edges", max_reference_edges),
+        ):
+            if value is not None and (
+                isinstance(value, bool)
+                or not isinstance(value, int)
+                or value < 0
+            ):
+                raise ValueError(
+                    f"{name} must be a non-negative integer or None",
+                )
+
+        self.max_keyword_steps = max_keyword_steps
+        self.max_reference_edges = max_reference_edges
+        self.keyword_steps = 0
+        self.reference_edges = 0
+        self.reason = None
+        self.last_keyword = None
+        self.last_reference = None
+        self._partial_errors = []
+        self._recorded_errors = set()
+        self._cancel_check = self._normalize_cancel_check(
+            cancel_check,
+            is_cancelled,
+            should_cancel,
+        )
+
+    @staticmethod
+    def _coalesce(name, primary, alias):
+        if primary is not None and alias is not None and primary != alias:
+            raise TypeError(f"{name} and its alias specify different values")
+        return primary if primary is not None else alias
+
+    @staticmethod
+    def _normalize_cancel_check(*candidates):
+        provided = [each for each in candidates if each is not None]
+        if len(provided) > 1:
+            raise TypeError("multiple cancellation checks were provided")
+        if not provided:
+            return None
+
+        check = provided[0]
+        is_set = getattr(check, "is_set", None)
+        if callable(is_set):
+            return is_set
+        if callable(check):
+            return check
+        if isinstance(check, bool):
+            return lambda: check
+        raise TypeError(
+            "cancel_check must be callable, boolean, or have is_set",
+        )
+
+    @property
+    def max_steps(self):
+        return self.max_keyword_steps
+
+    @property
+    def max_refs(self):
+        return self.max_reference_edges
+
+    @property
+    def cancel_check(self):
+        return self._cancel_check
+
+    @cancel_check.setter
+    def cancel_check(self, value):
+        self._cancel_check = self._normalize_cancel_check(value)
+
+    @property
+    def steps(self):
+        return self.keyword_steps
+
+    @property
+    def refs(self):
+        return self.reference_edges
+
+    @property
+    def keyword_step_count(self):
+        return self.keyword_steps
+
+    @property
+    def reference_edge_count(self):
+        return self.reference_edges
+
+    @property
+    def remaining_keyword_steps(self):
+        if self.max_keyword_steps is None:
+            return None
+        return max(0, self.max_keyword_steps - self.keyword_steps)
+
+    @property
+    def remaining_reference_edges(self):
+        if self.max_reference_edges is None:
+            return None
+        return max(0, self.max_reference_edges - self.reference_edges)
+
+    @property
+    def errors(self):
+        return list(self._partial_errors)
+
+    @property
+    def partial_errors(self):
+        return self.errors
+
+    @property
+    def exhausted(self):
+        return self.reason == "budget"
+
+    @property
+    def cancelled(self):
+        return self.reason == "cancelled"
+
+    @property
+    def is_cancelled(self):
+        return self.cancelled
+
+    @property
+    def incomplete(self):
+        return self.reason is not None
+
+    @property
+    def complete(self):
+        return self.reason is None
+
+    @property
+    def stop_reason(self):
+        return self.reason
+
+    def as_dict(self):
+        """Return a stable snapshot of counters, limits, and stop reason."""
+        return {
+            "keyword_steps": self.keyword_steps,
+            "reference_edges": self.reference_edges,
+            "max_keyword_steps": self.max_keyword_steps,
+            "max_reference_edges": self.max_reference_edges,
+            "reason": self.reason,
+            "keyword": self.last_keyword,
+            "reference": self.last_reference,
+            "errors": len(self._partial_errors),
+        }
+
+    def reset(self):
+        """Reset counters and the stop state so the budget can be reused."""
+        self.keyword_steps = 0
+        self.reference_edges = 0
+        self.reason = None
+        self.last_keyword = None
+        self.last_reference = None
+        self._partial_errors.clear()
+        self._recorded_errors.clear()
+
+    def check_cancel(self):
+        """Stop if this invocation has been cancelled."""
+        self._raise_if_stopped()
+        if self._cancel_check is not None and self._cancel_check():
+            self._stop(
+                exceptions.ValidationCancelled,
+                "Validation is incomplete: it was cancelled",
+            )
+
+    check_cancelled = check_cancel
+    check_canceled = check_cancel
+
+    def enter_keyword(self, keyword=None):
+        """Account for a keyword step, stopping before it if necessary."""
+        self.check_cancel()
+        if (
+            self.max_keyword_steps is not None
+            and self.keyword_steps >= self.max_keyword_steps
+        ):
+            self.last_keyword = keyword
+            self._stop(
+                exceptions.BudgetExceeded,
+                "Validation is incomplete: keyword step budget "
+                "was exhausted",
+                keyword=keyword,
+            )
+        self.keyword_steps += 1
+        self.last_keyword = keyword
+
+    def enter_reference(self, reference=None):
+        """Account for a reference edge, stopping before it if necessary."""
+        self.check_cancel()
+        if (
+            self.max_reference_edges is not None
+            and self.reference_edges >= self.max_reference_edges
+        ):
+            self.last_reference = reference
+            self._stop(
+                exceptions.BudgetExceeded,
+                "Validation is incomplete: reference edge budget "
+                "was exhausted",
+                reference=reference,
+            )
+        self.reference_edges += 1
+        self.last_reference = reference
+
+    def record_error(self, error):
+        """Remember a business error produced before validation stopped."""
+        if id(error) not in self._recorded_errors:
+            self._recorded_errors.add(id(error))
+            self._partial_errors.append(error)
+
+    def _raise_if_stopped(self):
+        if self.reason == "cancelled":
+            raise exceptions.ValidationCancelled(
+                budget=self,
+                errors=self._partial_errors,
+                keyword=self.last_keyword,
+                reference=self.last_reference,
+            )
+        elif self.reason == "budget":
+            raise exceptions.BudgetExceeded(
+                budget=self,
+                errors=self._partial_errors,
+                keyword=self.last_keyword,
+                reference=self.last_reference,
+            )
+
+    def _stop(self, exception_type, message, *, keyword=None, reference=None):
+        self.reason = (
+            "cancelled"
+            if exception_type is exceptions.ValidationCancelled
+            else "budget"
+        )
+        if keyword is not None:
+            self.last_keyword = keyword
+        if reference is not None:
+            self.last_reference = reference
+        raise exception_type(
+            message,
+            budget=self,
+            errors=self._partial_errors,
+            keyword=self.last_keyword,
+            reference=self.last_reference,
+        )
+
+    def __repr__(self):
+        return (
+            f"{self.__class__.__name__}("
+            f"keyword_steps={self.keyword_steps}, "
+            f"reference_edges={self.reference_edges}, "
+            f"reason={self.reason!r})"
+        )
+
+
+WorkBudget = ValidationBudget
+Budget = ValidationBudget
+ValidationIncomplete = exceptions.ValidationIncomplete
+BudgetExceeded = exceptions.BudgetExceeded
+ValidationCancelled = exceptions.ValidationCancelled
+
+
 def __getattr__(name):
     if name == "ErrorTree":
         warnings.warn(
@@ -249,6 +557,13 @@ def create(
             kw_only=True,
             repr=False,
         )
+        _budget = field(
+            default=None,
+            kw_only=True,
+            repr=False,
+            eq=False,
+            alias="budget",
+        )
 
         def __init_subclass__(cls):
             warnings.warn(
@@ -339,6 +654,35 @@ def create(
                 )
             return self._ref_resolver
 
+        @property
+        def budget(self):
+            """The work budget shared by this validation invocation."""
+            return self._budget
+
+        @budget.setter
+        def budget(self, value):
+            self._budget = value
+
+        @property
+        def work_budget(self):
+            return self._budget
+
+        def _budget_step(self, keyword):
+            if self._budget is not None:
+                self._budget.enter_keyword(keyword)
+
+        def _budget_reference(self, reference):
+            if self._budget is not None:
+                self._budget.enter_reference(reference)
+
+        def _budget_record(self, error):
+            if self._budget is not None:
+                self._budget.record_error(error)
+
+        def _budget_cancel(self):
+            if self._budget is not None:
+                self._budget.check_cancel()
+
         def evolve(self, **changes):
             schema = changes.setdefault("schema", self.schema)
             NewValidator = validator_for(schema, default=self.__class__)
@@ -349,7 +693,14 @@ def create(
 
             return NewValidator(**changes)
 
-        def iter_errors(self, instance, _schema=None):
+        def iter_errors(self, instance, _schema=None, *, budget=_UNSET):
+            if isinstance(_schema, ValidationBudget) and budget is _UNSET:
+                budget, _schema = _schema, None
+
+            if budget is not _UNSET:
+                self = self.evolve(budget=budget)
+            self._budget_cancel()
+
             if _schema is not None:
                 warnings.warn(
                     (
@@ -372,16 +723,20 @@ def create(
             if _schema is True:
                 return
             elif _schema is False:
-                yield exceptions.ValidationError(
+                error = exceptions.ValidationError(
                     f"False schema does not allow {instance!r}",
                     validator=None,
                     validator_value=None,
                     instance=instance,
                     schema=_schema,
                 )
+                self._budget_record(error)
+                yield error
+                self._budget_cancel()
                 return
 
             for validator, k, v in validators:
+                self._budget_step(k)
                 errors = validator(self, v, instance, _schema) or ()
                 for error in errors:
                     # set details if not already set by the called fn
@@ -394,7 +749,9 @@ def create(
                     )
                     if k not in {"if", "$ref"}:
                         error.schema_path.appendleft(k)
+                    self._budget_record(error)
                     yield error
+                self._budget_cancel()
 
         def descend(
             self,
@@ -404,10 +761,12 @@ def create(
             schema_path=None,
             resolver=None,
         ):
+            self._budget_cancel()
+
             if schema is True:
                 return
             elif schema is False:
-                yield exceptions.ValidationError(
+                error = exceptions.ValidationError(
                     f"False schema does not allow {instance!r}",
                     validator=None,
                     validator_value=None,
@@ -416,6 +775,9 @@ def create(
                     path=() if path is None else (path,),
                     schema_path=() if schema_path is None else (schema_path,),
                 )
+                self._budget_record(error)
+                yield error
+                self._budget_cancel()
                 return
 
             if self._ref_resolver is not None:
@@ -432,6 +794,7 @@ def create(
                 if validator is None:
                     continue
 
+                evolved._budget_step(k)
                 errors = validator(evolved, v, instance, schema) or ()
                 for error in errors:
                     # set details if not already set by the called fn
@@ -448,7 +811,9 @@ def create(
                         error.path.appendleft(path)
                     if schema_path is not None:
                         error.schema_path.appendleft(schema_path)
+                    evolved._budget_record(error)
                     yield error
+                evolved._budget_cancel()
 
         def validate(self, *args, **kwargs):
             for error in self.iter_errors(*args, **kwargs):
@@ -462,6 +827,8 @@ def create(
                 raise exc from None
 
         def _validate_reference(self, ref, instance):
+            self._budget_reference(ref)
+
             if self._ref_resolver is None:
                 try:
                     resolved = self._resolver.lookup(ref)
@@ -487,7 +854,10 @@ def create(
                     finally:
                         self._ref_resolver.pop_scope()
 
-        def is_valid(self, instance, _schema=None):
+        def is_valid(self, instance, _schema=None, *, budget=_UNSET):
+            if isinstance(_schema, ValidationBudget) and budget is _UNSET:
+                budget, _schema = _schema, None
+
             if _schema is not None:
                 warnings.warn(
                     (
@@ -501,7 +871,7 @@ def create(
                 )
                 self = self.evolve(schema=_schema)
 
-            error = next(self.iter_errors(instance), None)
+            error = next(self.iter_errors(instance, budget=budget), None)
             return error is None
 
     evolve_fields = [

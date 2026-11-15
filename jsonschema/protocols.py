@@ -27,6 +27,7 @@ if TYPE_CHECKING:
 
     from jsonschema import _typing
     from jsonschema.exceptions import ValidationError
+    from jsonschema.validators import ValidationBudget
     import jsonschema
     import jsonschema.validators
 
@@ -82,6 +83,13 @@ class Validator(Protocol):
             its `extra (optional) dependencies <index:extras>` when
             invoking ``pip``.
 
+        budget:
+
+            an optional `jsonschema.validators.ValidationBudget` which
+            limits the keyword steps and reference edges for validation.
+            The same budget is shared by validators descended into during
+            the invocation.
+
     .. deprecated:: v4.12.0
 
         Subclassing validator classes now explicitly warns this is not part of
@@ -119,6 +127,7 @@ class Validator(Protocol):
         format_checker: jsonschema.FormatChecker | None = None,
         *,
         registry: referencing.jsonschema.SchemaRegistry = ...,
+        budget: ValidationBudget | None = None,
     ) -> None: ...
 
     @classmethod
@@ -160,7 +169,12 @@ class Validator(Protocol):
 
         """
 
-    def is_valid(self, instance: Any) -> bool:
+    def is_valid(
+        self,
+        instance: Any,
+        *,
+        budget: ValidationBudget | None = ...,
+    ) -> bool:
         """
         Check if the instance is valid under the current `schema`.
 
@@ -172,9 +186,20 @@ class Validator(Protocol):
         >>> Draft202012Validator(schema).is_valid([2, 3, 4])
         False
 
+        Raises:
+
+            `jsonschema.exceptions.ValidationIncomplete`:
+
+                if the supplied work budget is exhausted or cancelled
+
         """
 
-    def iter_errors(self, instance: Any) -> Iterable[ValidationError]:
+    def iter_errors(
+        self,
+        instance: Any,
+        *,
+        budget: ValidationBudget | None = ...,
+    ) -> Iterable[ValidationError]:
         r"""
         Lazily yield each of the validation errors in the given instance.
 
@@ -189,13 +214,24 @@ class Validator(Protocol):
         4 is not one of [1, 2, 3]
         [2, 3, 4] is too long
 
+        Raises:
+
+            `jsonschema.exceptions.ValidationIncomplete`:
+
+                if the supplied work budget is exhausted or cancelled
+
         .. deprecated:: v4.0.0
 
             Calling this function with a second schema argument is deprecated.
             Use `Validator.evolve` instead.
         """
 
-    def validate(self, instance: Any) -> None:
+    def validate(
+        self,
+        instance: Any,
+        *,
+        budget: ValidationBudget | None = ...,
+    ) -> None:
         """
         Check if the instance is valid under the current `schema`.
 
@@ -210,6 +246,12 @@ class Validator(Protocol):
         Traceback (most recent call last):
             ...
         ValidationError: [2, 3, 4] is too long
+
+        Raises:
+
+            `jsonschema.exceptions.ValidationIncomplete`:
+
+                if the supplied work budget is exhausted or cancelled
 
         """
 

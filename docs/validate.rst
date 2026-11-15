@@ -24,6 +24,50 @@ The simplest way to validate an instance under a given schema is to use the `val
    Accepting untrusted schemas as input, especially when combined with untrusted data to validate, can lead to vulnerabilities even when restricting to official JSON Schema dialects and vocabularies.
    Never validate data against schemas from untrusted sources without proper sandboxing or input validation.
 
+Validation Work Budgets
+-----------------------
+
+For a single invocation, a `jsonschema.validators.ValidationBudget` can cap
+the number of keyword steps and the number of reference edges which validation
+may enter. The same budget is shared by all validators descended into during
+the invocation, including validators used by combinators and :kw:`$ref`.
+
+.. testcode::
+
+    from jsonschema import Draft202012Validator, ValidationBudget
+
+    budget = ValidationBudget(max_keyword_steps=100, max_reference_edges=20)
+    validator = Draft202012Validator({"type": "object"})
+    list(validator.iter_errors({"name": "example"}, budget=budget))
+
+The counters are deterministic: a keyword step is counted immediately before
+the keyword validator runs, and a reference edge immediately before it is
+resolved. A step or edge which would exceed its limit is not entered, so the
+counters identify the stop point reproducibly. Use
+`jsonschema.validators.ValidationBudget.as_dict` for a snapshot.
+
+.. autoclass:: jsonschema.validators.ValidationBudget
+    :noindex:
+
+If a limit is reached, or if the optional cancellation check returns true,
+validation raises `jsonschema.exceptions.ValidationIncomplete` rather than
+returning a verdict. This is intentionally distinct from
+`jsonschema.exceptions.ValidationError`, so it cannot be mistaken for a
+failed schema branch and retried by :kw:`anyOf`, :kw:`oneOf`, or similar
+combinators. Business errors which were already produced remain available
+through the exception's ``errors`` (also ``partial_errors``) attribute.
+
+.. autoexception:: jsonschema.exceptions.ValidationIncomplete
+    :noindex:
+
+.. autoexception:: jsonschema.exceptions.BudgetExceeded
+    :noindex:
+
+.. autoexception:: jsonschema.exceptions.ValidationCancelled
+    :noindex:
+
+Without a budget the default validation path is unchanged.
+
 .. _validator-protocol:
 
 The Validator Protocol

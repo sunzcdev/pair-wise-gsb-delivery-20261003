@@ -2309,6 +2309,216 @@ class TestValidate(TestCase):
         self.assertIn("12 is less than the minimum of 20", str(e.exception))
 
 
+class TestValidationBudget(TestCase):
+    schema = {"type": "integer", "minimum": 0}
+
+    def test_default_path_has_no_budget(self):
+        validator = validators.Draft202012Validator(self.schema)
+        errors = list(validator.iter_errors("not an integer"))
+
+        self.assertEqual(len(errors), 1)
+        self.assertIsNone(validator.budget)
+
+    def test_keyword_steps_are_counted_reproducibly(self):
+        snapshots = []
+        for _ in range(2):
+            budget = validators.ValidationBudget(max_keyword_steps=2)
+            validator = validators.Draft202012Validator(self.schema)
+            errors = list(
+                validator.iter_errors("not an integer", budget=budget),
+            )
+
+            self.assertEqual(len(errors), 1)
+            self.assertEqual(budget.keyword_steps, 2)
+            self.assertEqual(budget.reference_edges, 0)
+            self.assertFalse(budget.incomplete)
+            snapshots.append(budget.as_dict())
+
+        self.assertEqual(snapshots[0], snapshots[1])
+
+    def test_exhaustion_keeps_partial_errors(self):
+        budget = validators.ValidationBudget(max_steps=1)
+        validator = validators.Draft202012Validator(self.schema)
+
+        with self.assertRaises(exceptions.BudgetExceeded) as caught:
+            list(validator.iter_errors("not an integer", budget=budget))
+
+        error = caught.exception
+        self.assertIsInstance(error, exceptions.ValidationIncomplete)
+        self.assertNotIsInstance(error, exceptions.ValidationError)
+        self.assertEqual(error.reason, "budget")
+        self.assertEqual(budget.keyword_steps, 1)
+        self.assertEqual(error.keyword, "minimum")
+        self.assertEqual(len(error.errors), 1)
+        self.assertIn("not an integer", error.errors[0].message)
+
+    def test_reference_edges_are_counted_across_children(self):
+        schema = {
+            "$defs": {
+                "first": {"$ref": "#/$defs/second"},
+                "second": {"type": "integer"},
+            },
+            "$ref": "#/$defs/first",
+        }
+
+        complete = validators.ValidationBudget(max_refs=2)
+        validator = validators.Draft202012Validator(schema)
+        self.assertEqual(list(validator.iter_errors(12, budget=complete)), [])
+        self.assertEqual(
+            (complete.keyword_steps, complete.reference_edges),
+            (3, 2),
+        )
+
+        stopped = validators.ValidationBudget(max_refs=1)
+        with self.assertRaises(exceptions.BudgetExceeded) as caught:
+            list(validator.iter_errors(12, budget=stopped))
+
+        self.assertEqual(
+            (stopped.keyword_steps, stopped.reference_edges),
+            (2, 1),
+        )
+        self.assertEqual(caught.exception.reference, "#/$defs/second")
+
+    def test_recursive_references_stop_deterministically(self):
+        schema = {
+            "$defs": {"node": {"$ref": "#/$defs/node"}},
+            "$ref": "#/$defs/node",
+        }
+        budget = validators.ValidationBudget(max_refs=3)
+        validator = validators.Draft202012Validator(schema)
+
+        with self.assertRaises(exceptions.BudgetExceeded) as caught:
+            list(validator.iter_errors(12, budget=budget))
+
+        self.assertEqual(
+            (budget.keyword_steps, budget.reference_edges),
+            (4, 3),
+        )
+        self.assertEqual(caught.exception.reference, "#/$defs/node")
+
+    def test_cancellation_is_an_independent_terminal_state(self):
+        budget = validators.ValidationBudget(cancel_check=True)
+        validator = validators.Draft202012Validator(self.schema)
+
+        with self.assertRaises(exceptions.ValidationCancelled) as caught:
+            list(validator.iter_errors(0, budget=budget))
+
+        self.assertTrue(caught.exception.cancelled)
+        self.assertEqual(
+            (budget.keyword_steps, budget.reference_edges),
+            (0, 0),
+        )
+        self.assertEqual(budget.reason, "cancelled")
+
+    def test_cancellation_keeps_errors_already_yielded(self):
+        cancelled = [False]
+        budget = validators.ValidationBudget(
+            cancel_check=lambda: cancelled[0],
+        )
+        validator = validators.Draft202012Validator(self.schema)
+        errors = validator.iter_errors("not an integer", budget=budget)
+        first = next(errors)
+
+        cancelled[0] = True
+        with self.assertRaises(exceptions.ValidationCancelled) as caught:
+            next(errors)
+
+        self.assertEqual(len(caught.exception.errors), 1)
+        self.assertIs(caught.exception.errors[0], first)
+        self.assertEqual(budget.keyword_steps, 1)
+
+    def test_cancellation_during_the_last_keyword_is_not_a_verdict(self):
+        cancelled = [False]
+
+        def cancel(validator, value, instance, schema):
+            cancelled[0] = True
+            yield from ()
+
+        Validator = validators.create(
+            meta_schema={"$id": "urn:test:budget"},
+            validators={"cancel": cancel},
+        )
+        budget = validators.ValidationBudget(
+            cancel_check=lambda: cancelled[0],
+        )
+        validator = Validator({"cancel": True}, budget=budget)
+
+        with self.assertRaises(exceptions.ValidationCancelled):
+            list(validator.iter_errors(12))
+
+        self.assertEqual(budget.keyword_steps, 1)
+
+    def test_combinators_cannot_swallow_an_incomplete_state(self):
+        for combinator in ["anyOf", "oneOf"]:
+            with self.subTest(combinator=combinator):
+                schema = {
+                    combinator: [
+                        {
+                            "allOf": [
+                                {"type": "integer"},
+                                {"minimum": 5},
+                            ],
+                        },
+                        {"type": "string"},
+                    ],
+                }
+                budget = validators.ValidationBudget(max_steps=2)
+                validator = validators.Draft202012Validator(schema)
+
+                with self.assertRaises(exceptions.ValidationIncomplete):
+                    list(validator.iter_errors("a string", budget=budget))
+
+                self.assertEqual(budget.keyword_steps, 2)
+
+    def test_is_valid_never_reports_a_verdict_when_incomplete(self):
+        budget = validators.ValidationBudget(max_steps=1)
+        validator = validators.Draft202012Validator({
+            "anyOf": [{"type": "string"}, {"type": "integer"}],
+        })
+
+        with self.assertRaises(exceptions.ValidationIncomplete):
+            validator.is_valid(12, budget=budget)
+
+    def test_resource_access_errors_are_not_reclassified(self):
+        budget = validators.ValidationBudget(
+            max_keyword_steps=10,
+            max_reference_edges=10,
+        )
+        validator = validators.Draft202012Validator(
+            {"$ref": "https://example.com/missing"},
+            registry=referencing.Registry(),
+        )
+
+        with self.assertRaises(exceptions._WrappedReferencingError):
+            list(validator.iter_errors(12, budget=budget))
+
+        self.assertEqual(budget.reference_edges, 1)
+        self.assertFalse(budget.incomplete)
+
+    def test_budget_aliases(self):
+        budget = validators.ValidationBudget(max_steps=3, max_refs=4)
+
+        self.assertEqual(
+            (
+                budget.max_keyword_steps,
+                budget.max_reference_edges,
+                budget.max_steps,
+                budget.max_refs,
+            ),
+            (3, 4, 3, 4),
+        )
+
+    def test_module_level_validate_accepts_a_budget(self):
+        budget = validators.ValidationBudget(max_steps=1)
+
+        with self.assertRaises(exceptions.BudgetExceeded):
+            validators.validate(
+                "not an integer",
+                self.schema,
+                budget=budget,
+            )
+
+
 class TestThreading(TestCase):
     """
     Threading-related functionality tests.

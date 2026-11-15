@@ -1,6 +1,11 @@
 v4.27.0
 =======
 
+* Add invocation-level validation work budgets which count keyword steps and
+  entered reference edges, support cancellation checks, and share one budget
+  across descended validators. Exhaustion or cancellation raises
+  ``ValidationIncomplete`` rather than a ``ValidationError``, so combinators
+  cannot turn an unknown result into a verdict.
 * Support for Python 3.10 and 3.11 has been dropped.
 * Improve ``best_match`` for ``anyOf`` / ``oneOf`` errors: the most relevant error is now found within each subschema separately before the deepest of those is picked (#1257, #1300).
   In particular an applicator with a single subschema now produces the same best match as the bare subschema would.
