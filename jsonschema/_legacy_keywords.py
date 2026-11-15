@@ -254,104 +254,45 @@ def find_evaluated_item_indexes_by_schema(validator, instance, schema):
     """
     Get all indexes of items that get evaluated under the current schema.
 
-    Covers all keywords related to unevaluatedItems: items, prefixItems, if,
-    then, else, contains, unevaluatedItems, allOf, oneOf, anyOf
+    Draft 2019-09 keeps tuple ``items`` semantics, so this delegates to
+    the shared coverage calculation which chooses semantics from the
+    validator's dialect.
     """
-    if validator.is_type(schema, "boolean"):
-        return []
-    evaluated_indexes = []
-
-    ref = schema.get("$ref")
-    if ref is not None:
-        resolved = validator._resolver.lookup(ref)
-        evaluated_indexes.extend(
-            find_evaluated_item_indexes_by_schema(
-                validator.evolve(
-                    schema=resolved.contents,
-                    _resolver=resolved.resolver,
-                ),
-                instance,
-                resolved.contents,
-            ),
-        )
-
-    if "$recursiveRef" in schema:
-        resolved = lookup_recursive_ref(validator._resolver)
-        evaluated_indexes.extend(
-            find_evaluated_item_indexes_by_schema(
-                validator.evolve(
-                    schema=resolved.contents,
-                    _resolver=resolved.resolver,
-                ),
-                instance,
-                resolved.contents,
-            ),
-        )
-
-    if "items" in schema:
-        if "additionalItems" in schema:
-            return list(range(len(instance)))
-
-        if validator.is_type(schema["items"], "object"):
-            return list(range(len(instance)))
-        evaluated_indexes += list(range(len(schema["items"])))
-
-    if "if" in schema:
-        if validator.evolve(schema=schema["if"]).is_valid(instance):
-            evaluated_indexes += find_evaluated_item_indexes_by_schema(
-                validator,
-                instance,
-                schema["if"],
-            )
-            if "then" in schema:
-                evaluated_indexes += find_evaluated_item_indexes_by_schema(
-                    validator,
-                    instance,
-                    schema["then"],
-                )
-        elif "else" in schema:
-            evaluated_indexes += find_evaluated_item_indexes_by_schema(
-                validator,
-                instance,
-                schema["else"],
-            )
-
-    for keyword in ["contains", "unevaluatedItems"]:
-        if keyword in schema:
-            for k, v in enumerate(instance):
-                if validator.evolve(schema=schema[keyword]).is_valid(v):
-                    evaluated_indexes.append(k)
-
-    for keyword in ["allOf", "oneOf", "anyOf"]:
-        if keyword in schema:
-            for subschema in schema[keyword]:
-                errs = next(validator.descend(instance, subschema), None)
-                if errs is None:
-                    evaluated_indexes += find_evaluated_item_indexes_by_schema(
-                        validator,
-                        instance,
-                        subschema,
-                    )
-
-    return evaluated_indexes
+    return _utils.find_evaluated_item_indexes_by_schema(
+        validator,
+        instance,
+        schema,
+    )
 
 
 def unevaluatedItems_draft2019(validator, unevaluatedItems, instance, schema):
     if not validator.is_type(instance, "array"):
         return
-    evaluated_item_indexes = find_evaluated_item_indexes_by_schema(
+    unevaluated_indexes = _utils.find_unevaluated_item_indexes_by_schema(
         validator,
         instance,
         schema,
     )
-    unevaluated_items = [
-        item
-        for index, item in enumerate(instance)
-        if index not in evaluated_item_indexes
-    ]
-    if unevaluated_items:
+
+    if not unevaluated_indexes:
+        return
+
+    if unevaluatedItems is True:
+        return
+
+    if unevaluatedItems is False:
+        unevaluated_items = [
+            instance[index] for index in unevaluated_indexes
+        ]
         error = "Unevaluated items are not allowed (%s %s unexpected)"
         yield ValidationError(error % _utils.extras_msg(unevaluated_items))
+    else:
+        for index in unevaluated_indexes:
+            yield from validator.descend(
+                instance=instance[index],
+                schema=unevaluatedItems,
+                path=index,
+            )
 
 
 def find_evaluated_property_keys_by_schema(validator, instance, schema):

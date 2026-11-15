@@ -2,6 +2,8 @@ from collections.abc import Mapping, MutableMapping, Sequence
 from urllib.parse import urlsplit
 import re
 
+from referencing.jsonschema import lookup_recursive_ref
+
 # Module-level sentinels so recursive `_uniq_key` calls produce comparable
 # keys for nested True/False (function-default sentinels would also work, but
 # this makes the intent explicit).
@@ -236,25 +238,63 @@ def uniq(container):
     return True
 
 
-def find_evaluated_item_indexes_by_schema(validator, instance, schema):
+def _uses_tuple_items(validator):
     """
-    Get all indexes of items that get evaluated under the current schema.
+    Whether the given validator uses pre-2020-12 tuple ``items`` semantics.
 
-    Covers all keywords related to unevaluatedItems: items, prefixItems, if,
-    then, else, contains, unevaluatedItems, allOf, oneOf, anyOf
+    2020-12 moved tuples to ``prefixItems`` and made ``items`` apply to
+    every remaining item.  Older dialects (and extensions of them) still
+    treat an array-valued ``items`` as a tuple of subschemas.
     """
+    return "prefixItems" not in validator.VALIDATORS
+
+
+def find_contains_item_indexes(validator, instance, contains_schema):
+    """
+    Return the indexes of items which match a ``contains`` subschema.
+
+    This is the annotation value of ``contains``, before its count
+    constraints are applied.
+    """
+    contains_validator = validator.evolve(schema=contains_schema)
+    return [
+        index
+        for index, item in enumerate(instance)
+        if contains_validator.is_valid(item)
+    ]
+
+
+def contains_count_satisfied(schema, instance, matches):
+    """
+    Whether the number of ``contains`` matches satisfies its constraints.
+    """
+    min_contains = schema.get("minContains", 1)
+    max_contains = schema.get("maxContains", len(instance))
+    return min_contains <= matches <= max_contains
+
+
+def _is_valid_subschema(validator, instance, schema):
+    return next(validator.descend(instance, schema), None) is None
+
+
+def _find_evaluated_item_indexes_by_schema(
+    validator,
+    instance,
+    schema,
+    *,
+    include_unevaluated_items=True,
+):
     if validator.is_type(schema, "boolean"):
-        return []
-    evaluated_indexes = []
+        return set()
 
-    if "items" in schema:
-        return list(range(len(instance)))
+    evaluated_indexes = set()
+    tuple_items = _uses_tuple_items(validator)
 
     ref = schema.get("$ref")
     if ref is not None:
         resolved = validator._resolver.lookup(ref)
-        evaluated_indexes.extend(
-            find_evaluated_item_indexes_by_schema(
+        evaluated_indexes.update(
+            _find_evaluated_item_indexes_by_schema(
                 validator.evolve(
                     schema=resolved.contents,
                     _resolver=resolved.resolver,
@@ -264,11 +304,23 @@ def find_evaluated_item_indexes_by_schema(validator, instance, schema):
             ),
         )
 
-    dynamicRef = schema.get("$dynamicRef")
-    if dynamicRef is not None:
-        resolved = validator._resolver.lookup(dynamicRef)
-        evaluated_indexes.extend(
-            find_evaluated_item_indexes_by_schema(
+    if tuple_items:
+        if "$recursiveRef" in schema:
+            resolved = lookup_recursive_ref(validator._resolver)
+            evaluated_indexes.update(
+                _find_evaluated_item_indexes_by_schema(
+                    validator.evolve(
+                        schema=resolved.contents,
+                        _resolver=resolved.resolver,
+                    ),
+                    instance,
+                    resolved.contents,
+                ),
+            )
+    elif "$dynamicRef" in schema:
+        resolved = validator._resolver.lookup(schema["$dynamicRef"])
+        evaluated_indexes.update(
+            _find_evaluated_item_indexes_by_schema(
                 validator.evolve(
                     schema=resolved.contents,
                     _resolver=resolved.resolver,
@@ -278,47 +330,152 @@ def find_evaluated_item_indexes_by_schema(validator, instance, schema):
             ),
         )
 
-    if "prefixItems" in schema:
-        evaluated_indexes += list(range(len(schema["prefixItems"])))
+    if "items" in schema:
+        if not tuple_items:
+            # ``items`` applies to every item after ``prefixItems``,
+            # so together they cover the entire instance.
+            evaluated_indexes.update(range(len(instance)))
+        elif "additionalItems" in schema:
+            evaluated_indexes.update(range(len(instance)))
+        elif validator.is_type(schema["items"], "array"):
+            evaluated_indexes.update(
+                range(min(len(schema["items"]), len(instance))),
+            )
+        else:
+            evaluated_indexes.update(range(len(instance)))
+
+    if not tuple_items and "prefixItems" in schema:
+        evaluated_indexes.update(
+            range(min(len(schema["prefixItems"]), len(instance))),
+        )
+
+    if len(evaluated_indexes) == len(instance):
+        # Every item already has a coverage source, so evaluating later
+        # applicators again cannot change the result.
+        return evaluated_indexes
 
     if "if" in schema:
         if validator.evolve(schema=schema["if"]).is_valid(instance):
-            evaluated_indexes += find_evaluated_item_indexes_by_schema(
-                validator,
-                instance,
-                schema["if"],
-            )
-            if "then" in schema:
-                evaluated_indexes += find_evaluated_item_indexes_by_schema(
+            evaluated_indexes.update(
+                _find_evaluated_item_indexes_by_schema(
                     validator,
                     instance,
-                    schema["then"],
-                )
-        elif "else" in schema:
-            evaluated_indexes += find_evaluated_item_indexes_by_schema(
-                validator,
-                instance,
-                schema["else"],
+                    schema["if"],
+                ),
             )
-
-    for keyword in ["contains", "unevaluatedItems"]:
-        if keyword in schema:
-            for k, v in enumerate(instance):
-                if validator.evolve(schema=schema[keyword]).is_valid(v):
-                    evaluated_indexes.append(k)
-
-    for keyword in ["allOf", "oneOf", "anyOf"]:
-        if keyword in schema:
-            for subschema in schema[keyword]:
-                errs = next(validator.descend(instance, subschema), None)
-                if errs is None:
-                    evaluated_indexes += find_evaluated_item_indexes_by_schema(
+            if "then" in schema:
+                evaluated_indexes.update(
+                    _find_evaluated_item_indexes_by_schema(
                         validator,
                         instance,
-                        subschema,
-                    )
+                        schema["then"],
+                    ),
+                )
+        elif "else" in schema:
+            evaluated_indexes.update(
+                _find_evaluated_item_indexes_by_schema(
+                    validator,
+                    instance,
+                    schema["else"],
+                ),
+            )
+
+    if "contains" in schema:
+        matches = find_contains_item_indexes(
+            validator,
+            instance,
+            schema["contains"],
+        )
+        if contains_count_satisfied(schema, instance, len(matches)):
+            evaluated_indexes.update(matches)
+
+    for keyword in ("allOf", "oneOf", "anyOf"):
+        subschemas = schema.get(keyword)
+        if not subschemas:
+            continue
+
+        valid = [
+            subschema
+            for subschema in subschemas
+            if _is_valid_subschema(validator, instance, subschema)
+        ]
+        if keyword == "allOf":
+            # If any branch failed, allOf's annotations are discarded.
+            valid_subschemas = valid if len(valid) == len(subschemas) else []
+        elif keyword == "oneOf":
+            # An ambiguous oneOf is a failure, so it annotates nothing.
+            valid_subschemas = valid if len(valid) == 1 else []
+        else:
+            # anyOf collects annotations from every successful branch.
+            valid_subschemas = valid
+
+        for subschema in valid_subschemas:
+            evaluated_indexes.update(
+                _find_evaluated_item_indexes_by_schema(
+                    validator,
+                    instance,
+                    subschema,
+                ),
+            )
+
+    if include_unevaluated_items and "unevaluatedItems" in schema:
+        # Once ``unevaluatedItems`` is applied, every remaining item has
+        # been evaluated for any outer scope.
+        evaluated_indexes.update(range(len(instance)))
 
     return evaluated_indexes
+
+
+def find_evaluated_item_indexes_by_schema(
+    validator,
+    instance,
+    schema,
+    *,
+    include_unevaluated_items=True,
+):
+    """
+    Get all indexes of items that get evaluated under the current schema.
+
+    Covers all keywords related to unevaluatedItems: items, prefixItems,
+    if, then, else, contains, minContains, maxContains, unevaluatedItems,
+    allOf, oneOf, anyOf, and references.
+
+    ``contains`` only contributes its matching indexes when its count
+    constraints are satisfied.  A failed ``contains`` is therefore not
+    allowed to make otherwise-uncovered items appear evaluated.
+
+    The same helper is used by both draft 2019-09 and draft 2020-12.
+    Array-valued ``items`` retains its tuple meaning for dialects which
+    lack ``prefixItems``.
+    """
+    return sorted(
+        _find_evaluated_item_indexes_by_schema(
+            validator,
+            instance,
+            schema,
+            include_unevaluated_items=include_unevaluated_items,
+        ),
+    )
+
+
+def find_unevaluated_item_indexes_by_schema(validator, instance, schema):
+    """
+    Get the indexes of items which no adjacent keyword evaluated.
+
+    ``unevaluatedItems`` itself is deliberately excluded: it consumes
+    coverage, rather than contributing to it.
+    """
+    evaluated = set(
+        find_evaluated_item_indexes_by_schema(
+            validator,
+            instance,
+            schema,
+            include_unevaluated_items=False,
+        ),
+    )
+    return [
+        index for index in range(len(instance)) if index not in evaluated
+    ]
 
 
 def find_evaluated_property_keys_by_schema(validator, instance, schema):

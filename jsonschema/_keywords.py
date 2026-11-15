@@ -2,12 +2,14 @@ from fractions import Fraction
 import re
 
 from jsonschema._utils import (
+    contains_count_satisfied,
     ensure_list,
     equal,
     extras_msg,
     find_additional_properties,
-    find_evaluated_item_indexes_by_schema,
+    find_contains_item_indexes,
     find_evaluated_property_keys_by_schema,
+    find_unevaluated_item_indexes_by_schema,
     uniq,
 )
 from jsonschema.exceptions import FormatError, ValidationError
@@ -94,25 +96,20 @@ def contains(validator, contains, instance, schema):
     if not validator.is_type(instance, "array"):
         return
 
-    matches = 0
+    matches = find_contains_item_indexes(validator, instance, contains)
     min_contains = schema.get("minContains", 1)
     max_contains = schema.get("maxContains", len(instance))
 
-    contains_validator = validator.evolve(schema=contains)
+    if len(matches) > max_contains:
+        yield ValidationError(
+            "Too many items match the given schema "
+            f"(expected at most {max_contains})",
+            validator="maxContains",
+            validator_value=max_contains,
+        )
+        return
 
-    for each in instance:
-        if contains_validator.is_valid(each):
-            matches += 1
-            if matches > max_contains:
-                yield ValidationError(
-                    "Too many items match the given schema "
-                    f"(expected at most {max_contains})",
-                    validator="maxContains",
-                    validator_value=max_contains,
-                )
-                return
-
-    if matches < min_contains:
+    if not contains_count_satisfied(schema, instance, len(matches)):
         if not matches:
             yield ValidationError(
                 f"{instance!r} does not contain items "
@@ -121,7 +118,7 @@ def contains(validator, contains, instance, schema):
         else:
             yield ValidationError(
                 "Too few items match the given schema (expected at least "
-                f"{min_contains} but only {matches} matched)",
+                f"{min_contains} but only {len(matches)} matched)",
                 validator="minContains",
                 validator_value=min_contains,
             )
@@ -394,19 +391,31 @@ def if_(validator, if_schema, instance, schema):
 def unevaluatedItems(validator, unevaluatedItems, instance, schema):
     if not validator.is_type(instance, "array"):
         return
-    evaluated_item_indexes = find_evaluated_item_indexes_by_schema(
+    unevaluated_indexes = find_unevaluated_item_indexes_by_schema(
         validator,
         instance,
         schema,
     )
-    unevaluated_items = [
-        item
-        for index, item in enumerate(instance)
-        if index not in evaluated_item_indexes
-    ]
-    if unevaluated_items:
+
+    if not unevaluated_indexes:
+        return
+
+    if unevaluatedItems is True:
+        return
+
+    if unevaluatedItems is False:
+        unevaluated_items = [
+            instance[index] for index in unevaluated_indexes
+        ]
         error = "Unevaluated items are not allowed (%s %s unexpected)"
         yield ValidationError(error % extras_msg(unevaluated_items))
+    else:
+        for index in unevaluated_indexes:
+            yield from validator.descend(
+                instance=instance[index],
+                schema=unevaluatedItems,
+                path=index,
+            )
 
 
 def unevaluatedProperties(validator, unevaluatedProperties, instance, schema):

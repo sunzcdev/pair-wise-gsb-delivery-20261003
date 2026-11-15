@@ -828,6 +828,177 @@ class TestValidationErrorMessages(TestCase):
         )
 
 
+class TestArrayItemCoverage(TestCase):
+    def test_contains_too_few_does_not_evaluate_matches(self):
+        schema = {
+            "prefixItems": [{"type": "string"}],
+            "contains": {"type": "integer"},
+            "minContains": 2,
+            "unevaluatedItems": False,
+        }
+        errors = list(
+            validators.Draft202012Validator(schema).iter_errors(["foo", 1]),
+        )
+        self.assertEqual(
+            {error.validator: error.message for error in errors},
+            {
+                "minContains": (
+                    "Too few items match the given schema "
+                    "(expected at least 2 but only 1 matched)"
+                ),
+                "unevaluatedItems": (
+                    "Unevaluated items are not allowed (1 was unexpected)"
+                ),
+            },
+        )
+
+    def test_contains_too_many_does_not_evaluate_matches(self):
+        schema = {
+            "contains": {"type": "integer"},
+            "maxContains": 1,
+            "unevaluatedItems": False,
+        }
+        errors = list(
+            validators.Draft202012Validator(schema).iter_errors([1, 2]),
+        )
+        self.assertEqual(
+            {error.validator: error.message for error in errors},
+            {
+                "maxContains": (
+                    "Too many items match the given schema "
+                    "(expected at most 1)"
+                ),
+                "unevaluatedItems": (
+                    "Unevaluated items are not allowed (1, 2 were unexpected)"
+                ),
+            },
+        )
+
+    def test_satisfied_contains_evaluates_matching_items(self):
+        schema = {
+            "contains": {"type": "integer"},
+            "unevaluatedItems": False,
+        }
+        self.assertTrue(
+            validators.Draft202012Validator(schema).is_valid([1, 2]),
+        )
+
+    def test_satisfied_min_contains_still_needs_coverage(self):
+        schema = {
+            "contains": {"type": "integer"},
+            "minContains": 0,
+            "unevaluatedItems": False,
+        }
+        (error,) = validators.Draft202012Validator(schema).iter_errors(
+            ["foo"],
+        )
+        self.assertEqual(error.validator, "unevaluatedItems")
+        self.assertEqual(
+            error.message,
+            "Unevaluated items are not allowed ('foo' was unexpected)",
+        )
+
+    def test_unevaluated_items_schema_reports_item_path(self):
+        schema = {"unevaluatedItems": {"type": "string"}}
+        (error,) = validators.Draft202012Validator(schema).iter_errors(
+            ["foo", 1],
+        )
+        self.assertEqual(
+            (
+                error.validator,
+                error.message,
+                error.path,
+                error.schema_path,
+            ),
+            (
+                "type",
+                "1 is not of type 'string'",
+                deque([1]),
+                deque(["unevaluatedItems", "type"]),
+            ),
+        )
+
+    def test_failed_allOf_branches_do_not_contribute_coverage(self):
+        schema = {
+            "allOf": [
+                {"prefixItems": [True]},
+                {"type": "integer"},
+            ],
+            "unevaluatedItems": False,
+        }
+        errors = list(
+            validators.Draft202012Validator(schema).iter_errors([1]),
+        )
+        self.assertEqual(
+            {error.validator: error.message for error in errors},
+            {
+                "type": "[1] is not of type 'integer'",
+                "unevaluatedItems": (
+                    "Unevaluated items are not allowed (1 was unexpected)"
+                ),
+            },
+        )
+
+    def test_ambiguous_oneOf_does_not_contribute_coverage(self):
+        schema = {
+            "oneOf": [
+                True,
+                {"prefixItems": [True]},
+            ],
+            "unevaluatedItems": False,
+        }
+        errors = list(
+            validators.Draft202012Validator(schema).iter_errors([1]),
+        )
+        self.assertEqual(
+            {error.validator: error.message for error in errors},
+            {
+                "oneOf": (
+                    "[1] is valid under each of "
+                    "{'prefixItems': [True]}, True"
+                ),
+                "unevaluatedItems": (
+                    "Unevaluated items are not allowed (1 was unexpected)"
+                ),
+            },
+        )
+
+    def test_draft2019_contains_failure_uses_tuple_coverage(self):
+        schema = {
+            "items": [True],
+            "contains": {"type": "integer"},
+            "minContains": 2,
+            "unevaluatedItems": False,
+        }
+        errors = list(
+            validators.Draft201909Validator(schema).iter_errors(["foo", 1]),
+        )
+        self.assertEqual(
+            {error.validator for error in errors},
+            {"minContains", "unevaluatedItems"},
+        )
+
+    def test_tuple_items_semantics_are_dialect_specific(self):
+        instance = [1, "two"]
+        tuple_schema = {"items": [{"type": "integer"}]}
+
+        self.assertTrue(
+            validators.Draft7Validator(tuple_schema).is_valid(instance),
+        )
+        self.assertFalse(
+            validators.Draft201909Validator(
+                {**tuple_schema, "unevaluatedItems": False},
+            ).is_valid(instance),
+        )
+        with self.assertRaises(exceptions.SchemaError):
+            validators.Draft202012Validator.check_schema(tuple_schema)
+        self.assertFalse(
+            validators.Draft202012Validator(
+                {"items": {"type": "integer"}},
+            ).is_valid(instance),
+        )
+
+
 class TestValidationErrorDetails(TestCase):
     # TODO: These really need unit tests for each individual keyword, rather
     #       than just these higher level tests.

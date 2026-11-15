@@ -171,6 +171,37 @@ Draft 2020-12 meta-schema, you could use:
     Draft202012Validator.check_schema(schema)
 
 
+Array Coverage and Tuple Items
+------------------------------
+
+Coverage information used by :kw:`unevaluatedItems` is shared with
+:kw:`prefixItems`, :kw:`contains`, and the :kw:`minContains` /
+:kw:`maxContains` constraints.
+If :kw:`contains` does not satisfy its required count, its matching items are
+not reported as evaluated, so diagnostics can distinguish an uncovered item
+from an unsatisfied count constraint.
+
+Draft 2020-12 moved tuple validation from an array-valued :kw:`items` keyword
+to :kw:`prefixItems`.  Older drafts retain the tuple meaning of
+array-valued :kw:`items`.  For the same instance:
+
+.. code-block:: python
+
+    instance = [1, "two"]
+
+    Draft7Validator({"items": [{"type": "integer"}]}).is_valid(instance)
+    # True: only the first item is checked, and additional items are allowed.
+
+    Draft202012Validator.check_schema({"items": [{"type": "integer"}]})
+    # Raises SchemaError: 2020-12 items must be one schema, not a tuple.
+
+    Draft202012Validator({
+        "prefixItems": [{"type": "integer"}],
+        "items": False,
+    }).is_valid(instance)
+    # False: the 2020-12 equivalent explicitly rejects extra items.
+
+
 .. _validating formats:
 
 Validating Formats
