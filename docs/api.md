@@ -158,7 +158,17 @@ what gets sent over the wire.*
 * `def get(name, [domain], [path])`
 * `def delete(name, [domain], [path])`
 * `def clear([domain], [path])`
+* `def to_dict()` / `def from_dict(data, [merge], [mode])`
+* `def dumps()` / `def loads(data, [merge], [mode])`
 * *Standard mutable mapping interface*
+
+The `to_dict()`/`from_dict()` and `dumps()`/`loads()` pairs provide a
+versioned, plain-data snapshot of the cookie jar. The snapshot retains the
+domain, path, host-only, secure, port, and expiry attributes that affect
+which requests receive each cookie. Restoring replaces the jar by default;
+pass `merge=True` to update cookies matching on `(name, domain, path)` while
+keeping the others. Expired cookies are not restored, and a payload is
+validated in full before any cookies are applied.
 
 ## `Proxy`
 

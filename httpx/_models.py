@@ -5,6 +5,7 @@ import datetime
 import email.message
 import json as jsonlib
 import re
+import time
 import typing
 import urllib.request
 from collections.abc import Mapping
@@ -48,7 +49,14 @@ from ._types import (
 from ._urls import URL
 from ._utils import to_bytes_or_str, to_str
 
-__all__ = ["Cookies", "Headers", "Request", "Response"]
+__all__ = [
+    "Cookies",
+    "cookies_from_dict",
+    "cookies_to_dict",
+    "Headers",
+    "Request",
+    "Response",
+]
 
 SENSITIVE_HEADERS = {"authorization", "proxy-authorization"}
 
@@ -1076,17 +1084,253 @@ class Response:
                 await self.stream.aclose()
 
 
+def _serialized_cookie_expired(expires: int | None, now: int) -> bool:
+    return expires is not None and expires <= now
+
+
+def _looks_like_serialized_cookies(value: typing.Any) -> bool:
+    return (
+        isinstance(value, dict)
+        and "cookies" in value
+        and isinstance(value.get("cookies"), (list, tuple))
+        and (
+            "version" in value
+            or "schema_version" in value
+            or "format_version" in value
+        )
+    )
+
+
+def _cookie_from_serialized(
+    record: typing.Mapping[str, typing.Any], now: int
+) -> Cookie | None:
+    """
+    Build a `Cookie` from a plain-data record, or return `None` for an
+    expired record.
+    """
+    if not isinstance(record, Mapping):
+        raise ValueError("Each serialized cookie must be a mapping.")
+
+    def required_string(key: str, *, allow_empty: bool = True) -> str:
+        if key not in record:
+            raise ValueError(f"Serialized cookie is missing {key!r}.")
+        value = record[key]
+        if not isinstance(value, str):
+            raise ValueError(f"Serialized cookie field {key!r} must be a string.")
+        if not allow_empty and not value:
+            raise ValueError(f"Serialized cookie field {key!r} must not be empty.")
+        return value
+
+    def optional_string(key: str) -> str | None:
+        value = record.get(key)
+        if value is not None and not isinstance(value, str):
+            raise ValueError(
+                f"Serialized cookie field {key!r} must be a string or null."
+            )
+        return value
+
+    def boolean(key: str, default: bool) -> bool:
+        value = record.get(key, default)
+        if not isinstance(value, bool):
+            raise ValueError(f"Serialized cookie field {key!r} must be a boolean.")
+        return value
+
+    name = required_string("name", allow_empty=False)
+    if "value" not in record:
+        raise ValueError("Serialized cookie is missing 'value'.")
+    value = record["value"]
+    if value is not None and not isinstance(value, str):
+        raise ValueError("Serialized cookie field 'value' must be a string or null.")
+    domain = required_string("domain")
+    path = required_string("path")
+
+    expires: int | None
+    expires_value = record.get("expires")
+    if expires_value is None:
+        expires = None
+    else:
+        if isinstance(expires_value, bool) or not isinstance(
+            expires_value, (int, float)
+        ):
+            raise ValueError(
+                "Serialized cookie field 'expires' must be a number or null."
+            )
+        try:
+            expires = int(expires_value)
+        except (OverflowError, ValueError) as exc:
+            raise ValueError(
+                "Serialized cookie field 'expires' is not a valid timestamp."
+            ) from exc
+
+    if _serialized_cookie_expired(expires, now):
+        return None
+
+    secure = boolean("secure", False)
+    discard = boolean("discard", expires is None)
+    path_specified = boolean("path_specified", True)
+    rfc2109 = boolean("rfc2109", False)
+    comment = optional_string("comment")
+    comment_url = optional_string("comment_url")
+
+    host_only_value = record.get("host_only")
+    domain_specified_value = record.get("domain_specified")
+    if host_only_value is not None and not isinstance(host_only_value, bool):
+        raise ValueError("Serialized cookie field 'host_only' must be a boolean.")
+    if domain_specified_value is not None and not isinstance(
+        domain_specified_value, bool
+    ):
+        raise ValueError(
+            "Serialized cookie field 'domain_specified' must be a boolean."
+        )
+    if (
+        host_only_value is not None
+        and domain_specified_value is not None
+        and host_only_value == domain_specified_value
+    ):
+        raise ValueError(
+            "Serialized cookie fields 'host_only' and 'domain_specified' "
+            "are inconsistent."
+        )
+
+    if host_only_value is not None:
+        domain_specified = not host_only_value
+    elif domain_specified_value is not None:
+        domain_specified = domain_specified_value
+    else:
+        domain_specified = bool(domain)
+
+    domain_initial_dot_value = record.get("domain_initial_dot")
+    if domain_initial_dot_value is None:
+        domain_initial_dot = domain_specified and domain.startswith(".")
+    elif not isinstance(domain_initial_dot_value, bool):
+        raise ValueError(
+            "Serialized cookie field 'domain_initial_dot' must be a boolean."
+        )
+    else:
+        domain_initial_dot = domain_initial_dot_value
+
+    if not domain_specified:
+        if domain_initial_dot:
+            raise ValueError("A host-only cookie cannot have 'domain_initial_dot' set.")
+        domain_initial_dot = False
+
+    port = optional_string("port")
+    port_specified = boolean("port_specified", port is not None)
+    if port is None and port_specified:
+        raise ValueError("Serialized cookie field 'port_specified' requires a 'port'.")
+
+    version = record.get("version", 0)
+    if version is None:
+        version = 0
+    if isinstance(version, bool) or not isinstance(version, int) or version < 0:
+        raise ValueError(
+            "Serialized cookie field 'version' must be a non-negative integer."
+        )
+
+    rest_value = record.get("rest", {})
+    if rest_value is None:
+        rest: dict[str, typing.Any] = {}
+    elif isinstance(rest_value, Mapping):
+        rest = dict(rest_value)
+    else:
+        raise ValueError("Serialized cookie field 'rest' must be a mapping.")
+    for rest_key, rest_item in rest.items():
+        if not isinstance(rest_key, str):
+            raise ValueError("Serialized cookie 'rest' keys must be strings.")
+        if rest_item is not None and not isinstance(
+            rest_item, (str, int, float, bool)
+        ):
+            raise ValueError(
+                "Serialized cookie 'rest' values must be JSON primitive values."
+            )
+
+    return Cookie(
+        version=version,
+        name=name,
+        value=value,
+        port=port,
+        port_specified=port_specified,
+        domain=domain,
+        domain_specified=domain_specified,
+        domain_initial_dot=domain_initial_dot,
+        path=path,
+        path_specified=path_specified,
+        secure=secure,
+        expires=expires,
+        discard=discard,
+        comment=comment,
+        comment_url=comment_url,
+        rest=rest,
+        rfc2109=rfc2109,
+    )
+
+
+def _cookies_from_serialized(
+    data: typing.Mapping[str, typing.Any], now: int
+) -> list[Cookie]:
+    if not isinstance(data, Mapping):
+        raise ValueError("Serialized cookies must be a mapping.")
+
+    version = data.get(
+        "version", data.get("schema_version", data.get("format_version"))
+    )
+    if version is None:
+        raise ValueError("Serialized cookies are missing a version.")
+    if isinstance(version, bool) or version not in (1, "1"):
+        raise ValueError(f"Unsupported cookie serialization version: {version!r}.")
+
+    records = data.get("cookies")
+    if not isinstance(records, (list, tuple)):
+        raise ValueError("Serialized cookie field 'cookies' must be a list.")
+
+    cookies: list[Cookie] = []
+    for record in records:
+        cookie = _cookie_from_serialized(record, now)
+        if cookie is not None:
+            cookies.append(cookie)
+    return cookies
+
+
+def _cookie_to_serialized(cookie: Cookie) -> dict[str, typing.Any]:
+    return {
+        "name": cookie.name,
+        "value": cookie.value,
+        "domain": cookie.domain,
+        "path": cookie.path,
+        "secure": cookie.secure,
+        "expires": cookie.expires,
+        "discard": cookie.discard,
+        "host_only": not cookie.domain_specified,
+        "domain_specified": cookie.domain_specified,
+        "domain_initial_dot": cookie.domain_initial_dot,
+        "path_specified": cookie.path_specified,
+        "port": cookie.port,
+        "port_specified": cookie.port_specified,
+        "version": cookie.version,
+        "comment": cookie.comment,
+        "comment_url": cookie.comment_url,
+        "rest": dict(cookie._rest),
+        "rfc2109": cookie.rfc2109,
+    }
+
+
 class Cookies(typing.MutableMapping[str, str]):
     """
     HTTP Cookies, as a mutable mapping.
     """
 
+    SERIALIZATION_VERSION = 1
+
     def __init__(self, cookies: CookieTypes | None = None) -> None:
-        if cookies is None or isinstance(cookies, dict):
+        if cookies is None:
             self.jar = CookieJar()
-            if isinstance(cookies, dict):
-                for key, value in cookies.items():
-                    self.set(key, value)
+        elif _looks_like_serialized_cookies(cookies):
+            self.jar = CookieJar()
+            self.restore(typing.cast(typing.Mapping[str, typing.Any], cookies))
+        elif isinstance(cookies, dict):
+            self.jar = CookieJar()
+            for key, value in cookies.items():
+                self.set(key, value)
         elif isinstance(cookies, list):
             self.jar = CookieJar()
             for key, value in cookies:
@@ -1203,9 +1447,145 @@ class Cookies(typing.MutableMapping[str, str]):
         self.jar.clear(*args)
 
     def update(self, cookies: CookieTypes | None = None) -> None:  # type: ignore
+        if _looks_like_serialized_cookies(cookies):
+            self.restore(
+                typing.cast(typing.Mapping[str, typing.Any], cookies),
+                merge=True,
+            )
+            return
         cookies = Cookies(cookies)
         for cookie in cookies.jar:
             self.jar.set_cookie(cookie)
+
+    def to_dict(self, *, now: float | None = None) -> dict[str, typing.Any]:
+        """
+        Return a versioned, JSON-compatible representation of the cookie jar.
+
+        The export includes the attrs that affect which requests a cookie is
+        sent with, and whether it has expired. Expired cookies are omitted.
+        """
+        current_time = int(time.time() if now is None else now)
+        cookies = [
+            _cookie_to_serialized(cookie)
+            for cookie in self.jar
+            if not _serialized_cookie_expired(cookie.expires, current_time)
+        ]
+        return {"version": self.SERIALIZATION_VERSION, "cookies": cookies}
+
+    def export(self, *, now: float | None = None) -> dict[str, typing.Any]:
+        """
+        Alias for `to_dict()`.
+        """
+        return self.to_dict(now=now)
+
+    @classmethod
+    def from_dict(
+        cls,
+        data: typing.Mapping[str, typing.Any] | str | bytes,
+        *,
+        merge: bool = False,
+        replace: bool | None = None,
+        mode: str | None = None,
+        now: float | None = None,
+    ) -> Cookies:
+        """
+        Create a cookie jar from a versioned plain-data representation.
+        """
+        cookies = cls()
+        cookies.restore(data, merge=merge, replace=replace, mode=mode, now=now)
+        return cookies
+
+    def restore(
+        self,
+        data: typing.Mapping[str, typing.Any] | str | bytes,
+        *,
+        merge: bool = False,
+        replace: bool | None = None,
+        mode: str | None = None,
+        now: float | None = None,
+    ) -> None:
+        """
+        Restore cookies from a versioned plain-data representation.
+
+        By default the existing jar is replaced. Pass `merge=True` (or
+        `mode="merge"`) to update matching cookies while keeping others.
+        Cookie identity is `(name, domain, path)`.
+
+        The whole payload is validated before the jar is modified, so an
+        invalid record does not leave a partially restored jar.
+        """
+        if isinstance(data, (str, bytes)):
+            try:
+                data = jsonlib.loads(data)
+            except (TypeError, ValueError) as exc:
+                raise ValueError("Invalid serialized cookie data.") from exc
+
+        if mode is not None:
+            if mode not in ("replace", "merge"):
+                raise ValueError("mode must be either 'replace' or 'merge'.")
+            merge = mode == "merge"
+        if replace is not None:
+            if not isinstance(replace, bool):
+                raise ValueError("replace must be a boolean.")
+            merge = not replace
+        if not isinstance(merge, bool):
+            raise ValueError("merge must be a boolean.")
+
+        current_time = int(time.time() if now is None else now)
+        cookies = _cookies_from_serialized(data, current_time)
+
+        if not merge:
+            self.jar.clear()
+        for cookie in cookies:
+            self.jar.set_cookie(cookie)
+
+    def dumps(self, *, now: float | None = None, **kwargs: typing.Any) -> str:
+        """
+        Return the versioned representation as a JSON string.
+        """
+        return jsonlib.dumps(self.to_dict(now=now), **kwargs)
+
+    @classmethod
+    def loads(
+        cls,
+        data: str | bytes,
+        *,
+        merge: bool = False,
+        replace: bool | None = None,
+        mode: str | None = None,
+        now: float | None = None,
+    ) -> Cookies:
+        """
+        Create a cookie jar from a versioned JSON string.
+        """
+        try:
+            payload = jsonlib.loads(data)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("Invalid serialized cookie data.") from exc
+        return cls.from_dict(
+            payload, merge=merge, replace=replace, mode=mode, now=now
+        )
+
+    def to_json(self, *, now: float | None = None, **kwargs: typing.Any) -> str:
+        """
+        Alias for `dumps()`.
+        """
+        return self.dumps(now=now, **kwargs)
+
+    @classmethod
+    def from_json(
+        cls,
+        data: str | bytes,
+        *,
+        merge: bool = False,
+        replace: bool | None = None,
+        mode: str | None = None,
+        now: float | None = None,
+    ) -> Cookies:
+        """
+        Alias for `loads()`.
+        """
+        return cls.loads(data, merge=merge, replace=replace, mode=mode, now=now)
 
     def __setitem__(self, name: str, value: str) -> None:
         return self.set(name, value)
@@ -1275,3 +1655,28 @@ class Cookies(typing.MutableMapping[str, str]):
                 # https://docs.python.org/3/library/email.compat32-message.html#email.message.Message.__setitem__
                 info[key] = value
             return info
+
+
+def cookies_to_dict(
+    cookies: Cookies, *, now: float | None = None
+) -> dict[str, typing.Any]:
+    """
+    Return a versioned, JSON-compatible snapshot of `cookies`.
+    """
+    return cookies.to_dict(now=now)
+
+
+def cookies_from_dict(
+    data: typing.Mapping[str, typing.Any] | str | bytes,
+    *,
+    merge: bool = False,
+    replace: bool | None = None,
+    mode: str | None = None,
+    now: float | None = None,
+) -> Cookies:
+    """
+    Create a cookie jar from a versioned plain-data snapshot.
+    """
+    return Cookies.from_dict(
+        data, merge=merge, replace=replace, mode=mode, now=now
+    )

@@ -1,4 +1,6 @@
 import http
+import time
+from http.cookiejar import Cookie
 
 import pytest
 
@@ -96,3 +98,176 @@ def test_cookies_repr():
         "<Cookies[<Cookie foo=bar for http://blah.com />,"
         " <Cookie fizz=buzz for http://hello.com />]>"
     )
+
+
+def cookie_header(cookies: httpx.Cookies, url: str) -> str | None:
+    request = httpx.Request("GET", url)
+    cookies.set_cookie_header(request)
+    return request.headers.get("cookie")
+
+
+def set_cookie(cookies: httpx.Cookies, value: str) -> None:
+    request = httpx.Request("GET", "https://www.example.com/")
+    response = httpx.Response(200, headers={"set-cookie": value}, request=request)
+    cookies.extract_cookies(response)
+
+
+def test_cookies_serialization_preserves_request_scope():
+    cookies = httpx.Cookies()
+    set_cookie(cookies, "host_only=1; Path=/")
+    set_cookie(cookies, "same_name=root; Path=/; Domain=example.com")
+    set_cookie(cookies, "same_name=deep; Path=/app; Domain=example.com")
+
+    urls = [
+        "https://www.example.com/",
+        "https://api.example.com/",
+        "https://www.example.com/app/page",
+        "https://api.example.com/app/page",
+    ]
+    expected_headers = [cookie_header(cookies, url) for url in urls]
+
+    restored = httpx.Cookies.from_dict(cookies.to_dict())
+
+    assert [cookie_header(restored, url) for url in urls] == expected_headers
+    assert cookie_header(restored, "https://www.example.com/") == (
+        "host_only=1; same_name=root"
+    )
+    assert cookie_header(restored, "https://api.example.com/") == "same_name=root"
+    assert cookie_header(restored, "https://www.example.com/app/page") == (
+        "same_name=deep; host_only=1; same_name=root"
+    )
+
+
+def test_cookies_serialization_json_roundtrip():
+    cookies = httpx.Cookies()
+    cookies.set("name", "value", domain="example.com", path="/subpath")
+
+    restored = httpx.Cookies.loads(cookies.dumps())
+
+    assert restored.get("name", domain="example.com", path="/subpath") == "value"
+    assert restored.to_dict()["version"] == httpx.Cookies.SERIALIZATION_VERSION
+
+
+def test_cookies_restore_replace_and_merge():
+    cookies = httpx.Cookies()
+    cookies.set("keep", "old", domain="example.com")
+    cookies.set("other", "value", domain="example.com")
+
+    payload = {
+        "version": 1,
+        "cookies": [
+            {
+                "name": "keep",
+                "value": "new",
+                "domain": "example.com",
+                "path": "/",
+                "host_only": False,
+            }
+        ],
+    }
+
+    merged = httpx.Cookies(cookies)
+    merged.restore(payload, merge=True)
+    assert merged.get("keep", domain="example.com") == "new"
+    assert merged.get("other", domain="example.com") == "value"
+
+    replaced = httpx.Cookies(cookies)
+    replaced.restore(payload)
+    assert replaced.get("keep", domain="example.com") == "new"
+    assert "other" not in replaced
+
+
+def test_cookies_serialization_does_not_revive_expired_cookies():
+    now = int(time.time())
+    payload = {
+        "version": 1,
+        "cookies": [
+            {
+                "name": "deleted",
+                "value": "",
+                "domain": "example.com",
+                "path": "/",
+                "expires": now - 10,
+                "host_only": False,
+            },
+            {
+                "name": "alive",
+                "value": "yes",
+                "domain": "example.com",
+                "path": "/",
+                "expires": now + 3600,
+                "host_only": False,
+            },
+        ],
+    }
+
+    cookies = httpx.Cookies.from_dict(payload)
+
+    assert "deleted" not in cookies
+    assert cookies.get("alive", domain="example.com") == "yes"
+    assert [cookie["name"] for cookie in cookies.to_dict()["cookies"]] == ["alive"]
+
+
+def test_cookies_serialization_omits_expired_cookies():
+    cookies = httpx.Cookies()
+    cookies.jar.set_cookie(
+        Cookie(
+            version=0,
+            name="deleted",
+            value="",
+            port=None,
+            port_specified=False,
+            domain="example.com",
+            domain_specified=True,
+            domain_initial_dot=False,
+            path="/",
+            path_specified=True,
+            secure=False,
+            expires=int(time.time()) - 1,
+            discard=False,
+            comment=None,
+            comment_url=None,
+            rest={},
+        )
+    )
+
+    assert cookies.to_dict()["cookies"] == []
+
+
+@pytest.mark.parametrize("merge", [False, True])
+def test_cookies_restore_invalid_payload_is_atomic(merge):
+    cookies = httpx.Cookies()
+    cookies.set("existing", "value", domain="example.com")
+
+    payload = {
+        "version": 1,
+        "cookies": [
+            {
+                "name": "valid",
+                "value": "value",
+                "domain": "example.com",
+                "path": "/",
+            },
+            {
+                "name": "invalid",
+                "value": 123,
+                "domain": "example.com",
+                "path": "/",
+            },
+        ],
+    }
+
+    with pytest.raises(ValueError):
+        cookies.restore(payload, merge=merge)
+
+    assert dict(cookies) == {"existing": "value"}
+
+
+@pytest.mark.parametrize("version", [None, 2, "2"])
+def test_cookies_restore_rejects_unsupported_version(version):
+    payload = {"cookies": []}
+    if version is not None:
+        payload["version"] = version
+
+    with pytest.raises(ValueError):
+        httpx.Cookies.from_dict(payload)
