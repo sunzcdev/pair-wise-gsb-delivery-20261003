@@ -4,7 +4,7 @@ import warnings
 from collections.abc import Iterable, Sequence
 from typing import TYPE_CHECKING, Any, Literal
 
-from sqlalchemy import false, func, select
+from sqlalchemy import false, func, select, tuple_
 from sqlalchemy.exc import NoSuchTableError
 from sqlalchemy.schema import Column, Index
 from sqlalchemy.schema import Table as SQLATable
@@ -352,17 +352,116 @@ class Table:
         ensure: bool | None = None,
         types: dict[str, ColumnType] | None = None,
     ) -> None:
-        """
-        Sorts multiple input rows into upserts and inserts. Inserts are passed
-        to insert and upserts are updated.
+        """Sorts multiple input rows into upserts and inserts.
+
+        Rows are processed in chunks of at most ``chunk_size`` cached
+        records. Within each chunk, rows referring to the same ``keys``
+        are merged in input order (later rows take precedence), existing
+        records are detected with a single query, and updates as well as
+        inserts are executed as batched statements grouped by the set of
+        columns present in each row. Columns missing from a row are never
+        written as ``None``, while an explicit ``None`` stores a NULL.
 
         See :py:meth:`upsert() <dataset.Table.upsert>` and
         :py:meth:`insert_many() <dataset.Table.insert_many>`.
         """
-        # Removing a bulk implementation in 5e09aba401. Doing this one by one
-        # is incredibly slow, but doesn't run into issues with column creation.
+        if not len(rows):
+            return
+        keys = [self._get_column_name(k) for k in ensure_strings(keys)]
+        if not len(keys):
+            # Degenerate case: without keys no batching is possible.
+            for row in rows:
+                self.upsert(row, keys, ensure=ensure, types=types)
+            return
+
+        # Create the table and any missing columns up front, so that
+        # columns introduced by rows in later chunks cannot invalidate
+        # the structure of statements that were already executed.
+        sync_row: MutableRow = {}
         for row in rows:
-            self.upsert(row, keys, ensure=ensure, types=types)
+            for key in row:
+                if key not in sync_row:
+                    sync_row[key] = row[key]
+        self._sync_columns(sync_row, ensure, types=types)
+        if self._check_ensure(ensure):
+            self.create_index(keys)
+
+        chunk: dict[tuple[Any, ...], MutableRow] = {}
+        for row in rows:
+            synced = self._sync_columns(row, False)
+            try:
+                key_tuple = tuple(synced.get(k) for k in keys)
+                hash(key_tuple)
+            except TypeError:
+                key_tuple = None
+            if key_tuple is None or any(v is None for v in key_tuple):
+                # Rows with missing or NULL key values cannot be merged
+                # or matched in a batch; keep the row-by-row code path.
+                self._upsert_chunk(list(chunk.values()), keys)
+                chunk.clear()
+                self.upsert(synced, keys, ensure=False)
+                continue
+            if key_tuple in chunk:
+                # Later rows for the same key take precedence.
+                chunk[key_tuple].update(synced)
+            else:
+                chunk[key_tuple] = dict(synced)
+            if len(chunk) >= chunk_size:
+                self._upsert_chunk(list(chunk.values()), keys)
+                chunk.clear()
+        self._upsert_chunk(list(chunk.values()), keys)
+
+    def _upsert_chunk(self, rows: list[MutableRow], keys: list[str]) -> None:
+        """Apply a de-duplicated chunk of rows using batched statements.
+
+        Records already present in the table are updated, new ones are
+        inserted. Rows are grouped by their column signature so that a
+        single statement structure serves each group and no statement
+        has to be re-structured (or re-played) because of differing
+        columns between rows.
+        """
+        if not len(rows):
+            return
+        table = self.table
+        key_columns = [table.c[k] for k in keys]
+        if len(key_columns) == 1:
+            clause = key_columns[0].in_([row[keys[0]] for row in rows])
+        else:
+            clause = tuple_(*key_columns).in_(
+                [tuple(row[k] for k in keys) for row in rows]
+            )
+        query = select(*key_columns).where(clause)
+        existing = {tuple(r) for r in self.db.executable.execute(query)}
+
+        key_set = set(keys)
+        updates: dict[tuple[str, ...], list[MutableRow]] = {}
+        inserts: dict[tuple[str, ...], list[MutableRow]] = {}
+        for row in rows:
+            if tuple(row[k] for k in keys) in existing:
+                signature = tuple(k for k in row if k not in key_set)
+                if len(signature):
+                    updates.setdefault(signature, []).append(row)
+            else:
+                inserts.setdefault(tuple(row.keys()), []).append(row)
+
+        for signature, group in updates.items():
+            clauses = [table.c[k] == bindparam(f"_{k}") for k in keys]
+            stmt = (
+                table.update()
+                .where(and_(True, *clauses))
+                .values({col: bindparam(col) for col in signature})
+            )
+            params = []
+            for row in group:
+                param = {f"_{k}": row[k] for k in keys}
+                param.update({col: row[col] for col in signature})
+                params.append(param)
+            self.db.executable.execute(stmt, params)
+
+        for group in inserts.values():
+            self.db.executable.execute(table.insert(), [dict(row) for row in group])
+
+        self.db._auto_commit()
 
     def delete(self, *clauses: ColumnElement[bool], **filters: SQLWriteValue) -> bool:
         """Delete rows from the table.

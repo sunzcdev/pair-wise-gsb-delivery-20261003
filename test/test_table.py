@@ -1,6 +1,7 @@
 from datetime import datetime
 
 import pytest
+from sqlalchemy import event
 from sqlalchemy.exc import ArgumentError
 from sqlalchemy.types import BIGINT, TEXT
 
@@ -352,6 +353,143 @@ def test_upsert_many(db):
 
     tbl.upsert_many([{"id": 1, "age": 70}, {"id": 2, "weight": weight / 2}], "id")
     assert tbl.find_one(id=2)["weight"] == weight / 2
+
+
+class StatementCounter:
+    """Count statements executed against the engine."""
+
+    def __init__(self, engine):
+        self.statements = []
+        self.engine = engine
+        event.listen(engine, "before_cursor_execute", self.count)
+
+    def count(self, conn, cursor, statement, parameters, context, executemany):
+        self.statements.append(statement)
+
+    def reset(self):
+        self.statements.clear()
+
+    @property
+    def dml(self):
+        prefixes = ("INSERT", "UPDATE", "SELECT")
+        return [
+            s for s in self.statements if s.strip().upper().startswith(prefixes)
+        ]
+
+    def close(self):
+        event.remove(self.engine, "before_cursor_execute", self.count)
+
+
+def test_upsert_many_batched(db):
+    tbl = db["upsert_many_batched"]
+    counter = StatementCounter(db.engine)
+    try:
+        # Warm-up: create table and index, then count only DML below.
+        tbl.upsert_many([{"id": 0, "value": 0}], ["id"])
+        counter.reset()
+
+        rows = [{"id": i, "value": i * 10} for i in range(1, 11)]
+        tbl.upsert_many(rows, ["id"])
+        # One SELECT to find existing keys, one batched INSERT. The
+        # row-by-row implementation would run 20+ statements here.
+        assert len(counter.dml) <= 2, counter.dml
+        assert len(tbl) == 11
+        for i in range(1, 11):
+            assert tbl.find_one(id=i)["value"] == i * 10
+
+        counter.reset()
+        rows = [{"id": i, "value": i} for i in range(1, 11)]
+        tbl.upsert_many(rows, ["id"])
+        # One SELECT, one batched UPDATE covering all rows.
+        assert len(counter.dml) <= 2, counter.dml
+        for i in range(1, 11):
+            assert tbl.find_one(id=i)["value"] == i
+    finally:
+        counter.close()
+
+
+def test_upsert_many_same_key_order(db):
+    tbl = db["upsert_many_same_key"]
+    tbl.upsert_many(
+        [
+            {"id": 1, "value": 1},
+            {"id": 1, "value": 2, "other": "x"},
+            {"id": 1, "value": 3},
+        ],
+        ["id"],
+    )
+    row = tbl.find_one(id=1)
+    assert row["value"] == 3, row
+    assert row["other"] == "x", row
+    assert len(tbl) == 1, len(tbl)
+
+
+def test_upsert_many_missing_and_none_fields(db):
+    tbl = db["upsert_many_none"]
+    tbl.upsert_many([{"id": 1, "value": 10, "other": "keep"}], ["id"])
+
+    tbl.upsert_many(
+        [
+            {"id": 1, "value": 20},  # "other" must not be nulled out
+            {"id": 1, "other": None},  # explicit None writes NULL
+        ],
+        ["id"],
+    )
+    row = tbl.find_one(id=1)
+    assert row["value"] == 20, row
+    assert row["other"] is None, row
+
+    # Mixed column signatures are grouped, not padded with None.
+    tbl.upsert_many(
+        [
+            {"id": 2, "value": 5},
+            {"id": 3, "other": "only"},
+        ],
+        ["id"],
+    )
+    assert tbl.find_one(id=2)["other"] is None
+    assert tbl.find_one(id=3)["value"] is None
+
+
+def test_upsert_many_late_columns(db):
+    tbl = db["upsert_many_late_cols"]
+    rows = [{"id": i, "value": i} for i in range(5)]
+    # A new column only appears in a later chunk.
+    rows.append({"id": 5, "value": 5, "late": "new"})
+    tbl.upsert_many(rows, ["id"], chunk_size=2)
+    assert len(tbl) == 6, len(tbl)
+    assert "late" in tbl.columns
+    assert tbl.find_one(id=5)["late"] == "new"
+    for i in range(5):
+        assert tbl.find_one(id=i)["value"] == i
+
+
+def test_upsert_many_chunking(db):
+    tbl = db["upsert_many_chunked"]
+    counter = StatementCounter(db.engine)
+    try:
+        tbl.upsert_many([{"id": 0, "value": 0}], ["id"])
+        counter.reset()
+        rows = [{"id": i, "value": i} for i in range(1, 6)]
+        tbl.upsert_many(rows, ["id"], chunk_size=2)
+        # Three chunks (2 + 2 + 1), each with one SELECT and one INSERT.
+        assert len(counter.dml) == 6, counter.dml
+        assert len(tbl) == 6, len(tbl)
+    finally:
+        counter.close()
+
+
+def test_upsert_many_rollback(db):
+    tbl = db["upsert_many_tx"]
+    tbl.upsert_many([{"id": 1, "value": 1}], ["id"])
+    with pytest.raises(RuntimeError):
+        with db:
+            tbl.upsert_many([{"id": 1, "value": 99}, {"id": 2, "value": 2}], ["id"])
+            raise RuntimeError("boom")
+    # The failed transaction must be rolled back as a whole; the batch
+    # path must not introduce hidden commit boundaries.
+    assert tbl.find_one(id=1)["value"] == 1
+    assert tbl.find_one(id=2) is None
 
 
 def test_drop_operations(table):
