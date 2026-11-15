@@ -63,6 +63,21 @@ async def test_bytesio_content():
 
 
 @pytest.mark.anyio
+async def test_bytesio_content_respects_initial_position():
+    upload = io.BytesIO(b"Hello, world!")
+    upload.seek(7)
+
+    request = httpx.Request(method, url, content=upload)
+    content = b"".join(list(request.stream))
+
+    # Only the segment from the recorded offset is uploaded, and the
+    # declared Content-Length must match that segment.
+    assert content == b"world!"
+    assert request.headers == {"Host": "www.example.com", "Content-Length": "6"}
+    assert request.stream.can_replay()
+
+
+@pytest.mark.anyio
 async def test_async_bytesio_content():
     class AsyncBytesIO:
         def __init__(self, content: bytes) -> None:

@@ -13,6 +13,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 ### Added
 
 * Expose `FunctionAuth` from the public API. (#3699)
+* Request streams now expose a `can_replay()`/`replay()` contract. Multipart
+  file uploads record each part's initial offset and rewind to it (rather than
+  to the start of the file) when a redirect or an authentication retry resends
+  the body. A non-replayable stream that needs to be sent more than once now
+  raises `StreamReplayError`, closing the current response without sending an
+  empty body.
 
 ## 0.28.1 (6th December, 2024)
 

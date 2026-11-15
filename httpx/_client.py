@@ -23,6 +23,7 @@ from ._decoders import SUPPORTED_DECODERS
 from ._exceptions import (
     InvalidURL,
     RemoteProtocolError,
+    StreamReplayError,
     TooManyRedirects,
     request_context,
 )
@@ -950,8 +951,15 @@ class Client(BaseClient):
                     except StopIteration:
                         return response
 
+                    # The authentication flow wants to send another request.
+                    # Use the same replay contract as redirect handling so that
+                    # a one-shot request body produces a dedicated error.
+                    if not next_request.stream.can_replay():
+                        raise StreamReplayError()
+
                     response.history = list(history)
                     response.read()
+                    next_request.stream.replay()
                     request = next_request
                     history.append(response)
 
@@ -985,7 +993,16 @@ class Client(BaseClient):
                 if not response.has_redirect_location:
                     return response
 
+                method = self._redirect_method(request, response)
+                # Redirects that preserve the method resend the request body.
+                # Ensure the content is replayable before touching the current
+                # response, so a one-shot stream never results in an empty body.
+                if method != "GET" and not request.stream.can_replay():
+                    raise StreamReplayError()
+
                 request = self._build_redirect_request(request, response)
+                if method != "GET":
+                    request.stream.replay()
                 history = history + [response]
 
                 if follow_redirects:
@@ -1665,8 +1682,15 @@ class AsyncClient(BaseClient):
                     except StopAsyncIteration:
                         return response
 
+                    # The authentication flow wants to send another request.
+                    # Use the same replay contract as redirect handling so that
+                    # a one-shot request body produces a dedicated error.
+                    if not next_request.stream.can_replay():
+                        raise StreamReplayError()
+
                     response.history = list(history)
                     await response.aread()
+                    next_request.stream.replay()
                     request = next_request
                     history.append(response)
 
@@ -1701,7 +1725,16 @@ class AsyncClient(BaseClient):
                 if not response.has_redirect_location:
                     return response
 
+                method = self._redirect_method(request, response)
+                # Redirects that preserve the method resend the request body.
+                # Ensure the content is replayable before touching the current
+                # response, so a one-shot stream never results in an empty body.
+                if method != "GET" and not request.stream.can_replay():
+                    raise StreamReplayError()
+
                 request = self._build_redirect_request(request, response)
+                if method != "GET":
+                    request.stream.replay()
                 history = history + [response]
 
                 if follow_redirects:

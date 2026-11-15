@@ -702,7 +702,7 @@ async def test_digest_auth_unavailable_streaming_body():
         yield b"Example request body"  # pragma: no cover
 
     async with httpx.AsyncClient(transport=ConsumeBodyTransport(app)) as client:
-        with pytest.raises(httpx.StreamConsumed):
+        with pytest.raises(httpx.StreamReplayError):
             await client.post(url, content=streaming_body(), auth=auth)
 
 

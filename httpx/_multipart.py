@@ -102,6 +102,13 @@ class DataField:
 
         return self._data
 
+    def can_replay(self) -> bool:
+        return True
+
+    def replay(self) -> None:
+        # The field content is held in memory and rendered on demand.
+        pass
+
     def get_length(self) -> int:
         headers = self.render_headers()
         data = self.render_data()
@@ -167,6 +174,42 @@ class FileField:
         self.filename = filename
         self.file = fileobj
         self.headers = headers
+        # Remember where each part's content starts. When the request is
+        # replayed (e.g. following a redirect) we rewind to this position
+        # rather than to the very beginning of the caller's file, and we
+        # never close the file because it is owned by the caller.
+        self._initial_position = self._get_initial_position()
+
+    def _get_initial_position(self) -> int:
+        if isinstance(self.file, (str, bytes)) or not hasattr(self.file, "tell"):
+            return 0
+        try:
+            return self.file.tell()
+        except (OSError, io.UnsupportedOperation):
+            return 0
+
+    def can_replay(self) -> bool:
+        # Plain str/bytes content is always replayable. A file-like object can
+        # only be replayed if it actually supports seeking back to its initial
+        # position. Some objects (e.g. `io.IOBase` subclasses) expose `seek`
+        # and `tell` attributes even though they raise when called.
+        if isinstance(self.file, (str, bytes)):
+            return True
+        return self._is_seekable()
+
+    def _is_seekable(self) -> bool:
+        if not (hasattr(self.file, "seek") and hasattr(self.file, "tell")):
+            return False
+        try:
+            self.file.tell()
+            return True
+        except (OSError, io.UnsupportedOperation):
+            return False
+
+    def replay(self) -> None:
+        if isinstance(self.file, (str, bytes)):
+            return
+        self.file.seek(self._initial_position)
 
     def get_length(self) -> int | None:
         headers = self.render_headers()
@@ -181,7 +224,9 @@ class FileField:
         if file_length is None:
             return None
 
-        return len(headers) + file_length
+        # Only the segment from the recorded offset is uploaded, so the
+        # initial position has to be excluded from the declared length.
+        return len(headers) + file_length - self._initial_position
 
     def render_headers(self) -> bytes:
         if not hasattr(self, "_headers"):
@@ -207,7 +252,7 @@ class FileField:
 
         if hasattr(self.file, "seek"):
             try:
-                self.file.seek(0)
+                self.file.seek(self._initial_position)
             except io.UnsupportedOperation:
                 pass
 
@@ -290,6 +335,17 @@ class MultipartStream(SyncByteStream, AsyncByteStream):
         if content_length is None:
             return {"Transfer-Encoding": "chunked", "Content-Type": content_type}
         return {"Content-Length": str(content_length), "Content-Type": content_type}
+
+    def can_replay(self) -> bool:
+        # The whole multipart body is replayable only when every single field
+        # is able to produce its content again.
+        return all(field.can_replay() for field in self.fields)
+
+    def replay(self) -> None:
+        # Rewind every field to the position recorded for this request. Each
+        # file part tracks its own offset independently.
+        for field in self.fields:
+            field.replay()
 
     def __iter__(self) -> typing.Iterator[bytes]:
         for chunk in self.iter_chunks():

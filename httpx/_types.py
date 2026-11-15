@@ -96,6 +96,23 @@ class SyncByteStream:
         )  # pragma: no cover
         yield b""  # pragma: no cover
 
+    def can_replay(self) -> bool:
+        """
+        Return `True` if the stream is able to produce the same content again.
+
+        Streams backed by seekable resources (for example in-memory bytes or
+        files) can be replayed, while one-shot streams such as generators
+        cannot.
+        """
+        return False
+
+    def replay(self) -> None:
+        """
+        Reset the stream so that the request body can be sent a second time.
+
+        Only call this when `can_replay()` returns `True`.
+        """
+
     def close(self) -> None:
         """
         Subclasses can override this method to release any network resources
@@ -109,6 +126,23 @@ class AsyncByteStream:
             "The '__aiter__' method must be implemented."
         )  # pragma: no cover
         yield b""  # pragma: no cover
+
+    def can_replay(self) -> bool:
+        """
+        Return `True` if the stream is able to produce the same content again.
+
+        Streams backed by seekable resources (for example in-memory bytes or
+        files) can be replayed, while one-shot streams such as async
+        generators cannot.
+        """
+        return False
+
+    def replay(self) -> None:
+        """
+        Reset the stream so that the request body can be sent a second time.
+
+        Only call this when `can_replay()` returns `True`.
+        """
 
     async def aclose(self) -> None:
         pass

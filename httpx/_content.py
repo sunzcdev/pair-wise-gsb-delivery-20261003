@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import inspect
+import io
 import warnings
 from json import dumps as json_dumps
 from typing import (
@@ -38,6 +39,13 @@ class ByteStream(AsyncByteStream, SyncByteStream):
     async def __aiter__(self) -> AsyncIterator[bytes]:
         yield self._stream
 
+    def can_replay(self) -> bool:
+        return True
+
+    def replay(self) -> None:
+        # The full body is held in memory, so it can always be yielded again.
+        pass
+
 
 class IteratorByteStream(SyncByteStream):
     CHUNK_SIZE = 65_536
@@ -46,6 +54,29 @@ class IteratorByteStream(SyncByteStream):
         self._stream = stream
         self._is_stream_consumed = False
         self._is_generator = inspect.isgenerator(stream)
+        self._initial_position = self._get_initial_position()
+
+    def _get_initial_position(self) -> int:
+        # Record the position at which the request body should start, so that
+        # a replay (redirect/auth retry) does not reset the caller's stream to
+        # the very beginning. Non-seekable streams cannot be replayed anyway.
+        if hasattr(self._stream, "seek") and hasattr(self._stream, "tell"):
+            try:
+                return self._stream.tell()
+            except (AttributeError, OSError, io.UnsupportedOperation):
+                return 0
+        return 0
+
+    def get_content_length(self) -> int | None:
+        """
+        Return the number of bytes that will actually be sent, or `None` if
+        it cannot be determined up front.
+        """
+        total_length = peek_filelike_length(self._stream)
+        if total_length is None or not self.can_replay():
+            return None
+        # Only the segment starting at the recorded offset is uploaded.
+        return total_length - self._initial_position
 
     def __iter__(self) -> Iterator[bytes]:
         if self._is_stream_consumed and self._is_generator:
@@ -63,6 +94,25 @@ class IteratorByteStream(SyncByteStream):
             for part in self._stream:
                 yield part
 
+    def can_replay(self) -> bool:
+        # A seekable file-like object can be rewound to its initial position.
+        # `io.IOBase` subclasses can expose `seek`/`tell` while still raising
+        # when called, so probe the stream rather than relying on attributes.
+        return self._is_seekable()
+
+    def _is_seekable(self) -> bool:
+        if not (hasattr(self._stream, "seek") and hasattr(self._stream, "tell")):
+            return False
+        try:
+            self._stream.tell()
+            return True
+        except (AttributeError, OSError, io.UnsupportedOperation):
+            return False
+
+    def replay(self) -> None:
+        self._stream.seek(self._initial_position)
+        self._is_stream_consumed = False
+
 
 class AsyncIteratorByteStream(AsyncByteStream):
     CHUNK_SIZE = 65_536
@@ -71,6 +121,18 @@ class AsyncIteratorByteStream(AsyncByteStream):
         self._stream = stream
         self._is_stream_consumed = False
         self._is_generator = inspect.isasyncgen(stream)
+        self._initial_position = self._get_initial_position()
+
+    def _get_initial_position(self) -> int:
+        # Record the position at which the request body should start, so that
+        # a replay (redirect/auth retry) does not reset the caller's stream to
+        # the very beginning. Non-seekable streams cannot be replayed anyway.
+        if hasattr(self._stream, "seek") and hasattr(self._stream, "tell"):
+            try:
+                return self._stream.tell()
+            except (AttributeError, OSError, io.UnsupportedOperation):
+                return 0
+        return 0
 
     async def __aiter__(self) -> AsyncIterator[bytes]:
         if self._is_stream_consumed and self._is_generator:
@@ -87,6 +149,25 @@ class AsyncIteratorByteStream(AsyncByteStream):
             # Otherwise iterate.
             async for part in self._stream:
                 yield part
+
+    def can_replay(self) -> bool:
+        # An async seekable file-like object can be rewound to its
+        # initial position. Probe the stream because some objects expose
+        # `seek`/`tell` while still raising when called.
+        return self._is_seekable()
+
+    def _is_seekable(self) -> bool:
+        if not (hasattr(self._stream, "seek") and hasattr(self._stream, "tell")):
+            return False
+        try:
+            self._stream.tell()
+            return True
+        except (AttributeError, OSError, io.UnsupportedOperation):
+            return False
+
+    def replay(self) -> None:
+        self._stream.seek(self._initial_position)
+        self._is_stream_consumed = False
 
 
 class UnattachedStream(AsyncByteStream, SyncByteStream):
@@ -118,13 +199,14 @@ def encode_content(
         # catches a case that's easy for users to make in error, and would
         # otherwise pass through here, like any other bytes-iterable,
         # because `dict` happens to be iterable. See issue #2491.
-        content_length_or_none = peek_filelike_length(content)
+        stream = IteratorByteStream(content)  # type: ignore
+        content_length_or_none = stream.get_content_length()
 
         if content_length_or_none is None:
             headers = {"Transfer-Encoding": "chunked"}
         else:
             headers = {"Content-Length": str(content_length_or_none)}
-        return headers, IteratorByteStream(content)  # type: ignore
+        return headers, stream
 
     elif isinstance(content, AsyncIterable):
         headers = {"Transfer-Encoding": "chunked"}

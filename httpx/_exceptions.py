@@ -27,6 +27,7 @@ Our exception hierarchy:
 * StreamError
   x StreamConsumed
   x StreamClosed
+  x StreamReplayError
   x ResponseNotRead
   x RequestNotRead
 """
@@ -61,6 +62,7 @@ __all__ = [
     "ResponseNotRead",
     "StreamClosed",
     "StreamConsumed",
+    "StreamReplayError",
     "StreamError",
     "TimeoutException",
     "TooManyRedirects",
@@ -332,6 +334,25 @@ class StreamClosed(StreamError):
 
     def __init__(self) -> None:
         message = "Attempted to read or stream content, but the stream has been closed."
+        super().__init__(message)
+
+
+class StreamReplayError(StreamError):
+    """
+    Attempted to resend a request, but the request content cannot be replayed.
+
+    This can occur when a redirect or an authentication retry requires the
+    request body to be sent more than once, but the underlying stream (for
+    example a generator) does not support being consumed again.
+    """
+
+    def __init__(self) -> None:
+        message = (
+            "Attempted to resend a request, but the request content cannot "
+            "be replayed. This can happen when a redirect or an authentication "
+            "retry requires the request body to be streamed more than once, "
+            "and the stream does not support being consumed again."
+        )
         super().__init__(message)
 
 

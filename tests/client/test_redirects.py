@@ -1,3 +1,4 @@
+import io
 import typing
 
 import pytest
@@ -356,8 +357,100 @@ def test_cannot_redirect_streaming_body():
     def streaming_body() -> typing.Iterator[bytes]:
         yield b"Example request body"  # pragma: no cover
 
-    with pytest.raises(httpx.StreamConsumed):
+    with pytest.raises(httpx.StreamReplayError):
         client.post(url, content=streaming_body(), follow_redirects=True)
+
+
+def test_redirect_replays_multipart_file_from_recorded_offset():
+    client = httpx.Client(
+        transport=httpx.MockTransport(redirects), follow_redirects=True
+    )
+    url = "https://example.org/redirect_body"
+
+    upload = io.BytesIO(b"Hello, world!")
+    upload.seek(7)
+
+    response = client.post(url, files={"file": upload})
+    assert response.status_code == 200
+    # The 308 redirect preserves the method and body. The replayed upload must
+    # start from the recorded offset rather than from the start of the file.
+    assert "world!" in response.json()["body"]
+    assert "Hello" not in response.json()["body"]
+    assert not upload.closed
+
+
+def test_redirect_closes_response_when_body_cannot_replay():
+    closed = []
+
+    class TrackingStream(httpx.SyncByteStream):
+        def __iter__(self) -> typing.Iterator[bytes]:
+            yield b"<a>redirect</a>"
+
+        def close(self) -> None:
+            closed.append(True)
+
+    class TrackingTransport(httpx.MockTransport):
+        def handle_request(self, request: httpx.Request) -> httpx.Response:
+            # Consume the one-shot generator body, mirroring a real network
+            # send, before the redirect response is produced.
+            list(request.stream)
+            return httpx.Response(
+                httpx.codes.PERMANENT_REDIRECT,
+                headers={"location": "/target"},
+                stream=TrackingStream(),
+            )
+
+    client = httpx.Client(transport=TrackingTransport(redirects))
+    url = "https://example.org/redirect_body"
+
+    def streaming_body() -> typing.Iterator[bytes]:
+        yield b"Example request body"  # pragma: no cover
+
+    with pytest.raises(httpx.StreamReplayError):
+        client.post(url, content=streaming_body(), follow_redirects=True)
+
+    assert closed
+
+
+@pytest.mark.anyio
+async def test_async_redirect_replays_multipart_file_from_recorded_offset():
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(redirects), follow_redirects=True
+    ) as client:
+        url = "https://example.org/redirect_body"
+
+        upload = io.BytesIO(b"Hello, world!")
+        upload.seek(7)
+
+        response = await client.post(url, files={"file": upload})
+        assert response.status_code == 200
+        assert "world!" in response.json()["body"]
+        assert "Hello" not in response.json()["body"]
+        assert not upload.closed
+
+
+@pytest.mark.anyio
+async def test_async_cannot_redirect_streaming_body():
+    class AsyncConsumeBodyTransport(httpx.MockTransport):
+        async def handle_async_request(
+            self, request: httpx.Request
+        ) -> httpx.Response:
+            assert isinstance(request.stream, httpx.AsyncByteStream)
+            [_ async for _ in request.stream]
+            return self.handler(request)  # type: ignore[return-value]
+
+    async with httpx.AsyncClient(
+        transport=AsyncConsumeBodyTransport(redirects)
+    ) as client:
+        url = "https://example.org/redirect_body"
+
+        async def streaming_body() -> typing.AsyncIterator[bytes]:
+            yield b"Example request body"  # pragma: no cover
+
+        with pytest.raises(httpx.StreamReplayError):
+            await client.post(
+                url, content=streaming_body(), follow_redirects=True
+            )
 
 
 def test_cross_subdomain_redirect():

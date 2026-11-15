@@ -423,6 +423,7 @@ def test_multipart_encode_non_seekable_filelike() -> None:
 def test_multipart_rewinds_files():
     with tempfile.TemporaryFile() as upload:
         upload.write(b"Hello, world!")
+        upload.seek(0)
 
         transport = httpx.MockTransport(echo_request_content)
         client = httpx.Client(transport=transport)
@@ -432,11 +433,105 @@ def test_multipart_rewinds_files():
         assert response.status_code == 200
         assert b"\r\nHello, world!\r\n" in response.content
 
-        # POSTing the same file instance a second time should have the same content.
+        # POSTing the same file instance a second time, after the caller resets
+        # its position, should have the same content.
+        upload.seek(0)
         files = {"file": upload}
         response = client.post("http://127.0.0.1:8000/", files=files)
         assert response.status_code == 200
         assert b"\r\nHello, world!\r\n" in response.content
+
+
+def test_multipart_respects_initial_file_position():
+    """
+    A file that has already been seeked into the middle should upload from
+    the recorded offset, not from the very beginning of the file.
+    """
+    with tempfile.TemporaryFile() as upload:
+        upload.write(b"Hello, world!")
+        upload.seek(7)
+
+        transport = httpx.MockTransport(echo_request_content)
+        client = httpx.Client(transport=transport)
+
+        response = client.post("http://127.0.0.1:8000/", files={"file": upload})
+        assert response.status_code == 200
+        assert b"\r\nworld!\r\n" in response.content
+        assert b"Hello" not in response.content
+
+        # The declared length must match the bytes that are actually sent.
+        content_length = int(response.request.headers["Content-Length"])
+        assert content_length == len(response.content)
+
+
+def test_multipart_replay_restores_initial_file_position():
+    """
+    Replaying the multipart body (e.g. for a redirect) rewinds each file to
+    the offset recorded for the request, rather than to the start of the file.
+    """
+    with tempfile.TemporaryFile() as upload:
+        upload.write(b"Hello, world!")
+        upload.seek(7)
+
+        request = httpx.Request(
+            "POST",
+            "http://127.0.0.1:8000/",
+            files={"file": upload},
+        )
+        assert request.stream.can_replay()
+
+        first = request.read()
+        assert b"\r\nworld!\r\n" in first
+
+        request.stream.replay()
+        second = request.read()
+        assert second == first
+
+        # The caller's file is left open, and its position is untouched by
+        # the replay machinery beyond reading the requested segment.
+        assert not upload.closed
+
+
+def test_multipart_multiple_files_track_their_own_offsets():
+    with tempfile.TemporaryFile() as first, tempfile.TemporaryFile() as second:
+        first.write(b"aaaaBBBB")
+        second.write(b"ccccDDDD")
+        first.seek(4)
+        second.seek(4)
+
+        request = httpx.Request(
+            "POST",
+            "http://127.0.0.1:8000/",
+            files=[("first", first), ("second", second)],
+        )
+
+        body = request.read()
+        assert b"BBBB" in body
+        assert b"DDDD" in body
+        assert b"aaaa" not in body
+        assert b"cccc" not in body
+
+        request.stream.replay()
+        assert request.read() == body
+
+
+def test_multipart_non_replayable_file():
+    class NonSeekable:
+        def __init__(self) -> None:
+            self._buffer = io.BytesIO(b"file content")
+
+        def read(self, size: int = -1) -> bytes:
+            return self._buffer.read(size)
+
+    request = httpx.Request(
+        "POST",
+        "http://127.0.0.1:8000/",
+        files={"file": NonSeekable()},
+    )
+    assert not request.stream.can_replay()
+
+    # The first upload still works exactly as before.
+    assert b"file content" in request.read()
 
 
 class TestHeaderParamHTML5Formatting:
