@@ -1,3 +1,19 @@
+Unreleased
+
+* Added an explicit ``strict_unicode`` mode to ``JSONDecoder``,
+  ``JSONEncoder`` and the module-level ``loads``/``load``/``dumps``/``dump``
+  functions. When enabled, unpaired UTF-16 surrogate code points
+  (U+D800..U+DFFF) are rejected in decoded string values and object property
+  names (whether literal or ``\uXXXX`` escapes, with the error positioned at
+  the offending text), while escaped high/low surrogate pairs are still
+  combined into the supplementary-plane character they encode. On the
+  encoding side, strings and object keys containing an unpaired surrogate
+  raise ``ValueError``; the check runs before escaping so ``ensure_ascii``
+  cannot launder a lone surrogate into a ``\udXXX`` escape. The existing
+  ``strict`` control-character switch is unaffected. The C speedups do not
+  implement the mode, so enabling it transparently falls back to the
+  pure-Python scanner and encoder.
+
 Version 4.3.0 released 2026-11-10
 
 * The C encoder no longer crashes when ``default()`` or ``for_json()``

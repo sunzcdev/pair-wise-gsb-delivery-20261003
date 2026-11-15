@@ -463,7 +463,8 @@ Encoders and decoders
 
 .. class:: JSONDecoder(encoding='utf-8', object_hook=None, parse_float=None, \
                        parse_int=None, parse_constant=None, \
-                       object_pairs_hook=None, strict=True, allow_nan=False)
+                       object_pairs_hook=None, strict=True, allow_nan=False, \
+                       strict_unicode=False)
 
    Simple JSON decoder.
 
@@ -542,6 +543,15 @@ Encoders and decoders
    unescaped control characters are parse errors, if ``False`` then control
    characters will be allowed in strings.
 
+   *strict_unicode*, when True (not the default), makes the decoder reject
+   unpaired UTF-16 surrogate code points (U+D800..U+DFFF) in string values
+   and object property names, whether they appear as literal characters or as
+   ``\uXXXX`` escape sequences; the error is positioned at the offending
+   text. Escaped high/low surrogate pairs that encode a supplementary-plane
+   character are accepted and combined. It is independent of *strict*, which
+   only concerns literal control characters. The C speedups do not implement
+   this mode, so enabling it uses the pure-Python scanner.
+
    *allow_nan* when True (not the default), the decoder will allow
    ``NaN``, ``Infinity``, and ``-Infinity`` as their corresponding floats.
 
@@ -577,7 +587,8 @@ Encoders and decoders
                        namedtuple_as_object=True, tuple_as_array=True, \
                        bigint_as_string=False, item_sort_key=None, \
                        for_json=True, ignore_nan=False, \
-                       int_as_string_bitcount=None, iterable_as_array=False)
+                       int_as_string_bitcount=None, iterable_as_array=False, \
+                       strict_unicode=False)
 
    Extensible JSON encoder for Python data structures.
 
@@ -633,6 +644,14 @@ Encoders and decoders
    If *ensure_ascii* is true (the default), the output is guaranteed to be
    :class:`str` objects with all incoming unicode characters escaped.  If
    *ensure_ascii* is false, the output will be a unicode object.
+
+   If *strict_unicode* is true (not the default), encoding a string or object
+   key containing an unpaired UTF-16 surrogate code point (U+D800..U+DFFF)
+   raises :exc:`ValueError`. Properly paired surrogates encoding a
+   supplementary-plane character are always legal. The check runs before
+   escaping, so *ensure_ascii* cannot hide a lone surrogate behind a
+   ``\udXXX`` escape. The C speedups do not implement this mode, so enabling
+   it uses the pure-Python encoder.
 
    If *check_circular* is true (the default), then lists, dicts, iterables
    encoded with *iterable_as_array*, and custom encoded objects will be checked

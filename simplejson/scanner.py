@@ -25,6 +25,7 @@ def py_make_scanner(context):
     match_number = NUMBER_RE.match
     encoding = context.encoding
     strict = context.strict
+    strict_unicode = context.strict_unicode
     parse_float = context.parse_float
     parse_int = context.parse_int
     parse_constant = context.parse_constant
@@ -41,10 +42,12 @@ def py_make_scanner(context):
             raise JSONDecodeError(errmsg, string, idx)
 
         if nextchar == '"':
-            return parse_string(string, idx + 1, encoding, strict)
+            return parse_string(string, idx + 1, encoding, strict,
+                                strict_unicode=strict_unicode)
         elif nextchar == '{':
             return parse_object((string, idx + 1), encoding, strict,
-                _scan_once, object_hook, object_pairs_hook, memo)
+                _scan_once, object_hook, object_pairs_hook, memo,
+                strict_unicode=strict_unicode)
         elif nextchar == '[':
             return parse_array((string, idx + 1), _scan_once, array_hook)
         elif nextchar == 'n' and string[idx:idx + 4] == 'null':
@@ -84,4 +87,10 @@ def py_make_scanner(context):
 
     return scan_once
 
-make_scanner = c_make_scanner or py_make_scanner
+def make_scanner(context):
+    # strict_unicode is a pure-Python feature: the C scanner does not know
+    # how to reject unpaired surrogates, so fall back explicitly instead of
+    # silently ignoring the request.
+    if getattr(context, 'strict_unicode', False) or c_make_scanner is None:
+        return py_make_scanner(context)
+    return c_make_scanner(context)

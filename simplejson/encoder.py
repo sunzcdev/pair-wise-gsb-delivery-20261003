@@ -161,6 +161,62 @@ encode_basestring_ascii = (
 encode_basestring = (
     c_encode_basestring or py_encode_basestring)
 
+
+def _find_unpaired_surrogate(s):
+    """Return the index of the first unpaired surrogate in ``s``.
+
+    A high surrogate (U+D800..U+DBFF) immediately followed by a low
+    surrogate (U+DC00..U+DFFF) is a legal UTF-16 encoding of a supplementary
+    character and is not reported; every other surrogate code point is
+    unpaired. The ordinal-based scan behaves identically on narrow UCS-2
+    and wide builds: a supplementary character is itself stored as such a
+    pair on a narrow build, so it is correctly accepted.
+    """
+    idx = 0
+    length = len(s)
+    while idx < length:
+        code = ord(s[idx])
+        if 0xd800 <= code <= 0xdbff:
+            nxt = idx + 1
+            if nxt < length and 0xdc00 <= ord(s[nxt]) <= 0xdfff:
+                idx = nxt + 1
+                continue
+            return idx
+        if 0xdc00 <= code <= 0xdfff:
+            return idx
+        idx += 1
+    return None
+
+
+def _reject_unpaired_surrogate(s):
+    """Raise ValueError if ``s`` contains an unpaired UTF-16 surrogate.
+
+    Used by strict_unicode encoding. The check runs before any escaping so
+    that ``ensure_ascii`` cannot launder an illegal lone surrogate into a
+    ``\\udXXX`` escape: JSON produced by a strict encoder must never contain
+    an unpaired surrogate, escaped or literal.
+    """
+    if PY3 and isinstance(s, bytes):
+        # Normalize the same way the underlying encoders do so the check
+        # sees text rather than raw UTF-8 code units.
+        s = str(s, 'utf-8')
+    pos = _find_unpaired_surrogate(s)
+    if pos is not None:
+        raise ValueError(
+            "Unpaired surrogate character (0x%04x) is not JSON serializable"
+            % (ord(s[pos]),))
+
+
+def py_encode_basestring_strict(s, _encode=py_encode_basestring):
+    _reject_unpaired_surrogate(s)
+    return _encode(s)
+
+
+def py_encode_basestring_ascii_strict(s,
+        _encode=py_encode_basestring_ascii):
+    _reject_unpaired_surrogate(s)
+    return _encode(s)
+
 class JSONEncoder(object):
     """Extensible JSON <http://json.org> encoder for Python data structures.
 
@@ -199,7 +255,8 @@ class JSONEncoder(object):
                  use_decimal=True, namedtuple_as_object=True,
                  tuple_as_array=True, bigint_as_string=False,
                  item_sort_key=None, for_json=False, ignore_nan=False,
-                 int_as_string_bitcount=None, iterable_as_array=False):
+                 int_as_string_bitcount=None, iterable_as_array=False,
+                 strict_unicode=False):
         """Constructor for JSONEncoder, with sensible defaults.
 
         If skipkeys is false, then it is a TypeError to attempt
@@ -281,6 +338,14 @@ class JSONEncoder(object):
         as ``null`` in compliance with the ECMA-262 specification. If true,
         this will override *allow_nan*.
 
+        If *strict_unicode* is true (default: ``False``), encoding a string
+        or object key containing an unpaired UTF-16 surrogate code point
+        (U+D800..U+DFFF) raises :class:`ValueError`. Surrogate pairs that
+        encode a supplementary-plane character are always legal. The check
+        runs before escaping, so *ensure_ascii* cannot hide a lone surrogate
+        behind a ``\\udXXX`` escape. The C speedups do not implement this
+        mode, so enabling it transparently selects the pure-Python encoder.
+
         """
 
         self.skipkeys = skipkeys
@@ -297,6 +362,7 @@ class JSONEncoder(object):
         self.for_json = for_json
         self.ignore_nan = ignore_nan
         self.int_as_string_bitcount = int_as_string_bitcount
+        self.strict_unicode = strict_unicode
         if indent is not None and not isinstance(indent, string_types):
             indent = indent * ' '
         self.indent = indent
@@ -344,8 +410,12 @@ class JSONEncoder(object):
                 o = text_type(o, _encoding)
         if isinstance(o, string_types):
             if self.ensure_ascii:
+                if self.strict_unicode:
+                    return py_encode_basestring_ascii_strict(o)
                 return encode_basestring_ascii(o)
             else:
+                if self.strict_unicode:
+                    return py_encode_basestring_strict(o)
                 return encode_basestring(o)
         # This doesn't pass the iterator directly to ''.join() because the
         # exceptions aren't as detailed.  The list call should be roughly
@@ -373,9 +443,15 @@ class JSONEncoder(object):
         else:
             markers = None
         if self.ensure_ascii:
-            _encoder = encode_basestring_ascii
+            if self.strict_unicode:
+                _encoder = py_encode_basestring_ascii_strict
+            else:
+                _encoder = encode_basestring_ascii
         else:
-            _encoder = encode_basestring
+            if self.strict_unicode:
+                _encoder = py_encode_basestring_strict
+            else:
+                _encoder = encode_basestring
         if self.encoding != 'utf-8' and self.encoding is not None:
             def _encoder(o, _orig_encoder=_encoder, _encoding=self.encoding):
                 if isinstance(o, binary_type):
@@ -412,7 +488,7 @@ class JSONEncoder(object):
         key_memo = {}
         int_as_string_bitcount = (
             53 if self.bigint_as_string else self.int_as_string_bitcount)
-        if c_make_encoder is not None:
+        if c_make_encoder is not None and not self.strict_unicode:
             _iterencode = c_make_encoder(
                 markers, self.default, _encoder, self.indent,
                 self.key_separator, self.item_separator, self.sort_keys,
@@ -422,6 +498,8 @@ class JSONEncoder(object):
                 self.item_sort_key, self.encoding, self.for_json,
                 self.ignore_nan, decimal.Decimal, self.iterable_as_array)
         else:
+            # strict_unicode has no C implementation; always use the
+            # pure-Python encoder so the surrogate check is actually run.
             _iterencode = _make_iterencode(
                 markers, self.default, _encoder, self.indent, floatstr,
                 self.key_separator, self.item_separator, self.sort_keys,

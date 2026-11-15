@@ -233,6 +233,14 @@ def dump(obj, fp, skipkeys=False, ensure_ascii=True, check_circular=True,
     ``null`` in compliance with the ECMA-262 specification. If true, this will
     override *allow_nan*.
 
+    If *strict_unicode* is true (default: ``False``), strings and object keys
+    containing unpaired UTF-16 surrogate code points (U+D800..U+DFFF) raise
+    :class:`ValueError` instead of being emitted. Properly paired surrogates
+    that encode a supplementary-plane character remain valid, and the check
+    runs before escaping so *ensure_ascii* cannot launder a lone surrogate
+    into a ``\\udXXX`` escape. Enabling this option uses the pure-Python
+    encoder because the C speedups do not implement it.
+
     To use a custom ``JSONEncoder`` subclass (e.g. one that overrides the
     ``.default()`` method to serialize additional types), specify it with
     the ``cls`` kwarg. NOTE: You should use *default* or *for_json* instead
@@ -360,6 +368,14 @@ def dumps(obj, skipkeys=False, ensure_ascii=True, check_circular=True,
     ``null`` in compliance with the ECMA-262 specification. If true, this will
     override *allow_nan*.
 
+    If *strict_unicode* is true (default: ``False``), strings and object keys
+    containing unpaired UTF-16 surrogate code points (U+D800..U+DFFF) raise
+    :class:`ValueError` instead of being emitted. Properly paired surrogates
+    that encode a supplementary-plane character remain valid, and the check
+    runs before escaping so *ensure_ascii* cannot launder a lone surrogate
+    into a ``\\udXXX`` escape. Enabling this option uses the pure-Python
+    encoder because the C speedups do not implement it.
+
     To use a custom ``JSONEncoder`` subclass (e.g. one that overrides the
     ``.default()`` method to serialize additional types), specify it with
     the ``cls`` kwarg. NOTE: You should use *default* instead of subclassing
@@ -446,6 +462,9 @@ def load(fp, encoding=None, cls=None, object_hook=None, parse_float=None,
     ``'Infinity'``, ``'NaN'``. It is not recommended to use this feature,
     as it is rare to parse non-compliant JSON containing these values.
 
+    *strict_unicode* rejects unpaired UTF-16 surrogate code points; see
+    :func:`loads` for the full description.
+
     To use a custom ``JSONDecoder`` subclass, specify it with the ``cls``
     kwarg. NOTE: You should use *object_hook* or *object_pairs_hook* instead
     of subclassing whenever possible.
@@ -504,6 +523,15 @@ def loads(s, encoding=None, cls=None, object_hook=None, parse_float=None,
     called with one of the following strings: ``'-Infinity'``,
     ``'Infinity'``, ``'NaN'``. It is not recommended to use this feature,
     as it is rare to parse non-compliant JSON containing these values.
+
+    If *strict_unicode* is true (default: ``False``), unpaired UTF-16
+    surrogate code points (U+D800..U+DFFF) in string values and object
+    property names are rejected with :class:`JSONDecodeError`, whether they
+    appear as literal characters or as ``\\uXXXX`` escape sequences.
+    Escaped high/low surrogate pairs encoding a supplementary-plane
+    character are accepted and combined. It is independent of the *strict*
+    control-character behavior. Enabling this option uses the pure-Python
+    scanner because the C speedups do not implement it.
 
     To use a custom ``JSONDecoder`` subclass, specify it with the ``cls``
     kwarg. NOTE: You should use *object_hook* or *object_pairs_hook* instead

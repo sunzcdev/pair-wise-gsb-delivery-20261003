@@ -40,6 +40,32 @@ BACKSLASH = {
 
 DEFAULT_ENCODING = "utf-8"
 
+
+def _find_unpaired_surrogate(s):
+    """Return the index of the first unpaired surrogate in ``s``.
+
+    A high surrogate (U+D800..U+DBFF) paired with an immediately following
+    low surrogate (U+DC00..U+DFFF) is not reported. Used by strict_unicode
+    scans of literal (unescaped) text. The ordinal-based scan (rather than
+    a regex) behaves the same on narrow UCS-2 and wide builds: on narrow
+    builds a supplementary character is stored natively as exactly such a
+    pair, so it is correctly accepted.
+    """
+    idx = 0
+    length = len(s)
+    while idx < length:
+        code = ord(s[idx])
+        if 0xd800 <= code <= 0xdbff:
+            nxt = idx + 1
+            if nxt < length and 0xdc00 <= ord(s[nxt]) <= 0xdfff:
+                idx = nxt + 1
+                continue
+            return idx
+        if 0xdc00 <= code <= 0xdfff:
+            return idx
+        idx += 1
+    return None
+
 if hasattr(sys, 'get_int_max_str_digits'):
     bounded_int = int
 else:
@@ -65,7 +91,7 @@ def scan_four_digit_hex(s, end, _m=re.compile(r'^[0-9a-fA-F]{4}$').match):
     except ValueError:
         raise JSONDecodeError(msg, s, end - 2)
 
-def py_scanstring(s, end, encoding=None, strict=True,
+def py_scanstring(s, end, encoding=None, strict=True, strict_unicode=False,
         _b=BACKSLASH, _m=STRINGCHUNK.match, _join=u''.join,
         _PY3=PY3, _maxunicode=sys.maxunicode,
         _scan_four_digit_hex=scan_four_digit_hex):
@@ -74,6 +100,15 @@ def py_scanstring(s, end, encoding=None, strict=True,
     Unescapes all valid JSON string escape sequences and raises ValueError
     on attempt to decode an invalid string. If strict is False then literal
     control characters are allowed in the string.
+
+    If strict_unicode is True then unpaired UTF-16 surrogate code points
+    (U+D800..U+DFFF) are rejected wherever they occur: literal characters in
+    the JSON text, decoded ``\\uXXXX`` escapes, and object property names all
+    raise JSONDecodeError pointing at the offending text position. Escaped
+    high/low surrogate pairs (``\\uD800``-style followed by ``\\uDC00``-style)
+    are still combined into the single supplementary-plane character they
+    encode. The *strict* flag is unaffected: it only governs literal control
+    characters.
 
     Returns a tuple of the decoded string and the index of the character in s
     after the end quote."""
@@ -94,6 +129,12 @@ def py_scanstring(s, end, encoding=None, strict=True,
         if content:
             if not _PY3 and not isinstance(content, unicode):
                 content = unicode(content, encoding)
+            if strict_unicode:
+                bad = _find_unpaired_surrogate(content)
+                if bad is not None:
+                    raise JSONDecodeError(
+                        "Unpaired surrogate character at",
+                        s, prev_end + bad)
             _append(content)
         # Terminator is the end of string, a literal control character,
         # or a backslash denoting that an escape sequence follows
@@ -104,6 +145,11 @@ def py_scanstring(s, end, encoding=None, strict=True,
                 msg = "Invalid control character %r at"
                 raise JSONDecodeError(msg, s, end - 1)
             else:
+                if strict_unicode:
+                    code = ord(terminator)
+                    if 0xd800 <= code <= 0xdfff:
+                        raise JSONDecodeError(
+                            "Unpaired surrogate character at", s, end - 1)
                 _append(terminator)
                 continue
         try:
@@ -121,18 +167,42 @@ def py_scanstring(s, end, encoding=None, strict=True,
             end += 1
         else:
             # Unicode escape sequence
+            esc_begin = end
             uni, end = _scan_four_digit_hex(s, end + 1)
-            # Check for surrogate pair on UCS-4 systems
-            # Note that this will join high/low surrogate pairs
-            # but will also pass unpaired surrogates through
-            if (_maxunicode > 65535 and
-                uni & 0xfc00 == 0xd800 and
-                s[end:end + 2] == '\\u'):
+            if strict_unicode and (uni & 0xfc00) == 0xdc00:
+                # A low surrogate escape is only legal immediately after a
+                # high surrogate escape, which is handled below, so a leading
+                # low surrogate is always unpaired.
+                raise JSONDecodeError(
+                    "Unpaired surrogate escape sequence at", s, esc_begin)
+            if uni & 0xfc00 == 0xd800 and s[end:end + 2] == '\\u':
                 uni2, end2 = _scan_four_digit_hex(s, end + 2)
-                if uni2 & 0xfc00 == 0xdc00:
-                    uni = 0x10000 + (((uni - 0xd800) << 10) |
-                                        (uni2 - 0xdc00))
+                if (uni2 & 0xfc00) == 0xdc00:
+                    # A legal high/low surrogate pair. On UCS-4 (wide) builds
+                    # combine the two escapes into the single supplementary
+                    # character they encode; on narrow UCS-2 builds the pair
+                    # remains two code units in the decoded string, which is
+                    # that build's native representation of the character.
                     end = end2
+                    if _maxunicode > 65535:
+                        uni = 0x10000 + (((uni - 0xd800) << 10) |
+                                            (uni2 - 0xdc00))
+                        char = unichr(uni)
+                    else:
+                        _append(unichr(uni))
+                        char = unichr(uni2)
+                    _append(char)
+                    continue
+                if strict_unicode:
+                    # High surrogate followed by an escape that is not a
+                    # low surrogate: the high surrogate alone is unpaired.
+                    raise JSONDecodeError(
+                        "Unpaired surrogate escape sequence at",
+                        s, esc_begin)
+            elif strict_unicode and (uni & 0xfc00) == 0xd800:
+                # High surrogate with no following \uXXXX escape at all.
+                raise JSONDecodeError(
+                    "Unpaired surrogate escape sequence at", s, esc_begin)
             char = unichr(uni)
         # Append the unescaped character
         _append(char)
@@ -146,7 +216,7 @@ WHITESPACE = re.compile(r'[ \t\n\r]*', FLAGS)
 WHITESPACE_STR = ' \t\n\r'
 
 def JSONObject(state, encoding, strict, scan_once, object_hook,
-        object_pairs_hook, memo=None,
+        object_pairs_hook, memo=None, strict_unicode=False,
         _w=WHITESPACE.match, _ws=WHITESPACE_STR):
     (s, end) = state
     # Backwards compatibility
@@ -177,7 +247,8 @@ def JSONObject(state, encoding, strict, scan_once, object_hook,
                 s, end)
     end += 1
     while True:
-        key, end = scanstring(s, end, encoding, strict)
+        key, end = scanstring(s, end, encoding, strict,
+                              strict_unicode=strict_unicode)
         key = memo_get(key, key)
 
         # To skip some function call overhead we optimize the fast paths where
@@ -325,7 +396,7 @@ class JSONDecoder(object):
     def __init__(self, encoding=None, object_hook=None, parse_float=None,
             parse_int=None, parse_constant=None, strict=True,
             object_pairs_hook=None, allow_nan=False,
-            array_hook=None):
+            array_hook=None, strict_unicode=False):
         """
         *encoding* determines the encoding used to interpret any
         :class:`str` objects decoded by this instance (``'utf-8'`` by
@@ -371,6 +442,15 @@ class JSONDecoder(object):
         ``True`` means that unescaped control characters are parse errors, if
         ``False`` then control characters will be allowed in strings.
 
+        *strict_unicode*, if True, makes the decoder reject unpaired UTF-16
+        surrogate code points (U+D800..U+DFFF) in string values and object
+        property names, whether they occur as literal characters or as
+        ``\\uXXXX`` escapes. Escaped high/low surrogate pairs that encode a
+        supplementary-plane character are accepted and combined. It is
+        independent of *strict*, which only concerns literal control
+        characters. The C speedups do not implement this mode, so enabling
+        it transparently selects the pure-Python scanner.
+
         """
         if encoding is None:
             encoding = DEFAULT_ENCODING
@@ -383,10 +463,16 @@ class JSONDecoder(object):
             parse_constant = allow_nan and _CONSTANTS.__getitem__ or None
         self.parse_constant = parse_constant
         self.strict = strict
+        self.strict_unicode = strict_unicode
         self.array_hook = array_hook
         self.parse_object = JSONObject
         self.parse_array = JSONArray
-        self.parse_string = scanstring
+        if strict_unicode and c_scanstring is not None:
+            # The C scanstring has no strict-unicode mode; force the
+            # pure-Python implementation so the check is actually applied.
+            self.parse_string = py_scanstring
+        else:
+            self.parse_string = scanstring
         self.memo = {}
         self.scan_once = make_scanner(self)
 
