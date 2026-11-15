@@ -12,7 +12,13 @@ from requests.cookies import RequestsCookieJar
 from requests.structures import CaseInsensitiveDict
 
 from .._utils import is_json_content_type
-from ..policy import ExpirationTime, add_tzinfo, get_expiration_datetime, utcnow
+from ..policy import (
+    ExpirationTime,
+    add_tzinfo,
+    get_corrected_initial_age,
+    get_expiration_datetime,
+    utcnow,
+)
 from . import CachedHTTPResponse, CachedRequest, RichMixin
 
 if TYPE_CHECKING:
@@ -103,6 +109,9 @@ def _comparable_content(response: Response) -> Union[DecodedContent, bytes]:
 class CachedResponse(RichMixin, BaseResponse):
     """A class that emulates :py:class:`requests.Response`, optimized for serialization"""
 
+    # Corrected initial age (RFC 9111, section 4.2.3) in seconds at the time the response was
+    # stored; includes time spent in upstream proxy caches. Current age = this + local residence.
+    age_at_creation: int = field(default=0)
     _content: bytes = field(default=None)
     _decoded_content: DecodedContent = field(default=None)
     _next: Optional[CachedRequest] = field(default=None)
@@ -175,6 +184,16 @@ class CachedResponse(RichMixin, BaseResponse):
         return round(delta.total_seconds())
 
     @property
+    def age(self) -> int:
+        """Current age of the response in seconds (RFC 9111, section 4.2.3).
+
+        This is the corrected initial age from upstream plus the time the response has resided in
+        this local cache. It is never negative.
+        """
+        residence_time = (utcnow() - self.created_at).total_seconds()
+        return max(0, self.age_at_creation + round(residence_time))
+
+    @property
     def expires_unix(self) -> Optional[int]:
         """Get expiration time as a Unix timestamp"""
         if self.expires is None:
@@ -198,6 +217,30 @@ class CachedResponse(RichMixin, BaseResponse):
         """Determine if this cached response is older than the given time"""
         older_than = get_expiration_datetime(older_than, negative_delta=True)
         return older_than is not None and self.created_at < older_than
+
+    def update_revalidated_age(
+        self,
+        headers,
+        received_at: Optional[datetime] = None,
+    ) -> int:
+        """Update the stored age after a 304 Not Modified response (RFC 9111, section 4.3.4).
+
+        A 304 carries new ``Date``/``Age`` headers but no new body, so the represented content is
+        the same data that was originally received. The corrected initial age is therefore raised
+        to at least the response's current age, preventing an old body from being treated as
+        freshly generated. ``created_at`` is advanced to the revalidation time so that local
+        residence continues to accrue from the new response.
+
+        Returns the corrected initial age to use from the revalidation time onward. This is the
+        single age value that both the stored metadata and the freshness lifetime are based on.
+        """
+        received_at = received_at or utcnow()
+        # Measure the stored response's current age before resetting the residence clock
+        previous_age = self.age
+        revalidated_initial_age = get_corrected_initial_age(headers, received_at)
+        self.age_at_creation = max(previous_age, revalidated_initial_age)
+        self.created_at = received_at
+        return self.age_at_creation
 
     @property
     def next(self) -> Optional[PreparedRequest]:

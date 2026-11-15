@@ -282,14 +282,18 @@ class CacheMixin(MIXIN_BASE):
         actions.update_from_response(response)
 
         if not actions.skip_write:
-            self.cache.save_response(response, actions.cache_key, actions.expires)
+            self.cache.save_response(
+                response, actions.cache_key, expire_after=actions.expire_after
+            )
         elif cached_response is not None and response.status_code == 304:
             cached_response = actions.update_revalidated_response(
                 response, CachedResponse.from_response(cached_response)
             )
             cached_response.cache_key = actions.cache_key
             if not actions.skip_write:
-                self.cache.save_response(cached_response, actions.cache_key, actions.expires)  # type: ignore[unreachable]
+                # Write directly: age/expiration were already computed for the 304, and
+                # recalculating from its headers would reset the preserved body age to zero.
+                self.cache.responses[actions.cache_key] = cached_response  # type: ignore[unreachable]
             return cached_response
         else:
             logger.debug(f'Skipping cache write for URL: {request.url}')

@@ -1,6 +1,9 @@
 # History
 
 ## Unreleased
+* Account for an upstream `Age` header and the origin `Date` when computing freshness, so `max-age` and stale windows are measured against the response's current age rather than only local residence time
+* Clamp invalid/negative `Age` values and future `Date` headers (clock skew) to a non-negative corrected initial age per RFC 9111, so they can never extend a response's lifetime
+* Preserve a cached body's age on a 304 Not Modified revalidation instead of treating the old content as freshly generated
 * Fix `ValueError` when a response has an invalid `Expires` date (for example `Expires: garbage`); it is now treated as already expired
 * Fix JSON refresh comparisons for mixed-case `Content-Type` values
 * Keep caller-supplied MongoDB clients open when closing MongoDB or GridFS caches
