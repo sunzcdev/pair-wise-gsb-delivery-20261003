@@ -86,23 +86,59 @@ class GZipDecoder(ContentDecoder):
     """
     Handle 'gzip' decoding.
 
+    Set `multi_member=True` to decode concatenated gzip members. The default
+    preserves the existing single-member behaviour.
+
     See: https://stackoverflow.com/questions/1838699
     """
 
-    def __init__(self) -> None:
+    def __init__(self, multi_member: bool = False) -> None:
+        self.multi_member = multi_member
         self.decompressor = zlib.decompressobj(zlib.MAX_WBITS | 16)
+        self._member_has_data = False
+
+    def _reset(self) -> None:
+        self.decompressor = zlib.decompressobj(zlib.MAX_WBITS | 16)
+        self._member_has_data = False
 
     def decode(self, data: bytes) -> bytes:
-        try:
-            return self.decompressor.decompress(data)
-        except zlib.error as exc:
-            raise DecodingError(str(exc)) from exc
+        if not self.multi_member:
+            try:
+                return self.decompressor.decompress(data)
+            except zlib.error as exc:
+                raise DecodingError(str(exc)) from exc
+
+        output: list[bytes] = []
+        while data:
+            self._member_has_data = True
+            try:
+                output.append(self.decompressor.decompress(data))
+            except zlib.error as exc:
+                raise DecodingError(str(exc)) from exc
+
+            data = self.decompressor.unused_data
+            if self.decompressor.eof:
+                try:
+                    output.append(self.decompressor.flush())
+                except zlib.error as exc:  # pragma: no cover
+                    raise DecodingError(str(exc)) from exc
+                self._reset()
+
+        return b"".join(output)
 
     def flush(self) -> bytes:
         try:
-            return self.decompressor.flush()
+            data = self.decompressor.flush()
         except zlib.error as exc:  # pragma: no cover
             raise DecodingError(str(exc)) from exc
+
+        if (
+            self.multi_member
+            and self._member_has_data
+            and not self.decompressor.eof
+        ):
+            raise DecodingError("gzip data is incomplete")
+        return data
 
 
 class BrotliDecoder(ContentDecoder):

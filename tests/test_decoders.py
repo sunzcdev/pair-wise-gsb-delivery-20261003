@@ -9,6 +9,12 @@ import pytest
 import zstandard as zstd
 
 import httpx
+from httpx._decoders import DeflateDecoder, GZipDecoder, MultiDecoder
+
+
+def gzip_compress(data: bytes) -> bytes:
+    compressor = zlib.compressobj(9, zlib.DEFLATED, zlib.MAX_WBITS | 16)
+    return compressor.compress(data) + compressor.flush()
 
 
 def test_deflate():
@@ -50,8 +56,7 @@ def test_zlib():
 
 def test_gzip():
     body = b"test 123"
-    compressor = zlib.compressobj(9, zlib.DEFLATED, zlib.MAX_WBITS | 16)
-    compressed_body = compressor.compress(body) + compressor.flush()
+    compressed_body = gzip_compress(body)
 
     headers = [(b"Content-Encoding", b"gzip")]
     response = httpx.Response(
@@ -60,6 +65,89 @@ def test_gzip():
         content=compressed_body,
     )
     assert response.content == body
+
+
+@pytest.mark.parametrize("chunk_size", [1, 2, 3, 7, 64])
+def test_gzip_multi_member(chunk_size):
+    members = [
+        gzip_compress(b"test "),
+        gzip_compress(b""),
+        gzip_compress(b"123"),
+    ]
+    compressed_body = b"".join(members)
+
+    decoder = GZipDecoder(multi_member=True)
+    output = b"".join(
+        decoder.decode(compressed_body[index : index + chunk_size])
+        for index in range(0, len(compressed_body), chunk_size)
+    )
+    output += decoder.flush()
+
+    assert output == b"test 123"
+
+
+def test_gzip_multi_member_default_compatibility():
+    compressed_body = gzip_compress(b"test ") + gzip_compress(b"123")
+
+    decoder = GZipDecoder()
+    output = decoder.decode(compressed_body) + decoder.flush()
+
+    assert output == b"test "
+
+
+@pytest.mark.parametrize("chunk_size", [1, 3, 64])
+@pytest.mark.parametrize(
+    "corrupt",
+    [
+        lambda body: body[:-1],
+        lambda body: body[:-8] + bytes([body[-8] ^ 1]) + body[-7:],
+        lambda body: body + b"not-a-gzip-member",
+    ],
+)
+def test_gzip_multi_member_errors(chunk_size, corrupt):
+    first_member = gzip_compress(b"test ")
+    compressed_body = corrupt(first_member + gzip_compress(b"123"))
+
+    decoder = GZipDecoder(multi_member=True)
+    with pytest.raises(httpx.DecodingError):
+        for index in range(0, len(compressed_body), chunk_size):
+            decoder.decode(compressed_body[index : index + chunk_size])
+        decoder.flush()
+
+
+def test_gzip_multi_member_in_content_encoding_chain():
+    body = b"test 123"
+
+    compressed_body = zlib.compress(body)
+
+    split_at = len(compressed_body) // 2
+    gzip_members = (
+        gzip_compress(compressed_body[:split_at])
+        + gzip_compress(compressed_body[split_at:])
+    )
+    decoder = MultiDecoder(
+        children=[DeflateDecoder(), GZipDecoder(multi_member=True)]
+    )
+
+    output = b"".join(decoder.decode(bytes([value])) for value in gzip_members)
+    output += decoder.flush()
+
+    assert output == body
+
+    split_at = len(body) // 2
+    gzip_members = (
+        gzip_compress(body[:split_at]) + gzip_compress(body[split_at:])
+    )
+
+    compressed_body = zlib.compress(gzip_members)
+    decoder = MultiDecoder(
+        children=[GZipDecoder(multi_member=True), DeflateDecoder()]
+    )
+
+    output = b"".join(decoder.decode(bytes([value])) for value in compressed_body)
+    output += decoder.flush()
+
+    assert output == body
 
 
 def test_brotli():
