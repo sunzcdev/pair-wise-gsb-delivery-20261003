@@ -3,6 +3,18 @@
 History
 -------
 
+VERSION (unreleased)
+~~~~~~~~~~~~~~~~~~~~
+
+* Added an explicit provenance mode: passing ``provenance=True`` to
+  ``Selector`` makes every result selector expose a ``provenance`` record
+  with the source line, the node path within the document and the chain of
+  queries that produced it. Attribute and text results point back to their
+  owning element, results from a manually provided ``root`` and from JSON
+  input are explicitly marked as unknown, and records are immutable
+  snapshots taken at extraction time that never compare equal, so identical
+  values from different nodes cannot be merged.
+
 1.12.1 (2026-09-28)
 ~~~~~~~~~~~~~~~~~~~
 

@@ -8,6 +8,7 @@ import json
 import re
 import typing
 import warnings
+from dataclasses import dataclass, replace
 from functools import lru_cache
 from io import BytesIO
 from typing import (
@@ -55,6 +56,66 @@ class CannotDropElementWithoutParent(CannotRemoveElementWithoutParent):
 
 class AbsoluteXPathWarning(UserWarning):
     """Emitted when an absolute XPath is used on a nested selector."""
+
+
+#: Kinds of results a :class:`Provenance` can describe.
+ProvenanceKind: TypeAlias = Literal["element", "attribute", "text", "json", "unknown"]
+
+
+@dataclass(frozen=True, eq=False)
+class Provenance:
+    """Provenance of a :class:`Selector` result.
+
+    A provenance record is an immutable snapshot taken when the query that
+    produced the selector was evaluated. It stores lightweight coordinates
+    (a line number, a node path and the chain of queries), never a copy of
+    the document, and it is never updated afterwards: dropping or moving
+    nodes in the underlying tree does not change it, nor does it silently
+    start pointing at different nodes.
+
+    ``line`` is the 1-based source line of the node in the parsed document,
+    or ``None`` when it is unknown.
+
+    ``path`` is the path of the node within its document (as returned by
+    :meth:`lxml.etree._ElementTree.getpath`), or ``None`` when it is unknown.
+
+    ``query_chain`` is the tuple of queries (XPath, CSS, JMESPath or
+    JSONPath) that were applied, in order, to reach this result from the
+    root selector.
+
+    ``kind`` is ``"element"`` for node results, ``"attribute"`` or
+    ``"text"`` for attribute and text results (whose ``line`` and ``path``
+    point to the element that owns them), ``"json"`` for JSON results and
+    ``"unknown"`` otherwise.
+
+    ``attribute`` is the attribute name when ``kind`` is ``"attribute"``,
+    ``None`` otherwise.
+
+    ``unknown_reason`` explains why the coordinates are unknown, e.g.
+    because the selector was built from a manually provided root or because
+    the input is JSON, which has no source coordinates. It is ``None`` when
+    the coordinates are known.
+
+    Two provenance records are never considered equal, even if all their
+    fields match: identical values coming from different nodes must not be
+    merged.
+    """
+
+    line: int | None = None
+    path: str | None = None
+    query_chain: tuple[str, ...] = ()
+    kind: ProvenanceKind = "unknown"
+    attribute: str | None = None
+    unknown_reason: str | None = None
+
+    @property
+    def is_unknown(self) -> bool:
+        """Whether the source coordinates of this result are unknown."""
+        return self.line is None and self.path is None
+
+    def _advance(self, query: str) -> Provenance:
+        """Return a copy of this record with *query* appended to the chain."""
+        return replace(self, query_chain=self.query_chain + (query,))
 
 
 class SafeXMLParser(etree.XMLParser):
@@ -550,13 +611,24 @@ class Selector:
     protection. See `this lxml FAQ entry
     <https://lxml.de/FAQ.html#is-lxml-vulnerable-to-xml-bombs>`_ for more
     information.
+
+    ``provenance`` enables provenance tracking. When it is ``True``, every
+    selector, including the results of further queries, gets a
+    :attr:`provenance` record with the source line, the node path within the
+    document and the chain of queries that produced it. Provenance tracking
+    does not change the return values of :meth:`get` or :meth:`getall`.
+
+    .. versionadded:: VERSION
+       The ``provenance`` argument and the :attr:`provenance` attribute.
     """
 
     __slots__ = [
         "__weakref__",
         "_expr",
         "_huge_tree",
+        "_provenance",
         "_text",
+        "_track_provenance",
         "body",
         "namespaces",
         "root",
@@ -587,11 +659,14 @@ class Selector:
         base_url: str | None = None,
         _expr: str | None = None,
         huge_tree: bool = True,
+        provenance: bool = False,
+        _provenance: Provenance | None = None,
     ) -> None:
         self.root: Any
         if type not in ("html", "json", "text", "xml", None):
             raise ValueError(f"Invalid type: {type}")
 
+        parsed = False
         if text is not None:
             if root is not _NOT_SET:
                 warnings.warn(
@@ -610,6 +685,7 @@ class Selector:
             )
             self.root = root
             self.type = type
+            parsed = True
         elif body:
             if not isinstance(body, (bytes, bytearray)):
                 msg = f"body argument should be of type bytes or bytearray, got {body.__class__}"
@@ -623,6 +699,7 @@ class Selector:
             )
             self.root = root
             self.type = type
+            parsed = True
         elif root is _NOT_SET:
             raise ValueError("Selector needs text, body, or root arguments")
         else:
@@ -636,9 +713,125 @@ class Selector:
         self._expr = _expr
         self._huge_tree = huge_tree
         self._text = text
+        self._track_provenance = provenance
+        if provenance:
+            self._provenance = (
+                _provenance if _provenance is not None else self._root_provenance(parsed)
+            )
+        else:
+            self._provenance = None
 
     def __getstate__(self) -> Any:
         raise TypeError("can't pickle Selector objects")
+
+    @property
+    def provenance(self) -> Provenance | None:
+        """Provenance of this selector, as a :class:`Provenance` record.
+
+        It is ``None`` unless the root selector was created with
+        ``provenance=True``.
+
+        The record is a snapshot taken when the query that produced this
+        selector was evaluated. Later changes to the underlying document,
+        such as dropping nodes with :meth:`drop`, do not update it.
+
+        .. versionadded:: VERSION
+        """
+        return self._provenance
+
+    def _provenance_kwargs(self, provenance: Provenance | None) -> dict[str, Any]:
+        """Return the extra constructor arguments for a child selector.
+
+        They are only passed when provenance tracking is enabled, so that
+        subclasses with a custom ``__init__`` that predates provenance
+        support keep working as long as the feature is off.
+        """
+        if not self._track_provenance:
+            return {}
+        return {"provenance": True, "_provenance": provenance}
+
+    def _root_provenance(self, parsed: bool) -> Provenance:
+        """Build the provenance record for a root selector."""
+        chain = (self._expr,) if self._expr else ()
+        if parsed and isinstance(self.root, etree._Element):
+            return Provenance(
+                line=self.root.sourceline,
+                path=self.root.getroottree().getpath(self.root),
+                query_chain=chain,
+                kind="element",
+            )
+        if self.type == "json":
+            return Provenance(
+                query_chain=chain,
+                kind="json",
+                unknown_reason="JSON data has no source coordinates",
+            )
+        if not isinstance(self.root, etree._Element):
+            return Provenance(
+                query_chain=chain,
+                kind="unknown",
+                unknown_reason=f"{self.type!r} input has no source coordinates",
+            )
+        return Provenance(
+            query_chain=chain,
+            kind="unknown",
+            unknown_reason="the selector was built from a manually provided root",
+        )
+
+    def _query_chain(self, query: str) -> tuple[str, ...]:
+        if self._provenance is None:
+            return (query,)
+        return self._provenance.query_chain + (query,)
+
+    def _node_provenance(self, node: Any, query: str) -> Provenance | None:
+        """Build the provenance record for an XPath query result."""
+        if not self._track_provenance:
+            return None
+        chain = self._query_chain(query)
+        if isinstance(node, etree._Element):
+            return Provenance(
+                line=node.sourceline,
+                path=node.getroottree().getpath(node),
+                query_chain=chain,
+                kind="element",
+            )
+        if isinstance(node, etree._ElementUnicodeResult):
+            parent = node.getparent()
+            if parent is None:
+                return Provenance(
+                    query_chain=chain,
+                    kind="unknown",
+                    unknown_reason="the result is not linked to a parent element",
+                )
+            if node.is_attribute:
+                return Provenance(
+                    line=parent.sourceline,
+                    path=parent.getroottree().getpath(parent),
+                    query_chain=chain,
+                    kind="attribute",
+                    attribute=node.attrname,
+                )
+            return Provenance(
+                line=parent.sourceline,
+                path=parent.getroottree().getpath(parent),
+                query_chain=chain,
+                kind="text",
+            )
+        return Provenance(
+            query_chain=chain,
+            kind="unknown",
+            unknown_reason="the query result is not a document node",
+        )
+
+    def _json_provenance(self, query: str) -> Provenance | None:
+        """Build the provenance record for a JMESPath or JSONPath result."""
+        if not self._track_provenance:
+            return None
+        return Provenance(
+            query_chain=self._query_chain(query),
+            kind="json",
+            unknown_reason="JSON data has no source coordinates",
+        )
 
     def _get_root(
         self,
@@ -668,9 +861,10 @@ class Selector:
 
     def _json_selector_list(self, values: Any, query: str) -> SelectorList[Self]:
         def make_selector(x: Any) -> Selector:  # closure function
+            kwargs = self._provenance_kwargs(self._json_provenance(query))
             if isinstance(x, str):
-                return self.__class__(text=x, _expr=query, type="text")
-            return self.__class__(root=x, _expr=query)
+                return self.__class__(text=x, _expr=query, type="text", **kwargs)
+            return self.__class__(root=x, _expr=query, **kwargs)
 
         return typing.cast(
             "SelectorList[Self]",
@@ -762,13 +956,20 @@ class Selector:
         query: str,
         namespaces: Mapping[str, str] | None,
         kwargs: dict[str, Any],
+        _chain_query: str | None = None,
     ) -> SelectorList[Self]:
         if self.type not in ("html", "xml", "text"):
             raise ValueError(f"Cannot use xpath on a Selector of type {self.type!r}")
+        chain_query = query if _chain_query is None else _chain_query
         if self.type in ("html", "xml"):
             root = self.root
             if not hasattr(root, "xpath"):
                 if isinstance(root, str) and query.strip() == ".":
+                    provenance = (
+                        self._provenance._advance(chain_query)
+                        if self._provenance is not None
+                        else None
+                    )
                     return typing.cast(
                         "SelectorList[Self]",
                         self.selectorlist_cls(
@@ -778,6 +979,7 @@ class Selector:
                                     _expr=query,
                                     namespaces=self.namespaces,
                                     type=self.type,
+                                    **self._provenance_kwargs(provenance),
                                 )
                             ]
                         ),
@@ -790,7 +992,10 @@ class Selector:
         if namespaces is not None:
             nsp.update(namespaces)
         try:
-            xpathev = _get_xpath_evaluator(query, nsp, self._lxml_smart_strings)
+            # Smart strings are needed in provenance mode so that text and
+            # attribute results can be traced back to their owning element.
+            smart_strings = self._lxml_smart_strings or self._track_provenance
+            xpathev = _get_xpath_evaluator(query, nsp, smart_strings)
             result = xpathev(root, **kwargs)
         except etree.XPathError as exc:
             raise ValueError(f"XPath error: {exc} in {query}")
@@ -800,10 +1005,14 @@ class Selector:
 
         result = [
             self.__class__(
-                root=x,
+                root=str(x)
+                if self._track_provenance
+                and isinstance(x, etree._ElementUnicodeResult)
+                else x,
                 _expr=query,
                 namespaces=self.namespaces,
                 type=_xml_or_html(self.type),
+                **self._provenance_kwargs(self._node_provenance(x, chain_query)),
             )
             for x in result
         ]
@@ -822,7 +1031,9 @@ class Selector:
         """
         if self.type not in ("html", "xml", "text"):
             raise ValueError(f"Cannot use css on a Selector of type {self.type!r}")
-        return self.xpath(self._css2xpath(query))
+        # _chain_query keeps the CSS query itself in the provenance query
+        # chain instead of the XPath it is translated into.
+        return self._xpath(self._css2xpath(query), None, {}, _chain_query=query)
 
     def _css2xpath(self, query: str) -> str:
         type_ = _xml_or_html(self.type)

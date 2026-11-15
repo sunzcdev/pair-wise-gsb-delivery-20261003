@@ -1303,6 +1303,79 @@ get right (or legible) without a variable reference::
     '<p>He said: "I don\'t know why, but I like mixing single and double quotes!"</p>'
 
 
+.. _topics-provenance:
+
+Provenance tracking
+-------------------
+
+.. versionadded:: VERSION
+
+When extraction results are stored into a collection pipeline, it is often
+useful to know where each value came from. Passing ``provenance=True`` to
+:class:`~parsel.selector.Selector` enables explicit provenance tracking:
+every selector, including the results of further ``xpath()``, ``css()``,
+``jmespath()`` and ``jsonpath()`` calls, gets a
+:attr:`~parsel.selector.Selector.provenance` attribute with a
+:class:`~parsel.selector.Provenance` record::
+
+    >>> html = '''<html>
+    ... <body>
+    ... <div class="item">
+    ...   <a href="/1">one</a>
+    ... </div>
+    ... </body>
+    ... </html>'''
+    >>> selector = Selector(text=html, provenance=True)
+    >>> link = selector.css("div.item").xpath(".//a")[0]
+    >>> link.provenance.line
+    4
+    >>> link.provenance.path
+    '/html/body/div/a'
+    >>> link.provenance.query_chain
+    ('div.item', './/a')
+
+A provenance record keeps:
+
+- ``line``: the 1-based source line of the node in the parsed document.
+- ``path``: the path of the node within the document.
+- ``query_chain``: the queries that were applied, in order, to reach the
+  result from the root selector.
+
+Attribute and text results point back to the element that owns them::
+
+    >>> href = selector.xpath("//a/@href")[0]
+    >>> href.provenance.kind, href.provenance.attribute
+    ('attribute', 'href')
+    >>> href.provenance.path
+    '/html/body/div/a'
+    >>> text = selector.xpath("//a/text()")[0]
+    >>> text.provenance.kind
+    'text'
+
+Provenance records have the following properties:
+
+- They are per-result snapshots taken when the query runs. Identical values
+  coming from different nodes get separate records that never compare
+  equal, so they cannot be merged by accident. Slicing a
+  :class:`~parsel.selector.SelectorList` and flattening queries over a
+  ``SelectorList`` keep the provenance of each individual result.
+- They are lightweight: only line numbers, path strings and query strings
+  are stored, never a copy of the document.
+- They are immutable snapshots. Removing nodes with
+  :meth:`~parsel.selector.Selector.drop` after extraction does not update
+  them or silently repoint them to other nodes.
+- When the coordinates are unknown — for selectors built from a manually
+  provided ``root``, or for JSON input, which has no source coordinates —
+  ``line`` and ``path`` are ``None``, ``is_unknown`` is ``True`` and
+  ``unknown_reason`` explains why.
+
+Provenance tracking does not change the return values of
+:meth:`~parsel.selector.Selector.get` or
+:meth:`~parsel.selector.Selector.getall`. When ``provenance=True`` is not
+passed, :attr:`~parsel.selector.Selector.provenance` is ``None`` and no
+tracking happens.
+
+
 Converting CSS to XPath
 -----------------------
 
