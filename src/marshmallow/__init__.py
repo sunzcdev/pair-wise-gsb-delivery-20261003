@@ -9,6 +9,7 @@ from marshmallow.decorators import (
 )
 from marshmallow.exceptions import ValidationError
 from marshmallow.schema import Schema, SchemaOpts
+from marshmallow import structured
 
 from . import fields
 
@@ -25,6 +26,7 @@ __all__ = [
     "post_load",
     "pre_dump",
     "pre_load",
+    "structured",
     "validates",
     "validates_schema",
 ]

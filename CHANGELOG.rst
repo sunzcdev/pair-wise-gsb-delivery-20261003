@@ -1,6 +1,24 @@
 Changelog
 =========
 
+Unreleased
+----------
+
+Features:
+
+- Add typed, path-based structured errors.
+  `ValidationError.structured <marshmallow.exceptions.ValidationError.structured>`
+  returns `StructuredError <marshmallow.structured.StructuredError>` objects
+  whose paths distinguish list indices (``"index"``), tuple positions
+  (``"position"``), mapping keys/values (``"mapping_key"``/``"mapping_value"``),
+  field names (``"field"``) and schema-level errors (``"schema"``). The legacy
+  ``messages`` structure is unchanged. Use
+  `ValidationError.structured_jsonable
+  <marshmallow.exceptions.ValidationError.structured_jsonable>` for
+  JSON-serializable output: non-string mapping keys are type-tagged via
+  `marshmallow.structured.encode_key` instead of being coerced with ``str()``,
+  so distinct keys cannot collide.
+
 4.4.0 (2026-11-03)
 ------------------
 

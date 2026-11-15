@@ -11,6 +11,7 @@
     marshmallow.utils
     marshmallow.experimental.context
     marshmallow.exceptions
+    marshmallow.structured
 
 Private API
 ===========

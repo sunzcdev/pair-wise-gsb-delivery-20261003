@@ -6,24 +6,71 @@
     Users should not need to use this module directly.
 """
 
-from marshmallow.exceptions import SCHEMA
+from marshmallow.exceptions import SCHEMA, structured_errors_from_messages
+from marshmallow.structured import PathSegment, StructuredError
 
 
 class ErrorStore:
     def __init__(self):
         #: Dictionary of errors stored during serialization
         self.errors = {}
+        #: Typed, path-based errors stored alongside ``errors``
+        self.structured_errors: list[StructuredError] = []
 
-    def store_error(self, messages, field_name=SCHEMA, index=None):
+    def store_error(
+        self,
+        messages,
+        field_name=SCHEMA,
+        index=None,
+        structured_errors: list[StructuredError] | None = None,
+    ):
         # field error  -> store/merge error messages under field name key
         # schema error -> if string or list, store/merge under _schema key
         #              -> if dict, store/merge with other top-level keys
-        messages = copy_containers(messages)
+        raw_messages = copy_containers(messages)
+        messages = raw_messages
         if field_name != SCHEMA or not isinstance(messages, dict):
             messages = {field_name: messages}
         if index is not None:
             messages = {index: messages}
         self.errors = merge_errors(self.errors, messages)
+
+        head: tuple[PathSegment, ...] = (
+            (PathSegment.index(index),) if index is not None else ()
+        )
+        if not structured_errors:
+            # Fallback for callers that do not thread structured records
+            # through (e.g. direct ErrorStore use). Derive from the raw,
+            # unwrapped message tree so the location is not duplicated.
+            root_name = (
+                None
+                if field_name == SCHEMA
+                else field_name
+            )
+            structured_errors = structured_errors_from_messages(
+                raw_messages, root_name
+            )
+        middle: tuple[PathSegment, ...] = (
+            (PathSegment.field(str(field_name)),)
+            if field_name != SCHEMA
+            else ()
+        )
+        prefix = head + middle
+
+        self.structured_errors.extend(
+            _with_prefix(structured_errors, prefix)
+        )
+
+
+def _with_prefix(
+    structured_errors: list[StructuredError], prefix: tuple[PathSegment, ...]
+) -> list[StructuredError]:
+    if not prefix:
+        return list(structured_errors)
+    return [
+        StructuredError(prefix + error.path, copy_containers(error.messages))
+        for error in structured_errors
+    ]
 
 
 def copy_containers(errors):

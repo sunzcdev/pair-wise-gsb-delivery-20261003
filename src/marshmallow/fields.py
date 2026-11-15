@@ -22,7 +22,9 @@ from marshmallow.exceptions import (
     StringNotCollectionError,
     ValidationError,
     _FieldInstanceResolutionError,
+    prepend_path,
 )
+from marshmallow.structured import PathSegment, StructuredError
 from marshmallow.validate import And, Length
 
 if typing.TYPE_CHECKING:
@@ -631,7 +633,9 @@ class Nested(Field):
             valid_data = self.schema.load(value, unknown=self.unknown, partial=partial)
         except ValidationError as error:
             raise ValidationError(
-                error.messages, valid_data=error.valid_data
+                error.messages,
+                valid_data=error.valid_data,
+                structured_errors=error.structured_errors,
             ) from error
         return valid_data
 
@@ -773,6 +777,7 @@ class List(Field[list[_InternalT | None]]):
 
         result = []
         errors = {}
+        structured_errors: list[StructuredError] = []
         for idx, each in enumerate(value):
             try:
                 result.append(self.inner.deserialize(each, **kwargs))
@@ -780,8 +785,17 @@ class List(Field[list[_InternalT | None]]):
                 if error.valid_data is not None:
                     result.append(typing.cast("_InternalT", error.valid_data))
                 errors.update({idx: error.messages})
+                structured_errors.extend(
+                    prepend_path(
+                        error.structured_errors, (PathSegment.index(idx),)
+                    )
+                )
         if errors:
-            raise ValidationError(errors, valid_data=result)
+            raise ValidationError(
+                errors,
+                valid_data=result,
+                structured_errors=structured_errors,
+            )
         return result
 
 
@@ -868,6 +882,7 @@ class Tuple(Field[tuple]):
         result = []
         errors = {}
 
+        structured_errors: list[StructuredError] = []
         for idx, (field, each) in enumerate(zip(self.tuple_fields, value, strict=True)):
             try:
                 result.append(field.deserialize(each, **kwargs))
@@ -875,8 +890,17 @@ class Tuple(Field[tuple]):
                 if error.valid_data is not None:
                     result.append(error.valid_data)
                 errors.update({idx: error.messages})
+                structured_errors.extend(
+                    prepend_path(
+                        error.structured_errors, (PathSegment.position(idx),)
+                    )
+                )
         if errors:
-            raise ValidationError(errors, valid_data=result)
+            raise ValidationError(
+                errors,
+                valid_data=result,
+                structured_errors=structured_errors,
+            )
 
         return tuple(result)
 
@@ -1682,6 +1706,7 @@ class Mapping(Field[_MappingT], metaclass=abc.ABCMeta):
             return self.mapping_type(value)
 
         errors = collections.defaultdict(dict)
+        structured_errors: list[StructuredError] = []
 
         # Deserialize keys
         if self.key_field is None:
@@ -1693,6 +1718,12 @@ class Mapping(Field[_MappingT], metaclass=abc.ABCMeta):
                     keys[key] = self.key_field.deserialize(key, **kwargs)
                 except ValidationError as error:
                     errors[key]["key"] = error.messages
+                    structured_errors.extend(
+                        prepend_path(
+                            error.structured_errors,
+                            (PathSegment.mapping_key(key),),
+                        )
+                    )
 
         # Deserialize values
         result = self.mapping_type()
@@ -1706,6 +1737,15 @@ class Mapping(Field[_MappingT], metaclass=abc.ABCMeta):
                     deser_val = self.value_field.deserialize(val, **kwargs)
                 except ValidationError as error:
                     errors[key]["value"] = error.messages
+                    structured_errors.extend(
+                        prepend_path(
+                            error.structured_errors,
+                            (
+                                PathSegment.mapping_key(key),
+                                PathSegment.mapping_value(),
+                            ),
+                        )
+                    )
                     if error.valid_data is not None and key in keys:
                         result[keys[key]] = error.valid_data
                 else:
@@ -1713,7 +1753,11 @@ class Mapping(Field[_MappingT], metaclass=abc.ABCMeta):
                         result[keys[key]] = deser_val
 
         if errors:
-            raise ValidationError(errors, valid_data=result)
+            raise ValidationError(
+                dict(errors),
+                valid_data=result,
+                structured_errors=structured_errors,
+            )
 
         return result
 
