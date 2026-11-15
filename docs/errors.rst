@@ -239,6 +239,7 @@ failed when validating a given instance, you may want to do so using
     .. attribute:: errors
 
         The mapping of validation keywords to the error objects (usually `jsonschema.exceptions.ValidationError`\s) at this level of the tree.
+        If the same keyword failed multiple times at this level, only the last such error is present here; see `jsonschema.exceptions.ErrorTree.all_errors` for all of them.
 
 Consider the following example:
 
@@ -332,6 +333,15 @@ itself. So it appears in the root node of the tree.
     True
 
 That's all you need to know to use error trees.
+
+If the same keyword fails more than once at the same level of the
+instance, all of the failures are retained. The `ErrorTree.errors` dict
+continues to hold a single error per keyword, while
+`ErrorTree.all_errors` maps each keyword to the full (ordered) list of
+its errors, and `ErrorTree.errors_for` returns them for one keyword.
+You can also retrieve a subtree directly by an instance path with
+`ErrorTree.subtree`, and count a node's own errors separately from its
+descendants' with `ErrorTree.own_errors` and `ErrorTree.total_errors`.
 
 To summarize, each tree contains child trees that can be accessed by
 indexing the tree to get the corresponding child tree for a given

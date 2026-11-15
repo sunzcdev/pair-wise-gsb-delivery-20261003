@@ -683,13 +683,113 @@ class TestByRelevance(TestCase):
 
 class TestErrorTree(TestCase):
     def test_it_knows_how_many_total_errors_it_contains(self):
-        # FIXME: #442
         errors = [
             exceptions.ValidationError("Something", validator=i)
             for i in range(8)
         ]
         tree = exceptions.ErrorTree(errors)
         self.assertEqual(tree.total_errors, 8)
+
+    def test_it_does_not_traverse_a_one_shot_error_iterator_repeatedly(self):
+        def errors():
+            yield exceptions.ValidationError("a", validator="foo")
+            yield exceptions.ValidationError(
+                "b", validator="foo", path=["bar"],
+            )
+            yield exceptions.ValidationError(
+                "c", validator="foo", path=["bar"],
+            )
+
+        tree = exceptions.ErrorTree(errors())
+        self.assertEqual(tree.total_errors, 3)
+        self.assertEqual(tree.own_errors, 1)
+        self.assertEqual(tree["bar"].own_errors, 2)
+        self.assertEqual(
+            tree.total_errors,
+            tree.own_errors + tree["bar"].total_errors,
+        )
+
+    def test_it_keeps_multiple_errors_for_the_same_keyword(self):
+        e1, e2 = (
+            exceptions.ValidationError("1", validator="foo", path=["bar"]),
+            exceptions.ValidationError("2", validator="foo", path=["bar"]),
+        )
+        tree = exceptions.ErrorTree([e1, e2])
+
+        self.assertEqual(tree["bar"].all_errors, {"foo": [e1, e2]})
+        self.assertEqual(tree["bar"].errors_for("foo"), [e1, e2])
+        self.assertEqual(tree["bar"].total_errors, 2)
+
+    def test_errors_dict_still_contains_a_single_error_per_keyword(self):
+        e1, e2 = (
+            exceptions.ValidationError("1", validator="foo", path=["bar"]),
+            exceptions.ValidationError("2", validator="foo", path=["bar"]),
+        )
+        tree = exceptions.ErrorTree([e1, e2])
+
+        self.assertEqual(tree["bar"].errors, {"foo": e2})
+
+    def test_errors_for_unknown_keyword_is_empty(self):
+        error = exceptions.ValidationError("1", validator="foo")
+        tree = exceptions.ErrorTree([error])
+
+        self.assertEqual(tree.errors_for("nope"), [])
+
+    def test_subtree_retrieves_a_tree_by_instance_path(self):
+        error = exceptions.ValidationError(
+            "1", validator="foo", path=["bar", 0],
+        )
+        tree = exceptions.ErrorTree([error])
+
+        subtree = tree.subtree(["bar", 0])
+        self.assertEqual(subtree.errors, {"foo": error})
+        self.assertIs(subtree, tree["bar"][0])
+
+    def test_subtree_of_a_missing_path_is_empty(self):
+        error = exceptions.ValidationError(
+            "1", validator="foo", path=["bar"],
+        )
+        tree = exceptions.ErrorTree([error])
+
+        subtree = tree.subtree(["baz", "deeper"])
+        self.assertEqual(subtree.total_errors, 0)
+        self.assertEqual(subtree.own_errors, 0)
+        self.assertEqual(subtree.all_errors, {})
+        self.assertNotIn("baz", tree)
+
+    def test_empty_tree_has_no_errors_anywhere(self):
+        tree = exceptions.ErrorTree()
+
+        self.assertEqual(tree.errors, {})
+        self.assertEqual(tree.all_errors, {})
+        self.assertEqual(tree.own_errors, 0)
+        self.assertEqual(tree.total_errors, 0)
+        self.assertEqual(tree.subtree(["nothing", "here"]).total_errors, 0)
+
+    def test_own_and_total_errors_are_counted_separately(self):
+        errors = [
+            exceptions.ValidationError("root", validator="foo"),
+            exceptions.ValidationError("kid", validator="bar", path=["baz"]),
+        ]
+        tree = exceptions.ErrorTree(errors)
+
+        self.assertEqual(tree.own_errors, 1)
+        self.assertEqual(tree.total_errors, 2)
+        self.assertEqual(tree["baz"].own_errors, 1)
+
+    def test_context_errors_belong_to_their_parent_error(self):
+        context = [
+            exceptions.ValidationError("sub 1", validator="foo"),
+            exceptions.ValidationError("sub 2", validator="bar"),
+        ]
+        error = exceptions.ValidationError(
+            "parent", validator="anyOf", context=context,
+        )
+        tree = exceptions.ErrorTree([error])
+
+        self.assertEqual(tree.own_errors, 1)
+        self.assertEqual(tree.total_errors, 1)
+        self.assertEqual(tree.errors["anyOf"].context, context)
 
     def test_it_contains_an_item_if_the_item_had_an_error(self):
         errors = [exceptions.ValidationError("a message", path=["bar"])]

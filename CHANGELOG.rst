@@ -1,6 +1,8 @@
 v4.27.0
 =======
 
+* ``ErrorTree`` no longer drops errors when the same keyword fails multiple times at the same path (#442).
+  The new ``ErrorTree.all_errors`` and ``ErrorTree.errors_for`` expose all errors per keyword in stable order, ``ErrorTree.subtree`` retrieves a subtree by instance path, and ``ErrorTree.own_errors`` counts a node's own errors separately from ``ErrorTree.total_errors``.
 * Support for Python 3.10 and 3.11 has been dropped.
 * Improve ``best_match`` for ``anyOf`` / ``oneOf`` errors: the most relevant error is now found within each subschema separately before the deepest of those is picked (#1257, #1300).
   In particular an applicator with a single subschema now produces the same best match as the bare subschema would.
