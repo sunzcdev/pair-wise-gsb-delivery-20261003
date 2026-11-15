@@ -809,7 +809,19 @@ class Cache:
 
             self._cull(now, sql, cleanup)
 
-            return True
+        if filename is not None and not read:
+            full_path = op.join(self._directory, filename)
+
+            if not op.exists(full_path):
+                # A concurrent Cache.check(fix=True) removed the value
+                # file as an apparent orphan before its row was
+                # committed. Store the value again so the committed row
+                # does not reference a missing file. Values stored from
+                # file-like objects (read=True) are exempt because the
+                # stream is already consumed and cannot be re-stored.
+                return self.set(key, value, expire, read, tag, retry)
+
+        return True
 
     def __setitem__(self, key, value):
         """Set corresponding `value` for `key` in cache.
@@ -1013,7 +1025,19 @@ class Cache:
 
             self._cull(now, sql, cleanup)
 
-            return True
+        if filename is not None and not read:
+            full_path = op.join(self._directory, filename)
+
+            if not op.exists(full_path):
+                # A concurrent Cache.check(fix=True) removed the value
+                # file as an apparent orphan before its row was
+                # committed. The row now exists so use `set` to store
+                # the value again. Values stored from file-like objects
+                # (read=True) are exempt because the stream is already
+                # consumed and cannot be re-stored.
+                self.set(key, value, expire, read, tag, retry)
+
+        return True
 
     def incr(self, key, delta=1, default=0, retry=False):
         """Increment value by delta for item with key.
@@ -1482,7 +1506,20 @@ class Cache:
             self._row_insert(db_key, raw, now, columns)
             self._cull(now, sql, cleanup)
 
-            return db_key
+        if filename is not None and not read:
+            full_path = op.join(self._directory, filename)
+
+            if not op.exists(full_path):
+                # A concurrent Cache.check(fix=True) removed the value
+                # file as an apparent orphan before its row was
+                # committed. Store the value again under the same key so
+                # the committed row does not reference a missing file.
+                # Values stored from file-like objects (read=True) are
+                # exempt because the stream is already consumed and
+                # cannot be re-stored.
+                self.set(db_key, value, expire, read, tag, retry)
+
+        return db_key
 
     def pull(
         self,
@@ -1892,11 +1929,36 @@ class Cache:
 
         Intended for use in testing and post-mortem error analysis.
 
-        While checking the Cache table for consistency, a writer lock is held
-        on the database. The lock blocks other cache clients from writing to
-        the database. For caches with many file references, the lock may be
-        held for a long time. For example, local benchmarking shows that a
-        cache with 1,000 file references takes ~60ms to check.
+        File-related inconsistencies are reported in three categories:
+        "file not found" for database rows whose value file is missing,
+        "wrong file size" for files whose size differs from the recorded
+        `Cache.size`, and "unknown file" (:exc:`UnknownFileWarning`) for
+        files with no database reference.
+
+        No writer lock is held while the directory is scanned, so other
+        cache clients may continue writing during the check. Consequently
+        a read-only check may report uncertain items: for example, a file
+        written by a concurrent client whose database row is not yet
+        committed may be reported as an unknown file.
+
+        When `fix` is true, the identity of each inconsistent item is
+        re-confirmed in a short transaction immediately before it is
+        corrected, so stale scan results are never applied:
+
+        - Missing files: the row is deleted only if it still references
+          the same filename.
+        - Size mismatches: the size is updated only if the rowid,
+          filename, and recorded size are unchanged.
+        - Unknown files: the file is removed only if it is older than
+          the start of the scan and still has no database reference. A
+          file created during the scan may belong to a concurrent write
+          whose row is not yet committed and is therefore left in place.
+
+        Additionally, writers that store values in files verify after
+        committing that the value file still exists and store the value
+        again when a concurrent ``check(fix=True)`` removed it before
+        the row was committed. Committed rows therefore never reference
+        files deleted by this method.
 
         Raises :exc:`Timeout` error when database timeout occurs and `retry` is
         `False` (default).
@@ -1909,6 +1971,11 @@ class Cache:
         """
         # pylint: disable=access-member-before-definition,W0201
         with warnings.catch_warnings(record=True) as warns:
+            # Python 3.12: catch_warnings(record=True) no longer resets
+            # the filters to "always" so do so explicitly. Otherwise
+            # ambient filters may suppress recording the warnings.
+            warnings.simplefilter('always')
+
             sql = self._sql
 
             # Check integrity of database.
@@ -1922,69 +1989,86 @@ class Cache:
             if fix:
                 sql('VACUUM')
 
-            with self._transact(retry) as (sql, _):
+            # Record the start of the scan. Files created afterwards may
+            # belong to a concurrent writer whose database row is not yet
+            # committed and must not be treated as orphans.
 
-                # Check Cache.filename against file system.
+            scan_start = time.time()
 
-                filenames = set()
-                select = (
-                    'SELECT rowid, size, filename FROM Cache'
-                    ' WHERE filename IS NOT NULL'
-                )
+            # Check Cache.filename against file system. No writer lock is
+            # held while scanning so that other clients may continue
+            # writing. Fixes re-confirm the identity of each row in a
+            # short transaction.
 
-                rows = sql(select).fetchall()
+            filenames = set()
+            select = (
+                'SELECT rowid, size, filename FROM Cache'
+                ' WHERE filename IS NOT NULL'
+            )
 
-                for rowid, size, filename in rows:
-                    full_path = op.join(self._directory, filename)
-                    filenames.add(full_path)
+            rows = sql(select).fetchall()
 
-                    if op.exists(full_path):
-                        real_size = op.getsize(full_path)
+            for rowid, size, filename in rows:
+                full_path = op.join(self._directory, filename)
+                filenames.add(full_path)
 
-                        if size != real_size:
-                            message = 'wrong file size: %s, %d != %d'
-                            args = full_path, real_size, size
-                            warnings.warn(message % args)
-
-                            if fix:
-                                sql(
-                                    'UPDATE Cache SET size = ?'
-                                    ' WHERE rowid = ?',
-                                    (real_size, rowid),
-                                )
-
-                        continue
-
+                try:
+                    real_size = op.getsize(full_path)
+                except OSError:
+                    # File not found. It may have been removed by a
+                    # concurrent client after the row was scanned.
                     warnings.warn('file not found: %s' % full_path)
 
                     if fix:
-                        sql('DELETE FROM Cache WHERE rowid = ?', (rowid,))
+                        self._check_fix_missing(rowid, filename, retry)
 
-                # Check file system against Cache.filename.
+                    continue
 
-                for dirpath, _, files in os.walk(self._directory):
-                    paths = [op.join(dirpath, filename) for filename in files]
-                    error = set(paths) - filenames
+                if size != real_size:
+                    message = 'wrong file size: %s, %d != %d'
+                    args = full_path, real_size, size
+                    warnings.warn(message % args)
 
-                    for full_path in error:
-                        if DBNAME in full_path:
-                            continue
+                    if fix:
+                        self._check_fix_size(rowid, filename, size, retry)
 
-                        message = 'unknown file: %s' % full_path
-                        warnings.warn(message, UnknownFileWarning)
+            # Check file system against Cache.filename.
 
-                        if fix:
-                            os.remove(full_path)
+            for dirpath, _, files in os.walk(self._directory):
+                paths = [op.join(dirpath, filename) for filename in files]
+                error = set(paths) - filenames
 
-                # Check for empty directories.
+                for full_path in error:
+                    if DBNAME in full_path:
+                        continue
 
-                for dirpath, dirs, files in os.walk(self._directory):
-                    if not (dirs or files):
-                        message = 'empty directory: %s' % dirpath
-                        warnings.warn(message, EmptyDirWarning)
+                    message = 'unknown file: %s' % full_path
+                    warnings.warn(message, UnknownFileWarning)
 
-                        if fix:
-                            os.rmdir(dirpath)
+                    if fix:
+                        self._check_fix_unknown(full_path, scan_start, retry)
+
+            # Check for empty directories.
+
+            for dirpath, dirs, files in os.walk(self._directory):
+                if not (dirs or files):
+                    message = 'empty directory: %s' % dirpath
+                    warnings.warn(message, EmptyDirWarning)
+
+                    if fix:
+                        # Use removedirs so that parent directories which
+                        # become empty are removed as well. Suppress
+                        # OSError that may occur if another client
+                        # creates a file in the directory or removes it
+                        # concurrently. The cache directory itself is
+                        # never empty because it contains the database.
+                        with cl.suppress(OSError):
+                            os.removedirs(dirpath)
+
+            # Check Settings.count and Settings.size against the Cache
+            # table in a short transaction.
+
+            with self._transact(retry) as (sql, _):
 
                 # Check Settings.count against count of Cache rows.
 
@@ -2018,6 +2102,77 @@ class Cache:
                         )
 
             return warns
+
+    def _check_fix_missing(self, rowid, filename, retry):
+        """Delete row with missing file after re-confirming its identity.
+
+        The row is deleted only if it still references the same filename.
+        A concurrent writer may have replaced the value (and its file)
+        since the row was scanned.
+
+        """
+        with self._transact(retry) as (sql, _):
+            sql(
+                'DELETE FROM Cache WHERE rowid = ? AND filename = ?',
+                (rowid, filename),
+            )
+
+    def _check_fix_size(self, rowid, filename, size, retry):
+        """Correct file size after re-confirming the row identity.
+
+        The size is updated only if the rowid, filename, and recorded
+        size are unchanged since the row was scanned. The file itself is
+        re-measured so that a file still being written is not recorded
+        with a partial size.
+
+        """
+        full_path = op.join(self._directory, filename)
+
+        try:
+            real_size = op.getsize(full_path)
+        except OSError:
+            # File vanished since the scan; leave the row for the next
+            # check rather than guessing at a size.
+            return
+
+        with self._transact(retry) as (sql, _):
+            sql(
+                'UPDATE Cache SET size = ?'
+                ' WHERE rowid = ? AND filename = ? AND size = ?',
+                (real_size, rowid, filename, size),
+            )
+
+    def _check_fix_unknown(self, full_path, scan_start, retry):
+        """Remove unreferenced file after re-confirming its identity.
+
+        The file is removed only if it is older than the start of the
+        scan and still has no reference in the Cache table. A file
+        created during the scan may belong to a concurrent writer whose
+        database row is not yet committed, and is left in place.
+
+        """
+        try:
+            mtime = op.getmtime(full_path)
+        except OSError:
+            # File already removed, perhaps by another client.
+            return
+
+        if mtime >= scan_start:
+            # File created during the scan; its database row may not be
+            # committed yet. Do not treat it as an orphan.
+            return
+
+        filename = op.relpath(full_path, self._directory)
+
+        with self._transact(retry) as (sql, _):
+            select = 'SELECT COUNT(filename) FROM Cache WHERE filename = ?'
+            ((count,),) = sql(select, (filename,)).fetchall()
+
+            if count == 0:
+                # Suppress OSError that may occur if another cache
+                # deletes the file concurrently.
+                with cl.suppress(OSError):
+                    os.remove(full_path)
 
     def create_tag_index(self):
         """Create tag index on cache database.

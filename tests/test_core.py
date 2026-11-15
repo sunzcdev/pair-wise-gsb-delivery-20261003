@@ -614,6 +614,114 @@ def test_integrity_check(cache):
     assert len(cache.check()) == 0
 
 
+def test_check_fix_concurrent_file_write(tmpdir):
+    # A file written by another cache instance must not be deleted as an
+    # orphan while its database row is still uncommitted.
+    directory = str(tmpdir)
+    written = threading.Event()
+    proceed = threading.Event()
+
+    class PausableDisk(dc.Disk):
+        def _write(self, full_path, iterator, mode, encoding=None):
+            size = super()._write(full_path, iterator, mode, encoding=encoding)
+            # Pause after the value file is written but before Cache.set
+            # begins the transaction that inserts the database row.
+            written.set()
+            proceed.wait(timeout=30)
+            return size
+
+    with dc.Cache(directory, disk_min_file_size=1) as checker:
+        checker.set('old', b'old-value', retry=True)
+
+        other = dc.Cache(directory, disk=PausableDisk, disk_min_file_size=1)
+
+        try:
+            errors = []
+
+            def writer():
+                try:
+                    other.set('new', b'new-value', retry=True)
+                except BaseException as exc:  # pylint: disable=broad-except
+                    errors.append(exc)
+
+            thread = threading.Thread(target=writer)
+            thread.start()
+
+            # Wait until the value file exists but its row is uncommitted.
+            assert written.wait(timeout=30)
+
+            # The read-only scan reports the in-progress file as an
+            # uncertain unknown file, but the fixing check must not
+            # delete it.
+            warns = checker.check(fix=True)
+            messages = [str(warn.message) for warn in warns]
+            assert any('unknown file' in message for message in messages)
+
+            # Let the writer commit its row.
+            proceed.set()
+            thread.join(timeout=30)
+            assert not thread.is_alive()
+            assert not errors
+
+            # Both the old and new legitimate entries are readable.
+            assert checker.get('new', retry=True) == b'new-value'
+            assert checker.get('old', retry=True) == b'old-value'
+
+            # After the writer commits, a fixing check finds nothing.
+            assert checker.check(fix=True) == []
+        finally:
+            proceed.set()
+            other.close()
+
+    shutil.rmtree(directory, ignore_errors=True)
+
+
+def test_check_fix_stale_scan_row(tmpdir):
+    # A row replaced after the scan must not be deleted based on the
+    # stale scan result, and the fixing check must not block the
+    # concurrent write with a scan-long writer lock.
+    directory = str(tmpdir)
+
+    with dc.Cache(directory, disk_min_file_size=1) as checker:
+        checker.set('key', b'old-value', retry=True)
+
+        with checker.get('key', read=True, retry=True) as reader:
+            old_path = reader.name
+        os.remove(old_path)
+
+        other = dc.Cache(directory, timeout=5, disk_min_file_size=1)
+
+        try:
+            real_warn = warnings.warn
+
+            def warn_then_replace(message, *args, **kwargs):
+                real_warn(message, *args, **kwargs)
+                if str(message).startswith('file not found'):
+                    # Replace the row after it was scanned but before the
+                    # fixing delete is attempted. If check held a writer
+                    # lock for the whole scan, this write would time out.
+                    other.set('key', b'new-value', retry=True)
+
+            with mock.patch.object(warnings, 'warn', warn_then_replace):
+                warns = checker.check(fix=True)
+
+            messages = [str(warn.message) for warn in warns]
+            assert any('file not found' in message for message in messages)
+
+            # The replacement survived the fixing check: the stale scan
+            # result was not used to delete the updated row.
+            assert checker.get('key', retry=True) == b'new-value'
+            assert other.get('key', retry=True) == b'new-value'
+
+            # A subsequent check is clean: the row was kept and its new
+            # file is referenced.
+            assert checker.check(fix=True) == []
+        finally:
+            other.close()
+
+    shutil.rmtree(directory, ignore_errors=True)
+
+
 def test_expire(cache):
     cache.reset('cull_limit', 0)  # Disable expiring keys on `set`.
     now = time.time()
