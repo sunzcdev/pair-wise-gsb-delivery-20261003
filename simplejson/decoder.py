@@ -403,7 +403,8 @@ class JSONDecoder(object):
             raise JSONDecodeError("Extra data", s, end, len(s))
         return obj
 
-    def raw_decode(self, s, idx=0, _w=WHITESPACE.match, _PY3=PY3):
+    def raw_decode(self, s, idx=0, strict_idx=False, _w=WHITESPACE.match,
+            _PY3=PY3):
         """Decode a JSON document from ``s`` (a ``str`` or ``unicode``
         beginning with a JSON document) and return a 2-tuple of the Python
         representation and the index in ``s`` where the document ended.
@@ -411,7 +412,42 @@ class JSONDecoder(object):
         the JSON document begins.
 
         This can be used to decode a JSON document from a string that may
-        have extraneous data at the end.
+        have extraneous data at the end, or to decode several documents
+        back to back by feeding the returned end index back in as the
+        next ``idx``.
+
+        Starting point rules (the returned end index is always an offset
+        into the original, unmodified ``s``):
+
+        * A negative ``idx`` is rejected outright; it is never normalized
+          by Python's negative indexing.
+        * An ``idx`` greater than ``len(s)`` is rejected as out of range;
+          it is never clamped to the end of the string.
+        * A leading byte order mark is only consumed when ``idx`` points at
+          the very beginning of the buffer (``idx == 0``), and only outside
+          strict mode. A BOM found mid-buffer is a parse error rather than
+          a second document marker.
+        * Leading JSON whitespace (space, tab, CR, LF) at ``idx`` is
+          skipped, except in strict mode.
+        * The decoder never scans forward past damaged or unrelated
+          characters looking for the next legal value: the first character
+          actually examined is either ``idx`` itself (strict mode) or the
+          first non-whitespace, non-BOM character at or after ``idx``.
+          Pointing ``idx`` into the middle of a token -- for example at the
+          ``u`` or a hex digit of a ``\\uXXXX`` escape or inside a string --
+          is therefore not silently rescued by skipping to a later value.
+
+        When ``strict_idx`` is true the offset is treated as exact: no BOM
+        and no leading whitespace is consumed, so decoding starts at
+        ``idx`` itself. This makes the contract explicit when chaining
+        documents and guarantees that an offset landing on whitespace, a
+        BOM, a backslash or any other non-value character fails at that
+        exact position instead of moving the start.
+
+        When the remainder of the buffer contains only whitespace the two
+        modes report the situation separately: strict mode fails at ``idx``
+        with "Expecting value", while the default mode first advances past
+        the whitespace and then fails at ``len(s)``.
 
         """
         if idx < 0:
@@ -420,11 +456,26 @@ class JSONDecoder(object):
             raise JSONDecodeError('Expecting value', s, idx)
         if _PY3 and not isinstance(s, str):
             raise TypeError("Input string must be text, not bytes")
-        # strip UTF-8 bom
-        if len(s) > idx:
+        length = len(s)
+        if idx > length:
+            # An offset past the end of the buffer is an out of range
+            # argument, not an empty document: report it distinctly instead
+            # of clamping idx to len(s). The position stays in original
+            # buffer coordinates (it is safe for JSONDecodeError to format).
+            raise JSONDecodeError('idx out of range', s, length)
+        if strict_idx:
+            # Exact-offset contract: do not consume a BOM or any leading
+            # whitespace, and never look beyond idx for a legal value.
+            return self.scan_once(s, idx=idx)
+        # strip UTF-8 bom, but only at the start of the buffer. A BOM at a
+        # non-zero offset is ordinary (invalid) JSON content, not a marker.
+        if idx < length:
             ord0 = ord(s[idx])
-            if ord0 == 0xfeff:
+            if idx == 0 and ord0 == 0xfeff:
                 idx += 1
-            elif ord0 == 0xef and s[idx:idx + 3] == '\xef\xbb\xbf':
+            elif idx == 0 and ord0 == 0xef and s[idx:idx + 3] == '\xef\xbb\xbf':
                 idx += 3
+        # Skip leading whitespace. If this runs off the end (for example a
+        # buffer that is all whitespace), scan_once raises "Expecting value"
+        # at the resulting index rather than at any skipped-over content.
         return self.scan_once(s, idx=_w(s, idx).end())

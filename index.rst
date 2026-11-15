@@ -556,16 +556,40 @@ Encoders and decoders
       :func:`loads` for details. It is preferable to use that rather
       than this class.
 
-   .. method:: raw_decode(s[, idx=0])
+   .. method:: raw_decode(s[, idx=0[, strict_idx=False]])
 
       Decode a JSON document from *s* (a :class:`str` or :class:`unicode`
       beginning with a JSON document) starting from the index *idx* and return
       a 2-tuple of the Python representation and the index in *s* where the
-      document ended.
+      document ended. The returned end index is always an offset into the
+      original *s* and can be fed back as the next *idx* to decode several
+      documents sharing one buffer.
 
       This can be used to decode a JSON document from a string that may have
       extraneous data at the end, or to decode a string that has a series of
       JSON objects.
+
+      The starting point follows these rules:
+
+      * a negative *idx* raises :exc:`JSONDecodeError` and is never resolved
+        via Python's negative indexing;
+      * an *idx* greater than ``len(s)`` raises
+        :exc:`JSONDecodeError` with the message ``"idx out of range"`` and is
+        never clamped to the end of the string;
+      * a leading byte order mark is consumed only when *idx* is ``0``; a BOM
+        at any other offset is a parse error;
+      * leading JSON whitespace at *idx* is skipped unless *strict_idx* is
+        true;
+      * the decoder never scans forward past damaged or unrelated characters
+        looking for a legal value, so an offset inside a token (for example
+        inside a ``\\uXXXX`` escape or a string) fails at that offset.
+
+      When *strict_idx* is true the offset is treated as exact: no BOM and no
+      leading whitespace are consumed, so decoding starts at *idx* itself and
+      any non-value character there raises :exc:`JSONDecodeError` at that
+      position. When only whitespace remains, strict mode fails at *idx*
+      whereas the default mode first advances past the whitespace and fails
+      at ``len(s)``.
 
       :exc:`JSONDecodeError` will be raised if the given JSON
       document is not valid.

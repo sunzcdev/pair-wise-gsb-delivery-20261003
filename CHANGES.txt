@@ -1,5 +1,18 @@
 Version 4.3.0 released 2026-11-10
 
+* ``JSONDecoder.raw_decode()`` now documents and enforces explicit start
+  point rules for chained decoding. A byte order mark is only consumed at
+  the start of the buffer (``idx == 0``); a BOM at a non-zero offset is
+  now a parse error instead of being silently treated as a second document
+  marker. An ``idx`` past the end of the input raises a distinct
+  ``JSONDecodeError("idx out of range")`` instead of being clamped, and a
+  negative ``idx`` continues to fail without negative indexing. The new
+  ``strict_idx`` option treats the offset as exact: no BOM or leading
+  whitespace is consumed and the decoder never scans forward past damaged
+  content to find a legal value, so offsets landing inside a token (e.g.
+  a ``\uXXXX`` escape or a string) fail at that position. Returned end
+  indices remain coordinates of the original buffer, and text and
+  decoded-bytes entry points follow the same rules.
 * The C encoder no longer crashes when ``default()`` or ``for_json()``
   shrinks or grows the list being encoded, and no longer reads a freed
   key when encoding a dict value removes its entry. Both encoders now

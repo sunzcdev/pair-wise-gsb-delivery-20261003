@@ -181,6 +181,179 @@ class TestDecode(TestCase):
         self.assertRaises(ValueError, j.scan_once, y, diff)
         self.assertRaises(ValueError, j.raw_decode, y, i)
 
+    def test_raw_decode_negative_idx(self):
+        # Negative offsets are never normalized via Python indexing, in
+        # either mode, and the error keeps the requested coordinate.
+        j = json.decoder.JSONDecoder()
+        for strict in (False, True):
+            with self.assertRaises(json.JSONDecodeError) as cm:
+                j.raw_decode('1', -1, strict_idx=strict)
+            self.assertEqual(cm.exception.pos, -1)
+            self.assertEqual(cm.exception.msg, 'Expecting value')
+
+    def test_raw_decode_idx_out_of_range(self):
+        # An offset past the end of the buffer is an out of range argument
+        # rather than an empty document; it must not be clamped to len(s).
+        j = json.decoder.JSONDecoder()
+        for strict in (False, True):
+            with self.assertRaises(json.JSONDecodeError) as cm:
+                j.raw_decode('1234', 99, strict_idx=strict)
+            self.assertEqual(cm.exception.pos, 4)
+            self.assertEqual(cm.exception.msg, 'idx out of range')
+        # idx == len(s) is still in range and reports "Expecting value"
+        # (the buffer has no more content at that coordinate).
+        with self.assertRaises(json.JSONDecodeError) as cm:
+            j.raw_decode('1', 1)
+        self.assertEqual(cm.exception.pos, 1)
+        self.assertEqual(cm.exception.msg, 'Expecting value')
+
+    def test_raw_decode_whitespace_only_tail(self):
+        # The two modes separate "off range" from "only whitespace left":
+        # strict mode fails at idx itself, the default mode first advances
+        # past the whitespace and fails at the end of the buffer.
+        j = json.decoder.JSONDecoder()
+        with self.assertRaises(json.JSONDecodeError) as cm:
+            j.raw_decode('1   ', 1)
+        self.assertEqual(cm.exception.pos, 4)
+        with self.assertRaises(json.JSONDecodeError) as cm:
+            j.raw_decode('1   ', 1, strict_idx=True)
+        self.assertEqual(cm.exception.pos, 1)
+        with self.assertRaises(json.JSONDecodeError) as cm:
+            j.raw_decode('   ', 0)
+        self.assertEqual(cm.exception.pos, 3)
+        with self.assertRaises(json.JSONDecodeError) as cm:
+            j.raw_decode('   ', 0, strict_idx=True)
+        self.assertEqual(cm.exception.pos, 0)
+
+    def test_raw_decode_strict_rejects_leading_whitespace(self):
+        # strict_idx makes the offset exact: no whitespace is consumed and
+        # the failure points at idx instead of the value beyond it.
+        j = json.decoder.JSONDecoder()
+        self.assertEqual(j.raw_decode(' 1', 0), (1, 2))
+        with self.assertRaises(json.JSONDecodeError) as cm:
+            j.raw_decode(' 1', 0, strict_idx=True)
+        self.assertEqual(cm.exception.pos, 0)
+        # Each JSON whitespace character is covered.
+        for ws in (' ', '\t', '\n', '\r'):
+            with self.assertRaises(json.JSONDecodeError) as cm:
+                j.raw_decode(ws + '1', 0, strict_idx=True)
+            self.assertEqual(cm.exception.pos, 0)
+
+    def test_raw_decode_bom_only_at_buffer_start(self):
+        # A BOM is a buffer-level marker, so it is consumed only when idx
+        # points at the very beginning -- and never in strict mode. A BOM
+        # at a non-zero offset is ordinary invalid JSON content.
+        j = json.decoder.JSONDecoder()
+        # Unicode BOM (single code point) at the start.
+        self.assertEqual(j.raw_decode(u'\ufeff1'), (1, 2))
+        with self.assertRaises(json.JSONDecodeError) as cm:
+            j.raw_decode(u'\ufeff1', 0, strict_idx=True)
+        self.assertEqual(cm.exception.pos, 0)
+        # UTF-8 BOM represented as three characters (str input decoded as
+        # UTF-8 elsewhere) at the start.
+        self.assertEqual(j.raw_decode('\xef\xbb\xbf1'), (1, 4))
+        with self.assertRaises(json.JSONDecodeError) as cm:
+            j.raw_decode('\xef\xbb\xbf1', 0, strict_idx=True)
+        self.assertEqual(cm.exception.pos, 0)
+        # A BOM encountered mid-buffer must not be treated as a marker.
+        for strict in (False, True):
+            with self.assertRaises(json.JSONDecodeError) as cm:
+                j.raw_decode('1 \ufeff2', 2, strict_idx=strict)
+            self.assertEqual(cm.exception.pos, 2)
+            with self.assertRaises(json.JSONDecodeError) as cm:
+                j.raw_decode('1 \xef\xbb\xbf2', 2, strict_idx=strict)
+            self.assertEqual(cm.exception.pos, 2)
+
+    def test_raw_decode_does_not_skip_damaged_content(self):
+        # Neither mode scans forward past broken/unrelated characters to
+        # find a legal value further along the buffer.
+        j = json.decoder.JSONDecoder()
+        for strict in (False, True):
+            with self.assertRaises(json.JSONDecodeError) as cm:
+                j.raw_decode('x 1', 0, strict_idx=strict)
+            self.assertEqual(cm.exception.pos, 0)
+
+    def test_raw_decode_rejects_offsets_inside_tokens(self):
+        # An offset into the interior of a token must fail at that offset
+        # instead of being rescued by skipping to a later value. Cover the
+        # backslash of a \uXXXX escape and the interior of a string.
+        j = json.decoder.JSONDecoder()
+        doc = '["\\u0041"]'
+        backslash = doc.index('\\')
+        for strict in (False, True):
+            with self.assertRaises(json.JSONDecodeError) as cm:
+                j.raw_decode(doc, backslash, strict_idx=strict)
+            self.assertEqual(cm.exception.pos, backslash)
+        # The 'u' of the escape is not a value start either.
+        u_idx = doc.index('u')
+        for strict in (False, True):
+            with self.assertRaises(json.JSONDecodeError) as cm:
+                j.raw_decode(doc, u_idx, strict_idx=strict)
+            self.assertEqual(cm.exception.pos, u_idx)
+        # Pointing at a character inside a string (past the opening quote).
+        for strict in (False, True):
+            with self.assertRaises(json.JSONDecodeError) as cm:
+                j.raw_decode('"ab"', 1, strict_idx=strict)
+            self.assertEqual(cm.exception.pos, 1)
+
+    def test_raw_decode_chained_documents(self):
+        # The end index returned for one document feeds the next raw_decode
+        # call, and every coordinate stays relative to the original buffer.
+        j = json.decoder.JSONDecoder()
+        doc = '1 true  false null "x" [1, 2] {"k": 3}'
+        expected = [1, True, False, None, 'x', [1, 2], {'k': 3}]
+        idx = 0
+        values = []
+        while idx < len(doc):
+            value, idx = j.raw_decode(doc, idx)
+            values.append(value)
+        self.assertEqual(values, expected)
+        self.assertEqual(idx, len(doc))
+        # The same loop works with exact offsets under strict_idx as long
+        # as the inter-document whitespace is skipped by the caller; the
+        # parser itself never moves the start.
+        idx = 0
+        values = []
+        while idx < len(doc):
+            while idx < len(doc) and doc[idx] in ' \t\n\r':
+                idx += 1
+            if idx == len(doc):
+                break
+            value, idx = j.raw_decode(doc, idx, strict_idx=True)
+            values.append(value)
+        self.assertEqual(values, expected)
+        self.assertEqual(idx, len(doc))
+
+    def test_raw_decode_end_index_uses_original_coordinates(self):
+        # BOM and leading whitespace shift the start, but the returned end
+        # index remains an offset into the buffer the caller passed in.
+        j = json.decoder.JSONDecoder()
+        self.assertEqual(j.raw_decode('  [1]'), ([1], 5))
+        self.assertEqual(j.raw_decode(u'\ufeff[1]'), ([1], 4))
+        self.assertEqual(j.raw_decode('\xef\xbb\xbf[1]'), ([1], 6))
+        value, end = j.raw_decode('xx[1]yy', 2)
+        self.assertEqual(value, [1])
+        self.assertEqual(end, 5)
+        self.assertEqual('xx[1]yy'[end:], 'yy')
+
+    def test_raw_decode_text_and_bytes_share_start_rules(self):
+        # bytes are decoded to text first, so raw_decode's start rules are
+        # applied to the decoded text with the same coordinates; raw_decode
+        # itself still rejects bytes on Python 3.
+        j = json.decoder.JSONDecoder()
+        data = b'\xef\xbb\xbf  [1, 2]'
+        text = data.decode('utf-8')
+        self.assertEqual(j.decode(data), [1, 2])
+        self.assertEqual(j.decode(text), [1, 2])
+        if sys.version_info[0] >= 3:
+            self.assertRaises(TypeError, j.raw_decode, data)
+        # The decoded text view honors the same BOM/whitespace rules.
+        self.assertEqual(j.raw_decode(text), ([1, 2], len(text)))
+        with self.assertRaises(json.JSONDecodeError) as cm:
+            j.raw_decode(text, 0, strict_idx=True)
+        self.assertEqual(cm.exception.pos, 0)
+
+
     def test_array_hook(self):
         result = json.loads('[1, [2, 3], 4]', array_hook=tuple)
         self.assertEqual(result, (1, (2, 3), 4))
