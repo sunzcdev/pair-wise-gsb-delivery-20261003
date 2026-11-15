@@ -50,7 +50,12 @@ Here are some common `tag_generator` uses:
 The union members aren't required to be attrs classes or dataclasses, although those work automatically.
 They may be anything that cattrs can un/structure from/to a dictionary, for example a type with registered custom hooks.
 
-A default member can be specified to be used if the tag is missing or is unknown.
+The generated tags must be unique: if the `tag_generator` produces the same tag for two members, a `ValueError` is raised naming the tag and both participating types.
+The tag field name must also not collide with a serialized field name (including field aliases and renames) of any union member, since the tag would then overwrite the business value; this raises a `ValueError` as well.
+Both checks run before any hooks are registered, so a failed configuration never leaves the converter partially configured.
+
+A default member can be specified to be used if the tag is missing.
+If the tag is present but its value doesn't match any union member, structuring raises a `ValueError` listing the unknown tag and the known ones, instead of silently using the default member.
 This is useful for evolving APIs in a backwards-compatible way; an endpoint taking class `A` can be changed to take `A | B` with `A` as the default (for old clients which do not send the tag).
 
 This strategy only applies in the context of the union; the normal un/structuring hooks are left untouched.

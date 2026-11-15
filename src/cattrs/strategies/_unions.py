@@ -1,10 +1,18 @@
-from collections import defaultdict
 from typing import Any, Callable, Union
 
 from attrs import NOTHING, NothingType
 
 from .. import BaseConverter
-from .._compat import get_newtype_base, is_literal, is_subclass, is_union_type
+from .._compat import (
+    get_newtype_base,
+    get_origin,
+    has,
+    is_literal,
+    is_subclass,
+    is_union_type,
+)
+from ..gen._consts import neutral
+from ..gen._shared import _annotated_override_or_default
 from ..sentinels import is_sentinel
 from ..typealiases import get_type_alias_base, is_type_alias
 
@@ -18,6 +26,50 @@ __all__ = [
 def default_tag_generator(typ: type) -> str:
     """Return the class name."""
     return typ.__name__
+
+
+def _serialized_field_names(
+    cl: Any, converter: BaseConverter, unstructure_hook: Callable | None = None
+) -> set[str]:
+    """Return the serialized key names of the attrs/dataclass fields of `cl`.
+
+    The calculation mirrors the converter's own un/structuring rules: explicit
+    ``override(rename=...)`` values and ``Annotated[..., override(...)]`` overrides
+    win, otherwise the attribute alias is used when the converter has
+    ``use_alias`` enabled, and finally the plain field name is used.
+
+    Overrides attached to a generated unstructure hook (for example ones applied
+    through :func:`cattrs.gen.make_dict_unstructure_fn`) are honored too.
+
+    Classes that are neither attrs classes nor dataclasses are reported as having
+    no fields, since their payload shape is entirely determined by custom hooks.
+    """
+    origin = get_origin(cl) or cl
+    if not has(origin):
+        return set()
+
+    use_alias = getattr(converter, "use_alias", False)
+    if hasattr(origin, "__attrs_attrs__"):
+        attributes = origin.__attrs_attrs__
+    else:
+        attributes = origin.__dataclass_fields__.values()
+
+    hook_overrides = getattr(unstructure_hook, "overrides", None)
+    names: set[str] = set()
+    for attribute in attributes:
+        override = _annotated_override_or_default(
+            getattr(attribute, "type", None), neutral
+        )
+        if hook_overrides is not None and attribute.name in hook_overrides:
+            override = hook_overrides[attribute.name]
+
+        if override.rename is not None:
+            names.add(override.rename)
+        elif use_alias:
+            names.add(getattr(attribute, "alias", attribute.name))
+        else:
+            names.add(attribute.name)
+    return names
 
 
 def configure_tagged_union(
@@ -42,6 +94,10 @@ def configure_tagged_union(
     :param default: An optional class to be used if the tag information
         is not present when structuring.
 
+    The tags generated for the union members must be unique, and the tag field
+    name must not collide with any serialized field name of the union members;
+    otherwise a `ValueError` is raised and the converter is left untouched.
+
     The tagged union strategy currently only works with the dict
     un/structuring base strategy.
 
@@ -49,68 +105,131 @@ def configure_tagged_union(
 
     ..  versionchanged:: 25.1
         Type aliases of unions are now also supported.
+
+    ..  versionchanged:: NEXT
+        Duplicate tags generated for distinct union members, and tag field names
+        colliding with member field aliases, now raise `ValueError` before any
+        hooks are registered. An unknown tag no longer falls through to the
+        default member; the default member is only used when the tag is missing.
     """
     if is_type_alias(union):
         union = union.__value__
     args = union.__args__
 
-    tag_to_hook = {}
-    exact_cl_unstruct_hooks = {}
-    cl_to_tag = {}
+    # Phase 1: validate the whole configuration without touching the converter.
+    # Every check below must pass before any hook is registered, so a failure
+    # can never leave a partially set up converter behind.
+    cl_to_tag: dict[Any, Any] = {}
+    tag_to_cl: dict[Any, Any] = {}
+    for cl in args:
+        tag = tag_generator(cl)
+
+        # Bidirectional uniqueness: each class maps to one tag and each tag maps
+        # to one class. A custom tag generator can produce the same tag for two
+        # members, which previously silently overwrote the mapping.
+        if cl in cl_to_tag:
+            raise ValueError(
+                f"Union member {cl!r} is listed more than once in {union!r}; "
+                "every member of a tagged union must be unique."
+            )
+        if tag in tag_to_cl:
+            raise ValueError(
+                f"Tag generator {tag_generator!r} produced the duplicate tag "
+                f"{tag!r} for both {tag_to_cl[tag]!r} and {cl!r}; tags of a "
+                "tagged union must be unique."
+            )
+
+        # The tag field is injected into the payload, so a member serializing a
+        # field under the same key would have its business value shadowed by the
+        # tag (or vice versa). Renames applied through generated hooks are
+        # re-checked below, once the hooks are resolved.
+        conflicting_fields = _serialized_field_names(cl, converter) & {tag_name}
+        if conflicting_fields:
+            raise ValueError(
+                f"Tag field name {tag_name!r} collides with the serialized "
+                f"field name(s) {sorted(conflicting_fields)!r} of union member "
+                f"{cl!r}; choose a different tag name or rename the field."
+            )
+
+        cl_to_tag[cl] = tag
+        tag_to_cl[tag] = cl
+
+    # The live tag mapping starts empty and is only populated once every member
+    # hook has been resolved and validated, so a failure never leaves callable
+    # placeholder values (or half of the members) in the dispatch map.
+    tag_to_hook: dict[Any, Callable] = {}
+    exact_cl_unstruct_hooks: dict[Any, Callable] = {}
 
     if default is not NOTHING:
         default_handler = converter.get_structure_hook(default)
 
-        def structure_default(val: dict, _cl=default, _h=default_handler):
-            return _h(val, _cl)
-
-        tag_to_hook = defaultdict(lambda: structure_default)
-        cl_to_tag = defaultdict(lambda: default)
-
-        if getattr(converter, "forbid_extra_keys", False):
-
-            def structure_tagged_union(
-                val: dict,
-                _,
-                _tag_to_hook=tag_to_hook,
-                _tag_name=tag_name,
-                _dh=default_handler,
-                _default=default,
-            ) -> union:
-                if _tag_name in val:
-                    val = val.copy()
-                    return _tag_to_hook[val.pop(_tag_name)](val)
+        def structure_tagged_union(
+            val: dict,
+            _,
+            _tag_to_hook=tag_to_hook,
+            _known_tags=tag_to_cl,
+            _tag_name=tag_name,
+            _dh=default_handler,
+            _default=default,
+        ) -> union:
+            # The default member only handles payloads without a tag. An unknown
+            # tag is reported explicitly instead of being silently swallowed.
+            if _tag_name not in val:
                 return _dh(val, _default)
+            tag = val[_tag_name]
+            try:
+                hook = _tag_to_hook[tag]
+            except KeyError:
+                raise ValueError(
+                    f"Unknown tag {tag!r} for union {union!r}; known tags are "
+                    f"{list(_known_tags)!r}."
+                ) from None
+            if getattr(converter, "forbid_extra_keys", False):
+                # Copy so the caller's payload is not mutated by the pop.
+                val = val.copy()
+                val.pop(_tag_name)
+            return hook(val)
 
-        else:
+    elif getattr(converter, "forbid_extra_keys", False):
 
-            def structure_tagged_union(
-                val: dict,
-                _,
-                _tag_to_hook=tag_to_hook,
-                _tag_name=tag_name,
-                _dh=default_handler,
-                _default=default,
-            ) -> union:
-                if _tag_name in val:
-                    return _tag_to_hook[val[_tag_name]](val)
-                return _dh(val, _default)
+        def structure_tagged_union(
+            val: dict,
+            _,
+            _tag_to_cl=tag_to_hook,
+            _known_tags=tag_to_cl,
+            _tag_name=tag_name,
+        ) -> union:
+            tag = val[_tag_name]
+            try:
+                hook = _tag_to_cl[tag]
+            except KeyError:
+                raise ValueError(
+                    f"Unknown tag {tag!r} for union {union!r}; known tags are "
+                    f"{list(_known_tags)!r}."
+                ) from None
+            # Copy so the caller's payload is not mutated by the pop.
+            val = val.copy()
+            val.pop(_tag_name)
+            return hook(val)
 
     else:
-        if getattr(converter, "forbid_extra_keys", False):
 
-            def structure_tagged_union(
-                val: dict, _, _tag_to_cl=tag_to_hook, _tag_name=tag_name
-            ) -> union:
-                val = val.copy()
-                return _tag_to_cl[val.pop(_tag_name)](val)
-
-        else:
-
-            def structure_tagged_union(
-                val: dict, _, _tag_to_cl=tag_to_hook, _tag_name=tag_name
-            ) -> union:
-                return _tag_to_cl[val[_tag_name]](val)
+        def structure_tagged_union(
+            val: dict,
+            _,
+            _tag_to_cl=tag_to_hook,
+            _known_tags=tag_to_cl,
+            _tag_name=tag_name,
+        ) -> union:
+            tag = val[_tag_name]
+            try:
+                hook = _tag_to_cl[tag]
+            except KeyError:
+                raise ValueError(
+                    f"Unknown tag {tag!r} for union {union!r}; known tags are "
+                    f"{list(_known_tags)!r}."
+                ) from None
+            return hook(val)
 
     def unstructure_tagged_union(
         val: union,
@@ -125,10 +244,29 @@ def configure_tagged_union(
     converter.register_unstructure_hook(union, unstructure_tagged_union)
     converter.register_structure_hook(union, structure_tagged_union)
 
+    # Phase 3: resolve every member hook and re-validate against renames carried
+    # by generated hooks. Nothing is written into the live dispatch maps until
+    # the whole loop has validated, so a failure here leaves them empty rather
+    # than half populated.
+    resolved_member_hooks: dict[Any, tuple[Callable, Callable]] = {}
     for cl in args:
-        tag = tag_generator(cl)
         struct_handler = converter.get_structure_hook(cl)
         unstruct_handler = converter.get_unstructure_hook(cl)
+
+        conflicting_fields = (
+            _serialized_field_names(cl, converter, unstruct_handler) & {tag_name}
+        )
+        if conflicting_fields:
+            raise ValueError(
+                f"Tag field name {tag_name!r} collides with the serialized "
+                f"field name(s) {sorted(conflicting_fields)!r} of union member "
+                f"{cl!r}; choose a different tag name or rename the field."
+            )
+        resolved_member_hooks[cl] = (struct_handler, unstruct_handler)
+
+    # All checks passed; build and install the wrappers as a single final step.
+    for cl in args:
+        struct_handler, unstruct_handler = resolved_member_hooks[cl]
 
         def structure_union_member(val: dict, _cl=cl, _h=struct_handler) -> cl:
             return _h(val, _cl)
@@ -136,9 +274,8 @@ def configure_tagged_union(
         def unstructure_union_member(val: union, _h=unstruct_handler) -> dict:
             return _h(val)
 
-        tag_to_hook[tag] = structure_union_member
+        tag_to_hook[cl_to_tag[cl]] = structure_union_member
         exact_cl_unstruct_hooks[cl] = unstructure_union_member
-        cl_to_tag[cl] = tag
 
 
 def configure_union_passthrough(
