@@ -109,3 +109,24 @@ For example, if you wanted to see URLs only for `POST` requests:
 ...     if response.request.method == 'POST'
 ... ]
 ```
+
+## Revalidating Cached Responses
+Use {py:meth}`.CachedSession.revalidate` to actively check cached responses against the server,
+instead of waiting for them to be requested again. This sends conditional requests (with
+`If-None-Match` and/or `If-Modified-Since`) for responses that have validators, and groups the
+results in a {py:class}`.RevalidationReport`:
+```python
+>>> session = CachedSession()
+>>> report = session.revalidate(max_workers=4)
+>>> print(len(report.unmodified), len(report.updated), len(report.stale), len(report.failed))
+```
+
+Notes:
+* Each cached response is revalidated individually using its original request, so multiple
+  {ref}`Vary variants <matching-headers>` of the same URL are checked separately.
+* A failure for one item does not affect the remaining items; see `report.failed` for errors.
+* Cached responses remain readable during and after revalidation, and response hooks are not
+  triggered by revalidation requests.
+* To stop early, pass a {py:class}`threading.Event` via `cancel_event`; no new items will be
+  started, in-flight requests will finish, and unchecked items will be listed in
+  `report.pending` so you can tell which resources have not been verified yet.

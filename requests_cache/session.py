@@ -2,7 +2,7 @@
 
 from contextlib import contextmanager, nullcontext
 from logging import getLogger
-from threading import RLock, Thread
+from threading import Event, RLock, Thread
 from typing import TYPE_CHECKING, Iterable, Mapping, Optional, Union
 
 from requests import PreparedRequest
@@ -25,6 +25,7 @@ from .policy import (
     KeyCallback,
     set_request_headers,
 )
+from .revalidation import RevalidationReport, revalidate_cache
 from .serializers import SerializerType
 
 __all__ = ['CachedSession', 'CacheMixin']
@@ -328,6 +329,38 @@ class CacheMixin(MIXIN_BASE):
         logger.debug('Using stale response while revalidating')
         thread = Thread(target=self._send_and_cache, args=args, kwargs=kwargs)
         thread.start()
+
+    def revalidate(
+        self,
+        keys: Optional[Iterable[str]] = None,
+        max_workers: int = 4,
+        cancel_event: Optional[Event] = None,
+        **send_kwargs,
+    ) -> RevalidationReport:
+        """Actively revalidate cached responses with the origin server, using conditional
+        requests where validators (``ETag``/``Last-Modified``) are available.
+
+        Each cached response is checked individually using its original request, so multiple
+        ``Vary`` variants of the same URL are revalidated separately. Results are grouped by
+        outcome in the returned report; a failure for one item does not affect the remaining
+        items, and cached responses remain readable during and after revalidation. Cache-hit
+        behavior (including response hooks) is bypassed for revalidation requests.
+
+        Args:
+            keys: Specific cache keys to revalidate; defaults to all cached responses
+            max_workers: Maximum number of concurrent requests
+            cancel_event: When set, stop accepting new items and wait for in-flight requests to
+                finish; unchecked items are returned in ``report.pending``
+            send_kwargs: Additional keyword arguments for :py:meth:`requests.Session.send`
+                (e.g., ``timeout``)
+
+        Returns:
+            A report with ``unmodified``, ``updated``, ``stale``, ``failed``, and ``pending``
+            (not yet verified) results
+        """
+        return revalidate_cache(
+            self, keys=keys, max_workers=max_workers, cancel_event=cancel_event, **send_kwargs
+        )
 
     def _handle_error(self, cached_response: CachedResponse, actions: CacheActions) -> AnyResponse:
         """Handle a request error based on settings:
