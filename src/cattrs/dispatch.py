@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from functools import lru_cache, singledispatch
+from functools import singledispatch
 from typing import TYPE_CHECKING, Any, Callable, Generic, Literal, TypeVar
 
 from attrs import Factory, define
@@ -20,6 +20,14 @@ UnstructureHook: TypeAlias = Callable[[StructuredValue], UnstructuredValue]
 
 Hook = TypeVar("Hook", StructureHook, UnstructureHook)
 HookFactory: TypeAlias = Callable[[TargetType], Hook]
+
+# Types whose hooks are currently being generated, ordered outermost first.
+# A single global stack is shared by every dispatch because generated hooks
+# resolve their dependencies lazily (for example, ``Optional[T]`` and unions
+# look their member hooks up only when first invoked), outside the frame that
+# started the generation. The stack lets those late lookups still register a
+# dependency on the hook being built.
+_GENERATION_STACK: list[TargetType] = []
 
 
 @define
@@ -106,7 +114,14 @@ class MultiStrategyDispatch(Generic[Hook]):
     _direct_dispatch: dict[TargetType, Hook]
     _function_dispatch: FunctionDispatch
     _single_dispatch: Any
-    dispatch: Callable[[TargetType, BaseConverter], Hook]
+    dispatch: Callable[[TargetType], Hook]
+    _dispatch_cache: dict[TargetType, Hook]
+    # Maps a type to the types of the generated hooks that depend on it.
+    # A hook generated for type ``T`` records an edge ``dependency -> T`` for
+    # every hook it asks the converter for while being built.
+    _dependents: dict[TargetType, list[TargetType]]
+    _hits: int
+    _misses: int
 
     def __init__(
         self, fallback_factory: HookFactory[Hook], converter: BaseConverter
@@ -115,10 +130,55 @@ class MultiStrategyDispatch(Generic[Hook]):
         self._direct_dispatch = {}
         self._function_dispatch = FunctionDispatch(converter)
         self._single_dispatch = singledispatch(_DispatchNotFound)
-        self.dispatch = lru_cache(maxsize=None)(self.dispatch_without_caching)
+        self._dispatch_cache = {}
+        self._dependents = {}
+        self._hits = 0
+        self._misses = 0
+        self.dispatch = self._cached_dispatch
+
+    def _cached_dispatch(self, typ: TargetType) -> Hook:
+        """Dispatch on the type, caching generated hooks and their deps."""
+        self._record_dependency(typ)
+
+        cached = self._dispatch_cache.get(typ)
+        if cached is not None:
+            self._hits += 1
+            return cached
+
+        self._misses += 1
+        # A factory may register more hooks while running, which can clear the
+        # cache. Snapshot the surrounding frames so the global stack can be
+        # restored verbatim once generation finishes.
+        outer_frames = list(_GENERATION_STACK)
+        _GENERATION_STACK[:] = [*outer_frames, typ]
+        try:
+            hook = self.dispatch_without_caching(typ)
+        finally:
+            _GENERATION_STACK[:] = outer_frames
+
+        self._dispatch_cache[typ] = hook
+        return hook
+
+    def _record_dependency(self, typ: TargetType) -> None:
+        """Link ``typ`` to every hook currently being generated.
+
+        Recording the edge on cache hits as well as misses matters: a hook
+        generated late (an ``Optional[T]`` whose ``T`` hook already exists)
+        must still be invalidated when ``T`` changes. Linking every active
+        frame captures transitive dependencies through nested containers,
+        generic arguments and recursive types.
+        """
+        for owner in _GENERATION_STACK:
+            if owner == typ:
+                continue
+            dependents = self._dependents.setdefault(typ, [])
+            if owner not in dependents:
+                dependents.append(owner)
 
     def dispatch_without_caching(self, typ: TargetType) -> Hook:
         """Dispatch on the type but without caching the result."""
+        self._record_dependency(typ)
+
         try:
             dispatch = self._single_dispatch.dispatch(typ)
             if dispatch is not _DispatchNotFound:
@@ -135,13 +195,35 @@ class MultiStrategyDispatch(Generic[Hook]):
 
     def register_cls_list(self, cls_and_handler, direct: bool = False) -> None:
         """Register a class to direct or singledispatch."""
+        affected: list[TargetType] = []
         for cls, handler in cls_and_handler:
             if direct:
                 self._direct_dispatch[cls] = handler
             else:
                 self._single_dispatch.register(cls, handler)
                 self.clear_direct()
-        self.dispatch.cache_clear()
+                affected.append(cls)
+        if direct:
+            # Direct entries are consulted before the cache, so cached hooks
+            # stay valid and nothing has to be regenerated.
+            return
+        if affected:
+            for cls in affected:
+                # Registering a hook for a class also changes what
+                # singledispatch resolves its subclasses to.
+                self.invalidate(cls)
+                self._invalidate_subclasses(cls)
+        else:
+            self.clear_cache()
+
+    def _invalidate_subclasses(self, cls: TargetType) -> None:
+        """Invalidate cached hooks for the registered subclasses of ``cls``."""
+        get_subclasses = getattr(cls, "__subclasses__", None)
+        if get_subclasses is None:
+            return
+        for subclass in get_subclasses():
+            self.invalidate(subclass)
+            self._invalidate_subclasses(subclass)
 
     def register_func_list(
         self,
@@ -172,16 +254,49 @@ class MultiStrategyDispatch(Generic[Hook]):
                 else:
                     self._function_dispatch.register(func, handler, is_generator=is_gen)
         self.clear_direct()
-        self.dispatch.cache_clear()
+        self.clear_cache()
 
     def clear_direct(self) -> None:
         """Clear the direct dispatch."""
         self._direct_dispatch.clear()
 
+    def invalidate(self, typ: TargetType) -> None:
+        """Invalidate the cached hook for ``typ`` and every hook depending on it.
+
+        Only hooks that actually use ``typ`` (directly, through a nested
+        container, a generic argument or a recursive reference) are
+        regenerated; unrelated cached hooks are left untouched. Hooks that
+        were already handed out to callers are plain function objects and are
+        intentionally not mutated; callers must go through the converter (or
+        ``get_*_hook``) again to pick up the new behavior.
+        """
+        seen: set[int] = set()
+        pending = [typ]
+        while pending:
+            current = pending.pop()
+            marker = id(current)
+            if marker in seen:
+                continue
+            seen.add(marker)
+
+            self._dispatch_cache.pop(current, None)
+            pending.extend(self._dependents.pop(current, ()))
+
     def clear_cache(self) -> None:
         """Clear all caches."""
         self._direct_dispatch.clear()
-        self.dispatch.cache_clear()
+        self._dispatch_cache.clear()
+        self._dependents.clear()
+        self._hits = 0
+        self._misses = 0
+
+    def cache_info(self) -> tuple[int, int, int]:
+        """Return ``(hits, misses, current cache size)`` for the hook cache."""
+        return self._hits, self._misses, len(self._dispatch_cache)
+
+    def cache_clear(self) -> None:
+        """Alias of :meth:`clear_cache` for parity with ``functools.lru_cache``."""
+        self.clear_cache()
 
     def get_num_fns(self) -> int:
         return self._function_dispatch.get_num_fns()

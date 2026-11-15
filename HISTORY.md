@@ -13,6 +13,12 @@ Our backwards-compatibility policy can be found [here](https://github.com/python
 
 ## NEXT
 
+- Generated un/structuring hooks are now invalidated based on the types they
+  depend on. Registering a hook for a type only regenerates hooks that use it
+  (including through nested containers, generic arguments and recursive
+  references), leaving unrelated cached hooks untouched. Hooks already
+  retrieved from a converter keep their captured behavior; go through the
+  converter or `get_*_hook` again to pick up regenerated hooks.
 - Fix the msgspec converter passing typed deques directly to the encoder, which cannot serialize them. Deques are now unstructured into lists, including when nested in attrs classes or dataclasses.
   ([#818](https://github.com/python-attrs/cattrs/issues/818) [#819](https://github.com/python-attrs/cattrs/pull/819))
 

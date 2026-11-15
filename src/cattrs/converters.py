@@ -384,6 +384,12 @@ class BaseConverter:
         The converter function should take an instance of the class and return
         its Python equivalent.
 
+        Generated hooks that depend on the registered type (including nested
+        containers, generic arguments and recursive references) are
+        invalidated and regenerated on their next use; unrelated cached hooks
+        are left in place. Hooks already retrieved from the converter keep
+        their captured behavior and are not mutated.
+
         May also be used as a decorator. When used as a decorator, the first
         argument annotation from the decorated function will be used as the
         type to register the hook for.
@@ -499,6 +505,11 @@ class BaseConverter:
         If no hook is registered, the converter unstructure fallback factory
         will be used to produce one.
 
+        The returned object is the hook currently in use. Registering a new
+        hook for a type this hook depends on invalidates the converter's
+        cached hook, but it does not change a function already retrieved here;
+        call the converter or this method again to obtain the regenerated hook.
+
         :param cache_result: Whether to cache the returned hook.
 
         .. versionadded:: 24.1.0
@@ -526,6 +537,12 @@ class BaseConverter:
 
         and return the instance of the class. The type may seem redundant, but
         is sometimes needed (for example, when dealing with generic classes).
+
+        Generated hooks that depend on the registered type (including nested
+        containers, generic arguments and recursive references) are
+        invalidated and regenerated on their next use; unrelated cached hooks
+        are left in place. Hooks already retrieved from the converter keep
+        their captured behavior and are not mutated.
 
         This method may be used as a decorator. In this case, the decorated
         hook must have a return type annotation, and this annotation will be used
@@ -647,6 +664,11 @@ class BaseConverter:
 
         If no hook is registered, the converter structure fallback factory
         will be used to produce one.
+
+        The returned object is the hook currently in use. Registering a new
+        hook for a type this hook depends on invalidates the converter's
+        cached hook, but it does not change a function already retrieved here;
+        call the converter or this method again to obtain the regenerated hook.
 
         :param cache_result: Whether to cache the returned hook.
 
