@@ -1,6 +1,21 @@
 Changelog
 =========
 
+4.5.0 (unreleased)
+------------------
+
+Features:
+
+- Add patch-mode loading via `Schema.load_patch <marshmallow.Schema.load_patch>`.
+  Patch loading distinguishes absent fields, explicit ``None`` values, and the
+  new `marshmallow.constants.DELETE` sentinel, and returns per-field
+  `PatchValue <marshmallow.patch.PatchValue>` results carrying the implied
+  operation (`PatchOp.SET <marshmallow.patch.PatchOp>` or
+  `PatchOp.DELETE <marshmallow.patch.PatchOp>`). Deletion is only allowed on
+  fields declared with ``deletable=True`` and skips value conversion, while
+  set values go through the full validation pipeline. `Nested` fields recurse
+  in patch mode so presence state is preserved at every level.
+
 4.4.0 (2026-11-03)
 ------------------
 

@@ -8,6 +8,7 @@
     marshmallow.fields
     marshmallow.decorators
     marshmallow.validate
+    marshmallow.patch
     marshmallow.utils
     marshmallow.experimental.context
     marshmallow.exceptions

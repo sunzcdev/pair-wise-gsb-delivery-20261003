@@ -17,12 +17,13 @@ from enum import Enum as EnumType
 from typing import Unpack
 
 from marshmallow import class_registry, types, utils, validate
-from marshmallow.constants import missing as missing_
+from marshmallow.constants import DELETE, missing as missing_
 from marshmallow.exceptions import (
     StringNotCollectionError,
     ValidationError,
     _FieldInstanceResolutionError,
 )
+from marshmallow.patch import PatchValue
 from marshmallow.validate import And, Length
 
 if typing.TYPE_CHECKING:
@@ -86,6 +87,7 @@ class _BaseFieldKwargs(typing.TypedDict, total=False):
     post_load: types.PostLoadCallable | typing.Iterable[types.PostLoadCallable] | None
     required: bool
     allow_none: bool | None
+    deletable: bool
     load_only: bool
     dump_only: bool
     error_messages: types.ErrorMessages | None
@@ -141,6 +143,10 @@ class Field(typing.Generic[_InternalT]):
         validation/deserialization. If set to `False` (the default), `None` is considered invalid input.
         If ``load_default`` is explicitly set to `None` and ``allow_none`` is unset,
         `allow_none` is implicitly set to ``True``.
+    :param deletable: Set this to `True` to allow the field to be deleted with the
+        `marshmallow.constants.DELETE` marker when loading in patch mode
+        (`Schema.load_patch <marshmallow.Schema.load_patch>`). If `False` (the default),
+        the ``DELETE`` marker is rejected for this field.
     :param load_only: If `True` skip this field during serialization, otherwise
         its value will be present in the serialized data.
     :param dump_only: If `True` skip this field during deserialization, otherwise
@@ -161,6 +167,9 @@ class Field(typing.Generic[_InternalT]):
         Remove ``context`` property.
     .. versionchanged:: 4.3.0
         Add ``pre_load`` and ``post_load``.
+    .. versionchanged:: 4.5.0
+        Add ``deletable`` parameter and ``patch_deserialize`` method for
+        patch-mode loading.
     """
 
     # Some fields, such as Method fields and Function fields, are not expected
@@ -175,6 +184,7 @@ class Field(typing.Generic[_InternalT]):
         "required": "Missing data for required field.",
         "null": "Field may not be null.",
         "validator_failed": "Invalid value.",
+        "delete_not_allowed": "Field may not be deleted.",
     }
 
     def __init__(
@@ -193,6 +203,7 @@ class Field(typing.Generic[_InternalT]):
         ) = None,
         required: bool = False,
         allow_none: bool | None = None,
+        deletable: bool = False,
         load_only: bool = False,
         dump_only: bool = False,
         error_messages: types.ErrorMessages | None = None,
@@ -216,6 +227,7 @@ class Field(typing.Generic[_InternalT]):
         if required is True and load_default is not missing_:
             raise ValueError("'load_default' must not be set for required fields.")
         self.required = required
+        self.deletable = deletable
 
         metadata = metadata or {}
         self.metadata = metadata
@@ -385,6 +397,37 @@ class Field(typing.Generic[_InternalT]):
         for func in self.post_load:
             output = func(output)
         return output
+
+    def patch_deserialize(
+        self,
+        value: typing.Any,
+        attr: str | None = None,
+        data: typing.Mapping[str, typing.Any] | None = None,
+        **kwargs,
+    ) -> PatchValue:
+        """Deserialize ``value`` in patch mode, returning a `PatchValue`
+        that carries the operation implied by the input.
+
+        The `marshmallow.constants.DELETE` marker yields a `PatchOp.DELETE
+        <marshmallow.patch.PatchOp>` result without running any value
+        conversion or validation, and is only accepted if the field was
+        declared with ``deletable=True``. Any other value is deserialized
+        with the full validation pipeline of `deserialize` and wrapped in a
+        `PatchOp.SET <marshmallow.patch.PatchOp>` result.
+
+        :param value: The value to deserialize.
+        :param attr: The attribute/key in `data` to deserialize.
+        :param data: The raw input data passed to
+            `Schema.load_patch <marshmallow.Schema.load_patch>`.
+        :param kwargs: Field-specific keyword arguments.
+        :raise ValidationError: If the ``DELETE`` marker is used on a field
+            that is not deletable, or if a set value is invalid.
+        """
+        if value is DELETE:
+            if not self.deletable:
+                raise self.make_error("delete_not_allowed")
+            return PatchValue.delete()
+        return PatchValue.set(self.deserialize(value, attr, data, **kwargs))
 
     # Methods for concrete classes to override.
 
@@ -654,6 +697,28 @@ class Nested(Field):
         self._test_collection(value)
         return self._load(value, partial=partial)
 
+    def patch_deserialize(
+        self,
+        value: typing.Any,
+        attr: str | None = None,
+        data: typing.Mapping[str, typing.Any] | None = None,
+        **kwargs,
+    ) -> PatchValue:
+        """Same as :meth:`Field.patch_deserialize`, except set values are
+        loaded with `Schema.load_patch <marshmallow.Schema.load_patch>` so
+        that the presence state of each nested field is preserved.
+        """
+        if value is DELETE:
+            return super().patch_deserialize(value, attr, data, **kwargs)
+        self._test_collection(value)
+        try:
+            valid_data = self.schema.load_patch(value, unknown=self.unknown)
+        except ValidationError as error:
+            raise ValidationError(
+                error.messages, valid_data=error.valid_data
+            ) from error
+        return PatchValue.set(valid_data)
+
 
 class Pluck(Nested):
     """Allows you to replace nested data with one of the data's fields.
@@ -717,6 +782,22 @@ class Pluck(Nested):
         else:
             value = {self._field_data_key: value}
         return self._load(value, partial=partial)
+
+    def patch_deserialize(
+        self,
+        value: typing.Any,
+        attr: str | None = None,
+        data: typing.Mapping[str, typing.Any] | None = None,
+        **kwargs,
+    ) -> PatchValue:
+        if value is DELETE:
+            return super().patch_deserialize(value, attr, data, **kwargs)
+        self._test_collection(value)
+        if self.many:
+            value = [{self._field_data_key: v} for v in value]
+        else:
+            value = {self._field_data_key: value}
+        return PatchValue.set(self._load(value))
 
 
 class List(Field[list[_InternalT | None]]):

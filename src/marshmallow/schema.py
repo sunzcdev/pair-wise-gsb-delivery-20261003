@@ -32,6 +32,7 @@ from marshmallow.decorators import (
 from marshmallow.error_store import ErrorStore
 from marshmallow.exceptions import SCHEMA, StringNotCollectionError, ValidationError
 from marshmallow.orderedset import OrderedSet
+from marshmallow.patch import PatchOp, PatchValue
 from marshmallow.utils import (
     get_value,
     is_collection,
@@ -603,6 +604,7 @@ class Schema(metaclass=SchemaMeta):
         partial=None,
         unknown: types.UnknownOption = RAISE,
         index=None,
+        patch: bool = False,
     ) -> typing.Any | list[typing.Any]:
         """Deserialize ``data``.
 
@@ -617,6 +619,11 @@ class Schema(metaclass=SchemaMeta):
             fields in the data. Use `EXCLUDE`, `INCLUDE` or `RAISE`.
         :param index: Index of the item being deserialized (for storing errors) if
             deserializing a collection, otherwise `None`.
+        :param patch: Whether to deserialize in patch mode. Missing fields are
+            skipped without applying ``load_default`` or required-field checks,
+            and each present field produces a
+            `PatchValue <marshmallow.patch.PatchValue>` carrying the operation
+            implied by the input.
         :return: The deserialized data as `dict_class` instance or list of `dict_class`
         instances if `many` is `True`.
         """
@@ -634,6 +641,7 @@ class Schema(metaclass=SchemaMeta):
                         partial=partial,
                         unknown=unknown,
                         index=idx,
+                        patch=patch,
                     )
                     for idx, d in enumerate(data)
                 ]
@@ -650,6 +658,10 @@ class Schema(metaclass=SchemaMeta):
                 )
                 raw_value = data.get(field_name, missing)
                 if raw_value is missing:
+                    # In patch mode, absent fields are not part of the patch:
+                    # skip them without applying load_default or required checks.
+                    if patch:
+                        continue
                     # Ignore missing field if we're allowed to.
                     if partial is True or (
                         partial_is_collection and attr_name in partial
@@ -670,6 +682,12 @@ class Schema(metaclass=SchemaMeta):
                 def getter(
                     val, field_obj=field_obj, field_name=field_name, d_kwargs=d_kwargs
                 ):
+                    if patch:
+                        return field_obj.patch_deserialize(
+                            val,
+                            field_name,
+                            data,
+                        )
                     return field_obj.deserialize(
                         val,
                         field_name,
@@ -695,7 +713,9 @@ class Schema(metaclass=SchemaMeta):
                 for key in set(data) - fields:
                     value = data[key]
                     if unknown == INCLUDE:
-                        ret_d[key] = value
+                        # In patch mode, keep the result contract uniform:
+                        # included unknown fields are raw set operations.
+                        ret_d[key] = PatchValue.set(value) if patch else value
                     elif unknown == RAISE:
                         error_store.store_error(
                             [self.error_messages["unknown"]],
@@ -769,6 +789,57 @@ class Schema(metaclass=SchemaMeta):
         """
         data = self.opts.render_module.loads(s, **kwargs)
         return self.load(data, many=many, partial=partial, unknown=unknown)
+
+    def load_patch(
+        self,
+        data: Mapping[str, typing.Any] | Sequence[Mapping[str, typing.Any]],
+        *,
+        many: bool | None = None,
+        unknown: types.UnknownOption | None = None,
+    ):
+        """Deserialize an incremental patch to a mapping of field results
+        carrying operation semantics.
+
+        Unlike `load`, this method is meant for delta (incremental) payloads
+        and distinguishes three states for every declared field:
+
+        - Absent fields are not part of the patch. They are skipped without
+          applying ``load_default`` and without triggering required-field
+          errors, and they do not appear in the result. The required-field
+          rules of `load` for complete objects are not affected.
+        - Fields set to the `marshmallow.constants.DELETE` marker produce a
+          `PatchValue <marshmallow.patch.PatchValue>` with
+          `PatchOp.DELETE <marshmallow.patch.PatchOp>`. The marker is a unique
+          sentinel object, so it cannot collide with legitimate business
+          values. Deletion is only accepted for fields declared with
+          ``deletable=True`` and does not run any value conversion.
+        - Any other value, including an explicit ``None``, is deserialized
+          with the field's full validation pipeline and produces a
+          `PatchValue <marshmallow.patch.PatchValue>` with
+          `PatchOp.SET <marshmallow.patch.PatchOp>`.
+
+        `Nested <marshmallow.fields.Nested>` fields are loaded recursively in
+        patch mode, so the presence state of fields is preserved at every
+        level of the result.
+
+        ``post_load`` processors are not run, since the result is a set of
+        field operations rather than a complete object.
+
+        :param data: The patch data to deserialize.
+        :param many: Whether to deserialize `data` as a collection. If `None`,
+            the value for `self.many` is used.
+        :param unknown: Whether to exclude, include, or raise an error for
+            unknown fields in the data. Use `EXCLUDE`, `INCLUDE` or `RAISE`.
+            If `None`, the value for `self.unknown` is used.
+        :return: A dictionary mapping field names to
+            `PatchValue <marshmallow.patch.PatchValue>` results, or a list of
+            such dictionaries if `many` is `True`.
+
+        .. versionadded:: 4.5.0
+        """
+        return self._do_load(
+            data, many=many, unknown=unknown, postprocess=False, patch=True
+        )
 
     def _run_validator(
         self,
@@ -847,6 +918,7 @@ class Schema(metaclass=SchemaMeta):
         partial: bool | types.StrSequenceOrSet | None = None,
         unknown: types.UnknownOption | None = None,
         postprocess: bool = True,
+        patch: bool = False,
     ):
         """Deserialize `data`, returning the deserialized result.
         This method is private API.
@@ -862,6 +934,8 @@ class Schema(metaclass=SchemaMeta):
             fields in the data. Use `EXCLUDE`, `INCLUDE` or `RAISE`.
             If `None`, the value for `self.unknown` is used.
         :param postprocess: Whether to run post_load methods.
+        :param patch: Whether to deserialize in patch mode. See
+            `load_patch` for the patch-mode semantics.
         :return: Deserialized data
         """
         error_store = ErrorStore()
@@ -894,10 +968,11 @@ class Schema(metaclass=SchemaMeta):
                 many=many,
                 partial=partial,
                 unknown=unknown,
+                patch=patch,
             )
             # Run field-level validation
             self._invoke_field_validators(
-                error_store=error_store, data=result, many=many
+                error_store=error_store, data=result, many=many, patch=patch
             )
             # Run schema-level validation
             if self._hooks[VALIDATES_SCHEMA]:
@@ -1121,7 +1196,9 @@ class Schema(metaclass=SchemaMeta):
             unknown=unknown,
         )
 
-    def _invoke_field_validators(self, *, error_store: ErrorStore, data, many: bool):
+    def _invoke_field_validators(
+        self, *, error_store: ErrorStore, data, many: bool, patch: bool = False
+    ):
         for attr_name, _, validator_kwargs in self._hooks[VALIDATES]:
             validator = getattr(self, attr_name)
 
@@ -1147,6 +1224,11 @@ class Schema(metaclass=SchemaMeta):
                         except KeyError:
                             pass
                         else:
+                            if patch:
+                                # Deleted fields carry no value to validate.
+                                if value.op is PatchOp.DELETE:
+                                    continue
+                                value = value.value
                             validated_value = self._call_and_store(
                                 getter_func=do_validate,
                                 data=value,
@@ -1162,6 +1244,11 @@ class Schema(metaclass=SchemaMeta):
                     except KeyError:
                         pass
                     else:
+                        if patch:
+                            # Deleted fields carry no value to validate.
+                            if value.op is PatchOp.DELETE:
+                                continue
+                            value = value.value
                         validated_value = self._call_and_store(
                             getter_func=do_validate,
                             data=value,
