@@ -13,6 +13,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 ### Added
 
 * Expose `FunctionAuth` from the public API. (#3699)
+* Add `iter_lines_with_separators()` and `aiter_lines_with_separators()` for
+  streaming line text together with the original line separator.
 
 ## 0.28.1 (6th December, 2024)
 

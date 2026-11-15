@@ -59,6 +59,7 @@ __all__ = [
     "HTTPTransport",
     "InvalidURL",
     "Limits",
+    "LineRecord",
     "LocalProtocolError",
     "main",
     "MockTransport",

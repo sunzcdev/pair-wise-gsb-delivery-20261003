@@ -70,6 +70,7 @@
   * The amount of time elapsed between sending the request and calling `close()` on the corresponding response received for that request.
   [total_seconds()](https://docs.python.org/3/library/datetime.html#datetime.timedelta.total_seconds) to correctly get
   the total elapsed seconds.
+* `LineRecord` - **named tuple of `(text, separator)`**
 * `def .raise_for_status()` - **Response**
 * `def .json()` - **Any**
 * `def .read()` - **bytes**
@@ -77,6 +78,10 @@
 * `def .iter_bytes([chunk_size])` - **bytes iterator**
 * `def .iter_text([chunk_size])` - **text iterator**
 * `def .iter_lines()` - **text iterator**
+* `def .iter_lines(keepends=True)` - **text iterator, including separators**
+* `def .iter_lines(with_separators=True)` - **line record iterator**
+* `def .iter_lines_with_separators()` - **line record iterator**
+* `def .iter_line_records()` - **line record iterator**
 * `def .close()` - **None**
 * `def .next()` - **Response**
 * `def .aread()` - **bytes**
@@ -84,6 +89,10 @@
 * `def .aiter_bytes([chunk_size])` - **async bytes iterator**
 * `def .aiter_text([chunk_size])` - **async text iterator**
 * `def .aiter_lines()` - **async text iterator**
+* `def .aiter_lines(keepends=True)` - **async text iterator, including separators**
+* `def .aiter_lines(with_separators=True)` - **async line record iterator**
+* `def .aiter_lines_with_separators()` - **async line record iterator**
+* `def .aiter_line_records()` - **async line record iterator**
 * `def .aclose()` - **None**
 * `def .anext()` - **Response**
 

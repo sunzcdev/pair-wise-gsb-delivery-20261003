@@ -9,6 +9,7 @@ import pytest
 import zstandard as zstd
 
 import httpx
+from httpx._decoders import LineDecoder
 
 
 def test_deflate():
@@ -341,6 +342,116 @@ def test_line_decoder_crnl():
     # Issue #1033
     response = httpx.Response(200, content=[b"", b"12345\r\n", b"foo bar baz\r\n"])
     assert list(response.iter_lines()) == ["12345", "foo bar baz"]
+
+
+@pytest.mark.parametrize(
+    ["content", "expected"],
+    [
+        (
+            b"a\n\nb\nc",
+            [("a", "\n"), ("", "\n"), ("b", "\n"), ("c", "")],
+        ),
+        (
+            b"a\r\n\r\nb\r\nc",
+            [("a", "\r\n"), ("", "\r\n"), ("b", "\r\n"), ("c", "")],
+        ),
+        (
+            b"a\r\rb\rc",
+            [("a", "\r"), ("", "\r"), ("b", "\r"), ("c", "")],
+        ),
+        (b"a\n", [("a", "\n")]),
+        (b"a\r\n", [("a", "\r\n")]),
+        (b"a\r", [("a", "\r")]),
+        (b"a", [("a", "")]),
+        (b"", []),
+    ],
+)
+def test_line_decoder_with_separators(
+    content: bytes, expected: list[tuple[str, str]]
+) -> None:
+    response = httpx.Response(200, content=content)
+    assert list(response.iter_lines_with_separators()) == expected
+
+
+def test_line_decoder_with_separators_across_chunks() -> None:
+    # The `\r` and `\n` are split across chunks, and must still form a
+    # single separator rather than a CR followed by an LF.
+    response = httpx.Response(200, content=iter([b"a\r", b"\n", b"b\r", b"\nc"]))
+    assert list(response.iter_line_records()) == [
+        ("a", "\r\n"),
+        ("b", "\r\n"),
+        ("c", ""),
+    ]
+
+    response = httpx.Response(200, content=iter([b"a\r", b"\r\nb\r"]))
+    assert list(response.iter_line_records()) == [
+        ("a", "\r"),
+        ("", "\r\n"),
+        ("b", "\r"),
+    ]
+
+
+@pytest.mark.parametrize(
+    "separator",
+    [
+        "\n",
+        "\r",
+        "\r\n",
+        "\x0b",
+        "\x0c",
+        "\x1c",
+        "\x1d",
+        "\x1e",
+        "\x85",
+        "\u2028",
+        "\u2029",
+    ],
+)
+def test_line_decoder_with_separators_unicode_set(separator: str) -> None:
+    response = httpx.Response(200, content=f"a{separator}b{separator}".encode())
+    assert list(response.iter_lines_with_separators()) == [
+        ("a", separator),
+        ("b", separator),
+    ]
+
+
+def test_iter_lines_keepends() -> None:
+    response = httpx.Response(200, content=b"a\r\nb\nc")
+    assert list(response.iter_lines(keepends=True)) == ["a\r\n", "b\n", "c"]
+
+
+def test_iter_lines_default_remains_unchanged() -> None:
+    response = httpx.Response(200, content=b"a\r\n\r\nb\nc")
+    assert list(response.iter_lines()) == ["a", "", "b", "c"]
+
+
+def test_line_decoder_optional_separators() -> None:
+    decoder = LineDecoder()
+    assert decoder.decode("a\r", with_separators=True) == []
+    assert decoder.decode("\n", with_separators=True) == [("a", "\r\n")]
+    assert decoder.flush(with_separators=True) == []
+
+    decoder = LineDecoder(with_separators=True)
+    assert decoder.decode("a") == []
+    assert decoder.flush() == [("a", "")]
+
+
+@pytest.mark.anyio
+async def test_aiter_lines_with_separators_matches_sync() -> None:
+    chunks = [b"a\r", b"\n", b"\r", b"\nb\r"]
+    sync_response = httpx.Response(200, content=iter(chunks))
+    async_response = httpx.Response(200, content=async_byte_stream(chunks))
+
+    sync_records = list(sync_response.iter_lines_with_separators())
+    async_records = [
+        record async for record in async_response.aiter_lines_with_separators()
+    ]
+    assert async_records == sync_records
+
+
+async def async_byte_stream(chunks: list[bytes]) -> typing.AsyncIterator[bytes]:
+    for chunk in chunks:
+        yield chunk
 
 
 def test_invalid_content_encoding_header():

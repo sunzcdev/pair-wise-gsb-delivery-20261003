@@ -17,6 +17,7 @@ from ._decoders import (
     ContentDecoder,
     IdentityDecoder,
     LineDecoder,
+    LineRecord,
     MultiDecoder,
     TextChunker,
     TextDecoder,
@@ -48,7 +49,7 @@ from ._types import (
 from ._urls import URL
 from ._utils import to_bytes_or_str, to_str
 
-__all__ = ["Cookies", "Headers", "Request", "Response"]
+__all__ = ["Cookies", "Headers", "LineRecord", "Request", "Response"]
 
 SENSITIVE_HEADERS = {"authorization", "proxy-authorization"}
 
@@ -923,14 +924,50 @@ class Response:
             for chunk in chunker.flush():
                 yield chunk
 
-    def iter_lines(self) -> typing.Iterator[str]:
-        decoder = LineDecoder()
+    def iter_lines(
+        self,
+        with_separators: bool = False,
+        keepends: bool = False,
+    ) -> typing.Iterator[str | LineRecord]:
+        """
+        A line-iterator over the decoded response content.
+
+        By default this yields the same strings as before, without the
+        line separators. With `with_separators=True` it yields `LineRecord`
+        instances containing both the text and the separator. The separator
+        is an empty string for a final line which is not newline terminated.
+        With `keepends=True` it yields strings with their separators attached.
+        """
+        decoder = LineDecoder(with_separators=True)
         with request_context(request=self._request):
             for text in self.iter_text():
-                for line in decoder.decode(text):
-                    yield line
-            for line in decoder.flush():
-                yield line
+                for record in decoder.decode_with_separators(text):
+                    if with_separators:
+                        yield record
+                    elif keepends:
+                        yield record.text + record.separator
+                    else:
+                        yield record.text
+            for record in decoder.flush_with_separators():
+                if with_separators:
+                    yield record
+                elif keepends:
+                    yield record.text + record.separator
+                else:
+                    yield record.text
+
+    def iter_lines_with_separators(self) -> typing.Iterator[LineRecord]:
+        """
+        A line-record iterator which preserves the original line separators.
+        """
+        for record in self.iter_lines(with_separators=True):
+            yield typing.cast(LineRecord, record)
+
+    def iter_line_records(self) -> typing.Iterator[LineRecord]:
+        """
+        An alias for `iter_lines_with_separators()`.
+        """
+        yield from self.iter_lines_with_separators()
 
     def iter_raw(self, chunk_size: int | None = None) -> typing.Iterator[bytes]:
         """
@@ -1025,14 +1062,53 @@ class Response:
             for chunk in chunker.flush():
                 yield chunk
 
-    async def aiter_lines(self) -> typing.AsyncIterator[str]:
-        decoder = LineDecoder()
+    async def aiter_lines(
+        self,
+        with_separators: bool = False,
+        keepends: bool = False,
+    ) -> typing.AsyncIterator[str | LineRecord]:
+        """
+        An async line-iterator over the decoded response content.
+
+        By default this yields the same strings as before, without the
+        line separators. With `with_separators=True` it yields `LineRecord`
+        instances containing both the text and the separator. The separator
+        is an empty string for a final line which is not newline terminated.
+        With `keepends=True` it yields strings with their separators attached.
+        """
+        decoder = LineDecoder(with_separators=True)
         with request_context(request=self._request):
             async for text in self.aiter_text():
-                for line in decoder.decode(text):
-                    yield line
-            for line in decoder.flush():
-                yield line
+                for record in decoder.decode_with_separators(text):
+                    if with_separators:
+                        yield record
+                    elif keepends:
+                        yield record.text + record.separator
+                    else:
+                        yield record.text
+            for record in decoder.flush_with_separators():
+                if with_separators:
+                    yield record
+                elif keepends:
+                    yield record.text + record.separator
+                else:
+                    yield record.text
+
+    async def aiter_lines_with_separators(
+        self,
+    ) -> typing.AsyncIterator[LineRecord]:
+        """
+        An async line-record iterator which preserves the original separators.
+        """
+        async for record in self.aiter_lines(with_separators=True):
+            yield typing.cast(LineRecord, record)
+
+    async def aiter_line_records(self) -> typing.AsyncIterator[LineRecord]:
+        """
+        An alias for `aiter_lines_with_separators()`.
+        """
+        async for record in self.aiter_lines_with_separators():
+            yield record
 
     async def aiter_raw(
         self, chunk_size: int | None = None

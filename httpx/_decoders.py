@@ -318,6 +318,34 @@ class TextDecoder:
         return self.decoder.decode(b"", True)
 
 
+class LineRecord(typing.NamedTuple):
+    """
+    A line of text together with the separator that terminated it.
+
+    The separator is an empty string for the final line when the input
+    does not end with a line separator.
+    """
+
+    text: str
+    separator: str
+
+    @property
+    def line(self) -> str:
+        return self.text
+
+    @property
+    def line_ending(self) -> str:
+        return self.separator
+
+    @property
+    def terminated(self) -> bool:
+        return bool(self.separator)
+
+
+# The line separators recognised by `str.splitlines()`.
+LINE_SEPARATORS = "\n\r\x0b\x0c\x1c\x1d\x1e\x85\u2028\u2029"
+
+
 class LineDecoder:
     """
     Handles incrementally reading lines from text.
@@ -326,56 +354,96 @@ class LineDecoder:
     but handling the input iteratively.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, with_separators: bool = False) -> None:
         self.buffer: list[str] = []
         self.trailing_cr: bool = False
+        self.with_separators = with_separators
 
-    def decode(self, text: str) -> list[str]:
+    def _pop_record(self, separator: str) -> LineRecord:
+        record = LineRecord("".join(self.buffer), separator)
+        self.buffer = []
+        return record
+
+    def decode(
+        self, text: str, *, with_separators: bool | None = None
+    ) -> list[str] | list[LineRecord]:
+        records = self.decode_with_separators(text)
+        if with_separators is None:
+            with_separators = self.with_separators
+        if with_separators:
+            return records
+        return [record.text for record in records]
+
+    def decode_with_separators(self, text: str) -> list[LineRecord]:
         # See https://docs.python.org/3/library/stdtypes.html#str.splitlines
-        NEWLINE_CHARS = "\n\r\x0b\x0c\x1c\x1d\x1e\x85\u2028\u2029"
+        #
+        # NOTE: the edge case input of empty text doesn't occur in practice,
+        # because other httpx internals filter out this value.
+        if not text:
+            return []
 
-        # We always push a trailing `\r` into the next decode iteration.
+        records: list[LineRecord] = []
+
+        # A trailing `\r` may be the first half of a `\r\n` pair which is
+        # split across two input chunks. We defer it until the next decode
+        # call, or until flush() if the input ends there.
         if self.trailing_cr:
-            text = "\r" + text
+            if text.startswith("\n"):
+                records.append(self._pop_record("\r\n"))
+                text = text[1:]
+            else:
+                records.append(self._pop_record("\r"))
             self.trailing_cr = False
+
         if text.endswith("\r"):
             self.trailing_cr = True
             text = text[:-1]
 
         if not text:
-            # NOTE: the edge case input of empty text doesn't occur in practice,
-            # because other httpx internals filter out this value
-            return []  # pragma: no cover
+            return records
 
-        trailing_newline = text[-1] in NEWLINE_CHARS
-        lines = text.splitlines()
+        segments = text.splitlines(keepends=True)
+        for index, segment in enumerate(segments):
+            if segment.endswith("\r\n"):
+                line, separator = segment[:-2], "\r\n"
+            elif segment[-1] in LINE_SEPARATORS:
+                line, separator = segment[:-1], segment[-1]
+            else:
+                line, separator = segment, ""
 
-        if len(lines) == 1 and not trailing_newline:
-            # No new lines, buffer the input and continue.
-            self.buffer.append(lines[0])
-            return []
+            if index == 0 and self.buffer:
+                # Include any existing buffer in the first portion of the
+                # splitlines result.
+                line = "".join(self.buffer) + line
+                self.buffer = []
 
-        if self.buffer:
-            # Include any existing buffer in the first portion of the
-            # splitlines result.
-            lines = ["".join(self.buffer) + lines[0]] + lines[1:]
-            self.buffer = []
+            if separator:
+                records.append(LineRecord(line, separator))
+            else:
+                # The final segment is not newline terminated. Buffer it
+                # until we either see another separator or reach flush().
+                self.buffer.append(line)
 
-        if not trailing_newline:
-            # If the last segment of splitlines is not newline terminated,
-            # then drop it from our output and start a new buffer.
-            self.buffer = [lines.pop()]
+        return records
 
-        return lines
+    def flush(
+        self, *, with_separators: bool | None = None
+    ) -> list[str] | list[LineRecord]:
+        records = self.flush_with_separators()
+        if with_separators is None:
+            with_separators = self.with_separators
+        if with_separators:
+            return records
+        return [record.text for record in records]
 
-    def flush(self) -> list[str]:
-        if not self.buffer and not self.trailing_cr:
-            return []
-
-        lines = ["".join(self.buffer)]
-        self.buffer = []
-        self.trailing_cr = False
-        return lines
+    def flush_with_separators(self) -> list[LineRecord]:
+        records: list[LineRecord] = []
+        if self.trailing_cr:
+            records.append(self._pop_record("\r"))
+            self.trailing_cr = False
+        elif self.buffer:
+            records.append(self._pop_record(""))
+        return records
 
 
 SUPPORTED_DECODERS = {
