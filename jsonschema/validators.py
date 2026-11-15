@@ -137,6 +137,657 @@ _REMOTE_WARNING_REGISTRY = SPECIFICATIONS.combine(
 )
 
 
+_STANDARD_VOCABULARIES = frozenset(
+    {
+        "https://json-schema.org/draft/2020-12/vocab/core",
+        "https://json-schema.org/draft/2020-12/vocab/applicator",
+        "https://json-schema.org/draft/2020-12/vocab/unevaluated",
+        "https://json-schema.org/draft/2020-12/vocab/validation",
+        "https://json-schema.org/draft/2020-12/vocab/meta-data",
+        "https://json-schema.org/draft/2020-12/vocab/format-annotation",
+        "https://json-schema.org/draft/2020-12/vocab/format-assertion",
+        "https://json-schema.org/draft/2020-12/vocab/content",
+        "https://json-schema.org/draft/2019-09/vocab/core",
+        "https://json-schema.org/draft/2019-09/vocab/applicator",
+        "https://json-schema.org/draft/2019-09/vocab/validation",
+        "https://json-schema.org/draft/2019-09/vocab/meta-data",
+        "https://json-schema.org/draft/2019-09/vocab/format",
+        "https://json-schema.org/draft/2019-09/vocab/content",
+    },
+)
+
+
+@define(frozen=True)
+class VocabularyIssue:
+    """
+    A vocabulary declaration which could not be fully understood.
+
+    ``resource`` and ``path`` identify where the vocabulary was declared,
+    while ``required`` distinguishes required from optional vocabularies.
+    """
+
+    resource: str
+    path: tuple[str | int, ...]
+    vocabulary: str | None
+    required: bool
+    dialect: str | None
+    message: str
+
+    @property
+    def pointer(self) -> tuple[str | int, ...]:
+        return self.path
+
+    @property
+    def location(self) -> str:
+        return _format_vocabulary_location(self.resource, self.path)
+
+    @property
+    def json_pointer(self) -> str:
+        return "".join(
+            "/" + str(segment).replace("~", "~0").replace("/", "~1")
+            for segment in self.path
+        )
+
+    def __str__(self) -> str:
+        return self.message
+
+
+@define
+class VocabularyReport:
+    """
+    The result of eagerly checking a schema's declared capabilities.
+
+    ``errors`` contains declarations which make validation unsafe to start.
+    ``warnings`` contains optional vocabularies which are retained but whose
+    behavior is unknown to this implementation.
+    """
+
+    errors: list[VocabularyIssue] = field(factory=list)
+    warnings: list[VocabularyIssue] = field(factory=list)
+    dialect: str | None = None
+    validator: type[Validator] | None = None
+
+    @property
+    def issues(self) -> list[VocabularyIssue]:
+        return [*self.errors, *self.warnings]
+
+    @property
+    def unsupported(self) -> list[VocabularyIssue]:
+        return self.errors
+
+    @property
+    def unknown(self) -> list[VocabularyIssue]:
+        return self.issues
+
+    @property
+    def ok(self) -> bool:
+        return not self.errors
+
+    def __bool__(self) -> bool:
+        return self.ok
+
+    def __iter__(self):
+        return iter(self.issues)
+
+    def raise_for_errors(self) -> None:
+        """
+        Raise for the first required issue, or warn about optional ones.
+        """
+        _raise_or_warn(self, stacklevel=2)
+
+
+#: A perhaps-more-explicit alias for `VocabularyReport`.
+CapabilityReport = VocabularyReport
+
+
+def _format_vocabulary_location(
+    resource: str,
+    path: Iterable[str | int],
+) -> str:
+    pointer = "".join(
+        "/" + str(segment).replace("~", "~0").replace("/", "~1")
+        for segment in path
+    )
+    return f"{resource or '<root>'}#{pointer}"
+
+
+def _specification_for(validator: type[Validator]) -> referencing.Specification:
+    """
+    Retrieve the referencing specification matching a validator class.
+    """
+    metaschema = getattr(validator, "META_SCHEMA", None)
+    try:
+        dialect_id = validator.ID_OF(metaschema)
+    except Exception:
+        dialect_id = None
+    specification = referencing.jsonschema.specification_with(
+        dialect_id or "urn:unknown-dialect",
+        default=referencing.Specification.OPAQUE,
+    )
+    if specification is referencing.Specification.OPAQUE and isinstance(
+        metaschema,
+        Mapping,
+    ):
+        meta_dialect = metaschema.get("$schema")
+        if isinstance(meta_dialect, str):
+            return referencing.jsonschema.specification_with(
+                meta_dialect,
+                default=referencing.Specification.OPAQUE,
+            )
+    return specification
+
+
+def _meta_schema_for(dialect: str) -> type[Validator] | None:
+    try:
+        return _META_SCHEMAS[dialect]
+    except KeyError:
+        return None
+
+
+def _pointer_from_fragment(fragment: str) -> tuple[str | int, ...]:
+    if not fragment.startswith("/"):
+        return ()
+    return tuple(
+        unquote(segment).replace("~1", "/").replace("~0", "~")
+        for segment in fragment[1:].split("/")
+    )
+
+
+def _schema_pairs(
+    contents: Mapping[str, referencing.jsonschema.Schema],
+    specification: referencing.Specification,
+):
+    """
+    Yield ``(path, subschema)`` pairs for schema positions in ``contents``.
+
+    Unlike a naive recursive walk this follows the keyword scoping of the
+    active dialect, so dictionaries in annotations such as ``default`` or
+    ``examples`` are not mistaken for schemas.
+    """
+    name = specification.name
+
+    single: set[str] = set()
+    arrays: set[str] = set()
+    mappings: set[str] = set()
+
+    if name == "draft2020-12":
+        single = {
+            "additionalProperties",
+            "contains",
+            "contentSchema",
+            "else",
+            "if",
+            "items",
+            "not",
+            "propertyNames",
+            "then",
+            "unevaluatedItems",
+            "unevaluatedProperties",
+        }
+        arrays = {"allOf", "anyOf", "oneOf", "prefixItems"}
+        mappings = {
+            "$defs",
+            "definitions",
+            "dependentSchemas",
+            "patternProperties",
+            "properties",
+        }
+    elif name == "draft2019-09":
+        single = {
+            "additionalItems",
+            "additionalProperties",
+            "contains",
+            "contentSchema",
+            "else",
+            "if",
+            "not",
+            "propertyNames",
+            "then",
+            "unevaluatedItems",
+            "unevaluatedProperties",
+        }
+        arrays = {"allOf", "anyOf", "oneOf"}
+        mappings = {
+            "$defs",
+            "definitions",
+            "dependentSchemas",
+            "patternProperties",
+            "properties",
+        }
+    elif name in {"draft-07", "draft-06"}:
+        single = {
+            "additionalItems",
+            "additionalProperties",
+            "contains",
+            "else",
+            "if",
+            "not",
+            "propertyNames",
+            "then",
+        }
+        arrays = {"allOf", "anyOf", "oneOf"}
+        mappings = {"definitions", "patternProperties", "properties"}
+    elif name == "draft-04":
+        single = {"not"}
+        arrays = {"allOf", "anyOf", "oneOf"}
+        mappings = {"definitions", "patternProperties", "properties"}
+    elif name == "draft-03":
+        arrays = {"extends"}
+        mappings = {"definitions", "patternProperties", "properties"}
+    else:
+        for each in specification.subresources_of(contents):
+            yield (), each
+        return
+
+    for keyword in single:
+        if keyword in contents:
+            yield (keyword,), contents[keyword]
+
+    for keyword in arrays:
+        value = contents.get(keyword)
+        if isinstance(value, Sequence) and not isinstance(
+            value,
+            (str, bytes, Mapping),
+        ):
+            for index, each in enumerate(value):
+                yield (keyword, index), each
+
+    for keyword in mappings:
+        value = contents.get(keyword)
+        if isinstance(value, Mapping):
+            for key, each in value.items():
+                yield (keyword, key), each
+
+    items = contents.get("items")
+    if items is not None:
+        if isinstance(items, Sequence) and not isinstance(
+            items,
+            (str, bytes, Mapping),
+        ):
+            for index, each in enumerate(items):
+                yield ("items", index), each
+        else:
+            yield ("items",), items
+
+    if name in {"draft-07", "draft-06", "draft-04", "draft-03"}:
+        dependencies = contents.get("dependencies")
+        if isinstance(dependencies, Mapping):
+            for key, value in dependencies.items():
+                if isinstance(value, Mapping):
+                    yield ("dependencies", key), value
+
+    if name == "draft-03":
+        extends = contents.get("extends")
+        if isinstance(extends, Mapping):
+            yield ("extends",), extends
+
+    for keyword in {"additionalItems", "additionalProperties"}:
+        value = contents.get(keyword)
+        if isinstance(value, Mapping):
+            yield (keyword,), value
+
+
+class _CapabilityChecker:
+    def __init__(
+        self,
+        *,
+        registry: referencing.jsonschema.SchemaRegistry | None,
+        default: type[Validator],
+    ) -> None:
+        self.registry = (
+            _REMOTE_WARNING_REGISTRY
+            if registry is None
+            else SPECIFICATIONS.combine(registry)
+        )
+        self.default = default
+        self.report = VocabularyReport()
+        self._seen: set[tuple[str, tuple[str | int, ...], int]] = set()
+        self._crawled_registry = None
+        self._dialects: dict[
+            str,
+            tuple[referencing.Specification, type[Validator]],
+        ] = {}
+        self._resolving_dialects: set[str] = set()
+
+    def _crawled(self):
+        if self._crawled_registry is None:
+            self._crawled_registry = self.registry.crawl()
+        return self._crawled_registry
+
+    def _metaschema_contents(self, uri: str):
+        registry = self._crawled()
+        for candidate in (uri, uri.rstrip("#"), f"{uri}#"):
+            try:
+                return registry[candidate].contents
+            except KeyError:
+                continue
+        return None
+
+    def _resolve_dialect(
+        self,
+        dialect: str,
+        *,
+        resource: str,
+        path: tuple[str | int, ...],
+    ) -> tuple[referencing.Specification, type[Validator]]:
+        cached = self._dialects.get(dialect)
+        if cached is not None:
+            return cached
+
+        if dialect in self._resolving_dialects:
+            error = exceptions.UnknownDialectError(
+                dialect,
+                resource=resource,
+                path=path,
+            )
+            self.report.errors.append(
+                VocabularyIssue(
+                    resource=resource,
+                    path=path,
+                    vocabulary=None,
+                    required=True,
+                    dialect=dialect,
+                    message=str(error),
+                ),
+            )
+            fallback = (_specification_for(self.default), self.default)
+            self._dialects[dialect] = fallback
+            return fallback
+
+        self._resolving_dialects.add(dialect)
+        try:
+            validator = _meta_schema_for(dialect)
+            if validator is not None:
+                specification = _specification_for(validator)
+                metaschema = self._metaschema_contents(dialect)
+                if metaschema is None:
+                    metaschema = validator.META_SCHEMA
+                self._check_vocabulary_object(
+                    metaschema,
+                    resource=dialect,
+                    path=(),
+                    dialect=dialect,
+                )
+                result = (specification, validator)
+                self._dialects[dialect] = result
+                return result
+
+            metaschema = self._metaschema_contents(dialect)
+            if not isinstance(metaschema, Mapping):
+                error = exceptions.UnknownDialectError(
+                    dialect,
+                    resource=resource,
+                    path=path,
+                )
+                self.report.errors.append(
+                    VocabularyIssue(
+                        resource=resource,
+                        path=path,
+                        vocabulary=None,
+                        required=True,
+                        dialect=dialect,
+                        message=str(error),
+                    ),
+                )
+                fallback = (_specification_for(self.default), self.default)
+                self._dialects[dialect] = fallback
+                return fallback
+
+            meta_dialect = metaschema.get("$schema")
+            if not isinstance(meta_dialect, str) or meta_dialect == dialect:
+                error = exceptions.UnknownDialectError(
+                    dialect,
+                    resource=resource,
+                    path=path,
+                )
+                self.report.errors.append(
+                    VocabularyIssue(
+                        resource=resource,
+                        path=path,
+                        vocabulary=None,
+                        required=True,
+                        dialect=dialect,
+                        message=str(error),
+                    ),
+                )
+                fallback = (_specification_for(self.default), self.default)
+                self._dialects[dialect] = fallback
+                return fallback
+
+            specification, validator = self._resolve_dialect(
+                meta_dialect,
+                resource=dialect,
+                path=(),
+            )
+            self._check_vocabulary_object(
+                metaschema,
+                resource=dialect,
+                path=(),
+                dialect=dialect,
+            )
+            try:
+                if self.default.ID_OF(self.default.META_SCHEMA) == dialect:
+                    validator = self.default
+            except Exception:
+                pass
+            result = (specification, validator)
+            self._dialects[dialect] = result
+            return result
+        finally:
+            self._resolving_dialects.discard(dialect)
+
+    def _check_vocabulary_object(
+        self,
+        contents,
+        *,
+        resource: str,
+        path: tuple[str | int, ...],
+        dialect: str | None,
+    ) -> None:
+        if not isinstance(contents, Mapping):
+            return
+        vocabulary = contents.get("$vocabulary")
+        if not isinstance(vocabulary, Mapping):
+            return
+
+        for uri, required in vocabulary.items():
+            if not isinstance(uri, str) or uri in _STANDARD_VOCABULARIES:
+                continue
+            is_required = required is True
+            issue = VocabularyIssue(
+                resource=resource,
+                path=(*path, "$vocabulary", uri),
+                vocabulary=uri,
+                required=is_required,
+                dialect=dialect,
+                message=str(
+                    exceptions.UnsupportedVocabularyError(
+                        uri,
+                        resource=resource,
+                        path=(*path, "$vocabulary", uri),
+                        required=is_required,
+                        dialect=dialect,
+                    ),
+                ),
+            )
+            if is_required:
+                self.report.errors.append(issue)
+            else:
+                self.report.warnings.append(issue)
+
+    def check(self, schema: referencing.jsonschema.Schema) -> VocabularyReport:
+        if schema is True or schema is False:
+            return self.report
+
+        declared = schema.get("$schema") if isinstance(schema, Mapping) else None
+        if isinstance(declared, str):
+            root = ""
+            for id_keyword in ("$id", "id"):
+                identifier = schema.get(id_keyword)
+                if isinstance(identifier, str):
+                    root = urljoin(root, identifier)
+                    break
+            specification, validator = self._resolve_dialect(
+                declared,
+                resource=root,
+                path=("$schema",),
+            )
+            self.report.dialect = declared
+            self.report.validator = validator
+        else:
+            specification = _specification_for(self.default)
+            self.report.validator = self.default
+
+        resource = specification.create_resource(schema)
+        resolver = self.registry.resolver_with_root(resource)
+        base_uri = getattr(resolver, "_base_uri", "") or ""
+        self._scan(
+            schema,
+            specification=specification,
+            resource_uri=base_uri,
+            path=(),
+            resolver=resolver,
+        )
+        return self.report
+
+    def _scan(
+        self,
+        contents,
+        *,
+        specification,
+        resource_uri: str,
+        path: tuple[str | int, ...],
+        resolver,
+    ) -> None:
+        if contents is True or contents is False:
+            return
+        if not isinstance(contents, Mapping):
+            return
+
+        seen = (resource_uri, path, id(contents))
+        if seen in self._seen:
+            return
+        self._seen.add(seen)
+
+        declared = contents.get("$schema")
+        if isinstance(declared, str):
+            reported_resource = resource_uri
+            if not path and isinstance(contents.get("$id"), str):
+                reported_resource = urljoin(resource_uri, contents["$id"])
+            elif not path and isinstance(contents.get("id"), str):
+                reported_resource = urljoin(resource_uri, contents["id"])
+            specification, _ = self._resolve_dialect(
+                declared,
+                resource=reported_resource,
+                path=(*path, "$schema"),
+            )
+
+        identifier = specification.id_of(contents)
+        if identifier is not None:
+            resource_uri = urljoin(resource_uri, identifier)
+            path = ()
+            resolver = resolver.in_subresource(
+                specification.create_resource(contents),
+            )
+
+        self._check_vocabulary_object(
+            contents,
+            resource=resource_uri,
+            path=path,
+            dialect=contents.get("$schema"),
+        )
+
+        for keyword in ("$ref", "$dynamicRef", "$recursiveRef"):
+            reference = contents.get(keyword)
+            if isinstance(reference, str):
+                self._follow(
+                    reference,
+                    specification=specification,
+                    resource_uri=resource_uri,
+                    resolver=resolver,
+                )
+
+        for child_path, child in _schema_pairs(contents, specification):
+            self._scan(
+                child,
+                specification=specification,
+                resource_uri=resource_uri,
+                path=(*path, *child_path),
+                resolver=resolver,
+            )
+
+    def _follow(
+        self,
+        reference: str,
+        *,
+        specification,
+        resource_uri: str,
+        resolver,
+    ) -> None:
+        try:
+            resolved = resolver.lookup(reference)
+        except referencing.exceptions.Unresolvable:
+            return
+
+        base_uri = getattr(resolved.resolver, "_base_uri", resource_uri) or ""
+        _, fragment = urldefrag(urljoin(base_uri, reference))
+        self._scan(
+            resolved.contents,
+            specification=specification,
+            resource_uri=base_uri,
+            path=_pointer_from_fragment(fragment),
+            resolver=resolved.resolver,
+        )
+
+
+def check_vocabularies(
+    schema: referencing.jsonschema.Schema,
+    registry: referencing.jsonschema.SchemaRegistry | None = None,
+    *,
+    default: type[Validator] | _utils.Unset = _UNSET,
+) -> VocabularyReport:
+    """
+    Eagerly check the dialects and vocabularies declared by a schema.
+
+    This inspects the root resource, every embedded resource and every
+    registry-provided resource reachable through references.  It does not
+    inspect an instance, so branches which a particular instance would not
+    exercise are still checked.
+
+    Required but unsupported vocabularies are returned in the report's
+    ``errors``; optional unknown vocabularies are returned in ``warnings``.
+    Unlike `strict_validator_for` this function never raises for those
+    conditions, making it usable by tools which want to display all issues.
+    """
+    DefaultValidator = _LATEST_VERSION if default is _UNSET else default
+    checker = _CapabilityChecker(
+        registry=registry,
+        default=DefaultValidator,  # type: ignore[arg-type]
+    )
+    return checker.check(schema)
+
+
+def _raise_or_warn(report: VocabularyReport, *, stacklevel: int) -> None:
+    if report.errors:
+        issue = report.errors[0]
+        if issue.vocabulary is None:
+            raise exceptions.UnknownDialectError(
+                issue.dialect or issue.message,
+                resource=issue.resource,
+                path=issue.path,
+            )
+        raise exceptions.UnsupportedVocabularyError(
+            issue.vocabulary,
+            resource=issue.resource,
+            path=issue.path,
+            required=issue.required,
+            dialect=issue.dialect,
+        )
+
+    for issue in report.warnings:
+        warn(issue.message, UserWarning, stacklevel=stacklevel)
+
+
 def create(
     meta_schema: referencing.jsonschema.ObjectSchema,
     validators: (
@@ -249,6 +900,17 @@ def create(
             kw_only=True,
             repr=False,
         )
+        _strict: bool = field(
+            default=False,
+            alias="strict",
+            kw_only=True,
+            repr=False,
+        )
+        _vocabulary_report: VocabularyReport | None = field(
+            default=None,
+            init=False,
+            repr=False,
+        )
 
         def __init_subclass__(cls):
             warnings.warn(
@@ -299,6 +961,20 @@ def create(
                     if k in self.VALIDATORS
                 ]
 
+            if self._strict:
+                registry = getattr(
+                    self._resolver,
+                    "_registry",
+                    self._registry,
+                )
+                report = check_vocabularies(
+                    self.schema,
+                    registry=registry,
+                    default=self.__class__,
+                )
+                self._vocabulary_report = report
+                _raise_or_warn(report, stacklevel=4)
+
             # REMOVEME: Legacy ref resolution state management.
             push_scope = getattr(self._ref_resolver, "push_scope", None)
             if push_scope is not None:
@@ -307,7 +983,21 @@ def create(
                     push_scope(id)
 
         @classmethod
-        def check_schema(cls, schema, format_checker=_UNSET):
+        def check_schema(
+            cls,
+            schema,
+            format_checker=_UNSET,
+            *,
+            strict=False,
+            registry=None,
+        ):
+            if strict:
+                report = check_vocabularies(
+                    schema,
+                    registry=registry,
+                    default=cls,
+                )
+                _raise_or_warn(report, stacklevel=2)
             Validator = validator_for(cls.META_SCHEMA, default=cls)
             if format_checker is _UNSET:
                 format_checker = Validator.FORMAT_CHECKER
@@ -338,6 +1028,26 @@ def create(
                     id_of=id_of,
                 )
             return self._ref_resolver
+
+        @property
+        def vocabulary_report(self) -> VocabularyReport | None:
+            """
+            The eager capability report from strict loading, if requested.
+            """
+            return self._vocabulary_report
+
+        @property
+        def unknown_vocabularies(self) -> tuple[str, ...]:
+            """
+            Optional vocabularies which were retained but are not understood.
+            """
+            if self._vocabulary_report is None:
+                return ()
+            return tuple(
+                issue.vocabulary
+                for issue in self._vocabulary_report.warnings
+                if issue.vocabulary is not None
+            )
 
         def evolve(self, **changes):
             schema = changes.setdefault("schema", self.schema)
@@ -419,13 +1129,17 @@ def create(
                 return
 
             if self._ref_resolver is not None:
-                evolved = self.evolve(schema=schema)
+                evolved = self.evolve(schema=schema, strict=False)
             else:
                 if resolver is None:
                     resolver = self._resolver.in_subresource(
                         specification.create_resource(schema),
                     )
-                evolved = self.evolve(schema=schema, _resolver=resolver)
+                evolved = self.evolve(
+                    schema=schema,
+                    _resolver=resolver,
+                    strict=False,
+                )
 
             for k, v in applicable_validators(schema):
                 validator = evolved.VALIDATORS.get(k)
@@ -1333,7 +2047,11 @@ def validate(instance, schema, cls=None, *args, **kwargs):  # noqa: D417
 
     """
     if cls is None:
-        cls = validator_for(schema)
+        cls = validator_for(
+            schema,
+            strict=kwargs.get("strict", False),
+            registry=kwargs.get("registry"),
+        )
 
     cls.check_schema(schema)
     validator = cls(schema, *args, **kwargs)
@@ -1345,6 +2063,9 @@ def validate(instance, schema, cls=None, *args, **kwargs):  # noqa: D417
 def validator_for(
     schema,
     default: type[Validator] | _utils.Unset = _UNSET,
+    *,
+    strict: bool = False,
+    registry: referencing.jsonschema.SchemaRegistry | None = None,
 ) -> type[Validator]:
     """
     Retrieve the validator class appropriate for validating the given schema.
@@ -1365,6 +2086,25 @@ def validator_for(
 
             If unprovided, the default is to return the latest supported
             draft.
+
+        strict:
+
+            eagerly check the dialects and vocabularies declared by the
+            schema and any referenced resources.
+
+            With ``strict=True``, required vocabularies which are not
+            supported raise an error, optional unknown vocabularies are
+            reported as warnings, and unknown dialects are not silently
+            replaced by the default validator.
+
+            The default of ``False`` preserves the historical behavior of
+            this function.
+
+        registry:
+
+            an optional registry used while performing strict checks,
+            allowing referenced resources to be inspected before validation
+            begins.
 
     Examples:
 
@@ -1405,6 +2145,16 @@ def validator_for(
     """
     DefaultValidator = _LATEST_VERSION if default is _UNSET else default
 
+    if strict:
+        report = check_vocabularies(
+            schema,
+            registry=registry,
+            default=DefaultValidator,
+        )
+        _raise_or_warn(report, stacklevel=2)
+        if report.validator is not None:
+            return report.validator
+
     if schema is True or schema is False or "$schema" not in schema:
         return DefaultValidator  # type: ignore[return-value]
     if schema["$schema"] not in _META_SCHEMAS and default is _UNSET:
@@ -1418,3 +2168,68 @@ def validator_for(
             stacklevel=2,
         )
     return _META_SCHEMAS.get(schema["$schema"], DefaultValidator)
+
+
+def strict_validator_for(
+    schema,
+    default: type[Validator] | _utils.Unset = _UNSET,
+    registry: referencing.jsonschema.SchemaRegistry | None = None,
+) -> type[Validator]:
+    """
+    Retrieve a validator class only after checking declared capabilities.
+
+    This is the explicit strict counterpart to `validator_for`.  It inspects
+    the root resource, embedded resources and registry-provided resources
+    reachable from references, and refuses to return a validator if a
+    required vocabulary (or an unknown dialect) is not supported.
+
+    Optional unknown vocabularies are retained, reported as warnings, and
+    exposed on the resulting validator via ``unknown_vocabularies`` when it
+    is instantiated with ``strict=True``.
+    """
+    return validator_for(
+        schema,
+        default=default,
+        strict=True,
+        registry=registry,
+    )
+
+
+def strict_validate(
+    instance,
+    schema,
+    cls=None,
+    *args,
+    registry: referencing.jsonschema.SchemaRegistry | None = None,
+    **kwargs,
+):
+    """
+    Validate an instance after strictly checking schema capabilities.
+
+    This is the strict counterpart to `jsonschema.validators.validate`.
+    Required unsupported vocabularies and unknown dialects are rejected
+    before any instance data is inspected.
+    """
+    DefaultValidator = _LATEST_VERSION if cls is None else cls
+    report = check_vocabularies(
+        schema,
+        registry=registry,
+        default=DefaultValidator,
+    )
+    _raise_or_warn(report, stacklevel=2)
+
+    if cls is None:
+        cls = report.validator or DefaultValidator
+
+    cls.check_schema(schema)
+    if registry is not None:
+        kwargs["registry"] = registry
+    validator = cls(
+        schema,
+        *args,
+        **kwargs,
+    )
+    validator._vocabulary_report = report
+    error = exceptions.best_match(validator.iter_errors(instance))
+    if error is not None:
+        raise error

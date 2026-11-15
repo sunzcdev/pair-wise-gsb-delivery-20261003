@@ -14,6 +14,7 @@ import tempfile
 import warnings
 
 from attrs import define, field
+from referencing import Registry, Resource
 from referencing.jsonschema import DRAFT202012
 import referencing.exceptions
 
@@ -2210,6 +2211,128 @@ class TestValidatorFor(TestCase):
     def test_validator_for_custom_default_with_schema(self):
         schema, default = {"$schema": "mailto:foo@example.com"}, object()
         self.assertIs(validators.validator_for(schema, default), default)
+
+
+class TestStrictValidatorFor(TestCase):
+    def test_unknown_dialect_is_not_replaced_by_the_default(self):
+        schema = {
+            "$id": "https://example.com/schema",
+            "$schema": "https://example.com/unknown",
+        }
+        with self.assertRaises(exceptions.UnknownDialectError) as caught:
+            validators.strict_validator_for(schema)
+
+        self.assertEqual(caught.exception.resource, "https://example.com/schema")
+        self.assertEqual(tuple(caught.exception.schema_path), ("$schema",))
+        self.assertIn("https://example.com/unknown", str(caught.exception))
+
+    def test_normal_validator_for_still_falls_back(self):
+        schema = {"$schema": "https://example.com/unknown"}
+        with self.assertWarns(DeprecationWarning):
+            self.assertIs(
+                validators.validator_for(schema),
+                validators._LATEST_VERSION,
+            )
+
+    def test_required_vocabulary(self):
+        metaschema = {
+            "$id": "https://example.com/meta",
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "$vocabulary": {
+                "https://json-schema.org/draft/2020-12/vocab/core": True,
+                "https://example.com/vocab/required": True,
+            },
+        }
+        registry = Registry().with_contents(
+            [("https://example.com/meta", metaschema)],
+        )
+        schema = {"$schema": "https://example.com/meta"}
+
+        with self.assertRaises(
+            exceptions.UnsupportedVocabularyError,
+        ) as caught:
+            validators.strict_validator_for(schema, registry=registry)
+
+        self.assertEqual(
+            caught.exception.vocabulary,
+            "https://example.com/vocab/required",
+        )
+        self.assertEqual(caught.exception.resource, "https://example.com/meta")
+        self.assertEqual(
+            tuple(caught.exception.schema_path),
+            ("$vocabulary", "https://example.com/vocab/required"),
+        )
+
+    def test_optional_vocabulary_is_reported_but_retained(self):
+        metaschema = {
+            "$id": "https://example.com/meta",
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "$vocabulary": {
+                "https://json-schema.org/draft/2020-12/vocab/core": True,
+                "https://example.com/vocab/optional": False,
+            },
+        }
+        registry = Registry().with_contents(
+            [("https://example.com/meta", metaschema)],
+        )
+        schema = {"$schema": "https://example.com/meta"}
+
+        with self.assertWarns(UserWarning) as caught:
+            Validator = validators.strict_validator_for(
+                schema,
+                registry=registry,
+            )
+        self.assertIn("https://example.com/vocab/optional", str(caught.warning))
+        self.assertIs(Validator, validators.Draft202012Validator)
+
+    def test_embedded_resources_switch_dialects(self):
+        schema = {
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "$defs": {
+                "old": {
+                    "$schema": "http://json-schema.org/draft-07/schema#",
+                    "type": "string",
+                },
+            },
+        }
+        report = validators.check_vocabularies(schema)
+        self.assertTrue(report)
+        self.assertFalse(report.errors)
+
+    def test_referenced_resources_are_checked_before_validation(self):
+        metaschema = {
+            "$id": "https://example.com/meta",
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "$vocabulary": {
+                "https://json-schema.org/draft/2020-12/vocab/core": True,
+                "https://example.com/vocab/required": True,
+            },
+        }
+        referenced = {
+            "$id": "https://example.com/referenced",
+            "$schema": "https://example.com/meta",
+        }
+        registry = Registry().with_resources(
+            [
+                (
+                    "https://example.com/meta",
+                    Resource.from_contents(metaschema),
+                ),
+                (
+                    "https://example.com/referenced",
+                    Resource(contents=referenced, specification=DRAFT202012),
+                ),
+            ],
+        )
+        schema = {
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "properties": {
+                "unused": {"$ref": "https://example.com/referenced"},
+            },
+        }
+
+        with self.assertRaises(exceptions.UnsupportedVocabularyError):
+            validators.strict_validator_for(schema, registry=registry)
 
 
 class TestValidate(TestCase):

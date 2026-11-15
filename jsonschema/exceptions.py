@@ -231,6 +231,106 @@ class SchemaError(_Error):
     _word_for_instance_in_error_message = "schema"
 
 
+def _json_pointer(path: Iterable[str | int]) -> str:
+    return "".join(
+        "/" + str(segment).replace("~", "~0").replace("/", "~1")
+        for segment in path
+    )
+
+
+def _format_location(resource: str, path: Iterable[str | int]) -> str:
+    pointer = _json_pointer(path)
+    return f"{resource or '<root>'}#{pointer}"
+
+
+class UnknownDialectError(SchemaError):
+    """
+    A schema declared a dialect which this library does not understand.
+
+    The ``resource`` and ``path`` attributes identify the resource and the
+    location of the ``$schema`` declaration which introduced the dialect.
+    """
+
+    _word_for_schema_in_error_message = "metaschema"
+    _word_for_instance_in_error_message = "schema"
+
+    def __init__(
+        self,
+        dialect: str,
+        resource: str = "",
+        path: Iterable[str | int] = (),
+        *,
+        cause: Exception | None = None,
+    ) -> None:
+        self.dialect = self.uri = dialect
+        self.resource = self.resource_uri = resource
+        self.pointer = self.declaration_path = tuple(path)
+        self.vocabulary = None
+        self.required = True
+        super().__init__(
+            (
+                f"Unknown dialect {dialect!r} declared at "
+                f"{_format_location(resource, path)}"
+            ),
+            schema_path=path,
+            cause=cause,
+        )
+        # A loading error has no instance, so its declaration location is
+        # also the most useful value for ``path``.
+        self.path = self.relative_path = deque(self.pointer)
+
+    @property
+    def json_pointer(self) -> str:
+        return _json_pointer(self.pointer)
+
+
+class UnsupportedVocabularyError(SchemaError):
+    """
+    A schema requires a vocabulary which this library does not support.
+
+    ``resource`` and ``path`` identify the resource and the declaration of
+    the unsupported vocabulary.  ``required`` is ``True`` for entries which
+    the dialect marks as required, and ``False`` for optional ones.
+    """
+
+    _word_for_schema_in_error_message = "metaschema"
+    _word_for_instance_in_error_message = "schema"
+
+    def __init__(
+        self,
+        vocabulary: str,
+        resource: str = "",
+        path: Iterable[str | int] = (),
+        *,
+        required: bool = True,
+        dialect: str | None = None,
+    ) -> None:
+        self.vocabulary = self.uri = vocabulary
+        self.resource = self.resource_uri = resource
+        self.pointer = self.declaration_path = tuple(path)
+        self.required = required
+        self.dialect = dialect
+        qualifier = "required" if required else "optional"
+        super().__init__(
+            (
+                f"Unsupported {qualifier} vocabulary {vocabulary!r} "
+                f"declared at {_format_location(resource, path)}"
+            ),
+            schema_path=path,
+        )
+        self.path = self.relative_path = deque(self.pointer)
+
+    @property
+    def json_pointer(self) -> str:
+        return _json_pointer(self.pointer)
+
+
+#: Backwards/forwards friendly aliases for the error classes above.
+UnknownDialect = UnknownDialectError
+UnsupportedVocabulary = UnsupportedVocabularyError
+VocabularyError = UnsupportedVocabularyError
+
+
 @define(slots=False)
 class _RefResolutionError(Exception):  # noqa: PLW1641
     """

@@ -24,6 +24,34 @@ The simplest way to validate an instance under a given schema is to use the `val
    Accepting untrusted schemas as input, especially when combined with untrusted data to validate, can lead to vulnerabilities even when restricting to official JSON Schema dialects and vocabularies.
    Never validate data against schemas from untrusted sources without proper sandboxing or input validation.
 
+Strict Capability Checks
+------------------------
+
+By default, `jsonschema.validators.validator_for` preserves its historical
+fallback behavior when it encounters a ``$schema`` which it does not know.
+Use `jsonschema.validators.strict_validator_for` when a schema must be fully
+understood before validation begins.
+
+The strict entry point eagerly inspects the root resource, embedded resources
+and registry-provided resources reachable through references.  It raises
+`jsonschema.exceptions.UnknownDialectError` for an unknown dialect and
+`jsonschema.exceptions.UnsupportedVocabularyError` when a dialect requires a
+vocabulary which this implementation does not support.  Optional unknown
+vocabularies are retained and reported as warnings.
+
+`jsonschema.validators.check_vocabularies` performs the same inspection and
+returns a `jsonschema.validators.VocabularyReport` without raising, which is
+useful for diagnostics.
+
+.. autofunction:: jsonschema.validators.strict_validator_for
+    :noindex:
+
+.. autofunction:: jsonschema.validators.check_vocabularies
+    :noindex:
+
+.. autofunction:: jsonschema.validators.strict_validate
+    :noindex:
+
 .. _validator-protocol:
 
 The Validator Protocol

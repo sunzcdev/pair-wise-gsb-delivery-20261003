@@ -13,14 +13,25 @@ import warnings
 
 from jsonschema._format import FormatChecker
 from jsonschema._types import TypeChecker
-from jsonschema.exceptions import SchemaError, ValidationError
+from jsonschema.exceptions import (
+    SchemaError,
+    UnknownDialectError,
+    UnsupportedVocabularyError,
+    ValidationError,
+)
 from jsonschema.validators import (
+    CapabilityReport,
     Draft3Validator,
     Draft4Validator,
     Draft6Validator,
     Draft7Validator,
     Draft201909Validator,
     Draft202012Validator,
+    VocabularyIssue,
+    VocabularyReport,
+    check_vocabularies,
+    strict_validate,
+    strict_validator_for,
     validate,
 )
 
@@ -113,6 +124,7 @@ def __getattr__(name):
 
 
 __all__ = [
+    "CapabilityReport",
     "Draft3Validator",
     "Draft4Validator",
     "Draft6Validator",
@@ -122,6 +134,13 @@ __all__ = [
     "FormatChecker",
     "SchemaError",
     "TypeChecker",
+    "UnknownDialectError",
+    "UnsupportedVocabularyError",
     "ValidationError",
+    "VocabularyIssue",
+    "VocabularyReport",
+    "check_vocabularies",
+    "strict_validate",
+    "strict_validator_for",
     "validate",
 ]
