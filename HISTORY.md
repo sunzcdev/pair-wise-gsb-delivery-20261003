@@ -13,6 +13,9 @@ Our backwards-compatibility policy can be found [here](https://github.com/python
 
 ## NEXT
 
+- Fix hook generation for recursive generic classes (for example `Node[T]` with children of `Node[T]`, including references through `typing.Self`), so the generated hooks terminate and preserve the actual type arguments instead of losing them or raising `StructureHandlerNotFoundError`.
+  Recursive `TypedDict` structuring now also detects recursion directly instead of relying on Python's recursion limit.
+
 - Fix the msgspec converter passing typed deques directly to the encoder, which cannot serialize them. Deques are now unstructured into lists, including when nested in attrs classes or dataclasses.
   ([#818](https://github.com/python-attrs/cattrs/issues/818) [#819](https://github.com/python-attrs/cattrs/pull/819))
 
