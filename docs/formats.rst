@@ -250,6 +250,48 @@ The ``import_set()`` method also supports a ``skip_lines`` parameter that you
 can set to a number of lines that should be skipped before starting to read
 data.
 
+The ``import_set()`` method additionally accepts:
+
+- ``sheet``: the name (``str``) or zero-based index (``int``) of the
+  worksheet to import.  By default the active worksheet is imported.
+  ``import_book()`` always imports every worksheet.
+- ``max_rows``: an optional positive integer limiting the number of data
+  rows that may be read (the header row is not counted).
+- ``max_columns``: an optional positive integer limiting the number of
+  columns that may be read.
+
+These limits apply to the data region that is actually read.  If the
+worksheet contains more rows or columns than allowed, a
+:class:`tablib.ImportBoundExceeded` exception is raised instead of the extra
+data being silently dropped.  Invalid limit values (zero, negative numbers,
+non-integers) raise ``ValueError``.
+
+Only the populated region of a worksheet is read: rows without any cell
+value end the scan, and empty trailing cells are trimmed.  This means files
+declaring an inflated (or simply wrong) dimension, possibly with millions of
+empty trailing rows or styled-but-empty header cells, can still be imported
+without allocating a matrix for the declared dimensions.
+
+For example::
+
+    # Import at most the first 100 data rows and 10 columns of "Sheet2"
+    data = tablib.Dataset().load(
+        stream, 'xlsx', sheet='Sheet2', max_rows=100, max_columns=10
+    )
+
+Workbooks opened by Tablib are always closed again, including when an error
+or an import limit aborts the read early.  Streams passed in by the caller
+are never closed by Tablib: the workbook is opened on a private copy of the
+stream's contents instead.
+
+.. versionchanged:: 3.9.0
+
+    The ``sheet``, ``max_rows`` and ``max_columns`` parameters for
+    ``import_set()`` and the ``max_rows``/``max_columns`` parameters for
+    ``import_book()`` were added.  Importing no longer allocates memory for
+    the worksheet's declared dimension and always closes the workbook it
+    opened.
+
 The ``export_set()`` method supports a ``column_width`` parameter. Depending
 on the value passed, the column width will be set accordingly. It can be
 either ``None``, an integer, or default "adaptive". If "adaptive" is passed,

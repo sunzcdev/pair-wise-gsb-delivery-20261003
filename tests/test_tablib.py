@@ -16,10 +16,11 @@ from uuid import uuid4
 import xlrd
 from odf import opendocument, table
 from openpyxl.reader.excel import load_workbook
+from openpyxl.workbook import Workbook
 
 import tablib
 from tablib.core import Row, detect_format
-from tablib.exceptions import UnsupportedFormat
+from tablib.exceptions import ImportBoundExceeded, UnsupportedFormat
 from tablib.formats import registry
 
 try:
@@ -1652,6 +1653,254 @@ class XLSXTests(BaseTestCase):
         with xls_source.open('rb') as fh:
             data = tablib.Dataset().load(fh, read_only=False)
         self.assertEqual(data.height, 3)
+
+    def test_xlsx_bad_dimensions_read_only(self):
+        """A forged huge dimension and millions of empty trailing rows must
+        not cause a huge matrix to be built, even with lazy (read-only)
+        reading."""
+        xls_source = Path(__file__).parent / 'files' / 'bad_dimensions.xlsx'
+        with xls_source.open('rb') as fh:
+            dataset = tablib.Dataset().load(fh)
+        self.assertEqual(dataset.headers, ['PN', 'Qty', 'Price'])
+        self.assertEqual(dataset.height, 3)
+        self.assertEqual(dataset.width, 3)
+        self.assertEqual(dataset[0], ('EP00001', 10000, 0.0367))
+
+    def _bound_workbook_bytes(self):
+        workbook = Workbook()
+        worksheet = workbook.active
+        worksheet.title = 'first'
+        worksheet.append(['h1', 'h2', 'h3'])
+        worksheet.append([1, 2, 3])
+        worksheet.append([4, 5, 6])
+        worksheet.append([7, 8, 9])
+        second = workbook.create_sheet('second')
+        second.append(['a', 'b'])
+        second.append(['x', 'y'])
+        stream = BytesIO()
+        workbook.save(stream)
+        return stream.getvalue()
+
+    def test_xlsx_import_without_bounds_is_unchanged(self):
+        dataset = tablib.Dataset().load(self._bound_workbook_bytes(), 'xlsx')
+        self.assertEqual(dataset.headers, ['h1', 'h2', 'h3'])
+        self.assertEqual(dataset.height, 3)
+        self.assertEqual(dataset.width, 3)
+
+    def test_xlsx_import_max_rows_exact_fit(self):
+        dataset = tablib.Dataset().load(
+            self._bound_workbook_bytes(), 'xlsx', max_rows=3
+        )
+        self.assertEqual(dataset.height, 3)
+
+    def test_xlsx_import_max_rows_exceeded(self):
+        with self.assertRaises(ImportBoundExceeded):
+            tablib.Dataset().load(
+                self._bound_workbook_bytes(), 'xlsx', max_rows=2
+            )
+
+    def test_xlsx_import_max_rows_does_not_count_header(self):
+        workbook = Workbook()
+        worksheet = workbook.active
+        worksheet.append(['h'])
+        worksheet.append([1])
+        stream = BytesIO()
+        workbook.save(stream)
+        dataset = tablib.Dataset().load(stream.getvalue(), 'xlsx', max_rows=1)
+        self.assertEqual(dataset.headers, ['h'])
+        self.assertEqual(dataset.height, 1)
+
+    def test_xlsx_import_max_columns_exact_fit(self):
+        dataset = tablib.Dataset().load(
+            self._bound_workbook_bytes(), 'xlsx', max_columns=3
+        )
+        self.assertEqual(dataset.width, 3)
+
+    def test_xlsx_import_max_columns_exceeded(self):
+        with self.assertRaises(ImportBoundExceeded):
+            tablib.Dataset().load(
+                self._bound_workbook_bytes(), 'xlsx', max_columns=2
+            )
+
+    def test_xlsx_invalid_bound_values(self):
+        content = self._bound_workbook_bytes()
+        for value in (0, -1, 1.5, '3', True):
+            with self.subTest(value=value):
+                with self.assertRaises(ValueError):
+                    tablib.Dataset().load(content, 'xlsx', max_rows=value)
+                with self.assertRaises(ValueError):
+                    tablib.Dataset().load(content, 'xlsx', max_columns=value)
+
+    def test_xlsx_import_sheet_by_name_and_index(self):
+        content = self._bound_workbook_bytes()
+        by_name = tablib.Dataset().load(content, 'xlsx', sheet='second')
+        self.assertEqual(by_name.headers, ['a', 'b'])
+        self.assertEqual(by_name.height, 1)
+
+        by_index = tablib.Dataset().load(content, 'xlsx', sheet=1)
+        self.assertEqual(by_index.headers, ['a', 'b'])
+
+        first = tablib.Dataset().load(content, 'xlsx', sheet=0)
+        self.assertEqual(first.headers, ['h1', 'h2', 'h3'])
+
+    def test_xlsx_import_unknown_sheet_name(self):
+        with self.assertRaises(ValueError):
+            tablib.Dataset().load(
+                self._bound_workbook_bytes(), 'xlsx', sheet='missing'
+            )
+
+    def test_xlsx_import_sheet_index_out_of_range(self):
+        with self.assertRaises(ValueError):
+            tablib.Dataset().load(
+                self._bound_workbook_bytes(), 'xlsx', sheet=9
+            )
+
+    def test_xlsx_import_sheet_wrong_type(self):
+        with self.assertRaises(TypeError):
+            tablib.Dataset().load(
+                self._bound_workbook_bytes(), 'xlsx', sheet=1.5
+            )
+
+    def test_xlsx_import_sheet_with_bounds(self):
+        dataset = tablib.Dataset().load(
+            self._bound_workbook_bytes(),
+            'xlsx',
+            sheet='second',
+            max_rows=1,
+            max_columns=2,
+        )
+        self.assertEqual(dataset.headers, ['a', 'b'])
+        self.assertEqual(dataset[0], ('x', 'y'))
+
+    def test_xlsx_import_book_bounds(self):
+        content = self._bound_workbook_bytes()
+        databook = tablib.Databook().load(content, 'xlsx')
+        self.assertEqual(len(databook.sheets()), 2)
+
+        with self.assertRaises(ImportBoundExceeded):
+            tablib.Databook().load(content, 'xlsx', max_rows=1)
+        with self.assertRaises(ImportBoundExceeded):
+            tablib.Databook().load(content, 'xlsx', max_columns=2)
+
+    def test_xlsx_borrowed_stream_stays_open(self):
+        content = self._bound_workbook_bytes()
+        stream = BytesIO(content)
+        tablib.Dataset().load(stream, 'xlsx')
+        self.assertFalse(stream.closed)
+
+        stream = BytesIO(content)
+        with self.assertRaises(ImportBoundExceeded):
+            tablib.Dataset().load(stream, 'xlsx', max_rows=1)
+        self.assertFalse(stream.closed)
+
+        stream = BytesIO(b'not a workbook')
+        with self.assertRaises(Exception):
+            tablib.Dataset().load(stream, 'xlsx')
+        self.assertFalse(stream.closed)
+
+    def test_xlsx_workbook_is_closed_after_import(self):
+        from tablib.formats import _xlsx
+
+        content = self._bound_workbook_bytes()
+        original_load = _xlsx.load_workbook
+        closed = []
+
+        def tracking_load(*args, **kwargs):
+            workbook = original_load(*args, **kwargs)
+            original_close = workbook.close
+
+            def tracked_close():
+                closed.append(True)
+                return original_close()
+
+            workbook.close = tracked_close
+            return workbook
+
+        _xlsx.load_workbook = tracking_load
+        try:
+            tablib.Dataset().load(BytesIO(content), 'xlsx')
+            self.assertEqual(len(closed), 1)
+
+            with self.assertRaises(ImportBoundExceeded):
+                tablib.Dataset().load(BytesIO(content), 'xlsx', max_rows=1)
+            self.assertEqual(len(closed), 2)
+        finally:
+            _xlsx.load_workbook = original_load
+
+    def test_xlsx_read_only_archive_is_closed(self):
+        from tablib.formats import _xlsx
+
+        content = self._bound_workbook_bytes()
+        original_load = _xlsx.load_workbook
+        archives = []
+
+        def tracking_load(*args, **kwargs):
+            workbook = original_load(*args, **kwargs)
+            self.assertTrue(kwargs.get('read_only', True))
+            archive = workbook._archive
+            original_archive_close = archive.close
+
+            def tracked_archive_close():
+                archives.append(True)
+                return original_archive_close()
+
+            archive.close = tracked_archive_close
+            return workbook
+
+        _xlsx.load_workbook = tracking_load
+        try:
+            tablib.Dataset().load(BytesIO(content), 'xlsx')
+            self.assertEqual(len(archives), 1)
+        finally:
+            _xlsx.load_workbook = original_load
+
+    def test_xlsx_failed_import_leaves_wiped_dataset(self):
+        workbook = Workbook()
+        worksheet = workbook.active
+        worksheet.append(['h'])
+        worksheet.append([1])
+        worksheet.append([2])
+        stream = BytesIO()
+        workbook.save(stream)
+
+        dataset = tablib.Dataset()
+        dataset.append(('pre-existing',))
+        with self.assertRaises(ImportBoundExceeded):
+            dataset.load(stream.getvalue(), 'xlsx', max_rows=1)
+        self.assertEqual(dataset.height, 0)
+        self.assertIsNone(dataset.headers)
+
+    def test_xlsx_failed_book_import_leaves_empty_databook(self):
+        databook = tablib.Databook()
+        with self.assertRaises(ImportBoundExceeded):
+            databook.load(
+                self._bound_workbook_bytes(), 'xlsx', max_rows=1
+            )
+        self.assertEqual(databook.size, 0)
+
+    def test_xlsx_empty_trailing_rows_are_ignored(self):
+        workbook = Workbook()
+        worksheet = workbook.active
+        worksheet.append(['h1', 'h2'])
+        worksheet.append([1, 2])
+        for _ in range(3):
+            worksheet.append([])
+        stream = BytesIO()
+        workbook.save(stream)
+
+        dataset = tablib.Dataset().load(stream.getvalue(), 'xlsx')
+        self.assertEqual(dataset.headers, ['h1', 'h2'])
+        self.assertEqual(dataset.height, 1)
+        self.assertEqual(dataset[0], (1, 2))
+
+    def test_xlsx_header_styling_does_not_inflate_width(self):
+        """Styled-but-empty header cells (a common cause of inflated width)
+        must be trimmed instead of defining the dataset width."""
+        xls_source = Path(__file__).parent / 'files' / 'bad_dimensions.xlsx'
+        with xls_source.open('rb') as fh:
+            dataset = tablib.Dataset().load(fh, 'xlsx')
+        self.assertEqual(dataset.width, 3)
+        self.assertEqual(dataset.headers, ['PN', 'Qty', 'Price'])
 
     def test_xlsx_raise_ValueError_on_cell_write_during_export(self):
         """Test that the process handles errors which might be raised

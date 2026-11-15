@@ -20,3 +20,12 @@ class HeadersNeeded(TablibException, AttributeError):
 
 class UnsupportedFormat(TablibException, NotImplementedError):
     """Format not supported."""
+
+
+class ImportBoundExceeded(TablibException, ValueError):
+    """The imported data exceeds one of the configured import limits.
+
+    Raised instead of silently truncating the data so that callers always
+    know when a worksheet contained more rows or columns than they were
+    willing to read.
+    """
