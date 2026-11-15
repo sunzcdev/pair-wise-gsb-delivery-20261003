@@ -134,9 +134,18 @@ class Database:
                 conn.close()
 
     def _flush_tables(self) -> None:
-        """Clear the table metadata after transaction rollbacks."""
+        """Clear the table metadata after transaction rollbacks.
+
+        A rolled-back transaction may have undone structural changes (e.g.
+        a newly added column). Resetting only the reflected table object is
+        not enough: the cached column map and index set would still claim
+        the reverted columns exist, so they must be discarded as well and
+        re-reflected lazily on the next access.
+        """
         for table in self._tables.values():
             table._table = None
+            table._columns = None
+            table._indexes = []
 
     def _auto_commit(self) -> None:
         """Commit pending changes when not in an explicit transaction.

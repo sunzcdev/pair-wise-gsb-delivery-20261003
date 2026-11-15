@@ -5,7 +5,7 @@ from collections.abc import Iterable, Sequence
 from typing import TYPE_CHECKING, Any, Literal
 
 from sqlalchemy import false, func, select
-from sqlalchemy.exc import NoSuchTableError
+from sqlalchemy.exc import NoSuchTableError, SQLAlchemyError
 from sqlalchemy.schema import Column, Index
 from sqlalchemy.schema import Table as SQLATable
 from sqlalchemy.sql import and_, expression
@@ -448,10 +448,94 @@ class Table:
                 self._reflect_table()
                 self._threading_warn()
                 for column in columns:
-                    if not self.has_column(column.name):
+                    if self.has_column(column.name):
+                        # Another writer (possibly in a different Database
+                        # instance) may have created the column in the
+                        # meantime. Make sure the existing structure is
+                        # compatible with what we are about to write.
+                        self._assert_column_compatible(column)
+                        continue
+                    try:
                         self.db.op.add_column(self.name, column, schema=self.db.schema)
+                    except SQLAlchemyError as exc:
+                        if not self._is_duplicate_column_error(exc, column.name):
+                            # Anything other than a concurrent duplicate
+                            # column is a genuine failure and must surface.
+                            raise
+                        # The column was created concurrently, possibly by a
+                        # separate process/connection our local lock cannot
+                        # coordinate with. Roll back the failed statement,
+                        # re-read the real schema and verify compatibility
+                        # instead of trusting the stale table object.
+                        self._rollback_failed_ddl()
+                        self._reflect_table()
+                        self._assert_column_compatible(column)
+                # Always re-reflect after a structural change so the cached
+                # table object and column map match the database, even when
+                # the ALTER above failed with a duplicate-column error.
                 self._reflect_table()
                 self.db._auto_commit()
+
+    def _rollback_failed_ddl(self) -> None:
+        """Undo the implicit transaction opened by a failed DDL statement.
+
+        Inside an explicit transaction the caller manages the transaction
+        (and may still want to commit the other statements it contains), so
+        nothing is rolled back here.
+        """
+        if not self.db.in_transaction:
+            self.db.executable.rollback()
+
+    @staticmethod
+    def _is_duplicate_column_error(exc: SQLAlchemyError, column_name: str) -> bool:
+        """Check whether an error is a concurrent duplicate-column failure.
+
+        The wording is dialect-specific, so the underlying DBAPI message is
+        inspected. SQLite and MySQL report a "duplicate column" error, while
+        PostgreSQL says the column "already exists".
+        """
+        message = str(getattr(exc, "orig", exc) or exc).lower()
+        if "duplicate column" in message:
+            return True
+        return "already exists" in message and column_name.lower() in message
+
+    def _assert_column_compatible(self, column: Column[Any]) -> None:
+        """Raise a clear error when a concurrent column has an incompatible type.
+
+        Column names are compared case-insensitively, matching the behaviour
+        of the rest of the schema reflection machinery.
+        """
+        existing = self.table.c.get(self._get_column_name(column.name))
+        if existing is None:
+            # The column vanished between reflection and this check; let the
+            # next write cycle re-discover the current structure.
+            return
+        if self._types_match(existing.type, column.type):
+            return
+        dialect = self.db.executable.dialect
+        raise DatasetError(
+            f"Column {column.name!r} already exists on table {self.name!r} "
+            f"with an incompatible type: existing "
+            f"{existing.type.compile(dialect)!r}, requested "
+            f"{column.type.compile(dialect)!r}."
+        )
+
+    def _types_match(self, existing: ColumnType, requested: ColumnType) -> bool:
+        """Compare two column types independently of SQLAlchemy class identity.
+
+        A reflected column and a freshly constructed column describing the
+        same SQL type can be backed by different Python classes (e.g. a
+        reflected ``VARCHAR`` vs. a newly built ``Unicode``), so the compiled
+        DDL type names are compared as well.
+        """
+        if type(existing) is type(requested):
+            return True
+        dialect = self.db.executable.dialect
+        # The dialect argument is positional at runtime; the bundled type
+        # stubs disagree, hence the narrow ignores below.
+        existing_ddl = existing.compile(dialect).upper()  # type: ignore[arg-type]
+        requested_ddl = requested.compile(dialect).upper()  # type: ignore[arg-type]
+        return existing_ddl == requested_ddl
 
     def _sync_columns(
         self,
@@ -579,7 +663,10 @@ class Table:
         return args, row_
 
     def create_column(
-        self, name: str, type: ColumnType, **kwargs: object  # noqa: A002
+        self,
+        name: str,
+        type: ColumnType,
+        **kwargs: object,  # noqa: A002
     ) -> None:
         """Create a new column ``name`` of a specified type.
         ::
