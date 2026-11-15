@@ -3,6 +3,19 @@
 *The changelog has only been started with version 0.3.12, previous
 changes must be reconstructed from revision history.*
 
+* **2.1.0** (unreleased): Structured filters for data-only configurations
+  - **`Table.find`/`find_one`/`count`/`delete`**: new `_filter` argument accepts a
+    restricted, serialisable filter tree (`all`/`any`/`not`, comparisons,
+    membership and ranges) and compiles it with bound parameters
+  - **`Table.build_filter`**: compiles such a tree into a reusable SQLAlchemy
+    clause that `find` and `count` select the same rows for
+  - **Three-valued logic**: empty `all` is `TRUE`, empty `any` is `FALSE`,
+    `in []`/`notin []` are explicit identities and `null` members are handled
+    explicitly instead of relying on Python truthiness
+  - **`FilterError`**: unknown columns/operators and malformed nodes raise a
+    `QueryError` subclass carrying a JSON path before any query executes
+  - **Limits**: filter trees are capped by `MAX_FILTER_DEPTH` and
+    `MAX_FILTER_NODES`
 * **2.0.0**: Major modernization and type annotations
   - **Type annotations**: Full `mypy --strict` compliance across all modules
   - **PEP 561**: Added `py.typed` marker for downstream type checking

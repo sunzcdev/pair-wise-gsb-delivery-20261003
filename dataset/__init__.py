@@ -3,6 +3,13 @@ import warnings
 from typing import Any
 
 from dataset.database import Database
+from dataset.filters import (
+    MAX_FILTER_DEPTH,
+    MAX_FILTER_NODES,
+    FilterError,
+    FilterSpec,
+    compile_filter,
+)
 from dataset.table import Table
 from dataset.util import DatasetError, OutRow, QueryError, RowFactory, row_factory
 
@@ -15,10 +22,15 @@ warnings.filterwarnings(
 __all__ = [
     "Database",
     "DatasetError",
+    "FilterError",
+    "FilterSpec",
+    "MAX_FILTER_DEPTH",
+    "MAX_FILTER_NODES",
     "OutRow",
     "QueryError",
     "RowFactory",
     "Table",
+    "compile_filter",
     "connect",
 ]
 __version__ = "2.0.0"

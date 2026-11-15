@@ -16,6 +16,7 @@ from sqlalchemy.sql.expression import (
     bindparam,
 )
 
+from dataset.filters import FilterSpec, compile_filter
 from dataset.types import MYSQL_LENGTH_TYPES, ColumnType, Types
 from dataset.util import (
     QUERY_STEP,
@@ -189,7 +190,9 @@ class Table:
         if self._check_ensure(ensure):
             self.create_index(keys)
         args, _ = self._keys_to_args(row, keys)
-        if self.count(**args) == 0:
+        # Pass a clause rather than **args: a column called ``_filter`` must
+        # not be mistaken for the structured-filter keyword argument.
+        if self.count(self._args_to_clause(args)) == 0:
             return self.insert(row, ensure=False)
         return False
 
@@ -364,7 +367,12 @@ class Table:
         for row in rows:
             self.upsert(row, keys, ensure=ensure, types=types)
 
-    def delete(self, *clauses: ColumnElement[bool], **filters: SQLWriteValue) -> bool:
+    def delete(
+        self,
+        *clauses: ColumnElement[bool],
+        _filter: FilterSpec | None = None,
+        **filters: SQLWriteValue,
+    ) -> bool:
         """Delete rows from the table.
 
         Keyword arguments can be used to add column-based filters. The filter
@@ -373,11 +381,22 @@ class Table:
 
             table.delete(place='Berlin')
 
+        A structured data-only filter can be supplied via ``_filter`` as
+        described in :ref:`structured_filters`::
+
+            table.delete(_filter={
+                "field": "place", "op": "in", "value": ["Berlin", "Paris"]
+            })
+
         If no arguments are given, all records are deleted.
         """
         if not self.exists:
+            # Validate even when there is no data to delete.
+            self._filter_clauses(_filter, ())
             return False
-        clause = self._args_to_clause(filters, clauses=clauses)
+        clause = self._args_to_clause(
+            filters, clauses=self._filter_clauses(_filter, clauses)
+        )
         stmt = self.table.delete().where(clause)
         rp = self.db.executable.execute(stmt)
         self.db._auto_commit()
@@ -553,6 +572,45 @@ class Table:
                 clauses.append(self._generate_clause(column, "=", value))
         return and_(True, *clauses)
 
+    def build_filter(self, spec: FilterSpec) -> ColumnElement[bool]:
+        """Compile a structured, data-only filter into a SQL clause.
+
+        This turns a JSON/configuration-friendly filter tree into a single
+        SQLAlchemy predicate that can be handed to :py:meth:`find()
+        <dataset.Table.find>` and :py:meth:`count() <dataset.Table.count>`
+        (or any other clause-accepting method)::
+
+            clause = table.build_filter(
+                {"all": [
+                    {"field": "country", "op": "eq", "value": "Germany"},
+                    {"field": "population", "op": "between", "value": [1, 10]},
+                ]}
+            )
+            rows = list(table.find(clause))
+            total = table.count(clause)
+
+        See :ref:`structured_filters` for the complete format. Invalid
+        filters raise :py:class:`dataset.filters.FilterError` before any
+        query is executed.
+        """
+        return compile_filter(spec, self)
+
+    def _filter_clauses(
+        self,
+        structured: FilterSpec | None,
+        clauses: Iterable[ColumnElement[bool]],
+    ) -> list[ColumnElement[bool]]:
+        """Combine positional clauses with an optional structured filter.
+
+        The structured filter is compiled (and therefore validated) eagerly
+        so that unknown fields/operators and over-sized trees are reported
+        *before* any query is executed.
+        """
+        combined = list(clauses)
+        if structured is not None:
+            combined.append(compile_filter(structured, self))
+        return combined
+
     def _args_to_order_by(
         self, order_by: str | Sequence[str] | None
     ) -> list[UnaryExpression[Any]]:
@@ -720,6 +778,7 @@ class Table:
         *_clauses: ColumnElement[bool],
         _limit: int | None = None,
         _offset: int = 0,
+        _filter: FilterSpec | None = None,
         order_by: str | Sequence[str] | None = None,
         _streamed: bool = False,
         _step: int | None = QUERY_STEP,
@@ -749,11 +808,29 @@ class Table:
         You can also submit filters based on criteria other than equality,
         see :ref:`advanced_filters` for details.
 
+        Alternatively, pass a structured, data-only filter tree via
+        ``_filter``. This is useful when query configurations are loaded
+        from JSON or another data store and cannot contain SQLAlchemy
+        clauses (see :ref:`structured_filters`)::
+
+            results = table.find(_filter={
+                "all": [
+                    {"field": "country", "op": "eq", "value": "France"},
+                    {"field": "year", "op": "between", "value": [1980, 1989]},
+                ]
+            })
+
+        A structured filter is combined with positional clauses and keyword
+        filters using ``AND`` and yields the same rows as passing the
+        compiled clause to :py:meth:`count() <dataset.Table.count>`.
+
         To run more complex queries with JOINs, or to perform GROUP BY-style
         aggregation, you can also use :py:meth:`db.query() <dataset.Database.query>`
         to run raw SQL queries instead.
         """
         if not self.exists:
+            # Validate even when there is no data to query.
+            self._filter_clauses(_filter, ())
             return ResultIter(None, row_type=self.db.row_type)
         if self.db.engine is None:
             raise RuntimeError("Cannot run queries when no engine is available.")
@@ -762,7 +839,8 @@ class Table:
             _step = None
 
         orderings = self._args_to_order_by(order_by)
-        args = self._args_to_clause(kwargs, clauses=_clauses)
+        clauses = self._filter_clauses(_filter, _clauses)
+        args = self._args_to_clause(kwargs, clauses=clauses)
         query = self.table.select().where(args).limit(_limit).offset(_offset)
         if len(orderings):
             query = query.order_by(*orderings)
@@ -781,20 +859,28 @@ class Table:
         )
 
     def find_one(
-        self, *args: ColumnElement[bool], **kwargs: SQLWriteValue
+        self,
+        *args: ColumnElement[bool],
+        _filter: FilterSpec | None = None,
+        **kwargs: SQLWriteValue,
     ) -> OutRow | None:
         """Get a single result from the table.
 
         Works just like :py:meth:`find() <dataset.Table.find>` but returns one
-        result, or ``None``.
-        ::
+        result, or ``None``. The ``_filter`` argument accepts the same
+        structured filter tree::
 
             row = table.find_one(country='United States')
+            row = table.find_one(_filter={
+                "field": "country", "op": "eq", "value": "United States"
+            })
         """
         if not self.exists:
+            # Validate even when there is no data to query.
+            self._filter_clauses(_filter, ())
             return None
 
-        resiter = self.find(*args, _limit=1, _step=None, **kwargs)  # type: ignore[arg-type]
+        resiter = self.find(*args, _filter=_filter, _limit=1, _step=None, **kwargs)  # type: ignore[arg-type]
         try:
             for row in resiter:
                 return row
@@ -802,15 +888,32 @@ class Table:
             resiter.close()
         return None
 
-    def count(self, *_clauses: ColumnElement[bool], **kwargs: SQLWriteValue) -> int:
-        """Return the count of results for the given filter set."""
+    def count(
+        self,
+        *_clauses: ColumnElement[bool],
+        _filter: FilterSpec | None = None,
+        **kwargs: SQLWriteValue,
+    ) -> int:
+        """Return the count of results for the given filter set.
+
+        Accepts the same positional SQLAlchemy clauses, keyword filters and
+        structured ``_filter`` trees as :py:meth:`find() <dataset.Table.find>`.
+        For an identical filter, both methods select the same rows::
+
+            spec = {"field": "country", "op": "eq", "value": "France"}
+            assert table.count(_filter=spec) == len(list(table.find(_filter=spec)))
+        """
         # NOTE: this does not have support for limit and offset since I can't
         # see how this is useful. Still, there might be compatibility issues
         # with people using these flags. Let's see how it goes.
         if not self.exists:
+            # Validate even when there is no data to count.
+            self._filter_clauses(_filter, ())
             return 0
 
-        args = self._args_to_clause(kwargs, clauses=_clauses)
+        args = self._args_to_clause(
+            kwargs, clauses=self._filter_clauses(_filter, _clauses)
+        )
         query = select(func.count()).where(args)
         query = query.select_from(self.table)
         rp = self.db.executable.execute(query)
