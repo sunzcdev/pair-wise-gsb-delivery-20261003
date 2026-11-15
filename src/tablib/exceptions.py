@@ -20,3 +20,16 @@ class HeadersNeeded(TablibException, AttributeError):
 
 class UnsupportedFormat(TablibException, NotImplementedError):
     """Format not supported."""
+
+
+class InvalidMissingPolicy(TablibException, ValueError):
+    """Missing-value policy must be given explicitly as 'skip' or 'error'."""
+
+
+class SheetNotFound(TablibException, KeyError):
+    """The given Dataset is not a member of this Databook."""
+
+
+class SheetReferenced(TablibException, RuntimeError):
+    """The sheet takes part in registered references and cannot be removed
+    without explicitly unbinding them first."""

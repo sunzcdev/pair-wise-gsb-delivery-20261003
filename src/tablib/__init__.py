@@ -20,3 +20,14 @@ from .core import (  # noqa: F401
     import_book,
     import_set,
 )
+from .exceptions import (  # noqa: F401
+    InvalidMissingPolicy,
+    SheetNotFound,
+    SheetReferenced,
+)
+from .references import (  # noqa: F401
+    MISSING_ERROR,
+    MISSING_SKIP,
+    Reference,
+    ReferenceReport,
+)

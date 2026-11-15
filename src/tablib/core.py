@@ -23,9 +23,12 @@ from .exceptions import (
     InvalidDatasetIndex,
     InvalidDatasetType,
     InvalidDimensions,
+    SheetNotFound,
+    SheetReferenced,
     UnsupportedFormat,
 )
 from .formats import registry
+from .references import Reference, ReferenceReport, verify_reference
 from .utils import normalize_input
 
 __title__ = 'tablib'
@@ -865,6 +868,7 @@ class Databook:
 
     def __init__(self, sets=None):
         self._datasets = sets or []
+        self._references = []
 
     def __repr__(self):
         try:
@@ -875,6 +879,7 @@ class Databook:
     def wipe(self):
         """Removes all :class:`Dataset` objects from the :class:`Databook`."""
         self._datasets = []
+        self._references = []
 
     def sheets(self):
         return self._datasets
@@ -885,6 +890,86 @@ class Databook:
             self._datasets.append(dataset)
         else:
             raise InvalidDatasetType
+
+    # ---------
+    # Inter-sheet references
+    # ---------
+
+    @property
+    def references(self):
+        """The references registered on this book, as a read-only tuple."""
+        return tuple(self._references)
+
+    def add_reference(self, source, source_columns, target, target_columns,
+                      *, missing, name=None):
+        """Registers a reference between two sheets of this book.
+
+        Sheets are bound by identity, never by title, so sheets sharing a
+        title stay unambiguous.  The missing-value policy ``missing`` must
+        be stated explicitly (``'skip'`` or ``'error'``); see
+        :class:`tablib.references.Reference`.
+
+        Returns the created :class:`tablib.references.Reference`.
+        """
+        reference = Reference(
+            source, source_columns, target, target_columns,
+            missing=missing, name=name,
+        )
+        self._references.append(reference)
+        return reference
+
+    def remove_reference(self, reference):
+        """Unregisters a previously added reference."""
+        try:
+            self._references.remove(reference)
+        except ValueError:
+            raise SheetNotFound('unknown reference') from None
+
+    def verify_references(self):
+        """Read-only verification of every registered reference.
+
+        Returns a :class:`tablib.references.ReferenceReport` listing missing
+        tables, missing columns, duplicate target keys, dangling references
+        and (policy permitting) missing key values.  Nothing is mutated.
+        """
+        report = ReferenceReport()
+        for reference in self._references:
+            verify_reference(reference, self._datasets, report)
+        return report
+
+    def rename_sheet(self, dataset, new_title):
+        """Controlled rename of a member sheet.
+
+        Updates the sheet title and synchronizes the metadata of every
+        registered reference bound to this sheet's identity.
+        """
+        if not any(ds is dataset for ds in self._datasets):
+            raise SheetNotFound('the given dataset is not part of this book')
+        dataset.title = new_title
+        for reference in self._references:
+            reference._sync_title(dataset, new_title)
+
+    def remove_sheet(self, dataset, unlink=False):
+        """Removes a sheet from the book.
+
+        If the sheet takes part in registered references, the removal is
+        refused by raising :class:`tablib.exceptions.SheetReferenced`,
+        unless ``unlink=True`` is given to explicitly unbind those
+        references first.
+        """
+        involved = [ref for ref in self._references if ref.involves(dataset)]
+        if involved and not unlink:
+            raise SheetReferenced(
+                f'sheet is bound by {len(involved)} reference(s); '
+                'pass unlink=True to unbind them explicitly'
+            )
+        for reference in involved:
+            self._references.remove(reference)
+        for i, member in enumerate(self._datasets):
+            if member is dataset:
+                del self._datasets[i]
+                return
+        raise SheetNotFound('the given dataset is not part of this book')
 
     def _package(self):
         """Packages :class:`Databook` for delivery."""
