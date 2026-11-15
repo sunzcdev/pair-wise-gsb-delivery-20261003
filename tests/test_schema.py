@@ -1297,6 +1297,59 @@ def test_attribute_collision(attribute):
             MySchema()
 
 
+def test_nested_attribute_collision_is_rejected_by_default():
+    class MySchema(Schema):
+        parent = fields.Raw(attribute="payload")
+        child = fields.Raw(attribute="payload.child", data_key="other")
+        dump_only = fields.Raw(
+            attribute="payload.child.grandchild", dump_only=True
+        )
+
+    with pytest.raises(ValueError, match="parent.*child"):
+        MySchema()
+
+
+def test_attribute_merger_resolves_nested_collisions():
+    def merger(existing, new):
+        merged = dict(existing)
+        merged.update(new)
+        return merged
+
+    class MySchema(Schema):
+        parent = fields.Raw(attribute="payload")
+        child = fields.Raw(attribute="payload.child")
+
+    schema = MySchema(attribute_merger=merger)
+    assert schema.load({"parent": {"kept": True}, "child": 42}) == {
+        "payload": {"kept": True, "child": 42}
+    }
+
+
+def test_attribute_merger_failure_has_no_partial_item():
+    def merger(existing, new):
+        raise ValueError("cannot merge")
+
+    class MySchema(Schema):
+        parent = fields.Raw(attribute="payload")
+        child = fields.Raw(attribute="payload.child")
+
+    with pytest.raises(ValidationError) as excinfo:
+        MySchema(attribute_merger=merger).load({"parent": 1, "child": 2})
+
+    assert set(excinfo.value.messages) == {"parent", "child"}
+    assert excinfo.value.valid_data == {}
+
+
+def test_disjoint_nested_attributes_still_merge_into_one_structure():
+    class MySchema(Schema):
+        first = fields.Raw(attribute="payload.first")
+        second = fields.Raw(attribute="payload.second")
+
+    assert MySchema().load({"first": 1, "second": 2}) == {
+        "payload": {"first": 1, "second": 2}
+    }
+
+
 class TestDeeplyNestedLoadOnly:
     @pytest.fixture
     def schema(self):

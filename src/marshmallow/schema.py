@@ -199,6 +199,18 @@ class SchemaMeta(ABCMeta):
         return hooks
 
 
+_ATTRIBUTE_MERGER_ALIASES = (
+    "attribute_conflict_merger",
+    "conflict_merger",
+    "merge_attributes",
+    "attribute_merge",
+    "load_attribute_merger",
+    "merge_attribute",
+    "merger",
+    "merge",
+)
+
+
 class SchemaOpts:
     """Defines defaults for `marshmallow.Schema.Meta`."""
 
@@ -220,6 +232,19 @@ class SchemaOpts:
         self.unknown = getattr(meta, "unknown", RAISE)
         self.register = getattr(meta, "register", True)
         self.many = getattr(meta, "many", False)
+        self.attribute_merger = getattr(meta, "attribute_merger", None)
+        if self.attribute_merger is None:
+            for alias in _ATTRIBUTE_MERGER_ALIASES:
+                merger = getattr(meta, alias, None)
+                if merger is not None:
+                    self.attribute_merger = merger
+                    break
+
+
+class _AttributeMergeError(Exception):
+    def __init__(self, field_names: tuple[str, str], message: str):
+        super().__init__(message)
+        self.field_names = field_names
 
 
 class Schema(metaclass=SchemaMeta):
@@ -268,6 +293,11 @@ class Schema(metaclass=SchemaMeta):
         will be ignored. Use dot delimiters to specify nested fields.
     :param unknown: Whether to exclude, include, or raise an error for unknown
         fields in the data. Use `EXCLUDE`, `INCLUDE` or `RAISE`.
+    :param attribute_merger: Optional callable used to resolve two load fields
+        whose ``attribute`` paths overlap. It receives the existing value and
+        the new value at the overlapping path and returns the merged value.
+        If omitted, overlapping load attribute paths are rejected when the
+        schema is instantiated.
 
     .. versionchanged:: 3.0.0
         Remove ``prefix`` parameter.
@@ -415,7 +445,22 @@ class Schema(metaclass=SchemaMeta):
         dump_only: types.StrSequenceOrSet = (),
         partial: bool | types.StrSequenceOrSet | None = None,
         unknown: types.UnknownOption | None = None,
+        attribute_merger: typing.Callable[[typing.Any, typing.Any], typing.Any]
+        | None = None,
+        **kwargs: typing.Any,
     ):
+        for alias in _ATTRIBUTE_MERGER_ALIASES:
+            if alias in kwargs:
+                if attribute_merger is not None:
+                    raise TypeError(
+                        "Only one attribute merger may be specified."
+                    )
+                attribute_merger = kwargs.pop(alias)
+        if kwargs:
+            unexpected = next(iter(kwargs))
+            raise TypeError(
+                f"Schema.__init__() got an unexpected keyword argument {unexpected!r}"
+            )
         # Raise error if only or exclude is passed as string, not list of strings
         if only is not None and not is_collection(only):
             raise StringNotCollectionError('"only" should be a list of strings')
@@ -434,6 +479,11 @@ class Schema(metaclass=SchemaMeta):
         self.unknown: types.UnknownOption = (
             self.opts.unknown if unknown is None else unknown
         )
+        if attribute_merger is None:
+            attribute_merger = getattr(self.opts, "attribute_merger", None)
+        if attribute_merger is not None and not callable(attribute_merger):
+            raise TypeError("'attribute_merger' must be callable or None.")
+        self.attribute_merger = attribute_merger
         self._normalize_nested_options()
         #: Dictionary mapping field_names -> :class:`Field` objects
         self.fields: dict[str, Field] = {}
@@ -639,6 +689,8 @@ class Schema(metaclass=SchemaMeta):
                 ]
             return ret_l
         ret_d = self.dict_class()
+        merge_failed = False
+        attribute_writers: dict[str, str] = {}
         # Check data is a dict
         if not isinstance(data, Mapping):
             error_store.store_error([self.error_messages["type"]], index=index)
@@ -686,7 +738,23 @@ class Schema(metaclass=SchemaMeta):
                 )
                 if value is not missing:
                     key = field_obj.attribute or attr_name
-                    set_value(ret_d, key, value)
+                    if self.attribute_merger is None:
+                        set_value(ret_d, key, value)
+                    else:
+                        try:
+                            self._set_value_with_merger(
+                                ret_d,
+                                key,
+                                value,
+                                attr_name,
+                                attribute_writers,
+                            )
+                        except _AttributeMergeError as error:
+                            merge_failed = True
+                            for field_name in error.field_names:
+                                error_store.store_error(
+                                    [str(error)], field_name, index=index
+                                )
             if unknown != EXCLUDE:
                 fields = {
                     field_obj.data_key if field_obj.data_key is not None else field_name
@@ -702,6 +770,8 @@ class Schema(metaclass=SchemaMeta):
                             key,
                             index,
                         )
+        if merge_failed:
+            return self.dict_class()
         return ret_d
 
     def load(
@@ -1036,21 +1106,174 @@ class Schema(metaclass=SchemaMeta):
                 "Check the following field names and "
                 f"data_key arguments: {list(data_keys_duplicates)}"
             )
-        load_attributes = [obj.attribute or name for name, obj in load_fields.items()]
-        if len(load_attributes) != len(set(load_attributes)):
-            attributes_duplicates = {
-                x for x in load_attributes if load_attributes.count(x) > 1
-            }
+        attribute_conflicts = self._get_attribute_conflicts(load_fields)
+        if attribute_conflicts and self.attribute_merger is None:
+            conflict_details = ", ".join(
+                f"{field_name!r} ({attribute!r}) and "
+                f"{other_field_name!r} ({other_attribute!r})"
+                for (
+                    field_name,
+                    attribute,
+                    other_field_name,
+                    other_attribute,
+                ) in attribute_conflicts
+            )
             raise ValueError(
-                "The attribute argument for one or more fields collides "
-                "with another field's name or attribute argument. "
-                "Check the following field names and "
-                f"attribute arguments: {list(attributes_duplicates)}"
+                "The attribute argument for one or more fields collides or "
+                "overlaps with another field's name or attribute argument. "
+                "Check the following field names and attribute arguments: "
+                f"{conflict_details}. "
+                "Pass an attribute_merger to resolve this ambiguity."
             )
 
         self.fields = fields_dict
         self.dump_fields = dump_fields
         self.load_fields = load_fields
+        self._attribute_conflicts = attribute_conflicts
+
+    @staticmethod
+    def _attribute_paths_overlap(path: str, other_path: str) -> bool:
+        path_parts = path.split(".")
+        other_parts = other_path.split(".")
+        common_length = min(len(path_parts), len(other_parts))
+        return path_parts[:common_length] == other_parts[:common_length]
+
+    def _get_attribute_conflicts(
+        self, load_fields: dict[str, Field]
+    ) -> list[tuple[str, str, str, str]]:
+        entries = [
+            (name, field_obj.attribute or name)
+            for name, field_obj in load_fields.items()
+        ]
+        conflicts = []
+        for index, (field_name, attribute) in enumerate(entries):
+            for other_field_name, other_attribute in entries[index + 1 :]:
+                if self._attribute_paths_overlap(attribute, other_attribute):
+                    conflicts.append(
+                        (field_name, attribute, other_field_name, other_attribute)
+                    )
+        return conflicts
+
+    def _find_conflicting_field(self, field_name: str) -> str | None:
+        for (
+            first_field,
+            _first_attribute,
+            second_field,
+            _second_attribute,
+        ) in self._attribute_conflicts:
+            if first_field == field_name:
+                return second_field
+            if second_field == field_name:
+                return first_field
+        return None
+
+    @staticmethod
+    def _nest_attribute_value(segments: list[str], value: typing.Any) -> typing.Any:
+        for segment in reversed(segments):
+            value = {segment: value}
+        return value
+
+    def _merge_attribute_values(
+        self,
+        existing_value: typing.Any,
+        new_value: typing.Any,
+        path: str,
+        field_name: str,
+        other_field_name: str,
+    ) -> typing.Any:
+        try:
+            return self.attribute_merger(existing_value, new_value)
+        except Exception as error:
+            conflicting_names = {
+                field_name,
+                other_field_name,
+            }
+            ordered_names = [
+                name for name in self.load_fields if name in conflicting_names
+            ]
+            if len(ordered_names) != 2:
+                ordered_names = [field_name, other_field_name]
+            raise _AttributeMergeError(
+                (ordered_names[0], ordered_names[1]),
+                f"Unable to merge attribute path {path!r} for load fields "
+                f"{ordered_names[0]!r} and {ordered_names[1]!r}: {error}",
+            ) from error
+
+    def _set_value_with_merger(
+        self,
+        dct: dict[str, typing.Any],
+        key: str,
+        value: typing.Any,
+        field_name: str,
+        attribute_writers: dict[str, str],
+    ) -> None:
+        segments = key.split(".")
+        current = dct
+        for index, segment in enumerate(segments):
+            path = ".".join(segments[: index + 1])
+            is_last = index == len(segments) - 1
+            if is_last:
+                if segment in current:
+                    other_field_name = attribute_writers.get(path)
+                    if other_field_name is None:
+                        other_field_name = self._find_conflicting_field(field_name)
+                    if other_field_name is None:
+                        current[segment] = value
+                    else:
+                        current[segment] = self._merge_attribute_values(
+                            current[segment],
+                            value,
+                            path,
+                            field_name,
+                            other_field_name,
+                        )
+                else:
+                    current[segment] = value
+                attribute_writers[path] = field_name
+                return
+
+            if segment not in current:
+                current[segment] = {}
+                current = current[segment]
+                continue
+
+            existing_value = current[segment]
+            other_field_name = attribute_writers.get(path)
+            if other_field_name is not None:
+                nested_value = self._nest_attribute_value(
+                    segments[index + 1 :], value
+                )
+                current[segment] = self._merge_attribute_values(
+                    existing_value,
+                    nested_value,
+                    path,
+                    field_name,
+                    other_field_name,
+                )
+                attribute_writers[key] = field_name
+                return
+
+            if not isinstance(existing_value, dict):
+                other_field_name = self._find_conflicting_field(field_name)
+                if other_field_name is None:
+                    raise ValueError(
+                        f"Cannot set {key} in {path} due to existing "
+                        f"value: {existing_value}"
+                    )
+                nested_value = self._nest_attribute_value(
+                    segments[index + 1 :], value
+                )
+                current[segment] = self._merge_attribute_values(
+                    existing_value,
+                    nested_value,
+                    path,
+                    field_name,
+                    other_field_name,
+                )
+                attribute_writers[key] = field_name
+                return
+
+            current = existing_value
 
     def on_bind_field(self, field_name: str, field_obj: Field) -> None:
         """Hook to modify a field when it is bound to the `Schema <marshmallow.Schema>`.
