@@ -2,12 +2,14 @@ from collections.abc import Mapping, MutableMapping, Sequence
 from urllib.parse import urlsplit
 import re
 
-# Module-level sentinels so recursive `_uniq_key` calls produce comparable
-# keys for nested True/False (function-default sentinels would also work, but
-# this makes the intent explicit).
+# Module-level sentinels so the recursive fingerprint helpers produce
+# comparable tags for nested True/False (function-default sentinels would
+# also work, but this makes the intent explicit), plus markers for elements
+# that cannot be fully or partially hashed.
 _TRUE = object()
 _FALSE = object()
 _UNSUPPORTED = object()
+_UNHASHABLE = object()
 
 
 class URIDict(MutableMapping):
@@ -158,80 +160,137 @@ def unbool(element, true=object(), false=object()):
     return element
 
 
-def _uniq_key(element):
+def _structural_fingerprint(element):
     """
-    Convert an element into a hashable key compatible with `equal`.
+    Build a hashable *fingerprint* for an element.
 
-    Returns `_UNSUPPORTED` when an element cannot be canonically hashed.
+    The fingerprint is only a candidate-grouping hint: two elements with the
+    same fingerprint are not assumed equal, and two elements with different
+    fingerprints can never be `equal`. Every fingerprint collision is still
+    adjudicated with `equal`, so a hash collision never produces a wrong
+    result.
+
+    JSON equivalence is preserved while building it:
+
+    * mapping key order is ignored (items are collected into a frozenset),
+    * sequence order is significant (items are kept in order),
+    * booleans are tagged separately from numbers via `unbool`,
+
     """
     # NaN never equals itself, so it can't be deduplicated via hashing.
-    # Some custom container equality implementations can also raise here
-    # (e.g. mappings containing unhashable keys), in which case we fall back
-    # to brute force as well.
+    # Custom objects may raise arbitrary errors from their comparisons, in
+    # which case we give up on fingerprinting and fall back to brute force.
     try:
         if element != element:  # noqa: PLR0124 -- NaN detection
             return _UNSUPPORTED
-    except TypeError:
+    except Exception:  # noqa: BLE001 -- any failure means: use the fallback
         return _UNSUPPORTED
 
     element = unbool(element, true=_TRUE, false=_FALSE)
 
-    # Tagged tuples ("scalar"/"sequence"/"mapping", ...) prevent hash
-    # collisions between values of different shapes.
+    # Tagged tuples keep values of different shapes in separate buckets.
     if isinstance(element, Sequence) and not isinstance(element, str):
         values = []
         for each in element:
-            key = _uniq_key(each)
-            if key is _UNSUPPORTED:
+            fingerprint = _structural_fingerprint(each)
+            if fingerprint is _UNSUPPORTED:
                 return _UNSUPPORTED
-            values.append(key)
+            values.append(fingerprint)
         return "sequence", tuple(values)
 
     if isinstance(element, Mapping):
         items = []
         for key, value in element.items():
-            value_key = _uniq_key(value)
-            if value_key is _UNSUPPORTED:
+            value_fingerprint = _structural_fingerprint(value)
+            if value_fingerprint is _UNSUPPORTED:
                 return _UNSUPPORTED
-            items.append((key, value_key))
+            items.append((key, value_fingerprint))
         try:
             return "mapping", frozenset(items)
-        except TypeError:
-            # Unhashable mapping key — fall back to brute force.
+        except Exception:  # noqa: BLE001 -- e.g. an unhashable mapping key
             return _UNSUPPORTED
 
     try:
         hash(element)
-    except TypeError:
+    except Exception:  # noqa: BLE001 -- custom __hash__ may raise anything
         return _UNSUPPORTED
 
     return "scalar", element
+
+
+def _fallback_signature(element):
+    """
+    Cheap structural grouping hint for elements without a full fingerprint.
+
+    Unlike `_structural_fingerprint`, an unhashable or NaN leaf does not
+    invalidate the whole element: it is replaced by a shared sentinel so the
+    surrounding structure still contributes to grouping. This keeps elements
+    with different shapes in separate buckets instead of lumping every
+    fallback element together. The signature is only a hint -- equality is
+    always decided by `equal`.
+    """
+    return type(element), _partial_fingerprint(element)
+
+
+def _partial_fingerprint(element):
+    try:
+        if element != element:  # noqa: PLR0124 -- NaN detection
+            return _UNHASHABLE
+    except Exception:  # noqa: BLE001 -- uncooperative custom comparison
+        return _UNHASHABLE
+
+    element = unbool(element, true=_TRUE, false=_FALSE)
+
+    if isinstance(element, Sequence) and not isinstance(element, str):
+        return "sequence", tuple(
+            _partial_fingerprint(each) for each in element
+        )
+
+    if isinstance(element, Mapping):
+        try:
+            return "mapping", frozenset(
+                (key, _partial_fingerprint(value))
+                for key, value in element.items()
+            )
+        except Exception:  # noqa: BLE001 -- e.g. an unhashable mapping key
+            return _UNHASHABLE
+
+    return "scalar", _safe_hash(element)
+
+
+def _safe_hash(element):
+    try:
+        return hash(element)
+    except Exception:  # noqa: BLE001 -- unhashable or a failing __hash__
+        return _UNHASHABLE
 
 
 def uniq(container):
     """
     Check if all of a container's elements are unique.
 
-    Tries to use a structural hash compatible with `equal`, falling back to
-    brute force when necessary.
+    Elements are first split into candidate groups by a structural
+    fingerprint. Deep comparisons via `equal` only happen *within* a group,
+    so the common case stays linear while hash collisions are still
+    adjudicated correctly. Elements without a usable fingerprint (NaN,
+    unhashable values, or custom objects whose comparisons fail) are grouped
+    separately and checked with the same equality semantics as a fallback.
     """
-    seen_keys = set()
-    unsupported = []
+    fingerprinted = {}
+    fallback = {}
 
     for element in container:
-        key = _uniq_key(element)
+        fingerprint = _structural_fingerprint(element)
 
-        if key is _UNSUPPORTED:
-            for previous in unsupported:
-                if equal(previous, element):
-                    return False
-            unsupported.append(element)
-            continue
+        if fingerprint is _UNSUPPORTED:
+            bucket = fallback.setdefault(_fallback_signature(element), [])
+        else:
+            bucket = fingerprinted.setdefault(fingerprint, [])
 
-        if key in seen_keys:
-            return False
-
-        seen_keys.add(key)
+        for candidate in bucket:
+            if equal(candidate, element):
+                return False
+        bucket.append(element)
 
     return True
 

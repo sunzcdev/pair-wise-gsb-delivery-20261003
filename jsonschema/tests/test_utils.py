@@ -1,7 +1,9 @@
 from collections.abc import Mapping
 from math import nan
+from unittest import mock
 from unittest import TestCase
 
+from jsonschema import _utils
 from jsonschema._utils import equal, uniq
 
 
@@ -13,6 +15,41 @@ class Unhashable:
 
     def __eq__(self, other):
         return isinstance(other, Unhashable) and self.value == other.value
+
+
+class HashCollision:
+    """Distinct values that deliberately share a hash value."""
+
+    def __init__(self, value):
+        self.value = value
+
+    def __hash__(self):
+        return 42
+
+    def __eq__(self, other):
+        return (
+            isinstance(other, HashCollision) and self.value == other.value
+        )
+
+
+class ExplodingHash:
+    """A custom value whose hashing raises a non-TypeError exception."""
+
+    def __hash__(self):
+        raise ValueError("boom from __hash__")
+
+    def __eq__(self, other):
+        return other is self
+
+
+class ExplodingComparison:
+    """A custom value whose comparison raises a non-TypeError exception."""
+
+    def __hash__(self):
+        return 7
+
+    def __eq__(self, other):
+        raise RuntimeError("boom from __eq__")
 
 
 class TestEqual(TestCase):
@@ -150,6 +187,17 @@ class TestListEqual(TestCase):
 
 
 class TestUniq(TestCase):
+    def count_equal_calls(self, elements):
+        calls = []
+
+        def counting_equal(one, two):
+            calls.append((one, two))
+            return equal(one, two)
+
+        with mock.patch.object(_utils, "equal", counting_equal):
+            result = uniq(elements)
+        return result, calls
+
     def test_scalars(self):
         self.assertTrue(uniq([1, 2, 3]))
         self.assertFalse(uniq([1, 2, 1]))
@@ -226,4 +274,81 @@ class TestUniq(TestCase):
         )
         self.assertTrue(
             uniq([{"k": Unhashable(1)}, {"k": Unhashable(2)}]),
+        )
+
+    def test_hash_collision_is_not_treated_as_duplicate(self):
+        distinct = [HashCollision(1), HashCollision(2), HashCollision(3)]
+        self.assertTrue(uniq(distinct))
+        self.assertFalse(
+            uniq([HashCollision(1), HashCollision(2), HashCollision(1)]),
+        )
+
+    def test_same_fingerprint_still_adjudicated_by_equality(self):
+        # Distinct mapping objects can share a structural fingerprint, so
+        # they land in the same candidate bucket and the collision is
+        # adjudicated by `equal` instead of being assumed a duplicate.
+        result, calls = self.count_equal_calls(
+            [{"k": [1, 2]}, {"k": [1, 2]}],
+        )
+        self.assertFalse(result)
+        self.assertGreaterEqual(len(calls), 1)
+
+    def test_falls_back_when_hash_raises_non_type_error(self):
+        value = ExplodingHash()
+        self.assertTrue(uniq([value, object()]))
+        self.assertFalse(uniq([value, value]))
+
+    def test_falls_back_when_comparison_raises_non_type_error(self):
+        value = ExplodingComparison()
+        self.assertTrue(uniq([value, object()]))
+        self.assertFalse(uniq([value, value]))
+
+    def test_fallback_groups_reduce_pairwise_deep_comparisons(self):
+        # Mixing unhashable elements with NaN values lands every element in
+        # the fallback path, but the (type, partial fingerprint) signature
+        # splits them into separate candidate buckets, so no cross-group deep
+        # comparison runs.
+        elements = [Unhashable(each) for each in range(10)]
+        elements += [float("nan") for _ in range(10)]
+        result, calls = self.count_equal_calls(elements)
+        self.assertTrue(result)
+        self.assertLess(len(calls), 20 * 19 // 2)
+
+    def test_nan_bearing_structures_are_grouped_without_deep_compare(self):
+        # Distinct objects that each contain NaN cannot get a full
+        # fingerprint, but their surrounding structure still separates them
+        # into buckets -- no pairwise deep comparison is required.
+        distinct = [{"v": [index, nan]} for index in range(20)]
+        result, calls = self.count_equal_calls(distinct)
+        self.assertTrue(result)
+        self.assertEqual(calls, [])
+
+        # Equal NaN-bearing objects share a bucket and are still caught.
+        duplicate = [{"v": [1, nan]}, {"v": [1, nan]}]
+        self.assertFalse(uniq(duplicate))
+
+    def test_nested_unhashable_grouped_by_surrounding_structure(self):
+        # An unhashable leaf becomes a sentinel in the partial fingerprint,
+        # so differing surrounding keys avoid a deep comparison.
+        elements = [
+            {"group": index, "value": Unhashable(index)}
+            for index in range(20)
+        ]
+        result, calls = self.count_equal_calls(elements)
+        self.assertTrue(result)
+        self.assertEqual(calls, [])
+
+    def test_distinct_fallback_groups_are_never_compared(self):
+        # Different fallback signatures must never be deep-compared.
+        first = [Unhashable(1), Unhashable(2)]
+        second = [ExplodingHash(), ExplodingHash()]
+        result, calls = self.count_equal_calls(first + second)
+        self.assertTrue(result)
+        compared = {
+            tuple(sorted((type(a).__name__, type(b).__name__)))
+            for a, b in calls
+        }
+        self.assertNotIn(
+            ("ExplodingHash", "Unhashable"),
+            compared,
         )
