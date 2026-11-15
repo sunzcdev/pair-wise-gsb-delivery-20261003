@@ -76,6 +76,7 @@ __all__ = [
     "ReadError",
     "ReadTimeout",
     "RemoteProtocolError",
+    "REMOVE",
     "request",
     "Request",
     "RequestError",

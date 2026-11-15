@@ -87,6 +87,76 @@ def test_header_merge_conflicting_headers():
     }
 
 
+def test_header_remove_client_default():
+    """
+    A `REMOVE` marker removes a client-level header entirely,
+    matching header names case-insensitively.
+    """
+    url = "http://example.org/echo_headers"
+    client_headers = {"X-Auth-Token": "FooBarBazToken", "X-Custom": "example"}
+    request_headers = {"x-auth-token": httpx.REMOVE}
+    client = httpx.Client(
+        transport=httpx.MockTransport(echo_headers), headers=client_headers
+    )
+    response = client.get(url, headers=request_headers)
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "headers": {
+            "accept": "*/*",
+            "accept-encoding": "gzip, deflate, br, zstd",
+            "connection": "keep-alive",
+            "host": "example.org",
+            "user-agent": f"python-httpx/{httpx.__version__}",
+            "x-custom": "example",
+        }
+    }
+
+    # The client-level configuration is left unchanged.
+    assert client.headers["X-Auth-Token"] == "FooBarBazToken"
+    # The request-level mapping is left unchanged.
+    assert request_headers == {"x-auth-token": httpx.REMOVE}
+
+
+def test_header_remove_is_distinct_from_empty_value():
+    """
+    An empty-string value overrides a client-level header with an
+    empty value, rather than removing it.
+    """
+    url = "http://example.org/echo_headers"
+    client_headers = {"X-Auth-Token": "FooBarBazToken"}
+    client = httpx.Client(
+        transport=httpx.MockTransport(echo_headers), headers=client_headers
+    )
+    response = client.get(url, headers={"X-Auth-Token": ""})
+
+    assert response.status_code == 200
+    assert response.json()["headers"]["x-auth-token"] == ""
+
+
+def test_header_remove_with_build_request_and_send():
+    """
+    A request built with a `REMOVE` marker stays removed when sent,
+    without client-level defaults being merged back in.
+    """
+    url = "http://example.org/echo_headers"
+    client_headers = {"X-Auth-Token": "FooBarBazToken"}
+    client = httpx.Client(
+        transport=httpx.MockTransport(echo_headers), headers=client_headers
+    )
+    request = client.build_request("GET", url, headers={"X-Auth-Token": httpx.REMOVE})
+    assert "x-auth-token" not in request.headers
+
+    response = client.send(request)
+    assert response.status_code == 200
+    assert "x-auth-token" not in response.json()["headers"]
+
+
+def test_header_remove_marker_not_allowed_on_headers_instances():
+    with pytest.raises(TypeError):
+        httpx.Headers({"X-Auth-Token": httpx.REMOVE})
+
+
 def test_header_update():
     url = "http://example.org/echo_headers"
     client = httpx.Client(transport=httpx.MockTransport(echo_headers))

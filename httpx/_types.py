@@ -34,19 +34,19 @@ URLTypes = Union["URL", str]
 
 QueryParamTypes = Union[
     "QueryParams",
-    Mapping[str, Union[PrimitiveData, Sequence[PrimitiveData]]],
-    List[Tuple[str, PrimitiveData]],
-    Tuple[Tuple[str, PrimitiveData], ...],
+    Mapping[str, Union[PrimitiveData, "RemoveEntry", Sequence[PrimitiveData]]],
+    List[Tuple[str, Union[PrimitiveData, "RemoveEntry"]]],
+    Tuple[Tuple[str, Union[PrimitiveData, "RemoveEntry"]], ...],
     str,
     bytes,
 ]
 
 HeaderTypes = Union[
     "Headers",
-    Mapping[str, str],
-    Mapping[bytes, bytes],
-    Sequence[Tuple[str, str]],
-    Sequence[Tuple[bytes, bytes]],
+    Mapping[str, Union[str, "RemoveEntry"]],
+    Mapping[bytes, Union[bytes, "RemoveEntry"]],
+    Sequence[Tuple[str, Union[str, "RemoveEntry"]]],
+    Sequence[Tuple[bytes, Union[bytes, "RemoveEntry"]]],
 ]
 
 CookieTypes = Union["Cookies", CookieJar, Dict[str, str], List[Tuple[str, str]]]
@@ -86,7 +86,29 @@ RequestFiles = Union[Mapping[str, FileTypes], Sequence[Tuple[str, FileTypes]]]
 
 RequestExtensions = Mapping[str, Any]
 
-__all__ = ["AsyncByteStream", "SyncByteStream"]
+__all__ = ["AsyncByteStream", "SyncByteStream", "REMOVE"]
+
+
+class RemoveEntry:
+    """
+    A sentinel used as a header or query parameter value in request-level
+    `headers=...` and `params=...` arguments, indicating that any matching
+    client-level default should be removed entirely, rather than inherited
+    or overridden.
+
+    This is distinctly different to omitting the argument, which inherits
+    the client-level default, and to using an empty-string value, which
+    overrides the client-level default with an empty value.
+
+    For example `client.request("GET", ..., headers={"X-Token": REMOVE})`
+    sends a request without any `X-Token` header, even if an `X-Token`
+    header is configured on the client. Header names are matched
+    case-insensitively. For query parameters every value for the
+    parameter name is removed.
+    """
+
+
+REMOVE = RemoveEntry()
 
 
 class SyncByteStream:

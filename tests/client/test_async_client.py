@@ -278,6 +278,32 @@ async def test_client_closed_state_using_implicit_open():
 
 
 @pytest.mark.anyio
+async def test_remove_client_defaults():
+    def echo_request(request: httpx.Request) -> httpx.Response:
+        data = {"headers": dict(request.headers), "url": str(request.url)}
+        return httpx.Response(200, json=data)
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(echo_request),
+        headers={"X-Auth-Token": "FooBarBazToken"},
+        params=[("first", "1"), ("first", "2"), ("second", "3")],
+    ) as client:
+        response = await client.get(
+            "http://example.org/echo",
+            headers={"x-auth-token": httpx.REMOVE},
+            params={"first": httpx.REMOVE},
+        )
+
+    assert response.status_code == 200
+    assert "x-auth-token" not in response.json()["headers"]
+    assert response.json()["url"] == "http://example.org/echo?second=3"
+
+    # The client-level configuration is left unchanged.
+    assert client.headers["X-Auth-Token"] == "FooBarBazToken"
+    assert client.params.get_list("first") == ["1", "2"]
+
+
+@pytest.mark.anyio
 async def test_client_closed_state_using_with_block():
     async with httpx.AsyncClient(transport=httpx.MockTransport(hello_world)) as client:
         assert not client.is_closed

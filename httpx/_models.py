@@ -37,6 +37,7 @@ from ._types import (
     CookieTypes,
     HeaderTypes,
     QueryParamTypes,
+    RemoveEntry,
     RequestContent,
     RequestData,
     RequestExtensions,
@@ -152,11 +153,21 @@ class Headers(typing.MutableMapping[str, str]):
             self._list = list(headers._list)
         elif isinstance(headers, Mapping):
             for k, v in headers.items():
+                if isinstance(v, RemoveEntry):
+                    raise TypeError(
+                        "REMOVE may only be used in request-level `headers=...` "
+                        "arguments, to remove client-level defaults."
+                    )
                 bytes_key = _normalize_header_key(k, encoding)
                 bytes_value = _normalize_header_value(v, encoding)
                 self._list.append((bytes_key, bytes_key.lower(), bytes_value))
         elif headers is not None:
             for k, v in headers:
+                if isinstance(v, RemoveEntry):
+                    raise TypeError(
+                        "REMOVE may only be used in request-level `headers=...` "
+                        "arguments, to remove client-level defaults."
+                    )
                 bytes_key = _normalize_header_key(k, encoding)
                 bytes_value = _normalize_header_value(v, encoding)
                 self._list.append((bytes_key, bytes_key.lower(), bytes_value))

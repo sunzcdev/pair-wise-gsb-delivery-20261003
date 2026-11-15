@@ -125,6 +125,26 @@ b'alice:ecila123'
 
 If you need finer-grained control on the merging of client-level and request-level parameters, see [Request instances](#request-instances).
 
+### Removing client-level defaults
+
+For headers and query parameters, the `httpx.REMOVE` marker can be used as a request-level value to remove a client-level default entirely, rather than inheriting or overriding it. This is distinctly different to omitting the argument, which inherits the client-level value, and to using an empty-string value, which overrides the client-level value with an empty one.
+
+```pycon
+>>> headers = {'X-Auth': 'from-client'}
+>>> params = {'client_id': 'client1'}
+>>> with httpx.Client(headers=headers, params=params) as client:
+...     headers = {'X-Auth': httpx.REMOVE}
+...     params = {'client_id': httpx.REMOVE}
+...     r = client.get('https://example.com', headers=headers, params=params)
+...
+>>> r.request.url
+URL('https://example.com')
+>>> 'X-Auth' in r.request.headers
+False
+```
+
+Header names are matched case-insensitively. For query parameters, every value for the parameter name is removed. The client-level configuration and the request-level mappings are left unchanged.
+
 ## Other Client-only configuration options
 
 Additionally, `Client` accepts some configuration options that aren't available at the request level.

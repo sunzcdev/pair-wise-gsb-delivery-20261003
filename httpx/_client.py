@@ -6,6 +6,7 @@ import logging
 import time
 import typing
 import warnings
+from collections.abc import Mapping
 from contextlib import asynccontextmanager, contextmanager
 from types import TracebackType
 
@@ -38,6 +39,7 @@ from ._types import (
     HeaderTypes,
     ProxyTypes,
     QueryParamTypes,
+    RemoveEntry,
     RequestContent,
     RequestData,
     RequestExtensions,
@@ -425,9 +427,35 @@ class BaseClient:
         """
         Merge a headers argument together with any headers on the client,
         to create the headers used for the outgoing request.
+
+        Using `REMOVE` as a header value removes any client-level header
+        with that name, matched case-insensitively, instead of overriding it.
         """
         merged_headers = Headers(self.headers)
-        merged_headers.update(headers)
+        if headers is None:
+            return merged_headers
+        if isinstance(headers, Headers):
+            # `Headers` instances cannot include `REMOVE` markers.
+            merged_headers.update(headers)
+            return merged_headers
+        if isinstance(headers, Mapping):
+            header_items: list[tuple[typing.Any, typing.Any]] = list(headers.items())
+        else:
+            header_items = list(headers)
+        pending: list[tuple[typing.Any, typing.Any]] = []
+        for key, value in header_items:
+            if isinstance(value, RemoveEntry):
+                # Apply any pending updates first, so that the
+                # ordering of operations is preserved.
+                if pending:
+                    merged_headers.update(pending)
+                    pending = []
+                name = key.decode("ascii") if isinstance(key, bytes) else str(key)
+                merged_headers.pop(name, None)
+            else:
+                pending.append((key, value))
+        if pending:
+            merged_headers.update(pending)
         return merged_headers
 
     def _merge_queryparams(
@@ -436,10 +464,54 @@ class BaseClient:
         """
         Merge a queryparams argument together with any queryparams on the client,
         to create the queryparams used for the outgoing request.
+
+        Using `REMOVE` as a query parameter value removes every client-level
+        value for that parameter name, instead of overriding them.
         """
-        if params or self.params:
+        removals: list[str] = []
+        cleaned: QueryParamTypes | None
+        if isinstance(params, QueryParams):
+            # `QueryParams` instances cannot include `REMOVE` markers.
+            cleaned = params
+        elif isinstance(params, Mapping):
+            cleaned_mapping: dict[typing.Any, typing.Any] = {}
+            for key, value in params.items():
+                if isinstance(value, RemoveEntry) or (
+                    isinstance(value, (list, tuple))
+                    and any(isinstance(item, RemoveEntry) for item in value)
+                ):
+                    # A `REMOVE` marker anywhere for a parameter name
+                    # removes every value for that name.
+                    removals.append(str(key))
+                else:
+                    cleaned_mapping[key] = value
+            cleaned = cleaned_mapping
+        elif isinstance(params, (list, tuple)):
+            cleaned_items: list[tuple[typing.Any, typing.Any]] = []
+            removed_names = set()
+            for key, value in params:
+                if isinstance(value, RemoveEntry):
+                    removals.append(str(key))
+                    removed_names.add(str(key))
+                else:
+                    cleaned_items.append((key, value))
+            if removed_names:
+                cleaned_items = [
+                    (key, value)
+                    for key, value in cleaned_items
+                    if str(key) not in removed_names
+                ]
+            cleaned = cleaned_items
+        else:
+            # `str`, `bytes` and `None` cannot include `REMOVE` markers.
+            cleaned = params
+
+        if cleaned or removals or self.params:
             merged_queryparams = QueryParams(self.params)
-            return merged_queryparams.merge(params)
+            merged_queryparams = merged_queryparams.merge(cleaned)
+            for name in removals:
+                merged_queryparams = merged_queryparams.remove(name)
+            return merged_queryparams
         return params
 
     def _build_auth(self, auth: AuthTypes | None) -> Auth | None:

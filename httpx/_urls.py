@@ -5,7 +5,7 @@ from urllib.parse import parse_qs, unquote, urlencode
 
 import idna
 
-from ._types import QueryParamTypes
+from ._types import QueryParamTypes, RemoveEntry
 from ._urlparse import urlparse
 from ._utils import primitive_value_to_str
 
@@ -455,10 +455,14 @@ class QueryParams(typing.Mapping[str, str]):
             # Ensure that keys and values are neatly coerced to strings.
             # We coerce values `True` and `False` to JSON-like "true" and "false"
             # representations, and coerce `None` values to the empty string.
-            self._dict = {
-                str(k): [primitive_value_to_str(item) for item in v]
-                for k, v in dict_value.items()
-            }
+            self._dict = {}
+            for k, v in dict_value.items():
+                if any(isinstance(item, RemoveEntry) for item in v):
+                    raise TypeError(
+                        "REMOVE may only be used in request-level `params=...` "
+                        "arguments, to remove client-level defaults."
+                    )
+                self._dict[str(k)] = [primitive_value_to_str(item) for item in v]
 
     def keys(self) -> typing.KeysView[str]:
         """
