@@ -27,6 +27,7 @@ Our exception hierarchy:
 * StreamError
   x StreamConsumed
   x StreamClosed
+  x StreamInUse
   x ResponseNotRead
   x RequestNotRead
 """
@@ -59,6 +60,7 @@ __all__ = [
     "RequestError",
     "RequestNotRead",
     "ResponseNotRead",
+    "StreamInUse",
     "StreamClosed",
     "StreamConsumed",
     "StreamError",
@@ -332,6 +334,21 @@ class StreamClosed(StreamError):
 
     def __init__(self) -> None:
         message = "Attempted to read or stream content, but the stream has been closed."
+        super().__init__(message)
+
+
+class StreamInUse(StreamError):
+    """
+    Attempted to read or stream response content, while another read is
+    already in progress on the same response.
+    """
+
+    def __init__(self) -> None:
+        message = (
+            "Attempted to read or stream content, but the stream is already "
+            "being read. A single response stream may only have one active "
+            "reader at a time."
+        )
         super().__init__(message)
 
 

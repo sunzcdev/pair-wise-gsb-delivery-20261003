@@ -10,6 +10,8 @@ import urllib.request
 from collections.abc import Mapping
 from http.cookiejar import Cookie, CookieJar
 
+from anyio import Lock
+
 from ._content import ByteStream, UnattachedStream, encode_request, encode_response
 from ._decoders import (
     SUPPORTED_DECODERS,
@@ -28,6 +30,7 @@ from ._exceptions import (
     ResponseNotRead,
     StreamClosed,
     StreamConsumed,
+    StreamInUse,
     request_context,
 )
 from ._multipart import get_multipart_boundary_from_content_type
@@ -543,6 +546,12 @@ class Response:
         self.is_closed = False
         self.is_stream_consumed = False
 
+        # Per-instance lock ensuring that an async response stream never has
+        # more than one active reader, and that closing cannot race an
+        # in-progress read. This is isolated to the response instance, rather
+        # than being shared across the client.
+        self._stream_lock = Lock()
+
         self.default_encoding = default_encoding
 
         if stream is None:
@@ -1040,27 +1049,39 @@ class Response:
         """
         A byte-iterator over the raw response content.
         """
-        if self.is_stream_consumed:
-            raise StreamConsumed()
-        if self.is_closed:
-            raise StreamClosed()
         if not isinstance(self.stream, AsyncByteStream):
             raise RuntimeError("Attempted to call an async iterator on a sync stream.")
 
-        self.is_stream_consumed = True
-        self._num_bytes_downloaded = 0
-        chunker = ByteChunker(chunk_size=chunk_size)
+        # Fail fast if another reader is already streaming, before we touch
+        # the underlying stream for its next chunk. The lock is per-response,
+        # so it never serializes reads across separate responses or the client.
+        if self._stream_lock.locked():
+            raise StreamInUse()
 
-        with request_context(request=self._request):
-            async for raw_stream_bytes in self.stream:
-                self._num_bytes_downloaded += len(raw_stream_bytes)
-                for chunk in chunker.decode(raw_stream_bytes):
-                    yield chunk
+        async with self._stream_lock:
+            # Re-check under the lock: a peer may have acquired it (or closed
+            # the response) after the fast-path probe above.
+            if self.is_stream_consumed:
+                raise StreamConsumed()
+            if self.is_closed:
+                raise StreamClosed()
+            self.is_stream_consumed = True
+            self._num_bytes_downloaded = 0
+            chunker = ByteChunker(chunk_size=chunk_size)
 
-        for chunk in chunker.flush():
-            yield chunk
+            with request_context(request=self._request):
+                async for raw_stream_bytes in self.stream:
+                    self._num_bytes_downloaded += len(raw_stream_bytes)
+                    for chunk in chunker.decode(raw_stream_bytes):
+                        yield chunk
 
-        await self.aclose()
+            for chunk in chunker.flush():
+                yield chunk
+
+            # Release via the unguarded close helper, since we already hold
+            # the lock here. This keeps a single release path shared with
+            # `aclose()`.
+            await self._aclose_stream()
 
     async def aclose(self) -> None:
         """
@@ -1070,6 +1091,19 @@ class Response:
         if not isinstance(self.stream, AsyncByteStream):
             raise RuntimeError("Attempted to call an async close on a sync stream.")
 
+        # Wait for any in-progress read to finish (or be cancelled) before
+        # closing, so a read and a close cannot both release the stream.
+        async with self._stream_lock:
+            await self._aclose_stream()
+
+    async def _aclose_stream(self) -> None:
+        """
+        The single place that actually releases the underlying stream.
+
+        Callers must already hold `self._stream_lock`. The `is_closed` guard
+        guarantees the underlying stream is only ever closed once, regardless
+        of how many reads or closes race for it.
+        """
         if not self.is_closed:
             self.is_closed = True
             with request_context(request=self._request):

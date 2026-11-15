@@ -13,6 +13,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 ### Added
 
 * Expose `FunctionAuth` from the public API. (#3699)
+* Raise `StreamInUse` when an async response is iterated by more than one
+  reader at a time. The check is isolated to each `Response` instance, while
+  already buffered content remains safe to read concurrently.
 
 ## 0.28.1 (6th December, 2024)
 

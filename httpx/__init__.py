@@ -86,6 +86,7 @@ __all__ = [
     "StreamClosed",
     "StreamConsumed",
     "StreamError",
+    "StreamInUse",
     "SyncByteStream",
     "Timeout",
     "TimeoutException",
