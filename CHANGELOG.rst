@@ -1,6 +1,12 @@
 v4.27.0
 =======
 
+* Add `jsonschema._trace.collect`, which recursively collects a schema into
+  a basic location tree and, optionally, explains each ``$dynamicRef`` by
+  recording its static target, its dynamic-scope candidates and the resource
+  location actually adopted. The walk never invokes a validator or retains
+  an instance, restores the enclosing scope after each reference and keeps
+  sibling fields' resolution state independent.
 * Support for Python 3.10 and 3.11 has been dropped.
 * Improve ``best_match`` for ``anyOf`` / ``oneOf`` errors: the most relevant error is now found within each subschema separately before the deepest of those is picked (#1257, #1300).
   In particular an applicator with a single subschema now produces the same best match as the bare subschema would.
