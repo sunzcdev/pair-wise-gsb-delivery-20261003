@@ -16,7 +16,115 @@ from io import TextIOBase
 from threading import Lock
 
 from sqlparse import keywords, tokens
+from sqlparse.exceptions import SQLParseError
 from sqlparse.utils import consume
+
+
+#: Sentinel used in :class:`LexerConfig` keyword mappings to remove a
+#: keyword inherited from the base vocabulary.
+REMOVE_KEYWORD = object()
+
+
+class LexerConfig:
+    """Independent, immutable lexical configuration.
+
+    A config captures everything the :class:`Lexer` needs to tokenize SQL
+    without touching the process-wide default lexer: an optional custom
+    ``SQL_REGEX`` list and keyword overrides that are layered on top of the
+    built-in vocabulary.
+
+    :param sql_regex: Optional list of ``(regex, token_type)`` pairs as used
+        in :data:`sqlparse.keywords.SQL_REGEX`. When ``None`` the built-in
+        regex list is inherited.
+    :param keywords: Optional mapping of keyword -> token type. A value of
+        :data:`REMOVE_KEYWORD` removes an inherited keyword. Keys are stored
+        normalized to upper case.
+
+    The provided mappings are validated and copied in the constructor, so a
+    :class:`LexerConfig` keeps working even if the caller mutates the
+    dictionaries it was built from. Invalid input raises
+    :class:`~sqlparse.exceptions.SQLParseError` before any SQL is read.
+    """
+
+    __slots__ = ('_sql_regex', '_keywords', '_removed_keywords')
+
+    def __init__(self, sql_regex=None, keywords=None):
+        self._sql_regex = self._validate_sql_regex(sql_regex)
+        self._keywords, self._removed_keywords = self._validate_keywords(
+            keywords)
+
+    @staticmethod
+    def _validate_sql_regex(sql_regex):
+        if sql_regex is None:
+            return None
+        if not isinstance(sql_regex, (list, tuple)):
+            raise SQLParseError(
+                'sql_regex must be a list of (regex, token_type) pairs')
+
+        compiled = []
+        for entry in sql_regex:
+            if not isinstance(entry, (list, tuple)) or len(entry) != 2:
+                raise SQLParseError(
+                    'Each sql_regex entry must be a (regex, token_type) pair')
+            pattern, action = entry
+            if not isinstance(pattern, str):
+                raise SQLParseError('sql_regex patterns must be strings')
+            if not isinstance(action, tokens._TokenType) \
+                    and action is not keywords.PROCESS_AS_KEYWORD:
+                raise SQLParseError(
+                    'sql_regex actions must be a token type or '
+                    'keywords.PROCESS_AS_KEYWORD')
+            try:
+                re.compile(pattern, re.IGNORECASE | re.UNICODE)
+            except re.error as err:
+                raise SQLParseError(
+                    f'Invalid sql_regex pattern {pattern!r}: {err}') from err
+            compiled.append((pattern, action))
+        return compiled
+
+    @staticmethod
+    def _validate_keywords(keyword_map):
+        overrides = {}
+        removed = set()
+        if keyword_map is None:
+            return overrides, removed
+        if not isinstance(keyword_map, dict):
+            raise SQLParseError(
+                'keywords must be a mapping of keyword -> token type')
+
+        for key, value in keyword_map.items():
+            if not isinstance(key, str) or not key:
+                raise SQLParseError(
+                    'keyword names must be non-empty strings')
+            name = key.upper()
+            if value is REMOVE_KEYWORD:
+                removed.add(name)
+                overrides.pop(name, None)
+                continue
+            if not isinstance(value, tokens._TokenType):
+                raise SQLParseError(
+                    f'keyword {key!r} must map to a token type or '
+                    'lexer.REMOVE_KEYWORD')
+            overrides[name] = value
+            removed.discard(name)
+        return overrides, removed
+
+    @property
+    def sql_regex(self):
+        """A copy of the configured regex list, or ``None`` for default."""
+        if self._sql_regex is None:
+            return None
+        return list(self._sql_regex)
+
+    @property
+    def keyword_overrides(self):
+        """A copy of the keyword -> token type overrides (upper-cased)."""
+        return dict(self._keywords)
+
+    @property
+    def removed_keywords(self):
+        """A copy of the set of removed inherited keywords."""
+        return set(self._removed_keywords)
 
 
 class Lexer:
@@ -54,20 +162,54 @@ class Lexer:
                 cls._default_instance.default_initialization()
         return cls._default_instance
 
-    def default_initialization(self):
+    @classmethod
+    def from_config(cls, config):
+        """Build an independent lexer from a :class:`LexerConfig`.
+
+        The returned lexer starts from the default vocabulary, then applies
+        the config's keyword additions, removals and regex overrides. It is
+        a separate instance: neither it nor the config affect the default
+        singleton, and multiple configs can be interleaved safely.
+        """
+        if not isinstance(config, LexerConfig):
+            raise SQLParseError(
+                'lexer_config must be a sqlparse.lexer.LexerConfig instance')
+        lex = cls()
+        lex.default_initialization(copy_dicts=True)
+        if config.sql_regex is not None:
+            lex.set_SQL_REGEX(config.sql_regex)
+        overrides = config.keyword_overrides
+        # Keywords are resolved against the dictionaries in insertion order,
+        # so a keyword that already exists in the base vocabulary has to be
+        # removed before the override dictionary is appended.
+        lex.remove_keywords(config.removed_keywords | set(overrides))
+        if overrides:
+            lex.add_keywords(overrides)
+        return lex
+
+    def default_initialization(self, copy_dicts=False):
         """Initialize the lexer with default dictionaries.
-        Useful if you need to revert custom syntax settings."""
+        Useful if you need to revert custom syntax settings.
+
+        When ``copy_dicts`` is true the keyword dictionaries are copied
+        before being loaded, so later removals or overrides cannot mutate
+        the module-level defaults shared with other lexers.
+        """
         self.clear()
         self.set_SQL_REGEX(keywords.SQL_REGEX)
-        self.add_keywords(keywords.KEYWORDS_COMMON)
-        self.add_keywords(keywords.KEYWORDS_ORACLE)
-        self.add_keywords(keywords.KEYWORDS_MYSQL)
-        self.add_keywords(keywords.KEYWORDS_PLPGSQL)
-        self.add_keywords(keywords.KEYWORDS_HQL)
-        self.add_keywords(keywords.KEYWORDS_MSACCESS)
-        self.add_keywords(keywords.KEYWORDS_SNOWFLAKE)
-        self.add_keywords(keywords.KEYWORDS_BIGQUERY)
-        self.add_keywords(keywords.KEYWORDS)
+        default_dicts = (
+            keywords.KEYWORDS_COMMON,
+            keywords.KEYWORDS_ORACLE,
+            keywords.KEYWORDS_MYSQL,
+            keywords.KEYWORDS_PLPGSQL,
+            keywords.KEYWORDS_HQL,
+            keywords.KEYWORDS_MSACCESS,
+            keywords.KEYWORDS_SNOWFLAKE,
+            keywords.KEYWORDS_BIGQUERY,
+            keywords.KEYWORDS,
+        )
+        for kwdict in default_dicts:
+            self.add_keywords(dict(kwdict) if copy_dicts else kwdict)
 
     def clear(self):
         """Clear all syntax configurations.
@@ -89,6 +231,17 @@ class Lexer:
         """Add keyword dictionaries. Keywords are looked up in the same order
         that dictionaries were added."""
         self._keywords.append(keywords)
+
+    def remove_keywords(self, keyword_names):
+        """Remove keywords by name from every loaded keyword dictionary.
+
+        Names are matched case-insensitively. Unknown names are ignored, so
+        a config can remove a keyword that a dialect does not define.
+        """
+        names = {name.upper() for name in keyword_names}
+        for kwdict in self._keywords:
+            for name in names:
+                kwdict.pop(name, None)
 
     def is_keyword(self, value):
         """Checks for a keyword.
@@ -165,10 +318,26 @@ class Lexer:
                 yield tokens.Error, char
 
 
-def tokenize(sql, encoding=None):
+def _resolve_lexer(lexer_config):
+    """Return the lexer to use for a call.
+
+    ``None`` selects the process-wide default singleton. An explicit
+    :class:`LexerConfig` builds a dedicated lexer; anything else is rejected
+    rather than silently falling back to the default lexer.
+    """
+    if lexer_config is None:
+        return Lexer.get_default_instance()
+    return Lexer.from_config(lexer_config)
+
+
+def tokenize(sql, encoding=None, lexer_config=None):
     """Tokenize sql.
 
     Tokenize *sql* using the :class:`Lexer` and return a 2-tuple stream
     of ``(token type, value)`` items.
+
+    :param lexer_config: Optional :class:`LexerConfig`. When given, an
+        independent lexer built from that config is used instead of the
+        process-wide default singleton.
     """
-    return Lexer.get_default_instance().get_tokens(sql, encoding)
+    return _resolve_lexer(lexer_config).get_tokens(sql, encoding)

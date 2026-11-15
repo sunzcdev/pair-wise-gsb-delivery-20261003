@@ -84,3 +84,54 @@ a keyword to the lexer:
 
     # no configuration is passed here. The lexer is used as a singleton.
     sqlparse.parse("select * from foo zorder by bar;")
+
+Independent lexical configurations
+-----------------------------------
+
+Reconfiguring the singleton as shown above changes global state, so it cannot
+be used when one process has to review SQL from different sources at the same
+time. A keyword added for one source would suddenly be visible to every other
+source. :class:`~sqlparse.lexer.LexerConfig` provides an independent, immutable
+configuration that can be passed directly to :func:`parse`, :func:`split`,
+:func:`format` and :func:`~sqlparse.lexer.tokenize` through the
+``lexer_config`` argument. Each call then uses a dedicated
+:class:`~sqlparse.lexer.Lexer` and the default singleton is left untouched.
+
+A config inherits the built-in regex list and keyword vocabulary and layers
+customizations on top:
+
+* ``keywords`` maps a keyword (matched case-insensitively) to a token type,
+  overriding an inherited keyword of the same name.
+* Mapping a keyword to :data:`~sqlparse.lexer.REMOVE_KEYWORD` removes an
+  inherited keyword, so it is classified as a regular name instead.
+* ``sql_regex`` optionally replaces the whole regex list with a custom one,
+  for example by copying and editing :data:`sqlparse.keywords.SQL_REGEX`.
+
+The dictionaries passed to a config are validated and copied immediately, so
+later mutation of those dictionaries does not affect the config. Invalid
+arguments raise :class:`~sqlparse.exceptions.SQLParseError` while the config
+is being built, before any SQL is read.
+
+..  code-block:: python
+
+    import sqlparse
+    from sqlparse.lexer import LexerConfig, REMOVE_KEYWORD
+
+    # Source A treats "pivot" as a built-in name.
+    source_a = LexerConfig(keywords={'PIVOT': sqlparse.tokens.Name.Builtin})
+
+    # Source B treats the same word as a keyword and no longer knows "select".
+    source_b = LexerConfig(keywords={
+        'PIVOT': sqlparse.tokens.Keyword,
+        'SELECT': REMOVE_KEYWORD,
+    })
+
+    # The two configs can be interleaved without interfering with each other
+    # or with the default singleton lexer.
+    sqlparse.parse("select * from t pivot (x)", lexer_config=source_a)
+    sqlparse.parse("select * from t pivot (x)", lexer_config=source_b)
+
+Passing anything other than a :class:`~sqlparse.lexer.LexerConfig` (or
+``None``) as ``lexer_config`` raises :class:`~sqlparse.exceptions.SQLParseError`;
+a configured :class:`~sqlparse.engine.FilterStack` never silently falls back to
+the default lexer.
