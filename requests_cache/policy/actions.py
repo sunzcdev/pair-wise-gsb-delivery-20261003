@@ -21,6 +21,12 @@ from . import (
     get_url_expiration,
     utcnow,
 )
+from .range_requests import (
+    get_range_cache_key,
+    if_range_matches,
+    is_cacheable_range_response,
+    parse_range_header,
+)
 from .settings import CacheSettings
 
 if TYPE_CHECKING:
@@ -82,6 +88,11 @@ class CacheActions(RichMixin):
     _validation_headers: Dict[str, str] = field(factory=dict, repr=False)
     _vary_matched: bool = field(default=True, repr=False)
 
+    # Range request handling
+    _range_request: bool = field(default=False, repr=False)
+    _full_cache_key: Optional[str] = field(default=None, repr=False)
+    _reject_range: bool = field(default=False, repr=False)
+
     # Get session-level setting for stale_if_error and stale_while_revalidate, kept separate
     # from the above so a non-matching Vary variant's headers don't affect a later matching one
     _base_stale_if_error: Union[bool, ExpirationTime] = field(default=None, repr=False)
@@ -134,13 +145,32 @@ class CacheActions(RichMixin):
             'disabled by headers or refresh': kinda_no_cache,
             'disabled by expiration': actual_no_cache,
         }
+
+        # Range requests are handled separately from full-entity requests so that a 206 (Partial
+        # Content) response is never stored under or served from a full-entity cache key
+        range_header = (request.headers or {}).get('Range')
+        range_cache_key = None
+        reject_range = False
+        if range_header:
+            byte_ranges = parse_range_header(range_header)
+            single_range = byte_ranges is not None and len(byte_ranges) == 1
+            if settings.range_policy == 'cache' and single_range:
+                range_cache_key = get_range_cache_key(cache_key, byte_ranges[0])
+            else:
+                # 'isolate' policy, or a multi-range/invalid range request: don't read from the
+                # cache, and never cache a 206 response
+                read_criteria['range request'] = True
+                reject_range = True
         _log_cache_criteria('read', read_criteria)
 
         actions = cls(
-            cache_key=cache_key,
+            cache_key=range_cache_key or cache_key,
             directives=directives,
             expire_after=expire_after,
             only_if_cached=only_if_cached,
+            range_request=bool(range_header),
+            full_cache_key=cache_key if range_cache_key else None,
+            reject_range=reject_range,
             refresh=refresh,
             request=request,
             settings=settings,
@@ -209,6 +239,14 @@ class CacheActions(RichMixin):
         if cached_response is not None and self._settings.cache_control:
             self._update_from_cached_response_headers(cached_response)
 
+        # A cached partial response may only be reused if the request's If-Range validator (if
+        # any) matches the cached entry's entity validator
+        if cached_response is not None and self._range_request:
+            if_range = self._request.headers.get('If-Range')
+            if if_range and not if_range_matches(if_range, cached_response.headers):
+                logger.debug('If-Range does not match cached range response; treating as a miss')
+                cached_response = None
+
         usable_response = self.is_usable(cached_response)
         usable_if_error = self.is_usable(cached_response, error=True)
 
@@ -247,6 +285,8 @@ class CacheActions(RichMixin):
         if self._settings.cache_control:
             self._update_from_response_headers(directives)
 
+        cacheable_range = self._update_range_actions(response)
+
         # If "expired" but there's a validator, save it to the cache and revalidate on use
         skip_stale = self.expire_after == EXPIRE_IMMEDIATELY and not directives.has_validator
         do_not_cache = self.expire_after == DO_NOT_CACHE
@@ -259,14 +299,39 @@ class CacheActions(RichMixin):
         write_criteria = {
             'disabled cache': self._settings.disabled,
             'disabled method': not _is_method_allowed(response.request, self._settings),
-            'disabled status': response.status_code not in self._settings.allowable_codes,
+            'disabled status': response.status_code not in self._settings.allowable_codes
+            and not cacheable_range,
             'disabled by filter': filtered_out,
             'disabled by headers': self.skip_write,
             'disabled by expiration': do_not_cache or skip_stale,
             'disabled by read-only': self._settings.read_only,
+            'rejected range response': response.status_code == 206 and self._reject_range,
         }
         self.skip_write = any(write_criteria.values())
         _log_cache_criteria('write', write_criteria)
+
+    def _update_range_actions(self, response: Response) -> bool:
+        """Apply range caching policy to a new response, and return whether this is a cacheable
+        single-range (206) response.
+
+        * A 206 response is only cached under the range-qualified key if it passes validation
+          (exact single range, known complete length, valid ``Content-Range``, entity validator)
+        * A complete (non-206) response to a range request (e.g., ``If-Range`` didn't match, or
+          the server ignored ``Range``) is cached under the full-entity key
+        """
+        if response.status_code == 206:
+            cacheable = (
+                self._range_request
+                and not self._reject_range
+                and self._settings.range_policy == 'cache'
+                and is_cacheable_range_response(response.request, response)
+            )
+            self._reject_range = not cacheable
+            return cacheable
+        elif self._range_request and self._full_cache_key:
+            self.cache_key = self._full_cache_key
+            self._full_cache_key = None
+        return False
 
     def update_request(self, request: PreparedRequest) -> PreparedRequest:
         """Apply validation headers (if any) before sending a request"""

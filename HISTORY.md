@@ -1,6 +1,15 @@
 # History
 
 ## Unreleased
+* Add `range_policy` setting for `Range` requests and `206 Partial Content` responses:
+  * `'isolate'` (default): range requests bypass the cache, and `206` responses are never cached,
+    so partial content can never be stored under or served from a full-entity cache key
+  * `'cache'`: cache exact single-range `206` responses under a range-qualified key, reusable only
+    for the same byte range with a matching entity validator (`ETag`/`Last-Modified`/`If-Range`)
+  * Multi-range requests, unknown complete lengths (`Content-Range: bytes 0-99/*`), and invalid
+    `Content-Range` headers are never cached; unverified fragments are never spliced together
+  * A full `200` response to a range request (e.g., `If-Range` mismatch) follows full-entity
+    caching rules
 * Fix `ValueError` when a response has an invalid `Expires` date (for example `Expires: garbage`); it is now treated as already expired
 * Fix JSON refresh comparisons for mixed-case `Content-Type` values
 * Keep caller-supplied MongoDB clients open when closing MongoDB or GridFS caches

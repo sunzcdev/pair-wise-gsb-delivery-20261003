@@ -57,6 +57,7 @@ class CacheMixin(MIXIN_BASE):
         match_headers: Union[Iterable[str], bool] = False,
         filter_fn: Optional[FilterCallback] = None,
         key_fn: Optional[KeyCallback] = None,
+        range_policy: str = 'isolate',
         read_only: bool = False,
         stale_if_error: Union[bool, int] = False,
         autoclose: bool = True,
@@ -75,6 +76,7 @@ class CacheMixin(MIXIN_BASE):
             match_headers=match_headers,
             filter_fn=filter_fn,
             key_fn=key_fn,
+            range_policy=range_policy,
             read_only=read_only,
             stale_if_error=stale_if_error,
             autoclose=autoclose,
@@ -226,7 +228,9 @@ class CacheMixin(MIXIN_BASE):
 
         # Secondary Vary lookup: if the primary entry didn't match on Vary,
         # try a Vary-qualified key before going to the origin server.
-        if actions.vary_cache_key:
+        # Skipped for range requests: a partial (206) response must only ever be read from and
+        # written to its range-qualified key.
+        if actions.vary_cache_key and not actions._range_request:
             vary_key = actions.vary_cache_key
             vary_cached = self.cache.get_response(vary_key)
             # Use the Vary-qualified key for any future storage (hit or miss)
@@ -406,6 +410,10 @@ class CachedSession(CacheMixin, OriginalSession):
             be a list of headers, or ``True`` to match all.
         ignored_parameters: Request parameters, headers, and/or JSON body params to exclude from both
             request matching and cached request data
+        range_policy: Policy for ``Range`` requests and ``206 Partial Content`` responses:
+            ``'isolate'`` (default) never mixes partial responses with full-entity cache entries;
+            ``'cache'`` also caches exact single-range responses, reusable only for the same byte
+            range with a matching entity validator.
         read_only: Read existing cached responses, but do not write any new responses to the cache
         stale_if_error: Return a stale response if a new request raises an exception. Optionally
             accepts a time value representing maximum staleness to accept.

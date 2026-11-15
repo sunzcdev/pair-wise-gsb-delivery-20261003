@@ -1,6 +1,6 @@
 from typing import Dict, Iterable, Optional, Union
 
-from attrs import define, field
+from attrs import define, field, validators
 
 from .._utils import get_valid_kwargs
 from ..models import RichMixin
@@ -22,6 +22,9 @@ AUTH_HEADERS = (
 )
 AUTH_PARAMS = ('access_token', 'api_key', 'apikey')
 DEFAULT_IGNORED_PARAMS = AUTH_HEADERS + AUTH_PARAMS
+
+# Policies for handling Range requests and 206 (Partial Content) responses
+RANGE_POLICIES = ('isolate', 'cache')
 
 
 @define(repr=False)
@@ -45,6 +48,7 @@ class CacheSettings(RichMixin):
     key_fn: KeyCallback = field(default=None)
     match_headers: Union[Iterable[str], bool] = field(default=False)
     only_if_cached: bool = field(default=False)
+    range_policy: str = field(default='isolate', validator=validators.in_(RANGE_POLICIES))
     read_only: bool = field(default=False)
     stale_if_error: Union[bool, ExpirationTime] = field(default=False)
     stale_while_revalidate: Union[bool, ExpirationTime] = field(default=False)

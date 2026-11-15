@@ -84,6 +84,27 @@ isn't available:
 If you want to match _all_ request headers, you can use `match_headers=True`.
 
 
+(range-requests)=
+## Range Requests
+Requests with a `Range` header (resulting in `206 Partial Content` responses) are handled
+separately from full-entity requests, so a partial response is never stored under or served from
+the same cache key as a complete (`200`) response. This is controlled by the `range_policy`
+option:
+
+* `range_policy='isolate'` (default): Range requests bypass the cache, and `206` responses are
+  not cached.
+* `range_policy='cache'`: Exact single-range `206` responses are cached under a range-qualified
+  key. A cached partial response is only reused for a request with the exact same byte range, and
+  only if it has an entity validator (`ETag` or `Last-Modified`) that matches the request's
+  `If-Range` header, if one is sent.
+
+```{note}
+Multi-range requests, responses with an unknown complete length
+(`Content-Range: bytes 0-99/*`), and invalid `Content-Range` headers are never cached, and
+unverified fragments are never spliced together. A full `200` response to a range request (for
+example, when `If-Range` doesn't match) follows normal full-entity caching rules.
+```
+
 (custom-matching)=
 ## Custom Request Matching
 If you need more advanced behavior, you can implement your own custom request matching.
