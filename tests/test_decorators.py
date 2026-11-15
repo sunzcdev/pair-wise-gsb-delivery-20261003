@@ -15,6 +15,7 @@ from marshmallow import (
     validates,
     validates_schema,
 )
+from marshmallow.schema import ValidatorDiagnostic
 from tests.base import predicate
 
 
@@ -720,6 +721,229 @@ class TestValidatesSchemaDecorator:
                 "from validates_schema dict",
             ]
         }
+
+
+class TestValidatesSchemaDependencies:
+    def test_runs_when_all_dependencies_present(self):
+        class MySchema(Schema):
+            a = fields.Int()
+            b = fields.Int()
+
+            @validates_schema(requires=("a", "b"))
+            def validate_ab(self, data, **kwargs):
+                if data["a"] > data["b"]:
+                    raise ValidationError("a must not exceed b")
+
+        schema = MySchema(only=("a", "b"))
+        assert schema.validate({"a": 1, "b": 2}) == {}
+        assert schema.validator_diagnostics == []
+        errors = schema.validate({"a": 3, "b": 2})
+        assert errors["_schema"] == ["a must not exceed b"]
+        assert schema.validator_diagnostics == []
+
+    @pytest.mark.parametrize("projection", [{"only": ("a",)}, {"exclude": ("b",)}])
+    def test_missing_dependency_reports_error_by_default(self, projection):
+        class MySchema(Schema):
+            a = fields.Int()
+            b = fields.Int()
+
+            @validates_schema(requires=("a", "b"))
+            def validate_ab(self, data, **kwargs):
+                raise ValidationError("should not run")
+
+        schema = MySchema(**projection)
+        errors = schema.validate({"a": 1})
+        assert errors["_schema"] == [
+            "Schema-level validator 'validate_ab' was not run: "
+            "missing required fields: 'b'."
+        ]
+        assert schema.validator_diagnostics == [
+            ValidatorDiagnostic(
+                validator="validate_ab",
+                reason="missing_dependencies",
+                missing_fields=("b",),
+            )
+        ]
+
+    def test_missing_dependency_with_skip_policy(self):
+        ran = False
+
+        class MySchema(Schema):
+            a = fields.Int()
+            b = fields.Int()
+
+            @validates_schema(requires=("b",), on_missing_dependencies="skip")
+            def validate_b(self, data, **kwargs):
+                nonlocal ran
+                ran = True
+
+        schema = MySchema(exclude=("b",))
+        assert schema.validate({"a": 1}) == {}
+        assert ran is False
+        assert schema.validator_diagnostics == [
+            ValidatorDiagnostic(
+                validator="validate_b",
+                reason="missing_dependencies",
+                missing_fields=("b",),
+            )
+        ]
+
+    def test_missing_dependency_with_run_policy(self):
+        class MySchema(Schema):
+            a = fields.Int()
+            b = fields.Int()
+
+            @validates_schema(requires=("b",), on_missing_dependencies="run")
+            def validate_b(self, data, **kwargs):
+                raise ValidationError("ran anyway")
+
+        schema = MySchema(exclude=("b",))
+        errors = schema.validate({"a": 1})
+        assert errors["_schema"] == ["ran anyway"]
+        assert schema.validator_diagnostics == []
+
+    def test_missing_dependency_with_many(self):
+        class MySchema(Schema):
+            a = fields.Int()
+            b = fields.Int()
+
+            @validates_schema(requires=("b",))
+            def validate_ab(self, data, **kwargs):
+                raise ValidationError("should not run")
+
+        schema = MySchema(exclude=("b",), many=True)
+        errors = schema.validate([{"a": 1}, {"a": 2}])
+        assert errors["_schema"] == [
+            "Schema-level validator 'validate_ab' was not run: "
+            "missing required fields: 'b'."
+        ]
+        assert len(schema.validator_diagnostics) == 1
+
+    def test_data_key_does_not_change_field_identity(self):
+        class MySchema(Schema):
+            a = fields.Int(data_key="A")
+            b = fields.Int()
+
+            @validates_schema(requires=("a",))
+            def validate_a(self, data, **kwargs):
+                if data["a"] < 0:
+                    raise ValidationError("a must be positive")
+
+        schema = MySchema(exclude=("b",))
+        # "a" is still part of the schema, so the validator runs
+        assert schema.validate({"A": 1}) == {}
+        assert schema.validator_diagnostics == []
+        assert schema.validate({"A": -1}) == {"_schema": ["a must be positive"]}
+
+    def test_requires_must_use_declared_field_names(self):
+        class MySchema(Schema):
+            a = fields.Int(data_key="A")
+
+            @validates_schema(requires=("A",))
+            def validate_a(self, data, **kwargs):
+                pass
+
+        with pytest.raises(ValueError, match="undeclared fields"):
+            MySchema()
+
+    def test_requires_unknown_field_raises(self):
+        class MySchema(Schema):
+            a = fields.Int()
+
+            @validates_schema(requires=("nope",))
+            def validate_a(self, data, **kwargs):
+                pass
+
+        with pytest.raises(ValueError, match="undeclared fields"):
+            MySchema()
+
+    def test_invalid_on_missing_dependencies(self):
+        with pytest.raises(ValueError, match="on_missing_dependencies"):
+
+            class MySchema(Schema):
+                a = fields.Int()
+
+                @validates_schema(requires=("a",), on_missing_dependencies="bogus")
+                def validate_a(self, data, **kwargs):
+                    pass
+
+    def test_field_errors_and_missing_dependencies_are_distinct(self):
+        class MySchema(Schema):
+            a = fields.Int()
+            b = fields.Int()
+
+            @validates_schema(requires=("b",), on_missing_dependencies="skip")
+            def validate_dependency(self, data, **kwargs):
+                pass
+
+            @validates_schema
+            def validate_on_field_errors(self, data, **kwargs):
+                pass
+
+        schema = MySchema(exclude=("b",))
+        errors = schema.validate({"a": "not an int"})
+        assert list(errors.keys()) == ["a"]
+        reasons = {d.validator: d.reason for d in schema.validator_diagnostics}
+        assert reasons == {
+            "validate_dependency": "missing_dependencies",
+            "validate_on_field_errors": "field_errors",
+        }
+
+    def test_diagnostics_reset_between_loads(self):
+        class MySchema(Schema):
+            a = fields.Int()
+
+            @validates_schema
+            def validate_a(self, data, **kwargs):
+                pass
+
+        schema = MySchema()
+        schema.validate({"a": "not an int"})
+        assert len(schema.validator_diagnostics) == 1
+        schema.validate({"a": 1})
+        assert schema.validator_diagnostics == []
+
+    def test_nested_dependencies_resolve_at_nested_level(self):
+        class Inner(Schema):
+            x = fields.Int()
+            y = fields.Int()
+
+            @validates_schema(requires=("y",), on_missing_dependencies="skip")
+            def validate_inner(self, data, **kwargs):
+                raise ValidationError("inner should not run")
+
+        class Outer(Schema):
+            inner = fields.Nested(Inner)
+
+        schema = Outer(only=("inner.x",))
+        assert schema.validate({"inner": {"x": 1}}) == {}
+        nested_schema = schema.fields["inner"].schema
+        assert nested_schema.validator_diagnostics == [
+            ValidatorDiagnostic(
+                validator="validate_inner",
+                reason="missing_dependencies",
+                missing_fields=("y",),
+            )
+        ]
+
+    def test_nested_missing_dependency_reports_error(self):
+        class Inner(Schema):
+            x = fields.Int()
+            y = fields.Int()
+
+            @validates_schema(requires=("y",))
+            def validate_inner(self, data, **kwargs):
+                raise ValidationError("inner should not run")
+
+        class Outer(Schema):
+            inner = fields.Nested(Inner)
+
+        schema = Outer(only=("inner.x",))
+        errors = schema.validate({"inner": {"x": 1}})
+        assert errors["inner"]["_schema"] == [
+            "Schema-level validator 'validate_inner' was not run: "
+            "missing required fields: 'y'."
+        ]
 
 
 def test_decorator_error_handling():

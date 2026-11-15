@@ -71,6 +71,8 @@ import functools
 import typing
 from collections import defaultdict
 
+from marshmallow.types import MissingDependenciesOption
+
 PRE_DUMP = "pre_dump"
 POST_DUMP = "post_dump"
 PRE_LOAD = "pre_load"
@@ -100,6 +102,8 @@ def validates_schema(
     pass_collection: bool = False,
     pass_original: bool = False,
     skip_on_field_errors: bool = True,
+    requires: typing.Iterable[str] | None = None,
+    on_missing_dependencies: MissingDependenciesOption = "error",
 ) -> typing.Callable[..., typing.Any]:
     """Register a schema-level validator.
 
@@ -113,6 +117,21 @@ def validates_schema(
     If ``skip_on_field_errors=True``, this validation method will be skipped whenever
     validation errors have been detected when validating fields.
 
+    ``requires`` names the declared fields the validator depends on. Dependencies
+    are declared (canonical) field names; a field's ``data_key`` does not change
+    its identity. After field projection (``only``/``exclude``), the
+    ``on_missing_dependencies`` option controls what happens when one or more
+    dependencies are not part of the schema:
+
+    - ``"error"`` (default): The validator does not run and a schema-level
+      validation error is reported for the missing dependencies.
+    - ``"skip"``: The validator does not run. The skip is recorded in
+      `Schema.validator_diagnostics <marshmallow.Schema.validator_diagnostics>`.
+    - ``"run"``: The validator runs anyway.
+
+    Skipped validators are never counted as validation successes; a diagnostic
+    is recorded explaining why each validator did not run.
+
     .. versionchanged:: 3.0.0b1 ``skip_on_field_errors`` defaults to `True`.
     .. versionchanged:: 3.0.0 ``partial`` and ``many`` are always passed as keyword arguments to
         the decorated method.
@@ -120,13 +139,20 @@ def validates_schema(
     .. versionchanged:: 4.0.0 ``pass_many`` is renamed to ``pass_collection``.
     .. versionchanged:: 4.0.0 ``pass_collection``, ``pass_original``, and ``skip_on_field_errors``
         are keyword-only arguments.
+    .. versionadded:: 4.5.0 ``requires`` and ``on_missing_dependencies`` arguments.
     """
+    if on_missing_dependencies not in ("error", "skip", "run"):
+        raise ValueError(
+            '"on_missing_dependencies" must be one of "error", "skip", or "run".'
+        )
     return set_hook(
         fn,
         VALIDATES_SCHEMA,
         many=pass_collection,
         pass_original=pass_original,
         skip_on_field_errors=skip_on_field_errors,
+        requires=tuple(requires) if requires is not None else (),
+        on_missing_dependencies=on_missing_dependencies,
     )
 
 

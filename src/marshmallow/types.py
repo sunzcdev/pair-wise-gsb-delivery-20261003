@@ -26,6 +26,10 @@ ErrorMessages: typing.TypeAlias = dict[str, ErrorMessageValue]
 #: A valid option for the ``unknown`` schema option and argument
 UnknownOption: typing.TypeAlias = typing.Literal["exclude", "include", "raise"]
 
+#: A valid option for the ``on_missing_dependencies`` argument of
+#: `validates_schema <marshmallow.decorators.validates_schema>`
+MissingDependenciesOption: typing.TypeAlias = typing.Literal["error", "skip", "run"]
+
 #: Type for field-level pre-load functions
 PreLoadCallable = typing.Callable[[typing.Any], typing.Any]
 #: Type for field-level post-load functions

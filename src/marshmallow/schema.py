@@ -199,6 +199,23 @@ class SchemaMeta(ABCMeta):
         return hooks
 
 
+class ValidatorDiagnostic(typing.NamedTuple):
+    """Diagnostic record explaining why a schema-level validator did not run.
+
+    .. versionadded:: 4.5.0
+    """
+
+    #: Name of the validator method that did not run.
+    validator: str
+    #: Why the validator did not run: ``"missing_dependencies"`` if fields
+    #: declared in ``requires`` were projected out of the schema, or
+    #: ``"field_errors"`` if it was skipped because of field-level errors.
+    reason: typing.Literal["missing_dependencies", "field_errors"]
+    #: Declared field names required by the validator that are not part of
+    #: the schema. Empty when ``reason`` is ``"field_errors"``.
+    missing_fields: tuple[str, ...]
+
+
 class SchemaOpts:
     """Defines defaults for `marshmallow.Schema.Meta`."""
 
@@ -440,6 +457,12 @@ class Schema(metaclass=SchemaMeta):
         self.load_fields: dict[str, Field] = {}
         self.dump_fields: dict[str, Field] = {}
         self._init_fields()
+        #: Diagnostics explaining why schema-level validators did not run
+        #: during the most recent `load <marshmallow.Schema.load>` or
+        #: `validate <marshmallow.Schema.validate>` call. A skipped validator
+        #: is never counted as a validation success.
+        self.validator_diagnostics: list[ValidatorDiagnostic] = []
+        self._validate_validator_dependencies()
         messages = {}
         messages.update(self._default_error_messages)
         for cls in reversed(self.__class__.__mro__):
@@ -864,6 +887,7 @@ class Schema(metaclass=SchemaMeta):
         :param postprocess: Whether to run post_load methods.
         :return: Deserialized data
         """
+        self.validator_diagnostics = []
         error_store = ErrorStore()
         errors: dict[str, list[str]] = {}
         many = self.many if many is None else bool(many)
@@ -1052,6 +1076,25 @@ class Schema(metaclass=SchemaMeta):
         self.dump_fields = dump_fields
         self.load_fields = load_fields
 
+    def _validate_validator_dependencies(self) -> None:
+        """Check that fields named in the ``requires`` option of schema-level
+        validators are declared on the schema.
+        This method is private API.
+        """
+        for attr_name, _, validator_kwargs in self._hooks[VALIDATES_SCHEMA]:
+            undeclared = [
+                field_name
+                for field_name in validator_kwargs.get("requires", ())
+                if field_name not in self.declared_fields
+            ]
+            if undeclared:
+                raise ValueError(
+                    f"Schema-level validator {attr_name!r} of {self} requires "
+                    f"undeclared fields: {undeclared}. Dependencies must be "
+                    "declared field names; a field's data_key does not change "
+                    "its identity."
+                )
+
     def on_bind_field(self, field_name: str, field_obj: Field) -> None:
         """Hook to modify a field when it is bound to the `Schema <marshmallow.Schema>`.
 
@@ -1187,7 +1230,42 @@ class Schema(metaclass=SchemaMeta):
             if hook_many != pass_collection:
                 continue
             validator = getattr(self, attr_name)
+            # Dependencies are declared (canonical) field names, resolved
+            # against the fields of this schema after only/exclude projection.
+            # A field's data_key does not change its identity.
+            missing_dependencies = tuple(
+                field_name
+                for field_name in validator_kwargs.get("requires", ())
+                if field_name not in self.fields
+            )
+            on_missing = validator_kwargs.get("on_missing_dependencies", "error")
+            if missing_dependencies and on_missing != "run":
+                self.validator_diagnostics.append(
+                    ValidatorDiagnostic(
+                        validator=attr_name,
+                        reason="missing_dependencies",
+                        missing_fields=missing_dependencies,
+                    )
+                )
+                if on_missing == "error":
+                    error_store.store_error(
+                        [
+                            f"Schema-level validator {attr_name!r} was not run: "
+                            "missing required fields: "
+                            + ", ".join(repr(f) for f in missing_dependencies)
+                            + "."
+                        ],
+                        SCHEMA,
+                    )
+                continue
             if field_errors and validator_kwargs["skip_on_field_errors"]:
+                self.validator_diagnostics.append(
+                    ValidatorDiagnostic(
+                        validator=attr_name,
+                        reason="field_errors",
+                        missing_fields=(),
+                    )
+                )
                 continue
             pass_original = validator_kwargs.get("pass_original", False)
 
