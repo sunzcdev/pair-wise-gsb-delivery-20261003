@@ -63,6 +63,9 @@ Recipes
 .. autoclass:: diskcache.BoundedSemaphore
    :members:
 
+.. autoclass:: diskcache.SoftExpiringCache
+   :members:
+
 .. autodecorator:: diskcache.throttle
 
 .. autodecorator:: diskcache.barrier
