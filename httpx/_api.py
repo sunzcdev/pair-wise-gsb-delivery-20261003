@@ -53,6 +53,7 @@ def request(
     follow_redirects: bool = False,
     verify: ssl.SSLContext | str | bool = True,
     trust_env: bool = True,
+    digest: typing.Any = None,
 ) -> Response:
     """
     Sends an HTTP request.
@@ -87,6 +88,9 @@ def request(
     `ssl.SSLContext` to use a custom context.
     * **trust_env** - *(optional)* Enables or disables usage of environment
     variables for configuration.
+    * **digest** - *(optional)* A digest to verify against the response body,
+    as an `(algorithm, expected)` pair or a `httpx.DigestVerification`
+    instance. Verification covers the raw body bytes and only succeeds at EOF.
 
     **Returns:** `Response`
 
@@ -117,6 +121,7 @@ def request(
             headers=headers,
             auth=auth,
             follow_redirects=follow_redirects,
+            digest=digest,
         )
 
 
@@ -138,6 +143,7 @@ def stream(
     follow_redirects: bool = False,
     verify: ssl.SSLContext | str | bool = True,
     trust_env: bool = True,
+    digest: typing.Any = None,
 ) -> typing.Iterator[Response]:
     """
     Alternative to `httpx.request()` that streams the response body
@@ -167,6 +173,7 @@ def stream(
             headers=headers,
             auth=auth,
             follow_redirects=follow_redirects,
+            digest=digest,
         ) as response:
             yield response
 
@@ -183,6 +190,7 @@ def get(
     verify: ssl.SSLContext | str | bool = True,
     timeout: TimeoutTypes = DEFAULT_TIMEOUT_CONFIG,
     trust_env: bool = True,
+    digest: typing.Any = None,
 ) -> Response:
     """
     Sends a `GET` request.
@@ -204,6 +212,7 @@ def get(
         verify=verify,
         timeout=timeout,
         trust_env=trust_env,
+        digest=digest,
     )
 
 
@@ -219,6 +228,7 @@ def options(
     verify: ssl.SSLContext | str | bool = True,
     timeout: TimeoutTypes = DEFAULT_TIMEOUT_CONFIG,
     trust_env: bool = True,
+    digest: typing.Any = None,
 ) -> Response:
     """
     Sends an `OPTIONS` request.
@@ -240,6 +250,7 @@ def options(
         verify=verify,
         timeout=timeout,
         trust_env=trust_env,
+        digest=digest,
     )
 
 
@@ -255,6 +266,7 @@ def head(
     verify: ssl.SSLContext | str | bool = True,
     timeout: TimeoutTypes = DEFAULT_TIMEOUT_CONFIG,
     trust_env: bool = True,
+    digest: typing.Any = None,
 ) -> Response:
     """
     Sends a `HEAD` request.
@@ -276,6 +288,7 @@ def head(
         verify=verify,
         timeout=timeout,
         trust_env=trust_env,
+        digest=digest,
     )
 
 
@@ -295,6 +308,7 @@ def post(
     verify: ssl.SSLContext | str | bool = True,
     timeout: TimeoutTypes = DEFAULT_TIMEOUT_CONFIG,
     trust_env: bool = True,
+    digest: typing.Any = None,
 ) -> Response:
     """
     Sends a `POST` request.
@@ -317,6 +331,7 @@ def post(
         verify=verify,
         timeout=timeout,
         trust_env=trust_env,
+        digest=digest,
     )
 
 
@@ -336,6 +351,7 @@ def put(
     verify: ssl.SSLContext | str | bool = True,
     timeout: TimeoutTypes = DEFAULT_TIMEOUT_CONFIG,
     trust_env: bool = True,
+    digest: typing.Any = None,
 ) -> Response:
     """
     Sends a `PUT` request.
@@ -358,6 +374,7 @@ def put(
         verify=verify,
         timeout=timeout,
         trust_env=trust_env,
+        digest=digest,
     )
 
 
@@ -377,6 +394,7 @@ def patch(
     verify: ssl.SSLContext | str | bool = True,
     timeout: TimeoutTypes = DEFAULT_TIMEOUT_CONFIG,
     trust_env: bool = True,
+    digest: typing.Any = None,
 ) -> Response:
     """
     Sends a `PATCH` request.
@@ -399,6 +417,7 @@ def patch(
         verify=verify,
         timeout=timeout,
         trust_env=trust_env,
+        digest=digest,
     )
 
 
@@ -414,6 +433,7 @@ def delete(
     timeout: TimeoutTypes = DEFAULT_TIMEOUT_CONFIG,
     verify: ssl.SSLContext | str | bool = True,
     trust_env: bool = True,
+    digest: typing.Any = None,
 ) -> Response:
     """
     Sends a `DELETE` request.
@@ -435,4 +455,5 @@ def delete(
         verify=verify,
         timeout=timeout,
         trust_env=trust_env,
+        digest=digest,
     )

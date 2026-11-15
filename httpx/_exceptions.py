@@ -20,6 +20,10 @@ Our exception hierarchy:
       - ProxyError
       - UnsupportedProtocol
     + DecodingError
+    + DigestError
+      - DigestMismatch
+      - IncompleteDigest
+      - InvalidDigest
     + TooManyRedirects
   x HTTPStatusError
 * InvalidURL
@@ -45,8 +49,12 @@ __all__ = [
     "ConnectTimeout",
     "CookieConflict",
     "DecodingError",
+    "DigestError",
+    "DigestMismatch",
     "HTTPError",
     "HTTPStatusError",
+    "IncompleteDigest",
+    "InvalidDigest",
     "InvalidURL",
     "LocalProtocolError",
     "NetworkError",
@@ -243,6 +251,57 @@ class RemoteProtocolError(ProtocolError):
 class DecodingError(RequestError):
     """
     Decoding of the response failed, due to a malformed encoding.
+    """
+
+
+class DigestError(RequestError):
+    """
+    Base class for errors raised while checking a response body digest.
+    """
+
+
+class DigestMismatch(DigestError):
+    """
+    The response body was read to EOF, but its digest did not match.
+
+    The bytes delivered before this exception was raised cannot be withdrawn.
+    """
+
+    def __init__(
+        self,
+        *,
+        algorithm: str,
+        expected: bytes,
+        actual: bytes,
+        bytes_read: int | None = None,
+    ) -> None:
+        self.algorithm = algorithm
+        self.expected = expected
+        self.actual = actual
+        self.expected_digest = expected
+        self.actual_digest = actual
+        self.bytes_read = bytes_read
+        message = (
+            f"Digest mismatch for {algorithm}: expected {expected.hex()}, "
+            f"got {actual.hex()}"
+        )
+        if bytes_read is not None:
+            message += f" after {bytes_read} bytes"
+        super().__init__(message)
+
+
+class IncompleteDigest(DigestError):
+    """
+    Digest verification was requested before the response body reached EOF.
+
+    An early close leaves the digest `UNVERIFIED`; it is never treated as a
+    successful check of the bytes that happened to be read.
+    """
+
+
+class InvalidDigest(DigestError, ValueError):
+    """
+    A digest algorithm or expected digest value was malformed or unsupported.
     """
 
 

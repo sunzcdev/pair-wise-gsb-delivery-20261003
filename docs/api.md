@@ -66,15 +66,19 @@
 * `.next_request` - **Optional[Request]**
 * `.cookies` - **Cookies**
 * `.history` - **List[Response]**
+* `.digest_verifier` - **Optional[DigestVerification]**
+* `.digest_status` - **Optional[DigestStatus]**
+* `.is_digest_verified` - **bool**
 * `.elapsed` - **[timedelta](https://docs.python.org/3/library/datetime.html)**
   * The amount of time elapsed between sending the request and calling `close()` on the corresponding response received for that request.
   [total_seconds()](https://docs.python.org/3/library/datetime.html#datetime.timedelta.total_seconds) to correctly get
   the total elapsed seconds.
 * `def .raise_for_status()` - **Response**
 * `def .json()` - **Any**
-* `def .read()` - **bytes**
-* `def .iter_raw([chunk_size])` - **bytes iterator**
-* `def .iter_bytes([chunk_size])` - **bytes iterator**
+* `def .verify_digest(algorithm, expected)` - **DigestVerification**
+* `def .read([digest], [algorithm], [expected])` - **bytes**
+* `def .iter_raw([chunk_size], [digest], [algorithm], [expected])` - **bytes iterator**
+* `def .iter_bytes([chunk_size], [digest], [algorithm], [expected])` - **bytes iterator**
 * `def .iter_text([chunk_size])` - **text iterator**
 * `def .iter_lines()` - **text iterator**
 * `def .close()` - **None**
@@ -86,6 +90,36 @@
 * `def .aiter_lines()` - **async text iterator**
 * `def .aclose()` - **None**
 * `def .anext()` - **Response**
+
+## `DigestVerification`
+
+*Incremental verification of a raw response body.*
+
+* `def __init__(algorithm, expected)`
+* `def .update(data)` - **None**
+* `def .finish()` - **DigestStatus**
+* `def .verify()` - **DigestStatus**
+* `.status` - **DigestStatus**
+* `.algorithm` - **str**
+* `.expected` - **bytes**
+* `.actual` - **bytes**
+* `.bytes_read` - **int**
+* `.is_verified` - **bool**
+* `.is_failed` - **bool**
+* `.is_incomplete` - **bool**
+* `.is_interrupted` - **bool**
+
+## `DigestVerificationStream`
+
+*A sync or async byte-stream wrapper that verifies raw bytes as they are
+delivered.*
+
+* `def __init__(stream, algorithm, expected, [raise_on_mismatch])`
+* `.verifier` - **DigestVerification**
+* `.status` - **DigestStatus**
+* `.verified` - **bool**
+* `def .verify()` - **DigestStatus**
+* `def .close()` / `def .aclose()` - **None**
 
 ## `Request`
 

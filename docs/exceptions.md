@@ -25,6 +25,10 @@ For an overview of how to work with HTTPX exceptions, see [Exceptions (Quickstar
             * ProxyError
             * UnsupportedProtocol
         * DecodingError
+        * DigestError
+            * DigestMismatch
+            * IncompleteDigest
+            * InvalidDigest
         * TooManyRedirects
     * HTTPStatusError
 * InvalidURL
@@ -94,6 +98,18 @@ For an overview of how to work with HTTPX exceptions, see [Exceptions (Quickstar
     :docstring:
 
 ::: httpx.DecodingError
+    :docstring:
+
+::: httpx.DigestError
+    :docstring:
+
+::: httpx.DigestMismatch
+    :docstring:
+
+::: httpx.IncompleteDigest
+    :docstring:
+
+::: httpx.InvalidDigest
     :docstring:
 
 ::: httpx.TooManyRedirects

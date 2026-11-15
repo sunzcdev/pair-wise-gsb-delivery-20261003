@@ -21,9 +21,16 @@ from ._decoders import (
     TextChunker,
     TextDecoder,
 )
+from ._digest import (
+    DigestStatus,
+    DigestVerification,
+    DigestVerificationStream,
+    create_digest_verifier,
+)
 from ._exceptions import (
     CookieConflict,
     HTTPStatusError,
+    InvalidDigest,
     RequestNotRead,
     ResponseNotRead,
     StreamClosed,
@@ -527,6 +534,11 @@ class Response:
         extensions: ResponseExtensions | None = None,
         history: list[Response] | None = None,
         default_encoding: str | typing.Callable[[bytes], str] = "utf-8",
+        digest: typing.Any = None,
+        algorithm: str | None = None,
+        expected: str | bytes | None = None,
+        digest_algorithm: str | None = None,
+        digest_expected: str | bytes | None = None,
     ) -> None:
         self.status_code = status_code
         self.headers = Headers(headers)
@@ -542,6 +554,7 @@ class Response:
 
         self.is_closed = False
         self.is_stream_consumed = False
+        self._digest_verifier: DigestVerification | None = None
 
         self.default_encoding = default_encoding
 
@@ -549,6 +562,13 @@ class Response:
             headers, stream = encode_response(content, text, html, json)
             self._prepare(headers)
             self.stream = stream
+            self._install_digest(
+                digest=digest,
+                algorithm=algorithm,
+                expected=expected,
+                digest_algorithm=digest_algorithm,
+                digest_expected=digest_expected,
+            )
             if isinstance(stream, ByteStream):
                 # Load the response body, except for streaming content.
                 self.read()
@@ -565,7 +585,13 @@ class Response:
             # useful when creating response instances having received a stream
             # from the transport API.
             self.stream = stream
-
+            self._install_digest(
+                digest=digest,
+                algorithm=algorithm,
+                expected=expected,
+                digest_algorithm=digest_algorithm,
+                digest_expected=digest_expected,
+            )
         self._num_bytes_downloaded = 0
 
     def _prepare(self, default_headers: dict[str, str]) -> None:
@@ -574,6 +600,53 @@ class Response:
             if key.lower() == "transfer-encoding" and "content-length" in self.headers:
                 continue
             self.headers.setdefault(key, value)
+
+    def _install_digest(
+        self,
+        *,
+        digest: typing.Any = None,
+        algorithm: str | None = None,
+        expected: str | bytes | None = None,
+        digest_algorithm: str | None = None,
+        digest_expected: str | bytes | None = None,
+    ) -> DigestVerification | None:
+        verifier = create_digest_verifier(
+            digest=digest,
+            algorithm=algorithm,
+            expected=expected,
+            digest_algorithm=digest_algorithm,
+            digest_expected=digest_expected,
+        )
+        if verifier is None:
+            return self._digest_verifier
+
+        if self._digest_verifier is not None:
+            if (
+                self._digest_verifier.algorithm == verifier.algorithm
+                and self._digest_verifier.expected == verifier.expected
+            ):
+                return self._digest_verifier
+            raise InvalidDigest(
+                "Digest verification is already configured with different parameters."
+            )
+
+        if hasattr(self, "_content"):
+            content_encoding = self.headers.get("content-encoding", "")
+            if content_encoding.strip().lower() not in ("", "identity"):
+                raise RuntimeError(
+                    "Cannot verify the raw body digest of a response that has "
+                    "already been read and content-decoded. Configure digest "
+                    "verification before consuming the stream."
+                )
+            self._digest_verifier = verifier
+            verifier.update(self._content)
+            verifier.finish()
+            return verifier
+
+        self._digest_verifier = verifier
+        if not isinstance(self.stream, DigestVerificationStream):
+            self.stream = DigestVerificationStream(self.stream, verifier=verifier)
+        return verifier
 
     @property
     def elapsed(self) -> datetime.timedelta:
@@ -856,6 +929,60 @@ class Response:
     def num_bytes_downloaded(self) -> int:
         return self._num_bytes_downloaded
 
+    @property
+    def digest_verifier(self) -> DigestVerification | None:
+        """
+        The configured digest verifier, or `None` if verification is disabled.
+        """
+        return self._digest_verifier
+
+    @property
+    def digest_status(self) -> DigestStatus | None:
+        """
+        The digest state, or `None` if verification is disabled.
+        """
+        return None if self._digest_verifier is None else self._digest_verifier.status
+
+    @property
+    def is_digest_verified(self) -> bool:
+        return (
+            self._digest_verifier is not None
+            and self._digest_verifier.is_verified
+        )
+
+    @property
+    def digest_verified(self) -> bool:
+        return self.is_digest_verified
+
+    def verify_digest(
+        self,
+        algorithm: str | None = None,
+        expected: str | bytes | None = None,
+        *,
+        digest: typing.Any = None,
+    ) -> DigestVerification:
+        """
+        Configure digest verification before consuming the response stream.
+
+        Verification covers the raw body bytes, before content decoding.
+        """
+        verifier = self._install_digest(
+            digest=digest, algorithm=algorithm, expected=expected
+        )
+        assert verifier is not None
+        return verifier
+
+    def set_digest_verification(
+        self,
+        algorithm: str | None = None,
+        expected: str | bytes | None = None,
+        *,
+        digest: typing.Any = None,
+    ) -> DigestVerification:
+        return self.verify_digest(
+            algorithm=algorithm, expected=expected, digest=digest
+        )
+
     def __repr__(self) -> str:
         return f"<Response [{self.status_code} {self.reason_phrase}]>"
 
@@ -863,29 +990,71 @@ class Response:
         return {
             name: value
             for name, value in self.__dict__.items()
-            if name not in ["extensions", "stream", "is_closed", "_decoder"]
+            if name
+            not in [
+                "extensions",
+                "stream",
+                "is_closed",
+                "_decoder",
+                "_digest_verifier",
+            ]
         }
 
     def __setstate__(self, state: dict[str, typing.Any]) -> None:
         for name, value in state.items():
             setattr(self, name, value)
         self.is_closed = True
+        self._digest_verifier = None
         self.extensions = {}
         self.stream = UnattachedStream()
 
-    def read(self) -> bytes:
+    def read(
+        self,
+        *,
+        digest: typing.Any = None,
+        algorithm: str | None = None,
+        expected: str | bytes | None = None,
+        digest_algorithm: str | None = None,
+        digest_expected: str | bytes | None = None,
+    ) -> bytes:
         """
         Read and return the response content.
         """
+        self._install_digest(
+            digest=digest,
+            algorithm=algorithm,
+            expected=expected,
+            digest_algorithm=digest_algorithm,
+            digest_expected=digest_expected,
+        )
         if not hasattr(self, "_content"):
             self._content = b"".join(self.iter_bytes())
         return self._content
 
-    def iter_bytes(self, chunk_size: int | None = None) -> typing.Iterator[bytes]:
+    def iter_bytes(
+        self,
+        chunk_size: int | None = None,
+        *,
+        digest: typing.Any = None,
+        algorithm: str | None = None,
+        expected: str | bytes | None = None,
+        digest_algorithm: str | None = None,
+        digest_expected: str | bytes | None = None,
+    ) -> typing.Iterator[bytes]:
         """
         A byte-iterator over the decoded response content.
         This allows us to handle gzip, deflate, brotli, and zstd encoded responses.
         """
+        self._install_digest(
+            digest=digest,
+            algorithm=algorithm,
+            expected=expected,
+            digest_algorithm=digest_algorithm,
+            digest_expected=digest_expected,
+        )
+        return self._iter_bytes(chunk_size)
+
+    def _iter_bytes(self, chunk_size: int | None) -> typing.Iterator[bytes]:
         if hasattr(self, "_content"):
             chunk_size = len(self._content) if chunk_size is None else chunk_size
             for i in range(0, len(self._content), max(chunk_size, 1)):
@@ -932,10 +1101,29 @@ class Response:
             for line in decoder.flush():
                 yield line
 
-    def iter_raw(self, chunk_size: int | None = None) -> typing.Iterator[bytes]:
+    def iter_raw(
+        self,
+        chunk_size: int | None = None,
+        *,
+        digest: typing.Any = None,
+        algorithm: str | None = None,
+        expected: str | bytes | None = None,
+        digest_algorithm: str | None = None,
+        digest_expected: str | bytes | None = None,
+    ) -> typing.Iterator[bytes]:
         """
         A byte-iterator over the raw response content.
         """
+        self._install_digest(
+            digest=digest,
+            algorithm=algorithm,
+            expected=expected,
+            digest_algorithm=digest_algorithm,
+            digest_expected=digest_expected,
+        )
+        return self._iter_raw(chunk_size)
+
+    def _iter_raw(self, chunk_size: int | None) -> typing.Iterator[bytes]:
         if self.is_stream_consumed:
             raise StreamConsumed()
         if self.is_closed:
@@ -971,21 +1159,55 @@ class Response:
             with request_context(request=self._request):
                 self.stream.close()
 
-    async def aread(self) -> bytes:
+    async def aread(
+        self,
+        *,
+        digest: typing.Any = None,
+        algorithm: str | None = None,
+        expected: str | bytes | None = None,
+        digest_algorithm: str | None = None,
+        digest_expected: str | bytes | None = None,
+    ) -> bytes:
         """
         Read and return the response content.
         """
+        self._install_digest(
+            digest=digest,
+            algorithm=algorithm,
+            expected=expected,
+            digest_algorithm=digest_algorithm,
+            digest_expected=digest_expected,
+        )
         if not hasattr(self, "_content"):
             self._content = b"".join([part async for part in self.aiter_bytes()])
         return self._content
 
-    async def aiter_bytes(
-        self, chunk_size: int | None = None
+    def aiter_bytes(
+        self,
+        chunk_size: int | None = None,
+        *,
+        digest: typing.Any = None,
+        algorithm: str | None = None,
+        expected: str | bytes | None = None,
+        digest_algorithm: str | None = None,
+        digest_expected: str | bytes | None = None,
     ) -> typing.AsyncIterator[bytes]:
         """
         A byte-iterator over the decoded response content.
         This allows us to handle gzip, deflate, brotli, and zstd encoded responses.
         """
+        self._install_digest(
+            digest=digest,
+            algorithm=algorithm,
+            expected=expected,
+            digest_algorithm=digest_algorithm,
+            digest_expected=digest_expected,
+        )
+        return self._aiter_bytes(chunk_size)
+
+    async def _aiter_bytes(
+        self, chunk_size: int | None
+    ) -> typing.AsyncIterator[bytes]:
         if hasattr(self, "_content"):
             chunk_size = len(self._content) if chunk_size is None else chunk_size
             for i in range(0, len(self._content), max(chunk_size, 1)):
@@ -1034,12 +1256,31 @@ class Response:
             for line in decoder.flush():
                 yield line
 
-    async def aiter_raw(
-        self, chunk_size: int | None = None
+    def aiter_raw(
+        self,
+        chunk_size: int | None = None,
+        *,
+        digest: typing.Any = None,
+        algorithm: str | None = None,
+        expected: str | bytes | None = None,
+        digest_algorithm: str | None = None,
+        digest_expected: str | bytes | None = None,
     ) -> typing.AsyncIterator[bytes]:
         """
         A byte-iterator over the raw response content.
         """
+        self._install_digest(
+            digest=digest,
+            algorithm=algorithm,
+            expected=expected,
+            digest_algorithm=digest_algorithm,
+            digest_expected=digest_expected,
+        )
+        return self._aiter_raw(chunk_size)
+
+    async def _aiter_raw(
+        self, chunk_size: int | None
+    ) -> typing.AsyncIterator[bytes]:
         if self.is_stream_consumed:
             raise StreamConsumed()
         if self.is_closed:

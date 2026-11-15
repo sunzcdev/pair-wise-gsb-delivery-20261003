@@ -784,6 +784,7 @@ class Client(BaseClient):
         follow_redirects: bool | UseClientDefault = USE_CLIENT_DEFAULT,
         timeout: TimeoutTypes | UseClientDefault = USE_CLIENT_DEFAULT,
         extensions: RequestExtensions | None = None,
+        digest: typing.Any = None,
     ) -> Response:
         """
         Build and send a request.
@@ -822,7 +823,12 @@ class Client(BaseClient):
             timeout=timeout,
             extensions=extensions,
         )
-        return self.send(request, auth=auth, follow_redirects=follow_redirects)
+        return self.send(
+            request,
+            auth=auth,
+            follow_redirects=follow_redirects,
+            digest=digest,
+        )
 
     @contextmanager
     def stream(
@@ -841,6 +847,7 @@ class Client(BaseClient):
         follow_redirects: bool | UseClientDefault = USE_CLIENT_DEFAULT,
         timeout: TimeoutTypes | UseClientDefault = USE_CLIENT_DEFAULT,
         extensions: RequestExtensions | None = None,
+        digest: typing.Any = None,
     ) -> typing.Iterator[Response]:
         """
         Alternative to `httpx.request()` that streams the response body
@@ -870,6 +877,7 @@ class Client(BaseClient):
             auth=auth,
             follow_redirects=follow_redirects,
             stream=True,
+            digest=digest,
         )
         try:
             yield response
@@ -883,6 +891,7 @@ class Client(BaseClient):
         stream: bool = False,
         auth: AuthTypes | UseClientDefault | None = USE_CLIENT_DEFAULT,
         follow_redirects: bool | UseClientDefault = USE_CLIENT_DEFAULT,
+        digest: typing.Any = None,
     ) -> Response:
         """
         Send a request.
@@ -918,6 +927,8 @@ class Client(BaseClient):
             history=[],
         )
         try:
+            if digest is not None:
+                response.verify_digest(digest=digest)
             if not stream:
                 response.read()
 
@@ -1044,6 +1055,7 @@ class Client(BaseClient):
         follow_redirects: bool | UseClientDefault = USE_CLIENT_DEFAULT,
         timeout: TimeoutTypes | UseClientDefault = USE_CLIENT_DEFAULT,
         extensions: RequestExtensions | None = None,
+        digest: typing.Any = None,
     ) -> Response:
         """
         Send a `GET` request.
@@ -1060,6 +1072,7 @@ class Client(BaseClient):
             follow_redirects=follow_redirects,
             timeout=timeout,
             extensions=extensions,
+            digest=digest,
         )
 
     def options(
@@ -1073,6 +1086,7 @@ class Client(BaseClient):
         follow_redirects: bool | UseClientDefault = USE_CLIENT_DEFAULT,
         timeout: TimeoutTypes | UseClientDefault = USE_CLIENT_DEFAULT,
         extensions: RequestExtensions | None = None,
+        digest: typing.Any = None,
     ) -> Response:
         """
         Send an `OPTIONS` request.
@@ -1089,6 +1103,7 @@ class Client(BaseClient):
             follow_redirects=follow_redirects,
             timeout=timeout,
             extensions=extensions,
+            digest=digest,
         )
 
     def head(
@@ -1102,6 +1117,7 @@ class Client(BaseClient):
         follow_redirects: bool | UseClientDefault = USE_CLIENT_DEFAULT,
         timeout: TimeoutTypes | UseClientDefault = USE_CLIENT_DEFAULT,
         extensions: RequestExtensions | None = None,
+        digest: typing.Any = None,
     ) -> Response:
         """
         Send a `HEAD` request.
@@ -1118,6 +1134,7 @@ class Client(BaseClient):
             follow_redirects=follow_redirects,
             timeout=timeout,
             extensions=extensions,
+            digest=digest,
         )
 
     def post(
@@ -1135,6 +1152,7 @@ class Client(BaseClient):
         follow_redirects: bool | UseClientDefault = USE_CLIENT_DEFAULT,
         timeout: TimeoutTypes | UseClientDefault = USE_CLIENT_DEFAULT,
         extensions: RequestExtensions | None = None,
+        digest: typing.Any = None,
     ) -> Response:
         """
         Send a `POST` request.
@@ -1155,6 +1173,7 @@ class Client(BaseClient):
             follow_redirects=follow_redirects,
             timeout=timeout,
             extensions=extensions,
+            digest=digest,
         )
 
     def put(
@@ -1172,6 +1191,7 @@ class Client(BaseClient):
         follow_redirects: bool | UseClientDefault = USE_CLIENT_DEFAULT,
         timeout: TimeoutTypes | UseClientDefault = USE_CLIENT_DEFAULT,
         extensions: RequestExtensions | None = None,
+        digest: typing.Any = None,
     ) -> Response:
         """
         Send a `PUT` request.
@@ -1192,6 +1212,7 @@ class Client(BaseClient):
             follow_redirects=follow_redirects,
             timeout=timeout,
             extensions=extensions,
+            digest=digest,
         )
 
     def patch(
@@ -1209,6 +1230,7 @@ class Client(BaseClient):
         follow_redirects: bool | UseClientDefault = USE_CLIENT_DEFAULT,
         timeout: TimeoutTypes | UseClientDefault = USE_CLIENT_DEFAULT,
         extensions: RequestExtensions | None = None,
+        digest: typing.Any = None,
     ) -> Response:
         """
         Send a `PATCH` request.
@@ -1229,6 +1251,7 @@ class Client(BaseClient):
             follow_redirects=follow_redirects,
             timeout=timeout,
             extensions=extensions,
+            digest=digest,
         )
 
     def delete(
@@ -1242,6 +1265,7 @@ class Client(BaseClient):
         follow_redirects: bool | UseClientDefault = USE_CLIENT_DEFAULT,
         timeout: TimeoutTypes | UseClientDefault = USE_CLIENT_DEFAULT,
         extensions: RequestExtensions | None = None,
+        digest: typing.Any = None,
     ) -> Response:
         """
         Send a `DELETE` request.
@@ -1258,6 +1282,7 @@ class Client(BaseClient):
             follow_redirects=follow_redirects,
             timeout=timeout,
             extensions=extensions,
+            digest=digest,
         )
 
     def close(self) -> None:
@@ -1498,6 +1523,7 @@ class AsyncClient(BaseClient):
         follow_redirects: bool | UseClientDefault = USE_CLIENT_DEFAULT,
         timeout: TimeoutTypes | UseClientDefault = USE_CLIENT_DEFAULT,
         extensions: RequestExtensions | None = None,
+        digest: typing.Any = None,
     ) -> Response:
         """
         Build and send a request.
@@ -1537,7 +1563,12 @@ class AsyncClient(BaseClient):
             timeout=timeout,
             extensions=extensions,
         )
-        return await self.send(request, auth=auth, follow_redirects=follow_redirects)
+        return await self.send(
+            request,
+            auth=auth,
+            follow_redirects=follow_redirects,
+            digest=digest,
+        )
 
     @asynccontextmanager
     async def stream(
@@ -1556,6 +1587,7 @@ class AsyncClient(BaseClient):
         follow_redirects: bool | UseClientDefault = USE_CLIENT_DEFAULT,
         timeout: TimeoutTypes | UseClientDefault = USE_CLIENT_DEFAULT,
         extensions: RequestExtensions | None = None,
+        digest: typing.Any = None,
     ) -> typing.AsyncIterator[Response]:
         """
         Alternative to `httpx.request()` that streams the response body
@@ -1585,6 +1617,7 @@ class AsyncClient(BaseClient):
             auth=auth,
             follow_redirects=follow_redirects,
             stream=True,
+            digest=digest,
         )
         try:
             yield response
@@ -1598,6 +1631,7 @@ class AsyncClient(BaseClient):
         stream: bool = False,
         auth: AuthTypes | UseClientDefault | None = USE_CLIENT_DEFAULT,
         follow_redirects: bool | UseClientDefault = USE_CLIENT_DEFAULT,
+        digest: typing.Any = None,
     ) -> Response:
         """
         Send a request.
@@ -1633,6 +1667,8 @@ class AsyncClient(BaseClient):
             history=[],
         )
         try:
+            if digest is not None:
+                response.verify_digest(digest=digest)
             if not stream:
                 await response.aread()
 
@@ -1759,6 +1795,7 @@ class AsyncClient(BaseClient):
         follow_redirects: bool | UseClientDefault = USE_CLIENT_DEFAULT,
         timeout: TimeoutTypes | UseClientDefault = USE_CLIENT_DEFAULT,
         extensions: RequestExtensions | None = None,
+        digest: typing.Any = None,
     ) -> Response:
         """
         Send a `GET` request.
@@ -1775,6 +1812,7 @@ class AsyncClient(BaseClient):
             follow_redirects=follow_redirects,
             timeout=timeout,
             extensions=extensions,
+            digest=digest,
         )
 
     async def options(
@@ -1788,6 +1826,7 @@ class AsyncClient(BaseClient):
         follow_redirects: bool | UseClientDefault = USE_CLIENT_DEFAULT,
         timeout: TimeoutTypes | UseClientDefault = USE_CLIENT_DEFAULT,
         extensions: RequestExtensions | None = None,
+        digest: typing.Any = None,
     ) -> Response:
         """
         Send an `OPTIONS` request.
@@ -1804,6 +1843,7 @@ class AsyncClient(BaseClient):
             follow_redirects=follow_redirects,
             timeout=timeout,
             extensions=extensions,
+            digest=digest,
         )
 
     async def head(
@@ -1817,6 +1857,7 @@ class AsyncClient(BaseClient):
         follow_redirects: bool | UseClientDefault = USE_CLIENT_DEFAULT,
         timeout: TimeoutTypes | UseClientDefault = USE_CLIENT_DEFAULT,
         extensions: RequestExtensions | None = None,
+        digest: typing.Any = None,
     ) -> Response:
         """
         Send a `HEAD` request.
@@ -1833,6 +1874,7 @@ class AsyncClient(BaseClient):
             follow_redirects=follow_redirects,
             timeout=timeout,
             extensions=extensions,
+            digest=digest,
         )
 
     async def post(
@@ -1850,6 +1892,7 @@ class AsyncClient(BaseClient):
         follow_redirects: bool | UseClientDefault = USE_CLIENT_DEFAULT,
         timeout: TimeoutTypes | UseClientDefault = USE_CLIENT_DEFAULT,
         extensions: RequestExtensions | None = None,
+        digest: typing.Any = None,
     ) -> Response:
         """
         Send a `POST` request.
@@ -1870,6 +1913,7 @@ class AsyncClient(BaseClient):
             follow_redirects=follow_redirects,
             timeout=timeout,
             extensions=extensions,
+            digest=digest,
         )
 
     async def put(
@@ -1887,6 +1931,7 @@ class AsyncClient(BaseClient):
         follow_redirects: bool | UseClientDefault = USE_CLIENT_DEFAULT,
         timeout: TimeoutTypes | UseClientDefault = USE_CLIENT_DEFAULT,
         extensions: RequestExtensions | None = None,
+        digest: typing.Any = None,
     ) -> Response:
         """
         Send a `PUT` request.
@@ -1907,6 +1952,7 @@ class AsyncClient(BaseClient):
             follow_redirects=follow_redirects,
             timeout=timeout,
             extensions=extensions,
+            digest=digest,
         )
 
     async def patch(
@@ -1924,6 +1970,7 @@ class AsyncClient(BaseClient):
         follow_redirects: bool | UseClientDefault = USE_CLIENT_DEFAULT,
         timeout: TimeoutTypes | UseClientDefault = USE_CLIENT_DEFAULT,
         extensions: RequestExtensions | None = None,
+        digest: typing.Any = None,
     ) -> Response:
         """
         Send a `PATCH` request.
@@ -1944,6 +1991,7 @@ class AsyncClient(BaseClient):
             follow_redirects=follow_redirects,
             timeout=timeout,
             extensions=extensions,
+            digest=digest,
         )
 
     async def delete(
@@ -1957,6 +2005,7 @@ class AsyncClient(BaseClient):
         follow_redirects: bool | UseClientDefault = USE_CLIENT_DEFAULT,
         timeout: TimeoutTypes | UseClientDefault = USE_CLIENT_DEFAULT,
         extensions: RequestExtensions | None = None,
+        digest: typing.Any = None,
     ) -> Response:
         """
         Send a `DELETE` request.
@@ -1973,6 +2022,7 @@ class AsyncClient(BaseClient):
             follow_redirects=follow_redirects,
             timeout=timeout,
             extensions=extensions,
+            digest=digest,
         )
 
     async def aclose(self) -> None:
