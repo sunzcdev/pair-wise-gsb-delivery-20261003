@@ -59,6 +59,43 @@ functions. For example::
 
     dataset.export('csv', delimiter=' ', quotechar='|')
 
+Explicit null encoding
+----------------------
+
+Plain CSV cannot distinguish a missing value (``None``) from an empty string,
+and the text of any null marker (such as ``"NULL"``) cannot be told apart from
+a cell that genuinely contains that text. Pass the optional ``null_value``
+keyword argument to both export and import to enable an explicit, reversible
+encoding convention::
+
+    dataset.export('csv', null_value='NULL')
+    tablib.import_set(csv_text, format='csv', null_value='NULL')
+
+When ``null_value`` is set:
+
+- A ``None`` cell is written as the marker text, and an imported cell whose
+  text is exactly the marker becomes ``None``.
+- The empty string remains an empty field, on both export and import.
+- A real string that equals the marker, or starts with the escape prefix
+  ``\\``, is prefixed with one extra ``\\`` on export; the prefix is removed
+  again on import so the original text is recovered. For example, the cell
+  ``"NULL"`` is stored as ``"\\NULL"`` and the cell ``"\\NULL"`` as
+  ``"\\\\NULL"``.
+
+The decision is based solely on the cell text, never on whether a field was
+quoted, so the convention keeps its meaning with every :py:func:`csv.writer`
+``quoting`` mode (``QUOTE_MINIMAL``, ``QUOTE_ALL``, ``QUOTE_NONNUMERIC`` and
+``QUOTE_NONE``). Header cells are labels and are never converted: a header
+that happens to equal the marker stays a plain string.
+
+The same rules are applied to byte and text input: byte strings and binary
+streams are decoded as UTF-8 before parsing.
+
+When ``null_value`` is omitted (or ``None``), null encoding is disabled and
+CSV behaves exactly like the standard :mod:`csv` module: ``None`` and the
+empty string both become empty fields on export, and every field is imported
+as text.
+
 .. admonition:: Line endings
 
      Exporting uses \\r\\n line endings by default so, make sure to include

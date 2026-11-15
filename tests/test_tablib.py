@@ -8,6 +8,7 @@ import pickle
 import re
 import tempfile
 import unittest
+from csv import QUOTE_ALL, QUOTE_MINIMAL, QUOTE_NONE, QUOTE_NONNUMERIC
 from decimal import Decimal
 from io import BytesIO, StringIO
 from pathlib import Path
@@ -1186,6 +1187,170 @@ class CSVTests(BaseTestCase):
 
         d2 = tablib.import_set(_csv, format="csv", **kwargs)
         self.assertEqual(3, len(d2.headers))
+
+    # ------------------------------------------------------------------
+    # Explicit null encoding
+    # ------------------------------------------------------------------
+
+    def test_csv_null_roundtrip_distinguishes_none_empty_marker(self):
+        """None, the empty string and literal marker text all survive."""
+        dataset = tablib.Dataset(headers=['a', 'b', 'c'])
+        dataset.append([None, '', 'NULL'])
+        dataset.append(['NULL', 'x', ''])
+
+        exported = dataset.export('csv', null_value='NULL')
+
+        # None -> bare marker; empty string stays an empty field;
+        # a real cell equal to the marker gets escaped.
+        self.assertEqual(
+            exported,
+            'a,b,c\r\n'
+            'NULL,,\\NULL\r\n'
+            '\\NULL,x,\r\n',
+        )
+
+        restored = tablib.import_set(exported, format='csv', null_value='NULL')
+        self.assertEqual(restored.headers, ['a', 'b', 'c'])
+        self.assertEqual(restored[0], (None, '', 'NULL'))
+        self.assertEqual(restored[1], ('NULL', 'x', ''))
+
+    def test_csv_null_default_behaviour_unchanged(self):
+        """Without null_value, None and empty string both stay empty."""
+        dataset = tablib.Dataset(headers=['a', 'b'])
+        dataset.append([None, ''])
+
+        self.assertEqual(dataset.export('csv'), 'a,b\r\n,\r\n')
+
+        restored = tablib.import_set('a,b\r\n,\r\n', format='csv')
+        self.assertEqual(restored[0], ('', ''))
+        self.assertNotIn(None, restored[0])
+
+    def test_csv_null_marker_is_quoting_independent(self):
+        """Meaning must not depend on whether the field was quoted."""
+        rows = ([None, '', 'NULL', 'plain'], ['\\NULL', '\\x', '\\', None])
+
+        for quoting in (QUOTE_MINIMAL, QUOTE_ALL, QUOTE_NONNUMERIC, QUOTE_NONE):
+            dataset = tablib.Dataset(headers=['a', 'b', 'c', 'd'])
+            dataset.append(rows[0])
+            dataset.append(rows[1])
+
+            exported = dataset.export('csv', null_value='NULL', quoting=quoting)
+            restored = tablib.import_set(
+                exported, format='csv', null_value='NULL', quoting=quoting
+            )
+
+            self.assertEqual(restored.headers, ['a', 'b', 'c', 'd'])
+            self.assertEqual(restored[0], (None, '', 'NULL', 'plain'))
+            self.assertEqual(restored[1], ('\\NULL', '\\x', '\\', None))
+
+    def test_csv_null_escape_prefix_combinations(self):
+        """The marker and escape prefix must not swallow each other."""
+        values = [
+            'NULL',      # marker text -> escaped
+            '\\NULL',    # escaped marker -> double escaped
+            '\\',        # lone prefix -> escaped
+            '\\\\',      # two prefixes -> three on disk, two after decode
+            '\\\\NULL',
+            'NULLx',     # marker as substring is ordinary text
+            'xNULL',
+            '\\NULLx',
+        ]
+        dataset = tablib.Dataset()
+        for value in values:
+            dataset.append([value])
+
+        exported = dataset.export('csv', null_value='NULL')
+        restored = tablib.import_set(
+            exported, format='csv', null_value='NULL', headers=False
+        )
+        self.assertEqual([row[0] for row in restored], values)
+
+        # Exact on-disk encoding of the escape edge cases (one cell per row).
+        self.assertEqual(
+            exported.splitlines(),
+            [
+                '\\NULL',         # 'NULL' (marker text) -> prefixed once
+                '\\\\NULL',       # '\\NULL' -> prefixed again
+                '\\\\',           # '\\' (lone prefix)
+                '\\\\\\',         # '\\\\' -> one more prefix
+                '\\\\\\NULL',     # '\\\\NULL' -> one more prefix
+                'NULLx',          # marker as substring is ordinary text
+                'xNULL',
+                '\\\\NULLx',
+            ],
+        )
+
+    def test_csv_null_headers_are_not_converted(self):
+        """Headers equal to the marker stay plain strings."""
+        dataset = tablib.Dataset(headers=['NULL', 'name'])
+        dataset.append([None, 'NULL'])
+
+        exported = dataset.export('csv', null_value='NULL')
+        self.assertEqual(exported, 'NULL,name\r\nNULL,\\NULL\r\n')
+
+        restored = tablib.import_set(exported, format='csv', null_value='NULL')
+        self.assertEqual(restored.headers, ['NULL', 'name'])
+        self.assertEqual(restored[0], (None, 'NULL'))
+
+    def test_csv_null_bytes_and_text_use_same_rules(self):
+        """Byte and text inputs follow the same character-level rules."""
+        text = 'a,b\r\nNULL,\r\n"\\NULL",x\r\n'
+
+        from_text = tablib.import_set(text, format='csv', null_value='NULL')
+        from_bytes = tablib.import_set(
+            text.encode('utf-8'), format='csv', null_value='NULL'
+        )
+        from_bytes_io = tablib.import_set(
+            BytesIO(text.encode('utf-8')), format='csv', null_value='NULL'
+        )
+
+        for restored in (from_text, from_bytes, from_bytes_io):
+            self.assertEqual(restored[0], (None, ''))
+            self.assertEqual(restored[1], ('NULL', 'x'))
+
+    def test_csv_null_ragged_rows_pad_with_empty_string(self):
+        """Missing trailing cells are empty strings, never null markers."""
+        csv_text = 'a,b,c\nNULL\n'
+        restored = tablib.import_set(csv_text, format='csv', null_value='NULL')
+        self.assertEqual(restored[0], (None, '', ''))
+
+    def test_csv_null_without_headers(self):
+        """The encoding also works when the first row is data."""
+        dataset = tablib.Dataset()
+        dataset.append([None, '', 'NULL'])
+
+        exported = dataset.export('csv', null_value='NULL')
+        restored = tablib.import_set(
+            exported, format='csv', null_value='NULL', headers=False
+        )
+        self.assertIsNone(restored.headers)
+        self.assertEqual(restored[0], (None, '', 'NULL'))
+
+    def test_csv_null_invalid_marker(self):
+        """Only non-empty strings are valid null markers."""
+        dataset = tablib.Dataset()
+        dataset.append([None])
+
+        with self.assertRaises(ValueError):
+            dataset.export('csv', null_value='')
+        with self.assertRaises(ValueError):
+            tablib.import_set('x\n', format='csv', null_value='')
+        with self.assertRaises(ValueError):
+            dataset.export('csv', null_value=0)
+
+    def test_csv_null_custom_marker_and_tsv_inheritance(self):
+        """Any non-empty marker works and TSV inherits the convention."""
+        marker = '-- N/A --'
+        dataset = tablib.Dataset(headers=['a', 'b'])
+        dataset.append([None, marker])
+
+        exported = dataset.export('tsv', null_value=marker)
+        self.assertIn(marker + '\t', exported)
+
+        restored = tablib.import_set(
+            exported, format='tsv', null_value=marker
+        )
+        self.assertEqual(restored[0], (None, marker))
 
 
 class TSVTests(BaseTestCase):
