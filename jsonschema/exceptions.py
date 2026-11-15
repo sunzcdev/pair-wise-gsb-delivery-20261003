@@ -11,7 +11,7 @@ from typing import TYPE_CHECKING, Any, ClassVar
 import re
 import warnings
 
-from attrs import define
+from attrs import define, frozen
 from referencing.exceptions import Unresolvable as _Unresolvable
 
 from jsonschema import _utils
@@ -229,6 +229,55 @@ class SchemaError(_Error):
 
     _word_for_schema_in_error_message = "metaschema"
     _word_for_instance_in_error_message = "schema"
+
+
+@frozen
+class ClosedReferenceError(_Unresolvable):
+    """
+    A reference points at a resource which closed reference mode refused.
+
+    Closed reference mode (see `jsonschema.closed_registry`) resolves
+    references only against resources explicitly provided by the caller,
+    and never retrieves resources from the network or local filesystem.
+
+    This error is *not* a `ValidationError`: it indicates that validation
+    could not complete because a referenced resource is missing, not that
+    the instance is invalid. It is therefore raised immediately rather
+    than being collected (and potentially hidden) by keywords like
+    :kw:`anyOf`.
+
+    Attributes:
+
+        ref (str):
+
+            the reference which could not be resolved, as written in the
+            referring schema
+
+        uri (str):
+
+            the absolute URI of the missing resource, after resolving the
+            reference against the base URI it appeared under
+
+        chain (tuple[str, ...]):
+
+            the chain of references followed to reach the missing
+            resource, ending with ``ref`` itself
+    """
+
+    uri: str
+    chain: tuple[str, ...] = ()
+
+    def __str__(self) -> str:
+        message = (
+            f"{self.ref!r} could not be resolved: {self.uri!r} is not "
+            "registered in the provided registry, and closed reference "
+            "mode never retrieves unregistered resources from the "
+            "network or local filesystem."
+        )
+        if self.chain:
+            chain = " -> ".join(self.chain)
+            message += f"\n\nReference chain: {chain}"
+        return message
 
 
 @define(slots=False)

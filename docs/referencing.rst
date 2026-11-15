@@ -299,6 +299,58 @@ Retrieving resources from a SQLite database or some other network-accessible res
     You wouldn't want a user causing your machine to go off and retrieve giant files off the network by passing it a ``$ref`` to some huge blob, or exploiting similar vulnerabilities in your setup.
 
 
+Closed (Offline) Reference Resolution
+-------------------------------------
+
+In some environments -- e.g. offline validation pipelines -- references must *only* ever be resolved against schemas you have explicitly provided, and never by reaching out to the network or local filesystem.
+
+`jsonschema.closed_registry` creates such a "closed" registry.
+It behaves like any other `referencing.Registry` for resources which were registered with it, but any reference to a resource which was *not* registered immediately raises `jsonschema.exceptions.ClosedReferenceError`, which includes the missing resource's URI along with the chain of references which led to it.
+
+.. testcode::
+
+    from jsonschema import Draft202012Validator, closed_registry
+    from jsonschema.exceptions import ClosedReferenceError
+
+    registry = closed_registry()
+    validator = Draft202012Validator(
+        {"$ref": "https://example.com/not-registered.json"},
+        registry=registry,
+    )
+    try:
+        validator.validate(12)
+    except ClosedReferenceError as error:
+        print(error.uri)
+        print(error.chain)
+
+.. testoutput::
+
+    https://example.com/not-registered.json
+    ('https://example.com/not-registered.json',)
+
+An existing registry can be made closed by passing it to `jsonschema.closed_registry`, which preserves its registered resources while discarding any retrieval behavior it was configured with:
+
+.. testcode::
+
+    from referencing import Registry
+    from referencing.jsonschema import DRAFT202012
+
+    from jsonschema import Draft202012Validator, closed_registry
+
+    registry = closed_registry(Registry().with_resource(
+        "https://example.com/integer.json",
+        DRAFT202012.create_resource({"type": "integer"}),
+    ))
+    validator = Draft202012Validator(
+        {"$ref": "https://example.com/integer.json"},
+        registry=registry,
+    )
+    assert validator.is_valid(12)
+
+`jsonschema.exceptions.ClosedReferenceError` is *not* a `jsonschema.exceptions.ValidationError` -- it signals that validation could not complete, not that the instance is invalid.
+It is therefore raised immediately, and in particular is never swallowed by keywords like :kw:`anyOf` which collect ordinary validation failures from their subschemas.
+
+
 Migrating From ``RefResolver``
 ------------------------------
 

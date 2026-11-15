@@ -16,7 +16,7 @@ import json
 import reprlib
 import warnings
 
-from attrs import define, field, fields
+from attrs import define, evolve, field, fields
 from jsonschema_specifications import REGISTRY as SPECIFICATIONS
 from rpds import HashTrieMap
 import referencing.exceptions
@@ -137,6 +137,58 @@ _REMOTE_WARNING_REGISTRY = SPECIFICATIONS.combine(
 )
 
 
+class _RefusedRetrieval(Exception):
+    """
+    An internal signal that closed reference mode refused to retrieve a URI.
+    """
+
+    def __init__(self, uri: str) -> None:
+        super().__init__(uri)
+        self.uri = uri
+
+
+def _refuse_retrieval(uri: str):
+    raise _RefusedRetrieval(uri)
+
+
+def _refusal_within(error: BaseException):
+    while error is not None:
+        if isinstance(error, _RefusedRetrieval):
+            return error
+        error = error.__cause__
+    return None
+
+
+def closed_registry(registry=None):
+    """
+    Create a registry which resolves references only from what it holds.
+
+    The returned registry is "closed": any reference to a resource which
+    was not explicitly registered will fail immediately with
+    `jsonschema.exceptions.ClosedReferenceError`, rather than attempting
+    to retrieve the resource from the network or local filesystem.
+
+    Arguments:
+
+        registry (referencing.Registry):
+
+            a registry whose resources should be available for reference
+            resolution. Any retrieval behavior it was configured with is
+            discarded. If not provided, an empty registry is used, to
+            which resources can be added via e.g.
+            `referencing.Registry.with_resources`.
+
+    References to unregistered resources are reported with the missing
+    resource's URI and the chain of references which led to it, and are
+    raised as errors rather than being converted into validation
+    failures, so constructs like :kw:`anyOf` cannot mistake them for an
+    invalid instance.
+    """
+    if registry is None:
+        registry = referencing.Registry()
+    return evolve(registry, retrieve=_refuse_retrieval)
+
+
 def create(
     meta_schema: referencing.jsonschema.ObjectSchema,
     validators: (
@@ -248,6 +300,12 @@ def create(
             default=None,
             kw_only=True,
             repr=False,
+        )
+        _ref_chain: tuple[str, ...] = field(
+            default=(),
+            kw_only=True,
+            repr=False,
+            alias="_ref_chain",
         )
 
         def __init_subclass__(cls):
@@ -463,12 +521,24 @@ def create(
 
         def _validate_reference(self, ref, instance):
             if self._ref_resolver is None:
+                chain = self._ref_chain + (ref,)
                 try:
                     resolved = self._resolver.lookup(ref)
                 except referencing.exceptions.Unresolvable as err:
+                    refused = _refusal_within(err)
+                    if refused is not None:
+                        raise exceptions.ClosedReferenceError(
+                            ref=ref,
+                            uri=refused.uri,
+                            chain=chain,
+                        ) from err
                     raise exceptions._WrappedReferencingError(err) from err
 
-                return self.descend(
+                evolved = self.evolve(
+                    _ref_chain=chain,
+                    _resolver=self._resolver,
+                )
+                return evolved.descend(
                     instance,
                     resolved.contents,
                     resolver=resolved.resolver,

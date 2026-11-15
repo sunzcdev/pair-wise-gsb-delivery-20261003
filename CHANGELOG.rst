@@ -1,6 +1,8 @@
 v4.27.0
 =======
 
+* Add ``jsonschema.closed_registry`` for closed (offline) reference resolution: registries created with it resolve references only from explicitly registered resources, never retrieving from the network or local filesystem.
+  References to unregistered resources raise ``jsonschema.exceptions.ClosedReferenceError``, which reports the missing resource's URI and the reference chain which led to it, and which is distinct from ``ValidationError`` so it is not swallowed by keywords like ``anyOf``.
 * Support for Python 3.10 and 3.11 has been dropped.
 * Improve ``best_match`` for ``anyOf`` / ``oneOf`` errors: the most relevant error is now found within each subschema separately before the deepest of those is picked (#1257, #1300).
   In particular an applicator with a single subschema now produces the same best match as the bare subschema would.
