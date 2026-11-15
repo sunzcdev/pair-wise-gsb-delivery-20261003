@@ -411,6 +411,18 @@ class TokenList(Token):
 class Statement(TokenList):
     """Represents a SQL statement."""
 
+    __slots__ = ('grouping_error', 'is_incomplete')
+
+    def __init__(self, tokens=None):
+        super().__init__(tokens)
+        #: Exception captured when grouping this statement failed. ``None``
+        #: means grouping either succeeded or was not requested at all.
+        self.grouping_error = None
+        #: ``True`` for the trailing remainder of the input whose
+        #: statement boundary the lexer could not determine (an unclosed
+        #: quoted literal or multiline comment).
+        self.is_incomplete = False
+
     def get_type(self):
         """Returns the type of a statement.
 

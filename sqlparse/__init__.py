@@ -11,10 +11,24 @@
 from collections.abc import Generator
 from typing import IO, Any
 
-from sqlparse import cli, engine, filters, formatter, sql, tokens
+from sqlparse import cli, engine, filters, formatter, recovery, sql, tokens
+from sqlparse.exceptions import IncompleteInputError, SQLParseError
+from sqlparse.recovery import ParseResult, parse_recovery
 
 __version__ = "0.6.1"
-__all__ = ["cli", "engine", "filters", "formatter", "sql", "tokens"]
+__all__ = [
+    "IncompleteInputError",
+    "ParseResult",
+    "SQLParseError",
+    "cli",
+    "engine",
+    "filters",
+    "formatter",
+    "parse_recovery",
+    "recovery",
+    "sql",
+    "tokens",
+]
 
 
 def parse(

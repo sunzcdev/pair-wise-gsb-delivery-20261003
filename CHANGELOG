@@ -1,3 +1,21 @@
+Development Version
+-------------------
+
+New Features
+
+* Add `sqlparse.parse_recovery()` for reviewing batches of SQL statements.
+  A grouping failure on a single statement no longer hides the statements
+  that follow: every statement is returned in its original order as a
+  `ParseResult` that carries the verbatim source text plus either the
+  grouped `Statement` or the captured exception. Statements the lexer
+  cannot split because the input ends inside an unclosed quoted literal or
+  multiline comment are reported once as incomplete instead of being split
+  again at a semicolon that belongs to the open construct. Failed and
+  incomplete statements never reach the grouping-based formatting filters.
+  Recovery is opt-in; `parse()`, `split()` and `format()` keep their
+  existing non-validating behaviour.
+
+
 Release 0.6.1 (Nov 01, 2026)
 ----------------------------
 

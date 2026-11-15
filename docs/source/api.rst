@@ -12,9 +12,52 @@ The :mod:`sqlparse` module provides the following functions on module-level.
 
 .. autofunction:: sqlparse.parse
 
+.. autofunction:: sqlparse.parse_recovery
+
+.. autoclass:: sqlparse.recovery.ParseResult
+
+.. autoexception:: sqlparse.exceptions.IncompleteInputError
+
 In most cases there's no need to set the `encoding` parameter. If
 `encoding` is not set, sqlparse assumes that the given SQL statement
 is encoded either in utf-8 or latin-1.
+
+
+.. _recovery:
+
+Parsing with Recovery
+---------------------
+
+:func:`~sqlparse.parse` stops with an exception when grouping fails on
+any statement of a batch. When reviewing a whole SQL script this is
+unhelpful: one malformed statement would hide every statement after it.
+
+:func:`~sqlparse.parse_recovery` is an explicit, opt-in alternative. It
+returns one :class:`~sqlparse.recovery.ParseResult` per statement, in
+input order, carrying the verbatim source text plus either the grouped
+statement or a diagnosis::
+
+  >>> import sqlparse
+  >>> results = sqlparse.parse_recovery("SELECT 1; SELECT 'oops")
+  >>> [(result.ok, result.is_incomplete) for result in results]
+  [(True, False), (False, True)]
+
+A statement whose grouping fails is reported with its exception in
+``ParseResult.error`` and its ungrouped statement in
+``ParseResult.statement``, and parsing continues with the next
+statement. Failed statements are never passed to the formatting filters,
+which assume a successfully grouped tree, so their original text is
+preserved.
+
+If the lexer reaches the end of the input inside an unclosed quoted
+literal or block comment, the remaining text has no statement boundary
+the lexer could rely on. It is reported once as a single result with
+``ParseResult.is_incomplete`` set, instead of resuming at a semicolon
+that is actually part of the open construct.
+
+The existing :func:`~sqlparse.parse`, :func:`~sqlparse.split` and
+:func:`~sqlparse.format` functions keep their non-validating behaviour
+and are unaffected by the recovery mode.
 
 
 .. _formatting:

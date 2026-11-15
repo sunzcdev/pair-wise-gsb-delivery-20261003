@@ -16,7 +16,13 @@ from io import TextIOBase
 from threading import Lock
 
 from sqlparse import keywords, tokens
+from sqlparse.exceptions import IncompleteInputError
 from sqlparse.utils import consume
+
+# Characters that open a quoted literal. If such a quote reaches the
+# lexer's error branch, none of the patterns for a closed literal
+# matched, i.e. the literal is never terminated in the remaining input.
+_QUOTE_OPENERS = frozenset("'\"`´")
 
 
 class Lexer:
@@ -103,7 +109,7 @@ class Lexer:
         else:
             return tokens.Name, value
 
-    def get_tokens(self, text, encoding=None):
+    def get_tokens(self, text, encoding=None, raise_on_incomplete=False):
         """
         Return an iterable of (tokentype, value) pairs generated from
         `text`. If `unfiltered` is set to `True`, the filtering mechanism
@@ -115,6 +121,14 @@ class Lexer:
         Split ``text`` into (tokentype, text) pairs.
 
         ``stack`` is the initial stack (default: ``['root']``)
+
+        With *raise_on_incomplete* a delimiter that is never closed
+        (a quoted literal or a multiline comment) raises
+        :class:`~sqlparse.exceptions.IncompleteInputError` instead of
+        falling back to per-character error tokens. In that case no
+        statement boundary can be determined for the remaining input, so
+        the caller must not resume splitting at a later semicolon. The
+        default keeps the historical, non-validating tokenization.
         """
         if isinstance(text, TextIOBase):
             text = text.read()
@@ -148,6 +162,19 @@ class Lexer:
                     yield ttype, text[pos:end]
                     consume(iterable, end - pos - 1)
                     continue
+                # A multiline comment without its closing ``*/`` has no
+                # alternative reading: the rest of the input is still
+                # inside the comment, so no semicolon in it is a
+                # statement boundary. An unmatched dollar-quote delimiter
+                # may still be ordinary text and keeps the historical
+                # tokenization either way.
+                if raise_on_incomplete \
+                        and delimited_spans.openers[pos][2] in tokens.Comment:
+                    raise IncompleteInputError(
+                        "Unclosed multiline comment starting at position "
+                        f"{pos}.",
+                        remainder=text[pos:],
+                    )
 
             for rexmatch, action in self._SQL_REGEX:
                 m = rexmatch(text, pos)
@@ -162,13 +189,29 @@ class Lexer:
                 consume(iterable, m.end() - pos - 1)
                 break
             else:
+                # No rule matched. An opening quote reaching this branch
+                # means that none of the closed-literal patterns matched,
+                # i.e. the literal is never terminated further on. Any
+                # semicolon after it would be inside the literal.
+                if raise_on_incomplete and char in _QUOTE_OPENERS:
+                    raise IncompleteInputError(
+                        "Unclosed quoted literal starting at position "
+                        f"{pos}.",
+                        remainder=text[pos:],
+                    )
                 yield tokens.Error, char
 
 
-def tokenize(sql, encoding=None):
+def tokenize(sql, encoding=None, raise_on_incomplete=False):
     """Tokenize sql.
 
     Tokenize *sql* using the :class:`Lexer` and return a 2-tuple stream
     of ``(token type, value)`` items.
+
+    With *raise_on_incomplete* an unclosed quoted literal or multiline
+    comment raises
+    :class:`~sqlparse.exceptions.IncompleteInputError` instead of
+    emitting error tokens for it.
     """
-    return Lexer.get_default_instance().get_tokens(sql, encoding)
+    return Lexer.get_default_instance().get_tokens(
+        sql, encoding, raise_on_incomplete=raise_on_incomplete)

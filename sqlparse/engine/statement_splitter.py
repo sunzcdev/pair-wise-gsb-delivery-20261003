@@ -7,12 +7,16 @@
 
 from sqlparse import sql
 from sqlparse import tokens as T
+from sqlparse.exceptions import IncompleteInputError
 
 
 class StatementSplitter:
     """Filter that split stream at individual statements"""
 
-    def __init__(self):
+    def __init__(self, recover=False):
+        #: In recovery mode an incomplete input is reported as a
+        #: statement marked incomplete instead of raising.
+        self._recover = recover
         self._reset()
 
     def _reset(self):
@@ -152,45 +156,78 @@ class StatementSplitter:
         """Process the stream"""
         EOS_TTYPE = T.Whitespace, T.Comment.Single
 
-        # Run over all stream tokens
-        for ttype, value in stream:
-            # Yield token if we finished a statement and there's no whitespaces
-            # It will count newline token as a non whitespace. In this context
-            # whitespace ignores newlines.
-            # why don't multi line comments also count?
-            if self.consume_ws and ttype not in EOS_TTYPE:
-                yield sql.Statement(self.tokens)
+        try:
+            # Run over all stream tokens
+            for ttype, value in stream:
+                # Yield token if we finished a statement and there's no
+                # whitespaces. It will count newline token as a non
+                # whitespace. In this context whitespace ignores newlines.
+                # why don't multi line comments also count?
+                if self.consume_ws and ttype not in EOS_TTYPE:
+                    yield sql.Statement(self.tokens)
 
-                # Reset filter and prepare to process next statement
-                self._reset()
+                    # Reset filter and prepare to process next statement
+                    self._reset()
 
-            # Change current split level (increase, decrease or remain equal)
-            self.level += self._change_splitlevel(ttype, value)
+                # Change current split level
+                # (increase, decrease or remain equal)
+                self.level += self._change_splitlevel(ttype, value)
 
-            # Append the token to the current statement
-            self.tokens.append(sql.Token(ttype, value))
+                # Append the token to the current statement
+                self.tokens.append(sql.Token(ttype, value))
 
-            # Check if we get the end of a statement
-            # Issue762: Allow GO (or "GO 2") as statement splitter.
-            # When implementing a language toggle, it's not only to add
-            # keywords it's also to change some rules, like this splitting
-            # rule.
-            # Issue809: Ignore semicolons inside BEGIN...END blocks, but handle
-            # standalone BEGIN; as a transaction statement
-            if ttype is T.Punctuation and value == ';':
-                self._seen_begin = False
-                # Split on semicolon if not inside a BEGIN...END block
-                if self.level <= 0 and 'BEGIN' not in self._block_stack:
+                # Check if we get the end of a statement
+                # Issue762: Allow GO (or "GO 2") as statement splitter.
+                # When implementing a language toggle, it's not only to add
+                # keywords it's also to change some rules, like this splitting
+                # rule.
+                # Issue809: Ignore semicolons inside BEGIN...END blocks, but
+                # handle standalone BEGIN; as a transaction statement
+                if ttype is T.Punctuation and value == ';':
+                    self._seen_begin = False
+                    # Split on semicolon if not inside a BEGIN...END block
+                    if self.level <= 0 and 'BEGIN' not in self._block_stack:
+                        self.consume_ws = True
+                elif ttype is T.Keyword and value.split()[0] == 'GO':
                     self.consume_ws = True
-            elif ttype is T.Keyword and value.split()[0] == 'GO':
-                self.consume_ws = True
-            elif (ttype not in (T.Whitespace, T.Newline, T.Comment.Single,
-                                T.Comment.Multiline)
-                  and not (ttype is T.Keyword and value.upper() == 'BEGIN')):
-                # Reset _seen_begin if we see a non-whitespace, non-comment
-                # token but not for BEGIN itself (which just set the flag)
-                self._seen_begin = False
+                elif (ttype not in (T.Whitespace, T.Newline, T.Comment.Single,
+                                    T.Comment.Multiline)
+                      and not (ttype is T.Keyword and value.upper() == 'BEGIN')):
+                    # Reset _seen_begin if we see a non-whitespace, non-comment
+                    # token but not for BEGIN itself (which just set the flag)
+                    self._seen_begin = False
+        except IncompleteInputError as err:
+            # The lexer reached the end of the input inside an open
+            # literal or comment. Whatever semicolon follows is part of
+            # that construct, so no further boundary can be determined.
+            if not self._recover:
+                raise
+            yield from self._incomplete_tail(err)
+            return
 
         # Yield pending statement (if any)
         if self.tokens and not all(t.is_whitespace for t in self.tokens):
             yield sql.Statement(self.tokens)
+
+    def _incomplete_tail(self, err):
+        """Split off the trailing, incompletely delimited remainder.
+
+        A statement that was already finished (its semicolon was seen,
+        but it is only emitted once the next token arrives) is flushed
+        first. The buffered tokens of the statement that is still open
+        are kept together with the unclosed remainder, so that no new
+        statement starts at a semicolon inside the open construct.
+        """
+        if self.consume_ws:
+            yield sql.Statement(self.tokens)
+            self._reset()
+
+        # The lexer stopped at the opening delimiter, so nothing from the
+        # remainder has been tokenized yet and appending it verbatim
+        # reconstructs the original text.
+        self.tokens.append(sql.Token(T.Error, err.remainder or ''))
+        if self.tokens and not all(t.is_whitespace for t in self.tokens):
+            stmt = sql.Statement(self.tokens)
+            stmt.is_incomplete = True
+            stmt.grouping_error = err
+            yield stmt

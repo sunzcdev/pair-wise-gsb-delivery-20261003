@@ -32,6 +32,15 @@ The following classes represent distinct parts of a SQL statement.
 .. autoclass:: sqlparse.sql.Statement
    :members:
 
+A :class:`~sqlparse.sql.Statement` produced by
+:func:`~sqlparse.parse_recovery` also carries the outcome of grouping:
+``statement.grouping_error`` holds the captured exception when grouping
+failed (``None`` otherwise) and ``statement.is_incomplete`` is ``True``
+for the trailing remainder whose statement boundary the lexer could not
+determine. Statements returned by the regular :func:`~sqlparse.parse`
+always have ``grouping_error`` set to ``None`` and ``is_incomplete`` set
+to ``False``.
+
 .. autoclass:: sqlparse.sql.Comment
    :members:
 
