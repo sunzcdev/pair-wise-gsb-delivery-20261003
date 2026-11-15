@@ -306,3 +306,125 @@ def test_digest_auth_rfc_7616_sha_256(monkeypatch):
     response = httpx.Response(content=b"Hello, world!", status_code=200)
     with pytest.raises(StopIteration):
         flow.send(response)
+
+
+def _digest_challenge(nonce: str = "...", stale: str | None = None) -> dict[str, str]:
+    fields = [
+        'realm="..."',
+        'qop="auth"',
+        f'nonce="{nonce}"',
+        'opaque="..."',
+    ]
+    if stale is not None:
+        fields.append(f"stale={stale}")
+    return {"WWW-Authenticate": "Digest " + ", ".join(fields)}
+
+
+def test_digest_auth_stale_challenge_triggers_one_more_retry():
+    auth = httpx.DigestAuth(username="user", password="pass")
+    request = httpx.Request("GET", "https://www.example.com")
+
+    flow = auth.sync_auth_flow(request)
+    request = next(flow)
+    assert "Authorization" not in request.headers
+
+    # First 401 challenge: an authenticated request is produced.
+    response = httpx.Response(
+        status_code=401, headers=_digest_challenge(nonce="n1"), request=request
+    )
+    first_request = flow.send(response)
+    first_nc = parse_keqv_list(first_request.headers["Authorization"].split(", "))["nc"]
+    assert first_nc == "00000001"
+
+    # A second challenge marked stale=true, reusing the same nonce, is answered
+    # again with an incremented nonce count.
+    stale_response = httpx.Response(
+        status_code=401,
+        headers=_digest_challenge(nonce="n1", stale='"true"'),
+        request=first_request,
+    )
+    second_request = flow.send(stale_response)
+    second_fields = parse_keqv_list(second_request.headers["Authorization"].split(", "))
+    assert second_fields["nc"] == "00000002"
+    assert second_fields["nonce"] == "n1"
+
+    # A final success ends the flow.
+    success = httpx.Response(status_code=200, request=second_request)
+    with pytest.raises(StopIteration):
+        flow.send(success)
+
+
+def test_digest_auth_repeated_challenge_without_stale_stops():
+    auth = httpx.DigestAuth(username="user", password="pass")
+    request = httpx.Request("GET", "https://www.example.com")
+
+    flow = auth.sync_auth_flow(request)
+    next(flow)
+
+    response = httpx.Response(
+        status_code=401, headers=_digest_challenge(nonce="n1"), request=request
+    )
+    flow.send(response)
+
+    # A further 401 without stale=true (e.g. wrong credentials) must not be
+    # answered: the flow terminates and yields the last 401 response.
+    rejected = httpx.Response(
+        status_code=401,
+        headers=_digest_challenge(nonce="n2", stale='"false"'),
+        request=request,
+    )
+    with pytest.raises(StopIteration):
+        flow.send(rejected)
+
+
+def test_digest_auth_endless_stale_challenges_are_bounded():
+    auth = httpx.DigestAuth(username="user", password="pass")
+    request = httpx.Request("GET", "https://www.example.com")
+
+    flow = auth.sync_auth_flow(request)
+    next(flow)
+
+    challenge_count = 0
+    for _ in range(httpx.DigestAuth._MAX_CHALLENGE_ATTEMPTS + 3):
+        response = httpx.Response(
+            status_code=401,
+            headers=_digest_challenge(nonce="n1", stale='"true"'),
+            request=request,
+        )
+        try:
+            request = flow.send(response)
+            challenge_count += 1
+        except StopIteration:
+            break
+
+    # Only the bounded number of challenges are answered, then the flow ends.
+    assert challenge_count == httpx.DigestAuth._MAX_CHALLENGE_ATTEMPTS
+
+
+def test_digest_auth_state_isolated_between_origins():
+    auth = httpx.DigestAuth(username="user", password="pass")
+
+    def establish(host: str, nonce: str) -> None:
+        request = httpx.Request("GET", f"https://{host}/")
+        flow = auth.sync_auth_flow(request)
+        next(flow)
+        response = httpx.Response(
+            status_code=401,
+            headers=_digest_challenge(nonce=nonce),
+            request=request,
+        )
+        authenticated = flow.send(response)
+        assert authenticated.headers["Authorization"].startswith("Digest")
+        flow.close()
+
+    establish("a.example", "nonce-a")
+    establish("b.example", "nonce-b")
+
+    state_a = auth._get_state(httpx.Request("GET", "https://a.example/"))
+    state_b = auth._get_state(httpx.Request("GET", "https://b.example/"))
+    assert state_a is not None and state_b is not None
+    assert state_a is not state_b
+    assert state_a.challenge.nonce == b"nonce-a"
+    assert state_b.challenge.nonce == b"nonce-b"
+    # Each protection space keeps its own nonce count starting at one.
+    assert state_a.nonce_count == state_b.nonce_count == 2

@@ -42,11 +42,14 @@ class DigestApp:
         send_response_after_attempt: int = 1,
         qop: str = "auth",
         regenerate_nonce: bool = True,
+        stale: bool | None = None,
     ) -> None:
         self.algorithm = algorithm
         self.send_response_after_attempt = send_response_after_attempt
         self.qop = qop
         self._regenerate_nonce = regenerate_nonce
+        # When 'stale' is None the challenge header omits the field entirely.
+        self.stale = stale
         self._response_count = 0
 
     def __call__(self, request: httpx.Request) -> httpx.Response:
@@ -70,7 +73,9 @@ class DigestApp:
                 "ee6378f3ee14ebfd2fff54b70a91a7c9390518047f242ab2271380db0e14bda1"
             ),
             "algorithm": self.algorithm,
-            "stale": "FALSE",
+            "stale": (
+                None if self.stale is None else "TRUE" if self.stale else "FALSE"
+            ),
         }
         challenge_str = ", ".join(
             '{}="{}"'.format(key, value)
@@ -770,3 +775,263 @@ def test_sync_auth() -> None:
 
     assert response.status_code == 200
     assert response.json() == {"auth": "sync-auth"}
+
+
+class MultiOriginDigestApp:
+    """
+    Issues Digest challenges scoped to the request origin and records the
+    'nonce' / 'nc' values used by every authenticated request, grouped by
+    origin.
+    """
+
+    def __init__(self) -> None:
+        self.nonces: dict[str, str] = {}
+        self.records: dict[str, list[tuple[str, str]]] = {}
+
+    def __call__(self, request: httpx.Request) -> httpx.Response:
+        origin = f"{request.url.scheme}://{request.url.netloc.decode()}"
+        if origin not in self.nonces:
+            self.nonces[origin] = (
+                f"nonce-of-{request.url.host}-"
+                f"{hashlib.sha256(os.urandom(8)).hexdigest()[:16]}"
+            )
+        self.records.setdefault(origin, [])
+
+        authorization = request.headers.get("Authorization")
+        if authorization is None:
+            return self._challenge(origin)
+
+        fields = dict(
+            parse_keqv_list(authorization.removeprefix("Digest ").split(", "))
+        )
+        self.records[origin].append((fields["nonce"].strip('"'), fields["nc"]))
+        if fields["nonce"].strip('"') != self.nonces[origin]:
+            # The client answered with a nonce that belongs to another service.
+            return self._challenge(origin)
+        return httpx.Response(200, json={"auth": authorization})
+
+    def _challenge(self, origin: str) -> httpx.Response:
+        host = origin.split("://", 1)[1].split(":", 1)[0]
+        header = (
+            f'Digest realm="realm@{host}", qop="auth", '
+            f'nonce="{self.nonces[origin]}", opaque="opaque", algorithm="MD5"'
+        )
+        return httpx.Response(401, headers={"www-authenticate": header})
+
+
+@pytest.mark.anyio
+async def test_digest_auth_state_is_isolated_per_protection_space() -> None:
+    auth = httpx.DigestAuth(username="user", password="password123")
+    app = MultiOriginDigestApp()
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(app)) as client:
+        first = await client.get("https://service-a.example/", auth=auth)
+        second = await client.get("https://service-b.example/", auth=auth)
+        # A second request to the first service must reuse its own challenge.
+        third = await client.get("https://service-a.example/", auth=auth)
+
+    assert first.status_code == 200
+    assert second.status_code == 200
+    assert third.status_code == 200
+
+    # Each origin has its own nonce.
+    nonce_a = app.nonces["https://service-a.example"]
+    nonce_b = app.nonces["https://service-b.example"]
+    assert nonce_a != nonce_b
+
+    # Every request used the nonce issued by the service it was sent to.
+    assert all(
+        nonce == nonce_a for nonce, _ in app.records["https://service-a.example"]
+    )
+    assert all(
+        nonce == nonce_b for nonce, _ in app.records["https://service-b.example"]
+    )
+
+    # Nonce counts are tracked independently, both starting at one.
+    assert [nc for _, nc in app.records["https://service-a.example"]] == [
+        "00000001",
+        "00000002",
+    ]
+    assert [nc for _, nc in app.records["https://service-b.example"]] == ["00000001"]
+
+
+class StaleDigestApp:
+    """
+    Answers with a fixed nonce. The first request is challenged. Subsequent
+    authenticated requests are challenged again with 'stale=true' until
+    'success_after' requests have been seen, after which a 200 is returned.
+    """
+
+    def __init__(self, success_after: int, stale: bool | None = True) -> None:
+        self.success_after = success_after
+        self.stale = stale
+        self.nonce = "ee96edced2a0b43e4869e96ebe27563f369c1205a049d06419bb51d8aeddf3d3"
+        self.authorized_requests = 0
+
+    def __call__(self, request: httpx.Request) -> httpx.Response:
+        if request.headers.get("Authorization"):
+            self.authorized_requests += 1
+        if self.authorized_requests >= self.success_after:
+            return httpx.Response(
+                200, json={"auth": request.headers.get("Authorization")}
+            )
+        stale_field = (
+            ""
+            if self.stale is None
+            else f', stale="{"TRUE" if self.stale else "FALSE"}"'
+        )
+        header = (
+            'Digest realm="httpx@example.org", qop="auth", '
+            f'nonce="{self.nonce}", opaque="opaque", algorithm="MD5"{stale_field}'
+        )
+        return httpx.Response(401, headers={"www-authenticate": header})
+
+
+@pytest.mark.anyio
+async def test_digest_auth_retries_on_stale_challenge() -> None:
+    auth = httpx.DigestAuth(username="user", password="password123")
+    app = StaleDigestApp(success_after=2, stale=True)
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(app)) as client:
+        response = await client.get("https://example.org/", auth=auth)
+
+    assert response.status_code == 200
+    # Initial request, first authenticated retry, second retry after stale.
+    assert len(response.history) == 2
+    assert app.authorized_requests == 2
+
+    # Because the nonce did not change, the nonce count keeps increasing.
+    final_fields = dict(
+        parse_keqv_list(
+            response.request.headers["Authorization"]
+            .removeprefix("Digest ")
+            .split(", ")
+        )
+    )
+    assert final_fields["nonce"] == app.nonce
+    assert final_fields["nc"] == "00000002"
+
+
+@pytest.mark.anyio
+async def test_digest_auth_does_not_retry_without_stale_challenge() -> None:
+    # Repeated 401 without 'stale=true' (e.g. wrong credentials): only the
+    # first challenge is answered, the last 401 is returned to the caller.
+    auth = httpx.DigestAuth(username="user", password="password123")
+    app = StaleDigestApp(success_after=10, stale=False)
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(app)) as client:
+        response = await client.get("https://example.org/", auth=auth)
+
+    assert response.status_code == 401
+    assert len(response.history) == 1
+    assert app.authorized_requests == 1
+
+
+@pytest.mark.anyio
+async def test_digest_auth_bounds_stale_retries() -> None:
+    # A server that keeps answering with stale=true must not make the client
+    # loop forever: the number of authentication round-trips is bounded.
+    auth = httpx.DigestAuth(username="user", password="password123")
+    app = StaleDigestApp(success_after=100, stale=True)
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(app)) as client:
+        response = await client.get("https://example.org/", auth=auth)
+
+    assert response.status_code == 401
+    # One initial request plus at most the bounded number of challenge answers.
+    assert app.authorized_requests == httpx.DigestAuth._MAX_CHALLENGE_ATTEMPTS
+    assert len(response.history) == httpx.DigestAuth._MAX_CHALLENGE_ATTEMPTS
+
+
+class RecordingSyncApp:
+    def __init__(self) -> None:
+        self.nc_values: list[str] = []
+
+    def __call__(self, request: httpx.Request) -> httpx.Response:
+        authorization = request.headers.get("Authorization")
+        if authorization is None:
+            header = (
+                'Digest realm="httpx@example.org", qop="auth", '
+                'nonce="fixed-nonce", opaque="opaque", algorithm="MD5"'
+            )
+            return httpx.Response(401, headers={"www-authenticate": header})
+        fields = dict(
+            parse_keqv_list(authorization.removeprefix("Digest ").split(", "))
+        )
+        self.nc_values.append(fields["nc"])
+        return httpx.Response(200)
+
+
+def test_sync_digest_auth_concurrent_requests_get_distinct_nonce_counts() -> None:
+    auth = httpx.DigestAuth(username="user", password="password123")
+    app = RecordingSyncApp()
+
+    with httpx.Client(transport=httpx.MockTransport(app)) as client:
+        # Prime the shared challenge so every request builds an auth header.
+        assert client.get("https://example.org/", auth=auth).status_code == 200
+
+        barrier = threading.Barrier(8)
+
+        def send() -> None:
+            barrier.wait()
+            client.get("https://example.org/", auth=auth)
+
+        threads = [threading.Thread(target=send) for _ in range(8)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+
+    # The priming request used nc=1; the eight concurrent requests must each
+    # have received their own, strictly increasing nonce count.
+    assert sorted(app.nc_values) == [f"{nc:08x}" for nc in range(1, 10)]
+    assert len(app.nc_values) == len(set(app.nc_values))
+
+
+@pytest.mark.anyio
+async def test_async_digest_auth_concurrent_nonce_counts() -> None:
+    auth = httpx.DigestAuth(username="user", password="password123")
+    app = RecordingSyncApp()
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(app)) as client:
+        assert (await client.get("https://example.org/", auth=auth)).status_code == 200
+
+        async def send() -> None:
+            await client.get("https://example.org/", auth=auth)
+
+        async with anyio.create_task_group() as task_group:
+            for _ in range(8):
+                task_group.start_soon(send)
+
+    assert sorted(app.nc_values) == [f"{nc:08x}" for nc in range(1, 10)]
+    assert len(app.nc_values) == len(set(app.nc_values))
+
+
+@pytest.mark.anyio
+async def test_digest_auth_stale_challenge_does_not_overwrite_other_origin() -> None:
+    auth = httpx.DigestAuth(username="user", password="password123")
+    multi_origin_app = MultiOriginDigestApp()
+    stale_app = StaleDigestApp(success_after=2, stale=True)
+
+    def router(request: httpx.Request) -> httpx.Response:
+        if request.url.host == "stale.example":
+            return stale_app(request)
+        return multi_origin_app(request)
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(router)) as client:
+        # Establish challenge state on two unrelated origins.
+        await client.get("https://service-a.example/", auth=auth)
+        await client.get("https://stale.example/", auth=auth)
+        # A follow-up to service A must still use service A's own nonce/nc.
+        response = await client.get("https://service-a.example/", auth=auth)
+
+    assert response.status_code == 200
+    nonce_a = multi_origin_app.nonces["https://service-a.example"]
+    assert [nc for _, nc in multi_origin_app.records["https://service-a.example"]] == [
+        "00000001",
+        "00000002",
+    ]
+    assert all(
+        nonce == nonce_a
+        for nonce, _ in multi_origin_app.records["https://service-a.example"]
+    )
