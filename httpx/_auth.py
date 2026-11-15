@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import os
 import re
+import threading
 import time
 import typing
 from base64 import b64encode
@@ -10,6 +11,7 @@ from urllib.request import parse_http_list
 
 from ._exceptions import ProtocolError
 from ._models import Cookies, Request, Response
+from ._urls import URL
 from ._utils import to_bytes, to_str, unquote
 
 if typing.TYPE_CHECKING:  # pragma: no cover
@@ -17,6 +19,19 @@ if typing.TYPE_CHECKING:  # pragma: no cover
 
 
 __all__ = ["Auth", "BasicAuth", "DigestAuth", "FunctionAuth", "NetRCAuth"]
+
+
+_DigestAuthOrigin = typing.Tuple[str, str, typing.Optional[int]]
+_DigestAuthProtectionSpace = typing.Tuple[str, str, typing.Optional[int], bytes]
+
+
+class _DigestAuthState:
+    __slots__ = ("challenge", "nonce_count", "path")
+
+    def __init__(self, challenge: _DigestAuthChallenge, path: str) -> None:
+        self.challenge = challenge
+        self.nonce_count = 1
+        self.path = path
 
 
 class Auth:
@@ -183,43 +198,64 @@ class DigestAuth(Auth):
         "SHA-512": hashlib.sha512,
         "SHA-512-SESS": hashlib.sha512,
     }
+    # One authenticated request, plus one retry for a stale challenge.
+    _MAX_AUTH_ATTEMPTS = 2
 
     def __init__(self, username: str | bytes, password: str | bytes) -> None:
         self._username = to_bytes(username)
         self._password = to_bytes(password)
-        self._last_challenge: _DigestAuthChallenge | None = None
-        self._nonce_count = 1
+        self._challenge_states: dict[
+            _DigestAuthProtectionSpace, _DigestAuthState
+        ] = {}
+        self._challenge_lock = threading.Lock()
 
     def auth_flow(self, request: Request) -> typing.Generator[Request, Response, None]:
-        if self._last_challenge:
-            request.headers["Authorization"] = self._build_auth_header(
-                request, self._last_challenge
-            )
+        state = self._get_preemptive_challenge(request)
+        sent_preemptively = state is not None
+        auth_attempts = 0
+        if state is not None:
+            request.headers["Authorization"] = self._build_auth_header(request, state)
+            auth_attempts = 1
 
         response = yield request
 
-        if response.status_code != 401 or "www-authenticate" not in response.headers:
-            # If the response is not a 401 then we don't
-            # need to build an authenticated request.
-            return
+        while True:
+            if (
+                response.status_code != 401
+                or "www-authenticate" not in response.headers
+            ):
+                # If the response is not a 401 then we don't
+                # need to build an authenticated request.
+                return
 
-        for auth_header in response.headers.get_list("www-authenticate"):
-            if auth_header.lower().startswith("digest "):
-                break
-        else:
-            # If the response does not include a 'WWW-Authenticate: Digest ...'
-            # header, then we don't need to build an authenticated request.
-            return
+            for auth_header in response.headers.get_list("www-authenticate"):
+                if auth_header.lower().startswith("digest "):
+                    break
+            else:
+                # If the response does not include a 'WWW-Authenticate: Digest ...'
+                # header, then we don't need to build an authenticated request.
+                return
 
-        self._last_challenge = self._parse_challenge(request, response, auth_header)
-        self._nonce_count = 1
+            challenge = self._parse_challenge(request, response, auth_header)
+            challenge_request = response.request or request
+            state = self._store_challenge(challenge_request, challenge)
 
-        request.headers["Authorization"] = self._build_auth_header(
-            request, self._last_challenge
-        )
-        if response.cookies:
-            Cookies(response.cookies).set_cookie_header(request=request)
-        yield request
+            if auth_attempts >= self._MAX_AUTH_ATTEMPTS:
+                return
+
+            if auth_attempts > 0 and not challenge.stale:
+                # A non-stale challenge after sending credentials means that the
+                # credentials were rejected. The exception is a preemptive
+                # request, where the cached challenge may simply have expired.
+                if not (sent_preemptively and auth_attempts == 1):
+                    return
+
+            request.headers["Authorization"] = self._build_auth_header(request, state)
+            if response.cookies:
+                Cookies(response.cookies).set_cookie_header(request=request)
+            response = yield request
+            auth_attempts += 1
+            sent_preemptively = False
 
     def _parse_challenge(
         self, request: Request, response: Response, auth_header: str
@@ -237,25 +273,42 @@ class DigestAuth(Auth):
         header_dict: dict[str, str] = {}
         for field in parse_http_list(fields):
             key, value = field.strip().split("=", 1)
-            header_dict[key] = unquote(value)
+            header_dict[key.strip().lower()] = unquote(value.strip())
 
         try:
             realm = header_dict["realm"].encode()
             nonce = header_dict["nonce"].encode()
-            algorithm = header_dict.get("algorithm", "MD5")
+            algorithm = header_dict.get("algorithm", "MD5").strip()
             opaque = header_dict["opaque"].encode() if "opaque" in header_dict else None
             qop = header_dict["qop"].encode() if "qop" in header_dict else None
+            stale = header_dict.get("stale", "false").strip().lower() == "true"
+            if algorithm.upper() not in self._ALGORITHM_TO_HASH_FUNCTION:
+                message = f'Unsupported Digest algorithm "{algorithm}"'
+                raise ProtocolError(message, request=request)
             return _DigestAuthChallenge(
-                realm=realm, nonce=nonce, algorithm=algorithm, opaque=opaque, qop=qop
+                realm=realm,
+                nonce=nonce,
+                algorithm=algorithm,
+                opaque=opaque,
+                qop=qop,
+                stale=stale,
             )
-        except KeyError as exc:
+        except (KeyError, IndexError, TypeError, ValueError) as exc:
             message = "Malformed Digest WWW-Authenticate header"
             raise ProtocolError(message, request=request) from exc
 
     def _build_auth_header(
-        self, request: Request, challenge: _DigestAuthChallenge
+        self, request: Request, state: _DigestAuthState
     ) -> str:
-        hash_func = self._ALGORITHM_TO_HASH_FUNCTION[challenge.algorithm.upper()]
+        with self._challenge_lock:
+            challenge = state.challenge
+            nonce_count = state.nonce_count
+            state.nonce_count += 1
+
+        hash_func = self._ALGORITHM_TO_HASH_FUNCTION.get(challenge.algorithm.upper())
+        if hash_func is None:
+            message = f'Unsupported Digest algorithm "{challenge.algorithm}"'
+            raise ProtocolError(message, request=request)
 
         def digest(data: bytes) -> bytes:
             return hash_func(data).hexdigest().encode()
@@ -267,9 +320,8 @@ class DigestAuth(Auth):
         # TODO: implement auth-int
         HA2 = digest(A2)
 
-        nc_value = b"%08x" % self._nonce_count
-        cnonce = self._get_client_nonce(self._nonce_count, challenge.nonce)
-        self._nonce_count += 1
+        nc_value = b"%08x" % nonce_count
+        cnonce = self._get_client_nonce(nonce_count, challenge.nonce)
 
         HA1 = digest(A1)
         if challenge.algorithm.lower().endswith("-sess"):
@@ -299,6 +351,50 @@ class DigestAuth(Auth):
             format_args["cnonce"] = cnonce
 
         return "Digest " + self._get_header_value(format_args)
+
+    def _get_preemptive_challenge(
+        self, request: Request
+    ) -> _DigestAuthState | None:
+        origin = _get_origin(request.url)
+        path = request.url.path
+        with self._challenge_lock:
+            matching_states = [
+                state
+                for protection_space, state in self._challenge_states.items()
+                if protection_space[:3] == origin
+            ]
+
+            if not matching_states:
+                return None
+
+            # Prefer the challenge whose request path most closely encloses this
+            # request. If several realms exist for the same origin then this avoids
+            # arbitrarily using a challenge for a different protected path.
+            best_state = None
+            for state in matching_states:
+                if _path_is_in_scope(path, state.path):
+                    if best_state is None or len(state.path) >= len(best_state.path):
+                        best_state = state
+            return best_state if best_state is not None else matching_states[-1]
+
+    def _store_challenge(
+        self, request: Request, challenge: _DigestAuthChallenge
+    ) -> _DigestAuthState:
+        protection_space = _get_protection_space(request, challenge)
+        with self._challenge_lock:
+            state = self._challenge_states.get(protection_space)
+            if state is None or state.challenge.nonce != challenge.nonce:
+                state = _DigestAuthState(challenge, request.url.path)
+            else:
+                state.challenge = challenge
+                state.path = request.url.path
+
+            # Keep recently used challenges last so that they take priority when
+            # a request could match more than one protection space.
+            self._challenge_states.pop(protection_space, None)
+            self._challenge_states[protection_space] = state
+
+        return state
 
     def _get_client_nonce(self, nonce_count: int, nonce: bytes) -> bytes:
         s = str(nonce_count).encode()
@@ -346,3 +442,20 @@ class _DigestAuthChallenge(typing.NamedTuple):
     algorithm: str
     opaque: bytes | None
     qop: bytes | None
+    stale: bool = False
+
+
+def _get_origin(url: URL) -> _DigestAuthOrigin:
+    return (url.scheme, url.host, url.port)
+
+
+def _get_protection_space(
+    request: Request, challenge: _DigestAuthChallenge
+) -> _DigestAuthProtectionSpace:
+    return (*_get_origin(request.url), challenge.realm)
+
+
+def _path_is_in_scope(path: str, challenge_path: str) -> bool:
+    if path == challenge_path or challenge_path == "/":
+        return True
+    return path.startswith(challenge_path.rstrip("/") + "/")

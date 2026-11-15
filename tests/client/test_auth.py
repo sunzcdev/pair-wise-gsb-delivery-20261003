@@ -84,6 +84,39 @@ class DigestApp:
         return httpx.Response(401, headers=headers)
 
 
+class PerOriginDigestApp:
+    def __call__(self, request: httpx.Request) -> httpx.Response:
+        nonce = f"nonce-{request.url.host}"
+        if f'nonce="{nonce}"' in request.headers.get("Authorization", ""):
+            return httpx.Response(200)
+        challenge = (
+            f'Digest realm="httpx@example.org", qop="auth", '
+            f'nonce="{nonce}", opaque="opaque"'
+        )
+        return httpx.Response(401, headers={"www-authenticate": challenge})
+
+
+class StaleDigestApp:
+    def __init__(self, always_stale: bool = False) -> None:
+        self.always_stale = always_stale
+        self.requests = 0
+
+    def __call__(self, request: httpx.Request) -> httpx.Response:
+        self.requests += 1
+        if self.requests == 1:
+            return self.challenge("nonce-1", stale=False)
+        if self.always_stale or self.requests == 2:
+            return self.challenge(f"nonce-{self.requests}", stale=True)
+        return httpx.Response(200)
+
+    def challenge(self, nonce: str, stale: bool) -> httpx.Response:
+        challenge = (
+            f'Digest realm="httpx@example.org", qop="auth", '
+            f'nonce="{nonce}", stale="{str(stale).lower()}"'
+        )
+        return httpx.Response(401, headers={"www-authenticate": challenge})
+
+
 class RepeatAuth(httpx.Auth):
     """
     A mock authentication scheme that requires clients to send
@@ -551,6 +584,91 @@ async def test_digest_auth_reuses_challenge() -> None:
 
         assert len(response_1.history) == 1
         assert len(response_2.history) == 0
+
+
+def test_digest_auth_challenges_are_isolated_by_origin() -> None:
+    auth = httpx.DigestAuth(username="user", password="password123")
+    app = PerOriginDigestApp()
+
+    with httpx.Client(transport=httpx.MockTransport(app)) as client:
+        response_1 = client.get("https://one.example.org/", auth=auth)
+        response_2 = client.get("https://two.example.org/", auth=auth)
+        response_3 = client.get("https://one.example.org/", auth=auth)
+
+    assert response_1.status_code == 200
+    assert response_2.status_code == 200
+    assert response_3.status_code == 200
+    assert len(response_1.history) == 1
+    assert len(response_2.history) == 1
+    assert len(response_3.history) == 0
+    assert 'nonce="nonce-one.example.org"' in response_3.request.headers[
+        "Authorization"
+    ]
+
+
+def test_digest_auth_concurrent_nonce_counts_are_unique() -> None:
+    auth = httpx.DigestAuth(username="user", password="password123")
+    app = DigestApp()
+    nonce_counts: list[str] = []
+
+    with httpx.Client(transport=httpx.MockTransport(app)) as client:
+        response = client.get("https://example.org/", auth=auth)
+        assert response.status_code == 200
+
+        def send_request() -> None:
+            request = client.build_request("GET", "https://example.org/")
+            flow = auth.sync_auth_flow(request)
+            request = next(flow)
+            nonce_counts.append(
+                parse_keqv_list(request.headers["Authorization"].split(", "))["nc"]
+            )
+            flow.close()
+
+        threads = [threading.Thread(target=send_request) for _ in range(10)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+
+    assert len(set(nonce_counts)) == len(nonce_counts)
+    assert sorted(int(nc, 16) for nc in nonce_counts) == list(range(2, 12))
+
+
+@pytest.mark.anyio
+async def test_digest_auth_retries_stale_challenge() -> None:
+    auth = httpx.DigestAuth(username="user", password="password123")
+    app = StaleDigestApp()
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(app)) as client:
+        response = await client.get("https://example.org/", auth=auth)
+
+    assert response.status_code == 200
+    assert len(response.history) == 2
+    assert 'nonce="nonce-2"' in response.request.headers["Authorization"]
+    assert "nc=00000001" in response.request.headers["Authorization"]
+
+
+@pytest.mark.anyio
+async def test_digest_auth_stale_retries_are_bounded() -> None:
+    auth = httpx.DigestAuth(username="user", password="password123")
+    app = StaleDigestApp(always_stale=True)
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(app)) as client:
+        response = await client.get("https://example.org/", auth=auth)
+
+    assert response.status_code == 401
+    assert app.requests == auth._MAX_AUTH_ATTEMPTS + 1
+
+
+@pytest.mark.anyio
+async def test_digest_auth_unsupported_algorithm_raises_protocol_error() -> None:
+    url = "https://example.org/"
+    auth = httpx.DigestAuth(username="user", password="password123")
+    app = DigestApp(algorithm="unsupported")
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(app)) as client:
+        with pytest.raises(httpx.ProtocolError):
+            await client.get(url, auth=auth)
 
 
 @pytest.mark.anyio
