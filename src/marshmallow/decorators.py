@@ -60,9 +60,12 @@ Example: ::
     methods are not supported.
 
 .. warning::
-    The invocation order of decorated methods of the same type is not guaranteed.
-    If you need to guarantee order of different processing steps, you should put
-    them in the same processing method.
+    The invocation order of decorated methods of the same type is determined by
+    the order in which they are declared. Use the ``before`` and ``after``
+    keyword arguments to declare explicit ordering dependencies between hooks
+    of the same type. A dependency that references a hook of another type (or a
+    hook that does not exist), as well as a dependency cycle, raises an error
+    when the `Schema <marshmallow.Schema>` class is created.
 """
 
 from __future__ import annotations
@@ -70,6 +73,7 @@ from __future__ import annotations
 import functools
 import typing
 from collections import defaultdict
+from collections.abc import Sequence
 
 PRE_DUMP = "pre_dump"
 POST_DUMP = "post_dump"
@@ -77,6 +81,9 @@ PRE_LOAD = "pre_load"
 POST_LOAD = "post_load"
 VALIDATES = "validates"
 VALIDATES_SCHEMA = "validates_schema"
+
+# A single hook name or an ordered collection of hook names.
+HookDependency = str | Sequence[str]
 
 
 class MarshmallowHook:
@@ -100,6 +107,8 @@ def validates_schema(
     pass_collection: bool = False,
     pass_original: bool = False,
     skip_on_field_errors: bool = True,
+    before: HookDependency | None = None,
+    after: HookDependency | None = None,
 ) -> typing.Callable[..., typing.Any]:
     """Register a schema-level validator.
 
@@ -120,6 +129,8 @@ def validates_schema(
     .. versionchanged:: 4.0.0 ``pass_many`` is renamed to ``pass_collection``.
     .. versionchanged:: 4.0.0 ``pass_collection``, ``pass_original``, and ``skip_on_field_errors``
         are keyword-only arguments.
+    .. versionchanged:: 4.4.0 Added the ``before`` and ``after`` keyword arguments to
+        control invocation order within the same hook type.
     """
     return set_hook(
         fn,
@@ -127,6 +138,8 @@ def validates_schema(
         many=pass_collection,
         pass_original=pass_original,
         skip_on_field_errors=skip_on_field_errors,
+        before=before,
+        after=after,
     )
 
 
@@ -134,6 +147,8 @@ def pre_dump(
     fn: typing.Callable[..., typing.Any] | None = None,
     *,
     pass_collection: bool = False,
+    before: HookDependency | None = None,
+    after: HookDependency | None = None,
 ) -> typing.Callable[..., typing.Any]:
     """Register a method to invoke before serializing an object. The method
     receives the object to be serialized and returns the processed object.
@@ -145,8 +160,12 @@ def pre_dump(
     .. versionchanged:: 3.0.0 ``many`` is always passed as a keyword argument to the decorated method.
     .. versionchanged:: 4.0.0 ``pass_many`` is renamed to ``pass_collection``.
     .. versionchanged:: 4.0.0 ``pass_collection`` is a keyword-only argument.
+    .. versionchanged:: 4.4.0 Added the ``before`` and ``after`` keyword arguments to
+        control invocation order within the same hook type.
     """
-    return set_hook(fn, PRE_DUMP, many=pass_collection)
+    return set_hook(
+        fn, PRE_DUMP, many=pass_collection, before=before, after=after
+    )
 
 
 def post_dump(
@@ -154,6 +173,8 @@ def post_dump(
     *,
     pass_collection: bool = False,
     pass_original: bool = False,
+    before: HookDependency | None = None,
+    after: HookDependency | None = None,
 ) -> typing.Callable[..., typing.Any]:
     """Register a method to invoke after serializing an object. The method
     receives the serialized object and returns the processed object.
@@ -168,14 +189,25 @@ def post_dump(
     .. versionchanged:: 3.0.0 ``many`` is always passed as a keyword argument to the decorated method.
     .. versionchanged:: 4.0.0 ``pass_many`` is renamed to ``pass_collection``.
     .. versionchanged:: 4.0.0 ``pass_collection`` and ``pass_original`` are keyword-only arguments.
+    .. versionchanged:: 4.4.0 Added the ``before`` and ``after`` keyword arguments to
+        control invocation order within the same hook type.
     """
-    return set_hook(fn, POST_DUMP, many=pass_collection, pass_original=pass_original)
+    return set_hook(
+        fn,
+        POST_DUMP,
+        many=pass_collection,
+        pass_original=pass_original,
+        before=before,
+        after=after,
+    )
 
 
 def pre_load(
     fn: typing.Callable[..., typing.Any] | None = None,
     *,
     pass_collection: bool = False,
+    before: HookDependency | None = None,
+    after: HookDependency | None = None,
 ) -> typing.Callable[..., typing.Any]:
     """Register a method to invoke before deserializing an object. The method
     receives the data to be deserialized and returns the processed data.
@@ -189,8 +221,12 @@ def pre_load(
     .. versionchanged:: 4.0.0 ``pass_many`` is renamed to ``pass_collection``.
     .. versionchanged:: 4.0.0 ``pass_collection`` is a keyword-only argument.
     .. versionchanged:: 4.0.0 ``unknown`` is passed as a keyword argument to the decorated method.
+    .. versionchanged:: 4.4.0 Added the ``before`` and ``after`` keyword arguments to
+        control invocation order within the same hook type.
     """
-    return set_hook(fn, PRE_LOAD, many=pass_collection)
+    return set_hook(
+        fn, PRE_LOAD, many=pass_collection, before=before, after=after
+    )
 
 
 def post_load(
@@ -198,6 +234,8 @@ def post_load(
     *,
     pass_collection: bool = False,
     pass_original: bool = False,
+    before: HookDependency | None = None,
+    after: HookDependency | None = None,
 ) -> typing.Callable[..., typing.Any]:
     """Register a method to invoke after deserializing an object. The method
     receives the deserialized data and returns the processed data.
@@ -214,8 +252,40 @@ def post_load(
     .. versionchanged:: 4.0.0 ``pass_many`` is renamed to ``pass_collection``.
     .. versionchanged:: 4.0.0 ``pass_collection`` and ``pass_original`` are keyword-only arguments.
     .. versionchanged:: 4.0.0 ``unknown`` is passed as a keyword argument to the decorated method.
+    .. versionchanged:: 4.4.0 Added the ``before`` and ``after`` keyword arguments to
+        control invocation order within the same hook type.
     """
-    return set_hook(fn, POST_LOAD, many=pass_collection, pass_original=pass_original)
+    return set_hook(
+        fn,
+        POST_LOAD,
+        many=pass_collection,
+        pass_original=pass_original,
+        before=before,
+        after=after,
+    )
+
+
+def _normalize_dependencies(
+    value: HookDependency | None, argument: str
+) -> tuple[str, ...]:
+    """Normalize a ``before``/``after`` argument into a tuple of hook names."""
+    if value is None:
+        return ()
+    if isinstance(value, str):
+        return (value,)
+    if isinstance(value, Sequence):
+        names = tuple(value)
+        if not names or any(
+            not isinstance(name, str) or not name for name in names
+        ):
+            raise TypeError(
+                f"{argument} must contain at least one non-empty hook name."
+            )
+        return names
+    raise TypeError(
+        f"{argument} must be a hook name or a sequence of hook names, "
+        f"not {type(value).__name__}."
+    )
 
 
 def set_hook(
@@ -223,6 +293,8 @@ def set_hook(
     tag: str,
     *,
     many: bool = False,
+    before: HookDependency | None = None,
+    after: HookDependency | None = None,
     **kwargs: typing.Any,
 ) -> typing.Callable[..., typing.Any]:
     """Mark decorated function as a hook to be picked up later.
@@ -236,8 +308,18 @@ def set_hook(
         bound.
     """
     # Allow using this as either a decorator or a decorator factory.
+    before_names = _normalize_dependencies(before, "before")
+    after_names = _normalize_dependencies(after, "after")
+
     if fn is None:
-        return functools.partial(set_hook, tag=tag, many=many, **kwargs)
+        return functools.partial(
+            set_hook,
+            tag=tag,
+            many=many,
+            before=before_names or None,
+            after=after_names or None,
+            **kwargs,
+        )
 
     # Set a __marshmallow_hook__ attribute instead of wrapping in some class,
     # because I still want this to end up as a normal (unbound) method.
@@ -249,6 +331,8 @@ def set_hook(
     # Also save the kwargs for the tagged function on
     # __marshmallow_hook__, keyed by <tag>
     if hook_config is not None:
-        hook_config[tag].append((many, kwargs))
+        hook_config[tag].append(
+            (many, {**kwargs, "before": before_names, "after": after_names})
+        )
 
     return fn

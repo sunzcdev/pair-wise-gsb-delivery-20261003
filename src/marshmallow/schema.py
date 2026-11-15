@@ -14,6 +14,7 @@ import operator
 import typing
 import uuid
 from abc import ABCMeta
+from bisect import insort
 from collections import defaultdict
 from collections.abc import Mapping, Sequence
 from itertools import zip_longest
@@ -28,6 +29,7 @@ from marshmallow.decorators import (
     PRE_LOAD,
     VALIDATES,
     VALIDATES_SCHEMA,
+    MarshmallowHook,
 )
 from marshmallow.error_store import ErrorStore
 from marshmallow.exceptions import SCHEMA, StringNotCollectionError, ValidationError
@@ -84,6 +86,84 @@ def _get_fields_by_mro(klass: SchemaMeta):
         ),
         [],
     )
+
+
+def _sort_hooks(
+    tag: str,
+    hooks: list[tuple[str, bool, dict]],
+) -> list[tuple[str, bool, dict]]:
+    """Order the hooks registered under ``tag`` using their ``before``/``after``
+    dependencies.
+
+    Hooks without declared dependencies keep the relative order in which they
+    were collected (declaration order, following the class MRO). A hook that
+    overrides an inherited hook keeps a single position. Dependencies may only
+    reference other hooks of the same tag; unknown names and dependency cycles
+    raise an error while the `Schema` class is being created.
+    """
+    names = [name for name, _, _ in hooks]
+    name_set = set(names)
+    hook_by_name = dict(zip(names, hooks, strict=True))
+    order_index = {name: index for index, name in enumerate(names)}
+    # ``prerequisites[name]`` holds the hooks that must run before ``name``.
+    prerequisites: dict[str, list[str]] = {name: [] for name in names}
+
+    def require(requester: str, name: str, prerequisite: str) -> None:
+        missing = prerequisite if prerequisite not in name_set else (
+            name if name not in name_set else None
+        )
+        if missing is not None:
+            raise TypeError(
+                f'Hook "{requester}" has an ordering constraint referencing '
+                f'unknown "{tag}" hook "{missing}".'
+            )
+        if prerequisite not in prerequisites[name]:
+            prerequisites[name].append(prerequisite)
+
+    for name, _, config in hooks:
+        for target in config.get("after", ()):
+            # `name` runs after `target`: `target` is a prerequisite.
+            require(name, name, target)
+        for target in config.get("before", ()):
+            # `name` runs before `target`: `name` is a prerequisite of
+            # `target`.
+            require(name, target, name)
+
+    dependents: dict[str, list[str]] = {name: [] for name in names}
+    indegree: dict[str, int] = {name: 0 for name in names}
+    for name, node_prerequisites in prerequisites.items():
+        for prerequisite in dict.fromkeys(node_prerequisites):
+            dependents[prerequisite].append(name)
+            indegree[name] += 1
+
+    # Stable Kahn's algorithm. The ready queue is always kept in declaration
+    # order, and a node that becomes ready is inserted at its declaration
+    # position. Hence a hook is only displaced when a constraint requires it,
+    # and hooks without constraints keep their original relative declaration
+    # order.
+    ready = sorted(
+        (name for name in names if indegree[name] == 0),
+        key=order_index.get,
+    )
+    ordered_names: list[str] = []
+    while ready:
+        current = ready.pop(0)
+        ordered_names.append(current)
+        newly_ready = []
+        for dependent in dependents[current]:
+            indegree[dependent] -= 1
+            if indegree[dependent] == 0:
+                newly_ready.append(dependent)
+        for dependent in sorted(newly_ready, key=order_index.get):
+            insort(ready, dependent, key=order_index.get)
+
+    if len(ordered_names) != len(hooks):
+        processed = set(ordered_names)
+        cyclic = [name for name in names if name not in processed]
+        raise TypeError(
+            f'Cycle detected among "{tag}" hooks: {", ".join(cyclic)}.'
+        )
+    return [hook_by_name[name] for name in ordered_names]
 
 
 class SchemaMeta(ABCMeta):
@@ -165,38 +245,43 @@ class SchemaMeta(ABCMeta):
 
         hooks: dict[str, list[tuple[str, bool, dict]]] = defaultdict(list)
 
-        for attr_name in dir(cls):
-            # Need to look up the actual descriptor, not whatever might be
-            # bound to the class. This needs to come from the __dict__ of the
-            # declaring class.
-            for parent in mro:
-                try:
-                    attr = parent.__dict__[attr_name]
-                except KeyError:
-                    continue
-                else:
-                    break
-            else:
-                # In case we didn't find the attribute and didn't break above.
-                # We should never hit this - it's just here for completeness
-                # to exclude the possibility of attr being undefined.
-                continue
+        # First pass: resolve every attribute name to its final descriptor and
+        # remember the stable position of its first hook declaration. Walking
+        # the MRO from the base classes towards ``cls`` and reading each class'
+        # ``__dict__`` in declaration order (regular dicts preserve insertion
+        # order) makes an overridden hook keep the position of its base
+        # declaration as a single node. A non-hook override (e.g.
+        # ``deleted = None``) removes an inherited hook instead.
+        order: list[str] = []
+        resolved: dict[str, MarshmallowHook] = {}
+        for parent in reversed(mro):
+            for attr_name, attr in parent.__dict__.items():
+                if getattr(attr, "__marshmallow_hook__", None) is not None:
+                    if attr_name not in resolved:
+                        order.append(attr_name)
+                    resolved[attr_name] = attr
+                elif attr_name in resolved:
+                    order.remove(attr_name)
+                    del resolved[attr_name]
 
-            try:
-                hook_config: dict[str, list[tuple[bool, dict]]] = (
-                    attr.__marshmallow_hook__
+        # Second pass: expand the resolved descriptors in stable declaration
+        # order. The bound method is looked up again at invocation time by name.
+        for attr_name in order:
+            hook_config: dict[str, list[tuple[bool, dict]]] = resolved[
+                attr_name
+            ].__marshmallow_hook__
+            for tag, config in hook_config.items():
+                hooks[tag].extend(
+                    (attr_name, many, kwargs) for many, kwargs in config
                 )
-            except AttributeError:
-                pass
-            else:
-                for tag, config in hook_config.items():
-                    # Use name here so we can get the bound method later, in
-                    # case the processor was a descriptor or something.
-                    hooks[tag].extend(
-                        (attr_name, many, kwargs) for many, kwargs in config
-                    )
 
-        return hooks
+        return defaultdict(
+            list,
+            {
+                tag: _sort_hooks(tag, tag_hooks)
+                for tag, tag_hooks in hooks.items()
+            },
+        )
 
 
 class SchemaOpts:

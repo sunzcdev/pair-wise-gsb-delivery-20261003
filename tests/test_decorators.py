@@ -985,3 +985,302 @@ def test_post_load_method_that_appends_to_data():
 
     schema = MySchema(many=True)
     assert schema.load([{"foo": 24}]) == [{"foo": 24}, {"foo": 42}]
+
+
+class TestHookOrdering:
+    def test_undeclared_hooks_keep_declaration_order(self):
+        calls = []
+
+        class MySchema(Schema):
+            class Meta:
+                unknown = EXCLUDE
+
+            @pre_load
+            def zeta(self, item, **kwargs):
+                calls.append("zeta")
+                return item
+
+            @pre_load
+            def alpha(self, item, **kwargs):
+                calls.append("alpha")
+                return item
+
+            @pre_load
+            def middle(self, item, **kwargs):
+                calls.append("middle")
+                return item
+
+        assert [name for name, _, _ in MySchema._hooks["pre_load"]] == [
+            "zeta",
+            "alpha",
+            "middle",
+        ]
+        MySchema().load({})
+        assert calls == ["zeta", "alpha", "middle"]
+
+    def test_before_and_after_reorder_within_stage(self):
+        calls = []
+
+        class MySchema(Schema):
+            class Meta:
+                unknown = EXCLUDE
+
+            @pre_load
+            def step_one(self, item, **kwargs):
+                calls.append("one")
+                return item
+
+            @pre_load
+            def step_three(self, item, **kwargs):
+                calls.append("three")
+                return item
+
+            @pre_load(after="step_one", before="step_three")
+            def step_two(self, item, **kwargs):
+                calls.append("two")
+                return item
+
+        assert [name for name, _, _ in MySchema._hooks["pre_load"]] == [
+            "step_one",
+            "step_two",
+            "step_three",
+        ]
+        MySchema().load({})
+        assert calls == ["one", "two", "three"]
+
+    def test_before_and_after_accept_dependency_sequences(self):
+        class MySchema(Schema):
+            class Meta:
+                unknown = EXCLUDE
+
+            @pre_load
+            def first(self, item, **kwargs):
+                return item
+
+            @pre_load
+            def second(self, item, **kwargs):
+                return item
+
+            @pre_load(after=("first", "second"))
+            def third(self, item, **kwargs):
+                return item
+
+        assert [name for name, _, _ in MySchema._hooks["pre_load"]] == [
+            "first",
+            "second",
+            "third",
+        ]
+
+    def test_inherited_cleaning_chain_records_call_order(self):
+        calls = []
+
+        class BaseSchema(Schema):
+            class Meta:
+                unknown = EXCLUDE
+
+            @pre_load
+            def base_first(self, item, **kwargs):
+                calls.append("base_first")
+                return item
+
+            @pre_load
+            def base_second(self, item, **kwargs):
+                calls.append("base_second")
+                return item
+
+            @pre_load
+            def overridden(self, item, **kwargs):
+                calls.append("base_overridden")
+                return item
+
+        class ChildSchema(BaseSchema):
+            @pre_load(after="base_first", before="base_second")
+            def child_middle(self, item, **kwargs):
+                calls.append("child_middle")
+                return item
+
+            @pre_load
+            def child_last(self, item, **kwargs):
+                calls.append("child_last")
+                return item
+
+            @pre_load
+            def overridden(self, item, **kwargs):
+                calls.append("child_overridden")
+                return item
+
+        names = [name for name, _, _ in ChildSchema._hooks["pre_load"]]
+        # The overridden base method is a single node and stays where the base
+        # declared it; it is not duplicated by the child override.
+        assert names.count("overridden") == 1
+        assert names == [
+            "base_first",
+            "overridden",
+            "child_middle",
+            "base_second",
+            # Unconstrained and unrelated to the moved hook, ``child_last``
+            # keeps its declaration position relative to ``base_second``.
+            "child_last",
+        ]
+
+        ChildSchema().load({})
+        assert calls == [
+            "base_first",
+            "child_overridden",
+            "child_middle",
+            "base_second",
+            "child_last",
+        ]
+
+    def test_hooks_run_once_per_item_with_many(self):
+        calls = []
+
+        class MySchema(Schema):
+            class Meta:
+                unknown = EXCLUDE
+
+            @pre_load
+            def first(self, item, **kwargs):
+                calls.append("first")
+                return item
+
+            @pre_load(before="third")
+            def second(self, item, **kwargs):
+                calls.append("second")
+                return item
+
+            @pre_load
+            def third(self, item, **kwargs):
+                calls.append("third")
+                return item
+
+        MySchema().load([{}, {}], many=True)
+        assert calls == [
+            "first",
+            "first",
+            "second",
+            "second",
+            "third",
+            "third",
+        ]
+
+    def test_collection_and_single_hooks_stay_in_their_stages(self):
+        calls = []
+
+        class MySchema(Schema):
+            class Meta:
+                unknown = EXCLUDE
+
+            @pre_load(pass_collection=True)
+            def collection_first(self, data, many, **kwargs):
+                calls.append(("collection", "first"))
+                return data
+
+            @pre_load(pass_collection=True, after="collection_first")
+            def collection_second(self, data, many, **kwargs):
+                calls.append(("collection", "second"))
+                return data
+
+            @pre_load
+            def single_first(self, item, **kwargs):
+                calls.append(("single", "first"))
+                return item
+
+            @pre_load(after="single_first")
+            def single_second(self, item, **kwargs):
+                calls.append(("single", "second"))
+                return item
+
+        MySchema().load([{}, {}], many=True)
+        assert calls == [
+            ("collection", "first"),
+            ("collection", "second"),
+            ("single", "first"),
+            ("single", "first"),
+            ("single", "second"),
+            ("single", "second"),
+        ]
+
+    @pytest.mark.parametrize(
+        ("constraint", "value"),
+        [("before", "does_not_exist"), ("after", "does_not_exist")],
+    )
+    def test_unknown_dependency_is_rejected(self, constraint, value):
+        with pytest.raises(TypeError, match='unknown "pre_load" hook'):
+
+            class MySchema(Schema):
+                @pre_load(**{constraint: value})
+                def hook(self, item, **kwargs):
+                    return item
+
+    def test_cross_stage_dependency_is_rejected(self):
+        with pytest.raises(TypeError, match='unknown "post_load" hook'):
+
+            class MySchema(Schema):
+                @pre_load
+                def pre_hook(self, item, **kwargs):
+                    return item
+
+                @post_load(before="pre_hook")
+                def post_hook(self, item, **kwargs):
+                    return item
+
+    def test_dependency_cycle_is_rejected(self):
+        with pytest.raises(TypeError, match='Cycle detected among "pre_load"'):
+
+            class MySchema(Schema):
+                @pre_load(after="hook_b")
+                def hook_a(self, item, **kwargs):
+                    return item
+
+                @pre_load(after="hook_a")
+                def hook_b(self, item, **kwargs):
+                    return item
+
+    @pytest.mark.parametrize("value", [123, (), ("",), (42,)])
+    def test_invalid_dependency_value_is_rejected(self, value):
+        with pytest.raises(TypeError):
+
+            class MySchema(Schema):
+                @pre_load(after=value)
+                def hook(self, item, **kwargs):
+                    return item
+
+    def test_ordering_works_for_validates_schema_and_dump_hooks(self):
+        load_calls = []
+        dump_calls = []
+
+        class MySchema(Schema):
+            class Meta:
+                unknown = EXCLUDE
+
+            @validates_schema(before="validator_b")
+            def validator_a(self, data, **kwargs):
+                load_calls.append("a")
+
+            @validates_schema
+            def validator_b(self, data, **kwargs):
+                load_calls.append("b")
+
+            @post_dump(after="dump_b")
+            def dump_a(self, item, **kwargs):
+                dump_calls.append("a")
+                return item
+
+            @post_dump
+            def dump_b(self, item, **kwargs):
+                dump_calls.append("b")
+                return item
+
+        assert [name for name, _, _ in MySchema._hooks["validates_schema"]] == [
+            "validator_a",
+            "validator_b",
+        ]
+        assert [name for name, _, _ in MySchema._hooks["post_dump"]] == [
+            "dump_b",
+            "dump_a",
+        ]
+        MySchema().validate({})
+        assert load_calls == ["a", "b"]
+        MySchema().dump({})
+        assert dump_calls == ["b", "a"]

@@ -1,6 +1,20 @@
 Changelog
 =========
 
+4.4.1 (unreleased)
+------------------
+
+Features:
+
+- Add ``before`` and ``after`` keyword arguments to the ``pre_load``,
+  ``post_load``, ``pre_dump``, ``post_dump``, and ``validates_schema``
+  decorators to control invocation order within each processing stage. Hooks
+  without explicit constraints keep their declaration order, so renaming a
+  method no longer changes execution order. Unknown hook names, cross-stage
+  dependencies, and dependency cycles raise an error when the ``Schema`` class
+  is created. An overridden hook remains a single node and keeps the position of
+  its base declaration.
+
 4.4.0 (2026-11-03)
 ------------------
 

@@ -209,39 +209,52 @@ The pipeline for serialization is similar, except that the ``pass_many=True`` pr
 5. ``@post_dump(pass_many=True)`` methods
 
 
+Ordering processors
+-------------------
+
+You may register multiple processor methods on a Schema. By default, methods of
+the same type run in the order in which they are declared (following the class
+inheritance chain). To make an ordering explicit, pass the names of other hooks
+of the same type to the ``before`` and ``after`` keyword arguments. Each accepts
+a single hook name or a sequence of hook names.
+
+.. code-block:: python
+
+    from marshmallow import Schema, fields, pre_load
+
+
+    class MySchema(Schema):
+        field_a = fields.Raw()
+
+        @pre_load
+        def step1(self, data, **kwargs):
+            ...
+            return data
+
+        @pre_load(after="step1")
+        def step2(self, data, **kwargs):
+            ...
+            return data
+
+        @pre_load(before="step2")
+        def step_between(self, data, **kwargs):
+            ...
+            return data
+
+Hooks without an explicit constraint keep their relative declaration order, so
+renaming a method does not silently change the execution order. A constraint may
+only reference another hook of the same type: referencing an unknown hook, a
+hook of a different processing stage, or creating a dependency cycle raises an
+error when the ``Schema`` class is created. A method that overrides an inherited
+hook remains a single processing step and keeps the position of the original
+declaration.
+
+Note that ``pass_collection`` hooks and regular (single-object) hooks still run
+in their respective stages described above; ordering constraints never cause a
+hook to run more than once or outside of its stage.
+
 .. warning::
 
-    You may register multiple processor methods on a Schema. Keep in mind, however, that **the invocation order of decorated methods of the same type is not guaranteed**. If you need to guarantee order of processing steps, you should put them in the same method.
-
-
-    .. code-block:: python
-
-        from marshmallow import Schema, fields, pre_load
-
-
-        # YES
-        class MySchema(Schema):
-            field_a = fields.Raw()
-
-            @pre_load
-            def preprocess(self, data, **kwargs):
-                step1_data = self.step1(data)
-                step2_data = self.step2(step1_data)
-                return step2_data
-
-            def step1(self, data): ...
-
-            # Depends on step1
-            def step2(self, data): ...
-
-
-        # NO
-        class MySchema(Schema):
-            field_a = fields.Raw()
-
-            @pre_load
-            def step1(self, data, **kwargs): ...
-
-            # Depends on step1
-            @pre_load
-            def step2(self, data, **kwargs): ...
+    ``before`` and ``after`` only order hooks of the same type. If you need to
+    share state between tightly coupled steps, keeping them in the same method
+    remains the simplest option.
