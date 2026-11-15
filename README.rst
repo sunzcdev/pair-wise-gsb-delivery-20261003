@@ -242,6 +242,64 @@ WARC 1.1:
     WARC/1.1
     ...
     WARC-Date: 2018-12-26T10:11:12.456789Z
+
+
+
+Reproducible (Deterministic) WARC Output
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+By default every record gets a random ``WARC-Record-ID`` and the current
+``WARC-Date``, so the same input written twice produces different bytes. For
+reproducible test archives, pass an ``id_provider`` and a ``date_provider``:
+zero-argument callables (or the supplied helper classes) that return the
+record ID string and ISO 8601 date string respectively. The same providers are
+used for warcinfo records and for both sides of a request/response pair.
+
+For gzipped output, the gzip header metadata (modification time, original
+filename and OS byte) can also be pinned with ``gzip_mtime``,
+``gzip_filename`` and ``gzip_os``. With identical input and identical
+provider/metadata arguments the resulting archive is byte-for-byte identical.
+
+.. code:: python
+
+    from io import BytesIO
+    from warcio.warcwriter import BufferWARCWriter
+    from warcio.recordbuilder import StaticRecordIDProvider, StaticDateProvider
+
+    def build():
+        writer = BufferWARCWriter(
+            gzip=True,
+            id_provider=StaticRecordIDProvider([
+                '<urn:uuid:00000000-0000-0000-0000-000000000001>',
+                '<urn:uuid:00000000-0000-0000-0000-000000000002>',
+            ]),
+            date_provider=StaticDateProvider('2020-01-02T03:04:05Z'),
+            gzip_mtime=0,
+            gzip_os=255,
+        )
+        record = writer.create_warc_record(
+            'http://example.com/', 'resource',
+            payload=BytesIO(b'hello'), length=5)
+        writer.write_record(record)
+        return writer.get_contents()
+
+    assert build() == build()
+
+Providers are per-writer, so two writers never share ID/date state. A provider
+that returns an ID already used by another record of the same writer raises
+``warcio.exceptions.DuplicateRecordIDError``, and one that returns an invalid
+WARC date raises ``warcio.exceptions.InvalidWARCDateError`` (both subclass
+``ValueError``). Any plain callable works, so a simple
+``date_provider=lambda: '2020-01-02T03:04:05Z'`` is also valid. When no
+providers are supplied the historical defaults (random uuid4 IDs and the
+current UTC time) are used.
+
+Note that header ordering and duplicate headers are always written exactly as
+provided; they are never sorted or merged in the name of determinism.
+
+
+Filtering HTTP Capture
+~~~~~~~~~~~~~~~~~~~~~~
     
     
 

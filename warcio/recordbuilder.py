@@ -1,13 +1,94 @@
+import re
 import six
 import tempfile
 
 from datetime import datetime, timezone
 from io import BytesIO
 
+from warcio.exceptions import DuplicateRecordIDError, InvalidWARCDateError
 from warcio.recordloader import ArcWarcRecord, ArcWarcRecordLoader
 from warcio.statusandheaders import StatusAndHeadersParser, StatusAndHeaders
-from warcio.timeutils import datetime_to_iso_date
+from warcio.timeutils import datetime_to_iso_date, iso_date_to_datetime
 from warcio.utils import to_native_str, BUFF_SIZE, Digester
+
+
+#=================================================================
+# Pluggable record ID / date providers
+#
+# A provider is any zero-argument callable. The defaults below preserve
+# the historical behavior (random uuid4 ids and the current UTC time),
+# while fixed providers make WARC output reproducible byte for byte.
+#=================================================================
+class WARCRecordIDProvider(object):
+    """Base record id provider; subclasses implement ``__call__``.
+
+    The returned value must be a full WARC-Record-ID string,
+    eg. ``<urn:uuid:...>``.
+    """
+    def __call__(self):  #pragma: no cover
+        raise NotImplemented()
+
+
+class UUID4RecordIDProvider(WARCRecordIDProvider):
+    """Default provider: a fresh random uuid4 id for every record."""
+    def __call__(self):
+        return StatusAndHeadersParser.make_warc_id()
+
+
+class StaticRecordIDProvider(WARCRecordIDProvider):
+    """Deterministic provider returning ids from a fixed sequence.
+
+    Accepts either a single id string or a list of id strings. When the
+    sequence is exhausted, ``IndexError`` is raised instead of silently
+    reusing an id (which the writer would reject anyway).
+    """
+    def __init__(self, ids):
+        if isinstance(ids, str) or not hasattr(ids, '__iter__'):
+            ids = [ids]
+        self._ids = list(ids)
+        self._index = 0
+
+    def __call__(self):
+        try:
+            record_id = self._ids[self._index]
+        except IndexError:
+            raise IndexError('StaticRecordIDProvider has no more ids to provide')
+        self._index += 1
+        return record_id
+
+
+class WARCDateProvider(object):
+    """Base WARC-Date provider; subclasses implement ``__call__``."""
+    def __call__(self):  #pragma: no cover
+        raise NotImplemented()
+
+
+class CurrentDateProvider(WARCDateProvider):
+    """Default provider: the current UTC time as an ISO 8601 string."""
+    def __call__(self):
+        return datetime_to_iso_date(datetime.now(timezone.utc).replace(tzinfo=None))
+
+
+class StaticDateProvider(WARCDateProvider):
+    """Deterministic provider returning fixed date string(s).
+
+    Accepts either a single date string or a list of date strings. When a
+    list is exhausted, the last date keeps being returned so that any
+    number of records can be generated.
+    """
+    def __init__(self, dates):
+        if isinstance(dates, str) or not hasattr(dates, '__iter__'):
+            dates = [dates]
+        self._dates = list(dates)
+
+    def __call__(self):
+        return self._dates[0] if len(self._dates) == 1 else self._dates.pop(0)
+
+
+# WARC-Date is an ISO 8601 UTC timestamp, optionally with fractional seconds
+WARC_DATE_RX = re.compile(
+    r'^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z$')
+
 
 #=================================================================
 class RecordBuilder(object):
@@ -30,10 +111,22 @@ class RecordBuilder(object):
     NO_PAYLOAD_DIGEST_TYPES = ('warcinfo', 'revisit')
 
 
-    def __init__(self, warc_version=None, header_filter=None):
+    def __init__(self, warc_version=None, header_filter=None,
+                 id_provider=None, date_provider=None):
         self.warc_version = self._parse_warc_version(warc_version)
 
         self.header_filter = header_filter
+
+        # Per-instance providers so two writers never influence each other.
+        # Defaults reproduce the historical behavior (random id / current time).
+        self._default_date_provider = date_provider is None
+        self.id_provider = id_provider if id_provider is not None \
+            else UUID4RecordIDProvider()
+        self.date_provider = date_provider if date_provider is not None \
+            else CurrentDateProvider()
+
+        # ids already handed out (or explicitly used) by this builder
+        self._used_record_ids = set()
 
     def create_warcinfo_record(self, filename, info):
         warc_headers = StatusAndHeaders('', [], protocol=self.warc_version)
@@ -122,8 +215,13 @@ class RecordBuilder(object):
     def _init_warc_headers(self, uri, record_type, warc_headers_dict):
         warc_headers = StatusAndHeaders('', list(warc_headers_dict.items()), protocol=self.warc_version)
         warc_headers.replace_header('WARC-Type', record_type)
-        if not warc_headers.get_header('WARC-Record-ID'):
+
+        existing_id = warc_headers.get_header('WARC-Record-ID')
+        if not existing_id:
             warc_headers.add_header('WARC-Record-ID', self._make_warc_id())
+        else:
+            # an explicit id still has to remain unique within this writer
+            self._register_record_id(existing_id)
 
         if uri:
             warc_headers.replace_header('WARC-Target-URI', uri)
@@ -147,13 +245,59 @@ class RecordBuilder(object):
 
         return 'WARC/' + version
 
-    @classmethod
-    def _make_warc_id(cls):
-        return StatusAndHeadersParser.make_warc_id()
+    def _make_warc_id(self, id_=None):
+        """Return a unique WARC-Record-ID for this builder.
 
-    @classmethod
-    def _make_warc_date(cls, use_micros=False):
-        return datetime_to_iso_date(datetime.now(timezone.utc).replace(tzinfo=None), use_micros=use_micros)
+        Delegates to the configured ``id_provider`` (or uses an explicitly
+        passed id) and rejects any id already used by another record of this
+        builder/writer.
+        """
+        if id_:
+            record_id = id_
+        else:
+            record_id = self.id_provider()
+
+        return self._register_record_id(record_id)
+
+    def _register_record_id(self, record_id):
+        if not isinstance(record_id, str) or not record_id:
+            raise DuplicateRecordIDError(record_id)
+
+        if record_id in self._used_record_ids:
+            raise DuplicateRecordIDError(record_id)
+
+        self._used_record_ids.add(record_id)
+        return record_id
+
+    def _make_warc_date(self, use_micros=False):
+        """Return a validated WARC-Date from the configured date provider.
+
+        Custom date providers are plain zero-argument callables and simply
+        return their fixed value. The built-in default provider preserves
+        the historical behavior, including microsecond precision for
+        WARC/1.1.
+        """
+        if self._default_date_provider:
+            value = datetime_to_iso_date(
+                datetime.now(timezone.utc).replace(tzinfo=None),
+                use_micros=use_micros)
+        else:
+            value = self.date_provider()
+
+        return self._validate_warc_date(value)
+
+    @staticmethod
+    def _validate_warc_date(value):
+        if not isinstance(value, str) or not WARC_DATE_RX.match(value):
+            raise InvalidWARCDateError(value)
+
+        # also reject syntactically plausible but impossible calendar dates
+        try:
+            iso_date_to_datetime(value)
+        except (ValueError, OverflowError):
+            raise InvalidWARCDateError(value)
+
+        return value
 
     def ensure_digest(self, record, block=True, payload=True):
         if block:

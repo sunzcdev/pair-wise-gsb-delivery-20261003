@@ -1,3 +1,20 @@
+Unreleased
+~~~~~~~~~~
+
+- Add pluggable, per-writer ``id_provider`` and ``date_provider`` callables to
+  ``WARCWriter``/``RecordBuilder`` so that WARC-Record-IDs and WARC-Dates can be
+  fixed, enabling byte-for-byte reproducible (deterministic) test archives.
+  Default behavior (random uuid4 IDs and current UTC time) is unchanged.
+- A provider that returns a record ID already used by the same writer now raises
+  ``DuplicateRecordIDError``, and a provider that returns an invalid WARC date
+  raises ``InvalidWARCDateError`` (both are also ``ValueError``).
+- Allow fixing gzip compression metadata via the ``gzip_mtime``,
+  ``gzip_filename`` and ``gzip_os`` writer arguments. Default gzip output is
+  byte-identical to previous releases.
+- Original header order and duplicate headers are always preserved; they are
+  never sorted or merged. Request/response pairs and warcinfo records use the
+  same configured providers.
+
 1.8.2
 ~~~~~
 
