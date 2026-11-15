@@ -2397,3 +2397,212 @@ def test_deserialize_raises_exception_if_input_type_is_incorrect(data, unknown):
     exc = excinfo.value
     assert isinstance(exc.messages, dict)
     assert list(exc.messages.keys()) == ["_schema"]
+
+
+class TestUniqueTogether:
+    class TagSchema(Schema):
+        tag = fields.Str(required=True)
+        group = fields.Int()
+
+        class Meta:
+            unique_together = [("tag",)]
+
+    def test_unique_batch_loads_when_no_conflicts(self):
+        data = [{"tag": "a"}, {"tag": "b"}, {"tag": "c"}]
+        result = self.TagSchema(many=True).load(data)
+        assert result == data
+
+    def test_unique_violation_reports_all_conflicting_indexes(self):
+        data = [{"tag": "a"}, {"tag": "b"}, {"tag": "a"}, {"tag": "a"}]
+        with pytest.raises(ValidationError) as excinfo:
+            self.TagSchema(many=True).load(data)
+        errors = excinfo.value.messages
+        assert set(errors) == {0, 2, 3}
+        for index in (0, 2, 3):
+            assert errors[index] == {
+                "_schema": [
+                    "Values for fields 'tag' must be unique within the batch; "
+                    "duplicate value found in records at indexes 0, 2, 3."
+                ]
+            }
+
+    def test_unique_violation_excludes_conflicts_from_valid_data(self):
+        data = [{"tag": "a"}, {"tag": "b"}, {"tag": "a"}]
+        with pytest.raises(ValidationError) as excinfo:
+            self.TagSchema(many=True).load(data)
+        assert excinfo.value.valid_data == [{"tag": "b"}]
+
+    def test_unique_composite_fields_use_deserialized_values(self):
+        class EventSchema(Schema):
+            amount = fields.Decimal()
+            at = fields.DateTime()
+
+            class Meta:
+                unique_together = [("amount", "at")]
+
+        # Same instant in different timezones and equal Decimals with
+        # different exponents deserialize to equal values.
+        data = [
+            {"amount": "1.0", "at": "2026-01-01T00:00:00+00:00"},
+            {"amount": "1.00", "at": "2026-01-01T01:00:00+01:00"},
+            {"amount": "2", "at": "2026-01-01T00:00:00+00:00"},
+        ]
+        with pytest.raises(ValidationError) as excinfo:
+            EventSchema(many=True).load(data)
+        errors = excinfo.value.messages
+        assert set(errors) == {0, 1}
+        assert "indexes 0, 1" in errors[0]["_schema"][0]
+        assert excinfo.value.valid_data == [
+            {
+                "amount": decimal.Decimal("2"),
+                "at": dt.datetime(2026, 1, 1, tzinfo=dt.timezone.utc),
+            }
+        ]
+
+    def test_unique_missing_values_are_not_compared(self):
+        class MySchema(Schema):
+            tag = fields.Str()
+            group = fields.Int()
+
+            class Meta:
+                unique_together = [("tag", "group")]
+
+        # Records missing a constraint field never collapse into one key.
+        data = [{"tag": "a"}, {"tag": "a"}, {"group": 1}, {"group": 1}, {}]
+        assert MySchema(many=True).load(data) == data
+
+    def test_unique_invalid_records_are_not_compared(self):
+        # Records whose constraint field fails to deserialize cannot form a
+        # key: they are excluded from the batch check (never collapsed into
+        # a shared key) and their field errors are preserved.
+        class MySchema(Schema):
+            group = fields.Int(required=True)
+
+            class Meta:
+                unique_together = [("group",)]
+
+        data = [
+            {"group": "not-an-int"},
+            {"group": "not-an-int"},
+            {"group": 1},
+            {"group": 1},
+        ]
+        with pytest.raises(ValidationError) as excinfo:
+            MySchema(many=True).load(data)
+        errors = excinfo.value.messages
+        assert errors[0] == {"group": ["Not a valid integer."]}
+        assert errors[1] == {"group": ["Not a valid integer."]}
+        assert "_schema" in errors[2]
+        assert "_schema" in errors[3]
+
+    def test_unique_field_errors_and_batch_errors_are_both_reported(self):
+        data = [{"tag": "a", "group": "not-an-int"}, {"tag": "b"}, {"tag": "b"}]
+        with pytest.raises(ValidationError) as excinfo:
+            self.TagSchema(many=True).load(data)
+        errors = excinfo.value.messages
+        assert errors[0] == {"group": ["Not a valid integer."]}
+        assert "_schema" in errors[1]
+        assert "_schema" in errors[2]
+        # Only the conflicting records are excluded from valid_data.
+        assert excinfo.value.valid_data == [{"tag": "a"}]
+
+    def test_unique_none_is_not_a_value_by_default(self):
+        class MySchema(Schema):
+            tag = fields.Str(allow_none=True, load_default=None)
+
+            class Meta:
+                unique_together = [("tag",)]
+
+        data = [{"tag": None}, {}, {"tag": "a"}, {"tag": "a"}]
+        with pytest.raises(ValidationError) as excinfo:
+            MySchema(many=True).load(data)
+        assert set(excinfo.value.messages) == {2, 3}
+        assert excinfo.value.valid_data == [{"tag": None}, {"tag": None}]
+
+    def test_unique_none_is_value_when_configured(self):
+        class MySchema(Schema):
+            tag = fields.Str(allow_none=True, load_default=None)
+
+            class Meta:
+                unique_together = [{"fields": ("tag",), "none_is_value": True}]
+
+        with pytest.raises(ValidationError) as excinfo:
+            MySchema(many=True).load([{"tag": None}, {"tag": None}, {"tag": "a"}])
+        assert set(excinfo.value.messages) == {0, 1}
+        assert excinfo.value.valid_data == [{"tag": "a"}]
+
+    def test_unique_together_constructor_argument(self):
+        class MySchema(Schema):
+            tag = fields.Str()
+
+        with pytest.raises(ValidationError) as excinfo:
+            MySchema(many=True, unique_together=[("tag",)]).load(
+                [{"tag": "a"}, {"tag": "a"}]
+            )
+        assert set(excinfo.value.messages) == {0, 1}
+        # Without constraints, duplicates load fine.
+        assert MySchema(many=True).load([{"tag": "a"}, {"tag": "a"}]) == [
+            {"tag": "a"},
+            {"tag": "a"},
+        ]
+
+    def test_unique_together_respects_attribute_and_data_key(self):
+        class MySchema(Schema):
+            tag = fields.Str(attribute="tag_attr", data_key="Tag")
+
+            class Meta:
+                unique_together = [("tag",)]
+
+        with pytest.raises(ValidationError) as excinfo:
+            MySchema(many=True).load([{"Tag": "a"}, {"Tag": "a"}])
+        assert set(excinfo.value.messages) == {0, 1}
+
+    def test_unique_together_without_index_errors(self):
+        class MySchema(Schema):
+            tag = fields.Str()
+
+            class Meta:
+                index_errors = False
+                unique_together = [("tag",)]
+
+        with pytest.raises(ValidationError) as excinfo:
+            MySchema(many=True).load([{"tag": "a"}, {"tag": "a"}])
+        assert excinfo.value.messages == {
+            "_schema": [
+                "Values for fields 'tag' must be unique within the batch; "
+                "duplicate value found in records at indexes 0, 1."
+            ]
+        }
+
+    def test_unique_together_enforced_by_validate(self):
+        errors = self.TagSchema(many=True).validate([{"tag": "a"}, {"tag": "a"}])
+        assert set(errors) == {0, 1}
+
+    def test_unique_together_ignored_without_many(self):
+        assert self.TagSchema().load({"tag": "a"}) == {"tag": "a"}
+
+    @pytest.mark.parametrize(
+        "unique_together",
+        (
+            [("unknown_field",)],
+            ["tag"],
+            [()],
+            [{"fields": ("tag",), "bogus_option": True}],
+        ),
+    )
+    def test_unique_together_invalid_configuration(self, unique_together):
+        class MySchema(Schema):
+            tag = fields.Str()
+
+        with pytest.raises(ValueError, match="unique_together"):
+            MySchema(unique_together=unique_together)
+
+    def test_unique_together_unhashable_values(self):
+        class MySchema(Schema):
+            items = fields.List(fields.Int())
+
+            class Meta:
+                unique_together = [("items",)]
+
+        with pytest.raises(ValueError, match="must be hashable"):
+            MySchema(many=True).load([{"items": [1]}, {"items": [1]}])

@@ -43,6 +43,21 @@ if typing.TYPE_CHECKING:
     from marshmallow.fields import Field
 
 
+class _UniqueTogetherConstraint(typing.NamedTuple):
+    """A normalized batch-level uniqueness constraint.
+
+    This class is private API.
+    """
+
+    #: Declared field names, as passed to the ``unique_together`` option.
+    field_names: tuple[str, ...]
+    #: Keys of the constraint fields in deserialized output dictionaries.
+    keys: tuple[str, ...]
+    #: Whether `None` is compared as a regular value. If `False`, records
+    #: with a `None` value for any constraint field are not compared.
+    none_is_value: bool
+
+
 def _get_fields(attrs) -> list[tuple[str, Field]]:
     """Get fields from a class
 
@@ -209,6 +224,9 @@ class SchemaOpts:
         self.exclude = getattr(meta, "exclude", ())
         if not isinstance(self.exclude, (list, tuple)):
             raise ValueError("`exclude` must be a list or tuple.")
+        self.unique_together = getattr(meta, "unique_together", ())
+        if not isinstance(self.unique_together, (list, tuple)):
+            raise ValueError("`unique_together` option must be a list or tuple.")
         self.dateformat = getattr(meta, "dateformat", None)
         self.datetimeformat = getattr(meta, "datetimeformat", None)
         self.timeformat = getattr(meta, "timeformat", None)
@@ -268,6 +286,10 @@ class Schema(metaclass=SchemaMeta):
         will be ignored. Use dot delimiters to specify nested fields.
     :param unknown: Whether to exclude, include, or raise an error for unknown
         fields in the data. Use `EXCLUDE`, `INCLUDE` or `RAISE`.
+    :param unique_together: Batch-level uniqueness constraints applied when
+        deserializing with ``many=True``. If `None`, the value of the
+        ``unique_together`` `class Meta <marshmallow.Schema.Meta>` option is
+        used. See `marshmallow.Schema.Meta.unique_together` for the format.
 
     .. versionchanged:: 3.0.0
         Remove ``prefix`` parameter.
@@ -302,6 +324,10 @@ class Schema(metaclass=SchemaMeta):
     _default_error_messages: dict[str, str] = {
         "type": "Invalid input type.",
         "unknown": "Unknown field.",
+        "unique_together": (
+            "Values for fields {field_names} must be unique within the batch; "
+            "duplicate value found in records at indexes {indexes}."
+        ),
     }
 
     OPTIONS_CLASS: type = SchemaOpts
@@ -375,6 +401,19 @@ class Schema(metaclass=SchemaMeta):
         """
         many: typing.ClassVar[bool]
         """Whether data should be (de)serialized as a collection by default."""
+        unique_together: typing.ClassVar[
+            Sequence[tuple[str, ...] | list[str] | dict[str, typing.Any]]
+        ]
+        """Batch-level uniqueness constraints applied when deserializing with
+        ``many=True``. Each entry is a tuple of declared field names whose
+        deserialized values, taken together, must be unique within the batch,
+        or a dictionary of the form
+        ``{"fields": ("field_a", "field_b"), "none_is_value": True}``.
+        Records for which a constraint field is missing or fails to
+        deserialize are not compared. If ``none_is_value`` is `False`
+        (the default), records with a `None` value for any constraint field
+        are not compared; otherwise `None` is compared as a regular value.
+        """
         dateformat: typing.ClassVar[str]
         """Default format for `Date <marshmallow.fields.Date>` fields."""
         datetimeformat: typing.ClassVar[str]
@@ -415,6 +454,8 @@ class Schema(metaclass=SchemaMeta):
         dump_only: types.StrSequenceOrSet = (),
         partial: bool | types.StrSequenceOrSet | None = None,
         unknown: types.UnknownOption | None = None,
+        unique_together: Sequence[tuple[str, ...] | list[str] | dict[str, typing.Any]]
+        | None = None,
     ):
         # Raise error if only or exclude is passed as string, not list of strings
         if only is not None and not is_collection(only):
@@ -434,12 +475,19 @@ class Schema(metaclass=SchemaMeta):
         self.unknown: types.UnknownOption = (
             self.opts.unknown if unknown is None else unknown
         )
+        if unique_together is None:
+            unique_together = self.opts.unique_together
         self._normalize_nested_options()
         #: Dictionary mapping field_names -> :class:`Field` objects
         self.fields: dict[str, Field] = {}
         self.load_fields: dict[str, Field] = {}
         self.dump_fields: dict[str, Field] = {}
         self._init_fields()
+        #: Normalized batch-level uniqueness constraints, checked when
+        #: deserializing with ``many=True``.
+        self.unique_together: list[_UniqueTogetherConstraint] = (
+            self._normalize_unique_together(unique_together)
+        )
         messages = {}
         messages.update(self._default_error_messages)
         for cls in reversed(self.__class__.__mro__):
@@ -870,6 +918,7 @@ class Schema(metaclass=SchemaMeta):
         unknown = self.unknown if unknown is None else unknown
         if partial is None:
             partial = self.partial
+        conflict_indexes: set[int] = set()
         # Run preprocessors
         if self._hooks[PRE_LOAD]:
             try:
@@ -922,6 +971,9 @@ class Schema(metaclass=SchemaMeta):
                     unknown=unknown,
                     field_errors=field_errors,
                 )
+            # Run batch-level uniqueness checks
+            if many and self.unique_together and isinstance(result, list):
+                conflict_indexes = self._validate_unique_together(result, error_store)
             errors = error_store.errors
             # Run post processors
             if not errors and postprocess and self._hooks[POST_LOAD]:
@@ -937,7 +989,16 @@ class Schema(metaclass=SchemaMeta):
                 except ValidationError as err:
                     errors = err.normalized_messages()
         if errors:
-            exc = ValidationError(errors, data=data, valid_data=result)
+            valid_data = result
+            if conflict_indexes:
+                # Records involved in a uniqueness conflict are not valid,
+                # so exclude them from valid_data.
+                valid_data = [
+                    item
+                    for index, item in enumerate(result)
+                    if index not in conflict_indexes
+                ]
+            exc = ValidationError(errors, data=data, valid_data=valid_data)
             self.handle_error(exc, data, many=many, partial=partial)
             raise exc
 
@@ -1072,6 +1133,108 @@ class Schema(metaclass=SchemaMeta):
             field_obj.dump_only = True
         field_obj._bind_to_schema(field_name, self)
         self.on_bind_field(field_name, field_obj)
+
+    def _normalize_unique_together(
+        self,
+        unique_together: Sequence[tuple[str, ...] | list[str] | dict[str, typing.Any]],
+    ) -> list[_UniqueTogetherConstraint]:
+        """Normalize the ``unique_together`` option into constraints resolved
+        against this schema's load fields. This method is private API.
+        """
+        constraints = []
+        for entry in unique_together:
+            none_is_value = False
+            if isinstance(entry, Mapping):
+                unknown_options = set(entry) - {"fields", "none_is_value"}
+                if unknown_options:
+                    raise ValueError(
+                        "Unknown `unique_together` options: "
+                        f"{sorted(unknown_options)}. "
+                        "Valid options are 'fields' and 'none_is_value'."
+                    )
+                field_names = entry.get("fields", ())
+                none_is_value = bool(entry.get("none_is_value", False))
+            else:
+                field_names = entry
+            if isinstance(field_names, str) or not is_collection(field_names):
+                raise ValueError(
+                    "`unique_together` entries must be collections of field "
+                    "names or dictionaries with a 'fields' key."
+                )
+            field_names = tuple(field_names)
+            if not field_names:
+                raise ValueError("`unique_together` entries must not be empty.")
+            keys = []
+            for field_name in field_names:
+                field_obj = self.load_fields.get(field_name)
+                if field_obj is None:
+                    raise ValueError(
+                        f"`unique_together` field {field_name!r} does not "
+                        "match any loadable field of this schema."
+                    )
+                keys.append(field_obj.attribute or field_name)
+            constraints.append(
+                _UniqueTogetherConstraint(
+                    field_names=field_names,
+                    keys=tuple(keys),
+                    none_is_value=none_is_value,
+                )
+            )
+        return constraints
+
+    def _validate_unique_together(
+        self, data: list[typing.Any], error_store: ErrorStore
+    ) -> set[int]:
+        """Check batch-level uniqueness constraints against deserialized records.
+
+        Comparison uses the deserialized values themselves, so equivalent
+        values (e.g. ``Decimal("1.0")`` and ``Decimal("1.00")``, or aware
+        datetimes in different timezones denoting the same instant) are
+        considered equal. Records for which a constraint field is missing
+        (absent from the input or failed to deserialize) are not compared, so
+        invalid records never collapse into a shared key. Records with a
+        `None` value for a constraint field are only compared if the
+        constraint sets ``none_is_value``. Return the indexes of all records
+        involved in a conflict. This method is private API.
+        """
+        conflicted: set[int] = set()
+        for constraint in self.unique_together:
+            seen: dict[tuple[typing.Any, ...], list[int]] = {}
+            for index, record in enumerate(data):
+                if not isinstance(record, Mapping):
+                    continue
+                values = []
+                for key in constraint.keys:
+                    value = record.get(key, missing)
+                    if value is missing or (
+                        value is None and not constraint.none_is_value
+                    ):
+                        break
+                    values.append(value)
+                else:
+                    try:
+                        seen.setdefault(tuple(values), []).append(index)
+                    except TypeError as error:
+                        raise ValueError(
+                            "Values of `unique_together` fields "
+                            f"{constraint.field_names} must be hashable."
+                        ) from error
+            for indexes in seen.values():
+                if len(indexes) < 2:
+                    continue
+                conflicted.update(indexes)
+                message = self.error_messages["unique_together"].format(
+                    field_names=", ".join(
+                        repr(name) for name in constraint.field_names
+                    ),
+                    indexes=", ".join(str(index) for index in indexes),
+                )
+                if self.opts.index_errors:
+                    for index in indexes:
+                        error_store.store_error([message], index=index)
+                else:
+                    error_store.store_error([message])
+        return conflicted
 
     def _invoke_dump_processors(
         self, tag: str, data, *, many: bool, original_data=None

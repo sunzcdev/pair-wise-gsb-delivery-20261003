@@ -1,6 +1,20 @@
 Changelog
 =========
 
+4.5.0 (unreleased)
+------------------
+
+Features:
+
+- Add ``unique_together`` schema option and constructor argument for
+  batch-level uniqueness constraints when deserializing with ``many=True``.
+  Constraints compare deserialized values (supporting `Decimal` and
+  timezone-aware datetimes), report the indexes of all conflicting records,
+  and exclude conflicting records from ``valid_data``. Records with missing
+  or invalid constraint fields are never collapsed into a shared key;
+  handling of explicit `None` is configurable per constraint via
+  ``none_is_value``.
+
 4.4.0 (2026-11-03)
 ------------------
 
