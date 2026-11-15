@@ -1,6 +1,20 @@
 Changelog
 =========
 
+Unreleased
+----------
+
+Features:
+
+- Add experimental attribute access policies
+  (``marshmallow.experimental.access.AccessPolicy``) for dumping ORM objects
+  without triggering property getters or lazy queries. The ``"instance"``
+  mode reads only data already present on each instance, the ``"allowlist"``
+  mode additionally permits descriptors for declared field names, and a read
+  plan reports which fields were forbidden or missing. Nested, Method and
+  attribute paths all respect the policy without probing getters for
+  existence. Plain dumps without an active policy are unchanged.
+
 4.4.0 (2026-11-03)
 ------------------
 

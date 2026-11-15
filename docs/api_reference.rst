@@ -10,6 +10,7 @@
     marshmallow.validate
     marshmallow.utils
     marshmallow.experimental.context
+    marshmallow.experimental.access
     marshmallow.exceptions
 
 Private API

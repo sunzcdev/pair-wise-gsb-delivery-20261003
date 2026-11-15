@@ -10,6 +10,7 @@ The guides below demonstrate how to extend schemas in various ways.
   schema_validation
   using_original_input_data
   overriding_attribute_access
+  access_policies
   custom_error_handling
   custom_options
   custom_error_messages

@@ -33,7 +33,6 @@ from marshmallow.error_store import ErrorStore
 from marshmallow.exceptions import SCHEMA, StringNotCollectionError, ValidationError
 from marshmallow.orderedset import OrderedSet
 from marshmallow.utils import (
-    get_value,
     is_collection,
     is_sequence_but_not_string,
     set_value,
@@ -500,10 +499,18 @@ class Schema(metaclass=SchemaMeta):
     def get_attribute(self, obj: typing.Any, attr: str, default: typing.Any):
         """Defines how to pull values from an object to serialize.
 
+        When an :class:`~marshmallow.access.AccessPolicy` is active, access is
+        delegated to it so that forbidden descriptors (properties, lazy
+        relationships, ...) are never invoked. Subclasses overriding this
+        method can call :func:`marshmallow.access.access_value` to keep the
+        same behavior.
+
         .. versionchanged:: 3.0.0a1
             Changed position of ``obj`` and ``attr``.
         """
-        return get_value(obj, attr, default)
+        from marshmallow.access import access_value, get_active_policy  # noqa: PLC0415
+
+        return access_value(obj, attr, default, policy=get_active_policy())
 
     ##### Serialization/Deserialization API #####
 
@@ -543,7 +550,28 @@ class Schema(metaclass=SchemaMeta):
                 continue
             key = field_obj.data_key if field_obj.data_key is not None else attr_name
             ret[key] = value
+        self._attach_read_plan()
         return ret
+
+    def _attach_read_plan(self) -> None:
+        """Attach a read plan describing unevaluated fields to the active
+        :class:`~marshmallow.access.AccessPolicy`, if one is in scope.
+
+        Fields skipped because their access was forbidden or the attribute was
+        missing are reconciled here without having executed any getter.
+        """
+        from marshmallow.access import get_active_policy  # noqa: PLC0415
+
+        policy = get_active_policy()
+        if policy is None:
+            return
+        attribute_to_field = {
+            (field_obj.attribute or field_name): field_name
+            for field_name, field_obj in self.dump_fields.items()
+        }
+        policy._read_plan = policy.build_read_plan(
+            self.dump_fields.keys(), attribute_to_field
+        )
 
     def dump(self, obj: typing.Any, *, many: bool | None = None):
         """Serialize an object to native Python data types according to this

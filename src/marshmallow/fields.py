@@ -17,6 +17,7 @@ from enum import Enum as EnumType
 from typing import Unpack
 
 from marshmallow import class_registry, types, utils, validate
+from marshmallow.access import forbidden_access as _forbidden_access
 from marshmallow.constants import missing as missing_
 from marshmallow.exceptions import (
     StringNotCollectionError,
@@ -168,6 +169,12 @@ class Field(typing.Generic[_InternalT]):
     #  for those fields
     _CHECK_ATTRIBUTE = True
 
+    # Whether the field executes arbitrary, schema-declared callables
+    # (Method/Function) instead of reading a declared attribute. Such fields
+    # must respect the active access policy's declaration scope explicitly,
+    # since they bypass the attribute accessor entirely.
+    _POLICY_GATED_CALLABLE = False
+
     #: Default error messages for various kinds of errors. The keys in this dictionary
     #: are passed to `Field.make_error`. The values are error messages passed to
     #: :exc:`marshmallow.exceptions.ValidationError`.
@@ -318,14 +325,46 @@ class Field(typing.Generic[_InternalT]):
         """
         if self._CHECK_ATTRIBUTE:
             value = self.get_value(obj, attr, accessor=accessor)
-            if value is missing_:
+            if value is _forbidden_access:
+                # The active policy blocked the access and already recorded
+                # the field. Honor dump_default (like a missing attribute),
+                # otherwise skip the field without ever running a getter.
                 default = self.dump_default
                 value = default() if callable(default) else default
-            if value is missing_:
-                return value
+                if value is missing_:
+                    return missing_
+            elif value is missing_:
+                default = self.dump_default
+                value = default() if callable(default) else default
+                if value is missing_:
+                    return value
+        elif self._POLICY_GATED_CALLABLE and not self._allowed_by_policy(attr):
+            # Method/Function fields bypass the accessor and their
+            # ``_serialize`` always invokes the declared callable, so the
+            # policy has to short-circuit here without ever calling it.
+            return missing_
         else:
             value = None
         return self._serialize(value, attr, obj, **kwargs)
+
+    def _allowed_by_policy(self, attr: str) -> bool:
+        """Whether an active :class:`~marshmallow.access.AccessPolicy` permits
+        this field's callable to run.
+
+        With no active policy the field behaves exactly as before.
+        """
+        from marshmallow.access import get_active_policy  # noqa: PLC0415
+
+        policy = get_active_policy()
+        if policy is None:
+            return True
+        check_key = attr if self.attribute is None else self.attribute
+        # The policy answers from its declaration scope alone; no getter is
+        # ever executed to find out whether the attribute exists.
+        if policy.allows(check_key, None):
+            return True
+        policy.record_forbidden(check_key)
+        return False
 
     # If value is None, None may be returned
     @typing.overload
@@ -2006,6 +2045,7 @@ class Method(Field):
     """
 
     _CHECK_ATTRIBUTE = False
+    _POLICY_GATED_CALLABLE = True
 
     def __init__(
         self,
@@ -2068,6 +2108,7 @@ class Function(Field):
     """
 
     _CHECK_ATTRIBUTE = False
+    _POLICY_GATED_CALLABLE = True
 
     def __init__(
         self,

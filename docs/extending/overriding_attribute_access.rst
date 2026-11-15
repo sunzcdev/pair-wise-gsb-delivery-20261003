@@ -15,3 +15,8 @@ However, if you want to specify how values are accessed from an object, you can 
         # use dict.get for all input objects
         def get_attribute(self, obj, key, default):
             return obj.get(key, default)
+
+.. seealso::
+    :doc:`access_policies` describes how to prevent property getters and lazy
+    ORM relationships from executing during a dump, without overriding this
+    method yourself.
