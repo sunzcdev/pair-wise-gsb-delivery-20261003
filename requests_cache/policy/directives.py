@@ -23,6 +23,9 @@ class CacheDirectives(RichMixin):
     must_revalidate: bool = field(default=False)
     no_cache: bool = field(default=False)
     no_store: bool = field(default=False)
+    private: bool = field(default=False)
+    public: bool = field(default=False)
+    s_maxage: Optional[int] = field(default=None, converter=try_int)
     actual_no_cache: bool = field(default=False)  # Nonstandard value/internal use only
     only_if_cached: bool = field(default=False)
     stale_if_error: int = field(default=None, converter=try_int)
@@ -58,6 +61,22 @@ class CacheDirectives(RichMixin):
     @property
     def has_validator(self) -> bool:
         return bool(self.etag or self.last_modified)
+
+    @property
+    def allows_shared_storage(self) -> bool:
+        """Whether a shared cache may store this response.
+
+        ``no-store`` takes precedence over every other directive, and ``private`` takes
+        precedence over directives that would otherwise permit shared caching.
+        """
+        return not (self.no_store or self.private)
+
+    @property
+    def allows_authorized_shared_reuse(self) -> bool:
+        """Whether a shared cache may store or reuse this response for a request with
+        authorization.
+        """
+        return self.allows_shared_storage and (self.public or self.s_maxage is not None)
 
 
 def _split_kv_directive(directive: str):

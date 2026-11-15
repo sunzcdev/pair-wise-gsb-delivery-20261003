@@ -60,6 +60,7 @@ class CacheMixin(MIXIN_BASE):
         read_only: bool = False,
         stale_if_error: Union[bool, int] = False,
         autoclose: bool = True,
+        shared_cache: bool = False,
         **kwargs,
     ):
         self.cache = init_backend(cache_name, backend, serializer=serializer, **kwargs)
@@ -76,6 +77,7 @@ class CacheMixin(MIXIN_BASE):
             filter_fn=filter_fn,
             key_fn=key_fn,
             read_only=read_only,
+            shared_cache=shared_cache,
             stale_if_error=stale_if_error,
             autoclose=autoclose,
             **kwargs,
@@ -407,6 +409,10 @@ class CachedSession(CacheMixin, OriginalSession):
         ignored_parameters: Request parameters, headers, and/or JSON body params to exclude from both
             request matching and cached request data
         read_only: Read existing cached responses, but do not write any new responses to the cache
+        shared_cache: Enable shared cache behavior. Responses marked ``private`` or ``no-store``
+            will not be stored or reused, and requests with an ``Authorization`` header will only
+            use responses that explicitly allow shared caching (``Cache-Control: public`` or
+            ``s-maxage``)
         stale_if_error: Return a stale response if a new request raises an exception. Optionally
             accepts a time value representing maximum staleness to accept.
         stale_while_revalidate: Return a stale response initially, while a non-blocking request is

@@ -1,3 +1,4 @@
+from collections.abc import Mapping as MappingABC
 from datetime import datetime, timedelta
 from logging import DEBUG, getLogger
 from typing import TYPE_CHECKING, Dict, List, Mapping, MutableMapping, Optional, Union
@@ -168,8 +169,12 @@ class CacheActions(RichMixin):
         * max-stale
         * stale-if-error (if an error has occurred)
         * stale-while-revalidate
+
+        In shared cache mode, a response must also be eligible for shared caching.
         """
         if cached_response is None:
+            return False
+        elif self._settings.shared_cache and not self._is_shared_cache_eligible(cached_response):
             return False
         elif (
             cached_response.expires is None
@@ -206,7 +211,26 @@ class CacheActions(RichMixin):
             key_kwargs: Additional keyword arguments for ``create_key``.
         """
         self._vary_matched = True
-        if cached_response is not None and self._settings.cache_control:
+
+        # A shared cache must re-check eligibility for existing entries, including entries that
+        # were stored before the cache was configured in shared mode.
+        if (
+            cached_response is not None
+            and self._settings.shared_cache
+            and not self._is_shared_cache_eligible(cached_response)
+        ):
+            logger.debug(
+                f'Cached response for URL {cached_response.url} is not eligible for a shared cache'
+            )
+            if self._only_if_cached:
+                self.error_504 = True
+            else:
+                self.send_request = True
+            return
+
+        if cached_response is not None and (
+            self._settings.cache_control or self._settings.shared_cache
+        ):
             self._update_from_cached_response_headers(cached_response)
 
         usable_response = self.is_usable(cached_response)
@@ -244,7 +268,7 @@ class CacheActions(RichMixin):
         Used after receiving a new response, but before saving it to the cache.
         """
         directives = CacheDirectives.from_headers(response.headers)
-        if self._settings.cache_control:
+        if self._settings.cache_control or self._settings.shared_cache:
             self._update_from_response_headers(directives)
 
         # If "expired" but there's a validator, save it to the cache and revalidate on use
@@ -255,6 +279,14 @@ class CacheActions(RichMixin):
         callback = self._settings.filter_fn
         filtered_out = callback is not None and not callback(response)
 
+        # In shared cache mode, enforce response directives even when cache_control is disabled.
+        # Authorization requests may only be stored if the response explicitly allows shared reuse.
+        shared_eligible = True
+        if self._settings.shared_cache:
+            shared_eligible = directives.allows_shared_storage
+            if shared_eligible and self._request_has_authorization(response):
+                shared_eligible = directives.allows_authorized_shared_reuse
+
         # Check and log conditions for writing to the cache
         write_criteria = {
             'disabled cache': self._settings.disabled,
@@ -263,6 +295,7 @@ class CacheActions(RichMixin):
             'disabled by filter': filtered_out,
             'disabled by headers': self.skip_write,
             'disabled by expiration': do_not_cache or skip_stale,
+            'disabled by shared cache policy': not shared_eligible,
             'disabled by read-only': self._settings.read_only,
         }
         self.skip_write = any(write_criteria.values())
@@ -314,6 +347,25 @@ class CacheActions(RichMixin):
             self._base_stale_while_revalidate or directives.stale_while_revalidate
         )
 
+    def _is_shared_cache_eligible(self, cached_response: 'CachedResponse') -> bool:
+        """Check whether an existing cached response may be used by a shared cache"""
+        directives = CacheDirectives.from_headers(cached_response.headers)
+        if not directives.allows_shared_storage:
+            return False
+        if self._request_has_authorization():
+            return directives.allows_authorized_shared_reuse
+        return True
+
+    def _request_has_authorization(self, response: Optional[Response] = None) -> bool:
+        """Check the original request and response chain for an Authorization header"""
+        requests = [self._request]
+        if response is not None:
+            requests.append(getattr(response, 'request', None))
+            requests.extend(
+                getattr(r, 'request', None) for r in (getattr(response, 'history', None) or [])
+            )
+        return any(_has_authorization(request) for request in requests)
+
     def _update_from_response_headers(self, directives: CacheDirectives):
         """Check response headers for expiration and other cache directives"""
         logger.debug(f'Cache directives from response headers: {directives}')
@@ -322,7 +374,10 @@ class CacheActions(RichMixin):
         if directives.immutable:
             self.expire_after = NEVER_EXPIRE
         else:
+            # For a shared cache, s-maxage overrides max-age and Expires
+            shared_expires = directives.s_maxage if self._settings.shared_cache else None
             self.expire_after = coalesce(
+                shared_expires,
                 directives.max_age,
                 _validate_expires_header(directives.expires),
                 self.expire_after,
@@ -338,10 +393,10 @@ class CacheActions(RichMixin):
         revalidate = directives.has_validator and (
             cached_response.is_expired or self._refresh or self._settings.always_revalidate
         )
-        # These conditions only apply if cache_control=True
-        cc_revalidate = self._settings.cache_control and (
-            directives.no_cache or directives.must_revalidate
-        )
+        # These conditions only apply if response headers are enabled
+        cc_revalidate = (
+            self._settings.cache_control or self._settings.shared_cache
+        ) and (directives.no_cache or directives.must_revalidate)
 
         # Add the appropriate validation headers, if needed
         if revalidate or cc_revalidate:
@@ -448,6 +503,14 @@ def _is_method_allowed(request: PreparedRequest, settings: CacheSettings) -> boo
     methods = [headers.get(k) for k in METHOD_OVERRIDE_HEADERS]
     methods += [request.method]
     return any(m is not None and m in settings.allowable_methods for m in methods)
+
+
+def _has_authorization(request) -> bool:
+    """Check whether a request contains an Authorization header"""
+    headers = getattr(request, 'headers', None)
+    if not isinstance(headers, MappingABC):
+        return False
+    return any(k.lower() == 'authorization' and v for k, v in headers.items())
 
 
 def _log_vary_diff(

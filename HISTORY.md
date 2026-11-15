@@ -1,6 +1,8 @@
 # History
 
 ## Unreleased
+* Add an explicit `shared_cache` mode with RFC 9111 shared-cache admission rules for
+  `Authorization`, `private`, `public`, `s-maxage`, and `no-store`
 * Fix `ValueError` when a response has an invalid `Expires` date (for example `Expires: garbage`); it is now treated as already expired
 * Fix JSON refresh comparisons for mixed-case `Content-Type` values
 * Keep caller-supplied MongoDB clients open when closing MongoDB or GridFS caches

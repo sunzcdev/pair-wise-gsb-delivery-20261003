@@ -67,6 +67,22 @@ It's preferable to handle this proactively in your application, though. Options 
   `ignored_parameters`. If your cache backend is secured, you can choose to not redact auth
   headers/params from the cache.
 
+(shared-cache)=
+### Shared Cache Mode
+If the cache is shared by multiple principals and needs to follow shared-cache rules, enable
+`shared_cache`:
+```python
+>>> session = CachedSession(shared_cache=True)
+```
+In this mode, responses marked `Cache-Control: private` or `no-store` are neither stored nor
+reused. A request with an `Authorization` header can only use a cached response if the response
+explicitly allows shared caching with `Cache-Control: public` or `s-maxage`.
+
+`no-store` takes precedence over all other directives, and `private` takes precedence over
+`public` and `s-maxage`. For a shared cache, `s-maxage` also overrides `max-age` and `Expires`.
+These checks apply to existing cache entries as well, so entries created before shared mode was
+enabled are re-checked before use.
+
 Example: In the case of `Authorization` with a JWT, this would make the tradeoff of storing the
 token in the cache but making it usable for request matching (i.e., store a separate cached response
 per token value).

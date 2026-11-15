@@ -49,6 +49,7 @@ class CacheSettings(RichMixin):
     stale_if_error: Union[bool, ExpirationTime] = field(default=False)
     stale_while_revalidate: Union[bool, ExpirationTime] = field(default=False)
     urls_expire_after: Dict[ExpirationPattern, ExpirationTime] = field(factory=dict)
+    shared_cache: bool = field(default=False)
 
     @classmethod
     def from_kwargs(cls, **kwargs):

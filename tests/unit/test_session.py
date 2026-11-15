@@ -788,6 +788,89 @@ def test_default_ignored_parameters(mock_session):
     assert response.request.headers['Authorization'] == 'REDACTED'
 
 
+@pytest.mark.parametrize(
+    'response_headers, expected_from_cache',
+    [
+        # Authenticated requests require an explicit shared-cache directive
+        ({}, [False, False, False]),
+        ({'Cache-Control': 'max-age=60'}, [False, False, False]),
+        ({'Cache-Control': 'private, max-age=60'}, [False, False, False]),
+        ({'Cache-Control': 'public, max-age=60'}, [False, True, True]),
+        ({'Cache-Control': 's-maxage=60'}, [False, True, True]),
+        # private and no-store take precedence over public/s-maxage
+        ({'Cache-Control': 'private, public, max-age=60'}, [False, False, False]),
+        ({'Cache-Control': 'private, s-maxage=60'}, [False, False, False]),
+        ({'Cache-Control': 'no-store, public, max-age=60'}, [False, False, False]),
+        ({'Cache-Control': 'no-store, s-maxage=60'}, [False, False, False]),
+    ],
+)
+def test_shared_cache__authorization_admission(mock_session, response_headers, expected_from_cache):
+    """Two identities on the same URL must only share entries allowed by the response directives"""
+    mock_session.settings.shared_cache = True
+    url = f'{MOCKED_URL}/shared-auth'
+    mock_session.mock_adapter.register_uri(
+        'GET', url, headers=response_headers, text='mock response', status_code=200
+    )
+
+    responses = [
+        mock_session.get(url, headers={'Authorization': 'Bearer user-1'}),
+        mock_session.get(url, headers={'Authorization': 'Bearer user-1'}),
+        mock_session.get(url, headers={'Authorization': 'Bearer user-2'}),
+    ]
+
+    assert [response.from_cache for response in responses] == expected_from_cache
+    assert mock_session.mock_adapter.call_count == expected_from_cache.count(False)
+
+
+@pytest.mark.parametrize(
+    'request_headers, expected_from_cache',
+    [
+        ({}, False),
+        ({'Authorization': 'Bearer user-1'}, False),
+    ],
+)
+def test_shared_cache__rechecks_existing_private_entry(
+    mock_session, request_headers, expected_from_cache
+):
+    """Entries stored before shared mode was enabled must be re-checked for eligibility"""
+    mock_session.settings.shared_cache = True
+    url = f'{MOCKED_URL}/shared-existing-private'
+    mock_session.mock_adapter.register_uri('GET', url, text='fresh response', status_code=200)
+
+    request = Request('GET', url, headers=request_headers).prepare()
+    cache_key = mock_session.cache.create_key(request)
+    mock_session.cache.responses[cache_key] = CachedResponse(
+        url=url,
+        status_code=200,
+        headers={'Cache-Control': 'private, max-age=60'},
+        expires=utcnow() + timedelta(hours=1),
+    )
+
+    response = mock_session.get(url, headers=request_headers)
+
+    assert response.from_cache is expected_from_cache
+    assert mock_session.mock_adapter.call_count == 1
+
+
+@pytest.mark.parametrize('cache_control', [False, True])
+def test_shared_cache__s_maxage_expiration(mock_session, cache_control):
+    """s-maxage should control freshness for a shared cache, regardless of max-age"""
+    mock_session.settings.shared_cache = True
+    mock_session.settings.cache_control = cache_control
+    url = f'{MOCKED_URL}/shared-s-maxage'
+    mock_session.mock_adapter.register_uri(
+        'GET',
+        url,
+        headers={'Cache-Control': 'max-age=1, s-maxage=60'},
+        text='mock response',
+        status_code=200,
+    )
+
+    response = mock_session.get(url, headers={'Authorization': 'Bearer user-1'})
+
+    assert 58 <= (response.expires - utcnow()).total_seconds() <= 61
+
+
 @patch_normalize_url
 def test_filter_fn(mock_normalize_url, mock_session):
     mock_session.settings.filter_fn = lambda r: r.request.url != MOCKED_URL_JSON

@@ -12,10 +12,7 @@ from tests.conftest import ETAG, HTTPDATE_STR, LAST_MODIFIED, MOCKED_URL, create
 
 IGNORED_DIRECTIVES = [
     'no-transform',
-    'private',
     'proxy-revalidate',
-    'public',
-    's-maxage=<seconds>',
 ]
 BASIC_REQUEST = Request(method='GET', url='https://site.com/img.jpg', headers={})
 EXPIRED_RESPONSE = CachedResponse(expires=utcnow() - timedelta(1))
@@ -593,6 +590,112 @@ def test_update_from_response__no_store():
     actions = CacheActions.from_request('key', BASIC_REQUEST, CacheSettings(cache_control=True))
     actions.update_from_response(create_mock_response(headers={'Cache-Control': 'no-store'}))
     assert actions.skip_write is True
+
+
+@pytest.mark.parametrize(
+    'response_headers, request_headers, expected_skip_write',
+    [
+        # Unauthenticated responses may be shared unless explicitly restricted
+        ({}, {}, False),
+        ({'Cache-Control': 'public, max-age=60'}, {}, False),
+        ({'Cache-Control': 's-maxage=60'}, {}, False),
+        ({'Cache-Control': 'private, max-age=60'}, {}, True),
+        ({'Cache-Control': 'no-store, public, max-age=60'}, {}, True),
+        # Authenticated responses require an explicit shared-cache directive
+        ({}, {'Authorization': 'Bearer user-1'}, True),
+        ({'Cache-Control': 'max-age=60'}, {'Authorization': 'Bearer user-1'}, True),
+        ({'Cache-Control': 'public, max-age=60'}, {'Authorization': 'Bearer user-1'}, False),
+        ({'Cache-Control': 's-maxage=60'}, {'Authorization': 'Bearer user-1'}, False),
+        # no-store and private take precedence over public/s-maxage
+        (
+            {'Cache-Control': 'no-store, public, max-age=60'},
+            {'Authorization': 'Bearer user-1'},
+            True,
+        ),
+        (
+            {'Cache-Control': 'no-store, s-maxage=60'},
+            {'Authorization': 'Bearer user-1'},
+            True,
+        ),
+        (
+            {'Cache-Control': 'private, public, max-age=60'},
+            {'Authorization': 'Bearer user-1'},
+            True,
+        ),
+        (
+            {'Cache-Control': 'private, s-maxage=60'},
+            {'Authorization': 'Bearer user-1'},
+            True,
+        ),
+    ],
+)
+def test_update_from_response__shared_cache(
+    response_headers, request_headers, expected_skip_write
+):
+    request = Request(method='GET', url=MOCKED_URL, headers=request_headers).prepare()
+    actions = CacheActions.from_request('key', request, CacheSettings(shared_cache=True))
+    actions.update_from_response(
+        create_mock_response(headers=response_headers, request_headers=request_headers)
+    )
+
+    assert actions.skip_write is expected_skip_write
+
+
+def test_update_from_response__shared_cache_s_maxage_expiration():
+    request = Request(
+        method='GET', url=MOCKED_URL, headers={'Authorization': 'Bearer user-1'}
+    ).prepare()
+    actions = CacheActions.from_request('key', request, CacheSettings(shared_cache=True))
+    actions.update_from_response(
+        create_mock_response(headers={'Cache-Control': 'max-age=60, s-maxage=120'})
+    )
+
+    assert actions.expire_after == 120
+
+
+@pytest.mark.parametrize(
+    'cached_headers, request_headers, expected_send_request',
+    [
+        ({'Cache-Control': 'public, max-age=60'}, {}, False),
+        ({'Cache-Control': 's-maxage=60'}, {}, False),
+        ({'Cache-Control': 'private, max-age=60'}, {}, True),
+        ({'Cache-Control': 'no-store, max-age=60'}, {}, True),
+        ({'Cache-Control': 'max-age=60'}, {'Authorization': 'Bearer user-1'}, True),
+        (
+            {'Cache-Control': 'private, public, max-age=60'},
+            {'Authorization': 'Bearer user-1'},
+            True,
+        ),
+        (
+            {'Cache-Control': 'no-store, s-maxage=60'},
+            {'Authorization': 'Bearer user-1'},
+            True,
+        ),
+        (
+            {'Cache-Control': 'public, max-age=60'},
+            {'Authorization': 'Bearer user-1'},
+            False,
+        ),
+        (
+            {'Cache-Control': 's-maxage=60'},
+            {'Authorization': 'Bearer user-1'},
+            False,
+        ),
+    ],
+)
+def test_update_from_cached_response__shared_cache(
+    cached_headers, request_headers, expected_send_request
+):
+    request = Request(method='GET', url=MOCKED_URL, headers=request_headers).prepare()
+    actions = CacheActions.from_request('key', request, CacheSettings(shared_cache=True))
+    cached_response = CachedResponse(
+        headers=cached_headers,
+        expires=utcnow() + timedelta(hours=1),
+    )
+
+    actions.update_from_cached_response(cached_response)
+    assert actions.send_request is expected_send_request
+    assert actions.is_usable(cached_response) is not expected_send_request
 
 
 def test_update_from_response__ignored():
