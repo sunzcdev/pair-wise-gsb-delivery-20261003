@@ -33,5 +33,44 @@ class TaskException(Exception):
         return self.metadata.get('error') or 'unknown error'
 
 
+class RetryDecisionError(HueyException):
+    """
+    Raised when a task's retry-policy callback itself fails, or when it
+    returns an unusable decision. Wraps both the exception raised by the task
+    and the error encountered while deciding how to retry it. The task is not
+    retried again -- retrying would just re-enter the broken policy, risking
+    an endless loop.
+    """
+    def __init__(self, task_error, decision_error):
+        self.task_error = task_error
+        self.decision_error = decision_error
+        super(RetryDecisionError, self).__init__(
+            'retry policy failed for %r: %r' % (task_error, decision_error))
+
+    def __repr__(self):
+        return 'RetryDecisionError(task_error=%r, decision_error=%r)' % (
+            self.task_error, self.decision_error)
+
+
+class RetryDeadlineExceeded(HueyException):
+    """
+    Raised when a retry-policy callback asks for a next attempt that would
+    run after the task's total deadline (or the deadline has already passed).
+    Marks an explicit, final failure rather than silently dropping the retry
+    or scheduling it outside the allowed window.
+    """
+    def __init__(self, task_error, deadline, eta=None):
+        self.task_error = task_error
+        self.deadline = deadline
+        self.eta = eta
+        super(RetryDeadlineExceeded, self).__init__(
+            'retry deadline %s exceeded (planned eta %s) for %r' % (
+                deadline, eta, task_error))
+
+    def __repr__(self):
+        return 'RetryDeadlineExceeded(deadline=%r, eta=%r, task_error=%r)' % (
+            self.deadline, self.eta, self.task_error)
+
+
 # Not failures while a retry is pending.
 RETRYING_EXCEPTIONS = (RetryTask, RateLimitExceeded, TaskLockedException)

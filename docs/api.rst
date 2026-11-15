@@ -363,10 +363,11 @@ Huey object
             # ... later ...
             consumer.stop(graceful=True)
 
-    .. py:method:: task(retries=0, retry_delay=0, retry_backoff=0, priority=None, context=False, name=None, expires=None, timeout=None, **kwargs)
+    .. py:method:: task(retries=0, retry_delay=0, retry_backoff=0, priority=None, context=False, name=None, expires=None, timeout=None, retry_policy=None, retry_deadline=None, **kwargs)
 
         :param int retries: number of times to retry the function if an
-            unhandled exception occurs when it is executed.
+            unhandled exception occurs when it is executed. This also acts as
+            a hard cap on retries requested by a ``retry_policy`` callback.
         :param int retry_delay: number of seconds to wait between retries.
         :param retry_backoff: multiplier applied to the delay after each failed
             attempt, giving exponentially-growing waits between retries. The
@@ -374,6 +375,18 @@ Huey object
             disables backoff. A value of ``1`` leaves the delay constant, and
             values below ``1`` shrink it. Floats are accepted. See
             :ref:`recipe-exponential-backoff`.
+        :param retry_policy: optional callable invoked with
+            ``(exc, attempts, time_remaining)`` after an ordinary failure while
+            retries remain. It must return a :py:class:`RetryDecision`
+            describing whether to abort, retry immediately, or schedule the
+            next attempt. Cancellation, explicit :py:class:`RetryTask`,
+            rate-limit and lock rejections are not passed to it. See
+            :ref:`retry-policy`.
+        :param retry_deadline: optional absolute datetime or number of seconds
+            bounding the whole retry chain. A retry scheduled after the
+            deadline, or a failure occurring once it has elapsed, ends the task
+            with :py:class:`RetryDeadlineExceeded`. Relative values are
+            resolved when the task is enqueued.
         :param int priority: priority assigned to task, higher numbers are
             processed first by the consumer when there is a backlog. See
             :ref:`priority` (supported by every storage backend except
@@ -453,7 +466,7 @@ Huey object
         revocation, etc.), see :py:class:`TaskWrapper`, :py:class:`Task`,
         and :py:class:`Result`.
 
-    .. py:method:: periodic_task(validate_datetime, retries=0, retry_delay=0, retry_backoff=0, priority=None, context=False, name=None, expires=None, timeout=None, **kwargs)
+    .. py:method:: periodic_task(validate_datetime, retries=0, retry_delay=0, retry_backoff=0, priority=None, context=False, name=None, expires=None, timeout=None, retry_policy=None, retry_deadline=None, **kwargs)
 
         :param function validate_datetime: function which accepts a
             ``datetime`` instance and returns whether the task should be
@@ -463,6 +476,10 @@ Huey object
         :param int retry_delay: number of seconds to wait in-between retries.
         :param retry_backoff: multiplier applied to the delay after each failed
             attempt. See :py:meth:`~Huey.task`.
+        :param retry_policy: optional retry-decision callback. See
+            :py:meth:`~Huey.task` and :ref:`retry-policy`.
+        :param retry_deadline: optional absolute datetime or number of seconds
+            bounding the retry chain. See :py:meth:`~Huey.task`.
         :param int priority: priority assigned to task, higher numbers are
             processed first by the consumer when there is a backlog. See
             :ref:`priority` (supported by every storage backend except
@@ -1393,7 +1410,7 @@ Huey object
 
 
 
-.. py:class:: Task(args=None, kwargs=None, id=None, eta=None, retries=None, retry_delay=None, priority=None, expires=None, on_complete=None, on_error=None, expires_resolved=None, timeout=None, chord_config=None, retry_backoff=None)
+.. py:class:: Task(args=None, kwargs=None, id=None, eta=None, retries=None, retry_delay=None, priority=None, expires=None, on_complete=None, on_error=None, expires_resolved=None, timeout=None, chord_config=None, retry_backoff=None, retry_deadline=None, retry_deadline_resolved=None, attempts=None)
 
     :param tuple args: arguments for the function call.
     :param dict kwargs: keyword arguments for the function call.
@@ -1403,6 +1420,11 @@ Huey object
     :param int retry_delay: seconds to wait before retrying a failed task.
     :param retry_backoff: multiplier applied to ``retry_delay`` after each
         failed attempt. See :py:meth:`~Huey.task`.
+    :param retry_deadline: absolute datetime or number of seconds bounding the
+        whole retry chain. Relative values are resolved to
+        ``retry_deadline_resolved`` when the task is enqueued.
+    :param int attempts: number of times this task instance has executed. It
+        is serialized with the task and passed to the retry-policy callback.
     :param int priority: priority assigned to task, higher numbers are
         processed first by the consumer when there is a backlog.
     :param expires: set expiration time for task. If the task is not run
@@ -2341,6 +2363,49 @@ Exceptions
                 # Try again in 60 seconds for an HTTP error (500, etc).
                 raise RetryTask(delay=60)
             ...
+
+.. py:class:: RetryDecision
+
+    Return value of a task's ``retry_policy`` callback, describing what should
+    happen after a failure. Instances are created through the factory
+    classmethods rather than the constructor:
+
+    .. py:classmethod:: abort()
+
+        Give up and mark the task permanently failed.
+
+    .. py:classmethod:: retry_now()
+
+        Re-enqueue the task for an immediate retry.
+
+    .. py:classmethod:: retry_at(eta)
+
+        Schedule the next attempt for the absolute ``datetime`` ``eta``.
+
+    .. py:classmethod:: retry_after(delay)
+
+        Schedule the next attempt after ``delay`` seconds (a number) or a
+        ``timedelta``. Non-positive and non-finite delays raise ``ValueError``.
+
+    The runtime re-validates every decision. A time in the past, an illegal
+    interval, or an object that is not a :py:class:`RetryDecision` can never
+    reach the scheduling queue; the task fails definitively with
+    :py:class:`RetryDecisionError` instead.
+
+.. py:class:: RetryDecisionError(task_error, decision_error)
+
+    Raised when a ``retry_policy`` callback itself throws, or when it returns
+    an unusable decision. Wraps both the exception raised by the task
+    (``task_error``) and the error from the decision logic
+    (``decision_error``). The task is not retried again, so a broken callback
+    cannot recurse indefinitely.
+
+.. py:class:: RetryDeadlineExceeded(task_error, deadline, eta=None)
+
+    Raised when a policy asks for a next attempt that would run after the
+    task's ``retry_deadline`` (or the deadline has already elapsed when the
+    task fails). Marks an explicit, final failure rather than silently
+    dropping the retry or scheduling it outside the allowed window.
 
 .. py:class:: TaskException
 

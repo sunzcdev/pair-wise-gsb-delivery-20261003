@@ -5,6 +5,24 @@ Changelog
 
 [View commits](https://github.com/coleifer/huey/compare/3.5.4...master)
 
+* Add pluggable `retry_policy` callback to `task()` and `periodic_task()`.
+  The callback receives the exception, number of attempts and the time
+  remaining before an optional `retry_deadline`, and returns a
+  `RetryDecision` to abort, retry immediately, or schedule the next attempt
+  at an absolute time or after a delay. Existing `retries`, `retry_delay`
+  and `retry_backoff` configuration continues to work unchanged.
+* Add `retry_deadline` to bound the whole retry chain. A next attempt that
+  would run after the deadline, or a failure after the deadline has elapsed,
+  ends the task with an explicit `RetryDeadlineExceeded` failure.
+* Decisions are validated before they reach the scheduling queue: past times
+  and illegal (non-positive/non-finite) intervals never get scheduled and
+  instead fail definitively. A `retry_policy` that raises or returns an
+  unusable decision fails the task with `RetryDecisionError`, preserving
+  both the original task error and the decision error without recursive
+  retries. Cancellation, explicit `RetryTask`, rate-limit, lock and system
+  interrupts keep their existing semantics and are not routed through the
+  callback.
+
 ## 3.5.4
 
 * Fix possible hang if worker holding the stop flag was killed while holding

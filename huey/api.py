@@ -3,6 +3,7 @@ import datetime
 import inspect
 import itertools
 import logging
+import math
 import re
 import time
 import traceback
@@ -21,11 +22,18 @@ from huey.exceptions import ConfigurationError
 from huey.exceptions import RateLimitExceeded
 from huey.exceptions import RETRYING_EXCEPTIONS
 from huey.exceptions import ResultTimeout
+from huey.exceptions import RetryDecisionError
+from huey.exceptions import RetryDeadlineExceeded
 from huey.exceptions import RetryTask
 from huey.exceptions import TaskException
 from huey.exceptions import TaskLockedException
 from huey.exceptions import TaskTimeout
 from huey.registry import Registry
+from huey.retry import RETRY_ABORT
+from huey.retry import RETRY_AFTER
+from huey.retry import RETRY_AT
+from huey.retry import RETRY_NOW
+from huey.retry import RetryDecision
 from huey.serializer import Serializer
 from huey.storage import BlackHoleStorage
 from huey.storage import CySqliteStorage
@@ -169,7 +177,8 @@ class Huey(object):
         return Consumer(self, **options)
 
     def task(self, retries=0, retry_delay=0, retry_backoff=0, priority=None,
-             context=False, name=None, expires=None, timeout=None, **kwargs):
+             context=False, name=None, expires=None, timeout=None,
+             retry_policy=None, retry_deadline=None, **kwargs):
         TaskWrapper = self.task_wrapper_class
         def decorator(func):
             return TaskWrapper(
@@ -183,12 +192,15 @@ class Huey(object):
                 default_priority=priority,
                 default_expires=expires,
                 default_timeout=timeout,
+                default_retry_policy=retry_policy,
+                default_retry_deadline=retry_deadline,
                 **kwargs)
         return decorator
 
     def periodic_task(self, validate_datetime, retries=0, retry_delay=0,
                       retry_backoff=0, priority=None, context=False, name=None,
-                      expires=None, timeout=None, **kwargs):
+                      expires=None, timeout=None, retry_policy=None,
+                      retry_deadline=None, **kwargs):
         TaskWrapper = self.task_wrapper_class
         def decorator(func):
             def method_validate(self, timestamp):
@@ -205,6 +217,8 @@ class Huey(object):
                 default_priority=priority,
                 default_expires=expires,
                 default_timeout=timeout,
+                default_retry_policy=retry_policy,
+                default_retry_deadline=retry_deadline,
                 validate_datetime=method_validate,
                 task_base=PeriodicTask,
                 **kwargs)
@@ -310,6 +324,8 @@ class Huey(object):
         # Resolve the expiration time when the task is enqueued.
         if task.expires:
             task.resolve_expires(self.utc)
+        if task.retry_deadline:
+            task.resolve_retry_deadline(self.utc)
 
         self._emit(S.SIGNAL_ENQUEUED, task)
 
@@ -443,6 +459,10 @@ class Huey(object):
         retry_eta = None
         task_value = None
 
+        # Count every execution attempt. This value is serialized with the
+        # task and handed to the retry-policy callback on failure.
+        task.attempts += 1
+
         if task.timeout:
             task._deadline = start + task.timeout
 
@@ -538,8 +558,23 @@ class Huey(object):
             if final:
                 self._abort_chord_member(task, error)
             else:
-                self._emit(S.SIGNAL_RETRYING, task)
-                self._requeue_task(task, self._get_timestamp(), retry_eta)
+                # A retry-policy callback may decide to give up immediately,
+                # schedule a precise next attempt, or turn the original error
+                # into a definitive decision/deadline failure.
+                final, retry_eta, exception = self._determine_retry(
+                    task, exception, timestamp, retry_eta)
+                if final:
+                    error = Error(self.build_error_result(task, exception))
+                    if store:
+                        self.put_result(task.id, error)
+                    if task.on_error:
+                        handler = copy.copy(task.on_error)
+                        handler.extend_data(exception)
+                        self.enqueue(handler)
+                    self._abort_chord_member(task, error)
+                else:
+                    self._emit(S.SIGNAL_RETRYING, task)
+                    self._requeue_task(task, self._get_timestamp(), retry_eta)
 
         return task_value
 
@@ -583,6 +618,122 @@ class Huey(object):
             self.add_schedule(task)
         else:
             self.enqueue(task)
+
+    def _get_retry_policy(self, task):
+        # The policy lives on the task class and is never serialized.
+        return task.retry_policy
+
+    def _determine_retry(self, task, exception, timestamp, retry_eta):
+        """
+        Resolve what happens to a failed task that still has retries.
+
+        Returns a 3-tuple ``(final, retry_eta, exception)``:
+
+        * ``final`` is True when the task must not be retried again.
+        * ``retry_eta`` is the absolute datetime of the next attempt, or None
+          for an immediate re-enqueue.
+        * ``exception`` is the error to surface (possibly replaced by a
+          :class:`RetryDecisionError` or :class:`RetryDeadlineExceeded`).
+
+        Cancellation, explicit ``RetryTask``, rate-limit and lock rejections
+        keep their existing semantics and are never handed to the callback.
+        """
+        # An eta was already produced by the specialized handlers (RetryTask
+        # with eta/delay, rate-limiting). Preserve it and never consult the
+        # generic policy for these control-flow exceptions.
+        if isinstance(exception, (CancelExecution,) + RETRYING_EXCEPTIONS):
+            return False, retry_eta, exception
+
+        policy = self._get_retry_policy(task)
+        if policy is None:
+            # Default behavior: immediate or retry_delay/backoff scheduling.
+            return False, retry_eta, exception
+
+        deadline = task.retry_deadline_resolved
+        if deadline is not None and timestamp >= deadline:
+            # The total deadline has already elapsed: definitive failure.
+            err = RetryDeadlineExceeded(exception, deadline, eta=timestamp)
+            err.__cause__ = exception
+            logger.warning('Task %s retry deadline %s already passed.',
+                           task.id, deadline)
+            return True, None, err
+
+        time_remaining = None
+        if deadline is not None:
+            time_remaining = deadline - timestamp
+
+        try:
+            decision = policy(exception, task.attempts, time_remaining)
+        except Exception as exc:
+            # Keep both the original task failure and the policy error. Do not
+            # retry -- another attempt would just re-enter the broken policy.
+            err = RetryDecisionError(exception, exc)
+            err.__cause__ = exception
+            logger.exception('Task %s retry policy raised.', task.id)
+            return True, None, err
+
+        try:
+            return self._apply_retry_decision(task, decision, timestamp,
+                                              deadline, exception)
+        except Exception as exc:
+            err = RetryDecisionError(exception, exc)
+            err.__cause__ = exception
+            logger.warning('Task %s retry policy returned unusable decision '
+                           '%r: %r', task.id, decision, exc)
+            return True, None, err
+
+    def _apply_retry_decision(self, task, decision, timestamp, deadline,
+                              exception):
+        if not isinstance(decision, RetryDecision):
+            raise TypeError('retry policy must return a RetryDecision, got '
+                            '%r' % type(decision))
+
+        if decision.action == RETRY_ABORT:
+            logger.info('Task %s retry policy gave up.', task.id)
+            return True, None, exception
+
+        if decision.action == RETRY_NOW:
+            eta = None
+        elif decision.action == RETRY_AFTER:
+            delay = decision.delay
+            if isinstance(delay, datetime.timedelta):
+                delay = delay.total_seconds()
+            if isinstance(delay, bool) or not isinstance(delay, (int, float)):
+                raise TypeError('delay must be a number of seconds, got %r' %
+                                type(delay))
+            if not math.isfinite(delay) or delay <= 0:
+                raise ValueError('delay must be a finite, positive number of '
+                                 'seconds, got %r' % delay)
+            # Compute relative to the supplied (fixed) clock for testability.
+            eta = timestamp + datetime.timedelta(seconds=delay)
+        elif decision.action == RETRY_AT:
+            eta = decision.eta
+            if not isinstance(eta, datetime.datetime):
+                raise TypeError('eta must be a datetime instance, got %r' %
+                                type(eta))
+            eta = normalize_time(eta=eta, utc=self.utc)
+        else:
+            raise ValueError('unknown retry decision action %r' %
+                             decision.action)
+
+        if eta is not None:
+            if eta <= timestamp:
+                # A past (or exactly-now-as-past) eta must never reach the
+                # scheduling queue.
+                raise ValueError('scheduled retry time %s is in the past '
+                                 '(now %s)' % (eta, timestamp))
+            if deadline is not None and eta > deadline:
+                err = RetryDeadlineExceeded(exception, deadline, eta=eta)
+                err.__cause__ = exception
+                logger.warning('Task %s next retry %s exceeds deadline %s.',
+                               task.id, eta, deadline)
+                return True, None, err
+        elif deadline is not None and timestamp >= deadline:
+            err = RetryDeadlineExceeded(exception, deadline, eta=timestamp)
+            err.__cause__ = exception
+            return True, None, err
+
+        return False, eta, exception
 
     def _run_pre_execute(self, task):
         for name, callback in self._pre_execute.items():
@@ -798,12 +949,16 @@ class Task(object):
     default_retries = 0
     default_retry_delay = 0
     default_retry_backoff = 0
+    default_retry_policy = None
+    default_retry_deadline = None
     default_timeout = None
 
     def __init__(self, args=None, kwargs=None, id=None, eta=None, retries=None,
                  retry_delay=None, priority=None, expires=None,
                  on_complete=None, on_error=None, expires_resolved=None,
-                 timeout=None, chord_config=None, retry_backoff=None):
+                 timeout=None, chord_config=None, retry_backoff=None,
+                 retry_deadline=None, retry_deadline_resolved=None,
+                 attempts=None):
         self.name = type(self).__name__
         self.args = () if args is None else args
         self.kwargs = {} if kwargs is None else kwargs
@@ -820,11 +975,19 @@ class Task(object):
         self.expires = expires if expires is not None else self.default_expires
         self.expires_resolved = expires_resolved
         self.timeout = timeout if timeout is not None else self.default_timeout
+        self.retry_deadline = (retry_deadline if retry_deadline is not None
+                               else self.default_retry_deadline)
+        self.retry_deadline_resolved = retry_deadline_resolved
+        self.attempts = attempts if attempts is not None else 0
         self.chord_config = chord_config
         self._deadline = None
 
         self.on_complete = on_complete
         self.on_error = on_error
+
+    @property
+    def retry_policy(self):
+        return getattr(type(self), 'default_retry_policy', None)
 
     @property
     def data(self):
@@ -851,6 +1014,10 @@ class Task(object):
             rep += ', on error %s' % self.on_error
         if self.chord_config:
             rep += ', chord %s' % self.chord_config.cid
+        if self.retry_deadline_resolved:
+            rep += ' retry-deadline=%s' % self.retry_deadline_resolved
+        if self.attempts:
+            rep += ' attempts=%s' % self.attempts
         return rep
 
     def __hash__(self):
@@ -863,6 +1030,12 @@ class Task(object):
         if self.expires:
             self.expires_resolved = normalize_expire_time(self.expires, utc)
         return self.expires_resolved
+
+    def resolve_retry_deadline(self, utc=True):
+        if self.retry_deadline:
+            self.retry_deadline_resolved = normalize_expire_time(
+                self.retry_deadline, utc)
+        return self.retry_deadline_resolved
 
     @property
     def time_remaining(self):
@@ -998,7 +1171,8 @@ class TaskWrapper(object):
 
     def schedule(self, args=None, kwargs=None, eta=None, delay=None,
                  priority=None, retries=None, retry_delay=None,
-                 retry_backoff=None, expires=None, timeout=None, id=None):
+                 retry_backoff=None, expires=None, timeout=None, id=None,
+                 retry_deadline=None):
         if eta is None and delay is None:
             if isinstance(args, (int, float)):
                 delay = args
@@ -1024,7 +1198,8 @@ class TaskWrapper(object):
             retry_backoff=retry_backoff,
             priority=priority,
             expires=expires,
-            timeout=timeout)
+            timeout=timeout,
+            retry_deadline=retry_deadline)
         return self.huey.enqueue(task)
 
     def _apply(self, it):
@@ -1057,7 +1232,8 @@ class TaskWrapper(object):
                                retry_backoff=kwargs.pop('retry_backoff', None),
                                priority=kwargs.pop('priority', None),
                                expires=kwargs.pop('expires', None),
-                               timeout=kwargs.pop('timeout', None))
+                               timeout=kwargs.pop('timeout', None),
+                               retry_deadline=kwargs.pop('retry_deadline', None))
 
 
 class TaskLock(object):
@@ -1297,6 +1473,9 @@ class Result(object):
             expires=expires if expires is not None else self.task.expires,
             timeout=self.task.timeout,
             chord_config=self.task.chord_config,
+            retry_deadline=self.task.retry_deadline,
+            retry_deadline_resolved=self.task.retry_deadline_resolved,
+            attempts=self.task.attempts,
             on_complete=on_complete,
             on_error=on_error)
         return self.huey.enqueue(task)

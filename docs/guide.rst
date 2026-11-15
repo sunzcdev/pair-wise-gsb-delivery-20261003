@@ -231,10 +231,82 @@ error. The :py:class:`Result` stays unready until the retry finishes.
             raise RetryTask(delay=60)
         ...
 
+Custom retry policies
+^^^^^^^^^^^^^^^^^^^^^^
+
+.. _retry-policy:
+
+A fixed ``retry_delay`` cannot tell a *transient* failure (a network blip worth
+retrying) from a *permanent* one (a bad request that will never succeed). For
+full control, pass a ``retry_policy`` callable to :py:meth:`~Huey.task`.
+
+The policy is called whenever a task with retries remaining raises an ordinary
+exception. It receives three positional arguments:
+
+* ``exc`` -- the exception raised by the task.
+* ``attempts`` -- the number of execution attempts so far (starts at 1).
+* ``time_remaining`` -- a :py:class:`datetime.timedelta` with the time left
+  before the task's ``retry_deadline``, or ``None`` when no deadline is set.
+
+It returns a :py:class:`RetryDecision` describing what to do:
+
+* :py:meth:`~RetryDecision.abort` -- give up and mark the task permanently
+  failed.
+* :py:meth:`~RetryDecision.retry_now` -- re-enqueue immediately.
+* :py:meth:`~RetryDecision.retry_at` -- schedule the next attempt at an
+  absolute :py:class:`~datetime.datetime`.
+* :py:meth:`~RetryDecision.retry_after` -- schedule the next attempt after a
+  number of seconds (or a :py:class:`~datetime.timedelta`).
+
+.. code-block:: python
+
+    from huey import RetryDecision
+
+    def collector_policy(exc, attempts, time_remaining):
+        # Never retry permanent failures.
+        if isinstance(exc, BadRequestError):
+            return RetryDecision.abort()
+        # Give up once the overall collection window has nearly elapsed.
+        if time_remaining is not None and time_remaining.seconds < 30:
+            return RetryDecision.abort()
+        # Otherwise back off, but never beyond the deadline.
+        return RetryDecision.retry_after(min(2 ** attempts, 60))
+
+    @huey.task(retries=10, retry_deadline=3600,
+               retry_policy=collector_policy)
+    def collect_from_endpoint(url):
+        ...
+
+The configured ``retries`` still acts as a hard cap: the policy is only
+consulted while retries remain, and every re-enqueue decrements the counter,
+so a policy can never cause an infinite retry loop.
+
+The optional ``retry_deadline`` bounds the whole retry chain. Like
+``expires`` it accepts an absolute datetime or a number of seconds and is
+resolved when the task is enqueued. A decision whose next attempt would run
+after the deadline -- or a failure that occurs once the deadline has already
+passed -- raises :py:class:`RetryDeadlineExceeded`, which is stored as the
+task's explicit, final error instead of scheduling a hopeless retry.
+
+The runtime validates every decision before touching the schedule. A time in
+the past or a non-positive/non-finite interval can never enter the scheduling
+queue; the task fails definitively with a :py:class:`RetryDecisionError`. That
+same exception is used when the policy callable itself raises, and it preserves
+both the original task error and the error from the policy. The policy is only
+invoked once per failed attempt, so a broken policy cannot recurse.
+
+Cancellation (:py:class:`CancelExecution`), explicit
+:py:class:`RetryTask`, rate-limit and lock rejections keep their existing
+semantics and are **not** passed to the policy; neither are system
+interrupts (``KeyboardInterrupt``). The original ``retries``,
+``retry_delay`` and ``retry_backoff`` options continue to work exactly as
+before when no policy is configured.
+
 For more information, see the following API documentation:
 
 * :py:meth:`~Huey.task` and :py:meth:`~Huey.periodic_task`
 * :py:class:`Result`
+* :py:class:`RetryDecision`
 * :py:class:`RetryTask`
 
 

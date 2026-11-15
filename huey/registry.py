@@ -7,7 +7,9 @@ from huey.utils import ChordConfig
 Message = namedtuple('Message', ('id', 'name', 'eta', 'retries', 'retry_delay',
                                  'priority', 'args', 'kwargs', 'on_complete',
                                  'on_error', 'expires', 'expires_resolved',
-                                 'timeout', 'chord_config', 'retry_backoff'))
+                                 'timeout', 'chord_config', 'retry_backoff',
+                                 'retry_deadline', 'retry_deadline_resolved',
+                                 'attempts'))
 
 # Automatically set missing parameters to None. This is kind-of a hack, but it
 # allows us to add new parameters while continuing to be able to handle
@@ -91,7 +93,10 @@ class Registry(object):
             task.expires_resolved,
             task.timeout,
             chord_config,
-            task.retry_backoff)
+            task.retry_backoff,
+            task.retry_deadline,
+            task.retry_deadline_resolved,
+            task.attempts)
 
     def create_task(self, message):
         TaskClass = self.string_to_task(message.name)
@@ -124,7 +129,10 @@ class Registry(object):
             message.expires_resolved,
             message.timeout,
             chord_config,
-            message.retry_backoff)
+            message.retry_backoff,
+            retry_deadline=message.retry_deadline,
+            retry_deadline_resolved=message.retry_deadline_resolved,
+            attempts=message.attempts)
 
     @property
     def periodic_tasks(self):
