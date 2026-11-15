@@ -19,8 +19,17 @@ Table
 -----
 
 .. autoclass:: dataset.Table
-   :members: exists, columns, find, find_one, all, count, distinct, insert, insert_ignore, insert_many, update, update_many, upsert, upsert_many, delete, create_column, create_column_by_example, drop_column, create_index, drop, has_column, has_index
+   :members: exists, columns, find, find_one, all, count, distinct, insert, insert_ignore, insert_many, update, update_many, upsert, upsert_many, delete, snapshot_sync, sync_snapshot, create_column, create_column_by_example, drop_column, create_index, drop, has_column, has_index
    :special-members: __len__, __iter__
+
+
+Snapshot Sync
+-------------
+
+.. autoclass:: dataset.SnapshotSync
+   :members: add, add_many, flush, count
+
+.. autoexception:: dataset.SnapshotError
 
 
 Data Export

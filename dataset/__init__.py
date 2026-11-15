@@ -3,6 +3,7 @@ import warnings
 from typing import Any
 
 from dataset.database import Database
+from dataset.snapshot import SnapshotError, SnapshotSync
 from dataset.table import Table
 from dataset.util import DatasetError, OutRow, QueryError, RowFactory, row_factory
 
@@ -18,6 +19,8 @@ __all__ = [
     "OutRow",
     "QueryError",
     "RowFactory",
+    "SnapshotError",
+    "SnapshotSync",
     "Table",
     "connect",
 ]

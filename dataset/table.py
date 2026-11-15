@@ -16,6 +16,7 @@ from sqlalchemy.sql.expression import (
     bindparam,
 )
 
+from dataset.snapshot import SnapshotSync
 from dataset.types import MYSQL_LENGTH_TYPES, ColumnType, Types
 from dataset.util import (
     QUERY_STEP,
@@ -363,6 +364,68 @@ class Table:
         # is incredibly slow, but doesn't run into issues with column creation.
         for row in rows:
             self.upsert(row, keys, ensure=ensure, types=types)
+
+    def snapshot_sync(
+        self,
+        keys: str | Iterable[str],
+        scope: dict[str, SQLWriteValue] | None = None,
+        chunk_size: int = 1000,
+        ensure: bool | None = None,
+        types: dict[str, ColumnType] | None = None,
+    ) -> SnapshotSync:
+        """Begin an explicit snapshot sync for a scope of this table.
+
+        A snapshot sync replaces the complete set of rows matching ``scope``
+        (e.g. all rows of one data source) with a new batch of rows, keyed
+        by the business key columns in ``keys``. Rows are staged in chunks
+        of ``chunk_size`` inside a transaction. Only once the input has
+        ended normally and all keys have been validated (present and
+        unique) is the transaction committed: existing keys are updated in
+        place (keeping their primary key), new keys are inserted, and rows
+        of the scope missing from the snapshot are deleted. If the source
+        fails midway or a duplicate key is found, everything is rolled back
+        and the previous snapshot remains fully visible. Rows outside
+        ``scope`` are never touched.
+        ::
+
+            with table.snapshot_sync(['sku'], scope={'source': 'shop-a'}) as sync:
+                for row in iter_source():
+                    sync.add(row)
+
+        See :py:class:`SnapshotSync <dataset.snapshot.SnapshotSync>`.
+        """
+        return SnapshotSync(
+            self,
+            keys,
+            scope=scope,
+            chunk_size=chunk_size,
+            ensure=ensure,
+            types=types,
+        )
+
+    def sync_snapshot(
+        self,
+        rows: Iterable[WriteRow],
+        keys: str | Iterable[str],
+        scope: dict[str, SQLWriteValue] | None = None,
+        chunk_size: int = 1000,
+        ensure: bool | None = None,
+        types: dict[str, ColumnType] | None = None,
+    ) -> int:
+        """Synchronise a full snapshot of ``rows`` for a scope in one call.
+
+        This is a shorthand for :py:meth:`snapshot_sync()
+        <dataset.Table.snapshot_sync>` that consumes the whole ``rows``
+        iterable and returns the number of rows in the snapshot.
+        ::
+
+            table.sync_snapshot(rows, ['sku'], scope={'source': 'shop-a'})
+        """
+        with self.snapshot_sync(
+            keys, scope=scope, chunk_size=chunk_size, ensure=ensure, types=types
+        ) as sync:
+            sync.add_many(rows)
+        return sync.count
 
     def delete(self, *clauses: ColumnElement[bool], **filters: SQLWriteValue) -> bool:
         """Delete rows from the table.
