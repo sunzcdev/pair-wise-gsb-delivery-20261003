@@ -42,6 +42,138 @@ def _pretty(thing: Any, prefix: str):
     return indent(pformat(thing, width=72, sort_dicts=False), prefix).lstrip()
 
 
+def _json_pointer(path: Iterable[str | int]) -> str:
+    """
+    Format a schema path as a JSON Pointer.
+    """
+    return "".join(
+        "/" + str(each).replace("~", "~0").replace("/", "~1")
+        for each in path
+    )
+
+
+@define(frozen=True)
+class BranchDetail:
+    """
+    The outcome of attempting one branch of a branching keyword.
+
+    ``valid`` is ``None`` when the branch was intentionally not evaluated,
+    in which case ``status`` is ``"not-evaluated"``. A branch which was
+    skipped for performance reasons is therefore never reported as failed.
+    """
+
+    index: int
+    schema: Any
+    schema_path: tuple[str | int, ...]
+    schema_uri: str | None
+    valid: bool | None
+    status: str
+    errors: tuple[ValidationError, ...] = ()
+    keyword: str | None = None
+
+    @property
+    def evaluated(self) -> bool:
+        return self.valid is not None
+
+    @property
+    def successful(self) -> bool:
+        return self.valid is True
+
+    @property
+    def succeeded(self) -> bool:
+        return self.successful
+
+    @property
+    def is_valid(self) -> bool | None:
+        return self.valid
+
+    @property
+    def branch_index(self) -> int:
+        return self.index
+
+    @property
+    def outcome(self) -> str:
+        return {
+            "valid": "success",
+            "invalid": "failure",
+            "not-evaluated": "not-evaluated",
+        }[self.status]
+
+    @property
+    def schema_pointer(self) -> str:
+        return _json_pointer(self.schema_path)
+
+    @property
+    def relative_schema_path(self) -> tuple[int]:
+        return (self.index,)
+
+    @property
+    def absolute_schema_path(self) -> tuple[str | int, ...]:
+        return self.schema_path
+
+    @property
+    def keyword_location(self) -> str:
+        return self.schema_pointer
+
+    @property
+    def schema_location(self) -> str:
+        if self.schema_uri:
+            return f"{self.schema_uri}#{self.schema_pointer}"
+        return f"#{self.schema_pointer}"
+
+    @property
+    def absolute_keyword_location(self) -> str:
+        return self.schema_location
+
+    @property
+    def error(self) -> ValidationError | None:
+        return self.errors[0] if self.errors else None
+
+    def __getitem__(self, key: str) -> Any:
+        if not isinstance(key, str):
+            raise TypeError("BranchDetail indices must be strings")
+        return getattr(self, key)
+
+    def get(self, key: str, default: Any = None) -> Any:
+        return getattr(self, key, default)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "index": self.index,
+            "keyword": self.keyword,
+            "schema": self.schema,
+            "schema_path": list(self.schema_path),
+            "schema_uri": self.schema_uri,
+            "schema_location": self.schema_location,
+            "valid": self.valid,
+            "status": self.status,
+            "errors": list(self.errors),
+        }
+
+
+@define(frozen=True)
+class BranchReport:
+    """
+    The result of a validation run which explicitly collected branch details.
+    """
+
+    valid: bool
+    errors: tuple[ValidationError, ...] = ()
+    branches: tuple[BranchDetail, ...] = ()
+
+    @property
+    def successful_branches(self) -> tuple[BranchDetail, ...]:
+        return tuple(each for each in self.branches if each.successful)
+
+    @property
+    def branch_results(self) -> tuple[BranchDetail, ...]:
+        return self.branches
+
+
+Branch = BranchDetail
+BranchResult = BranchDetail
+
+
 def __getattr__(name):
     if name == "RefResolutionError":
         warnings.warn(
@@ -70,6 +202,9 @@ class _Error(Exception):
         schema_path: Iterable[str | int] = (),
         parent: _Error | None = None,
         type_checker: _types.TypeChecker = _unset,  # type: ignore[assignment]
+        branches: Iterable[BranchDetail] = (),
+        schema_uri: str | None = _unset,  # type: ignore[assignment]
+        resource_schema_path: Iterable[str | int] | _utils.Unset = _unset,
     ) -> None:
         super().__init__(
             message,
@@ -94,6 +229,12 @@ class _Error(Exception):
         self.schema = schema
         self.parent = parent
         self._type_checker = type_checker
+        self.branches = tuple(branches)
+        self.schema_uri = schema_uri
+        if resource_schema_path is _unset:
+            self.resource_schema_path = _unset
+        else:
+            self.resource_schema_path = deque(resource_schema_path)
 
         for error in context:
             error.parent = self
@@ -156,6 +297,59 @@ class _Error(Exception):
         path = deque(self.relative_schema_path)
         path.extendleft(reversed(parent.absolute_schema_path))
         return path
+
+    @property
+    def schema_pointer(self) -> str:
+        """
+        The absolute schema path, formatted as a JSON Pointer.
+        """
+        if self.resource_schema_path is not _unset:
+            return _json_pointer(self.resource_schema_path)
+        return _json_pointer(self.absolute_schema_path)
+
+    @property
+    def schema_location(self) -> str:
+        """
+        The schema location, including the originating resource URI.
+        """
+        if self.schema_uri is not _unset and self.schema_uri:
+            return f"{self.schema_uri}#{self.schema_pointer}"
+        return f"#{self.schema_pointer}"
+
+    @property
+    def branch_details(self) -> tuple[BranchDetail, ...]:
+        """
+        Per-branch outcomes, when the caller requested or the keyword saw them.
+        """
+        return self.branches
+
+    @property
+    def branch_results(self) -> tuple[BranchDetail, ...]:
+        """
+        An alias for `branch_details`.
+        """
+        return self.branches
+
+    @property
+    def successful_branches(self) -> tuple[BranchDetail, ...]:
+        """
+        The branches which actually validated the instance successfully.
+        """
+        return tuple(each for each in self.branches if each.successful)
+
+    @property
+    def failed_branches(self) -> tuple[BranchDetail, ...]:
+        """
+        The branches which were evaluated and rejected the instance.
+        """
+        return tuple(each for each in self.branches if each.valid is False)
+
+    @property
+    def unevaluated_branches(self) -> tuple[BranchDetail, ...]:
+        """
+        The branches which were not evaluated, rather than failed.
+        """
+        return tuple(each for each in self.branches if each.valid is None)
 
     @property
     def json_path(self) -> str:

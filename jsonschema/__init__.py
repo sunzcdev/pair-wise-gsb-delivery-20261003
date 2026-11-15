@@ -13,7 +13,12 @@ import warnings
 
 from jsonschema._format import FormatChecker
 from jsonschema._types import TypeChecker
-from jsonschema.exceptions import SchemaError, ValidationError
+from jsonschema.exceptions import (
+    BranchDetail,
+    BranchReport,
+    SchemaError,
+    ValidationError,
+)
 from jsonschema.validators import (
     Draft3Validator,
     Draft4Validator,
@@ -22,6 +27,7 @@ from jsonschema.validators import (
     Draft201909Validator,
     Draft202012Validator,
     validate,
+    validate_with_branch_details,
 )
 
 

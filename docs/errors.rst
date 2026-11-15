@@ -17,7 +17,9 @@ raised or returned, depending on which method or function is used.
     ===============  =================  ========================
     `message`        `context`          `instance`
 
-                     `cause`            `json_path`
+                     `branches`         `json_path`
+
+                     `cause`
 
                                         `path`
 
@@ -107,6 +109,32 @@ raised or returned, depending on which method or function is used.
         `schema_path` and `path` of these errors will be relative
         to the parent error.
 
+    .. attribute:: branches
+
+        The outcome of each branch of a branching keyword (currently
+        :kw:`oneOf` and :kw:`anyOf`), when branch details are available.
+        Each entry is a `BranchDetail` with its branch index, schema,
+        schema location, and whether the branch succeeded, failed, or was
+        not evaluated.
+
+        .. versionadded:: 4.27.0
+
+    .. attribute:: successful_branches
+
+        The entries of `branches` which actually succeeded. For an
+        ambiguous :kw:`oneOf`, this contains every simultaneously
+        successful branch, even when the human-readable message still
+        summarizes them using their schema representations.
+
+    .. attribute:: schema_uri
+
+        The URI of the resource in which the error's schema was found,
+        retaining the original resource when a :kw:`$ref` was followed.
+
+    .. attribute:: schema_location
+
+        The `schema_uri`, combined with `schema_pointer` as a URI fragment.
+
     .. attribute:: cause
 
         If the error was caused by a *non*-validation error, the
@@ -118,6 +146,13 @@ raised or returned, depending on which method or function is used.
 
         A validation error which this error is the `context` of.
         ``None`` if there wasn't one.
+
+
+.. autoclass:: BranchDetail
+    :members:
+
+.. autoclass:: BranchReport
+    :members:
 
 
 In case an invalid schema itself is encountered, a `SchemaError` is

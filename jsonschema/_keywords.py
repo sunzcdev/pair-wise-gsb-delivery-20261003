@@ -10,7 +10,7 @@ from jsonschema._utils import (
     find_evaluated_property_keys_by_schema,
     uniq,
 )
-from jsonschema.exceptions import FormatError, ValidationError
+from jsonschema.exceptions import BranchDetail, FormatError, ValidationError
 
 
 def patternProperties(validator, patternProperties, instance, schema):
@@ -335,25 +335,96 @@ def allOf(validator, allOf, instance, schema):
         yield from validator.descend(instance, subschema, schema_path=index)
 
 
+def _branch_detail(
+    validator,
+    keyword,
+    index,
+    subschema,
+    *,
+    valid,
+    errors=(),
+):
+    if valid is None:
+        status = "not-evaluated"
+        errors = ()
+    elif valid:
+        status = "valid"
+    else:
+        status = "invalid"
+
+    resolver = getattr(validator, "_resolver", None)
+    schema_uri = getattr(resolver, "_base_uri", None) or None
+    schema_path = tuple(getattr(validator, "_schema_path", ()))
+    if schema_path[-1:] == (keyword,):
+        schema_path = (*schema_path, index)
+    else:
+        schema_path = (*schema_path, keyword, index)
+    detail = BranchDetail(
+        index=index,
+        schema=subschema,
+        schema_path=schema_path,
+        schema_uri=schema_uri,
+        valid=valid,
+        status=status,
+        errors=tuple(errors),
+        keyword=keyword,
+    )
+    sink = getattr(validator, "_branch_detail_sink", None)
+    if sink is not None:
+        sink.append(detail)
+    return detail
+
+
 def anyOf(validator, anyOf, instance, schema):
     all_errors = []
+    branches = []
+    succeeded = False
+    full_details = getattr(validator, "_branch_details", False)
     for index, subschema in enumerate(anyOf):
         errs = list(validator.descend(instance, subschema, schema_path=index))
+        valid = not errs
+        branches.append(
+            _branch_detail(
+                validator,
+                "anyOf",
+                index,
+                subschema,
+                valid=valid,
+                errors=errs,
+            ),
+        )
         if not errs:
-            break
-        all_errors.extend(errs)
-    else:
+            succeeded = True
+            if not full_details:
+                break
+        else:
+            all_errors.extend(errs)
+    if not succeeded:
         yield ValidationError(
             f"{instance!r} is not valid under any of the given schemas",
             context=all_errors,
+            branches=tuple(branches),
         )
 
 
 def oneOf(validator, oneOf, instance, schema):
     subschemas = enumerate(oneOf)
     all_errors = []
+    branches = []
+    full_details = getattr(validator, "_branch_details", False)
     for index, subschema in subschemas:
         errs = list(validator.descend(instance, subschema, schema_path=index))
+        valid = not errs
+        branches.append(
+            _branch_detail(
+                validator,
+                "oneOf",
+                index,
+                subschema,
+                valid=valid,
+                errors=errs,
+            ),
+        )
         if not errs:
             first_valid = subschema
             break
@@ -362,17 +433,40 @@ def oneOf(validator, oneOf, instance, schema):
         yield ValidationError(
             f"{instance!r} is not valid under any of the given schemas",
             context=all_errors,
+            branches=tuple(branches),
         )
+        return
 
-    more_valid = [
-        each
-        for _, each in subschemas
-        if validator.evolve(schema=each).is_valid(instance)
-    ]
+    more_valid = []
+    for index, subschema in subschemas:
+        if full_details:
+            errs = list(
+                validator.descend(instance, subschema, schema_path=index),
+            )
+            valid = not errs
+        else:
+            errs = ()
+            valid = validator.evolve(schema=subschema).is_valid(instance)
+        branches.append(
+            _branch_detail(
+                validator,
+                "oneOf",
+                index,
+                subschema,
+                valid=valid,
+                errors=errs,
+            ),
+        )
+        if valid:
+            more_valid.append(subschema)
+
     if more_valid:
         more_valid.append(first_valid)
         reprs = ", ".join(repr(schema) for schema in more_valid)
-        yield ValidationError(f"{instance!r} is valid under each of {reprs}")
+        yield ValidationError(
+            f"{instance!r} is valid under each of {reprs}",
+            branches=tuple(branches),
+        )
 
 
 def not_(validator, not_schema, instance, schema):

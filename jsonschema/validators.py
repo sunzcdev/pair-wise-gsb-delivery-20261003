@@ -249,6 +249,27 @@ def create(
             kw_only=True,
             repr=False,
         )
+        _schema_path: tuple[str | int, ...] = field(
+            alias="_schema_path",
+            default=(),
+            kw_only=True,
+            repr=False,
+            eq=False,
+        )
+        _branch_details: bool = field(
+            alias="branch_details",
+            default=False,
+            kw_only=True,
+            repr=False,
+            eq=False,
+        )
+        _branch_detail_sink: list[exceptions.BranchDetail] | None = field(
+            alias="_branch_detail_sink",
+            default=None,
+            kw_only=True,
+            repr=False,
+            eq=False,
+        )
 
         def __init_subclass__(cls):
             warnings.warn(
@@ -349,7 +370,13 @@ def create(
 
             return NewValidator(**changes)
 
-        def iter_errors(self, instance, _schema=None):
+        def iter_errors(self, instance, _schema=None, *, branch_details=None):
+            if (
+                branch_details is not None
+                and branch_details != self._branch_details
+            ):
+                self = self.evolve(branch_details=branch_details)
+
             if _schema is not None:
                 warnings.warn(
                     (
@@ -378,23 +405,31 @@ def create(
                     validator_value=None,
                     instance=instance,
                     schema=_schema,
+                    schema_uri=self._resolver._base_uri,
                 )
                 return
 
             for validator, k, v in validators:
-                errors = validator(self, v, instance, _schema) or ()
-                for error in errors:
-                    # set details if not already set by the called fn
-                    error._set(
-                        validator=k,
-                        validator_value=v,
-                        instance=instance,
-                        schema=_schema,
-                        type_checker=self.TYPE_CHECKER,
-                    )
-                    if k not in {"if", "$ref"}:
-                        error.schema_path.appendleft(k)
-                    yield error
+                previous_schema_path = self._schema_path
+                self._schema_path = (*previous_schema_path, k)
+                try:
+                    errors = validator(self, v, instance, _schema) or ()
+                    for error in errors:
+                        # set details if not already set by the called fn
+                        error._set(
+                            validator=k,
+                            validator_value=v,
+                            instance=instance,
+                            schema=_schema,
+                            type_checker=self.TYPE_CHECKER,
+                            schema_uri=self._resolver._base_uri,
+                            resource_schema_path=deque(self._schema_path),
+                        )
+                        if k not in {"if", "$ref"}:
+                            error.schema_path.appendleft(k)
+                        yield error
+                finally:
+                    self._schema_path = previous_schema_path
 
         def descend(
             self,
@@ -403,7 +438,16 @@ def create(
             path=None,
             schema_path=None,
             resolver=None,
+            *,
+            _schema_path=None,
         ):
+            if _schema_path is not None:
+                local_schema_path = tuple(_schema_path)
+            else:
+                local_schema_path = self._schema_path
+                if schema_path is not None:
+                    local_schema_path = (*local_schema_path, schema_path)
+
             if schema is True:
                 return
             elif schema is False:
@@ -415,40 +459,61 @@ def create(
                     schema=schema,
                     path=() if path is None else (path,),
                     schema_path=() if schema_path is None else (schema_path,),
+                    schema_uri=self._resolver._base_uri,
+                    resource_schema_path=deque(local_schema_path),
                 )
                 return
 
+            if self.ID_OF(schema) is not None:
+                local_schema_path = ()
+
             if self._ref_resolver is not None:
-                evolved = self.evolve(schema=schema)
+                evolved = self.evolve(
+                    schema=schema,
+                    _schema_path=local_schema_path,
+                )
             else:
                 if resolver is None:
                     resolver = self._resolver.in_subresource(
                         specification.create_resource(schema),
                     )
-                evolved = self.evolve(schema=schema, _resolver=resolver)
+                evolved = self.evolve(
+                    schema=schema,
+                    _resolver=resolver,
+                    _schema_path=local_schema_path,
+                )
 
             for k, v in applicable_validators(schema):
                 validator = evolved.VALIDATORS.get(k)
                 if validator is None:
                     continue
 
-                errors = validator(evolved, v, instance, schema) or ()
-                for error in errors:
-                    # set details if not already set by the called fn
-                    error._set(
-                        validator=k,
-                        validator_value=v,
-                        instance=instance,
-                        schema=schema,
-                        type_checker=evolved.TYPE_CHECKER,
-                    )
-                    if k not in {"if", "$ref"}:
-                        error.schema_path.appendleft(k)
-                    if path is not None:
-                        error.path.appendleft(path)
-                    if schema_path is not None:
-                        error.schema_path.appendleft(schema_path)
-                    yield error
+                previous_schema_path = evolved._schema_path
+                evolved._schema_path = (*previous_schema_path, k)
+                try:
+                    errors = validator(evolved, v, instance, schema) or ()
+                    for error in errors:
+                        # set details if not already set by the called fn
+                        error._set(
+                            validator=k,
+                            validator_value=v,
+                            instance=instance,
+                            schema=schema,
+                            type_checker=evolved.TYPE_CHECKER,
+                            schema_uri=evolved._resolver._base_uri,
+                            resource_schema_path=deque(
+                                evolved._schema_path,
+                            ),
+                        )
+                        if k not in {"if", "$ref"}:
+                            error.schema_path.appendleft(k)
+                        if path is not None:
+                            error.path.appendleft(path)
+                        if schema_path is not None:
+                            error.schema_path.appendleft(schema_path)
+                        yield error
+                finally:
+                    evolved._schema_path = previous_schema_path
 
         def validate(self, *args, **kwargs):
             for error in self.iter_errors(*args, **kwargs):
@@ -462,6 +527,7 @@ def create(
                 raise exc from None
 
         def _validate_reference(self, ref, instance):
+            target_path = _pointer_segments(urldefrag(ref)[1])
             if self._ref_resolver is None:
                 try:
                     resolved = self._resolver.lookup(ref)
@@ -472,22 +538,33 @@ def create(
                     instance,
                     resolved.contents,
                     resolver=resolved.resolver,
+                    _schema_path=target_path,
                 )
             else:
                 resolve = getattr(self._ref_resolver, "resolve", None)
                 if resolve is None:
                     with self._ref_resolver.resolving(ref) as resolved:
-                        return self.descend(instance, resolved)
+                        return self.descend(
+                            instance,
+                            resolved,
+                            _schema_path=target_path,
+                        )
                 else:
                     scope, resolved = resolve(ref)
                     self._ref_resolver.push_scope(scope)
 
                     try:
-                        return list(self.descend(instance, resolved))
+                        return list(
+                            self.descend(
+                                instance,
+                                resolved,
+                                _schema_path=target_path,
+                            ),
+                        )
                     finally:
                         self._ref_resolver.pop_scope()
 
-        def is_valid(self, instance, _schema=None):
+        def is_valid(self, instance, _schema=None, *, branch_details=False):
             if _schema is not None:
                 warnings.warn(
                     (
@@ -501,8 +578,61 @@ def create(
                 )
                 self = self.evolve(schema=_schema)
 
-            error = next(self.iter_errors(instance), None)
+            error = next(
+                self.iter_errors(
+                    instance,
+                    branch_details=branch_details,
+                ),
+                None,
+            )
             return error is None
+
+        def collect_branch_details(
+            self,
+            instance,
+            _schema=None,
+            *,
+            keyword=None,
+        ):
+            """
+            Validate and collect the outcome of every attempted branch.
+
+            Unlike normal validation, branching keywords are exhaustively
+            evaluated here, including ``anyOf`` branches after one has
+            already succeeded.
+            """
+            sink: list[exceptions.BranchDetail] = []
+            validator = self.evolve(
+                branch_details=True,
+                _branch_detail_sink=sink,
+            )
+            errors = list(validator.iter_errors(instance, _schema=_schema))
+            branches = tuple(
+                each
+                for each in sink
+                if keyword is None or each.keyword == keyword
+            )
+            return exceptions.BranchReport(
+                valid=not errors,
+                errors=tuple(errors),
+                branches=branches,
+            )
+
+        def validate_with_branch_details(
+            self,
+            instance,
+            _schema=None,
+            *,
+            keyword=None,
+        ):
+            """
+            An alias for `collect_branch_details`.
+            """
+            return self.collect_branch_details(
+                instance,
+                _schema=_schema,
+                keyword=keyword,
+            )
 
     evolve_fields = [
         (field.name, field.alias) for field in fields(Validator) if field.init
@@ -1246,6 +1376,15 @@ class _RefResolver:
 _SUBSCHEMAS_KEYWORDS = ("$id", "id", "$anchor", "$dynamicAnchor")
 
 
+def _pointer_segments(fragment):
+    if not fragment.startswith("/"):
+        return ()
+    return tuple(
+        unquote(segment).replace("~1", "/").replace("~0", "~")
+        for segment in fragment[1:].split("/")
+    )
+
+
 def _match_keyword(keyword):
 
     def matcher(value):
@@ -1340,6 +1479,28 @@ def validate(instance, schema, cls=None, *args, **kwargs):  # noqa: D417
     error = exceptions.best_match(validator.iter_errors(instance))
     if error is not None:
         raise error
+
+
+def validate_with_branch_details(instance, schema, cls=None, *args, **kwargs):
+    """
+    Validate an instance and return a report including branch outcomes.
+
+    This is the explicit opt-in for exhaustive branch evaluation. In
+    particular, ``anyOf`` branches are all validated even after one of them
+    has already succeeded.
+
+    Any provided positional and keyword arguments are passed on when
+    instantiating the ``cls`` as in `jsonschema.validators.validate`.
+    """
+    if cls is None:
+        cls = validator_for(schema)
+
+    cls.check_schema(schema)
+    validator = cls(schema, *args, **kwargs)
+    return validator.collect_branch_details(instance)
+
+
+validate_with_branches = validate_with_branch_details
 
 
 def validator_for(

@@ -19,6 +19,24 @@ The simplest way to validate an instance under a given schema is to use the `val
 .. autofunction:: validate
     :noindex:
 
+Branch Details
+--------------
+
+Branching keywords normally stop as soon as their result is known.
+In particular, :kw:`anyOf` does not keep validating branches after one
+has succeeded. A caller which needs the outcome of every branch can ask
+for the extra work explicitly:
+
+.. autofunction:: validate_with_branch_details
+    :noindex:
+
+The returned `jsonschema.exceptions.BranchReport` contains one
+`jsonschema.exceptions.BranchDetail` per attempted branch, including its
+index, schema location, and success, failure, or not-evaluated status.
+The same information is attached to the `branches` attribute of
+`jsonschema.exceptions.ValidationError` errors raised by :kw:`oneOf` and
+:kw:`anyOf`.
+
 .. warning::
 
    Accepting untrusted schemas as input, especially when combined with untrusted data to validate, can lead to vulnerabilities even when restricting to official JSON Schema dialects and vocabularies.

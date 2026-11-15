@@ -2615,6 +2615,153 @@ class TestRefResolver(TestCase):
         )
 
 
+class TestBranchDetails(TestCase):
+    def test_oneOf_lists_all_branches_and_true_successes(self):
+        schema = {
+            "oneOf": [
+                {"type": "integer"},
+                {"minimum": 0},
+                {"type": "string"},
+            ],
+        }
+        error, = validators.Draft202012Validator(schema).iter_errors(5)
+
+        self.assertEqual(
+            [(branch.index, branch.valid) for branch in error.branches],
+            [(0, True), (1, True), (2, False)],
+        )
+        self.assertEqual(
+            [branch.index for branch in error.successful_branches],
+            [0, 1],
+        )
+        self.assertEqual(
+            [branch.index for branch in error.failed_branches],
+            [2],
+        )
+
+    def test_oneOf_without_a_match_marks_every_branch_failed(self):
+        schema = {"oneOf": [{"type": "string"}, {"type": "null"}]}
+        error, = validators.Draft202012Validator(schema).iter_errors(5)
+
+        self.assertEqual(
+            [
+                (branch.index, branch.valid, branch.status)
+                for branch in error.branches
+            ],
+            [(0, False, "invalid"), (1, False, "invalid")],
+        )
+        self.assertEqual(error.schema_location, "#/oneOf")
+
+    def test_anyOf_short_circuits_but_details_are_exhaustive(self):
+        seen = []
+
+        def probe(validator, value, instance, schema):
+            seen.append(value)
+            if value == 0:
+                yield exceptions.ValidationError("nope")
+
+        Validator = validators.extend(
+            validators.Draft202012Validator,
+            {"probe": probe},
+        )
+        validator = Validator(
+            {"anyOf": [{"probe": 0}, {"probe": 1}, {"probe": 2}]},
+        )
+
+        self.assertTrue(validator.is_valid(object()))
+        self.assertEqual(seen, [0, 1])
+
+        seen.clear()
+        report = validator.collect_branch_details(object())
+        self.assertEqual(seen, [0, 1, 2])
+        self.assertTrue(report.valid)
+        self.assertEqual(
+            [(branch.index, branch.valid) for branch in report.branches],
+            [(0, False), (1, True), (2, True)],
+        )
+
+    def test_nested_references_keep_the_branching_resource_location(self):
+        resource = DRAFT202012.create_resource({
+            "$id": "https://example.com/other.json",
+            "$defs": {
+                "choice": {
+                    "oneOf": [{"type": "integer"}, {"minimum": 0}],
+                },
+            },
+        })
+        registry = referencing.Registry().with_resource(
+            "https://example.com/other.json",
+            resource,
+        )
+        schema = {
+            "$ref": "https://example.com/other.json#/$defs/choice",
+        }
+        error, = validators.Draft202012Validator(
+            schema,
+            registry=registry,
+        ).iter_errors(5)
+
+        self.assertEqual(
+            error.schema_location,
+            "https://example.com/other.json#/$defs/choice/oneOf",
+        )
+        self.assertEqual(
+            [branch.schema_location for branch in error.branches],
+            [
+                "https://example.com/other.json"
+                "#/$defs/choice/oneOf/0",
+                "https://example.com/other.json"
+                "#/$defs/choice/oneOf/1",
+            ],
+        )
+
+    def test_nested_keywords_are_part_of_branch_locations(self):
+        schema = {
+            "properties": {
+                "choice": {
+                    "oneOf": [{"type": "integer"}, {"minimum": 0}],
+                },
+            },
+        }
+        error, = validators.Draft202012Validator(schema).iter_errors(
+            {"choice": 5},
+        )
+
+        self.assertEqual(
+            [branch.schema_path for branch in error.branches],
+            [
+                ("properties", "choice", "oneOf", 0),
+                ("properties", "choice", "oneOf", 1),
+            ],
+        )
+
+    def test_validate_with_branch_details_reports_valid_anyOf(self):
+        schema = {"anyOf": [{"type": "integer"}, {"type": "string"}]}
+        report = validators.validate_with_branch_details(5, schema)
+
+        self.assertTrue(report.valid)
+        self.assertEqual(
+            [(branch.index, branch.valid) for branch in report.branches],
+            [(0, True), (1, False)],
+        )
+
+    def test_unexecuted_branches_are_not_reported_as_failures(self):
+        skipped = exceptions.BranchDetail(
+            index=1,
+            schema={"type": "string"},
+            schema_path=("oneOf", 1),
+            schema_uri=None,
+            valid=None,
+            status="not-evaluated",
+            keyword="oneOf",
+        )
+        error = exceptions.ValidationError("ambiguous", branches=[skipped])
+
+        self.assertEqual(error.failed_branches, ())
+        self.assertEqual(error.unevaluated_branches, (skipped,))
+        self.assertEqual(skipped.outcome, "not-evaluated")
+
+
 def sorted_errors(errors):
     def key(error):
         return (

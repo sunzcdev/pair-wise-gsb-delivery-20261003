@@ -9,6 +9,9 @@ v4.27.0
 * Errors produced by a ``false`` subschema now have the correct ``path`` and ``schema_path``, rather than empty ones.
 * Accessing an index with no errors on an ``ErrorTree`` no longer causes that index to appear in the tree (#1328).
   Subtrees also properly propagate lookup errors which were previously missing when accessing indices not in the subtree.
+* Branching keywords can now report per-branch details, including branch indexes, schema locations, and success, failure, or not-evaluated status.
+  ``anyOf`` keeps its normal short-circuit behavior, while ``validate_with_branch_details`` explicitly opts into evaluating every branch.
+  Branch locations retain the originating resource when references are followed.
 
 v4.26.0
 =======

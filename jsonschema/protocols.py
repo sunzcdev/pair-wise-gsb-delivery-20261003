@@ -26,7 +26,7 @@ if TYPE_CHECKING:
     import referencing.jsonschema
 
     from jsonschema import _typing
-    from jsonschema.exceptions import ValidationError
+    from jsonschema.exceptions import BranchReport, ValidationError
     import jsonschema
     import jsonschema.validators
 
@@ -160,7 +160,12 @@ class Validator(Protocol):
 
         """
 
-    def is_valid(self, instance: Any) -> bool:
+    def is_valid(
+        self,
+        instance: Any,
+        *,
+        branch_details: bool = ...,
+    ) -> bool:
         """
         Check if the instance is valid under the current `schema`.
 
@@ -174,7 +179,12 @@ class Validator(Protocol):
 
         """
 
-    def iter_errors(self, instance: Any) -> Iterable[ValidationError]:
+    def iter_errors(
+        self,
+        instance: Any,
+        *,
+        branch_details: bool | None = ...,
+    ) -> Iterable[ValidationError]:
         r"""
         Lazily yield each of the validation errors in the given instance.
 
@@ -193,6 +203,31 @@ class Validator(Protocol):
 
             Calling this function with a second schema argument is deprecated.
             Use `Validator.evolve` instead.
+        """
+
+    def collect_branch_details(
+        self,
+        instance: Any,
+        *,
+        keyword: str | None = ...,
+    ) -> BranchReport:
+        """
+        Validate exhaustively and collect the outcome of each branch.
+
+        Branching keywords such as :kw:`anyOf` normally stop as soon as
+        they can decide the result. This method explicitly opts into the
+        extra validation needed to report every branch, including branches
+        after the first successful :kw:`anyOf` branch.
+        """
+
+    def validate_with_branch_details(
+        self,
+        instance: Any,
+        *,
+        keyword: str | None = ...,
+    ) -> BranchReport:
+        """
+        An alias for `collect_branch_details`.
         """
 
     def validate(self, instance: Any) -> None:
