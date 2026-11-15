@@ -13,6 +13,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 ### Added
 
 * Expose `FunctionAuth` from the public API. (#3699)
+* Add optional streaming mode to `ASGITransport` with `streaming=True`, returning the response once the application sends `http.response.start` and streaming the body with a bounded buffer of `max_buffered_chunks`.
 
 ## 0.28.1 (6th December, 2024)
 

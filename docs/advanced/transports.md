@@ -140,6 +140,21 @@ async with httpx.AsyncClient(transport=transport, base_url="http://testserver") 
 
 See [the ASGI documentation](https://asgi.readthedocs.io/en/latest/specs/www.html#connection-scope) for more details on the `client` and `root_path` keys.
 
+### Streaming responses
+
+By default the transport buffers the response until the application has completed. Setting `streaming=True` returns the response as soon as the application sends `http.response.start`, with the application producing the response body concurrently to the client reading it:
+
+```python
+transport = httpx.ASGITransport(app=app, streaming=True)
+
+async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
+    async with client.stream("GET", "/") as response:
+        async for chunk in response.aiter_bytes():
+            ...
+```
+
+The number of body chunks buffered between the application and the client is bounded by `max_buffered_chunks`, so a fast application cannot run arbitrarily far ahead of a slow client. Closing the response early delivers an `http.disconnect` message to the application and winds down its task, and closing the transport ensures no application tasks are left running.
+
 ### ASGI startup and shutdown
 
 It is not in the scope of HTTPX to trigger ASGI lifespan events of your app.
