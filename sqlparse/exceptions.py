@@ -10,3 +10,8 @@
 
 class SQLParseError(Exception):
     """Base class for exceptions in this module."""
+
+
+class MixedParameterStylesError(SQLParseError):
+    """Raised when a statement mixes parameter placeholder styles that
+    cannot be reported as a single coherent style."""

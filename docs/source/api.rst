@@ -17,6 +17,35 @@ In most cases there's no need to set the `encoding` parameter. If
 is encoded either in utf-8 or latin-1.
 
 
+.. _finding_parameters:
+
+Finding Parameter Placeholders
+------------------------------
+
+.. module:: sqlparse.params
+
+The :mod:`sqlparse.params` module locates driver parameter placeholders
+in SQL text without rewriting the statement or extracting literals.
+
+.. autofunction:: sqlparse.params.find_params
+
+.. autoclass:: sqlparse.params.Parameter
+
+Recognized styles (available as module constants such as
+``sqlparse.params.QMARK``): ``qmark`` (``?``), ``numeric`` (``:1``),
+``named`` (``:name``), ``format`` (``%s``), ``pyformat`` (``%(name)s``)
+and ``dollar`` (``$1``). Pass ``style=`` to restrict recognition to a
+single style; without it, a statement that mixes styles raises
+:class:`sqlparse.exceptions.MixedParameterStylesError`.
+
+Pass ``dialect='postgres'`` or ``dialect='mysql'`` to preserve the
+dialect's operator lexing while scanning: PostgreSQL ``?|``/``?&``
+JSON operators, dollar-quoted strings and ``E'...'`` escapes, or MySQL
+backslash escapes, are then handled correctly. Text inside quotes,
+comments and ``::`` casts is never reported, and ``%%`` escapes are
+not counted as placeholders.
+
+
 .. _formatting:
 
 Formatting of SQL Statements
