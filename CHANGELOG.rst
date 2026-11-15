@@ -9,6 +9,11 @@ v4.27.0
 * Errors produced by a ``false`` subschema now have the correct ``path`` and ``schema_path``, rather than empty ones.
 * Accessing an index with no errors on an ``ErrorTree`` no longer causes that index to appear in the tree (#1328).
   Subtrees also properly propagate lookup errors which were previously missing when accessing indices not in the subtree.
+* Add ``jsonschema.exceptions.serialize_error`` (and ``dump_error``) for logging errors safely.
+  Values selected by a ``RedactionPolicy``, by field name, schema path, instance path or callable, are masked,
+  while the failed keyword, the instance location and a failure-reason category are preserved.
+  The original error is never modified, a parent's message cannot re-introduce a masked child value,
+  ``cause`` is reduced to an explicit summary rather than expanded, and limits on size and depth are reported via ``truncated``.
 
 v4.26.0
 =======

@@ -129,6 +129,71 @@ raised.
     The same attributes are present as for `ValidationError`\s.
 
 
+Safely serializing errors
+-------------------------
+
+Validation errors are optimized for people reading tracebacks, so their
+messages may include the offending instance value, and their ``context`` may
+contain nested errors carrying further values. When errors are written to
+logs, those values may be sensitive.
+
+`serialize_error` provides a separate, structured representation which does
+not modify the original error. The failed keyword, the instance location, and
+a category for the reason for failure are preserved, while values selected by
+a `RedactionPolicy` are replaced with a mask:
+
+.. code:: python
+
+    from jsonschema.exceptions import serialize_error
+
+    result = serialize_error(
+        error,
+        sensitive_schema_paths=[("properties", "password")],
+        max_depth=8,
+        max_context=20,
+    )
+    log.info("validation failed", extra={"error": result})
+
+Field names, JSON pointers, JSON paths, or callables can also identify
+sensitive locations:
+
+.. code:: python
+
+    serialize_error(error, sensitive_fields={"password", "token"})
+    serialize_error(error, sensitive_schema_paths="/properties/password")
+    serialize_error(error, sensitive_paths="$.account.token")
+    serialize_error(
+        error,
+        field_policy=lambda name, path, value: name.endswith("_secret"),
+    )
+
+The returned mapping also contains a sanitized ``message``, ``instance``,
+``validator_value`` and ``schema``. Composite errors keep their ``context``
+as nested safe mappings, and a parent error's message is scrubbed using the
+sensitive values discovered in its children, so a rendered parent object
+cannot re-introduce a masked child value. Its ``parent`` is described only
+by its type, keyword and location.
+
+By default ``cause`` is never expanded with its own ``repr`` or ``str``. It
+is reduced to its type and an explicit summary, and unknown custom exceptions
+receive an explicit "unrecognized exception type" summary. This avoids
+arbitrary exception rendering and stops a cause from bypassing redaction.
+
+``max_depth``, ``max_length``, ``max_items``, ``max_context`` and
+``max_bytes`` bound the output. Whenever a limit changes the result,
+``truncated`` is true and ``truncation`` lists the reasons. `dump_error`
+returns the same data as a JSON string.
+
+.. autofunction:: serialize_error
+    :noindex:
+
+.. autofunction:: dump_error
+    :noindex:
+
+.. autoclass:: RedactionPolicy
+    :noindex:
+
+
 These attributes can be clarified with a short example:
 
 .. testcode::

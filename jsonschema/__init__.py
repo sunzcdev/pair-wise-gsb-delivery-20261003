@@ -13,7 +13,17 @@ import warnings
 
 from jsonschema._format import FormatChecker
 from jsonschema._types import TypeChecker
-from jsonschema.exceptions import SchemaError, ValidationError
+from jsonschema.exceptions import (
+    RedactionPolicy,
+    SchemaError,
+    ValidationError,
+    dump_error,
+    redact_error,
+    safe_error,
+    safe_error_json,
+    safe_serialize,
+    serialize_error,
+)
 from jsonschema.validators import (
     Draft3Validator,
     Draft4Validator,
@@ -120,8 +130,15 @@ __all__ = [
     "Draft201909Validator",
     "Draft202012Validator",
     "FormatChecker",
+    "RedactionPolicy",
     "SchemaError",
     "TypeChecker",
     "ValidationError",
+    "dump_error",
+    "redact_error",
+    "safe_error",
+    "safe_error_json",
+    "safe_serialize",
+    "serialize_error",
     "validate",
 ]
