@@ -110,6 +110,28 @@ class Error(Exception):
     message: str
 
 
+@attr.s(auto_exc=True, auto_attribs=True)
+class SourceChangedError(Error):
+    """
+    Error raised by :py:class:`FollowReader` when the followed source
+    is truncated or replaced while being read.
+
+    In that case the previously buffered (unterminated) trailing line
+    cannot be continued, since it belongs to the old file contents.
+    The reader does not attempt to splice old and new contents
+    together and raises this error instead.
+
+    The ``.reason`` attribute contains either ``"truncated"`` or
+    ``"replaced"``.
+    """
+
+    reason: str
+
+    def __init__(self, message: str, reason: str) -> None:
+        self.reason = reason
+        super().__init__(message)
+
+
 @attr.s(auto_exc=True, auto_attribs=True, init=False)
 class InvalidLineError(Error, ValueError):
     """
@@ -182,6 +204,59 @@ class ReaderWriterBase:
         exc_tb: Optional[types.TracebackType],
     ) -> None:
         self.close()
+
+
+def _decode_line(
+    line: Union[str, bytes],
+    lineno: int,
+    loads: LoadsCallable,
+    type: Optional[Type[Any]],
+    allow_none: bool,
+) -> JSONValue:
+    """
+    Decode a single physical line into a JSON value.
+
+    This contains the validation logic shared between :py:class:`Reader`
+    and :py:class:`FollowReader`. The `line` must be a terminated
+    physical line; callers are responsible for buffering an
+    unterminated trailing line until more data is available.
+    """
+    if isinstance(line, bytes):
+        try:
+            line = line.decode("utf-8")
+        except UnicodeDecodeError as orig_exc:
+            exc = InvalidLineError(
+                f"line is not valid utf-8: {orig_exc}", line, lineno
+            )
+            raise exc from orig_exc
+
+    if line.startswith(SKIPPABLE_SINGLE_INITIAL_CHARS):
+        line = line[1:]
+
+    try:
+        value: JSONValue = loads(line)
+    except ValueError as orig_exc:
+        exc = InvalidLineError(
+            f"line contains invalid json: {orig_exc}", line, lineno
+        )
+        raise exc from orig_exc
+
+    if value is None:
+        if allow_none:
+            return None
+        raise InvalidLineError("line contains null value", line, lineno)
+
+    if type is not None:
+        valid = isinstance(value, type)
+        if type is int and isinstance(value, bool):
+            # isinstance() is not sufficient, since bool is an int subclass
+            valid = False
+        if not valid:
+            raise InvalidLineError(
+                "line does not match requested type", line, lineno
+            )
+
+    return value
 
 
 @attr.s(auto_attribs=True, repr=False)
@@ -310,42 +385,13 @@ class Reader(ReaderWriterBase):
         except StopIteration:
             raise EOFError from None
 
-        if isinstance(line, bytes):
-            try:
-                line = line.decode("utf-8")
-            except UnicodeDecodeError as orig_exc:
-                exc = InvalidLineError(
-                    f"line is not valid utf-8: {orig_exc}", line, lineno
-                )
-                raise exc from orig_exc
-
-        if line.startswith(SKIPPABLE_SINGLE_INITIAL_CHARS):
-            line = line[1:]
-
-        try:
-            value: JSONValue = self._loads(line)
-        except ValueError as orig_exc:
-            exc = InvalidLineError(
-                f"line contains invalid json: {orig_exc}", line, lineno
-            )
-            raise exc from orig_exc
-
-        if value is None:
-            if allow_none:
-                return None
-            raise InvalidLineError("line contains null value", line, lineno)
-
-        if type is not None:
-            valid = isinstance(value, type)
-            if type is int and isinstance(value, bool):
-                # isinstance() is not sufficient, since bool is an int subclass
-                valid = False
-            if not valid:
-                raise InvalidLineError(
-                    "line does not match requested type", line, lineno
-                )
-
-        return value
+        return _decode_line(
+            line,
+            lineno=lineno,
+            loads=self._loads,
+            type=type,
+            allow_none=allow_none,
+        )
 
     # No type specified, None not allowed
     @overload
@@ -451,6 +497,462 @@ class Reader(ReaderWriterBase):
             return repr_for_fp(self._fp)
         class_name = type(self._file_or_iterable).__name__
         return f"<{class_name} at 0x{id(self._file_or_iterable):x}>"
+
+
+@attr.s(auto_attribs=True, repr=False)
+class FollowReader(ReaderWriterBase):
+    """
+    Reader for jsonlines files that may still be appended to.
+
+    Unlike :py:class:`Reader`, this reader does not treat an
+    unterminated trailing line as a permanent record. Instead, the
+    incomplete line is buffered. A subsequent call can pick up the
+    remainder once the writer has flushed more data, after which the
+    completed line is parsed as a single record.
+
+    The reader never busy-waits and never polls the file by itself.
+    Each :py:meth:`read` call performs at most one read attempt on the
+    underlying file. When no complete line is available,
+    :py:exc:`EOFError` is raised, leaving the partial line buffered.
+    The caller decides when to try again, e.g. based on a filesystem
+    notification or an externally controlled interval.
+
+    When the caller knows the source has ended, call
+    :py:meth:`finish` to process the buffered trailing line according
+    to the final-tail-line rules: a buffered (non-empty) line is
+    parsed like any other line, while an empty buffer results in
+    :py:exc:`EOFError`.
+
+    If the file is truncated or replaced (e.g. log rotation),
+    :py:exc:`SourceChangedError` is raised. The buffered partial line
+    is never spliced together with contents from the new file.
+
+    Physical line numbers are counted continuously across calls, and
+    every successfully parsed record is emitted exactly once.
+
+    The first argument must be either an open readable file-like
+    object (text or binary) backed by a real file, or a file name /
+    path-like object, which will be opened for reading.
+
+    :param file_or_name: readable file-like object or name/path of
+        the file to follow
+    :param loads: custom json decoder callable
+    """
+
+    _file_or_name: Union[typing.IO[str], typing.IO[bytes], Openable]
+    _loads: LoadsCallable = attr.ib(default=default_loads, kw_only=True)
+
+    #: Buffered unterminated trailing line (without line ending).
+    _pending: Union[str, bytes, None] = attr.ib(default=None, init=False)
+
+    #: Next physical line number (1-based), counting continuously.
+    _lineno: int = attr.ib(default=1, init=False)
+
+    #: Identity of the underlying file, used to detect replacements.
+    _file_identity: Optional[Tuple[int, int]] = attr.ib(
+        default=None, init=False
+    )
+
+    def __attrs_post_init__(self) -> None:
+        fp: Union[typing.IO[str], typing.IO[bytes]]
+        if isinstance(self._file_or_name, (str, bytes, int, os.PathLike)):
+            # Open in binary mode so that partial multibyte characters in
+            # an unterminated line can be buffered without decoding errors.
+            fp = builtins.open(self._file_or_name, "rb")
+            self._should_close_fp = True
+        else:
+            fp = self._file_or_name
+        self._fp = fp
+        self._file_identity = self._get_file_identity(fp)
+
+    @staticmethod
+    def _get_file_identity(
+        fp: Union[typing.IO[str], typing.IO[bytes]],
+    ) -> Optional[Tuple[int, int]]:
+        try:
+            stat_result = os.fstat(fp.fileno())
+        except (OSError, AttributeError):
+            return None
+        return stat_result.st_dev, stat_result.st_ino
+
+    def _check_source(self) -> None:
+        """
+        Verify that the followed file was neither truncated nor replaced.
+        """
+        fp = self._fp
+        assert fp is not None
+
+        identity = self._get_file_identity(fp)
+        if (
+            self._file_identity is not None
+            and identity is not None
+            and identity != self._file_identity
+        ):
+            self._pending = None
+            raise SourceChangedError(
+                "followed source was replaced (e.g. log rotation)",
+                reason="replaced",
+            )
+
+        try:
+            current_position = fp.tell()
+            current_size = os.fstat(fp.fileno()).st_size
+        except (OSError, AttributeError):
+            return
+        if current_size < current_position:
+            # The file shrank beneath the read position. The buffered
+            # partial line belongs to the discarded contents, so it is
+            # dropped rather than spliced onto the new contents.
+            self._pending = None
+            raise SourceChangedError(
+                "followed source was truncated",
+                reason="truncated",
+            )
+
+    def _read_raw_line(self) -> Optional[Tuple[Union[str, bytes], bool]]:
+        """
+        Read one physical line from the file.
+
+        Returns ``None`` when no (additional) data is available right
+        now. Otherwise returns a ``(line, terminated)`` tuple where
+        `line` has the trailing newline stripped and `terminated`
+        tells whether the physical line was newline-terminated. A
+        ``terminated`` value of ``False`` means this is an
+        unterminated trailing line.
+        """
+        fp = self._fp
+        assert fp is not None
+
+        raw_line = fp.readline()
+        if raw_line == "" or raw_line == b"":
+            return None
+
+        if isinstance(raw_line, bytes):
+            terminated = raw_line.endswith(b"\n")
+            line: Union[str, bytes] = raw_line[:-1] if terminated else raw_line
+        else:
+            terminated = raw_line.endswith("\n")
+            line = raw_line[:-1] if terminated else raw_line
+        return line, terminated
+
+    # No type specified, None not allowed
+    @overload
+    def read(
+        self,
+        *,
+        type: Literal[None] = ...,
+        allow_none: Literal[False] = ...,
+        skip_empty: bool = ...,
+    ) -> JSONValue:
+        ...  # pragma: no cover
+
+    # No type specified, None allowed
+    @overload
+    def read(
+        self,
+        *,
+        type: Literal[None] = ...,
+        allow_none: Literal[True],
+        skip_empty: bool = ...,
+    ) -> Optional[JSONValue]:
+        ...  # pragma: no cover
+
+    # Type specified, None not allowed
+    @overload
+    def read(
+        self,
+        *,
+        type: Type[TJSONValue],
+        allow_none: Literal[False] = ...,
+        skip_empty: bool = ...,
+    ) -> TJSONValue:
+        ...  # pragma: no cover
+
+    # Type specified, None allowed
+    @overload
+    def read(
+        self,
+        *,
+        type: Type[TJSONValue],
+        allow_none: Literal[True],
+        skip_empty: bool = ...,
+    ) -> Optional[TJSONValue]:
+        ...  # pragma: no cover
+
+    # Generic definition
+    @overload
+    def read(
+        self,
+        *,
+        type: Optional[Type[Any]] = ...,
+        allow_none: bool = ...,
+        skip_empty: bool = ...,
+    ) -> Optional[JSONValue]:
+        ...  # pragma: no cover
+
+    def read(
+        self,
+        *,
+        type: Optional[Type[Any]] = None,
+        allow_none: bool = False,
+        skip_empty: bool = False,
+    ) -> Optional[JSONValue]:
+        """
+        Read and decode the next complete line.
+
+        An unterminated trailing line is kept buffered instead of being
+        parsed. It is combined with the remainder found on the next
+        call (if any) and only parsed once complete. When no complete
+        line is currently available, :py:exc:`EOFError` is raised; the
+        caller may try again later after the source has potentially
+        grown.
+
+        See :py:meth:`Reader.read` for the meaning of the arguments.
+        """
+        if self._closed:
+            raise RuntimeError("reader is closed")
+        if type is not None and type not in VALID_TYPES:
+            raise ValueError("invalid type specified")
+
+        self._check_source()
+
+        while True:
+            raw = self._read_raw_line()
+            if raw is None:
+                # No more data right now; any buffered partial line
+                # remains untouched for a later call.
+                raise EOFError
+
+            fragment, terminated = raw
+            lineno = self._lineno
+            pending = self._pending
+            if pending is None:
+                line = fragment
+            elif isinstance(pending, bytes) and isinstance(fragment, bytes):
+                line = pending + fragment
+            elif isinstance(pending, str) and isinstance(fragment, str):
+                line = pending + fragment
+            else:  # pragma: no cover - the stream type never changes
+                raise TypeError("inconsistent stream types while following")
+            self._pending = None
+
+            if not terminated:
+                # Unterminated trailing line: buffer it and wait for
+                # more data on a subsequent call.
+                self._pending = line
+                raise EOFError
+
+            self._lineno += 1
+
+            if skip_empty and not line.rstrip():
+                continue
+
+            return _decode_line(
+                line,
+                lineno=lineno,
+                loads=self._loads,
+                type=type,
+                allow_none=allow_none,
+            )
+
+    # No type specified, None not allowed
+    @overload
+    def finish(
+        self,
+        *,
+        type: Literal[None] = ...,
+        allow_none: Literal[False] = ...,
+        skip_empty: bool = ...,
+    ) -> JSONValue:
+        ...  # pragma: no cover
+
+    # No type specified, None allowed
+    @overload
+    def finish(
+        self,
+        *,
+        type: Literal[None] = ...,
+        allow_none: Literal[True],
+        skip_empty: bool = ...,
+    ) -> Optional[JSONValue]:
+        ...  # pragma: no cover
+
+    # Type specified, None not allowed
+    @overload
+    def finish(
+        self,
+        *,
+        type: Type[TJSONValue],
+        allow_none: Literal[False] = ...,
+        skip_empty: bool = ...,
+    ) -> TJSONValue:
+        ...  # pragma: no cover
+
+    # Type specified, None allowed
+    @overload
+    def finish(
+        self,
+        *,
+        type: Type[TJSONValue],
+        allow_none: Literal[True],
+        skip_empty: bool = ...,
+    ) -> Optional[TJSONValue]:
+        ...  # pragma: no cover
+
+    # Generic definition
+    @overload
+    def finish(
+        self,
+        *,
+        type: Optional[Type[Any]] = ...,
+        allow_none: bool = ...,
+        skip_empty: bool = ...,
+    ) -> Optional[JSONValue]:
+        ...  # pragma: no cover
+
+    def finish(
+        self,
+        *,
+        type: Optional[Type[Any]] = None,
+        allow_none: bool = False,
+        skip_empty: bool = False,
+    ) -> Optional[JSONValue]:
+        """
+        Process the buffered trailing line after the source has ended.
+
+        This must only be called once the caller knows no more data
+        will be appended. If a (non-empty when `skip_empty` is set)
+        line remains buffered, it is parsed using the final-tail-line
+        rules and returned. If nothing is buffered, :py:exc:`EOFError`
+        is raised.
+
+        See :py:meth:`Reader.read` for the meaning of the arguments.
+        """
+        if self._closed:
+            raise RuntimeError("reader is closed")
+        if type is not None and type not in VALID_TYPES:
+            raise ValueError("invalid type specified")
+
+        line = self._pending
+        if line is None or (skip_empty and not line.rstrip()):
+            self._pending = None
+            raise EOFError
+
+        lineno = self._lineno
+        self._pending = None
+        self._lineno += 1
+        return _decode_line(
+            line,
+            lineno=lineno,
+            loads=self._loads,
+            type=type,
+            allow_none=allow_none,
+        )
+
+    # No type specified, None not allowed
+    @overload
+    def iter(
+        self,
+        *,
+        type: Literal[None] = ...,
+        allow_none: Literal[False] = ...,
+        skip_empty: bool = ...,
+        skip_invalid: bool = ...,
+    ) -> Iterator[JSONValue]:
+        ...  # pragma: no cover
+
+    # No type specified, None allowed
+    @overload
+    def iter(
+        self,
+        *,
+        type: Literal[None] = ...,
+        allow_none: Literal[True],
+        skip_empty: bool = ...,
+        skip_invalid: bool = ...,
+    ) -> Iterator[JSONValue]:
+        ...  # pragma: no cover
+
+    # Type specified, None not allowed
+    @overload
+    def iter(
+        self,
+        *,
+        type: Type[TJSONValue],
+        allow_none: Literal[False] = ...,
+        skip_empty: bool = ...,
+        skip_invalid: bool = ...,
+    ) -> Iterator[TJSONValue]:
+        ...  # pragma: no cover
+
+    # Type specified, None allowed
+    @overload
+    def iter(
+        self,
+        *,
+        type: Type[TJSONValue],
+        allow_none: Literal[True],
+        skip_empty: bool = ...,
+        skip_invalid: bool = ...,
+    ) -> Iterator[Optional[TJSONValue]]:
+        ...  # pragma: no cover
+
+    # Generic definition
+    @overload
+    def iter(
+        self,
+        *,
+        type: Optional[Type[TJSONValue]] = ...,
+        allow_none: bool = ...,
+        skip_empty: bool = ...,
+        skip_invalid: bool = ...,
+    ) -> Iterator[Optional[TJSONValue]]:
+        ...  # pragma: no cover
+
+    def iter(
+        self,
+        type: Optional[Type[Any]] = None,
+        allow_none: bool = False,
+        skip_empty: bool = False,
+        skip_invalid: bool = False,
+    ) -> Iterator[Optional[JSONValue]]:
+        """
+        Yield the records that are currently available.
+
+        This performs a single non-blocking pass over the data that is
+        present right now; it never waits for more data to appear. Any
+        unterminated trailing line stays buffered, so calling this
+        again later will pick up where this call stopped. Incomplete
+        lines are therefore never emitted, and no record is emitted
+        more than once.
+
+        When `skip_invalid` is set to ``True``, invalid (but complete)
+        lines are silently ignored.
+
+        See :py:meth:`Reader.read` for a description of the other
+        arguments.
+        """
+        while True:
+            try:
+                value = self.read(
+                    type=type,
+                    allow_none=allow_none,
+                    skip_empty=skip_empty,
+                )
+            except InvalidLineError:
+                if not skip_invalid:
+                    raise
+            except EOFError:
+                return
+            else:
+                yield value
+
+    def _repr_for_wrapped(self) -> str:
+        fp = self._fp
+        if fp is not None:
+            return repr_for_fp(fp)
+        class_name = type(self._file_or_name).__name__
+        return f"<{class_name} at 0x{id(self._file_or_name):x}>"
 
 
 @attr.s(auto_attribs=True, repr=False)
@@ -570,6 +1072,18 @@ def open(
     mode: Literal["r"] = ...,
     *,
     loads: Optional[LoadsCallable] = ...,
+    follow: Literal[True],
+) -> FollowReader:
+    ...  # pragma: no cover
+
+
+@overload
+def open(
+    file: Openable,
+    mode: Literal["r"] = ...,
+    *,
+    loads: Optional[LoadsCallable] = ...,
+    follow: Literal[False] = ...,
 ) -> Reader:
     ...  # pragma: no cover
 
@@ -597,7 +1111,8 @@ def open(
     compact: Optional[bool] = ...,
     sort_keys: Optional[bool] = ...,
     flush: Optional[bool] = ...,
-) -> Union[Reader, Writer]:
+    follow: bool = ...,
+) -> Union[Reader, Writer, FollowReader]:
     ...  # pragma: no cover
 
 
@@ -610,13 +1125,19 @@ def open(
     compact: Optional[bool] = None,
     sort_keys: Optional[bool] = None,
     flush: Optional[bool] = None,
-) -> Union[Reader, Writer]:
+    follow: bool = False,
+) -> Union[Reader, Writer, FollowReader]:
     """
     Open a jsonlines file for reading or writing.
 
     This is a convenience function to open a file and wrap it in either a
-    :py:class:`Reader` or :py:class:`Writer` instance, depending on the
-    specified `mode`.
+    :py:class:`Reader`, :py:class:`FollowReader`, or :py:class:`Writer`
+    instance, depending on the specified `mode` and `follow` arguments.
+
+    When reading, passing ``follow=True`` returns a
+    :py:class:`FollowReader` instead of a regular :py:class:`Reader`.
+    This is useful for files that may still be appended to. The
+    `follow` argument is only valid together with ``mode='r'``.
 
     Additional keyword arguments will be passed on to the reader and writer;
     see their documentation for available options.
@@ -634,9 +1155,21 @@ def open(
     :param file: name or ‘path-like object’ of the file to open
     :param mode: whether to open the file for reading (``r``),
         writing (``w``), appending (``a``), or exclusive creation (``x``).
+    :param follow: whether to return a :py:class:`FollowReader` that
+        keeps an unterminated trailing line buffered instead of
+        parsing it immediately (reading mode only)
     """
     if mode not in {"r", "w", "a", "x"}:
         raise ValueError("'mode' must be either 'r', 'w', 'a', or 'x'")
+    if follow and mode != "r":
+        raise ValueError("'follow' is only supported with mode='r'")
+
+    if follow:
+        # FollowReader opens the file itself and takes care of closing
+        # it (``_should_close_fp``) in its initialiser.
+        return FollowReader(
+            file, loads=loads if loads is not None else default_loads
+        )
 
     cls = Reader if mode == "r" else Writer
     encoding = "utf-8-sig" if mode == "r" else "utf-8"
@@ -649,7 +1182,7 @@ def open(
         flush=flush,
     )
     kwargs = {key: value for key, value in kwargs.items() if value is not None}
-    instance: Union[Reader, Writer] = cls(fp, **kwargs)
+    instance = cls(fp, **kwargs)
     instance._should_close_fp = True
     return instance
 

@@ -54,6 +54,18 @@ Features
   * allows complete control over decoding using a custom ``loads``
     callable
 
+* Dedicated :py:class:`~jsonlines.FollowReader` for files that may
+  still be appended to
+
+  * keeps an unterminated trailing line buffered instead of treating
+    it as a (permanently) invalid record
+  * completes and parses that line once more data is available
+  * never busy-waits or polls; the caller decides when to refresh
+  * reports truncation and replacement (e.g. log rotation) via
+    :py:class:`~jsonlines.SourceChangedError`
+  * counts physical line numbers continuously and emits every record
+    exactly once
+
 * Flexible :py:class:`~jsonlines.Writer`
 
   * wraps a file-like object
@@ -123,6 +135,41 @@ calling :py:meth:`Reader.iter()` instead::
   for obj in reader.iter(type=dict, skip_invalid=True):
       ...
 
+Following a file that is still being written to
+------------------------------------------------
+
+A regular :py:class:`Reader` treats the end of the input as final: a
+trailing line without a line ending is parsed immediately, and reading
+past the end raises :py:exc:`EOFError`. That is not suitable for files
+that are still being appended to, where the last (partial) line is
+still in flux and should not be mistaken for a permanently bad record.
+
+The :py:class:`FollowReader` handles this case. It buffers an
+unterminated trailing line, and only parses it once the line is
+completed on a subsequent read. When no complete line is available
+yet, :py:meth:`~FollowReader.read()` raises :py:exc:`EOFError` while
+leaving the partial line buffered. The reader never waits or polls by
+itself; the calling code decides when to try again, for example after
+receiving a filesystem notification::
+
+  with jsonlines.open("events.jsonl", follow=True) as reader:
+      while True:
+          for obj in reader.iter():
+              handle(obj)
+          wait_for_external_signal()  # caller controls the timing
+
+When the caller knows the source has ended for good,
+:py:meth:`~FollowReader.finish` applies the final-tail-line rules: a
+remaining buffered line is parsed like any other line, while an empty
+buffer results in :py:exc:`EOFError`::
+
+      last_obj = reader.finish()
+
+If the followed file is truncated or replaced (as happens during log
+rotation), :py:class:`SourceChangedError` is raised. The buffered
+partial line is never spliced together with the contents of the new
+file.
+
 A :py:class:`Writer` wraps a file-like object, and can write a single
 object, or multiple objects at once::
 
@@ -167,6 +214,10 @@ API
    :members:
    :inherited-members:
 
+.. autoclass:: jsonlines.FollowReader
+   :members:
+   :inherited-members:
+
 .. autoclass:: jsonlines.Writer
    :members:
    :inherited-members:
@@ -175,6 +226,9 @@ API
    :members:
 
 .. autoclass:: jsonlines.InvalidLineError
+   :members:
+
+.. autoclass:: jsonlines.SourceChangedError
    :members:
 
 
@@ -188,6 +242,15 @@ The source code and issue tracker for this package can be found on GitHub:
 
 Version history
 ===============
+
+* development version
+
+  * add :py:class:`jsonlines.FollowReader` and the ``follow=True``
+    option to :py:func:`jsonlines.open()` for reading files that may
+    still be appended to. An unterminated trailing line is buffered
+    until it is completed, source truncation or replacement raises
+    :py:class:`jsonlines.SourceChangedError`, and the regular
+    :py:class:`jsonlines.Reader` EOF behaviour is unchanged.
 
 * 4.0.0, released at 2023-09-01
 

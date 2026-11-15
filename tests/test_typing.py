@@ -58,6 +58,26 @@ def something_with_reader() -> None:
     locals()  # Silence flake8 F841
 
 
+def something_with_follow_reader() -> None:
+    follow_reader: jsonlines.FollowReader
+    follow_reader = jsonlines.FollowReader(io.StringIO())
+    follow_reader = jsonlines.FollowReader(io.BytesIO())
+    follow_reader = jsonlines.FollowReader("/some/path.jsonl")
+
+    f1 = follow_reader.read()
+    f2 = follow_reader.read(allow_none=True)
+    f3: numbers.Number = follow_reader.read(type=random.choice([int, float]))
+    f4: int = follow_reader.finish(type=int)
+
+    follow_iter: Iterable[int] = follow_reader.iter(type=int)
+
+    # reveal_type(f1)
+    # reveal_type(f2)
+    # reveal_type(f3)
+    # reveal_type(f4)
+    locals()  # Silence flake8 F841
+
+
 def something_with_writer() -> None:
     writer: jsonlines.Writer
     writer = jsonlines.Writer(io.StringIO())
@@ -78,6 +98,10 @@ def something_with_open() -> None:
         mode="r",
         loads=json.loads,
     )
+
+    follow_reader: jsonlines.FollowReader = jsonlines.open(name, follow=True)
+    follow_reader.read()
+    follow_reader.finish()
 
     writer: jsonlines.Writer
     writer = jsonlines.open(name, "w")
