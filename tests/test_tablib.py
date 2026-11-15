@@ -445,6 +445,108 @@ class TablibTestCase(BaseTestCase):
         )
         self.assertEqual(tablib.detect_format(_bunk), None)
 
+    def test_detect_format_candidates_ambiguous(self):
+        """A text can be both valid JSON and a single-row CSV: every plausible
+        format is reported with its evidence, not just the first match."""
+        result = tablib.detect_format_candidates('["a", "b"]')
+        keys = [candidate.key for candidate in result.candidates]
+        self.assertIn('json', keys)
+        self.assertIn('csv', keys)
+        self.assertTrue(result.is_ambiguous)
+        self.assertFalse(result.is_unknown)
+        # The most confident candidate comes first and matches detect_format().
+        self.assertEqual(result.best.key, 'json')
+        self.assertEqual(tablib.detect_format('["a", "b"]'), 'json')
+        for candidate in result.candidates:
+            self.assertIn(candidate.confidence, ('signature', 'structure', 'heuristic'))
+            self.assertTrue(candidate.evidence)
+        self.assertIn('json', result.explain())
+
+    def test_detect_format_candidates_unambiguous(self):
+        result = tablib.detect_format_candidates('1,2,3\n4,5,6\n7,8,9\n')
+        self.assertEqual([c.key for c in result.candidates], ['csv'])
+        self.assertFalse(result.is_ambiguous)
+
+    def test_load_require_unambiguous_raises(self):
+        """load() can refuse to guess when detection is ambiguous."""
+        with self.assertRaises(tablib.AmbiguousFormatError) as ctx:
+            tablib.Dataset().load('["a", "b"]', require_unambiguous=True)
+        keys = [candidate.key for candidate in ctx.exception.candidates]
+        self.assertIn('json', keys)
+        self.assertIn('csv', keys)
+
+    def test_load_require_unambiguous_ok(self):
+        """Unambiguous input loads fine even with require_unambiguous=True."""
+        dset = tablib.Dataset().load('1,2,3\n4,5,6\n', require_unambiguous=True)
+        self.assertEqual(dset.height, 1)
+
+    def test_load_ambiguous_still_guesses_by_default(self):
+        """Without require_unambiguous, load() keeps the legacy behaviour."""
+        dset = tablib.Dataset().load('[{"a": 1}, {"a": 2}]')
+        self.assertEqual(dset.dict, [{'a': 1}, {'a': 2}])
+
+    def test_detect_does_not_consume_seekable_stream(self):
+        stream = StringIO('1,2,3\n4,5,6\n')
+        stream.read(1)
+        position = stream.tell()
+        tablib.detect_format(stream)
+        self.assertEqual(stream.tell(), position)
+
+    def test_detect_non_seekable_stream_no_data_loss(self):
+        """Detection on a non-seekable stream replays the sampled prefix, so
+        the real import still sees the complete content."""
+
+        class NonSeekable(StringIO):
+            def seekable(self):
+                return False
+
+            def tell(self):
+                raise OSError('not seekable')
+
+            def seek(self, *args):
+                raise OSError('not seekable')
+
+        csv_text = ''.join(f'{i},{i + 1}\n' for i in range(5000))
+        dset = tablib.Dataset().load(NonSeekable(csv_text), headers=False)
+        self.assertEqual(dset.height, 5000)
+        self.assertEqual(dset[0], ('0', '1'))
+        self.assertEqual(dset[-1], ('4999', '5000'))
+
+    def test_detect_truncated_signature_is_unknown(self):
+        """An incomplete binary signature is reported as unknown and does not
+        trigger any real import attempt."""
+        result = tablib.detect_format_candidates(b'PK')
+        self.assertTrue(result.is_unknown)
+        self.assertTrue(result.unknown_reasons)
+        with self.assertRaises(UnsupportedFormat):
+            tablib.Dataset().load(b'PK')
+
+    def test_detect_gzip_is_unknown(self):
+        result = tablib.detect_format_candidates(b'\x1f\x8b' + b'x' * 100)
+        self.assertTrue(result.is_unknown)
+        self.assertIn('gzip', result.unknown_reasons[0])
+
+    def test_detect_unrecognized_binary_is_unknown(self):
+        result = tablib.detect_format_candidates(bytes(range(256)) * 4)
+        self.assertTrue(result.is_unknown)
+        self.assertTrue(result.unknown_reasons)
+
+    def test_detect_binary_signatures(self):
+        _xlsx = self.founders.export('xlsx')
+        result = tablib.detect_format_candidates(_xlsx)
+        self.assertEqual(result.best.key, 'xlsx')
+        self.assertEqual(result.best.confidence, 'signature')
+
+        _ods = self.founders.export('ods')
+        result = tablib.detect_format_candidates(_ods)
+        self.assertEqual(result.best.key, 'ods')
+        self.assertEqual(result.best.confidence, 'signature')
+
+        _xls = self.founders.export('xls')
+        result = tablib.detect_format_candidates(_xls)
+        self.assertEqual(result.best.key, 'xls')
+        self.assertEqual(result.best.confidence, 'signature')
+
     def test_transpose(self):
         """Transpose a dataset."""
 

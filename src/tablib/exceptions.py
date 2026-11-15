@@ -20,3 +20,11 @@ class HeadersNeeded(TablibException, AttributeError):
 
 class UnsupportedFormat(TablibException, NotImplementedError):
     """Format not supported."""
+
+
+class AmbiguousFormatError(TablibException, ValueError):
+    """Format auto-detection found several plausible formats."""
+
+    def __init__(self, message, candidates=()):
+        super().__init__(message)
+        self.candidates = list(candidates)

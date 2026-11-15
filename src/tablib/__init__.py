@@ -11,12 +11,14 @@ except ImportError:
 
 
 from .core import (  # noqa: F401
+    AmbiguousFormatError,
     Databook,
     Dataset,
     InvalidDatasetType,
     InvalidDimensions,
     UnsupportedFormat,
     detect_format,
+    detect_format_candidates,
     import_book,
     import_set,
 )

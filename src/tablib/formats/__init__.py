@@ -125,11 +125,15 @@ class Registry:
             self.register('cli', 'tablib.formats._cli.CLIFormat')
 
     def formats(self):
+        for _key, fmt in self.items():
+            yield fmt
+
+    def items(self):
         self._ensure_builtins_registered()
         for key, frm in self._formats.items():
             if isinstance(frm, str):
                 self._formats[key] = load_format_class(frm)
-            yield self._formats[key]
+            yield key, self._formats[key]
 
     def get_format(self, key):
         self._ensure_builtins_registered()

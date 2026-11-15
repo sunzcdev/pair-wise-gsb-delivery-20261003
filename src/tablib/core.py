@@ -19,12 +19,14 @@ from copy import copy
 from operator import itemgetter
 
 from .exceptions import (
+    AmbiguousFormatError,
     HeadersNeeded,
     InvalidDatasetIndex,
     InvalidDatasetType,
     InvalidDimensions,
     UnsupportedFormat,
 )
+from .detection import detect_format_candidates
 from .formats import registry
 from .utils import normalize_input
 
@@ -410,17 +412,20 @@ class Dataset:
             except TypeError:
                 return 0
 
-    def load(self, in_stream, format=None, **kwargs):
+    def load(self, in_stream, format=None, *, require_unambiguous=False, **kwargs):
         """
         Import `in_stream` to the :class:`Dataset` object using the `format`.
         `in_stream` can be a file-like object, a string, or a bytestring.
 
+        :param require_unambiguous: (optional) when auto-detecting the format,
+            raise :class:`AmbiguousFormatError` instead of guessing if several
+            formats plausibly match the input.
         :param \\*\\*kwargs: (optional) custom configuration to the format `import_set`.
         """
 
         stream = normalize_input(in_stream)
         if not format:
-            format = detect_format(stream)
+            stream, format = _detect_load_format(stream, require_unambiguous)
 
         fmt = registry.get_format(format)
         if not hasattr(fmt, 'import_set'):
@@ -902,17 +907,20 @@ class Databook:
         """The number of the :class:`Dataset` objects within :class:`Databook`."""
         return len(self._datasets)
 
-    def load(self, in_stream, format, **kwargs):
+    def load(self, in_stream, format=None, *, require_unambiguous=False, **kwargs):
         """
         Import `in_stream` to the :class:`Databook` object using the `format`.
         `in_stream` can be a file-like object, a string, or a bytestring.
 
+        :param require_unambiguous: (optional) when auto-detecting the format,
+            raise :class:`AmbiguousFormatError` instead of guessing if several
+            formats plausibly match the input.
         :param \\*\\*kwargs: (optional) custom configuration to the format `import_book`.
         """
 
         stream = normalize_input(in_stream)
         if not format:
-            format = detect_format(stream)
+            stream, format = _detect_load_format(stream, require_unambiguous)
 
         fmt = registry.get_format(format)
         if not hasattr(fmt, 'import_book'):
@@ -934,21 +942,38 @@ class Databook:
         return fmt.export_book(self, **kwargs)
 
 
+def _detect_load_format(stream, require_unambiguous):
+    """Detect the format of `stream` for :meth:`Dataset.load`/:meth:`Databook.load`.
+
+    Return a ``(stream, format_key)`` tuple where `stream` is positioned at the
+    start of the content and safe to import from.
+    """
+    result = detect_format_candidates(stream)
+    if require_unambiguous and result.is_ambiguous:
+        raise AmbiguousFormatError(
+            'Ambiguous input: it can be interpreted as '
+            + ', '.join(candidate.title for candidate in result.candidates)
+            + '. Pass the `format` argument explicitly.',
+            candidates=result.candidates,
+        )
+    best = result.best
+    if best is None:
+        message = 'Unable to detect the input format.'
+        if result.unknown_reasons:
+            message += ' ' + '; '.join(result.unknown_reasons)
+        raise UnsupportedFormat(message)
+    return result.stream, best.key
+
+
 def detect_format(stream):
-    """Return format name of given stream (file-like object, string, or bytestring)."""
-    stream = normalize_input(stream)
-    fmt_title = None
-    for fmt in registry.formats():
-        try:
-            if fmt.detect(stream):
-                fmt_title = fmt.title
-                break
-        except AttributeError:
-            pass
-        finally:
-            if hasattr(stream, 'seek'):
-                stream.seek(0)
-    return fmt_title
+    """Return format name of given stream (file-like object, string, or bytestring).
+
+    Only the most confident candidate is returned; use
+    :func:`tablib.detect_format_candidates` to get every plausible format
+    together with its evidence and confidence.
+    """
+    best = detect_format_candidates(stream).best
+    return best.title if best is not None else None
 
 
 def import_set(stream, format=None, **kwargs):
