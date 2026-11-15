@@ -17,6 +17,53 @@ In most cases there's no need to set the `encoding` parameter. If
 is encoded either in utf-8 or latin-1.
 
 
+.. _range_editing:
+
+Range Editing of Token Trees
+----------------------------
+
+An already parsed and grouped statement can be edited without flattening
+it back into a string and re-parsing it.  The range-editing API operates on
+whole *leaf tokens* only, so the identity of every token outside the edited
+range is preserved.
+
+An :class:`~sqlparse.EditOp` describes a single edit using character offsets
+relative to ``str(statement)``.  Offsets must lie on leaf-token boundaries
+and an edit must stay inside a single group; ranges that cut into a leaf
+token or cross a group boundary are rejected with
+:class:`~sqlparse.RangeEditError` instead of being guessed at.
+
+.. autoclass:: sqlparse.EditOp
+   :members: replace, insert, delete
+
+.. autoclass:: sqlparse.RangeEditor
+   :members: apply, replace, insert, delete
+
+.. autofunction:: sqlparse.edit_range
+
+.. autofunction:: sqlparse.check_structure
+
+.. autoexception:: sqlparse.RangeEditError
+
+Edits are applied atomically: all edits in a batch are validated before the
+tree is touched and overlapping ranges are rejected, so a failed call never
+leaves a partially modified tree behind.  The tree is deliberately *not*
+re-grouped.  After an edit the cached grouping may no longer describe the
+new syntax; call :func:`~sqlparse.check_structure` to inspect the cached
+parent links and group values::
+
+    import sqlparse
+    from sqlparse import RangeEditor
+
+    statement = sqlparse.parse("select a from t where x = 1")[0]
+    text = str(statement)
+    start = text.index("1")
+
+    RangeEditor(statement).replace(start, start + 1, "2")
+    assert str(statement) == "select a from t where x = 2"
+    assert sqlparse.check_structure(statement) == []
+
+
 .. _formatting:
 
 Formatting of SQL Statements

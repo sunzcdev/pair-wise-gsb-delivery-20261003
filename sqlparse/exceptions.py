@@ -10,3 +10,11 @@
 
 class SQLParseError(Exception):
     """Base class for exceptions in this module."""
+
+
+class RangeEditError(SQLParseError):
+    """Raised when a restricted range edit cannot be applied.
+
+    The edit is rejected before the token tree is modified, so the
+    tree remains in its previous, consistent state.
+    """
