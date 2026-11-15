@@ -240,6 +240,8 @@ typedef struct _PyScannerObject {
     int strict;
     PyObject *object_hook;
     PyObject *pairs_hook;
+    PyObject *hook_mode;
+    int hook_chain;
     PyObject *array_hook;
     PyObject *parse_float;
     PyObject *parse_int;
@@ -259,6 +261,7 @@ typedef struct _PyScannerObject {
     X(strict_bool)                    \
     X(object_hook)                    \
     X(pairs_hook)                     \
+    X(hook_mode)                      \
     X(array_hook)                     \
     X(parse_float)                    \
     X(parse_int)                      \
@@ -270,6 +273,7 @@ static PyMemberDef scanner_members[] = {
     {"strict", Py_T_OBJECT_EX, offsetof(PyScannerObject, strict_bool), READONLY, "strict"},
     {"object_hook", Py_T_OBJECT_EX, offsetof(PyScannerObject, object_hook), READONLY, "object_hook"},
     {"object_pairs_hook", Py_T_OBJECT_EX, offsetof(PyScannerObject, pairs_hook), READONLY, "object_pairs_hook"},
+    {"object_hook_mode", Py_T_OBJECT_EX, offsetof(PyScannerObject, hook_mode), READONLY, "object_hook_mode"},
     {"array_hook", Py_T_OBJECT_EX, offsetof(PyScannerObject, array_hook), READONLY, "array_hook"},
     {"parse_float", Py_T_OBJECT_EX, offsetof(PyScannerObject, parse_float), READONLY, "parse_float"},
     {"parse_int", Py_T_OBJECT_EX, offsetof(PyScannerObject, parse_int), READONLY, "parse_int"},
@@ -2495,6 +2499,25 @@ scanner_new(PyTypeObject *type, PyObject *args, PyObject *kwds)
         goto bail;
     LOAD_ATTR(object_hook, "object_hook");
     LOAD_ATTR(pairs_hook, "object_pairs_hook");
+    LOAD_ATTR(hook_mode, "object_hook_mode");
+    /* Precompute whether object_hook should be called with the result of
+     * object_pairs_hook ("chain" mode). The Python side validates the mode
+     * string, so anything other than "chain" keeps the historical
+     * priority behavior. */
+    s->hook_chain = 0;
+    if (PyUnicode_Check(s->hook_mode)) {
+        int cmp = PyUnicode_CompareWithASCIIString(s->hook_mode, "chain");
+        if (cmp < 0 && PyErr_Occurred())
+            goto bail;
+        s->hook_chain = (cmp == 0);
+    }
+    else if (PyBytes_Check(s->hook_mode)) {
+        /* Python 2 passes the mode as a str (bytes) */
+        char *mode = PyBytes_AsString(s->hook_mode);
+        if (mode == NULL)
+            goto bail;
+        s->hook_chain = (strcmp(mode, "chain") == 0);
+    }
     LOAD_ATTR(array_hook, "array_hook");
     LOAD_ATTR(parse_float, "parse_float");
     LOAD_ATTR(parse_int, "parse_int");

@@ -30,6 +30,7 @@ def py_make_scanner(context):
     parse_constant = context.parse_constant
     object_hook = context.object_hook
     object_pairs_hook = context.object_pairs_hook
+    object_hook_mode = context.object_hook_mode
     array_hook = context.array_hook
     memo = context.memo
 
@@ -44,7 +45,8 @@ def py_make_scanner(context):
             return parse_string(string, idx + 1, encoding, strict)
         elif nextchar == '{':
             return parse_object((string, idx + 1), encoding, strict,
-                _scan_once, object_hook, object_pairs_hook, memo)
+                _scan_once, object_hook, object_pairs_hook, memo,
+                object_hook_mode=object_hook_mode)
         elif nextchar == '[':
             return parse_array((string, idx + 1), _scan_once, array_hook)
         elif nextchar == 'n' and string[idx:idx + 4] == 'null':

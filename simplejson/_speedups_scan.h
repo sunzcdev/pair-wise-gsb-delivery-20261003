@@ -311,7 +311,18 @@ JSON_SCAN_FN(_parse_object)(PyScannerObject *s, PyObject *pystr,
         val = PyObject_CallOneArg(s->pairs_hook, pairs);
         if (val == NULL)
             goto bail;
-        Py_DECREF(pairs);
+        Py_CLEAR(pairs);
+        /* in "chain" mode the object_hook receives whatever the
+           pairs_hook returned, even if it is not a mapping */
+        if (s->hook_chain && s->object_hook != Py_None) {
+            rval = PyObject_CallOneArg(s->object_hook, val);
+            Py_DECREF(val);
+            val = NULL;
+            if (rval == NULL)
+                goto bail;
+            val = rval;
+            rval = NULL;
+        }
         *next_idx_ptr = idx + 1;
         return val;
     }

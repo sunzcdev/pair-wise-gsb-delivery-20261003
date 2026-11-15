@@ -327,7 +327,8 @@ Basic Usage
 .. function:: load(fp, encoding='utf-8', cls=None, object_hook=None, \
                    parse_float=None, parse_int=None, \
                    parse_constant=None, object_pairs_hook=None, \
-                   use_decimal=None, allow_nan=False, **kw)
+                   use_decimal=None, allow_nan=False, \
+                   object_hook_mode=None, **kw)
 
    Deserialize *fp* (a ``.read()``-supporting file-like object containing a JSON
    document) to a Python object using this
@@ -370,7 +371,8 @@ Basic Usage
 .. function:: loads(s, encoding='utf-8', cls=None, object_hook=None, \
                     parse_float=None, parse_int=None, \
                     parse_constant=None, object_pairs_hook=None, \
-                    use_decimal=None, allow_nan=False, **kw)
+                    use_decimal=None, allow_nan=False, \
+                    object_hook_mode=None, **kw)
 
     Deserialize *s* (a :class:`str` or :class:`unicode` instance containing a JSON
     document) to a Python object. :exc:`JSONDecodeError` will be
@@ -404,6 +406,24 @@ Basic Usage
     rely on the order that the key and value pairs are decoded (for example,
     :class:`collections.OrderedDict` will remember the order of insertion). If
     *object_hook* is also defined, the *object_pairs_hook* takes priority.
+
+    *object_hook_mode* controls how *object_hook* and *object_pairs_hook*
+    interact when both are specified. It must be one of ``'priority'``,
+    ``'chain'``, or ``'exclusive'``:
+
+    - ``'priority'`` (the default) keeps the historical behavior:
+      *object_pairs_hook* is called and *object_hook* is ignored.
+    - ``'chain'`` calls *object_pairs_hook* with the list of pairs and then
+      calls *object_hook* with the value that *object_pairs_hook* returned
+      (which need not be a mapping).
+    - ``'exclusive'`` raises :exc:`ValueError` if both hooks are specified,
+      making the mutual exclusion explicit.
+
+    In all modes hooks fire from the inside out: the hooks of a nested
+    object run before the hooks of the object that contains it, and
+    whatever a hook returns is used as the decoded value as-is.
+
+    .. versionadded:: 4.4.0
 
     *parse_float*, if specified, will be called with the string of every JSON
     float to be decoded.  By default, this is equivalent to ``float(num_str)``.
@@ -463,7 +483,8 @@ Encoders and decoders
 
 .. class:: JSONDecoder(encoding='utf-8', object_hook=None, parse_float=None, \
                        parse_int=None, parse_constant=None, \
-                       object_pairs_hook=None, strict=True, allow_nan=False)
+                       object_pairs_hook=None, strict=True, allow_nan=False, \
+                       object_hook_mode=None)
 
    Simple JSON decoder.
 
@@ -514,6 +535,14 @@ Encoders and decoders
    rely on the order that the key and value pairs are decoded (for example,
    :class:`collections.OrderedDict` will remember the order of insertion). If
    *object_hook* is also defined, the *object_pairs_hook* takes priority.
+
+   *object_hook_mode* controls how *object_hook* and *object_pairs_hook*
+   interact when both are specified: ``'priority'`` (the default) keeps the
+   historical behavior where *object_pairs_hook* wins, ``'chain'`` passes
+   the return value of *object_pairs_hook* to *object_hook*, and
+   ``'exclusive'`` raises :exc:`ValueError` if both hooks are specified.
+
+   .. versionadded:: 4.4.0
 
    *parse_float*, if specified, will be called with the string of every JSON
    float to be decoded.  By default, this is equivalent to ``float(num_str)``.
