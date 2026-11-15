@@ -168,6 +168,9 @@ class Limits:
             keep-alive connections below this point. Should be less than or equal
             to `max_connections`.
     * **keepalive_expiry** - Time limit on idle keep-alive connections in seconds.
+    * **max_connections_per_origin** - The maximum number of concurrent
+            requests that may be in flight to any single origin. A request
+            holds its permit until its response body is exhausted or closed.
     """
 
     def __init__(
@@ -176,10 +179,26 @@ class Limits:
         max_connections: int | None = None,
         max_keepalive_connections: int | None = None,
         keepalive_expiry: float | None = 5.0,
+        max_connections_per_origin: int | None = None,
+        max_concurrent_requests_per_origin: int | None = None,
+        max_concurrency_per_origin: int | None = None,
     ) -> None:
         self.max_connections = max_connections
         self.max_keepalive_connections = max_keepalive_connections
         self.keepalive_expiry = keepalive_expiry
+        self.max_connections_per_origin = _coalesce_origin_limit(
+            max_connections_per_origin,
+            max_concurrent_requests_per_origin,
+            max_concurrency_per_origin,
+        )
+
+    @property
+    def max_concurrent_requests_per_origin(self) -> int | None:
+        return self.max_connections_per_origin
+
+    @property
+    def max_concurrency_per_origin(self) -> int | None:
+        return self.max_connections_per_origin
 
     def __eq__(self, other: typing.Any) -> bool:
         return (
@@ -187,15 +206,37 @@ class Limits:
             and self.max_connections == other.max_connections
             and self.max_keepalive_connections == other.max_keepalive_connections
             and self.keepalive_expiry == other.keepalive_expiry
+            and self.max_connections_per_origin == other.max_connections_per_origin
         )
 
     def __repr__(self) -> str:
         class_name = self.__class__.__name__
-        return (
+        value = (
             f"{class_name}(max_connections={self.max_connections}, "
             f"max_keepalive_connections={self.max_keepalive_connections}, "
             f"keepalive_expiry={self.keepalive_expiry})"
         )
+        if self.max_connections_per_origin is not None:
+            value = value[:-1] + (
+                f", max_connections_per_origin={self.max_connections_per_origin})"
+            )
+        return value
+
+
+def _coalesce_origin_limit(*values: int | None) -> int | None:
+    limits = [value for value in values if value is not None]
+    if not limits:
+        return None
+    if len(set(limits)) > 1:
+        raise ValueError(
+            "Conflicting per-origin concurrency limits: " + ", ".join(map(str, limits))
+        )
+    limit = limits[0]
+    if limit < 1:
+        raise ValueError(
+            "max_connections_per_origin must be at least 1, or None."
+        )
+    return limit
 
 
 class Proxy:

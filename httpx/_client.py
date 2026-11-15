@@ -18,7 +18,9 @@ from ._config import (
     Limits,
     Proxy,
     Timeout,
+    _coalesce_origin_limit,
 )
+from ._concurrency import AsyncOriginLimiter, SyncOriginLimiter
 from ._decoders import SUPPORTED_DECODERS
 from ._exceptions import (
     InvalidURL,
@@ -91,6 +93,10 @@ def _same_origin(url: URL, other: URL) -> bool:
     )
 
 
+def _origin_key(url: URL) -> tuple[str, str, int | None]:
+    return (url.scheme, url.host, _port_or_default(url))
+
+
 class UseClientDefault:
     """
     For some parameters such as `auth=...` and `timeout=...` we need to be able
@@ -139,47 +145,97 @@ class ClientState(enum.Enum):
 class BoundSyncStream(SyncByteStream):
     """
     A byte stream that is bound to a given response instance, and that
-    ensures the `response.elapsed` is set once the response is closed.
+    ensures the `response.elapsed` is set once the response is closed, and
+    releases any per-origin concurrency permit once the body is complete.
     """
 
     def __init__(
-        self, stream: SyncByteStream, response: Response, start: float
+        self,
+        stream: SyncByteStream,
+        response: Response,
+        start: float,
+        release: typing.Callable[[], None] | None = None,
     ) -> None:
         self._stream = stream
         self._response = response
         self._start = start
+        self._release = release
+
+        if response.is_closed or response.is_stream_consumed:
+            self._release_permit()
+
+    def _release_permit(self) -> None:
+        if self._release is not None:
+            release, self._release = self._release, None
+            release()
 
     def __iter__(self) -> typing.Iterator[bytes]:
-        for chunk in self._stream:
-            yield chunk
+        try:
+            for chunk in self._stream:
+                yield chunk
+        except GeneratorExit:
+            raise
+        except BaseException:
+            self._release_permit()
+            raise
+        else:
+            self._release_permit()
 
     def close(self) -> None:
-        elapsed = time.perf_counter() - self._start
-        self._response.elapsed = datetime.timedelta(seconds=elapsed)
-        self._stream.close()
+        try:
+            elapsed = time.perf_counter() - self._start
+            self._response.elapsed = datetime.timedelta(seconds=elapsed)
+            self._stream.close()
+        finally:
+            self._release_permit()
 
 
 class BoundAsyncStream(AsyncByteStream):
     """
     An async byte stream that is bound to a given response instance, and that
-    ensures the `response.elapsed` is set once the response is closed.
+    ensures the `response.elapsed` is set once the response is closed, and
+    releases any per-origin concurrency permit once the body is complete.
     """
 
     def __init__(
-        self, stream: AsyncByteStream, response: Response, start: float
+        self,
+        stream: AsyncByteStream,
+        response: Response,
+        start: float,
+        release: typing.Callable[[], None] | None = None,
     ) -> None:
         self._stream = stream
         self._response = response
         self._start = start
+        self._release = release
+
+        if response.is_closed or response.is_stream_consumed:
+            self._release_permit()
+
+    def _release_permit(self) -> None:
+        if self._release is not None:
+            release, self._release = self._release, None
+            release()
 
     async def __aiter__(self) -> typing.AsyncIterator[bytes]:
-        async for chunk in self._stream:
-            yield chunk
+        try:
+            async for chunk in self._stream:
+                yield chunk
+        except GeneratorExit:
+            raise
+        except BaseException:
+            self._release_permit()
+            raise
+        else:
+            self._release_permit()
 
     async def aclose(self) -> None:
-        elapsed = time.perf_counter() - self._start
-        self._response.elapsed = datetime.timedelta(seconds=elapsed)
-        await self._stream.aclose()
+        try:
+            elapsed = time.perf_counter() - self._start
+            self._response.elapsed = datetime.timedelta(seconds=elapsed)
+            await self._stream.aclose()
+        finally:
+            self._release_permit()
 
 
 EventHook = typing.Callable[..., typing.Any]
@@ -200,6 +256,7 @@ class BaseClient:
         base_url: URL | str = "",
         trust_env: bool = True,
         default_encoding: str | typing.Callable[[bytes], str] = "utf-8",
+        origin_concurrency_limit: int | None = None,
     ) -> None:
         event_hooks = {} if event_hooks is None else event_hooks
 
@@ -219,6 +276,7 @@ class BaseClient:
         self._trust_env = trust_env
         self._default_encoding = default_encoding
         self._state = ClientState.UNOPENED
+        self._origin_concurrency_limit = origin_concurrency_limit
 
     @property
     def is_closed(self) -> bool:
@@ -230,6 +288,21 @@ class BaseClient:
     @property
     def trust_env(self) -> bool:
         return self._trust_env
+
+    @property
+    def max_connections_per_origin(self) -> int | None:
+        """
+        The maximum number of in-flight requests allowed for any single origin.
+        """
+        return self._origin_concurrency_limit
+
+    @property
+    def max_concurrent_requests_per_origin(self) -> int | None:
+        return self._origin_concurrency_limit
+
+    @property
+    def max_concurrency_per_origin(self) -> int | None:
+        return self._origin_concurrency_limit
 
     def _enforce_trailing_slash(self, url: URL) -> URL:
         if url.raw_path.endswith(b"/"):
@@ -623,6 +696,8 @@ class Client(BaseClient):
     * **timeout** - *(optional)* The timeout configuration to use when sending
     requests.
     * **limits** - *(optional)* The limits configuration to use.
+    * **max_connections_per_origin** - *(optional)* The maximum number of
+    concurrent in-flight requests to any single origin.
     * **max_redirects** - *(optional)* The maximum number of redirect responses
     that should be followed.
     * **base_url** - *(optional)* A URL to use as the base when building
@@ -653,12 +728,21 @@ class Client(BaseClient):
         timeout: TimeoutTypes = DEFAULT_TIMEOUT_CONFIG,
         follow_redirects: bool = False,
         limits: Limits = DEFAULT_LIMITS,
+        max_connections_per_origin: int | None = None,
+        max_concurrent_requests_per_origin: int | None = None,
+        max_concurrency_per_origin: int | None = None,
         max_redirects: int = DEFAULT_MAX_REDIRECTS,
         event_hooks: None | (typing.Mapping[str, list[EventHook]]) = None,
         base_url: URL | str = "",
         transport: BaseTransport | None = None,
         default_encoding: str | typing.Callable[[bytes], str] = "utf-8",
     ) -> None:
+        origin_concurrency_limit = _coalesce_origin_limit(
+            max_connections_per_origin,
+            max_concurrent_requests_per_origin,
+            max_concurrency_per_origin,
+            limits.max_connections_per_origin,
+        )
         super().__init__(
             auth=auth,
             params=params,
@@ -671,7 +755,9 @@ class Client(BaseClient):
             base_url=base_url,
             trust_env=trust_env,
             default_encoding=default_encoding,
+            origin_concurrency_limit=origin_concurrency_limit,
         )
+        self._origin_limiter = SyncOriginLimiter(origin_concurrency_limit)
 
         if http2:
             try:
@@ -952,6 +1038,7 @@ class Client(BaseClient):
 
                     response.history = list(history)
                     response.read()
+                    response.close()
                     request = next_request
                     history.append(response)
 
@@ -990,6 +1077,7 @@ class Client(BaseClient):
 
                 if follow_redirects:
                     response.read()
+                    response.close()
                 else:
                     response.next_request = request
                     return response
@@ -1003,35 +1091,46 @@ class Client(BaseClient):
         Sends a single request, without handling any redirections.
         """
         transport = self._transport_for_url(request.url)
-        start = time.perf_counter()
 
         if not isinstance(request.stream, SyncByteStream):
             raise RuntimeError(
                 "Attempted to send an async request with a sync Client instance."
             )
 
-        with request_context(request=request):
-            response = transport.handle_request(request)
+        permit = self._origin_limiter.acquire(_origin_key(request.url))
+        response: Response | None = None
+        try:
+            start = time.perf_counter()
+            with request_context(request=request):
+                response = transport.handle_request(request)
 
-        assert isinstance(response.stream, SyncByteStream)
+            assert isinstance(response.stream, SyncByteStream)
 
-        response.request = request
-        response.stream = BoundSyncStream(
-            response.stream, response=response, start=start
-        )
-        self.cookies.extract_cookies(response)
-        response.default_encoding = self._default_encoding
+            response.request = request
+            response.stream = BoundSyncStream(
+                response.stream, response=response, start=start, release=permit.release
+            )
+            self.cookies.extract_cookies(response)
+            response.default_encoding = self._default_encoding
 
-        logger.info(
-            'HTTP Request: %s %s "%s %d %s"',
-            request.method,
-            request.url,
-            response.http_version,
-            response.status_code,
-            response.reason_phrase,
-        )
+            logger.info(
+                'HTTP Request: %s %s "%s %d %s"',
+                request.method,
+                request.url,
+                response.http_version,
+                response.status_code,
+                response.reason_phrase,
+            )
 
-        return response
+            return response
+        except BaseException:
+            if response is not None:
+                try:
+                    response.close()
+                except BaseException:
+                    pass
+            permit.release()
+            raise
 
     def get(
         self,
@@ -1266,6 +1365,7 @@ class Client(BaseClient):
         """
         if self._state != ClientState.CLOSED:
             self._state = ClientState.CLOSED
+            self._origin_limiter.close()
 
             self._transport.close()
             for transport in self._mounts.values():
@@ -1297,6 +1397,7 @@ class Client(BaseClient):
         traceback: TracebackType | None = None,
     ) -> None:
         self._state = ClientState.CLOSED
+        self._origin_limiter.close()
 
         self._transport.__exit__(exc_type, exc_value, traceback)
         for transport in self._mounts.values():
@@ -1337,6 +1438,8 @@ class AsyncClient(BaseClient):
     * **timeout** - *(optional)* The timeout configuration to use when sending
     requests.
     * **limits** - *(optional)* The limits configuration to use.
+    * **max_connections_per_origin** - *(optional)* The maximum number of
+    concurrent in-flight requests to any single origin.
     * **max_redirects** - *(optional)* The maximum number of redirect responses
     that should be followed.
     * **base_url** - *(optional)* A URL to use as the base when building
@@ -1366,6 +1469,9 @@ class AsyncClient(BaseClient):
         timeout: TimeoutTypes = DEFAULT_TIMEOUT_CONFIG,
         follow_redirects: bool = False,
         limits: Limits = DEFAULT_LIMITS,
+        max_connections_per_origin: int | None = None,
+        max_concurrent_requests_per_origin: int | None = None,
+        max_concurrency_per_origin: int | None = None,
         max_redirects: int = DEFAULT_MAX_REDIRECTS,
         event_hooks: None | (typing.Mapping[str, list[EventHook]]) = None,
         base_url: URL | str = "",
@@ -1373,6 +1479,12 @@ class AsyncClient(BaseClient):
         trust_env: bool = True,
         default_encoding: str | typing.Callable[[bytes], str] = "utf-8",
     ) -> None:
+        origin_concurrency_limit = _coalesce_origin_limit(
+            max_connections_per_origin,
+            max_concurrent_requests_per_origin,
+            max_concurrency_per_origin,
+            limits.max_connections_per_origin,
+        )
         super().__init__(
             auth=auth,
             params=params,
@@ -1385,7 +1497,9 @@ class AsyncClient(BaseClient):
             base_url=base_url,
             trust_env=trust_env,
             default_encoding=default_encoding,
+            origin_concurrency_limit=origin_concurrency_limit,
         )
+        self._origin_limiter = AsyncOriginLimiter(origin_concurrency_limit)
 
         if http2:
             try:
@@ -1667,6 +1781,7 @@ class AsyncClient(BaseClient):
 
                     response.history = list(history)
                     await response.aread()
+                    await response.aclose()
                     request = next_request
                     history.append(response)
 
@@ -1706,6 +1821,7 @@ class AsyncClient(BaseClient):
 
                 if follow_redirects:
                     await response.aread()
+                    await response.aclose()
                 else:
                     response.next_request = request
                     return response
@@ -1719,34 +1835,45 @@ class AsyncClient(BaseClient):
         Sends a single request, without handling any redirections.
         """
         transport = self._transport_for_url(request.url)
-        start = time.perf_counter()
 
         if not isinstance(request.stream, AsyncByteStream):
             raise RuntimeError(
                 "Attempted to send a sync request with an AsyncClient instance."
             )
 
-        with request_context(request=request):
-            response = await transport.handle_async_request(request)
+        permit = await self._origin_limiter.acquire(_origin_key(request.url))
+        response: Response | None = None
+        try:
+            start = time.perf_counter()
+            with request_context(request=request):
+                response = await transport.handle_async_request(request)
 
-        assert isinstance(response.stream, AsyncByteStream)
-        response.request = request
-        response.stream = BoundAsyncStream(
-            response.stream, response=response, start=start
-        )
-        self.cookies.extract_cookies(response)
-        response.default_encoding = self._default_encoding
+            assert isinstance(response.stream, AsyncByteStream)
+            response.request = request
+            response.stream = BoundAsyncStream(
+                response.stream, response=response, start=start, release=permit.release
+            )
+            self.cookies.extract_cookies(response)
+            response.default_encoding = self._default_encoding
 
-        logger.info(
-            'HTTP Request: %s %s "%s %d %s"',
-            request.method,
-            request.url,
-            response.http_version,
-            response.status_code,
-            response.reason_phrase,
-        )
+            logger.info(
+                'HTTP Request: %s %s "%s %d %s"',
+                request.method,
+                request.url,
+                response.http_version,
+                response.status_code,
+                response.reason_phrase,
+            )
 
-        return response
+            return response
+        except BaseException:
+            if response is not None:
+                try:
+                    await response.aclose()
+                except BaseException:
+                    pass
+            permit.release()
+            raise
 
     async def get(
         self,
@@ -1981,6 +2108,7 @@ class AsyncClient(BaseClient):
         """
         if self._state != ClientState.CLOSED:
             self._state = ClientState.CLOSED
+            self._origin_limiter.close()
 
             await self._transport.aclose()
             for proxy in self._mounts.values():
@@ -2012,6 +2140,7 @@ class AsyncClient(BaseClient):
         traceback: TracebackType | None = None,
     ) -> None:
         self._state = ClientState.CLOSED
+        self._origin_limiter.close()
 
         await self._transport.__aexit__(exc_type, exc_value, traceback)
         for proxy in self._mounts.values():

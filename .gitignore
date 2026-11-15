@@ -1,6 +1,8 @@
 *.pyc
 .coverage
 .pytest_cache/
+.test-tmp*/
+pytest-cache-files-*/
 .mypy_cache/
 __pycache__/
 htmlcov/
