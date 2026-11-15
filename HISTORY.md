@@ -1,6 +1,18 @@
 # History
 
 ## Unreleased
+* Add `CachedSession.cache_plan()`: a side-effect-free decision entry point that evaluates cache
+  behavior for a request (whether reading the cache, contacting the origin server, and writing to
+  the cache are allowed) without sending it, and without modifying the request or cached responses
+* Add `CachePlan` and `CachePolicyError` to the public API
+* Reject contradictory `only_if_cached` + `force_refresh` options (or `only-if-cached` + `no-cache`
+  request headers) with `CachePolicyError`, including an explanation of the conflict, instead of
+  silently picking one; `CachePolicyError` is distinct from `requests.RequestException` so decision
+  errors can be told apart from network failures
+* Document the order of precedence for `only_if_cached`, `refresh`, `force_refresh`, and
+  `Cache-Control` request headers (see "Option Precedence and Conflicts" in the user guide)
+* Fix merging per-request cache options with a `Cache-Control` request header containing whitespace
+  after commas
 * Fix `ValueError` when a response has an invalid `Expires` date (for example `Expires: garbage`); it is now treated as already expired
 * Fix JSON refresh comparisons for mixed-case `Content-Type` values
 * Keep caller-supplied MongoDB clients open when closing MongoDB or GridFS caches

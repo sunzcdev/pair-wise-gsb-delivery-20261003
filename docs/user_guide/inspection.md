@@ -2,6 +2,51 @@
 # {fas}`search` Cache Inspection
 Here are some ways to get additional information out of the cache session, backend, and responses:
 
+(cache-plan)=
+## Planning Cache Behavior
+Use {py:meth}`.CachedSession.cache_plan` to find out what a request **would** do, without sending
+it. This is a side-effect-free decision entry point: it never sends a request, never modifies the
+given {py:class}`~requests.PreparedRequest`, and never adds, updates, or deletes cached responses.
+
+It returns a {py:class}`.CachePlan` that indicates whether each cache operation is allowed:
+- `read_cache`: Reading a response from the cache is allowed
+- `contact_origin`: Contacting the origin server is allowed (including for redirects and
+  background refreshes)
+- `write_cache`: Writing a response to the cache is allowed
+
+It also describes what will happen given the current cache contents (`send_request`,
+`resend_request`, `resend_async`, `error_504`), and includes human-readable `reasons` for each
+decision. See {ref}`option-precedence` for the rules used to combine `only_if_cached`, `refresh`,
+`force_refresh`, and `Cache-Control` request headers.
+
+```python
+>>> from requests import Request
+>>> from requests_cache import CachedSession
+
+>>> session = CachedSession()
+>>> request = session.prepare_request(Request('GET', 'https://httpbin.org/get'))
+
+>>> plan = session.cache_plan(request, only_if_cached=True)
+>>> print(plan.read_cache, plan.contact_origin, plan.write_cache)
+True False True
+>>> print(plan.error_504)  # Not cached, and contacting the origin server is forbidden
+True
+>>> print(*plan.reasons, sep='\n')
+```
+
+Contradictory option combinations (for example `only_if_cached=True` with `force_refresh=True`)
+are rejected with {py:class}`.CachePolicyError`, which is distinct from
+{py:exc}`requests.RequestException` so decision errors can be told apart from real network
+failures:
+```python
+>>> from requests_cache import CachePolicyError
+>>> try:
+...     plan = session.cache_plan(request, only_if_cached=True, force_refresh=True)
+... except CachePolicyError as e:
+...     print(e)
+Conflicting cache options: 'only-if-cached' and 'no-cache' (force_refresh). ...
+```
+
 ## Response Details
 The following attributes are available on responses:
 - `from_cache`: indicates if the response came from the cache

@@ -27,6 +27,7 @@ from requests_cache.policy import (
     EXPIRE_IMMEDIATELY,
     NEVER_EXPIRE,
     CacheActions,
+    CachePolicyError,
     utcnow,
 )
 from requests_cache.policy.actions import METHOD_OVERRIDE_HEADERS
@@ -1280,6 +1281,34 @@ def test_request_only_if_cached__uncached(mock_session):
     assert response.status_code == 504
     with pytest.raises(HTTPError):
         response.raise_for_status()
+
+
+def test_request_only_if_cached__redirect(mock_session):
+    """only_if_cached applies to redirects as well: if the redirect target is not cached,
+    a 504 is returned instead of contacting the origin server"""
+    response = mock_session.get(MOCKED_URL_REDIRECT, only_if_cached=True)
+    assert response.status_code == 504
+
+    # If both the redirect and its target are cached, the cached target is used
+    mock_session.get(MOCKED_URL_REDIRECT)
+    response = mock_session.get(MOCKED_URL_REDIRECT, only_if_cached=True)
+    assert response.status_code == 200
+    assert response.from_cache is True
+
+
+def test_request_only_if_cached__force_refresh__conflict(mock_session):
+    """only_if_cached + force_refresh is contradictory and rejected with an explainable reason"""
+    with pytest.raises(CachePolicyError, match='only-if-cached'):
+        mock_session.get(MOCKED_URL, only_if_cached=True, force_refresh=True)
+
+    # The same conflict is detected via Cache-Control request headers
+    with pytest.raises(CachePolicyError):
+        mock_session.get(MOCKED_URL, headers={'Cache-Control': 'no-cache, only-if-cached'})
+
+    # And across sources (session setting + per-request option)
+    mock_session.settings.only_if_cached = True
+    with pytest.raises(CachePolicyError):
+        mock_session.get(MOCKED_URL, force_refresh=True)
 
 
 @skip_pypy

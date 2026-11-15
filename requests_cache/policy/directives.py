@@ -71,7 +71,11 @@ def set_request_headers(
 ):
     """Translate keyword arguments into equivalent request headers"""
     headers = CaseInsensitiveDict(headers)
-    directives = headers['Cache-Control'].split(',') if headers.get('Cache-Control') else []
+    directives = (
+        [d.strip() for d in headers['Cache-Control'].split(',')]
+        if headers.get('Cache-Control')
+        else []
+    )
 
     if only_if_cached:
         directives.append('only-if-cached')

@@ -21,6 +21,7 @@ from . import (
     get_url_expiration,
     utcnow,
 )
+from .plan import validate_cache_options
 from .settings import CacheSettings
 
 if TYPE_CHECKING:
@@ -126,6 +127,9 @@ class CacheActions(RichMixin):
         stale_while_revalidate = (
             settings.stale_while_revalidate or directives.stale_while_revalidate
         )
+
+        # Reject contradictory option combinations before deciding anything
+        validate_cache_options(directives, settings)
 
         # Check and log conditions for reading from the cache
         read_criteria = {

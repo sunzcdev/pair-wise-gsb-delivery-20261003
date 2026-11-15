@@ -18,6 +18,7 @@ from .policy import (
     DEFAULT_METHODS,
     DEFAULT_STATUS_CODES,
     CacheActions,
+    CachePlan,
     CacheSettings,
     ExpirationPatterns,
     ExpirationTime,
@@ -214,6 +215,84 @@ class CacheMixin(MIXIN_BASE):
         request.headers = set_request_headers(
             request.headers, expire_after, only_if_cached, refresh, force_refresh
         )
+        actions, cached_response = self._evaluate_request(request, **kwargs)
+
+        # Handle missing and expired responses based on settings and headers
+        if actions.error_504:
+            response: AnyResponse = get_504_response(request)
+        elif actions.resend_async:
+            self._resend_async(request, actions, cached_response, **kwargs)
+            response = cached_response  # type: ignore
+        elif actions.resend_request:
+            response = self._resend(request, actions, cached_response, **kwargs)  # type: ignore
+            if isinstance(response, OriginalResponse) and actions._vary_matched:
+                response.update_content_changed(cached_response)
+        elif actions.send_request:
+            response = self._send_and_cache(request, actions, cached_response, **kwargs)
+        else:
+            response = cached_response  # type: ignore  # Guaranteed to be non-None by this point
+
+        # If the request has been filtered out and was previously cached, delete it
+        if self.settings.filter_fn is not None and not self.settings.filter_fn(response):
+            logger.debug(f'Deleting filtered response for URL: {response.url}')
+            self.cache.delete(actions.cache_key)
+            return response
+
+        # Dispatch any hooks here, because they are removed during serialization
+        return dispatch_hook('response', request.hooks, response, **kwargs)
+
+    def cache_plan(
+        self,
+        request: PreparedRequest,
+        expire_after: ExpirationTime = None,
+        only_if_cached: bool = False,
+        refresh: bool = False,
+        force_refresh: bool = False,
+        **kwargs,
+    ) -> CachePlan:
+        """Compute the cache actions for a request **without** sending it. This is a
+        side-effect-free decision entry point: it does not send any requests, does not modify the
+        given :py:class:`~requests.PreparedRequest`, and does not add, update, or delete any
+        cached responses.
+
+        The returned plan describes whether each cache operation is allowed for this request:
+
+        * ``read_cache``: Reading a response from the cache is allowed
+        * ``contact_origin``: Contacting the origin server is allowed (including for redirects
+          and background refreshes)
+        * ``write_cache``: Writing a response to the cache is allowed
+
+        See :py:class:`.CachePlan` for all available outputs, and :ref:`option-precedence` for
+        the order of precedence between ``only_if_cached``, ``refresh``, ``force_refresh``, and
+        ``Cache-Control`` request headers.
+
+        Args:
+            request: The prepared request to evaluate
+            expire_after: Expiration time to set only for this request
+            only_if_cached: Only return results from the cache
+            refresh: Revalidate with the server before using a cached response
+            force_refresh: Always make a new request, and overwrite any previously cached response
+
+        Returns:
+            A plan describing the cache actions that would be taken for this request
+
+        Raises:
+            CachePolicyError: If the given options and/or ``Cache-Control`` request headers are
+                mutually contradictory. This is raised before any request is sent, and is not a
+                subclass of ``requests.RequestException``, so decision errors can be told apart
+                from real network failures.
+        """
+        plan_request = request.copy()
+        plan_request.headers = set_request_headers(
+            plan_request.headers, expire_after, only_if_cached, refresh, force_refresh
+        )
+        actions, _ = self._evaluate_request(plan_request, **kwargs)
+        return CachePlan.from_actions(actions)
+
+    def _evaluate_request(self, request: PreparedRequest, **kwargs):
+        """Compute cache actions for a request and fetch any matching cached response.
+        This is read-only: it never sends requests and never modifies the cache.
+        """
         actions = CacheActions.from_request(
             self.cache.create_key(request, **kwargs), request, self.settings
         )
@@ -243,29 +322,7 @@ class CacheMixin(MIXIN_BASE):
                 actions.update_from_cached_response(vary_cached, self.cache.create_key, **kwargs)
                 cached_response = vary_cached
 
-        # Handle missing and expired responses based on settings and headers
-        if actions.error_504:
-            response: AnyResponse = get_504_response(request)
-        elif actions.resend_async:
-            self._resend_async(request, actions, cached_response, **kwargs)
-            response = cached_response  # type: ignore
-        elif actions.resend_request:
-            response = self._resend(request, actions, cached_response, **kwargs)  # type: ignore
-            if isinstance(response, OriginalResponse) and actions._vary_matched:
-                response.update_content_changed(cached_response)
-        elif actions.send_request:
-            response = self._send_and_cache(request, actions, cached_response, **kwargs)
-        else:
-            response = cached_response  # type: ignore  # Guaranteed to be non-None by this point
-
-        # If the request has been filtered out and was previously cached, delete it
-        if self.settings.filter_fn is not None and not self.settings.filter_fn(response):
-            logger.debug(f'Deleting filtered response for URL: {response.url}')
-            self.cache.delete(actions.cache_key)
-            return response
-
-        # Dispatch any hooks here, because they are removed during serialization
-        return dispatch_hook('response', request.hooks, response, **kwargs)
+        return actions, cached_response
 
     def _send_and_cache(
         self,

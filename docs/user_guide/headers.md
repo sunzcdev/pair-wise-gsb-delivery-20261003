@@ -43,6 +43,42 @@ To enable this behavior, use the `cache_control` option:
 >>> session = CachedSession(cache_control=True)
 ```
 
+(option-precedence)=
+## Option Precedence and Conflicts
+The per-request options `only_if_cached`, `refresh`, and `force_refresh` are translated into
+equivalent `Cache-Control` request directives (`only-if-cached`, `must-revalidate`, and `no-cache`,
+respectively), so the same rules apply whether they come from keyword arguments, request headers,
+or session settings. When multiple options are combined, the following order of precedence is used:
+
+1. `only_if_cached`: The origin server will not be contacted at all, including for redirects and
+   background ({ref}`stale-while-revalidate <stale-while-revalidate>`) refreshes. If no usable
+   cached response is available, a `504` response is returned instead.
+2. `force_refresh`: Skip reading from the cache, always send a new request, and overwrite any
+   previously cached response. Implies `refresh`.
+3. `refresh`: Revalidate with the server before using a cached response.
+
+The resulting behavior for each combination is:
+
+| `only_if_cached` | `refresh` | `force_refresh` | Read cache | Contact origin | Write cache |
+| ---------------- | --------- | --------------- | ---------- | -------------- | ----------- |
+| – | – | – | ✔ | if needed | ✔ |
+| ✔ | – | – | ✔ | ✖ (504 if not cached) | ✔ |
+| – | ✔ | – | ✔ | ✔ (revalidate) | ✔ |
+| – | – | ✔ | ✖ | ✔ | ✔ (overwrite) |
+| ✔ | ✔ | – | ✔ | ✖ | ✔ (`only_if_cached` wins) |
+| – | ✔ | ✔ | ✖ | ✔ | ✔ (`force_refresh` wins) |
+| ✔ | – | ✔ | **rejected** (see below) ||||
+
+Additional rules:
+- `no-store` forbids **both** reading from and writing to the cache.
+- `only_if_cached` + `force_refresh` (or `Cache-Control: only-if-cached` combined with `no-cache`)
+  is contradictory: one forbids contacting the origin server while the other requires it. This
+  combination is rejected with {py:class}`.CachePolicyError`, with an explanation of the conflict,
+  before any request is sent. This is a decision error, not a network error: `CachePolicyError` is
+  not a subclass of {py:exc}`requests.RequestException`.
+- Use {py:meth}`.CachedSession.cache_plan` to evaluate these rules for a request without sending
+  it. See {ref}`cache-plan` for details.
+
 ## Supported Headers
 Requests-cache implements the majority of private cache behaviors specified by the following RFCs,
 with some minor variations:
