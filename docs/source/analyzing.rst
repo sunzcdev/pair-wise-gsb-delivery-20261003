@@ -62,3 +62,39 @@ The following classes represent distinct parts of a SQL statement.
 .. autoclass:: sqlparse.sql.Comparison
    :members:
 
+
+Transaction Control Events
+--------------------------
+
+The :mod:`sqlparse.transactions` module provides a restricted,
+best-effort preview of the transaction control flow of a script, e.g.
+for batch loaders.  It recognizes top-level ``BEGIN``/``COMMIT``/
+``ROLLBACK``, ``SAVEPOINT``, ``RELEASE`` and ``ROLLBACK TO SAVEPOINT``
+statements together with savepoint names and source positions.
+Keywords inside procedure bodies, strings or comments are not reported,
+and unrecognized statements are reported as ``UNKNOWN``.
+
+The scan is purely syntactic: it does not connect to a database and
+does not fully validate the SQL.  The recognized transaction start
+syntax is selected explicitly through
+:class:`~sqlparse.transactions.TransactionScanConfig`.
+
+.. autofunction:: sqlparse.transactions.scan_transactions
+
+.. autofunction:: sqlparse.transactions.check_savepoint_order
+
+.. autoclass:: sqlparse.transactions.TransactionScanConfig
+   :members:
+
+.. autoclass:: sqlparse.transactions.TransactionEvent
+   :members:
+
+.. autoclass:: sqlparse.transactions.TransactionEventType
+   :members:
+
+.. autoclass:: sqlparse.transactions.TransactionReport
+   :members:
+
+.. autoclass:: sqlparse.transactions.SavepointIssue
+   :members:
+

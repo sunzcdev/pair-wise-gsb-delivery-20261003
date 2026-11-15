@@ -1,5 +1,20 @@
+Unreleased
+----------
+
+Notable Changes
+
+* Added the ``sqlparse.transactions`` module: a restricted, non-validating
+  scanner that previews transaction control events (BEGIN/COMMIT/ROLLBACK,
+  SAVEPOINT, RELEASE, ROLLBACK TO SAVEPOINT) with savepoint names and
+  source positions.  It ignores look-alike keywords in procedure bodies,
+  strings and comments, reports unrecognized statements as UNKNOWN and
+  flags savepoints that are released or rolled back to without a matching
+  preceding SAVEPOINT.  Dialect-specific transaction start syntax (e.g.
+  START TRANSACTION) is selected via an explicit TransactionScanConfig.
+
+
 Release 0.6.1 (Nov 01, 2026)
-----------------------------
+-----------------------------
 
 End of Maintenance
 
