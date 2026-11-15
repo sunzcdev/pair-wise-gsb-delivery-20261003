@@ -25,6 +25,10 @@ def something_with_reader() -> None:
     reader = jsonlines.Reader(io.BytesIO())
     reader = jsonlines.Reader(['"text"'])
     reader = jsonlines.Reader([b'"bytes"'])
+    reader = jsonlines.Reader(io.StringIO(), format=jsonlines.Format.JSON_LINES)
+    reader = jsonlines.Reader(
+        io.BytesIO(), format=jsonlines.Format.RFC7464_TEXT_SEQUENCES
+    )
 
     r1 = reader.read()
     r2 = reader.read(allow_none=True)
@@ -77,6 +81,11 @@ def something_with_open() -> None:
         name,
         mode="r",
         loads=json.loads,
+    )
+    reader = jsonlines.open(
+        name,
+        mode="r",
+        format=jsonlines.Format.JSON_LINES,
     )
 
     writer: jsonlines.Writer

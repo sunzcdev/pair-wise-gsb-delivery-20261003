@@ -43,6 +43,8 @@ Features
 * Flexible :py:class:`~jsonlines.Reader`
 
   * wraps a file-like object or any other iterable yielding lines
+  * supports explicit, strict parsing of both JSON Lines and
+    :rfc:`7464` JSON Text Sequences via :py:class:`~jsonlines.Format`
   * can read lines directly via the
     :py:meth:`~jsonlines.Reader.read()` method
   * can be used as an iterator, either directly or via the
@@ -158,10 +160,71 @@ This should be enough to get started. See the API docs below for
 more details.
 
 
+Input formats
+=============
+
+Two related but distinct line-oriented JSON formats exist, and they
+frame records differently:
+
+* **JSON Lines** (also known as ndjson) holds exactly one JSON value
+  per physical line. It has no record separators; the line ending is
+  the only delimiter.
+
+* **RFC 7464 JSON Text Sequences** prefixes every record with an ASCII
+  record separator (RS, ``\\x1e``) and ends it with a line feed (LF).
+  Because the RS character marks the start of each record, a single
+  JSON value may legitimately span multiple physical lines.
+
+By default a :py:class:`Reader` uses the historical, lenient behaviour
+for backwards compatibility: it transparently tolerates a single
+leading UTF-8 BOM or RS character on each line. Pass the ``format``
+argument to opt into explicit, strict handling instead:
+
+.. code-block:: python
+
+    import jsonlines
+
+    with jsonlines.Reader(fp, format=jsonlines.Format.JSON_LINES) as reader:
+        ...
+
+    with jsonlines.Reader(
+        fp, format=jsonlines.Format.RFC7464_TEXT_SEQUENCES
+    ) as reader:
+        ...
+
+In strict mode the rules of the selected format are enforced:
+
+* A UTF-8 BOM is only accepted at the very start of a stream. A BOM
+  anywhere else raises :py:class:`~jsonlines.InvalidLineError`.
+
+* In JSON Lines mode an RS character is never valid; its exact
+  position (line, column and stream offset) is reported.
+
+* In RFC 7464 mode every record must start with an RS. Input that does
+  not use RS framing (i.e. plain JSON Lines) is rejected rather than
+  silently reinterpreted.
+
+* Special characters that occur *inside* a JSON string are always part
+  of the payload and are never stripped or treated as delimiters.
+
+* Empty records (for example two consecutive RS characters in RFC 7464
+  mode, or an empty physical line in JSON Lines mode) are not valid
+  JSON and raise :py:class:`~jsonlines.InvalidLineError` by default.
+  Use ``skip_empty=True`` to skip them.
+
+Lenient mode never silently switches between formats based on the
+input; an explicit format choice simply reports violations instead of
+guessing.
+
+
 API
 ===
 
 .. autofunction:: jsonlines.open
+
+.. autoclass:: jsonlines.Format
+   :members:
+   :undoc-members:
 
 .. autoclass:: jsonlines.Reader
    :members:
@@ -188,6 +251,20 @@ The source code and issue tracker for this package can be found on GitHub:
 
 Version history
 ===============
+
+* unreleased
+
+  * add an explicit ``format`` argument to :py:class:`Reader` and
+    :py:func:`open()` with strict
+    :py:attr:`~Format.JSON_LINES` and
+    :py:attr:`~Format.RFC7464_TEXT_SEQUENCES` modes. Strict parsing
+    enforces where a UTF-8 BOM may occur, rejects record separators in
+    JSON Lines input, supports RFC 7464 records spanning multiple
+    physical lines, preserves RS/BOM characters inside JSON strings,
+    and reports the position (line, column and stream offset) of mixed
+    or otherwise invalid framing. The default behaviour remains the
+    backwards compatible, lenient handling and never silently changes
+    format.
 
 * 4.0.0, released at 2023-09-01
 

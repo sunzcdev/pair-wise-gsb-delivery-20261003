@@ -5,6 +5,7 @@ Module for the jsonlines data format.
 # expose only public api
 from .jsonlines import (
     Error,
+    Format,
     InvalidLineError,
     Reader,
     Writer,
@@ -13,6 +14,7 @@ from .jsonlines import (
 
 __all__ = [
     "Error",
+    "Format",
     "InvalidLineError",
     "Reader",
     "Writer",

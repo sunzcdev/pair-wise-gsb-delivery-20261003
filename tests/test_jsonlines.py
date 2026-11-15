@@ -11,7 +11,6 @@ import tempfile
 import jsonlines
 import pytest
 
-
 SAMPLE_BYTES = b'{"a": 1}\n{"b": 2}\n'
 SAMPLE_TEXT = SAMPLE_BYTES.decode("utf-8")
 
@@ -311,3 +310,241 @@ def test_single_char_stripping() -> None:
     Sanity check that a helper constant actually contains single-char strings.
     """
     assert all(len(s) == 1 for s in jsonlines.jsonlines.SKIPPABLE_SINGLE_INITIAL_CHARS)
+
+
+# ---------------------------------------------------------------------------
+# Explicit, strict format modes
+# ---------------------------------------------------------------------------
+
+BOM = codecs.BOM_UTF8.decode()
+RS = jsonlines.jsonlines.RECORD_SEPARATOR
+
+
+def test_format_enum_is_public_api() -> None:
+    assert jsonlines.Format is jsonlines.jsonlines.Format
+    assert {member.name for member in jsonlines.Format} == {
+        "JSON_LINES",
+        "RFC7464_TEXT_SEQUENCES",
+    }
+
+
+def test_reader_format_is_keyword_only() -> None:
+    with pytest.raises(TypeError):
+        jsonlines.Reader(io.StringIO(), jsonlines.Format.JSON_LINES)  # type: ignore
+
+
+def test_lenient_mode_remains_default() -> None:
+    # The historical behaviour is unchanged when no format is selected.
+    with jsonlines.Reader(io.StringIO(RS + '"a"\n' + BOM + "2\n")) as reader:
+        assert list(reader) == ["a", 2]
+
+
+def test_lenient_mode_does_not_strip_in_string_chars() -> None:
+    # Only the very first character of a line is ever inspected, so
+    # characters embedded in JSON strings survive untouched.
+    with jsonlines.Reader(io.StringIO('"a' + RS + 'b"\n')) as reader:
+        with pytest.raises(jsonlines.InvalidLineError):
+            reader.read()
+
+
+def test_json_lines_basic() -> None:
+    fp = io.StringIO("1\n2\n")
+    with jsonlines.Reader(fp, format=jsonlines.Format.JSON_LINES) as reader:
+        assert list(reader) == [1, 2]
+
+
+def test_json_lines_one_value_per_physical_line() -> None:
+    # Multiple values on a single physical line are not valid JSON Lines.
+    fp = io.StringIO("1 2\n")
+    with jsonlines.Reader(fp, format=jsonlines.Format.JSON_LINES) as reader:
+        with pytest.raises(jsonlines.InvalidLineError):
+            reader.read()
+
+
+def test_json_lines_bom_only_at_stream_start_text() -> None:
+    fp = io.StringIO(BOM + "1\n2\n")
+    with jsonlines.Reader(fp, format=jsonlines.Format.JSON_LINES) as reader:
+        assert list(reader) == [1, 2]
+
+
+def test_json_lines_bom_only_at_stream_start_bytes() -> None:
+    fp = io.BytesIO(codecs.BOM_UTF8 + b"1\n2\n")
+    with jsonlines.Reader(fp, format=jsonlines.Format.JSON_LINES) as reader:
+        assert list(reader) == [1, 2]
+
+
+def test_json_lines_bom_mid_stream_is_rejected() -> None:
+    fp = io.StringIO("1\n" + BOM + "2\n")
+    with jsonlines.Reader(fp, format=jsonlines.Format.JSON_LINES) as reader:
+        assert reader.read() == 1  # first line is fine
+        with pytest.raises(jsonlines.InvalidLineError) as excinfo:
+            reader.read()
+    exc = excinfo.value
+    assert "BOM" in str(exc)
+    assert exc.lineno == 2
+    assert exc.column == 1
+    assert exc.position == 2
+
+
+def test_json_lines_record_separator_is_rejected_with_position() -> None:
+    fp = io.StringIO("1\n" + RS + "2\n")
+    with jsonlines.Reader(fp, format=jsonlines.Format.JSON_LINES) as reader:
+        assert reader.read() == 1
+        with pytest.raises(jsonlines.InvalidLineError) as excinfo:
+            reader.read()
+    exc = excinfo.value
+    assert "record separator" in str(exc)
+    assert exc.lineno == 2
+    assert exc.column == 1
+    assert exc.position == 2
+
+
+def test_json_lines_record_separator_inside_string_is_not_stripped() -> None:
+    # A raw RS inside a JSON string must not be treated as a separator;
+    # it makes the line invalid JSON, and the error points at its position.
+    fp = io.StringIO('"a' + RS + 'b"\n')
+    with jsonlines.Reader(fp, format=jsonlines.Format.JSON_LINES) as reader:
+        with pytest.raises(jsonlines.InvalidLineError) as excinfo:
+            reader.read()
+    exc = excinfo.value
+    assert "record separator" in str(exc)
+    assert exc.column == 3
+    assert exc.position == 2
+    # The RS was not removed from the offending line.
+    assert RS in exc.line
+
+
+def test_json_lines_bom_inside_string_is_preserved() -> None:
+    fp = io.StringIO(json.dumps("x" + BOM + "y", ensure_ascii=False) + "\n")
+    with jsonlines.Reader(fp, format=jsonlines.Format.JSON_LINES) as reader:
+        assert reader.read() == "x" + BOM + "y"
+
+
+def test_json_lines_empty_line_handling() -> None:
+    fp = io.StringIO("1\n\n2\n")
+    with jsonlines.Reader(fp, format=jsonlines.Format.JSON_LINES) as reader:
+        assert reader.read() == 1
+        with pytest.raises(jsonlines.InvalidLineError):
+            reader.read()
+    with jsonlines.Reader(
+        io.StringIO("1\n\n2\n"), format=jsonlines.Format.JSON_LINES
+    ) as reader:
+        assert list(reader.iter(skip_empty=True)) == [1, 2]
+
+
+def test_rfc7464_basic_records() -> None:
+    fp = io.StringIO(RS + '"a"\n' + RS + '"b"\n')
+    with jsonlines.Reader(fp, format=jsonlines.Format.RFC7464_TEXT_SEQUENCES) as reader:
+        assert list(reader) == ["a", "b"]
+
+
+def test_rfc7464_records_from_bytes() -> None:
+    fp = io.BytesIO(b'\x1e"a"\x0a\x1e"b"\x0a')
+    with jsonlines.Reader(fp, format=jsonlines.Format.RFC7464_TEXT_SEQUENCES) as reader:
+        assert list(reader) == ["a", "b"]
+
+
+def test_rfc7464_record_can_span_physical_lines() -> None:
+    data = RS + '{\n  "x": 1\n}\n' + RS + "2\n"
+    fp = io.StringIO(data)
+    with jsonlines.Reader(fp, format=jsonlines.Format.RFC7464_TEXT_SEQUENCES) as reader:
+        assert list(reader) == [{"x": 1}, 2]
+
+
+def test_rfc7464_consecutive_records_without_line_feed() -> None:
+    # RS immediately following an RS starts the next record.
+    fp = io.StringIO(RS + "1" + RS + "2\n")
+    with jsonlines.Reader(fp, format=jsonlines.Format.RFC7464_TEXT_SEQUENCES) as reader:
+        assert reader.read() == 1
+        assert reader.read() == 2
+
+
+def test_rfc7464_empty_record_is_invalid_by_default() -> None:
+    fp = io.StringIO(RS + "1\n" + RS + RS + "2\n")
+    with jsonlines.Reader(fp, format=jsonlines.Format.RFC7464_TEXT_SEQUENCES) as reader:
+        assert reader.read() == 1
+        with pytest.raises(jsonlines.InvalidLineError):
+            reader.read()
+
+
+def test_rfc7464_empty_record_can_be_skipped() -> None:
+    fp = io.StringIO(RS + "1\n" + RS + RS + "2\n")
+    with jsonlines.Reader(fp, format=jsonlines.Format.RFC7464_TEXT_SEQUENCES) as reader:
+        assert list(reader.iter(skip_empty=True)) == [1, 2]
+
+
+def test_rfc7464_trailing_record_separator() -> None:
+    fp = io.StringIO(RS + "1\n" + RS)
+    with jsonlines.Reader(fp, format=jsonlines.Format.RFC7464_TEXT_SEQUENCES) as reader:
+        assert reader.read() == 1
+        with pytest.raises(jsonlines.InvalidLineError):
+            reader.read()
+
+
+def test_rfc7464_requires_leading_record_separator() -> None:
+    fp = io.StringIO("1\n" + RS + "2\n")
+    with jsonlines.Reader(fp, format=jsonlines.Format.RFC7464_TEXT_SEQUENCES) as reader:
+        with pytest.raises(jsonlines.InvalidLineError) as excinfo:
+            reader.read()
+    exc = excinfo.value
+    assert "record separator" in str(exc)
+    assert exc.lineno == 1
+    assert exc.column == 1
+    assert exc.position == 0
+
+
+def test_rfc7464_leading_bom_is_accepted() -> None:
+    fp = io.StringIO(BOM + RS + "1\n" + RS + "2\n")
+    with jsonlines.Reader(fp, format=jsonlines.Format.RFC7464_TEXT_SEQUENCES) as reader:
+        assert list(reader) == [1, 2]
+
+
+def test_rfc7464_bom_inside_record_is_rejected() -> None:
+    fp = io.StringIO(RS + "1" + BOM + "\n")
+    with jsonlines.Reader(fp, format=jsonlines.Format.RFC7464_TEXT_SEQUENCES) as reader:
+        with pytest.raises(jsonlines.InvalidLineError) as excinfo:
+            reader.read()
+    exc = excinfo.value
+    assert "BOM" in str(exc)
+    assert exc.position == 2
+
+
+def test_rfc7464_record_separator_inside_string_is_preserved() -> None:
+    # An escaped (valid) RS inside a JSON string survives as data and is
+    # never mistaken for a record delimiter.
+    data = RS + json.dumps("a" + RS + "b") + "\n" + RS + "2\n"
+    fp = io.StringIO(data)
+    with jsonlines.Reader(fp, format=jsonlines.Format.RFC7464_TEXT_SEQUENCES) as reader:
+        assert reader.read() == "a" + RS + "b"
+        assert reader.read() == 2
+
+
+def test_rfc7464_typed_and_allow_none_options() -> None:
+    fp = io.StringIO(RS + "1\n" + RS + "null\n")
+    with jsonlines.Reader(fp, format=jsonlines.Format.RFC7464_TEXT_SEQUENCES) as reader:
+        assert reader.read(type=int) == 1
+        assert reader.read(allow_none=True) is None
+
+
+def test_mixed_format_json_lines_input_in_rfc_mode_is_rejected() -> None:
+    # JSON Lines framing (no RS) is invalid for RFC 7464 parsing.
+    fp = io.StringIO("1\n2\n")
+    with jsonlines.Reader(fp, format=jsonlines.Format.RFC7464_TEXT_SEQUENCES) as reader:
+        with pytest.raises(jsonlines.InvalidLineError) as excinfo:
+            reader.read()
+    assert "record separator" in str(excinfo.value)
+
+
+def test_mixed_format_rfc_input_in_json_lines_mode_is_rejected() -> None:
+    fp = io.StringIO(RS + "1\n" + RS + "2\n")
+    with jsonlines.Reader(fp, format=jsonlines.Format.JSON_LINES) as reader:
+        with pytest.raises(jsonlines.InvalidLineError) as excinfo:
+            reader.read()
+    assert "record separator" in str(excinfo.value)
+
+
+def test_invalid_line_error_position_attributes_default_to_none() -> None:
+    exc = jsonlines.InvalidLineError("boom", "line", 1)
+    assert exc.column is None
+    assert exc.position is None
+    assert str(exc) == "boom (line 1)"
