@@ -12,6 +12,7 @@ import math
 import numbers
 import typing
 import uuid
+from collections.abc import Iterable as _Iterable
 from collections.abc import Mapping as _Mapping
 from enum import Enum as EnumType
 from typing import Unpack
@@ -19,6 +20,7 @@ from typing import Unpack
 from marshmallow import class_registry, types, utils, validate
 from marshmallow.constants import missing as missing_
 from marshmallow.exceptions import (
+    SCHEMA,
     StringNotCollectionError,
     ValidationError,
     _FieldInstanceResolutionError,
@@ -728,6 +730,10 @@ class List(Field[list[_InternalT | None]]):
         numbers = fields.List(fields.Float())
 
     :param cls_or_instance: A field class or instance.
+    :param min: The minimum number of items. If not provided, minimum
+        item count will not be checked.
+    :param max: The maximum number of items. If not provided, maximum
+        item count will not be checked.
     :param kwargs: The same keyword arguments that :class:`Field` receives.
 
     .. versionchanged:: 3.0.0rc9
@@ -740,8 +746,14 @@ class List(Field[list[_InternalT | None]]):
     def __init__(
         self,
         cls_or_instance: Field[_InternalT] | type[Field[_InternalT]],
+        min: int | None = None,  # noqa: A002
+        max: int | None = None,  # noqa: A002
         **kwargs: Unpack[_BaseFieldKwargs],
     ):
+        if min is not None and max is not None and min > max:
+            raise ValueError("'min' must be less than or equal to 'max'.")
+        self.min = min
+        self.max = max
         super().__init__(**kwargs)
         try:
             self.inner: Field[_InternalT] = _resolve_field_instance(cls_or_instance)
@@ -767,19 +779,38 @@ class List(Field[list[_InternalT | None]]):
             return None
         return [self.inner._serialize(each, attr, obj, **kwargs) for each in value]
 
+    def _length_error(self, value, *, too_few: bool) -> str:
+        if too_few:
+            message = Length.message_min if self.max is None else Length.message_all
+        else:
+            message = Length.message_max if self.min is None else Length.message_all
+        return message.format(input=value, min=self.min, max=self.max)
+
     def _deserialize(self, value, attr, data, **kwargs) -> list[_InternalT | None]:
-        if not utils.is_collection(value):
+        if isinstance(value, (str, bytes, bytearray, _Mapping)) or not isinstance(
+            value, _Iterable
+        ):
             raise self.make_error("invalid")
 
         result = []
         errors = {}
+        count = 0
+        too_many = False
         for idx, each in enumerate(value):
+            if self.max is not None and idx >= self.max:
+                too_many = True
+                break
+            count += 1
             try:
                 result.append(self.inner.deserialize(each, **kwargs))
             except ValidationError as error:
                 if error.valid_data is not None:
                     result.append(typing.cast("_InternalT", error.valid_data))
                 errors.update({idx: error.messages})
+        if too_many:
+            errors[SCHEMA] = [self._length_error(value, too_few=False)]
+        elif self.min is not None and count < self.min:
+            errors[SCHEMA] = [self._length_error(value, too_few=True)]
         if errors:
             raise ValidationError(errors, valid_data=result)
         return result

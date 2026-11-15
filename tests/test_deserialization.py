@@ -1370,6 +1370,93 @@ class TestFieldDeserialization:
             field.deserialize(value)
         assert excinfo.value.args[0] == "Not a valid list."
 
+    def test_list_field_deserialize_iterable(self):
+        def records():
+            yield "1"
+            yield "2"
+
+        field = fields.List(fields.Int())
+        assert field.deserialize(records()) == [1, 2]
+
+    def test_list_field_deserialize_iterable_with_min_and_max(self):
+        field = fields.List(fields.Int(), min=1, max=2)
+        assert field.deserialize(iter(["1", "2"])) == [1, 2]
+
+        with pytest.raises(ValidationError) as excinfo:
+            field.deserialize(iter([]))
+        assert excinfo.value.messages == {
+            "_schema": ["Length must be between 1 and 2."]
+        }
+
+        with pytest.raises(ValidationError) as excinfo:
+            field.deserialize(iter(["1", "2", "3"]))
+        assert excinfo.value.messages == {
+            "_schema": ["Length must be between 1 and 2."]
+        }
+
+    def test_list_field_max_stops_consuming_iterable(self):
+        consumed = []
+
+        def records():
+            for index in range(10):
+                consumed.append(index)
+                yield index
+
+        field = fields.List(fields.Int(), max=2)
+        with pytest.raises(ValidationError) as excinfo:
+            field.deserialize(records())
+        assert consumed == [0, 1, 2]
+        assert excinfo.value.messages == {
+            "_schema": ["Longer than maximum length 2."]
+        }
+        assert excinfo.value.valid_data == [0, 1]
+
+    def test_list_field_reports_length_and_element_errors(self):
+        field = fields.List(fields.Int(), max=2)
+        with pytest.raises(ValidationError) as excinfo:
+            field.deserialize(iter([1, "bad", 3]))
+        assert excinfo.value.messages == {
+            1: ["Not a valid integer."],
+            "_schema": ["Longer than maximum length 2."],
+        }
+        assert excinfo.value.valid_data == [1]
+
+        field = fields.List(fields.Int(), min=3)
+        with pytest.raises(ValidationError) as excinfo:
+            field.deserialize(iter([1, "bad"]))
+        assert excinfo.value.messages == {
+            1: ["Not a valid integer."],
+            "_schema": ["Shorter than minimum length 3."],
+        }
+        assert excinfo.value.valid_data == [1]
+
+    @pytest.mark.parametrize("value", ["12", b"12", {"0": 1}])
+    def test_list_field_bounds_do_not_accept_strings_or_mappings(self, value):
+        field = fields.List(fields.Int(), min=1, max=2, allow_none=True)
+        with pytest.raises(ValidationError) as excinfo:
+            field.deserialize(value, partial=True)
+        assert excinfo.value.messages == ["Not a valid list."]
+
+    def test_list_field_preserves_source_errors(self):
+        class SourceError(Exception):
+            pass
+
+        def records():
+            yield 1
+            raise SourceError("source failed")
+
+        field = fields.List(fields.Int(), max=2)
+        with pytest.raises(SourceError, match="source failed"):
+            field.deserialize(records())
+
+        def invalid_records():
+            yield 1
+            raise ValidationError("source failed")
+
+        with pytest.raises(ValidationError) as excinfo:
+            field.deserialize(invalid_records())
+        assert excinfo.value.messages == ["source failed"]
+
     def test_datetime_int_tuple_field_deserialization(self):
         dtime = dt.datetime.now()
         data = dtime.isoformat(), 42
