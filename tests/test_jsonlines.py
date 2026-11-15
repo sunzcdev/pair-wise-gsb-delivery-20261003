@@ -2,6 +2,7 @@
 Tests for the jsonlines library.
 """
 
+import asyncio
 import codecs
 import collections
 import io
@@ -14,6 +15,29 @@ import pytest
 
 SAMPLE_BYTES = b'{"a": 1}\n{"b": 2}\n'
 SAMPLE_TEXT = SAMPLE_BYTES.decode("utf-8")
+
+
+class AsyncLineSource:
+    """
+    Async iterable yielding lines, tracking pulls and aclose() calls.
+    """
+
+    def __init__(self, lines):
+        self.lines = list(lines)
+        self.pulls = 0
+        self.aclosed = False
+
+    def __aiter__(self):
+        return self
+
+    async def __anext__(self):
+        if not self.lines:
+            raise StopAsyncIteration
+        self.pulls += 1
+        return self.lines.pop(0)
+
+    async def aclose(self):
+        self.aclosed = True
 
 
 def is_json_decode_error(exc: object) -> bool:
@@ -311,3 +335,180 @@ def test_single_char_stripping() -> None:
     Sanity check that a helper constant actually contains single-char strings.
     """
     assert all(len(s) == 1 for s in jsonlines.jsonlines.SKIPPABLE_SINGLE_INITIAL_CHARS)
+
+
+def test_async_reader() -> None:
+    async def main() -> None:
+        source = AsyncLineSource(['{"a": 1}', '{"b": 2}'])
+        async with jsonlines.AsyncReader(source) as reader:
+            assert await reader.read() == {"a": 1}
+            assert await reader.read() == {"b": 2}
+            with pytest.raises(EOFError):
+                await reader.read()
+        with pytest.raises(RuntimeError):
+            await reader.read()
+
+    asyncio.run(main())
+
+
+def test_async_reader_iteration() -> None:
+    async def main() -> None:
+        source = AsyncLineSource(["1", "2", "3"])
+        reader = jsonlines.AsyncReader(source)
+        assert [obj async for obj in reader] == [1, 2, 3]
+        assert "wrapping <AsyncLineSource at " in repr(reader)
+
+    asyncio.run(main())
+
+
+def test_async_reader_lazy_pulls() -> None:
+    """
+    The next line is only requested from the source when asked for.
+    """
+
+    async def main() -> None:
+        source = AsyncLineSource(["1", "2", "3"])
+        reader = jsonlines.AsyncReader(source)
+        assert source.pulls == 0
+        assert await reader.read() == 1
+        assert source.pulls == 1
+        assert await reader.read() == 2
+        assert source.pulls == 2
+
+    asyncio.run(main())
+
+
+def test_async_reader_iter_flags() -> None:
+    async def main() -> None:
+        source = AsyncLineSource(["1", "", "invalid", "null", "2"])
+        reader = jsonlines.AsyncReader(source)
+        result = [
+            obj
+            async for obj in reader.iter(
+                allow_none=True, skip_empty=True, skip_invalid=True
+            )
+        ]
+        assert result == [1, None, 2]
+
+    asyncio.run(main())
+
+
+def test_async_reader_typed_reads() -> None:
+    async def main() -> None:
+        source = AsyncLineSource(["12", "true"])
+        reader = jsonlines.AsyncReader(source)
+        assert await reader.read(type=int) == 12
+        with pytest.raises(jsonlines.InvalidLineError) as excinfo:
+            await reader.read(type=int)
+        exc = excinfo.value
+        assert "does not match requested type" in str(exc)
+        assert exc.line == "true"
+        assert exc.lineno == 2
+
+        reader = jsonlines.AsyncReader(AsyncLineSource([]))
+        with pytest.raises(ValueError) as excinfo:
+            await reader.read(type="nope")  # type: ignore[call-overload]
+        assert "invalid type specified" in str(excinfo.value)
+
+    asyncio.run(main())
+
+
+def test_async_reader_line_numbers_match_sync_reader() -> None:
+    """
+    Line numbers in errors are identical to the synchronous Reader.
+    """
+
+    async def main() -> None:
+        lines = ["1", "", "  ", "invalid", "true"]
+        sync_reader = jsonlines.Reader(list(lines))
+        async_reader = jsonlines.AsyncReader(AsyncLineSource(lines))
+        assert sync_reader.read(skip_empty=True) == 1
+        assert await async_reader.read(skip_empty=True) == 1
+        with pytest.raises(jsonlines.InvalidLineError) as sync_excinfo:
+            sync_reader.read(skip_empty=True)
+        with pytest.raises(jsonlines.InvalidLineError) as async_excinfo:
+            await async_reader.read(skip_empty=True)
+        assert async_excinfo.value.lineno == sync_excinfo.value.lineno == 4
+        assert async_excinfo.value.line == sync_excinfo.value.line
+
+    asyncio.run(main())
+
+
+def test_async_reader_bytes_and_bom() -> None:
+    async def main() -> None:
+        source = AsyncLineSource([codecs.BOM_UTF8 + b"1", b"\xff"])
+        reader = jsonlines.AsyncReader(source)
+        assert await reader.read() == 1
+        with pytest.raises(jsonlines.InvalidLineError) as excinfo:
+            await reader.read()
+        assert "line is not valid utf-8" in str(excinfo.value)
+
+    asyncio.run(main())
+
+
+def test_async_reader_custom_loads_is_called_synchronously() -> None:
+    calls = []
+
+    def loads(s):
+        calls.append(s)
+        return "uh what"
+
+    async def main() -> None:
+        reader = jsonlines.AsyncReader(AsyncLineSource(["{}"]), loads=loads)
+        assert await reader.read() == "uh what"
+
+    asyncio.run(main())
+    assert calls == ["{}"]
+
+
+def test_async_reader_close_does_not_aclose_source() -> None:
+    async def main() -> None:
+        source = AsyncLineSource(["1"])
+        async with jsonlines.AsyncReader(source) as reader:
+            assert await reader.read() == 1
+        assert not source.aclosed
+        reader.close()
+        reader.close()  # no-op
+        assert not source.aclosed
+
+    asyncio.run(main())
+
+
+def test_async_reader_cancellation_propagates() -> None:
+    """
+    Cancelling a pending read raises CancelledError (it is not
+    swallowed) and does not consume a line.
+    """
+
+    class BlockingSource:
+        def __init__(self):
+            self.started = 0
+            self.lines = []
+
+        def __aiter__(self):
+            return self
+
+        async def __anext__(self):
+            if self.lines:
+                return self.lines.pop(0)
+            self.started += 1
+            await asyncio.Event().wait()  # blocks forever
+            raise AssertionError("unreachable")  # pragma: no cover
+
+    async def main() -> None:
+        source = BlockingSource()
+        reader = jsonlines.AsyncReader(source)
+        task = asyncio.ensure_future(reader.read())
+        await asyncio.sleep(0)  # let the read() start and block on the source
+        assert source.started == 1
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        # No line was consumed by the cancelled read; the reader is
+        # still usable and the next line gets line number 1.
+        source.lines.append("invalid")
+        with pytest.raises(jsonlines.InvalidLineError) as excinfo:
+            await reader.read()
+        assert excinfo.value.lineno == 1
+
+    asyncio.run(main())

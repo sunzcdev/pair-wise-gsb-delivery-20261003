@@ -54,6 +54,16 @@ Features
   * allows complete control over decoding using a custom ``loads``
     callable
 
+* Flexible :py:class:`~jsonlines.AsyncReader`
+
+  * wraps any async iterable yielding lines
+  * async variant of the :py:class:`~jsonlines.Reader`, with the same
+    decoding, type checks, and skip options
+  * pulls lines lazily from the source, one at a time
+  * propagates cancellation (``asyncio.CancelledError``) to the caller
+  * never closes (``aclose()``) the caller-provided source
+  * can be used as an async context manager
+
 * Flexible :py:class:`~jsonlines.Writer`
 
   * wraps a file-like object
@@ -166,6 +176,9 @@ API
 .. autoclass:: jsonlines.Reader
    :members:
    :inherited-members:
+
+.. autoclass:: jsonlines.AsyncReader
+   :members:
 
 .. autoclass:: jsonlines.Writer
    :members:
