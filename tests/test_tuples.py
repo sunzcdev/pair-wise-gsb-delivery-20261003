@@ -1,6 +1,7 @@
 """Tests for tuples of all kinds."""
 
-from typing import Annotated, List, Literal, NamedTuple, Tuple
+from collections import namedtuple
+from typing import Annotated, Generic, List, Literal, NamedTuple, Tuple, TypeVar
 
 from attrs import Factory, define
 from pytest import raises
@@ -10,6 +11,8 @@ from cattrs.cols import (
     is_namedtuple,
     namedtuple_dict_structure_factory,
     namedtuple_dict_unstructure_factory,
+    namedtuple_structure_factory,
+    namedtuple_unstructure_factory,
 )
 from cattrs.converters import BaseConverter
 from cattrs.errors import (
@@ -17,6 +20,8 @@ from cattrs.errors import (
     ForbiddenExtraKeysError,
     IterableValidationError,
 )
+
+T = TypeVar("T")
 
 
 def test_structuring_invalid_tuples(converter: BaseConverter):
@@ -93,6 +98,27 @@ def test_named_tuple_predicate():
         pass
 
     assert not is_namedtuple(Test2)
+
+    # `collections.namedtuple` classes are namedtuples.
+    assert is_namedtuple(namedtuple("Test3", "a b"))
+
+    # Generic namedtuples, bare and with actual arguments.
+    class Test4(NamedTuple, Generic[T]):
+        a: T
+
+    assert is_namedtuple(Test4)
+    assert is_namedtuple(Test4[int])
+
+    # Objects merely quacking like namedtuples are not namedtuples.
+    class Test5:
+        _fields = ("a", "b")
+
+    assert not is_namedtuple(Test5)
+
+    class Test6(tuple):
+        _fields = ("a", "b")
+
+    assert not is_namedtuple(Test6)
 
 
 def test_simple_typed_namedtuples(genconverter: Converter):
@@ -211,3 +237,178 @@ def test_dict_namedtuples_detailed_validation():
 
     with raises(ClassValidationError):
         c.structure({"a": "not_an_int"}, Test)
+
+
+def test_namedtuple_sequence_defaults(converter: BaseConverter):
+    """Only trailing fields with defaults may be omitted from sequences."""
+
+    class Test(NamedTuple):
+        a: int
+        b: str = "test"
+        c: float = 1.5
+
+    assert converter.structure([1], Test) == Test(1, "test", 1.5)
+    assert converter.structure([1, "a"], Test) == Test(1, "a", 1.5)
+    assert converter.structure([1, "a", 2.5], Test) == Test(1, "a", 2.5)
+
+    # Fields without defaults may not be omitted.
+    with raises(Exception) as exc_info:
+        converter.structure([], Test)
+
+    if converter.detailed_validation:
+        assert isinstance(exc_info.value, IterableValidationError)
+        exc = exc_info.value.exceptions[0]
+        assert isinstance(exc, ValueError)
+        # The note points at the first missing position.
+        assert exc.__notes__ == [f"Structuring {Test} @ index 0"]
+    else:
+        assert isinstance(exc_info.value, ValueError)
+
+
+def test_namedtuple_sequence_too_many(converter: BaseConverter):
+    """Sequences longer than the number of fields are an error, with position."""
+
+    class Test(NamedTuple):
+        a: int
+        b: str = "test"
+
+    with raises(Exception) as exc_info:
+        converter.structure([1, "a", 3], Test)
+
+    if converter.detailed_validation:
+        assert isinstance(exc_info.value, IterableValidationError)
+        exc = exc_info.value.exceptions[0]
+        assert isinstance(exc, ValueError)
+        # The note points at the first extra position.
+        assert exc.__notes__ == [f"Structuring {Test} @ index 2"]
+    else:
+        assert isinstance(exc_info.value, ValueError)
+
+
+def test_namedtuple_sequence_element_errors(converter: BaseConverter):
+    """Positional element errors are reported with their indices."""
+
+    class Test(NamedTuple):
+        a: int
+        b: int
+
+    if converter.detailed_validation:
+        with raises(IterableValidationError) as exc_info:
+            converter.structure([1, "not-an-int"], Test)
+
+        exc = exc_info.value.exceptions[0]
+        assert exc.__notes__ == [f"Structuring {Test} @ index 1"]
+    else:
+        with raises(ValueError):
+            converter.structure([1, "not-an-int"], Test)
+
+
+def test_generic_namedtuples(genconverter: Converter):
+    """Generic namedtuples keep their actual type arguments."""
+
+    class Test(NamedTuple, Generic[T]):
+        a: T
+        b: List[T] = Factory(list)
+
+    genconverter.register_structure_hook(int, lambda v, _: v + 1)
+    genconverter.register_unstructure_hook(int, lambda v: v - 1)
+
+    assert genconverter.structure([1, [2]], Test[int]) == Test(2, [3])
+    assert genconverter.unstructure(Test(2, [3]), unstructure_as=Test[int]) == (
+        1,
+        [2],
+    )
+
+
+def test_generic_namedtuples_dict_factories(genconverter: Converter):
+    """Generic namedtuples keep their actual type arguments with dict factories."""
+
+    class Test(NamedTuple, Generic[T]):
+        a: T
+        b: str = "test"
+
+    genconverter.register_structure_hook(int, lambda v, _: v + 1)
+    genconverter.register_unstructure_hook(int, lambda v: v - 1)
+
+    genconverter.register_structure_hook_factory(
+        lambda t: t is Test[int],
+        lambda t, c: namedtuple_dict_structure_factory(t, c),
+    )
+    genconverter.register_unstructure_hook_factory(
+        lambda t: t is Test[int],
+        lambda t, c: namedtuple_dict_unstructure_factory(t, c),
+    )
+
+    assert genconverter.structure({"a": 1}, Test[int]) == Test(2, "test")
+    assert genconverter.unstructure(Test(2, "a"), unstructure_as=Test[int]) == {
+        "a": 1,
+        "b": "a",
+    }
+
+
+def test_namedtuple_structure_from_mapping(genconverter: Converter):
+    """`namedtuple_structure_factory` can be configured to structure from mappings."""
+
+    class Test(NamedTuple):
+        a: int
+        b: str = "test"
+
+    genconverter.register_structure_hook_factory(
+        lambda t: t is Test,
+        lambda t, c: namedtuple_structure_factory(
+            t, c, "mapping", forbid_extra_keys=True
+        ),
+    )
+
+    assert genconverter.structure({"a": 1}, Test) == Test(1, "test")
+
+    with raises(Exception) as exc_info:
+        genconverter.structure({"a": 1, "b": "2", "c": 3}, Test)
+
+    if genconverter.detailed_validation:
+        exc = exc_info.value.exceptions[0]
+    else:
+        exc = exc_info.value
+
+    assert isinstance(exc, ForbiddenExtraKeysError)
+    assert exc.extra_fields == {"c"}
+
+
+def test_namedtuple_structure_from_invalid(genconverter: Converter):
+    """An invalid `structure_from` value raises."""
+
+    class Test(NamedTuple):
+        a: int
+
+    with raises(ValueError, match="structure_from"):
+        namedtuple_structure_factory(Test, genconverter, "set")
+
+
+def test_namedtuple_unstructure_to_dict(genconverter: Converter):
+    """`namedtuple_unstructure_factory` can unstructure to dicts."""
+
+    class TestInner(NamedTuple):
+        a: int
+
+    class Test(NamedTuple):
+        a: int
+        b: TestInner = TestInner(1)
+
+    genconverter.register_unstructure_hook_factory(
+        lambda t: t in (Test, TestInner),
+        lambda t, c: namedtuple_unstructure_factory(t, c, dict),
+    )
+
+    assert genconverter.unstructure(Test(1, TestInner(2))) == {
+        "a": 1,
+        "b": {"a": 2},
+    }
+
+
+def test_collections_namedtuples(converter: BaseConverter):
+    """`collections.namedtuple` classes are supported."""
+
+    Test = namedtuple("Test", "a b")
+
+    assert converter.structure([1, "2"], Test) == Test(1, "2")
+    assert converter.unstructure(Test(1, "2")) == Test(1, "2")

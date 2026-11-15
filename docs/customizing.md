@@ -541,25 +541,62 @@ Added the {meth}`is_mutable_sequence` predicate and {meth}`homogenous_tuple_stru
 
 ### Customizing Named Tuples
 
-Named tuples can be un/structured using dictionaries using the {meth}`namedtuple_dict_structure_factory`
+By default, named tuples are structured from positional sequences and unstructured into tuples.
+The input and output formats can be chosen independently and explicitly:
+{meth}`namedtuple_structure_factory` takes a `structure_from` argument
+(`"sequence"` or `"mapping"`), and {meth}`namedtuple_unstructure_factory` takes
+an `unstructure_to` argument (for example, `tuple` or `dict`).
+
+```{doctest} namedtuples
+>>> from typing import NamedTuple
+
+>>> from cattrs.cols import is_namedtuple
+>>> from cattrs.cols import namedtuple_structure_factory, namedtuple_unstructure_factory
+
+>>> c = Converter()
+
+>>> class MyNamedTuple(NamedTuple):
+...     a: int
+...     b: str = "default"
+
+>>> _ = c.register_structure_hook_factory(
+...     is_namedtuple,
+...     lambda t, conv: namedtuple_structure_factory(t, conv, "mapping"),
+... )
+>>> _ = c.register_unstructure_hook_factory(
+...     is_namedtuple,
+...     lambda t, conv: namedtuple_unstructure_factory(t, conv, dict),
+... )
+
+>>> c.structure({"a": 1}, MyNamedTuple)
+MyNamedTuple(a=1, b='default')
+
+>>> c.unstructure(MyNamedTuple(1, "a"))
+{'a': 1, 'b': 'a'}
+```
+
+When structuring from sequences, trailing fields with defaults may be omitted;
+sequences longer than the number of fields are an error.
+
+```{doctest} namedtuples
+>>> c2 = Converter()
+
+>>> c2.structure([1], MyNamedTuple)
+MyNamedTuple(a=1, b='default')
+```
+
+Named tuples can also be un/structured using dictionaries using the {meth}`namedtuple_dict_structure_factory`
 and {meth}`namedtuple_dict_unstructure_factory` hook factories.
 
 To unstructure _all_ named tuples into dictionaries:
 
 ```{doctest} namedtuples
->>> from typing import NamedTuple
-
 >>> from cattrs.cols import is_namedtuple, namedtuple_dict_unstructure_factory
->>> c = Converter()
 
->>> c.register_unstructure_hook_factory(is_namedtuple, namedtuple_dict_unstructure_factory)
-<function namedtuple_dict_unstructure_factory at ...>
+>>> _ = c2.register_unstructure_hook_factory(is_namedtuple, namedtuple_dict_unstructure_factory)
 
->>> class MyNamedTuple(NamedTuple):
-...     a: int
-
->>> c.unstructure(MyNamedTuple(1))
-{'a': 1}
+>>> c2.unstructure(MyNamedTuple(1, "a"))
+{'a': 1, 'b': 'a'}
 ```
 
 To only un/structure _some_ named tuples into dictionaries,
@@ -568,7 +605,7 @@ change the predicate function when registering the hook factory:
 ```{doctest} namedtuples
     :options: +ELLIPSIS
 
->>> c.register_unstructure_hook_factory(
+>>> c2.register_unstructure_hook_factory(
 ...     lambda t: t is MyNamedTuple,
 ...     namedtuple_dict_unstructure_factory,
 ... )
@@ -577,4 +614,9 @@ change the predicate function when registering the hook factory:
 
 ```{versionadded} 24.1.0
 
+```
+```{versionchanged} NEXT
+The input and output formats can now be chosen explicitly using the `structure_from`
+and `unstructure_to` arguments of {meth}`namedtuple_structure_factory` and
+{meth}`namedtuple_unstructure_factory`.
 ```

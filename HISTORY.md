@@ -13,6 +13,18 @@ Our backwards-compatibility policy can be found [here](https://github.com/python
 
 ## NEXT
 
+- Rework `NamedTuple` support:
+
+  - {func}`namedtuple_structure_factory <cattrs.cols.namedtuple_structure_factory>` now takes a `structure_from` argument,
+    allowing each named tuple type to be structured from positional sequences (the default) or from mappings of field names;
+    {func}`namedtuple_unstructure_factory <cattrs.cols.namedtuple_unstructure_factory>` now supports `unstructure_to=dict`,
+    so the output format can be chosen independently.
+  - When structuring from sequences, trailing fields with defaults may now be omitted;
+    overlong sequences, unknown mapping keys and positional element errors are reported with their positions.
+  - Generic named tuples now have their actual type arguments applied to their fields when un/structuring.
+  - `collections.namedtuple` classes are now recognized by {func}`is_namedtuple <cattrs.cols.is_namedtuple>`;
+    plain tuples and objects merely having a `_fields` attribute are still not treated as named tuples.
+
 - Fix the msgspec converter passing typed deques directly to the encoder, which cannot serialize them. Deques are now unstructured into lists, including when nested in attrs classes or dataclasses.
   ([#818](https://github.com/python-attrs/cattrs/issues/818) [#819](https://github.com/python-attrs/cattrs/pull/819))
 

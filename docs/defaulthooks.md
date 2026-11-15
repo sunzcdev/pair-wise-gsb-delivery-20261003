@@ -645,12 +645,22 @@ When unstructuring, literals are passed through.
 
 Named tuples with type hints (created from [`typing.NamedTuple`](https://docs.python.org/3/library/typing.html#typing.NamedTuple)) are supported.
 Named tuples are un/structured using tuples or lists by default.
+Named tuples created using [`collections.namedtuple`](https://docs.python.org/3/library/collections.html#collections.namedtuple) are also supported, with their fields treated as `typing.Any`.
+
+When structuring, trailing fields with defaults may be omitted from the input;
+inputs longer than the number of fields are an error.
+Generic named tuples are supported, with their actual type arguments applied to the fields.
 
 The {mod}`cattrs.cols` module contains hook factories for un/structuring named tuples using dictionaries instead,
 [see here for details](customizing.md#customizing-named-tuples).
 
 ```{versionadded} 24.1.0
 
+```
+
+```{versionchanged} NEXT
+Trailing fields with defaults may now be omitted when structuring, and generic
+named tuples and `collections.namedtuple` classes are now supported.
 ```
 
 ### `typing.Final`

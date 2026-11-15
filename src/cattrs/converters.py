@@ -1219,11 +1219,11 @@ class Converter(BaseConverter):
         self.register_unstructure_hook_factory(
             is_hetero_tuple, self.gen_unstructure_hetero_tuple
         )
-        self.register_unstructure_hook_factory(is_namedtuple)(
-            namedtuple_unstructure_factory
-        )
         self.register_unstructure_hook_factory(
             is_sequence, self.gen_unstructure_iterable
+        )
+        self.register_unstructure_hook_factory(is_namedtuple)(
+            namedtuple_unstructure_factory
         )
         self.register_unstructure_hook_factory(is_mapping, self.gen_unstructure_mapping)
         self.register_unstructure_hook_factory(
