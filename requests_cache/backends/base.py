@@ -12,14 +12,27 @@ from collections import UserDict
 from datetime import datetime
 from logging import getLogger
 from pickle import PickleError
-from typing import TYPE_CHECKING, Iterable, Iterator, List, MutableMapping, Optional, TypeVar, Union
+from typing import (
+    TYPE_CHECKING,
+    FrozenSet,
+    Iterable,
+    Iterator,
+    List,
+    MutableMapping,
+    NamedTuple,
+    Optional,
+    Set,
+    TypeVar,
+    Union,
+)
 from warnings import warn
 
 from pathlib import Path
 
+from attrs import define, field
 from requests import Request, Response
 
-from ..cache_keys import create_key, redact_response
+from ..cache_keys import create_key, get_vary_set, redact_response
 from ..models import AnyRequest, CachedResponse
 from ..policy import DEFAULT_CACHE_NAME, CacheSettings, ExpirationTime
 from ..serializers import SerializerType, init_serializer
@@ -28,6 +41,36 @@ from ..serializers import SerializerType, init_serializer
 DESERIALIZE_ERRORS = (AttributeError, EOFError, ImportError, PickleError, TypeError, ValueError)
 
 logger = getLogger(__name__)
+
+
+@define
+class VaryFamily:
+    """Inspectable identity of a variant family for a single base cache key (URL).
+
+    A "variant family" is the set of cached response variants for one URL, along with the
+    ``Vary`` header set that currently selects between them. When the server changes its
+    ``Vary`` header, the whole family is switched to the new set as a single unit, and variants
+    cached under the previous set are invalidated.
+
+    Attributes:
+        vary: Normalized ``Vary`` header names currently in effect. An empty set means the
+            response does not vary; ``{'*'}`` means ``Vary: *`` (never reusable).
+        variants: Cache keys of variant responses stored under this family (not including the
+            primary entry stored under the base cache key itself)
+    """
+
+    vary: FrozenSet[str] = field(factory=frozenset)
+    variants: Set[str] = field(factory=set)
+
+
+class _VaryUpdate(NamedTuple):
+    """A planned update to a variant family, to be applied after the new response is stored"""
+
+    base_key: str
+    new_vary: FrozenSet[str]
+    store_key: str
+    invalidated: List[str]
+    register_variant: bool
 
 
 class BaseCache:
@@ -55,6 +98,10 @@ class BaseCache:
         self.cache_name = cache_name
         self.responses: BaseStorage[str, CachedResponse] = DictStorage()
         self.redirects: BaseStorage[str, str] = DictStorage()
+        # Inspectable variant family identities, keyed by base cache key
+        self.vary_index: dict[str, VaryFamily] = {}
+        # Reverse lookup from a variant cache key to its base cache key
+        self._vary_variants: dict[str, str] = {}
         self._settings = CacheSettings()  # Init and public access is done in CachedSession
 
     @property
@@ -100,18 +147,107 @@ class BaseCache:
         cache_key = cache_key or self.create_key(response.request)
         cached_response = CachedResponse.from_response(response, expires=expires)
         cached_response = redact_response(cached_response, self._settings.ignored_parameters)
+
+        # Plan any variant family changes up front, but only apply them after the new response
+        # has been successfully stored
+        vary_update = self._plan_vary_update(cached_response, cache_key)
+        if vary_update is not None:
+            cache_key = vary_update.store_key
         self.responses[cache_key] = cached_response
+        if vary_update is not None:
+            self._apply_vary_update(vary_update)
 
         # Save redirect aliases, unless this is a revalidation (i.e., it was saved previously)
         if response.history and not cached_response.revalidated:
             for r in response.history:
                 self.redirects[self.create_key(r.request)] = cache_key
 
+    def _plan_vary_update(
+        self, response: CachedResponse, cache_key: str
+    ) -> Optional[_VaryUpdate]:
+        """Determine how saving a response affects the variant family for its URL.
+
+        Returns a planned update, or ``None`` for a plain response with no ``Vary`` bookkeeping
+        (the common case, kept fully compatible with non-varying caches).
+        """
+        vary = get_vary_set(response.headers)
+
+        # Find the base cache key for this response, if it's already part of a known family
+        base_key = self._vary_variants.get(cache_key)
+        if base_key is None and cache_key in self.vary_index:
+            base_key = cache_key
+        if base_key is None:
+            if vary is None:
+                return None
+            # Anchor the family at the originally requested URL (as the session does when
+            # looking up responses); for redirects, that's the first request in the chain
+            base_request = response.history[0].request if response.history else response.request
+            base_key = self.create_key(base_request)
+
+        new_vary = vary or frozenset()
+        family = self.vary_index.get(base_key)
+        if family is not None:
+            current_vary = family.vary
+            invalidated = sorted(family.variants)
+        else:
+            # Recover the family identity from any previously stored primary entry
+            existing = self.responses.get(base_key)
+            existing_vary = get_vary_set(existing.headers) if existing is not None else None
+            current_vary = existing_vary or frozenset()
+            invalidated = []
+
+        if new_vary == current_vary:
+            # Same family; register the variant key, unless this is the primary entry
+            return _VaryUpdate(base_key, new_vary, cache_key, [], cache_key != base_key)
+
+        # The Vary set changed (including to/from none or '*'): switch the whole family to the
+        # new identity. The new response becomes the primary entry, and variants cached under
+        # the previous Vary set are invalidated so they can't be matched by outdated rules.
+        logger.debug(
+            f'Vary set changed for cache key {base_key}: '
+            f'{sorted(current_vary)} -> {sorted(new_vary)}'
+        )
+        return _VaryUpdate(base_key, new_vary, base_key, invalidated, False)
+
+    def _apply_vary_update(self, update: _VaryUpdate):
+        """Apply a planned variant family update. Called after the new response has been stored,
+        so a cleanup failure only leaves unreachable orphan entries (never a mix of new and old
+        matching rules), and the index is updated as a single unit.
+        """
+        if update.invalidated:
+            try:
+                self.responses.bulk_delete(update.invalidated)
+            except Exception as e:
+                logger.warning(f'Failed to clean up stale Vary variants: {e}')
+
+        family = self.vary_index.setdefault(update.base_key, VaryFamily())
+        for key in update.invalidated:
+            self._vary_variants.pop(key, None)
+        family.variants.difference_update(update.invalidated)
+        family.vary = update.new_vary
+        if update.register_variant:
+            family.variants.add(update.store_key)
+            self._vary_variants[update.store_key] = update.base_key
+
+    def _prune_vary_index(self):
+        """Drop variant family entries whose responses no longer exist in the cache"""
+        for base_key in [k for k in self.vary_index if k not in self.responses]:
+            family = self.vary_index.pop(base_key)
+            for variant_key in family.variants:
+                self._vary_variants.pop(variant_key, None)
+        for family in self.vary_index.values():
+            missing = {k for k in family.variants if k not in self.responses}
+            for variant_key in missing:
+                self._vary_variants.pop(variant_key, None)
+            family.variants.difference_update(missing)
+
     def clear(self):
         """Delete all items from the cache"""
         logger.info('Clearing all items from the cache')
         self.responses.clear()
         self.redirects.clear()
+        self.vary_index.clear()
+        self._vary_variants.clear()
 
     def close(self):
         """Close any open backend connections"""
@@ -202,6 +338,7 @@ class BaseCache:
         else:
             self.responses.bulk_delete(delete_keys)
         self._prune_redirects()
+        self._prune_vary_index()
 
     def _prune_redirects(self):
         """Remove any redirects that no longer point to an existing response"""

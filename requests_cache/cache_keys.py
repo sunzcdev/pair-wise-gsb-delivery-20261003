@@ -15,6 +15,7 @@ from typing import (
     TYPE_CHECKING,
     Any,
     Dict,
+    FrozenSet,
     Iterable,
     List,
     Mapping,
@@ -33,11 +34,13 @@ from ._utils import decode, encode, patch_form_boundary, is_json_content_type
 
 __all__ = [
     'create_key',
+    'get_vary_set',
     'normalize_body',
     'normalize_headers',
     'normalize_request',
     'normalize_params',
     'normalize_url',
+    'vary_family_key',
 ]
 if TYPE_CHECKING:
     from .models import AnyPreparedRequest, AnyRequest, CachedResponse
@@ -91,6 +94,42 @@ def create_key(
         key = sha256()  # type: ignore
     for part in key_parts:
         key.update(encode(part))
+    return key.hexdigest()
+
+
+def get_vary_set(headers: Mapping[str, str]) -> Optional[FrozenSet[str]]:
+    """Normalize a response's ``Vary`` header into a set of lowercase header names. This defines
+    the identity of a "variant family" for a given URL: the set of request headers that select
+    which cached variant may be reused.
+
+    Returns:
+    * ``None`` if there is no ``Vary`` header
+    * ``{'*'}`` for ``Vary: *`` (response may never be reused without revalidation)
+    * An empty ``frozenset`` for an empty ``Vary`` value
+    * Otherwise, a frozenset of the named headers
+    """
+    vary = headers.get('Vary') or headers.get('vary')
+    if not vary:
+        return None
+    vary_set = {h.strip().lower() for h in vary.split(',') if h.strip()}
+    if '*' in vary_set:
+        return frozenset({'*'})
+    return frozenset(vary_set)
+
+
+def vary_family_key(cache_key: str, vary_headers: Iterable[str]) -> str:
+    """Derive a variant cache key that is bound to a specific ``Vary`` header set (variant
+    family). Mixing the family identity into the key guarantees that variants cached under a
+    previous ``Vary`` set can never be matched after the server changes its ``Vary`` header for
+    the same URL, even if the old variant entries have not been cleaned up yet.
+    """
+    try:
+        key = blake2b(digest_size=8)
+    except (TypeError, ValueError):
+        key = sha256()  # type: ignore
+    key.update(encode(cache_key))
+    for header in sorted({h.strip().lower() for h in vary_headers}):
+        key.update(encode(header))
     return key.hexdigest()
 
 

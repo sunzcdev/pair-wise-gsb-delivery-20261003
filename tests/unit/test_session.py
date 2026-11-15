@@ -32,6 +32,7 @@ from requests_cache.policy import (
 from requests_cache.policy.actions import METHOD_OVERRIDE_HEADERS
 from requests_cache.session import OriginalSession
 from tests.conftest import (
+    ETAG,
     MOCKED_URL,
     MOCKED_URL_200_404,
     MOCKED_URL_404,
@@ -471,6 +472,186 @@ def test_match_headers__vary_alternating_with_redirects(mock_session):
     # Second round: both should be cache hits
     assert mock_session.get(MOCKED_URL_VARY_REDIRECT, headers=headers_en).from_cache is True
     assert mock_session.get(MOCKED_URL_VARY_REDIRECT, headers=headers_gb).from_cache is True
+
+
+def _register_vary_family_url(mock_session, state, url=None, etag=None):
+    """Register a mock URL whose ``Vary`` header (and content negotiation) can be changed
+    mid-test via ``state['vary']``. Response content reflects the currently negotiated header,
+    so it's always possible to tell which rules a response was produced under.
+    """
+    url = url or f'{MOCKED_URL}/vary-family'
+
+    def callback(request, context):
+        vary = state['vary']
+        if vary:
+            context.headers['Vary'] = vary
+        if etag and request.headers.get('If-None-Match') == etag:
+            context.status_code = 304
+            return ''
+        if etag:
+            context.headers['ETag'] = etag
+        if vary == 'Accept-Language':
+            return f"lang={request.headers.get('Accept-Language', 'none')}"
+        elif vary == 'Accept-Encoding':
+            return f"encoding={request.headers.get('Accept-Encoding', 'none')}"
+        return 'plain response'
+
+    mock_session.mock_adapter.register_uri('GET', url, text=callback)
+    return url
+
+
+def _base_key(session, url):
+    return session.cache.create_key(Request('GET', url).prepare())
+
+
+def test_vary_family_switch(mock_session):
+    """If the server changes its Vary set for a URL, variants cached under the old Vary set
+    must not be matched by the outdated rules; the whole variant family switches at once.
+    """
+    state = {'vary': 'Accept-Language'}
+    url = _register_vary_family_url(mock_session, state)
+
+    # Populate variants under Vary: Accept-Language
+    assert mock_session.get(url, headers={'Accept-Language': 'en'}).text == 'lang=en'
+    assert mock_session.get(url, headers={'Accept-Language': 'fr'}).text == 'lang=fr'
+    r = mock_session.get(url, headers={'Accept-Language': 'fr'})
+    assert r.from_cache is True and r.text == 'lang=fr'
+
+    # The variant family identity is inspectable, and each variant has its own cache key
+    base_key = _base_key(mock_session, url)
+    family = mock_session.cache.vary_index[base_key]
+    assert family.vary == {'accept-language'}
+    assert len(family.variants) == 1
+    old_keys = set(mock_session.cache.responses.keys())
+    assert old_keys == {base_key, *family.variants}
+
+    # The server switches to Vary: Accept-Encoding
+    state['vary'] = 'Accept-Encoding'
+    r = mock_session.get(url, headers={'Accept-Encoding': 'gzip'}, force_refresh=True)
+    assert r.from_cache is False and r.text == 'encoding=gzip'
+
+    # The family identity switched atomically, and old variants were invalidated
+    family = mock_session.cache.vary_index[base_key]
+    assert family.vary == {'accept-encoding'}
+    assert not (old_keys - {base_key}) & set(mock_session.cache.responses.keys())
+
+    # A request that previously matched an old variant must not be served by outdated rules
+    r = mock_session.get(url, headers={'Accept-Language': 'fr'})
+    assert r.from_cache is False
+    assert r.text == f'encoding={r.request.headers["Accept-Encoding"]}'
+
+    # New-rule variants are cached and served under the new family
+    r = mock_session.get(url, headers={'Accept-Encoding': 'gzip'})
+    assert r.from_cache is True and r.text == 'encoding=gzip'
+
+
+def test_vary_family_switch__via_304(mock_session):
+    """A 304 response carrying a new Vary header must also switch the variant family"""
+    state = {'vary': 'Accept-Language'}
+    url = _register_vary_family_url(mock_session, state, etag=ETAG)
+
+    # Populate variants under Vary: Accept-Language
+    mock_session.get(url, headers={'Accept-Language': 'en'})
+    mock_session.get(url, headers={'Accept-Language': 'fr'})
+    base_key = _base_key(mock_session, url)
+    assert mock_session.cache.vary_index[base_key].vary == {'accept-language'}
+    old_variant_keys = set(mock_session.cache.vary_index[base_key].variants)
+
+    # The server now varies on Accept-Encoding; revalidation returns 304 + new Vary
+    state['vary'] = 'Accept-Encoding'
+    r = mock_session.get(url, headers={'Accept-Language': 'en'}, refresh=True)
+    assert r.status_code == 200
+
+    # The family switched to the new Vary set, and old variants were invalidated
+    family = mock_session.cache.vary_index[base_key]
+    assert family.vary == {'accept-encoding'}
+    assert family.variants == set()
+    assert not old_variant_keys & set(mock_session.cache.responses.keys())
+
+    # Old variants can't be matched anymore; a differently-negotiated request fetches fresh content
+    r = mock_session.get(url, headers={'Accept-Encoding': 'br'})
+    assert r.from_cache is False and r.text == 'encoding=br'
+
+
+def test_vary_family_switch__vary_star(mock_session):
+    """Vary: * must not leave any reusable variants behind"""
+    state = {'vary': 'Accept-Language'}
+    url = _register_vary_family_url(mock_session, state)
+    mock_session.get(url, headers={'Accept-Language': 'en'})
+    mock_session.get(url, headers={'Accept-Language': 'fr'})
+    base_key = _base_key(mock_session, url)
+    assert len(mock_session.cache.vary_index[base_key].variants) == 1
+
+    # The server switches to Vary: *
+    state['vary'] = '*'
+    mock_session.get(url, force_refresh=True)
+
+    # Old variants are invalidated, and no new reusable variants are created
+    family = mock_session.cache.vary_index[base_key]
+    assert family.vary == {'*'}
+    assert family.variants == set()
+    assert mock_session.get(url).from_cache is False
+    assert mock_session.get(url).from_cache is False
+    assert mock_session.cache.vary_index[base_key].variants == set()
+
+
+def test_vary_family_switch__to_no_vary(mock_session):
+    """If the server stops sending Vary, the variant family is cleared and the response
+    behaves like a plain (non-varying) cache entry"""
+    state = {'vary': 'Accept-Language'}
+    url = _register_vary_family_url(mock_session, state)
+    mock_session.get(url, headers={'Accept-Language': 'en'})
+    mock_session.get(url, headers={'Accept-Language': 'fr'})
+    base_key = _base_key(mock_session, url)
+
+    # The server drops the Vary header entirely
+    state['vary'] = None
+    mock_session.get(url, force_refresh=True)
+
+    family = mock_session.cache.vary_index[base_key]
+    assert family.vary == set()
+    assert family.variants == set()
+
+    # A single plain entry now serves all requests, regardless of previous negotiation headers
+    r = mock_session.get(url, headers={'Accept-Language': 'fr'})
+    assert r.from_cache is True and r.text == 'plain response'
+    assert len(mock_session.cache.responses.keys()) == 1
+
+
+def test_vary_family_switch__cleanup_failure(mock_session):
+    """If cleaning up old variants fails during a family switch, the cache must not end up in
+    a half-switched state: the new family identity applies, and stale variants can't be matched
+    """
+    state = {'vary': 'Accept-Language'}
+    url = _register_vary_family_url(mock_session, state)
+    mock_session.get(url, headers={'Accept-Language': 'en'})
+    mock_session.get(url, headers={'Accept-Language': 'fr'})
+    base_key = _base_key(mock_session, url)
+
+    # Make variant cleanup fail during the switch
+    state['vary'] = 'Accept-Encoding'
+    with patch.object(
+        mock_session.cache.responses, 'bulk_delete', side_effect=IOError('storage error')
+    ):
+        mock_session.get(url, headers={'Accept-Encoding': 'gzip'}, force_refresh=True)
+
+    # The family identity still switched as a unit
+    family = mock_session.cache.vary_index[base_key]
+    assert family.vary == {'accept-encoding'}
+    assert family.variants == set()
+
+    # The orphaned old variant is unreachable: no stale-rule cache hits
+    r = mock_session.get(url, headers={'Accept-Language': 'fr'})
+    assert r.from_cache is False
+    assert r.text == f'encoding={r.request.headers["Accept-Encoding"]}'
+
+
+def test_vary_family__no_vary_compatible(mock_session):
+    """Plain responses without Vary are unaffected by variant family bookkeeping"""
+    assert mock_session.get(MOCKED_URL).from_cache is False
+    assert mock_session.get(MOCKED_URL).from_cache is True
+    assert mock_session.cache.vary_index == {}
+    assert len(mock_session.cache.responses.keys()) == 1
 
 
 def test_include_get_headers():

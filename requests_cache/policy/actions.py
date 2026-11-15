@@ -7,7 +7,7 @@ from requests import PreparedRequest, Response
 from requests.structures import CaseInsensitiveDict
 
 from .._utils import coalesce
-from ..cache_keys import normalize_headers
+from ..cache_keys import normalize_headers, vary_family_key
 from ..models import RichMixin
 from . import (
     DO_NOT_CACHE,
@@ -359,12 +359,14 @@ class CacheActions(RichMixin):
         vary = cached_response.headers.get('Vary')
         if not vary:
             return True
-        elif vary == '*':
+
+        vary_set = [k.strip().lower() for k in vary.split(',') if k.strip()]
+        if '*' in vary_set:
             return False
 
         # Generate a secondary cache key based on Vary for both the cached request and new request.
         # If there are redirects, compare the new request against the last request in the chain.
-        match_headers = [k.strip().lower() for k in vary.split(',')]
+        match_headers = list(vary_set)
         vary_request = (
             cached_response.history[-1].request
             if cached_response.history
@@ -401,10 +403,14 @@ class CacheActions(RichMixin):
                 vary_request.headers,
                 key_kwargs['match_headers'],
             )
-            # Compute secondary cache key with merged Vary + user match_headers
+            # Compute secondary cache key with merged Vary + user match_headers, bound to the
+            # current variant family identity so variants cached under a previous Vary set
+            # can never be matched after the family switches
             merged = self._merge_match_headers(match_headers)
             key_kwargs['match_headers'] = merged
-            self.vary_cache_key = create_key(self._request, **key_kwargs)
+            self.vary_cache_key = vary_family_key(
+                create_key(self._request, **key_kwargs), vary_set
+            )
         return headers_match
 
     def _cookies_match(self, cached_request: 'CachedRequest') -> bool:

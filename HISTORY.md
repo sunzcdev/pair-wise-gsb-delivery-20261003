@@ -1,6 +1,12 @@
 # History
 
 ## Unreleased
+* Track an inspectable variant family identity per URL (`BaseCache.vary_index`); when a response
+  (including a `304` revalidation) changes the `Vary` set for a URL, switch the whole family to the
+  new set as a single unit so variants cached under the old `Vary` set can no longer be matched
+* Bind Vary-qualified cache keys to the current `Vary` header set, so stale variants remain
+  unreachable even if cleanup of old variants fails during a family switch
+* Ensure `Vary: *` responses leave no reusable variants behind
 * Fix `ValueError` when a response has an invalid `Expires` date (for example `Expires: garbage`); it is now treated as already expired
 * Fix JSON refresh comparisons for mixed-case `Content-Type` values
 * Keep caller-supplied MongoDB clients open when closing MongoDB or GridFS caches
