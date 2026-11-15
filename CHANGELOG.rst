@@ -9,6 +9,7 @@ v4.27.0
 * Errors produced by a ``false`` subschema now have the correct ``path`` and ``schema_path``, rather than empty ones.
 * Accessing an index with no errors on an ``ErrorTree`` no longer causes that index to appear in the tree (#1328).
   Subtrees also properly propagate lookup errors which were previously missing when accessing indices not in the subtree.
+* Add ``jsonschema.exceptions.missing_members``, a read-only projection which splits ``required`` and ``dependentRequired`` errors into one addressable ``MissingMember`` per absent property, recording the parent object's location, the missing member's name and the triggering dependency.
 
 v4.26.0
 =======

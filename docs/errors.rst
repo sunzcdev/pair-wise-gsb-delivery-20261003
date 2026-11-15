@@ -405,3 +405,51 @@ to guess the most relevant error in a given bunch.
 
 .. autofunction:: by_relevance
     :noindex:
+
+
+missing members
+---------------
+
+Errors for the :kw:`required` and :kw:`dependentRequired` keywords point
+at the object which is missing properties, since the absent properties
+themselves of course do not exist in the instance. When each missing
+member needs to be addressed individually -- for example to show one
+problem per field in a UI -- `missing_members` projects such errors
+into one `jsonschema.exceptions.MissingMember` per absent property.
+
+.. doctest::
+
+    >>> from jsonschema import Draft202012Validator
+    >>> from jsonschema.exceptions import missing_members
+
+    >>> schema = {
+    ...     "properties": {
+    ...         "user": {
+    ...             "required": ["name"],
+    ...             "dependentRequired": {"email": ["contact"]},
+    ...         },
+    ...     },
+    ... }
+    >>> instance = {"user": {"email": "a@example.com"}}
+    >>> errors = Draft202012Validator(schema).iter_errors(instance)
+    >>> for member in missing_members(errors):
+    ...     print(member.parent_pointer, member.member_token, member.triggered_by)
+    /user name None
+    /user contact email
+
+Each projection records the location of the parent object
+(`MissingMember.parent_path`, keeping array indices distinct from
+string keys, or `MissingMember.parent_pointer` as a JSON Pointer), the
+name of the missing member (`MissingMember.member`, or escaped for a
+JSON Pointer via `MissingMember.member_token`), the property whose
+presence triggered a :kw:`dependentRequired` dependency
+(`MissingMember.triggered_by`), and the `ValidationError` it was
+derived from (`MissingMember.error`). No instance path is fabricated
+for the missing member itself, as it does not exist in the instance.
+
+Projections arising from within combinators like :kw:`anyOf` or
+:kw:`oneOf` are grouped by branch -- projections sharing a
+`MissingMember.branch` are contiguous in the result.
+
+.. autofunction:: missing_members
+    :noindex:

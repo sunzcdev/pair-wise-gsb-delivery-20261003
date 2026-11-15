@@ -1,3 +1,4 @@
+from itertools import groupby
 from unittest import TestCase
 import textwrap
 
@@ -861,6 +862,162 @@ class TestErrorTree(TestCase):
     def test_repr_empty(self):
         tree = exceptions.ErrorTree([])
         self.assertEqual(repr(tree), "<ErrorTree (0 total errors)>")
+
+
+class TestMissingMembers(TestCase):
+    def missing_members_of(self, instance, schema):
+        errors = list(_LATEST_VERSION(schema).iter_errors(instance))
+        msg = f"No errors found for {instance} under {schema!r}!"
+        self.assertTrue(errors, msg=msg)
+        return exceptions.missing_members(errors), errors
+
+    def test_required_projects_one_member_per_missing_property(self):
+        projections, errors = self.missing_members_of(
+            instance={"present": 1},
+            schema={"required": ["foo", "bar", "present"]},
+        )
+        self.assertEqual([each.member for each in projections], ["foo", "bar"])
+        for each in projections:
+            self.assertIsNone(each.triggered_by)
+            self.assertEqual(each.parent_path, ())
+            self.assertEqual(each.parent_pointer, "")
+            self.assertEqual(each.branch, ())
+        self.assertEqual(
+            [each.error for each in projections],
+            errors,
+        )
+
+    def test_dependent_required_projects_the_triggering_property(self):
+        projections, errors = self.missing_members_of(
+            instance={"credit_card": 1234},
+            schema={
+                "dependentRequired": {
+                    "credit_card": ["billing_address", "cardholder"],
+                    "absent": ["irrelevant"],
+                },
+            },
+        )
+        self.assertEqual(
+            [each.member for each in projections],
+            ["billing_address", "cardholder"],
+        )
+        for each in projections:
+            self.assertEqual(each.triggered_by, "credit_card")
+        self.assertEqual(
+            [each.error for each in projections],
+            errors,
+        )
+
+    def test_members_present_in_the_instance_are_not_projected(self):
+        projections, _ = self.missing_members_of(
+            instance={"foo": 1},
+            schema={"required": ["foo", "bar"]},
+        )
+        self.assertEqual([each.member for each in projections], ["bar"])
+
+    def test_member_names_are_json_pointer_escaped(self):
+        projections, _ = self.missing_members_of(
+            instance={"a/b~c": {}},
+            schema={
+                "properties": {
+                    "a/b~c": {"required": ["x/y", "~z", "plain"]},
+                },
+            },
+        )
+        self.assertEqual(
+            [each.member_token for each in projections],
+            ["x~1y", "~0z", "plain"],
+        )
+        for each in projections:
+            self.assertEqual(each.parent_path, ("a/b~c",))
+            self.assertEqual(each.parent_pointer, "/a~1b~0c")
+
+    def test_array_indices_and_string_keys_are_not_confused(self):
+        projections, _ = self.missing_members_of(
+            instance={"0": {}, "items": [{}]},
+            schema={
+                "properties": {
+                    "0": {"required": ["foo"]},
+                    "items": {"items": {"required": ["bar"]}},
+                },
+            },
+        )
+        by_member = {each.member: each for each in projections}
+        self.assertEqual(by_member["foo"].parent_path, ("0",))
+        self.assertIsInstance(by_member["foo"].parent_path[0], str)
+        self.assertEqual(by_member["foo"].parent_pointer, "/0")
+        self.assertEqual(by_member["bar"].parent_path, ("items", 0))
+        self.assertIsInstance(by_member["bar"].parent_path[1], int)
+        self.assertEqual(by_member["bar"].parent_pointer, "/items/0")
+
+    def test_no_instance_path_is_fabricated_for_missing_members(self):
+        instance = {"foo": 1}
+        (projection,), _ = self.missing_members_of(
+            instance=instance,
+            schema={"required": ["bar"]},
+        )
+        self.assertNotIn(projection.member, instance)
+        self.assertEqual(projection.parent_path, ())
+        self.assertFalse(hasattr(projection, "path"))
+
+    def test_combinator_errors_are_grouped_by_branch(self):
+        projections, _ = self.missing_members_of(
+            instance={},
+            schema={
+                "anyOf": [
+                    {"required": ["a"]},
+                    {"required": ["b", "c"]},
+                ],
+            },
+        )
+        self.assertEqual(
+            [(each.branch, each.member) for each in projections],
+            [((0,), "a"), ((1,), "b"), ((1,), "c")],
+        )
+        groups = [
+            (branch, [each.member for each in members])
+            for branch, members in groupby(
+                projections,
+                key=lambda each: each.branch,
+            )
+        ]
+        self.assertEqual(groups, [((0,), ["a"]), ((1,), ["b", "c"])])
+
+    def test_nested_combinators_accumulate_branch_indices(self):
+        projections, _ = self.missing_members_of(
+            instance={},
+            schema={
+                "anyOf": [
+                    {"oneOf": [{"required": ["deep"]}, {"required": ["x"]}]},
+                ],
+            },
+        )
+        branches = {each.branch for each in projections}
+        self.assertEqual(branches, {(0, 0), (0, 1)})
+
+    def test_other_keywords_are_ignored(self):
+        projections, _ = self.missing_members_of(
+            instance=12,
+            schema={"minimum": 37},
+        )
+        self.assertEqual(projections, [])
+
+    def test_errors_without_details_are_skipped(self):
+        vague = exceptions.ValidationError("oh no!", validator="required")
+        self.assertEqual(exceptions.missing_members([vague]), [])
+
+    def test_iterating_errors_and_best_match_are_unaffected(self):
+        schema = {"anyOf": [{"required": ["a"]}, {"minProperties": 2}]}
+        validator = _LATEST_VERSION(schema)
+        errors = list(validator.iter_errors({}))
+
+        best_before = exceptions.best_match(iter(errors))
+        projections = exceptions.missing_members(errors)
+        best_after = exceptions.best_match(iter(errors))
+
+        self.assertEqual(len(projections), 1)
+        self.assertIs(best_before, best_after)
+        self.assertEqual(len(errors), 1)
 
 
 class TestErrorInitReprStr(TestCase):

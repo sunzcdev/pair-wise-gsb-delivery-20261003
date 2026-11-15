@@ -5,6 +5,7 @@ Validation errors, and some surrounding helpers.
 from __future__ import annotations
 
 from collections import defaultdict, deque
+from collections.abc import Mapping
 from pprint import pformat
 from textwrap import dedent, indent
 from typing import TYPE_CHECKING, Any, ClassVar
@@ -20,7 +21,6 @@ if TYPE_CHECKING:
     from collections.abc import (
         Callable,
         Iterable,
-        Mapping,
         MutableMapping,
         Sequence,
     )
@@ -434,6 +434,188 @@ class ErrorTree:
         """
         child_errors = sum(len(tree) for _, tree in self._contents.items())
         return len(self.errors) + child_errors
+
+
+def _escape_json_pointer_token(token: str | int) -> str:
+    """
+    Escape a single reference token for use in a JSON Pointer (RFC 6901).
+    """
+    return str(token).replace("~", "~0").replace("/", "~1")
+
+
+@define(frozen=True)
+class MissingMember:
+    """
+    A single missing object member, projected from a `ValidationError`.
+
+    Errors for the :kw:`required` and :kw:`dependentRequired` keywords
+    point at the parent object as a whole, which makes them awkward to
+    consume when each missing member needs to be addressed individually
+    (e.g. when rendering one problem per field in a UI). `missing_members`
+    splits such errors into one `MissingMember` per absent property.
+
+    Each projection keeps a reference to the `ValidationError` it was
+    derived from via `MissingMember.error`, so no information is lost.
+
+    .. note::
+
+        The missing member does *not* exist in the instance, so no
+        instance path is fabricated for it. Use `parent_path` (or
+        `parent_pointer`) for the location of the containing object --
+        which does exist -- and `member` for the name of the absent
+        property within it.
+    """
+
+    error: ValidationError
+    """
+    The original `ValidationError` this projection was derived from.
+    """
+
+    member: str
+    """
+    The name of the property missing from the parent object.
+    """
+
+    triggered_by: str | None
+    """
+    For :kw:`dependentRequired`, the property whose presence in the
+    instance triggered the dependency, or `None` for :kw:`required`.
+    """
+
+    branch: tuple[str | int | None, ...]
+    """
+    The combinators branch the projection belongs to.
+
+    Empty for errors raised directly; otherwise the indices of the
+    subschemas (e.g. within :kw:`anyOf` or :kw:`oneOf`) which were
+    descended into to reach the error, outermost first.
+    """
+
+    @property
+    def parent_path(self) -> tuple[str | int, ...]:
+        """
+        The absolute path to the parent object missing the member.
+
+        Path segments retain their types, so array indices (`int`) are
+        never confused with string object keys.
+        """
+        return tuple(self.error.absolute_path)
+
+    @property
+    def parent_pointer(self) -> str:
+        """
+        A JSON Pointer (RFC 6901) to the parent object.
+
+        The empty string if the parent object is the instance itself.
+        """
+        return "".join(
+            "/" + _escape_json_pointer_token(segment)
+            for segment in self.parent_path
+        )
+
+    @property
+    def member_token(self) -> str:
+        """
+        The missing member's name, escaped as a JSON Pointer token.
+        """
+        return _escape_json_pointer_token(self.member)
+
+
+def missing_members(
+    errors: Iterable[ValidationError],
+) -> list[MissingMember]:
+    """
+    Project :kw:`required` and :kw:`dependentRequired` errors onto members.
+
+    Each error for those keywords is split into one `MissingMember` per
+    missing property, each recording the parent object's location, the
+    missing member's name, and (for :kw:`dependentRequired`) the property
+    whose presence triggered the dependency. Errors for other keywords
+    are ignored.
+
+    Errors within the context of combinators like :kw:`anyOf` or
+    :kw:`oneOf` are descended into, and the resulting projections are
+    grouped by branch: projections sharing a `MissingMember.branch` are
+    contiguous in the returned list, so they can be grouped with e.g.
+    `itertools.groupby`.
+
+    This is a read-only view over the provided errors -- iterating
+    errors or using `best_match` on them is unaffected.
+
+    Arguments:
+
+        errors (collections.abc.Iterable):
+
+            the errors to project, e.g. from
+            `jsonschema.protocols.Validator.iter_errors`
+
+    Returns:
+
+        a list of `MissingMember` projections, one per missing member
+    """
+    projections = []
+    for error in errors:
+        projections.extend(_project_missing_members(error, branch=()))
+    return projections
+
+
+def _project_missing_members(
+    error: _Error,
+    branch: tuple[str | int | None, ...],
+) -> Iterable[MissingMember]:
+    if error.validator in ("required", "dependentRequired"):
+        yield from _missing_members_of(error, branch)
+    else:
+        for suberror in error.context:
+            index = suberror.schema_path[0] if suberror.schema_path else None
+            yield from _project_missing_members(
+                suberror,
+                branch=branch + (index,),
+            )
+
+
+def _missing_members_of(
+    error: _Error,
+    branch: tuple[str | int | None, ...],
+) -> Iterable[MissingMember]:
+    instance, dependencies = error.instance, error.validator_value
+    if instance is _unset or dependencies is _unset:
+        return
+    if not isinstance(instance, Mapping):
+        return
+
+    if error.validator == "required":
+        candidates = [
+            (property, None)
+            for property in dependencies
+            if property not in instance
+        ]
+        expected = "{0!r} is a required property"
+    else:  # dependentRequired
+        candidates = [
+            (each, property)
+            for property, dependency in dependencies.items()
+            if property in instance
+            for each in dependency
+            if each not in instance
+        ]
+        expected = "{0!r} is a dependency of {1!r}"
+
+    # Each error the keywords emit covers exactly one missing member, so
+    # attribute the error to the member whose message it carries rather
+    # than to every absent property its validator value happens to list.
+    missing = dict.fromkeys(
+        (member, triggered_by)
+        for member, triggered_by in candidates
+        if expected.format(member, triggered_by) == error.message
+    )
+    for member, triggered_by in missing:
+        yield MissingMember(
+            error=error,
+            member=member,
+            triggered_by=triggered_by,
+            branch=branch,
+        )
 
 
 def by_relevance(weak=WEAK_MATCHES, strong=STRONG_MATCHES):
