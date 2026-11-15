@@ -69,7 +69,9 @@ The following headers are currently supported:
 **Response headers:**
 - `Cache-Control: immutable`: Cache the response with no expiration
 - `Cache-Control: max-age`: Used as the expiration time in seconds
-- `Cache-Control: must-revalidate`: When used in combination with `max-age=0`, revalidate immediately.
+- `Cache-Control: must-revalidate`: When used in combination with `max-age=0`, revalidate
+  immediately. This also prevents an expired response from being used as a `stale-if-error`
+  fallback.
 - `Cache-Control: no-cache`: Revalidate with the server before using a cached response
 - `Cache-Control: no-store` Skip writing to the cache
 - `Cache-Control: stale-if-error`: Same behavior as request header

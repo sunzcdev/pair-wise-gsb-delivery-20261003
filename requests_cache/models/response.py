@@ -31,6 +31,10 @@ logger = getLogger(__name__)
 class BaseResponse(Response):
     """Wrapper class for responses returned by :py:class:`.CachedSession`. This mainly exists to
     provide type hints for extra cache-related attributes that are added to non-cached responses.
+
+    A stale response returned by ``stale_if_error`` also has an ``error_category`` attribute
+    indicating why the refresh failed: ``'transport'`` for a request/transport error, or
+    ``'status'`` for an invalid origin status code. It is ``None`` for all other responses.
     """
 
     created_at: datetime = field(factory=utcnow)
@@ -38,6 +42,15 @@ class BaseResponse(Response):
     cache_key: str = ''  # Not serialized; set by BaseCache.get_response()
     revalidated: bool = False  # Not serialized; set by CacheActions.update_revalidated_response()
     has_content_changed: Optional[bool] = None  # Not serialized; set when refreshing a response
+
+    @property
+    def error_category(self) -> Optional[str]:
+        """Category of the error that caused a stale response to be returned, if any"""
+        return getattr(self, '_error_category', None)
+
+    @error_category.setter
+    def error_category(self, value: Optional[str]):
+        self._error_category = value
 
     @property
     def from_cache(self) -> bool:

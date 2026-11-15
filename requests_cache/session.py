@@ -7,6 +7,17 @@ from typing import TYPE_CHECKING, Iterable, Mapping, Optional, Union
 
 from requests import PreparedRequest
 from requests import Session as OriginalSession
+from requests.exceptions import (
+    HTTPError,
+    InvalidHeader,
+    InvalidSchema,
+    InvalidURL,
+    MissingSchema,
+    RequestException,
+    StreamConsumedError,
+    UnrewindableBodyError,
+    URLRequired,
+)
 from requests.hooks import dispatch_hook
 
 from ._utils import get_valid_kwargs, patch_form_boundary
@@ -34,6 +45,23 @@ else:
     MIXIN_BASE = object
 
 logger = getLogger(__name__)
+
+# Request errors that are not caused by a failure to reach the origin server. These are normally
+# configuration or programming errors, so they should not be converted into a stale cache response.
+_NON_TRANSPORT_ERRORS = (
+    HTTPError,
+    InvalidHeader,
+    InvalidSchema,
+    InvalidURL,
+    MissingSchema,
+    StreamConsumedError,
+    UnrewindableBodyError,
+    URLRequired,
+)
+
+# Marker added to exceptions raised by response hooks, so they can be distinguished from origin
+# errors even when a hook raises a RequestException subclass
+_CALLBACK_ERROR_ATTR = '_requests_cache_callback_error'
 
 
 class CacheMixin(MIXIN_BASE):
@@ -222,6 +250,8 @@ class CacheMixin(MIXIN_BASE):
         cached_response: Optional[CachedResponse] = None
         if not actions.skip_read:
             cached_response = self.cache.get_response(actions.cache_key)
+            if cached_response is not None:
+                cached_response.error_category = None
         actions.update_from_cached_response(cached_response, self.cache.create_key, **kwargs)
 
         # Secondary Vary lookup: if the primary entry didn't match on Vary,
@@ -229,6 +259,8 @@ class CacheMixin(MIXIN_BASE):
         if actions.vary_cache_key:
             vary_key = actions.vary_cache_key
             vary_cached = self.cache.get_response(vary_key)
+            if vary_cached is not None:
+                vary_cached.error_category = None
             # Use the Vary-qualified key for any future storage (hit or miss)
             actions.cache_key = vary_key
             if vary_cached is not None:
@@ -258,11 +290,14 @@ class CacheMixin(MIXIN_BASE):
         else:
             response = cached_response  # type: ignore  # Guaranteed to be non-None by this point
 
-        # If the request has been filtered out and was previously cached, delete it
-        if self.settings.filter_fn is not None and not self.settings.filter_fn(response):
-            logger.debug(f'Deleting filtered response for URL: {response.url}')
-            self.cache.delete(actions.cache_key)
-            return response
+        # If the request has been filtered out and was previously cached, delete it. Don't delete a
+        # stale response that was just returned as an error fallback.
+        if self.settings.filter_fn is not None:
+            filtered_out = not self.settings.filter_fn(response)
+            if filtered_out and getattr(response, 'error_category', None) is None:
+                logger.debug(f'Deleting filtered response for URL: {response.url}')
+                self.cache.delete(actions.cache_key)
+                return response
 
         # Dispatch any hooks here, because they are removed during serialization
         return dispatch_hook('response', request.hooks, response, **kwargs)
@@ -279,6 +314,19 @@ class CacheMixin(MIXIN_BASE):
         """
         request = actions.update_request(request)
         response = super().send(request, **kwargs)
+        return self._cache_response(response, actions, cached_response)
+
+    def _cache_response(
+        self,
+        response: AnyResponse,
+        actions: CacheActions,
+        cached_response: Optional[CachedResponse] = None,
+    ) -> AnyResponse:
+        """Apply response settings and save to the cache, if applicable.
+
+        This is separate from sending the request so that callback and cache write errors can't be
+        mistaken for origin errors.
+        """
         actions.update_from_response(response)
 
         if not actions.skip_write:
@@ -292,7 +340,7 @@ class CacheMixin(MIXIN_BASE):
                 self.cache.save_response(cached_response, actions.cache_key, actions.expires)  # type: ignore[unreachable]
             return cached_response
         else:
-            logger.debug(f'Skipping cache write for URL: {request.url}')
+            logger.debug(f'Skipping cache write for URL: {response.request.url}')
 
         # This is possible if the original request is a cache miss, but updating its validation
         # headers results in redirecting to a different URL that is a cache hit
@@ -312,16 +360,29 @@ class CacheMixin(MIXIN_BASE):
         response
         """
         logger.debug('Stale response; attempting to re-send request')
+        request = actions.update_request(request)
+
+        # Only errors from sending the request to the origin are eligible for stale-if-error
+        # fallback. Response hooks, filter callbacks, and cache writes run below, outside this block.
         try:
-            response = self._send_and_cache(request, actions, cached_response, **kwargs)
-            if (
-                actions._stale_if_error
-                and response.status_code not in self.settings.allowable_codes
-            ):
+            with _tag_callback_errors(request):
+                response = super().send(request, **kwargs)
+        except RequestException as e:
+            if isinstance(e, _NON_TRANSPORT_ERRORS) or getattr(e, _CALLBACK_ERROR_ATTR, False):
+                raise
+            return self._handle_error(cached_response, actions, 'transport', e)
+
+        # Response hooks have run, so callback errors will propagate from here. Cache writes are
+        # also outside the transport error handler above.
+        response = self._cache_response(response, actions, cached_response)
+
+        # A response with a status code that isn't configured as valid is also eligible for fallback
+        if actions._stale_if_error and response.status_code not in self.settings.allowable_codes:
+            try:
                 response.raise_for_status()
-            return response
-        except Exception:
-            return self._handle_error(cached_response, actions)
+            except HTTPError as e:
+                return self._handle_error(cached_response, actions, 'status', e)
+        return response
 
     def _resend_async(self, *args, **kwargs):
         """Send a non-blocking request to refresh a cached response"""
@@ -329,19 +390,27 @@ class CacheMixin(MIXIN_BASE):
         thread = Thread(target=self._send_and_cache, args=args, kwargs=kwargs)
         thread.start()
 
-    def _handle_error(self, cached_response: CachedResponse, actions: CacheActions) -> AnyResponse:
+    def _handle_error(
+        self,
+        cached_response: CachedResponse,
+        actions: CacheActions,
+        error_category: str,
+        error: BaseException,
+    ) -> AnyResponse:
         """Handle a request error based on settings:
         * Default behavior: re-raise the error
         * stale-if-error: Ignore the error and and return the stale cache item
         """
-        if actions.is_usable(cached_response, error=True):
+        if actions._stale_if_error and actions.is_usable(cached_response, error=True):
+            cached_response.error_category = error_category
             logger.warning(
-                f'Request for URL {cached_response.request.url} failed; using cached response',
+                f'Request for URL {cached_response.request.url} failed ({error_category}); '
+                'using cached response',
                 exc_info=True,
             )
             return cached_response
         else:
-            raise
+            raise error
 
     @contextmanager
     def cache_disabled(self):
@@ -407,8 +476,9 @@ class CachedSession(CacheMixin, OriginalSession):
         ignored_parameters: Request parameters, headers, and/or JSON body params to exclude from both
             request matching and cached request data
         read_only: Read existing cached responses, but do not write any new responses to the cache
-        stale_if_error: Return a stale response if a new request raises an exception. Optionally
-            accepts a time value representing maximum staleness to accept.
+        stale_if_error: Return a stale response if a new request has a transport error or an origin
+            status code not in ``allowable_codes``. Optionally accepts a time value representing
+            maximum staleness to accept.
         stale_while_revalidate: Return a stale response initially, while a non-blocking request is
             sent to refresh the response for the next time it's requested
         autoclose: Close the cache backend when the session is closed
@@ -427,3 +497,31 @@ def get_504_response(request: PreparedRequest) -> CachedResponse:
         reason='Not Cached',
         request=request,  # type: ignore
     )
+
+
+@contextmanager
+def _tag_callback_errors(request: PreparedRequest):
+    """Mark exceptions raised by response hooks so they can't be mistaken for origin failures"""
+    response_hooks = request.hooks.get('response') if request.hooks else None
+    if not response_hooks:
+        yield
+        return
+
+    def make_tagged_hook(hook):
+        def tagged_hook(response, *args, **kwargs):
+            try:
+                return hook(response, *args, **kwargs)
+            except Exception as e:
+                try:
+                    setattr(e, _CALLBACK_ERROR_ATTR, True)
+                except Exception:
+                    pass
+                raise
+
+        return tagged_hook
+
+    request.hooks['response'] = [make_tagged_hook(hook) for hook in response_hooks]
+    try:
+        yield
+    finally:
+        request.hooks['response'] = response_hooks

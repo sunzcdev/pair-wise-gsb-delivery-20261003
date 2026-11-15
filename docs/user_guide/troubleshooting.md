@@ -67,8 +67,9 @@ Here are some error messages you may see either in the logs or (more rarely) in 
   * This message is to help with debugging and can generally be ignored. If you prefer, you can
     either {py:meth}`~.BaseCache.delete` the invalid responses or {py:meth}`~.BaseCache.clear` the
     entire cache.
-* **`Request for URL {url} failed; using cached response`:** This is just a notification that the
-  {ref}`stale_if_error <request-errors>` option is working as intended.
+* **`Request for URL {url} failed ({category}); using cached response`:** This is just a
+  notification that the {ref}`stale_if_error <request-errors>` option is working as intended.
+  `category` is either `transport` or `status`.
 * **{py:exc}`~requests.RequestException`:** These are general request errors not specific to
   requests-cache. See `requests` documentation on
   [Errors and Exceptions](https://requests.readthedocs.io/en/latest/user/quickstart/#errors-and-exceptions)

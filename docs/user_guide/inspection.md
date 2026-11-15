@@ -13,6 +13,9 @@ The following attributes are available on responses:
 - `created_at`: {py:class}`~datetime.datetime` of when the cached response was created or last updated
 - `expires`: {py:class}`~datetime.datetime` after which the cached response will expire (see
   {ref}`expiration` for details)
+- `error_category`: When a stale response is returned due to `stale_if_error`, this is `transport`
+  for a request/transport error or `status` for an invalid origin status code; otherwise it is
+  `None`. See {ref}`request-errors` for details.
 - `is_expired`: indicates if the cached response is expired (if, for example, an old response was returned due to a request error)
 
 :::{dropdown} Examples

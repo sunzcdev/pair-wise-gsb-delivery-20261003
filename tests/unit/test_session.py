@@ -513,17 +513,109 @@ def test_expired_request_error(url, mock_session):
 @skip_pypy
 @pytest.mark.parametrize('url', [MOCKED_URL, MOCKED_URL_ETAG])
 def test_stale_if_error__exception(url, mock_session):
-    """With stale_if_error, expect to get old cache data if there is an exception during a request"""
+    """With stale_if_error, expect to get old cache data if there is a transport error"""
     mock_session.settings.stale_if_error = True
     mock_session.settings.expire_after = 1
     with time_travel(START_DT):
         assert mock_session.get(url).from_cache is False
         assert mock_session.get(url).from_cache is True
 
-    with patch.object(mock_session.cache, 'save_response', side_effect=RequestException):
+    mock_session.mock_adapter.register_uri('GET', url, exc=requests.ConnectionError)
+    with time_travel(START_DT + timedelta(seconds=1.1)):
+        response = mock_session.get(url)
+        assert response.from_cache is True and response.is_expired is True
+        assert response.error_category == 'transport'
+
+
+@skip_pypy
+def test_stale_if_error__hook_error(mock_session):
+    """A response hook error should be raised, not converted into a stale cache response"""
+    mock_session.settings.stale_if_error = True
+    mock_session.settings.expire_after = 1
+    with time_travel(START_DT):
+        mock_session.get(MOCKED_URL)
+
+    def hook(response, *args, **kwargs):
+        raise RequestException('hook error')
+
+    with time_travel(START_DT + timedelta(seconds=1.1)):
+        with pytest.raises(RequestException, match='hook error'):
+            mock_session.get(MOCKED_URL, hooks={'response': hook})
+
+    assert mock_session.cache.contains(url=MOCKED_URL)
+
+
+@skip_pypy
+def test_stale_if_error__filter_error(mock_session):
+    """A filter callback error should be raised, not converted into a stale cache response"""
+    mock_session.settings.stale_if_error = True
+    mock_session.settings.expire_after = 1
+    with time_travel(START_DT):
+        mock_session.get(MOCKED_URL)
+
+    def filter_fn(response):
+        raise ValueError('filter error')
+
+    mock_session.settings.filter_fn = filter_fn
+    with time_travel(START_DT + timedelta(seconds=1.1)):
+        with pytest.raises(ValueError, match='filter error'):
+            mock_session.get(MOCKED_URL)
+
+    assert mock_session.cache.contains(url=MOCKED_URL)
+
+
+@skip_pypy
+def test_stale_if_error__filtered_fallback_is_not_deleted(mock_session):
+    """A filter callback should not delete a cached response used for error fallback"""
+    mock_session.settings.stale_if_error = True
+    mock_session.settings.expire_after = 1
+    with time_travel(START_DT):
+        mock_session.get(MOCKED_URL)
+
+    mock_session.settings.filter_fn = lambda response: False
+    mock_session.mock_adapter.register_uri('GET', MOCKED_URL, exc=requests.ConnectionError)
+    with time_travel(START_DT + timedelta(seconds=1.1)):
+        response = mock_session.get(MOCKED_URL)
+
+    assert response.from_cache is True
+    assert response.error_category == 'transport'
+    assert mock_session.cache.contains(url=MOCKED_URL)
+
+
+@skip_pypy
+def test_stale_if_error__filter_error_during_fallback(mock_session):
+    """A filter callback error after a transport failure should still be raised"""
+    mock_session.settings.stale_if_error = True
+    mock_session.settings.expire_after = 1
+    with time_travel(START_DT):
+        mock_session.get(MOCKED_URL)
+
+    def filter_fn(response):
+        raise ValueError('filter error')
+
+    mock_session.settings.filter_fn = filter_fn
+    mock_session.mock_adapter.register_uri('GET', MOCKED_URL, exc=requests.ConnectionError)
+    with time_travel(START_DT + timedelta(seconds=1.1)):
+        with pytest.raises(ValueError, match='filter error'):
+            mock_session.get(MOCKED_URL)
+
+    assert mock_session.cache.contains(url=MOCKED_URL)
+
+
+@skip_pypy
+def test_stale_if_error__cache_write_error(mock_session):
+    """A cache write error should be raised, not converted into a stale cache response"""
+    mock_session.settings.stale_if_error = True
+    mock_session.settings.expire_after = 1
+    with time_travel(START_DT):
+        mock_session.get(MOCKED_URL)
+
+    with patch.object(mock_session.cache, 'save_response', side_effect=ValueError('write error')):
         with time_travel(START_DT + timedelta(seconds=1.1)):
-            response = mock_session.get(url)
-            assert response.from_cache is True and response.is_expired is True
+            with pytest.raises(ValueError, match='write error'):
+                mock_session.get(MOCKED_URL)
+
+    assert mock_session.cache.contains(url=MOCKED_URL)
 
 
 @skip_pypy
@@ -545,6 +637,7 @@ def test_stale_if_error__error_code(url, mock_session):
         assert response.status_code == 200
         assert response.from_cache is True
         assert response.is_expired is True
+        assert response.error_category == 'status'
 
 
 @skip_pypy
@@ -608,6 +701,33 @@ def test_stale_if_error__response_header(mock_session):
     assert response.status_code == 200
     assert response.from_cache is True
     assert response.text == 'original content'
+
+
+@pytest.mark.parametrize('failure', ['transport', 'status'])
+def test_stale_if_error__must_revalidate(failure, mock_session):
+    """must-revalidate should prevent an expired response from being used for error fallback"""
+    url = f'{MOCKED_URL}/must-revalidate-{failure}'
+    mock_session.settings.cache_control = True
+    mock_session.settings.stale_if_error = True
+    mock_session.mock_adapter.register_uri(
+        'GET',
+        url,
+        text='original content',
+        headers={'Cache-Control': 'max-age=0,must-revalidate', 'ETag': 'original'},
+    )
+    mock_session.get(url)
+
+    if failure == 'transport':
+        mock_session.mock_adapter.register_uri('GET', url, exc=requests.ConnectionError)
+        expected_error = requests.ConnectionError
+    else:
+        mock_session.mock_adapter.register_uri('GET', url, status_code=500)
+        expected_error = HTTPError
+
+    with pytest.raises(expected_error):
+        mock_session.get(url)
+
+    assert mock_session.cache.contains(url=url)
 
 
 def test_stale_if_error_is_scoped_to_matching_vary_response(mock_session):

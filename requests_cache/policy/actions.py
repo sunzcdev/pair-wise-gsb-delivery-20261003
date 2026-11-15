@@ -168,8 +168,17 @@ class CacheActions(RichMixin):
         * max-stale
         * stale-if-error (if an error has occurred)
         * stale-while-revalidate
+
+        A cached response with ``Cache-Control: must-revalidate`` can never be used after it has
+        expired, even when ``stale-if-error`` is set.
         """
         if cached_response is None:
+            return False
+        elif (
+            error
+            and cached_response.is_expired
+            and CacheDirectives.from_headers(cached_response.headers).must_revalidate
+        ):
             return False
         elif (
             cached_response.expires is None

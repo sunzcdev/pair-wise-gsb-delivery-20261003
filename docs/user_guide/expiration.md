@@ -125,10 +125,17 @@ maximum staleness you are willing to accept:
 session = CachedSession(stale_if_error=timedelta(minutes=5))
 ```
 
-In addition to HTTP error codes, `stale_if_error` also applies to python exceptions (typically a
-{py:exc}`~requests.RequestException`). See `requests` documentation on
+In addition to HTTP error codes, `stale_if_error` also applies to transport errors (typically a
+{py:exc}`~requests.RequestException` raised while sending the request). See `requests`
+documentation on
 [Errors and Exceptions](https://requests.readthedocs.io/en/latest/user/quickstart/#errors-and-exceptions)
 for more details on request errors in general.
+
+Error fallback is intentionally limited to failures from the origin server. Errors raised by
+response hooks, filter callbacks, or cache serialization/storage operations are re-raised normally,
+and do not delete an existing cached response. A stale response returned this way has an
+`error_category` of either `transport` or `status`, and is still subject to the `stale_if_error`
+time limit and any `must-revalidate` directive on the cached response.
 
 (reset)=
 ## Resetting Expiration
