@@ -3819,9 +3819,20 @@ encoder_listencode_list(PyEncoderObject *s, JSON_Accu *rval, PyObject *seq,
          * emits a compact "[]" under an indent= setting. */
         int emitted_open = 0;
 
-        iter = PyObject_GetIter(seq);
-        if (iter == NULL)
-            goto bail;
+        if (PyIter_Check(seq)) {
+            /* seq is already an iterator: the iterable_as_array probe
+             * in encoder_listencode_default built it from origin. A
+             * custom iterator's __iter__ may only run once, so consume
+             * that iterator directly instead of letting
+             * PyObject_GetIter call __iter__ again. */
+            Py_INCREF(seq);
+            iter = seq;
+        }
+        else {
+            iter = PyObject_GetIter(seq);
+            if (iter == NULL)
+                goto bail;
+        }
         while ((obj = PyIter_Next(iter))) {
             if (!emitted_open) {
                 if (JSON_Accu_Accumulate(state, rval, state->JSON_open_array))

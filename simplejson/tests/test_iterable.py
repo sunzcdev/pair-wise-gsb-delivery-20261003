@@ -93,6 +93,62 @@ class FalsySelfIterator(object):
     next = __next__
 
 
+class OneShotIterator(object):
+    # An iterator whose __iter__ may run only once, like a custom
+    # collection's draining iterator: the encoder must consume the
+    # single iterator its probe built, not call __iter__ again.
+    def __init__(self, values):
+        self.values = list(values)
+        self.calls = 0
+
+    def __iter__(self):
+        self.calls += 1
+        if self.calls > 1:
+            raise RuntimeError("__iter__ called more than once")
+        return self
+
+    def __next__(self):
+        if self.values:
+            return self.values.pop(0)
+        raise StopIteration
+
+    next = __next__
+
+
+class MidIterationError(object):
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        raise RuntimeError("mid-iteration")
+
+    next = __next__
+
+
+class IterableForJson(object):
+    def __init__(self):
+        self.iter_calls = 0
+
+    def for_json(self):
+        return {'via': 'for_json'}
+
+    def __iter__(self):
+        self.iter_calls += 1
+        return iter([1])
+
+
+class IterableAsDict(object):
+    def __init__(self):
+        self.iter_calls = 0
+
+    def _asdict(self):
+        return {'via': 'asdict'}
+
+    def __iter__(self):
+        self.iter_calls += 1
+        return iter([1])
+
+
 # Every level is a new object, so circular checks cannot stop the
 # encoder; only the C encoder's recursion guard does. On Python 3.14+ the
 # interpreter's own stack checks also catch Deep, whose __iter__ is a
@@ -191,6 +247,69 @@ class TestIterable(unittest.TestCase):
             encoded = json.dumps(FalsySelfIterator(), iterable_as_array=True,
                                  indent=indent)
             self.assertEqual(json.loads(encoded), [1, 1])
+
+    def test_one_shot_iterator_is_itered_once(self):
+        # The probe's iterator is the one that gets encoded: __iter__
+        # runs exactly once per source per encode, at every depth.
+        for indent in (None, 2):
+            value = OneShotIterator([1, 2, 3])
+            encoded = json.dumps(value, iterable_as_array=True, indent=indent)
+            self.assertEqual(json.loads(encoded), [1, 2, 3])
+            self.assertEqual(value.calls, 1)
+            value = OneShotIterator(
+                [OneShotIterator([1]), OneShotIterator([])])
+            encoded = json.dumps(value, iterable_as_array=True, indent=indent)
+            self.assertEqual(json.loads(encoded), [[1], []])
+            self.assertEqual(value.calls, 1)
+            for wrap in (lambda v: [v], lambda v: {'v': v}):
+                value = OneShotIterator([1])
+                encoded = json.dumps(wrap(value), iterable_as_array=True,
+                                     indent=indent)
+                self.assertEqual(json.loads(encoded), json.loads(
+                    json.dumps(wrap([1]), iterable_as_array=True,
+                               indent=indent)))
+                self.assertEqual(value.calls, 1)
+
+    def test_one_shot_iterator_empty(self):
+        for indent in (None, 2):
+            value = OneShotIterator([])
+            self.assertEqual(
+                json.dumps(value, iterable_as_array=True, indent=indent), '[]')
+            self.assertEqual(value.calls, 1)
+
+    def test_iteration_error_does_not_leak_markers(self):
+        for indent in (None, 2):
+            encoder = json.JSONEncoder(iterable_as_array=True, indent=indent)
+            self.assertRaises(RuntimeError, encoder.encode,
+                              MidIterationError())
+            # A subsequent independent encode with the same encoder
+            # starts with a clean circular-reference state.
+            self.assertEqual(json.loads(encoder.encode([1, 2])), [1, 2])
+            self.assertEqual(
+                json.loads(encoder.encode(OneShotIterator([4]))), [4])
+
+    def test_rereadable_iterable_encodes_repeatedly(self):
+        encoder = json.JSONEncoder(iterable_as_array=True)
+        value = IterableValues([1, 2])
+        for _ in range(2):
+            self.assertEqual(json.loads(encoder.encode(value)), [1, 2])
+
+    def test_iterable_with_encoding_protocol_prefers_the_protocol(self):
+        for cls, expected, enable, disable in (
+                (IterableForJson, {'via': 'for_json'},
+                 {'for_json': True}, {'for_json': False}),
+                (IterableAsDict, {'via': 'asdict'},
+                 {'namedtuple_as_object': True},
+                 {'namedtuple_as_object': False})):
+            value = cls()
+            encoded = json.dumps(value, iterable_as_array=True, **enable)
+            self.assertEqual(json.loads(encoded), expected)
+            self.assertEqual(value.iter_calls, 0)
+            # With the protocol disabled the iterable path is used.
+            value = cls()
+            self.assertEqual(json.loads(json.dumps(
+                value, iterable_as_array=True, **disable)), [1])
+            self.assertEqual(value.iter_calls, 1)
 
     @skip_if_speedups_missing
     def test_unbounded_iterable_recursion_is_guarded(self):

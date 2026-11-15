@@ -552,6 +552,20 @@ def _make_iterencode(markers, _default, _encoder, _indent, _floatstr,
         if markers is not None:
             del markers[markerid]
 
+    def _enumerate_once(iterator):
+        # enumerate() without the initial iter(): the iterable_as_array
+        # probe in _iterencode already built this iterator from its
+        # source, and a custom iterator's __iter__ may only run once,
+        # so the source's single iterator is consumed directly here.
+        i = 0
+        while True:
+            try:
+                value = next(iterator)
+            except StopIteration:
+                return
+            yield i, value
+            i += 1
+
     def _iterencode_list(lst, _current_indent_level, _origin=None):
         # _origin is the object being encoded: lst itself, or under
         # iterable_as_array the iterable that produced the iterator lst.
@@ -564,6 +578,9 @@ def _make_iterencode(markers, _default, _encoder, _indent, _floatstr,
                 yield '[]'
                 return
             _origin = lst
+            items = enumerate(lst)
+        else:
+            items = _enumerate_once(lst)
         if markers is not None:
             markerid = id(_origin)
             if markerid in markers:
@@ -580,7 +597,7 @@ def _make_iterencode(markers, _default, _encoder, _indent, _floatstr,
                 newline_indent = None
                 separator = _item_separator
             first = True
-            for i, value in enumerate(lst):
+            for i, value in items:
                 if first:
                     first = False
                 else:

@@ -1,3 +1,10 @@
+Unreleased
+
+* With ``iterable_as_array=True`` both encoders now call ``__iter__``
+  exactly once per iterable per encode, so one-shot iterators (whose
+  ``__iter__`` may only run once) encode correctly
+  https://github.com/simplejson/simplejson/pull/406
+
 Version 4.3.0 released 2026-11-10
 
 * The C encoder no longer crashes when ``default()`` or ``for_json()``
