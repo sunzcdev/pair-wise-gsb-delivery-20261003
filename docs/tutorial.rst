@@ -390,6 +390,50 @@ deleted manually.
 
 To permanently delete the cache, recursively remove the cache's directory.
 
+.. _tutorial-backup:
+
+Backup and Restore
+~~~~~~~~~~~~~~~~~~
+
+Large values are stored in separate files rather than in the SQLite database,
+so copying ``cache.db`` alone produces an incomplete backup. The
+:meth:`backup <diskcache.Cache.backup>` method packages a consistent,
+point-in-time snapshot of the database together with every value file it
+references. Other processes may keep reading and writing while the backup
+runs: the database is copied with SQLite's online backup API and each
+referenced value file is pinned with a hard link before it is copied.
+
+The destination is a directory containing the database snapshot, the value
+files under ``values/``, and a ``manifest.json`` checksum manifest that
+records the relative path, size, and SHA-256 digest of every file.
+
+.. code-block:: python
+
+    import diskcache as dc
+
+    cache = dc.Cache('/tmp/cache-dir')
+    cache.backup('/tmp/cache-backup')
+
+Rows inserted after the snapshot begins never appear in the backup, and value
+files replaced afterwards are still copied from the snapshot. Expiration
+timestamps are absolute, so the time spent backing up never extends the
+lifetime of an item.
+
+:meth:`restore <diskcache.Cache.restore>` verifies every checksum and checks
+that all relative paths stay inside the backup directory before anything is
+written. If verification fails, the destination is left untouched. Only files
+listed in the manifest are copied; unrelated files in the backup directory
+are ignored.
+
+.. code-block:: python
+
+    dc.Cache.restore('/tmp/cache-backup', '/tmp/restored-cache')
+    restored = dc.Cache('/tmp/restored-cache')
+
+:class:`diskcache.FanoutCache` exposes the same pair of methods and records
+the shard count in its manifest so that :meth:`FanoutCache.restore
+<diskcache.FanoutCache.restore>` opens a cache with the same layout.
+
 .. _tutorial-fanoutcache:
 
 FanoutCache

@@ -3,13 +3,26 @@
 import contextlib as cl
 import functools
 import itertools as it
+import json
 import operator
+import os
 import os.path as op
+import shutil
 import sqlite3
 import tempfile
 import time
 
-from .core import DEFAULT_SETTINGS, ENOVAL, Cache, Disk, Timeout
+from .core import (
+    BACKUP_FORMAT_VERSION,
+    BACKUP_MANIFEST_NAME,
+    BACKUP_TMP_PREFIX,
+    DEFAULT_SETTINGS,
+    ENOVAL,
+    BackupError,
+    Cache,
+    Disk,
+    Timeout,
+)
 from .persistent import Deque, Index
 
 
@@ -384,6 +397,138 @@ class FanoutCache:
         index = self._hash(key) % self._count
         shard = self._shards[index]
         del shard[key]
+
+    def backup(self, directory, retry=True):
+        """Back up every shard to a self-contained directory at `directory`.
+
+        Delegates to :meth:`Cache.backup <diskcache.Cache.backup>` for each
+        shard. The resulting layout mirrors the shard directories and a
+        top-level manifest records the shard count so the backup can be
+        restored as a :class:`FanoutCache`.
+
+        :param str directory: destination directory, which must not already
+            exist
+        :param bool retry: retry when concurrent writers invalidate a
+            snapshot (default True)
+        :return: path of the created backup directory
+        :raises BackupError: if no consistent snapshot could be produced
+        :raises FileExistsError: if `directory` already exists
+
+        """
+        directory = str(directory)
+
+        if op.exists(directory):
+            raise FileExistsError(
+                'backup destination already exists: %s' % directory
+            )
+
+        parent = op.abspath(op.dirname(directory) or '.')
+        staging = tempfile.mkdtemp(prefix=BACKUP_TMP_PREFIX, dir=parent)
+
+        try:
+            for num, shard in enumerate(self._shards):
+                shard.backup(op.join(staging, '%03d' % num), retry=retry)
+
+            manifest = {
+                'format': BACKUP_FORMAT_VERSION,
+                'type': 'fanout',
+                'shards': self._count,
+                'created': time.time(),
+            }
+
+            with open(
+                op.join(staging, BACKUP_MANIFEST_NAME),
+                'w',
+                encoding='utf-8',
+            ) as writer:
+                json.dump(manifest, writer, indent=2, sort_keys=True)
+
+            os.rename(staging, directory)
+            return directory
+        except BaseException:
+            shutil.rmtree(staging, ignore_errors=True)
+            raise
+
+    @classmethod
+    def restore(
+        cls, source, directory, timeout=0.010, disk=Disk, **settings
+    ):
+        """Restore a fanout backup into `directory` and open the cache.
+
+        Every shard backup is verified before anything is written, following
+        the same checksum and path checks as
+        :meth:`Cache.restore <diskcache.Cache.restore>`. The restored cache is
+        assembled in a temporary directory next to the target and moved into
+        place only after all shards are restored successfully.
+
+        :param str source: backup directory produced by :meth:`backup`
+        :param str directory: destination cache directory, which must not
+            already exist
+        :param float timeout: SQLite connection timeout for the restored cache
+        :param disk: `Disk` type for the restored cache
+        :param settings: any of `DEFAULT_SETTINGS`
+        :return: opened :class:`FanoutCache` rooted at `directory`
+        :raises BackupError: if the backup is missing, malformed, or fails
+            verification
+        :raises FileExistsError: if `directory` already exists
+
+        """
+        source = str(source)
+        directory = str(directory)
+
+        if op.exists(directory):
+            raise FileExistsError(
+                'restore destination already exists: %s' % directory
+            )
+
+        manifest_path = op.join(source, BACKUP_MANIFEST_NAME)
+
+        try:
+            with open(manifest_path, encoding='utf-8') as reader:
+                manifest = json.load(reader)
+        except (OSError, ValueError):
+            raise BackupError(
+                'cannot read fanout backup manifest'
+            ) from None
+
+        if (
+            not isinstance(manifest, dict)
+            or manifest.get('format') != BACKUP_FORMAT_VERSION
+            or manifest.get('type') != 'fanout'
+        ):
+            raise BackupError('invalid fanout backup manifest')
+
+        shard_count = manifest.get('shards')
+
+        if not isinstance(shard_count, int) or shard_count < 1:
+            raise BackupError('invalid shard count in fanout backup manifest')
+
+        shard_names = ['%03d' % num for num in range(shard_count)]
+
+        for name in shard_names:
+            Cache._verify_backup(op.join(source, name))
+
+        parent = op.abspath(op.dirname(directory) or '.')
+        staging = tempfile.mkdtemp(prefix=BACKUP_TMP_PREFIX, dir=parent)
+
+        try:
+            for name in shard_names:
+                Cache.restore(
+                    op.join(source, name), op.join(staging, name)
+                )
+
+            os.rename(staging, directory)
+        except BaseException:
+            shutil.rmtree(staging, ignore_errors=True)
+            raise
+
+        return cls(
+            directory,
+            shards=shard_count,
+            timeout=timeout,
+            disk=disk,
+            **settings,
+        )
 
     def check(self, fix=False, retry=False):
         """Check database and file system consistency.

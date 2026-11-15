@@ -5,12 +5,15 @@ import codecs
 import contextlib as cl
 import errno
 import functools as ft
+import hashlib
 import io
 import json
 import os
 import os.path as op
+import pathlib
 import pickle
 import pickletools
+import shutil
 import sqlite3
 import struct
 import tempfile
@@ -38,6 +41,13 @@ class Constant(tuple):
 DBNAME = 'cache.db'
 ENOVAL = Constant('ENOVAL')
 UNKNOWN = Constant('UNKNOWN')
+
+BACKUP_FORMAT_VERSION = 1
+BACKUP_DBNAME = 'cache.db'
+BACKUP_VALUES_DIRNAME = 'values'
+BACKUP_MANIFEST_NAME = 'manifest.json'
+BACKUP_TMP_PREFIX = '.diskcache-backup-'
+BACKUP_RESTORE_PREFIX = '.diskcache-restore-'
 
 MODE_NONE = 0
 MODE_RAW = 1
@@ -376,6 +386,17 @@ class Timeout(Exception):
     """Database timeout expired."""
 
 
+class BackupError(Exception):
+    """Backup or restore failed.
+
+    Raised when a cache backup cannot be produced consistently (for example a
+    referenced value file disappeared despite retries) or when a backup fails
+    verification during restore. A failed restore never modifies the target
+    cache directory.
+
+    """
+
+
 class UnknownFileWarning(UserWarning):
     """Warning used by Cache.check for unknown files."""
 
@@ -412,6 +433,72 @@ def args_to_key(base, args, kwargs, typed, ignore):
             key += tuple(type(value) for _, value in sorted_items)
 
     return key
+
+
+def _is_relative_path(path):
+    """Return True when `path` is a safe relative path.
+
+    Absolute paths, empty paths, paths with a drive or root, and paths that
+    escape via ``..`` components are rejected. The check works on the string
+    form of the path so that backups created on one operating system can be
+    verified on another.
+
+    :param str path: candidate relative path
+    :return: True when `path` stays within its containing directory
+
+    """
+    if not isinstance(path, str) or not path:
+        return False
+
+    normalized = path.replace('\\', '/')
+    parts = normalized.split('/')
+
+    if parts[0] == '' or parts[-1] == '':
+        # Leading or trailing separator (latter means directory reference).
+        return False
+
+    for part in parts:
+        if part in ('', '.', '..'):
+            return False
+
+    if op.isabs(path) or op.splitdrive(path)[0]:
+        return False
+
+    return True
+
+
+def _file_sha256(full_path, buf_size=2**20):
+    """Return hexadecimal SHA-256 digest of file at `full_path`.
+
+    :param str full_path: path of file to hash
+    :param int buf_size: read buffer size in bytes
+    :return: lowercase hexadecimal digest string
+
+    """
+    digest = hashlib.sha256()
+
+    with open(full_path, 'rb') as reader:
+        for chunk in iter(ft.partial(reader.read, buf_size), b''):
+            digest.update(chunk)
+
+    return digest.hexdigest()
+
+
+def _link_or_copy(src, dst):
+    """Create a hard link from `src` to `dst`, falling back to a copy.
+
+    Hard links pin the source inode so that value files replaced or removed by
+    other processes remain available for the duration of a backup. File
+    systems without hard link support fall back to a regular copy.
+
+    :param str src: source file path
+    :param str dst: destination path, which must not exist
+
+    """
+    try:
+        os.link(src, dst)
+    except OSError:
+        shutil.copyfile(src, dst)
 
 
 class Cache:
@@ -1887,6 +1974,412 @@ class Cache:
 
         return decorator
 
+    def backup(self, directory, retry=True):
+        """Back up the cache to a self-contained directory at `directory`.
+
+        The backup is a consistent, point-in-time snapshot of the cache. It
+        contains a copy of the database (produced with SQLite's online backup
+        API so other processes may continue reading and writing) together with
+        every value file referenced by the rows in that snapshot. A
+        ``manifest.json`` checksum manifest lists the relative path, size, and
+        SHA-256 digest of the database and each value file.
+
+        Value files are never modified in place, but they may be replaced or
+        removed by concurrent writes. To keep the files referenced by the
+        snapshot copyable, each referenced file is pinned with a hard link
+        inside the cache directory while the write lock is briefly held. The
+        lock is released before the files are copied, so other processes are
+        not blocked for the duration of the copy. File systems without hard
+        link support fall back to a regular copy.
+
+        Rows inserted after the snapshot was taken never appear in the backup.
+        Absolute expiration timestamps are stored verbatim in the database, so
+        restoring a backup does not extend the lifetime of any item.
+
+        :param str directory: destination directory, which must not already
+            exist
+        :param bool retry: retry when concurrent writers invalidate a
+            snapshot (default True)
+        :return: path of the created backup directory
+        :raises BackupError: if no consistent snapshot could be produced
+        :raises Timeout: if the database lock cannot be acquired and `retry`
+            is False
+        :raises FileExistsError: if `directory` already exists
+
+        """
+        directory = str(directory)
+
+        if op.exists(directory):
+            raise FileExistsError(
+                'backup destination already exists: %s' % directory
+            )
+
+        parent = op.abspath(op.dirname(directory) or '.')
+
+        with cl.suppress(OSError):
+            os.makedirs(parent)
+
+        attempts = 5 if retry else 1
+
+        for _ in range(attempts):
+            destination = tempfile.mkdtemp(
+                prefix=BACKUP_TMP_PREFIX, dir=parent
+            )
+            staging = tempfile.mkdtemp(
+                prefix=BACKUP_TMP_PREFIX, dir=self._directory
+            )
+
+            try:
+                consistent = self._backup_snapshot(
+                    destination, staging
+                )
+            except BaseException:
+                shutil.rmtree(destination, ignore_errors=True)
+                shutil.rmtree(staging, ignore_errors=True)
+                raise
+
+            if consistent:
+                shutil.rmtree(staging, ignore_errors=True)
+
+                try:
+                    os.rename(destination, directory)
+                except BaseException:
+                    shutil.rmtree(destination, ignore_errors=True)
+                    raise
+
+                return directory
+
+            # Snapshot raced a deletion: discard and try again.
+            shutil.rmtree(destination, ignore_errors=True)
+            shutil.rmtree(staging, ignore_errors=True)
+
+        raise BackupError(
+            'unable to produce a consistent backup; a referenced value'
+            ' file was removed concurrently'
+        )
+
+    def _backup_snapshot(self, destination, staging):
+        """Build one snapshot attempt. Return False to request a retry."""
+        # Online backup: readers and writers in other processes keep working.
+        snapshot_path = op.join(destination, BACKUP_DBNAME)
+        source = self._con
+        target = sqlite3.connect(snapshot_path)
+
+        try:
+            source.backup(target)
+        finally:
+            target.close()
+
+        snapshot = sqlite3.connect(
+            pathlib.Path(snapshot_path).as_uri() + '?immutable=1', uri=True
+        )
+
+        try:
+            rows = snapshot.execute(
+                'SELECT DISTINCT filename FROM Cache'
+                ' WHERE filename IS NOT NULL'
+            ).fetchall()
+        finally:
+            snapshot.close()
+
+        filenames = sorted(row[0] for row in rows)
+
+        # Pin every referenced file while briefly holding the write lock.
+        # Files replaced or deleted afterwards stay available through the
+        # hard link. Missing files mean the snapshot raced a deletion, so the
+        # whole attempt is retried.
+        with self._transact(retry=False):
+            for filename in filenames:
+                if not _is_relative_path(filename):
+                    raise BackupError(
+                        'cache references an invalid file path: %s' % filename
+                    )
+
+                src = op.join(self._directory, filename)
+                pinned = op.join(staging, filename)
+
+                with cl.suppress(OSError):
+                    os.makedirs(op.dirname(pinned))
+
+                try:
+                    _link_or_copy(src, pinned)
+                except OSError:
+                    return False
+
+        files = []
+
+        for filename in filenames:
+            rel = op.join(BACKUP_VALUES_DIRNAME, filename)
+            target_path = op.join(destination, rel)
+            source_path = op.join(staging, filename)
+
+            with cl.suppress(OSError):
+                os.makedirs(op.dirname(target_path))
+
+            shutil.copyfile(source_path, target_path)
+            files.append(
+                {
+                    'path': rel.replace('\\', '/'),
+                    'source': filename.replace('\\', '/'),
+                    'size': op.getsize(target_path),
+                    'sha256': _file_sha256(target_path),
+                }
+            )
+
+        manifest = {
+            'format': BACKUP_FORMAT_VERSION,
+            'created': time.time(),
+            'database': {
+                'path': BACKUP_DBNAME,
+                'size': op.getsize(snapshot_path),
+                'sha256': _file_sha256(snapshot_path),
+            },
+            'files': files,
+        }
+
+        manifest_path = op.join(destination, BACKUP_MANIFEST_NAME)
+
+        with open(manifest_path, 'w', encoding='utf-8') as writer:
+            json.dump(manifest, writer, indent=2, sort_keys=True)
+
+        return True
+
+    @classmethod
+    def restore(cls, source, directory):
+        """Restore a backup created by :meth:`backup` into `directory`.
+
+        Every entry of the checksum manifest is verified before anything is
+        written to `directory`. Verification checks the manifest structure,
+        that all relative paths stay inside the backup, and that the size and
+        SHA-256 digest of the database and every value file match. Only files
+        referenced by the manifest are copied; unrelated files in the backup
+        directory are ignored and directories are never walked recursively.
+
+        The restored cache is assembled in a temporary directory next to the
+        target and moved into place only after verification and copying
+        succeed. When verification fails, `directory` is left untouched.
+
+        Expiration timestamps are restored as absolute values, so time spent
+        taking or restoring the backup never extends an item's lifetime.
+
+        :param str source: backup directory produced by :meth:`backup`
+        :param str directory: destination cache directory
+        :return: path of the restored cache directory
+        :raises BackupError: if the backup is missing, malformed, outside its
+            directory, or fails checksum verification
+        :raises FileExistsError: if `directory` already exists
+
+        """
+        source = str(source)
+        directory = str(directory)
+
+        if op.exists(directory):
+            raise FileExistsError(
+                'restore destination already exists: %s' % directory
+            )
+
+        parent = op.abspath(op.dirname(directory) or '.')
+
+        with cl.suppress(OSError):
+            os.makedirs(parent)
+
+        staging = tempfile.mkdtemp(
+            prefix=BACKUP_RESTORE_PREFIX, dir=parent
+        )
+
+        try:
+            manifest = cls._verify_backup(source)
+            cls._restore_backup(source, staging, manifest)
+
+            if op.exists(directory):
+                # Another process may have created the cache meanwhile.
+                raise FileExistsError(
+                    'restore destination already exists: %s' % directory
+                )
+
+            os.rename(staging, directory)
+            return directory
+        finally:
+            shutil.rmtree(staging, ignore_errors=True)
+
+    @classmethod
+    def _verify_backup(cls, source):
+        """Validate `source` and return its parsed manifest."""
+        if not op.isdir(source):
+            raise BackupError(
+                'backup directory does not exist: %s' % source
+            )
+
+        manifest_path = op.join(source, BACKUP_MANIFEST_NAME)
+
+        try:
+            with open(manifest_path, encoding='utf-8') as reader:
+                manifest = json.load(reader)
+        except (OSError, ValueError) as error:
+            raise BackupError(
+                'cannot read backup manifest: %s' % error
+            ) from None
+
+        if not isinstance(manifest, dict):
+            raise BackupError(
+                'invalid backup manifest: root must be an object'
+            )
+
+        if manifest.get('format') != BACKUP_FORMAT_VERSION:
+            raise BackupError(
+                'unsupported backup format: %r' % manifest.get('format')
+            )
+
+        database = manifest.get('database')
+        entries = manifest.get('files')
+
+        if not isinstance(database, dict) or not isinstance(entries, list):
+            raise BackupError('invalid backup manifest structure')
+
+        seen = set()
+
+        for entry in entries:
+            if not isinstance(entry, dict):
+                raise BackupError('invalid backup manifest entry')
+
+            path = entry.get('path')
+            source_name = entry.get('source')
+
+            if not _is_relative_path(path):
+                raise BackupError(
+                    'manifest contains an invalid file path: %r' % path
+                )
+            if not _is_relative_path(source_name):
+                raise BackupError(
+                    'manifest contains an invalid source path: %r'
+                    % source_name
+                )
+            if path in seen:
+                raise BackupError('duplicate manifest entry: %s' % path)
+
+            seen.add(path)
+
+        all_entries = [database] + entries
+
+        for entry in all_entries:
+            path = entry.get('path')
+            size = entry.get('size')
+            digest = entry.get('sha256')
+
+            if not _is_relative_path(path):
+                raise BackupError(
+                    'manifest contains an invalid file path: %r' % path
+                )
+
+            if not isinstance(size, int) or size < 0:
+                raise BackupError(
+                    'manifest entry has an invalid size: %r' % path
+                )
+            if not isinstance(digest, str) or len(digest) != 64:
+                raise BackupError(
+                    'manifest entry has an invalid checksum: %r' % path
+                )
+
+            full_path = op.join(source, path)
+
+            if op.commonpath(
+                (op.abspath(source), op.abspath(full_path))
+            ) != op.abspath(source):
+                raise BackupError(
+                    'manifest path escapes the backup directory: %s' % path
+                )
+
+            if not op.isfile(full_path):
+                raise BackupError(
+                    'backup is missing a referenced file: %s' % path
+                )
+
+            if op.getsize(full_path) != size:
+                raise BackupError('size mismatch for %s' % path)
+            if _file_sha256(full_path) != digest:
+                raise BackupError('checksum mismatch for %s' % path)
+
+        # The database snapshot must itself be a valid SQLite database whose
+        # value references agree with the manifest.
+        db_path = op.join(source, database['path'])
+        cls._verify_database(db_path, entries)
+
+        return manifest
+
+    @staticmethod
+    def _verify_database(db_path, entries):
+        """Check the snapshot database and its referenced value files."""
+        try:
+            connection = sqlite3.connect(
+                pathlib.Path(db_path).as_uri() + '?immutable=1', uri=True
+            )
+        except sqlite3.Error as error:
+            raise BackupError(
+                'cannot open backup database: %s' % error
+            ) from None
+
+        try:
+            rows = connection.execute(
+                'PRAGMA integrity_check'
+            ).fetchall()
+
+            if len(rows) != 1 or rows[0][0] != 'ok':
+                raise BackupError('backup database failed integrity check')
+
+            rows = connection.execute(
+                'SELECT DISTINCT filename FROM Cache'
+                ' WHERE filename IS NOT NULL'
+            ).fetchall()
+        except sqlite3.DatabaseError as error:
+            raise BackupError(
+                'backup database is unreadable: %s' % error
+            ) from None
+        finally:
+            connection.close()
+
+        referenced = set()
+
+        for (filename,) in rows:
+            if not _is_relative_path(filename):
+                raise BackupError(
+                    'database references an invalid file path: %r' % filename
+                )
+            referenced.add(filename.replace('\\', '/'))
+
+        manifest_sources = {
+            entry['source'].replace('\\', '/') for entry in entries
+        }
+
+        if referenced != manifest_sources:
+            raise BackupError(
+                'manifest does not match the files referenced by the database'
+            )
+
+    @staticmethod
+    def _restore_backup(source, destination, manifest):
+        """Copy verified backup contents into empty `destination`."""
+        database = manifest['database']
+        db_target = op.join(destination, DBNAME)
+
+        with cl.suppress(OSError):
+            os.makedirs(op.dirname(db_target))
+
+        shutil.copyfile(
+            op.join(source, database['path']), db_target
+        )
+
+        for entry in manifest['files']:
+            # Restore at the relative path recorded in the database rows.
+            target_rel = entry['source']
+            target_path = op.join(destination, target_rel)
+
+            with cl.suppress(OSError):
+                os.makedirs(op.dirname(target_path))
+
+            shutil.copyfile(
+                op.join(source, entry['path']), target_path
+            )
+
     def check(self, fix=False, retry=False):
         """Check database and file system consistency.
 
@@ -1968,6 +2461,12 @@ class Cache:
 
                     for full_path in error:
                         if DBNAME in full_path:
+                            continue
+
+                        # Hard links used by in-progress backups live in a
+                        # temporary staging directory inside the cache.
+                        relative = op.relpath(full_path, self._directory)
+                        if relative.startswith(BACKUP_TMP_PREFIX):
                             continue
 
                         message = 'unknown file: %s' % full_path
