@@ -215,6 +215,7 @@ class BaseClient:
         self._event_hooks = {
             "request": list(event_hooks.get("request", [])),
             "response": list(event_hooks.get("response", [])),
+            "response_complete": list(event_hooks.get("response_complete", [])),
         }
         self._trust_env = trust_env
         self._default_encoding = default_encoding
@@ -267,6 +268,7 @@ class BaseClient:
         self._event_hooks = {
             "request": list(event_hooks.get("request", [])),
             "response": list(event_hooks.get("response", [])),
+            "response_complete": list(event_hooks.get("response_complete", [])),
         }
 
     @property
@@ -1019,6 +1021,8 @@ class Client(BaseClient):
         response.stream = BoundSyncStream(
             response.stream, response=response, start=start
         )
+        for hook in self._event_hooks["response_complete"]:
+            response.add_termination_hook(hook)
         self.cookies.extract_cookies(response)
         response.default_encoding = self._default_encoding
 
@@ -1734,6 +1738,8 @@ class AsyncClient(BaseClient):
         response.stream = BoundAsyncStream(
             response.stream, response=response, start=start
         )
+        for hook in self._event_hooks["response_complete"]:
+            await response.aadd_termination_hook(hook)
         self.cookies.extract_cookies(response)
         response.default_encoding = self._default_encoding
 

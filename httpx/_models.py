@@ -48,7 +48,23 @@ from ._types import (
 from ._urls import URL
 from ._utils import to_bytes_or_str, to_str
 
-__all__ = ["Cookies", "Headers", "Request", "Response"]
+__all__ = ["Cookies", "Headers", "Request", "Response", "ResponseTerminationReason"]
+
+ResponseTerminationHook = typing.Callable[..., typing.Any]
+
+
+class ResponseTerminationReason:
+    """
+    Enumerates the terminal states a response body can reach.
+
+    * `COMPLETE` - The response body was read to completion.
+    * `CLOSED_EARLY` - The response was closed before the body was fully read.
+    * `FAILED` - Reading or decoding the response body raised an exception.
+    """
+
+    COMPLETE = "complete"
+    CLOSED_EARLY = "closed_early"
+    FAILED = "failed"
 
 SENSITIVE_HEADERS = {"authorization", "proxy-authorization"}
 
@@ -545,6 +561,15 @@ class Response:
 
         self.default_encoding = default_encoding
 
+        # Terminal state tracking for the response body. A response reaches a
+        # terminal state exactly once, either when the body is fully read, when
+        # it is closed early, or when reading/decoding fails.
+        self._termination_reason: str | None = None
+        self._termination_exception: Exception | None = None
+        self._stream_exhausted = False
+        self._termination_hooks: list[ResponseTerminationHook] = []
+        self._num_bytes_downloaded = 0
+
         if stream is None:
             headers, stream = encode_response(content, text, html, json)
             self._prepare(headers)
@@ -565,8 +590,6 @@ class Response:
             # useful when creating response instances having received a stream
             # from the transport API.
             self.stream = stream
-
-        self._num_bytes_downloaded = 0
 
     def _prepare(self, default_headers: dict[str, str]) -> None:
         for key, value in default_headers.items():
@@ -856,6 +879,79 @@ class Response:
     def num_bytes_downloaded(self) -> int:
         return self._num_bytes_downloaded
 
+    @property
+    def termination_reason(self) -> str | None:
+        """
+        Returns the terminal state of the response body, or `None` if the
+        response has not yet reached a terminal state.
+
+        The possible values are the constants on `ResponseTerminationReason`:
+        `"complete"`, `"closed_early"` or `"failed"`.
+        """
+        return self._termination_reason
+
+    def add_termination_hook(self, hook: ResponseTerminationHook) -> None:
+        """
+        Register a callable to run once when the response body reaches a
+        terminal state.
+
+        The hook is called with the keyword arguments `response`, `reason`,
+        `num_bytes` and `exception`. If the response has already reached a
+        terminal state the hook is invoked immediately.
+        """
+        self._termination_hooks.append(hook)
+        if self._termination_reason is not None:
+            self._run_termination_hook(hook)
+
+    async def aadd_termination_hook(self, hook: ResponseTerminationHook) -> None:
+        """
+        Register an async callable to run once when the response body reaches
+        a terminal state.
+
+        The hook is awaited with the keyword arguments `response`, `reason`,
+        `num_bytes` and `exception`. If the response has already reached a
+        terminal state the hook is awaited immediately.
+        """
+        self._termination_hooks.append(hook)
+        if self._termination_reason is not None:
+            await self._arun_termination_hook(hook)
+
+    def _run_termination_hook(self, hook: ResponseTerminationHook) -> None:
+        hook(
+            response=self,
+            reason=self._termination_reason,
+            num_bytes=self._num_bytes_downloaded,
+            exception=self._termination_exception,
+        )
+
+    async def _arun_termination_hook(self, hook: ResponseTerminationHook) -> None:
+        await hook(
+            response=self,
+            reason=self._termination_reason,
+            num_bytes=self._num_bytes_downloaded,
+            exception=self._termination_exception,
+        )
+
+    def _settle_termination(
+        self, reason: str, exception: Exception | None = None
+    ) -> None:
+        if self._termination_reason is not None:
+            return
+        self._termination_reason = reason
+        self._termination_exception = exception
+        for hook in list(self._termination_hooks):
+            self._run_termination_hook(hook)
+
+    async def _asettle_termination(
+        self, reason: str, exception: Exception | None = None
+    ) -> None:
+        if self._termination_reason is not None:
+            return
+        self._termination_reason = reason
+        self._termination_exception = exception
+        for hook in list(self._termination_hooks):
+            await self._arun_termination_hook(hook)
+
     def __repr__(self) -> str:
         return f"<Response [{self.status_code} {self.reason_phrase}]>"
 
@@ -863,13 +959,24 @@ class Response:
         return {
             name: value
             for name, value in self.__dict__.items()
-            if name not in ["extensions", "stream", "is_closed", "_decoder"]
+            if name
+            not in [
+                "extensions",
+                "stream",
+                "is_closed",
+                "_decoder",
+                "_termination_hooks",
+            ]
         }
 
     def __setstate__(self, state: dict[str, typing.Any]) -> None:
         for name, value in state.items():
             setattr(self, name, value)
         self.is_closed = True
+        self._termination_reason = ResponseTerminationReason.COMPLETE
+        self._termination_exception = None
+        self._stream_exhausted = True
+        self._termination_hooks = []
         self.extensions = {}
         self.stream = UnattachedStream()
 
@@ -894,15 +1001,22 @@ class Response:
             decoder = self._get_content_decoder()
             chunker = ByteChunker(chunk_size=chunk_size)
             with request_context(request=self._request):
-                for raw_bytes in self.iter_raw():
-                    decoded = decoder.decode(raw_bytes)
+                try:
+                    for raw_bytes in self.iter_raw():
+                        decoded = decoder.decode(raw_bytes)
+                        for chunk in chunker.decode(decoded):
+                            yield chunk
+                    decoded = decoder.flush()
                     for chunk in chunker.decode(decoded):
+                        yield chunk  # pragma: no cover
+                    for chunk in chunker.flush():
                         yield chunk
-                decoded = decoder.flush()
-                for chunk in chunker.decode(decoded):
-                    yield chunk  # pragma: no cover
-                for chunk in chunker.flush():
-                    yield chunk
+                except Exception as exc:
+                    self._settle_termination(
+                        ResponseTerminationReason.FAILED, exception=exc
+                    )
+                    raise
+                self._settle_termination(ResponseTerminationReason.COMPLETE)
 
     def iter_text(self, chunk_size: int | None = None) -> typing.Iterator[str]:
         """
@@ -947,15 +1061,22 @@ class Response:
         self._num_bytes_downloaded = 0
         chunker = ByteChunker(chunk_size=chunk_size)
 
-        with request_context(request=self._request):
-            for raw_stream_bytes in self.stream:
-                self._num_bytes_downloaded += len(raw_stream_bytes)
-                for chunk in chunker.decode(raw_stream_bytes):
-                    yield chunk
+        try:
+            with request_context(request=self._request):
+                for raw_stream_bytes in self.stream:
+                    self._num_bytes_downloaded += len(raw_stream_bytes)
+                    for chunk in chunker.decode(raw_stream_bytes):
+                        yield chunk
 
-        for chunk in chunker.flush():
-            yield chunk
+            for chunk in chunker.flush():
+                yield chunk
+        except Exception as exc:
+            self._settle_termination(
+                ResponseTerminationReason.FAILED, exception=exc
+            )
+            raise
 
+        self._stream_exhausted = True
         self.close()
 
     def close(self) -> None:
@@ -970,6 +1091,13 @@ class Response:
             self.is_closed = True
             with request_context(request=self._request):
                 self.stream.close()
+            if self._termination_reason is None:
+                reason = (
+                    ResponseTerminationReason.COMPLETE
+                    if self._stream_exhausted
+                    else ResponseTerminationReason.CLOSED_EARLY
+                )
+                self._settle_termination(reason)
 
     async def aread(self) -> bytes:
         """
@@ -994,15 +1122,22 @@ class Response:
             decoder = self._get_content_decoder()
             chunker = ByteChunker(chunk_size=chunk_size)
             with request_context(request=self._request):
-                async for raw_bytes in self.aiter_raw():
-                    decoded = decoder.decode(raw_bytes)
+                try:
+                    async for raw_bytes in self.aiter_raw():
+                        decoded = decoder.decode(raw_bytes)
+                        for chunk in chunker.decode(decoded):
+                            yield chunk
+                    decoded = decoder.flush()
                     for chunk in chunker.decode(decoded):
+                        yield chunk  # pragma: no cover
+                    for chunk in chunker.flush():
                         yield chunk
-                decoded = decoder.flush()
-                for chunk in chunker.decode(decoded):
-                    yield chunk  # pragma: no cover
-                for chunk in chunker.flush():
-                    yield chunk
+                except Exception as exc:
+                    await self._asettle_termination(
+                        ResponseTerminationReason.FAILED, exception=exc
+                    )
+                    raise
+                await self._asettle_termination(ResponseTerminationReason.COMPLETE)
 
     async def aiter_text(
         self, chunk_size: int | None = None
@@ -1051,15 +1186,22 @@ class Response:
         self._num_bytes_downloaded = 0
         chunker = ByteChunker(chunk_size=chunk_size)
 
-        with request_context(request=self._request):
-            async for raw_stream_bytes in self.stream:
-                self._num_bytes_downloaded += len(raw_stream_bytes)
-                for chunk in chunker.decode(raw_stream_bytes):
-                    yield chunk
+        try:
+            with request_context(request=self._request):
+                async for raw_stream_bytes in self.stream:
+                    self._num_bytes_downloaded += len(raw_stream_bytes)
+                    for chunk in chunker.decode(raw_stream_bytes):
+                        yield chunk
 
-        for chunk in chunker.flush():
-            yield chunk
+            for chunk in chunker.flush():
+                yield chunk
+        except Exception as exc:
+            await self._asettle_termination(
+                ResponseTerminationReason.FAILED, exception=exc
+            )
+            raise
 
+        self._stream_exhausted = True
         await self.aclose()
 
     async def aclose(self) -> None:
@@ -1074,6 +1216,13 @@ class Response:
             self.is_closed = True
             with request_context(request=self._request):
                 await self.stream.aclose()
+            if self._termination_reason is None:
+                reason = (
+                    ResponseTerminationReason.COMPLETE
+                    if self._stream_exhausted
+                    else ResponseTerminationReason.CLOSED_EARLY
+                )
+                await self._asettle_termination(reason)
 
 
 class Cookies(typing.MutableMapping[str, str]):

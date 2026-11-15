@@ -5,6 +5,7 @@ There are currently two event hooks:
 
 * `request` - Called after a request is fully prepared, but before it is sent to the network. Passed the `request` instance.
 * `response` - Called after the response has been fetched from the network, but before it is returned to the caller. Passed the `response` instance.
+* `response_complete` - Called once when the response body reaches a terminal state. Passed the `response` instance, a `reason`, the number of bytes received as `num_bytes`, and any `exception` that occurred.
 
 These allow you to install client-wide functionality such as logging, monitoring or tracing.
 
@@ -36,6 +37,34 @@ client = httpx.Client(event_hooks={'response': [raise_on_4xx_5xx]})
 
     If you need access to the response body inside an event hook, you'll
     need to call `response.read()`, or for AsyncClients, `response.aread()`.
+
+## Monitoring when the body completes
+
+The `response` hook fires as soon as the response headers are available, which
+is usually before the response body has been read. The `response_complete` hook
+instead fires exactly once, when the body reaches a terminal state. This makes
+it suitable for monitoring and instrumentation that needs to know when the
+response is genuinely finished.
+
+The `reason` keyword argument is one of the constants on
+`httpx.ResponseTerminationReason`:
+
+* `httpx.ResponseTerminationReason.COMPLETE` - The body was read to completion.
+* `httpx.ResponseTerminationReason.CLOSED_EARLY` - The response was closed before the body was fully read.
+* `httpx.ResponseTerminationReason.FAILED` - Reading or decoding the body raised an exception, provided as `exception`.
+
+```python
+def log_response_complete(response, reason, num_bytes, exception):
+    print(f"{response.request.method} {response.request.url} -> {reason} ({num_bytes} bytes)")
+
+client = httpx.Client(event_hooks={"response_complete": [log_response_complete]})
+```
+
+The hook is bound to a specific `Response`, so every response in a redirect
+chain settles independently. Empty bodies and `HEAD` requests also reach the
+`complete` state, with `num_bytes` set to `0`. Reading a response and then
+closing it only notifies once. If a hook itself raises an exception, the
+exception propagates to the caller.
 
 The hooks are also allowed to modify `request` and `response` objects.
 

@@ -82,6 +82,7 @@ __all__ = [
     "RequestNotRead",
     "Response",
     "ResponseNotRead",
+    "ResponseTerminationReason",
     "stream",
     "StreamClosed",
     "StreamConsumed",

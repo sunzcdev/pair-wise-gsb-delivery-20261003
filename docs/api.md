@@ -66,6 +66,8 @@
 * `.next_request` - **Optional[Request]**
 * `.cookies` - **Cookies**
 * `.history` - **List[Response]**
+* `.termination_reason` - **Optional[str]**
+  * The terminal state of the response body, or `None` before it settles. One of the constants on `ResponseTerminationReason`.
 * `.elapsed` - **[timedelta](https://docs.python.org/3/library/datetime.html)**
   * The amount of time elapsed between sending the request and calling `close()` on the corresponding response received for that request.
   [total_seconds()](https://docs.python.org/3/library/datetime.html#datetime.timedelta.total_seconds) to correctly get
@@ -78,6 +80,8 @@
 * `def .iter_text([chunk_size])` - **text iterator**
 * `def .iter_lines()` - **text iterator**
 * `def .close()` - **None**
+* `def .add_termination_hook(hook)` - **None**
+  * Register a callable invoked once when the body reaches a terminal state, with the keyword arguments `response`, `reason`, `num_bytes` and `exception`.
 * `def .next()` - **Response**
 * `def .aread()` - **bytes**
 * `def .aiter_raw([chunk_size])` - **async bytes iterator**
@@ -85,7 +89,17 @@
 * `def .aiter_text([chunk_size])` - **async text iterator**
 * `def .aiter_lines()` - **async text iterator**
 * `def .aclose()` - **None**
+* `async def .aadd_termination_hook(hook)` - **None**
+  * Async equivalent of `.add_termination_hook()`.
 * `def .anext()` - **Response**
+
+## `ResponseTerminationReason`
+
+*Constants describing the terminal state of a response body.*
+
+* `.COMPLETE` - The response body was read to completion.
+* `.CLOSED_EARLY` - The response was closed before the body was fully read.
+* `.FAILED` - Reading or decoding the response body raised an exception.
 
 ## `Request`
 

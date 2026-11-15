@@ -13,6 +13,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 ### Added
 
 * Expose `FunctionAuth` from the public API. (#3699)
+* Add the `response_complete` event hook and `ResponseTerminationReason`, providing an explicit terminal-state callback for the response body that distinguishes a fully read body, an early close, and a read/decode failure, along with the number of bytes received.
 
 ## 0.28.1 (6th December, 2024)
 
