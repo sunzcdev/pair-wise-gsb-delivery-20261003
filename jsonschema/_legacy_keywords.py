@@ -354,7 +354,13 @@ def unevaluatedItems_draft2019(validator, unevaluatedItems, instance, schema):
         yield ValidationError(error % _utils.extras_msg(unevaluated_items))
 
 
-def find_evaluated_property_keys_by_schema(validator, instance, schema):
+def find_evaluated_property_keys_by_schema(
+    validator,
+    instance,
+    schema,
+    explanation=None,
+    _prefix="",
+):
     if validator.is_type(schema, "boolean"):
         return []
     evaluated_keys = []
@@ -370,6 +376,8 @@ def find_evaluated_property_keys_by_schema(validator, instance, schema):
                 ),
                 instance,
                 resolved.contents,
+                explanation=explanation,
+                _prefix=f"{_prefix}$ref[{ref!r}] -> ",
             ),
         )
 
@@ -383,27 +391,39 @@ def find_evaluated_property_keys_by_schema(validator, instance, schema):
                 ),
                 instance,
                 resolved.contents,
+                explanation=explanation,
+                _prefix=f"{_prefix}$recursiveRef -> ",
             ),
         )
 
     properties = schema.get("properties")
     if validator.is_type(properties, "object"):
-        evaluated_keys += properties.keys() & instance.keys()
+        for key in properties.keys() & instance.keys():
+            evaluated_keys.append(key)
+            _utils._note_evaluated_key(
+                explanation, key, f"{_prefix}properties[{key!r}]",
+            )
 
     for keyword in ["additionalProperties", "unevaluatedProperties"]:
         if (subschema := schema.get(keyword)) is None:
             continue
-        evaluated_keys += (
-            key
-            for key, value in instance.items()
-            if _utils.is_valid(validator.descend(value, subschema))
-        )
+        for key, value in instance.items():
+            if _utils.is_valid(validator.descend(value, subschema)):
+                evaluated_keys.append(key)
+                _utils._note_evaluated_key(
+                    explanation, key, f"{_prefix}{keyword}",
+                )
 
     if "patternProperties" in schema:
         for property in instance:
             for pattern in schema["patternProperties"]:
                 if re.search(pattern, property):
                     evaluated_keys.append(property)
+                    _utils._note_evaluated_key(
+                        explanation,
+                        property,
+                        f"{_prefix}patternProperties[{pattern!r}]",
+                    )
 
     if "dependentSchemas" in schema:
         for property, subschema in schema["dependentSchemas"].items():
@@ -413,17 +433,21 @@ def find_evaluated_property_keys_by_schema(validator, instance, schema):
                 validator,
                 instance,
                 subschema,
+                explanation=explanation,
+                _prefix=f"{_prefix}dependentSchemas[{property!r}] -> ",
             )
 
     for keyword in ["allOf", "oneOf", "anyOf"]:
         if keyword in schema:
-            for subschema in schema[keyword]:
+            for index, subschema in enumerate(schema[keyword]):
                 errs = next(validator.descend(instance, subschema), None)
                 if errs is None:
                     evaluated_keys += find_evaluated_property_keys_by_schema(
                         validator,
                         instance,
                         subschema,
+                        explanation=explanation,
+                        _prefix=f"{_prefix}{keyword}[{index}] -> ",
                     )
 
     if "if" in schema:
@@ -432,18 +456,24 @@ def find_evaluated_property_keys_by_schema(validator, instance, schema):
                 validator,
                 instance,
                 schema["if"],
+                explanation=explanation,
+                _prefix=f"{_prefix}if -> ",
             )
             if "then" in schema:
                 evaluated_keys += find_evaluated_property_keys_by_schema(
                     validator,
                     instance,
                     schema["then"],
+                    explanation=explanation,
+                    _prefix=f"{_prefix}then -> ",
                 )
         elif "else" in schema:
             evaluated_keys += find_evaluated_property_keys_by_schema(
                 validator,
                 instance,
                 schema["else"],
+                explanation=explanation,
+                _prefix=f"{_prefix}else -> ",
             )
 
     return evaluated_keys
@@ -452,10 +482,12 @@ def find_evaluated_property_keys_by_schema(validator, instance, schema):
 def unevaluatedProperties_draft2019(validator, uP, instance, schema):
     if not validator.is_type(instance, "object"):
         return
+    explanation = {}
     evaluated_keys = find_evaluated_property_keys_by_schema(
         validator,
         instance,
         schema,
+        explanation=explanation,
     )
     unevaluated_keys = []
     for property in instance:
@@ -474,10 +506,19 @@ def unevaluatedProperties_draft2019(validator, uP, instance, schema):
         if uP is False:
             error = "Unevaluated properties are not allowed (%s %s unexpected)"
             extras = sorted(unevaluated_keys, key=str)
-            yield ValidationError(error % _utils.extras_msg(extras))
+            validation_error = ValidationError(error % _utils.extras_msg(extras))
         else:
             error = (
                 "Unevaluated properties are not valid under "
                 "the given schema (%s %s unevaluated and invalid)"
             )
-            yield ValidationError(error % _utils.extras_msg(unevaluated_keys))
+            validation_error = ValidationError(
+                error % _utils.extras_msg(unevaluated_keys),
+            )
+        # Optionally consumable detail about why each *other* property
+        # of the instance was already evaluated, collected during the
+        # very same evaluation pass above (so no keyword was re-run to
+        # produce it). Keys of nested instances (e.g. under recursive
+        # references) are distinguished by each error's instance path.
+        validation_error.evaluation_explanation = explanation
+        yield validation_error

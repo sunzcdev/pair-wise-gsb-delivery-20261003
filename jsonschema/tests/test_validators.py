@@ -828,6 +828,176 @@ class TestValidationErrorMessages(TestCase):
         )
 
 
+class TestUnevaluatedPropertiesExplanation(TestCase):
+    def error_for(self, instance, schema, cls=validators.Draft202012Validator):
+        [error] = cls(schema).iter_errors(instance)
+        return error
+
+    def test_explains_why_each_other_property_was_evaluated(self):
+        schema = {
+            "properties": {"foo": True},
+            "patternProperties": {"^x-": True},
+            "allOf": [{"properties": {"a": True}}],
+            "$defs": {"r": {"properties": {"refd": True}}},
+            "$ref": "#/$defs/r",
+            "unevaluatedProperties": False,
+        }
+        instance = {"foo": 1, "x-1": 2, "a": 3, "refd": 4, "extra": 5}
+        error = self.error_for(instance, schema)
+        self.assertEqual(
+            error.evaluation_explanation,
+            {
+                "foo": ["properties['foo']"],
+                "x-1": ["patternProperties['^x-']"],
+                "a": ["allOf[0] -> properties['a']"],
+                "refd": ["$ref['#/$defs/r'] -> properties['refd']"],
+            },
+        )
+        # the unevaluated property itself is not "explained"
+        self.assertNotIn("extra", error.evaluation_explanation)
+
+    def test_default_error_message_is_unchanged(self):
+        schema = {"properties": {"foo": True}, "unevaluatedProperties": False}
+        error = self.error_for({"foo": 1, "bar": 2}, schema)
+        self.assertEqual(
+            error.message,
+            "Unevaluated properties are not allowed ('bar' was unexpected)",
+        )
+
+    def test_failing_anyOf_branch_contributes_no_explanation(self):
+        schema = {
+            "anyOf": [
+                {"properties": {"b": True}, "required": ["missing"]},
+                {"properties": {"c": True}},
+            ],
+            "unevaluatedProperties": False,
+        }
+        error = self.error_for({"c": 1, "extra": 2}, schema)
+        self.assertEqual(
+            error.evaluation_explanation,
+            {"c": ["anyOf[1] -> properties['c']"]},
+        )
+
+    def test_if_then_else_follow_the_applicable_branch(self):
+        schema = {
+            "if": {
+                "properties": {"flag": {"const": 1}},
+                "required": ["flag"],
+            },
+            "then": {"properties": {"t": True}},
+            "else": {"properties": {"e": True}},
+            "unevaluatedProperties": False,
+        }
+        then_error = self.error_for({"flag": 1, "t": 2, "extra": 3}, schema)
+        self.assertEqual(
+            then_error.evaluation_explanation,
+            {
+                "flag": ["if -> properties['flag']"],
+                "t": ["then -> properties['t']"],
+            },
+        )
+        else_error = self.error_for({"e": 2, "extra": 3}, schema)
+        self.assertEqual(
+            else_error.evaluation_explanation,
+            {"e": ["else -> properties['e']"]},
+        )
+
+    def test_explanation_uses_the_same_evaluation_pass(self):
+        calls = []
+
+        def counted(validator, value, instance, schema):
+            calls.append(instance)
+            return
+            yield  # pragma: no cover
+
+        Custom = validators.extend(
+            validators.Draft202012Validator,
+            {"x-counted": counted},
+        )
+        schema = {
+            "x-counted": True,
+            "properties": {"foo": True},
+            "unevaluatedProperties": False,
+        }
+        [error] = Custom(schema).iter_errors({"foo": 1, "bar": 2})
+        self.assertEqual(
+            error.evaluation_explanation,
+            {"foo": ["properties['foo']"]},
+        )
+        # collecting the explanation did not re-run the custom keyword
+        self.assertEqual(len(calls), 1)
+
+    def test_recursive_references_are_distinguished_by_instance_path(self):
+        schema = {
+            "$ref": "#/$defs/node",
+            "$defs": {
+                "node": {
+                    "type": "object",
+                    "properties": {
+                        "name": {"type": "string"},
+                        "child": {"$ref": "#/$defs/node"},
+                    },
+                    "unevaluatedProperties": False,
+                },
+            },
+        }
+        instance = {
+            "name": "root",
+            "junk_root": 1,
+            "child": {"name": "leaf", "junk_leaf": 2},
+        }
+        errors = list(
+            validators.Draft202012Validator(schema).iter_errors(instance),
+        )
+        self.assertEqual(len(errors), 2)
+        by_path = {tuple(error.absolute_path): error for error in errors}
+        self.assertEqual(set(by_path), {(), ("child",)})
+        self.assertEqual(
+            set(by_path[()].evaluation_explanation),
+            {"name", "child"},
+        )
+        self.assertEqual(
+            by_path[("child",)].evaluation_explanation,
+            {"name": ["properties['name']"]},
+        )
+
+    def test_draft2019_recursive_ref(self):
+        schema = {
+            "$id": "https://example.com/node",
+            "$recursiveAnchor": True,
+            "type": "object",
+            "properties": {
+                "name": {"type": "string"},
+                "child": {"$recursiveRef": "#"},
+            },
+            "unevaluatedProperties": False,
+        }
+        instance = {
+            "name": "root",
+            "junk_root": 1,
+            "child": {"name": "leaf", "junk_leaf": 2},
+        }
+        errors = list(
+            validators.Draft201909Validator(schema).iter_errors(instance),
+        )
+        self.assertEqual(len(errors), 2)
+        by_path = {tuple(error.absolute_path): error for error in errors}
+        self.assertEqual(set(by_path), {(), ("child",)})
+        self.assertEqual(
+            set(by_path[()].evaluation_explanation),
+            {"name", "child"},
+        )
+        self.assertEqual(
+            by_path[("child",)].evaluation_explanation,
+            {"name": ["properties['name']"]},
+        )
+
+    def test_other_errors_have_no_evaluation_explanation(self):
+        schema = {"required": ["foo"]}
+        [error] = validators.Draft202012Validator(schema).iter_errors({})
+        self.assertFalse(hasattr(error, "evaluation_explanation"))
+
+
 class TestValidationErrorDetails(TestCase):
     # TODO: These really need unit tests for each individual keyword, rather
     #       than just these higher level tests.

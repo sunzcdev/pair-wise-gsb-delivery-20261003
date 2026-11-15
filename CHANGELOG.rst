@@ -1,6 +1,9 @@
 v4.27.0
 =======
 
+* Errors produced by ``unevaluatedProperties`` now carry an optional ``evaluation_explanation`` attribute: a mapping of each already-evaluated property of the offending object to the keywords, references, or combinator branches which evaluated it.
+  The explanation is collected during the same evaluation pass which decided validity (so no keyword validators are re-run to produce it), only applicable branches contribute (e.g. failing ``anyOf`` subschemas contribute nothing), and recursive schemas produce one explanation per error, distinguished by the error's instance path.
+  Default error messages are unchanged.
 * Support for Python 3.10 and 3.11 has been dropped.
 * Improve ``best_match`` for ``anyOf`` / ``oneOf`` errors: the most relevant error is now found within each subschema separately before the deepest of those is picked (#1257, #1300).
   In particular an applicator with a single subschema now produces the same best match as the bare subschema would.

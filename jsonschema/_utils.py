@@ -321,13 +321,38 @@ def find_evaluated_item_indexes_by_schema(validator, instance, schema):
     return evaluated_indexes
 
 
-def find_evaluated_property_keys_by_schema(validator, instance, schema):
+def _note_evaluated_key(explanation, key, source):
+    """
+    Record why a property key was evaluated, if explanations are wanted.
+
+    The note is appended as ``source`` to ``explanation[key]``. It is
+    produced as a byproduct of the evaluation pass itself, so collecting
+    it never re-runs any (possibly side-effecting) keyword validators.
+    """
+    if explanation is not None:
+        explanation.setdefault(key, []).append(source)
+
+
+def find_evaluated_property_keys_by_schema(
+    validator,
+    instance,
+    schema,
+    explanation=None,
+    _prefix="",
+):
     """
     Get all keys of items that get evaluated under the current schema.
 
     Covers all keywords related to unevaluatedProperties: properties,
     additionalProperties, unevaluatedProperties, patternProperties,
     dependentSchemas, allOf, oneOf, anyOf, if, then, else
+
+    If ``explanation`` is a dict, it is populated, as part of this same
+    evaluation pass, with a mapping of each evaluated property key to
+    the list of sources (keywords, reference targets, or combinator
+    branches) which caused the key to be considered evaluated. Only
+    branches which actually apply to the instance contribute notes, so
+    e.g. failing ``anyOf`` subschemas leave no trace in the explanation.
     """
     if validator.is_type(schema, "boolean"):
         return []
@@ -344,6 +369,8 @@ def find_evaluated_property_keys_by_schema(validator, instance, schema):
                 ),
                 instance,
                 resolved.contents,
+                explanation=explanation,
+                _prefix=f"{_prefix}$ref[{ref!r}] -> ",
             ),
         )
 
@@ -358,27 +385,37 @@ def find_evaluated_property_keys_by_schema(validator, instance, schema):
                 ),
                 instance,
                 resolved.contents,
+                explanation=explanation,
+                _prefix=f"{_prefix}$dynamicRef[{dynamicRef!r}] -> ",
             ),
         )
 
     properties = schema.get("properties")
     if validator.is_type(properties, "object"):
-        evaluated_keys += properties.keys() & instance.keys()
+        for key in properties.keys() & instance.keys():
+            evaluated_keys.append(key)
+            _note_evaluated_key(
+                explanation, key, f"{_prefix}properties[{key!r}]",
+            )
 
     for keyword in ["additionalProperties", "unevaluatedProperties"]:
         if (subschema := schema.get(keyword)) is None:
             continue
-        evaluated_keys += (
-            key
-            for key, value in instance.items()
-            if is_valid(validator.descend(value, subschema))
-        )
+        for key, value in instance.items():
+            if is_valid(validator.descend(value, subschema)):
+                evaluated_keys.append(key)
+                _note_evaluated_key(explanation, key, f"{_prefix}{keyword}")
 
     if "patternProperties" in schema:
         for property in instance:
             for pattern in schema["patternProperties"]:
                 if re.search(pattern, property):
                     evaluated_keys.append(property)
+                    _note_evaluated_key(
+                        explanation,
+                        property,
+                        f"{_prefix}patternProperties[{pattern!r}]",
+                    )
 
     if "dependentSchemas" in schema:
         for property, subschema in schema["dependentSchemas"].items():
@@ -388,16 +425,20 @@ def find_evaluated_property_keys_by_schema(validator, instance, schema):
                 validator,
                 instance,
                 subschema,
+                explanation=explanation,
+                _prefix=f"{_prefix}dependentSchemas[{property!r}] -> ",
             )
 
     for keyword in ["allOf", "oneOf", "anyOf"]:
-        for subschema in schema.get(keyword, []):
+        for index, subschema in enumerate(schema.get(keyword, [])):
             if not is_valid(validator.descend(instance, subschema)):
                 continue
             evaluated_keys += find_evaluated_property_keys_by_schema(
                 validator,
                 instance,
                 subschema,
+                explanation=explanation,
+                _prefix=f"{_prefix}{keyword}[{index}] -> ",
             )
 
     if "if" in schema:
@@ -406,18 +447,24 @@ def find_evaluated_property_keys_by_schema(validator, instance, schema):
                 validator,
                 instance,
                 schema["if"],
+                explanation=explanation,
+                _prefix=f"{_prefix}if -> ",
             )
             if "then" in schema:
                 evaluated_keys += find_evaluated_property_keys_by_schema(
                     validator,
                     instance,
                     schema["then"],
+                    explanation=explanation,
+                    _prefix=f"{_prefix}then -> ",
                 )
         elif "else" in schema:
             evaluated_keys += find_evaluated_property_keys_by_schema(
                 validator,
                 instance,
                 schema["else"],
+                explanation=explanation,
+                _prefix=f"{_prefix}else -> ",
             )
 
     return evaluated_keys

@@ -412,10 +412,12 @@ def unevaluatedItems(validator, unevaluatedItems, instance, schema):
 def unevaluatedProperties(validator, unevaluatedProperties, instance, schema):
     if not validator.is_type(instance, "object"):
         return
+    explanation = {}
     evaluated_keys = find_evaluated_property_keys_by_schema(
         validator,
         instance,
         schema,
+        explanation=explanation,
     )
     unevaluated_keys = []
     for property in instance:
@@ -434,13 +436,22 @@ def unevaluatedProperties(validator, unevaluatedProperties, instance, schema):
         if unevaluatedProperties is False:
             error = "Unevaluated properties are not allowed (%s %s unexpected)"
             extras = sorted(unevaluated_keys, key=str)
-            yield ValidationError(error % extras_msg(extras))
+            validation_error = ValidationError(error % extras_msg(extras))
         else:
             error = (
                 "Unevaluated properties are not valid under "
                 "the given schema (%s %s unevaluated and invalid)"
             )
-            yield ValidationError(error % extras_msg(unevaluated_keys))
+            validation_error = ValidationError(
+                error % extras_msg(unevaluated_keys),
+            )
+        # Optionally consumable detail about why each *other* property
+        # of the instance was already evaluated, collected during the
+        # very same evaluation pass above (so no keyword was re-run to
+        # produce it). Keys of nested instances (e.g. under recursive
+        # references) are distinguished by each error's instance path.
+        validation_error.evaluation_explanation = explanation
+        yield validation_error
 
 
 def prefixItems(validator, prefixItems, instance, schema):

@@ -119,6 +119,33 @@ raised or returned, depending on which method or function is used.
         A validation error which this error is the `context` of.
         ``None`` if there wasn't one.
 
+    .. attribute:: evaluation_explanation
+
+        Present *only* on errors produced by the
+        :kw:`unevaluatedProperties` keyword.
+
+        A `dict` mapping each *evaluated* property of the offending
+        object to a list of human-readable descriptions of which
+        keywords caused it to be evaluated -- e.g.
+        ``"properties['foo']"``, ``"patternProperties['^x-']"``,
+        ``"allOf[0] -> properties['a']"`` or
+        ``"$ref['#/$defs/r'] -> properties['bar']"``. Only branches
+        which actually applied to the instance contribute entries, so
+        failing :kw:`anyOf` subschemas (or the inapplicable side of
+        :kw:`if` / :kw:`then` / :kw:`else`) leave no trace.
+
+        The explanation is collected during the same evaluation pass
+        which decided validity, so consulting it never re-runs any
+        (possibly side-effecting) keyword validators. When schemas are
+        recursive, each error carries the explanation for the object at
+        its own `absolute_path`, so properties of nested instances are
+        distinguished by the error's instance path.
+
+        The unevaluated properties themselves are not included; they
+        are already named in the error `message`. The default error
+        output is unaffected by this attribute -- it is simply
+        additional, optional context for programmatic consumers.
+
 
 In case an invalid schema itself is encountered, a `SchemaError` is
 raised.
