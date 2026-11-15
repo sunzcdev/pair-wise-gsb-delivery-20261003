@@ -271,6 +271,127 @@ class SmokeTest(IsolatedAsyncioTestCase):
             rows = await cursor.fetchall()
             self.assertEqual(rows, [(10,), (24,), (16,)])
 
+    async def test_cursor_arraysize_queue_order(self):
+        async with aiosqlite.connect(self.db) as db:
+            await db.execute(
+                "create table test_arraysize (i integer primary key asc)"
+            )
+            await db.executemany(
+                "insert into test_arraysize values (?)", [(i,) for i in range(10)]
+            )
+            await db.commit()
+
+            cursor = await db.execute("select i from test_arraysize order by i")
+
+            await cursor.set_arraysize(3)
+            self.assertEqual(await cursor.get_arraysize(), 3)
+            rows = await cursor.fetchmany()
+            self.assertEqual(rows, [(0,), (1,), (2,)])
+
+            # subsequent fetches must not reuse the previously cached size
+            await cursor.set_arraysize(4)
+            self.assertEqual(await cursor.get_arraysize(), 4)
+            rows = await cursor.fetchmany()
+            self.assertEqual(rows, [(3,), (4,), (5,), (6,)])
+
+            # an explicit size still overrides arraysize for that call only
+            rows = await cursor.fetchmany(1)
+            self.assertEqual(rows, [(7,)])
+            rows = await cursor.fetchmany()
+            self.assertEqual(rows, [(8,), (9,)])
+
+            await cursor.close()
+
+    async def test_cursor_config_invalid_not_partially_applied(self):
+        async with aiosqlite.connect(self.db) as db:
+            cursor = await db.execute("select 1")
+
+            await cursor.set_arraysize(5)
+            with self.assertRaises(TypeError):
+                await cursor.set_arraysize("lots")
+            with self.assertRaises(TypeError):
+                await cursor.set_arraysize(None)
+            # failed sets leave the previous value untouched
+            self.assertEqual(await cursor.get_arraysize(), 5)
+
+            self.assertIsNone(await cursor.get_row_factory())
+            with self.assertRaises(TypeError):
+                await cursor.set_row_factory(42)
+            self.assertIsNone(await cursor.get_row_factory())
+
+            await cursor.set_row_factory(aiosqlite.Row)
+            self.assertIs(await cursor.get_row_factory(), aiosqlite.Row)
+            await cursor.set_row_factory(None)
+            self.assertIsNone(await cursor.get_row_factory())
+
+            await cursor.close()
+
+    async def test_cursor_row_factory_queue_order(self):
+        async with aiosqlite.connect(self.db) as db:
+            await db.execute("create table test_factory_order (k integer, d text)")
+            await db.execute("insert into test_factory_order values (1, 'a'), (2, 'b')")
+            await db.commit()
+
+            cursor = await db.execute("select * from test_factory_order order by k")
+
+            # queue the fetch first, then the config change
+            fetch_task = asyncio.ensure_future(cursor.fetchone())
+            await asyncio.sleep(0)  # let the fetch reach the operation queue
+            await cursor.set_row_factory(aiosqlite.Row)
+
+            # the fetch queued first observes the config in effect at its
+            # position in the queue (the default tuple factory)
+            row = await fetch_task
+            self.assertIsInstance(row, tuple)
+            self.assertNotIsInstance(row, aiosqlite.Row)
+
+            # fetches queued after the setter observe the new factory
+            row = await cursor.fetchone()
+            self.assertIsInstance(row, aiosqlite.Row)
+            self.assertEqual(row["d"], "b")
+
+            await cursor.close()
+
+    async def test_cursor_config_two_tasks_set_read_close(self):
+        async with aiosqlite.connect(self.db) as db:
+            await db.execute("create table test_two_tasks (i integer)")
+            await db.executemany(
+                "insert into test_two_tasks values (?)", [(i,) for i in range(10)]
+            )
+            await db.commit()
+
+            cursor = await db.execute("select i from test_two_tasks order by i")
+            configured = asyncio.Event()
+            fetched = asyncio.Event()
+
+            async def setter():
+                await cursor.set_arraysize(2)
+                await cursor.set_row_factory(aiosqlite.Row)
+                configured.set()
+                await fetched.wait()
+                # close is queued after everything the fetcher scheduled
+                await cursor.close()
+                return "closed"
+
+            async def fetcher():
+                await configured.wait()
+                # snapshot reads observe everything the setter queued
+                self.assertEqual(await cursor.get_arraysize(), 2)
+                self.assertIs(await cursor.get_row_factory(), aiosqlite.Row)
+                rows = await cursor.fetchmany()
+                fetched.set()
+                return rows
+
+            rows, result = await asyncio.gather(fetcher(), setter())
+            self.assertEqual(result, "closed")
+            self.assertEqual(len(rows), 2)
+            self.assertIsInstance(rows[0], aiosqlite.Row)
+            self.assertEqual([row["i"] for row in rows], [0, 1])
+
+            # the cursor was closed by the setter task after the fetch
+            with self.assertRaises(sqlite3.ProgrammingError):
+                await cursor.fetchone()
+
     async def test_enable_load_extension(self):
         """Assert that after enabling extension loading, they can be loaded"""
         async with aiosqlite.connect(self.db) as db:
