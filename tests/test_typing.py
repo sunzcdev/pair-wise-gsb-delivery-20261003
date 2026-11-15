@@ -55,6 +55,26 @@ def something_with_reader() -> None:
     iter_dict: Iterable[Dict[str, Any]] = reader.iter(type=dict)
     iter_optional_str: Iterable[Optional[str]] = reader.iter(type=str, allow_none=True)
 
+    def observe(rejected: jsonlines.RejectedLine) -> None:
+        lineno: int = rejected.lineno
+        reason: jsonlines.RejectionReason = rejected.reason
+        preview: str = rejected.preview
+        locals()  # Silence flake8 F841
+
+    report = jsonlines.RejectionReport()
+    iter_observed: Iterable[int] = reader.iter(
+        type=int,
+        skip_invalid=True,
+        on_reject=observe,
+        max_rejects=10,
+        max_consecutive_rejects=3,
+    )
+    iter_report: Iterable[str] = reader.iter(
+        type=str,
+        on_reject=report,
+    )
+    some_report: Optional[jsonlines.RejectionReport] = reader.rejection_report
+
     locals()  # Silence flake8 F841
 
 

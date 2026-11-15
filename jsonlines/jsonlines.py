@@ -58,6 +58,34 @@ SKIPPABLE_SINGLE_INITIAL_CHARS = (
     codecs.BOM_UTF8.decode(),
 )
 
+# Maximum number of characters of the raw line that are included in the
+# ``preview`` of a RejectedLine. Keeping the preview bounded means observing
+# rejected lines never requires holding arbitrarily large lines in memory.
+REJECTION_PREVIEW_LIMIT = 200
+
+
+class RejectionReason(str, enum.Enum):
+    """
+    Reason why a line was rejected by the reader.
+
+    Instances are attached to :py:class:`RejectedLine` objects passed to
+    rejection observers, and used as keys in
+    :py:attr:`RejectionReport.counts`. Values are plain strings, so they
+    can be logged or serialized to JSON directly.
+    """
+
+    #: the line is not valid UTF-8
+    DECODE = "decode"
+
+    #: the line does not contain valid JSON
+    SYNTAX = "syntax"
+
+    #: the decoded value does not match the requested type
+    TYPE = "type"
+
+    #: the line contains a JSON null value, which is not allowed
+    NULL = "null"
+
 
 class DumpsResultConversion(enum.Enum):
     LeaveAsIs = enum.auto()
@@ -110,6 +138,22 @@ class Error(Exception):
     message: str
 
 
+def _make_line_preview(line: Union[str, bytes]) -> str:
+    """
+    Make a bounded, human readable preview of a raw line.
+    """
+    if isinstance(line, bytes):
+        # Undecodable bytes must not prevent rejection observation, so
+        # replace them instead of raising another exception.
+        text = line.decode("utf-8", errors="backslashreplace")
+    else:
+        text = line
+    text = text.rstrip()
+    if len(text) > REJECTION_PREVIEW_LIMIT:
+        return text[:REJECTION_PREVIEW_LIMIT] + "…"
+    return text
+
+
 @attr.s(auto_exc=True, auto_attribs=True, init=False)
 class InvalidLineError(Error, ValueError):
     """
@@ -120,7 +164,10 @@ class InvalidLineError(Error, ValueError):
     different data type.
 
     The original line itself is stored on the exception instance as the
-    ``.line`` attribute, and the line number as ``.lineno``.
+    ``.line`` attribute, and the line number as ``.lineno``. The
+    ``.reason`` attribute contains a :py:class:`RejectionReason` value
+    (or ``None`` for errors not raised by line decoding), and
+    ``.preview`` contains a truncated version of the original line.
 
     This class subclasses both ``jsonlines.Error`` and the built-in
     ``ValueError``.
@@ -132,10 +179,128 @@ class InvalidLineError(Error, ValueError):
     #: The line number
     lineno: int
 
-    def __init__(self, message: str, line: Union[str, bytes], lineno: int) -> None:
+    #: The reason the line was rejected, if known
+    reason: Optional[RejectionReason] = None
+
+    def __init__(
+        self,
+        message: str,
+        line: Union[str, bytes],
+        lineno: int,
+        reason: Optional[RejectionReason] = None,
+    ) -> None:
         self.line = line.rstrip()
         self.lineno = lineno
+        self.reason = reason
         super().__init__(f"{message} (line {lineno})")
+
+    @property
+    def preview(self) -> str:
+        """
+        Truncated preview of the original line.
+        """
+        return _make_line_preview(self.line)
+
+
+@attr.s(auto_attribs=True, frozen=True)
+class RejectedLine:
+    """
+    Description of a single line that was rejected during iteration.
+
+    Instances are passed to the ``on_reject`` callback of
+    :py:meth:`Reader.iter()`.
+
+    The payload is deliberately small and bounded: :py:attr:`preview`
+    is a truncated version of the raw line (at most
+    :py:data:`REJECTION_PREVIEW_LIMIT` characters plus an ellipsis), so
+    observers never receive whole lines and cannot accidentally retain
+    unbounded memory per rejected line.
+    """
+
+    #: Line number, starting at 1
+    lineno: int
+
+    #: Why the line was rejected
+    reason: RejectionReason
+
+    #: Truncated preview of the raw line
+    preview: str
+
+
+@attr.s(auto_attribs=True)
+class RejectionReport:
+    """
+    Counters for rejected lines observed during iteration.
+
+    A report is created for every call to :py:meth:`Reader.iter()` and
+    available as :py:attr:`Reader.rejection_report` afterwards. Since
+    instances are callable, one can also pass an externally created
+    report directly as the ``on_reject`` callback::
+
+        report = jsonlines.RejectionReport()
+        for obj in reader.iter(skip_invalid=True, on_reject=report):
+            ...
+
+    Only aggregate counts are kept; rejected lines themselves are not
+    stored, so memory use does not grow with the number of rejections.
+    """
+
+    #: Number of rejected lines per reason
+    counts: Dict[RejectionReason, int] = attr.ib(factory=dict)
+
+    #: Total number of rejected lines
+    total: int = 0
+
+    #: Current number of consecutive rejected lines
+    consecutive: int = 0
+
+    #: Longest run of consecutive rejected lines seen so far
+    max_consecutive: int = 0
+
+    #: Configured absolute rejection limit, if any
+    max_rejects: Optional[int] = None
+
+    #: Configured consecutive rejection limit, if any
+    max_consecutive_rejects: Optional[int] = None
+
+    #: Whether iteration ended before reaching the end of the input
+    incomplete: bool = False
+
+    #: Why iteration ended early: ``"max_rejects"``,
+    #: ``"max_consecutive_rejects"``, or ``"observer_error"``
+    stop_reason: Optional[str] = None
+
+    def __call__(self, rejected: RejectedLine) -> None:
+        self.record(rejected)
+
+    def record(self, rejected: RejectedLine) -> None:
+        """
+        Record a single rejected line.
+        """
+        self.total += 1
+        self.counts[rejected.reason] = self.counts.get(rejected.reason, 0) + 1
+        self.consecutive += 1
+        if self.consecutive > self.max_consecutive:
+            self.max_consecutive = self.consecutive
+
+    def accepted(self) -> None:
+        """
+        Record that a valid line was read.
+        """
+        self.consecutive = 0
+
+    def count(self, reason: RejectionReason) -> int:
+        """
+        Number of rejections for a single reason.
+        """
+        return self.counts.get(reason, 0)
+
+    def mark_incomplete(self, stop_reason: str) -> None:
+        """
+        Mark the iteration as incomplete.
+        """
+        self.incomplete = True
+        self.stop_reason = stop_reason
 
 
 @attr.s(auto_attribs=True, repr=False)
@@ -210,6 +375,10 @@ class Reader(ReaderWriterBase):
     ]
     _line_iter: Iterator[Tuple[int, Union[bytes, str]]] = attr.ib(init=False)
     _loads: LoadsCallable = attr.ib(default=default_loads, kw_only=True)
+    _rejection_report: Optional[RejectionReport] = attr.ib(default=None, init=False)
+    # Set only when read() itself detected the end of the input, so that
+    # an EOFError raised by the underlying source is not mistaken for it.
+    _input_exhausted: bool = attr.ib(default=False, init=False)
 
     def __attrs_post_init__(self) -> None:
         if isinstance(self._file_or_iterable, io.IOBase):
@@ -219,6 +388,17 @@ class Reader(ReaderWriterBase):
             )
 
         self._line_iter = enumerate(self._file_or_iterable, 1)
+
+    @property
+    def rejection_report(self) -> Optional[RejectionReport]:
+        """
+        Report for the most recent :py:meth:`iter` call, if any.
+
+        This is ``None`` before :py:meth:`iter` has been called. Every
+        :py:meth:`iter` call creates a fresh report; rejected lines
+        themselves are not retained, only counts.
+        """
+        return self._rejection_report
 
     # No type specified, None not allowed
     @overload
@@ -297,6 +477,9 @@ class Reader(ReaderWriterBase):
 
         If `skip_empty` is set to ``True``, empty lines and lines
         containing only whitespace are silently skipped.
+
+        The resulting :py:exc:`InvalidLineError` has its ``.reason``
+        attribute set to the corresponding :py:class:`RejectionReason`.
         """
         if self._closed:
             raise RuntimeError("reader is closed")
@@ -308,6 +491,7 @@ class Reader(ReaderWriterBase):
             while skip_empty and not line.rstrip():
                 lineno, line = next(self._line_iter)
         except StopIteration:
+            self._input_exhausted = True
             raise EOFError from None
 
         if isinstance(line, bytes):
@@ -315,7 +499,10 @@ class Reader(ReaderWriterBase):
                 line = line.decode("utf-8")
             except UnicodeDecodeError as orig_exc:
                 exc = InvalidLineError(
-                    f"line is not valid utf-8: {orig_exc}", line, lineno
+                    f"line is not valid utf-8: {orig_exc}",
+                    line,
+                    lineno,
+                    RejectionReason.DECODE,
                 )
                 raise exc from orig_exc
 
@@ -326,14 +513,19 @@ class Reader(ReaderWriterBase):
             value: JSONValue = self._loads(line)
         except ValueError as orig_exc:
             exc = InvalidLineError(
-                f"line contains invalid json: {orig_exc}", line, lineno
+                f"line contains invalid json: {orig_exc}",
+                line,
+                lineno,
+                RejectionReason.SYNTAX,
             )
             raise exc from orig_exc
 
         if value is None:
             if allow_none:
                 return None
-            raise InvalidLineError("line contains null value", line, lineno)
+            raise InvalidLineError(
+                "line contains null value", line, lineno, RejectionReason.NULL
+            )
 
         if type is not None:
             valid = isinstance(value, type)
@@ -342,7 +534,10 @@ class Reader(ReaderWriterBase):
                 valid = False
             if not valid:
                 raise InvalidLineError(
-                    "line does not match requested type", line, lineno
+                    "line does not match requested type",
+                    line,
+                    lineno,
+                    RejectionReason.TYPE,
                 )
 
         return value
@@ -356,6 +551,9 @@ class Reader(ReaderWriterBase):
         allow_none: Literal[False] = ...,
         skip_empty: bool = ...,
         skip_invalid: bool = ...,
+        on_reject: Optional[Callable[[RejectedLine], Any]] = ...,
+        max_rejects: Optional[int] = ...,
+        max_consecutive_rejects: Optional[int] = ...,
     ) -> Iterator[JSONValue]:
         ...  # pragma: no cover
 
@@ -368,6 +566,9 @@ class Reader(ReaderWriterBase):
         allow_none: Literal[True],
         skip_empty: bool = ...,
         skip_invalid: bool = ...,
+        on_reject: Optional[Callable[[RejectedLine], Any]] = ...,
+        max_rejects: Optional[int] = ...,
+        max_consecutive_rejects: Optional[int] = ...,
     ) -> Iterator[JSONValue]:
         ...  # pragma: no cover
 
@@ -380,6 +581,9 @@ class Reader(ReaderWriterBase):
         allow_none: Literal[False] = ...,
         skip_empty: bool = ...,
         skip_invalid: bool = ...,
+        on_reject: Optional[Callable[[RejectedLine], Any]] = ...,
+        max_rejects: Optional[int] = ...,
+        max_consecutive_rejects: Optional[int] = ...,
     ) -> Iterator[TJSONValue]:
         ...  # pragma: no cover
 
@@ -392,6 +596,9 @@ class Reader(ReaderWriterBase):
         allow_none: Literal[True],
         skip_empty: bool = ...,
         skip_invalid: bool = ...,
+        on_reject: Optional[Callable[[RejectedLine], Any]] = ...,
+        max_rejects: Optional[int] = ...,
+        max_consecutive_rejects: Optional[int] = ...,
     ) -> Iterator[Optional[TJSONValue]]:
         ...  # pragma: no cover
 
@@ -404,6 +611,9 @@ class Reader(ReaderWriterBase):
         allow_none: bool = ...,
         skip_empty: bool = ...,
         skip_invalid: bool = ...,
+        on_reject: Optional[Callable[[RejectedLine], Any]] = ...,
+        max_rejects: Optional[int] = ...,
+        max_consecutive_rejects: Optional[int] = ...,
     ) -> Iterator[Optional[TJSONValue]]:
         ...  # pragma: no cover
 
@@ -413,6 +623,10 @@ class Reader(ReaderWriterBase):
         allow_none: bool = False,
         skip_empty: bool = False,
         skip_invalid: bool = False,
+        *,
+        on_reject: Optional[Callable[[RejectedLine], Any]] = None,
+        max_rejects: Optional[int] = None,
+        max_consecutive_rejects: Optional[int] = None,
     ) -> Iterator[Optional[JSONValue]]:
         """
         Iterate over all lines.
@@ -423,22 +637,109 @@ class Reader(ReaderWriterBase):
         instance.
 
         When `skip_invalid` is set to ``True``, invalid lines will be
-        silently ignored.
+        silently ignored, except that they are reported through the
+        optional `on_reject` callback (see below). Rejected lines are
+        always counted in the :py:attr:`rejection_report`.
+
+        The `on_reject` argument registers an observer that is called
+        with a :py:class:`RejectedLine` for every rejected line. This
+        does not change the skipping behaviour: lines are still skipped
+        only when `skip_invalid` is true. When `skip_invalid` is false
+        and `on_reject` is given, the observer is called and the
+        :py:exc:`InvalidLineError` is re-raised afterwards. A
+        :py:class:`RejectionReport` instance can be passed directly,
+        since reports are callable. If the observer raises, iteration
+        stops and the observer’s exception propagates unchanged; the
+        report is marked incomplete with ``stop_reason ==
+        "observer_error"``. Exceptions raised while reading from the
+        underlying source are never swallowed.
+
+        The `max_rejects` (absolute) and `max_consecutive_rejects`
+        (consecutive) arguments limit the number of rejected lines.
+        When a limit is exceeded, iteration stops and the report is
+        marked incomplete (``stop_reason`` is ``"max_rejects"`` or
+        ``"max_consecutive_rejects"``). Limits apply to rejections
+        while skipping; they are irrelevant when `skip_invalid` is
+        false.
 
         See :py:meth:`~Reader.read()` for a description of the other
         arguments.
         """
-        try:
-            while True:
-                try:
-                    yield self.read(
-                        type=type, allow_none=allow_none, skip_empty=skip_empty
-                    )
-                except InvalidLineError:
-                    if not skip_invalid:
+        if max_rejects is not None and max_rejects < 0:
+            raise ValueError("max_rejects must be non-negative")
+        if max_consecutive_rejects is not None and max_consecutive_rejects < 0:
+            raise ValueError("max_consecutive_rejects must be non-negative")
+
+        report = RejectionReport(
+            max_rejects=max_rejects,
+            max_consecutive_rejects=max_consecutive_rejects,
+        )
+        self._rejection_report = report
+
+        return self._iter_lines(
+            type=type,
+            allow_none=allow_none,
+            skip_empty=skip_empty,
+            skip_invalid=skip_invalid,
+            on_reject=on_reject,
+            report=report,
+        )
+
+    def _iter_lines(
+        self,
+        *,
+        type: Optional[Type[Any]],
+        allow_none: bool,
+        skip_empty: bool,
+        skip_invalid: bool,
+        on_reject: Optional[Callable[[RejectedLine], Any]],
+        report: RejectionReport,
+    ) -> Iterator[Optional[JSONValue]]:
+        while True:
+            try:
+                value = self.read(
+                    type=type, allow_none=allow_none, skip_empty=skip_empty
+                )
+            except EOFError:
+                if self._input_exhausted:
+                    # Genuine end of input; nothing was rejected.
+                    return
+                # An EOFError from the source or from a custom loads()
+                # callable is not the end of the input; propagate it.
+                raise
+            except InvalidLineError as exc:
+                rejected = RejectedLine(
+                    lineno=exc.lineno,
+                    reason=exc.reason or RejectionReason.SYNTAX,
+                    preview=exc.preview,
+                )
+                report.record(rejected)
+                if on_reject is not None:
+                    try:
+                        on_reject(rejected)
+                    except BaseException:
+                        # The observer failed: stop iterating and let the
+                        # observer's exception propagate unchanged. This
+                        # deliberately also applies to exceptions that
+                        # iteration itself treats as control flow (e.g.
+                        # EOFError), so a failing observer is never
+                        # mistaken for the end of the input.
+                        report.mark_incomplete("observer_error")
                         raise
-        except EOFError:
-            pass
+                if not skip_invalid:
+                    raise
+                if report.max_rejects is not None and report.total > report.max_rejects:
+                    report.mark_incomplete("max_rejects")
+                    return
+                if (
+                    report.max_consecutive_rejects is not None
+                    and report.consecutive > report.max_consecutive_rejects
+                ):
+                    report.mark_incomplete("max_consecutive_rejects")
+                    return
+            else:
+                report.accepted()
+                yield value
 
     def __iter__(self) -> Iterator[Any]:
         """

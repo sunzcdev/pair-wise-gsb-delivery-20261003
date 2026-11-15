@@ -49,6 +49,9 @@ Features
     :py:meth:`~jsonlines.Reader.iter()` method
   * can validate data types, including `None` checks
   * can skip invalid lines during iteration
+  * can report rejected lines to an observer, with the rejection
+    reason, line number, and a truncated preview
+  * can enforce limits on the number (and run) of rejected lines
   * provides decent error messages
   * can be used as a context manager
   * allows complete control over decoding using a custom ``loads``
@@ -123,6 +126,44 @@ calling :py:meth:`Reader.iter()` instead::
   for obj in reader.iter(type=dict, skip_invalid=True):
       ...
 
+Rejected lines
+--------------
+
+With ``skip_invalid=True`` the caller only sees the good records. To
+observe what is being skipped, pass an observer via ``on_reject``; it
+is called with a :py:class:`RejectedLine` for every rejected line::
+
+  def report_rejection(rejected):
+      print(rejected.lineno, rejected.reason, rejected.preview)
+
+  for obj in reader.iter(skip_invalid=True, on_reject=report_rejection):
+      ...
+
+Each rejection carries the line number, a :py:class:`RejectionReason`
+(``DECODE``, ``SYNTAX``, ``TYPE``, or ``NULL``), and a truncated preview
+of the raw line (at most
+``jsonlines.jsonlines.REJECTION_PREVIEW_LIMIT`` characters). The
+observer does not change the skipping behaviour: it is purely
+observational. If the observer raises, iteration stops and that
+exception propagates unchanged (the report is marked incomplete); errors
+raised by the underlying source are never swallowed.
+
+Counters are available through :py:attr:`Reader.rejection_report` after
+iteration, or by passing a :py:class:`RejectionReport` directly as the
+observer (reports are callable)::
+
+  report = jsonlines.RejectionReport()
+  for obj in reader.iter(skip_invalid=True, on_reject=report):
+      ...
+
+  print(report.total, report.counts)
+
+To avoid consuming an endless stream of garbage, pass ``max_rejects``
+(absolute limit) and/or ``max_consecutive_rejects`` (limit on a
+consecutive run). When a limit is exceeded, iteration stops and the
+report is marked ``incomplete`` with a ``stop_reason``. Only counters
+are kept; rejected lines are never buffered in memory.
+
 A :py:class:`Writer` wraps a file-like object, and can write a single
 object, or multiple objects at once::
 
@@ -175,6 +216,15 @@ API
    :members:
 
 .. autoclass:: jsonlines.InvalidLineError
+   :members:
+
+.. autoclass:: jsonlines.RejectedLine
+   :members:
+
+.. autoclass:: jsonlines.RejectionReason
+   :members:
+
+.. autoclass:: jsonlines.RejectionReport
    :members:
 
 
