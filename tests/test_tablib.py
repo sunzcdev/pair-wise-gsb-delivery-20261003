@@ -1552,6 +1552,68 @@ class XLSXTests(BaseTestCase):
         new_data = tablib.Databook().load(_xlsx, 'xlsx')
         self.assertEqual(new_data.sheets()[0].title, 'bad name -------qwertyuiopasdfg')
 
+    def test_xlsx_export_book_unique_sheet_titles(self):
+        """Colliding sheet titles are disambiguated deterministically."""
+        from tablib.formats._xlsx import unique_xlsx_sheet_titles
+
+        titles = unique_xlsx_sheet_titles([
+            'Data', 'data', 'Data (2)', 'DATA', None, 'Sheet4', None,
+            'a' * 40, 'a' * 31 + ' (2)', 'a' * 40,
+        ])
+        self.assertEqual(titles, [
+            'Data', 'data (2)', 'Data (2) (2)', 'DATA (3)',
+            'Sheet4', 'Sheet4 (2)', 'Sheet6',
+            'a' * 31, 'a' * 27 + ' (2)', 'a' * 27 + ' (3)',
+        ])
+        # deterministic: same input order yields the same output
+        self.assertEqual(titles, unique_xlsx_sheet_titles([
+            'Data', 'data', 'Data (2)', 'DATA', None, 'Sheet4', None,
+            'a' * 40, 'a' * 31 + ' (2)', 'a' * 40,
+        ]))
+        self.assertTrue(all(len(t) <= 31 for t in titles))
+
+    def test_xlsx_export_book_title_collisions(self):
+        """Databook export produces unique sheet names and a title map."""
+        book = tablib.Databook()
+        for title in ('Sales/Q1', 'Sales:Q1', 'sales-q1', None, None):
+            book.add_sheet(tablib.Dataset(title=title))
+        content, title_map = book.export('xlsx', return_title_map=True)
+
+        wb = load_workbook(filename=BytesIO(content))
+        self.assertEqual(
+            wb.sheetnames,
+            ['Sales-Q1', 'Sales-Q1 (2)', 'sales-q1 (3)', 'Sheet3', 'Sheet4'],
+        )
+        self.assertEqual(title_map, [
+            ('Sales/Q1', 'Sales-Q1'),
+            ('Sales:Q1', 'Sales-Q1 (2)'),
+            ('sales-q1', 'sales-q1 (3)'),
+            (None, 'Sheet3'),
+            (None, 'Sheet4'),
+        ])
+        # the caller's datasets are not modified by the export
+        self.assertEqual(
+            [dset.title for dset in book.sheets()],
+            ['Sales/Q1', 'Sales:Q1', 'sales-q1', None, None],
+        )
+
+    def test_xlsx_import_book_title_map(self):
+        """The export title map restores original titles on import."""
+        book = tablib.Databook()
+        for title in ('Sales/Q1', 'Sales:Q1', None):
+            dset = tablib.Dataset(title=title)
+            dset.headers = ('col',)
+            dset.append(('x',))
+            book.add_sheet(dset)
+        content, title_map = book.export('xlsx', return_title_map=True)
+
+        new_book = tablib.Databook().load(content, 'xlsx', title_map=title_map)
+        self.assertEqual(
+            [dset.title for dset in new_book.sheets()],
+            ['Sales/Q1', 'Sales:Q1', None],
+        )
+        self.assertEqual(new_book.sheets()[0][0], ('x',))
+
     def test_xlsx_import_book_ragged(self):
         """Import XLSX file through databook when not all rows have the same length."""
         xlsx_source = Path(__file__).parent / 'files' / 'ragged.xlsx'

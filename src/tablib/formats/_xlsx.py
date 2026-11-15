@@ -23,9 +23,45 @@ import tablib
 
 INVALID_TITLE_REGEX = re.compile(r'[\\*?:/\[\]]')
 
+MAX_SHEET_TITLE_LENGTH = 31
+
 
 def safe_xlsx_sheet_title(s, replace="-"):
-    return re.sub(INVALID_TITLE_REGEX, replace, s)[:31]
+    return re.sub(INVALID_TITLE_REGEX, replace, s)[:MAX_SHEET_TITLE_LENGTH]
+
+
+def unique_xlsx_sheet_titles(titles, invalid_char_subst="-"):
+    """Return valid, unique XLSX sheet titles for the given titles.
+
+    Each title is sanitized with :func:`safe_xlsx_sheet_title` (invalid
+    characters replaced, truncated to 31 characters). Empty titles fall back
+    to ``Sheet{i}`` where ``i`` is the zero-based position of the sheet.
+
+    Uniqueness is enforced case-insensitively across the whole workbook,
+    because Excel treats sheet names case-insensitively. Colliding titles
+    receive a `` (n)`` suffix (starting at 2), with the base truncated so the
+    result stays within 31 characters. The suffix number is incremented until
+    the candidate is unique, so titles which already end with such a suffix
+    cannot collide either.
+
+    The function is deterministic: the same sequence of input titles always
+    yields the same output titles.
+    """
+    used = set()
+    result = []
+    for i, title in enumerate(titles):
+        base = safe_xlsx_sheet_title(title, invalid_char_subst) if title else ''
+        if not base:
+            base = f'Sheet{i}'
+        candidate = base
+        n = 2
+        while candidate.casefold() in used:
+            suffix = f' ({n})'
+            candidate = base[:MAX_SHEET_TITLE_LENGTH - len(suffix)] + suffix
+            n += 1
+        used.add(candidate.casefold())
+        result.append(candidate)
+    return result
 
 
 class XLSXFormat:
@@ -84,20 +120,35 @@ class XLSXFormat:
 
     @classmethod
     def export_book(cls, databook, freeze_panes=True, invalid_char_subst="-",
-                    escape=False, column_width=None):
+                    escape=False, column_width=None, sheet_namer=None,
+                    return_title_map=False):
         """Returns XLSX representation of DataBook.
         See export_set().
-        """
 
+        Sheet titles are made valid and unique across the whole workbook by
+        ``sheet_namer``, a callable receiving the list of dataset titles and
+        ``invalid_char_subst`` and returning the actual sheet titles in the
+        same order. It defaults to :func:`unique_xlsx_sheet_titles`, which
+        disambiguates deterministically. The caller's ``Dataset.title``
+        attributes are never modified.
+
+        If ``return_title_map`` is True, returns a ``(content, title_map)``
+        tuple where ``title_map`` is a list of ``(original_title,
+        actual_title)`` tuples in sheet order. The same mapping can be passed
+        to ``import_book(..., title_map=...)`` to restore the original
+        titles.
+        """
+        if sheet_namer is None:
+            sheet_namer = unique_xlsx_sheet_titles
+        titles = sheet_namer(
+            [dset.title for dset in databook._datasets], invalid_char_subst
+        )
         wb = Workbook()
         for sheet in wb.worksheets:
             wb.remove(sheet)
-        for i, dset in enumerate(databook._datasets):
+        for title, dset in zip(titles, databook._datasets):
             ws = wb.create_sheet()
-            ws.title = (
-                safe_xlsx_sheet_title(dset.title, invalid_char_subst)
-                if dset.title else f"Sheet{i}"
-            )
+            ws.title = title
 
             cls.dset_sheet(dset, ws, freeze_panes=freeze_panes, escape=escape)
 
@@ -105,7 +156,14 @@ class XLSXFormat:
 
         stream = BytesIO()
         wb.save(stream)
-        return stream.getvalue()
+        content = stream.getvalue()
+        if return_title_map:
+            title_map = [
+                (dset.title, title)
+                for dset, title in zip(databook._datasets, titles)
+            ]
+            return content, title_map
+        return content
 
     @classmethod
     def import_sheet(cls, dset, sheet, headers=True, skip_lines=0):
@@ -135,16 +193,26 @@ class XLSXFormat:
         cls.import_sheet(dset, sheet, headers, skip_lines)
 
     @classmethod
-    def import_book(cls, dbook, in_stream, headers=True, read_only=True):
-        """Returns databook from XLS stream."""
+    def import_book(cls, dbook, in_stream, headers=True, read_only=True,
+                    title_map=None):
+        """Returns databook from XLS stream.
+
+        If ``title_map`` is given (a positional ``(original_title,
+        actual_title)`` mapping as returned by ``export_book(...,
+        return_title_map=True)``), the original dataset titles are restored
+        by position instead of keeping the disambiguated sheet names stored
+        in the file.
+        """
 
         dbook.wipe()
 
         xls_book = load_workbook(in_stream, read_only=read_only, data_only=True)
 
-        for sheet in xls_book.worksheets:
+        for i, sheet in enumerate(xls_book.worksheets):
             dset = tablib.Dataset()
             cls.import_sheet(dset, sheet, headers)
+            if title_map is not None and i < len(title_map):
+                dset.title = title_map[i][0]
             dbook.add_sheet(dset)
 
     @classmethod

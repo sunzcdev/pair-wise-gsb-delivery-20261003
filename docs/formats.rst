@@ -266,6 +266,20 @@ This works with ``Databook`` as well::
 
 The adaptive width will be calculated for each sheet in the databook.
 
+When exporting a ``Databook``, sheet titles are sanitized (invalid characters
+replaced, truncated to 31 characters) and made unique across the whole
+workbook in a deterministic way: colliding titles receive a `` (n)`` suffix,
+and titles are compared case-insensitively because Excel folds case. The
+naming strategy can be overridden with the ``sheet_namer`` parameter of
+``export_book()``. Pass ``return_title_map=True`` to get a
+``(content, title_map)`` tuple, where ``title_map`` maps each original
+dataset title to the actual sheet title, in sheet order. The same mapping
+can be handed back to ``import_book()`` to restore the original titles::
+
+    book = tablib.Databook()
+    content, title_map = book.export('xlsx', return_title_map=True)
+    restored = tablib.Databook().load(content, 'xlsx', title_map=title_map)
+
 .. versionchanged:: 3.8.0
     The ``column_width`` parameter for ``export_set()`` was added.
 
