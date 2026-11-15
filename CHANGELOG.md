@@ -14,6 +14,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 * Expose `FunctionAuth` from the public API. (#3699)
 
+### Fixed
+
+* `WSGITransport` now supports applications that defer `start_response` until the first iteration, delivers `write()` output interleaved with the returned iterable in order, and closes the application iterable on exhaustion, early client close, and iteration errors.
+
 ## 0.28.1 (6th December, 2024)
 
 * Fix SSL case where `verify=False` together with client side certificates.

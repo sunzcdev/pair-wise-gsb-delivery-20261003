@@ -1,7 +1,7 @@
 from __future__ import annotations
 
+import collections
 import io
-import itertools
 import sys
 import typing
 
@@ -13,32 +13,92 @@ if typing.TYPE_CHECKING:
     from _typeshed import OptExcInfo  # pragma: no cover
     from _typeshed.wsgi import WSGIApplication  # pragma: no cover
 
-_T = typing.TypeVar("_T")
-
 
 __all__ = ["WSGITransport"]
 
 
-def _skip_leading_empty_chunks(body: typing.Iterable[_T]) -> typing.Iterable[_T]:
-    body = iter(body)
-    for chunk in body:
-        if chunk:
-            return itertools.chain([chunk], body)
-    return []
-
-
 class WSGIByteStream(SyncByteStream):
-    def __init__(self, result: typing.Iterable[bytes]) -> None:
+    """
+    A byte stream wrapping the iterable returned by a WSGI application.
+
+    This supports applications that defer calling `start_response` until
+    the first iteration, and applications that mix `write()` calls with a
+    returned iterable, delivering output in the order the application
+    produced it. The application iterable is closed once it is exhausted,
+    if the client closes the response early, or if iteration fails.
+    """
+
+    def __init__(
+        self,
+        result: typing.Iterable[bytes],
+        write_buffer: collections.deque[bytes],
+    ) -> None:
         self._close = getattr(result, "close", None)
-        self._result = _skip_leading_empty_chunks(result)
+        self._app_iter = iter(result)
+        self._write_buffer = write_buffer
+        self._pending: collections.deque[bytes] = collections.deque()
+        self._exhausted = False
+
+    def _drain_writes(self) -> None:
+        while self._write_buffer:
+            self._pending.append(self._write_buffer.popleft())
+
+    def pull(self) -> bool:
+        """
+        Advance the application iterable by one step, queueing any output
+        in the order the application produced it.
+
+        Returns `False` once the application iterable is exhausted.
+        """
+        if self._exhausted:
+            return False
+        try:
+            chunk = next(self._app_iter)
+        except StopIteration:
+            self._exhausted = True
+            self._drain_writes()
+            self.close()
+            return False
+        except BaseException:
+            self._exhausted = True
+            self._close_suppressing_errors()
+            raise
+        # Anything the application passed to `write()` before yielding
+        # this chunk must be delivered first.
+        self._drain_writes()
+        self._pending.append(chunk)
+        return True
 
     def __iter__(self) -> typing.Iterator[bytes]:
-        for part in self._result:
-            yield part
+        try:
+            while True:
+                while self._pending:
+                    chunk = self._pending.popleft()
+                    if chunk:
+                        yield chunk
+                # Note that `pull()` may queue trailing `write()` output
+                # when the application iterable is exhausted, so the
+                # queued chunks are checked again before finishing.
+                if not self.pull() and not self._pending:
+                    break
+        except BaseException:
+            # Either the application iterable raised, or the client
+            # stopped reading the response early. Make sure the application
+            # iterable is closed, without letting a failing `close()`
+            # mask an exception that is already in flight.
+            self._close_suppressing_errors()
+            raise
 
     def close(self) -> None:
-        if self._close is not None:
-            self._close()
+        close, self._close = self._close, None
+        if close is not None:
+            close()
+
+    def _close_suppressing_errors(self) -> None:
+        try:
+            self.close()
+        except Exception:
+            pass
 
 
 class WSGITransport(BaseTransport):
@@ -119,6 +179,7 @@ class WSGITransport(BaseTransport):
         seen_status = None
         seen_response_headers = None
         seen_exc_info = None
+        write_buffer: collections.deque[bytes] = collections.deque()
 
         def start_response(
             status: str,
@@ -129,15 +190,25 @@ class WSGITransport(BaseTransport):
             seen_status = status
             seen_response_headers = response_headers
             seen_exc_info = exc_info
-            return lambda _: None
+            return write_buffer.append
 
         result = self.app(environ, start_response)
+        stream = WSGIByteStream(result, write_buffer)
 
-        stream = WSGIByteStream(result)
+        # WSGI applications may defer calling `start_response` until the
+        # first iteration. Pull from the application until the response
+        # headers are available, buffering any body chunks produced along
+        # the way for later delivery.
+        while seen_status is None and stream.pull():
+            pass
 
         assert seen_status is not None
         assert seen_response_headers is not None
         if seen_exc_info and seen_exc_info[0] and self.raise_app_exceptions:
+            try:
+                stream.close()
+            except Exception:
+                pass  # Don't let a failing `close()` mask the app exception.
             raise seen_exc_info[1]
 
         status_code = int(seen_status.split()[0])

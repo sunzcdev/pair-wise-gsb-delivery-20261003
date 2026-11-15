@@ -201,3 +201,223 @@ def test_wsgi_server_protocol():
     assert response.status_code == 200
     assert response.text == "success"
     assert server_protocol == "HTTP/1.1"
+
+
+def test_wsgi_deferred_start_response():
+    """
+    Applications may defer calling `start_response` until the first
+    iteration. The response headers are picked up, and the application
+    iterable is closed once it is exhausted.
+    """
+    events: list[str] = []
+
+    def app(environ, start_response):
+        events.append("started")
+        try:
+            start_response("200 OK", [("Content-Type", "text/plain")])
+            events.append("responded")
+            yield b"Hello, "
+            events.append("yielded")
+            yield b"World!"
+        finally:
+            events.append("closed")
+
+    transport = httpx.WSGITransport(app=app)
+    client = httpx.Client(transport=transport)
+    response = client.get("http://www.example.org/")
+    assert response.status_code == 200
+    assert response.text == "Hello, World!"
+    assert events == ["started", "responded", "yielded", "closed"]
+
+
+def test_wsgi_close_called_once_on_exhaustion():
+    events: list[str] = []
+
+    class Body:
+        def __iter__(self):
+            events.append("iterated")
+            yield b"Hello, World!"
+
+        def close(self):
+            events.append("closed")
+
+    def app(environ, start_response):
+        start_response("200 OK", [("Content-Type", "text/plain")])
+        return Body()
+
+    transport = httpx.WSGITransport(app=app)
+    with httpx.Client(transport=transport) as client:
+        response = client.get("http://www.example.org/")
+        assert response.text == "Hello, World!"
+    assert events == ["iterated", "closed"]
+
+
+def test_wsgi_close_on_client_disconnect():
+    """
+    Closing the response before it is fully read closes the
+    application iterable.
+    """
+    events: list[str] = []
+
+    def app(environ, start_response):
+        start_response("200 OK", [("Content-Type", "text/plain")])
+        try:
+            yield b"chunk-1"
+            yield b"chunk-2"
+            yield b"chunk-3"
+        finally:
+            events.append("closed")
+
+    transport = httpx.WSGITransport(app=app)
+    with httpx.Client(transport=transport) as client:
+        with client.stream("GET", "http://www.example.org/") as response:
+            assert next(response.iter_bytes()) == b"chunk-1"
+    assert events == ["closed"]
+
+
+def test_wsgi_close_on_iteration_error():
+    """
+    An exception raised while iterating the application still closes
+    the application iterable, and propagates to the client.
+    """
+    events: list[str] = []
+
+    class Body:
+        def __iter__(self):
+            events.append("iterated")
+            yield b"partial"
+            raise ValueError("iteration failed")
+
+        def close(self):
+            events.append("closed")
+
+    def app(environ, start_response):
+        start_response("200 OK", [("Content-Type", "text/plain")])
+        return Body()
+
+    transport = httpx.WSGITransport(app=app)
+    client = httpx.Client(transport=transport)
+    with pytest.raises(ValueError, match="iteration failed"):
+        client.get("http://www.example.org/")
+    assert events == ["iterated", "closed"]
+
+
+def test_wsgi_close_error_does_not_mask_iteration_error():
+    """
+    A failing `close()` must not hide an exception raised while
+    iterating the application.
+    """
+
+    class Body:
+        def __iter__(self):
+            yield b"partial"
+            raise ValueError("iteration failed")
+
+        def close(self):
+            raise RuntimeError("close failed")
+
+    def app(environ, start_response):
+        start_response("200 OK", [("Content-Type", "text/plain")])
+        return Body()
+
+    transport = httpx.WSGITransport(app=app)
+    client = httpx.Client(transport=transport)
+    with pytest.raises(ValueError, match="iteration failed"):
+        client.get("http://www.example.org/")
+
+
+def test_wsgi_write_callable():
+    """
+    Output passed to the `write()` callable is delivered in the order
+    the application produced it, interleaved with the returned iterable.
+    """
+    events: list[str] = []
+
+    def app(environ, start_response):
+        write = start_response("200 OK", [("Content-Type", "text/plain")])
+        events.append("responded")
+        write(b"1")
+        yield b"2"
+        write(b"3")
+        yield b"4"
+        write(b"5")
+
+    transport = httpx.WSGITransport(app=app)
+    client = httpx.Client(transport=transport)
+    response = client.get("http://www.example.org/")
+    assert response.status_code == 200
+    assert response.text == "12345"
+    assert events == ["responded"]
+
+
+def test_wsgi_write_callable_with_eager_start_response():
+    def app(environ, start_response):
+        write = start_response("200 OK", [("Content-Type", "text/plain")])
+        write(b"Hello, ")
+        return [b"World!"]
+
+    transport = httpx.WSGITransport(app=app)
+    client = httpx.Client(transport=transport)
+    response = client.get("http://www.example.org/")
+    assert response.status_code == 200
+    assert response.text == "Hello, World!"
+
+
+def test_wsgi_head_request_runs_app_cleanup():
+    """
+    HEAD responses have no body, but the application is still run to
+    completion and its iterable is closed.
+    """
+    events: list[str] = []
+
+    def app(environ, start_response):
+        events.append("started")
+        try:
+            start_response(
+                "200 OK",
+                [("Content-Type", "text/plain"), ("Content-Length", "13")],
+            )
+            events.append("responded")
+            if environ["REQUEST_METHOD"] != "HEAD":
+                yield b"Hello, World!"
+        finally:
+            events.append("closed")
+
+    transport = httpx.WSGITransport(app=app)
+    client = httpx.Client(transport=transport)
+    response = client.head("http://www.example.org/")
+    assert response.status_code == 200
+    assert response.content == b""
+    assert events == ["started", "responded", "closed"]
+
+
+def test_wsgi_exc_info_closes_iterable():
+    """
+    An application reporting an error through `exc_info` still has its
+    returned iterable closed when the exception is re-raised.
+    """
+    events: list[str] = []
+
+    class Body:
+        def __iter__(self):
+            return iter([b"Nope!"])
+
+        def close(self):
+            events.append("closed")
+
+    def app(environ, start_response):
+        try:
+            raise ValueError("application failed")
+        except ValueError:
+            start_response(
+                "500 Server Error",
+                [("Content-Type", "text/plain")],
+                sys.exc_info(),
+            )
+        return Body()
+
+    transport = httpx.WSGITransport(app=app)
+    client = httpx.Client(transport=transport)
+    with pytest.raises(ValueError, match="application failed"):
+        client.get("http://www.example.org/")
+    assert events == ["closed"]
