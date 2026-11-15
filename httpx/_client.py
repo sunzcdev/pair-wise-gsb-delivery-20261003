@@ -6,6 +6,7 @@ import logging
 import time
 import typing
 import warnings
+from collections.abc import Mapping as ABCMapping
 from contextlib import asynccontextmanager, contextmanager
 from types import TracebackType
 
@@ -51,7 +52,7 @@ from ._utils import URLPattern, get_environment_proxies
 if typing.TYPE_CHECKING:
     import ssl  # pragma: no cover
 
-__all__ = ["USE_CLIENT_DEFAULT", "AsyncClient", "Client"]
+__all__ = ["USE_CLIENT_DEFAULT", "AsyncClient", "Client", "Mount"]
 
 # The type annotation for @classmethod and context managers here follows PEP 484
 # https://www.python.org/dev/peps/pep-0484/#annotating-instance-and-class-methods
@@ -112,6 +113,77 @@ class UseClientDefault:
 
 
 USE_CLIENT_DEFAULT = UseClientDefault()
+
+
+class Mount:
+    """
+    A mount entry, pairing a transport instance with the URL pattern it should
+    handle, along with an explicit declaration of who owns the transport.
+
+    A mount may also be provided as a bare `{pattern: transport}` mapping
+    entry. In both cases the transport is, by default, owned by the client and
+    is closed when the client closes. Wrapping the transport in
+    `Mount(..., owner=False)` declares that the transport is *borrowed*,
+    meaning the client will use it but will leave its lifetime under the
+    caller's control.
+
+    **Parameters:**
+
+    * **pattern** - A URL pattern, such as `"https://"`, `"all://example.org"`,
+    or `"all://"`.
+    * **transport** - The transport instance that should handle requests whose
+    URL matches the pattern. May be `None`, in which case the client's main
+    transport is used for matching requests.
+    * **owner** - Set to `False` to mark the transport as *borrowed*, so the
+    client does not close it. Defaults to `True`, meaning the client owns the
+    transport and is responsible for closing it.
+    """
+
+    def __init__(
+        self,
+        pattern: str,
+        transport: BaseTransport | AsyncBaseTransport | None,
+        owner: bool = True,
+    ) -> None:
+        self.pattern = pattern
+        self.transport = transport
+        self.owner = owner
+
+
+# A mapping of `{pattern: transport}` keeps the historical API, where every
+# provided transport is owned and closed by the client. To mark an individual
+# mount as borrowed use a sequence of `Mount(..., owner=False)` entries instead.
+MountsTypes = typing.Union[
+    typing.Mapping[str, typing.Union[BaseTransport, AsyncBaseTransport, None]],
+    typing.Sequence[Mount],
+]
+
+
+def _normalize_mounts(
+    mounts: MountsTypes | None,
+) -> list[Mount]:
+    """
+    Normalize the different accepted `mounts` representations into a list of
+    explicit `Mount` entries.
+    """
+    if mounts is None:
+        return []
+
+    if isinstance(mounts, ABCMapping):
+        return [
+            Mount(pattern=key, transport=transport, owner=True)
+            for key, transport in mounts.items()
+        ]
+
+    normalized: list[Mount] = []
+    for mount in mounts:
+        if not isinstance(mount, Mount):
+            raise TypeError(
+                "Mount entries must be 'httpx.Mount' instances, with a URL "
+                f"pattern, a transport, and an 'owner' flag. Got {mount!r}."
+            )
+        normalized.append(mount)
+    return normalized
 
 
 logger = logging.getLogger("httpx")
@@ -219,6 +291,87 @@ class BaseClient:
         self._trust_env = trust_env
         self._default_encoding = default_encoding
         self._state = ClientState.UNOPENED
+
+        # Identity set of transports whose lifetime is owned by this client.
+        # Only transports recorded here are closed (or entered/exited as
+        # context managers) by the client. Borrowed transports are managed by
+        # their caller and are deliberately absent from this set.
+        # Identity (rather than equality/hashing) is used so that recording the
+        # same object more than once, or under several mounts, still results in
+        # it being closed at most once.
+        self._owned_transport_ids: set[int] = set()
+
+    def _owns_transport(self, transport: typing.Any) -> bool:
+        return id(transport) in self._owned_transport_ids
+
+    def _register_owned_transport(self, transport: typing.Any) -> None:
+        self._owned_transport_ids.add(id(transport))
+
+    def _iter_owned_transports(
+        self, transport: typing.Any, mounts: typing.Mapping[typing.Any, typing.Any]
+    ) -> typing.Iterator[typing.Any]:
+        seen: set[int] = set()
+        candidates = [transport, *mounts.values()]
+        for candidate in candidates:
+            if candidate is None or id(candidate) in seen:
+                continue
+            seen.add(id(candidate))
+            if self._owns_transport(candidate):
+                yield candidate
+
+    def _close_owned_transports(
+        self, transport: typing.Any, mounts: typing.Mapping[typing.Any, typing.Any]
+    ) -> None:
+        for owned in self._iter_owned_transports(transport, mounts):
+            owned.close()
+
+    async def _aclose_owned_transports(
+        self,
+        transport: typing.Any,
+        mounts: typing.Mapping[typing.Any, typing.Any],
+    ) -> None:
+        for owned in self._iter_owned_transports(transport, mounts):
+            await owned.aclose()
+
+    def _aclose_owned_transports_sync(
+        self, transport: typing.Any, mounts: typing.Mapping[typing.Any, typing.Any]
+    ) -> None:
+        """
+        Release asynchronous transports owned by this client while unwinding a
+        failed construction, which happens outside of `aclose()`/`__aexit__`.
+
+        Construction always fails before any request is sent, so the owned
+        transports have not had a chance to open loop-bound connections. We
+        therefore close any transport that exposes a synchronous `close()`
+        directly, and drive the remaining `aclose()` coroutines on a dedicated
+        thread with a fresh event loop. This works whether or not the caller
+        is itself running inside an event loop.
+        """
+        owned_transports = list(self._iter_owned_transports(transport, mounts))
+        if not owned_transports:
+            return
+
+        async_only: list[AsyncBaseTransport] = []
+        for owned in owned_transports:
+            sync_close = getattr(owned, "close", None)
+            if callable(sync_close):
+                sync_close()
+            else:
+                async_only.append(owned)
+
+        if not async_only:
+            return
+
+        import asyncio
+        import concurrent.futures
+
+        async def _close_all() -> None:
+            for owned in async_only:
+                await owned.aclose()
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+            future = executor.submit(asyncio.run, _close_all())
+            future.result()
 
     @property
     def is_closed(self) -> bool:
@@ -629,6 +782,13 @@ class Client(BaseClient):
     request URLs.
     * **transport** - *(optional)* A transport class to use for sending requests
     over the network.
+    * **mounts** - *(optional)* A mapping of URL patterns to transports, or a
+    sequence of `httpx.Mount` entries declaring per-mount ownership.
+    * **owner** - *(optional)* When a `transport` instance is passed explicitly,
+    the client takes ownership and closes it by default, matching the historical
+    behaviour. Set `owner=False` to mark the transport as *borrowed* instead,
+    leaving its lifetime under the caller's control so the same transport can be
+    shared safely between several clients.
     * **trust_env** - *(optional)* Enables or disables usage of environment
     variables for configuration.
     * **default_encoding** - *(optional)* The default encoding to use for decoding
@@ -649,7 +809,7 @@ class Client(BaseClient):
         http1: bool = True,
         http2: bool = False,
         proxy: ProxyTypes | None = None,
-        mounts: None | (typing.Mapping[str, BaseTransport | None]) = None,
+        mounts: MountsTypes | None = None,
         timeout: TimeoutTypes = DEFAULT_TIMEOUT_CONFIG,
         follow_redirects: bool = False,
         limits: Limits = DEFAULT_LIMITS,
@@ -657,6 +817,7 @@ class Client(BaseClient):
         event_hooks: None | (typing.Mapping[str, list[EventHook]]) = None,
         base_url: URL | str = "",
         transport: BaseTransport | None = None,
+        owner: bool = True,
         default_encoding: str | typing.Callable[[bytes], str] = "utf-8",
     ) -> None:
         super().__init__(
@@ -685,35 +846,58 @@ class Client(BaseClient):
         allow_env_proxies = trust_env and transport is None
         proxy_map = self._get_proxy_map(proxy, allow_env_proxies)
 
-        self._transport = self._init_transport(
-            verify=verify,
-            cert=cert,
-            trust_env=trust_env,
-            http1=http1,
-            http2=http2,
-            limits=limits,
-            transport=transport,
-        )
-        self._mounts: dict[URLPattern, BaseTransport | None] = {
-            URLPattern(key): None
-            if proxy is None
-            else self._init_proxy_transport(
-                proxy,
+        try:
+            self._transport = self._init_transport(
                 verify=verify,
                 cert=cert,
                 trust_env=trust_env,
                 http1=http1,
                 http2=http2,
                 limits=limits,
+                transport=transport,
             )
-            for key, proxy in proxy_map.items()
-        }
-        if mounts is not None:
-            self._mounts.update(
-                {URLPattern(key): transport for key, transport in mounts.items()}
-            )
+            # A transport we instantiate ourselves is always owned by the
+            # client. A caller-provided transport is owned by default, unless
+            # it has been explicitly marked as borrowed via `owner=False`.
+            if transport is None or owner:
+                self._register_owned_transport(self._transport)
 
-        self._mounts = dict(sorted(self._mounts.items()))
+            self._mounts: dict[URLPattern, BaseTransport | None] = {
+                URLPattern(key): None
+                if proxy is None
+                else self._init_proxy_transport(
+                    proxy,
+                    verify=verify,
+                    cert=cert,
+                    trust_env=trust_env,
+                    http1=http1,
+                    http2=http2,
+                    limits=limits,
+                )
+                for key, proxy in proxy_map.items()
+            }
+            # Proxy transports are created by the client and are therefore
+            # always owned by it.
+            for mounted in self._mounts.values():
+                if mounted is not None:
+                    self._register_owned_transport(mounted)
+
+            for mount in _normalize_mounts(mounts):
+                mounted_transport = mount.transport
+                self._mounts[URLPattern(mount.pattern)] = mounted_transport
+                if mount.owner and mounted_transport is not None:
+                    self._register_owned_transport(mounted_transport)
+
+            self._mounts = dict(sorted(self._mounts.items()))
+        except BaseException:
+            # If construction fails partway through, release any transport that
+            # has already been registered as owned by this client. Borrowed
+            # transports are left untouched, since their lifetime is managed by
+            # the caller.
+            self._close_owned_transports(
+                getattr(self, "_transport", None), self._mounts
+            )
+            raise
 
     def _init_transport(
         self,
@@ -1263,14 +1447,16 @@ class Client(BaseClient):
     def close(self) -> None:
         """
         Close transport and proxies.
+
+        Only transports owned by this client are closed. Borrowed transports
+        are left open, since their lifetime is managed by the caller. A given
+        transport object is closed at most once, even if it is referenced by
+        both the main transport and one or more mounts.
         """
         if self._state != ClientState.CLOSED:
             self._state = ClientState.CLOSED
 
-            self._transport.close()
-            for transport in self._mounts.values():
-                if transport is not None:
-                    transport.close()
+            self._close_owned_transports(self._transport, self._mounts)
 
     def __enter__(self: T) -> T:
         if self._state != ClientState.UNOPENED:
@@ -1284,10 +1470,16 @@ class Client(BaseClient):
 
         self._state = ClientState.OPENED
 
-        self._transport.__enter__()
-        for transport in self._mounts.values():
-            if transport is not None:
+        try:
+            for transport in self._iter_owned_transports(
+                self._transport, self._mounts
+            ):
                 transport.__enter__()
+        except BaseException:
+            # Entering one of the transports failed. Tear down any transport
+            # this client owns, while leaving borrowed transports untouched.
+            self._close_owned_transports(self._transport, self._mounts)
+            raise
         return self
 
     def __exit__(
@@ -1298,10 +1490,8 @@ class Client(BaseClient):
     ) -> None:
         self._state = ClientState.CLOSED
 
-        self._transport.__exit__(exc_type, exc_value, traceback)
-        for transport in self._mounts.values():
-            if transport is not None:
-                transport.__exit__(exc_type, exc_value, traceback)
+        for transport in self._iter_owned_transports(self._transport, self._mounts):
+            transport.__exit__(exc_type, exc_value, traceback)
 
 
 class AsyncClient(BaseClient):
@@ -1343,6 +1533,13 @@ class AsyncClient(BaseClient):
     request URLs.
     * **transport** - *(optional)* A transport class to use for sending requests
     over the network.
+    * **mounts** - *(optional)* A mapping of URL patterns to transports, or a
+    sequence of `httpx.Mount` entries declaring per-mount ownership.
+    * **owner** - *(optional)* When a `transport` instance is passed explicitly,
+    the client takes ownership and closes it by default, matching the historical
+    behaviour. Set `owner=False` to mark the transport as *borrowed* instead,
+    leaving its lifetime under the caller's control so the same transport can be
+    shared safely between several clients.
     * **trust_env** - *(optional)* Enables or disables usage of environment
     variables for configuration.
     * **default_encoding** - *(optional)* The default encoding to use for decoding
@@ -1362,7 +1559,7 @@ class AsyncClient(BaseClient):
         http1: bool = True,
         http2: bool = False,
         proxy: ProxyTypes | None = None,
-        mounts: None | (typing.Mapping[str, AsyncBaseTransport | None]) = None,
+        mounts: MountsTypes | None = None,
         timeout: TimeoutTypes = DEFAULT_TIMEOUT_CONFIG,
         follow_redirects: bool = False,
         limits: Limits = DEFAULT_LIMITS,
@@ -1370,6 +1567,7 @@ class AsyncClient(BaseClient):
         event_hooks: None | (typing.Mapping[str, list[EventHook]]) = None,
         base_url: URL | str = "",
         transport: AsyncBaseTransport | None = None,
+        owner: bool = True,
         trust_env: bool = True,
         default_encoding: str | typing.Callable[[bytes], str] = "utf-8",
     ) -> None:
@@ -1399,35 +1597,61 @@ class AsyncClient(BaseClient):
         allow_env_proxies = trust_env and transport is None
         proxy_map = self._get_proxy_map(proxy, allow_env_proxies)
 
-        self._transport = self._init_transport(
-            verify=verify,
-            cert=cert,
-            trust_env=trust_env,
-            http1=http1,
-            http2=http2,
-            limits=limits,
-            transport=transport,
-        )
-
-        self._mounts: dict[URLPattern, AsyncBaseTransport | None] = {
-            URLPattern(key): None
-            if proxy is None
-            else self._init_proxy_transport(
-                proxy,
+        try:
+            self._transport = self._init_transport(
                 verify=verify,
                 cert=cert,
                 trust_env=trust_env,
                 http1=http1,
                 http2=http2,
                 limits=limits,
+                transport=transport,
             )
-            for key, proxy in proxy_map.items()
-        }
-        if mounts is not None:
-            self._mounts.update(
-                {URLPattern(key): transport for key, transport in mounts.items()}
+            # A transport we instantiate ourselves is always owned by the
+            # client. A caller-provided transport is owned by default, unless
+            # it has been explicitly marked as borrowed via `owner=False`.
+            if transport is None or owner:
+                self._register_owned_transport(self._transport)
+
+            self._mounts: dict[URLPattern, AsyncBaseTransport | None] = {
+                URLPattern(key): None
+                if proxy is None
+                else self._init_proxy_transport(
+                    proxy,
+                    verify=verify,
+                    cert=cert,
+                    trust_env=trust_env,
+                    http1=http1,
+                    http2=http2,
+                    limits=limits,
+                )
+                for key, proxy in proxy_map.items()
+            }
+            # Proxy transports are created by the client and are therefore
+            # always owned by it.
+            for mounted in self._mounts.values():
+                if mounted is not None:
+                    self._register_owned_transport(mounted)
+
+            for mount in _normalize_mounts(mounts):
+                mounted_transport = mount.transport
+                self._mounts[URLPattern(mount.pattern)] = mounted_transport
+                if mount.owner and mounted_transport is not None:
+                    self._register_owned_transport(mounted_transport)
+
+            self._mounts = dict(sorted(self._mounts.items()))
+        except BaseException:
+            # If construction fails partway through, release any transport that
+            # has already been registered as owned by this client. Borrowed
+            # transports are left untouched, since their lifetime is managed by
+            # the caller.
+            #
+            # Construction happens before any request is sent, so there is no
+            # event loop to drive the asynchronous cleanup with yet.
+            self._aclose_owned_transports_sync(
+                getattr(self, "_transport", None), self._mounts
             )
-        self._mounts = dict(sorted(self._mounts.items()))
+            raise
 
     def _init_transport(
         self,
@@ -1978,14 +2202,16 @@ class AsyncClient(BaseClient):
     async def aclose(self) -> None:
         """
         Close transport and proxies.
+
+        Only transports owned by this client are closed. Borrowed transports
+        are left open, since their lifetime is managed by the caller. A given
+        transport object is closed at most once, even if it is referenced by
+        both the main transport and one or more mounts.
         """
         if self._state != ClientState.CLOSED:
             self._state = ClientState.CLOSED
 
-            await self._transport.aclose()
-            for proxy in self._mounts.values():
-                if proxy is not None:
-                    await proxy.aclose()
+            await self._aclose_owned_transports(self._transport, self._mounts)
 
     async def __aenter__(self: U) -> U:
         if self._state != ClientState.UNOPENED:
@@ -1999,10 +2225,16 @@ class AsyncClient(BaseClient):
 
         self._state = ClientState.OPENED
 
-        await self._transport.__aenter__()
-        for proxy in self._mounts.values():
-            if proxy is not None:
-                await proxy.__aenter__()
+        try:
+            for transport in self._iter_owned_transports(
+                self._transport, self._mounts
+            ):
+                await transport.__aenter__()
+        except BaseException:
+            # Entering one of the transports failed. Tear down any transport
+            # this client owns, while leaving borrowed transports untouched.
+            await self._aclose_owned_transports(self._transport, self._mounts)
+            raise
         return self
 
     async def __aexit__(
@@ -2013,7 +2245,5 @@ class AsyncClient(BaseClient):
     ) -> None:
         self._state = ClientState.CLOSED
 
-        await self._transport.__aexit__(exc_type, exc_value, traceback)
-        for proxy in self._mounts.values():
-            if proxy is not None:
-                await proxy.__aexit__(exc_type, exc_value, traceback)
+        for transport in self._iter_owned_transports(self._transport, self._mounts):
+            await transport.__aexit__(exc_type, exc_value, traceback)

@@ -13,6 +13,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 ### Added
 
 * Expose `FunctionAuth` from the public API. (#3699)
+* Add explicit transport ownership to `Client` and `AsyncClient`. A transport
+  passed via `transport=` or `mounts=` is owned and closed by the client by
+  default; pass `owner=False` (or wrap a mount in `httpx.Mount(..., owner=False)`)
+  to borrow it instead, so a shared transport is no longer closed by one client
+  out from under the others. Ownership is tracked by identity, so the same
+  object attached to several routes is closed at most once, and transports owned
+  by the client are also cleaned up if construction or context entry fails.
 
 ## 0.28.1 (6th December, 2024)
 

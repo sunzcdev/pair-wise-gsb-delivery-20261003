@@ -331,6 +331,61 @@ mounts = {"file://": FileSystemTransport()}
 client = httpx.Client(mounts=mounts)
 ```
 
+### Transport ownership and borrowing
+
+By default a client *owns* the transports it uses. When you pass a transport
+instance to `Client(transport=...)` or supply mounts, the client will enter
+them when it opens and close them again when it closes. This keeps the
+historical behaviour where the client manages the transport's lifetime:
+
+```python
+transport = httpx.HTTPTransport()
+client = httpx.Client(transport=transport)
+client.close()
+# `transport` has been closed by the client.
+```
+
+That becomes problematic when the *same* transport object is shared between
+several clients, because the first client to close would tear it down
+underneath the others. To share a transport safely, mark it as **borrowed**
+with `owner=False`. A borrowed transport is still used for requests, but the
+client never enters or closes it — its lifetime stays entirely under the
+caller's control:
+
+```python
+shared = httpx.HTTPTransport()
+
+first = httpx.Client(transport=shared, owner=False)
+second = httpx.Client(transport=shared, owner=False)
+first.close()
+second.close()
+# `shared` is still open; the caller is responsible for closing it.
+shared.close()
+```
+
+The same distinction can be made per mount. The mapping form keeps the
+default ownership, while `httpx.Mount` lets you declare an individual mount
+as borrowed:
+
+```python
+client = httpx.Client(
+    mounts=[
+        # Owned: closed together with the client.
+        httpx.Mount("https://", httpx.HTTPTransport()),
+        # Borrowed: left open when the client closes.
+        httpx.Mount("all://example.org", shared_transport, owner=False),
+    ]
+)
+```
+
+Ownership is tracked by object identity. A transport object that is attached
+both as the main transport and as one or more mounts is therefore closed at
+most once. If construction (or entering the client context) fails partway
+through, only the transports the client had already taken ownership of are
+cleaned up; borrowed transports are left untouched. The availability of a
+borrowed transport remains the caller's responsibility — no global reference
+counting is performed.
+
 ### Routing
 
 HTTPX provides a powerful mechanism for routing requests, allowing you to write complex rules that specify which transport should be used for each request.

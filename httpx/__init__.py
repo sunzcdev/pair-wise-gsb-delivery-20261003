@@ -62,6 +62,7 @@ __all__ = [
     "LocalProtocolError",
     "main",
     "MockTransport",
+    "Mount",
     "NetRCAuth",
     "NetworkError",
     "options",
