@@ -92,6 +92,16 @@ def unquote(value: str) -> str:
     return value[1:-1] if value[0] == value[-1] == '"' else value
 
 
+# CIDR mount keys, such as "all://10.0.0.0/8", "all://10.0.0.0/8:8080",
+# "all://[fd00::/8]" or "all://[fd00::/8]:8080".
+CIDR_PATTERN = re.compile(
+    r"^(?P<scheme>[a-zA-Z][a-zA-Z0-9+.\-]*://)"
+    r"(?:\[(?P<ipv6>[^\]/]+)/(?P<ipv6_prefix>\d+)\]"
+    r"|(?P<ipv4>[0-9.]+)/(?P<ipv4_prefix>\d+))"
+    r"(?::(?P<port>\d+))?$"
+)
+
+
 def peek_filelike_length(stream: typing.Any) -> int | None:
     """
     Given a file-like stream object, return its length in number of bytes
@@ -157,6 +167,22 @@ class URLPattern:
     True
     >>> pattern.matches(httpx.URL("https://example.com"))
     False
+
+    # With CIDR matching, against literal IP addresses in the URL...
+    >>> pattern = URLPattern("all://10.0.0.0/8")
+    >>> pattern.matches(httpx.URL("http://10.1.2.3"))
+    True
+    >>> pattern.matches(httpx.URL("http://11.0.0.1"))
+    False
+
+    # Hostnames are never resolved to decide routing...
+    >>> pattern.matches(httpx.URL("http://example.com"))
+    False
+
+    # IPv6 CIDR matching...
+    >>> pattern = URLPattern("all://[fd00::/8]")
+    >>> pattern.matches(httpx.URL("http://[fd00::1]:8080"))
+    True
     """
 
     def __init__(self, pattern: str) -> None:
@@ -169,8 +195,30 @@ class URLPattern:
                 f'Instead of "{pattern}", use "{pattern}://"'
             )
 
-        url = URL(pattern)
         self.pattern = pattern
+        self.cidr: ipaddress.IPv4Network | ipaddress.IPv6Network | None = None
+
+        cidr_match = CIDR_PATTERN.match(pattern)
+        if cidr_match is not None:
+            # CIDR patterns, such as "all://10.0.0.0/8" or "all://[fd00::/8]".
+            # These match against literal IP addresses in request URLs,
+            # and never trigger DNS resolution.
+            address = cidr_match["ipv4"] or cidr_match["ipv6"]
+            prefix = cidr_match["ipv4_prefix"] or cidr_match["ipv6_prefix"]
+            try:
+                self.cidr = ipaddress.ip_network(f"{address}/{prefix}")
+            except ValueError:
+                raise ValueError(
+                    f"Invalid CIDR network in proxy key: {pattern!r}"
+                ) from None
+            scheme = cidr_match["scheme"][:-3]
+            self.scheme = "" if scheme == "all" else scheme
+            self.host = ""
+            self.host_regex = None
+            self.port = self._normalize_port(cidr_match["port"])
+            return
+
+        url = URL(pattern)
         self.scheme = "" if url.scheme == "all" else url.scheme
         self.host = "" if url.host == "*" else url.host
         self.port = url.port
@@ -189,10 +237,35 @@ class URLPattern:
             domain = re.escape(url.host)
             self.host_regex = re.compile(f"^{domain}$")
 
+    def _normalize_port(self, port: str | None) -> int | None:
+        # Mirror the URL normalization of default ports, so that
+        # port-qualified CIDR patterns compare against the URL's
+        # real origin. For example "http://10.0.0.0/8:80" is
+        # equivalent to "http://10.0.0.0/8".
+        if port is None:
+            return None
+        port_as_int = int(port)
+        default_port = {"ftp": 21, "http": 80, "https": 443, "ws": 80, "wss": 443}.get(
+            self.scheme
+        )
+        if port_as_int == default_port:
+            return None
+        return port_as_int
+
     def matches(self, other: URL) -> bool:
         if self.scheme and self.scheme != other.scheme:
             return False
-        if (
+        if self.cidr is not None:
+            # CIDR patterns only match literal IP addresses in the URL.
+            # Hostnames are not assumed to belong to any network, and
+            # are never resolved to decide routing.
+            try:
+                ip = ipaddress.ip_address(other.host)
+            except ValueError:
+                return False
+            if ip not in self.cidr:
+                return False
+        elif (
             self.host
             and self.host_regex is not None
             and not self.host_regex.match(other.host)
@@ -210,8 +283,12 @@ class URLPattern:
         """
         # URLs with a port should take priority over URLs without a port.
         port_priority = 0 if self.port is not None else 1
-        # Longer hostnames should match first.
-        host_priority = -len(self.host)
+        if self.cidr is not None:
+            # More specific networks (longer prefixes) should match first.
+            host_priority = -self.cidr.prefixlen
+        else:
+            # Longer hostnames should match first.
+            host_priority = -len(self.host)
         # Longer schemes should match first.
         scheme_priority = -len(self.scheme)
         return (port_priority, host_priority, scheme_priority)

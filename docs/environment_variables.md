@@ -36,13 +36,13 @@ python -c "import httpx; httpx.get('http://example.com', trust_env=False)"
 
 ### `NO_PROXY`
 
-Valid values: a comma-separated list of hostnames/urls
+Valid values: a comma-separated list of hostnames/urls, which may include IPv4 or IPv6 CIDR networks such as `192.168.0.0/16` or `fd00::/8`
 
 `NO_PROXY` disables the proxy for specific urls
 
 ```bash
 export HTTP_PROXY=http://my-external-proxy.com:1234
-export NO_PROXY=http://127.0.0.1,python-httpx.org
+export NO_PROXY=http://127.0.0.1,python-httpx.org,192.168.0.0/16
 
 # As in the previous example, this request will be sent through the proxy
 python -c "import httpx; httpx.get('http://example.com')"
@@ -50,7 +50,10 @@ python -c "import httpx; httpx.get('http://example.com')"
 # These requests will be sent directly, bypassing the proxy
 python -c "import httpx; httpx.get('http://127.0.0.1:5000/my-api')"
 python -c "import httpx; httpx.get('https://www.python-httpx.org')"
+python -c "import httpx; httpx.get('http://192.168.1.10/my-api')"
 ```
+
+CIDR entries in `NO_PROXY` only match literal IP addresses in the request URL. Hostnames are never resolved to decide routing.
 
 ## `SSL_CERT_FILE`
 

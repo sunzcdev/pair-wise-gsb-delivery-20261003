@@ -13,6 +13,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 ### Added
 
 * Expose `FunctionAuth` from the public API. (#3699)
+* Support IPv4/IPv6 CIDR networks in proxy mount keys and `NO_PROXY`, allowing literal IP ranges such as `all://10.0.0.0/8` or `all://[fd00::/8]` to bypass proxies without any DNS resolution.
 
 ## 0.28.1 (6th December, 2024)
 

@@ -127,11 +127,49 @@ def test_get_environment_proxies(environment, proxies):
         ("http://", "https://example.com", False),
         ("all://", "https://example.com:123", True),
         ("", "https://example.com:123", True),
+        # CIDR patterns match literal IP addresses in the URL...
+        ("all://10.0.0.0/8", "http://10.1.2.3", True),
+        ("all://10.0.0.0/8", "http://10.1.2.3:8080", True),
+        ("all://10.0.0.0/8", "https://10.0.0.1", True),
+        ("all://10.0.0.0/8", "http://11.0.0.1", False),
+        ("http://10.0.0.0/8", "https://10.1.2.3", False),
+        ("all://192.168.0.0/16", "http://192.168.0.1", True),
+        ("all://192.168.0.0/16", "http://192.167.255.255", False),
+        ("all://[fd00::/8]", "http://[fd00::1]", True),
+        ("all://[fd00::/8]", "http://[fd00::1]:8080", True),
+        ("all://[fd00::/8]", "http://[::1]", False),
+        ("all://[fd00::/8]", "http://10.0.0.1", False),
+        # ...but never match hostnames, since no DNS resolution is performed.
+        ("all://10.0.0.0/8", "http://example.com", False),
+        ("all://0.0.0.0/0", "http://example.com", False),
+        ("all://[::/0]", "http://example.com", False),
+        # Port-qualified CIDR patterns compare against the URL's origin port.
+        ("all://10.0.0.0/8:8080", "http://10.1.2.3:8080", True),
+        ("all://10.0.0.0/8:8080", "http://10.1.2.3", False),
+        ("all://10.0.0.0/8:8080", "http://10.1.2.3:9090", False),
+        ("http://10.0.0.0/8:80", "http://10.1.2.3", True),
+        ("all://[fd00::/8]:8080", "http://[fd00::1]:8080", True),
+        ("all://[fd00::/8]:8080", "http://[fd00::1]", False),
     ],
 )
 def test_url_matches(pattern, url, expected):
     pattern = URLPattern(pattern)
     assert pattern.matches(httpx.URL(url)) == expected
+
+
+@pytest.mark.parametrize(
+    "pattern",
+    [
+        "all://10.0.0.0/33",
+        "all://10.0.0.1/8",
+        "all://999.0.0.0/8",
+        "all://[fd00::/129]",
+        "all://[not-an-ip/8]",
+    ],
+)
+def test_url_pattern_invalid_cidr(pattern):
+    with pytest.raises(ValueError):
+        URLPattern(pattern)
 
 
 def test_pattern_priority():
@@ -140,11 +178,17 @@ def test_pattern_priority():
         URLPattern("http://"),
         URLPattern("http://example.com"),
         URLPattern("http://example.com:123"),
+        URLPattern("all://10.0.0.0/8"),
+        URLPattern("all://10.0.0.0/8:8080"),
+        URLPattern("all://10.1.0.0/16"),
     ]
     random.shuffle(matchers)
     assert sorted(matchers) == [
         URLPattern("http://example.com:123"),
+        URLPattern("all://10.0.0.0/8:8080"),
+        URLPattern("all://10.1.0.0/16"),
         URLPattern("http://example.com"),
+        URLPattern("all://10.0.0.0/8"),
         URLPattern("http://"),
         URLPattern("all://"),
     ]

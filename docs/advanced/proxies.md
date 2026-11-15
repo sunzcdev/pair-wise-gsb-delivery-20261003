@@ -28,6 +28,23 @@ with httpx.Client(mounts=proxy_mounts) as client:
 
 For detailed information about proxy routing, see the [Routing](#routing) section.
 
+### Excluding networks from proxying
+
+Mount keys may also be IPv4 or IPv6 CIDR networks, such as `"all://10.0.0.0/8"` or `"all://[fd00::/8]"`. Mounting `None` against a CIDR network bypasses the proxy for requests to literal IP addresses within that network, which is useful for keeping traffic to internal networks direct...
+
+```python
+proxy_mounts = {
+    "all://": httpx.HTTPTransport(proxy="http://localhost:8030"),
+    "all://10.0.0.0/8": None,
+    "all://[fd00::/8]": None,
+}
+
+with httpx.Client(mounts=proxy_mounts) as client:
+    ...
+```
+
+CIDR mount keys only ever match against the literal IP address in the request URL. Hostnames are never resolved to decide routing, so a hostname that would resolve into an excluded network is still sent through the proxy. CIDR keys may also be port-qualified, such as `"all://10.0.0.0/8:8080"`, in which case they take priority over plain mount keys, matching against the port of the URL origin. Invalid networks are rejected with a `ValueError` when the client is created.
+
 !!! tip "Gotcha"
     In most cases, the proxy URL for the `https://` key _should_ use the `http://` scheme (that's not a typo!).
 
