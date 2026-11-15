@@ -1,7 +1,7 @@
 from logging import getLogger
 from urllib.parse import urlsplit
 
-from attrs import asdict, define, field, fields_dict
+from attrs import define, field, fields_dict
 from requests import PreparedRequest
 from requests.cookies import RequestsCookieJar
 from requests.structures import CaseInsensitiveDict
@@ -26,7 +26,9 @@ class CachedRequest(RichMixin):
     def from_request(cls, original_request: PreparedRequest) -> 'CachedRequest':
         """Create a CachedRequest based on an original request object"""
         kwargs = {k: getattr(original_request, k, None) for k in fields_dict(cls).keys()}
-        kwargs['cookies'] = getattr(original_request, '_cookies', None)
+        kwargs['headers'] = CaseInsensitiveDict(getattr(original_request, 'headers', None) or {})
+        cookies = getattr(original_request, '_cookies', None)
+        kwargs['cookies'] = cookies.copy() if cookies is not None else RequestsCookieJar()
         return cls(**kwargs)  # type: ignore  # False positive in mypy 0.920+?
 
     @property
@@ -38,7 +40,13 @@ class CachedRequest(RichMixin):
 
     def copy(self) -> 'CachedRequest':
         """Return a copy of the CachedRequest"""
-        return self.__class__(**asdict(self))
+        return self.__class__(
+            body=self.body,
+            cookies=self.cookies.copy(),
+            headers=CaseInsensitiveDict(self.headers),
+            method=self.method,
+            url=self.url,
+        )
 
     def prepare(self) -> PreparedRequest:
         """Convert the CachedRequest back into a PreparedRequest"""

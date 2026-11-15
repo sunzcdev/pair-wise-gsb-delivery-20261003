@@ -54,6 +54,7 @@ class CachedHTTPResponse(RichMixin, HTTPResponse):
             assert isinstance(response.raw, HTTPResponse)
         # Get basic attributes
         kwargs = {k: getattr(response.raw, k, None) for k in fields_dict(cls).keys()}
+        kwargs['headers'] = HTTPHeaderDict(kwargs.get('headers') or {})
         # Init kwarg for HTTPResponse._request_url has no leading '_'
         kwargs['request_url'] = response.raw._request_url  # type: ignore[attr-defined]
         kwargs['body'] = _copy_body(response)

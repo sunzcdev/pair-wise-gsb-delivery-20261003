@@ -80,6 +80,8 @@ class BaseCache:
             response = self.responses.get(key)
             if response is None:  # Note: bool(requests.Response) is False if status > 400
                 response = self.responses[self.redirects[key]]
+            if isinstance(response, CachedResponse):
+                response = response.copy()
             return response
         except (AttributeError, KeyError):
             return default
@@ -393,12 +395,16 @@ class DictStorage(UserDict, BaseStorage):
         self.serializer = None
 
     def __getitem__(self, key):
-        """An additional step is needed here for response data. The original response object
-        is still in memory, and hasn't gone through a serialize/deserialize loop. So, the file-like
-        response body has already been read, and needs to be reset.
+        """Return an isolated copy of response data.
+
+        The original response object is still in memory and hasn't gone through a
+        serialize/deserialize loop, so returning it directly would share headers, cookies,
+        redirect history, and the raw response read position with the cache entry.
         """
         item = super().__getitem__(key)
-        if getattr(item, 'raw', None):
+        if isinstance(item, CachedResponse):
+            item = item.copy()
+        elif getattr(item, 'raw', None):
             item.raw.reset()
         try:
             item.cache_key = key

@@ -130,6 +130,11 @@ class CachedResponse(RichMixin, BaseResponse):
         """Create a CachedResponse based on an original Response or another CachedResponse object"""
         if isinstance(response, CachedResponse):
             obj = attr.evolve(response, **kwargs)
+            obj.headers = CaseInsensitiveDict(obj.headers)
+            obj.cookies = obj.cookies.copy()
+            obj.request = obj.request.copy()
+            obj._next = obj._next.copy() if obj._next else None
+            obj.raw = CachedHTTPResponse.from_cached_response(obj)
             obj._convert_redirects()
             return obj
 
@@ -137,7 +142,14 @@ class CachedResponse(RichMixin, BaseResponse):
 
         # Copy basic attributes
         for k in Response.__attrs__:
-            setattr(obj, k, getattr(response, k, None))
+            value = getattr(response, k, None)
+            if k == 'headers':
+                value = CaseInsensitiveDict(value or {})
+            elif k == 'cookies':
+                value = (value or RequestsCookieJar()).copy()
+            elif k == 'history':
+                value = list(value or [])
+            setattr(obj, k, value)
 
         # Store request, raw response, and next response (if it's a redirect response)
         obj.raw = CachedHTTPResponse.from_response(response)
@@ -149,6 +161,34 @@ class CachedResponse(RichMixin, BaseResponse):
 
         obj._convert_redirects()
         return obj
+
+    def copy(self) -> 'CachedResponse':
+        """Return an independent copy of this response.
+
+        Mutable response data (headers, cookies, redirect history, and request) is copied, while
+        the response body is shared as an immutable ``bytes`` object. The raw response gets a new
+        file pointer so read position is never shared between consumers.
+        """
+        obj = attr.evolve(self)
+        obj.headers = CaseInsensitiveDict(self.headers)
+        obj.cookies = self.cookies.copy()
+        obj.history = [
+            redirect.copy() if isinstance(redirect, CachedResponse) else self.from_response(redirect)
+            for redirect in self.history
+        ]
+        obj.request = self.request.copy()
+        obj._next = self._next.copy() if self._next else None
+        obj.raw = CachedHTTPResponse.from_cached_response(obj)
+        _copy_extra_attrs(self, obj)
+        return obj
+
+    def __copy__(self) -> 'CachedResponse':
+        """Support the standard library copy protocol"""
+        return self.copy()
+
+    def __deepcopy__(self, memo) -> 'CachedResponse':
+        """Copy mutable response data while sharing the immutable body"""
+        return self.copy()
 
     def _convert_redirects(self):
         """Convert redirect history, if any; avoid recursion by not copying redirects of redirects"""
@@ -230,6 +270,12 @@ class CachedResponse(RichMixin, BaseResponse):
             f'expires: {format_datetime(self.expires)} ({"stale" if self.is_expired else "fresh"}), '
             f'size: {format_file_size(self.size)}, request: {self.request}>'
         )
+
+
+def _copy_extra_attrs(source: CachedResponse, target: CachedResponse):
+    """Copy cache-related attributes that aren't attrs fields"""
+    for name in ('cache_key', 'revalidated', 'has_content_changed'):
+        setattr(target, name, getattr(source, name))
 
 
 def format_datetime(value: Optional[datetime]) -> str:
