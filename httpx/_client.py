@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import datetime
 import enum
+import inspect
 import logging
 import time
 import typing
@@ -32,6 +33,7 @@ from ._transports.base import AsyncBaseTransport, BaseTransport
 from ._transports.default import AsyncHTTPTransport, HTTPTransport
 from ._types import (
     AsyncByteStream,
+    AsyncRedirectHook,
     AuthTypes,
     CertTypes,
     CookieTypes,
@@ -43,6 +45,7 @@ from ._types import (
     RequestExtensions,
     RequestFiles,
     SyncByteStream,
+    SyncRedirectHook,
     TimeoutTypes,
 )
 from ._urls import URL, QueryParams
@@ -51,12 +54,24 @@ from ._utils import URLPattern, get_environment_proxies
 if typing.TYPE_CHECKING:
     import ssl  # pragma: no cover
 
-__all__ = ["USE_CLIENT_DEFAULT", "AsyncClient", "Client"]
+__all__ = [
+    "AsyncClient",
+    "AsyncRedirectHook",
+    "Client",
+    "FollowRedirects",
+    "SyncRedirectHook",
+    "USE_CLIENT_DEFAULT",
+]
 
 # The type annotation for @classmethod and context managers here follows PEP 484
 # https://www.python.org/dev/peps/pep-0484/#annotating-instance-and-class-methods
 T = typing.TypeVar("T", bound="Client")
 U = typing.TypeVar("U", bound="AsyncClient")
+
+# The `follow_redirects` parameter either enables/disables redirects with a
+# boolean, or provides a callable hook that decides whether each individual
+# redirect should be followed.
+FollowRedirects = bool | SyncRedirectHook | AsyncRedirectHook
 
 
 def _is_https_redirect(url: URL, location: URL) -> bool:
@@ -581,6 +596,46 @@ class BaseClient:
 
         return request.stream
 
+    def _invoke_redirect_hook(
+        self,
+        follow_redirects: FollowRedirects,
+        response: Response,
+        request: Request,
+        history: list[Response],
+    ) -> bool:
+        """
+        Invoke a synchronous redirect decision hook.
+
+        The hook is passed the redirect response, the request that would be
+        sent next, and a copy of the redirect history, so that it cannot
+        mutate the client's internal state.
+        """
+        if inspect.iscoroutinefunction(follow_redirects):
+            raise RuntimeError(
+                "Attempted to call an async redirect hook with a sync "
+                "Client instance. Use 'httpx.AsyncClient' instead."
+            )
+        return bool(follow_redirects(response, request, list(history)))
+
+    async def _ainvoke_redirect_hook(
+        self,
+        follow_redirects: FollowRedirects,
+        response: Response,
+        request: Request,
+        history: list[Response],
+    ) -> bool:
+        """
+        Invoke a redirect decision hook, which may be sync or async.
+
+        The hook is passed the redirect response, the request that would be
+        sent next, and a copy of the redirect history, so that it cannot
+        mutate the client's internal state.
+        """
+        decision = follow_redirects(response, request, list(history))
+        if inspect.isawaitable(decision):
+            decision = await decision
+        return bool(decision)
+
     def _set_timeout(self, request: Request) -> None:
         if "timeout" not in request.extensions:
             timeout = (
@@ -781,7 +836,7 @@ class Client(BaseClient):
         headers: HeaderTypes | None = None,
         cookies: CookieTypes | None = None,
         auth: AuthTypes | UseClientDefault | None = USE_CLIENT_DEFAULT,
-        follow_redirects: bool | UseClientDefault = USE_CLIENT_DEFAULT,
+        follow_redirects: FollowRedirects | UseClientDefault = USE_CLIENT_DEFAULT,
         timeout: TimeoutTypes | UseClientDefault = USE_CLIENT_DEFAULT,
         extensions: RequestExtensions | None = None,
     ) -> Response:
@@ -838,7 +893,7 @@ class Client(BaseClient):
         headers: HeaderTypes | None = None,
         cookies: CookieTypes | None = None,
         auth: AuthTypes | UseClientDefault | None = USE_CLIENT_DEFAULT,
-        follow_redirects: bool | UseClientDefault = USE_CLIENT_DEFAULT,
+        follow_redirects: FollowRedirects | UseClientDefault = USE_CLIENT_DEFAULT,
         timeout: TimeoutTypes | UseClientDefault = USE_CLIENT_DEFAULT,
         extensions: RequestExtensions | None = None,
     ) -> typing.Iterator[Response]:
@@ -882,7 +937,7 @@ class Client(BaseClient):
         *,
         stream: bool = False,
         auth: AuthTypes | UseClientDefault | None = USE_CLIENT_DEFAULT,
-        follow_redirects: bool | UseClientDefault = USE_CLIENT_DEFAULT,
+        follow_redirects: FollowRedirects | UseClientDefault = USE_CLIENT_DEFAULT,
     ) -> Response:
         """
         Send a request.
@@ -931,7 +986,7 @@ class Client(BaseClient):
         self,
         request: Request,
         auth: Auth,
-        follow_redirects: bool,
+        follow_redirects: FollowRedirects,
         history: list[Response],
     ) -> Response:
         auth_flow = auth.sync_auth_flow(request)
@@ -964,7 +1019,7 @@ class Client(BaseClient):
     def _send_handling_redirects(
         self,
         request: Request,
-        follow_redirects: bool,
+        follow_redirects: FollowRedirects,
         history: list[Response],
     ) -> Response:
         while True:
@@ -985,13 +1040,24 @@ class Client(BaseClient):
                 if not response.has_redirect_location:
                     return response
 
-                request = self._build_redirect_request(request, response)
-                history = history + [response]
+                next_request = self._build_redirect_request(request, response)
 
-                if follow_redirects:
+                if isinstance(follow_redirects, bool):
+                    should_follow = follow_redirects
+                else:
+                    should_follow = self._invoke_redirect_hook(
+                        follow_redirects,
+                        response,
+                        next_request,
+                        history,
+                    )
+
+                if should_follow:
+                    request = next_request
+                    history = history + [response]
                     response.read()
                 else:
-                    response.next_request = request
+                    response.next_request = next_request
                     return response
 
             except BaseException as exc:
@@ -1041,7 +1107,7 @@ class Client(BaseClient):
         headers: HeaderTypes | None = None,
         cookies: CookieTypes | None = None,
         auth: AuthTypes | UseClientDefault | None = USE_CLIENT_DEFAULT,
-        follow_redirects: bool | UseClientDefault = USE_CLIENT_DEFAULT,
+        follow_redirects: FollowRedirects | UseClientDefault = USE_CLIENT_DEFAULT,
         timeout: TimeoutTypes | UseClientDefault = USE_CLIENT_DEFAULT,
         extensions: RequestExtensions | None = None,
     ) -> Response:
@@ -1070,7 +1136,7 @@ class Client(BaseClient):
         headers: HeaderTypes | None = None,
         cookies: CookieTypes | None = None,
         auth: AuthTypes | UseClientDefault = USE_CLIENT_DEFAULT,
-        follow_redirects: bool | UseClientDefault = USE_CLIENT_DEFAULT,
+        follow_redirects: FollowRedirects | UseClientDefault = USE_CLIENT_DEFAULT,
         timeout: TimeoutTypes | UseClientDefault = USE_CLIENT_DEFAULT,
         extensions: RequestExtensions | None = None,
     ) -> Response:
@@ -1099,7 +1165,7 @@ class Client(BaseClient):
         headers: HeaderTypes | None = None,
         cookies: CookieTypes | None = None,
         auth: AuthTypes | UseClientDefault = USE_CLIENT_DEFAULT,
-        follow_redirects: bool | UseClientDefault = USE_CLIENT_DEFAULT,
+        follow_redirects: FollowRedirects | UseClientDefault = USE_CLIENT_DEFAULT,
         timeout: TimeoutTypes | UseClientDefault = USE_CLIENT_DEFAULT,
         extensions: RequestExtensions | None = None,
     ) -> Response:
@@ -1132,7 +1198,7 @@ class Client(BaseClient):
         headers: HeaderTypes | None = None,
         cookies: CookieTypes | None = None,
         auth: AuthTypes | UseClientDefault = USE_CLIENT_DEFAULT,
-        follow_redirects: bool | UseClientDefault = USE_CLIENT_DEFAULT,
+        follow_redirects: FollowRedirects | UseClientDefault = USE_CLIENT_DEFAULT,
         timeout: TimeoutTypes | UseClientDefault = USE_CLIENT_DEFAULT,
         extensions: RequestExtensions | None = None,
     ) -> Response:
@@ -1169,7 +1235,7 @@ class Client(BaseClient):
         headers: HeaderTypes | None = None,
         cookies: CookieTypes | None = None,
         auth: AuthTypes | UseClientDefault = USE_CLIENT_DEFAULT,
-        follow_redirects: bool | UseClientDefault = USE_CLIENT_DEFAULT,
+        follow_redirects: FollowRedirects | UseClientDefault = USE_CLIENT_DEFAULT,
         timeout: TimeoutTypes | UseClientDefault = USE_CLIENT_DEFAULT,
         extensions: RequestExtensions | None = None,
     ) -> Response:
@@ -1206,7 +1272,7 @@ class Client(BaseClient):
         headers: HeaderTypes | None = None,
         cookies: CookieTypes | None = None,
         auth: AuthTypes | UseClientDefault = USE_CLIENT_DEFAULT,
-        follow_redirects: bool | UseClientDefault = USE_CLIENT_DEFAULT,
+        follow_redirects: FollowRedirects | UseClientDefault = USE_CLIENT_DEFAULT,
         timeout: TimeoutTypes | UseClientDefault = USE_CLIENT_DEFAULT,
         extensions: RequestExtensions | None = None,
     ) -> Response:
@@ -1239,7 +1305,7 @@ class Client(BaseClient):
         headers: HeaderTypes | None = None,
         cookies: CookieTypes | None = None,
         auth: AuthTypes | UseClientDefault = USE_CLIENT_DEFAULT,
-        follow_redirects: bool | UseClientDefault = USE_CLIENT_DEFAULT,
+        follow_redirects: FollowRedirects | UseClientDefault = USE_CLIENT_DEFAULT,
         timeout: TimeoutTypes | UseClientDefault = USE_CLIENT_DEFAULT,
         extensions: RequestExtensions | None = None,
     ) -> Response:
@@ -1495,7 +1561,7 @@ class AsyncClient(BaseClient):
         headers: HeaderTypes | None = None,
         cookies: CookieTypes | None = None,
         auth: AuthTypes | UseClientDefault | None = USE_CLIENT_DEFAULT,
-        follow_redirects: bool | UseClientDefault = USE_CLIENT_DEFAULT,
+        follow_redirects: FollowRedirects | UseClientDefault = USE_CLIENT_DEFAULT,
         timeout: TimeoutTypes | UseClientDefault = USE_CLIENT_DEFAULT,
         extensions: RequestExtensions | None = None,
     ) -> Response:
@@ -1553,7 +1619,7 @@ class AsyncClient(BaseClient):
         headers: HeaderTypes | None = None,
         cookies: CookieTypes | None = None,
         auth: AuthTypes | UseClientDefault | None = USE_CLIENT_DEFAULT,
-        follow_redirects: bool | UseClientDefault = USE_CLIENT_DEFAULT,
+        follow_redirects: FollowRedirects | UseClientDefault = USE_CLIENT_DEFAULT,
         timeout: TimeoutTypes | UseClientDefault = USE_CLIENT_DEFAULT,
         extensions: RequestExtensions | None = None,
     ) -> typing.AsyncIterator[Response]:
@@ -1597,7 +1663,7 @@ class AsyncClient(BaseClient):
         *,
         stream: bool = False,
         auth: AuthTypes | UseClientDefault | None = USE_CLIENT_DEFAULT,
-        follow_redirects: bool | UseClientDefault = USE_CLIENT_DEFAULT,
+        follow_redirects: FollowRedirects | UseClientDefault = USE_CLIENT_DEFAULT,
     ) -> Response:
         """
         Send a request.
@@ -1646,7 +1712,7 @@ class AsyncClient(BaseClient):
         self,
         request: Request,
         auth: Auth,
-        follow_redirects: bool,
+        follow_redirects: FollowRedirects,
         history: list[Response],
     ) -> Response:
         auth_flow = auth.async_auth_flow(request)
@@ -1679,7 +1745,7 @@ class AsyncClient(BaseClient):
     async def _send_handling_redirects(
         self,
         request: Request,
-        follow_redirects: bool,
+        follow_redirects: FollowRedirects,
         history: list[Response],
     ) -> Response:
         while True:
@@ -1701,13 +1767,24 @@ class AsyncClient(BaseClient):
                 if not response.has_redirect_location:
                     return response
 
-                request = self._build_redirect_request(request, response)
-                history = history + [response]
+                next_request = self._build_redirect_request(request, response)
 
-                if follow_redirects:
+                if isinstance(follow_redirects, bool):
+                    should_follow = follow_redirects
+                else:
+                    should_follow = await self._ainvoke_redirect_hook(
+                        follow_redirects,
+                        response,
+                        next_request,
+                        history,
+                    )
+
+                if should_follow:
+                    request = next_request
+                    history = history + [response]
                     await response.aread()
                 else:
-                    response.next_request = request
+                    response.next_request = next_request
                     return response
 
             except BaseException as exc:
@@ -1756,7 +1833,7 @@ class AsyncClient(BaseClient):
         headers: HeaderTypes | None = None,
         cookies: CookieTypes | None = None,
         auth: AuthTypes | UseClientDefault | None = USE_CLIENT_DEFAULT,
-        follow_redirects: bool | UseClientDefault = USE_CLIENT_DEFAULT,
+        follow_redirects: FollowRedirects | UseClientDefault = USE_CLIENT_DEFAULT,
         timeout: TimeoutTypes | UseClientDefault = USE_CLIENT_DEFAULT,
         extensions: RequestExtensions | None = None,
     ) -> Response:
@@ -1785,7 +1862,7 @@ class AsyncClient(BaseClient):
         headers: HeaderTypes | None = None,
         cookies: CookieTypes | None = None,
         auth: AuthTypes | UseClientDefault = USE_CLIENT_DEFAULT,
-        follow_redirects: bool | UseClientDefault = USE_CLIENT_DEFAULT,
+        follow_redirects: FollowRedirects | UseClientDefault = USE_CLIENT_DEFAULT,
         timeout: TimeoutTypes | UseClientDefault = USE_CLIENT_DEFAULT,
         extensions: RequestExtensions | None = None,
     ) -> Response:
@@ -1814,7 +1891,7 @@ class AsyncClient(BaseClient):
         headers: HeaderTypes | None = None,
         cookies: CookieTypes | None = None,
         auth: AuthTypes | UseClientDefault = USE_CLIENT_DEFAULT,
-        follow_redirects: bool | UseClientDefault = USE_CLIENT_DEFAULT,
+        follow_redirects: FollowRedirects | UseClientDefault = USE_CLIENT_DEFAULT,
         timeout: TimeoutTypes | UseClientDefault = USE_CLIENT_DEFAULT,
         extensions: RequestExtensions | None = None,
     ) -> Response:
@@ -1847,7 +1924,7 @@ class AsyncClient(BaseClient):
         headers: HeaderTypes | None = None,
         cookies: CookieTypes | None = None,
         auth: AuthTypes | UseClientDefault = USE_CLIENT_DEFAULT,
-        follow_redirects: bool | UseClientDefault = USE_CLIENT_DEFAULT,
+        follow_redirects: FollowRedirects | UseClientDefault = USE_CLIENT_DEFAULT,
         timeout: TimeoutTypes | UseClientDefault = USE_CLIENT_DEFAULT,
         extensions: RequestExtensions | None = None,
     ) -> Response:
@@ -1884,7 +1961,7 @@ class AsyncClient(BaseClient):
         headers: HeaderTypes | None = None,
         cookies: CookieTypes | None = None,
         auth: AuthTypes | UseClientDefault = USE_CLIENT_DEFAULT,
-        follow_redirects: bool | UseClientDefault = USE_CLIENT_DEFAULT,
+        follow_redirects: FollowRedirects | UseClientDefault = USE_CLIENT_DEFAULT,
         timeout: TimeoutTypes | UseClientDefault = USE_CLIENT_DEFAULT,
         extensions: RequestExtensions | None = None,
     ) -> Response:
@@ -1921,7 +1998,7 @@ class AsyncClient(BaseClient):
         headers: HeaderTypes | None = None,
         cookies: CookieTypes | None = None,
         auth: AuthTypes | UseClientDefault = USE_CLIENT_DEFAULT,
-        follow_redirects: bool | UseClientDefault = USE_CLIENT_DEFAULT,
+        follow_redirects: FollowRedirects | UseClientDefault = USE_CLIENT_DEFAULT,
         timeout: TimeoutTypes | UseClientDefault = USE_CLIENT_DEFAULT,
         extensions: RequestExtensions | None = None,
     ) -> Response:
@@ -1954,7 +2031,7 @@ class AsyncClient(BaseClient):
         headers: HeaderTypes | None = None,
         cookies: CookieTypes | None = None,
         auth: AuthTypes | UseClientDefault = USE_CLIENT_DEFAULT,
-        follow_redirects: bool | UseClientDefault = USE_CLIENT_DEFAULT,
+        follow_redirects: FollowRedirects | UseClientDefault = USE_CLIENT_DEFAULT,
         timeout: TimeoutTypes | UseClientDefault = USE_CLIENT_DEFAULT,
         extensions: RequestExtensions | None = None,
     ) -> Response:

@@ -4,6 +4,7 @@ Type definitions for type checking purposes.
 
 from http.cookiejar import CookieJar
 from typing import (
+    Awaitable,
     IO,
     TYPE_CHECKING,
     Any,
@@ -24,7 +25,7 @@ from typing import (
 if TYPE_CHECKING:  # pragma: no cover
     from ._auth import Auth  # noqa: F401
     from ._config import Proxy, Timeout  # noqa: F401
-    from ._models import Cookies, Headers, Request  # noqa: F401
+    from ._models import Cookies, Headers, Request, Response  # noqa: F401
     from ._urls import URL, QueryParams  # noqa: F401
 
 
@@ -63,6 +64,15 @@ AuthTypes = Union[
     Tuple[Union[str, bytes], Union[str, bytes]],
     Callable[["Request"], "Request"],
     "Auth",
+]
+
+# A callable used to decide whether a given redirect should be followed.
+# It receives the redirect response, the request that would be sent next,
+# and the chain of redirect responses already followed, and returns `True`
+# to follow the redirect or `False` to stop on the current response.
+SyncRedirectHook = Callable[["Response", "Request", List["Response"]], bool]
+AsyncRedirectHook = Callable[
+    ["Response", "Request", List["Response"]], Awaitable[bool]
 ]
 
 RequestContent = Union[str, bytes, Iterable[bytes], AsyncIterable[bytes]]

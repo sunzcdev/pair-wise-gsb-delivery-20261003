@@ -448,6 +448,45 @@ The `history` property of the response can be used to inspect any followed redir
 It contains a list of any redirect responses that were followed, in the order
 in which they were made.
 
+### Customizing redirect decisions
+
+Instead of a plain boolean, `follow_redirects` also accepts a callable that is
+invoked before each redirect is followed. The hook receives the redirect
+response, the request that would be sent next, and the chain of redirect
+responses already followed. Return `True` to follow the redirect, or `False`
+to stop and return the redirect response:
+
+```pycon
+>>> def redirect_hook(response, request, history):
+...     # Stop following once we leave the original host.
+...     return request.url.host == response.request.url.host
+...
+>>> client = httpx.Client()
+>>> response = client.get(
+...     "http://github.com/", follow_redirects=redirect_hook
+... )
+>>> response.next_request
+<Request('GET', 'https://github.com/')>
+```
+
+When the hook returns `False`, the response body is left open for the caller
+to read, and the prepared next request is available as `response.next_request`.
+If the hook raises an exception, the client closes the redirect response and
+propagates the exception. The `history` argument is a copy, so mutating it
+cannot affect the client's internal state.
+
+`AsyncClient` supports both sync and async hooks:
+
+```python
+async def redirect_hook(response, request, history):
+    return request.url.scheme == "https"
+
+async with httpx.AsyncClient() as client:
+    response = await client.get(
+        "http://github.com/", follow_redirects=redirect_hook
+    )
+```
+
 ## Timeouts
 
 HTTPX defaults to including reasonable timeouts for all network operations,

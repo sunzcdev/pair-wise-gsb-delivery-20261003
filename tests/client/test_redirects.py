@@ -445,3 +445,351 @@ async def test_async_invalid_redirect():
             await client.get(
                 "http://example.org/invalid_redirect", follow_redirects=True
             )
+
+
+class TrackingStream(httpx.SyncByteStream):
+    def __init__(self) -> None:
+        self.closed = False
+
+    def __iter__(self) -> typing.Iterator[bytes]:
+        yield b"redirect body"
+
+    def close(self) -> None:
+        self.closed = True
+
+
+def test_redirect_hook_can_follow():
+    calls: list[tuple[int, str, str, int]] = []
+
+    def redirect_hook(
+        response: httpx.Response,
+        request: httpx.Request,
+        history: list[httpx.Response],
+    ) -> bool:
+        calls.append(
+            (response.status_code, request.method, str(request.url), len(history))
+        )
+        return True
+
+    client = httpx.Client(transport=httpx.MockTransport(redirects))
+    response = client.get(
+        "https://example.org/redirect_303", follow_redirects=redirect_hook
+    )
+    assert response.status_code == httpx.codes.OK
+    assert response.url == "https://example.org/"
+    assert len(response.history) == 1
+    assert calls == [(httpx.codes.SEE_OTHER, "GET", "https://example.org/", 0)]
+
+
+def test_redirect_hook_can_stop():
+    def redirect_hook(
+        response: httpx.Response,
+        request: httpx.Request,
+        history: list[httpx.Response],
+    ) -> bool:
+        return False
+
+    client = httpx.Client(transport=httpx.MockTransport(redirects))
+    response = client.get(
+        "https://example.org/redirect_303", follow_redirects=redirect_hook
+    )
+    assert response.status_code == httpx.codes.SEE_OTHER
+    assert response.url == "https://example.org/redirect_303"
+    assert response.history == []
+    assert response.next_request is not None
+    assert response.next_request.method == "GET"
+    assert response.next_request.url == "https://example.org/"
+
+
+def test_redirect_hook_stop_leaves_body_open():
+    stream = TrackingStream()
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            httpx.codes.SEE_OTHER,
+            headers={"location": "https://example.org/"},
+            stream=stream,
+        )
+
+    def redirect_hook(
+        response: httpx.Response,
+        request: httpx.Request,
+        history: list[httpx.Response],
+    ) -> bool:
+        assert not response.is_closed
+        assert not response.is_stream_consumed
+        return False
+
+    client = httpx.Client(transport=httpx.MockTransport(handler))
+    with client.stream(
+        "GET", "https://example.org/redirect_303", follow_redirects=redirect_hook
+    ) as response:
+        assert response.status_code == httpx.codes.SEE_OTHER
+        assert response.next_request is not None
+        assert not stream.closed
+        assert response.read() == b"redirect body"
+
+    assert stream.closed
+
+
+def test_redirect_hook_exception_closes_response():
+    stream = TrackingStream()
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            httpx.codes.SEE_OTHER,
+            headers={"location": "https://example.org/"},
+            stream=stream,
+        )
+
+    def redirect_hook(
+        response: httpx.Response,
+        request: httpx.Request,
+        history: list[httpx.Response],
+    ) -> bool:
+        raise RuntimeError("hook failed")
+
+    client = httpx.Client(transport=httpx.MockTransport(handler))
+    with pytest.raises(RuntimeError, match="hook failed"):
+        client.get(
+            "https://example.org/redirect_303", follow_redirects=redirect_hook
+        )
+    assert stream.closed
+
+
+def test_redirect_hook_receives_history_chain():
+    seen: list[int] = []
+
+    def redirect_hook(
+        response: httpx.Response,
+        request: httpx.Request,
+        history: list[httpx.Response],
+    ) -> bool:
+        seen.append(len(history))
+        return True
+
+    client = httpx.Client(transport=httpx.MockTransport(redirects))
+    response = client.get(
+        "https://example.org/multiple_redirects?count=3",
+        follow_redirects=redirect_hook,
+    )
+    assert response.status_code == httpx.codes.OK
+    assert seen == [0, 1, 2]
+
+
+def test_redirect_hook_cannot_mutate_client_history():
+    def redirect_hook(
+        response: httpx.Response,
+        request: httpx.Request,
+        history: list[httpx.Response],
+    ) -> bool:
+        history.append(response)
+        history.clear()
+        return True
+
+    client = httpx.Client(transport=httpx.MockTransport(redirects))
+    response = client.get(
+        "https://example.org/multiple_redirects?count=2",
+        follow_redirects=redirect_hook,
+    )
+    assert response.status_code == httpx.codes.OK
+    assert len(response.history) == 2
+
+
+def test_redirect_hook_sees_303_method_change():
+    decisions: list[tuple[int, str]] = []
+
+    def redirect_hook(
+        response: httpx.Response,
+        request: httpx.Request,
+        history: list[httpx.Response],
+    ) -> bool:
+        decisions.append((response.status_code, request.method))
+        return False
+
+    client = httpx.Client(transport=httpx.MockTransport(redirects))
+    response = client.post(
+        "https://example.org/redirect_303", follow_redirects=redirect_hook
+    )
+    assert response.next_request is not None
+    assert response.next_request.method == "GET"
+    assert decisions == [(httpx.codes.SEE_OTHER, "GET")]
+
+
+def test_redirect_hook_sees_307_body_preserved():
+    decisions: list[tuple[str, bool]] = []
+
+    def redirect_hook(
+        response: httpx.Response,
+        request: httpx.Request,
+        history: list[httpx.Response],
+    ) -> bool:
+        decisions.append((request.method, request.stream is not None))
+        return False
+
+    client = httpx.Client(transport=httpx.MockTransport(redirects))
+    response = client.post(
+        "https://example.org/redirect_body",
+        content=b"Example request body",
+        follow_redirects=redirect_hook,
+    )
+    assert response.status_code == httpx.codes.PERMANENT_REDIRECT
+    assert response.next_request is not None
+    assert response.next_request.method == "POST"
+    assert decisions == [("POST", True)]
+
+
+def test_redirect_hook_sees_relative_location():
+    def redirect_hook(
+        response: httpx.Response,
+        request: httpx.Request,
+        history: list[httpx.Response],
+    ) -> bool:
+        return False
+
+    client = httpx.Client(transport=httpx.MockTransport(redirects))
+    response = client.get(
+        "https://example.org/relative_redirect", follow_redirects=redirect_hook
+    )
+    assert response.next_request is not None
+    assert response.next_request.url == "https://example.org/"
+
+
+def test_async_redirect_hook_rejected_by_sync_client():
+    async def redirect_hook(
+        response: httpx.Response,
+        request: httpx.Request,
+        history: list[httpx.Response],
+    ) -> bool:
+        return True
+
+    client = httpx.Client(transport=httpx.MockTransport(redirects))
+    with pytest.raises(RuntimeError, match="async redirect hook"):
+        client.get(
+            "https://example.org/redirect_303", follow_redirects=redirect_hook
+        )
+
+
+@pytest.mark.anyio
+async def test_async_redirect_hook_can_follow():
+    calls: list[tuple[int, str, int]] = []
+
+    async def redirect_hook(
+        response: httpx.Response,
+        request: httpx.Request,
+        history: list[httpx.Response],
+    ) -> bool:
+        calls.append((response.status_code, request.method, len(history)))
+        return True
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(redirects)
+    ) as client:
+        response = await client.get(
+            "https://example.org/multiple_redirects?count=2",
+            follow_redirects=redirect_hook,
+        )
+    assert response.status_code == httpx.codes.OK
+    assert len(response.history) == 2
+    assert calls == [
+        (httpx.codes.SEE_OTHER, "GET", 0),
+        (httpx.codes.SEE_OTHER, "GET", 1),
+    ]
+
+
+@pytest.mark.anyio
+async def test_async_redirect_hook_can_stop():
+    async def redirect_hook(
+        response: httpx.Response,
+        request: httpx.Request,
+        history: list[httpx.Response],
+    ) -> bool:
+        return False
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(redirects)
+    ) as client:
+        response = await client.get(
+            "https://example.org/redirect_303", follow_redirects=redirect_hook
+        )
+    assert response.status_code == httpx.codes.SEE_OTHER
+    assert response.next_request is not None
+    assert response.next_request.method == "GET"
+    assert response.next_request.url == "https://example.org/"
+    assert response.history == []
+
+
+@pytest.mark.anyio
+async def test_async_redirect_hook_accepts_sync_callable():
+    def redirect_hook(
+        response: httpx.Response,
+        request: httpx.Request,
+        history: list[httpx.Response],
+    ) -> bool:
+        return True
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(redirects)
+    ) as client:
+        response = await client.get(
+            "https://example.org/redirect_303", follow_redirects=redirect_hook
+        )
+    assert response.status_code == httpx.codes.OK
+    assert len(response.history) == 1
+
+
+@pytest.mark.anyio
+async def test_async_redirect_hook_exception_closes_response():
+    class AsyncTrackingStream(httpx.AsyncByteStream):
+        def __init__(self) -> None:
+            self.closed = False
+
+        async def __aiter__(self) -> typing.AsyncIterator[bytes]:
+            yield b"redirect body"
+
+        async def aclose(self) -> None:
+            self.closed = True
+
+    stream = AsyncTrackingStream()
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            httpx.codes.SEE_OTHER,
+            headers={"location": "https://example.org/"},
+            stream=stream,
+        )
+
+    async def redirect_hook(
+        response: httpx.Response,
+        request: httpx.Request,
+        history: list[httpx.Response],
+    ) -> bool:
+        raise RuntimeError("async hook failed")
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        with pytest.raises(RuntimeError, match="async hook failed"):
+            await client.get(
+                "https://example.org/redirect_303",
+                follow_redirects=redirect_hook,
+            )
+    assert stream.closed
+
+
+@pytest.mark.anyio
+async def test_async_redirect_hook_cannot_mutate_client_history():
+    async def redirect_hook(
+        response: httpx.Response,
+        request: httpx.Request,
+        history: list[httpx.Response],
+    ) -> bool:
+        history.append(response)
+        return True
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(redirects)
+    ) as client:
+        response = await client.get(
+            "https://example.org/multiple_redirects?count=2",
+            follow_redirects=redirect_hook,
+        )
+    assert len(response.history) == 2

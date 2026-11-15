@@ -13,6 +13,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 ### Added
 
 * Expose `FunctionAuth` from the public API. (#3699)
+* Add support for a callable `follow_redirects` hook that decides whether
+  each individual redirect should be followed, on both `Client` and
+  `AsyncClient`.
 
 ## 0.28.1 (6th December, 2024)
 
