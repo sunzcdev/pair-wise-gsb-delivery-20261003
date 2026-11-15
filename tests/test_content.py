@@ -1,5 +1,6 @@
 import io
 import typing
+from urllib.parse import quote_plus
 
 import pytest
 
@@ -250,6 +251,144 @@ async def test_urlencoded_list():
     }
     assert sync_content == b"example=a&example=1&example=true"
     assert async_content == b"example=a&example=1&example=true"
+
+
+@pytest.mark.anyio
+async def test_urlencoded_default_charset_is_utf8_without_header_charset():
+    request = httpx.Request(method, url, data={"greeting": "café"})
+
+    content = b"".join(list(request.stream))
+
+    assert request.headers["Content-Type"] == "application/x-www-form-urlencoded"
+    assert content == b"greeting=caf%C3%A9"
+
+
+@pytest.mark.anyio
+async def test_urlencoded_custom_charset_encodes_name_and_value():
+    request = httpx.Request(
+        method, url, data={"greeting": "café"}, form_charset="latin-1"
+    )
+
+    content = b"".join(list(request.stream))
+
+    assert (
+        request.headers["Content-Type"]
+        == "application/x-www-form-urlencoded; charset=iso8859-1"
+    )
+    assert content == b"greeting=caf%E9"
+
+
+@pytest.mark.anyio
+async def test_urlencoded_custom_charset_non_ascii_field_name():
+    request = httpx.Request(
+        method, url, data={"名前": "値"}, form_charset="shift_jis"
+    )
+
+    content = b"".join(list(request.stream))
+
+    assert (
+        request.headers["Content-Type"]
+        == "application/x-www-form-urlencoded; charset=shift_jis"
+    )
+    expected = (
+        quote_plus("名前", encoding="shift_jis")
+        + "="
+        + quote_plus("値", encoding="shift_jis")
+    ).encode("ascii")
+    assert content == expected
+    assert content == b"%96%BC%91O=%92l"
+
+
+@pytest.mark.anyio
+async def test_urlencoded_preserves_repeat_and_ordered_keys():
+    request = httpx.Request(
+        method,
+        url,
+        data={"k": ["a", "b", "c"], "x": "1"},
+        form_charset="latin-1",
+    )
+
+    content = b"".join(list(request.stream))
+
+    assert content == b"k=a&k=b&k=c&x=1"
+
+
+@pytest.mark.anyio
+async def test_urlencoded_unencodable_value_reports_field_position():
+    with pytest.raises(httpx.FormEncodingError) as exc_info:
+        httpx.Request(
+            method,
+            url,
+            data={"ok": "a", "bad": "中文"},
+            form_charset="latin-1",
+        )
+
+    message = str(exc_info.value)
+    assert "field 2" in message
+    assert "item 1" in message
+    assert "iso8859-1" in message
+
+
+@pytest.mark.anyio
+async def test_urlencoded_unencodable_name_reports_field_position():
+    with pytest.raises(httpx.FormEncodingError) as exc_info:
+        httpx.Request(method, url, data={"中": "x"}, form_charset="latin-1")
+
+    message = str(exc_info.value)
+    assert "name of field 1" in message
+
+
+@pytest.mark.anyio
+async def test_urlencoded_rejects_conflicting_explicit_charset():
+    with pytest.raises(httpx.FormEncodingError, match="Conflicting form encodings"):
+        httpx.Request(
+            method,
+            url,
+            data={"k": "café"},
+            headers={
+                "Content-Type": "application/x-www-form-urlencoded; charset=shift_jis"
+            },
+            form_charset="latin-1",
+        )
+
+
+@pytest.mark.anyio
+async def test_urlencoded_accepts_matching_explicit_charset_alias():
+    request = httpx.Request(
+        method,
+        url,
+        data={"k": "café"},
+        headers={
+            "Content-Type": "application/x-www-form-urlencoded; charset=ISO-8859-1"
+        },
+        form_charset="latin-1",
+    )
+
+    content = b"".join(list(request.stream))
+    assert (
+        request.headers["Content-Type"]
+        == "application/x-www-form-urlencoded; charset=ISO-8859-1"
+    )
+    assert content == b"k=caf%E9"
+
+
+@pytest.mark.anyio
+async def test_urlencoded_unknown_charset_raises_lookup_error():
+    with pytest.raises(LookupError):
+        httpx.Request(
+            method, url, data={"k": "a"}, form_charset="not-a-real-charset"
+        )
+
+
+@pytest.mark.anyio
+async def test_urlencoded_form_charset_does_not_affect_raw_bytes():
+    request = httpx.Request(
+        method, url, content=b"\xff\xfe raw", form_charset="latin-1"
+    )
+
+    content = b"".join(list(request.stream))
+    assert content == b"\xff\xfe raw"
+    assert "Content-Type" not in request.headers
 
 
 @pytest.mark.anyio
@@ -516,3 +655,92 @@ def test_allow_nan_false():
         ValueError, match="Out of range float values are not JSON compliant"
     ):
         httpx.Response(200, json=data_with_inf)
+
+
+def test_urlencoded_charset_via_build_request():
+    client = httpx.Client()
+    request = client.build_request(
+        method, url, data={"greeting": "café"}, form_charset="latin-1"
+    )
+
+    assert (
+        request.headers["Content-Type"]
+        == "application/x-www-form-urlencoded; charset=iso8859-1"
+    )
+    assert request.content == b"greeting=caf%E9"
+
+
+@pytest.mark.anyio
+async def test_urlencoded_charset_bytes_seen_by_transport():
+    seen = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen["content_type"] = request.headers.get("Content-Type")
+        seen["content"] = request.content
+        return httpx.Response(200)
+
+    transport = httpx.MockTransport(handler)
+
+    with httpx.Client(transport=transport) as client:
+        client.request(
+            method,
+            url,
+            data={"greeting": "café"},
+            form_charset="latin-1",
+        )
+
+    assert (
+        seen["content_type"]
+        == "application/x-www-form-urlencoded; charset=iso8859-1"
+    )
+    assert seen["content"] == b"greeting=caf%E9"
+
+
+@pytest.mark.anyio
+async def test_urlencoded_charset_fails_before_reaching_transport():
+    calls = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        return httpx.Response(200)
+
+    transport = httpx.MockTransport(handler)
+
+    with httpx.Client(transport=transport) as client:
+        with pytest.raises(httpx.FormEncodingError):
+            client.request(
+                method,
+                url,
+                data={"bad": "中文"},
+                form_charset="latin-1",
+            )
+
+    assert calls == 0
+
+
+@pytest.mark.anyio
+async def test_form_charset_does_not_affect_multipart():
+    seen = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen["content_type"] = request.headers.get("Content-Type")
+        seen["content"] = request.content
+        return httpx.Response(200)
+
+    transport = httpx.MockTransport(handler)
+    files = {"file": ("upload", b"<file content>", "application/octet-stream")}
+
+    with httpx.Client(transport=transport) as client:
+        client.request(
+            method,
+            url,
+            data={"message": "中文"},
+            files=files,
+            form_charset="latin-1",
+        )
+
+    assert seen["content_type"].startswith("multipart/form-data")
+    assert "charset" not in seen["content_type"]
+    # Multipart fields keep their existing UTF-8 behaviour.
+    assert "中文".encode("utf-8") in seen["content"]

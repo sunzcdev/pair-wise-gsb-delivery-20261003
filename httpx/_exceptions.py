@@ -45,6 +45,7 @@ __all__ = [
     "ConnectTimeout",
     "CookieConflict",
     "DecodingError",
+    "FormEncodingError",
     "HTTPError",
     "HTTPStatusError",
     "InvalidURL",
@@ -286,6 +287,15 @@ class CookieConflict(Exception):
 
     def __init__(self, message: str) -> None:
         super().__init__(message)
+
+
+class FormEncodingError(ValueError):
+    """
+    Raised when form data cannot be encoded using the requested charset.
+
+    The error is raised while the request is being built, before any data is
+    sent, and the message identifies the position of the offending field.
+    """
 
 
 # Stream exceptions...

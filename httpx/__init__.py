@@ -50,6 +50,7 @@ __all__ = [
     "DecodingError",
     "delete",
     "DigestAuth",
+    "FormEncodingError",
     "FunctionAuth",
     "get",
     "head",

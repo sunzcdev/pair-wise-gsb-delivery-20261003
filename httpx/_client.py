@@ -350,6 +350,7 @@ class BaseClient:
         headers: HeaderTypes | None = None,
         cookies: CookieTypes | None = None,
         timeout: TimeoutTypes | UseClientDefault = USE_CLIENT_DEFAULT,
+        form_charset: str | None = None,
         extensions: RequestExtensions | None = None,
     ) -> Request:
         """
@@ -385,6 +386,7 @@ class BaseClient:
             params=params,
             headers=headers,
             cookies=cookies,
+            form_charset=form_charset,
             extensions=extensions,
         )
 
@@ -783,6 +785,7 @@ class Client(BaseClient):
         auth: AuthTypes | UseClientDefault | None = USE_CLIENT_DEFAULT,
         follow_redirects: bool | UseClientDefault = USE_CLIENT_DEFAULT,
         timeout: TimeoutTypes | UseClientDefault = USE_CLIENT_DEFAULT,
+        form_charset: str | None = None,
         extensions: RequestExtensions | None = None,
     ) -> Response:
         """
@@ -820,6 +823,7 @@ class Client(BaseClient):
             headers=headers,
             cookies=cookies,
             timeout=timeout,
+            form_charset=form_charset,
             extensions=extensions,
         )
         return self.send(request, auth=auth, follow_redirects=follow_redirects)
@@ -840,6 +844,7 @@ class Client(BaseClient):
         auth: AuthTypes | UseClientDefault | None = USE_CLIENT_DEFAULT,
         follow_redirects: bool | UseClientDefault = USE_CLIENT_DEFAULT,
         timeout: TimeoutTypes | UseClientDefault = USE_CLIENT_DEFAULT,
+        form_charset: str | None = None,
         extensions: RequestExtensions | None = None,
     ) -> typing.Iterator[Response]:
         """
@@ -863,6 +868,7 @@ class Client(BaseClient):
             headers=headers,
             cookies=cookies,
             timeout=timeout,
+            form_charset=form_charset,
             extensions=extensions,
         )
         response = self.send(
@@ -1497,6 +1503,7 @@ class AsyncClient(BaseClient):
         auth: AuthTypes | UseClientDefault | None = USE_CLIENT_DEFAULT,
         follow_redirects: bool | UseClientDefault = USE_CLIENT_DEFAULT,
         timeout: TimeoutTypes | UseClientDefault = USE_CLIENT_DEFAULT,
+        form_charset: str | None = None,
         extensions: RequestExtensions | None = None,
     ) -> Response:
         """
@@ -1535,6 +1542,7 @@ class AsyncClient(BaseClient):
             headers=headers,
             cookies=cookies,
             timeout=timeout,
+            form_charset=form_charset,
             extensions=extensions,
         )
         return await self.send(request, auth=auth, follow_redirects=follow_redirects)
@@ -1555,6 +1563,7 @@ class AsyncClient(BaseClient):
         auth: AuthTypes | UseClientDefault | None = USE_CLIENT_DEFAULT,
         follow_redirects: bool | UseClientDefault = USE_CLIENT_DEFAULT,
         timeout: TimeoutTypes | UseClientDefault = USE_CLIENT_DEFAULT,
+        form_charset: str | None = None,
         extensions: RequestExtensions | None = None,
     ) -> typing.AsyncIterator[Response]:
         """
@@ -1578,6 +1587,7 @@ class AsyncClient(BaseClient):
             headers=headers,
             cookies=cookies,
             timeout=timeout,
+            form_charset=form_charset,
             extensions=extensions,
         )
         response = await self.send(

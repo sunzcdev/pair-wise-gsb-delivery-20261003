@@ -23,6 +23,7 @@ from ._decoders import (
 )
 from ._exceptions import (
     CookieConflict,
+    FormEncodingError,
     HTTPStatusError,
     RequestNotRead,
     ResponseNotRead,
@@ -393,6 +394,7 @@ class Request:
         files: RequestFiles | None = None,
         json: typing.Any | None = None,
         stream: SyncByteStream | AsyncByteStream | None = None,
+        form_charset: str | None = None,
         extensions: RequestExtensions | None = None,
     ) -> None:
         self.method = method.upper()
@@ -405,6 +407,21 @@ class Request:
 
         if stream is None:
             content_type: str | None = self.headers.get("content-type")
+            if form_charset is not None and data and not files:
+                # The body and its Content-Type header must advertise the same
+                # charset. Refuse to send a request where the two disagree.
+                requested_charset = codecs.lookup(form_charset).name
+                header_charset = _parse_content_type_charset(content_type or "")
+                if (
+                    header_charset is not None
+                    and codecs.lookup(header_charset).name != requested_charset
+                ):
+                    raise FormEncodingError(
+                        "Conflicting form encodings: "
+                        f"form_charset={requested_charset!r} but the "
+                        "Content-Type header declares "
+                        f"charset={header_charset!r}."
+                    )
             headers, stream = encode_request(
                 content=content,
                 data=data,
@@ -415,6 +432,7 @@ class Request:
                     if content_type
                     else None
                 ),
+                form_charset=form_charset,
             )
             self._prepare(headers)
             self.stream = stream

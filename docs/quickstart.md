@@ -169,6 +169,38 @@ Form encoded data can also include multiple values from a given key.
 }
 ```
 
+### Character set
+
+Form encoded data is encoded as UTF-8 by default. Some legacy APIs require a
+different character set. Use `form_charset` to encode both the field names and
+values with a specific codec. The same codec is advertised in the
+`Content-Type` header so that the header and the body always agree.
+
+```pycon
+>>> data = {'greeting': 'café'}
+>>> request = httpx.Request(
+...     "POST",
+...     "https://httpbin.org/post",
+...     data=data,
+...     form_charset="iso-8859-1",
+... )
+>>> request.headers["Content-Type"]
+'application/x-www-form-urlencoded; charset=iso8859-1'
+>>> request.content
+b'greeting=caf%E9'
+```
+
+The setting applies per request through `Client.request(...)`,
+`Client.build_request(...)`, or `httpx.Request(...)`. Repeated keys and the
+order of key/value pairs are preserved. If a field cannot be represented in
+the requested character set, an `httpx.FormEncodingError` is raised while the
+request is being built, before anything is sent, and the error message
+identifies the offending field. Passing a `form_charset` that conflicts with
+an explicit `Content-Type` header charset also raises `FormEncodingError`.
+
+This setting only affects `application/x-www-form-urlencoded` form data. Raw
+`content=...` bytes and multipart file uploads are not affected by it.
+
 ## Sending Multipart File Uploads
 
 You can also upload files, using HTTP multipart encoding:

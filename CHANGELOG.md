@@ -13,6 +13,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 ### Added
 
 * Expose `FunctionAuth` from the public API. (#3699)
+* Add `form_charset` to `Request`, `Client.request()`, `Client.stream()`,
+  `AsyncClient.request()` and `AsyncClient.stream()` to encode
+  `application/x-www-form-urlencoded` field names and values using a chosen
+  character set, with a matching `Content-Type` header. Raise
+  `FormEncodingError` before sending when a field cannot be encoded or the
+  charset conflicts with an explicit `Content-Type` header.
 
 ## 0.28.1 (6th December, 2024)
 

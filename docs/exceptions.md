@@ -29,6 +29,7 @@ For an overview of how to work with HTTPX exceptions, see [Exceptions (Quickstar
     * HTTPStatusError
 * InvalidURL
 * CookieConflict
+* FormEncodingError
 * StreamError
     * StreamConsumed
     * ResponseNotRead
@@ -106,6 +107,9 @@ For an overview of how to work with HTTPX exceptions, see [Exceptions (Quickstar
     :docstring:
 
 ::: httpx.CookieConflict
+    :docstring:
+
+::: httpx.FormEncodingError
     :docstring:
 
 ::: httpx.StreamError

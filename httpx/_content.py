@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import codecs
 import inspect
 import warnings
 from json import dumps as json_dumps
@@ -11,9 +12,9 @@ from typing import (
     Iterator,
     Mapping,
 )
-from urllib.parse import urlencode
+from urllib.parse import quote_plus
 
-from ._exceptions import StreamClosed, StreamConsumed
+from ._exceptions import FormEncodingError, StreamClosed, StreamConsumed
 from ._multipart import MultipartStream
 from ._types import (
     AsyncByteStream,
@@ -133,18 +134,60 @@ def encode_content(
     raise TypeError(f"Unexpected type for 'content', {type(content)!r}")
 
 
+def _encode_form_field(value: str, charset: str, position: str) -> str:
+    """
+    Percent-encode a single form field name or value using the given charset.
+
+    `position` is a human readable description of where the field sits within
+    the submitted data, and is surfaced in the error if the value cannot be
+    encoded using `charset`.
+    """
+    try:
+        return quote_plus(value, encoding=charset)
+    except UnicodeEncodeError as exc:
+        raise FormEncodingError(
+            f"Cannot encode {position} using charset {charset!r}: "
+            f"character {exc.object[exc.start:exc.end]!r} at index "
+            f"{exc.start} is not representable in this charset."
+        ) from exc
+
+
 def encode_urlencoded_data(
     data: RequestData,
+    charset: str = "utf-8",
 ) -> tuple[dict[str, str], ByteStream]:
-    plain_data = []
-    for key, value in data.items():
+    # Resolve the canonical codec name up front, so an unknown charset fails
+    # loudly rather than producing a body that disagrees with the header.
+    charset = codecs.lookup(charset).name
+
+    encoded_parts: list[str] = []
+    for field_index, (key, value) in enumerate(data.items()):
         if isinstance(value, (list, tuple)):
-            plain_data.extend([(key, primitive_value_to_str(item)) for item in value])
+            values = [primitive_value_to_str(item) for item in value]
         else:
-            plain_data.append((key, primitive_value_to_str(value)))
-    body = urlencode(plain_data, doseq=True).encode("utf-8")
+            values = [primitive_value_to_str(value)]
+
+        encoded_key = _encode_form_field(
+            primitive_value_to_str(key),
+            charset,
+            f"the name of field {field_index + 1}",
+        )
+        for value_index, item in enumerate(values):
+            encoded_value = _encode_form_field(
+                item,
+                charset,
+                f"the value of field {field_index + 1}, item {value_index + 1}",
+            )
+            encoded_parts.append(f"{encoded_key}={encoded_value}")
+
+    body = "&".join(encoded_parts).encode("ascii")
     content_length = str(len(body))
-    content_type = "application/x-www-form-urlencoded"
+    if charset == "utf-8":
+        # Preserve the historical default content type, which omits any
+        # charset parameter while still encoding the body as UTF-8.
+        content_type = "application/x-www-form-urlencoded"
+    else:
+        content_type = f"application/x-www-form-urlencoded; charset={charset}"
     headers = {"Content-Length": content_length, "Content-Type": content_type}
     return headers, ByteStream(body)
 
@@ -189,6 +232,7 @@ def encode_request(
     files: RequestFiles | None = None,
     json: Any | None = None,
     boundary: bytes | None = None,
+    form_charset: str | None = None,
 ) -> tuple[dict[str, str], SyncByteStream | AsyncByteStream]:
     """
     Handles encoding the given `content`, `data`, `files`, and `json`,
@@ -211,7 +255,7 @@ def encode_request(
     elif files:
         return encode_multipart_data(data or {}, files, boundary)
     elif data:
-        return encode_urlencoded_data(data)
+        return encode_urlencoded_data(data, charset=form_charset or "utf-8")
     elif json is not None:
         return encode_json(json)
 
