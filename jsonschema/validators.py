@@ -137,6 +137,67 @@ _REMOTE_WARNING_REGISTRY = SPECIFICATIONS.combine(
 )
 
 
+def _closed_retrieve(uri: str):
+    # A closed registry has no way to fetch anything it wasn't given.
+    # Raising `NoSuchResource` makes the referencing layer turn this into
+    # an `Unresolvable` reference, which jsonschema reports explicitly as
+    # a closed-reference configuration error rather than attempting any
+    # network or local filesystem access.
+    raise referencing.exceptions.NoSuchResource(ref=uri)
+
+
+def _is_closed_registry(registry: object) -> bool:
+    return getattr(registry, "_retrieve", None) is _closed_retrieve
+
+
+def closed_registry(
+    resources: Iterable[tuple[str, referencing.jsonschema.Resource]] = (),
+) -> referencing.jsonschema.SchemaRegistry:
+    """
+    Build a *closed* registry containing only explicitly registered resources.
+
+    A closed registry never retrieves a resource from an implicit source --
+    not over the network, not from the local filesystem, and not from any
+    other location. References may only resolve to resources that are part
+    of the returned registry, so validation is fully deterministic and safe
+    to run inside an offline pipeline.
+
+    Following a reference whose target URI has not been registered raises a
+    `jsonschema.exceptions.ClosedReferenceError` describing the missing
+    resource and the chain of references which led to it. This is an error
+    in the referencing configuration, not an invalid instance, and therefore
+    is raised even from underneath keywords such as :kw:`anyOf` or
+    :kw:`oneOf`.
+
+    Relative references, fragment anchors (including ``#``-only pointers)
+    and nested resources are still resolved normally relative to each
+    resource's base URI, and recursion within a registered resource remains
+    supported.
+
+    The JSON Schema meta-schemas are always included, so :kw:`$schema`
+    keywords and references to the built-in dialects continue to resolve.
+
+    Arguments:
+
+        resources:
+
+            an iterable of ``(uri, resource)`` pairs to make available, as
+            accepted by `referencing.Registry.with_resources`.
+
+    Returns:
+
+        a closed `referencing.Registry` pre-populated with the given
+        resources and the built-in meta-schemas
+
+    """
+    registry = referencing.Registry(  # type: ignore[call-arg]
+        retrieve=_closed_retrieve,
+    )
+    if resources:
+        registry = registry.with_resources(resources)
+    return SPECIFICATIONS.combine(registry)
+
+
 def create(
     meta_schema: referencing.jsonschema.ObjectSchema,
     validators: (
@@ -249,6 +310,11 @@ def create(
             kw_only=True,
             repr=False,
         )
+        # Whether the registry forbids implicit (network / filesystem /
+        # other external) retrieval. Such registries report missing
+        # references as explicit configuration errors rather than as
+        # ordinary instance validation failures.
+        _closed = field(default=False, init=False, repr=False, eq=False)
 
         def __init_subclass__(cls):
             warnings.warn(
@@ -283,6 +349,7 @@ def create(
             cls.evolve = evolve
 
         def __attrs_post_init__(self):
+            self._closed = _is_closed_registry(self._registry)
             if self._resolver is None:
                 registry = self._registry
                 if registry is not _REMOTE_WARNING_REGISTRY:
@@ -461,11 +528,37 @@ def create(
                 exc = exceptions.UnknownType(type, instance, self.schema)
                 raise exc from None
 
+        def _closed_reference_error(self, ref):
+            base_uri = self._resolver._base_uri
+            uri, _ = urldefrag(urljoin(base_uri, ref))
+            # `_previous` records each base URI we have already moved
+            # through, newest first, and `base_uri` is the resource from
+            # which the failing reference was made. Reversing it (and
+            # appending the missing URI) reconstructs the full chain in
+            # traversal order for diagnostics. An empty base -- a root
+            # schema without an `$id` -- is omitted for clarity.
+            chain = (
+                *(each for each in reversed(self._resolver._previous) if each),
+                *((base_uri,) if base_uri else ()),
+                uri,
+            )
+            return exceptions.ClosedReferenceError(
+                ref=ref,
+                uri=uri,
+                reference_chain=chain,
+            )
+
         def _validate_reference(self, ref, instance):
             if self._ref_resolver is None:
                 try:
                     resolved = self._resolver.lookup(ref)
+                except exceptions.ClosedReferenceError:
+                    # A closed-reference failure encountered deeper in the
+                    # chain already carries the full reference chain.
+                    raise
                 except referencing.exceptions.Unresolvable as err:
+                    if self._closed:
+                        raise self._closed_reference_error(ref) from err
                     raise exceptions._WrappedReferencingError(err) from err
 
                 return self.descend(

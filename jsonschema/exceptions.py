@@ -13,6 +13,7 @@ import warnings
 
 from attrs import define
 from referencing.exceptions import Unresolvable as _Unresolvable
+import attrs
 
 from jsonschema import _utils
 
@@ -281,6 +282,55 @@ class _WrappedReferencingError(
 
     def __str__(self):
         return f"{self._wrapped.__class__.__name__}: {self._wrapped}"
+
+
+@attrs.frozen
+class ClosedReferenceError(_Unresolvable):
+    """
+    A reference could not be resolved under a closed referencing registry.
+
+    A *closed* registry only contains the resources explicitly registered
+    with it. It never retrieves additional resources, whether over the
+    network, from the local filesystem or from any other implicit source,
+    so encountering a reference whose target has not been registered is an
+    error in the referencing configuration rather than an instance being
+    invalid under the schema.
+
+    Unlike an ordinary `ValidationError`, this error is raised (and is not
+    swallowed by keywords such as :kw:`anyOf` or :kw:`oneOf`), because the
+    schema could not even be fully resolved and therefore no meaningful
+    validation result exists.
+
+    Attributes:
+
+        ref:
+            the exact reference which failed to resolve, as it appeared in
+            the schema
+
+        uri:
+            the fully resolved URI which was looked up and found missing
+            from the registry
+
+        reference_chain:
+            the chain of references traversed before reaching the missing
+            resource, in resolution order. The first element is the
+            outermost reference and the last element is ``ref`` itself.
+
+    """
+
+    ref: str
+    uri: str
+    reference_chain: tuple[str, ...] = ()
+
+    def __str__(self) -> str:
+        chain = " -> ".join(repr(each) for each in self.reference_chain)
+        message = (
+            "Referencing is closed, and no resource is registered for "
+            f"{self.uri!r} (from reference {self.ref!r})"
+        )
+        if chain:
+            message += f". Reference chain: {chain}"
+        return message
 
 
 class UndefinedTypeCheck(Exception):

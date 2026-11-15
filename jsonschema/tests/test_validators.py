@@ -2367,6 +2367,252 @@ class TestReferencing(TestCase):
         self.assertFalse(w)
 
 
+class TestClosedReferencing(TestCase):
+    """
+    A closed registry only resolves references to registered resources.
+
+    Missing references are configuration errors (a resource the caller
+    forgot to provide), not invalid instances, and therefore are raised
+    rather than reported as ordinary validation failures -- even from
+    within keywords such as anyOf which otherwise swallow sub-errors.
+    """
+
+    def test_it_is_exported_from_the_package(self):
+        from jsonschema import closed_registry
+
+        self.assertIs(closed_registry, validators.closed_registry)
+
+    def test_a_missing_reference_raises_a_closed_reference_error(self):
+        registry = validators.closed_registry()
+        schema = {"$ref": "https://example.com/missing"}
+        validator = validators.Draft202012Validator(schema, registry=registry)
+
+        with self.assertRaises(exceptions.ClosedReferenceError) as cm:
+            validator.validate(12)
+
+        error = cm.exception
+        self.assertIsInstance(error, referencing.exceptions.Unresolvable)
+        self.assertEqual(error.ref, "https://example.com/missing")
+        self.assertEqual(error.uri, "https://example.com/missing")
+        self.assertEqual(
+            error.reference_chain,
+            ("https://example.com/missing",),
+        )
+
+    def test_the_error_records_the_missing_resource_and_reference_chain(self):
+        a = DRAFT202012.create_resource(
+            {"$id": "https://example.com/a.json", "$ref": "b.json"},
+        )
+        b = DRAFT202012.create_resource(
+            {"$id": "https://example.com/b.json", "$ref": "c.json"},
+        )
+        registry = validators.closed_registry(
+            [
+                ("https://example.com/a.json", a),
+                ("https://example.com/b.json", b),
+            ],
+        )
+        validator = validators.Draft202012Validator(
+            {"$ref": "https://example.com/a.json"},
+            registry=registry,
+        )
+
+        with self.assertRaises(exceptions.ClosedReferenceError) as cm:
+            validator.validate(12)
+
+        self.assertEqual(cm.exception.ref, "c.json")
+        self.assertEqual(cm.exception.uri, "https://example.com/c.json")
+        self.assertEqual(
+            cm.exception.reference_chain,
+            (
+                "https://example.com/a.json",
+                "https://example.com/b.json",
+                "https://example.com/c.json",
+            ),
+        )
+        self.assertIn("c.json", str(cm.exception))
+        # The underlying referencing error is preserved as the cause.
+        self.assertIsInstance(
+            cm.exception.__cause__,
+            referencing.exceptions.Unresolvable,
+        )
+
+    def test_the_reference_chain_is_reported_in_traversal_order(self):
+        def resource(name, ref):
+            return DRAFT202012.create_resource(
+                {"$id": f"https://example.com/{name}", "$ref": ref},
+            )
+
+        registry = validators.closed_registry(
+            [
+                ("https://example.com/a", resource("a", "b")),
+                ("https://example.com/b", resource("b", "c")),
+                ("https://example.com/c", resource("c", "d")),
+            ],
+        )
+        validator = validators.Draft202012Validator(
+            {"$ref": "https://example.com/a"},
+            registry=registry,
+        )
+
+        with self.assertRaises(exceptions.ClosedReferenceError) as cm:
+            validator.validate(12)
+
+        self.assertEqual(
+            cm.exception.reference_chain,
+            (
+                "https://example.com/a",
+                "https://example.com/b",
+                "https://example.com/c",
+                "https://example.com/d",
+            ),
+        )
+
+    def test_it_never_retrieves_over_the_network_or_filesystem(self):
+        registry = validators.closed_registry()
+        validator = validators.Draft202012Validator(
+            {"$ref": "https://example.com/missing"},
+            registry=registry,
+        )
+
+        with (
+            mock.patch("urllib.request.urlopen") as urlopen,
+            mock.patch(
+                "jsonschema.validators._warn_for_remote_retrieve",
+            ) as remote,
+        ):
+            with self.assertRaises(exceptions.ClosedReferenceError):
+                validator.validate(12)
+
+        self.assertFalse(urlopen.called)
+        self.assertFalse(remote.called)
+
+    def test_file_references_are_not_read_from_disk(self):
+        registry = validators.closed_registry()
+        validator = validators.Draft202012Validator(
+            {"$ref": "file:///does/not/exist"},
+            registry=registry,
+        )
+
+        with self.assertRaises(exceptions.ClosedReferenceError) as cm:
+            validator.validate(12)
+        self.assertEqual(cm.exception.uri, "file:///does/not/exist")
+
+    def test_anyOf_does_not_swallow_a_closed_reference_error(self):
+        registry = validators.closed_registry()
+        schema = {
+            "anyOf": [
+                {"$ref": "https://example.com/missing"},
+                {"type": "integer"},
+            ],
+        }
+        validator = validators.Draft202012Validator(schema, registry=registry)
+
+        # Whether or not another branch would have matched, the
+        # unresolvable reference is raised instead of a business error.
+        for instance in (12, "not an integer"):
+            with self.assertRaises(exceptions.ClosedReferenceError):
+                validator.validate(instance)
+            with self.assertRaises(exceptions.ClosedReferenceError):
+                validator.is_valid(instance)
+
+    def test_oneOf_and_allOf_also_propagate_closed_reference_errors(self):
+        registry = validators.closed_registry()
+        for keyword in ("oneOf", "allOf"):
+            validator = validators.Draft202012Validator(
+                {keyword: [{"$ref": "urn:example:missing"}]},
+                registry=registry,
+            )
+            with self.assertRaises(exceptions.ClosedReferenceError):
+                validator.validate(12)
+
+    def test_relative_ids_anchors_and_nested_resources_still_resolve(self):
+        root = {
+            "$id": "https://example.com/root.json",
+            "type": "object",
+            "properties": {
+                "name": {"$ref": "inner.json#thing"},
+                "age": {"$ref": "#/$defs/ptr"},
+            },
+            "$defs": {
+                "inner": {
+                    "$id": "inner.json",
+                    "$anchor": "thing",
+                    "type": "string",
+                },
+                "ptr": {"type": "integer"},
+            },
+        }
+        registry = validators.closed_registry(
+            [
+                (
+                    "https://example.com/root.json",
+                    DRAFT202012.create_resource(root),
+                ),
+            ],
+        )
+        validator = validators.Draft202012Validator(root, registry=registry)
+
+        self.assertTrue(validator.is_valid({"name": "hello", "age": 3}))
+        self.assertFalse(validator.is_valid({"name": 9, "age": 3}))
+        self.assertFalse(validator.is_valid({"name": "hello", "age": "x"}))
+
+    def test_recursion_within_a_registered_resource_is_allowed(self):
+        tree = {
+            "$id": "https://example.com/tree.json",
+            "type": "object",
+            "properties": {"child": {"$ref": "#"}},
+        }
+        registry = validators.closed_registry(
+            [
+                (
+                    "https://example.com/tree.json",
+                    DRAFT202012.create_resource(tree),
+                ),
+            ],
+        )
+        validator = validators.Draft202012Validator(
+            {"$ref": "https://example.com/tree.json"},
+            registry=registry,
+        )
+
+        self.assertTrue(
+            validator.is_valid({"child": {"child": {}}}),
+        )
+        self.assertFalse(
+            validator.is_valid({"child": {"child": 5}}),
+        )
+
+    def test_registered_resources_validate_instances_normally(self):
+        resource = DRAFT202012.create_resource({"type": "integer"})
+        registry = validators.closed_registry(
+            [("urn:example:integer", resource)],
+        )
+        validator = validators.Draft202012Validator(
+            {"$ref": "urn:example:integer"},
+            registry=registry,
+        )
+
+        self.assertTrue(validator.is_valid(7))
+        errors = list(validator.iter_errors("a string"))
+        self.assertEqual(len(errors), 1)
+        self.assertEqual(errors[0].validator, "type")
+        self.assertNotIsInstance(errors[0], exceptions.ClosedReferenceError)
+
+    def test_a_non_closed_registry_keeps_the_wrapped_error_behavior(self):
+        registry = referencing.Registry()
+        validator = validators.Draft202012Validator(
+            {"$ref": "urn:example:missing"},
+            registry=registry,
+        )
+
+        with self.assertRaises(referencing.exceptions.Unresolvable):
+            validator.validate(12)
+        with self.assertRaises(Exception) as cm:
+            validator.validate(12)
+        self.assertNotIsInstance(cm.exception, exceptions.ClosedReferenceError)
+
+
 class TestRefResolver(TestCase):
     base_uri = ""
     stored_uri = "foo://stored"

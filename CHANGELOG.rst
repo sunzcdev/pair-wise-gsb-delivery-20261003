@@ -1,6 +1,11 @@
 v4.27.0
 =======
 
+* Add `jsonschema.closed_registry`, which builds a *closed* `referencing.Registry` for offline pipelines.
+  Such a registry only resolves references to explicitly registered resources and never implicitly retrieves anything over the network or from the local filesystem.
+  A reference whose target is not registered now raises a `jsonschema.exceptions.ClosedReferenceError` that reports the missing resource URI and the full reference chain.
+  This is a referencing-configuration error rather than an instance validation failure, so it is raised even from underneath ``anyOf``, ``oneOf`` or ``allOf`` instead of being reported as a business validation error.
+  Relative references, fragment anchors, nested resources and recursion within registered resources continue to resolve normally.
 * Support for Python 3.10 and 3.11 has been dropped.
 * Improve ``best_match`` for ``anyOf`` / ``oneOf`` errors: the most relevant error is now found within each subschema separately before the deepest of those is picked (#1257, #1300).
   In particular an applicator with a single subschema now produces the same best match as the bare subschema would.

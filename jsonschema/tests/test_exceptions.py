@@ -2,6 +2,7 @@ from unittest import TestCase
 import textwrap
 
 import jsonpath_ng
+import referencing.exceptions
 
 from jsonschema import exceptions
 from jsonschema.validators import _LATEST_VERSION
@@ -1113,3 +1114,57 @@ class TestJsonPathRendering(TestCase):
 
     def test_open_bracket(self):
         self.validate_json_path_rendering("[", "$['[']")
+
+
+class TestClosedReferenceError(TestCase):
+    def test_it_is_an_unresolvable_reference_error(self):
+        error = exceptions.ClosedReferenceError(
+            ref="d.json",
+            uri="https://example.com/d.json",
+            reference_chain=(
+                "https://example.com/a.json",
+                "https://example.com/d.json",
+            ),
+        )
+        self.assertIsInstance(error, referencing.exceptions.Unresolvable)
+        self.assertEqual(error.ref, "d.json")
+        self.assertEqual(error.uri, "https://example.com/d.json")
+
+    def test_it_is_equal_and_hashable_by_contents(self):
+        chain = ("https://example.com/a.json", "https://example.com/d.json")
+        first = exceptions.ClosedReferenceError(
+            ref="d.json",
+            uri="https://example.com/d.json",
+            reference_chain=chain,
+        )
+        second = exceptions.ClosedReferenceError(
+            ref="d.json",
+            uri="https://example.com/d.json",
+            reference_chain=chain,
+        )
+        self.assertEqual(first, second)
+        self.assertEqual(hash(first), hash(second))
+
+    def test_its_message_describes_the_missing_resource_and_chain(self):
+        error = exceptions.ClosedReferenceError(
+            ref="c.json",
+            uri="https://example.com/c.json",
+            reference_chain=(
+                "https://example.com/a.json",
+                "https://example.com/b.json",
+                "https://example.com/c.json",
+            ),
+        )
+        message = str(error)
+        self.assertIn("https://example.com/c.json", message)
+        self.assertIn("c.json", message)
+        self.assertIn("https://example.com/a.json", message)
+        self.assertIn("Reference chain", message)
+
+    def test_it_is_not_a_validation_error(self):
+        error = exceptions.ClosedReferenceError(
+            ref="x",
+            uri="urn:example:x",
+            reference_chain=("urn:example:x",),
+        )
+        self.assertNotIsInstance(error, exceptions.ValidationError)

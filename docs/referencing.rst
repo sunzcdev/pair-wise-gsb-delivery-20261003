@@ -299,6 +299,60 @@ Retrieving resources from a SQLite database or some other network-accessible res
     You wouldn't want a user causing your machine to go off and retrieve giant files off the network by passing it a ``$ref`` to some huge blob, or exploiting similar vulnerabilities in your setup.
 
 
+.. _closed-referencing:
+
+Closed Referencing for Offline Pipelines
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+When validation runs in an offline pipeline -- for instance a build step, a locked-down service or an environment without network or filesystem access -- the set of schemas which may be referenced is known ahead of time and is provided explicitly by the caller.
+
+For this situation, `jsonschema` provides `jsonschema.closed_registry`, which builds a *closed* `referencing.Registry`.
+A closed registry contains only the resources registered with it (along with the built-in JSON Schema meta-schemas) and will never implicitly retrieve anything: it never makes a network request, never reads a local file and never falls back to any other external source.
+
+.. testcode::
+
+    from referencing.jsonschema import DRAFT202012
+
+    from jsonschema import Draft202012Validator, closed_registry
+
+    integer = DRAFT202012.create_resource({"type": "integer"})
+    registry = closed_registry([("urn:example:integer", integer)])
+
+    validator = Draft202012Validator(
+        {"$ref": "urn:example:integer"},
+        registry=registry,
+    )
+    validator.validate(7)  # passes
+
+Relative references, fragment anchors (including ``#``-only JSON pointers) and nested resources continue to resolve normally, relative to the base URI established by each resource's :kw:`$id`, and recursion within a registered resource remains fully supported.
+
+If a reference points at a URI which was never registered, a `jsonschema.exceptions.ClosedReferenceError` is raised.
+It reports both the fully resolved URI of the *missing resource* and the complete *reference chain* traversed to reach it, which makes misconfigured pipelines straightforward to diagnose:
+
+.. testcode::
+
+    failing = Draft202012Validator(
+        {"$ref": "urn:example:not-registered"},
+        registry=registry,
+    )
+    try:
+        failing.validate(7)
+    except Exception as error:
+        print(type(error).__name__)
+        print(error.uri)
+        print(error.reference_chain)
+
+.. testoutput::
+
+    ClosedReferenceError
+    urn:example:not-registered
+    ('urn:example:not-registered',)
+
+This is deliberately different from an instance failing validation.
+A missing reference means the schema itself could not be completely resolved, so no meaningful validation result exists; `jsonschema.exceptions.ClosedReferenceError` is therefore *raised* rather than yielded as a `jsonschema.ValidationError`, and it is not swallowed by keywords such as :kw:`anyOf`, :kw:`oneOf` or :kw:`allOf` -- even when another branch would otherwise have matched.
+
+Note that a plain `referencing.Registry` (i.e. one constructed directly rather than via `jsonschema.closed_registry`) is also closed in the sense that it has no retrieval callable configured, but `jsonschema.closed_registry` additionally guarantees the explicit, chain-aware `jsonschema.exceptions.ClosedReferenceError` described above and pre-loads the JSON Schema meta-schemas.
+
 Migrating From ``RefResolver``
 ------------------------------
 
