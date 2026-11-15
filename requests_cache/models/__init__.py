@@ -9,6 +9,7 @@ from .base import RichMixin
 from .raw_response import CachedHTTPResponse
 from .request import CachedRequest
 from .response import CachedResponse, DecodedContent, OriginalResponse
+from .vary import VaryFamily, normalize_vary
 
 AnyResponse = Union[OriginalResponse, CachedResponse]
 AnyRequest = Union[Request, PreparedRequest, CachedRequest]

@@ -72,6 +72,14 @@ different `Accept` values for content negotiation) works correctly without extra
 Not all servers send `Vary`, however.
 ```
 
+The set of variants cached for one URL forms a **Vary family**. requests-cache records the
+negotiation rule currently in effect (the normalized `Vary` header set) and the cache keys that
+belong to it. If a server later changes its `Vary` header (for example switching from
+`Vary: Accept-Language` to `Vary: Accept-Encoding`, or sending `Vary: *`), the old family is
+retired atomically and a new rule takes effect, so a variant stored under the outdated rule can
+never be matched again. A response with `Vary: *` never leaves a reusable variant. You can inspect
+the family for a request target via `BaseCache.get_vary_family()`.
+
 Use the `match_headers` option if you want to specify which headers you want to match when `Vary`
 isn't available:
 ```python

@@ -479,6 +479,101 @@ def test_include_get_headers():
     assert session.settings.match_headers is True
 
 
+def test_vary_rule_change__same_url_switches_negotiation(mock_session):
+    """When the origin changes its Vary set, old variants must not match the stale rule and the
+    cached content + keys follow the new negotiation rule."""
+    url = f'{MOCKED_URL}/vary-rule-change'
+    base_key = mock_session.cache.create_key(Request('GET', url).prepare())
+
+    # Phase 1: vary on Accept-Language, two variants cached under distinct keys
+    mock_session.mock_adapter.register_uri(
+        'GET', url, headers={'Vary': 'Accept-Language'}, text='lang', status_code=200
+    )
+    en = mock_session.get(url, headers={'Accept-Language': 'en'})
+    fr = mock_session.get(url, headers={'Accept-Language': 'fr'})
+    assert en.from_cache is False and fr.from_cache is False
+    assert mock_session.get(url, headers={'Accept-Language': 'en'}).from_cache is True
+    assert mock_session.get(url, headers={'Accept-Language': 'fr'}).from_cache is True
+
+    family = mock_session.cache.get_vary_family(base_key)
+    assert family.vary == ('accept-language',)
+    old_member_keys = set(family.member_keys)
+    assert len(old_member_keys) == 2
+
+    # Phase 2: origin now varies on Accept-Encoding instead
+    mock_session.mock_adapter.register_uri(
+        'GET', url, headers={'Vary': 'Accept-Encoding'}, text='enc', status_code=200
+    )
+    gzip = mock_session.get(url, headers={'Accept-Encoding': 'gzip'})
+    assert gzip.from_cache is False
+    assert gzip.text == 'enc'
+
+    # Old language variants are retired; only the re-anchored base entry remains
+    remaining = set(mock_session.cache.responses.keys())
+    assert remaining.isdisjoint(old_member_keys - {base_key})
+    new_family = mock_session.cache.get_vary_family(base_key)
+    assert new_family.vary == ('accept-encoding',)
+    assert new_family.member_keys == [base_key]
+
+    # The same Accept-Encoding request now hits the new family
+    assert mock_session.get(url, headers={'Accept-Encoding': 'gzip'}).from_cache is True
+
+
+def test_vary_rule_change__304_carries_new_vary(mock_session):
+    """A 304 revalidation that carries a changed Vary header must still switch the family rule
+    and retire the outdated variants atomically."""
+    url = f'{MOCKED_URL}/vary-304-change'
+    base_key = mock_session.cache.create_key(Request('GET', url).prepare())
+
+    mock_session.mock_adapter.register_uri(
+        'GET',
+        url,
+        headers={'Vary': 'Accept-Language', 'ETag': '"lang"'},
+        text='lang',
+        status_code=200,
+    )
+    mock_session.get(url, headers={'Accept-Language': 'en'})
+    mock_session.get(url, headers={'Accept-Language': 'fr'})
+    old_member_keys = set(mock_session.cache.get_vary_family(base_key).member_keys)
+    assert len(old_member_keys) == 2
+
+    # Stale revalidation answers 304 with a new negotiation rule
+    mock_session.mock_adapter.register_uri(
+        'GET',
+        url,
+        headers={'Vary': 'Accept-Encoding', 'ETag': '"enc"'},
+        status_code=304,
+    )
+    mock_session.settings.always_revalidate = True
+    response = mock_session.get(url, headers={'Accept-Language': 'fr'})
+
+    family = mock_session.cache.get_vary_family(base_key)
+    assert family.vary == ('accept-encoding',)
+    assert family.member_keys == [base_key]
+    assert set(mock_session.cache.responses.keys()).isdisjoint(old_member_keys - {base_key})
+    # The 304 keeps the previously stored body while updating the Vary rule
+    assert response.text == 'lang'
+
+
+def test_vary_wildcard__never_reuses_variant(mock_session):
+    """Vary: * must never be served from cache and must not leave a reusable variant behind."""
+    url = f'{MOCKED_URL}/vary-wildcard'
+    base_key = mock_session.cache.create_key(Request('GET', url).prepare())
+
+    mock_session.mock_adapter.register_uri(
+        'GET', url, headers={'Vary': '*'}, text='star', status_code=200
+    )
+    first = mock_session.get(url, headers={'Accept': 'a'})
+    second = mock_session.get(url, headers={'Accept': 'a'})
+    assert first.from_cache is False
+    assert second.from_cache is False
+
+    family = mock_session.cache.get_vary_family(base_key)
+    assert family.is_wildcard
+    assert family.member_keys == [base_key]
+    assert sorted(mock_session.cache.responses.keys()) == [base_key]
+
+
 # Error handling
 # -----------------------------------------------------
 

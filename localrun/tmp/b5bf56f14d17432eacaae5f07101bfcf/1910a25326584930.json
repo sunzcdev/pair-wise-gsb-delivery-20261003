@@ -1,0 +1,22 @@
+{
+  "created_at": "2026-11-15T01:25:53.062404+00:00",
+  "elapsed": 0.000141,
+  "encoding": "iso-8859-1",
+  "expires": "2026-11-14T01:25:53.033774+00:00",
+  "headers": {
+    "Content-Type": "text/plain; charset=iso-8859-1"
+  },
+  "request": {
+    "headers": {
+      "Accept": "*/*",
+      "Accept-Encoding": "gzip, deflate",
+      "Connection": "keep-alive",
+      "User-Agent": "python-requests/2.34.2"
+    },
+    "method": "GET",
+    "url": "http+mock://requests-cache.com/text/content-change-encoding"
+  },
+  "status_code": 200,
+  "url": "http+mock://requests-cache.com/text/content-change-encoding",
+  "_decoded_content": "\u00e9"
+}

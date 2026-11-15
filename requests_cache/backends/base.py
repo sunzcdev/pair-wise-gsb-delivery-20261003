@@ -12,7 +12,18 @@ from collections import UserDict
 from datetime import datetime
 from logging import getLogger
 from pickle import PickleError
-from typing import TYPE_CHECKING, Iterable, Iterator, List, MutableMapping, Optional, TypeVar, Union
+from typing import (
+    TYPE_CHECKING,
+    Dict,
+    Iterable,
+    Iterator,
+    List,
+    MutableMapping,
+    Optional,
+    TypeVar,
+    Tuple,
+    Union,
+)
 from warnings import warn
 
 from pathlib import Path
@@ -20,7 +31,7 @@ from pathlib import Path
 from requests import Request, Response
 
 from ..cache_keys import create_key, redact_response
-from ..models import AnyRequest, CachedResponse
+from ..models import AnyRequest, CachedResponse, VaryFamily, normalize_vary
 from ..policy import DEFAULT_CACHE_NAME, CacheSettings, ExpirationTime
 from ..serializers import SerializerType, init_serializer
 
@@ -55,6 +66,10 @@ class BaseCache:
         self.cache_name = cache_name
         self.responses: BaseStorage[str, CachedResponse] = DictStorage()
         self.redirects: BaseStorage[str, str] = DictStorage()
+        # Inspectable Vary-family index, keyed by the base cache key of each request target.
+        # This lives alongside the response storage so a negotiation-rule change can switch an
+        # entire family atomically instead of leaving half-new/half-stale variant entries.
+        self.vary_families: Dict[str, VaryFamily] = {}
         self._settings = CacheSettings()  # Init and public access is done in CachedSession
 
     @property
@@ -88,30 +103,125 @@ class BaseCache:
         self,
         response: Response,
         cache_key: Optional[str] = None,
+        base_cache_key: Optional[str] = None,
         expires: Optional[datetime] = None,
-    ):
+    ) -> str:
         """Save a response to the cache
 
         Args:
             cache_key: Cache key for this response; will otherwise be generated based on request
+            base_cache_key: Primary (non-Vary-qualified) key identifying the request target that
+                owns this response; used to maintain the inspectable Vary-family index
             response: Response to save
             expires: Absolute expiration time for this response
+
+        Returns:
+            The cache key under which the response was actually stored. This may differ from the
+            requested ``cache_key`` when a Vary-rule change re-anchors the family.
         """
         cache_key = cache_key or self.create_key(response.request)
+        base_cache_key = base_cache_key or cache_key
         cached_response = CachedResponse.from_response(response, expires=expires)
         cached_response = redact_response(cached_response, self._settings.ignored_parameters)
+
+        vary = normalize_vary(cached_response.headers.get('Vary'))
+        cache_key, switched = self._update_vary_family(base_cache_key, cache_key, vary)
+        if switched:
+            # A rule change re-anchors the family on the primary key; drop aliases that still
+            # point at retired variant entries so the old rule can never be reached again.
+            self._prune_redirects()
         self.responses[cache_key] = cached_response
 
         # Save redirect aliases, unless this is a revalidation (i.e., it was saved previously)
         if response.history and not cached_response.revalidated:
             for r in response.history:
                 self.redirects[self.create_key(r.request)] = cache_key
+        return cache_key
+
+    def _update_vary_family(
+        self, base_key: str, cache_key: str, vary: Tuple[str, ...]
+    ) -> Tuple[str, bool]:
+        """Maintain the Vary-family index for a request target and return the key under which the
+        response must actually be stored, plus a flag indicating whether the negotiation rule
+        changed.
+
+        Switching rules is all-or-nothing: when the new ``Vary`` set differs from the recorded
+        family (including a change to or from ``Vary: *``), every previously cached member is
+        removed before the new family is registered, so no stale variant can be matched later.
+        """
+        family = self.vary_families.get(base_key)
+
+        # First time we see this target with a negotiation rule.
+        if family is None:
+            if not vary:
+                return cache_key, False
+            family = VaryFamily(vary=vary, anchor_key=base_key, member_keys=[base_key])
+            self.vary_families[base_key] = family
+            if cache_key != base_key:
+                family.add(cache_key)
+            return cache_key, False
+
+        # The origin stopped negotiating: dissolve the family and retire its variants.
+        if not vary:
+            self._remove_family_members(family, keep=base_key)
+            self.vary_families.pop(base_key, None)
+            return cache_key, True
+
+        # The negotiation rule changed: retire the whole old family before registering the new one.
+        switched = family.vary != vary
+        if switched:
+            self._remove_family_members(family, keep=base_key)
+            family.vary = vary
+            family.anchor_key = base_key
+            family.member_keys = [base_key]
+            # The new rule starts from its primary entry; any secondary key derived under the
+            # outdated rule is invalid and must not be written to.
+            cache_key = base_key
+
+        # Vary: * never leaves a reusable variant; always anchor on the primary key.
+        if vary == ('*',):
+            return base_key, switched
+
+        if cache_key != base_key:
+            family.add(cache_key)
+        elif base_key not in family.member_keys:
+            family.add(base_key)
+        return cache_key, switched
+
+    def _remove_family_members(self, family: 'VaryFamily', keep: Optional[str] = None) -> None:
+        """Delete cached responses owned by a family, optionally retaining a key that is about to
+        be rewritten in place."""
+        for key in list(family.member_keys):
+            if key == keep:
+                continue
+            try:
+                del self.responses[key]
+            except KeyError:
+                pass
+
+    def get_vary_family(self, base_cache_key: str) -> Optional['VaryFamily']:
+        """Return the inspectable Vary family registered for a request target, if any"""
+        return self.vary_families.get(base_cache_key)
+
+    def _prune_vary_families(self, deleted_keys: Iterable[str]) -> None:
+        """Keep the Vary-family index consistent after responses are removed.
+
+        A family whose anchor is deleted is dropped along with its remaining variant bookkeeping.
+        Removing an individual secondary variant just drops it from the member list.
+        """
+        deleted = set(deleted_keys)
+        for base_key, family in list(self.vary_families.items()):
+            if base_key in deleted:
+                self.vary_families.pop(base_key, None)
+                continue
+            family.member_keys = [k for k in family.member_keys if k not in deleted]
 
     def clear(self):
         """Delete all items from the cache"""
         logger.info('Clearing all items from the cache')
         self.responses.clear()
         self.redirects.clear()
+        self.vary_families.clear()
 
     def close(self):
         """Close any open backend connections"""
@@ -201,6 +311,7 @@ class BaseCache:
                 pass
         else:
             self.responses.bulk_delete(delete_keys)
+        self._prune_vary_families(delete_keys)
         self._prune_redirects()
 
     def _prune_redirects(self):

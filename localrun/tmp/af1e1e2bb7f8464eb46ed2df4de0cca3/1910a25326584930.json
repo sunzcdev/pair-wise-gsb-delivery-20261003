@@ -1,0 +1,22 @@
+{
+  "_content": "bm90IGpzb24=",
+  "created_at": "2026-11-15T01:24:39.871772+00:00",
+  "elapsed": 0.000348,
+  "encoding": "utf-8",
+  "expires": "2026-11-14T01:24:39.841024+00:00",
+  "headers": {
+    "Content-Type": "application/json"
+  },
+  "request": {
+    "headers": {
+      "Accept": "*/*",
+      "Accept-Encoding": "gzip, deflate",
+      "Connection": "keep-alive",
+      "User-Agent": "python-requests/2.34.2"
+    },
+    "method": "GET",
+    "url": "http+mock://requests-cache.com/text/content-change-encoding"
+  },
+  "status_code": 200,
+  "url": "http+mock://requests-cache.com/text/content-change-encoding"
+}

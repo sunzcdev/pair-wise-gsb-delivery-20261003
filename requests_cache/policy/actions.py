@@ -68,6 +68,8 @@ class CacheActions(RichMixin):
     skip_read: bool = field(default=False)
     skip_write: bool = field(default=False)
     vary_cache_key: Optional[str] = field(default=None)
+    # Primary (non-Vary-qualified) key identifying the request target; stable across Vary changes
+    base_cache_key: Optional[str] = field(default=None, repr=False)
 
     # Inputs
     _directives: CacheDirectives = field(default=None, repr=False)
@@ -138,6 +140,7 @@ class CacheActions(RichMixin):
 
         actions = cls(
             cache_key=cache_key,
+            base_cache_key=cache_key,
             directives=directives,
             expire_after=expire_after,
             only_if_cached=only_if_cached,

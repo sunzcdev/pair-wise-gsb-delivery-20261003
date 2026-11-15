@@ -117,6 +117,12 @@ class SQLiteCache(BaseCache):
             with self.responses._lock:
                 return super().delete(**kwargs)
         else:
+            if expired:
+                # Expired entries may include family anchors; reconcile the index against the
+                # keys that actually remain after the SQL deletion.
+                self._prune_vary_families_after_expiry()
+            else:
+                self._prune_vary_families(keys)
             self._prune_redirects()
 
         # Skip vacuuming if only one key was deleted, or if explicitly disabled
@@ -130,6 +136,18 @@ class SQLiteCache(BaseCache):
                 f'DELETE FROM {self.responses.table_name} WHERE expires <= ?',
                 (round(time()),),
             )
+
+    def _prune_vary_families_after_expiry(self):
+        """Drop Vary families whose anchor (or all members) were removed by expiry cleanup"""
+        with self.responses.connection() as con:
+            surviving = {
+                row[0] for row in con.execute(f'SELECT key FROM {self.responses.table_name}')
+            }
+        for base_key, family in list(self.vary_families.items()):
+            if base_key not in surviving:
+                self.vary_families.pop(base_key, None)
+            else:
+                family.member_keys = [k for k in family.member_keys if k in surviving]
 
     def _prune_redirects(self):
         """A more efficient implementation of removing invalid redirects in SQL"""

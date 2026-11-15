@@ -4,6 +4,7 @@ import pickle
 from datetime import timedelta
 from logging import getLogger
 from pickle import PickleError
+from time import sleep
 from unittest.mock import patch
 
 import pytest
@@ -367,3 +368,170 @@ def test_remove_expired_responses(mock_session):
 
         mock_session.cache.remove_expired_responses()
         assert mock_delete.call_count == 2 and mock_reset.call_count == 1
+
+
+# Vary family index
+# ------------------
+
+
+def _vary_session(url):
+    """An in-memory session plus its base cache key for a single request target"""
+    # Short expiration so a later rule change actually forces contact with the origin again
+    session = CachedSession(backend='memory', expire_after=timedelta(seconds=1))
+    session = mount_mock_adapter(session)
+    base_key = session.cache.create_key(Request('GET', url).prepare())
+    return session, base_key
+
+
+def _register(session, url, vary, **kwargs):
+    headers = {'Vary': vary} if vary else {}
+    session.mock_adapter.register_uri(
+        'GET', url, headers=headers, text=kwargs.pop('text', 'body'), status_code=200, **kwargs
+    )
+
+
+def test_save_response__no_vary_has_no_family():
+    url = f'{MOCKED_URL}/no-vary'
+    session, base_key = _vary_session(url)
+    _register(session, url, None)
+    session.get(url)
+
+    assert session.cache.get_vary_family(base_key) is None
+
+
+def test_save_response__vary_family_tracks_variants():
+    url = f'{MOCKED_URL}/vary-family'
+    session, base_key = _vary_session(url)
+    _register(session, url, 'Accept-Language')
+
+    session.get(url, headers={'Accept-Language': 'en'})
+    session.get(url, headers={'Accept-Language': 'fr'})
+
+    family = session.cache.get_vary_family(base_key)
+    assert family.vary == ('accept-language',)
+    assert family.anchor_key == base_key
+    assert base_key in family.member_keys
+    assert len(family.member_keys) == len(session.cache.responses.keys())
+
+
+def test_save_response__vary_rule_switch_is_atomic():
+    url = f'{MOCKED_URL}/vary-switch'
+    session, base_key = _vary_session(url)
+    _register(session, url, 'Accept-Language')
+    session.get(url, headers={'Accept-Language': 'en'})
+    session.get(url, headers={'Accept-Language': 'fr'})
+    old_keys = set(session.cache.responses.keys())
+    assert len(old_keys) == 2
+
+    # Origin switches negotiation rule to Accept-Encoding
+    sleep(1.1)
+    _register(session, url, 'Accept-Encoding')
+    session.get(url, headers={'Accept-Encoding': 'gzip'})
+
+    remaining = set(session.cache.responses.keys())
+    assert remaining.isdisjoint(old_keys - {base_key})
+    family = session.cache.get_vary_family(base_key)
+    assert family.vary == ('accept-encoding',)
+    assert family.member_keys == [base_key]
+
+
+def test_save_response__vary_wildcard_leaves_no_reusable_variants():
+    url = f'{MOCKED_URL}/vary-star'
+    session, base_key = _vary_session(url)
+    _register(session, url, 'Accept-Language')
+    session.get(url, headers={'Accept-Language': 'en'})
+    session.get(url, headers={'Accept-Language': 'fr'})
+    assert len(session.cache.responses.keys()) == 2
+
+    # Vary: * must discard every reusable variant and anchor on the base key
+    sleep(1.1)
+    _register(session, url, '*')
+    session.get(url, headers={'Accept-Language': 'en'})
+
+    assert sorted(session.cache.responses.keys()) == [base_key]
+    family = session.cache.get_vary_family(base_key)
+    assert family.is_wildcard
+    assert family.member_keys == [base_key]
+
+
+def test_save_response__vary_wildcard_then_normal_rule_resets_family():
+    url = f'{MOCKED_URL}/vary-star-reset'
+    session, base_key = _vary_session(url)
+    _register(session, url, '*')
+    session.get(url)
+    assert session.cache.get_vary_family(base_key).is_wildcard
+
+    sleep(1.1)
+    _register(session, url, 'Accept-Encoding')
+    session.get(url, headers={'Accept-Encoding': 'gzip'})
+    family = session.cache.get_vary_family(base_key)
+    assert family.vary == ('accept-encoding',)
+    assert family.member_keys == [base_key]
+
+
+def test_save_response__dropping_vary_dissolves_family():
+    url = f'{MOCKED_URL}/vary-dropped'
+    session, base_key = _vary_session(url)
+    _register(session, url, 'Accept-Language')
+    session.get(url, headers={'Accept-Language': 'en'})
+    session.get(url, headers={'Accept-Language': 'fr'})
+    assert session.cache.get_vary_family(base_key) is not None
+
+    # Origin stops negotiating: family bookkeeping must be removed and variants retired
+    sleep(1.1)
+    _register(session, url, None)
+    session.get(url, headers={'Accept-Language': 'en'})
+
+    assert session.cache.get_vary_family(base_key) is None
+    assert sorted(session.cache.responses.keys()) == [base_key]
+    # Plain (non-Vary) caching keeps working
+    assert session.get(url, headers={'Accept-Language': 'en'}).from_cache is True
+
+
+def test_delete__prunes_vary_family():
+    url = f'{MOCKED_URL}/vary-delete'
+    session, base_key = _vary_session(url)
+    _register(session, url, 'Accept-Language')
+    session.get(url, headers={'Accept-Language': 'en'})
+    session.get(url, headers={'Accept-Language': 'fr'})
+    secondary_key = next(
+        k for k in session.cache.responses.keys() if k != base_key
+    )
+
+    session.cache.delete(secondary_key)
+    family = session.cache.get_vary_family(base_key)
+    assert family.member_keys == [base_key]
+
+    session.cache.delete(base_key)
+    assert session.cache.get_vary_family(base_key) is None
+
+
+def test_clear__drops_vary_families():
+    url = f'{MOCKED_URL}/vary-clear'
+    session, base_key = _vary_session(url)
+    _register(session, url, 'Accept-Language')
+    session.get(url, headers={'Accept-Language': 'en'})
+    assert session.cache.get_vary_family(base_key) is not None
+
+    session.cache.clear()
+    assert session.cache.vary_families == {}
+
+
+def test_sqlite_delete__prunes_vary_family(tempfile_session):
+    """The SQLite backend overrides delete(); it must still keep the Vary-family index consistent."""
+    from requests_cache.backends.sqlite import SQLiteCache
+
+    assert isinstance(tempfile_session.cache, SQLiteCache)
+    url = f'{MOCKED_URL}/vary-sqlite-delete'
+    session = mount_mock_adapter(tempfile_session)
+    base_key = session.cache.create_key(Request('GET', url).prepare())
+
+    session.mock_adapter.register_uri(
+        'GET', url, headers={'Vary': 'Accept-Language'}, text='body', status_code=200
+    )
+    session.get(url, headers={'Accept-Language': 'en'})
+    session.get(url, headers={'Accept-Language': 'fr'})
+    assert session.cache.get_vary_family(base_key) is not None
+
+    session.cache.delete(base_key)
+    assert session.cache.get_vary_family(base_key) is None
