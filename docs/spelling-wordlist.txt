@@ -24,6 +24,8 @@ indices
 ipv
 iterable
 iteratively
+lint
+linting
 Javascript
 jsonschema
 majorly

@@ -31,6 +31,7 @@ from jsonschema import (
     _utils,
     exceptions,
 )
+from jsonschema._lint import ExtensionVocabulary, LintIssue, lint  # noqa: F401
 
 if TYPE_CHECKING:
     from jsonschema.protocols import Validator
