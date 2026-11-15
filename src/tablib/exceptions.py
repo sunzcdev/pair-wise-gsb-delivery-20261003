@@ -20,3 +20,13 @@ class HeadersNeeded(TablibException, AttributeError):
 
 class UnsupportedFormat(TablibException, NotImplementedError):
     """Format not supported."""
+
+
+class AmbiguousHeadersError(TablibException, ValueError):
+    """Dataset headers cannot be represented unambiguously as mapping keys.
+
+    Raised when a mapping-style view (``Dataset.dict``, JSON or YAML export)
+    is requested for a dataset whose headers are duplicated or blank (``None``
+    or empty string). Headers are never renamed automatically, so that
+    consumers cannot mistake the contract of the exported data.
+    """

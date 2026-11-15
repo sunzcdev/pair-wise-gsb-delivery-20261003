@@ -19,6 +19,7 @@ from copy import copy
 from operator import itemgetter
 
 from .exceptions import (
+    AmbiguousHeadersError,
     HeadersNeeded,
     InvalidDatasetIndex,
     InvalidDatasetType,
@@ -278,9 +279,62 @@ class Dataset:
                 raise InvalidDimensions
             return False
 
-    def _package(self, dicts=True):
-        """Packages Dataset into lists of dictionaries for transmission."""
-        # TODO: Dicts default to false?
+    def _check_mapping_headers(self):
+        """Assures headers can be used as unambiguous mapping keys.
+
+        Raises :class:`AmbiguousHeadersError` if any header is duplicated or
+        blank (``None`` or empty string). Headers are never renamed
+        automatically, so that consumers cannot mistake the contract of the
+        exported data.
+        """
+        duplicates = []
+        blank_positions = []
+        seen = []
+        for pos, header in enumerate(self.headers):
+            if header is None or header == '':
+                blank_positions.append(pos)
+            elif header in seen:
+                if header not in duplicates:
+                    duplicates.append(header)
+            else:
+                seen.append(header)
+
+        if not duplicates and not blank_positions:
+            return
+
+        problems = []
+        if duplicates:
+            problems.append(
+                'duplicate headers: ' + ', '.join(repr(h) for h in duplicates)
+            )
+        if blank_positions:
+            problems.append(
+                'blank headers (None or empty string) at positions: '
+                + ', '.join(str(pos) for pos in blank_positions)
+            )
+        raise AmbiguousHeadersError(
+            'Dataset headers cannot be represented as unambiguous mapping '
+            f"keys ({'; '.join(problems)}). Use a positional export (e.g. "
+            'CSV), pass pairs=True to export lists of (header, value) pairs '
+            'preserving duplicates and order, or pass strict=False to keep '
+            'the legacy behavior where later columns silently overwrite '
+            'earlier ones sharing the same header.'
+        )
+
+    def _package(self, dicts=True, strict=True, pairs=False):
+        """Packages Dataset into lists of dictionaries for transmission.
+
+        :param dicts: when True (the default) and headers are set, rows are
+            packaged as dictionaries keyed by the headers; when False, rows
+            are packaged as plain lists (positional representation).
+        :param strict: when True (the default), mapping-style output raises
+            :class:`AmbiguousHeadersError` on duplicated or blank headers.
+            Pass ``strict=False`` for the legacy lenient behavior where later
+            columns silently overwrite earlier ones sharing the same header.
+        :param pairs: when True, each row is packaged as a list of
+            ``[header, value]`` pairs instead of a dictionary, fully
+            preserving duplicate headers and column order.
+        """
 
         _data = list(self._data)
 
@@ -298,7 +352,16 @@ class Dataset:
 
         if self.headers:
             if dicts:
-                data = [dict(list(zip(self.headers, format_row(row)))) for row in _data]
+                if pairs:
+                    data = [
+                        [[header, value]
+                         for header, value in zip(self.headers, format_row(row))]
+                        for row in _data
+                    ]
+                else:
+                    if strict:
+                        self._check_mapping_headers()
+                    data = [dict(zip(self.headers, format_row(row))) for row in _data]
             else:
                 data = [list(self.headers)] + [format_row(row) for row in _data]
         else:
@@ -328,6 +391,13 @@ class Dataset:
         been set, a list of Python dictionaries will be returned. If no headers have been set,
         a list of tuples (rows) will be returned instead.
 
+        Mapping-style output is strict: :class:`AmbiguousHeadersError` is raised if the
+        headers are duplicated or blank, since such headers cannot be represented
+        unambiguously as dictionary keys. Use :meth:`Dataset.get_dict` with
+        ``pairs=True`` to obtain lists of ``[header, value]`` pairs preserving
+        duplicate headers and column order, or with ``strict=False`` for the
+        legacy lenient behavior.
+
         A dataset object can also be imported by setting the `Dataset.dict` attribute: ::
 
             data = tablib.Dataset()
@@ -335,6 +405,39 @@ class Dataset:
 
         """
         return self._package()
+
+    def get_dict(self, strict=True, pairs=False):
+        """A native Python representation of the :class:`Dataset` object, with
+        explicit control over how headers are mapped.
+
+        :param strict: when True (the default), raise
+            :class:`AmbiguousHeadersError` if the headers are duplicated or
+            blank. Pass ``strict=False`` for the legacy lenient behavior where
+            later columns silently overwrite earlier ones sharing the same
+            header.
+        :param pairs: when True, return each row as a list of
+            ``[header, value]`` pairs instead of a dictionary, fully
+            preserving duplicate headers and column order.
+        """
+        return self._package(strict=strict, pairs=pairs)
+
+    def _load_pairs(self, rows):
+        """Import rows given as lists of ``[header, value]`` pairs, preserving
+        duplicate headers and column order."""
+        self.wipe()
+        if not rows:
+            return
+        for row in rows:
+            for pair in row:
+                if not isinstance(pair, (list, tuple)) or len(pair) != 2:
+                    raise UnsupportedFormat(
+                        'Rows must be lists of [header, value] pairs. '
+                        'Please check format documentation '
+                        'https://tablib.readthedocs.io/en/stable/formats.html'
+                    )
+        self.headers = [pair[0] for pair in rows[0]]
+        for row in rows:
+            self.append(Row([pair[1] for pair in row]))
 
     def _set_dict(self, pickle):
         """A native Python representation of the Dataset object. If headers have been
@@ -886,14 +989,14 @@ class Databook:
         else:
             raise InvalidDatasetType
 
-    def _package(self):
+    def _package(self, **kwargs):
         """Packages :class:`Databook` for delivery."""
         collector = []
 
         for dset in self._datasets:
             collector.append({
                 'title': dset.title,
-                'data': dset._package()
+                'data': dset._package(**kwargs)
             })
         return collector
 

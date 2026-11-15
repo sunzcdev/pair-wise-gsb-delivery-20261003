@@ -130,6 +130,17 @@ Import/export using the JSON_ format. If headers have been set, a JSON list of
 objects will be returned. If no headers have been set, a JSON list of lists
 (rows) will be returned instead.
 
+Mapping-style output is strict: if headers are duplicated or blank (``None``
+or empty string), exporting raises
+:class:`tablib.exceptions.AmbiguousHeadersError` instead of silently
+overwriting columns, and headers are never renamed automatically. Pass
+``pairs=True`` to export each row as a list of ``[header, value]`` pairs,
+fully preserving duplicate headers and column order (such payloads can be
+re-imported with ``pairs=True``), or ``strict=False`` for the legacy lenient
+behavior where later columns overwrite earlier ones sharing the same header.
+Positional formats such as CSV are unaffected. The same rules apply to the
+``Dataset.dict`` view (see :meth:`tablib.Dataset.get_dict`) and to YAML.
+
 Import assumes (for now) that headers exist.
 
 .. _JSON: http://json.org/
@@ -300,6 +311,11 @@ Import/export data in the YAML_ format.
 When exporting, if headers have been set, a YAML list of objects will be
 returned. If no headers have been set, a YAML list of lists (rows) will be
 returned instead.
+
+Like JSON, mapping-style output is strict about duplicated or blank headers
+(``AmbiguousHeadersError``); pass ``pairs=True`` to preserve duplicate
+headers as ``[header, value]`` pairs, or ``strict=False`` for the legacy
+lenient behavior.
 
 Import assumes (for now) that headers exist.
 

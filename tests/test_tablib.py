@@ -14,12 +14,13 @@ from pathlib import Path
 from uuid import uuid4
 
 import xlrd
+import yaml
 from odf import opendocument, table
 from openpyxl.reader.excel import load_workbook
 
 import tablib
 from tablib.core import Row, detect_format
-from tablib.exceptions import UnsupportedFormat
+from tablib.exceptions import AmbiguousHeadersError, UnsupportedFormat
 from tablib.formats import registry
 
 try:
@@ -2144,3 +2145,145 @@ class SQLFormatTests(unittest.TestCase):
         expected = ("INSERT INTO schema_name.custom_table (col1,col2)"
                     " VALUES (1, 'test');\nCOMMIT;\n")
         self.assertEqual(sql, expected)
+
+
+class AmbiguousHeadersTests(BaseTestCase):
+    """Tests for strict mapping-style output with ambiguous headers."""
+
+    def _dup_dataset(self):
+        dset = tablib.Dataset()
+        dset.headers = ('name', 'name', 'age')
+        dset.append(('John', 'George', 90))
+        dset.append(('Tom', 'Bob', 50))
+        return dset
+
+    def test_dict_view_duplicate_headers_raises(self):
+        """Dataset.dict raises on duplicate headers instead of losing columns."""
+        dset = self._dup_dataset()
+        with self.assertRaises(AmbiguousHeadersError):
+            dset.dict
+
+    def test_json_export_duplicate_headers_raises(self):
+        dset = self._dup_dataset()
+        with self.assertRaises(AmbiguousHeadersError):
+            dset.export('json')
+
+    def test_yaml_export_duplicate_headers_raises(self):
+        dset = self._dup_dataset()
+        with self.assertRaises(AmbiguousHeadersError):
+            dset.export('yaml')
+
+    def test_databook_json_export_duplicate_headers_raises(self):
+        book = tablib.Databook()
+        book.add_sheet(self._dup_dataset())
+        with self.assertRaises(AmbiguousHeadersError):
+            book.export('json')
+        with self.assertRaises(AmbiguousHeadersError):
+            book.export('yaml')
+
+    def test_lenient_mode_kept_for_compatibility(self):
+        """strict=False keeps the legacy behavior: later columns win."""
+        dset = self._dup_dataset()
+        self.assertEqual(
+            dset.get_dict(strict=False),
+            [
+                {'name': 'George', 'age': 90},
+                {'name': 'Bob', 'age': 50},
+            ],
+        )
+        self.assertEqual(
+            json.loads(dset.export('json', strict=False)),
+            [{'name': 'George', 'age': 90}, {'name': 'Bob', 'age': 50}],
+        )
+        self.assertEqual(
+            yaml.safe_load(dset.export('yaml', strict=False)),
+            [{'name': 'George', 'age': 90}, {'name': 'Bob', 'age': 50}],
+        )
+
+    def test_pairs_representation_preserves_duplicates_and_order(self):
+        """pairs=True keeps every column, in order, as [header, value] pairs."""
+        dset = self._dup_dataset()
+        expected = [
+            [['name', 'John'], ['name', 'George'], ['age', 90]],
+            [['name', 'Tom'], ['name', 'Bob'], ['age', 50]],
+        ]
+        self.assertEqual(dset.get_dict(pairs=True), expected)
+        self.assertEqual(json.loads(dset.export('json', pairs=True)), expected)
+        self.assertEqual(yaml.safe_load(dset.export('yaml', pairs=True)), expected)
+
+    def test_pairs_json_round_trip(self):
+        """JSON pairs export/import preserves duplicate headers and order."""
+        dset = self._dup_dataset()
+        payload = dset.export('json', pairs=True)
+        clone = tablib.Dataset().load(payload, 'json', pairs=True)
+        self.assertEqual(clone.headers, ['name', 'name', 'age'])
+        self.assertEqual(clone._package(dicts=False), dset._package(dicts=False))
+
+    def test_pairs_yaml_round_trip(self):
+        """YAML pairs export/import preserves duplicate headers and order."""
+        dset = self._dup_dataset()
+        payload = dset.export('yaml', pairs=True)
+        clone = tablib.Dataset().load(payload, 'yaml', pairs=True)
+        self.assertEqual(clone.headers, ['name', 'name', 'age'])
+        self.assertEqual(clone._package(dicts=False), dset._package(dicts=False))
+
+    def test_pairs_databook_json_round_trip(self):
+        book = tablib.Databook()
+        book.add_sheet(self._dup_dataset())
+        payload = book.export('json', pairs=True)
+        clone = tablib.Databook().load(payload, 'json', pairs=True)
+        self.assertEqual(clone.sheets()[0].headers, ['name', 'name', 'age'])
+
+    def test_csv_export_unaffected_by_duplicate_headers(self):
+        """Positional CSV export keeps working with duplicate headers."""
+        dset = self._dup_dataset()
+        self.assertEqual(
+            dset.export('csv'),
+            'name,name,age\r\nJohn,George,90\r\nTom,Bob,50\r\n',
+        )
+
+    def test_empty_string_headers_raise_separately(self):
+        """Blank headers are rejected, never silently renamed."""
+        dset = tablib.Dataset()
+        dset.headers = ('name', '', 'age')
+        dset.append(('John', 'x', 90))
+        with self.assertRaises(AmbiguousHeadersError):
+            dset.dict
+        with self.assertRaises(AmbiguousHeadersError):
+            dset.export('json')
+        with self.assertRaises(AmbiguousHeadersError):
+            dset.export('yaml')
+        # ... but pairs and positional exports still work.
+        self.assertEqual(
+            dset.get_dict(pairs=True),
+            [[['name', 'John'], ['', 'x'], ['age', 90]]],
+        )
+        self.assertEqual(dset.export('csv'), 'name,,age\r\nJohn,x,90\r\n')
+
+    def test_none_header_raises(self):
+        dset = tablib.Dataset()
+        dset.headers = ('name', None, 'age')
+        dset.append(('John', 'x', 90))
+        with self.assertRaises(AmbiguousHeadersError):
+            dset.dict
+
+    def test_headerless_dataset_exports_positionally(self):
+        """No headers at all is not an error: rows export as plain lists."""
+        dset = tablib.Dataset()
+        dset.append(('John', 'Adams', 90))
+        self.assertEqual(dset.dict, [['John', 'Adams', 90]])
+        self.assertEqual(json.loads(dset.export('json')), [['John', 'Adams', 90]])
+        self.assertEqual(
+            yaml.safe_load(dset.export('yaml')), [['John', 'Adams', 90]]
+        )
+
+    def test_unique_headers_unaffected_by_strict_default(self):
+        """Datasets with unique headers behave exactly as before."""
+        expected = [
+            {'first_name': 'John', 'last_name': 'Adams', 'gpa': 90},
+            {'first_name': 'George', 'last_name': 'Washington', 'gpa': 67},
+            {'first_name': 'Thomas', 'last_name': 'Jefferson', 'gpa': 50},
+        ]
+        self.assertEqual(self.founders.dict, expected)
+        self.assertEqual(json.loads(self.founders.export('json')), expected)
+        self.assertEqual(yaml.safe_load(self.founders.export('yaml')), expected)
