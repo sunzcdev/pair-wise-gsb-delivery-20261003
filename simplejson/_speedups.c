@@ -3322,6 +3322,16 @@ encoder_listencode_obj(PyEncoderObject *s, JSON_Accu *rval, PyObject *obj, Py_ss
         if (encoded != NULL)
             rv = _steal_accumulate(state, rval, encoded);
     }
+    /* Conversion-protocol order is intentionally hard-wired here:
+       for_json() outranks _asdict(), both outrank the native list/tuple
+       and dict container checks, and the iterable protocol is handled last
+       inside encoder_listencode_default. This matches the pure-Python
+       encoder's DEFAULT_PROTOCOL_PRIORITY. JSONEncoder only constructs this
+       accelerated encoder when the user-supplied protocol_priority equals
+       that default order (see
+       JSONEncoder._protocol_priority_supported_by_speedups); any other
+       order takes the pure-Python path, so the two backends can never
+       encode the same object with different protocol orders. */
     else if (s->for_json && _call_json_method(obj, state->JSON_attr_for_json, &newobj)) {
         rv = encoder_steal_encode(s, rval, obj, newobj, indent_level, /*as_dict=*/0);
     }

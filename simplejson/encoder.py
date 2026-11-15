@@ -89,6 +89,77 @@ if sys.version_info >= (3, 15):
 else:
     _dict_types = dict
 
+# Custom conversion protocols an object may implement. Each name is also
+# the spelling accepted by JSONEncoder(protocol_priority=...):
+#   'for_json' -> the object's for_json() method (enabled by for_json=True)
+#   '_asdict'  -> the object's _asdict() method (enabled by
+#                 namedtuple_as_object=True)
+#   'iterable' -> __iter__(), encoded as a JSON array (enabled by
+#                 iterable_as_array=True)
+PROTOCOL_FOR_JSON = 'for_json'
+PROTOCOL_ASDICT = '_asdict'
+PROTOCOL_ITERABLE = 'iterable'
+
+# All known protocols, in the order that has always been used by both the
+# Python and the C encoders: for_json() outranks _asdict(), which outranks
+# iterable_as_array handling. This tuple is the default protocol_priority.
+DEFAULT_PROTOCOL_PRIORITY = (
+    PROTOCOL_FOR_JSON,
+    PROTOCOL_ASDICT,
+    PROTOCOL_ITERABLE,
+)
+
+
+def _normalize_protocol_priority(protocol_priority):
+    """Validate and normalize a ``protocol_priority`` argument.
+
+    Returns a tuple of the canonical protocol name strings. Raises
+    ``ValueError`` (never deferred to encoding time) for unknown names or
+    repeated entries, and ``TypeError`` for values that are not iterables
+    of strings.
+    """
+    if isinstance(protocol_priority, string_types):
+        # A single string is almost always a typo (e.g. "for_json" instead
+        # of ("for_json",)); never silently iterate its characters.
+        raise TypeError(
+            "protocol_priority must be an iterable of protocol name "
+            "strings, not a single %s" % type(protocol_priority).__name__)
+    try:
+        priority = tuple(protocol_priority)
+    except TypeError:
+        raise TypeError(
+            "protocol_priority must be an iterable of protocol name "
+            "strings, not %s" % type(protocol_priority).__name__)
+    normalized = []
+    for name in priority:
+        if not isinstance(name, string_types):
+            raise TypeError(
+                "protocol_priority entries must be strings, not %s" %
+                type(name).__name__)
+        if name not in DEFAULT_PROTOCOL_PRIORITY:
+            raise ValueError(
+                "unknown protocol %r in protocol_priority; valid "
+                "protocols are %r" %
+                (name, list(DEFAULT_PROTOCOL_PRIORITY)))
+        if name in normalized:
+            raise ValueError(
+                "protocol %r appears more than once in protocol_priority" %
+                (name,))
+        normalized.append(name)
+    return tuple(normalized)
+
+
+def _enabled_protocols(for_json, namedtuple_as_object, iterable_as_array):
+    """The protocol names enabled by the corresponding encoder switches."""
+    enabled = []
+    if for_json:
+        enabled.append(PROTOCOL_FOR_JSON)
+    if namedtuple_as_object:
+        enabled.append(PROTOCOL_ASDICT)
+    if iterable_as_array:
+        enabled.append(PROTOCOL_ITERABLE)
+    return tuple(enabled)
+
 def py_encode_basestring(s, _PY3=PY3, _q=u'"'):
     """Return a JSON representation of a Python string
 
@@ -199,7 +270,8 @@ class JSONEncoder(object):
                  use_decimal=True, namedtuple_as_object=True,
                  tuple_as_array=True, bigint_as_string=False,
                  item_sort_key=None, for_json=False, ignore_nan=False,
-                 int_as_string_bitcount=None, iterable_as_array=False):
+                 int_as_string_bitcount=None, iterable_as_array=False,
+                 protocol_priority=None):
         """Constructor for JSONEncoder, with sensible defaults.
 
         If skipkeys is false, then it is a TypeError to attempt
@@ -281,6 +353,19 @@ class JSONEncoder(object):
         as ``null`` in compliance with the ECMA-262 specification. If true,
         this will override *allow_nan*.
 
+        If *protocol_priority* is given, it must be an iterable of the
+        protocol name strings ``'for_json'``, ``'_asdict'`` and
+        ``'iterable'`` (without duplicates or unknown names). It fixes the
+        order in which an object implementing more than one enabled
+        conversion protocol is converted. When ``None`` (the default) the
+        historical order is used: ``('for_json', '_asdict', 'iterable')``.
+        Only the highest-priority protocol that is enabled and available is
+        ever invoked for an object; a protocol whose enabling switch is off
+        (``for_json``, ``namedtuple_as_object`` or
+        ``iterable_as_array`` respectively) must not be listed, and every
+        enabled protocol must be listed. Such conflicts raise ``ValueError``
+        here, before any encoding happens.
+
         """
 
         self.skipkeys = skipkeys
@@ -307,6 +392,35 @@ class JSONEncoder(object):
         if default is not None:
             self.default = default
         self.encoding = encoding
+        enabled = _enabled_protocols(
+            for_json, namedtuple_as_object, iterable_as_array)
+        if protocol_priority is None:
+            # Default ordering; protocols whose enabling switch is off are
+            # dropped so self.protocol_priority always names exactly the
+            # protocols this encoder may invoke.
+            protocol_priority = DEFAULT_PROTOCOL_PRIORITY
+            explicit_priority = False
+        else:
+            protocol_priority = _normalize_protocol_priority(
+                protocol_priority)
+            explicit_priority = True
+        if explicit_priority:
+            # Reject conflicts between the declared priority and the
+            # enabling switches before encoding can start: listing a
+            # disabled protocol, or omitting an enabled one, would leave
+            # the effective order ambiguous.
+            if set(protocol_priority) != set(enabled):
+                raise ValueError(
+                    "protocol_priority %r does not match the protocols "
+                    "enabled by for_json=%r, namedtuple_as_object=%r and "
+                    "iterable_as_array=%r (enabled protocols: %r)" %
+                    (list(protocol_priority), for_json,
+                     namedtuple_as_object, iterable_as_array,
+                     list(enabled)))
+        else:
+            protocol_priority = tuple(
+                name for name in protocol_priority if name in enabled)
+        self.protocol_priority = protocol_priority
 
     def default(self, o):
         """Implement this method in a subclass such that it returns
@@ -412,7 +526,14 @@ class JSONEncoder(object):
         key_memo = {}
         int_as_string_bitcount = (
             53 if self.bigint_as_string else self.int_as_string_bitcount)
-        if c_make_encoder is not None:
+        # The C encoder's dispatch order is fixed at for_json -> _asdict
+        # -> iterable. It can only be used when the configured priority is
+        # exactly that order (restricted to the enabled protocols); any
+        # other order is a protocol configuration the speedups do not
+        # support, so we take the explicit pure-Python compatibility path
+        # rather than silently encoding with a different order.
+        if (c_make_encoder is not None and
+                self._protocol_priority_supported_by_speedups()):
             _iterencode = c_make_encoder(
                 markers, self.default, _encoder, self.indent,
                 self.key_separator, self.item_separator, self.sort_keys,
@@ -429,11 +550,26 @@ class JSONEncoder(object):
                 self.namedtuple_as_object, self.tuple_as_array,
                 int_as_string_bitcount,
                 self.item_sort_key, self.encoding, self.for_json,
-                self.iterable_as_array, Decimal=decimal.Decimal)
+                self.iterable_as_array, self.protocol_priority,
+                Decimal=decimal.Decimal)
         try:
             return _iterencode(o, 0)
         finally:
             key_memo.clear()
+
+    def _protocol_priority_supported_by_speedups(self):
+        """Return whether the C speedups can encode with this priority.
+
+        The accelerated encoder has one hard-wired conversion order
+        (``for_json`` -> ``_asdict`` -> iterable). A configured priority is
+        accelerated only when it matches that order for the enabled
+        protocols; every other order must take the pure-Python path so the
+        two backends never disagree. Exposed for inspection and testing.
+        """
+        c_supported_priority = tuple(
+            name for name in DEFAULT_PROTOCOL_PRIORITY
+            if name in self.protocol_priority)
+        return c_supported_priority == self.protocol_priority
 
 
 class JSONEncoderForHTML(JSONEncoder):
@@ -479,6 +615,7 @@ def _make_iterencode(markers, _default, _encoder, _indent, _floatstr,
         _int_as_string_bitcount, _item_sort_key,
         _encoding,_for_json,
         _iterable_as_array,
+        _protocol_priority=DEFAULT_PROTOCOL_PRIORITY,
         ## HACK: hand-optimized bytecode; turn globals into locals
         _PY3=PY3,
         ValueError=ValueError,
@@ -552,6 +689,76 @@ def _make_iterencode(markers, _default, _encoder, _indent, _floatstr,
         if markers is not None:
             del markers[markerid]
 
+    # Method protocols that outrank the iterable protocol in the
+    # configured order. When iterable is ranked ahead of a method, that
+    # method must not be probed first for any object (the iterable branch
+    # below wins instead); under the default order iterable is last, so
+    # this tuple contains every enabled method and the historical
+    # behavior is unchanged.
+    _iterable_rank = (
+        _protocol_priority.index(PROTOCOL_ITERABLE)
+        if PROTOCOL_ITERABLE in _protocol_priority
+        else len(_protocol_priority))
+    _method_priority_pre_iterable = tuple(
+        _protocol_priority[:_iterable_rank])
+
+    def _iterencode_methods(o, _current_indent_level, method_priority):
+        """Resolve o through the given method protocols (for_json /
+        _asdict), in the supplied priority order.
+
+        Only the first method protocol in *method_priority* that is
+        actually available is invoked: a TypeError from the method means
+        "not this protocol" (swallowed by call_method) and the next method
+        is tried. Yields nothing when no listed method protocol applies,
+        so the caller keeps its normal container/iterable/default
+        dispatch.
+
+        A selected method that returns o itself, or whose conversion leads
+        back through o while its marker is still held, fails here with the
+        same "Circular reference detected" ValueError (annotated with the
+        containing path by the caller) instead of re-entering resolution.
+        """
+        for protocol in method_priority:
+            if protocol == PROTOCOL_FOR_JSON:
+                # A revisited object (its marker is held by an in-flight
+                # conversion) fails before for_json() runs again, so the
+                # selected protocol is invoked at most once and no
+                # lower-priority protocol is retried. This is a membership
+                # test, not a pushed marker: user code that clears the
+                # markers dict from inside a callback is not blocked.
+                if markers is not None and id(o) in markers:
+                    raise ValueError("Circular reference detected")
+                for_json = call_method(o, 'for_json')
+                if not for_json:
+                    continue
+                result = for_json[0]
+                # One-step cycle: for_json() returns o itself.
+                if result is o and markers is not None:
+                    raise ValueError("Circular reference detected")
+                for chunk in _iterencode_method(o, result,
+                                                _current_indent_level,
+                                                _iterencode):
+                    yield chunk
+                return
+            if protocol == PROTOCOL_ASDICT:
+                if markers is not None and id(o) in markers:
+                    raise ValueError("Circular reference detected")
+                _asdict = call_method(o, '_asdict')
+                if not _asdict:
+                    continue
+                dct = _asdict[0]
+                if not isinstance(dct, dict):
+                    raise TypeError(
+                        "_asdict() must return a dict, not %s" %
+                        (type(dct).__name__,))
+                if dct is o and markers is not None:
+                    raise ValueError("Circular reference detected")
+                for chunk in _iterencode_method(o, dct,
+                                                _current_indent_level,
+                                                _iterencode_dict):
+                    yield chunk
+                return
+
     def _iterencode_list(lst, _current_indent_level, _origin=None):
         # _origin is the object being encoded: lst itself, or under
         # iterable_as_array the iterable that produced the iterator lst.
@@ -606,29 +813,28 @@ def _make_iterencode(markers, _default, _encoder, _indent, _floatstr,
                         yield buf + _encode_decimal(value, _floatstr)
                     else:
                         yield buf
-                        for_json = _for_json and call_method(value, 'for_json')
-                        if for_json:
-                            chunks = _iterencode_method(value, for_json[0],
-                                                        _current_indent_level, _iterencode)
-                        else:
-                            _asdict = _namedtuple_as_object and call_method(value, '_asdict')
-                            if _asdict:
-                                dct = _asdict[0]
-                                if not isinstance(dct, dict):
-                                    raise TypeError("_asdict() must return a dict, not %s" % (type(dct).__name__,))
-                                chunks = _iterencode_method(value, dct,
-                                                            _current_indent_level, _iterencode_dict)
-                            elif isinstance(value, list):
+                        methods = _iterencode_methods(
+                            value, _current_indent_level,
+                            _method_priority_pre_iterable)
+                        try:
+                            first_chunk = next(methods)
+                        except StopIteration:
+                            if isinstance(value, list):
                                 chunks = _iterencode_list(value, _current_indent_level)
                             elif _tuple_as_array and isinstance(value, tuple):
                                 chunks = _iterencode_list(value, _current_indent_level)
                             elif isinstance(value, _dict_types):
                                 chunks = _iterencode_dict(value, _current_indent_level)
                             else:
-                                # for_json and _asdict were already tried
+                                # for_json, _asdict and iterable were
+                                # already tried in priority order.
                                 chunks = _iterencode(value, _current_indent_level, True)
-                        for chunk in chunks:
-                            yield chunk
+                            for chunk in chunks:
+                                yield chunk
+                        else:
+                            yield first_chunk
+                            for chunk in methods:
+                                yield chunk
                 except BaseException as exc:
                     _annotate_exception(
                         exc, 'when serializing %s item %d',
@@ -743,30 +949,28 @@ def _make_iterencode(markers, _default, _encoder, _indent, _floatstr,
                     elif _use_decimal and isinstance(value, Decimal):
                         yield _encode_decimal(value, _floatstr)
                     else:
-                        for_json = _for_json and call_method(value, 'for_json')
-                        if for_json:
-                            chunks = _iterencode_method(value, for_json[0],
-                                                        _current_indent_level, _iterencode)
-                        else:
-                            _asdict = _namedtuple_as_object and call_method(value, '_asdict')
-                            if _asdict:
-                                # Not `dct`: the note below names dct's type.
-                                asdict_dct = _asdict[0]
-                                if not isinstance(asdict_dct, dict):
-                                    raise TypeError("_asdict() must return a dict, not %s" % (type(asdict_dct).__name__,))
-                                chunks = _iterencode_method(value, asdict_dct,
-                                                            _current_indent_level, _iterencode_dict)
-                            elif isinstance(value, list):
+                        methods = _iterencode_methods(
+                            value, _current_indent_level,
+                            _method_priority_pre_iterable)
+                        try:
+                            first_chunk = next(methods)
+                        except StopIteration:
+                            if isinstance(value, list):
                                 chunks = _iterencode_list(value, _current_indent_level)
                             elif _tuple_as_array and isinstance(value, tuple):
                                 chunks = _iterencode_list(value, _current_indent_level)
                             elif isinstance(value, _dict_types):
                                 chunks = _iterencode_dict(value, _current_indent_level)
                             else:
-                                # for_json and _asdict were already tried
+                                # for_json, _asdict and iterable were
+                                # already tried in priority order.
                                 chunks = _iterencode(value, _current_indent_level, True)
-                        for chunk in chunks:
-                            yield chunk
+                            for chunk in chunks:
+                                yield chunk
+                        else:
+                            yield first_chunk
+                            for chunk in methods:
+                                yield chunk
                 except BaseException as exc:
                     _annotate_exception(
                         exc, 'when serializing %s item %r',
@@ -804,64 +1008,72 @@ def _make_iterencode(markers, _default, _encoder, _indent, _floatstr,
         elif isinstance(o, float):
             yield _floatstr(o)
         else:
-            for_json = (_for_json and not _methods_tried
-                        and call_method(o, 'for_json'))
-            if for_json:
-                for chunk in _iterencode_method(o, for_json[0],
-                                              _current_indent_level, _iterencode):
-                    yield chunk
-            else:
-                _asdict = (_namedtuple_as_object and not _methods_tried
-                           and call_method(o, '_asdict'))
-                if _asdict:
-                    dct = _asdict[0]
-                    if not isinstance(dct, dict):
-                        raise TypeError("_asdict() must return a dict, not %s" % (type(dct).__name__,))
-                    for chunk in _iterencode_method(o, dct,
-                                                  _current_indent_level, _iterencode_dict):
-                        yield chunk
-                elif isinstance(o, list):
-                    for chunk in _iterencode_list(o, _current_indent_level):
-                        yield chunk
-                elif (_tuple_as_array and isinstance(o, tuple)):
-                    for chunk in _iterencode_list(o, _current_indent_level):
-                        yield chunk
-                elif isinstance(o, _dict_types):
-                    for chunk in _iterencode_dict(o, _current_indent_level):
-                        yield chunk
-                elif _use_decimal and isinstance(o, Decimal):
-                    yield _encode_decimal(o, _floatstr)
+            if not _methods_tried:
+                # First contact with o: for_json()/_asdict() are probed
+                # (in configured priority order) before the list/tuple/dict
+                # container checks, so a list subclass defining _asdict()
+                # still encodes as an object. The iterable protocol is
+                # intentionally excluded here: it ranks behind the
+                # container checks in the historical dispatch order. Only
+                # methods that outrank the iterable protocol are probed
+                # for a non-container object.
+                methods = _iterencode_methods(
+                    o, _current_indent_level,
+                    _method_priority_pre_iterable)
+                try:
+                    first_chunk = next(methods)
+                except StopIteration:
+                    pass
                 else:
-                    while _iterable_as_array:
-                        # Reject a revisited iterable before its __iter__
-                        # runs again; _iterencode_list marks o itself.
-                        if markers is not None and id(o) in markers:
-                            raise ValueError("Circular reference detected")
-                        try:
-                            iterator = iter(o)
-                        except TypeError:
-                            break
-                        for chunk in _iterencode_list(iterator,
-                                                      _current_indent_level,
-                                                      o):
+                    yield first_chunk
+                    for chunk in methods:
+                        yield chunk
+                    return
+            # No method protocol applied (or the list/dict item path
+            # already probed them once).
+            if isinstance(o, list):
+                for chunk in _iterencode_list(o, _current_indent_level):
+                    yield chunk
+            elif (_tuple_as_array and isinstance(o, tuple)):
+                for chunk in _iterencode_list(o, _current_indent_level):
+                    yield chunk
+            elif isinstance(o, _dict_types):
+                for chunk in _iterencode_dict(o, _current_indent_level):
+                    yield chunk
+            elif _use_decimal and isinstance(o, Decimal):
+                yield _encode_decimal(o, _floatstr)
+            else:
+                # The iterable protocol comes after every container
+                # check. A revisited iterable is rejected before __iter__
+                # runs again; _iterencode_list marks o itself via _origin.
+                if PROTOCOL_ITERABLE in _protocol_priority:
+                    if markers is not None and id(o) in markers:
+                        raise ValueError("Circular reference detected")
+                    try:
+                        iterator = iter(o)
+                    except TypeError:
+                        iterator = None
+                    if iterator is not None:
+                        for chunk in _iterencode_list(
+                                iterator, _current_indent_level, o):
                             yield chunk
                         return
+                if markers is not None:
+                    markerid = id(o)
+                    if markerid in markers:
+                        raise ValueError("Circular reference detected")
+                    markers[markerid] = o
+                try:
+                    o = _default(o)
+                    for chunk in _iterencode(o, _current_indent_level):
+                        yield chunk
+                except BaseException as exc:
                     if markers is not None:
-                        markerid = id(o)
-                        if markerid in markers:
-                            raise ValueError("Circular reference detected")
-                        markers[markerid] = o
-                    try:
-                        o = _default(o)
-                        for chunk in _iterencode(o, _current_indent_level):
-                            yield chunk
-                    except BaseException as exc:
-                        if markers is not None:
-                            markers.pop(markerid, None)
-                        _annotate_exception(
-                            exc, 'when serializing %s object', o)
-                        raise
-                    if markers is not None:
-                        del markers[markerid]
+                        markers.pop(markerid, None)
+                    _annotate_exception(
+                        exc, 'when serializing %s object', o)
+                    raise
+                if markers is not None:
+                    del markers[markerid]
 
     return _iterencode

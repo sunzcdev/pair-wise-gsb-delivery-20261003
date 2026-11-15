@@ -158,7 +158,7 @@ def dump(obj, fp, skipkeys=False, ensure_ascii=True, check_circular=True,
          namedtuple_as_object=True, tuple_as_array=True,
          bigint_as_string=False, sort_keys=False, item_sort_key=None,
          for_json=False, ignore_nan=False, int_as_string_bitcount=None,
-         iterable_as_array=False, **kw):
+         iterable_as_array=False, protocol_priority=None, **kw):
     """Serialize ``obj`` as a JSON formatted stream to ``fp`` (a
     ``.write()``-supporting file-like object).
 
@@ -233,6 +233,14 @@ def dump(obj, fp, skipkeys=False, ensure_ascii=True, check_circular=True,
     ``null`` in compliance with the ECMA-262 specification. If true, this will
     override *allow_nan*.
 
+    If *protocol_priority* is given it must be an iterable of the protocol
+    names ``'for_json'``, ``'_asdict'`` and ``'iterable'`` fixing the order
+    in which an object's enabled conversion protocols are tried. It must
+    name exactly the protocols enabled by *for_json*,
+    *namedtuple_as_object* and *iterable_as_array*; a conflicting order
+    raises ``ValueError`` before anything is encoded. The default order is
+    ``('for_json', '_asdict', 'iterable')``.
+
     To use a custom ``JSONEncoder`` subclass (e.g. one that overrides the
     ``.default()`` method to serialize additional types), specify it with
     the ``cls`` kwarg. NOTE: You should use *default* or *for_json* instead
@@ -248,6 +256,7 @@ def dump(obj, fp, skipkeys=False, ensure_ascii=True, check_circular=True,
         and not bigint_as_string and not sort_keys
         and item_sort_key is None and not for_json
         and not ignore_nan and int_as_string_bitcount is None
+        and protocol_priority is None
         and not kw
     ):
         iterable = _default_encoder.iterencode(obj)
@@ -267,6 +276,7 @@ def dump(obj, fp, skipkeys=False, ensure_ascii=True, check_circular=True,
             for_json=for_json,
             ignore_nan=ignore_nan,
             int_as_string_bitcount=int_as_string_bitcount,
+            protocol_priority=protocol_priority,
             **kw).iterencode(obj)
     # could accelerate with writelines in some versions of Python, at
     # a debuggability cost
@@ -280,7 +290,7 @@ def dumps(obj, skipkeys=False, ensure_ascii=True, check_circular=True,
           namedtuple_as_object=True, tuple_as_array=True,
           bigint_as_string=False, sort_keys=False, item_sort_key=None,
           for_json=False, ignore_nan=False, int_as_string_bitcount=None,
-          iterable_as_array=False, **kw):
+          iterable_as_array=False, protocol_priority=None, **kw):
     """Serialize ``obj`` to a JSON formatted ``str``.
 
     If ``skipkeys`` is true then ``dict`` keys that are not basic types
@@ -360,6 +370,14 @@ def dumps(obj, skipkeys=False, ensure_ascii=True, check_circular=True,
     ``null`` in compliance with the ECMA-262 specification. If true, this will
     override *allow_nan*.
 
+    If *protocol_priority* is given it must be an iterable of the protocol
+    names ``'for_json'``, ``'_asdict'`` and ``'iterable'`` fixing the order
+    in which an object's enabled conversion protocols are tried. It must
+    name exactly the protocols enabled by *for_json*,
+    *namedtuple_as_object* and *iterable_as_array*; a conflicting order
+    raises ``ValueError`` before anything is encoded. The default order is
+    ``('for_json', '_asdict', 'iterable')``.
+
     To use a custom ``JSONEncoder`` subclass (e.g. one that overrides the
     ``.default()`` method to serialize additional types), specify it with
     the ``cls`` kwarg. NOTE: You should use *default* instead of subclassing
@@ -375,6 +393,7 @@ def dumps(obj, skipkeys=False, ensure_ascii=True, check_circular=True,
         and not bigint_as_string and not sort_keys
         and item_sort_key is None and not for_json
         and not ignore_nan and int_as_string_bitcount is None
+        and protocol_priority is None
         and not kw
     ):
         return _default_encoder.encode(obj)
@@ -394,6 +413,7 @@ def dumps(obj, skipkeys=False, ensure_ascii=True, check_circular=True,
         for_json=for_json,
         ignore_nan=ignore_nan,
         int_as_string_bitcount=int_as_string_bitcount,
+        protocol_priority=protocol_priority,
         **kw).encode(obj)
 
 

@@ -1,3 +1,27 @@
+Unreleased
+----------
+
+* Added the ``protocol_priority`` option to :class:`JSONEncoder`,
+  :func:`dump` and :func:`dumps`. It is a configurable, inspectable
+  ordering of the ``'for_json'``, ``'_asdict'`` and ``'iterable'``
+  conversion protocols; the default
+  ``('for_json', '_asdict', 'iterable')`` preserves the historical
+  behavior. A priority that conflicts with the ``for_json``,
+  ``namedtuple_as_object`` or ``iterable_as_array`` switches (unknown or
+  repeated names, a disabled protocol listed, or an enabled protocol
+  omitted) raises ``ValueError`` while the encoder is constructed, before
+  anything is encoded.
+* One object conversion now invokes only the single highest-priority
+  protocol that is enabled and available; a protocol that returns the
+  original object or leads back through it raises a path-annotated
+  ``ValueError("Circular reference detected")`` without retrying any
+  other protocol.
+* The pure-Python and C encoders no longer risk disagreeing on the
+  protocol order: a configured priority the C speedups cannot express is
+  automatically served by the explicit pure-Python compatibility path
+  (see ``JSONEncoder._protocol_priority_supported_by_speedups``) instead
+  of silently using the speedups' hard-wired order.
+
 Version 4.3.0 released 2026-11-10
 
 * The C encoder no longer crashes when ``default()`` or ``for_json()``

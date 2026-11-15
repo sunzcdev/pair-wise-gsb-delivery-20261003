@@ -159,7 +159,8 @@ Basic Usage
                    namedtuple_as_object=True, tuple_as_array=True, \
                    bigint_as_string=False, sort_keys=False, \
                    item_sort_key=None, for_json=None, ignore_nan=False, \
-                   int_as_string_bitcount=None, iterable_as_array=False, **kw)
+                   int_as_string_bitcount=None, iterable_as_array=False, \
+                   protocol_priority=None, **kw)
 
     Serialize *obj* as a JSON formatted stream to *fp*
     (a ``.write()``-supporting file-like object) using this
@@ -190,7 +191,8 @@ Basic Usage
                     namedtuple_as_object=True, tuple_as_array=True, \
                     bigint_as_string=False, sort_keys=False, \
                     item_sort_key=None, for_json=None, ignore_nan=False, \
-                    int_as_string_bitcount=None, iterable_as_array=False, **kw)
+                    int_as_string_bitcount=None, iterable_as_array=False, \
+                    protocol_priority=None, **kw)
 
     Serialize *obj* to a JSON formatted :class:`str`.
 
@@ -307,6 +309,19 @@ Basic Usage
     :class:`float` values (``nan``, ``inf``, ``-inf``) will be serialized as
     ``null`` in compliance with the ECMA-262 specification. If true, this will
     override *allow_nan*.
+
+    If *protocol_priority* is given it must be an iterable of the protocol
+    names ``'for_json'``, ``'_asdict'`` and ``'iterable'`` (without
+    duplicates or unknown names). It fixes the order in which an object's
+    enabled conversion protocols are tried when more than one is
+    available. It must name exactly the protocols enabled by *for_json*,
+    *namedtuple_as_object* and *iterable_as_array*; listing a disabled
+    protocol or omitting an enabled one raises ``ValueError`` before
+    anything is encoded. The default order is
+    ``('for_json', '_asdict', 'iterable')``. Only the highest-priority
+    protocol that is enabled and available is ever invoked. An order that
+    the C speedups cannot express is automatically encoded with the
+    pure-Python encoder, so the two backends never apply different orders.
 
     If *int_as_string_bitcount* is a positive number ``n`` (default: ``None``),
     :class:`int` ``2**n`` and higher or lower than ``-2**n`` will be encoded as strings. This is to
@@ -577,7 +592,8 @@ Encoders and decoders
                        namedtuple_as_object=True, tuple_as_array=True, \
                        bigint_as_string=False, item_sort_key=None, \
                        for_json=True, ignore_nan=False, \
-                       int_as_string_bitcount=None, iterable_as_array=False)
+                       int_as_string_bitcount=None, iterable_as_array=False, \
+                       protocol_priority=None)
 
    Extensible JSON encoder for Python data structures.
 
