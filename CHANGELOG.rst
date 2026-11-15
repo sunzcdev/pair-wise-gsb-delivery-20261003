@@ -1,6 +1,7 @@
 v4.27.0
 =======
 
+* Add ``jsonschema.prepare``, which precompiles the regular expressions used by a schema's ``pattern`` and ``patternProperties`` keywords (recording the URI and JSON pointer of each) and returns a reusable ``PreparedValidator`` for efficiently validating many instances against the same schema.
 * Support for Python 3.10 and 3.11 has been dropped.
 * Improve ``best_match`` for ``anyOf`` / ``oneOf`` errors: the most relevant error is now found within each subschema separately before the deepest of those is picked (#1257, #1300).
   In particular an applicator with a single subschema now produces the same best match as the bare subschema would.
