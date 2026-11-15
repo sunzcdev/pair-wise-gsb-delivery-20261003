@@ -535,3 +535,108 @@ class SmokeTest(IsolatedAsyncioTestCase):
         loop.close()
 
         db.stop()
+
+class BlobTest(IsolatedAsyncioTestCase):
+    @classmethod
+    def setUpClass(cls):
+        setup_logger()
+
+    def setUp(self):
+        td = TemporaryDirectory()
+        self.addCleanup(td.cleanup)
+        self.db = Path(td.name).resolve() / "test.db"
+
+    async def make_blob_row(self, db, size=64):
+        await db.execute("create table blobs (id integer primary key, data blob)")
+        await db.execute("insert into blobs (data) values (zeroblob(?))", [size])
+        await db.commit()
+
+    async def test_blob_chunked_read_write(self):
+        async with aiosqlite.connect(self.db) as db:
+            await self.make_blob_row(db, 64)
+            expected = b"".join(bytes([i // 8]) * 8 for i in range(0, 64, 8))
+
+            async with db.blobopen("blobs", "data", 1) as blob:
+                self.assertEqual(len(blob), 64)
+
+                # write in small chunks
+                for i in range(0, 64, 8):
+                    await blob.seek(i)
+                    await blob.write(bytes([i // 8]) * 8)
+
+                # read back in small (non-aligned) chunks
+                await blob.seek(0)
+                chunks = []
+                while True:
+                    chunk = await blob.read(7)
+                    if not chunk:
+                        break
+                    self.assertLessEqual(len(chunk), 7)
+                    chunks.append(chunk)
+                self.assertEqual(b"".join(chunks), expected)
+
+                # reading past the end returns b"" (EOF)
+                self.assertEqual(await blob.read(10), b"")
+
+                # zero-length read is not EOF and does not move the position
+                await blob.seek(3)
+                self.assertEqual(await blob.read(0), b"")
+                self.assertEqual(await blob.tell(), 3)
+                self.assertEqual(await blob.read(1), expected[3:4])
+
+            # handle is closed after the context manager exits
+            with self.assertRaises(sqlite3.ProgrammingError):
+                await blob.read(1)
+
+    async def test_blob_independent_positions(self):
+        async with aiosqlite.connect(self.db) as db:
+            await self.make_blob_row(db, 16)
+            await db.execute(
+                "update blobs set data = ? where id = 1", [b"0123456789abcdef"]
+            )
+            await db.commit()
+
+            blob1 = await db.blobopen("blobs", "data", 1)
+            blob2 = await db.blobopen("blobs", "data", 1)
+            try:
+                self.assertEqual(await blob1.read(4), b"0123")
+                self.assertEqual(await blob2.read(4), b"0123")
+
+                await blob1.seek(8)
+                self.assertEqual(await blob1.read(2), b"89")
+                # blob2's position is unaffected by blob1's seek
+                self.assertEqual(await blob2.read(2), b"45")
+            finally:
+                await blob1.close()
+                await blob2.close()
+
+    async def test_blob_readonly_write(self):
+        async with aiosqlite.connect(self.db) as db:
+            await self.make_blob_row(db, 16)
+            async with db.blobopen("blobs", "data", 1, readonly=True) as blob:
+                self.assertEqual(await blob.read(4), b"\x00" * 4)
+                with self.assertRaisesRegex(
+                    sqlite3.OperationalError, "read-only blob"
+                ):
+                    await blob.write(b"xx")
+
+    async def test_blob_invalidated_by_row_update(self):
+        async with aiosqlite.connect(self.db) as db:
+            await self.make_blob_row(db, 16)
+            blob = await db.blobopen("blobs", "data", 1)
+
+            # modifying the row invalidates the open handle
+            await db.execute("update blobs set data = zeroblob(32) where id = 1")
+            with self.assertRaisesRegex(
+                sqlite3.OperationalError, "no longer valid"
+            ):
+                await blob.read(1)
+
+    async def test_blob_connection_closed(self):
+        db = await aiosqlite.connect(self.db)
+        await self.make_blob_row(db, 16)
+        blob = await db.blobopen("blobs", "data", 1)
+        await db.close()
+
+        with self.assertRaisesRegex(ValueError, "Connection closed"):
+            await blob.read(1)

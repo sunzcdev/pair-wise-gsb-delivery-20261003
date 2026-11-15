@@ -16,10 +16,11 @@ from threading import Thread
 from typing import Any, Callable, Literal, Optional, Union
 from warnings import warn
 
+from .blob import Blob
 from .context import contextmanager
 from .cursor import Cursor
 
-__all__ = ["connect", "Connection", "Cursor"]
+__all__ = ["connect", "Connection", "Cursor", "Blob"]
 
 AuthorizerCallback = Callable[[int, str, str, str, str], int]
 
@@ -212,6 +213,38 @@ class Connection:
             future = self.stop()
             if future:
                 await future
+
+    @contextmanager
+    async def blobopen(
+        self,
+        table: str,
+        column: str,
+        row: int,
+        *,
+        readonly: bool = False,
+        name: str = "main",
+    ) -> Blob:
+        """
+        Open an async handle for incremental I/O on a single BLOB value.
+
+        Example::
+
+            async with db.blobopen("files", "data", rowid) as blob:
+                while chunk := await blob.read(1024):
+                    ...
+
+        The handle is closed automatically when leaving the ``async with``
+        block. Note that the handle is invalidated if the underlying row is
+        modified while the blob is open.
+        """
+        def opener() -> tuple[sqlite3.Blob, int]:
+            blob = self._conn.blobopen(table, column, row, readonly=readonly, name=name)
+            # capture the length on the connection thread; reading it from the
+            # event loop thread would violate sqlite3's thread affinity checks
+            return blob, len(blob)
+
+        blob, length = await self._execute(opener)
+        return Blob(self, blob, length)
 
     @contextmanager
     async def execute(
