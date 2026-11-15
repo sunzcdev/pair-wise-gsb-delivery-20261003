@@ -756,6 +756,228 @@ class TablibTestCase(BaseTestCase):
         # Act / Assert
         self.assertTrue(john.has_tag(["tag2", "tag1"]))
 
+    # -------------------------------------------------------------
+    # Source tag retention across derived Datasets
+    # -------------------------------------------------------------
+
+    def _tagged_dataset(self):
+        """A Dataset where every row carries distinct source tags."""
+        dataset = tablib.Dataset(headers=self.headers, title='Founders')
+        dataset.append(self.john, tags=['first', 'a'])
+        dataset.append(self.george, tags=['second', 'b'])
+        dataset.append(self.tom, tags=['third', 'a'])
+        return dataset
+
+    def test_filter_keeps_source_tags(self):
+        """filter() retains the source tags of each surviving row."""
+        dataset = self._tagged_dataset()
+
+        filtered = dataset.filter('a')
+
+        self.assertEqual(filtered.height, 2)
+        self.assertEqual(
+            [list(row.tags) for row in filtered._data],
+            [['first', 'a'], ['third', 'a']],
+        )
+
+    def test_filter_does_not_share_mutable_tag_state(self):
+        """Tags changed on a filtered row must not reach the original row."""
+        dataset = self._tagged_dataset()
+
+        filtered = dataset.filter('a')
+        filtered._data[0].tags.append('added')
+
+        self.assertEqual(
+            list(dataset._data[0].tags), ['first', 'a'],
+            'Original Dataset tags must not be mutated by a derivation',
+        )
+        self.assertEqual(list(filtered._data[0].tags), ['first', 'a', 'added'])
+
+    def test_sort_keeps_source_tags(self):
+        """sort() keeps each row's tags aligned with its values."""
+        dataset = self._tagged_dataset()
+
+        sorted_dataset = dataset.sort(col='first_name')
+
+        expected_rows = [self.george, self.john, self.tom]
+        expected_tags = [['second', 'b'], ['first', 'a'], ['third', 'a']]
+        self.assertEqual(
+            [row.tuple for row in sorted_dataset._data], expected_rows,
+        )
+        self.assertEqual(
+            [list(row.tags) for row in sorted_dataset._data], expected_tags,
+        )
+
+    def test_sort_does_not_share_mutable_tag_state(self):
+        """Tags changed on a sorted row must not reach the original row."""
+        dataset = self._tagged_dataset()
+
+        sorted_dataset = dataset.sort(col='first_name')
+        sorted_dataset._data[0].tags.append('added')
+
+        self.assertEqual(
+            list(dataset._data[1].tags), ['second', 'b'],
+            'Original Dataset tags must not be mutated by a derivation',
+        )
+
+    def test_sort_preserves_metadata(self):
+        """sort() must keep dynamic columns, formatters, separators, title."""
+        dataset = self._tagged_dataset()
+        dataset.append_separator('sep')
+        dataset.add_formatter('gpa', lambda value: value + 1)
+        dataset.append_col(lambda row: row[0][0], header='initial')
+
+        sorted_dataset = dataset.sort(col='first_name')
+
+        self.assertEqual(sorted_dataset.title, 'Founders')
+        self.assertEqual(sorted_dataset.headers, dataset.headers)
+        self.assertEqual(sorted_dataset._separators, dataset._separators)
+        self.assertEqual(
+            list(sorted_dataset._formatters), list(dataset._formatters),
+        )
+        self.assertEqual(
+            sorted_dataset._dynamic_columns.keys(),
+            dataset._dynamic_columns.keys(),
+        )
+        # Dynamic column value travels with its row.
+        initial_index = sorted_dataset.headers.index('initial')
+        self.assertEqual(sorted_dataset._data[0][initial_index], 'G')
+
+    def test_sort_duplicate_value_rows_tracked_by_identity(self):
+        """Rows with identical values keep distinct tag sets when sorted."""
+        dataset = tablib.Dataset(headers=('v',))
+        dataset.append((1,), tags=['one-a'])
+        dataset.append((1,), tags=['one-b'])
+        dataset.append((0,), tags=['zero'])
+
+        sorted_dataset = dataset.sort(col=0)
+
+        self.assertEqual(
+            [list(row.tags) for row in sorted_dataset._data],
+            [['zero'], ['one-a'], ['one-b']],
+        )
+
+    def test_stack_keeps_source_tags(self):
+        """stack() preserves the tags of rows from both sources."""
+        left = self._tagged_dataset()
+        right = tablib.Dataset(headers=self.headers)
+        right.append(('Jane', 'Doe', 33), tags=['right'])
+
+        stacked = left.stack(right)
+
+        self.assertEqual(
+            [list(row.tags) for row in stacked._data],
+            [
+                ['first', 'a'], ['second', 'b'], ['third', 'a'], ['right'],
+            ],
+        )
+
+    def test_stack_does_not_share_mutable_tag_state(self):
+        """stack() rows are independent of both source Datasets."""
+        left = self._tagged_dataset()
+        right = tablib.Dataset(headers=self.headers)
+        right.append(('Jane', 'Doe', 33), tags=['right'])
+
+        stacked = left.stack(right)
+        stacked._data[0].tags.append('left-added')
+        stacked._data[-1].tags.append('right-added')
+
+        self.assertEqual(list(left._data[0].tags), ['first', 'a'])
+        self.assertEqual(list(right._data[0].tags), ['right'])
+
+    def test_subset_keeps_source_tags(self):
+        """subset() keeps the source tags of the selected rows."""
+        dataset = self._tagged_dataset()
+
+        subset = dataset.subset(rows=(0, 2), cols=('first_name', 'gpa'))
+
+        self.assertEqual(
+            [list(row.tags) for row in subset._data],
+            [['first', 'a'], ['third', 'a']],
+        )
+
+    def test_subset_does_not_share_mutable_tag_state(self):
+        """Tags changed on a subset row must not reach the original row."""
+        dataset = self._tagged_dataset()
+
+        subset = dataset.subset(rows=(0,), cols=('first_name', 'gpa'))
+        subset._data[0].tags.append('added')
+
+        self.assertEqual(list(dataset._data[0].tags), ['first', 'a'])
+
+    def test_transpose_reports_untaggable_mapping(self):
+        """transpose() raises rather than silently dropping source tags."""
+        dataset = self._tagged_dataset()
+
+        with self.assertRaises(tablib.TagsNotSupported):
+            dataset.transpose()
+
+    def test_transpose_drop_policy_discards_tags(self):
+        """transpose(tags='drop') explicitly returns a tagless transpose."""
+        dataset = self._tagged_dataset()
+
+        transposed = dataset.transpose(tags='drop')
+
+        self.assertFalse(any(row.tags for row in transposed._data))
+        # Values still transpose as usual.
+        self.assertEqual(
+            transposed.headers,
+            ['first_name', 'John', 'George', 'Thomas'],
+        )
+
+    def test_transpose_rejects_unknown_policy(self):
+        """An unknown tag policy is rejected."""
+        dataset = self._tagged_dataset()
+
+        with self.assertRaises(ValueError):
+            dataset.transpose(tags='bogus')
+
+    def test_transpose_without_tags_still_works(self):
+        """Datasets without tags transpose unchanged, using the default."""
+        untagged = tablib.Dataset(headers=self.headers)
+        untagged.append(self.john)
+        untagged.append(self.george)
+        untagged.append(self.tom)
+
+        transposed = untagged.transpose()
+
+        self.assertEqual(
+            transposed.headers,
+            ['first_name', 'John', 'George', 'Thomas'],
+        )
+
+    def test_transpose_empty_dataset_default_policy(self):
+        """Empty Datasets still return None regardless of the tag policy."""
+        self.assertIsNone(tablib.Dataset().transpose())
+
+    def test_derived_dataset_does_not_mutate_source_data(self):
+        """Every derived Dataset holds independent Row instances."""
+        dataset = self._tagged_dataset()
+
+        for derived in (
+            dataset.filter('a'),
+            dataset.sort(col='first_name'),
+            dataset.stack(dataset),
+            dataset.subset(rows=(0, 1), cols=('first_name',)),
+        ):
+            self.assertTrue(derived._data)
+            for row in derived._data:
+                self.assertNotIn(row, dataset._data)
+
+    def test_slice_returns_tuples_and_leaves_source_untouched(self):
+        """Slicing exposes tuples; deleting a slice row keeps source tags."""
+        dataset = self._tagged_dataset()
+
+        sliced = dataset[0:2]
+
+        self.assertEqual(sliced, [self.john, self.george])
+        self.assertNotIsInstance(sliced, tablib.Dataset)
+        # The source rows, including their tags, are unchanged.
+        self.assertEqual(
+            [list(row.tags) for row in dataset._data],
+            [['first', 'a'], ['second', 'b'], ['third', 'a']],
+        )
+
 
 class HTMLTests(BaseTestCase):
     founders_html = (

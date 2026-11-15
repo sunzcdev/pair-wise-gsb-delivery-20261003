@@ -326,6 +326,24 @@ Using chaining you can get a filter type and. ::
 
 It's that simple. The original :class:`Dataset` is untouched.
 
+Tags travel with their rows through the row-level derivations:
+:meth:`~tablib.Dataset.filter`, :meth:`~tablib.Dataset.sort`,
+:meth:`~tablib.Dataset.stack` and :meth:`~tablib.Dataset.subset` each return a
+new :class:`Dataset` whose rows carry the tags of their source rows. Every
+derived row keeps its own independent copy of the tag list, so re-tagging a
+derived :class:`Dataset` never mutates the original one, even when two rows
+hold identical values.
+
+Some operations have no one-to-one mapping between source rows and result
+rows. In particular, :meth:`~tablib.Dataset.transpose` builds each new row from
+one cell of *every* source row, so the source tags cannot be assigned
+automatically. Instead of dropping them silently, ``transpose()`` raises
+:class:`~tablib.exceptions.TagsNotSupported` while any row is tagged. Choose a
+policy explicitly with ``transpose(tags='drop')`` if discarding the tags is
+acceptable::
+
+    students.transpose(tags='drop')
+
 Open an Excel Workbook and read first sheet
 -------------------------------------------
 

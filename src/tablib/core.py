@@ -23,6 +23,7 @@ from .exceptions import (
     InvalidDatasetIndex,
     InvalidDatasetType,
     InvalidDimensions,
+    TagsNotSupported,
     UnsupportedFormat,
 )
 from .formats import registry
@@ -277,6 +278,20 @@ class Dataset:
             if not safety:
                 raise InvalidDimensions
             return False
+
+    def _copy_rows(self):
+        """Return independent copies of the internal :class:`Row` objects.
+
+        Each copy keeps the source tags of its row, but no derived
+        :class:`Dataset` ever shares the mutable tag list of the source
+        :class:`Dataset`. Rows carrying identical values are still distinct
+        copies tracked by their own identity.
+        """
+        return [row.copy() for row in self._data]
+
+    def _has_tags(self):
+        """Whether at least one row in the :class:`Dataset` carries tags."""
+        return any(row.tags for row in self._data)
 
     def _package(self, dicts=True):
         """Packages Dataset into lists of dictionaries for transmission."""
@@ -648,9 +663,14 @@ class Dataset:
     def filter(self, tag):
         """Returns a new instance of the :class:`Dataset`, excluding any rows
         that do not contain the given :ref:`tags <tags>`.
+
+        Every retained row keeps its source tags on an independent copy, so
+        tagging the filtered :class:`Dataset` never mutates the original one.
         """
         _dset = copy(self)
-        _dset._data = [row for row in _dset._data if row.has_tag(tag)]
+        _dset._data = [
+            row.copy() for row in _dset._data if row.has_tag(tag)
+        ]
 
         return _dset
 
@@ -660,34 +680,27 @@ class Dataset:
         setting ``reverse`` to ``True``.
 
         Returns a new :class:`Dataset` instance where columns have been
-        sorted.
+        sorted. Each row keeps its source tags (and any other row metadata)
+        on an independent copy, so rows with identical values are still
+        tracked by their own identity rather than by their values.
         """
 
         if isinstance(col, str):
-
             if not self.headers:
                 raise HeadersNeeded
+            col = self.headers.index(col)
+        # An integer column is used directly: Row objects index by position,
+        # whether or not headers are present.
 
-            _sorted = sorted(self.dict, key=itemgetter(col), reverse=reverse)
-            _dset = Dataset(headers=self.headers, title=self.title)
-
-            for item in _sorted:
-                row = [item[key] for key in self.headers]
-                _dset.append(row=row)
-
-        else:
-            if self.headers:
-                col = self.headers[col]
-
-            _sorted = sorted(self.dict, key=itemgetter(col), reverse=reverse)
-            _dset = Dataset(headers=self.headers, title=self.title)
-
-            for item in _sorted:
-                if self.headers:
-                    row = [item[key] for key in self.headers]
-                else:
-                    row = item
-                _dset.append(row=row)
+        _dset = copy(self)
+        # Sorting the Row objects themselves (instead of a dict projection)
+        # keeps every row's tags aligned with its values, and copying the
+        # rows ensures the source Dataset does not share mutable tag state.
+        _dset._data = sorted(
+            self._copy_rows(),
+            key=lambda row: itemgetter(col)(row),
+            reverse=reverse,
+        )
 
         return _dset
 
@@ -729,15 +742,37 @@ class Dataset:
 
         return _dset
 
-    def transpose(self):
+    def transpose(self, tags='raise'):
         """Transpose a :class:`Dataset`, turning rows into columns and vice
         versa, returning a new ``Dataset`` instance. If the instance has
         headers, the first row of the original instance becomes the new header
-        row."""
+        row.
+
+        Transposing has no one-to-one correspondence between source rows and
+        result rows: every result row is assembled from one cell of *every*
+        source row, so source tags cannot be carried over automatically. The
+        ``tags`` parameter makes the required policy explicit:
+
+        :param tags: either ``'raise'`` (default), which raises
+                     :class:`~tablib.exceptions.TagsNotSupported` when any
+                     source row carries tags, or ``'drop'``, which returns the
+                     transposed :class:`Dataset` without any tags.
+        """
+
+        if tags not in ('raise', 'drop'):
+            raise ValueError("'tags' must be either 'raise' or 'drop'")
 
         # Don't transpose if there is no data
         if not self:
             return
+
+        if tags == 'raise' and self._has_tags():
+            raise TagsNotSupported(
+                'This Dataset contains tagged rows. Transpose cannot map '
+                'source rows to result rows one-to-one, so their tags cannot '
+                "be preserved. Call transpose(tags='drop') to explicitly "
+                'discard the tags and transpose anyway.'
+            )
 
         if self.headers is None:
             return self._transpose_without_headers()
@@ -755,11 +790,13 @@ class Dataset:
         if self.width != other.width:
             raise InvalidDimensions
 
-        # Copy the source data
+        # Copy the source data and both sets of rows. Each row keeps its
+        # source tags, but the resulting Dataset holds independent copies, so
+        # tagging the stacked Dataset never mutates either source Dataset.
         _dset = copy(self)
 
-        rows_to_stack = list(_dset._data)
-        other_rows = list(other._data)
+        rows_to_stack = self._copy_rows()
+        other_rows = other._copy_rows()
 
         rows_to_stack.extend(other_rows)
         _dset._data = rows_to_stack
@@ -854,7 +891,9 @@ class Dataset:
                     raise KeyError
 
             if row_no in rows:
-                _dset.append(row=Row(data_row))
+                # Keep the source tags of the selected row on an independent
+                # copy so the subset cannot mutate the original Dataset.
+                _dset.append(row=Row(data_row), tags=list(row.tags))
 
         return _dset
 
