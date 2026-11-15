@@ -77,6 +77,25 @@ sqlite_utils.db.ForeignKey
 
 .. autoclass:: sqlite_utils.db.ForeignKey
 
+.. _reference_db_other_versioned_upsert:
+
+sqlite_utils.db.VersionedUpsertResult
+-------------------------------------
+
+.. autoclass:: sqlite_utils.db.VersionedUpsertResult
+   :members:
+
+sqlite_utils.db.VersionConflict
+-------------------------------
+
+.. autoclass:: sqlite_utils.db.VersionConflict
+   :members:
+
+sqlite_utils.db.InvalidVersionError
+-----------------------------------
+
+.. autoclass:: sqlite_utils.db.InvalidVersionError
+
 sqlite_utils.utils
 ==================
 

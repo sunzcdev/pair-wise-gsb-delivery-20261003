@@ -4,6 +4,14 @@
  Changelog
 ===========
 
+.. _v4_3:
+
+4.3 (unreleased)
+----------------
+
+- New :ref:`versioned upsert <python_api_versioned_upsert>` mode. Passing ``version="column_name"`` to ``table.upsert()`` or ``table.upsert_all()`` only applies records whose version is strictly higher than the stored version: lower versions are skipped as stale, equal versions whose provided fields already match are treated as replays, and equal versions with conflicting content are reported as ``VersionConflict`` objects rather than overwriting data. The call returns a new ``VersionedUpsertResult`` with separate ``inserted``, ``updated``, ``stale`` and ``replayed`` counts (conflicts are not counted as success). Missing or non-comparable version values raise ``InvalidVersionError`` and roll back the whole batch - version ordering is evaluated in Python, never via SQLite's implicit type comparison. Sparse records and compound primary keys are supported, with omitted fields left untouched rather than written as ``NULL``. The check and write execute inside a single ``BEGIN IMMEDIATE`` transaction, so another connection cannot insert a matching row inside the check-then-write race window.
+- ``Database.atomic()`` now accepts ``immediate=True`` to open the transaction with ``BEGIN IMMEDIATE``, acquiring SQLite's write lock before any reads.
+
 .. _v4_2_1:
 
 4.2.1 (2026-08-13)

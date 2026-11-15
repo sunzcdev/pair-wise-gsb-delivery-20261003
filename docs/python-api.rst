@@ -1278,6 +1278,66 @@ Every record passed to ``upsert()`` or ``upsert_all()`` must include a value for
 .. note::
     In the CLI: :ref:`sqlite-utils upsert <cli_upsert>`
 
+.. _python_api_versioned_upsert:
+
+Versioned upserts
+-----------------
+
+A plain upsert always wins: if two copies of the same record arrive out of order, the last one to be written overwrites whatever was there before, even if it carried older data. If your records include a version number you can pass ``version="column_name"`` to make upserts respect that ordering::
+
+    table.upsert_all(
+        [
+            {"id": 1, "version": 3, "name": "Cleo", "age": 5},
+            {"id": 1, "version": 1, "name": "Cleo (stale copy)"},
+        ],
+        pk="id",
+        version="version",
+    )
+
+The second record has a lower version than the row already stored, so it is skipped and the table keeps version 3. Both ``.upsert()`` and ``.upsert_all()`` accept ``version=``; in that mode they return a ``VersionedUpsertResult`` object (instead of the table) that breaks the batch down into separate counts:
+
+- ``result.inserted`` - rows that did not exist and were created
+- ``result.updated`` - existing rows replaced because the incoming version was strictly higher
+- ``result.stale`` - records skipped because their version was lower than the stored version
+- ``result.replayed`` - records with the same version whose provided fields already matched the stored row
+- ``result.conflicts`` - a tuple of ``VersionConflict`` objects for same-version records whose content differed; these are not counted as successful writes
+
+For example::
+
+    result = table.upsert_all(
+        [
+            {"id": 2, "version": 1, "name": "Nixie"},   # inserted
+            {"id": 1, "version": 4, "name": "Cleo!"},   # updated
+            {"id": 1, "version": 2, "name": "old"},     # stale
+            {"id": 1, "version": 4, "name": "Cleo!"},   # replayed
+            {"id": 1, "version": 3, "name": "different"},  # stale
+        ],
+        pk="id",
+        version="version",
+    )
+    result.inserted  # 1
+    result.updated   # 1
+    result.stale     # 2
+    result.replayed  # 1
+    result.conflicts # ()
+
+When two records carry the same version but disagree about the content, nothing is overwritten. Instead a ``VersionConflict`` is reported containing the primary key, version, incoming record, stored row and the tuple of ``differing_fields``::
+
+    result = table.upsert(
+        {"id": 1, "version": 4, "name": "Pancakes"},
+        pk="id",
+        version="version",
+    )
+    result.conflict_count        # 1
+    result.conflicts[0].pk       # 1
+    result.conflicts[0].differing_fields  # ("name",)
+
+Sparse records are supported: fields a record does not mention are left untouched and are not treated as explicit ``NULL`` values. Only the fields actually provided participate in replay/conflict comparison, so re-sending a partial record that matches the current row counts as a replay. Sending an explicit ``None`` does still write ``NULL`` (and matches a stored ``NULL`` when replayed).
+
+Version values must be present on every record and must be comparable in Python - plain ``int``, ``float`` (excluding ``NaN``) or ``str`` values. Missing, null, boolean or otherwise incomparable versions raise ``sqlite_utils.db.InvalidVersionError`` *before* anything is written, and the whole batch is rolled back. Comparisons are performed in Python rather than relying on SQLite's implicit type affinity, so for example a string version can never silently overwrite an integer version.
+
+The check and the write run together inside a single ``BEGIN IMMEDIATE`` transaction that takes SQLite's write lock before any row is read. Another connection therefore cannot insert a matching row in between the check and the write; the competing versioned upsert blocks until the lock is released and then sees the committed row. Compound primary keys are supported in the same way as regular upserts. Pass ``alter=True`` to create columns that the table does not yet have.
+
 .. _python_api_old_upsert:
 
 Alternative upserts using INSERT OR IGNORE

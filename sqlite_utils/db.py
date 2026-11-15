@@ -6,6 +6,7 @@ import importlib
 import inspect
 import itertools
 import json
+import math
 import os
 import pathlib
 import re
@@ -460,6 +461,19 @@ class PrimaryKeyRequired(Exception):
     "Primary key needs to be specified"
 
 
+class InvalidVersionError(Exception):
+    """
+    A versioned upsert record was missing a version value, carried a version
+    value that could not be compared in Python (for example ``NaN`` or a
+    non-scalar object), or could not be compared against the version stored in
+    the database because the two values were of incompatible types.
+
+    Version comparisons are always performed in Python rather than relying on
+    SQLite's implicit, affinity-based comparison rules, so a record that
+    triggers this error is rejected wholesale before anything is written.
+    """
+
+
 class InvalidColumns(Exception):
     "Specified columns do not exist"
 
@@ -477,6 +491,85 @@ class BadMultiValues(Exception):
 
     def __init__(self, values: object) -> None:
         self.values = values
+
+
+@dataclass(frozen=True)
+class VersionConflict:
+    """
+    A versioned upsert record that collided with an existing row carrying the
+    same version value but different content. The existing row is left
+    untouched and the record is not counted as a successful write.
+
+    :param pk: Primary key value of the conflicting row (a tuple for compound keys)
+    :param version: Version value shared by the stored row and the incoming record
+    :param record: The incoming record that was rejected
+    :param existing: The row that was already stored in the table
+    :param differing_fields: Column names whose stored values differ from the
+      values supplied by the incoming record (only fields the record actually
+      provides are considered - omitted fields are not treated as ``NULL``)
+    """
+
+    pk: Any
+    version: Any
+    record: dict[str, Any]
+    existing: dict[str, Any]
+    differing_fields: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class VersionedUpsertResult:
+    """
+    Outcome of a versioned upsert (``upsert_all(..., version=...)`` or
+    ``upsert(..., version=...)``).
+
+    Records fall into one of four mutually exclusive categories:
+
+    - ``inserted``: no row with the primary key existed, so the record was inserted
+    - ``updated``: an older row existed and the record's strictly higher version replaced it
+    - ``stale``: a newer row existed, so the lower-version record was skipped without writing
+    - ``replayed``: an identical-version row existed and every field the record
+      provided already matched the stored values, so nothing needed to change
+
+    Conflicting records (same version, different content) are collected in
+    :attr:`conflicts` and deliberately excluded from the success counters.
+
+    Records whose version is missing or not comparable never reach this point:
+    they raise :class:`InvalidVersionError` before any write occurs, so no
+    partially-applied batch is possible.
+    """
+
+    table: "Table"
+    inserted: int = 0
+    updated: int = 0
+    stale: int = 0
+    replayed: int = 0
+    conflicts: tuple[VersionConflict, ...] = ()
+
+    @property
+    def conflict_count(self) -> int:
+        "Number of records rejected because of a same-version content conflict."
+        return len(self.conflicts)
+
+    @property
+    def succeeded(self) -> int:
+        "Number of records that resulted in an insert or an update."
+        return self.inserted + self.updated
+
+    @property
+    def skipped(self) -> int:
+        "Number of records that made no change to the table (stale, replay or conflict)."
+        return self.stale + self.replayed + len(self.conflicts)
+
+    @property
+    def total(self) -> int:
+        "Total number of records presented to the versioned upsert."
+        return (
+            self.inserted
+            + self.updated
+            + self.stale
+            + self.replayed
+            + len(self.conflicts)
+        )
 
 
 _COUNTS_TABLE_CREATE_SQL = """
@@ -651,11 +744,19 @@ class Database:
         self.conn.close()
 
     @contextlib.contextmanager
-    def atomic(self) -> Generator["Database", None, None]:
+    def atomic(self, immediate: bool = False) -> Generator["Database", None, None]:
         """
         Context manager for wrapping multiple database operations in a transaction.
 
         Nested blocks use SQLite savepoints.
+
+        :param immediate: Use ``BEGIN IMMEDIATE`` instead of ``BEGIN`` so the
+          connection acquires SQLite's reserved (write) lock as the transaction
+          starts, before any reads. This removes the read-then-write race
+          window where another connection could insert a matching row between
+          a ``SELECT`` and the subsequent write. If a transaction is already
+          open on this connection a savepoint is used instead, in which case
+          the outer transaction is responsible for having taken the lock.
         """
         if self.conn.in_transaction:
             savepoint = f"sqlite_utils_{secrets.token_hex(16)}"
@@ -674,7 +775,7 @@ class Database:
             else:
                 self.conn.execute(f"RELEASE SAVEPOINT {savepoint};")
         else:
-            self.conn.execute("BEGIN")
+            self.conn.execute("BEGIN IMMEDIATE" if immediate else "BEGIN")
             try:
                 yield self
             except BaseException:
@@ -5043,12 +5144,15 @@ class Table(Queryable):
         conversions: dict[str, str] | Default | None = DEFAULT,
         columns: dict[str, Any] | Default | None = DEFAULT,
         strict: bool | Default | None = DEFAULT,
-    ) -> "Table":
+        version: str | None = None,
+    ) -> "Table | VersionedUpsertResult":
         """
         Like ``.insert()`` but performs an ``UPSERT``, where records are inserted if they do
         not exist and updated if they DO exist, based on matching against their primary key.
 
-        See :ref:`python_api_upsert`.
+        See :ref:`python_api_upsert`. Pass ``version="column_name"`` for a
+        :ref:`versioned upsert <python_api_versioned_upsert>`, which returns a
+        :class:`VersionedUpsertResult` instead of the table.
         """
         return self.upsert_all(
             [record],
@@ -5064,6 +5168,7 @@ class Table(Queryable):
             conversions=conversions,
             columns=columns,
             strict=strict,
+            version=version,
         )
 
     def upsert_all(
@@ -5083,10 +5188,40 @@ class Table(Queryable):
         columns: dict[str, Any] | Default | None = DEFAULT,
         analyze: bool = False,
         strict: bool | Default | None = DEFAULT,
-    ) -> "Table":
+        version: str | None = None,
+    ) -> "Table | VersionedUpsertResult":
         """
         Like ``.upsert()`` but can be applied to a list of records.
+
+        Pass ``version="column_name"`` to switch on :ref:`versioned upserts
+        <python_api_versioned_upsert>`. In that mode every record must carry a
+        comparable version value in the named column; records are only applied
+        when their version is strictly higher than the stored version, and the
+        method returns a :class:`VersionedUpsertResult` with separate counts
+        for inserted, updated, stale and replayed records plus any
+        same-version :class:`VersionConflict` collisions. Without ``version=``
+        the method behaves exactly as before and returns the :class:`Table`.
         """
+        if version is not None:
+            return self._versioned_upsert_all(
+                records,
+                pk=self.value_or_default("pk", pk),
+                foreign_keys=self.value_or_default("foreign_keys", foreign_keys),
+                column_order=self.value_or_default("column_order", column_order),
+                not_null=self.value_or_default("not_null", not_null),
+                defaults=self.value_or_default("defaults", defaults),
+                hash_id=self.value_or_default("hash_id", hash_id),
+                hash_id_columns=self.value_or_default(
+                    "hash_id_columns", hash_id_columns
+                ),
+                alter=self.value_or_default("alter", alter),
+                extracts=self.value_or_default("extracts", extracts),
+                conversions=self.value_or_default("conversions", conversions) or {},
+                columns=self.value_or_default("columns", columns),
+                analyze=analyze,
+                strict=self.value_or_default("strict", strict),
+                version=version,
+            )
         return self.insert_all(
             records,
             pk=pk,
@@ -5104,6 +5239,347 @@ class Table(Queryable):
             upsert=True,
             analyze=analyze,
             strict=strict,
+        )
+
+    @staticmethod
+    def _validate_version_value(value: Any, version_column: str) -> Any:
+        """
+        Validate one version-column value and return it unchanged.
+
+        Only plain ``int`` (not ``bool``), ``float`` (not ``NaN``) and ``str``
+        values are accepted, so ordering is always resolved by Python's own
+        comparison rules rather than SQLite's implicit, affinity-based
+        comparison. A missing/``None`` or otherwise incomparable value raises
+        :class:`InvalidVersionError`.
+        """
+        if isinstance(value, bool) or value is None:
+            raise InvalidVersionError(
+                f"versioned upsert requires a comparable value in the "
+                f"{version_column!r} column for every record"
+            )
+        if isinstance(value, float) and math.isnan(value):
+            raise InvalidVersionError(
+                f"versioned upsert cannot compare NaN values in the "
+                f"{version_column!r} column"
+            )
+        if not isinstance(value, (int, float, str)):
+            raise InvalidVersionError(
+                f"versioned upsert version values must be int, float or str, "
+                f"not {type(value).__name__} (column {version_column!r})"
+            )
+        return value
+
+    def _versioned_upsert_all(
+        self,
+        records: Iterable[dict[str, Any]] | Iterable[Sequence[Any]],
+        *,
+        pk: PrimaryKey | None,
+        foreign_keys: ForeignKeysType | None,
+        column_order: list[str] | None,
+        not_null: Iterable[str] | None,
+        defaults: dict[str, Any] | None,
+        hash_id: str | None,
+        hash_id_columns: Iterable[str] | None,
+        alter: bool | None,
+        extracts: dict[str, str] | list[str] | None,
+        conversions: dict[str, str],
+        columns: dict[str, Any] | None,
+        analyze: bool,
+        strict: bool | None,
+        version: str,
+    ) -> VersionedUpsertResult:
+        if hash_id:
+            raise ValueError(
+                "versioned upserts do not support hash_id= - name an explicit "
+                "primary key column with pk= instead"
+            )
+        if extracts:
+            raise ValueError("versioned upserts do not support extracts=")
+        if conversions:
+            raise ValueError("versioned upserts do not support conversions=")
+
+        records_list = list(records)
+        for record in records_list:
+            if not isinstance(record, dict):
+                raise ValueError(
+                    "versioned upserts require dictionary records - list/tuple "
+                    "based iteration is not supported"
+                )
+        if not records_list:
+            return VersionedUpsertResult(table=self)
+
+        # Resolve the primary key the same way plain upserts do
+        if not pk and self.exists():
+            existing_pks = [column.name for column in self.columns if column.is_pk]
+            if existing_pks:
+                pk = existing_pks[0] if len(existing_pks) == 1 else tuple(
+                    existing_pks
+                )
+        if not pk:
+            raise PrimaryKeyRequired("versioned upsert() requires a pk")
+        pk_cols = [pk] if isinstance(pk, str) else list(pk)
+
+        # Resolve casing of the version column against whatever the first
+        # record actually uses, then confirm every record provides it
+        version_column = resolve_casing(version, records_list[0].keys())
+        for record in records_list:
+            if version_column not in record:
+                raise InvalidVersionError(
+                    f"versioned upsert requires every record to provide the "
+                    f"version column {version!r}"
+                )
+            self._validate_version_value(record[version_column], version_column)
+
+        if fold_identifier_case(version_column) in {
+            fold_identifier_case(c) for c in pk_cols
+        }:
+            raise ValueError(
+                f"the version column {version_column!r} cannot also be a "
+                "primary key column"
+            )
+
+        # Every record must provide a non-NULL value for every pk column
+        for record in records_list:
+            resolved_pk_cols = [
+                resolve_casing(c, record.keys()) for c in pk_cols
+            ]
+            for requested, actual in zip(pk_cols, resolved_pk_cols):
+                if actual not in record:
+                    raise PrimaryKeyRequired(
+                        "versioned upsert requires a value for the primary key "
+                        f"column {requested!r}"
+                    )
+                if record[actual] is None:
+                    raise PrimaryKeyRequired(
+                        "versioned upsert requires a non-null value for the "
+                        f"primary key column {requested!r}"
+                    )
+
+        # Create the table up-front (inside the write transaction below) so
+        # column resolution can rely on it existing. Derive column types from
+        # every record, with explicit columns= taking precedence.
+        column_types: dict[str, Any] = {}
+        for record in records_list:
+            for name, value in record.items():
+                if name not in column_types:
+                    suggested = suggest_column_types([{name: value}])
+                    if name in suggested:
+                        column_types[name] = suggested[name]
+        column_types.update(columns or {})
+
+        inserted = updated = stale = replayed = 0
+        conflicts: list[VersionConflict] = []
+
+        # BEGIN IMMEDIATE takes SQLite's write lock before the first SELECT, so
+        # no other connection can insert a matching row inside the
+        # check-then-write window. Every statement below runs in this one
+        # transaction and any error rolls the whole batch back.
+        with self.db.atomic(immediate=True):
+            if not self.exists():
+                self.create(
+                    column_types,
+                    pk,
+                    foreign_keys,
+                    column_order=column_order,
+                    not_null=not_null,
+                    defaults=defaults,
+                    hash_id=hash_id,
+                    hash_id_columns=hash_id_columns,
+                    extracts=extracts,
+                    strict=strict,
+                )
+
+            existing_columns = self.columns_dict
+            pk_cols = [
+                resolve_casing(c, existing_columns) for c in pk_cols
+            ]
+            version_column = resolve_casing(version, existing_columns)
+
+            needed = [
+                name
+                for name in column_types
+                if resolve_casing(name, existing_columns) not in existing_columns
+            ]
+            if needed and not alter:
+                raise InvalidColumns(
+                    "Invalid column{} {} for table {} with columns {}".format(
+                        "s" if len(needed) > 1 else "",
+                        needed,
+                        self.name,
+                        list(existing_columns),
+                    )
+                )
+            for name in needed:
+                self.add_column(name, column_types[name])
+            if needed:
+                existing_columns = self.columns_dict
+                pk_cols = [
+                    resolve_casing(c, existing_columns) for c in pk_cols
+                ]
+                version_column = resolve_casing(version, existing_columns)
+
+            table_sql = quote_identifier(self.name)
+            pk_folded = {fold_identifier_case(c) for c in pk_cols}
+            version_folded = fold_identifier_case(version_column)
+
+            for record in records_list:
+                # Map record keys onto the table's actual column casing
+                record_pk_cols = [
+                    resolve_casing(c, record.keys()) for c in pk_cols
+                ]
+                record_version_col = resolve_casing(
+                    version, record.keys()
+                )
+                pk_values = [record[c] for c in record_pk_cols]
+                pk_out = pk_values[0] if len(pk_values) == 1 else tuple(pk_values)
+                incoming_version = self._validate_version_value(
+                    record[record_version_col], version_column
+                )
+
+                where_sql = " AND ".join(
+                    f"{quote_identifier(c)} IS ?" for c in pk_cols
+                )
+                # Select the real columns explicitly, plus rowid under an alias,
+                # so an INTEGER PRIMARY KEY rowid alias cannot produce two
+                # identically-named result columns
+                select_cols = ", ".join(
+                    [quote_identifier(c) for c in existing_columns]
+                    + ["rowid AS _su_rowid"]
+                )
+                cursor = self.db.execute(
+                    f"SELECT {select_cols} FROM {table_sql} WHERE {where_sql}",
+                    pk_values,
+                )
+                fetched = cursor.fetchone()
+                column_names = [d[0] for d in cursor.description]
+                existing_row: dict[str, Any] | None = None
+                existing_rowid: Any = None
+                if fetched is not None:
+                    existing_row = dict(zip(column_names, fetched))
+                    existing_rowid = existing_row.pop("_su_rowid")
+
+                if existing_row is None:
+                    # Brand new row - insert only the fields the record provides
+                    insert_cols = [
+                        resolve_casing(name, existing_columns)
+                        for name in record
+                    ]
+                    placeholders = ", ".join("?" for _ in insert_cols)
+                    insert_sql = (
+                        f"INSERT INTO {table_sql} "
+                        f"({', '.join(quote_identifier(c) for c in insert_cols)}) "
+                        f"VALUES ({placeholders})"
+                    )
+                    self.db.execute(
+                        insert_sql,
+                        [
+                            jsonify_if_needed(
+                                record[resolve_casing(c, record.keys())]
+                            )
+                            for c in insert_cols
+                        ],
+                    )
+                    inserted += 1
+                    self.last_pk = pk_out
+                    self.last_rowid = self.db.execute(
+                        "SELECT last_insert_rowid()"
+                    ).fetchone()[0]
+                    continue
+
+                stored_version = existing_row[version_column]
+                # The stored version must itself be comparable in Python
+                self._validate_version_value(stored_version, version_column)
+                try:
+                    comparison = (incoming_version > stored_version) - (
+                        incoming_version < stored_version
+                    )
+                except TypeError as ex:
+                    raise InvalidVersionError(
+                        f"versioned upsert cannot compare incoming version "
+                        f"{incoming_version!r} against stored version "
+                        f"{stored_version!r} in column {version_column!r}"
+                    ) from ex
+
+                if comparison < 0:
+                    # Out-of-order record carrying an older version
+                    stale += 1
+                    self.last_pk = pk_out
+                    self.last_rowid = existing_rowid
+                    continue
+
+                if comparison == 0:
+                    differing: list[str] = []
+                    for name in record:
+                        actual = resolve_casing(name, existing_columns)
+                        if fold_identifier_case(actual) in pk_folded or (
+                            fold_identifier_case(actual) == version_folded
+                        ):
+                            continue
+                        incoming_value = jsonify_if_needed(record[name])
+                        stored_value = existing_row.get(actual)
+                        # Only fields the record provides are compared; columns
+                        # it omits are untouched and never count as a conflict
+                        if incoming_value != stored_value and not (
+                            incoming_value is None and stored_value is None
+                        ):
+                            differing.append(actual)
+                    if differing:
+                        conflicts.append(
+                            VersionConflict(
+                                pk=pk_out,
+                                version=stored_version,
+                                record=dict(record),
+                                existing=dict(existing_row),
+                                differing_fields=tuple(differing),
+                            )
+                        )
+                    else:
+                        replayed += 1
+                    self.last_pk = pk_out
+                    self.last_rowid = existing_rowid
+                    continue
+
+                # Strictly higher version - update only the provided,
+                # non-primary-key fields, leaving omitted columns untouched
+                update_cols = [
+                    resolve_casing(name, existing_columns)
+                    for name in record
+                    if fold_identifier_case(
+                        resolve_casing(name, existing_columns)
+                    )
+                    not in pk_folded
+                ]
+                if update_cols:
+                    set_sql = ", ".join(
+                        f"{quote_identifier(c)} = ?" for c in update_cols
+                    )
+                    update_where = " AND ".join(
+                        f"{quote_identifier(c)} IS ?" for c in pk_cols
+                    )
+                    params = [
+                        jsonify_if_needed(
+                            record[resolve_casing(c, record.keys())]
+                        )
+                        for c in update_cols
+                    ] + pk_values
+                    self.db.execute(
+                        f"UPDATE {table_sql} SET {set_sql} WHERE {update_where}",
+                        params,
+                    )
+                updated += 1
+                self.last_pk = pk_out
+                self.last_rowid = existing_rowid
+
+        if analyze:
+            self.analyze()
+
+        return VersionedUpsertResult(
+            table=self,
+            inserted=inserted,
+            updated=updated,
+            stale=stale,
+            replayed=replayed,
+            conflicts=tuple(conflicts),
         )
 
     def add_missing_columns(self, records: Iterable[dict[str, Any]]) -> "Table":
