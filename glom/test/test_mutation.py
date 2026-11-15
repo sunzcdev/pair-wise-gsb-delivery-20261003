@@ -1,7 +1,7 @@
 import pytest
 
 from glom import glom, Path, T, S, Spec, Glommer, PathAssignError, PathAccessError
-from glom import assign, Assign, delete, Delete, PathDeleteError, Or
+from glom import assign, Assign, delete, Delete, PathDeleteError, Or, MissingFactory
 from glom import core
 from glom.core import UnregisteredTarget
 
@@ -199,6 +199,147 @@ def test_assign_missing_unassignable():
     # unassignable is already present, but not possible to assign to,
     # raising the PathAssignError.
     assert Tarjay.init_count == 3
+
+
+def test_missing_factory_context_args():
+    """The context factory receives the remaining path, the parent node,
+    and the segment about to be written, once per genuinely missing
+    segment."""
+    calls = []
+
+    def factory(remaining_path, parent, path_segment):
+        calls.append((remaining_path, parent, path_segment))
+        return {}
+
+    target = {}
+    assign(target, 'a.b.c', 'value', missing=MissingFactory(factory))
+
+    assert target == {'a': {'b': {'c': 'value'}}}
+    # only 'a' and 'b' are missing intermediate nodes; 'c' is the write
+    assert len(calls) == 2
+    first_path, first_parent, first_segment = calls[0]
+    assert first_segment == 'a'
+    assert first_parent is target
+    assert first_path == Path('a', 'b', 'c')
+    second_path, second_parent, second_segment = calls[1]
+    assert second_segment == 'b'
+    assert second_path == Path('b', 'c')
+    assert isinstance(second_parent, dict)
+
+
+def test_missing_factory_legacy_zero_arg():
+    """A plain zero-argument missing callable keeps working unchanged,
+    with and without the MissingFactory wrapper distinction."""
+    target = {}
+    assign(target, 'a.b.c', 'v', missing=dict)
+    assert target == {'a': {'b': {'c': 'v'}}}
+
+    # non-callable missing is still rejected
+    with pytest.raises(TypeError, match='callable'):
+        MissingFactory('not callable')
+
+
+def test_missing_factory_repr():
+    def factory(remaining_path, parent, path_segment):
+        return {}
+
+    spec = Assign('a.b', 1, missing=MissingFactory(factory))
+    rendered = repr(spec)
+    assert rendered.startswith('Assign(')
+    assert 'MissingFactory(' in rendered
+    # a builtin-backed factory round-trips through repr like other specs
+    builtin_spec = Assign('a.b', 1, missing=MissingFactory(dict))
+    assert repr(eval(repr(builtin_spec))) == repr(builtin_spec)
+    assert repr(MissingFactory(dict)) == 'MissingFactory(dict)'
+
+
+def test_extant_none_empty_not_missing():
+    """Existing None, [], and {} are real nodes, never missing ones."""
+    def make_counter():
+        calls = [0]
+
+        def factory(remaining_path, parent, path_segment):
+            calls[0] += 1
+            return {}
+        return calls, factory
+
+    # empty dict is kept and written into; no factory invocation
+    calls, factory = make_counter()
+    target = {'a': {}}
+    assign(target, 'a.b', 1, missing=MissingFactory(factory))
+    assert target == {'a': {'b': 1}}
+    assert calls == [0]
+
+    # an existing empty list is a real node: an out-of-range index is a
+    # genuine miss, but the factory result is validated against the list
+    # and rejected rather than silently replacing the list
+    calls, factory = make_counter()
+    target = {'a': []}
+    with pytest.raises(PathAssignError):
+        assign(target, 'a.0.b', 1, missing=MissingFactory(factory))
+    assert target == {'a': []}
+
+    # None is an extant (but unwritable) node: it raises, untouched, and
+    # the factory is never called because None itself is not "missing"
+    calls, factory = make_counter()
+    target = {'a': None}
+    with pytest.raises(PathAssignError):
+        assign(target, 'a.b', 1, missing=MissingFactory(factory))
+    assert target == {'a': None}
+    assert calls == [0]
+
+
+def test_missing_factory_bad_result_no_half_chain():
+    """A factory returning an object that cannot hold the next step
+    raises with the original path and leaves the document clean."""
+    target = {'preexisting': 'ok'}
+    with pytest.raises(PathAssignError) as exc_info:
+        assign(target, 'a.b.c', 'value',
+               missing=MissingFactory(lambda remaining_path, parent, seg: 42))
+    # the error references the original assignment path
+    assert exc_info.value.path == Path('a', 'b')
+    assert target == {'preexisting': 'ok'}
+
+
+def test_missing_factory_parallel_paths_share_parent():
+    """Two assignment paths in one glom() call share the parents they
+    create, rather than each rebuilding the chain."""
+    target = {}
+    spec = (Assign('shared.a', 1, missing=dict),
+            Assign('shared.b', 2, missing=dict))
+    glom(target, spec)
+    assert target == {'shared': {'a': 1, 'b': 2}}
+
+
+def test_missing_factory_no_cross_document_cache():
+    """A single Assign spec reused across documents must never hand one
+    document a container created for another."""
+    spec = Assign('a.b', 'value', missing=dict)
+    first, second = {}, {}
+    glom(first, spec)
+    glom(second, spec)
+    assert first == second == {'a': {'b': 'value'}}
+    assert first['a'] is not second['a']
+
+
+def test_missing_factory_context_drives_container_type():
+    """The factory can use the parent/segment context to choose types."""
+    def factory(remaining_path, parent, path_segment):
+        # integer index writes need a sequence parent
+        return [] if isinstance(path_segment, int) else {}
+
+    target = {}
+    assign(target, Path('a', 'b'), 'value', missing=MissingFactory(factory))
+    assert target == {'a': {'b': 'value'}}
+
+
+def test_missing_factory_s_path():
+    """Backfill also works for scope-based (S) assignment paths."""
+    result = glom(
+        {},
+        (Assign(S['scoped']['nested'], 'value', missing=MissingFactory(lambda r, p, s: {})),
+         S['scoped']))
+    assert result == {'nested': 'value'}
 
 
 def test_s_assign():

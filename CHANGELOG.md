@@ -12,6 +12,19 @@ The glom team's approach to updates can be summed up as:
 Check this page when upgrading, we strive to keep the updates
 summarized and well-linked.
 
+## Unreleased
+
+- Add `MissingFactory`, an explicit context-aware form of `Assign`'s
+  `missing` argument. Unlike a plain zero-argument callable, its factory
+  receives the remaining assignment path, the parent node, and the path
+  segment about to be written, so it can choose whether to build a list,
+  dict, or another container. The zero-argument `missing` callable
+  remains fully supported.
+- Backfill now treats existing `None`, `[]`, and `{}` as real nodes
+  rather than missing ones, and a factory result that cannot hold the
+  next step raises a `PathAssignError` with the original path without
+  leaving a half-built chain on the target.
+
 ## 25.12.0
 
 _(December 28, 2025)_
