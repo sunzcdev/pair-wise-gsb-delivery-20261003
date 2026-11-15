@@ -26,6 +26,7 @@ from jsonschema import (
     _format,
     _keywords,
     _legacy_keywords,
+    _suggest,
     _types,
     _typing,
     _utils,
@@ -453,6 +454,32 @@ def create(
         def validate(self, *args, **kwargs):
             for error in self.iter_errors(*args, **kwargs):
                 raise error
+
+        def suggest_defaults(self, instance):
+            """
+            Suggest :kw:`default` values for missing properties.
+
+            The :kw:`default` keyword is merely an annotation, so this
+            method is an advisory, independent interface: it reports
+            what *could* be filled in for properties missing from the
+            instance, along with where each candidate was declared and
+            under which applicator branch it applies. Neither the
+            instance nor the schema is modified, and nothing is ever
+            filled in implicitly -- in particular when a :kw:`oneOf`
+            cannot be uniquely matched, its branches contribute no
+            candidates.
+
+            Arguments:
+
+                instance:
+
+                    The instance to find missing properties for
+
+            Returns:
+
+                a list of `jsonschema._suggest.Suggestion`
+            """
+            return _suggest.suggest_defaults(self, instance)
 
         def is_type(self, instance, type):
             try:
@@ -1340,6 +1367,49 @@ def validate(instance, schema, cls=None, *args, **kwargs):  # noqa: D417
     error = exceptions.best_match(validator.iter_errors(instance))
     if error is not None:
         raise error
+
+
+def suggest_defaults(instance, schema, cls=None, *args, **kwargs):
+    """
+    Suggest :kw:`default` values for properties missing from an instance.
+
+    This is an advisory counterpart to `validate`: rather than checking
+    the instance, it reports what *could* be filled in based on
+    :kw:`default` annotations in the schema. Each suggestion includes
+    the candidate value, where it was declared, and the applicator
+    branch it applies under. Neither the instance nor the schema is
+    modified, and conflicting or ambiguous candidates are reported
+    rather than guessed at.
+
+    Arguments:
+
+        instance:
+
+            The instance to find missing properties for
+
+        schema:
+
+            The schema to suggest defaults from
+
+        cls (jsonschema.protocols.Validator):
+
+            The class that will be used to interpret the schema.
+
+    If the ``cls`` argument is not provided, it is determined with
+    `validator_for`, in the same way as for `validate`.
+
+    Any other provided positional and keyword arguments will be passed
+    on when instantiating the ``cls``.
+
+    Returns:
+
+        a list of `jsonschema._suggest.Suggestion`
+    """
+    if cls is None:
+        cls = validator_for(schema)
+
+    validator = cls(schema, *args, **kwargs)
+    return validator.suggest_defaults(instance)
 
 
 def validator_for(

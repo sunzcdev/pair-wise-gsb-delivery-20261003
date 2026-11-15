@@ -1,6 +1,9 @@
 v4.27.0
 =======
 
+* Add ``jsonschema.suggest_defaults`` (and ``Validator.suggest_defaults``), an advisory interface which reports what ``default`` values could be filled in for properties missing from an instance.
+  Suggestions include where each candidate was declared and under which applicator branch it applies; conflicting ``allOf`` candidates, ambiguous ``oneOf`` branches, and candidates which fail their own schema are reported rather than applied.
+  Neither the instance nor the schema is ever modified.
 * Support for Python 3.10 and 3.11 has been dropped.
 * Improve ``best_match`` for ``anyOf`` / ``oneOf`` errors: the most relevant error is now found within each subschema separately before the deepest of those is picked (#1257, #1300).
   In particular an applicator with a single subschema now produces the same best match as the bare subschema would.

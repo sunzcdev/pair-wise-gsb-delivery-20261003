@@ -21,6 +21,7 @@ from jsonschema.validators import (
     Draft7Validator,
     Draft201909Validator,
     Draft202012Validator,
+    suggest_defaults,
     validate,
 )
 
@@ -123,5 +124,6 @@ __all__ = [
     "SchemaError",
     "TypeChecker",
     "ValidationError",
+    "suggest_defaults",
     "validate",
 ]
