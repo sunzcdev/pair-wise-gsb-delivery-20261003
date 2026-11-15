@@ -2,10 +2,20 @@
 Tests for the parts of jsonschema related to the :kw:`format` keyword.
 """
 
+from unittest import mock
 from unittest import TestCase
 
-from jsonschema import FormatChecker, ValidationError
-from jsonschema.exceptions import FormatError
+import referencing.jsonschema
+from referencing import Registry, Resource
+
+from jsonschema import (
+    Draft202012Validator,
+    FormatChecker,
+    SchemaError,
+    ValidationError,
+)
+from jsonschema import _format
+from jsonschema.exceptions import FormatCapabilityError, FormatError
 from jsonschema.validators import Draft4Validator
 
 BOOM = ValueError("Boom!")
@@ -88,4 +98,81 @@ class TestFormatChecker(TestCase):
         self.assertEqual(
             repr(checker),
             "<FormatChecker checkers=['bar', 'baz', 'foo']>",
+        )
+
+    def test_strict_formats_report_unknown_and_dependencies(self):
+        checker = FormatChecker(formats=())
+        schema = {
+            "if": {"format": "emial"},
+            "then": {"format": "duration"},
+        }
+        with mock.patch.object(
+            _format,
+            "_dependency_is_available",
+            return_value=False,
+        ):
+            with self.assertRaises(FormatCapabilityError) as cm:
+                checker.check_schema(schema)
+
+        error = cm.exception
+        self.assertIsInstance(error, SchemaError)
+        self.assertEqual(
+            set(error.unknown_formats),
+            {"emial"},
+        )
+        self.assertEqual(
+            error.missing_dependencies,
+            {"duration": ("isoduration",)},
+        )
+        self.assertIn("'emial' (not registered", str(error))
+        self.assertIn("'duration' (missing dependency", str(error))
+        self.assertIn("#/if", str(error))
+        self.assertIn("#/then", str(error))
+
+    def test_annotation_only_mode_allows_unknown_formats(self):
+        Draft202012Validator.check_schema(
+            {"format": "emial"},
+            format_checker=None,
+            strict_formats=True,
+        )
+
+    def test_strict_formats_do_not_register_custom_formats_globally(self):
+        original = dict(FormatChecker.checkers)
+        checker = FormatChecker()
+        checker.checks("custom")(lambda instance: True)
+
+        Draft202012Validator.check_schema(
+            {"format": "custom"},
+            format_checker=checker,
+            strict_formats=True,
+        )
+
+        self.assertEqual(FormatChecker.checkers, original)
+        self.assertNotIn("custom", FormatChecker.checkers)
+
+    def test_strict_formats_follow_referenced_resources(self):
+        schema = {
+            "properties": {
+                "value": {"$ref": "https://example.com/remote"},
+            },
+        }
+        registry = Registry().with_resource(
+            "https://example.com/remote",
+            Resource.from_contents(
+                {"format": "emial"},
+                default_specification=referencing.jsonschema.DRAFT202012,
+            ),
+        )
+
+        with self.assertRaises(FormatCapabilityError) as cm:
+            Draft202012Validator.check_schema(
+                schema,
+                strict_formats=True,
+                registry=registry,
+            )
+
+        self.assertIn("emial", str(cm.exception))
+        self.assertEqual(
+            cm.exception.missing[0].resource,
+            "https://example.com/remote",
         )

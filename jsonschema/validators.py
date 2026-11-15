@@ -307,16 +307,141 @@ def create(
                     push_scope(id)
 
         @classmethod
-        def check_schema(cls, schema, format_checker=_UNSET):
+        def check_schema(
+            cls,
+            schema,
+            format_checker=_UNSET,
+            strict_formats=None,
+            *,
+            strict=None,
+            format_policy=None,
+            registry=None,
+            follow_references=True,
+        ):
+            """
+            Validate the given schema against the validator's `META_SCHEMA`.
+
+            When ``strict_formats`` is true, additionally assert that every
+            :kw:`format` declared anywhere in the schema is available to the
+            provided ``format_checker``.  This includes formats in referenced
+            resources and in every applicator branch, not only branches which
+            a particular instance would reach.  All unavailable formats are
+            reported together.
+
+            Passing ``format_checker=None`` keeps :kw:`format` in
+            annotation-only mode, so unknown formats are permitted even when
+            strict checking is requested.
+
+            ``registry`` is used both while checking the schema and while
+            following references to find declared formats.
+            """
             Validator = validator_for(cls.META_SCHEMA, default=cls)
             if format_checker is _UNSET:
                 format_checker = Validator.FORMAT_CHECKER
+
+            if format_policy is not None:
+                policy = format_policy.lower().replace("_", "-")
+                if policy in {
+                    "strict",
+                    "strict-formats",
+                    "assert",
+                    "assertion",
+                }:
+                    policy_strict = True
+                elif policy in {
+                    "annotation",
+                    "annotation-only",
+                    "annotate",
+                    "none",
+                    "off",
+                }:
+                    policy_strict = False
+                else:
+                    raise ValueError(
+                        f"Unknown format policy {format_policy!r}",
+                    )
+                if strict_formats is None:
+                    strict_formats = policy_strict
+
+            if strict is not None:
+                if strict_formats is None:
+                    strict_formats = strict
+                elif bool(strict_formats) != bool(strict):
+                    raise ValueError(
+                        "strict and strict_formats disagree",
+                    )
+
+            if strict_formats is None:
+                strict_formats = getattr(format_checker, "strict", False)
+
+            kwargs = {}
+            if registry is not None:
+                kwargs["registry"] = registry
             validator = Validator(
                 schema=cls.META_SCHEMA,
                 format_checker=format_checker,
+                **kwargs,
             )
             for error in validator.iter_errors(schema):
                 raise exceptions.SchemaError.create_from(error)
+
+            if strict_formats and format_checker is not None:
+                check_capabilities = getattr(
+                    format_checker,
+                    "check_schema",
+                    None,
+                )
+                if check_capabilities is not None:
+                    check_capabilities(
+                        schema,
+                        registry=registry,
+                        follow_references=follow_references,
+                        validator_cls=cls,
+                    )
+
+        @classmethod
+        def iter_missing_formats(
+            cls,
+            schema,
+            format_checker=_UNSET,
+            *,
+            registry=None,
+            resolver=None,
+            follow_references=True,
+            strict=None,
+            strict_formats=None,
+        ):
+            """
+            Iterate the unavailable :kw:`format` capabilities in ``schema``.
+
+            This is a static schema inspection; no instance is validated.
+            """
+            if format_checker is _UNSET:
+                format_checker = cls.FORMAT_CHECKER
+            if format_checker is None:
+                return iter(())
+            return format_checker.iter_missing_formats(
+                schema,
+                registry=registry,
+                resolver=resolver,
+                follow_references=follow_references,
+                validator_cls=cls,
+            )
+
+        @classmethod
+        def missing_formats(cls, schema, format_checker=_UNSET, **kwargs):
+            """
+            Return the distinct unavailable formats in ``schema``.
+            """
+            if format_checker is _UNSET:
+                format_checker = cls.FORMAT_CHECKER
+            if format_checker is None:
+                return ()
+            return format_checker.missing_formats(
+                schema,
+                validator_cls=cls,
+                **kwargs,
+            )
 
         @property
         def resolver(self):
@@ -1335,7 +1460,20 @@ def validate(instance, schema, cls=None, *args, **kwargs):  # noqa: D417
     if cls is None:
         cls = validator_for(schema)
 
-    cls.check_schema(schema)
+    strict_formats = kwargs.pop("strict_formats", None)
+    strict = kwargs.pop("strict", None)
+    format_policy = kwargs.pop("format_policy", None)
+    if strict_formats is None and strict is None and format_policy is None:
+        cls.check_schema(schema)
+    else:
+        cls.check_schema(
+            schema,
+            format_checker=kwargs.get("format_checker", _UNSET),
+            strict_formats=strict_formats,
+            strict=strict,
+            format_policy=format_policy,
+            registry=kwargs.get("registry"),
+        )
     validator = cls(schema, *args, **kwargs)
     error = exceptions.best_match(validator.iter_errors(instance))
     if error is not None:

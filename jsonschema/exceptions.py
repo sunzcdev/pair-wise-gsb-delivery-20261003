@@ -231,6 +231,45 @@ class SchemaError(_Error):
     _word_for_instance_in_error_message = "schema"
 
 
+class FormatCapabilityError(SchemaError):
+    """
+    A schema declares format capabilities which are not available.
+
+    This is a `SchemaError` because it is reported while preparing a schema,
+    before any instance is validated.  The individual capabilities are
+    available as `missing_formats` (and its aliases), each of which is a
+    string naming the format and additionally carries its reason and location.
+    """
+
+    def __init__(self, message, missing=(), *, schema=_unset):
+        self.missing = self.missing_formats = tuple(missing)
+        self.unregistered = tuple(
+            each
+            for each in self.missing
+            if getattr(each, "reason", None) == "unregistered"
+        )
+        self.missing_dependency = tuple(
+            each
+            for each in self.missing
+            if getattr(each, "reason", None) == "missing-dependency"
+        )
+        self.unregistered_formats = self.unregistered
+        self.formats_with_missing_dependencies = self.missing_dependency
+        self.missing_dependency_formats = self.missing_dependency
+        self.unknown_formats = tuple(str(each) for each in self.unregistered)
+        self.unknown = self.unregistered
+        self.missing_dependencies = {
+            str(each): tuple(getattr(each, "dependencies", ()))
+            for each in self.missing_dependency
+        }
+        super().__init__(message, schema=schema)
+
+
+#: Descriptive aliases for the strict format-capability failure.
+MissingFormatError = FormatCapabilityError
+FormatSchemaError = FormatCapabilityError
+
+
 @define(slots=False)
 class _RefResolutionError(Exception):  # noqa: PLW1641
     """

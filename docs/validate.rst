@@ -219,6 +219,36 @@ The more specific list of formats along with any additional dependencies they ha
 
     If a dependency is not installed when using a checker that requires it, validation will succeed without throwing an error, as also specified by the specification.
 
+Schema preparation can opt in to checking that every declared format is
+available before any instance is validated.
+This is useful in offline integrations, where a misspelled format name or a
+missing optional dependency would otherwise silently disable a check.
+
+.. code:: python
+
+    from jsonschema import Draft202012Validator
+
+    Draft202012Validator.check_schema(
+        {"format": "emial"},
+        strict_formats=True,
+    )
+
+This raises `jsonschema.exceptions.FormatCapabilityError` with every
+unavailable format, distinguishing formats which are not registered from
+formats whose optional dependency is not installed.
+Formats declared in referenced resources and in every applicator branch
+(including ``if`` / ``then`` / ``else``) are included.
+No instance validation is performed.
+Passing ``format_checker=None`` keeps ``format`` annotation-only, which
+allows unknown formats even when ``strict_formats=True`` is requested.
+
+The same check is available directly on a checker via
+`FormatChecker.check_schema`, `FormatChecker.missing_formats`, and
+`FormatChecker.iter_missing_formats`.
+A checker created with ``strict=True`` also uses strict checking by default.
+Custom formats registered with `FormatChecker.checks` remain local to that
+checker instance; they are not added to the global registry.
+
 =========================  ====================
 Checker                    Notes
 =========================  ====================
@@ -285,6 +315,10 @@ The supported mechanism for ensuring these dependencies are present is again as 
             Use `FormatChecker.checks` on an instance instead.
 
 .. autoexception:: jsonschema.exceptions.FormatError
+    :noindex:
+    :members:
+
+.. autoexception:: jsonschema.exceptions.FormatCapabilityError
     :noindex:
     :members:
 
