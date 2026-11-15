@@ -7,14 +7,19 @@
 
 from sqlparse import sql
 from sqlparse import tokens as T
+from sqlparse.filters.filter import Filter
 
 
-class OutputFilter:
+class OutputFilter(Filter):
     varname_prefix = ''
 
     def __init__(self, varname='sql'):
         self.varname = self.varname_prefix + varname
         self.count = 0
+
+    def begin(self):
+        """Return a fresh serializer with a reset statement counter."""
+        return type(self)(varname=self.varname[len(self.varname_prefix):])
 
     def _process(self, stream, varname, has_nl):
         raise NotImplementedError

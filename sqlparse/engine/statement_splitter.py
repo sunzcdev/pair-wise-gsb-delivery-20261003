@@ -15,6 +15,15 @@ class StatementSplitter:
     def __init__(self):
         self._reset()
 
+    def begin(self):
+        """Return a fresh splitter for one run.
+
+        The splitter accumulates the tokens of the statement currently being
+        built, so a separate instance is required per run to keep interleaved
+        ``FilterStack.run()`` calls independent.
+        """
+        return type(self)()
+
     def _reset(self):
         """Set the filter attributes to its default values"""
         self._block_stack = []

@@ -7,10 +7,11 @@
 
 from sqlparse import sql
 from sqlparse import tokens as T
+from sqlparse.filters.filter import Filter
 from sqlparse.utils import indent, offset
 
 
-class ReindentFilter:
+class ReindentFilter(Filter):
     def __init__(self, width=2, char=' ', wrap_after=0, n='\n',
                  comma_first=False, indent_after_first=False,
                  indent_columns=False, compact=False):
@@ -26,6 +27,18 @@ class ReindentFilter:
         self._curr_stmt = None
         self._last_stmt = None
         self._last_func = None
+
+    def begin(self):
+        """Return a fresh reindenter with run-private state."""
+        return type(self)(
+            width=self.width,
+            char=self.char,
+            wrap_after=self.wrap_after,
+            n=self.n,
+            comma_first=self.comma_first,
+            indent_after_first=bool(self.indent),
+            indent_columns=self.indent_columns,
+            compact=self.compact)
 
     @property
     def leading_ws(self):

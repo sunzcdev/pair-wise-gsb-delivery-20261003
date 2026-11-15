@@ -1,3 +1,20 @@
+Unreleased
+----------
+
+Enhancements
+
+* A reused `FilterStack` now isolates each `run()` call in its own session.
+  Stateful built-in filters (`ReindentFilter`, `AlignedIndentFilter` and the
+  output serializers) and the statement splitter hand back a fresh, reset
+  instance via a new `begin()` method, so indentation level, statement
+  counters and half-consumed generators can no longer leak between runs --
+  including when two runs are interleaved or one is closed or fails early.
+  Custom filters can subclass `sqlparse.filters.Filter` and override
+  `begin()` to opt in. Filters without `begin()` keep working unchanged but
+  remain shared across runs and therefore must stay stateless to be safely
+  reusable. No user-supplied objects are deep-copied; the stack relies on
+  `begin()` instead.
+
 Release 0.6.1 (Nov 01, 2026)
 ----------------------------
 

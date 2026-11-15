@@ -84,3 +84,58 @@ a keyword to the lexer:
 
     # no configuration is passed here. The lexer is used as a singleton.
     sqlparse.parse("select * from foo zorder by bar;")
+
+
+Writing Stateful Filters
+------------------------
+
+A :class:`~sqlparse.engine.FilterStack` is reusable: the same stack instance can
+be driven through several :meth:`~sqlparse.engine.FilterStack.run` calls, and
+the generators returned by those calls may even be consumed in an interleaved
+fashion or closed before they are exhausted.  Filters are attached to the
+stack once, so a filter that mutates itself while processing a stream needs an
+explicit boundary between runs.
+
+sqlparse models that boundary with a *session*.  When a run starts, the stack
+calls ``begin()`` on every registered filter and uses the returned object for
+that run only; it is discarded when the generator finishes or is closed.
+Stateful filters therefore implement ``begin()`` to return a freshly reset
+instance, while stateless filters can leave the default in place (it returns
+``self``).
+
+.. code-block:: python
+
+    from sqlparse.filters import Filter
+
+
+    class CountingFilter(Filter):
+        def __init__(self):
+            self.seen = 0
+
+        def begin(self):
+            # A run-private copy with reset state. Configuration stored on
+            # the registered filter can be copied over explicitly.
+            return CountingFilter()
+
+        def process(self, stmt):
+            self.seen += 1
+            return stmt
+
+Because each run keeps its own session object in the generator's local frame,
+two interleaved runs never share indentation level, statement counters or any
+half-consumed generator state, and abandoning or failing one run cannot
+pollute the next one. The stack relies on ``begin()`` rather than copying
+filters, so arbitrary objects referenced by a filter are never deep-copied.
+
+The built-in stateful filters -- :class:`~sqlparse.filters.ReindentFilter`,
+:class:`~sqlparse.filters.AlignedIndentFilter` and the output serializers --
+already implement ``begin()``.
+
+.. note::
+
+   A custom filter that does **not** define ``begin()`` keeps working
+   unchanged for backwards compatibility, but the same instance is reused on
+   every run. Such a filter must not keep per-statement or per-run state; if
+   it does, the state accumulates across runs and interleaved runs share it.
+   Give any stateful filter a ``begin()`` method that returns a new instance
+   to make it safe to reuse on a shared stack.

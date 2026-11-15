@@ -6,6 +6,7 @@
 # the BSD License: https://opensource.org/licenses/BSD-3-Clause
 
 from sqlparse.filters.aligned_indent import AlignedIndentFilter
+from sqlparse.filters.filter import Filter
 from sqlparse.filters.others import (
     SerializerUnicode,
     SpacesAroundOperatorsFilter,
@@ -24,6 +25,7 @@ from sqlparse.filters.tokens import (
 
 __all__ = [
     'AlignedIndentFilter',
+    'Filter',
     'IdentifierCaseFilter',
     'KeywordCaseFilter',
     'OutputPHPFilter',

@@ -7,10 +7,11 @@
 
 from sqlparse import sql
 from sqlparse import tokens as T
+from sqlparse.filters.filter import Filter
 from sqlparse.utils import indent, offset
 
 
-class AlignedIndentFilter:
+class AlignedIndentFilter(Filter):
     join_words = (r'((LEFT\s+|RIGHT\s+|FULL\s+)?'
                   r'(INNER\s+|OUTER\s+|STRAIGHT\s+)?|'
                   r'(CROSS\s+|NATURAL\s+)?)?JOIN\b')
@@ -28,6 +29,10 @@ class AlignedIndentFilter:
         self.indent = 0
         self.char = char
         self._max_kwd_len = len('select')
+
+    def begin(self):
+        """Return a fresh aligned indenter with run-private state."""
+        return type(self)(char=self.char, n=self.n)
 
     def nl(self, offset=1):
         # offset = 1 represent a single space after SELECT
