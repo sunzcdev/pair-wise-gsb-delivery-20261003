@@ -14,7 +14,7 @@ from os.path import getsize, isfile
 from pathlib import Path
 from tempfile import gettempdir
 from time import sleep, time
-from typing import Collection, Iterator, List, Optional, Tuple, Type
+from typing import Collection, Iterable, Iterator, List, Optional, Tuple, Type
 
 from platformdirs import user_cache_dir
 
@@ -117,7 +117,7 @@ class SQLiteCache(BaseCache):
             with self.responses._lock:
                 return super().delete(**kwargs)
         else:
-            self._prune_redirects()
+            self._prune_redirects(keys)
 
         # Skip vacuuming if only one key was deleted, or if explicitly disabled
         if vacuum and (expired or kwargs or len(keys) > 1):
@@ -131,18 +131,9 @@ class SQLiteCache(BaseCache):
                 (round(time()),),
             )
 
-    def _prune_redirects(self):
-        """A more efficient implementation of removing invalid redirects in SQL"""
-        with self.redirects.connection(commit=True) as conn:
-            t1 = self.redirects.table_name
-            t2 = self.responses.table_name
-            conn.execute(
-                f'DELETE FROM {t1} WHERE key IN ('
-                f'    SELECT {t1}.key FROM {t1}'
-                f'    LEFT JOIN {t2} ON {t2}.key = {t1}.value'
-                f'    WHERE {t2}.key IS NULL'
-                ')'
-            )
+    def _prune_redirects(self, deleted_keys: Optional[Iterable[str]] = None):
+        """Remove invalid redirects using the same alias-chain rules as the base implementation"""
+        super()._prune_redirects(deleted_keys)
 
     def count(self, expired: bool = True) -> int:
         """Count number of responses, optionally excluding expired

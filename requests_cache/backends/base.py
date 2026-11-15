@@ -29,6 +29,11 @@ DESERIALIZE_ERRORS = (AttributeError, EOFError, ImportError, PickleError, TypeEr
 
 logger = getLogger(__name__)
 
+# Maximum number of redirect aliases to follow when resolving a cache key
+MAX_REDIRECT_CHAIN_LENGTH = 100
+MAX_ALIAS_CHAIN_LENGTH = MAX_REDIRECT_CHAIN_LENGTH
+MAX_REDIRECTS = MAX_REDIRECT_CHAIN_LENGTH
+
 
 class BaseCache:
     """Base class for cache backends. Can be used as a non-persistent, in-memory cache.
@@ -69,6 +74,47 @@ class BaseCache:
     # Main cache operations
     # ---------------------
 
+    def _resolve_redirect(self, key: str, default=None) -> Optional[str]:
+        """Resolve a redirect alias to its final response key.
+
+        Alias chains are followed iteratively, up to :py:const:`MAX_REDIRECT_CHAIN_LENGTH`.
+        Circular, overlong, and otherwise invalid chains are logged and resolved to ``default``.
+        """
+        max_length = min(MAX_REDIRECT_CHAIN_LENGTH, MAX_ALIAS_CHAIN_LENGTH, MAX_REDIRECTS)
+        path: List[str] = []
+        visited = set()
+        current = key
+
+        for _ in range(max_length + 1):
+            try:
+                if current in visited:
+                    chain = ' -> '.join(map(str, [*path, current]))
+                    logger.warning(
+                        f'Circular redirect alias chain detected (loop/cycle) '
+                        f'for key {key!r}: {chain}'
+                    )
+                    return default
+                visited.add(current)
+                path.append(current)
+
+                # A direct response takes precedence over an alias with the same key
+                if current in self.responses:
+                    return current
+                current = self.redirects[current]
+            except KeyError:
+                # Reached the end of the alias chain
+                return current
+            except (AttributeError, TypeError, ValueError) as e:
+                logger.warning(f'Invalid redirect alias chain for key {key!r}: {e}')
+                return default
+
+        chain = ' -> '.join(map(str, path))
+        logger.warning(
+            f'Redirect alias chain length {len(path)} exceeds the maximum limit '
+            f'of {max_length} for key {key!r}: {chain}'
+        )
+        return default
+
     def get_response(self, key: str, default=None) -> Optional[CachedResponse]:
         """Retrieve a response from the cache, if it exists
 
@@ -79,9 +125,10 @@ class BaseCache:
         try:
             response = self.responses.get(key)
             if response is None:  # Note: bool(requests.Response) is False if status > 400
-                response = self.responses[self.redirects[key]]
-            return response
-        except (AttributeError, KeyError):
+                redirect_key = self._resolve_redirect(key)
+                response = self.responses.get(redirect_key) if redirect_key is not None else None
+            return response if response is not None else default
+        except (AttributeError, KeyError, TypeError, ValueError):
             return default
 
     def save_response(
@@ -158,7 +205,13 @@ class BaseCache:
             request = Request('GET', url)
         if request and not key:
             key = self.create_key(request, verify=verify)
-        return key in self.responses or key in self.redirects
+        try:
+            if key in self.responses:
+                return True
+            redirect_key = self._resolve_redirect(key)
+            return redirect_key is not None and redirect_key in self.responses
+        except (AttributeError, KeyError, TypeError, ValueError):
+            return False
 
     def delete(
         self,
@@ -201,11 +254,26 @@ class BaseCache:
                 pass
         else:
             self.responses.bulk_delete(delete_keys)
-        self._prune_redirects()
+        self._prune_redirects(delete_keys)
 
-    def _prune_redirects(self):
-        """Remove any redirects that no longer point to an existing response"""
-        invalid_redirects = [k for k, v in self.redirects.items() if v not in self.responses]
+    def _prune_redirects(self, deleted_keys: Optional[Iterable[str]] = None):
+        """Remove explicitly deleted aliases and aliases that no longer resolve to a response.
+
+        This includes the full reverse closure of deleted responses, so multi-hop alias chains
+        don't leave behind dangling aliases that still resolve (or appear to resolve) to a
+        deleted entry. Circular and overlong chains are also removed.
+        """
+        if deleted_keys:
+            self.redirects.bulk_delete(deleted_keys)
+
+        invalid_redirects = []
+        for key in list(self.redirects.keys()):
+            # Keep redundant aliases for keys that also have a direct response
+            if key in self.responses:
+                continue
+            target = self._resolve_redirect(key)
+            if target is None or target not in self.responses:
+                invalid_redirects.append(key)
         self.redirects.bulk_delete(invalid_redirects)
 
     def filter(
