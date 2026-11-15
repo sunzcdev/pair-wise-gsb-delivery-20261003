@@ -33,8 +33,13 @@ from ._utils import decode, encode, patch_form_boundary, is_json_content_type
 
 __all__ = [
     'create_key',
+    'JSON_BODY_MATCH_FALLBACK',
+    'JSON_BODY_MATCH_OFF',
+    'JSON_BODY_MATCH_REJECT',
+    'JSONBodyNormalizationError',
     'normalize_body',
     'normalize_headers',
+    'normalize_json_body_canonical',
     'normalize_request',
     'normalize_params',
     'normalize_url',
@@ -45,11 +50,149 @@ if TYPE_CHECKING:
 # Maximum JSON request body size that will be filtered and normalized
 MAX_NORM_BODY_SIZE = 10 * 1024 * 1024
 
+# Explicit JSON body matching modes
+JSON_BODY_MATCH_OFF = 'off'
+JSON_BODY_MATCH_FALLBACK = 'fallback'
+JSON_BODY_MATCH_REJECT = 'reject'
+JSON_BODY_MATCH_MODES = (
+    JSON_BODY_MATCH_OFF,
+    JSON_BODY_MATCH_FALLBACK,
+    JSON_BODY_MATCH_REJECT,
+)
+
 KVList = List[Tuple[str, str]]
 ParamList = Optional[Iterable[str]]
 RequestContent = Union[Mapping, str, bytes]
 
 logger = getLogger(__name__)
+
+
+class JSONBodyNormalizationError(ValueError):
+    """Raised when a request body declared as JSON cannot be normalized into an unambiguous
+    canonical cache key (e.g. invalid JSON, an unsupported charset, or duplicate object keys).
+    """
+
+
+def _reject_duplicate_keys(pairs: List[Tuple[str, Any]]) -> Dict[str, Any]:
+    """``object_pairs_hook`` that rejects objects containing duplicate keys, since their meaning
+    is ambiguous and different JSON parsers resolve them differently."""
+    result: Dict[str, Any] = {}
+    for key, value in pairs:
+        if key in result:
+            raise JSONBodyNormalizationError(f'Duplicate JSON object key: {key!r}')
+        result[key] = value
+    return result
+
+
+def _reject_non_finite(value: str) -> Any:
+    """``parse_constant`` hook that rejects the non-standard ``NaN``/``Infinity`` tokens so only
+    fully parseable, standards-compliant JSON is used for canonical matching."""
+    raise JSONBodyNormalizationError(f'Non-finite JSON number is not supported: {value}')
+
+
+def _get_content_charset(request: AnyPreparedRequest) -> str:
+    """Determine the charset used to decode a JSON request body.
+
+    JSON defaults to UTF-8 (RFC 8259). A charset explicitly declared on the Content-Type header
+    takes precedence, and an unrecognized/unsupported charset is treated as a normalization
+    failure rather than guessed.
+    """
+    content_type = request.headers.get('Content-Type', '') or ''
+    for param in content_type.split(';')[1:]:
+        name, sep, value = param.strip().partition('=')
+        if sep and name.lower() == 'charset' and value:
+            return value.strip('"').strip("'").lower()
+    return 'utf-8'
+
+
+def _decode_json_body(body: Union[str, bytes], charset: str) -> str:
+    """Decode a raw JSON body using a definite charset, rejecting undecodable bytes."""
+    if isinstance(body, str):
+        return body
+    try:
+        return body.decode(charset)
+    except (LookupError, UnicodeDecodeError) as e:
+        raise JSONBodyNormalizationError(
+            f'Unable to decode JSON body using charset {charset!r}: {e}'
+        ) from e
+
+
+def _parse_canonical_json(decoded_body: str) -> Any:
+    """Parse JSON while preserving integer precision (no float coercion) and rejecting ambiguous
+    duplicate keys or non-standard tokens."""
+    try:
+        return json.loads(
+            decoded_body,
+            parse_int=int,
+            parse_float=float,
+            parse_constant=_reject_non_finite,
+            object_pairs_hook=_reject_duplicate_keys,
+        )
+    except JSONBodyNormalizationError:
+        raise
+    except (TypeError, ValueError) as e:
+        raise JSONBodyNormalizationError(f'Invalid JSON request body: {e}') from e
+
+
+def _filter_json_canonical(data: Any, ignored_parameters: Optional[set]) -> Any:
+    """Recursively replace ignored parameters while preserving value types and array order."""
+    if isinstance(data, Mapping):
+        result = {}
+        for key, value in data.items():
+            if key in ignored_parameters:
+                result[key] = 'REDACTED'
+            else:
+                result[key] = _filter_json_canonical(value, ignored_parameters)
+        return result
+    if isinstance(data, list):
+        return [_filter_json_canonical(item, ignored_parameters) for item in data]
+    return data
+
+
+def _canonical_json(value: Any) -> str:
+    """Serialize parsed JSON into a deterministic, type-preserving canonical string.
+
+    Object keys are sorted (key order is irrelevant), while arrays keep their order. Type tags
+    keep values like ``1``, ``"1"`` and ``true`` distinct, and integers are emitted without any
+    floating-point conversion.
+    """
+    if value is None:
+        return 'null'
+    if isinstance(value, bool):
+        return f'bool:{value}'
+    if isinstance(value, int):
+        return f'int:{value}'
+    if isinstance(value, float):
+        return f'float:{json.dumps(value)}'
+    if isinstance(value, str):
+        return f'str:{json.dumps(value, ensure_ascii=False)}'
+    if isinstance(value, Mapping):
+        # Standard JSON object keys are always strings, so they can be sorted directly
+        items = ','.join(
+            f'{json.dumps(key, ensure_ascii=False)}:{_canonical_json(item)}'
+            for key, item in sorted(value.items())
+        )
+        return f'obj:{{{items}}}'
+    if isinstance(value, list):
+        items = ','.join(_canonical_json(item) for item in value)
+        return f'arr:[{items}]'
+    raise JSONBodyNormalizationError(f'Unsupported JSON value type: {type(value).__name__}')
+
+
+def normalize_json_body_canonical(
+    original_body: Union[str, bytes],
+    charset: str,
+    ignored_parameters: ParamList = None,
+) -> str:
+    """Parse a JSON request body and return an unambiguous canonical representation for cache keys.
+
+    Only bodies fully parseable as JSON are accepted. Object key order is ignored, but value
+    types and array order are preserved, and duplicate object keys are rejected.
+    """
+    decoded_body = _decode_json_body(original_body, charset)
+    parsed = _parse_canonical_json(decoded_body)
+    parsed = _filter_json_canonical(parsed, set(ignored_parameters or []))
+    return _canonical_json(parsed)
 
 
 def create_key(
@@ -58,6 +201,7 @@ def create_key(
     match_headers: Union[ParamList, bool] = False,
     serializer: Any = None,
     content_root_key: Optional[str] = None,
+    json_body_match: Optional[str] = JSON_BODY_MATCH_OFF,
     **request_kwargs,
 ) -> str:
     """Create a normalized cache key based on a request object
@@ -68,10 +212,15 @@ def create_key(
         match_headers: Match only the specified headers, or ``True`` to match all headers
         serializer: Serializer name or instance
         content_root_key: root element in the request body to apply ignored_parameters to
+        json_body_match: How to match request bodies declared as JSON; one of
+            :data:`JSON_BODY_MATCH_OFF`, :data:`JSON_BODY_MATCH_FALLBACK`, or
+            :data:`JSON_BODY_MATCH_REJECT`
         request_kwargs: Additional keyword arguments for :py:func:`~requests.request`
     """
     # Normalize and gather all relevant request info to match against
-    request = normalize_request(request, ignored_parameters, content_root_key)
+    request = normalize_request(
+        request, ignored_parameters, content_root_key, json_body_match
+    )
     key_parts = [
         request.method or '',
         request.url,
@@ -115,6 +264,7 @@ def normalize_request(
     request: AnyRequest,
     ignored_parameters: ParamList = None,
     content_root_key: Optional[str] = None,
+    json_body_match: Optional[str] = JSON_BODY_MATCH_OFF,
 ) -> AnyPreparedRequest:
     """Normalize and remove ignored parameters from request URL, body, and headers.
     This is used for both:
@@ -126,6 +276,7 @@ def normalize_request(
         request: Request object to normalize
         ignored_parameters: Request parameters, headers, and/or JSON body params to exclude
         content_root_key: root element in the request body to apply ignored_parameters to
+        json_body_match: How to match request bodies declared as JSON; see :func:`create_key`
     """
     if isinstance(request, Request):
         # For a multipart POST request that hasn't been prepared, we need to patch the form boundary
@@ -138,7 +289,9 @@ def normalize_request(
     norm_request.method = (norm_request.method or '').upper()
     norm_request.url = normalize_url(norm_request.url or '', ignored_parameters)
     norm_request.headers = normalize_headers(norm_request.headers, ignored_parameters)
-    norm_request.body = normalize_body(norm_request, ignored_parameters, content_root_key)
+    norm_request.body = normalize_body(
+        norm_request, ignored_parameters, content_root_key, json_body_match
+    )
     return norm_request
 
 
@@ -169,10 +322,12 @@ def normalize_body(
     request: AnyPreparedRequest,
     ignored_parameters: ParamList,
     content_root_key: Optional[str] = None,
+    json_body_match: Optional[str] = JSON_BODY_MATCH_OFF,
 ) -> bytes:
     """Normalize and filter a request body if possible, depending on Content-Type"""
     if not request.body:
         return b''
+    json_body_match = json_body_match or JSON_BODY_MATCH_OFF
 
     norm_body: Union[str, bytes] = request.body
 
@@ -189,9 +344,29 @@ def normalize_body(
     except (AttributeError, KeyError):
         content_type = ''
 
-    # Filter and sort params if possible
     if is_json_content_type(content_type):
-        norm_body = normalize_json_body(norm_body, ignored_parameters, content_root_key)
+        if json_body_match == JSON_BODY_MATCH_OFF:
+            # Legacy behavior: best-effort normalization that ignores ordering/type distinctions
+            norm_body = normalize_json_body(norm_body, ignored_parameters, content_root_key)
+        else:
+            # Explicit strict JSON equivalence matching
+            if len(norm_body) > MAX_NORM_BODY_SIZE:
+                error = JSONBodyNormalizationError(
+                    f'JSON body exceeds maximum normalized size of {MAX_NORM_BODY_SIZE} bytes'
+                )
+                if json_body_match == JSON_BODY_MATCH_REJECT:
+                    raise error
+                logger.debug('Falling back to raw byte body: %s', error)
+            else:
+                charset = _get_content_charset(request)
+                try:
+                    norm_body = normalize_json_body_canonical(
+                        norm_body, charset, ignored_parameters
+                    )
+                except JSONBodyNormalizationError as error:
+                    if json_body_match == JSON_BODY_MATCH_REJECT:
+                        raise
+                    logger.debug('Falling back to raw byte body: %s', error)
     elif content_type == 'application/x-www-form-urlencoded':
         norm_body = normalize_params(norm_body, ignored_parameters)
 
@@ -236,7 +411,11 @@ def normalize_params(value: Union[str, bytes], ignored_parameters: ParamList = N
     return query_str
 
 
-def redact_response(response: CachedResponse, ignored_parameters: ParamList) -> CachedResponse:
+def redact_response(
+    response: CachedResponse,
+    ignored_parameters: ParamList,
+    json_body_match: Optional[str] = JSON_BODY_MATCH_OFF,
+) -> CachedResponse:
     """Redact any ignored parameters (potentially containing sensitive info) from a cached request"""
     if ignored_parameters:
         response.url = filter_url(response.url, ignored_parameters)
@@ -247,7 +426,9 @@ def redact_response(response: CachedResponse, ignored_parameters: ParamList) -> 
         response.request.headers = CaseInsensitiveDict(
             filter_sort_dict(response.request.headers, ignored_parameters)
         )
-        response.request.body = normalize_body(response.request, ignored_parameters)
+        response.request.body = normalize_body(
+            response.request, ignored_parameters, json_body_match=json_body_match
+        )
     return response
 
 

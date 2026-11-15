@@ -99,7 +99,11 @@ class BaseCache:
         """
         cache_key = cache_key or self.create_key(response.request)
         cached_response = CachedResponse.from_response(response, expires=expires)
-        cached_response = redact_response(cached_response, self._settings.ignored_parameters)
+        cached_response = redact_response(
+            cached_response,
+            self._settings.ignored_parameters,
+            self._settings.json_body_match,
+        )
         self.responses[cache_key] = cached_response
 
         # Save redirect aliases, unless this is a revalidation (i.e., it was saved previously)
@@ -131,6 +135,7 @@ class BaseCache:
             request=request,
             ignored_parameters=self._settings.ignored_parameters,
             content_root_key=self._settings.content_root_key,
+            json_body_match=self._settings.json_body_match,
             match_headers=match_headers or self._settings.match_headers,
             serializer=self.responses.serializer,
             **kwargs,

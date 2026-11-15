@@ -11,6 +11,7 @@ from requests.hooks import dispatch_hook
 
 from ._utils import get_valid_kwargs, patch_form_boundary
 from .backends import BackendSpecifier, StrOrPath, init_backend
+from .cache_keys import JSON_BODY_MATCH_REJECT, JSONBodyNormalizationError
 from .models import AnyResponse, CachedResponse, OriginalResponse
 from .policy import (
     DEFAULT_CACHE_NAME,
@@ -54,6 +55,7 @@ class CacheMixin(MIXIN_BASE):
         allowable_methods: Iterable[str] = DEFAULT_METHODS,
         always_revalidate: bool = False,
         ignored_parameters: Iterable[str] = DEFAULT_IGNORED_PARAMS,
+        json_body_match: Optional[str] = None,
         match_headers: Union[Iterable[str], bool] = False,
         filter_fn: Optional[FilterCallback] = None,
         key_fn: Optional[KeyCallback] = None,
@@ -72,6 +74,7 @@ class CacheMixin(MIXIN_BASE):
             allowable_methods=allowable_methods,
             always_revalidate=always_revalidate,
             ignored_parameters=ignored_parameters,
+            json_body_match=json_body_match,
             match_headers=match_headers,
             filter_fn=filter_fn,
             key_fn=key_fn,
@@ -214,9 +217,19 @@ class CacheMixin(MIXIN_BASE):
         request.headers = set_request_headers(
             request.headers, expire_after, only_if_cached, refresh, force_refresh
         )
-        actions = CacheActions.from_request(
-            self.cache.create_key(request, **kwargs), request, self.settings
-        )
+        try:
+            cache_key = self.cache.create_key(request, **kwargs)
+        except JSONBodyNormalizationError as error:
+            if self.settings.json_body_match != JSON_BODY_MATCH_REJECT:
+                raise
+            # A body declared as JSON cannot be matched unambiguously; send the request but do
+            # not read from or write to the cache for it.
+            logger.info('Skipping cache due to JSON body normalization failure: %s', error)
+            actions = CacheActions.from_request('', request, self.settings)
+            actions.skip_read = True
+            actions.skip_write = True
+        else:
+            actions = CacheActions.from_request(cache_key, request, self.settings)
 
         # Attempt to fetch a cached response
         cached_response: Optional[CachedResponse] = None
@@ -281,7 +294,7 @@ class CacheMixin(MIXIN_BASE):
         response = super().send(request, **kwargs)
         actions.update_from_response(response)
 
-        if not actions.skip_write:
+        if not actions.skip_write and actions.cache_key:
             self.cache.save_response(response, actions.cache_key, actions.expires)
         elif cached_response is not None and response.status_code == 304:
             cached_response = actions.update_revalidated_response(
@@ -406,6 +419,10 @@ class CachedSession(CacheMixin, OriginalSession):
             be a list of headers, or ``True`` to match all.
         ignored_parameters: Request parameters, headers, and/or JSON body params to exclude from both
             request matching and cached request data
+        json_body_match: How to match request bodies declared as JSON. ``None`` keeps the legacy
+            best-effort behavior, ``'fallback'`` uses strict type- and order-preserving JSON
+            matching with a raw-byte fallback for unparseable bodies, and ``'reject'`` bypasses
+            the cache when such a body cannot be normalized. See :ref:`matching` for details.
         read_only: Read existing cached responses, but do not write any new responses to the cache
         stale_if_error: Return a stale response if a new request raises an exception. Optionally
             accepts a time value representing maximum staleness to accept.

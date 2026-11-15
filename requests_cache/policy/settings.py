@@ -3,6 +3,7 @@ from typing import Dict, Iterable, Optional, Union
 from attrs import define, field
 
 from .._utils import get_valid_kwargs
+from ..cache_keys import JSON_BODY_MATCH_MODES
 from ..models import RichMixin
 from . import ExpirationPattern, ExpirationTime, FilterCallback, KeyCallback
 
@@ -42,6 +43,7 @@ class CacheSettings(RichMixin):
     expire_after: ExpirationTime = field(default=None)
     filter_fn: FilterCallback = field(default=None)
     ignored_parameters: Iterable[str] = field(default=DEFAULT_IGNORED_PARAMS)
+    json_body_match: Optional[str] = field(default=None)
     key_fn: KeyCallback = field(default=None)
     match_headers: Union[Iterable[str], bool] = field(default=False)
     only_if_cached: bool = field(default=False)
@@ -59,7 +61,15 @@ class CacheSettings(RichMixin):
         """
         kwargs = cls._rename_kwargs(kwargs)
         kwargs = get_valid_kwargs(cls.__init__, kwargs)
-        return cls(**kwargs)
+        settings = cls(**kwargs)
+        if settings.json_body_match is not None and (
+            settings.json_body_match not in JSON_BODY_MATCH_MODES
+        ):
+            raise ValueError(
+                'json_body_match must be one of: '
+                + ', '.join(repr(mode) for mode in JSON_BODY_MATCH_MODES)
+            )
+        return settings
 
     @staticmethod
     def _rename_kwargs(kwargs):

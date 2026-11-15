@@ -59,6 +59,45 @@ with a fixed header value. For example, always passing `"Accept-Encoding": "gzip
 deflate"` ensures that additional compression encodings are not added to the request.
 ```
 
+### JSON Request Bodies
+The default body normalization is a best-effort transformation intended to increase cache hits.
+For JSON bodies it sorts both object keys and array values, which can conflate requests that are
+not actually equivalent. For example, `[1, 2]` and `[2, 1]` would match under that behavior.
+
+If you need strict, unambiguous matching for bodies sent as JSON, use the `json_body_match`
+option. When enabled, a body is only treated as JSON when its `Content-Type` declares it and the
+body can be fully parsed. Matching then follows these rules:
+
+* Object key order is ignored (the only reordering that is semantically irrelevant)
+* Value types are kept distinct, so `1`, `"1"` and `true` never match each other
+* Array order is preserved, so `[1, 2]` and `[2, 1]` do not match
+* Large integers keep their full precision and are never converted to floating point
+* Objects containing duplicate keys are rejected as ambiguous
+* The body is decoded using a definite charset (UTF-8 by default, or the declared `charset`)
+
+The normalization is used only to build the cache key; the actual request body sent over the
+wire is never modified.
+
+`json_body_match` accepts one of three values:
+
+* `None` (default): keep the legacy best-effort behavior unchanged
+* `'fallback'`: use strict JSON matching when the body is fully parseable; otherwise fall back to
+  matching the raw body bytes exactly
+* `'reject'`: use strict JSON matching, and bypass the cache entirely (neither read nor write)
+  when a body declared as JSON cannot be normalized unambiguously
+
+```python
+>>> session = CachedSession(
+...     allowable_methods=('GET', 'POST'), json_body_match='reject'
+... )
+>>> # These two requests match because object key order is irrelevant
+>>> session.post('https://example.com/items', json={'a': 1, 'b': 2})
+>>> session.post('https://example.com/items', json={'b': 2, 'a': 1})
+>>> # These do not match, because value types and array order are significant
+>>> session.post('https://example.com/items', json={'v': 1})
+>>> session.post('https://example.com/items', json={'v': '1'})
+```
+
 (matching-headers)=
 ## Matching Request Headers
 ```{note}
