@@ -5,6 +5,7 @@ import ipaddress
 import math
 import typing
 import uuid
+import warnings
 from unittest.mock import patch
 
 import pytest
@@ -287,6 +288,165 @@ class TestFieldDeserialization:
         assert isinstance(m7d, decimal.Decimal)
         assert m7d.is_zero()
         assert m7d.is_signed()
+
+    def test_decimal_field_precision_policy_default_is_allow(self):
+        field = fields.Decimal(1)
+        assert field.precision_policy is fields.PrecisionPolicy.ALLOW
+        # Rounding happens silently, preserving the historical behavior.
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            assert field.deserialize("12.355") == decimal.Decimal("12.4")
+
+    def test_decimal_field_precision_policy_accepts_string_value(self):
+        field = fields.Decimal(1, precision_policy="reject")
+        assert field.precision_policy is fields.PrecisionPolicy.REJECT
+
+    def test_decimal_field_precision_policy_reject(self):
+        field = fields.Decimal(1, precision_policy=fields.PrecisionPolicy.REJECT)
+        # Values that already fit the precision are accepted.
+        assert field.deserialize("12.3") == decimal.Decimal("12.3")
+        assert field.deserialize("12") == decimal.Decimal("12.0")
+        # Values that would be rounded are rejected.
+        with pytest.raises(ValidationError) as excinfo:
+            field.deserialize("12.355")
+        assert excinfo.value.messages == [
+            "Value cannot be represented exactly with the required precision."
+        ]
+
+    def test_decimal_field_precision_policy_reject_respects_rounding(self):
+        round_down = fields.Decimal(
+            1, decimal.ROUND_DOWN, precision_policy=fields.PrecisionPolicy.REJECT
+        )
+        with pytest.raises(ValidationError):
+            round_down.deserialize("12.355")
+
+    @pytest.mark.parametrize(
+        ("value", "places"),
+        [
+            ("12.3", 1),
+            ("12", 1),
+            ("1.50", 1),
+            ("1.000", 1),
+            ("10.00", 1),
+            ("-0", 2),
+            ("0", 2),
+            ("0.00", 2),
+            ("100", 2),
+        ],
+    )
+    def test_decimal_field_precision_policy_no_false_positive(self, value, places):
+        # Exact values, trailing zeros and signed zeros must not be reported.
+        field = fields.Decimal(
+            places, precision_policy=fields.PrecisionPolicy.REPORT
+        )
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            result = field.deserialize(value)
+        assert caught == []
+        assert result == decimal.Decimal(value).quantize(
+            decimal.Decimal((0, (1,), -places))
+        )
+
+    def test_decimal_field_precision_policy_report(self):
+        field = fields.Decimal(1, precision_policy=fields.PrecisionPolicy.REPORT)
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            result = field.deserialize("12.355")
+        assert result == decimal.Decimal("12.4")
+        assert len(caught) == 1
+        warning = caught[0].message
+        assert isinstance(warning, fields.RoundingWarning)
+        assert warning.original == "12.355"
+        assert warning.quantized == decimal.Decimal("12.4")
+        assert warning.places == 1
+        assert warning.rounding is None
+
+    def test_decimal_field_precision_policy_report_field_location(self):
+        class PrecisionSchema(Schema):
+            amount = fields.Decimal(
+                1,
+                data_key="amountInCents",
+                precision_policy=fields.PrecisionPolicy.REPORT,
+            )
+
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            PrecisionSchema().load({"amountInCents": "12.355"})
+        warning = caught[0].message
+        assert warning.field_name == "amount"
+        assert warning.data_key == "amountInCents"
+        assert "amountInCents" in str(warning)
+
+    def test_decimal_field_precision_policy_reject_list_position(self):
+        class PrecisionSchema(Schema):
+            amounts = fields.List(
+                fields.Decimal(1, precision_policy=fields.PrecisionPolicy.REJECT)
+            )
+
+        with pytest.raises(ValidationError) as excinfo:
+            PrecisionSchema().load({"amounts": ["1.0", "2.99", "3.55"]})
+        assert excinfo.value.messages == {
+            "amounts": {
+                1: ["Value cannot be represented exactly with the required precision."],
+                2: ["Value cannot be represented exactly with the required precision."],
+            }
+        }
+
+    def test_decimal_field_precision_policy_does_not_mutate_thread_context(self):
+        context = decimal.getcontext()
+        original_prec = context.prec
+        original_trap = context.traps[decimal.Inexact]
+        context.prec = 40
+        context.traps[decimal.Inexact] = 1
+        context.flags[decimal.Inexact] = 0
+        try:
+            report = fields.Decimal(
+                1, precision_policy=fields.PrecisionPolicy.REPORT
+            )
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                report.deserialize("12.355")
+            reject = fields.Decimal(
+                1, precision_policy=fields.PrecisionPolicy.REJECT
+            )
+            with pytest.raises(ValidationError):
+                reject.deserialize("12.355")
+            assert context.prec == 40
+            assert context.traps[decimal.Inexact] is True
+            assert context.flags[decimal.Inexact] == 0
+        finally:
+            context.prec = original_prec
+            context.traps[decimal.Inexact] = original_trap
+
+    def test_decimal_field_precision_policy_special_values_not_reported(self):
+        field = fields.Decimal(
+            places=2,
+            allow_nan=True,
+            precision_policy=fields.PrecisionPolicy.REPORT,
+        )
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            assert field.deserialize("NaN").is_nan()
+            assert field.deserialize("Infinity").is_infinite()
+            result = field.deserialize("-0")
+        assert result.is_zero()
+        assert result.is_signed()
+        assert caught == []
+
+    def test_decimal_field_precision_policy_huge_exponent_still_invalid(self):
+        field = fields.Decimal(
+            1, precision_policy=fields.PrecisionPolicy.REJECT
+        )
+        with pytest.raises(ValidationError) as excinfo:
+            field.deserialize("1E+100")
+        assert excinfo.value.messages == ["Not a valid number."]
+
+    def test_decimal_field_precision_policy_ignored_without_places(self):
+        field = fields.Decimal(
+            precision_policy=fields.PrecisionPolicy.REJECT
+        )
+        # Without places there is no quantization, so extra precision is kept.
+        assert field.deserialize("12.355") == decimal.Decimal("12.355")
 
     @pytest.mark.parametrize("allow_nan", (None, False, True))
     @pytest.mark.parametrize("value", ("nan", "-nan", "inf", "-inf"))

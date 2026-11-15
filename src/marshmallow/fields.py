@@ -12,8 +12,9 @@ import math
 import numbers
 import typing
 import uuid
+import warnings
 from collections.abc import Mapping as _Mapping
-from enum import Enum as EnumType
+from enum import Enum as EnumType, StrEnum
 from typing import Unpack
 
 from marshmallow import class_registry, types, utils, validate
@@ -60,7 +61,9 @@ __all__ = [
     "Nested",
     "Number",
     "Pluck",
+    "PrecisionPolicy",
     "Raw",
+    "RoundingWarning",
     "Str",
     "String",
     "Time",
@@ -1058,6 +1061,54 @@ class Float(Number[float]):
         return num
 
 
+class PrecisionPolicy(StrEnum):
+    """Strategy for handling values that lose precision when quantized to a
+    :class:`Decimal` field's fixed number of ``places``.
+
+    Rounding is only detected when the quantized value is numerically different
+    from the input. Merely adjusting the number of trailing zeros (for example
+    ``Decimal("1.50")`` quantized to one place) is therefore never reported.
+    """
+
+    #: Quantize silently, matching the historical behavior of :class:`Decimal`.
+    ALLOW = "allow"
+    #: Quantize and emit a :class:`RoundingWarning` when precision is lost.
+    REPORT = "report"
+    #: Raise a :exc:`~marshmallow.exceptions.ValidationError` instead of rounding.
+    REJECT = "reject"
+
+
+class RoundingWarning(UserWarning):
+    """Emitted by a :class:`Decimal` field using
+    :attr:`PrecisionPolicy.REPORT` when quantization changes a value.
+
+    The warning carries the original field name and input value so that callers
+    can locate the source of the imprecise data without trapping it as an error.
+    """
+
+    def __init__(
+        self,
+        *,
+        field_name: str | None,
+        data_key: str | None,
+        original: typing.Any,
+        quantized: decimal.Decimal,
+        places: int | None,
+        rounding: str | None,
+    ) -> None:
+        self.field_name = field_name
+        self.data_key = data_key
+        self.original = original
+        self.quantized = quantized
+        self.places = places
+        self.rounding = rounding
+        location = data_key if data_key is not None else field_name
+        super().__init__(
+            f"Value {original!r} for field {location!r} was rounded to "
+            f"{quantized} when quantized to {places} decimal place(s)."
+        )
+
+
 class Decimal(Number[decimal.Decimal]):
     """A field that (de)serializes to the Python ``decimal.Decimal`` type.
     It's safe to use when dealing with money values, percentages, ratios
@@ -1086,6 +1137,14 @@ class Decimal(Number[decimal.Decimal]):
     :param rounding: How to round the value during quantize, for example
         `decimal.ROUND_UP`. If `None`, uses the rounding value from
         the current thread's context.
+    :param precision_policy: What to do when quantizing a value changes it, i.e.
+        when the input has more precision than ``places`` can represent. Use a
+        member of :class:`PrecisionPolicy`: ``ALLOW`` (the default, keep the
+        historical silent rounding behavior), ``REPORT`` (round but emit a
+        :class:`RoundingWarning` that references the field and input value), or
+        ``REJECT`` (raise a validation error instead of rounding). The signal is
+        observed in a local `decimal` context, so the calling thread's precision
+        and traps are never modified. Has no effect when ``places`` is `None`.
     :param allow_nan: If `True`, `NaN`, `Infinity` and `-Infinity` are allowed,
         even though they are illegal according to the JSON specification.
     :param as_string: If `True`, serialize to a string instead of a Python
@@ -1097,7 +1156,8 @@ class Decimal(Number[decimal.Decimal]):
 
     #: Default error messages.
     default_error_messages = {
-        "special": "Special numeric values (nan or infinity) are not permitted."
+        "special": "Special numeric values (nan or infinity) are not permitted.",
+        "inexact": "Value cannot be represented exactly with the required precision.",
     }
 
     def __init__(
@@ -1105,14 +1165,17 @@ class Decimal(Number[decimal.Decimal]):
         places: int | None = None,
         rounding: str | None = None,
         *,
+        precision_policy: PrecisionPolicy = PrecisionPolicy.ALLOW,
         allow_nan: bool = False,
         as_string: bool = False,
         **kwargs: Unpack[_BaseFieldKwargs],
     ):
+        self.places_count = places
         self.places = (
             decimal.Decimal((0, (1,), -places)) if places is not None else None
         )
         self.rounding = rounding
+        self.precision_policy = PrecisionPolicy(precision_policy)
         self.allow_nan = allow_nan
         super().__init__(as_string=as_string, **kwargs)
 
@@ -1123,8 +1186,44 @@ class Decimal(Number[decimal.Decimal]):
             if num.is_nan():
                 return decimal.Decimal("NaN")  # avoid sNaN, -sNaN and -NaN
         if self.places is not None and num.is_finite():
-            num = num.quantize(self.places, rounding=self.rounding)
+            num = self._quantize(num, value)
         return num
+
+    def _quantize(
+        self, num: decimal.Decimal, original: typing.Any
+    ) -> decimal.Decimal:
+        """Quantize ``num`` while detecting lost precision in a local context.
+
+        The local context inherits the calling thread's precision and traps and
+        is restored on exit, so neither the thread context nor its flags are
+        mutated. The ``Inexact`` signal is raised only when the result differs
+        numerically, which keeps trailing-zero normalization and signed zeros
+        from being reported as rounding.
+        """
+        with decimal.localcontext() as context:
+            # Observe the Inexact flag rather than letting a thread-level trap
+            # turn it into an exception inside this isolated context.
+            context.traps[decimal.Inexact] = 0
+            inexact_before = context.flags[decimal.Inexact]
+            quantized = num.quantize(self.places, rounding=self.rounding)
+            inexact = context.flags[decimal.Inexact] != inexact_before
+        if not inexact:
+            return quantized
+        if self.precision_policy is PrecisionPolicy.REJECT:
+            raise self.make_error("inexact")
+        if self.precision_policy is PrecisionPolicy.REPORT:
+            warnings.warn(
+                RoundingWarning(
+                    field_name=self.name,
+                    data_key=self.data_key,
+                    original=original,
+                    quantized=quantized,
+                    places=self.places_count,
+                    rounding=self.rounding,
+                ),
+                stacklevel=2,
+            )
+        return quantized
 
     # override Number
     def _validated(self, value: typing.Any) -> decimal.Decimal:

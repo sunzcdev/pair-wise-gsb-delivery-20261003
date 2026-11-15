@@ -1,6 +1,22 @@
 Changelog
 =========
 
+Unreleased
+----------
+
+Features:
+
+- Add ``precision_policy`` to `marshmallow.fields.Decimal` to control what
+  happens when quantizing a value changes it. ``PrecisionPolicy.ALLOW`` keeps
+  the historical silent rounding (default), ``PrecisionPolicy.REPORT`` rounds
+  and emits a `marshmallow.fields.RoundingWarning` referencing the field and
+  input value, and ``PrecisionPolicy.REJECT`` raises a
+  `ValidationError <marshmallow.exceptions.ValidationError>`. Rounding is
+  detected from the ``Inexact`` signal in a local `decimal` context, so the
+  calling thread's precision and traps are never modified and values that
+  already fit the precision (including trailing-zero normalization and signed
+  zeros) are never reported.
+
 4.4.0 (2026-11-03)
 ------------------
 

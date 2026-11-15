@@ -6,6 +6,7 @@ import ipaddress
 import itertools
 import math
 import uuid
+import warnings
 from collections import OrderedDict
 from typing import NamedTuple
 
@@ -13,6 +14,7 @@ import pytest
 
 from marshmallow import Schema, fields
 from marshmallow import missing as missing_
+from marshmallow.exceptions import ValidationError
 from tests.base import ALL_FIELDS, DateEnum, GenderEnum, HairColorEnum, User, central
 
 
@@ -410,6 +412,67 @@ class TestFieldSerialization:
         s = field.serialize("m1", user)
         assert isinstance(s, str)
         assert s == "0.00"
+
+    def test_decimal_field_precision_policy_report_on_dump(self, user):
+        user.m1 = "12.355"
+        field = fields.Decimal(1, precision_policy=fields.PrecisionPolicy.REPORT)
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            result = field.serialize("m1", user)
+        assert result == decimal.Decimal("12.4")
+        assert len(caught) == 1
+        warning = caught[0].message
+        assert isinstance(warning, fields.RoundingWarning)
+        assert warning.field_name is None
+        assert warning.original == "12.355"
+        assert warning.quantized == decimal.Decimal("12.4")
+
+        # A field bound to a schema reports the originating field name.
+        class PrecisionSchema(Schema):
+            m1 = fields.Decimal(
+                1, precision_policy=fields.PrecisionPolicy.REPORT
+            )
+
+        with warnings.catch_warnings(record=True) as bound_caught:
+            warnings.simplefilter("always")
+            PrecisionSchema().dump({"m1": decimal.Decimal("12.355")})
+        assert bound_caught[0].message.field_name == "m1"
+
+    def test_decimal_field_precision_policy_report_as_string_dump(self, user):
+        # The as_string dump path shares the same quantization and reporting rule.
+        user.m1 = decimal.Decimal("12.355")
+        field = fields.Decimal(
+            1,
+            as_string=True,
+            precision_policy=fields.PrecisionPolicy.REPORT,
+        )
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            result = field.serialize("m1", user)
+        assert result == "12.4"
+        assert isinstance(caught[0].message, fields.RoundingWarning)
+
+    def test_decimal_field_precision_policy_no_false_positive_on_dump(self, user):
+        user.m1 = "1.50"
+        field = fields.Decimal(
+            1, precision_policy=fields.PrecisionPolicy.REPORT
+        )
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            result = field.serialize("m1", user)
+        assert result == decimal.Decimal("1.5")
+        assert caught == []
+
+    def test_decimal_field_precision_policy_reject_on_dump(self, user):
+        user.m1 = "12.355"
+        field = fields.Decimal(
+            1, precision_policy=fields.PrecisionPolicy.REJECT
+        )
+        with pytest.raises(ValidationError) as excinfo:
+            field.serialize("m1", user)
+        assert excinfo.value.messages == [
+            "Value cannot be represented exactly with the required precision."
+        ]
 
     def test_email_field_serialize_none(self, user):
         user.email = None
