@@ -122,7 +122,7 @@ __version__ = '4.3.0'
 __all__ = [
     'dump', 'dumps', 'load', 'loads',
     'JSONDecoder', 'JSONDecodeError', 'JSONEncoder',
-    'OrderedDict', 'simple_first', 'RawJSON'
+    'OrderedDict', 'simple_first', 'RawJSON', 'ValidatedRawJSON'
 ]
 
 __author__ = 'Bob Ippolito <bob@redivi.com>'
@@ -130,7 +130,7 @@ __author__ = 'Bob Ippolito <bob@redivi.com>'
 from decimal import Decimal
 
 from .errors import JSONDecodeError
-from .raw_json import RawJSON
+from .raw_json import RawJSON, ValidatedRawJSON
 from .decoder import JSONDecoder
 from .encoder import JSONEncoder, JSONEncoderForHTML
 
