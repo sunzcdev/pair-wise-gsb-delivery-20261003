@@ -12,6 +12,7 @@ from huey import SqliteHuey
 from huey.api import crontab
 from huey.consumer import Consumer
 from huey.consumer import ConsumerStopped
+from huey.consumer import DrainState
 from huey.consumer import ForkSafeFlag
 from huey.consumer import ProcessEnvironment
 from huey.consumer import Scheduler
@@ -435,6 +436,346 @@ class TestConsumerShutdown(BaseTestCase):
         consumer._interrupt_workers = interrupt_workers
         consumer._handle_signal(signal.SIGTERM, None)
         self.assertRaises(ConsumerStopped, consumer.loop)
+
+
+class TestDrainState(unittest.TestCase):
+    def test_drain_state(self):
+        drain = DrainState()
+        self.assertTrue(drain.is_drained)
+        self.assertTrue(drain.wait(0))
+
+        drain.admit('a')
+        drain.admit('b')
+        drain.admit('a')  # Admitting twice is idempotent.
+        self.assertFalse(drain.is_drained)
+        self.assertEqual(drain.remaining, 2)
+        self.assertEqual(drain.remaining_ids(), ['a', 'b'])
+
+        drain.task_done('a')
+        self.assertFalse(drain.is_drained)
+        self.assertEqual(drain.completed, 1)
+        drain.task_done('unknown')  # Unknown tasks are ignored.
+        self.assertEqual(drain.remaining, 1)
+
+        drain.task_done('b')
+        self.assertTrue(drain.is_drained)
+        self.assertTrue(drain.wait(0))
+        self.assertEqual(drain.completed, 2)
+
+    def test_within_horizon(self):
+        now = datetime.datetime(2026, 11, 16, 12, 0)
+        drain = DrainState(eta_limit=60)
+        self.assertTrue(drain.within_horizon(
+            now + datetime.timedelta(seconds=59), now))
+        self.assertFalse(drain.within_horizon(
+            now + datetime.timedelta(seconds=61), now))
+        self.assertTrue(drain.within_horizon(None, now))
+
+        # No limit: everything is within the horizon.
+        drain = DrainState()
+        self.assertTrue(drain.within_horizon(
+            now + datetime.timedelta(days=365), now))
+
+
+class TestConsumerDrain(BaseTestCase):
+    consumer_class = TestConsumer
+
+    def test_drain_excludes_new_submissions(self):
+        state = []
+
+        @self.huey.task()
+        def task_a(n):
+            state.append(n)
+            return n
+
+        task_a(1)
+        task_a(2)
+        consumer = self.consumer(workers=1)
+        worker, _ = consumer.worker_threads[0]
+
+        drain = self.huey.start_drain()
+        self.assertEqual(drain.remaining, 2)
+
+        # Submitted after the drain began: not part of the batch.
+        r3 = task_a(3)
+        self.assertEqual(drain.remaining, 2)
+
+        worker.loop()
+        worker.loop()
+        self.assertEqual(state, [1, 2])
+        self.assertTrue(drain.is_drained)
+        self.assertEqual(drain.completed, 2)
+
+        # The new task is deferred and left in the queue for the next run.
+        worker.loop()
+        self.assertEqual(state, [1, 2])
+        self.assertEqual(len(self.huey), 1)
+        self.assertIsNone(r3.get_raw_result())
+
+    def test_drain_includes_success_chain(self):
+        state = []
+
+        @self.huey.task()
+        def task_a(n):
+            state.append(('a', n))
+            return n + 1
+
+        @self.huey.task()
+        def task_b(n):
+            state.append(('b', n))
+            return n
+
+        pipeline = task_a.s(1)
+        pipeline.then(task_b)
+        self.huey.enqueue(pipeline)
+
+        consumer = self.consumer(workers=1)
+        worker, _ = consumer.worker_threads[0]
+        drain = self.huey.start_drain()
+        self.assertEqual(drain.remaining, 1)
+
+        worker.loop()  # Runs task_a, enqueues task_b as part of the batch.
+        self.assertEqual(drain.remaining, 1)
+        worker.loop()  # Runs task_b.
+        self.assertTrue(drain.is_drained)
+        self.assertEqual(state, [('a', 1), ('b', 2)])
+
+    def test_drain_includes_error_handler(self):
+        state = []
+
+        @self.huey.task()
+        def task_a():
+            raise ValueError('nope')
+
+        @self.huey.task()
+        def err_handler(exc):
+            state.append(str(exc))
+
+        task = task_a.s()
+        task.error(err_handler)
+        self.huey.enqueue(task)
+
+        consumer = self.consumer(workers=1)
+        worker, _ = consumer.worker_threads[0]
+        drain = self.huey.start_drain()
+
+        worker.loop()  # Fails, enqueues the error handler within the batch.
+        self.assertEqual(drain.remaining, 1)
+        worker.loop()
+        self.assertTrue(drain.is_drained)
+        self.assertEqual(state, ['nope'])
+
+    def test_drain_includes_retries(self):
+        attempts = []
+
+        @self.huey.task(retries=1)
+        def task_a():
+            attempts.append(1)
+            if len(attempts) == 1:
+                raise ValueError('try again')
+            return 'ok'
+
+        r = task_a()
+        consumer = self.consumer(workers=1)
+        worker, _ = consumer.worker_threads[0]
+        drain = self.huey.start_drain()
+
+        worker.loop()  # Fails and is immediately requeued (same batch).
+        self.assertEqual(drain.remaining, 1)
+        worker.loop()  # Retry succeeds.
+        self.assertTrue(drain.is_drained)
+        self.assertEqual(r.get(), 'ok')
+
+    def test_drain_retry_beyond_eta_limit(self):
+        @self.huey.task(retries=1, retry_delay=3600)
+        def task_a():
+            raise ValueError('nope')
+
+        task_a()
+        consumer = self.consumer(workers=1)
+        worker, _ = consumer.worker_threads[0]
+
+        # With no ETA limit, the drain waits for the scheduled retry.
+        drain = self.huey.start_drain()
+        worker.loop()
+        self.assertFalse(drain.is_drained)
+        self.assertEqual(drain.remaining, 1)
+        self.assertEqual(self.huey.scheduled_count(), 1)
+        self.huey.stop_drain()
+        self.huey.flush()
+
+        # With an ETA limit, the far-future retry is retained in the
+        # schedule for the next run and does not hold up the drain.
+        task_a()
+        drain = self.huey.start_drain(eta_limit=60)
+        worker.loop()
+        self.assertTrue(drain.is_drained)
+        self.assertEqual(self.huey.scheduled_count(), 1)
+        self.assertEqual(len(self.huey), 0)
+
+    def test_drain_scheduled_horizon(self):
+        state = []
+
+        @self.huey.task()
+        def task_a(n):
+            state.append(n)
+            return n
+
+        now = datetime.datetime.now()
+        near = task_a.s(1, eta=now + datetime.timedelta(seconds=30))
+        far = task_a.s(2, eta=now + datetime.timedelta(seconds=120))
+        self.huey.add_schedule(near)
+        self.huey.add_schedule(far)
+
+        drain = self.huey.start_drain(eta_limit=60)
+        self.assertTrue(drain.is_admitted(near.id))
+        self.assertFalse(drain.is_admitted(far.id))
+        self.assertEqual(drain.remaining, 1)
+
+        # The scheduler enqueues the admitted task when it comes due, and
+        # leaves the other scheduled for the next run.
+        consumer = self.consumer(workers=1)
+        scheduler = consumer._create_scheduler()
+        scheduler._next_loop = time.monotonic() + 60
+        scheduler._next_periodic = time.monotonic() + 60
+        later = now + datetime.timedelta(seconds=300)
+        scheduler.loop(later)
+        self.assertEqual(len(self.huey), 1)
+        self.assertEqual(self.huey.scheduled_count(), 1)
+
+        worker, _ = consumer.worker_threads[0]
+        worker.loop(later)
+        self.assertEqual(state, [1])  # The "near" task ran.
+        self.assertTrue(drain.is_drained)
+
+    def test_drain_skips_periodic_tasks(self):
+        @self.huey.periodic_task(crontab(minute='*'))
+        def task_p():
+            pass
+
+        consumer = self.consumer(workers=1)
+        scheduler = consumer._create_scheduler()
+        scheduler._next_loop = time.monotonic() + 60
+        scheduler._next_periodic = time.monotonic() - 60
+
+        self.huey.start_drain()
+        scheduler.loop(datetime.datetime(2000, 1, 1, 0, 0))
+        self.assertEqual(len(self.huey), 0)  # Not enqueued while draining.
+
+    def test_drain_revoked_task(self):
+        @self.huey.task()
+        def task_a():
+            return 1
+
+        r = task_a()
+        r.revoke()
+        consumer = self.consumer(workers=1)
+        worker, _ = consumer.worker_threads[0]
+
+        drain = self.huey.start_drain()
+        worker.loop()
+        self.assertTrue(drain.is_drained)
+        self.assertIsNone(r.get_raw_result())
+
+    def test_drain_timeout_reports_remaining(self):
+        release = threading.Event()
+        started = threading.Event()
+
+        @self.huey.task()
+        def block():
+            started.set()
+            release.wait(5)
+            return 'done'
+
+        r = block()
+        consumer = self.consumer(workers=1, shutdown_timeout=0.5)
+        consumer.scheduler.start()
+        _, worker_t = consumer.worker_threads[0]
+        worker_t.start()
+        self.assertTrue(started.wait(5))
+        try:
+            with self.assertLogs('huey.consumer', 'WARNING') as logs:
+                consumer.drain(timeout=0.2)
+            self.assertTrue(any('Drain incomplete' in line
+                                for line in logs.output))
+            # The unfinished task is reported, not marked as successful.
+            self.assertIsNone(r.get_raw_result())
+            self.assertEqual(self.huey.drain.remaining, 1)
+        finally:
+            release.set()
+            worker_t.join(5)
+        self.assertFalse(worker_t.is_alive())
+
+        # Once the task finishes, the drain state reflects it.
+        self.assertEqual(r.get(), 'done')
+        self.assertTrue(self.huey.drain.is_drained)
+
+    def test_drain_end_to_end(self):
+        @self.huey.task()
+        def task_a(n):
+            return n + 1
+
+        r1 = task_a(1)
+        r2 = task_a(2)
+        consumer = self.consumer(workers=2, drain_timeout=10)
+        consumer.start()
+        try:
+            drain_t = threading.Thread(target=consumer.drain)
+            drain_t.start()
+            while self.huey.drain is None:
+                time.sleep(0.001)
+            r3 = task_a(3)  # Submitted after the drain began.
+            drain_t.join(10)
+            self.assertFalse(drain_t.is_alive())
+        finally:
+            consumer.stop()
+
+        self.assertEqual(r1.get(), 2)
+        self.assertEqual(r2.get(), 3)
+        self.assertTrue(self.huey.drain.is_drained)
+        # The late submission was left in the queue for the next run.
+        self.assertIsNone(r3.get_raw_result())
+        self.assertEqual(len(self.huey), 1)
+
+    def test_drain_on_shutdown(self):
+        @self.huey.task()
+        def task_a(n):
+            return n + 1
+
+        r1 = task_a(1)
+        consumer = self.consumer(workers=1, drain_on_shutdown=True,
+                                 drain_timeout=10)
+        consumer.start()
+        consumer.stop(graceful=True)  # Graceful stop drains first.
+        self.assertEqual(r1.get(), 2)
+        self.assertIsNotNone(self.huey.drain)
+        self.assertTrue(self.huey.drain.is_drained)
+        self.assertTrue(consumer.stop_flag.is_set())
+
+    def test_drain_options(self):
+        cfg = ConsumerConfig(drain_on_shutdown=True, drain_timeout=30,
+                             drain_eta_limit=60)
+        cfg.validate()
+        consumer = self.huey.create_consumer(**cfg.values)
+        self.assertTrue(consumer.drain_on_shutdown)
+        self.assertEqual(consumer.drain_timeout, 30)
+        self.assertEqual(consumer.drain_eta_limit, 60)
+
+        parser = OptionParserHandler().get_option_parser()
+        options, _ = parser.parse_args(['-D', '-T', '15', '-E', '30'])
+        self.assertTrue(options.drain_on_shutdown)
+        self.assertEqual(options.drain_timeout, 15)
+        self.assertEqual(options.drain_eta_limit, 30)
+
+        consumer = self.huey.create_consumer(**ConsumerConfig().values)
+        self.assertFalse(consumer.drain_on_shutdown)
+        self.assertIsNone(consumer.drain_timeout)
+        self.assertIsNone(consumer.drain_eta_limit)
+
+        for kwargs in ({'drain_timeout': 0}, {'drain_timeout': -1},
+                       {'drain_eta_limit': -1}):
+            cfg = ConsumerConfig(**kwargs)
+            self.assertRaises(ValueError, cfg.validate)
 
 
 class TestForkSafeFlag(unittest.TestCase):

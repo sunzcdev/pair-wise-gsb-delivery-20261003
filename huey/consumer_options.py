@@ -24,6 +24,9 @@ config_defaults = (
     ('max_tasks', None),
     ('shutdown_timeout', None),
     ('graceful_signal', 'INT'),
+    ('drain_on_shutdown', False),
+    ('drain_timeout', None),
+    ('drain_eta_limit', None),
 )
 config_keys = [param for param, _ in config_defaults]
 
@@ -85,6 +88,22 @@ class OptionParserHandler(object):
                    help=('signal that triggers graceful shutdown, INT or '
                          'TERM (default=INT). The other signal interrupts '
                          'running tasks.')),
+            option(('D', 'drain'), action='store_true', dest='drain_on_shutdown',
+                   help=('on graceful shutdown, drain the batch of accepted '
+                         'tasks (plus any work they spawn) before exiting. '
+                         'Tasks submitted after the drain begins are left '
+                         'for the next run.')),
+            option(('T', 'drain-timeout'), dest='drain_timeout', type='float',
+                   metavar='SECONDS',
+                   help=('maximum time to wait for a drain to complete before '
+                         'reporting the remaining tasks and exiting '
+                         '(default=wait forever)')),
+            option(('E', 'drain-eta-limit'), dest='drain_eta_limit',
+                   type='float', metavar='SECONDS',
+                   help=('when draining, do not wait for scheduled tasks or '
+                         'retries whose ETA is more than SECONDS in the '
+                         'future; they are left for the next run (default=no '
+                         'limit)')),
         )
 
     def get_scheduler_options(self):
@@ -154,6 +173,10 @@ class ConsumerConfig(namedtuple('_ConsumerConfig', config_keys)):
                              '1, 2, 3, 4, 5, 6, 10, 12, 15, 20, 30, or 60')
         if self.graceful_signal not in ('INT', 'TERM'):
             raise ValueError('The graceful signal must be INT or TERM.')
+        if self.drain_timeout is not None and self.drain_timeout <= 0:
+            raise ValueError('The drain timeout must be positive.')
+        if self.drain_eta_limit is not None and self.drain_eta_limit < 0:
+            raise ValueError('The drain ETA limit must be non-negative.')
 
     @property
     def loglevel(self):

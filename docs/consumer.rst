@@ -150,6 +150,20 @@ Options for the consumer
     use ``TERM`` for graceful and ``INT`` to shutdown immediately. See
     :ref:`deployment-signals`.
 
+``-D``, ``--drain``
+    On graceful shutdown, drain the batch of already-accepted tasks before
+    exiting. See :ref:`consumer-drain`.
+
+``-T``, ``--drain-timeout``
+    Maximum time to wait for a drain to complete. When the deadline is
+    reached, the remaining tasks are reported and left for the next run. By
+    default the consumer waits indefinitely.
+
+``-E``, ``--drain-eta-limit``
+    When draining, do not wait for scheduled tasks or retries whose ETA is
+    more than the given number of seconds in the future. They are left in the
+    schedule for the next run. By default there is no limit.
+
 ``-s``, ``--scheduler-interval``
     The frequency with which the scheduler should run. By default this will run
     every second, but you can increase the interval to as much as 60 seconds.
@@ -267,6 +281,59 @@ acknowledgement of completed tasks. This means that if you terminate the
 consumer **without** letting it finish any currently-executing tasks, those
 tasks will be lost. To be alerted when this occurs, you can use Huey's
 :ref:`signals` (specifically ``signals.SIGNAL_INTERRUPTED``).
+
+.. _consumer-drain:
+
+Draining the consumer
+---------------------
+
+A graceful shutdown only waits for tasks that are currently executing. When
+you instead want the consumer to finish the batch of work it has already
+accepted - and then exit, without chasing newly-submitted tasks - use the
+*drain* mode.
+
+Draining freezes the admission watermark: the batch consists of the tasks
+accepted before the drain began (queued, currently executing, or scheduled
+within the ETA limit), plus any work those tasks go on to spawn. Success
+chains (``then()``), error handlers (``error()``) and finite retries of an
+accepted task all belong to the batch. Tasks submitted after the drain
+begins are left in the queue (or schedule) for the next run and do not
+count towards the batch.
+
+To drain and then shut down programmatically:
+
+.. code-block:: python
+
+    consumer = huey.create_consumer(drain_timeout=300, drain_eta_limit=60)
+    consumer.start()
+    ...
+    consumer.drain()  # Blocks until the batch is done, then shuts down.
+
+Alternatively, run the consumer with ``-D``/``--drain`` to make every
+graceful shutdown drain first:
+
+.. code-block:: shell
+
+    huey_consumer my.app.huey --drain --drain-timeout=300 --drain-eta-limit=60
+
+Two options control how much work a drain waits for:
+
+* ``drain_timeout`` bounds the total time spent draining. When the deadline
+  is reached, the remaining tasks are reported in the logs and left for the
+  next run - they are **not** marked as successful.
+* ``drain_eta_limit`` excludes scheduled tasks and retries whose ETA lies
+  further in the future than the given number of seconds. They are retained
+  in the schedule for the next run rather than being waited on.
+
+Drain progress is logged as it happens, and the final state (completed or
+remaining tasks) is logged on normal completion, cancellation, and before a
+consumer restart.
+
+.. note::
+    Drain mode requires the ``thread`` (default) or ``greenlet`` worker
+    types. With ``process`` workers the drain state cannot be shared with
+    the worker processes, so the consumer falls back to a regular graceful
+    shutdown.
 
 .. _consumer-deployments:
 

@@ -16,6 +16,7 @@ from functools import wraps
 from huey import signals as S
 from huey.constants import EmptyData
 from huey.consumer import Consumer
+from huey.consumer import DrainState
 from huey.exceptions import CancelExecution
 from huey.exceptions import ConfigurationError
 from huey.exceptions import RateLimitExceeded
@@ -126,6 +127,7 @@ class Huey(object):
         self._signal = S.Signal()
         self._tasks_in_flight = set()
         self._timeout_handler = None  # This is consumer-specific.
+        self._drain = None  # DrainState when the consumer is draining.
 
     def get_task_wrapper_class(self):
         return TaskWrapper
@@ -281,6 +283,57 @@ class Huey(object):
                 break  # Task might have raced and finished.
             self._emit(S.SIGNAL_INTERRUPTED, task)
 
+    @property
+    def drain(self):
+        """
+        The active :py:class:`DrainState`, if the consumer is draining.
+        """
+        return self._drain
+
+    def start_drain(self, eta_limit=None):
+        """
+        Begin draining: freeze the admission watermark and return a
+        :py:class:`DrainState` tracking the batch of accepted tasks.
+
+        The batch consists of tasks accepted before the drain began - those
+        in the queue, currently executing, or scheduled to run within
+        `eta_limit` seconds (no limit if unspecified) - plus any work those
+        tasks go on to spawn (success chains, error handlers and retries).
+        Tasks submitted after the drain begins are left for the next run.
+        """
+        drain = DrainState(eta_limit=eta_limit)
+        timestamp = self._get_timestamp()
+        for task in list(self._tasks_in_flight):
+            drain.admit(task.id)
+        for task in self.pending():
+            drain.admit(task.id)
+        for task in self.scheduled():
+            if drain.within_horizon(task.eta, timestamp):
+                drain.admit(task.id)
+        self._drain = drain
+        return drain
+
+    def stop_drain(self):
+        self._drain = None
+
+    def _drain_task_done(self, task):
+        if self._drain is not None:
+            self._drain.task_done(task.id)
+
+    def _drain_admit_derived(self, parent, derived):
+        # Work spawned by an admitted task belongs to the drained batch.
+        if (self._drain is not None and
+                self._drain.is_admitted(parent.id)):
+            self._drain.admit(derived.id)
+
+    def _drain_defer(self, task, timestamp):
+        # A scheduled task whose ETA lies beyond the drain's ETA limit is
+        # retained in the schedule for the next run and no longer counts
+        # towards the drained batch.
+        if (self._drain is not None and
+                not self._drain.within_horizon(task.eta, timestamp)):
+            self._drain.task_done(task.id)
+
     def signal(self, *signals):
         def decorator(fn):
             self._signal.connect(fn, *signals)
@@ -416,14 +469,17 @@ class Huey(object):
 
         if not self.ready_to_run(task, timestamp):
             self.add_schedule(task)
+            self._drain_defer(task, timestamp)
         elif self.is_revoked(task, timestamp, False):
             logger.warning('Task %s was revoked, not executing', task)
             self._emit(S.SIGNAL_REVOKED, task)
             self._abort_chord_member(task, SKIPPED)
+            self._drain_task_done(task)
         elif task.expires_resolved and task.expires_resolved < timestamp:
             logger.info('Task %s expired, not executing.', task)
             self._emit(S.SIGNAL_EXPIRED, task)
             self._abort_chord_member(task, SKIPPED)
+            self._drain_task_done(task)
         else:
             logger.info('Executing %s', task)
             self._emit(S.SIGNAL_EXECUTING, task)
@@ -436,6 +492,7 @@ class Huey(object):
             except CancelExecution:
                 self._emit(S.SIGNAL_CANCELED, task)
                 self._abort_chord_member(task, SKIPPED)
+                self._drain_task_done(task)
                 return
 
         start = time.monotonic()
@@ -495,6 +552,7 @@ class Huey(object):
         except KeyboardInterrupt:
             logger.warning('Received exit signal, %s did not finish.', task.id)
             self._emit(S.SIGNAL_INTERRUPTED, task)
+            self._drain_task_done(task)
             return
         except Exception as exc:
             logger.exception('Unhandled exception in task %s.', task.id)
@@ -516,9 +574,11 @@ class Huey(object):
             self._emit(S.SIGNAL_COMPLETE, task)
             if task.on_complete:
                 task.on_complete.extend_data(task_value)
+                self._drain_admit_derived(task, task.on_complete)
                 self.enqueue(task.on_complete)
             if task.chord_config is not None:
-                self._check_chord(task.chord_config, task_value)
+                self._check_chord(task.chord_config, task_value, task)
+            self._drain_task_done(task)
         else:
             final = not task.retries
             surface = final or (self.store_intermediate_errors and
@@ -534,9 +594,11 @@ class Huey(object):
                 # Copy, as on_error is shared across retries.
                 handler = copy.copy(task.on_error)
                 handler.extend_data(exception)
+                self._drain_admit_derived(task, handler)
                 self.enqueue(handler)
             if final:
                 self._abort_chord_member(task, error)
+                self._drain_task_done(task)
             else:
                 self._emit(S.SIGNAL_RETRYING, task)
                 self._requeue_task(task, self._get_timestamp(), retry_eta)
@@ -547,10 +609,10 @@ class Huey(object):
         # The rest of the pipeline won't run, so report to its chord here.
         while task is not None:
             if task.chord_config is not None:
-                return self._check_chord(task.chord_config, value)
+                return self._check_chord(task.chord_config, value, task)
             task = task.on_complete
 
-    def _check_chord(self, cc, value):
+    def _check_chord(self, cc, value, task=None):
         chord_key = 'chord:%s' % cc.cid
         result_key = 'chord:%s:%s' % (cc.cid, cc.idx)
         self.put_result(result_key, value)
@@ -567,6 +629,8 @@ class Huey(object):
 
             callback = cc.callback
             callback.extend_data((results,))
+            if task is not None:
+                self._drain_admit_derived(task, callback)
             self.enqueue(callback)
 
     def _requeue_task(self, task, timestamp, retry_eta=None):
@@ -575,12 +639,14 @@ class Huey(object):
         if retry_eta is not None:
             task.eta = retry_eta
             self.add_schedule(task)
+            self._drain_defer(task, timestamp)
         elif task.retry_delay:
             delay = datetime.timedelta(seconds=task.retry_delay)
             task.eta = timestamp + delay
             if task.retry_backoff:
                 task.retry_delay *= task.retry_backoff
             self.add_schedule(task)
+            self._drain_defer(task, timestamp)
         else:
             self.enqueue(task)
 

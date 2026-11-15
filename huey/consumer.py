@@ -1,4 +1,5 @@
 import contextlib
+import datetime
 import logging
 import os
 import select
@@ -32,6 +33,70 @@ logger = logging.getLogger('huey.consumer')
 class ConsumerStopped(Exception): pass
 
 class WorkerRecycle(Exception): pass
+
+
+class DrainState(object):
+    """
+    Tracks the batch of tasks admitted for a drain.
+
+    When a drain begins, the admission watermark is frozen: tasks accepted
+    before the drain (queued, in-flight, or scheduled within the ETA limit)
+    make up the batch, along with any work those tasks go on to spawn
+    (success chains, error handlers and finite retries). Tasks submitted
+    after the drain begins are left for the next run and do not count
+    towards the batch.
+    """
+    def __init__(self, eta_limit=None):
+        self.eta_limit = eta_limit
+        self.started_at = time.monotonic()
+        self.completed = 0
+        self._lock = threading.Lock()
+        self._pending = set()
+        self._drained = threading.Event()
+        self._drained.set()
+
+    def admit(self, task_id):
+        with self._lock:
+            self._pending.add(task_id)
+            self._drained.clear()
+
+    def is_admitted(self, task_id):
+        with self._lock:
+            return task_id in self._pending
+
+    def task_done(self, task_id):
+        with self._lock:
+            if task_id in self._pending:
+                self._pending.discard(task_id)
+                self.completed += 1
+                if not self._pending:
+                    self._drained.set()
+
+    def within_horizon(self, eta, timestamp):
+        """
+        Whether a task with the given ETA is waited on by this drain. Tasks
+        due further than ``eta_limit`` seconds in the future are retained in
+        the schedule for the next run instead.
+        """
+        if self.eta_limit is None or eta is None:
+            return True
+        return eta <= timestamp + datetime.timedelta(seconds=self.eta_limit)
+
+    @property
+    def remaining(self):
+        with self._lock:
+            return len(self._pending)
+
+    def remaining_ids(self):
+        with self._lock:
+            return sorted(self._pending)
+
+    @property
+    def is_drained(self):
+        return self._drained.is_set()
+
+    def wait(self, timeout=None):
+        return self._drained.wait(timeout)
 
 
 class BaseProcess(object):
@@ -119,6 +184,7 @@ class Worker(BaseProcess):
 
     def loop(self, now=None):
         task = None
+        drain = self.huey.drain
         try:
             task = self.huey.dequeue()
         except Exception:
@@ -126,6 +192,14 @@ class Worker(BaseProcess):
             self.sleep()
         else:
             if task is not None:
+                if drain is not None and not drain.is_admitted(task.id):
+                    # Task was submitted after the drain began. Put it back
+                    # and leave it for the next run.
+                    self._logger.debug('Deferring %s, not part of drain.', task)
+                    self.huey.storage.enqueue(
+                        self.huey.serialize_task(task), task.priority)
+                    self.sleep()
+                    return
                 self.delay = self.default_delay
                 self.task_count += 1
                 try:
@@ -176,19 +250,31 @@ class Scheduler(BaseProcess):
             self._next_loop = time.monotonic()
             return
 
+        drain = self.huey.drain
         try:
             task_list = self.huey.read_schedule(now)
         except Exception:
             self._logger.exception('Error reading schedule.')
         else:
             for task in task_list:
+                if drain is not None and not drain.is_admitted(task.id):
+                    # Not part of the drained batch - leave it scheduled for
+                    # the next run.
+                    self._logger.debug('Deferring scheduled %s (draining).',
+                                       task)
+                    try:
+                        self.huey.add_schedule(task)
+                    except Exception:
+                        self._logger.exception('Error re-scheduling %s.', task)
+                    continue
                 self._logger.debug('Enqueueing %s', task)
                 try:
                     self.huey.enqueue(task)
                 except Exception:
                     self._logger.exception('Error enqueueing %s.', task)
 
-        if self.periodic and self._next_periodic <= time.monotonic():
+        if (self.periodic and drain is None and
+                self._next_periodic <= time.monotonic()):
             # Skip checks missed during a stall (e.g. suspend) to avoid dupes.
             while self._next_periodic <= time.monotonic():
                 self._next_periodic += self.periodic_task_seconds
@@ -394,7 +480,8 @@ class Consumer(object):
                  worker_type=WORKER_THREAD, check_worker_health=True,
                  health_check_interval=10, flush_locks=False,
                  extra_locks=None, max_tasks=None, shutdown_timeout=None,
-                 graceful_signal='INT'):
+                 graceful_signal='INT', drain_on_shutdown=False,
+                 drain_timeout=None, drain_eta_limit=None):
 
         self._logger = logging.getLogger('huey.consumer')
         if huey.immediate:
@@ -411,6 +498,9 @@ class Consumer(object):
         self.max_tasks = max_tasks  # Max tasks to execute before recycling.
         self.shutdown_timeout = shutdown_timeout
         self.graceful_signal = graceful_signal
+        self.drain_on_shutdown = drain_on_shutdown  # Drain before stopping?
+        self.drain_timeout = drain_timeout  # Max seconds to wait for a drain.
+        self.drain_eta_limit = drain_eta_limit  # Max ETA horizon for a drain.
 
         if max_tasks and not check_worker_health:
             raise ConfigurationError('max_tasks requires check_worker_health '
@@ -548,6 +638,9 @@ class Consumer(object):
 
         self._logger.info('\n'.join(msg))
 
+        # Reset any drain state left over from a previous run.
+        self.huey.stop_drain()
+
         # Forked children must not share the parent's storage connection.
         if self.environment.forks:
             self.huey.storage.close()
@@ -567,7 +660,15 @@ class Consumer(object):
         If `graceful=True`, this method blocks until the workers to finish
         executing any tasks they might be currently working on, or until
         `shutdown_timeout` elapses.
+
+        If the consumer was created with `drain_on_shutdown=True`, a graceful
+        shutdown first drains the batch of already-accepted tasks - see
+        `drain()`.
         """
+        if (graceful and self.drain_on_shutdown and
+                self.huey.drain is None and not self.stop_flag.is_set()):
+            self.drain()
+            return
         self.stop_flag.set()
         if graceful:
             self._logger.info('Shutting down gracefully...')
@@ -586,6 +687,78 @@ class Consumer(object):
                                  self.shutdown_timeout)
         self._interrupt_workers()
         self._logger.info('Shutting down')
+
+    def drain(self, timeout=None):
+        """
+        Drain the consumer, then shut down gracefully.
+
+        Draining freezes the admission watermark: the batch of tasks accepted
+        before the drain began (queued, in-flight, or scheduled within
+        `drain_eta_limit` seconds), plus any work those tasks spawn (success
+        chains, error handlers and finite retries), is processed to
+        completion. Tasks submitted after the drain begins are left in the
+        queue (or schedule) for the next run and do not count towards the
+        batch.
+
+        If the batch does not finish within `timeout` seconds (defaults to
+        the consumer's `drain_timeout`, i.e. no limit), the remaining tasks
+        are reported and left for the next run - they are not marked as
+        successful.
+        """
+        if self.environment.forks or self.stop_flag.is_set():
+            # Drain state is local to this process, so it cannot be
+            # coordinated with forked workers - fall back to a graceful
+            # shutdown, which still lets in-flight tasks finish.
+            if self.environment.forks:
+                self._logger.warning('Drain mode is not supported with '
+                                     'process workers, shutting down '
+                                     'gracefully instead.')
+            # Setting the stop-flag first ensures stop() does not re-enter
+            # drain() when drain_on_shutdown is enabled.
+            self.stop_flag.set()
+            self.stop(graceful=True)
+            return
+
+        if timeout is None:
+            timeout = self.drain_timeout
+        drain = self.huey.start_drain(eta_limit=self.drain_eta_limit)
+        self._logger.info('Draining: %d task(s) admitted, timeout=%s.',
+                          drain.remaining,
+                          'none' if timeout is None else timeout)
+        try:
+            completed = self._wait_for_drain(drain, timeout)
+        except KeyboardInterrupt:
+            self._logger.info('Drain interrupted with %d task(s) remaining.',
+                              drain.remaining)
+            self._restart = False
+            completed = False
+
+        if completed:
+            self._logger.info('Drain complete: %d task(s) finished in %0.1fs.',
+                              drain.completed,
+                              time.monotonic() - drain.started_at)
+        else:
+            self._logger.warning('Drain incomplete: %d task(s) left for the '
+                                 'next run: %s', drain.remaining,
+                                 ', '.join(drain.remaining_ids()))
+        self.stop(graceful=True)
+
+    def _wait_for_drain(self, drain, timeout):
+        deadline = None if timeout is None else time.monotonic() + timeout
+        last_log = time.monotonic()
+        while True:
+            wait = 0.5
+            if deadline is not None:
+                wait = min(wait, max(deadline - time.monotonic(), 0))
+            if drain.wait(wait):
+                return True
+            if deadline is not None and time.monotonic() >= deadline:
+                return False
+            now = time.monotonic()
+            if now - last_log >= 5:
+                last_log = now
+                self._logger.info('Draining: %d task(s) remaining.',
+                                  drain.remaining)
 
     def _interrupt_workers(self):
         self.environment.interrupt_workers([p for _, p in self.worker_threads])
@@ -616,6 +789,15 @@ class Consumer(object):
                 break
 
         self.huey.notify_interrupted_tasks()
+
+        drain = self.huey.drain
+        if drain is not None:
+            if drain.is_drained:
+                self._logger.info('Drained %d task(s).', drain.completed)
+            else:
+                self._logger.info('Drain unfinished: %d task(s) left for the '
+                                  'next run: %s', drain.remaining,
+                                  ', '.join(drain.remaining_ids()))
 
         if self._restart:
             self._logger.info('Consumer will restart.')

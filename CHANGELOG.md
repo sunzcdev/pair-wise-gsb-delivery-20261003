@@ -3,6 +3,15 @@ Changelog
 
 ## Master
 
+* Add consumer drain mode (`Consumer.drain()` / `--drain`): on shutdown,
+  finish the batch of already-accepted tasks - including their success
+  chains, error handlers and finite retries - then exit, instead of chasing
+  newly-submitted tasks. The admission watermark is frozen when the drain
+  begins; later submissions are left for the next run. `drain_timeout`
+  bounds the wait (remaining tasks are reported, not marked successful) and
+  `drain_eta_limit` allows far-future scheduled tasks/retries to be retained
+  rather than waited on. Requires thread or greenlet workers.
+
 [View commits](https://github.com/coleifer/huey/compare/3.5.4...master)
 
 ## 3.5.4
