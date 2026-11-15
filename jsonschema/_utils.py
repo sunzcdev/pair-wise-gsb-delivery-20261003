@@ -329,49 +329,109 @@ def find_evaluated_property_keys_by_schema(validator, instance, schema):
     additionalProperties, unevaluatedProperties, patternProperties,
     dependentSchemas, allOf, oneOf, anyOf, if, then, else
     """
+    return _evaluated_property_keys_by_schema(
+        validator,
+        instance,
+        schema,
+        explanations=None,
+        context=(),
+    )
+
+
+def explain_evaluated_property_keys_by_schema(validator, instance, schema):
+    """
+    Get evaluated keys, along with an explanation of why each was evaluated.
+
+    Returns a pair ``(evaluated_keys, explanations)`` where
+    ``evaluated_keys`` is exactly what
+    `find_evaluated_property_keys_by_schema` returns (both are computed in
+    a single shared traversal, so no schema keyword is applied more than
+    once) and ``explanations`` maps each evaluated property of the
+    instance to a list of contributions describing which keywords (and
+    which applicator branches or references) evaluated it.
+
+    Each contribution is a mapping with a ``"keyword"`` entry naming the
+    keyword which directly evaluated the property, along with optional
+    details (e.g. ``"pattern"`` for :kw:`patternProperties`) and an
+    optional ``"via"`` entry listing the applicators or references the
+    contribution was reached through.
+    """
+    explanations = {}
+    evaluated_keys = _evaluated_property_keys_by_schema(
+        validator,
+        instance,
+        schema,
+        explanations=explanations,
+        context=(),
+    )
+    return evaluated_keys, explanations
+
+
+def _record_evaluated_property(explanations, context, keyword, keys, **detail):
+    """
+    Record a contribution to evaluated property keys, if explaining.
+    """
+    if explanations is None:
+        return
+    for key in keys:
+        contribution = {"keyword": keyword, **detail}
+        if context:
+            contribution["via"] = list(context)
+        explanations.setdefault(key, []).append(contribution)
+
+
+def _evaluated_property_keys_by_schema(
+    validator,
+    instance,
+    schema,
+    explanations,
+    context,
+):
     if validator.is_type(schema, "boolean"):
         return []
     evaluated_keys = []
 
-    ref = schema.get("$ref")
-    if ref is not None:
+    for keyword in ["$ref", "$dynamicRef"]:
+        ref = schema.get(keyword)
+        if ref is None:
+            continue
         resolved = validator._resolver.lookup(ref)
-        evaluated_keys.extend(
-            find_evaluated_property_keys_by_schema(
-                validator.evolve(
-                    schema=resolved.contents,
-                    _resolver=resolved.resolver,
-                ),
-                instance,
-                resolved.contents,
+        evaluated_keys += _evaluated_property_keys_by_schema(
+            validator.evolve(
+                schema=resolved.contents,
+                _resolver=resolved.resolver,
             ),
-        )
-
-    dynamicRef = schema.get("$dynamicRef")
-    if dynamicRef is not None:
-        resolved = validator._resolver.lookup(dynamicRef)
-        evaluated_keys.extend(
-            find_evaluated_property_keys_by_schema(
-                validator.evolve(
-                    schema=resolved.contents,
-                    _resolver=resolved.resolver,
-                ),
-                instance,
-                resolved.contents,
-            ),
+            instance,
+            resolved.contents,
+            explanations,
+            context + ({"keyword": keyword, "ref": ref},),
         )
 
     properties = schema.get("properties")
     if validator.is_type(properties, "object"):
-        evaluated_keys += properties.keys() & instance.keys()
+        keys = properties.keys() & instance.keys()
+        evaluated_keys += keys
+        _record_evaluated_property(
+            explanations,
+            context,
+            "properties",
+            keys,
+        )
 
     for keyword in ["additionalProperties", "unevaluatedProperties"]:
         if (subschema := schema.get(keyword)) is None:
             continue
-        evaluated_keys += (
+        keys = [
             key
             for key, value in instance.items()
             if is_valid(validator.descend(value, subschema))
+        ]
+        evaluated_keys += keys
+        _record_evaluated_property(
+            explanations,
+            context,
+            keyword,
+            keys,
         )
 
     if "patternProperties" in schema:
@@ -379,45 +439,63 @@ def find_evaluated_property_keys_by_schema(validator, instance, schema):
             for pattern in schema["patternProperties"]:
                 if re.search(pattern, property):
                     evaluated_keys.append(property)
+                    _record_evaluated_property(
+                        explanations,
+                        context,
+                        "patternProperties",
+                        [property],
+                        pattern=pattern,
+                    )
 
     if "dependentSchemas" in schema:
         for property, subschema in schema["dependentSchemas"].items():
             if property not in instance:
                 continue
-            evaluated_keys += find_evaluated_property_keys_by_schema(
+            evaluated_keys += _evaluated_property_keys_by_schema(
                 validator,
                 instance,
                 subschema,
+                explanations,
+                context
+                + ({"keyword": "dependentSchemas", "property": property},),
             )
 
     for keyword in ["allOf", "oneOf", "anyOf"]:
-        for subschema in schema.get(keyword, []):
+        for index, subschema in enumerate(schema.get(keyword, [])):
             if not is_valid(validator.descend(instance, subschema)):
                 continue
-            evaluated_keys += find_evaluated_property_keys_by_schema(
+            evaluated_keys += _evaluated_property_keys_by_schema(
                 validator,
                 instance,
                 subschema,
+                explanations,
+                context + ({"keyword": keyword, "index": index},),
             )
 
     if "if" in schema:
         if validator.evolve(schema=schema["if"]).is_valid(instance):
-            evaluated_keys += find_evaluated_property_keys_by_schema(
+            evaluated_keys += _evaluated_property_keys_by_schema(
                 validator,
                 instance,
                 schema["if"],
+                explanations,
+                context + ({"keyword": "if"},),
             )
             if "then" in schema:
-                evaluated_keys += find_evaluated_property_keys_by_schema(
+                evaluated_keys += _evaluated_property_keys_by_schema(
                     validator,
                     instance,
                     schema["then"],
+                    explanations,
+                    context + ({"keyword": "then"},),
                 )
         elif "else" in schema:
-            evaluated_keys += find_evaluated_property_keys_by_schema(
+            evaluated_keys += _evaluated_property_keys_by_schema(
                 validator,
                 instance,
                 schema["else"],
+                explanations,
+                context + ({"keyword": "else"},),
             )
 
     return evaluated_keys

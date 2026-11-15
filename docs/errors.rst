@@ -119,6 +119,70 @@ raised or returned, depending on which method or function is used.
         A validation error which this error is the `context` of.
         ``None`` if there wasn't one.
 
+    .. attribute:: evaluation_explanation
+
+        For errors from the :kw:`unevaluatedProperties` keyword, an
+        optional mapping explaining why each *other* property of the
+        instance was considered evaluated (and hence accepted).
+
+        This is only populated when the validator was created with
+        ``explain_unevaluated_properties=True``; it is ``None``
+        otherwise. See `evaluated-properties-explanations`_ for
+        details.
+
+
+.. _evaluated-properties-explanations:
+
+Explaining Evaluated Properties
+-------------------------------
+
+When :kw:`unevaluatedProperties` fails, the error message names the
+properties which were not evaluated, but it is often just as useful to
+know *why* the remaining properties were accepted. Passing
+``explain_unevaluated_properties=True`` to a validator attaches an
+`evaluation_explanation <ValidationError.evaluation_explanation>` to
+each :kw:`unevaluatedProperties` error:
+
+.. code-block:: python
+
+    >>> from jsonschema import Draft202012Validator
+    >>> schema = {
+    ...     "properties": {"foo": {}},
+    ...     "allOf": [{"properties": {"bar": {}}}],
+    ...     "unevaluatedProperties": False,
+    ... }
+    >>> validator = Draft202012Validator(
+    ...     schema, explain_unevaluated_properties=True,
+    ... )
+    >>> [error] = validator.iter_errors({"foo": 1, "bar": 2, "baz": 3})
+    >>> error.message
+    "Unevaluated properties are not allowed ('baz' was unexpected)"
+    >>> error.evaluation_explanation
+    {'foo': [{'keyword': 'properties'}], 'bar': [{'keyword': 'properties', 'via': [{'keyword': 'allOf', 'index': 0}]}]}
+
+The explanation maps each evaluated property of the instance at the
+error's `ValidationError.absolute_path` to the list of contributions
+which evaluated it. Each contribution names the keyword which directly
+evaluated the property (e.g. :kw:`properties`, :kw:`patternProperties`,
+:kw:`additionalProperties`), along with any relevant detail (such as the
+matching ``pattern`` for :kw:`patternProperties`). Contributions reached
+through applicators or references include a ``via`` list describing the
+path taken, e.g. a :kw:`$ref` (with the resolved reference) or an
+:kw:`allOf`/:kw:`anyOf`/:kw:`oneOf` branch (with its index).
+
+The explanation is computed from the same evaluation pass used to
+validate the instance, so:
+
+* branches which did not apply contribute nothing -- a failing
+  :kw:`anyOf` branch leaves no trace, and :kw:`if`/:kw:`then`/:kw:`else`
+  contribute according to the standard applicator rules;
+* no keyword (including custom keywords with side effects) is executed
+  any more than it would be with the option disabled.
+
+Because each error carries the explanation for its own location in the
+instance, properties evaluated through recursive references (e.g.
+:kw:`$dynamicRef`) are distinguished by the error's instance path.
+
 
 In case an invalid schema itself is encountered, a `SchemaError` is
 raised.

@@ -4,6 +4,7 @@ import re
 from jsonschema._utils import (
     ensure_list,
     equal,
+    explain_evaluated_property_keys_by_schema,
     extras_msg,
     find_additional_properties,
     find_evaluated_item_indexes_by_schema,
@@ -412,11 +413,21 @@ def unevaluatedItems(validator, unevaluatedItems, instance, schema):
 def unevaluatedProperties(validator, unevaluatedProperties, instance, schema):
     if not validator.is_type(instance, "object"):
         return
-    evaluated_keys = find_evaluated_property_keys_by_schema(
-        validator,
-        instance,
-        schema,
-    )
+    if validator._explain_unevaluated_properties:
+        evaluated_keys, explanations = (
+            explain_evaluated_property_keys_by_schema(
+                validator,
+                instance,
+                schema,
+            )
+        )
+    else:
+        explanations = None
+        evaluated_keys = find_evaluated_property_keys_by_schema(
+            validator,
+            instance,
+            schema,
+        )
     unevaluated_keys = []
     for property in instance:
         if property not in evaluated_keys:
@@ -434,13 +445,16 @@ def unevaluatedProperties(validator, unevaluatedProperties, instance, schema):
         if unevaluatedProperties is False:
             error = "Unevaluated properties are not allowed (%s %s unexpected)"
             extras = sorted(unevaluated_keys, key=str)
-            yield ValidationError(error % extras_msg(extras))
+            error = ValidationError(error % extras_msg(extras))
         else:
             error = (
                 "Unevaluated properties are not valid under "
                 "the given schema (%s %s unevaluated and invalid)"
             )
-            yield ValidationError(error % extras_msg(unevaluated_keys))
+            error = ValidationError(error % extras_msg(unevaluated_keys))
+        if explanations is not None:
+            error.evaluation_explanation = explanations
+        yield error
 
 
 def prefixItems(validator, prefixItems, instance, schema):

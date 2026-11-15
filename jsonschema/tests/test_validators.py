@@ -828,6 +828,238 @@ class TestValidationErrorMessages(TestCase):
         )
 
 
+class TestUnevaluatedPropertiesExplanation(TestCase):
+    def errors_for(self, instance, schema):
+        validator = validators.Draft202012Validator(
+            schema,
+            explain_unevaluated_properties=True,
+        )
+        errors = [
+            error
+            for error in validator.iter_errors(instance)
+            if error.validator == "unevaluatedProperties"
+        ]
+        self.assertTrue(errors, msg=f"No errors were raised for {instance!r}")
+        return errors
+
+    def test_disabled_by_default(self):
+        schema = {"properties": {"foo": {}}, "unevaluatedProperties": False}
+        validator = validators.Draft202012Validator(schema)
+        [error] = list(validator.iter_errors({"foo": 1, "bar": 2}))
+        self.assertIsNone(error.evaluation_explanation)
+        self.assertEqual(
+            error.message,
+            "Unevaluated properties are not allowed ('bar' was unexpected)",
+        )
+
+    def test_properties(self):
+        schema = {"properties": {"foo": {}}, "unevaluatedProperties": False}
+        [error] = self.errors_for({"foo": 1, "bar": 2}, schema)
+        self.assertEqual(
+            error.evaluation_explanation,
+            {"foo": [{"keyword": "properties"}]},
+        )
+
+    def test_pattern_properties(self):
+        schema = {
+            "patternProperties": {"^f": {}},
+            "unevaluatedProperties": False,
+        }
+        [error] = self.errors_for({"foo": 1, "bar": 2}, schema)
+        self.assertEqual(
+            error.evaluation_explanation,
+            {"foo": [{"keyword": "patternProperties", "pattern": "^f"}]},
+        )
+
+    def test_additional_properties(self):
+        schema = {
+            "properties": {"foo": {}},
+            "additionalProperties": {"type": "integer"},
+            "unevaluatedProperties": False,
+        }
+        [error] = self.errors_for({"foo": 1, "bar": 2, "baz": "no"}, schema)
+        self.assertEqual(
+            error.evaluation_explanation,
+            {
+                "foo": [
+                    {"keyword": "properties"},
+                    {"keyword": "additionalProperties"},
+                ],
+                "bar": [{"keyword": "additionalProperties"}],
+            },
+        )
+
+    def test_dependent_schemas(self):
+        schema = {
+            "dependentSchemas": {"foo": {"properties": {"bar": {}}}},
+            "unevaluatedProperties": False,
+        }
+        [error] = self.errors_for({"foo": 1, "bar": 2, "baz": 3}, schema)
+        self.assertEqual(
+            error.evaluation_explanation,
+            {
+                "bar": [
+                    {
+                        "keyword": "properties",
+                        "via": [
+                            {"keyword": "dependentSchemas", "property": "foo"},
+                        ],
+                    },
+                ],
+            },
+        )
+
+    def test_ref(self):
+        schema = {
+            "$defs": {"inner": {"properties": {"foo": {}}}},
+            "$ref": "#/$defs/inner",
+            "unevaluatedProperties": False,
+        }
+        [error] = self.errors_for({"foo": 1, "bar": 2}, schema)
+        self.assertEqual(
+            error.evaluation_explanation,
+            {
+                "foo": [
+                    {
+                        "keyword": "properties",
+                        "via": [{"keyword": "$ref", "ref": "#/$defs/inner"}],
+                    },
+                ],
+            },
+        )
+
+    def test_failed_anyOf_branch_does_not_contribute(self):
+        schema = {
+            "anyOf": [
+                {"properties": {"foo": {}}},
+                {"properties": {"bar": {}}, "required": ["bar", "baz"]},
+            ],
+            "unevaluatedProperties": False,
+        }
+        [error] = self.errors_for({"foo": 1, "bar": 2, "quux": 3}, schema)
+        self.assertEqual(
+            error.evaluation_explanation,
+            {
+                "foo": [
+                    {
+                        "keyword": "properties",
+                        "via": [{"keyword": "anyOf", "index": 0}],
+                    },
+                ],
+            },
+        )
+
+    def test_if_then_else(self):
+        schema = {
+            "if": {"properties": {"kind": {"const": "a"}}},
+            "then": {"properties": {"then_prop": {}}},
+            "else": {"properties": {"else_prop": {}}},
+            "unevaluatedProperties": False,
+        }
+        [then_error] = self.errors_for(
+            {"kind": "a", "then_prop": 1, "extra": 2},
+            schema,
+        )
+        self.assertEqual(
+            then_error.evaluation_explanation,
+            {
+                "kind": [
+                    {"keyword": "properties", "via": [{"keyword": "if"}]},
+                ],
+                "then_prop": [
+                    {"keyword": "properties", "via": [{"keyword": "then"}]},
+                ],
+            },
+        )
+
+        [else_error] = self.errors_for(
+            {"kind": "b", "else_prop": 1, "extra": 2},
+            schema,
+        )
+        self.assertEqual(
+            else_error.evaluation_explanation,
+            {
+                "else_prop": [
+                    {"keyword": "properties", "via": [{"keyword": "else"}]},
+                ],
+            },
+        )
+
+    def test_subschema_value(self):
+        schema = {
+            "properties": {"foo": {}},
+            "unevaluatedProperties": {"const": 12},
+        }
+        [error] = self.errors_for({"foo": 1, "bar": "no"}, schema)
+        self.assertEqual(
+            error.evaluation_explanation,
+            {"foo": [{"keyword": "properties"}]},
+        )
+
+    def test_recursive_references_distinguished_by_instance_path(self):
+        schema = {
+            "$dynamicAnchor": "node",
+            "properties": {
+                "name": {"type": "string"},
+                "child": {"$dynamicRef": "#node"},
+            },
+            "unevaluatedProperties": False,
+        }
+        instance = {
+            "name": "a",
+            "nope": 1,
+            "child": {"name": "b", "extra": 2},
+        }
+        validator = validators.Draft202012Validator(
+            schema,
+            explain_unevaluated_properties=True,
+        )
+        errors = {
+            tuple(error.absolute_path): error
+            for error in validator.iter_errors(instance)
+        }
+        self.assertEqual(set(errors), {(), ("child",)})
+        self.assertEqual(
+            errors[()].evaluation_explanation,
+            {
+                "name": [{"keyword": "properties"}],
+                "child": [{"keyword": "properties"}],
+            },
+        )
+        self.assertEqual(
+            errors[("child",)].evaluation_explanation,
+            {"name": [{"keyword": "properties"}]},
+        )
+
+    def test_no_extra_evaluation_of_custom_keywords(self):
+        counts = {"plain": 0, "explaining": 0}
+
+        def counted(validator, value, instance, schema):
+            counts[counts["mode"]] += 1
+
+        CountedValidator = validators.extend(
+            validators.Draft202012Validator,
+            validators={"counted": counted},
+        )
+        schema = {
+            "allOf": [{"counted": True}],
+            "unevaluatedProperties": False,
+        }
+
+        counts["mode"] = "plain"
+        list(CountedValidator(schema).iter_errors({"extra": 1}))
+
+        counts["mode"] = "explaining"
+        explaining = CountedValidator(
+            schema,
+            explain_unevaluated_properties=True,
+        )
+        list(explaining.iter_errors({"extra": 1}))
+
+        self.assertGreater(counts["explaining"], 0)
+        self.assertEqual(counts["explaining"], counts["plain"])
+
+
 class TestValidationErrorDetails(TestCase):
     # TODO: These really need unit tests for each individual keyword, rather
     #       than just these higher level tests.

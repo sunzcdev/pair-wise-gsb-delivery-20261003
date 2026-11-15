@@ -249,6 +249,12 @@ def create(
             kw_only=True,
             repr=False,
         )
+        _explain_unevaluated_properties = field(
+            alias="explain_unevaluated_properties",
+            default=False,
+            kw_only=True,
+            repr=False,
+        )
 
         def __init_subclass__(cls):
             warnings.warn(

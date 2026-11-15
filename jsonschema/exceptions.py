@@ -57,6 +57,12 @@ class _Error(Exception):
     _word_for_schema_in_error_message: ClassVar[str]
     _word_for_instance_in_error_message: ClassVar[str]
 
+    #: An optional explanation of why each evaluated property of the
+    #: instance was considered evaluated, attached to
+    #: :kw:`unevaluatedProperties` errors when the validator was created
+    #: with ``explain_unevaluated_properties=True``. `None` otherwise.
+    evaluation_explanation: dict | None = None
+
     def __init__(
         self,
         message: str,
