@@ -249,6 +249,18 @@ def create(
             kw_only=True,
             repr=False,
         )
+        _schema_path: tuple[str | int, ...] = field(
+            default=(),
+            init=False,
+            repr=False,
+            eq=False,
+        )
+        _current_keyword: str | None = field(
+            default=None,
+            init=False,
+            repr=False,
+            eq=False,
+        )
 
         def __init_subclass__(cls):
             warnings.warn(
@@ -378,23 +390,34 @@ def create(
                     validator_value=None,
                     instance=instance,
                     schema=_schema,
+                    schema_uri=self._resolver._base_uri,
+                    declaration_path=self._schema_path,
                 )
                 return
 
             for validator, k, v in validators:
-                errors = validator(self, v, instance, _schema) or ()
-                for error in errors:
-                    # set details if not already set by the called fn
-                    error._set(
-                        validator=k,
-                        validator_value=v,
-                        instance=instance,
-                        schema=_schema,
-                        type_checker=self.TYPE_CHECKER,
-                    )
-                    if k not in {"if", "$ref"}:
-                        error.schema_path.appendleft(k)
-                    yield error
+                self._current_keyword = k
+                try:
+                    errors = validator(self, v, instance, _schema) or ()
+                    for error in errors:
+                        # set details if not already set by the called fn
+                        error._set(
+                            validator=k,
+                            validator_value=v,
+                            instance=instance,
+                            schema=_schema,
+                            type_checker=self.TYPE_CHECKER,
+                            schema_uri=self._resolver._base_uri,
+                        )
+                        if k not in {"if", "$ref"}:
+                            error.schema_path.appendleft(k)
+                        if error._declaration_path is None:
+                            error._declaration_path = (
+                                self._schema_path + (k,)
+                            )
+                        yield error
+                finally:
+                    self._current_keyword = None
 
         def descend(
             self,
@@ -403,7 +426,20 @@ def create(
             path=None,
             schema_path=None,
             resolver=None,
+            _schema_path=None,
         ):
+            if _schema_path is None:
+                child_schema_path = self._schema_path
+                if self._current_keyword is not None:
+                    child_schema_path += (self._current_keyword,)
+                if schema_path is not None:
+                    if isinstance(schema_path, (str, int)):
+                        child_schema_path += (schema_path,)
+                    else:
+                        child_schema_path += tuple(schema_path)
+            else:
+                child_schema_path = tuple(_schema_path)
+
             if schema is True:
                 return
             elif schema is False:
@@ -415,8 +451,22 @@ def create(
                     schema=schema,
                     path=() if path is None else (path,),
                     schema_path=() if schema_path is None else (schema_path,),
+                    schema_uri=(
+                        self._resolver._base_uri
+                        if self._ref_resolver is None
+                        else getattr(
+                            self._ref_resolver,
+                            "resolution_scope",
+                            "",
+                        )
+                    ),
+                    declaration_path=child_schema_path,
                 )
                 return
+
+            previous_base = None
+            if self._ref_resolver is None:
+                previous_base = self._resolver._base_uri
 
             if self._ref_resolver is not None:
                 evolved = self.evolve(schema=schema)
@@ -427,28 +477,53 @@ def create(
                     )
                 evolved = self.evolve(schema=schema, _resolver=resolver)
 
+            if (
+                _schema_path is None
+                and previous_base is not None
+                and evolved._resolver._base_uri != previous_base
+            ):
+                child_schema_path = ()
+            evolved._schema_path = child_schema_path
+
             for k, v in applicable_validators(schema):
                 validator = evolved.VALIDATORS.get(k)
                 if validator is None:
                     continue
 
-                errors = validator(evolved, v, instance, schema) or ()
-                for error in errors:
-                    # set details if not already set by the called fn
-                    error._set(
-                        validator=k,
-                        validator_value=v,
-                        instance=instance,
-                        schema=schema,
-                        type_checker=evolved.TYPE_CHECKER,
-                    )
-                    if k not in {"if", "$ref"}:
-                        error.schema_path.appendleft(k)
-                    if path is not None:
-                        error.path.appendleft(path)
-                    if schema_path is not None:
-                        error.schema_path.appendleft(schema_path)
-                    yield error
+                evolved._current_keyword = k
+                try:
+                    errors = validator(evolved, v, instance, schema) or ()
+                    for error in errors:
+                        # set details if not already set by the called fn
+                        error._set(
+                            validator=k,
+                            validator_value=v,
+                            instance=instance,
+                            schema=schema,
+                            type_checker=evolved.TYPE_CHECKER,
+                            schema_uri=(
+                                evolved._resolver._base_uri
+                                if evolved._ref_resolver is None
+                                else getattr(
+                                    evolved._ref_resolver,
+                                    "resolution_scope",
+                                    "",
+                                )
+                            ),
+                        )
+                        if k not in {"if", "$ref"}:
+                            error.schema_path.appendleft(k)
+                        if error._declaration_path is None:
+                            error._declaration_path = (
+                                evolved._schema_path + (k,)
+                            )
+                        if path is not None:
+                            error.path.appendleft(path)
+                        if schema_path is not None:
+                            error.schema_path.appendleft(schema_path)
+                        yield error
+                finally:
+                    evolved._current_keyword = None
 
         def validate(self, *args, **kwargs):
             for error in self.iter_errors(*args, **kwargs):
@@ -461,29 +536,128 @@ def create(
                 exc = exceptions.UnknownType(type, instance, self.schema)
                 raise exc from None
 
-        def _validate_reference(self, ref, instance):
+        def _reference_step(self, ref, schema, resolved=None, keyword="$ref"):
+            if self._ref_resolver is None:
+                source = self._resolver._base_uri
+            else:
+                source = getattr(
+                    self._ref_resolver,
+                    "resolution_scope",
+                    "",
+                )
+
+            ref_text = ref if isinstance(ref, str) else str(ref)
+            if ref_text.startswith("#"):
+                absolute = f"{source}{ref_text}"
+            else:
+                absolute = urljoin(source, ref_text)
+            target_resource, fragment = urldefrag(absolute)
+            target_path = exceptions._pointer_segments(fragment)
+
+            if resolved is not None:
+                target_resource = getattr(
+                    resolved.resolver,
+                    "_base_uri",
+                    target_resource,
+                )
+
+            return exceptions.ReferenceStep(
+                source=source,
+                ref=ref_text,
+                target=absolute,
+                source_path=self._schema_path + (keyword,),
+                target_path=target_path,
+                target_resource=target_resource,
+                fragment=fragment,
+                source_schema=schema,
+                target_schema=(
+                    None if resolved is None else resolved.contents
+                ),
+            )
+
+        def _validate_reference(
+            self,
+            ref,
+            instance,
+            schema=None,
+            keyword="$ref",
+        ):
             if self._ref_resolver is None:
                 try:
                     resolved = self._resolver.lookup(ref)
                 except referencing.exceptions.Unresolvable as err:
-                    raise exceptions._WrappedReferencingError(err) from err
+                    step = self._reference_step(ref, schema, keyword=keyword)
+                    raise exceptions.ReferenceResolutionError(
+                        err,
+                        ref=ref,
+                        source=step.source,
+                        target=step.target,
+                        chain=(step,),
+                    ) from err
 
-                return self.descend(
-                    instance,
-                    resolved.contents,
-                    resolver=resolved.resolver,
+                step = self._reference_step(
+                    ref,
+                    schema,
+                    resolved=resolved,
+                    keyword=keyword,
                 )
+                try:
+                    for error in self.descend(
+                        instance,
+                        resolved.contents,
+                        resolver=resolved.resolver,
+                        _schema_path=step.target_path,
+                    ):
+                        error._prepend_ref_step(step)
+                        yield error
+                except exceptions.ReferenceResolutionError as err:
+                    err._prepend_ref_step(step)
+                    raise
             else:
                 resolve = getattr(self._ref_resolver, "resolve", None)
                 if resolve is None:
-                    with self._ref_resolver.resolving(ref) as resolved:
-                        return self.descend(instance, resolved)
+                    try:
+                        with self._ref_resolver.resolving(ref) as resolved:
+                            step = self._reference_step(
+                                ref,
+                                schema,
+                                keyword=keyword,
+                            )
+                            for error in self.descend(
+                                instance,
+                                resolved,
+                                _schema_path=step.target_path,
+                            ):
+                                error._prepend_ref_step(step)
+                                yield error
+                    except exceptions.ReferenceResolutionError as err:
+                        step = self._reference_step(
+                            ref,
+                            schema,
+                            keyword=keyword,
+                        )
+                        err._prepend_ref_step(step)
+                        raise
                 else:
                     scope, resolved = resolve(ref)
                     self._ref_resolver.push_scope(scope)
 
                     try:
-                        return list(self.descend(instance, resolved))
+                        step = self._reference_step(
+                            ref,
+                            schema,
+                            keyword=keyword,
+                        )
+                        for error in self.descend(
+                            instance,
+                            resolved,
+                            _schema_path=step.target_path,
+                        ):
+                            error._prepend_ref_step(step)
+                            yield error
+                    except exceptions.ReferenceResolutionError as err:
+                        err._prepend_ref_step(step)
+                        raise
                     finally:
                         self._ref_resolver.pop_scope()
 

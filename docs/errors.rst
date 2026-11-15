@@ -119,6 +119,31 @@ raised or returned, depending on which method or function is used.
         A validation error which this error is the `context` of.
         ``None`` if there wasn't one.
 
+    .. attribute:: ref_chain
+
+        A `ReferenceChain` describing the ``$ref`` hops which led to this
+        error. Each `ReferenceStep` retains the source resource, the
+        reference text as written, the resolved target, and the paths to
+        the reference and to the target schema. The chain is the finite
+        path actually traversed for this instance, including only the
+        recursion which really occurred.
+
+    .. attribute:: ref_chains
+
+        The distinct reference chains which contributed to an applicator
+        error. Two entries which reach the same contract remain separate
+        chains, so their respective call sites are still identifiable.
+
+    .. attribute:: entry_location
+
+        The resource and path at which the entry reference was used.
+
+    .. attribute:: declaration_location
+
+        The resource and path at which the final failed constraint was
+        declared. `path` continues to identify the offending instance
+        element and is not replaced by either schema location.
+
 
 In case an invalid schema itself is encountered, a `SchemaError` is
 raised.
@@ -127,6 +152,17 @@ raised.
     :noindex:
 
     The same attributes are present as for `ValidationError`\s.
+
+
+Reference resolution failures are not validation errors
+-------------------------------------------------------
+
+When a ``$ref`` cannot be resolved, validation cannot determine whether
+the instance is valid. A `ReferenceResolutionError` is raised instead of
+a `ValidationError`, so applicators such as :kw:`anyOf` do not silently
+turn a missing resource into an ordinary instance failure. It retains
+the same `ref_chain`, `entry_location`, and resolved-target information
+described above.
 
 
 These attributes can be clarified with a short example:

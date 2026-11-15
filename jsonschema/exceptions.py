@@ -5,13 +5,15 @@ Validation errors, and some surrounding helpers.
 from __future__ import annotations
 
 from collections import defaultdict, deque
+from collections.abc import Mapping, Sequence
 from pprint import pformat
 from textwrap import dedent, indent
 from typing import TYPE_CHECKING, Any, ClassVar
+from urllib.parse import unquote, urldefrag
 import re
 import warnings
 
-from attrs import define
+from attrs import define, field
 from referencing.exceptions import Unresolvable as _Unresolvable
 
 from jsonschema import _utils
@@ -20,9 +22,7 @@ if TYPE_CHECKING:
     from collections.abc import (
         Callable,
         Iterable,
-        Mapping,
         MutableMapping,
-        Sequence,
     )
 
     from jsonschema import _types
@@ -40,6 +40,372 @@ def _pretty(thing: Any, prefix: str):
     Format something for an error message as prettily as we currently can.
     """
     return indent(pformat(thing, width=72, sort_dicts=False), prefix).lstrip()
+
+
+def _json_pointer(path: Iterable[str | int]) -> str:
+    """
+    Format a sequence of path segments as a JSON Pointer.
+    """
+    return "".join(
+        "/" + str(each).replace("~", "~0").replace("/", "~1")
+        for each in path
+    )
+
+
+def _format_location(resource: str, path: Iterable[str | int]) -> str:
+    """
+    Render a resource URI and path as a single location.
+    """
+    return f"{resource}#{_json_pointer(path)}"
+
+
+def _pointer_segments(fragment: str) -> tuple[str | int, ...]:
+    """
+    Split a URI fragment which is a JSON Pointer into path segments.
+    """
+    if not fragment.startswith("/"):
+        return ()
+
+    return tuple(
+        segment.replace("~1", "/").replace("~0", "~")
+        for segment in (
+            unquote(each) for each in fragment[1:].split("/")
+        )
+    )
+
+
+@define(frozen=True, eq=False)
+class ReferenceStep:
+    """
+    One hop of a chain of ``$ref`` resolutions.
+
+    ``source`` identifies the resource in which the reference was used,
+    ``ref`` is the text of the reference as written, and ``target`` is
+    the absolute location to which it resolved. ``source_path`` is the
+    path of the ``$ref`` keyword within ``source`` and ``target_path`` is
+    the path at which the referenced schema begins within the target
+    resource.
+    """
+
+    source: str
+    ref: str
+    target: str
+    source_path: tuple[str | int, ...] = ()
+    target_path: tuple[str | int, ...] = ()
+    target_resource: str = ""
+    fragment: str = ""
+    source_schema: Any = field(default=None, repr=False, eq=False)
+    target_schema: Any = field(default=None, repr=False, eq=False)
+
+    @property
+    def source_resource(self) -> str:
+        return self.source
+
+    @property
+    def source_uri(self) -> str:
+        return self.source
+
+    @property
+    def from_resource(self) -> str:
+        return self.source
+
+    @property
+    def reference(self) -> str:
+        return self.ref
+
+    @property
+    def reference_text(self) -> str:
+        return self.ref
+
+    @property
+    def target_uri(self) -> str:
+        return self.target
+
+    @property
+    def resolved(self) -> str:
+        return self.target
+
+    @property
+    def resolution_target(self) -> str:
+        return self.target
+
+    @property
+    def resolved_target(self) -> str:
+        return self.target
+
+    @property
+    def resolved_uri(self) -> str:
+        return self.target
+
+    @property
+    def from_uri(self) -> str:
+        return self.source
+
+    @property
+    def to_uri(self) -> str:
+        return self.target
+
+    @property
+    def from_path(self) -> tuple[str | int, ...]:
+        return self.source_path
+
+    @property
+    def to_path(self) -> tuple[str | int, ...]:
+        return self.target_path
+
+    @property
+    def contents(self) -> Any:
+        return self.target_schema
+
+    @property
+    def source_location(self) -> str:
+        return _format_location(self.source, self.source_path)
+
+    @property
+    def source_pointer(self) -> str:
+        return _json_pointer(self.source_path)
+
+    @property
+    def target_pointer(self) -> str:
+        return _json_pointer(self.target_path)
+
+    @property
+    def target_location(self) -> str:
+        resource = self.target_resource or urldefrag(self.target)[0]
+        return _format_location(resource, self.target_path)
+
+    @property
+    def location(self) -> str:
+        return self.source_location
+
+    @property
+    def path(self) -> tuple[str | int, ...]:
+        return self.source_path
+
+    def __getitem__(self, key):
+        if isinstance(key, (int, slice)):
+            return (self.source, self.ref, self.target)[key]
+        if not isinstance(key, str):
+            raise TypeError(
+                "ReferenceStep indices must be strings, integers, or slices",
+            )
+        return getattr(self, key)
+
+    def get(self, key: str, default: Any = None) -> Any:
+        return getattr(self, key, default)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "source": self.source,
+            "source_resource": self.source,
+            "ref": self.ref,
+            "reference": self.ref,
+            "target": self.target,
+            "target_uri": self.target,
+            "source_path": list(self.source_path),
+            "target_path": list(self.target_path),
+            "source_location": self.source_location,
+            "target_location": self.target_location,
+        }
+
+    def __eq__(self, other: object) -> bool:
+        if isinstance(other, ReferenceStep):
+            return (
+                self.source,
+                self.ref,
+                self.target,
+                self.source_path,
+                self.target_path,
+                self.target_resource,
+                self.fragment,
+            ) == (
+                other.source,
+                other.ref,
+                other.target,
+                other.source_path,
+                other.target_path,
+                other.target_resource,
+                other.fragment,
+            )
+        if isinstance(other, Mapping):
+            return all(
+                getattr(self, key, _unset) == value
+                for key, value in other.items()
+            )
+        return NotImplemented
+
+    def __hash__(self) -> int:
+        return hash(
+            (
+                self.source,
+                self.ref,
+                self.target,
+                self.source_path,
+                self.target_path,
+                self.target_resource,
+                self.fragment,
+            ),
+        )
+
+    def __repr__(self) -> str:
+        return (
+            f"<ReferenceStep {self.source_location} "
+            f"--{self.ref}--> {self.target_location}>"
+        )
+
+    def __str__(self) -> str:
+        return (
+            f"{self.source_location} "
+            f"--{self.ref}--> {self.target_location}"
+        )
+
+
+def _coerce_reference_step(value) -> ReferenceStep:
+    if isinstance(value, ReferenceStep):
+        return value
+    if not isinstance(value, Mapping):
+        return value
+
+    source = value.get(
+        "source",
+        value.get(
+            "source_resource",
+            value.get("source_uri", value.get("from_resource", "")),
+        ),
+    )
+    ref = value.get(
+        "ref",
+        value.get(
+            "reference",
+            value.get("reference_text", value.get("ref_text", "")),
+        ),
+    )
+    target = value.get(
+        "target",
+        value.get(
+            "target_uri",
+            value.get(
+                "resolution_target",
+                value.get("resolved_target", value.get("resolved", "")),
+            ),
+        ),
+    )
+    target_resource, fragment = urldefrag(target)
+    return ReferenceStep(
+        source=source,
+        ref=ref,
+        target=target,
+        source_path=tuple(value.get("source_path", value.get("path", ()))),
+        target_path=tuple(value.get("target_path", ())),
+        target_resource=value.get("target_resource", target_resource),
+        fragment=value.get("fragment", fragment),
+        source_schema=value.get("source_schema"),
+        target_schema=value.get("target_schema", value.get("contents")),
+    )
+
+
+def _reference_steps(values) -> tuple[ReferenceStep, ...]:
+    if isinstance(values, ReferenceChain):
+        return values.steps
+    return tuple(_coerce_reference_step(each) for each in values)
+
+
+@define(frozen=True, eq=False)
+class ReferenceChain(Sequence[ReferenceStep]):
+    """
+    A finite, runtime view of the references followed to an error.
+
+    Each step preserves the source resource, the reference as written
+    (or as dynamically resolved), and the resolved target. Recursion
+    therefore appears only as far as it was actually traversed while
+    validating a particular instance.
+    """
+
+    steps: tuple[ReferenceStep, ...] = field(
+        default=(),
+        converter=_reference_steps,
+    )
+
+    def __len__(self) -> int:
+        return len(self.steps)
+
+    def __getitem__(self, index):
+        return self.steps[index]
+
+    def __iter__(self):
+        return iter(self.steps)
+
+    def __bool__(self) -> bool:
+        return bool(self.steps)
+
+    def __eq__(self, other: object) -> bool:
+        if isinstance(other, ReferenceChain):
+            return self.steps == other.steps
+        if isinstance(other, (list, tuple)):
+            return len(self.steps) == len(other) and all(
+                step == expected
+                for step, expected in zip(self.steps, other)
+            )
+        return NotImplemented
+
+    def __hash__(self) -> int:
+        return hash(self.steps)
+
+    @property
+    def entry(self) -> ReferenceStep | None:
+        return self.steps[0] if self.steps else None
+
+    @property
+    def first(self) -> ReferenceStep | None:
+        return self.entry
+
+    @property
+    def last(self) -> ReferenceStep | None:
+        return self.steps[-1] if self.steps else None
+
+    @property
+    def source(self) -> str:
+        return self.entry.source if self.entry is not None else ""
+
+    @property
+    def source_resource(self) -> str:
+        return self.source
+
+    @property
+    def entry_location(self) -> str:
+        return self.entry.source_location if self.entry is not None else ""
+
+    @property
+    def target(self) -> str:
+        return self.last.target if self.last is not None else ""
+
+    @property
+    def target_location(self) -> str:
+        return self.last.target_location if self.last is not None else ""
+
+    @property
+    def refs(self) -> tuple[str, ...]:
+        return tuple(step.ref for step in self.steps)
+
+    @property
+    def locations(self) -> tuple[str, ...]:
+        return tuple(step.source_location for step in self.steps)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "entry": self.entry_location,
+            "target": self.target_location,
+            "steps": [step.to_dict() for step in self.steps],
+        }
+
+    def __repr__(self) -> str:
+        return f"<ReferenceChain {self.steps!r}>"
+
+    def __str__(self) -> str:
+        return " -> ".join(
+            f"{step.source_location} --{step.ref}--> {step.target_location}"
+            for step in self.steps
+        )
 
 
 def __getattr__(name):
@@ -70,6 +436,9 @@ class _Error(Exception):
         schema_path: Iterable[str | int] = (),
         parent: _Error | None = None,
         type_checker: _types.TypeChecker = _unset,  # type: ignore[assignment]
+        schema_uri: str | None = _unset,  # type: ignore[assignment]
+        declaration_path: Iterable[str | int] | None = None,
+        ref_chain: Iterable[ReferenceStep] = (),
     ) -> None:
         super().__init__(
             message,
@@ -94,6 +463,11 @@ class _Error(Exception):
         self.schema = schema
         self.parent = parent
         self._type_checker = type_checker
+        self.schema_uri = schema_uri
+        self._declaration_path = (
+            None if declaration_path is None else tuple(declaration_path)
+        )
+        self._ref_chain = ReferenceChain(ref_chain).steps
 
         for error in context:
             error.parent = self
@@ -121,7 +495,7 @@ class _Error(Exception):
         )
         prefix = 16 * " "
 
-        return dedent(
+        rendered = dedent(
             f"""\
             {self.message}
 
@@ -132,6 +506,38 @@ class _Error(Exception):
                 {_pretty(self.instance, prefix=prefix)}
             """.rstrip(),
         )
+        chains = self.ref_chains
+        if chains:
+            if len(chains) == 1:
+                heading = "Reference chain:"
+            else:
+                heading = "Reference chains:"
+            lines = ["", heading]
+            for chain in chains:
+                lines.append(f"  entry: {chain.entry_location}")
+                lines.extend(f"    {step}" for step in chain.steps)
+                declaration = None
+                for error in self.context:
+                    if (
+                        error.ref_chain == chain
+                        and error._declaration_path is not None
+                    ):
+                        declaration = error.declaration_location
+                        break
+                if chain == self.ref_chain and self._ref_chain:
+                    declaration = self.declaration_location
+                elif declaration is None and self._declaration_path is not None:
+                    declaration = self.declaration_location
+                if declaration is not None:
+                    lines.append(
+                        f"  declaration: {declaration}",
+                    )
+                elif chain.last is not None:
+                    lines.append(
+                        f"  declaration: {chain.last.target_location}",
+                    )
+            rendered += "\n" + "\n".join(lines)
+        return rendered
 
     @classmethod
     def create_from(cls, other: _Error):
@@ -170,6 +576,186 @@ class _Error(Exception):
                 path += "['" + escaped_elem + "']"
         return path
 
+    @property
+    def schema_location(self) -> str:
+        """
+        The location of the failed constraint, including its resource.
+        """
+        return self.declaration_location
+
+    @property
+    def declaration_path(self) -> tuple[str | int, ...]:
+        """
+        The path of the failed constraint within its declaring resource.
+        """
+        if self._declaration_path is not None:
+            return self._declaration_path
+        return tuple(self.absolute_schema_path)
+
+    @property
+    def constraint_path(self) -> tuple[str | int, ...]:
+        return self.declaration_path
+
+    @property
+    def declaration_location(self) -> str:
+        """
+        The resource and path at which the failed constraint was declared.
+        """
+        resource = "" if self.schema_uri is _unset else (self.schema_uri or "")
+        return _format_location(resource, self.declaration_path)
+
+    @property
+    def constraint_location(self) -> str:
+        return self.declaration_location
+
+    @property
+    def final_location(self) -> str:
+        return self.declaration_location
+
+    @property
+    def schema_resource(self) -> str:
+        return "" if self.schema_uri is _unset else (self.schema_uri or "")
+
+    @property
+    def ref_chain(self) -> ReferenceChain:
+        """
+        The references traversed to reach this error.
+
+        When the error itself was produced at the end of a chain, this is
+        that chain. For an applicator error, it is the first of the
+        distinct chains found in its context (see `ref_chains`).
+        """
+        if self._ref_chain:
+            return ReferenceChain(self._ref_chain)
+        chains = self.ref_chains
+        return chains[0] if chains else ReferenceChain(())
+
+    @property
+    def reference_chain(self) -> ReferenceChain:
+        return self.ref_chain
+
+    @property
+    def ref_chains(self) -> tuple[ReferenceChain, ...]:
+        """
+        All distinct reference chains which contributed to this error.
+        """
+        chains: list[ReferenceChain] = []
+        if self._ref_chain:
+            chains.append(ReferenceChain(self._ref_chain))
+        for error in self.context:
+            chains.extend(error.ref_chains)
+
+        distinct: list[ReferenceChain] = []
+        for chain in chains:
+            if chain not in distinct:
+                distinct.append(chain)
+        return tuple(distinct)
+
+    @property
+    def ref_steps(self) -> tuple[ReferenceStep, ...]:
+        return self.ref_chain.steps
+
+    @property
+    def entry_location(self) -> str:
+        """
+        The location at which the entry reference was used.
+        """
+        chains = self.ref_chains
+        if not chains:
+            return ""
+        return chains[0].entry_location
+
+    @property
+    def entry_usage_location(self) -> str:
+        return self.entry_location
+
+    @property
+    def entry_locations(self) -> tuple[str, ...]:
+        return tuple(chain.entry_location for chain in self.ref_chains)
+
+    @property
+    def entry(self) -> ReferenceStep | None:
+        return self.ref_chain.entry
+
+    @property
+    def entry_step(self) -> ReferenceStep | None:
+        return self.entry
+
+    @property
+    def final_step(self) -> ReferenceStep | None:
+        return self.ref_chain.last
+
+    @property
+    def target_location(self) -> str:
+        return self.ref_chain.target_location
+
+    @property
+    def usage_location(self) -> str:
+        return self.entry_location
+
+    @property
+    def entry_schema_location(self) -> str:
+        return self.entry_location
+
+    @property
+    def entry_uri(self) -> str:
+        return self.entry_resource
+
+    @property
+    def entry_path(self) -> tuple[str | int, ...]:
+        return self.entry_schema_path
+
+    @property
+    def entry_pointer(self) -> str:
+        return _json_pointer(self.entry_schema_path)
+
+    @property
+    def entry_resource(self) -> str:
+        chains = self.ref_chains
+        return chains[0].source if chains else ""
+
+    @property
+    def entry_schema_path(self) -> tuple[str | int, ...]:
+        chains = self.ref_chains
+        if not chains or chains[0].entry is None:
+            return ()
+        return chains[0].entry.source_path
+
+    @property
+    def declaration_schema_path(self) -> tuple[str | int, ...]:
+        return self.declaration_path
+
+    @property
+    def constraint_schema_path(self) -> tuple[str | int, ...]:
+        return self.declaration_path
+
+    @property
+    def declaration_pointer(self) -> str:
+        return _json_pointer(self.declaration_path)
+
+    @property
+    def declaration_uri(self) -> str:
+        return self.schema_resource
+
+    @property
+    def declaration_resource(self) -> str:
+        return self.schema_resource
+
+    @property
+    def chain(self) -> ReferenceChain:
+        return self.ref_chain
+
+    @property
+    def chains(self) -> tuple[ReferenceChain, ...]:
+        return self.ref_chains
+
+    @property
+    def refs(self) -> tuple[ReferenceStep, ...]:
+        return self.ref_steps
+
+    def _prepend_ref_step(self, step: ReferenceStep) -> None:
+        self._ref_chain = (step, *self._ref_chain)
+
     def _set(
         self,
         type_checker: _types.TypeChecker | None = None,
@@ -195,7 +781,15 @@ class _Error(Exception):
             "schema",
             "parent",
         )
-        return {attr: getattr(self, attr) for attr in attrs}
+        contents = {attr: getattr(self, attr) for attr in attrs}
+        if self._ref_chain or (
+            self.schema_uri is not _unset and self.schema_uri
+        ):
+            contents["schema_uri"] = self.schema_uri
+            contents["declaration_path"] = self._declaration_path
+        if self._ref_chain:
+            contents["ref_chain"] = self._ref_chain
+        return contents
 
     def _matches_type(self) -> bool:
         try:
@@ -281,6 +875,138 @@ class _WrappedReferencingError(
 
     def __str__(self):
         return f"{self._wrapped.__class__.__name__}: {self._wrapped}"
+
+
+class ReferenceResolutionError(_WrappedReferencingError):
+    """
+    A reference could not be resolved while validating an instance.
+
+    Unlike a `ValidationError`, this indicates that validation could not
+    continue because a referenced resource (or a pointer or anchor within
+    it) does not exist. It is therefore never swallowed by applicators
+    such as :kw:`anyOf`, and is not a statement about the instance's
+    validity.
+
+    It retains the reference chain which led to the failure, along with
+    the entry location at which the chain was entered.
+    """
+
+    def __init__(
+        self,
+        cause: _Unresolvable,
+        *,
+        ref: str | None = None,
+        source: str = "",
+        target: str = "",
+        chain: Iterable[ReferenceStep] = (),
+    ) -> None:
+        super().__init__(cause)
+        object.__setattr__(
+            self,
+            "ref",
+            cause.ref if ref is None else ref,
+        )
+        object.__setattr__(self, "source", source)
+        object.__setattr__(self, "target", target)
+        object.__setattr__(self, "cause", cause)
+        object.__setattr__(self, "__cause__", cause)
+        object.__setattr__(
+            self,
+            "_ref_chain",
+            ReferenceChain(chain).steps,
+        )
+
+    @property
+    def ref_chain(self) -> ReferenceChain:
+        return ReferenceChain(self._ref_chain)
+
+    @property
+    def reference_chain(self) -> ReferenceChain:
+        return self.ref_chain
+
+    @property
+    def chain(self) -> ReferenceChain:
+        return self.ref_chain
+
+    @property
+    def steps(self) -> tuple[ReferenceStep, ...]:
+        return self._ref_chain
+
+    @property
+    def entry_location(self) -> str:
+        entry = self.ref_chain.entry
+        return "" if entry is None else entry.source_location
+
+    @property
+    def source_resource(self) -> str:
+        return self.source
+
+    @property
+    def target_resource(self) -> str:
+        return self.target
+
+    @property
+    def target_location(self) -> str:
+        return self.ref_chain.target_location
+
+    @property
+    def unresolved_location(self) -> str:
+        return self.target_location
+
+    def _prepend_ref_step(self, step: ReferenceStep) -> None:
+        object.__setattr__(self, "_ref_chain", (step, *self._ref_chain))
+        object.__setattr__(self, "source", step.source)
+
+    def __str__(self) -> str:
+        rendered = super().__str__()
+        if len(self._ref_chain) <= 1:
+            return rendered
+
+        lines = [rendered, "", "Reference chain:"]
+        lines.append(f"  entry: {self.entry_location}")
+        lines.extend(f"    {step}" for step in self._ref_chain)
+        lines.append(f"  unresolved: {self._ref_chain[-1].target_location}")
+        return "\n".join(lines)
+
+    def __repr__(self) -> str:
+        return (
+            f"<{self.__class__.__name__}: {self.ref!r}; "
+            f"chain={self.ref_chain!r}>"
+        )
+
+
+#: Convenient aliases for the reference-chain view.
+RefStep = ReferenceStep
+ReferenceHop = ReferenceStep
+RefHop = ReferenceStep
+RefChain = ReferenceChain
+ReferenceTrace = ReferenceChain
+ReferenceChainError = ReferenceResolutionError
+UnresolvableReferenceError = ReferenceResolutionError
+ReferenceError = ReferenceResolutionError
+RefError = ReferenceResolutionError
+ReferenceResolutionFailure = ReferenceResolutionError
+
+
+def reference_chain(error: _Error) -> ReferenceChain:
+    """
+    Return the reference chain attached to a validation error.
+    """
+    return error.ref_chain
+
+
+def reference_chains(
+    errors: Iterable[_Error],
+) -> tuple[ReferenceChain, ...]:
+    """
+    Return every distinct reference chain found amongst the given errors.
+    """
+    chains: list[ReferenceChain] = []
+    for error in errors:
+        for chain in error.ref_chains:
+            if chain not in chains:
+                chains.append(chain)
+    return tuple(chains)
 
 
 class UndefinedTypeCheck(Exception):

@@ -273,11 +273,20 @@ def enum(validator, enums, instance, schema):
 
 
 def ref(validator, ref, instance, schema):
-    yield from validator._validate_reference(ref=ref, instance=instance)
+    yield from validator._validate_reference(
+        ref=ref,
+        instance=instance,
+        schema=schema,
+    )
 
 
 def dynamicRef(validator, dynamicRef, instance, schema):
-    yield from validator._validate_reference(ref=dynamicRef, instance=instance)
+    yield from validator._validate_reference(
+        ref=dynamicRef,
+        instance=instance,
+        schema=schema,
+        keyword="$dynamicRef",
+    )
 
 
 def type(validator, types, instance, schema):

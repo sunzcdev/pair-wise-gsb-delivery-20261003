@@ -2,7 +2,7 @@ import re
 
 from referencing.jsonschema import lookup_recursive_ref
 
-from jsonschema import _utils
+from jsonschema import _utils, exceptions
 from jsonschema.exceptions import ValidationError
 
 
@@ -243,11 +243,24 @@ def contains_draft6_draft7(validator, contains, instance, schema):
 
 def recursiveRef(validator, recursiveRef, instance, schema):
     resolved = lookup_recursive_ref(validator._resolver)
-    yield from validator.descend(
-        instance,
-        resolved.contents,
-        resolver=resolved.resolver,
+    step = validator._reference_step(
+        recursiveRef,
+        schema,
+        resolved=resolved,
+        keyword="$recursiveRef",
     )
+    try:
+        for error in validator.descend(
+            instance,
+            resolved.contents,
+            resolver=resolved.resolver,
+            _schema_path=step.target_path,
+        ):
+            error._prepend_ref_step(step)
+            yield error
+    except exceptions.ReferenceResolutionError as err:
+        err._prepend_ref_step(step)
+        raise
 
 
 def find_evaluated_item_indexes_by_schema(validator, instance, schema):
