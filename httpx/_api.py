@@ -53,6 +53,7 @@ def request(
     follow_redirects: bool = False,
     verify: ssl.SSLContext | str | bool = True,
     trust_env: bool = True,
+    form_charset: str | None = None,
 ) -> Response:
     """
     Sends an HTTP request.
@@ -67,7 +68,7 @@ def request(
     * **content** - *(optional)* Binary content to include in the body of the
     request, as bytes or a byte iterator.
     * **data** - *(optional)* Form data to include in the body of the request,
-    as a dictionary.
+    as a dictionary, or as an ordered sequence of two-tuples.
     * **files** - *(optional)* A dictionary of upload files to include in the
     body of the request.
     * **json** - *(optional)* A JSON serializable object to include in the body
@@ -87,6 +88,10 @@ def request(
     `ssl.SSLContext` to use a custom context.
     * **trust_env** - *(optional)* Enables or disables usage of environment
     variables for configuration.
+    * **form_charset** - *(optional)* The charset to use when encoding
+    URL-encoded form data, eg. `"gbk"`. The `Content-Type` header is updated
+    to match. Only applies to `data=<...>` form bodies, and does not affect
+    raw content or multipart uploads.
 
     **Returns:** `Response`
 
@@ -117,6 +122,7 @@ def request(
             headers=headers,
             auth=auth,
             follow_redirects=follow_redirects,
+            form_charset=form_charset,
         )
 
 
@@ -138,6 +144,7 @@ def stream(
     follow_redirects: bool = False,
     verify: ssl.SSLContext | str | bool = True,
     trust_env: bool = True,
+    form_charset: str | None = None,
 ) -> typing.Iterator[Response]:
     """
     Alternative to `httpx.request()` that streams the response body
@@ -167,6 +174,7 @@ def stream(
             headers=headers,
             auth=auth,
             follow_redirects=follow_redirects,
+            form_charset=form_charset,
         ) as response:
             yield response
 
@@ -295,6 +303,7 @@ def post(
     verify: ssl.SSLContext | str | bool = True,
     timeout: TimeoutTypes = DEFAULT_TIMEOUT_CONFIG,
     trust_env: bool = True,
+    form_charset: str | None = None,
 ) -> Response:
     """
     Sends a `POST` request.
@@ -317,6 +326,7 @@ def post(
         verify=verify,
         timeout=timeout,
         trust_env=trust_env,
+        form_charset=form_charset,
     )
 
 
@@ -336,6 +346,7 @@ def put(
     verify: ssl.SSLContext | str | bool = True,
     timeout: TimeoutTypes = DEFAULT_TIMEOUT_CONFIG,
     trust_env: bool = True,
+    form_charset: str | None = None,
 ) -> Response:
     """
     Sends a `PUT` request.
@@ -358,6 +369,7 @@ def put(
         verify=verify,
         timeout=timeout,
         trust_env=trust_env,
+        form_charset=form_charset,
     )
 
 
@@ -377,6 +389,7 @@ def patch(
     verify: ssl.SSLContext | str | bool = True,
     timeout: TimeoutTypes = DEFAULT_TIMEOUT_CONFIG,
     trust_env: bool = True,
+    form_charset: str | None = None,
 ) -> Response:
     """
     Sends a `PATCH` request.
@@ -399,6 +412,7 @@ def patch(
         verify=verify,
         timeout=timeout,
         trust_env=trust_env,
+        form_charset=form_charset,
     )
 
 

@@ -351,6 +351,7 @@ class BaseClient:
         cookies: CookieTypes | None = None,
         timeout: TimeoutTypes | UseClientDefault = USE_CLIENT_DEFAULT,
         extensions: RequestExtensions | None = None,
+        form_charset: str | None = None,
     ) -> Request:
         """
         Build and return a request instance.
@@ -386,6 +387,7 @@ class BaseClient:
             headers=headers,
             cookies=cookies,
             extensions=extensions,
+            form_charset=form_charset,
         )
 
     def _merge_url(self, url: URL | str) -> URL:
@@ -784,6 +786,7 @@ class Client(BaseClient):
         follow_redirects: bool | UseClientDefault = USE_CLIENT_DEFAULT,
         timeout: TimeoutTypes | UseClientDefault = USE_CLIENT_DEFAULT,
         extensions: RequestExtensions | None = None,
+        form_charset: str | None = None,
     ) -> Response:
         """
         Build and send a request.
@@ -821,6 +824,7 @@ class Client(BaseClient):
             cookies=cookies,
             timeout=timeout,
             extensions=extensions,
+            form_charset=form_charset,
         )
         return self.send(request, auth=auth, follow_redirects=follow_redirects)
 
@@ -841,6 +845,7 @@ class Client(BaseClient):
         follow_redirects: bool | UseClientDefault = USE_CLIENT_DEFAULT,
         timeout: TimeoutTypes | UseClientDefault = USE_CLIENT_DEFAULT,
         extensions: RequestExtensions | None = None,
+        form_charset: str | None = None,
     ) -> typing.Iterator[Response]:
         """
         Alternative to `httpx.request()` that streams the response body
@@ -864,6 +869,7 @@ class Client(BaseClient):
             cookies=cookies,
             timeout=timeout,
             extensions=extensions,
+            form_charset=form_charset,
         )
         response = self.send(
             request=request,
@@ -1135,6 +1141,7 @@ class Client(BaseClient):
         follow_redirects: bool | UseClientDefault = USE_CLIENT_DEFAULT,
         timeout: TimeoutTypes | UseClientDefault = USE_CLIENT_DEFAULT,
         extensions: RequestExtensions | None = None,
+        form_charset: str | None = None,
     ) -> Response:
         """
         Send a `POST` request.
@@ -1155,6 +1162,7 @@ class Client(BaseClient):
             follow_redirects=follow_redirects,
             timeout=timeout,
             extensions=extensions,
+            form_charset=form_charset,
         )
 
     def put(
@@ -1172,6 +1180,7 @@ class Client(BaseClient):
         follow_redirects: bool | UseClientDefault = USE_CLIENT_DEFAULT,
         timeout: TimeoutTypes | UseClientDefault = USE_CLIENT_DEFAULT,
         extensions: RequestExtensions | None = None,
+        form_charset: str | None = None,
     ) -> Response:
         """
         Send a `PUT` request.
@@ -1192,6 +1201,7 @@ class Client(BaseClient):
             follow_redirects=follow_redirects,
             timeout=timeout,
             extensions=extensions,
+            form_charset=form_charset,
         )
 
     def patch(
@@ -1209,6 +1219,7 @@ class Client(BaseClient):
         follow_redirects: bool | UseClientDefault = USE_CLIENT_DEFAULT,
         timeout: TimeoutTypes | UseClientDefault = USE_CLIENT_DEFAULT,
         extensions: RequestExtensions | None = None,
+        form_charset: str | None = None,
     ) -> Response:
         """
         Send a `PATCH` request.
@@ -1229,6 +1240,7 @@ class Client(BaseClient):
             follow_redirects=follow_redirects,
             timeout=timeout,
             extensions=extensions,
+            form_charset=form_charset,
         )
 
     def delete(
@@ -1498,6 +1510,7 @@ class AsyncClient(BaseClient):
         follow_redirects: bool | UseClientDefault = USE_CLIENT_DEFAULT,
         timeout: TimeoutTypes | UseClientDefault = USE_CLIENT_DEFAULT,
         extensions: RequestExtensions | None = None,
+        form_charset: str | None = None,
     ) -> Response:
         """
         Build and send a request.
@@ -1536,6 +1549,7 @@ class AsyncClient(BaseClient):
             cookies=cookies,
             timeout=timeout,
             extensions=extensions,
+            form_charset=form_charset,
         )
         return await self.send(request, auth=auth, follow_redirects=follow_redirects)
 
@@ -1556,6 +1570,7 @@ class AsyncClient(BaseClient):
         follow_redirects: bool | UseClientDefault = USE_CLIENT_DEFAULT,
         timeout: TimeoutTypes | UseClientDefault = USE_CLIENT_DEFAULT,
         extensions: RequestExtensions | None = None,
+        form_charset: str | None = None,
     ) -> typing.AsyncIterator[Response]:
         """
         Alternative to `httpx.request()` that streams the response body
@@ -1579,6 +1594,7 @@ class AsyncClient(BaseClient):
             cookies=cookies,
             timeout=timeout,
             extensions=extensions,
+            form_charset=form_charset,
         )
         response = await self.send(
             request=request,
@@ -1850,6 +1866,7 @@ class AsyncClient(BaseClient):
         follow_redirects: bool | UseClientDefault = USE_CLIENT_DEFAULT,
         timeout: TimeoutTypes | UseClientDefault = USE_CLIENT_DEFAULT,
         extensions: RequestExtensions | None = None,
+        form_charset: str | None = None,
     ) -> Response:
         """
         Send a `POST` request.
@@ -1870,6 +1887,7 @@ class AsyncClient(BaseClient):
             follow_redirects=follow_redirects,
             timeout=timeout,
             extensions=extensions,
+            form_charset=form_charset,
         )
 
     async def put(
@@ -1887,6 +1905,7 @@ class AsyncClient(BaseClient):
         follow_redirects: bool | UseClientDefault = USE_CLIENT_DEFAULT,
         timeout: TimeoutTypes | UseClientDefault = USE_CLIENT_DEFAULT,
         extensions: RequestExtensions | None = None,
+        form_charset: str | None = None,
     ) -> Response:
         """
         Send a `PUT` request.
@@ -1907,6 +1926,7 @@ class AsyncClient(BaseClient):
             follow_redirects=follow_redirects,
             timeout=timeout,
             extensions=extensions,
+            form_charset=form_charset,
         )
 
     async def patch(
@@ -1924,6 +1944,7 @@ class AsyncClient(BaseClient):
         follow_redirects: bool | UseClientDefault = USE_CLIENT_DEFAULT,
         timeout: TimeoutTypes | UseClientDefault = USE_CLIENT_DEFAULT,
         extensions: RequestExtensions | None = None,
+        form_charset: str | None = None,
     ) -> Response:
         """
         Send a `PATCH` request.
@@ -1944,6 +1965,7 @@ class AsyncClient(BaseClient):
             follow_redirects=follow_redirects,
             timeout=timeout,
             extensions=extensions,
+            form_charset=form_charset,
         )
 
     async def delete(

@@ -13,6 +13,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 ### Added
 
 * Expose `FunctionAuth` from the public API. (#3699)
+* Add a per-request `form_charset` argument, selecting the charset used to
+  encode `application/x-www-form-urlencoded` bodies, with a matching
+  `Content-Type` header. Form `data` now also accepts ordered sequences of
+  `(key, value)` pairs, preserving duplicate keys.
 
 ## 0.28.1 (6th December, 2024)
 

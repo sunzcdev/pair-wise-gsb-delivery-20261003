@@ -10,7 +10,13 @@ import urllib.request
 from collections.abc import Mapping
 from http.cookiejar import Cookie, CookieJar
 
-from ._content import ByteStream, UnattachedStream, encode_request, encode_response
+from ._content import (
+    ByteStream,
+    UnattachedStream,
+    charsets_match,
+    encode_request,
+    encode_response,
+)
 from ._decoders import (
     SUPPORTED_DECODERS,
     ByteChunker,
@@ -394,6 +400,7 @@ class Request:
         json: typing.Any | None = None,
         stream: SyncByteStream | AsyncByteStream | None = None,
         extensions: RequestExtensions | None = None,
+        form_charset: str | None = None,
     ) -> None:
         self.method = method.upper()
         self.url = URL(url) if params is None else URL(url, params=params)
@@ -405,6 +412,25 @@ class Request:
 
         if stream is None:
             content_type: str | None = self.headers.get("content-type")
+            if (
+                form_charset is not None
+                and content_type is not None
+                and content is None
+                and not files
+                and data
+            ):
+                # URL-encoded form data will be encoded using `form_charset`.
+                # An explicitly provided `Content-Type` header must not
+                # disagree with the charset used for the request body.
+                header_charset = _parse_content_type_charset(content_type)
+                if header_charset is not None and not charsets_match(
+                    header_charset, form_charset
+                ):
+                    raise ValueError(
+                        f"Conflicting charsets: the Content-Type header "
+                        f"specifies charset={header_charset!r}, but "
+                        f"form_charset={form_charset!r} was passed."
+                    )
             headers, stream = encode_request(
                 content=content,
                 data=data,
@@ -415,6 +441,7 @@ class Request:
                     if content_type
                     else None
                 ),
+                form_charset=form_charset,
             )
             self._prepare(headers)
             self.stream = stream

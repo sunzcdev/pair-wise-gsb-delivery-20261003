@@ -169,6 +169,31 @@ Form encoded data can also include multiple values from a given key.
 }
 ```
 
+Ordered key-value pairs are also supported, which preserves the ordering
+of duplicate keys.
+
+```pycon
+>>> data = [('key1', 'value1'), ('key1', 'value2')]
+>>> r = httpx.post("https://httpbin.org/post", data=data)
+```
+
+Form encoded data defaults to UTF-8. If you're working against a legacy
+server that requires a specific charset, use the `form_charset` argument.
+The field names and values are encoded using the given charset, and the
+`Content-Type` header is updated to match.
+
+```pycon
+>>> data = {'key1': '值'}
+>>> r = httpx.post("https://httpbin.org/post", data=data, form_charset="gbk")
+>>> r.request.headers["Content-Type"]
+'application/x-www-form-urlencoded; charset=gbk'
+```
+
+The `form_charset` argument only applies to form-encoded data. Raw
+`content=...` bodies and multipart uploads are not affected by it. If a
+`Content-Type` header with a conflicting charset is passed explicitly,
+an error is raised rather than sending a mismatched request.
+
 ## Sending Multipart File Uploads
 
 You can also upload files, using HTTP multipart encoding:

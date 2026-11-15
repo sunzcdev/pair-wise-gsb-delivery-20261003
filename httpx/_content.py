@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import codecs
 import inspect
 import warnings
 from json import dumps as json_dumps
@@ -11,7 +12,7 @@ from typing import (
     Iterator,
     Mapping,
 )
-from urllib.parse import urlencode
+from urllib.parse import quote_plus, urlencode
 
 from ._exceptions import StreamClosed, StreamConsumed
 from ._multipart import MultipartStream
@@ -133,18 +134,73 @@ def encode_content(
     raise TypeError(f"Unexpected type for 'content', {type(content)!r}")
 
 
+def _is_form_pairs(data: Any) -> bool:
+    """
+    Return `True` if `data` is an ordered sequence of `(key, value)` pairs,
+    rather than a mapping or raw content.
+    """
+    return isinstance(data, (list, tuple)) and all(
+        isinstance(item, (list, tuple)) and len(item) == 2 for item in data
+    )
+
+
+def normalize_form_charset(charset: str) -> str:
+    """
+    Validate a form encoding charset, returning its canonical codec name.
+    """
+    try:
+        return codecs.lookup(charset).name
+    except LookupError:
+        raise ValueError(f"Unknown charset for form encoding: {charset!r}") from None
+
+
+def charsets_match(first: str, second: str) -> bool:
+    """
+    Return `True` if two charset names refer to the same codec.
+    """
+    try:
+        return codecs.lookup(first) == codecs.lookup(second)
+    except LookupError:
+        return first.lower() == second.lower()
+
+
 def encode_urlencoded_data(
-    data: RequestData,
+    data: RequestData, charset: str | None = None
 ) -> tuple[dict[str, str], ByteStream]:
-    plain_data = []
-    for key, value in data.items():
+    plain_data: list[tuple[Any, str]] = []
+    items = data.items() if isinstance(data, Mapping) else data
+    for key, value in items:
         if isinstance(value, (list, tuple)):
-            plain_data.extend([(key, primitive_value_to_str(item)) for item in value])
+            plain_data.extend((key, primitive_value_to_str(item)) for item in value)
         else:
             plain_data.append((key, primitive_value_to_str(value)))
-    body = urlencode(plain_data, doseq=True).encode("utf-8")
+
+    if charset is None:
+        body = urlencode(plain_data, doseq=True).encode("utf-8")
+        content_type = "application/x-www-form-urlencoded"
+    else:
+        charset = normalize_form_charset(charset)
+        encoded_pairs = []
+        for position, (key, value) in enumerate(plain_data):
+            if not isinstance(key, str):
+                key = str(key)
+            try:
+                encoded_key = quote_plus(
+                    key, safe="", encoding=charset, errors="strict"
+                )
+                encoded_value = quote_plus(
+                    value, safe="", encoding=charset, errors="strict"
+                )
+            except UnicodeEncodeError as exc:
+                raise ValueError(
+                    f"Unable to encode form field #{position} (key={key!r}) "
+                    f"using charset {charset!r}: {exc}"
+                ) from None
+            encoded_pairs.append(f"{encoded_key}={encoded_value}")
+        body = "&".join(encoded_pairs).encode("ascii")
+        content_type = f"application/x-www-form-urlencoded; charset={charset}"
+
     content_length = str(len(body))
-    content_type = "application/x-www-form-urlencoded"
     headers = {"Content-Length": content_length, "Content-Type": content_type}
     return headers, ByteStream(body)
 
@@ -189,12 +245,16 @@ def encode_request(
     files: RequestFiles | None = None,
     json: Any | None = None,
     boundary: bytes | None = None,
+    form_charset: str | None = None,
 ) -> tuple[dict[str, str], SyncByteStream | AsyncByteStream]:
     """
     Handles encoding the given `content`, `data`, `files`, and `json`,
     returning a two-tuple of (<headers>, <stream>).
+
+    The `form_charset` switch only applies to URL-encoded form data.
+    Raw `content` bodies and multipart uploads are not affected by it.
     """
-    if data is not None and not isinstance(data, Mapping):
+    if data is not None and not isinstance(data, Mapping) and not _is_form_pairs(data):
         # We prefer to separate `content=<bytes|str|byte iterator|bytes aiterator>`
         # for raw request content, and `data=<form data>` for url encoded or
         # multipart form content.
@@ -209,9 +269,13 @@ def encode_request(
     if content is not None:
         return encode_content(content)
     elif files:
+        if data is not None and not isinstance(data, Mapping):
+            # Multipart forms are keyed. Collapse any ordered
+            # `(key, value)` pairs into a plain mapping.
+            data = dict(data)
         return encode_multipart_data(data or {}, files, boundary)
     elif data:
-        return encode_urlencoded_data(data)
+        return encode_urlencoded_data(data, charset=form_charset)
     elif json is not None:
         return encode_json(json)
 
