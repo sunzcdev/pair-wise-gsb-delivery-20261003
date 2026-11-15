@@ -38,6 +38,10 @@ from .raw_json import RawJSON
 ESCAPE = re.compile(r'[\x00-\x1f\\"]')
 ESCAPE_ASCII = re.compile(r'([\\"]|[^\ -~])')
 HAS_UTF8 = re.compile(r'[\x80-\xff]')
+# Deterministic mode additionally escapes the surrogate code points:
+# an unpaired surrogate has no UTF-8 representation, so it is emitted
+# as a lowercase \uXXXX escape to keep the output well-formed UTF-8.
+ESCAPE_DETERMINISTIC = re.compile(u'[\\x00-\\x1f\\\\"\\ud800-\\udfff]')
 ESCAPE_DCT = {
     '\\': '\\\\',
     '"': '\\"',
@@ -161,6 +165,67 @@ encode_basestring_ascii = (
 encode_basestring = (
     c_encode_basestring or py_encode_basestring)
 
+
+def py_encode_basestring_deterministic(s, _PY3=PY3):
+    """Return the deterministic JSON representation of a string.
+
+    Basic Multilingual Plane characters are emitted literally (the
+    output of deterministic mode is UTF-8 text); only the escapes that
+    JSON mandates are used.  Unpaired surrogates, which have no UTF-8
+    representation, are emitted as lowercase ``\\uXXXX`` escapes so
+    that the output stays well-formed.
+    """
+    if _PY3:
+        if type(s) is not str:
+            # convert an str subclass instance to exact str
+            # raise a TypeError otherwise
+            s = str.__str__(s)
+    else:
+        if isinstance(s, str):
+            # bytes must be UTF-8 in deterministic mode
+            s = unicode(s, 'utf-8')
+        elif type(s) is not unicode:
+            # convert a unicode subclass instance to exact unicode
+            # raise a TypeError otherwise
+            s = unicode.__getnewargs__(s)[0]
+    def replace(match):
+        c = match.group(0)
+        try:
+            return ESCAPE_DCT[c]
+        except KeyError:
+            # an unpaired surrogate
+            return '\\u%04x' % (ord(c),)
+    return u'"' + ESCAPE_DETERMINISTIC.sub(replace, s) + u'"'
+
+
+if PY3:
+    def _utf16_sort_key(s):
+        # Big-endian UTF-16 code units compare in UTF-16 code unit
+        # order; surrogatepass maps each unpaired surrogate to its own
+        # code unit so lone surrogates sort by code unit value too.
+        return s.encode('utf-16-be', 'surrogatepass')
+else:
+    def _utf16_sort_key(s):
+        # List of UTF-16 code units; on narrow builds non-BMP
+        # characters are already stored as a surrogate pair.
+        units = []
+        for c in s:
+            n = ord(c)
+            if n < 0x10000:
+                units.append(n)
+            else:
+                n -= 0x10000
+                units.append(0xd800 | (n >> 10))
+                units.append(0xdc00 | (n & 0x3ff))
+        return units
+
+# Integers with an absolute value up to 2**53 are exactly
+# representable as IEEE 754 doubles; anything larger may round
+# differently across JSON implementations, so deterministic mode
+# rejects it instead of guessing.
+_EXACT_INT_LIMIT = 2 ** 53
+
+
 class JSONEncoder(object):
     """Extensible JSON <http://json.org> encoder for Python data structures.
 
@@ -199,7 +264,8 @@ class JSONEncoder(object):
                  use_decimal=True, namedtuple_as_object=True,
                  tuple_as_array=True, bigint_as_string=False,
                  item_sort_key=None, for_json=False, ignore_nan=False,
-                 int_as_string_bitcount=None, iterable_as_array=False):
+                 int_as_string_bitcount=None, iterable_as_array=False,
+                 deterministic=False):
         """Constructor for JSONEncoder, with sensible defaults.
 
         If skipkeys is false, then it is a TypeError to attempt
@@ -281,7 +347,76 @@ class JSONEncoder(object):
         as ``null`` in compliance with the ECMA-262 specification. If true,
         this will override *allow_nan*.
 
+        If *deterministic* is true (default: ``False``), the encoder
+        produces a canonical JSON digest: object keys are sorted by
+        UTF-16 code unit order, the output is compact UTF-8 text with
+        no insignificant whitespace, only string keys and finite JSON
+        numbers are accepted, and objects that cannot satisfy this
+        contract are rejected with ``TypeError`` instead of being
+        passed to ``default()``. The deterministic configuration is
+        fixed, so it conflicts with (and refuses to be silently
+        overridden by) *sort_keys*, *item_sort_key*, *indent*,
+        *separators*, *default*, *skipkeys*, *allow_nan*, *ignore_nan*,
+        *for_json*, *bigint_as_string*, *int_as_string_bitcount*,
+        *iterable_as_array*, and non-UTF-8 *encoding*; it also requires
+        *ensure_ascii=False* to be passed explicitly. Combining
+        ``deterministic=True`` with any of those raises ``TypeError``.
+
         """
+
+        if deterministic:
+            # The deterministic configuration fixes the key order,
+            # separators, and number formatting itself. Any option that
+            # would change (or appear to change) those decisions is a
+            # hard error rather than a silent override, so that a
+            # digest never depends on which option "won".
+            conflicts = []
+            if skipkeys:
+                conflicts.append('skipkeys')
+            if ensure_ascii:
+                conflicts.append('ensure_ascii')
+            if allow_nan:
+                conflicts.append('allow_nan')
+            if ignore_nan:
+                conflicts.append('ignore_nan')
+            if sort_keys:
+                conflicts.append('sort_keys')
+            if item_sort_key is not None:
+                conflicts.append('item_sort_key')
+            if indent is not None:
+                conflicts.append('indent')
+            if separators is not None:
+                conflicts.append('separators')
+            if default is not None:
+                conflicts.append('default')
+            if for_json:
+                conflicts.append('for_json')
+            if bigint_as_string:
+                conflicts.append('bigint_as_string')
+            if int_as_string_bitcount is not None:
+                conflicts.append('int_as_string_bitcount')
+            if iterable_as_array:
+                conflicts.append('iterable_as_array')
+            if not tuple_as_array:
+                conflicts.append('tuple_as_array')
+            if not namedtuple_as_object:
+                conflicts.append('namedtuple_as_object')
+            if encoding not in (None, 'utf-8'):
+                conflicts.append('encoding')
+            if conflicts:
+                raise TypeError(
+                    'deterministic=True does not allow the conflicting '
+                    'option(s): %s. The deterministic configuration fixes '
+                    'key order (UTF-16 code unit order), separators, and '
+                    'number formatting itself; remove the conflicting '
+                    'options instead of overriding them. Note that '
+                    'deterministic output is UTF-8 text, so '
+                    'ensure_ascii=False must be passed explicitly.'
+                    % (', '.join(conflicts),))
+            # Normalize the fixed settings so that introspection of the
+            # encoder reflects what deterministic mode actually does.
+            self.item_separator, self.key_separator = (',', ':')
+        self.deterministic = deterministic
 
         self.skipkeys = skipkeys
         self.ensure_ascii = ensure_ascii
@@ -337,6 +472,8 @@ class JSONEncoder(object):
         '{"foo": ["bar", "baz"]}'
 
         """
+        if self.deterministic:
+            return u''.join(self.iterencode(o))
         # This is for extremely simple cases and benchmarks.
         if isinstance(o, binary_type):
             _encoding = self.encoding
@@ -372,6 +509,10 @@ class JSONEncoder(object):
             markers = {}
         else:
             markers = None
+        if self.deterministic:
+            _iterencode = _make_deterministic_iterencode(
+                markers, self.use_decimal, Decimal=decimal.Decimal)
+            return _iterencode(o)
         if self.ensure_ascii:
             _encoder = encode_basestring_ascii
         else:
@@ -863,5 +1004,177 @@ def _make_iterencode(markers, _default, _encoder, _indent, _floatstr,
                         raise
                     if markers is not None:
                         del markers[markerid]
+
+    return _iterencode
+
+
+def _make_deterministic_iterencode(markers, _use_decimal,
+        ## HACK: hand-optimized bytecode; turn globals into locals
+        _PY3=PY3,
+        ValueError=ValueError,
+        TypeError=TypeError,
+        string_types=string_types,
+        integer_types=integer_types,
+        _dict_types=_dict_types,
+        isinstance=isinstance,
+        float=float,
+        id=id,
+        Decimal=None,
+    ):
+    """Return an encoder for the restricted deterministic configuration.
+
+    The output is compact UTF-8 JSON text: object keys are sorted by
+    UTF-16 code unit order, separators are fixed to (',', ':'), only
+    string keys and finite JSON numbers are accepted, and there is no
+    default()/for_json/RawJSON fallback -- anything outside the
+    contract raises TypeError (or ValueError for out-of-range numbers).
+    """
+    if _use_decimal and Decimal is None:
+        Decimal = decimal.Decimal
+    elif not _use_decimal:
+        Decimal = None
+
+    _encode_string = py_encode_basestring_deterministic
+
+    def _encode_float(value):
+        if type(value) is not float:
+            # See #118, do not trust custom str/repr
+            value = float(value)
+        if value != value or value == _INFINITY or value == -_INFINITY:
+            raise ValueError(
+                "Out of range float values are not JSON compliant "
+                "in deterministic mode: " + repr(value))
+        if value == 0:
+            # IEEE 754 negative zero digests identically to zero.
+            return '0'
+        return FLOAT_REPR(value)
+
+    def _encode_int(value):
+        if type(value) not in integer_types:
+            # See #118, do not trust custom str/repr
+            value = int(value)
+        if not -_EXACT_INT_LIMIT <= value <= _EXACT_INT_LIMIT:
+            raise ValueError(
+                "Integer values outside the exactly representable "
+                "IEEE 754 range (-2**53..2**53) are not deterministic: "
+                + repr(value))
+        return str(value)
+
+    def _encode_decimal_value(value):
+        if not value.is_finite():
+            raise ValueError(
+                "Out of range Decimal values are not JSON compliant "
+                "in deterministic mode: " + repr(value))
+        # str() of a finite Decimal is always a valid JSON number;
+        # the representation (including a signed zero) is preserved.
+        return str(value)
+
+    def _iterencode_list(lst):
+        if not lst:
+            yield '[]'
+            return
+        if markers is not None:
+            markerid = id(lst)
+            if markerid in markers:
+                raise ValueError("Circular reference detected")
+            markers[markerid] = lst
+        try:
+            first = True
+            for i, value in enumerate(lst):
+                if first:
+                    first = False
+                    yield '['
+                else:
+                    yield ','
+                try:
+                    for chunk in _iterencode(value):
+                        yield chunk
+                except BaseException as exc:
+                    _annotate_exception(
+                        exc, 'when serializing %s item %d',
+                        lst, i)
+                    raise
+            yield ']'
+        finally:
+            if markers is not None:
+                markers.pop(markerid, None)
+
+    def _iterencode_dict(dct):
+        if not dct:
+            yield '{}'
+            return
+        if markers is not None:
+            markerid = id(dct)
+            if markerid in markers:
+                raise ValueError("Circular reference detected")
+            markers[markerid] = dct
+        try:
+            items = []
+            for key, value in dct.items():
+                if not isinstance(key, string_types):
+                    raise TypeError(
+                        'keys must be str in deterministic mode, '
+                        'not %s' % key.__class__.__name__)
+                if not _PY3 and isinstance(key, str):
+                    # bytes keys must be UTF-8 in deterministic mode
+                    key = unicode(key, 'utf-8')
+                items.append((_utf16_sort_key(key), key, value))
+            # Sort by UTF-16 code units, not by code point: the two
+            # differ whenever a key outside the BMP is compared with
+            # a BMP key at or above U+E000.
+            items.sort(key=itemgetter(0))
+            first = True
+            for _sort_key, key, value in items:
+                if first:
+                    first = False
+                    yield '{'
+                else:
+                    yield ','
+                yield _encode_string(key)
+                yield ':'
+                try:
+                    for chunk in _iterencode(value):
+                        yield chunk
+                except BaseException as exc:
+                    _annotate_exception(
+                        exc, 'when serializing %s item %r',
+                        dct, key)
+                    raise
+            yield '}'
+        finally:
+            if markers is not None:
+                markers.pop(markerid, None)
+
+    def _iterencode(o):
+        if isinstance(o, string_types):
+            yield _encode_string(o)
+        elif o is None:
+            yield 'null'
+        elif o is True:
+            yield 'true'
+        elif o is False:
+            yield 'false'
+        elif isinstance(o, integer_types):
+            yield _encode_int(o)
+        elif isinstance(o, float):
+            yield _encode_float(o)
+        elif Decimal is not None and isinstance(o, Decimal):
+            yield _encode_decimal_value(o)
+        elif isinstance(o, list):
+            for chunk in _iterencode_list(o):
+                yield chunk
+        elif isinstance(o, tuple):
+            for chunk in _iterencode_list(o):
+                yield chunk
+        elif isinstance(o, _dict_types):
+            for chunk in _iterencode_dict(o):
+                yield chunk
+        else:
+            # No default(), for_json(), _asdict(), iterable, or RawJSON
+            # fallback: a custom object that cannot satisfy the
+            # deterministic contract is rejected outright.
+            raise TypeError(
+                'Object of type %s is not JSON serializable in '
+                'deterministic mode' % o.__class__.__name__)
 
     return _iterencode

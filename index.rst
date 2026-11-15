@@ -53,6 +53,41 @@ Compact encoding::
     >>> json.dumps(obj, separators=(',', ':'), sort_keys=True)
     '[1,2,3,{"4":5,"6":7}]'
 
+Deterministic encoding for digests (e.g. when two collector programs
+written in different languages must hash identical JSON text)::
+
+    >>> import simplejson as json
+    >>> obj = {'b': [1, -0.0], 'a': None}
+    >>> json.dumps(obj, deterministic=True, ensure_ascii=False)
+    '{"a":null,"b":[1,0]}'
+
+Unlike ``sort_keys``, which compares keys by code point, deterministic
+mode sorts object keys by UTF-16 code unit order. The two orders differ
+whenever a key outside the Basic Multilingual Plane is compared with a
+BMP key at or above U+E000::
+
+    >>> obj = {'\U0001F600': 1, '\uE000': 2}
+    >>> json.dumps(obj, sort_keys=True, ensure_ascii=False, separators=(',', ':')) == u'{"\uE000":2,"\U0001F600":1}'
+    True
+    >>> json.dumps(obj, deterministic=True, ensure_ascii=False) == u'{"\U0001F600":1,"\uE000":2}'
+    True
+
+The deterministic configuration is restricted so that the output depends
+only on the input value: keys must be strings, numbers must be finite
+(integers are limited to the exactly representable IEEE 754 range
+-2**53..2**53, and negative zero is serialized as ``0``), unpaired
+surrogates are escaped since they have no UTF-8 representation, and
+custom objects are rejected with ``TypeError`` instead of being passed
+to ``default()``. Options that would change the output -- such as
+``sort_keys``, ``item_sort_key``, ``indent`` or ``separators`` -- raise
+``TypeError`` when combined with ``deterministic=True`` rather than
+silently overriding the canonical form::
+
+    >>> json.dumps({'a': 1}, deterministic=True, sort_keys=True)
+    Traceback (most recent call last):
+    ...
+    TypeError: deterministic=True does not allow the conflicting option(s): ensure_ascii, sort_keys. The deterministic configuration fixes key order (UTF-16 code unit order), separators, and number formatting itself; remove the conflicting options instead of overriding them. Note that deterministic output is UTF-8 text, so ensure_ascii=False must be passed explicitly.
+
 Pretty printing::
 
     >>> import simplejson as json
@@ -159,7 +194,8 @@ Basic Usage
                    namedtuple_as_object=True, tuple_as_array=True, \
                    bigint_as_string=False, sort_keys=False, \
                    item_sort_key=None, for_json=None, ignore_nan=False, \
-                   int_as_string_bitcount=None, iterable_as_array=False, **kw)
+                   int_as_string_bitcount=None, iterable_as_array=False, \
+                   deterministic=False, **kw)
 
     Serialize *obj* as a JSON formatted stream to *fp*
     (a ``.write()``-supporting file-like object) using this
@@ -190,7 +226,8 @@ Basic Usage
                     namedtuple_as_object=True, tuple_as_array=True, \
                     bigint_as_string=False, sort_keys=False, \
                     item_sort_key=None, for_json=None, ignore_nan=False, \
-                    int_as_string_bitcount=None, iterable_as_array=False, **kw)
+                    int_as_string_bitcount=None, iterable_as_array=False, \
+                   deterministic=False, **kw)
 
     Serialize *obj* to a JSON formatted :class:`str`.
 
@@ -317,6 +354,27 @@ Basic Usage
     boundary.
 
     See also *bigint_as_string* (which is equivalent to `int_as_string_bitcount=53`).
+
+    If *deterministic* is true (default: ``False``), the output is a
+    canonical JSON digest suitable for byte-identical comparison across
+    implementations: object keys are sorted by UTF-16 code unit order
+    (not code point order, as with *sort_keys*), the output is compact
+    UTF-8 text with fixed ``(',', ':')`` separators, only string keys
+    and finite JSON numbers are accepted, and custom objects are
+    rejected with :exc:`TypeError` instead of being passed to
+    *default*. Integers are limited to the exactly representable
+    IEEE 754 range ``-2**53..2**53``, negative zero is serialized as
+    ``0``, and unpaired surrogates are escaped since they have no
+    UTF-8 representation. *deterministic* requires
+    ``ensure_ascii=False`` and raises :exc:`TypeError` when combined
+    with conflicting options (*sort_keys*, *item_sort_key*, *indent*,
+    *separators*, *skipkeys*, *allow_nan*, *ignore_nan*, *default*,
+    *for_json*, *bigint_as_string*, *int_as_string_bitcount*,
+    *iterable_as_array*, or a non-UTF-8 *encoding*) rather than letting
+    them silently override the canonical form.
+
+    .. versionadded:: 4.4.0
+        *deterministic* is new in 4.4.0.
 
     .. note::
 
@@ -577,7 +635,8 @@ Encoders and decoders
                        namedtuple_as_object=True, tuple_as_array=True, \
                        bigint_as_string=False, item_sort_key=None, \
                        for_json=True, ignore_nan=False, \
-                       int_as_string_bitcount=None, iterable_as_array=False)
+                       int_as_string_bitcount=None, iterable_as_array=False, \
+                       deterministic=False)
 
    Extensible JSON encoder for Python data structures.
 
@@ -712,6 +771,18 @@ Encoders and decoders
    :class:`float` values (``nan``, ``inf``, ``-inf``) will be serialized as
    ``null`` in compliance with the ECMA-262 specification. If true, this will
    override *allow_nan*.
+
+   If *deterministic* is true (default: ``False``), the encoder produces a
+   canonical JSON digest: object keys are sorted by UTF-16 code unit order,
+   the output is compact UTF-8 text, only string keys and finite JSON
+   numbers are accepted, and custom objects are rejected with
+   :exc:`TypeError` instead of being passed to :meth:`default`. See
+   :func:`dumps` for the full contract and the list of conflicting options
+   that raise :exc:`TypeError` rather than silently overriding the
+   canonical form.
+
+   .. versionadded:: 4.4.0
+       *deterministic* is new in 4.4.0.
 
    .. method:: default(o)
 

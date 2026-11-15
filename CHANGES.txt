@@ -1,3 +1,17 @@
+Version 4.4.0 released 2026-11-15
+
+* New restricted ``deterministic=True`` encoding configuration for
+  ``dumps()``, ``dump()`` and ``JSONEncoder``: object keys are sorted
+  by UTF-16 code unit order (unlike ``sort_keys``, which uses code
+  point order), the output is compact UTF-8 text, only string keys and
+  finite JSON numbers are accepted, and custom objects are rejected
+  with ``TypeError`` instead of falling back to ``default()``.
+  Unpaired surrogates are escaped (they have no UTF-8 representation),
+  negative zero is serialized as ``0``, integers are limited to the
+  exactly representable IEEE 754 range -2**53..2**53, and conflicting
+  options such as ``sort_keys`` or ``item_sort_key`` raise
+  ``TypeError`` instead of silently overriding the canonical form
+
 Version 4.3.0 released 2026-11-10
 
 * The C encoder no longer crashes when ``default()`` or ``for_json()``
