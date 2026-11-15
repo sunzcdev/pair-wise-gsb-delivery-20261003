@@ -20,7 +20,7 @@ from itertools import zip_longest
 
 from marshmallow import class_registry, types
 from marshmallow import fields as ma_fields
-from marshmallow.constants import EXCLUDE, INCLUDE, RAISE, missing
+from marshmallow.constants import COLLECT, EXCLUDE, INCLUDE, RAISE, missing
 from marshmallow.decorators import (
     POST_DUMP,
     POST_LOAD,
@@ -218,6 +218,10 @@ class SchemaOpts:
         self.load_only = getattr(meta, "load_only", ())
         self.dump_only = getattr(meta, "dump_only", ())
         self.unknown = getattr(meta, "unknown", RAISE)
+        self.unknown_collect_field = getattr(meta, "unknown_collect_field", None)
+        self.unknown_collect_conflict = getattr(
+            meta, "unknown_collect_conflict", "reject"
+        )
         self.register = getattr(meta, "register", True)
         self.many = getattr(meta, "many", False)
 
@@ -267,13 +271,22 @@ class Schema(metaclass=SchemaMeta):
         its value is an iterable, only missing fields listed in that iterable
         will be ignored. Use dot delimiters to specify nested fields.
     :param unknown: Whether to exclude, include, or raise an error for unknown
-        fields in the data. Use `EXCLUDE`, `INCLUDE` or `RAISE`.
+        fields in the data. Use `EXCLUDE`, `INCLUDE`, `RAISE` or `COLLECT`.
+    :param unknown_collect_field: Name of the output key that receives a
+        mapping of unknown input keys to their (raw) values when
+        ``unknown=COLLECT`` is used. Must not collide with any declared
+        field name, ``attribute`` or ``data_key``. If `None`, the value of
+        the `unknown_collect_field <marshmallow.Schema.Meta.unknown_collect_field>`
+        `Meta <marshmallow.Schema.Meta>` option is used.
 
     .. versionchanged:: 3.0.0
         Remove ``prefix`` parameter.
 
     .. versionchanged:: 4.0.0
         Remove ``context`` parameter.
+
+    .. versionadded:: 4.5.0
+        Add ``unknown_collect_field`` parameter and ``COLLECT`` unknown option.
     """
 
     TYPE_MAPPING: dict[type, type[Field]] = {
@@ -302,6 +315,8 @@ class Schema(metaclass=SchemaMeta):
     _default_error_messages: dict[str, str] = {
         "type": "Invalid input type.",
         "unknown": "Unknown field.",
+        "unknown_collect_reserved": "Reserved field.",
+        "unknown_collect_type": "Invalid input type.",
     }
 
     OPTIONS_CLASS: type = SchemaOpts
@@ -396,7 +411,29 @@ class Schema(metaclass=SchemaMeta):
         """Fields to exclude from deserialized results"""
         unknown: typing.ClassVar[types.UnknownOption]
         """Whether to exclude, include, or raise an error for unknown fields in the data.
-        Use `EXCLUDE`, `INCLUDE` or `RAISE`.
+        Use `EXCLUDE`, `INCLUDE`, `RAISE` or `COLLECT`.
+
+        .. versionadded:: 4.5.0 Add `COLLECT` option.
+        """
+        unknown_collect_field: typing.ClassVar[str | None]
+        """Name of the output key that receives a mapping of unknown input keys
+        to their raw values when ``unknown=COLLECT`` is used. Required when
+        ``unknown=COLLECT``. Must not collide with any declared field name,
+        ``attribute`` or ``data_key``.
+
+        .. versionadded:: 4.5.0
+        """
+        unknown_collect_conflict: typing.ClassVar[typing.Literal["reject", "merge"]]
+        """How to handle input data that explicitly contains the
+        `unknown_collect_field <marshmallow.Schema.Meta.unknown_collect_field>` key
+        when ``unknown=COLLECT`` is used. One of:
+
+        - ``"reject"`` (default): store a validation error for the reserved key.
+        - ``"merge"``: the explicit value must be a mapping; its entries are
+          merged into the collected mapping. Collected unknown keys take
+          precedence over explicitly provided ones on key collisions.
+
+        .. versionadded:: 4.5.0
         """
         register: typing.ClassVar[bool]
         """Whether to register the `Schema <marshmallow.Schema>` with marshmallow's internal
@@ -415,6 +452,7 @@ class Schema(metaclass=SchemaMeta):
         dump_only: types.StrSequenceOrSet = (),
         partial: bool | types.StrSequenceOrSet | None = None,
         unknown: types.UnknownOption | None = None,
+        unknown_collect_field: str | None = None,
     ):
         # Raise error if only or exclude is passed as string, not list of strings
         if only is not None and not is_collection(only):
@@ -434,18 +472,56 @@ class Schema(metaclass=SchemaMeta):
         self.unknown: types.UnknownOption = (
             self.opts.unknown if unknown is None else unknown
         )
+        self.unknown_collect_field: str | None = (
+            self.opts.unknown_collect_field
+            if unknown_collect_field is None
+            else unknown_collect_field
+        )
+        self.unknown_collect_conflict: str = self.opts.unknown_collect_conflict
         self._normalize_nested_options()
         #: Dictionary mapping field_names -> :class:`Field` objects
         self.fields: dict[str, Field] = {}
         self.load_fields: dict[str, Field] = {}
         self.dump_fields: dict[str, Field] = {}
         self._init_fields()
+        if self.unknown == COLLECT:
+            self._validate_unknown_collect()
         messages = {}
         messages.update(self._default_error_messages)
         for cls in reversed(self.__class__.__mro__):
             messages.update(getattr(cls, "error_messages", {}))
         messages.update(self.error_messages or {})
         self.error_messages = messages
+
+    def _validate_unknown_collect(self) -> None:
+        """Validate the ``unknown_collect_*`` options.
+
+        Called when ``unknown=COLLECT`` is in effect, either at instantiation
+        time or when passed to `load <marshmallow.Schema.load>`.
+        This method is private API.
+        """
+        collect_field = self.unknown_collect_field
+        if not collect_field:
+            raise ValueError(
+                "`unknown_collect_field` must be set when `unknown` is `COLLECT`."
+            )
+        if self.unknown_collect_conflict not in ("reject", "merge"):
+            raise ValueError(
+                "`unknown_collect_conflict` must be one of 'reject' or 'merge', "
+                f"not {self.unknown_collect_conflict!r}."
+            )
+        reserved = set()
+        for attr_name, field_obj in self.fields.items():
+            reserved.add(attr_name)
+            if field_obj.attribute is not None:
+                reserved.add(field_obj.attribute)
+            if field_obj.data_key is not None:
+                reserved.add(field_obj.data_key)
+        if collect_field in reserved:
+            raise ValueError(
+                f"`unknown_collect_field` {collect_field!r} conflicts with a "
+                "declared field name, `attribute` or `data_key`."
+            )
 
     def __repr__(self) -> str:
         return f"<{self.__class__.__name__}(many={self.many})>"
@@ -614,7 +690,7 @@ class Schema(metaclass=SchemaMeta):
             its value is an iterable, only missing fields listed in that iterable
             will be ignored. Use dot delimiters to specify nested fields.
         :param unknown: Whether to exclude, include, or raise an error for unknown
-            fields in the data. Use `EXCLUDE`, `INCLUDE` or `RAISE`.
+            fields in the data. Use `EXCLUDE`, `INCLUDE`, `RAISE` or `COLLECT`.
         :param index: Index of the item being deserialized (for storing errors) if
             deserializing a collection, otherwise `None`.
         :return: The deserialized data as `dict_class` instance or list of `dict_class`
@@ -692,16 +768,47 @@ class Schema(metaclass=SchemaMeta):
                     field_obj.data_key if field_obj.data_key is not None else field_name
                     for field_name, field_obj in self.load_fields.items()
                 }
-                for key in set(data) - fields:
-                    value = data[key]
-                    if unknown == INCLUDE:
-                        ret_d[key] = value
-                    elif unknown == RAISE:
-                        error_store.store_error(
-                            [self.error_messages["unknown"]],
-                            key,
-                            index,
-                        )
+                if unknown == COLLECT:
+                    collect_field = typing.cast("str", self.unknown_collect_field)
+                    explicit = data.get(collect_field, missing)
+                    extras = {}
+                    if explicit is not missing:
+                        if (
+                            self.unknown_collect_conflict == "merge"
+                            and isinstance(explicit, Mapping)
+                        ):
+                            # Merged first so collected unknown keys take
+                            # precedence on collisions.
+                            extras.update(copy.deepcopy(dict(explicit)))
+                        elif self.unknown_collect_conflict == "merge":
+                            error_store.store_error(
+                                [self.error_messages["unknown_collect_type"]],
+                                collect_field,
+                                index,
+                            )
+                        else:
+                            error_store.store_error(
+                                [self.error_messages["unknown_collect_reserved"]],
+                                collect_field,
+                                index,
+                            )
+                    for key in set(data) - fields - {collect_field}:
+                        # Deep-copy so the returned mapping shares no mutable
+                        # containers with the input data.
+                        extras[key] = copy.deepcopy(data[key])
+                    if extras:
+                        ret_d[collect_field] = extras
+                else:
+                    for key in set(data) - fields:
+                        value = data[key]
+                        if unknown == INCLUDE:
+                            ret_d[key] = value
+                        elif unknown == RAISE:
+                            error_store.store_error(
+                                [self.error_messages["unknown"]],
+                                key,
+                                index,
+                            )
         return ret_d
 
     def load(
@@ -722,7 +829,7 @@ class Schema(metaclass=SchemaMeta):
             its value is an iterable, only missing fields listed in that iterable
             will be ignored. Use dot delimiters to specify nested fields.
         :param unknown: Whether to exclude, include, or raise an error for unknown
-            fields in the data. Use `EXCLUDE`, `INCLUDE` or `RAISE`.
+            fields in the data. Use `EXCLUDE`, `INCLUDE`, `RAISE` or `COLLECT`.
             If `None`, the value for `self.unknown` is used.
         :return: Deserialized data
 
@@ -756,7 +863,7 @@ class Schema(metaclass=SchemaMeta):
             its value is an iterable, only missing fields listed in that iterable
             will be ignored. Use dot delimiters to specify nested fields.
         :param unknown: Whether to exclude, include, or raise an error for unknown
-            fields in the data. Use `EXCLUDE`, `INCLUDE` or `RAISE`.
+            fields in the data. Use `EXCLUDE`, `INCLUDE`, `RAISE` or `COLLECT`.
             If `None`, the value for `self.unknown` is used.
         :return: Deserialized data
 
@@ -859,7 +966,7 @@ class Schema(metaclass=SchemaMeta):
             will be allowed missing. If `True`, all fields will be allowed missing.
             If `None`, the value for `self.partial` is used.
         :param unknown: Whether to exclude, include, or raise an error for unknown
-            fields in the data. Use `EXCLUDE`, `INCLUDE` or `RAISE`.
+            fields in the data. Use `EXCLUDE`, `INCLUDE`, `RAISE` or `COLLECT`.
             If `None`, the value for `self.unknown` is used.
         :param postprocess: Whether to run post_load methods.
         :return: Deserialized data
@@ -868,6 +975,8 @@ class Schema(metaclass=SchemaMeta):
         errors: dict[str, list[str]] = {}
         many = self.many if many is None else bool(many)
         unknown = self.unknown if unknown is None else unknown
+        if unknown == COLLECT:
+            self._validate_unknown_collect()
         if partial is None:
             partial = self.partial
         # Run preprocessors

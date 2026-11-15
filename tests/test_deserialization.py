@@ -10,6 +10,7 @@ from unittest.mock import patch
 import pytest
 
 from marshmallow import (
+    COLLECT,
     EXCLUDE,
     INCLUDE,
     RAISE,
@@ -2116,6 +2117,185 @@ class TestSchemaDeserialization:
         # but extra keys included via unknown=INCLUDE are not transformed into nested dicts
         data = MySchema().load({"foo": "hi", "bar.baz": "okay", "alpha.beta": "woah!"})
         assert data == {"foo": "hi", "bar": "okay", "alpha.beta": "woah!"}
+
+
+class TestUnknownCollect:
+    class MySchema(Schema):
+        foo = fields.Integer()
+
+        class Meta:
+            unknown = COLLECT
+            unknown_collect_field = "_extras"
+
+    def test_collect_unknown_fields(self):
+        data = self.MySchema().load({"foo": 3, "bar": 5, "baz": "qux"})
+        assert data == {"foo": 3, "_extras": {"bar": 5, "baz": "qux"}}
+
+    def test_collect_no_unknown_fields(self):
+        data = self.MySchema().load({"foo": 3})
+        assert data == {"foo": 3}
+        assert "_extras" not in data
+
+    def test_collect_field_via_constructor(self):
+        class MySchema(Schema):
+            foo = fields.Integer()
+
+            class Meta:
+                unknown = COLLECT
+
+        schema = MySchema(unknown_collect_field="_extras")
+        assert schema.load({"foo": 1, "bar": 2}) == {"foo": 1, "_extras": {"bar": 2}}
+
+    def test_collect_via_load_argument(self):
+        class MySchema(Schema):
+            foo = fields.Integer()
+
+        schema = MySchema(unknown_collect_field="_extras")
+        data = schema.load({"foo": 1, "bar": 2}, unknown=COLLECT)
+        assert data == {"foo": 1, "_extras": {"bar": 2}}
+        # default behavior is unchanged
+        with pytest.raises(ValidationError):
+            schema.load({"foo": 1, "bar": 2})
+
+    def test_collect_requires_collect_field(self):
+        class MySchema(Schema):
+            foo = fields.Integer()
+
+        with pytest.raises(ValueError, match="unknown_collect_field"):
+            MySchema(unknown=COLLECT)
+
+        with pytest.raises(ValueError, match="unknown_collect_field"):
+            MySchema().load({"foo": 1}, unknown=COLLECT)
+
+    def test_collect_invalid_conflict_option(self):
+        class MySchema(Schema):
+            foo = fields.Integer()
+
+            class Meta:
+                unknown = COLLECT
+                unknown_collect_field = "_extras"
+                unknown_collect_conflict = "bogus"
+
+        with pytest.raises(ValueError, match="unknown_collect_conflict"):
+            MySchema()
+
+    @pytest.mark.parametrize(
+        "declared",
+        (
+            {"_extras": fields.Integer()},
+            {"foo": fields.Integer(data_key="_extras")},
+            {"foo": fields.Integer(attribute="_extras")},
+        ),
+    )
+    def test_collect_field_conflicts_with_declared_fields(self, declared):
+        class MySchema(Schema):
+            class Meta:
+                unknown = COLLECT
+                unknown_collect_field = "_extras"
+
+        MySchema._declared_fields = dict(declared)
+
+        with pytest.raises(ValueError, match="conflicts"):
+            MySchema()
+
+    def test_collect_explicit_field_rejected_by_default(self):
+        with pytest.raises(ValidationError) as excinfo:
+            self.MySchema().load({"foo": 1, "_extras": {"bar": 2}, "baz": 3})
+        err = excinfo.value
+        assert err.messages["_extras"] == ["Reserved field."]
+        # other unknown fields are still collected in the valid data
+        assert err.valid_data == {"foo": 1, "_extras": {"baz": 3}}
+
+    def test_collect_explicit_field_merged(self):
+        class MySchema(Schema):
+            foo = fields.Integer()
+
+            class Meta:
+                unknown = COLLECT
+                unknown_collect_field = "_extras"
+                unknown_collect_conflict = "merge"
+
+        data = MySchema().load({"foo": 1, "_extras": {"bar": 2}, "baz": 3})
+        assert data == {"foo": 1, "_extras": {"bar": 2, "baz": 3}}
+
+        # collected unknown keys take precedence on collisions
+        data = MySchema().load({"foo": 1, "_extras": {"baz": 2}, "baz": 3})
+        assert data == {"foo": 1, "_extras": {"baz": 3}}
+
+        # explicit value must be a mapping
+        with pytest.raises(ValidationError) as excinfo:
+            MySchema().load({"foo": 1, "_extras": "nope"})
+        assert excinfo.value.messages["_extras"] == ["Invalid input type."]
+
+    def test_collect_preserves_source_names_with_data_key(self):
+        class MySchema(Schema):
+            foo = fields.Integer(data_key="Foo")
+
+            class Meta:
+                unknown = COLLECT
+                unknown_collect_field = "_extras"
+
+        data = MySchema().load({"Foo": 1, "foo": 2})
+        assert data == {"foo": 1, "_extras": {"foo": 2}}
+
+    def test_collect_load_only_and_dump_only(self):
+        class MySchema(Schema):
+            write_only = fields.Integer(load_only=True)
+            read_only = fields.Integer(dump_only=True)
+
+            class Meta:
+                unknown = COLLECT
+                unknown_collect_field = "_extras"
+
+        # load_only fields are known; dump_only fields are collected as unknown
+        data = MySchema().load({"write_only": 1, "read_only": 2})
+        assert data == {"write_only": 1, "_extras": {"read_only": 2}}
+
+    def test_collect_nested_per_level(self):
+        class InnerSchema(Schema):
+            foo = fields.Integer()
+
+            class Meta:
+                unknown = COLLECT
+                unknown_collect_field = "_extras"
+
+        class OuterSchema(Schema):
+            inner = fields.Nested(InnerSchema)
+            bar = fields.Integer()
+
+            class Meta:
+                unknown = COLLECT
+                unknown_collect_field = "_extras"
+
+        data = OuterSchema().load(
+            {
+                "bar": 1,
+                "outer_unknown": 2,
+                "inner": {"foo": 3, "inner_unknown": 4},
+            }
+        )
+        assert data == {
+            "bar": 1,
+            "inner": {"foo": 3, "_extras": {"inner_unknown": 4}},
+            "_extras": {"outer_unknown": 2},
+        }
+
+    def test_collect_many(self):
+        data = self.MySchema(many=True).load([{"foo": 1}, {"foo": 2, "bar": 3}])
+        assert data == [{"foo": 1}, {"foo": 2, "_extras": {"bar": 3}}]
+
+    def test_collect_does_not_share_mutable_containers_with_input(self):
+        src = {"foo": 1, "items": [1, 2], "mapping": {"key": "value"}}
+        data = self.MySchema().load(src)
+        assert data["_extras"] == {"items": [1, 2], "mapping": {"key": "value"}}
+
+        data["_extras"]["items"].append(3)
+        data["_extras"]["mapping"]["key"] = "changed"
+        assert src == {"foo": 1, "items": [1, 2], "mapping": {"key": "value"}}
+
+    def test_collect_does_not_unpack_dotted_names(self):
+        data = self.MySchema().load({"foo": 1, "alpha.beta": "woah!"})
+        assert data == {"foo": 1, "_extras": {"alpha.beta": "woah!"}}
 
 
 validators_gen = (

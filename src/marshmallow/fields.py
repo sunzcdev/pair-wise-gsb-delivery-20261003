@@ -513,7 +513,7 @@ class Nested(Field):
         If `None` (default), and `Schema` subclass is provided, schema instance sets ``many`` as False.
         If `True | False`, nested `[nested_field].schema.many` is overridden.
     :param unknown: Whether to exclude, include, or raise an error for unknown
-        fields in the data. Use `EXCLUDE`, `INCLUDE` or `RAISE`.
+        fields in the data. Use `EXCLUDE`, `INCLUDE`, `RAISE` or `COLLECT`.
     :param kwargs: The same keyword arguments that :class:`Field` receives.
     """
 

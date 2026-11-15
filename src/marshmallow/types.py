@@ -24,7 +24,9 @@ ErrorMessageValue: typing.TypeAlias = str | list | dict
 ErrorMessages: typing.TypeAlias = dict[str, ErrorMessageValue]
 
 #: A valid option for the ``unknown`` schema option and argument
-UnknownOption: typing.TypeAlias = typing.Literal["exclude", "include", "raise"]
+UnknownOption: typing.TypeAlias = typing.Literal[
+    "exclude", "include", "raise", "collect"
+]
 
 #: Type for field-level pre-load functions
 PreLoadCallable = typing.Callable[[typing.Any], typing.Any]

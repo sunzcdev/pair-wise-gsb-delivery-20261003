@@ -33,3 +33,11 @@ Constants for ``unknown``
 
    Indicates that fields that are not explicitly declared on a schema should
    result in an error.
+
+.. data:: COLLECT
+
+   Indicates that fields that are not explicitly declared on a schema should
+   be collected, with their original key names, into a mapping stored under
+   the key named by the ``unknown_collect_field`` option.
+
+   .. versionadded:: 4.5.0

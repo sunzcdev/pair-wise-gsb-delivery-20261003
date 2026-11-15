@@ -1,6 +1,18 @@
 Changelog
 =========
 
+4.5.0 (unreleased)
+------------------
+
+Features:
+
+- Add ``COLLECT`` option for ``unknown``: unknown input keys are collected,
+  with their original key names, into a mapping stored under the key named by
+  the new ``unknown_collect_field`` option (settable in ``class Meta`` or via
+  the ``Schema`` constructor). The new ``unknown_collect_conflict`` ``Meta``
+  option (``"reject"`` or ``"merge"``) controls how explicitly provided
+  values for the extension key are handled.
+
 4.4.0 (2026-11-03)
 ------------------
 

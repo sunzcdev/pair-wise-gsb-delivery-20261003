@@ -447,6 +447,9 @@ This behavior can be modified with the ``unknown`` option, which accepts one of 
   if there are any unknown fields
 - `EXCLUDE <marshmallow.EXCLUDE>`: exclude unknown fields
 - `INCLUDE <marshmallow.INCLUDE>`: accept and include the unknown fields
+- `COLLECT <marshmallow.COLLECT>`: collect the unknown fields, with their
+  original (source) key names, into a mapping stored under a dedicated
+  extension key of the output
 
 You can specify `unknown <marshmallow.Schema.Meta.unknown>` in the `class Meta <marshmallow.Schema.Meta>` of your `Schema <marshmallow.Schema>`,
 
@@ -496,6 +499,50 @@ will override the value applied at instantiation time,
 which itself will override the value defined in the `class Meta <marshmallow.Schema.Meta>`.
 
 This order of precedence allows you to change the behavior of a schema for different contexts.
+
+.. _unknown_collect:
+
+Collecting unknown fields
++++++++++++++++++++++++++
+
+.. versionadded:: 4.5.0
+
+With ``unknown=COLLECT``, unknown keys are gathered into a single mapping
+stored under the key named by ``unknown_collect_field`` instead of being
+merged into the top-level output. This keeps the declared output clean while
+preserving the source data, which is useful for ingestion pipelines that need
+to forward unrecognized fields.
+
+.. code-block:: python
+
+    from marshmallow import Schema, fields, COLLECT
+
+
+    class UserSchema(Schema):
+        name = fields.Str()
+
+        class Meta:
+            unknown = COLLECT
+            unknown_collect_field = "_extras"
+
+
+    UserSchema().load({"name": "Monty", "extra": "Not a field"})
+    # {'name': 'Monty', '_extras': {'extra': 'Not a field'}}
+
+The extension key must not collide with any declared field name,
+``attribute`` or ``data_key``; a ``ValueError`` is raised otherwise.
+``unknown_collect_field`` may also be passed to the
+`Schema <marshmallow.Schema>` constructor, and each `Nested <marshmallow.fields.Nested>`
+level collects its own unknown fields according to its own schema's options.
+
+If the input data explicitly contains the extension key, the behavior is
+controlled by the ``unknown_collect_conflict`` `Meta <marshmallow.Schema.Meta>`
+option: ``"reject"`` (default) reports a validation error for the reserved
+key, while ``"merge"`` merges the explicitly provided mapping into the
+collected one (collected unknown keys take precedence on collisions).
+
+The collected mapping is a deep copy and shares no mutable containers with
+the input data.
 
 
 Validation without deserialization
