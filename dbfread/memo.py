@@ -10,6 +10,7 @@ DB4 == dBase IV
 """
 from .ifiles import ifind
 from .struct_parser import StructParser
+from .exceptions import DBFChangedError
 
 
 VFPFileHeader = StructParser(
@@ -62,8 +63,9 @@ VFP_TYPE_MAP = {
 
 
 class MemoFile(object):
-    def __init__(self, filename):
+    def __init__(self, filename, opener=open):
         self.filename = filename
+        self._opener = opener
         self._open()
         self._init()
 
@@ -71,7 +73,7 @@ class MemoFile(object):
         pass
 
     def _open(self):
-        self.file = open(self.filename, 'rb')
+        self.file = self._opener(self.filename, 'rb')
         # Shortcuts for speed.
         self._read = self.file.read
         self._seek = self.file.seek
@@ -176,12 +178,56 @@ def find_memofile(dbf_filename):
         return None
 
 
-def open_memofile(filename, dbversion):
+def open_memofile(filename, dbversion, opener=open):
     if filename.lower().endswith('.fpt'):
-        return VFPMemoFile(filename)
+        return VFPMemoFile(filename, opener=opener)
     else:
         # print('######', dbversion)
         if dbversion == 0x83:
-            return DB3MemoFile(filename)
+            return DB3MemoFile(filename, opener=opener)
         else:
-            return DB4MemoFile(filename)
+            return DB4MemoFile(filename, opener=opener)
+
+
+class GuardedMemoFile(object):
+    """Wrap a memo file and verify its identity around every lookup.
+
+    This is used for consistent reads that stream directly from the
+    original files.  The wrapped memo file is never modified; only its
+    identity is re-checked.  If the memo file has been replaced,
+    truncated or otherwise changed a
+    :class:`~dbfread.exceptions.DBFChangedError` is raised instead of
+    silently returning data from the wrong file.
+    """
+
+    def __init__(self, memofile, identity):
+        self._memofile = memofile
+        self._identity = identity
+
+    def __getitem__(self, index):
+        # Check before the seek/read and again afterwards so a replacement
+        # that happens between DBF records is caught on the next lookup.
+        self._identity.check()
+        try:
+            return self._memofile[index]
+        except DBFChangedError:
+            raise
+        except IOError as error:
+            # A short read inside the memo file usually means it was
+            # truncated while the table was being read.
+            self._identity.check()
+            raise DBFChangedError(
+                'memo file {} could not be read completely; the result '
+                'is incomplete: {}'.format(self._identity.path, error))
+        finally:
+            self._identity.check()
+
+    def close(self):
+        self._memofile._close()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, type, value, traceback):
+        self.close()
+        return False

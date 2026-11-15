@@ -7,6 +7,25 @@ Release History
 (Next Version)
 ^^^^^^^^^^^^^^^^^^
 
+* added an optional consistent read view for files that may be replaced
+  or modified by another program while they are being read.  Pass
+  ``consistent=True`` to pin the identity (device, inode, size and
+  modification time) of the DBF and memo files and raise the new
+  ``DBFChangedError`` if either file is replaced, removed, truncated or
+  grown during the read.  The result is explicitly marked incomplete.
+
+* added ``copy_to_temp=True``.  This copies the DBF and memo files into
+  a private temporary directory before reading, verifying the identity
+  of each source file before and after the copy.  The temporary copy is
+  removed on close, when the ``with`` block ends or if construction
+  fails.  Source files are only opened for reading and are never
+  modified.
+
+* the old default behaviour is unchanged: both new options default to
+  ``False`` and no temporary files are created unless requested.  The
+  new checks are best-effort and do not claim to provide a transactional
+  snapshot without co-operation from the writer.
+
 * records are now returned ``dict`` instead of ``collections.OrderedDict``
   in Python 3.7 and up (as well as CPython 3.6) since normal Python
   dictionaries are now ordered.

@@ -74,6 +74,36 @@ raw=False
   Returns all data values as byte strings. This can be used for
   debugging or for doing your own decoding.
 
+consistent=False
+  Turn on a best-effort consistent view of the DBF file and its memo
+  file while they are being read.
+
+  When enabled the identity (device, inode, size and modification time)
+  of both files is fixed when the table is opened and re-checked on every
+  record and again at the end.  If another program replaces, removes,
+  truncates, grows or rewrites either file while it is being read a
+  ``DBFChangedError`` is raised and the records read so far must be
+  considered incomplete.
+
+  This can not give a true transactional snapshot without co-operation
+  from the writer.  In particular, a writer that replaces a file and
+  restores its exact size and modification time can not be detected.
+  Use ``copy_to_temp=True`` below for stronger isolation.  See
+  :doc:`consistent_reads`.
+
+copy_to_temp=False
+  Copy the DBF file and its memo file into a private temporary directory
+  before reading them.  The identity of each source file is pinned
+  before the copy and verified again afterwards, so a replacement or
+  truncation during the copy aborts the read with ``DBFChangedError``.
+  All reading then happens from the copies, which no other program
+  knows about, giving the closest thing to a snapshot dbfread can offer.
+
+  This implies ``consistent=True``.  The temporary directory is removed
+  when the table is closed (``close()`` or the end of a ``with`` block)
+  or if construction fails.  The original files are opened read-only and
+  are never modified or deleted.  See :doc:`consistent_reads`.
+
 
 Methods
 -------
@@ -87,6 +117,13 @@ unload()
    Unload records from memory. The ``records`` and ``deleted``
    attributes will now be instances of ``RecordIterator``, which
    streams records from disk.
+
+close()
+   Close the table.  When reading from a temporary copy
+   (``copy_to_temp=True``) this also deletes the private temporary
+   directory and its copies.  The original DBF and memo files are never
+   touched.  After closing, iterating or counting records raises
+   ``DBFChangedError``.
 
 
 Attributes
@@ -132,10 +169,34 @@ ignorecase, lowernames, recfactory, parserclass, raw
   These are set to the values of the same keyword arguments.
 
 filename
-  File name of the DBF file.
+  File name of the DBF file.  When ``copy_to_temp=True`` this is the
+  private copy in the temporary directory rather than the original.
 
 memofilename
   File name of the memo file, or ``None`` if there is no memo file.
+  When ``copy_to_temp=True`` this is the private copy in the temporary
+  directory rather than the original.
+
+source_filename
+  File name of the original DBF file as passed in (or found with case
+  insensitive lookup).  This is the same as ``filename`` unless
+  ``copy_to_temp=True`` is used.
+
+source_memofilename
+  File name of the original memo file, or ``None`` if there is none.
+  This is the same as ``memofilename`` unless ``copy_to_temp=True`` is
+  used.
+
+consistent
+  ``True`` if the table is doing consistent reads (set by either
+  ``consistent=True`` or ``copy_to_temp=True``).
+
+copy_to_temp
+  Value of the same keyword argument: ``True`` when reading from a
+  private temporary copy.
+
+closed
+  ``True`` after ``close()`` has been called.
 
 header
   The file header. This is only intended for internal use, but is exposed
