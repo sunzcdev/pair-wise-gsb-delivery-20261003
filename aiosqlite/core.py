@@ -45,6 +45,19 @@ _STOP_RUNNING_SENTINEL = object()
 _TxQueue = SimpleQueue[tuple[Optional[asyncio.Future], Callable[[], Any]]]
 
 
+def _supports_window_functions() -> bool:
+    """
+    Whether the bundled ``sqlite3`` module exposes user-defined window functions.
+
+    ``Connection.create_window_function`` was added in Python 3.11.  Kept as a
+    module-level function so the capability check can be exercised in tests
+    without trying to mutate the immutable ``sqlite3.Connection`` type.
+
+    :meta private:
+    """
+    return hasattr(sqlite3.Connection, "create_window_function")
+
+
 def _connection_worker_thread(tx: _TxQueue):
     """
     Execute function calls on a separate thread.
@@ -279,6 +292,73 @@ class Connection:
             num_params,
             func,
             deterministic=deterministic,
+        )
+
+    async def create_aggregate(
+        self, name: str, num_params: int, aggregate_class: Optional[type]
+    ) -> None:
+        """
+        Create or remove a user-defined aggregate function.
+
+        ``aggregate_class`` must define a parameterless ``__init__`` plus a
+        ``step(value, ...)`` method that adds each row to the running state and
+        a ``finalize()`` method that returns the aggregate result.  Passing
+        ``None`` removes an aggregate previously registered under ``name``.
+
+        The class itself is handed to ``sqlite3`` rather than an instance: a
+        fresh aggregate object is instantiated by SQLite for every query that
+        invokes the function, so state never leaks between queries and no class
+        instance is ever cached or shared by the connection.
+
+        Exceptions raised by ``step`` or ``finalize`` are not caught here; they
+        propagate through SQLite as the standard ``sqlite3`` errors (for
+        example ``sqlite3.OperationalError``) and are raised from the awaiting
+        query, exactly as with the synchronous ``sqlite3`` module.
+
+        Like all other connection operations, the registration is queued onto
+        the connection's worker thread, so registrations and deregistrations
+        take effect in the same order relative to queries as they were awaited.
+        """
+        await self._execute(
+            self._conn.create_aggregate, name, num_params, aggregate_class
+        )
+
+    async def create_window_function(
+        self, name: str, num_params: int, aggregate_class: Optional[type]
+    ) -> None:
+        """
+        Create or remove a user-defined aggregate window function.
+
+        ``aggregate_class`` must implement the aggregate window function
+        protocol: a parameterless ``__init__``, ``step(value, ...)``,
+        ``inverse(value, ...)``, ``value()`` and ``finalize()``.  Passing
+        ``None`` removes a window function previously registered under
+        ``name``.
+
+        As with :meth:`create_aggregate`, the class is passed through directly
+        and SQLite instantiates a new object for every query; instances are
+        never cached or reused between queries.  Exceptions raised by any of
+        ``step``, ``inverse``, ``value`` or ``finalize`` are left to propagate
+        through SQLite as standard ``sqlite3`` errors instead of being
+        swallowed or rewrapped.
+
+        Window functions require Python 3.11 or newer (and a SQLite build with
+        window function support).  When the running interpreter cannot provide
+        them, ``NotSupportedError`` is raised eagerly at registration time,
+        before anything is queued on the worker thread, rather than failing
+        later when a query runs.
+        """
+        if not _supports_window_functions():
+            raise sqlite3.NotSupportedError(
+                "sqlite3.Connection.create_window_function is not available; "
+                "user-defined window functions require Python 3.11 or newer"
+            )
+
+        await self._execute(
+            self._conn.create_window_function,  # type: ignore[attr-defined]
+            name,
+            num_params,
+            aggregate_class,
         )
 
     @property

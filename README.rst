@@ -55,6 +55,50 @@ aiosqlite also replicates most of the advanced features of ``sqlite3``:
         assert db.total_changes > 0
 
 
+Custom functions, aggregates and window functions
+--------------------------------------------------
+
+User-defined scalar functions, aggregates and window functions are registered
+asynchronously on the same worker thread that runs every query, so
+registrations take effect in order relative to the queries around them:
+
+.. code-block:: python
+
+    class RunningTotal:
+        def __init__(self):
+            self.total = 0
+
+        def step(self, value):
+            self.total += value
+
+        def inverse(self, value):
+            self.total -= value
+
+        def value(self):
+            return self.total
+
+        def finalize(self):
+            return self.total
+
+    async with aiosqlite.connect(...) as db:
+        await db.create_function("double", 1, lambda x: x * 2)
+        await db.create_aggregate("running_total", 1, RunningTotal)
+        await db.create_window_function("running_total_win", 1, RunningTotal)
+
+        await db.execute("SELECT running_total(column) FROM table")
+        await db.execute(
+            "SELECT running_total_win(column) OVER ("
+            "ORDER BY column ROWS BETWEEN 1 PRECEDING AND CURRENT ROW)"
+            " FROM table"
+        )
+
+A new aggregate or window function object is created for every query, so
+function state is never shared between queries. Exceptions raised by the
+callback methods propagate through SQLite as standard ``sqlite3`` errors.
+Window functions require Python 3.11 or newer; attempting to register one on an
+older interpreter raises ``sqlite3.NotSupportedError`` at registration time.
+
+
 Install
 -------
 

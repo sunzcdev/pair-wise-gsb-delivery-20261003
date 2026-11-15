@@ -12,7 +12,132 @@ from unittest import IsolatedAsyncioTestCase, SkipTest
 from unittest.mock import patch
 
 import aiosqlite
+from aiosqlite import core as aiosqlite_core
 from .helpers import setup_logger
+
+
+class CountAggregate:
+    """Aggregate that counts how many rows it has seen."""
+
+    instances: "list[CountAggregate]" = []
+
+    def __init__(self) -> None:
+        self.count = 0
+        type(self).instances.append(self)
+
+    def step(self, value) -> None:
+        self.count += 1
+
+    def finalize(self) -> int:
+        return self.count
+
+
+class SumAggregate:
+    """Aggregate that sums non-null integer values."""
+
+    def __init__(self) -> None:
+        self.total = 0
+
+    def step(self, value) -> None:
+        self.total += value
+
+    def finalize(self) -> int:
+        return self.total
+
+
+class StepErrorAggregate:
+    def __init__(self) -> None:
+        pass
+
+    def step(self, value) -> None:
+        raise ValueError("boom in step")
+
+    def finalize(self):
+        return None
+
+
+class FinalizeErrorAggregate:
+    def __init__(self) -> None:
+        pass
+
+    def step(self, value) -> None:
+        pass
+
+    def finalize(self):
+        raise RuntimeError("boom in finalize")
+
+
+class SumWindow:
+    """Aggregate window function maintaining a running sum of a frame."""
+
+    instances: "list[SumWindow]" = []
+
+    def __init__(self) -> None:
+        self.total = 0
+        type(self).instances.append(self)
+
+    def step(self, value) -> None:
+        self.total += value
+
+    def inverse(self, value) -> None:
+        self.total -= value
+
+    def value(self) -> int:
+        return self.total
+
+    def finalize(self) -> int:
+        return self.total
+
+
+class WindowStepError:
+    def __init__(self) -> None:
+        pass
+
+    def step(self, value) -> None:
+        raise ValueError("boom in window step")
+
+    def inverse(self, value) -> None:
+        pass
+
+    def value(self):
+        return None
+
+    def finalize(self):
+        return None
+
+
+class WindowInverseError:
+    def __init__(self) -> None:
+        self.total = 0
+
+    def step(self, value) -> None:
+        self.total += value
+
+    def inverse(self, value) -> None:
+        raise RuntimeError("boom in window inverse")
+
+    def value(self) -> int:
+        return self.total
+
+    def finalize(self) -> int:
+        return self.total
+
+
+class WindowValueError:
+    def __init__(self) -> None:
+        pass
+
+    def step(self, value) -> None:
+        pass
+
+    def inverse(self, value) -> None:
+        pass
+
+    def value(self):
+        raise KeyError("boom in window value")
+
+    def finalize(self):
+        return None
 
 
 class SmokeTest(IsolatedAsyncioTestCase):
@@ -332,6 +457,225 @@ class SmokeTest(IsolatedAsyncioTestCase):
 
             # Non-deterministic functions cannot be used in indexes
             await db.execute("create index t on foo(one_arg(bar))")
+
+    async def test_create_aggregate(self):
+        """Registered aggregate functions can be used inside SQL queries."""
+        CountAggregate.instances.clear()
+
+        async with aiosqlite.connect(":memory:") as db:
+            await db.execute("create table foo (id integer)")
+            await db.executemany("insert into foo values (?)", [(1,), (2,), (3,), (4,)])
+            await db.create_aggregate("my_count", 1, CountAggregate)
+            await db.create_aggregate("my_sum", 1, SumAggregate)
+
+            async with db.execute("select my_count(id), my_sum(id) from foo") as cur:
+                self.assertEqual(await cur.fetchone(), (4, 10))
+
+            # zero-row aggregate: no rows means step() is never called and
+            # SQLite reports NULL without ever instantiating the class
+            async with db.execute("select my_count(id) from foo where id > 100") as cur:
+                self.assertIsNone((await cur.fetchone())[0])
+
+    async def test_create_aggregate_distinct_instance_per_query(self):
+        """A new aggregate object must back every query, never a shared one."""
+        CountAggregate.instances.clear()
+
+        async with aiosqlite.connect(":memory:") as db:
+            await db.execute("create table foo (id integer)")
+            await db.executemany("insert into foo values (?)", [(1,), (2,)])
+            await db.create_aggregate("my_count", 1, CountAggregate)
+
+            await db.execute_fetchall("select my_count(id) from foo")
+            await db.execute_fetchall("select my_count(id) from foo")
+            await db.execute("create table bar (id integer)")
+            await db.executemany("insert into bar values (?)", [(1,), (2,), (3,)])
+            await db.execute_fetchall("select my_count(id) from bar")
+
+        # three queries, three independent objects, each counting its own rows
+        self.assertEqual(len(CountAggregate.instances), 3)
+        self.assertEqual(len({id(obj) for obj in CountAggregate.instances}), 3)
+        self.assertEqual(
+            sorted(obj.count for obj in CountAggregate.instances), [2, 2, 3]
+        )
+
+    async def test_create_aggregate_exception_propagation(self):
+        """step/finalize errors surface through sqlite3 error semantics."""
+        async with aiosqlite.connect(":memory:") as db:
+            await db.execute("create table foo (id integer)")
+            await db.executemany("insert into foo values (?)", [(1,), (2,)])
+
+            await db.create_aggregate("step_boom", 1, StepErrorAggregate)
+            with self.assertRaises(sqlite3.OperationalError):
+                await db.execute_fetchall("select step_boom(id) from foo")
+
+            await db.create_aggregate("finalize_boom", 1, FinalizeErrorAggregate)
+            with self.assertRaises(sqlite3.OperationalError):
+                await db.execute_fetchall("select finalize_boom(id) from foo")
+
+            # the connection stays usable after a callback error
+            async with db.execute("select 1") as cur:
+                self.assertEqual(await cur.fetchone(), (1,))
+
+    async def test_create_aggregate_deregister(self):
+        """Replacing a registration with None removes the SQL function."""
+        async with aiosqlite.connect(":memory:") as db:
+            await db.execute("create table foo (id integer)")
+            await db.execute("insert into foo values (1)")
+            await db.create_aggregate("my_sum", 1, SumAggregate)
+
+            async with db.execute("select my_sum(id) from foo") as cur:
+                self.assertEqual(await cur.fetchone(), (1,))
+
+            await db.create_aggregate("my_sum", 1, None)
+            with self.assertRaises(sqlite3.OperationalError):
+                await db.execute_fetchall("select my_sum(id) from foo")
+
+    async def test_registration_runs_on_worker_thread_in_order(self):
+        """Registrations/deregistrations queue on the worker thread in order."""
+        events: list[tuple[str, str]] = []
+
+        class LoggingConnection(aiosqlite_core.Connection):
+            async def _execute(self, fn, *args, **kwargs):
+                name = getattr(fn, "__name__", repr(fn))
+                events.append(("queued", name))
+                try:
+                    return await super()._execute(fn, *args, **kwargs)
+                finally:
+                    events.append(("done", name))
+
+        db = LoggingConnection(lambda: sqlite3.connect(":memory:"), 64)
+        await db
+        try:
+            await db.create_function("scalar", 1, lambda value: value)
+            await db.create_aggregate("agg", 1, SumAggregate)
+            await db.execute("create table foo (id integer)")
+            for value in (1, 2, 3):
+                await db.execute("insert into foo values (?)", [value])
+            self.assertEqual(
+                await db.execute_fetchall("select agg(id) from foo"), [(6,)]
+            )
+            await db.create_aggregate("agg", 1, None)
+
+            expected = [
+                "create_function",
+                "create_aggregate",
+                "execute",  # create table
+                "execute",  # insert x3
+                "execute",
+                "execute",
+                "_execute_fetchall",  # select agg
+                "create_aggregate",  # deregister
+            ]
+            names = [name for _, name in events]
+            self.assertEqual(names, [x for name in expected for x in (name, name)])
+            # every operation finished before the next one started (FIFO)
+            self.assertEqual(
+                [phase for phase, _ in events],
+                ["queued", "done"] * len(expected),
+            )
+            # all queued work has drained and the deregistration took effect
+            self.assertTrue(db._tx.empty())
+            with self.assertRaises(sqlite3.OperationalError):
+                await db.execute_fetchall("select agg(id) from foo")
+        finally:
+            await db.close()
+
+    async def test_create_window_function(self):
+        """Window functions support frames, inverse and value callbacks."""
+        if not hasattr(sqlite3.Connection, "create_window_function"):
+            raise SkipTest("window functions require Python 3.11 or newer")
+
+        SumWindow.instances.clear()
+
+        async with aiosqlite.connect(":memory:") as db:
+            await db.execute("create table foo (grp text, id integer)")
+            await db.executemany(
+                "insert into foo values (?, ?)",
+                [("a", 1), ("a", 2), ("a", 3), ("b", 4)],
+            )
+            await db.create_window_function("win_sum", 1, SumWindow)
+
+            async with db.execute(
+                "select grp, id, win_sum(id) over ("
+                "partition by grp order by id "
+                "rows between 1 preceding and current row"
+                ") from foo order by grp, id"
+            ) as cur:
+                self.assertEqual(
+                    await cur.fetchall(),
+                    [("a", 1, 1), ("a", 2, 3), ("a", 3, 5), ("b", 4, 4)],
+                )
+
+            # unpartitioned frame: the same object accumulates every row
+            async with db.execute("select win_sum(id) over () from foo") as cur:
+                self.assertEqual([row[0] for row in await cur.fetchall()], [10] * 4)
+
+        # each query got its own window function instance
+        self.assertGreaterEqual(len(SumWindow.instances), 2)
+        self.assertEqual(
+            len({id(obj) for obj in SumWindow.instances}),
+            len(SumWindow.instances),
+        )
+
+    async def test_create_window_function_exception_propagation(self):
+        """step/inverse/value errors propagate via sqlite3 error semantics."""
+        if not hasattr(sqlite3.Connection, "create_window_function"):
+            raise SkipTest("window functions require Python 3.11 or newer")
+
+        async with aiosqlite.connect(":memory:") as db:
+            await db.execute("create table foo (id integer)")
+            await db.executemany("insert into foo values (?)", [(1,), (2,), (3,)])
+
+            await db.create_window_function("step_boom", 1, WindowStepError)
+            with self.assertRaises(sqlite3.OperationalError):
+                await db.execute_fetchall("select step_boom(id) over () from foo")
+
+            await db.create_window_function("inverse_boom", 1, WindowInverseError)
+            with self.assertRaises(sqlite3.OperationalError):
+                await db.execute_fetchall(
+                    "select inverse_boom(id) over ("
+                    "order by id rows between 1 preceding and current row"
+                    ") from foo"
+                )
+
+            await db.create_window_function("value_boom", 1, WindowValueError)
+            with self.assertRaises(sqlite3.OperationalError):
+                await db.execute_fetchall("select value_boom(id) over () from foo")
+
+            async with db.execute("select 1") as cur:
+                self.assertEqual(await cur.fetchone(), (1,))
+
+    async def test_create_window_function_deregister(self):
+        """Passing None removes a previously registered window function."""
+        if not hasattr(sqlite3.Connection, "create_window_function"):
+            raise SkipTest("window functions require Python 3.11 or newer")
+
+        async with aiosqlite.connect(":memory:") as db:
+            await db.execute("create table foo (id integer)")
+            await db.executemany("insert into foo values (?)", [(1,), (2,)])
+            await db.create_window_function("win_sum", 1, SumWindow)
+
+            async with db.execute("select win_sum(id) over () from foo") as cur:
+                self.assertEqual([row[0] for row in await cur.fetchall()], [3, 3])
+
+            await db.create_window_function("win_sum", 1, None)
+            with self.assertRaises(sqlite3.OperationalError):
+                await db.execute_fetchall("select win_sum(id) over () from foo")
+
+    async def test_create_window_function_unsupported(self):
+        """Missing window-function support is rejected at registration time."""
+        original = aiosqlite_core._supports_window_functions
+        aiosqlite_core._supports_window_functions = lambda: False
+        try:
+            async with aiosqlite.connect(":memory:") as db:
+                with self.assertRaises(sqlite3.NotSupportedError):
+                    await db.create_window_function("win_sum", 1, SumWindow)
+
+                # nothing was queued: the connection remains fully usable
+                async with db.execute("select 1") as cur:
+                    self.assertEqual(await cur.fetchone(), (1,))
+        finally:
+            aiosqlite_core._supports_window_functions = original
 
     async def test_set_trace_callback(self):
         statements = []
