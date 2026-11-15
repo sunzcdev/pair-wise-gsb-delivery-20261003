@@ -5,6 +5,7 @@ from ._client import *
 from ._config import *
 from ._content import *
 from ._exceptions import *
+from ._extensions import *
 from ._models import *
 from ._status_codes import *
 from ._transports import *
@@ -46,10 +47,12 @@ __all__ = [
     "ConnectTimeout",
     "CookieConflict",
     "Cookies",
+    "copy_request_extensions",
     "create_ssl_context",
     "DecodingError",
     "delete",
     "DigestAuth",
+    "ExtensionCopyError",
     "FunctionAuth",
     "get",
     "head",

@@ -13,6 +13,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 ### Added
 
 * Expose `FunctionAuth` from the public API. (#3699)
+* Add an explicit copy protocol for request extensions, applied when redirects and authentication flows derive new requests. Mutable extension values may implement `__httpx_extension_copy__()` to provide derived copies, immutable values are inherited directly, and reserved keys such as `"timeout"` have fixed rules. Exposes `httpx.copy_request_extensions()` and `httpx.ExtensionCopyError`.
 
 ## 0.28.1 (6th December, 2024)
 

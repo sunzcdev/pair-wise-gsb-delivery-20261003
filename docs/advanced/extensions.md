@@ -179,6 +179,54 @@ extensions = {"target": b"*"}
 response = httpx.request("CONNECT", "https://www.example.com", extensions=extensions)
 ```
 
+## Copying Request Extensions
+
+When the client derives a new request from an existing one, such as when following
+a redirect or re-sending a request within an authentication flow, the request
+extensions are carried across using an explicit copy protocol:
+
+* Reserved keys used by `httpx` internals (`"timeout"`, `"trace"`, `"sni_hostname"`,
+  and `"target"`) have fixed rules. They are always inherited as-is, and user-supplied
+  copy callbacks cannot override them.
+* Mutable values may implement `__httpx_extension_copy__()` to provide a derived
+  copy of themselves, so that mutable state declared as independent is not
+  accidentally shared between the original request and the new one.
+* Plain immutable values, such as strings, numbers, and tuples of immutables,
+  are inherited directly.
+* Any other mutable value raises `httpx.ExtensionCopyError`. The failure occurs
+  before the next request is sent, and the current response is released.
+
+For example, a trace context that should be tracked independently on each hop:
+
+```python
+class TraceContext:
+    def __init__(self, spans):
+        self.spans = spans
+
+    def __httpx_extension_copy__(self):
+        # Each redirect hop gets its own derived copy, so that
+        # modifications made by one hop never leak back into another.
+        return TraceContext(spans=list(self.spans))
+
+
+client = httpx.Client()
+response = client.get(
+    "https://www.example.com",
+    extensions={"trace_context": TraceContext(spans=[])},
+    follow_redirects=True,
+)
+```
+
+The same rules are available as a standalone helper, which also accepts optional
+per-key copy callbacks:
+
+```python
+copied = httpx.copy_request_extensions(
+    request.extensions,
+    copy_callbacks={"routing": lambda value: value.copy()},
+)
+```
+
 ## Response Extensions
 
 ### `"http_version"`

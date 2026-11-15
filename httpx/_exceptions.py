@@ -20,6 +20,7 @@ Our exception hierarchy:
       - ProxyError
       - UnsupportedProtocol
     + DecodingError
+    + ExtensionCopyError
     + TooManyRedirects
   x HTTPStatusError
 * InvalidURL
@@ -45,6 +46,7 @@ __all__ = [
     "ConnectTimeout",
     "CookieConflict",
     "DecodingError",
+    "ExtensionCopyError",
     "HTTPError",
     "HTTPStatusError",
     "InvalidURL",
@@ -243,6 +245,14 @@ class RemoteProtocolError(ProtocolError):
 class DecodingError(RequestError):
     """
     Decoding of the response failed, due to a malformed encoding.
+    """
+
+
+class ExtensionCopyError(RequestError):
+    """
+    A request extension could not be copied when deriving a new request,
+    such as when following a redirect or re-sending a request within an
+    authentication flow.
     """
 
 

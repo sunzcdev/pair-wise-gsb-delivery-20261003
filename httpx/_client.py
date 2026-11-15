@@ -21,11 +21,13 @@ from ._config import (
 )
 from ._decoders import SUPPORTED_DECODERS
 from ._exceptions import (
+    ExtensionCopyError,
     InvalidURL,
     RemoteProtocolError,
     TooManyRedirects,
     request_context,
 )
+from ._extensions import copy_request_extensions
 from ._models import Cookies, Headers, Request, Response
 from ._status_codes import codes
 from ._transports.base import AsyncBaseTransport, BaseTransport
@@ -482,14 +484,37 @@ class BaseClient:
         headers = self._redirect_headers(request, url, method)
         stream = self._redirect_stream(request, method)
         cookies = Cookies(self.cookies)
+        extensions = self._redirect_extensions(request)
         return Request(
             method=method,
             url=url,
             headers=headers,
             cookies=cookies,
             stream=stream,
-            extensions=request.extensions,
+            extensions=extensions,
         )
+
+    def _redirect_extensions(self, request: Request) -> dict[str, typing.Any]:
+        """
+        Return the extensions that should be used for the redirect request.
+        """
+        try:
+            return copy_request_extensions(request.extensions)
+        except ExtensionCopyError as exc:
+            exc.request = request
+            raise
+
+    def _auth_flow_extensions(self, request: Request) -> dict[str, typing.Any]:
+        """
+        Return the extensions for a new request built by an authentication
+        flow, ensuring mutable extension state is not accidentally shared
+        with the request it was derived from.
+        """
+        try:
+            return copy_request_extensions(request.extensions)
+        except ExtensionCopyError as exc:
+            exc.request = request
+            raise
 
     def _redirect_method(self, request: Request, response: Response) -> str:
         """
@@ -952,6 +977,10 @@ class Client(BaseClient):
 
                     response.history = list(history)
                     response.read()
+                    if next_request is not request:
+                        next_request.extensions = self._auth_flow_extensions(
+                            next_request
+                        )
                     request = next_request
                     history.append(response)
 
@@ -1667,6 +1696,10 @@ class AsyncClient(BaseClient):
 
                     response.history = list(history)
                     await response.aread()
+                    if next_request is not request:
+                        next_request.extensions = self._auth_flow_extensions(
+                            next_request
+                        )
                     request = next_request
                     history.append(response)
 
