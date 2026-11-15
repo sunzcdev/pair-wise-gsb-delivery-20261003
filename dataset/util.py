@@ -37,6 +37,12 @@ MutableRow = dict[str, SQLWriteValue]
 OutRow = Mapping[str, Any]
 RowFactory = Callable[[Iterable[tuple[str, Any]]], OutRow]
 
+# A single aggregation specification: (function, column, result alias).
+# ``column`` of None or "*" is only valid for ``count`` (i.e. COUNT(*)).
+AggregateSpec = tuple[str, str | None, str]
+# HAVING conditions keyed by a group column or aggregate result alias.
+HavingSpec = Mapping[str, SQLWriteValue]
+
 row_factory: RowFactory = OrderedDict
 
 

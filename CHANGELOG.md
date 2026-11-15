@@ -4,6 +4,7 @@
 changes must be reconstructed from revision history.*
 
 * **2.0.0**: Major modernization and type annotations
+  - **`Table.aggregate()`**: New whitelisted GROUP BY aggregation API supporting `count`/`sum`/`min`/`max`/`avg`, WHERE filters, HAVING (with aggregate-alias resolution) and streaming `ResultIter`; no raw SQL expressions accepted
   - **Type annotations**: Full `mypy --strict` compliance across all modules
   - **PEP 561**: Added `py.typed` marker for downstream type checking
   - **New types**: Exported `OutRow`, `RowFactory`, `QueryError` for downstream use

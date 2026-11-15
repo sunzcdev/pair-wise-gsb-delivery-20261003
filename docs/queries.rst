@@ -68,11 +68,62 @@ These clauses also work with :py:meth:`table.count() <dataset.Table.count>`,
 :py:meth:`table.find_one() <dataset.Table.find_one>`, and
 :py:meth:`table.delete() <dataset.Table.delete>`.
 
+Grouped aggregation
+-------------------
+
+For quality statistics and other GROUP BY-style summaries,
+:py:meth:`table.aggregate() <dataset.Table.aggregate>` builds the query for
+you. Pass one or more ``(function, column, alias)`` tuples — the supported
+functions are ``count``, ``sum``, ``min``, ``max`` and ``avg``, and no raw SQL
+expressions are accepted::
+
+    # one row per place with the number of readings
+    results = table.aggregate(
+        [("count", "*", "num_readings")], group_by="place"
+    )
+
+    # several aggregates at once
+    results = table.aggregate(
+        [
+            ("sum", "temperature", "total"),
+            ("avg", "temperature", "average"),
+            ("min", "temperature", "lowest"),
+        ],
+        group_by=["place", "date"],
+    )
+
+``("count", "*", alias)`` produces ``COUNT(*)`` and counts every row, while
+``("count", "column", alias)`` produces ``COUNT(column)`` and ignores rows
+where the column is NULL. Result aliases must not collide with each other or
+with the GROUP BY columns.
+
+Keyword arguments filter the underlying rows (WHERE) using the same filter
+syntax as :py:meth:`find() <dataset.Table.find>`, and all values are sent as
+bound parameters. The ``having`` argument filters the aggregated groups; its
+keys name either a GROUP BY column or an aggregate alias, which is resolved
+back to the underlying aggregate::
+
+    # only keep places with at least two readings
+    results = table.aggregate(
+        [("count", "*", "num")],
+        group_by="place",
+        having={"num": {">=": 2}},
+    )
+
+Without ``group_by`` the query returns a single aggregate row, following
+standard database semantics — even when no rows match, in which case
+``COUNT(*)`` comes back as ``0`` and the other aggregates as ``NULL``.
+
+Like :py:meth:`find() <dataset.Table.find>`, the result is a streaming
+:class:`~dataset.util.ResultIter`; closing it early releases the query
+resources instead of materialising all rows first.
+
 Queries using raw SQL
 ---------------------
 
-To run more complex queries with JOINs, or to perform GROUP BY-style
-aggregation, you can also use :py:meth:`db.query() <dataset.Database.query>`
+To run more complex queries with JOINs, or queries not covered by the
+built-in helpers, you can also use
+:py:meth:`db.query() <dataset.Database.query>`
 to run raw SQL queries instead. This also supports parameterisation to avoid
 SQL injections::
 

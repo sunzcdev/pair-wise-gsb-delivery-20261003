@@ -1,7 +1,7 @@
 import logging
 import threading
 import warnings
-from collections.abc import Iterable, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from typing import TYPE_CHECKING, Any, Literal
 
 from sqlalchemy import false, func, select
@@ -19,7 +19,9 @@ from sqlalchemy.sql.expression import (
 from dataset.types import MYSQL_LENGTH_TYPES, ColumnType, Types
 from dataset.util import (
     QUERY_STEP,
+    AggregateSpec,
     DatasetError,
+    HavingSpec,
     MutableRow,
     OutRow,
     QueryError,
@@ -491,47 +493,60 @@ class Table:
     def _generate_clause(
         self, column: str, op: str, value: SQLWriteValue
     ) -> ColumnElement[bool]:
+        return self._generate_expression_clause(self.table.c[column], op, value)
+
+    def _generate_expression_clause(
+        self,
+        target: ColumnElement[Any],
+        op: str,
+        value: SQLWriteValue,
+    ) -> ColumnElement[bool]:
+        """Build a comparison clause against any SQL expression.
+
+        Unlike :meth:`_generate_clause`, this also works with aggregate
+        expressions (e.g. ``func.count()``) used inside HAVING clauses.
+        """
         if op in ("like",):
-            return self.table.c[column].like(value)
+            return target.like(value)
         if op in ("ilike",):
-            return self.table.c[column].ilike(value)
+            return target.ilike(value)
         if op in ("notlike",):
-            return self.table.c[column].notlike(value)
+            return target.notlike(value)
         if op in ("notilike",):
-            return self.table.c[column].notilike(value)
+            return target.notilike(value)
         if op in (">", "gt"):
-            return self.table.c[column] > value
+            return target > value
         if op in ("<", "lt"):
-            return self.table.c[column] < value
+            return target < value
         if op in (">=", "gte"):
-            return self.table.c[column] >= value
+            return target >= value
         if op in ("<=", "lte"):
-            return self.table.c[column] <= value
+            return target <= value
         if op in ("=", "==", "is"):
-            return self.table.c[column] == value
+            return target == value
         if op in ("!=", "<>", "not"):
-            return self.table.c[column] != value
+            return target != value
         if op in ("in",):
             if not isinstance(value, (list, tuple, set)):
                 raise QueryError(f"'in' filter requires a list, got {type(value)}")
-            return self.table.c[column].in_(value)
+            return target.in_(value)
         if op in ("notin",):
             if not isinstance(value, (list, tuple, set)):
                 raise QueryError(f"'notin' filter requires a list, got {type(value)}")
-            return self.table.c[column].notin_(value)
+            return target.notin_(value)
         if op in ("between", ".."):
             if not isinstance(value, (list, tuple)) or len(value) != 2:
                 raise QueryError("'between' filter requires a list of two values")
             start, end = value
-            return self.table.c[column].between(start, end)
+            return target.between(start, end)
         if op in ("startswith",):
             if not isinstance(value, str):
                 raise QueryError("'startswith' filter requires a string")
-            return self.table.c[column].startswith(value, autoescape=True)
+            return target.startswith(value, autoescape=True)
         if op in ("endswith",):
             if not isinstance(value, str):
                 raise QueryError("'endswith' filter requires a string")
-            return self.table.c[column].endswith(value, autoescape=True)
+            return target.endswith(value, autoescape=True)
         return false()
 
     def _args_to_clause(
@@ -866,6 +881,234 @@ class Table:
             .order_by(*[c.asc() for c in columns])
         )
         return self.db.query(q)
+
+    # Aggregate functions accepted by :meth:`aggregate`. No arbitrary SQL
+    # expressions are accepted — only these whitelisted function names.
+    AGGREGATE_FUNCTIONS = ("count", "sum", "min", "max", "avg")
+
+    def _normalize_aggregates(
+        self, aggregates: AggregateSpec | Sequence[AggregateSpec]
+    ) -> list[AggregateSpec]:
+        """Accept a single spec or a sequence of specs and validate them."""
+        if (
+            isinstance(aggregates, tuple)
+            and len(aggregates) == 3
+            and isinstance(aggregates[0], str)
+        ):
+            specs = [aggregates]
+        else:
+            specs = list(aggregates)
+        if not specs:
+            raise QueryError("At least one aggregate must be specified.")
+        normalized: list[AggregateSpec] = []
+        for spec in specs:
+            if not isinstance(spec, tuple) or len(spec) != 3:
+                raise QueryError(
+                    f"Aggregate must be a (function, column, alias) tuple, "
+                    f"got: {spec!r}"
+                )
+            function, column, alias = spec
+            function = function.lower()
+            if function not in self.AGGREGATE_FUNCTIONS:
+                raise QueryError(
+                    f"Unsupported aggregate function: {function!r}. "
+                    f"Allowed: {', '.join(self.AGGREGATE_FUNCTIONS)}"
+                )
+            if column is None or column == "*":
+                if function != "count":
+                    raise QueryError(
+                        f"Aggregate {function!r} requires a column; only "
+                        "'count' accepts COUNT(*)."
+                    )
+                column = None
+            else:
+                column = self._get_column_name(column)
+                if not self.has_column(column):
+                    raise DatasetError(f"No such column: {column}")
+            alias = normalize_column_name(alias)
+            normalized.append((function, column, alias))
+        return normalized
+
+    def _build_aggregate(self, function: str, column: str | None) -> ColumnElement[Any]:
+        """Construct a whitelisted aggregate SQL expression."""
+        if function == "count" and column is None:
+            # COUNT(*): counts all rows, including rows with NULL values.
+            return func.count()
+        assert column is not None
+        target = self.table.c[column]
+        if function == "count":
+            # COUNT(column): counts non-NULL values only.
+            return func.count(target)
+        if function == "sum":
+            return func.sum(target)
+        if function == "min":
+            return func.min(target)
+        if function == "max":
+            return func.max(target)
+        return func.avg(target)
+
+    def _having_to_clause(
+        self,
+        having: HavingSpec,
+        expressions: Mapping[str, ColumnElement[Any]],
+    ) -> ColumnElement[bool]:
+        """Turn a HAVING spec into a SQL clause.
+
+        Keys may name either a GROUP BY column or an aggregate result alias.
+        An aggregate alias is resolved back to its aggregate expression
+        (aliases cannot be referenced portably inside HAVING). All values are
+        passed through as bound parameters.
+        """
+        clauses: list[ColumnElement[bool]] = []
+        for key, condition in having.items():
+            key = normalize_column_name(key)
+            lookup = normalize_column_key(key)
+            target = None
+            for name, expression_ in expressions.items():
+                if normalize_column_key(name) == lookup:
+                    target = expression_
+                    break
+            if target is None:
+                raise QueryError(
+                    f"HAVING references unknown column or aggregate alias: {key}"
+                )
+            if isinstance(condition, Mapping):
+                for op, value in condition.items():
+                    clauses.append(self._generate_expression_clause(target, op, value))
+            elif isinstance(condition, (list, tuple, set)):
+                clauses.append(
+                    self._generate_expression_clause(target, "in", condition)
+                )
+            else:
+                clauses.append(self._generate_expression_clause(target, "=", condition))
+        return and_(True, *clauses)
+
+    def aggregate(
+        self,
+        aggregates: AggregateSpec | Sequence[AggregateSpec],
+        group_by: str | Sequence[str] | None = None,
+        having: HavingSpec | None = None,
+        _streamed: bool = False,
+        _step: int | None = QUERY_STEP,
+        **kwargs: SQLWriteValue,
+    ) -> ResultIter:
+        """Run a grouped aggregation query against the table.
+
+        ``aggregates`` is a list of ``(function, column, alias)`` tuples.
+        Supported functions are ``count``, ``sum``, ``min``, ``max`` and
+        ``avg``. The column may be ``None`` or ``"*"`` only for ``count``,
+        which produces ``COUNT(*)`` and counts all rows; ``COUNT(column)``
+        instead ignores rows where the column is NULL. A single tuple may be
+        passed instead of a list. No arbitrary SQL expressions are accepted::
+
+            # one row per place, with the number of readings
+            results = table.aggregate(
+                [("count", "*", "num_readings")], group_by="place"
+            )
+
+            # several aggregates at once, with a WHERE filter
+            results = table.aggregate(
+                [
+                    ("sum", "temperature", "total"),
+                    ("avg", "temperature", "average"),
+                    ("min", "temperature", "lowest"),
+                ],
+                group_by=["place"],
+                place=["B€rkeley", "G€lway"],
+            )
+
+        ``group_by`` names one or more existing columns. With no GROUP BY,
+        the query returns a single row, following standard database
+        semantics — even when no rows match (aggregates then come back as
+        ``0`` or ``NULL``).
+
+        Aggregate result aliases must be valid column names and must not
+        collide with each other or with the GROUP BY columns.
+
+        ``having`` filters the aggregated groups. Its keys reference either
+        a GROUP BY column or an aggregate alias, which is resolved back to
+        the underlying aggregate. Values use the same filter syntax as
+        :py:meth:`find` and are always passed as bound parameters::
+
+            results = table.aggregate(
+                [("count", "*", "num")],
+                group_by="place",
+                having={"num": {">=": 2}},
+            )
+
+        Remaining keyword arguments become WHERE filters on the underlying
+        rows, just like in :py:meth:`find`. The result is returned as a
+        :class:`ResultIter` that streams rows without materialising them;
+        closing it early (or exhausting it) releases the query resources.
+        """
+        if not self.exists:
+            return ResultIter(None, row_type=self.db.row_type)
+        if self.db.engine is None:
+            raise RuntimeError("Cannot run queries when no engine is available.")
+
+        if _step is False or _step == 0:
+            _step = None
+
+        group_names = [
+            self._get_column_name(name)
+            for name in ensure_strings(group_by)
+            if name is not None
+        ]
+        for name in group_names:
+            if not self.has_column(name):
+                raise DatasetError(f"No such column: {name}")
+
+        specs = self._normalize_aggregates(aggregates)
+        used_names: set[str | None] = set()
+        for name in group_names:
+            key = normalize_column_key(name)
+            if key in used_names:
+                raise QueryError(f"Duplicate GROUP BY column: {name}")
+            used_names.add(key)
+        for _function, _column, alias in specs:
+            key = normalize_column_key(alias)
+            if key in used_names:
+                raise QueryError(
+                    f"Aggregate alias {alias!r} conflicts with a GROUP BY "
+                    "column or another aggregate result."
+                )
+            used_names.add(key)
+
+        group_columns = [self.table.c[name].label(name) for name in group_names]
+        aggregate_columns: list[ColumnElement[Any]] = []
+        # Expressions addressable from HAVING: group columns plus each
+        # aggregate, keyed by its result alias.
+        having_expressions: dict[str, ColumnElement[Any]] = {
+            name: self.table.c[name] for name in group_names
+        }
+        for function, column, alias in specs:
+            expression_ = self._build_aggregate(function, column).label(alias)
+            aggregate_columns.append(expression_)
+            having_expressions[alias] = expression_
+
+        where_clause = self._args_to_clause(kwargs)
+        query = (
+            select(*group_columns, *aggregate_columns)
+            .select_from(self.table)
+            .where(where_clause)
+        )
+        if group_columns:
+            query = query.group_by(*[self.table.c[name] for name in group_names])
+        if having:
+            query = query.having(self._having_to_clause(having, having_expressions))
+
+        stream_conn = None
+        conn = self.db.executable
+        if _streamed:
+            stream_conn = self.db.engine.connect()
+            conn = stream_conn.execution_options(stream_results=True)
+
+        return ResultIter(
+            conn.execute(query),
+            row_type=self.db.row_type,
+            step=_step,
+            connection=stream_conn,
+        )
 
     # Legacy methods for running find queries.
     all = find

@@ -1,12 +1,14 @@
 from datetime import datetime
 
 import pytest
+from sqlalchemy import func, select
 from sqlalchemy.exc import ArgumentError
 from sqlalchemy.types import BIGINT, TEXT
 
 from dataset import chunked
+from dataset.util import DatasetError, QueryError, ResultIter
 
-from .conftest import TEST_CITY_1, TEST_DATA
+from .conftest import TEST_CITY_1, TEST_CITY_2, TEST_DATA
 
 
 def test_insert(table):
@@ -449,3 +451,306 @@ def test_key_order(db, table):
 def test_empty_query(table):
     empty = list(table.find(place="not in data"))
     assert len(empty) == 0, empty
+
+
+def test_aggregate_returns_result_iter(table):
+    results = table.aggregate([("count", "*", "num")], group_by="place")
+    assert isinstance(results, ResultIter)
+    rows = list(results)
+    assert len(rows) == 2, rows
+    # Result resources are released once the iterator is exhausted
+    assert results.result_proxy is not None
+    assert results.result_proxy.closed
+
+
+def test_aggregate_group_by_single_spec(table):
+    rows = list(table.aggregate(("count", "*", "num"), group_by="place"))
+    counts = {row["place"]: row["num"] for row in rows}
+    assert counts == {TEST_CITY_1: 3, TEST_CITY_2: 3}, counts
+
+
+def test_aggregate_multiple_functions(table):
+    rows = list(
+        table.aggregate(
+            [
+                ("count", "*", "num"),
+                ("sum", "temperature", "total"),
+                ("min", "temperature", "lowest"),
+                ("max", "temperature", "highest"),
+                ("avg", "temperature", "average"),
+            ],
+            group_by="place",
+        )
+    )
+    by_place = {row["place"]: row for row in rows}
+    galway = by_place[TEST_CITY_2]
+    assert galway["num"] == 3
+    assert galway["total"] == 0  # 1 + -1 + 0
+    assert galway["lowest"] == -1
+    assert galway["highest"] == 1
+    berkeley = by_place[TEST_CITY_1]
+    assert berkeley["total"] == 19  # 6 + 8 + 5
+    assert berkeley["average"] == 19 / 3
+
+
+def test_aggregate_count_star_vs_count_column(db):
+    tbl = db["null_counts"]
+    tbl.insert_many(
+        [
+            {"grp": "a", "value": 1},
+            {"grp": "a", "value": None},
+            {"grp": "a", "value": 3},
+            {"grp": "b", "value": None},
+        ]
+    )
+    rows = list(
+        tbl.aggregate(
+            [
+                ("count", "*", "all_rows"),
+                ("count", "value", "non_null"),
+            ],
+            group_by="grp",
+        )
+    )
+    stats = {row["grp"]: row for row in rows}
+    assert stats["a"]["all_rows"] == 3
+    assert stats["a"]["non_null"] == 2
+    assert stats["b"]["all_rows"] == 1
+    assert stats["b"]["non_null"] == 0
+
+
+def test_aggregate_multi_column_grouping(table):
+    rows = list(table.aggregate([("count", "*", "num")], group_by=["place", "date"]))
+    assert len(rows) == 6, rows
+    for row in rows:
+        assert set(row.keys()) == {"place", "date", "num"}
+        assert row["num"] == 1
+
+
+def test_aggregate_where_filters(table):
+    rows = list(
+        table.aggregate(
+            [("sum", "temperature", "total")],
+            group_by="place",
+            place=TEST_CITY_1,
+        )
+    )
+    assert len(rows) == 1, rows
+    assert rows[0]["place"] == TEST_CITY_1
+    assert rows[0]["total"] == 19
+
+    # DSL operators also work and their values are parameter-bound
+    rows = list(
+        table.aggregate(
+            [("count", "*", "num")],
+            group_by="place",
+            temperature={">": 5},
+        )
+    )
+    assert {row["place"]: row["num"] for row in rows} == {TEST_CITY_1: 2}
+
+
+def test_aggregate_no_group_by(table):
+    rows = list(table.aggregate([("count", "*", "num"), ("sum", "temperature", "s")]))
+    assert len(rows) == 1, rows
+    assert rows[0]["num"] == 6
+    assert rows[0]["s"] == 19
+
+
+def test_aggregate_no_group_by_no_matching_rows(table):
+    # Standard SQL semantics: an aggregate without GROUP BY returns one row
+    # even when the WHERE clause matches nothing.
+    rows = list(
+        table.aggregate(
+            [
+                ("count", "*", "num"),
+                ("sum", "temperature", "total"),
+                ("avg", "temperature", "average"),
+            ],
+            place="Atlantis",
+        )
+    )
+    assert len(rows) == 1, rows
+    assert rows[0]["num"] == 0
+    assert rows[0]["total"] is None
+    assert rows[0]["average"] is None
+
+
+def test_aggregate_group_by_no_matching_rows(table):
+    # With GROUP BY, no matching groups means no result rows.
+    rows = list(
+        table.aggregate(
+            [("count", "*", "num")],
+            group_by="place",
+            place="Atlantis",
+        )
+    )
+    assert rows == []
+
+
+def test_aggregate_having_without_group_by(table):
+    # HAVING filters the single aggregate row; database semantics decide
+    # whether it survives.
+    rows = list(table.aggregate([("count", "*", "num")], having={"num": {">": 6}}))
+    assert rows == []
+    rows = list(table.aggregate([("count", "*", "num")], having={"num": {"<=": 6}}))
+    assert len(rows) == 1
+    assert rows[0]["num"] == 6
+
+
+def test_aggregate_having_alias(table):
+    rows = list(
+        table.aggregate(
+            [("count", "*", "num"), ("sum", "temperature", "total")],
+            group_by="place",
+            having={"num": {">=": 3}},
+        )
+    )
+    assert len(rows) == 2, rows
+    for row in rows:
+        assert row["num"] >= 3
+
+    rows = list(
+        table.aggregate(
+            [("count", "*", "num")],
+            group_by="place",
+            having={"num": {">": 3}},
+        )
+    )
+    assert rows == []
+
+    # HAVING can also reference a GROUP BY column
+    rows = list(
+        table.aggregate(
+            [("count", "*", "num")],
+            group_by="place",
+            having={"place": TEST_CITY_1},
+        )
+    )
+    assert len(rows) == 1
+    assert rows[0]["place"] == TEST_CITY_1
+
+
+def test_aggregate_having_equality_and_between(table):
+    rows = list(
+        table.aggregate(
+            [("count", "*", "num"), ("sum", "temperature", "total")],
+            group_by="place",
+            having={"num": 3, "total": {"between": [-5, 10]}},
+        )
+    )
+    assert {row["place"] for row in rows} == {TEST_CITY_2}
+
+
+def test_aggregate_having_unknown_alias(table):
+    with pytest.raises(QueryError):
+        list(
+            table.aggregate(
+                [("count", "*", "num")],
+                group_by="place",
+                having={"nope": 1},
+            )
+        )
+
+
+def test_aggregate_alias_conflicts_with_group_column(table):
+    with pytest.raises(QueryError):
+        table.aggregate([("count", "*", "place")], group_by="place")
+
+
+def test_aggregate_duplicate_aliases(table):
+    with pytest.raises(QueryError):
+        table.aggregate(
+            [
+                ("count", "*", "num"),
+                ("sum", "temperature", "num"),
+            ],
+            group_by="place",
+        )
+
+
+def test_aggregate_unknown_function(table):
+    with pytest.raises(QueryError):
+        table.aggregate([("median", "temperature", "m")], group_by="place")
+
+
+def test_aggregate_star_only_for_count(table):
+    with pytest.raises(QueryError):
+        table.aggregate([("sum", "*", "s")], group_by="place")
+
+
+def test_aggregate_unknown_column(table):
+    with pytest.raises(DatasetError):
+        table.aggregate([("sum", "nope", "s")], group_by="place")
+    with pytest.raises(DatasetError):
+        table.aggregate([("count", "*", "num")], group_by="nope")
+
+
+def test_aggregate_empty_specs(table):
+    with pytest.raises(QueryError):
+        table.aggregate([], group_by="place")
+
+
+def test_aggregate_malformed_spec(table):
+    with pytest.raises(QueryError):
+        table.aggregate([("count", "*")], group_by="place")  # type: ignore[list-item]
+
+
+def test_aggregate_case_insensitive_columns_and_aliases(table):
+    rows = list(
+        table.aggregate(
+            [("COUNT", "*", "NUM")],
+            group_by="PLACE",
+            having={"num": 3},
+        )
+    )
+    assert len(rows) == 2
+    assert "NUM" in rows[0]
+
+
+def test_aggregate_on_missing_table(db):
+    tbl = db.load_table("does_not_exist")
+    assert list(tbl.aggregate([("count", "*", "num")])) == []
+
+
+def test_aggregate_values_are_bound(table):
+    # Compile the statement and make sure filter values become bind parameters
+    # rather than being interpolated into the SQL text.
+    place = table.table.c.place
+    stmt = select(place.label("place"), func.count().label("num")).where(
+        table._args_to_clause({"place": TEST_CITY_1})
+    )
+    compiled = stmt.compile(table.db.engine)
+    assert TEST_CITY_1 in compiled.params.values()
+    assert TEST_CITY_1 not in str(compiled)
+
+
+def test_aggregate_streamed_close_releases_connection(db, table):
+    results = table.aggregate(
+        [("count", "*", "num")],
+        group_by="place",
+        _streamed=True,
+        _step=1,
+    )
+    stream_conn = results._conn
+    assert stream_conn is not None
+    assert not stream_conn.closed
+    # Closing without consuming everything still returns the stream connection
+    results.close()
+    assert stream_conn.closed
+    assert results._conn is None
+    # Closing again is a safe no-op
+    results.close()
+
+
+def test_aggregate_streamed_consume(table):
+    rows = list(
+        table.aggregate(
+            [("count", "*", "num")],
+            group_by="place",
+            _streamed=True,
+            _step=1,
+        )
+    )
+    assert len(rows) == 2
+
