@@ -3,6 +3,18 @@
 History
 -------
 
+(unreleased)
+~~~~~~~~~~~~
+
+* Added support for the Selectors Level 4 ``An+B of S`` syntax of
+  ``:nth-child()`` and ``:nth-last-child()`` in CSS queries, e.g.
+  ``li:nth-child(2 of .item)``. Positions are counted only among the siblings
+  matching the selector list ``S``, a node matched by several selectors of the
+  list counts once, and siblings of different parents are counted separately.
+  The ``An+B`` part accepts ``odd``/``even``, constants, and negative steps.
+  Unsupported combinations, such as ``:nth-of-type(An+B of S)``, a pseudo-element
+  or ``:scope`` inside ``S``, are rejected before the query runs.
+
 1.12.1 (2026-09-28)
 ~~~~~~~~~~~~~~~~~~~
 

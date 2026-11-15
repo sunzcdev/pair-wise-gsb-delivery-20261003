@@ -296,6 +296,54 @@ Examples:
 
 .. _CSS Selectors: https://www.w3.org/TR/css3-selectors/#selectors
 
+.. _topics-selectors-nth-child-of:
+
+Counting only matching siblings
+-------------------------------
+
+``:nth-child()`` and ``:nth-last-child()`` also accept the Selectors Level 4
+``An+B of S`` form, where the position is counted only among the siblings that
+match the selector list ``S``. In a list such as::
+
+    >>> html = """
+    ... <ul>
+    ...   <li class="ad">ad</li>
+    ...   <li class="item">1</li>
+    ...   <li class="separator">---</li>
+    ...   <li class="item">2</li>
+    ...   <li class="item">3</li>
+    ... </ul>
+    ... """
+    >>> sel = Selector(text=html)
+
+``li:nth-child(2 of .item)`` selects only the second ``.item`` sibling, skipping
+the advertisement and separator nodes::
+
+    >>> sel.css('li:nth-child(2 of .item)::text').get()
+    '2'
+
+``li:nth-last-child(1 of .item)`` counts from the end in the same way::
+
+    >>> sel.css('li:nth-last-child(1 of .item)::text').get()
+    '3'
+
+``S`` may be a selector list, and a node matched by more than one of its
+selectors is counted once::
+
+    >>> sel.css('li:nth-child(1 of .item, .promo)::text').getall()
+    ['1']
+
+``An+B`` supports positive and negative steps, constants, and ``odd``/``even``,
+as in plain ``:nth-child()``. Commas and parentheses inside strings, such as
+attribute values, are not treated as the ``of`` keyword or as selector-list
+separators.
+
+The ``of S`` form is only supported by ``:nth-child()`` and
+``:nth-last-child()``. Combinations that cannot be expressed, such as
+``:nth-of-type(An+B of S)``, a pseudo-element or ``:scope`` inside ``S``, raise
+an error before the query runs.
+
+
 .. _topics-selectors-nesting-selectors:
 
 Nesting selectors
