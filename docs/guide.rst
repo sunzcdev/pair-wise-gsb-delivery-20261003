@@ -353,6 +353,97 @@ For more information, see:
 * :py:class:`Result`
 * :py:class:`TaskException`
 
+Rejected messages (dead-letter store)
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+Two kinds of dequeued messages can never become a task:
+
+1. **Corrupt messages** whose bytes fail to deserialize (the
+   ``deserialize`` stage).
+2. **Unknown tasks** that deserialize fine but name a task which is not
+   registered with the consumer (the ``registry`` stage), e.g. a message
+   produced by an older version of your application.
+
+By default these messages are logged and discarded, and the worker moves on
+to the next message. To preserve them instead, enable a dead-letter store:
+
+.. code-block:: python
+
+    from huey import SqliteHuey
+    from huey.deadletter import SqliteDeadLetterStorage
+
+    # A local SQLite database is enough to inspect and replay rejections.
+    huey = SqliteHuey('my-app', filename='queue.db',
+                      dead_letter=SqliteDeadLetterStorage,
+                      filename='dead-letter.db')
+
+    # Or keep rejections in memory (lost on restart):
+    huey = MemoryHuey('my-app', dead_letter=True)
+
+Each rejection is stored with its **original, unmodified message bytes**, the
+**source queue**, the **failure stage**, the exception representation and the
+time the message was received (dequeued). The dead-letter store is completely
+separate from the result key/value store - it uses its own tables/collections,
+its own retention policy and its own flush method, so rejection records can
+never collide with or be mistaken for task results.
+
+Inspecting rejections::
+
+    # Newest first; include_replayed=False hides already-replayed records.
+    for record in huey.dead_letters(include_replayed=False):
+        print(record.id, record.stage, record.queue, record.error)
+
+    huey.dead_letter_count()          # Total retained records.
+    huey.get_dead_letter(record_id)   # Fetch a single record.
+    huey.delete_dead_letter(record_id)
+    huey.flush_dead_letters()         # Clear all rejections only.
+
+Retention
+"""""""""
+
+Rejected messages have an independent retention policy configured when the
+store is created. ``max_items`` keeps only the newest N records and ``ttl``
+drops records older than the given number of seconds; pruning runs on every
+write and can also be triggered explicitly:
+
+.. code-block:: python
+
+    huey = SqliteHuey('my-app', dead_letter=True,
+                      dead_letter_max_items=1000, dead_letter_ttl=7 * 86400)
+    huey.prune_dead_letters()
+
+Safety
+""""""
+
+A message is only considered handled once its rejection record has been
+durably written. If the dead-letter store itself fails, Huey puts the original
+bytes back on the source queue and re-raises the error rather than claiming the
+message was saved. With no dead-letter store configured the historical
+log-and-drop behavior is unchanged.
+
+Replaying rejections
+""""""""""""""""""""
+
+Replay is always an explicit action - nothing is re-enqueued automatically.
+Calling :py:meth:`Huey.replay_dead_letter` places the original bytes back onto
+their source queue. Parameters are never rewritten and no validation is
+skipped: the message goes through the exact same deserialize and registry
+lookup as any other message.
+
+.. code-block:: python
+
+    # Re-deploy a build that registers the missing task, then:
+    huey.replay_dead_letter(record_id)
+
+    # Or replay every outstanding rejection at once.
+    huey.replay_dead_letters()
+
+The originating record is marked ``replayed`` but **not deleted**, preserving
+the audit trail. If the underlying problem still exists the message is
+rejected again, and the new record is linked to the original through its
+``origin_id`` field. Replaying an unknown or already-replayed id raises
+``KeyError``.
+
 .. _immediate:
 
 Immediate mode

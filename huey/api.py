@@ -1,5 +1,6 @@
 import copy
 import datetime
+import hashlib
 import inspect
 import itertools
 import logging
@@ -16,6 +17,12 @@ from functools import wraps
 from huey import signals as S
 from huey.constants import EmptyData
 from huey.consumer import Consumer
+from huey.deadletter import BaseDeadLetterStorage
+from huey.deadletter import MemoryDeadLetterStorage
+from huey.deadletter import SqliteDeadLetterStorage
+from huey.deadletter import STATUS_REJECTED
+from huey.deadletter import STAGE_DESERIALIZE
+from huey.deadletter import STAGE_REGISTRY
 from huey.exceptions import CancelExecution
 from huey.exceptions import ConfigurationError
 from huey.exceptions import RateLimitExceeded
@@ -72,6 +79,14 @@ class Huey(object):
     :param bool use_zlib: use zlib for compression instead of gzip.
     :param bool immediate_use_memory: automatically switch to a local in-memory
         storage backend when immediate-mode is enabled.
+    :param dead_letter: enable an optional dead-letter store for messages that
+        cannot be processed because they are corrupt or reference a task that
+        is not registered. Accepts ``False``/``None`` (disabled, the default),
+        ``True`` (an in-memory store), an already-initialized
+        :class:`~huey.deadletter.BaseDeadLetterStorage` instance, or the class
+        plus keyword arguments (e.g. ``SqliteDeadLetterStorage,
+        filename='huey.db')``). The dead-letter store is kept completely
+        separate from the result store and has its own retention policy.
     :param storage_kwargs: arbitrary keyword arguments that will be passed to
         the storage backend for additional configuration.
 
@@ -95,7 +110,9 @@ class Huey(object):
     def __init__(self, name='huey', results=True, store_none=False, utc=True,
                  immediate=False, serializer=None, compression=False,
                  use_zlib=False, immediate_use_memory=True, storage_class=None,
-                 store_intermediate_errors=True, **storage_kwargs):
+                 store_intermediate_errors=True, dead_letter=None,
+                 dead_letter_max_items=None, dead_letter_ttl=None,
+                 **storage_kwargs):
 
         self.name = name
         self.results = results
@@ -113,6 +130,10 @@ class Huey(object):
         if storage_class is not None:
             self.storage_class = storage_class
         self.storage = self.create_storage()
+
+        # Optional, fully-independent dead-letter (rejected message) store.
+        self.dead_letter = self.create_dead_letter(
+            dead_letter, dead_letter_max_items, dead_letter_ttl)
 
         # Allow overriding the default TaskWrapper implementation.
         self.task_wrapper_class = self.get_task_wrapper_class()
@@ -151,6 +172,43 @@ class Huey(object):
         else:
             Storage = self.storage_class
         return Storage(self.name, **kwargs)
+
+    def create_dead_letter(self, config, max_items=None, ttl=None):
+        """
+        Build the optional dead-letter store.
+
+        ``config`` may be:
+
+        * ``False`` or ``None`` - dead-lettering is disabled and unprocessable
+          messages are logged and dropped (the historical behavior).
+        * ``True`` - use an in-memory dead-letter store.
+        * a :class:`~huey.deadletter.BaseDeadLetterStorage` instance, used as
+          given (the retention arguments are ignored).
+        * a dead-letter storage class, instantiated with the retention
+          arguments plus any defaults.
+        """
+        if not config:
+            return None
+        if isinstance(config, BaseDeadLetterStorage):
+            return config
+        if config is True:
+            config = MemoryDeadLetterStorage
+        if not inspect.isclass(config) or not issubclass(
+                config, BaseDeadLetterStorage):
+            raise ConfigurationError(
+                'dead_letter must be a boolean, a BaseDeadLetterStorage '
+                'instance or subclass, got %r' % (config,))
+
+        kwargs = {}
+        if config is SqliteDeadLetterStorage:
+            # Keep the dead-letter tables in a separate database file by
+            # default so they can never be confused with task results.
+            kwargs['filename'] = '%s-dead-letter.db' % self.name
+        if max_items is not None:
+            kwargs['max_items'] = max_items
+        if ttl is not None:
+            kwargs['ttl'] = ttl
+        return config(**kwargs)
 
     @property
     def immediate(self):
@@ -372,8 +430,69 @@ class Huey(object):
 
     def dequeue(self):
         data = self.storage.dequeue()
-        if data is not None:
-            return self.deserialize_task(data)
+        if data is None:
+            return None
+        received_at = time.time()
+        try:
+            # Split the two failure modes so the rejection record can report
+            # exactly where processing broke down: malformed bytes versus a
+            # message that names a task no longer present in the registry.
+            message = self.serializer.deserialize(data)
+        except Exception as exc:
+            return self._handle_unprocessable(
+                data, STAGE_DESERIALIZE, exc, received_at)
+        try:
+            return self._registry.create_task(message)
+        except Exception as exc:
+            return self._handle_unprocessable(
+                data, STAGE_REGISTRY, exc, received_at)
+
+    def _handle_unprocessable(self, data, stage, exc, received_at):
+        """
+        Deal with a dequeued message that cannot be turned into a task.
+
+        With no dead-letter store configured the historical behavior is kept:
+        the message is logged and dropped. Otherwise the original bytes are
+        persisted to the dead-letter store. If that write fails the message is
+        placed back on the source queue and the exception is re-raised, so we
+        never report a message as safely stored when it was not.
+        """
+        error = repr(exc)
+        if self.dead_letter is None:
+            logger.error('Discarding unprocessable message (stage=%s): %s',
+                         stage, error, exc_info=exc)
+            return None
+
+        origin_id = self.dead_letter.pending_origin(
+            self._dead_letter_hash(data))
+        try:
+            record = self.dead_letter.add(
+                queue=self.storage.name,
+                data=data,
+                stage=stage,
+                error=error,
+                enqueued_at=received_at,
+                origin_id=origin_id)
+        except Exception:
+            logger.exception('Could not write message to dead-letter store, '
+                             'returning it to queue "%s".', self.storage.name)
+            try:
+                self.storage.enqueue(data)
+            except Exception:
+                logger.exception('Could not return message to queue "%s".',
+                                 self.storage.name)
+            raise
+        if origin_id is not None:
+            # A replay failed again; clear the in-flight association now that
+            # the new rejection (linked via origin_id) is durably stored.
+            self.dead_letter.clear_pending(self._dead_letter_hash(data))
+        logger.error('Rejected unprocessable message (stage=%s), stored as '
+                     'dead-letter %s: %s', stage, record.id, error)
+        return None
+
+    @staticmethod
+    def _dead_letter_hash(data):
+        return hashlib.sha256(bytes(data)).hexdigest()
 
     def put(self, key, data):
         return self.storage.put_data(key, self.serializer.serialize(data))
@@ -753,6 +872,96 @@ class Huey(object):
 
     def flush(self):
         self.storage.flush_all()
+
+    # ------------------------------------------------------------------ #
+    # Dead-letter (rejected message) support.
+    # ------------------------------------------------------------------ #
+
+    def _require_dead_letter(self):
+        if self.dead_letter is None:
+            raise ConfigurationError(
+                'No dead-letter store is configured on this Huey instance. '
+                'Pass dead_letter=True (or a dead-letter storage) when '
+                'creating your Huey instance.')
+        return self.dead_letter
+
+    def dead_letters(self, include_replayed=True, limit=None):
+        """List retained rejection records, newest first."""
+        return self._require_dead_letter().list(include_replayed, limit)
+
+    def dead_letter_count(self, include_replayed=True):
+        """Return the number of retained rejection records."""
+        return self._require_dead_letter().count(include_replayed)
+
+    def get_dead_letter(self, id):
+        """Return a single rejection record by id, or ``None``."""
+        return self._require_dead_letter().get(id)
+
+    def delete_dead_letter(self, id):
+        """Delete a single rejection record. Returns whether it existed."""
+        return self._require_dead_letter().delete(id)
+
+    def flush_dead_letters(self):
+        """Remove all rejection records. Does not touch the result store."""
+        self._require_dead_letter().flush()
+
+    def prune_dead_letters(self, now=None):
+        """Apply the configured size/TTL retention policy."""
+        self._require_dead_letter().prune(now)
+
+    def replay_dead_letter(self, id):
+        """
+        Explicitly replay a rejected message.
+
+        The original, unmodified message bytes are placed back onto the source
+        queue - parameters are never altered and no validation is skipped. If
+        the underlying problem persists the message is rejected again, with the
+        new record linked to ``id`` via its ``origin_id``.
+
+        The originating record is marked as ``replayed`` (it is not deleted),
+        preserving the full audit trail and the association between attempts.
+
+        :returns: the id of the replayed rejection record.
+        :raises KeyError: if the id is unknown or already replayed.
+        """
+        store = self._require_dead_letter()
+        record = store.get(id)
+        if record is None or record.status != STATUS_REJECTED:
+            raise KeyError(id)
+
+        # Register the association before the bytes re-enter the queue so that
+        # a worker that immediately rejects them still links the new record to
+        # this one via its origin_id. The association is cleared when that
+        # linked rejection is written, or by the retention policy's prune.
+        data_hash = self._dead_letter_hash(record.data)
+        store.register_pending(data_hash, id)
+        try:
+            self.storage.enqueue(record.data)
+        except Exception:
+            store.clear_pending(data_hash)
+            raise
+        store.mark_replayed(id)
+        logger.info('Replayed dead-letter %s back onto queue "%s".', id,
+                    record.queue)
+        return id
+
+    def replay_dead_letters(self, limit=None):
+        """
+        Replay every outstanding (non-replayed) rejection.
+
+        Returns the list of replayed record ids. Each replay is independent:
+        a failure to enqueue one record does not prevent the others from being
+        replayed.
+        """
+        store = self._require_dead_letter()
+        replayed = []
+        for record in store.list(include_replayed=False, limit=limit):
+            try:
+                self.replay_dead_letter(record.id)
+            except KeyError:
+                continue  # Race: replayed by someone else.
+            replayed.append(record.id)
+        return replayed
 
     def lock_task(self, lock_name, ttl=None):
         return TaskLock(self, lock_name, ttl)

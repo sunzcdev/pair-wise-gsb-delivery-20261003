@@ -2544,3 +2544,30 @@ Huey comes with several built-in storage implementations:
 .. autoclass:: huey.storage.BaseStorage
    :members:
 
+
+
+Dead-letter storage
+-------------------
+
+When a dequeued message is corrupt or references an unregistered task, an
+optional dead-letter store preserves the original message bytes together with
+the context needed to understand and replay the rejection. See
+:ref:`the guide <guide>` for an end-to-end walk-through.
+
+.. autoclass:: huey.deadletter.DeadLetter
+   :members:
+
+.. autoclass:: huey.deadletter.BaseDeadLetterStorage
+   :members:
+
+.. autoclass:: huey.deadletter.MemoryDeadLetterStorage
+   :members:
+
+.. autoclass:: huey.deadletter.SqliteDeadLetterStorage
+   :members:
+
+The associated :py:class:`Huey` methods are
+:py:meth:`Huey.dead_letters`, :py:meth:`Huey.dead_letter_count`,
+:py:meth:`Huey.get_dead_letter`, :py:meth:`Huey.delete_dead_letter`,
+:py:meth:`Huey.flush_dead_letters`, :py:meth:`Huey.prune_dead_letters`,
+:py:meth:`Huey.replay_dead_letter` and :py:meth:`Huey.replay_dead_letters`.

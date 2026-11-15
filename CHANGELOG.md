@@ -5,6 +5,18 @@ Changelog
 
 [View commits](https://github.com/coleifer/huey/compare/3.5.4...master)
 
+* Add an optional dead-letter (rejected-message) store. Messages that cannot
+  be deserialized or that name an unregistered task are now persisted with
+  their original bytes, source queue, failure stage and receipt time instead
+  of only being logged and dropped, while the worker keeps processing valid
+  messages. If the dead-letter write fails the message is returned to the
+  queue and the error re-raised, so an unsaved message is never reported as
+  safely stored. Replay is explicit, leaves the original rejection in place
+  and links any re-rejection via `origin_id`; parameters are never rewritten
+  and validation is never skipped. Rejections use independent storage with
+  their own retention policy (`max_items` / `ttl`) and flush method, including
+  in-memory and local SQLite backends.
+
 ## 3.5.4
 
 * Fix possible hang if worker holding the stop flag was killed while holding
