@@ -12,6 +12,8 @@ def json_reader(
     reader_schema: Optional[Schema] = None,
     *,
     decoder=AvroJSONDecoder,
+    explain_callback=None,
+    on_explain_error: str = "raise",
 ) -> reader:
     """Iterator over records in an avro json file.
 
@@ -27,7 +29,14 @@ def json_reader(
     decoder
         By default the standard AvroJSONDecoder will be used, but a custom one
         could be passed here
-
+    explain_callback
+        Optional callable invoked with an :class:`ExplanationEvent` for each
+        real parse decision, using the same path / record-index semantics as
+        the binary readers. When ``None`` (the default) no events are
+        collected.
+    on_explain_error
+        What to do when ``explain_callback`` raises: ``"raise"`` (default;
+        propagate) or ``"ignore"`` (swallow and keep reading).
 
     Example::
 
@@ -50,7 +59,12 @@ def json_reader(
             for record in avro_reader:
                 print(record)
     """
-    reader_instance = reader(decoder(fo), schema)
+    reader_instance = reader(
+        decoder(fo),
+        schema,
+        explain_callback=explain_callback,
+        on_explain_error=on_explain_error,
+    )
     if reader_schema:
         reader_instance.reader_schema = parse_schema(
             reader_schema, reader_instance._named_schemas["reader"], _write_hint=False

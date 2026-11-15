@@ -12,6 +12,7 @@ from typing import (
 )
 from .io.json_decoder import AvroJSONDecoder
 from .types import AvroMessage, Schema
+from ._explain_py import ExplanationEvent
 
 T = TypeVar("T")
 
@@ -42,6 +43,8 @@ class reader(file_reader[AvroMessage]):
         handle_unicode_errors: str = ...,
         return_named_type: bool = ...,
         return_named_type_override: bool = ...,
+        explain_callback: Optional[Callable[[ExplanationEvent], None]] = ...,
+        on_explain_error: str = ...,
     ): ...
 
 class block_reader(file_reader[Block]):
@@ -54,6 +57,8 @@ class block_reader(file_reader[Block]):
         handle_unicode_errors: str = ...,
         return_named_type: bool = ...,
         return_named_type_override: bool = ...,
+        explain_callback: Optional[Callable[[ExplanationEvent], None]] = ...,
+        on_explain_error: str = ...,
     ): ...
 
 class Block:
@@ -85,6 +90,8 @@ def schemaless_reader(
     handle_unicode_errors: str = ...,
     return_named_type: bool = ...,
     return_named_type_override: bool = ...,
+    explain_callback: Optional[Callable[[ExplanationEvent], None]] = ...,
+    on_explain_error: str = ...,
 ) -> AvroMessage: ...
 def is_avro(path_or_buffer: Union[str, IO]) -> bool: ...
 

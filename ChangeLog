@@ -1,3 +1,6 @@
+Unreleased
+* Add optional explain_callback to the pure-Python reader (reader, block_reader, schemaless_reader, json_reader) reporting the field aliases, default values, union branches and numeric promotions actually used while decoding, with schema path and record index; callback failures are controlled via the explicit on_explain_error option and events never contain field values
+
 2026-10-07 version 1.13.1
 * Match reader named schema reference with inline writer schema (@AnkitaAdvitot)
 

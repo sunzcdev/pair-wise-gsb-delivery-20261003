@@ -34,9 +34,47 @@ from ._read_common import (
     HEADER_SCHEMA,
     missing_codec_lib,
 )
+from ._explain_py import (
+    ExplanationCollector,
+    validate_explain_options,
+)
 from .const import NAMED_TYPES, AVRO_TYPES
 
 T = TypeVar("T")
+
+
+def _get_collector(options):
+    """Return the explanation collector, or None when explanations are off.
+
+    When no ``explain_callback`` was supplied, nothing is stored and the
+    reader takes the same code paths as before.
+    """
+    return options.get("_explain_collector")
+
+
+def _read_data_with_record_index(
+    decoder,
+    writer_schema,
+    named_schemas,
+    reader_schema,
+    options,
+):
+    """Read one top-level record, maintaining the explanation record index.
+
+    Used by the binary container and schemaless entry points so both attach
+    the same record-index / schema-path semantics to their events.
+    """
+    collector = _get_collector(options)
+    if collector is not None:
+        collector.begin_record()
+    return read_data(
+        decoder,
+        writer_schema,
+        named_schemas,
+        reader_schema,
+        options,
+    )
+
 
 decimal_context = Context()
 epoch = datetime(1970, 1, 1, tzinfo=timezone.utc)
@@ -421,11 +459,14 @@ def read_union(
     index = decoder.read_index()
     idx_schema = writer_schema[index]
     idx_reader_schema = None
+    collector = _get_collector(options)
 
     if reader_schema:
         # Handle case where the reader schema is just a single type (not union)
         if not isinstance(reader_schema, list):
             if match_types(idx_schema, reader_schema, named_schemas):
+                if collector is not None:
+                    collector.emit_union_branch(index, idx_schema, reader_schema)
                 result = read_data(
                     decoder,
                     idx_schema,
@@ -441,6 +482,8 @@ def read_union(
             for schema in reader_schema:
                 if match_types(idx_schema, schema, named_schemas):
                     idx_reader_schema = schema
+                    if collector is not None:
+                        collector.emit_union_branch(index, idx_schema, schema)
                     result = read_data(
                         decoder,
                         idx_schema,
@@ -454,6 +497,10 @@ def read_union(
                     f"schema mismatch: {writer_schema} not found in {reader_schema}"
                 )
     else:
+        if collector is not None:
+            # No reader schema: the branch taken is determined solely by the
+            # writer's index. Branches not selected produce no event.
+            collector.emit_union_branch(index, idx_schema, None)
         result = read_data(decoder, idx_schema, named_schemas, None, options)
 
     return_record_name_override = options.get("return_record_name_override")
@@ -526,48 +573,88 @@ def read_record(
          field's value is unset.
     """
     record = {}
-    if reader_schema is None:
-        for field in writer_schema["fields"]:
-            record[field["name"]] = read_data(
-                decoder,
-                field["type"],
-                named_schemas,
-                None,
-                options,
-            )
-    else:
-        readers_field_dict = {}
-        aliases_field_dict = {}
-        for f in reader_schema["fields"]:
-            readers_field_dict[f["name"]] = f
-            for alias in f.get("aliases", []):
-                aliases_field_dict[alias] = f
+    collector = _get_collector(options)
+    if collector is not None:
+        # Record names are part of the schema path; reader-schema names are
+        # used during schema resolution, writer-schema names otherwise.
+        record_path_name = (
+            reader_schema["name"] if reader_schema else writer_schema["name"]
+        )
+        collector.push(record_path_name)
+    try:
+        if reader_schema is None:
+            for field in writer_schema["fields"]:
+                if collector is not None:
+                    collector.push(field["name"])
+                try:
+                    record[field["name"]] = read_data(
+                        decoder,
+                        field["type"],
+                        named_schemas,
+                        None,
+                        options,
+                    )
+                finally:
+                    if collector is not None:
+                        collector.pop()
+        else:
+            readers_field_dict = {}
+            aliases_field_dict = {}
+            for f in reader_schema["fields"]:
+                readers_field_dict[f["name"]] = f
+                for alias in f.get("aliases", []):
+                    aliases_field_dict[alias] = f
 
-        for field in writer_schema["fields"]:
-            readers_field = readers_field_dict.get(
-                field["name"],
-                aliases_field_dict.get(field["name"]),
-            )
-            if readers_field:
-                readers_field_name = readers_field["name"]
-                record[readers_field_name] = read_data(
-                    decoder,
-                    field["type"],
-                    named_schemas,
-                    readers_field["type"],
-                    options,
+            for field in writer_schema["fields"]:
+                readers_field = readers_field_dict.get(
+                    field["name"],
+                    aliases_field_dict.get(field["name"]),
                 )
-                del readers_field_dict[readers_field_name]
-            else:
-                skip_data(decoder, field["type"], named_schemas)
+                if readers_field:
+                    readers_field_name = readers_field["name"]
+                    # A real field-alias resolution happened when the writer
+                    # field name differs from the reader field name (an alias
+                    # matched). The event is emitted at the record path before
+                    # the reader field name is pushed onto it.
+                    if collector is not None and field["name"] != readers_field_name:
+                        collector.emit_field_alias(
+                            field["name"],
+                            readers_field_name,
+                            field["name"],
+                        )
+                    if collector is not None:
+                        collector.push(readers_field_name)
+                    try:
+                        record[readers_field_name] = read_data(
+                            decoder,
+                            field["type"],
+                            named_schemas,
+                            readers_field["type"],
+                            options,
+                        )
+                    finally:
+                        if collector is not None:
+                            collector.pop()
+                    del readers_field_dict[readers_field_name]
+                else:
+                    # The reader has no matching field: the value is genuinely
+                    # skipped, so no explanation event is fabricated for it.
+                    skip_data(decoder, field["type"], named_schemas)
 
-        # fill in default values
-        for f_name, field in readers_field_dict.items():
-            if "default" in field:
-                record[field["name"]] = field["default"]
-            else:
-                msg = f"No default value for field {field['name']} in {reader_schema['name']}"
-                raise SchemaResolutionError(msg)
+            # fill in default values
+            for f_name, field in readers_field_dict.items():
+                if "default" in field:
+                    if collector is not None:
+                        # Only defaults that are actually used are reported,
+                        # and never the default value itself.
+                        collector.emit_field_default(field["name"])
+                    record[field["name"]] = field["default"]
+                else:
+                    msg = f"No default value for field {field['name']} in {reader_schema['name']}"
+                    raise SchemaResolutionError(msg)
+    finally:
+        if collector is not None:
+            collector.pop()
 
     return record
 
@@ -618,17 +705,25 @@ SKIPS = {
 }
 
 
-def maybe_promote(data, writer_type, reader_type):
+def maybe_promote(data, writer_type, reader_type, collector=None):
     if writer_type == "int":
         # No need to promote to long since they are the same type in Python
         if reader_type == "float" or reader_type == "double":
+            if collector is not None:
+                collector.emit_promotion(writer_type, reader_type)
             return float(data)
     if writer_type == "long":
         if reader_type == "float" or reader_type == "double":
+            if collector is not None:
+                collector.emit_promotion(writer_type, reader_type)
             return float(data)
     if writer_type == "string" and reader_type == "bytes":
+        if collector is not None:
+            collector.emit_promotion(writer_type, reader_type)
         return data.encode()
     if writer_type == "bytes" and reader_type == "string":
+        if collector is not None:
+            collector.emit_promotion(writer_type, reader_type)
         return data.decode()
     return data
 
@@ -671,7 +766,12 @@ def read_data(
                 return fn(data, writer_schema, reader_schema)
 
         if reader_schema is not None:
-            return maybe_promote(data, record_type, extract_record_type(reader_schema))
+            return maybe_promote(
+                data,
+                record_type,
+                extract_record_type(reader_schema),
+                _get_collector(options),
+            )
         else:
             return data
     else:
@@ -818,7 +918,7 @@ def _iter_avro_records(
         block_fo = read_block(decoder)
 
         for i in range(block_count):
-            yield read_data(
+            yield _read_data_with_record_index(
                 BinaryDecoder(block_fo),
                 writer_schema,
                 named_schemas,
@@ -919,7 +1019,7 @@ class Block:
 
     def __iter__(self):
         for i in range(self.num_records):
-            yield read_data(
+            yield _read_data_with_record_index(
                 BinaryDecoder(self.bytes_),
                 self.writer_schema,
                 self._named_schemas,
@@ -1050,7 +1150,18 @@ class reader(file_reader[AvroMessage]):
         Default `strict`. Should be set to a valid string that can be used in
         the errors argument of the string decode() function. Examples include
         `replace` and `ignore`
-
+    explain_callback
+        Optional callable invoked with an :class:`ExplanationEvent` each time
+        a real parse decision is made while reading a record (field alias
+        match, default value used, union branch selected or numeric
+        promotion). Events carry the schema path and the zero-based record
+        index but never field values. When ``None`` (the default) no events
+        are collected and no extra bookkeeping is done.
+    on_explain_error
+        What to do when ``explain_callback`` raises an exception. Must be
+        explicitly chosen: ``"raise"`` (the default; the exception
+        propagates, aborting iteration) or ``"ignore"`` (the exception is
+        swallowed and reading continues with unchanged data).
 
     Example::
 
@@ -1098,7 +1209,10 @@ class reader(file_reader[AvroMessage]):
         handle_unicode_errors: str = "strict",
         return_named_type: bool = False,
         return_named_type_override: bool = False,
+        explain_callback=None,
+        on_explain_error: str = "raise",
     ):
+        validate_explain_options(explain_callback, on_explain_error)
         options = {
             "return_record_name": return_record_name,
             "return_record_name_override": return_record_name_override,
@@ -1106,6 +1220,10 @@ class reader(file_reader[AvroMessage]):
             "return_named_type": return_named_type,
             "return_named_type_override": return_named_type_override,
         }
+        if explain_callback is not None:
+            options["_explain_collector"] = ExplanationCollector(
+                explain_callback, on_explain_error
+            )
         super().__init__(fo, reader_schema, options)
 
         if isinstance(self.decoder, AvroJSONDecoder):
@@ -1118,7 +1236,7 @@ class reader(file_reader[AvroMessage]):
 
             def _elems():
                 while not self.decoder.done:
-                    yield read_data(
+                    yield _read_data_with_record_index(
                         self.decoder,
                         self.writer_schema,
                         self._named_schemas,
@@ -1177,6 +1295,15 @@ class block_reader(file_reader[Block]):
         Default `strict`. Should be set to a valid string that can be used in
         the errors argument of the string decode() function. Examples include
         `replace` and `ignore`
+    explain_callback
+        Optional callable invoked with an :class:`ExplanationEvent` each time
+        a real parse decision is made while reading a record (field alias
+        match, default value used, union branch selected or numeric
+        promotion). The record index is continuous across all blocks. When
+        ``None`` (the default) no events are collected.
+    on_explain_error
+        What to do when ``explain_callback`` raises: ``"raise"`` (default;
+        propagate) or ``"ignore"`` (swallow and keep reading).
 
 
     Example::
@@ -1213,7 +1340,10 @@ class block_reader(file_reader[Block]):
         handle_unicode_errors: str = "strict",
         return_named_type: bool = False,
         return_named_type_override: bool = False,
+        explain_callback=None,
+        on_explain_error: str = "raise",
     ):
+        validate_explain_options(explain_callback, on_explain_error)
         options = {
             "return_record_name": return_record_name,
             "return_record_name_override": return_record_name_override,
@@ -1221,6 +1351,10 @@ class block_reader(file_reader[Block]):
             "return_named_type": return_named_type,
             "return_named_type_override": return_named_type_override,
         }
+        if explain_callback is not None:
+            options["_explain_collector"] = ExplanationCollector(
+                explain_callback, on_explain_error
+            )
         super().__init__(fo, reader_schema, options)
 
         self._read_header()
@@ -1245,6 +1379,8 @@ def schemaless_reader(
     handle_unicode_errors: str = "strict",
     return_named_type: bool = False,
     return_named_type_override: bool = False,
+    explain_callback=None,
+    on_explain_error: str = "raise",
 ) -> AvroMessage:
     """Reads a single record written using the
     :meth:`~fastavro._write_py.schemaless_writer`
@@ -1283,7 +1419,17 @@ def schemaless_reader(
         Default `strict`. Should be set to a valid string that can be used in
         the errors argument of the string decode() function. Examples include
         `replace` and `ignore`
-
+    explain_callback
+        Optional callable invoked with an :class:`ExplanationEvent` for each
+        real parse decision (field alias match, default value used, union
+        branch selected or numeric promotion). Events use the same schema
+        path semantics as the binary container reader and carry record index
+        ``0`` (a schemaless read decodes a single record). Field values are
+        never included. When ``None`` (the default) no events are collected.
+    on_explain_error
+        What to do when ``explain_callback`` raises: ``"raise"`` (default;
+        the exception propagates) or ``"ignore"`` (the exception is swallowed
+        and the decoded data is returned unchanged).
 
     Example::
 
@@ -1293,6 +1439,8 @@ def schemaless_reader(
 
     Note: The ``schemaless_reader`` can only read a single record.
     """
+    validate_explain_options(explain_callback, on_explain_error)
+
     if writer_schema == reader_schema:
         # No need for the reader schema if they are the same
         reader_schema = None
@@ -1312,8 +1460,12 @@ def schemaless_reader(
         "return_named_type": return_named_type,
         "return_named_type_override": return_named_type_override,
     }
+    if explain_callback is not None:
+        options["_explain_collector"] = ExplanationCollector(
+            explain_callback, on_explain_error
+        )
 
-    return read_data(
+    return _read_data_with_record_index(
         decoder,
         writer_schema,
         named_schemas,

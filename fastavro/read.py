@@ -7,6 +7,16 @@ from . import json_read
 from . import logical_readers
 from . import _read_common
 
+# Explanation events are only implemented by the pure-Python reader, so they
+# are imported from the pure-Python module directly.
+from ._explain_py import (
+    ExplanationEvent,
+    FIELD_ALIAS,
+    FIELD_DEFAULT,
+    UNION_BRANCH,
+    PROMOTION,
+)
+
 # Private API
 HEADER_SCHEMA = _read_common.HEADER_SCHEMA
 SYNC_SIZE = _read_common.SYNC_SIZE
@@ -29,4 +39,9 @@ __all__ = [
     "block_reader",
     "SchemaResolutionError",
     "LOGICAL_READERS",
+    "ExplanationEvent",
+    "FIELD_ALIAS",
+    "FIELD_DEFAULT",
+    "UNION_BRANCH",
+    "PROMOTION",
 ]
