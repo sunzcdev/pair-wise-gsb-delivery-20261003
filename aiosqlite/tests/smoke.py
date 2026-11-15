@@ -511,6 +511,142 @@ class SmokeTest(IsolatedAsyncioTestCase):
                 rows = cursor.fetchall()
                 self.assertEqual(rows, [(1, "hello"), (2, "world")])
 
+    async def test_serialize_deserialize_roundtrip(self):
+        async with (
+            aiosqlite.connect(":memory:") as db1,
+            aiosqlite.connect(":memory:") as db2,
+        ):
+            await db1.execute("create table foo (i integer, k charvar(250))")
+            await db1.executemany(
+                "insert into foo values (?, ?)", [(1, "hello"), (2, "world")]
+            )
+            await db1.commit()
+
+            snapshot = await db1.serialize()
+            self.assertIsInstance(snapshot, bytes)
+            self.assertGreater(len(snapshot), 0)
+
+            with self.assertRaisesRegex(OperationalError, "no such table: foo"):
+                await db2.execute("select * from foo")
+
+            await db2.deserialize(snapshot)
+
+            async with db2.execute("select * from foo") as cursor:
+                rows = await cursor.fetchall()
+                self.assertEqual(rows, [(1, "hello"), (2, "world")])
+
+    async def test_serialize_explicit_database_name(self):
+        async with aiosqlite.connect(":memory:") as db:
+            await db.execute("attach database ':memory:' as aux")
+            await db.execute("create table aux.bar (i integer)")
+            await db.execute("insert into aux.bar values (42)")
+            await db.commit()
+
+            main_snapshot = await db.serialize(name="main")
+            aux_snapshot = await db.serialize(name="aux")
+            self.assertNotEqual(main_snapshot, aux_snapshot)
+
+        async with aiosqlite.connect(":memory:") as db:
+            await db.deserialize(aux_snapshot)
+            async with db.execute("select * from bar") as cursor:
+                self.assertEqual(await cursor.fetchall(), [(42,)])
+
+    async def test_serialize_snapshot_not_affected_by_later_writes(self):
+        async with aiosqlite.connect(":memory:") as db:
+            await db.execute("create table foo (i integer)")
+            await db.execute("insert into foo values (1)")
+            await db.commit()
+
+            snapshot = await db.serialize()
+            snapshot_copy = bytes(snapshot)
+
+            await db.execute("insert into foo values (2)")
+            await db.execute("drop table foo")
+            await db.commit()
+
+            # snapshot bytes object is unchanged by subsequent writes
+            self.assertEqual(snapshot, snapshot_copy)
+
+        async with aiosqlite.connect(":memory:") as db:
+            await db.deserialize(snapshot)
+            async with db.execute("select * from foo") as cursor:
+                self.assertEqual(await cursor.fetchall(), [(1,)])
+
+    async def test_deserialize_conflict_keeps_current_database(self):
+        async with aiosqlite.connect(":memory:") as db:
+            await db.execute("create table foo (i integer)")
+            await db.execute("insert into foo values (1)")
+            await db.commit()
+            replacement = await db.serialize()
+
+            await db.execute("insert into foo values (2)")
+            await db.commit()
+
+            # conflict: active transaction
+            await db.execute("insert into foo values (3)")
+            self.assertTrue(db.in_transaction)
+            with self.assertRaises(OperationalError):
+                await db.deserialize(replacement)
+            await db.rollback()
+
+            # conflict: open cursor with unfetched rows
+            cursor = await db.execute("select * from foo")
+            await cursor.fetchone()
+            with self.assertRaises(OperationalError):
+                await db.deserialize(replacement)
+            await cursor.close()
+
+            # current database is still intact and usable after failures
+            async with db.execute("select * from foo order by i") as cursor:
+                self.assertEqual(await cursor.fetchall(), [(1,), (2,)])
+
+            # and a clean restore still works afterwards
+            await db.deserialize(replacement)
+            async with db.execute("select * from foo") as cursor:
+                self.assertEqual(await cursor.fetchall(), [(1,)])
+
+    async def test_deserialize_does_not_transfer_close_ownership(self):
+        db1 = await aiosqlite.connect(":memory:")
+        try:
+            await db1.execute("create table foo (i integer)")
+            await db1.execute("insert into foo values (7)")
+            await db1.commit()
+            snapshot = await db1.serialize()
+
+            # restore into a borrowed connection and close it again
+            db2 = await aiosqlite.connect(":memory:")
+            await db2.deserialize(snapshot)
+            async with db2.execute("select * from foo") as cursor:
+                self.assertEqual(await cursor.fetchall(), [(7,)])
+            await db2.close()
+
+            # closing the borrowed connection must not affect the source
+            async with db1.execute("select * from foo") as cursor:
+                self.assertEqual(await cursor.fetchall(), [(7,)])
+            await db1.execute("insert into foo values (8)")
+            await db1.commit()
+            async with db1.execute("select * from foo order by i") as cursor:
+                self.assertEqual(await cursor.fetchall(), [(7,), (8,)])
+        finally:
+            await db1.close()
+
+    async def test_serialize_unsupported_platform(self):
+        class ConnectionWithoutSerialize:
+            pass
+
+        async with aiosqlite.connect(":memory:") as db:
+            with patch.object(
+                sqlite3, "Connection", ConnectionWithoutSerialize
+            ):
+                with self.assertRaises(sqlite3.NotSupportedError):
+                    await db.serialize()
+                with self.assertRaises(sqlite3.NotSupportedError):
+                    await db.deserialize(b"")
+
+            # connection still usable afterwards
+            async with db.execute("select 1") as cursor:
+                self.assertEqual(await cursor.fetchall(), [(1,)])
+
     async def test_emits_warning_when_left_open(self):
         db = await aiosqlite.connect(":memory:")
 

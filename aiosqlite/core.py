@@ -413,6 +413,61 @@ class Connection:
 
         await task
 
+    async def serialize(self, *, name: str = "main") -> bytes:
+        """
+        Serialize a database into a bytes snapshot.
+
+        Returns an immutable ``bytes`` object containing the full contents of
+        the database aliased ``name`` (``"main"`` unless specified otherwise).
+        The snapshot is a point-in-time copy; later writes to the database do
+        not modify the returned bytes.
+
+        Raises ``sqlite3.NotSupportedError`` if the underlying sqlite3 library
+        does not provide the serialize API, rather than silently returning an
+        empty snapshot.
+        """
+        if not hasattr(sqlite3.Connection, "serialize"):
+            raise sqlite3.NotSupportedError(
+                "the underlying sqlite3 library does not support serialize"
+            )
+
+        snapshot = await self._execute(self._conn.serialize, name=name)
+        # Defensive copy: guarantee an immutable bytes object detached from
+        # any buffer the underlying library might reuse or mutate later.
+        return bytes(snapshot)
+
+    async def deserialize(self, data: bytes, /, *, name: str = "main") -> None:
+        """
+        Restore a serialized snapshot into the database aliased ``name``.
+
+        The check for conflicting active transactions runs on the connection
+        thread, serialized with any queued statements. Open cursors with
+        unfetched rows also conflict; the underlying sqlite3 library raises
+        ``sqlite3.OperationalError`` in that case. On any failure the current
+        database is left intact and usable.
+
+        Raises ``sqlite3.NotSupportedError`` if the underlying sqlite3 library
+        does not provide the deserialize API.
+        """
+        if not hasattr(sqlite3.Connection, "deserialize"):
+            raise sqlite3.NotSupportedError(
+                "the underlying sqlite3 library does not support deserialize"
+            )
+
+        # Copy up front so the snapshot cannot be mutated by the caller
+        # (e.g. a bytearray) while the restore is queued or running.
+        snapshot = bytes(data)
+
+        def restore() -> None:
+            if self._conn.in_transaction:
+                raise sqlite3.OperationalError(
+                    "cannot deserialize while a transaction is active; "
+                    "commit or roll back first"
+                )
+            self._conn.deserialize(snapshot, name=name)
+
+        await self._execute(restore)
+
     async def backup(
         self,
         target: Union["Connection", sqlite3.Connection],
