@@ -1645,6 +1645,214 @@ class XLSXTests(BaseTestCase):
         wb = load_workbook(filename=BytesIO(_xlsx))
         self.assertEqual('SUM(1+1)', wb.active['A1'].value)
 
+    def test_xlsx_export_formula_policy_text(self):
+        """formula_policy='text' stores '='-prefixed strings verbatim."""
+        data.append(('=SUM(1+1)',))
+        _xlsx = data.export('xlsx', formula_policy='text')
+        wb = load_workbook(filename=BytesIO(_xlsx))
+        cell = wb.active['A1']
+        self.assertEqual('=SUM(1+1)', cell.value)
+        self.assertEqual('s', cell.data_type)
+
+    def test_xlsx_export_formula_policy_formula(self):
+        """formula_policy='formula' stores '='-prefixed strings as formulae."""
+        data.append(('=SUM(1+1)',))
+        _xlsx = data.export('xlsx', formula_policy='formula')
+        wb = load_workbook(filename=BytesIO(_xlsx))
+        cell = wb.active['A1']
+        self.assertEqual('=SUM(1+1)', cell.value)
+        self.assertEqual('f', cell.data_type)
+
+    def test_xlsx_export_formula_policy_per_column(self):
+        """Each column gets its own policy, by header name or index."""
+        data.headers = ('formula', 'literal', 'other')
+        data.append(('=SUM(1+1)', '=not-a-formula', '=SUM(2+2)'))
+        _xlsx = data.export('xlsx', formula_policy={
+            'formula': 'formula',
+            'literal': 'text',
+            2: 'text',
+        })
+        wb = load_workbook(filename=BytesIO(_xlsx))
+        ws = wb.active
+        self.assertEqual('f', ws['A2'].data_type)
+        self.assertEqual('=SUM(1+1)', ws['A2'].value)
+        self.assertEqual('s', ws['B2'].data_type)
+        self.assertEqual('=not-a-formula', ws['B2'].value)
+        self.assertEqual('s', ws['C2'].data_type)
+        self.assertEqual('=SUM(2+2)', ws['C2'].value)
+
+    def test_xlsx_export_formula_policy_sequence(self):
+        """Policies may also be given as a per-column sequence."""
+        data.append(('=SUM(1+1)', '=not-a-formula'))
+        _xlsx = data.export('xlsx', formula_policy=('formula', 'text'))
+        wb = load_workbook(filename=BytesIO(_xlsx))
+        ws = wb.active
+        self.assertEqual('f', ws['A1'].data_type)
+        self.assertEqual('s', ws['B1'].data_type)
+        self.assertEqual('=not-a-formula', ws['B1'].value)
+
+    def test_xlsx_export_formula_policy_default_star(self):
+        """The '*' key sets the default policy for unlisted columns."""
+        data.append(('=SUM(1+1)', '=not-a-formula'))
+        _xlsx = data.export('xlsx', formula_policy={
+            '*': 'text',
+            0: 'formula',
+        })
+        wb = load_workbook(filename=BytesIO(_xlsx))
+        ws = wb.active
+        self.assertEqual('f', ws['A1'].data_type)
+        self.assertEqual('s', ws['B1'].data_type)
+        self.assertEqual('=not-a-formula', ws['B1'].value)
+
+    def test_xlsx_export_formula_policy_in_header(self):
+        """The column policy also applies to the header cell."""
+        data.headers = ('=SUM(1+1)',)
+        _xlsx = data.export('xlsx', formula_policy='text')
+        wb = load_workbook(filename=BytesIO(_xlsx))
+        cell = wb.active['A1']
+        self.assertEqual('=SUM(1+1)', cell.value)
+        self.assertEqual('s', cell.data_type)
+
+    def test_xlsx_export_formula_policy_invalid(self):
+        data.append(('=SUM(1+1)',))
+        with self.assertRaises(ValueError):
+            data.export('xlsx', formula_policy='bogus')
+        with self.assertRaises(ValueError):
+            data.export('xlsx', formula_policy={0: 'bogus'})
+        with self.assertRaises(TypeError):
+            data.export('xlsx', formula_policy=42)
+
+    def test_xlsx_export_formula_policy_takes_precedence_over_escape(self):
+        """An explicit column policy wins over the legacy escape flag."""
+        data.append(('=SUM(1+1)', '=SUM(2+2)'))
+        _xlsx = data.export('xlsx', escape=True,
+                            formula_policy={0: 'formula'})
+        wb = load_workbook(filename=BytesIO(_xlsx))
+        ws = wb.active
+        # column 0 keeps its formula despite escape=True
+        self.assertEqual('=SUM(1+1)', ws['A1'].value)
+        self.assertEqual('f', ws['A1'].data_type)
+        # column 1 falls back to 'auto', so escape still applies
+        self.assertEqual('SUM(2+2)', ws['B1'].value)
+
+    def test_xlsx_export_formula_policy_preserves_types(self):
+        """Numbers, dates and plain text keep their native type."""
+        data.headers = ('int', 'float', 'date', 'text')
+        data.append((1, 2.5, dt.datetime(2026, 11, 15, 10, 30), 'hello'))
+        _xlsx = data.export('xlsx', formula_policy='text')
+        wb = load_workbook(filename=BytesIO(_xlsx))
+        ws = wb.active
+        self.assertEqual(1, ws['A2'].value)
+        self.assertEqual(2.5, ws['B2'].value)
+        self.assertEqual(dt.datetime(2026, 11, 15, 10, 30), ws['C2'].value)
+        self.assertEqual('hello', ws['D2'].value)
+
+    def test_xlsx_import_formulas(self):
+        """formulas=True imports the formula text instead of cached values."""
+        xlsx_source = (
+            Path(__file__).parent / 'files' / 'xlsx_formulas_and_text.xlsx'
+        )
+        with xlsx_source.open('rb') as fh:
+            data = tablib.Dataset().load(fh, 'xlsx', formulas=True)
+        self.assertEqual(
+            data.headers, ['calc', 'literal', 'number', 'when', 'note'])
+        row1, row2 = data[0], data[1]
+        # formula cells are read as their formula text
+        self.assertEqual('=C2*2', row1[0])
+        self.assertEqual('=C3*2', row2[0])
+        # literal '=' text is read verbatim
+        self.assertEqual('=equals-text', row1[1])
+        self.assertEqual('=another=text', row2[1])
+        # numbers, dates and plain text keep their types
+        self.assertEqual(3, row1[2])
+        self.assertEqual(4.5, row2[2])
+        self.assertEqual(dt.datetime(2026, 11, 15, 0, 0), row1[3])
+        self.assertEqual(dt.datetime(2026, 11, 15, 10, 30), row2[3])
+        self.assertEqual('plain text', row1[4])
+
+    def test_xlsx_import_cached_values_default(self):
+        """By default, cached values are imported; a missing cache is None."""
+        xlsx_source = (
+            Path(__file__).parent / 'files' / 'xlsx_formulas_and_text.xlsx'
+        )
+        with xlsx_source.open('rb') as fh:
+            data = tablib.Dataset().load(fh, 'xlsx')
+        row1, row2 = data[0], data[1]
+        self.assertEqual(6, row1[0])  # cached value of =C2*2
+        self.assertIsNone(row2[0])  # =C3*2 has no cached value
+        self.assertEqual('=equals-text', row1[1])
+        self.assertEqual(3, row1[2])
+        self.assertEqual(dt.datetime(2026, 11, 15, 0, 0), row1[3])
+
+    def test_xlsx_import_missing_formula_cache_marker(self):
+        """Formula cells without a cached value can be marked explicitly."""
+        xlsx_source = (
+            Path(__file__).parent / 'files' / 'xlsx_formulas_and_text.xlsx'
+        )
+        with xlsx_source.open('rb') as fh:
+            data = tablib.Dataset().load(
+                fh, 'xlsx', missing_formula_cache='#NO_CACHE#')
+        row1, row2 = data[0], data[1]
+        self.assertEqual(6, row1[0])  # cached value still wins
+        self.assertEqual('#NO_CACHE#', row2[0])  # missing cache is marked
+        self.assertEqual('=equals-text', row1[1])
+        self.assertEqual(4.5, row2[2])
+
+    def test_xlsx_import_book_formulas_and_marker(self):
+        """Databook import supports formulas and missing_formula_cache."""
+        xlsx_source = (
+            Path(__file__).parent / 'files' / 'xlsx_formulas_and_text.xlsx'
+        )
+        with xlsx_source.open('rb') as fh:
+            book = tablib.Databook().load(fh, 'xlsx', formulas=True)
+        self.assertEqual('=C2*2', book.sheets()[0][0][0])
+
+        with xlsx_source.open('rb') as fh:
+            book = tablib.Databook().load(
+                fh, 'xlsx', missing_formula_cache='#NO_CACHE#')
+        sheet = book.sheets()[0]
+        self.assertEqual(6, sheet[0][0])
+        self.assertEqual('#NO_CACHE#', sheet[1][0])
+
+    def test_xlsx_formula_text_roundtrip(self):
+        """Round-trip a workbook mixing formulae and literal '=' text."""
+        xlsx_source = (
+            Path(__file__).parent / 'files' / 'xlsx_formulas_and_text.xlsx'
+        )
+        with xlsx_source.open('rb') as fh:
+            data = tablib.Dataset().load(fh, 'xlsx', formulas=True)
+
+        # export: 'calc' column as formulae, 'literal' column as text
+        _xlsx = data.export('xlsx', formula_policy={
+            'calc': 'formula',
+            'literal': 'text',
+        })
+        wb = load_workbook(filename=BytesIO(_xlsx))
+        ws = wb.active
+        self.assertEqual('f', ws['A2'].data_type)
+        self.assertEqual('=C2*2', ws['A2'].value)
+        self.assertEqual('f', ws['A3'].data_type)
+        self.assertEqual('s', ws['B2'].data_type)
+        self.assertEqual('=equals-text', ws['B2'].value)
+        self.assertEqual('s', ws['B3'].data_type)
+        self.assertEqual('=another=text', ws['B3'].value)
+
+        # re-import the exported workbook: formulae come back as text,
+        # literal '=' strings are preserved verbatim, types are kept
+        reimported = tablib.Dataset().load(BytesIO(_xlsx), 'xlsx',
+                                           formulas=True)
+        self.assertEqual(reimported.headers, data.headers)
+        self.assertEqual(reimported[0], data[0])
+        self.assertEqual(reimported[1], data[1])
+
+        # reading cached values: exported formulae have no cache yet
+        reimported = tablib.Dataset().load(
+            BytesIO(_xlsx), 'xlsx', missing_formula_cache='#NO_CACHE#')
+        self.assertEqual('#NO_CACHE#', reimported[0][0])
+        self.assertEqual('=equals-text', reimported[0][1])
+        self.assertEqual(3, reimported[0][2])
+        self.assertEqual(dt.datetime(2026, 11, 15, 0, 0), reimported[0][3])
+
     def test_xlsx_bad_dimensions(self):
         """Test loading file with bad dimension.  Must be done with
         read_only=False."""

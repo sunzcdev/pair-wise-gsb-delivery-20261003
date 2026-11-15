@@ -276,7 +276,13 @@ The adaptive width will be calculated for each sheet in the databook.
 .. note::
 
     When reading an ``xlsx`` file containing formulas in its cells, Tablib will
-    read the cell values, not the cell formulas.
+    read the cell values, not the cell formulas.  Tablib never evaluates
+    formulas itself.  Pass ``formulas=True`` to ``import_set()`` /
+    ``import_book()`` to import the formula text (e.g. ``'=SUM(A1:B1)'``)
+    instead.  When reading cached values, a formula cell whose cached value
+    does not exist is imported as ``None``; pass ``missing_formula_cache``
+    (e.g. the ``tablib.formats._xlsx.FORMULA_CACHE_MISSING`` constant) to
+    have such cells replaced by that marker instead.
 
 .. versionchanged:: 2.0.0
 
@@ -285,6 +291,23 @@ The adaptive width will be calculated for each sheet in the databook.
 You can export data to xlsx format by calling :meth:`export('xlsx') <.export>`.
 There are optional parameters to control the export.
 For available parameters, see :meth:`tablib.formats._xlsx.XLSXFormat.export_set`.
+
+Strings starting with ``=`` are stored as formulas by default (this is
+openpyxl's behaviour).  The ``formula_policy`` parameter of ``export_set()``
+and ``export_book()`` lets the caller decide explicitly, per column, whether
+such strings are stored as formulas or as literal text.  It accepts one of
+the ``tablib.formats._xlsx.FORMULA_*`` constants (``FORMULA_AUTO``,
+``FORMULA_TEXT``, ``FORMULA_FORMULA``) applied to every column, a sequence
+applied by column position, or a mapping of column index / header name to a
+constant, using the special key ``'*'`` as the default for unlisted columns.
+With ``FORMULA_TEXT`` the cell text is preserved verbatim, so a literal
+``'=not-a-formula'`` string survives a round trip.  Numbers, dates and
+plain text always keep their native type regardless of the policy::
+
+    data.export('xlsx', formula_policy={
+        '*': 'text',        # store strings verbatim by default
+        'total': 'formula', # except the 'total' column
+    })
 
 .. admonition:: Binary Warning
 
