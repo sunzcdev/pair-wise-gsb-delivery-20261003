@@ -266,6 +266,83 @@ Child(a=1, b='foo')
 
 ```
 
+## Deterministic Sets Strategy
+
+_Found at {py:func}`cattrs.strategies.configure_deterministic_sets`._
+
+Sets and frozensets are unordered, so their iteration order follows the (potentially process-randomized) hash values of their elements.
+Archiving the unstructured output of a set can therefore produce different wire formats for the same data across runs, even when the underlying values never change.
+The _deterministic sets_ strategy removes this source of nondeterminism by unstructuring every set and frozenset into a sorted list.
+
+The strategy is opt-in and takes a required `sort_key` callable.
+The key is applied to each element **after** it has been unstructured, so it always works with the wire-format values rather than the original (possibly unorderable) objects.
+
+```{doctest} deterministic_sets
+
+>>> from cattrs import Converter
+>>> from cattrs.strategies import configure_deterministic_sets
+>>> from typing import Set
+
+>>> converter = Converter()
+>>> configure_deterministic_sets(converter, sort_key=lambda value: value)
+
+>>> converter.unstructure({3, 1, 2}, unstructure_as=Set[int])
+[1, 2, 3]
+
+```
+
+The key is the same kind of callable used by {py:func}`sorted`, so it can reach into complex wire values:
+
+```{doctest} deterministic_sets
+
+>>> from attrs import frozen
+
+>>> @frozen
+... class User:
+...     name: str
+...     age: int
+
+>>> users = {User("Bob", 40), User("Alice", 30)}
+>>> configure_deterministic_sets(converter, sort_key=lambda payload: payload["age"])
+>>> converter.unstructure(users, unstructure_as=Set[User])
+[{'name': 'Alice', 'age': 30}, {'name': 'Bob', 'age': 40}]
+
+```
+
+### Key Collisions and Ordering Errors
+
+When two elements produce the same key, the tie is broken deterministically by comparing their unstructured wire values.
+This keeps the result stable without depending on set iteration order.
+
+If the sort keys, or the wire values involved in a collision, are not mutually comparable, a {py:class}`cattrs.DeterministicSetError` is raised.
+The original {py:class}`TypeError` is attached as its `cause`; there is deliberately no fallback to {py:func}`repr`, since such a fallback would silently hide an ordering bug.
+
+```{doctest} deterministic_sets
+
+>>> from cattrs import DeterministicSetError
+
+>>> error_converter = Converter()
+>>> configure_deterministic_sets(error_converter, sort_key=lambda value: value)
+>>> try:
+...     error_converter.unstructure({1, "a"}, unstructure_as=Set[object])
+... except DeterministicSetError as exc:
+...     type(exc.cause).__name__
+'TypeError'
+
+```
+
+### Scope and Guarantees
+
+- Both {py:class}`cattrs.BaseConverter` and {py:class}`cattrs.Converter` are supported, as are the preconfigured converters.
+- The strategy affects unstructuring only. Structuring keeps its default behavior, so element type conversion and nested error locations are preserved.
+- Each concrete generic set type gets its own hook; there is no shared mutable state between them.
+- Empty sets unstructure to empty lists.
+- When the strategy is not applied, sets and frozensets keep their existing container policy.
+
+```{versionadded} NEXT
+
+```
+
 ## Using Class-Specific Structure and Unstructure Methods
 
 _Found at {py:func}`cattrs.strategies.use_class_methods`._

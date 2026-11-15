@@ -140,3 +140,25 @@ class ForbiddenExtraKeysError(CattrsError):
             or f"Extra fields in constructor for {self.cl.__name__}: "
             f"{', '.join(sorted(self.extra_fields))}"
         )
+
+
+class DeterministicSetError(CattrsError):
+    """Raised by the deterministic sets strategy when elements cannot be ordered.
+
+    The strategy sorts unstructured set elements using a caller-provided key,
+    breaking key ties by comparing the unstructured (wire format) values.
+    This error is raised when either the sort keys or, on a key collision,
+    the wire values are not mutually comparable.
+
+    The original ordering failure is attached as the :attr:`cause` attribute
+    and as the exception cause (``__cause__``) for inspection.
+    """
+
+    def __init__(self, message: str, cause: Exception) -> None:
+        self.message = message
+        self.cause = cause
+        super().__init__(message)
+        self.__cause__ = cause
+
+    def __str__(self) -> str:
+        return self.message

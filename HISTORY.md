@@ -13,6 +13,7 @@ Our backwards-compatibility policy can be found [here](https://github.com/python
 
 ## NEXT
 
+- Add the {py:func}`cattrs.strategies.configure_deterministic_sets` strategy. It unstructures sets and frozensets into lists sorted by a caller-provided key applied to the unstructured wire-format values, making archived output independent of process hash randomization. Key collisions are resolved by comparing the wire values, and unorderable keys raise the new public {py:class}`cattrs.DeterministicSetError` instead of falling back to `repr`.
 - Fix the msgspec converter passing typed deques directly to the encoder, which cannot serialize them. Deques are now unstructured into lists, including when nested in attrs classes or dataclasses.
   ([#818](https://github.com/python-attrs/cattrs/issues/818) [#819](https://github.com/python-attrs/cattrs/pull/819))
 
