@@ -81,6 +81,7 @@ class _BaseFieldKwargs(typing.TypedDict, total=False):
     dump_default: typing.Any
     data_key: str | None
     attribute: str | None
+    strict: bool | None
     validate: types.Validator | typing.Iterable[types.Validator] | None
     pre_load: types.PreLoadCallable | typing.Iterable[types.PreLoadCallable] | None
     post_load: types.PostLoadCallable | typing.Iterable[types.PostLoadCallable] | None
@@ -118,6 +119,9 @@ class Field(typing.Generic[_InternalT]):
     :param data_key: The name of the dict key in the external representation, i.e.
         the input of `load` and the output of `dump`.
         If `None`, the key will match the name of the field.
+    :param strict: If `True`, disable lenient type conversion for this field.
+        If `False`, lenient conversion is used even when strict mode is enabled
+        for the containing schema load. If `None`, the schema load setting is used.
     :param attribute: The name of the key/attribute in the internal representation, i.e.
         the output of `load` and the input of `dump`.
         If `None`, the key/attribute will match the name of the field.
@@ -184,6 +188,7 @@ class Field(typing.Generic[_InternalT]):
         dump_default: typing.Any = missing_,
         data_key: str | None = None,
         attribute: str | None = None,
+        strict: bool | None = None,
         validate: types.Validator | typing.Iterable[types.Validator] | None = None,
         pre_load: (
             types.PreLoadCallable | typing.Iterable[types.PreLoadCallable] | None
@@ -203,6 +208,7 @@ class Field(typing.Generic[_InternalT]):
 
         self.attribute = attribute
         self.data_key = data_key
+        self.strict = strict
         self.validate = validate
         self.validators = self._normalize_processors(validate, param="validate")
         self.pre_load = self._normalize_processors(pre_load, param="pre_load")
@@ -377,6 +383,10 @@ class Field(typing.Generic[_InternalT]):
         if self.allow_none and value is None:
             return None
 
+        requested_strict = bool(kwargs.pop("strict", False))
+        effective_strict = self.strict if self.strict is not None else requested_strict
+        if effective_strict or requested_strict:
+            kwargs["strict"] = effective_strict
         output = self._deserialize(value, attr, data, **kwargs)
         # Apply validators
         self._validate(output)
@@ -626,9 +636,13 @@ class Nested(Field):
         self,
         value: typing.Any,
         partial: bool | types.StrSequenceOrSet | None = None,  # noqa: FBT001
+        *,
+        strict: bool = False,
     ):
         try:
-            valid_data = self.schema.load(value, unknown=self.unknown, partial=partial)
+            valid_data = self.schema.load(
+                value, unknown=self.unknown, partial=partial, strict=strict
+            )
         except ValidationError as error:
             raise ValidationError(
                 error.messages, valid_data=error.valid_data
@@ -652,7 +666,9 @@ class Nested(Field):
             Add ``partial`` parameter.
         """
         self._test_collection(value)
-        return self._load(value, partial=partial)
+        return self._load(
+            value, partial=partial, strict=bool(kwargs.get("strict", False))
+        )
 
 
 class Pluck(Nested):
@@ -716,7 +732,9 @@ class Pluck(Nested):
             value = [{self._field_data_key: v} for v in value]
         else:
             value = {self._field_data_key: value}
-        return self._load(value, partial=partial)
+        return self._load(
+            value, partial=partial, strict=bool(kwargs.get("strict", False))
+        )
 
 
 class List(Field[list[_InternalT | None]]):
@@ -899,6 +917,8 @@ class String(Field[str]):
         return utils.ensure_text_type(value)
 
     def _deserialize(self, value, attr, data, **kwargs) -> str:
+        if kwargs.get("strict", False) and not isinstance(value, str):
+            raise self.make_error("invalid")
         if not isinstance(value, (str, bytes)):
             raise self.make_error("invalid")
         try:
@@ -968,7 +988,7 @@ class Number(Field[_NumT], metaclass=abc.ABCMeta):
         """Return the number value for value, given this field's `num_type`."""
         return self.num_type(value)  # type: ignore[call-arg]
 
-    def _validated(self, value: typing.Any) -> _NumT:
+    def _validated(self, value: typing.Any, *, strict: bool = False) -> _NumT:
         """Format the value or raise a :exc:`ValidationError` if an error occurs."""
         # (value is True or value is False) is ~5x faster than isinstance(value, bool)
         if value is True or value is False:
@@ -991,7 +1011,7 @@ class Number(Field[_NumT], metaclass=abc.ABCMeta):
         return self._to_string(ret) if self.as_string else ret
 
     def _deserialize(self, value, attr, data, **kwargs) -> _NumT:
-        return self._validated(value)
+        return self._validated(value, strict=bool(kwargs.get("strict", False)))
 
 
 class Integer(Number[int]):
@@ -1010,18 +1030,17 @@ class Integer(Number[int]):
     def __init__(
         self,
         *,
-        strict: bool = False,
+        strict: bool | None = None,
         as_string: bool = False,
         **kwargs: Unpack[_BaseFieldKwargs],
     ):
-        self.strict = strict
-        super().__init__(as_string=as_string, **kwargs)
+        super().__init__(as_string=as_string, strict=strict, **kwargs)
 
     # override Number
-    def _validated(self, value: typing.Any) -> int:
-        if self.strict and not isinstance(value, numbers.Integral):
+    def _validated(self, value: typing.Any, *, strict: bool = False) -> int:
+        if strict and not isinstance(value, numbers.Integral):
             raise self.make_error("invalid", input=value)
-        return super()._validated(value)
+        return super()._validated(value, strict=strict)
 
 
 class Float(Number[float]):
@@ -1050,8 +1069,12 @@ class Float(Number[float]):
         self.allow_nan = allow_nan
         super().__init__(as_string=as_string, **kwargs)
 
-    def _validated(self, value: typing.Any) -> float:
-        num = super()._validated(value)
+    def _validated(self, value: typing.Any, *, strict: bool = False) -> float:
+        if strict and (
+            value is True or value is False or not isinstance(value, (int, float))
+        ):
+            raise self.make_error("invalid", input=value)
+        num = super()._validated(value, strict=strict)
         if self.allow_nan is False:
             if math.isnan(num) or num == float("inf") or num == float("-inf"):
                 raise self.make_error("special")
@@ -1090,6 +1113,9 @@ class Decimal(Number[decimal.Decimal]):
         even though they are illegal according to the JSON specification.
     :param as_string: If `True`, serialize to a string instead of a Python
         `decimal.Decimal` type.
+    :param allow_string: If `True`, accept string input in strict mode.
+        If `False`, reject string input even in lenient mode. If `None`, string
+        input is accepted in lenient mode and rejected in strict mode.
     :param kwargs: The same keyword arguments that :class:`Number` receives.
     """
 
@@ -1107,6 +1133,7 @@ class Decimal(Number[decimal.Decimal]):
         *,
         allow_nan: bool = False,
         as_string: bool = False,
+        allow_string: bool | None = None,
         **kwargs: Unpack[_BaseFieldKwargs],
     ):
         self.places = (
@@ -1114,6 +1141,7 @@ class Decimal(Number[decimal.Decimal]):
         )
         self.rounding = rounding
         self.allow_nan = allow_nan
+        self.allow_string = allow_string
         super().__init__(as_string=as_string, **kwargs)
 
     # override Number
@@ -1127,9 +1155,14 @@ class Decimal(Number[decimal.Decimal]):
         return num
 
     # override Number
-    def _validated(self, value: typing.Any) -> decimal.Decimal:
+    def _validated(self, value: typing.Any, *, strict: bool = False) -> decimal.Decimal:
+        if isinstance(value, str):
+            if self.allow_string is False or (self.allow_string is None and strict):
+                raise self.make_error("invalid", input=value)
+        elif strict and not isinstance(value, (decimal.Decimal, int, float)):
+            raise self.make_error("invalid", input=value)
         try:
-            num = super()._validated(value)
+            num = super()._validated(value, strict=False)
         except decimal.InvalidOperation as error:
             raise self.make_error("invalid") from error
         if not self.allow_nan and (num.is_nan() or num.is_infinite()):
@@ -1218,6 +1251,8 @@ class Boolean(Field[bool]):
         data: typing.Mapping[str, typing.Any] | None,
         **kwargs,
     ) -> bool:
+        if kwargs.get("strict", False) and not isinstance(value, bool):
+            raise self.make_error("invalid", input=value)
         if not self.truthy:
             return bool(value)
         try:

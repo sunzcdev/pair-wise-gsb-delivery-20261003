@@ -395,6 +395,42 @@ You can ignore missing fields entirely by setting ``partial=True``.
     # OR UserSchema(partial=True).load({'age': 42})
     print(result)  # => {'age': 42}
 
+Strict loading
+--------------
+
+Pass ``strict=True`` to `Schema.load <marshmallow.Schema.load>` to disable
+lenient conversions for `String <marshmallow.fields.String>`,
+`Integer <marshmallow.fields.Integer>`, `Float <marshmallow.fields.Float>`,
+and `Boolean <marshmallow.fields.Boolean>`, including values nested in
+`List <marshmallow.fields.List>` and `Dict <marshmallow.fields.Dict>` fields.
+
+.. code-block:: python
+
+    class ItemSchema(Schema):
+        quantity = fields.Integer()
+        active = fields.Boolean()
+
+
+    ItemSchema().load({"quantity": "42", "active": 1})
+    # {'quantity': 42, 'active': True}
+
+    ItemSchema().load({"quantity": "42", "active": 1}, strict=True)
+    # raises ValidationError
+
+Fields may override the load setting with ``strict=True`` or ``strict=False``.
+`Decimal <marshmallow.fields.Decimal>` string input is rejected in strict mode
+unless ``allow_string=True`` is set on the field.
+
+.. code-block:: python
+
+    class PaymentSchema(Schema):
+        amount = fields.Decimal()
+        text_amount = fields.Decimal(allow_string=True)
+
+
+    PaymentSchema().load({"amount": "12.50", "text_amount": "12.50"}, strict=True)
+    # raises ValidationError for "amount"
+
 Specifying defaults
 -------------------
 

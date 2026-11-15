@@ -602,6 +602,7 @@ class Schema(metaclass=SchemaMeta):
         many: bool = False,
         partial=None,
         unknown: types.UnknownOption = RAISE,
+        strict: bool = False,
         index=None,
     ) -> typing.Any | list[typing.Any]:
         """Deserialize ``data``.
@@ -615,6 +616,7 @@ class Schema(metaclass=SchemaMeta):
             will be ignored. Use dot delimiters to specify nested fields.
         :param unknown: Whether to exclude, include, or raise an error for unknown
             fields in the data. Use `EXCLUDE`, `INCLUDE` or `RAISE`.
+        :param strict: Whether to disable lenient type conversion for fields.
         :param index: Index of the item being deserialized (for storing errors) if
             deserializing a collection, otherwise `None`.
         :return: The deserialized data as `dict_class` instance or list of `dict_class`
@@ -633,6 +635,7 @@ class Schema(metaclass=SchemaMeta):
                         many=False,
                         partial=partial,
                         unknown=unknown,
+                        strict=strict,
                         index=idx,
                     )
                     for idx, d in enumerate(data)
@@ -655,7 +658,7 @@ class Schema(metaclass=SchemaMeta):
                         partial_is_collection and attr_name in partial
                     ):
                         continue
-                d_kwargs = {}
+                d_kwargs: dict[str, typing.Any] = {"strict": True} if strict else {}
                 # Allow partial loading of nested schemas.
                 if partial_is_collection:
                     prefix = attr_name + "."
@@ -711,6 +714,7 @@ class Schema(metaclass=SchemaMeta):
         many: bool | None = None,
         partial: bool | types.StrSequenceOrSet | None = None,
         unknown: types.UnknownOption | None = None,
+        strict: bool | None = None,
     ):
         """Deserialize a data structure to an object defined by this Schema's fields.
 
@@ -724,6 +728,9 @@ class Schema(metaclass=SchemaMeta):
         :param unknown: Whether to exclude, include, or raise an error for unknown
             fields in the data. Use `EXCLUDE`, `INCLUDE` or `RAISE`.
             If `None`, the value for `self.unknown` is used.
+        :param strict: If `True`, disable lenient type conversion for fields.
+            If `False` or `None`, lenient conversion is used. Field-level
+            ``strict`` settings take precedence.
         :return: Deserialized data
 
         .. versionchanged:: 3.0.0b7
@@ -732,7 +739,12 @@ class Schema(metaclass=SchemaMeta):
             if invalid data are passed.
         """
         return self._do_load(
-            data, many=many, partial=partial, unknown=unknown, postprocess=True
+            data,
+            many=many,
+            partial=partial,
+            unknown=unknown,
+            strict=strict,
+            postprocess=True,
         )
 
     def loads(
@@ -743,6 +755,7 @@ class Schema(metaclass=SchemaMeta):
         many: bool | None = None,
         partial: bool | types.StrSequenceOrSet | None = None,
         unknown: types.UnknownOption | None = None,
+        strict: bool | None = None,
         **kwargs,
     ):
         """Same as :meth:`load`, except it uses `marshmallow.Schema.Meta.render_module` to deserialize
@@ -758,6 +771,9 @@ class Schema(metaclass=SchemaMeta):
         :param unknown: Whether to exclude, include, or raise an error for unknown
             fields in the data. Use `EXCLUDE`, `INCLUDE` or `RAISE`.
             If `None`, the value for `self.unknown` is used.
+        :param strict: If `True`, disable lenient type conversion for fields.
+            If `False` or `None`, lenient conversion is used. Field-level
+            ``strict`` settings take precedence.
         :return: Deserialized data
 
         .. versionchanged:: 3.0.0b7
@@ -768,7 +784,9 @@ class Schema(metaclass=SchemaMeta):
             Rename ``json_module`` parameter to ``s``.
         """
         data = self.opts.render_module.loads(s, **kwargs)
-        return self.load(data, many=many, partial=partial, unknown=unknown)
+        return self.load(
+            data, many=many, partial=partial, unknown=unknown, strict=strict
+        )
 
     def _run_validator(
         self,
@@ -818,6 +836,7 @@ class Schema(metaclass=SchemaMeta):
         *,
         many: bool | None = None,
         partial: bool | types.StrSequenceOrSet | None = None,
+        strict: bool | None = None,
     ) -> dict[str, list[str]]:
         """Validate `data` against the schema, returning a dictionary of
         validation errors.
@@ -829,10 +848,19 @@ class Schema(metaclass=SchemaMeta):
             any fields declared. Propagates down to ``Nested`` fields as well. If
             its value is an iterable, only missing fields listed in that iterable
             will be ignored. Use dot delimiters to specify nested fields.
+        :param strict: If `True`, disable lenient type conversion for fields.
+            If `False` or `None`, lenient conversion is used. Field-level
+            ``strict`` settings take precedence.
         :return: A dictionary of validation errors.
         """
         try:
-            self._do_load(data, many=many, partial=partial, postprocess=False)
+            self._do_load(
+                data,
+                many=many,
+                partial=partial,
+                strict=strict,
+                postprocess=False,
+            )
         except ValidationError as exc:
             return typing.cast("dict[str, list[str]]", exc.messages)
         return {}
@@ -846,6 +874,7 @@ class Schema(metaclass=SchemaMeta):
         many: bool | None = None,
         partial: bool | types.StrSequenceOrSet | None = None,
         unknown: types.UnknownOption | None = None,
+        strict: bool | None = None,
         postprocess: bool = True,
     ):
         """Deserialize `data`, returning the deserialized result.
@@ -861,6 +890,8 @@ class Schema(metaclass=SchemaMeta):
         :param unknown: Whether to exclude, include, or raise an error for unknown
             fields in the data. Use `EXCLUDE`, `INCLUDE` or `RAISE`.
             If `None`, the value for `self.unknown` is used.
+        :param strict: Whether to disable lenient type conversion for fields.
+            If `None`, ``False`` is used.
         :param postprocess: Whether to run post_load methods.
         :return: Deserialized data
         """
@@ -868,6 +899,7 @@ class Schema(metaclass=SchemaMeta):
         errors: dict[str, list[str]] = {}
         many = self.many if many is None else bool(many)
         unknown = self.unknown if unknown is None else unknown
+        strict = bool(strict)
         if partial is None:
             partial = self.partial
         # Run preprocessors
@@ -894,6 +926,7 @@ class Schema(metaclass=SchemaMeta):
                 many=many,
                 partial=partial,
                 unknown=unknown,
+                strict=strict,
             )
             # Run field-level validation
             self._invoke_field_validators(
