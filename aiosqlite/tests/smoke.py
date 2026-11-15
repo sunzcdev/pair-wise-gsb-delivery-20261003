@@ -5,6 +5,7 @@ import asyncio
 import sqlite3
 import sys
 from pathlib import Path
+from queue import Queue
 from sqlite3 import OperationalError
 from tempfile import TemporaryDirectory
 from threading import Thread
@@ -425,6 +426,156 @@ class SmokeTest(IsolatedAsyncioTestCase):
                     "COMMIT;",
                 ],
             )
+
+    async def test_iterdump_queue_size_validation(self):
+        async with aiosqlite.connect(":memory:") as db:
+            for bad_size in (0, -1, 1.5, "10"):
+                with self.subTest(bad_size=bad_size):
+                    with self.assertRaises(ValueError):
+                        # Validation happens when iteration starts.
+                        async for _ in db.iterdump(queue_size=bad_size):
+                            self.fail("should not yield anything")
+
+    async def test_iterdump_bounded_backlog_with_slow_consumer(self):
+        # A small bounded queue plus a deliberately slow consumer must keep
+        # the in-memory backlog at or below the configured capacity instead
+        # of buffering the whole database. Guard with a timeout so a deadlock
+        # (event loop waiting on a thread blocked against the full queue)
+        # fails the test instead of hanging forever.
+        queue_size = 2
+        created: list[Queue] = []
+        high_water = 0
+
+        class TrackingQueue(Queue):
+            def __init__(self, maxsize=0):
+                super().__init__(maxsize=maxsize)
+                created.append(self)
+
+            def put(self, *args, **kwargs):
+                nonlocal high_water
+                result = super().put(*args, **kwargs)
+                high_water = max(high_water, self.qsize())
+                return result
+
+        async with aiosqlite.connect(":memory:") as db:
+            await db.execute("create table foo (id integer primary key, val text)")
+            await db.executemany(
+                "insert into foo (val) values (?)",
+                [(f"row-{i}",) for i in range(500)],
+            )
+            await db.commit()
+
+            with patch("aiosqlite.core.Queue", TrackingQueue):
+                lines = []
+
+                async def consume():
+                    async for line in db.iterdump(queue_size=queue_size):
+                        lines.append(line)
+                        # Slow consumer: yield control so the dumper can fill
+                        # the bounded queue and get blocked on it.
+                        await asyncio.sleep(0)
+
+                await asyncio.wait_for(consume(), timeout=10)
+
+            self.assertEqual(len(created), 1)
+            self.assertEqual(created[0].maxsize, queue_size)
+            # The backlog never exceeded the configured capacity.
+            self.assertLessEqual(high_water, queue_size)
+            # BEGIN + CREATE TABLE + 500 INSERTs + COMMIT were all delivered.
+            self.assertEqual(len(lines), 503)
+            self.assertEqual(lines[0], "BEGIN TRANSACTION;")
+            self.assertEqual(lines[-1], "COMMIT;")
+
+    async def test_iterdump_early_close_releases_worker(self):
+        # Closing the iterator before the dump finishes must stop the dumper
+        # and free the shared worker thread for subsequent operations.
+        async with aiosqlite.connect(":memory:") as db:
+            await db.execute("create table foo (id integer primary key, val text)")
+            await db.executemany(
+                "insert into foo (val) values (?)",
+                [(f"row-{i}",) for i in range(2000)],
+            )
+            await db.commit()
+
+            iterator = db.iterdump(queue_size=1)
+            count = 0
+            async for line in iterator:
+                count += 1
+                if count == 3:
+                    await asyncio.wait_for(iterator.aclose(), timeout=10)
+                    break
+
+            self.assertEqual(count, 3)
+
+            # The worker thread must still be alive and responsive.
+            self.assertTrue(db._thread.is_alive())
+            cursor = await asyncio.wait_for(
+                db.execute("select count(*) from foo"), timeout=10
+            )
+            rows = await cursor.fetchall()
+            self.assertEqual(rows, [(2000,)])
+
+    async def test_iterdump_cancelled_consumer_releases_worker(self):
+        # Cancelling the consuming task while the dump is in flight must not
+        # leave the dumper thread stuck on the full queue.
+        async with aiosqlite.connect(":memory:") as db:
+            await db.execute("create table foo (id integer primary key, val text)")
+            await db.executemany(
+                "insert into foo (val) values (?)",
+                [(f"row-{i}",) for i in range(2000)],
+            )
+            await db.commit()
+
+            started = asyncio.Event()
+
+            async def consume():
+                started.set()
+                async for _ in db.iterdump(queue_size=1):
+                    await asyncio.sleep(0)
+
+            task = asyncio.ensure_future(consume())
+            await started.wait()
+            # Let the consumer/dumper make some progress, then cancel.
+            await asyncio.sleep(0.05)
+            task.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await asyncio.wait_for(task, timeout=10)
+
+            # The connection must still work afterwards.
+            self.assertTrue(db._thread.is_alive())
+            cursor = await asyncio.wait_for(db.execute("select 42"), timeout=10)
+            self.assertEqual(await cursor.fetchall(), [(42,)])
+
+    async def test_iterdump_error_propagated_to_consumer(self):
+        # Failures inside the dumper must reach the consumer as a real
+        # exception, not just an end-of-dump sentinel, and the connection
+        # must remain usable afterwards. sqlite3.Connection is an immutable
+        # C type, so inject the failure through a Connection subclass.
+        class BrokenDumpConnection(sqlite3.Connection):
+            def iterdump(self):
+                yield "BEGIN TRANSACTION;"
+                raise RuntimeError("boom")
+
+        db = aiosqlite.Connection(
+            lambda: BrokenDumpConnection(":memory:"), iter_chunk_size=64
+        )
+        await db
+        try:
+            await db.execute("create table foo (i integer)")
+
+            lines = []
+            with self.assertRaisesRegex(RuntimeError, "boom"):
+                async for line in db.iterdump(queue_size=1):
+                    lines.append(line)
+
+            self.assertEqual(lines, ["BEGIN TRANSACTION;"])
+
+            # Worker thread survived and still serves new operations.
+            self.assertTrue(db._thread.is_alive())
+            cursor = await db.execute("select 1")
+            self.assertEqual(await cursor.fetchall(), [(1,)])
+        finally:
+            await db.close()
 
     async def test_cursor_on_closed_connection(self):
         db = await aiosqlite.connect(self.db)

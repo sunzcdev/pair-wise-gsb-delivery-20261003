@@ -11,8 +11,8 @@ import sqlite3
 from collections.abc import AsyncIterator, Generator, Iterable
 from functools import partial
 from pathlib import Path
-from queue import Empty, Queue, SimpleQueue
-from threading import Thread
+from queue import Empty, Full, Queue, SimpleQueue
+from threading import Event, Thread
 from typing import Any, Callable, Literal, Optional, Union
 from warnings import warn
 
@@ -371,7 +371,7 @@ class Connection:
         """
         await self._execute(self._conn.set_authorizer, authorizer_callback)
 
-    async def iterdump(self) -> AsyncIterator[str]:
+    async def iterdump(self, queue_size: int = 1024) -> AsyncIterator[str]:
         """
         Return an async iterator to dump the database in SQL text format.
 
@@ -380,38 +380,90 @@ class Connection:
             async for line in db.iterdump():
                 ...
 
+        ``queue_size`` bounds the number of SQL lines buffered between the
+        background dumper thread and this async iterator. When the queue is
+        full, the dumper blocks until the consumer catches up, so a slow
+        consumer can no longer cause the entire database to accumulate in
+        memory. If the iterator is closed early (for example by ``aclose()``
+        or task cancellation), the dumper thread is unblocked and stopped so
+        that the connection's worker thread stays available for subsequent
+        operations. Any exception raised while dumping is delivered to the
+        consumer through the iterator instead of being silently replaced by
+        the end-of-dump sentinel.
         """
-        dump_queue: Queue = Queue()
+        if not isinstance(queue_size, int) or queue_size <= 0:
+            raise ValueError("queue_size must be a positive integer")
 
-        def dumper():
+        # Bounded queue: a slow consumer applies back pressure to the dumper
+        # rather than allowing the whole database to be buffered in memory.
+        dump_queue: Queue[Union[str, BaseException, None]] = Queue(maxsize=queue_size)
+        # Signaled when this iterator is closed or cancelled so that a dumper
+        # blocked on a full queue wakes up and exits instead of hanging the
+        # shared connection worker thread.
+        stop = Event()
+
+        def put_item(item: Union[str, BaseException, None]) -> None:
+            """Enqueue an item, interruptible by `stop`."""
+            while not stop.is_set():
+                try:
+                    # Returns immediately when there is room; only blocks
+                    # (briefly) when the bounded queue is full.
+                    dump_queue.put(item, timeout=0.05)
+                    return
+                except Full:
+                    continue
+
+        def dumper() -> None:
             try:
                 for line in self._conn.iterdump():
-                    dump_queue.put_nowait(line)
-                dump_queue.put_nowait(None)
+                    if stop.is_set():
+                        break
+                    put_item(line)
+                    if stop.is_set():
+                        break
+                else:
+                    # Clean end of the dump.
+                    put_item(None)
 
-            except Exception:
+            except Exception as e:
                 LOG.exception("exception while dumping db")
-                dump_queue.put_nowait(None)
-                raise
+                # Propagate the actual failure to the consumer instead of
+                # leaving only the end-of-dump sentinel.
+                put_item(e)
 
         fut = self._execute(dumper)
         task = asyncio.ensure_future(fut)
 
-        while True:
-            try:
-                line: Optional[str] = dump_queue.get_nowait()
-                if line is None:
+        try:
+            while True:
+                try:
+                    item: Union[str, BaseException, None] = dump_queue.get_nowait()
+
+                except Empty:
+                    if task.done():
+                        LOG.warning("iterdump completed unexpectedly")
+                        break
+
+                    # Never block the event loop on the bounded queue: the
+                    # dumper runs on the connection's worker thread, so a
+                    # blocking get here could deadlock against a full queue.
+                    await asyncio.sleep(0.01)
+                    continue
+
+                if item is None:
                     break
-                yield line
 
-            except Empty:
-                if task.done():
-                    LOG.warning("iterdump completed unexpectedly")
-                    break
+                if isinstance(item, BaseException):
+                    raise item
 
-                await asyncio.sleep(0.01)
+                yield item
 
-        await task
+        finally:
+            # Wake up a dumper blocked on the full queue (or waiting on the
+            # stop event) and wait for it to release the worker thread so the
+            # connection can keep serving subsequent operations.
+            stop.set()
+            await task
 
     async def backup(
         self,
