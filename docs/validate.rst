@@ -44,6 +44,50 @@ The Validator Protocol
 All of the `versioned validators <versioned-validators>` that are included with `jsonschema` adhere to the protocol, and any `extensions of these validators <jsonschema.validators.extend>` will as well.
 For more information on `creating <jsonschema.validators.create>` or `extending <jsonschema.validators.extend>` validators see `creating-validators`.
 
+.. _exact-numeric-validation:
+
+Exact Numeric Validation
+------------------------
+
+By default, ``multipleOf`` keeps the historical fast path: float divisors use
+float division, and other values use their matching Python arithmetic.  For
+fixed-precision decimal data, that can make a result depend on binary floating
+point and on the current ``decimal.Decimal`` context precision.
+
+Pass ``exact_numbers=True`` to a validator (or to `validate
+<jsonschema.validators.validate>`) to opt into exact arithmetic instead:
+
+.. testcode::
+
+    from decimal import Decimal
+    from jsonschema import Draft202012Validator
+
+    validator = Draft202012Validator(
+        {"multipleOf": Decimal("0.01")},
+        exact_numbers=True,
+    )
+    assert validator.is_valid(Decimal("0.07"))
+    assert validator.is_valid(0.07)
+
+Exact mode supports `int`, `decimal.Decimal`, `fractions.Fraction` and finite
+`float` values for both the instance and the ``multipleOf`` value.  A finite
+float is interpreted as the shortest decimal string which round-trips to that
+float, i.e. as ``Decimal(repr(value))``.  Consequently ``0.1`` means decimal
+0.1, and the same rule is used no matter which side of the comparison the float
+is on.
+
+Exact mode uses rational arithmetic, so very large numbers and very small
+steps are not limited by the ambient ``Decimal`` context.  It never reads
+from or writes to the process-wide Decimal context.  ``bool`` is not a number;
+``NaN`` and infinity are rejected as explicit non-finite numeric errors.
+An invalid ``multipleOf`` value (a boolean, a non-finite value, or zero)
+raises `TypeError` or `ValueError`, rather than producing a misleading
+instance validation result.
+
+The aliases ``exact=True`` and ``numeric_mode="exact"`` are also accepted.
+``numeric_mode="default"`` (or ``exact_numbers=False``) keeps the compatible
+historical behavior.
+
 Type Checking
 -------------
 

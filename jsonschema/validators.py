@@ -249,6 +249,13 @@ def create(
             kw_only=True,
             repr=False,
         )
+        exact_numbers: bool = field(default=False, kw_only=True, repr=False)
+        exact: bool | None = field(default=None, kw_only=True, repr=False)
+        numeric_mode: str | None = field(
+            default=None,
+            kw_only=True,
+            repr=False,
+        )
 
         def __init_subclass__(cls):
             warnings.warn(
@@ -455,6 +462,20 @@ def create(
                 raise error
 
         def is_type(self, instance, type):
+            if _keywords._exact_numeric_mode(self) and type in {
+                "number",
+                "integer",
+            }:
+                if isinstance(instance, bool):
+                    return False
+                if _keywords._is_nonfinite_number(instance):
+                    return False
+                if (
+                    type == "number"
+                    and not _keywords._is_supported_exact_number(instance)
+                ):
+                    return False
+
             try:
                 return self.TYPE_CHECKER.is_type(instance, type)
             except exceptions.UndefinedTypeCheck:

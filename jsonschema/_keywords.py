@@ -1,4 +1,7 @@
+from decimal import Decimal
 from fractions import Fraction
+import math
+import numbers
 import re
 
 from jsonschema._utils import (
@@ -167,7 +170,177 @@ def maximum(validator, maximum, instance, schema):
         yield ValidationError(message)
 
 
+_EXACT_NUMERIC_MODES = frozenset(
+    {"exact", "decimal", "fixed", "fixed_point"},
+)
+_DEFAULT_NUMERIC_MODES = frozenset(
+    {"default", "binary", "compatible", "float"},
+)
+
+
+def _exact_numeric_mode(validator):
+    """
+    Return whether ``validator`` is using exact numeric validation.
+
+    ``exact_numbers`` is the primary spelling.  ``exact`` and
+    ``numeric_mode`` are accepted as aliases so callers can choose the
+    wording which fits their configuration layer.
+    """
+    if getattr(validator, "exact_numbers", False):
+        return True
+
+    exact = getattr(validator, "exact", None)
+    if exact is not None:
+        return bool(exact)
+
+    mode = getattr(validator, "numeric_mode", None)
+    if mode is None:
+        return False
+    if isinstance(mode, bool):
+        return mode
+
+    normalized = str(mode).strip().lower().replace("-", "_")
+    if normalized in _EXACT_NUMERIC_MODES:
+        return True
+    if normalized in _DEFAULT_NUMERIC_MODES:
+        return False
+    expected = sorted(_EXACT_NUMERIC_MODES | _DEFAULT_NUMERIC_MODES)
+    raise ValueError(
+        f"unknown numeric_mode {mode!r}; expected one of {expected}",
+    )
+
+
+def _is_nonfinite_number(value):
+    if isinstance(value, float):
+        return not math.isfinite(value)
+    if isinstance(value, Decimal):
+        return not value.is_finite()
+    return False
+
+
+def _is_supported_exact_number(value):
+    if isinstance(value, bool):
+        return False
+    if isinstance(value, (int, float, Decimal, Fraction)):
+        return True
+    return isinstance(value, numbers.Rational)
+
+
+def _exact_components(value, *, what):
+    """
+    Represent a supported number as ``(numerator, denominator, exponent)``
+    where the value is ``numerator / denominator * 10**exponent``.
+
+    Keeping the power of ten symbolic avoids expanding enormous exponents.
+    Floats are interpreted as the shortest decimal string which round-trips
+    to the same float, i.e. ``Decimal(repr(value))``.  That makes ``0.1``
+    mean decimal 0.1 rather than its binary approximation.  The same rule is
+    used for instances and for the ``multipleOf`` value.
+    """
+    if isinstance(value, bool):
+        raise TypeError(f"{what} must be a number, not a bool")
+
+    if isinstance(value, float):
+        if not math.isfinite(value):
+            raise ValueError(f"{what} must be finite, got {value!r}")
+        value = Decimal(repr(value))
+
+    if isinstance(value, Decimal):
+        if not value.is_finite():
+            raise ValueError(f"{what} must be finite, got {value!r}")
+        sign, digits, exponent = value.as_tuple()
+        coefficient = int("".join(map(str, digits)))
+        if sign:
+            coefficient = -coefficient
+        return coefficient, 1, exponent
+
+    if isinstance(value, numbers.Rational):
+        return value.numerator, value.denominator, 0
+
+    raise TypeError(
+        f"{what} has unsupported numeric type {type(value).__name__}",
+    )
+
+
+def _exact_multiple_of(dividend, divisor):
+    """
+    Return whether ``dividend`` is an exact integer multiple of ``divisor``.
+
+    Both arguments are triples from `_exact_components`.  The power-of-ten
+    difference is handled with modular arithmetic and bounded factor loops,
+    rather than by constructing ``10**difference``.
+    """
+    dividend_numerator, dividend_denominator, dividend_exponent = dividend
+    divisor_numerator, divisor_denominator, divisor_exponent = divisor
+
+    if divisor_numerator == 0:
+        raise ValueError("multipleOf divisor must not be zero")
+    if dividend_numerator == 0:
+        return True
+
+    numerator = dividend_numerator * divisor_denominator
+    denominator = dividend_denominator * divisor_numerator
+    difference = dividend_exponent - divisor_exponent
+
+    if difference >= 0:
+        modulus = abs(denominator)
+        if modulus == 1:
+            return True
+        remainder = numerator % modulus
+        return (remainder * pow(10, difference, modulus)) % modulus == 0
+
+    modulus = abs(denominator)
+    if numerator % modulus != 0:
+        return False
+
+    quotient = numerator // modulus
+    required = -difference
+
+    twos = 0
+    while twos < required and quotient % 2 == 0:
+        quotient //= 2
+        twos += 1
+    if twos < required:
+        return False
+
+    fives = 0
+    while fives < required and quotient % 5 == 0:
+        quotient //= 5
+        fives += 1
+    return fives == required
+
+
+def _multipleOfExact(dB, instance):
+    if isinstance(instance, bool):
+        return
+
+    if _is_nonfinite_number(instance):
+        yield ValidationError(
+            f"{instance!r} is not a finite number and cannot be checked "
+            f"against a multipleOf value",
+        )
+        return
+
+    if not isinstance(instance, numbers.Number):
+        return
+
+    divisor = _exact_components(dB, what="multipleOf divisor")
+
+    try:
+        dividend = _exact_components(instance, what="instance")
+    except (TypeError, ValueError) as error:
+        yield ValidationError(str(error))
+        return
+
+    if not _exact_multiple_of(dividend, divisor):
+        yield ValidationError(f"{instance!r} is not a multiple of {dB}")
+
+
 def multipleOf(validator, dB, instance, schema):
+    if _exact_numeric_mode(validator):
+        yield from _multipleOfExact(dB, instance)
+        return
+
     if not validator.is_type(instance, "number"):
         return
 

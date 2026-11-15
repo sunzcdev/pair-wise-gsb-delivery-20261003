@@ -2,7 +2,8 @@ from __future__ import annotations
 
 from collections import deque, namedtuple
 from contextlib import contextmanager
-from decimal import Decimal
+from decimal import Decimal, getcontext, localcontext
+from fractions import Fraction
 from io import BytesIO
 from typing import Any
 from unittest import TestCase, mock
@@ -2642,3 +2643,182 @@ class _ReallyFakeJSONResponse:
 
     def json(self):
         return json.loads(self._response)
+
+
+class MultipleOfExactNumbersTests(TestCase):
+    def validator(self, schema, **kwargs):
+        return validators.Draft202012Validator(
+            schema,
+            exact_numbers=True,
+            **kwargs,
+        )
+
+    def test_default_path_is_unchanged(self):
+        validator = validators.Draft202012Validator(
+            {"multipleOf": 0.1},
+        )
+
+        self.assertFalse(validator.is_valid(0.3))
+
+    def test_exact_decimals_are_not_binary_floats(self):
+        validator = self.validator({"multipleOf": Decimal("0.1")})
+
+        self.assertTrue(validator.is_valid(Decimal("0.3")))
+        self.assertFalse(validator.is_valid(Decimal("0.31")))
+
+    def test_exact_mode_accepts_mixed_decimal_and_float(self):
+        validator = self.validator({"multipleOf": 0.1})
+
+        self.assertTrue(validator.is_valid(Decimal("0.3")))
+        self.assertTrue(validator.is_valid(0.3))
+        self.assertFalse(validator.is_valid(Decimal("0.31")))
+
+    def test_floats_use_their_shortest_round_tripping_decimal(self):
+        validator = self.validator({"multipleOf": 0.01})
+
+        self.assertTrue(validator.is_valid(0.07))
+        self.assertFalse(validator.is_valid(0.071))
+
+    def test_tiny_steps_and_huge_numbers_are_exact(self):
+        validator = self.validator({"multipleOf": Decimal("1e-20")})
+
+        self.assertTrue(validator.is_valid(10**100))
+        self.assertFalse(
+            validator.is_valid(Decimal("1.000000000000000000001")),
+        )
+
+    def test_extreme_exponents_do_not_expand_powers_of_ten(self):
+        validator = self.validator({"multipleOf": Decimal("1e-1000000000")})
+
+        self.assertTrue(validator.is_valid(Decimal("1e1000000000")))
+        self.assertFalse(
+            self.validator(
+                {"multipleOf": Decimal("3e-1000000000")},
+            ).is_valid(Decimal("1e1000000000")),
+        )
+
+    def test_exactness_does_not_depend_on_decimal_context_precision(self):
+        validator = self.validator({"multipleOf": Decimal("0.000001")})
+
+        with localcontext() as context:
+            context.prec = 2
+            self.assertTrue(
+                validator.is_valid(Decimal("123456789.123456")),
+            )
+
+    def test_global_decimal_context_is_not_modified(self):
+        context = getcontext()
+        before = (
+            context.prec,
+            context.rounding,
+            context.Emin,
+            context.Emax,
+            context.capitals,
+            context.clamp,
+            dict(context.flags),
+            dict(context.traps),
+        )
+
+        validator = self.validator({"multipleOf": Decimal("1e-1000")})
+        self.assertTrue(validator.is_valid(Decimal("1e1000")))
+
+        after = (
+            context.prec,
+            context.rounding,
+            context.Emin,
+            context.Emax,
+            context.capitals,
+            context.clamp,
+            dict(context.flags),
+            dict(context.traps),
+        )
+        self.assertEqual(after, before)
+
+    def test_bools_are_not_numbers(self):
+        validator = self.validator({"multipleOf": 2})
+
+        self.assertTrue(validator.is_valid(True))
+        self.assertFalse(
+            self.validator({"type": "number"}).is_valid(True),
+        )
+
+    def test_nonfinite_instances_are_explicitly_invalid(self):
+        validator = self.validator({"multipleOf": 2})
+
+        for value in (
+            float("nan"),
+            float("inf"),
+            float("-inf"),
+            Decimal("NaN"),
+            Decimal("Infinity"),
+        ):
+            with self.subTest(value=value):
+                errors = list(validator.iter_errors(value))
+                self.assertEqual(len(errors), 1)
+                self.assertIn("finite", errors[0].message)
+
+        self.assertFalse(
+            self.validator({"type": "number"}).is_valid(float("nan")),
+        )
+
+    def test_nonfinite_or_bool_divisors_are_errors(self):
+        for divisor in (float("nan"), float("inf"), Decimal("NaN")):
+            with self.subTest(divisor=divisor):
+                with self.assertRaises(ValueError) as error:
+                    self.validator({"multipleOf": divisor}).is_valid(2)
+                self.assertIn("finite", str(error.exception))
+
+        with self.assertRaises(TypeError):
+            self.validator({"multipleOf": True}).is_valid(2)
+
+    def test_zero_divisor_is_an_error(self):
+        with self.assertRaises(ValueError):
+            self.validator({"multipleOf": 0}).is_valid(2)
+
+    def test_exact_fractions_are_supported(self):
+        validator = self.validator({"multipleOf": Fraction(1, 6)})
+
+        self.assertTrue(validator.is_valid(Fraction(1, 3)))
+        self.assertFalse(validator.is_valid(Fraction(1, 4)))
+
+    def test_mode_aliases(self):
+        schema = {"multipleOf": 0.1}
+
+        self.assertTrue(
+            validators.Draft202012Validator(schema, exact=True).is_valid(0.3),
+        )
+        self.assertTrue(
+            validators.Draft202012Validator(
+                schema,
+                numeric_mode="exact",
+            ).is_valid(0.3),
+        )
+        self.assertFalse(
+            validators.Draft202012Validator(
+                schema,
+                numeric_mode="default",
+            ).is_valid(0.3),
+        )
+
+    def test_unknown_numeric_mode_is_rejected(self):
+        validator = validators.Draft202012Validator(
+            {"multipleOf": 0.1},
+            numeric_mode="surprise",
+        )
+
+        with self.assertRaises(ValueError):
+            validator.is_valid(0.3)
+
+    def test_exact_mode_propagates_to_subschemas_and_evolve(self):
+        validator = self.validator(
+            {"properties": {"amount": {"multipleOf": 0.1}}},
+        )
+
+        self.assertTrue(
+            validator.is_valid({"amount": Decimal("0.3")}),
+        )
+        self.assertTrue(
+            validator.evolve(
+                schema={"properties": {"amount": {"multipleOf": 0.1}}},
+            ).is_valid({"amount": Decimal("0.3")}),
+        )
