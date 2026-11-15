@@ -13,6 +13,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 ### Added
 
 * Expose `FunctionAuth` from the public API. (#3699)
+* Multipart file uploads accept a declared byte length as a fifth tuple
+  element, allowing a `Content-Length` header for non-seekable file objects.
+  The streamed length is verified against the declaration and a mismatch
+  raises a `ValueError` naming the offending field.
 
 ## 0.28.1 (6th December, 2024)
 

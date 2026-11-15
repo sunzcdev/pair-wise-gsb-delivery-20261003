@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import io
 import tempfile
 import typing
@@ -467,3 +468,379 @@ class TestHeaderParamHTML5Formatting:
         files = {"upload": (filename, b"<file content>")}
         request = httpx.Request("GET", "https://www.example.com", files=files)
         assert expected in request.read()
+
+
+class NonSeekableStream(io.IOBase):
+    """
+    A readable, non-seekable file-like object whose length cannot be
+    inferred through `fileno()`, `seek()` or `tell()`.
+    """
+
+    def __init__(self, data: bytes, chunk_size: int = 64 * 1024) -> None:
+        self._buffer = io.BytesIO(data)
+        self._chunk_size = chunk_size
+
+    def seekable(self) -> bool:
+        return False
+
+    def seek(self, *args: typing.Any) -> int:
+        raise io.UnsupportedOperation
+
+    def tell(self) -> int:
+        raise io.UnsupportedOperation
+
+    def fileno(self) -> int:
+        raise OSError
+
+    def read(self, size: int = -1) -> bytes:
+        if size is None or size < 0:
+            size = self._chunk_size
+        return self._buffer.read(min(size, self._chunk_size))
+
+
+class TestExplicitFileLength:
+    def test_declared_length_sets_content_length_for_non_seekable_stream(
+        self,
+    ) -> None:
+        url = "https://www.example.com/"
+        headers = {"Content-Type": "multipart/form-data; boundary=BOUNDARY"}
+        files = {
+            "file": (
+                "name.txt",
+                NonSeekableStream(b"<file content>"),
+                "text/plain",
+                {},
+                len(b"<file content>"),
+            )
+        }
+
+        request = httpx.Request("POST", url, headers=headers, files=files)
+
+        assert request.headers["Content-Length"] == str(
+            len(
+                b'--BOUNDARY\r\nContent-Disposition: form-data; name="file";'
+                b' filename="name.txt"\r\nContent-Type: text/plain\r\n\r\n'
+                b"<file content>\r\n--BOUNDARY--\r\n"
+            )
+        )
+        assert "Transfer-Encoding" not in request.headers
+        assert request.read() == (
+            b'--BOUNDARY\r\nContent-Disposition: form-data; name="file";'
+            b' filename="name.txt"\r\nContent-Type: text/plain\r\n\r\n'
+            b"<file content>\r\n--BOUNDARY--\r\n"
+        )
+
+    def test_declared_length_without_headers_tuple(self) -> None:
+        url = "https://www.example.com/"
+        headers = {"Content-Type": "multipart/form-data; boundary=BOUNDARY"}
+        files = {
+            "file": (
+                "name.txt",
+                NonSeekableStream(b"<file content>"),
+                None,
+                {},
+                14,
+            )
+        }
+
+        request = httpx.Request("POST", url, headers=headers, files=files)
+
+        assert request.headers["Content-Length"] == str(
+            len(
+                b'--BOUNDARY\r\nContent-Disposition: form-data; name="file";'
+                b' filename="name.txt"\r\nContent-Type: text/plain\r\n\r\n'
+                b"<file content>\r\n--BOUNDARY--\r\n"
+            )
+        )
+
+    def test_empty_file_with_declared_length_is_verified(self) -> None:
+        url = "https://www.example.com/"
+        headers = {"Content-Type": "multipart/form-data; boundary=BOUNDARY"}
+        files = {
+            "file": (
+                "empty.txt",
+                NonSeekableStream(b""),
+                "text/plain",
+                {},
+                0,
+            )
+        }
+
+        request = httpx.Request("POST", url, headers=headers, files=files)
+
+        assert request.headers["Content-Length"] == str(
+            len(
+                b'--BOUNDARY\r\nContent-Disposition: form-data; name="file";'
+                b' filename="empty.txt"\r\nContent-Type: text/plain\r\n\r\n'
+                b"\r\n--BOUNDARY--\r\n"
+            )
+        )
+        assert request.read() == (
+            b'--BOUNDARY\r\nContent-Disposition: form-data; name="file";'
+            b' filename="empty.txt"\r\nContent-Type: text/plain\r\n\r\n'
+            b"\r\n--BOUNDARY--\r\n"
+        )
+
+    def test_empty_file_declared_nonzero_length_fails_during_transfer(self) -> None:
+        url = "https://www.example.com/"
+        headers = {"Content-Type": "multipart/form-data; boundary=BOUNDARY"}
+        files = {
+            "file": (
+                "empty.txt",
+                NonSeekableStream(b""),
+                "text/plain",
+                {},
+                5,
+            )
+        }
+
+        request = httpx.Request("POST", url, headers=headers, files=files)
+
+        with pytest.raises(ValueError, match="shorter") as exc_info:
+            request.read()
+        assert "file" in str(exc_info.value)
+
+    def test_stream_shorter_than_declared_length_fails_during_transfer(self) -> None:
+        url = "https://www.example.com/"
+        headers = {"Content-Type": "multipart/form-data; boundary=BOUNDARY"}
+        files = {
+            "file": (
+                "name.txt",
+                NonSeekableStream(b"short"),
+                "text/plain",
+                {},
+                14,
+            )
+        }
+
+        request = httpx.Request("POST", url, headers=headers, files=files)
+
+        with pytest.raises(ValueError, match="shorter") as exc_info:
+            b"".join(request.stream)
+        assert "file" in str(exc_info.value)
+        assert "14" in str(exc_info.value)
+
+    def test_longer_stream_does_not_leak_extra_bytes_into_next_part(
+        self,
+    ) -> None:
+        url = "https://www.example.com/"
+        headers = {"Content-Type": "multipart/form-data; boundary=BOUNDARY"}
+        files = {
+            "file": (
+                "name.txt",
+                NonSeekableStream(b"<file content> plus extra bytes"),
+                "text/plain",
+                {},
+                14,
+            )
+        }
+
+        request = httpx.Request("POST", url, headers=headers, files=files)
+
+        emitted: list[bytes] = []
+        with pytest.raises(ValueError, match="longer") as exc_info:
+            for chunk in request.stream:
+                emitted.append(chunk)
+        body = b"".join(emitted)
+
+        assert "file" in str(exc_info.value)
+        assert "14" in str(exc_info.value)
+        # The closing boundary of the part must never have been written,
+        # and the surplus bytes must not appear anywhere in the output.
+        assert b"--BOUNDARY--\r\n" not in body
+        assert b" plus extra bytes" not in body
+        assert body.endswith(b"<file content>")
+
+    def test_mismatch_on_second_field_names_the_offending_field(self) -> None:
+        url = "https://www.example.com/"
+        headers = {"Content-Type": "multipart/form-data; boundary=BOUNDARY"}
+        files = [
+            (
+                "first",
+                (
+                    "a.txt",
+                    NonSeekableStream(b"aaaa"),
+                    "text/plain",
+                    {},
+                    4,
+                ),
+            ),
+            (
+                "second",
+                (
+                    "b.txt",
+                    NonSeekableStream(b"bb"),
+                    "text/plain",
+                    {},
+                    4,
+                ),
+            ),
+        ]
+
+        request = httpx.Request("POST", url, headers=headers, files=files)
+
+        with pytest.raises(ValueError) as exc_info:
+            b"".join(request.stream)
+        assert "second" in str(exc_info.value)
+
+    def test_unknown_field_length_still_uses_chunked_encoding(self) -> None:
+        url = "https://www.example.com/"
+        headers = {"Content-Type": "multipart/form-data; boundary=BOUNDARY"}
+        files = {
+            "declared": (
+                "a.txt",
+                NonSeekableStream(b"aaaa"),
+                "text/plain",
+                {},
+                4,
+            ),
+            "undeclared": ("b.txt", NonSeekableStream(b"bbbb")),
+        }
+
+        request = httpx.Request("POST", url, headers=headers, files=files)
+
+        assert "Content-Length" not in request.headers
+        assert request.headers["Transfer-Encoding"] == "chunked"
+
+    def test_does_not_read_the_file_before_streaming(self) -> None:
+        class ReadTrackingStream(NonSeekableStream):
+            def __init__(self, data: bytes) -> None:
+                super().__init__(data)
+                self.read_count = 0
+
+            def read(self, size: int = -1) -> bytes:
+                self.read_count += 1
+                return super().read(size)
+
+        stream = ReadTrackingStream(b"<file content>")
+        url = "https://www.example.com/"
+        headers = {"Content-Type": "multipart/form-data; boundary=BOUNDARY"}
+        files = {
+            "file": ("name.txt", stream, "text/plain", {}, 14),
+        }
+
+        request = httpx.Request("POST", url, headers=headers, files=files)
+
+        assert stream.read_count == 0
+        # Building the headers must not consume any of the body either.
+        request.stream.get_headers()
+        assert stream.read_count == 0
+
+        request.read()
+        assert stream.read_count >= 1
+
+    def test_invalid_length_type_raises_type_error(self) -> None:
+        url = "https://www.example.com/"
+        files = {
+            "file": (
+                "name.txt",
+                NonSeekableStream(b"<file content>"),
+                "text/plain",
+                {},
+                "14",
+            )
+        }
+
+        with pytest.raises(TypeError, match="length"):
+            httpx.Request("POST", url, files=files)
+
+    def test_negative_length_raises_value_error(self) -> None:
+        url = "https://www.example.com/"
+        files = {
+            "file": (
+                "name.txt",
+                NonSeekableStream(b"<file content>"),
+                "text/plain",
+                {},
+                -1,
+            )
+        }
+
+        with pytest.raises(ValueError, match="file"):
+            httpx.Request("POST", url, files=files)
+
+    def test_boolean_length_is_rejected(self) -> None:
+        url = "https://www.example.com/"
+        files = {
+            "file": (
+                "name.txt",
+                NonSeekableStream(b"x"),
+                "text/plain",
+                {},
+                True,
+            )
+        }
+
+        with pytest.raises(TypeError, match="length"):
+            httpx.Request("POST", url, files=files)
+
+    def test_bytes_content_with_declared_length_is_verified(self) -> None:
+        url = "https://www.example.com/"
+        headers = {"Content-Type": "multipart/form-data; boundary=BOUNDARY"}
+        files = {"file": ("name.txt", b"<bytes content>", "text/plain", {}, 15)}
+
+        request = httpx.Request("POST", url, headers=headers, files=files)
+        assert request.read() == (
+            b'--BOUNDARY\r\nContent-Disposition: form-data; name="file";'
+            b' filename="name.txt"\r\nContent-Type: text/plain\r\n\r\n'
+            b"<bytes content>\r\n--BOUNDARY--\r\n"
+        )
+
+        wrong_files = {"file": ("name.txt", b"<bytes content>", "text/plain", {}, 5)}
+        wrong_request = httpx.Request("POST", url, headers=headers, files=wrong_files)
+        with pytest.raises(ValueError, match="longer"):
+            b"".join(wrong_request.stream)
+
+
+def test_explicit_file_length_sync_and_async_match() -> None:
+    url = "https://www.example.com/"
+    headers = {"Content-Type": "multipart/form-data; boundary=BOUNDARY"}
+
+    def build_request() -> httpx.Request:
+        files = {
+            "file": (
+                "name.txt",
+                NonSeekableStream(b"<file content>"),
+                "text/plain",
+                {},
+                14,
+            )
+        }
+        return httpx.Request("POST", url, headers=headers, files=files)
+
+    sync_body = b"".join(build_request().stream)
+    async_body = asyncio.run(_collect_async(build_request()))
+
+    assert async_body == sync_body
+    assert sync_body == (
+        b'--BOUNDARY\r\nContent-Disposition: form-data; name="file";'
+        b' filename="name.txt"\r\nContent-Type: text/plain\r\n\r\n'
+        b"<file content>\r\n--BOUNDARY--\r\n"
+    )
+
+
+def test_explicit_file_length_mismatch_sync_and_async_match() -> None:
+    url = "https://www.example.com/"
+    headers = {"Content-Type": "multipart/form-data; boundary=BOUNDARY"}
+
+    def build_request() -> httpx.Request:
+        files = {
+            "file": (
+                "name.txt",
+                NonSeekableStream(b"short"),
+                "text/plain",
+                {},
+                14,
+            )
+        }
+        return httpx.Request("POST", url, headers=headers, files=files)
+
+    with pytest.raises(ValueError, match="shorter"):
+        b"".join(build_request().stream)
+
+    with pytest.raises(ValueError, match="shorter"):
+        asyncio.run(_collect_async(build_request()))
+
+
+async def _collect_async(request: httpx.Request) -> bytes:
+    return b"".join([chunk async for chunk in request.stream])

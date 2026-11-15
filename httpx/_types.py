@@ -81,6 +81,14 @@ FileTypes = Union[
     Tuple[Optional[str], FileContent, Optional[str]],
     # (filename, file (or bytes), content_type, headers)
     Tuple[Optional[str], FileContent, Optional[str], Mapping[str, str]],
+    # (filename, file (or bytes), content_type, headers, length)
+    Tuple[
+        Optional[str],
+        FileContent,
+        Optional[str],
+        Mapping[str, str],
+        Optional[int],
+    ],
 ]
 RequestFiles = Union[Mapping[str, FileTypes], Sequence[Tuple[str, FileTypes]]]
 

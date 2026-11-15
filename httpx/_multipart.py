@@ -126,6 +126,7 @@ class FileField:
 
         headers: dict[str, str] = {}
         content_type: str | None = None
+        length: int | None = None
 
         # This large tuple based API largely mirror's requests' API
         # It would be good to think of better APIs for this that we could
@@ -138,9 +139,12 @@ class FileField:
                 filename, fileobj = value
             elif len(value) == 3:
                 filename, fileobj, content_type = value
-            else:
+            elif len(value) == 4:
                 # all 4 parameters included
-                filename, fileobj, content_type, headers = value  # type: ignore
+                filename, fileobj, content_type, headers = value
+            else:
+                # all 5 parameters included, including the declared file length
+                filename, fileobj, content_type, headers, length = value
         else:
             filename = Path(str(getattr(value, "name", "upload"))).name
             fileobj = value
@@ -164,12 +168,28 @@ class FileField:
                 "Multipart file uploads must be opened in binary mode, not text mode."
             )
 
+        if length is not None:
+            if isinstance(length, bool) or not isinstance(length, int):
+                raise TypeError(
+                    "Invalid type for length. Expected int, got "
+                    f"{type(length)}: {length!r}"
+                )
+            if length < 0:
+                raise ValueError(
+                    f"Invalid length for file {name!r}. "
+                    f"Expected a non-negative value, got {length}."
+                )
+
         self.filename = filename
         self.file = fileobj
         self.headers = headers
+        self.length = length
 
     def get_length(self) -> int | None:
         headers = self.render_headers()
+
+        if self.length is not None:
+            return len(headers) + self.length
 
         if isinstance(self.file, (str, bytes)):
             return len(headers) + len(to_bytes(self.file))
@@ -202,7 +222,8 @@ class FileField:
 
     def render_data(self) -> typing.Iterator[bytes]:
         if isinstance(self.file, (str, bytes)):
-            yield to_bytes(self.file)
+            data = to_bytes(self.file)
+            yield from self._verify_length([data])
             return
 
         if hasattr(self.file, "seek"):
@@ -211,10 +232,42 @@ class FileField:
             except io.UnsupportedOperation:
                 pass
 
-        chunk = self.file.read(self.CHUNK_SIZE)
-        while chunk:
-            yield to_bytes(chunk)
+        def iter_chunks() -> typing.Iterator[bytes]:
             chunk = self.file.read(self.CHUNK_SIZE)
+            while chunk:
+                yield to_bytes(chunk)
+                chunk = self.file.read(self.CHUNK_SIZE)
+
+        yield from self._verify_length(iter_chunks())
+
+    def _verify_length(self, chunks: typing.Iterable[bytes]) -> typing.Iterator[bytes]:
+        """
+        Yield the encoded file bytes, verifying that the number of bytes
+        produced matches the explicitly declared length, when one was given.
+        """
+        if self.length is None:
+            yield from chunks
+            return
+
+        remaining = self.length
+        for chunk in chunks:
+            if len(chunk) > remaining:
+                # Emit only the bytes that were declared, so that no extra
+                # bytes can ever leak into the following part of the body,
+                # then fail the transfer rather than continuing to encode.
+                yield chunk[:remaining]
+                raise ValueError(
+                    f"File {self.name!r} is longer than its declared length "
+                    f"of {self.length} bytes."
+                )
+            remaining -= len(chunk)
+            yield chunk
+
+        if remaining != 0:
+            raise ValueError(
+                f"File {self.name!r} is shorter than its declared length "
+                f"of {self.length} bytes."
+            )
 
     def render(self) -> typing.Iterator[bytes]:
         yield self.render_headers()

@@ -204,6 +204,22 @@ of items for the file value:
 }
 ```
 
+If the file object cannot report its own size (for example because it is
+neither seekable nor backed by a real file descriptor), you can declare the
+number of bytes the part contains using a five element tuple. The declared
+length is then used to send a `Content-Length` header instead of falling back
+to chunked transfer encoding:
+
+```pycon
+>>> files = {'upload-file': ('report.xls', report_file, 'application/vnd.ms-excel', {}, 1234)}
+>>> r = httpx.post("https://httpbin.org/post", files=files)
+```
+
+The length refers to the encoded bytes of the file part and is checked while
+streaming. If the object yields fewer or more bytes than declared, the request
+fails with a `ValueError` (naming the offending field) rather than sending a
+mis-sized body. Empty files are verified too, with a declared length of `0`.
+
 If you need to include non-file data fields in the multipart form, use the `data=...` parameter:
 
 ```pycon
