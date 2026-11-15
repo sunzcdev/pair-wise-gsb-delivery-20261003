@@ -1,6 +1,13 @@
 # History
 
 ## Unreleased
+* Rework updating a cached response after a 304 (Not Modified) revalidation:
+  * Merge headers per RFC 9111: replace same-named fields, keep fields not present in the 304
+    response, and remove stale `Warning` header fields with 1xx warn-codes
+  * Keep the cached expiration if the 304 response provides no expiration information
+  * Never write the 304 response's (empty) body to the cache
+  * Treat a `no-store` directive in a 304 response as invalidating the cached response
+  * Don't modify the previously cached response object in place when merging
 * Fix `ValueError` when a response has an invalid `Expires` date (for example `Expires: garbage`); it is now treated as already expired
 * Fix JSON refresh comparisons for mixed-case `Content-Type` values
 * Keep caller-supplied MongoDB clients open when closing MongoDB or GridFS caches

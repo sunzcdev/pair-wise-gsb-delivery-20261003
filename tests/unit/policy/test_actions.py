@@ -654,6 +654,108 @@ def test_update_revalidated_response__transfer_encoding():
     assert 'Content-Length' not in cached_response.headers
 
 
+def test_update_revalidated_response__merge_headers():
+    """After revalidation, headers from the 304 response should replace stored headers with the
+    same name, and stored headers not present in the 304 response should be kept
+    """
+    actions = CacheActions.from_request('key', BASIC_REQUEST, CacheSettings(cache_control=True))
+    cached_response = create_mock_response(
+        headers={'ETag': ETAG, 'Cache-Control': 'max-age=60', 'X-Custom-Header': 'cached'}
+    )
+    new_response = create_mock_response(
+        status_code=304, headers={'ETag': ETAG, 'X-Custom-Header': 'updated'}
+    )
+    merged_response = actions.update_revalidated_response(new_response, cached_response)
+    assert merged_response.headers['X-Custom-Header'] == 'updated'
+    assert merged_response.headers['Cache-Control'] == 'max-age=60'
+
+
+@pytest.mark.parametrize(
+    'cached_warning, expected_warning',
+    [
+        ('110 - "Response is stale"', None),
+        ('214 - "Transformation applied"', '214 - "Transformation applied"'),
+        (
+            '110 - "Response is stale", 214 - "Transformation, applied"',
+            '214 - "Transformation, applied"',
+        ),
+    ],
+)
+def test_update_revalidated_response__remove_stale_warnings(cached_warning, expected_warning):
+    """After revalidation, Warning header fields with 1xx warn-codes should be removed from the
+    cached response; other warnings (including quoted commas) should be kept
+    """
+    actions = CacheActions.from_request('key', BASIC_REQUEST, CacheSettings(cache_control=True))
+    cached_response = create_mock_response(headers={'ETag': ETAG, 'Warning': cached_warning})
+    new_response = create_mock_response(status_code=304, headers={'ETag': ETAG})
+    merged_response = actions.update_revalidated_response(new_response, cached_response)
+    assert merged_response.headers.get('Warning') == expected_warning
+    assert actions.skip_write is (expected_warning == cached_warning)
+
+
+def test_update_revalidated_response__keep_expiration():
+    """A 304 response that provides no expiration information should not change the cached
+    response's expiration
+    """
+    actions = CacheActions.from_request('key', BASIC_REQUEST, CacheSettings(cache_control=True))
+    expires = utcnow() + timedelta(hours=1)
+    cached_response = CachedResponse(expires=expires, headers={'ETag': ETAG})
+    new_response = create_mock_response(status_code=304, headers={'ETag': ETAG})
+    merged_response = actions.update_revalidated_response(new_response, cached_response)
+    assert merged_response.expires == expires
+    assert actions.skip_write is True
+
+
+def test_update_revalidated_response__no_store():
+    """A no-store directive in a 304 response should prevent the cached response from being
+    updated or reused
+    """
+    actions = CacheActions.from_request('key', BASIC_REQUEST, CacheSettings(cache_control=True))
+    cached_response = create_mock_response(headers={'ETag': ETAG})
+    new_response = create_mock_response(
+        status_code=304, headers={'ETag': ETAG, 'Cache-Control': 'no-store'}
+    )
+    actions.update_revalidated_response(new_response, cached_response)
+    assert actions.skip_write is True
+    assert actions._response_no_store is True
+
+
+def test_update_revalidated_response__no_store__ignored():
+    """A no-store directive in a 304 response should be ignored if cache_control=False"""
+    actions = CacheActions.from_request('key', BASIC_REQUEST, CacheSettings(cache_control=False))
+    cached_response = create_mock_response(headers={'ETag': ETAG})
+    new_response = create_mock_response(
+        status_code=304, headers={'ETag': ETAG, 'Cache-Control': 'no-store'}
+    )
+    actions.update_revalidated_response(new_response, cached_response)
+    assert actions._response_no_store is False
+
+
+def test_update_revalidated_response__does_not_modify_original():
+    """Merging a 304 response should not modify the original cached response, which may still
+    be held by the caller
+    """
+    actions = CacheActions.from_request('key', BASIC_REQUEST, CacheSettings(cache_control=True))
+    expires = utcnow() + timedelta(hours=1)
+    cached_response = CachedResponse(
+        status_code=200,
+        expires=expires,
+        headers={'ETag': ETAG, 'Warning': '110 - "Response is stale"'},
+    )
+    original_headers = dict(cached_response.headers.items())
+    new_response = create_mock_response(
+        status_code=304, headers={'ETag': ETAG, 'X-New-Header': 'new'}
+    )
+    merged_response = actions.update_revalidated_response(new_response, cached_response)
+
+    assert merged_response is not cached_response
+    assert dict(cached_response.headers.items()) == original_headers
+    assert cached_response.expires == expires
+    assert cached_response.revalidated is False
+    assert merged_response.headers['X-New-Header'] == 'new'
+    assert 'Warning' not in merged_response.headers
+
+
 @pytest.mark.parametrize('directive', IGNORED_DIRECTIVES)
 def test_ignored_headers(directive):
     """Ensure that currently unimplemented Cache-Control headers do not affect behavior"""

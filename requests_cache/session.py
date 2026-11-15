@@ -281,16 +281,22 @@ class CacheMixin(MIXIN_BASE):
         response = super().send(request, **kwargs)
         actions.update_from_response(response)
 
-        if not actions.skip_write:
-            self.cache.save_response(response, actions.cache_key, actions.expires)
-        elif cached_response is not None and response.status_code == 304:
-            cached_response = actions.update_revalidated_response(
-                response, CachedResponse.from_response(cached_response)
-            )
+        # Revalidation (304 Not Modified): update the cached response's metadata. The 304
+        # response itself has no usable body, so it is never written to the cache.
+        if cached_response is not None and response.status_code == 304:
+            cached_response = actions.update_revalidated_response(response, cached_response)
             cached_response.cache_key = actions.cache_key
             if not actions.skip_write:
-                self.cache.save_response(cached_response, actions.cache_key, actions.expires)  # type: ignore[unreachable]
+                self.cache.save_response(
+                    cached_response, actions.cache_key, cached_response.expires
+                )
+            # A no-store directive in the 304 response invalidates the cached response
+            elif actions._response_no_store and not self.settings.read_only:
+                self.cache.delete(actions.cache_key)
             return cached_response
+
+        if not actions.skip_write:
+            self.cache.save_response(response, actions.cache_key, actions.expires)
         else:
             logger.debug(f'Skipping cache write for URL: {request.url}')
 

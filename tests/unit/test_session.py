@@ -32,6 +32,7 @@ from requests_cache.policy import (
 from requests_cache.policy.actions import METHOD_OVERRIDE_HEADERS
 from requests_cache.session import OriginalSession
 from tests.conftest import (
+    ETAG,
     MOCKED_URL,
     MOCKED_URL_200_404,
     MOCKED_URL_404,
@@ -1402,6 +1403,45 @@ def test_revalidation__update_cache(mock_session):
         response_3 = mock_session.get(MOCKED_URL_ETAG, refresh=True, expire_after=60)
         mock_save.assert_called()
     assert response_3.headers['new_header'] == 'true'
+
+
+def test_revalidation__304_in_allowable_codes(mock_session):
+    """A 304 response should never be written to the cache, even if 304 is an allowable status
+    code; the response body and status code always come from the cached response
+    """
+    mock_session.settings.allowable_codes = (200, 304)
+    mock_session.settings.expire_after = 60
+    mock_session.mock_adapter.register_uri(
+        'GET', MOCKED_URL_ETAG, headers={'ETag': ETAG}, text='mock response', status_code=200
+    )
+    mock_session.get(MOCKED_URL_ETAG)
+    mock_session.mock_adapter.register_uri('GET', MOCKED_URL_ETAG, status_code=304)
+
+    response = mock_session.get(MOCKED_URL_ETAG, refresh=True)
+    assert response.from_cache is True and response.revalidated is True
+    assert response.status_code == 200
+    assert response.text == 'mock response'
+
+
+def test_revalidation__no_store(mock_session):
+    """A 304 response with a no-store directive should invalidate the cached response so it
+    doesn't continue to be reused
+    """
+    mock_session.settings.cache_control = True
+    mock_session.settings.expire_after = 60
+    mock_session.get(MOCKED_URL_ETAG)
+    mock_session.mock_adapter.register_uri(
+        'GET', MOCKED_URL_ETAG, status_code=304, headers={'Cache-Control': 'no-store'}
+    )
+
+    response = mock_session.get(MOCKED_URL_ETAG, refresh=True)
+    assert response.from_cache is True and response.revalidated is True
+    assert not mock_session.cache.contains(url=MOCKED_URL_ETAG)
+
+    # The next request should be sent to the server instead of reusing the cached response
+    mock_session.mock_adapter.register_uri('GET', MOCKED_URL_ETAG, status_code=200)
+    response = mock_session.get(MOCKED_URL_ETAG)
+    assert response.from_cache is False
 
 
 def test_request_refresh(mock_session):

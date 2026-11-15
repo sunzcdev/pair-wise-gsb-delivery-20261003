@@ -77,6 +77,7 @@ class CacheActions(RichMixin):
     _only_if_cached: bool = field(default=False, repr=False)
     _refresh: bool = field(default=False, repr=False)
     _request: PreparedRequest = field(default=None, repr=False)
+    _response_no_store: bool = field(default=False, repr=False)
     _stale_if_error: Union[bool, ExpirationTime] = field(default=None, repr=False)
     _stale_while_revalidate: Union[bool, ExpirationTime] = field(default=None, repr=False)
     _validation_headers: Dict[str, str] = field(factory=dict, repr=False)
@@ -276,32 +277,55 @@ class CacheActions(RichMixin):
     def update_revalidated_response(
         self, response: Response, cached_response: 'CachedResponse'
     ) -> 'CachedResponse':
-        """After revalidation, update the cached response's expiration and headers"""
+        """After revalidation, update the cached response's expiration and headers.
+
+        Header fields are merged according to RFC 9111, section 4.3.4:
+
+        * Fields in the 304 response replace stored fields with the same name
+        * Stored fields not present in the 304 response are kept as-is
+        * Warning fields with 1xx warn-codes are removed from the stored response
+        * The response body and other state always come from the cached response, never the 304
+
+        Returns a merged copy; the response passed in is never modified, since it may still
+        be held by the caller (or by an in-memory backend).
+        """
+        from ..models import CachedResponse  # Avoid circular import
+
         logger.debug(f'Response for URL {response.request.url} has not been modified')
+
+        cached_response = CachedResponse.from_response(cached_response)
+        headers = CaseInsensitiveDict(cached_response.headers)
+        warnings_removed = _remove_stale_warnings(headers)
+        headers.update(response.headers)
+
+        # Account for Transfer-Encoding in original response and Content-Length in 304 response
+        if 'Content-Length' in headers and 'Transfer-Encoding' in headers:
+            del headers['Content-Length']
+
+        # A 304 that provides no expiration information doesn't change the cached expiration
+        expires = self.expires if self.expire_after is not None else cached_response.expires
 
         # Skip updating the cached response if expiration and headers are unchanged
         # OR if session/request settings skip it.
         # Ignore validators missing from new response, since they may be omitted
-        headers_changed = any(
+        headers_changed = warnings_removed or any(
             cached_response.headers.get(k) != v for k, v in response.headers.items()
         )
-        expiration_changed = self.expires != cached_response.expires
+        expiration_changed = expires != cached_response.expires
+
+        # A no-store directive in the 304 response means the cached response must not be reused
+        response_directives = CacheDirectives.from_headers(response.headers)
+        self._response_no_store = self._settings.cache_control and response_directives.no_store
         permanent_skip = (
-            self._settings.read_only or self._settings.disabled or self._directives.no_store
+            self._settings.read_only
+            or self._settings.disabled
+            or self._directives.no_store
+            or self._response_no_store
         )
         self.skip_write = permanent_skip or not (expiration_changed or headers_changed)
 
-        cached_response.expires = self.expires
-
-        # Update headers;
-        # Account for Transfer-Encoding in original response and Content-Length in 304 response
-        cached_response.headers.update(response.headers)
-        if (
-            'Content-Length' in cached_response.headers
-            and 'Transfer-Encoding' in cached_response.headers
-        ):
-            del cached_response.headers['Content-Length']
-
+        cached_response.headers = headers
+        cached_response.expires = expires
         cached_response.revalidated = True
         cached_response.has_content_changed = False
         return cached_response
@@ -440,6 +464,51 @@ def _validate_expires_header(expires: Optional[str]) -> ExpirationTime:
         logger.debug(f'Invalid Expires header: {expires!r}; treating as expired')
         return EXPIRE_IMMEDIATELY
     return expires
+
+
+def _remove_stale_warnings(headers: MutableMapping[str, str]) -> bool:
+    """Remove any Warning header fields with 1xx warn-codes from a stored response, as
+    required when handling a 304 (Not Modified) response (RFC 9111, section 4.3.4).
+
+    Returns:
+        ``True`` if any warnings were removed
+    """
+    warning = headers.get('Warning')
+    if not warning:
+        return False
+    values = _split_list_header(warning)
+    kept = [v for v in values if not _is_stale_warning(v)]
+    if len(kept) == len(values):
+        return False
+    if kept:
+        headers['Warning'] = ', '.join(kept)
+    else:
+        del headers['Warning']
+    return True
+
+
+def _is_stale_warning(value: str) -> bool:
+    """A Warning header field with a 1xx warn-code is stale after a successful revalidation"""
+    warn_code = value.split(' ', 1)[0].strip()
+    return len(warn_code) == 3 and warn_code.startswith('1') and warn_code.isdigit()
+
+
+def _split_list_header(value: str) -> List[str]:
+    """Split a comma-separated header value (possibly combined from multiple header fields with
+    the same name), ignoring commas within quoted strings"""
+    values = []
+    current = []
+    in_quotes = False
+    for char in value:
+        if char == '"':
+            in_quotes = not in_quotes
+        if char == ',' and not in_quotes:
+            values.append(''.join(current).strip())
+            current = []
+        else:
+            current.append(char)
+    values.append(''.join(current).strip())
+    return [v for v in values if v]
 
 
 def _is_method_allowed(request: PreparedRequest, settings: CacheSettings) -> bool:
