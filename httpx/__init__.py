@@ -83,6 +83,7 @@ __all__ = [
     "Response",
     "ResponseNotRead",
     "stream",
+    "StreamBusy",
     "StreamClosed",
     "StreamConsumed",
     "StreamError",

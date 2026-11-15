@@ -34,6 +34,7 @@ For an overview of how to work with HTTPX exceptions, see [Exceptions (Quickstar
     * ResponseNotRead
     * RequestNotRead
     * StreamClosed
+    * StreamBusy
 
 ---
 
@@ -115,6 +116,9 @@ For an overview of how to work with HTTPX exceptions, see [Exceptions (Quickstar
     :docstring:
 
 ::: httpx.StreamClosed
+    :docstring:
+
+::: httpx.StreamBusy
     :docstring:
 
 ::: httpx.ResponseNotRead

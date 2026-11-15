@@ -1,7 +1,10 @@
+import collections
 import json
+import math
 import pickle
 import typing
 
+import anyio
 import chardet
 import pytest
 
@@ -1038,3 +1041,180 @@ def test_response_decode_text_using_explicit_encoding():
     assert response.reason_phrase == "OK"
     assert response.encoding == "cp1252"
     assert response.text == text
+
+
+class GatedAsyncStream(httpx.AsyncByteStream):
+    """
+    A controlled async byte stream that only yields chunks when the test
+    explicitly releases them. Used to deterministically interleave tasks
+    that access the same streaming response.
+
+    Use as an async context manager, so that the underlying channels
+    are closed once the test completes.
+    """
+
+    def __init__(self, chunks: list) -> None:
+        self._chunks = collections.deque(chunks)
+        self._release_send, self._release_receive = (
+            anyio.create_memory_object_stream(math.inf)
+        )
+        self._parked_send, self._parked_receive = anyio.create_memory_object_stream(
+            math.inf
+        )
+        self.yielded: list = []
+        self.close_count = 0
+        self._closed = False
+
+    async def __aenter__(self) -> "GatedAsyncStream":
+        return self
+
+    async def __aexit__(self, *args: object) -> None:
+        await self._release_send.aclose()
+        await self._release_receive.aclose()
+        await self._parked_send.aclose()
+        await self._parked_receive.aclose()
+
+    async def __aiter__(self) -> typing.AsyncIterator[bytes]:
+        while self._chunks and not self._closed:
+            self._parked_send.send_nowait(None)
+            await self._release_receive.receive()
+            if self._closed:
+                return
+            chunk = self._chunks.popleft()
+            self.yielded.append(chunk)
+            yield chunk
+
+    async def aclose(self) -> None:
+        self.close_count += 1
+        self._closed = True
+        # Wake up any reader that is parked waiting for the next chunk.
+        self._release_send.send_nowait(None)
+
+    def release_chunk(self) -> None:
+        """Allow the stream to yield its next chunk."""
+        self._release_send.send_nowait(None)
+
+    async def wait_until_parked(self) -> None:
+        """Wait until a reader is parked, waiting for the next chunk."""
+        await self._parked_receive.receive()
+
+
+@pytest.mark.anyio
+async def test_concurrent_stream_read_raises_stream_busy():
+    async with GatedAsyncStream([b"Hello", b", ", b"world!"]) as stream:
+        response = httpx.Response(200, stream=stream)
+        content = []
+
+        async def read_response():
+            content.append(await response.aread())
+
+        with anyio.fail_after(5):
+            async with anyio.create_task_group() as task_group:
+                task_group.start_soon(read_response)
+
+                # The first reader receives one chunk, then parks waiting
+                # for the next one.
+                await stream.wait_until_parked()
+                stream.release_chunk()
+                await stream.wait_until_parked()
+                assert stream.yielded == [b"Hello"]
+
+                # A second task attempting to stream the same response fails
+                # before touching the underlying stream...
+                with pytest.raises(httpx.StreamBusy):
+                    async for _ in response.aiter_raw():
+                        pass  # pragma: no cover
+
+                # ...and does not steal any data from the first reader.
+                assert stream.yielded == [b"Hello"]
+
+                # The first reader receives the remaining content intact.
+                stream.release_chunk()
+                await stream.wait_until_parked()
+                stream.release_chunk()
+
+        assert content == [b"Hello, world!"]
+        assert response.is_closed
+        assert stream.close_count == 1
+
+        # The now-cached content can be read repeatedly.
+        assert await response.aread() == b"Hello, world!"
+        cached = b"".join([part async for part in response.aiter_bytes()])
+        assert cached == b"Hello, world!"
+
+
+@pytest.mark.anyio
+async def test_cancelled_stream_read_allows_aclose():
+    async with GatedAsyncStream([b"Hello, ", b"world!"]) as stream:
+        response = httpx.Response(200, stream=stream)
+        collected = []
+
+        async def read_response():
+            async for chunk in response.aiter_raw():
+                collected.append(chunk)
+
+        with anyio.fail_after(5):
+            async with anyio.create_task_group() as task_group:
+                task_group.start_soon(read_response)
+                await stream.wait_until_parked()
+                stream.release_chunk()
+                await stream.wait_until_parked()
+                assert collected == [b"Hello, "]
+                # Cancel the reader while it is parked on the next chunk.
+                task_group.cancel_scope.cancel()
+
+        # The cancelled read must not prevent a legitimate close.
+        assert not response.is_closed
+        await response.aclose()
+        assert response.is_closed
+        assert stream.close_count == 1
+
+
+@pytest.mark.anyio
+async def test_aclose_racing_pending_read_releases_stream_once():
+    async with GatedAsyncStream([b"Hello, ", b"world!"]) as stream:
+        response = httpx.Response(200, stream=stream)
+        collected = []
+
+        async def read_response():
+            async for chunk in response.aiter_raw():
+                collected.append(chunk)
+
+        with anyio.fail_after(5):
+            async with anyio.create_task_group() as task_group:
+                task_group.start_soon(read_response)
+                await stream.wait_until_parked()
+                # Close the response while the read is parked on the next chunk.
+                await response.aclose()
+                assert response.is_closed
+            # The parked reader wakes up and finishes without re-releasing.
+
+        # There is only a single final release of the underlying stream.
+        assert stream.close_count == 1
+
+
+@pytest.mark.anyio
+async def test_active_reader_check_is_scoped_per_response():
+    async with GatedAsyncStream([b"one"]) as stream_1:
+        async with GatedAsyncStream([b"two"]) as stream_2:
+            response_1 = httpx.Response(200, stream=stream_1)
+            response_2 = httpx.Response(200, stream=stream_2)
+            collected_1: list = []
+            collected_2: list = []
+
+            async def read_response(response, collected):
+                async for chunk in response.aiter_raw():
+                    collected.append(chunk)
+
+            with anyio.fail_after(5):
+                async with anyio.create_task_group() as task_group:
+                    task_group.start_soon(read_response, response_1, collected_1)
+                    task_group.start_soon(read_response, response_2, collected_2)
+                    # Both responses are read concurrently, each by one task.
+                    await stream_1.wait_until_parked()
+                    await stream_2.wait_until_parked()
+                    stream_1.release_chunk()
+                    stream_2.release_chunk()
+
+            assert collected_1 == [b"one"]
+            assert collected_2 == [b"two"]

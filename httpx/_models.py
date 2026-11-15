@@ -26,6 +26,7 @@ from ._exceptions import (
     HTTPStatusError,
     RequestNotRead,
     ResponseNotRead,
+    StreamBusy,
     StreamClosed,
     StreamConsumed,
     request_context,
@@ -542,6 +543,11 @@ class Response:
 
         self.is_closed = False
         self.is_stream_consumed = False
+        # Tracks whether a task is currently reading from the response stream.
+        # This is per-response, and is used to guard against concurrent
+        # streaming reads, which would otherwise interleave chunks between
+        # tasks in an arbitrary manner.
+        self._active_reader = False
 
         self.default_encoding = default_encoding
 
@@ -1040,6 +1046,11 @@ class Response:
         """
         A byte-iterator over the raw response content.
         """
+        if self._active_reader:
+            # Fail before touching the underlying stream, so that a
+            # concurrent reader cannot steal chunks from the task that
+            # is already reading this response.
+            raise StreamBusy()
         if self.is_stream_consumed:
             raise StreamConsumed()
         if self.is_closed:
@@ -1047,20 +1058,27 @@ class Response:
         if not isinstance(self.stream, AsyncByteStream):
             raise RuntimeError("Attempted to call an async iterator on a sync stream.")
 
+        self._active_reader = True
         self.is_stream_consumed = True
         self._num_bytes_downloaded = 0
         chunker = ByteChunker(chunk_size=chunk_size)
 
-        with request_context(request=self._request):
-            async for raw_stream_bytes in self.stream:
-                self._num_bytes_downloaded += len(raw_stream_bytes)
-                for chunk in chunker.decode(raw_stream_bytes):
-                    yield chunk
+        try:
+            with request_context(request=self._request):
+                async for raw_stream_bytes in self.stream:
+                    self._num_bytes_downloaded += len(raw_stream_bytes)
+                    for chunk in chunker.decode(raw_stream_bytes):
+                        yield chunk
 
-        for chunk in chunker.flush():
-            yield chunk
+            for chunk in chunker.flush():
+                yield chunk
 
-        await self.aclose()
+            await self.aclose()
+        finally:
+            # Resetting the active reader here ensures that a cancelled
+            # or errored read still allows the response to be closed
+            # cleanly afterwards.
+            self._active_reader = False
 
     async def aclose(self) -> None:
         """

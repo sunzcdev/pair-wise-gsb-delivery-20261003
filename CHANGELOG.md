@@ -13,6 +13,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 ### Added
 
 * Expose `FunctionAuth` from the public API. (#3699)
+* Add `httpx.StreamBusy`, raised when an async response stream is read concurrently by more than one task. Streaming reads are now guarded by a per-response active reader check.
 
 ## 0.28.1 (6th December, 2024)
 
