@@ -445,3 +445,163 @@ async def test_async_invalid_redirect():
             await client.get(
                 "http://example.org/invalid_redirect", follow_redirects=True
             )
+
+
+def large_body_redirects(request: httpx.Request) -> httpx.Response:
+    if request.url.path == "/redirect":
+        return httpx.Response(
+            302,
+            headers={"location": "https://example.org/target"},
+            content=b"x" * 100,
+        )
+    return httpx.Response(200, content=b"final body")
+
+
+def test_history_body_limit_truncates_redirect_body():
+    client = httpx.Client(
+        transport=httpx.MockTransport(large_body_redirects),
+        history_body_limit=10,
+    )
+    response = client.get("https://example.org/redirect", follow_redirects=True)
+
+    assert len(response.history) == 1
+    assert response.history[0].content == b"x" * 10
+    assert response.history[0].is_content_truncated is True
+    assert response.history[0].is_closed is True
+    # The final response is not subject to the limit.
+    assert response.content == b"final body"
+    assert response.is_content_truncated is False
+
+
+def test_history_body_limit_default_keeps_full_body():
+    client = httpx.Client(transport=httpx.MockTransport(large_body_redirects))
+    response = client.get("https://example.org/redirect", follow_redirects=True)
+
+    assert response.history[0].content == b"x" * 100
+    assert response.history[0].is_content_truncated is False
+
+
+def test_history_body_limit_zero():
+    client = httpx.Client(
+        transport=httpx.MockTransport(large_body_redirects),
+        history_body_limit=0,
+    )
+    response = client.get("https://example.org/redirect", follow_redirects=True)
+
+    assert response.history[0].content == b""
+    assert response.history[0].is_content_truncated is True
+
+
+def test_history_body_limit_not_truncated_when_body_smaller():
+    client = httpx.Client(
+        transport=httpx.MockTransport(large_body_redirects),
+        history_body_limit=1000,
+    )
+    response = client.get("https://example.org/redirect", follow_redirects=True)
+
+    assert response.history[0].content == b"x" * 100
+    assert response.history[0].is_content_truncated is False
+
+
+def test_history_body_limit_rejects_negative_value():
+    with pytest.raises(ValueError):
+        httpx.Client(
+            transport=httpx.MockTransport(large_body_redirects),
+            history_body_limit=-1,
+        )
+
+
+def test_history_body_limit_uses_decoded_bytes():
+    import gzip
+
+    decoded_body = b"x" * 100
+    compressed_body = gzip.compress(decoded_body)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/redirect":
+            return httpx.Response(
+                302,
+                headers={
+                    "location": "https://example.org/target",
+                    "Content-Encoding": "gzip",
+                },
+                content=compressed_body,
+            )
+        return httpx.Response(200, content=b"final body")
+
+    client = httpx.Client(
+        transport=httpx.MockTransport(handler),
+        history_body_limit=10,
+    )
+    response = client.get("https://example.org/redirect", follow_redirects=True)
+
+    assert response.history[0].content == b"x" * 10
+    assert response.history[0].is_content_truncated is True
+
+
+class ChallengeAuth(httpx.Auth):
+    def sync_auth_flow(self, request: httpx.Request):
+        response = yield request
+        if response.status_code == 401:
+            request.headers["Authorization"] = "token"
+            yield request
+
+    async def async_auth_flow(self, request: httpx.Request):
+        response = yield request
+        if response.status_code == 401:
+            request.headers["Authorization"] = "token"
+            yield request
+
+
+def challenge_handler(request: httpx.Request) -> httpx.Response:
+    if request.headers.get("Authorization") != "token":
+        return httpx.Response(401, content=b"y" * 100)
+    return httpx.Response(200, content=b"ok")
+
+
+def test_history_body_limit_applies_to_auth_challenge():
+    client = httpx.Client(
+        transport=httpx.MockTransport(challenge_handler),
+        auth=ChallengeAuth(),
+        history_body_limit=10,
+    )
+    response = client.get("https://example.org/")
+
+    assert response.status_code == 200
+    assert len(response.history) == 1
+    assert response.history[0].status_code == 401
+    assert response.history[0].content == b"y" * 10
+    assert response.history[0].is_content_truncated is True
+
+
+@pytest.mark.anyio
+async def test_async_history_body_limit_truncates_redirect_body():
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(large_body_redirects),
+        history_body_limit=10,
+    ) as client:
+        response = await client.get(
+            "https://example.org/redirect", follow_redirects=True
+        )
+
+    assert len(response.history) == 1
+    assert response.history[0].content == b"x" * 10
+    assert response.history[0].is_content_truncated is True
+    assert response.history[0].is_closed is True
+    assert response.content == b"final body"
+    assert response.is_content_truncated is False
+
+
+@pytest.mark.anyio
+async def test_async_history_body_limit_applies_to_auth_challenge():
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(challenge_handler),
+        auth=ChallengeAuth(),
+        history_body_limit=10,
+    ) as client:
+        response = await client.get("https://example.org/")
+
+    assert response.status_code == 200
+    assert len(response.history) == 1
+    assert response.history[0].content == b"y" * 10
+    assert response.history[0].is_content_truncated is True

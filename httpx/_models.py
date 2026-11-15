@@ -542,6 +542,7 @@ class Response:
 
         self.is_closed = False
         self.is_stream_consumed = False
+        self.is_content_truncated = False
 
         self.default_encoding = default_encoding
 
@@ -873,12 +874,45 @@ class Response:
         self.extensions = {}
         self.stream = UnattachedStream()
 
-    def read(self) -> bytes:
+    def read(self, max_bytes: int | None = None) -> bytes:
         """
         Read and return the response content.
+
+        When `max_bytes` is given, only the first `max_bytes` of the
+        *decoded* response content are retained. The underlying stream is
+        still drained to completion (or closed) so that the connection can
+        be released, and `is_content_truncated` is set to `True` whenever the
+        decoded content was larger than the limit. The limit is measured on
+        the decoded response bytes, not on the raw on-the-wire bytes.
         """
+        if max_bytes is None:
+            if not hasattr(self, "_content"):
+                self._content = b"".join(self.iter_bytes())
+            return self._content
+
+        if max_bytes < 0:
+            raise ValueError("max_bytes must be a non-negative integer, or None")
+
         if not hasattr(self, "_content"):
-            self._content = b"".join(self.iter_bytes())
+            parts: list[bytes] = []
+            remaining = max_bytes
+            truncated = False
+            for chunk in self.iter_bytes():
+                if remaining > 0:
+                    if len(chunk) > remaining:
+                        truncated = True
+                    parts.append(chunk[:remaining])
+                    remaining -= min(len(chunk), remaining)
+                elif chunk:
+                    truncated = True
+            content = b"".join(parts)
+            self._content = content
+            self.stream = ByteStream(content)
+            self.is_content_truncated = truncated
+        elif len(self._content) > max_bytes:
+            self.is_content_truncated = True
+            self._content = self._content[:max_bytes]
+            self.stream = ByteStream(self._content)
         return self._content
 
     def iter_bytes(self, chunk_size: int | None = None) -> typing.Iterator[bytes]:
@@ -971,12 +1005,47 @@ class Response:
             with request_context(request=self._request):
                 self.stream.close()
 
-    async def aread(self) -> bytes:
+    async def aread(self, max_bytes: int | None = None) -> bytes:
         """
         Read and return the response content.
+
+        When `max_bytes` is given, only the first `max_bytes` of the
+        *decoded* response content are retained. The underlying stream is
+        still drained to completion (or closed) so that the connection can
+        be released, and `is_content_truncated` is set to `True` whenever the
+        decoded content was larger than the limit. The limit is measured on
+        the decoded response bytes, not on the raw on-the-wire bytes.
         """
+        if max_bytes is None:
+            if not hasattr(self, "_content"):
+                self._content = b"".join(
+                    [part async for part in self.aiter_bytes()]
+                )
+            return self._content
+
+        if max_bytes < 0:
+            raise ValueError("max_bytes must be a non-negative integer, or None")
+
         if not hasattr(self, "_content"):
-            self._content = b"".join([part async for part in self.aiter_bytes()])
+            parts: list[bytes] = []
+            remaining = max_bytes
+            truncated = False
+            async for chunk in self.aiter_bytes():
+                if remaining > 0:
+                    if len(chunk) > remaining:
+                        truncated = True
+                    parts.append(chunk[:remaining])
+                    remaining -= min(len(chunk), remaining)
+                elif chunk:
+                    truncated = True
+            content = b"".join(parts)
+            self._content = content
+            self.stream = ByteStream(content)
+            self.is_content_truncated = truncated
+        elif len(self._content) > max_bytes:
+            self.is_content_truncated = True
+            self._content = self._content[:max_bytes]
+            self.stream = ByteStream(self._content)
         return self._content
 
     async def aiter_bytes(

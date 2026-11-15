@@ -196,12 +196,17 @@ class BaseClient:
         timeout: TimeoutTypes = DEFAULT_TIMEOUT_CONFIG,
         follow_redirects: bool = False,
         max_redirects: int = DEFAULT_MAX_REDIRECTS,
+        history_body_limit: int | None = None,
         event_hooks: None | (typing.Mapping[str, list[EventHook]]) = None,
         base_url: URL | str = "",
         trust_env: bool = True,
         default_encoding: str | typing.Callable[[bytes], str] = "utf-8",
     ) -> None:
         event_hooks = {} if event_hooks is None else event_hooks
+        if history_body_limit is not None and history_body_limit < 0:
+            raise ValueError(
+                "history_body_limit must be a non-negative integer, or None"
+            )
 
         self._base_url = self._enforce_trailing_slash(URL(base_url))
 
@@ -212,6 +217,7 @@ class BaseClient:
         self._timeout = Timeout(timeout)
         self.follow_redirects = follow_redirects
         self.max_redirects = max_redirects
+        self.history_body_limit = history_body_limit
         self._event_hooks = {
             "request": list(event_hooks.get("request", [])),
             "response": list(event_hooks.get("response", [])),
@@ -625,6 +631,13 @@ class Client(BaseClient):
     * **limits** - *(optional)* The limits configuration to use.
     * **max_redirects** - *(optional)* The maximum number of redirect responses
     that should be followed.
+    * **history_body_limit** - *(optional)* An upper bound, in decoded bytes, on
+    the response body that is retained for each entry in `response.history`.
+    The stream of an intermediate response is still fully drained or closed so
+    that the connection is released, but only the leading prefix of its decoded
+    body is kept. Responses whose body exceeded the limit expose
+    `is_content_truncated=True`. The final response is not limited, and the
+    default of `None` preserves the complete history bodies.
     * **base_url** - *(optional)* A URL to use as the base when building
     request URLs.
     * **transport** - *(optional)* A transport class to use for sending requests
@@ -654,6 +667,7 @@ class Client(BaseClient):
         follow_redirects: bool = False,
         limits: Limits = DEFAULT_LIMITS,
         max_redirects: int = DEFAULT_MAX_REDIRECTS,
+        history_body_limit: int | None = None,
         event_hooks: None | (typing.Mapping[str, list[EventHook]]) = None,
         base_url: URL | str = "",
         transport: BaseTransport | None = None,
@@ -667,6 +681,7 @@ class Client(BaseClient):
             timeout=timeout,
             follow_redirects=follow_redirects,
             max_redirects=max_redirects,
+            history_body_limit=history_body_limit,
             event_hooks=event_hooks,
             base_url=base_url,
             trust_env=trust_env,
@@ -951,7 +966,7 @@ class Client(BaseClient):
                         return response
 
                     response.history = list(history)
-                    response.read()
+                    response.read(max_bytes=self.history_body_limit)
                     request = next_request
                     history.append(response)
 
@@ -989,7 +1004,7 @@ class Client(BaseClient):
                 history = history + [response]
 
                 if follow_redirects:
-                    response.read()
+                    response.read(max_bytes=self.history_body_limit)
                 else:
                     response.next_request = request
                     return response
@@ -1339,6 +1354,13 @@ class AsyncClient(BaseClient):
     * **limits** - *(optional)* The limits configuration to use.
     * **max_redirects** - *(optional)* The maximum number of redirect responses
     that should be followed.
+    * **history_body_limit** - *(optional)* An upper bound, in decoded bytes, on
+    the response body that is retained for each entry in `response.history`.
+    The stream of an intermediate response is still fully drained or closed so
+    that the connection is released, but only the leading prefix of its decoded
+    body is kept. Responses whose body exceeded the limit expose
+    `is_content_truncated=True`. The final response is not limited, and the
+    default of `None` preserves the complete history bodies.
     * **base_url** - *(optional)* A URL to use as the base when building
     request URLs.
     * **transport** - *(optional)* A transport class to use for sending requests
@@ -1367,6 +1389,7 @@ class AsyncClient(BaseClient):
         follow_redirects: bool = False,
         limits: Limits = DEFAULT_LIMITS,
         max_redirects: int = DEFAULT_MAX_REDIRECTS,
+        history_body_limit: int | None = None,
         event_hooks: None | (typing.Mapping[str, list[EventHook]]) = None,
         base_url: URL | str = "",
         transport: AsyncBaseTransport | None = None,
@@ -1381,6 +1404,7 @@ class AsyncClient(BaseClient):
             timeout=timeout,
             follow_redirects=follow_redirects,
             max_redirects=max_redirects,
+            history_body_limit=history_body_limit,
             event_hooks=event_hooks,
             base_url=base_url,
             trust_env=trust_env,
@@ -1666,7 +1690,7 @@ class AsyncClient(BaseClient):
                         return response
 
                     response.history = list(history)
-                    await response.aread()
+                    await response.aread(max_bytes=self.history_body_limit)
                     request = next_request
                     history.append(response)
 
@@ -1705,7 +1729,7 @@ class AsyncClient(BaseClient):
                 history = history + [response]
 
                 if follow_redirects:
-                    await response.aread()
+                    await response.aread(max_bytes=self.history_body_limit)
                 else:
                     response.next_request = request
                     return response

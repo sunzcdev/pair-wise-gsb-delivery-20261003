@@ -383,6 +383,109 @@ async def test_empty_aread():
     assert response.is_closed
 
 
+def test_read_with_limit():
+    response = httpx.Response(200, content=b"Hello, world!")
+
+    content = response.read(max_bytes=5)
+
+    assert content == b"Hello"
+    assert response.content == b"Hello"
+    assert response.is_content_truncated is True
+    assert response.is_closed
+
+
+def test_read_with_limit_exact_size():
+    response = httpx.Response(200, content=b"Hello")
+
+    content = response.read(max_bytes=5)
+
+    assert content == b"Hello"
+    assert response.is_content_truncated is False
+
+
+def test_read_with_limit_zero():
+    response = httpx.Response(200, content=b"Hello, world!")
+
+    content = response.read(max_bytes=0)
+
+    assert content == b""
+    assert response.content == b""
+    assert response.is_content_truncated is True
+
+
+def test_read_with_negative_limit():
+    response = httpx.Response(200, content=b"Hello, world!")
+
+    with pytest.raises(ValueError):
+        response.read(max_bytes=-1)
+
+
+def test_streaming_read_with_limit_drains_stream():
+    response = httpx.Response(200, content=streaming_body())
+
+    content = response.read(max_bytes=5)
+
+    assert content == b"Hello"
+    assert response.content == b"Hello"
+    assert response.is_content_truncated is True
+    # The underlying stream has been fully drained and the response closed,
+    # so the connection can be released.
+    assert response.is_stream_consumed is True
+    assert response.is_closed is True
+
+
+def test_streaming_read_with_limit_not_truncated():
+    response = httpx.Response(200, content=streaming_body())
+
+    content = response.read(max_bytes=100)
+
+    assert content == b"Hello, world!"
+    assert response.is_content_truncated is False
+    assert response.is_closed is True
+
+
+def test_read_with_limit_on_decoded_content():
+    import gzip
+
+    body = b"Hello, world!"
+    compressed = gzip.compress(body)
+    response = httpx.Response(
+        200,
+        headers={"Content-Encoding": "gzip"},
+        content=compressed,
+    )
+
+    content = response.read(max_bytes=5)
+
+    # The limit applies to the decoded body, not the compressed wire bytes.
+    assert content == b"Hello"
+    assert response.is_content_truncated is True
+
+
+@pytest.mark.anyio
+async def test_aread_with_limit():
+    response = httpx.Response(200, content=b"Hello, world!")
+
+    content = await response.aread(max_bytes=5)
+
+    assert content == b"Hello"
+    assert response.content == b"Hello"
+    assert response.is_content_truncated is True
+    assert response.is_closed
+
+
+@pytest.mark.anyio
+async def test_streaming_aread_with_limit_drains_stream():
+    response = httpx.Response(200, content=async_streaming_body())
+
+    content = await response.aread(max_bytes=5)
+
+    assert content == b"Hello"
+    assert response.is_content_truncated is True
+    assert response.is_stream_consumed is True
+    assert response.is_closed is True
+
+
 def test_iter_raw():
     response = httpx.Response(
         200,

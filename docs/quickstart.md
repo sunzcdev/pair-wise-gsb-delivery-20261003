@@ -448,6 +448,26 @@ The `history` property of the response can be used to inspect any followed redir
 It contains a list of any redirect responses that were followed, in the order
 in which they were made.
 
+Each history response is read in full so that its connection can be released.
+If the redirect responses carry large bodies, you can cap how much of that
+body is retained with the `history_body_limit` client parameter:
+
+```pycon
+>>> client = httpx.Client(history_body_limit=1024, follow_redirects=True)
+>>> r = client.get('http://github.com/')
+>>> r.history[0].is_content_truncated
+False
+```
+
+The limit is measured on the **decoded** response bytes (after removing any
+`Content-Encoding` such as gzip), not on the raw bytes received on the wire.
+When a body exceeds the limit only its leading prefix is kept, the stream is
+still fully drained (or closed) so the connection is released, and
+`response.is_content_truncated` is `True` on the affected history entries.
+The final response is never limited, and the default of `None` keeps the
+historical bodies intact. The same rule applies to the intermediate responses
+generated while handling authentication challenges.
+
 ## Timeouts
 
 HTTPX defaults to including reasonable timeouts for all network operations,

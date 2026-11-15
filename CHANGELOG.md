@@ -13,6 +13,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 ### Added
 
 * Expose `FunctionAuth` from the public API. (#3699)
+* Add `history_body_limit` parameter to `Client` and `AsyncClient`, allowing the retained bodies of redirect/auth-challenge history responses to be capped to a decoded-byte prefix, while still draining or closing their streams. Truncated history responses expose `is_content_truncated`. The final response is unaffected and the default (`None`) preserves the previous behaviour.
 
 ## 0.28.1 (6th December, 2024)
 
