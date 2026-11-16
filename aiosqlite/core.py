@@ -12,14 +12,14 @@ from collections.abc import AsyncIterator, Generator, Iterable
 from functools import partial
 from pathlib import Path
 from queue import Empty, Queue, SimpleQueue
-from threading import Thread
+from threading import Lock, Thread
 from typing import Any, Callable, Literal, Optional, Union
 from warnings import warn
 
 from .context import contextmanager
 from .cursor import Cursor
 
-__all__ = ["connect", "Connection", "Cursor"]
+__all__ = ["connect", "Connection", "Cursor", "CancelToken"]
 
 AuthorizerCallback = Callable[[int, str, str, str, str], int]
 
@@ -39,6 +39,12 @@ def set_exception(fut: asyncio.Future, e: BaseException) -> None:
     """Set the exception of a future if it hasn't been set already."""
     if not fut.done():
         fut.set_exception(e)
+
+
+def cancel_future(fut: asyncio.Future) -> None:
+    """Cancel a future if it hasn't completed already."""
+    if not fut.done():
+        fut.cancel()
 
 
 _STOP_RUNNING_SENTINEL = object()
@@ -73,6 +79,189 @@ def _connection_worker_thread(tx: _TxQueue):
             LOG.debug("returning exception %s", e)
             if future:
                 future.get_loop().call_soon_threadsafe(set_exception, future, e)
+
+
+class CancelToken:
+    """
+    Handle identifying a single queued or executing operation, allowing
+    targeted cancellation without affecting any other operation.
+
+    Awaiting the token yields the operation's result. Use `cancel()` to
+    cancel only this specific operation.
+
+    Cancellation is operation-scoped: an interrupt is only issued while this
+    operation is still executing, and any interrupt that the target statement
+    did not consume is absorbed before the connection moves on to the next
+    queued operation, so a cancellation can never spill over onto a later
+    query.
+
+    Instances are created via `Connection.execute_cancellable`.
+    """
+
+    def __init__(
+        self,
+        connection: "Connection",
+        fn: Callable[..., Any],
+        args: tuple,
+        kwargs: dict,
+        wrapper: Optional[Callable[[Any], Any]] = None,
+    ) -> None:
+        self._connection = connection
+        self._function = partial(fn, *args, **kwargs)
+        self._wrapper = wrapper
+        self._future = asyncio.get_event_loop().create_future()
+        # Guards _started/_completed/_cancelled/_interrupt_issued against
+        # races between the worker thread (executing the operation) and
+        # cancel() callers.
+        self._lock = Lock()
+        self._started = False
+        self._completed = False
+        self._cancelled = False
+        self._interrupt_issued = False
+
+    def __await__(self) -> Generator[Any, None, Any]:
+        return self._future.__await__()
+
+    def __repr__(self) -> str:
+        if self._cancelled:
+            state = "cancelled"
+        elif self._completed:
+            state = "completed"
+        elif self._started:
+            state = "running"
+        else:
+            state = "queued"
+        return f"<CancelToken {state} {self._function}>"
+
+    @property
+    def done(self) -> bool:
+        """True if the operation finished executing or was cancelled."""
+        return self._completed or self._cancelled
+
+    def _run(self) -> Any:
+        """Execute the operation on the connection's worker thread.
+
+        :meta private:
+        """
+        with self._lock:
+            if self._cancelled:
+                # Cancelled while queued: follow queue rules and skip
+                # execution when the item is reached in queue order.
+                raise asyncio.CancelledError("operation cancelled while queued")
+            self._started = True
+
+        try:
+            result = self._function()
+        except BaseException:
+            # Mark completion before the exception is delivered to the
+            # future, so that cancel() can observe a just-finished operation
+            # and never issues an interrupt that would land on the next
+            # operation. Failed statements are reset by sqlite3, so a
+            # sacrificial statement can absorb any leftover interrupt.
+            with self._lock:
+                self._completed = True
+                drain = self._interrupt_issued
+            if drain:
+                self._drain_interrupt()
+            raise
+
+        # Mark completion before the result is delivered to the future, so
+        # that cancel() can observe a just-finished operation and never
+        # issues an interrupt that would land on the next operation.
+        with self._lock:
+            self._completed = True
+            drain = self._interrupt_issued
+
+        if drain and not self._drain_interrupt():
+            # The interrupt issued for this operation is still pending: the
+            # statement completed without consuming it and is still active
+            # (e.g. an unfetched SELECT), which keeps the interrupt flag set,
+            # so SQLite would apply it to whatever statement runs next on the
+            # connection. Discard the result, reset the statement, and clear
+            # the flag, so that later operations are never affected; the
+            # operation itself reports the cancellation instead.
+            if isinstance(result, sqlite3.Cursor):
+                try:
+                    result.close()
+                except sqlite3.Error:
+                    pass
+            self._drain_interrupt()
+            raise sqlite3.OperationalError("interrupted")
+
+        if self._wrapper is not None:
+            result = self._wrapper(result)
+        return result
+
+    def _drain_interrupt(self) -> bool:
+        """Absorb a leftover interrupt before the next queued operation runs.
+
+        An interrupt that was issued while this operation was executing may
+        outlive the target statement (e.g. when the statement was blocked
+        inside a user-defined function and already passed its last interrupt
+        checkpoint). SQLite would then apply the pending interrupt to whatever
+        statement runs next on the connection. Running a sacrificial no-op
+        statement here, on the worker thread and before the next queued item
+        is processed, consumes or clears that stray interrupt so later
+        operations are never affected.
+
+        :meta private:
+        :return: True if no interrupt is pending anymore, False if the
+            sacrificial statement was itself interrupted.
+        """
+        try:
+            connection = self._connection._connection
+            if connection is None:
+                return True
+            connection.execute("SELECT 1").fetchall()
+            return True
+        except sqlite3.Error:
+            # The sacrificial statement absorbed the pending interrupt.
+            return False
+
+    def cancel(self) -> bool:
+        """
+        Cancel this specific operation, if it is still pending.
+
+        - If the operation is still queued, it is marked cancelled and will be
+          skipped when reached in the queue; awaiting it raises
+          ``asyncio.CancelledError``. Nothing is executing on its behalf yet,
+          so no interrupt is issued and the currently running operation (if
+          any) is left alone.
+        - If the operation is currently executing, a ``sqlite3`` interrupt is
+          issued, aborting only the running statement. Awaiting the token
+          raises ``sqlite3.OperationalError`` if the statement is aborted.
+        - If the operation already finished executing — including the race
+          where it completed just before this call — nothing happens, so no
+          interrupt is left behind that could hit the next operation.
+
+        :return: True if cancellation was issued, False if the operation had
+            already completed or been cancelled.
+        """
+        with self._lock:
+            if self._completed or self._cancelled:
+                return False
+
+            if not self._started:
+                self._cancelled = True
+                try:
+                    loop = self._future.get_loop()
+                    loop.call_soon_threadsafe(cancel_future, self._future)
+                except RuntimeError:
+                    # Event loop already closed; cancel directly.
+                    cancel_future(self._future)
+                return True
+
+            # The worker thread is executing exactly this operation right now,
+            # so the interrupt can only hit this operation.
+            try:
+                self._connection._conn.interrupt()
+            except (ValueError, sqlite3.ProgrammingError):
+                # Connection already closed; nothing left to interrupt.
+                return False
+            # Remember that an interrupt was issued, so that the worker can
+            # absorb it if the target statement finishes without consuming it.
+            self._interrupt_issued = True
+            return True
 
 
 class Connection:
@@ -255,8 +444,56 @@ class Connection:
         cursor = await self._execute(self._conn.executescript, sql_script)
         return Cursor(self, cursor)
 
+    def execute_cancellable(
+        self, sql: str, parameters: Optional[Iterable[Any]] = None
+    ) -> CancelToken:
+        """
+        Queue a query for execution and return a `CancelToken` identifying
+        this specific operation.
+
+        Unlike `interrupt()`, which aborts whatever statement happens to be
+        running on the connection at the time, the returned token carries the
+        identity of this operation: `CancelToken.cancel()` only issues an
+        interrupt if this operation is still executing, and is a no-op
+        (returning False) if it already completed — so a slow query can be
+        cancelled without any risk of interrupting a later query that has
+        already started.
+
+        Awaiting the token returns a `Cursor` for the query.
+
+        Example::
+
+            token = db.execute_cancellable("select * from slow_table")
+            task = asyncio.ensure_future(token)
+            ...
+            token.cancel()  # cancels only this query, if still running
+            cursor = await task  # raises OperationalError if interrupted
+        """
+        if parameters is None:
+            parameters = []
+
+        if not self._running or not self._connection:
+            raise ValueError("Connection closed")
+
+        token = CancelToken(
+            self,
+            self._connection.execute,
+            (sql, parameters),
+            {},
+            wrapper=partial(Cursor, self),
+        )
+        self._tx.put_nowait((token._future, token._run))
+        return token
+
     async def interrupt(self) -> None:
-        """Interrupt pending queries."""
+        """
+        Interrupt whatever query is currently executing on the connection.
+
+        Note that this affects any statement running at the time of the call,
+        which may not be the one you intend to cancel. Prefer
+        `execute_cancellable()` and `CancelToken.cancel()` for targeted
+        cancellation of a specific operation.
+        """
         return self._conn.interrupt()
 
     async def create_function(

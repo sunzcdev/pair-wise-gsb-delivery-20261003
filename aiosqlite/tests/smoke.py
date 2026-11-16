@@ -7,7 +7,7 @@ import sys
 from pathlib import Path
 from sqlite3 import OperationalError
 from tempfile import TemporaryDirectory
-from threading import Thread
+from threading import Barrier, Event, Thread
 from unittest import IsolatedAsyncioTestCase, SkipTest
 from unittest.mock import patch
 
@@ -522,6 +522,213 @@ class SmokeTest(IsolatedAsyncioTestCase):
     async def test_stop_without_close(self):
         db = await aiosqlite.connect(":memory:")
         await db.stop()
+
+    async def test_cancellable_interrupts_only_target_query(self):
+        started = Event()
+        release = Event()
+
+        def gate():
+            # Block the query until the test has issued the cancellation;
+            # the recursive CTE then keeps the query running (and
+            # interruptible) until the pending interrupt aborts it.
+            started.set()
+            release.wait(10)
+            return 1
+
+        async with aiosqlite.connect(":memory:") as db:
+            await db.create_function("gate", 0, gate)
+
+            token = db.execute_cancellable(
+                "WITH RECURSIVE cnt(x) AS ("
+                "  SELECT gate()"
+                "  UNION ALL SELECT x + 1 FROM cnt WHERE x < 10000000"
+                ") SELECT sum(x) FROM cnt"
+            )
+            self.assertIsInstance(token, aiosqlite.CancelToken)
+            task = asyncio.ensure_future(token)
+
+            loop = asyncio.get_event_loop()
+            self.assertTrue(await loop.run_in_executor(None, started.wait, 10))
+
+            # the target query is still executing, so cancellation is issued
+            self.assertTrue(token.cancel())
+            release.set()
+
+            with self.assertRaisesRegex(OperationalError, "interrupted"):
+                await task
+
+            # a query started after the cancellation must not be affected
+            async with db.execute("select 1, 2") as cursor:
+                self.assertEqual(await cursor.fetchall(), [(1, 2)])
+
+    async def test_cancellable_cancel_after_completion(self):
+        async with aiosqlite.connect(":memory:") as db:
+            token = db.execute_cancellable("select 1")
+            cursor = await token
+            self.assertIsInstance(cursor, aiosqlite.Cursor)
+            self.assertEqual(await cursor.fetchall(), [(1,)])
+
+            # too late: the operation already completed, so no interrupt
+            # may be issued
+            self.assertFalse(token.cancel())
+            self.assertTrue(token.done)
+
+            # the next query must not see any stray interrupt
+            async with db.execute("select 2") as cursor:
+                self.assertEqual(await cursor.fetchall(), [(2,)])
+
+    async def test_cancellable_cancel_queued(self):
+        entered = Event()
+        release = Event()
+        ran = []
+
+        def gate():
+            entered.set()
+            release.wait(10)
+            return 1
+
+        def mark():
+            ran.append(True)
+            return 2
+
+        async with aiosqlite.connect(":memory:") as db:
+            await db.create_function("gate", 0, gate)
+            await db.create_function("mark", 0, mark)
+
+            token1 = db.execute_cancellable("select gate()")
+            task1 = asyncio.ensure_future(token1)
+            loop = asyncio.get_event_loop()
+            self.assertTrue(await loop.run_in_executor(None, entered.wait, 10))
+
+            # queued behind the running query
+            token2 = db.execute_cancellable("select mark()")
+            task2 = asyncio.ensure_future(token2)
+
+            # cancelling a queued item must not interrupt the running query
+            self.assertTrue(token2.cancel())
+            self.assertTrue(token2.done)
+            with self.assertRaises(asyncio.CancelledError):
+                await task2
+
+            release.set()
+            cursor = await task1
+            self.assertEqual(await cursor.fetchall(), [(1,)])
+
+            # the cancelled item was skipped when reached in queue order
+            self.assertEqual(ran, [])
+
+            # the queue drained normally and later queries work
+            async with db.execute("select 3") as cursor:
+                self.assertEqual(await cursor.fetchall(), [(3,)])
+
+    async def test_cancellable_completion_races_with_cancel(self):
+        started = Event()
+        barrier = Barrier(2)
+
+        def controlled():
+            started.set()
+            # return at the same moment the cancellation is attempted
+            barrier.wait(10)
+            return 42
+
+        async with aiosqlite.connect(":memory:") as db:
+            await db.create_function("controlled", 0, controlled)
+
+            token = db.execute_cancellable("select controlled()")
+            task = asyncio.ensure_future(token)
+            loop = asyncio.get_event_loop()
+            self.assertTrue(await loop.run_in_executor(None, started.wait, 10))
+
+            def canceller():
+                barrier.wait(10)  # complete and cancel simultaneously
+                return token.cancel()
+
+            cancelled = await loop.run_in_executor(None, canceller)
+
+            try:
+                cursor = await task
+                rows = await cursor.fetchall()
+            except OperationalError:
+                rows = None
+
+            if cancelled:
+                # The interrupt raced with completion: either the statement
+                # was aborted, or it finished and the leftover interrupt was
+                # absorbed before it could hit any other operation.
+                self.assertIn(rows, (None, [(42,)]))
+            else:
+                # already completed: no interrupt was issued at all
+                self.assertEqual(rows, [(42,)])
+
+            # either way, no stray interrupt may affect the next query
+            async with db.execute("select 1") as cursor:
+                self.assertEqual(await cursor.fetchall(), [(1,)])
+
+    async def test_cancellable_interrupt_transaction_state(self):
+        entered = Event()
+        release = Event()
+
+        def blocker():
+            entered.set()
+            release.wait(10)
+            return 1
+
+        async with aiosqlite.connect(self.db) as db:
+            await db.execute("create table tx_state (i integer)")
+            await db.commit()
+            await db.create_function("blocker", 0, blocker)
+
+            await db.execute("insert into tx_state values (1)")
+            self.assertTrue(db.in_transaction)
+
+            token = db.execute_cancellable(
+                "INSERT INTO tx_state "
+                "WITH RECURSIVE cnt(x) AS ("
+                "  SELECT blocker()"
+                "  UNION ALL SELECT x + 1 FROM cnt WHERE x < 10000000"
+                ") SELECT x FROM cnt"
+            )
+            task = asyncio.ensure_future(token)
+            loop = asyncio.get_event_loop()
+            self.assertTrue(await loop.run_in_executor(None, entered.wait, 10))
+            self.assertTrue(token.cancel())
+            release.set()
+
+            with self.assertRaises(OperationalError):
+                await task
+
+            # aiosqlite must report the transaction state that sqlite3
+            # actually has after the interruption
+            self.assertEqual(db.in_transaction, db._conn.in_transaction)
+
+            async with db.execute("select count(*) from tx_state") as cursor:
+                row = await cursor.fetchone()
+            if db.in_transaction:
+                # only the interrupted statement was rolled back; the first
+                # insert is still pending in the transaction
+                self.assertEqual(row[0], 1)
+                await db.rollback()
+            else:
+                # sqlite rolled the whole transaction back
+                self.assertEqual(row[0], 0)
+            self.assertFalse(db.in_transaction)
+
+            # no partial data from the interrupted statement remains
+            async with db.execute("select count(*) from tx_state") as cursor:
+                row = await cursor.fetchone()
+                self.assertEqual(row[0], 0)
+
+            # the connection is still fully usable afterwards
+            await db.execute("insert into tx_state values (2)")
+            await db.commit()
+            async with db.execute("select * from tx_state") as cursor:
+                self.assertEqual(await cursor.fetchall(), [(2,)])
+
+    async def test_cancellable_on_closed_connection(self):
+        db = await aiosqlite.connect(":memory:")
+        await db.close()
+        with self.assertRaisesRegex(ValueError, "Connection closed"):
+            db.execute_cancellable("select 1")
 
     def test_stop_after_event_loop_closed(self):
         db = None

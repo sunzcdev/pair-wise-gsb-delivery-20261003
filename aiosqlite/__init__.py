@@ -21,7 +21,7 @@ from sqlite3 import (  # pylint: disable=redefined-builtin
 
 __author__ = "Amethyst Reese"
 from .__version__ import __version__
-from .core import connect, Connection, Cursor
+from .core import connect, CancelToken, Connection, Cursor
 
 __all__ = [
     "__version__",
@@ -31,6 +31,7 @@ __all__ = [
     "sqlite_version",
     "sqlite_version_info",
     "connect",
+    "CancelToken",
     "Connection",
     "Cursor",
     "Row",
