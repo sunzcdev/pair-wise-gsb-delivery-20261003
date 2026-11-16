@@ -4,6 +4,7 @@
 import asyncio
 import sqlite3
 import sys
+import time
 from pathlib import Path
 from sqlite3 import OperationalError
 from tempfile import TemporaryDirectory
@@ -295,6 +296,135 @@ class SmokeTest(IsolatedAsyncioTestCase):
                 await db.execute(
                     "create table test_progress_handler (i integer primary key asc, k integer)"
                 )
+
+    async def test_progress_subscription(self):
+        """Operation-scoped progress events are delivered to the owning loop."""
+        events = []
+
+        async with aiosqlite.connect(self.db) as db:
+            await db.execute("create table foo (i integer)")
+            await db.executemany("insert into foo values (?)", [(i,) for i in range(100)])
+            await db.commit()
+
+            async with db.progress_subscription(
+                lambda ticks, coalesced: events.append((ticks, coalesced)), n=1
+            ):
+                async with db.execute("select * from foo") as cursor:
+                    rows = await cursor.fetchall()
+                    self.assertEqual(len(rows), 100)
+
+            # deliveries happen on the event loop; let them run
+            await asyncio.sleep(0.1)
+            self.assertTrue(events)
+            self.assertTrue(all(ticks >= 1 for ticks, _ in events))
+
+            # a following query without a subscription gets no stale events
+            events.clear()
+            async with db.execute("select * from foo") as cursor:
+                await cursor.fetchall()
+            await asyncio.sleep(0.1)
+            self.assertEqual(events, [])
+
+    async def test_progress_subscription_restores_global_handler(self):
+        """The previous global handler is restored after the operation ends."""
+        global_calls = []
+
+        async with aiosqlite.connect(self.db) as db:
+            await db.execute("create table foo (i integer)")
+            await db.executemany("insert into foo values (?)", [(i,) for i in range(50)])
+            await db.commit()
+            await db.set_progress_handler(lambda: global_calls.append(1) or 0, 1)
+
+            async with db.progress_subscription(lambda ticks, coalesced: None, n=1):
+                async with db.execute("select * from foo") as cursor:
+                    await cursor.fetchall()
+
+            # subscription restored the global handler, not None
+            async with db.execute("select * from foo") as cursor:
+                await cursor.fetchall()
+            self.assertTrue(global_calls)
+
+    async def test_progress_subscription_coalesces_backlog(self):
+        """Backlog is bounded and merged events are flagged as coalesced."""
+        events = []
+
+        def on_progress(ticks, coalesced):
+            events.append((ticks, coalesced))
+
+        async with aiosqlite.connect(self.db) as db:
+            async with db.progress_subscription(on_progress, n=1, max_pending=2):
+                async def run_query():
+                    async with db.execute_fetchall(
+                        "with recursive cnt(x) as ("
+                        "select 1 union all select x+1 from cnt where x<100000"
+                        ") select count(*) from cnt"
+                    ) as rows:
+                        return rows
+
+                task = asyncio.ensure_future(run_query())
+                await asyncio.sleep(0)  # let the query reach the worker thread
+                # block the event loop while the worker fires progress events,
+                # so deliveries pile up past max_pending
+                time.sleep(0.5)
+                rows = await task
+                self.assertEqual(rows, [(100000,)])
+
+            await asyncio.sleep(0.1)
+            self.assertTrue(events)
+            self.assertTrue(any(coalesced for _, coalesced in events))
+            total = sum(ticks for ticks, _ in events)
+            self.assertGreater(total, len(events))
+
+    async def test_progress_subscription_callback_error_and_cancel(self):
+        """Callback errors and cancellation still restore the handler."""
+        calls = []
+
+        def bad_callback(ticks, coalesced):
+            calls.append(ticks)
+            raise RuntimeError("boom")
+
+        async with aiosqlite.connect(self.db) as db:
+            await db.execute("create table foo (i integer)")
+            await db.executemany("insert into foo values (?)", [(i,) for i in range(50)])
+            await db.commit()
+
+            async with db.progress_subscription(bad_callback, n=1):
+                async with db.execute("select * from foo") as cursor:
+                    await cursor.fetchall()
+            await asyncio.sleep(0.1)
+            self.assertTrue(calls)
+
+            # cancellation of the operation also restores state
+            with self.assertRaises(asyncio.CancelledError):
+                async with db.progress_subscription(lambda t, c: None, n=1):
+                    raise asyncio.CancelledError()
+
+            # handler was restored to None: no stale events on later queries
+            calls.clear()
+            async with db.execute("select * from foo") as cursor:
+                await cursor.fetchall()
+            await asyncio.sleep(0.1)
+            self.assertEqual(calls, [])
+
+    async def test_execute_with_progress(self):
+        """execute_with_progress delivers events and returns a usable cursor."""
+        events = []
+
+        async def on_progress(ticks, coalesced):
+            events.append(ticks)
+
+        async with aiosqlite.connect(self.db) as db:
+            await db.execute("create table foo (i integer)")
+            await db.executemany("insert into foo values (?)", [(i,) for i in range(50)])
+            await db.commit()
+
+            async with db.execute_with_progress(
+                "select * from foo", progress=on_progress, n=1
+            ) as cursor:
+                self.assertIsInstance(cursor, aiosqlite.Cursor)
+
+            await asyncio.sleep(0.1)
+            self.assertTrue(events)
 
     async def test_create_function(self):
         """Assert that after creating a custom function, it can be used"""

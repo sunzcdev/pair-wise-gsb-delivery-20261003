@@ -6,13 +6,15 @@ Core implementation of aiosqlite proxies
 """
 
 import asyncio
+import inspect
 import logging
 import sqlite3
 from collections.abc import AsyncIterator, Generator, Iterable
+from contextlib import asynccontextmanager
 from functools import partial
 from pathlib import Path
 from queue import Empty, Queue, SimpleQueue
-from threading import Thread
+from threading import Lock, Thread
 from typing import Any, Callable, Literal, Optional, Union
 from warnings import warn
 
@@ -22,6 +24,7 @@ from .cursor import Cursor
 __all__ = ["connect", "Connection", "Cursor"]
 
 AuthorizerCallback = Callable[[int, str, str, str, str], int]
+ProgressCallback = Callable[[int, bool], Any]
 
 LOG = logging.getLogger("aiosqlite")
 
@@ -75,6 +78,79 @@ def _connection_worker_thread(tx: _TxQueue):
                 future.get_loop().call_soon_threadsafe(set_exception, future, e)
 
 
+class _ProgressDispatcher:
+    """
+    Operation-scoped sqlite3 progress handler.
+
+    Installed on the worker thread for the duration of a single operation.
+    Each invocation is forwarded to the owning event loop via
+    ``loop.call_soon_threadsafe`` -- async functions cannot run inside the
+    sqlite3 callback itself.  At most ``max_pending`` deliveries may be in
+    flight; further events are coalesced into the next delivery and flagged.
+
+    :meta private:
+    """
+
+    def __init__(
+        self,
+        loop: asyncio.AbstractEventLoop,
+        callback: ProgressCallback,
+        max_pending: int,
+    ) -> None:
+        self._loop = loop
+        self._callback = callback
+        self._max_pending = max(1, max_pending)
+        self._pending = 0
+        self._coalesced = 0
+        self._active = True
+        self._lock = Lock()
+
+    def __call__(self) -> int:
+        """sqlite3 progress handler, invoked on the worker thread."""
+        with self._lock:
+            if not self._active:
+                return 0
+            if self._pending >= self._max_pending:
+                # Backlog is full: merge this event into the next delivery.
+                self._coalesced += 1
+                return 0
+            self._pending += 1
+            coalesced = self._coalesced
+            self._coalesced = 0
+
+        try:
+            self._loop.call_soon_threadsafe(self._deliver, 1 + coalesced, coalesced > 0)
+        except RuntimeError:
+            # Owning event loop is already closed; drop the event.
+            with self._lock:
+                self._pending -= 1
+        return 0
+
+    def _deliver(self, ticks: int, coalesced: bool) -> None:
+        """Run the user callback on the owning event loop."""
+        with self._lock:
+            self._pending -= 1
+        try:
+            result = self._callback(ticks, coalesced)
+        except Exception:
+            LOG.exception("progress callback raised")
+            return
+        if inspect.isawaitable(result):
+            asyncio.ensure_future(self._await_result(result))
+
+    @staticmethod
+    async def _await_result(awaitable: Any) -> None:
+        try:
+            await awaitable
+        except Exception:
+            LOG.exception("progress callback raised")
+
+    def close(self) -> None:
+        """Stop delivering events, even if sqlite3 still invokes the handler."""
+        with self._lock:
+            self._active = False
+
+
 class Connection:
     def __init__(
         self,
@@ -88,6 +164,11 @@ class Connection:
         self._tx: _TxQueue = SimpleQueue()
         self._iter_chunk_size = iter_chunk_size
         self._thread = Thread(target=_connection_worker_thread, args=(self._tx,))
+        # Last global progress handler installed via set_progress_handler(),
+        # used to restore state after an operation-scoped subscription ends.
+        self._progress_handler: Optional[tuple[Callable[[], Optional[int]], int]] = (
+            None
+        )
 
         if loop is not None:
             warn(
@@ -209,6 +290,7 @@ class Connection:
             raise
         finally:
             self._connection = None
+            self._progress_handler = None
             future = self.stop()
             if future:
                 await future
@@ -323,9 +405,105 @@ class Connection:
         self, handler: Callable[[], Optional[int]], n: int
     ) -> None:
         await self._execute(self._conn.set_progress_handler, handler, n)
+        self._progress_handler = (handler, n) if handler is not None else None
 
     async def set_trace_callback(self, handler: Callable) -> None:
         await self._execute(self._conn.set_trace_callback, handler)
+
+    @asynccontextmanager
+    async def progress_subscription(
+        self,
+        progress: ProgressCallback,
+        n: int = 1000,
+        max_pending: int = 16,
+    ) -> AsyncIterator[None]:
+        """
+        Subscribe to query progress for the duration of a single operation.
+
+        Installs an operation-scoped progress handler before the wrapped
+        statements run, and restores the previous global handler (if any)
+        when the block exits -- including on cancellation, callback errors,
+        or event loop shutdown.  Statements executed afterwards without a
+        subscription will not receive this operation's events.
+
+        The sqlite3 progress handler runs on the connection's worker thread,
+        where async functions cannot run, so events are safely delivered back
+        to the event loop that owns the subscription.  At most ``max_pending``
+        deliveries may be in flight; additional events are coalesced into the
+        next delivery and flagged.
+
+        Example::
+
+            async def on_progress(ticks: int, coalesced: bool) -> None:
+                ...
+
+            async with db.progress_subscription(on_progress, n=100):
+                async with db.execute("select ...") as cursor:
+                    rows = await cursor.fetchall()
+
+        :param progress: Callback invoked on the owning event loop as
+            ``progress(ticks, coalesced)``, where ``ticks`` is the number of
+            progress events represented by this delivery and ``coalesced`` is
+            ``True`` if events were merged because the backlog limit was
+            reached.  May be a plain or async function; its return value
+            cannot abort the query (use ``interrupt()`` for that).
+        :param n: Number of sqlite3 VM instructions between progress events.
+        :param max_pending: Maximum number of undelivered events to buffer
+            before coalescing.
+        """
+        loop = asyncio.get_running_loop()
+        dispatcher = _ProgressDispatcher(loop, progress, max_pending)
+        previous = self._progress_handler
+        await self._execute(self._conn.set_progress_handler, dispatcher, n)
+        try:
+            yield
+        finally:
+            dispatcher.close()
+            try:
+                await self._restore_progress_handler(previous, loop)
+            except Exception:
+                LOG.exception("failed to restore previous progress handler")
+
+    async def _restore_progress_handler(
+        self,
+        previous: Optional[tuple[Callable[[], Optional[int]], int]],
+        loop: asyncio.AbstractEventLoop,
+    ) -> None:
+        """Restore the global progress handler after a subscription ends."""
+        if not self._running or self._connection is None:
+            return
+        handler, n = previous if previous is not None else (None, 0)
+        if loop.is_closed():
+            # The owning loop is gone; queue the restore directly on the
+            # worker thread so later operations don't see a stale handler.
+            self._tx.put_nowait(
+                (None, partial(self._conn.set_progress_handler, handler, n))
+            )
+            return
+        await self._execute(self._conn.set_progress_handler, handler, n)
+
+    @contextmanager
+    async def execute_with_progress(
+        self,
+        sql: str,
+        parameters: Optional[Iterable[Any]] = None,
+        *,
+        progress: ProgressCallback,
+        n: int = 1000,
+        max_pending: int = 16,
+    ) -> Cursor:
+        """
+        Execute a query with an operation-scoped progress subscription.
+
+        Convenience wrapper combining ``progress_subscription`` and
+        ``execute``; see ``progress_subscription`` for details.
+        """
+        if parameters is None:
+            parameters = []
+        async with self.progress_subscription(progress, n=n, max_pending=max_pending):
+            cursor = await self._execute(self._conn.execute, sql, parameters)
+        return Cursor(self, cursor)
+
 
     async def set_authorizer(
         self, authorizer_callback: Optional[AuthorizerCallback]
