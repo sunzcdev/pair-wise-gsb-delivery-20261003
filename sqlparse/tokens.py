@@ -59,6 +59,20 @@ Assignment = Token.Assignment
 Generic = Token.Generic
 Command = Generic.Command
 
+# Template regions of ETL tools (Jinja-style ``{{ ... }}`` / ``{% ... %}``).
+# The whole region is one opaque token: the expression inside belongs to the
+# template engine, not to SQL, so it must not be keyword-cased, split or
+# re-indented. Whitespace inside the region is preserved verbatim.
+Template = Token.Template
+# ``{{ ... }}`` expressions
+Template.Variable
+# ``{% ... %}`` statements
+Template.Tag
+# A region whose closing delimiter is missing is still emitted as one
+# opaque span, but its token type hangs off Token.Error so the usual
+# error handling (``ttype in T.Error``) recognizes the diagnostic.
+Error.Template
+
 # String and some others are not direct children of Token.
 # alias them:
 Token.Token = Token

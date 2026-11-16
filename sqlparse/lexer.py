@@ -134,13 +134,16 @@ class Lexer:
 
         delimited_spans = keywords.find_delimited_spans(text)
         span_openers = delimited_spans.openers
+        template_spans = keywords.find_template_spans(text)
+        template_openers = template_spans.openers
 
         iterable = enumerate(text)
         for pos, char in iterable:
             # Only positions the lexer actually reaches may open a
-            # dollar-quoted literal or a multiline comment; a delimiter
-            # inside a string literal or behind a "--" comment is skipped
-            # along with its surrounding token and never resolved.
+            # dollar-quoted literal, a multiline comment or a template
+            # region; a delimiter inside a string literal or behind a "--"
+            # comment is skipped along with its surrounding token and
+            # never resolved.
             if pos in span_openers:
                 resolved = delimited_spans.resolve(pos)
                 if resolved is not None:
@@ -148,6 +151,12 @@ class Lexer:
                     yield ttype, text[pos:end]
                     consume(iterable, end - pos - 1)
                     continue
+
+            if pos in template_openers:
+                end, ttype = template_spans.resolve(pos)
+                yield ttype, text[pos:end]
+                consume(iterable, end - pos - 1)
+                continue
 
             for rexmatch, action in self._SQL_REGEX:
                 m = rexmatch(text, pos)

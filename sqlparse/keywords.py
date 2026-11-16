@@ -116,6 +116,104 @@ def find_delimited_spans(text):
     return DelimitedSpans(openers, closers)
 
 
+# ETL templates (e.g. Jinja) embed ``{{ ... }}`` expressions and
+# ``{% ... %}`` statements inside SQL.  A region is a single opaque token so
+# that the SQL grammar never sees the expression text: keywords inside it
+# must not change case and its original whitespace must survive formatting.
+#
+# A region only opens at a position the SQL lexer actually reaches, so an
+# opener inside a string literal or comment ("SELECT '{{'") never starts a
+# region.  The closing delimiter may itself appear inside a quoted segment of
+# the expression ("{{ x ~ '}}' }}"), so closer matching skips quoted text.
+# A region without its closer is reported with an Error.Template token type
+# so the diagnostic points at the whole unclosed span instead of treating
+# the opener characters as stray punctuation.
+#
+# Like the dollar/comment spans above, opener positions are collected with a
+# lookahead regex in one pass and pairing is deferred to the lexer position:
+# resolving eagerly would pair against closers hidden inside strings,
+# comments or regions the lexer skips as a whole.
+_TEMPLATE_OPEN = re.compile(r'(?=(\{\{|\{%))')
+_TEMPLATE_CLOSER = {'{{': '}}', '{%': '%}'}
+_TEMPLATE_TTYPE = {
+    '{{': tokens.Template.Variable,
+    '{%': tokens.Template.Tag,
+}
+# Quoted segment of a template expression.  A backslash escapes the next
+# character and two quotes in a row escape each other, so neither can
+# terminate the segment ("{{ x ~ 'it''s }} text' }}" still pairs correctly).
+_TEMPLATE_QUOTED = re.compile(
+    r"""
+      ' (?:''|\\.|[^'\\])* '   # single-quoted segment
+    | " (?:\"\"|\\.|[^"\\])* " # double-quoted segment
+    """, re.VERBOSE)
+
+
+class TemplateSpans:
+    """Template regions (``{{ ... }}`` / ``{% ... %}``), resolved on
+    demand by the lexer from precomputed opener positions.
+
+    Openers are collected over the whole input for a single linear pass,
+    but only positions the lexer actually reaches -- never ones inside
+    string literals, comments or an already emitted region -- are resolved.
+    """
+
+    __slots__ = ('_text', 'openers')
+
+    def __init__(self, text, openers):
+        self._text = text
+        #: start offset -> (offset behind the opener, closer, closed ttype)
+        self.openers = openers
+
+    def resolve(self, pos):
+        """Return ``(end offset, token type)`` for the region opening at
+        `pos`.  Without a closing delimiter the region runs to the end of
+        the text and gets an Error.Template token type, mirroring how an
+        unclosed SQL string is diagnosed instead of silently dropping text.
+        """
+        opener_end, closer, ttype = self.openers[pos]
+        text = self._text
+        closer_len = len(closer)
+        scan = opener_end
+        length = len(text)
+        while scan < length:
+            char = text[scan]
+            if char in ('\'', '"'):
+                m = _TEMPLATE_QUOTED.match(text, scan)
+                if m is None:
+                    # An unterminated quoted segment is opaque all the way
+                    # to the end of the text, so no closing delimiter can
+                    # follow: the region is unclosed.
+                    break
+                scan = m.end()
+                continue
+            if text.startswith(closer, scan):
+                return scan + closer_len, ttype
+            scan += 1
+        return length, tokens.Error.Template
+
+
+_NO_TEMPLATE_SPANS = TemplateSpans('', {})
+
+
+def find_template_spans(text):
+    """Locate the opener positions of template regions in `text` and
+    return them as a :class:`TemplateSpans`.
+
+    Only openers are collected here; pairing with the closing delimiter is
+    deferred to :meth:`TemplateSpans.resolve`, which the lexer calls at
+    positions it actually reaches.
+    """
+    if '{{' not in text and '{%' not in text:
+        return _NO_TEMPLATE_SPANS
+    openers = {}
+    for m in _TEMPLATE_OPEN.finditer(text):
+        opener = m.group(1)
+        openers[m.start()] = (
+            m.end(), _TEMPLATE_CLOSER[opener], _TEMPLATE_TTYPE[opener])
+    return TemplateSpans(text, openers)
+
+
 SQL_REGEX = [
     (r'(--|# )\+.*?(\r\n|\r|\n|$)', tokens.Comment.Single.Hint),
 
