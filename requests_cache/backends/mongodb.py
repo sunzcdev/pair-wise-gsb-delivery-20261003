@@ -126,6 +126,10 @@ class MongoDict(BaseStorage):
         value = document['data'] if 'data' in document else document
         return self.deserialize(key, value)
 
+    def __contains__(self, key) -> bool:
+        """Check for a key without deserializing the value"""
+        return self.collection.find_one({'_id': key}, {'_id': True}) is not None
+
     def __setitem__(self, key, value):
         """If ``value`` is already a dict, its values will be stored under top-level keys.
         Otherwise, it will be stored under a 'data' key.

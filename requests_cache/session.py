@@ -63,6 +63,16 @@ class CacheMixin(MIXIN_BASE):
         **kwargs,
     ):
         self.cache = init_backend(cache_name, backend, serializer=serializer, **kwargs)
+
+        # Settings that affect corrupt entry handling should not be silently dropped when they were
+        # set on an existing backend instance
+        backend_settings = self.cache._settings
+        backend_kwargs = {}
+        if 'corruption_policy' not in kwargs and 'corrupt_entry_policy' not in kwargs:
+            backend_kwargs['corruption_policy'] = backend_settings.corruption_policy
+        if 'on_corruption' not in kwargs:
+            backend_kwargs['on_corruption'] = backend_settings.on_corruption
+
         self.settings = CacheSettings.from_kwargs(
             expire_after=expire_after,
             urls_expire_after=urls_expire_after,
@@ -78,6 +88,7 @@ class CacheMixin(MIXIN_BASE):
             read_only=read_only,
             stale_if_error=stale_if_error,
             autoclose=autoclose,
+            **backend_kwargs,
             **kwargs,
         )
         self._lock = RLock()
@@ -412,6 +423,11 @@ class CachedSession(CacheMixin, OriginalSession):
         stale_while_revalidate: Return a stale response initially, while a non-blocking request is
             sent to refresh the response for the next time it's requested
         autoclose: Close the cache backend when the session is closed
+        corruption_policy: How to handle a cache entry that can't be deserialized: ``report``
+            (default, treat it as a cache miss), ``delete`` (also remove the entry and its redirect
+            aliases), or ``raise``. See :ref:`corrupt-entries`.
+        on_corruption: Optional callback that receives a :py:class:`.CorruptEntryError` (with the
+            cache key, stage, and exception category) for each entry that can't be deserialized
         filter_fn: Response filtering function that indicates whether or not a given response should
             be cached. See :ref:`custom-filtering` for details.
         key_fn: Request matching function for generating custom cache keys. See

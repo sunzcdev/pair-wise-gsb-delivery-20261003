@@ -1,6 +1,10 @@
 # History
 
 ## Unreleased
+* Add an explicit `corruption_policy` for cache entries that can't be deserialized: `report`
+  (default), `delete` (also removes redirect aliases, unless `read_only`), or `raise`
+* Add `on_corruption` callback and `CorruptEntryError` (with cache key, stage, and exception
+  category) for reporting corrupt entries
 * Fix `ValueError` when a response has an invalid `Expires` date (for example `Expires: garbage`); it is now treated as already expired
 * Fix JSON refresh comparisons for mixed-case `Content-Type` values
 * Keep caller-supplied MongoDB clients open when closing MongoDB or GridFS caches

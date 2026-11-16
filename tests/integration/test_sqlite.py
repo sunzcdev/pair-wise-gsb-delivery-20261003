@@ -14,7 +14,8 @@ from requests_cache.backends import BaseCache, SQLiteCache, SQLiteDict
 from requests_cache.backends.sqlite import MEMORY_URI
 from requests_cache.models import CachedRequest, CachedResponse
 from requests_cache.policy import utcnow
-from tests.conftest import skip_pypy
+from requests_cache.session import CachedSession
+from tests.conftest import MOCKED_URL_JSON, mount_mock_adapter, skip_pypy
 from tests.integration.base_cache_test import BaseCacheTest
 from tests.integration.base_storage_test import CACHE_NAME, BaseStorageTest
 
@@ -451,3 +452,260 @@ class TestSQLiteCache(BaseCacheTest):
             assert prev_item is None or prev_item.expires < item.expires
             assert item.cache_key
             assert not item.is_expired
+
+
+class TestSQLiteCorruptEntries:
+    """Tests for isolating single cache entries that can't be deserialized (see CorruptionPolicy)"""
+
+    def _init_corrupt_cache(
+        self,
+        tempfile_path,
+        corruption_policy='report',
+        read_only=False,
+        on_corruption=None,
+    ):
+        """Create a cache with valid responses on both sides of one corrupt entry"""
+        session = CachedSession(
+            cache_name=tempfile_path,
+            backend='sqlite',
+            corruption_policy=corruption_policy,
+            read_only=read_only,
+            on_corruption=on_corruption,
+        )
+        for key in ('key_a', 'key_c', 'key_e'):
+            session.cache.responses[key] = CachedResponse(
+                status_code=200, url=f'https://example.com/{key}'
+            )
+
+        # Write a value that can't be unpickled directly, so we don't go through serialize()
+        with session.cache.responses.connection(commit=True) as con:
+            con.execute(
+                'INSERT OR REPLACE INTO responses (key, value, expires) VALUES (?, ?, ?)',
+                ('key_bad', sqlite3.Binary(b'not a valid pickled response'), None),
+            )
+
+        # Direct and multi-hop aliases pointing at the corrupt entry, plus an unrelated alias
+        session.cache.redirects['alias_bad'] = 'key_bad'
+        session.cache.redirects['alias_alias_bad'] = 'alias_bad'
+        session.cache.redirects['alias_c'] = 'key_c'
+        return session
+
+    def test_corrupt_entry__report_continues_batch(self, tempfile_path, caplog):
+        """A corrupt entry between two valid ones should not stop the rest of the batch"""
+        session = self._init_corrupt_cache(tempfile_path)
+
+        items = list(session.cache.sorted(key='key'))
+
+        # Both neighbors are readable, and the corrupt entry is treated as a miss
+        assert [item.cache_key for item in items] == ['key_a', 'key_c', 'key_e']
+        assert session.cache.get_response('key_bad') is None
+        assert session.cache.get_response('key_a').url == 'https://example.com/key_a'
+
+        # Report-only leaves the entry and its aliases in place
+        assert 'key_bad' in session.cache.responses
+        assert session.cache.redirects['alias_bad'] == 'key_bad'
+
+        # Diagnostics identify the key, stage, and exception category
+        assert 'key_bad' in caplog.text
+        assert 'stage=deserialize' in caplog.text
+        assert 'UnpicklingError' in caplog.text
+
+    def test_corrupt_entry__delete_removes_entry_and_aliases(self, tempfile_path, caplog):
+        session = self._init_corrupt_cache(tempfile_path, corruption_policy='delete')
+
+        items = list(session.cache.sorted(key='key'))
+
+        # Subsequent reads still work, and the corrupt entry is gone
+        assert [item.cache_key for item in items] == ['key_a', 'key_c', 'key_e']
+        assert 'key_bad' not in session.cache.responses
+        assert session.cache.get_response('key_c').url == 'https://example.com/key_c'
+
+        # Aliases that resolve to the corrupt entry are isolated in the same operation
+        assert 'alias_bad' not in session.cache.redirects
+        assert 'alias_alias_bad' not in session.cache.redirects
+        # An unrelated alias is untouched
+        assert session.cache.redirects['alias_c'] == 'key_c'
+
+        assert 'key_bad' in caplog.text
+        assert 'stage=deserialize' in caplog.text
+
+    def test_corrupt_entry__delete_then_refetch(self, tempfile_path):
+        """Deleting a corrupt entry should allow it to be fetched and re-cached"""
+        session = mount_mock_adapter(
+            CachedSession(cache_name=tempfile_path, backend='sqlite', corruption_policy='delete')
+        )
+        url = MOCKED_URL_JSON
+        session.get(url)
+        key = list(session.cache.responses.keys())[0]
+
+        # Corrupt the cached value in place
+        with session.cache.responses.connection(commit=True) as con:
+            con.execute(
+                'UPDATE responses SET value = ? WHERE key = ?',
+                (sqlite3.Binary(b'garbage'), key),
+            )
+
+        assert session.get(url).from_cache is False
+        assert session.get(url).from_cache is True
+        assert session.cache.get_response(key) is not None
+
+    def test_corrupt_entry__raise(self, tempfile_path):
+        from requests_cache.policy import CorruptEntryError
+
+        session = self._init_corrupt_cache(tempfile_path, corruption_policy='raise')
+
+        with pytest.raises(CorruptEntryError) as exc_info:
+            session.cache.get_response('key_bad')
+
+        error = exc_info.value
+        assert error.key == 'key_bad'
+        assert error.stage == 'deserialize'
+        assert error.exception_category == 'pickle'
+        assert isinstance(error.__cause__, pickle.UnpicklingError)
+
+        # A strict failure is isolated to the bad entry, which is left in place
+        assert session.cache.get_response('key_a').url == 'https://example.com/key_a'
+        assert 'key_bad' in session.cache.responses
+
+    def test_corrupt_entry__read_only_never_deletes(self, tempfile_path):
+        session = self._init_corrupt_cache(
+            tempfile_path, corruption_policy='delete', read_only=True
+        )
+
+        assert session.cache.get_response('key_bad') is None
+        assert 'key_bad' in session.cache.responses
+        assert session.cache.redirects['alias_bad'] == 'key_bad'
+        assert session.cache.get_response('key_a').url == 'https://example.com/key_a'
+
+    def test_corrupt_entry__callback_failure_is_not_recursive(self, tempfile_path, caplog):
+        events = []
+
+        def on_corruption(event):
+            events.append(event)
+            raise RuntimeError('callback failed')
+
+        session = self._init_corrupt_cache(
+            tempfile_path, corruption_policy='delete', on_corruption=on_corruption
+        )
+
+        assert session.cache.get_response('key_bad') is None
+
+        # The callback is called once; its error is reported but doesn't re-enter recovery
+        assert len(events) == 1
+        assert events[0].key == 'key_bad'
+        assert 'stage=callback' in caplog.text
+        assert 'key_bad' not in session.cache.responses
+        assert session.cache.get_response('key_a').url == 'https://example.com/key_a'
+
+    def test_corrupt_entry__callback_receives_event(self, tempfile_path):
+        events = []
+        session = self._init_corrupt_cache(tempfile_path, on_corruption=events.append)
+
+        assert session.cache.get_response('key_bad') is None
+
+        assert len(events) == 1
+        assert events[0].key == 'key_bad'
+        assert events[0].as_dict()['exception_type'] == 'UnpicklingError'
+
+    def test_corrupt_entry__callback_reading_same_entry_does_not_recurse(self, tempfile_path):
+        """If a callback reads the corrupt entry again, recovery doesn't re-enter itself"""
+        calls = []
+
+        def on_corruption(event):
+            calls.append(event)
+            # Reading the same entry from within the callback must not start another recovery
+            assert session.cache.get_response(event.key) is None
+
+        session = self._init_corrupt_cache(
+            tempfile_path, corruption_policy='delete', on_corruption=on_corruption
+        )
+        assert session.cache.get_response('key_bad') is None
+
+        # Only the outer event is reported, and the entry is deleted once
+        assert len(calls) == 1
+        assert 'key_bad' not in session.cache.responses
+
+    def test_corrupt_entry__connection_error_is_not_isolation(self, tempfile_path):
+        """A database connection error isn't a single corrupt entry, and must not clear the cache"""
+        session = self._init_corrupt_cache(tempfile_path, corruption_policy='delete')
+
+        with patch.object(
+            session.cache.responses,
+            'connection',
+            side_effect=sqlite3.OperationalError('unable to open database file'),
+        ):
+            with pytest.raises(sqlite3.OperationalError):
+                session.cache.get_response('key_a')
+
+        # Nothing was treated as corrupt, and nothing was deleted
+        assert len(session.cache.responses) == 4
+        assert 'key_bad' in session.cache.responses
+        assert session.cache.redirects['alias_bad'] == 'key_bad'
+
+    def test_corrupt_entry__delete_failure_does_not_clear_cache(self, tempfile_path, caplog):
+        """If isolation itself fails, the failure is logged and the cache is left intact"""
+        session = self._init_corrupt_cache(tempfile_path, corruption_policy='delete')
+
+        with patch.object(
+            session.cache,
+            '_delete_corrupt_entry',
+            side_effect=sqlite3.OperationalError('disk is on fire'),
+        ):
+            assert session.cache.get_response('key_bad') is None
+
+        assert 'stage=delete' in caplog.text
+        assert 'disk is on fire' in caplog.text
+        # The rest of the cache is untouched
+        assert len(session.cache.responses) == 4
+        assert session.cache.get_response('key_a').url == 'https://example.com/key_a'
+
+    def test_corrupt_entry__strict_policy_does_not_block_later_reads(self, tempfile_path):
+        """Even with the strict policy, a handled error doesn't prevent later reads"""
+        from requests_cache.policy import CorruptEntryError
+
+        session = self._init_corrupt_cache(tempfile_path, corruption_policy='raise')
+
+        with pytest.raises(CorruptEntryError):
+            session.cache.get_response('key_bad')
+
+        for key in ('key_c', 'key_e'):
+            assert session.cache.get_response(key).url == f'https://example.com/{key}'
+
+    @pytest.mark.parametrize('policy', ['report', 'delete', 'raise'])
+    def test_corrupt_entry__standalone_storage(self, tempfile_path, policy):
+        """A storage instance used on its own applies its own policy"""
+        from requests_cache.policy import CorruptEntryError
+
+        cache = SQLiteDict(tempfile_path, 'responses', corruption_policy=policy)
+        cache['good'] = CachedResponse(status_code=200, url='https://example.com/good')
+        with cache.connection(commit=True) as con:
+            con.execute(
+                'INSERT OR REPLACE INTO responses (key, value, expires) VALUES (?, ?, ?)',
+                ('bad', sqlite3.Binary(b'garbage'), None),
+            )
+
+        if policy == 'raise':
+            with pytest.raises(CorruptEntryError):
+                cache['bad']
+        else:
+            assert cache['bad'] is None
+
+        # Deletion depends on the policy, and the good entry is always readable
+        assert ('bad' in cache) is (policy != 'delete')
+        assert cache['good'].url == 'https://example.com/good'
+
+    def test_corrupt_entry__membership_check_does_not_deserialize(self, tempfile_path):
+        """A membership check is read-only, and must not delete a corrupt entry"""
+        session = self._init_corrupt_cache(tempfile_path, corruption_policy='delete')
+
+        assert 'key_bad' in session.cache.responses
+        assert 'alias_bad' in session.cache.redirects
+        assert 'key_bad' in session.cache.responses
+
+    def test_corrupt_entry__sorted_keeps_error_status_responses(self, tempfile_path):
+        """Responses with error status codes are falsy but valid, so they must still be returned"""
+        session = CachedSession(cache_name=tempfile_path, backend='sqlite')
+        session.cache.responses['error'] = CachedResponse(status_code=500, url='https://e.com/err')
+        session.cache.responses['ok'] = CachedResponse(status_code=200, url='https://e.com/ok')
+
+        assert [r.cache_key for r in session.cache.sorted(key='key')] == ['error', 'ok']

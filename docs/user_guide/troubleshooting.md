@@ -53,20 +53,25 @@ logging.getLogger('requests_cache').setLevel('DEBUG')
   [#56](https://github.com/requests-cache/requests-cache/issues/56) and
   [#102](https://github.com/requests-cache/requests-cache/issues/102).
   ```{note}
-  A cached response that can't be reused will simply be deleted and fetched again. If you get a
-  traceback just by reading from the cache, this is **not** intended behavior, so please create a bug
-  report!
+  A cached response that can't be deserialized is isolated from the rest of the cache: it's
+  reported and treated as a cache miss by default, so other entries can still be read. See
+  {ref}`corrupt-entries` for the available `corruption_policy` options. If you get a traceback just
+  by reading from the cache with the default policy, this is **not** intended behavior, so please
+  create a bug report!
   ```
 
 ## Common Error Messages
 Here are some error messages you may see either in the logs or (more rarely) in a traceback:
 
-* **`Unable to deserialize response with key {cache key}`:** This
-  usually means that a response was previously cached in a format that isn't compatible with the
-  current version of requests-cache or one of its dependencies.
-  * This message is to help with debugging and can generally be ignored. If you prefer, you can
-    either {py:meth}`~.BaseCache.delete` the invalid responses or {py:meth}`~.BaseCache.clear` the
-    entire cache.
+* **`Unable to deserialize cache entry (key={cache key}, stage=deserialize, error={error type})`:**
+  This usually means that a response was previously cached in a format that isn't compatible with
+  the current version of requests-cache or one of its dependencies.
+  * This message is to help with debugging and can generally be ignored with the default
+    `corruption_policy='report'`. If you prefer, you can also use `corruption_policy='delete'` to
+    remove the bad entry and its redirect aliases, `corruption_policy='raise'` to stop with a
+    {py:class}`.CorruptEntryError`, or {py:meth}`~.BaseCache.delete` /
+    {py:meth}`~.BaseCache.clear` to clean up the cache manually. See {ref}`corrupt-entries` for
+    details.
 * **`Request for URL {url} failed; using cached response`:** This is just a notification that the
   {ref}`stale_if_error <request-errors>` option is working as intended.
 * **{py:exc}`~requests.RequestException`:** These are general request errors not specific to

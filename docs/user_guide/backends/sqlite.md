@@ -75,6 +75,44 @@ for details.
 >>> backend = SQLiteCache(fast_save=True)
 ```
 
+(corrupt-entries)=
+## Corrupt Entries
+If a single entry can't be deserialized (for example, because it was written by an incompatible
+requests-cache or serializer version, or the file was truncated), the failure is isolated to that
+entry. Other entries can still be read, and the bad entry is treated as a cache miss.
+
+Use `corruption_policy` to choose what happens:
+```python
+>>> # Report the failure and leave the entry in place (default)
+>>> backend = SQLiteCache(corruption_policy='report')
+
+>>> # Report the failure, then delete the entry and any redirect aliases that resolve to it
+>>> backend = SQLiteCache(corruption_policy='delete')
+
+>>> # Raise CorruptEntryError, with the key, stage, and exception category
+>>> backend = SQLiteCache(corruption_policy='raise')
+```
+
+The policy can be changed at runtime with `session.settings.corruption_policy`. Use `on_corruption`
+to receive a {py:class}`.CorruptEntryError` for logging or metrics:
+```python
+>>> def report_corruption(error):
+...     print(error.key, error.stage, error.exception_category)
+
+>>> session = CachedSession(corruption_policy='delete', on_corruption=report_corruption)
+```
+
+Notes:
+
+* The response and its redirect aliases are removed in a single transaction, so a failure part-way
+  through can't leave a half-isolated entry.
+* In {ref}`read-only <read-only>` mode, a `delete` policy reports the failure but never removes the
+  entry.
+* An error while handling one entry (including an error from the `on_corruption` callback) is
+  logged and doesn't recurse or retry.
+* Database connection and query errors are **not** treated as corrupt entries. They are raised to
+  the caller, and recovery never falls back to clearing the whole cache.
+
 ## Concurrency
 SQLite supports concurrent access, so it is safe to use from a multi-threaded and/or multi-process
 application. It supports unlimited concurrent reads. Writes, however, are queued and run in serial,

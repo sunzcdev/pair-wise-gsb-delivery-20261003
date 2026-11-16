@@ -129,6 +129,10 @@ class DynamoDbDict(BaseStorage):
             raise KeyError
         return self.deserialize(key, response['Item']['value'])
 
+    def __contains__(self, key) -> bool:
+        """Check for a key without deserializing the value"""
+        return 'Item' in self._table.get_item(Key={'key': key})
+
     def __setitem__(self, key, value):
         item = {'key': key, 'value': self.serialize(value)}
 

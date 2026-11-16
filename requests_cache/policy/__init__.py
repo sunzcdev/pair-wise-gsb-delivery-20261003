@@ -20,6 +20,7 @@ KeyCallback = Callable[..., str]
 HeaderDict = Mapping[str, str]
 
 
+from .corruption import *
 from .expiration import *
 from .settings import *
 from .directives import CacheDirectives, set_request_headers

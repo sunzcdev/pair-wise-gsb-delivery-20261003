@@ -137,7 +137,10 @@ class FileDict(BaseStorage):
         mode = 'rb' if self.is_binary else 'r'
         with self._try_io(key):
             with self._key2path(key).open(mode) as f:
-                return self.deserialize(key, f.read())
+                serialized = f.read()
+        # Deserialize after the file is closed, so a corrupt-entry policy can delete it even on
+        # platforms that don't allow deleting open files
+        return self.deserialize(key, serialized)
 
     def __delitem__(self, key):
         with self._try_io(key):

@@ -144,6 +144,44 @@ class SQLiteCache(BaseCache):
                 ')'
             )
 
+    def _delete_corrupt_entry(self, key: str):
+        """Delete a corrupt response and its redirect aliases in a single transaction.
+
+        Both tables are updated in the same transaction, so a crash or error part-way through can't
+        leave a half-isolated entry (a deleted response with aliases still pointing at it, or the
+        reverse).
+        """
+        with self.responses._lock:
+            aliases = self._get_redirect_aliases([key])
+            with self.responses.connection(commit=True) as con:
+                con.execute(f'DELETE FROM {self.responses.table_name} WHERE key = ?', (key,))
+                for chunk in chunkify(aliases, max_size=SQLITE_MAX_VARIABLE_NUMBER):
+                    marks, args = _format_sequence(chunk)
+                    con.execute(
+                        f'DELETE FROM {self.redirects.table_name} WHERE key IN ({marks})',
+                        args,
+                    )
+
+    def _get_redirect_aliases(self, target_keys):
+        """Collect aliases in SQL, following multi-hop links without looping on cycles"""
+        seeds = {k for k in target_keys if k is not None}
+        targets = list(seeds)
+        aliases: List[str] = []
+        seen = set(seeds)
+        with self.redirects.connection() as con:
+            while targets:
+                marks, args = _format_sequence(targets)
+                cur = con.execute(
+                    f'SELECT key FROM {self.redirects.table_name} WHERE value IN ({marks})',
+                    args,
+                )
+                rows = cur.fetchall()
+                cur.close()
+                targets = [row[0] for row in rows if row[0] not in seen]
+                seen.update(targets)
+                aliases.extend(targets)
+        return aliases
+
     def count(self, expired: bool = True) -> int:
         """Count number of responses, optionally excluding expired
 
@@ -355,6 +393,16 @@ class SQLiteDict(BaseStorage):
             for row in con.execute(f'SELECT key FROM {self.table_name}'):
                 yield row[0]
 
+    def __contains__(self, key) -> bool:
+        """Check for a key without deserializing its value, so a membership check can't trigger
+        corrupt-entry handling
+        """
+        with self.connection() as con:
+            cur = con.execute(f'SELECT 1 FROM {self.table_name} WHERE key = ?', (key,))
+            row = cur.fetchone()
+            cur.close()
+            return row is not None
+
     def __len__(self):
         return self.count()
 
@@ -442,8 +490,9 @@ class SQLiteDict(BaseStorage):
                 params,
             ):
                 result = self.deserialize(row[0], row[1])
-                # Omit any results that can't be deserialized
-                if result:
+                # Omit any results that can't be deserialized. Note: check for None explicitly,
+                # since a valid CachedResponse with an error status code is falsy.
+                if result is not None:
                     yield result
 
     def vacuum(self):

@@ -1,6 +1,7 @@
 """BaseCache tests that use mocked responses only"""
 
 import pickle
+import sqlite3
 from datetime import timedelta
 from logging import getLogger
 from pickle import PickleError
@@ -351,6 +352,51 @@ def test_urls__error(mock_session):
 
     # The invalid response should be skipped, but remain in the cache
     assert len(mock_session.cache.responses.keys()) == 3
+
+
+# Corrupt entry isolation
+# ----------------------
+
+
+def test_filter__skips_corrupt_entry(mock_session):
+    """A corrupt entry between two valid ones should not stop the rest of the batch"""
+    responses = [
+        mock_session.get(url) for url in [MOCKED_URL, MOCKED_URL_JSON, MOCKED_URL_HTTPS]
+    ]
+    valid_responses = [responses[0], responses[2]]
+
+    # Simulate a corrupt entry in the middle of the batch
+    deserialize_results = [responses[0], None, responses[2]]
+    with patch.object(SQLiteDict, 'deserialize', side_effect=deserialize_results):
+        assert [r.url for r in mock_session.cache.filter()] == [
+            r.url for r in valid_responses
+        ]
+
+
+def test_filter__delete_corrupt_entry_continues_batch(mock_session, caplog):
+    """With the delete policy, deleting a corrupt entry must not disturb iteration"""
+    keys = [mock_session.get(url).cache_key for url in [MOCKED_URL, MOCKED_URL_JSON]]
+    corrupt_key = 'corrupt_key'
+    mock_session.cache.responses[corrupt_key] = CachedResponse(status_code=200)
+    mock_session.settings.corruption_policy = 'delete'
+
+    # Corrupt the stored value directly, so deserialization fails for this entry only
+    with mock_session.cache.responses.connection(commit=True) as con:
+        con.execute(
+            'UPDATE responses SET value = ? WHERE key = ?',
+            (sqlite3.Binary(b'garbage'), corrupt_key),
+        )
+
+    responses = list(mock_session.cache.filter())
+
+    assert {r.cache_key for r in responses} == set(keys)
+    assert corrupt_key not in mock_session.cache.responses
+    assert 'stage=deserialize' in caplog.text
+
+
+def test_corruption_policy__invalid_value():
+    with pytest.raises(ValueError):
+        BaseCache(corruption_policy='explode')
 
 
 # Deprecated methods

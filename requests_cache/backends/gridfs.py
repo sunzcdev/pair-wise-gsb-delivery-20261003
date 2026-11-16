@@ -91,7 +91,10 @@ class GridFSDict(BaseStorage):
                 file_handle = self.fs.find_one({'_id': key})
                 if file_handle is None:
                     raise KeyError
-                return self.deserialize(key, file_handle.read())
+                serialized = file_handle.read()
+            # Deserialize after the GridFS handle has been closed, so a corrupt-entry policy can
+            # delete the file without being blocked by an open read handle
+            return self.deserialize(key, serialized)
         except CorruptGridFile as e:
             logger.warning(e, exc_info=True)
             raise KeyError from e
@@ -114,6 +117,11 @@ class GridFSDict(BaseStorage):
             if res is None:
                 raise KeyError
             self.fs.delete(res._id)
+
+    def __contains__(self, key) -> bool:
+        """Check for a key without reading or deserializing the file contents"""
+        with self._lock:
+            return self.db['fs.files'].find_one({'_id': key}, {'_id': True}) is not None
 
     def __len__(self):
         return self.db['fs.files'].estimated_document_count()

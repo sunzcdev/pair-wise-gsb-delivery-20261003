@@ -17,7 +17,7 @@ import requests
 from requests import HTTPError, Request, RequestException, Session
 from requests.structures import CaseInsensitiveDict
 
-from requests_cache import ALL_METHODS, CachedSession
+from requests_cache import ALL_METHODS, CachedSession, SQLiteCache
 from requests_cache._utils import get_placeholder_class
 from requests_cache.backends import BACKEND_CLASSES, BaseCache
 from requests_cache.backends.base import DESERIALIZE_ERRORS
@@ -687,6 +687,100 @@ def test_unpickle_errors(mock_session, error):
     resp = mock_session.get(MOCKED_URL_JSON)
     assert resp.from_cache is True
     assert resp.json()['message'] == 'mock json response'
+
+
+# Corrupt entry policy
+# --------------------
+
+
+def test_corruption_policy__default(mock_session):
+    """The default policy is report-only, so a deserialization error is treated as a miss"""
+    assert mock_session.settings.corruption_policy == 'report'
+    assert mock_session.cache.corruption_policy == 'report'
+
+
+@pytest.mark.parametrize('value', ['report', 'delete', 'raise', 'strict', 'refetch'])
+def test_corruption_policy__values(mock_session, value):
+    mock_session.settings.corruption_policy = value
+    assert mock_session.settings.corruption_policy == mock_session.cache.corruption_policy
+
+
+def test_corruption_policy__invalid(mock_session):
+    with pytest.raises(ValueError):
+        mock_session.settings.corruption_policy = 'explode'
+
+
+def test_corruption_policy__backend_instance():
+    """A policy set on an existing backend should be preserved by the session"""
+    from requests_cache.policy import CorruptionPolicy
+
+    backend = SQLiteCache(':memory:', corruption_policy='delete')
+    session = CachedSession(backend=backend)
+    assert session.settings.corruption_policy == CorruptionPolicy.DELETE
+    assert session.cache.corruption_policy == CorruptionPolicy.DELETE
+
+
+def test_corruption_policy__raise(mock_session):
+    """With the strict policy, a deserialization error raises a CorruptEntryError"""
+    from requests_cache.policy import CorruptEntryError
+
+    cached = mock_session.get(MOCKED_URL)
+    mock_session.settings.corruption_policy = 'raise'
+
+    with patch.object(
+        mock_session.cache.responses.serializer, 'loads', side_effect=PickleError('garbage')
+    ):
+        with pytest.raises(CorruptEntryError) as exc_info:
+            mock_session.get(MOCKED_URL)
+
+    error = exc_info.value
+    assert error.key == cached.cache_key
+    assert error.stage == 'deserialize'
+    assert error.exception_name == 'PickleError'
+
+    # The entry is isolated: the cache is still readable once the error is handled
+    assert mock_session.get(MOCKED_URL).from_cache is True
+
+
+def test_corruption_policy__delete_and_refetch(mock_session, caplog):
+    """With the delete policy, a corrupt entry is removed and the request is made again"""
+    response = mock_session.get(MOCKED_URL)
+    key = response.cache_key
+    mock_session.settings.corruption_policy = 'delete'
+
+    with patch.object(mock_session.cache.responses.serializer, 'loads', side_effect=PickleError):
+        assert mock_session.get(MOCKED_URL).from_cache is False
+
+    assert 'stage=deserialize' in caplog.text
+    # After the bad value is removed, a fresh response is written and then read normally
+    assert mock_session.get(MOCKED_URL).from_cache is True
+    assert mock_session.cache.get_response(key) is not None
+
+
+def test_corruption_policy__read_only_does_not_delete(mock_session):
+    """In read-only mode, the delete policy must not remove the corrupt entry"""
+    mock_session.get(MOCKED_URL)
+    key = next(iter(mock_session.cache.responses.keys()))
+    mock_session.settings.corruption_policy = 'delete'
+    mock_session.settings.read_only = True
+
+    with patch.object(mock_session.cache.responses.serializer, 'loads', side_effect=PickleError):
+        assert mock_session.get(MOCKED_URL).from_cache is False
+
+    assert key in mock_session.cache.responses
+
+
+def test_corruption_policy__callback(mock_session):
+    events = []
+    mock_session.settings.on_corruption = events.append
+    mock_session.get(MOCKED_URL)
+
+    with patch.object(mock_session.cache.responses.serializer, 'loads', side_effect=PickleError):
+        mock_session.get(MOCKED_URL)
+
+    assert len(events) == 1
+    assert events[0].stage == 'deserialize'
+    assert events[0].exception_name == 'PickleError'
 
 
 # Additional CachedSession settings and methods

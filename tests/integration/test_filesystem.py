@@ -9,6 +9,7 @@ from platformdirs import user_cache_dir
 
 from requests_cache.backends import FileCache, FileDict, LRUFileDict
 from requests_cache.backends.filesystem import LRUDict
+from requests_cache.models import CachedResponse
 from requests_cache.serializers import (
     SERIALIZERS,
     SerializerPipeline,
@@ -560,3 +561,37 @@ class TestFileCache(BaseCacheTest):
         start_bytes = session.cache.responses.size()
         session.cache.responses['key_1'] = 'value_1'
         assert session.cache.responses.size() == start_bytes + len('value_1')
+
+
+class TestFileCacheCorruptEntries:
+    """Corrupt entry isolation for file-based caches (no external services required)"""
+
+    @pytest.mark.parametrize('lru', [False, True])
+    def test_corrupt_entry__delete(self, tmp_path, caplog, lru):
+        kwargs = {'max_cache_bytes': 100_000} if lru else {}
+        cache = FileCache(tmp_path / 'cache', corruption_policy='delete', **kwargs)
+        cache.responses['good_a'] = CachedResponse(status_code=200, url='https://e.com/a')
+        cache.responses['good_c'] = CachedResponse(status_code=200, url='https://e.com/c')
+
+        # Write an unparseable JSON file directly, so loading it will fail
+        (cache.responses.cache_dir / 'bad.json').write_text('not json')
+        cache.redirects['alias_bad'] = 'bad'
+
+        assert set(cache.responses.keys()) == {'good_a', 'good_c', 'bad'}
+        assert cache.get_response('bad') is None
+        assert 'stage=deserialize' in caplog.text
+        assert 'JSONDecodeError' in caplog.text
+
+        # The bad file and its alias are removed; the remaining entries are still readable
+        assert set(cache.responses.keys()) == {'good_a', 'good_c'}
+        assert 'alias_bad' not in cache.redirects
+        assert cache.get_response('good_a').url == 'https://e.com/a'
+
+    def test_corrupt_entry__report(self, tmp_path):
+        cache = FileCache(tmp_path / 'cache')
+        cache.responses['good_a'] = CachedResponse(status_code=200, url='https://e.com/a')
+        (cache.responses.cache_dir / 'bad.json').write_text('not json')
+
+        assert cache.get_response('bad') is None
+        # The file is left in place
+        assert set(cache.responses.keys()) == {'good_a', 'bad'}
