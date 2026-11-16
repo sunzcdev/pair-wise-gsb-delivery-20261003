@@ -120,3 +120,24 @@ class EmptyExpressionError(JMESPathError):
 
 class UnknownFunctionError(JMESPathError):
     pass
+
+
+@with_str_method
+class UndefinedVariableError(JMESPathError):
+    """Raised when an external variable has no binding.
+
+    This is distinct from binding a variable to ``None``: a variable that
+    is explicitly bound to ``None`` evaluates to ``None`` while a variable
+    that is missing from the binding mapping raises this error.
+    """
+
+    def __init__(self, variable_name, expression=None):
+        self.variable_name = variable_name
+        # Whatever catches the error can fill in the full expression.
+        self.expression = expression
+        super(UndefinedVariableError, self).__init__(variable_name)
+
+    def __str__(self):
+        return (
+            'Undefined external variable "$%s" in expression:\n"%s"' % (
+                self.variable_name, self.expression))

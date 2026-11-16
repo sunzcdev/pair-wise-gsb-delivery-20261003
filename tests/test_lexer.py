@@ -155,6 +155,72 @@ class TestRegexLexer(unittest.TestCase):
         with self.assertRaisesRegex(LexerError, "Unknown token"):
             list(self.lexer.tokenize('foo-bar'))
 
+    def test_external_variable(self):
+        tokens = list(self.lexer.tokenize('$foo'))
+        self.assert_tokens(tokens, [{'type': 'external_variable',
+                                     'value': 'foo'}])
+
+    def test_external_variable_with_underscore_and_digits(self):
+        tokens = list(self.lexer.tokenize('$foo_bar2'))
+        self.assert_tokens(tokens, [{'type': 'external_variable',
+                                     'value': 'foo_bar2'}])
+
+    def test_braced_external_variable(self):
+        tokens = list(self.lexer.tokenize('${foo_bar}'))
+        self.assert_tokens(tokens, [{'type': 'external_variable',
+                                     'value': 'foo_bar'}])
+
+    def test_external_variable_stops_at_dot(self):
+        tokens = list(self.lexer.tokenize('$foo.bar'))
+        self.assert_tokens(tokens, [
+            {'type': 'external_variable', 'value': 'foo'},
+            {'type': 'dot', 'value': '.'},
+            {'type': 'unquoted_identifier', 'value': 'bar'},
+        ])
+
+    def test_external_variable_position_information(self):
+        tokens = list(self.lexer.tokenize('$foo'))
+        self.assertEqual(
+            tokens,
+            [{'type': 'external_variable', 'value': 'foo',
+              'start': 0, 'end': 3},
+             {'type': 'eof', 'value': '', 'start': 4, 'end': 4}]
+        )
+
+    def test_braced_external_variable_position_information(self):
+        tokens = list(self.lexer.tokenize('${foo}'))
+        self.assertEqual(
+            tokens,
+            [{'type': 'external_variable', 'value': 'foo',
+              'start': 0, 'end': 5},
+             {'type': 'eof', 'value': '', 'start': 6, 'end': 6}]
+        )
+
+    def test_dollar_inside_raw_string_is_literal(self):
+        tokens = list(self.lexer.tokenize("'$foo ${bar}'"))
+        self.assert_tokens(tokens, [{'type': 'literal',
+                                     'value': '$foo ${bar}'}])
+
+    def test_dollar_inside_json_literal_is_literal(self):
+        tokens = list(self.lexer.tokenize('`"$foo"`'))
+        self.assert_tokens(tokens, [{'type': 'literal', 'value': '$foo'}])
+
+    def test_empty_external_variable_name_is_error(self):
+        with self.assertRaises(LexerError):
+            list(self.lexer.tokenize('$'))
+
+    def test_external_variable_starting_with_digit_is_error(self):
+        with self.assertRaises(LexerError):
+            list(self.lexer.tokenize('$1foo'))
+
+    def test_braced_external_variable_starting_with_digit_is_error(self):
+        with self.assertRaises(LexerError):
+            list(self.lexer.tokenize('${1foo}'))
+
+    def test_unclosed_braced_external_variable_is_error(self):
+        with self.assertRaisesRegex(LexerError, 'Unclosed'):
+            list(self.lexer.tokenize('${foo'))
+
 
 if __name__ == '__main__':
     unittest.main()

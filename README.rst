@@ -101,6 +101,36 @@ of your dict keys.  To do this you can use either of these options:
     ...               jmespath.Options(dict_cls=collections.OrderedDict))
 
 
+External Variables
+~~~~~~~~~~~~~~~~~~
+
+When you want to reuse the same expression and only change a filter or
+reference value, you can use an external variable instead of building the
+expression through string substitution.  A variable is written as
+``$name`` (or ``${name}``) and its value is supplied at search time
+through a ``bindings`` mapping:
+
+.. code:: python
+
+    >>> import jmespath
+    >>> expression = jmespath.compile('people[?age >= $min_age].name')
+    >>> data = {'people': [{'name': 'a', 'age': 20},
+    ...                    {'name': 'b', 'age': 30}]}
+    >>> expression.search(data, bindings={'min_age': 18})
+    ['a', 'b']
+    >>> expression.search(data, bindings={'min_age': 25})
+    ['b']
+
+You can also pass the bindings to ``jmespath.search`` directly or through
+``jmespath.Options(bindings=...)``.  Variables are never resolved from the
+target document: a name missing from ``bindings`` raises
+``jmespath.exceptions.UndefinedVariableError``, while an explicit
+``bindings={'name': None}`` evaluates to ``None``.  A ``$`` that appears
+inside a string or JSON literal is left untouched, and because the compiled
+expression only stores the variable name, the parse cache never retains the
+binding values from a previous search.
+
+
 Custom Functions
 ~~~~~~~~~~~~~~~~
 

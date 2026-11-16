@@ -1,6 +1,7 @@
 import operator
 
 from jmespath import functions
+from jmespath import exceptions
 from jmespath.compat import string_type
 from numbers import Number
 
@@ -58,7 +59,7 @@ def _is_actual_number(x):
 
 class Options(object):
     """Options to control how a JMESPath function is evaluated."""
-    def __init__(self, dict_cls=None, custom_functions=None):
+    def __init__(self, dict_cls=None, custom_functions=None, bindings=None):
         #: The class to use when creating a dict.  The interpreter
         #  may create dictionaries during the evaluation of a JMESPath
         #  expression.  For example, a multi-select hash will
@@ -69,6 +70,16 @@ class Options(object):
         #  have predictable key ordering.
         self.dict_cls = dict_cls
         self.custom_functions = custom_functions
+        #: A mapping of external variable names to their bound values.
+        #  Variables referenced with the ``$name`` syntax are resolved
+        #  from this mapping.  A name missing from the mapping raises
+        #  an ``UndefinedVariableError`` while an explicit ``None``
+        #  binding evaluates to ``None``.
+        self.bindings = bindings if bindings is not None else {}
+        #: The source expression being evaluated.  This is populated by
+        #  ``ParsedResult.search`` so that runtime errors can report the
+        #  expression that triggered them.
+        self.expression = None
 
 
 class _Expression(object):
@@ -121,9 +132,23 @@ class TreeInterpreter(Visitor):
             self._functions = self._options.custom_functions
         else:
             self._functions = functions.Functions()
+        self._bindings = options.bindings
 
     def default_visit(self, node, *args, **kwargs):
         raise NotImplementedError(node['type'])
+
+    def visit_external_variable(self, node, value):
+        # Variables are resolved exclusively from the binding mapping;
+        # they are never inferred from the target document.  A missing
+        # binding is an error while an explicit ``None`` binding is a
+        # legitimate value, so membership is checked rather than using
+        # ``dict.get`` with a default.
+        name = node['value']
+        if name not in self._bindings:
+            raise exceptions.UndefinedVariableError(
+                variable_name=name,
+                expression=self._options.expression)
+        return self._bindings[name]
 
     def visit_subexpression(self, node, value):
         result = value

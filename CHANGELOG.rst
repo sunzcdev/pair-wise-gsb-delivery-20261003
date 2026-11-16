@@ -1,7 +1,13 @@
 Next Release (TBD)
 ==================
 
-* No changes yet.
+* Add support for external variables.  Expressions can reference values
+  supplied at search time through an explicit ``$name`` (or ``${name}``)
+  syntax and a ``bindings`` mapping passed to ``search``/``Options``.
+  Variable names are validated while parsing, a missing binding raises
+  ``UndefinedVariableError`` (distinct from an explicit ``None`` binding),
+  and the parsed expression cache never stores binding values, so a single
+  compiled expression can be reused with different bindings.
 
 
 1.1.0

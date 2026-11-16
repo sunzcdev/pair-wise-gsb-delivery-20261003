@@ -45,6 +45,7 @@ class Parser(object):
         'number': 0,
         'current': 0,
         'expref': 0,
+        'external_variable': 0,
         'colon': 0,
         'pipe': 1,
         'or': 2,
@@ -249,6 +250,21 @@ class Parser(object):
 
     def _token_nud_current(self, token):
         return ast.current_node()
+
+    def _token_nud_external_variable(self, token):
+        name = token['value']
+        # Validate the variable name at parse time rather than guessing
+        # it from the target document during evaluation.
+        if not self._is_valid_variable_name(name):
+            raise exceptions.ParseError(
+                token['start'], token['value'], token['type'],
+                'Invalid external variable name "%s"' % name)
+        return ast.external_variable(name)
+
+    def _is_valid_variable_name(self, name):
+        if not name or name[0] not in lexer.Lexer.START_IDENTIFIER:
+            return False
+        return all(char in lexer.Lexer.VALID_IDENTIFIER for char in name)
 
     def _token_nud_expref(self, token):
         expression = self._expression(self.BINDING_POWER['expref'])
@@ -511,7 +527,25 @@ class ParsedResult(object):
         self.expression = expression
         self.parsed = parsed
 
-    def search(self, value, options=None):
+    def search(self, value, options=None, bindings=None):
+        if bindings is not None:
+            if options is None:
+                options = visitor.Options(bindings=bindings)
+            elif options.bindings:
+                merged = dict(options.bindings)
+                merged.update(bindings)
+                options = visitor.Options(
+                    dict_cls=options.dict_cls,
+                    custom_functions=options.custom_functions,
+                    bindings=merged)
+            else:
+                options = visitor.Options(
+                    dict_cls=options.dict_cls,
+                    custom_functions=options.custom_functions,
+                    bindings=bindings)
+        if options is not None:
+            # Surface the source expression in error messages.
+            options.expression = self.expression
         interpreter = visitor.TreeInterpreter(options)
         result = interpreter.visit(self.parsed, value)
         return result

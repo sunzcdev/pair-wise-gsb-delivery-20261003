@@ -8,5 +8,6 @@ def compile(expression):
     return parser.Parser().parse(expression)
 
 
-def search(expression, data, options=None):
-    return parser.Parser().parse(expression).search(data, options=options)
+def search(expression, data, options=None, bindings=None):
+    return parser.Parser().parse(expression).search(
+        data, options=options, bindings=bindings)

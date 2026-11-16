@@ -14,6 +14,14 @@ def expref(expression):
     return {'type': 'expref', 'children': [expression]}
 
 
+def external_variable(name):
+    # A reference to a value supplied through the external binding
+    # mapping passed to ``search``.  The node only stores the variable
+    # name, never its bound value, so a parsed expression can be cached
+    # and reused with different bindings.
+    return {'type': 'external_variable', 'children': [], 'value': name}
+
+
 def function_expression(name, args):
     return {'type': 'function_expression', 'children': args, 'value': name}
 

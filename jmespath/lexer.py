@@ -56,6 +56,8 @@ class Lexer(object):
                            'start': start, 'end': start + 1}
             elif self._current == "'":
                 yield self._consume_raw_string_literal()
+            elif self._current == '$':
+                yield self._consume_external_variable()
             elif self._current == '|':
                 yield self._match_or_else('|', 'or', 'pipe')
             elif self._current == '&':
@@ -194,6 +196,42 @@ class Lexer(object):
         lexeme = self._consume_until("'").replace("\\'", "'")
         token_len = self._position - start
         return {'type': 'literal', 'value': lexeme,
+                'start': start, 'end': token_len}
+
+    def _consume_external_variable(self):
+        # External variables use an explicit ``$name`` or ``${name}``
+        # syntax.  The ``$`` marker is only recognized outside of string
+        # and JSON literals, so a ``$`` appearing inside a literal is
+        # left untouched.
+        start = self._position
+        next_char = self._next()
+        if next_char == '{':
+            self._next()
+            buff = ''
+            while self._current is not None and self._current != '}':
+                buff += self._current
+                self._next()
+            if self._current is None:
+                raise LexerError(
+                    lexer_position=start,
+                    lexer_value=self._expression[start:],
+                    message='Unclosed "}" delimiter for external variable')
+            # Consume the closing "}".
+            self._next()
+        else:
+            buff = ''
+            if next_char in self.START_IDENTIFIER:
+                buff = next_char
+                while self._next() in self.VALID_IDENTIFIER:
+                    buff += self._current
+        if not buff or buff[0] not in self.START_IDENTIFIER or \
+                any(char not in self.VALID_IDENTIFIER for char in buff):
+            raise LexerError(
+                lexer_position=start,
+                lexer_value=self._expression[start:self._position],
+                message='Invalid external variable name "%s"' % buff)
+        token_len = self._position - start
+        return {'type': 'external_variable', 'value': buff,
                 'start': start, 'end': token_len}
 
     def _match_or_else(self, expected, match_type, else_type):
