@@ -1,3 +1,28 @@
+Development Version
+-------------------
+
+Notable Changes
+
+* ``strip_comments`` can keep selected comment categories.  The new
+  ``strip_comments_keep`` option takes ``"hint"`` (the default, matching
+  previous behaviour), ``"ordinary"``, ``"all"`` or ``"none"``, and
+  ``strip_comments_keep_prefixes`` keeps comments carrying a caller
+  declared marker such as ``@etl:``.  Kept comments stay at their original
+  position, including after ``reindent``.  Only lexed comment tokens are
+  matched, so look-alike text inside string literals and dollar-quoted
+  blocks is neither kept nor removed.  The ``sqlformat`` command gained
+  ``--strip-comments-keep`` and ``--strip-comments-keep-prefix``.
+
+Bug Fixes
+
+* Removing a comment no longer glues the surrounding tokens into one word
+  (``1/*c*/AS`` produced ``1AS``, issue425).  A line comment still
+  contributes its line break, while a block comment leaves a single blank
+  at most, so ``a /*c*/ b`` no longer turns into ``a  b``.
+* ``strip_comments`` keeps the indentation of the following line for
+  comments inside parentheses (issue484).
+
+
 Release 0.6.1 (Nov 01, 2026)
 ----------------------------
 

@@ -49,6 +49,10 @@ Common formatting options include:
 * ``--identifiers lower`` or ``-i lower``: Convert identifiers to lowercase
 * ``--indent_width 4``: Set indentation width to 4 spaces
 * ``--strip-comments``: Remove comments from SQL
+* ``--strip-comments-keep``: Keep only the given comment category
+  (``hint``, ``ordinary``, ``all`` or ``none``), repeatable
+* ``--strip-comments-keep-prefix``: Keep comments starting with a marker
+  such as ``@etl:``, repeatable
 
 Run ``sqlformat --help`` for a complete list of formatting options.
 

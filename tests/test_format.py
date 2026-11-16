@@ -138,6 +138,132 @@ class TestFormat:
         res = sqlparse.format(sql, strip_comments=True)
         assert res == sql
 
+    def test_strip_comments_keep_categories(self):
+        sql = 'select a /* note */ /*+full(t)*/ from t -- tail\nwhere b=1'
+        assert sqlparse.format(
+            sql, strip_comments=True, strip_comments_keep='hint') == (
+                'select a /*+full(t)*/ from t\nwhere b=1')
+        assert sqlparse.format(
+            sql, strip_comments=True, strip_comments_keep='ordinary') == (
+                'select a /* note */ from t -- tail\nwhere b=1')
+        assert sqlparse.format(
+            sql, strip_comments=True, strip_comments_keep='all') == sql
+        assert sqlparse.format(
+            sql, strip_comments=True, strip_comments_keep='none') == (
+                'select a from t\nwhere b=1')
+        assert sqlparse.format(
+            sql, strip_comments=True,
+            strip_comments_keep=('hint', 'ordinary')) == sql
+
+    def test_strip_comments_keep_is_normalized(self):
+        sql = 'select a /*+full(t)*/ from t'
+        for value in (('ordinary', 'hint'), ['HINT'], 'HINT'):
+            assert sqlparse.format(
+                sql, strip_comments=True,
+                strip_comments_keep=value) == sql
+
+    def test_strip_comments_keep_defaults_to_hints(self):
+        sql = 'select a /* note */ /*+full(t)*/ from t'
+        assert sqlparse.format(sql, strip_comments=True) == \
+            sqlparse.format(sql, strip_comments=True,
+                            strip_comments_keep='hint')
+
+    def test_strip_comments_keep_implies_strip_comments(self):
+        sql = 'select a /* note */ /*+full(t)*/ from t'
+        assert sqlparse.format(sql, strip_comments_keep='none') == (
+            'select a from t')
+        # The plain formatter leaves comments alone.
+        assert sqlparse.format(sql) == sql
+
+    def test_strip_comments_keep_invalid_option(self):
+        sql = 'select 1 /* note */'
+        for value in ('foo', ('all', 'hint'), ('none', 'hint'), 1, [2]):
+            with pytest.raises(SQLParseError):
+                sqlparse.format(sql, strip_comments=True,
+                                strip_comments_keep=value)
+
+    def test_strip_comments_keep_prefixes(self):
+        sql = ('select a /* @etl:job=1 */ from t '
+               '-- @ETL:step=2\nwhere b=1 /* plain */')
+        res = sqlparse.format(
+            sql, strip_comments=True, strip_comments_keep='none',
+            strip_comments_keep_prefixes=['@etl:'])
+        assert res == ('select a /* @etl:job=1 */ from t '
+                       '-- @ETL:step=2\nwhere b=1')
+
+    def test_strip_comments_keep_prefixes_overrides_categories(self):
+        # '@etl' is not a hint, but the caller asked for it explicitly.
+        sql = 'select a --+@etl:keep\nfrom t'
+        res = sqlparse.format(
+            sql, strip_comments=True, strip_comments_keep='none',
+            strip_comments_keep_prefixes=['@etl:'])
+        assert res == sql
+
+    def test_strip_comments_keep_prefixes_ignore_delimiters(self):
+        sql = 'select a /* @etl:x */ from t'
+        for prefix in ('@etl:', '/*@etl:', '  @ETL:  '):
+            res = sqlparse.format(
+                sql, strip_comments=True, strip_comments_keep='none',
+                strip_comments_keep_prefixes=[prefix])
+            assert res == sql
+
+    def test_strip_comments_keep_prefixes_not_in_literals(self):
+        sql = ('select \'-- @etl:x\' as a, "/* @etl:y */" as b, '
+               '$$-- @etl:z$$ as c from t')
+        assert sqlparse.format(
+            sql, strip_comments=True, strip_comments_keep='none',
+            strip_comments_keep_prefixes=['@etl:']) == sql
+        # ... and a literal looking like a hint is not kept either.
+        sql = "select '/*+full(t)*/' as a from t where b=1"
+        assert sqlparse.format(sql, strip_comments=True) == sql
+
+    def test_strip_comments_keep_prefixes_invalid_option(self):
+        sql = 'select 1 /* note */'
+        for value in ('', '  ', ['a\nb'], ['a\rb'], [1]):
+            with pytest.raises(SQLParseError):
+                sqlparse.format(sql, strip_comments=True,
+                                strip_comments_keep_prefixes=value)
+
+    def test_strip_comments_does_not_glue_tokens(self):
+        # see issue425
+        assert sqlparse.format('select 1/*c*/AS x',
+                               strip_comments=True) == 'select 1 AS x'
+        assert sqlparse.format('select a/*c*/b from t',
+                               strip_comments=True) == 'select a b from t'
+        assert sqlparse.format("select 'x'/*c*/'y'",
+                               strip_comments=True) == "select 'x' 'y'"
+        assert sqlparse.format('select 1/*c*/.5',
+                               strip_comments=True) == 'select 1 .5'
+
+    def test_strip_comments_blocks_newline_and_gap(self):
+        # A line comment owns its terminator, a block comment only a gap.
+        assert sqlparse.format('select *-- c\nfrom t',
+                               strip_comments=True) == 'select *\nfrom t'
+        assert sqlparse.format('select * /* c */ from t',
+                               strip_comments=True) == 'select * from t'
+        assert sqlparse.format('select a, /* c */ b from t',
+                               strip_comments=True) == 'select a, b from t'
+        assert sqlparse.format('select a from t /* c */ where b=1',
+                               strip_comments=True) == (
+            'select a from t where b=1')
+
+    def test_strip_comments_keeps_hint_in_place(self):
+        sql = 'select /*+full(t)*/ a, b from t where c=1'
+        assert sqlparse.format(sql, strip_comments=True, reindent=True) == \
+            'select /*+full(t)*/ a,\n                    b\nfrom t\nwhere c=1'
+        sql = 'select a, --+index(t i)\nb from t'
+        assert sqlparse.format(sql, strip_comments=True, reindent=True) == \
+            'select a, --+index(t i)\nb\nfrom t'
+
+    def test_strip_comments_shared_group(self):
+        # A hint and an ordinary comment may live in one comment group.
+        sql = 'select /* note */ /*+full(t)*/ a from t'
+        assert sqlparse.format(sql, strip_comments=True) == \
+            'select /*+full(t)*/ a from t'
+        sql = 'select /*+full(t)*/ /* note */ a from t'
+        assert sqlparse.format(sql, strip_comments=True) == \
+            'select /*+full(t)*/ a from t'
+
     def test_strip_ws(self):
         f = lambda sql: sqlparse.format(sql, strip_whitespace=True)
         s = 'select\n* from      foo\n\twhere  ( 1 = 2 )\n'

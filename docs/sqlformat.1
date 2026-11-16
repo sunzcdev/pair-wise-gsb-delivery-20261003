@@ -56,6 +56,16 @@ puts every item in the list on its own line.
 \fB\-\-strip\-comments
 Remove comments.
 .TP
+\fB\-\-strip\-comments\-keep\fR=\fICATEGORY\fR
+Comment category to keep while removing comments.  May be repeated.
+.I CATEGORY
+is one of "hint", "ordinary", "all", "none" (default: "hint").
+.TP
+\fB\-\-strip\-comments\-keep\-prefix\fR=\fIPREFIX\fR
+Keep comments whose text starts with
+.IR PREFIX ,
+for example a collector marker.  May be repeated.
+.TP
 .BR \-h | \-\-help
 Print a short help message and exit.
 All subsequent options are ignored.

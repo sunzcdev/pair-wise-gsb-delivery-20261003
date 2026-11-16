@@ -94,6 +94,26 @@ def create_parser():
         help='remove comments')
 
     group.add_argument(
+        '--strip-comments-keep',
+        dest='strip_comments_keep',
+        metavar='CATEGORY',
+        action='append',
+        default=None,
+        choices=['hint', 'ordinary', 'all', 'none'],
+        help='comment categories --strip-comments keeps, CHOICE is one of '
+             '"hint", "ordinary", "all", "none" (default: "hint"). '
+             'Can be repeated.')
+
+    group.add_argument(
+        '--strip-comments-keep-prefix',
+        dest='strip_comments_keep_prefixes',
+        metavar='PREFIX',
+        action='append',
+        default=None,
+        help='keep comments starting with PREFIX, e.g. a collector marker. '
+             'Can be repeated.')
+
+    group.add_argument(
         '-r', '--reindent',
         dest='reindent',
         action='store_true',
@@ -195,6 +215,10 @@ def _process_file(filename, args):
     # Format the SQL before opening the destination. Opening it truncates
     # the file, so a formatting error would otherwise leave it empty.
     formatter_opts = vars(args)
+    if formatter_opts.get('strip_comments_keep') or \
+            formatter_opts.get('strip_comments_keep_prefixes'):
+        # Selecting what to keep only makes sense while stripping.
+        formatter_opts['strip_comments'] = True
     try:
         formatter_opts = sqlparse.formatter.validate_options(formatter_opts)
     except SQLParseError as e:

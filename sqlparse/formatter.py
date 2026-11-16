@@ -9,6 +9,81 @@
 
 from sqlparse import filters
 from sqlparse.exceptions import SQLParseError
+from sqlparse.filters.others import KEEP_CATEGORIES
+
+
+def _validate_keep_comments(value):
+    """Validates the ``strip_comments_keep`` option.
+
+    Accepts a single category or an iterable of categories.  ``'hint'`` and
+    ``'ordinary'`` may be combined; the whole set (everything) and the empty
+    set (nothing) are accepted as the strings ``'all'`` and ``'none'``.
+    Returns a tuple of categories to keep.
+    """
+    if isinstance(value, str):
+        value = (value,)
+    try:
+        items = list(value)
+    except TypeError:
+        raise SQLParseError('Invalid value for strip_comments_keep: '
+                            f'{value!r}') from None
+
+    keep = set()
+    has_all = has_none = False
+    for item in items:
+        if not isinstance(item, str):
+            raise SQLParseError('Invalid value for strip_comments_keep: '
+                                f'{value!r}')
+        item = item.lower()
+        if item == 'all':
+            has_all = True
+        elif item == 'none':
+            has_none = True
+        elif item in KEEP_CATEGORIES:
+            keep.add(item)
+        else:
+            raise SQLParseError('Invalid value for strip_comments_keep: '
+                                f'{value!r}')
+    if has_all and has_none:
+        raise SQLParseError('Invalid value for strip_comments_keep: '
+                            f'{value!r}')
+    if has_all:
+        if keep:
+            raise SQLParseError('Invalid value for strip_comments_keep: '
+                                f'{value!r}')
+        return tuple(KEEP_CATEGORIES)
+    if has_none and keep:
+        raise SQLParseError('Invalid value for strip_comments_keep: '
+                            f'{value!r}')
+    # Canonical order keeps the option comparable and stable.
+    return tuple(c for c in KEEP_CATEGORIES if c in keep)
+
+
+def _validate_comment_prefixes(value):
+    """Validates the ``strip_comments_keep_prefixes`` option."""
+    if value is None:
+        return ()
+    if isinstance(value, str):
+        value = (value,)
+    try:
+        items = list(value)
+    except TypeError:
+        raise SQLParseError('Invalid value for strip_comments_keep_prefixes: '
+                            f'{value!r}') from None
+    for item in items:
+        if not isinstance(item, str):
+            raise SQLParseError('Invalid value for '
+                                'strip_comments_keep_prefixes: '
+                                f'{value!r}')
+        if not item.strip():
+            raise SQLParseError('Invalid value for '
+                                'strip_comments_keep_prefixes: '
+                                'prefixes must not be empty')
+        if '\n' in item or '\r' in item:
+            raise SQLParseError('Invalid value for '
+                                'strip_comments_keep_prefixes: '
+                                'prefixes must be single-line')
+    return tuple(items)
 
 
 def validate_options(options):
@@ -32,6 +107,24 @@ def validate_options(options):
     if strip_comments not in [True, False]:
         raise SQLParseError('Invalid value for strip_comments: '
                             f'{strip_comments!r}')
+
+    keep_given = options.get('strip_comments_keep') is not None
+    keep = options.get('strip_comments_keep')
+    if keep is None:
+        # Historical behaviour: only SQL hints survive (issue262).
+        keep = ('hint',)
+    options['strip_comments_keep'] = _validate_keep_comments(keep)
+
+    prefixes = options.get('strip_comments_keep_prefixes')
+    options['strip_comments_keep_prefixes'] = \
+        _validate_comment_prefixes(prefixes)
+
+    # Selecting the categories to keep is only meaningful together with
+    # comment stripping, so requesting it implies the filter.  The default
+    # does not: plain format() must leave comments untouched.
+    if 'strip_comments' not in options and (
+            keep_given or options['strip_comments_keep_prefixes']):
+        options['strip_comments'] = True
 
     space_around_operators = options.get('use_space_around_operators', False)
     if space_around_operators not in [True, False]:
@@ -160,8 +253,14 @@ def build_filter_stack(stack, options):
 
     # After grouping
     if options.get('strip_comments'):
+        keep = options.get('strip_comments_keep')
+        if keep is None:
+            # Historical behaviour: only SQL hints survive (issue262).
+            keep = ('hint',)
         stack.enable_grouping()
-        stack.stmtprocess.append(filters.StripCommentsFilter())
+        stack.stmtprocess.append(filters.StripCommentsFilter(
+            keep=keep,
+            prefixes=options.get('strip_comments_keep_prefixes') or ()))
 
     if options.get('strip_whitespace') or options.get('reindent'):
         stack.enable_grouping()

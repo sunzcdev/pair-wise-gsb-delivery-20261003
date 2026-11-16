@@ -235,3 +235,93 @@ def test_cli_outfile_keeps_file_on_format_error(tmpdir, capsys):
     assert out_file.read() == "select 1"
     _, err = capsys.readouterr()
     assert err.startswith("[ERROR] Failed to format")
+
+
+def test_cli_strip_comments_keeps_hints_by_default(tmpdir, capsys):
+    sql = "select a /* note */ /*+full(t)*/ from t\n"
+    test_file = tmpdir.join("test.sql")
+    test_file.write(sql)
+
+    result = sqlparse.cli.main([str(test_file), '--strip-comments'])
+
+    assert result == 0
+    out, _ = capsys.readouterr()
+    assert out == "select a /*+full(t)*/ from t\n"
+
+
+def test_cli_strip_comments_keep_none(tmpdir, capsys):
+    sql = "select a /* note */ /*+full(t)*/ from t\n"
+    test_file = tmpdir.join("test.sql")
+    test_file.write(sql)
+
+    result = sqlparse.cli.main(
+        [str(test_file), '--strip-comments', '--strip-comments-keep', 'none'])
+
+    assert result == 0
+    out, _ = capsys.readouterr()
+    assert out == "select a from t\n"
+
+
+def test_cli_strip_comments_keep_prefix(tmpdir, capsys):
+    sql = "select a /* @etl:job */ /* note */ from t\n"
+    test_file = tmpdir.join("test.sql")
+    test_file.write(sql)
+
+    result = sqlparse.cli.main([
+        str(test_file), '--strip-comments', '--strip-comments-keep', 'none',
+        '--strip-comments-keep-prefix', '@etl:'])
+
+    assert result == 0
+    out, _ = capsys.readouterr()
+    assert out == "select a /* @etl:job */ from t\n"
+
+
+def test_cli_strip_comments_keep_repeated(tmpdir, capsys):
+    sql = "select a /* note */ /*+full(t)*/ from t\n"
+    test_file = tmpdir.join("test.sql")
+    test_file.write(sql)
+
+    result = sqlparse.cli.main([
+        str(test_file), '--strip-comments',
+        '--strip-comments-keep', 'hint',
+        '--strip-comments-keep', 'ordinary'])
+
+    assert result == 0
+    out, _ = capsys.readouterr()
+    assert out == sql
+
+
+def test_cli_strip_comments_keep_invalid_choice(tmpdir):
+    test_file = tmpdir.join("test.sql")
+    test_file.write("select 1\n")
+
+    with pytest.raises(SystemExit):
+        sqlparse.cli.main(
+            [str(test_file), '--strip-comments', '--strip-comments-keep',
+             'bogus'])
+
+
+def test_cli_strip_comments_keep_implies_strip(tmpdir, capsys):
+    sql = "select a /* note */ /*+full(t)*/ from t\n"
+    test_file = tmpdir.join("test.sql")
+    test_file.write(sql)
+
+    result = sqlparse.cli.main(
+        [str(test_file), '--strip-comments-keep', 'none'])
+
+    assert result == 0
+    out, _ = capsys.readouterr()
+    assert out == "select a from t\n"
+
+
+def test_cli_strip_comments_keep_prefix_implies_strip(tmpdir, capsys):
+    sql = "select a /* @etl:job */ /* note */ from t\n"
+    test_file = tmpdir.join("test.sql")
+    test_file.write(sql)
+
+    result = sqlparse.cli.main(
+        [str(test_file), '--strip-comments-keep-prefix', '@etl:'])
+
+    assert result == 0
+    out, _ = capsys.readouterr()
+    assert out == "select a /* @etl:job */ from t\n"

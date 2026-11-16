@@ -33,7 +33,25 @@ The :meth:`~sqlparse.format` function accepts the following keyword arguments.
   and "capitalize".
 
 ``strip_comments``
-  If ``True`` comments are removed from the statements.
+  If ``True`` comments are removed from the statements.  By default SQL
+  hints (``/*+ ... */`` and ``--+ ...``) are kept; see
+  ``strip_comments_keep``.
+
+``strip_comments_keep`` (default: "hint")
+  Selects which comment categories survive ``strip_comments``.  Allowed
+  values are ``"hint"`` (SQL hints such as ``/*+full(t)*/``), ``"ordinary"``
+  (plain explanatory comments), ``"all"`` and ``"none"``.  ``"hint"`` and
+  ``"ordinary"`` may also be given together as a sequence.  Setting this
+  option turns on ``strip_comments``.  Comments that are kept stay at the
+  position they were written in, also after ``reindent``.
+
+``strip_comments_keep_prefixes`` (default: none)
+  A sequence of marker prefixes.  Comments whose text starts with one of
+  them are kept even when their category is not selected, which lets a
+  collector tag its own comments (e.g. ``["@etl:"]``).  Comment delimiters,
+  surrounding blanks and case are ignored in the prefix.  Only real comment
+  tokens are matched: look-alike text inside a string literal, a quoted
+  identifier or a dollar-quoted block is not a marker and is left alone.
 
 ``truncate_strings``
   If ``truncate_strings`` is a positive integer, string literals longer than

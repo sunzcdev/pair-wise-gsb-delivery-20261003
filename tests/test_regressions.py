@@ -372,7 +372,6 @@ def test_issue469_copy_as_psql_command():
     assert formatted == '\\copy SELECT * FROM Foo'
 
 
-@pytest.mark.xfail(reason='Needs to be fixed')
 def test_issue484_comments_and_newlines():
     formatted = sqlparse.format('\n'.join([
         'Create table myTable',

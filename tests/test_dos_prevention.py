@@ -131,3 +131,24 @@ def test_unterminated_quotes_format_under_1s():
         sqlparse.format(sql)
         dt = time.perf_counter() - t0
         assert dt < 1.0, f'format took {dt:.2f}s, expected sub-second'
+
+
+def test_strip_comments_scales_linearly():
+    """Stripping many comments must not be quadratic.
+
+    Removing one comment at a time from the middle of a token list shifts
+    every following token, and looking up a comment's neighbour by walking
+    up the parent chain re-scans the list.  Either makes input that
+    consists mostly of comments cost O(n**2).  Compare two sizes: linear
+    work grows with the factor 4, quadratic work with 16.
+    """
+    def elapsed(count):
+        stmt = sqlparse.parse('-- c\n' * count + 'select 1')[0]
+        t0 = time.perf_counter()
+        sqlparse.filters.StripCommentsFilter(keep='none').process(stmt)
+        return time.perf_counter() - t0
+
+    small = min(elapsed(1500) for _ in range(3))
+    large = min(elapsed(6000) for _ in range(3))
+    assert large < small * 8, (
+        f'4x input took {large / small:.1f}x the time, expected linear growth')
