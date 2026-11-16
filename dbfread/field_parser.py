@@ -6,6 +6,7 @@ import datetime
 import struct
 from decimal import Decimal
 from .memo import BinaryMemo
+from .exceptions import MEMO_ERRORS, MemoReferenceInvalid
 
 PY2 = sys.version_info[0] == 2
 
@@ -77,7 +78,14 @@ class FieldParser:
         except KeyError:
             raise ValueError('Unknown field type: {!r}'.format(field.type))
         else:
-            return func(field, data)
+            try:
+                return func(field, data)
+            except MEMO_ERRORS as error:
+                # Attach the field name so the error can be traced
+                # back to the offending DBF field.
+                if error.field is None:
+                    error.field = getattr(field, 'name', None)
+                raise
 
     def parse0(self, field, data):
         """Parse flags field and return as byte string"""
@@ -137,7 +145,11 @@ class FieldParser:
                 if data.strip(b' \x00') == b'':
                     return 0
                 else:
-                    raise ValueError(
+                    # A malformed reference is a memo error so it gets
+                    # the field name and record number attached like
+                    # the other memo errors. It still subclasses
+                    # ValueError for backwards compatibility.
+                    raise MemoReferenceInvalid(
                         'Memo index is not an integer: {!r}'.format(data))
 
     def parseM(self, field, data):

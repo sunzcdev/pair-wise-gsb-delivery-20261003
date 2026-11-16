@@ -141,9 +141,44 @@ exception. If you still want the rest of the data you can pass
 returned as ``None``, as would be the case if there was no memo.
 
 dbfread has full support for Visual FoxPro (``.FPT``) and dBase III
-(``.DBT``) memo files. It reads dBase IV (also ``.DBT``) memo files,
-but only if they use the default block size of 512 bytes. (This will
-be fixed if I can find more files to study.)
+(``.DBT``) memo files. It also reads dBase IV (also ``.DBT``) memo
+files, using the block size stored in the file header.
+
+Each format has its own block size and its own way of ending a memo,
+and dbfread follows them separately: dBase III uses fixed 512 byte
+blocks and a ``'\x1a'`` terminator; dBase IV and Visual FoxPro store
+the block size in the memo file header and store the memo length in
+each block header, so their binary memos are never cut short at a
+terminator byte.
+
+By default memo references are read leniently, the way older versions
+of dbfread did. If you pass ``strict_memo=True`` the block numbers
+read from the DBF file are checked before they are followed, and a
+specific exception is raised if something is wrong:
+
+* ``MemoBlockOutOfRange`` -- the block number is negative or starts
+  outside the memo file.
+* ``MemoHeaderCorrupt`` -- the block header is incomplete or contains
+  invalid values.
+* ``MemoTruncated`` -- the memo body ends before the declared length
+  (or, for dBase III, before the terminator).
+* ``MemoReferenceInvalid`` -- the reference itself is not a number
+  (this is also a ``ValueError``, as before).
+
+An empty reference (block number 0) is not an error and returns
+``None`` in both modes. ``MemoBlockOutOfRange``, ``MemoHeaderCorrupt``
+and ``MemoTruncated`` are subclasses of ``MemoError`` (which again
+subclasses ``IOError``). ``MemoReferenceInvalid`` is a ``ValueError``
+and is not a ``MemoError``. All of them carry ``record``, ``field`` and
+``block`` attributes where applicable, so the error can be traced back
+to the DBF record and field it came from. In strict mode the memo
+length stored in the block header (Visual FoxPro and dBase IV) is
+authoritative, so binary memos are never cut short by terminator
+bytes.
+
+The same block can be referenced by several records, and every read
+seeks to an absolute position first. A failed read therefore never
+leaves a stale cursor behind for the next, independent memo read.
 
 
 Record Factories

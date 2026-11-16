@@ -7,6 +7,24 @@ Release History
 (Next Version)
 ^^^^^^^^^^^^^^^^^^
 
+* added ``strict_memo`` option. When ``True`` memo block references
+  from the DBF file are validated before they are followed:
+  ``MemoBlockOutOfRange`` (negative or out of range block number),
+  ``MemoHeaderCorrupt`` (incomplete or invalid block header),
+  ``MemoTruncated`` (memo body shorter than its declared length) and
+  ``MemoReferenceInvalid`` (reference is not a number). The first
+  three are subclasses of ``MemoError``; ``MemoReferenceInvalid`` is a
+  ``ValueError`` as before. All carry ``record``, ``field`` and
+  ``block`` attributes. The default ``False`` keeps the previous
+  lenient behaviour.
+
+* the dBase IV memo reader now uses the block size stored in the DBT
+  file header instead of assuming 512 bytes.
+
+* strict mode reads dBase IV and Visual FoxPro memos by the length in
+  the block header, so binary memos containing ``'\x1a'`` or
+  ``'\x1f'`` are no longer cut short.
+
 * records are now returned ``dict`` instead of ``collections.OrderedDict``
   in Python 3.7 and up (as well as CPython 3.6) since normal Python
   dictionaries are now ordered.
