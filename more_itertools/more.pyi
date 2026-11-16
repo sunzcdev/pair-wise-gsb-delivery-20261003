@@ -33,6 +33,8 @@ from _typeshed import (
 
 __all__ = [
     'AbortThread',
+    'BookmarkExpired',
+    'BookmarkNotYetRead',
     'SequenceView',
     'adjacent',
     'all_unique',
@@ -40,6 +42,7 @@ __all__ = [
     'always_reversible',
     'argmax',
     'argmin',
+    'bookmark',
     'bucket',
     'callback_iter',
     'chunked',
@@ -631,6 +634,19 @@ class SequenceView(Generic[_T_co], Sequence[_T_co]):
     def __getitem__(self, index: slice) -> Sequence[_T_co]: ...
     def __len__(self) -> int: ...
 
+class BookmarkExpired(LookupError):
+    index: int
+    def __init__(self, index: int) -> None: ...
+
+class BookmarkNotYetRead(LookupError):
+    index: int
+    def __init__(self, index: int) -> None: ...
+
+class bookmark(int):
+    def __new__(cls, index: int) -> Self: ...
+    @property
+    def index(self) -> int: ...
+
 class seekable(Generic[_T_co], Iterator[_T_co]):
     def __init__(
         self, iterable: Iterable[_T_co], maxlen: int | None = ...
@@ -645,6 +661,11 @@ class seekable(Generic[_T_co], Iterator[_T_co]):
     def elements(self) -> SequenceView[_T_co]: ...
     def seek(self, index: int) -> None: ...
     def relative_seek(self, count: int) -> None: ...
+    @overload
+    def bookmark(self) -> bookmark: ...
+    @overload
+    def bookmark(self, index: int) -> bookmark: ...
+    def restore(self, mark: bookmark | int) -> int: ...
     def __getitem__(self, index: int) -> _T_co: ...
 
 class run_length:

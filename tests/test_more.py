@@ -3927,6 +3927,250 @@ class SeekableTest(PeekableMixinTests, TestCase):
         self.assertEqual(s[-1], '4')
         self.assertEqual(s[0], '3')
 
+    def test_bookmark_index_is_absolute(self):
+        s = mi.seekable((str(n) for n in range(10)), maxlen=4)
+        self.assertEqual(s.bookmark().index, 0)
+        mi.take(6, s)
+        self.assertEqual(s.bookmark().index, 6)
+        # ``seek`` is cache-relative, so seek(1) moves to the second retained
+        # item, which is absolute position 3.
+        self.assertEqual(list(s.elements()), ['2', '3', '4', '5'])
+        s.seek(1)
+        self.assertEqual(next(s), '3')
+        self.assertEqual(s.bookmark().index, 4)
+        # A bookmark names a position in the source, not in the cache.
+        self.assertEqual(s.bookmark(0).index, 0)
+        self.assertEqual(s.bookmark(7).index, 7)
+        self.assertEqual(repr(s.bookmark(7)), 'bookmark(7)')
+        self.assertEqual(s.bookmark(1), s.bookmark(1))
+        self.assertNotEqual(s.bookmark(1), s.bookmark(2))
+        self.assertEqual(len({s.bookmark(1), s.bookmark(1)}), 1)
+
+    def test_bookmark_rejects_bad_indexes(self):
+        self.assertRaises(TypeError, lambda: mi.bookmark('1'))
+        self.assertRaises(TypeError, lambda: mi.bookmark(1.0))
+        self.assertRaises(TypeError, lambda: mi.bookmark(True))
+        self.assertRaises(ValueError, lambda: mi.bookmark(-1))
+
+    def test_bookmark_restores_retained_position(self):
+        s = mi.seekable((str(n) for n in count()), maxlen=3)
+        self.assertEqual(mi.take(3, s), ['0', '1', '2'])
+        mark = s.bookmark()
+        self.assertEqual(mark.index, 3)
+        self.assertEqual(mi.take(3, s), ['3', '4', '5'])
+        self.assertEqual(list(s.elements()), ['3', '4', '5'])
+        # '3' is still cached, so the absolute bookmark is still usable.
+        self.assertEqual(s.restore(mark), 3)
+        self.assertEqual(next(s), '3')
+
+    def test_bookmark_restore_does_not_shift_to_cache_left_edge(self):
+        s = mi.seekable((str(n) for n in count()), maxlen=2)
+        old = s.bookmark()
+        self.assertEqual(mi.take(3, s), ['0', '1', '2'])
+        # The cache's left edge is now '1', but the old bookmark is not
+        # silently remapped onto it.
+        self.assertEqual(list(s.elements()), ['1', '2'])
+        with self.assertRaises(mi.BookmarkExpired):
+            s.restore(old)
+        # A failed restore leaves the iteration position alone.
+        self.assertEqual(next(s), '3')
+
+    def test_bookmark_not_yet_read(self):
+        s = mi.seekable(str(n) for n in range(4))
+        ahead = s.bookmark(2)
+        with self.assertRaises(mi.BookmarkNotYetRead):
+            s.restore(ahead)
+        self.assertEqual(mi.take(2, s), ['0', '1'])
+        self.assertEqual(s.restore(ahead), 2)
+        self.assertEqual(next(s), '2')
+
+    def test_bookmark_boundaries(self):
+        s = mi.seekable((str(n) for n in range(4)), maxlen=2)
+        start = s.bookmark()
+        self.assertEqual(start.index, 0)
+        self.assertEqual(s.restore(start), 0)
+        self.assertEqual(next(s), '0')
+        # A bookmark at the read frontier is restorable once the frontier is
+        # reached, and reading resumes from the source.
+        mi.consume(s)
+        end = s.bookmark()
+        self.assertEqual(end.index, 4)
+        self.assertEqual(s.restore(end), 4)
+        self.assertEqual(list(s), [])
+        # The retained window is [2, 4], so 2 is restorable and 1 is not.
+        self.assertEqual(s.restore(2), 2)
+        self.assertEqual(next(s), '2')
+        with self.assertRaises(mi.BookmarkExpired):
+            s.restore(1)
+
+    def test_restore_accepts_plain_index(self):
+        s = mi.seekable((str(n) for n in range(6)), maxlen=3)
+        mi.consume(s)
+        self.assertEqual(s.restore(4), 4)
+        self.assertEqual(next(s), '4')
+
+    def test_bookmark_relative_seek_share_coordinates(self):
+        s = mi.seekable((str(n) for n in count()), maxlen=2)
+        self.assertEqual(mi.take(4, s), ['0', '1', '2', '3'])
+        # A backward relative seek stops at the oldest retained item, which is
+        # absolute position 2, not zero.
+        s.relative_seek(-10)
+        self.assertEqual(s.bookmark().index, 2)
+        self.assertEqual(next(s), '2')
+        self.assertEqual(s.peek(), '3')
+        # peek restores the position it looked at, in the same coordinates.
+        self.assertEqual(s.bookmark().index, 3)
+
+    def test_relative_seek_forward_from_retained_position(self):
+        s = mi.seekable((str(n) for n in count()), maxlen=2)
+        self.assertEqual(mi.take(5, s), ['0', '1', '2', '3', '4'])
+        s.restore(3)
+        s.relative_seek(1)
+        self.assertEqual(s.bookmark().index, 4)
+        self.assertEqual(next(s), '4')
+
+    def test_bookmark_does_not_keep_evicted_items_alive(self):
+        refs = []
+
+        class Item:
+            pass
+
+        def items():
+            for _ in range(4):
+                item = Item()
+                refs.append(weakref.ref(item))
+                yield item
+
+        s = mi.seekable(items(), maxlen=2)
+        mark = s.bookmark()
+        mi.consume(s)
+        gc.collect()
+        # The two evicted items are gone even though a bookmark exists.
+        alive = [ref() is not None for ref in refs]
+        self.assertEqual(alive, [False, False, True, True])
+        with self.assertRaises(mi.BookmarkExpired):
+            s.restore(mark)
+        self.assertEqual(len(list(s.elements())), 2)
+
+    def test_source_error_does_not_move_read_position(self):
+        class Flaky:
+            def __init__(self, values):
+                self.values = iter(values)
+
+            def __iter__(self):
+                return self
+
+            def __next__(self):
+                value = next(self.values)
+                if value == 'fail':
+                    raise RuntimeError('boom')
+                return value
+
+        s = mi.seekable(Flaky(['a', 'fail', 'b']))
+        self.assertEqual(next(s), 'a')
+        self.assertEqual(s.bookmark().index, 1)
+        with self.assertRaises(RuntimeError):
+            next(s)
+        self.assertEqual(s.bookmark().index, 1)
+        # The failing read did not add anything to the cache.
+        self.assertEqual(list(s.elements()), ['a'])
+        # A position at the successfully read frontier is not "not yet read".
+        self.assertEqual(s.restore(1), 1)
+
+    def test_bookmark_maxlen_zero(self):
+        s = mi.seekable([10, 20, 30], maxlen=0)
+        self.assertEqual(s.bookmark().index, 0)
+        with self.assertRaises(mi.BookmarkNotYetRead):
+            s.restore(s.bookmark(1))
+        self.assertEqual(s.peek(), 10)
+        self.assertEqual(s.bookmark().index, 0)
+        self.assertEqual(list(s), [10, 20, 30])
+        self.assertEqual(s.bookmark().index, 3)
+        self.assertEqual(list(s.elements()), [])
+        # Nothing is retained, so only the read frontier itself is restorable.
+        self.assertEqual(s.restore(3), 3)
+        with self.assertRaises(mi.BookmarkExpired):
+            s.restore(2)
+
+    def test_bookmark_unbounded_matches_seek(self):
+        s = mi.seekable(str(n) for n in range(10))
+        mi.consume(s, 5)
+        mark = s.bookmark()
+        self.assertEqual(list(s), ['5', '6', '7', '8', '9'])
+        self.assertEqual(s.restore(mark), 5)
+        s.seek(5)  # The same position, expressed as a cache index.
+        self.assertEqual(next(s), '5')
+        self.assertEqual(s.restore(0), 0)
+        self.assertEqual(next(s), '0')
+
+    def test_bookmark_after_negative_cache_index(self):
+        s = mi.seekable((str(n) for n in range(10)), maxlen=3)
+        mi.consume(s, 5)
+        s.seek(-1)  # Negative indexes address the cache from the right.
+        self.assertEqual(s.bookmark().index, 4)
+        s.seek(-2)
+        self.assertEqual(next(s), '3')
+        self.assertEqual(s.bookmark().index, 4)
+
+    def test_restore_never_reads_ahead(self):
+        pulled = []
+
+        def source():
+            for n in range(5):
+                pulled.append(n)
+                yield n
+
+        s = mi.seekable(source())
+        mi.consume(s, 2)
+        self.assertEqual(pulled, [0, 1])
+        # Restoring a not-yet-read position must not consume the source for
+        # the caller; it only reports the failure.
+        with self.assertRaises(mi.BookmarkNotYetRead):
+            s.restore(4)
+        self.assertEqual(pulled, [0, 1])
+        self.assertEqual(next(s), 2)
+        self.assertEqual(pulled, [0, 1, 2])
+
+    def test_bookmark_survives_multiple_restores(self):
+        s = mi.seekable((str(n) for n in count()), maxlen=3)
+        mi.consume(s, 2)
+        mark = s.bookmark()
+        self.assertEqual(s.restore(mark), 2)
+        self.assertEqual(mi.take(2, s), ['2', '3'])
+        # Still within the retained window, so the same bookmark works again.
+        self.assertEqual(s.restore(mark), 2)
+        self.assertEqual(next(s), '2')
+
+    def test_bookmark_is_exported(self):
+        self.assertIs(mi.bookmark, type(mi.seekable([]).bookmark()))
+        self.assertTrue(issubclass(mi.BookmarkExpired, Exception))
+        self.assertTrue(issubclass(mi.BookmarkNotYetRead, Exception))
+        for name in ('bookmark', 'BookmarkExpired', 'BookmarkNotYetRead'):
+            self.assertIn(name, mi.more.__all__)
+
+    def test_bookmark_exceptions_carry_index(self):
+        s = mi.seekable([0, 1, 2], maxlen=1)
+        mi.consume(s)
+        with self.assertRaises(mi.BookmarkExpired) as caught:
+            s.restore(1)
+        self.assertEqual(caught.exception.index, 1)
+
+        s = mi.seekable([0, 1, 2])
+        with self.assertRaises(mi.BookmarkNotYetRead) as caught:
+            s.restore(2)
+        self.assertEqual(caught.exception.index, 2)
+
+    def test_bookmark_survives_round_trip_as_integer(self):
+        s = mi.seekable([0, 1, 2, 3, 4], maxlen=3)
+        mi.consume(s, 4)
+        mark = s.bookmark()
+        self.assertIsInstance(mark, int)
+        self.assertEqual(int(mark), 4)
+        self.assertEqual(mark, 4)
+        # A plain integer round-trips through storage just like a bookmark.
+        self.assertEqual(s.restore(int(mark)), 4)
+        self.assertEqual(list(s), [4])
+
 
 class SequenceViewTests(TestCase):
     def test_init(self):

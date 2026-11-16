@@ -51,6 +51,9 @@ These tools peek at an iterable's values without advancing it.
 .. autofunction:: spy
 .. autoclass:: peekable
 .. autoclass:: seekable
+.. autoclass:: bookmark
+.. autoexception:: BookmarkExpired
+.. autoexception:: BookmarkNotYetRead
 
 
 Windowing

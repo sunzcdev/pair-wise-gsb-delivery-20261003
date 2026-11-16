@@ -60,6 +60,8 @@ from .recipes import (
 
 __all__ = [
     'AbortThread',
+    'BookmarkExpired',
+    'BookmarkNotYetRead',
     'SequenceView',
     'adjacent',
     'all_unique',
@@ -67,6 +69,7 @@ __all__ = [
     'always_reversible',
     'argmax',
     'argmin',
+    'bookmark',
     'bucket',
     'callback_iter',
     'chunked',
@@ -2995,6 +2998,72 @@ class SequenceView(Sequence):
         return f'{self.__class__.__name__}({self._target!r})'
 
 
+class BookmarkExpired(LookupError):
+    """Raised by :meth:`seekable.restore` when the items at a bookmark's
+    absolute position have already been evicted from a bounded cache.
+
+    The bookmark is still meaningful: it names the same position in the source
+    iterable. That position simply cannot be revisited, and it must not be
+    confused with the left edge of the cache, which moves as items are evicted.
+
+    The evicted absolute position is available as the :attr:`index` attribute.
+
+    """
+
+    def __init__(self, index):
+        super().__init__(
+            f'bookmark at index {index} was evicted from the cache'
+        )
+        self.index = index
+
+
+class BookmarkNotYetRead(LookupError):
+    """Raised by :meth:`seekable.restore` when a bookmark's absolute position
+    lies beyond the part of the source iterable that has been read so far.
+
+    Reading more items from the source may make the bookmark restorable, but
+    restoring cannot read ahead on the caller's behalf. The unread absolute
+    position is available as the :attr:`index` attribute.
+
+    """
+
+    def __init__(self, index):
+        super().__init__(f'bookmark at index {index} has not been read yet')
+        self.index = index
+
+
+class bookmark(int):
+    """An absolute position in a :class:`seekable` source iterable.
+
+    Create one with :meth:`seekable.bookmark`. A bookmark is the number of
+    items between the start of the source iterable and the position it names,
+    so it can be saved as a plain integer (and it compares equal to one). That
+    number keeps its meaning when a bounded cache evicts older items. A
+    bookmark holds only the number: it keeps no items alive, so it never
+    prevents eviction and never resurrects an item that has already been
+    evicted.
+
+    """
+
+    __slots__ = ()
+
+    def __new__(cls, index):
+        if isinstance(index, bool) or not isinstance(index, int):
+            raise TypeError('bookmark index must be an integer')
+        if index < 0:
+            raise ValueError('bookmark index must be non-negative')
+        return super().__new__(cls, index)
+
+    @property
+    def index(self):
+        """The absolute index of this bookmark, counted from the start of the
+        source iterable."""
+        return int(self)
+
+    def __repr__(self):
+        return f'{self.__class__.__name__}({int(self)})'
+
+
 class seekable:
     """Wrap an iterator to allow for seeking backward and forward. This
     progressively caches the items in the source iterable so they can be
@@ -3104,6 +3173,105 @@ class seekable:
         >>> next(it)
         '6'
 
+    A bounded cache evicts items from its left edge, so indexes into the cache
+    drift away from positions in the source iterable. To remember a lookback
+    position that survives eviction, use :meth:`bookmark`. It records an
+    absolute position: the number of items between the start of the source
+    iterable and the position being remembered. That number does not change
+    when old items are evicted:
+
+        >>> from itertools import count
+        >>> it = seekable((str(n) for n in count()), maxlen=3)
+        >>> next(it), next(it), next(it)
+        ('0', '1', '2')
+        >>> mark = it.bookmark()
+        >>> mark
+        bookmark(3)
+        >>> next(it), next(it), next(it)
+        ('3', '4', '5')
+        >>> list(it.elements())
+        ['3', '4', '5']
+        >>> it.restore(mark)  # '3' is still cached
+        3
+        >>> next(it)
+        '3'
+
+    :meth:`restore` distinguishes three cases by comparing the bookmark with
+    the range that has actually been read and is still cached. A retained
+    position is restored, as above. A position whose items have been evicted
+    raises :class:`BookmarkExpired`; the left edge of the cache is not
+    treated as a new zero point:
+
+        >>> it = seekable((str(n) for n in count()), maxlen=2)
+        >>> old = it.bookmark()
+        >>> next(it), next(it), next(it)
+        ('0', '1', '2')
+        >>> it.restore(old)  # doctest: +IGNORE_EXCEPTION_DETAIL
+        Traceback (most recent call last):
+          ...
+        BookmarkExpired: bookmark at index 0 was evicted from the cache
+
+    A bookmark may also name a position that has not been read from the source
+    yet; :meth:`restore` raises :class:`BookmarkNotYetRead` until enough items
+    have been read:
+
+        >>> it = seekable(str(n) for n in range(4))
+        >>> ahead = it.bookmark(2)
+        >>> it.restore(ahead)  # doctest: +IGNORE_EXCEPTION_DETAIL
+        Traceback (most recent call last):
+          ...
+        BookmarkNotYetRead: bookmark at index 2 has not been read yet
+        >>> next(it), next(it)
+        ('0', '1')
+        >>> it.restore(ahead)
+        2
+        >>> next(it)
+        '2'
+
+    :meth:`bookmark`, :meth:`restore`, :meth:`peek`, and
+    :meth:`relative_seek` share these absolute positions. In particular, a
+    backward relative seek stops at the oldest retained item instead of
+    pretending that the cache starts at zero:
+
+        >>> it = seekable((str(n) for n in count()), maxlen=2)
+        >>> next(it), next(it), next(it), next(it)
+        ('0', '1', '2', '3')
+        >>> it.relative_seek(-10)
+        >>> it.peek()
+        '2'
+        >>> it.bookmark()
+        bookmark(2)
+
+    (:meth:`seek` keeps its original meaning: its indexes are counted from the
+    left edge of the cache, so ``seek(0)`` moves to the oldest cached item.)
+
+    As more items are read, eviction shrinks the retained range and old
+    bookmarks expire accordingly. A bookmark holds only its index, so it
+    neither prevents eviction nor keeps evicted items alive. An error raised
+    by the source iterable does not move the successfully read position:
+
+        >>> class Flaky:
+        ...     def __init__(self, items):
+        ...         self.items = iter(items)
+        ...     def __iter__(self):
+        ...         return self
+        ...     def __next__(self):
+        ...         item = next(self.items)
+        ...         if item == 'fail':
+        ...             raise RuntimeError('boom')
+        ...         return item
+        >>> it = seekable(Flaky(['a', 'fail']))
+        >>> next(it)
+        'a'
+        >>> it.bookmark()
+        bookmark(1)
+        >>> next(it)
+        Traceback (most recent call last):
+          ...
+        RuntimeError: boom
+        >>> it.bookmark()
+        bookmark(1)
+
     """
 
     def __init__(self, iterable, maxlen=None):
@@ -3116,6 +3284,10 @@ class seekable:
         else:
             self._cache = deque([], maxlen)
         self._index = None
+        # Absolute index of the next item to be read from the source. It only
+        # advances after a successful read, so a raising source leaves the
+        # successfully read position in place.
+        self._frontier = 0
 
     def __iter__(self):
         return self
@@ -3131,6 +3303,7 @@ class seekable:
                 return item
 
         item = next(self._source)
+        self._frontier += 1
         self._cache.append(item)
         return item
 
@@ -3159,19 +3332,98 @@ class seekable:
         return SequenceView(self._cache)
 
     def seek(self, index):
-        self._index = index
         remainder = index - len(self._cache)
         if remainder > 0:
+            self._index = None
             consume(self, remainder)
+        else:
+            self._index = index
 
     def relative_seek(self, count):
-        if self._index is None:
-            self._index = len(self._cache)
+        # Relative positions are measured against the current cache index; the
+        # lower bound is the oldest retained item, not an assumed zero.
+        offset = self._offset()
+        index = len(self._cache) if self._index is None else self._index
+        self._seek_absolute(offset + max(index + count, 0))
 
-        self.seek(max(self._index + count, 0))
+    def bookmark(self, index=None):
+        """Return a :class:`bookmark` for an absolute position in the source
+        iterable. Without *index*, the bookmark names the current position.
+
+        Absolute positions count items from the start of the source iterable,
+        so cache eviction does not change them. The returned bookmark stores
+        only the position number; it keeps no items alive.
+
+        >>> it = seekable(str(n) for n in range(5))
+        >>> next(it), next(it)
+        ('0', '1')
+        >>> mark = it.bookmark()
+        >>> next(it), next(it)
+        ('2', '3')
+        >>> it.restore(mark)
+        2
+        >>> next(it)
+        '2'
+
+        """
+        if index is None:
+            return bookmark(self._absolute_position())
+        return bookmark(index)
+
+    def restore(self, mark):
+        """Seek to an absolute position recorded by :meth:`bookmark`.
+
+        Return the absolute index, leaving the iterator positioned there.
+        Raise :class:`BookmarkNotYetRead` if *mark* is beyond the items read
+        from the source so far, and :class:`BookmarkExpired` if the items at
+        *mark* have been evicted from a bounded cache. A plain integer is
+        accepted and treated as an absolute index.
+
+        """
+        if not isinstance(mark, bookmark):
+            mark = bookmark(mark)
+        index = mark.index
+        if index > self._frontier:
+            raise BookmarkNotYetRead(index)
+        if index < self._offset():
+            raise BookmarkExpired(index)
+        self._index = index - self._offset()
+        if self._index == len(self._cache):
+            self._index = None
+        return index
 
     def __getitem__(self, index):
         return self._cache[index]
+
+    def _offset(self):
+        # Absolute index of the oldest item that is still cached. It stays
+        # zero for an unbounded (or zero-length) cache.
+        return self._frontier - len(self._cache)
+
+    def _absolute_position(self):
+        if self._index is None:
+            return self._frontier
+        index = self._index
+        if index < 0:
+            # ``seek`` accepts negative indexes into the cache. An index that
+            # falls off the left edge behaves like an exhausted one: the next
+            # read comes from the source, at the read frontier.
+            index += len(self._cache)
+            if index < 0:
+                return self._frontier
+        return self._offset() + index
+
+    def _seek_absolute(self, index):
+        # Never seek before the oldest item that is still cached, and read
+        # ahead only when moving past everything that has been read.
+        index = max(index, self._offset())
+        if index > self._frontier:
+            self._index = None
+            consume(self, index - self._frontier)
+        else:
+            self._index = index - self._offset()
+            if self._index == len(self._cache):
+                self._index = None
 
 
 class run_length:

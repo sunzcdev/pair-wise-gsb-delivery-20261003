@@ -10,6 +10,7 @@ Unreleased
 
 * Updated functions:
     * :func:`peekable` was updated to avoid caching the entire iterable when sliced with a negative step and omitted *stop*.
+    * :func:`seekable` now supports absolute-position :class:`bookmark` objects: :meth:`seekable.bookmark` records a position that survives cache eviction, and :meth:`seekable.restore` distinguishes retained, evicted (:exc:`BookmarkExpired`) and not-yet-read (:exc:`BookmarkNotYetRead`) positions.
 
 11.2.1
 ----------
