@@ -128,6 +128,7 @@ Binary file `src/chardet/models/models.bin` — v2 dense zlib-compressed format 
 
 - `detect(byte_str, should_rename_legacy, chunk_size, encoding_era, max_bytes, *, prefer_superset, compat_names, include_encodings, exclude_encodings, no_match_encoding, empty_input_encoding)` → `{"encoding": ..., "confidence": ..., "language": ..., "mime_type": ...}`; the two deprecated positionals come first, so pass `encoding_era` and `max_bytes` by keyword
 - `detect_all(byte_str, ignore_threshold, ...)` → list of result dicts
+- `detect_groups(byte_str, ignore_threshold, ...)` → `DetectionGroups`: the ranked candidates grouped by the text each decodes the examined window to (`grouping.py`); equivalence is per-input (decided by decoding, not alias tables), undecodable candidates are listed separately, and `output_names` maps each display name to all its members
 - `UniversalDetector` (`detector.py`) — streaming interface with `feed()`/`close()`/`reset()`
 
 All three are thin adapters over `_request.DetectionRequest` (interpreted, not mypyc-compiled), and the `chardetect` CLI calls `detect()`. The request owns option validation and deprecation warnings (`resolve`), the `run_pipeline` call (`run`), and the output-name transforms plus `detect_all`'s threshold/sort/dedupe (`render`).

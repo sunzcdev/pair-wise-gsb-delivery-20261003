@@ -13,6 +13,19 @@ Unreleased
 
 **Features:**
 
+- New ``chardet.detect_groups()`` groups the ranked candidates by the
+  text each one decodes the examined window to.  On short ASCII input,
+  or input whose non-ASCII bytes sit in a range the candidates share,
+  several encodings produce identical text and land in one group, with
+  every member's original encoding name and confidence preserved.
+  Membership is decided by decoding the examined bytes, never by a
+  static alias table, and a group claims equivalence for this input
+  only.  Candidates that cannot decode the window are listed separately
+  in ``undecodable``, and the ``output_names`` mapping keeps every
+  member when a ``compat_names``/``prefer_superset`` rename collapses
+  several candidates onto one display name.
+  (`GSB Harness <https://github.com/>`_ via Claude)
+
 - ``chardetect`` has two new flags.  ``--prefer-superset`` reports a
   detected subset encoding under its Windows code page, like
   ``Windows-1253`` for ISO-8859-7 text, the same as

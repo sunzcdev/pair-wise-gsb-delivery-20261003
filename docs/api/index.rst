@@ -8,6 +8,8 @@ Top-level Functions
 
 .. autofunction:: chardet.detect_all
 
+.. autofunction:: chardet.detect_groups
+
 UniversalDetector
 -----------------
 
@@ -34,6 +36,14 @@ Result Types
    :undoc-members:
 
 .. autoclass:: chardet.DetectionDict
+   :members:
+   :undoc-members:
+
+.. autoclass:: chardet.DetectionGroups
+   :members:
+   :undoc-members:
+
+.. autoclass:: chardet.CandidateGroup
    :members:
    :undoc-members:
 

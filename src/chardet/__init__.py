@@ -9,12 +9,15 @@ from chardet._utils import DEFAULT_MAX_BYTES, MINIMUM_THRESHOLD
 from chardet._version import __version__
 from chardet.detector import UniversalDetector
 from chardet.enums import EncodingEra, LanguageFilter
+from chardet.grouping import CandidateGroup, DetectionGroups
 from chardet.pipeline import DetectionDict, DetectionResult
 
 __all__ = [
     "DEFAULT_MAX_BYTES",
     "MINIMUM_THRESHOLD",
+    "CandidateGroup",
     "DetectionDict",
+    "DetectionGroups",
     "DetectionResult",
     "EncodingEra",
     "LanguageFilter",
@@ -22,6 +25,7 @@ __all__ = [
     "__version__",
     "detect",
     "detect_all",
+    "detect_groups",
 ]
 
 
@@ -186,5 +190,83 @@ def detect_all(  # noqa: PLR0913
         request.run(data, full_ranking=True),
         data[:max_bytes],
         all_results=True,
+        ignore_threshold=ignore_threshold,
+    )
+
+
+def detect_groups(  # noqa: PLR0913
+    byte_str: bytes | bytearray,
+    ignore_threshold: bool = False,
+    should_rename_legacy: bool = False,
+    encoding_era: EncodingEra = EncodingEra.ALL,
+    chunk_size: int = _DEFAULT_CHUNK_SIZE,
+    max_bytes: int = DEFAULT_MAX_BYTES,
+    *,
+    prefer_superset: bool = False,
+    compat_names: bool = True,
+    include_encodings: Iterable[str] | None = None,
+    exclude_encodings: Iterable[str] | None = None,
+    no_match_encoding: str = "cp1252",
+    empty_input_encoding: str = "utf-8",
+) -> DetectionGroups:
+    """Detect candidate encodings, grouped by the text they decode the input to.
+
+    Runs the same detection as :func:`detect_all`, then groups the ranked
+    candidates by the text each one decodes the examined window
+    (``byte_str[:max_bytes]``) to.  On short ASCII input, or input whose
+    non-ASCII bytes all sit in a range the candidates share, several
+    encodings land in one group because they produce byte-for-byte
+    identical text for *this* input --- the group says nothing about how
+    its members would decode any other input, and membership is decided
+    by decoding, never by a static alias or superset table.
+
+    :param byte_str: The byte sequence to detect encoding for.
+    :param ignore_threshold: If ``True``, group all candidate encodings
+        regardless of confidence score.  By default, results at or below
+        the minimum confidence threshold (0.20) are left out, unless every
+        result is below it.
+    :param should_rename_legacy: Deprecated alias for *prefer_superset*.
+    :param encoding_era: Restrict candidate encodings to the given era.
+    :param chunk_size: Deprecated -- accepted for backward compatibility but
+        has no effect.
+    :param max_bytes: Maximum number of bytes to examine from *byte_str*.
+        The grouping's equivalence claims cover exactly these bytes.
+    :param prefer_superset: If ``True``, the ``output_names`` mapping
+        reports the decode-safe Windows/CP superset names, as
+        :func:`detect_all` would.  Group members keep their original
+        (internal) encoding names either way.
+    :param compat_names: If ``True`` (default), ``output_names`` uses the
+        chardet 5.x/6.x compatible display names.
+    :param include_encodings: If given, restrict detection to only these
+        encodings (names or aliases).
+    :param exclude_encodings: If given, remove these encodings from the
+        candidate set.
+    :param no_match_encoding: Encoding to return when no candidate survives
+        the pipeline.  Defaults to ``"cp1252"``.
+    :param empty_input_encoding: Encoding to return for empty input.  Defaults
+        to ``"utf-8"``.
+    :returns: A :class:`DetectionGroups` with the tied candidates in
+        :attr:`~DetectionGroups.groups` (original encoding names and
+        confidence scores preserved), the candidates that cannot decode
+        the window in :attr:`~DetectionGroups.undecodable`, and every
+        member's display name in :attr:`~DetectionGroups.output_names`.
+    """
+    request = DetectionRequest.resolve(
+        should_rename_legacy=should_rename_legacy,
+        encoding_era=encoding_era,
+        chunk_size=chunk_size,
+        max_bytes=max_bytes,
+        prefer_superset=prefer_superset,
+        compat_names=compat_names,
+        include_encodings=include_encodings,
+        exclude_encodings=exclude_encodings,
+        no_match_encoding=no_match_encoding,
+        empty_input_encoding=empty_input_encoding,
+        stacklevel=3,
+    )
+    data = byte_str if isinstance(byte_str, bytes) else bytes(byte_str)
+    return request.render_groups(
+        request.run(data, full_ranking=True),
+        data[:max_bytes],
         ignore_threshold=ignore_threshold,
     )

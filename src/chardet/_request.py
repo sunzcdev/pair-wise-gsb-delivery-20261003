@@ -15,9 +15,11 @@ from __future__ import annotations
 import dataclasses
 import warnings
 from collections.abc import Iterable
+from types import MappingProxyType
 
 from chardet._utils import DEFAULT_MAX_BYTES, MINIMUM_THRESHOLD
 from chardet.enums import EncodingEra
+from chardet.grouping import DetectionGroups, group_candidates
 from chardet.output_names import apply_compat_names, apply_preferred_superset
 from chardet.pipeline import DetectionDict, DetectionResult
 from chardet.pipeline.orchestrator import run_pipeline
@@ -195,6 +197,67 @@ class DetectionRequest:
             if filtered:
                 dicts = filtered
         return self._rank_unique([self._render_one(d, window) for d in dicts])
+
+    def render_groups(
+        self,
+        results: list[DetectionResult],
+        window: bytes,
+        *,
+        ignore_threshold: bool = False,
+    ) -> DetectionGroups:
+        """Group ranked results by the text each decodes *window* to.
+
+        Applies the same confidence threshold as :meth:`render` with
+        ``all_results=True``, then groups the survivors with
+        :func:`~chardet.grouping.group_candidates`.  The equivalence is a
+        fact about *window* --- the bytes this detection examined --- and
+        claims nothing about how the member encodings treat any other
+        input.
+
+        The ``output_names`` mapping runs this request's
+        ``prefer_superset`` and ``compat_names`` transforms on every
+        member, group members and undecodable candidates alike, and is
+        inverted (display name -> internal names) so that members a rename
+        collapses onto one output name are listed together instead of
+        dropped the way :meth:`render`'s dedupe drops them.
+
+        :param results: Ranked results from :meth:`run`.
+        :param window: The bytes the verdict is about (``data[:max_bytes]``).
+        :param ignore_threshold: Keep the results at or below
+            :data:`~chardet.MINIMUM_THRESHOLD` too.
+        :returns: The grouped candidates.
+        """
+        if not ignore_threshold:
+            filtered = [r for r in results if r.confidence > MINIMUM_THRESHOLD]
+            if filtered:
+                results = filtered
+        groups, undecodable = group_candidates(results, window)
+        by_display: dict[str, list[str]] = {}
+        for result in (member for group in groups for member in group.members):
+            self._collect_output_name(result, window, by_display)
+        for result in undecodable:
+            self._collect_output_name(result, window, by_display)
+        return DetectionGroups(
+            groups=tuple(groups),
+            undecodable=tuple(undecodable),
+            output_names=MappingProxyType(
+                {name: tuple(members) for name, members in by_display.items()}
+            ),
+            window_size=len(window),
+        )
+
+    def _collect_output_name(
+        self,
+        result: DetectionResult,
+        window: bytes,
+        by_display: dict[str, list[str]],
+    ) -> None:
+        """Record *result*'s display name in *by_display*, keeping every member."""
+        if result.encoding is None:
+            return
+        display = self._render_one(result.to_dict(), window)["encoding"]
+        if display is not None:
+            by_display.setdefault(display, []).append(result.encoding)
 
     def _render_one(self, d: DetectionDict, window: bytes) -> DetectionDict:
         """Apply the output remaps to one result dict, in place."""

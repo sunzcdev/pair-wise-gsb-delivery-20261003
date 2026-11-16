@@ -55,6 +55,35 @@ candidates. With ``prefer_superset=True`` two candidates can map to one
 name (ISO-8859-7 and Windows-1253 both become Windows-1253); only the
 higher-confidence one is listed.
 
+Grouping Equivalent Candidates
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+On short ASCII input, or input whose non-ASCII bytes all sit in a range
+the candidate encodings share, several encodings decode the examined
+bytes to the exact same text and no ranking can tell them apart. Use
+:func:`chardet.detect_groups` to see those ties explicitly:
+
+.. code-block:: python
+
+   groups = chardet.detect_groups(data)
+   for group in groups.groups:
+       tied = ", ".join(m.encoding for m in group.members)
+       print(f"{tied} -> {group.decoded_text!r}")
+   for r in groups.undecodable:
+       print(f"{r.encoding} cannot decode the examined bytes")
+
+Grouping is decided by decoding the examined window
+(``byte_str[:max_bytes]``) under each candidate — never by a static alias
+or superset table — and each group keeps its members' original encoding
+names and confidence scores. A group is a fact about *this* input only:
+Windows-1252 and ISO-8859-1 decode ``"Café"`` alike and part ways at
+byte ``0x80``, so membership never means two encodings are
+interchangeable in general. Candidates that cannot decode the window are
+listed separately in ``undecodable``, and ``output_names`` maps every
+display name (after ``compat_names``/``prefer_superset`` renaming) to all
+members reported under it, so a rename that collapses several candidates
+onto one name loses none of them.
+
 Streaming Detection
 -------------------
 
