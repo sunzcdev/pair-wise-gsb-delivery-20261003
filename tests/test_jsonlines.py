@@ -6,6 +6,7 @@ import codecs
 import collections
 import io
 import json
+import os
 import tempfile
 
 import jsonlines
@@ -253,6 +254,124 @@ def test_custom_dumps_bytes() -> None:
         writer.write(123)
 
     assert fp.getvalue() == b"some bytes\n"
+
+
+def test_validate_dumps_ok() -> None:
+    fp = io.BytesIO()
+    with jsonlines.Writer(fp, validate_dumps=True) as writer:
+        writer.write({"a": 1})
+        writer.write("escapes are fine: \n\r")
+    assert fp.getvalue() == '{"a": 1}\n"escapes are fine: \\n\\r"\n'.encode()
+
+
+def test_validate_dumps_custom_dumps_called_once_per_record() -> None:
+    calls = []
+
+    def dumps(obj: object) -> str:
+        calls.append(obj)
+        return json.dumps(obj)
+
+    fp = io.StringIO()
+    with jsonlines.Writer(fp, dumps=dumps, validate_dumps=True) as writer:
+        writer.write_all([1, 2, 3])
+    # one call at construction for type sniffing, plus one per record
+    assert calls == [{}, 1, 2, 3]
+    assert fp.getvalue() == "1\n2\n3\n"
+
+
+def test_validate_dumps_trailing_whitespace_allowed() -> None:
+    fp = io.StringIO()
+    with jsonlines.Writer(
+        fp, dumps=lambda obj: '{"a": 1} \t\n', validate_dumps=True
+    ) as writer:
+        writer.write({"a": 1})
+    assert fp.getvalue() == '{"a": 1} \t\n\n'
+
+
+def test_validate_dumps_physical_newline_rejected() -> None:
+    fp = io.StringIO()
+    with jsonlines.Writer(
+        fp, dumps=lambda obj: json.dumps(obj, indent=2), validate_dumps=True
+    ) as writer:
+        with pytest.raises(jsonlines.InvalidDumpsError) as excinfo:
+            writer.write({"a": 1})
+        exc = excinfo.value
+        assert "physical line break" in str(exc)
+        assert exc.lineno == 1
+    # nothing may have been written for the failed record
+    assert fp.getvalue() == ""
+
+
+def test_validate_dumps_multiple_json_values_rejected() -> None:
+    fp = io.BytesIO()
+    with jsonlines.Writer(
+        fp, dumps=lambda obj: b'{"a": 1}\n{"b": 2}', validate_dumps=True
+    ) as writer:
+        with pytest.raises(jsonlines.InvalidDumpsError) as excinfo:
+            writer.write({})
+        assert "data after the json value" in str(excinfo.value)
+    assert fp.getvalue() == b""
+
+
+def test_validate_dumps_invalid_json_rejected() -> None:
+    fp = io.StringIO()
+    with jsonlines.Writer(
+        fp, dumps=lambda obj: "oh hai", validate_dumps=True
+    ) as writer:
+        with pytest.raises(jsonlines.InvalidDumpsError) as excinfo:
+            writer.write({})
+        exc = excinfo.value
+        assert "not valid json" in str(exc)
+        assert exc.result == "oh hai"
+    assert fp.getvalue() == ""
+
+
+def test_validate_dumps_invalid_utf8_rejected() -> None:
+    fp = io.BytesIO()
+    with jsonlines.Writer(
+        fp, dumps=lambda obj: b'{"a": "\xff\xfe"}', validate_dumps=True
+    ) as writer:
+        with pytest.raises(jsonlines.InvalidDumpsError) as excinfo:
+            writer.write({})
+        assert "not valid utf-8" in str(excinfo.value)
+    assert fp.getvalue() == b""
+
+
+def test_validate_dumps_non_str_bytes_rejected() -> None:
+    fp = io.StringIO()
+    with jsonlines.Writer(
+        fp, dumps=lambda obj: None, validate_dumps=True  # type: ignore[arg-type,return-value]
+    ) as writer:
+        with pytest.raises(jsonlines.InvalidDumpsError) as excinfo:
+            writer.write({})
+        assert "must be str or bytes" in str(excinfo.value)
+    assert fp.getvalue() == ""
+
+
+def test_validate_dumps_write_all_failure_lineno() -> None:
+    def dumps(obj: object) -> str:
+        if obj == "boom":
+            return "not json"
+        return json.dumps(obj)
+
+    fp = io.StringIO()
+    with jsonlines.Writer(fp, dumps=dumps, validate_dumps=True) as writer:
+        with pytest.raises(jsonlines.InvalidDumpsError) as excinfo:
+            writer.write_all([1, 2, "boom", 3])
+        exc = excinfo.value
+        assert exc.lineno == 3
+        assert "record 3" in str(exc)
+    # only the records before the failing one were written
+    assert fp.getvalue() == "1\n2\n"
+
+
+def test_validate_dumps_via_open() -> None:
+    with tempfile.TemporaryDirectory() as tmpdir:
+        path = os.path.join(tmpdir, "out.jsonl")
+        with jsonlines.open(path, mode="w", validate_dumps=True) as writer:
+            writer.write(123)
+        with open(path, "r", encoding="utf-8") as fp:
+            assert fp.read() == "123\n"
 
 
 def test_custom_loads() -> None:

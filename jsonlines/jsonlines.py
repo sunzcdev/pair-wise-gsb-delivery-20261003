@@ -58,6 +58,10 @@ SKIPPABLE_SINGLE_INITIAL_CHARS = (
     codecs.BOM_UTF8.decode(),
 )
 
+# Decoder used for validating dumps() output. A shared instance is fine
+# since JSONDecoder instances are stateless.
+DUMPS_VALIDATION_DECODER = json.JSONDecoder()
+
 
 class DumpsResultConversion(enum.Enum):
     LeaveAsIs = enum.auto()
@@ -136,6 +140,37 @@ class InvalidLineError(Error, ValueError):
         self.line = line.rstrip()
         self.lineno = lineno
         super().__init__(f"{message} (line {lineno})")
+
+
+@attr.s(auto_exc=True, auto_attribs=True, init=False)
+class InvalidDumpsError(Error, ValueError):
+    """
+    Error raised when dumps output validation fails.
+
+    This happens when output validation is enabled (see the
+    `validate_dumps` argument to :py:class:`Writer`), and the custom
+    ``dumps()`` callable produced output that is not a single JSON
+    value, or contains physical line breaks that are not allowed by the
+    jsonlines format.
+
+    The offending dumps result itself is stored on the exception
+    instance as the ``.result`` attribute, and the record number as
+    ``.lineno``.
+
+    This class subclasses both ``jsonlines.Error`` and the built-in
+    ``ValueError``.
+    """
+
+    #: The invalid dumps() result
+    result: Union[str, bytes]
+
+    #: The record number (1-based)
+    lineno: int
+
+    def __init__(self, message: str, result: Union[str, bytes], lineno: int) -> None:
+        self.result = result
+        self.lineno = lineno
+        super().__init__(f"{message} (record {lineno})")
 
 
 @attr.s(auto_attribs=True, repr=False)
@@ -472,6 +507,16 @@ class Writer(ReaderWriterBase):
     `dumps` argument. The callable must produce (unicode) string output.
     If specified, the `compact` and `sort` arguments will be ignored.
 
+    When the `validate_dumps` argument is set to ``True``, the result of
+    each ``dumps()`` call is validated before anything is written: it
+    must contain exactly one JSON value, and must not contain physical
+    line breaks, which are forbidden by the jsonlines format. Trailing
+    whitespace (including a trailing newline) is allowed and ignored.
+    Both ``str`` and ``bytes`` results are supported; ``bytes`` results
+    must be valid UTF-8. Validation failures raise
+    :py:exc:`InvalidDumpsError`, and no bytes for the offending record
+    will have been written.
+
     When the `flush` argument is set to ``True``, the writer will call
     ``fp.flush()`` after each written line.
 
@@ -479,6 +524,7 @@ class Writer(ReaderWriterBase):
     :param compact: whether to use a compact output format
     :param sort_keys: whether to sort object keys
     :param dumps: custom encoder callable
+    :param validate_dumps: whether to validate each ``dumps()`` result
     :param flush: whether to flush the file-like object after writing each line
     """
 
@@ -488,6 +534,8 @@ class Writer(ReaderWriterBase):
     _sort_keys: bool = attr.ib(default=False, kw_only=True)
     _flush: bool = attr.ib(default=False, kw_only=True)
     _dumps: DumpsCallable = attr.ib(default=default_dumps, kw_only=True)
+    _validate_dumps: bool = attr.ib(default=False, kw_only=True)
+    _lineno: int = attr.ib(default=0, init=False)
     _dumps_result_conversion: DumpsResultConversion = attr.ib(
         default=DumpsResultConversion.LeaveAsIs, init=False
     )
@@ -535,6 +583,11 @@ class Writer(ReaderWriterBase):
 
         line = self._dumps(obj)
 
+        if self._validate_dumps:
+            # Validate before writing anything, so that no bytes of an
+            # invalid record end up in the output.
+            self._validate_dumps_result(line)
+
         # This handles either str or bytes, but the type checker does not know
         # that this code always passes the right type of arguments.
         if self._dumps_result_conversion == DumpsResultConversion.EncodeToBytes:
@@ -545,11 +598,61 @@ class Writer(ReaderWriterBase):
         fp = self._fp
         fp.write(line)  # type: ignore[arg-type]
         fp.write(b"\n" if self._fp_is_binary else "\n")  # type: ignore[call-overload]
+        self._lineno += 1
 
         if self._flush:
             fp.flush()
 
         return len(line) + 1  # including newline
+
+    def _validate_dumps_result(self, result: Union[str, bytes]) -> None:
+        """
+        Validate a single ``dumps()`` result.
+
+        The result must be a ``str``, or ``bytes`` containing valid
+        UTF-8. Its content must be exactly one JSON value, optionally
+        followed by whitespace, and must not contain physical line
+        breaks (escaped newlines inside JSON strings are fine, since
+        those are not physical line breaks).
+
+        Raises :py:exc:`InvalidDumpsError` if validation fails.
+        """
+        lineno = self._lineno + 1
+
+        if isinstance(result, bytes):
+            try:
+                text = result.decode("utf-8")
+            except UnicodeDecodeError as orig_exc:
+                exc = InvalidDumpsError(
+                    f"dumps result is not valid utf-8: {orig_exc}", result, lineno
+                )
+                raise exc from orig_exc
+        elif isinstance(result, str):
+            text = result
+        else:
+            raise InvalidDumpsError(
+                f"dumps result must be str or bytes, not {type(result).__name__}",
+                result,
+                lineno,
+            )
+
+        try:
+            _, end = DUMPS_VALIDATION_DECODER.raw_decode(text)
+        except ValueError as orig_exc:
+            exc = InvalidDumpsError(
+                f"dumps result is not valid json: {orig_exc}", result, lineno
+            )
+            raise exc from orig_exc
+
+        if text[end:].strip():
+            raise InvalidDumpsError(
+                "dumps result contains data after the json value", result, lineno
+            )
+
+        if "\n" in text[:end] or "\r" in text[:end]:
+            raise InvalidDumpsError(
+                "dumps result contains a physical line break", result, lineno
+            )
 
     def write_all(self, iterable: Iterable[Any]) -> int:
         """
@@ -582,6 +685,7 @@ def open(
     dumps: Optional[DumpsCallable] = ...,
     compact: Optional[bool] = ...,
     sort_keys: Optional[bool] = ...,
+    validate_dumps: Optional[bool] = ...,
     flush: Optional[bool] = ...,
 ) -> Writer:
     ...  # pragma: no cover
@@ -596,6 +700,7 @@ def open(
     dumps: Optional[DumpsCallable] = ...,
     compact: Optional[bool] = ...,
     sort_keys: Optional[bool] = ...,
+    validate_dumps: Optional[bool] = ...,
     flush: Optional[bool] = ...,
 ) -> Union[Reader, Writer]:
     ...  # pragma: no cover
@@ -609,6 +714,7 @@ def open(
     dumps: Optional[DumpsCallable] = None,
     compact: Optional[bool] = None,
     sort_keys: Optional[bool] = None,
+    validate_dumps: Optional[bool] = None,
     flush: Optional[bool] = None,
 ) -> Union[Reader, Writer]:
     """
@@ -646,6 +752,7 @@ def open(
         dumps=dumps,
         compact=compact,
         sort_keys=sort_keys,
+        validate_dumps=validate_dumps,
         flush=flush,
     )
     kwargs = {key: value for key, value in kwargs.items() if value is not None}

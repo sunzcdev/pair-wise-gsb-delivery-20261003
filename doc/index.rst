@@ -177,6 +177,9 @@ API
 .. autoclass:: jsonlines.InvalidLineError
    :members:
 
+.. autoclass:: jsonlines.InvalidDumpsError
+   :members:
+
 
 Contributing
 ============
@@ -188,6 +191,13 @@ The source code and issue tracker for this package can be found on GitHub:
 
 Version history
 ===============
+
+* unreleased
+
+  * add optional ``dumps()`` output validation to :py:class:`Writer`
+    via the ``validate_dumps`` argument, raising
+    :py:exc:`InvalidDumpsError` when the output is not exactly one
+    JSON value or contains physical line breaks
 
 * 4.0.0, released at 2023-09-01
 
