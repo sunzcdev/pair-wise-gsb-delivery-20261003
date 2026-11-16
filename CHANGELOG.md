@@ -14,6 +14,8 @@ _(unreleased)_
 - Added timezone suffix support (`Z`, `+HH:MM`, `-HHMM`, optional seconds) to [`timeutils.isoparse`][timeutils.isoparse], returning aware datetimes so aware `isoformat()` output round-trips ([#594](https://github.com/mahmoud/boltons/pull/594))
 - Added keyword-only support to [`funcutils.wraps`][funcutils.wraps] `expected` via `(name, default, kwonly)` triples ([#522](https://github.com/mahmoud/boltons/pull/522))
 - Added [`iterutils.chunked_filter`][iterutils.chunked_filter], which filters an iterable in batches, calling the predicate once per batch ([#491](https://github.com/mahmoud/boltons/pull/491))
+- Added bounded previewing to [`tableutils.Table.from_data`][tableutils.Table.from_data] via a per-container `max_entries` budget, alongside the existing `max_depth`; over-budget or too-deep values become typed `tableutils.FoldMarker` cells (`DepthLimitFoldMarker`, `EntryLimitFoldMarker`, `SharedReferenceFoldMarker`, `CycleFoldMarker`) carrying the folded type and original path, so truncated preview text is never mistaken for a real cell value. HTML and text render the same markers, object properties are accessed at most once, and the input data is no longer mutated
+- Fixed [`tableutils.Table.from_data`][tableutils.Table.from_data] raising `TypeError` on recursive (self-referential) data; cycles now render as `CycleFoldMarker` cells, and repeated occurrences of a shared object render as `SharedReferenceFoldMarker` cells
 - Fixed [`listutils.BarrelList`][listutils.BarrelList] pickling and `copy.copy`/`copy.deepcopy` (hang/duplication) by adding `__reduce__` ([#596](https://github.com/mahmoud/boltons/pull/596))
 - Fixed [`listutils.BarrelList`][listutils.BarrelList] rich comparisons (`==`, `!=`, `<`, `<=`, `>`, `>=`) comparing empty base-list storage instead of contents ([#544](https://github.com/mahmoud/boltons/pull/544))
 - Fixed [`listutils.BarrelList`][listutils.BarrelList] `+`, `+=`, `*` and `*=` operating on empty base-list storage ([#540](https://github.com/mahmoud/boltons/pull/540), [#532](https://github.com/mahmoud/boltons/pull/532))
@@ -1382,6 +1384,7 @@ added in this release.
 [strutils.unwrap_text]: http://boltons.readthedocs.org/en/latest/strutils.html#boltons.strutils.unwrap_text
 [tableutils]: http://boltons.readthedocs.org/en/latest/tableutils.html
 [tableutils.Table]: http://boltons.readthedocs.org/en/latest/tableutils.html#boltons.tableutils.Table
+[tableutils.Table.from_data]: http://boltons.readthedocs.org/en/latest/tableutils.html#boltons.tableutils.Table.from_data
 [tbutils]: http://boltons.readthedocs.org/en/latest/tbutils.html
 [tbutils.Callpoint]: http://boltons.readthedocs.org/en/latest/tbutils.html#boltons.tbutils.Callpoint
 [tbutils.ExceptionInfo]: http://boltons.readthedocs.org/en/latest/tbutils.html#boltons.tbutils.ExceptionInfo
