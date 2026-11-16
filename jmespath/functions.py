@@ -309,54 +309,80 @@ class Functions(metaclass=FunctionRegistry):
     @signature({'types': ['array']}, {'types': ['expref']})
     def _func_sort_by(self, array, expref):
         if not array:
+            # Don't touch the expression when there is nothing to sort.
             return array
-        # sort_by allows for the expref to be either a number of
-        # a string, so we have some special logic to handle this.
-        # We evaluate the first array element and verify that it's
-        # either a string of a number.  We then create a key function
-        # that validates that type, which requires that remaining array
-        # elements resolve to the same type as the first element.
-        required_type = self._convert_to_jmespath_type(
-            type(expref.visit(expref.expression, array[0])).__name__)
-        if required_type not in ['number', 'string']:
-            raise exceptions.JMESPathTypeError(
-                'sort_by', array[0], required_type, ['string', 'number'])
-        keyfunc = self._create_key_func(expref,
-                                        [required_type],
-                                        'sort_by')
-        return list(sorted(array, key=keyfunc))
+        # Evaluate the key expression exactly once per member and make sure
+        # every key belongs to the same, allowed type domain before any
+        # ordering happens.  The input array is never mutated; all the work
+        # happens on a separate list of (key, index, member) tuples.
+        decorated = self._collect_sort_keys(
+            array, expref, 'sort_by', ['number', 'string'])
+        # Python's sort is stable, so members with equal keys retain their
+        # original input order.  Tying the comparison on the original index
+        # makes that guarantee explicit and avoids comparing the members
+        # themselves.
+        ordered = sorted(decorated, key=lambda item: (item[0], item[1]))
+        return [member for key, index, member in ordered]
 
     @signature({'types': ['array']}, {'types': ['expref']})
     def _func_min_by(self, array, expref):
-        keyfunc = self._create_key_func(expref,
-                                        ['number', 'string'],
-                                        'min_by')
-        if array:
-            return min(array, key=keyfunc)
-        else:
+        if not array:
             return None
+        decorated = self._collect_sort_keys(
+            array, expref, 'min_by', ['number', 'string'])
+        # Compare on the key only so that, when several members share the
+        # smallest key, the first one in the input is returned (the same
+        # first-occurrence tie breaking the built-in min() provides).
+        best_key, best_index, best_member = decorated[0]
+        for key, index, member in decorated[1:]:
+            if key < best_key:
+                best_key, best_index, best_member = key, index, member
+        return best_member
 
     @signature({'types': ['array']}, {'types': ['expref']})
     def _func_max_by(self, array, expref):
-        keyfunc = self._create_key_func(expref,
-                                        ['number', 'string'],
-                                        'max_by')
-        if array:
-            return max(array, key=keyfunc)
-        else:
+        if not array:
             return None
+        decorated = self._collect_sort_keys(
+            array, expref, 'max_by', ['number', 'string'])
+        # Compare on the key only so that, when several members share the
+        # largest key, the first one in the input is returned (the same
+        # first-occurrence tie breaking the built-in max() provides).
+        best_key, best_index, best_member = decorated[0]
+        for key, index, member in decorated[1:]:
+            if key > best_key:
+                best_key, best_index, best_member = key, index, member
+        return best_member
 
-    def _create_key_func(self, expref, allowed_types, function_name):
-        def keyfunc(x):
-            result = expref.visit(expref.expression, x)
-            actual_typename = type(result).__name__
-            jmespath_type = self._convert_to_jmespath_type(actual_typename)
-            # allowed_types is in term of jmespath types, not python types.
-            if jmespath_type not in allowed_types:
+    def _collect_sort_keys(self, array, expref, function_name,
+                           allowed_types):
+        # Walk the members in their original order, evaluating the key
+        # expression a single time per member.  Nothing is reordered until
+        # every key has been collected and validated, so a failure leaves
+        # the caller's array exactly as it was passed in and can always be
+        # attributed to the member's original position.
+        decorated = []
+        required_type = None
+        for index, member in enumerate(array):
+            try:
+                result = expref.visit(expref.expression, member)
+            except Exception as e:
+                # Surface the original member position alongside whatever
+                # went wrong while evaluating its key expression.
+                raise exceptions.JMESPathSortError(
+                    function_name, index, e)
+            actual_type = self._convert_to_jmespath_type(
+                type(result).__name__)
+            if actual_type not in allowed_types:
                 raise exceptions.JMESPathTypeError(
-                    function_name, result, jmespath_type, allowed_types)
-            return result
-        return keyfunc
+                    function_name, result, actual_type, allowed_types)
+            if required_type is None:
+                required_type = actual_type
+            elif actual_type != required_type:
+                raise exceptions.JMESPathTypeError(
+                    function_name, result, actual_type, [required_type])
+            decorated.append((result, index, member))
+        return decorated
 
     def _convert_to_jmespath_type(self, pyobject):
         return TYPES_MAP.get(pyobject, 'unknown')

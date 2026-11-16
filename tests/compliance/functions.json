@@ -617,6 +617,11 @@
          {"age": 30, "age_str": "30", "bool": true, "name": "c"},
          {"age": 50, "age_str": "50", "bool": false, "name": "d"},
          {"age": 10, "age_str": "10", "bool": true, "name": 3}
+    ],
+    "mixed": [
+         {"age": 20},
+         {"age": "40"},
+         {"age": 30}
     ]
   },
   "cases": [
@@ -728,6 +733,21 @@
     {
       "expression": "min_by(`[]`, &age)",
       "result": null
+    },
+    {
+      "comment": "mixed number/string keys are rejected for sort_by",
+      "expression": "sort_by(mixed, &age)",
+      "error": "invalid-type"
+    },
+    {
+      "comment": "mixed number/string keys are rejected for min_by",
+      "expression": "min_by(mixed, &age)",
+      "error": "invalid-type"
+    },
+    {
+      "comment": "mixed number/string keys are rejected for max_by",
+      "expression": "max_by(mixed, &age)",
+      "error": "invalid-type"
     }
   ]
 }, {

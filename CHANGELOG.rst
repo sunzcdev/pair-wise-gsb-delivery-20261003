@@ -1,7 +1,16 @@
 Next Release (TBD)
 ==================
 
-* No changes yet.
+* Reworked ``sort_by``, ``min_by`` and ``max_by`` so the key expression is
+  evaluated exactly once per array member and every key is validated to
+  belong to the same allowed type domain (all numbers or all strings)
+  before any ordering occurs.  Mixed number/string keys now raise an
+  ``invalid-type`` error for all three functions instead of leaking a
+  Python ``TypeError`` from ``min_by``/``max_by``.  The input array is never
+  mutated, and a key expression failure is reported against the offending
+  member's original position via the new ``JMESPathSortError``.  Empty arrays
+  still short-circuit without evaluating the expression, and equal keys keep
+  their original input order.
 
 
 1.1.0

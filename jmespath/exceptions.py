@@ -112,6 +112,27 @@ class JMESPathTypeError(JMESPathError):
                     self.expected_types, self.actual_type))
 
 
+@with_str_method
+class JMESPathSortError(JMESPathError):
+    """Raised when a sort-family key expression cannot be evaluated.
+
+    The ``index`` is the position of the member in the array as it was
+    originally passed in, before any ordering takes place.
+    """
+    def __init__(self, function_name, index, original_error):
+        self.function_name = function_name
+        self.index = index
+        self.original_error = original_error
+        super(JMESPathSortError, self).__init__(
+            function_name, index, original_error)
+
+    def __str__(self):
+        return (
+            'In function %s(), failed to evaluate the key expression for '
+            'the element at index %s: %s' % (
+                self.function_name, self.index, self.original_error))
+
+
 class EmptyExpressionError(JMESPathError):
     def __init__(self):
         super(EmptyExpressionError, self).__init__(
