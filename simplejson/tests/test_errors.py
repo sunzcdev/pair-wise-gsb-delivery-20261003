@@ -245,3 +245,372 @@ class TestErrors(TestCase):
                          '_asdict() must return a dict, not list')
         self.assertEqual(cm.exception.__notes__,
                          ["when serializing dict item 'a'"])
+
+
+class _Unserializable(object):
+    pass
+
+
+class _ForJsonRaises(object):
+    def __init__(self, exc):
+        self.exc = exc
+        self.calls = 0
+
+    def for_json(self):
+        self.calls += 1
+        raise self.exc
+
+
+class TestDiagnoseErrors(TestCase):
+    """Location diagnostics for failed custom conversions.
+
+    ``diagnose_errors=True`` turns a failure inside ``default()``,
+    ``for_json()``, ``_asdict()`` or object-key conversion into a
+    ``JSONEncodeError`` naming the container path, with the original
+    exception preserved as ``__cause__``.
+    """
+
+    def test_default_failure_reports_record_and_field(self):
+        records = [
+            {'id': 1, 'name': 'ok'},
+            {'id': 2, 'name': _Unserializable()},
+        ]
+        with self.assertRaises(json.JSONEncodeError) as cm:
+            json.dumps(records, diagnose_errors=True)
+        exc = cm.exception
+        self.assertEqual(exc.path, '$[1].name')
+        self.assertEqual(exc.path_parts, (1, 'name'))
+        self.assertEqual(exc.kind, 'value')
+        self.assertEqual(exc.value_type, '_Unserializable')
+        self.assertIn('$[1].name', str(exc))
+
+    def test_preserves_original_as_cause(self):
+        error = ValueError('conversion blew up')
+
+        def default(obj):
+            raise error
+
+        with self.assertRaises(json.JSONEncodeError) as cm:
+            json.dumps({'a': _Unserializable()}, default=default,
+                       diagnose_errors=True)
+        exc = cm.exception
+        self.assertIs(exc.__cause__, error)
+        self.assertIs(exc.original, error)
+        # The original message is not folded into the wrapper's text;
+        # callers reach it through the chain.
+        self.assertNotIn('conversion blew up', str(exc))
+        # The chain renders as "direct cause", not the noisier
+        # "during handling of the above exception".
+        if sys.version_info >= (3,):
+            import traceback
+            text = ''.join(traceback.format_exception(
+                type(exc), exc, exc.__traceback__))
+            self.assertIn('direct cause', text)
+            self.assertNotIn('during handling', text)
+        # Existing PEP 678 notes are still attached to the wrapper.
+        if sys.version_info >= (3, 11):
+            self.assertIn("when serializing dict item 'a'", exc.__notes__)
+
+    def test_wrapper_is_catchable_as_typeerror_and_valueerror(self):
+        def default(obj):
+            raise TypeError('nope')
+
+        for caught in (TypeError, ValueError):
+            with self.assertRaises(caught):
+                json.dumps([_Unserializable()], default=default,
+                           diagnose_errors=True)
+
+    def test_for_json_failure_reports_path(self):
+        failing = _ForJsonRaises(RuntimeError('no'))
+        with self.assertRaises(json.JSONEncodeError) as cm:
+            json.dumps({'outer': [0, failing]}, for_json=True,
+                       diagnose_errors=True)
+        self.assertEqual(cm.exception.path, '$.outer[1]')
+        self.assertIn('RuntimeError', str(cm.exception))
+
+    def test_root_failure_reports_dollar(self):
+        failing = _ForJsonRaises(RuntimeError('no'))
+        with self.assertRaises(json.JSONEncodeError) as cm:
+            json.dumps(failing, for_json=True, diagnose_errors=True)
+        self.assertEqual(cm.exception.path, '$')
+        self.assertEqual(cm.exception.path_parts, ())
+
+    def test_array_indices_only_for_entered_containers(self):
+        with self.assertRaises(json.JSONEncodeError) as cm:
+            json.dumps([[0, [1, [_Unserializable()]]]], diagnose_errors=True)
+        self.assertEqual(cm.exception.path, '$[0][1][1][0]')
+        self.assertEqual(cm.exception.path_parts, (0, 1, 1, 0))
+
+    def test_path_quotes_keys_that_are_not_identifiers(self):
+        value = {'a b': [{'c\'d': _Unserializable()}]}
+        with self.assertRaises(json.JSONEncodeError) as cm:
+            json.dumps(value, diagnose_errors=True)
+        exc = cm.exception
+        self.assertEqual(exc.path_parts, ('a b', 0, "c'd"))
+        # Non-identifier keys are bracketed and repr-quoted, so the path
+        # stays unambiguous.
+        self.assertTrue(exc.path.startswith("$['a b'][0]["))
+        self.assertTrue(exc.path.endswith("]"))
+        self.assertIn("c'd", exc.path)
+
+    def test_key_conversion_error_is_kind_key(self):
+        with self.assertRaises(json.JSONEncodeError) as cm:
+            json.dumps({'records': [{('bad',): 1}]}, diagnose_errors=True)
+        exc = cm.exception
+        self.assertEqual(exc.kind, 'key')
+        self.assertEqual(exc.path, '$.records[0]')
+        self.assertEqual(exc.value_type, 'tuple')
+        self.assertIn('key of type tuple', str(exc))
+        self.assertIsInstance(exc.__cause__, TypeError)
+
+    def test_key_conversion_error_under_sort_keys(self):
+        with self.assertRaises(json.JSONEncodeError) as cm:
+            json.dumps({'r': [{'nested': {('bad',): 1}}]},
+                       sort_keys=True, diagnose_errors=True)
+        exc = cm.exception
+        self.assertEqual(exc.kind, 'key')
+        self.assertEqual(exc.path, '$.r[0].nested')
+
+    def test_skipkeys_still_skips_without_diagnostic(self):
+        self.assertEqual(
+            json.dumps({'a': 1, ('bad',): 2}, skipkeys=True,
+                       diagnose_errors=True),
+            '{"a": 1}')
+
+    def test_value_error_and_key_error_are_distinguished(self):
+        with self.assertRaises(json.JSONEncodeError) as value_cm:
+            json.dumps({'a': _Unserializable()}, diagnose_errors=True)
+        with self.assertRaises(json.JSONEncodeError) as key_cm:
+            json.dumps({('bad',): 1}, diagnose_errors=True)
+        self.assertEqual(value_cm.exception.kind, 'value')
+        self.assertEqual(key_cm.exception.kind, 'key')
+        self.assertNotEqual(value_cm.exception.path,
+                            key_cm.exception.path)
+
+    def test_sensitive_value_not_in_message(self):
+        secret = 'AKIA-very-secret-token'
+
+        class Leaky(object):
+            def for_json(self):
+                raise ValueError('failed for ' + secret)
+
+        with self.assertRaises(json.JSONEncodeError) as cm:
+            json.dumps({'records': [{'token': Leaky()}]}, for_json=True,
+                       diagnose_errors=True)
+        exc = cm.exception
+        self.assertNotIn(secret, str(exc))
+        self.assertNotIn(secret, ' '.join(getattr(exc, '__notes__', [])))
+        # The underlying failure is still reachable through the chain, so
+        # a caller who opts in can inspect it deliberately.
+        self.assertIn(secret, str(exc.__cause__))
+
+    def test_sensitive_key_not_in_message(self):
+        class SecretKey(object):
+            def __str__(self):
+                return 'password=hunter2'
+
+        with self.assertRaises(json.JSONEncodeError) as cm:
+            json.dumps({'a': {SecretKey(): 1}}, diagnose_errors=True)
+        exc = cm.exception
+        self.assertNotIn('hunter2', str(exc))
+        self.assertEqual(exc.path_parts, ('a',))
+
+    def test_conversion_callbacks_are_not_re_run(self):
+        calls = []
+
+        class Outer(object):
+            def for_json(self):
+                calls.append('outer')
+                return {'inner': _Inner()}
+
+        class _Inner(object):
+            def for_json(self):
+                calls.append('inner')
+                raise ValueError('boom')
+
+        with self.assertRaises(json.JSONEncodeError) as cm:
+            json.dumps([Outer()], for_json=True, diagnose_errors=True)
+        self.assertEqual(calls, ['outer', 'inner'])
+        self.assertEqual(cm.exception.path, '$[0].inner')
+
+    def test_path_tracks_entered_containers_only(self):
+        # default() returns a container whose later member fails; the path
+        # extends through the container actually entered, without the
+        # encoder inventing a position for the object that produced it.
+        class Wrapper(object):
+            pass
+
+        def default(obj):
+            if isinstance(obj, Wrapper):
+                return {'a': [1, _Unserializable()]}
+            raise TypeError('not serializable')
+
+        with self.assertRaises(json.JSONEncodeError) as cm:
+            json.dumps({'top': Wrapper()}, default=default,
+                       diagnose_errors=True)
+        self.assertEqual(cm.exception.path, '$.top.a[1]')
+
+    def test_asdict_returning_non_dict_is_diagnosed(self):
+        class NotADict(object):
+            def _asdict(self):
+                return [1]
+
+        with self.assertRaises(json.JSONEncodeError) as cm:
+            json.dumps({'records': [{'x': NotADict()}]}, diagnose_errors=True)
+        exc = cm.exception
+        self.assertEqual(exc.path, '$.records[0].x')
+        self.assertEqual(exc.kind, 'value')
+        self.assertIn('must return a dict', str(exc))
+
+    def test_output_is_not_atomic_before_first_chunk(self):
+        failing = _ForJsonRaises(ValueError('boom'))
+        with self.assertRaises(json.JSONEncodeError) as cm:
+            json.dumps(failing, for_json=True, diagnose_errors=True)
+        exc = cm.exception
+        self.assertFalse(exc.complete)
+        self.assertFalse(exc.prefix_emitted)
+
+    def test_iterencode_prefix_is_marked_incomplete(self):
+        failing = _ForJsonRaises(ValueError('boom'))
+        chunks = []
+        encoder = json.JSONEncoder(for_json=True, diagnose_errors=True)
+        with self.assertRaises(json.JSONEncodeError) as cm:
+            for chunk in encoder.iterencode([1, 2, failing]):
+                chunks.append(chunk)
+        exc = cm.exception
+        self.assertEqual(''.join(chunks), '[1, 2, ')
+        self.assertFalse(exc.complete)
+        self.assertTrue(exc.prefix_emitted)
+        # The truncated text is deliberately not valid JSON.
+        self.assertRaises(ValueError, json.loads, ''.join(chunks))
+
+    def test_encode_does_not_report_a_prefix(self):
+        # encode() discards the partial list, so no truncated document
+        # escaped to the caller even though iterencode had yielded chunks.
+        failing = _ForJsonRaises(ValueError('boom'))
+        with self.assertRaises(json.JSONEncodeError) as cm:
+            json.dumps([1, 2, failing], for_json=True, diagnose_errors=True)
+        exc = cm.exception
+        self.assertFalse(exc.complete)
+        self.assertFalse(exc.prefix_emitted)
+
+    def test_disabled_by_default(self):
+        with self.assertRaises(ValueError) as cm:
+            json.dumps([_ForJsonRaises(ValueError('boom'))], for_json=True)
+        self.assertNotIsInstance(cm.exception, json.JSONEncodeError)
+        self.assertEqual(str(cm.exception), 'boom')
+
+    def test_diagnose_errors_option_round_trips_through_encoder(self):
+        encoder = json.JSONEncoder(diagnose_errors=True)
+        self.assertTrue(encoder.diagnose_errors)
+        self.assertFalse(json.JSONEncoder().diagnose_errors)
+
+    def test_interpreter_exceptions_are_not_wrapped(self):
+        for exc_type in (KeyboardInterrupt, SystemExit):
+            failing = _ForJsonRaises(exc_type())
+            with self.assertRaises(exc_type):
+                json.dumps([failing], for_json=True, diagnose_errors=True)
+
+    def test_c_speedups_are_bypassed_when_diagnosing(self):
+        # The C encoder has no location tracking.  When the speedups are
+        # loaded, diagnose_errors must take the Python path rather than
+        # silently dropping the diagnostic.
+        from simplejson import encoder as encoder_module
+        original = encoder_module.c_make_encoder
+        calls = []
+
+        def fake_c_make_encoder(*args, **kwargs):
+            calls.append(1)
+            return lambda o, level: iter(['{}'])
+
+        encoder_module.c_make_encoder = fake_c_make_encoder
+        try:
+            with self.assertRaises(json.JSONEncodeError) as cm:
+                json.dumps([_Unserializable()], diagnose_errors=True)
+            self.assertEqual(cm.exception.path, '$[0]')
+            self.assertEqual(calls, [])
+        finally:
+            encoder_module.c_make_encoder = original
+
+    def test_dump_reports_prefix_written_to_file(self):
+        import io
+        failing = _ForJsonRaises(ValueError('boom'))
+        fp = io.StringIO()
+        with self.assertRaises(json.JSONEncodeError) as cm:
+            json.dump([1, 2, failing], fp, for_json=True,
+                      diagnose_errors=True)
+        exc = cm.exception
+        self.assertEqual(fp.getvalue(), '[1, 2, ')
+        self.assertTrue(exc.prefix_emitted)
+        self.assertFalse(exc.complete)
+
+    def test_typeerror_still_means_method_not_supported(self):
+        # A TypeError from for_json()/_asdict() means "not supported" and
+        # must still fall through to default() even while diagnosing.
+        calls = []
+
+        class Raises(object):
+            def for_json(self):
+                calls.append('for_json')
+                raise TypeError('nope')
+
+            def _asdict(self):
+                calls.append('_asdict')
+                raise TypeError('nope')
+
+        self.assertEqual(
+            json.dumps([Raises()], for_json=True, default=lambda o: 'd',
+                       diagnose_errors=True),
+            '["d"]')
+        self.assertEqual(calls, ['for_json', '_asdict'])
+
+    def test_diagnostic_is_picklable_with_cause(self):
+        import pickle
+        error = ValueError('boom')
+
+        def default(obj):
+            raise error
+
+        with self.assertRaises(json.JSONEncodeError) as cm:
+            json.dumps({'a': _Unserializable()}, default=default,
+                       diagnose_errors=True)
+        exc = cm.exception
+        copy = pickle.loads(pickle.dumps(exc))
+        self.assertEqual(copy.path, exc.path)
+        self.assertEqual(copy.path_parts, exc.path_parts)
+        self.assertEqual(copy.kind, exc.kind)
+        self.assertEqual(copy.value_type, exc.value_type)
+        self.assertEqual(str(copy), str(exc))
+        self.assertIsInstance(copy.__cause__, ValueError)
+        self.assertEqual(str(copy.__cause__), 'boom')
+
+    def test_nested_diagnostic_is_re_raised_verbatim(self):
+        # JSONEncodeError is a TypeError subclass so old handlers keep
+        # working, but a diagnostic escaping a for_json()/default() call
+        # means "a nested encode failed", not "this protocol is
+        # unsupported": it must not fall through to _asdict()/default().
+        error = json.JSONEncodeError('user made', path_parts=('custom',))
+
+        class RaisesDiagnostic(object):
+            def for_json(self):
+                raise error
+
+            def _asdict(self):
+                raise AssertionError('must not be called')
+
+        with self.assertRaises(json.JSONEncodeError) as cm:
+            json.dumps([RaisesDiagnostic()], for_json=True,
+                       default=lambda o: 'not reached',
+                       diagnose_errors=True)
+        self.assertIs(cm.exception, error)
+        self.assertEqual(cm.exception.path, '$.custom')
+
+    def test_diagnostic_does_not_leak_markers(self):
+        # A failed diagnostic encode must release its circular marker so a
+        # reused encoder does not report a false cycle on the next call.
+        encoder = json.JSONEncoder(for_json=True, diagnose_errors=True)
+        for _ in range(2):
+            self.assertRaises(
+                json.JSONEncodeError, encoder.encode,
+                [_ForJsonRaises(ValueError('boom'))])
+

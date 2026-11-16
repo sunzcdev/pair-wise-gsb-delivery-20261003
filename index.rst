@@ -159,7 +159,8 @@ Basic Usage
                    namedtuple_as_object=True, tuple_as_array=True, \
                    bigint_as_string=False, sort_keys=False, \
                    item_sort_key=None, for_json=None, ignore_nan=False, \
-                   int_as_string_bitcount=None, iterable_as_array=False, **kw)
+                   int_as_string_bitcount=None, iterable_as_array=False, \
+                   diagnose_errors=False, **kw)
 
     Serialize *obj* as a JSON formatted stream to *fp*
     (a ``.write()``-supporting file-like object) using this
@@ -190,7 +191,8 @@ Basic Usage
                     namedtuple_as_object=True, tuple_as_array=True, \
                     bigint_as_string=False, sort_keys=False, \
                     item_sort_key=None, for_json=None, ignore_nan=False, \
-                    int_as_string_bitcount=None, iterable_as_array=False, **kw)
+                    int_as_string_bitcount=None, iterable_as_array=False, \
+                    diagnose_errors=False, **kw)
 
     Serialize *obj* to a JSON formatted :class:`str`.
 
@@ -307,6 +309,15 @@ Basic Usage
     :class:`float` values (``nan``, ``inf``, ``-inf``) will be serialized as
     ``null`` in compliance with the ECMA-262 specification. If true, this will
     override *allow_nan*.
+
+    If *diagnose_errors* is true (default: ``False``), a failure raised by
+    *default*, *for_json*, ``_asdict()`` or object-key conversion is reported
+    as a :exc:`JSONEncodeError` that locates the failing position (for
+    example ``$.records[3].payload``) and keeps the original exception as
+    ``__cause__``. Only the position and value type are recorded, never the
+    value itself. See :exc:`JSONEncodeError` for the full contract. Because
+    the C speedups do not implement this tracking, setting it selects the
+    pure Python encoder.
 
     If *int_as_string_bitcount* is a positive number ``n`` (default: ``None``),
     :class:`int` ``2**n`` and higher or lower than ``-2**n`` will be encoded as strings. This is to
@@ -577,7 +588,8 @@ Encoders and decoders
                        namedtuple_as_object=True, tuple_as_array=True, \
                        bigint_as_string=False, item_sort_key=None, \
                        for_json=True, ignore_nan=False, \
-                       int_as_string_bitcount=None, iterable_as_array=False)
+                       int_as_string_bitcount=None, iterable_as_array=False, \
+                       diagnose_errors=False)
 
    Extensible JSON encoder for Python data structures.
 
@@ -713,6 +725,29 @@ Encoders and decoders
    ``null`` in compliance with the ECMA-262 specification. If true, this will
    override *allow_nan*.
 
+   If *diagnose_errors* is true (default: ``False``), a failure raised by
+   *default*, *for_json*, ``_asdict()`` or object-key conversion is reported
+   as a :exc:`JSONEncodeError` instead of the original exception. The new
+   exception locates the position in the structure -- for example
+   ``$.records[3].payload`` for the ``payload`` field of the fourth record --
+   and keeps the original exception as its ``__cause__`` (and as its
+   ``original`` attribute). Only the position and the offending value's type
+   name are recorded, never the value itself, so a payload that holds
+   credentials or tokens does not end up in logs. The path tracks only the
+   containers the encoder actually entered; a conversion callback is never
+   re-run to recover position information, and object-key failures are
+   reported with ``kind='key'`` to distinguish them from value failures.
+
+   Encoding is not atomic. Because :meth:`iterencode` streams, an exception
+   raised partway through does not mean no output was produced:
+   :attr:`JSONEncodeError.complete` is always ``False``, and
+   :attr:`JSONEncodeError.prefix_emitted` tells a consumer whether chunks
+   already yielded form a truncated, incomplete document. This option forces
+   the pure Python encoder; the C speedups do not implement it.
+
+   .. versionchanged:: 4.4.0
+     *diagnose_errors* is new in 4.4.0.
+
    .. method:: default(o)
 
     Implement this method in a subclass such that it returns a serializable
@@ -816,6 +851,58 @@ Exceptions
     .. attribute:: endcolno
 
         The column corresponding to end (may be ``None``)
+
+
+.. exception:: JSONEncodeError(message, original=None, path_parts=(), kind='value', value_type=None)
+
+    Raised by the Python encoder instead of the original conversion failure
+    when *diagnose_errors* is enabled. Subclass of both :exc:`TypeError` and
+    :exc:`ValueError`, so existing handlers for either keep working. The
+    original exception is retained as ``__cause__`` and as
+    :attr:`original`; its text is deliberately not merged into this
+    exception's message.
+
+    .. attribute:: path
+
+        A JSONPath-like string locating the failure, such as
+        ``'$.records[2].payload'``. Array indices use ``[i]``; object
+        members use ``.name`` for identifier-like keys and
+        ``['odd key']`` otherwise. The root is ``'$'``.
+
+    .. attribute:: path_parts
+
+        The raw components of :attr:`path` as a tuple of ``int`` indices
+        and ``str`` keys, for programmatic use.
+
+    .. attribute:: kind
+
+        ``'value'`` when converting a value failed, ``'key'`` when an
+        object key could not be converted.
+
+    .. attribute:: value_type
+
+        ``type(...).__name__`` of the value or key whose conversion
+        failed. The value itself is never included.
+
+    .. attribute:: original
+
+        The exception raised by the conversion callback, same object as
+        ``__cause__``.
+
+    .. attribute:: complete
+
+        Always ``False``. Encoding is not atomic: a partially written
+        document may already have been produced.
+
+    .. attribute:: prefix_emitted
+
+        ``True`` if :meth:`JSONEncoder.iterencode` had already yielded at
+        least one chunk before the failure, so the consumer holds a
+        truncated, invalid document. ``False`` when nothing was emitted or
+        when the failure surfaced through :meth:`JSONEncoder.encode` or
+        :func:`dumps`, whose partial output is discarded.
+
+    .. versionadded:: 4.4.0
 
 
 Standard Compliance and Interoperability

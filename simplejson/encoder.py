@@ -7,9 +7,46 @@ from operator import itemgetter
 import decimal
 import sys
 from .compat import binary_type, text_type, string_types, integer_types, PY3
+from .errors import JSONEncodeError, format_path
 
 # PEP 678 add_note() is available on Python 3.11+
 _HAS_ADD_NOTE = sys.version_info >= (3, 11)
+
+
+def _safe_type_name(obj):
+    """Return ``type(obj).__name__`` without letting it raise."""
+    try:
+        return type(obj).__name__
+    except BaseException:
+        return '?'
+
+
+def _conversion_failure(exc, kind, value, path_parts, detail=None):
+    """Build the optional location-diagnostic error for a failed conversion.
+
+    ``kind`` is ``'value'`` for ``default()``/``for_json()``/``_asdict()``
+    failures and ``'key'`` for object-key conversion failures.  ``path_parts``
+    names only containers the encoder had already entered, so the message
+    never re-runs a conversion callback to recover position information.
+
+    Only type names are embedded -- never ``repr(value)`` -- so a payload
+    that happens to hold credentials, tokens or other sensitive data does
+    not leak into the exception, its notes, or a traceback log.
+    """
+    if isinstance(exc, JSONEncodeError):
+        # Already annotated by an inner level; keep the innermost path.
+        return exc
+    value_type = _safe_type_name(value)
+    subject = ('key of type %s' if kind == 'key' else 'value of type %s') % (
+        value_type,)
+    if detail is None:
+        detail = '%s raised' % (_safe_type_name(exc),)
+    message = (
+        'cannot serialize %s at %s: %s (encoding is not atomic; any prefix '
+        'already yielded by iterencode() is an incomplete document)'
+        % (subject, format_path(path_parts), detail))
+    return JSONEncodeError(message, original=exc, path_parts=path_parts,
+                           kind=kind, value_type=value_type)
 
 
 def _annotate_exception(exc, note_format, obj, *args):
@@ -19,6 +56,24 @@ def _annotate_exception(exc, note_format, obj, *args):
         except BaseException:
             # Diagnostic failures must not replace the serialization error.
             pass
+
+
+def _checked_iterencode(chunks):
+    """Track whether any output was emitted before a diagnostic failure.
+
+    ``JSONEncodeError.complete`` is always false; this wrapper lets a
+    consumer that was streaming through ``iterencode()`` tell a truncated,
+    never-complete document (``prefix_emitted``) from a failure that
+    happened before the first chunk.
+    """
+    emitted = False
+    try:
+        for chunk in chunks:
+            emitted = True
+            yield chunk
+    except JSONEncodeError as exc:
+        exc.prefix_emitted = emitted
+        raise
 
 
 def _import_speedups():
@@ -199,7 +254,8 @@ class JSONEncoder(object):
                  use_decimal=True, namedtuple_as_object=True,
                  tuple_as_array=True, bigint_as_string=False,
                  item_sort_key=None, for_json=False, ignore_nan=False,
-                 int_as_string_bitcount=None, iterable_as_array=False):
+                 int_as_string_bitcount=None, iterable_as_array=False,
+                 diagnose_errors=False):
         """Constructor for JSONEncoder, with sensible defaults.
 
         If skipkeys is false, then it is a TypeError to attempt
@@ -281,6 +337,18 @@ class JSONEncoder(object):
         as ``null`` in compliance with the ECMA-262 specification. If true,
         this will override *allow_nan*.
 
+        If *diagnose_errors* is true (default: ``False``), a failure raised
+        by ``default()``, ``for_json()``, ``_asdict()`` or object-key
+        conversion is reported as a :exc:`~simplejson.errors.JSONEncodeError`
+        that names the position in the structure (for example
+        ``$.records[3].payload``) and keeps the original exception as its
+        ``__cause__``. This is a pure-Python encoder feature; the C speedups
+        do not implement it, so the encoder falls back to the Python
+        implementation when it is requested. Only the path and the type
+        names of the offending value are recorded -- never the value itself.
+        Because ``iterencode()`` streams, the exception does not imply the
+        output was all-or-nothing: see :attr:`JSONEncodeError.complete`.
+
         """
 
         self.skipkeys = skipkeys
@@ -297,6 +365,7 @@ class JSONEncoder(object):
         self.for_json = for_json
         self.ignore_nan = ignore_nan
         self.int_as_string_bitcount = int_as_string_bitcount
+        self.diagnose_errors = diagnose_errors
         if indent is not None and not isinstance(indent, string_types):
             indent = indent * ' '
         self.indent = indent
@@ -352,7 +421,13 @@ class JSONEncoder(object):
         # equivalent to the PySequence_Fast that ''.join() would do.
         chunks = self.iterencode(o)
         if not isinstance(chunks, (list, tuple)):
-            chunks = list(chunks)
+            try:
+                chunks = list(chunks)
+            except JSONEncodeError as exc:
+                # Nothing was returned to the caller, so no partial document
+                # escaped even though the generator had emitted chunks.
+                exc.prefix_emitted = False
+                raise
         if self.ensure_ascii:
             return ''.join(chunks)
         else:
@@ -412,7 +487,9 @@ class JSONEncoder(object):
         key_memo = {}
         int_as_string_bitcount = (
             53 if self.bigint_as_string else self.int_as_string_bitcount)
-        if c_make_encoder is not None:
+        # The C encoder has no location tracking, so requesting diagnostics
+        # must not silently lose them by taking the accelerated path.
+        if c_make_encoder is not None and not self.diagnose_errors:
             _iterencode = c_make_encoder(
                 markers, self.default, _encoder, self.indent,
                 self.key_separator, self.item_separator, self.sort_keys,
@@ -429,8 +506,11 @@ class JSONEncoder(object):
                 self.namedtuple_as_object, self.tuple_as_array,
                 int_as_string_bitcount,
                 self.item_sort_key, self.encoding, self.for_json,
-                self.iterable_as_array, Decimal=decimal.Decimal)
+                self.iterable_as_array, Decimal=decimal.Decimal,
+                _diagnose_errors=self.diagnose_errors)
         try:
+            if self.diagnose_errors:
+                return _checked_iterencode(_iterencode(o, 0, _path=()))
             return _iterencode(o, 0)
         finally:
             key_memo.clear()
@@ -454,10 +534,16 @@ class JSONEncoderForHTML(JSONEncoder):
         # Override JSONEncoder.encode because it has hacks for
         # performance that make things more complicated.
         chunks = self.iterencode(o)
-        if self.ensure_ascii:
-            return ''.join(chunks)
-        else:
-            return u''.join(chunks)
+        try:
+            if self.ensure_ascii:
+                return ''.join(chunks)
+            else:
+                return u''.join(chunks)
+        except JSONEncodeError as exc:
+            # The joined result is never returned, so nothing partial
+            # reached the caller.
+            exc.prefix_emitted = False
+            raise
 
     def iterencode(self, o):
         chunks = super(JSONEncoderForHTML, self).iterencode(o)
@@ -479,6 +565,7 @@ def _make_iterencode(markers, _default, _encoder, _indent, _floatstr,
         _int_as_string_bitcount, _item_sort_key,
         _encoding,_for_json,
         _iterable_as_array,
+        _diagnose_errors=False,
         ## HACK: hand-optimized bytecode; turn globals into locals
         _PY3=PY3,
         ValueError=ValueError,
@@ -507,13 +594,45 @@ def _make_iterencode(markers, _default, _encoder, _indent, _floatstr,
          not isinstance(_int_as_string_bitcount, integer_types))):
         raise TypeError("int_as_string_bitcount must be a positive integer")
 
-    def call_method(obj, method_name):
+    # Interpreter-level exceptions are never converted into a diagnostic;
+    # wrapping them would hide Ctrl-C / shutdown from the caller.
+    _unwrappable = (KeyboardInterrupt, SystemExit, GeneratorExit)
+
+    def _diagnose(exc, kind, value, path):
+        # Return a JSONEncodeError to raise instead of ``exc``, or None to
+        # let ``exc`` propagate untouched.  ``path`` is None when location
+        # tracking is off, which also keeps the hot path tuple-free.
+        if not _diagnose_errors or isinstance(exc, _unwrappable):
+            return None
+        return _conversion_failure(exc, kind, value, path or ())
+
+    def _asdict_error(value, returned, path):
+        # _asdict() returned something that is not a dict.  The callback
+        # itself succeeded, so the error is built here rather than caught.
+        message = '_asdict() must return a dict, not %s' % (
+            _safe_type_name(returned),)
+        if path is None or not _diagnose_errors:
+            return TypeError(message)
+        return _conversion_failure(
+            TypeError(message), 'value', value, path, detail=message)
+
+    def call_method(obj, method_name, path=None):
         method = getattr(obj, method_name, None)
         if callable(method):
             try:
                 return (method(),)
-            except TypeError:
-                pass
+            except TypeError as exc:
+                # JSONEncodeError subclasses TypeError (so existing
+                # handlers keep working) but means "a nested encode failed",
+                # not "this protocol is unsupported".  Re-raise it instead
+                # of falling through to _asdict()/default().
+                if _diagnose_errors and isinstance(exc, JSONEncodeError):
+                    raise
+            except BaseException as exc:
+                replacement = _diagnose(exc, 'value', obj, path)
+                if replacement is None:
+                    raise
+                raise replacement
         return None
 
     def _encode_int(value):
@@ -532,14 +651,15 @@ def _make_iterencode(markers, _default, _encoder, _indent, _floatstr,
             return str(value)
         return '"' + str(value) + '"'
 
-    def _iterencode_method(obj, result, _current_indent_level, encode):
+    def _iterencode_method(obj, result, _current_indent_level, encode,
+                           _path=None):
         if markers is not None:
             markerid = id(obj)
             if markerid in markers:
                 raise ValueError("Circular reference detected")
             markers[markerid] = obj
         try:
-            for chunk in encode(result, _current_indent_level):
+            for chunk in encode(result, _current_indent_level, _path=_path):
                 yield chunk
         except BaseException:
             # Like the C encoder's encoder_markers_discard: release the
@@ -552,13 +672,15 @@ def _make_iterencode(markers, _default, _encoder, _indent, _floatstr,
         if markers is not None:
             del markers[markerid]
 
-    def _iterencode_list(lst, _current_indent_level, _origin=None):
+    def _iterencode_list(lst, _current_indent_level, _origin=None, _path=None):
         # _origin is the object being encoded: lst itself, or under
         # iterable_as_array the iterable that produced the iterator lst.
         # It is the circular reference marker (a fresh iterator would
         # never match) and is named in error notes. An iterator's truth
         # value says nothing about emptiness, so only lists and tuples
         # take the fast path.
+        # _path is the location of this container, extended per item for
+        # diagnostics; None when diagnose_errors is off.
         if _origin is None:
             if not lst:
                 yield '[]'
@@ -606,27 +728,43 @@ def _make_iterencode(markers, _default, _encoder, _indent, _floatstr,
                         yield buf + _encode_decimal(value, _floatstr)
                     else:
                         yield buf
-                        for_json = _for_json and call_method(value, 'for_json')
+                        # Built only on the conversion path: scalars never
+                        # need a diagnostic, so this keeps the hot loop free.
+                        item_path = (_path + (i,)
+                                     if _path is not None else None)
+                        for_json = _for_json and call_method(
+                            value, 'for_json', item_path)
                         if for_json:
-                            chunks = _iterencode_method(value, for_json[0],
-                                                        _current_indent_level, _iterencode)
+                            chunks = _iterencode_method(
+                                value, for_json[0], _current_indent_level,
+                                _iterencode, item_path)
                         else:
-                            _asdict = _namedtuple_as_object and call_method(value, '_asdict')
+                            _asdict = _namedtuple_as_object and call_method(
+                                value, '_asdict', item_path)
                             if _asdict:
                                 dct = _asdict[0]
                                 if not isinstance(dct, dict):
-                                    raise TypeError("_asdict() must return a dict, not %s" % (type(dct).__name__,))
-                                chunks = _iterencode_method(value, dct,
-                                                            _current_indent_level, _iterencode_dict)
+                                    raise _asdict_error(value, dct, item_path)
+                                chunks = _iterencode_method(
+                                    value, dct, _current_indent_level,
+                                    _iterencode_dict, item_path)
                             elif isinstance(value, list):
-                                chunks = _iterencode_list(value, _current_indent_level)
+                                chunks = _iterencode_list(
+                                    value, _current_indent_level,
+                                    _path=item_path)
                             elif _tuple_as_array and isinstance(value, tuple):
-                                chunks = _iterencode_list(value, _current_indent_level)
+                                chunks = _iterencode_list(
+                                    value, _current_indent_level,
+                                    _path=item_path)
                             elif isinstance(value, _dict_types):
-                                chunks = _iterencode_dict(value, _current_indent_level)
+                                chunks = _iterencode_dict(
+                                    value, _current_indent_level,
+                                    _path=item_path)
                             else:
                                 # for_json and _asdict were already tried
-                                chunks = _iterencode(value, _current_indent_level, True)
+                                chunks = _iterencode(
+                                    value, _current_indent_level, True,
+                                    item_path)
                         for chunk in chunks:
                             yield chunk
                 except BaseException as exc:
@@ -649,7 +787,7 @@ def _make_iterencode(markers, _default, _encoder, _indent, _floatstr,
         if markers is not None:
             del markers[markerid]
 
-    def _stringify_key(key):
+    def _stringify_key(key, _path=None):
         if isinstance(key, string_types): # pragma: no cover
             pass
         elif _PY3 and isinstance(key, bytes) and _encoding is not None:
@@ -672,11 +810,19 @@ def _make_iterencode(markers, _default, _encoder, _indent, _floatstr,
         elif _skipkeys:
             key = None
         else:
-            raise TypeError('keys must be str, int, float, bool or None, '
-                            'not %s' % key.__class__.__name__)
+            # A key that cannot be converted is reported as kind='key', so
+            # callers can tell it apart from a failing value conversion.
+            # _safe_type_name avoids letting a hostile metaclass __name__
+            # mask the conversion error.
+            error = TypeError('keys must be str, int, float, bool or None, '
+                              'not %s' % (_safe_type_name(key),))
+            replacement = _diagnose(error, 'key', key, _path)
+            if replacement is not None:
+                raise replacement
+            raise error
         return key
 
-    def _iterencode_dict(dct, _current_indent_level):
+    def _iterencode_dict(dct, _current_indent_level, _path=None):
         if not dct:
             yield '{}'
             return
@@ -704,7 +850,7 @@ def _make_iterencode(markers, _default, _encoder, _indent, _floatstr,
                 items = []
                 for k, v in dct.items():
                     if not isinstance(k, string_types):
-                        k = _stringify_key(k)
+                        k = _stringify_key(k, _path)
                         if k is None:
                             continue
                     items.append((k, v))
@@ -713,7 +859,7 @@ def _make_iterencode(markers, _default, _encoder, _indent, _floatstr,
                 items = iteritems
             for key, value in items:
                 if _item_sort_key is None and not isinstance(key, string_types):
-                    key = _stringify_key(key)
+                    key = _stringify_key(key, _path)
                     if key is None:
                         # _skipkeys must be True
                         continue
@@ -743,28 +889,46 @@ def _make_iterencode(markers, _default, _encoder, _indent, _floatstr,
                     elif _use_decimal and isinstance(value, Decimal):
                         yield _encode_decimal(value, _floatstr)
                     else:
-                        for_json = _for_json and call_method(value, 'for_json')
+                        # The diagnostic path names the source member key;
+                        # keys reaching this point are already text.  Built
+                        # only on the conversion path so scalars stay cheap.
+                        member_path = (
+                            _path + (key,) if _path is not None else None)
+                        for_json = _for_json and call_method(
+                            value, 'for_json', member_path)
                         if for_json:
-                            chunks = _iterencode_method(value, for_json[0],
-                                                        _current_indent_level, _iterencode)
+                            chunks = _iterencode_method(
+                                value, for_json[0], _current_indent_level,
+                                _iterencode, member_path)
                         else:
-                            _asdict = _namedtuple_as_object and call_method(value, '_asdict')
+                            _asdict = _namedtuple_as_object and call_method(
+                                value, '_asdict', member_path)
                             if _asdict:
                                 # Not `dct`: the note below names dct's type.
                                 asdict_dct = _asdict[0]
                                 if not isinstance(asdict_dct, dict):
-                                    raise TypeError("_asdict() must return a dict, not %s" % (type(asdict_dct).__name__,))
-                                chunks = _iterencode_method(value, asdict_dct,
-                                                            _current_indent_level, _iterencode_dict)
+                                    raise _asdict_error(
+                                        value, asdict_dct, member_path)
+                                chunks = _iterencode_method(
+                                    value, asdict_dct, _current_indent_level,
+                                    _iterencode_dict, member_path)
                             elif isinstance(value, list):
-                                chunks = _iterencode_list(value, _current_indent_level)
+                                chunks = _iterencode_list(
+                                    value, _current_indent_level,
+                                    _path=member_path)
                             elif _tuple_as_array and isinstance(value, tuple):
-                                chunks = _iterencode_list(value, _current_indent_level)
+                                chunks = _iterencode_list(
+                                    value, _current_indent_level,
+                                    _path=member_path)
                             elif isinstance(value, _dict_types):
-                                chunks = _iterencode_dict(value, _current_indent_level)
+                                chunks = _iterencode_dict(
+                                    value, _current_indent_level,
+                                    _path=member_path)
                             else:
                                 # for_json and _asdict were already tried
-                                chunks = _iterencode(value, _current_indent_level, True)
+                                chunks = _iterencode(
+                                    value, _current_indent_level, True,
+                                    member_path)
                         for chunk in chunks:
                             yield chunk
                 except BaseException as exc:
@@ -783,10 +947,13 @@ def _make_iterencode(markers, _default, _encoder, _indent, _floatstr,
         if markers is not None:
             del markers[markerid]
 
-    def _iterencode(o, _current_indent_level, _methods_tried=False):
+    def _iterencode(o, _current_indent_level, _methods_tried=False,
+                    _path=None):
         # _methods_tried: the list and dict item paths already called
         # for_json() and _asdict() on o, so calling them again would run
         # them (and any side effects) twice, unlike the C encoder.
+        # _path: location of o, tracked only for containers already
+        # entered; None when diagnose_errors is off.
         if isinstance(o, string_types):
             yield _encoder(o)
         elif _PY3 and isinstance(o, bytes) and _encoding is not None:
@@ -805,29 +972,34 @@ def _make_iterencode(markers, _default, _encoder, _indent, _floatstr,
             yield _floatstr(o)
         else:
             for_json = (_for_json and not _methods_tried
-                        and call_method(o, 'for_json'))
+                        and call_method(o, 'for_json', _path))
             if for_json:
-                for chunk in _iterencode_method(o, for_json[0],
-                                              _current_indent_level, _iterencode):
+                for chunk in _iterencode_method(
+                        o, for_json[0], _current_indent_level, _iterencode,
+                        _path):
                     yield chunk
             else:
                 _asdict = (_namedtuple_as_object and not _methods_tried
-                           and call_method(o, '_asdict'))
+                           and call_method(o, '_asdict', _path))
                 if _asdict:
                     dct = _asdict[0]
                     if not isinstance(dct, dict):
-                        raise TypeError("_asdict() must return a dict, not %s" % (type(dct).__name__,))
-                    for chunk in _iterencode_method(o, dct,
-                                                  _current_indent_level, _iterencode_dict):
+                        raise _asdict_error(o, dct, _path)
+                    for chunk in _iterencode_method(
+                            o, dct, _current_indent_level, _iterencode_dict,
+                            _path):
                         yield chunk
                 elif isinstance(o, list):
-                    for chunk in _iterencode_list(o, _current_indent_level):
+                    for chunk in _iterencode_list(
+                            o, _current_indent_level, _path=_path):
                         yield chunk
                 elif (_tuple_as_array and isinstance(o, tuple)):
-                    for chunk in _iterencode_list(o, _current_indent_level):
+                    for chunk in _iterencode_list(
+                            o, _current_indent_level, _path=_path):
                         yield chunk
                 elif isinstance(o, _dict_types):
-                    for chunk in _iterencode_dict(o, _current_indent_level):
+                    for chunk in _iterencode_dict(
+                            o, _current_indent_level, _path=_path):
                         yield chunk
                 elif _use_decimal and isinstance(o, Decimal):
                     yield _encode_decimal(o, _floatstr)
@@ -843,7 +1015,7 @@ def _make_iterencode(markers, _default, _encoder, _indent, _floatstr,
                             break
                         for chunk in _iterencode_list(iterator,
                                                       _current_indent_level,
-                                                      o):
+                                                      o, _path):
                             yield chunk
                         return
                     if markers is not None:
@@ -852,14 +1024,30 @@ def _make_iterencode(markers, _default, _encoder, _indent, _floatstr,
                             raise ValueError("Circular reference detected")
                         markers[markerid] = o
                     try:
-                        o = _default(o)
-                        for chunk in _iterencode(o, _current_indent_level):
+                        converted = _default(o)
+                    except BaseException as exc:
+                        if markers is not None:
+                            markers.pop(markerid, None)
+                        replacement = _diagnose(exc, 'value', o, _path)
+                        if replacement is not None:
+                            _annotate_exception(
+                                replacement, 'when serializing %s object', o)
+                            raise replacement
+                        _annotate_exception(
+                            exc, 'when serializing %s object', o)
+                        raise
+                    try:
+                        for chunk in _iterencode(converted,
+                                                 _current_indent_level,
+                                                 _path=_path):
                             yield chunk
                     except BaseException as exc:
                         if markers is not None:
                             markers.pop(markerid, None)
+                        # default() succeeded, so this note reflects the
+                        # returned object's type, matching the C encoder.
                         _annotate_exception(
-                            exc, 'when serializing %s object', o)
+                            exc, 'when serializing %s object', converted)
                         raise
                     if markers is not None:
                         del markers[markerid]

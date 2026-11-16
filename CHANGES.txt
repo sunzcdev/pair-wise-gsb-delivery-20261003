@@ -1,3 +1,23 @@
+Version 4.4.0 released 2026-11-17
+
+* The Python encoder gained an opt-in ``diagnose_errors`` option. When it
+  is enabled, a failure inside ``default()``, ``for_json()``, ``_asdict()``
+  or object-key conversion is raised as ``simplejson.JSONEncodeError``,
+  which locates the failing position as a JSONPath-like string such as
+  ``$.records[3].payload`` and keeps the original exception as
+  ``__cause__``/``original``. Object-key failures report ``kind='key'`` to
+  distinguish them from value failures, so a batch of records can be traced
+  back to the exact record and field. Only the path and the offending
+  value's type name are recorded -- never the value itself -- so sensitive
+  payloads do not leak into messages or notes. The path covers only
+  containers the encoder actually entered and never re-runs a conversion
+  callback to recover position information. Because ``iterencode()``
+  streams, ``JSONEncodeError.complete`` is always ``False`` and
+  ``prefix_emitted`` reports whether chunks had already been yielded, so a
+  truncated document is never mistaken for a complete one. The option
+  forces the pure Python encoder because the C speedups do not track
+  positions.
+
 Version 4.3.0 released 2026-11-10
 
 * The C encoder no longer crashes when ``default()`` or ``for_json()``

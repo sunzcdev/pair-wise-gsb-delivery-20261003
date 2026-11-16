@@ -121,7 +121,7 @@ from __future__ import absolute_import
 __version__ = '4.3.0'
 __all__ = [
     'dump', 'dumps', 'load', 'loads',
-    'JSONDecoder', 'JSONDecodeError', 'JSONEncoder',
+    'JSONDecoder', 'JSONDecodeError', 'JSONEncoder', 'JSONEncodeError',
     'OrderedDict', 'simple_first', 'RawJSON'
 ]
 
@@ -129,7 +129,7 @@ __author__ = 'Bob Ippolito <bob@redivi.com>'
 
 from decimal import Decimal
 
-from .errors import JSONDecodeError
+from .errors import JSONDecodeError, JSONEncodeError
 from .raw_json import RawJSON
 from .decoder import JSONDecoder
 from .encoder import JSONEncoder, JSONEncoderForHTML
@@ -158,7 +158,7 @@ def dump(obj, fp, skipkeys=False, ensure_ascii=True, check_circular=True,
          namedtuple_as_object=True, tuple_as_array=True,
          bigint_as_string=False, sort_keys=False, item_sort_key=None,
          for_json=False, ignore_nan=False, int_as_string_bitcount=None,
-         iterable_as_array=False, **kw):
+         iterable_as_array=False, diagnose_errors=False, **kw):
     """Serialize ``obj`` as a JSON formatted stream to ``fp`` (a
     ``.write()``-supporting file-like object).
 
@@ -233,6 +233,12 @@ def dump(obj, fp, skipkeys=False, ensure_ascii=True, check_circular=True,
     ``null`` in compliance with the ECMA-262 specification. If true, this will
     override *allow_nan*.
 
+    If *diagnose_errors* is true (default: ``False``), a failure raised by
+    *default*, *for_json*, ``_asdict()`` or object-key conversion is reported
+    as a :exc:`JSONEncodeError` naming the position in the structure and
+    keeping the original exception as its ``__cause__``. This is a pure Python
+    encoder feature and forces the compatibility path.
+
     To use a custom ``JSONEncoder`` subclass (e.g. one that overrides the
     ``.default()`` method to serialize additional types), specify it with
     the ``cls`` kwarg. NOTE: You should use *default* or *for_json* instead
@@ -248,7 +254,7 @@ def dump(obj, fp, skipkeys=False, ensure_ascii=True, check_circular=True,
         and not bigint_as_string and not sort_keys
         and item_sort_key is None and not for_json
         and not ignore_nan and int_as_string_bitcount is None
-        and not kw
+        and not diagnose_errors and not kw
     ):
         iterable = _default_encoder.iterencode(obj)
     else:
@@ -267,6 +273,7 @@ def dump(obj, fp, skipkeys=False, ensure_ascii=True, check_circular=True,
             for_json=for_json,
             ignore_nan=ignore_nan,
             int_as_string_bitcount=int_as_string_bitcount,
+            diagnose_errors=diagnose_errors,
             **kw).iterencode(obj)
     # could accelerate with writelines in some versions of Python, at
     # a debuggability cost
@@ -280,7 +287,7 @@ def dumps(obj, skipkeys=False, ensure_ascii=True, check_circular=True,
           namedtuple_as_object=True, tuple_as_array=True,
           bigint_as_string=False, sort_keys=False, item_sort_key=None,
           for_json=False, ignore_nan=False, int_as_string_bitcount=None,
-          iterable_as_array=False, **kw):
+          iterable_as_array=False, diagnose_errors=False, **kw):
     """Serialize ``obj`` to a JSON formatted ``str``.
 
     If ``skipkeys`` is true then ``dict`` keys that are not basic types
@@ -360,6 +367,15 @@ def dumps(obj, skipkeys=False, ensure_ascii=True, check_circular=True,
     ``null`` in compliance with the ECMA-262 specification. If true, this will
     override *allow_nan*.
 
+    If *diagnose_errors* is true (default: ``False``), a failure raised by
+    *default*, *for_json*, ``_asdict()`` or object-key conversion is reported
+    as a :exc:`JSONEncodeError` whose ``path`` attribute locates the value
+    (for example ``$.records[3].payload``) and whose ``__cause__`` is the
+    original exception. Only the path and type names are recorded, never the
+    offending value. Use it when a batch of records must be traced back to
+    the exact record and field; it is a pure Python encoder feature and
+    therefore disables the C speedups.
+
     To use a custom ``JSONEncoder`` subclass (e.g. one that overrides the
     ``.default()`` method to serialize additional types), specify it with
     the ``cls`` kwarg. NOTE: You should use *default* instead of subclassing
@@ -375,7 +391,7 @@ def dumps(obj, skipkeys=False, ensure_ascii=True, check_circular=True,
         and not bigint_as_string and not sort_keys
         and item_sort_key is None and not for_json
         and not ignore_nan and int_as_string_bitcount is None
-        and not kw
+        and not diagnose_errors and not kw
     ):
         return _default_encoder.encode(obj)
     if cls is None:
@@ -394,6 +410,7 @@ def dumps(obj, skipkeys=False, ensure_ascii=True, check_circular=True,
         for_json=for_json,
         ignore_nan=ignore_nan,
         int_as_string_bitcount=int_as_string_bitcount,
+        diagnose_errors=diagnose_errors,
         **kw).encode(obj)
 
 
