@@ -1,3 +1,19 @@
+Development Version
+-------------------
+
+* Added ``sqlparse.split_script()``, a splitter with an optional client
+  directive mode.  When ``client_directives=True``, MySQL client style
+  ``DELIMITER`` commands that occupy a line of their own are recognized
+  as directive events and change the statement terminator, so that
+  semicolons inside procedure bodies no longer split statements.
+  Directives inside strings or comments have no effect; empty
+  delimiters or delimiters containing whitespace are rejected with
+  ``SQLParseError``.  The returned statement and directive events carry
+  original line numbers and character ranges from which the source
+  script can be reconstructed.  With the mode disabled the script is
+  split exactly like ``sqlparse.split()``.
+
+
 Release 0.6.1 (Nov 01, 2026)
 ----------------------------
 

@@ -7,10 +7,18 @@
 
 from sqlparse.engine import grouping
 from sqlparse.engine.filter_stack import FilterStack
+from sqlparse.engine.script_splitter import (
+    DirectiveEvent,
+    StatementEvent,
+    split_script,
+)
 from sqlparse.engine.statement_splitter import StatementSplitter
 
 __all__ = [
+    'DirectiveEvent',
     'FilterStack',
+    'StatementEvent',
     'StatementSplitter',
     'grouping',
+    'split_script',
 ]

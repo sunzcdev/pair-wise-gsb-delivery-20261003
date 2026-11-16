@@ -73,3 +73,22 @@ def split(
     """
     stack = engine.FilterStack(strip_semicolon=strip_semicolon)
     return [str(stmt).strip() for stmt in stack.run(sql, encoding)]
+
+
+def split_script(
+    sql: str, encoding: str | None = None, client_directives: bool = False
+) -> list[engine.StatementEvent | engine.DirectiveEvent]:
+    """Split *sql* into statement and client directive events.
+
+    :param sql: A string containing one or more SQL statements.
+    :param encoding: The encoding of the statement (optional).
+    :param client_directives: If True, recognize MySQL client style
+        ``DELIMITER`` directives that occupy a line of their own and
+        change the statement terminator accordingly (default: False).
+    :returns: A list of :class:`~sqlparse.engine.StatementEvent` and
+        :class:`~sqlparse.engine.DirectiveEvent` instances.  The events
+        carry character offsets and line numbers so that the source
+        script can be reconstructed from the event ranges.
+    """
+    return engine.split_script(
+        sql, encoding=encoding, client_directives=client_directives)
