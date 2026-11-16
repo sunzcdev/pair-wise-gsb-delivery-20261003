@@ -349,6 +349,139 @@ class TestParserCaching(unittest.TestCase):
         self.assertEqual(errors, [])
 
 
+class TestParserCacheCostBudget(unittest.TestCase):
+    def setUp(self):
+        parser.Parser.purge()
+        self._previous_max_cost = parser.Parser._MAX_COST
+        parser.Parser.set_max_cost(None)
+
+    def tearDown(self):
+        parser.Parser.set_max_cost(self._previous_max_cost)
+        parser.Parser.purge()
+
+    def test_oversized_expression_parses_but_is_not_cached(self):
+        p = parser.Parser()
+        # Budget smaller than a single expression's cost.
+        parser.Parser.set_max_cost(1)
+        parsed = p.parse('foo.bar')
+        self.assertEqual(parsed.search({'foo': {'bar': 'baz'}}), 'baz')
+        stats = parser.Parser.cache_stats()
+        self.assertEqual(stats['rejected'], 1)
+        self.assertEqual(stats['size'], 0)
+        self.assertEqual(stats['cost'], 0)
+        # Parsing again is a miss, not a hit: it never entered the cache.
+        p.parse('foo.bar')
+        stats = parser.Parser.cache_stats()
+        self.assertEqual(stats['rejected'], 2)
+        self.assertEqual(stats['hits'], 0)
+
+    def test_cost_budget_evicts_oldest_entries(self):
+        p = parser.Parser()
+        small_cost = len('a'.encode('utf-8')) + 1  # bytes + AST nodes
+        parser.Parser.set_max_cost(small_cost * 2)
+        p.parse('a')
+        p.parse('b')
+        before = parser.Parser.cache_stats()
+        self.assertEqual(before['size'], 2)
+        p.parse('c')
+        after = parser.Parser.cache_stats()
+        self.assertEqual(after['size'], 2)
+        self.assertLessEqual(after['cost'], small_cost * 2)
+        self.assertEqual(after['evictions'], before['evictions'] + 1)
+        # 'a' was evicted; 'b' and 'c' are still cached.
+        self.assertNotIn('a', parser.Parser._CACHE)
+        self.assertIn('b', parser.Parser._CACHE)
+        self.assertIn('c', parser.Parser._CACHE)
+
+    def test_failed_parse_does_not_consume_budget(self):
+        p = parser.Parser()
+        parser.Parser.set_max_cost(100)
+        before = parser.Parser.cache_stats()
+        with self.assertRaises(exceptions.ParseError):
+            p.parse('foo]baz')
+        after = parser.Parser.cache_stats()
+        self.assertEqual(after['cost'], before['cost'])
+        self.assertEqual(after['size'], before['size'])
+        self.assertEqual(after['rejected'], before['rejected'])
+        self.assertEqual(after['misses'], before['misses'] + 1)
+
+    def test_purge_resets_cost_accounting(self):
+        p = parser.Parser()
+        parser.Parser.set_max_cost(1000)
+        p.parse('foo.bar')
+        self.assertGreater(parser.Parser.cache_stats()['cost'], 0)
+        parser.Parser.purge()
+        stats = parser.Parser.cache_stats()
+        self.assertEqual(stats['cost'], 0)
+        self.assertEqual(stats['size'], 0)
+
+    def test_evicted_plans_remain_usable(self):
+        p = parser.Parser()
+        parser.Parser.set_max_cost(None)
+        first = p.parse('foo.bar')
+        # Force eviction of everything currently cached.
+        parser.Parser.set_max_cost(0)
+        self.assertEqual(parser.Parser.cache_stats()['size'], 0)
+        # The previously returned plan is unaffected by eviction.
+        self.assertEqual(first.search({'foo': {'bar': 42}}), 42)
+
+    def test_stats_distinguish_hits_misses_and_rejections(self):
+        p = parser.Parser()
+        parser.Parser.set_max_cost(None)
+        p.parse('foo')
+        p.parse('foo')
+        p.parse('bar')
+        parser.Parser.set_max_cost(1)
+        p.parse('baz.qux')
+        stats = parser.Parser.cache_stats()
+        self.assertEqual(stats['hits'], 1)
+        self.assertEqual(stats['misses'], 3)
+        self.assertEqual(stats['rejected'], 1)
+        # The snapshot is read-only: mutating it changes nothing.
+        stats['hits'] = 999
+        self.assertEqual(parser.Parser.cache_stats()['hits'], 1)
+
+    def test_search_data_is_not_charged_to_cache(self):
+        p = parser.Parser()
+        parser.Parser.set_max_cost(None)
+        parsed = p.parse('foo[*].bar')
+        before = parser.Parser.cache_stats()
+        parsed.search({'foo': [{'bar': 'x' * 100000}]})
+        after = parser.Parser.cache_stats()
+        self.assertEqual(before['cost'], after['cost'])
+        self.assertEqual(before['size'], after['size'])
+
+    def test_concurrent_compile_and_purge_keep_counts_consistent(self):
+        parser.Parser.set_max_cost(None)
+        errors = []
+
+        def compiler():
+            p = parser.Parser()
+            for i in range(200):
+                try:
+                    p.parse('field%s' % (i % 50))
+                except Exception as e:
+                    errors.append(e)
+
+        def purger():
+            for _ in range(50):
+                parser.Parser.purge()
+
+        threads = ([threading.Thread(target=compiler) for _ in range(4)] +
+                   [threading.Thread(target=purger) for _ in range(2)])
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+        self.assertEqual(errors, [])
+        stats = parser.Parser.cache_stats()
+        self.assertEqual(
+            stats['cost'],
+            sum(parser.Parser._CACHE_COSTS.values()))
+        self.assertEqual(stats['size'], len(parser.Parser._CACHE))
+        self.assertEqual(stats['size'], len(parser.Parser._CACHE_COSTS))
+
+
 class TestParserAddsExpressionAttribute(unittest.TestCase):
     def test_expression_available_from_parser(self):
         p = parser.Parser()

@@ -25,11 +25,33 @@ A few notes on the implementation.
   consuming from the token iterator one token at a time.
 
 """
+import threading
+
 from jmespath import lexer
 from jmespath.compat import with_repr_method
 from jmespath import ast
 from jmespath import exceptions
 from jmespath import visitor
+
+
+def _ast_node_count(node):
+    """Count the number of nodes in an AST.
+
+    The count is iterative so deeply nested expressions do not
+    exhaust the recursion limit.  Only the AST itself is measured;
+    any data the compiled expression is later executed against is
+    never part of this accounting.
+    """
+    total = 0
+    stack = [node]
+    while stack:
+        current = stack.pop()
+        if not isinstance(current, dict):
+            # Slice nodes can contain None placeholders.
+            continue
+        total += 1
+        stack.extend(current.get('children') or [])
+    return total
 
 
 class Parser(object):
@@ -72,6 +94,27 @@ class Parser(object):
     # _CACHE dict.
     _CACHE = {}
     _MAX_SIZE = 512
+    # Optional total cost budget for the cache.  Each cached
+    # expression is charged ``len(expression.encode('utf-8'))``
+    # plus the number of nodes in its AST.  ``None`` disables
+    # cost based eviction and only _MAX_SIZE applies.
+    _MAX_COST = None
+    # Per entry cost so evictions can refund the budget.
+    _CACHE_COSTS = {}
+    # Total cost of everything currently in _CACHE.  Guarded by
+    # _CACHE_LOCK together with _CACHE, _CACHE_COSTS and
+    # _CACHE_STATS so concurrent compiles and purge() keep the
+    # counters consistent with the actual cache contents.
+    _CACHE_COST = 0
+    _CACHE_LOCK = threading.Lock()
+    _CACHE_STATS = {
+        'hits': 0,
+        'misses': 0,
+        # Expressions that parsed successfully but were too
+        # expensive to store in the shared cache.
+        'rejected': 0,
+        'evictions': 0,
+    }
 
     def __init__(self, lookahead=2):
         self.tokenizer = None
@@ -80,27 +123,63 @@ class Parser(object):
         self._index = 0
 
     def parse(self, expression):
-        try:
-            return self._CACHE[expression]
-        except KeyError:
-            pass
-        parsed_result = self._do_parse(expression)
-        if len(self._CACHE) >= self._MAX_SIZE:
+        # NOTE: _CACHE_COST is a class level counter, so it is
+        # always read and written through the class (never via
+        # ``self._CACHE_COST = ...``, which would create an
+        # instance attribute shadowing the shared counter).
+        cls = type(self)
+        with cls._CACHE_LOCK:
             try:
-                del self._CACHE[next(iter(self._CACHE))]
-            except (KeyError, StopIteration, RuntimeError):
-                # KeyError - Another thread else already deleted the key.
-                # RuntimeError - Another modified the cache.
-                # StopIteration - (Unlikely) Cache is empty.
-                #
-                # If we encounter an error we should NOT be adding to the
-                # cache.  To ensure we do not exceed self._MAX_SIZE, we
-                # can only add to the cache if we successfully removed
-                # an element from the cache, otherwise this can grow
-                # unbounded.
+                result = cls._CACHE[expression]
+            except KeyError:
+                cls._CACHE_STATS['misses'] += 1
+            else:
+                cls._CACHE_STATS['hits'] += 1
+                return result
+        # Parse outside the lock so concurrent compiles of
+        # different expressions can proceed in parallel.  A failed
+        # parse raises here and never touches the cache, so it does
+        # not consume any of the cost budget.
+        parsed_result = self._do_parse(expression)
+        cost = self._expression_cost(expression, parsed_result.parsed)
+        with cls._CACHE_LOCK:
+            max_cost = cls._MAX_COST
+            if max_cost is not None and cost > max_cost:
+                # The expression is valid and the parsed plan is
+                # returned to the caller, but a single entry this
+                # expensive is never admitted to the shared cache.
+                cls._CACHE_STATS['rejected'] += 1
                 return parsed_result
-        self._CACHE[expression] = parsed_result
+            # Another thread may have compiled the same expression
+            # while we were parsing.  Refund the stale entry so the
+            # cost accounting stays exact.
+            previous_cost = cls._CACHE_COSTS.pop(expression, None)
+            if previous_cost is not None:
+                cls._CACHE.pop(expression, None)
+                cls._CACHE_COST -= previous_cost
+            while cls._CACHE and (
+                    len(cls._CACHE) >= cls._MAX_SIZE or
+                    (max_cost is not None and
+                     cls._CACHE_COST + cost > max_cost)):
+                # Evict the oldest entry.  Eviction only removes the
+                # shared reference; ParsedResult objects already
+                # handed out remain fully usable.
+                oldest = next(iter(cls._CACHE))
+                del cls._CACHE[oldest]
+                cls._CACHE_COST -= cls._CACHE_COSTS.pop(oldest, 0)
+                cls._CACHE_STATS['evictions'] += 1
+            cls._CACHE[expression] = parsed_result
+            cls._CACHE_COSTS[expression] = cost
+            cls._CACHE_COST += cost
         return parsed_result
+
+    @staticmethod
+    def _expression_cost(expression, parsed):
+        # Charged as the UTF-8 byte size of the expression plus the
+        # number of AST nodes it compiled to.  The data an
+        # expression is executed against is deliberately not part
+        # of the cost; only the compiled plan is cached.
+        return len(expression.encode('utf-8')) + _ast_node_count(parsed)
 
     def _do_parse(self, expression):
         try:
@@ -501,8 +580,63 @@ class Parser(object):
 
     @classmethod
     def purge(cls):
-        """Clear the expression compilation cache."""
-        cls._CACHE.clear()
+        """Clear the expression compilation cache.
+
+        Also resets the cumulative statistics so the counters
+        always describe the cache as it exists after the purge.
+        """
+        with cls._CACHE_LOCK:
+            cls._CACHE.clear()
+            cls._CACHE_COSTS.clear()
+            cls._CACHE_COST = 0
+            for key in cls._CACHE_STATS:
+                cls._CACHE_STATS[key] = 0
+
+    @classmethod
+    def set_max_cost(cls, max_cost):
+        """Set the optional total cost budget for the cache.
+
+        ``max_cost`` is the maximum summed cost (expression bytes
+        plus AST node count) of all cached expressions, or ``None``
+        to disable cost based eviction.  Lowering the budget evicts
+        the oldest entries until the cache is within budget.
+        """
+        if max_cost is not None and max_cost < 0:
+            raise ValueError('max_cost must be non-negative or None')
+        with cls._CACHE_LOCK:
+            cls._MAX_COST = max_cost
+            if max_cost is not None:
+                while cls._CACHE and cls._CACHE_COST > max_cost:
+                    oldest = next(iter(cls._CACHE))
+                    del cls._CACHE[oldest]
+                    cls._CACHE_COST -= cls._CACHE_COSTS.pop(oldest, 0)
+                    cls._CACHE_STATS['evictions'] += 1
+
+    @classmethod
+    def cache_stats(cls):
+        """Return a read-only snapshot of cache statistics.
+
+        The returned dict is a copy; mutating it has no effect on
+        the cache.  Keys:
+
+        * ``hits`` - expressions served from the cache.
+        * ``misses`` - expressions not found in the cache.
+        * ``rejected`` - expressions that parsed successfully but
+          were too expensive to admit to the shared cache.
+        * ``evictions`` - entries removed to satisfy the size or
+          cost budget.
+        * ``size`` / ``cost`` - current entry count and total cost.
+        * ``max_size`` / ``max_cost`` - configured budgets.
+        """
+        with cls._CACHE_LOCK:
+            stats = dict(cls._CACHE_STATS)
+            stats.update({
+                'size': len(cls._CACHE),
+                'cost': cls._CACHE_COST,
+                'max_size': cls._MAX_SIZE,
+                'max_cost': cls._MAX_COST,
+            })
+        return stats
 
 
 @with_repr_method

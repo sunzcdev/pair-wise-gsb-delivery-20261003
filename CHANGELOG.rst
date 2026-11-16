@@ -1,7 +1,13 @@
 Next Release (TBD)
 ==================
 
-* No changes yet.
+* Add an optional cost budget for the expression cache.  Cached
+  expressions are charged by expression byte size plus AST node
+  count (``Parser.set_max_cost()``); expressions over budget still
+  parse but are not admitted to the shared cache.  Added
+  ``Parser.cache_stats()`` for read-only cache statistics
+  (hits/misses/rejections/evictions) and made cache accounting
+  consistent under concurrent compiles and ``purge()``.
 
 
 1.1.0
