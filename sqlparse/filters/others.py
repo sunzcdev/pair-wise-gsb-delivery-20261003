@@ -13,39 +13,66 @@ from sqlparse.utils import split_unquoted_newlines
 
 
 class StripCommentsFilter:
+    """Removes comments from statements.
+
+    Optimizer hints (``/*+ ... */``, ``--+ ...``, ``#+ ...``) are always
+    kept (see issue262).  Additional comment categories can be preserved
+    by passing ``keep_prefixes``: a comment whose text starts with one of
+    the given prefixes is kept in its original position.  Prefixes are
+    matched against the raw comment text, so they should include the
+    comment opener, e.g. ``--!`` or ``/*!``.
+    """
+
+    def __init__(self, keep_prefixes=()):
+        self.keep_prefixes = tuple(keep_prefixes)
 
     @staticmethod
-    def _process(tlist):
+    def _get_insert_token(token):
+        """Returns either a whitespace or the line breaks from token."""
+        # See issue484 why line breaks should be preserved.
+        # Note: The actual value for a line break is replaced by \n
+        # in SerializerUnicode which will be executed in the
+        # postprocessing state.
+        m = re.search(r'([\r\n]+) *$', token.value)
+        if m is not None:
+            return sql.Token(T.Whitespace.Newline, m.groups()[0])
+        else:
+            return sql.Token(T.Whitespace, ' ')
+
+    @staticmethod
+    def _is_sql_hint(token):
+        # skipping token remove if token is a SQL-Hint. issue262
+        sql_hints = (T.Comment.Multiline.Hint, T.Comment.Single.Hint)
+        return token.ttype in sql_hints
+
+    def _is_kept(self, token):
+        """Returns True if the comment belongs to a preserved category."""
+        if isinstance(token, sql.Comment):
+            # Grouped comments are cleaned inside out: sublists are
+            # processed first, so every comment token still left in the
+            # group (hint or prefix-marked) belongs to a preserved
+            # category.  A group without any remaining comment token
+            # holds only whitespace and can be removed.
+            return any(isinstance(child, sql.Comment)
+                       or child.ttype in T.Comment
+                       for child in token.tokens)
+        if self._is_sql_hint(token):
+            return True
+        if not self.keep_prefixes:
+            return False
+        # Only genuine comment tokens reach this point; comment-like
+        # text inside string literals is never lexed as a comment.
+        return token.value.startswith(self.keep_prefixes)
+
+    def _process(self, tlist):
         def get_next_comment(idx=-1):
             # TODO(andi) Comment types should be unified, see related issue38
             return tlist.token_next_by(i=sql.Comment, t=T.Comment, idx=idx)
 
-        def _get_insert_token(token):
-            """Returns either a whitespace or the line breaks from token."""
-            # See issue484 why line breaks should be preserved.
-            # Note: The actual value for a line break is replaced by \n
-            # in SerializerUnicode which will be executed in the
-            # postprocessing state.
-            m = re.search(r'([\r\n]+) *$', token.value)
-            if m is not None:
-                return sql.Token(T.Whitespace.Newline, m.groups()[0])
-            else:
-                return sql.Token(T.Whitespace, ' ')
-
-        sql_hints = (T.Comment.Multiline.Hint, T.Comment.Single.Hint)
+        _get_insert_token = self._get_insert_token
         tidx, token = get_next_comment()
         while token:
-            # skipping token remove if token is a SQL-Hint. issue262
-            is_sql_hint = False
-            if token.ttype in sql_hints:
-                is_sql_hint = True
-            elif isinstance(token, sql.Comment):
-                comment_tokens = token.tokens
-                if len(comment_tokens) > 0:
-                    if comment_tokens[0].ttype in sql_hints:
-                        is_sql_hint = True
-
-            if is_sql_hint:
+            if self._is_kept(token):
                 # using current index as start index to search next token for
                 # preventing infinite loop in cases when token type is a
                 # "SQL-Hint" and has to be skipped
@@ -68,6 +95,10 @@ class StripCommentsFilter:
                 tlist.tokens.remove(token)
                 tidx -= 1
             else:
+                # The comment sits between two non-whitespace tokens;
+                # replacing it by a whitespace (or its own line breaks)
+                # prevents the surrounding tokens from being glued into
+                # a single word.
                 tlist.tokens[tidx] = _get_insert_token(token)
 
             # using current index as start index to search next token for
@@ -77,7 +108,7 @@ class StripCommentsFilter:
 
     def process(self, stmt):
         [self.process(sgroup) for sgroup in stmt.get_sublists()]
-        StripCommentsFilter._process(stmt)
+        self._process(stmt)
         return stmt
 
 

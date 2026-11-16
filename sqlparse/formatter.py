@@ -33,6 +33,24 @@ def validate_options(options):
         raise SQLParseError('Invalid value for strip_comments: '
                             f'{strip_comments!r}')
 
+    keep_comment_prefixes = options.get('keep_comment_prefixes')
+    if keep_comment_prefixes is None:
+        keep_comment_prefixes = ()
+    elif isinstance(keep_comment_prefixes, str):
+        keep_comment_prefixes = (keep_comment_prefixes,)
+    else:
+        try:
+            keep_comment_prefixes = tuple(keep_comment_prefixes)
+        except TypeError:
+            raise SQLParseError(
+                'Invalid value for keep_comment_prefixes: '
+                f'{keep_comment_prefixes!r}')
+    if not all(isinstance(prefix, str) and prefix
+               for prefix in keep_comment_prefixes):
+        raise SQLParseError('keep_comment_prefixes requires non-empty '
+                            'strings')
+    options['keep_comment_prefixes'] = keep_comment_prefixes
+
     space_around_operators = options.get('use_space_around_operators', False)
     if space_around_operators not in [True, False]:
         raise SQLParseError('Invalid value for use_space_around_operators: '
@@ -161,7 +179,8 @@ def build_filter_stack(stack, options):
     # After grouping
     if options.get('strip_comments'):
         stack.enable_grouping()
-        stack.stmtprocess.append(filters.StripCommentsFilter())
+        stack.stmtprocess.append(filters.StripCommentsFilter(
+            keep_prefixes=options.get('keep_comment_prefixes', ())))
 
     if options.get('strip_whitespace') or options.get('reindent'):
         stack.enable_grouping()

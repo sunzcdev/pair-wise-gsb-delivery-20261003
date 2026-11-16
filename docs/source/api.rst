@@ -33,7 +33,16 @@ The :meth:`~sqlparse.format` function accepts the following keyword arguments.
   and "capitalize".
 
 ``strip_comments``
-  If ``True`` comments are removed from the statements.
+  If ``True`` comments are removed from the statements. Optimizer hints
+  (e.g. ``/*+ ... */`` or ``--+ ...``) are always preserved.
+
+``keep_comment_prefixes``
+  An iterable of strings (or a single string). When ``strip_comments`` is
+  enabled, comments whose text starts with one of the given prefixes are
+  kept in their original position instead of being removed. Prefixes are
+  matched against the raw comment text, so they should include the comment
+  opener, e.g. ``["--!", "/*!"]``. Comment-like text inside string
+  literals is never treated as a comment.
 
 ``truncate_strings``
   If ``truncate_strings`` is a positive integer, string literals longer than

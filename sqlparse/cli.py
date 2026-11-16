@@ -94,6 +94,15 @@ def create_parser():
         help='remove comments')
 
     group.add_argument(
+        '--keep-comment-prefix',
+        dest='keep_comment_prefixes',
+        action='append',
+        metavar='PREFIX',
+        help='keep comments starting with PREFIX when stripping comments '
+             '(may be given multiple times; optimizer hints are always '
+             'kept)')
+
+    group.add_argument(
         '-r', '--reindent',
         dest='reindent',
         action='store_true',

@@ -138,6 +138,111 @@ class TestFormat:
         res = sqlparse.format(sql, strip_comments=True)
         assert res == sql
 
+    def test_strip_comments_keep_prefixes(self):
+        sql = 'select a --! keep me\nfrom foo -- drop me\nwhere x = 1'
+        res = sqlparse.format(sql, strip_comments=True,
+                              keep_comment_prefixes=['--!'])
+        assert res == 'select a --! keep me\nfrom foo\nwhere x = 1'
+        # block comment markers are kept in place, normal ones removed
+        sql = 'select /*!40000 SQL_NO_CACHE */ a from t /* normal */'
+        res = sqlparse.format(sql, strip_comments=True,
+                              keep_comment_prefixes=['/*!'])
+        assert res == 'select /*!40000 SQL_NO_CACHE */ a from t'
+        # a single string is accepted as one prefix
+        sql = 'select 1 --! marker'
+        res = sqlparse.format(sql, strip_comments=True,
+                              keep_comment_prefixes='--!')
+        assert res == sql
+        # multiple prefixes
+        sql = '--@ collect\nselect 1 --! audit\n/* plain */'
+        res = sqlparse.format(sql, strip_comments=True,
+                              keep_comment_prefixes=['--@', '--!'])
+        assert res == '--@ collect\nselect 1 --! audit\n'
+        # hints are kept even without keep_comment_prefixes
+        sql = 'select /*+ full(t) */ a from t --! marker'
+        res = sqlparse.format(sql, strip_comments=True,
+                              keep_comment_prefixes=['--!'])
+        assert res == sql
+        # prefixes don't match comments starting differently
+        sql = 'select 1 --!! not matched'
+        res = sqlparse.format(sql, strip_comments=True,
+                              keep_comment_prefixes=['--!x'])
+        assert res == 'select 1'
+        # adjacent comments are grouped; the marker survives while the
+        # plain comment next to it is removed
+        sql = 'select 1 /* plain */ /*! kept */ from t'
+        res = sqlparse.format(sql, strip_comments=True,
+                              keep_comment_prefixes=['/*!'])
+        assert res == 'select 1  /*! kept */ from t'
+        sql = '-- plain\n--! keep\nselect 1'
+        res = sqlparse.format(sql, strip_comments=True,
+                              keep_comment_prefixes=['--!'])
+        assert res == '--! keep\nselect 1'
+        # a hint preceded by a plain comment in the same group is kept
+        sql = 'select 1 /* plain */ /*+ hint */ from t'
+        res = sqlparse.format(sql, strip_comments=True)
+        assert res == 'select 1  /*+ hint */ from t'
+
+    def test_strip_comments_keep_prefixes_invalid_option(self):
+        sql = 'select 1 --! marker'
+        with pytest.raises(SQLParseError):
+            sqlparse.format(sql, strip_comments=True,
+                            keep_comment_prefixes=[''])
+        with pytest.raises(SQLParseError):
+            sqlparse.format(sql, strip_comments=True,
+                            keep_comment_prefixes=[1])
+        with pytest.raises(SQLParseError):
+            sqlparse.format(sql, strip_comments=True,
+                            keep_comment_prefixes=5)
+
+    def test_strip_comments_keep_prefixes_no_gluing(self):
+        # removing a comment must not glue the surrounding tokens together
+        sql = 'select a/*x*/b from t'
+        res = sqlparse.format(sql, strip_comments=True,
+                              keep_comment_prefixes=['--!'])
+        assert res == 'select a b from t'
+        sql = 'select a--x\nb from t'
+        res = sqlparse.format(sql, strip_comments=True,
+                              keep_comment_prefixes=['--!'])
+        assert res == 'select a\nb from t'
+        # kept markers sit between tokens without disturbing them
+        sql = 'select a--! keep\nb from t'
+        res = sqlparse.format(sql, strip_comments=True,
+                              keep_comment_prefixes=['--!'])
+        assert res == 'select a--! keep\nb from t'
+
+    def test_strip_comments_keep_prefixes_ignores_strings(self):
+        # comment-like text inside string literals is not a marker
+        sql = "select '--! not a marker' as s --! real\nfrom t"
+        res = sqlparse.format(sql, strip_comments=True,
+                              keep_comment_prefixes=['--!'])
+        assert res == sql
+        sql = "select '/* not a comment */' as c /* real */ from t"
+        res = sqlparse.format(sql, strip_comments=True,
+                              keep_comment_prefixes=['/*!'])
+        assert res == "select '/* not a comment */' as c   from t"
+        # a string is never removed, even if it looks like a comment
+        sql = "select '-- plain' as s from t"
+        res = sqlparse.format(sql, strip_comments=True)
+        assert res == sql
+
+    def test_strip_comments_keep_prefixes_reindent(self):
+        # kept hints and markers stay attached to their statement
+        sql = 'select /*+ full(t) */ a from t where x = 1 -- drop\nand y = 2'
+        res = sqlparse.format(sql, strip_comments=True, reindent=True)
+        assert res == '\n'.join([
+            'select /*+ full(t) */ a',
+            'from t',
+            'where x = 1',
+            '  and y = 2'])
+        sql = 'select a --! important\nfrom t where x = 1'
+        res = sqlparse.format(sql, strip_comments=True, reindent=True,
+                              keep_comment_prefixes=['--!'])
+        assert res == '\n'.join([
+            'select a --! important',
+            'from t',
+            'where x = 1'])
+
     def test_strip_ws(self):
         f = lambda sql: sqlparse.format(sql, strip_whitespace=True)
         s = 'select\n* from      foo\n\twhere  ( 1 = 2 )\n'
