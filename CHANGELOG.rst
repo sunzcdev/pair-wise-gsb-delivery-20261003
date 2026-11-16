@@ -1,7 +1,14 @@
 Next Release (TBD)
 ==================
 
-* No changes yet.
+* Add a streaming search entry point (``jmespath.stream_search`` and
+  ``ParsedResult.stream_search``) that evaluates a projection or filter
+  projection over an outer array one element at a time and returns an
+  iterator.  Expressions that cannot be processed item by item — sorting,
+  reversing, length dependent slices or indexes, or functions without a
+  streamable capability declaration — raise
+  ``StreamingExpressionError`` before the source is read, so a one shot
+  iterable is never partially consumed.
 
 
 1.1.0

@@ -118,5 +118,15 @@ class EmptyExpressionError(JMESPathError):
             "Invalid JMESPath expression: cannot be empty.")
 
 
+class StreamingExpressionError(JMESPathError):
+    """Raised when an expression cannot be evaluated against a stream.
+
+    The check is performed entirely against the parsed expression, before
+    the streaming source is ever read, so a source never gets partially
+    consumed by an expression that turns out to be non streamable.
+    """
+    pass
+
+
 class UnknownFunctionError(JMESPathError):
     pass

@@ -42,6 +42,18 @@ def signature(*arguments):
     return _record_signature
 
 
+def streamable(func):
+    """Declare that a function can be evaluated item by item.
+
+    A streamable function never needs to buffer the entire outer array,
+    know its length, or reorder it.  Functions without this explicit
+    capability declaration are not streamable and must be rejected before
+    a streaming source is read.
+    """
+    func.streamable = True
+    return func
+
+
 class FunctionRegistry(type):
     def __init__(cls, name, bases, attrs):
         cls._populate_function_table()
@@ -68,6 +80,38 @@ class Functions(metaclass=FunctionRegistry):
 
     FUNCTION_TABLE = {
     }
+
+    #: Capability declaration of the built in functions that can be
+    #: evaluated element by element.  A function is streamable only when it
+    #: never has to see the whole array: it must not aggregate, reorder,
+    #: reverse, or rely on the total length of its input.  Everything not
+    #: listed here (or otherwise marked with ``streamable``) is rejected up
+    #: front by the streaming interpreter rather than discovered at runtime.
+    STREAMABLE_FUNCTIONS = frozenset([
+        # Scalar / element wise helpers.
+        'abs', 'ceil', 'floor', 'not_null', 'to_array', 'to_string',
+        'to_number', 'type', 'contains', 'ends_with', 'starts_with',
+        # Object helpers applied to a single element.
+        'keys', 'values', 'merge',
+        # map() applies an expression one element at a time and keeps every
+        # result (including nulls), so it can be driven by the stream.
+        'map',
+    ])
+
+    def is_streamable(self, function_name):
+        """Return whether a function is declared safe for streaming.
+
+        The answer comes solely from the capability declaration: the built
+        in :data:`STREAMABLE_FUNCTIONS` set and the ``streamable`` marker
+        that custom functions can carry.  It is never inferred from what a
+        particular evaluation happens to touch.
+        """
+        if function_name in self.STREAMABLE_FUNCTIONS:
+            return True
+        spec = self.FUNCTION_TABLE.get(function_name)
+        if spec is not None:
+            return getattr(spec['function'], 'streamable', False)
+        return False
 
     def call_function(self, function_name, resolved_args):
         try:

@@ -516,6 +516,20 @@ class ParsedResult(object):
         result = interpreter.visit(self.parsed, value)
         return result
 
+    def stream_search(self, value, options=None):
+        """Lazily evaluate this expression over an outer array source.
+
+        Returns an iterator that yields one projected element at a time.
+        Only projections and filter projections that can be processed item
+        by item are accepted; everything else raises a
+        :class:`jmespath.exceptions.StreamingExpressionError` before
+        ``value`` is read, so a one shot iterable is never partially
+        consumed.
+        """
+        from jmespath.stream import StreamingTreeInterpreter
+        interpreter = StreamingTreeInterpreter(options)
+        return interpreter.stream_search(self.parsed, value)
+
     def _render_dot_file(self):
         """Render the parsed AST as a dot file.
 

@@ -1,5 +1,7 @@
 from jmespath import parser
+from jmespath import exceptions
 from jmespath.visitor import Options
+from jmespath.stream import stream_search
 
 __version__ = '1.1.0'
 
