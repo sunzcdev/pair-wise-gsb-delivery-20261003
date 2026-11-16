@@ -32,14 +32,15 @@ from . import css_match as cm
 from . import css_types as ct
 from .util import DEBUG, NOCACHE, NOSTRICT, SelectorSyntaxError  # noqa: F401
 import bs4
-from typing import Any, Mapping, Iterator, Iterable, cast
+from typing import Any, Mapping, Iterable, cast
 
 __all__ = (
-    'DEBUG', 'NOCACHE', 'NOSTRICT', 'SelectorSyntaxError', 'CustomSelectors', 'SoupSieve',
+    'DEBUG', 'NOCACHE', 'NOSTRICT', 'Selection', 'SelectorSyntaxError', 'CustomSelectors', 'SoupSieve',
     'closest', 'compile', 'filter', 'iselect', 'match', 'select', 'select_one'
 )
 
 SoupSieve = cm.SoupSieve
+Selection = cm.Selection
 CustomSelectors = ct.CustomSelectors
 
 
@@ -213,11 +214,20 @@ def iselect(
     custom: Mapping[str, str | ct.SelectorList] | None = None,
     ignore: Iterable[str] | None = None,
     max_selectors: int = cp.SELECTOR_LIMIT,
+    stable: bool = False,
     **kwargs: Any
-) -> Iterator[bs4.Tag]:
-    """Iterate the specified tags."""
+) -> cm.Selection:
+    """
+    Iterate the specified tags.
 
-    yield from compile(
+    By default, the returned `Selection` iterates the live tree (`view` is `'live'`).
+    When `stable` is enabled, it instead traverses a snapshot of the candidate tags
+    captured at creation (`view` is `'snapshot'`), so moving nodes within the same
+    tree, inserting siblings, or deleting not yet visited ancestors while consuming
+    the iterator cannot silently skip or repeat results.
+    """
+
+    return compile(
         select,
         namespaces,
         flags,
@@ -225,7 +235,7 @@ def iselect(
         ignore=ignore,
         max_selectors=max_selectors,
         **kwargs
-    ).iselect(tag, limit)
+    ).iselect(tag, limit, stable=stable)
 
 
 def escape(ident: str) -> str:

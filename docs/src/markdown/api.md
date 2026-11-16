@@ -154,11 +154,33 @@ sv.select('p:is(.a, .b, .c)', soup)
 ## `soupsieve.iselect()`
 
 ```py
-def iselect(select, node, namespaces=None, limit=0, flags=0, **kwargs):
+def iselect(select, node, namespaces=None, limit=0, flags=0, *, stable=False, **kwargs):
     """Select the specified tags."""
 ```
 
-`iselect` is exactly like `select` except that it returns a generator instead of a list.
+`iselect` is exactly like `select` except that it returns a `Selection` iterator instead of a list.
+
+By default, the iterator walks the live tree, so structural changes made to the document while consuming the
+iterator are reflected in the remaining results. When `stable` is set to `True`, the iterator instead traverses a
+snapshot of the candidate tags captured, in document order, when the iterator is created. Under this snapshot view,
+moving nodes within the same tree, inserting siblings, or deleting not yet visited ancestors cannot cause results
+to be silently skipped or repeated. Tags are always yielded as the exact `Tag` objects in the document; the
+snapshot never copies them.
+
+The returned `Selection` declares the traversal view in use via its `view` attribute, which is either `'live'`
+(the default) or `'snapshot'`. Calling its `close()` method releases the state held for the traversal before the
+iterator is exhausted; it can also be used as a context manager, which closes it on exit.
+
+```py play session="example1"
+with sv.iselect('p:is(.a, .b, .c)', soup, stable=True) as selection:
+    selection.view
+    for el in selection:
+        print(el)
+```
+
+> [!new] New in 4.2
+> The `stable` parameter and the `Selection` object with its `view` attribute and `close()` method were added in
+> 4.2. Previously, `iselect` returned a plain generator iterating the live tree.
 
 ## `soupsieve.closest()`
 
@@ -258,7 +280,7 @@ class SoupSieve:
     def select(self, tag, limit=0):
         """Select the specified tags."""
 
-    def iselect(self, tag, limit=0):
+    def iselect(self, tag, limit=0, *, stable=False):
         """Iterate the specified tags."""
 ```
 

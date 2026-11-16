@@ -2150,20 +2150,6 @@ class CSSMatch(_DocumentNav):
 
         yield match
 
-    def select(self, limit: int = 0) -> Iterator[bs4.Tag]:
-        """Match all tags under the targeted tag."""
-
-        lim = None if limit < 1 else limit
-
-        # Selecting from a `template` is how its contents are reached, but only for that `template`.
-        for child in self.get_tag_descendants(self.tag, template_contents=True):
-            if self.match(child):
-                yield child
-                if lim is not None:
-                    lim -= 1
-                    if lim < 1:
-                        break
-
     def closest(self) -> bs4.Tag | None:
         """Match closest ancestor."""
 
@@ -2188,6 +2174,115 @@ class CSSMatch(_DocumentNav):
         """Match."""
 
         return not self.is_doc(el) and self.is_tag(el) and self.match_selectors(el, self.selectors)
+
+
+class Selection(Iterator[bs4.Tag]):
+    """
+    Iterator over the tags selected under a given tag.
+
+    The `view` attribute declares the traversal view in use:
+
+    - `'live'`: the default, dynamic traversal. The tree is walked as it exists at each
+      step, so structural changes made while consuming the iterator are reflected in the
+      remaining results.
+    - `'snapshot'`: a stable traversal. The candidate tags are captured, in document
+      order, when the iterator is created, so moving nodes within the same tree,
+      inserting siblings, or deleting not yet visited ancestors cannot cause results to
+      be silently skipped or repeated. Tags are yielded as the exact `Tag` objects that
+      were captured; the snapshot never copies them.
+
+    Call `close()` to release the state held for the traversal before the iterator is
+    exhausted. A `Selection` can also be used as a context manager, which closes it on
+    exit.
+    """
+
+    LIVE = 'live'
+    SNAPSHOT = 'snapshot'
+
+    __slots__ = ('view', '_match', '_limit', '_snapshot', '_live', '_index')
+
+    def __init__(self, match: CSSMatch, limit: int = 0, stable: bool = False) -> None:
+        """Initialize."""
+
+        self.view = self.SNAPSHOT if stable else self.LIVE
+        self._match: CSSMatch | None = match
+        self._limit = None if limit < 1 else limit
+        self._index = 0
+        if stable:
+            # Capture the candidates now so that mutating the tree while iterating
+            # cannot disturb the traversal.
+            self._snapshot: list[bs4.Tag] | None = list(
+                match.get_tag_descendants(match.tag, template_contents=True)
+            )
+            self._live: Iterator[bs4.Tag] | None = None
+        else:
+            self._snapshot = None
+            # Selecting from a `template` is how its contents are reached, but only for that `template`.
+            self._live = match.get_tag_descendants(match.tag, template_contents=True)
+
+    @property
+    def closed(self) -> bool:
+        """Return whether the selection has been closed."""
+
+        return self._match is None
+
+    def __iter__(self) -> Selection:
+        """Iterate."""
+
+        return self
+
+    def __next__(self) -> bs4.Tag:
+        """Get the next matching tag."""
+
+        match = self._match
+        if match is None:
+            raise StopIteration
+
+        snapshot = self._snapshot
+        live = self._live
+        while True:
+            if snapshot is not None:
+                if self._index >= len(snapshot):
+                    break
+                child = snapshot[self._index]
+                self._index += 1
+            elif live is not None:
+                child = next(live, None)
+                if child is None:
+                    break
+            else:  # pragma: no cover
+                break
+
+            if match.match(child):
+                if self._limit is not None:
+                    self._limit -= 1
+                    if self._limit < 1:
+                        self.close()
+                return child
+
+        self.close()
+        raise StopIteration
+
+    def close(self) -> None:
+        """Close the selection, releasing any state held for the traversal."""
+
+        self._match = None
+        self._snapshot = None
+        live, self._live = self._live, None
+        if live is not None:
+            close = getattr(live, 'close', None)
+            if close is not None:
+                close()
+
+    def __enter__(self) -> Selection:
+        """Enter the context."""
+
+        return self
+
+    def __exit__(self, *args: Any) -> None:
+        """Exit the context, releasing any state held for the traversal."""
+
+        self.close()
 
 
 class SoupSieve(ct.Immutable):
@@ -2258,10 +2353,17 @@ class SoupSieve(ct.Immutable):
 
         return list(self.iselect(tag, limit))
 
-    def iselect(self, tag: bs4.Tag, limit: int = 0) -> Iterator[bs4.Tag]:
-        """Iterate the specified tags."""
+    def iselect(self, tag: bs4.Tag, limit: int = 0, *, stable: bool = False) -> Selection:
+        """
+        Iterate the specified tags.
 
-        yield from CSSMatch(self.selectors, tag, self.namespaces, self.flags).select(limit)
+        When `stable` is enabled, the iterator traverses a snapshot of the candidate
+        tags captured at creation instead of walking the live tree, so mutating the
+        tree while consuming the iterator cannot silently skip or repeat results. The
+        returned `Selection` declares the view in use via its `view` attribute.
+        """
+
+        return Selection(CSSMatch(self.selectors, tag, self.namespaces, self.flags), limit, stable)
 
     def __repr__(self) -> str:  # pragma: no cover
         """Representation."""

@@ -192,6 +192,246 @@ class TestSoupSieve(util.TestCase):
 
         self.assertEqual(['1', '2', '3', '4', '5', 'some-id', '6'], ids)
 
+    def test_iselect_view(self):
+        """Test that the iterator declares the traversal view in use."""
+
+        markup = """
+        <html>
+        <head>
+        </head>
+        <body>
+        <p id="1" class="x"></p>
+        <p id="2" class="x"></p>
+        </body>
+        </html>
+        """
+
+        soup = self.soup(markup, 'html.parser')
+
+        # The default is the dynamic, live traversal.
+        selection = sv.iselect('p.x', soup)
+        self.assertEqual(sv.Selection.LIVE, selection.view)
+        self.assertEqual('live', selection.view)
+        self.assertFalse(selection.closed)
+        self.assertEqual(['1', '2'], [el.attrs['id'] for el in selection])
+
+        # The stable traversal iterates a snapshot.
+        selection = sv.iselect('p.x', soup, stable=True)
+        self.assertEqual(sv.Selection.SNAPSHOT, selection.view)
+        self.assertEqual('snapshot', selection.view)
+        self.assertEqual(['1', '2'], [el.attrs['id'] for el in selection])
+
+        # A compiled pattern exposes the same interface.
+        pattern = sv.compile('p.x')
+        self.assertEqual('live', pattern.iselect(soup).view)
+        self.assertEqual('snapshot', pattern.iselect(soup, stable=True).view)
+
+    def test_iselect_stable_matches_select(self):
+        """Test that the stable traversal yields the same results as `select` on an unmutated tree."""
+
+        markup = """
+        <html>
+        <head>
+        </head>
+        <body>
+        <div id="a"><p id="1" class="x"></p><p id="2" class="x"></p></div>
+        <div id="b"><p id="3" class="x"></p><span><p id="4" class="x"></p></span></div>
+        <div id="c"><p id="5" class="x"></p></div>
+        </body>
+        </html>
+        """
+
+        soup = self.soup(markup, 'html.parser')
+
+        expected = sv.select('p.x', soup)
+        actual = list(sv.iselect('p.x', soup, stable=True))
+        self.assertEqual(expected, actual)
+        # The tags are the exact same objects, not copies.
+        self.assertTrue(all(a is b for a, b in zip(expected, actual)))
+
+    def test_iselect_stable_move(self):
+        """Test that moving a node within the same tree cannot skip or repeat stable results."""
+
+        markup = """
+        <html>
+        <head>
+        </head>
+        <body>
+        <div id="a"><p id="1" class="x"></p><p id="2" class="x"></p></div>
+        <div id="b"><p id="3" class="x"></p><p id="4" class="x"></p></div>
+        <div id="c"><p id="5" class="x"></p></div>
+        </body>
+        </html>
+        """
+
+        soup = self.soup(markup, 'html.parser')
+
+        selection = sv.iselect('p.x', soup, stable=True)
+        first = next(selection)
+        self.assertEqual('1', first.attrs['id'])
+
+        # Move a not yet visited node ahead of nodes that were already visited.
+        moved = soup.find('p', id='4')
+        soup.find('div', id='a').insert(0, moved)
+
+        rest = list(selection)
+        self.assertEqual(['2', '3', '4', '5'], [el.attrs['id'] for el in rest])
+        # The moved node is yielded exactly once and is the same object.
+        self.assertIs(moved, rest[2])
+
+    def test_iselect_stable_insert_sibling(self):
+        """Test that inserting siblings during stable traversal does not disturb the snapshot view."""
+
+        markup = """
+        <html>
+        <head>
+        </head>
+        <body>
+        <div id="a"><p id="1" class="x"></p><p id="2" class="x"></p></div>
+        <div id="b"><p id="3" class="x"></p></div>
+        </body>
+        </html>
+        """
+
+        soup = self.soup(markup, 'html.parser')
+
+        selection = sv.iselect('p.x', soup, stable=True)
+        self.assertEqual('1', next(selection).attrs['id'])
+
+        # Insert a new matching sibling; it is not part of the snapshot view.
+        new = soup.new_tag('p', id='99')
+        new['class'] = 'x'
+        soup.find('div', id='b').append(new)
+
+        self.assertEqual(['2', '3'], [el.attrs['id'] for el in selection])
+
+    def test_iselect_stable_delete_unvisited_ancestor(self):
+        """Test that deleting a not yet visited ancestor does not disturb the snapshot view."""
+
+        markup = """
+        <html>
+        <head>
+        </head>
+        <body>
+        <div id="a"><p id="1" class="x"></p><p id="2" class="x"></p></div>
+        <div id="b"><p id="3" class="x"></p><p id="4" class="x"></p></div>
+        <div id="c"><p id="5" class="x"></p></div>
+        </body>
+        </html>
+        """
+
+        soup = self.soup(markup, 'html.parser')
+
+        selection = sv.iselect('p.x', soup, stable=True)
+        self.assertEqual('1', next(selection).attrs['id'])
+
+        # Delete an ancestor whose descendants have not been visited yet.
+        div_b = soup.find('div', id='b')
+        p3 = div_b.find('p', id='3')
+        div_b.extract()
+
+        rest = list(selection)
+        self.assertEqual(['2', '3', '4', '5'], [el.attrs['id'] for el in rest])
+        # Tags captured in the snapshot keep their identity.
+        self.assertIs(p3, rest[1])
+
+    def test_iselect_stable_limit(self):
+        """Test that a limit is still applied with the stable traversal."""
+
+        markup = """
+        <html>
+        <head>
+        </head>
+        <body>
+        <p id="1" class="x"></p>
+        <p id="2" class="x"></p>
+        <p id="3" class="x"></p>
+        </body>
+        </html>
+        """
+
+        soup = self.soup(markup, 'html.parser')
+
+        self.assertEqual(['1', '2'], [el.attrs['id'] for el in sv.iselect('p.x', soup, limit=2, stable=True)])
+
+    def test_iselect_close(self):
+        """Test that closing an iterator releases the traversal state."""
+
+        markup = """
+        <html>
+        <head>
+        </head>
+        <body>
+        <p id="1" class="x"></p>
+        <p id="2" class="x"></p>
+        </body>
+        </html>
+        """
+
+        soup = self.soup(markup, 'html.parser')
+
+        for stable in (True, False):
+            selection = sv.iselect('p.x', soup, stable=stable)
+            self.assertFalse(selection.closed)
+            self.assertEqual('1', next(selection).attrs['id'])
+            selection.close()
+            self.assertTrue(selection.closed)
+            # Closing is idempotent and stops iteration.
+            selection.close()
+            with self.assertRaises(StopIteration):
+                next(selection)
+
+        # Exhausting the iterator closes it as well.
+        selection = sv.iselect('p.x', soup, stable=True)
+        self.assertEqual(['1', '2'], [el.attrs['id'] for el in selection])
+        self.assertTrue(selection.closed)
+
+    def test_iselect_context_manager(self):
+        """Test that an iterator can be used as a context manager."""
+
+        markup = """
+        <html>
+        <head>
+        </head>
+        <body>
+        <p id="1" class="x"></p>
+        <p id="2" class="x"></p>
+        </body>
+        </html>
+        """
+
+        soup = self.soup(markup, 'html.parser')
+
+        with sv.iselect('p.x', soup, stable=True) as selection:
+            self.assertEqual('1', next(selection).attrs['id'])
+        self.assertTrue(selection.closed)
+
+    def test_iselect_live_is_dynamic(self):
+        """Test that the default traversal still walks the live tree."""
+
+        markup = """
+        <html>
+        <head>
+        </head>
+        <body>
+        <div id="a"><p id="1" class="x"></p></div>
+        <div id="b"><p id="2" class="x"></p></div>
+        </body>
+        </html>
+        """
+
+        soup = self.soup(markup, 'html.parser')
+
+        selection = sv.iselect('p.x', soup)
+        self.assertEqual('1', next(selection).attrs['id'])
+
+        # The dynamic traversal reflects mutations, so the new node is seen.
+        new = soup.new_tag('p', id='3')
+        new['class'] = 'x'
+        soup.find('div', id='b').append(new)
+
+        self.assertEqual(['2', '3'], [el.attrs['id'] for el in selection])
+
     def test_match(self):
         """Test matching."""
 

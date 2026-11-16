@@ -3,6 +3,16 @@ icon: lucide/scroll-text
 ---
 # Changelog
 
+## 4.2
+
+-   **NEW**: `iselect` now accepts a `stable` parameter. When enabled, the iterator traverses a snapshot of the
+    candidate tags captured at creation instead of walking the live tree, so moving nodes within the same tree,
+    inserting siblings, or deleting not yet visited ancestors while consuming the iterator cannot silently skip or
+    repeat results.
+-   **NEW**: `iselect` now returns a `Selection` iterator which declares the traversal view in use (`'live'` or
+    `'snapshot'`) via its `view` attribute and can be closed early with `close()` to release the state held for the
+    traversal. The default dynamic traversal is unchanged.
+
 ## 4.1.1
 
 -   **FIX**: Improve performance of tag name matching, which runs for every element and selector.
