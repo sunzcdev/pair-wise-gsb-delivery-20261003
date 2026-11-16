@@ -651,12 +651,18 @@ class CSSMatch(_DocumentNav):
         selectors: ct.SelectorList,
         scope: bs4.Tag | None,
         namespaces: ct.Namespaces | None,
-        flags: int
+        flags: int,
+        limit: bs4.Tag | None = None
     ) -> None:
         """Initialize."""
 
         self.assert_valid_input(scope)
+        if limit is not None:
+            self.assert_valid_input(limit)
         self.tag = scope
+        # An explicit boundary turns on restricted mode: `limit` is the record root, and matching never leaves it.
+        self.limit = limit
+        self.scoped = limit is not None
         self.cached_meta_lang: list[tuple[str, str]] = []
         self.cached_forms: dict[int, TreeForms] = {}
         self.cached_options: dict[int, dict[int, bool]] = {}
@@ -690,7 +696,12 @@ class CSSMatch(_DocumentNav):
                 break
 
         self.root = root
-        self.scope = scope if scope is not doc else root
+        if self.limit is not None:
+            # Restricted mode: `:scope` is the explicit record root. A document node names its document
+            # element, mirroring the normal handling of `:scope` on a document.
+            self.scope = root if self.is_doc(self.limit) else self.limit
+        else:
+            self.scope = scope if scope is not doc else root
         self.has_html_namespace = self.has_html_ns(root)
 
         # Parsers either record a namespace for every element or for none. The root
@@ -714,6 +725,52 @@ class CSSMatch(_DocumentNav):
         self.tree_cache.clear()
         self.select_cache.clear()
         self.index_cache.clear()
+
+    def in_scope(self, el: bs4.element.PageElement) -> bool:
+        """Check whether an element is the record root itself or one of its descendants."""
+
+        node: bs4.element.PageElement | None = el
+        while node is not None:
+            if node is self.scope:
+                return True
+            node = node.parent
+        return False
+
+    def get_relation_parent(
+        self,
+        el: bs4.Tag,
+        no_doc: bool = True,
+        no_template: bool = True
+    ) -> bs4.Tag | bs4.BeautifulSoup | None:
+        """
+        Get the parent used to resolve a combinator.
+
+        This keeps the exact document and `template` handling of `get_parent()` for the given flags. In restricted
+        mode it additionally stops the walk at the record root: a parent outside of the root's subtree is replaced
+        with `None`, so neither ancestors nor the sibling sets of ancestors outside the record can take part in a
+        match. The root itself stays available as the parent of its own children.
+        """
+
+        parent = self.get_parent(el, no_doc=no_doc, no_template=no_template)
+        if self.scoped and parent is not None and not self.in_scope(parent):
+            parent = None
+        return parent
+
+    def get_relation_previous_tag(self, el: bs4.Tag) -> bs4.Tag | None:
+        """Get the previous sibling tag for a combinator, stopping at the record boundary."""
+
+        sibling = self.get_previous_tag(el)
+        if self.scoped and sibling is not None and not self.in_scope(sibling):
+            sibling = None
+        return sibling
+
+    def get_relation_next_tag(self, el: bs4.Tag) -> bs4.Tag | None:
+        """Get the next sibling tag for a combinator, stopping at the record boundary."""
+
+        sibling = self.get_next_tag(el)
+        if self.scoped and sibling is not None and not self.in_scope(sibling):
+            sibling = None
+        return sibling
 
     def supports_namespaces(self) -> bool:
         """Check if namespaces are supported in the HTML type."""
@@ -1011,7 +1068,7 @@ class CSSMatch(_DocumentNav):
         # Get the parent and use the ID for the cache key. Siblings do not need a parent element:
         # they can be top level elements in the document or the top level contents of a `template`.
         # Only an element that has been detached has no parent, and it has no siblings.
-        parent = self.get_parent(el, no_doc=False, no_template=False)
+        parent = self.get_relation_parent(el, no_doc=False, no_template=False)
         if parent is None:
             return found
         pkey = id(parent)
@@ -1074,7 +1131,7 @@ class CSSMatch(_DocumentNav):
         found = False
         visited: list[tuple[int, int]] = []
         parent: bs4.Tag | None = el
-        while not found and parent and (parent := self.get_parent(parent)):
+        while not found and parent and (parent := self.get_relation_parent(parent)):
             key = (id(parent), id(relation))
             if key in self.anc_cache:
                 found = self.anc_cache[key]
@@ -1100,10 +1157,10 @@ class CSSMatch(_DocumentNav):
                 found = yield from self.match_ancestor(el, relation)
             else:
                 parent: bs4.Tag | None = el
-                while not found and parent and (parent := self.get_parent(parent)):
+                while not found and parent and (parent := self.get_relation_parent(parent)):
                     found = parent is not None and (yield parent, relation)
         elif relation[0].rel_type == REL_CLOSE_PARENT:
-            parent = self.get_parent(el)
+            parent = self.get_relation_parent(el, no_doc=True, no_template=True)
             if parent is None:
                 pass
             elif self.enable_cache:
@@ -1122,10 +1179,10 @@ class CSSMatch(_DocumentNav):
                 found = yield from self.match_general_sibling(el, relation)
             else:
                 sibling: bs4.Tag | None = el
-                while not found and sibling and (sibling := self.get_previous_tag(sibling)):
+                while not found and sibling and (sibling := self.get_relation_previous_tag(sibling)):
                     found = sibling is not None and (yield sibling, relation)
         elif relation[0].rel_type == REL_CLOSE_SIBLING:
-            sibling = self.get_previous_tag(el)
+            sibling = self.get_relation_previous_tag(el)
             found = sibling is not None and (yield sibling, relation)
         return found
 
@@ -1209,10 +1266,10 @@ class CSSMatch(_DocumentNav):
                 found = yield from self.match_general_sibling(el, relation)
             else:
                 sibling: bs4.Tag | None = el
-                while not found and sibling and (sibling := self.get_next_tag(sibling)):
+                while not found and sibling and (sibling := self.get_relation_next_tag(sibling)):
                     found = yield sibling, relation
         elif relation[0].rel_type == REL_HAS_CLOSE_SIBLING:
-            sibling = self.get_next_tag(el)
+            sibling = self.get_relation_next_tag(el)
             found = sibling is not None and (yield sibling, relation)
         return found
 
@@ -2151,7 +2208,12 @@ class CSSMatch(_DocumentNav):
         yield match
 
     def select(self, limit: int = 0) -> Iterator[bs4.Tag]:
-        """Match all tags under the targeted tag."""
+        """
+        Match all tags under the targeted tag.
+
+        In restricted mode the candidate set is confined to the record root's subtree while matching,
+        rather than searching the whole document and filtering the results afterwards.
+        """
 
         lim = None if limit < 1 else limit
 
@@ -2165,7 +2227,11 @@ class CSSMatch(_DocumentNav):
                         break
 
     def closest(self) -> bs4.Tag | None:
-        """Match closest ancestor."""
+        """
+        Match closest ancestor.
+
+        In restricted mode the walk stops at the record root, so a match outside of it is never returned.
+        """
 
         current: bs4.Tag | None = self.tag
         closest = None
@@ -2173,7 +2239,11 @@ class CSSMatch(_DocumentNav):
             if self.match(current):
                 closest = current
             else:
-                current = self.get_parent(current)
+                current = (
+                    self.get_relation_parent(current, no_doc=True, no_template=True)
+                    if self.scoped
+                    else self.get_parent(current)
+                )
         return closest
 
     def filter(self) -> list[bs4.Tag]:  # noqa A001
@@ -2187,7 +2257,12 @@ class CSSMatch(_DocumentNav):
     def match(self, el: bs4.Tag) -> bool:
         """Match."""
 
-        return not self.is_doc(el) and self.is_tag(el) and self.match_selectors(el, self.selectors)
+        if self.is_doc(el) or not self.is_tag(el):
+            return False
+        # Restricted mode only matches the record root itself or its descendants.
+        if self.scoped and not self.in_scope(el):
+            return False
+        return self.match_selectors(el, self.selectors)
 
 
 class SoupSieve(ct.Immutable):
@@ -2219,17 +2294,28 @@ class SoupSieve(ct.Immutable):
             flags=flags
         )
 
-    def match(self, tag: bs4.Tag) -> bool:
-        """Match."""
+    def match(self, tag: bs4.Tag, scope: bs4.Tag | None = None) -> bool:
+        """
+        Match.
 
-        return CSSMatch(self.selectors, tag, self.namespaces, self.flags).match(tag)
+        When `scope` names a record root, matching runs in restricted mode: `scope` is the boundary and `:scope`
+        points at it, so `tag` is matched only when it is the root or one of its descendants and combinators in
+        the selector cannot leave the root's subtree.
+        """
 
-    def closest(self, tag: bs4.Tag) -> bs4.Tag | None:
-        """Match closest ancestor."""
+        return CSSMatch(self.selectors, tag, self.namespaces, self.flags, scope).match(tag)
 
-        return CSSMatch(self.selectors, tag, self.namespaces, self.flags).closest()
+    def closest(self, tag: bs4.Tag, scope: bs4.Tag | None = None) -> bs4.Tag | None:
+        """
+        Match closest ancestor.
 
-    def filter(self, iterable: Iterable[bs4.Tag]) -> list[bs4.Tag]:  # noqa A001
+        In restricted mode (`scope` given) the ancestor walk stops at the record root, so nothing outside of it
+        is returned.
+        """
+
+        return CSSMatch(self.selectors, tag, self.namespaces, self.flags, scope).closest()
+
+    def filter(self, iterable: Iterable[bs4.Tag], scope: bs4.Tag | None = None) -> list[bs4.Tag]:  # noqa A001
         """
         Filter.
 
@@ -2239,29 +2325,49 @@ class SoupSieve(ct.Immutable):
 
         Any other kind of iterable could have tags from different documents or detached tags,
         so for those, we use a new `CSSMatch` for each item in the iterable.
+
+        When `scope` is given, filtering runs in restricted mode and keeps only nodes inside the record root.
         """
 
         if isinstance(iterable, bs4.Tag):
-            return CSSMatch(self.selectors, iterable, self.namespaces, self.flags).filter()
+            return CSSMatch(self.selectors, iterable, self.namespaces, self.flags, scope).filter()
         else:
             # There is no guarantee that elements are from the same document, evaluate them separately.
-            return [node for node in iterable if not CSSMatch.is_navigable_string(node) and self.match(node)]
+            return [
+                node for node in iterable
+                if not CSSMatch.is_navigable_string(node) and self.match(node, scope)
+            ]
 
-    def select_one(self, tag: bs4.Tag) -> bs4.Tag | None:
+    def select_one(self, tag: bs4.Tag, scope: bs4.Tag | None = None) -> bs4.Tag | None:
         """Select a single tag."""
 
-        tags = self.select(tag, limit=1)
+        tags = self.select(tag, scope=scope, limit=1)
         return tags[0] if tags else None
 
-    def select(self, tag: bs4.Tag, limit: int = 0) -> list[bs4.Tag]:
+    def select(
+        self,
+        tag: bs4.Tag,
+        limit: int = 0,
+        scope: bs4.Tag | None = None
+    ) -> list[bs4.Tag]:
         """Select the specified tags."""
 
-        return list(self.iselect(tag, limit))
+        return list(self.iselect(tag, limit, scope))
 
-    def iselect(self, tag: bs4.Tag, limit: int = 0) -> Iterator[bs4.Tag]:
-        """Iterate the specified tags."""
+    def iselect(
+        self,
+        tag: bs4.Tag,
+        limit: int = 0,
+        scope: bs4.Tag | None = None
+    ) -> Iterator[bs4.Tag]:
+        """
+        Iterate the specified tags.
 
-        yield from CSSMatch(self.selectors, tag, self.namespaces, self.flags).select(limit)
+        When `scope` is given, the search runs in restricted mode: matching is performed inside the record root's
+        subtree instead of matching over the whole document and discarding out-of-scope results.
+        """
+
+        yield from CSSMatch(self.selectors, tag, self.namespaces, self.flags, scope).select(limit)
 
     def __repr__(self) -> str:  # pragma: no cover
         """Representation."""

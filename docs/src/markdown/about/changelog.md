@@ -3,6 +3,15 @@ icon: lucide/scroll-text
 ---
 # Changelog
 
+## Unreleased
+
+-   **NEW**: Add an explicit restricted mode for closed-scope matching. Passing a record root through the new `scope`
+    keyword argument of `select()`, `select_one()`, `iselect()`, `match()`, `closest()` and `filter()` (and the
+    matching methods of a compiled object) closes the match around that root: ancestors and siblings outside of the
+    root never take part, `:scope` points at the root, and `:has()`, relative combinators and `nth` selectors keep
+    working inside its subtree. Matching is evaluated within the boundary instead of matching the whole document and
+    filtering afterwards. Without `scope`, the original document-wide DOM relationships are unchanged.
+
 ## 4.1.1
 
 -   **FIX**: Improve performance of tag name matching, which runs for every element and selector.

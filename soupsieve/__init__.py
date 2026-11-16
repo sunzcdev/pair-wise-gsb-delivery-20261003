@@ -91,9 +91,15 @@ def closest(
     custom: Mapping[str, str | ct.SelectorList] | None = None,
     ignore: Iterable[str] | None = None,
     max_selectors: int = cp.SELECTOR_LIMIT,
+    scope: bs4.Tag | None = None,
     **kwargs: Any
 ) -> bs4.Tag | None:
-    """Match closest ancestor."""
+    """
+    Match closest ancestor.
+
+    When `scope` names a record root, matching runs in restricted mode: the ancestor walk stops at that root and
+    nothing outside of it is returned.
+    """
 
     return compile(
         select,
@@ -103,7 +109,7 @@ def closest(
         ignore=ignore,
         max_selectors=max_selectors,
         **kwargs
-    ).closest(tag)
+    ).closest(tag, scope)
 
 
 def match(
@@ -115,9 +121,16 @@ def match(
     custom: Mapping[str, str | ct.SelectorList] | None = None,
     ignore: Iterable[str] | None = None,
     max_selectors: int = cp.SELECTOR_LIMIT,
+    scope: bs4.Tag | None = None,
     **kwargs: Any
 ) -> bool:
-    """Match node."""
+    """
+    Match node.
+
+    When `scope` names a record root, matching runs in restricted mode: `scope` is the boundary (and what
+    `:scope` points at), so `tag` only matches when it is the root or its descendant and no combinator in the
+    selector can leave the root's subtree.
+    """
 
     return compile(
         select,
@@ -127,7 +140,7 @@ def match(
         ignore=ignore,
         max_selectors=max_selectors,
         **kwargs
-    ).match(tag)
+    ).match(tag, scope)
 
 
 def filter(  # noqa: A001
@@ -139,9 +152,15 @@ def filter(  # noqa: A001
     custom: Mapping[str, str | ct.SelectorList] | None = None,
     ignore: Iterable[str] | None = None,
     max_selectors: int = cp.SELECTOR_LIMIT,
+    scope: bs4.Tag | None = None,
     **kwargs: Any
 ) -> list[bs4.Tag]:
-    """Filter list of nodes."""
+    """
+    Filter list of nodes.
+
+    When `scope` names a record root, only nodes inside of it are kept and the selector is evaluated in
+    restricted mode.
+    """
 
     return compile(
         select,
@@ -151,7 +170,7 @@ def filter(  # noqa: A001
         ignore=ignore,
         max_selectors=max_selectors,
         **kwargs
-    ).filter(iterable)
+    ).filter(iterable, scope)
 
 
 def select_one(
@@ -163,9 +182,14 @@ def select_one(
     custom: Mapping[str, str | ct.SelectorList] | None = None,
     ignore: Iterable[str] | None = None,
     max_selectors: int = cp.SELECTOR_LIMIT,
+    scope: bs4.Tag | None = None,
     **kwargs: Any
 ) -> bs4.Tag | None:
-    """Select a single tag."""
+    """
+    Select a single tag.
+
+    When `scope` names a record root, the search runs in restricted mode within that root's subtree.
+    """
 
     return compile(
         select,
@@ -175,7 +199,7 @@ def select_one(
         ignore=ignore,
         max_selectors=max_selectors,
         **kwargs
-    ).select_one(tag)
+    ).select_one(tag, scope)
 
 
 def select(
@@ -188,9 +212,15 @@ def select(
     custom: Mapping[str, str | ct.SelectorList] | None = None,
     ignore: Iterable[str] | None = None,
     max_selectors: int = cp.SELECTOR_LIMIT,
+    scope: bs4.Tag | None = None,
     **kwargs: Any
 ) -> list[bs4.Tag]:
-    """Select the specified tags."""
+    """
+    Select the specified tags.
+
+    When `scope` names a record root, the search runs in restricted mode: candidates are matched inside the
+    root's subtree, with `:scope` pointing at that root, instead of matching the whole document and filtering.
+    """
 
     return compile(
         select,
@@ -200,7 +230,7 @@ def select(
         ignore=ignore,
         max_selectors=max_selectors,
         **kwargs
-    ).select(tag, limit)
+    ).select(tag, limit, scope)
 
 
 def iselect(
@@ -213,9 +243,14 @@ def iselect(
     custom: Mapping[str, str | ct.SelectorList] | None = None,
     ignore: Iterable[str] | None = None,
     max_selectors: int = cp.SELECTOR_LIMIT,
+    scope: bs4.Tag | None = None,
     **kwargs: Any
 ) -> Iterator[bs4.Tag]:
-    """Iterate the specified tags."""
+    """
+    Iterate the specified tags.
+
+    When `scope` names a record root, the search runs in restricted mode within that root's subtree.
+    """
 
     yield from compile(
         select,
@@ -225,7 +260,7 @@ def iselect(
         ignore=ignore,
         max_selectors=max_selectors,
         **kwargs
-    ).iselect(tag, limit)
+    ).iselect(tag, limit, scope)
 
 
 def escape(ident: str) -> str:

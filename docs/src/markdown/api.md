@@ -115,6 +115,48 @@ except sv.SelectorSyntaxError:
 sv.select('div:has(> p:has(+ .b + .c))', soup, flags=sv.NOSTRICT)
 ```
 
+## Restricted Mode
+
+> [!new] New in next release
+
+When a page is extracted record by record, each record is processed against its own subtree. Passing a record root
+through the `scope` keyword argument enables **restricted mode**, which closes the match around that root:
+
+-   ancestors and siblings outside of the record root never take part in matching, even when a selector's
+    combinators would otherwise walk up to them through the normal DOM relationships;
+-   [`#!css :scope`](./selectors/pseudo-classes.md#:scope) points at the record root;
+-   `select()`, `match()` and `closest()` (and the other entry points) all honor the same boundary, and the
+    record root's own subtree still supports `#!css :has()`, relative combinators and `nth` selectors.
+
+Matching is performed inside the boundary while the selector is evaluated, rather than matching over the whole
+document and discarding out-of-scope results afterwards. Without `scope`, the original, document-wide DOM
+relationships continue to apply.
+
+```py play session="restricted"
+from bs4 import BeautifulSoup
+import soupsieve as sv
+
+markup = """
+<div class="record" id="r1"><p class="lead"></p><p id="r1-b"></p></div>
+<div class="record" id="r2"><p class="lead"></p><p id="r2-b"></p></div>
+"""
+soup = BeautifulSoup(markup, 'html.parser')
+
+# Extract each record in turn against its own closed scope.
+for record in sv.select('.record', soup):
+    # The adjacent-sibling condition is satisfied inside every record.
+    print([el['id'] for el in sv.select('p.lead + p', record, scope=record)])
+
+# In normal mode the same selector can follow relationships that leave a record.
+print(sv.match('.record + .record > p', soup.select_one('#r2-b')))
+# In restricted mode those relationships stop at the record root, so this matches nothing.
+print(sv.match('.record + .record > p', soup.select_one('#r2-b'), scope=soup.select_one('#r2')))
+```
+
+The `scope` argument is accepted by `select()`, `select_one()`, `iselect()`, `match()`, `closest()` and
+`filter()`, as well as the matching methods of a compiled object. A `scope` that is not a tag raises a
+`TypeError`, the same as any other invalid input.
+
 ## `soupsieve.select_one()`
 
 ```py

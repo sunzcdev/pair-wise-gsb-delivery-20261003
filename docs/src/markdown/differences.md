@@ -152,6 +152,30 @@ soup.select(':scope + div')
 
 This is by design and is in align with the behavior exhibited in all web browsers.
 
+### Restricted Mode
+
+The behavior above only restricts which elements are *returned*: a selector can still follow combinators through the
+normal DOM relationships to ancestors and siblings that are not under the *scoped* element. When extracting a page
+record by record, that can let a condition satisfied by an adjacent record influence a match.
+
+Passing a record root through the `scope` keyword argument enables **restricted mode**. The given root becomes a
+closed boundary that every combinator respects, and `:scope` points at it:
+
+-   descendant (space) and child (`>`) combinators stop at the record root instead of walking up to its ancestors;
+-   sibling (`+`, `~`) combinators only see siblings inside the record, never siblings of the record root;
+-   [`:has()`](./selectors/pseudo-classes.md#:has), relative combinators and `nth` selectors keep working normally
+    inside the root's subtree.
+
+```py
+for record in sv.select('.record', soup):
+    # Conditions are evaluated entirely within each record's subtree.
+    sv.select('p.lead + p', record, scope=record)
+```
+
+Restricted mode matches inside the boundary while evaluating the selector, it does not match over the whole document
+and simply filter the results. Without `scope`, the original document-wide DOM relationships are unchanged. See
+[Restricted Mode](./api.md#restricted-mode) for the full API.
+
 ## Selected Element Order
 
 Another quirk of Beautiful Soup's old implementation was that it returned the HTML nodes in the order of how the
