@@ -159,7 +159,8 @@ Basic Usage
                    namedtuple_as_object=True, tuple_as_array=True, \
                    bigint_as_string=False, sort_keys=False, \
                    item_sort_key=None, for_json=None, ignore_nan=False, \
-                   int_as_string_bitcount=None, iterable_as_array=False, **kw)
+                   int_as_string_bitcount=None, iterable_as_array=False, \
+                   protocol_priority=None, **kw)
 
     Serialize *obj* as a JSON formatted stream to *fp*
     (a ``.write()``-supporting file-like object) using this
@@ -190,7 +191,8 @@ Basic Usage
                     namedtuple_as_object=True, tuple_as_array=True, \
                     bigint_as_string=False, sort_keys=False, \
                     item_sort_key=None, for_json=None, ignore_nan=False, \
-                    int_as_string_bitcount=None, iterable_as_array=False, **kw)
+                    int_as_string_bitcount=None, iterable_as_array=False, \
+                    protocol_priority=None, **kw)
 
     Serialize *obj* to a JSON formatted :class:`str`.
 
@@ -302,6 +304,23 @@ Basic Usage
     If *for_json* is true (not the default), objects with a ``for_json()``
     method will use the return value of that method for encoding as JSON
     instead of the object.
+
+    If *protocol_priority* is a sequence of protocol names drawn from
+    ``'for_json'``, ``'asdict'`` and ``'iterable'``, an object that
+    supports more than one conversion protocol is converted by the first
+    one listed, and only that protocol is called for it. The default
+    (``None``) tries ``for_json()`` first, then ``_asdict()``, then the
+    iterable protocol. Each listed protocol must be enabled by its
+    corresponding option (*for_json*, *namedtuple_as_object*,
+    *iterable_as_array*); conflicting configurations raise
+    :exc:`ValueError` before encoding begins. A protocol conversion that
+    returns the original object raises a circular reference
+    :exc:`ValueError`, even when *check_circular* is false. Non-default
+    priorities are encoded by the pure-Python implementation, since the C
+    speedups only support the default order.
+
+    .. versionchanged:: 4.3.0
+        *protocol_priority* is new in 4.3.0.
 
     If *ignore_nan* is true (default: ``False``), then out of range
     :class:`float` values (``nan``, ``inf``, ``-inf``) will be serialized as
@@ -577,7 +596,8 @@ Encoders and decoders
                        namedtuple_as_object=True, tuple_as_array=True, \
                        bigint_as_string=False, item_sort_key=None, \
                        for_json=True, ignore_nan=False, \
-                       int_as_string_bitcount=None, iterable_as_array=False)
+                       int_as_string_bitcount=None, iterable_as_array=False, \
+                       protocol_priority=None)
 
    Extensible JSON encoder for Python data structures.
 
@@ -707,6 +727,21 @@ Encoders and decoders
    If *for_json* is true (default: ``False``), objects with a ``for_json()``
    method will use the return value of that method for encoding as JSON instead
    of the object.
+
+   If *protocol_priority* is a sequence of protocol names drawn from
+   ``'for_json'``, ``'asdict'`` and ``'iterable'``, an object that supports
+   more than one conversion protocol is converted by the first one listed,
+   and only that protocol is called for it. The default (``None``) tries
+   ``for_json()`` first, then ``_asdict()``, then the iterable protocol.
+   Each listed protocol must be enabled by its corresponding option
+   (*for_json*, *namedtuple_as_object*, *iterable_as_array*); conflicting
+   configurations raise :exc:`ValueError` before encoding begins. The
+   effective priority is available as the ``protocol_priority`` attribute.
+   Non-default priorities are encoded by the pure-Python implementation,
+   since the C speedups only support the default order.
+
+   .. versionchanged:: 4.3.0
+     *protocol_priority* is new in 4.3.0.
 
    If *ignore_nan* is true (default: ``False``), then out of range
    :class:`float` values (``nan``, ``inf``, ``-inf``) will be serialized as

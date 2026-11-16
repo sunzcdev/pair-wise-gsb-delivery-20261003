@@ -3125,6 +3125,11 @@ encoder_markers_check(PyEncoderObject *s, PyObject *obj)
  *   - if as_dict is 1, encodes newobj as a dict via
  *     encoder_listencode_dict after a TypeError-on-mismatch check
  *     (_asdict contract: must return a dict).
+ * Both contracts are validated before the marker push, and a protocol
+ * that returns the original object is a circular reference even when
+ * check_circular is off — matching the Python encoder's
+ * _iterencode_protocols, which performs the same checks in the same
+ * order.
  * Cleans up on every exit path. */
 static int
 encoder_steal_encode(PyEncoderObject *s, JSON_Accu *rval,
@@ -3135,6 +3140,25 @@ encoder_steal_encode(PyEncoderObject *s, JSON_Accu *rval,
     PyObject *ident = NULL;
     if (newobj == NULL)
         return -1;
+    if (as_dict && !JSON_AnyDict_Check(newobj)) {
+        PyErr_Format(PyExc_TypeError,
+                     "_asdict() must return a dict, not %.80s",
+                     json_type_name(newobj));
+        Py_DECREF(newobj);
+        return -1;
+    }
+    if (newobj == obj) {
+        /* A conversion protocol that returns the original object is a
+         * circular reference, even when check_circular is off; detect it
+         * here instead of recursing until the stack guard trips. */
+        Py_DECREF(newobj);
+        PyErr_SetString(PyExc_ValueError, "Circular reference detected");
+#if PY_VERSION_HEX >= 0x030B0000
+        encoder_annotate_exception(get_speedups_state(s->module_ref),
+            "when serializing %s object", json_type_name(obj));
+#endif
+        return -1;
+    }
     if (encoder_markers_push(s, obj, &ident)) {
         Py_DECREF(newobj);
         return -1;
@@ -3145,14 +3169,7 @@ encoder_steal_encode(PyEncoderObject *s, JSON_Accu *rval,
         return -1;
     }
     if (as_dict) {
-        if (JSON_AnyDict_Check(newobj)) {
-            rv = encoder_listencode_dict(s, rval, newobj, indent_level);
-        } else {
-            PyErr_Format(PyExc_TypeError,
-                         "_asdict() must return a dict, not %.80s",
-                         json_type_name(newobj));
-            rv = -1;
-        }
+        rv = encoder_listencode_dict(s, rval, newobj, indent_level);
     } else {
         rv = encoder_listencode_obj(s, rval, newobj, indent_level);
     }

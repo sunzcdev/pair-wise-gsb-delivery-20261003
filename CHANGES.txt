@@ -1,5 +1,16 @@
 Version 4.3.0 released 2026-11-10
 
+* New ``protocol_priority`` option for ``JSONEncoder``, ``dump`` and
+  ``dumps`` selects which conversion protocol (``for_json()``,
+  ``_asdict()`` or the iterable protocol) is used, and in which order,
+  for objects that implement more than one of them. The effective order
+  is inspectable as the ``protocol_priority`` attribute, conflicting
+  configurations are rejected before encoding begins, and the default
+  order is unchanged. A protocol conversion that returns the original
+  object now raises a circular reference ``ValueError`` with path
+  context instead of recursing, even with ``check_circular=False``.
+  Non-default priorities are encoded by the pure-Python implementation,
+  since the C speedups only support the default order
 * The C encoder no longer crashes when ``default()`` or ``for_json()``
   shrinks or grows the list being encoded, and no longer reads a freed
   key when encoding a dict value removes its entry. Both encoders now

@@ -65,7 +65,32 @@ class TestCustomMethodCycles(TestCase):
     @skipIf(sys.platform == 'emscripten',
             'Pyodide cannot recover from unbounded recursion')
     def test_circular_checks_can_be_disabled(self):
+        # An indirect conversion cycle with check_circular=False still
+        # recurses until the interpreter's recursion guard trips.
+        first = ForJson()
+        second = ForJson(first)
+        first.value = second
+        with self.assertRaises(RuntimeError):
+            json.dumps(first, for_json=True, check_circular=False)
+
+    def test_direct_self_conversion_is_circular_without_markers(self):
+        # A protocol that returns the original object is detected
+        # directly, even when check_circular is off.
         value = ForJson()
         value.value = value
-        with self.assertRaises(RuntimeError):
-            json.dumps(value, for_json=True, check_circular=False)
+        for check_circular in (True, False):
+            with self.assertRaises(ValueError) as exc:
+                json.dumps(value, for_json=True,
+                           check_circular=check_circular)
+            self.assertEqual(str(exc.exception),
+                             'Circular reference detected')
+
+    def test_asdict_returning_self_is_circular_without_markers(self):
+        class SelfAsDict(dict):
+            def _asdict(self):
+                return self
+        for check_circular in (True, False):
+            with self.assertRaises(ValueError) as exc:
+                json.dumps(SelfAsDict(), check_circular=check_circular)
+            self.assertEqual(str(exc.exception),
+                             'Circular reference detected')
