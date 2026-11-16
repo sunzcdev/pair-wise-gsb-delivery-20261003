@@ -60,6 +60,16 @@ class DelimitedSpans:
         #: tag -> ([closer start, ...], [closer end, ...]), both ascending
         self._closers = closers
 
+    def is_comment_opener(self, pos):
+        """Return True if the opener at *pos* starts a multiline comment.
+
+        Comment openers share one tag-independent closer, so a missing
+        closer always means an unterminated comment. Dollar-quoted
+        literals are keyed by their tag instead; an opener whose own tag
+        never closes may still be ordinary text (e.g. ``$A$ x $B$``).
+        """
+        return self.openers[pos][1] == _COMMENT_TAG
+
     def resolve(self, pos):
         """Return ``(end offset, token type)`` for the span opening at
         `pos`, or None if its closing delimiter is missing -- just as a

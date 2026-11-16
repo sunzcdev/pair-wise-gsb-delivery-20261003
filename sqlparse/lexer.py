@@ -16,7 +16,37 @@ from io import TextIOBase
 from threading import Lock
 
 from sqlparse import keywords, tokens
+from sqlparse.exceptions import IncompleteInputError
 from sqlparse.utils import consume
+
+# Opening quote characters of string-like literals. When such a character
+# reaches the lexer's error branch none of the string rules could consume
+# it, which (in recovery mode) means its closing quote is missing.
+_STRING_OPENERS = ("'", '"', '`', '´')
+
+# Token types whose rules can delimit a string-like literal. The first
+# rule starting with an opening quote wins, just like in the match loop.
+_STRING_TTYPES = (tokens.String.Single, tokens.String.Symbol, tokens.Name)
+
+
+def _build_closed_string_patterns(sql_regex):
+    """Map each opening quote to the regex of its closed literal.
+
+    Reuse the very patterns the lexer was configured with, so the
+    incompleteness check cannot drift from what the lexer normally
+    accepts, also for a custom configuration.
+    """
+    closed = {}
+    for pattern, action in sql_regex:
+        if not isinstance(action, tokens._TokenType) \
+                or action not in _STRING_TTYPES:
+            continue
+        for quote in _STRING_OPENERS:
+            if pattern.startswith(quote) and quote not in closed:
+                closed[quote] = re.compile(pattern, re.IGNORECASE | re.UNICODE)
+    return tuple((re.compile(re.escape(quote)), closed[quote])
+                 for quote in _STRING_OPENERS
+                 if quote in closed)
 
 
 class Lexer:
@@ -25,6 +55,10 @@ class Lexer:
 
     _default_instance = None
     _lock = Lock()
+
+    # Rules derived from the configured SQL_REGEX; empty until the lexer
+    # has been initialised.
+    _closed_string_patterns = ()
 
     # Development notes:
     # - This class is prepared to be able to support additional SQL dialects
@@ -76,6 +110,7 @@ class Lexer:
         to make the lexer functional again."""
         self._SQL_REGEX = []
         self._keywords = []
+        self._closed_string_patterns = ()
 
     def set_SQL_REGEX(self, SQL_REGEX):
         """Set the list of regex that will parse the SQL."""
@@ -84,6 +119,10 @@ class Lexer:
             (re.compile(rx, FLAGS).match, tt)
             for rx, tt in SQL_REGEX
         ]
+        # Derived from the configured patterns, so a custom rule set is
+        # checked for unclosed string literals with its own rules.
+        self._closed_string_patterns = _build_closed_string_patterns(
+            SQL_REGEX)
 
     def add_keywords(self, keywords):
         """Add keyword dictionaries. Keywords are looked up in the same order
@@ -103,7 +142,7 @@ class Lexer:
         else:
             return tokens.Name, value
 
-    def get_tokens(self, text, encoding=None):
+    def get_tokens(self, text, encoding=None, raise_on_incomplete=False):
         """
         Return an iterable of (tokentype, value) pairs generated from
         `text`. If `unfiltered` is set to `True`, the filtering mechanism
@@ -115,6 +154,11 @@ class Lexer:
         Split ``text`` into (tokentype, text) pairs.
 
         ``stack`` is the initial stack (default: ``['root']``)
+
+        If *raise_on_incomplete* is ``True`` an unterminated multiline
+        comment or string literal raises :class:`IncompleteInputError`
+        instead of falling back to per-character error tokens. The default
+        keeps the historical, non-validating tokenization.
         """
         if isinstance(text, TextIOBase):
             text = text.read()
@@ -148,6 +192,17 @@ class Lexer:
                     yield ttype, text[pos:end]
                     consume(iterable, end - pos - 1)
                     continue
+                # A multiline comment without its closing ``*/`` has no
+                # alternative reading, so the rest of the input cannot be
+                # split into statements any more. An unmatched dollar-quote
+                # opener may still be ordinary text and keeps its
+                # historical tokenization.
+                if raise_on_incomplete \
+                        and delimited_spans.is_comment_opener(pos):
+                    raise IncompleteInputError(
+                        "Unclosed multiline comment starting at position "
+                        f"{pos}.",
+                        remainder=text[pos:])
 
             for rexmatch, action in self._SQL_REGEX:
                 m = rexmatch(text, pos)
@@ -162,13 +217,31 @@ class Lexer:
                 consume(iterable, m.end() - pos - 1)
                 break
             else:
+                if raise_on_incomplete and self._is_unclosed_string(text, pos):
+                    raise IncompleteInputError(
+                        "Unclosed string literal starting at position "
+                        f"{pos}.",
+                        remainder=text[pos:])
                 yield tokens.Error, char
 
+    def _is_unclosed_string(self, text, pos):
+        """Return True if a string opened at *pos* has no closing quote.
 
-def tokenize(sql, encoding=None):
+        Only a quote character that no string rule could consume reaches
+        the check, so other error characters (say, a lone backslash left
+        over by a greedy match) are still reported as ordinary errors.
+        """
+        for opener, closed in self._closed_string_patterns:
+            if opener.match(text, pos) is not None:
+                return closed.match(text, pos) is None
+        return False
+
+
+def tokenize(sql, encoding=None, raise_on_incomplete=False):
     """Tokenize sql.
 
     Tokenize *sql* using the :class:`Lexer` and return a 2-tuple stream
     of ``(token type, value)`` items.
     """
-    return Lexer.get_default_instance().get_tokens(sql, encoding)
+    return Lexer.get_default_instance().get_tokens(
+        sql, encoding, raise_on_incomplete=raise_on_incomplete)

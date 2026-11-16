@@ -411,6 +411,22 @@ class TokenList(Token):
 class Statement(TokenList):
     """Represents a SQL statement."""
 
+    # Token and TokenList define __slots__, so the two recovery flags need
+    # to be declared here as well.
+    __slots__ = ('grouping_error', 'is_incomplete')
+
+    def __init__(self, tokens=None):
+        super().__init__(tokens)
+        #: Exception captured when grouping this statement failed, or
+        #: ``None`` if grouping succeeded or was not requested. A failed
+        #: statement keeps its ungrouped tokens so the original text
+        #: survives.
+        self.grouping_error = None
+        #: ``True`` for the trailing remainder of an input whose statement
+        #: boundary the lexer could not determine (an unclosed string
+        #: literal or multiline comment).
+        self.is_incomplete = False
+
     def get_type(self):
         """Returns the type of a statement.
 

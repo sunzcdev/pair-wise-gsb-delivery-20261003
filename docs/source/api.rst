@@ -12,9 +12,52 @@ The :mod:`sqlparse` module provides the following functions on module-level.
 
 .. autofunction:: sqlparse.parse
 
+.. autofunction:: sqlparse.parse_recovery
+
 In most cases there's no need to set the `encoding` parameter. If
 `encoding` is not set, sqlparse assumes that the given SQL statement
 is encoded either in utf-8 or latin-1.
+
+
+.. _recovery:
+
+Recovery-aware parsing
+----------------------
+
+:func:`~sqlparse.parse` raises as soon as grouping one statement fails,
+so a single malformed statement hides every statement after it. For
+batches such as a SQL script under review, use
+:func:`~sqlparse.parse_recovery` instead. It returns one
+:class:`~sqlparse.recovery.ParseResult` per statement, in input order,
+carrying:
+
+``source``
+  The verbatim source text of the statement. Concatenating the
+  ``source`` of every result reproduces the input that produced
+  statements; whitespace-only input yields no result, as with
+  :func:`~sqlparse.parse`.
+
+``statement``
+  The grouped :class:`~sqlparse.sql.Statement` when grouping succeeded,
+  otherwise the ungrouped statement (whose text is still the original).
+
+``error``
+  ``None`` on success, or the :class:`~sqlparse.exceptions.SQLParseError`
+  that made grouping fail (for example exceeding the grouping limits).
+  A failed statement never passes through the formatting filters, which
+  require a successfully grouped tree.
+
+``is_incomplete``
+  ``True`` for a trailing statement whose boundary the lexer could not
+  determine, i.e. the input ends inside an unclosed string literal or
+  multiline comment. The remaining input is reported once; splitting is
+  not resumed at a semicolon inside the open construct. Because there is
+  no statement boundary, the result also carries an
+  :class:`~sqlparse.exceptions.IncompleteInputError` as its ``error``.
+
+Recovery is opt-in. :func:`~sqlparse.parse`, :func:`~sqlparse.split` and
+:func:`~sqlparse.format` keep raising or fragmenting the input exactly as
+before.
 
 
 .. _formatting:

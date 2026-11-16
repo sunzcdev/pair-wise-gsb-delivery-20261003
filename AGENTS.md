@@ -99,6 +99,9 @@ Token types are defined in `sqlparse/tokens.py` and used for classification duri
 The main entry points in `sqlparse/__init__.py`:
 
 - `parse(sql, encoding=None)`: Parse SQL into tuple of `Statement` objects
+- `parse_recovery(sql, encoding=None)`: Parse a batch with per-statement
+  recovery; returns `ParseResult` objects carrying the source, the grouped
+  statement or the grouping error, and an incomplete-input flag
 - `format(sql, encoding=None, **options)`: Format SQL with options (reindent, keyword_case, etc.)
 - `split(sql, encoding=None, strip_semicolon=False)`: Split SQL into individual statement strings
 - `parsestream(stream, encoding=None)`: Generator version of parse for file-like objects

@@ -42,7 +42,7 @@ pip install sqlparse
 ## Usage
 
 Three module-level functions cover most needs: `split()`, `format()` and
-`parse()`.
+`parse()`. `parse_recovery()` adds per-statement error recovery for batches.
 
 ### Split a script into statements
 
@@ -95,6 +95,30 @@ which is how nested constructs like subqueries and `CASE` expressions are
 represented. See
 [Analyzing SQL statements](https://sqlparse.readthedocs.io/en/latest/analyzing.html)
 for the traversal API.
+
+### Review a script with per-statement recovery
+
+`parse()` raises when grouping one statement fails, which hides every
+statement after it. `parse_recovery()` keeps the whole batch in order and
+reports what happened to each statement:
+
+```python
+import sqlparse
+
+for result in sqlparse.parse_recovery("select 1; select 'unterminated"):
+    print(result.ok, result.is_incomplete, repr(result.source))
+```
+
+```
+True False 'select 1; '
+False True "select 'unterminated"
+```
+
+`result.statement` holds the grouped tree on success. On failure `result.error`
+holds the diagnosis and the statement stays ungrouped, so its original text is
+preserved. A trailing statement the lexer cannot delimit — the input ends inside
+a string literal or a multiline comment — is reported once with
+`is_incomplete=True`; splitting is not resumed at a semicolon inside it.
 
 ## Command line
 
