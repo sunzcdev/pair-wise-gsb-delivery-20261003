@@ -9,10 +9,13 @@ import pytest
 
 import chardet.pipeline.markup as markup_mod
 from chardet import detect
+from chardet.enums import DeclarationStatus
 from chardet.pipeline import DETERMINISTIC_CONFIDENCE, DetectionResult
 from chardet.pipeline.markup import (
     Declaration,
+    DeclarationOutcome,
     detect_markup_charset,
+    explain_declarations,
     iter_declarations,
 )
 from chardet.registry import REGISTRY, EncodingInfo
@@ -866,3 +869,92 @@ def test_promotion_table_derives_from_the_registry():
         "shift_jis_2004": ("shift_jis", "cp932"),
         "euc_kr": ("euc_kr", "cp949"),
     }
+
+# --- The diagnostic: each declaration's own outcome ---------------------------
+
+
+def test_explain_reports_an_invalid_label():
+    data = b'<meta charset="no-such-encoding"><meta charset="utf-8">'
+    assert explain_declarations(data, _ALL) == [
+        DeclarationOutcome(
+            Declaration(None, "text/html"), DeclarationStatus.INVALID_LABEL, None
+        ),
+        DeclarationOutcome(
+            Declaration("utf-8", "text/html"), DeclarationStatus.ACCEPTED, "utf-8"
+        ),
+    ]
+
+
+def test_explain_reports_a_decode_mismatch_for_a_legal_but_wrong_label():
+    """A legal label whose bytes do not match is not an invalid label."""
+    data = b'<meta charset="euc-jp">' + b"x" * 5000 + b"\x80\x80\x80"
+    (outcome,) = explain_declarations(data, _ALL)
+    assert outcome.status is DeclarationStatus.DECODE_MISMATCH
+    assert outcome.declaration == Declaration("euc_jis_2004", "text/html")
+    assert outcome.answer is None
+
+
+def test_explain_reports_a_filtered_declaration():
+    data = b'<meta charset="iso-8859-5">' + _CYRILLIC_1251
+    (outcome,) = explain_declarations(data, _ALL - {"iso8859-5"})
+    assert outcome.status is DeclarationStatus.FILTERED
+    assert outcome.answer is None
+
+
+def test_explain_reports_the_promoted_answer():
+    kr = "한국어 텍스트입니다.".encode("euc-kr") * 400 + "똠".encode("cp949")
+    (outcome,) = explain_declarations(b'<meta charset="euc-kr">' + kr, _ALL)
+    assert outcome.status is DeclarationStatus.ACCEPTED
+    assert outcome.answer == "cp949"
+
+
+def test_explain_stops_where_the_stage_stops():
+    """Nothing past the first accepted or filtered declaration is examined."""
+    accepted = b'<meta charset="iso-8859-1"><meta charset="no-such-encoding">'
+    outcomes = explain_declarations(accepted + _LATIN1_TEXT, _ALL)
+    assert [o.status for o in outcomes] == [DeclarationStatus.ACCEPTED]
+
+    filtered = b'<meta charset="iso-8859-1"><meta charset="utf-8">'
+    outcomes = explain_declarations(filtered + _LATIN1_TEXT, _ALL - {"iso8859-1"})
+    assert [o.status for o in outcomes] == [DeclarationStatus.FILTERED]
+
+
+def test_explain_repeats_a_failed_label_with_its_cached_outcome():
+    data = b'<meta charset="euc-jp">' * 2 + b"x" * 5000 + b"\x80\x80\x80"
+    outcomes = explain_declarations(data, _ALL)
+    assert [o.status for o in outcomes] == [
+        DeclarationStatus.DECODE_MISMATCH,
+        DeclarationStatus.DECODE_MISMATCH,
+    ]
+
+
+def test_explain_agrees_with_the_stage():
+    """The stage's answer is the first ACCEPTED outcome, or nothing."""
+    pages = [
+        b'<meta charset="iso-8859-1">' + _LATIN1_TEXT,
+        b'<meta charset="no-such-encoding"><meta charset="utf-8">',
+        b'<meta charset="euc-jp">' + b"x" * 5000 + b"\x80\x80\x80",
+        b"plain text, no declarations",
+    ]
+    for page in pages:
+        outcomes = explain_declarations(page, _ALL)
+        accepted = [o for o in outcomes if o.status is DeclarationStatus.ACCEPTED]
+        result = detect_markup_charset(page, _ALL)
+        assert (result.encoding if result else None) == (
+            accepted[0].answer if accepted else None
+        )
+
+
+# --- Fake declarations do not take effect -------------------------------------
+
+
+def test_coding_cookie_inside_a_string_literal_is_not_a_declaration():
+    """PEP 263 reads the cookie from a comment, never from a string."""
+    data = b'x = "# coding: cp1251"\nprint("hi")\n'
+    assert _declarations(data) == []
+    assert detect(data)["encoding"] == "ascii"
+
+
+def test_charset_in_body_text_is_not_a_declaration():
+    data = b"<p>set charset=koi8-r in the header to read this page</p>"
+    assert _declarations(data) == []

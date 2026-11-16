@@ -437,6 +437,47 @@ filters, chardet returns ``encoding=None`` with a warning.  Similarly,
 These parameters apply to :func:`~chardet.detect`,
 :func:`~chardet.detect_all`, and :class:`~chardet.UniversalDetector`.
 
+Charset Declaration Policy
+--------------------------
+
+A ``<meta charset>`` tag, an ``<?xml encoding?>`` prolog, or a PEP 263
+coding cookie is a claim about the bytes, not a fact: pages carry stale,
+defaulted, or copied declarations.  The ``declaration_policy`` parameter
+says how much weight that claim gets:
+
+- ``DeclarationPolicy.STRICT`` (default) — a declaration is honored only
+  when its encoding decodes the whole examination window and passes the
+  encoding filters; such a declaration is the answer and detection stops.
+  A declaration that fails the window is skipped, so a stale prolog
+  cannot hide a correct meta tag.
+- ``DeclarationPolicy.PREFER`` — a compatible declaration is still the
+  answer, but detection does not stop: every other candidate is checked
+  and ranked behind it, so :func:`~chardet.detect_all` also shows what
+  the bytes alone would have said.
+- ``DeclarationPolicy.HINT`` — a declaration never commits.  It only
+  lifts its encoding to a moderate confidence when the pipeline's own
+  byte checks already kept that encoding in the ranking, so a declaration
+  that lies about the bytes has no effect at all.
+
+.. code-block:: python
+
+   from chardet import DeclarationPolicy, detect, detect_all
+
+   detect(data, declaration_policy=DeclarationPolicy.HINT)
+   detect_all(data, declaration_policy="prefer")  # string values work too
+
+The guarantees around declarations hold under every policy:
+
+- A byte order mark outranks a declaration; the priority is fixed.
+- A declaration inside an HTML comment, a ``charset=`` mention in body
+  text or an attribute value, and a PEP 263 cookie inside a string
+  literal are not declarations and have no effect.
+- A declaration can never name an encoding that ``include_encodings``,
+  ``exclude_encodings``, or ``encoding_era`` rules out.
+- The promise that the answer decodes covers the examined window
+  (``max_bytes``), never bytes beyond it: a declaration validated against
+  the window says nothing about the rest of the file.
+
 Limiting Bytes
 --------------
 
@@ -526,6 +567,10 @@ chardet includes a ``chardetect`` command:
    # Report raw Python codec names
    chardetect --no-compat-names japanese.txt
    # japanese.txt: euc_jis_2004 with confidence 0.770844139781662
+
+   # Treat a charset declaration as a hint rather than a verdict
+   chardetect --declaration-policy hint somefile.html
+   # somefile.html: ISO-8859-1 with confidence 0.5
 
    # Read from stdin
    cat somefile.txt | chardetect

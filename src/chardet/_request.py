@@ -12,12 +12,13 @@ thin adapters over it.
 
 from __future__ import annotations
 
+import contextlib
 import dataclasses
 import warnings
 from collections.abc import Iterable
 
 from chardet._utils import DEFAULT_MAX_BYTES, MINIMUM_THRESHOLD
-from chardet.enums import EncodingEra
+from chardet.enums import DeclarationPolicy, EncodingEra
 from chardet.output_names import apply_compat_names, apply_preferred_superset
 from chardet.pipeline import DetectionDict, DetectionResult
 from chardet.pipeline.orchestrator import run_pipeline
@@ -42,6 +43,27 @@ def _validate_max_bytes(max_bytes: int) -> None:
     if isinstance(max_bytes, bool) or not isinstance(max_bytes, int) or max_bytes < 1:
         msg = "max_bytes must be a positive integer"
         raise ValueError(msg)
+
+
+def _validate_declaration_policy(
+    declaration_policy: DeclarationPolicy | str,
+) -> DeclarationPolicy:
+    """Return *declaration_policy* as a :class:`DeclarationPolicy`.
+
+    The policy's string values (``"strict"``, ``"prefer"``, ``"hint"``)
+    are accepted too, so command-line and config-file callers do not need
+    the enum in hand.
+    """
+    if isinstance(declaration_policy, DeclarationPolicy):
+        return declaration_policy
+    if isinstance(declaration_policy, str):
+        with contextlib.suppress(ValueError):
+            return DeclarationPolicy(declaration_policy.lower())
+    msg = (
+        "declaration_policy must be a DeclarationPolicy or one of "
+        f"'strict', 'prefer', 'hint'; got {declaration_policy!r}"
+    )
+    raise ValueError(msg)
 
 
 def _resolve_prefer_superset(
@@ -74,6 +96,7 @@ class DetectionRequest:
     exclude_encodings: frozenset[str] | None = None
     no_match_encoding: str = "cp1252"
     empty_input_encoding: str = "utf-8"
+    declaration_policy: DeclarationPolicy = DeclarationPolicy.STRICT
 
     @classmethod
     def resolve(  # noqa: PLR0913
@@ -89,6 +112,7 @@ class DetectionRequest:
         exclude_encodings: Iterable[str] | None = None,
         no_match_encoding: str = "cp1252",
         empty_input_encoding: str = "utf-8",
+        declaration_policy: DeclarationPolicy | str = DeclarationPolicy.STRICT,
         stacklevel: int = 2,
     ) -> DetectionRequest:
         """Validate the public options and resolve them into a request.
@@ -101,8 +125,9 @@ class DetectionRequest:
             :func:`warnings.warn` counts it from the caller of this method:
             ``2`` is that caller, ``3`` the caller's caller (what a public
             function passes so the warning names the user's line).
-        :raises ValueError: If *max_bytes* is not a positive integer or an
-            encoding name is unknown.
+        :raises ValueError: If *max_bytes* is not a positive integer, an
+            encoding name is unknown, or *declaration_policy* is not a
+            valid policy.
         """
         # Each helper adds its own frame, hence the +1.
         _warn_deprecated_chunk_size(chunk_size, stacklevel=stacklevel + 1)
@@ -129,6 +154,7 @@ class DetectionRequest:
             empty_input_encoding=_validate_encoding(
                 empty_input_encoding, "empty_input_encoding"
             ),
+            declaration_policy=_validate_declaration_policy(declaration_policy),
         )
 
     def run(
@@ -157,6 +183,7 @@ class DetectionRequest:
             empty_input_encoding=self.empty_input_encoding,
             full_ranking=full_ranking,
             input_truncated=input_truncated,
+            declaration_policy=self.declaration_policy,
         )
 
     def render(

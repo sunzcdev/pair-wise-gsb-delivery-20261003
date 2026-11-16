@@ -21,6 +21,9 @@ _GREEK = "Καλημέρα κόσμε, αυτό είναι ένα δοκιμασ
 )
 _JAPANESE = "日本語のテキストです。文字コードを判定します。".encode("euc_jp")
 _FRENCH = "Le café était fermé, alors nous sommes allés à la gare.".encode("cp1252")
+_DECLARED_LATIN1 = (
+    b'<meta charset="iso-8859-1">' + "Voilà, un résumé. ".encode("latin-1") * 5
+)
 
 _INPUTS = {
     "greek": _GREEK,
@@ -29,6 +32,7 @@ _INPUTS = {
     "ascii": b"Hello, world!",
     "empty": b"",
     "binary": b"\x00\x01\x02\x03" * 20,
+    "declared-latin1": _DECLARED_LATIN1,
 }
 
 _OPTIONS: dict[str, dict[str, Any]] = {
@@ -43,6 +47,8 @@ _OPTIONS: dict[str, dict[str, Any]] = {
     },
     "small-window": {"max_bytes": 16},
     "modern-era": {"encoding_era": EncodingEra.MODERN_WEB},
+    "declaration-prefer": {"declaration_policy": "prefer"},
+    "declaration-hint": {"declaration_policy": "hint"},
 }
 
 

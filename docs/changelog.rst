@@ -13,6 +13,24 @@ Unreleased
 
 **Features:**
 
+- New ``declaration_policy`` parameter on ``detect()``, ``detect_all()``,
+  and ``UniversalDetector`` (plus ``--declaration-policy`` for
+  ``chardetect``) controls how a charset declaration in the data weighs
+  against the byte evidence.  The default, ``DeclarationPolicy.STRICT``,
+  is the historical behavior: a declaration that decodes the examined
+  window is the answer.  ``DeclarationPolicy.PREFER`` still reports a
+  compatible declaration first but checks and ranks every other candidate
+  behind it, and ``DeclarationPolicy.HINT`` lets a declaration only lift
+  its own encoding inside the statistical ranking, so a declaration that
+  lies about the bytes has no effect.  Under every policy a BOM outranks
+  a declaration, a declaration can never name an encoding the filters
+  exclude, and the decode promise covers the examined window only.  The
+  new ``chardet.pipeline.markup.explain_declarations()`` diagnostic
+  reports each declaration's outcome separately — an invalid label, a
+  legal label whose bytes do not match, a filtered-out encoding, or the
+  accepted answer.
+  (via Claude)
+
 - ``chardetect`` has two new flags.  ``--prefer-superset`` reports a
   detected subset encoding under its Windows code page, like
   ``Windows-1253`` for ISO-8859-7 text, the same as

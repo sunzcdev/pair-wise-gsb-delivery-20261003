@@ -1,11 +1,13 @@
 """Stage 1b: charset declarations (HTML/XML/PEP 263) and the answer they give.
 
-The module has two seams.  :func:`iter_declarations` is the parser: it
+The module has three seams.  :func:`iter_declarations` is the parser: it
 reads the head of the data and yields every charset declaration it finds,
 resolved to a registry name, without decoding the window.
-:func:`detect_markup_charset` is the stage: it walks those declarations
-and decides which one, if any, is the answer, including any promotion to
-a Windows superset.
+:func:`explain_declarations` walks those declarations the way the stage
+decides them and reports each one's outcome, keeping an invalid label
+distinct from a legal declaration whose bytes do not match.
+:func:`detect_markup_charset` is the stage: it takes the first accepted
+declaration as the answer, including any promotion to a Windows superset.
 
 Note: ``from __future__ import annotations`` is intentionally omitted because
 this module is compiled with mypyc, which does not support PEP 563 string
@@ -17,7 +19,7 @@ from collections.abc import Iterator
 from typing import NamedTuple
 
 from chardet._utils import decodes_without_error
-from chardet.enums import EncodingEra
+from chardet.enums import DeclarationStatus, EncodingEra
 from chardet.output_names import display_codec
 from chardet.pipeline import DETERMINISTIC_CONFIDENCE, DetectionResult, PipelineContext
 from chardet.pipeline.structural import compute_structural_score
@@ -458,6 +460,76 @@ def _declared_answer(data: bytes, encoding: str, allowed: frozenset[str]) -> _Ve
     return _UNSETTLED
 
 
+class DeclarationOutcome(NamedTuple):
+    """What one declaration says about the window, and what came of it.
+
+    :ivar declaration: The declaration the parser found.
+    :ivar status: How the stage decided it (see :class:`DeclarationStatus`).
+    :ivar answer: The encoding name the declaration reports — its own name
+        or its Windows superset — when *status* is ``ACCEPTED``, else
+        ``None``.
+    """
+
+    declaration: Declaration
+    status: DeclarationStatus
+    answer: str | None
+
+
+def explain_declarations(
+    data: bytes, allowed: frozenset[str]
+) -> list[DeclarationOutcome]:
+    """Walk the declarations in *data* the way the stage decides them.
+
+    Same scan and same verdicts as :func:`detect_markup_charset`, but every
+    declaration is reported with its own outcome instead of only the
+    winning one: an ``INVALID_LABEL`` (no codec answers to the label, or a
+    label the prescan never honors) stays distinct from a
+    ``DECODE_MISMATCH`` (a legal label whose encoding cannot decode the
+    window) and from a ``FILTERED`` one (decodes the window, but the
+    caller's filters rule it out).  The walk stops where the stage would
+    stop: at the first ``ACCEPTED`` or ``FILTERED`` outcome.  Each failed
+    encoding is decode-checked once, however often the head repeats it;
+    a repeated label is reported again with the cached outcome.
+
+    This is a diagnostic, not a shortcut: it pays the same window decodes
+    the stage would.  The verdicts are facts about *data* — the
+    examination window — not about any bytes beyond it.
+
+    :param data: The raw byte data to scan (the examination window).
+    :param allowed: The encoding names the caller's filters permit.
+    :returns: One :class:`DeclarationOutcome` per declaration examined, in
+        scan order.
+    """
+    outcomes: list[DeclarationOutcome] = []
+    rejected: dict[str, DeclarationStatus] = {}
+    for declaration in iter_declarations(data):
+        encoding = declaration.encoding
+        if encoding is None:
+            outcomes.append(
+                DeclarationOutcome(declaration, DeclarationStatus.INVALID_LABEL, None)
+            )
+            continue
+        if encoding in rejected:
+            outcomes.append(DeclarationOutcome(declaration, rejected[encoding], None))
+            continue
+        answer, settled = _declared_answer(data, encoding, allowed)
+        if answer is not None:
+            outcomes.append(
+                DeclarationOutcome(declaration, DeclarationStatus.ACCEPTED, answer)
+            )
+            break
+        if settled:
+            outcomes.append(
+                DeclarationOutcome(declaration, DeclarationStatus.FILTERED, None)
+            )
+            break
+        rejected[encoding] = DeclarationStatus.DECODE_MISMATCH
+        outcomes.append(
+            DeclarationOutcome(declaration, DeclarationStatus.DECODE_MISMATCH, None)
+        )
+    return outcomes
+
+
 def detect_markup_charset(
     data: bytes,
     allowed: frozenset[str],
@@ -476,6 +548,8 @@ def detect_markup_charset(
     scan with no answer, leaving the page to the later stages, the same as
     a page without one.  Each failed encoding is decoded once: the head can
     repeat one label hundreds of times, and every try reads the window.
+    :func:`explain_declarations` reports the per-declaration outcomes
+    behind this decision.
 
     A declaration is honored over pure ASCII, since the declared encoding
     decodes those bytes identically, but not over genuine UTF-8 structure:
@@ -492,32 +566,26 @@ def detect_markup_charset(
     :returns: A :class:`DetectionResult` with confidence 0.95 (or the UTF-8
         precheck's), or ``None`` when no declaration is accepted.
     """
-    rejected: set[str] = set()
-    for declaration in iter_declarations(data):
-        encoding = declaration.encoding
-        if encoding is None or encoding in rejected:
-            continue
-        answer, settled = _declared_answer(data, encoding, allowed)
-        if answer is None:
-            if settled:
-                return None
-            rejected.add(encoding)
-            continue
-        if (
-            utf8_precheck is not None
-            and utf8_precheck.encoding != answer
-            and utf8_precheck.encoding in allowed
-        ):
+    for outcome in explain_declarations(data, allowed):
+        if outcome.status is DeclarationStatus.ACCEPTED and outcome.answer is not None:
+            answer = outcome.answer
+            if (
+                utf8_precheck is not None
+                and utf8_precheck.encoding != answer
+                and utf8_precheck.encoding in allowed
+            ):
+                return DetectionResult(
+                    utf8_precheck.encoding,
+                    utf8_precheck.confidence,
+                    utf8_precheck.language,
+                    outcome.declaration.mime_type,
+                )
             return DetectionResult(
-                utf8_precheck.encoding,
-                utf8_precheck.confidence,
-                utf8_precheck.language,
-                declaration.mime_type,
+                encoding=answer,
+                confidence=DETERMINISTIC_CONFIDENCE,
+                language=None,
+                mime_type=outcome.declaration.mime_type,
             )
-        return DetectionResult(
-            encoding=answer,
-            confidence=DETERMINISTIC_CONFIDENCE,
-            language=None,
-            mime_type=declaration.mime_type,
-        )
+        if outcome.status is DeclarationStatus.FILTERED:
+            return None
     return None

@@ -8,7 +8,7 @@ annotations.
 import warnings
 
 from chardet._utils import DEFAULT_MAX_BYTES, EVIDENCE_CAP_BYTES, decodes_without_error
-from chardet.enums import EncodingEra
+from chardet.enums import DeclarationPolicy, EncodingEra
 from chardet.pipeline import (
     _NONE_RESULT,
     DETERMINISTIC_CONFIDENCE,
@@ -44,6 +44,66 @@ _BINARY_RESULT = DetectionResult(
 # Threshold at which a CJK structural score is confident enough to trigger
 # combined structural+statistical ranking rather than purely statistical.
 _STRUCTURAL_CONFIDENCE_THRESHOLD = 0.85
+
+# Confidence floor a HINT-policy declaration gives its encoding: enough to
+# lift a plausible candidate past single-byte noise, never enough to beat
+# solid statistical evidence on its own.  A hint never reaches a
+# deterministic stage's answer at all.
+_HINT_CONFIDENCE = 0.5
+
+
+def _apply_declaration_policy(
+    declaration_policy: DeclarationPolicy,
+    declared: DetectionResult | None,
+    results: list[DetectionResult],
+) -> list[DetectionResult]:
+    """Merge a non-strict declaration outcome into the ranking *results*.
+
+    STRICT never reaches here — a strict declaration commits at the markup
+    stage.  PREFER puts the declaration's answer first and lifts its
+    confidence to the best the rest of the pipeline found, so the
+    preference survives the confidence-sorted ``detect_all`` rendering;
+    the other candidates follow, still checked.  HINT only lifts the
+    declared encoding to the hint confidence when the pipeline's own
+    checks already kept that encoding in the ranking — a candidate those
+    checks eliminated stays eliminated, so a declaration that lies about
+    the bytes has no effect.  Both policies inherit the markup stage's
+    filter gate: *declared* is ``None`` when the caller's filters rule the
+    declared encoding out, and neither policy can name it.
+    """
+    if declared is None or declaration_policy is DeclarationPolicy.STRICT:
+        return results
+    if declaration_policy is DeclarationPolicy.PREFER:
+        top = max((r.confidence for r in results), default=0.0)
+        preferred = DetectionResult(
+            declared.encoding,
+            max(declared.confidence, top),
+            declared.language,
+            declared.mime_type,
+        )
+        # A preferred answer supersedes the encoding=None "nothing fit"
+        # sentinel and the tail's own entry for the declared encoding.
+        rest = [
+            r
+            for r in results
+            if r.encoding is not None and r.encoding != declared.encoding
+        ]
+        return [preferred, *rest]
+    # DeclarationPolicy.HINT
+    for i, result in enumerate(results):
+        if result.encoding == declared.encoding:
+            if result.confidence >= _HINT_CONFIDENCE:
+                return results
+            boosted = DetectionResult(
+                result.encoding,
+                _HINT_CONFIDENCE,
+                result.language,
+                result.mime_type or declared.mime_type,
+            )
+            hinted = [*results[:i], boosted, *results[i + 1 :]]
+            hinted.sort(key=lambda r: r.confidence, reverse=True)
+            return hinted
+    return results
 
 # Maximum bytes used for statistical bigram scoring.  Bigram models
 # converge quickly — 16 KB is sufficient for discrimination across all
@@ -275,6 +335,7 @@ def _run_pipeline_core(  # noqa: PLR0913, PLR0915
     empty_input_encoding: str = "utf-8",
     full_ranking: bool = False,
     input_truncated: bool = False,
+    declaration_policy: DeclarationPolicy = DeclarationPolicy.STRICT,
 ) -> list[DetectionResult]:
     """Core pipeline logic. Returns list of results sorted by confidence."""
     ctx = PipelineContext()
@@ -292,6 +353,12 @@ def _run_pipeline_core(  # noqa: PLR0913, PLR0915
             empty_input_encoding, allowed, "empty_input_encoding"
         )
 
+    # Only STRICT lets a declaration pre-empt a deterministic stage.  The
+    # priority is fixed: a BOM (or UTF-16/32 pattern, escape sequence,
+    # magic number, binary verdict) outranks any declaration, and under
+    # PREFER and HINT the declaration never enters these stages at all.
+    strict_declarations = declaration_policy is DeclarationPolicy.STRICT
+
     # Stage 1a: BOM detection (runs first — BOMs are definitive and
     # UTF-16/32 data looks binary due to null bytes)
     bom_result = detect_bom(data, input_truncated=input_truncated)
@@ -299,7 +366,7 @@ def _run_pipeline_core(  # noqa: PLR0913, PLR0915
         # The UTF-7 signature is five ASCII bytes, not a byte order mark
         # no other charset would hold, so it yields to a declaration the
         # way the escape stage's answers do below.
-        if bom_result.encoding == "utf-7":
+        if bom_result.encoding == "utf-7" and strict_declarations:
             declared = detect_markup_charset(data, allowed)
             if declared is not None:
                 return [declared]
@@ -335,17 +402,20 @@ def _run_pipeline_core(  # noqa: PLR0913, PLR0915
         # is an ISO-2022 answer under a declared ISO-2022 name: that is
         # the same family, and the designations name the variant.  The
         # head scan costs a few microseconds on a stream that declares
-        # nothing.
-        declared = detect_markup_charset(data, allowed)
-        if (
-            declared is not None
-            and declared.encoding is not None
-            and not (
-                escape_result.encoding.startswith("iso2022")
-                and declared.encoding.startswith("iso2022")
-            )
-        ):
-            return [declared]
+        # nothing.  Only STRICT makes the comparison: under PREFER and
+        # HINT the escape answer stands and the declaration is weighed at
+        # its own stage below.
+        if strict_declarations:
+            declared = detect_markup_charset(data, allowed)
+            if (
+                declared is not None
+                and declared.encoding is not None
+                and not (
+                    escape_result.encoding.startswith("iso2022")
+                    and declared.encoding.startswith("iso2022")
+                )
+            ):
+                return [declared]
         return [escape_result]
 
     # Magic number detection for known binary formats — runs before
@@ -379,18 +449,25 @@ def _run_pipeline_core(  # noqa: PLR0913, PLR0915
 
     # Stage 1b: Markup charset extraction.  The stage owns the whole
     # declaration decision: decode checks, superset promotion, the allowed
-    # gate, and the UTF-8 override (see its docstring).
-    markup_result = detect_markup_charset(data, allowed, utf8_precheck)
-    if markup_result is not None:
-        return [markup_result]
+    # gate, and the UTF-8 override (see its docstring).  What the answer
+    # means is the declaration policy's call: STRICT commits to it here,
+    # PREFER and HINT carry it alongside and merge it into the ranking the
+    # rest of the pipeline produces (_apply_declaration_policy).
+    declared_result = detect_markup_charset(data, allowed, utf8_precheck)
+    if declared_result is not None and strict_declarations:
+        return [declared_result]
 
     # Stage 1c: ASCII (use pre-computed result)
     if ascii_precheck is not None and ascii_precheck.encoding in allowed:
-        return [ascii_precheck]
+        return _apply_declaration_policy(
+            declaration_policy, declared_result, [ascii_precheck]
+        )
 
     # Stage 1d: UTF-8 structural validation (use pre-computed result)
     if utf8_precheck is not None and utf8_precheck.encoding in allowed:
-        return [utf8_precheck]
+        return _apply_declaration_policy(
+            declaration_policy, declared_result, [utf8_precheck]
+        )
 
     # The filtering, gating, and probing stages below converge on bounded
     # evidence (ADR-0006).  One slice, taken here, feeds them all: the
@@ -418,14 +495,28 @@ def _run_pipeline_core(  # noqa: PLR0913, PLR0915
         valid_candidates = tuple(e for e in valid_candidates if e.name != "utf-8")
 
     if not valid_candidates:
-        return _make_fallback_or_none(no_match_encoding, allowed, "no_match_encoding")
+        return _apply_declaration_policy(
+            declaration_policy,
+            declared_result,
+            _make_fallback_or_none(no_match_encoding, allowed, "no_match_encoding"),
+        )
 
     # Gate: eliminate CJK multi-byte candidates that lack genuine
     # multi-byte structure.  Cache structural scores for Stage 2b.
     valid_candidates = _gate_cjk_candidates(evidence, valid_candidates, ctx)
 
     if not valid_candidates:
-        return _make_fallback_or_none(no_match_encoding, allowed, "no_match_encoding")
+        return _apply_declaration_policy(
+            declaration_policy,
+            declared_result,
+            _make_fallback_or_none(no_match_encoding, allowed, "no_match_encoding"),
+        )
+
+    # A HINT declaration must see its own encoding's score to lift it, so
+    # the pruned ranking (which may drop that encoding) is not enough.
+    score_full_ranking = full_ranking or (
+        declaration_policy is DeclarationPolicy.HINT and declared_result is not None
+    )
 
     # Stage 2b: Structural probing for multi-byte encodings
     # Reuse scores already computed during the CJK gate above.
@@ -449,14 +540,18 @@ def _run_pipeline_core(  # noqa: PLR0913, PLR0915
                 structural_scores,
                 valid_candidates,
                 ctx,
-                full_ranking=full_ranking,
+                full_ranking=score_full_ranking,
             )
             if results:
                 results = postprocess_results(
                     evidence, results, input_truncated=evidence_truncated
                 )
-                return _hold_validity_past_cap(
-                    data, evidence, results, allowed, no_match_encoding
+                return _apply_declaration_policy(
+                    declaration_policy,
+                    declared_result,
+                    _hold_validity_past_cap(
+                        data, evidence, results, allowed, no_match_encoding
+                    ),
                 )
 
     # Stage 3: Statistical scoring for all remaining candidates.
@@ -464,15 +559,25 @@ def _run_pipeline_core(  # noqa: PLR0913, PLR0915
     # beyond 16 KB — cap the data to avoid unnecessary work on large files.
     stat_data = evidence[:_STAT_SCORE_MAX_BYTES]
     results = list(
-        score_candidates(stat_data, tuple(valid_candidates), full_ranking=full_ranking)
+        score_candidates(
+            stat_data, tuple(valid_candidates), full_ranking=score_full_ranking
+        )
     )
     if not results:
-        return _make_fallback_or_none(no_match_encoding, allowed, "no_match_encoding")
+        return _apply_declaration_policy(
+            declaration_policy,
+            declared_result,
+            _make_fallback_or_none(no_match_encoding, allowed, "no_match_encoding"),
+        )
 
     # Rank corrections reason about the same evidence window the ranking
     # came from, which also bounds their byte-presence scans.
     results = postprocess_results(evidence, results, input_truncated=evidence_truncated)
-    return _hold_validity_past_cap(data, evidence, results, allowed, no_match_encoding)
+    return _apply_declaration_policy(
+        declaration_policy,
+        declared_result,
+        _hold_validity_past_cap(data, evidence, results, allowed, no_match_encoding),
+    )
 
 
 def run_pipeline(  # noqa: PLR0913
@@ -486,6 +591,7 @@ def run_pipeline(  # noqa: PLR0913
     empty_input_encoding: str = "utf-8",
     full_ranking: bool = False,
     input_truncated: bool = False,
+    declaration_policy: DeclarationPolicy = DeclarationPolicy.STRICT,
 ) -> list[DetectionResult]:
     """Run the full detection pipeline.
 
@@ -505,6 +611,8 @@ def run_pipeline(  # noqa: PLR0913
         ``max_bytes``, which this function cannot see from ``len(data)``
         alone).  Truncation by the ``max_bytes`` slice here is detected
         either way; the flag only ever widens it.
+    :param declaration_policy: How a charset declaration in the data weighs
+        against the byte evidence (see :class:`DeclarationPolicy`).
     :returns: A list of :class:`DetectionResult` sorted by confidence descending.
     """
     results = _run_pipeline_core(
@@ -517,6 +625,7 @@ def run_pipeline(  # noqa: PLR0913
         no_match_encoding=no_match_encoding,
         empty_input_encoding=empty_input_encoding,
         full_ranking=full_ranking,
+        declaration_policy=declaration_policy,
     )
     # Same slice the core ran on: ``max_bytes`` is the caller's cap on what
     # chardet may look at, and language fill is not exempt from it just

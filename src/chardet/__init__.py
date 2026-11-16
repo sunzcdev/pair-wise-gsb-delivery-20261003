@@ -8,12 +8,13 @@ from chardet._request import _DEFAULT_CHUNK_SIZE, DetectionRequest
 from chardet._utils import DEFAULT_MAX_BYTES, MINIMUM_THRESHOLD
 from chardet._version import __version__
 from chardet.detector import UniversalDetector
-from chardet.enums import EncodingEra, LanguageFilter
+from chardet.enums import DeclarationPolicy, EncodingEra, LanguageFilter
 from chardet.pipeline import DetectionDict, DetectionResult
 
 __all__ = [
     "DEFAULT_MAX_BYTES",
     "MINIMUM_THRESHOLD",
+    "DeclarationPolicy",
     "DetectionDict",
     "DetectionResult",
     "EncodingEra",
@@ -59,6 +60,7 @@ def detect(  # noqa: PLR0913
     exclude_encodings: Iterable[str] | None = None,
     no_match_encoding: str = "cp1252",
     empty_input_encoding: str = "utf-8",
+    declaration_policy: DeclarationPolicy | str = DeclarationPolicy.STRICT,
 ) -> DetectionDict:
     """Detect the encoding of the given byte string.
 
@@ -99,6 +101,23 @@ def detect(  # noqa: PLR0913
         against the data: it is the caller's sentinel for "nothing fit".
     :param empty_input_encoding: Encoding to return for empty input.  Defaults
         to ``"utf-8"``.
+    :param declaration_policy: How a charset declaration found in the data
+        (``<meta charset>``, ``<?xml encoding>``, or a PEP 263 cookie)
+        weighs against the byte evidence; a declaration is a claim about
+        the bytes, not a fact.  ``DeclarationPolicy.STRICT`` (default)
+        honors a declaration only when its encoding decodes the whole
+        examination window and passes the filters, and such a declaration
+        is the answer.  ``DeclarationPolicy.PREFER`` also reports a
+        compatible declaration first, but still checks and ranks every
+        other candidate behind it.  ``DeclarationPolicy.HINT`` treats the
+        declaration as a hint only: it can lift its encoding inside the
+        statistical ranking but never commits, so a declaration that lies
+        about the bytes has no effect.  Accepts the enum member or its
+        value (``"strict"``, ``"prefer"``, ``"hint"``).  Under every
+        policy a byte order mark outranks a declaration, a declaration
+        can never name an encoding the filters exclude, and the promise
+        that the answer decodes covers the examined window
+        (``max_bytes``), not bytes beyond it.
     :returns: A dictionary with keys ``"encoding"``, ``"confidence"``,
         ``"language"``, and ``"mime_type"``.
     """
@@ -113,6 +132,7 @@ def detect(  # noqa: PLR0913
         exclude_encodings=exclude_encodings,
         no_match_encoding=no_match_encoding,
         empty_input_encoding=empty_input_encoding,
+        declaration_policy=declaration_policy,
         stacklevel=3,
     )
     data = byte_str if isinstance(byte_str, bytes) else bytes(byte_str)
@@ -133,6 +153,7 @@ def detect_all(  # noqa: PLR0913
     exclude_encodings: Iterable[str] | None = None,
     no_match_encoding: str = "cp1252",
     empty_input_encoding: str = "utf-8",
+    declaration_policy: DeclarationPolicy | str = DeclarationPolicy.STRICT,
 ) -> list[DetectionDict]:
     """Detect all possible encodings of the given byte string.
 
@@ -165,6 +186,13 @@ def detect_all(  # noqa: PLR0913
         the pipeline.  Defaults to ``"cp1252"``.
     :param empty_input_encoding: Encoding to return for empty input.  Defaults
         to ``"utf-8"``.
+    :param declaration_policy: How a charset declaration found in the data
+        weighs against the byte evidence.  With
+        ``DeclarationPolicy.PREFER`` a compatible declaration heads the
+        list and the other candidates follow, still checked; with
+        ``DeclarationPolicy.HINT`` a declaration can only lift its
+        encoding inside the ranking.  See :func:`detect` for the full
+        semantics.
     :returns: A list of dictionaries, sorted by descending confidence, one
         per encoding name.
     """
@@ -179,6 +207,7 @@ def detect_all(  # noqa: PLR0913
         exclude_encodings=exclude_encodings,
         no_match_encoding=no_match_encoding,
         empty_input_encoding=empty_input_encoding,
+        declaration_policy=declaration_policy,
         stacklevel=3,
     )
     data = byte_str if isinstance(byte_str, bytes) else bytes(byte_str)

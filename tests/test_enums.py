@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import enum
 
-from chardet.enums import EncodingEra
+from chardet.enums import DeclarationPolicy, DeclarationStatus, EncodingEra
 
 
 def test_encoding_era_is_int_flag():
@@ -42,3 +42,20 @@ def test_encoding_era_values_are_powers_of_two():
             assert member.value & (member.value - 1) == 0, (
                 f"{member.name} is not a power of two"
             )
+
+def test_declaration_policy_members_and_values():
+    # The values are a public contract: resolve() and the CLI accept them.
+    assert {m.name: m.value for m in DeclarationPolicy} == {
+        "STRICT": "strict",
+        "PREFER": "prefer",
+        "HINT": "hint",
+    }
+
+
+def test_declaration_status_members():
+    assert set(DeclarationStatus.__members__) == {
+        "ACCEPTED",
+        "FILTERED",
+        "DECODE_MISMATCH",
+        "INVALID_LABEL",
+    }

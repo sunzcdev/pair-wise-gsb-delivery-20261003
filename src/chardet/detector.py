@@ -10,7 +10,7 @@ from typing import ClassVar
 from chardet import _utils
 from chardet._request import DetectionRequest
 from chardet._utils import DEFAULT_MAX_BYTES
-from chardet.enums import EncodingEra, LanguageFilter
+from chardet.enums import DeclarationPolicy, EncodingEra, LanguageFilter
 from chardet.output_names import PREFERRED_SUPERSET
 from chardet.pipeline import _NONE_RESULT, DetectionDict
 
@@ -51,6 +51,7 @@ class UniversalDetector:
         exclude_encodings: Iterable[str] | None = None,
         no_match_encoding: str = "cp1252",
         empty_input_encoding: str = "utf-8",
+        declaration_policy: DeclarationPolicy | str = DeclarationPolicy.STRICT,
     ) -> None:
         """Initialize the detector.
 
@@ -78,6 +79,9 @@ class UniversalDetector:
             survives the pipeline.  Defaults to ``"cp1252"``.
         :param empty_input_encoding: Encoding to return for empty input.
             Defaults to ``"utf-8"``.
+        :param declaration_policy: How a charset declaration found in the
+            buffered data weighs against the byte evidence.  See
+            :func:`chardet.detect` for the full semantics.
         """
         if lang_filter != LanguageFilter.ALL:
             warnings.warn(
@@ -96,6 +100,7 @@ class UniversalDetector:
             exclude_encodings=exclude_encodings,
             no_match_encoding=no_match_encoding,
             empty_input_encoding=empty_input_encoding,
+            declaration_policy=declaration_policy,
             stacklevel=3,
         )
         self._buffer = bytearray()

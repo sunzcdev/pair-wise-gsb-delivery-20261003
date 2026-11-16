@@ -22,6 +22,10 @@ Enumerations
    :members:
    :undoc-members:
 
+.. autoclass:: chardet.DeclarationPolicy
+   :members:
+   :undoc-members:
+
 .. autoclass:: chardet.LanguageFilter
    :members:
    :undoc-members:

@@ -160,6 +160,17 @@ def main(argv: list[str] | None = None) -> None:
         ),
     )
     parser.add_argument(
+        "--declaration-policy",
+        default="strict",
+        choices=["strict", "prefer", "hint"],
+        help=(
+            "How a charset declaration in the data weighs against the byte "
+            "evidence: 'strict' (default) honors a declaration that decodes "
+            "the examined bytes, 'prefer' also ranks the other candidates "
+            "behind it, 'hint' never lets a declaration commit"
+        ),
+    )
+    parser.add_argument(
         "--version", action="version", version=f"chardet {chardet.__version__}"
     )
 
@@ -191,6 +202,7 @@ def main(argv: list[str] | None = None) -> None:
             exclude_encodings=exclude,
             no_match_encoding=args.no_match_encoding,
             empty_input_encoding=args.empty_input_encoding,
+            declaration_policy=args.declaration_policy,
         )
 
     if args.files:
