@@ -84,6 +84,21 @@ Import/export using the dBASE_ format.
         with open('output.dbf', 'wb') as f:
             f.write(dataset.export('dbf')
 
+Export applies the following conversion rules: field names are uppercased
+and truncated to 10 bytes in the target encoding (duplicates after
+truncation are rejected), ``None`` is exported as an empty field, dates
+and datetimes use their ISO representation, non-finite numbers (``inf``,
+``-inf``, ``nan``) and numbers that do not fit a ``N(10, 8)`` field are
+exported as blank numeric fields, and text wider than 80 encoded bytes is
+truncated at a character boundary.
+
+Pass ``strict=True`` to validate the whole dataset before anything is
+written instead.  Any value that would be altered by the rules above is
+then reported in a single ``ValueError`` listing every conflicting column
+and unrepresentable cell, and no output is produced::
+
+    dataset.export('dbf', strict=True)
+
 .. _dBASE: https://en.wikipedia.org/wiki/DBase
 
 df (DataFrame)

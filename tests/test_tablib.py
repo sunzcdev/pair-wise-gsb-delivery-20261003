@@ -2016,6 +2016,151 @@ class DBFTests(BaseTestCase):
         fmt = registry.get_format('dbf')
         self.assertEqual(('dbf',), fmt.extensions)
 
+    def test_dbf_export_set_strict_clean_data(self):
+        """Strict DBF export of representable data matches the default."""
+        data.append(self.john)
+        data.append(self.george)
+        data.headers = self.headers
+
+        self.assertEqual(data.export('dbf'), data.export('dbf', strict=True))
+
+    def test_dbf_export_set_strict_field_name_too_long(self):
+        """Strict preflight lists columns whose names need truncation."""
+        data.append(self.john)
+        data.headers = ('first_name_is_long', 'last_name', 'gpa')
+
+        with self.assertRaises(ValueError) as ctx:
+            data.export('dbf', strict=True)
+        message = str(ctx.exception)
+        self.assertIn('first_name_is_long', message)
+        self.assertIn('truncated', message)
+        # byte count, not character count: 10 ASCII chars fit exactly
+        data.headers = ('first_name', 'last_name', 'gpa')
+        data.export('dbf', strict=True)
+
+    def test_dbf_export_set_strict_field_name_multibyte(self):
+        """Field name limits are enforced on encoded bytes, not chars."""
+        data.append(self.john)
+        # 4 characters but 12 bytes once encoded: too long.
+        data.headers = ('汉字字字', 'last_name', 'gpa')
+        with self.assertRaises(ValueError):
+            data.export('dbf', strict=True)
+        # 3 characters, 9 bytes: fits.
+        data.headers = ('汉字字', 'last_name', 'gpa')
+        data.export('dbf', strict=True)
+
+    def test_dbf_export_set_duplicate_field_names(self):
+        """Names colliding after encoding and truncation are rejected."""
+        data.append(self.john)
+        data.headers = ('first_name_1', 'first_name_2', 'gpa')
+        with self.assertRaises(ValueError) as ctx:
+            data.export('dbf')
+        self.assertIn('FIRST_NAME', str(ctx.exception))
+        with self.assertRaises(ValueError):
+            data.export('dbf', strict=True)
+
+    def test_dbf_export_set_strict_text_too_wide(self):
+        """Strict preflight lists cells exceeding the character width."""
+        data.append(('x' * 81, 'Adams', 90))
+        data.append(self.george)
+        data.headers = self.headers
+
+        with self.assertRaises(ValueError) as ctx:
+            data.export('dbf', strict=True)
+        message = str(ctx.exception)
+        self.assertIn('row 0', message)
+        self.assertIn('first_name', message)
+
+    def test_dbf_export_set_strict_numeric_overflow(self):
+        """Strict preflight lists numbers that do not fit N(10, 8)."""
+        data.append(self.john)
+        data.append(('George', 'Washington', 12345678901))
+        data.headers = self.headers
+
+        with self.assertRaises(ValueError) as ctx:
+            data.export('dbf', strict=True)
+        self.assertIn('row 1', str(ctx.exception))
+
+    def test_dbf_export_set_strict_numeric_precision(self):
+        """Strict preflight lists numbers losing decimal places."""
+        data.append(self.john)
+        data.append(('George', 'Washington', 1 / 3))
+        data.headers = self.headers
+
+        with self.assertRaises(ValueError) as ctx:
+            data.export('dbf', strict=True)
+        self.assertIn('precision', str(ctx.exception))
+
+    def test_dbf_export_set_strict_non_finite(self):
+        """Strict preflight rejects inf and nan cells."""
+        for weird in (float('inf'), float('-inf'), float('nan')):
+            data.wipe()
+            data.append(('John', 'Adams', weird))
+            data.headers = self.headers
+            with self.assertRaises(ValueError) as ctx:
+                data.export('dbf', strict=True)
+            self.assertIn('non-finite', str(ctx.exception))
+
+    def test_dbf_export_set_strict_reports_all_problems(self):
+        """A failing strict preflight lists every problem at once."""
+        data.append(('x' * 81, 'Adams', float('nan')))
+        data.append(self.george)
+        data.headers = ('first_name_is_long', 'last_name', 'gpa')
+
+        with self.assertRaises(ValueError) as ctx:
+            data.export('dbf', strict=True)
+        message = str(ctx.exception)
+        self.assertIn('first_name_is_long', message)  # truncated name
+        self.assertIn('text needs', message)  # wide text cell
+        self.assertIn('non-finite', message)  # nan cell
+
+    def test_dbf_export_set_none_date_and_non_finite_rules(self):
+        """None, dates and non-finite values follow the public rules."""
+        data.append(('John', 'Adams', 90))
+        data.append(('George', None, None))
+        data.append(('Thomas', dt.date(2020, 2, 29), float('inf')))
+        data.headers = self.headers
+
+        data.dbf = data.export('dbf')
+        self.assertEqual(data[0], ('John', 'Adams', 90.0))
+        self.assertEqual(data[1], ('George', '', 0))
+        self.assertEqual(data[2], ('Thomas', '2020-02-29', 0))
+
+    def test_dbf_export_set_truncates_long_values(self):
+        """Default export truncates long names and wide text by bytes."""
+        data.append(('x' * 90, 'Adams', 90))
+        data.headers = ('first_name_is_long', 'last_name', 'gpa')
+
+        data.dbf = data.export('dbf')
+        self.assertEqual(data.headers, ['FIRST_NAME', 'LAST_NAME', 'GPA'])
+        self.assertEqual(data[0], ('x' * 80, 'Adams', 90.0))
+
+    def test_dbf_export_set_non_ascii_roundtrip(self):
+        """Multibyte text survives an export/import round trip."""
+        data.append(('汉字' * 10, 'Adams', 90))
+        data.headers = self.headers
+
+        data.dbf = data.export('dbf')
+        # 20 CJK chars = 60 bytes, well within the 80-byte field.
+        self.assertEqual(data[0][0], '汉字' * 10)
+
+    def test_dbf_export_set_non_ascii_truncation(self):
+        """Multibyte text is truncated by bytes at a char boundary."""
+        data.append(('汉字' * 30, 'Adams', 90))
+        data.headers = self.headers
+
+        data.dbf = data.export('dbf')
+        # 60 bytes of CJK text fit the 80-byte field: 26 full chars.
+        self.assertEqual(data[0][0], '汉字' * 13)
+
+    def test_dbf_export_set_numeric_truncation_compatible(self):
+        """Lossy decimals keep the historical truncated encoding."""
+        data.append(('John', 'Adams', 1 / 3))
+        data.headers = self.headers
+
+        data.dbf = data.export('dbf')
+        self.assertEqual(data[0][2], 0.33333333)
+
 
 class JiraTests(BaseTestCase):
     def test_jira_export(self):
