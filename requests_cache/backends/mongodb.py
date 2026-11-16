@@ -55,6 +55,7 @@ class MongoCache(BaseCache):
             serializer=None,
             **kwargs,
         )
+        self._configure_storages()
 
     def get_ttl(self) -> Optional[int]:
         """Get the currently defined TTL value in seconds, if any"""

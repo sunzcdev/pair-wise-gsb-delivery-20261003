@@ -1,6 +1,7 @@
 """BaseCache tests that use mocked responses only"""
 
 import pickle
+import sqlite3
 from datetime import timedelta
 from logging import getLogger
 from pickle import PickleError
@@ -9,10 +10,10 @@ from unittest.mock import patch
 import pytest
 from requests import Request
 
-from requests_cache.backends import BaseCache, SQLiteDict
+from requests_cache.backends import BaseCache, DictStorage, SQLiteDict
 from requests_cache.cache_keys import create_key
 from requests_cache.models import CachedRequest, CachedResponse
-from requests_cache.policy import utcnow
+from requests_cache.policy import CorruptionPolicy, CorruptEntryError, utcnow
 from requests_cache.session import CachedSession
 from tests.conftest import (
     MOCKED_URL,
@@ -351,6 +352,159 @@ def test_urls__error(mock_session):
 
     # The invalid response should be skipped, but remain in the cache
     assert len(mock_session.cache.responses.keys()) == 3
+
+
+# Corrupt entries
+# -----------------------------------------------------
+
+
+CORRUPT_VALUE = object()
+
+
+class CorruptingStorage(DictStorage):
+    """DictStorage variant that fails to deserialize a sentinel value.
+
+    This exercises the same ``BaseStorage._handle_corrupt_entry()`` error path as a real backend,
+    without needing a database.
+    """
+
+    def __getitem__(self, key):
+        value = super().__getitem__(key)
+        if value is CORRUPT_VALUE:
+            return self._handle_corrupt_entry(key, 'deserialize', ValueError('Invalid response!'))
+        return value
+
+
+def _init_corrupt_cache(**kwargs) -> BaseCache:
+    """Create an in-memory cache with a bad value between two good ones"""
+    cache = BaseCache(**kwargs)
+    cache.responses = CorruptingStorage()
+    cache.redirects = DictStorage()
+    cache._configure_storages()
+
+    cache.responses['key_a'] = CachedResponse(url='https://example.com/a')
+    cache.responses['key_bad'] = CORRUPT_VALUE
+    cache.responses['key_c'] = CachedResponse(url='https://example.com/c')
+    cache.redirects['alias_bad'] = 'key_bad'
+    cache.redirects['alias_alias_bad'] = 'alias_bad'
+    cache.redirects['alias_c'] = 'key_c'
+    return cache
+
+
+def test_corrupt_entry__report_does_not_block_later_reads():
+    """With the default policy, a bad value between good ones is skipped and left in place"""
+    cache = _init_corrupt_cache()
+
+    assert [r.url for r in cache.filter()] == [
+        'https://example.com/a',
+        'https://example.com/c',
+    ]
+    assert cache.get_response('key_bad') is None
+    assert 'key_bad' in cache.responses
+    assert cache.redirects['alias_bad'] == 'key_bad'
+
+
+def test_corrupt_entry__delete_removes_entry_and_aliases():
+    cache = _init_corrupt_cache(corruption_policy='delete')
+
+    assert [r.url for r in cache.filter()] == [
+        'https://example.com/a',
+        'https://example.com/c',
+    ]
+
+    assert 'key_bad' not in cache.responses
+    assert 'alias_bad' not in cache.redirects
+    assert 'alias_alias_bad' not in cache.redirects
+    assert cache.redirects['alias_c'] == 'key_c'
+
+
+def test_corrupt_entry__raise():
+    cache = _init_corrupt_cache(corruption_policy='raise')
+
+    with pytest.raises(CorruptEntryError) as exc_info:
+        cache.get_response('key_bad')
+
+    assert exc_info.value.key == 'key_bad'
+    assert exc_info.value.stage == 'deserialize'
+    assert exc_info.value.exception_category == 'ValueError'
+
+    # Other entries are still readable
+    assert cache.get_response('key_a').url == 'https://example.com/a'
+
+
+def test_corrupt_entry__read_only_never_deletes():
+    cache = _init_corrupt_cache(corruption_policy='delete', read_only=True)
+
+    assert cache.get_response('key_bad') is None
+    assert 'key_bad' in cache.responses
+    assert cache.redirects['alias_bad'] == 'key_bad'
+
+
+def test_corrupt_entry__callback_failure_is_not_recursive():
+    events = []
+
+    def on_corruption(event):
+        events.append(event)
+        raise RuntimeError('callback failed')
+
+    cache = _init_corrupt_cache(corruption_policy='delete', on_corruption=on_corruption)
+
+    assert cache.get_response('key_bad') is None
+    assert len(events) == 1
+    assert events[0].key == 'key_bad'
+    assert 'key_bad' not in cache.responses
+
+
+def test_corrupt_entry__callback_reentry_is_not_recursive():
+    """A callback that reads the same bad key must not re-enter recovery"""
+    calls = []
+    cache = None
+
+    def on_corruption(event):
+        calls.append(event)
+        # Re-entering the corrupt read inside the callback must not recurse
+        cache.get_response('key_bad')
+
+    cache = _init_corrupt_cache(corruption_policy='delete', on_corruption=on_corruption)
+
+    assert cache.get_response('key_bad') is None
+    assert len(calls) == 1
+    assert 'key_bad' not in cache.responses
+
+
+def test_corrupt_entry__args_are_validated():
+    """An invalid policy name is rejected at initialization"""
+    with pytest.raises(ValueError, match='Invalid corruption policy'):
+        BaseCache(corruption_policy='nonsense')
+
+
+def test_corrupt_entry__storage_level_policy():
+    """A storage used on its own also respects a corruption policy"""
+
+    class FailingSerializer:
+        def dumps(self, value):
+            return pickle.dumps(value)
+
+        def loads(self, value):
+            if value == b'corrupt':
+                raise PickleError('Invalid response!')
+            return pickle.loads(value)
+
+    storage = SQLiteDict(':memory:', table_name='storage_policy', serializer=FailingSerializer())
+    storage['key_a'] = 'value_a'
+    with storage.connection(commit=True) as con:
+        con.execute(
+            "INSERT OR REPLACE INTO storage_policy (key, value, expires) VALUES (?, ?, ?)",
+            ('key_bad', sqlite3.Binary(b'corrupt'), None),
+        )
+
+    assert storage['key_a'] == 'value_a'
+    assert storage.get('key_bad') is None
+    assert 'key_bad' in storage
+
+    storage.corruption_policy = CorruptionPolicy.DELETE
+    assert storage.get('key_bad') is None
+    assert 'key_bad' not in storage
 
 
 # Deprecated methods

@@ -63,7 +63,7 @@ class CacheMixin(MIXIN_BASE):
         **kwargs,
     ):
         self.cache = init_backend(cache_name, backend, serializer=serializer, **kwargs)
-        self.settings = CacheSettings.from_kwargs(
+        settings_kwargs = dict(
             expire_after=expire_after,
             urls_expire_after=urls_expire_after,
             cache_control=cache_control,
@@ -80,6 +80,11 @@ class CacheMixin(MIXIN_BASE):
             autoclose=autoclose,
             **kwargs,
         )
+        # Preserve any corruption policy configured directly on a backend instance, unless it was
+        # also passed to the session
+        settings_kwargs.setdefault('corruption_policy', self.cache._settings.corruption_policy)
+        settings_kwargs.setdefault('on_corruption', self.cache._settings.on_corruption)
+        self.settings = CacheSettings.from_kwargs(**settings_kwargs)
         self._lock = RLock()
 
         # If the mixin superclass is a custom Session, pass along any valid kwargs
@@ -412,6 +417,10 @@ class CachedSession(CacheMixin, OriginalSession):
         stale_while_revalidate: Return a stale response initially, while a non-blocking request is
             sent to refresh the response for the next time it's requested
         autoclose: Close the cache backend when the session is closed
+        corruption_policy: How to handle cache entries that can't be deserialized: ``report``
+            (default), ``delete`` (also removes redirect aliases), or ``raise``
+        on_corruption: Optional callback that receives a
+            :py:class:`.CorruptEntryError` when an entry can't be deserialized
         filter_fn: Response filtering function that indicates whether or not a given response should
             be cached. See :ref:`custom-filtering` for details.
         key_fn: Request matching function for generating custom cache keys. See

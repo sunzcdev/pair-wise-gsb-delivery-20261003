@@ -75,6 +75,37 @@ for details.
 >>> backend = SQLiteCache(fast_save=True)
 ```
 
+## Corrupt Entries
+If a cached response can't be deserialized (for example, because it was written by an incompatible
+requests-cache or serializer version), the failure is isolated to that entry by default. Other
+entries can still be read, and the bad entry is treated as a cache miss.
+
+Use `corruption_policy` to choose what happens:
+```python
+# Report the failure and leave the entry in place (default)
+>>> backend = SQLiteCache(corruption_policy='report')
+
+# Report the failure, then delete the entry and any redirect aliases pointing to it
+>>> backend = SQLiteCache(corruption_policy='delete')
+
+# Raise CorruptEntryError with the key, stage, and exception category
+>>> backend = SQLiteCache(corruption_policy='raise')
+```
+
+The policy can also be changed at runtime with `session.settings.corruption_policy`, or per backend
+with `backend.corruption_policy`. Use `on_corruption` to receive a {py:class}`.CorruptEntryError`
+for logging or metrics:
+```python
+>>> def report_error(error):
+...     print(error.key, error.stage, error.exception_category)
+
+>>> session = CachedSession(corruption_policy='delete', on_corruption=report_error)
+```
+
+In {ref}`read-only <read-only>` mode, a `delete` policy reports the failure but never removes the
+entry. Database connection errors are not treated as corrupt entries, and recovery never falls back
+to clearing the whole cache.
+
 ## Concurrency
 SQLite supports concurrent access, so it is safe to use from a multi-threaded and/or multi-process
 application. It supports unlimited concurrent reads. Writes, however, are queued and run in serial,

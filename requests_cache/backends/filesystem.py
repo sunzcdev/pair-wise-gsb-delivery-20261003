@@ -65,6 +65,7 @@ class FileCache(BaseCache):
             self.redirects: SQLiteDict = SQLiteDict(
                 self.cache_dir / 'redirects.sqlite', 'redirects', serializer=None, **kwargs
             )
+        self._configure_storages()
 
     @property
     def lock(self) -> RLock:

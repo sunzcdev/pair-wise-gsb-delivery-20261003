@@ -52,6 +52,7 @@ class GridFSCache(BaseCache):
             serializer=None,
             **kwargs,
         )
+        self._configure_storages()
 
     def delete(self, *args, **kwargs):
         with self.responses._lock:

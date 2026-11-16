@@ -55,6 +55,7 @@ class DynamoDbCache(BaseCache):
         )
         # Redirects will be only stored in memory and not persisted
         self.redirects: BaseStorage[str, str] = DictStorage()
+        self._configure_storages()
 
 
 class DynamoDbDict(BaseStorage):

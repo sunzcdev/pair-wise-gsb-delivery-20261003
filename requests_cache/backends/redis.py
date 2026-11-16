@@ -47,6 +47,7 @@ class RedisCache(BaseCache):
         self.redirects = RedisHashDict(
             namespace, collection_name='redirects', connection=self.responses.connection, **kwargs
         )
+        self._configure_storages()
 
 
 class RedisDict(BaseStorage):
