@@ -13,6 +13,13 @@ Our backwards-compatibility policy can be found [here](https://github.com/python
 
 ## NEXT
 
+- Add diagnostic hook resolution: {meth}`BaseConverter.explain_structure_hook <cattrs.BaseConverter.explain_structure_hook>` and
+  {meth}`BaseConverter.explain_unstructure_hook <cattrs.BaseConverter.explain_unstructure_hook>` now return a
+  {class}`~cattrs.dispatch.HookResolutionReport` listing the candidate rules in dispatch order, the adopted rule and the
+  reason every other matching rule is shadowed. Pass ``strict=True`` to raise {class}`~cattrs.errors.AmbiguousHookError`
+  when multiple predicate rules of the same priority match. Resolution never invokes a hook or hook factory, predicate
+  exceptions are retained on the report instead of being silently skipped, and the result reflects the rules currently
+  registered without affecting normal conversion speed or other converters.
 - Fix the msgspec converter passing typed deques directly to the encoder, which cannot serialize them. Deques are now unstructured into lists, including when nested in attrs classes or dataclasses.
   ([#818](https://github.com/python-attrs/cattrs/issues/818) [#819](https://github.com/python-attrs/cattrs/pull/819))
 

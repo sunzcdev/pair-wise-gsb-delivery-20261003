@@ -1,9 +1,14 @@
+from __future__ import annotations
+
 from collections.abc import Sequence
-from typing import Any, Optional, Union
+from typing import TYPE_CHECKING, Any, Optional, Union
 
 from typing_extensions import Self
 
 from cattrs._compat import ExceptionGroup
+
+if TYPE_CHECKING:
+    from .dispatch import HookCandidate
 
 
 class CattrsError(Exception):
@@ -140,3 +145,29 @@ class ForbiddenExtraKeysError(CattrsError):
             or f"Extra fields in constructor for {self.cl.__name__}: "
             f"{', '.join(sorted(self.extra_fields))}"
         )
+
+
+class AmbiguousHookError(CattrsError):
+    """Raised by diagnostic hook resolution when multiple rules of the same
+    priority match a type and ambiguity is not allowed.
+
+    Only predicate (function-dispatch) rules can be ambiguous: exact-match and
+    ``singledispatch`` rules have at most one winner per type. The colliding
+    candidates are retained on :attr:`candidates` for inspection.
+
+    :param type_: The type being resolved.
+    :param candidates: The equally-prioritized candidates that all matched.
+
+    .. versionadded:: NEXT
+    """
+
+    def __init__(
+        self, message: str, type_: Any, candidates: Sequence[HookCandidate]
+    ) -> None:
+        super().__init__(message, type_)
+        self.message = message
+        self.type_ = type_
+        self.candidates = tuple(candidates)
+
+    def __str__(self) -> str:
+        return self.message

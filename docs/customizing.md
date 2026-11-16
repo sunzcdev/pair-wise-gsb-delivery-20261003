@@ -175,6 +175,65 @@ Here's an example of using an unstructure hook factory to handle unstructuring [
 [1, 2]
 ```
 
+### Diagnosing Hook Resolution
+
+When a converter has many rules registered through exact types, base classes
+and predicate factories, it can be hard to tell which rule actually wins for a
+given type. The diagnostic methods
+{meth}`explain_unstructure_hook() <cattrs.BaseConverter.explain_unstructure_hook>`
+and
+{meth}`explain_structure_hook() <cattrs.BaseConverter.explain_structure_hook>`
+return a {class}`~cattrs.dispatch.HookResolutionReport` describing the whole
+resolution without performing any conversion.
+
+Each {class}`~cattrs.dispatch.HookCandidate` in the report says whether the
+rule matched, whether it is a hook factory, and - when it matched but lost -
+the reason it was shadowed. Candidates are listed in the order the dispatcher
+consults them: `singledispatch` class rules first, then exact-type rules, then
+predicate rules (most recently registered first), and finally the fallback
+factory.
+
+```{doctest}
+>>> from cattrs import BaseConverter
+
+>>> class Base: pass
+>>> class Sub(Base): pass
+
+>>> c = BaseConverter()
+>>> c.register_unstructure_hook(Base, lambda o: "base rule")
+>>> c.register_unstructure_hook_func(
+...     lambda t: issubclass(t, Base), lambda o: "predicate rule"
+... )
+
+>>> report = c.explain_unstructure_hook(Sub)
+>>> report.adopted.kind
+'singledispatch'
+>>> [candidate.shadow_reason for candidate in report.shadowed_candidates]
+['shadowed by a higher-priority singledispatch or exact rule']
+>>> print(report)  # doctest: +SKIP
+```
+
+Diagnostic resolution never invokes a hook or hook factory, does not populate
+the dispatch cache, and always reflects the rules currently registered on that
+converter, so normal conversions stay fast and separate converters never
+interfere with each other.
+
+If a predicate raises while being evaluated, the exception is retained on the
+candidate (see
+{attr}`HookResolutionReport.predicate_errors <cattrs.dispatch.HookResolutionReport.predicate_errors>`)
+instead of being silently swallowed; that rule is simply treated as not
+matching.
+
+Pass `strict=True` to refuse same-priority ambiguity: when more than one
+predicate rule matches the type, an
+{class}`~cattrs.errors.AmbiguousHookError` carrying the colliding candidates is
+raised, even if a higher-priority class rule would have hidden the conflict.
+
+```python
+>>> c.explain_unstructure_hook(Sub, strict=True)  # doctest: +SKIP
+cattrs.errors.AmbiguousHookError: Multiple predicate hooks match ...
+```
+
 ## Using `cattrs.gen` Hook Factories
 
 The {mod}`cattrs.gen` module contains [hook factories](#hook-factories) for un/structuring _attrs_ classes, dataclasses and typed dicts.

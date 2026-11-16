@@ -77,6 +77,7 @@ from .cols import (
 from .disambiguators import create_default_dis_func, is_supported_union
 from .dispatch import (
     HookFactory,
+    HookResolutionReport,
     MultiStrategyDispatch,
     StructuredValue,
     StructureHook,
@@ -509,6 +510,27 @@ class BaseConverter:
             else self._unstructure_func.dispatch_without_caching(type)
         )
 
+    def explain_unstructure_hook(
+        self, type: Any, *, strict: bool = False
+    ) -> HookResolutionReport:
+        """Explain how the unstructure hook for ``type`` would be resolved.
+
+        Returns a :class:`~cattrs.dispatch.HookResolutionReport` describing the
+        candidate rules in dispatch order, the adopted rule and why every other
+        matching rule is shadowed. This is a diagnostic-only operation: no hook
+        or hook factory is invoked, the dispatch cache is not touched, and the
+        result always reflects the rules currently registered on this
+        converter.
+
+        :param type: The type whose unstructure hook should be explained.
+        :param strict: When true, raise
+            :class:`~cattrs.errors.AmbiguousHookError` if multiple predicate
+            rules of the same priority match ``type``.
+
+        .. versionadded:: NEXT
+        """
+        return self._unstructure_func.explain(type, strict=strict)
+
     @overload
     def register_structure_hook(self, cl: StructureHookT) -> StructureHookT: ...
 
@@ -661,6 +683,27 @@ class BaseConverter:
             if cache_result
             else self._structure_func.dispatch_without_caching(type)
         )
+
+    def explain_structure_hook(
+        self, type: Any, *, strict: bool = False
+    ) -> HookResolutionReport:
+        """Explain how the structure hook for ``type`` would be resolved.
+
+        Returns a :class:`~cattrs.dispatch.HookResolutionReport` describing the
+        candidate rules in dispatch order, the adopted rule and why every other
+        matching rule is shadowed. This is a diagnostic-only operation: no hook
+        or hook factory is invoked, the dispatch cache is not touched, and the
+        result always reflects the rules currently registered on this
+        converter.
+
+        :param type: The type whose structure hook should be explained.
+        :param strict: When true, raise
+            :class:`~cattrs.errors.AmbiguousHookError` if multiple predicate
+            rules of the same priority match ``type``.
+
+        .. versionadded:: NEXT
+        """
+        return self._structure_func.explain(type, strict=strict)
 
     # Classes to Python primitives.
     def unstructure_attrs_asdict(self, obj: Any) -> dict[str, Any]:

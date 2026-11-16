@@ -1,7 +1,9 @@
 from typing import Final
 
 from .converters import BaseConverter, Converter, GenConverter, UnstructureStrategy
+from .dispatch import HookCandidate, HookResolutionReport
 from .errors import (
+    AmbiguousHookError,
     AttributeValidationNote,
     BaseValidationError,
     ClassValidationError,
@@ -15,6 +17,7 @@ from .types import SimpleStructureHook
 from .v import transform_error
 
 __all__ = [
+    "AmbiguousHookError",
     "AttributeValidationNote",
     "BaseConverter",
     "BaseValidationError",
@@ -22,6 +25,8 @@ __all__ = [
     "Converter",
     "ForbiddenExtraKeysError",
     "GenConverter",
+    "HookCandidate",
+    "HookResolutionReport",
     "IterableValidationError",
     "IterableValidationNote",
     "SimpleStructureHook",
