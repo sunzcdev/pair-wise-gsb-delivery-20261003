@@ -11,7 +11,11 @@ reach a certain (configurable) threshold. Boltons provides two of them, with
 the same API as their :mod:`io` counterparts: :ref:`spooledbytesio` for binary
 data, like :class:`io.BytesIO`, and :ref:`spooledstringio` for text, like
 :class:`io.StringIO`. ``SpooledBytesIO.write()`` takes bytes;
-``SpooledStringIO.write()`` takes strings.
+``SpooledStringIO.write()`` takes strings. ``SpooledStringIO`` can also
+accept encoded bytes in chunks: construct it with ``encoding=...`` and feed
+the chunks to ``write_encoded()``, which decodes incrementally (characters
+split across chunks are held until completed), then call ``finalize()`` when
+the source is exhausted.
 
 .. _spooledbytesio:
 

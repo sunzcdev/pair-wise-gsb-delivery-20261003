@@ -45,7 +45,7 @@ from abc import (
     abstractproperty,
 )
 from errno import EINVAL
-from codecs import EncodedFile
+from codecs import EncodedFile, getincrementaldecoder
 from tempfile import TemporaryFile
 from itertools import zip_longest
 
@@ -372,15 +372,69 @@ class SpooledStringIO(SpooledIOBase):
 
         >>> from boltons import ioutils
         >>> with ioutils.SpooledStringIO() as f:
-        ...     _ = f.write(u"\u2014 Hey, an emdash!")
+        ...     _ = f.write(u"\\u2014 Hey, an emdash!")
         ...     _ = f.seek(0)
         ...     isinstance(f.read(), str)
         True
 
+    Passing ``encoding`` to the constructor enables encoded-input mode,
+    for consumers that receive encoded bytes in chunks (e.g. from a
+    socket or another streamed source) and want the decoded text spooled.
+    The encoding is fixed at construction time; chunks are then fed to
+    :meth:`write_encoded` and decoded incrementally, so a character split
+    across chunk boundaries is held in the decoder until the rest of it
+    arrives. Call :meth:`finalize()` when the source is exhausted; only
+    then is a truncated trailing character detected and raised as
+    :exc:`UnicodeDecodeError`::
+
+        >>> with ioutils.SpooledStringIO(encoding='utf-8') as f:
+        ...     _ = f.write_encoded('\u2014 snowman: \u2603'.encode('utf-8')[:5])
+        ...     _ = f.write_encoded('\u2014 snowman: \u2603'.encode('utf-8')[5:])
+        ...     _ = f.finalize()
+        ...     _ = f.seek(0)
+        ...     f.read()
+        '\u2014 snowman: \u2603'
+
+    While an incomplete character is pending in the decoder, plain text
+    :meth:`write`, :meth:`seek`, and :meth:`truncate` raise
+    :exc:`ValueError`; feed the remaining bytes with :meth:`write_encoded`
+    or call :meth:`finalize()` first.
     """
     def __init__(self, *args, **kwargs):
         self._tell = 0
+        self._encoding = kwargs.pop('encoding', None)
+        self._decoder = None
+        self._decoder_finalized = False
         super().__init__(*args, **kwargs)
+
+    @property
+    def encoding(self):
+        """The input encoding fixed at construction, or None if plain
+        text mode."""
+        return self._encoding
+
+    def _get_decoder(self):
+        if self._decoder is None:
+            self._decoder = getincrementaldecoder(self._encoding)(
+                errors='strict')
+        return self._decoder
+
+    def _decoder_pending(self):
+        """Whether the decoder holds bytes of an incomplete character"""
+        decoder = self._decoder
+        if decoder is None:
+            return False
+        state = decoder.getstate()
+        if isinstance(state, tuple):
+            return bool(state[0])
+        return bool(state)
+
+    def _check_no_pending(self, op):
+        if self._decoder_pending():
+            raise ValueError(
+                "cannot {} while an incomplete multi-byte character is "
+                "pending; write the remaining bytes with write_encoded() "
+                "or call finalize() first".format(op))
 
     def read(self, n=-1):
         self._checkClosed()
@@ -388,18 +442,76 @@ class SpooledStringIO(SpooledIOBase):
         self._tell = self.tell() + len(ret)
         return ret
 
-    def write(self, s):
-        self._checkClosed()
-        if not isinstance(s, str):
-            raise TypeError("str expected, got {}".format(
-                type(s).__name__
-            ))
+    def _write_text(self, s):
         current_pos = self.tell()
         if self.buffer.tell() + len(s.encode('utf-8')) >= self._max_size:
             self.rollover()
         self.buffer.write(s.encode('utf-8'))
         self._tell = current_pos + len(s)
         return len(s)
+
+    def write(self, s):
+        self._checkClosed()
+        if not isinstance(s, str):
+            raise TypeError("str expected, got {}".format(
+                type(s).__name__
+            ))
+        self._check_no_pending('write text')
+        return self._write_text(s)
+
+    def write_encoded(self, data):
+        """
+        Write a chunk of encoded bytes, decoding with the encoding fixed
+        at construction. Returns the number of characters decoded and
+        written, which may be less than the number of characters in
+        *data* (or even 0) when a character is split across chunks; the
+        remainder is held in the decoder until more bytes arrive or
+        :meth:`finalize()` is called. Raises :exc:`TypeError` if no
+        ``encoding`` was set, :exc:`ValueError` if the encoded input was
+        already finalized, and :exc:`UnicodeDecodeError` on undecodable
+        input (in which case nothing is counted as written).
+        """
+        self._checkClosed()
+        if self._encoding is None:
+            raise TypeError("write_encoded() requires an input encoding; "
+                            "pass encoding=... to the constructor")
+        if self._decoder_finalized:
+            raise ValueError("encoded input already finalized")
+        if isinstance(data, (bytearray, memoryview)):
+            data = bytes(data)
+        if not isinstance(data, bytes):
+            raise TypeError("bytes-like object expected, got {}".format(
+                type(data).__name__
+            ))
+        text = self._get_decoder().decode(data, final=False)
+        if not text:
+            return 0
+        return self._write_text(text)
+
+    def finalize(self):
+        """
+        Mark the encoded input as complete, flushing any bytes held by
+        the incremental decoder. Only here is a truncated trailing
+        character judged: if the decoder is still holding an incomplete
+        character, the pending bytes are discarded (never counted as
+        written) and :exc:`UnicodeDecodeError` is raised. Returns the
+        number of characters flushed. Subsequent calls return 0, and
+        :meth:`write_encoded` raises :exc:`ValueError` once finalized.
+        """
+        self._checkClosed()
+        if self._encoding is None:
+            raise ValueError("finalize() requires an input encoding; "
+                             "pass encoding=... to the constructor")
+        if self._decoder_finalized:
+            return 0
+        self._decoder_finalized = True
+        decoder, self._decoder = self._decoder, None
+        if decoder is None:
+            return 0
+        text = decoder.decode(b'', final=True)
+        if not text:
+            return 0
+        return self._write_text(text)
 
     def _traverse_codepoints(self, current_position, n):
         """Traverse from current position to the right n codepoints"""
@@ -430,6 +542,7 @@ class SpooledStringIO(SpooledIOBase):
     def seek(self, pos, mode=0):
         """Traverse from offset to the specified codepoint"""
         self._checkClosed()
+        self._check_no_pending('seek')
         # Seek to position from the start of the file
         if mode == os.SEEK_SET:
             if pos < 0:
@@ -468,6 +581,11 @@ class SpooledStringIO(SpooledIOBase):
         self._tell = self.tell() + len(ret)
         return ret
 
+    def truncate(self, size=None):
+        self._checkClosed()
+        self._check_no_pending('truncate')
+        return super().truncate(size)
+
     def readlines(self, sizehint=0):
         ret = [x.decode('utf-8') for x in self.buffer.readlines(sizehint)]
         self._tell = self.tell() + sum(len(x) for x in ret)
@@ -494,7 +612,12 @@ class SpooledStringIO(SpooledIOBase):
             tmp.write(self.buffer.getvalue())
             self.buffer.close()
             self._buffer = tmp
-            self.seek(char_pos)
+            # Restore the position without going through seek(), which
+            # refuses to run while the decoder holds a partial character;
+            # rolling over must not disturb pending encoded input.
+            self.buffer.seek(0)
+            self._traverse_codepoints(0, char_pos)
+            self._tell = char_pos
 
     def tell(self):
         """Return the codepoint position"""

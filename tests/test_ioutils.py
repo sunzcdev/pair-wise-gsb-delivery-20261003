@@ -584,6 +584,208 @@ class TestSpooledStringIO(TestCase, BaseTestMixin, AssertionsMixin):
         self.assertEqual(self.spooled_flo.getvalue(), expected)
 
 
+class TestSpooledStringIOEncodedMode(TestCase):
+    """Tests for SpooledStringIO's encoded-input write mode"""
+
+    def make_flo(self, **kwargs):
+        kwargs.setdefault('encoding', 'utf-8')
+        return ioutils.SpooledStringIO(**kwargs)
+
+    def test_encoding_property(self):
+        self.assertEqual(self.make_flo().encoding, 'utf-8')
+        self.assertIsNone(ioutils.SpooledStringIO().encoding)
+
+    def test_chunked_multibyte_roundtrip(self):
+        """Characters split across chunks are reassembled by the decoder"""
+        text = 'a—b☃c'
+        data = text.encode('utf-8')
+        for rolled in (False, True):
+            with self.subTest(rolled=rolled):
+                flo = self.make_flo()
+                if rolled:
+                    flo.rollover()
+                total = 0
+                for i in range(len(data)):
+                    total += flo.write_encoded(data[i:i + 1])
+                self.assertEqual(total, len(text))
+                flo.finalize()
+                self.assertEqual(flo.tell(), len(text))
+                flo.seek(0)
+                self.assertEqual(flo.read(), text)
+
+    def test_write_encoded_returns_decoded_character_count(self):
+        """Return value counts decoded characters, not input bytes"""
+        emdash = '—'.encode('utf-8')
+        self.assertEqual(len(emdash), 3)
+        for rolled in (False, True):
+            with self.subTest(rolled=rolled):
+                flo = self.make_flo()
+                if rolled:
+                    flo.rollover()
+                self.assertEqual(flo.write_encoded(emdash[:1]), 0)
+                self.assertEqual(flo.tell(), 0)
+                self.assertEqual(flo.write_encoded(emdash[1:]), 1)
+                self.assertEqual(flo.tell(), 1)
+                self.assertEqual(flo.write_encoded(b''), 0)
+
+    def test_write_encoded_accepts_bytes_like(self):
+        flo = self.make_flo()
+        self.assertEqual(flo.write_encoded(bytearray(b'ab')), 2)
+        self.assertEqual(flo.write_encoded(memoryview(b'cd')), 2)
+        flo.finalize()
+        self.assertEqual(flo.getvalue(), 'abcd')
+
+    def test_write_encoded_requires_encoding(self):
+        """Encoded-input mode is fixed at construction time"""
+        flo = ioutils.SpooledStringIO()
+        self.assertRaises(TypeError, flo.write_encoded, b'abc')
+        self.assertRaises(ValueError, flo.finalize)
+
+    def test_write_encoded_type_checked(self):
+        flo = self.make_flo()
+        self.assertRaises(TypeError, flo.write_encoded, 'text')
+        self.assertRaises(TypeError, flo.write_encoded, 42)
+
+    def test_fixed_encoding_is_used(self):
+        """A non-utf-8 input encoding decodes through the same interface"""
+        text = 'héllo ☃'
+        data = text.encode('utf-16-le')
+        flo = self.make_flo(encoding='utf-16-le')
+        flo.write_encoded(data[:3])
+        flo.write_encoded(data[3:])
+        flo.finalize()
+        flo.seek(0)
+        self.assertEqual(flo.read(), text)
+
+    def test_pending_partial_character_blocks_text_write_seek_truncate(self):
+        """Half a character pending: write/seek/truncate refuse clearly"""
+        emdash = '—'.encode('utf-8')
+        for rolled in (False, True):
+            with self.subTest(rolled=rolled):
+                flo = self.make_flo()
+                flo.write_encoded(b'ok')
+                if rolled:
+                    flo.rollover()
+                flo.write_encoded(emdash[:1])
+                with self.assertRaises(ValueError):
+                    flo.write('x')
+                with self.assertRaises(ValueError):
+                    flo.seek(0)
+                with self.assertRaises(ValueError):
+                    flo.truncate()
+                with self.assertRaises(ValueError):
+                    flo.truncate(1)
+                # completing the character performs a controlled unblock
+                flo.write_encoded(emdash[1:])
+                flo.write('!')
+                flo.seek(0)
+                self.assertEqual(flo.read(), 'ok—!')
+                flo.truncate(2)
+                self.assertEqual(flo.getvalue(), 'ok')
+
+    def test_mixed_text_and_encoded_writes(self):
+        """Plain text writes are fine whenever no character is pending"""
+        flo = self.make_flo()
+        flo.write('ab')
+        flo.write_encoded('cd'.encode('utf-8'))
+        flo.finalize()
+        flo.write('ef')
+        self.assertEqual(flo.tell(), 6)
+        self.assertEqual(flo.getvalue(), 'abcdef')
+
+    def test_finalize_detects_truncated_tail(self):
+        """Only finalize() judges a truncated trailing character"""
+        emdash = '—'.encode('utf-8')
+        for rolled in (False, True):
+            with self.subTest(rolled=rolled):
+                flo = self.make_flo()
+                flo.write_encoded(b'abc')
+                if rolled:
+                    flo.rollover()
+                flo.write_encoded(emdash[:2])
+                # not yet judged: the caller may still complete the char
+                self.assertEqual(flo.tell(), 3)
+                with self.assertRaises(UnicodeDecodeError):
+                    flo.finalize()
+                # the incomplete character was never counted as written
+                self.assertEqual(flo.tell(), 3)
+                self.assertEqual(flo.getvalue(), 'abc')
+                # pending state is discarded; the flo is usable again
+                flo.seek(1)
+                flo.truncate()
+                self.assertEqual(flo.getvalue(), 'a')
+
+    def test_finalize_idempotent_and_ends_encoded_input(self):
+        flo = self.make_flo()
+        flo.write_encoded('x☃'.encode('utf-8'))
+        self.assertEqual(flo.finalize(), 0)
+        self.assertEqual(flo.finalize(), 0)
+        self.assertRaises(ValueError, flo.write_encoded, b'more')
+        self.assertEqual(flo.getvalue(), 'x☃')
+
+    def test_decode_error_counts_nothing_as_written(self):
+        """Undecodable input raises without advancing the position"""
+        for rolled in (False, True):
+            with self.subTest(rolled=rolled):
+                flo = self.make_flo()
+                flo.write_encoded(b'ab')
+                if rolled:
+                    flo.rollover()
+                with self.assertRaises(UnicodeDecodeError):
+                    flo.write_encoded(b'\xff')
+                self.assertEqual(flo.tell(), 2)
+                self.assertEqual(flo.len, 2)
+
+    def test_rollover_failure_counts_nothing_as_written(self):
+        """A failed rollover leaves position and contents untouched"""
+        flo = self.make_flo(max_size=1)
+
+        def _failing_rollover():
+            raise OSError('disk full')
+
+        flo.rollover = _failing_rollover
+        with self.assertRaises(OSError):
+            flo.write_encoded('—'.encode('utf-8'))
+        self.assertEqual(flo.tell(), 0)
+        self.assertFalse(flo._rolled)
+        self.assertEqual(flo.getvalue(), '')
+
+    def test_auto_rollover_with_split_characters(self):
+        """Rollover works even while the decoder holds half a character"""
+        text = '—' * 10
+        data = text.encode('utf-8')
+        flo = self.make_flo(max_size=10)
+        for i in range(0, len(data), 2):
+            flo.write_encoded(data[i:i + 2])
+        flo.finalize()
+        self.assertTrue(flo._rolled)
+        self.assertEqual(flo.tell(), len(text))
+        self.assertEqual(flo.len, len(text))
+        self.assertEqual(flo.getvalue(), text)
+
+    def test_character_positioning_contract(self):
+        """tell/seek/read keep counting codepoints in encoded-input mode"""
+        for rolled in (False, True):
+            with self.subTest(rolled=rolled):
+                flo = self.make_flo()
+                flo.write_encoded('a☃bc'.encode('utf-8'))
+                flo.finalize()
+                if rolled:
+                    flo.rollover()
+                self.assertEqual(flo.tell(), 4)
+                flo.seek(1)
+                self.assertEqual(flo.read(1), '☃')
+                self.assertEqual(flo.tell(), 2)
+                self.assertEqual(flo.seek(-1, os.SEEK_END), 3)
+                self.assertEqual(flo.read(), 'c')
+
+    def test_closed_file_valueerrors(self):
+        flo = self.make_flo()
+        flo.close()
+        self.assertRaises(ValueError, flo.write_encoded, b'a')
+        self.assertRaises(ValueError, flo.finalize)
+
+
 class TestMultiFileReader(TestCase):
     def test_read_seek_bytes(self):
         r = ioutils.MultiFileReader(io.BytesIO(b'narf'), io.BytesIO(b'troz'))
