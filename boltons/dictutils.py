@@ -898,6 +898,82 @@ class OneToOne(dict):
         self.update(other)
         return self
 
+    def update_all(self, updates=None, removals=()):
+        """Apply a batch of updates and removals atomically. Unlike
+        :meth:`update`, which assigns items one at a time, conflicts
+        are checked against the *final* state of the mapping, so
+        swapping two values (or rotating several) works as expected:
+
+        >>> oto = OneToOne({'a': 1, 'b': 2, 'c': 3})
+        >>> oto.update_all({'a': 2, 'b': 3, 'c': 1})
+        >>> oto == {'a': 2, 'b': 3, 'c': 1}
+        True
+        >>> oto.inv == {1: 'c', 2: 'a', 3: 'b'}
+        True
+
+        *updates* may be a mapping or an iterable of key-value pairs,
+        and *removals* an iterable of keys to delete. Removals are
+        applied before updates. The whole batch is validated before
+        anything is committed:
+
+        * a genuine many-to-one conflict in the final state raises
+          :exc:`ValueError`
+        * a removal key missing from the mapping raises
+          :exc:`KeyError`
+        * an exception raised while consuming a generator input
+          propagates as-is
+
+        In all of these cases the mapping (and its ``inv``) is left
+        untouched. On success, both directions are updated in place,
+        so previously obtained references to ``oto.inv`` observe the
+        same change:
+
+        >>> inv = oto.inv
+        >>> oto.update_all({'a': 4}, removals=['b'])
+        >>> inv == {1: 'c', 4: 'a'}
+        True
+        >>> inv is oto.inv
+        True
+        """
+        if updates is None:
+            update_items = []
+        elif callable(getattr(updates, 'keys', None)):
+            update_items = [(k, updates[k]) for k in updates.keys()]
+        else:
+            # fully materialize first so a generator raising midway
+            # cannot leave the mapping partially updated
+            update_items = list(updates)
+        removals = list(removals)
+
+        for key, val in update_items:
+            hash(key)
+            hash(val)
+
+        for key in removals:
+            if key not in self:
+                raise KeyError(key)
+
+        final = dict(self)
+        for key in removals:
+            del final[key]
+        for key, val in update_items:
+            final[key] = val
+
+        val_multidict = {}
+        for k, v in final.items():
+            val_multidict.setdefault(v, []).append(k)
+        dupes = {v: k_list for v, k_list in
+                 val_multidict.items() if len(k_list) > 1}
+        if dupes:
+            raise ValueError('expected unique values, got multiple keys for'
+                             ' the following values: %r' % dupes)
+
+        # commit in place so existing references to self.inv stay live
+        dict.clear(self)
+        dict.update(self, final)
+        dict.clear(self.inv)
+        dict.update(self.inv, [(v, k) for k, v in final.items()])
+
     def __repr__(self):
         cn = self.__class__.__name__
         dict_repr = dict.__repr__(self)

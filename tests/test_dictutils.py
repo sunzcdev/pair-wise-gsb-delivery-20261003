@@ -494,6 +494,67 @@ def test_one_to_one_ior():
     assert oto.inv == {1: 'd', 2: 'c'}
 
 
+def test_one_to_one_update_all():
+    # legal swap, impossible with per-item assignment
+    oto = OneToOne({'a': 1, 'b': 2})
+    oto.update_all({'a': 2, 'b': 1})
+    assert oto == {'a': 2, 'b': 1}
+    assert oto.inv == {1: 'b', 2: 'a'}
+
+    # multi-point permutation (3-cycle)
+    oto = OneToOne({'a': 1, 'b': 2, 'c': 3})
+    oto.update_all({'a': 2, 'b': 3, 'c': 1})
+    assert oto == {'a': 2, 'b': 3, 'c': 1}
+    assert oto.inv == {1: 'c', 2: 'a', 3: 'b'}
+
+    # removals applied together with updates
+    oto.update_all({'d': 4}, removals=['a'])
+    assert oto == {'b': 3, 'c': 1, 'd': 4}
+    assert oto.inv == {1: 'c', 3: 'b', 4: 'd'}
+
+    # genuine many-to-one conflict fails before commit
+    with pytest.raises(ValueError):
+        oto.update_all({'b': 1, 'c': 1})
+    assert oto == {'b': 3, 'c': 1, 'd': 4}
+    assert oto.inv == {1: 'c', 3: 'b', 4: 'd'}
+
+    # missing removal key fails before commit
+    with pytest.raises(KeyError):
+        oto.update_all({'b': 5}, removals=['nope'])
+    assert oto == {'b': 3, 'c': 1, 'd': 4}
+    assert oto.inv == {1: 'c', 3: 'b', 4: 'd'}
+
+    # generator raising midway leaves the mapping untouched
+    def bad_gen():
+        yield ('b', 5)
+        raise RuntimeError('boom')
+
+    with pytest.raises(RuntimeError):
+        oto.update_all(bad_gen())
+    assert oto == {'b': 3, 'c': 1, 'd': 4}
+    assert oto.inv == {1: 'c', 3: 'b', 4: 'd'}
+
+    # unhashable value fails before commit
+    with pytest.raises(TypeError):
+        oto.update_all([('b', [])])
+    assert oto == {'b': 3, 'c': 1, 'd': 4}
+
+    # previously obtained inverse references observe the same change
+    inv = oto.inv
+    oto.update_all({'b': 6})
+    assert inv == {1: 'c', 4: 'd', 6: 'b'}
+    assert inv is oto.inv
+
+    # works symmetrically from the inverse side
+    oto.inv.update_all({1: 'z'})
+    assert oto == {'b': 6, 'z': 1, 'd': 4}
+    assert oto.inv == {1: 'z', 4: 'd', 6: 'b'}
+
+    # no-op defaults
+    oto.update_all()
+    assert oto == {'b': 6, 'z': 1, 'd': 4}
+
+
 def test_many_to_many():
     m2m = ManyToMany()
     assert len(m2m) == 0
