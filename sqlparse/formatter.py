@@ -131,6 +131,16 @@ def validate_options(options):
             raise SQLParseError('right_margin requires an integer > 10')
     options['right_margin'] = right_margin
 
+    output_limit = options.get('output_limit')
+    if output_limit is not None:
+        try:
+            output_limit = int(output_limit)
+        except (TypeError, ValueError):
+            raise SQLParseError('output_limit requires an integer')
+        if output_limit < 1:
+            raise SQLParseError('output_limit requires a positive integer')
+    options['output_limit'] = output_limit
+
     return options
 
 

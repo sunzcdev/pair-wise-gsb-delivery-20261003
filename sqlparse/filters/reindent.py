@@ -253,22 +253,158 @@ class ReindentFilter:
             if end_idx is not None and not self.compact:
                 tlist.insert_before(end_idx, self.nl())
 
+    def _line_len_before(self, tokens, base):
+        """Returns the width of the line in front of ``tokens[-1]``.
+
+        This is :meth:`_current_line_len` applied to the last element of
+        *tokens*: values are visited from the right and the walk stops at
+        the line break that starts the current line.  The caller passes the
+        children emitted so far, so no ``list.index()`` lookup is needed;
+        *base* is the width in front of the first child, which the walk
+        would reach through the parent chain.
+        """
+        length = 0
+        stack = [(tokens, len(tokens) - 1)]
+        while stack:
+            seq, pos = stack[-1]
+            if pos < 0:
+                stack.pop()
+                continue
+            token = seq[pos]
+            stack[-1] = (seq, pos - 1)
+
+            if token.is_group:
+                stack.append((token.tokens, len(token.tokens) - 1))
+                continue
+
+            value = token.value
+            size = len(value)
+            if not size:
+                continue
+            lines = value.splitlines()
+            if len(lines) == 1 and len(lines[0]) == size:
+                length += size
+                continue
+
+            # ``value`` holds the break that starts the current line.  The
+            # sentinel keeps a trailing break from collapsing, so ``lines``
+            # always has one entry more than the number of breaks.
+            lines = (value + '.').splitlines()
+            tail = len(lines[-1]) - 1 + length
+            if tail:
+                return tail
+            # Nothing but a break to our right, and ``splitlines()`` drops
+            # that empty line -- so the line to measure is the one before.
+            if len(lines) > 2:
+                return len(lines[-2])
+            length = len(lines[0])
+        return base + length
+
     def _process_values(self, tlist):
+        """Lay out a ``VALUES`` list with one row per line.
+
+        Every row but the first starts on its own line, under the row that
+        shares its comma.  The width of that line used to be measured per
+        row, and the measurement located the row with ``list.index()`` on
+        the group's children -- ``insert_after()`` repeated that lookup for
+        the comma.  Laying out n rows therefore walked the child list n
+        times, so formatting an export with many thousands of ``VALUES``
+        rows spent most of its time rescanning rows that were already laid
+        out.
+
+        The children are now rebuilt in a single pass.  A row usually
+        starts right behind a break this filter inserted, so the width of
+        its line is known and can be followed forward with one addition per
+        token.  A value that carries a break of its own -- a multiline
+        literal, a line comment between two rows -- changes what the
+        measurement reports, so from there the width is measured with
+        ``_line_len_before()`` over the children emitted so far, until an
+        inserted break starts a new line and the forward count is known
+        again.  That reproduces the previous output exactly without paying
+        the ``list.index()`` lookups.  The comma of a row comes from a
+        forward-only scan -- a row without a comma of its own shares a
+        later one and the scan never moves back.
+        """
         tlist.insert_before(0, self.nl())
-        tidx, token = tlist.token_next_by(i=sql.Parenthesis)
-        first_token = token
-        while token:
-            ptidx, ptoken = tlist.token_next_by(m=(T.Punctuation, ','),
-                                                idx=tidx)
-            if ptoken:
-                if self.comma_first:
-                    adjust = -2
-                    offset = self._get_offset(first_token) + adjust
-                    tlist.insert_before(ptoken, self.nl(offset))
+        tokens = tlist.tokens
+        size = len(tokens)
+        first = next((idx for idx, token in enumerate(tokens)
+                      if isinstance(token, sql.Parenthesis)), None)
+        if first is None:
+            return
+
+        leading = len(self.char * self.leading_ws)
+        # Only the width in front of the first row has to be measured; it
+        # includes whatever the statement put there.
+        first_line = self._current_line_len(tokens[first])
+        first_column = first_line
+        if self.comma_first:
+            # Breaks go in front of the comma, in line with the first row
+            # less the ", " they sit next to.
+            first_column -= 2
+
+        # The comma whose break follows each row.  A row without a comma of
+        # its own shares the comma of a later row; the code inserted a
+        # break for it there too, so several breaks can share a comma.
+        breaks = {}
+        comma_of = {}
+        comma = first
+        for idx in range(first, size):
+            if not isinstance(tokens[idx], sql.Parenthesis):
+                continue
+            comma = max(comma, idx + 1)
+            while comma < size and not tokens[comma].match(T.Punctuation, ','):
+                comma += 1
+            if comma == size:
+                # No comma left, so no later row has one either.
+                break
+            comma_of[idx] = comma
+            if self.comma_first:
+                # All breaks in front of a comma are at the same column.
+                breaks.setdefault(comma, []).append(first_column - leading)
+
+        # ``width`` is the width of the line up to the children emitted so
+        # far, or ``None`` when a value with a break of its own made it
+        # unknown; then the line is measured as before.
+        width = None
+        laid_out = []
+        idx = 0
+        while idx < size:
+            token = tokens[idx]
+            if self.comma_first and idx in breaks:
+                for indent in breaks[idx]:
+                    token = self.nl(indent)
+                    laid_out.append(token)
+                    width = leading + indent
+            if idx in comma_of and not self.comma_first:
+                if width is None:
+                    column = self._line_len_before(laid_out, first_column)
                 else:
-                    tlist.insert_after(ptoken,
-                                       self.nl(self._get_offset(token)))
-            tidx, token = tlist.token_next_by(i=sql.Parenthesis, idx=tidx)
+                    column = width
+                breaks.setdefault(comma_of[idx], []).append(column - leading)
+            laid_out.append(tokens[idx])
+            if width is not None:
+                value = tokens[idx].value
+                if '\n' in value or '\r' in value:
+                    width = None
+                else:
+                    width += len(value)
+            idx += 1
+            if not self.comma_first and idx - 1 in breaks:
+                # ``insert_after(..., skip_ws=True)`` put the breaks behind
+                # the whitespace following the comma; keep that order and
+                # let the serializer strip the resulting trailing space.
+                indents = breaks[idx - 1]
+                while idx < size and tokens[idx].is_whitespace:
+                    laid_out.append(tokens[idx])
+                    idx += 1
+                for indent in indents:
+                    laid_out.append(self.nl(indent))
+                    width = leading + indent
+
+        for token in laid_out:
+            token.parent = tlist
+        tlist.tokens = laid_out
 
     def _process_default(self, tlist, stmts=True):
         self._split_statements(tlist) if stmts else None

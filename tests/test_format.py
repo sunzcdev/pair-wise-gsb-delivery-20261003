@@ -1,7 +1,7 @@
 import pytest
 
 import sqlparse
-from sqlparse.exceptions import SQLParseError
+from sqlparse.exceptions import OutputLimitExceeded, SQLParseError
 
 
 class TestFormat:
@@ -649,6 +649,42 @@ class TestFormatReindent:
             '     , (3, 4)',
             '     , (5, 6)'])
 
+    def test_insert_values_wide_list(self):
+        # A data export produces many rows; each one goes on its own line,
+        # aligned under the first row, and the layout does not depend on
+        # the number of rows.
+        f = lambda sql: sqlparse.format(sql, reindent=True)
+        rows = [f'({i}, {i * 2})' for i in range(20)]
+        s = 'insert into foo(a, b) values ' + ', '.join(rows)
+        expected = ['insert into foo(a, b)', 'values (0, 0),']
+        expected += [f'       {row},' for row in rows[1:-1]]
+        expected.append(f'       {rows[-1]}')
+        assert f(s) == '\n'.join(expected)
+
+    def test_insert_values_wide_list_comma_first(self):
+        f = lambda sql: sqlparse.format(sql, reindent=True, comma_first=True)
+        rows = [f'({i})' for i in range(5)]
+        s = 'insert into foo values ' + ', '.join(rows)
+        assert f(s) == '\n'.join([
+            'insert into foo',
+            'values (0)',
+            '     , (1)',
+            '     , (2)',
+            '     , (3)',
+            '     , (4)'])
+
+    def test_insert_values_keeps_literal_contents(self):
+        # The row layout must not touch the values themselves, including
+        # long string literals and nested parentheses.
+        f = lambda sql: sqlparse.format(sql, reindent=True)
+        s = ("insert into foo values ('{}', (1, 2)), "
+             "('b', (3, 4))").format('x' * 200)
+        formatted = f(s)
+        assert formatted.splitlines()[1] == "values ('{}', (1, 2))," \
+            .format('x' * 200)
+        assert formatted.splitlines()[2] == "       ('b', (3, 4))"
+        assert len(formatted) > 200
+
 
 class TestOutputFormat:
     def test_python(self):
@@ -839,3 +875,87 @@ def test_strip_ws_removes_trailing_ws_in_groups():  # issue782
                                 strip_whitespace=True)
     expected = '(where foo = bar) from'
     assert formatted == expected
+
+
+class TestOutputLimit:
+    """The output_limit option bounds the formatted result.
+
+    It is a budget, not a truncation: a result that would exceed it raises
+    OutputLimitExceeded instead of returning a shorter string that looks
+    like a successfully formatted statement.
+    """
+
+    SQL = 'select a, b from t where x = 1'
+
+    def test_under_limit_is_unchanged(self):
+        expected = sqlparse.format(self.SQL, reindent=True)
+        assert sqlparse.format(
+            self.SQL, reindent=True,
+            output_limit=len(expected)) == expected
+        assert sqlparse.format(
+            self.SQL, reindent=True,
+            output_limit=len(expected) + 100) == expected
+
+    def test_exact_limit_compared_after_serialization(self):
+        # rstrip() in the serializer can shorten a statement, so the
+        # budget has to be applied to the string that is returned.
+        sql = 'select a   \nfrom t   '
+        formatted = sqlparse.format(sql, reindent=True)
+        assert sqlparse.format(
+            sql, reindent=True, output_limit=len(formatted)) == formatted
+
+    def test_over_limit_raises(self):
+        expected = sqlparse.format(self.SQL, reindent=True)
+        with pytest.raises(OutputLimitExceeded) as excinfo:
+            sqlparse.format(self.SQL, reindent=True,
+                            output_limit=len(expected) - 1)
+        assert excinfo.value.limit == len(expected) - 1
+        assert excinfo.value.length == len(expected)
+
+    def test_no_truncated_result(self):
+        # The error must not accompany a returned statement that silently
+        # lost its tail: format() either returns the whole result or raises.
+        with pytest.raises(OutputLimitExceeded):
+            result = sqlparse.format(self.SQL, reindent=True, output_limit=10)
+            pytest.fail(f'format() returned {result!r}')
+
+    def test_limit_counts_every_statement(self):
+        sql = 'select 1; select 2; select 3'
+        formatted = sqlparse.format(sql)
+        assert sqlparse.format(
+            sql, output_limit=len(formatted)) == formatted
+        with pytest.raises(OutputLimitExceeded):
+            sqlparse.format(sql, output_limit=len(formatted) - 1)
+
+    def test_string_literal_counted_at_real_length(self):
+        sql = "select '{}' from t".format('x' * 100)
+        formatted = sqlparse.format(sql)
+        assert len(formatted) > 100
+        with pytest.raises(OutputLimitExceeded) as excinfo:
+            sqlparse.format(sql, output_limit=100)
+        assert excinfo.value.length == len(formatted)
+
+    def test_limit_applies_to_output_format(self):
+        sql = 'select * from foo; select 1 from dual'
+        formatted = sqlparse.format(sql, output_format='python')
+        assert sqlparse.format(
+            sql, output_format='python',
+            output_limit=len(formatted)) == formatted
+        with pytest.raises(OutputLimitExceeded):
+            sqlparse.format(sql, output_format='python',
+                            output_limit=len(formatted) - 1)
+
+    def test_limit_does_not_change_short_statements(self):
+        sql = 'insert into foo values (1, 2)'
+        assert (sqlparse.format(sql, reindent=True, output_limit=1000)
+                == sqlparse.format(sql, reindent=True))
+
+    def test_invalid_option(self):
+        for option in ('ten', 0, -5):
+            with pytest.raises(SQLParseError):
+                sqlparse.format('foo', output_limit=option)
+
+    def test_error_is_a_parse_error(self):
+        # Existing callers catch SQLParseError; the dedicated subclass is
+        # still one, and can be caught more precisely.
+        assert issubclass(OutputLimitExceeded, SQLParseError)

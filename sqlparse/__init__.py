@@ -52,11 +52,17 @@ def format(sql: str, encoding: str | None = None, **options: Any) -> str:
     keyword "encoding" which determines the encoding of the statement.
 
     :returns: The formatted SQL statement as string.
+    :raises ~sqlparse.exceptions.OutputLimitExceeded: If ``output_limit``
+        is set and the formatted result is longer than that many
+        characters.  The result is not truncated.
     """
     stack = engine.FilterStack()
     options = formatter.validate_options(options)
     stack = formatter.build_filter_stack(stack, options)
     stack.postprocess.append(filters.SerializerUnicode())
+    if options['output_limit'] is not None:
+        stack.postprocess.append(
+            filters.OutputLimitFilter(options['output_limit']))
     return "".join(stack.run(sql, encoding))
 
 

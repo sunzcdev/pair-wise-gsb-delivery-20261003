@@ -155,6 +155,15 @@ def create_parser():
         help='Try to produce more compact output (default False)')
 
     group.add_argument(
+        '--output_limit',
+        dest='output_limit',
+        default=None,
+        type=int,
+        metavar='CHARS',
+        help='Refuse to produce more than CHARS characters of output '
+             '(default: no limit)')
+
+    group.add_argument(
         '--encoding',
         dest='encoding',
         default='utf-8',

@@ -84,6 +84,19 @@ The :meth:`~sqlparse.format` function accepts the following keyword arguments.
 ``comma_first``
   If ``True`` comma-first notation for column names is used.
 
+``output_limit``
+  If ``output_limit`` is a positive integer, formatting refuses to return
+  more than that many characters.  The formatted text is not truncated:
+  when the output would be longer, :func:`~sqlparse.format` raises
+  :class:`~sqlparse.exceptions.OutputLimitExceeded` (a subclass of
+  :class:`~sqlparse.exceptions.SQLParseError`) instead of returning a
+  shorter string.  The length is that of the string that would be
+  returned, so characters inside string literals count at their real
+  length and the option combines with all other options, ``output_format``
+  included.  This is useful when a data export produces very large
+  ``INSERT ... VALUES`` statements and the caller wants a bound on the
+  result.  There is no limit by default.
+
 
 Security and Performance Considerations
 ---------------------------------------
@@ -115,6 +128,14 @@ of service (DoS) attacks:
     # Disable limits completely (use with extreme caution)
     sqlparse.engine.grouping.MAX_GROUPING_DEPTH = None
     sqlparse.engine.grouping.MAX_GROUPING_TOKENS = None
+
+**Output Budget**
+  The grouping limits bound the work done before formatting starts.  A
+  single statement that is within those limits can still produce a large
+  result, e.g. when reindenting an ``INSERT ... VALUES`` list with many
+  rows.  ``output_limit`` additionally bounds the size of the result; see
+  the ``output_limit`` option above.  Like the grouping limits it is off by
+  default and has to be chosen by the caller.
 
 .. warning::
    Increasing the grouping limits or disabling them completely may make your

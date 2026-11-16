@@ -56,12 +56,21 @@ class Vector:
     :param build: Builds the payload for a given size, ``n -> sql``.
     :param sizes: Sizes to measure, ascending.
     :param run: Entry point under test, defaults to :func:`sqlparse.parse`.
+    :param prepare: Optional ``payload -> input`` callable applied before the
+        measured call, for work that should not be timed -- e.g. parsing when
+        only a later formatting stage is under test.
+    :param work: Optional ``input -> dict`` callable computing counters for
+        the same workload, for benchmarks that want to show the amount of
+        work rather than only the elapsed time.  It runs on a freshly
+        prepared input so it cannot disturb the timed call.
     """
 
     name: str
     build: Callable[[int], str]
     sizes: tuple
-    run: Callable[[str], object] = sqlparse.parse
+    run: Callable[[object], object] = sqlparse.parse
+    prepare: Callable[[str], object] | None = None
+    work: Callable[[object], dict] | None = None
 
 
 class Timeout(Exception):
@@ -79,26 +88,37 @@ if _CAN_ALARM:
     signal.signal(signal.SIGALRM, _alarm_handler)
 
 
-def measure(run, sql, timeout=DEFAULT_TIMEOUT):
-    """Run ``run(sql)`` once, return ``(status, elapsed milliseconds)``.
+def measure(run, payload, timeout=DEFAULT_TIMEOUT, repeat=5):
+    """Run ``run(payload)``, return ``(status, elapsed milliseconds)``.
 
-    The status is ``ok``, ``cap`` when a grouping limit rejected the input
-    before the measured path was reached, or ``timeout``.
+    The status is ``ok``, ``cap`` when a grouping limit or an output budget
+    rejected the input before the measured path was reached, or ``timeout``.
+    Only the call itself is timed; building ``payload`` happens in the
+    caller.  The call is run up to *repeat* times and the fastest run is
+    returned: it is the measurement least disturbed by other work on the
+    host, and unlike an average it never gets slower because the host was
+    busy.  A rejected payload is not repeated.
     """
-    if _CAN_ALARM:
-        signal.alarm(timeout)
     status = 'ok'
-    t0 = time.perf_counter()
-    try:
-        run(sql)
-    except sqlparse.exceptions.SQLParseError:
-        status = 'cap'
-    except Timeout:
-        status = 'timeout'
-    finally:
+    best = None
+    for _ in range(repeat):
         if _CAN_ALARM:
-            signal.alarm(0)
-    return status, (time.perf_counter() - t0) * 1000
+            signal.alarm(timeout)
+        t0 = time.perf_counter()
+        try:
+            run(payload)
+        except sqlparse.exceptions.SQLParseError:
+            status = 'cap'
+        except Timeout:
+            status = 'timeout'
+        finally:
+            if _CAN_ALARM:
+                signal.alarm(0)
+        elapsed = (time.perf_counter() - t0) * 1000
+        best = elapsed if best is None else min(best, elapsed)
+        if status != 'ok':
+            break
+    return status, best
 
 
 def _format_size(n_bytes):
@@ -131,19 +151,30 @@ def _exponent(points):
     return covariance / variance
 
 
+def make_input(vector, sql):
+    """Return the argument for the measured call, building it untimed."""
+    return vector.prepare(sql) if vector.prepare else sql
+
+
 def run_vector(vector, timeout=DEFAULT_TIMEOUT):
     """Measure one vector, print its table and return its verdict."""
     print(f'{vector.name}:')
-    print(f'  {"n":>8}  {"input":>9}  {"time":>11}  {"ratio":>7}  status')
+    header = f'  {"n":>8}  {"input":>9}  {"time":>11}  {"ratio":>7}  status'
+    if vector.work:
+        header += '  work'
+    print(header)
 
     points = []
     previous = None
     for n in vector.sizes:
         sql = vector.build(n)
-        status, elapsed = measure(vector.run, sql, timeout)
+        status, elapsed = measure(vector.run, make_input(vector, sql), timeout)
         ratio = f'{elapsed / previous:.2f}x' if previous else '-'
-        print(f'  {n:>8}  {_format_size(len(sql)):>9}  {elapsed:>8.1f} ms  '
-              f'{ratio:>7}  {status}')
+        row = (f'  {n:>8}  {_format_size(len(sql)):>9}  {elapsed:>8.1f} ms  '
+               f'{ratio:>7}  {status}')
+        if vector.work:
+            row += '  ' + _format_work(vector.work(make_input(vector, sql)))
+        print(row)
         previous = elapsed
         if status == 'ok' and elapsed >= MIN_SIGNIFICANT_MS:
             points.append((n, elapsed))
@@ -157,6 +188,10 @@ def run_vector(vector, timeout=DEFAULT_TIMEOUT):
     print(f'  scaling exponent {exponent:.2f} '
           f'(1.0 linear, 2.0 quadratic)  =>  {verdict}\n')
     return verdict
+
+
+def _format_work(counters):
+    return ' '.join(f'{name}={value}' for name, value in counters.items())
 
 
 def _parse_args(argv, title, vectors):
@@ -199,7 +234,8 @@ def main(title, vectors, note=None, argv=None):
     verdicts = [
         run_vector(
             vector if args.sizes is None
-            else Vector(vector.name, vector.build, args.sizes, vector.run),
+            else Vector(vector.name, vector.build, args.sizes, vector.run,
+                        vector.prepare, vector.work),
             args.timeout)
         for vector in vectors
     ]

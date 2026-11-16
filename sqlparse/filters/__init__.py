@@ -7,6 +7,7 @@
 
 from sqlparse.filters.aligned_indent import AlignedIndentFilter
 from sqlparse.filters.others import (
+    OutputLimitFilter,
     SerializerUnicode,
     SpacesAroundOperatorsFilter,
     StripCommentsFilter,
@@ -26,6 +27,7 @@ __all__ = [
     'AlignedIndentFilter',
     'IdentifierCaseFilter',
     'KeywordCaseFilter',
+    'OutputLimitFilter',
     'OutputPHPFilter',
     'OutputPythonFilter',
     'ReindentFilter',

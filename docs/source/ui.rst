@@ -49,6 +49,8 @@ Common formatting options include:
 * ``--identifiers lower`` or ``-i lower``: Convert identifiers to lowercase
 * ``--indent_width 4``: Set indentation width to 4 spaces
 * ``--strip-comments``: Remove comments from SQL
+* ``--output_limit 1000000``: Fail instead of emitting more than that many
+  characters of output
 
 Run ``sqlformat --help`` for a complete list of formatting options.
 

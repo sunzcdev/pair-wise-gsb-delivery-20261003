@@ -24,6 +24,9 @@ This project uses `uv` for dependency and environment management. Common command
 - Run all scaling benchmarks: `make benchmark`
 - Run a single one: `uv run --group dev python benchmarks/bench_grouping.py`
 - Each script exits non-zero if a measured code path grows super-linearly.
+- Vectors may build their input before the clock starts (`prepare`) and
+  report deterministic work counters (`work`), e.g.
+  `benchmarks/bench_values_layout.py` for the `VALUES` layout stage.
   See `benchmarks/README.md` for the options and for adding a benchmark.
 
 ### Coverage

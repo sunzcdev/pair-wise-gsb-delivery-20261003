@@ -3,6 +3,7 @@
 import pytest
 import sqlparse
 from sqlparse.exceptions import SQLParseError
+from sqlparse import filters
 import time
 
 
@@ -131,3 +132,84 @@ def test_unterminated_quotes_format_under_1s():
         sqlparse.format(sql)
         dt = time.perf_counter() - t0
         assert dt < 1.0, f'format took {dt:.2f}s, expected sub-second'
+
+
+def _prepare(values_sql):
+    stmt = sqlparse.parse(values_sql)[0]
+    return filters.StripWhitespaceFilter().process(stmt)
+
+
+def _values_sql(rows):
+    values = ", ".join(f"({i}, {i * 2})" for i in range(rows))
+    return f"INSERT INTO t (a, b) VALUES {values}"
+
+
+def _count_layout_work(stmt):
+    """Count the scan steps the VALUES layout performs on *stmt*.
+
+    Two lookups are counted, both of which used to walk the group's child
+    list once per row: ``TokenList.token_index()`` (which the per-row
+    column probe and ``insert_after()`` used) and the tokens visited by the
+    line measurement.  The counts are deterministic, unlike elapsed time.
+    """
+    comparisons = [0]
+    visits = [0]
+    index = sqlparse.sql.TokenList.token_index
+    line_len_before = filters.ReindentFilter._line_len_before
+
+    def token_index(self, token, start=0):
+        start = start if isinstance(start, int) else token_index(self, start)
+        for idx in range(start, len(self.tokens)):
+            comparisons[0] += 1
+            if self.tokens[idx] is token:
+                return idx
+        raise ValueError("token is not a child of the list")
+
+    def measured(self, tokens, base):
+        visits[0] += len(tokens)
+        return line_len_before(self, tokens, base)
+
+    sqlparse.sql.TokenList.token_index = token_index
+    filters.ReindentFilter._line_len_before = measured
+    try:
+        stmt = filters.ReindentFilter(char=" ", width=2).process(stmt)
+        filters.SerializerUnicode().process(stmt)
+    finally:
+        sqlparse.sql.TokenList.token_index = index
+        filters.ReindentFilter._line_len_before = line_len_before
+    return comparisons[0] + visits[0]
+
+
+def test_values_layout_scan_volume_does_not_grow_with_rows():
+    """Laying out a VALUES list must not rescan the rows already placed.
+
+    ``_process_values()`` used to probe the row column and insert each
+    break through ``list.index()``, so the scan volume grew quadratically
+    with the number of rows.  The count is deterministic, unlike a
+    measurement of elapsed time, so it is the fact this test asserts on.
+    """
+    volume = [_count_layout_work(_prepare(_values_sql(rows)))
+              for rows in (100, 200, 400, 800)]
+    assert len(set(volume)) == 1, volume
+    assert volume[0] < 100
+
+
+def test_values_layout_survives_malformed_rows():
+    """Rows without a comma of their own keep the previous output.
+
+    Such rows share the next comma, so several breaks land on one token.
+    The layout used to discover that through the same per-row lookups; it
+    now tracks them itself, and the text it produces must not change.
+    """
+    cases = {
+        'INSERT INTO t VALUES (1) (2), (3)':
+            'INSERT INTO t\nVALUES (1) (2),\n\n           (3)',
+        'INSERT INTO t VALUES (1) (2) (3), (4)':
+            'INSERT INTO t\nVALUES (1) (2) (3),\n\n\n               (4)',
+        'INSERT INTO t VALUES (1), , (2)':
+            'INSERT INTO t\nVALUES (1),\n       , (2)',
+        'INSERT INTO t VALUES (1),':
+            'INSERT INTO t\nVALUES (1),',
+    }
+    for sql, expected in cases.items():
+        assert sqlparse.format(sql, reindent=True) == expected

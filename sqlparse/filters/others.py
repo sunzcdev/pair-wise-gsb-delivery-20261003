@@ -9,6 +9,7 @@ import re
 
 from sqlparse import sql
 from sqlparse import tokens as T
+from sqlparse.exceptions import OutputLimitExceeded
 from sqlparse.utils import split_unquoted_newlines
 
 
@@ -178,3 +179,26 @@ class SerializerUnicode:
     def process(stmt):
         lines = split_unquoted_newlines(stmt)
         return '\n'.join(line.rstrip() for line in lines)
+
+
+class OutputLimitFilter:
+    """Enforce a budget on the length of the formatted output.
+
+    This runs after :class:`SerializerUnicode`, so it counts the characters
+    that would actually be returned -- whitespace normalization, keyword
+    case, ``output_format`` wrappers and the contents of string literals
+    included.  Nothing is truncated: when the accumulated length of the
+    statements formatted so far exceeds *limit*, formatting stops with
+    :class:`~sqlparse.exceptions.OutputLimitExceeded`, so a caller can never
+    mistake a cut-off result for a complete one.
+    """
+
+    def __init__(self, limit):
+        self.limit = limit
+        self.length = 0
+
+    def process(self, stmt):
+        self.length += len(stmt)
+        if self.length > self.limit:
+            raise OutputLimitExceeded(self.limit, self.length)
+        return stmt

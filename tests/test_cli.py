@@ -235,3 +235,30 @@ def test_cli_outfile_keeps_file_on_format_error(tmpdir, capsys):
     assert out_file.read() == "select 1"
     _, err = capsys.readouterr()
     assert err.startswith("[ERROR] Failed to format")
+
+
+def test_cli_output_limit_accepts_output_under_budget(tmpdir, capsys):
+    test_file = tmpdir.join("in.sql")
+    test_file.write("select   *   from   foo")
+
+    result = sqlparse.cli.main(
+        [str(test_file), '--reindent', '--output_limit', '100'])
+
+    assert result == 0
+    out, _ = capsys.readouterr()
+    assert out == "select *\nfrom foo"
+
+
+def test_cli_output_limit_reports_over_budget(tmpdir, capsys):
+    test_file = tmpdir.join("in.sql")
+    test_file.write("select   *   from   foo")
+
+    result = sqlparse.cli.main(
+        [str(test_file), '--reindent', '--output_limit', '5'])
+
+    assert result == 1
+    out, err = capsys.readouterr()
+    # Nothing is written: a cut-off statement must not look like output.
+    assert out == ""
+    assert err.startswith("[ERROR] Failed to format")
+    assert "output_limit" in err

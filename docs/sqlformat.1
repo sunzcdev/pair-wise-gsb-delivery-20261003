@@ -56,6 +56,14 @@ puts every item in the list on its own line.
 \fB\-\-strip\-comments
 Remove comments.
 .TP
+\fB\-\-output_limit\fR=\fICHARS\fR
+Refuse to produce more than
+.I CHARS
+characters of formatted output.
+If the result would be longer, no output is written and an error is
+reported instead; the result is never truncated.
+By default there is no limit.
+.TP
 .BR \-h | \-\-help
 Print a short help message and exit.
 All subsequent options are ignored.
