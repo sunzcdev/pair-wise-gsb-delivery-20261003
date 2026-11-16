@@ -5801,6 +5801,243 @@ class ZipBroadcastTests(TestCase):
         )
 
 
+class ZipBroadcastSingletonTests(TestCase):
+    def test_singleton_broadcast(self):
+        for objects, expected in [
+            # A single iterable of length 1 broadcasts
+            ([[1], [2, 3, 4]], [(1, 2), (1, 3), (1, 4)]),
+            ([[1, 2, 3], [4]], [(1, 4), (2, 4), (3, 4)]),
+            # Several singletons broadcast together
+            ([[1, 2], [3], [4]], [(1, 3, 4), (2, 3, 4)]),
+            ([[1], [2], [3]], [(1, 2, 3)]),
+            # Scalars still broadcast alongside singletons
+            ([[1, 2], 3, [4]], [(1, 3, 4), (2, 3, 4)]),
+            # Sources of equal length pass through unchanged
+            ([[1, 2], [3, 4]], [(1, 3), (2, 4)]),
+        ]:
+            with self.subTest(objects=objects):
+                self.assertEqual(
+                    list(mi.zip_broadcast(*objects, singleton=True)), expected
+                )
+
+    def test_singleton_without_singleton_mode(self):
+        # The default mode still truncates, for backwards compatibility
+        self.assertEqual(list(mi.zip_broadcast([1, 2, 3], [4])), [(1, 4)])
+
+    def test_degenerate_inputs(self):
+        self.assertEqual(list(mi.zip_broadcast(singleton=True)), [])
+        self.assertEqual(list(mi.zip_broadcast(1, singleton=True)), [(1,)])
+        self.assertEqual(list(mi.zip_broadcast([1], singleton=True)), [(1,)])
+        self.assertEqual(
+            list(mi.zip_broadcast([1, 2], singleton=True)), [(1,), (2,)]
+        )
+
+    def test_scalar_types_still_apply(self):
+        # A one-character string is a scalar by default, so it broadcasts
+        self.assertEqual(
+            list(mi.zip_broadcast('a', [1, 2], singleton=True)),
+            [('a', 1), ('a', 2)],
+        )
+        # With scalar_types=None it is an ordinary iterable, so a
+        # one-character string is now a singleton
+        self.assertEqual(
+            list(
+                mi.zip_broadcast(
+                    'a', [1, 2], singleton=True, scalar_types=None
+                )
+            ),
+            [('a', 1), ('a', 2)],
+        )
+        # A two-character string read as an iterable is not a singleton
+        self.assertEqual(
+            list(mi.zip_broadcast('ab', [1, 2], scalar_types=None)),
+            [('a', 1), ('b', 2)],
+        )
+        self.assertEqual(
+            list(
+                mi.zip_broadcast(
+                    'ab', [1, 2], singleton=True, scalar_types=None
+                )
+            ),
+            [('a', 1), ('b', 2)],
+        )
+
+    def test_lookahead_is_bounded(self):
+        # Only the items needed to classify an input should be read
+        reads = []
+
+        def source():
+            for i in range(10):
+                reads.append(i)
+                yield i
+
+        it = mi.zip_broadcast([0], source(), singleton=True)
+        self.assertEqual(reads, [])
+        next(it)
+        # One item to detect the singleton and one to detect a second item
+        self.assertEqual(reads, [0, 1])
+
+    def test_single_use_iterable(self):
+        class SingleUseIterable:
+            def __init__(self, values):
+                self.values = values
+                self.opened = 0
+
+            def __iter__(self):
+                self.opened += 1
+                if self.opened > 1:
+                    raise RuntimeError('input already opened')
+                return iter(self.values)
+
+        # A singleton input is still broadcast while being opened once
+        source = SingleUseIterable([1])
+        self.assertEqual(
+            list(mi.zip_broadcast(source, ['x', 'y'], singleton=True)),
+            [(1, 'x'), (1, 'y')],
+        )
+        self.assertEqual(source.opened, 1)
+
+        # The same holds when the input supplies a whole column
+        source = SingleUseIterable([1, 2])
+        self.assertEqual(
+            list(mi.zip_broadcast(source, ['x', 'y'], singleton=True)),
+            [(1, 'x'), (2, 'y')],
+        )
+        self.assertEqual(source.opened, 1)
+
+        # An empty input is reported without opening it again
+        source = SingleUseIterable([])
+        with self.assertRaises(mi.ZipBroadcastEmptySourceError):
+            list(mi.zip_broadcast(source, ['x', 'y'], singleton=True))
+        self.assertEqual(source.opened, 1)
+
+    def test_empty_source(self):
+        for objects, position in [
+            ([[], [1, 2]], 0),
+            ([[1, 2], []], 1),
+            ([[1], [], [2]], 1),
+            ([1, [], 2], 1),
+        ]:
+            with self.subTest(objects=objects):
+                with self.assertRaises(mi.ZipBroadcastEmptySourceError) as ctx:
+                    list(mi.zip_broadcast(*objects, singleton=True))
+                self.assertEqual(ctx.exception.position, position)
+                self.assertEqual(ctx.exception.rows_emitted, 0)
+                self.assertIsInstance(ctx.exception, ValueError)
+
+    def test_length_mismatch(self):
+        for objects, rows_emitted in [
+            ([[1, 2, 3], [4, 5]], 2),
+            ([[1, 2], [3, 4, 5]], 2),
+            # A singleton does not take part in the length comparison
+            ([[1], [2, 3, 4], [5, 6]], 2),
+            ([[1, 2, 3], [4], [5, 6]], 2),
+            ([[1, 2, 3], [4, 5, 6], [7, 8]], 2),
+            # Several sources can end at once
+            ([[1, 2], [3, 4], [5, 6, 7]], 2),
+        ]:
+            with self.subTest(objects=objects):
+                with self.assertRaises(
+                    mi.ZipBroadcastLengthMismatchError
+                ) as ctx:
+                    list(mi.zip_broadcast(*objects, singleton=True))
+                self.assertEqual(ctx.exception.rows_emitted, rows_emitted)
+                self.assertIsInstance(ctx.exception, ValueError)
+
+    def test_not_truncated_with_rows(self):
+        # The error reports how many rows were produced beforehand
+        it = mi.zip_broadcast([1, 2, 3], [4, 5], singleton=True)
+        produced = []
+        with self.assertRaises(mi.ZipBroadcastLengthMismatchError) as ctx:
+            for item in it:
+                produced.append(item)
+        self.assertEqual(produced, [(1, 4), (2, 5)])
+        self.assertEqual(ctx.exception.rows_emitted, len(produced))
+
+    def test_source_raises(self):
+        def broken():
+            yield 1
+            yield 2
+            raise RuntimeError('boom')
+
+        with self.assertRaises(mi.ZipBroadcastSourceError) as ctx:
+            list(mi.zip_broadcast(broken(), [10, 20, 30], singleton=True))
+        exc = ctx.exception
+        self.assertEqual(exc.position, 0)
+        self.assertEqual(exc.rows_emitted, 2)
+        self.assertIsInstance(exc.__cause__, RuntimeError)
+        self.assertIn('boom', str(exc))
+        self.assertNotIsInstance(exc, ValueError)
+
+    def test_source_raises_while_classifying(self):
+        def broken():
+            raise RuntimeError('early')
+            yield
+
+        with self.assertRaises(mi.ZipBroadcastSourceError) as ctx:
+            list(mi.zip_broadcast(['a'], broken(), singleton=True))
+        self.assertEqual(ctx.exception.position, 1)
+        self.assertEqual(ctx.exception.rows_emitted, 0)
+
+    def test_source_raises_without_a_message(self):
+        def broken():
+            yield 1
+            yield 2
+            raise RuntimeError
+
+        with self.assertRaises(mi.ZipBroadcastSourceError) as ctx:
+            list(mi.zip_broadcast(broken(), [10, 20, 30], singleton=True))
+        self.assertIn('RuntimeError', str(ctx.exception))
+        self.assertEqual(str(ctx.exception.__cause__), '')
+
+    def test_source_raises_instead_of_ending(self):
+        # An exception must not be mistaken for the end of a source
+        def broken():
+            yield 1
+            raise RuntimeError('boom')
+
+        with self.assertRaises(mi.ZipBroadcastSourceError):
+            list(mi.zip_broadcast(broken(), [10, 20], singleton=True))
+
+    def test_infinite_sources(self):
+        self.assertEqual(
+            list(islice(mi.zip_broadcast(count(), ['x'], singleton=True), 3)),
+            [(0, 'x'), (1, 'x'), (2, 'x')],
+        )
+        self.assertEqual(
+            list(
+                islice(mi.zip_broadcast(count(), count(10), singleton=True), 3)
+            ),
+            [(0, 10), (1, 11), (2, 12)],
+        )
+        # An infinite source next to a finite one still fails loudly
+        with self.assertRaises(mi.ZipBroadcastLengthMismatchError) as ctx:
+            list(mi.zip_broadcast(count(), [1, 2], singleton=True))
+        self.assertEqual(ctx.exception.rows_emitted, 2)
+
+    def test_strict_is_redundant(self):
+        with self.assertRaises(mi.ZipBroadcastLengthMismatchError):
+            list(
+                mi.zip_broadcast(
+                    [1, 2, 3], [4, 5], singleton=True, strict=True
+                )
+            )
+        self.assertEqual(
+            list(mi.zip_broadcast([1, 2], [3], singleton=True, strict=True)),
+            [(1, 3), (2, 3)],
+        )
+
+    def test_error_hierarchy(self):
+        for exc_type in (
+            mi.ZipBroadcastEmptySourceError,
+            mi.ZipBroadcastLengthMismatchError,
+            mi.ZipBroadcastSourceError,
+        ):
+            with self.subTest(exc_type=exc_type):
+                self.assertTrue(issubclass(exc_type, mi.ZipBroadcastError))
+        self.assertIn('0 row(s)', str(mi.ZipBroadcastError('oops')))
+
+
 class UniqueInWindowTests(TestCase):
     def test_invalid_n(self):
         with self.assertRaises(ValueError):

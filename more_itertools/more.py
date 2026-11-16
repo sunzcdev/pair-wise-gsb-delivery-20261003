@@ -61,6 +61,10 @@ from .recipes import (
 __all__ = [
     'AbortThread',
     'SequenceView',
+    'ZipBroadcastEmptySourceError',
+    'ZipBroadcastError',
+    'ZipBroadcastLengthMismatchError',
+    'ZipBroadcastSourceError',
     'adjacent',
     'all_unique',
     'always_iterable',
@@ -4684,7 +4688,38 @@ def chunked_even(iterable, n):
             yield buffer[i : i + partial_size]
 
 
-def zip_broadcast(*objects, scalar_types=(str, bytes), strict=False):
+class ZipBroadcastError(Exception):
+    """Base class for the errors raised by :func:`zip_broadcast`.
+
+    The number of rows that were yielded before the error occurred is
+    available as *rows_emitted*, and the index of the offending argument
+    (when there is one) is available as *position*.
+    """
+
+    def __init__(self, message, rows_emitted=0, position=None):
+        super().__init__(f'{message} (after {rows_emitted} row(s) emitted)')
+        self.rows_emitted = rows_emitted
+        self.position = position
+
+
+class ZipBroadcastEmptySourceError(ZipBroadcastError, ValueError):
+    """An iterable source of :func:`zip_broadcast` is empty in singleton
+    mode, so there is no value to broadcast."""
+
+
+class ZipBroadcastLengthMismatchError(ZipBroadcastError, ValueError):
+    """The non-singleton sources of :func:`zip_broadcast` have different
+    lengths in singleton mode."""
+
+
+class ZipBroadcastSourceError(ZipBroadcastError):
+    """A source of :func:`zip_broadcast` raised an exception in singleton
+    mode. The original exception is chained as ``__cause__``."""
+
+
+def zip_broadcast(
+    *objects, scalar_types=(str, bytes), strict=False, singleton=False
+):
     """A version of :func:`zip` that "broadcasts" any scalar
     (i.e., non-iterable) items into output tuples.
 
@@ -4704,6 +4739,64 @@ def zip_broadcast(*objects, scalar_types=(str, bytes), strict=False):
     If the *strict* keyword argument is ``True``, then
     ``ValueError`` will be raised if any of the iterables have
     different lengths.
+
+    Set the *singleton* keyword argument to ``True`` to also broadcast
+    iterable arguments that contain exactly one item:
+
+    >>> list(zip_broadcast([1, 2, 3], ['a'], singleton=True))
+    [(1, 'a'), (2, 'a'), (3, 'a')]
+
+    An input is classified by looking ahead at most two items: one to
+    establish that the input is not empty and one to learn whether it holds
+    a second item. The items that were looked at are kept, the rest of the
+    input is read lazily, and single-use iterators are only opened once.
+    Consequently an infinite source can be combined with a singleton:
+
+    >>> list(islice(zip_broadcast(count(), ['x'], singleton=True), 3))
+    [(0, 'x'), (1, 'x'), (2, 'x')]
+
+    A singleton is expected to repeat for every row, so unequal source
+    lengths are not silently truncated to the shortest one. Instead, the
+    failure modes are reported separately, and each error records in
+    *rows_emitted* how many rows were yielded first and in *position* which
+    argument is at fault. All of them derive from
+    :exc:`ZipBroadcastError`, and the two that describe the shape of the
+    input are also ``ValueError``s, like the ones raised for *strict*.
+
+    An empty iterable has no value to broadcast:
+
+    >>> try:
+    ...     list(zip_broadcast([1], [], singleton=True))
+    ... except ZipBroadcastEmptySourceError as exc:
+    ...     print(exc.position, exc.rows_emitted)
+    1 0
+
+    The non-singleton iterables must agree on a length:
+
+    >>> try:
+    ...     list(zip_broadcast([1, 2], [3, 4, 5], singleton=True))
+    ... except ZipBroadcastLengthMismatchError as exc:
+    ...     print(exc.position, exc.rows_emitted)
+    0 2
+
+    A failing source is chained to the exception it raised, rather than
+    being mistaken for the end of the input:
+
+    >>> def broken():
+    ...     yield 1
+    ...     yield 2
+    ...     raise RuntimeError('boom')
+    >>> try:
+    ...     list(zip_broadcast(broken(), [10, 20, 30], singleton=True))
+    ... except ZipBroadcastSourceError as exc:
+    ...     print(exc.position, exc.rows_emitted, repr(exc.__cause__))
+    0 2 RuntimeError('boom')
+
+    Set *singleton* to ``True`` and *strict* is redundant, since a length
+    conflict is always an error in this mode. Scalars (including strings,
+    unless *scalar_types* says otherwise) are still broadcast as before,
+    so a one-character string counts as a singleton only when its type is
+    not covered by *scalar_types*.
     """
 
     def get_iterator(obj):
@@ -4713,6 +4806,36 @@ def zip_broadcast(*objects, scalar_types=(str, bytes), strict=False):
             return iter(obj)
         except TypeError:
             return None
+
+    def source_error(exc, position, rows_emitted):
+        reason = type(exc).__name__
+        detail = str(exc)
+        if detail:
+            reason = f'{reason}: {detail}'
+        return ZipBroadcastSourceError(
+            f'argument {position} raised {reason}',
+            rows_emitted=rows_emitted,
+            position=position,
+        )
+
+    def first_item(source, position):
+        try:
+            return True, next(source)
+        except StopIteration:
+            return False, None
+        except Exception as exc:
+            raise source_error(exc, position, 0) from exc
+
+    def has_more(source, position, rows_emitted):
+        # Look at the next item without consuming it; peekable keeps it for
+        # the next() that follows, so nothing has to be read twice.
+        try:
+            source.peek()
+        except StopIteration:
+            return False
+        except Exception as exc:
+            raise source_error(exc, position, rows_emitted) from exc
+        return True
 
     size = len(objects)
     if not size:
@@ -4731,6 +4854,63 @@ def zip_broadcast(*objects, scalar_types=(str, bytes), strict=False):
     if not iterables:
         yield tuple(objects)
         return
+
+    if singleton:
+        row = list(new_item)
+        sources = []
+        for position, iterator in zip(iterable_positions, iterables):
+            # One item plus a single peek is all it takes to tell a
+            # singleton from a longer source, and the peekable retains
+            # whatever it read instead of the input being opened twice.
+            source = peekable(iterator)
+            found, value = first_item(source, position)
+            if not found:
+                raise ZipBroadcastEmptySourceError(
+                    f'argument {position} is empty; in singleton mode '
+                    'every iterable source needs at least one item',
+                    rows_emitted=0,
+                    position=position,
+                )
+            if has_more(source, position, 0):
+                source.prepend(value)
+                sources.append((position, source))
+            else:
+                row[position] = value
+
+        if not sources:
+            yield tuple(row)
+            return
+
+        rows_emitted = 0
+        num_sources = len(sources)
+        while True:
+            # Check every source for its end before taking any item, so a
+            # mismatch can be reported without consuming further input.
+            ended = [
+                position
+                for position, source in sources
+                if not has_more(source, position, rows_emitted)
+            ]
+            if ended:
+                if len(ended) == num_sources:
+                    return
+                stopped = ', '.join(str(i) for i in ended)
+                running = ', '.join(
+                    str(i) for i, _ in sources if i not in ended
+                )
+                raise ZipBroadcastLengthMismatchError(
+                    'the non-singleton sources have unequal lengths: '
+                    f'argument(s) {stopped} ended after {rows_emitted} '
+                    f'row(s) while argument(s) {running} had more items',
+                    rows_emitted=rows_emitted,
+                    position=ended[0],
+                )
+
+            for position, source in sources:
+                row[position] = next(source)
+
+            yield tuple(row)
+            rows_emitted += 1
 
     for item in zip(*iterables, strict=strict):
         for i, new_item[i] in zip(iterable_positions, item):

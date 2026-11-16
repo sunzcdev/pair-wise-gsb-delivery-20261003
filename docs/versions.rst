@@ -8,8 +8,12 @@ Version History
 Unreleased
 ----------
 
+* New functions:
+    * :class:`ZipBroadcastError` and its subclasses :class:`ZipBroadcastEmptySourceError`, :class:`ZipBroadcastLengthMismatchError`, and :class:`ZipBroadcastSourceError` report the failures of :func:`zip_broadcast` in singleton mode.
+
 * Updated functions:
     * :func:`peekable` was updated to avoid caching the entire iterable when sliced with a negative step and omitted *stop*.
+    * :func:`zip_broadcast` gained a *singleton* keyword argument that broadcasts inputs of length one. It looks ahead at most two items per input, keeps what it read so single-use iterables are not opened twice, and reports empty sources, unequal source lengths, and failing sources separately, each with the number of rows already yielded.
 
 11.2.1
 ----------

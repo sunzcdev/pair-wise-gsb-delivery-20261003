@@ -34,6 +34,10 @@ from _typeshed import (
 __all__ = [
     'AbortThread',
     'SequenceView',
+    'ZipBroadcastEmptySourceError',
+    'ZipBroadcastError',
+    'ZipBroadcastLengthMismatchError',
+    'ZipBroadcastSourceError',
     'adjacent',
     'all_unique',
     'always_iterable',
@@ -833,12 +837,28 @@ class countable(Generic[_T_co], Iterator[_T_co]):
     items_seen: int
 
 def chunked_even(iterable: Iterable[_T], n: int) -> Iterator[list[_T]]: ...
+
+class ZipBroadcastError(Exception):
+    rows_emitted: int
+    position: int | None
+    def __init__(
+        self,
+        message: str,
+        rows_emitted: int = ...,
+        position: int | None = ...,
+    ) -> None: ...
+
+class ZipBroadcastEmptySourceError(ZipBroadcastError, ValueError): ...
+class ZipBroadcastLengthMismatchError(ZipBroadcastError, ValueError): ...
+class ZipBroadcastSourceError(ZipBroadcastError): ...
+
 @overload
 def zip_broadcast(
     __obj1: _T | Iterable[_T],
     *,
     scalar_types: _ClassInfo | None = ...,
     strict: bool = ...,
+    singleton: bool = ...,
 ) -> Iterable[tuple[_T, ...]]: ...
 @overload
 def zip_broadcast(
@@ -847,6 +867,7 @@ def zip_broadcast(
     *,
     scalar_types: _ClassInfo | None = ...,
     strict: bool = ...,
+    singleton: bool = ...,
 ) -> Iterable[tuple[_T, ...]]: ...
 @overload
 def zip_broadcast(
@@ -856,6 +877,7 @@ def zip_broadcast(
     *,
     scalar_types: _ClassInfo | None = ...,
     strict: bool = ...,
+    singleton: bool = ...,
 ) -> Iterable[tuple[_T, ...]]: ...
 @overload
 def zip_broadcast(
@@ -866,6 +888,7 @@ def zip_broadcast(
     *,
     scalar_types: _ClassInfo | None = ...,
     strict: bool = ...,
+    singleton: bool = ...,
 ) -> Iterable[tuple[_T, ...]]: ...
 @overload
 def zip_broadcast(
@@ -877,6 +900,7 @@ def zip_broadcast(
     *,
     scalar_types: _ClassInfo | None = ...,
     strict: bool = ...,
+    singleton: bool = ...,
 ) -> Iterable[tuple[_T, ...]]: ...
 @overload
 def zip_broadcast(
@@ -889,6 +913,7 @@ def zip_broadcast(
     *objects: _T | Iterable[_T],
     scalar_types: _ClassInfo | None = ...,
     strict: bool = ...,
+    singleton: bool = ...,
 ) -> Iterable[tuple[_T, ...]]: ...
 def unique_in_window(
     iterable: Iterable[_T], n: int, key: Callable[[_T], _U] | None = ...
