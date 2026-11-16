@@ -15,6 +15,7 @@ from .core import (  # noqa: F401
     Dataset,
     InvalidDatasetType,
     InvalidDimensions,
+    ODSValidationError,
     UnsupportedFormat,
     detect_format,
     import_book,

@@ -14,7 +14,7 @@ from pathlib import Path
 from uuid import uuid4
 
 import xlrd
-from odf import opendocument, table
+from odf import opendocument, table, text
 from openpyxl.reader.excel import load_workbook
 
 import tablib
@@ -1367,6 +1367,241 @@ class ODSTests(BaseTestCase):
         self.assertListEqual([0, 0, 0, 14, 30, 0], [int(v or 0) for v in duration])
         # datetime value
         self.assertEqual(cells[2].getAttribute('datevalue'), '2019-10-04T12:30:08')
+
+    @staticmethod
+    def _ods_bytes(*rows):
+        """Build an ODS document from row specs.
+
+        Each row spec is ``(cells, row_repeat)`` where ``cells`` is a list
+        of cell specs and ``row_repeat`` is the
+        ``table:number-rows-repeated`` value (or ``None`` to omit it). A
+        cell spec is either a scalar value or a
+        ``(value, columns_repeated)`` tuple; ``None`` values produce empty
+        cells so that repetition attributes can be exercised directly.
+        """
+        from odf.opendocument import OpenDocumentSpreadsheet
+
+        doc = OpenDocumentSpreadsheet()
+        ws = table.Table(name='Sheet1')
+        doc.spreadsheet.addElement(ws)
+        for cells, row_repeat in rows:
+            kwargs = {}
+            if row_repeat is not None:
+                kwargs['numberrowsrepeated'] = row_repeat
+            odf_row = table.TableRow(**kwargs)
+            ws.addElement(odf_row)
+            for spec in cells:
+                if isinstance(spec, tuple):
+                    value, col_repeat = spec
+                else:
+                    value, col_repeat = spec, None
+                kwargs = {}
+                if col_repeat is not None:
+                    kwargs['numbercolumnsrepeated'] = col_repeat
+                cell = table.TableCell(**kwargs)
+                if value is not None:
+                    cell.setAttribute('valuetype', 'string')
+                    cell.addElement(text.P(text=str(value)))
+                odf_row.addElement(cell)
+        stream = BytesIO()
+        doc.save(stream)
+        return stream.getvalue()
+
+    def test_ods_import_expands_repeated_rows(self):
+        # A single data row followed by three repeated empty rows: the
+        # repeated rows are expanded, and the trailing blank run is trimmed
+        # as the empty sheet tail rather than silently collapsed away.
+        _ods = self._ods_bytes(([('x', 1)], None), ([(None, 1)], 3))
+        dataset = tablib.Dataset().load(_ods, 'ods', headers=False)
+        self.assertEqual(dataset.height, 1)
+        self.assertEqual(dataset[0], ('x',))
+
+    def test_ods_import_keeps_interior_blank_rows(self):
+        # Blank rows inside the data range are genuine empty rows and are
+        # preserved (padded to the sheet width); only the trailing blank
+        # run is trimmed.
+        _ods = self._ods_bytes(
+            ([('a', 1)], None),
+            ([(None, 1)], 2),
+            ([('b', 1)], None),
+            ([(None, 1)], 100),
+        )
+        dataset = tablib.Dataset().load(_ods, 'ods', headers=False)
+        self.assertEqual(
+            list(dataset),
+            [('a',), ('',), ('',), ('b',)],
+        )
+
+    def test_ods_import_expands_repeated_cells(self):
+        # A cell repeated three times expands into three values.
+        _ods = self._ods_bytes(([('a', 3)], None))
+        dataset = tablib.Dataset().load(_ods, 'ods', headers=False)
+        self.assertEqual(dataset.pop(), ('a', 'a', 'a'))
+
+    def test_ods_import_repeated_blank_tail_is_trimmed(self):
+        # The empty tail of a sheet is encoded as a huge run of empty
+        # repeated cells and must not be materialized or change the width.
+        _ods = self._ods_bytes(([('a', 1), (None, 16383)], None))
+        dataset = tablib.Dataset().load(_ods, 'ods', headers=False)
+        self.assertEqual(dataset.width, 1)
+        self.assertEqual(dataset.pop(), ('a',))
+
+    def test_ods_import_plain_empty_cell_is_real_data(self):
+        # An empty cell without a repetition attribute is genuine data and
+        # is imported as an empty string, preserving row alignment.
+        _ods = self._ods_bytes(([(1, 1), None, True], None))
+        dataset = tablib.Dataset().load(_ods, 'ods', headers=False)
+        self.assertEqual(dataset.pop(), ('1', '', 'True'))
+
+    def test_ods_import_repeated_blank_rows_are_trimmed(self):
+        # Repeated empty rows form the blank sheet tail and never reach the
+        # dataset, while repeated rows with content are fully expanded.
+        _ods = self._ods_bytes(
+            ([('v', 1)], 2),
+            ([(None, 1)], 1_048_573),
+        )
+        dataset = tablib.Dataset().load(_ods, 'ods', headers=False)
+        self.assertEqual(dataset.height, 2)
+        self.assertEqual(list(dataset), [('v',), ('v',)])
+
+    def test_ods_import_row_budget_enforced_before_expansion(self):
+        _ods = self._ods_bytes(([(None, 1)], 1_048_577))
+        with self.assertRaises(tablib.ODSValidationError):
+            tablib.Dataset().load(_ods, 'ods', headers=False)
+
+    def test_ods_import_column_budget_enforced_before_expansion(self):
+        # 9_000 repeated data cells twice exceeds the 16_384 column budget
+        # while the compressed document itself stays tiny.
+        _ods = self._ods_bytes(([('a', 9_000), ('b', 9_000)], None))
+        with self.assertRaises(tablib.ODSValidationError):
+            tablib.Dataset().load(_ods, 'ods', headers=False)
+
+    def test_ods_import_invalid_cell_repeat_diagnosed(self):
+        from odf.namespaces import TABLENS
+
+        _ods = self._ods_bytes(([('a', 1)], None))
+        book = opendocument.load(BytesIO(_ods))
+        cell = book.spreadsheet.getElementsByType(table.TableCell)[0]
+        cell.attributes[(TABLENS, 'number-columns-repeated')] = '0'
+        stream = BytesIO()
+        book.save(stream)
+        with self.assertRaises(tablib.ODSValidationError):
+            tablib.Dataset().load(stream.getvalue(), 'ods', headers=False)
+
+    def test_ods_import_non_integer_cell_repeat_diagnosed(self):
+        from odf.namespaces import TABLENS
+
+        _ods = self._ods_bytes(([('a', 1)], None))
+        book = opendocument.load(BytesIO(_ods))
+        cell = book.spreadsheet.getElementsByType(table.TableCell)[0]
+        cell.attributes[(TABLENS, 'number-columns-repeated')] = 'lots'
+        stream = BytesIO()
+        book.save(stream)
+        with self.assertRaises(tablib.ODSValidationError):
+            tablib.Dataset().load(stream.getvalue(), 'ods', headers=False)
+
+    def test_ods_import_invalid_row_repeat_diagnosed(self):
+        from odf.namespaces import TABLENS
+
+        _ods = self._ods_bytes(([('a', 1)], None))
+        book = opendocument.load(BytesIO(_ods))
+        row = book.spreadsheet.getElementsByType(table.TableRow)[0]
+        row.attributes[(TABLENS, 'number-rows-repeated')] = '-2'
+        stream = BytesIO()
+        book.save(stream)
+        with self.assertRaises(tablib.ODSValidationError):
+            tablib.Dataset().load(stream.getvalue(), 'ods', headers=False)
+
+    def test_ods_import_huge_row_repeat_diagnosed_without_expansion(self):
+        # A repeat count beyond any machine-sized integer must be rejected
+        # by the budget check rather than triggering integer overflow or
+        # memory exhaustion during expansion.
+        import sys
+
+        from odf.namespaces import TABLENS
+
+        _ods = self._ods_bytes(([(None, 1)], 2))
+        book = opendocument.load(BytesIO(_ods))
+        row = book.spreadsheet.getElementsByType(table.TableRow)[0]
+        row.attributes[(TABLENS, 'number-rows-repeated')] = str(sys.maxsize + 1)
+        stream = BytesIO()
+        book.save(stream)
+        with self.assertRaises(tablib.ODSValidationError):
+            tablib.Dataset().load(stream.getvalue(), 'ods', headers=False)
+
+    def test_ods_import_covered_cell_diagnosed(self):
+        from odf.opendocument import OpenDocumentSpreadsheet
+
+        doc = OpenDocumentSpreadsheet()
+        ws = table.Table(name='Sheet1')
+        doc.spreadsheet.addElement(ws)
+        odf_row = table.TableRow()
+        ws.addElement(odf_row)
+        anchor = table.TableCell(
+            numbercolumnsspanned=2, numberrowsspanned=1, valuetype='string',
+        )
+        anchor.addElement(text.P(text='merged'))
+        odf_row.addElement(anchor)
+        odf_row.addElement(table.CoveredTableCell())
+        stream = BytesIO()
+        doc.save(stream)
+        with self.assertRaises(tablib.ODSValidationError):
+            tablib.Dataset().load(stream.getvalue(), 'ods', headers=False)
+
+    def test_ods_import_failure_keeps_existing_dataset(self):
+        dataset = tablib.Dataset(headers=('keep',))
+        dataset.append(('data',))
+        _ods = self._ods_bytes(([(None, 1)], 1_048_577))
+        with self.assertRaises(tablib.ODSValidationError):
+            dataset.load(_ods, 'ods', headers=False)
+        # The previous contents must survive a failed import untouched.
+        self.assertEqual(dataset.headers, ['keep'])
+        self.assertEqual(dataset.height, 1)
+        self.assertEqual(dataset.pop(), ('data',))
+
+    def test_ods_import_book_failure_keeps_existing_sheets(self):
+        first = tablib.Dataset(headers=('a',))
+        first.append((1,))
+        dbook = tablib.Databook([first])
+        _ods = self._ods_bytes(([(None, 1)], 1_048_577))
+        with self.assertRaises(tablib.ODSValidationError):
+            dbook.load(BytesIO(_ods), 'ods')
+        self.assertEqual(dbook.size, 1)
+        self.assertIs(dbook.sheets()[0], first)
+        self.assertEqual(dbook.sheets()[0].pop(), (1,))
+
+    def test_ods_import_formula_cell_uses_cached_value(self):
+        # A formula cell stores the formula in a table:formula child node
+        # and its cached result in office:value; tablib keeps reading the
+        # cached/displayed value according to its existing value-type rules.
+        from odf.element import Element
+        from odf.namespaces import TEXTNS
+
+        doc = opendocument.load(BytesIO(self._ods_bytes(([('x', 1)], None))))
+        cell = doc.spreadsheet.getElementsByType(table.TableCell)[0]
+        cell.setAttribute('valuetype', 'float')
+        cell.setAttribute('value', '42')
+        # Replace the paragraph text with the formula's displayed result
+        # and add the formula node, mirroring spreadsheet applications.
+        paragraph = cell.childNodes[0]
+        paragraph.childNodes[:] = []
+        paragraph.addText('42')
+        formula = Element(qname=(TEXTNS, 'table-formula'), check_grammar=False)
+        formula.attributes[(TEXTNS, 'formula')] = 'of:=1+1'
+        formula.parentNode = cell
+        cell.childNodes.append(formula)
+        stream = BytesIO()
+        doc.save(stream)
+        dataset = tablib.Dataset().load(stream.getvalue(), 'ods', headers=False)
+        self.assertEqual(dataset.pop(), (42.0,))
+        # Sanity check that the formula really was part of the document.
+        reloaded = opendocument.load(BytesIO(stream.getvalue()))
+        stored = reloaded.getElementsByType(table.TableCell)[0]
+        self.assertEqual(stored.getAttribute('value'), '42')
+        formula_qname = (TEXTNS, 'table-formula')
+        self.assertTrue(
+            any(node.qname == formula_qname for node in stored.childNodes)
+        )
 
 
 class XLSTests(BaseTestCase):
