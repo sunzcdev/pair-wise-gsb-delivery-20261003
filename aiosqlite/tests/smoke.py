@@ -256,6 +256,175 @@ class SmokeTest(IsolatedAsyncioTestCase):
                 self.assertEqual(row["k"], 1)
                 self.assertEqual(row["d"], b"hi")
 
+    async def test_cursor_async_arraysize(self):
+        """Async getter/setter round-trip and snapshot semantics."""
+        async with aiosqlite.connect(self.db) as db:
+            cursor = await db.cursor()
+            self.assertEqual(await cursor.get_arraysize(), 1)
+
+            await cursor.set_arraysize(4)
+            self.assertEqual(await cursor.get_arraysize(), 4)
+            # the synchronous compatibility property observes the same value
+            self.assertEqual(cursor.arraysize, 4)
+
+            await cursor.set_arraysize(2)
+            self.assertEqual(await cursor.get_arraysize(), 2)
+
+    async def test_cursor_async_arraysize_fetch_order(self):
+        """arraysize changes apply in connection queue order, no stale cache."""
+        async with aiosqlite.connect(self.db) as db:
+            await db.execute(
+                "create table test_arraysize_order (i integer primary key asc)"
+            )
+            await db.executemany(
+                "insert into test_arraysize_order values (?)",
+                [[i] for i in range(10)],
+            )
+            await db.commit()
+
+            cursor = await db.execute("select i from test_arraysize_order")
+            await cursor.set_arraysize(2)
+
+            # the first fetchmany uses the arraysize active when it runs
+            first = await cursor.fetchmany()
+            self.assertEqual(first, [(0,), (1,)])
+
+            # queue the next fetch before changing the setting: it must keep
+            # the old value because it is ahead of the setter in the queue
+            pending = asyncio.ensure_future(cursor.fetchmany())
+            await asyncio.sleep(0)
+            await cursor.set_arraysize(4)
+            self.assertEqual(await pending, [(2,), (3,)])
+
+            # later fetches never reuse the old value
+            self.assertEqual(await cursor.fetchmany(), [(4,), (5,), (6,), (7,)])
+            self.assertEqual(await cursor.fetchmany(), [(8,), (9,)])
+
+    async def test_cursor_async_arraysize_invalid_value(self):
+        """Invalid arraysize assignments fail and are never partially applied."""
+        async with aiosqlite.connect(self.db) as db:
+            cursor = await db.cursor()
+            await cursor.set_arraysize(3)
+
+            with self.assertRaises(TypeError):
+                await cursor.set_arraysize("not-an-int")
+
+            # the previous value is still intact, both via snapshot and sync view
+            self.assertEqual(await cursor.get_arraysize(), 3)
+            self.assertEqual(cursor.arraysize, 3)
+
+    async def test_cursor_async_row_factory(self):
+        """Async getter/setter round-trip for the row factory."""
+        async with aiosqlite.connect(self.db) as db:
+            cursor = await db.cursor()
+            self.assertIsNone(await cursor.get_row_factory())
+
+            await cursor.set_row_factory(aiosqlite.Row)
+            self.assertIs(await cursor.get_row_factory(), aiosqlite.Row)
+            self.assertIs(cursor.row_factory, aiosqlite.Row)
+
+            await cursor.set_row_factory(None)
+            self.assertIsNone(await cursor.get_row_factory())
+            self.assertIsNone(cursor.row_factory)
+
+    async def test_cursor_async_row_factory_fetch_order(self):
+        """Queued fetches use the factory active when they run, with no cache."""
+
+        def upper_row_factory(raw_cursor, row):
+            return tuple(str(value).upper() for value in row)
+
+        async with aiosqlite.connect(self.db) as db:
+            await db.execute("create table test_factory_order (k text)")
+            await db.execute("insert into test_factory_order values ('alpha')")
+            await db.execute("insert into test_factory_order values ('beta')")
+            await db.execute("insert into test_factory_order values ('gamma')")
+            await db.commit()
+
+            cursor = await db.execute("select k from test_factory_order")
+
+            # rows start as plain tuples
+            self.assertEqual(await cursor.fetchone(), ("alpha",))
+
+            # queue a fetch before changing the factory: it must use the
+            # previous (None) factory because it runs first on the worker
+            pending = asyncio.ensure_future(cursor.fetchone())
+            await asyncio.sleep(0)
+            await cursor.set_row_factory(aiosqlite.Row)
+            row = await pending
+            self.assertIsInstance(row, tuple)
+            self.assertNotIsInstance(row, aiosqlite.Row)
+            self.assertEqual(row, ("beta",))
+
+            # subsequent fetches use the new factory; nothing is cached
+            row = await cursor.fetchone()
+            self.assertIsInstance(row, aiosqlite.Row)
+            self.assertEqual(row["k"], "gamma")
+
+            # resetting to a valid factory restores rows for later fetches;
+            # row factories are per-cursor, so re-run the query on this cursor
+            await cursor.set_row_factory(upper_row_factory)
+            await cursor.execute("select k from test_factory_order")
+            self.assertEqual(await cursor.fetchone(), ("ALPHA",))
+            await cursor.set_row_factory(None)
+            self.assertEqual(await cursor.fetchone(), ("beta",))
+
+    async def test_cursor_async_row_factory_invalid_value(self):
+        """A non-callable factory fails at fetch time without residual state."""
+        async with aiosqlite.connect(self.db) as db:
+            await db.execute("create table test_bad_factory (k text)")
+            await db.executemany(
+                "insert into test_bad_factory values (?)",
+                [("alpha",), ("beta",)],
+            )
+            await db.commit()
+
+            cursor = await db.execute("select k from test_bad_factory")
+            # sqlite3 accepts any object when assigning, then raises when rows
+            # are built; the snapshot read must still report what was assigned
+            await cursor.set_row_factory(42)
+            self.assertEqual(await cursor.get_row_factory(), 42)
+            with self.assertRaises(TypeError):
+                await cursor.fetchone()
+
+            # the cursor remains usable once a valid factory is restored
+            # (the failed fetch consumed its row, so the next one is "beta")
+            await cursor.set_row_factory(None)
+            self.assertEqual(await cursor.fetchone(), ("beta",))
+
+    async def test_cursor_async_config_close_order(self):
+        """Two tasks: settings/reads queued before close work; after close fail."""
+        db = await aiosqlite.connect(self.db)
+        cursor = await db.cursor()
+        setter_done = asyncio.Event()
+
+        async def setter():
+            await cursor.set_arraysize(9)
+            await cursor.set_row_factory(aiosqlite.Row)
+            setter_done.set()
+
+        async def reader():
+            await setter_done.wait()
+            # these reads are queued ahead of close() and must observe the
+            # values applied by the setter task, in queue order
+            self.assertEqual(await cursor.get_arraysize(), 9)
+            self.assertIs(await cursor.get_row_factory(), aiosqlite.Row)
+
+        await asyncio.gather(
+            asyncio.ensure_future(setter()), asyncio.ensure_future(reader())
+        )
+
+        await db.close()
+
+        # operations queued after the connection is closed are rejected
+        with self.assertRaisesRegex(ValueError, "Connection closed"):
+            await cursor.get_arraysize()
+        with self.assertRaisesRegex(ValueError, "Connection closed"):
+            await cursor.get_row_factory()
+        with self.assertRaisesRegex(ValueError, "Connection closed"):
+            await cursor.set_arraysize(1)
+        with self.assertRaisesRegex(ValueError, "Connection closed"):
+            await cursor.set_row_factory(None)
+
     async def test_fetch_all(self):
         async with aiosqlite.connect(self.db) as db:
             await db.execute(
