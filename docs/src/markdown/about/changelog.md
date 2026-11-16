@@ -3,6 +3,14 @@ icon: lucide/scroll-text
 ---
 # Changelog
 
+## Unreleased
+
+-   **NEW**: Add `soupsieve.select_many()`, which matches many selectors against the same read-only tree in one call.
+    Each selector still gets its own results in document order, but the relationship indexes built while scanning the
+    tree (`:has()` descendant and sibling searches, `nth` positions, child indexes, etc.) are shared by all the
+    selectors instead of being rebuilt for each one. The shared state is discarded when the call returns, so no part
+    of the document is kept in the global compiled pattern cache.
+
 ## 4.1.1
 
 -   **FIX**: Improve performance of tag name matching, which runs for every element and selector.

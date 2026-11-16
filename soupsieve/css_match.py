@@ -132,6 +132,49 @@ class TreeForms(NamedTuple):
     checked: dict[tuple[int, str], bs4.Tag]
 
 
+class MatchState:
+    """
+    The relationship indexes built while matching against one read-only tree.
+
+    Each index is keyed by the identity of the elements and of the selector relation it
+    describes, so indexes built for one selector can be shared with other selectors matched
+    against the same tree without ever widening their matches: an entry is only ever reused
+    for the exact relation object that produced it, and selector independent indexes are
+    pure functions of the tree.
+
+    The state holds strong references to elements, so it must not be kept once the batch of
+    matches that shares it is done. It is only valid while the tree is not modified.
+
+    `scans` counts the elements visited by the traversals whose results are indexed, which
+    allows comparing a shared state with one state per selector to show the repeated scans
+    that were avoided.
+    """
+
+    __slots__ = (
+        'cached_meta_lang', 'cached_forms', 'cached_options', 'nth_cache', 'sib_cache',
+        'anc_cache', 'desc_cache', 'dir_cache', 'lang_cache', 'edit_cache', 'tree_cache',
+        'select_cache', 'index_cache', 'scans'
+    )
+
+    def __init__(self) -> None:
+        """Initialize."""
+
+        self.cached_meta_lang: list[tuple[str, str]] = []
+        self.cached_forms: dict[int, TreeForms] = {}
+        self.cached_options: dict[int, dict[int, bool]] = {}
+        self.nth_cache: dict[Hashable, NthState] = {}
+        self.sib_cache: dict[Hashable, int] = {}
+        self.anc_cache: dict[tuple[int, int], bool] = {}
+        self.desc_cache: dict[tuple[int, int], bool] = {}
+        self.dir_cache: dict[int, int] = {}
+        self.lang_cache: dict[int, str] = {}
+        self.edit_cache: dict[int, bool] = {}
+        self.tree_cache: dict[int, bs4.Tag] = {}
+        self.select_cache: dict[int, bs4.Tag | None] = {}
+        self.index_cache: dict[int, dict[int, int]] = {}
+        self.scans = 0
+
+
 class _DocumentNav:
     """Navigate a Beautiful Soup document."""
 
@@ -651,29 +694,33 @@ class CSSMatch(_DocumentNav):
         selectors: ct.SelectorList,
         scope: bs4.Tag | None,
         namespaces: ct.Namespaces | None,
-        flags: int
+        flags: int,
+        state: MatchState | None = None
     ) -> None:
         """Initialize."""
 
         self.assert_valid_input(scope)
         self.tag = scope
-        self.cached_meta_lang: list[tuple[str, str]] = []
-        self.cached_forms: dict[int, TreeForms] = {}
-        self.cached_options: dict[int, dict[int, bool]] = {}
+        if state is None:
+            state = MatchState()
+        self.state = state
+        self.cached_meta_lang = state.cached_meta_lang
+        self.cached_forms = state.cached_forms
+        self.cached_options = state.cached_options
         self.selectors = selectors
         self.namespaces: ct.Namespaces | dict[str, str] = {} if namespaces is None else namespaces
         self.flags = flags
         self.enable_cache = not bool(self.flags & util.NOCACHE)
-        self.nth_cache: dict[Hashable, NthState] = {}
-        self.sib_cache: dict[Hashable, int] = {}
-        self.anc_cache: dict[tuple[int, int], bool] = {}
-        self.desc_cache: dict[tuple[int, int], bool] = {}
-        self.dir_cache: dict[int, int] = {}
-        self.lang_cache: dict[int, str] = {}
-        self.edit_cache: dict[int, bool] = {}
-        self.tree_cache: dict[int, bs4.Tag] = {}
-        self.select_cache: dict[int, bs4.Tag | None] = {}
-        self.index_cache: dict[int, dict[int, int]] = {}
+        self.nth_cache = state.nth_cache
+        self.sib_cache = state.sib_cache
+        self.anc_cache = state.anc_cache
+        self.desc_cache = state.desc_cache
+        self.dir_cache = state.dir_cache
+        self.lang_cache = state.lang_cache
+        self.edit_cache = state.edit_cache
+        self.tree_cache = state.tree_cache
+        self.select_cache = state.select_cache
+        self.index_cache = state.index_cache
 
         # Find the root element for the whole tree
         doc = scope
@@ -993,6 +1040,7 @@ class CSSMatch(_DocumentNav):
 
         key = id(parent)
         if key not in self.index_cache:
+            self.state.scans += len(parent.contents)
             self.index_cache[key] = {id(child): i for i, child in enumerate(parent.contents)}
         index = self.index_cache[key].get(id(target), -1)
         return start <= index < (end if end is not None else len(parent.contents))
@@ -1038,6 +1086,7 @@ class CSSMatch(_DocumentNav):
         passed = False
         incr = -1 if reverse else 1
         for child in self.get_children(parent, start=start, reverse=reverse, template_contents=True):
+            self.state.scans += 1
             start += incr
             if not isinstance(child, bs4.Tag):
                 continue
@@ -1075,6 +1124,7 @@ class CSSMatch(_DocumentNav):
         visited: list[tuple[int, int]] = []
         parent: bs4.Tag | None = el
         while not found and parent and (parent := self.get_parent(parent)):
+            self.state.scans += 1
             key = (id(parent), id(relation))
             if key in self.anc_cache:
                 found = self.anc_cache[key]
@@ -1165,6 +1215,7 @@ class CSSMatch(_DocumentNav):
         stack = [self.get_tag_children(el)]
         while stack and not found:
             for child in stack[-1]:
+                self.state.scans += 1
                 key = (id(child), id(relation))
                 if key in self.desc_cache:
                     if self.desc_cache[key]:
@@ -1342,10 +1393,12 @@ class CSSMatch(_DocumentNav):
         else:
             pkey = id(parent)
             if pkey not in self.index_cache:
+                self.state.scans += len(contents)
                 self.index_cache[pkey] = {id(child): i for i, child in enumerate(contents)}
             end = self.index_cache[pkey][id(el)] + 1
 
         while state.pos < end:
+            self.state.scans += 1
             node = contents[state.pos]
             if self.is_tag(node) and (yield from self.match_nth_candidate(el, cast('bs4.Tag', node), n)):
                 state.count += 1
@@ -1434,6 +1487,7 @@ class CSSMatch(_DocumentNav):
         top = el
         parent = self.get_parent(top, no_doc=False, no_template=False)
         while parent is not None:
+            self.state.scans += 1
             key = id(top)
             if key in self.tree_cache:
                 top = self.tree_cache[key]
@@ -1495,6 +1549,7 @@ class CSSMatch(_DocumentNav):
         ]
         while stack:
             el, form = stack.pop()
+            self.state.scans += 1
 
             # The end of a nested form, which ends the form it is in
             if el is None:
@@ -1602,6 +1657,7 @@ class CSSMatch(_DocumentNav):
         ]
         while stack:
             el, group = stack.pop()
+            self.state.scans += 1
             name = self.get_tag(el) if self.is_html_tag(el) else None
             if name == 'select' and not self.is_xml:
                 break
@@ -1638,6 +1694,7 @@ class CSSMatch(_DocumentNav):
         visited: list[int] = []
         node = el
         while True:
+            self.state.scans += 1
             key = id(node)
             if key in self.select_cache:
                 parent = self.select_cache[key]
@@ -1692,6 +1749,7 @@ class CSSMatch(_DocumentNav):
         found_lang = None
         last = None
         while found_lang is None:
+            self.state.scans += 1
             key = id(parent)
             if key in self.lang_cache:
                 return self.lang_cache[key]
@@ -1791,6 +1849,7 @@ class CSSMatch(_DocumentNav):
         """Resolve the direction of an element."""
 
         while True:
+            self.state.scans += 1
             key = id(el)
             if key in self.dir_cache:
                 return self.dir_cache[key]
@@ -2005,6 +2064,7 @@ class CSSMatch(_DocumentNav):
         editable = False
         node = el  # type: bs4.Tag | None
         while node is not None:
+            self.state.scans += 1
             key = id(node)
             if key in self.edit_cache:
                 editable = self.edit_cache[key]
@@ -2275,3 +2335,28 @@ class SoupSieve(ct.Immutable):
 
 
 ct.pickle_register(SoupSieve)
+
+
+def select_many(compiled: Iterable[SoupSieve], tag: bs4.Tag) -> list[list[bs4.Tag]]:
+    """
+    Match many compiled selectors against the same read-only tree.
+
+    Every selector is evaluated independently and gets its own results in document order,
+    but all of them share one `MatchState`, so the relationship indexes built while matching
+    one selector (`:has()` descendant and sibling searches, `nth` positions, child indexes,
+    form info, etc.) are reused by the others instead of scanning the same nodes again.
+    Sharing cannot widen a match: relation indexes are keyed by the identity of the exact
+    selector relation that produced them, and the remaining indexes are pure functions of
+    the tree.
+
+    The shared state holds strong references to elements and is discarded when this returns,
+    so no part of the document is left in the global compiled pattern cache. The tree must
+    not be modified during the call.
+    """
+
+    _DocumentNav.assert_valid_input(tag)
+    state = MatchState()
+    results = []
+    for ss in compiled:
+        results.append(list(CSSMatch(ss.selectors, tag, ss.namespaces, ss.flags, state).select()))
+    return results

@@ -155,10 +155,34 @@ sv.select('p:is(.a, .b, .c)', soup)
 
 ```py
 def iselect(select, node, namespaces=None, limit=0, flags=0, **kwargs):
-    """Select the specified tags."""
+    """Iterate the specified tags."""
 ```
 
 `iselect` is exactly like `select` except that it returns a generator instead of a list.
+
+## `soupsieve.select_many()`
+
+```py
+def select_many(patterns, tag, namespaces=None, flags=0, **kwargs):
+    """Select the tags matching each of the patterns."""
+```
+
+`select_many` matches many selectors against the same tag in one call. It returns one list per pattern, in the order
+the patterns were given, each in document order, exactly as if [`select`](#soupsieveselect) had been called for each of
+them. Patterns can be CSS selector strings, compiled selectors, or a mix of both.
+
+Matching many selectors that use `:has()` or sibling combinators one at a time traverses the same nodes over and over.
+`select_many` shares the relationship indexes built while scanning the tree between all the selectors, so each node is
+scanned far fewer times. Sharing an index never widens a selector's matches: each selector is still evaluated
+independently, including nested `:has()`, adjacent sibling, and namespace conditions.
+
+The tree must not be modified during the call. The shared state is discarded when the call returns; only the compiled
+patterns are kept in the global cache, never the document.
+
+```py play session="example1"
+import soupsieve as sv
+sv.select_many(['p:has(+ p)', 'p + p'], soup)
+```
 
 ## `soupsieve.closest()`
 

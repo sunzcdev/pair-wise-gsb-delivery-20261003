@@ -36,7 +36,7 @@ from typing import Any, Mapping, Iterator, Iterable, cast
 
 __all__ = (
     'DEBUG', 'NOCACHE', 'NOSTRICT', 'SelectorSyntaxError', 'CustomSelectors', 'SoupSieve',
-    'closest', 'compile', 'filter', 'iselect', 'match', 'select', 'select_one'
+    'closest', 'compile', 'filter', 'iselect', 'match', 'select', 'select_many', 'select_one'
 )
 
 SoupSieve = cm.SoupSieve
@@ -226,6 +226,45 @@ def iselect(
         max_selectors=max_selectors,
         **kwargs
     ).iselect(tag, limit)
+
+
+def select_many(
+    patterns: Iterable[str | SoupSieve],
+    tag: bs4.Tag,
+    namespaces: dict[str, str] | None = None,
+    flags: int = 0,
+    *,
+    custom: Mapping[str, str | ct.SelectorList] | None = None,
+    ignore: Iterable[str] | None = None,
+    max_selectors: int = cp.SELECTOR_LIMIT,
+    **kwargs: Any
+) -> list[list[bs4.Tag]]:
+    """
+    Select the tags matching each of the patterns against the same read-only tree.
+
+    Returns one list per pattern, in the order the patterns were given, each in document
+    order, exactly as if `select` had been called for each of them. The selectors share the
+    relationship indexes built while scanning the tree, so many selectors with `:has()` or
+    sibling combinators do not each traverse the same nodes again. Sharing an index never
+    widens a selector's matches.
+
+    The tree must not be modified during the call. The shared state is discarded when the
+    call returns; only the compiled patterns are kept in the global cache, never the
+    document.
+    """
+
+    compiled = [
+        compile(
+            pattern,
+            namespaces,
+            flags,
+            custom=custom,
+            ignore=ignore,
+            max_selectors=max_selectors,
+            **kwargs
+        ) for pattern in patterns
+    ]
+    return cm.select_many(compiled, tag)
 
 
 def escape(ident: str) -> str:
