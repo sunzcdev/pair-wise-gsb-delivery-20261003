@@ -21,6 +21,11 @@ Our exception hierarchy:
       - UnsupportedProtocol
     + DecodingError
     + TooManyRedirects
+    + DigestError
+      - DigestFormatError
+      - DigestMismatchError
+      - DigestUnverifiedError
+        · DigestInterruptedError
   x HTTPStatusError
 * InvalidURL
 * CookieConflict
@@ -45,6 +50,11 @@ __all__ = [
     "ConnectTimeout",
     "CookieConflict",
     "DecodingError",
+    "DigestError",
+    "DigestFormatError",
+    "DigestInterruptedError",
+    "DigestMismatchError",
+    "DigestUnverifiedError",
     "HTTPError",
     "HTTPStatusError",
     "InvalidURL",
@@ -249,6 +259,56 @@ class DecodingError(RequestError):
 class TooManyRedirects(RequestError):
     """
     Too many redirects.
+    """
+
+
+# Digest verification exceptions...
+
+
+class DigestError(RequestError):
+    """
+    Base class for digest verification errors.
+
+    Raised when verifying the digest of a downloaded response body
+    against a server-declared expected value.
+    """
+
+
+class DigestFormatError(DigestError, ValueError):
+    """
+    The digest algorithm or expected digest value was malformed.
+
+    Raised when the verification wrapper is created, before any
+    content is streamed.
+    """
+
+
+class DigestMismatchError(DigestError):
+    """
+    The digest computed over the downloaded content did not match the
+    expected digest once the stream reached EOF.
+
+    Any bytes that were already streamed to the caller before the
+    mismatch was detected cannot be retracted.
+    """
+
+
+class DigestUnverifiedError(DigestError):
+    """
+    The stream was closed before reaching EOF, so the digest could not
+    be verified.
+
+    A partially read prefix of the content must never be treated as
+    verified.
+    """
+
+
+class DigestInterruptedError(DigestUnverifiedError):
+    """
+    The transfer was interrupted by an underlying error before EOF, so
+    the digest could not be verified.
+
+    The original transport error is available as `__cause__`.
     """
 
 

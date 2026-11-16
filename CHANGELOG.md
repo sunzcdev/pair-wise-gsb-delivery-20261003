@@ -13,6 +13,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 ### Added
 
 * Expose `FunctionAuth` from the public API. (#3699)
+* Add optional digest verification for downloads, via `httpx.SyncDigestStream` and `httpx.AsyncDigestStream`, which wrap the raw response stream and confirm a caller-specified algorithm and expected digest once the stream reaches EOF.
 
 ## 0.28.1 (6th December, 2024)
 

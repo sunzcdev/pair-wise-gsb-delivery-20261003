@@ -4,6 +4,7 @@ from ._auth import *
 from ._client import *
 from ._config import *
 from ._content import *
+from ._digest import *
 from ._exceptions import *
 from ._models import *
 from ._status_codes import *
@@ -34,6 +35,7 @@ __all__ = [
     "AsyncBaseTransport",
     "AsyncByteStream",
     "AsyncClient",
+    "AsyncDigestStream",
     "AsyncHTTPTransport",
     "Auth",
     "BaseTransport",
@@ -50,6 +52,12 @@ __all__ = [
     "DecodingError",
     "delete",
     "DigestAuth",
+    "DigestError",
+    "DigestFormatError",
+    "DigestInterruptedError",
+    "DigestMismatchError",
+    "DigestUnverifiedError",
+    "DigestVerifier",
     "FunctionAuth",
     "get",
     "head",
@@ -87,6 +95,7 @@ __all__ = [
     "StreamConsumed",
     "StreamError",
     "SyncByteStream",
+    "SyncDigestStream",
     "Timeout",
     "TimeoutException",
     "TooManyRedirects",

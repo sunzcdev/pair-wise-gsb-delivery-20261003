@@ -384,6 +384,31 @@ If you're using streaming responses in any of these ways then the `response.cont
 ...         print(r.text)
 ```
 
+## Verifying Download Digests
+
+When a server declares a digest of the content it is serving, for example through a `Content-Digest` header, you may want to verify the downloaded bytes against that declaration. HTTPX provides an optional digest verification wrapper that you can apply around the raw response stream, explicitly specifying the algorithm and the expected digest:
+
+```pycon
+>>> with httpx.stream("GET", "https://www.example.com/file.zip") as r:
+...     r.stream = httpx.SyncDigestStream(r.stream, algorithm="sha256", expected=expected_hex_digest)
+...     content = r.read()  # Raises `httpx.DigestMismatchError` at EOF if the digest does not match.
+...     assert r.stream.verified
+```
+
+For async clients, use `httpx.AsyncDigestStream` in the same way.
+
+The digest accumulates incrementally as the raw body streams in, and is only confirmed once the stream reaches EOF. Reading the response with `.read()` and iterating over it chunk-by-chunk share the same digest computation, since both consume the same underlying stream.
+
+Some important points to be aware of:
+
+* Verification is confirmed **only at EOF**. Content is still delivered chunk-by-chunk as it arrives, so any bytes that were already consumed before a `DigestMismatchError` is raised **cannot be retracted**. Digest verification does not make the download atomic: if you need all-or-nothing semantics, buffer the content yourself and only use it once the stream has completed without error.
+* Closing the response before EOF leaves the digest **unverified**. A partially read prefix of the content must never be treated as a successful verification. You can check `stream.verified`, or call `stream.verify()` to raise if the digest was not confirmed.
+* Failures are reported distinctly:
+    * `httpx.DigestFormatError` — the algorithm name or expected digest was malformed. Raised when the wrapper is created, before anything is downloaded.
+    * `httpx.DigestMismatchError` — the stream reached EOF, but the computed digest did not match the expected digest.
+    * `httpx.DigestInterruptedError` — raised by `stream.verify()` if the transfer was interrupted by an underlying network error before EOF. The original error propagates unchanged during iteration, and is available as `__cause__`.
+    * `httpx.DigestUnverifiedError` — raised by `stream.verify()` if the stream was closed before EOF.
+
 ## Cookies
 
 Any cookies that are set on the response can be easily accessed:
