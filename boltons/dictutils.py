@@ -67,6 +67,7 @@ thanks to `Mark Williams`_ for all his help.
 
 """
 
+from collections import namedtuple
 from collections.abc import KeysView, ValuesView, ItemsView
 from itertools import zip_longest
 
@@ -80,7 +81,8 @@ except ImportError:
 PREV, NEXT, KEY, VALUE, SPREV, SNEXT = range(6)
 
 
-__all__ = ['MultiDict', 'OMD', 'OrderedMultiDict', 'OneToOne', 'ManyToMany', 'subdict', 'FrozenDict']
+__all__ = ['MultiDict', 'OMD', 'OrderedMultiDict', 'OneToOne', 'ManyToMany',
+           'ManyToManyDiff', 'subdict', 'FrozenDict']
 
 
 class OrderedMultiDict(dict):
@@ -904,6 +906,34 @@ class OneToOne(dict):
         return f"{cn}({dict_repr})"
 
 
+class ManyToManyDiff(namedtuple('ManyToManyDiff', ('added', 'removed'))):
+    """The result of :meth:`ManyToMany.update_targets` (and its
+    single-source shortcut, :meth:`ManyToMany.set_targets`).
+
+    It is a two-tuple of the *actual* relation changes made by one
+    batch update: ``added`` and ``removed`` are :class:`frozenset`
+    instances holding ``(source, target)`` pairs, oriented like the
+    :class:`ManyToMany` that was updated. Edges that were already
+    present (or already absent) are not reported, and a repeated
+    input edge is reported at most once. A batch that changes
+    nothing yields an empty, falsey diff:
+
+    >>> bool(ManyToManyDiff(added=frozenset(), removed=frozenset()))
+    False
+    >>> diff = ManyToMany([('a', 'b')]).set_targets('a', ['b', 'c'])
+    >>> sorted(diff.added), sorted(diff.removed)
+    ([('a', 'c')], [])
+    >>> bool(diff)
+    True
+
+    Instances compare and unpack like any other two-tuple.
+    """
+    __slots__ = ()
+
+    def __bool__(self):
+        return bool(self.added or self.removed)
+
+
 # marker for the secret handshake used internally to set up the invert ManyToMany
 _PAIRING = object()
 
@@ -917,6 +947,12 @@ class ManyToMany:
     up to date which is a dict-of-tuples in the other direction
 
     also, can be used as a directed graph among hashable python objects
+
+    single edges are managed with :meth:`add`, :meth:`remove`, and
+    :meth:`replace`. To replace a whole target set at once and learn
+    which edges were added or removed, use :meth:`set_targets` (one
+    source) or :meth:`update_targets` (a batch), both of which return a
+    :class:`ManyToManyDiff` and update ``.inv`` in place.
     """
     def __init__(self, items=None):
         self.data = {}
@@ -1005,6 +1041,168 @@ class ManyToMany:
             revset = self.inv.data[val]
             revset.remove(key)
             revset.add(newkey)
+
+    def set_targets(self, source, targets):
+        """Replace *all* the targets of *source* in one step, returning
+        a :class:`ManyToManyDiff` of the edges that actually changed.
+
+        *targets* is an iterable of nodes to relate to *source*, or
+        ``None`` for "no targets". Repeated targets are collapsed, so
+        each edge is added (or reported) at most once. Self-relations
+        are allowed; because nodes are compared like dict keys, a
+        source and a target that are equal are one node, not two::
+
+        >>> m2m = ManyToMany([('orders', 'amount'), ('orders', 'currency')])
+        >>> diff = m2m.set_targets('orders', ['amount', 'customer'])
+        >>> sorted(diff.added)
+        [('orders', 'customer')]
+        >>> sorted(diff.removed)
+        [('orders', 'currency')]
+        >>> sorted(m2m['orders'])
+        ['amount', 'customer']
+        >>> 'currency' in m2m.inv
+        False
+
+        The reverse adjacency is updated in the same step, and
+        ``m2m.inv`` stays the same object, so references to it taken
+        earlier see the change::
+
+        >>> inv = m2m.inv
+        >>> m2m.set_targets('orders', ['customer'])
+        ManyToManyDiff(added=frozenset(), removed=frozenset({('orders', 'amount')}))
+        >>> inv is m2m.inv
+        True
+        >>> sorted(inv['customer'])
+        ['orders']
+
+        Passing an empty iterable (or ``None``) removes every edge of
+        *source*. :class:`ManyToMany` does not store empty adjacency
+        sets, so a source explicitly left without targets ends up just
+        like a node that was never seen: absent from both directions,
+        with :meth:`get` returning an empty :class:`frozenset`::
+
+        >>> bool(m2m.set_targets('orders', []))
+        True
+        >>> 'orders' in m2m, 'orders' in m2m.inv
+        (False, False)
+        >>> m2m.get('orders') == frozenset()
+        True
+
+        Setting a node that is not yet present to no targets is a
+        no-op with an empty diff::
+
+        >>> bool(m2m.set_targets('never-seen', []))
+        False
+
+        The whole replacement is validated before anything is
+        committed, so an unhashable node, a non-iterable *targets*
+        value, or a *targets* iterator that raises leaves the relation
+        untouched. Note that *targets* is always an iterable of nodes:
+        a plain string is read as an iterable of characters, so wrap a
+        single string target in a list (``['customer']``). See
+        :meth:`update_targets` for the multi-source batch.
+        """
+        return self.update_targets([(source, targets)])
+
+    def update_targets(self, source_targets):
+        """Replace the targets of several sources in one atomic batch,
+        returning a :class:`ManyToManyDiff` of the actual edge changes.
+
+        *source_targets* is a mapping of source to the iterable of its
+        new targets, or an iterable of ``(source, targets)`` pairs
+        (for example, another :class:`ManyToMany`, whose keys map to
+        frozensets of targets). Only the sources listed are touched;
+        each listed source has its complete target set replaced, as
+        with :meth:`set_targets`. If a source is repeated in an
+        iterable input, the last entry wins:
+
+        >>> m2m = ManyToMany([('orders', 'amount'), ('orders', 'currency'),
+        ...                   ('refunds', 'amount')])
+        >>> diff = m2m.update_targets({'orders': ['amount', 'customer'],
+        ...                            'refunds': ['amount', 'customer']})
+        >>> sorted(diff.added)
+        [('orders', 'customer'), ('refunds', 'customer')]
+        >>> sorted(diff.removed)
+        [('orders', 'currency')]
+        >>> sorted(m2m.inv['customer'])
+        ['orders', 'refunds']
+        >>> sorted(m2m.inv['amount'])
+        ['orders', 'refunds']
+
+        Only edges that really changed are reported: an edge that was
+        already present is not in ``added``, an edge that was already
+        gone is not in ``removed``, and a repeated input edge shows up
+        once. Self-relations work, and are a single edge even if the
+        target is passed repeatedly or is an equal-but-distinct object::
+
+        >>> m2m = ManyToMany()
+        >>> diff = m2m.set_targets('a', ['a', 'a', ''.join(['a'])])
+        >>> diff.added == frozenset({('a', 'a')})
+        True
+        >>> m2m['a'] == m2m.inv['a'] == frozenset(['a'])
+        True
+
+        The whole batch is materialized and validated before the
+        relation is mutated. If iterating a source's targets (or the
+        batch itself) raises, includes an unhashable node, or yields a
+        malformed entry, nothing is committed -- neither the forward
+        sets nor the reverse adjacency change.
+
+        Both directions are updated in place, and ``self.inv`` keeps
+        its identity, so previously obtained inverse views observe the
+        same change. Because the inverse is a full
+        :class:`ManyToMany` itself, this method also works on it,
+        replacing the set of sources that point at a target::
+
+        >>> m2m = ManyToMany([('a', 1), ('b', 1)])
+        >>> diff = m2m.inv.set_targets(1, ['b'])
+        >>> sorted(diff.removed)
+        [(1, 'a')]
+        >>> sorted(m2m.get('a'))
+        []
+        >>> sorted(m2m['b'])
+        [1]
+        """
+        if callable(getattr(source_targets, 'keys', None)):
+            batch = [(source, source_targets[source])
+                     for source in source_targets.keys()]
+        else:
+            # materialize the outer input up front for the same
+            # all-or-nothing reason as the inner target iterables
+            batch = list(source_targets)
+
+        # validate and normalize the entire batch before any mutation
+        plan = {}
+        for source, targets in batch:
+            hash(source)  # raises TypeError for unhashable sources
+            if targets is None:
+                targets = ()
+            new_targets = set()
+            for target in targets:
+                hash(target)  # raises TypeError for unhashable targets
+                new_targets.add(target)
+            # a repeated source resolves to its last entry, the same
+            # as applying the replacements in order
+            plan[source] = new_targets
+
+        added, removed = set(), set()
+        for source, new_targets in plan.items():
+            old_targets = self.data.get(source, frozenset())
+            for target in old_targets - new_targets:
+                removed.add((source, target))
+            for target in new_targets - old_targets:
+                added.add((source, target))
+
+        # commit; both sides are mutated in place so self.inv (and any
+        # reference to it) stays live, and every diffed edge exists in
+        # exactly the direction it was diffed from
+        for source, target in removed:
+            self.remove(source, target)
+        for source, target in added:
+            self.add(source, target)
+
+        return ManyToManyDiff(added=frozenset(added),
+                              removed=frozenset(removed))
 
     def iteritems(self):
         for key in self.data:

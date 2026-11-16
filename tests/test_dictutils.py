@@ -1,7 +1,7 @@
 import sys
 import pytest
 
-from boltons.dictutils import OMD, OneToOne, ManyToMany, FrozenDict, subdict, FrozenHashError
+from boltons.dictutils import OMD, OneToOne, ManyToMany, ManyToManyDiff, FrozenDict, subdict, FrozenHashError
 from boltons.urlutils import QueryParamDict
 
 
@@ -552,6 +552,241 @@ def test_many_to_many_replace_existing_key():
     assert m2m['new'] == frozenset([1, 2])
     assert m2m.inv[1] == frozenset(['new'])
     assert m2m.inv[2] == frozenset(['new'])
+
+
+def test_many_to_many_set_targets_replaces_and_diffs():
+    m2m = ManyToMany([('orders', 'amount'), ('orders', 'currency'),
+                      ('orders', 'customer'), ('refunds', 'amount')])
+    inv = m2m.inv
+
+    diff = m2m.set_targets('orders', ['amount', 'customer', 'region'])
+
+    assert isinstance(diff, ManyToManyDiff)
+    assert diff.added == frozenset([('orders', 'region')])
+    assert diff.removed == frozenset([('orders', 'currency')])
+    assert m2m['orders'] == frozenset(['amount', 'customer', 'region'])
+    assert 'currency' not in m2m.inv
+    assert m2m.inv['region'] == frozenset(['orders'])
+    # the inverse object is updated in place, not replaced
+    assert inv is m2m.inv
+    assert inv['region'] == frozenset(['orders'])
+    assert inv['amount'] == frozenset(['orders', 'refunds'])
+
+
+def test_many_to_many_set_targets_no_change_is_empty_diff():
+    m2m = ManyToMany([('a', 1), ('a', 2)])
+    diff = m2m.set_targets('a', [2, 1])
+    assert not diff
+    assert diff.added == frozenset()
+    assert diff.removed == frozenset()
+    assert m2m['a'] == frozenset([1, 2])
+
+
+def test_many_to_many_set_targets_duplicates_and_generators():
+    m2m = ManyToMany()
+    diff = m2m.set_targets('a', iter(['x', 'x', 'y', 'x']))
+    assert diff.added == frozenset([('a', 'x'), ('a', 'y')])
+    assert diff.removed == frozenset()
+    assert m2m['a'] == frozenset(['x', 'y'])
+    assert m2m.inv['x'] == frozenset(['a'])
+    assert m2m.inv['y'] == frozenset(['a'])
+
+    # a repeated input edge that is already present is not re-reported
+    assert not m2m.set_targets('a', ['x', 'x', 'y'])
+
+
+def test_many_to_many_set_targets_self_relation():
+    class Node:
+        def __init__(self, name):
+            self.name = name
+
+        def __hash__(self):
+            return hash(self.name)
+
+        def __eq__(self, other):
+            return type(self) is type(other) and self.name == other.name
+
+        def __repr__(self):
+            return 'Node(%r)' % self.name
+
+    m2m = ManyToMany()
+    node = Node('self')
+    alias = Node('self')  # equal but a distinct object
+
+    diff = m2m.set_targets(node, [node, alias, Node('self')])
+
+    # equal nodes are one node: exactly one self-edge, counted once
+    assert diff.added == frozenset([(node, node)])
+    assert len(m2m) == 1
+    assert m2m[node] == frozenset([node])
+    assert m2m.inv[node] == frozenset([node])
+    assert m2m.inv is not None and len(list(m2m.iteritems())) == 1
+
+
+def test_many_to_many_set_targets_empty_and_unseen():
+    m2m = ManyToMany([('a', 1), ('a', 2), ('b', 1)])
+    diff = m2m.set_targets('a', [])
+    assert diff.removed == frozenset([('a', 1), ('a', 2)])
+    assert diff.added == frozenset()
+    assert 'a' not in m2m
+    assert 'a' not in m2m.inv
+    assert m2m.get('a') == frozenset()
+    assert m2m.inv[1] == frozenset(['b'])
+
+    # explicitly target-less and never-seen are indistinguishable
+    assert m2m.get('a') == m2m.get('never-seen')
+    assert not m2m.set_targets('never-seen', [])
+    assert not m2m.set_targets('never-seen', None)
+
+
+def test_many_to_many_set_targets_none_clears():
+    m2m = ManyToMany([('a', 1)])
+    diff = m2m.set_targets('a', None)
+    assert diff.removed == frozenset([('a', 1)])
+    assert 'a' not in m2m
+    assert 1 not in m2m.inv
+
+
+def test_many_to_many_set_targets_atomic_on_bad_input():
+    m2m = ManyToMany([('a', 1), ('b', 2)])
+    before = (ManyToMany(m2m), ManyToMany(m2m.inv))
+    inv_id = id(m2m.inv)
+
+    def bad_targets():
+        yield 3
+        yield []  # unhashable, midway through the batch
+
+    with pytest.raises(TypeError):
+        m2m.set_targets('a', bad_targets())
+
+    assert m2m == before[0]
+    assert m2m.inv == before[1]
+    assert id(m2m.inv) == inv_id
+
+    with pytest.raises(TypeError):
+        m2m.set_targets([], ['x'])
+
+    assert m2m == before[0]
+
+
+def test_many_to_many_set_targets_atomic_on_iteration_error():
+    m2m = ManyToMany([('a', 1)])
+    before = ManyToMany(m2m)
+
+    def exploding():
+        yield 2
+        raise RuntimeError('source iterator failed midway')
+
+    with pytest.raises(RuntimeError, match='failed midway'):
+        m2m.set_targets('a', exploding())
+
+    assert m2m == before
+    assert m2m['a'] == frozenset([1])
+    assert 2 not in m2m.inv
+
+
+def test_many_to_many_update_targets_batch():
+    m2m = ManyToMany([('orders', 'amount'), ('orders', 'currency'),
+                      ('refunds', 'amount')])
+    diff = m2m.update_targets({'orders': ['amount', 'customer'],
+                               'refunds': ['amount', 'customer'],
+                               'invoices': []})
+
+    assert diff.added == frozenset([('orders', 'customer'),
+                                    ('refunds', 'customer')])
+    assert diff.removed == frozenset([('orders', 'currency')])
+    assert m2m['orders'] == frozenset(['amount', 'customer'])
+    assert m2m['refunds'] == frozenset(['amount', 'customer'])
+    assert 'invoices' not in m2m
+    assert m2m.inv['customer'] == frozenset(['orders', 'refunds'])
+    assert m2m.inv.get('currency') == frozenset()
+
+
+def test_many_to_many_update_targets_iterable_pairs():
+    m2m = ManyToMany([('a', 1), ('a', 2), ('b', 1)])
+    diff = m2m.update_targets([('a', [2, 3]), ('b', None)])
+
+    assert diff.added == frozenset([('a', 3)])
+    assert diff.removed == frozenset([('a', 1), ('b', 1)])
+    assert m2m['a'] == frozenset([2, 3])
+    assert 'b' not in m2m
+    assert m2m.inv.get(1) == frozenset()
+
+
+def test_many_to_many_update_targets_last_entry_wins():
+    m2m = ManyToMany([('a', 1)])
+    diff = m2m.update_targets([('a', [2]), ('a', [1])])
+    assert not diff
+    assert m2m['a'] == frozenset([1])
+
+
+def test_many_to_many_update_targets_from_mapping():
+    source = ManyToMany([('a', 1), ('b', 2)])
+    m2m = ManyToMany()
+    diff = m2m.update_targets(source)
+    assert diff.added == frozenset([('a', 1), ('b', 2)])
+    assert m2m == source
+    assert m2m.inv == source.inv
+    assert m2m is not source and m2m.inv is not source.inv
+
+
+def test_many_to_many_update_targets_atomic_multi_source():
+    m2m = ManyToMany([('a', 1), ('b', 2)])
+    before = ManyToMany(m2m)
+    inv_before = ManyToMany(m2m.inv)
+
+    def bad():
+        yield 3
+        raise ValueError('bad source data')
+
+    with pytest.raises(ValueError, match='bad source data'):
+        m2m.update_targets({'a': [9], 'b': bad()})
+
+    assert m2m == before
+    assert m2m.inv == inv_before
+    assert 9 not in m2m.inv
+
+
+def test_many_to_many_diff_contract():
+    diff = ManyToManyDiff(added=frozenset([('a', 1)]), removed=frozenset())
+    assert bool(diff)
+    assert tuple(diff) == (frozenset([('a', 1)]), frozenset())
+    assert diff == (frozenset([('a', 1)]), frozenset())
+    assert not bool(ManyToManyDiff(frozenset(), frozenset()))
+
+    added, removed = diff
+    assert added == frozenset([('a', 1)])
+    assert removed == frozenset()
+
+
+def test_many_to_many_inverse_identity_preserved():
+    m2m = ManyToMany([('a', 1), ('b', 1)])
+    inv = m2m.inv
+    fwd = inv.inv
+
+    diff = m2m.update_targets({'a': [2]})
+
+    assert inv is m2m.inv
+    assert fwd is m2m
+    assert inv[2] == frozenset(['a'])
+    assert inv[1] == frozenset(['b'])
+    assert inv.get(3) == frozenset()
+    assert diff.added == frozenset([('a', 2)])
+    assert diff.removed == frozenset([('a', 1)])
+
+
+def test_many_to_many_single_edge_api_unchanged():
+    m2m = ManyToMany()
+    m2m.add('a', 1)
+    m2m.add('a', 2)
+    assert m2m['a'] == frozenset([1, 2])
+    m2m.remove('a', 1)
+    assert m2m['a'] == frozenset([2])
+    m2m.replace('a', 'b')
+    assert 'a' not in m2m
+    assert m2m['b'] == frozenset([2])
+    with pytest.raises(TypeError):
+        m2m.add('b', [])
 
 
 def test_frozendict():

@@ -14,6 +14,7 @@ _(unreleased)_
 - Added timezone suffix support (`Z`, `+HH:MM`, `-HHMM`, optional seconds) to [`timeutils.isoparse`][timeutils.isoparse], returning aware datetimes so aware `isoformat()` output round-trips ([#594](https://github.com/mahmoud/boltons/pull/594))
 - Added keyword-only support to [`funcutils.wraps`][funcutils.wraps] `expected` via `(name, default, kwonly)` triples ([#522](https://github.com/mahmoud/boltons/pull/522))
 - Added [`iterutils.chunked_filter`][iterutils.chunked_filter], which filters an iterable in batches, calling the predicate once per batch ([#491](https://github.com/mahmoud/boltons/pull/491))
+- Added [`dictutils.ManyToMany.set_targets`][dictutils.ManyToMany.set_targets] and [`dictutils.ManyToMany.update_targets`][dictutils.ManyToMany.update_targets], which atomically replace the targets of one or more sources in both directions and return a [`dictutils.ManyToManyDiff`][dictutils.ManyToManyDiff] of the edges actually added and removed
 - Fixed [`listutils.BarrelList`][listutils.BarrelList] pickling and `copy.copy`/`copy.deepcopy` (hang/duplication) by adding `__reduce__` ([#596](https://github.com/mahmoud/boltons/pull/596))
 - Fixed [`listutils.BarrelList`][listutils.BarrelList] rich comparisons (`==`, `!=`, `<`, `<=`, `>`, `>=`) comparing empty base-list storage instead of contents ([#544](https://github.com/mahmoud/boltons/pull/544))
 - Fixed [`listutils.BarrelList`][listutils.BarrelList] `+`, `+=`, `*` and `*=` operating on empty base-list storage ([#540](https://github.com/mahmoud/boltons/pull/540), [#532](https://github.com/mahmoud/boltons/pull/532))
@@ -1242,6 +1243,9 @@ added in this release.
 [dictutils.OrderedMultiDict.get_inverted]: http://boltons.readthedocs.org/en/latest/dictutils.html#boltons.dictutils.OrderedMultiDict.get_inverted
 [dictutils.OneToOne]: http://boltons.readthedocs.org/en/latest/dictutils.html#boltons.dictutils.OneToOne
 [dictutils.ManyToMany]: http://boltons.readthedocs.org/en/latest/dictutils.html#boltons.dictutils.ManyToMany
+[dictutils.ManyToMany.set_targets]: http://boltons.readthedocs.org/en/latest/dictutils.html#boltons.dictutils.ManyToMany.set_targets
+[dictutils.ManyToMany.update_targets]: http://boltons.readthedocs.org/en/latest/dictutils.html#boltons.dictutils.ManyToMany.update_targets
+[dictutils.ManyToManyDiff]: http://boltons.readthedocs.org/en/latest/dictutils.html#boltons.dictutils.ManyToManyDiff
 [dictutils.FrozenDict]: http://boltons.readthedocs.org/en/latest/dictutils.html#boltons.dictutils.FrozenDict
 [dictutils.subdict]: http://boltons.readthedocs.org/en/latest/dictutils.html#boltons.dictutils.subdict
 [ecoutils]: http://boltons.readthedocs.org/en/latest/ecoutils.html
