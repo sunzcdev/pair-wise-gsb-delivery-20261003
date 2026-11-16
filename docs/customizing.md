@@ -16,6 +16,24 @@ When the {meth}`list_structure_factory() <cattrs.cols.list_structure_factory>`
 is applied to the `list[int]` type to produce a hook, it will retrieve and store
 the hook for `int`, which should be already present.
 
+Generated hooks remember which types they depend on: the fields of _attrs_ classes and dataclasses,
+nested container elements, generic arguments and recursive references are all tracked.
+When a hook is (re)registered for a type, only the generated hooks transitively depending on that
+type are invalidated and regenerated on their next use; cached hooks for unrelated types are kept.
+This works in both the structuring and unstructuring directions, and each converter keeps its own
+dependency graph so registering a hook on one converter never affects another.
+Use {meth}`Converter.invalidate_structure_hook() <cattrs.BaseConverter.invalidate_structure_hook>`
+and {meth}`Converter.invalidate_unstructure_hook() <cattrs.BaseConverter.invalidate_unstructure_hook>`
+to apply the same invalidation manually.
+
+Hooks already retrieved through {meth}`Converter.get_structure_hook() <cattrs.BaseConverter.get_structure_hook>`
+or {meth}`Converter.get_unstructure_hook() <cattrs.BaseConverter.get_unstructure_hook>` keep the behavior
+they captured at creation time; cache invalidation cannot change a function object already held by a caller.
+Fetch a fresh hook to observe newly registered hooks.
+The {class}`BaseConverter <cattrs.BaseConverter>` does not generate specialized hooks, so it resolves
+field types at call time and always picks up the latest registrations.
+
+
 ## Custom (Un-)structuring Hooks
 
 You can write your own structuring and unstructuring functions and register them for types using {meth}`Converter.register_structure_hook() <cattrs.BaseConverter.register_structure_hook>` and {meth}`Converter.register_unstructure_hook() <cattrs.BaseConverter.register_unstructure_hook>`.

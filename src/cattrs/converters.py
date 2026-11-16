@@ -393,6 +393,8 @@ class BaseConverter:
         .. versionchanged:: 25.1.0
             Modern type aliases are now supported.
         .. versionchanged:: NEXT
+            Registering a hook now only invalidates generated hooks that depend
+            on the given type, instead of the entire hook cache.
             Individual Python 3.15+ sentinel instances are now supported.
         """
         if func is None:
@@ -416,6 +418,26 @@ class BaseConverter:
         else:
             self._unstructure_func.register_cls_list([(cls, func)])
         return None
+
+    def invalidate_unstructure_hook(self, cl: Any) -> set[Any]:
+        """Drop the cached unstructuring hook for ``cl`` and its dependents.
+
+        Generated hooks capture the unstructuring hooks of the types they use
+        (attributes, generic arguments and nested container elements). This
+        method removes the hook cached for ``cl`` together with every generated
+        hook transitively depending on it; unrelated cached hooks are kept.
+        The invalidated types are regenerated lazily on their next use.
+
+        Hooks already handed out via
+        {meth}`get_unstructure_hook` keep their captured behavior; callers
+        wanting the new behavior must fetch a fresh hook, rather than relying on
+        another converter's cache being modified.
+
+        :return: The types whose cached unstructuring hooks were invalidated.
+
+        .. versionadded:: NEXT
+        """
+        return self._unstructure_func.invalidate(cl)
 
     def register_unstructure_hook_func(
         self, check_func: Predicate, func: UnstructureHook
@@ -536,6 +558,8 @@ class BaseConverter:
         .. versionchanged:: 25.1.0
             Modern type aliases are now supported.
         .. versionchanged:: NEXT
+            Registering a hook now only invalidates generated hooks that depend
+            on the given type, instead of the entire hook cache.
             Individual Python 3.15+ sentinel instances are now supported.
         """
         if func is None:
@@ -549,7 +573,8 @@ class BaseConverter:
             resolve_types(cl)
         if is_union_type(cl):
             self._union_struct_registry[cl] = func
-            self._structure_func.clear_cache()
+            # Only hooks depending on this exact union type are stale.
+            self._structure_func.invalidate(cl)
         elif is_type_alias(cl) or is_sentinel(cl):
             # Type aliases and sentinel instances are special-cased.
             self._structure_func.register_func_list([(lambda t: t is cl, func)])
@@ -559,6 +584,26 @@ class BaseConverter:
         else:
             self._structure_func.register_cls_list([(cl, func)])
         return None
+
+    def invalidate_structure_hook(self, cl: Any) -> set[Any]:
+        """Drop the cached structuring hook for ``cl`` and its dependents.
+
+        Generated hooks capture the structuring hooks of the types they use
+        (attributes, generic arguments and nested container elements). This
+        method removes the hook cached for ``cl`` together with every generated
+        hook transitively depending on it; unrelated cached hooks are kept.
+        The invalidated types are regenerated lazily on their next use.
+
+        Hooks already handed out via
+        {meth}`get_structure_hook` keep their captured behavior; callers
+        wanting the new behavior must fetch a fresh hook, rather than relying on
+        another converter's cache being modified.
+
+        :return: The types whose cached structuring hooks were invalidated.
+
+        .. versionadded:: NEXT
+        """
+        return self._structure_func.invalidate(cl)
 
     def register_structure_hook_func(
         self, check_func: Predicate, func: StructureHook

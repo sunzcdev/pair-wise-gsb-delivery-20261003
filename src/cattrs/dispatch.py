@@ -1,7 +1,8 @@
 from __future__ import annotations
 
-from functools import lru_cache, singledispatch
-from typing import TYPE_CHECKING, Any, Callable, Generic, Literal, TypeVar
+from contextlib import contextmanager, suppress
+from functools import singledispatch
+from typing import TYPE_CHECKING, Any, Callable, Generic, Iterator, Literal, TypeVar
 
 from attrs import Factory, define
 
@@ -100,6 +101,10 @@ class MultiStrategyDispatch(Generic[Hook]):
     .. versionchanged:: 24.1.0
         Support for factories that require converters, hence this requires a
         converter when creating.
+    .. versionchanged:: NEXT
+        Generated hooks now record the types they depend on. Registering a hook
+        for a type only invalidates cached hooks that actually depend on that
+        type, in both the structuring and unstructuring directions.
     """
 
     _fallback_factory: HookFactory[Hook]
@@ -107,6 +112,12 @@ class MultiStrategyDispatch(Generic[Hook]):
     _function_dispatch: FunctionDispatch
     _single_dispatch: Any
     dispatch: Callable[[TargetType, BaseConverter], Hook]
+    #: Exact-type hook cache, replacing the previous ``functools.lru_cache``.
+    _cache: dict[TargetType, Hook]
+    #: Types whose cached hooks depend on a given type (child -> {parents}).
+    _dependents: dict[TargetType, set[TargetType]]
+    #: Stack of types whose hooks are currently being generated.
+    _generating: list[TargetType]
 
     def __init__(
         self, fallback_factory: HookFactory[Hook], converter: BaseConverter
@@ -115,10 +126,84 @@ class MultiStrategyDispatch(Generic[Hook]):
         self._direct_dispatch = {}
         self._function_dispatch = FunctionDispatch(converter)
         self._single_dispatch = singledispatch(_DispatchNotFound)
-        self.dispatch = lru_cache(maxsize=None)(self.dispatch_without_caching)
+        self._cache = {}
+        self._dependents = {}
+        self._generating = []
+        self.dispatch = self._dispatch
+
+    def _record_dependency(self, dependent: TargetType, dependency: TargetType) -> None:
+        """Record that a hook for ``dependency`` is used while generating the
+        hook for ``dependent``.
+
+        Types are only recorded when a hook is actually being generated, and
+        unhashable types are silently ignored (they simply can't be cached).
+        """
+        if dependent is not dependency:
+            with suppress(TypeError):
+                # An unhashable type can neither be cached nor invalidated.
+                self._dependents.setdefault(dependency, set()).add(dependent)
+
+    def _record_generation_edges(self, typ: TargetType) -> None:
+        """Record the dependency edges implied by looking up ``typ`` while a
+        hook is being generated.
+
+        Class hooks are registered with _singledispatch_, which dispatches by
+        the method resolution order: a hook registered for any base class also
+        serves its subclasses. Recording every base class therefore ensures that
+        re-registering a superclass hook invalidates the generated hooks of its
+        subclasses, while hooks for unrelated classes stay cached.
+        """
+        parent = self._generating[-1]
+        self._record_dependency(parent, typ)
+        try:
+            mro = typ.__mro__
+        except AttributeError:
+            return
+        for base in mro:
+            if base is not object:
+                self._record_dependency(parent, base)
+
+    def _dispatch(self, typ: TargetType) -> Hook:
+        """Return the hook for ``typ``, caching the result.
+
+        On a cache miss the type is pushed onto the generation stack, so hooks
+        fetched by a hook factory are recorded as dependencies. Dependencies are
+        recorded on cache hits too, since an already generated hook is still part
+        of the parent type's behavior.
+        """
+        if self._generating:
+            self._record_generation_edges(typ)
+        cached = self._cache.get(typ)
+        if cached is not None:
+            return cached
+        with self._generating_type(typ):
+            hook = self.dispatch_without_caching(typ)
+        with suppress(TypeError):
+            # Unhashable types can't be cached anyway.
+            self._cache[typ] = hook
+        return hook
+
+    @contextmanager
+    def _generating_type(self, typ: TargetType) -> Iterator[None]:
+        # Cache clears can happen while a hook is being generated (factories may
+        # register hooks themselves), so restore the stack on exit instead of
+        # assuming it survived unchanged.
+        previous: list[TargetType] = self._generating
+        self._generating = [*previous, typ]
+        try:
+            yield
+        finally:
+            self._generating = previous
 
     def dispatch_without_caching(self, typ: TargetType) -> Hook:
-        """Dispatch on the type but without caching the result."""
+        """Dispatch on the type but without caching the result.
+
+        When called while a hook is being generated, the looked-up type (and
+        its base classes, since _singledispatch_ dispatches by MRO) is recorded
+        as a dependency of the generated hook.
+        """
+        if self._generating:
+            self._record_generation_edges(typ)
         try:
             dispatch = self._single_dispatch.dispatch(typ)
             if dispatch is not _DispatchNotFound:
@@ -135,13 +220,25 @@ class MultiStrategyDispatch(Generic[Hook]):
 
     def register_cls_list(self, cls_and_handler, direct: bool = False) -> None:
         """Register a class to direct or singledispatch."""
+        registered = []
         for cls, handler in cls_and_handler:
             if direct:
+                # The generated hook itself replaces any stale direct entry;
+                # keep it so the next lookup doesn't regenerate the same hook.
                 self._direct_dispatch[cls] = handler
             else:
                 self._single_dispatch.register(cls, handler)
+                # Direct entries shadow singledispatch; they are lazily
+                # regenerated, so drop them to let the new handler win.
                 self.clear_direct()
-        self.dispatch.cache_clear()
+            registered.append(cls)
+        if len(registered) == 1:
+            # A single exact type changed: drop its cached hook and the hooks
+            # transitively depending on it, keeping everything else intact.
+            self.invalidate(registered[0], keep_direct=direct)
+        else:
+            # Multiple types at once: conservatively reset everything.
+            self.clear_cache()
 
     def register_func_list(
         self,
@@ -158,6 +255,9 @@ class MultiStrategyDispatch(Generic[Hook]):
         :param pred_and_handler: The list of predicates and their associated
             handlers. If a handler is registered in `extended` mode, it's a
             factory that requires a converter.
+
+        Predicates may match any number of types, so all cached hooks are
+        invalidated conservatively.
         """
         for tup in pred_and_handler:
             if len(tup) == 2:
@@ -171,17 +271,50 @@ class MultiStrategyDispatch(Generic[Hook]):
                     )
                 else:
                     self._function_dispatch.register(func, handler, is_generator=is_gen)
-        self.clear_direct()
-        self.dispatch.cache_clear()
+        self.clear_cache()
 
     def clear_direct(self) -> None:
         """Clear the direct dispatch."""
         self._direct_dispatch.clear()
 
+    def invalidate(
+        self, typ: TargetType, *, keep_direct: bool = False
+    ) -> set[TargetType]:
+        """Invalidate the cached hook for ``typ`` and every hook depending on it.
+
+        The transitive closure of dependent types is recomputed lazily the next
+        time their hooks are requested; cached hooks unrelated to ``typ`` are
+        left untouched. The invalidated types are returned.
+
+        :param keep_direct: Whether to keep the direct-dispatch entry for
+            ``typ``. This is used when a freshly generated hook is being
+            registered directly, so it must not be discarded immediately.
+
+        .. versionadded:: NEXT
+        """
+        affected: set[TargetType] = set()
+        pending = [typ]
+        while pending:
+            current = pending.pop()
+            if current in affected:
+                continue
+            affected.add(current)
+            try:
+                self._cache.pop(current, None)
+                if not (keep_direct and current is typ):
+                    self._direct_dispatch.pop(current, None)
+            except TypeError:
+                # Unhashable types are never present in either mapping.
+                continue
+            pending.extend(self._dependents.get(current, ()))
+        return affected
+
     def clear_cache(self) -> None:
         """Clear all caches."""
         self._direct_dispatch.clear()
-        self.dispatch.cache_clear()
+        self._cache.clear()
+        self._dependents.clear()
+        self._generating.clear()
 
     def get_num_fns(self) -> int:
         return self._function_dispatch.get_num_fns()

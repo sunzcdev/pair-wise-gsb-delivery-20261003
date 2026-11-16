@@ -13,6 +13,8 @@ Our backwards-compatibility policy can be found [here](https://github.com/python
 
 ## NEXT
 
+- Generated hooks now track their type dependencies (fields, nested container elements, generic arguments and recursive references) in both directions. Registering a hook for a type only invalidates the cached hooks that actually depend on it, instead of clearing the whole hook cache; unrelated hooks are preserved. New `BaseConverter.invalidate_structure_hook` and `BaseConverter.invalidate_unstructure_hook` methods expose this invalidation manually. Hooks already retrieved through `get_structure_hook`/`get_unstructure_hook` retain their captured behavior, and each converter maintains an independent cache.
+
 - Fix the msgspec converter passing typed deques directly to the encoder, which cannot serialize them. Deques are now unstructured into lists, including when nested in attrs classes or dataclasses.
   ([#818](https://github.com/python-attrs/cattrs/issues/818) [#819](https://github.com/python-attrs/cattrs/pull/819))
 
