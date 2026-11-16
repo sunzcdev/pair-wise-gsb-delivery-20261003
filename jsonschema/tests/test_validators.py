@@ -1650,6 +1650,226 @@ class TestValidationErrorDetails(TestCase):
         )
 
 
+class TestUnevaluatedItemsContainsCoverage(TestCase):
+    """
+    Coverage (evaluated index) bookkeeping shared by ``prefixItems``,
+    ``contains`` / ``minContains`` / ``maxContains`` and
+    ``unevaluatedItems``.
+    """
+
+    def _errors(self, schema, instance, cls=validators.Draft202012Validator):
+        return list(cls(schema).iter_errors(instance))
+
+    def test_contains_passing_marks_matches_as_evaluated(self):
+        schema = {
+            "prefixItems": [True],
+            "contains": {"type": "string"},
+            "unevaluatedItems": False,
+        }
+        # The second item is covered by the successful contains keyword.
+        self.assertEqual(self._errors(schema, [1, "foo"]), [])
+
+    def test_contains_without_matches_does_not_evaluate_anything(self):
+        schema = {"contains": {"type": "string"}, "unevaluatedItems": False}
+        errors = self._errors(schema, [1, 2])
+        # Nothing was matched, so contains fails and every item is also
+        # reported separately as unevaluated rather than silently covered.
+        self.assertEqual(
+            sorted(error.validator for error in errors),
+            ["contains", "unevaluatedItems"],
+        )
+        contains_error = next(
+            error for error in errors if error.validator == "contains"
+        )
+        self.assertEqual(
+            contains_error.message,
+            "[1, 2] does not contain items matching the given schema",
+        )
+
+    def test_min_counts_as_failure_not_coverage(self):
+        """
+        When ``contains`` does not meet ``minContains`` its locally matched
+        items must not be treated as evaluated, so ``unevaluatedItems`` still
+        reports them instead of letting the schema pass on partial success.
+        """
+        schema = {
+            "contains": {"type": "string"},
+            "minContains": 2,
+            "unevaluatedItems": False,
+        }
+        errors = self._errors(schema, ["foo", 2, 3])
+        self.assertEqual(
+            [error.validator for error in errors],
+            ["minContains", "unevaluatedItems"],
+        )
+        min_error, unevaluated_error = errors
+        self.assertEqual(
+            min_error.message,
+            "Too few items match the given schema "
+            "(expected at least 2 but only 1 matched)",
+        )
+        self.assertIn(
+            "Unevaluated items are not allowed",
+            unevaluated_error.message,
+        )
+
+    def test_max_counts_as_failure_not_coverage(self):
+        schema = {
+            "prefixItems": [True],
+            "contains": {"type": "string"},
+            "maxContains": 1,
+            "unevaluatedItems": False,
+        }
+        errors = self._errors(schema, [1, "foo", "bar", 3])
+        self.assertEqual(
+            [error.validator for error in errors],
+            ["maxContains", "unevaluatedItems"],
+        )
+        max_error, unevaluated_error = errors
+        self.assertEqual(
+            max_error.message,
+            "Too many items match the given schema (expected at most 1)",
+        )
+        self.assertIn(
+            "Unevaluated items are not allowed",
+            unevaluated_error.message,
+        )
+
+    def test_diagnostics_distinguish_uncovered_from_count_failure(self):
+        """
+        The two failure modes remain distinguishable in the diagnostics:
+        ``minContains`` / ``maxContains`` describe unsatisfied count
+        constraints, whereas ``unevaluatedItems`` names the uncovered items.
+        """
+        count_schema = {
+            "contains": {"type": "string"},
+            "minContains": 3,
+        }
+        (count_error,) = self._errors(count_schema, ["foo", "bar", 1, 2])
+        self.assertEqual(count_error.validator, "minContains")
+        self.assertIn("Too few items match", count_error.message)
+
+        coverage_schema = {
+            "prefixItems": [True],
+            "unevaluatedItems": False,
+        }
+        (coverage_error,) = self._errors(coverage_schema, [1, 2])
+        self.assertEqual(coverage_error.validator, "unevaluatedItems")
+        self.assertIn(
+            "Unevaluated items are not allowed",
+            coverage_error.message,
+        )
+        self.assertIn("2", coverage_error.message)
+
+    def test_min_contains_zero_passes_but_covers_only_actual_matches(self):
+        # minContains=0 makes contains pass even with no matches, but only
+        # items which actually match carry the annotation.
+        schema = {
+            "contains": {"type": "string"},
+            "minContains": 0,
+            "unevaluatedItems": False,
+        }
+        self.assertEqual(
+            [error.validator for error in self._errors(schema, [1, 2])],
+            ["unevaluatedItems"],
+        )
+        self.assertEqual(self._errors(schema, ["foo", "bar"]), [])
+
+    def test_evaluated_indexes_are_consistent_between_keywords(self):
+        from jsonschema._utils import find_evaluated_item_indexes_by_schema
+
+        schema = {
+            "prefixItems": [True],
+            "contains": {"type": "string"},
+            "minContains": 1,
+            "unevaluatedItems": False,
+        }
+        instance = [1, "foo", 3]
+        validator = validators.Draft202012Validator(schema)
+
+        # A single, shared view of the evaluated indexes drives both the
+        # contains check and unevaluatedItems.
+        evaluated = find_evaluated_item_indexes_by_schema(
+            validator,
+            instance,
+            schema,
+        )
+        self.assertEqual(evaluated, [0, 1])
+        (error,) = self._errors(schema, instance)
+        self.assertEqual(error.validator, "unevaluatedItems")
+
+    def test_failing_branch_does_not_contribute_coverage(self):
+        # The single anyOf branch fails on its own unevaluatedItems, so it may
+        # not mark anything as evaluated for the outer unevaluatedItems.
+        schema = {
+            "anyOf": [{"prefixItems": [True], "unevaluatedItems": False}],
+            "unevaluatedItems": False,
+        }
+        errors = self._errors(schema, [1, 2])
+        self.assertEqual(
+            [error.validator for error in errors],
+            ["anyOf", "unevaluatedItems"],
+        )
+
+    def test_tuple_items_semantics_unchanged_across_drafts(self):
+        """
+        The same instance under the same tuple-shaped schema shows the
+        dialect difference: 2020-12 uses ``prefixItems`` + ``items`` while
+        draft 7 keeps the array-valued ``items`` + ``additionalItems``.
+        """
+        instance = ["foo", "bar", 37]
+
+        modern_schema = {"prefixItems": [{}], "items": False}
+        modern_errors = self._errors(
+            modern_schema,
+            instance,
+            cls=validators.Draft202012Validator,
+        )
+        self.assertEqual(
+            [error.validator for error in modern_errors],
+            ["items"],
+        )
+        self.assertEqual(
+            modern_errors[0].message,
+            "Expected at most 1 item but found 2 extra: ['bar', 37]",
+        )
+
+        legacy_schema = {"items": [{}], "additionalItems": False}
+        legacy_errors = self._errors(
+            legacy_schema,
+            instance,
+            cls=validators.Draft7Validator,
+        )
+        self.assertEqual(
+            [error.validator for error in legacy_errors],
+            ["additionalItems"],
+        )
+        self.assertEqual(
+            legacy_errors[0].message,
+            "Additional items are not allowed ('bar', 37 were unexpected)",
+        )
+
+    def test_2019_09_contains_covers_matches_without_counts(self):
+        # Draft 2019-09 has no minContains/maxContains; a present contains
+        # that matches an item always evaluates it, and the tuple form of
+        # `items` (not `prefixItems`) covers the leading positions.
+        schema = {
+            "items": [True],
+            "contains": {"type": "string"},
+            "unevaluatedItems": False,
+        }
+        validator = validators.Draft201909Validator(schema)
+        self.assertEqual(list(validator.iter_errors([1, "foo"])), [])
+
+        errors = list(validator.iter_errors([1, 2]))
+        # `contains` fails outright (no match), and the uncovered trailing
+        # item is then independently reported by `unevaluatedItems`.
+        self.assertEqual(
+            sorted(error.validator for error in errors),
+            ["contains", "unevaluatedItems"],
+        )
+
+
 class MetaSchemaTestsMixin:
     # TODO: These all belong upstream
     def test_invalid_properties(self):

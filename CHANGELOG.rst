@@ -9,6 +9,8 @@ v4.27.0
 * Errors produced by a ``false`` subschema now have the correct ``path`` and ``schema_path``, rather than empty ones.
 * Accessing an index with no errors on an ``ErrorTree`` no longer causes that index to appear in the tree (#1328).
   Subtrees also properly propagate lookup errors which were previously missing when accessing indices not in the subtree.
+* On draft 2020-12, the array coverage calculation behind ``unevaluatedItems`` now shares a single view of the indexes evaluated by ``prefixItems`` and ``contains`` (including ``minContains`` / ``maxContains``).
+  When ``contains`` fails to satisfy its count constraints, its locally matched items no longer count as evaluated, so a failing ``contains`` can no longer mask unevaluated trailing items; diagnostics continue to distinguish an ``unevaluatedItems`` failure (uncovered items) from a ``minContains`` / ``maxContains`` failure (unsatisfied count).
 
 v4.26.0
 =======

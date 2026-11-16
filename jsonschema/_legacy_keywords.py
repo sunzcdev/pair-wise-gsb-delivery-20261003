@@ -254,8 +254,17 @@ def find_evaluated_item_indexes_by_schema(validator, instance, schema):
     """
     Get all indexes of items that get evaluated under the current schema.
 
-    Covers all keywords related to unevaluatedItems: items, prefixItems, if,
-    then, else, contains, unevaluatedItems, allOf, oneOf, anyOf
+    Covers all keywords related to unevaluatedItems: items, if, then, else,
+    contains, unevaluatedItems, allOf, oneOf, anyOf.
+
+    This is the draft 2019-09 flavor of the coverage calculation. It
+    intentionally differs from the 2020-12 one:
+
+    * tuple validation is still expressed by an array-valued ``items``
+      keyword together with ``additionalItems`` rather than ``prefixItems``;
+    * 2019-09 has no ``minContains`` / ``maxContains`` keywords, so every
+      item matched by a present ``contains`` is evaluated (the keyword itself
+      only fails when no item matches).
     """
     if validator.is_type(schema, "boolean"):
         return []
@@ -289,6 +298,10 @@ def find_evaluated_item_indexes_by_schema(validator, instance, schema):
         )
 
     if "items" in schema:
+        # In 2019-09 a tuple form of `items` (an array of subschemas) only
+        # evaluates the positions it lists, while a single subschema form
+        # applies to every item. `additionalItems` alongside the tuple form
+        # covers the remaining positions.
         if "additionalItems" in schema:
             return list(range(len(instance)))
 
@@ -297,6 +310,8 @@ def find_evaluated_item_indexes_by_schema(validator, instance, schema):
         evaluated_indexes += list(range(len(schema["items"])))
 
     if "if" in schema:
+        # Only the branch which actually applies can contribute annotations:
+        # `then` is reached when `if` succeeds, `else` otherwise.
         if validator.evolve(schema=schema["if"]).is_valid(instance):
             evaluated_indexes += find_evaluated_item_indexes_by_schema(
                 validator,
@@ -316,12 +331,17 @@ def find_evaluated_item_indexes_by_schema(validator, instance, schema):
                 schema["else"],
             )
 
+    # 2019-09 has no minContains / maxContains, so `contains` only fails when
+    # nothing matches; every item that does match is evaluated.
     for keyword in ["contains", "unevaluatedItems"]:
         if keyword in schema:
             for k, v in enumerate(instance):
                 if validator.evolve(schema=schema[keyword]).is_valid(v):
                     evaluated_indexes.append(k)
 
+    # Applicator branches only propagate annotations when they successfully
+    # validate the whole instance; a failing branch evaluates nothing as far
+    # as an outer unevaluatedItems is concerned.
     for keyword in ["allOf", "oneOf", "anyOf"]:
         if keyword in schema:
             for subschema in schema[keyword]:

@@ -241,8 +241,18 @@ def find_evaluated_item_indexes_by_schema(validator, instance, schema):
     Get all indexes of items that get evaluated under the current schema.
 
     Covers all keywords related to unevaluatedItems: items, prefixItems, if,
-    then, else, contains, unevaluatedItems, allOf, oneOf, anyOf
+    then, else, contains, unevaluatedItems, allOf, oneOf, anyOf.
+
+    The ``contains`` calculation is shared with the ``contains`` keyword
+    itself (see ``jsonschema._keywords._contains_matches``): the matched
+    indexes, ``minContains`` and ``maxContains`` are evaluated a single time,
+    so the coverage information here is always consistent with the result of
+    validating the keyword. In particular, when ``contains`` does not satisfy
+    its count constraints it fails as a whole, and its locally matched items
+    therefore contribute no evaluated indexes.
     """
+    from jsonschema._keywords import _contains_matches
+
     if validator.is_type(schema, "boolean"):
         return []
     evaluated_indexes = []
@@ -282,6 +292,8 @@ def find_evaluated_item_indexes_by_schema(validator, instance, schema):
         evaluated_indexes += list(range(len(schema["prefixItems"])))
 
     if "if" in schema:
+        # Only the branch which actually applies can contribute annotations:
+        # `then` is reached when `if` succeeds, `else` otherwise.
         if validator.evolve(schema=schema["if"]).is_valid(instance):
             evaluated_indexes += find_evaluated_item_indexes_by_schema(
                 validator,
@@ -301,12 +313,30 @@ def find_evaluated_item_indexes_by_schema(validator, instance, schema):
                 schema["else"],
             )
 
-    for keyword in ["contains", "unevaluatedItems"]:
-        if keyword in schema:
-            for k, v in enumerate(instance):
-                if validator.evolve(schema=schema[keyword]).is_valid(v):
-                    evaluated_indexes.append(k)
+    if "contains" in schema:
+        # Annotations are only produced when the `contains` keyword passes,
+        # i.e. when the number of matched items lies within the
+        # minContains / maxContains bounds. A failing keyword must not let
+        # its locally successful matches count as evaluated.
+        matched_indexes, min_contains, max_contains = _contains_matches(
+            validator,
+            schema["contains"],
+            instance,
+            schema,
+        )
+        if min_contains <= len(matched_indexes) <= max_contains:
+            evaluated_indexes += matched_indexes
 
+    if "unevaluatedItems" in schema:
+        # The items which pass the unevaluatedItems subschema are themselves
+        # evaluated, and thus carry the keyword's annotation.
+        for k, v in enumerate(instance):
+            if validator.evolve(schema=schema["unevaluatedItems"]).is_valid(v):
+                evaluated_indexes.append(k)
+
+    # In 2020-12, applicator branches only propagate annotations when they
+    # successfully validate the whole instance; a failing branch evaluates
+    # nothing as far as an outer unevaluatedItems is concerned.
     for keyword in ["allOf", "oneOf", "anyOf"]:
         if keyword in schema:
             for subschema in schema[keyword]:

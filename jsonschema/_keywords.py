@@ -90,27 +90,51 @@ def const(validator, const, instance, schema):
         yield ValidationError(f"{const!r} was expected")
 
 
-def contains(validator, contains, instance, schema):
-    if not validator.is_type(instance, "array"):
-        return
+def _contains_matches(validator, contains, instance, schema):
+    """
+    Evaluate ``contains`` once and share the result.
 
-    matches = 0
+    Returns a tuple ``(matched_indexes, min_contains, max_contains)`` where
+    ``matched_indexes`` lists the indexes of the items which validate against
+    the ``contains`` subschema.
+
+    The same evaluated indexes are used both by the ``contains`` /
+    ``minContains`` / ``maxContains`` keywords and by the coverage calculation
+    behind ``unevaluatedItems``, so the two never disagree about which items
+    the keyword has evaluated.
+    """
     min_contains = schema.get("minContains", 1)
     max_contains = schema.get("maxContains", len(instance))
 
     contains_validator = validator.evolve(schema=contains)
+    matched_indexes = [
+        index
+        for index, item in enumerate(instance)
+        if contains_validator.is_valid(item)
+    ]
+    return matched_indexes, min_contains, max_contains
 
-    for each in instance:
-        if contains_validator.is_valid(each):
-            matches += 1
-            if matches > max_contains:
-                yield ValidationError(
-                    "Too many items match the given schema "
-                    f"(expected at most {max_contains})",
-                    validator="maxContains",
-                    validator_value=max_contains,
-                )
-                return
+
+def contains(validator, contains, instance, schema):
+    if not validator.is_type(instance, "array"):
+        return
+
+    matched_indexes, min_contains, max_contains = _contains_matches(
+        validator,
+        contains,
+        instance,
+        schema,
+    )
+    matches = len(matched_indexes)
+
+    if matches > max_contains:
+        yield ValidationError(
+            "Too many items match the given schema "
+            f"(expected at most {max_contains})",
+            validator="maxContains",
+            validator_value=max_contains,
+        )
+        return
 
     if matches < min_contains:
         if not matches:
