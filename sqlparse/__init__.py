@@ -12,9 +12,23 @@ from collections.abc import Generator
 from typing import IO, Any
 
 from sqlparse import cli, engine, filters, formatter, sql, tokens
+from sqlparse.editing import EditOp, RangeEditor, check_structure, edit_range
+from sqlparse.exceptions import RangeEditError
 
 __version__ = "0.6.1"
-__all__ = ["cli", "engine", "filters", "formatter", "sql", "tokens"]
+__all__ = [
+    "EditOp",
+    "RangeEditor",
+    "RangeEditError",
+    "check_structure",
+    "cli",
+    "edit_range",
+    "engine",
+    "filters",
+    "formatter",
+    "sql",
+    "tokens",
+]
 
 
 def parse(
