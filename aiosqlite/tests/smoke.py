@@ -4,10 +4,11 @@
 import asyncio
 import sqlite3
 import sys
+import time
 from pathlib import Path
 from sqlite3 import OperationalError
 from tempfile import TemporaryDirectory
-from threading import Thread
+from threading import Event, Lock, Thread
 from unittest import IsolatedAsyncioTestCase, SkipTest
 from unittest.mock import patch
 
@@ -448,7 +449,9 @@ class SmokeTest(IsolatedAsyncioTestCase):
         for task in tasks:
             try:
                 await task
-            except sqlite3.ProgrammingError:
+            except (sqlite3.ProgrammingError, ValueError):
+                # Either the cursor hit an already closed database, or the
+                # connection rejected the query because closing had begun.
                 pass
 
     async def test_close_blocking_until_transaction_queue_empty(self):
@@ -469,6 +472,203 @@ class SmokeTest(IsolatedAsyncioTestCase):
 
         # no error
         await db.close()
+
+    async def test_concurrent_close_single_underlying_close(self):
+        """Concurrent close()/stop() callers share one underlying close."""
+        calls = []
+
+        class CountingConnection:
+            def __init__(self, real):
+                self.real = real
+                self.lock = Lock()
+
+            def close(self):
+                with self.lock:
+                    calls.append(self.real)
+                time.sleep(0.01)
+                return self.real.close()
+
+            def __getattr__(self, name):
+                return getattr(self.real, name)
+
+        db = await aiosqlite.connect(":memory:")
+        db._state.connection = CountingConnection(db._state.connection)
+
+        await asyncio.gather(*(db.close() for _ in range(5)), db.stop(), db.stop())
+
+        self.assertEqual(len(calls), 1, "underlying close must run exactly once")
+        self.assertTrue(db._state.close_complete)
+        self.assertIsNone(db._state.connection)
+
+    async def test_concurrent_close_both_waiters_get_terminal_state(self):
+        """Every waiter observes the same real outcome, not an early return."""
+
+        class FailingClose:
+            def __init__(self, real):
+                self.real = real
+
+            def close(self):
+                time.sleep(0.05)
+                raise OperationalError("cannot close")
+
+            def __getattr__(self, name):
+                return getattr(self.real, name)
+
+        db = await aiosqlite.connect(":memory:")
+        db._state.connection = FailingClose(db._state.connection)
+
+        async def closer():
+            await db.close()
+
+        results = await asyncio.gather(closer(), closer(), return_exceptions=True)
+        self.assertTrue(all(isinstance(r, OperationalError) for r in results))
+        self.assertIsInstance(db._state.close_exception, OperationalError)
+
+        # A later call must also surface the recorded failure.
+        with self.assertRaisesRegex(OperationalError, "cannot close"):
+            await db.close()
+
+        self.assertFalse(db._thread.is_alive())
+
+    async def test_cancelled_waiter_does_not_cancel_shutdown(self):
+        """Canceling one close() waiter must not cancel the shared cleanup."""
+
+        class SlowClose:
+            def __init__(self, real):
+                self.real = real
+
+            def close(self):
+                time.sleep(0.2)
+                return self.real.close()
+
+            def __getattr__(self, name):
+                return getattr(self.real, name)
+
+        db = await aiosqlite.connect(":memory:")
+        db._state.connection = SlowClose(db._state.connection)
+
+        cancelled = asyncio.ensure_future(db.close())
+        survivor = asyncio.ensure_future(db.close())
+
+        await asyncio.sleep(0.05)
+        cancelled.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await cancelled
+
+        # The other waiter still completes and the thread is gone.
+        await asyncio.wait_for(survivor, timeout=5)
+        self.assertFalse(db._thread.is_alive())
+        self.assertTrue(db._state.close_complete)
+
+    async def test_cancelled_waiter_with_no_survivor_still_stops_thread(self):
+        """Cancel-all-the-waiters must not leave the worker thread running."""
+
+        class SlowClose:
+            def __init__(self, real):
+                self.real = real
+
+            def close(self):
+                time.sleep(0.1)
+                return self.real.close()
+
+            def __getattr__(self, name):
+                return getattr(self.real, name)
+
+        db = await aiosqlite.connect(":memory:")
+        db._state.connection = SlowClose(db._state.connection)
+
+        waiter = asyncio.ensure_future(db.close())
+        # Let the shutdown start, then cancel the only waiter.
+        await asyncio.sleep(0.02)
+        waiter.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await waiter
+
+        db._thread.join(timeout=5)
+        self.assertFalse(db._thread.is_alive())
+        self.assertTrue(db._state.close_complete)
+
+    async def test_queries_rejected_once_closing_begins(self):
+        """New work is refused as soon as shutdown starts, ahead of the queue."""
+        db = await aiosqlite.connect(self.db)
+        await db.execute("create table closing (i integer)")
+        await db.commit()
+
+        close_future = db.stop()
+        self.assertFalse(db._state.running)
+        self.assertTrue(db._state.closing)
+
+        with self.assertRaisesRegex(ValueError, "Connection closed"):
+            await db.execute("insert into closing (i) values (1)")
+
+        if close_future is not None:
+            await close_future
+
+    async def test_queue_drains_in_order_before_close(self):
+        """Work accepted before the close starts still runs, in order."""
+        order = []
+        started = Event()
+        release = Event()
+
+        class RecordingConnection:
+            def __init__(self, real):
+                self.real = real
+
+            def close(self):
+                # Recorded on the worker thread, like the operations below.
+                order.append("close")
+                return self.real.close()
+
+            def __getattr__(self, name):
+                return getattr(self.real, name)
+
+        def blocker():
+            # Occupy the worker so the following operations queue up behind it.
+            started.set()
+            release.wait(timeout=5)
+
+        db = await aiosqlite.connect(":memory:")
+        db._state.connection = RecordingConnection(db._state.connection)
+
+        blocking = asyncio.ensure_future(db._execute(blocker))
+        await asyncio.get_running_loop().run_in_executor(None, started.wait, 5)
+
+        # Accepted before the close begins, so they must all run first.
+        tasks = [
+            asyncio.ensure_future(db._execute(lambda i=i: order.append(i)))
+            for i in range(5)
+        ]
+        close_task = asyncio.ensure_future(db.close())
+        release.set()
+
+        await asyncio.gather(blocking, *tasks, close_task)
+
+        self.assertEqual(order, [0, 1, 2, 3, 4, "close"])
+
+    async def test_close_error_not_masked_by_second_call(self):
+        """A failed close must not be reported as success on a second call."""
+
+        class FailingClose:
+            def __init__(self, real):
+                self.real = real
+
+            def close(self):
+                raise OperationalError("disk gone")
+
+            def __getattr__(self, name):
+                return getattr(self.real, name)
+
+        db = await aiosqlite.connect(":memory:")
+        db._state.connection = FailingClose(db._state.connection)
+
+        with self.assertRaisesRegex(OperationalError, "disk gone"):
+            await db.close()
+
+        # Second call must not simply return; it reports the same failure.
+        with self.assertRaisesRegex(OperationalError, "disk gone"):
+            await db.close()
+
+        self.assertFalse(db._thread.is_alive())
 
     async def test_backup_aiosqlite(self):
         def progress(a, b, c):
