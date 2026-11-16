@@ -301,6 +301,45 @@ def test_raw(cache):
     assert cache[0] == b'abcd'
 
 
+def test_pop_rollback(cache):
+    value = b'x' * 2**20
+    cache.set('key', value)
+
+    with pytest.raises(RuntimeError):
+        with cache.transact():
+            assert cache.pop('key') == value
+            raise RuntimeError('abort')
+
+    assert cache['key'] == value
+    assert len(cache.check()) == 0
+
+
+def test_delete_rollback(cache):
+    value = b'x' * 2**20
+    cache.set('key', value)
+
+    with pytest.raises(RuntimeError):
+        with cache.transact():
+            del cache['key']
+            raise RuntimeError('abort')
+
+    assert cache['key'] == value
+    assert len(cache.check()) == 0
+
+
+def test_push_pull_rollback(cache):
+    value = b'x' * 2**20
+    cache.push(value)
+
+    with pytest.raises(RuntimeError):
+        with cache.transact():
+            assert cache.pull()[1] == value
+            raise RuntimeError('abort')
+
+    assert cache.pull()[1] == value
+    assert len(cache.check()) == 0
+
+
 def test_get(cache):
     assert cache.get(0) is None
     assert cache.get(1, 'dne') == 'dne'

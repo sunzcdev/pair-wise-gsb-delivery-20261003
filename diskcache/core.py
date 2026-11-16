@@ -441,6 +441,7 @@ class Cache:
         self._timeout = 0  # Manually handle retries during initialization.
         self._local = threading.local()
         self._txn_id = None
+        self._txn_scope = []
 
         if not op.isdir(directory):
             try:
@@ -708,7 +709,6 @@ class Cache:
     @cl.contextmanager
     def _transact(self, retry=False, filename=None):
         sql = self._sql
-        filenames = []
         _disk_remove = self._disk.remove
         tid = threading.get_ident()
         txn_id = self._txn_id
@@ -729,22 +729,110 @@ class Cache:
                         _disk_remove(filename)
                     raise Timeout from None
 
+        # Files are removed lazily: a file queued for cleanup is deleted only
+        # when the outermost transaction commits, and a file queued for
+        # discard is deleted only when the outermost transaction rolls back.
+        # Deleting a queued cleanup file earlier would corrupt the cache if an
+        # enclosing transaction rolls back and restored the row that still
+        # references it. A nested scope hands both sets of files to the
+        # enclosing scope so nothing is removed too early or forgotten. A file
+        # may be in both sets, for example when a batch evicts its own value,
+        # and is then removed whether the transaction commits or rolls back.
+
+        cleanup_files = []
+        discard_files = {}
+        self._txn_scope.append((cleanup_files, discard_files))
+
+        def cleanup(filename):
+            if filename is not None:
+                cleanup_files.append(filename)
+
         try:
-            yield sql, filenames.append
+            yield sql, cleanup
         except BaseException:
+            self._txn_scope.pop()
+
             if begin:
                 assert self._txn_id == tid
                 self._txn_id = None
                 sql('ROLLBACK')
+
+                for name in discard_files:
+                    _disk_remove(name)
+            else:
+                self._merge_scope(cleanup_files, discard_files)
+
             raise
         else:
+            self._txn_scope.pop()
+
             if begin:
                 assert self._txn_id == tid
                 self._txn_id = None
                 sql('COMMIT')
-            for name in filenames:
-                if name is not None:
+
+                for name in cleanup_files:
                     _disk_remove(name)
+            else:
+                self._merge_scope(cleanup_files, discard_files)
+
+    def _merge_scope(self, cleanup_files, discard_files):
+        """Hand a nested scope's pending files to the enclosing scope."""
+        if not self._txn_scope:
+            return
+
+        scope_cleanup, scope_discard = self._txn_scope[-1]
+        scope_cleanup.extend(cleanup_files)
+        scope_discard.update(discard_files)
+
+    def _cleanup_later(self, filenames):
+        """Queue `filenames` for removal when the transaction commits.
+
+        Called after a value file has been fetched from a row that was
+        deleted. When no transaction is active the files are removed
+        immediately. When an enclosing transaction is active the removal is
+        deferred to its commit, so a rollback keeps the files that the
+        restored rows reference.
+
+        :param filenames: iterable of relative paths to value files
+
+        """
+        filenames = [name for name in filenames if name is not None]
+
+        if not filenames:
+            return
+
+        tid = threading.get_ident()
+
+        if self._txn_id == tid and self._txn_scope:
+            self._txn_scope[-1][0].extend(filenames)
+        else:
+            for filename in filenames:
+                self._disk.remove(filename)
+
+    def _discard_later(self, filenames):
+        """Queue `filenames` for removal if the transaction rolls back.
+
+        Must be called while a transaction is active. The files are removed
+        when the outermost transaction rolls back and kept when it commits.
+        Files may also be queued for cleanup; they are then removed either
+        way because the row that referenced them is gone on both paths.
+
+        :param filenames: iterable of relative paths to value files
+
+        """
+        filenames = [name for name in filenames if name is not None]
+
+        if not filenames:
+            return
+
+        tid = threading.get_ident()
+
+        if self._txn_id == tid and self._txn_scope:
+            self._txn_scope[-1][1].update(dict.fromkeys(filenames))
+        else:
+            for filename in filenames:
+                self._disk.remove(filename)
 
     def set(self, key, value, expire=None, read=False, tag=None, retry=False):
         """Set `key` and `value` item in cache.
@@ -1321,8 +1409,7 @@ class Cache:
             # Key was deleted before we could retrieve result.
             return default
         finally:
-            if filename is not None:
-                self._disk.remove(filename)
+            self._cleanup_later([filename])
 
         if expire_time and tag:
             return value, db_expire_time, db_tag
@@ -1590,8 +1677,7 @@ class Cache:
                 # Key was deleted before we could retrieve result.
                 continue
             finally:
-                if name is not None:
-                    self._disk.remove(name)
+                self._cleanup_later([name])
             break
 
         if expire_time and tag:

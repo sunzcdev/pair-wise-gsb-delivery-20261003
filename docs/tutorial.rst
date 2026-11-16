@@ -576,6 +576,28 @@ limitations prohibit holding all items in memory at the same time. The deque
 uses a fixed amount of memory regardless of the size or number of items stored
 inside it.
 
+Use :meth:`extend_batch <diskcache.Deque.extend_batch>` and
+:meth:`extendleft_batch <diskcache.Deque.extendleft_batch>` to add many values
+in one atomic operation. Unlike calling :meth:`append <diskcache.Deque.append>`
+in a loop, either the whole batch is written or the deque is left unchanged.
+Both methods accept a one-shot iterator, return the counts of values retained
+and evicted, and preserve the input order of the batch.
+
+    >>> from diskcache import Deque
+    >>> queue = Deque(maxlen=3)
+    >>> queue.extend_batch(iter([1, 2, 3, 4, 5]))
+    (3, 2)
+    >>> list(queue)
+    [3, 4, 5]
+    >>> queue.extendleft_batch(iter([6, 7, 8, 9]))
+    (3, 1)
+    >>> list(queue)
+    [6, 7, 8]
+    >>> queue.extend_batch([9], policy='reject')
+    Traceback (most recent call last):
+        ...
+    ValueError: batch of 1 items does not fit in deque with maxlen 3
+
 Index
 -----
 

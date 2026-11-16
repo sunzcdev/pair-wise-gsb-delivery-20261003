@@ -2,6 +2,7 @@
 """
 
 import operator as op
+import time
 from collections import OrderedDict
 from collections.abc import (
     ItemsView,
@@ -14,6 +15,17 @@ from contextlib import contextmanager
 from shutil import rmtree
 
 from .core import ENOVAL, Cache
+
+# Integer key space used by queues stored with `Cache.push` and `Cache.pull`.
+# Deque and Index use the same layout so the bounds are shared here.
+
+_QUEUE_MIN_KEY = 0
+_QUEUE_MAX_KEY = 999999999999999
+_QUEUE_MID_KEY = 500000000000000
+
+# Maximum number of rows deleted per statement during eviction. SQLite limits
+# the number of bound parameters per statement so batch evictions are chunked.
+_DELETE_CHUNK = 500
 
 
 def _make_compare(seq_op, doc):
@@ -427,6 +439,372 @@ class Deque(Sequence):
         """
         for value in iterable:
             self._appendleft(value)
+
+    def _store_batch(self, iterable):
+        """Serialize every value from `iterable` before any row is written.
+
+        The iterator is consumed exactly once. If the iterator raises or a
+        value cannot be serialized then the value files created for earlier
+        values are removed and the error is re-raised. No database row is
+        written by this method.
+
+        :param iterable: one-shot iterable of values
+        :return: (columns, filenames) pair where `columns` is a list of
+            ``(size, mode, filename, value)`` tuples and `filenames` is the
+            list of value files created on disk
+
+        """
+        disk = self._cache.disk
+        stored = []
+        filenames = []
+
+        try:
+            for value in iterable:
+                columns = disk.store(value, False)
+                stored.append(columns)
+
+                if columns[2] is not None:
+                    filenames.append(columns[2])
+        except BaseException:
+            for filename in filenames:
+                disk.remove(filename)
+            raise
+
+        return stored, filenames
+
+    @staticmethod
+    def _batch_select(side):
+        """Return SQL selecting queue rows from `side` ordered for eviction."""
+        order = 'ASC' if side == 'back' else 'DESC'
+        return (
+            'SELECT rowid, key, filename FROM Cache'
+            ' WHERE ? < key AND key < ? AND raw = 1'
+            ' ORDER BY key ' + order + ' LIMIT ?'
+        )
+
+    def _renormalize_keys(self, sql):
+        """Renumber queue rows to consecutive keys centered in key space.
+
+        Called only when a batch would otherwise overflow the integer key
+        range. Keys are cleared before they are reassigned because `key` is
+        part of a unique index and SQLite treats NULL values as distinct.
+
+        :param sql: database execute callable
+        :return: (minimum key, maximum key) after renumbering or
+            ``(None, None)`` when the queue is empty
+
+        """
+        select = (
+            'SELECT rowid FROM Cache'
+            ' WHERE ? < key AND key < ? AND raw = 1'
+            ' ORDER BY key ASC'
+        )
+        rows = sql(select, (_QUEUE_MIN_KEY, _QUEUE_MAX_KEY)).fetchall()
+
+        if not rows:
+            return None, None
+
+        first = _QUEUE_MID_KEY - len(rows) // 2
+
+        sql(
+            'UPDATE Cache SET key = NULL'
+            ' WHERE ? < key AND key < ? AND raw = 1',
+            (_QUEUE_MIN_KEY, _QUEUE_MAX_KEY),
+        )
+
+        for offset, (rowid,) in enumerate(rows):
+            sql(
+                'UPDATE Cache SET key = ? WHERE rowid = ?',
+                (first + offset, rowid),
+            )
+
+        return first, first + len(rows) - 1
+
+    def _reserve_keys(self, sql, side, count):
+        """Reserve a contiguous integer key range for a batch of `count`.
+
+        Keys are allocated from the extreme of `side` while the write lock is
+        held so concurrent writers cannot collide.
+
+        :param sql: database execute callable
+        :param str side: either 'back' or 'front'
+        :param int count: number of keys to reserve
+        :return: ``(start, stop)`` half-open key range
+
+        """
+        select = (
+            'SELECT MIN(key), MAX(key) FROM Cache'
+            ' WHERE ? < key AND key < ? AND raw = 1'
+        )
+
+        for attempt in (0, 1):
+            row = sql(select, (_QUEUE_MIN_KEY, _QUEUE_MAX_KEY)).fetchone()
+            min_key, max_key = row
+
+            if side == 'back':
+                start = _QUEUE_MID_KEY if max_key is None else max_key + 1
+                stop = start + count
+
+                if stop <= _QUEUE_MAX_KEY:
+                    return start, stop
+            else:
+                assert side == 'front'
+                stop = _QUEUE_MID_KEY if min_key is None else min_key
+                start = stop - count
+
+                if start > _QUEUE_MIN_KEY:
+                    return start, stop
+
+            if attempt:
+                break
+
+            self._renormalize_keys(sql)
+
+        raise OverflowError('deque does not fit in the integer key space')
+
+    def _insert_batch(self, sql, stored, side, now):
+        """Insert a serialized batch and evict rows to honor `maxlen`.
+
+        Batch keys are allocated so the input order is preserved at `side`.
+        Eviction removes rows from the opposite side, exactly like `append`
+        (evict front) and `appendleft` (evict back).
+
+        Value files of evicted rows are returned rather than removed so the
+        caller can queue them for cleanup only after the enclosing savepoint
+        is released. Removing them earlier would corrupt the deque when the
+        savepoint is rolled back and the evicted rows are restored.
+
+        :param sql: database execute callable
+        :param list stored: serialized value columns
+        :param str side: either 'back' or 'front'
+        :param float now: store time
+        :return: (retained count, evicted count, evicted filenames)
+
+        """
+        # pylint: disable=protected-access
+        cache = self._cache
+        count = len(stored)
+        start, stop = self._reserve_keys(sql, side, count)
+
+        insert = (
+            'INSERT INTO Cache('
+            ' key, raw, store_time, expire_time, access_time,'
+            ' access_count, tag, size, mode, filename, value'
+            ') VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)'
+        )
+        rows = [
+            (
+                start + offset,
+                True,
+                now,  # store_time
+                None,  # expire_time
+                now,  # access_time
+                0,  # access_count
+                None,  # tag
+                size,
+                mode,
+                filename,
+                value,
+            )
+            for offset, (size, mode, filename, value) in enumerate(stored)
+        ]
+        cache._con.executemany(insert, rows)
+
+        # Count evicted batch values separately from pre-existing ones so the
+        # caller learns what happened to the values it supplied.
+
+        select = self._batch_select(side)
+        maxlen = self._maxlen
+        length = len(cache)
+        evicted = 0
+        filenames = []
+
+        while length > maxlen:
+            limit = int(length - maxlen)
+
+            if limit < 1:
+                limit = 1
+
+            # SQLite limits the number of bound parameters per statement, so
+            # large evictions are deleted in chunks.
+            limit = min(limit, _DELETE_CHUNK)
+
+            evict_rows = sql(
+                select, (_QUEUE_MIN_KEY, _QUEUE_MAX_KEY, limit)
+            ).fetchall()
+
+            if not evict_rows:  # pragma: no cover
+                break
+
+            rowids = [rowid for rowid, _, _ in evict_rows]
+            delete = 'DELETE FROM Cache WHERE rowid IN (%s)' % (
+                ','.join(['?'] * len(rowids))
+            )
+            sql(delete, rowids)
+            length -= len(evict_rows)
+
+            for _, key, filename in evict_rows:
+                if filename is not None:
+                    filenames.append(filename)
+
+                if start <= key < stop:
+                    evicted += 1
+
+        return count - evicted, evicted, filenames
+
+    def _extend_batch(self, iterable, side, policy):
+        """Atomically write a whole batch onto one side of the deque.
+
+        Values are serialized before the database transaction begins so a
+        source iterator error or a serialization error aborts before any row
+        is written. Rows are inserted and evicted inside a savepoint so a
+        database lock timeout or any other error never leaves half of the
+        batch appended, even when the caller catches the error inside an
+        enclosing transaction.
+
+        :param iterable: one-shot iterable of values to add
+        :param str side: either 'back' or 'front'
+        :param str policy: either 'evict' or 'reject'
+        :return: (retained, evicted) counts for the supplied batch
+        :raises ValueError: if `policy` is unknown or a rejected batch does
+            not fit in the deque
+
+        """
+        if policy not in ('evict', 'reject'):
+            raise ValueError(
+                "policy must be 'evict' or 'reject', not %r" % (policy,)
+            )
+
+        stored, created = self._store_batch(iterable)
+
+        if not stored:
+            return 0, 0
+
+        count = len(stored)
+        now = time.time()
+
+        try:
+            # pylint: disable=protected-access
+            with self._cache._transact(retry=True) as (sql, cleanup):
+                # If an enclosing transaction rolls back then the rows
+                # written here disappear and these files must disappear too.
+                self._cache._discard_later(created)
+
+                if (
+                    policy == 'reject'
+                    and len(self._cache) + count > self._maxlen
+                ):
+                    raise ValueError(
+                        'batch of %d items does not fit in deque with'
+                        ' maxlen %s' % (count, self._maxlen)
+                    )
+
+                sql('SAVEPOINT deque_extend_batch')
+
+                try:
+                    result, evicted, filenames = self._insert_batch(
+                        sql, stored, side, now
+                    )
+                except BaseException:
+                    sql('ROLLBACK TO SAVEPOINT deque_extend_batch')
+                    sql('RELEASE SAVEPOINT deque_extend_batch')
+                    raise
+                else:
+                    sql('RELEASE SAVEPOINT deque_extend_batch')
+
+                # The savepoint committed so the evicted rows are gone for
+                # good. Queue their files for removal on transaction commit.
+                for filename in filenames:
+                    cleanup(filename)
+
+                return result, evicted
+        except BaseException:
+            # Any failure outside the savepoint leaves the batch rows
+            # rolled back, so the files written for this batch are orphans.
+            # Removal is idempotent if the transaction already did it.
+            for filename in created:
+                self._cache.disk.remove(filename)
+            raise
+
+    def extend_batch(self, iterable, policy='evict'):
+        """Atomically extend back side of deque with values from `iterable`.
+
+        Unlike calling `append` for each value, the whole batch is written in
+        a single transaction. A source iterator error, a serialization error,
+        or a database lock timeout leaves the deque unchanged: no partial
+        batch is ever appended.
+
+        Input order is preserved. The first value in `iterable` is the first
+        value of the batch when the deque is read from front to back.
+
+        >>> deque = Deque()
+        >>> deque.extend_batch([1, 2, 3])
+        (3, 0)
+        >>> list(deque)
+        [1, 2, 3]
+        >>> deque = Deque(maxlen=3)
+        >>> deque.extend_batch([1, 2, 3, 4, 5])
+        (3, 2)
+        >>> list(deque)
+        [3, 4, 5]
+
+        :param iterable: one-shot iterable of values to add to the back
+        :param str policy: capacity strategy when the deque has a `maxlen`:
+
+            * ``'evict'`` (default) - accept the batch and evict values from
+              the front as needed, matching `append` semantics.
+            * ``'reject'`` - refuse the whole batch when it does not fit and
+              raise `ValueError` without writing anything.
+
+        :return: ``(retained, evicted)`` pair with the count of values from
+            `iterable` still in the deque afterward and the count of values
+            from `iterable` removed because they did not fit in `maxlen`.
+            ``retained + evicted`` equals the number of values supplied.
+            Pre-existing values removed to make room are not counted.
+        :raises ValueError: if `policy` is unknown, or when the ``'reject'``
+            policy is used and the batch does not fit
+
+        """
+        return self._extend_batch(iterable, 'back', policy)
+
+    def extendleft_batch(self, iterable, policy='evict'):
+        """Atomically extend front side of deque with values from `iterable`.
+
+        Unlike calling `appendleft` for each value, the whole batch is written
+        in a single transaction and the batch is *not* inverted: the first
+        value in `iterable` becomes the first value of the deque. A source
+        iterator error, a serialization error, or a database lock timeout
+        leaves the deque unchanged.
+
+        >>> deque = Deque()
+        >>> deque.extendleft_batch([1, 2, 3])
+        (3, 0)
+        >>> list(deque)
+        [1, 2, 3]
+        >>> deque = Deque(maxlen=3)
+        >>> deque.extendleft_batch([1, 2, 3, 4, 5])
+        (3, 2)
+        >>> list(deque)
+        [1, 2, 3]
+
+        :param iterable: one-shot iterable of values to add to the front
+        :param str policy: capacity strategy when the deque has a `maxlen`:
+
+            * ``'evict'`` (default) - accept the batch and evict values from
+              the back as needed, matching `appendleft` semantics.
+            * ``'reject'`` - refuse the whole batch when it does not fit and
+              raise `ValueError` without writing anything.
+
+        :return: ``(retained, evicted)`` pair with the count of values from
+            `iterable` still in the deque afterward and the count of values
+            from `iterable` removed because they did not fit in `maxlen`.
+            ``retained + evicted`` equals the number of values supplied.
+            Pre-existing values removed to make room are not counted.
+        :raises ValueError: if `policy` is unknown, or when the ``'reject'``
+            policy is used and the batch does not fit
+
+        """
+        return self._extend_batch(iterable, 'front', policy)
 
     def peek(self):
         """Peek at value at back of deque.
