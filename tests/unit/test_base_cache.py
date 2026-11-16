@@ -1,7 +1,7 @@
 """BaseCache tests that use mocked responses only"""
 
 import pickle
-from datetime import timedelta
+from datetime import datetime, timedelta, timezone
 from logging import getLogger
 from pickle import PickleError
 from unittest.mock import patch
@@ -9,7 +9,7 @@ from unittest.mock import patch
 import pytest
 from requests import Request
 
-from requests_cache.backends import BaseCache, SQLiteDict
+from requests_cache.backends import BaseCache, SQLiteCache, SQLiteDict
 from requests_cache.cache_keys import create_key
 from requests_cache.models import CachedRequest, CachedResponse
 from requests_cache.policy import utcnow
@@ -21,6 +21,7 @@ from tests.conftest import (
     MOCKED_URL_JSON,
     MOCKED_URL_REDIRECT,
     START_DT,
+    assert_delta_approx_equal,
     ignore_deprecation,
     mount_mock_adapter,
     patch_normalize_url,
@@ -29,6 +30,14 @@ from tests.conftest import (
 )
 
 logger = getLogger(__name__)
+
+AGE_T0 = datetime(2026, 11, 15, 12, 0, 0, tzinfo=timezone.utc)
+AGE_T0_STR = 'Sun, 15 Nov 2026 12:00:00 GMT'
+AGED_HEADERS = {
+    'Cache-Control': 'max-age=600',
+    'Age': '300',
+    'Date': AGE_T0_STR,
+}
 
 
 class InvalidResponse:
@@ -320,6 +329,79 @@ def test_save_response__manual(mock_session):
     response = mock_session.get(MOCKED_URL)
     mock_session.cache.clear()
     mock_session.cache.save_response(response)
+
+
+@skip_pypy
+def test_save_response__age_adjusted_expiration(mock_session):
+    """A relative expire_after is shortened by the response's upstream age"""
+    with time_travel(AGE_T0):
+        response = CachedResponse(url=MOCKED_URL, status_code=200, headers=dict(AGED_HEADERS))
+        mock_session.cache.save_response(response, 'key', expire_after=600)
+        cached = mock_session.cache.get_response('key')
+
+        assert cached.age_at_creation == 300
+        assert cached.age == 300
+        # SQLite stores expirations at second resolution
+        assert_delta_approx_equal(cached.expires, AGE_T0 + timedelta(seconds=300), 0)
+
+
+@skip_pypy
+def test_save_response__absolute_expiration_not_shifted(mock_session):
+    """An absolute expiration is a fixed point in time and is unaffected by age"""
+    absolute = AGE_T0 + timedelta(seconds=999)
+    with time_travel(AGE_T0):
+        response = CachedResponse(url=MOCKED_URL, status_code=200, headers=dict(AGED_HEADERS))
+        mock_session.cache.save_response(response, 'key', expires=absolute)
+        cached = mock_session.cache.get_response('key')
+
+        assert cached.expires == absolute
+        assert cached.age_at_creation == 300
+
+
+@skip_pypy
+@pytest.mark.parametrize('backend', ['memory', 'sqlite'])
+def test_remaining_lifetime__backend_parity(backend, tempfile_path):
+    """The same entry read from an in-memory or SQLite backend has an identical remaining lifetime.
+
+    This exercises the full serialize/deserialize round trip for SQLite, so any loss or shift of
+    age metadata would show up as a difference between the two backends.
+    """
+    cache = BaseCache() if backend == 'memory' else SQLiteCache(tempfile_path)
+    with time_travel(AGE_T0):
+        response = CachedResponse(url=MOCKED_URL, status_code=200, headers=dict(AGED_HEADERS))
+        cache.save_response(response, 'key', expire_after=600)
+
+    with time_travel(AGE_T0 + timedelta(seconds=120)):
+        first = cache.get_response('key')
+        second = cache.get_response('key')
+        assert first.age == second.age == 420
+        assert first.expires_delta == second.expires_delta == 180
+        assert first.is_expired is second.is_expired is False
+        # SQLite stores expirations at second resolution
+        assert_delta_approx_equal(first.expires, second.expires, 0)
+        assert_delta_approx_equal(first.expires, AGE_T0 + timedelta(seconds=300), 0)
+
+
+@skip_pypy
+def test_expiration__request_level_expire_after_precedence(mock_session):
+    """A request-level expire_after still takes precedence over the session setting, but its
+    lifetime is measured against the response's current age."""
+    mock_session.settings.expire_after = 60
+    with time_travel(AGE_T0):
+        mock_session.mock_adapter.register_uri(
+            'GET',
+            MOCKED_URL,
+            headers=dict(AGED_HEADERS),
+            text='mock response',
+            status_code=200,
+        )
+        response = mock_session.get(MOCKED_URL, expire_after=600)
+
+        # 600s requested minus the 300s the response already spent upstream
+        assert_delta_approx_equal(response.created_at, response.expires, 300)
+        cached = mock_session.cache.get_response(response.cache_key)
+        assert_delta_approx_equal(response.created_at, cached.expires, 300)
+        assert cached.age_at_creation == 300
 
 
 def test_update(mock_session):

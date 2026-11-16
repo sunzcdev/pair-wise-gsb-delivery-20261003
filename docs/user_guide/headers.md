@@ -67,13 +67,19 @@ The following headers are currently supported:
 - `If-Modified-Since`: Automatically added for revalidation, if `Last-Modified` is available
 
 **Response headers:**
+- `Age`: Combined with `Date` and the local receive time to compute the response's current age
+  ([RFC 9111](https://datatracker.ietf.org/doc/html/rfc9111#section-4.2.3)). Time already spent in
+  upstream caches shortens the remaining freshness of `max-age` and the stale windows; invalid or
+  negative values are ignored rather than extending the lifetime.
 - `Cache-Control: immutable`: Cache the response with no expiration
-- `Cache-Control: max-age`: Used as the expiration time in seconds
+- `Cache-Control: max-age`: Used as the expiration time in seconds, minus the response's current age
 - `Cache-Control: must-revalidate`: When used in combination with `max-age=0`, revalidate immediately.
 - `Cache-Control: no-cache`: Revalidate with the server before using a cached response
 - `Cache-Control: no-store` Skip writing to the cache
 - `Cache-Control: stale-if-error`: Same behavior as request header
 - `Cache-Control: stale-while-revalidate`: If expired by less than this many seconds, return the stale response immediately and send an asynchronous revalidation request
+- `Date`: Used with `Age` to determine how long ago the origin generated the response; a future
+  `Date` from clock skew is clamped so it cannot produce a negative age
 - `Expires`: Used as an absolute expiration datetime
 - `ETag`: Validator used for conditional requests
 - `Last-Modified`: Validator used for conditional requests

@@ -29,6 +29,39 @@ request, the following order of precedence is used:
 4. Per-URL expiration (`urls_expire_after` argument for {py:class}`.CachedSession`)
 5. Per-session expiration (`expire_after` argument for {py:class}`.CachedSession`)
 
+(age)=
+## Response Age
+A response may already be old when it arrives: an upstream proxy or CDN can have been serving it for
+a while. Requests-cache uses the `Date` and `Age` response headers
+([RFC 9111](https://datatracker.ietf.org/doc/html/rfc9111#section-4.2.3)) to determine how old a
+response already was when it was received, and shortens a relative `max-age` accordingly. This is a
+transport-level correction, so it applies regardless of the `cache_control` setting, but it never
+changes which expiration value is used (see {ref}`precedence`).
+
+For example, with `cache_control=True`, a response with `Cache-Control: max-age=600` and `Age: 300`
+will only be considered fresh for another 300 seconds after it is cached. The same applies to a
+client-side lifetime: `session.get(url, expire_after=600)` gives the same result if the response
+arrives with `Age: 300`.
+```python
+>>> session = CachedSession(cache_control=True)
+>>> session.get(url)  # Response has max-age=600 and Age=300
+>>> response = session.get(url)  # Served from the cache
+>>> print(response.expires_delta)
+300
+```
+The same current age is used for all time-based cache decisions, including
+{ref}`stale-if-error <request-errors>` and {ref}`stale-while-revalidate <stale-while-revalidate>`
+windows and `Cache-Control: min-fresh`/`max-stale` request headers.
+
+Notes:
+- Invalid, non-numeric, or negative `Age` values are ignored (treated as zero), so they can never
+  extend a response's lifetime.
+- A `Date` header in the future (due to clock skew) is clamped, so it cannot produce a negative age.
+- An absolute expiration value (a {py:class}`~datetime.datetime`, or an `Expires` header) is a fixed
+  point in time and is not shifted by the response's age.
+- A `304 Not Modified` response reuses the previously cached body, so that body's age is preserved
+  rather than being reset to zero when the expiration is updated.
+
 ## Expiration Values
 `expire_after` can be any of the following time values:
 - A positive number (in seconds)

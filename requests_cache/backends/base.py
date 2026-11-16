@@ -21,7 +21,13 @@ from requests import Request, Response
 
 from ..cache_keys import create_key, redact_response
 from ..models import AnyRequest, CachedResponse
-from ..policy import DEFAULT_CACHE_NAME, CacheSettings, ExpirationTime
+from ..policy import (
+    DEFAULT_CACHE_NAME,
+    CacheSettings,
+    ExpirationTime,
+    get_age_adjusted_expiration,
+    get_corrected_initial_age,
+)
 from ..serializers import SerializerType, init_serializer
 
 # Specific exceptions that may be raised during deserialization
@@ -89,16 +95,26 @@ class BaseCache:
         response: Response,
         cache_key: Optional[str] = None,
         expires: Optional[datetime] = None,
+        expire_after: ExpirationTime = None,
     ):
         """Save a response to the cache
 
         Args:
             cache_key: Cache key for this response; will otherwise be generated based on request
             response: Response to save
-            expires: Absolute expiration time for this response
+            expires: Pre-computed absolute expiration time, used when ``expire_after`` is omitted
+            expire_after: Raw expiration value (relative or absolute) from cache policy; a relative
+                freshness lifetime is adjusted for the response's current age, including time spent
+                in upstream caches (per ``Date`` and ``Age`` headers)
         """
         cache_key = cache_key or self.create_key(response.request)
-        cached_response = CachedResponse.from_response(response, expires=expires)
+        expiration_value = expire_after if expire_after is not None else expires
+        age_adjusted_expires = get_age_adjusted_expiration(response.headers, expiration_value)
+        cached_response = CachedResponse.from_response(response, expires=age_adjusted_expires)
+        cached_response.age_at_creation = max(
+            cached_response.age_at_creation or 0,
+            get_corrected_initial_age(response.headers),
+        )
         cached_response = redact_response(cached_response, self._settings.ignored_parameters)
         self.responses[cache_key] = cached_response
 

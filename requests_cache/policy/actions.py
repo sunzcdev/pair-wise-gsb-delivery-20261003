@@ -18,6 +18,7 @@ from . import (
     KeyCallback,
     get_expiration_datetime,
     get_expiration_seconds,
+    get_revalidated_expiration,
     get_url_expiration,
     utcnow,
 )
@@ -279,19 +280,25 @@ class CacheActions(RichMixin):
         """After revalidation, update the cached response's expiration and headers"""
         logger.debug(f'Response for URL {response.request.url} has not been modified')
 
+        revalidated_at = utcnow()
+        # RFC 9111, section 4.3.4: first determine the unified corrected age of the (unchanged)
+        # content, then measure any relative freshness lifetime from that age.
+        revalidated_age = cached_response.update_revalidated_age(response.headers, revalidated_at)
+        new_expires = get_revalidated_expiration(self.expire_after, revalidated_age, revalidated_at)
+
         # Skip updating the cached response if expiration and headers are unchanged
         # OR if session/request settings skip it.
         # Ignore validators missing from new response, since they may be omitted
         headers_changed = any(
             cached_response.headers.get(k) != v for k, v in response.headers.items()
         )
-        expiration_changed = self.expires != cached_response.expires
+        expiration_changed = new_expires != cached_response.expires
         permanent_skip = (
             self._settings.read_only or self._settings.disabled or self._directives.no_store
         )
         self.skip_write = permanent_skip or not (expiration_changed or headers_changed)
 
-        cached_response.expires = self.expires
+        cached_response.expires = new_expires
 
         # Update headers;
         # Account for Transfer-Encoding in original response and Content-Length in 304 response

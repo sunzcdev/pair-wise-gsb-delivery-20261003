@@ -1,4 +1,4 @@
-from datetime import timedelta
+from datetime import datetime, timedelta, timezone
 from unittest.mock import patch
 
 import pytest
@@ -8,7 +8,15 @@ from requests.cookies import RequestsCookieJar
 from requests_cache.cache_keys import create_key
 from requests_cache.models import CachedRequest, CachedResponse
 from requests_cache.policy import EXPIRE_IMMEDIATELY, CacheActions, CacheSettings, utcnow
-from tests.conftest import ETAG, HTTPDATE_STR, LAST_MODIFIED, MOCKED_URL, create_mock_response
+from tests.conftest import (
+    ETAG,
+    HTTPDATE_STR,
+    LAST_MODIFIED,
+    MOCKED_URL,
+    create_mock_response,
+    skip_pypy,
+    time_travel,
+)
 
 IGNORED_DIRECTIVES = [
     'no-transform',
@@ -652,6 +660,200 @@ def test_update_revalidated_response__transfer_encoding():
     cached_response = actions.update_revalidated_response(new_response, cached_response)
     assert cached_response.headers['Transfer-Encoding'] == 'chunked'
     assert 'Content-Length' not in cached_response.headers
+
+
+REVALIDATION_T0 = datetime(2026, 11, 15, 12, 0, 0, tzinfo=timezone.utc)
+REVALIDATION_T0_STR = 'Sun, 15 Nov 2026 12:00:00 GMT'
+
+
+@skip_pypy
+def test_update_revalidated_response__preserves_body_age():
+    """A 304 response must not make an old cached body look freshly generated, even when the 304
+    itself carries a new Date/Age claiming the content is fresh"""
+    with time_travel(REVALIDATION_T0):
+        cached_response = CachedResponse(
+            url=MOCKED_URL,
+            status_code=200,
+            headers={'ETag': ETAG},
+            age_at_creation=300,
+            created_at=REVALIDATION_T0,
+            expires=REVALIDATION_T0 + timedelta(seconds=300),
+        )
+
+    with time_travel(REVALIDATION_T0 + timedelta(seconds=600)):
+        actions = CacheActions.from_request(
+            'key', BASIC_REQUEST, CacheSettings(cache_control=True)
+        )
+        new_response = create_mock_response(
+            status_code=304,
+            headers={
+                'ETag': ETAG,
+                'Cache-Control': 'max-age=600',
+                'Date': 'Sun, 15 Nov 2026 12:10:00 GMT',
+                'Age': '0',
+            },
+        )
+        actions.update_from_response(new_response)
+        result = actions.update_revalidated_response(
+            new_response, CachedResponse.from_response(cached_response)
+        )
+
+        # Total content age is the 300s it already had upstream plus 600s local residence
+        assert result.age_at_creation == 900
+        assert result.age == 900
+        # A 600s lifetime cannot revive content that is already 900s old
+        assert result.expires == REVALIDATION_T0 + timedelta(seconds=300)
+        assert result.expires_delta == -300
+        assert result.is_expired is True
+        assert result.created_at == REVALIDATION_T0 + timedelta(seconds=600)
+
+
+@skip_pypy
+def test_update_revalidated_response__higher_upstream_age_wins():
+    """If the 304 reports a higher age than the stored content, the higher value is used"""
+    with time_travel(REVALIDATION_T0):
+        cached_response = CachedResponse(
+            url=MOCKED_URL,
+            status_code=200,
+            headers={'ETag': ETAG},
+            age_at_creation=100,
+            created_at=REVALIDATION_T0,
+            expires=REVALIDATION_T0 + timedelta(seconds=200),
+        )
+
+    with time_travel(REVALIDATION_T0 + timedelta(seconds=300)):
+        actions = CacheActions.from_request(
+            'key', BASIC_REQUEST, CacheSettings(cache_control=True)
+        )
+        new_response = create_mock_response(
+            status_code=304,
+            headers={
+                'ETag': ETAG,
+                'Cache-Control': 'max-age=600',
+                'Date': 'Sun, 15 Nov 2026 12:05:00 GMT',
+                'Age': '500',
+            },
+        )
+        actions.update_from_response(new_response)
+        result = actions.update_revalidated_response(
+            new_response, CachedResponse.from_response(cached_response)
+        )
+
+        assert result.age_at_creation == 500
+        assert result.expires_delta == 100
+
+
+@skip_pypy
+def test_update_revalidated_response__without_age_headers():
+    """If the 304 has no age information, the stored content's current age is retained"""
+    with time_travel(REVALIDATION_T0):
+        cached_response = CachedResponse(
+            url=MOCKED_URL,
+            status_code=200,
+            headers={'ETag': ETAG},
+            age_at_creation=200,
+            created_at=REVALIDATION_T0,
+            expires=REVALIDATION_T0,
+        )
+
+    with time_travel(REVALIDATION_T0 + timedelta(seconds=300)):
+        actions = CacheActions.from_request(
+            'key', BASIC_REQUEST, CacheSettings(cache_control=True)
+        )
+        new_response = create_mock_response(
+            status_code=304,
+            headers={'ETag': ETAG, 'Cache-Control': 'max-age=600'},
+        )
+        actions.update_from_response(new_response)
+        result = actions.update_revalidated_response(
+            new_response, CachedResponse.from_response(cached_response)
+        )
+
+        assert result.age_at_creation == 500
+        assert result.age == 500
+        assert result.expires_delta == 100
+
+
+@skip_pypy
+def test_update_revalidated_response__immutable():
+    """`immutable` still means never expire after revalidation"""
+    with time_travel(REVALIDATION_T0):
+        cached_response = CachedResponse(
+            url=MOCKED_URL,
+            status_code=200,
+            headers={'ETag': ETAG},
+            age_at_creation=100,
+            created_at=REVALIDATION_T0,
+        )
+
+    with time_travel(REVALIDATION_T0 + timedelta(seconds=300)):
+        actions = CacheActions.from_request(
+            'key', BASIC_REQUEST, CacheSettings(cache_control=True)
+        )
+        new_response = create_mock_response(
+            status_code=304,
+            headers={'ETag': ETAG, 'Cache-Control': 'immutable'},
+        )
+        actions.update_from_response(new_response)
+        result = actions.update_revalidated_response(
+            new_response, CachedResponse.from_response(cached_response)
+        )
+
+        assert result.expires is None
+        assert result.age == 400
+
+
+@skip_pypy
+def test_is_usable__age_adjusted_expiration():
+    """is_usable() is based on expires, which already reflects the response's current age"""
+    # 600s lifetime, but the response was already 580s old when received -> only 20s left
+    cached_response = CachedResponse(
+        expires=REVALIDATION_T0 + timedelta(seconds=20),
+        age_at_creation=580,
+        created_at=REVALIDATION_T0,
+    )
+
+    with time_travel(REVALIDATION_T0 + timedelta(seconds=10)):
+        actions = CacheActions.from_request('key', BASIC_REQUEST)
+        assert actions.is_usable(cached_response) is True
+
+    with time_travel(REVALIDATION_T0 + timedelta(seconds=25)):
+        actions = CacheActions.from_request('key', BASIC_REQUEST)
+        assert actions.is_usable(cached_response) is False
+
+
+@skip_pypy
+@pytest.mark.parametrize('remaining, usable', [(20, False), (25, True)])
+def test_is_usable__min_fresh_with_aged_response(remaining, usable):
+    """min-fresh is measured against the remaining lifetime, not the original max-age"""
+    request = Request(method='GET', url=MOCKED_URL, headers={'Cache-Control': 'min-fresh=21'})
+    actions = CacheActions.from_request('key', request)
+    cached_response = CachedResponse(
+        expires=REVALIDATION_T0 + timedelta(seconds=remaining),
+        age_at_creation=580,
+        created_at=REVALIDATION_T0,
+    )
+    with time_travel(REVALIDATION_T0):
+        assert actions.is_usable(cached_response) is usable
+
+
+@skip_pypy
+@pytest.mark.parametrize('offset, usable', [(10, True), (35, False)])
+def test_is_usable__stale_while_revalidate_with_aged_response(offset, usable):
+    """The stale-while-revalidate window starts from the age-adjusted expiration"""
+    request = Request(method='GET', url=MOCKED_URL)
+    with time_travel(REVALIDATION_T0):
+        actions = CacheActions.from_request(
+            'key', request, CacheSettings(stale_while_revalidate=30)
+        )
+        actions._update_from_cached_response_headers(CachedResponse())
+    cached_response = CachedResponse(
+        expires=REVALIDATION_T0 + timedelta(seconds=20),
+        age_at_creation=580,
+        created_at=REVALIDATION_T0,
+    )
+    with time_travel(REVALIDATION_T0 + timedelta(seconds=20 + offset)):
+        assert actions.is_usable(cached_response) is usable
 
 
 @pytest.mark.parametrize('directive', IGNORED_DIRECTIVES)

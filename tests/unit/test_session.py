@@ -4,7 +4,7 @@ import json
 import pickle
 import sys
 from collections import UserDict, defaultdict
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from logging import getLogger
 from pathlib import Path
 from pickle import PickleError
@@ -1360,6 +1360,131 @@ def test_request_only_if_cached__prepared_request(mock_session):
     assert response.status_code == 504
     with pytest.raises(HTTPError):
         response.raise_for_status()
+
+
+@skip_pypy
+def test_age_header_shortens_expiration(mock_session):
+    """An upstream Age header shortens the remaining lifetime of a cached response"""
+    age_t0 = datetime(2026, 11, 15, 12, 0, 0, tzinfo=timezone.utc)
+    mock_session.mock_adapter.register_uri(
+        'GET',
+        MOCKED_URL,
+        headers={'Age': '300', 'Date': 'Sun, 15 Nov 2026 12:00:00 GMT'},
+        text='mock response',
+        status_code=200,
+    )
+
+    with time_travel(age_t0):
+        response = mock_session.get(MOCKED_URL, expire_after=600)
+        cached = mock_session.cache.get_response(response.cache_key)
+
+        # Lifetime is 600s, but 300s of it was already spent upstream
+        assert cached.age_at_creation == 300
+        assert cached.age == 300
+        assert cached.expires_delta == 300
+        assert abs((response.expires - cached.expires).total_seconds()) < 1
+
+    # Still fresh after 299s, stale after 301s
+    with time_travel(age_t0 + timedelta(seconds=299)):
+        assert mock_session.cache.get_response(response.cache_key).is_expired is False
+    with time_travel(age_t0 + timedelta(seconds=301)):
+        assert mock_session.cache.get_response(response.cache_key).is_expired is True
+
+
+@skip_pypy
+def test_invalid_age_does_not_extend_expiration(mock_session):
+    """Invalid or negative Age headers must not extend a response's lifetime"""
+    age_t0 = datetime(2026, 11, 15, 12, 0, 0, tzinfo=timezone.utc)
+    mock_session.mock_adapter.register_uri(
+        'GET',
+        MOCKED_URL,
+        headers={'Age': '-100', 'Date': 'garbage'},
+        text='mock response',
+        status_code=200,
+    )
+
+    with time_travel(age_t0):
+        response = mock_session.get(MOCKED_URL, expire_after=600)
+        cached = mock_session.cache.get_response(response.cache_key)
+        assert cached.age_at_creation == 0
+        assert cached.expires_delta == 600
+
+
+@skip_pypy
+def test_304_preserves_body_age(mock_session):
+    """After a 304 revalidation, the old body must not be treated as freshly generated"""
+    age_t0 = datetime(2026, 11, 15, 12, 0, 0, tzinfo=timezone.utc)
+    mock_session.settings.cache_control = True
+    mock_session.mock_adapter.register_uri(
+        'GET',
+        MOCKED_URL_ETAG,
+        headers={
+            'ETag': '"v1"',
+            'Cache-Control': 'max-age=600',
+            'Age': '300',
+            'Date': 'Sun, 15 Nov 2026 12:00:00 GMT',
+        },
+        status_code=200,
+    )
+
+    with time_travel(age_t0):
+        response = mock_session.get(MOCKED_URL_ETAG)
+        assert response.from_cache is False
+        cache_key = response.cache_key
+        assert mock_session.cache.get_response(cache_key).age_at_creation == 300
+
+    # Revalidate once the response is stale; the 304 claims the content is brand new
+    mock_session.mock_adapter.register_uri(
+        'GET',
+        MOCKED_URL_ETAG,
+        headers={
+            'ETag': '"v1"',
+            'Cache-Control': 'max-age=600',
+            'Age': '0',
+            'Date': 'Sun, 15 Nov 2026 12:10:00 GMT',
+        },
+        status_code=304,
+    )
+    with time_travel(age_t0 + timedelta(seconds=600)):
+        response = mock_session.get(MOCKED_URL_ETAG)
+        assert response.from_cache is True and response.revalidated is True
+        revalidated = mock_session.cache.get_response(cache_key)
+        # 300s of upstream age plus 600s of local residence is retained
+        assert revalidated.age_at_creation == 900
+        assert revalidated.age == 900
+        # So the content is already stale again, despite the new max-age=600
+        assert revalidated.is_expired is True
+        assert response.expires == revalidated.expires
+
+
+@skip_pypy
+def test_remaining_lifetime__memory_and_sqlite(mock_session, tempfile_path):
+    """The same entry read from an in-memory or SQLite backend has the same remaining lifetime"""
+    age_t0 = datetime(2026, 11, 15, 12, 0, 0, tzinfo=timezone.utc)
+    headers = {'Age': '300', 'Date': 'Sun, 15 Nov 2026 12:00:00 GMT'}
+    sessions = {
+        'sqlite': mock_session,
+        'memory': mount_mock_adapter(
+            CachedSession(tempfile_path, backend='memory', allowable_methods=ALL_METHODS)
+        ),
+    }
+
+    for name, session in sessions.items():
+        session.mock_adapter.register_uri(
+            'GET', MOCKED_URL, headers=headers, text='mock response', status_code=200
+        )
+        with time_travel(age_t0):
+            response = session.get(MOCKED_URL, expire_after=600)
+        key = response.cache_key
+
+        with time_travel(age_t0 + timedelta(seconds=120)):
+            cached = session.cache.get_response(key)
+            assert cached.age == 420, name
+            assert cached.expires_delta == 180, name
+            assert cached.is_expired is False, name
+
+    for session in sessions.values():
+        session.close()
 
 
 def test_revalidation__skip_update(mock_session):

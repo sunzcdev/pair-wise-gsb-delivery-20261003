@@ -7,12 +7,26 @@ import pytest
 from requests_cache.policy.expiration import (
     DO_NOT_CACHE,
     EXPIRE_IMMEDIATELY,
+    NEVER_EXPIRE,
+    get_age_adjusted_expiration,
+    get_age_header,
+    get_corrected_initial_age,
     get_expiration_datetime,
+    get_revalidated_expiration,
     get_url_expiration,
     utcnow,
 )
 from requests_cache.policy.directives import set_request_headers
-from tests.conftest import HTTPDATE_DATETIME, HTTPDATE_STR
+from tests.conftest import HTTPDATE_DATETIME, HTTPDATE_STR, skip_pypy, time_travel
+
+# A fixed local receive time, used with the controlled clock in tests/conftest.py
+AGE_T0 = datetime(2026, 11, 15, 12, 0, 0, tzinfo=timezone.utc)
+AGE_T0_STR = 'Sun, 15 Nov 2026 12:00:00 GMT'
+AGED_HEADERS = {
+    'Cache-Control': 'max-age=600',
+    'Age': '300',
+    'Date': AGE_T0_STR,
+}
 
 
 @patch('requests_cache.expiration.datetime')
@@ -131,3 +145,133 @@ def test_set_request_headers__do_not_cache():
     )
     assert 'X-ACTUAL-NO-CACHE' in headers
     assert 'Cache-Control' not in headers
+
+
+# Age header / response age
+# -------------------------
+
+
+@pytest.mark.parametrize(
+    'headers, expected_age',
+    [
+        ({}, 0),
+        ({'Age': '300'}, 300),
+        ({'Age': '0'}, 0),
+        ({'Age': 'not-a-number'}, 0),
+        ({'Age': ''}, 0),
+        ({'Age': '-100'}, 0),  # Negative ages must never extend the lifetime
+        ({'Age': '  120  '}, 120),
+    ],
+)
+def test_get_age_header(headers, expected_age):
+    assert get_age_header(headers) == expected_age
+
+
+@pytest.mark.parametrize(
+    'headers, expected_age',
+    [
+        ({}, 0),
+        # Age only
+        ({'Age': '250'}, 250),
+        # Date only; apparent age is measured from the receive time
+        ({'Date': 'Sun, 15 Nov 2026 11:56:40 GMT'}, 200),
+        # The larger of the two wins
+        ({'Date': 'Sun, 15 Nov 2026 11:58:20 GMT', 'Age': '400'}, 400),
+        ({'Date': 'Sun, 15 Nov 2026 11:56:40 GMT', 'Age': '100'}, 200),
+        # Invalid dates fall back to the Age header
+        ({'Date': 'not-a-date', 'Age': '150'}, 150),
+        ({'Date': 'garbage'}, 0),
+        # Invalid/negative Age is ignored, not treated as a negative offset
+        ({'Date': 'Sun, 15 Nov 2026 11:58:20 GMT', 'Age': '-400'}, 100),
+    ],
+)
+@skip_pypy
+def test_get_corrected_initial_age(headers, expected_age):
+    with time_travel(AGE_T0):
+        assert get_corrected_initial_age(headers) == expected_age
+
+
+@pytest.mark.parametrize(
+    'date_header',
+    [
+        'Sun, 15 Nov 2026 12:00:30 GMT',  # Within the clock skew tolerance
+        'Sun, 15 Nov 2026 13:00:00 GMT',  # Far in the future
+    ],
+)
+@skip_pypy
+def test_get_corrected_initial_age__future_date_clamped(date_header):
+    """A future Date (clock skew) must never produce a negative age"""
+    with time_travel(AGE_T0):
+        assert get_corrected_initial_age({'Date': date_header}) == 0
+
+
+@pytest.mark.parametrize(
+    'expire_after, expected_delta',
+    [
+        (600, 300),
+        (60, -240),
+        (timedelta(seconds=600), 300),
+        (600.5, 300.5),
+        (EXPIRE_IMMEDIATELY, 0),
+        (NEVER_EXPIRE, None),
+        (DO_NOT_CACHE, None),
+        (None, None),
+    ],
+)
+@skip_pypy
+def test_get_age_adjusted_expiration(expire_after, expected_delta):
+    """A relative lifetime is shortened by the response's corrected initial age"""
+    with time_travel(AGE_T0):
+        result = get_age_adjusted_expiration(AGED_HEADERS, expire_after)
+    if expected_delta is None:
+        assert result is None
+    else:
+        assert result == AGE_T0 + timedelta(seconds=expected_delta)
+
+
+@pytest.mark.parametrize('headers', [{}, {'Age': '-100'}, {'Age': 'junk'}, {'Date': 'garbage'}])
+@skip_pypy
+def test_get_age_adjusted_expiration__no_usable_age(headers):
+    """With no usable age information, a client-side expire_after keeps its full lifetime"""
+    with time_travel(AGE_T0):
+        assert get_age_adjusted_expiration(headers, 600) == AGE_T0 + timedelta(seconds=600)
+
+
+@skip_pypy
+def test_get_age_adjusted_expiration__absolute_is_fixed_point():
+    """An absolute expiration (datetime or Expires httpdate) is not shifted by current age"""
+    absolute = AGE_T0 + timedelta(seconds=999)
+    with time_travel(AGE_T0):
+        assert get_age_adjusted_expiration(AGED_HEADERS, absolute) == absolute
+        httpdate = 'Sun, 15 Nov 2026 12:16:39 GMT'
+        assert get_age_adjusted_expiration(AGED_HEADERS, httpdate) == absolute
+
+
+@pytest.mark.parametrize(
+    'expire_after, corrected_age, expected_delta',
+    [
+        (600, 500, 100),
+        (600, 900, -300),
+        (600, 0, 600),
+        (timedelta(seconds=600), 500, 100),
+        (EXPIRE_IMMEDIATELY, 500, 0),
+        (NEVER_EXPIRE, 500, None),
+        (DO_NOT_CACHE, 500, None),
+        (None, 500, None),
+    ],
+)
+@skip_pypy
+def test_get_revalidated_expiration(expire_after, corrected_age, expected_delta):
+    with time_travel(AGE_T0):
+        result = get_revalidated_expiration(expire_after, corrected_age)
+    if expected_delta is None:
+        assert result is None
+    else:
+        assert result == AGE_T0 + timedelta(seconds=expected_delta)
+
+
+@skip_pypy
+def test_get_revalidated_expiration__absolute_is_fixed_point():
+    absolute = AGE_T0 + timedelta(seconds=999)
+    with time_travel(AGE_T0):
+        assert get_revalidated_expiration(absolute, 500) == absolute

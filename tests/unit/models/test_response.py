@@ -1,4 +1,4 @@
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from io import BytesIO
 from json import loads
 from time import sleep
@@ -9,7 +9,10 @@ from urllib3.response import HTTPResponse
 
 from requests_cache.models.response import CachedResponse, OriginalResponse, format_file_size
 from requests_cache.policy import CacheActions, utcnow
-from tests.conftest import MOCKED_URL
+from tests.conftest import MOCKED_URL, skip_pypy, time_travel
+
+AGE_T0 = datetime(2026, 11, 15, 12, 0, 0, tzinfo=timezone.utc)
+AGE_T0_STR = 'Sun, 15 Nov 2026 12:00:00 GMT'
 
 
 def test_basic_attrs(mock_session):
@@ -165,6 +168,58 @@ def test_size(mock_session):
     assert response.size == 0
     response._content = b'1' * 1024
     assert response.size == 1024
+
+
+def test_age_default():
+    """Legacy cached entries (and freshly created responses) have no upstream age"""
+    response = CachedResponse()
+    assert response.age_at_creation == 0
+    assert response.age >= 0
+
+
+@skip_pypy
+def test_age_is_upstream_age_plus_local_residence():
+    with time_travel(AGE_T0):
+        response = CachedResponse(age_at_creation=300, created_at=AGE_T0)
+        assert response.age == 300
+
+    with time_travel(AGE_T0 + timedelta(seconds=100)):
+        assert response.age == 400
+
+
+@skip_pypy
+def test_age_is_never_negative():
+    """If created_at is in the future (e.g. a clock adjustment), age must not become negative"""
+    with time_travel(AGE_T0):
+        response = CachedResponse(age_at_creation=0, created_at=AGE_T0 + timedelta(seconds=300))
+        assert response.age == 0
+
+
+@skip_pypy
+def test_update_revalidated_age__preserves_old_body_age():
+    """A 304 response must not make an old cached body look freshly generated"""
+    with time_travel(AGE_T0):
+        response = CachedResponse(age_at_creation=300, created_at=AGE_T0)
+
+    with time_travel(AGE_T0 + timedelta(seconds=600)):
+        # A 304 with a new Date/Age must not lower the stored age below the current age
+        revalidated_age = response.update_revalidated_age({'Date': AGE_T0_STR, 'Age': '0'})
+        assert revalidated_age == 900
+        assert response.age_at_creation == 900
+        # The residence clock restarts at the revalidation time
+        assert response.created_at == AGE_T0 + timedelta(seconds=600)
+        assert response.age == 900
+
+
+@skip_pypy
+def test_update_revalidated_age__uses_higher_upstream_age():
+    with time_travel(AGE_T0):
+        response = CachedResponse(age_at_creation=100, created_at=AGE_T0)
+
+    with time_travel(AGE_T0 + timedelta(seconds=300)):
+        revalidated_age = response.update_revalidated_age({'Age': '500'})
+        assert revalidated_age == 500
+        assert response.age == 500
 
 
 def test_str(mock_session):
