@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from functools import lru_cache, singledispatch
-from typing import TYPE_CHECKING, Any, Callable, Generic, Literal, TypeVar
+from typing import TYPE_CHECKING, Any, Callable, Generic, Literal, NamedTuple, TypeVar
 
 from attrs import Factory, define
 
@@ -20,6 +20,31 @@ UnstructureHook: TypeAlias = Callable[[StructuredValue], UnstructuredValue]
 
 Hook = TypeVar("Hook", StructureHook, UnstructureHook)
 HookFactory: TypeAlias = Callable[[TargetType], Hook]
+
+#: Where a resolved hook ultimately came from.
+HookSourceKind: TypeAlias = Literal[
+    "singledispatch", "direct", "function", "factory", "fallback"
+]
+
+
+class ResolvedHook(NamedTuple):
+    """The outcome of resolving a hook for a type, without exposing the
+    dispatch internals.
+
+    :param hook: The hook that would be used to (un)structure the type.
+    :param kind: Where the hook came from.
+    :param handler: The registered handler or factory that produced the hook;
+        for the fallback, the fallback factory itself.
+    :param predicate: The matching predicate for function-dispatch entries.
+    :param generated: Whether the handler was a hook factory (and so was
+        invoked to produce the hook) rather than a directly registered hook.
+    """
+
+    hook: Callable[..., Any]
+    kind: HookSourceKind
+    handler: Callable[..., Any]
+    predicate: Predicate | None
+    generated: bool
 
 
 @define
@@ -47,6 +72,12 @@ class FunctionDispatch:
     _handler_pairs: list[tuple[Predicate, Callable[[Any, Any], Any], bool, bool]] = (
         Factory(list)
     )
+    # An optional recorder invoked whenever a hook factory is run. It receives
+    # the type, the factory and the produced hook. Used by the planning API to
+    # honestly report hook-factory side effects during preparation.
+    factory_recorder: (
+        Callable[[TargetType, Callable[..., Any], Callable[..., Any]], None] | None
+    ) = None
 
     def register(
         self,
@@ -72,10 +103,41 @@ class FunctionDispatch:
             if ch:
                 if is_generator:
                     if takes_converter:
-                        return handler(typ, self._converter)
-                    return handler(typ)
+                        hook = handler(typ, self._converter)
+                    else:
+                        hook = handler(typ)
+                    if self.factory_recorder is not None:
+                        self.factory_recorder(typ, handler, hook)
+                    return hook
 
                 return handler
+        return None
+
+    def resolve(
+        self, typ: Any
+    ) -> tuple[Callable[..., Any], Predicate, bool, bool] | None:
+        """Resolve the matching handler pair for ``typ``.
+
+        Returns a tuple of ``(handler, predicate, is_generator,
+        takes_converter)``, or ``None`` if no predicate matches. Factory
+        handlers are invoked (and recorded through ``factory_recorder``),
+        mirroring :meth:`dispatch`.
+        """
+        for can_handle, handler, is_generator, takes_converter in self._handler_pairs:
+            try:
+                ch = can_handle(typ)
+            except Exception:  # noqa: S112
+                continue
+            if ch:
+                if is_generator:
+                    if takes_converter:
+                        hook = handler(typ, self._converter)
+                    else:
+                        hook = handler(typ)
+                    if self.factory_recorder is not None:
+                        self.factory_recorder(typ, handler, hook)
+                    return hook, can_handle, True, takes_converter
+                return handler, can_handle, False, takes_converter
         return None
 
     def get_num_fns(self) -> int:
@@ -106,6 +168,9 @@ class MultiStrategyDispatch(Generic[Hook]):
     _direct_dispatch: dict[TargetType, Hook]
     _function_dispatch: FunctionDispatch
     _single_dispatch: Any
+    #: The singledispatch registry entries present after the converter's
+    #: built-in class hooks were registered. Later registrations are custom.
+    _builtin_single_dispatch: frozenset[Callable[..., Any]]
     dispatch: Callable[[TargetType, BaseConverter], Hook]
 
     def __init__(
@@ -115,7 +180,14 @@ class MultiStrategyDispatch(Generic[Hook]):
         self._direct_dispatch = {}
         self._function_dispatch = FunctionDispatch(converter)
         self._single_dispatch = singledispatch(_DispatchNotFound)
+        self._builtin_single_dispatch = frozenset()
         self.dispatch = lru_cache(maxsize=None)(self.dispatch_without_caching)
+
+    def snapshot_builtin_single_dispatch(self) -> None:
+        """Freeze the current singledispatch registry as the built-in set."""
+        self._builtin_single_dispatch = frozenset(
+            self._single_dispatch.registry.values()
+        )
 
     def dispatch_without_caching(self, typ: TargetType) -> Hook:
         """Dispatch on the type but without caching the result."""
@@ -131,7 +203,70 @@ class MultiStrategyDispatch(Generic[Hook]):
             return direct_dispatch
 
         res = self._function_dispatch.dispatch(typ)
-        return res if res is not None else self._fallback_factory(typ)
+        if res is not None:
+            return res
+        # The fallback itself is a hook factory; record it so the planning API
+        # can attribute a missing handler to the exact type that reaches it.
+        recorder = self._function_dispatch.factory_recorder
+        try:
+            hook = self._fallback_factory(typ)
+        except BaseException:
+            if recorder is not None:
+                recorder(typ, self._fallback_factory, None)
+            raise
+        if recorder is not None:
+            recorder(typ, self._fallback_factory, hook)
+        return hook
+
+    def resolve(self, typ: TargetType) -> ResolvedHook:
+        """Resolve the hook for ``typ`` and describe where it came from.
+
+        Unlike :meth:`dispatch`, this never caches, and it returns the
+        selected handler alongside its source. Hook factories selected by the
+        function dispatch are still invoked (and reported through the function
+        dispatch's ``factory_recorder``), because a hook cannot be selected
+        without producing it.
+        """
+        try:
+            hook = self._single_dispatch.dispatch(typ)
+            if hook is not _DispatchNotFound:
+                return ResolvedHook(hook, "singledispatch", hook, None, False)
+        except Exception:  # noqa: S110
+            pass
+
+        direct_hook = self._direct_dispatch.get(typ)
+        if direct_hook is not None:
+            return ResolvedHook(
+                direct_hook, "direct", direct_hook, None, False
+            )
+
+        resolved = self._function_dispatch.resolve(typ)
+        if resolved is not None:
+            hook, predicate, is_generator, _takes_converter = resolved
+            if is_generator:
+                return ResolvedHook(hook, "factory", hook, predicate, True)
+            return ResolvedHook(hook, "function", hook, predicate, False)
+
+        # The fallback itself is a hook factory, so record its invocation.
+        recorder = self._function_dispatch.factory_recorder
+        try:
+            hook = self._fallback_factory(typ)
+        except BaseException:
+            if recorder is not None:
+                recorder(typ, self._fallback_factory, None)
+            raise
+        if recorder is not None:
+            recorder(typ, self._fallback_factory, hook)
+        return ResolvedHook(hook, "fallback", self._fallback_factory, None, True)
+
+    def set_factory_recorder(
+        self,
+        recorder: (
+            Callable[[TargetType, Callable[..., Any], Callable[..., Any]], None] | None
+        ),
+    ) -> None:
+        """Install (or remove) a recorder for invoked hook factories."""
+        self._function_dispatch.factory_recorder = recorder
 
     def register_cls_list(self, cls_and_handler, direct: bool = False) -> None:
         """Register a class to direct or singledispatch."""
@@ -190,4 +325,7 @@ class MultiStrategyDispatch(Generic[Hook]):
         self._function_dispatch.copy_to(other._function_dispatch, skip=skip)
         for cls, fn in self._single_dispatch.registry.items():
             other._single_dispatch.register(cls, fn)
+        # Preserve the built-in hook set so the planning API still recognizes
+        # built-in class hooks after copying.
+        other._builtin_single_dispatch = self._builtin_single_dispatch
         other.clear_cache()

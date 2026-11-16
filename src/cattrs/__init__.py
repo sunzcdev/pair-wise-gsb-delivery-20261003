@@ -11,6 +11,13 @@ from .errors import (
     StructureHandlerNotFoundError,
 )
 from .gen import override
+from .planning import (
+    ConversionPlan,
+    FactoryInvocation,
+    HookSource,
+    TypeEdge,
+    TypeNode,
+)
 from .types import SimpleStructureHook
 from .v import transform_error
 
@@ -19,13 +26,18 @@ __all__ = [
     "BaseConverter",
     "BaseValidationError",
     "ClassValidationError",
+    "ConversionPlan",
     "Converter",
+    "FactoryInvocation",
     "ForbiddenExtraKeysError",
     "GenConverter",
+    "HookSource",
     "IterableValidationError",
     "IterableValidationNote",
     "SimpleStructureHook",
     "StructureHandlerNotFoundError",
+    "TypeEdge",
+    "TypeNode",
     "UnstructureStrategy",
     "get_structure_hook",
     "get_unstructure_hook",

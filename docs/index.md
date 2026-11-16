@@ -44,6 +44,7 @@ customizing
 strategies
 recipes
 validation
+planning
 preconf
 unions
 usage

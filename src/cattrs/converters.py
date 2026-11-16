@@ -9,7 +9,7 @@ from enum import Enum
 from inspect import Signature
 from inspect import signature as inspect_signature
 from pathlib import Path
-from typing import Any, Optional, Tuple, TypeVar, overload
+from typing import TYPE_CHECKING, Any, Optional, Tuple, TypeVar, overload
 
 from attrs import Attribute, resolve_types
 from attrs import has as attrs_has
@@ -91,7 +91,12 @@ from .errors import (
     IterableValidationNote,
     StructureHandlerNotFoundError,
 )
-from .fns import Predicate, identity, raise_error
+from .fns import (
+    Predicate,
+    default_structure_fallback_factory,
+    default_unstructure_fallback_factory,
+    identity,
+)
 from .gen import (
     AttributeOverride,
     HeteroTupleStructureFn,
@@ -120,6 +125,9 @@ from .typealiases import (
     type_alias_structure_factory,
 )
 from .types import SimpleStructureHook
+
+if TYPE_CHECKING:
+    from .planning import ConversionPlan
 
 __all__ = ["BaseConverter", "Converter", "GenConverter", "UnstructureStrategy"]
 
@@ -207,9 +215,11 @@ class BaseConverter:
         unstruct_strat: UnstructureStrategy = UnstructureStrategy.AS_DICT,
         prefer_attrib_converters: bool = False,
         detailed_validation: bool = True,
-        unstructure_fallback_factory: HookFactory[UnstructureHook] = lambda _: identity,
-        structure_fallback_factory: HookFactory[StructureHook] = lambda t: raise_error(
-            None, t
+        unstructure_fallback_factory: HookFactory[UnstructureHook] = (
+            default_unstructure_fallback_factory
+        ),
+        structure_fallback_factory: HookFactory[StructureHook] = (
+            default_structure_fallback_factory
         ),
     ) -> None:
         """
@@ -350,6 +360,11 @@ class BaseConverter:
                 (Path, self._structure_call),
             ]
         )
+
+        # Freeze the built-in hook sets so the planning API can tell
+        # converter-provided hooks apart from user-registered ones.
+        self._unstructure_func.snapshot_builtin_single_dispatch()
+        self._structure_func.snapshot_builtin_single_dispatch()
 
         self._dict_factory = dict_factory
 
@@ -661,6 +676,36 @@ class BaseConverter:
             if cache_result
             else self._structure_func.dispatch_without_caching(type)
         )
+
+    def plan_structure(self, type: Any) -> ConversionPlan:
+        """Prepare a structuring plan for ``type`` without structuring anything.
+
+        The plan describes, for every reachable type position, the hook that
+        would ultimately be used (and where it came from), the recursive edges
+        of the type graph, any missing handlers and any unverified ``Any`` or
+        ``TypeVar`` positions.
+
+        Preparation does not call field conversion hooks or object
+        constructors. It may still run registered hook factories in order to
+        select their hooks; those invocations (and any side effects they
+        perform) are recorded on the plan's ``factory_invocations``.
+
+        .. versionadded:: NEXT
+        """
+        from .planning import plan_structure
+
+        return plan_structure(self, type)
+
+    def plan_unstructure(self, type: Any) -> ConversionPlan:
+        """Prepare an unstructuring plan for ``type`` without unstructuring it.
+
+        See :meth:`plan_structure` for the semantics and caveats.
+
+        .. versionadded:: NEXT
+        """
+        from .planning import plan_unstructure
+
+        return plan_unstructure(self, type)
 
     # Classes to Python primitives.
     def unstructure_attrs_asdict(self, obj: Any) -> dict[str, Any]:
@@ -1119,9 +1164,11 @@ class Converter(BaseConverter):
         unstruct_collection_overrides: Mapping[type, UnstructureHook] = {},
         prefer_attrib_converters: bool = False,
         detailed_validation: bool = True,
-        unstructure_fallback_factory: HookFactory[UnstructureHook] = lambda _: identity,
-        structure_fallback_factory: HookFactory[StructureHook] = lambda t: raise_error(
-            None, t
+        unstructure_fallback_factory: HookFactory[UnstructureHook] = (
+            default_unstructure_fallback_factory
+        ),
+        structure_fallback_factory: HookFactory[StructureHook] = (
+            default_structure_fallback_factory
         ),
         use_alias: bool = False,
     ):

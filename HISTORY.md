@@ -13,6 +13,7 @@ Our backwards-compatibility policy can be found [here](https://github.com/python
 
 ## NEXT
 
+- Add preparation-only conversion planning: {meth}`BaseConverter.plan_structure` and {meth}`BaseConverter.plan_unstructure` (and the {mod}`cattrs.planning` module) produce a {class}`~cattrs.ConversionPlan` listing every reachable type position, the hook ultimately selected for each (and whether it is a built-in or custom hook), the recursive edges of the type graph, missing handlers, unverified `Any`/`TypeVar` positions and every hook factory executed during preparation. Planning never invokes field conversion hooks or object constructors, but hook factories may still run and are recorded explicitly since they can have side effects.
 - Fix the msgspec converter passing typed deques directly to the encoder, which cannot serialize them. Deques are now unstructured into lists, including when nested in attrs classes or dataclasses.
   ([#818](https://github.com/python-attrs/cattrs/issues/818) [#819](https://github.com/python-attrs/cattrs/pull/819))
 
