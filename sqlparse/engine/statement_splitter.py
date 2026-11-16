@@ -12,6 +12,10 @@ from sqlparse import tokens as T
 class StatementSplitter:
     """Filter that split stream at individual statements"""
 
+    #: Token types that may trail a finished statement without
+    #: starting the next one.
+    EOS_TTYPE = T.Whitespace, T.Comment.Single
+
     def __init__(self):
         self._reset()
 
@@ -150,47 +154,64 @@ class StatementSplitter:
 
     def process(self, stream):
         """Process the stream"""
-        EOS_TTYPE = T.Whitespace, T.Comment.Single
-
         # Run over all stream tokens
         for ttype, value in stream:
-            # Yield token if we finished a statement and there's no whitespaces
-            # It will count newline token as a non whitespace. In this context
-            # whitespace ignores newlines.
-            # why don't multi line comments also count?
-            if self.consume_ws and ttype not in EOS_TTYPE:
-                yield sql.Statement(self.tokens)
-
-                # Reset filter and prepare to process next statement
-                self._reset()
-
-            # Change current split level (increase, decrease or remain equal)
-            self.level += self._change_splitlevel(ttype, value)
-
-            # Append the token to the current statement
-            self.tokens.append(sql.Token(ttype, value))
-
-            # Check if we get the end of a statement
-            # Issue762: Allow GO (or "GO 2") as statement splitter.
-            # When implementing a language toggle, it's not only to add
-            # keywords it's also to change some rules, like this splitting
-            # rule.
-            # Issue809: Ignore semicolons inside BEGIN...END blocks, but handle
-            # standalone BEGIN; as a transaction statement
-            if ttype is T.Punctuation and value == ';':
-                self._seen_begin = False
-                # Split on semicolon if not inside a BEGIN...END block
-                if self.level <= 0 and 'BEGIN' not in self._block_stack:
-                    self.consume_ws = True
-            elif ttype is T.Keyword and value.split()[0] == 'GO':
-                self.consume_ws = True
-            elif (ttype not in (T.Whitespace, T.Newline, T.Comment.Single,
-                                T.Comment.Multiline)
-                  and not (ttype is T.Keyword and value.upper() == 'BEGIN')):
-                # Reset _seen_begin if we see a non-whitespace, non-comment
-                # token but not for BEGIN itself (which just set the flag)
-                self._seen_begin = False
+            stmt = self._process_token(ttype, value)
+            if stmt is not None:
+                yield stmt
 
         # Yield pending statement (if any)
+        stmt = self._get_pending()
+        if stmt is not None:
+            yield stmt
+
+    def _process_token(self, ttype, value):
+        """Process a single token.
+
+        Returns a completed :class:`~sqlparse.sql.Statement` when the
+        token finishes the pending statement, else ``None``.
+        """
+        # Yield token if we finished a statement and there's no whitespaces
+        # It will count newline token as a non whitespace. In this context
+        # whitespace ignores newlines.
+        # why don't multi line comments also count?
+        stmt = None
+        if self.consume_ws and ttype not in self.EOS_TTYPE:
+            stmt = sql.Statement(self.tokens)
+
+            # Reset filter and prepare to process next statement
+            self._reset()
+
+        # Change current split level (increase, decrease or remain equal)
+        self.level += self._change_splitlevel(ttype, value)
+
+        # Append the token to the current statement
+        self.tokens.append(sql.Token(ttype, value))
+
+        # Check if we get the end of a statement
+        # Issue762: Allow GO (or "GO 2") as statement splitter.
+        # When implementing a language toggle, it's not only to add
+        # keywords it's also to change some rules, like this splitting
+        # rule.
+        # Issue809: Ignore semicolons inside BEGIN...END blocks, but handle
+        # standalone BEGIN; as a transaction statement
+        if ttype is T.Punctuation and value == ';':
+            self._seen_begin = False
+            # Split on semicolon if not inside a BEGIN...END block
+            if self.level <= 0 and 'BEGIN' not in self._block_stack:
+                self.consume_ws = True
+        elif ttype is T.Keyword and value.split()[0] == 'GO':
+            self.consume_ws = True
+        elif (ttype not in (T.Whitespace, T.Newline, T.Comment.Single,
+                            T.Comment.Multiline)
+              and not (ttype is T.Keyword and value.upper() == 'BEGIN')):
+            # Reset _seen_begin if we see a non-whitespace, non-comment
+            # token but not for BEGIN itself (which just set the flag)
+            self._seen_begin = False
+        return stmt
+
+    def _get_pending(self):
+        """Return the pending statement at end of stream, if any."""
         if self.tokens and not all(t.is_whitespace for t in self.tokens):
-            yield sql.Statement(self.tokens)
+            return sql.Statement(self.tokens)
+        return None

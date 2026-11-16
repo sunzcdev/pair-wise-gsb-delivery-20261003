@@ -1,3 +1,17 @@
+Notable Changes (unreleased)
+----------------------------
+
+* Added `sqlparse.splitstream()`, a new entry point that splits SQL
+  statements from an iterable of text chunks (e.g. an ETL pipeline
+  receiving network packets).  Complete statements are produced as soon
+  as they appear; string literals, comments, dollar-quoted literals and
+  BEGIN ... END block state are tracked across chunk boundaries, so the
+  result is identical to `sqlparse.split()` on the joined input no
+  matter where chunks are cut.  Only the currently unfinished statement
+  is kept in memory.  The companion class
+  `sqlparse.engine.StreamStatementSplitter` reports a separate
+  incomplete status when the input ends with unclosed structures.
+
 Release 0.6.1 (Nov 01, 2026)
 ----------------------------
 

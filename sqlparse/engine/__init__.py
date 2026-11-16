@@ -8,9 +8,15 @@
 from sqlparse.engine import grouping
 from sqlparse.engine.filter_stack import FilterStack
 from sqlparse.engine.statement_splitter import StatementSplitter
+from sqlparse.engine.stream_splitter import (
+    StreamSplitResult,
+    StreamStatementSplitter,
+)
 
 __all__ = [
     'FilterStack',
     'StatementSplitter',
+    'StreamSplitResult',
+    'StreamStatementSplitter',
     'grouping',
 ]

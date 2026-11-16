@@ -8,7 +8,7 @@
 """Parse SQL statements."""
 
 # Setup namespace
-from collections.abc import Generator
+from collections.abc import Generator, Iterable
 from typing import IO, Any
 
 from sqlparse import cli, engine, filters, formatter, sql, tokens
@@ -73,3 +73,38 @@ def split(
     """
     stack = engine.FilterStack(strip_semicolon=strip_semicolon)
     return [str(stmt).strip() for stmt in stack.run(sql, encoding)]
+
+
+def splitstream(
+    chunks: Iterable[str], encoding: str | None = None
+) -> Generator[str, None, None]:
+    """Split sql statements from an iterable of text chunks.
+
+    Unlike :func:`parsestream`, which may read the whole input before
+    producing statements, this generator consumes the input chunk by
+    chunk and yields each statement as soon as it is complete.  Only the
+    currently unfinished statement is kept in memory.
+
+    The result is identical to :func:`split` called on the joined
+    chunks, regardless of where the chunk boundaries fall -- even in the
+    middle of escape sequences, string or dollar-quoted literals,
+    comments, or semicolons.
+
+    Use :class:`sqlparse.engine.StreamStatementSplitter` directly when
+    you need to know whether the input ended with unclosed structures
+    (string, comment, dollar-quoted literal, parenthesis or
+    BEGIN ... END block); its ``close()`` method reports a separate
+    incomplete status for that case.
+
+    :param chunks: An iterable of text chunks (``str``, or ``bytes``
+        when *encoding* is given).
+    :param encoding: The encoding of byte chunks (optional).
+    :returns: A generator of strings.
+    """
+    splitter = engine.StreamStatementSplitter(encoding=encoding)
+    for chunk in chunks:
+        yield from splitter.feed(chunk)
+    result = splitter.close()
+    yield from result.statements
+    if result.statement is not None:
+        yield result.statement
