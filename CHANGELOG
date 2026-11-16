@@ -1,3 +1,17 @@
+Development
+-----------
+
+Enhancements
+
+* `format()` accepts a new option `protected_regions`: a sequence of
+  non-overlapping `(start, end)` character offsets into the original SQL
+  text whose content is emitted verbatim.  Case conversion, comment
+  stripping, reindentation and output escaping leave protected text
+  untouched, while the text around the regions is formatted as usual.
+  Region boundaries must coincide with token boundaries, otherwise an
+  `SQLParseError` is raised before any formatting takes place.
+
+
 Release 0.6.1 (Nov 01, 2026)
 ----------------------------
 

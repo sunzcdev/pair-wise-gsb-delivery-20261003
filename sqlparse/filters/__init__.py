@@ -19,6 +19,7 @@ from sqlparse.filters.right_margin import RightMarginFilter
 from sqlparse.filters.tokens import (
     IdentifierCaseFilter,
     KeywordCaseFilter,
+    ProtectedRegionFilter,
     TruncateStringFilter,
 )
 
@@ -28,6 +29,7 @@ __all__ = [
     'KeywordCaseFilter',
     'OutputPHPFilter',
     'OutputPythonFilter',
+    'ProtectedRegionFilter',
     'ReindentFilter',
     'RightMarginFilter',
     'SerializerUnicode',

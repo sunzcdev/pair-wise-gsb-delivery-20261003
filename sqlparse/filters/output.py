@@ -19,6 +19,17 @@ class OutputFilter:
     def _process(self, stream, varname, has_nl):
         raise NotImplementedError
 
+    @staticmethod
+    def _expand(tokens):
+        """Yield tokens, descending into groups that contain protected
+        regions so those can be emitted verbatim."""
+        for token in tokens:
+            if token.is_group and any(
+                    t.ttype is T.Protected for t in token.flatten()):
+                yield from OutputFilter._expand(token.tokens)
+            else:
+                yield token
+
     def process(self, stmt):
         self.count += 1
         if self.count > 1:
@@ -27,7 +38,7 @@ class OutputFilter:
             varname = self.varname
 
         has_nl = len(str(stmt).strip().splitlines()) > 1
-        stmt.tokens = self._process(stmt.tokens, varname, has_nl)
+        stmt.tokens = self._process(self._expand(stmt.tokens), varname, has_nl)
         return stmt
 
 
@@ -46,6 +57,11 @@ class OutputPythonFilter(OutputFilter):
 
         # Print the tokens on the quote
         for token in stream:
+            # Protected regions are emitted verbatim, without escaping
+            if token.ttype is T.Protected:
+                yield sql.Token(T.Text, token.value)
+                continue
+
             # Token is a new line separator
             if token.is_whitespace and '\n' in token.value:
                 # Close quote and add a new line
@@ -94,6 +110,11 @@ class OutputPHPFilter(OutputFilter):
 
         # Print the tokens on the quote
         for token in stream:
+            # Protected regions are emitted verbatim, without escaping
+            if token.ttype is T.Protected:
+                yield sql.Token(T.Text, token.value)
+                continue
+
             # Token is a new line separator
             if token.is_whitespace and '\n' in token.value:
                 # Close quote and add a new line

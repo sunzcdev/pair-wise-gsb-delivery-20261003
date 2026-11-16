@@ -84,6 +84,17 @@ The :meth:`~sqlparse.format` function accepts the following keyword arguments.
 ``comma_first``
   If ``True`` comma-first notation for column names is used.
 
+``protected_regions``
+  A sequence of ``(start, end)`` character offsets into the original SQL
+  text.  The text inside each region is emitted verbatim: case conversion,
+  comment stripping, reindentation and output escaping leave it untouched,
+  while the text around the regions is formatted as usual.  Regions must
+  not overlap and both offsets must coincide with token boundaries,
+  otherwise :class:`~sqlparse.exceptions.SQLParseError` is raised before
+  any formatting takes place.  If a region contains line breaks, they are
+  still taken into account when computing column positions for the
+  surrounding text.  By default no regions are protected.
+
 
 Security and Performance Considerations
 ---------------------------------------

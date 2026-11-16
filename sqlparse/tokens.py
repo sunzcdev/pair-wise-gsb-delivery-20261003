@@ -41,6 +41,9 @@ Newline = Whitespace.Newline
 Error = Token.Error
 # Text that doesn't belong to this lexer (e.g. HTML in PHP)
 Other = Token.Other
+# Text inside a protected region (see the "protected_regions" format
+# option).  Such tokens are passed through verbatim by all filters.
+Protected = Token.Protected
 
 # Common token types for source code
 Keyword = Token.Keyword

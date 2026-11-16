@@ -131,6 +131,32 @@ def validate_options(options):
             raise SQLParseError('right_margin requires an integer > 10')
     options['right_margin'] = right_margin
 
+    protected_regions = options.get('protected_regions')
+    if protected_regions is None:
+        protected_regions = ()
+    else:
+        normalized = []
+        try:
+            for region in protected_regions:
+                start, end = region
+                normalized.append((int(start), int(end)))
+        except (TypeError, ValueError):
+            raise SQLParseError(
+                'protected_regions requires (start, end) pairs of integers')
+        normalized.sort()
+        prev_end = 0
+        for start, end in normalized:
+            if start < 0 or end <= start:
+                raise SQLParseError(
+                    'protected_regions requires 0 <= start < end, got: '
+                    f'{(start, end)!r}')
+            if start < prev_end:
+                raise SQLParseError(
+                    'protected_regions must not overlap')
+            prev_end = end
+        protected_regions = tuple(normalized)
+    options['protected_regions'] = protected_regions
+
     return options
 
 
@@ -141,6 +167,12 @@ def build_filter_stack(stack, options):
       stack: :class:`~sqlparse.filters.FilterStack` instance
       options: Dictionary with options validated by validate_options.
     """
+    # Protected regions are merged into single tokens before any other
+    # filter sees the token stream, so their content stays verbatim.
+    if options.get('protected_regions'):
+        stack.preprocess.append(
+            filters.ProtectedRegionFilter(options['protected_regions']))
+
     # Token filter
     if options.get('keyword_case'):
         stack.preprocess.append(

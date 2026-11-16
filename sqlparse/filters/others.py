@@ -175,6 +175,38 @@ class StripTrailingSemicolonFilter:
 
 class SerializerUnicode:
     @staticmethod
-    def process(stmt):
-        lines = split_unquoted_newlines(stmt)
+    def _serialize(text, rstrip_last=True):
+        lines = split_unquoted_newlines(text)
+        if not rstrip_last and lines:
+            # The last line continues into a protected region, so its
+            # end is not a real line break and must not be rstripped.
+            return '\n'.join(
+                [line.rstrip() for line in lines[:-1]] + [lines[-1]])
         return '\n'.join(line.rstrip() for line in lines)
+
+    @staticmethod
+    def process(stmt):
+        # Note: stmt.tokens may be a one-shot generator (e.g. when an
+        # output filter ran before), so flatten exactly once and build
+        # the text from the collected tokens.
+        tokens = list(stmt.flatten())
+        if not any(token.ttype is T.Protected for token in tokens):
+            text = ''.join(token.value for token in tokens)
+            return SerializerUnicode._serialize(text)
+        # Protected regions are emitted verbatim; only the text around
+        # them is normalized.  Region boundaries coincide with token
+        # boundaries, so quoting state cannot leak across a region.
+        parts = []
+        plain = []
+        for token in tokens:
+            if token.ttype is T.Protected:
+                if plain:
+                    parts.append(SerializerUnicode._serialize(
+                        ''.join(plain), rstrip_last=False))
+                    del plain[:]
+                parts.append(token.value)
+            else:
+                plain.append(token.value)
+        if plain:
+            parts.append(SerializerUnicode._serialize(''.join(plain)))
+        return ''.join(parts)

@@ -756,6 +756,147 @@ class TestOutputFormat:
             sqlparse.format(sql, output_format='foo')
 
 
+class TestProtectedRegions:
+    # "protected_regions" holds (start, end) character offsets into the
+    # original SQL text whose content must be emitted verbatim.
+
+    def test_keyword_case_skips_protected(self):
+        sql = 'select foo from bar'
+        formatted = sqlparse.format(sql, keyword_case='upper',
+                                    protected_regions=[(7, 15)])
+        assert formatted == 'SELECT foo from bar'
+
+    def test_identifier_case_skips_protected(self):
+        sql = 'select foo from bar'
+        formatted = sqlparse.format(sql, identifier_case='upper',
+                                    protected_regions=[(7, 10)])
+        assert formatted == 'select foo from BAR'
+
+    def test_region_covering_whole_statement(self):
+        sql = 'select foo from bar'
+        formatted = sqlparse.format(sql, keyword_case='upper',
+                                    protected_regions=[(0, 19)])
+        assert formatted == sql
+
+    def test_multiple_regions(self):
+        sql = 'select foo from bar'
+        formatted = sqlparse.format(sql, keyword_case='upper',
+                                    protected_regions=[(0, 6), (7, 10)])
+        assert formatted == 'select foo FROM bar'
+
+    def test_unsorted_regions_are_accepted(self):
+        sql = 'select foo from bar'
+        formatted = sqlparse.format(sql, keyword_case='upper',
+                                    protected_regions=[(7, 10), (0, 6)])
+        assert formatted == 'select foo FROM bar'
+
+    def test_region_start_must_be_token_boundary(self):
+        sql = 'select foo from bar'
+        with pytest.raises(SQLParseError):
+            sqlparse.format(sql, protected_regions=[(8, 15)])
+
+    def test_region_end_must_be_token_boundary(self):
+        sql = 'select foo from bar'
+        with pytest.raises(SQLParseError):
+            sqlparse.format(sql, protected_regions=[(7, 14)])
+
+    def test_region_beyond_input(self):
+        sql = 'select foo from bar'
+        with pytest.raises(SQLParseError):
+            sqlparse.format(sql, protected_regions=[(16, 25)])
+
+    @pytest.mark.parametrize('regions', [
+        [(7, 12), (10, 15)],   # overlapping
+        [(10, 7)],             # end before start
+        [(7, 7)],              # empty region
+        [(-1, 7)],             # negative start
+        ['foo'],               # not pairs
+        [(1, 2, 3)],           # not a pair
+    ])
+    def test_invalid_regions(self, regions):
+        sql = 'select foo from bar'
+        with pytest.raises(SQLParseError):
+            sqlparse.format(sql, protected_regions=regions)
+
+    def test_strip_comments_keeps_protected(self):
+        sql = 'select a -- keep me\nfrom t'
+        formatted = sqlparse.format(sql, strip_comments=True,
+                                    protected_regions=[(9, 20)])
+        assert formatted == sql
+
+    def test_strip_comments_still_strips_unprotected(self):
+        sql = 'select a -- keep me\nfrom t -- drop me'
+        formatted = sqlparse.format(sql, strip_comments=True,
+                                    protected_regions=[(9, 20)])
+        assert formatted == 'select a -- keep me\nfrom t'
+
+    def test_truncate_strings_skips_protected(self):
+        sql = "select 'abcdef', 'ghijkl' from t"
+        formatted = sqlparse.format(sql, truncate_strings=3,
+                                    protected_regions=[(7, 15)])
+        assert formatted == "select 'abcdef', 'ghi[...]' from t"
+
+    def test_semicolon_in_region_does_not_split(self):
+        sql = 'select 1; select 2'
+        formatted = sqlparse.format(sql, keyword_case='upper',
+                                    protected_regions=[(8, 10)])
+        assert formatted == 'SELECT 1; SELECT 2'
+
+    def test_reindent_keeps_region_verbatim(self):
+        sql = 'select x\ny, z from t'
+        formatted = sqlparse.format(sql, reindent=True,
+                                    protected_regions=[(7, 10)])
+        assert formatted == 'select x\ny, z\nfrom t'
+
+    def test_reindent_column_position_after_region_newline(self):
+        # The newline inside the protected region must be taken into
+        # account when computing column positions for the text after it:
+        # "g" aligns under "f" on the line started by protected "y".
+        sql = 'select x\ny, f(b, c), g from t'
+        formatted = sqlparse.format(sql, reindent=True,
+                                    protected_regions=[(7, 10)])
+        assert formatted == '\n'.join([
+            'select x',
+            'y, f(b, c),',
+            '   g',
+            'from t'])
+
+    def test_region_with_trailing_whitespace_stays_verbatim(self):
+        sql = 'select x  \ny, z from t'
+        formatted = sqlparse.format(sql, protected_regions=[(7, 12)])
+        assert formatted == sql
+
+    def test_output_python_does_not_escape_protected(self):
+        sql = "select a, 'x' from t"
+        formatted = sqlparse.format(sql, output_format='python',
+                                    protected_regions=[(10, 13)])
+        assert formatted == "sql = 'select a, 'x' from t'"
+
+    def test_output_python_escapes_unprotected(self):
+        sql = "select a, 'x' from t"
+        formatted = sqlparse.format(sql, output_format='python')
+        assert formatted == "sql = 'select a, \\'x\\' from t'"
+
+    def test_output_python_protected_inside_group(self):
+        sql = "select (a + 'x') from t"
+        formatted = sqlparse.format(sql, output_format='python',
+                                    protected_regions=[(12, 15)])
+        assert formatted == "sql = 'select (a + 'x') from t'"
+
+    def test_output_php_does_not_escape_protected(self):
+        sql = "select a, $x from t"
+        formatted = sqlparse.format(sql, output_format='php',
+                                    protected_regions=[(10, 12)])
+        assert formatted == '$sql = "select a, $x from t";'
+
+    def test_no_regions_by_default(self):
+        # the regular entry point does not require the option
+        sql = 'select foo from bar'
+        assert sqlparse.format(sql, keyword_case='upper') == \
+            'SELECT foo FROM bar'
+        assert sqlparse.format(sql, protected_regions=None) == sql
+
+
 def test_format_column_ordering():
     # issue89
     sql = 'select * from foo order by c1 desc, c2, c3;'
