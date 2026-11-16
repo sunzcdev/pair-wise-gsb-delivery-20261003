@@ -414,6 +414,34 @@ A single attribute can be included by overriding it with `omit=False`.
 ClassWithInitFalse(number=2)
 ```
 
+Since `init=False` fields are not accepted by the constructor, their values are
+assigned to the instance *after* it has been created. This means frozen classes
+(both _attrs_ and dataclasses), and individual fields made read-only with a
+frozen `on_setattr` hook, cannot have their `init=False` fields restored.
+Generating a structuring hook that includes such a field raises a
+{class}`~cattrs.FrozenStructureError` while the hook is being generated, before
+any instance is constructed.
+
+```{doctest}
+
+>>> from attrs import frozen
+>>> from cattrs import FrozenStructureError
+>>>
+>>> @frozen
+... class FrozenWithInitFalse:
+...    number: int
+...    doubled: int = field(default=0, init=False)
+>>>
+>>> c = cattrs.Converter()
+>>> try:
+...     make_dict_structure_fn(
+...         FrozenWithInitFalse, c, _cattrs_include_init_false=True
+...     )
+... except FrozenStructureError as exc:
+...     print(type(exc).__name__)
+FrozenStructureError
+```
+
 ```{versionadded} 23.2.0
 
 ```

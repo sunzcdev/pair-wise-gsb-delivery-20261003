@@ -9,6 +9,7 @@ from cattrs.errors import (
     BaseValidationError,
     ClassValidationError,
     ForbiddenExtraKeysError,
+    FrozenStructureError,
     IterableValidationError,
     StructureHandlerNotFoundError,
 )
@@ -21,6 +22,7 @@ from cattrs.errors import (
         (ForbiddenExtraKeysError, ("Forbidden Message", int, {"foo", "bar"})),
         (ForbiddenExtraKeysError, ("", str, {"foo", "bar"})),
         (ForbiddenExtraKeysError, (None, list, {"foo", "bar"})),
+        (FrozenStructureError, (int, ("foo", "bar"))),
         (
             BaseValidationError,
             ("BaseValidation Message", [ValueError("Test BaseValidation")], int),

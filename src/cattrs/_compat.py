@@ -45,6 +45,17 @@ from attrs import NOTHING, Attribute, Factory, NothingType, resolve_types
 from attrs import fields as attrs_fields
 from attrs import fields_dict as attrs_fields_dict
 
+try:
+    # The frozen class marker used by modern attrs releases.
+    from attr._make import _frozen_setattrs
+except ImportError:  # pragma: no cover
+    _frozen_setattrs = None
+
+try:
+    from attrs.setters import frozen as _frozen_setter
+except ImportError:  # pragma: no cover
+    _frozen_setter = None
+
 __all__ = [
     "ANIES",
     "ExceptionGroup",
@@ -53,6 +64,8 @@ __all__ = [
     "adapted_fields",
     "fields_dict",
     "has",
+    "is_attrs_frozen",
+    "is_frozen_setter",
     "is_typeddict",
 ]
 
@@ -115,6 +128,51 @@ def is_typeddict(cls: Any):
 
 def has(cls):
     return hasattr(cls, "__attrs_attrs__") or hasattr(cls, "__dataclass_fields__")
+
+
+def is_attrs_frozen(cl: type) -> bool:
+    """Whether *cl* is frozen, and so its instances reject attribute assignment.
+
+    Covers frozen _attrs_ classes (including frozen subclasses) and frozen
+    dataclasses, both of which install a ``__setattr__`` that raises instead of
+    writing to the instance.
+    """
+    setattr_fn = getattr(cl, "__setattr__", None)
+    if _frozen_setattrs is not None and setattr_fn is _frozen_setattrs:
+        # Frozen attrs classes, including classes inheriting from a frozen base.
+        return True
+    if is_dataclass(cl):
+        # Frozen dataclasses generate their own raising __setattr__.
+        params = getattr(cl, "__dataclass_params__", None)
+        return bool(getattr(params, "frozen", False))
+    return False
+
+
+def is_frozen_setter(attribute: Attribute) -> bool:
+    """Whether *attribute* has a read-only ``on_setattr`` hook.
+
+    A plain ``attrs.setters.frozen`` hook is recognized directly; composite
+    hooks (such as ``attrs.setters.pipe(...)``) are treated as frozen whenever
+    they contain the frozen setter, since any assignment then raises.
+    """
+    on_setattr = getattr(attribute, "on_setattr", None)
+    if on_setattr is None or _frozen_setter is None:
+        return False
+    if on_setattr is _frozen_setter:
+        return True
+
+    def contains_frozen(obj: Any) -> bool:
+        if obj is _frozen_setter:
+            return True
+        # `attrs.setters.pipe` closes over a tuple of the wrapped setters.
+        if isinstance(obj, tuple):
+            return any(contains_frozen(item) for item in obj)
+        return False
+
+    closure = getattr(on_setattr, "__closure__", None)
+    return closure is not None and any(
+        contains_frozen(cell.cell_contents) for cell in closure
+    )
 
 
 def has_with_generic(cls):

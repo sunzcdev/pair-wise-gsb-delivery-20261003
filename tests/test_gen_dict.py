@@ -1,17 +1,22 @@
 """Tests for generated dict functions."""
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field as dcfield
 from math import ceil
 from typing import Annotated, Dict, Literal, Type, Union
 
 import pytest
 from attrs import NOTHING, Factory, define, field, frozen
+from attrs.setters import frozen as frozen_setter
 from hypothesis import assume, given
 from hypothesis.strategies import data, just, one_of, sampled_from
 
 from cattrs import BaseConverter, Converter
 from cattrs._compat import adapted_fields, fields
-from cattrs.errors import ClassValidationError, ForbiddenExtraKeysError
+from cattrs.errors import (
+    ClassValidationError,
+    ForbiddenExtraKeysError,
+    FrozenStructureError,
+)
 from cattrs.gen import (
     make_dict_structure_fn,
     make_dict_unstructure_fn,
@@ -703,6 +708,238 @@ def test_init_false_no_structure_hook(converter: BaseConverter):
     res.a = 5
 
     assert converter.structure({"a": "5"}, A) == res
+
+
+def test_init_false_frozen_class_rejected() -> None:
+    """Frozen attrs classes cannot restore init=False fields after construction."""
+
+    @frozen
+    class FrozenClass:
+        a: int
+        b: int = field(init=False, default=1)
+
+    @define
+    class ReadOnlyField:
+        a: int
+        b: int = field(init=False, default=1, on_setattr=frozen_setter)
+
+    c = Converter()
+
+    # The configuration is refused while generating the hook, before any
+    # instance is constructed.
+    with pytest.raises(FrozenStructureError) as exc_info:
+        make_dict_structure_fn(FrozenClass, c, _cattrs_include_init_false=True)
+    assert exc_info.value.cl is FrozenClass
+    assert exc_info.value.field_names == ("b",)
+
+    # The same applies to a per-field include override.
+    with pytest.raises(FrozenStructureError):
+        make_dict_structure_fn(FrozenClass, c, b=override(omit=False))
+
+    # A field-level frozen setter on an otherwise mutable class is refused too.
+    with pytest.raises(FrozenStructureError) as exc_info:
+        make_dict_structure_fn(ReadOnlyField, c, _cattrs_include_init_false=True)
+    assert exc_info.value.field_names == ("b",)
+
+    # Skipping the field (the default) keeps working.
+    hook = make_dict_structure_fn(FrozenClass, c)
+    c.register_structure_hook(FrozenClass, hook)
+    assert c.structure({"a": 1}, FrozenClass) == FrozenClass(1)
+
+
+def test_init_false_frozen_dataclass_rejected() -> None:
+    """Frozen dataclasses are rejected the same way as frozen attrs classes."""
+
+    @dataclass(frozen=True)
+    class FrozenDataclass:
+        a: int
+        b: int = dcfield(init=False, default=1)
+
+    c = Converter()
+    with pytest.raises(FrozenStructureError) as exc_info:
+        make_dict_structure_fn(FrozenDataclass, c, _cattrs_include_init_false=True)
+    assert exc_info.value.cl is FrozenDataclass
+    assert exc_info.value.field_names == ("b",)
+
+
+def test_init_false_frozen_inherited_rejected() -> None:
+    """A mutable class inheriting from a frozen base cannot be assigned to."""
+
+    @frozen
+    class FrozenBase:
+        a: int
+
+    @define
+    class Child(FrozenBase):
+        b: int = field(init=False, default=1)
+
+    c = Converter()
+    with pytest.raises(FrozenStructureError):
+        make_dict_structure_fn(Child, c, _cattrs_include_init_false=True)
+
+
+def test_init_false_not_passed_to_constructor() -> None:
+    """init=False values are assigned after construction, never via __init__."""
+
+    constructor_args = []
+
+    @define
+    class A:
+        a: int
+        b: int = field(init=False, default=1)
+
+        def __attrs_post_init__(self) -> None:
+            constructor_args.append(("b", self.b))
+
+    c = Converter(detailed_validation=False)
+    hook = make_dict_structure_fn(A, c, _cattrs_include_init_false=True)
+    c.register_structure_hook(A, hook)
+
+    result = c.structure({"a": 1, "b": 2}, A)
+    assert result.a == 1
+    assert result.b == 2
+    # The constructor only ever saw the default for the init=False field.
+    assert constructor_args == [("b", 1)]
+
+
+def test_init_false_converter_and_validator_run_once(converter: BaseConverter) -> None:
+    """Restoration runs each field's converter and validator on the restored value only.
+
+    The constructor is still free to apply the definitions to the field
+    default, but a post-construction restoration must not run them a second
+    time on that default: each restored value is converted and validated
+    exactly once.
+    """
+    converter_inputs = []
+    validator_inputs = []
+
+    def tracking_converter(value):
+        converter_inputs.append(value)
+        return f"converted:{value}"
+
+    def tracking_validator(instance, attribute, value):
+        validator_inputs.append((attribute.name, value))
+
+    @define
+    class A:
+        a: int
+        plain: str = field(
+            init=False, default="default-plain",
+            converter=tracking_converter, validator=tracking_validator,
+        )
+        other: str = field(
+            init=False, default=Factory(lambda: "default-other"),
+            converter=tracking_converter,
+        )
+
+    converter.register_structure_hook(
+        A, make_dict_structure_fn(A, converter, _cattrs_include_init_false=True)
+    )
+
+    result = converter.structure(
+        {"a": 1, "plain": "restore-plain", "other": "restore-other"}, A
+    )
+
+    assert result.plain == "converted:restore-plain"
+    assert result.other == "converted:restore-other"
+
+    # Each restored value reaches the converter exactly once during the
+    # post-construction assignment; the converter never sees a restored value
+    # more than once.
+    assert converter_inputs.count("restore-plain") == 1
+    assert converter_inputs.count("restore-other") == 1
+    # The validator runs once for the restored value, on its converted form.
+    assert validator_inputs.count(
+        ("plain", "converted:restore-plain")
+    ) == 1
+
+
+def test_init_false_missing_key_keeps_default(converter: BaseConverter) -> None:
+    """When no value is supplied, the constructor default is left intact."""
+
+    @define
+    class A:
+        a: int
+        b: int = field(init=False, default=5)
+
+    converter.register_structure_hook(
+        A, make_dict_structure_fn(A, converter, _cattrs_include_init_false=True)
+    )
+
+    result = converter.structure({"a": 1}, A)
+    assert result.a == 1
+    assert result.b == 5
+
+
+def test_init_false_failure_not_swallowed() -> None:
+    """A failed post-construction assignment surfaces instead of a partial object."""
+
+    @define
+    class A:
+        a: int
+        b: int = field(init=False, default=1)
+
+    c = Converter()  # detailed validation enabled
+
+    def failing_hook(value, type):
+        raise ValueError("boom")
+
+    c.register_structure_hook(int, failing_hook)
+    c.register_structure_hook(
+        A, make_dict_structure_fn(A, c, _cattrs_include_init_false=True)
+    )
+
+    with pytest.raises(ClassValidationError) as exc_info:
+        c.structure({"a": 1, "b": 2}, A)
+    assert any(
+        isinstance(exc, ValueError) and str(exc) == "boom"
+        for exc in exc_info.value.exceptions
+    )
+
+
+def test_init_false_aliases_slots_and_inheritance() -> None:
+    """Aliases, slots and inherited init=False fields are all restored."""
+
+    @define(slots=True)
+    class Base:
+        a: int
+        slotted: int = field(init=False, default=0, alias="slotted_alias")
+
+    @define(slots=True)
+    class Child(Base):
+        b: int
+        own: int = field(init=False, default=0)
+
+    c = Converter()
+    hook = make_dict_structure_fn(
+        Child,
+        c,
+        _cattrs_include_init_false=True,
+        _cattrs_use_alias=True,
+    )
+    c.register_structure_hook(Child, hook)
+
+    result = c.structure(
+        {"a": 1, "b": 2, "slotted_alias": 3, "own": 4}, Child
+    )
+    assert result.a == 1
+    assert result.b == 2
+    assert result.slotted == 3
+    assert result.own == 4
+
+    unstructure_hook = make_dict_unstructure_fn(
+        Child,
+        c,
+        _cattrs_include_init_false=True,
+        _cattrs_use_alias=True,
+    )
+    c.register_unstructure_hook(Child, unstructure_hook)
+    assert c.unstructure(result) == {
+        "a": 1,
+        "b": 2,
+        "slotted_alias": 3,
+        "own": 4,
+    }
 
 
 @given(forbid_extra_keys=..., detailed_validation=...)

@@ -115,6 +115,35 @@ class ClassValidationError(BaseValidationError):
         return excs_with_notes, other_excs
 
 
+class FrozenStructureError(CattrsError):
+    """Raised when an ``init=False`` field cannot be restored after construction.
+
+    Fields declared with ``init=False`` are not accepted by the class
+    constructor, so they have to be assigned to the instance after it has been
+    created. That is impossible for frozen _attrs_ classes and dataclasses, or
+    for individual fields made read-only with a frozen ``on_setattr`` hook.
+    Including such a field in a structuring hook (with
+    ``_cattrs_include_init_false=True`` or an ``omit=False`` override) is
+    therefore rejected while the hook is being generated, before any instance
+    is constructed.
+    """
+
+    def __init__(self, cl: type, field_names: Sequence[str]) -> None:
+        self.cl = cl
+        self.field_names = tuple(field_names)
+        # Keep the structured data in ``args`` so the standard exception
+        # pickling machinery round-trips it without a custom reducer.
+        super().__init__(cl, self.field_names)
+
+    def __str__(self) -> str:
+        names = ", ".join(repr(name) for name in self.field_names)
+        return (
+            f"Cannot structure init=False field(s) {names} of frozen or "
+            f"read-only class {self.cl.__qualname__!r}: the constructor does "
+            "not accept them and they cannot be assigned after instantiation."
+        )
+
+
 class ForbiddenExtraKeysError(CattrsError):
     """
     Raised when `forbid_extra_keys` is activated and such extra keys are detected

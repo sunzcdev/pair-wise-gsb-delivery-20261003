@@ -14,8 +14,10 @@ from .._compat import (
     get_args,
     get_origin,
     is_annotated,
+    is_attrs_frozen,
     is_bare,
     is_bare_final,
+    is_frozen_setter,
     is_generic,
 )
 from .._generics import deep_copy_with
@@ -24,6 +26,7 @@ from ..errors import (
     AttributeValidationNote,
     ClassValidationError,
     ForbiddenExtraKeysError,
+    FrozenStructureError,
     IterableValidationError,
     IterableValidationNote,
     StructureHandlerNotFoundError,
@@ -66,6 +69,47 @@ def override(
 
 
 T = TypeVar("T")
+
+
+def _is_included(a: Attribute, override: AttributeOverride, include_init_false: bool) -> bool:
+    """Whether *a* is part of the generated hook.
+
+    Explicit overrides win; otherwise the global `include_init_false` flag
+    decides what happens to `init=False` fields.
+    """
+    if override.omit:
+        return False
+    if override.omit is False:
+        return True
+    return a.init or include_init_false
+
+
+def _check_post_construction_assignable(
+    attrs: list[Attribute],
+    cl: type[T],
+    kwargs: dict[str, AttributeOverride],
+    include_init_false: bool,
+) -> None:
+    """Reject included ``init=False`` fields that cannot be restored.
+
+    Such fields are never passed to the constructor; their values are assigned
+    to the instance afterwards. On a frozen class, or for a field with a frozen
+    ``on_setattr`` hook, that assignment can never succeed, so the
+    configuration is refused here, before any object gets constructed and
+    before a partially populated instance could be returned.
+    """
+    class_frozen = is_attrs_frozen(cl)
+    unwritable: list[str] = []
+    for a in attrs:
+        if a.init:
+            continue
+        override = kwargs.get(a.name, neutral)
+        if not _is_included(a, override, include_init_false):
+            continue
+        if class_frozen or is_frozen_setter(a):
+            unwritable.append(a.name)
+    if unwritable:
+        raise FrozenStructureError(cl, unwritable)
 
 
 def make_dict_unstructure_fn_from_attrs(
@@ -133,9 +177,7 @@ def make_dict_unstructure_fn_from_attrs(
             if override != neutral:
                 kwargs[attr_name] = override
 
-        if override.omit:
-            continue
-        if override.omit is None and not a.init and not _cattrs_include_init_false:
+        if not _is_included(a, override, _cattrs_include_init_false):
             continue
         if override.rename is None:
             kn = attr_name if not _cattrs_use_alias else a.alias
@@ -422,6 +464,22 @@ def make_dict_structure_fn_from_attrs(
         globs["__c_a"] = allowed_fields
         globs["__c_feke"] = ForbiddenExtraKeysError
 
+    # Resolve annotated overrides up front so the preflight check sees the
+    # effective configuration of every field.
+    for a in attrs:
+        an = a.name
+        if an in kwargs:
+            continue
+        override = _annotated_override_or_default(a.type, neutral)
+        if override != neutral:
+            kwargs[an] = override
+
+    # init=False fields are restored by assignment after construction; refuse
+    # the configuration up front when that assignment is impossible.
+    _check_post_construction_assignable(
+        attrs, cl, kwargs, _cattrs_include_init_false
+    )
+
     if _cattrs_detailed_validation:
         lines.append("  res = {}")
         lines.append("  errors = []")
@@ -437,9 +495,7 @@ def make_dict_structure_fn_from_attrs(
                 if override != neutral:
                     kwargs[an] = override
 
-            if override.omit:
-                continue
-            if override.omit is None and not a.init and not _cattrs_include_init_false:
+            if not _is_included(a, override, _cattrs_include_init_false):
                 continue
             t = a.type
             if isinstance(t, TypeVar):
@@ -475,6 +531,8 @@ def make_dict_structure_fn_from_attrs(
 
             if not a.init:
                 if a.default is not NOTHING:
+                    # Only touch the field when a value is supplied; without a
+                    # restore key the constructor default is left untouched.
                     pi_lines.append(f"{i}if {kn!r} in o:")
                     i = f"{i}  "
                 pi_lines.append(f"{i}try:")
@@ -538,6 +596,8 @@ def make_dict_structure_fn_from_attrs(
                 "    errors.append(__c_feke('', __cl, unknown_fields))",
             ]
 
+        # Fail before constructing the instance if any constructor argument
+        # could not be structured.
         post_lines.append(
             f"  if errors: raise __c_cve('While structuring ' + {cl_name!r}, errors, __cl)"
         )
@@ -561,6 +621,11 @@ def make_dict_structure_fn_from_attrs(
                     f"  except Exception as exc: raise __c_cve('While structuring ' + {cl_name!r}, [exc], __cl)"
                 ]
             )
+            # A failed post-construction assignment must surface instead of a
+            # partially populated instance being returned.
+            pi_lines.append(
+                f"  if errors: raise __c_cve('While structuring ' + {cl_name!r}, errors, __cl)"
+            )
             pi_lines.append("  return instance")
     else:
         non_required = []
@@ -575,9 +640,7 @@ def make_dict_structure_fn_from_attrs(
                 if override != neutral:
                     kwargs[an] = override
 
-            if override.omit:
-                continue
-            if override.omit is None and not a.init and not _cattrs_include_init_false:
+            if not _is_included(a, override, _cattrs_include_init_false):
                 continue
 
             if a.default is not NOTHING:
@@ -611,6 +674,8 @@ def make_dict_structure_fn_from_attrs(
             allowed_fields.add(kn)
 
             if not a.init:
+                # Reaching here means the field has no default, so the
+                # constructor never assigned it.
                 if handler is not None:
                     struct_handler_name = f"__c_structure_{an}"
                     internal_arg_parts[struct_handler_name] = handler

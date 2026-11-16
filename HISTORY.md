@@ -13,6 +13,8 @@ Our backwards-compatibility policy can be found [here](https://github.com/python
 
 ## NEXT
 
+- Generating a dict structuring hook that includes an `init=False` field of a frozen _attrs_ class, frozen dataclass, or a field with a read-only (`frozen`) `on_setattr` hook now raises {class}`~cattrs.FrozenStructureError` at hook-generation time. Such fields cannot be passed to the constructor nor assigned after construction, so the unsupported configuration is refused before any instance is created instead of silently returning a partially populated object.
+- With detailed validation enabled, errors raised while assigning `init=False` fields after construction are now propagated as a {class}`~cattrs.errors.ClassValidationError` instead of being swallowed and returning an incomplete instance.
 - Fix the msgspec converter passing typed deques directly to the encoder, which cannot serialize them. Deques are now unstructured into lists, including when nested in attrs classes or dataclasses.
   ([#818](https://github.com/python-attrs/cattrs/issues/818) [#819](https://github.com/python-attrs/cattrs/pull/819))
 
