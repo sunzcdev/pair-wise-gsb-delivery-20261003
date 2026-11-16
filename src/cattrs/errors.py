@@ -1,4 +1,4 @@
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from typing import Any, Optional, Union
 
 from typing_extensions import Self
@@ -8,6 +8,33 @@ from cattrs._compat import ExceptionGroup
 
 class CattrsError(Exception):
     """Base ``cattrs`` exception."""
+
+
+class SetUnstructureError(CattrsError):
+    """Raised when a set cannot be deterministically unstructured.
+
+    This is raised by the
+    {func}`configure_set_unstructure <cattrs.strategies.configure_set_unstructure>`
+    strategy when the sort keys produced for the unstructured elements cannot be
+    ordered, for example because the caller-provided key function returns values
+    of incomparable types (such as a mix of strings and integers). The original
+    exception is available as the ``__cause__`` of this error.
+
+    :param key: The sort key function used for the failed unstructuring.
+    :param values: The unstructured elements that could not be sorted.
+
+    .. versionadded:: NEXT
+    """
+
+    def __init__(self, key: Callable[[Any], Any], values: Sequence[Any]) -> None:
+        self.key = key
+        self.values = list(values)
+        super().__init__(
+            "Cannot deterministically unstructure the set: the sort keys "
+            "returned by the provided key function are not mutually orderable. "
+            "All sort keys must be comparable; falling back to `repr` is not "
+            "supported."
+        )
 
 
 class StructureHandlerNotFoundError(CattrsError):

@@ -393,3 +393,71 @@ This strategy has been preapplied to the following preconfigured converters:
 ```{versionadded} 23.2.0
 
 ```
+
+## Deterministic Set Unstructuring
+
+_Found at {py:func}`cattrs.strategies.configure_set_unstructure`._
+
+By default, unstructuring a `set` or `frozenset` keeps the container's own iteration order, and that order is derived from the hash values of the elements.
+Python randomizes string hashes between processes, so the serialized order of a set of strings differs from run to run and is not suitable for archives or diff-friendly wire formats.
+
+The _deterministic set unstructuring_ strategy replaces the set and frozenset unstructure hooks so that elements are first converted with their normal unstructure hooks and then sorted using a key function **you** provide.
+The key is applied to the converted (wire-format) values, not the original objects.
+
+```{doctest} deterministic_sets
+
+>>> from cattrs.strategies import configure_set_unstructure
+>>> converter = Converter()
+>>> configure_set_unstructure(converter, key=lambda v: v)
+
+>>> converter.unstructure({"cherry", "apple", "banana"}, unstructure_as=Set[str])
+['apple', 'banana', 'cherry']
+
+>>> converter.unstructure(frozenset({3, 1, 2}), unstructure_as=FrozenSet[int])
+[1, 2, 3]
+```
+
+The sorted result is a `list` by default; pass `unstructure_to` to choose another ordered collection:
+
+```python
+>>> converter = Converter()
+>>> configure_set_unstructure(converter, key=lambda v: v, unstructure_to=tuple)
+>>> converter.unstructure({3, 1, 2}, unstructure_as=Set[int])
+(1, 2, 3)
+```
+
+Because elements are unstructured before the key runs, the key works on the wire representation, for example when an _attrs_ class unstructures to a dictionary:
+
+```python
+>>> @define(frozen=True)
+... class Box:
+...     n: int
+
+>>> converter = Converter()
+>>> converter.register_unstructure_hook(Box, lambda box: {"n": box.n})
+>>> configure_set_unstructure(converter, key=lambda wire: wire["n"])
+>>> converter.unstructure({Box(3), Box(1), Box(2)}, unstructure_as=Set[Box])
+[{'n': 1}, {'n': 2}, {'n': 3}]
+```
+
+The sort uses Python's stable sort: elements whose keys compare equal keep their relative order instead of raising.
+If you need output that is reproducible even when keys collide, make the key unique by including the value itself (for example `key=lambda v: (v["group"], v["n"])`).
+
+Keys must be mutually orderable.
+If they are not (for example a mix of strings and integers, or a key function that raises `TypeError`), cattrs raises {py:class}`~cattrs.SetUnstructureError` rather than silently falling back to another ordering such as sorting by `repr`:
+
+```python
+>>> converter = Converter()
+>>> configure_set_unstructure(converter, key=lambda v: v)
+>>> converter.unstructure({1, "a"}, unstructure_as=Set[object])
+Traceback (most recent call last):
+...
+cattrs.SetUnstructureError: Cannot deterministically unstructure the set: ...
+```
+
+The strategy only affects unstructuring: structuring hooks and every other container type keep their existing behavior.
+Empty sets unstructure to an empty ordered collection, each generic set type (such as `set[int]` versus `set[str]`) gets its own independently cached hook, and a converter without the strategy applied continues to unstructure sets as sets.
+
+```{versionadded} NEXT
+
+```

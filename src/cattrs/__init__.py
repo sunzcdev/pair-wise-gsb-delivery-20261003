@@ -8,6 +8,7 @@ from .errors import (
     ForbiddenExtraKeysError,
     IterableValidationError,
     IterableValidationNote,
+    SetUnstructureError,
     StructureHandlerNotFoundError,
 )
 from .gen import override
@@ -24,6 +25,7 @@ __all__ = [
     "GenConverter",
     "IterableValidationError",
     "IterableValidationNote",
+    "SetUnstructureError",
     "SimpleStructureHook",
     "StructureHandlerNotFoundError",
     "UnstructureStrategy",
