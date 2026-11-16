@@ -4955,6 +4955,222 @@ class SampleTests(TestCase):
         with self.assertRaises(ValueError):
             mi.sample('abcde', 10, counts=[1, 1, 1, 1, 1], strict=True)
 
+    def test_injected_rng_is_reproducible(self):
+        """The same rng seed reproduces the sample in every mode."""
+        for kwargs, iterable in [
+            ({}, range(50)),
+            ({'weights': range(1, 51)}, range(50)),
+            ({'counts': [25, 25]}, ['x', 'y']),
+        ]:
+            first = mi.sample(iterable, 5, rng=Random(20240101), **kwargs)
+            second = mi.sample(iterable, 5, rng=Random(20240101), **kwargs)
+            self.assertEqual(first, second)
+
+    def test_injected_rng_does_not_touch_global_state(self):
+        """Injecting an rng leaves the global random module untouched."""
+        seed(1234)
+        expected = [random() for _ in range(5)]
+        seed(1234)
+        mi.sample(range(100), 5, weights=range(1, 101), rng=Random(99))
+        mi.sample(range(100), 5, rng=Random(99))
+        mi.sample(['a', 'b'], 5, counts=[50, 50], rng=Random(99))
+        self.assertEqual([random() for _ in range(5)], expected)
+
+    def test_zero_weights_are_never_selected(self):
+        data = ['a', 'b', 'z1', 'z2']
+        weights = [1, 1, 0, 0]
+
+        # k exceeds the number of positive-weight candidates: non-strict
+        # mode returns only the positive-weight elements, shuffled.
+        sampled = mi.sample(data, 3, weights=weights, rng=Random(0))
+        self.assertEqual(sorted(sampled), ['a', 'b'])
+
+        # All-zero weights can never produce a sample.
+        self.assertEqual(
+            mi.sample(['z1', 'z2'], 2, weights=[0, 0], rng=Random(0)), []
+        )
+
+        # Over many runs, zero-weight elements never appear.
+        for s in range(200):
+            sampled = mi.sample(
+                ['a', 'b', 'z'], 2, weights=[1, 1, 0], rng=Random(s)
+            )
+            self.assertNotIn('z', sampled)
+
+        # Zero-weight elements in front of positive ones are skipped.
+        sampled = mi.sample(
+            ['z', 'a'], 1, weights=[0, 1], rng=Random(0)
+        )
+        self.assertEqual(sampled, ['a'])
+
+    def test_sample_larger_than_positive_weight_population(self):
+        # strict mode raises once the positive candidates run out
+        with self.assertRaises(ValueError):
+            mi.sample(
+                ['a', 'b', 'z'], 3, weights=[1, 1, 0], strict=True
+            )
+        with self.assertRaises(ValueError):
+            mi.sample(['z1', 'z2'], 1, weights=[0, 0], strict=True)
+        # non-strict mode returns every positive-weight element
+        self.assertEqual(
+            sorted(mi.sample(['z', 'a'], 2, weights=[0, 1])), ['a']
+        )
+
+    def test_illegal_weights_raise_value_error(self):
+        for bad in (-1, -0.5, float('nan'), float('inf'), -float('inf')):
+            # While the reservoir is being filled ...
+            with self.assertRaises(ValueError):
+                mi.sample(['a', 'b', 'c'], 2, weights=[bad, 1, 1])
+            # ... and after it has been filled.
+            with self.assertRaises(ValueError):
+                mi.sample(['a', 'b', 'c'], 2, weights=[1, 1, bad])
+
+    def test_weight_length_mismatch_raises(self):
+        # More weights than elements (sized and one-shot iterables).
+        with self.assertRaises(ValueError):
+            mi.sample(['a', 'b'], 1, weights=[1, 1, 1])
+        with self.assertRaises(ValueError):
+            mi.sample(['a', 'b'], 1, weights=(1 for _ in range(3)))
+        # Fewer weights than elements.
+        with self.assertRaises(ValueError):
+            mi.sample(['a', 'b', 'c'], 2, weights=[1, 1])
+        with self.assertRaises(ValueError):
+            mi.sample(
+                ['a', 'b', 'c'], 2, weights=(1 for _ in range(2))
+            )
+        # Mismatch is still detected when the reservoir fills before the
+        # extra trailing weights would have been silently dropped.
+        with self.assertRaises(ValueError):
+            mi.sample(
+                ['a', 'b', 'c'], 1, weights=[1, 1, 1, 1]
+            )
+
+    def test_weighted_underflow_does_not_starve_candidates(self):
+        # Equal huge weights must remain distinguishable instead of their
+        # keys collapsing to negative zero, which used to make selection
+        # deterministic and order-dependent.
+        selections = {
+            tuple(
+                mi.sample(
+                    ['a', 'b'], 1, weights=[1e308, 1e308],
+                    rng=Random(seed),
+                )
+            )
+            for seed in range(50)
+        }
+        self.assertEqual(selections, {('a',), ('b',)})
+
+        # When k equals the population, every element is returned no matter
+        # how far apart the weights are.
+        data = ['g', 'm1', 'm2', 'm3']
+        weights = [1e308, 1e100, 1e100, 1e100]
+        self.assertEqual(
+            sorted(mi.sample(data, 4, weights=weights, rng=Random(0))),
+            sorted(data),
+        )
+
+        # A smaller-but-positive candidate next to a giant must still be
+        # reachable on some runs.
+        seen_medium = False
+        for seed in range(100):
+            sampled = mi.sample(
+                ['g', 'm1', 'm2', 'm3'],
+                2,
+                weights=[1e308, 1e150, 1e150, 1e150],
+                rng=Random(seed),
+            )
+            if any(item.startswith('m') for item in sampled):
+                seen_medium = True
+                break
+        self.assertTrue(seen_medium)
+
+        # Spans wider than the floating-point range do not crash.
+        self.assertEqual(
+            mi.sample(
+                ['g', 't'], 1, weights=[1e308, 1e-300], rng=Random(0)
+            ),
+            ['g'],
+        )
+        self.assertEqual(
+            sorted(
+                mi.sample(
+                    ['a', 'b'], 2, weights=[5e-324, 1.0], rng=Random(0)
+                )
+            ),
+            ['a', 'b'],
+        )
+
+    def test_weighted_marginals_k1(self):
+        """Statistical check against exact k=1 inclusion probabilities."""
+        weights = [1.0, 2.0, 4.0, 8.0]
+        trials = 20000
+        counts = Counter()
+        for trial in range(trials):
+            counts.update(
+                mi.sample(
+                    range(4), 1, weights=weights, rng=Random(trial)
+                )
+            )
+        total = sum(weights)
+        for i, weight in enumerate(weights):
+            empirical = counts[i] / trials
+            theoretical = weight / total
+            # Generous bound: several standard errors.
+            self.assertLess(abs(empirical - theoretical), 0.02)
+
+    def test_weighted_marginals_vs_reference_implementation(self):
+        """Statistical check against an independent, simple reference."""
+
+        def reference(population, weights, k, rng):
+            keys = [
+                (rng.random() ** (1 / weight), element)
+                for element, weight in zip(population, weights)
+            ]
+            keys.sort(key=itemgetter(0), reverse=True)
+            return [element for _, element in keys[:k]]
+
+        for weights, k in [
+            ([1.0, 1.0, 3.0], 2),
+            ([2.0, 5.0, 1.0, 7.0], 3),
+        ]:
+            trials = 10000
+            actual, expected = Counter(), Counter()
+            for trial in range(trials):
+                actual.update(
+                    mi.sample(
+                        range(len(weights)),
+                        k,
+                        weights=weights,
+                        rng=Random(7000 + trial),
+                    )
+                )
+                expected.update(
+                    reference(
+                        range(len(weights)),
+                        weights,
+                        k,
+                        Random(7000 + trial),
+                    )
+                )
+            for i in range(len(weights)):
+                self.assertLess(
+                    abs(actual[i] / trials - expected[i] / trials), 0.03
+                )
+
+    def test_weighted_scale_invariance_with_extreme_scales(self):
+        base_weights = [1.0, 2.0, 3.0, 4.0, 5.0]
+        for factor in (1e-300, 1e300):
+            unscaled = mi.sample(
+                range(5), 2, weights=base_weights, rng=Random(77)
+            )
+            scaled = mi.sample(
+                range(5),
+                2,
+                weights=[w * factor for w in base_weights],
+                rng=Random(77),
+            )
+            self.assertEqual(unscaled, scaled)
+
 
 class BarelySortable:
     def __init__(self, value):

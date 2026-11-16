@@ -3885,9 +3885,13 @@ def map_if(iterable, pred, func, func_else=None):
             yield func(item) if pred(item) else func_else(item)
 
 
-def _sample_unweighted(iterator, k, strict):
+def _sample_unweighted(iterator, k, strict, rng=None):
     # Algorithm L in the 1994 paper by Kim-Hung Li:
     # "Reservoir-Sampling Algorithms of Time Complexity O(n(1+log(N/n)))".
+
+    random_func = rng.random if rng is not None else random
+    randrange_func = rng.randrange if rng is not None else randrange
+    shuffle_func = rng.shuffle if rng is not None else shuffle
 
     reservoir = list(islice(iterator, k))
     if strict and len(reservoir) < k:
@@ -3896,57 +3900,144 @@ def _sample_unweighted(iterator, k, strict):
 
     with suppress(StopIteration):
         while True:
-            W *= random() ** (1 / k)
-            skip = floor(log(random()) / log1p(-W))
+            W *= random_func() ** (1 / k)
+            skip = floor(log(random_func()) / log1p(-W))
             element = next(islice(iterator, skip, None))
-            reservoir[randrange(k)] = element
+            reservoir[randrange_func(k)] = element
 
-    shuffle(reservoir)
+    shuffle_func(reservoir)
     return reservoir
 
 
-def _sample_weighted(iterator, k, weights, strict):
+def _sample_weighted(iterator, k, weights, strict, rng=None):
     # Implementation of "A-ExpJ" from the 2006 paper by Efraimidis et al. :
     # "Weighted random sampling with a reservoir".
 
-    # Log-transform for numerical stability for weights that are small/large
-    weight_keys = (log(random()) / weight for weight in weights)
+    random_func = rng.random if rng is not None else random
+    uniform_func = rng.uniform if rng is not None else uniform
+    shuffle_func = rng.shuffle if rng is not None else shuffle
 
-    # Fill up the reservoir (collection of samples) with the first `k`
-    # weight-keys and elements, then heapify the list.
-    reservoir = take(k, zip(weight_keys, iterator))
-    if strict and len(reservoir) < k:
-        raise ValueError('Sample larger than population')
+    def check_weight(weight):
+        if weight < 0 or not math.isfinite(weight):
+            raise ValueError(
+                f'weights must be finite and non-negative, not {weight!r}'
+            )
+
+    reservoir = []
+    positive_seen = 0
+    missing = object()  # sentinel for detecting length mismatches
+    # Reservoir entries are (heap_key, (weight, element)).
+    #
+    # The Efraimidis key of an item is log(U) / weight.  When the weights
+    # span many orders of magnitude, that key can underflow to negative
+    # zero; negative zero compares equal to zero, which corrupts the heap
+    # ordering and makes later candidates permanently unselectable.  To
+    # avoid that, the keys stored in the heap are computed with the weights
+    # divided by *scale*:
+    #
+    #     heap_key = log(U) / (weight / scale)
+    #
+    # Dividing every key by the same positive factor leaves their relative
+    # ordering -- and therefore every sampling probability -- unchanged.
+    # The factor is only adjusted when a key would otherwise underflow, so
+    # ordinary inputs keep scale == 1.0 and the exact paper arithmetic.
+    scale = 1.0
+
+    def make_heap_key(weight):
+        return log(random_func()) / (weight / scale)
+
+    def rescale(new_scale, trigger_weight):
+        # Move to a scale under which keys of *trigger_weight*'s magnitude
+        # are representable, and redraw every stored key.  Redrawing is
+        # required because any stored key that already underflowed to
+        # negative zero no longer carries ordering information; the new
+        # independent draws have the same distribution, so the reservoir's
+        # distribution is unchanged.
+        nonlocal scale
+        scale = new_scale
+        for i, (_, (weight, element)) in enumerate(reservoir):
+            reservoir[i] = (make_heap_key(weight), (weight, element))
+        heapify(reservoir)
+        return make_heap_key(trigger_weight)
+
+    # Fill the reservoir with the first *k* elements having positive weight.
+    # Zero-weight elements are valid input but can never be selected.
+    while len(reservoir) < k:
+        weight = next(weights, missing)
+        element = next(iterator, missing)
+        if weight is missing or element is missing:
+            if weight is not element:
+                raise ValueError(
+                    'weights and iterable must have the same length'
+                )
+            # The input was exhausted before the reservoir could be filled.
+            if strict and positive_seen < k:
+                raise ValueError('Sample larger than population')
+            shuffle_func(reservoir)
+            return [item for _, (_, item) in reservoir]
+        check_weight(weight)
+        if weight == 0:
+            continue
+        positive_seen += 1
+        heap_key_value = make_heap_key(weight)
+        if heap_key_value == 0.0:
+            heap_key_value = rescale(float(weight), weight)
+        reservoir.append((heap_key_value, (weight, element)))
 
     heapify(reservoir)
 
-    # The number of jumps before changing the reservoir is a random variable
-    # with an exponential distribution. Sample it using random() and logs.
-    smallest_weight_key, _ = reservoir[0]
-    weights_to_skip = log(random()) / smallest_weight_key
+    # A-ExpJ jump threshold expressed with the scaled keys and scaled
+    # weights.  The paper uses X = -log(V) / key_min in raw-weight units.
+    # Because key_min = heap_key / scale and both negatives cancel, that is
+    # algebraically the same as ``log(V) / heap_key / scale`` below, but the
+    # division-first ordering cannot overflow: a candidate negligible enough
+    # to make the threshold infinite is simply never picked.
+    def jump_threshold():
+        return log(random_func()) / reservoir[0][0] / scale
 
-    for weight, element in zip(weights, iterator):
-        if weight >= weights_to_skip:
-            # The notation here is consistent with the paper, but we store
-            # the weight-keys in log-space for better numerical stability.
-            smallest_weight_key, _ = reservoir[0]
-            t_w = exp(weight * smallest_weight_key)
-            r_2 = uniform(t_w, 1)  # generate U(t_w, 1)
-            weight_key = log(r_2) / weight
-            heapreplace(reservoir, (weight_key, element))
-            smallest_weight_key, _ = reservoir[0]
-            weights_to_skip = log(random()) / smallest_weight_key
+    weights_to_skip = jump_threshold()
+
+    while True:
+        weight = next(weights, missing)
+        element = next(iterator, missing)
+        if weight is missing or element is missing:
+            if weight is not element:
+                raise ValueError(
+                    'weights and iterable must have the same length'
+                )
+            break
+        check_weight(weight)
+        if weight == 0:
+            # Zero-weight elements never enter the sample.
+            continue
+        positive_seen += 1
+        scaled_weight = weight / scale
+        if scaled_weight >= weights_to_skip:
+            # The notation here is consistent with the paper, but the keys
+            # are kept in scaled, log-space form for numerical stability.
+            smallest_heap_key = reservoir[0][0]
+            t_w = exp(scaled_weight * smallest_heap_key)
+            r_2 = uniform_func(t_w, 1)  # generate U(t_w, 1)
+            heap_key_value = log(r_2) / scaled_weight
+            if heap_key_value == 0.0:
+                heap_key_value = rescale(float(weight), weight)
+            heapreplace(reservoir, (heap_key_value, (weight, element)))
+            weights_to_skip = jump_threshold()
         else:
-            weights_to_skip -= weight
+            weights_to_skip -= scaled_weight
 
-    ret = [element for weight_key, element in reservoir]
-    shuffle(ret)
+    ret = [element for _, (_, element) in reservoir]
+    shuffle_func(ret)
     return ret
 
 
-def _sample_counted(population, k, counts, strict):
+def _sample_counted(population, k, counts, strict, rng=None):
     element = None
     remaining = 0
+
+    random_func = rng.random if rng is not None else random
+    randrange_func = rng.randrange if rng is not None else randrange
+    shuffle_func = rng.shuffle if rng is not None else shuffle
 
     def feed(i):
         # Advance *i* steps ahead and consume an element
@@ -3970,16 +4061,16 @@ def _sample_counted(population, k, counts, strict):
     with suppress(StopIteration):
         W = 1.0
         while True:
-            W *= random() ** (1 / k)
-            skip = floor(log(random()) / log1p(-W))
+            W *= random_func() ** (1 / k)
+            skip = floor(log(random_func()) / log1p(-W))
             element = feed(skip)
-            reservoir[randrange(k)] = element
+            reservoir[randrange_func(k)] = element
 
-    shuffle(reservoir)
+    shuffle_func(reservoir)
     return reservoir
 
 
-def sample(iterable, k, weights=None, *, counts=None, strict=False):
+def sample(iterable, k, weights=None, *, counts=None, strict=False, rng=None):
     """Return a *k*-length list of elements chosen (without replacement)
     from the *iterable*.
 
@@ -4012,13 +4103,34 @@ def sample(iterable, k, weights=None, *, counts=None, strict=False):
     does not match the behavior of :func:`random.sample`'s *counts*
     parameter). Note that *weights* may not be used with *counts*.
 
+    Weighted sampling accepts finite, non-negative weights.  Elements with
+    a zero weight are never selected.  Negative, infinite, or NaN weights
+    raise ``ValueError``.  The number of weights must match the length of
+    *iterable*; otherwise ``ValueError`` is raised instead of silently
+    truncating either input.  If *k* exceeds the number of positive-weight
+    elements, ``ValueError`` is raised when *strict* is ``True``, and only
+    the positive-weight elements are returned (in shuffled order) when
+    *strict* is ``False``.
+
     If the length of *iterable* is less than *k*,
     ``ValueError`` is raised if *strict* is ``True`` and
     all elements are returned (in shuffled order) if *strict* is ``False``.
 
     By default, the `Algorithm L <https://w.wiki/ANrM>`__ reservoir sampling
     technique is used. When *weights* are provided,
-    `Algorithm A-ExpJ <https://w.wiki/ANrS>`__ is used instead.
+    `Algorithm A-ExpJ <https://w.wiki/ANrS>`__ is used instead.  The weighted
+    variant rescales weights internally whenever floating-point underflow
+    would otherwise occur, so weights spanning many orders of magnitude
+    (for example, ``1e-300`` next to ``1e300``) do not cause candidates to
+    become permanently unselectable.
+
+    Pass a :class:`random.Random`-like object (one exposing ``random``,
+    ``uniform``, ``randrange`` and ``shuffle``) as *rng* to make the result
+    reproducible without touching global random state:
+
+    >>> from random import Random
+    >>> sample(range(100), 5, rng=Random(20240101))  # doctest: +SKIP
+    [50, 30, 68, 85, 18]
 
     Notes on reproducibility:
 
@@ -4052,14 +4164,14 @@ def sample(iterable, k, weights=None, *, counts=None, strict=False):
 
     elif weights is not None:
         weights = iter(weights)
-        return _sample_weighted(iterator, k, weights, strict)
+        return _sample_weighted(iterator, k, weights, strict, rng)
 
     elif counts is not None:
         counts = iter(counts)
-        return _sample_counted(iterator, k, counts, strict)
+        return _sample_counted(iterator, k, counts, strict, rng)
 
     else:
-        return _sample_unweighted(iterator, k, strict)
+        return _sample_unweighted(iterator, k, strict, rng)
 
 
 def is_sorted(iterable, key=None, reverse=False, strict=False):

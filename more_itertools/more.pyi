@@ -748,13 +748,21 @@ def map_if(
     func_else: Callable[[Any], Any] | None = ...,
 ) -> Iterator[Any]: ...
 def _sample_unweighted(
-    iterator: Iterator[_T], k: int, strict: bool
+    iterator: Iterator[_T], k: int, strict: bool, rng: Any | None = ...
 ) -> list[_T]: ...
 def _sample_counted(
-    population: Iterator[_T], k: int, counts: Iterable[int], strict: bool
+    population: Iterator[_T],
+    k: int,
+    counts: Iterable[int],
+    strict: bool,
+    rng: Any | None = ...,
 ) -> list[_T]: ...
 def _sample_weighted(
-    iterator: Iterator[_T], k: int, weights: Iterator[float], strict: bool
+    iterator: Iterator[_T],
+    k: int,
+    weights: Iterator[float],
+    strict: bool,
+    rng: Any | None = ...,
 ) -> list[_T]: ...
 def sample(
     iterable: Iterable[_T],
@@ -763,6 +771,7 @@ def sample(
     *,
     counts: Iterable[int] | None = ...,
     strict: bool = False,
+    rng: Any | None = None,
 ) -> list[_T]: ...
 def is_sorted(
     iterable: Iterable[_T],
