@@ -10,6 +10,7 @@ Unreleased
 
 * Updated functions:
     * :func:`peekable` was updated to avoid caching the entire iterable when sliced with a negative step and omitted *stop*.
+    * :func:`random_ordered_range` now accepts a *seed* for reproducible permutations and exposes a JSON-serializable ``state`` snapshot.  Passing the snapshot back via the *state* argument resumes the same permutation without repeating delivered values.  States are bound to their range and algorithm version; mismatched or corrupt states raise ``ValueError``.  Memory use remains constant for arbitrarily large ranges.
 
 11.2.1
 ----------

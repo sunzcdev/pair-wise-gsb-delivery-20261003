@@ -1,10 +1,11 @@
 __lazy_modules__ = frozenset({'queue', 'threading'})
 
 import math
+import secrets
 import types
 
 from collections import Counter, defaultdict, deque
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from contextlib import suppress
 from functools import cached_property, partial, wraps
 from heapq import heapify, heapreplace
@@ -28,7 +29,7 @@ from itertools import (
 from math import comb, e, exp, floor, fsum, log, log1p, perm, tau
 from math import ceil, prod
 from queue import Empty, Queue
-from random import random, randrange, shuffle, uniform
+from random import Random, random, randrange, shuffle, uniform
 from operator import (
     attrgetter,
     getitem,
@@ -42,6 +43,7 @@ from operator import (
 from sys import maxsize
 from time import monotonic
 from threading import Lock
+from typing import Any, TypedDict, cast
 
 from .recipes import (
     _marker,
@@ -5621,44 +5623,353 @@ def subfactorial(n):
     return sf
 
 
-def _full_period_lcg(n):
-    "Returns values from range(n) in randomly shuffled order."
+# Algorithm version recorded in every progress state.  Bump this whenever
+# the permutation algorithm or the state schema changes so that states from a
+# different implementation are rejected instead of being misinterpreted.
+_RANDOM_ORDERED_RANGE_VERSION = 1
 
-    # The algorithm is a fluxed, full period linear congruential generator.
-    # Size *m* is a power of two.  The *mask* speeds-up modulo calculations.
-    # The multiplier *a* and addend *c* are Hull-Dobell constants.  See:
-    # https://jackgiffin.com/main/pdfs/Random-Number-Generators-T-E-Hull-and-A-R-Dobell.pdf
-    # The value *x* is a random starting point.
-    # The *flux* bitfield breaks-up patterns in the LCG.
-
-    m = 1 << n.bit_length()
-    mask = m - 1
-    a = randrange(5, m, 4) if m > 4 else 1
-    c = randrange(1, m, 2) if m > 1 else 1
-    x = randrange(m)
-    flux = randrange(m)
-
-    for _ in repeat(None, m):
-        index = x ^ flux
-        if index < n:
-            yield index
-        x = (a * x + c) & mask
+# At most this many indices are buffered at once, so the iterator's memory
+# usage stays constant instead of growing with the length of the range.
+_RANDOM_ORDERED_RANGE_BATCH_SIZE = 1024
 
 
-def _random_ordered_indices(n):
-    "Shuffle batches to mitigate the small state space of the LCG."
+class _RandomOrderedRangeState(TypedDict):
+    "Plain-data, JSON-serializable snapshot of the iterator's progress."
 
-    # Batched variation of Knuth's Algorithm M in §3.2.2 of TAOCP.
-    batch_size = 1024
-    iterable = range(n) if n <= batch_size else _full_period_lcg(n)
-    for batch in map(list, batched(iterable, batch_size)):
-        shuffle(batch)
-        yield from batch
+    version: int
+    start: int
+    stop: int
+    step: int
+    n: int
+    seed: int
+    m: int
+    a: int
+    c: int
+    x: int
+    flux: int
+    remaining_steps: int
+    batch_number: int
+    batch: list[int]
+    position: int
+    delivered: int
 
 
-def random_ordered_range(*args):
-    "Return :func:`range` values in randomly shuffled order."
-    range_object = range(*args)
-    n = len(range_object)
-    for index in _random_ordered_indices(n):
-        yield range_object[index]
+def _random_ordered_batch_seed(seed: int, batch_number: int) -> int:
+    "Derive a deterministic, well-mixed seed for batch *batch_number*."
+    # SplitMix64 mixing, applied to the master seed and the batch number so
+    # that batches are independently shuffled without storing RNG state.
+    mask64 = (1 << 64) - 1
+    value = (seed ^ (batch_number + 0x9E3779B97F4A7C15)) & mask64
+    value = (value + 0x9E3779B97F4A7C15) & mask64
+    value = ((value ^ (value >> 30)) * 0xBF58476D1CE4E5B9) & mask64
+    value = ((value ^ (value >> 27)) * 0x94D049BB133111EB) & mask64
+    return value ^ (value >> 31)
+
+
+class random_ordered_range:
+    """Return :func:`range` values in randomly shuffled order.
+
+    The full permutation is never materialized: indices are generated from a
+    full-period linear congruential generator whose modulus is the next power
+    of two, and re-shuffled in fixed-size batches.  Memory use therefore stays
+    constant regardless of the length of the range.
+
+    Pass an explicit integer *seed* to make the permutation reproducible.
+    When *seed* is omitted, an unpredictable seed is drawn and recorded in the
+    :attr:`state`.
+
+    The :attr:`state` attribute holds a plain-data (JSON-serializable)
+    progress snapshot.  Save it at any time -- even between individual values
+    -- and pass it back as *state* to a new iterator to resume.  Resuming
+    continues the exact same permutation and never re-delivers a value that
+    was already produced.  The state is bound to both the range and the
+    algorithm version; a state created for different range arguments, from a
+    newer or older algorithm version, or one that has been corrupted, raises
+    :exc:`ValueError`.
+
+    >>> from more_itertools import take
+    >>> it = random_ordered_range(10, seed=42)
+    >>> first = take(4, it)
+    >>> resumed = random_ordered_range(10, seed=42, state=it.state)
+    >>> output = first + list(resumed)
+    >>> sorted(output) == list(range(10))
+    True
+
+    """
+
+    def __init__(
+        self, *args: int, seed: Any = _marker, state: Any = None
+    ) -> None:
+        self._range = range(*args)
+        n = len(self._range)
+
+        if state is None:
+            if seed is _marker or seed is None:
+                seed = secrets.randbits(64)
+            elif not isinstance(seed, int) or isinstance(seed, bool):
+                raise TypeError('seed must be an integer or None')
+            self._state: _RandomOrderedRangeState = self._initial_state(
+                seed, n
+            )
+        else:
+            self._state = self._validate_state(state)
+            if (
+                seed is not _marker
+                and seed is not None
+                and seed != (self._state['seed'])
+            ):
+                raise ValueError(
+                    'seed does not match the seed recorded in state'
+                )
+
+    def _initial_state(self, seed: int, n: int) -> _RandomOrderedRangeState:
+        range_object = self._range
+        if n == 0:
+            return {
+                'version': _RANDOM_ORDERED_RANGE_VERSION,
+                'start': range_object.start,
+                'stop': range_object.stop,
+                'step': range_object.step,
+                'n': 0,
+                'seed': seed,
+                'm': 0,
+                'a': 0,
+                'c': 0,
+                'x': 0,
+                'flux': 0,
+                'remaining_steps': 0,
+                'batch_number': 0,
+                'batch': [],
+                'position': 0,
+                'delivered': 0,
+            }
+
+        # Fluxed, full-period linear congruential generator.  The modulus *m*
+        # is a power of two and *mask* speeds up modulo calculations.  The
+        # multiplier *a* and addend *c* are Hull-Dobell constants.  See:
+        # https://jackgiffin.com/main/pdfs/Random-Number-Generators-T-E-Hull-and-A-R-Dobell.pdf
+        # *x* is the starting point and *flux* is a bitfield that breaks up
+        # patterns in the LCG.  All four are derived from *seed*, so a given
+        # seed always produces the same generator and the same permutation.
+        m = 1 << n.bit_length()
+        rng = Random(seed)
+        a = rng.randrange(5, m, 4) if m > 4 else 1
+        c = rng.randrange(1, m, 2) if m > 1 else 1
+        x = rng.randrange(m)
+        flux = rng.randrange(m)
+
+        return {
+            'version': _RANDOM_ORDERED_RANGE_VERSION,
+            'start': range_object.start,
+            'stop': range_object.stop,
+            'step': range_object.step,
+            'n': n,
+            'seed': seed,
+            'm': m,
+            'a': a,
+            'c': c,
+            'x': x,
+            'flux': flux,
+            'remaining_steps': m,
+            'batch_number': 0,
+            'batch': [],
+            'position': 0,
+            'delivered': 0,
+        }
+
+    def _validate_state(self, state: Any) -> _RandomOrderedRangeState:
+        # Reject anything that is not plain data with the expected schema.
+        if not isinstance(state, Mapping):
+            raise ValueError('state must be a mapping')
+        validated = dict(state)
+
+        expected_keys = {
+            'version',
+            'start',
+            'stop',
+            'step',
+            'n',
+            'seed',
+            'm',
+            'a',
+            'c',
+            'x',
+            'flux',
+            'remaining_steps',
+            'batch_number',
+            'batch',
+            'position',
+            'delivered',
+        }
+        if set(validated) != expected_keys:
+            raise ValueError('state has unexpected or missing fields')
+        if validated['version'] != _RANDOM_ORDERED_RANGE_VERSION:
+            raise ValueError(
+                'state was produced by an incompatible algorithm version'
+            )
+
+        # Booleans are rejected explicitly because they are ints in Python.
+        for key in (
+            'start',
+            'stop',
+            'step',
+            'n',
+            'seed',
+            'm',
+            'a',
+            'c',
+            'x',
+            'flux',
+            'remaining_steps',
+            'batch_number',
+            'position',
+            'delivered',
+        ):
+            value = validated[key]
+            if not isinstance(value, int) or isinstance(value, bool):
+                raise ValueError(f'state field {key!r} must be an integer')
+        if not isinstance(validated['batch'], list):
+            raise ValueError("state field 'batch' must be a list")
+
+        # The state is bound to the range it was created for.
+        range_object = self._range
+        if (
+            validated['start'] != range_object.start
+            or validated['stop'] != range_object.stop
+            or validated['step'] != range_object.step
+            or validated['n'] != len(range_object)
+        ):
+            raise ValueError('state does not match the given range')
+
+        n = validated['n']
+        if n < 0:
+            raise ValueError("state field 'n' must be nonnegative")
+        if not (0 <= validated['delivered'] <= n):
+            raise ValueError("state field 'delivered' is out of range")
+        if validated['batch_number'] < 0:
+            raise ValueError("state field 'batch_number' must be nonnegative")
+
+        batch = validated['batch']
+        if len(batch) > _RANDOM_ORDERED_RANGE_BATCH_SIZE:
+            raise ValueError("state field 'batch' exceeds the batch size")
+        if not (0 <= validated['position'] <= len(batch)):
+            raise ValueError("state field 'position' is outside the batch")
+        if any(
+            not isinstance(index, int)
+            or isinstance(index, bool)
+            or not 0 <= index < n
+            for index in batch
+        ):
+            raise ValueError("state field 'batch' contains invalid indices")
+        if len(set(batch)) != len(batch):
+            raise ValueError("state field 'batch' contains duplicate indices")
+
+        if n == 0:
+            zero_fields = (
+                'm',
+                'a',
+                'c',
+                'x',
+                'flux',
+                'remaining_steps',
+                'batch_number',
+                'position',
+                'delivered',
+            )
+            if any(validated[key] != 0 for key in zero_fields) or batch:
+                raise ValueError('corrupt state for an empty range')
+            return cast(_RandomOrderedRangeState, validated)
+
+        m = validated['m']
+        if m != 1 << n.bit_length() or m < 2:
+            raise ValueError("state field 'm' is inconsistent with 'n'")
+        if validated['remaining_steps'] < 0:
+            raise ValueError(
+                "state field 'remaining_steps' must be nonnegative"
+            )
+        for key in ('x', 'flux'):
+            if not 0 <= validated[key] < m:
+                raise ValueError(f'state field {key!r} is outside the modulus')
+        if (
+            validated['c'] < 1
+            or validated['c'] >= m
+            or validated['c'] % 2 == 0
+        ):
+            raise ValueError(
+                "state field 'c' is not a valid Hull-Dobell addend"
+            )
+        if m > 4:
+            if not 5 <= validated['a'] < m or validated['a'] % 4 != 1:
+                raise ValueError(
+                    "state field 'a' is not a valid Hull-Dobell multiplier"
+                )
+        elif validated['a'] != 1:
+            raise ValueError(
+                "state field 'a' is not a valid Hull-Dobell multiplier"
+            )
+
+        # Every value either has been delivered or is still buffered.
+        if validated['delivered'] + len(batch) - validated['position'] > n:
+            raise ValueError('state accounts for more indices than the range')
+        return cast(_RandomOrderedRangeState, validated)
+
+    @property
+    def state(self) -> _RandomOrderedRangeState:
+        """A fresh plain-data snapshot of the current progress."""
+        snapshot = cast(_RandomOrderedRangeState, dict(self._state))
+        snapshot['batch'] = list(snapshot['batch'])
+        return snapshot
+
+    def __len__(self) -> int:
+        state = self._state
+        return state['n'] - state['delivered']
+
+    def __iter__(self) -> 'random_ordered_range':
+        return self
+
+    def __next__(self) -> int:
+        state = self._state
+        if state['position'] >= len(state['batch']):
+            self._refill_batch()
+            if state['position'] >= len(state['batch']):
+                raise StopIteration
+        index = state['batch'][state['position']]
+        state['position'] += 1
+        state['delivered'] += 1
+        return self._range[index]
+
+    def _refill_batch(self) -> None:
+        state = self._state
+        n = state['n']
+        if n == 0:
+            return
+
+        # Collect the next batch of in-range indices from the LCG, then
+        # shuffle it.  Each batch has its own deterministic RNG derived from
+        # the seed and the batch number, so shuffles are reproducible without
+        # storing any RNG state in the progress state.
+        batch: list[int] = []
+        mask = state['m'] - 1
+        while (
+            len(batch) < _RANDOM_ORDERED_RANGE_BATCH_SIZE
+            and state['remaining_steps'] > 0
+        ):
+            index = state['x'] ^ state['flux']
+            if index < n:
+                batch.append(index)
+            state['x'] = (state['a'] * state['x'] + state['c']) & mask
+            state['remaining_steps'] -= 1
+
+        if batch:
+            batch_rng = Random(
+                _random_ordered_batch_seed(
+                    state['seed'], state['batch_number']
+                )
+            )
+            batch_rng.shuffle(batch)
+            state['batch_number'] += 1
+            state['batch'] = batch
+            state['position'] = 0
+        else:
+            state['batch'] = []
+            state['position'] = 0

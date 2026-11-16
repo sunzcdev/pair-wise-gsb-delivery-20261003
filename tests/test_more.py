@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import cmath
+import copy
 import gc
+import json
 import platform
 import types
 import weakref
@@ -7514,3 +7516,280 @@ class TestRandomOrderedRange(TestCase):
         # Without mitigation the LCG doesn't produce many distinct permutations
         perms = set(tuple(mi.random_ordered_range(6)) for _ in range(10**5))
         self.assertEqual(len(perms), factorial(6))
+
+    def test_seed_makes_permutation_reproducible(self):
+        # The same seed reproduces the exact same permutation.
+        first = list(mi.random_ordered_range(10_000, seed=42))
+        second = list(mi.random_ordered_range(10_000, seed=42))
+        self.assertEqual(first, second)
+        # Different seeds produce different permutations.
+        other = list(mi.random_ordered_range(10_000, seed=43))
+        self.assertNotEqual(first, other)
+
+    def test_seed_none_still_covers_every_value(self):
+        # Without a seed an unpredictable one is chosen and recorded.
+        iterator = mi.random_ordered_range(100)
+        self.assertIsInstance(iterator.state['seed'], int)
+        self.assertEqual(sorted(iterator), list(range(100)))
+
+    def test_seed_must_be_integer(self):
+        with self.assertRaises(TypeError):
+            mi.random_ordered_range(10, seed='not-an-int')
+        with self.assertRaises(TypeError):
+            mi.random_ordered_range(10, seed=True)
+
+    def test_state_is_plain_json_serializable_data(self):
+        iterator = mi.random_ordered_range(10_000, seed=7)
+        list(islice(iterator, 500))
+        state = iterator.state
+        # Round-tripping through JSON keeps the state usable.
+        restored = json.loads(json.dumps(state))
+        self.assertEqual(restored, state)
+        resumed = mi.random_ordered_range(10_000, seed=7, state=restored)
+        self.assertEqual(list(resumed), list(iterator))
+
+    def test_state_snapshot_is_independent(self):
+        iterator = mi.random_ordered_range(100, seed=7)
+        list(islice(iterator, 10))
+        snapshot = iterator.state
+        snapshot['batch'].append(999_999)
+        snapshot['delivered'] = -1
+        # Mutating a snapshot does not affect the live iterator.
+        self.assertNotIn(999_999, iterator.state['batch'])
+        self.assertEqual(iterator.state['delivered'], 10)
+
+    def test_resume_continues_same_permutation_without_repeats(self):
+        # Stitching together separately consumed batches covers each index once.
+        reference = list(mi.random_ordered_range(10_000, seed=123))
+        output = []
+        state = None
+        cursor = 0
+        for chunk_size in (1, 7, 1024, 3000, 999, 5969):
+            if state is None:
+                iterator = mi.random_ordered_range(10_000, seed=123)
+            else:
+                iterator = mi.random_ordered_range(
+                    10_000, seed=123, state=state
+                )
+            output.extend(list(islice(iterator, chunk_size)))
+            state = iterator.state
+            cursor += chunk_size
+            # The resumed prefix always matches the original permutation.
+            self.assertEqual(output, reference[:cursor])
+        self.assertEqual(sorted(output), list(range(10_000)))
+        self.assertEqual(len(output), len(set(output)))
+        self.assertEqual(output, reference)
+        # Nothing remains once the permutation is exhausted.
+        self.assertEqual(
+            list(mi.random_ordered_range(10_000, seed=123, state=state)), []
+        )
+
+    def test_resume_after_every_single_value(self):
+        # Pausing and resuming between every value never loses or repeats one.
+        for n in (0, 1, 2, 3, 4, 5, 7, 8, 15, 16, 17, 33, 100):
+            with self.subTest(n=n):
+                reference = list(mi.random_ordered_range(n, seed=99))
+                iterator = mi.random_ordered_range(n, seed=99)
+                produced = []
+                for expected in reference:
+                    self.assertEqual(next(iterator), expected)
+                    produced.append(expected)
+                    state = json.loads(json.dumps(iterator.state))
+                    resumed = mi.random_ordered_range(n, seed=99, state=state)
+                    self.assertEqual(list(resumed), reference[len(produced) :])
+                self.assertEqual(produced, reference)
+
+    def test_resume_with_range_arguments(self):
+        # The state is bound to start/stop/step, not just the length.
+        args = (1000, 2000, 10)
+        n = len(range(*args))
+        iterator = mi.random_ordered_range(*args, seed=5)
+        list(islice(iterator, 37))
+        state = iterator.state
+        resumed = mi.random_ordered_range(*args, seed=5, state=state)
+        self.assertEqual(len(resumed), n - 37)
+        reference = list(mi.random_ordered_range(*args, seed=5))
+        self.assertEqual(list(resumed), reference[37:])
+
+    def test_len_tracks_remaining_values(self):
+        iterator = mi.random_ordered_range(250, seed=3)
+        self.assertEqual(len(iterator), 250)
+        list(islice(iterator, 100))
+        self.assertEqual(len(iterator), 150)
+        list(iterator)
+        self.assertEqual(len(iterator), 0)
+
+    def test_state_rejected_for_wrong_range(self):
+        iterator = mi.random_ordered_range(1000, 2000, 7, seed=8)
+        list(islice(iterator, 10))
+        state = iterator.state
+        for wrong_args in (
+            (1001, 2000, 7),
+            (1000, 2001, 7),
+            (1000, 2000, 8),
+            (143,),
+        ):
+            with self.subTest(wrong_args=wrong_args):
+                with self.assertRaises(ValueError):
+                    mi.random_ordered_range(*wrong_args, state=state)
+
+    def test_state_rejected_for_wrong_version(self):
+        iterator = mi.random_ordered_range(100, seed=8)
+        state = iterator.state
+        for version in (0, 2, 99):
+            corrupt = copy.deepcopy(state)
+            corrupt['version'] = version
+            with self.assertRaises(ValueError):
+                mi.random_ordered_range(100, state=corrupt)
+
+    def test_state_rejected_for_schema_damage(self):
+        iterator = mi.random_ordered_range(100, seed=8)
+        list(islice(iterator, 5))
+        state = iterator.state
+        # Not a mapping.
+        with self.assertRaises(ValueError):
+            mi.random_ordered_range(100, state=[1, 2, 3])
+        # Missing or unexpected fields.
+        missing = copy.deepcopy(state)
+        del missing['x']
+        with self.assertRaises(ValueError):
+            mi.random_ordered_range(100, state=missing)
+        extra = copy.deepcopy(state)
+        extra['unexpected'] = 1
+        with self.assertRaises(ValueError):
+            mi.random_ordered_range(100, state=extra)
+        # Non-integer scalar fields (floats and booleans are both invalid).
+        for key in (
+            'start',
+            'stop',
+            'step',
+            'n',
+            'seed',
+            'm',
+            'a',
+            'c',
+            'x',
+            'flux',
+            'remaining_steps',
+            'batch_number',
+            'position',
+            'delivered',
+        ):
+            for bad_value in (1.5, True):
+                corrupt = copy.deepcopy(state)
+                corrupt[key] = bad_value
+                with self.subTest(key=key, bad_value=bad_value):
+                    with self.assertRaises(ValueError):
+                        mi.random_ordered_range(100, state=corrupt)
+
+    def test_state_rejected_for_corrupt_batch(self):
+        iterator = mi.random_ordered_range(100, seed=8)
+        list(islice(iterator, 5))
+        state = iterator.state
+        cases = {
+            'not a list': {'batch': (1, 2)},
+            'index too large': {'batch': [100]},
+            'negative index': {'batch': [-1]},
+            'duplicate indices': {'batch': [1, 1]},
+            'position beyond batch': {'position': len(state['batch']) + 1},
+            'batch oversized': {
+                'batch': [0] * (mi.more._RANDOM_ORDERED_RANGE_BATCH_SIZE + 1)
+            },
+        }
+        for label, changes in cases.items():
+            with self.subTest(label=label):
+                corrupt = copy.deepcopy(state)
+                corrupt.update(changes)
+                with self.assertRaises(ValueError):
+                    mi.random_ordered_range(100, state=corrupt)
+
+    def test_state_rejected_for_broken_lcg_invariants(self):
+        iterator = mi.random_ordered_range(100, seed=8)
+        list(islice(iterator, 5))
+        state = iterator.state
+        cases = {
+            'even addend': {'c': 2},
+            'multiplier not 1 mod 4': {'a': 7},
+            'modulus not power of two': {'m': 200},
+            'state outside modulus': {'x': state['m']},
+            'negative remaining steps': {'remaining_steps': -1},
+            'delivered beyond range': {'delivered': 101},
+        }
+        for label, changes in cases.items():
+            with self.subTest(label=label):
+                corrupt = copy.deepcopy(state)
+                corrupt.update(changes)
+                with self.assertRaises(ValueError):
+                    mi.random_ordered_range(100, state=corrupt)
+
+    def test_empty_range_state(self):
+        for args in ((0,), (10, 0), (0, 0, 1)):
+            with self.subTest(args=args):
+                iterator = mi.random_ordered_range(*args, seed=11)
+                self.assertEqual(list(iterator), [])
+                self.assertEqual(len(iterator), 0)
+                state = iterator.state
+                self.assertEqual(state['n'], 0)
+                # A serialized empty-range state can be resumed harmlessly.
+                resumed = mi.random_ordered_range(
+                    *args, seed=11, state=json.loads(json.dumps(state))
+                )
+                self.assertEqual(list(resumed), [])
+
+    def test_empty_range_corrupt_state_rejected(self):
+        iterator = mi.random_ordered_range(0, seed=11)
+        state = iterator.state
+        corrupt = copy.deepcopy(state)
+        corrupt['m'] = 1
+        with self.assertRaises(ValueError):
+            mi.random_ordered_range(0, state=corrupt)
+        corrupt = copy.deepcopy(state)
+        corrupt['batch'] = [0]
+        with self.assertRaises(ValueError):
+            mi.random_ordered_range(0, state=corrupt)
+
+    def test_seed_mismatch_with_state_rejected(self):
+        iterator = mi.random_ordered_range(100, seed=8)
+        state = iterator.state
+        with self.assertRaises(ValueError):
+            mi.random_ordered_range(100, seed=9, state=state)
+        # Passing the same seed or omitting the seed both work.
+        mi.random_ordered_range(100, seed=8, state=copy.deepcopy(state))
+        mi.random_ordered_range(100, state=copy.deepcopy(state))
+
+    def test_power_of_two_lengths(self):
+        # Rejection sampling inside the LCG must still cover every index.
+        for exponent in range(0, 12):
+            n = 1 << exponent
+            with self.subTest(n=n):
+                output = list(mi.random_ordered_range(n, seed=exponent))
+                self.assertEqual(sorted(output), list(range(n)))
+                self.assertEqual(len(output), len(set(output)))
+
+    def test_non_power_of_two_lengths(self):
+        for n in (3, 5, 6, 7, 9, 15, 17, 31, 33, 63, 65, 1023, 1025):
+            with self.subTest(n=n):
+                output = list(mi.random_ordered_range(n, seed=n))
+                self.assertEqual(sorted(output), list(range(n)))
+
+    def test_memory_does_not_grow_with_range_length(self):
+        import tracemalloc
+
+        def peak_memory(n):
+            tracemalloc.start()
+            try:
+                iterator = mi.random_ordered_range(n, seed=4)
+                list(islice(iterator, 500))
+                state_size = len(json.dumps(iterator.state))
+                _, peak = tracemalloc.get_traced_memory()
+            finally:
+                tracemalloc.stop()
+            return peak, state_size
+
+        small_peak, small_state = peak_memory(10_000)
+        big_peak, big_state = peak_memory(10_000_000)
+        # A thousand-fold larger range must not need a thousand-fold more
+        # memory: both the working set and the serialized state stay bounded.
+        self.assertLess(big_peak, small_peak * 3)
+        self.assertLess(big_state, 100_000)
+        self.assertLess(small_state, 100_000)
