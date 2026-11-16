@@ -11,6 +11,13 @@ for you.
 
 import warnings
 
+from jsonschema._containment import (
+    COMPATIBLE,
+    INCOMPATIBLE,
+    UNKNOWN,
+    ContainmentResult,
+    check_scalar_numeric_containment,
+)
 from jsonschema._format import FormatChecker
 from jsonschema._types import TypeChecker
 from jsonschema.exceptions import SchemaError, ValidationError
@@ -113,6 +120,8 @@ def __getattr__(name):
 
 
 __all__ = [
+    "COMPATIBLE",
+    "ContainmentResult",
     "Draft3Validator",
     "Draft4Validator",
     "Draft6Validator",
@@ -120,8 +129,11 @@ __all__ = [
     "Draft201909Validator",
     "Draft202012Validator",
     "FormatChecker",
+    "INCOMPATIBLE",
     "SchemaError",
     "TypeChecker",
+    "UNKNOWN",
     "ValidationError",
+    "check_scalar_numeric_containment",
     "validate",
 ]

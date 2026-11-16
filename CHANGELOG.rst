@@ -1,6 +1,10 @@
 v4.27.0
 =======
 
+* Add a deliberately limited containment analysis for scalar numeric schemas via :func:`jsonschema.check_scalar_numeric_containment`.
+  It checks whether every numeric scalar accepted by an old schema is still accepted by a new one, covering numeric bounds (including open/closed boundaries and the draft 3/4 boolean form), the ``integer`` type and numeric ``enum``, with locally or registry-resolvable ``$ref`` chains.
+  Every reported incompatibility carries a concrete ``decimal.Decimal`` witness that is re-validated against both validators so boundary precision is preserved; schemas outside the supported subset, unresolvable references or undecidable combinations return an *unknown* verdict rather than guessing.
+  This is not a general-purpose decidability engine for arbitrary schemas.
 * Support for Python 3.10 and 3.11 has been dropped.
 * Improve ``best_match`` for ``anyOf`` / ``oneOf`` errors: the most relevant error is now found within each subschema separately before the deepest of those is picked (#1257, #1300).
   In particular an applicator with a single subschema now produces the same best match as the bare subschema would.
