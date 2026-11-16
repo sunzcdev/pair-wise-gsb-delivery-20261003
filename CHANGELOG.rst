@@ -2,6 +2,9 @@ v4.27.0
 =======
 
 * Support for Python 3.10 and 3.11 has been dropped.
+* Validation errors now carry a ``ref_chain`` -- a tuple of ``jsonschema.exceptions.RefChainSegment`` objects, one per reference (``:kw:$ref``, ``:kw:$dynamicRef``, ``:kw:$recursiveRef``) actually traversed to reach the failure, ordered from the outermost (entry) reference inwards.
+  Each segment preserves the source resource, the reference text as written, and the resolved target URI, so error reports can point both at the entry usage location and at the final constraint declaration location (via ``schema_path``), while ``path`` continues to identify the offending instance element.
+  The chain is also rendered as part of ``str(error)``, and the outermost hop is conveniently available as ``error.entry_ref``.
 * Improve ``best_match`` for ``anyOf`` / ``oneOf`` errors: the most relevant error is now found within each subschema separately before the deepest of those is picked (#1257, #1300).
   In particular an applicator with a single subschema now produces the same best match as the bare subschema would.
   ``relevance`` no longer considers an error's position amongst its siblings.

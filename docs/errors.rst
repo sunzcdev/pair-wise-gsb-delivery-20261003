@@ -119,6 +119,38 @@ raised or returned, depending on which method or function is used.
         A validation error which this error is the `context` of.
         ``None`` if there wasn't one.
 
+    .. attribute:: ref_chain
+
+        A tuple of `RefChainSegment`\s, one for each reference
+        (:kw:`$ref`, :kw:`$dynamicRef` or :kw:`$recursiveRef`) that was
+        followed to reach the failed constraint, ordered from the
+        outermost (entry) reference inwards.
+
+        Each segment preserves the resource the reference was found in
+        (`RefChainSegment.source`), the reference text as written
+        (`RefChainSegment.ref`), and the URI it resolved to
+        (`RefChainSegment.target`). The tuple is empty if no references
+        were traversed, and only ever contains hops which were actually
+        walked while validating the instance -- e.g. for a recursive
+        schema it contains exactly as many hops as the (finite) instance
+        required.
+
+        Combined with `schema_path` -- which is relative to the
+        *final* referenced schema -- the chain lets a report point both
+        at the entry usage location and at the resource where the failed
+        constraint was declared.
+
+    .. attribute:: entry_ref
+
+        The first (outermost) segment of `ref_chain`, or ``None`` if no
+        reference was followed. This identifies where the referenced
+        schema was *used*, as opposed to `schema_path`, which identifies
+        where the failed constraint was *declared*.
+
+
+.. autoexception:: RefChainSegment
+    :noindex:
+
 
 In case an invalid schema itself is encountered, a `SchemaError` is
 raised.
@@ -221,6 +253,51 @@ easier debugging.
 
     On instance[1]:
         3
+
+
+Reference chains
+----------------
+
+When a failure is reached by following one or more references, the
+error's `ValidationError.ref_chain` records each hop, so a report can
+point both at the entry usage location and at the final constraint
+declaration location -- while `ValidationError.path` continues to
+identify the offending part of the instance.
+
+.. testcode::
+
+    schema = {
+        "$id": "https://example.com/root",
+        "$ref": "contract.json",
+        "$defs": {
+            "contract": {
+                "$id": "contract.json",
+                "properties": {"name": {"type": "string"}},
+            },
+        },
+    }
+    instance = {"name": 12}
+    (error,) = Draft202012Validator(schema).iter_errors(instance)
+
+    print(error.ref_chain[0].source)  # where the $ref was used
+    print(error.ref_chain[0].ref)     # the reference text
+    print(error.ref_chain[0].target)  # what it resolved to
+    print(list(error.schema_path))    # the failed constraint, in the target
+    print(list(error.path))           # the offending instance element
+
+.. testoutput::
+
+    https://example.com/root
+    contract.json
+    https://example.com/contract.json
+    ['properties', 'name', 'type']
+    ['name']
+
+If the same contract is referenced from two different places, each
+failure carries its own chain, attributing it to the entry point which
+led to it. And if a reference cannot be resolved at all, a
+`referencing.exceptions.Unresolvable` error is raised directly -- it is
+*not* wrapped in a `ValidationError`.
 
 
 ErrorTrees

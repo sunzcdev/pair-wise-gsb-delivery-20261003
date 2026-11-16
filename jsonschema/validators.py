@@ -41,6 +41,20 @@ _VALIDATORS: dict[str, Validator] = {}
 _META_SCHEMAS = _utils.URIDict()
 
 
+def _record_ref_segment(errors, segment):
+    """
+    Prepend a reference chain segment to each error as it is yielded.
+
+    Each reference hop wraps the errors produced within the referenced
+    schema, so that by the time an error reaches the caller its
+    ``ref_chain`` contains one segment per reference actually traversed,
+    ordered from the outermost (entry) reference inwards.
+    """
+    for error in errors:
+        error.ref_chain = (segment, *error.ref_chain)
+        yield error
+
+
 def __getattr__(name):
     if name == "ErrorTree":
         warnings.warn(
@@ -466,12 +480,24 @@ def create(
                 try:
                     resolved = self._resolver.lookup(ref)
                 except referencing.exceptions.Unresolvable as err:
+                    # Resolution failures are *not* validation errors --
+                    # they must propagate as-is rather than being wrapped
+                    # in (e.g. a type) `ValidationError`.
                     raise exceptions._WrappedReferencingError(err) from err
 
-                return self.descend(
-                    instance,
-                    resolved.contents,
-                    resolver=resolved.resolver,
+                base_uri = self._resolver._base_uri
+                segment = exceptions.RefChainSegment(
+                    source=base_uri,
+                    ref=ref,
+                    target=urljoin(base_uri, ref),
+                )
+                return _record_ref_segment(
+                    self.descend(
+                        instance,
+                        resolved.contents,
+                        resolver=resolved.resolver,
+                    ),
+                    segment,
                 )
             else:
                 resolve = getattr(self._ref_resolver, "resolve", None)

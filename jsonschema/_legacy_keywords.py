@@ -3,7 +3,7 @@ import re
 from referencing.jsonschema import lookup_recursive_ref
 
 from jsonschema import _utils
-from jsonschema.exceptions import ValidationError
+from jsonschema.exceptions import RefChainSegment, ValidationError
 
 
 def ignore_ref_siblings(schema):
@@ -243,11 +243,18 @@ def contains_draft6_draft7(validator, contains, instance, schema):
 
 def recursiveRef(validator, recursiveRef, instance, schema):
     resolved = lookup_recursive_ref(validator._resolver)
-    yield from validator.descend(
+    segment = RefChainSegment(
+        source=validator._resolver._base_uri,
+        ref=recursiveRef,
+        target=resolved.resolver._base_uri,
+    )
+    for error in validator.descend(
         instance,
         resolved.contents,
         resolver=resolved.resolver,
-    )
+    ):
+        error.ref_chain = (segment, *error.ref_chain)
+        yield error
 
 
 def find_evaluated_item_indexes_by_schema(validator, instance, schema):

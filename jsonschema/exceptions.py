@@ -42,6 +42,45 @@ def _pretty(thing: Any, prefix: str):
     return indent(pformat(thing, width=72, sort_dicts=False), prefix).lstrip()
 
 
+@define(frozen=True)
+class RefChainSegment:
+    """
+    A single hop in the chain of references followed to reach an error.
+
+    Whenever validation descends through a reference (e.g. :kw:`$ref`,
+    :kw:`$dynamicRef` or :kw:`$recursiveRef`), one segment is recorded,
+    preserving:
+
+        source:
+
+            the URI of the resource which contained the reference (the
+            base URI in effect at the reference's location, or ``""``
+            for a root resource without an ``$id``)
+
+        ref:
+
+            the reference text exactly as written in the schema
+
+        target:
+
+            the absolute URI the reference resolved to
+
+    Segments are accumulated on `ValidationError.ref_chain`, ordered
+    from the outermost (entry) reference to the innermost one, so the
+    first segment identifies where the referenced schema was *used* and
+    the last one (combined with the error's ``schema_path``) identifies
+    where the failed constraint was *declared*.
+    """
+
+    source: str
+    ref: str
+    target: str
+
+    def __str__(self) -> str:
+        source = self.source or "<root resource>"
+        return f"{source}: {self.ref!r} -> {self.target!r}"
+
+
 def __getattr__(name):
     if name == "RefResolutionError":
         warnings.warn(
@@ -70,6 +109,7 @@ class _Error(Exception):
         schema_path: Iterable[str | int] = (),
         parent: _Error | None = None,
         type_checker: _types.TypeChecker = _unset,  # type: ignore[assignment]
+        ref_chain: Iterable[RefChainSegment] = (),
     ) -> None:
         super().__init__(
             message,
@@ -93,6 +133,7 @@ class _Error(Exception):
         self.instance = instance
         self.schema = schema
         self.parent = parent
+        self.ref_chain = tuple(ref_chain)
         self._type_checker = type_checker
 
         for error in context:
@@ -121,8 +162,16 @@ class _Error(Exception):
         )
         prefix = 16 * " "
 
-        return dedent(
-            f"""\
+        ref_chain = ""
+        if self.ref_chain:
+            hops = "\n".join(f"    {segment}" for segment in self.ref_chain)
+            ref_chain = (
+                f"\n\nVia reference chain (outermost reference first):\n{hops}"
+            )
+
+        return (
+            dedent(
+                f"""\
             {self.message}
 
             Failed validating {self.validator!r} in {schema_path}:
@@ -131,6 +180,8 @@ class _Error(Exception):
             On {instance_path}:
                 {_pretty(self.instance, prefix=prefix)}
             """.rstrip(),
+            )
+            + ref_chain
         )
 
     @classmethod
@@ -170,6 +221,18 @@ class _Error(Exception):
                 path += "['" + escaped_elem + "']"
         return path
 
+    @property
+    def entry_ref(self) -> RefChainSegment | None:
+        """
+        The outermost reference hop followed to reach this error, if any.
+
+        This identifies where the (transitively) referenced schema was
+        *used* -- the entry point into the reference chain -- as opposed
+        to ``schema_path``, which identifies where the failed constraint
+        was *declared* within the final referenced schema.
+        """
+        return self.ref_chain[0] if self.ref_chain else None
+
     def _set(
         self,
         type_checker: _types.TypeChecker | None = None,
@@ -194,6 +257,7 @@ class _Error(Exception):
             "instance",
             "schema",
             "parent",
+            "ref_chain",
         )
         return {attr: getattr(self, attr) for attr in attrs}
 
