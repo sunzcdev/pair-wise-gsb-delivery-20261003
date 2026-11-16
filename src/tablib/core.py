@@ -19,7 +19,10 @@ from copy import copy
 from operator import itemgetter
 
 from .exceptions import (
+    BatchError,  # noqa: F401  re-exported as tablib.BatchError
+    BatchSourceError,
     HeadersNeeded,
+    InvalidBatchRow,
     InvalidDatasetIndex,
     InvalidDatasetType,
     InvalidDimensions,
@@ -33,6 +36,72 @@ __author__ = 'Kenneth Reitz'
 __license__ = 'MIT'
 __copyright__ = 'Copyright 2017 Kenneth Reitz. 2019 Jazzband.'
 __docformat__ = 'restructuredtext'
+
+
+# Failure policies for :meth:`Dataset.extend_batch`.
+#: Reject the entire batch: on failure the :class:`Dataset` is restored.
+BATCH_REJECT = 'reject'
+#: Keep the rows accepted before the first failure and report the progress.
+BATCH_PREFIX = 'prefix'
+
+
+class BatchResult:
+    """Outcome of :meth:`Dataset.extend_batch`.
+
+    A result is truthy when every row of the batch entered the
+    :class:`Dataset`. When a row could not be processed, the result reports
+    exactly how far the ingestion got: the number of rows actually added
+    (:attr:`accepted`), how many source rows were pulled (:attr:`consumed`),
+    the position of the failing row within the batch (:attr:`failed_index`)
+    and the error itself (:attr:`error`).
+
+    :param accepted: number of rows added to the :class:`Dataset`
+    :param error: exception describing the first failing row, or ``None``
+    """
+
+    __slots__ = ['accepted', 'error']
+
+    def __init__(self, accepted, error=None):
+        self.accepted = accepted
+        self.error = error
+
+    @property
+    def ok(self):
+        """``True`` when every row of the batch was accepted."""
+        return self.error is None
+
+    @property
+    def failed(self):
+        """``True`` when ingestion stopped at a failing row."""
+        return self.error is not None
+
+    @property
+    def failed_index(self):
+        """Zero-based position of the first failing row, or ``None``."""
+        return None if self.error is None else self.error.index
+
+    @property
+    def consumed(self):
+        """Number of source rows pulled from the iterable.
+
+        This equals :attr:`accepted` when the source itself failed, and
+        :attr:`accepted` plus one when the failing row was produced but did
+        not pass validation.
+        """
+        if self.error is None or isinstance(self.error, BatchSourceError):
+            return self.accepted
+        return self.accepted + 1
+
+    def __bool__(self):
+        return self.ok
+
+    def __repr__(self):
+        if self.error is None:
+            return f'<BatchResult: {self.accepted} row(s) accepted>'
+        return (
+            f'<BatchResult: {self.accepted} row(s) accepted, '
+            f'failed at row {self.error.index}>'
+        )
 
 
 class Row:
@@ -486,13 +555,112 @@ class Dataset:
 
         self.rpush(row, tags)
 
-    def extend(self, rows, tags=()):
+    def extend(self, rows, tags=(), on_error=None):
         """Adds a list of rows to the :class:`Dataset` using
-        :method:`Dataset.append`
+        :method:`Dataset.append`.
+
+        The default behaviour is unchanged: rows are appended one at a time,
+        so if one of them is invalid the preceding rows stay in the
+        :class:`Dataset`, the original exception is raised, and ``None`` is
+        returned.
+
+        Passing ``on_error`` switches to an explicit batch mode backed by
+        :meth:`Dataset.extend_batch` and returns a :class:`BatchResult`::
+
+            data.extend(rows, on_error=tablib.BATCH_REJECT)   # all or nothing
+            data.extend(rows, on_error=tablib.BATCH_PREFIX)   # keep accepted rows
         """
 
-        for row in rows:
-            self.append(row, tags)
+        if on_error is None:
+            for row in rows:
+                self.append(row, tags)
+            return None
+
+        return self.extend_batch(rows, tags=tags, on_error=on_error)
+
+    def _prepare_batch_row(self, row, tags):
+        """Validate a single batch row and build the :class:`Row` to store.
+
+        Mirrors :meth:`Dataset.insert` but never mutates the supplied row and
+        keeps the identity of an already built :class:`Row` when possible.
+        ``tags`` are only applied when explicitly given.
+        """
+        self._validate(row)
+        if len(row) < self.width:
+            row = list(row)
+            for pos, func in self._dynamic_columns.items():
+                row.insert(pos, func(row))
+
+        if isinstance(row, Row) and not tags:
+            return row
+        return Row(row, tags=tags)
+
+    def extend_batch(self, rows, tags=(), on_error=BATCH_REJECT):
+        """Adds a batch of rows with an explicit failure policy.
+
+        Unlike :meth:`extend`, which appends rows one by one up to the failing
+        row and leaves the caller guessing what was accepted, this method
+        treats the batch as a unit and reports the exact progress.
+
+        ``rows`` may be a one-shot iterable such as a generator. It is
+        consumed lazily, at most once, and iteration stops at the first
+        failure. Each dynamic-column callable is run at most once per row.
+
+        Two policies are available:
+
+        * :data:`BATCH_REJECT` (default): the whole batch is rejected. On
+          failure the :class:`Dataset` is restored to its exact previous
+          state -- rows, row tags and width -- and an exception is raised.
+          :class:`Row` objects already in the :class:`Dataset` keep their
+          identity.
+        * :data:`BATCH_PREFIX`: the rows accepted before the first failure
+          are kept and a :class:`BatchResult` is returned instead of raising,
+          reporting the number of accepted rows and the failing position.
+
+        A validation failure raises :class:`InvalidBatchRow`, while an
+        exception raised by the ``rows`` iterable itself is reported as
+        :class:`BatchSourceError`. Both carry a zero-based ``index`` for the
+        offending row within the batch and the original exception as
+        ``original``.
+
+        :param rows: iterable of rows to add
+        :param tags: tags applied to every inserted row
+        :param on_error: :data:`BATCH_REJECT` or :data:`BATCH_PREFIX`
+        :rtype: BatchResult
+        """
+        if on_error not in (BATCH_REJECT, BATCH_PREFIX):
+            raise ValueError(
+                f'on_error must be {BATCH_REJECT!r} or {BATCH_PREFIX!r}, '
+                f'not {on_error!r}'
+            )
+
+        iterator = iter(rows)
+        height = self.height
+        index = 0
+
+        while True:
+            try:
+                row = next(iterator)
+            except StopIteration:
+                return BatchResult(index)
+            except Exception as exc:
+                error = BatchSourceError(index, exc)
+                if on_error == BATCH_PREFIX:
+                    return BatchResult(index, error)
+                del self._data[height:]
+                raise error from exc
+
+            try:
+                prepared = self._prepare_batch_row(row, tags)
+            except Exception as exc:
+                error = InvalidBatchRow(index, exc)
+                if on_error == BATCH_PREFIX:
+                    return BatchResult(index, error)
+                del self._data[height:]
+                raise error from exc
+
+            self._data.append(prepared)
+            index += 1
 
     def lpop(self):
         """Removes and returns the first row of the :class:`Dataset`."""

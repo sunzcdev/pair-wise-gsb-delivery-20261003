@@ -18,8 +18,19 @@ from odf import opendocument, table
 from openpyxl.reader.excel import load_workbook
 
 import tablib
-from tablib.core import Row, detect_format
-from tablib.exceptions import UnsupportedFormat
+from tablib.core import (
+    BATCH_PREFIX,
+    BATCH_REJECT,
+    BatchResult,
+    Row,
+    detect_format,
+)
+from tablib.exceptions import (
+    BatchError,
+    BatchSourceError,
+    InvalidBatchRow,
+    UnsupportedFormat,
+)
 from tablib.formats import registry
 
 try:
@@ -755,6 +766,405 @@ class TablibTestCase(BaseTestCase):
 
         # Act / Assert
         self.assertTrue(john.has_tag(["tag2", "tag1"]))
+
+
+class ExtendBatchTests(BaseTestCase):
+    """Tests for Dataset.extend_batch and the batch mode of Dataset.extend."""
+
+    def setUp(self):
+        super().setUp()
+        # A fresh dataset with headers (the base one is already filled).
+        self.founders = tablib.Dataset(headers=self.headers, title='Founders')
+        self.good_rows = [self.john, self.george, self.tom]
+        # A row with one column too few.
+        self.bad_row = ('John', 'Adams')
+
+    def _rows_with_failure_at(self, index):
+        rows = [list(row) for row in self.good_rows]
+        rows[index] = self.bad_row
+        return rows
+
+    def test_success_returns_batch_result(self):
+        result = self.founders.extend_batch(self.good_rows)
+
+        self.assertIsInstance(result, BatchResult)
+        self.assertTrue(result)
+        self.assertTrue(result.ok)
+        self.assertFalse(result.failed)
+        self.assertIsNone(result.error)
+        self.assertIsNone(result.failed_index)
+        self.assertEqual(result.accepted, 3)
+        self.assertEqual(self.founders.height, 3)
+        self.assertEqual(self.founders.width, 3)
+        self.assertEqual(
+            [row.tuple for row in self.founders._data], self.good_rows
+        )
+
+    def test_empty_batch(self):
+        result = self.founders.extend_batch(iter(()))
+
+        self.assertTrue(result.ok)
+        self.assertEqual(result.accepted, 0)
+        self.assertEqual(self.founders.height, 0)
+
+    def test_default_policy_rejects_whole_batch(self):
+        with self.assertRaises(InvalidBatchRow) as ctx:
+            self.founders.extend_batch(self._rows_with_failure_at(1))
+
+        error = ctx.exception
+        self.assertEqual(error.index, 1)
+        self.assertIsInstance(error.original, tablib.InvalidDimensions)
+        self.assertIn('row 1', str(error))
+
+        # Nothing entered the dataset.
+        self.assertEqual(self.founders.height, 0)
+        self.assertEqual(self.founders.width, 3)
+        self.assertEqual(self.founders.headers, list(self.headers))
+
+    def test_explicit_reject_policy(self):
+        with self.assertRaises(InvalidBatchRow):
+            self.founders.extend_batch(
+                self._rows_with_failure_at(0), on_error=BATCH_REJECT
+            )
+        self.assertEqual(self.founders.height, 0)
+
+    def test_reject_restores_rows_tags_and_width(self):
+        self.founders.append(self.john, tags=('kept',))
+        existing_row = self.founders._data[0]
+        original_width = self.founders.width
+
+        with self.assertRaises(InvalidBatchRow):
+            self.founders.extend_batch(
+                self._rows_with_failure_at(1), tags=('new',)
+            )
+
+        # The pre-existing Row keeps its identity, tags and content.
+        self.assertIs(self.founders._data[0], existing_row)
+        self.assertEqual(self.founders._data[0].tags, ['kept'])
+        self.assertEqual(self.founders[0], self.john)
+        self.assertEqual(self.founders.height, 1)
+        self.assertEqual(self.founders.width, original_width)
+
+    def test_reject_restores_width_of_headerless_dataset(self):
+        dataset = tablib.Dataset()
+        with self.assertRaises(InvalidBatchRow):
+            dataset.extend_batch([self.john, self.bad_row])
+
+        # Rows, width and header state all roll back to empty.
+        self.assertEqual(dataset.height, 0)
+        self.assertEqual(dataset.width, 0)
+        self.assertIsNone(dataset.headers)
+
+    def test_reject_restores_headers_only_dataset(self):
+        dataset = tablib.Dataset(headers=self.headers)
+        with self.assertRaises(InvalidBatchRow):
+            dataset.extend_batch(self._rows_with_failure_at(2))
+
+        self.assertEqual(dataset.height, 0)
+        self.assertEqual(dataset.width, 3)
+        self.assertEqual(dataset.headers, list(self.headers))
+
+    def test_prefix_keeps_accepted_rows_and_reports_progress(self):
+        result = self.founders.extend_batch(
+            self._rows_with_failure_at(1), on_error=BATCH_PREFIX
+        )
+
+        self.assertFalse(result.ok)
+        self.assertFalse(result)
+        self.assertTrue(result.failed)
+        self.assertEqual(result.accepted, 1)
+        self.assertEqual(result.failed_index, 1)
+        self.assertIsInstance(result.error, InvalidBatchRow)
+        self.assertEqual(self.founders.height, 1)
+        self.assertEqual(self.founders[0], self.john)
+        self.assertEqual(self.founders.width, 3)
+
+    def test_prefix_failure_on_first_row_accepts_nothing(self):
+        result = self.founders.extend_batch(
+            self._rows_with_failure_at(0), on_error=BATCH_PREFIX
+        )
+
+        self.assertEqual(result.accepted, 0)
+        self.assertEqual(result.failed_index, 0)
+        self.assertEqual(self.founders.height, 0)
+        self.assertEqual(self.founders.width, 3)
+
+    def test_prefix_appends_after_existing_rows(self):
+        self.founders.append(self.john)
+        result = self.founders.extend_batch(
+            self._rows_with_failure_at(2), on_error=BATCH_PREFIX
+        )
+
+        self.assertEqual(result.accepted, 2)
+        self.assertEqual(self.founders.height, 3)
+        self.assertEqual(self.founders[0], self.john)
+        self.assertEqual(self.founders[1], self.john)
+        self.assertEqual(self.founders[2], self.george)
+
+    def test_one_shot_generator_is_consumed_at_most_once(self):
+        consumed = []
+
+        def source():
+            for position, row in enumerate(self._rows_with_failure_at(1)):
+                consumed.append(position)
+                yield row
+
+        with self.assertRaises(InvalidBatchRow):
+            self.founders.extend_batch(source())
+
+        # Iteration stopped at the failing row, no re-iteration happened.
+        self.assertEqual(consumed, [0, 1])
+        self.assertEqual(self.founders.height, 0)
+
+    def test_prefix_stops_consuming_generator_after_failure(self):
+        def source():
+            yield self.john
+            yield self.bad_row
+            raise AssertionError('generator advanced past the failing row')
+
+        result = self.founders.extend_batch(source(), on_error=BATCH_PREFIX)
+        self.assertEqual(result.accepted, 1)
+        self.assertEqual(result.failed_index, 1)
+
+    def test_source_error_is_distinguished_in_reject_mode(self):
+        def source():
+            yield self.john
+            raise RuntimeError('source exploded')
+
+        with self.assertRaises(BatchSourceError) as ctx:
+            self.founders.extend_batch(source())
+
+        error = ctx.exception
+        self.assertEqual(error.index, 1)
+        self.assertIsInstance(error.original, RuntimeError)
+        self.assertEqual(str(error.original), 'source exploded')
+        self.assertIn('source', str(error))
+        # The reject policy rolls back what had already been accepted.
+        self.assertEqual(self.founders.height, 0)
+
+    def test_source_error_is_distinguished_in_prefix_mode(self):
+        def source():
+            yield self.john
+            raise RuntimeError('source exploded')
+
+        result = self.founders.extend_batch(source(), on_error=BATCH_PREFIX)
+
+        self.assertFalse(result.ok)
+        self.assertEqual(result.accepted, 1)
+        self.assertEqual(result.failed_index, 1)
+        self.assertIsInstance(result.error, BatchSourceError)
+        self.assertEqual(self.founders.height, 1)
+
+    def test_source_error_on_first_yield(self):
+        def source():
+            raise RuntimeError('immediate')
+            yield  # pragma: no cover - makes this function a generator
+
+        with self.assertRaises(BatchSourceError) as ctx:
+            self.founders.extend_batch(source())
+        self.assertEqual(ctx.exception.index, 0)
+        self.assertEqual(self.founders.height, 0)
+
+    def test_validation_error_and_source_error_are_distinct(self):
+        with self.assertRaises(InvalidBatchRow) as validation_ctx:
+            self.founders.extend_batch([self.bad_row])
+        self.assertNotIsInstance(validation_ctx.exception, BatchSourceError)
+
+        def failing_source():
+            raise RuntimeError('boom')
+            yield  # pragma: no cover
+
+        with self.assertRaises(BatchSourceError) as source_ctx:
+            self.founders.extend_batch(failing_source())
+        self.assertNotIsInstance(source_ctx.exception, InvalidBatchRow)
+        self.assertNotIsInstance(source_ctx.exception, tablib.InvalidDimensions)
+
+    def test_non_sequence_row_is_reported_as_invalid_batch_row(self):
+        result = self.founders.extend_batch(
+            [self.john, 42, self.george], on_error=BATCH_PREFIX
+        )
+
+        self.assertEqual(result.accepted, 1)
+        self.assertEqual(result.failed_index, 1)
+        self.assertIsInstance(result.error, InvalidBatchRow)
+        self.assertIsInstance(result.error.original, TypeError)
+        self.assertEqual(self.founders.height, 1)
+
+    def test_invalid_batch_row_stays_compatible_with_invalid_dimensions(self):
+        self.assertTrue(issubclass(InvalidBatchRow, BatchError))
+        self.assertTrue(issubclass(InvalidBatchRow, tablib.InvalidDimensions))
+        self.assertTrue(issubclass(BatchSourceError, BatchError))
+
+        # Existing callers catching InvalidDimensions keep working.
+        with self.assertRaises(tablib.InvalidDimensions):
+            self.founders.extend_batch(self._rows_with_failure_at(0))
+
+    def test_dynamic_column_runs_once_per_row(self):
+        calls = []
+
+        def dynamic(row):
+            calls.append(tuple(row))
+            return row[0] + 10
+
+        dataset = tablib.Dataset(headers=('value', 'label'))
+        dataset.append_col(dynamic, header='derived')
+
+        result = dataset.extend_batch([(1, 'a'), (2, 'b'), (3, 'c')])
+
+        self.assertTrue(result.ok)
+        self.assertEqual(calls, [(1, 'a'), (2, 'b'), (3, 'c')])
+        self.assertEqual(dataset.get_col(2), [11, 12, 13])
+
+    def test_dynamic_column_skipped_for_fully_populated_rows(self):
+        calls = []
+
+        def dynamic(row):
+            calls.append(row)
+            return 99
+
+        dataset = tablib.Dataset(headers=('a', 'b'))
+        dataset.append_col(dynamic, header='c')
+
+        dataset.extend_batch([(1, 2, 3), (4, 5, 6)])
+
+        self.assertEqual(calls, [])
+        self.assertEqual(dataset.get_col(2), [3, 6])
+
+    def test_dynamic_column_failure_is_wrapped_and_rolled_back(self):
+        def dynamic(row):
+            raise ValueError('dynamic failed')
+
+        dataset = tablib.Dataset(headers=('a', 'b', 'c'))
+        dataset._dynamic_columns[2] = dynamic
+        dataset._data.append(Row((0, 0, 0)))
+        log_height = dataset.height
+
+        with self.assertRaises(InvalidBatchRow) as ctx:
+            dataset.extend_batch([(1, 2)])
+
+        self.assertEqual(ctx.exception.index, 0)
+        self.assertIsInstance(ctx.exception.original, ValueError)
+        self.assertEqual(dataset.height, log_height)
+        self.assertEqual(dataset[0], (0, 0, 0))
+        self.assertEqual(dataset.width, 3)
+
+    def test_row_object_identity_is_preserved(self):
+        row = Row(self.john)
+        self.founders.extend_batch([row])
+
+        self.assertIs(self.founders._data[0], row)
+
+    def test_input_row_not_mutated_by_dynamic_columns(self):
+        def dynamic(row):
+            return row[0] * 2
+
+        dataset = tablib.Dataset(headers=('a', 'b'))
+        dataset.append_col(dynamic, header='c')
+        incoming = Row((3, 'x'))
+
+        dataset.extend_batch([incoming])
+
+        self.assertEqual(incoming.list, [3, 'x'])
+        self.assertEqual(dataset._data[0].list, [3, 'x', 6])
+
+    def test_tags_are_applied_to_every_batch_row(self):
+        self.founders.extend_batch(self.good_rows, tags=('batch', 'new'))
+
+        for row in self.founders._data:
+            self.assertTrue(row.has_tag('batch'))
+            self.assertTrue(row.has_tag('new'))
+
+    def test_existing_tags_kept_when_no_tags_are_given(self):
+        row = Row(self.john, tags=['kept'])
+        self.founders.extend_batch([row])
+
+        self.assertTrue(self.founders._data[0].has_tag('kept'))
+
+    def test_invalid_policy_raises_value_error(self):
+        with self.assertRaises(ValueError):
+            self.founders.extend_batch(self.good_rows, on_error='bogus')
+        self.assertEqual(self.founders.height, 0)
+
+    def test_legacy_extend_returns_none_and_keeps_partial_rows(self):
+        result = self.founders.extend(self.good_rows[:2])
+        self.assertIsNone(result)
+        self.assertEqual(self.founders.height, 2)
+
+        with self.assertRaises(tablib.InvalidDimensions):
+            self.founders.extend([self.george, self.bad_row, self.tom])
+
+        # Legacy behaviour: everything up to the failing row was kept and no
+        # batch error type is involved.
+        self.assertEqual(self.founders.height, 3)
+        self.assertEqual(self.founders[2], self.george)
+
+    def test_extend_accepts_batch_reject_policy(self):
+        with self.assertRaises(InvalidBatchRow):
+            self.founders.extend(
+                self._rows_with_failure_at(1), on_error=BATCH_REJECT
+            )
+
+        # Reject mode is all or nothing, just like extend_batch.
+        self.assertEqual(self.founders.height, 0)
+
+    def test_extend_with_prefix_policy_returns_batch_result(self):
+        result = self.founders.extend(
+            self._rows_with_failure_at(1), on_error=BATCH_PREFIX
+        )
+
+        self.assertIsInstance(result, BatchResult)
+        self.assertEqual(result.accepted, 1)
+        self.assertEqual(result.failed_index, 1)
+        self.assertEqual(self.founders.height, 1)
+
+    def test_result_reports_consumed_rows(self):
+        consumed_rows = self.founders.extend_batch(
+            self._rows_with_failure_at(1), on_error=BATCH_PREFIX
+        )
+        # The failing row was produced by the source and then rejected.
+        self.assertEqual(consumed_rows.consumed, 2)
+        self.assertEqual(self.founders.height, 1)
+
+        def failing_source():
+            yield self.john
+            raise RuntimeError('boom')
+
+        source_failure = self.founders.extend_batch(
+            failing_source(), on_error=BATCH_PREFIX
+        )
+        # The source failed while producing the second row, so it was never
+        # pulled into the batch.
+        self.assertEqual(source_failure.consumed, 1)
+        self.assertEqual(source_failure.accepted, 1)
+
+    def test_result_repr(self):
+        ok = BatchResult(2)
+        failed = BatchResult(1, InvalidBatchRow(1, tablib.InvalidDimensions()))
+
+        self.assertIn('2 row(s) accepted', repr(ok))
+        self.assertIn('failed at row 1', repr(failed))
+
+    def test_batch_errors_survive_pickling(self):
+        validation_error = InvalidBatchRow(2, tablib.InvalidDimensions('bad width'))
+        restored = pickle.loads(pickle.dumps(validation_error))
+
+        self.assertIsInstance(restored, InvalidBatchRow)
+        self.assertIsInstance(restored, tablib.InvalidDimensions)
+        self.assertEqual(restored.index, 2)
+        self.assertEqual(str(restored), str(validation_error))
+
+        source_error = BatchSourceError(0, RuntimeError('boom'))
+        restored_source = pickle.loads(pickle.dumps(source_error))
+        self.assertIsInstance(restored_source, BatchSourceError)
+        self.assertEqual(restored_source.index, 0)
+        self.assertIsInstance(restored_source.original, RuntimeError)
+
+    def test_batch_api_is_exported_at_top_level(self):
+        for name in (
+            'BATCH_PREFIX', 'BATCH_REJECT', 'BatchResult',
+            'BatchError', 'InvalidBatchRow', 'BatchSourceError',
+        ):
+            self.assertTrue(hasattr(tablib, name), name)
 
 
 class HTMLTests(BaseTestCase):

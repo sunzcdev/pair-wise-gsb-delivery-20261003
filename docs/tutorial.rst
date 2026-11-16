@@ -64,6 +64,55 @@ You can get a nice, Pythonic view of the dataset at any time with :class:`Datase
 
 
 
+-------------------
+Adding Rows in Bulk
+-------------------
+
+
+:meth:`Dataset.extend` appends rows one at a time. If one of them is invalid,
+the rows before it have already entered the :class:`Dataset`, and the caller
+has no easy way of knowing how far the ingestion got.
+
+For batch ingestion with well-defined failure semantics, use
+:meth:`Dataset.extend_batch`. It accepts any iterable -- including a one-shot
+generator -- and takes an ``on_error`` policy.
+
+With the default :data:`tablib.BATCH_REJECT` policy, the batch is atomic: a
+failure restores the :class:`Dataset` to its exact previous state (rows, tags
+and width) and raises an exception carrying the zero-based index of the
+offending row::
+
+    from tablib.exceptions import InvalidBatchRow
+
+    try:
+        data.extend_batch(rows_from_a_generator)
+    except InvalidBatchRow as error:
+        error.index      # position of the bad row within the batch
+        error.original   # underlying exception
+
+With :data:`tablib.BATCH_PREFIX`, the rows accepted before the first failure
+are kept and a :class:`tablib.BatchResult` reports the exact progress instead
+of raising::
+
+    result = data.extend_batch(rows, on_error=tablib.BATCH_PREFIX)
+    result.ok             # True if the whole batch was accepted
+    result.accepted       # number of rows actually added
+    result.consumed       # number of source rows pulled from the iterable
+    result.failed_index   # index of the first failing row, or None
+
+Two kinds of errors are kept apart. :class:`tablib.exceptions.InvalidBatchRow`
+means a row failed validation or row preparation (it also subclasses
+:class:`tablib.InvalidDimensions` for backwards compatibility), while
+:class:`tablib.exceptions.BatchSourceError` means the iterable itself raised
+while yielding a row. Both expose the source ``index`` and the ``original``
+exception. Dynamic-column callables run at most once per row.
+
+The same policies can be selected through :meth:`Dataset.extend` by passing
+``on_error``; calling it without that argument keeps the legacy behaviour
+(partial append, original exception, ``None`` return value).
+
+
+
 --------------
 Adding Headers
 --------------

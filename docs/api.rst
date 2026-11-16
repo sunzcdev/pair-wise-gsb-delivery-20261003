@@ -21,6 +21,19 @@ Dataset Object
    :inherited-members:
 
 
+----------------
+Batch Ingestion
+----------------
+
+
+.. autodata:: BATCH_REJECT
+
+.. autodata:: BATCH_PREFIX
+
+.. autoclass:: BatchResult
+   :members:
+
+
 ---------------
 Databook Object
 ---------------

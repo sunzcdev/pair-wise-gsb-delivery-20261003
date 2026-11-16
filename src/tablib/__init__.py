@@ -11,8 +11,14 @@ except ImportError:
 
 
 from .core import (  # noqa: F401
+    BATCH_PREFIX,
+    BATCH_REJECT,
+    BatchError,
+    BatchResult,
+    BatchSourceError,
     Databook,
     Dataset,
+    InvalidBatchRow,
     InvalidDatasetType,
     InvalidDimensions,
     UnsupportedFormat,
