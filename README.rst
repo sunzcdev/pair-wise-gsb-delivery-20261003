@@ -178,7 +178,43 @@ The following example (similar to a `unit test from the test suite <test/test_ca
               ]
 
      assert actual == expected
-        
+
+
+Nested and Multi-Threaded Capture
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+A ``capture_http()`` block is bound to the thread that entered it. Each request is
+recorded by the writer that was active *in its own thread* when the request was sent,
+so several capture tasks can run in one process without stealing each other's records:
+
+* Nesting blocks in one thread makes the inner block take over for that thread; when it
+  exits, the outer block is restored and captures again.
+* Other threads are unaffected by a context entered elsewhere: a thread with no
+  ``capture_http()`` of its own records nothing, and two threads with their own captures
+  write to their own writers.
+* A response belongs to the writer that was active when the request was made, even if the
+  response body is consumed after that block has exited (for example with ``stream=True``).
+* A block that exits because of an exception leaves nothing behind: no patch, no writer and
+  no context remains active for later requests.
+
+.. code:: python
+
+    outer = BufferWARCWriter()
+    inner = BufferWARCWriter()
+
+    with capture_http(outer) as outer_writer:
+        requests.get('http://example.com/outer')   # -> outer
+
+        with capture_http(inner) as inner_writer:
+            requests.get('http://example.com/inner')   # -> inner
+
+        requests.get('http://example.com/outer2')  # -> outer again
+
+When several threads share one writer, give each thread its own ``capture_http()``
+block: writes to a writer are serialized, so the resulting WARC stays valid.
+
+Requests made while no capture is active behave exactly as before — they are not
+recorded and no WARC is created.
 
 Customizing WARC Writing
 ~~~~~~~~~~~~~~~~~~~~~~~~

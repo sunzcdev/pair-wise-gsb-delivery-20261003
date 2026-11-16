@@ -3,6 +3,9 @@
 
 - Replace unmaintained brotlipy with brotlicffi>=1.2.1.0 by @ato https://github.com/webrecorder/warcio/pull/211
 - Add Content-Encoding: x-gzip as an alias for gzip by @sammist2 in https://github.com/webrecorder/warcio/pull/210
+- ``capture_http``: bind each capture to the thread that entered it instead of a single global recorder, so concurrent capture tasks no longer record into the most recently opened writer
+- ``capture_http``: nested blocks override the outer capture for the current thread and restore it on exit; other threads are unaffected
+- ``capture_http``: a request is recorded by the writer active when it was sent, even if the response body is read after the block exited; failed requests and exception exits leave no context or partial records behind
 
 1.8.1
 ~~~~~

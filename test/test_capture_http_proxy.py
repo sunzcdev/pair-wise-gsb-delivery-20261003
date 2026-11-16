@@ -2,6 +2,7 @@ from warcio.capture_http import capture_http
 
 import threading
 from wsgiref.simple_server import make_server, WSGIServer
+from socketserver import ThreadingMixIn
 import time
 
 import requests
@@ -24,7 +25,11 @@ class TestCaptureHttpProxy():
         from wsgiprox.wsgiprox import WSGIProxMiddleware
         wsgiprox = WSGIProxMiddleware(app, '/')
 
-        class NoLogServer(WSGIServer):
+        # threaded: the proxy keeps connections alive, and a single-threaded
+        # wsgiref server would deadlock on the second request over a tunnel
+        class NoLogServer(ThreadingMixIn, WSGIServer):
+            daemon_threads = True
+
             def handle_error(self, request, client_address):
                 pass
 
@@ -122,7 +127,8 @@ class TestCaptureHttpProxy():
                 res = sesh.get("https://example.com/test", proxies=self.proxies, verify=False)
                 res = sesh.get("https://example.com/foo", proxies=self.proxies, verify=False)
 
-            # *will* be captured, as part of same session... (fix this?)
+            # no capture active: not recorded, even though the pooled
+            # connection was created while capturing
             res = sesh.get("https://example.com/skip", proxies=self.proxies, verify=False)
 
             with capture_http(warc_writer):
@@ -151,15 +157,7 @@ class TestCaptureHttpProxy():
             assert request.rec_headers['WARC-Target-URI'] == "https://example.com/foo"
             assert request.rec_headers['WARC-Proxy-Host'] == 'https://proxy.com:{0}'.format(self.port)
 
-            response = next(ai)
-            assert response.rec_type == 'response'
-            assert response.rec_headers['WARC-Target-URI'] == "https://example.com/skip"
-            assert response.rec_headers['WARC-Proxy-Host'] == 'https://proxy.com:{0}'.format(self.port)
-            assert response.content_stream().read().decode('utf-8') == 'Proxied: /https://example.com/skip'
-
-            request = next(ai)
-            assert request.rec_type == 'request'
-
+            # 'skip' was not captured, 'bar' was, in the re-opened context
             response = next(ai)
             assert response.rec_type == 'response'
             assert response.rec_headers['WARC-Target-URI'] == "https://example.com/bar"
@@ -168,6 +166,7 @@ class TestCaptureHttpProxy():
 
             request = next(ai)
             assert request.rec_type == 'request'
+            assert request.rec_headers['WARC-Target-URI'] == "https://example.com/bar"
 
             with raises(StopIteration):
                 assert next(ai)
