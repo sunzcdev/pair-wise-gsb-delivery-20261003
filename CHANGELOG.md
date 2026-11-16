@@ -9,6 +9,7 @@ scheme (`YY.MINOR.MICRO`).
 
 _(unreleased)_
 
+- Added explicit data ownership modes to [`statsutils.Stats`][statsutils.Stats]: `frozen=True` creates an immutable snapshot, while the default mode gains a controlled editing interface (`add`, `extend`, `set_data`) that atomically invalidates all cached statistics and bumps the new `version` counter; failed edits preserve the old data and cache, and `copy.copy`/`copy.deepcopy` no longer share mutable cache state
 - Added `key` and `reverse` support to [`listutils.BarrelList.sort`][listutils.BarrelList.sort] ([#550](https://github.com/mahmoud/boltons/pull/550))
 - Added `start` and `stop` support to [`listutils.BarrelList.index`][listutils.BarrelList.index] ([#592](https://github.com/mahmoud/boltons/pull/592))
 - Added timezone suffix support (`Z`, `+HH:MM`, `-HHMM`, optional seconds) to [`timeutils.isoparse`][timeutils.isoparse], returning aware datetimes so aware `isoformat()` output round-trips ([#594](https://github.com/mahmoud/boltons/pull/594))

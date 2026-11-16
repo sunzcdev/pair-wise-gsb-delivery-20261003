@@ -123,10 +123,35 @@ system instrumentation package.
 .. _streaming: https://en.wikipedia.org/wiki/Streaming_algorithm
 .. _Lithoxyl: https://github.com/mahmoud/lithoxyl
 
+Data ownership and mutation
+---------------------------
+
+Because :class:`Stats` caches computed measures, the object offers two
+explicit data ownership modes, selected with the ``frozen`` argument:
+
+* ``frozen=True`` makes the ``Stats`` object a fixed snapshot. The
+  data is copied into an immutable container, cached measures stay
+  valid forever, and all editing methods raise.
+* ``frozen=False`` (the default) allows updates through the controlled
+  editing interface: :meth:`Stats.add`, :meth:`Stats.extend`,
+  :meth:`Stats.set_data`, and :meth:`Stats.trim_relative`. Each
+  successful edit atomically replaces the data and invalidates every
+  cached measure (quantiles, mean, variance, histograms, etc.), so all
+  measures always reflect the same version of the data. Edits that
+  fail (e.g., an iterable that raises midway) leave the old data and
+  cache untouched.
+
+``Stats`` does not, and cannot, automatically detect in-place
+modifications of an arbitrary external list. If you mutate
+:attr:`Stats.data` directly (or pass ``use_copy=False`` and modify the
+original list), call :meth:`Stats.clear_cache` to invalidate the
+cached measures manually.
+
 """
 
 
 import bisect
+import copy as _copy_module
 from math import floor, ceil
 from collections import Counter
 
@@ -169,14 +194,34 @@ class Stats:
             modifications. Pass ``False`` to disable this behavior.
         is_sorted (bool): Presorted data can skip an extra sorting
             step for a little speed boost. Defaults to False.
+        frozen (bool): Pass ``True`` to make the Stats object a fixed
+            snapshot: the data is copied into an immutable container
+            and the editing methods (:meth:`add`, :meth:`extend`,
+            :meth:`set_data`, :meth:`trim_relative`) raise
+            ``RuntimeError``. Defaults to False, allowing updates
+            through the editing methods, which invalidate cached
+            statistics automatically.
+
+    .. note::
+
+       ``Stats`` does not auto-detect in-place mutations of an
+       external list. When passing ``use_copy=False`` or modifying
+       :attr:`data` directly, call :meth:`clear_cache` afterward so
+       cached measures are recomputed. See the module docstring for
+       details on data ownership.
 
     """
-    def __init__(self, data, default=0.0, use_copy=True, is_sorted=False):
-        self._use_copy = use_copy
+    def __init__(self, data, default=0.0, use_copy=True, is_sorted=False,
+                 frozen=False):
+        self._frozen = bool(frozen)
+        self._use_copy = use_copy or self._frozen
         self._is_sorted = is_sorted
         self._sorted_data = None
-        if use_copy:
-            self.data = list(data)
+        if self._use_copy:
+            copied_data = list(data)
+            # frozen snapshots are stored immutably so neither the
+            # caller nor Stats itself can quietly invalidate the cache
+            self.data = tuple(copied_data) if self._frozen else copied_data
         else:
             self.data = data
 
@@ -186,6 +231,7 @@ class Stats:
                                  if isinstance(getattr(cls, a, None),
                                                _StatsProperty)]
         self._pearson_precision = 0
+        self._version = 0
 
     def __len__(self):
         return len(self.data)
@@ -212,6 +258,88 @@ class Stats:
             self._sorted_data = sorted(self.data)
         return self._sorted_data
 
+    @property
+    def frozen(self):
+        """``True`` if this ``Stats`` object is a fixed snapshot that
+        cannot be modified. Set at construction time with the
+        ``frozen`` argument.
+        """
+        return self._frozen
+
+    @property
+    def version(self):
+        """An integer identifying the current version of the
+        data. Starts at 0 and increments every time the dataset is
+        replaced through the editing interface or the cache is
+        cleared. All cached measures (quantiles, mean, variance,
+        histograms, etc.) are invalidated together, so they always
+        reflect the same version of the data.
+        """
+        return self._version
+
+    def _check_editable(self):
+        if self._frozen:
+            raise RuntimeError('cannot modify a frozen Stats object;'
+                               ' create a new Stats with the updated'
+                               ' data instead')
+
+    def add(self, value):
+        """Add a single datapoint to the dataset, invalidating all
+        cached statistics. Raises ``RuntimeError`` if the Stats object
+        is frozen.
+
+        >>> stats = Stats([1, 2, 3])
+        >>> stats.mean
+        2.0
+        >>> stats.add(4)
+        >>> stats.mean
+        2.5
+        """
+        self._check_editable()
+        new_data = list(self.data)
+        new_data.append(value)
+        self.data = new_data
+        self.clear_cache()
+
+    def extend(self, values):
+        """Add multiple datapoints to the dataset, invalidating all
+        cached statistics. Raises ``RuntimeError`` if the Stats object
+        is frozen.
+
+        The new values are fully materialized before the dataset is
+        touched, so if *values* raises partway through, the old data
+        and cache are preserved.
+
+        >>> stats = Stats([1, 2, 3])
+        >>> stats.extend([4, 5])
+        >>> stats.mean
+        3.0
+        """
+        self._check_editable()
+        new_data = list(self.data) + list(values)
+        self.data = new_data
+        self.clear_cache()
+
+    def set_data(self, data, is_sorted=False):
+        """Replace the entire dataset, invalidating all cached
+        statistics. Raises ``RuntimeError`` if the Stats object is
+        frozen.
+
+        Args:
+            data (list): List or other iterable containing the new
+                numeric values.
+            is_sorted (bool): Pass True if the new data is presorted
+                to skip an extra sorting step. Defaults to False.
+
+        The new data is copied before it is installed, so if *data*
+        cannot be iterated, the old data and cache are preserved.
+        """
+        self._check_editable()
+        new_data = list(data)
+        self.data = new_data
+        self.clear_cache()
+        self._is_sorted = bool(is_sorted)
+
     def clear_cache(self):
         """``Stats`` objects automatically cache intermediary calculations
         that can be reused. For instance, accessing the ``std_dev``
@@ -219,7 +347,10 @@ class Stats:
         significantly faster for medium-to-large datasets.
 
         If you modify the object by adding additional data points,
-        call this function to have the cached statistics recomputed.
+        call this function to have the cached statistics
+        recomputed. The editing methods (:meth:`add`, :meth:`extend`,
+        :meth:`set_data`, :meth:`trim_relative`) call it automatically;
+        it is only needed when :attr:`data` is mutated directly.
 
         """
         for attr_name in self._prop_attr_names:
@@ -229,7 +360,39 @@ class Stats:
             delattr(self, attr_name)
         self._sorted_data = None
         self._is_sorted = False
+        self._version += 1
         return
+
+    def __copy__(self):
+        # A copied Stats gets its own data container and must never
+        # share mutable cache state (e.g. _sorted_data) with the
+        # original. Immutable cached measures are carried over, and
+        # the default and precision settings are preserved.
+        cls = self.__class__
+        new = cls.__new__(cls)
+        new._frozen = self._frozen
+        new._use_copy = True
+        new._is_sorted = self._is_sorted
+        new._sorted_data = None
+        if self._frozen:
+            new.data = tuple(self.data)
+        else:
+            new.data = list(self.data)
+        new.default = self.default
+        new._prop_attr_names = list(self._prop_attr_names)
+        new._pearson_precision = self._pearson_precision
+        new._version = self._version
+        for attr_name in self._prop_attr_names:
+            prop = getattr(cls, attr_name)
+            if not hasattr(self, prop.internal_name):
+                continue
+            setattr(new, prop.internal_name, getattr(self, prop.internal_name))
+        return new
+
+    def __deepcopy__(self, memo):
+        new = self.__copy__()
+        new.data = _copy_module.deepcopy(new.data, memo)
+        return new
 
     def _calc_count(self):
         """The number of items in this Stats object. Returns the same as
@@ -541,9 +704,11 @@ class Stats:
         .. note:
 
             This operation modifies the data in-place. It does not
-            make or return a copy.
+            make or return a copy. It raises ``RuntimeError`` if the
+            Stats object is frozen.
 
         """
+        self._check_editable()
         trim = float(amount)
         if not 0.0 <= trim < 0.5:
             raise ValueError('expected amount between 0.0 and 0.5, not %r'
