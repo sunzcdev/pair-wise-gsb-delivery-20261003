@@ -180,6 +180,51 @@ JMESPath libraries, not just python), please let us know at
 `jmespath.site <https://github.com/jmespath/jmespath.site/issues>`__.
 
 
+Call Level Capability Policies
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+When expressions are supplied by more than one source, a service may need
+to limit the set of functions each source is allowed to invoke.  A
+``jmespath.CapabilityPolicy`` restricts the callable functions for a
+single ``search`` call through the ``capability_policy`` option.
+
+Policies are pure data.  They only hold the registered names of functions
+(for example ``"length"``, never the underlying ``_func_length`` method),
+never modify the global function table, and load or execute no code.  The
+built in data manipulation functions keep working normally as long as
+their registered name is permitted.
+
+An allow list permits only the named functions:
+
+.. code:: python
+
+    >>> import jmespath
+    >>> options = jmespath.Options(capability_policy=jmespath.CapabilityPolicy(
+    ...     allowed_functions=['length']))
+    >>> jmespath.search('length(foo)', {'foo': 'hello'}, options)
+    5
+    >>> jmespath.search('abs(`-1`)', {}, options)
+    Traceback (most recent call last):
+    ...
+    jmespath.exceptions.FunctionNotAllowedError: Function abs() is not ...
+
+A deny list permits everything except the named functions:
+
+.. code:: python
+
+    >>> options = jmespath.Options(capability_policy=jmespath.CapabilityPolicy(
+    ...     denied_functions=['abs']))
+
+The whole expression is checked before it is evaluated, so a call is
+rejected even when it sits behind a short circuited ``&&``/``||`` branch
+or inside an expression reference (``&...``).  The
+``FunctionNotAllowedError`` reports the column of the offending function
+name and points at it in the source expression.  Policies are matched on
+the function's actual registered name, so overriding a built in function
+in a custom ``Functions`` subclass cannot bypass a restriction on that
+name.
+
+
 Specification
 =============
 

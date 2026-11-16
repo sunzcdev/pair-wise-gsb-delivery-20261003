@@ -1,7 +1,15 @@
 Next Release (TBD)
 ==================
 
-* No changes yet.
+* Add call level capability policies (``jmespath.CapabilityPolicy``,
+  exposed via ``Options(capability_policy=...)``) that restrict the
+  functions an expression may invoke.  The entire expression is validated
+  against the policy before evaluation, including calls inside
+  short-circuited conditions and expression references, and rejected
+  calls raise ``FunctionNotAllowedError`` with the position of the
+  function name token.  Policies match on registered function names (so
+  custom overrides cannot bypass a restriction), are pure data, and never
+  modify the global function table.
 
 
 1.1.0

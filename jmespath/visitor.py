@@ -1,6 +1,8 @@
 import operator
 
 from jmespath import functions
+from jmespath import lexer
+from jmespath import exceptions
 from jmespath.compat import string_type
 from numbers import Number
 
@@ -58,7 +60,8 @@ def _is_actual_number(x):
 
 class Options(object):
     """Options to control how a JMESPath function is evaluated."""
-    def __init__(self, dict_cls=None, custom_functions=None):
+    def __init__(self, dict_cls=None, custom_functions=None,
+                 capability_policy=None):
         #: The class to use when creating a dict.  The interpreter
         #  may create dictionaries during the evaluation of a JMESPath
         #  expression.  For example, a multi-select hash will
@@ -69,6 +72,12 @@ class Options(object):
         #  have predictable key ordering.
         self.dict_cls = dict_cls
         self.custom_functions = custom_functions
+        #: An optional call level :class:`~jmespath.capabilities.
+        #  CapabilityPolicy` that limits which functions the expression
+        #  is allowed to invoke.  The whole expression is checked against
+        #  the policy before anything is evaluated.  When ``None`` no
+        #  restrictions are applied.
+        self.capability_policy = capability_policy
 
 
 class _Expression(object):
@@ -109,7 +118,7 @@ class TreeInterpreter(Visitor):
     _EQUALITY_OPS = ['eq', 'ne']
     MAP_TYPE = dict
 
-    def __init__(self, options=None):
+    def __init__(self, options=None, expression=None, parsed=None):
         super(TreeInterpreter, self).__init__()
         self._dict_cls = self.MAP_TYPE
         if options is None:
@@ -121,9 +130,71 @@ class TreeInterpreter(Visitor):
             self._functions = self._options.custom_functions
         else:
             self._functions = functions.Functions()
+        self._expression = expression
+        self._capability_policy = options.capability_policy
+        self._function_positions = None
+        self._function_nodes = []
+        if self._capability_policy is not None and parsed is not None:
+            # Enforce the policy over the entire expression up front so
+            # that calls hidden behind short circuited conditions or inside
+            # expression references are still rejected.
+            self._enforce_capability_policy(parsed)
 
     def default_visit(self, node, *args, **kwargs):
         raise NotImplementedError(node['type'])
+
+    def _enforce_capability_policy(self, root_node):
+        # Walk the entire AST before evaluating anything.  Checking against
+        # the AST rather than at call time means functions nested inside
+        # expression references and branches that a short circuit would
+        # never reach cannot slip past the policy.
+        self._function_nodes = list(self._iter_function_nodes(root_node))
+        for node in self._function_nodes:
+            function_name = node['value']
+            if not self._capability_policy.is_allowed(function_name):
+                self._raise_not_allowed(function_name, node)
+
+    def _iter_function_nodes(self, node):
+        if node.get('type') == 'function_expression':
+            yield node
+        for child in node.get('children', []):
+            for nested in self._iter_function_nodes(child):
+                yield nested
+
+    def _raise_not_allowed(self, function_name, node):
+        position = self._position_of_function(node)
+        if position is None:
+            # No source text available (for example a hand built AST);
+            # the policy's check raises the position-less variant.
+            self._capability_policy.check(function_name)
+        raise exceptions.FunctionNotAllowedError(
+            function_name, position=position, expression=self._expression)
+
+    def _position_of_function(self, node):
+        # The AST dictionaries intentionally carry no position metadata.
+        # Recover the column by pairing function_expression nodes (found in
+        # document order during the tree walk) with the function name
+        # tokens emitted by the lexer (also in document order).
+        if self._function_positions is None:
+            self._function_positions = self._lex_function_positions()
+        try:
+            index = self._function_nodes.index(node)
+        except ValueError:
+            return None
+        if index < len(self._function_positions):
+            return self._function_positions[index]
+        return None
+
+    def _lex_function_positions(self):
+        if not self._expression:
+            return []
+        positions = []
+        tokens = list(lexer.Lexer().tokenize(self._expression))
+        for i, token in enumerate(tokens[:-1]):
+            if (token['type'] == 'unquoted_identifier' and
+                    tokens[i + 1]['type'] == 'lparen'):
+                positions.append(token['start'])
+        return positions
 
     def visit_subexpression(self, node, value):
         result = value

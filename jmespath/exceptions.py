@@ -120,3 +120,33 @@ class EmptyExpressionError(JMESPathError):
 
 class UnknownFunctionError(JMESPathError):
     pass
+
+
+@with_str_method
+class FunctionNotAllowedError(JMESPathError):
+    """Raised when a function call is rejected by the capability policy.
+
+    The policy is enforced over the whole expression before any part of it
+    is evaluated, so a function that is never reached at runtime (for
+    example a call sitting behind a short-circuited ``&&``/``||`` branch or
+    inside an expression reference) is still reported here.
+    """
+
+    def __init__(self, function_name, position=None, expression=None):
+        self.function_name = function_name
+        #: Column of the function name token in the source expression.
+        self.position = position
+        #: The full expression, filled in by the caller when available so
+        #: the error can render a pointer at the offending call.
+        self.expression = expression
+        message = "Function %s() is not allowed" % function_name
+        super(FunctionNotAllowedError, self).__init__(message)
+
+    def __str__(self):
+        base = "Function %s() is not allowed" % self.function_name
+        if self.position is None or self.expression is None:
+            return base
+        underline = ' ' * self.position + '^'
+        return (
+            '%s by the active capability policy, for expression:\n'
+            '"%s"\n%s' % (base, self.expression, underline))
