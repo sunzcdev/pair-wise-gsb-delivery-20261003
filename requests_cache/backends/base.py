@@ -13,13 +13,14 @@ from datetime import datetime
 from logging import getLogger
 from pickle import PickleError
 from typing import TYPE_CHECKING, Iterable, Iterator, List, MutableMapping, Optional, TypeVar, Union
+from urllib.parse import urlsplit, urlunsplit
 from warnings import warn
 
 from pathlib import Path
 
 from requests import Request, Response
 
-from ..cache_keys import create_key, redact_response
+from ..cache_keys import create_key, normalize_url, redact_response
 from ..models import AnyRequest, CachedResponse
 from ..policy import DEFAULT_CACHE_NAME, CacheSettings, ExpirationTime
 from ..serializers import SerializerType, init_serializer
@@ -178,12 +179,15 @@ class BaseCache:
             invalid: Remove all invalid responses (that can't be deserialized with current settings)
             older_than: Remove responses older than this value, relative to ``response.created_at``
             requests: Remove matching responses, according to current request matching settings
-            urls: Remove matching GET requests for the specified URL(s)
+            urls: Remove all cached responses matching the specified URL(s), including ``Vary``
+                variants and responses for other methods
             verify: Set to ``False`` to remove responses without SSL verification
         """
         delete_keys: List[str] = list(keys) if keys else []
         if urls:
+            urls = list(urls)
             requests = list(requests or []) + [Request('GET', url).prepare() for url in urls]
+            delete_keys += self._get_keys_for_urls(urls)
         if requests:
             delete_keys += [self.create_key(request, verify=verify) for request in requests]
 
@@ -202,6 +206,60 @@ class BaseCache:
         else:
             self.responses.bulk_delete(delete_keys)
         self._prune_redirects()
+
+    def invalidate(self, *urls: str):
+        """Invalidate all cached responses associated with one or more URLs.
+
+        This removes every matching response, including all ``Vary`` variants and responses for
+        methods other than ``GET``. Any redirect aliases pointing to removed responses are also
+        pruned.
+        """
+        keys = self._get_keys_for_urls(urls)
+        if keys:
+            logger.debug(f'Invalidating {len(keys)} cached responses for URLs: {urls}')
+            self.delete(*keys)
+
+    def _get_keys_for_urls(self, urls: Iterable[str]) -> List[str]:
+        """Get cache keys for all stored responses matching one or more URLs"""
+        targets = {self._normalize_invalidation_url(url) for url in urls}
+        targets.discard('')
+        if not targets:
+            return []
+
+        matching_keys = []
+        for key in list(self.responses.keys()):
+            try:
+                response = self.responses[key]
+            except (AttributeError, KeyError):
+                continue
+            if response is None:
+                continue
+            response_urls = self._get_response_urls(response)
+            if targets.intersection(response_urls):
+                matching_keys.append(key)
+        return matching_keys
+
+    def _get_response_urls(self, response: CachedResponse) -> set:
+        """Get all URLs associated with a cached response, including redirect history"""
+        urls = set()
+        for item in [response, *(response.history or [])]:
+            for url in (getattr(item, 'url', None), getattr(item.request, 'url', None)):
+                normalized_url = self._normalize_invalidation_url(url)
+                if normalized_url:
+                    urls.add(normalized_url)
+        return urls
+
+    def _normalize_invalidation_url(self, url: Optional[str]) -> str:
+        """Normalize a URL for matching against cached requests and responses"""
+        if not url:
+            return ''
+        try:
+            parts = urlsplit(url)
+            parts = parts._replace(fragment='')
+            return normalize_url(urlunsplit(parts), self._settings.ignored_parameters)
+        except (TypeError, ValueError):
+            logger.debug(f'Unable to normalize URL for invalidation: {url!r}')
+            return ''
 
     def _prune_redirects(self):
         """Remove any redirects that no longer point to an existing response"""

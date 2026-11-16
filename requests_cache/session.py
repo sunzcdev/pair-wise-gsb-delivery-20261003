@@ -3,7 +3,8 @@
 from contextlib import contextmanager, nullcontext
 from logging import getLogger
 from threading import RLock, Thread
-from typing import TYPE_CHECKING, Iterable, Mapping, Optional, Union
+from typing import TYPE_CHECKING, Iterable, List, Mapping, Optional, Union
+from urllib.parse import urljoin, urlsplit, urlunsplit, uses_relative
 
 from requests import PreparedRequest
 from requests import Session as OriginalSession
@@ -35,6 +36,9 @@ else:
 
 logger = getLogger(__name__)
 
+SAFE_METHODS = ('GET', 'HEAD', 'OPTIONS', 'TRACE')
+DEFAULT_PORTS = {'http': 80, 'https': 443, 'ws': 80, 'wss': 443}
+
 
 class CacheMixin(MIXIN_BASE):
     """Mixin class that extends :py:class:`requests.Session` with caching features.
@@ -60,6 +64,7 @@ class CacheMixin(MIXIN_BASE):
         read_only: bool = False,
         stale_if_error: Union[bool, int] = False,
         autoclose: bool = True,
+        cache_invalidation: bool = True,
         **kwargs,
     ):
         self.cache = init_backend(cache_name, backend, serializer=serializer, **kwargs)
@@ -71,6 +76,7 @@ class CacheMixin(MIXIN_BASE):
             allowable_codes=allowable_codes,
             allowable_methods=allowable_methods,
             always_revalidate=always_revalidate,
+            cache_invalidation=cache_invalidation,
             ignored_parameters=ignored_parameters,
             match_headers=match_headers,
             filter_fn=filter_fn,
@@ -280,6 +286,7 @@ class CacheMixin(MIXIN_BASE):
         request = actions.update_request(request)
         response = super().send(request, **kwargs)
         actions.update_from_response(response)
+        self._invalidate_after_response(request, response)
 
         if not actions.skip_write:
             self.cache.save_response(response, actions.cache_key, actions.expires)
@@ -300,6 +307,24 @@ class CacheMixin(MIXIN_BASE):
             return response
         else:
             return OriginalResponse.wrap_response(response, actions)
+
+    def _invalidate_after_response(self, request: PreparedRequest, response):
+        """Apply HTTP cache invalidation after a successful unsafe request.
+
+        The effective request URI, along with same-origin ``Location`` and ``Content-Location``
+        resources, is invalidated. All stored variants of each resource are removed.
+        """
+        settings = self.settings
+        if settings.disabled or settings.read_only or not settings.cache_invalidation:
+            return
+        if (request.method or '').upper() in SAFE_METHODS:
+            return
+        if response.status_code >= 400:
+            return
+
+        urls = _get_invalidation_urls(request, response)
+        if urls:
+            self.cache.invalidate(*urls)
 
     def _resend(
         self,
@@ -412,11 +437,76 @@ class CachedSession(CacheMixin, OriginalSession):
         stale_while_revalidate: Return a stale response initially, while a non-blocking request is
             sent to refresh the response for the next time it's requested
         autoclose: Close the cache backend when the session is closed
+        cache_invalidation: Invalidate cached responses after a successful unsafe request, including
+            same-origin ``Location`` and ``Content-Location`` resources
         filter_fn: Response filtering function that indicates whether or not a given response should
             be cached. See :ref:`custom-filtering` for details.
         key_fn: Request matching function for generating custom cache keys. See
             :ref:`custom-matching` for details.
     """
+
+
+def _get_invalidation_urls(request: PreparedRequest, response) -> List[str]:
+    """Get URLs to invalidate based on the request URI and linked response resources"""
+    request_url = request.url or ''
+    if not request_url:
+        return []
+
+    urls = [request_url]
+    request_origin = _get_origin(request_url)
+    for item in [*(response.history or []), response]:
+        base_url = item.url or request_url
+        for header in ('Location', 'Content-Location'):
+            value = item.headers.get(header)
+            if not value:
+                continue
+            linked_url = _resolve_url(base_url, value.strip())
+            if request_origin and _get_origin(linked_url) == request_origin:
+                urls.append(linked_url)
+    return urls
+
+
+def _resolve_url(base_url: str, url: str) -> str:
+    """Resolve a possibly-relative URL against a response URL.
+
+    ``urljoin`` only resolves relative references for registered URI schemes, so use a temporary
+    standard scheme for custom schemes such as ``http+mock://``.
+    """
+    if urlsplit(url).scheme:
+        return url
+
+    base_parts = urlsplit(base_url)
+    if not base_parts.scheme or base_parts.scheme in uses_relative:
+        return urljoin(base_url, url)
+
+    alias = urlunsplit(
+        ('http', base_parts.netloc, base_parts.path, base_parts.query, base_parts.fragment)
+    )
+    resolved = urlsplit(urljoin(alias, url))
+    return urlunsplit(
+        (
+            base_parts.scheme,
+            resolved.netloc,
+            resolved.path,
+            resolved.query,
+            resolved.fragment,
+        )
+    )
+
+
+def _get_origin(url: str):
+    """Get a normalized (scheme, host, port) tuple for same-origin checks"""
+    if not url:
+        return None
+    parts = urlsplit(url)
+    scheme = parts.scheme.lower()
+    try:
+        port = parts.port
+    except ValueError:
+        return None
+    if port is None:
+        port = DEFAULT_PORTS.get(scheme)
+    return scheme, (parts.hostname or '').lower(), port
 
 
 def get_504_response(request: PreparedRequest) -> CachedResponse:
