@@ -180,6 +180,53 @@ JMESPath libraries, not just python), please let us know at
 `jmespath.site <https://github.com/jmespath/jmespath.site/issues>`__.
 
 
+Equi-joins between collections
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+``join_by`` relates two arrays in a single expression.  Each side is
+given an expression reference that evaluates to that record's key::
+
+    join_by(left_array, &left_key_expr,
+            right_array, &right_key_expr
+            [, mode])
+
+The result is a list of ``{"left": ..., "right": ...}`` objects.  The
+default mode is ``'inner'`` and only emits matched records.  The mode
+``'left'`` is a left outer join: a left record with no match is emitted
+once with ``"right": null``.
+
+Given::
+
+    {"orders": [{"id": 1, "sku": "a"}, {"id": 2, "sku": "b"},
+                {"id": 3, "sku": "z"}],
+     "items":  [{"code": "a", "name": "Apple"},
+                {"code": "a", "name": "Avocado"},
+                {"code": "b", "name": "Banana"}]}
+
+``join_by(orders, &sku, items, &code)`` returns::
+
+    [{"left": {"id": 1, "sku": "a"}, "right": {"code": "a", "name": "Apple"}},
+     {"left": {"id": 1, "sku": "a"}, "right": {"code": "a", "name": "Avocado"}},
+     {"left": {"id": 2, "sku": "b"}, "right": {"code": "b", "name": "Banana"}}]
+
+and ``join_by(orders, &sku, items, &code, 'left')`` additionally keeps
+``{"left": {"id": 3, "sku": "z"}, "right": null}``.
+
+Matching rules:
+
+* Only the right array is indexed, so time and memory scale with the
+  right array while the left array is streamed in its original order.
+* Keys use JSON type equality: ``true`` is not ``1``, ``"1"`` is not
+  ``1``, ``1`` and ``1.0`` are the same number, objects match
+  regardless of key order, and array order is significant.  Python's
+  ``bool``/``int`` equality is never used to pair records.
+* A key that evaluates to ``null`` (including a missing field) never
+  matches anything, on either side.  Such right records are not added
+  to the index and such left records only survive in ``'left'`` mode.
+* Duplicate keys expand as a cartesian product in left order, then
+  right order.
+
+
 Specification
 =============
 

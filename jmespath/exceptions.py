@@ -97,6 +97,22 @@ class VariadictArityError(ArityError):
 
 
 @with_str_method
+class OptionalArityError(ArityError):
+    def __init__(self, expected, optional, actual, name):
+        super(OptionalArityError, self).__init__(expected, actual, name)
+        self.optional_arity = optional
+
+    def __str__(self):
+        return ("Expected %s or %s %s for function %s(), "
+                "received %s" % (
+                    self.expected_arity,
+                    self.optional_arity,
+                    self._pluralize('argument', self.expected_arity),
+                    self.function_name,
+                    self.actual_arity))
+
+
+@with_str_method
 class JMESPathTypeError(JMESPathError):
     def __init__(self, function_name, current_value, actual_type,
                  expected_types):
@@ -110,6 +126,19 @@ class JMESPathTypeError(JMESPathError):
                 'expected one of: %s, received: "%s"' % (
                     self.function_name, self.current_value,
                     self.expected_types, self.actual_type))
+
+
+@with_str_method
+class JMESPathValueError(JMESPathError):
+    """An argument had a supported type but an unsupported value."""
+    def __init__(self, function_name, current_value, expected):
+        self.function_name = function_name
+        self.current_value = current_value
+        self.expected = expected
+
+    def __str__(self):
+        return ('In function %s(), invalid value: %r, expected %s' % (
+            self.function_name, self.current_value, self.expected))
 
 
 class EmptyExpressionError(JMESPathError):

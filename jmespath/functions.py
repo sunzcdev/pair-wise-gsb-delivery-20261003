@@ -1,5 +1,6 @@
 import math
 import json
+import numbers
 
 from jmespath import exceptions
 from jmespath.compat import string_type as STRING_TYPE
@@ -33,6 +34,64 @@ REVERSE_TYPES_MAP = {
     'number': ('float', 'int', 'long'),
     'expref': ('_Expression',),
 }
+
+
+#: Modes accepted by ``join_by()``.  ``inner`` keeps only matches,
+#: ``left`` is a left outer join that keeps unmatched left records with a
+#: null right side.
+JOIN_MODES = ('inner', 'left')
+
+
+def _canonical_number(value):
+    # JSON only has one number type, so 1 and 1.0 are the same key.
+    # ``bool`` is checked before ``int`` by ``_json_key`` because
+    # ``bool`` subclasses ``int`` in python.
+    if isinstance(value, float) and not math.isfinite(value):
+        # JSON numbers are finite, so NaN and infinity have no well
+        # defined JSON equality and cannot be used as a key.
+        raise TypeError('number is not finite')
+    try:
+        as_int = int(value)
+    except (TypeError, ValueError, OverflowError):
+        raise TypeError('number is not a real JSON number')
+    if value == as_int:
+        # ``int()`` is exact for the integer valued numbers we accept
+        # (including arbitrary precision int), so this does not lose
+        # information.  The equality check keeps 1.5 as a float key.
+        return as_int
+    return value
+
+
+def _json_key(value):
+    """Return a hashable key implementing JSON type equality.
+
+    Every JSON value maps to a unique representation, so ``true`` never
+    equals ``1``, ``"1"`` never equals ``1``, and two objects are equal
+    regardless of their key order.  Values outside of the JSON domain
+    (for example a ``datetime`` returned by a custom function) raise a
+    ``TypeError`` because there is no JSON equality to apply to them.
+    """
+    if value is None:
+        return ('null',)
+    if isinstance(value, bool):
+        return ('boolean', value)
+    if isinstance(value, numbers.Number):
+        return ('number', _canonical_number(value))
+    if isinstance(value, STRING_TYPE):
+        return ('string', value)
+    if isinstance(value, list):
+        return ('array', tuple(_json_key(element) for element in value))
+    if isinstance(value, dict):
+        pairs = []
+        for key, element in value.items():
+            if not isinstance(key, STRING_TYPE):
+                raise TypeError('object key is not a string')
+            pairs.append((key, _json_key(element)))
+        # Objects are equal by their members, so the key order of an
+        # object must not affect key equality.
+        return ('object', frozenset(pairs))
+    raise TypeError('value of type %s is not a JSON value' % (
+        type(value).__name__,))
 
 
 def signature(*arguments):
@@ -85,13 +144,33 @@ class Functions(metaclass=FunctionRegistry):
             if len(args) < len(signature):
                 raise exceptions.VariadictArityError(
                     len(signature), len(args), function_name)
-        elif len(args) != len(signature):
-            raise exceptions.ArityError(
-                len(signature), len(args), function_name)
+        else:
+            # Signature entries are required by default.  A trailing
+            # entry may be marked ``optional`` to let a function take a
+            # shorter argument list (join_by() uses this for its mode).
+            required = self._required_arity(signature)
+            if len(args) < required:
+                if required == len(signature):
+                    raise exceptions.ArityError(
+                        required, len(args), function_name)
+                raise exceptions.OptionalArityError(
+                    required, len(signature), len(args), function_name)
+            if len(args) > len(signature):
+                raise exceptions.ArityError(
+                    len(signature), len(args), function_name)
         return self._type_check(args, signature, function_name)
 
+    def _required_arity(self, signature):
+        required = 0
+        for argument in signature:
+            if argument.get('optional'):
+                break
+            required += 1
+        return required
+
     def _type_check(self, actual, signature, function_name):
-        for i in range(len(signature)):
+        # Optional trailing arguments may be absent from ``actual``.
+        for i in range(min(len(signature), len(actual))):
             allowed_types = signature[i]['types']
             if allowed_types:
                 self._type_check_single(actual[i], allowed_types,
@@ -345,6 +424,51 @@ class Functions(metaclass=FunctionRegistry):
             return max(array, key=keyfunc)
         else:
             return None
+
+    @signature({'types': ['array']}, {'types': ['expref']},
+               {'types': ['array']}, {'types': ['expref']},
+               {'types': ['string'], 'optional': True})
+    def _func_join_by(self, left, left_expref, right, right_expref,
+                      mode='inner'):
+        return self._join_by(left, left_expref, right, right_expref, mode)
+
+    def _join_by(self, left, left_expref, right, right_expref, mode):
+        if mode not in JOIN_MODES:
+            raise exceptions.JMESPathValueError(
+                'join_by', mode, 'one of: %s' % ', '.join(
+                    repr(m) for m in JOIN_MODES))
+        # Only the right hand side is indexed.  A right record whose key
+        # expression is null (which includes a missing field) is left out
+        # of the index, and a left record with a null key never looks up,
+        # so null and missing keys never join records together.
+        index = {}
+        for element in right:
+            key = self._join_key(right_expref, element)
+            if key is not None:
+                # Keeping every right record in encounter order means a
+                # duplicated key expands in right order within a left
+                # record, and left records are walked in left order.
+                index.setdefault(key, []).append(element)
+        result = []
+        for element in left:
+            key = self._join_key(left_expref, element)
+            matches = () if key is None else index.get(key, ())
+            if matches:
+                for match in matches:
+                    result.append({'left': element, 'right': match})
+            elif mode == 'left':
+                result.append({'left': element, 'right': None})
+        return result
+
+    def _join_key(self, expref, element):
+        key = expref.visit(expref.expression, element)
+        if key is None:
+            return None
+        try:
+            return _json_key(key)
+        except TypeError as e:
+            raise exceptions.JMESPathValueError(
+                'join_by', key, 'a JSON value (%s)' % e)
 
     def _create_key_func(self, expref, allowed_types, function_name):
         def keyfunc(x):

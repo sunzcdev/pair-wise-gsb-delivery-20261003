@@ -1,7 +1,13 @@
 Next Release (TBD)
 ==================
 
-* No changes yet.
+* Add a ``join_by()`` function that equi-joins two arrays inside a
+  single expression using per-side key expression references.  It
+  supports inner and left outer joins, uses JSON type equality for
+  keys (so ``true`` never matches ``1``), never matches null or missing
+  keys, and only indexes the right hand array.
+* Function signatures may now mark a trailing argument as
+  ``optional`` so a function can be called with fewer arguments.
 
 
 1.1.0
