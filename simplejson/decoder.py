@@ -19,6 +19,18 @@ c_scanstring = _import_c_scanstring()
 # compatibility, but it was never in the __all__
 __all__ = ['JSONDecoder']
 
+#: ``object_hook_mode`` that keeps the historical behavior: when both
+#: hooks are supplied, ``object_pairs_hook`` wins and ``object_hook``
+#: is not called.
+HOOK_MODE_PRIORITY = 'priority'
+#: ``object_hook_mode`` that passes the return value of
+#: ``object_pairs_hook`` to ``object_hook``.
+HOOK_MODE_CHAIN = 'chain'
+#: ``object_hook_mode`` that rejects having both hooks set.
+HOOK_MODE_EXCLUSIVE = 'exclusive'
+
+_HOOK_MODES = (HOOK_MODE_PRIORITY, HOOK_MODE_CHAIN, HOOK_MODE_EXCLUSIVE)
+
 FLAGS = re.VERBOSE | re.MULTILINE | re.DOTALL
 
 def _floatconstants():
@@ -145,8 +157,33 @@ scanstring = c_scanstring or py_scanstring
 WHITESPACE = re.compile(r'[ \t\n\r]*', FLAGS)
 WHITESPACE_STR = ' \t\n\r'
 
+def _apply_object_hooks(pairs, object_hook, object_pairs_hook,
+                        object_hook_mode=None):
+    """Turn a list of decoded key/value pairs into the decoded object.
+
+    This is the single place where the two object hooks meet, so the
+    empty-object and non-empty-object code paths cannot drift apart.
+    Hooks fire from the inside out: the elements of *pairs* already have
+    the hooks of any nested containers applied, and whatever a hook
+    returns is used as the value as-is -- it is never re-encoded and
+    re-decoded, even when it is not a mapping.
+
+    ``object_hook_mode`` is validated by :class:`JSONDecoder`; ``None``
+    means the historical ``'priority'`` behavior.
+    """
+    if object_pairs_hook is not None:
+        result = object_pairs_hook(pairs)
+        if object_hook_mode == HOOK_MODE_CHAIN and object_hook is not None:
+            result = object_hook(result)
+        return result
+    result = dict(pairs)
+    if object_hook is not None:
+        result = object_hook(result)
+    return result
+
+
 def JSONObject(state, encoding, strict, scan_once, object_hook,
-        object_pairs_hook, memo=None,
+        object_pairs_hook, memo=None, object_hook_mode=None,
         _w=WHITESPACE.match, _ws=WHITESPACE_STR):
     (s, end) = state
     # Backwards compatibility
@@ -164,13 +201,9 @@ def JSONObject(state, encoding, strict, scan_once, object_hook,
             nextchar = s[end:end + 1]
         # Trivial empty object
         if nextchar == '}':
-            if object_pairs_hook is not None:
-                result = object_pairs_hook(pairs)
-                return result, end + 1
-            pairs = {}
-            if object_hook is not None:
-                pairs = object_hook(pairs)
-            return pairs, end + 1
+            return _apply_object_hooks(
+                pairs, object_hook, object_pairs_hook,
+                object_hook_mode), end + 1
         elif nextchar != '"':
             raise JSONDecodeError(
                 "Expecting property name enclosed in double quotes or '}'",
@@ -236,13 +269,8 @@ def JSONObject(state, encoding, strict, scan_once, object_hook,
                 "Expecting property name enclosed in double quotes",
                 s, end - 1)
 
-    if object_pairs_hook is not None:
-        result = object_pairs_hook(pairs)
-        return result, end
-    pairs = dict(pairs)
-    if object_hook is not None:
-        pairs = object_hook(pairs)
-    return pairs, end
+    return _apply_object_hooks(
+        pairs, object_hook, object_pairs_hook, object_hook_mode), end
 
 def JSONArray(state, scan_once, array_hook=None,
               _w=WHITESPACE.match, _ws=WHITESPACE_STR):
@@ -325,7 +353,7 @@ class JSONDecoder(object):
     def __init__(self, encoding=None, object_hook=None, parse_float=None,
             parse_int=None, parse_constant=None, strict=True,
             object_pairs_hook=None, allow_nan=False,
-            array_hook=None):
+            array_hook=None, object_hook_mode=None):
         """
         *encoding* determines the encoding used to interpret any
         :class:`str` objects decoded by this instance (``'utf-8'`` by
@@ -347,6 +375,22 @@ class JSONDecoder(object):
         example, :func:`collections.OrderedDict` will remember the order of
         insertion). If *object_hook* is also defined, the *object_pairs_hook*
         takes priority.
+
+        *object_hook_mode* makes the interaction between *object_hook* and
+        *object_pairs_hook* explicit when both are supplied. It must be one
+        of ``'priority'``, ``'chain'``, or ``'exclusive'``:
+
+        * ``'priority'`` (the default) keeps the historical behavior:
+          *object_pairs_hook* is called and *object_hook* is ignored.
+        * ``'chain'`` calls *object_pairs_hook* with the list of pairs and
+          then calls *object_hook* with whatever *object_pairs_hook*
+          returned. The intermediate value need not be a mapping; it is
+          handed over untouched, never re-encoded and re-decoded.
+        * ``'exclusive'`` raises :exc:`ValueError` at construction time if
+          both hooks are supplied, making the mutual exclusion explicit.
+
+        Either way hooks fire from the innermost object outwards, and a
+        hook's return value becomes the decoded value as-is.
 
         *parse_float*, if specified, will be called with the string of every
         JSON float to be decoded.  By default, this is equivalent to
@@ -374,9 +418,22 @@ class JSONDecoder(object):
         """
         if encoding is None:
             encoding = DEFAULT_ENCODING
+        if object_hook_mode is None:
+            object_hook_mode = HOOK_MODE_PRIORITY
+        elif object_hook_mode not in _HOOK_MODES:
+            raise ValueError(
+                "object_hook_mode must be one of %r, got %r"
+                % (_HOOK_MODES, object_hook_mode))
+        if (object_hook_mode == HOOK_MODE_EXCLUSIVE
+                and object_hook is not None
+                and object_pairs_hook is not None):
+            raise ValueError(
+                "object_hook and object_pairs_hook are mutually exclusive "
+                "when object_hook_mode='exclusive'")
         self.encoding = encoding
         self.object_hook = object_hook
         self.object_pairs_hook = object_pairs_hook
+        self.object_hook_mode = object_hook_mode
         self.parse_float = float if parse_float is None else parse_float
         self.parse_int = bounded_int if parse_int is None else parse_int
         if parse_constant is None:

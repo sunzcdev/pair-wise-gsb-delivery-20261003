@@ -215,6 +215,89 @@ class TestDecode(TestCase):
         self.assertEqual(result, [1, 2])
         self.assertIsInstance(result, list)
 
+    def test_object_hook_mode_default_is_priority(self):
+        calls = []
+
+        def pairs_hook(pairs):
+            calls.append(('pairs', list(pairs)))
+            return OrderedDict(pairs)
+
+        def object_hook(d):
+            calls.append(('object', d))
+            return 'never'
+
+        for kwargs in ({}, {'object_hook_mode': 'priority'}):
+            del calls[:]
+            result = json.loads(
+                '{"a": 1}', object_hook=object_hook,
+                object_pairs_hook=pairs_hook, **kwargs)
+            self.assertEqual(calls, [('pairs', [('a', 1)])])
+            self.assertEqual(result, OrderedDict([('a', 1)]))
+
+    def test_object_hook_mode_chain(self):
+        calls = []
+
+        def pairs_hook(pairs):
+            calls.append(('pairs', list(pairs)))
+            return [('wrapped', list(pairs))]
+
+        def object_hook(obj):
+            calls.append(('object', obj))
+            return ('object_hook', obj)
+
+        result = json.loads('{"a": 1}', object_hook=object_hook,
+                            object_pairs_hook=pairs_hook,
+                            object_hook_mode='chain')
+        # pairs result, which is not a mapping, is handed over untouched
+        self.assertEqual(calls, [('pairs', [('a', 1)]),
+                                 ('object', [('wrapped', [('a', 1)])])])
+        self.assertEqual(result,
+                         ('object_hook', [('wrapped', [('a', 1)])]))
+
+    def test_object_hook_mode_chain_empty_object(self):
+        calls = []
+        result = json.loads(
+            '{}',
+            object_pairs_hook=lambda pairs: calls.append(list(pairs)) or 'p',
+            object_hook=lambda obj: calls.append(obj) or 'o',
+            object_hook_mode='chain')
+        # both hooks fire for the trivial empty object, in order
+        self.assertEqual(calls, [[], 'p'])
+        self.assertEqual(result, 'o')
+
+    def test_object_hook_mode_chain_loads_via_load(self):
+        calls = []
+        result = json.load(
+            StringIO('{"a": 1}'),
+            object_pairs_hook=lambda pairs: calls.append('pairs') or pairs,
+            object_hook=lambda obj: calls.append('object') or obj,
+            object_hook_mode='chain')
+        self.assertEqual(calls, ['pairs', 'object'])
+        self.assertEqual(result, [('a', 1)])
+
+    def test_object_hook_mode_exclusive(self):
+        def unused(value):
+            raise AssertionError('hook should not run')
+
+        self.assertRaises(
+            ValueError, json.loads, '{"a": 1}', object_hook=unused,
+            object_pairs_hook=unused, object_hook_mode='exclusive')
+        # a single hook in exclusive mode is still allowed
+        self.assertEqual(
+            json.loads('{"a": 1}', object_hook=lambda d: ('hooked', d),
+                       object_hook_mode='exclusive'),
+            ('hooked', {'a': 1}))
+        self.assertEqual(
+            json.loads('{"a": 1}', object_pairs_hook=lambda p: ('pairs', p),
+                       object_hook_mode='exclusive'),
+            ('pairs', [('a', 1)]))
+
+    def test_object_hook_mode_rejects_unknown_value(self):
+        self.assertRaises(ValueError, json.JSONDecoder,
+                          object_hook_mode='sequential')
+        self.assertRaises(ValueError, json.loads, '{"a": 1}',
+                          object_hook_mode='priority ')
+
     def test_trailing_comma_unexpected_data(self):
         # Matches CPython's test_unexpected_data for trailing commas
         test_cases = [

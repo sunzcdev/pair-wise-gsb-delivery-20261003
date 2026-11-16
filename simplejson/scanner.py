@@ -30,6 +30,13 @@ def py_make_scanner(context):
     parse_constant = context.parse_constant
     object_hook = context.object_hook
     object_pairs_hook = context.object_pairs_hook
+    # Optional for the benefit of third-party context objects that
+    # predate it, and left unset for the historical default so that a
+    # user-supplied parse_object with the older 7-argument signature
+    # keeps working.
+    object_hook_mode = getattr(context, 'object_hook_mode', None)
+    if object_hook_mode in (None, 'priority'):
+        object_hook_mode = None
     array_hook = context.array_hook
     memo = context.memo
 
@@ -43,8 +50,12 @@ def py_make_scanner(context):
         if nextchar == '"':
             return parse_string(string, idx + 1, encoding, strict)
         elif nextchar == '{':
+            if object_hook_mode is None:
+                return parse_object((string, idx + 1), encoding, strict,
+                    _scan_once, object_hook, object_pairs_hook, memo)
             return parse_object((string, idx + 1), encoding, strict,
-                _scan_once, object_hook, object_pairs_hook, memo)
+                _scan_once, object_hook, object_pairs_hook, memo,
+                object_hook_mode)
         elif nextchar == '[':
             return parse_array((string, idx + 1), _scan_once, array_hook)
         elif nextchar == 'n' and string[idx:idx + 4] == 'null':

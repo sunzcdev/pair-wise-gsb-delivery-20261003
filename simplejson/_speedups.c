@@ -240,6 +240,12 @@ typedef struct _PyScannerObject {
     int strict;
     PyObject *object_hook;
     PyObject *pairs_hook;
+    PyObject *hook_mode;
+    /* Precomputed from hook_mode: nonzero when object_hook should be
+     * fed the return value of object_pairs_hook ("chain" mode). The
+     * Python decoder validates the mode string, so this stays 0 for
+     * the historical "priority" behavior. */
+    int hook_chain;
     PyObject *array_hook;
     PyObject *parse_float;
     PyObject *parse_int;
@@ -259,6 +265,7 @@ typedef struct _PyScannerObject {
     X(strict_bool)                    \
     X(object_hook)                    \
     X(pairs_hook)                     \
+    X(hook_mode)                      \
     X(array_hook)                     \
     X(parse_float)                    \
     X(parse_int)                      \
@@ -270,6 +277,7 @@ static PyMemberDef scanner_members[] = {
     {"strict", Py_T_OBJECT_EX, offsetof(PyScannerObject, strict_bool), READONLY, "strict"},
     {"object_hook", Py_T_OBJECT_EX, offsetof(PyScannerObject, object_hook), READONLY, "object_hook"},
     {"object_pairs_hook", Py_T_OBJECT_EX, offsetof(PyScannerObject, pairs_hook), READONLY, "object_pairs_hook"},
+    {"object_hook_mode", Py_T_OBJECT_EX, offsetof(PyScannerObject, hook_mode), READONLY, "object_hook_mode"},
     {"array_hook", Py_T_OBJECT_EX, offsetof(PyScannerObject, array_hook), READONLY, "array_hook"},
     {"parse_float", Py_T_OBJECT_EX, offsetof(PyScannerObject, parse_float), READONLY, "parse_float"},
     {"parse_int", Py_T_OBJECT_EX, offsetof(PyScannerObject, parse_int), READONLY, "parse_int"},
@@ -2495,6 +2503,35 @@ scanner_new(PyTypeObject *type, PyObject *args, PyObject *kwds)
         goto bail;
     LOAD_ATTR(object_hook, "object_hook");
     LOAD_ATTR(pairs_hook, "object_pairs_hook");
+    /* object_hook_mode is optional for the benefit of third-party
+     * context objects that predate it; a missing attribute means the
+     * historical "priority" behavior. */
+    s->hook_mode = PyObject_GetAttrString(ctx, "object_hook_mode");
+    if (s->hook_mode == NULL) {
+        if (!PyErr_ExceptionMatches(PyExc_AttributeError))
+            goto bail;
+        PyErr_Clear();
+        s->hook_mode = Py_None;
+        Py_INCREF(Py_None);
+    }
+    /* Precompute whether object_hook must be fed the return value of
+     * object_pairs_hook ("chain" mode). JSONDecoder validates the mode
+     * string, so anything else -- including None -- keeps the
+     * historical "priority" behavior. Comparing against a fresh string
+     * keeps this correct for both Py2 str and Py2 unicode without
+     * hand-rolling encoding checks. */
+    s->hook_chain = 0;
+    if (s->hook_mode != Py_None) {
+        PyObject *chain = JSON_InternFromString("chain");
+        int is_chain;
+        if (chain == NULL)
+            goto bail;
+        is_chain = PyObject_RichCompareBool(s->hook_mode, chain, Py_EQ);
+        Py_DECREF(chain);
+        if (is_chain < 0)
+            goto bail;
+        s->hook_chain = is_chain;
+    }
     LOAD_ATTR(array_hook, "array_hook");
     LOAD_ATTR(parse_float, "parse_float");
     LOAD_ATTR(parse_int, "parse_int");

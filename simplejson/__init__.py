@@ -402,7 +402,8 @@ _default_decoder = JSONDecoder()
 
 def load(fp, encoding=None, cls=None, object_hook=None, parse_float=None,
         parse_int=None, parse_constant=None, object_pairs_hook=None,
-        use_decimal=False, allow_nan=False, array_hook=None, **kw):
+        use_decimal=False, allow_nan=False, array_hook=None,
+        object_hook_mode=None, **kw):
     """Deserialize ``fp`` (a ``.read()``-supporting file-like object containing
     a JSON document as `str` or `bytes`) to a Python object.
 
@@ -423,6 +424,14 @@ def load(fp, encoding=None, cls=None, object_hook=None, parse_float=None,
     example, :func:`collections.OrderedDict` will remember the order of
     insertion). If *object_hook* is also defined, the *object_pairs_hook*
     takes priority.
+
+    *object_hook_mode* makes that interaction explicit when both hooks are
+    supplied. It must be ``'priority'`` (the default, and the historical
+    behavior: *object_pairs_hook* wins), ``'chain'`` (the return value of
+    *object_pairs_hook* is passed to *object_hook*, whether or not it is a
+    mapping), or ``'exclusive'`` (supplying both hooks is a
+    :exc:`ValueError`). Hooks fire from the inside out, and a hook's
+    return value is used as the decoded value as-is.
 
     *parse_float*, if specified, will be called with the string of every
     JSON float to be decoded. By default, this is equivalent to
@@ -456,12 +465,13 @@ def load(fp, encoding=None, cls=None, object_hook=None, parse_float=None,
         parse_float=parse_float, parse_int=parse_int,
         parse_constant=parse_constant, object_pairs_hook=object_pairs_hook,
         use_decimal=use_decimal, allow_nan=allow_nan,
-        array_hook=array_hook, **kw)
+        array_hook=array_hook, object_hook_mode=object_hook_mode, **kw)
 
 
 def loads(s, encoding=None, cls=None, object_hook=None, parse_float=None,
         parse_int=None, parse_constant=None, object_pairs_hook=None,
-        use_decimal=False, allow_nan=False, array_hook=None, **kw):
+        use_decimal=False, allow_nan=False, array_hook=None,
+        object_hook_mode=None, **kw):
     """Deserialize ``s`` (a ``str`` or ``unicode`` instance containing a JSON
     document) to a Python object.
 
@@ -482,6 +492,14 @@ def loads(s, encoding=None, cls=None, object_hook=None, parse_float=None,
     example, :func:`collections.OrderedDict` will remember the order of
     insertion). If *object_hook* is also defined, the *object_pairs_hook*
     takes priority.
+
+    *object_hook_mode* makes that interaction explicit when both hooks are
+    supplied. It must be ``'priority'`` (the default, and the historical
+    behavior: *object_pairs_hook* wins), ``'chain'`` (the return value of
+    *object_pairs_hook* is passed to *object_hook*, whether or not it is a
+    mapping), or ``'exclusive'`` (supplying both hooks is a
+    :exc:`ValueError`). Hooks fire from the inside out, and a hook's
+    return value is used as the decoded value as-is.
 
     *parse_float*, if specified, will be called with the string of every
     JSON float to be decoded.  By default, this is equivalent to
@@ -513,7 +531,7 @@ def loads(s, encoding=None, cls=None, object_hook=None, parse_float=None,
     if (cls is None and encoding is None and object_hook is None and
             parse_int is None and parse_float is None and
             parse_constant is None and object_pairs_hook is None
-            and array_hook is None
+            and array_hook is None and object_hook_mode is None
             and not use_decimal and not allow_nan and not kw):
         return _default_decoder.decode(s)
     if cls is None:
@@ -522,6 +540,8 @@ def loads(s, encoding=None, cls=None, object_hook=None, parse_float=None,
         kw['object_hook'] = object_hook
     if object_pairs_hook is not None:
         kw['object_pairs_hook'] = object_pairs_hook
+    if object_hook_mode is not None:
+        kw['object_hook_mode'] = object_hook_mode
     if array_hook is not None:
         kw['array_hook'] = array_hook
     if parse_float is not None:

@@ -1,3 +1,17 @@
+Version 4.4.0 (unreleased)
+
+* New ``object_hook_mode`` argument for ``JSONDecoder``, ``load`` and
+  ``loads`` makes the interaction between ``object_hook`` and
+  ``object_pairs_hook`` explicit. ``'priority'`` (the default) keeps the
+  historical behavior where ``object_pairs_hook`` wins, ``'chain'``
+  passes the return value of ``object_pairs_hook`` to ``object_hook``
+  even when that value is not a mapping, and ``'exclusive'`` rejects
+  supplying both hooks with ``ValueError``. Hooks run from the inside
+  out, hook return values are used as-is without re-encoding, and
+  exceptions from hooks or numeric callbacks keep propagating unchanged
+  rather than becoming ``JSONDecodeError``. Implemented in both the C
+  and pure Python decoders.
+
 Version 4.3.0 released 2026-11-10
 
 * The C encoder no longer crashes when ``default()`` or ``for_json()``
