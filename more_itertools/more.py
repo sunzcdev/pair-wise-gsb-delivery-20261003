@@ -5552,6 +5552,34 @@ def concurrent_tee(iterable, n=2):
     tee objects for other threads to have reliable independent copies of
     the data stream.
 
+    Each branch keeps its own position in the stream.  The end of the stream
+    and any exception raised by *iterable* are recorded once, in shared
+    state, so that every branch encounters that same outcome when it reaches
+    the same position.  A failing source is therefore never silently skipped
+    by a branch that arrives later.
+
+    Calling ``close()`` on a branch discards its buffered values without
+    disturbing the other branches.  The input iterator is closed once, when
+    the last branch has been closed or exhausted.
+
+    For example, a failing source makes every branch fail at the same point::
+
+        >>> from more_itertools import concurrent_tee
+        >>> def source():
+        ...     yield 1
+        ...     raise ValueError('broken')
+        >>> a, b = concurrent_tee(source())
+        >>> next(a), next(b)
+        (1, 1)
+        >>> next(a)
+        Traceback (most recent call last):
+            ...
+        ValueError: broken
+        >>> next(b)
+        Traceback (most recent call last):
+            ...
+        ValueError: broken
+
     The new iterators are only thread-safe if consumed within a single thread.
     To share just one of the new iterators across multiple threads, wrap it
     with :func:`serialize`.
@@ -5568,31 +5596,121 @@ def concurrent_tee(iterable, n=2):
     return tuple(result)
 
 
+class _concurrent_tee_end:
+    """Shared terminal node for the end of a concurrent_tee stream.
+
+    *error* is the exception raised by the source iterator, or ``None`` for
+    ordinary exhaustion.  *traceback* is the traceback captured where the
+    source failed.  The outcome is stored once, in a node that every branch
+    reaches at the same logical position, so a branch cannot silently
+    advance past a source failure that another branch has already seen.
+    """
+
+    __slots__ = ('error', 'traceback')
+
+    def __init__(self, error):
+        self.error = error
+        self.traceback = None if error is None else error.__traceback__
+
+
+class _concurrent_tee_state:
+    """Hold the mutable state shared by all branches of a tee group.
+
+    The group owns the source iterator, which is closed exactly once, after
+    the last branch has been exhausted or closed.  *lock* guards the source;
+    *branches_lock* only guards the reference count, so that closing or
+    exhausting one branch never waits on another branch's read.
+    """
+
+    __slots__ = ('iterator', 'lock', 'branches', 'branches_lock')
+
+    def __init__(self, iterator):
+        self.iterator = iterator
+        self.lock = Lock()
+        self.branches = 0
+        self.branches_lock = Lock()
+
+    def release(self):
+        """Drop a branch, closing the owned source when none remain."""
+        with self.branches_lock:
+            self.branches -= 1
+            if self.branches:
+                return
+            iterator, self.iterator = self.iterator, None
+        # Close outside the locks: close() may run arbitrary code.
+        close = getattr(iterator, 'close', None)
+        if close is not None:
+            close()
+
+
 class _concurrent_tee:
-    __slots__ = ('iterator', 'link', 'lock')
+    __slots__ = ('state', 'link')
 
     def __init__(self, iterable):
         if isinstance(iterable, _concurrent_tee):
-            self.iterator = iterable.iterator
+            self.state = iterable.state
+            # New branches start at the same position as their sibling.
             self.link = iterable.link
-            self.lock = iterable.lock
         else:
-            self.iterator = iter(iterable)
+            self.state = _concurrent_tee_state(iter(iterable))
             self.link = [None, None]
-            self.lock = Lock()
+        # All branches are created before any is consumed, so no lock is
+        # needed here.
+        self.state.branches += 1
+
+    @property
+    def lock(self):
+        return self.state.lock
 
     def __iter__(self):
         return self
 
     def __next__(self):
         link = self.link
+        if link is None:
+            raise StopIteration
         if link[1] is None:
-            with self.lock:
+            # Only the branch that needs the next value touches the source,
+            # and it holds the lock just long enough to read one item.  A
+            # branch that is not being consumed therefore never blocks the
+            # ones that are.
+            state = self.state
+            with state.lock:
                 if link[1] is None:
-                    link[0] = next(self.iterator)
-                    link[1] = [None, None]
+                    try:
+                        value = next(state.iterator)
+                    except StopIteration:
+                        link[1] = _concurrent_tee_end(None)
+                    except BaseException as error:
+                        # Record the failure, including KeyboardInterrupt
+                        # and friends, so later branches fail here too.
+                        link[1] = _concurrent_tee_end(error)
+                    else:
+                        link[0] = value
+                        link[1] = [None, None]
+        following = link[1]
+        if isinstance(following, _concurrent_tee_end):
+            # The end of the stream, or the source's failure, is shared:
+            # every branch stops or fails here, at this same position.
+            self._release()
+            if following.error is None:
+                raise StopIteration
+            raise following.error.with_traceback(following.traceback)
         value, self.link = link
         return value
+
+    def close(self):
+        """Close this branch, discarding any values it has buffered.
+
+        The other branches are unaffected.  The source iterator is closed
+        once the last branch has been closed or exhausted.
+        """
+        if self.link is not None:
+            self._release()
+
+    def _release(self):
+        self.link = None
+        self.state.release()
 
 
 def subfactorial(n):

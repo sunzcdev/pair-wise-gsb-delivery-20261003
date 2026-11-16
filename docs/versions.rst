@@ -9,6 +9,10 @@ Unreleased
 ----------
 
 * Updated functions:
+    * :func:`concurrent_tee` branches now observe the same end of stream, and the same
+      exception if the source fails, at the same position. Branches also gained a
+      ``close()`` method: it discards that branch's buffered values without affecting
+      the others, and the source iterator is closed once the last branch is done.
     * :func:`peekable` was updated to avoid caching the entire iterable when sliced with a negative step and omitted *stop*.
 
 11.2.1

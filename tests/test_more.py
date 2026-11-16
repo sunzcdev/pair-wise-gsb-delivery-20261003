@@ -7197,6 +7197,198 @@ class TestConcurrentTee(TestCase):
             non_concurrent_source = producer(limit)
             mi.concurrent_tee(non_concurrent_source, n=-1)  # Negative n
 
+    def test_branches_advance_independently(self):
+        a, b, c = mi.concurrent_tee(iter('abcdef'), n=3)
+        self.assertEqual((next(a), next(b), next(c)), ('a', 'a', 'a'))
+        self.assertEqual((next(a), next(b), next(c)), ('b', 'b', 'b'))
+        self.assertEqual(list(a), list('cdef'))
+        self.assertEqual(list(c), list('cdef'))
+        # b lags behind and still replays everything after its position.
+        self.assertEqual(list(b), list('cdef'))
+
+    def test_source_failure_is_shared(self):
+        class Boom(Exception):
+            pass
+
+        def producer():
+            yield 0
+            yield 1
+            raise Boom('bad')
+
+        a, b = mi.concurrent_tee(producer(), n=2)
+        self.assertEqual([next(a), next(a)], [0, 1])
+        with self.assertRaises(Boom) as caught_a:
+            next(a)
+
+        # The lagging branch replays the same values and hits the same error.
+        self.assertEqual([next(b), next(b)], [0, 1])
+        with self.assertRaises(Boom) as caught_b:
+            next(b)
+
+        self.assertIs(caught_a.exception, caught_b.exception)
+        self.assertEqual(str(caught_a.exception), 'bad')
+
+        # Both branches are done; the record is stable on later calls.
+        for branch in (a, b):
+            with self.assertRaises(StopIteration):
+                next(branch)
+
+    def test_source_exhaustion_is_shared(self):
+        calls = []
+
+        def producer():
+            for x in range(3):
+                calls.append(x)
+                yield x
+
+        a, b = mi.concurrent_tee(producer(), n=2)
+        self.assertEqual(list(a), [0, 1, 2])
+        self.assertEqual(calls, [0, 1, 2])
+        self.assertEqual(list(b), [0, 1, 2])
+        # Exhaustion was recorded once, not re-read from the source.
+        self.assertEqual(calls, [0, 1, 2])
+
+    def test_idle_branch_does_not_block_failure(self):
+        def producer():
+            yield 'first'
+            raise ValueError('boom')
+
+        a, b = mi.concurrent_tee(producer(), n=2)
+        self.assertEqual(next(a), 'first')
+
+        outcome = []
+
+        def consume():
+            try:
+                next(a)
+            except ValueError as error:
+                outcome.append(error)
+
+        # b is never consumed, so it cannot be holding anything back.
+        worker = Thread(target=consume)
+        worker.start()
+        worker.join(timeout=10)
+        self.assertFalse(worker.is_alive())
+        self.assertEqual(len(outcome), 1)
+        self.assertEqual(str(outcome[0]), 'boom')
+
+        self.assertEqual(next(b), 'first')
+        with self.assertRaises(ValueError):
+            next(b)
+
+    def test_close_does_not_hide_source_failure(self):
+        def producer():
+            yield 1
+            raise ValueError('boom')
+
+        a, b = mi.concurrent_tee(producer(), n=2)
+        self.assertEqual(next(a), 1)
+        a.close()
+        self.assertEqual(next(b), 1)
+        with self.assertRaises(ValueError):
+            next(b)
+
+    def test_close_releases_buffered_values(self):
+        class Payload:
+            pass
+
+        refs = []
+
+        def producer():
+            for _ in range(3):
+                payload = Payload()
+                refs.append(weakref.ref(payload))
+                yield payload
+
+        leading, lagging = mi.concurrent_tee(producer(), n=2)
+        self.assertEqual(len(list(leading)), 3)
+        gc.collect()
+        # The values are still buffered for the lagging branch.
+        self.assertEqual(sum(ref() is not None for ref in refs), 3)
+
+        lagging.close()
+        gc.collect()
+        self.assertEqual(sum(ref() is not None for ref in refs), 0)
+
+        # Closing is idempotent and the branch stays finished.
+        lagging.close()
+        with self.assertRaises(StopIteration):
+            next(lagging)
+
+    def test_source_closed_once_by_last_branch(self):
+        class ClosableSource:
+            def __init__(self):
+                self.iterator = iter(range(5))
+                self.closed = 0
+
+            def __iter__(self):
+                return self
+
+            def __next__(self):
+                return next(self.iterator)
+
+            def close(self):
+                self.closed += 1
+
+        source = ClosableSource()
+        a, b = mi.concurrent_tee(source, n=2)
+        self.assertEqual(next(a), 0)
+
+        a.close()
+        self.assertEqual(source.closed, 0)  # b still owns the source
+
+        b.close()
+        self.assertEqual(source.closed, 1)
+
+        a.close()
+        b.close()
+        self.assertEqual(source.closed, 1)  # never closed twice
+
+    def test_source_closed_after_exhaustion(self):
+        class ClosableSource:
+            def __init__(self):
+                self.iterator = iter(range(2))
+                self.closed = 0
+
+            def __iter__(self):
+                return self
+
+            def __next__(self):
+                return next(self.iterator)
+
+            def close(self):
+                self.closed += 1
+
+        source = ClosableSource()
+        a, b = mi.concurrent_tee(source, n=2)
+        self.assertEqual(list(a), [0, 1])
+        self.assertEqual(source.closed, 0)
+        self.assertEqual(list(b), [0, 1])
+        self.assertEqual(source.closed, 1)
+
+    def test_branch_serialized_for_multiple_threads(self):
+        # concurrent_tee branches are thread-safe only within one thread.
+        # Sharing a single branch across threads still needs serialize().
+        a, b = mi.concurrent_tee(iter(range(1000)), n=2)
+        serialized = mi.serialize(a)
+        results = []
+        results_lock = Lock()
+
+        def consume():
+            collected = list(serialized)
+            with results_lock:
+                results.append(collected)
+
+        workers = [Thread(target=consume) for _ in range(4)]
+        for worker in workers:
+            worker.start()
+        for worker in workers:
+            worker.join()
+
+        combined = sorted(chain.from_iterable(results))
+        self.assertEqual(combined, list(range(1000)))
+        self.assertEqual(list(b), list(range(1000)))
+
 
 def grow_to_window(data, maxlen):
     "Return growing window views upto maxlen."
