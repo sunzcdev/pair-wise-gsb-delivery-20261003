@@ -9,6 +9,7 @@ Our exception hierarchy:
         · ReadTimeout
         · WriteTimeout
         · PoolTimeout
+        · TotalTimeout
       - NetworkError
         · ConnectError
         · ReadError
@@ -64,6 +65,7 @@ __all__ = [
     "StreamError",
     "TimeoutException",
     "TooManyRedirects",
+    "TotalTimeout",
     "TransportError",
     "UnsupportedProtocol",
     "WriteError",
@@ -159,6 +161,32 @@ class PoolTimeout(TimeoutException):
     """
     Timed out waiting to acquire a connection from the pool.
     """
+
+
+class TotalTimeout(TimeoutException):
+    """
+    The total deadline for a request has been exceeded.
+
+    Unlike the per-operation timeouts, the total deadline spans the entire
+    request, from the first send until the response body has been fully read,
+    and is not reset by redirects or authentication challenges.
+
+    The `.request` attribute holds the original request, as passed to
+    `client.send()`. The `.last_request` attribute holds the most recent
+    request that was actually in flight when the deadline expired, which
+    may differ from the original request if redirects or authentication
+    challenges occurred.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        request: Request | None = None,
+        last_request: Request | None = None,
+    ) -> None:
+        super().__init__(message, request=request)
+        self.last_request = request if last_request is None else last_request
 
 
 # Core networking exceptions...
@@ -372,6 +400,6 @@ def request_context(
     try:
         yield
     except RequestError as exc:
-        if request is not None:
+        if request is not None and exc._request is None:
             exc.request = request
         raise exc

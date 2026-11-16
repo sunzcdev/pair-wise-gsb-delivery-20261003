@@ -20,10 +20,12 @@ from ._config import (
     Timeout,
 )
 from ._decoders import SUPPORTED_DECODERS
+from ._deadline import Deadline
 from ._exceptions import (
     InvalidURL,
     RemoteProtocolError,
     TooManyRedirects,
+    TotalTimeout,
     request_context,
 )
 from ._models import Cookies, Headers, Request, Response
@@ -182,6 +184,80 @@ class BoundAsyncStream(AsyncByteStream):
         await self._stream.aclose()
 
 
+class DeadlineSyncStream(SyncByteStream):
+    """
+    A byte stream that enforces a total `Deadline` while the response
+    body is being read. If the deadline expires mid-body the current
+    response is closed and a `TotalTimeout` is raised.
+    """
+
+    def __init__(
+        self,
+        stream: SyncByteStream,
+        *,
+        deadline: Deadline,
+        request: Request,
+        original_request: Request,
+        response: Response,
+    ) -> None:
+        self._stream = stream
+        self._deadline = deadline
+        self._request = request
+        self._original_request = original_request
+        self._response = response
+
+    def __iter__(self) -> typing.Iterator[bytes]:
+        try:
+            for chunk in self._stream:
+                self._deadline.check(self._request, self._original_request)
+                yield chunk
+            # The deadline spans until the body has been fully read.
+            self._deadline.check(self._request, self._original_request)
+        except TotalTimeout:
+            self._response.close()
+            raise
+
+    def close(self) -> None:
+        self._stream.close()
+
+
+class DeadlineAsyncStream(AsyncByteStream):
+    """
+    An async byte stream that enforces a total `Deadline` while the
+    response body is being read. If the deadline expires mid-body the
+    current response is closed and a `TotalTimeout` is raised.
+    """
+
+    def __init__(
+        self,
+        stream: AsyncByteStream,
+        *,
+        deadline: Deadline,
+        request: Request,
+        original_request: Request,
+        response: Response,
+    ) -> None:
+        self._stream = stream
+        self._deadline = deadline
+        self._request = request
+        self._original_request = original_request
+        self._response = response
+
+    async def __aiter__(self) -> typing.AsyncIterator[bytes]:
+        try:
+            async for chunk in self._stream:
+                self._deadline.check(self._request, self._original_request)
+                yield chunk
+            # The deadline spans until the body has been fully read.
+            self._deadline.check(self._request, self._original_request)
+        except TotalTimeout:
+            await self._response.aclose()
+            raise
+
+    async def aclose(self) -> None:
+        await self._stream.aclose()
+
+
 EventHook = typing.Callable[..., typing.Any]
 
 
@@ -194,6 +270,7 @@ class BaseClient:
         headers: HeaderTypes | None = None,
         cookies: CookieTypes | None = None,
         timeout: TimeoutTypes = DEFAULT_TIMEOUT_CONFIG,
+        deadline: float | None = None,
         follow_redirects: bool = False,
         max_redirects: int = DEFAULT_MAX_REDIRECTS,
         event_hooks: None | (typing.Mapping[str, list[EventHook]]) = None,
@@ -210,6 +287,7 @@ class BaseClient:
         self.headers = Headers(headers)
         self._cookies = Cookies(cookies)
         self._timeout = Timeout(timeout)
+        self._deadline = deadline
         self.follow_redirects = follow_redirects
         self.max_redirects = max_redirects
         self._event_hooks = {
@@ -257,6 +335,19 @@ class BaseClient:
     @timeout.setter
     def timeout(self, timeout: TimeoutTypes) -> None:
         self._timeout = Timeout(timeout)
+
+    @property
+    def deadline(self) -> float | None:
+        """
+        The total deadline in seconds applied to each request, spanning
+        any redirects or authentication challenges, or `None` for no
+        total deadline.
+        """
+        return self._deadline
+
+    @deadline.setter
+    def deadline(self, deadline: float | None) -> None:
+        self._deadline = deadline
 
     @property
     def event_hooks(self) -> dict[str, list[EventHook]]:
@@ -350,6 +441,7 @@ class BaseClient:
         headers: HeaderTypes | None = None,
         cookies: CookieTypes | None = None,
         timeout: TimeoutTypes | UseClientDefault = USE_CLIENT_DEFAULT,
+        deadline: float | None | UseClientDefault = USE_CLIENT_DEFAULT,
         extensions: RequestExtensions | None = None,
     ) -> Request:
         """
@@ -375,6 +467,11 @@ class BaseClient:
                 else Timeout(timeout)
             )
             extensions = dict(**extensions, timeout=timeout.as_dict())
+        if "deadline" not in extensions:
+            deadline = (
+                self._deadline if isinstance(deadline, UseClientDefault) else deadline
+            )
+            extensions = dict(**extensions, deadline=deadline)
         return Request(
             method,
             url,
@@ -590,6 +687,10 @@ class BaseClient:
             )
             request.extensions = dict(**request.extensions, timeout=timeout.as_dict())
 
+    def _set_deadline(self, request: Request) -> None:
+        if "deadline" not in request.extensions:
+            request.extensions = dict(**request.extensions, deadline=self._deadline)
+
 
 class Client(BaseClient):
     """
@@ -622,6 +723,9 @@ class Client(BaseClient):
     * **proxy** - *(optional)* A proxy URL where all the traffic should be routed.
     * **timeout** - *(optional)* The timeout configuration to use when sending
     requests.
+    * **deadline** - *(optional)* A total time limit in seconds for each request,
+    spanning any redirects or authentication challenges, and not reset by them.
+    When used together with `timeout`, whichever expires first takes effect.
     * **limits** - *(optional)* The limits configuration to use.
     * **max_redirects** - *(optional)* The maximum number of redirect responses
     that should be followed.
@@ -651,6 +755,7 @@ class Client(BaseClient):
         proxy: ProxyTypes | None = None,
         mounts: None | (typing.Mapping[str, BaseTransport | None]) = None,
         timeout: TimeoutTypes = DEFAULT_TIMEOUT_CONFIG,
+        deadline: float | None = None,
         follow_redirects: bool = False,
         limits: Limits = DEFAULT_LIMITS,
         max_redirects: int = DEFAULT_MAX_REDIRECTS,
@@ -665,6 +770,7 @@ class Client(BaseClient):
             headers=headers,
             cookies=cookies,
             timeout=timeout,
+            deadline=deadline,
             follow_redirects=follow_redirects,
             max_redirects=max_redirects,
             event_hooks=event_hooks,
@@ -783,6 +889,7 @@ class Client(BaseClient):
         auth: AuthTypes | UseClientDefault | None = USE_CLIENT_DEFAULT,
         follow_redirects: bool | UseClientDefault = USE_CLIENT_DEFAULT,
         timeout: TimeoutTypes | UseClientDefault = USE_CLIENT_DEFAULT,
+        deadline: float | None | UseClientDefault = USE_CLIENT_DEFAULT,
         extensions: RequestExtensions | None = None,
     ) -> Response:
         """
@@ -820,6 +927,7 @@ class Client(BaseClient):
             headers=headers,
             cookies=cookies,
             timeout=timeout,
+            deadline=deadline,
             extensions=extensions,
         )
         return self.send(request, auth=auth, follow_redirects=follow_redirects)
@@ -840,6 +948,7 @@ class Client(BaseClient):
         auth: AuthTypes | UseClientDefault | None = USE_CLIENT_DEFAULT,
         follow_redirects: bool | UseClientDefault = USE_CLIENT_DEFAULT,
         timeout: TimeoutTypes | UseClientDefault = USE_CLIENT_DEFAULT,
+        deadline: float | None | UseClientDefault = USE_CLIENT_DEFAULT,
         extensions: RequestExtensions | None = None,
     ) -> typing.Iterator[Response]:
         """
@@ -863,6 +972,7 @@ class Client(BaseClient):
             headers=headers,
             cookies=cookies,
             timeout=timeout,
+            deadline=deadline,
             extensions=extensions,
         )
         response = self.send(
@@ -908,14 +1018,22 @@ class Client(BaseClient):
         )
 
         self._set_timeout(request)
+        self._set_deadline(request)
 
         auth = self._build_request_auth(request, auth)
+
+        # The total deadline starts as the first request is sent, and is
+        # shared across any redirects or authentication challenges.
+        deadline = Deadline(request.extensions["deadline"])
+        original_request = request
 
         response = self._send_handling_auth(
             request,
             auth=auth,
             follow_redirects=follow_redirects,
             history=[],
+            deadline=deadline,
+            original_request=original_request,
         )
         try:
             if not stream:
@@ -933,6 +1051,8 @@ class Client(BaseClient):
         auth: Auth,
         follow_redirects: bool,
         history: list[Response],
+        deadline: Deadline,
+        original_request: Request,
     ) -> Response:
         auth_flow = auth.sync_auth_flow(request)
         try:
@@ -943,6 +1063,8 @@ class Client(BaseClient):
                     request,
                     follow_redirects=follow_redirects,
                     history=history,
+                    deadline=deadline,
+                    original_request=original_request,
                 )
                 try:
                     try:
@@ -966,6 +1088,8 @@ class Client(BaseClient):
         request: Request,
         follow_redirects: bool,
         history: list[Response],
+        deadline: Deadline,
+        original_request: Request,
     ) -> Response:
         while True:
             if len(history) > self.max_redirects:
@@ -976,7 +1100,9 @@ class Client(BaseClient):
             for hook in self._event_hooks["request"]:
                 hook(request)
 
-            response = self._send_single_request(request)
+            response = self._send_single_request(
+                request, deadline=deadline, original_request=original_request
+            )
             try:
                 for hook in self._event_hooks["response"]:
                     hook(response)
@@ -998,7 +1124,12 @@ class Client(BaseClient):
                 response.close()
                 raise exc
 
-    def _send_single_request(self, request: Request) -> Response:
+    def _send_single_request(
+        self,
+        request: Request,
+        deadline: Deadline,
+        original_request: Request,
+    ) -> Response:
         """
         Sends a single request, without handling any redirections.
         """
@@ -1010,17 +1141,41 @@ class Client(BaseClient):
                 "Attempted to send an async request with a sync Client instance."
             )
 
+        # Redirects and authentication challenges do not reset the total
+        # deadline. The remaining budget is shared with the transport by
+        # clamping the per-operation timeouts, so that whichever of the
+        # per-phase timeout or the total deadline expires first takes effect.
+        deadline.check(request, original_request)
+        if deadline.is_active:
+            timeout = request.extensions.get("timeout", {})
+            clamped = deadline.clamp_timeout(timeout)
+            extensions = dict(request.extensions)
+            extensions["timeout"] = clamped
+            request.extensions = extensions
+
         with request_context(request=request):
             response = transport.handle_request(request)
 
         assert isinstance(response.stream, SyncByteStream)
 
         response.request = request
-        response.stream = BoundSyncStream(
-            response.stream, response=response, start=start
-        )
+        stream = response.stream
+        if deadline.is_active:
+            stream = DeadlineSyncStream(
+                stream,
+                deadline=deadline,
+                request=request,
+                original_request=original_request,
+                response=response,
+            )
+        response.stream = BoundSyncStream(stream, response=response, start=start)
         self.cookies.extract_cookies(response)
         response.default_encoding = self._default_encoding
+
+        if deadline.expired:
+            # The deadline expired while the response headers were in flight.
+            response.close()
+            deadline.check(request, original_request)
 
         logger.info(
             'HTTP Request: %s %s "%s %d %s"',
@@ -1043,6 +1198,7 @@ class Client(BaseClient):
         auth: AuthTypes | UseClientDefault | None = USE_CLIENT_DEFAULT,
         follow_redirects: bool | UseClientDefault = USE_CLIENT_DEFAULT,
         timeout: TimeoutTypes | UseClientDefault = USE_CLIENT_DEFAULT,
+        deadline: float | None | UseClientDefault = USE_CLIENT_DEFAULT,
         extensions: RequestExtensions | None = None,
     ) -> Response:
         """
@@ -1059,6 +1215,7 @@ class Client(BaseClient):
             auth=auth,
             follow_redirects=follow_redirects,
             timeout=timeout,
+            deadline=deadline,
             extensions=extensions,
         )
 
@@ -1072,6 +1229,7 @@ class Client(BaseClient):
         auth: AuthTypes | UseClientDefault = USE_CLIENT_DEFAULT,
         follow_redirects: bool | UseClientDefault = USE_CLIENT_DEFAULT,
         timeout: TimeoutTypes | UseClientDefault = USE_CLIENT_DEFAULT,
+        deadline: float | None | UseClientDefault = USE_CLIENT_DEFAULT,
         extensions: RequestExtensions | None = None,
     ) -> Response:
         """
@@ -1088,6 +1246,7 @@ class Client(BaseClient):
             auth=auth,
             follow_redirects=follow_redirects,
             timeout=timeout,
+            deadline=deadline,
             extensions=extensions,
         )
 
@@ -1101,6 +1260,7 @@ class Client(BaseClient):
         auth: AuthTypes | UseClientDefault = USE_CLIENT_DEFAULT,
         follow_redirects: bool | UseClientDefault = USE_CLIENT_DEFAULT,
         timeout: TimeoutTypes | UseClientDefault = USE_CLIENT_DEFAULT,
+        deadline: float | None | UseClientDefault = USE_CLIENT_DEFAULT,
         extensions: RequestExtensions | None = None,
     ) -> Response:
         """
@@ -1117,6 +1277,7 @@ class Client(BaseClient):
             auth=auth,
             follow_redirects=follow_redirects,
             timeout=timeout,
+            deadline=deadline,
             extensions=extensions,
         )
 
@@ -1134,6 +1295,7 @@ class Client(BaseClient):
         auth: AuthTypes | UseClientDefault = USE_CLIENT_DEFAULT,
         follow_redirects: bool | UseClientDefault = USE_CLIENT_DEFAULT,
         timeout: TimeoutTypes | UseClientDefault = USE_CLIENT_DEFAULT,
+        deadline: float | None | UseClientDefault = USE_CLIENT_DEFAULT,
         extensions: RequestExtensions | None = None,
     ) -> Response:
         """
@@ -1154,6 +1316,7 @@ class Client(BaseClient):
             auth=auth,
             follow_redirects=follow_redirects,
             timeout=timeout,
+            deadline=deadline,
             extensions=extensions,
         )
 
@@ -1171,6 +1334,7 @@ class Client(BaseClient):
         auth: AuthTypes | UseClientDefault = USE_CLIENT_DEFAULT,
         follow_redirects: bool | UseClientDefault = USE_CLIENT_DEFAULT,
         timeout: TimeoutTypes | UseClientDefault = USE_CLIENT_DEFAULT,
+        deadline: float | None | UseClientDefault = USE_CLIENT_DEFAULT,
         extensions: RequestExtensions | None = None,
     ) -> Response:
         """
@@ -1191,6 +1355,7 @@ class Client(BaseClient):
             auth=auth,
             follow_redirects=follow_redirects,
             timeout=timeout,
+            deadline=deadline,
             extensions=extensions,
         )
 
@@ -1208,6 +1373,7 @@ class Client(BaseClient):
         auth: AuthTypes | UseClientDefault = USE_CLIENT_DEFAULT,
         follow_redirects: bool | UseClientDefault = USE_CLIENT_DEFAULT,
         timeout: TimeoutTypes | UseClientDefault = USE_CLIENT_DEFAULT,
+        deadline: float | None | UseClientDefault = USE_CLIENT_DEFAULT,
         extensions: RequestExtensions | None = None,
     ) -> Response:
         """
@@ -1228,6 +1394,7 @@ class Client(BaseClient):
             auth=auth,
             follow_redirects=follow_redirects,
             timeout=timeout,
+            deadline=deadline,
             extensions=extensions,
         )
 
@@ -1241,6 +1408,7 @@ class Client(BaseClient):
         auth: AuthTypes | UseClientDefault = USE_CLIENT_DEFAULT,
         follow_redirects: bool | UseClientDefault = USE_CLIENT_DEFAULT,
         timeout: TimeoutTypes | UseClientDefault = USE_CLIENT_DEFAULT,
+        deadline: float | None | UseClientDefault = USE_CLIENT_DEFAULT,
         extensions: RequestExtensions | None = None,
     ) -> Response:
         """
@@ -1257,6 +1425,7 @@ class Client(BaseClient):
             auth=auth,
             follow_redirects=follow_redirects,
             timeout=timeout,
+            deadline=deadline,
             extensions=extensions,
         )
 
@@ -1336,6 +1505,9 @@ class AsyncClient(BaseClient):
     * **proxy** - *(optional)* A proxy URL where all the traffic should be routed.
     * **timeout** - *(optional)* The timeout configuration to use when sending
     requests.
+    * **deadline** - *(optional)* A total time limit in seconds for each request,
+    spanning any redirects or authentication challenges, and not reset by them.
+    When used together with `timeout`, whichever expires first takes effect.
     * **limits** - *(optional)* The limits configuration to use.
     * **max_redirects** - *(optional)* The maximum number of redirect responses
     that should be followed.
@@ -1364,6 +1536,7 @@ class AsyncClient(BaseClient):
         proxy: ProxyTypes | None = None,
         mounts: None | (typing.Mapping[str, AsyncBaseTransport | None]) = None,
         timeout: TimeoutTypes = DEFAULT_TIMEOUT_CONFIG,
+        deadline: float | None = None,
         follow_redirects: bool = False,
         limits: Limits = DEFAULT_LIMITS,
         max_redirects: int = DEFAULT_MAX_REDIRECTS,
@@ -1379,6 +1552,7 @@ class AsyncClient(BaseClient):
             headers=headers,
             cookies=cookies,
             timeout=timeout,
+            deadline=deadline,
             follow_redirects=follow_redirects,
             max_redirects=max_redirects,
             event_hooks=event_hooks,
@@ -1497,6 +1671,7 @@ class AsyncClient(BaseClient):
         auth: AuthTypes | UseClientDefault | None = USE_CLIENT_DEFAULT,
         follow_redirects: bool | UseClientDefault = USE_CLIENT_DEFAULT,
         timeout: TimeoutTypes | UseClientDefault = USE_CLIENT_DEFAULT,
+        deadline: float | None | UseClientDefault = USE_CLIENT_DEFAULT,
         extensions: RequestExtensions | None = None,
     ) -> Response:
         """
@@ -1535,6 +1710,7 @@ class AsyncClient(BaseClient):
             headers=headers,
             cookies=cookies,
             timeout=timeout,
+            deadline=deadline,
             extensions=extensions,
         )
         return await self.send(request, auth=auth, follow_redirects=follow_redirects)
@@ -1555,6 +1731,7 @@ class AsyncClient(BaseClient):
         auth: AuthTypes | UseClientDefault | None = USE_CLIENT_DEFAULT,
         follow_redirects: bool | UseClientDefault = USE_CLIENT_DEFAULT,
         timeout: TimeoutTypes | UseClientDefault = USE_CLIENT_DEFAULT,
+        deadline: float | None | UseClientDefault = USE_CLIENT_DEFAULT,
         extensions: RequestExtensions | None = None,
     ) -> typing.AsyncIterator[Response]:
         """
@@ -1578,6 +1755,7 @@ class AsyncClient(BaseClient):
             headers=headers,
             cookies=cookies,
             timeout=timeout,
+            deadline=deadline,
             extensions=extensions,
         )
         response = await self.send(
@@ -1623,14 +1801,22 @@ class AsyncClient(BaseClient):
         )
 
         self._set_timeout(request)
+        self._set_deadline(request)
 
         auth = self._build_request_auth(request, auth)
+
+        # The total deadline starts as the first request is sent, and is
+        # shared across any redirects or authentication challenges.
+        deadline = Deadline(request.extensions["deadline"])
+        original_request = request
 
         response = await self._send_handling_auth(
             request,
             auth=auth,
             follow_redirects=follow_redirects,
             history=[],
+            deadline=deadline,
+            original_request=original_request,
         )
         try:
             if not stream:
@@ -1648,6 +1834,8 @@ class AsyncClient(BaseClient):
         auth: Auth,
         follow_redirects: bool,
         history: list[Response],
+        deadline: Deadline,
+        original_request: Request,
     ) -> Response:
         auth_flow = auth.async_auth_flow(request)
         try:
@@ -1658,6 +1846,8 @@ class AsyncClient(BaseClient):
                     request,
                     follow_redirects=follow_redirects,
                     history=history,
+                    deadline=deadline,
+                    original_request=original_request,
                 )
                 try:
                     try:
@@ -1681,6 +1871,8 @@ class AsyncClient(BaseClient):
         request: Request,
         follow_redirects: bool,
         history: list[Response],
+        deadline: Deadline,
+        original_request: Request,
     ) -> Response:
         while True:
             if len(history) > self.max_redirects:
@@ -1691,7 +1883,9 @@ class AsyncClient(BaseClient):
             for hook in self._event_hooks["request"]:
                 await hook(request)
 
-            response = await self._send_single_request(request)
+            response = await self._send_single_request(
+                request, deadline=deadline, original_request=original_request
+            )
             try:
                 for hook in self._event_hooks["response"]:
                     await hook(response)
@@ -1714,7 +1908,12 @@ class AsyncClient(BaseClient):
                 await response.aclose()
                 raise exc
 
-    async def _send_single_request(self, request: Request) -> Response:
+    async def _send_single_request(
+        self,
+        request: Request,
+        deadline: Deadline,
+        original_request: Request,
+    ) -> Response:
         """
         Sends a single request, without handling any redirections.
         """
@@ -1726,16 +1925,40 @@ class AsyncClient(BaseClient):
                 "Attempted to send a sync request with an AsyncClient instance."
             )
 
+        # Redirects and authentication challenges do not reset the total
+        # deadline. The remaining budget is shared with the transport by
+        # clamping the per-operation timeouts, so that whichever of the
+        # per-phase timeout or the total deadline expires first takes effect.
+        deadline.check(request, original_request)
+        if deadline.is_active:
+            timeout = request.extensions.get("timeout", {})
+            clamped = deadline.clamp_timeout(timeout)
+            extensions = dict(request.extensions)
+            extensions["timeout"] = clamped
+            request.extensions = extensions
+
         with request_context(request=request):
             response = await transport.handle_async_request(request)
 
         assert isinstance(response.stream, AsyncByteStream)
         response.request = request
-        response.stream = BoundAsyncStream(
-            response.stream, response=response, start=start
-        )
+        stream = response.stream
+        if deadline.is_active:
+            stream = DeadlineAsyncStream(
+                stream,
+                deadline=deadline,
+                request=request,
+                original_request=original_request,
+                response=response,
+            )
+        response.stream = BoundAsyncStream(stream, response=response, start=start)
         self.cookies.extract_cookies(response)
         response.default_encoding = self._default_encoding
+
+        if deadline.expired:
+            # The deadline expired while the response headers were in flight.
+            await response.aclose()
+            deadline.check(request, original_request)
 
         logger.info(
             'HTTP Request: %s %s "%s %d %s"',
@@ -1758,6 +1981,7 @@ class AsyncClient(BaseClient):
         auth: AuthTypes | UseClientDefault | None = USE_CLIENT_DEFAULT,
         follow_redirects: bool | UseClientDefault = USE_CLIENT_DEFAULT,
         timeout: TimeoutTypes | UseClientDefault = USE_CLIENT_DEFAULT,
+        deadline: float | None | UseClientDefault = USE_CLIENT_DEFAULT,
         extensions: RequestExtensions | None = None,
     ) -> Response:
         """
@@ -1774,6 +1998,7 @@ class AsyncClient(BaseClient):
             auth=auth,
             follow_redirects=follow_redirects,
             timeout=timeout,
+            deadline=deadline,
             extensions=extensions,
         )
 
@@ -1787,6 +2012,7 @@ class AsyncClient(BaseClient):
         auth: AuthTypes | UseClientDefault = USE_CLIENT_DEFAULT,
         follow_redirects: bool | UseClientDefault = USE_CLIENT_DEFAULT,
         timeout: TimeoutTypes | UseClientDefault = USE_CLIENT_DEFAULT,
+        deadline: float | None | UseClientDefault = USE_CLIENT_DEFAULT,
         extensions: RequestExtensions | None = None,
     ) -> Response:
         """
@@ -1803,6 +2029,7 @@ class AsyncClient(BaseClient):
             auth=auth,
             follow_redirects=follow_redirects,
             timeout=timeout,
+            deadline=deadline,
             extensions=extensions,
         )
 
@@ -1816,6 +2043,7 @@ class AsyncClient(BaseClient):
         auth: AuthTypes | UseClientDefault = USE_CLIENT_DEFAULT,
         follow_redirects: bool | UseClientDefault = USE_CLIENT_DEFAULT,
         timeout: TimeoutTypes | UseClientDefault = USE_CLIENT_DEFAULT,
+        deadline: float | None | UseClientDefault = USE_CLIENT_DEFAULT,
         extensions: RequestExtensions | None = None,
     ) -> Response:
         """
@@ -1832,6 +2060,7 @@ class AsyncClient(BaseClient):
             auth=auth,
             follow_redirects=follow_redirects,
             timeout=timeout,
+            deadline=deadline,
             extensions=extensions,
         )
 
@@ -1849,6 +2078,7 @@ class AsyncClient(BaseClient):
         auth: AuthTypes | UseClientDefault = USE_CLIENT_DEFAULT,
         follow_redirects: bool | UseClientDefault = USE_CLIENT_DEFAULT,
         timeout: TimeoutTypes | UseClientDefault = USE_CLIENT_DEFAULT,
+        deadline: float | None | UseClientDefault = USE_CLIENT_DEFAULT,
         extensions: RequestExtensions | None = None,
     ) -> Response:
         """
@@ -1869,6 +2099,7 @@ class AsyncClient(BaseClient):
             auth=auth,
             follow_redirects=follow_redirects,
             timeout=timeout,
+            deadline=deadline,
             extensions=extensions,
         )
 
@@ -1886,6 +2117,7 @@ class AsyncClient(BaseClient):
         auth: AuthTypes | UseClientDefault = USE_CLIENT_DEFAULT,
         follow_redirects: bool | UseClientDefault = USE_CLIENT_DEFAULT,
         timeout: TimeoutTypes | UseClientDefault = USE_CLIENT_DEFAULT,
+        deadline: float | None | UseClientDefault = USE_CLIENT_DEFAULT,
         extensions: RequestExtensions | None = None,
     ) -> Response:
         """
@@ -1906,6 +2138,7 @@ class AsyncClient(BaseClient):
             auth=auth,
             follow_redirects=follow_redirects,
             timeout=timeout,
+            deadline=deadline,
             extensions=extensions,
         )
 
@@ -1923,6 +2156,7 @@ class AsyncClient(BaseClient):
         auth: AuthTypes | UseClientDefault = USE_CLIENT_DEFAULT,
         follow_redirects: bool | UseClientDefault = USE_CLIENT_DEFAULT,
         timeout: TimeoutTypes | UseClientDefault = USE_CLIENT_DEFAULT,
+        deadline: float | None | UseClientDefault = USE_CLIENT_DEFAULT,
         extensions: RequestExtensions | None = None,
     ) -> Response:
         """
@@ -1943,6 +2177,7 @@ class AsyncClient(BaseClient):
             auth=auth,
             follow_redirects=follow_redirects,
             timeout=timeout,
+            deadline=deadline,
             extensions=extensions,
         )
 
@@ -1956,6 +2191,7 @@ class AsyncClient(BaseClient):
         auth: AuthTypes | UseClientDefault = USE_CLIENT_DEFAULT,
         follow_redirects: bool | UseClientDefault = USE_CLIENT_DEFAULT,
         timeout: TimeoutTypes | UseClientDefault = USE_CLIENT_DEFAULT,
+        deadline: float | None | UseClientDefault = USE_CLIENT_DEFAULT,
         extensions: RequestExtensions | None = None,
     ) -> Response:
         """
@@ -1972,6 +2208,7 @@ class AsyncClient(BaseClient):
             auth=auth,
             follow_redirects=follow_redirects,
             timeout=timeout,
+            deadline=deadline,
             extensions=extensions,
         )
 

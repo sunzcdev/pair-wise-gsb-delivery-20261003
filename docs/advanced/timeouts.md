@@ -69,3 +69,30 @@ client = httpx.Client(timeout=timeout)
 
 response = client.get('http://example.com/')
 ```
+
+## Setting a total deadline
+
+The per-operation timeouts above apply to each network operation individually,
+so a request that involves redirects or authentication challenges may take
+arbitrarily long overall, since each follow-up request gets a fresh budget.
+
+The `deadline` argument instead sets a single total time budget for the whole
+request, starting when the first request is sent and ending once the response
+body has been fully read. Redirects and authentication challenges do not reset
+the budget. When `deadline` is used together with `timeout`, whichever expires
+first takes effect.
+
+```python
+# Using a client instance:
+with httpx.Client() as client:
+    client.get("http://example.com/api/v1/example", deadline=10.0)
+
+# Setting a default deadline on the client:
+client = httpx.Client(deadline=10.0)
+```
+
+If the total deadline is exceeded a `TotalTimeout` exception is raised, and
+the response currently in flight is closed. The exception's `.request`
+attribute holds the original request, while `.last_request` holds the most
+recent request that was actually in flight, which may differ if redirects
+or authentication challenges occurred.
