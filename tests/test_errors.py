@@ -8,9 +8,12 @@ from cattrs._compat import ExceptionGroup
 from cattrs.errors import (
     BaseValidationError,
     ClassValidationError,
+    DuplicatedTagsError,
     ForbiddenExtraKeysError,
     IterableValidationError,
     StructureHandlerNotFoundError,
+    TagNameCollisionError,
+    UnknownTagError,
 )
 
 
@@ -21,6 +24,9 @@ from cattrs.errors import (
         (ForbiddenExtraKeysError, ("Forbidden Message", int, {"foo", "bar"})),
         (ForbiddenExtraKeysError, ("", str, {"foo", "bar"})),
         (ForbiddenExtraKeysError, (None, list, {"foo", "bar"})),
+        (DuplicatedTagsError, ("tag", (int, str))),
+        (TagNameCollisionError, ("_type", int, "_type")),
+        (UnknownTagError, ("tag", int | str, "_type")),
         (
             BaseValidationError,
             ("BaseValidation Message", [ValueError("Test BaseValidation")], int),

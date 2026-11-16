@@ -1,10 +1,17 @@
-from collections import defaultdict
-from typing import Any, Callable, Union
+from typing import Any, Callable, Union, get_origin
 
 from attrs import NOTHING, NothingType
 
 from .. import BaseConverter
-from .._compat import get_newtype_base, is_literal, is_subclass, is_union_type
+from .._compat import (
+    adapted_fields,
+    get_newtype_base,
+    has,
+    is_literal,
+    is_subclass,
+    is_union_type,
+)
+from ..errors import DuplicatedTagsError, TagNameCollisionError, UnknownTagError
 from ..sentinels import is_sentinel
 from ..typealiases import get_type_alias_base, is_type_alias
 
@@ -40,33 +47,73 @@ def configure_tagged_union(
     :param tag_name: The key under which the tag will be set in the
         unstructured payload. By default, `'_type'`.
     :param default: An optional class to be used if the tag information
-        is not present when structuring.
+        is not present when structuring. Note that a tag which is present
+        but unknown is never routed to the default; an
+        :class:`~cattrs.errors.UnknownTagError` is raised instead.
 
     The tagged union strategy currently only works with the dict
     un/structuring base strategy.
+
+    Before any hooks are registered, the configuration is validated, so a failed
+    call never leaves a partially configured converter behind:
+
+    * every union member must produce a distinct tag, otherwise a
+      :class:`~cattrs.errors.DuplicatedTagsError` is raised, and
+    * the tag field name must not collide with a serialized field (its name or
+      alias) of any attrs class or dataclass participating in the union,
+      otherwise a :class:`~cattrs.errors.TagNameCollisionError` is raised.
 
     .. versionadded:: 23.1.0
 
     ..  versionchanged:: 25.1
         Type aliases of unions are now also supported.
+    ..  versionchanged:: NEXT
+        Duplicate tags and tag field name collisions are now reported up front
+        instead of silently overwriting the tag-to-member mapping. A default
+        member now only handles payloads missing the tag; unknown tags raise
+        :class:`~cattrs.errors.UnknownTagError`.
     """
     if is_type_alias(union):
         union = union.__value__
     args = union.__args__
 
-    tag_to_hook = {}
-    exact_cl_unstruct_hooks = {}
-    cl_to_tag = {}
+    # All validation happens before anything is registered on the converter, so
+    # a failure cannot leave a half-configured converter behind.
+    cl_to_tag: dict[type, Any] = {}
+    tag_to_cls: dict[Any, list[type]] = {}
+    for cl in args:
+        tag = tag_generator(cl)
+        cl_to_tag[cl] = tag
+        tag_to_cls.setdefault(tag, []).append(cl)
+
+    # Bidirectional uniqueness: a tag must map to exactly one member and every
+    # member must map to exactly one tag.
+    for tag, classes in tag_to_cls.items():
+        if len(classes) > 1:
+            raise DuplicatedTagsError(tag, classes)
+
+    # The tag field must not shadow a serialized field of a participating
+    # attrs class or dataclass, since the tag would clobber that field in the
+    # unstructured payload (and vice versa when structuring).
+    checked: set[int] = set()
+    members = (*args, default) if default is not NOTHING else args
+    for cl in members:
+        origin = get_origin(cl) or cl
+        if not has(origin) or id(origin) in checked:
+            continue
+        checked.add(id(origin))
+        for attribute in adapted_fields(origin):
+            if tag_name == attribute.name:
+                raise TagNameCollisionError(tag_name, origin, attribute.name)
+            if tag_name == attribute.alias:
+                raise TagNameCollisionError(tag_name, origin, attribute.alias)
+
+    tag_to_hook: dict[Any, Callable] = {}
+    exact_cl_unstruct_hooks: dict[type, Callable] = {}
 
     if default is not NOTHING:
         default_handler = converter.get_structure_hook(default)
 
-        def structure_default(val: dict, _cl=default, _h=default_handler):
-            return _h(val, _cl)
-
-        tag_to_hook = defaultdict(lambda: structure_default)
-        cl_to_tag = defaultdict(lambda: default)
-
         if getattr(converter, "forbid_extra_keys", False):
 
             def structure_tagged_union(
@@ -76,11 +123,17 @@ def configure_tagged_union(
                 _tag_name=tag_name,
                 _dh=default_handler,
                 _default=default,
+                _union=union,
             ) -> union:
-                if _tag_name in val:
-                    val = val.copy()
-                    return _tag_to_hook[val.pop(_tag_name)](val)
-                return _dh(val, _default)
+                if _tag_name not in val:
+                    return _dh(val, _default)
+                tag = val[_tag_name]
+                hook = _tag_to_hook.get(tag)
+                if hook is None:
+                    raise UnknownTagError(tag, _union, _tag_name)
+                val = val.copy()
+                val.pop(_tag_name)
+                return hook(val)
 
         else:
 
@@ -91,26 +144,47 @@ def configure_tagged_union(
                 _tag_name=tag_name,
                 _dh=default_handler,
                 _default=default,
+                _union=union,
             ) -> union:
-                if _tag_name in val:
-                    return _tag_to_hook[val[_tag_name]](val)
-                return _dh(val, _default)
+                if _tag_name not in val:
+                    return _dh(val, _default)
+                tag = val[_tag_name]
+                hook = _tag_to_hook.get(tag)
+                if hook is None:
+                    raise UnknownTagError(tag, _union, _tag_name)
+                return hook(val)
+
+    elif getattr(converter, "forbid_extra_keys", False):
+
+        def structure_tagged_union(
+            val: dict,
+            _,
+            _tag_to_hook=tag_to_hook,
+            _tag_name=tag_name,
+            _union=union,
+        ) -> union:
+            tag = val[_tag_name]
+            hook = _tag_to_hook.get(tag)
+            if hook is None:
+                raise UnknownTagError(tag, _union, _tag_name)
+            val = val.copy()
+            val.pop(_tag_name)
+            return hook(val)
 
     else:
-        if getattr(converter, "forbid_extra_keys", False):
 
-            def structure_tagged_union(
-                val: dict, _, _tag_to_cl=tag_to_hook, _tag_name=tag_name
-            ) -> union:
-                val = val.copy()
-                return _tag_to_cl[val.pop(_tag_name)](val)
-
-        else:
-
-            def structure_tagged_union(
-                val: dict, _, _tag_to_cl=tag_to_hook, _tag_name=tag_name
-            ) -> union:
-                return _tag_to_cl[val[_tag_name]](val)
+        def structure_tagged_union(
+            val: dict,
+            _,
+            _tag_to_hook=tag_to_hook,
+            _tag_name=tag_name,
+            _union=union,
+        ) -> union:
+            tag = val[_tag_name]
+            hook = _tag_to_hook.get(tag)
+            if hook is None:
+                raise UnknownTagError(tag, _union, _tag_name)
+            return hook(val)
 
     def unstructure_tagged_union(
         val: union,
@@ -126,7 +200,7 @@ def configure_tagged_union(
     converter.register_structure_hook(union, structure_tagged_union)
 
     for cl in args:
-        tag = tag_generator(cl)
+        tag = cl_to_tag[cl]
         struct_handler = converter.get_structure_hook(cl)
         unstruct_handler = converter.get_unstructure_hook(cl)
 
@@ -138,7 +212,6 @@ def configure_tagged_union(
 
         tag_to_hook[tag] = structure_union_member
         exact_cl_unstruct_hooks[cl] = unstructure_union_member
-        cl_to_tag[cl] = tag
 
 
 def configure_union_passthrough(

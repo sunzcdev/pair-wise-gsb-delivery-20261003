@@ -13,6 +13,7 @@ Our backwards-compatibility policy can be found [here](https://github.com/python
 
 ## NEXT
 
+- `configure_tagged_union <cattrs.strategies.configure_tagged_union>` now validates its configuration before registering any hooks, so a failed call no longer leaves a half-configured converter. Duplicate tags produced by the `tag_generator` raise `DuplicatedTagsError` (listing the colliding members and tag) instead of silently overwriting the tag-to-member mapping, and a tag field name colliding with a participating class's field name or alias raises `TagNameCollisionError`. A `default` member now only handles payloads missing the tag; payloads with an unknown tag raise `UnknownTagError` instead of falling through to the default. Structuring no longer mutates the caller's payload, and normal round trips are unchanged.
 - Fix the msgspec converter passing typed deques directly to the encoder, which cannot serialize them. Deques are now unstructured into lists, including when nested in attrs classes or dataclasses.
   ([#818](https://github.com/python-attrs/cattrs/issues/818) [#819](https://github.com/python-attrs/cattrs/pull/819))
 

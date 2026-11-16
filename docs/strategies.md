@@ -50,8 +50,12 @@ Here are some common `tag_generator` uses:
 The union members aren't required to be attrs classes or dataclasses, although those work automatically.
 They may be anything that cattrs can un/structure from/to a dictionary, for example a type with registered custom hooks.
 
-A default member can be specified to be used if the tag is missing or is unknown.
+A default member can be specified to be used if the tag is missing.
 This is useful for evolving APIs in a backwards-compatible way; an endpoint taking class `A` can be changed to take `A | B` with `A` as the default (for old clients which do not send the tag).
+A tag that is present but unknown is *not* routed to the default member; instead an {class}`~cattrs.errors.UnknownTagError` is raised.
+
+The configuration is validated before any hooks are installed, so a failed call leaves the converter untouched.
+Every union member must produce a distinct tag (otherwise a {class}`~cattrs.errors.DuplicatedTagsError` is raised), and the tag field name must not collide with a field name or alias of any participating _attrs_ class or dataclass (otherwise a {class}`~cattrs.errors.TagNameCollisionError` is raised).
 
 This strategy only applies in the context of the union; the normal un/structuring hooks are left untouched.
 This also means union members can be reused in multiple unions easily.
@@ -77,6 +81,7 @@ The Apple App Store supports [server callbacks](https://developer.apple.com/docu
 The payload can be interpreted as about a dozen different messages, based on the value of the `notificationType` field.
 
 To keep the example simple we define two classes, one for the `REFUND` event and one for everything else.
+Note the tag field must be distinct from the members' own fields, so we tag the payloads under an additional `_type` key rather than reusing `notificationType`.
 
 ```{testcode} apple
 
@@ -93,7 +98,7 @@ AppleNotification = Refund | OtherAppleNotification
 ```
 
 Next, we use the _tagged unions_ strategy to prepare our converter.
-The tag value for the `Refund` event is `REFUND`, and we can let the `OtherAppleNotification` class handle all the other cases.
+The tag value for the `Refund` event is `REFUND`, and we can let the `OtherAppleNotification` class handle payloads without a tag.
 The `tag_generator` parameter is a callable, so we can give it the `get` method of a dictionary.
 
 ```{doctest} apple
@@ -104,7 +109,6 @@ The `tag_generator` parameter is a callable, so we can give it the `get` method 
 >>> configure_tagged_union(
 ...     AppleNotification,
 ...     c,
-...     tag_name="notificationType",
 ...     tag_generator={Refund: "REFUND"}.get,
 ...     default=OtherAppleNotification
 ... )
@@ -115,7 +119,11 @@ The converter is now ready to start structuring Apple notifications.
 
 ```{doctest} apple
 
->>> payload = {"notificationType": "REFUND", "originalTransactionId": "1"}
+>>> payload = {
+...     "_type": "REFUND",
+...     "notificationType": "REFUND",
+...     "originalTransactionId": "1",
+... }
 >>> notification = c.structure(payload, AppleNotification)
 
 >>> match notification:
@@ -124,6 +132,21 @@ The converter is now ready to start structuring Apple notifications.
 ...     case OtherAppleNotification(not_type):
 ...         print("Can't handle this yet")
 Refund for 1!
+```
+
+Payloads without a tag fall back to the default member, whereas payloads carrying an unknown tag raise instead of being silently treated as the default.
+
+```{doctest} apple
+
+>>> from cattrs.errors import UnknownTagError
+>>> c.structure({"notificationType": "DID_CHANGE_RENEWAL_PREF"}, AppleNotification)
+OtherAppleNotification(notificationType='DID_CHANGE_RENEWAL_PREF')
+
+>>> try:
+...     c.structure({"_type": "MYSTERY", "notificationType": "MYSTERY"}, AppleNotification)
+... except UnknownTagError as e:
+...     print(e.tag)
+MYSTERY
 ```
 
 ```{versionadded} 23.1.0
