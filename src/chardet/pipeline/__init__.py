@@ -21,7 +21,16 @@ HIGH_BYTES: bytes = bytes(range(0x80, 0x100))
 ASCII_TEXT_BYTES: bytes = bytes([0x09, 0x0A, 0x0D, *range(0x20, 0x7F)])
 
 
-class DetectionDict(TypedDict):
+class _DetectionDictOptional(TypedDict, total=False):
+    """Keys a detection dict carries only in specific outcomes."""
+
+    #: The grouped candidates, best first.  Present only when a
+    #: confidence threshold (``min_confidence`` / ``min_confidence_gap``)
+    #: refused the statistical verdict; see :func:`chardet.detect`.
+    candidates: list[DetectionDict]
+
+
+class DetectionDict(_DetectionDictOptional):
     """Dictionary representation of a detection result.
 
     Returned by :func:`chardet.detect`, :func:`chardet.detect_all`,
@@ -40,12 +49,22 @@ class DetectionResult:
 
     Frozen dataclass holding the encoding name, confidence score, and
     optional language identifier returned by the detection pipeline.
+
+    ``statistical`` is provenance metadata: ``True`` when the answer came
+    out of statistical scoring, ``False`` for the definitive stages
+    (BOM, escape, markup, ASCII, UTF-8, UTF-16/32 patterns, magic,
+    binary) and for the empty-input / no-match fallbacks.  The
+    confidence-threshold options (``min_confidence`` /
+    ``min_confidence_gap``) read it to leave non-statistical answers
+    alone.  It is excluded from equality and never appears in
+    :meth:`to_dict`.
     """
 
     encoding: str | None
     confidence: float
     language: str | None
     mime_type: str | None = None
+    statistical: bool = field(default=False, compare=False)
 
     def to_dict(self) -> DetectionDict:
         """Convert this result to a plain dict.

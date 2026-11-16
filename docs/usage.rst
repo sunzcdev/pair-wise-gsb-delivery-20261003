@@ -85,6 +85,42 @@ The constructor accepts the same tuning parameters as :func:`~chardet.detect`:
        max_bytes=50_000,                      # stop buffering after 50 KB
    )
 
+Refusing Uncertain Answers
+--------------------------
+
+An ingestion pipeline that would rather drop a document than decode it
+wrong can set a floor on the statistical verdict with two optional
+parameters of :func:`~chardet.detect` and
+:class:`~chardet.UniversalDetector`:
+
+- ``min_confidence`` — refuse a statistically-detected answer whose
+  confidence is below this value.
+- ``min_confidence_gap`` — refuse the answer when the runner-up
+  *distinct* encoding scores within this margin of the winner.
+  Candidates that decode the examined bytes to the same text (aliases of
+  one codec, or pairs like ISO-8859-1 and Windows-1252 on data without
+  C1 bytes) are grouped before the gap is measured, so one encoding
+  never counts as its own runner-up.
+
+.. code-block:: python
+
+   result = chardet.detect(data, min_confidence=0.5, min_confidence_gap=0.1)
+   if result["encoding"] is None:
+       for candidate in result["candidates"]:
+           print(f"refused: {candidate['encoding']} ({candidate['confidence']:.2f})")
+
+When a threshold refuses the answer, the result is ``{"encoding": None,
+"confidence": 0.0, "language": None, "mime_type": None, "candidates":
+[...]}`` — chardet declines to pick rather than dress a guess up as an
+answer, and ``"candidates"`` holds the grouped alternatives, best first.
+
+The thresholds apply only to statistical scoring.  Definitive evidence
+(BOM, charset declarations, escape sequences, ASCII/UTF-8 structure,
+UTF-16/32 patterns, magic numbers), the empty-input and no-match
+fallbacks, and binary results are returned as they are.  Setting either
+option makes detection score every candidate, so it costs more than the
+default; with both at ``None`` (the default) the result is unchanged.
+
 Encoding Eras
 -------------
 

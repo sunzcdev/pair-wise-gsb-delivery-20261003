@@ -7,7 +7,10 @@ chardet detects the character encoding of a byte string and the language of its 
 ### Result shape
 
 **DetectionResult**:
-A frozen dataclass holding `encoding`, `confidence`, `language`, and `mime_type` for one detection candidate.
+A frozen dataclass holding `encoding`, `confidence`, `language`, and `mime_type` for one detection candidate, plus a `statistical` provenance flag (excluded from equality and `to_dict`) that says whether the answer came out of statistical scoring. The **confidence thresholds** read it.
+
+**Confidence thresholds** (`min_confidence`, `min_confidence_gap`):
+Optional single-verdict options of `detect` and `UniversalDetector`, both default `None`. They refuse a weak *statistical* answer — below the minimum confidence, or with the runner-up **distinct** encoding within the gap — returning `encoding=None` at confidence 0.0 with the grouped alternatives under `"candidates"` instead of a guess dressed up as an answer. Candidates that decode the **examination window** to the same text (aliases, or pairs like ISO-8859-1/Windows-1252 without C1 bytes) are grouped before the gap is measured, so one encoding never counts as its own runner-up. Definitive stages, the empty-input and no-match fallbacks, and binary results are exempt. Setting either option makes detection score every candidate (full ranking).
 
 **Confidence**:
 A score in `[0.0, 1.0]` reflecting how the result was determined: 1.0 for BOM, 0.95 for deterministic stages (escape, markup, ASCII, BOM-less UTF-16/32, binary), 0.80–0.99 for UTF-8 scaled by multi-byte ratio, and lower scores for statistical ranking.

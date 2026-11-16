@@ -51,6 +51,8 @@ class UniversalDetector:
         exclude_encodings: Iterable[str] | None = None,
         no_match_encoding: str = "cp1252",
         empty_input_encoding: str = "utf-8",
+        min_confidence: float | None = None,
+        min_confidence_gap: float | None = None,
     ) -> None:
         """Initialize the detector.
 
@@ -78,6 +80,14 @@ class UniversalDetector:
             survives the pipeline.  Defaults to ``"cp1252"``.
         :param empty_input_encoding: Encoding to return for empty input.
             Defaults to ``"utf-8"``.
+        :param min_confidence: If given, refuse a statistically-detected
+            answer whose confidence is below this value (0.0--1.0).
+        :param min_confidence_gap: If given, refuse a statistically-detected
+            answer when the runner-up distinct encoding scores within this
+            margin of the winner (0.0--1.0).  A refused verdict is
+            ``encoding=None`` at confidence 0.0 with the grouped
+            alternatives under ``"candidates"``.  See :func:`chardet.detect`
+            for details.
         """
         if lang_filter != LanguageFilter.ALL:
             warnings.warn(
@@ -96,6 +106,8 @@ class UniversalDetector:
             exclude_encodings=exclude_encodings,
             no_match_encoding=no_match_encoding,
             empty_input_encoding=empty_input_encoding,
+            min_confidence=min_confidence,
+            min_confidence_gap=min_confidence_gap,
             stacklevel=3,
         )
         self._buffer = bytearray()

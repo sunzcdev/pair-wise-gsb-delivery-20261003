@@ -115,7 +115,7 @@ All detection flows through `run_pipeline()`, which runs stages in order — eac
 
 ### Key Types
 
-- **`DetectionResult`** (`pipeline/__init__.py`) — frozen dataclass: `encoding`, `confidence`, `language`, `mime_type`
+- **`DetectionResult`** (`pipeline/__init__.py`) — frozen dataclass: `encoding`, `confidence`, `language`, `mime_type`, plus a `statistical` provenance flag (excluded from equality and `to_dict`) marking answers that came out of statistical scoring; the confidence-threshold options read it to exempt definitive/fallback results
 - **`EncodingInfo`** (`registry.py`) — frozen dataclass: `name`, `aliases`, `era`, `is_multibyte_cjk`, `languages`, `superset` (the Windows/CP code page that stands in for the encoding, or `None`; markup promotion and dead-heat promotion derive their tables from it, while `output_names.PREFERRED_SUPERSET` stays the frozen `prefer_superset` selection, see ADR-0007)
 - **`EncodingEra`** (`enums.py`) — IntFlag for filtering candidates: `MODERN_WEB`, `LEGACY_ISO`, `LEGACY_MAC`, `LEGACY_REGIONAL`, `DOS`, `MAINFRAME`, `ALL`
 - **`BigramProfile`** (`models/__init__.py`) — pre-computed weighted bigram frequencies, computed once and reused across all candidate models
@@ -126,7 +126,7 @@ Binary file `src/chardet/models/models.bin` — v2 dense zlib-compressed format 
 
 ### Public API (`src/chardet/__init__.py`)
 
-- `detect(byte_str, should_rename_legacy, chunk_size, encoding_era, max_bytes, *, prefer_superset, compat_names, include_encodings, exclude_encodings, no_match_encoding, empty_input_encoding)` → `{"encoding": ..., "confidence": ..., "language": ..., "mime_type": ...}`; the two deprecated positionals come first, so pass `encoding_era` and `max_bytes` by keyword
+- `detect(byte_str, should_rename_legacy, chunk_size, encoding_era, max_bytes, *, prefer_superset, compat_names, include_encodings, exclude_encodings, no_match_encoding, empty_input_encoding, min_confidence, min_confidence_gap)` → `{"encoding": ..., "confidence": ..., "language": ..., "mime_type": ...}`; the two deprecated positionals come first, so pass `encoding_era` and `max_bytes` by keyword. The optional confidence thresholds (`min_confidence`, `min_confidence_gap`, both default `None`) refuse a weak *statistical* verdict instead of returning it: the result is `encoding=None` at confidence 0.0 with the grouped candidates under `"candidates"`. Decode-equivalent candidates (aliases, or pairs like ISO-8859-1/Windows-1252 on a window without C1 bytes) are grouped before the gap is measured; definitive stages, empty input, binary, and the no-match fallback are exempt
 - `detect_all(byte_str, ignore_threshold, ...)` → list of result dicts
 - `UniversalDetector` (`detector.py`) — streaming interface with `feed()`/`close()`/`reset()`
 

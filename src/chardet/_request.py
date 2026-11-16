@@ -44,6 +44,63 @@ def _validate_max_bytes(max_bytes: int) -> None:
         raise ValueError(msg)
 
 
+def _validate_confidence_threshold(value: float | None, name: str) -> float | None:
+    """Validate one optional confidence threshold, or pass ``None`` through."""
+    if value is None:
+        return None
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, (int, float))
+        or not 0.0 <= value <= 1.0
+    ):
+        msg = f"{name} must be a number between 0.0 and 1.0"
+        raise ValueError(msg)
+    return float(value)
+
+
+def _decode_window(window: bytes, encoding: str | None) -> str | None:
+    """Decode *window* under *encoding*, or return ``None`` when that fails."""
+    if encoding is None:
+        return None
+    try:
+        return window.decode(encoding)
+    except (LookupError, UnicodeDecodeError):
+        return None
+
+
+def _group_equivalent(
+    results: list[DetectionResult], window: bytes
+) -> list[list[DetectionResult]]:
+    """Group ranked candidates that are the same encoding for *window*.
+
+    Two candidates share a group when they decode the examined window to
+    the same text — aliases of one codec trivially so, and near-identical
+    pairs such as ISO-8859-1 and Windows-1252 whenever the window holds
+    none of the bytes they map differently.  A candidate whose name
+    cannot decode the window groups only with an exact name match.  The
+    first member of each group is its highest-confidence one, since
+    *results* arrives ranked; the groups are ordered the same way.
+    """
+    groups: list[list[DetectionResult]] = []
+    texts: list[str | None] = []  # each group's leader's decode of the window
+    for result in results:
+        text = _decode_window(window, result.encoding)
+        for group, leader_text in zip(groups, texts, strict=True):
+            same_text = text is not None and text == leader_text
+            same_failure = (
+                text is None
+                and leader_text is None
+                and result.encoding == group[0].encoding
+            )
+            if same_text or same_failure:
+                group.append(result)
+                break
+        else:
+            groups.append([result])
+            texts.append(text)
+    return groups
+
+
 def _resolve_prefer_superset(
     *, should_rename_legacy: bool, prefer_superset: bool, stacklevel: int = 3
 ) -> bool:
@@ -74,6 +131,13 @@ class DetectionRequest:
     exclude_encodings: frozenset[str] | None = None
     no_match_encoding: str = "cp1252"
     empty_input_encoding: str = "utf-8"
+    min_confidence: float | None = None
+    min_confidence_gap: float | None = None
+
+    @property
+    def _has_confidence_thresholds(self) -> bool:
+        """Whether either confidence threshold option is set."""
+        return self.min_confidence is not None or self.min_confidence_gap is not None
 
     @classmethod
     def resolve(  # noqa: PLR0913
@@ -89,6 +153,8 @@ class DetectionRequest:
         exclude_encodings: Iterable[str] | None = None,
         no_match_encoding: str = "cp1252",
         empty_input_encoding: str = "utf-8",
+        min_confidence: float | None = None,
+        min_confidence_gap: float | None = None,
         stacklevel: int = 2,
     ) -> DetectionRequest:
         """Validate the public options and resolve them into a request.
@@ -101,8 +167,9 @@ class DetectionRequest:
             :func:`warnings.warn` counts it from the caller of this method:
             ``2`` is that caller, ``3`` the caller's caller (what a public
             function passes so the warning names the user's line).
-        :raises ValueError: If *max_bytes* is not a positive integer or an
-            encoding name is unknown.
+        :raises ValueError: If *max_bytes* is not a positive integer, an
+            encoding name is unknown, or a confidence threshold is not a
+            number between 0.0 and 1.0.
         """
         # Each helper adds its own frame, hence the +1.
         _warn_deprecated_chunk_size(chunk_size, stacklevel=stacklevel + 1)
@@ -129,6 +196,12 @@ class DetectionRequest:
             empty_input_encoding=_validate_encoding(
                 empty_input_encoding, "empty_input_encoding"
             ),
+            min_confidence=_validate_confidence_threshold(
+                min_confidence, "min_confidence"
+            ),
+            min_confidence_gap=_validate_confidence_threshold(
+                min_confidence_gap, "min_confidence_gap"
+            ),
         )
 
     def run(
@@ -143,6 +216,10 @@ class DetectionRequest:
         :param data: The caller's bytes; the pipeline examines at most
             :attr:`max_bytes` of them.
         :param full_ranking: Rank every candidate, as ``detect_all`` needs.
+            The confidence thresholds need it too: the gap is measured
+            against the second *distinct* encoding, which the pruned
+            ranking does not guarantee, and a refused verdict lists the
+            full candidate set.
         :param input_truncated: *data* is already a cut-off view of the
             caller's input (``UniversalDetector`` caps its buffer).
         :returns: The ranked results, best first.
@@ -155,7 +232,7 @@ class DetectionRequest:
             exclude_encodings=self.exclude_encodings,
             no_match_encoding=self.no_match_encoding,
             empty_input_encoding=self.empty_input_encoding,
-            full_ranking=full_ranking,
+            full_ranking=full_ranking or self._has_confidence_thresholds,
             input_truncated=input_truncated,
         )
 
@@ -182,12 +259,15 @@ class DetectionRequest:
             :func:`chardet.detect_all` reports it: drop results at or below
             :data:`~chardet.MINIMUM_THRESHOLD` unless that leaves nothing,
             sort by confidence, and list each name once.  When ``False``,
-            render only the top result.
+            render only the top result, subject to the confidence
+            thresholds when they are set.
         :param ignore_threshold: With *all_results*, keep the results at or
             below the threshold too.
         :returns: The rendered dicts, best first.
         """
         if not all_results:
+            if self._has_confidence_thresholds and results[0].statistical:
+                return [self._render_verdict(results, window)]
             return [self._render_one(results[0].to_dict(), window)]
         dicts = [r.to_dict() for r in results]
         if not ignore_threshold:
@@ -195,6 +275,41 @@ class DetectionRequest:
             if filtered:
                 dicts = filtered
         return self._rank_unique([self._render_one(d, window) for d in dicts])
+
+    def _render_verdict(
+        self, results: list[DetectionResult], window: bytes
+    ) -> DetectionDict:
+        """Apply the confidence thresholds to a statistical ranking.
+
+        The top answer stands when it clears every threshold the request
+        sets.  Otherwise the verdict is uncertain: ``encoding=None`` at
+        confidence 0.0, with the grouped candidates attached under
+        ``"candidates"`` — chardet declines to pick rather than dress a
+        guess up as an answer.  The gap is measured between groups of
+        equivalent candidates (see :func:`_group_equivalent`), so one
+        encoding under two names never counts as its own runner-up.
+        """
+        groups = _group_equivalent(results, window)
+        top = groups[0][0].confidence
+        if self.min_confidence is not None and top < self.min_confidence:
+            uncertain = True
+        elif self.min_confidence_gap is not None:
+            second = groups[1][0].confidence if len(groups) > 1 else 0.0
+            uncertain = top - second < self.min_confidence_gap
+        else:
+            uncertain = False
+        if not uncertain:
+            return self._render_one(results[0].to_dict(), window)
+        candidates = self._rank_unique(
+            [self._render_one(group[0].to_dict(), window) for group in groups]
+        )
+        return {
+            "encoding": None,
+            "confidence": 0.0,
+            "language": None,
+            "mime_type": None,
+            "candidates": candidates,
+        }
 
     def _render_one(self, d: DetectionDict, window: bytes) -> DetectionDict:
         """Apply the output remaps to one result dict, in place."""

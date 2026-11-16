@@ -59,6 +59,8 @@ def detect(  # noqa: PLR0913
     exclude_encodings: Iterable[str] | None = None,
     no_match_encoding: str = "cp1252",
     empty_input_encoding: str = "utf-8",
+    min_confidence: float | None = None,
+    min_confidence_gap: float | None = None,
 ) -> DetectionDict:
     """Detect the encoding of the given byte string.
 
@@ -99,8 +101,34 @@ def detect(  # noqa: PLR0913
         against the data: it is the caller's sentinel for "nothing fit".
     :param empty_input_encoding: Encoding to return for empty input.  Defaults
         to ``"utf-8"``.
+    :param min_confidence: If given, refuse a statistically-detected answer
+        whose confidence is below this value (0.0--1.0).  See the note below.
+    :param min_confidence_gap: If given, refuse a statistically-detected
+        answer when the runner-up *distinct* encoding scores within this
+        margin of the winner (0.0--1.0).  Candidates that decode the
+        examined bytes to the same text --- aliases of one codec, or pairs
+        like ISO-8859-1 and Windows-1252 on data without C1 bytes --- are
+        grouped before the gap is measured, so one encoding never counts
+        as its own runner-up.  See the note below.
     :returns: A dictionary with keys ``"encoding"``, ``"confidence"``,
         ``"language"``, and ``"mime_type"``.
+
+    .. note::
+
+        The confidence thresholds apply only to answers produced by
+        statistical scoring.  Definitive evidence (BOM, charset
+        declarations, escape sequences, ASCII/UTF-8 structure, UTF-16/32
+        patterns, magic numbers), the empty-input and no-match fallbacks,
+        and binary results are returned as they are.  When a threshold
+        refuses the statistical answer, the result is
+        ``{"encoding": None, "confidence": 0.0, "language": None,
+        "mime_type": None, "candidates": [...]}`` — chardet declines to
+        pick rather than dress a guess up as an answer, and
+        ``"candidates"`` holds the grouped alternatives, best first.
+        Setting either option makes detection score every candidate, so
+        it costs more than the default.  With both options at ``None``
+        (the default), the result is exactly what chardet has always
+        returned.
     """
     request = DetectionRequest.resolve(
         should_rename_legacy=should_rename_legacy,
@@ -113,6 +141,8 @@ def detect(  # noqa: PLR0913
         exclude_encodings=exclude_encodings,
         no_match_encoding=no_match_encoding,
         empty_input_encoding=empty_input_encoding,
+        min_confidence=min_confidence,
+        min_confidence_gap=min_confidence_gap,
         stacklevel=3,
     )
     data = byte_str if isinstance(byte_str, bytes) else bytes(byte_str)

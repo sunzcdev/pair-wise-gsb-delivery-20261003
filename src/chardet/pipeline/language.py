@@ -139,6 +139,12 @@ def fill_languages(
             filled.append(result)
         else:
             filled.append(
-                DetectionResult(encoding, result.confidence, lang, result.mime_type)
+                DetectionResult(
+                    encoding,
+                    result.confidence,
+                    lang,
+                    result.mime_type,
+                    result.statistical,
+                )
             )
     return filled

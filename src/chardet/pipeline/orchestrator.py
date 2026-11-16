@@ -261,7 +261,26 @@ def _with_default_mime(result: DetectionResult) -> DetectionResult:
     if result.mime_type is not None:
         return result
     mime = "text/plain" if result.encoding is not None else "application/octet-stream"
-    return DetectionResult(result.encoding, result.confidence, result.language, mime)
+    return DetectionResult(
+        result.encoding, result.confidence, result.language, mime, result.statistical
+    )
+
+
+def _tag_statistical(results: list[DetectionResult]) -> list[DetectionResult]:
+    """Mark a ranking produced by statistical scoring as statistical.
+
+    The confidence-threshold options (``min_confidence`` /
+    ``min_confidence_gap``) refuse only statistical answers; definitive
+    stage results, the empty-input and no-match fallbacks, and binary
+    results stand on their own.  Tagging happens at the two statistical
+    exits, after post-processing, so the rank corrections' reconstructions
+    need no knowledge of the flag; the past-cap validity hold either
+    returns these same objects or substitutes the untagged fallback.
+    """
+    return [
+        DetectionResult(r.encoding, r.confidence, r.language, r.mime_type, True)
+        for r in results
+    ]
 
 
 def _run_pipeline_core(  # noqa: PLR0913, PLR0915
@@ -456,7 +475,11 @@ def _run_pipeline_core(  # noqa: PLR0913, PLR0915
                     evidence, results, input_truncated=evidence_truncated
                 )
                 return _hold_validity_past_cap(
-                    data, evidence, results, allowed, no_match_encoding
+                    data,
+                    evidence,
+                    _tag_statistical(results),
+                    allowed,
+                    no_match_encoding,
                 )
 
     # Stage 3: Statistical scoring for all remaining candidates.
@@ -472,7 +495,9 @@ def _run_pipeline_core(  # noqa: PLR0913, PLR0915
     # Rank corrections reason about the same evidence window the ranking
     # came from, which also bounds their byte-presence scans.
     results = postprocess_results(evidence, results, input_truncated=evidence_truncated)
-    return _hold_validity_past_cap(data, evidence, results, allowed, no_match_encoding)
+    return _hold_validity_past_cap(
+        data, evidence, _tag_statistical(results), allowed, no_match_encoding
+    )
 
 
 def run_pipeline(  # noqa: PLR0913
@@ -526,7 +551,7 @@ def run_pipeline(  # noqa: PLR0913
     # for "no linguistic content").  Kept internal so language fill does not
     # overwrite it; callers see language=None.
     results = [
-        DetectionResult(r.encoding, r.confidence, None, r.mime_type)
+        DetectionResult(r.encoding, r.confidence, None, r.mime_type, r.statistical)
         if r.language == "zxx"
         else r
         for r in results
@@ -539,7 +564,9 @@ def run_pipeline(  # noqa: PLR0913
     # stages may boost confidence above 1.0 for ranking purposes (e.g.
     # CJK byte-coverage boost), but callers expect a probability-like value.
     return [
-        DetectionResult(r.encoding, min(r.confidence, 1.0), r.language, r.mime_type)
+        DetectionResult(
+            r.encoding, min(r.confidence, 1.0), r.language, r.mime_type, r.statistical
+        )
         if r.confidence > 1.0
         else r
         for r in results

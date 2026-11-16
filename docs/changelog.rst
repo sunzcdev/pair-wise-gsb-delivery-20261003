@@ -13,6 +13,22 @@ Unreleased
 
 **Features:**
 
+- ``detect()`` and ``UniversalDetector`` accept two new optional
+  thresholds, ``min_confidence`` and ``min_confidence_gap``.  When a
+  statistically-detected answer falls below the minimum confidence, or
+  the runner-up distinct encoding scores within the gap of the winner,
+  the result is an honest "uncertain" verdict — ``encoding=None`` at
+  confidence 0.0 with the grouped alternatives under ``"candidates"`` —
+  instead of a guess dressed up as an answer.  Candidates that decode
+  the examined bytes to the same text (aliases, or pairs like
+  ISO-8859-1/Windows-1252 without C1 bytes) are grouped before the gap
+  is measured, so one encoding never counts as its own runner-up.
+  Definitive evidence (BOM, declarations, escape sequences, ASCII/UTF-8
+  structure, UTF-16/32 patterns, magic numbers), the empty-input and
+  no-match fallbacks, and binary results are exempt.  With both options
+  at their ``None`` default, results are unchanged.
+  (`GSB Harness <https://github.com/sunzcdev>`_ via Claude)
+
 - ``chardetect`` has two new flags.  ``--prefer-superset`` reports a
   detected subset encoding under its Windows code page, like
   ``Windows-1253`` for ISO-8859-7 text, the same as
