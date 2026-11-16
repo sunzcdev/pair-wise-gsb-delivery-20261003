@@ -23,6 +23,12 @@ from jsonschema.validators import (
     Draft202012Validator,
     validate,
 )
+from jsonschema.walker import (
+    ReferenceEdge,
+    SchemaNode,
+    SchemaWalker,
+    walk,
+)
 
 
 def __getattr__(name):
@@ -120,8 +126,12 @@ __all__ = [
     "Draft201909Validator",
     "Draft202012Validator",
     "FormatChecker",
+    "ReferenceEdge",
     "SchemaError",
+    "SchemaNode",
+    "SchemaWalker",
     "TypeChecker",
     "ValidationError",
     "validate",
+    "walk",
 ]
