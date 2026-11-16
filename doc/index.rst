@@ -154,6 +154,20 @@ calling code. That means no ``.close()`` is needed there::
   with jsonlines.open('input.jsonl') as reader:
       ...
 
+Archives consisting of multiple concatenated gzip ``.jsonl.gz``
+fragments, as produced by some data collection pipelines, can be read
+using :py:func:`jsonlines.open_gzip_archive()`, which decompresses one
+gzip member at a time and returns a regular :py:class:`Reader`::
+
+  with jsonlines.open_gzip_archive('input.jsonl.gz') as reader:
+      for obj in reader:
+          ...
+
+A corrupt or truncated gzip member raises
+:py:exc:`jsonlines.InvalidArchiveError`, which reports the member index
+and the number of lines already delivered, and is never silently
+skipped by ``skip_invalid=True``.
+
 This should be enough to get started. See the API docs below for
 more details.
 
@@ -162,6 +176,8 @@ API
 ===
 
 .. autofunction:: jsonlines.open
+
+.. autofunction:: jsonlines.open_gzip_archive
 
 .. autoclass:: jsonlines.Reader
    :members:
@@ -175,6 +191,9 @@ API
    :members:
 
 .. autoclass:: jsonlines.InvalidLineError
+   :members:
+
+.. autoclass:: jsonlines.InvalidArchiveError
    :members:
 
 

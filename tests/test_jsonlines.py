@@ -6,7 +6,9 @@ import codecs
 import collections
 import io
 import json
+import os
 import tempfile
+import zlib
 
 import jsonlines
 import pytest
@@ -311,3 +313,137 @@ def test_single_char_stripping() -> None:
     Sanity check that a helper constant actually contains single-char strings.
     """
     assert all(len(s) == 1 for s in jsonlines.jsonlines.SKIPPABLE_SINGLE_INITIAL_CHARS)
+
+def gzip_member(data: bytes) -> bytes:
+    compressor = zlib.compressobj(9, zlib.DEFLATED, 16 | zlib.MAX_WBITS)
+    return compressor.compress(data) + compressor.flush()
+
+
+def test_open_gzip_archive_single_member() -> None:
+    fp = io.BytesIO(gzip_member(b'{"a": 1}\n{"b": 2}\n'))
+    with jsonlines.open_gzip_archive(fp) as reader:
+        assert list(reader) == [{"a": 1}, {"b": 2}]
+
+
+def test_open_gzip_archive_concatenated_members() -> None:
+    archive = gzip_member(b"1\n2\n") + gzip_member(b"3\n") + gzip_member(b"4\n5\n")
+    fp = io.BytesIO(archive)
+    with jsonlines.open_gzip_archive(fp) as reader:
+        assert list(reader) == [1, 2, 3, 4, 5]
+
+
+def test_open_gzip_archive_member_boundary_is_not_a_line_break() -> None:
+    # The last line of a member is continued by the next member.
+    archive = gzip_member(b'{"a":') + gzip_member(b" 1}\n") + gzip_member(b'{"b": 2}\n')
+    fp = io.BytesIO(archive)
+    with jsonlines.open_gzip_archive(fp) as reader:
+        assert list(reader) == [{"a": 1}, {"b": 2}]
+
+
+def test_open_gzip_archive_final_line_without_newline() -> None:
+    fp = io.BytesIO(gzip_member(b"1\n2"))
+    with jsonlines.open_gzip_archive(fp) as reader:
+        assert list(reader) == [1, 2]
+
+
+def test_open_gzip_archive_empty() -> None:
+    fp = io.BytesIO(b"")
+    with jsonlines.open_gzip_archive(fp) as reader:
+        assert list(reader) == []
+
+
+def test_open_gzip_archive_reader_semantics() -> None:
+    # The returned reader behaves like any other jsonlines.Reader.
+    archive = gzip_member(b"1\n\nnonsense\n2\n")
+    fp = io.BytesIO(archive)
+    with jsonlines.open_gzip_archive(fp) as reader:
+        assert list(reader.iter(skip_empty=True, skip_invalid=True)) == [1, 2]
+    fp = io.BytesIO(gzip_member(b"{}\n"))
+    with jsonlines.open_gzip_archive(fp) as reader:
+        assert reader.read(type=dict) == {}
+        with pytest.raises(EOFError):
+            reader.read()
+
+
+def test_open_gzip_archive_corrupt_member() -> None:
+    archive = gzip_member(b"1\n2\n") + gzip_member(b"3\n") + b"not a gzip member"
+    fp = io.BytesIO(archive)
+    with jsonlines.open_gzip_archive(fp) as reader:
+        with pytest.raises(jsonlines.InvalidArchiveError) as excinfo:
+            list(reader.iter(skip_invalid=True))
+    exc = excinfo.value
+    assert exc.member_index == 2
+    assert exc.lines_read == 3
+    assert isinstance(exc, jsonlines.Error)
+    assert not isinstance(exc, jsonlines.InvalidLineError)
+
+
+def test_open_gzip_archive_corrupt_member_midway() -> None:
+    good = gzip_member(b"1\n")
+    corrupt = bytearray(gzip_member(b"2\n3\n"))
+    corrupt[-8:-4] = b"\xff\xff\xff\xff"  # corrupt the crc32
+    fp = io.BytesIO(good + bytes(corrupt))
+    with jsonlines.open_gzip_archive(fp) as reader:
+        with pytest.raises(jsonlines.InvalidArchiveError) as excinfo:
+            list(reader)
+    assert excinfo.value.member_index == 1
+
+
+def test_open_gzip_archive_truncated_member() -> None:
+    # The second member is missing its gzip trailer, so all of its
+    # content lines are still delivered before the truncation error.
+    archive = gzip_member(b"1\n") + gzip_member(b"2\n3\n")[:15]
+    fp = io.BytesIO(archive)
+    with jsonlines.open_gzip_archive(fp) as reader:
+        with pytest.raises(jsonlines.InvalidArchiveError) as excinfo:
+            list(reader.iter(skip_invalid=True))
+    exc = excinfo.value
+    assert exc.member_index == 1
+    assert exc.lines_read == 3
+    assert "truncated" in str(exc)
+
+
+def test_open_gzip_archive_not_gzip_at_all() -> None:
+    fp = io.BytesIO(b"1\n2\n")
+    with jsonlines.open_gzip_archive(fp) as reader:
+        with pytest.raises(jsonlines.InvalidArchiveError) as excinfo:
+            list(reader)
+    assert excinfo.value.member_index == 0
+    assert excinfo.value.lines_read == 0
+
+
+def test_open_gzip_archive_by_filename(tmp_path) -> None:
+    path = tmp_path / "archive.jsonl.gz"
+    path.write_bytes(gzip_member(b"1\n") + gzip_member(b"2\n"))
+    with jsonlines.open_gzip_archive(str(path)) as reader:
+        assert list(reader) == [1, 2]
+    assert reader._fp.closed
+
+
+def test_open_gzip_archive_custom_loads() -> None:
+    fp = io.BytesIO(gzip_member(b'"a"\n'))
+    loads = lambda s: json.loads(s).upper()  # noqa: E731
+    with jsonlines.open_gzip_archive(fp, loads=loads) as reader:
+        assert list(reader) == ["A"]
+
+
+def test_open_gzip_archive_incremental_decompression() -> None:
+    # Decompression must happen lazily, without reading the whole
+    # archive up front. Use incompressible data so that the compressed
+    # size exceeds the read chunk size.
+    reads = []
+
+    class TrackingReader(io.BytesIO):
+        def read(self, n=-1):
+            data = super().read(n)
+            reads.append(len(data))
+            return data
+
+    archive = gzip_member(os.urandom(128 * 1024)) + gzip_member(b"2\n")
+    fp = TrackingReader(archive)
+    it = jsonlines.jsonlines._iter_gzip_archive_lines(fp)
+    next(it)
+    assert sum(reads) < len(archive)  # second member not read yet
+    # The first member's final partial line is continued by the second
+    # member, so the last line ends with the second member's content.
+    assert list(it)[-1].endswith(b"2\n")

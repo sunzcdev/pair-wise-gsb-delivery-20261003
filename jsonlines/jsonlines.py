@@ -10,6 +10,7 @@ import json
 import os
 import types
 import typing
+import zlib
 from typing import (
     Any,
     Callable,
@@ -136,6 +137,37 @@ class InvalidLineError(Error, ValueError):
         self.line = line.rstrip()
         self.lineno = lineno
         super().__init__(f"{message} (line {lineno})")
+
+
+@attr.s(auto_exc=True, auto_attribs=True, init=False)
+class InvalidArchiveError(Error):
+    """
+    Error raised when a gzip member in a concatenated archive is
+    corrupt or truncated.
+
+    This is a structural archive error, not a line-level error, so it
+    is deliberately *not* a subclass of :py:exc:`InvalidLineError` and
+    will never be silently skipped by ``skip_invalid=True``.
+
+    The 0-based index of the offending gzip member is stored on the
+    exception instance as the ``.member_index`` attribute, and the
+    number of lines already delivered to the caller as ``.lines_read``.
+
+    This class subclasses :py:exc:`jsonlines.Error`.
+    """
+
+    #: The 0-based index of the corrupt or truncated gzip member
+    member_index: int
+
+    #: The number of lines delivered before the error was encountered
+    lines_read: int
+
+    def __init__(self, message: str, member_index: int, lines_read: int) -> None:
+        self.member_index = member_index
+        self.lines_read = lines_read
+        super().__init__(
+            f"{message} (member {member_index}, after {lines_read} lines)"
+        )
 
 
 @attr.s(auto_attribs=True, repr=False)
@@ -652,6 +684,117 @@ def open(
     instance: Union[Reader, Writer] = cls(fp, **kwargs)
     instance._should_close_fp = True
     return instance
+
+
+def _iter_gzip_archive_lines(
+    fp: typing.IO[bytes], chunk_size: int = 64 * 1024
+) -> Iterator[bytes]:
+    """
+    Yield lines from a stream of concatenated gzip members.
+
+    Members are decompressed one at a time, without ever holding the
+    whole decompressed archive in memory. A member boundary is not a
+    line boundary: a trailing partial line at the end of a member is
+    continued by the decompressed data of the next member.
+
+    Corrupt or truncated members raise :py:exc:`InvalidArchiveError`.
+    """
+    member_index = 0
+    lines_read = 0
+    buffer = b""
+    decompressor = zlib.decompressobj(wbits=16 | zlib.MAX_WBITS)
+    member_has_data = False
+
+    while True:
+        data = fp.read(chunk_size)
+        if not data:
+            break
+        while data:
+            member_has_data = True
+            try:
+                chunk = decompressor.decompress(data)
+            except zlib.error as exc:
+                raise InvalidArchiveError(
+                    f"gzip member is corrupt: {exc}", member_index, lines_read
+                ) from exc
+            buffer += chunk
+            if decompressor.eof:
+                # End of a member; continue with the next one. Note that
+                # this does not terminate any partially buffered line.
+                data = decompressor.unused_data
+                member_index += 1
+                decompressor = zlib.decompressobj(wbits=16 | zlib.MAX_WBITS)
+                member_has_data = False
+            else:
+                data = b""
+            parts = buffer.split(b"\n")
+            buffer = parts.pop()
+            for part in parts:
+                lines_read += 1
+                yield part + b"\n"
+
+    if member_has_data and not decompressor.eof:
+        raise InvalidArchiveError(
+            "archive is truncated: gzip member is incomplete",
+            member_index,
+            lines_read,
+        )
+    if buffer:
+        # Final line without a trailing newline.
+        lines_read += 1
+        yield buffer
+
+
+def open_gzip_archive(
+    file: Union[Openable, typing.IO[bytes]],
+    *,
+    loads: Optional[LoadsCallable] = None,
+) -> Reader:
+    """
+    Open a concatenated gzip archive of jsonlines data for reading.
+
+    Some archival pipelines produce a single stream by concatenating
+    multiple gzip ``.jsonl.gz`` fragments. This function reads such an
+    archive by decompressing one gzip member at a time, and returns a
+    regular :py:class:`Reader` with the usual record semantics
+    (``.read()``, ``.iter()``, type checks, ``skip_empty``, and so on).
+
+    A member boundary is not treated as a line break: if a member ends
+    in the middle of a line, that line is continued by the decompressed
+    data of the next member.
+
+    Decompression is incremental; the archive is never decompressed in
+    its entirety up front.
+
+    A corrupt or truncated gzip member raises
+    :py:exc:`InvalidArchiveError`, reporting the 0-based member index
+    and the number of lines already delivered. This error is not an
+    :py:exc:`InvalidLineError`, so it is never silently skipped when
+    using ``skip_invalid=True``.
+
+    The `file` argument can be a file name or ‘path-like object’, which
+    will be opened in binary mode and closed when the returned reader
+    is closed, or an already opened binary file-like object, which the
+    caller remains responsible for closing.
+
+    :param file: name, ‘path-like object’, or binary file-like object
+        of the archive to read
+    :param loads: custom json decoder callable
+    """
+    should_close_fp = False
+    if isinstance(file, (str, bytes, int, os.PathLike)):
+        fp = builtins.open(file, mode="rb")
+        should_close_fp = True
+    else:
+        fp = file
+    kwargs = {}
+    if loads is not None:
+        kwargs["loads"] = loads
+    reader = Reader(_iter_gzip_archive_lines(fp), **kwargs)
+    if should_close_fp:
+        reader._fp = fp
+        reader._should_close_fp = True
+    return reader
 
 
 def repr_for_fp(fp: typing.IO[Any]) -> str:
