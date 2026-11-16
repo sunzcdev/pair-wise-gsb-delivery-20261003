@@ -2263,6 +2263,19 @@ class SoupSieve(ct.Immutable):
 
         yield from CSSMatch(self.selectors, tag, self.namespaces, self.flags).select(limit)
 
+    def specificity(self) -> list[tuple[int, int, int]]:
+        """
+        Calculate the specificity of each selector in the compiled selector list.
+
+        Returns a list of `(a, b, c)` tuples — IDs, classes/attributes/pseudo-classes,
+        and types — one per complex selector, in the order the selectors were declared.
+
+        The analysis is static: it only inspects the compiled selectors, never touches
+        a document, and has no effect on how selectors match.
+        """
+
+        return ct.specificity(self.selectors)
+
     def __repr__(self) -> str:  # pragma: no cover
         """Representation."""
 

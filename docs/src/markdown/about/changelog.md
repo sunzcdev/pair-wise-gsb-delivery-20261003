@@ -3,6 +3,14 @@ icon: lucide/scroll-text
 ---
 # Changelog
 
+## 4.2
+
+-   **NEW**: Compiled selectors now provide static specificity information via the new `SoupSieve.specificity()`
+    method, which reports an `(a, b, c)` tuple for each selector in the selector list. `:where()` contributes zero
+    weight, `:is()`, `:not()`, and `:has()` take on the weight of their most specific candidate, and custom
+    pseudo-classes are scored by their expanded semantics. The analysis uses only the compiled selectors and does
+    not change matching behavior.
+
 ## 4.1.1
 
 -   **FIX**: Improve performance of tag name matching, which runs for every element and selector.

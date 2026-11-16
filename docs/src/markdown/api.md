@@ -260,6 +260,27 @@ class SoupSieve:
 
     def iselect(self, tag, limit=0):
         """Iterate the specified tags."""
+
+    def specificity(self):
+        """Calculate the specificity of each selector in the compiled selector list."""
+```
+
+`specificity` statically analyzes the compiled selectors and returns a list of `(a, b, c)` tuples &mdash; ID,
+class/attribute/pseudo-class, and type weights &mdash; one per complex selector, in the order the selectors were
+declared. The analysis uses only the compiled selectors and never touches a document, and it has no effect on how
+selectors match.
+
+-   `#!css :where()` and everything inside it has zero weight.
+-   `#!css :is()`, `#!css :not()`, and `#!css :has()` take on the weight of their most specific candidate, as do
+    custom pseudo-classes and other pseudo-classes that expand to a selector list, which are scored by their actual
+    expanded semantics.
+-   Namespace prefixes and attribute values are not miscounted as extra selectors.
+-   Pseudo-elements are rejected when a pattern is compiled, so no score is ever guessed for them.
+
+```py
+>>> import soupsieve as sv
+>>> sv.compile('div:where(#a), :is(p, #b)').specificity()
+[(0, 0, 1), (1, 0, 0)]
 ```
 
 ## `soupsieve.purge()`

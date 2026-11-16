@@ -16,7 +16,8 @@ __all__ = (
     'SelectorLang',
     'SelectorList',
     'Namespaces',
-    'CustomSelectors'
+    'CustomSelectors',
+    'specificity'
 )
 
 SEL_EMPTY = 0x1
@@ -344,11 +345,12 @@ class SelectorLang(Immutable):
 class SelectorList(Immutable):
     """Selector list."""
 
-    __slots__ = ("selectors", "is_not", "is_html", "count", "_hash")
+    __slots__ = ("selectors", "is_not", "is_html", "is_where", "count", "_hash")
 
     selectors: tuple[Selector | SelectorNull, ...]
     is_not: bool
     is_html: bool
+    is_where: bool
     count: int
 
     def __init__(
@@ -356,6 +358,7 @@ class SelectorList(Immutable):
         selectors: Iterable[Selector | SelectorNull] | None = None,
         is_not: bool = False,
         is_html: bool = False,
+        is_where: bool = False,
         count: int = 0,
     ) -> None:
         """Initialize."""
@@ -364,6 +367,7 @@ class SelectorList(Immutable):
             selectors=tuple(selectors) if selectors is not None else (),
             is_not=is_not,
             is_html=is_html,
+            is_where=is_where,
             count=count
         )
 
@@ -383,10 +387,131 @@ class SelectorList(Immutable):
         return self.selectors[index]
 
 
+# Flags that correspond to actual pseudo-classes and therefore contribute to specificity.
+# The remaining flags are internal matching hints (such as `SEL_DEFAULT`) and add no weight.
+SPECIFICITY_FLAGS = (SEL_ROOT, SEL_EMPTY, SEL_SCOPE, SEL_DEFINED, SEL_DIR_LTR, SEL_DIR_RTL)
+
+
+def _compound_base_specificity(sel: Selector) -> tuple[int, int, int]:
+    """
+    Calculate the specificity of a compound selector, excluding nested selector lists.
+
+    A namespace prefix is simply part of the type selector and adds nothing, and the
+    universal selector `*` (prefixed or not) has no weight. An attribute selector counts
+    once, regardless of whether it matches a value or what that value is.
+    """
+
+    # ID selectors
+    a = len(sel.ids)
+    # Classes, attributes, and pseudo-classes
+    b = len(sel.classes) + len(sel.attributes) + len(sel.contains) + len(sel.lang) + len(sel.nth)
+    # Type selectors
+    c = 0
+
+    if sel.tag is not None and sel.tag.name != '*':
+        c += 1
+
+    for flag in SPECIFICITY_FLAGS:
+        if sel.flags & flag:
+            b += 1
+
+    return a, b, c
+
+
+def _specificity(sel: Selector | SelectorNull) -> tuple[int, int, int]:
+    """
+    Calculate the specificity of a single complex selector.
+
+    Selector structures can nest very deeply, so evaluate them with an explicit stack
+    instead of recursing. Operations are resolved onto a value stack:
+
+    - `complex`: push the specificity of a complex selector (its compound selector
+      plus everything past its combinators).
+    - `list`: push the specificity of a selector list, which is that of its most
+      specific candidate, or zero for `:where()`.
+    - `max`: replace the top `n` values with the largest one.
+    - `sum`: replace the top `n` values with their sum plus the given base.
+    """
+
+    results: list[tuple[int, int, int]] = []
+    stack: list[tuple[Any, ...]] = [('complex', sel)]
+    while stack:
+        op = stack.pop()
+        kind = op[0]
+        if kind == 'complex':
+            current = op[1]
+            if not isinstance(current, Selector):
+                # A "no match" selector, such as a forgiven empty slot, has no weight.
+                results.append((0, 0, 0))
+                continue
+            # Gather the whole combinator chain, summing the specificity of each
+            # compound selector and collecting the nested selector lists on the way.
+            a = b = c = 0
+            nested: list[SelectorList] = []
+            while isinstance(current, Selector):
+                ca, cb, cc = _compound_base_specificity(current)
+                a += ca
+                b += cb
+                c += cc
+                for nth in current.nth:
+                    nested.append(nth.selectors)
+                nested.extend(current.selectors)
+                relation = current.relation
+                current = relation[0] if len(relation) else Null
+            if nested:
+                stack.append(('sum', len(nested), a, b, c))
+                for item in nested:
+                    stack.append(('list', item))
+            else:
+                results.append((a, b, c))
+        elif kind == 'list':
+            lst = op[1]
+            if lst.is_where or not len(lst):
+                results.append((0, 0, 0))
+            else:
+                stack.append(('max', len(lst)))
+                for item in lst:
+                    stack.append(('complex', item))
+        elif kind == 'max':
+            n = op[1]
+            best = max(results[-n:])
+            del results[-n:]
+            results.append(best)
+        else:  # 'sum'
+            _, n, a, b, c = op
+            for ra, rb, rc in results[-n:]:
+                a += ra
+                b += rb
+                c += rc
+            del results[-n:]
+            results.append((a, b, c))
+    return results[-1]
+
+
+def specificity(selectors: SelectorList) -> list[tuple[int, int, int]]:
+    """
+    Calculate the specificity of each complex selector in a selector list.
+
+    Returns a list of `(a, b, c)` tuples (ID, class/attribute/pseudo-class, and type
+    weight), one per complex selector, in the order the selectors were declared.
+
+    The analysis is static and uses only the compiled selectors:
+
+    - `:where()` and everything inside it has zero weight.
+    - `:is()`, `:not()`, and `:has()` take on the weight of their most specific
+      candidate, as do custom pseudo-classes and other pseudo-classes that expand
+      to a selector list, which are scored by their actual expanded semantics.
+    - Namespace prefixes and attribute values are not miscounted as extra selectors.
+    - Pseudo-elements are rejected when a pattern is compiled, so no score is ever
+      guessed for them.
+    """
+
+    return [_specificity(sel) for sel in selectors]
+
+
 KT = TypeVar('KT')
 VT = TypeVar('VT')
 RT = TypeVar('RT')
-
 
 class ImmutableDict(Mapping[KT, VT]):
     """Hashable, immutable dictionary."""

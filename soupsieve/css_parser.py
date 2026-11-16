@@ -250,6 +250,7 @@ FLG_PLACEHOLDER_SHOWN = 0x200
 FLG_FORGIVE = 0x400
 FLG_EDITABLE = 0x800
 FLG_CHECKED = 0x1000
+FLG_WHERE = 0x2000
 
 # Maximum cached patterns to store
 _MAXCACHE = 500
@@ -554,6 +555,7 @@ class _SelectorContext:
         self.is_out_of_range = bool(flags & FLG_OUT_OF_RANGE)
         self.is_placeholder_shown = bool(flags & FLG_PLACEHOLDER_SHOWN)
         self.is_forgive = bool(flags & FLG_FORGIVE)
+        self.is_where = bool(flags & FLG_WHERE)
         self.is_editable = bool(flags & FLG_EDITABLE)
         self.is_checked = bool(flags & FLG_CHECKED)
 
@@ -566,7 +568,8 @@ class _SelectorContext:
 
         for name in (
             'is_pseudo', 'is_open', 'is_relative', 'is_not', 'is_html', 'is_default', 'is_indeterminate',
-            'is_in_range', 'is_out_of_range', 'is_placeholder_shown', 'is_forgive', 'is_editable', 'is_checked'
+            'is_in_range', 'is_out_of_range', 'is_placeholder_shown', 'is_forgive', 'is_where',
+            'is_editable', 'is_checked'
         ):
             if getattr(self, name):
                 print(f'    {name}: True')
@@ -1147,6 +1150,8 @@ class CSSParser:
             flags |= FLG_RELATIVE
         elif name in (':where', ':is'):
             flags |= FLG_FORGIVE
+            if name == ':where':
+                flags |= FLG_WHERE
 
         return self.create_context(flags, index, on_close)
 
@@ -1492,7 +1497,13 @@ class CSSParser:
             selectors[-1].flags = ct.SEL_CHECKED
 
         # Return selector list
-        return ct.SelectorList([s.freeze() for s in selectors], ctx.is_not, ctx.is_html, self.count - ctx.count)
+        return ct.SelectorList(
+            [s.freeze() for s in selectors],
+            ctx.is_not,
+            ctx.is_html,
+            ctx.is_where,
+            self.count - ctx.count
+        )
 
     def selector_iter(self, pattern: str) -> Iterator[tuple[str, Match[str]]]:
         """Iterate selector tokens."""
