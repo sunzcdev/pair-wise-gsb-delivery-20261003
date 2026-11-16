@@ -9,6 +9,7 @@ scheme (`YY.MINOR.MICRO`).
 
 _(unreleased)_
 
+- Added a `preorder` callable to [`iterutils.remap`][iterutils.remap], making pre-order decisions (`REMAP_TRAVERSE`, `REMAP_KEEP`, `REMAP_DROP`) per item before any recursion, so whole subtrees can be pruned or kept atomically without calling `enter`/`visit` on their children
 - Added `key` and `reverse` support to [`listutils.BarrelList.sort`][listutils.BarrelList.sort] ([#550](https://github.com/mahmoud/boltons/pull/550))
 - Added `start` and `stop` support to [`listutils.BarrelList.index`][listutils.BarrelList.index] ([#592](https://github.com/mahmoud/boltons/pull/592))
 - Added timezone suffix support (`Z`, `+HH:MM`, `-HHMM`, optional seconds) to [`timeutils.isoparse`][timeutils.isoparse], returning aware datetimes so aware `isoformat()` output round-trips ([#594](https://github.com/mahmoud/boltons/pull/594))

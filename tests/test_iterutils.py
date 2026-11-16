@@ -13,6 +13,10 @@ from boltons.iterutils import (first,
                                research,
                                default_enter,
                                default_exit,
+                               default_preorder,
+                               REMAP_TRAVERSE,
+                               REMAP_KEEP,
+                               REMAP_DROP,
                                get_path)
 from boltons.namedutils import namedtuple
 
@@ -368,6 +372,159 @@ class TestRemap:
             f.close()  # see #146
             assert remap(x) == x
         return
+
+    def test_preorder_default(self):
+        # the default preorder traverses everything, as before
+        orig = {'a': 1, 'b': {'c': [1, 2, 3]}}
+        assert remap(orig, preorder=default_preorder) == orig
+        # a preorder returning None also traverses
+        assert remap(orig, preorder=lambda p, k, v: None) == orig
+
+    def test_preorder_noncallable(self):
+        with pytest.raises(TypeError):
+            remap([], preorder='test')
+
+    def test_preorder_bad_decision(self):
+        with pytest.raises(TypeError):
+            remap({'a': 1}, preorder=lambda p, k, v: 'maybe')
+
+    def test_preorder_drop_subtree(self):
+        orig = {'user': 'alice',
+                'credentials': {'password': 'abc123', 'hint': 'pet'},
+                'sessions': [{'token': 'xyz', 'credentials': {'password': 'q'}}]}
+
+        def preorder(path, key, value):
+            if key == 'credentials':
+                return REMAP_DROP
+            return REMAP_TRAVERSE
+
+        remapped = remap(orig, preorder=preorder)
+        assert remapped == {'user': 'alice', 'sessions': [{'token': 'xyz'}]}
+
+    def test_preorder_keep_atomic(self):
+        blob = {'raw': [1, 2, {'deep': True}]}
+        orig = {'meta': {'blob': blob}, 'other': [1, 2]}
+
+        def preorder(path, key, value):
+            if key == 'blob':
+                return REMAP_KEEP
+            return REMAP_TRAVERSE
+
+        remapped = remap(orig, preorder=preorder)
+        assert remapped == orig
+        # kept atomically: the very same object, not a remapped copy
+        assert remapped['meta']['blob'] is blob
+        # traversed parts are still copies
+        assert remapped['other'] is not orig['other']
+
+    def test_preorder_pruned_subtree_not_expanded(self):
+        # an items iterator which raises if it is expanded proves the
+        # pruned subtree is never entered, let alone iterated
+        class ExplodingIterator:
+            def __iter__(self):
+                return self
+
+            def __next__(self):
+                raise AssertionError('pruned subtree was expanded')
+
+        entered = []
+        visited = []
+
+        def enter(path, key, value):
+            entered.append((path, key))
+            if key == 'secret':
+                return {}, ExplodingIterator()
+            return default_enter(path, key, value)
+
+        def visit(path, key, value):
+            visited.append((path, key))
+            return key, value
+
+        def preorder(path, key, value):
+            if key == 'secret':
+                return REMAP_DROP
+            return REMAP_TRAVERSE
+
+        orig = {'public': 1, 'secret': {'password': 'abc123'}}
+        remapped = remap(orig, visit=visit, enter=enter, preorder=preorder)
+        assert remapped == {'public': 1}
+        assert ((), 'secret') not in entered
+        assert all(key != 'password' for _path, key in visited)
+
+    def test_preorder_shared_object_per_path(self):
+        # the same object, seen at different paths, can get different
+        # decisions; the identity cache must not override path policy
+        shared = ['shared']
+        orig = {'keep': shared, 'drop': shared, 'traverse': shared}
+
+        def preorder(path, key, value):
+            if key == 'drop':
+                return REMAP_DROP
+            if key == 'keep':
+                return REMAP_KEEP
+            return REMAP_TRAVERSE
+
+        remapped = remap(orig, preorder=preorder)
+        assert set(remapped) == {'keep', 'traverse'}
+        # kept as-is, so it's the original object
+        assert remapped['keep'] is shared
+        # traversed, so it's a remapped copy
+        assert remapped['traverse'] == shared
+        assert remapped['traverse'] is not shared
+
+    def test_preorder_cycle_boundary(self):
+        # a self-referential structure pruned by preorder terminates
+        selfref = [0, 1]
+        selfref.append(selfref)
+        orig = {'data': selfref}
+
+        def preorder(path, key, value):
+            if key == 'data':
+                return REMAP_KEEP
+            return REMAP_TRAVERSE
+
+        remapped = remap(orig, preorder=preorder)
+        assert remapped['data'] is selfref
+
+        # dropping a cyclic subtree also terminates
+        def drop_data(path, key, value):
+            if key == 'data':
+                return REMAP_DROP
+            return REMAP_TRAVERSE
+
+        remapped = remap(orig, preorder=drop_data)
+        assert remapped == {}
+
+        # and traversing a cycle still works as before
+        remapped = remap(orig)
+        assert remapped['data'][:2] == [0, 1]
+        assert remapped['data'][2] is remapped['data']
+
+    def test_preorder_root(self):
+        # keeping the root atomically short-circuits the whole remap
+        orig = {'a': [1, 2, 3]}
+        assert remap(orig, preorder=lambda p, k, v: REMAP_KEEP) is orig
+
+        # dropping the root is an error, there'd be nothing to return
+        with pytest.raises(TypeError):
+            remap(orig, preorder=lambda p, k, v: REMAP_DROP)
+
+    def test_preorder_with_visit_exit(self):
+        # post-order visit/exit rules still apply to traversed items
+        orig = {'a': 1, 'b': {'c': 2}, 'junk': {'d': 3}}
+
+        def preorder(path, key, value):
+            if key == 'junk':
+                return REMAP_DROP
+            return REMAP_TRAVERSE
+
+        def visit(path, key, value):
+            if isinstance(value, int):
+                return key, value * 10
+            return key, value
+
+        remapped = remap(orig, visit=visit, preorder=preorder)
+        assert remapped == {'a': 10, 'b': {'c': 20}}
 
 
 class TestGetPath:

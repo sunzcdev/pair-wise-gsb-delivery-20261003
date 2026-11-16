@@ -53,9 +53,22 @@ try:
     from .typeutils import make_sentinel
     _UNSET = make_sentinel('_UNSET')
     _REMAP_EXIT = make_sentinel('_REMAP_EXIT')
+    REMAP_TRAVERSE = make_sentinel('REMAP_TRAVERSE', var_name='REMAP_TRAVERSE')
+    REMAP_KEEP = make_sentinel('REMAP_KEEP', var_name='REMAP_KEEP')
+    REMAP_DROP = make_sentinel('REMAP_DROP', var_name='REMAP_DROP')
 except ImportError:
     _REMAP_EXIT = object()
     _UNSET = object()
+    REMAP_TRAVERSE = object()
+    REMAP_KEEP = object()
+    REMAP_DROP = object()
+
+# The REMAP_* sentinels above are the pre-order decisions understood by
+# the *preorder* callable of remap():
+#
+#   REMAP_TRAVERSE: continue with the normal enter/visit/exit traversal
+#   REMAP_KEEP:     keep the item as-is, without traversing its children
+#   REMAP_DROP:     drop the item and its whole subtree
 
 
 def is_iterable(obj):
@@ -1101,6 +1114,15 @@ def default_visit(path, key, value):
 _orig_default_visit = default_visit
 
 
+def default_preorder(path, key, value):
+    # print('preorder(%r, %r, %r)' % (path, key, value))
+    return REMAP_TRAVERSE
+
+
+# enable the extreme: monkeypatching iterutils with a different default_preorder
+_orig_default_preorder = default_preorder
+
+
 def default_enter(path, key, value):
     # print('enter(%r, %r)' % (key, value))
     if isinstance(value, (str, bytes)):
@@ -1156,6 +1178,7 @@ def remap(
         enter=default_enter,
         exit=default_exit,
         cache: bool = True,
+        preorder=default_preorder,
         **kwargs,
 ):
     """The remap ("recursive map") function is used to traverse and
@@ -1182,6 +1205,22 @@ def remap(
     See `this remap cookbook`_ for more delicious recipes.
 
     .. _this remap cookbook: http://sedimental.org/remap.html
+
+    When a key alone is enough to decide the fate of a whole branch,
+    use *preorder* to prune before any recursion happens:
+
+    >>> secret = {'password': 'abc123', 'hint': 'a pet name'}
+    >>> doc = {'user': 'alice', 'credentials': secret}
+    >>> def prune(path, key, value):
+    ...     if key == 'credentials':
+    ...         return REMAP_DROP
+    ...     return REMAP_TRAVERSE
+    >>> remap(doc, preorder=prune)
+    {'user': 'alice'}
+
+    The ``'password'`` and ``'hint'`` items were never visited; the
+    whole ``'credentials'`` subtree was skipped as soon as its key was
+    seen.
 
     remap takes four main arguments: the object to traverse and three
     optional callables which determine how the remapped object will be
@@ -1235,13 +1274,41 @@ def remap(
             objects. Uses object identity for the cache. For example
             this is turned off for applications like `research` which
             need to traverse all trees.
+        preorder (callable): This function is called on every item in
+            *root* before any other processing, as soon as the item is
+            reached. It accepts the same three positional arguments as
+            *visit*: *path*, *key*, and *value*, and it returns a
+            pre-order decision for the item:
+
+            * ``REMAP_TRAVERSE`` (or ``None``): proceed with the normal
+              traversal, i.e., the *enter*, *visit*, and *exit*
+              callables. This is the default.
+            * ``REMAP_KEEP``: keep the item as-is, as an atomic
+              value. The item's children are not traversed, and neither
+              *enter* nor *visit* is called on the item or its
+              children. The original object itself, not a copy, is
+              added to the new parent.
+            * ``REMAP_DROP``: drop the item and its whole subtree from
+              the new structure. Again, neither *enter* nor *visit* is
+              called on the item or its children.
+
+            Unlike *enter* and *exit*, which are called once per unique
+            value, *preorder* is called for every occurrence of an
+            item, before the identity cache is consulted. This means a
+            shared object may be dropped at one path and kept or
+            traversed at another. Cycles are still bounded: a
+            self-referential structure kept with ``REMAP_KEEP`` or
+            dropped with ``REMAP_DROP`` is never recursed into, and a
+            traversed one is handled by the usual reference-loop
+            detection.
         reraise_visit (bool): A pragmatic convenience for the *visit*
             callable. When set to ``False``, remap ignores any errors
             raised by the *visit* callback. Items causing exceptions
             are kept. See examples for more details.
         trace (bool): Pass ``trace=True`` to print out the entire
             traversal. Or pass a tuple of ``'visit'``, ``'enter'``,
-            or ``'exit'`` to print only the selected events.
+            ``'exit'``, or ``'preorder'`` to print only the selected
+            events.
 
     remap is designed to cover the majority of cases with just the
     *visit* callable. While passing in multiple callables is very
@@ -1269,15 +1336,18 @@ def remap(
         raise TypeError('enter expected callable, not: %r' % enter)
     if not callable(exit):
         raise TypeError('exit expected callable, not: %r' % exit)
+    if not callable(preorder):
+        raise TypeError('preorder expected callable, not: %r' % preorder)
     reraise_visit = kwargs.pop('reraise_visit', True)
     trace = kwargs.pop('trace', ())
     if trace is True:
-        trace = ('visit', 'enter', 'exit')
+        trace = ('visit', 'enter', 'exit', 'preorder')
     elif isinstance(trace, str):
         trace = (trace,)
     if not isinstance(trace, (tuple, list, set)):
         raise TypeError('trace expected tuple of event names, not: %r' % trace)
     trace_enter, trace_exit, trace_visit = 'enter' in trace, 'exit' in trace, 'visit' in trace
+    trace_preorder = 'preorder' in trace
 
     if kwargs:
         raise TypeError('unexpected keyword arguments: %r' % kwargs.keys())
@@ -1300,32 +1370,63 @@ def remap(
             registry[id_value] = value
             if not new_items_stack:
                 continue
-        elif cache and id_value in registry:
-            value = registry[id_value]
         else:
-            if trace_enter:
-                print(' .. remap enter:', path, '-', key, '-', value)
-            res = enter(path, key, value)
-            if trace_enter:
-                print(' .. remap enter result:', res)
-            try:
-                new_parent, new_items = res
-            except TypeError:
-                # TODO: handle False?
-                raise TypeError('enter should return a tuple of (new_parent,'
-                                ' items_iterator), not: %r' % res)
-            if new_items is not False:
-                # traverse unless False is explicitly passed
-                registry[id_value] = new_parent
-                new_items_stack.append((path, []))
-                if value is not root:
-                    path += (key,)
-                stack.append((_REMAP_EXIT, (key, new_parent, value)))
-                if new_items:
-                    stack.extend(reversed(list(new_items)))
-                if trace_enter:
-                    print(' .. remap stack size now:', len(stack))
+            # Pre-order decision, made per (path, key, value), before
+            # the identity cache is consulted. A shared object may thus
+            # be pruned at one path and traversed at another; the cache
+            # never overrides the per-path decision.
+            if preorder is _orig_default_preorder:
+                # avoid function call overhead by inlining the default
+                decision = REMAP_TRAVERSE
+            else:
+                if trace_preorder:
+                    print(' .. remap preorder:', path, '-', key, '-', value)
+                decision = preorder(path, key, value)
+                if decision is None:
+                    decision = REMAP_TRAVERSE
+                if trace_preorder:
+                    print(' .. remap preorder result:', decision)
+            if decision is REMAP_DROP:
+                # drop the item and its whole subtree; no enter/visit
+                if not new_items_stack:
+                    raise TypeError('preorder cannot drop the root object')
                 continue
+            if decision is REMAP_KEEP:
+                # keep the item as an atomic value; no enter/visit
+                if not new_items_stack:
+                    return value
+                new_items_stack[-1][1].append((key, value))
+                continue
+            if decision is not REMAP_TRAVERSE:
+                raise TypeError('preorder should return REMAP_TRAVERSE,'
+                                ' REMAP_KEEP, or REMAP_DROP, not: %r'
+                                % (decision,))
+            if cache and id_value in registry:
+                value = registry[id_value]
+            else:
+                if trace_enter:
+                    print(' .. remap enter:', path, '-', key, '-', value)
+                res = enter(path, key, value)
+                if trace_enter:
+                    print(' .. remap enter result:', res)
+                try:
+                    new_parent, new_items = res
+                except TypeError:
+                    # TODO: handle False?
+                    raise TypeError('enter should return a tuple of (new_parent,'
+                                    ' items_iterator), not: %r' % res)
+                if new_items is not False:
+                    # traverse unless False is explicitly passed
+                    registry[id_value] = new_parent
+                    new_items_stack.append((path, []))
+                    if value is not root:
+                        path += (key,)
+                    stack.append((_REMAP_EXIT, (key, new_parent, value)))
+                    if new_items:
+                        stack.extend(reversed(list(new_items)))
+                    if trace_enter:
+                        print(' .. remap stack size now:', len(stack))
+                    continue
         if visit is _orig_default_visit:
             # avoid function call overhead by inlining identity operation
             visited_item = (key, value)
