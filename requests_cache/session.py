@@ -2,7 +2,7 @@
 
 from contextlib import contextmanager, nullcontext
 from logging import getLogger
-from threading import RLock, Thread
+from threading import Event, RLock, Thread
 from typing import TYPE_CHECKING, Iterable, Mapping, Optional, Union
 
 from requests import PreparedRequest
@@ -12,6 +12,7 @@ from requests.hooks import dispatch_hook
 from ._utils import get_valid_kwargs, patch_form_boundary
 from .backends import BackendSpecifier, StrOrPath, init_backend
 from .models import AnyResponse, CachedResponse, OriginalResponse
+from .revalidation import CacheRevalidator, RevalidationReport
 from .policy import (
     DEFAULT_CACHE_NAME,
     DEFAULT_IGNORED_PARAMS,
@@ -195,6 +196,7 @@ class CacheMixin(MIXIN_BASE):
         only_if_cached: bool = False,
         refresh: bool = False,
         force_refresh: bool = False,
+        skip_hooks: bool = False,
         **kwargs,
     ) -> AnyResponse:
         """Send a prepared request, with caching. See :py:meth:`requests.Session.send` for base
@@ -209,6 +211,10 @@ class CacheMixin(MIXIN_BASE):
         5. :py:meth:`.BaseCache.get_response`
         6. :py:meth:`requests.Session.send` (if not using a cached response)
         7. :py:meth:`.BaseCache.save_response` (if not using a cached response)
+
+        Args:
+            skip_hooks: Don't dispatch response hooks. Used internally for bulk revalidation,
+                which must not trigger normal cache-hit hooks.
         """
         # Determine which actions to take based on settings and request info
         request.headers = set_request_headers(
@@ -264,7 +270,16 @@ class CacheMixin(MIXIN_BASE):
             self.cache.delete(actions.cache_key)
             return response
 
-        # Dispatch any hooks here, because they are removed during serialization
+        # Dispatch any hooks here, because they are removed during serialization.
+        # Bulk revalidation passes skip_hooks=True, since it must not trigger normal hit hooks.
+        return self._dispatch_response_hooks(request, response, skip_hooks, **kwargs)
+
+    def _dispatch_response_hooks(
+        self, request: PreparedRequest, response: AnyResponse, skip_hooks: bool, **kwargs
+    ) -> AnyResponse:
+        """Dispatch response hooks unless suppressed (e.g. by bulk revalidation)"""
+        if skip_hooks:
+            return response
         return dispatch_hook('response', request.hooks, response, **kwargs)
 
     def _send_and_cache(
@@ -342,6 +357,46 @@ class CacheMixin(MIXIN_BASE):
             return cached_response
         else:
             raise
+
+    def revalidate(
+        self,
+        keys: Optional[Iterable[str]] = None,
+        max_workers: int = 5,
+        cancel_event: Optional[Event] = None,
+        force_refresh: bool = False,
+        timeout: Optional[float] = None,
+    ) -> RevalidationReport:
+        """Actively revalidate cached responses with bounded concurrency.
+
+        A conditional request is sent for each selected cache entity (each ``Vary`` variant has
+        its own cache key and is therefore revalidated separately, even when several variants
+        share a URL). Each entity gets an independent result; one failure never discards the
+        others. Response hooks are not dispatched, and previously cached responses remain
+        readable even if their revalidation fails.
+
+        Args:
+            keys: Cache keys to revalidate. If not provided, every entity in the cache is used.
+            max_workers: Maximum number of revalidation requests in flight at once.
+            cancel_event: When set, no further entities are admitted; in-flight requests are
+                still awaited. Entities not admitted appear as :py:attr:`RevalidationStatus.SKIPPED`
+                in the returned report (see :py:attr:`RevalidationReport.unverified`).
+            force_refresh: Revalidate entities without validators using an unconditional request
+                instead of skipping them.
+            timeout: Optional per-request timeout, forwarded to the underlying transport.
+
+        Returns:
+            A report grouping results into not-modified, updated, invalidated, failed, and
+            skipped entities.
+        """
+        revalidator = CacheRevalidator(
+            cache=self.cache,
+            send=self.send,
+            max_workers=max_workers,
+            cancel_event=cancel_event,
+            force_refresh=force_refresh,
+            request_timeout=timeout,
+        )
+        return revalidator.run(keys)
 
     @contextmanager
     def cache_disabled(self):

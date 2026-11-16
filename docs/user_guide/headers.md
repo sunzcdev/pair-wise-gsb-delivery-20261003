@@ -30,6 +30,43 @@ True
 Also see {ref}`stale-while-revalidate` for a variation of this behavior.
 ```
 
+(bulk-revalidation)=
+## Bulk revalidation
+In addition to revalidating responses one at a time as they are requested, a whole cache (or a
+subset of it) can be proactively revalidated with bounded concurrency via
+{py:meth:`.CachedSession.revalidate`. A conditional request is sent for each cached entity that
+has a validator:
+
+```python
+>>> from threading import Event
+>>> report = session.revalidate(max_workers=4)
+>>> report.counts()
+{'not_modified': 8, 'updated': 1, 'invalidated': 0, 'skipped': 2, 'failed': 0}
+```
+
+Each entity is identified by its cache key, so distinct `Vary` variants of the same URL are
+revalidated separately. Every entity gets an independent result, so one failing request never
+discards the others; the previously cached responses also remain readable after a failure.
+Entities that could not be confirmed with the origin (failures and skips) are available through
+{py:attr}`.RevalidationReport.unverified`:
+
+```python
+>>> for result in report.unverified:
+...     print(result.cache_key, result.status, result.reason or result.error)
+```
+
+Revalidation does not dispatch normal response hooks. It can be cancelled cooperatively by
+passing a {py:class}`threading.Event`; after cancellation no new entities are admitted, while
+requests already in flight are allowed to finish and the remaining entities are reported as
+skipped:
+
+```python
+>>> cancel_event = Event()
+>>> report = session.revalidate(cancel_event=cancel_event)
+>>> # ...from another thread, to stop admitting new entities:
+>>> cancel_event.set()
+```
+
 (cache-control)=
 ## Cache-Control
 `Cache-Control` **request** headers will always be used if present. This is mainly useful if you are

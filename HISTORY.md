@@ -1,6 +1,11 @@
 # History
 
 ## Unreleased
+* Add `CachedSession.revalidate()` and `CacheRevalidator` for active, bounded-concurrency
+  revalidation of cached entities. Each cache entry (including distinct `Vary` variants of a URL)
+  is revalidated independently with a conditional request, returning separate not-modified,
+  updated, invalidated, skipped, and failed results; failures never discard other results,
+  in-flight requests finish after cancellation, and normal response hooks are not dispatched.
 * Fix `ValueError` when a response has an invalid `Expires` date (for example `Expires: garbage`); it is now treated as already expired
 * Fix JSON refresh comparisons for mixed-case `Content-Type` values
 * Keep caller-supplied MongoDB clients open when closing MongoDB or GridFS caches

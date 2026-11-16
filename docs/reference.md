@@ -22,6 +22,7 @@ The following modules include the majority of the API relevant for most users:
 ```{toctree}
 :maxdepth: 2
 modules/requests_cache.session
+modules/requests_cache.revalidation
 modules/requests_cache.patcher
 modules/requests_cache.backends
 modules/requests_cache.models
