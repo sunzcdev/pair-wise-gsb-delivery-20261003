@@ -1188,6 +1188,332 @@ class BucketTests(TestCase):
             self.assertFalse(missing in D)
         self.assertEqual(set(D), {10, 20})
 
+    def test_default_behavior_unchanged(self):
+        # No budget: unbounded caching, no new exceptions, stats say complete
+        iterable = [10, 20, 30, 11, 21, 31, 12, 22, 23, 33]
+        D = mi.bucket(iterable, key=lambda x: 10 * (x // 10))
+        self.assertIsNone(D.cache_budget)
+        self.assertEqual(D.cache_size, 0)
+        self.assertTrue(D.is_complete)
+        self.assertEqual(list(D[10]), [10, 11, 12])
+        self.assertEqual(list(D[30]), [30, 31, 33])
+        self.assertEqual(list(D[20]), [20, 21, 22, 23])
+        self.assertEqual(D.stats['dropped'], 0)
+        self.assertEqual(set(D), {10, 20, 30})
+
+    def test_invalid_budget_and_policy(self):
+        make = lambda **kw: mi.bucket([1], key=lambda x: x, **kw)
+        self.assertRaises(ValueError, make, cache_budget=-1)
+        self.assertRaises(TypeError, make, cache_budget=1.5)
+        self.assertRaises(TypeError, make, cache_budget=True)
+        self.assertRaises(
+            ValueError, make, cache_budget=1, on_overflow='bogus'
+        )
+        make(cache_budget=1, on_overflow=lambda b, k, x: False)
+
+    def test_cache_size_tracks_cached_items(self):
+        D = mi.bucket(
+            [10, 20, 11, 21, 12], key=lambda x: 10 * (x // 10), cache_budget=10
+        )
+        self.assertEqual(D.cache_budget, 10)
+        self.assertEqual(D.cache_size, 0)
+        # Draining one key caches the items of the other keys it scans.
+        self.assertEqual(list(D[10]), [10, 11, 12])
+        self.assertEqual(D.cache_size, 2)
+        self.assertEqual(D.cached_keys(), (20,))
+        self.assertEqual(list(D[20]), [20, 21])
+        self.assertEqual(D.cache_size, 0)
+        self.assertEqual(D.cached_keys(), ())
+        self.assertTrue(D.is_complete)
+
+    def test_budget_raise_reports_item_and_is_bounded(self):
+        D = mi.bucket(range(6), key=lambda x: x % 2, cache_budget=2)
+        with self.assertRaises(mi.BucketOverflowError) as cm:
+            list(D[0])
+        self.assertEqual(cm.exception.budget, 2)
+        self.assertEqual(cm.exception.key, 1)
+        # 0, 2 and 4 matched the requested key; 1 and 3 filled the budget,
+        # so 5 is the item that could not be cached.
+        self.assertEqual(cm.exception.item, 5)
+        # The items that did fit are still there and readable in order.
+        self.assertLessEqual(D.cache_size, 2)
+        self.assertEqual(D.cached_keys(), (1,))
+        # The refused item is reported by the exception and also counted, so
+        # a caller that catches the error still learns that data is missing.
+        self.assertEqual(D.stats['dropped_overflow'], 1)
+        self.assertEqual(D.stats['dropped'], 1)
+        self.assertFalse(D.is_complete)
+
+    def test_budget_bounds_membership_probe(self):
+        # An infinite source plus a budget must not hang a missing-key probe.
+        D = mi.bucket(count(), key=lambda x: x % 2, cache_budget=3)
+        with self.assertRaises(mi.BucketOverflowError):
+            5 in D
+        self.assertLessEqual(D.cache_size, 3)
+
+    def test_budget_policy_drops_and_counts(self):
+        D = mi.bucket(
+            range(6),
+            key=lambda x: x % 2,
+            cache_budget=2,
+            on_overflow=lambda b, k, item: False,
+        )
+        # Matching items still flow through; the first two odd items fill
+        # the budget and every later odd item is dropped and counted.
+        self.assertEqual(list(D[0]), [0, 2, 4])
+        stats = D.stats
+        self.assertEqual(stats['dropped_overflow'], 1)
+        self.assertEqual(stats['dropped'], 1)
+        self.assertFalse(stats['complete'])
+        self.assertFalse(D.is_complete)
+        # The cached odds survive, in their original order.
+        self.assertEqual(list(D[1]), [1, 3])
+        self.assertEqual(D.stats['dropped'], 1)
+
+    def test_budget_policy_can_make_room_by_abandoning(self):
+        def policy(b, key, item):
+            b.abandon(1)
+            return True
+
+        D = mi.bucket(
+            range(6), key=lambda x: x % 2, cache_budget=2, on_overflow=policy
+        )
+        self.assertEqual(list(D[0]), [0, 2, 4])
+        self.assertIn(1, D.stats['abandoned'])
+        self.assertGreater(D.stats['dropped_abandoned'], 0)
+
+    def test_zero_budget_with_policy_drops_every_nonmatching_item(self):
+        D = mi.bucket(
+            range(6),
+            key=lambda x: x % 2,
+            cache_budget=0,
+            on_overflow=lambda b, k, item: False,
+        )
+        # Matching items still flow through directly; nothing is cached.
+        self.assertEqual(list(D[0]), [0, 2, 4])
+        self.assertEqual(D.cache_size, 0)
+        self.assertEqual(D.stats['dropped_overflow'], 3)
+
+    def test_zero_budget_with_raise(self):
+        D = mi.bucket(range(4), key=lambda x: x % 2, cache_budget=0)
+        it = D[0]
+        self.assertEqual(next(it), 0)  # a matching item needs no cache
+        with self.assertRaises(mi.BucketOverflowError):
+            next(it)
+
+    def test_abandon_clears_cached_items_and_counts_them(self):
+        D = mi.bucket([10, 20, 11, 21, 12, 22], key=lambda x: 10 * (x // 10))
+        # Draining key 10 caches every key-20 item behind it.
+        self.assertEqual(list(D[10]), [10, 11, 12])
+        self.assertEqual(D.cache_size, 3)
+        D.abandon(20)
+        self.assertNotIn(20, D.cached_keys())
+        self.assertEqual(D.cache_size, 0)
+        self.assertEqual(D.stats['dropped_abandoned'], 3)
+        self.assertIn(20, D.stats['abandoned'])
+        self.assertFalse(D.is_complete)
+
+    def test_abandon_rejects_later_items(self):
+        # Abandoning before any item is seen: the key never revives, its
+        # later records are rejected and counted, and other keys are intact.
+        D = mi.bucket([10, 20, 11, 21, 12, 22], key=lambda x: 10 * (x // 10))
+        D.abandon(20)
+        self.assertEqual(list(D[10]), [10, 11, 12])
+        self.assertEqual(list(D[20]), [])  # later records were not accepted
+        self.assertEqual(D.stats['dropped_abandoned'], 3)
+        self.assertEqual(D.cache_size, 0)
+        self.assertNotIn(20, D)
+
+    def test_discard_is_alias_for_abandon(self):
+        self.assertIs(mi.bucket.abandon, mi.bucket.discard)
+        D = mi.bucket([1, 2, 3], key=lambda x: x)
+        D.discard(2)
+        self.assertIn(2, D.stats['abandoned'])
+        # Nothing was cached yet, so nothing needed to be dropped.
+        self.assertEqual(D.stats['dropped_abandoned'], 0)
+        # Scanning for key 1 skips key 2's record and caches key 3's.
+        self.assertEqual(list(D[1]), [1])
+        self.assertEqual(D.stats['dropped_abandoned'], 1)
+        self.assertEqual(list(D[3]), [3])
+        self.assertEqual(list(D[2]), [])
+
+    def test_abandon_unseen_key_is_sticky(self):
+        D = mi.bucket([1, 2, 3, 4], key=lambda x: x % 2, cache_budget=5)
+        D.abandon(0)
+        self.assertEqual(list(D[1]), [1, 3])
+        self.assertEqual(D.stats['dropped_abandoned'], 2)  # 2 and 4
+        self.assertEqual(list(D[0]), [])
+        # Abandoning twice does not double-count.
+        D.abandon(0)
+        self.assertEqual(D.stats['dropped_abandoned'], 2)
+
+    def test_active_keys_keep_their_order(self):
+        D = mi.bucket(
+            [10, 20, 11, 21, 12, 22, 13], key=lambda x: 10 * (x // 10)
+        )
+        D.abandon(20)
+        self.assertEqual(list(D[10]), [10, 11, 12, 13])
+
+    def test_contains_of_abandoned_key_does_not_advance_source(self):
+        D = mi.bucket([10, 20, 11], key=lambda x: 10 * (x // 10))
+        D.abandon(20)
+        self.assertNotIn(20, D)
+        # The active key still sees every item, proving the probe of the
+        # abandoned key pulled nothing.
+        self.assertEqual(list(D[10]), [10, 11])
+
+    def test_iteration_does_not_present_dropped_items_as_complete(self):
+        D = mi.bucket(
+            range(6),
+            key=lambda x: x % 2,
+            cache_budget=2,
+            on_overflow=lambda b, k, item: False,
+        )
+        self.assertEqual(list(D[0]), [0, 2, 4])
+        with self.assertRaises(mi.BucketIncompleteError):
+            set(D)
+        # The bytes that remain are still inspectable without the exception.
+        self.assertEqual(D.cached_keys(), (1,))
+
+    def test_iteration_after_abandon_is_not_complete(self):
+        D = mi.bucket([1, 2, 3], key=lambda x: x)
+        D.abandon(2)
+        with self.assertRaises(mi.BucketIncompleteError):
+            set(D)
+
+    def test_source_error_reported_once_and_cache_still_drainable(self):
+        def flaky():
+            yield 10
+            yield 20
+            yield 11
+            raise RuntimeError('boom')
+
+        D = mi.bucket(flaky(), key=lambda x: 10 * (x // 10))
+        # The first read that reaches the failure gets the original error...
+        with self.assertRaises(RuntimeError):
+            list(D[30])
+        # ...exactly once; afterwards cached data is still readable.
+        self.assertEqual(list(D[10]), [10, 11])
+        self.assertEqual(list(D[20]), [20])
+        self.assertEqual(list(D[30]), [])
+        self.assertTrue(D.stats['source_errored'])
+        self.assertFalse(D.is_complete)
+        with self.assertRaises(mi.BucketIncompleteError):
+            set(D)
+
+    def test_contains_after_source_error(self):
+        def flaky():
+            yield 10
+            raise RuntimeError('boom')
+
+        D = mi.bucket(flaky(), key=lambda x: 10 * (x // 10))
+        with self.assertRaises(RuntimeError):
+            20 in D
+        # Later probes of missing keys just answer False.
+        self.assertNotIn(30, D)
+
+    def test_validator_rejects_probe_without_reading_source(self):
+        D = mi.bucket(
+            count(), key=lambda x: x % 10, validator=lambda x: x in {1, 3}
+        )
+        self.assertFalse(2 in D)
+        self.assertEqual(next(D[1]), 1)
+
+    def test_stats_snapshot_shape(self):
+        D = mi.bucket([1, 2], key=lambda x: x)
+        self.assertEqual(
+            set(D.stats),
+            {
+                'cached',
+                'budget',
+                'dropped',
+                'dropped_overflow',
+                'dropped_abandoned',
+                'abandoned',
+                'source_errored',
+                'complete',
+            },
+        )
+        self.assertIsNone(D.stats['budget'])
+        self.assertEqual(D.stats['cached'], 0)
+        self.assertEqual(D.stats['abandoned'], ())
+
+    def test_partial_reading_leaves_the_rest_for_later(self):
+        # Reading part of one bucket must not lose the other keys; a later
+        # full iteration still sees the whole source.
+        D = mi.bucket([10, 20, 11, 21, 12, 22], key=lambda x: 10 * (x // 10))
+        it = D[10]
+        self.assertEqual(next(it), 10)
+        self.assertEqual(set(D), {10, 20})
+        self.assertEqual(list(it), [11, 12])
+        self.assertEqual(list(D[20]), [20, 21, 22])
+        self.assertTrue(D.is_complete)
+
+    def test_probe_does_not_reorder_active_bucket(self):
+        D = mi.bucket([10, 20, 11, 21], key=lambda x: 10 * (x // 10))
+        self.assertIn(20, D)
+        # Probing 20 cached 20/21 but must not disturb key 10's own order.
+        self.assertEqual(list(D[10]), [10, 11])
+        self.assertEqual(list(D[20]), [20, 21])
+
+    def test_probe_of_policy_dropped_item_is_false(self):
+        # The policy refuses everything once the budget is full, so the
+        # probe cannot hand back an item and must answer False, not True.
+        D = mi.bucket(
+            range(6),
+            key=lambda x: x % 2,
+            cache_budget=2,
+            on_overflow=lambda b, k, item: False,
+        )
+        self.assertIn(1, D)  # there was still room for the first items
+        self.assertEqual(D.cache_size, 2)
+        self.assertNotIn(5, D)  # key 5 never occurs; the probe is bounded
+        self.assertGreater(D.stats['dropped_overflow'], 0)
+        self.assertFalse(D.is_complete)
+
+    def test_cached_keys_never_raises_on_incomplete_bucket(self):
+        D = mi.bucket(
+            range(4),
+            key=lambda x: x % 2,
+            cache_budget=1,
+            on_overflow=lambda b, k, item: False,
+        )
+        with self.assertRaises(mi.BucketIncompleteError):
+            set(D)
+        # ...but the escape hatch reports the residual cache quietly.
+        self.assertEqual(D.cached_keys(), (0,))
+        self.assertFalse(D.is_complete)
+
+    def test_probe_of_item_the_policy_refuses_is_false(self):
+        # With no room at all, the key's own first item is refused, so the
+        # probe has nothing to hand back and must answer False.
+        D = mi.bucket(
+            [1, 2],
+            key=lambda x: x,
+            cache_budget=0,
+            on_overflow=lambda b, k, item: False,
+        )
+        self.assertNotIn(1, D)
+        self.assertEqual(D.stats['dropped_overflow'], 1)
+
+    def test_getitem_after_abandon_mid_stream_is_empty(self):
+        D = mi.bucket([1, 2, 3], key=lambda x: x)
+        it = D[1]
+        D.abandon(1)
+        # The generator was created before the abandonment and sees it.
+        self.assertEqual(list(it), [])
+        # An item pulled after the abandonment is dropped and counted, not
+        # handed back as if the key were still active.
+        D2 = mi.bucket([1, 2], key=lambda x: x % 2)
+
+        def key(item):
+            D2.abandon(1)
+            return item % 2
+
+        D2._key = key
+        self.assertEqual(list(D2[1]), [])
+        self.assertEqual(D2.stats['dropped_abandoned'], 1)
+
 
 class SpyTests(TestCase):
     """Tests for ``spy()``"""

@@ -8,8 +8,13 @@ Version History
 Unreleased
 ----------
 
+* New classes:
+    * :class:`BucketOverflowError` is raised by :func:`bucket` when a finite ``cache_budget`` is exhausted in its default mode; the refused item and its key are attached to the exception.
+    * :class:`BucketIncompleteError` is raised by :func:`bucket` when items were dropped or the wrapped source raised, so a partial result is never presented as a complete split.
+
 * Updated functions:
     * :func:`peekable` was updated to avoid caching the entire iterable when sliced with a negative step and omitted *stop*.
+    * :func:`bucket` now accepts a *cache_budget* that caps cached items (inspectable via the ``cache_budget``, ``cache_size`` and ``stats`` attributes) and an *on_overflow* callable for caller-defined drop policies; the default behavior is unchanged. It also gains ``abandon``/``discard`` to explicitly give up on a key, rejecting its later records without draining the source. A source exception is now re-raised only once while already-cached items remain readable.
 
 11.2.1
 ----------

@@ -60,6 +60,8 @@ from .recipes import (
 
 __all__ = [
     'AbortThread',
+    'BucketIncompleteError',
+    'BucketOverflowError',
     'SequenceView',
     'adjacent',
     'all_unique',
@@ -1147,6 +1149,34 @@ def substrings_indexes(seq, reverse=False):
     )
 
 
+class BucketOverflowError(Exception):
+    """Raised when a :class:`bucket` cannot cache an item within its budget.
+
+    The configured limit is available as the ``budget`` attribute, and the
+    key and item that did not fit as ``key`` and ``item``.
+    """
+
+    def __init__(self, budget, key, item):
+        self.budget = budget
+        self.key = key
+        self.item = item
+        super().__init__(
+            f'bucket cache budget of {budget} exhausted while caching '
+            f'{item!r} for key {key!r}'
+        )
+
+
+class BucketIncompleteError(Exception):
+    """Raised when a :class:`bucket` cannot report a complete split.
+
+    Iterating a bucket raises this once items have been dropped (by an
+    overflow policy or by :meth:`bucket.abandon`) or once the wrapped source
+    has raised, so a partial result is never presented as if it were the
+    whole input. Use :attr:`bucket.stats` or :meth:`bucket.cached_keys` to
+    inspect what is actually cached.
+    """
+
+
 class bucket:
     """Wrap *iterable* and return an object that buckets the iterable into
     child iterables based on a *key* function.
@@ -1181,6 +1211,62 @@ class bucket:
         >>> list(s[2])
         []
 
+    **Cache budgets.** Items pulled from the source are cached until a child
+    iterable consumes them, so a key nobody reads can make a whole input
+    pile up in memory. Pass *cache_budget* to cap the number of cached
+    items; the default ``None`` means unbounded and preserves the original
+    behavior. The current usage is inspectable through
+    :attr:`cache_budget`, :attr:`cache_size` and :attr:`stats`.
+
+    When the budget is full and another item has to be cached,
+    *on_overflow* decides what happens:
+
+    * ``'raise'`` (the default when a budget is given) raises
+      :class:`BucketOverflowError`. The item that did not fit is attached to
+      the exception, so it is reported instead of silently lost. A probe of
+      a key the source never produces therefore stops at the budget rather
+      than draining the source forever.
+    * a callable ``policy(bucket, key, item)`` is the caller's strategy. It
+      may call :meth:`abandon` to free room, and returns a truthy value to
+      keep the item or a falsey value to drop it. Dropped items are counted
+      in :attr:`stats`.
+
+        >>> s = bucket(
+        ...     range(6),
+        ...     key=lambda x: x % 2,
+        ...     cache_budget=2,
+        ...     on_overflow=lambda b, k, item: False,
+        ... )
+        >>> list(s[0])
+        [0, 2, 4]
+        >>> s.stats['dropped_overflow']
+        1
+        >>> list(s[1])
+        [1, 3]
+
+    **Abandoning a key.** Call :meth:`abandon` (also spelled ``discard``) to
+    give up on a key. Its cached items are dropped and counted, and every
+    later item with that key is rejected -- it is neither cached nor
+    yielded -- so the answer to "are later records accepted?" is no. The
+    decision lasts for the lifetime of the bucket, and the remaining keys
+    keep their original relative order.
+
+        >>> s = bucket(range(6), key=lambda x: x % 2)
+        >>> s.abandon(1)
+        >>> list(s[0])
+        [0, 2, 4]
+        >>> s.stats['dropped_abandoned']
+        3
+        >>> s.is_complete
+        False
+
+    If anything was dropped, or the source raised, the bucket cannot
+    honestly claim a complete split: iterating the bucket itself raises
+    :class:`BucketIncompleteError` rather than quietly handing back a
+    partial set of keys. Use :meth:`cached_keys` and :attr:`stats` to read
+    what is still available. A source exception is raised only once;
+    afterwards the items already cached can still be drained.
+
     .. seealso:: :func:`map_reduce`, :func:`groupby_transform`
 
     If storage is not a concern, :func:`map_reduce` returns a Python
@@ -1190,7 +1276,30 @@ class bucket:
 
     """
 
-    def __init__(self, iterable, key, validator=None):
+    def __init__(
+        self,
+        iterable,
+        key,
+        validator=None,
+        cache_budget=None,
+        on_overflow=None,
+    ):
+        if cache_budget is not None:
+            if isinstance(cache_budget, bool) or not isinstance(
+                cache_budget, int
+            ):
+                raise TypeError('cache_budget must be a non-negative integer')
+            if cache_budget < 0:
+                raise ValueError('cache_budget must be non-negative')
+
+        if on_overflow is None:
+            on_overflow = 'raise'
+        elif on_overflow != 'raise' and not callable(on_overflow):
+            raise ValueError(
+                "on_overflow must be 'raise' or a callable "
+                '(bucket, key, item) policy'
+            )
+
         self._it = iter(iterable)
         self._key = key
         self._cache = defaultdict(deque)
@@ -1198,19 +1307,195 @@ class bucket:
         # callable object that is falsey (e.g. an empty ``set`` subclass with
         # ``__call__``), and ``validator or ...`` would silently replace it.
         self._validator = (lambda x: True) if validator is None else validator
+        self._budget = cache_budget
+        self._on_overflow = on_overflow
+        # Number of items currently held across all cached deques.
+        self._size = 0
+        # Items dropped while caching, split by reason.
+        self._dropped_overflow = 0
+        self._dropped_abandoned = 0
+        self._abandoned = set()
+        # The first source failure, kept so repeats report exhaustion.
+        self._source_error = None
 
-    def __contains__(self, value):
-        if not self._validator(value):
-            return False
+    @property
+    def cache_budget(self):
+        """The maximum number of cached items, or ``None`` if unbounded."""
+        return self._budget
+
+    @property
+    def cache_size(self):
+        """The number of items currently held in the cache."""
+        return self._size
+
+    @property
+    def is_complete(self):
+        """``True`` if the bucket still represents the whole input.
+
+        That requires that the source did not raise and that no item was
+        dropped, either by an *on_overflow* policy or because its key was
+        abandoned. Abandoning a key counts only when one of its records is
+        actually rejected, so abandoning a key the source never produces
+        leaves the split complete.
+        """
+        return self._source_error is None and not (
+            self._dropped_overflow or self._dropped_abandoned
+        )
+
+    @property
+    def stats(self):
+        """A snapshot of the cache and drop counters.
+
+        The returned ``dict`` has these keys:
+
+        * ``cached``: items currently held in the cache
+        * ``budget``: the configured budget, or ``None`` if unbounded
+        * ``dropped``: total items the bucket could not deliver
+        * ``dropped_overflow``: items refused because the budget was full,
+          whether reported through :class:`BucketOverflowError` or dropped
+          by the *on_overflow* policy
+        * ``dropped_abandoned``: items dropped because their key was
+          abandoned
+        * ``abandoned``: tuple of the keys given to :meth:`abandon`
+        * ``source_errored``: whether the wrapped source raised
+        * ``complete``: whether the bucket still represents the whole input
+          (see :attr:`is_complete`)
+        """
+        return {
+            'cached': self._size,
+            'budget': self._budget,
+            'dropped': self._dropped_overflow + self._dropped_abandoned,
+            'dropped_overflow': self._dropped_overflow,
+            'dropped_abandoned': self._dropped_abandoned,
+            'abandoned': tuple(sorted(self._abandoned, key=repr)),
+            'source_errored': self._source_error is not None,
+            'complete': self.is_complete,
+        }
+
+    def cached_keys(self):
+        """Return the keys that currently have cached items behind them.
+
+        Unlike iterating the bucket, this never raises, even when the cached
+        data is known to be incomplete (see :class:`BucketIncompleteError`).
+        """
+        return tuple(k for k, items in self._cache.items() if items)
+
+    def abandon(self, value):
+        """Give up on *value* and reject every one of its future items.
+
+        Any items already cached for *value* are dropped and counted in
+        :attr:`stats`. Items encountered afterwards are dropped and counted
+        too: they are never cached and never yielded, and both
+        :meth:`__getitem__` and :meth:`__contains__` treat the key as absent
+        without advancing the source. Abandoning an already abandoned key
+        has no further effect, and the decision cannot be undone.
+        """
+        if value in self._abandoned:
+            return
+
+        self._abandoned.add(value)
+        queued = self._cache.pop(value, None)
+        if queued:
+            self._size -= len(queued)
+            self._dropped_abandoned += len(queued)
+
+    # ``discard`` reads naturally for "drop this bucket"; it is the same
+    # operation as ``abandon``.
+    discard = abandon
+
+    def _next_source(self):
+        """Return the next item from the source, remembering a failure.
+
+        A source exception is raised the first time it happens; later calls
+        report exhaustion instead, so that items already cached remain
+        readable.
+        """
+        if self._source_error is not None:
+            raise StopIteration
 
         try:
-            item = next(self[value])
+            return next(self._it)
         except StopIteration:
-            return False
-        else:
-            self._cache[value].appendleft(item)
+            raise
+        except Exception as exc:
+            self._source_error = exc
+            raise
 
+    def _store(self, item_value, item):
+        """Cache *item* under *item_value*, applying abandonment and budget.
+
+        Returns ``True`` if the item ended up in the cache. It returns
+        ``False`` when the item was dropped, either because its key was
+        abandoned or because the *on_overflow* policy refused it; in the
+        default overflow mode a full budget raises instead of returning.
+        """
+        if item_value in self._abandoned:
+            self._dropped_abandoned += 1
+            return False
+
+        if self._budget is not None and self._size >= self._budget:
+            if not callable(self._on_overflow):
+                # The refused item is reported by the exception and counted
+                # too, so a caller that catches the error still learns that
+                # data is missing.
+                self._dropped_overflow += 1
+                raise BucketOverflowError(self._budget, item_value, item)
+
+            keep = self._on_overflow(self, item_value, item)
+            if item_value in self._abandoned:
+                # The policy gave up on this key while handling the item.
+                self._dropped_abandoned += 1
+                return False
+            if not (keep and self._size < self._budget):
+                # The policy dropped the item, or it freed no room for it.
+                self._dropped_overflow += 1
+                return False
+
+        self._cache[item_value].append(item)
+        self._size += 1
         return True
+
+    def _peek(self, value):
+        """Return the first item whose key is *value*, without consuming it.
+
+        Returns a ``(found, item)`` pair. The item stays in the cache, so a
+        membership probe neither reorders a bucket nor perturbs the budget.
+
+        A probe is bounded by the budget: if an item is refused while
+        probing (the default mode raises :class:`BucketOverflowError`; an
+        *on_overflow* policy that drops instead makes this return
+        ``False``), the probe stops rather than draining the source. A
+        ``False`` in that case means "no accepted item found so far", not
+        "the key never occurs"; :attr:`is_complete` reports which one it is.
+        """
+        queued = self._cache.get(value)
+        if queued:
+            return True, queued[0]
+
+        while True:
+            try:
+                item = self._next_source()
+            except StopIteration:
+                return False, None
+            item_value = self._key(item)
+            if item_value == value:
+                if not self._store(value, item):
+                    # The policy refused the very item we were looking for.
+                    return False, None
+                return True, item
+            elif self._validator(item_value):
+                if not self._store(item_value, item):
+                    # The budget is refusing items, so the probe can no
+                    # longer be answered authoritatively; stop instead of
+                    # pulling the whole source through a full cache.
+                    return False, None
+
+    def __contains__(self, value):
+        if value in self._abandoned or not self._validator(value):
+            return False
+
+        found, _ = self._peek(value)
+        return found
 
     def _get_values(self, value):
         """
@@ -1221,35 +1506,63 @@ class bucket:
         while True:
             # If we've cached some items that match the target value, emit
             # the first one and evict it from the cache.
-            if self._cache.get(value):
-                yield self._cache[value].popleft()
+            queued = self._cache.get(value)
+            if queued:
+                item = queued.popleft()
+                self._size -= 1
+                yield item
             # Otherwise we need to advance the parent iterator to search for
             # a matching item, caching the rest.
             else:
+                if value in self._abandoned:
+                    return
                 while True:
                     try:
-                        item = next(self._it)
+                        item = self._next_source()
                     except StopIteration:
                         return
                     item_value = self._key(item)
                     if item_value == value:
-                        if value not in self._cache:
-                            self._cache[value] = deque()
+                        if value in self._abandoned:
+                            # Abandoned while this iterable was in flight.
+                            self._dropped_abandoned += 1
+                            return
+                        # Register the key even though this item is yielded
+                        # directly, so a drained key is still reported when
+                        # the bucket itself is iterated.
+                        self._cache.setdefault(value, deque())
                         yield item
                         break
                     elif self._validator(item_value):
-                        self._cache[item_value].append(item)
+                        self._store(item_value, item)
 
     def __iter__(self):
-        for item in self._it:
+        while True:
+            try:
+                item = self._next_source()
+            except StopIteration:
+                break
             item_value = self._key(item)
             if self._validator(item_value):
-                self._cache[item_value].append(item)
+                self._store(item_value, item)
+
+        if not self.is_complete:
+            dropped = self._dropped_overflow + self._dropped_abandoned
+            reasons = []
+            if dropped:
+                reasons.append(f'{dropped} item(s) were dropped')
+            if self._source_error is not None:
+                reasons.append(f'the source raised {self._source_error!r}')
+            raise BucketIncompleteError(
+                'bucket cannot report a complete split: '
+                + ' and '.join(reasons)
+                + '; see bucket.stats and bucket.cached_keys()'
+            )
 
         return iter(self._cache)
 
     def __getitem__(self, value):
-        if not self._validator(value):
+        if value in self._abandoned or not self._validator(value):
             return iter(())
 
         return self._get_values(value)
