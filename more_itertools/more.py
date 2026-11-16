@@ -60,6 +60,7 @@ from .recipes import (
 
 __all__ = [
     'AbortThread',
+    'BufferOverflowError',
     'SequenceView',
     'adjacent',
     'all_unique',
@@ -5399,6 +5400,11 @@ def argmax(iterable, *, key=None):
     return max(enumerate(iterable), key=itemgetter(1))[0]
 
 
+class BufferOverflowError(LookupError):
+    """Raised in bounded mode when a requested record is no longer
+    (or not yet) available within the caller's cache limit."""
+
+
 def _extract_monotonic(iterator, indices):
     'Non-decreasing indices, lazily consumed'
     num_read = 0
@@ -5413,6 +5419,38 @@ def _extract_monotonic(iterator, indices):
             raise IndexError(index) from None
         else:
             num_read += advance + 1
+        yield value
+
+
+def _extract_monotonic_bounded(iterator, indices, cache_size):
+    'Non-decreasing indices with a bounded look-back, lazily consumed'
+    num_read = 0
+    previous = None
+    last_value = None
+    for index in indices:
+        if not isinstance(index, int):
+            raise ValueError(f'Invalid index: {index}')
+        if index < 0:
+            raise ValueError(f'Invalid index: {index}')
+        if index < num_read:
+            # The record was produced earlier; only the immediately
+            # preceding record can still be served (a repeated index).
+            if cache_size and index == previous:
+                yield last_value
+                continue
+            raise BufferOverflowError(
+                f'Index {index} was already consumed and is outside the '
+                f'cache (cache_size={cache_size})'
+            ) from None
+        try:
+            value = next(islice(iterator, index - num_read, None))
+        except ValueError:
+            raise ValueError(f'Invalid index: {index}') from None
+        except StopIteration:
+            raise IndexError(index) from None
+        num_read = index + 1
+        previous = index
+        last_value = value
         yield value
 
 
@@ -5438,7 +5476,44 @@ def _extract_buffered(iterator, index_and_position):
             next_to_emit += 1
 
 
-def extract(iterable, indices, *, monotonic=False):
+def _extract_bounded(iterator, indices, cache_size):
+    'Arbitrary index order, lazily consumed with a bounded record cache'
+    # Fixed-capacity ring buffer holding the most recent cache_size
+    # records of the stream. Memory never exceeds the caller's bound
+    # regardless of how far apart the requested indices are.
+    ring = [None] * cache_size
+    oldest = 0  # Stream position of the oldest still-addressable record.
+    source_position = -1
+
+    for index in indices:
+        if not isinstance(index, int):
+            raise ValueError(f'Invalid index: {index}')
+        if index < 0:
+            raise ValueError(f'Invalid index: {index}')
+        if index <= source_position:
+            if index < oldest:
+                raise BufferOverflowError(
+                    f'Index {index} is unavailable within the cache '
+                    f'(cache_size={cache_size})'
+                ) from None
+            yield ring[index % cache_size]
+            continue
+
+        # Advance the source up to the requested position, caching every
+        # record that passes through (including skipped ones).
+        for position in range(source_position + 1, index + 1):
+            try:
+                value = next(iterator)
+            except StopIteration:
+                raise IndexError(position) from None
+            if cache_size:
+                ring[position % cache_size] = value
+        source_position = index
+        oldest = max(0, index - cache_size + 1)
+        yield value
+
+
+def extract(iterable, indices, *, monotonic=False, cache_size=None):
     """Yield values at the specified indices.
 
     Example:
@@ -5453,16 +5528,46 @@ def extract(iterable, indices, *, monotonic=False):
     and must be finite. When *monotonic* is true, *indices* are consumed
     lazily and can be infinite but must be non-decreasing.
 
+    When *cache_size* is an integer, bounded mode is enabled. Indices are
+    then processed lazily in request order, so *indices* may be an
+    infinite, out-of-order stream of repeated indices. Repeating an index
+    yields the same record again without advancing the source iterable.
+
+    At most *cache_size* records of the source are retained in a sliding
+    window, so bounded mode never materializes the whole stream even when
+    requested indices are far apart. A request for a record that already
+    fell out of the window raises :class:`BufferOverflowError`; the caller
+    can catch it and treat the index as invalidated instead. A
+    *cache_size* of zero means no record is retained, so only indices that
+    advance the source can be served. In monotonic bounded mode the
+    constant-memory fast path only replays the immediately preceding
+    index; any other backward request raises
+    :class:`BufferOverflowError`.
+
     Raises ``IndexError`` if an index lies beyond the iterable.
-    Raises ``ValueError`` for a negative index or for a decreasing
-    index when *monotonic* is true.
+    Raises ``ValueError`` for a negative or non-integer index (in bounded
+    mode), for a decreasing index when *monotonic* is true without a
+    cache bound, or for a negative *cache_size*.
+    Raises :class:`BufferOverflowError` when, in bounded mode, a requested
+    record is outside the cache.
+    Any other exception raised by the source iterable propagates
+    unchanged.
     """
+
+    if cache_size is not None:
+        if not isinstance(cache_size, int) or cache_size < 0:
+            raise ValueError('cache_size must be a non-negative integer')
 
     iterator = iter(iterable)
     indices = iter(indices)
 
     if monotonic:
-        return _extract_monotonic(iterator, indices)
+        if cache_size is None:
+            return _extract_monotonic(iterator, indices)
+        return _extract_monotonic_bounded(iterator, indices, cache_size)
+
+    if cache_size is not None:
+        return _extract_bounded(iterator, indices, cache_size)
 
     index_and_position = sorted(zip(indices, count()))
     if index_and_position and index_and_position[0][0] < 0:

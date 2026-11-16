@@ -7008,6 +7008,314 @@ class ExtractTests(TestCase):
             list(extract(count(), [5, 7, 3, 9, 4])), [5, 7, 3, 9, 4]
         )
 
+    def test_bounded_basics(self):
+        extract = mi.extract
+        data = 'abcdefghijklmnopqrstuvwxyz'
+
+        # Out-of-order, repeated indices; emitted in request order.
+        self.assertEqual(
+            list(extract(data, [7, 4, 11, 11, 14], cache_size=8)),
+            ['h', 'e', 'l', 'l', 'o'],
+        )
+
+        # Empty indices don't touch the source.
+        self.assertEqual(list(extract(iter(data), [], cache_size=4)), [])
+
+        # Result is an iterator.
+        iterator = extract(data, [0, 1, 2], cache_size=2)
+        self.assertTrue(hasattr(iterator, '__next__'))
+
+    def test_bounded_repeats_do_not_advance_source(self):
+        extract = mi.extract
+
+        seen = []
+
+        def source():
+            for value in 'ABCDE':
+                seen.append(value)
+                yield value
+
+        iterator = extract(source(), [0, 0, 0, 2, 2], cache_size=3)
+        self.assertEqual(next(iterator), 'A')
+        self.assertEqual(seen, ['A'])  # Repeats do not pull again.
+        self.assertEqual(next(iterator), 'A')
+        self.assertEqual(seen, ['A'])
+        self.assertEqual(next(iterator), 'A')
+        self.assertEqual(seen, ['A'])
+        self.assertEqual(next(iterator), 'C')
+        self.assertEqual(seen, ['A', 'B', 'C'])
+        self.assertEqual(next(iterator), 'C')
+        self.assertEqual(seen, ['A', 'B', 'C'])
+
+    def test_bounded_overflow(self):
+        extract = mi.extract
+
+        # A window of two stream positions keeps indices 0 and 2 here.
+        iterator = extract('abcdef', [0, 2, 0], cache_size=2)
+        self.assertEqual(next(iterator), 'a')
+        self.assertEqual(next(iterator), 'c')
+        with self.assertRaises(mi.BufferOverflowError):
+            next(iterator)
+
+        # cache_size=0 retains nothing: even an immediate repeat fails.
+        iterator = extract('abcdef', [1, 1], cache_size=0)
+        self.assertEqual(next(iterator), 'b')
+        with self.assertRaises(mi.BufferOverflowError):
+            next(iterator)
+
+        # A skipped position inside the window stays addressable.
+        self.assertEqual(
+            list(extract('abcdef', [3, 1, 3, 1], cache_size=3)),
+            ['d', 'b', 'd', 'b'],
+        )
+
+        # A skipped position outside the window overflows.
+        iterator = extract('abcdef', [4, 1], cache_size=3)
+        self.assertEqual(next(iterator), 'e')
+        with self.assertRaises(mi.BufferOverflowError):
+            next(iterator)
+
+    def test_bounded_overflow_does_not_advance_source(self):
+        extract = mi.extract
+
+        seen = []
+
+        def source():
+            for value in 'ABCDE':
+                seen.append(value)
+                yield value
+
+        iterator = extract(source(), [2, 0], cache_size=1)
+        self.assertEqual(next(iterator), 'C')
+        self.assertEqual(seen, ['A', 'B', 'C'])
+        with self.assertRaises(mi.BufferOverflowError):
+            next(iterator)
+        # The failed lookup never pulled another record.
+        self.assertEqual(seen, ['A', 'B', 'C'])
+        # The iterator remains usable after the rejected request.
+        self.assertEqual(list(extract([1, 2, 3], [0], cache_size=1)), [1])
+
+    def test_bounded_eviction_keeps_most_recent(self):
+        extract = mi.extract
+
+        # cache_size=3 keeps the last three stream positions (3, 4, 5);
+        # indices 1 and 2 fall outside the window and can no longer be
+        # served, while everything up to index 3 still works.
+        iterator = extract('abcdefg', [1, 3, 5, 4, 3], cache_size=3)
+        self.assertEqual(list(iterator), ['b', 'd', 'f', 'e', 'd'])
+
+        iterator = extract('abcdefg', [1, 3, 5, 2], cache_size=3)
+        self.assertEqual(next(iterator), 'b')
+        self.assertEqual(next(iterator), 'd')
+        self.assertEqual(next(iterator), 'f')
+        with self.assertRaises(mi.BufferOverflowError):
+            next(iterator)
+
+    def test_bounded_error_categories(self):
+        extract = mi.extract
+
+        # Beyond the end of a finite source: IndexError, not overflow.
+        with self.assertRaises(IndexError):
+            list(extract('abc', [0, 5], cache_size=2))
+
+        # Negative indices: ValueError, and the source is not exhausted
+        # to detect it.
+        produced = []
+
+        def source():
+            for value in (1, 2, 3):
+                produced.append(value)
+                yield value
+
+        iterator = extract(source(), [0, -1], cache_size=2)
+        self.assertEqual(next(iterator), 1)
+        with self.assertRaises(ValueError):
+            next(iterator)
+        self.assertEqual(produced, [1])
+
+        # A negative index before any consumption also raises ValueError.
+        with self.assertRaises(ValueError):
+            list(extract('abc', [-1], cache_size=2))
+
+        # Non-integer indices.
+        with self.assertRaises(ValueError):
+            list(extract('abc', [1.5], cache_size=2))
+
+        # Source exceptions propagate unchanged and distinct from the
+        # index-related errors.
+        class BoomError(RuntimeError):
+            pass
+
+        def boom():
+            yield 0
+            raise BoomError('source failed')
+
+        iterator = extract(boom(), [0, 2], cache_size=2)
+        self.assertEqual(next(iterator), 0)
+        with self.assertRaises(BoomError):
+            next(iterator)
+
+    def test_bounded_invalid_cache_size(self):
+        extract = mi.extract
+        for bad in (-1, -100, 1.5, '2'):
+            with self.subTest(bad=bad):
+                with self.assertRaises(ValueError):
+                    extract('abc', [0], cache_size=bad)
+
+    def test_bounded_lazy_indices_and_source(self):
+        extract = mi.extract
+
+        # An infinite index stream is consumed lazily.
+        result = mi.take(4, extract(count(), count(0, 2), cache_size=2))
+        self.assertEqual(result, [0, 2, 4, 6])
+
+        # The source advances only as far as the largest requested index.
+        source = mi.peekable(iter('ABCDEFGHIJKLM'))
+        iterator = extract(source, [4, 2, 10], cache_size=11)
+        self.assertEqual(next(iterator), 'E')
+        self.assertEqual(source.peek(), 'F')
+        self.assertEqual(next(iterator), 'C')
+        self.assertEqual(source.peek(), 'F')
+        self.assertEqual(next(iterator), 'K')
+        self.assertEqual(source.peek(), 'L')
+
+        # A cache too small to cover an earlier stream position overflows
+        # instead of rewinding the source.
+        source = mi.peekable(iter('ABCDEFGHIJKLM'))
+        iterator = extract(source, [4, 2], cache_size=2)
+        self.assertEqual(next(iterator), 'E')
+        with self.assertRaises(mi.BufferOverflowError):
+            next(iterator)
+        self.assertEqual(source.peek(), 'F')
+
+    def test_bounded_monotonic_fast_path(self):
+        extract = mi.extract
+
+        # Repeats of the last index replay the record without advancing.
+        seen = []
+
+        def source():
+            for value in 'ABCDE':
+                seen.append(value)
+                yield value
+
+        iterator = extract(
+            source(), [0, 0, 2, 2, 4], monotonic=True, cache_size=1
+        )
+        self.assertEqual(list(iterator), ['A', 'A', 'C', 'C', 'E'])
+        self.assertEqual(seen, ['A', 'B', 'C', 'D', 'E'])
+
+        # A repeat that looks back beyond the last index overflows.
+        iterator = extract('abcdef', [0, 1, 0], monotonic=True, cache_size=5)
+        self.assertEqual(next(iterator), 'a')
+        self.assertEqual(next(iterator), 'b')
+        with self.assertRaises(mi.BufferOverflowError):
+            next(iterator)
+        # cache_size=0 forbids every repeat.
+        iterator = extract('abcdef', [1, 1], monotonic=True, cache_size=0)
+        self.assertEqual(next(iterator), 'b')
+        with self.assertRaises(mi.BufferOverflowError):
+            next(iterator)
+
+        # A decreasing index cannot be replayed from the constant-memory
+        # fast path, so it overflows; negative indices are ValueErrors.
+        with self.assertRaises(mi.BufferOverflowError):
+            list(extract('abcdefg', [2, 1], monotonic=True, cache_size=3))
+        with self.assertRaises(ValueError):
+            list(extract('abcdefg', [-1, 0], monotonic=True, cache_size=3))
+
+        # Beyond the end is an IndexError.
+        with self.assertRaises(IndexError):
+            list(extract('abc', [5], monotonic=True, cache_size=3))
+
+    def test_bounded_monotonic_constant_memory(self):
+        # The fast path only keeps the most recently produced record,
+        # never the whole stream.
+        extract = mi.extract
+
+        class Record:
+            pass
+
+        holder = {}
+        refs = {}
+
+        def source():
+            for n in range(6):
+                value = Record()
+                holder[n] = value
+                refs[n] = weakref.ref(value)
+                yield value
+
+        iterator = extract(
+            source(), [0, 1, 2, 3, 4], monotonic=True, cache_size=10
+        )
+        next(iterator)  # 0 is the current record, held by the frame.
+        next(iterator)  # 1 is now current; 0 must have been released.
+        del holder[0]
+        gc.collect()
+        self.assertIsNone(refs[0]())
+        next(iterator)
+        del holder[1]
+        gc.collect()
+        self.assertIsNone(refs[1]())
+
+    def test_bounded_does_not_buffer_whole_stream(self):
+        extract = mi.extract
+
+        class Record:
+            pass
+
+        holder = {}
+        refs = {}
+
+        def source():
+            for n in range(8):
+                value = Record()
+                holder[n] = value
+                refs[n] = weakref.ref(value)
+                yield value
+
+        # A cache_size of 2 bounds memory to the last two stream positions,
+        # even though far-apart indices are requested.
+        iterator = extract(source(), [0, 2, 4, 6], cache_size=2)
+        next(iterator)  # window: {0}
+        next(iterator)  # window: {0, 2}; position 1 skipped, nothing held
+        next(iterator)  # window: {2, 4}; position 0 evicted
+        del holder[0]
+        gc.collect()
+        self.assertIsNone(refs[0]())
+        next(iterator)  # window: {4, 6}; position 2 evicted
+        del holder[2]
+        gc.collect()
+        self.assertIsNone(refs[2]())
+
+        # The retained window (indices 4 and 6) stays alive.
+        self.assertIsNotNone(refs[4]())
+        self.assertIsNotNone(refs[6]())
+
+    def test_bounded_all_orderings(self):
+        extract = mi.extract
+        data = 'abcdefg'
+        # With a cache covering every fetched record, any ordering must
+        # match the unbounded semantics.
+        for indices in product(range(4), repeat=4):
+            with self.subTest(indices=indices):
+                actual = tuple(extract(data, indices, cache_size=4))
+                expected = itemgetter(*indices)(data)
+                self.assertEqual(actual, expected)
+
+        # A tight cache makes a look-back to an evicted position fail,
+        # even though the index itself was valid earlier.
+        iterator = extract(data, [1, 3, 1], cache_size=2)
+        self.assertEqual(next(iterator), 'b')
+        self.assertEqual(next(iterator), 'd')
+        with self.assertRaises(mi.BufferOverflowError):
+            next(iterator)
+
+    def test_buffer_overflow_error_type(self):
+        self.assertTrue(issubclass(mi.BufferOverflowError, LookupError))
+        self.assertTrue(issubclass(mi.BufferOverflowError, Exception))
+
 
 class TestSerialize(TestCase):
     def test_concurrent_calls(self):

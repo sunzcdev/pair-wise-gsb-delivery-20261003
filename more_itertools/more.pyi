@@ -33,6 +33,7 @@ from _typeshed import (
 
 __all__ = [
     'AbortThread',
+    'BufferOverflowError',
     'SequenceView',
     'adjacent',
     'all_unique',
@@ -774,6 +775,9 @@ def is_sorted(
 class AbortThread(BaseException):
     pass
 
+class BufferOverflowError(LookupError):
+    pass
+
 class callback_iter(Generic[_T_co], Iterator[_T_co]):
     def __init__(
         self,
@@ -1000,6 +1004,7 @@ def extract(
     indices: Iterable[int],
     *,
     monotonic: bool = ...,
+    cache_size: int | None = ...,
 ) -> Iterator[_T]: ...
 def subfactorial(n: int) -> int: ...
 
