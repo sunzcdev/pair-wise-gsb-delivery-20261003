@@ -3,6 +3,17 @@
 History
 -------
 
+Unreleased
+~~~~~~~~~~
+
+* Added ``Selector.jmespath_detail()``, ``Selector.jsonpath_detail()`` and
+  their ``SelectorList`` counterparts. They return a ``JSONQueryDetail``
+  object that reports whether the query matched, the matched values with
+  their JSON types and (for JSONPath) node paths, and per-input diagnostics
+  that tell non-JSON input apart from a legitimate empty result. JSONPath
+  reports an explicit JSON ``null`` as a match; JMESPath, which cannot tell
+  a missing key apart from a ``null``, reports those cases as unknown.
+
 1.12.1 (2026-09-28)
 ~~~~~~~~~~~~~~~~~~~
 

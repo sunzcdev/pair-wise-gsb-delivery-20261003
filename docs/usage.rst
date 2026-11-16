@@ -989,6 +989,74 @@ For example::
         Comment: <!-- comment -->
         Children: <br>
 
+.. _topics-json-query-details:
+
+Inspecting JSON query results
+-----------------------------
+
+:meth:`~parsel.selector.Selector.jmespath` and
+:meth:`~parsel.selector.Selector.jsonpath` return selectors, which is
+convenient for extraction but cannot tell a missing key apart from a JSON
+``null``, and drops the type information of the matched values. The
+:meth:`~parsel.selector.Selector.jmespath_detail` and
+:meth:`~parsel.selector.Selector.jsonpath_detail` methods return a
+:class:`~parsel.selector.JSONQueryDetail` object instead, which reports
+whether the query matched, how many values it matched, the JSON type of each
+value, and diagnostics about the input::
+
+    >>> selector = Selector(text='{"a": null, "b": [1, 2]}')
+    >>> detail = selector.jsonpath_detail('$.a')
+    >>> detail.matched
+    True
+    >>> detail.match_count
+    1
+    >>> detail.values
+    [None]
+    >>> detail.matches[0].value_type
+    'null'
+    >>> detail.matches[0].path
+    "$['a']"
+
+JSONPath reports an explicit ``null`` as a match, while a missing key is a
+definitive miss::
+
+    >>> selector.jsonpath_detail('$.missing').matched
+    False
+
+JMESPath cannot tell those two cases apart, so it reports them as unknown
+(``None``) instead of fabricating a hit or a miss::
+
+    >>> selector.jmespath_detail('a').matched is None
+    True
+    >>> selector.jmespath_detail('missing').matched is None
+    True
+
+Falsy values (``False``, ``0``, ``""``, ``[]``) are never treated as a lack
+of a match::
+
+    >>> Selector(text='{"a": []}').jmespath_detail('a').values
+    [[]]
+
+Input that is not JSON is diagnosed separately from a legitimate empty
+result::
+
+    >>> detail = Selector(text='<p>not JSON</p>').jsonpath_detail('$.a')
+    >>> detail.matched is None
+    True
+    >>> detail.sources[0].is_json
+    False
+
+When these methods are called on a :class:`~parsel.selector.SelectorList`,
+every match and source carries the index of the source selector it comes
+from::
+
+    >>> selector = Selector(text='[{"a": 1}, {"b": 2}, {"a": 3}]')
+    >>> detail = selector.jmespath('[*]').jmespath_detail('a')
+    >>> detail.values
+    [1, 3]
+    >>> [match.source_index for match in detail.matches]
+    [0, 2]
+
 .. _old-extraction-api:
 
 extract() and extract_first()

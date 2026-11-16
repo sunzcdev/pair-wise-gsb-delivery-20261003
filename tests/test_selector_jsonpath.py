@@ -6,7 +6,7 @@ from typing import TYPE_CHECKING, Any, cast
 
 import pytest
 
-from parsel import Selector
+from parsel import JSONQuerySource, Selector
 from parsel.selector import JSONPathError, _compile_jsonpath, _jsonpath_backend
 
 if TYPE_CHECKING:
@@ -154,5 +154,110 @@ class TestJSONPath:
             else "jsonpath"
         )
         _jsonpath_backend.cache_clear()
-        _, _, backend_error = _jsonpath_backend()
+        *_, backend_error = _jsonpath_backend()
         assert backend_error.__module__.split(".")[0] == expected
+
+
+class TestJSONPathDetail:
+    def test_hit(self) -> None:
+        sel = Selector(text='{"a": {"b": 1}}')
+        detail = sel.jsonpath_detail("$.a.b")
+        assert detail.query == "$.a.b"
+        assert detail.backend == "jsonpath"
+        assert detail.matched is True
+        assert detail.match_count == 1
+        assert detail.values == [1]
+        match = detail.matches[0]
+        assert match.value == 1
+        assert match.value_type == "number"
+        assert match.path == "$['a']['b']"
+        assert match.source_index is None
+        assert detail.sources == (JSONQuerySource(index=None, is_json=True),)
+        assert detail.non_json_sources == ()
+
+    def test_null_value(self) -> None:
+        """An explicit JSON null is a match, unlike a missing key."""
+        sel = Selector(text='{"a": null}')
+        detail = sel.jsonpath_detail("$.a")
+        assert detail.matched is True
+        assert detail.match_count == 1
+        assert detail.values == [None]
+        assert detail.matches[0].value_type == "null"
+        assert detail.matches[0].path == "$['a']"
+
+        miss = sel.jsonpath_detail("$.b")
+        assert miss.matched is False
+        assert miss.match_count == 0
+        assert miss.values == []
+        assert miss.sources[0].is_json is True
+
+    def test_falsy_values_kept(self) -> None:
+        """Falsy values must not be dropped by truthiness checks."""
+        sel = Selector(text='{"a": [false, 0, "", []]}')
+        detail = sel.jsonpath_detail("$.a[*]")
+        assert detail.matched is True
+        assert detail.match_count == 4
+        assert detail.values == [False, 0, "", []]
+        assert [m.value_type for m in detail.matches] == [
+            "boolean",
+            "number",
+            "string",
+            "array",
+        ]
+
+    def test_empty_array_hit(self) -> None:
+        detail = Selector(text='{"a": []}').jsonpath_detail("$.a")
+        assert detail.matched is True
+        assert detail.values == [[]]
+        assert detail.matches[0].value_type == "array"
+
+    def test_not_json(self) -> None:
+        """Non-JSON input is diagnosed separately from a legitimate empty
+        result."""
+        sel = Selector(text="<html><body><p>Not JSON</p></body></html>")
+        detail = sel.jsonpath_detail("$.a")
+        assert detail.matched is None
+        assert detail.match_count == 0
+        assert detail.sources == (JSONQuerySource(index=None, is_json=False),)
+        assert detail.non_json_sources == (None,)
+
+    def test_invalid_query(self) -> None:
+        sel = Selector(text="{}")
+        with pytest.raises(JSONPathError):
+            sel.jsonpath_detail("$.[")
+
+    def test_selector_list(self) -> None:
+        """Matches carry the index of their source selector."""
+        sel = Selector(text='[{"a": 1}, {"a": 2}, {"b": 3}]')
+        detail = sel.jsonpath("$[*]").jsonpath_detail("$.a")
+        assert detail.matched is True
+        assert detail.match_count == 2
+        assert detail.values == [1, 2]
+        assert [m.source_index for m in detail.matches] == [0, 1]
+        assert [s.index for s in detail.sources] == [0, 1, 2]
+        assert all(s.is_json for s in detail.sources)
+
+    def test_selector_list_no_match(self) -> None:
+        sel = Selector(text='[{"a": 1}, {"a": 2}]')
+        detail = sel.jsonpath("$[*]").jsonpath_detail("$.b")
+        assert detail.matched is False
+        assert detail.match_count == 0
+
+    def test_selector_list_not_json_source(self) -> None:
+        """A non-JSON input in the list is diagnosed by index, separately
+        from legitimate empty results."""
+        html_text = (
+            '<div><content>{"a": 1}</content><content>not json</content></div>'
+        )
+        detail = Selector(text=html_text).xpath("//content").jsonpath_detail("$.a")
+        assert detail.matched is True
+        assert detail.values == [1]
+        assert detail.matches[0].source_index == 0
+        assert detail.non_json_sources == (1,)
+        assert [s.is_json for s in detail.sources] == [True, False]
+
+    def test_selector_list_empty(self) -> None:
+        detail = Selector(text="{}").jsonpath("$.b").jsonpath_detail("$.a")
+        assert detail.matched is False
+        assert detail.match_count == 0
+        assert detail.sources == ()

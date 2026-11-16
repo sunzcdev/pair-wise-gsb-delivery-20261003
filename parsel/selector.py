@@ -4,6 +4,7 @@ packages."""
 from __future__ import annotations
 
 import codecs
+import dataclasses
 import json
 import re
 import typing
@@ -212,6 +213,34 @@ class SelectorList(list[_SelectorType]):
         ``query`` is the same argument as the one in :meth:`Selector.jsonpath`.
         """
         return self.__class__(flatten([x.jsonpath(query) for x in self]))
+
+    def jmespath_detail(self, query: str, **kwargs: Any) -> JSONQueryDetail:
+        """
+        Call the ``.jmespath_detail()`` method for each element in this list
+        and return their combined result as a single :class:`JSONQueryDetail`.
+
+        .. versionadded:: VERSION
+
+        Every match and source in the returned object carries the index of
+        the element of this list it comes from.
+        """
+        return _merge_json_query_details(
+            [x.jmespath_detail(query, **kwargs) for x in self], query, "jmespath"
+        )
+
+    def jsonpath_detail(self, query: str) -> JSONQueryDetail:
+        """
+        Call the ``.jsonpath_detail()`` method for each element in this list
+        and return their combined result as a single :class:`JSONQueryDetail`.
+
+        .. versionadded:: VERSION
+
+        Every match and source in the returned object carries the index of
+        the element of this list it comes from.
+        """
+        return _merge_json_query_details(
+            [x.jsonpath_detail(query) for x in self], query, "jsonpath"
+        )
 
     def xpath(
         self,
@@ -473,10 +502,155 @@ class JSONPathError(ValueError):
     """
 
 
+def _json_type_name(value: Any) -> str:
+    """Return the JSON type name of *value*."""
+    if value is None:
+        return "null"
+    if isinstance(value, bool):
+        return "boolean"
+    if isinstance(value, (int, float)):
+        return "number"
+    if isinstance(value, str):
+        return "string"
+    if isinstance(value, list):
+        return "array"
+    if isinstance(value, dict):
+        return "object"
+    return type(value).__name__
+
+
+@dataclasses.dataclass(frozen=True)
+class JSONQueryMatch:
+    """A single value matched by a JMESPath or JSONPath query.
+
+    .. versionadded:: VERSION
+
+    ``value`` is the matched value as is. Falsy values (``False``, ``0``,
+    ``""``, ``[]``) and JSON ``null`` are kept, they are never treated as a
+    lack of a match.
+
+    ``value_type`` is the JSON type of ``value``: ``"null"``, ``"boolean"``,
+    ``"number"``, ``"string"``, ``"array"`` or ``"object"``.
+
+    ``path`` is the path of the matched node within the input document, or
+    ``None`` when the query backend cannot provide one (JMESPath never does).
+    Paths are never made up.
+
+    ``source_index`` is the index of the source selector when the query was
+    run on a :class:`SelectorList`, or ``None`` when it was run on a single
+    :class:`Selector`.
+    """
+
+    value: Any
+    value_type: str
+    path: str | None
+    source_index: int | None
+
+
+@dataclasses.dataclass(frozen=True)
+class JSONQuerySource:
+    """Diagnostics about one input document of a JMESPath or JSONPath query.
+
+    .. versionadded:: VERSION
+
+    ``index`` is the index of the source selector when the query was run on a
+    :class:`SelectorList`, or ``None`` when it was run on a single
+    :class:`Selector`.
+
+    ``is_json`` is ``False`` when the input is not JSON (e.g. an HTML
+    document without JSON in it), in which case the query was not really
+    evaluated and the empty result must not be read as a legitimate "no
+    match".
+    """
+
+    index: int | None
+    is_json: bool
+
+
+@dataclasses.dataclass(frozen=True)
+class JSONQueryDetail:
+    """Detailed result of a JMESPath or JSONPath query.
+
+    .. versionadded:: VERSION
+
+    ``matched`` is ``True`` when the query matched, ``False`` when it
+    definitely did not, and ``None`` when the backend cannot tell. JMESPath
+    returns ``None`` both for a missing key and for an explicit JSON
+    ``null``, so a ``None`` JMESPath result is reported as unknown instead of
+    as a fabricated hit or miss. Non-JSON input is also reported as unknown.
+
+    ``matches`` is a tuple of :class:`JSONQueryMatch` objects, one per
+    matched value.
+
+    ``sources`` is a tuple of :class:`JSONQuerySource` objects with
+    per-input diagnostics.
+    """
+
+    query: str
+    backend: Literal["jmespath", "jsonpath"]
+    matched: bool | None
+    matches: tuple[JSONQueryMatch, ...]
+    sources: tuple[JSONQuerySource, ...]
+
+    @property
+    def match_count(self) -> int:
+        """Number of matched values."""
+        return len(self.matches)
+
+    @property
+    def values(self) -> list[Any]:
+        """Matched values, in matching order."""
+        return [match.value for match in self.matches]
+
+    @property
+    def non_json_sources(self) -> tuple[int | None, ...]:
+        """Indexes of the sources whose input is not JSON."""
+        return tuple(source.index for source in self.sources if not source.is_json)
+
+
+def _merge_json_query_details(
+    details: list[JSONQueryDetail],
+    query: str,
+    backend: Literal["jmespath", "jsonpath"],
+) -> JSONQueryDetail:
+    """Combine per-selector details into one, keeping track of the index of
+    the source selector of every match and source."""
+    matches: list[JSONQueryMatch] = []
+    sources: list[JSONQuerySource] = []
+    unknown = False
+    for index, detail in enumerate(details):
+        sources.extend(
+            JSONQuerySource(index=index, is_json=source.is_json)
+            for source in detail.sources
+        )
+        matches.extend(
+            dataclasses.replace(match, source_index=index)
+            for match in detail.matches
+        )
+        if detail.matched is None:
+            unknown = True
+    matched: bool | None
+    if matches:
+        matched = True
+    elif unknown:
+        matched = None
+    else:
+        matched = False
+    return JSONQueryDetail(
+        query=query,
+        backend=backend,
+        matched=matched,
+        matches=tuple(matches),
+        sources=tuple(sources),
+    )
+
+
 @lru_cache(maxsize=1)
-def _jsonpath_backend() -> tuple[Any, Any, type[Exception]]:
-    """Return a query compiler, a function that runs a compiled query on data,
-    and the base error class of the underlying JSONPath package."""
+def _jsonpath_backend() -> tuple[Any, Any, Any, type[Exception]]:
+    """Return a query compiler, a function that runs a compiled query on data
+    and returns the matched values, a function that returns the matched
+    values with their paths, and the base error class of the underlying
+    JSONPath package."""
     try:
         import jsonpath_rfc9535  # noqa: PLC0415
     except ImportError:
@@ -486,6 +660,9 @@ def _jsonpath_backend() -> tuple[Any, Any, type[Exception]]:
         return (
             rfc9535_env.compile,
             lambda compiled, data: compiled.find(data).values(),
+            lambda compiled, data: [
+                (node.value, node.path()) for node in compiled.find(data)
+            ],
             jsonpath_rfc9535.JSONPathError,
         )
     try:
@@ -502,13 +679,16 @@ def _jsonpath_backend() -> tuple[Any, Any, type[Exception]]:
     return (
         jsonpath_env.compile,
         lambda compiled, data: compiled.findall(data),
+        lambda compiled, data: [
+            (match.value, match.path) for match in compiled.finditer(data)
+        ],
         jsonpath.JSONPathError,
     )
 
 
 @lru_cache(maxsize=512)
 def _compile_jsonpath(query: str) -> Any:
-    compile_query, run_query, backend_error = _jsonpath_backend()
+    compile_query, run_query, _, backend_error = _jsonpath_backend()
     try:
         compiled = compile_query(query)
     except backend_error as error:
@@ -521,6 +701,23 @@ def _compile_jsonpath(query: str) -> Any:
             raise JSONPathError(str(error))
 
     return find
+
+
+@lru_cache(maxsize=512)
+def _compile_jsonpath_detail(query: str) -> Any:
+    compile_query, _, run_detailed_query, backend_error = _jsonpath_backend()
+    try:
+        compiled = compile_query(query)
+    except backend_error as error:
+        raise JSONPathError(str(error))
+
+    def find_detailed(data: Any) -> list[tuple[Any, str | None]]:
+        try:
+            return run_detailed_query(compiled, data)
+        except backend_error as error:
+            raise JSONPathError(str(error))
+
+    return find_detailed
 
 
 class Selector:
@@ -666,6 +863,34 @@ class Selector:
         assert self.type in {"html", "xml"}  # nosec
         return _load_json_or_none(self.root.text)
 
+    def _json_source(self) -> tuple[Any, bool]:
+        """Return the JSON data to query and whether the input is JSON.
+
+        Unlike :meth:`_json_data`, the boolean flag tells a JSON ``null``
+        document apart from input that is not JSON at all.
+        """
+        if isinstance(self.root, str):
+            try:
+                return json.loads(self.root), True
+            except ValueError:
+                return None, False
+        if self.type == "json":
+            if self.root is not None:
+                return self.root, True
+            if self._text is not None:
+                # A None root with input text means either a JSON null
+                # document or input that failed to parse as JSON.
+                try:
+                    return json.loads(self._text), True
+                except ValueError:
+                    return None, False
+            return None, True
+        assert self.type in {"html", "xml"}  # nosec
+        try:
+            return json.loads(self.root.text), True
+        except (TypeError, ValueError):
+            return None, False
+
     def _json_selector_list(self, values: Any, query: str) -> SelectorList[Self]:
         def make_selector(x: Any) -> Selector:  # closure function
             if isinstance(x, str):
@@ -718,6 +943,106 @@ class Selector:
         """
         return self._json_selector_list(
             _compile_jsonpath(query)(self._json_data()), query
+        )
+
+    def jmespath_detail(self, query: str, **kwargs: Any) -> JSONQueryDetail:
+        """
+        Run the JMESPath ``query`` and return a :class:`JSONQueryDetail`
+        with the matched values, their JSON types, and diagnostics about the
+        input, instead of a :class:`SelectorList`.
+
+        .. versionadded:: VERSION
+
+        Unlike :meth:`jmespath`, this method reports whether the query
+        matched. JMESPath returns ``None`` both for a missing key and for an
+        explicit JSON ``null``, so when the result is ``None`` the
+        :attr:`~JSONQueryDetail.matched` attribute is ``None`` (unknown)
+        rather than a fabricated hit or miss, and no matches are reported.
+        Non-empty list results are flattened into one match per element,
+        while an empty list result is kept as a single ``"array"`` match, so
+        that falsy values are never lost.
+
+        ``query`` and any additional named arguments are the same as in
+        :meth:`jmespath`.
+        """
+        data, is_json = self._json_source()
+        source = JSONQuerySource(index=None, is_json=is_json)
+        if not is_json:
+            return JSONQueryDetail(
+                query=query,
+                backend="jmespath",
+                matched=None,
+                matches=(),
+                sources=(source,),
+            )
+        result = jmespath.search(query, data, **kwargs)
+        if result is None:
+            # JMESPath cannot tell a missing key apart from a JSON null.
+            return JSONQueryDetail(
+                query=query,
+                backend="jmespath",
+                matched=None,
+                matches=(),
+                sources=(source,),
+            )
+        values = result if isinstance(result, list) and result else [result]
+        matches = tuple(
+            JSONQueryMatch(
+                value=value,
+                value_type=_json_type_name(value),
+                path=None,
+                source_index=None,
+            )
+            for value in values
+        )
+        return JSONQueryDetail(
+            query=query,
+            backend="jmespath",
+            matched=True,
+            matches=matches,
+            sources=(source,),
+        )
+
+    def jsonpath_detail(self, query: str) -> JSONQueryDetail:
+        """
+        Run the JSONPath ``query`` and return a :class:`JSONQueryDetail`
+        with the matched values, their JSON types and paths, and diagnostics
+        about the input, instead of a :class:`SelectorList`.
+
+        .. versionadded:: VERSION
+
+        Unlike :meth:`jsonpath`, this method reports whether the query
+        matched. An explicit JSON ``null`` is reported as a match of type
+        ``"null"``, unlike a missing key. Invalid queries raise
+        :class:`JSONPathError`.
+
+        ``query`` is the same argument as the one in :meth:`Selector.jsonpath`.
+        """
+        data, is_json = self._json_source()
+        source = JSONQuerySource(index=None, is_json=is_json)
+        if not is_json:
+            return JSONQueryDetail(
+                query=query,
+                backend="jsonpath",
+                matched=None,
+                matches=(),
+                sources=(source,),
+            )
+        matches = tuple(
+            JSONQueryMatch(
+                value=value,
+                value_type=_json_type_name(value),
+                path=path,
+                source_index=None,
+            )
+            for value, path in _compile_jsonpath_detail(query)(data)
+        )
+        return JSONQueryDetail(
+            query=query,
+            backend="jsonpath",
+            matched=bool(matches),
+            matches=matches,
+            sources=(source,),
         )
 
     def xpath(
