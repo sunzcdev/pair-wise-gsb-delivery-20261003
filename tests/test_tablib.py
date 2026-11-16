@@ -8,6 +8,7 @@ import pickle
 import re
 import tempfile
 import unittest
+from copy import copy
 from decimal import Decimal
 from io import BytesIO, StringIO
 from pathlib import Path
@@ -228,6 +229,244 @@ class TablibTestCase(BaseTestCase):
             self.founders['initials'],
             ['JA', 'GW', 'TJ', 'SO', 'OS', 'AD']
         )
+
+    def test_dynamic_column_not_rebound_by_column_insert(self):
+        """Inserting a normal column before a dynamic column does not
+        rebind the calculator to another column."""
+
+        self.founders.append_col(lambda row: row[-1] * 2, header='double_gpa')
+        self.assertEqual(self.founders['double_gpa'], [180, 134, 100])
+
+        self.founders.insert_col(0, [10, 20, 30], header='age')
+
+        # The calculator followed its column and existing data was not
+        # recomputed.
+        self.assertEqual(
+            self.founders.headers,
+            ['age', 'first_name', 'last_name', 'gpa', 'double_gpa']
+        )
+        self.assertEqual(self.founders['double_gpa'], [180, 134, 100])
+
+        # A new row is still completed at the right position.
+        self.founders.append((40, 'Some', 'One', 71))
+        self.assertEqual(self.founders[3], (40, 'Some', 'One', 71, 142))
+
+    def test_dynamic_column_not_rebound_by_column_delete(self):
+        """Deleting a normal column before a dynamic column does not
+        rebind the calculator to another column."""
+
+        self.founders.append_col(lambda row: row[-1] * 2, header='double_gpa')
+
+        del self.founders['first_name']
+
+        self.assertEqual(self.founders['double_gpa'], [180, 134, 100])
+        self.founders.append(('One', 71))
+        self.assertEqual(self.founders[3], ('One', 71, 142))
+
+    def test_dynamic_column_delete_removes_calculator(self):
+        """Deleting a dynamic column removes its calculator."""
+
+        self.founders.append_col(lambda row: row[-1] * 2, header='double_gpa')
+        del self.founders['double_gpa']
+
+        self.assertEqual(self.founders._dynamic_columns, {})
+        # Rows are no longer completed dynamically.
+        self.founders.append(('Some', 'One', 71))
+        self.assertEqual(self.founders[3], ('Some', 'One', 71))
+        with self.assertRaises(tablib.InvalidDimensions):
+            self.founders.append(('Short', 'Row'))
+
+    def test_insert_callable_column_at_position(self):
+        """A callable column inserted at a given position is registered
+        at that position, not at the end."""
+
+        self.founders.lpush_col(lambda row: 'id', header='ident')
+        self.assertEqual(list(self.founders._dynamic_columns), [0])
+
+        self.founders.append(('Some', 'One', 71))
+        self.assertEqual(self.founders[3], ('id', 'Some', 'One', 71))
+
+    def test_multiple_dynamic_columns_stay_aligned(self):
+        """Multiple calculators keep their own positions whatever the
+        registration order."""
+
+        self.founders.append_col(lambda row: row[-1] * 2, header='double_gpa')
+        self.founders.lpush_col(lambda row: 'id', header='ident')
+
+        self.founders.append(('Some', 'One', 71))
+        self.assertEqual(self.founders[3], ('id', 'Some', 'One', 71, 142))
+
+    def test_dynamic_columns_survive_multiple_structural_edits(self):
+        """After a series of insertions and deletions, calculators are
+        still bound to their own columns and new rows are completed at
+        the right positions."""
+
+        self.founders.append_col(lambda row: row[-1] * 2, header='double_gpa')
+        self.founders.lpush_col(lambda row: 'id', header='ident')
+        self.founders.insert_col(2, ['a', 'b', 'c'], header='middle')
+        del self.founders['middle']
+        del self.founders['last_name']
+
+        self.assertEqual(
+            self.founders.headers,
+            ['ident', 'first_name', 'gpa', 'double_gpa']
+        )
+        self.assertEqual(self.founders['double_gpa'], [180, 134, 100])
+
+        self.founders.append(('New', 50))
+        self.assertEqual(self.founders[3], ('id', 'New', 50, 100))
+
+    def test_moving_normal_column_does_not_recompute_existing_data(self):
+        """Moving a normal column (delete + insert elsewhere) leaves the
+        materialized dynamic values untouched and the calculator bound
+        to its own column."""
+
+        self.founders.append_col(lambda row: row[0], header='echo')
+
+        gpa = self.founders['gpa']
+        del self.founders['gpa']
+        self.founders.insert_col(0, gpa, header='gpa')
+
+        # Existing dynamic values were not recomputed against the new
+        # column layout.
+        self.assertEqual(self.founders['echo'], ['John', 'George', 'Thomas'])
+        self.assertEqual(
+            self.founders.headers,
+            ['gpa', 'first_name', 'last_name', 'echo']
+        )
+
+        # New rows are still completed at the right position.
+        self.founders.append((55, 'New', 'Row'))
+        self.assertEqual(self.founders[3], (55, 'New', 'Row', 55))
+
+    def test_failing_calculator_leaves_no_partial_row(self):
+        """A calculator failure while appending a row leaves the dataset
+        untouched: no half-completed row is stored."""
+
+        def picky(row):
+            if row[0] == 'Bad':
+                raise ValueError('boom')
+            return row[-1] * 2
+
+        self.founders.append_col(picky, header='double_gpa')
+        height = self.founders.height
+
+        with self.assertRaises(ValueError):
+            self.founders.append(('Bad', 'Row', 10))
+
+        self.assertEqual(self.founders.height, height)
+        self.assertTrue(all(len(row) == self.founders.width
+                            for row in self.founders._data))
+
+        # The dataset still works afterwards.
+        self.founders.append(('Good', 'Row', 50))
+        self.assertEqual(self.founders[-1], ('Good', 'Row', 50, 100))
+
+    def test_failing_callable_column_insert_is_atomic(self):
+        """A callable that fails while its column is being added does not
+        leave a registered calculator behind."""
+
+        def boom(row):
+            raise ValueError('boom')
+
+        with self.assertRaises(ValueError):
+            self.founders.append_col(boom, header='bad')
+
+        self.assertEqual(self.founders.width, 3)
+        self.assertEqual(self.founders.headers, list(self.headers))
+        self.assertEqual(self.founders._dynamic_columns, {})
+
+    def test_copy_preserves_dynamic_columns_independently(self):
+        """copy() preserves the dynamic behavior, and structural edits on
+        the copy never rebind the calculators of the original."""
+
+        self.founders.append_col(lambda row: row[-1] * 2, header='double_gpa')
+
+        copied = copy(self.founders)
+        copied.append(('Some', 'One', 71))
+        self.assertEqual(copied[3], ('Some', 'One', 71, 142))
+        self.assertEqual(self.founders.height, 3)
+
+        copied.insert_col(0, [1, 2, 3, 4], header='age')
+        copied.append((40, 'Other', 'Two', 60))
+        self.assertEqual(copied[4], (40, 'Other', 'Two', 60, 120))
+
+        # The original is unaffected by the edits on the copy.
+        self.assertEqual(
+            self.founders.headers,
+            ['first_name', 'last_name', 'gpa', 'double_gpa']
+        )
+        self.founders.append(('Unaffected', 'Row', 50))
+        self.assertEqual(self.founders[3], ('Unaffected', 'Row', 50, 100))
+
+    def test_filter_preserves_dynamic_columns(self):
+        """filter() preserves the dynamic behavior in the result."""
+
+        self.founders.append_col(lambda row: row[-1] * 2, header='double_gpa')
+        self.founders.append(('Tagged', 'Row', 10), tags=['x'])
+
+        filtered = self.founders.filter('x')
+        self.assertEqual(filtered.height, 1)
+
+        filtered.append(('New', 'Row', 20))
+        self.assertEqual(filtered[-1], ('New', 'Row', 20, 40))
+
+    def test_stack_preserves_dynamic_columns(self):
+        """stack() preserves the dynamic behavior of the left dataset."""
+
+        self.founders.append_col(lambda row: row[-1] * 2, header='double_gpa')
+
+        other = tablib.Dataset(
+            headers=['first_name', 'last_name', 'gpa', 'double_gpa'])
+        other.append(('Some', 'One', 71, 142))
+
+        stacked = self.founders.stack(other)
+        self.assertEqual(stacked.height, 4)
+
+        stacked.append(('New', 'Row', 50))
+        self.assertEqual(stacked[-1], ('New', 'Row', 50, 100))
+        self.assertEqual(self.founders.height, 3)
+
+    def test_derived_datasets_drop_dynamic_columns(self):
+        """sort(), subset(), stack_cols() and transpose() return datasets
+        with materialized values only: no dynamic behavior is kept."""
+
+        self.founders.append_col(lambda row: row[-1] * 2, header='double_gpa')
+
+        subset = self.founders.subset(cols=['first_name', 'double_gpa'])
+        self.assertEqual(subset._dynamic_columns, {})
+        subset.append(('Some', 142))
+        self.assertEqual(subset[-1], ('Some', 142))
+
+        sorted_ = self.founders.sort('gpa')
+        self.assertEqual(sorted_._dynamic_columns, {})
+
+        other = tablib.Dataset(headers=['extra'])
+        other.extend([('x',), ('y',), ('z',)])
+        stacked = self.founders.stack_cols(other)
+        self.assertEqual(stacked._dynamic_columns, {})
+
+        transposed = self.founders.transpose()
+        self.assertEqual(transposed._dynamic_columns, {})
+
+    def test_wipe_clears_dynamic_columns(self):
+        """wipe() drops the calculators along with the content."""
+
+        self.founders.append_col(lambda row: row[-1] * 2, header='double_gpa')
+        self.founders.wipe()
+
+        self.assertEqual(self.founders._dynamic_columns, {})
+        self.founders.headers = self.headers
+        self.founders.append(self.john)
+        self.assertEqual(self.founders[0], self.john)
+
+    def test_setitem_completes_dynamic_columns(self):
+        """Replacing a row with only the non-dynamic values computes the
+        dynamic ones."""
+
+        self.founders.append_col(lambda row: row[-1] * 2, header='double_gpa')
+        self.founders[0] = ('John', 'Adams', 45)
+        self.assertEqual(self.founders[0], ('John', 'Adams', 45, 90))
 
     def test_header_slicing(self):
         """Verify slicing by headers."""

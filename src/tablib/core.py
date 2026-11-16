@@ -165,6 +165,10 @@ class Dataset:
         self._formatters = []
 
         # {col_index: col_func}
+        # Each calculator is bound to the identity of its column, not to a
+        # fixed position: structural edits (column insertions/deletions)
+        # update the positions here so a calculator always follows its own
+        # column.
         self._dynamic_columns = {}
 
         self.headers = kwargs.get('headers')
@@ -192,6 +196,8 @@ class Dataset:
 
     def __setitem__(self, key, value):
         self._validate(value)
+        if len(value) < self.width:
+            value = self._complete_row(value)
         self._data[key] = Row(value)
 
     def __delitem__(self, key):
@@ -203,8 +209,10 @@ class Dataset:
 
                 pos = self.headers.index(key)
                 del self.headers[pos]
-                if pos in self._dynamic_columns:
-                    del self._dynamic_columns[pos]
+                # Deleting a column also deletes the calculator bound to
+                # it (if any); calculators of the columns after it follow
+                # their own column to its new position.
+                self._remove_dynamic_column(pos)
 
                 for i, row in enumerate(self._data):
 
@@ -245,6 +253,57 @@ class Dataset:
     # ---------
     # Internals
     # ---------
+
+    def _complete_row(self, row):
+        """Return `row` completed with the computed values of the dynamic
+        columns, inserted at their current positions (in ascending order).
+
+        The row is completed locally first: if a calculator fails, the
+        exception propagates before anything is stored, so no
+        half-completed row is left behind in the dataset.
+        """
+        row = list(row)
+        for pos, func in sorted(self._dynamic_columns.items()):
+            row.insert(pos, func(row))
+        return row
+
+    def _shift_dynamic_columns(self, index, delta):
+        """Shift the positions of the dynamic columns located at or after
+        `index` by `delta`, so that each calculator keeps following its
+        own column when other columns are inserted or removed."""
+        if self._dynamic_columns:
+            self._dynamic_columns = {
+                (pos + delta if pos >= index else pos): func
+                for pos, func in self._dynamic_columns.items()
+            }
+
+    def _remove_dynamic_column(self, index):
+        """Drop the calculator bound to the column at `index` (if any) and
+        shift the calculators of the columns after it one position to the
+        left, so they stay bound to their own column."""
+        if self._dynamic_columns:
+            self._dynamic_columns = {
+                (pos - 1 if pos > index else pos): func
+                for pos, func in self._dynamic_columns.items()
+                if pos != index
+            }
+
+    def __copy__(self):
+        """A shallow copy that gets its own rows, headers, separators,
+        formatters and dynamic column calculators, so that later
+        structural edits on either the copy or the original never rebind
+        each other's calculators or mutate each other's rows. Dynamic
+        behavior is preserved: rows appended to the copy are still
+        completed by the calculators."""
+        _new = self.__class__()
+        _new.__dict__.update(self.__dict__)
+        _new._data = [row.copy() for row in self._data]
+        if self.__headers is not None:
+            _new.__headers = list(self.__headers)
+        _new._separators = list(self._separators)
+        _new._formatters = list(self._formatters)
+        _new._dynamic_columns = dict(self._dynamic_columns)
+        return _new
 
     def _get_in_format(self, fmt_key, **kwargs):
         return registry.get_format(fmt_key).export_set(self, **kwargs)
@@ -460,9 +519,7 @@ class Dataset:
 
         self._validate(row)
         if len(row) < self.width:
-            for pos, func in self._dynamic_columns.items():
-                row = list(row)
-                row.insert(pos, func(row))
+            row = self._complete_row(row)
         self._data.insert(index, Row(row, tags=tags))
 
     def rpush(self, row, tags=()):
@@ -538,6 +595,10 @@ class Dataset:
 
             data.append_col(col=random.randint)
 
+        The callable is bound to the identity of the new column, not to a
+        fixed position: inserting or deleting other columns before it does
+        not rebind it, and deleting its column removes the callable.
+
         If inserting a column, and :attr:`Dataset.headers` is set, the
         header attribute must be set, and will be considered the header for
         that row.
@@ -550,8 +611,13 @@ class Dataset:
 
         # Callable Columns...
         if callable(col):
-            self._dynamic_columns[self.width] = col
-            col = list(map(col, self._data))
+            func = col
+            # Compute the values before touching anything: if the callable
+            # fails, the dataset is left untouched and no calculator is
+            # registered for a column that was never inserted.
+            col = [func(row) for row in self._data]
+        else:
+            func = None
 
         col = self._clean_col(col)
         self._validate(col=col)
@@ -566,6 +632,15 @@ class Dataset:
                 raise InvalidDimensions
 
             self.headers.insert(index, header)
+
+        # A calculator is bound to its own column, not to a fixed
+        # position: the calculators of the columns at or after the
+        # insertion point follow their column to its new position, and
+        # the new calculator (if any) is registered at the actual
+        # insertion index.
+        self._shift_dynamic_columns(index, 1)
+        if func is not None:
+            self._dynamic_columns[index] = func
 
         if self.height and self.width:
 
@@ -648,6 +723,8 @@ class Dataset:
     def filter(self, tag):
         """Returns a new instance of the :class:`Dataset`, excluding any rows
         that do not contain the given :ref:`tags <tags>`.
+
+        Dynamic column calculators are preserved in the returned instance.
         """
         _dset = copy(self)
         _dset._data = [row for row in _dset._data if row.has_tag(tag)]
@@ -660,7 +737,8 @@ class Dataset:
         setting ``reverse`` to ``True``.
 
         Returns a new :class:`Dataset` instance where columns have been
-        sorted.
+        sorted. The new instance contains materialized values only:
+        dynamic column calculators are not carried over.
         """
 
         if isinstance(col, str):
@@ -733,7 +811,8 @@ class Dataset:
         """Transpose a :class:`Dataset`, turning rows into columns and vice
         versa, returning a new ``Dataset`` instance. If the instance has
         headers, the first row of the original instance becomes the new header
-        row."""
+        row. The new instance contains materialized values only: dynamic
+        column calculators are not carried over."""
 
         # Don't transpose if there is no data
         if not self:
@@ -747,7 +826,10 @@ class Dataset:
     def stack(self, other):
         """Stack two :class:`Dataset` instances together by
         joining at the row level, and return new combined
-        ``Dataset`` instance."""
+        ``Dataset`` instance.
+
+        Dynamic column calculators of this instance are preserved in the
+        result; rows appended to it are still completed dynamically."""
 
         if not isinstance(other, Dataset):
             raise TypeError("'other' must be a Dataset instance")
@@ -770,7 +852,10 @@ class Dataset:
         """Stack two :class:`Dataset` instances together by
         joining at the column level, and return a new
         combined ``Dataset`` instance. If either ``Dataset``
-        has headers set, than the other must as well."""
+        has headers set, than the other must as well.
+
+        The new instance contains materialized values only:
+        dynamic column calculators are not carried over."""
 
         if not isinstance(other, Dataset):
             raise TypeError("'other' must be a Dataset instance")
@@ -815,13 +900,20 @@ class Dataset:
         ]
 
     def wipe(self):
-        """Removes all content and headers from the :class:`Dataset` object."""
+        """Removes all content and headers from the :class:`Dataset` object.
+
+        Dynamic column calculators are dropped as well, since the columns
+        they were bound to no longer exist."""
         self._data = []
         self.__headers = None
+        self._dynamic_columns = {}
 
     def subset(self, rows=None, cols=None):
         """Returns a new instance of the :class:`Dataset`,
         including only specified rows and columns.
+
+        The new instance contains materialized values only:
+        dynamic column calculators are not carried over.
         """
 
         # Don't return if no data

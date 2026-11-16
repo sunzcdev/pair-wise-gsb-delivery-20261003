@@ -281,6 +281,23 @@ either provide all values in the row, or only the non-dynamic values and then
 the dynamic values will be automatically generated using the function initially
 provided for the column calculation.
 
+A dynamic column is bound to the identity of its column, not to a fixed
+position. Inserting or deleting other columns before it does not rebind the
+calculation to a different column, and rows appended afterwards still get
+their dynamic values at the right place. Deleting a dynamic column also
+removes its calculation, and moving a normal column never recomputes the
+values already stored in the rows.
+
+If the callable of a dynamic column raises an error while a row is being
+added, the dataset is left untouched: no half-completed row is stored.
+
+Derived datasets follow a single rule: :meth:`Dataset.filter`,
+:meth:`Dataset.stack` and ``copy.copy()`` preserve the dynamic columns (rows
+appended to the result are still completed dynamically), while
+:meth:`Dataset.sort`, :meth:`Dataset.subset`, :meth:`Dataset.stack_cols` and
+:meth:`Dataset.transpose` return new datasets containing materialized values
+only, without any dynamic behavior.
+
 ..versionchanged:: 3.6.0
 
     In older versions, you could only add new rows with fully-populated rows,
