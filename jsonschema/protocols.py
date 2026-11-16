@@ -82,6 +82,16 @@ class Validator(Protocol):
             its `extra (optional) dependencies <index:extras>` when
             invoking ``pip``.
 
+        content_validator:
+
+            if provided, a `jsonschema.ContentValidator` which will be
+            used to validate :kw:`contentEncoding`,
+            :kw:`contentMediaType` and :kw:`contentSchema` properties
+            present in the schema. If unprovided, *no* content
+            validation is done, and the presence of these keywords
+            within schemas is strictly informational (no decoding is
+            performed).
+
     .. deprecated:: v4.12.0
 
         Subclassing validator classes now explicitly warns this is not part of
@@ -117,6 +127,7 @@ class Validator(Protocol):
         schema: Mapping | bool,
         resolver: Any = None,  # deprecated
         format_checker: jsonschema.FormatChecker | None = None,
+        content_validator: jsonschema.ContentValidator | None = None,
         *,
         registry: referencing.jsonschema.SchemaRegistry = ...,
     ) -> None: ...
@@ -223,7 +234,7 @@ class Validator(Protocol):
 
         >>> validator = Draft202012Validator({})
         >>> validator.evolve(schema={"type": "number"})
-        Draft202012Validator(schema={'type': 'number'}, format_checker=None)
+        Draft202012Validator(schema={'type': 'number'}, ...)
 
         The returned object satisfies the validator protocol, but may not
         be of the same concrete class! In particular this occurs
@@ -233,5 +244,5 @@ class Validator(Protocol):
         >>> validator.evolve(
         ...     schema={"$schema": Draft7Validator.META_SCHEMA["$id"]}
         ... )
-        Draft7Validator(schema=..., format_checker=None)
+        Draft7Validator(schema=..., ...)
         """

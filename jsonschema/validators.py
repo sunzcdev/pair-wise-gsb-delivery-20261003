@@ -23,6 +23,7 @@ import referencing.exceptions
 import referencing.jsonschema
 
 from jsonschema import (
+    _content,
     _format,
     _keywords,
     _legacy_keywords,
@@ -237,6 +238,9 @@ def create(
         schema: referencing.jsonschema.Schema = field(repr=reprlib.repr)
         _ref_resolver = field(default=None, repr=False, alias="resolver")
         format_checker: _format.FormatChecker | None = field(default=None)
+        content_validator: _content.ContentValidator | None = field(
+            default=None,
+        )
         # TODO: include new meta-schemas added at runtime
         _registry: referencing.jsonschema.SchemaRegistry = field(
             default=_REMOTE_WARNING_REGISTRY,
@@ -730,6 +734,8 @@ Draft7Validator = create(
         "anyOf": _keywords.anyOf,
         "const": _keywords.const,
         "contains": _legacy_keywords.contains_draft6_draft7,
+        "contentEncoding": _content.contentEncoding,
+        "contentMediaType": _content.contentMediaType,
         "dependencies": _legacy_keywords.dependencies_draft4_draft6_draft7,
         "enum": _keywords.enum,
         "exclusiveMaximum": _keywords.exclusiveMaximum,
@@ -776,6 +782,9 @@ Draft201909Validator = create(
         "anyOf": _keywords.anyOf,
         "const": _keywords.const,
         "contains": _keywords.contains,
+        "contentEncoding": _content.contentEncoding,
+        "contentMediaType": _content.contentMediaType,
+        "contentSchema": _content.contentSchema,
         "dependentRequired": _keywords.dependentRequired,
         "dependentSchemas": _keywords.dependentSchemas,
         "enum": _keywords.enum,
@@ -824,6 +833,9 @@ Draft202012Validator = create(
         "anyOf": _keywords.anyOf,
         "const": _keywords.const,
         "contains": _keywords.contains,
+        "contentEncoding": _content.contentEncoding,
+        "contentMediaType": _content.contentMediaType,
+        "contentSchema": _content.contentSchema,
         "dependentRequired": _keywords.dependentRequired,
         "dependentSchemas": _keywords.dependentSchemas,
         "enum": _keywords.enum,

@@ -7,6 +7,10 @@ v4.27.0
   ``relevance`` no longer considers an error's position amongst its siblings.
   When subschemas fail equally deeply, the one which produced fewer errors is now preferred (#1002).
 * Errors produced by a ``false`` subschema now have the correct ``path`` and ``schema_path``, rather than empty ones.
+* Add opt-in validation of the ``contentEncoding``, ``contentMediaType`` and ``contentSchema`` keywords via the new ``jsonschema.ContentValidator`` policy, which is passed to validator classes as ``content_validator=``.
+  By default (and without one) these keywords remain purely annotations, and no decoding of instance strings is performed.
+  The initial implementation supports ``base64``-encoded ``application/json`` content along with ``contentSchema``, enforces an independent decoding byte budget, and reports unsupported encodings or media types according to the declared policy.
+  Errors are located at the outer string in the original document, with the path within the decoded content exposed separately as ``error.content_path``.
 * Accessing an index with no errors on an ``ErrorTree`` no longer causes that index to appear in the tree (#1328).
   Subtrees also properly propagate lookup errors which were previously missing when accessing indices not in the subtree.
 

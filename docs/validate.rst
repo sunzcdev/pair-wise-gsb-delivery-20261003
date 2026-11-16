@@ -307,3 +307,46 @@ Since in most cases "validating" an email address is an attempt instead to confi
 The same applies to the ``idn-email`` format.
 
 If you indeed want a particular well-specified set of emails to be considered valid, you can use `FormatChecker.checks` to provide your specific definition.
+
+
+Validating Content
+------------------
+
+JSON Schema defines the :kw:`contentEncoding`, :kw:`contentMediaType` and :kw:`contentSchema` keywords, which together describe strings whose contents encode another document (for example a base64-encoded JSON object).
+By default, as per the specification, these keywords are purely annotations: they are collected from the schema but no decoding or validation of the string's contents is performed.
+Optionally however, validation can be enabled by passing a `jsonschema.ContentValidator` to a `Validator`:
+
+.. doctest::
+
+    >>> schema = {
+    ...     "type": "string",
+    ...     "contentEncoding": "base64",
+    ...     "contentMediaType": "application/json",
+    ...     "contentSchema": {"type": "object", "required": ["n"]},
+    ... }
+    >>> validator = Draft202012Validator(
+    ...     schema, content_validator=ContentValidator(),
+    ... )
+    >>> validator.validate("eyJuIjogM30=")  # base64 of {"n": 3}
+
+The outer string is first checked to decode under its declared :kw:`contentEncoding`, then the decoded bytes are interpreted per :kw:`contentMediaType`, and finally the resulting object is validated against :kw:`contentSchema`:
+
+.. doctest::
+
+    >>> validator.validate("not base64!")
+    Traceback (most recent call last):
+        ...
+    ValidationError: 'not base64!' is not valid base64
+    >>> validator.validate("e30=")  # base64 of {}, which lacks "n"
+    Traceback (most recent call last):
+        ...
+    ValidationError: decoded content does not conform to contentSchema (at $ within the decoded content): 'n' is a required property
+
+Errors produced by content validation always refer to the *outer* string: their `jsonschema.exceptions.ValidationError.path` (and ``json_path``) locate the field within the original document, exactly as if no decoding had happened.
+When a :kw:`contentSchema` fails, the path *within the decoded content* is available separately as ``error.content_path``, and the full inner error as ``error.content_error``, so inner instance paths are never confused with paths into the original document.
+
+Decoding is bounded by an independent byte budget (``max_decoded_bytes``, defaulting to 1 MiB), and encodings or media types which the policy does not support are reported as unsupported (or ignored, if the policy's ``on_unsupported`` is set to ``"ignore"``).
+
+.. autoclass:: jsonschema.ContentValidator
+    :noindex:
+    :members:

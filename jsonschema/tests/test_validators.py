@@ -128,7 +128,8 @@ class TestCreateAndExtend(TestCase):
         self.addCleanup(validators._VALIDATORS.pop, "my version")
         self.assertEqual(
             repr(Validator({})),
-            "MyVersionValidator(schema={}, format_checker=None)",
+            "MyVersionValidator(schema={}, format_checker=None, "
+            "content_validator=None)",
         )
 
     def test_long_repr(self):
@@ -142,7 +143,7 @@ class TestCreateAndExtend(TestCase):
             repr(Validator({"a": list(range(1000))})),
             (
                 "MyVersionValidator(schema={'a': [0, 1, 2, 3, 4, 5, ...]}, "
-                "format_checker=None)"
+                "format_checker=None, content_validator=None)"
             ),
         )
 
@@ -150,7 +151,8 @@ class TestCreateAndExtend(TestCase):
         Validator = validators.create(meta_schema={})
         self.assertEqual(
             repr(Validator({})),
-            "Validator(schema={}, format_checker=None)",
+            "Validator(schema={}, format_checker=None, "
+            "content_validator=None)",
         )
 
     def test_dashes_are_stripped_from_validator_names(self):

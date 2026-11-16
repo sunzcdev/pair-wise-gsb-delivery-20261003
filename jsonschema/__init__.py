@@ -11,6 +11,7 @@ for you.
 
 import warnings
 
+from jsonschema._content import ContentValidator
 from jsonschema._format import FormatChecker
 from jsonschema._types import TypeChecker
 from jsonschema.exceptions import SchemaError, ValidationError
@@ -113,6 +114,7 @@ def __getattr__(name):
 
 
 __all__ = [
+    "ContentValidator",
     "Draft3Validator",
     "Draft4Validator",
     "Draft6Validator",
