@@ -331,12 +331,14 @@ def test_omit_default_roundtrip(cl_and_vals):
 
     inst = C()
     unstructured = converter.unstructure(inst)
-    assert unstructured == {}
+    # `a` has a static default and is omitted; `b` has a factory default and
+    # is kept, since factories are not called to detect defaults.
+    assert unstructured == {"b": converter.unstructure(inst.b)}
     assert inst == converter.structure(unstructured, C)
 
     inst = C(0)
     unstructured = converter.unstructure(inst)
-    assert unstructured == {"a": 0}
+    assert unstructured == {"a": 0, "b": converter.unstructure(inst.b)}
     assert inst == converter.structure(unstructured, C)
 
 
@@ -344,6 +346,9 @@ def test_omit_default_roundtrip(cl_and_vals):
 def test_omit_default_with_attrs_converter_roundtrip(cl_and_vals):
     """
     Omit default with an attrs converter works.
+
+    Attrs converters are applied to static defaults before comparing; factory
+    defaults are kept, since factories are not called to detect defaults.
     """
     converter = Converter(omit_if_default=True)
     cl, vals, kwargs = cl_and_vals
@@ -352,36 +357,42 @@ def test_omit_default_with_attrs_converter_roundtrip(cl_and_vals):
     class C:
         a1: int = field(default="1", converter=int)
         a2: int = field(default="1", converter=attrs.Converter(int))
-        a3: int = field(factory=lambda: "1", converter=int)
-        a4: int = field(factory=lambda: "1", converter=attrs.Converter(int))
-        a5: int = field(
-            factory=lambda: "2",
+        a3: int = field(
+            default="2",
             converter=attrs.Converter(
-                lambda obj, self: int(obj) + self.a4, takes_self=True
+                lambda obj, self: int(obj) + self.a2, takes_self=True
             ),
         )
-        a6: int = field(
-            factory=lambda: "2",
+        a4: int = field(
+            default="2",
             converter=attrs.Converter(
-                lambda obj, field: int(obj) + int(field.default.factory()) - 2,
+                lambda obj, field: int(obj) + int(field.default) - 2,
                 takes_field=True,
             ),
         )
-        a7: int = field(
-            factory=lambda: "3",
+        a5: int = field(
+            default="3",
             converter=attrs.Converter(
                 lambda obj, self, field: (
-                    int(obj) + self.a6 + int(field.default.factory()) - 3
+                    int(obj) + self.a4 + int(field.default) - 3
                 ),
                 takes_self=True,
                 takes_field=True,
             ),
         )
+        b1: int = field(factory=lambda: "1", converter=int)
+        b2: int = field(factory=lambda: "1", converter=attrs.Converter(int))
         c: cl = Factory(lambda: cl(*vals, **kwargs))
 
     inst = C()
     unstructured = converter.unstructure(inst)
-    assert unstructured == {}
+    # Static defaults (a1-a5) are omitted; factory defaults (b1, b2, c) are
+    # kept, since factories are not called to detect defaults.
+    assert unstructured == {
+        "b1": 1,
+        "b2": 1,
+        "c": converter.unstructure(inst.c),
+    }
     assert inst == converter.structure(unstructured, C)
 
     inst = C(0, 0, 0, 0, 0, 0, 0)
@@ -392,8 +403,9 @@ def test_omit_default_with_attrs_converter_roundtrip(cl_and_vals):
         "a3": 0,
         "a4": 0,
         "a5": 0,
-        "a6": 0,
-        "a7": 0,
+        "b1": 0,
+        "b2": 0,
+        "c": converter.unstructure(inst.c),
     }
     assert inst == converter.structure(unstructured, C)
 

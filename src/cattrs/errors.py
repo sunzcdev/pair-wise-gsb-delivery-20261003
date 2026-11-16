@@ -115,6 +115,30 @@ class ClassValidationError(BaseValidationError):
         return excs_with_notes, other_excs
 
 
+class DefaultComparisonError(CattrsError, TypeError):
+    """
+    Raised when comparing an attribute value against its default fails while
+    unstructuring with ``omit_if_default``.
+
+    This happens when the equality function (the default ``==`` or a custom
+    ``default_eq``) raises an exception, or when it produces a non-boolean
+    result (like a NumPy array), which cannot be interpreted as a definitive
+    answer.
+
+    The attributes `cl` and `attribute_name` locate the field which failed
+    to compare.
+    """
+
+    def __init__(self, message: str, cl: type, attribute_name: str) -> None:
+        super().__init__(message, cl, attribute_name)
+        self.message = message
+        self.cl = cl
+        self.attribute_name = attribute_name
+
+    def __str__(self) -> str:
+        return self.message
+
+
 class ForbiddenExtraKeysError(CattrsError):
     """
     Raised when `forbid_extra_keys` is activated and such extra keys are detected

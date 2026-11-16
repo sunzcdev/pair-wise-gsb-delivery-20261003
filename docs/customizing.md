@@ -188,18 +188,24 @@ The hook factories are also good building blocks for more complex customizations
 Another reason is overriding behavior on a per-attribute basis.
 
 Currently, the overrides only support generating dictionary un/structuring hooks (as opposed to tuples),
-and support `omit_if_default`, `forbid_extra_keys`, `rename` and `omit`.
+and support `omit_if_default` (including `default_baseline` and `default_eq`), `forbid_extra_keys`, `rename` and `omit`.
 
 ### `omit_if_default`
 ```{currentmodule} cattrs.gen
 ```
 
 This override can be applied on a per-class or per-attribute basis.
-The generated unstructuring hook will skip unstructuring values that are equal to their default or factory values.
+The generated unstructuring hook will skip unstructuring values that are equal to their defaults.
 By default, {func}`make_dict_unstructure_fn` and {func}`make_dict_unstructure_fn_from_attrs`
 inherit the converter's `omit_if_default` setting (`False` for a {class}`cattrs.BaseConverter`).
 Pass `_cattrs_omit_if_default=True` or `_cattrs_omit_if_default=False` to override this setting
 for a particular hook; per-attribute overrides take precedence over either value.
+
+Static default values are compared against directly.
+Attributes with factory defaults participate in omission only when an explicit baseline is
+provided via `override(default_baseline=...)`; factories are never called (and no model
+instance is constructed) to detect defaults, so without a baseline the attribute is always
+kept in the output.
 
 If a default-valued field is needed to select a class during structuring, such as a `Literal` discriminator, preserve it with `override(omit_if_default=False)`.
 This also applies when using {func}`cattrs.strategies.include_subclasses` with `overrides`, since those generated hooks now inherit the converter setting.
@@ -217,7 +223,7 @@ For example, pass `overrides={"kind": override(omit_if_default=False)}` to keep 
 >>> c = cattrs.Converter()
 >>> c.register_unstructure_hook(
 ...     WithDefault, 
-...     make_dict_unstructure_fn(WithDefault, c, b=override(omit_if_default=True)),
+...     make_dict_unstructure_fn(WithDefault, c, b=override(omit_if_default=True, default_baseline={})),
 ... )
 >>> c.unstructure(WithDefault(1))
 {'a': 1}
@@ -252,6 +258,42 @@ The parameter to {meth}`make_dict_unstructure_fn` is named ``_cattrs_omit_if_def
 >>> c.register_unstructure_hook(TestClass, hook)
 >>> c.unstructure(TestClass())
 {'b': ...}
+```
+
+#### Customizing the default comparison
+
+When `omit_if_default` is in effect for a field, the comparison target and the equality
+function can be customized per field:
+
+- `override(default_baseline=...)` provides an explicit value to compare the attribute
+  against, instead of the attribute default. The baseline is compared against the
+  attribute value directly; _attrs_ converters are not applied to it. This is the only
+  way to omit attributes with factory defaults.
+- `override(default_eq=...)` provides a custom equality function, called with the
+  attribute value and the default (or baseline). It must return a boolean.
+
+The comparison is checked: if the equality function raises, or returns a non-boolean
+result (like a NumPy array, which cannot be implicitly truth-tested), a
+{class}`cattrs.errors.DefaultComparisonError` is raised identifying the class and
+attribute involved.
+
+```{doctest}
+
+>>> from cattrs.gen import make_dict_unstructure_fn, override
+
+>>> @define
+... class CaseInsensitive:
+...     name: str = "FOO"
+
+>>> c = cattrs.Converter(omit_if_default=True)
+>>> c.register_unstructure_hook(
+...     CaseInsensitive,
+...     make_dict_unstructure_fn(
+...         CaseInsensitive, c, name=override(default_eq=lambda v, d: v.upper() == d)
+...     ),
+... )
+>>> c.unstructure(CaseInsensitive("foo"))
+{}
 ```
 
 This override has no effect when generating structuring functions.

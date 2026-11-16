@@ -11,7 +11,11 @@ from hypothesis.strategies import data, just, one_of, sampled_from
 
 from cattrs import BaseConverter, Converter
 from cattrs._compat import adapted_fields, fields
-from cattrs.errors import ClassValidationError, ForbiddenExtraKeysError
+from cattrs.errors import (
+    ClassValidationError,
+    DefaultComparisonError,
+    ForbiddenExtraKeysError,
+)
 from cattrs.gen import (
     make_dict_structure_fn,
     make_dict_unstructure_fn,
@@ -101,16 +105,9 @@ def test_nodefs_generated_unstructuring_cl(
                 else:
                     assert attr.name in res
             else:
-                # The default is a factory, but might take self.
-                if attr.default.takes_self:
-                    # Our strategies can only produce these for now.
-                    assert val == attr.default.factory(cl)
-                    assert attr.name not in res
-                else:
-                    if val == attr.default.factory():
-                        assert attr.name not in res
-                    else:
-                        assert attr.name in res
+                # Factory defaults are never called to detect defaults, so
+                # the field is always kept without an explicit baseline.
+                assert attr.name in res
 
 
 @pytest.mark.parametrize("decorate", [define, dataclass])
@@ -183,6 +180,286 @@ def test_omit_if_default_from_converter_attribute_overrides(
     )
 
 
+@pytest.mark.parametrize("from_attrs", [False, True])
+def test_omit_if_default_factory_not_called(from_attrs):
+    """Default factories are not called to detect defaults; fields are kept."""
+    calls = []
+
+    @define
+    class A:
+        a: int = 1
+        b: list = Factory(lambda: calls.append(1) or [])
+
+    converter = Converter(omit_if_default=True)
+    if from_attrs:
+        hook = make_dict_unstructure_fn_from_attrs(adapted_fields(A), A, converter)
+    else:
+        hook = make_dict_unstructure_fn(A, converter)
+    converter.register_unstructure_hook(A, hook)
+
+    inst = A()
+    assert inst.b == []
+    calls.clear()
+
+    # The static default is omitted, the factory default is kept.
+    assert converter.unstructure(inst) == {"b": []}
+    assert converter.unstructure(A(2, [1])) == {"a": 2, "b": [1]}
+    assert calls == []
+
+
+@pytest.mark.parametrize("from_attrs", [False, True])
+def test_omit_if_default_factory_takes_self_kept(from_attrs):
+    """Factories taking self are also not called; their fields are kept."""
+
+    @define
+    class A:
+        a: int = 1
+        b: int = Factory(lambda self: self.a + 1, takes_self=True)
+
+    converter = Converter(omit_if_default=True)
+    if from_attrs:
+        hook = make_dict_unstructure_fn_from_attrs(adapted_fields(A), A, converter)
+    else:
+        hook = make_dict_unstructure_fn(A, converter)
+    converter.register_unstructure_hook(A, hook)
+
+    assert converter.unstructure(A(1)) == {"b": 2}
+    assert converter.unstructure(A(5)) == {"a": 5, "b": 6}
+
+
+def test_omit_if_default_does_not_instantiate():
+    """No new model instances are constructed to detect defaults."""
+    instances = []
+
+    @define
+    class A:
+        b: list = Factory(list)
+
+        def __attrs_post_init__(self):
+            instances.append(self)
+
+    converter = Converter(omit_if_default=True)
+    hook = make_dict_unstructure_fn(A, converter)
+    converter.register_unstructure_hook(A, hook)
+
+    inst = A()
+    assert len(instances) == 1
+
+    converter.unstructure(inst)
+    converter.unstructure(inst)
+    assert len(instances) == 1
+
+
+@pytest.mark.parametrize("from_attrs", [False, True])
+def test_omit_if_default_factory_baseline(from_attrs):
+    """Factory defaults participate in omission given an explicit baseline."""
+
+    @define
+    class A:
+        a: int = 1
+        b: list = Factory(list)
+
+    converter = Converter(omit_if_default=True)
+    if from_attrs:
+        hook = make_dict_unstructure_fn_from_attrs(
+            adapted_fields(A), A, converter, b=override(default_baseline=[])
+        )
+    else:
+        hook = make_dict_unstructure_fn(A, converter, b=override(default_baseline=[]))
+    converter.register_unstructure_hook(A, hook)
+
+    assert converter.unstructure(A()) == {}
+    assert converter.unstructure(A(b=[1])) == {"b": [1]}
+    assert converter.unstructure(A(2)) == {"a": 2}
+
+
+def test_omit_if_default_baseline_per_field():
+    """A baseline enables omission for a single field on its own."""
+
+    @define
+    class A:
+        a: int = 1
+        b: list = Factory(list)
+
+    converter = Converter()
+    converter.register_unstructure_hook(
+        A,
+        make_dict_unstructure_fn(
+            A, converter, b=override(omit_if_default=True, default_baseline=[])
+        ),
+    )
+
+    assert converter.unstructure(A()) == {"a": 1}
+    assert converter.unstructure(A(b=[1])) == {"a": 1, "b": [1]}
+
+
+def test_baseline_alone_does_not_enable_omission():
+    """A baseline without omit_if_default does not omit anything."""
+
+    @define
+    class A:
+        b: list = Factory(list)
+
+    converter = Converter()
+    converter.register_unstructure_hook(
+        A, make_dict_unstructure_fn(A, converter, b=override(default_baseline=[]))
+    )
+
+    assert converter.unstructure(A()) == {"b": []}
+
+
+def test_omit_if_default_baseline_without_default():
+    """A baseline can serve as the comparison reference for a field
+    without a default."""
+
+    @define
+    class A:
+        a: int
+
+    converter = Converter()
+    converter.register_unstructure_hook(
+        A,
+        make_dict_unstructure_fn(
+            A, converter, a=override(omit_if_default=True, default_baseline=0)
+        ),
+    )
+
+    assert converter.unstructure(A(0)) == {}
+    assert converter.unstructure(A(1)) == {"a": 1}
+
+
+def test_omit_if_default_baseline_with_attrs_converter():
+    """Baselines are compared against converted attribute values directly;
+    attrs converters are not applied to them."""
+
+    @define
+    class A:
+        a: int = field(factory=lambda: "1", converter=int)
+
+    converter = Converter(omit_if_default=True)
+    converter.register_unstructure_hook(
+        A, make_dict_unstructure_fn(A, converter, a=override(default_baseline=1))
+    )
+
+    assert converter.unstructure(A()) == {}
+    assert converter.unstructure(A(2)) == {"a": 2}
+
+
+def test_omit_if_default_custom_eq():
+    """A custom equality function is used for the default comparison."""
+
+    @define
+    class A:
+        name: str = "FOO"
+
+    converter = Converter(omit_if_default=True)
+    converter.register_unstructure_hook(
+        A,
+        make_dict_unstructure_fn(
+            A, converter, name=override(default_eq=lambda v, d: v.upper() == d)
+        ),
+    )
+
+    assert converter.unstructure(A("foo")) == {}
+    assert converter.unstructure(A("bar")) == {"name": "bar"}
+
+
+def test_omit_if_default_custom_eq_with_baseline():
+    """Custom equality functions also apply to explicit baselines."""
+
+    @define
+    class A:
+        b: list = Factory(list)
+
+    converter = Converter(omit_if_default=True)
+    converter.register_unstructure_hook(
+        A,
+        make_dict_unstructure_fn(
+            A,
+            converter,
+            b=override(default_baseline=[0], default_eq=lambda v, d: len(v) == len(d)),
+        ),
+    )
+
+    assert converter.unstructure(A([1])) == {}
+    assert converter.unstructure(A([1, 2])) == {"b": [1, 2]}
+
+
+def test_omit_if_default_eq_error_locates_field():
+    """Errors from custom equality functions are localized to the field."""
+
+    def bad_eq(v, d):
+        raise ValueError("boom")
+
+    @define
+    class A:
+        a: int = 1
+        name: str = "x"
+
+    converter = Converter(omit_if_default=True)
+    converter.register_unstructure_hook(
+        A, make_dict_unstructure_fn(A, converter, name=override(default_eq=bad_eq))
+    )
+
+    with pytest.raises(DefaultComparisonError) as exc_info:
+        converter.unstructure(A(name="y"))
+
+    exc = exc_info.value
+    assert exc.cl is A
+    assert exc.attribute_name == "name"
+    assert "name" in str(exc)
+    assert isinstance(exc.__cause__, ValueError)
+
+
+def test_omit_if_default_non_boolean_eq_result():
+    """Non-boolean custom equality results are not implicitly truth-tested."""
+
+    @define
+    class A:
+        a: int = 1
+
+    converter = Converter(omit_if_default=True)
+    converter.register_unstructure_hook(
+        A,
+        make_dict_unstructure_fn(
+            A, converter, a=override(default_eq=lambda v, d: [True])
+        ),
+    )
+
+    with pytest.raises(DefaultComparisonError) as exc_info:
+        converter.unstructure(A())
+
+    assert exc_info.value.attribute_name == "a"
+    assert isinstance(exc_info.value, TypeError)
+
+
+def test_omit_if_default_non_boolean_comparison_result():
+    """Array-like values, whose == is element-wise, are not truth-tested."""
+
+    class ArrayLike:
+        """Like a NumPy array, == produces a non-boolean result."""
+
+        def __eq__(self, other):
+            return [True, True]
+
+        def __ne__(self, other):
+            return [False, False]
+
+    @define
+    class A:
+        x: object = None
+
+    converter = Converter(omit_if_default=True)
+
+    with pytest.raises(DefaultComparisonError) as exc_info:
+        converter.unstructure(A(ArrayLike()))
+
+    exc = exc_info.value
+    assert exc.cl is A
+    assert exc.attribute_name == "x"
+    assert isinstance(exc, TypeError)
+
+
 @given(
     one_of(just(BaseConverter), just(Converter)),
     nested_classes()
@@ -232,13 +509,9 @@ def test_individual_overrides(converter_cls, cl_and_vals):
                 else:
                     assert attr.name in res
             else:
-                if attr.default.takes_self:
-                    assert attr.name not in res
-                else:
-                    if val == attr.default.factory():
-                        assert attr.name not in res
-                    else:
-                        assert attr.name in res
+                # Factory defaults are never called to detect defaults, so
+                # the field is always kept without an explicit baseline.
+                assert attr.name in res
 
 
 @given(

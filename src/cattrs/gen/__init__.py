@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import re
 from collections.abc import Callable, Iterable, Mapping
+from operator import eq as _operator_eq
 from typing import TYPE_CHECKING, Any, Final, Literal, TypeVar
 
 from attrs import NOTHING, Attribute, Converter, Factory, evolve
@@ -23,6 +24,7 @@ from ..dispatch import UnstructureHook
 from ..errors import (
     AttributeValidationNote,
     ClassValidationError,
+    DefaultComparisonError,
     ForbiddenExtraKeysError,
     IterableValidationError,
     IterableValidationNote,
@@ -57,12 +59,67 @@ def override(
     omit: bool | None = None,
     struct_hook: Callable[[Any, Any], Any] | None = None,
     unstruct_hook: Callable[[Any], Any] | None = None,
+    default_baseline: Any = NOTHING,
+    default_eq: Callable[[Any, Any], bool] | None = None,
 ) -> AttributeOverride:
     """Override how a particular field is handled.
 
     :param omit: Whether to skip the field or not. `None` means apply default handling.
+    :param default_baseline: An explicit value to compare the attribute value
+        against when `omit_if_default` is in effect, instead of the attribute
+        default. The baseline is compared against the attribute value directly
+        (any _attrs_ converters are not applied to it). This is the only way to
+        omit attributes with factory defaults, since factories are never called
+        to detect defaults.
+    :param default_eq: A custom equality function for the default comparison,
+        called with the attribute value and the default (or baseline, if
+        provided). It must return a boolean; anything else raises a
+        :class:`DefaultComparisonError <cattrs.errors.DefaultComparisonError>`.
+
+    .. versionchanged:: NEXT
+        Added the `default_baseline` and `default_eq` parameters.
     """
-    return AttributeOverride(omit_if_default, rename, omit, struct_hook, unstruct_hook)
+    return AttributeOverride(
+        omit_if_default,
+        rename,
+        omit,
+        struct_hook,
+        unstruct_hook,
+        default_baseline,
+        default_eq,
+    )
+
+
+def _make_default_comparator(
+    eq: Callable[[Any, Any], bool], cl: type, attr_name: str
+) -> Callable[[Any, Any], bool]:
+    """Make a checked comparator of attribute values against their defaults.
+
+    The comparator localizes any error to the given field, and refuses to
+    implicitly truth-test non-boolean comparison results (like NumPy arrays).
+    """
+
+    def compare(value: Any, default: Any) -> bool:
+        try:
+            res = eq(value, default)
+        except Exception as exc:
+            raise DefaultComparisonError(
+                f"Error comparing attribute {attr_name!r} of {cl.__name__} "
+                "against its default",
+                cl,
+                attr_name,
+            ) from exc
+        if not isinstance(res, bool):
+            raise DefaultComparisonError(
+                f"Comparing attribute {attr_name!r} of {cl.__name__} against its "
+                f"default produced a non-boolean result of type "
+                f"{type(res).__name__}; the equality function must return a bool",
+                cl,
+                attr_name,
+            )
+        return res
+
+    return compare
 
 
 T = TypeVar("T")
@@ -91,7 +148,10 @@ def make_dict_unstructure_fn_from_attrs(
         module name and qualname.
     :param _cattrs_omit_if_default: if true, attributes equal to their default values
         will be omitted in the result dictionary. By default, the value is taken
-        from the converter, or is false for a `BaseConverter`.
+        from the converter, or is false for a `BaseConverter`. Attributes with
+        factory defaults are only omitted when an explicit
+        :func:`override(default_baseline=...) <cattrs.gen.override>` is provided
+        for them; otherwise they are always kept.
     :param _cattrs_use_alias: If true, the attribute alias will be used as the
         dictionary key by default.
     :param _cattrs_include_init_false: If true, _attrs_ fields marked as `init=False`
@@ -108,6 +168,15 @@ def make_dict_unstructure_fn_from_attrs(
         When `_cattrs_omit_if_default` is true and the attribute has an attrs converter
         specified, the converter is applied to the default value before checking if it
         is equal to the attribute's value.
+    .. versionchanged:: NEXT
+        When omitting defaults, default factories are no longer called to
+        produce a comparison value; attributes with factory defaults are kept
+        unless an explicit baseline is provided via
+        :func:`override(default_baseline=...) <cattrs.gen.override>`. The
+        default comparison is checked: errors are localized to the field and
+        non-boolean comparison results raise
+        :class:`DefaultComparisonError <cattrs.errors.DefaultComparisonError>`
+        instead of being implicitly truth-tested.
     """
 
     fn_name = "unstructure_" + cl.__name__
@@ -189,44 +258,72 @@ def make_dict_unstructure_fn_from_attrs(
         else:
             invoke = f"instance.{attr_name}"
 
-        if d is not NOTHING and (
+        wants_omit_if_default = (
             (_cattrs_omit_if_default and override.omit_if_default is not False)
             or override.omit_if_default
-        ):
+        )
+        baseline = override.default_baseline
+
+        # Determine the reference value for the default comparison. Static
+        # defaults are compared against directly. Factory defaults participate
+        # in omission only when an explicit baseline is provided; factories are
+        # never called (and no model instance is constructed) to detect
+        # defaults, so fields without a baseline are always kept.
+        if not wants_omit_if_default:
+            reference = NOTHING
+        elif baseline is not NOTHING:
+            reference = baseline
+        elif d is not NOTHING and not isinstance(d, Factory):
+            reference = d
+        else:
+            reference = NOTHING
+
+        if reference is not NOTHING:
             def_name = f"__c_def_{attr_name}"
 
-            if isinstance(d, Factory):
-                globs[def_name] = d.factory
-                internal_arg_parts[def_name] = d.factory
-                def_str = f"{def_name}(instance)" if d.takes_self else f"{def_name}()"
+            if baseline is not NOTHING:
+                # The baseline is compared against the attribute value
+                # directly, so attrs converters are not applied to it.
+                globs[def_name] = baseline
+                internal_arg_parts[def_name] = baseline
+                def_str = def_name
             else:
                 globs[def_name] = d
                 internal_arg_parts[def_name] = d
                 def_str = def_name
 
-            c = a.converter
-            if c is not None:
-                conv_name = f"__c_conv_{attr_name}"
-                if isinstance(c, Converter):
-                    globs[conv_name] = c
-                    internal_arg_parts[conv_name] = c
-                    field_name = f"__c_field_{attr_name}"
-                    globs[field_name] = a
-                    internal_arg_parts[field_name] = a
-                    def_str = f"{conv_name}({def_str}, instance, {field_name})"
-                elif isinstance(d, Factory):
-                    globs[conv_name] = c
-                    internal_arg_parts[conv_name] = c
-                    def_str = f"{conv_name}({def_str})"
-                else:
-                    globs[def_name] = c(d)
-                    internal_arg_parts[def_name] = c(d)
+                c = a.converter
+                if c is not None:
+                    conv_name = f"__c_conv_{attr_name}"
+                    if isinstance(c, Converter):
+                        globs[conv_name] = c
+                        internal_arg_parts[conv_name] = c
+                        field_name = f"__c_field_{attr_name}"
+                        globs[field_name] = a
+                        internal_arg_parts[field_name] = a
+                        def_str = f"{conv_name}({def_str}, instance, {field_name})"
+                    else:
+                        globs[def_name] = c(d)
+                        internal_arg_parts[def_name] = c(d)
 
-            lines.append(f"  if instance.{attr_name} != {def_str}:")
+            cmp_name = f"__c_cmp_{attr_name}"
+            comparator = _make_default_comparator(
+                (
+                    override.default_eq
+                    if override.default_eq is not None
+                    else _operator_eq
+                ),
+                cl,
+                attr_name,
+            )
+            globs[cmp_name] = comparator
+            internal_arg_parts[cmp_name] = comparator
+
+            lines.append(f"  if not {cmp_name}(instance.{attr_name}, {def_str}):")
             lines.append(f"    res[{kn!r}] = {invoke}")
 
         else:
-            # No default or no override.
+            # No default, no comparable reference, or no override.
             invocation_lines.append(f"{kn!r}: {invoke},")
 
     internal_arg_line = ", ".join([f"{i}={i}" for i in internal_arg_parts])
@@ -274,7 +371,10 @@ def make_dict_unstructure_fn(
 
     :param _cattrs_omit_if_default: if true, attributes equal to their default values
         will be omitted in the result dictionary. By default, the value is taken
-        from the converter, or is false for a `BaseConverter`.
+        from the converter, or is false for a `BaseConverter`. Attributes with
+        factory defaults are only omitted when an explicit
+        :func:`override(default_baseline=...) <cattrs.gen.override>` is provided
+        for them; otherwise they are always kept.
     :param _cattrs_use_alias: If true, the attribute alias will be used as the
         dictionary key by default.
     :param _cattrs_include_init_false: If true, _attrs_ fields marked as `init=False`
@@ -288,6 +388,11 @@ def make_dict_unstructure_fn(
     .. versionchanged:: 26.1.0
         `typing.Annotated[T, override()]` is now recognized and can be used to customize
         unstructuring.
+    .. versionchanged:: NEXT
+        When omitting defaults, default factories are no longer called to
+        produce a comparison value; attributes with factory defaults are kept
+        unless an explicit baseline is provided via
+        :func:`override(default_baseline=...) <cattrs.gen.override>`.
     """
     origin = get_origin(cl)
     attrs = adapted_fields(origin or cl)  # type: ignore

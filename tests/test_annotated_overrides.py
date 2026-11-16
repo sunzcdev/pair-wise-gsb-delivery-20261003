@@ -1,7 +1,7 @@
 from dataclasses import dataclass
 from typing import Annotated, NamedTuple, TypedDict
 
-from attrs import define
+from attrs import Factory, define
 
 from cattrs import Converter
 from cattrs._compat import NotRequired
@@ -133,6 +133,23 @@ def test_annotated_override_omit_if_default(genconverter: Converter):
     # a matches default, should be omitted. b matches default but no override, should stay (default behavior is to keep)
     assert genconverter.unstructure(A()) == {"b": 1}
     assert genconverter.unstructure(A(a=1)) == {"a": 1, "b": 1}
+
+
+def test_annotated_override_default_baseline(genconverter: Converter):
+    """default_baseline and default_eq work in Annotated."""
+
+    @define
+    class A:
+        a: Annotated[int, override(omit_if_default=True, default_baseline=0)] = (
+            Factory(int)
+        )
+        b: Annotated[str, override(omit_if_default=True, default_eq=str.__eq__)] = (
+            "x"
+        )
+
+    # a matches the baseline, b matches the default; both are omitted.
+    assert genconverter.unstructure(A()) == {}
+    assert genconverter.unstructure(A(1, "y")) == {"a": 1, "b": "y"}
 
 
 def test_overrides_attribute_populated(genconverter: Converter):

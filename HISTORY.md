@@ -13,6 +13,11 @@ Our backwards-compatibility policy can be found [here](https://github.com/python
 
 ## NEXT
 
+- When unstructuring with `omit_if_default`, default factories are no longer called to produce a comparison value.
+  Attributes with factory defaults are now always kept unless an explicit comparison baseline is provided for the field via the new `default_baseline` parameter of {func}`cattrs.gen.override`; static defaults are still compared against directly.
+  The default comparison can also be customized per field with the new `default_eq` parameter of {func}`cattrs.gen.override`.
+  The comparison is checked: errors raised by equality functions are localized to the field, and non-boolean comparison results (like NumPy arrays) raise {class}`cattrs.errors.DefaultComparisonError` instead of being implicitly truth-tested.
+
 - Fix the msgspec converter passing typed deques directly to the encoder, which cannot serialize them. Deques are now unstructured into lists, including when nested in attrs classes or dataclasses.
   ([#818](https://github.com/python-attrs/cattrs/issues/818) [#819](https://github.com/python-attrs/cattrs/pull/819))
 
