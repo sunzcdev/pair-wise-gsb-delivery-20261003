@@ -4,6 +4,15 @@ from __future__ import annotations
 import re
 
 from parsel import Selector
+from parsel.selector import (
+    IssueCategory,
+    RejectionReason,
+    Rule,
+    RuleResult,
+    RuleStatus,
+    ValidatorErrorPolicy,
+    select_first,
+)
 
 
 def correct() -> None:
@@ -58,3 +67,51 @@ def incorrect() -> None:
     my_selector = MySelector()
     res: str = my_selector.my_own_func()  # type: ignore[assignment]
     sub_res: str = my_selector.xpath("//somens:a/text()")[0].my_own_func()  # type: ignore[assignment]
+
+
+def rules_correct() -> None:
+    record = Selector(text="<div><span>x</span></div>").css("div")[0]
+    rules = [
+        Rule("h1::text", method="css", name="primary"),
+        Rule(
+            ".//span/text()",
+            min_count=1,
+            max_count=3,
+            allow_empty=True,
+            validator=lambda values: True,
+        ),
+    ]
+    result: RuleResult = select_first(record, rules)
+    values: tuple[str, ...] = result.values
+    status: RuleStatus = result.status
+    single: str | None = result.value
+    _ = (values, status, single)
+    if result.error is not None:
+        _ = str(result.error)
+    for rejection in result.rejections:
+        reason: RejectionReason = rejection.reason
+        category: IssueCategory = rejection.category
+        _ = (reason.value, category.value)
+    select_first(record, rules, on_validator_error=ValidatorErrorPolicy.STOP)
+    select_first(record, rules, on_validator_error="fail_candidate")
+
+
+def rules_incorrect() -> None:
+    record = Selector(text="<div/>")
+
+    # The query must be a string.
+    Rule(5)  # type: ignore[arg-type]
+
+    # A validator receives the tuple of values, not a single string.
+    def one_value_validator(value: str) -> bool:
+        return value.startswith("$")
+
+    Rule("h1", validator=one_value_validator)  # type: ignore[arg-type]
+
+    # select_first needs a sequence of rules, not a single rule.
+    select_first(record, Rule("h1"))  # type: ignore[arg-type]
+
+    # values is a tuple of strings, not a list.
+    result = select_first(record, [Rule("h1")])
+    values: list[str] = result.values  # type: ignore[assignment]
+    _ = values

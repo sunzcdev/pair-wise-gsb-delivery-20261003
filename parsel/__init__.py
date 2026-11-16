@@ -8,14 +8,40 @@ __email__ = "info@scrapy.org"
 __version__ = "1.12.1"
 __all__ = [
     "AbsoluteXPathWarning",
+    "IssueCategory",
+    "Rejection",
+    "RejectionReason",
+    "Rule",
+    "RuleConfigurationError",
+    "RuleError",
+    "RuleResult",
+    "RuleStatus",
+    "RuleSyntaxError",
     "Selector",
     "SelectorList",
+    "ValidatorErrorPolicy",
     "css2xpath",
+    "select_first",
     "xpathfuncs",
 ]
 
 from parsel import xpathfuncs
 from parsel.csstranslator import css2xpath
-from parsel.selector import AbsoluteXPathWarning, Selector, SelectorList
+from parsel.selector import (
+    AbsoluteXPathWarning,
+    IssueCategory,
+    Rejection,
+    RejectionReason,
+    Rule,
+    RuleConfigurationError,
+    RuleError,
+    RuleResult,
+    RuleStatus,
+    RuleSyntaxError,
+    Selector,
+    SelectorList,
+    ValidatorErrorPolicy,
+    select_first,
+)
 
 xpathfuncs.setup()

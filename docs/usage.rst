@@ -1328,6 +1328,188 @@ into an XPath expression as a string, which you can use as-is or combine to
 build a more complex expression, before feeding to a function expecting XPath.
 
 
+.. _topics-selectors-rules:
+
+Selecting fields with candidate rules
+-------------------------------------
+
+When a page template changes, the same field is often reachable through
+several XPath or CSS expressions kept as primary and fallback candidates.
+:func:`~parsel.select_first` evaluates an ordered sequence of
+:class:`~parsel.Rule` objects against a single record node, such as the
+selector for one product or one article, and returns the first candidate that
+satisfies its rule. Candidates that were tried first and rejected are kept on
+the returned :class:`~parsel.RuleResult`, together with the reason why each
+one was rejected.
+
+.. code-block:: pycon
+
+    >>> from parsel import Rule, select_first
+    >>> record = Selector(text='''
+    ...     <div class="product">
+    ...         <h2 class="name">Red shoes</h2>
+    ...         <span class="price">$29.99</span>
+    ...     </div>''').css("div.product")[0]
+    >>> rules = [
+    ...     Rule("h1.name::text", method="css", name="old-name"),
+    ...     Rule("h2.name::text", method="css", name="new-name"),
+    ... ]
+    >>> result = select_first(record, rules)
+    >>> result.matched
+    True
+    >>> result.index
+    1
+    >>> result.values
+    ('Red shoes',)
+
+The failed primary candidate is recorded instead of being silently skipped:
+
+.. code-block:: pycon
+
+    >>> rejection = result.rejections[0]
+    >>> rejection.rule.name
+    'old-name'
+    >>> rejection.reason.value
+    'no_match'
+    >>> rejection.category.value
+    'template_mismatch'
+    >>> rejection.detail
+    'expected exactly 1 match(es), got 0'
+
+Each rule can bound the number of nodes that its expression must match.
+``min_count`` and ``max_count`` default to a single node. Set
+``max_count=None`` to accept any number of nodes, and ``min_count=0`` to let a
+candidate win even when its expression matches nothing:
+
+.. code-block:: pycon
+
+    >>> many = select_first(record, [Rule(".//h2", max_count=None)])
+    >>> many.matched, many.values
+    (True, ('<h2 class="name">Red shoes</h2>',))
+    >>> absent = select_first(record, [Rule(".//li", min_count=0)])
+    >>> absent.matched, absent.values
+    (True, ())
+    >>> required = select_first(record, [Rule(".//li")])
+    >>> required.status.value
+    'no_match'
+
+The values of a rule can be checked by a ``validator``. It receives the
+extracted values as a tuple, accepts the candidate by returning ``True``, and
+rejects it with any other return value; a string return value is kept as the
+rejection detail. This lets the next candidate be tried when the content is
+present but invalid:
+
+.. code-block:: pycon
+
+    >>> def is_price(values):
+    ...     return values[0].startswith("$") or "not a price"
+    >>> fallback = [
+    ...     Rule("h2.name::text", method="css", validator=is_price),
+    ...     Rule("span.price::text", method="css", validator=is_price),
+    ... ]
+    >>> priced = select_first(record, fallback)
+    >>> priced.index
+    1
+    >>> priced.rejections[0].reason.value
+    'validator_rejected'
+    >>> priced.rejections[0].detail
+    'not a price'
+
+Empty extracted text is a per-rule decision, not a blanket truthiness check.
+A rule whose values include the exact empty string is rejected by default;
+pass ``allow_empty=True`` to accept it. Any other value, such as ``"0"`` or
+whitespace, is content:
+
+.. code-block:: pycon
+
+    >>> hidden = Selector(text='<input value=""/>').css("input")[0]
+    >>> select_first(hidden, [Rule("::attr(value)", method="css")]).status.value
+    'no_match'
+    >>> select_first(
+    ...     hidden, [Rule("::attr(value)", method="css", allow_empty=True)]
+    ... ).values
+    ('',)
+
+Invalid XPath or CSS syntax is a configuration problem, never a missing
+match: evaluation stops immediately and the result carries a
+:class:`~parsel.RuleSyntaxError`, so a typo cannot be hidden behind a fallback
+rule. :meth:`~parsel.Rule.validate` lets a pipeline reject a broken ruleset
+before it starts scanning records:
+
+.. code-block:: pycon
+
+    >>> broken = select_first(record, [Rule("///["), Rule("h2::text", method="css")])
+    >>> broken.status.value
+    'error'
+    >>> type(broken.error).__name__
+    'RuleSyntaxError'
+    >>> broken.index
+    0
+    >>> Rule("///[").validate()
+    Traceback (most recent call last):
+        ...
+    parsel.selector.RuleSyntaxError: Invalid xpath expression '///[' in rule 'xpath:///[': Invalid expression
+
+A validator raising an exception is different from a validator returning
+``False``. By default the selection stops with a
+:class:`~parsel.selector.RuleError`, because an unexpected exception usually
+means that the validator itself is broken. Pass
+``on_validator_error="fail_candidate"`` to record the exception as a rejection
+and continue with the next candidate instead:
+
+.. code-block:: pycon
+
+    >>> def broken_validator(values):
+    ...     raise RuntimeError("boom")
+    >>> candidates = [
+    ...     Rule("span.price::text", method="css", validator=broken_validator),
+    ...     Rule("h2.name::text", method="css"),
+    ... ]
+    >>> strict = select_first(record, candidates)
+    >>> strict.status.value
+    'error'
+    >>> len(strict.rejections)
+    0
+    >>> lenient = select_first(
+    ...     record, candidates, on_validator_error="fail_candidate"
+    ... )
+    >>> lenient.values
+    ('Red shoes',)
+    >>> lenient.rejections[0].reason.value
+    'validator_error'
+
+:meth:`~parsel.RuleResult.explain` renders the outcome as a report whose
+lines carry an :class:`~parsel.IssueCategory`, so that logs can tell a
+template mismatch, invalid content and a broken rule apart. The result also
+groups the rejections by category through
+:attr:`~parsel.RuleResult.template_mismatches`,
+:attr:`~parsel.RuleResult.invalid_content` and
+:attr:`~parsel.RuleResult.rule_errors`:
+
+.. code-block:: pycon
+
+    >>> page = Selector(text='''
+    ...     <div class="product">
+    ...         <h2 class="name">Red shoes</h2>
+    ...         <input type="hidden" value=""/>
+    ...     </div>''').css("div.product")[0]
+    >>> print(select_first(
+    ...     page,
+    ...     [
+    ...         Rule("h1.name::text", method="css", name="old-name"),
+    ...         Rule("::attr(value)", method="css", name="hidden-price"),
+    ...     ],
+    ... ).explain())
+    [invalid_content] No rule matched.
+    Rejected candidates:
+      #0 [template_mismatch] old-name: no_match (expected exactly 1 match(es), got 0)
+      #1 [invalid_content] hidden-price: empty_value (1 of 1 value(s) are empty)
+
+:func:`~parsel.select_first` only reads the node it is given: it does not
+modify the DOM and it never accesses the network, so it is safe to call for
+every record of a response.
+
+
 Similar libraries
 =================
 

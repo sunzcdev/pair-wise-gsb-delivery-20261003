@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+import dataclasses
 import html
 import pickle
 import re
+import socket
 import typing
+import warnings
 import weakref
 from typing import TYPE_CHECKING, Any, cast
 
@@ -16,6 +19,16 @@ from parsel.selector import (
     _NOT_SET,
     CannotRemoveElementWithoutParent,
     CannotRemoveElementWithoutRoot,
+    IssueCategory,
+    RejectionReason,
+    Rule,
+    RuleConfigurationError,
+    RuleError,
+    RuleResult,
+    RuleStatus,
+    RuleSyntaxError,
+    ValidatorErrorPolicy,
+    select_first,
 )
 
 if TYPE_CHECKING:
@@ -1499,3 +1512,673 @@ def test_repeated_queries_do_not_leak_memory() -> None:
     finally:
         tracemalloc.stop()
     assert after - before < 50_000
+
+
+RECORD_HTML = """
+<html>
+  <body>
+    <div class="record" id="first">
+      <h1 class="title-new">New title</h1>
+      <span class="price">$19.99</span>
+      <span class="blank"> </span>
+      <em class="zero">0</em>
+      <input type="hidden" value="" />
+      <ul>
+        <li>one</li>
+        <li>two</li>
+        <li>three</li>
+      </ul>
+    </div>
+    <div class="record" id="second">
+      <h1 class="title-new">Second title</h1>
+    </div>
+  </body>
+</html>
+"""
+
+
+def make_record() -> Selector:
+    return Selector(text=RECORD_HTML).css("div#first")[0]
+
+
+class TestRuleConfiguration:
+    def test_defaults(self) -> None:
+        rule = Rule("h1::text", method="css")
+        assert rule.query == "h1::text"
+        assert rule.method == "css"
+        assert rule.min_count == 1
+        assert rule.max_count == 1
+        assert rule.allow_empty is False
+        assert rule.validator is None
+        assert rule.name is None
+
+    def test_rule_is_frozen(self) -> None:
+        rule = Rule(".//h1/text()")
+        with pytest.raises(dataclasses.FrozenInstanceError):
+            rule.query = ".//h2/text()"  # type: ignore[misc]
+
+    def test_invalid_method(self) -> None:
+        with pytest.raises(RuleConfigurationError, match="Invalid method"):
+            Rule(".//a", method="jmespath")
+
+    @pytest.mark.parametrize("query", ["", "   ", 5, None])
+    def test_invalid_query(self, query: object) -> None:
+        with pytest.raises(RuleConfigurationError, match="query"):
+            Rule(query)  # type: ignore[arg-type]
+
+    @pytest.mark.parametrize("value", [-1, 1.5, "1", True])
+    def test_invalid_count(self, value: object) -> None:
+        with pytest.raises(RuleConfigurationError):
+            Rule(".//a", min_count=value)  # type: ignore[arg-type]
+        with pytest.raises(RuleConfigurationError):
+            Rule(".//a", max_count=value)  # type: ignore[arg-type]
+
+    def test_max_count_below_min_count(self) -> None:
+        with pytest.raises(RuleConfigurationError, match="max_count"):
+            Rule(".//a", min_count=3, max_count=2)
+
+    def test_invalid_allow_empty(self) -> None:
+        with pytest.raises(RuleConfigurationError, match="allow_empty"):
+            Rule(".//a", allow_empty=1)  # type: ignore[arg-type]
+
+    def test_invalid_validator(self) -> None:
+        with pytest.raises(RuleConfigurationError, match="validator"):
+            Rule(".//a", validator="not callable")  # type: ignore[arg-type]
+
+    def test_label(self) -> None:
+        assert Rule(".//h1/text()", name="headline").label() == "headline"
+        assert Rule(".//h1/text()").label() == "xpath:.//h1/text()"
+        assert Rule("h1::text", method="css").label() == "css:h1::text"
+
+    def test_expected_count(self) -> None:
+        assert Rule(".//a").expected_count() == "exactly 1"
+        assert Rule(".//a", min_count=2, max_count=4).expected_count() == (
+            "between 2 and 4"
+        )
+        assert Rule(".//a", min_count=0, max_count=None).expected_count() == (
+            "at least 0"
+        )
+
+    def test_validate_xpath(self) -> None:
+        Rule(".//h1/text()").validate()
+        with pytest.raises(RuleSyntaxError, match="Invalid xpath expression"):
+            Rule(".//h1[").validate()
+
+    def test_validate_css(self) -> None:
+        Rule("h1::text", method="css").validate()
+        with pytest.raises(RuleSyntaxError, match="Invalid css expression"):
+            Rule("h1[", method="css").validate()
+
+    def test_select_first_requires_rules(self) -> None:
+        with pytest.raises(RuleConfigurationError, match="at least one rule"):
+            select_first(make_record(), [])
+
+    def test_select_first_rejects_a_single_rule(self) -> None:
+        with pytest.raises(RuleConfigurationError, match="sequence of Rule"):
+            select_first(make_record(), Rule(".//h1/text()"))  # type: ignore[arg-type]
+
+    @pytest.mark.parametrize("rules", [".//h1/text()", b"rules", 3, None])
+    def test_select_first_rejects_non_sequences(self, rules: object) -> None:
+        with pytest.raises(RuleConfigurationError, match="rules"):
+            select_first(make_record(), rules)  # type: ignore[arg-type]
+
+    def test_select_first_rejects_non_rule_items(self) -> None:
+        with pytest.raises(RuleConfigurationError, match="Expected a Rule"):
+            select_first(make_record(), [".//h1/text()"])  # type: ignore[list-item]
+
+    def test_invalid_validator_error_policy(self) -> None:
+        with pytest.raises(RuleConfigurationError, match="on_validator_error"):
+            select_first(
+                make_record(),
+                [Rule(".//h1/text()")],
+                on_validator_error="bogus",
+            )
+
+
+class TestSelectFirst:
+    def test_first_matching_rule_wins(self) -> None:
+        rules = [
+            Rule(".//h2/text()", name="old-title"),
+            Rule(".//h1/text()", name="new-title"),
+        ]
+        result = select_first(make_record(), rules)
+
+        assert result.status is RuleStatus.MATCHED
+        assert result.matched is True
+        assert result.index == 1
+        assert result.rule is rules[1]
+        assert result.values == ("New title",)
+        assert result.value == "New title"
+
+    def test_rejected_candidate_is_reported(self) -> None:
+        result = select_first(
+            make_record(),
+            [Rule(".//h2/text()", name="old"), Rule(".//h1/text()", name="new")],
+        )
+
+        assert len(result.rejections) == 1
+        rejection = result.rejections[0]
+        assert rejection.index == 0
+        assert rejection.rule.name == "old"
+        assert rejection.reason is RejectionReason.NO_MATCH
+        assert rejection.count == 0
+        assert rejection.detail == "expected exactly 1 match(es), got 0"
+        assert rejection.category is IssueCategory.TEMPLATE_MISMATCH
+
+    def test_first_rule_short_circuits_later_ones(self) -> None:
+        result = select_first(
+            make_record(),
+            [
+                Rule(".//h1/text()", name="primary"),
+                Rule(".//span[@class='price']/text()", name="fallback"),
+            ],
+        )
+
+        assert result.index == 0
+        assert result.rule is not None
+        assert result.rule.name == "primary"
+        assert result.values == ("New title",)
+        assert result.rejections == ()
+
+    def test_css_and_xpath_rules(self) -> None:
+        assert select_first(make_record(), [Rule("h1::text", method="css")]).values == (
+            "New title",
+        )
+        assert select_first(make_record(), [Rule(".//h1/text()")]).values == (
+            "New title",
+        )
+
+    def test_no_match_reports_every_candidate(self) -> None:
+        result = select_first(
+            make_record(),
+            [
+                Rule(".//h2/text()", name="a"),
+                Rule(".//h3/text()", name="b"),
+            ],
+        )
+
+        assert result.status is RuleStatus.NO_MATCH
+        assert result.matched is False
+        assert result.rule is None
+        assert result.index is None
+        assert result.values == ()
+        assert result.value is None
+        assert [rejection.index for rejection in result.rejections] == [0, 1]
+        assert all(
+            rejection.reason is RejectionReason.NO_MATCH
+            for rejection in result.rejections
+        )
+        assert result.category is IssueCategory.TEMPLATE_MISMATCH
+
+    def test_rejections_keep_configuration_order(self) -> None:
+        names = ["third", "first", "second"]
+        rules = [
+            Rule(".//h2/text()", name=names[0]),
+            Rule(".//h3/text()", name=names[1]),
+            Rule(".//h4/text()", name=names[2]),
+        ]
+        result = select_first(make_record(), rules)
+        assert [rejection.rule.name for rejection in result.rejections] == names
+
+    def test_count_range(self) -> None:
+        too_few = Rule(".//li/text()", min_count=4, max_count=None)
+        too_many = Rule(".//li/text()", max_count=2)
+        exact = Rule(".//li/text()", min_count=3, max_count=3)
+
+        few = select_first(make_record(), [too_few])
+        many = select_first(make_record(), [too_many])
+        ok = select_first(make_record(), [exact])
+
+        assert few.rejections[0].reason is RejectionReason.NO_MATCH
+        assert few.rejections[0].detail == "expected at least 4 match(es), got 3"
+        assert many.rejections[0].reason is RejectionReason.TOO_MANY_MATCHES
+        assert many.rejections[0].count == 3
+        assert many.rejections[0].detail == "expected between 1 and 2 match(es), got 3"
+        assert ok.values == ("one", "two", "three")
+
+    def test_unbounded_max_count(self) -> None:
+        result = select_first(make_record(), [Rule(".//li/text()", max_count=None)])
+        assert result.matched is True
+        assert result.values == ("one", "two", "three")
+
+    def test_zero_min_count_accepts_no_match(self) -> None:
+        result = select_first(make_record(), [Rule(".//h2/text()", min_count=0)])
+        assert result.matched is True
+        assert result.values == ()
+
+    def test_too_many_matches_is_a_template_mismatch(self) -> None:
+        result = select_first(make_record(), [Rule(".//li/text()", max_count=2)])
+        assert result.rejections[0].category is IssueCategory.TEMPLATE_MISMATCH
+        assert result.category is IssueCategory.TEMPLATE_MISMATCH
+
+
+class TestEmptyValues:
+    def test_empty_value_is_rejected_by_default(self) -> None:
+        result = select_first(make_record(), [Rule(".//input/@value")])
+        rejection = result.rejections[0]
+
+        assert result.status is RuleStatus.NO_MATCH
+        assert rejection.reason is RejectionReason.EMPTY_VALUE
+        assert rejection.count == 1
+        assert rejection.category is IssueCategory.INVALID_CONTENT
+        assert result.category is IssueCategory.INVALID_CONTENT
+
+    def test_allow_empty_accepts_empty_value(self) -> None:
+        result = select_first(
+            make_record(), [Rule(".//input/@value", allow_empty=True)]
+        )
+        assert result.matched is True
+        assert result.values == ("",)
+        assert result.value == ""
+
+    def test_one_empty_value_rejects_the_candidate(self) -> None:
+        node = Selector(text='<div><input value="a"/><input value=""/></div>').css(
+            "div"
+        )[0]
+        result = select_first(node, [Rule(".//input/@value", max_count=None)])
+        assert result.status is RuleStatus.NO_MATCH
+        assert result.rejections[0].reason is RejectionReason.EMPTY_VALUE
+        assert result.rejections[0].detail == "1 of 2 value(s) are empty"
+
+    def test_later_non_empty_value_does_not_rescue_the_candidate(self) -> None:
+        node = Selector(text='<div><input value=""/><input value="a"/></div>').css(
+            "div"
+        )[0]
+        result = select_first(node, [Rule(".//input/@value", max_count=None)])
+        assert result.status is RuleStatus.NO_MATCH
+        assert result.rejections[0].reason is RejectionReason.EMPTY_VALUE
+
+    def test_whitespace_is_content(self) -> None:
+        result = select_first(make_record(), [Rule(".//span[@class='blank']/text()")])
+        assert result.matched is True
+        assert result.values == (" ",)
+
+    @pytest.mark.parametrize("text", ["0", "false", "None", " "])
+    def test_truthiness_is_not_used(self, text: str) -> None:
+        node = Selector(text=f"<div><b>{text}</b></div>").css("div")[0]
+        result = select_first(node, [Rule(".//b/text()")])
+        assert result.matched is True
+        assert result.values == (text,)
+
+    def test_empty_value_does_not_skip_a_later_validator(
+        self,
+    ) -> None:
+        calls: list[tuple[str, ...]] = []
+
+        def validator(values: tuple[str, ...]) -> bool:
+            calls.append(values)
+            return True
+
+        select_first(
+            make_record(),
+            [Rule(".//input/@value", validator=validator)],
+        )
+        assert calls == []
+
+
+class TestValidator:
+    def test_validator_accepts_the_candidate(self) -> None:
+        rule = Rule(
+            ".//span[@class='price']/text()",
+            validator=lambda values: values[0].startswith("$"),
+        )
+        assert select_first(make_record(), [rule]).matched is True
+
+    def test_validator_receives_a_tuple(self) -> None:
+        seen: list[tuple[str, ...]] = []
+
+        def validator(values: tuple[str, ...]) -> bool:
+            seen.append(values)
+            return True
+
+        select_first(
+            make_record(),
+            [Rule(".//li/text()", max_count=None, validator=validator)],
+        )
+        assert seen == [("one", "two", "three")]
+
+    def test_false_rejects_the_candidate(self) -> None:
+        result = select_first(
+            make_record(),
+            [Rule(".//span[@class='price']/text()", validator=lambda values: False)],
+        )
+        rejection = result.rejections[0]
+
+        assert result.status is RuleStatus.NO_MATCH
+        assert rejection.reason is RejectionReason.VALIDATOR_REJECTED
+        assert rejection.detail == ""
+        assert rejection.category is IssueCategory.INVALID_CONTENT
+
+    @pytest.mark.parametrize("verdict", [0, "", None, []])
+    def test_non_true_verdicts_reject(self, verdict: object) -> None:
+        result = select_first(
+            make_record(),
+            [Rule(".//h1/text()", validator=lambda values: verdict)],
+        )
+        assert result.status is RuleStatus.NO_MATCH
+        assert result.rejections[0].reason is RejectionReason.VALIDATOR_REJECTED
+
+    def test_string_verdict_is_kept_as_detail(self) -> None:
+        result = select_first(
+            make_record(),
+            [Rule(".//h1/text()", validator=lambda values: "not a headline")],
+        )
+        assert result.rejections[0].detail == "not a headline"
+
+    def test_next_candidate_is_tried_after_a_rejection(self) -> None:
+        rules = [
+            Rule(
+                ".//span[@class='price']/text()",
+                name="price",
+                validator=lambda values: "not a price",
+            ),
+            Rule(".//h1/text()", name="title"),
+        ]
+        result = select_first(make_record(), rules)
+
+        assert result.index == 1
+        assert result.values == ("New title",)
+        assert result.rejections[0].reason is RejectionReason.VALIDATOR_REJECTED
+
+    def test_validator_error_stops_by_default(self) -> None:
+        def broken(values: tuple[str, ...]) -> bool:
+            raise RuntimeError("validator exploded")
+
+        result = select_first(
+            make_record(),
+            [
+                Rule(".//span[@class='price']/text()", validator=broken),
+                Rule(".//h1/text()", name="title"),
+            ],
+        )
+
+        assert result.status is RuleStatus.ERROR
+        assert result.matched is False
+        assert result.index == 0
+        assert isinstance(result.error, RuleError)
+        assert "RuntimeError" in str(result.error)
+        assert "validator exploded" in str(result.error)
+        assert result.category is IssueCategory.RULE_ERROR
+
+    def test_validator_error_can_fail_only_the_candidate(
+        self,
+    ) -> None:
+        def broken(values: tuple[str, ...]) -> bool:
+            raise RuntimeError("validator exploded")
+
+        result = select_first(
+            make_record(),
+            [
+                Rule(".//span[@class='price']/text()", validator=broken),
+                Rule(".//h1/text()", name="title"),
+            ],
+            on_validator_error=ValidatorErrorPolicy.FAIL_CANDIDATE,
+        )
+
+        assert result.status is RuleStatus.MATCHED
+        assert result.values == ("New title",)
+        rejection = result.rejections[0]
+        assert rejection.reason is RejectionReason.VALIDATOR_ERROR
+        assert rejection.detail == "RuntimeError: validator exploded"
+        assert rejection.category is IssueCategory.RULE_ERROR
+
+    def test_validator_error_policy_accepts_strings(self) -> None:
+        def broken(values: tuple[str, ...]) -> bool:
+            raise RuntimeError("boom")
+
+        result = select_first(
+            make_record(),
+            [
+                Rule(".//span[@class='price']/text()", validator=broken),
+                Rule(".//h1/text()"),
+            ],
+            on_validator_error="fail_candidate",
+        )
+        assert result.matched is True
+
+
+class TestRuleErrors:
+    def test_invalid_xpath_is_not_a_missing_match(self) -> None:
+        result = select_first(
+            make_record(),
+            [Rule(".//h1["), Rule(".//h1/text()", name="fallback")],
+        )
+
+        assert result.status is RuleStatus.ERROR
+        assert isinstance(result.error, RuleSyntaxError)
+        assert result.index == 0
+        assert result.rejections == ()
+        assert result.category is IssueCategory.RULE_ERROR
+
+    def test_invalid_css_is_not_a_missing_match(self) -> None:
+        result = select_first(
+            make_record(),
+            [Rule("h1[", method="css"), Rule("h1::text", method="css")],
+        )
+
+        assert result.status is RuleStatus.ERROR
+        assert isinstance(result.error, RuleSyntaxError)
+        assert result.index == 0
+
+    def test_undefined_namespace_is_a_rule_error(self) -> None:
+        result = select_first(make_record(), [Rule(".//foo:bar")])
+        assert result.status is RuleStatus.ERROR
+        assert isinstance(result.error, RuleSyntaxError)
+
+    def test_error_after_rejections_keeps_them(self) -> None:
+        result = select_first(
+            make_record(),
+            [Rule(".//h2/text()", name="a"), Rule(".//h1[")],
+        )
+
+        assert result.status is RuleStatus.ERROR
+        assert result.index == 1
+        assert len(result.rejections) == 1
+        assert result.rejections[0].reason is RejectionReason.NO_MATCH
+
+    def test_document_scoped_xpath_on_a_nested_node_is_a_rule_error(
+        self,
+    ) -> None:
+        result = select_first(make_record(), [Rule("//h1/text()")])
+
+        assert result.status is RuleStatus.ERROR
+        assert isinstance(result.error, RuleConfigurationError)
+        assert ".//" in str(result.error)
+
+    def test_document_scoped_xpath_warns_nothing_under_a_strict_policy(
+        self,
+    ) -> None:
+        # The repository turns warnings into errors, so a rule must not rely
+        # on a warning to report its outcome.
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            result = select_first(make_record(), [Rule("//h1/text()")])
+        assert result.status is RuleStatus.ERROR
+
+    def test_json_record_node_is_a_rule_error(self) -> None:
+        result = select_first(Selector(text='{"a": 1}'), [Rule(".//a")])
+        assert result.status is RuleStatus.ERROR
+        assert isinstance(result.error, RuleConfigurationError)
+        assert "'json'" in str(result.error)
+
+    def test_selector_list_is_not_a_record_node(self) -> None:
+        records = Selector(text=RECORD_HTML).css("div.record")
+        with pytest.raises(RuleConfigurationError, match="single record node"):
+            select_first(records, [Rule(".//h1/text()")])  # type: ignore[arg-type]
+
+    def test_node_without_the_requested_method(self) -> None:
+        class XPathOnlyNode:
+            def xpath(
+                self,
+                query: str,
+                namespaces: Mapping[str, str] | None = None,
+                **kwargs: object,
+            ) -> SelectorList[Selector]:
+                return SelectorList()
+
+        node = XPathOnlyNode()
+        result = select_first(node, [Rule("h1", method="css")])  # type: ignore[arg-type]
+        assert result.status is RuleStatus.ERROR
+        assert isinstance(result.error, RuleConfigurationError)
+
+
+class TestExplain:
+    def test_match(self) -> None:
+        result = select_first(
+            make_record(),
+            [Rule(".//h2/text()", name="old"), Rule(".//h1/text()", name="new")],
+        )
+        report = result.explain()
+
+        assert "Matched rule #1 (new) with 1 value(s)." in report
+        assert "#0 [template_mismatch] old: no_match" in report
+
+    def test_no_match(self) -> None:
+        result = select_first(make_record(), [Rule(".//h2/text()", name="old")])
+        report = result.explain()
+
+        assert "[template_mismatch] No rule matched." in report
+        assert "#0 [template_mismatch] old: no_match" in report
+
+    def test_invalid_content(self) -> None:
+        result = select_first(make_record(), [Rule(".//input/@value", name="hidden")])
+        report = result.explain()
+
+        assert "[invalid_content] No rule matched." in report
+        assert "empty_value" in report
+
+    def test_rule_error(self) -> None:
+        result = select_first(make_record(), [Rule(".//h1[", name="broken")])
+        report = result.explain()
+
+        assert "[rule_error] Rule error in rule #0 (broken)" in report
+
+    def test_rejection_describe(self) -> None:
+        result = select_first(make_record(), [Rule(".//li/text()", max_count=2)])
+        assert (
+            result.rejections[0]
+            .describe()
+            .startswith("#0 [template_mismatch] xpath:.//li/text(): too_many_matches")
+        )
+
+    def test_stable_enum_values(self) -> None:
+        assert RuleStatus.MATCHED.value == "matched"
+        assert RuleStatus.NO_MATCH.value == "no_match"
+        assert RuleStatus.ERROR.value == "error"
+        assert IssueCategory.TEMPLATE_MISMATCH.value == "template_mismatch"
+        assert IssueCategory.INVALID_CONTENT.value == "invalid_content"
+        assert IssueCategory.RULE_ERROR.value == "rule_error"
+        assert RejectionReason.NO_MATCH.value == "no_match"
+        assert RejectionReason.TOO_MANY_MATCHES.value == "too_many_matches"
+        assert RejectionReason.EMPTY_VALUE.value == "empty_value"
+        assert RejectionReason.VALIDATOR_REJECTED.value == "validator_rejected"
+        assert RejectionReason.VALIDATOR_ERROR.value == "validator_error"
+        assert ValidatorErrorPolicy.STOP.value == "stop"
+        assert ValidatorErrorPolicy.FAIL_CANDIDATE.value == "fail_candidate"
+
+
+class TestRuleResultHelpers:
+    def test_rejections_by_category(self) -> None:
+        rules = [
+            Rule(".//h2/text()"),
+            Rule(".//input/@value"),
+            Rule(
+                ".//span[@class='price']/text()",
+                validator=lambda values: "bad price",
+            ),
+            Rule(".//h1/text()"),
+        ]
+        result = select_first(make_record(), rules)
+
+        assert len(result.template_mismatches) == 1
+        assert len(result.invalid_content) == 2
+        assert result.rule_errors == ()
+        assert result.rejections_with_category(IssueCategory.INVALID_CONTENT) == (
+            result.invalid_content
+        )
+
+    def test_rule_errors_category(self) -> None:
+        def broken(values: tuple[str, ...]) -> bool:
+            raise RuntimeError("boom")
+
+        result = select_first(
+            make_record(),
+            [Rule(".//span[@class='price']/text()", validator=broken)],
+            on_validator_error=ValidatorErrorPolicy.FAIL_CANDIDATE,
+        )
+        assert len(result.rule_errors) == 1
+        assert result.rule_errors[0].category is IssueCategory.RULE_ERROR
+        # With no match, a rule error outranks the template mismatch of the
+        # other candidates.
+        assert result.category is IssueCategory.RULE_ERROR
+
+    def test_rule_resolves_from_the_result(self) -> None:
+        rules = [Rule(".//h2/text()"), Rule(".//h1/text()")]
+        result = select_first(make_record(), rules)
+        assert result.rules == tuple(rules)
+        assert result.rule is rules[1]
+
+
+class TestRulesDoNotChangeTheRecord:
+    def test_dom_is_not_modified(self) -> None:
+        before = make_record().get()
+        select_first(
+            make_record(),
+            [
+                Rule(".//h2/text()"),
+                Rule(".//h1/text()"),
+                Rule("input", method="css"),
+            ],
+        )
+        assert make_record().get() == before
+
+    def test_queries_stay_scoped_to_the_record(self) -> None:
+        page = Selector(text=RECORD_HTML)
+        first, second = page.css("div.record")
+
+        first_result = select_first(first, [Rule(".//h1/text()")])
+        second_result = select_first(second, [Rule(".//h1/text()")])
+
+        assert first_result.values == ("New title",)
+        assert second_result.values == ("Second title",)
+
+    def test_rule_does_not_need_the_network(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        def no_network(*args: Any, **kwargs: Any) -> None:
+            raise AssertionError("a rule must not access the network")
+
+        monkeypatch.setattr(socket, "create_connection", no_network)
+        monkeypatch.setattr(socket, "socket", no_network)
+        result = select_first(make_record(), [Rule(".//h1/text()")])
+        assert result.values == ("New title",)
+
+
+class TestPublicExports:
+    def test_public_names(self) -> None:
+        import parsel  # noqa: PLC0415
+
+        for name in (
+            "IssueCategory",
+            "Rejection",
+            "RejectionReason",
+            "Rule",
+            "RuleConfigurationError",
+            "RuleError",
+            "RuleResult",
+            "RuleStatus",
+            "RuleSyntaxError",
+            "ValidatorErrorPolicy",
+            "select_first",
+        ):
+            assert getattr(parsel, name) is getattr(selector_module, name)
+            assert name in parsel.__all__
+
+    def test_result_is_not_picklable_only_because_of_rules(self) -> None:
+        # Rules and results are plain data; pickling is not part of the API
+        # contract, but the result must not hold a Selector.
+        result = select_first(
+            Selector(text="<div><h1>x</h1></div>").css("div")[0],
+            [Rule(".//h1/text()")],
+        )
+        assert isinstance(result, RuleResult)

@@ -8,12 +8,15 @@ import json
 import re
 import typing
 import warnings
+from dataclasses import dataclass
+from enum import StrEnum
 from functools import lru_cache
 from io import BytesIO
 from typing import (
     TYPE_CHECKING,
     Any,
     Literal,
+    Protocol,
     Self,
     SupportsIndex,
     TypeAlias,
@@ -22,13 +25,14 @@ from typing import (
 )
 
 import jmespath
+from cssselect.parser import SelectorError as CSSSelectorError
 from lxml import etree, html
 
 from .csstranslator import GenericTranslator, HTMLTranslator
 from .utils import extract_regex, flatten, iflatten, shorten
 
 if TYPE_CHECKING:
-    from collections.abc import Mapping
+    from collections.abc import Callable, Mapping, Sequence
     from re import Pattern
 
 
@@ -1005,3 +1009,623 @@ class Selector:
     def __repr__(self) -> str:
         data = repr(shorten(str(self.get()), width=40))
         return f"<{type(self).__name__} query={self._expr!r} data={data}>"
+
+
+# ---------------------------------------------------------------------------
+# Candidate rules
+# ---------------------------------------------------------------------------
+
+
+class RuleError(Exception):
+    """Base class for the errors reported by the candidate-rule helpers."""
+
+
+class RuleConfigurationError(RuleError):
+    """A rule, or a call of :func:`select_first`, is configured incorrectly."""
+
+
+class RuleSyntaxError(RuleConfigurationError):
+    """The XPath or CSS expression of a rule is invalid.
+
+    Rule expressions are configuration, so an invalid expression is reported
+    as a rule error instead of being treated as a candidate without matches.
+    """
+
+
+class RuleStatus(StrEnum):
+    """The outcome of evaluating an ordered sequence of rules.
+
+    The string values are stable and suitable for logs and metrics.
+    """
+
+    MATCHED = "matched"
+    NO_MATCH = "no_match"
+    ERROR = "error"
+
+
+class IssueCategory(StrEnum):
+    """The kind of problem that a rule result represents.
+
+    * :attr:`TEMPLATE_MISMATCH` means that a record node did not contain the
+      nodes that a candidate expected, which usually points to a page
+      template change.
+    * :attr:`INVALID_CONTENT` means that a candidate matched nodes, but their
+      content was not acceptable, for example because a value was empty or
+      because the rule validator rejected it.
+    * :attr:`RULE_ERROR` means that the rule itself is broken, for example by
+      an invalid expression or by a validator that raised.
+
+    The string values are stable and suitable for logs and metrics.
+    """
+
+    TEMPLATE_MISMATCH = "template_mismatch"
+    INVALID_CONTENT = "invalid_content"
+    RULE_ERROR = "rule_error"
+
+
+class RejectionReason(StrEnum):
+    """Why a candidate rule was rejected.
+
+    The string values are stable and suitable for logs and metrics.
+    """
+
+    NO_MATCH = "no_match"
+    TOO_MANY_MATCHES = "too_many_matches"
+    EMPTY_VALUE = "empty_value"
+    VALIDATOR_REJECTED = "validator_rejected"
+    VALIDATOR_ERROR = "validator_error"
+
+
+_REJECTION_CATEGORIES: dict[RejectionReason, IssueCategory] = {
+    RejectionReason.NO_MATCH: IssueCategory.TEMPLATE_MISMATCH,
+    RejectionReason.TOO_MANY_MATCHES: IssueCategory.TEMPLATE_MISMATCH,
+    RejectionReason.EMPTY_VALUE: IssueCategory.INVALID_CONTENT,
+    RejectionReason.VALIDATOR_REJECTED: IssueCategory.INVALID_CONTENT,
+    RejectionReason.VALIDATOR_ERROR: IssueCategory.RULE_ERROR,
+}
+
+
+class ValidatorErrorPolicy(StrEnum):
+    """What :func:`select_first` does when a rule validator raises.
+
+    * :attr:`STOP` stops evaluating the remaining candidates and returns a
+      result whose status is :attr:`RuleStatus.ERROR`, because an unexpected
+      exception usually means that the validator is broken.
+    * :attr:`FAIL_CANDIDATE` records the exception as a rejection of that
+      candidate and continues with the next candidate.
+    """
+
+    STOP = "stop"
+    FAIL_CANDIDATE = "fail_candidate"
+
+
+class _SupportsSelection(Protocol):
+    """The part of the :class:`Selector` interface that rules rely on."""
+
+    def xpath(
+        self,
+        query: str,
+        namespaces: Mapping[str, str] | None = None,
+        **kwargs: Any,
+    ) -> SelectorList[Selector]: ...
+
+    def css(self, query: str) -> SelectorList[Selector]: ...
+
+
+def _check_node(node: object) -> None:
+    """Make sure *node* is a single record node, not a list of nodes."""
+    if isinstance(node, (list, tuple, SelectorList)):
+        msg = (
+            f"select_first() expects a single record node, got"
+            f" {type(node).__name__}; iterate over the records and call"
+            f" select_first() for each one"
+        )
+        raise RuleConfigurationError(msg)
+
+
+def _check_count(name: str, value: object) -> int:
+    """Validate a match-count bound and return it as an ``int``."""
+    if isinstance(value, bool) or not isinstance(value, int):
+        msg = f"{name} must be an integer, got {value!r}"
+        raise RuleConfigurationError(msg)
+    if value < 0:
+        msg = f"{name} must be equal to or greater than 0, got {value}"
+        raise RuleConfigurationError(msg)
+    return value
+
+
+@dataclass(frozen=True)
+class Rule:
+    """A candidate rule for extracting the values of a field.
+
+    ``query`` is an XPath or CSS expression evaluated on the record node.
+    XPath is used by default; pass ``method="css"`` to use CSS instead.
+
+    ``min_count`` and ``max_count`` bound the number of nodes that ``query``
+    must match for the rule to accept the result. A rule matches exactly one
+    node by default; set ``max_count=None`` to accept any number of nodes, or
+    ``min_count=0`` to accept a missing value.
+
+    ``allow_empty`` decides whether empty strings among the extracted values
+    are acceptable. It is a decision of each rule, so no blanket truthiness
+    test is applied: only the exact empty string counts as empty, whereas
+    values such as ``"0"`` or ``" "`` are content. When ``allow_empty`` is
+    ``False`` (the default), a candidate whose values include an empty string
+    is rejected with :attr:`RejectionReason.EMPTY_VALUE`.
+
+    ``validator`` is an optional callable that receives the extracted values
+    as a tuple of strings. It accepts the candidate by returning ``True``.
+    Any other return value rejects the candidate, and a string return value is
+    recorded as the rejection detail.
+
+    ``name`` optionally identifies the rule in reports; ``method:query`` is
+    used otherwise.
+    """
+
+    query: str
+    method: str = "xpath"
+    min_count: int = 1
+    max_count: int | None = 1
+    allow_empty: bool = False
+    validator: Callable[[tuple[str, ...]], object] | None = None
+    name: str | None = None
+
+    def __post_init__(self) -> None:
+        if self.method not in ("xpath", "css"):
+            msg = f"Invalid method: {self.method!r}; expected 'xpath' or 'css'"
+            raise RuleConfigurationError(msg)
+        if not isinstance(self.query, str):
+            msg = f"query must be a string, got {type(self.query).__name__}"
+            raise RuleConfigurationError(msg)
+        if not self.query.strip():
+            msg = "query must not be empty"
+            raise RuleConfigurationError(msg)
+        _check_count("min_count", self.min_count)
+        if self.max_count is not None:
+            _check_count("max_count", self.max_count)
+            if self.max_count < self.min_count:
+                msg = (
+                    f"max_count ({self.max_count}) must be equal to or greater"
+                    f" than min_count ({self.min_count})"
+                )
+                raise RuleConfigurationError(msg)
+        if not isinstance(self.allow_empty, bool):
+            msg = f"allow_empty must be a bool, got {self.allow_empty!r}"
+            raise RuleConfigurationError(msg)
+        if self.validator is not None and not callable(self.validator):
+            msg = f"validator must be callable, got {self.validator!r}"
+            raise RuleConfigurationError(msg)
+
+    def label(self) -> str:
+        """Return a readable identifier of this rule for reports."""
+        if self.name is not None:
+            return self.name
+        return f"{self.method}:{self.query}"
+
+    def expected_count(self) -> str:
+        """Describe the number of matches that this rule accepts."""
+        if self.max_count is None:
+            return f"at least {self.min_count}"
+        if self.min_count == self.max_count:
+            return f"exactly {self.min_count}"
+        return f"between {self.min_count} and {self.max_count}"
+
+    def matches_count(self, count: int) -> bool:
+        """Return whether *count* is within the accepted match range."""
+        if count < self.min_count:
+            return False
+        return self.max_count is None or count <= self.max_count
+
+    def validate(self) -> None:
+        """Check the syntax of the expression without evaluating it.
+
+        Scraping code can call this to reject a broken ruleset before it
+        starts scanning records. Invalid expressions raise
+        :class:`RuleSyntaxError`.
+        """
+        try:
+            if self.method == "xpath":
+                etree.XPath(self.query)
+            else:
+                # The HTML translator accepts every CSS expression that the
+                # XML translator does, plus the HTML-only pseudo-classes.
+                _ctgroup["html"]["_csstranslator"].css_to_xpath(self.query)
+        except (etree.XPathError, CSSSelectorError) as exc:
+            msg = (
+                f"Invalid {self.method} expression {self.query!r} in rule"
+                f" {self.label()!r}: {exc}"
+            )
+            raise RuleSyntaxError(msg) from exc
+
+
+@dataclass(frozen=True)
+class Rejection:
+    """A candidate rule that was rejected, with the reason why.
+
+    ``index`` is the position of the rule in the sequence given to
+    :func:`select_first`, ``count`` is the number of nodes that its expression
+    matched, and ``detail`` is a human-readable explanation.
+    """
+
+    index: int
+    rule: Rule
+    reason: RejectionReason
+    count: int = 0
+    detail: str = ""
+
+    @property
+    def category(self) -> IssueCategory:
+        """The kind of problem that this rejection represents."""
+        return _REJECTION_CATEGORIES[self.reason]
+
+    def describe(self) -> str:
+        """Return a one-line description of this rejection."""
+        text = (
+            f"#{self.index} [{self.category.value}] {self.rule.label()}: "
+            f"{self.reason.value}"
+        )
+        if self.detail:
+            text += f" ({self.detail})"
+        return text
+
+
+@dataclass(frozen=True)
+class RuleResult:
+    """The outcome of :func:`select_first`.
+
+    ``status`` tells whether a rule matched, no rule matched, or a rule itself
+    was broken. ``rules`` holds the configured candidates in order.
+
+    On a match, ``index``, :attr:`rule` and ``values`` identify the winning
+    candidate and hold its extracted strings. ``rejections`` records every
+    candidate that was tried and rejected beforehand, in configuration order,
+    whether or not a later candidate matched. On an error, ``index`` and
+    :attr:`rule` identify the broken candidate, and ``error`` holds the
+    :class:`RuleError` that stopped the evaluation.
+    """
+
+    status: RuleStatus
+    rules: tuple[Rule, ...]
+    index: int | None = None
+    values: tuple[str, ...] = ()
+    rejections: tuple[Rejection, ...] = ()
+    error: RuleError | None = None
+
+    @property
+    def matched(self) -> bool:
+        """Whether a rule matched."""
+        return self.status is RuleStatus.MATCHED
+
+    @property
+    def rule(self) -> Rule | None:
+        """The rule that matched or reported an error, if any."""
+        if self.index is None:
+            return None
+        return self.rules[self.index]
+
+    @property
+    def value(self) -> str | None:
+        """The first extracted value, or ``None`` if there is none."""
+        return self.values[0] if self.values else None
+
+    @property
+    def category(self) -> IssueCategory | None:
+        """The kind of problem that the result represents, if any.
+
+        A matching result has no problem. An error result is always a
+        :attr:`IssueCategory.RULE_ERROR`. A result without a match reports the
+        most severe problem among its rejections: a rule error first, then
+        invalid content, and a template mismatch otherwise.
+        """
+        if self.status is RuleStatus.MATCHED:
+            return None
+        if self.status is RuleStatus.ERROR:
+            return IssueCategory.RULE_ERROR
+        if self.rule_errors:
+            return IssueCategory.RULE_ERROR
+        if self.invalid_content:
+            return IssueCategory.INVALID_CONTENT
+        return IssueCategory.TEMPLATE_MISMATCH
+
+    def rejections_with_category(
+        self, category: IssueCategory
+    ) -> tuple[Rejection, ...]:
+        """Return the rejections that represent *category*."""
+        return tuple(r for r in self.rejections if r.category is category)
+
+    @property
+    def template_mismatches(self) -> tuple[Rejection, ...]:
+        """Rejections caused by nodes that the record did not contain."""
+        return self.rejections_with_category(IssueCategory.TEMPLATE_MISMATCH)
+
+    @property
+    def invalid_content(self) -> tuple[Rejection, ...]:
+        """Rejections caused by matched nodes with unacceptable content."""
+        return self.rejections_with_category(IssueCategory.INVALID_CONTENT)
+
+    @property
+    def rule_errors(self) -> tuple[Rejection, ...]:
+        """Rejections caused by a broken rule, such as a raising validator."""
+        return self.rejections_with_category(IssueCategory.RULE_ERROR)
+
+    def explain(self) -> str:
+        """Return a multi-line report of the outcome.
+
+        Rejected candidates are prefixed with their :class:`IssueCategory`,
+        so that a template mismatch, invalid content and a rule error can be
+        told apart in logs.
+        """
+        rule = self.rule
+        if self.status is RuleStatus.MATCHED:
+            label = rule.label() if rule is not None else "?"
+            headline = (
+                f"Matched rule #{self.index} ({label})"
+                f" with {len(self.values)} value(s)."
+            )
+            lines = [headline]
+        elif self.status is RuleStatus.ERROR:
+            where = (
+                f"rule #{self.index} ({rule.label()})" if rule is not None else "a rule"
+            )
+            headline = (
+                f"[{IssueCategory.RULE_ERROR.value}] Rule error in {where}: "
+                f"{self.error}"
+            )
+            lines = [headline]
+        else:
+            category = self.category or IssueCategory.TEMPLATE_MISMATCH
+            lines = [f"[{category.value}] No rule matched."]
+        if self.rejections:
+            lines.append("Rejected candidates:")
+            lines.extend(f"  {rejection.describe()}" for rejection in self.rejections)
+        return "\n".join(lines)
+
+
+def _is_nested(node: _SupportsSelection) -> bool:
+    root = getattr(node, "root", None)
+    return isinstance(root, etree._Element) and root.getparent() is not None
+
+
+def _run_query(node: _SupportsSelection, rule: Rule) -> SelectorList[Selector]:
+    """Evaluate the expression of *rule* on *node*.
+
+    A rule expression that the node cannot evaluate is a configuration
+    problem, so the corresponding exception becomes a :class:`RuleSyntaxError`
+    instead of being treated as a candidate without matches. Other exceptions,
+    which signal a bug elsewhere, are not swallowed.
+    """
+    method = getattr(node, rule.method, None)
+    if not callable(method):
+        msg = (
+            f"The record node has no {rule.method}() method, so rule"
+            f" {rule.label()!r} cannot be evaluated"
+        )
+        raise RuleConfigurationError(msg)
+    node_type = getattr(node, "type", None)
+    if node_type not in (None, "html", "xml", "text"):
+        # Selector.xpath()/css() cannot run on, say, a JSON selector, and its
+        # ValueError would otherwise be reported as an expression syntax
+        # error even though the expression may be perfectly valid.
+        msg = (
+            f"The record node has type {node_type!r}, so {rule.method} rules"
+            f" such as {rule.label()!r} cannot be evaluated on it"
+        )
+        raise RuleConfigurationError(msg)
+    if rule.method == "xpath" and rule.query[:1] == "/" and _is_nested(node):
+        # A syntax error takes precedence over the scoping problem, so a typo
+        # is never described as an absolute-path mistake.
+        rule.validate()
+        msg = (
+            f"Rule {rule.label()!r} uses the document-scoped expression"
+            f" {rule.query!r} on a nested record node; use a relative"
+            f" expression such as './/...' instead"
+        )
+        raise RuleConfigurationError(msg)
+    try:
+        selected = method(rule.query)
+    except (etree.XPathError, ValueError, CSSSelectorError) as exc:
+        msg = (
+            f"Invalid {rule.method} expression {rule.query!r} in rule"
+            f" {rule.label()!r}: {exc}"
+        )
+        raise RuleSyntaxError(msg) from exc
+    return typing.cast("SelectorList[Selector]", selected)
+
+
+def _validator_error(rule: Rule, exc: Exception) -> RuleError:
+    return RuleError(
+        f"Validator of rule {rule.label()!r} raised {type(exc).__name__}: {exc}"
+    )
+
+
+def _check_rules(rules: object) -> tuple[Rule, ...]:
+    """Validate the *rules* argument of :func:`select_first`."""
+    if isinstance(rules, Rule):
+        msg = "rules must be a sequence of Rule objects, not a single Rule"
+        raise RuleConfigurationError(msg)
+    if isinstance(rules, (str, bytes)) or not hasattr(rules, "__iter__"):
+        msg = f"rules must be a sequence of Rule objects, got {rules!r}"
+        raise RuleConfigurationError(msg)
+    configured = tuple(typing.cast("Sequence[object]", rules))
+    if not configured:
+        msg = "at least one rule is required"
+        raise RuleConfigurationError(msg)
+    for rule in configured:
+        if not isinstance(rule, Rule):
+            msg = f"Expected a Rule, got {type(rule).__name__}"
+            raise RuleConfigurationError(msg)
+    return typing.cast("tuple[Rule, ...]", configured)
+
+
+def _apply_validator(
+    rule: Rule,
+    values: tuple[str, ...],
+    index: int,
+    count: int,
+    policy: ValidatorErrorPolicy,
+) -> Rejection | None:
+    """Run the validator of *rule*.
+
+    Returns ``None`` when the candidate is accepted, a rejection when it is
+    rejected, and raises :class:`RuleError` when the policy is
+    :attr:`ValidatorErrorPolicy.STOP` and the validator raises.
+    """
+    if rule.validator is None:
+        return None
+    try:
+        verdict = rule.validator(values)
+    except Exception as exc:  # pylint: disable=broad-exception-caught
+        # A validator is caller code, so any exception it raises must follow
+        # the validator error policy instead of escaping this helper.
+        if policy is ValidatorErrorPolicy.STOP:
+            raise _validator_error(rule, exc) from exc
+        return Rejection(
+            index=index,
+            rule=rule,
+            reason=RejectionReason.VALIDATOR_ERROR,
+            count=count,
+            detail=f"{type(exc).__name__}: {exc}",
+        )
+    if verdict is True:
+        return None
+    return Rejection(
+        index=index,
+        rule=rule,
+        reason=RejectionReason.VALIDATOR_REJECTED,
+        count=count,
+        detail=verdict if isinstance(verdict, str) else "",
+    )
+
+
+def _evaluate(
+    node: _SupportsSelection,
+    rule: Rule,
+    index: int,
+    policy: ValidatorErrorPolicy,
+) -> tuple[tuple[str, ...], Rejection | None]:
+    """Evaluate one candidate on *node*.
+
+    Returns the extracted values and ``None`` when the candidate wins, or an
+    empty tuple and the rejection that explains why it did not. A rule
+    problem raises :class:`RuleError`.
+    """
+    selected = _run_query(node, rule)
+    count = len(selected)
+    if not rule.matches_count(count):
+        reason = (
+            RejectionReason.NO_MATCH
+            if count < rule.min_count
+            else RejectionReason.TOO_MANY_MATCHES
+        )
+        return (), Rejection(
+            index=index,
+            rule=rule,
+            reason=reason,
+            count=count,
+            detail=f"expected {rule.expected_count()} match(es), got {count}",
+        )
+
+    values = tuple(selected.getall())
+    empty = sum(value == "" for value in values)
+    if empty and not rule.allow_empty:
+        return (), Rejection(
+            index=index,
+            rule=rule,
+            reason=RejectionReason.EMPTY_VALUE,
+            count=count,
+            detail=f"{empty} of {count} value(s) are empty",
+        )
+
+    rejection = _apply_validator(rule, values, index, count, policy)
+    if rejection is not None:
+        return (), rejection
+    return values, None
+
+
+def select_first(
+    node: _SupportsSelection,
+    rules: Sequence[Rule],
+    *,
+    on_validator_error: ValidatorErrorPolicy | str = ValidatorErrorPolicy.STOP,
+) -> RuleResult:
+    """Try *rules* in order on the single record node *node*.
+
+    Each candidate is evaluated with the ``xpath()`` or ``css()`` method of
+    *node*, in the order in which the rules are given. The first candidate
+    wins whose expression matches a number of nodes within the ``min_count``
+    and ``max_count`` range of its rule, whose extracted values are acceptable
+    to ``allow_empty``, and whose optional ``validator`` returns ``True``.
+    Its values are returned, and the candidates tried before it are reported
+    in ``rejections`` together with the reason why each one was rejected.
+
+    Empty values are not checked with a truthiness test: only the exact empty
+    string counts as empty, and whether it is acceptable is decided by the
+    ``allow_empty`` flag of each rule.
+
+    Invalid XPath or CSS syntax is a configuration problem, not a missing
+    match: the evaluation stops and the result status is
+    :attr:`RuleStatus.ERROR`, with a :class:`RuleSyntaxError` in ``error``.
+
+    ``on_validator_error`` decides what happens when a validator raises.
+    :attr:`ValidatorErrorPolicy.STOP` (the default) stops with a
+    :class:`RuleError`; :attr:`ValidatorErrorPolicy.FAIL_CANDIDATE` records
+    the exception as a rejection and tries the next candidate.
+
+    The function only reads *node*: it does not modify the DOM, it does not
+    access the network, and it does not depend on where the node comes from.
+
+    >>> from parsel import Rule, select_first
+    >>> record = Selector(text="<div><h2>Red shoes</h2></div>").css("div")[0]
+    >>> rules = [
+    ...     Rule("h1::text", method="css", name="old"),
+    ...     Rule("h2::text", method="css", name="new"),
+    ... ]
+    >>> result = select_first(record, rules)
+    >>> result.status.value
+    'matched'
+    >>> result.values
+    ('Red shoes',)
+    >>> result.rejections[0].reason.value
+    'no_match'
+    >>> result.rejections[0].category.value
+    'template_mismatch'
+    """
+    configured = _check_rules(rules)
+    _check_node(node)
+    try:
+        policy = ValidatorErrorPolicy(on_validator_error)
+    except ValueError:
+        msg = (
+            f"Invalid on_validator_error: {on_validator_error!r}; expected"
+            f" 'stop' or 'fail_candidate'"
+        )
+        raise RuleConfigurationError(msg) from None
+
+    rejections: list[Rejection] = []
+    for index, rule in enumerate(configured):
+        try:
+            values, rejection = _evaluate(node, rule, index, policy)
+        except RuleError as exc:
+            return RuleResult(
+                status=RuleStatus.ERROR,
+                rules=configured,
+                index=index,
+                rejections=tuple(rejections),
+                error=exc,
+            )
+        if rejection is not None:
+            rejections.append(rejection)
+            continue
+        return RuleResult(
+            status=RuleStatus.MATCHED,
+            rules=configured,
+            index=index,
+            values=values,
+            rejections=tuple(rejections),
+        )
+
+    return RuleResult(
+        status=RuleStatus.NO_MATCH,
+        rules=configured,
+        rejections=tuple(rejections),
+    )

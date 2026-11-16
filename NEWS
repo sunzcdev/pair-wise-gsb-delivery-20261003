@@ -3,6 +3,21 @@
 History
 -------
 
+(unreleased)
+~~~~~~~~~~~~
+
+* Added :class:`~parsel.selector.Rule` and
+  :func:`~parsel.selector.select_first` to try an ordered sequence of
+  candidate XPath/CSS expressions on a single record node and return the first
+  one that satisfies its rule. Each rule bounds the number of matched nodes
+  with ``min_count``/``max_count``, decides whether empty text is acceptable,
+  and can run an optional validator. The returned
+  :class:`~parsel.selector.RuleResult` records the candidates that were
+  rejected and why, and separates template mismatches, invalid content and
+  rule errors. Invalid selector syntax is reported as
+  :class:`~parsel.selector.RuleSyntaxError` instead of a missing match, and
+  validator exceptions follow an explicit raise-or-fail policy.
+
 1.12.1 (2026-09-28)
 ~~~~~~~~~~~~~~~~~~~
 
