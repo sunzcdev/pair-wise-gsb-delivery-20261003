@@ -41,3 +41,22 @@ def test_list(table, loaded_table):
 
     # This should not return old style table which was a subclass of list.
     assert not isinstance(table, list)
+
+
+def test_envelopes_have_physical_numbers(table, loaded_table):
+    streamed = [(envelope.index, envelope.deleted, envelope.record)
+                for envelope in table.iter_records()]
+    loaded = [(envelope.index, envelope.deleted, envelope.record)
+              for envelope in loaded_table.iter_records()]
+
+    assert streamed == loaded
+    assert [index for (index, deleted, record) in streamed] == [0, 1, 2]
+    assert [deleted for (index, deleted, record) in streamed] == \
+        [False, False, True]
+
+    # The envelopes keep the order from the file.
+    assert [record['NAME'] for (index, deleted, record) in streamed] == \
+        ['Alice', 'Bob', 'Deleted Guy']
+    loaded_envelopes = loaded_table.envelopes
+    assert [envelope.record['NAME'] for envelope in loaded_envelopes] == \
+        ['Alice', 'Bob', 'Deleted Guy']

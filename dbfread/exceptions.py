@@ -7,4 +7,13 @@ class MissingMemoFile(IOError):
     """Raised if the corresponding memo file was not found."""
 
 
-__all__ = ['DBFNotFound', 'MissingMemoFile']
+class RecordCountMismatchWarning(UserWarning):
+    """The record count in the file header does not match the file."""
+
+
+class TruncatedRecordWarning(UserWarning):
+    """The file ends with a partial record, which is not returned."""
+
+
+__all__ = ['DBFNotFound', 'MissingMemoFile',
+           'RecordCountMismatchWarning', 'TruncatedRecordWarning']

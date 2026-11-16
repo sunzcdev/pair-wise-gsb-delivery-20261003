@@ -47,6 +47,39 @@ Deleted records are available in ``deleted``:
     >>> len(table.deleted)
     1
 
+To see active and deleted records together in the order they are
+stored in the file, use ``iter_records()``. It returns a
+``RecordEnvelope`` for each record with its physical record number,
+its delete flag and the field values:
+
+.. code-block:: python
+
+    >>> for envelope in table.iter_records():
+    ...     print(envelope.index, envelope.deleted, envelope.record['NAME'])
+    0 False Alice
+    1 False Bob
+    2 True Deleted Guy
+
+Physical record numbers count from ``0`` at the first record in the
+file and do not change when deleted records are skipped. You can read
+an inclusive range of physical record numbers with ``first`` and
+``last``:
+
+.. code-block:: python
+
+    >>> [envelope.record['NAME']
+    ...  for envelope in table.iter_records(first=1, last=2)]
+    ['Bob', 'Deleted Guy']
+
+The result is the same whether the table is loaded or not.
+
+If the record count in the file header does not match the number of
+complete records in the file, ``iter_records()`` and ``load()`` issue
+a ``RecordCountMismatchWarning``. ``check_record_count()`` returns the
+same information as a ``RecordCountReport`` without warning. A file
+that ends with a partial record gives a ``TruncatedRecordWarning``,
+and that partial record is never returned as data.
+
 You can also use the ``with`` statement:
 
 .. code-block:: python
@@ -93,7 +126,9 @@ table attributes you can do:
 You can unload records again with ``table.unload()``.
 
 If the table is not loaded, the ``records`` and ``deleted`` attributes
-return ``RecordIterator`` objects.
+return ``RecordIterator`` objects. The ``envelopes`` attribute returns
+a ``RecordEnvelopeIterator``, which yields both active and deleted
+records with their physical positions.
 
 Loading or iterating over records will open the DBF and memo file once
 for each iteration. This means the ``DBF`` object doesn't hold any

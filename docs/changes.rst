@@ -7,6 +7,27 @@ Release History
 (Next Version)
 ^^^^^^^^^^^^^^^^^^
 
+* added ``DBF.iter_records(first=None, last=None)`` (alias
+  ``iter_envelopes()``), which yields ``RecordEnvelope`` objects with
+  the physical record number, the delete flag and the field values for
+  both active and deleted records in file order. Physical numbers do
+  not shift when deleted records are skipped, and the result is the
+  same in loaded and streaming mode. Normal iteration over the table
+  is unchanged and still returns active records only.
+
+* added the ``DBF.envelopes`` attribute with all records in file
+  order.
+
+* added ``DBF.check_record_count()``, which compares the header record
+  count with the number of complete records in the file.
+  ``RecordCountMismatchWarning`` is issued when they differ and
+  ``TruncatedRecordWarning`` when the file ends with a partial record.
+  A partial record is never returned as data, and ``len()`` agrees
+  with iteration.
+
+* ``load()`` now reads the file in a single pass instead of once for
+  active and once for deleted records.
+
 * records are now returned ``dict`` instead of ``collections.OrderedDict``
   in Python 3.7 and up (as well as CPython 3.6) since normal Python
   dictionaries are now ordered.

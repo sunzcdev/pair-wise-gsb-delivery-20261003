@@ -6,6 +6,7 @@ import sys
 import datetime
 import platform
 import collections
+import warnings
 
 from .ifiles import ifind
 from .struct_parser import StructParser
@@ -13,7 +14,8 @@ from .field_parser import FieldParser
 from .memo import find_memofile, open_memofile, FakeMemoFile
 from .codepages import guess_encoding
 from .dbversions import get_dbversion_string
-from .exceptions import DBFNotFound, MissingMemoFile
+from .exceptions import (DBFNotFound, MissingMemoFile,
+                         RecordCountMismatchWarning, TruncatedRecordWarning)
 
 _py_version = (sys.version_info.major, sys.version_info.minor)
 _py_impl = platform.python_implementation()
@@ -83,6 +85,111 @@ class RecordIterator(object):
         return self._table._count_records(self._record_type)
 
 
+class RecordEnvelope(collections.namedtuple(
+        'RecordEnvelope', ['index', 'deleted', 'record'])):
+    """A record together with its physical position in the file.
+
+    ``index`` is the zero-based physical record number, counted from
+    the first record in the file. It does not change when deleted
+    records are skipped or when only part of the file is read, so the
+    same number always refers to the same record whether the records
+    are streamed or loaded.
+
+    ``deleted`` is ``True`` for records flagged as deleted in the file
+    and ``False`` for active records.
+
+    ``record`` is the value produced by the record factory (a ``dict``
+    by default).
+
+    Being a tuple, an envelope can also be unpacked::
+
+        >>> for index, deleted, record in table.iter_records():
+        ...     pass
+
+    """
+    __slots__ = ()
+
+    @property
+    def record_number(self):
+        """One-based physical record number (``index + 1``)."""
+        return self.index + 1
+
+    @property
+    def is_deleted(self):
+        """``True`` if the record is flagged as deleted."""
+        return self.deleted
+
+    def __getitem__(self, key):
+        # Tuple behaviour for numbers and slices, attribute behaviour
+        # for strings, so both envelope[0] and envelope['index'] work.
+        try:
+            return tuple.__getitem__(self, key)
+        except TypeError:
+            try:
+                return getattr(self, key)
+            except (AttributeError, TypeError):
+                raise KeyError(key)
+
+    def get(self, key, default=None):
+        """Dictionary-style access with a default."""
+        try:
+            return self[key]
+        except KeyError:
+            return default
+
+
+class RecordEnvelopeIterator(object):
+    """Iterate over :class:`RecordEnvelope` objects.
+
+    This is returned by the ``envelopes`` attribute when the table is
+    not loaded. Iterating over it or calling ``len()`` on it gives the
+    same result, like the other iterators in dbfread.
+
+    """
+    def __init__(self, table):
+        self._table = table
+
+    def __iter__(self):
+        return self._table._iter_envelopes()
+
+    def __len__(self):
+        return self._table._count_envelopes()
+
+
+class RecordCountReport(collections.namedtuple(
+        'RecordCountReport',
+        ['header_count', 'actual_count', 'difference', 'truncated'])):
+    """Result of :meth:`DBF.check_record_count`.
+
+    ``header_count`` is the record count stored in the file header and
+    ``actual_count`` is the number of complete records found in the
+    file, deleted ones included.
+
+    ``difference`` is ``header_count - actual_count``, so a positive
+    value means the header claims more records than the file holds.
+
+    ``truncated`` is ``True`` if the file ends with a partial record.
+    Such a record is never returned as data.
+
+    """
+    __slots__ = ()
+
+    @property
+    def ok(self):
+        """``True`` if the counts match and the file is not truncated."""
+        return self.difference == 0 and not self.truncated
+
+    @property
+    def missing(self):
+        """Records claimed by the header but not found in the file."""
+        return max(self.difference, 0)
+
+    @property
+    def extra(self):
+        """Records found in the file but not counted by the header."""
+        return max(-self.difference, 0)
+
+
 class DBF(object):
     """DBF table."""
     def __init__(self, filename, encoding=None, ignorecase=True,
@@ -112,6 +219,7 @@ class DBF(object):
         self.name = os.path.splitext(self.name)[0].lower()
         self._records = None
         self._deleted = None
+        self._envelopes = None
 
         if ignorecase:
             self.filename = ifind(filename)
@@ -176,10 +284,18 @@ class DBF(object):
         This loads both records and deleted records. The ``records``
         and ``deleted`` attributes will now be lists of records.
 
+        The file is read in a single pass, so the records keep the
+        order they have in the file and the physical record numbers in
+        ``envelopes`` are the same as when streaming.
+
         """
         if not self.loaded:
-            self._records = list(self._iter_records(b' '))
-            self._deleted = list(self._iter_records(b'*'))
+            envelopes = list(self._iter_envelopes(report=True))
+            self._envelopes = envelopes
+            self._records = [envelope.record for envelope in envelopes
+                             if not envelope.deleted]
+            self._deleted = [envelope.record for envelope in envelopes
+                             if envelope.deleted]
 
     def unload(self):
         """Unload records from memory.
@@ -189,6 +305,7 @@ class DBF(object):
         """
         self._records = None
         self._deleted = None
+        self._envelopes = None
 
     @property
     def records(self):
@@ -209,6 +326,24 @@ class DBF(object):
             return self._deleted
         else:
             return RecordIterator(self, b'*')
+
+    @property
+    def envelopes(self):
+        """All records with physical position and delete flag.
+
+        When the table is loaded this is a list of
+        :class:`RecordEnvelope` objects, otherwise it is a
+        :class:`RecordEnvelopeIterator` that streams from disk. In both
+        cases iterating over it or calling ``len()`` gives the same
+        result.
+
+        """
+        if self.loaded:
+            if self._envelopes is None:
+                self._envelopes = list(self._iter_envelopes())
+            return self._envelopes
+        else:
+            return RecordEnvelopeIterator(self)
 
     def _read_header(self, infile):
         # Todo: more checks?
@@ -273,63 +408,311 @@ class DBF(object):
                 # Todo: return as byte string?
                 raise ValueError('Unknown field type: {!r}'.format(field.type))
 
-    def _skip_record(self, infile):
-        # -1 for the record separator which was already read.
-        infile.seek(self.header.recordlen - 1, 1)
+    def _record_bodylen(self):
+        """Number of bytes in a record body (excluding the flag byte).
+
+        Normally this is ``recordlen - 1``. Field lengths can be
+        changed after the table is opened (see docs/dbf_objects.rst),
+        and if they then add up to more than the record length the
+        longer value is used so that all fields can still be read.
+        """
+        field_len = sum(field.length for field in self.fields)
+        return max(self.header.recordlen - 1, field_len)
+
+    @staticmethod
+    def _read_record(infile, bodylen):
+        """Read one physical record slot.
+
+        Returns ``(flag, data)`` where ``flag`` is the record flag byte
+        and ``data`` is the record body. ``flag`` is ``b'\\x1a'`` for
+        the end-of-file marker and ``None`` at the end of the file. In
+        both cases ``data`` is ``None``.
+
+        ``data`` is shorter than ``bodylen`` when the file ends in the
+        middle of a record.
+        """
+        flag = infile.read(1)
+        if not flag:
+            return None, None
+        if flag == b'\x1a':
+            return flag, None
+
+        return flag, infile.read(bodylen)
+
+    @staticmethod
+    def _is_padding(flag, data):
+        """Check if a short tail is padding and not a partial record.
+
+        Some writers pad the end of the file to a block boundary with
+        spaces or NUL bytes instead of writing an end-of-file marker.
+        Such a tail must not be reported as a partial record.
+        """
+        if flag not in (b' ', b'\x00'):
+            return False
+
+        return (flag + data).strip(b' \x00') == b''
+
+    def _scan_records(self, infile, last=None, stats=None, warn=True):
+        """Yield ``(index, deleted, data)`` for complete records.
+
+        Records are numbered from zero in file order and that number is
+        independent of which records are returned, so skipping deleted
+        (or otherwise skipped) records never renumbers the rest.
+
+        Only complete records are yielded. A partial record at the end
+        of the file is reported (unless ``warn`` is false) and then
+        abandoned, because its missing bytes cannot be told apart from
+        real field data.
+
+        A slot whose flag byte is neither space (active) nor asterisk
+        (deleted) is not returned, but it still occupies its physical
+        position so the numbering of the following records does not
+        move.
+
+        If ``last`` is given the scan stops after that physical record.
+
+        ``stats``, if given, is filled with the number of complete
+        record slots (``actual``), whether a partial record was found
+        (``truncated``) and whether the end of the records was reached
+        (``complete``).
+        """
+        if self.header.recordlen < 1:
+            raise ValueError('record length must be at least 1 (was {})'
+                             .format(self.header.recordlen))
+
+        if stats is None:
+            stats = {}
+        stats['actual'] = 0
+        stats['truncated'] = False
+        stats['complete'] = False
+
+        bodylen = self._record_bodylen()
+
+        # Skip to first record.
+        infile.seek(self.header.headerlen, 0)
+
+        index = 0
+        while True:
+            flag, data = self._read_record(infile, bodylen)
+
+            if flag is None or flag == b'\x1a':
+                # End of file or end-of-file marker (not a record).
+                stats['complete'] = True
+                return
+
+            if len(data) != bodylen:
+                # A partial record. Space or NUL padding to a block
+                # boundary is not a partial record and is ignored.
+                if self._is_padding(flag, data):
+                    stats['complete'] = True
+                else:
+                    stats['truncated'] = True
+                    if warn:
+                        self._report_truncated(index)
+                return
+
+            stats['actual'] = index + 1
+
+            if flag in (b' ', b'*'):
+                yield index, flag == b'*', data
+
+            if last is not None and index >= last:
+                return
+
+            index += 1
+
+    def _report_truncated(self, index):
+        warnings.warn(
+            'file {!r} ends with an incomplete record at physical '
+            'position {}; it is not returned'.format(self.filename, index),
+            TruncatedRecordWarning, stacklevel=3)
+
+    def _report_record_count(self, actual_count):
+        header_count = self.header.numrecords
+        if header_count == actual_count:
+            return
+
+        warnings.warn(
+            'header of {!r} says {} records but {} complete records were '
+            'found (difference {})'.format(self.filename, header_count,
+                                           actual_count,
+                                           header_count - actual_count),
+            RecordCountMismatchWarning, stacklevel=3)
+
+    def check_record_count(self):
+        """Compare the header record count with the records in the file.
+
+        Returns a :class:`RecordCountReport` with the count from the
+        header, the number of complete records found, their difference
+        and whether the file ends with a partial record.
+
+        The difference is ``header_count - actual_count``: a positive
+        value means the header claims records that are not in the file.
+        """
+        stats = {}
+        with open(self.filename, 'rb') as infile:
+            for _ in self._scan_records(infile, stats=stats, warn=False):
+                pass
+
+        return RecordCountReport(self.header.numrecords,
+                                 stats['actual'],
+                                 self.header.numrecords - stats['actual'],
+                                 stats['truncated'])
+
+    def _make_parser(self, memofile):
+        """Return a function that parses one field value."""
+        if self.raw:
+            def parse(_, data):
+                return data
+            return parse
+        else:
+            return self.parserclass(self, memofile).parse
+
+    def _parse_record(self, data, parse):
+        """Parse a record body with the configured record factory."""
+        items = []
+        offset = 0
+        for field in self.fields:
+            next_offset = offset + field.length
+            items.append((field.name, parse(field, data[offset:next_offset])))
+            offset = next_offset
+
+        return self.recfactory(items)
 
     def _count_records(self, record_type=b' '):
         count = 0
 
         with open(self.filename, 'rb') as infile:
-            # Skip to first record.
-            infile.seek(self.header.headerlen, 0)
-
-            while True:
-                sep = infile.read(1)
-                if sep == record_type:
+            # Count complete records only, so len() agrees with what
+            # iteration returns even if the file ends in a partial
+            # record.
+            for (_, deleted, _) in self._scan_records(infile, warn=False):
+                if (b'*' if deleted else b' ') == record_type:
                     count += 1
-                    self._skip_record(infile)
-                elif sep in (b'\x1a', b''):
-                    # End of records.
-                    break
-                else:
-                    self._skip_record(infile)
 
         return count
 
-    def _iter_records(self, record_type=b' '):
+    def _count_envelopes(self):
+        if self.loaded and self._envelopes is not None:
+            return len(self._envelopes)
+
+        count = 0
+        with open(self.filename, 'rb') as infile:
+            for _ in self._scan_records(infile, warn=False):
+                count += 1
+
+        return count
+
+    @staticmethod
+    def _validate_range(first, last):
+        """Check a physical record range.
+
+        ``first`` and ``last`` are zero-based physical record numbers
+        and both are inclusive. ``None`` means open-ended.
+        """
+        for name, value in [('first', first), ('last', last)]:
+            if value is None:
+                continue
+            if isinstance(value, bool) or not isinstance(value, int):
+                raise TypeError(
+                    '{} must be an integer or None, was {!r}'
+                    .format(name, value))
+            if value < 0:
+                raise ValueError('{} must be non-negative, was {}'
+                                 .format(name, value))
+
+        if first is not None and last is not None and last < first:
+            raise ValueError('last ({}) must not be smaller than first ({})'
+                             .format(last, first))
+
+    @staticmethod
+    def _select_envelopes(envelopes, first=None, last=None):
+        selected = []
+        for envelope in envelopes:
+            if first is not None and envelope.index < first:
+                continue
+            if last is not None and envelope.index > last:
+                continue
+            selected.append(envelope)
+        return selected
+
+    def _iter_envelopes(self, first=None, last=None, report=False):
+        """Stream records with physical position and delete flag.
+
+        The main file and the memo file (when needed) are opened once
+        for the whole iteration.
+
+        If ``report`` is true the header record count is compared with
+        the file when the scan reaches the end, and a warning is issued
+        on a mismatch.
+        """
+        self._validate_range(first, last)
+
+        if self.loaded and self._envelopes is not None:
+            for envelope in self._select_envelopes(self._envelopes,
+                                                   first, last):
+                yield envelope
+            return
+
         with open(self.filename, 'rb') as infile, \
-             self._open_memofile() as memofile:
+                self._open_memofile() as memofile:
 
-            # Skip to first record.
-            infile.seek(self.header.headerlen, 0)
+            parse = self._make_parser(memofile)
 
-            if self.raw:
-                def parse(_, data):
-                    return data
-            else:
-                field_parser = self.parserclass(self, memofile)
-                parse = field_parser.parse
+            stats = {}
+            for (index, deleted, data) in self._scan_records(
+                    infile, last=last, stats=stats):
+                if first is not None and index < first:
+                    continue
+                yield RecordEnvelope(index, deleted,
+                                     self._parse_record(data, parse))
 
-            # Shortcuts for speed.
-            skip_record = self._skip_record
-            read = infile.read
+            # The header can only be compared with the whole file, so
+            # skip the check when the scan did not reach the end.
+            if report and stats['complete']:
+                self._report_record_count(stats['actual'])
 
-            while True:
-                sep = read(1)
+    def iter_records(self, first=None, last=None):
+        """Iterate over records with their physical position.
 
-                if sep == record_type:
-                    items = [
-                        (field.name, parse(field, read(field.length)))
-                        for field in self.fields
-                    ]
-                    yield self.recfactory(items)
+        Yields :class:`RecordEnvelope` objects in file order, so active
+        and deleted records are interleaved exactly as they are stored.
+        Each envelope carries the zero-based physical record number
+        (``index``), the delete flag (``deleted``) and the parsed field
+        values (``record``).
 
-                elif sep in (b'\x1a', b''):
-                    # End of records.
-                    break
-                else:
-                    skip_record(infile)
+        ``first`` and ``last`` select an inclusive range of physical
+        record numbers. Numbers are positions counted from the first
+        record in the file, so they do not shift when deleted records
+        are skipped or when only a range is read. ``None`` means
+        open-ended; values outside the file simply yield nothing.
+
+        The result is the same whether the table is loaded or not. The
+        main file (and the memo file when needed) is opened once per
+        iteration, and custom ``parserclass`` and ``recfactory`` are
+        used. Iterating over the table itself is unchanged and still
+        returns only active records.
+        """
+        self._validate_range(first, last)
+        return self._iter_envelopes(first=first, last=last, report=True)
+
+    # More descriptive alias.
+    iter_envelopes = iter_records
+
+    def _iter_records(self, record_type=b' '):
+        """Stream records with the given flag byte.
+
+        This is the default iteration used by ``records``, ``deleted``
+        and ``DBF.__iter__``. It returns records only and does not
+        expose physical numbers or the end-of-file diagnostics.
+        """
+        with open(self.filename, 'rb') as infile, \
+                self._open_memofile() as memofile:
+
+            parse = self._make_parser(memofile)
+            for (_, deleted, data) in self._scan_records(infile, warn=False):
+                if (b'*' if deleted else b' ') == record_type:
+                    yield self._parse_record(data, parse)
 
     def __iter__(self):
         if self.loaded:

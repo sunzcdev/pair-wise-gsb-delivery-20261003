@@ -15,8 +15,14 @@ class DeprecatedDBF(DBF, list):
 
     def load(self):
         if not self.loaded:
-            self[:] = self._iter_records(b' ')
-            self._deleted = list(self._iter_records(b'*'))
+            # Read the file once so active and deleted records keep
+            # their order from the file.
+            envelopes = list(self._iter_envelopes(report=True))
+            self._envelopes = envelopes
+            self[:] = [envelope.record for envelope in envelopes
+                       if not envelope.deleted]
+            self._deleted = [envelope.record for envelope in envelopes
+                             if envelope.deleted]
 
     def unload(self):
         # self.loaded is not checked here because this
@@ -24,6 +30,7 @@ class DeprecatedDBF(DBF, list):
         # Also, unloading twice has no consequences.
         del self[:]
         self._deleted = None
+        self._envelopes = None
 
     def __iter__(self):
         if self.loaded:

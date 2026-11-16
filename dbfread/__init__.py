@@ -17,9 +17,10 @@ __email__ = 'ombdalen@gmail.com'
 __url__ = 'https://dbfread.readthedocs.io/'
 __license__ = 'MIT'
 
-from .dbf import DBF
+from .dbf import DBF, RecordCountReport, RecordEnvelope
 from .deprecated_dbf import open, read
-from .exceptions import DBFNotFound, MissingMemoFile
+from .exceptions import (DBFNotFound, MissingMemoFile,
+                         RecordCountMismatchWarning, TruncatedRecordWarning)
 from .field_parser import FieldParser, InvalidValue
 from .version import version_info, version as __version__
 

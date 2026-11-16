@@ -83,10 +83,104 @@ load()
    records. The ``records`` and ``deleted`` attributes will now be
    lists of records.
 
+   The file is read in a single pass, so the records keep the order
+   they have in the file and physical record numbers are the same as
+   when streaming.
+
 unload()
    Unload records from memory. The ``records`` and ``deleted``
    attributes will now be instances of ``RecordIterator``, which
    streams records from disk.
+
+iter_records(first=None, last=None)
+   Iterate over records together with their physical position. This
+   yields ``RecordEnvelope`` objects in file order, so active and
+   deleted records are interleaved exactly as they are stored::
+
+       >>> for envelope in DBF('people.dbf').iter_records():
+       ...     print(envelope.index, envelope.deleted, envelope.record)
+
+   ``first`` and ``last`` select an inclusive range of physical record
+   numbers. ``None`` means open-ended, and values outside the file
+   simply yield nothing.
+
+   ``iter_envelopes()`` is an alias.
+
+   The main file (and the memo file when needed) is opened once for
+   each iteration. Custom ``parserclass`` and ``recfactory`` are used
+   like for normal iteration. Iterating over the table itself is
+   unchanged and still returns only active records.
+
+check_record_count()
+   Compare the record count in the file header with the number of
+   complete records in the file. Returns a ``RecordCountReport``
+   (see below).
+
+
+Record Envelopes
+----------------
+
+``RecordEnvelope`` is a named tuple with three items:
+
+index
+  The zero-based physical record number, counted from the first record
+  in the file. It does not shift when deleted records are skipped or
+  when only a range is read, so the same number always refers to the
+  same record. ``record_number`` gives the one-based number.
+
+deleted
+  ``True`` for records flagged as deleted in the file, ``False`` for
+  active records. ``is_deleted`` is an alias.
+
+record
+  The parsed field values, produced by ``recfactory`` (a ``dict`` by
+  default).
+
+Because it is a tuple, an envelope can also be unpacked::
+
+    for index, deleted, record in table.iter_records():
+        ...
+
+Physical record numbers are positions in the file, not a count of the
+records that have been returned. If record 1 is deleted,
+``iter_records(first=1)`` still starts at record 1, and each returned
+envelope keeps the number it has in the file.
+
+
+Record Count Diagnostics
+------------------------
+
+A file can disagree with its own header. dbfread reports this instead
+of silently returning a different number of records:
+
+* ``RecordCountMismatchWarning`` is issued by ``iter_records()`` and
+  by ``load()`` when the header count differs from the number of
+  complete records actually found. ``check_record_count()`` returns
+  the same information without warning.
+* ``TruncatedRecordWarning`` is issued when the file ends with a
+  partial record. A partial record is never returned as data, because
+  its missing bytes cannot be told apart from real field data. Space
+  or NUL padding after the last record is not a partial record.
+
+``RecordCountReport`` has these attributes:
+
+header_count
+  The record count stored in the file header.
+
+actual_count
+  The number of complete records found in the file, deleted records
+  included.
+
+difference
+  ``header_count - actual_count``. A positive number means the header
+  claims more records than the file holds. ``missing`` and ``extra``
+  give the positive part of the difference in each direction.
+
+truncated
+  ``True`` if the file ends with a partial record.
+
+ok
+  ``True`` if the counts match and the file is not truncated.
 
 
 Attributes
@@ -101,6 +195,14 @@ deleted
   If the table is loaded this is a list of deleted records. If not,
   it's a ``RecordIterator`` object. In either case, iterating over it
   or calling ``len()`` on it will give the same results.
+
+envelopes
+  All records, active and deleted, with their physical position and
+  delete flag. If the table is loaded this is a list of
+  ``RecordEnvelope`` objects, otherwise it's a
+  ``RecordEnvelopeIterator`` that streams from disk. In either case
+  iterating over it or calling ``len()`` on it will give the same
+  results.
 
 loaded
   ``True`` if records are loaded into memory.
