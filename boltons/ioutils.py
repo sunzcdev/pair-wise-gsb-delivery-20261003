@@ -44,6 +44,7 @@ from abc import (
     abstractmethod,
     abstractproperty,
 )
+from bisect import bisect_right
 from errno import EINVAL
 from codecs import EncodedFile
 from tempfile import TemporaryFile
@@ -545,6 +546,15 @@ class MultiFileReader:
     raise a TypeError on non-file-like objects. A ValueError is raised
     when file-like objects are a mix of bytes- and text-handling
     objects (for instance, BytesIO and StringIO).
+
+    In addition to sequential reading, a logical, contiguous byte
+    (or character) stream is exposed through :meth:`seek` and
+    :meth:`tell`. A lazily-built index of the fixed-length sources
+    makes it possible to position the cursor at any logical offset
+    without rereading any of the data, and empty files are spanned
+    transparently. The underlying files are borrowed: they are never
+    closed by the reader. If a source grows or shrinks after the index
+    has been built, the stale index is rejected with a ValueError.
     """
 
     def __init__(self, *fileobjs):
@@ -563,6 +573,55 @@ class MultiFileReader:
             self._joiner = b''
         self._fileobjs = fileobjs
         self._index = 0
+        # Logical offset at which each file starts and its length when
+        # indexed. Both stay None until the index is lazily built.
+        self._offsets = None
+        self._lengths = None
+        self._size = None
+
+    @staticmethod
+    def _get_len(fileobj):
+        """Return the fixed length of *fileobj* without reading its
+        contents. The size is taken with seek/tell and the cursor is
+        restored to exactly where it was.
+        """
+        cur = fileobj.tell()
+        fileobj.seek(0, os.SEEK_END)
+        length = fileobj.tell()
+        fileobj.seek(cur)
+        return length
+
+    def _build_index(self):
+        """Build the shard index from the current lengths of the
+        sources. No data is read, and every cursor is left exactly
+        where it was found.
+        """
+        lengths = [self._get_len(f) for f in self._fileobjs]
+        offsets = []
+        running = 0
+        for length in lengths:
+            offsets.append(running)
+            running += length
+        self._lengths = lengths
+        self._offsets = offsets
+        self._size = running
+
+    def _check_index(self):
+        """Ensure a built index still matches the sources. Reusing an
+        index after any source has changed length would silently
+        misposition reads, so raise a ValueError instead. Only lengths
+        are revisited; contents are never read and every cursor is
+        returned to its prior position.
+        """
+        if self._lengths is None:
+            self._build_index()
+            return
+        for idx, fileobj in enumerate(self._fileobjs):
+            if self._get_len(fileobj) != self._lengths[idx]:
+                raise ValueError(
+                    'MultiFileReader source length changed; index is stale.'
+                    ' Construct a new MultiFileReader instead of reusing one'
+                    ' whose files have been grown or truncated')
 
     def read(self, amt=None):
         """Read up to the specified *amt*, seamlessly bridging across
@@ -584,16 +643,56 @@ class MultiFileReader:
             amt -= got
         return self._joiner.join(parts)
 
-    def seek(self, offset, whence=os.SEEK_SET):
-        """Enables setting position of the file cursor to a given
-        *offset*. Currently only supports ``offset=0``.
+    def tell(self):
+        """Return the current logical position across the concatenated
+        stream, spanning empty files as needed.
         """
-        if whence != os.SEEK_SET:
-            raise NotImplementedError(
-                'MultiFileReader.seek() only supports os.SEEK_SET')
-        if offset != 0:
-            raise NotImplementedError(
-                'MultiFileReader only supports seeking to start at this time')
-        for f in self._fileobjs:
-            f.seek(0)
-        self._index = 0
+        self._check_index()
+        if self._index >= len(self._fileobjs):
+            return self._size
+        return self._offsets[self._index] + self._fileobjs[self._index].tell()
+
+    def seek(self, offset, whence=os.SEEK_SET):
+        """Set the logical cursor position and return the resulting
+        absolute offset.
+
+        Supports all three standard modes: ``os.SEEK_SET`` for an
+        absolute offset, ``os.SEEK_CUR`` for an offset relative to the
+        current position, and ``os.SEEK_END`` for one measured back
+        from the end of the logical stream. Offsets landing past the
+        end are clamped to the end of the stream, matching ordinary
+        file behavior. Seeking to ``0`` keeps working exactly as it
+        always has.
+        """
+        self._check_index()
+        if whence == os.SEEK_SET:
+            target = offset
+        elif whence == os.SEEK_CUR:
+            target = self.tell() + offset
+        elif whence == os.SEEK_END:
+            target = self._size + offset
+        else:
+            raise ValueError(
+                'invalid whence for MultiFileReader.seek(): %r' % (whence,))
+        if target < 0:
+            raise ValueError('negative seek position %r' % (target,))
+        if target > self._size:
+            target = self._size
+
+        # The rightmost file starting at or below the target owns it.
+        # bisect_right naturally skips empty shards sharing an offset.
+        idx = bisect_right(self._offsets, target) - 1
+        if idx < 0:
+            # No files at all; nothing to reposition.
+            return target
+        # Rewind every borrowed shard before positioning: shards read to
+        # EOF in a previous pass are otherwise still parked there and a
+        # later read bridging forward from an earlier shard would get
+        # nothing from them. This also preserves the historical
+        # seek(0) behavior of rewinding every underlying file.
+        for fileobj in self._fileobjs:
+            fileobj.seek(0)
+        local = target - self._offsets[idx]
+        self._fileobjs[idx].seek(local)
+        self._index = idx
+        return target

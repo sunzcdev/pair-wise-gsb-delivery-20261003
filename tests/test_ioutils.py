@@ -638,3 +638,207 @@ class TestMultiFileReader(TestCase):
         mfr = ioutils.MultiFileReader(f1, f2)
         utf8_double_file_str = mfr.read()
         assert utf8_double_file_str == (utf8_file_str * 2)
+
+    def test_tell_tracks_logical_position(self):
+        r = ioutils.MultiFileReader(io.BytesIO(b'ab'),
+                                    io.BytesIO(b'cde'),
+                                    io.BytesIO(b'f'))
+        self.assertEqual(r.tell(), 0)
+        r.read(3)
+        self.assertEqual(r.tell(), 3)
+        r.read(3)
+        self.assertEqual(r.tell(), 6)
+        # tell() at and beyond the end stays pinned at the stream size
+        self.assertEqual(r.tell(), 6)
+
+    def test_seek_absolute_inside_and_across_shards(self):
+        r = ioutils.MultiFileReader(io.BytesIO(b'ab'),
+                                    io.BytesIO(b'cde'),
+                                    io.BytesIO(b'f'))
+        self.assertEqual(r.seek(1), 1)
+        self.assertEqual(r.tell(), 1)
+        self.assertEqual(r.read(2), b'bc')
+
+        # Seek to a boundary between shards reads from the next shard
+        self.assertEqual(r.seek(2), 2)
+        self.assertEqual(r.read(2), b'cd')
+
+        # Seek into a later shard
+        self.assertEqual(r.seek(4), 4)
+        self.assertEqual(r.read(3), b'ef')
+
+    def test_seek_current_relative(self):
+        r = ioutils.MultiFileReader(io.BytesIO(b'ab'),
+                                    io.BytesIO(b'cde'),
+                                    io.BytesIO(b'f'))
+        r.seek(1)
+        self.assertEqual(r.seek(2, os.SEEK_CUR), 3)
+        self.assertEqual(r.read(1), b'd')
+        self.assertEqual(r.tell(), 4)
+        self.assertEqual(r.seek(-2, os.SEEK_CUR), 2)
+        self.assertEqual(r.read(1), b'c')
+        self.assertEqual(r.seek(0, os.SEEK_CUR), 3)
+
+    def test_seek_end(self):
+        r = ioutils.MultiFileReader(io.BytesIO(b'ab'),
+                                    io.BytesIO(b'cde'),
+                                    io.BytesIO(b'f'))
+        self.assertEqual(r.seek(0, os.SEEK_END), 6)
+        self.assertEqual(r.read(), b'')
+        self.assertEqual(r.seek(-3, os.SEEK_END), 3)
+        self.assertEqual(r.read(), b'def')
+
+    def test_seek_to_end_and_past_end_are_clamped(self):
+        r = ioutils.MultiFileReader(io.BytesIO(b'ab'), io.BytesIO(b'cd'))
+        self.assertEqual(r.seek(100), 4)
+        self.assertEqual(r.tell(), 4)
+        self.assertEqual(r.read(), b'')
+        # Still repositionable after clamping to the end
+        r.seek(0)
+        self.assertEqual(r.read(), b'abcd')
+
+    def test_negative_seek_rejected(self):
+        r = ioutils.MultiFileReader(io.BytesIO(b'ab'), io.BytesIO(b'cd'))
+        self.assertRaises(ValueError, r.seek, -1)
+        r.seek(1)
+        self.assertRaises(ValueError, r.seek, -5, os.SEEK_CUR)
+        self.assertRaises(ValueError, r.seek, -10, os.SEEK_END)
+        # Cursor is unchanged by a rejected seek
+        self.assertEqual(r.tell(), 1)
+
+    def test_invalid_whence(self):
+        r = ioutils.MultiFileReader(io.BytesIO(b'ab'))
+        self.assertRaises(ValueError, r.seek, 0, 42)
+
+    def test_empty_shards_are_spanned(self):
+        r = ioutils.MultiFileReader(io.BytesIO(b''),
+                                    io.BytesIO(b'ab'),
+                                    io.BytesIO(b''),
+                                    io.BytesIO(b''),
+                                    io.BytesIO(b'cd'),
+                                    io.BytesIO(b''))
+        # Logical offsets ignore empty shards
+        self.assertEqual(r.read(), b'abcd')
+        r.seek(0)
+        self.assertEqual(r.tell(), 0)
+        self.assertEqual(r.seek(2), 2)
+        self.assertEqual(r.read(), b'cd')
+        # Every empty-shard offset resolves to the same logical position
+        r.seek(0)
+        self.assertEqual(r.read(2), b'ab')
+        self.assertEqual(r.tell(), 2)
+
+    def test_all_empty_shards(self):
+        r = ioutils.MultiFileReader(io.BytesIO(b''), io.BytesIO(b''))
+        self.assertEqual(r.tell(), 0)
+        self.assertEqual(r.seek(0, os.SEEK_END), 0)
+        self.assertEqual(r.seek(5), 0)
+        self.assertEqual(r.read(), b'')
+
+    def test_seek_then_read_bridges_shards(self):
+        r = ioutils.MultiFileReader(io.BytesIO(b'abcd'),
+                                    io.BytesIO(b'efgh'),
+                                    io.BytesIO(b'ij'))
+        r.seek(3)
+        self.assertEqual(r.read(6), b'defghi')
+        self.assertEqual(r.tell(), 9)
+        r.seek(0)
+        self.assertEqual(r.read(), b'abcdefghij')
+
+    def test_text_mode_seek_tell(self):
+        r = ioutils.MultiFileReader(io.StringIO('ab'), io.StringIO('cde'))
+        self.assertEqual(r.seek(3), 3)
+        self.assertEqual(r.tell(), 3)
+        self.assertEqual(r.read(), 'de')
+        self.assertEqual(r.seek(-2, os.SEEK_END), 3)
+
+    def test_index_is_built_lazily_and_cached(self):
+        f1, f2 = io.BytesIO(b'ab'), io.BytesIO(b'cde')
+        r = ioutils.MultiFileReader(f1, f2)
+        self.assertIsNone(r._offsets)
+        r.read(1)
+        # Plain reads do not pay for index construction
+        self.assertIsNone(r._offsets)
+        r.tell()
+        self.assertEqual(r._offsets, [0, 2])
+        self.assertEqual(r._lengths, [2, 3])
+        self.assertEqual(r._size, 5)
+        offsets_before = r._offsets
+        r.seek(4)
+        # Repeated positioning reuses the cached index
+        self.assertIs(r._offsets, offsets_before)
+
+    def test_seek_does_not_reread_contents(self):
+        class TrackingBytesIO(io.BytesIO):
+            def __init__(self, data):
+                super().__init__(data)
+                self.bytes_read = 0
+
+            def read(self, n=-1):
+                data = super().read(n)
+                self.bytes_read += len(data)
+                return data
+
+        f1, f2 = TrackingBytesIO(b'abcd'), TrackingBytesIO(b'efgh')
+        r = ioutils.MultiFileReader(f1, f2)
+        r.seek(6)
+        self.assertEqual(f1.bytes_read, 0)
+        self.assertEqual(f2.bytes_read, 0)
+        self.assertEqual(r.tell(), 6)
+        self.assertEqual(f1.bytes_read, 0)
+        self.assertEqual(f2.bytes_read, 0)
+        self.assertEqual(r.read(1), b'g')
+        self.assertEqual(f2.bytes_read, 1)
+
+    def test_stale_index_rejected_when_source_changes_size(self):
+        f1, f2 = io.BytesIO(b'ab'), io.BytesIO(b'cde')
+        r = ioutils.MultiFileReader(f1, f2)
+        r.seek(1)
+        # A source grows out from under the reader
+        f2.seek(0, os.SEEK_END)
+        f2.write(b'XYZ')
+        self.assertEqual(len(f2.getvalue()), 6)
+        self.assertRaises(ValueError, r.tell)
+        self.assertRaises(ValueError, r.seek, 0)
+
+    def test_stale_index_rejected_on_truncation(self):
+        f1, f2 = io.BytesIO(b'ab'), io.BytesIO(b'cde')
+        r = ioutils.MultiFileReader(f1, f2)
+        r.tell()
+        f1.truncate(1)
+        self.assertRaises(ValueError, r.seek, 1)
+
+    def test_seek_zero_legacy_behavior(self):
+        f1, f2 = io.BytesIO(b'narf'), io.BytesIO(b'troz')
+        r = ioutils.MultiFileReader(f1, f2)
+        r.read()
+        # Historical behavior: seek(0) rewinds every underlying file
+        self.assertEqual(r.seek(0), 0)
+        self.assertEqual(f1.tell(), 0)
+        self.assertEqual(f2.tell(), 0)
+        self.assertEqual(r.read(), b'narftroz')
+
+    def test_borrowed_files_are_not_closed(self):
+        f1, f2 = io.BytesIO(b'ab'), io.BytesIO(b'cd')
+        r = ioutils.MultiFileReader(f1, f2)
+        r.read()
+        r.seek(0)
+        r.read()
+        self.assertFalse(f1.closed)
+        self.assertFalse(f2.closed)
+
+    def test_real_files_seek_tell(self):
+        with open(CUR_FILE_PATH, 'rb') as f:
+            contents = f.read()
+        size = len(contents)
+        with open(CUR_FILE_PATH, 'rb') as f1:
+            with open(CUR_FILE_PATH, 'rb') as f2:
+                mfr = ioutils.MultiFileReader(f1, f2)
+                # Two real files of equal size make one logical stream
+                self.assertEqual(mfr.seek(0, os.SEEK_END), size * 2)
+                self.assertEqual(mfr.seek(size * 2 + 10), size * 2)
+                mfr.seek(size - 5)
+                self.assertEqual(mfr.tell(), size - 5)
+                self.assertEqual(mfr.read(5), contents[-5:])
+                self.assertFalse(f1.closed)
+                self.assertFalse(f2.closed)
