@@ -16,10 +16,11 @@ from threading import Thread
 from typing import Any, Callable, Literal, Optional, Union
 from warnings import warn
 
+from .blob import Blob
 from .context import contextmanager
 from .cursor import Cursor
 
-__all__ = ["connect", "Connection", "Cursor"]
+__all__ = ["connect", "Blob", "Connection", "Cursor"]
 
 AuthorizerCallback = Callable[[int, str, str, str, str], int]
 
@@ -370,6 +371,35 @@ class Connection:
             Pass ``None`` to remove the authorizer.
         """
         await self._execute(self._conn.set_authorizer, authorizer_callback)
+
+    @contextmanager
+    async def blobopen(
+        self,
+        table: str,
+        column: str,
+        rowid: int,
+        *,
+        readonly: bool = False,
+        name: str = "main",
+    ) -> Blob:
+        """
+        Open an async blob handle for incremental I/O on a single BLOB value.
+
+        The returned :class:`Blob` supports chunked ``read()``/``write()``,
+        ``seek()``/``tell()``, and async context management. All underlying
+        sqlite3 blob operations run on the connection's worker thread, and
+        each handle keeps an independent position.
+
+        Requires Python 3.11+ (``sqlite3.Blob``).
+        """
+        if not hasattr(sqlite3, "Blob"):
+            raise NotImplementedError(
+                "blobopen requires sqlite3.Blob, available in Python 3.11+"
+            )
+        blob = await self._execute(
+            self._conn.blobopen, table, column, rowid, readonly=readonly, name=name
+        )
+        return Blob(self, blob)
 
     async def iterdump(self) -> AsyncIterator[str]:
         """
