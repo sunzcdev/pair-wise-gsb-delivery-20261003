@@ -563,30 +563,66 @@ class MultiFileReader:
             self._joiner = b''
         self._fileobjs = fileobjs
         self._index = 0
+        # Holds content which has been read from an underlying fileobj
+        # but not yet returned to the caller (e.g., a source returned
+        # more than was requested).
+        self._buf = self._joiner
 
     def read(self, amt=None):
         """Read up to the specified *amt*, seamlessly bridging across
         files. Returns the appropriate type of string (bytes or text)
         for the input, and returns an empty string when the files are
         exhausted.
+
+        A short read from an underlying file object is not treated as
+        the end of that file; only an empty result advances to the next
+        one. Any content read beyond *amt* is retained for the next
+        call. Reading zero bytes does not advance any file object.
         """
         if amt is None or amt < 0:
-            ret = self._joiner.join(f.read()
-                                    for f in self._fileobjs[self._index:])
-            self._index = len(self._fileobjs)
-            return ret
+            parts = [self._buf]
+            try:
+                while self._index < len(self._fileobjs):
+                    parts.append(self._fileobjs[self._index].read())
+                    self._index += 1
+            except Exception:
+                # Keep what has already been read, so it is neither
+                # lost nor read a second time.
+                self._buf = self._joiner.join(parts)
+                raise
+            self._buf = self._joiner
+            return self._joiner.join(parts)
+        if amt == 0:
+            return self._joiner
         parts = []
-        while amt > 0 and self._index < len(self._fileobjs):
-            parts.append(self._fileobjs[self._index].read(amt))
-            got = len(parts[-1])
-            if got < amt:
-                self._index += 1
-            amt -= got
+        if self._buf:
+            taken = self._buf[:amt]
+            parts.append(taken)
+            self._buf = self._buf[len(taken):]
+            amt -= len(taken)
+        try:
+            while amt > 0 and self._index < len(self._fileobjs):
+                chunk = self._fileobjs[self._index].read(amt)
+                if not chunk:
+                    # A genuinely empty result is the only signal that
+                    # this file object is exhausted.
+                    self._index += 1
+                    continue
+                if len(chunk) > amt:
+                    self._buf = chunk[amt:] + self._buf
+                    chunk = chunk[:amt]
+                parts.append(chunk)
+                amt -= len(chunk)
+        except Exception:
+            # Preserve content read before the error for the next call.
+            self._buf = self._joiner.join(parts) + self._buf
+            raise
         return self._joiner.join(parts)
 
     def seek(self, offset, whence=os.SEEK_SET):
         """Enables setting position of the file cursor to a given
-        *offset*. Currently only supports ``offset=0``.
+        *offset*. Currently only supports ``offset=0``. Any content
+        buffered from previous reads is discarded.
         """
         if whence != os.SEEK_SET:
             raise NotImplementedError(
@@ -597,3 +633,4 @@ class MultiFileReader:
         for f in self._fileobjs:
             f.seek(0)
         self._index = 0
+        self._buf = self._joiner

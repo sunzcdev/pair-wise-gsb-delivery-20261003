@@ -58,6 +58,7 @@ _(unreleased)_
 - Fixed [`ioutils.SpooledBytesIO`][ioutils.SpooledBytesIO] and [`ioutils.SpooledStringIO`][ioutils.SpooledStringIO] `truncate(size)` moving the position when it was past *size* ([#545](https://github.com/mahmoud/boltons/pull/545))
 - Fixed [`ioutils.SpooledBytesIO`][ioutils.SpooledBytesIO] `readline(0)` reading a full line ([#542](https://github.com/mahmoud/boltons/pull/542))
 - Fixed [`ioutils.MultiFileReader`][ioutils.MultiFileReader] `read(0)` reading everything, `read()` rereading consumed files, and `seek(0)` not resetting to the first file ([#512](https://github.com/mahmoud/boltons/pull/512))
+- Fixed [`ioutils.MultiFileReader`][ioutils.MultiFileReader] treating a short read as end-of-source, which dropped the rest of a file when a source returned fewer bytes than requested; only an empty read now advances to the next source, excess content is buffered for the next call, `read(0)` advances nothing, and data read before a mid-read error is preserved
 - Updated the [`ioutils`][ioutils] docs to use `SpooledStringIO` for text and drop Python 2 `cStringIO` references ([#555](https://github.com/mahmoud/boltons/pull/555))
 - Fixed [`jsonutils.reverse_iter_lines`][jsonutils.reverse_iter_lines] merging lines into one chunk for files starting with blank lines ([#536](https://github.com/mahmoud/boltons/pull/536))
 - Fixed [`jsonutils.reverse_iter_lines`][jsonutils.reverse_iter_lines] raising `TypeError` on text streams without a `.buffer`, like `io.StringIO` ([#488](https://github.com/mahmoud/boltons/pull/488))

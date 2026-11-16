@@ -584,6 +584,51 @@ class TestSpooledStringIO(TestCase, BaseTestMixin, AssertionsMixin):
         self.assertEqual(self.spooled_flo.getvalue(), expected)
 
 
+class _ShortReadIO(io.BytesIO):
+    """A BytesIO that returns at most *chunk* bytes per read."""
+
+    def __init__(self, data, chunk):
+        super().__init__(data)
+        self._chunk = chunk
+
+    def read(self, amt=None):
+        if amt is None or amt < 0:
+            return super().read()
+        if amt == 0:
+            return b''
+        return super().read(min(amt, self._chunk))
+
+
+class _OverReadIO(io.BytesIO):
+    """A BytesIO that returns more than requested, when available."""
+
+    def __init__(self, data, extra):
+        super().__init__(data)
+        self._extra = extra
+
+    def read(self, amt=None):
+        if amt is None or amt < 0:
+            return super().read()
+        if amt == 0:
+            return b''
+        return super().read(amt + self._extra)
+
+
+class _FailingIO(io.BytesIO):
+    """A BytesIO whose read fails on the *fail_on*-th call."""
+
+    def __init__(self, data, fail_on):
+        super().__init__(data)
+        self._fail_on = fail_on
+        self._calls = 0
+
+    def read(self, amt=None):
+        self._calls += 1
+        if self._calls == self._fail_on:
+            raise IOError('read failed')
+        return super().read(amt)
+
+
 class TestMultiFileReader(TestCase):
     def test_read_seek_bytes(self):
         r = ioutils.MultiFileReader(io.BytesIO(b'narf'), io.BytesIO(b'troz'))
@@ -602,12 +647,74 @@ class TestMultiFileReader(TestCase):
 
     def test_read_zero_and_negative(self):
         r = ioutils.MultiFileReader(io.BytesIO(b'narf'), io.BytesIO(b'troz'))
+        f1, f2 = r._fileobjs
         self.assertEqual(r.read(0), b'')
+        self.assertEqual((f1.tell(), f2.tell(), r._index), (0, 0, 0))
         self.assertEqual(r.read(5), b'narft')
         self.assertEqual(r.read(-1), b'roz')
         self.assertEqual(r.read(), b'')
         r.seek(0)
         self.assertEqual(r.read(3), b'nar')
+
+    def test_short_reads_do_not_advance(self):
+        """A short read is not EOF; only an empty read moves on."""
+        data = b'abcdefghij'
+        r = ioutils.MultiFileReader(_ShortReadIO(data[:4], 1),
+                                    _ShortReadIO(data[4:7], 2),
+                                    _ShortReadIO(data[7:], 1))
+        self.assertEqual(r.read(5), b'abcde')
+        self.assertEqual(r.read(5), b'fghij')
+        self.assertEqual(r.read(5), b'')
+
+    def test_short_reads_match_full_read(self):
+        """Concatenated short reader results equal one full read."""
+        data = b'0123456789abcdefghij'
+        mfr = ioutils.MultiFileReader(_ShortReadIO(data[:7], 2),
+                                      _ShortReadIO(data[7:], 3))
+        chunks = []
+        while True:
+            chunk = mfr.read(4)
+            if not chunk:
+                break
+            chunks.append(chunk)
+        self.assertEqual(b''.join(chunks), data)
+
+    def test_over_read_is_buffered(self):
+        """Content beyond amt is kept for subsequent reads."""
+        mfr = ioutils.MultiFileReader(_OverReadIO(b'abcdef', 2),
+                                      _OverReadIO(b'ghij', 3))
+        self.assertEqual([mfr.read(3), mfr.read(3), mfr.read(3), mfr.read(3)],
+                         [b'abc', b'def', b'ghi', b'j'])
+
+    def test_seek_clears_buffer(self):
+        mfr = ioutils.MultiFileReader(_OverReadIO(b'abcdef', 2))
+        self.assertEqual(mfr.read(2), b'ab')
+        self.assertEqual(mfr._buf, b'cd')
+        mfr.seek(0)
+        self.assertEqual(mfr._buf, b'')
+        self.assertEqual(mfr.read(), b'abcdef')
+
+    def test_io_error_keeps_read_data(self):
+        """Data read before a mid-read error is not lost or repeated."""
+        failing = _FailingIO(b'hello', 1)
+        mfr = ioutils.MultiFileReader(io.BytesIO(b'ab'), failing)
+        self.assertRaises(IOError, mfr.read, 6)
+        self.assertEqual(mfr.read(), b'abhello')
+        mfr.seek(0)
+        self.assertEqual(mfr.read(), b'abhello')
+
+    def test_text_short_reads(self):
+        class _ShortTextIO(io.StringIO):
+            def read(self, amt=None):
+                if amt is None or amt < 0:
+                    return super().read()
+                if amt == 0:
+                    return ''
+                return super().read(min(amt, 2))
+
+        mfr = ioutils.MultiFileReader(_ShortTextIO('narf'), _ShortTextIO('troz'))
+        self.assertEqual([mfr.read(3), mfr.read(3), mfr.read(3)],
+                         ['nar', 'ftr', 'oz'])
 
     def test_no_mixed_bytes_and_text(self):
         self.assertRaises(ValueError, ioutils.MultiFileReader,
