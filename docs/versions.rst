@@ -9,6 +9,9 @@ Unreleased
 ----------
 
 * Updated functions:
+    * :func:`callback_iter` now delivers buffered records after its producer
+      finishes, gains optional *max_pending* and *raise_on_error* arguments,
+      and rejects callbacks that arrive after it is closed.
     * :func:`peekable` was updated to avoid caching the entire iterable when sliced with a negative step and omitted *stop*.
 
 11.2.1

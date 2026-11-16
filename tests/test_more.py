@@ -5131,6 +5131,285 @@ class CallbackIterTests(TestCase):
             with self.assertRaises(ValueError):
                 it.result
 
+    def test_tail_is_delivered_after_producer_returns(self):
+        # The producer returns immediately after its final callback, so the
+        # buffer is non-empty when the future becomes done. Every record must
+        # still be delivered, and the return value must remain available.
+        def func(callback=None):
+            for i in range(5):
+                callback(i)
+            return 'done'
+
+        with mi.callback_iter(func) as it:
+            self.assertEqual(
+                list(it),
+                [((i,), {}) for i in range(5)],
+            )
+            self.assertTrue(it.done)
+            self.assertEqual(it.result, 'done')
+
+    def test_tail_is_delivered_when_consumer_starts_late(self):
+        # A controllable producer: it publishes all of its records, signals
+        # that it is about to return, and waits for the test to let it go.
+        # No sleep is involved, so the assertion cannot race the last
+        # callback.
+        produced = Event()
+        release = Event()
+
+        def func(callback=None):
+            for i in range(3):
+                callback(i)
+            produced.set()
+            release.wait()
+            return 'done'
+
+        with mi.callback_iter(func, wait_seconds=0.01) as it:
+            # Starting iteration also starts the producer.
+            self.assertEqual(next(it), ((0,), {}))
+
+            self.assertTrue(produced.wait(5))
+            release.set()
+
+            self.assertEqual(
+                list(it),
+                [((1,), {}), ((2,), {})],
+            )
+            self.assertTrue(it.done)
+            self.assertEqual(it.result, 'done')
+
+    def test_raise_on_error_delivers_then_raises(self):
+        def func(callback=None):
+            callback(1, 'a', intermediate_total=1)
+            callback(2, 'b', intermediate_total=3)
+            raise ValueError('error in target')
+
+        with mi.callback_iter(
+            func, wait_seconds=0.01, raise_on_error=True
+        ) as it:
+            self.assertEqual(
+                next(it),
+                ((1, 'a'), {'intermediate_total': 1}),
+            )
+            self.assertEqual(
+                next(it),
+                ((2, 'b'), {'intermediate_total': 3}),
+            )
+
+            with self.assertRaises(ValueError):
+                next(it)
+
+            # The original attribute still reports the failure.
+            with self.assertRaises(ValueError):
+                it.result
+
+    def test_raise_on_error_success_is_silent(self):
+        def func(callback=None):
+            callback('a')
+            return 6
+
+        with mi.callback_iter(func, raise_on_error=True) as it:
+            self.assertEqual(list(it), [(('a',), {})])
+            self.assertEqual(it.result, 6)
+
+    def test_raise_on_error_is_opt_in(self):
+        def func(callback=None):
+            callback('a')
+            raise ValueError('error in target')
+
+        with mi.callback_iter(func) as it:
+            self.assertEqual(list(it), [(('a',), {})])
+
+    def test_raise_on_error_not_raised_after_early_exit(self):
+        def func(callback=None):
+            callback('a')
+            raise ValueError('error in target')
+
+        with mi.callback_iter(func, raise_on_error=True) as it:
+            self.assertEqual(next(it), (('a',), {}))
+
+    def test_raise_on_error_preserves_exception_object(self):
+        error = ValueError('error in target')
+
+        def func(callback=None):
+            callback('a')
+            raise error
+
+        with mi.callback_iter(func, raise_on_error=True) as it:
+            with self.assertRaises(ValueError) as ctx:
+                list(it)
+            self.assertIs(ctx.exception, error)
+
+    def test_raise_on_error_with_stop_iteration(self):
+        # A StopIteration cannot escape a generator (PEP 479), so it is
+        # surfaced as a RuntimeError instead of silently ending the stream.
+        def func(callback=None):
+            callback('a')
+            raise StopIteration('stopped early')
+
+        with mi.callback_iter(func, raise_on_error=True) as it:
+            with self.assertRaises(RuntimeError):
+                list(it)
+
+    def test_abort_rejects_late_callback(self):
+        # Once the consumer stops, the producer's next callback must be
+        # rejected explicitly instead of being buffered for nobody.
+        errors = []
+
+        def func(callback=None):
+            callback('a')
+            while True:
+                try:
+                    callback('late')
+                except mi.AbortThread as exc:
+                    errors.append(exc)
+                    return
+
+        with mi.callback_iter(func, wait_seconds=0.01, max_pending=2) as it:
+            self.assertEqual(next(it), (('a',), {}))
+
+        # close() waits for the producer, which is rejected on the callback
+        # it makes after the buffer fills up.
+        self.assertEqual(len(errors), 1)
+        self.assertIsInstance(errors[0], mi.AbortThread)
+
+    def test_abort_rejects_callback_without_consumer(self):
+        # max_pending=1 means the producer's second callback blocks. Closing
+        # must reject it and let close() return.
+        errors = []
+
+        def func(callback=None):
+            while True:
+                try:
+                    callback('x')
+                except mi.AbortThread as exc:
+                    errors.append(exc)
+                    return
+
+        it = mi.callback_iter(func, wait_seconds=0.01, max_pending=1)
+        self.assertEqual(next(it), (('x',), {}))
+
+        it.close()
+
+        self.assertEqual(len(errors), 1)
+        self.assertIsInstance(errors[0], mi.AbortThread)
+        self.assertEqual(list(it), [])
+
+    def test_close_releases_producer_blocked_on_max_pending(self):
+        # With max_pending=1 the third callback blocks: 'a' was consumed but
+        # 'b' remains buffered. Closing must release the blocked callback
+        # rather than deadlocking the producer thread.
+        blocked_soon = Event()
+        errors = []
+
+        def func(callback=None):
+            callback('a')
+            callback('b')
+            blocked_soon.set()
+            try:
+                callback('c')
+            except mi.AbortThread as exc:
+                errors.append(exc)
+
+        with mi.callback_iter(func, wait_seconds=0.01, max_pending=1) as it:
+            self.assertEqual(next(it), (('a',), {}))
+            self.assertTrue(blocked_soon.wait(5))
+
+        self.assertEqual(len(errors), 1)
+        self.assertIsInstance(errors[0], mi.AbortThread)
+
+    def test_max_pending_bounds_the_buffer(self):
+        # Only the consumer removes records, so the buffer length is stable
+        # between pops. It must never exceed max_pending, and every record
+        # that was accepted must still be delivered.
+        finished = Event()
+
+        def func(callback=None):
+            for value in 'abcdef':
+                callback(value)
+            finished.set()
+
+        with mi.callback_iter(func, wait_seconds=0.01, max_pending=2) as it:
+            self.assertEqual(next(it), (('a',), {}))
+
+            # With a bound of two, six callbacks cannot all be accepted while
+            # just one record has been consumed.
+            self.assertLessEqual(len(it._pending), 2)
+            self.assertFalse(finished.is_set())
+
+            self.assertEqual(
+                list(it),
+                [
+                    (('b',), {}),
+                    (('c',), {}),
+                    (('d',), {}),
+                    (('e',), {}),
+                    (('f',), {}),
+                ],
+            )
+            self.assertTrue(finished.wait(5))
+
+    def test_max_pending_validates(self):
+        for bad in (0, -1, 1.0, 'two'):
+            with self.assertRaises(ValueError):
+                mi.callback_iter(lambda callback=None: None, max_pending=bad)
+
+    def test_done_after_full_consumption(self):
+        def func(callback=None):
+            callback('a')
+            return 'done'
+
+        with mi.callback_iter(func, wait_seconds=0.01) as it:
+            self.assertEqual(list(it), [(('a',), {})])
+            self.assertTrue(it.done)
+            self.assertEqual(it.result, 'done')
+
+    def test_late_callback_after_producer_finished_is_rejected(self):
+        # A callback retained by the producer and invoked after it returned
+        # must be rejected instead of silently growing the buffer.
+        stored = []
+
+        def func(callback=None):
+            stored.append(callback)
+            callback('a')
+            return 'done'
+
+        with mi.callback_iter(func, wait_seconds=0.01) as it:
+            self.assertEqual(list(it), [(('a',), {})])
+            with it._condition:
+                self.assertTrue(
+                    it._condition.wait_for(lambda: it._finished, 5)
+                )
+
+            with self.assertRaises(mi.AbortThread):
+                stored[0]('late')
+
+            self.assertEqual(it._pending, deque())
+
+    def test_done_before_iteration(self):
+        it = mi.callback_iter(lambda callback=None: None)
+        self.assertFalse(it.done)
+        it.close()
+
+    def test_result_after_producer_finishes_but_before_drain(self):
+        # The producer has returned while one record is still buffered, so
+        # `done` and `result` must already be settled even though the
+        # consumer has not drained the buffer yet.
+        def func(callback=None):
+            callback('a')
+            callback('b')
+            return 'done'
+
+        with mi.callback_iter(func, wait_seconds=0.01) as it:
+            self.assertEqual(next(it), (('a',), {}))
+            with it._condition:
+                it._condition.wait_for(lambda: it._finished, 5)
+
+            self.assertTrue(it.done)
+            self.assertEqual(it.result, 'done')
+
+            # The tail is still delivered afterwards.
+            self.assertEqual(list(it), [(('b',), {})])
+
 
 class WindowedCompleteTests(TestCase):
     """Tests for ``windowed_complete()``"""

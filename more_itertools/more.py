@@ -1,4 +1,4 @@
-__lazy_modules__ = frozenset({'queue', 'threading'})
+__lazy_modules__ = frozenset({'threading'})
 
 import math
 import types
@@ -27,7 +27,6 @@ from itertools import (
 )
 from math import comb, e, exp, floor, fsum, log, log1p, perm, tau
 from math import ceil, prod
-from queue import Empty, Queue
 from random import random, randrange, shuffle, uniform
 from operator import (
     attrgetter,
@@ -41,7 +40,7 @@ from operator import (
 )
 from sys import maxsize
 from time import monotonic
-from threading import Lock
+from threading import Condition, Lock
 
 from .recipes import (
     _marker,
@@ -4136,6 +4135,49 @@ class callback_iter:
     >>> it.result
     4
 
+    Records delivered to the callback before the function returns are
+    buffered, so the last few are still delivered after it finishes:
+
+    >>> def last_batch(callback=None):
+    ...     callback('a')
+    ...     callback('b')
+    ...     callback('c')
+    >>> with callback_iter(last_batch) as it:
+    ...     next(it)
+    ...     list(it)
+    (('a',), {})
+    [(('b',), {}), (('c',), {})]
+
+    By default, an exception raised by *func* is only reported through the
+    ``result`` property. Pass ``raise_on_error=True`` to have the iterator
+    deliver every accepted record first, and then raise the producer's
+    exception:
+
+    >>> def broken(callback=None):
+    ...     callback('a')
+    ...     raise ValueError('failed to collect')
+    >>> it = callback_iter(broken, raise_on_error=True)
+    >>> next(it)
+    (('a',), {})
+    >>> next(it)
+    Traceback (most recent call last):
+      ...
+    ValueError: failed to collect
+    >>> it.close()
+
+    The ``result`` property is unchanged by *raise_on_error*: it still
+    returns the producer's value, or raises its exception.
+
+    >>> with callback_iter(broken) as it:
+    ...     list(it)
+    [(('a',), {})]
+    >>> with callback_iter(broken) as it:
+    ...     list(it)
+    ...     it.result
+    Traceback (most recent call last):
+      ...
+    ValueError: failed to collect
+
     Notes:
 
     * If the function uses some keyword argument besides ``callback``, supply
@@ -4149,15 +4191,41 @@ class callback_iter:
       ``more_itertools.AbortThread`` exception.
     * Provide *wait_seconds* to adjust how frequently the it is polled for
       output.
+    * If *max_pending* is given, at most that many accepted records are
+      buffered; a callback that finds the buffer full waits for the consumer
+      to drain it.
+    * Exiting the ``with`` block early (or calling ``close()``) stops the
+      producer: a callback that is waiting for buffer space, as well as any
+      callback invoked afterwards, raises ``AbortThread`` and its record is
+      rejected rather than buffered.
 
     """
 
-    def __init__(self, func, callback_kwd='callback', wait_seconds=0.1):
+    def __init__(
+        self,
+        func,
+        callback_kwd='callback',
+        wait_seconds=0.1,
+        max_pending=None,
+        raise_on_error=False,
+    ):
+        if max_pending is not None and (
+            not isinstance(max_pending, int) or max_pending < 1
+        ):
+            raise ValueError('max_pending must be a positive integer or None')
+
         self._func = func
         self._callback_kwd = callback_kwd
         self._aborted = False
+        self._finished = False
         self._future = None
         self._wait_seconds = wait_seconds
+        self._max_pending = max_pending
+        self._raise_on_error = raise_on_error
+
+        # Accepted-but-unconsumed records, guarded by _condition
+        self._pending = deque()
+        self._condition = Condition()
 
         # Lazily import concurrent.future
         self._module = __import__('concurrent.futures').futures
@@ -4168,7 +4236,16 @@ class callback_iter:
         return self
 
     def __exit__(self, exc_type, exc_value, traceback):
-        self._aborted = True
+        self.close()
+
+    def close(self):
+        """Stop the producer and reject any further callbacks."""
+        with self._condition:
+            self._aborted = True
+            # Nothing buffered will be handed out any more, so release it.
+            self._pending.clear()
+            self._condition.notify_all()
+
         self._executor.shutdown()
 
     def __iter__(self):
@@ -4181,11 +4258,17 @@ class callback_iter:
     def done(self):
         if self._future is None:
             return False
-        return self._future.done()
+        return self._finished or self._future.done()
 
     @property
     def result(self):
         if self._future:
+            if self._finished:
+                # The producer has completed execution, so this only waits
+                # for its future to be settled. Return the value, or raise
+                # the producer's exception.
+                return self._future.result()
+
             try:
                 return self._future.result(timeout=0)
             except self._module.TimeoutError:
@@ -4194,41 +4277,73 @@ class callback_iter:
         raise RuntimeError('Function has not yet completed')
 
     def _reader(self):
-        q = Queue()
-
         def callback(*args, **kwargs):
-            if self._aborted:
-                raise AbortThread('canceled by user')
+            """Accept a record, or block while the buffer is full."""
+            with self._condition:
+                while True:
+                    if self._aborted:
+                        raise AbortThread('canceled by user')
 
-            q.put((args, kwargs))
+                    if self._finished:
+                        raise AbortThread(
+                            'callback rejected: the producer has finished'
+                        )
 
-        self._future = self._executor.submit(
-            self._func, **{self._callback_kwd: callback}
-        )
+                    if (
+                        self._max_pending is None
+                        or len(self._pending) < self._max_pending
+                    ):
+                        self._pending.append((args, kwargs))
+                        self._condition.notify_all()
+                        return
+
+                    # The consumer has not caught up. Wait for it (or for
+                    # close()) instead of buffering without bound.
+                    self._condition.wait(self._wait_seconds)
+
+        def produce():
+            try:
+                return self._func(**{self._callback_kwd: callback})
+            finally:
+                # Every record has been accepted by now, so whatever remains
+                # buffered is the complete tail of the stream.
+                with self._condition:
+                    self._finished = True
+                    self._condition.notify_all()
+
+        self._future = self._executor.submit(produce)
 
         while True:
-            try:
-                item = q.get(timeout=self._wait_seconds)
-            except Empty:
-                pass
-            else:
-                q.task_done()
-                yield item
+            with self._condition:
+                while (
+                    not self._pending
+                    and not self._finished
+                    and not self._aborted
+                ):
+                    self._condition.wait(self._wait_seconds)
 
-            if self._future.done():
-                break
+                if self._aborted or not self._pending:
+                    break
 
-        remaining = []
-        while True:
+                item = self._pending.popleft()
+                self._condition.notify_all()
+
+            # The lock is released while yielding, so the producer may keep
+            # filling the buffer while the consumer processes an item.
+            yield item
+
+        if self._raise_on_error and not self._aborted:
+            # Every accepted record has been delivered, so it is now safe to
+            # report the failure. Going through the future preserves both the
+            # original exception object and its traceback.
             try:
-                item = q.get_nowait()
-            except Empty:
-                break
-            else:
-                q.task_done()
-                remaining.append(item)
-        q.join()
-        yield from remaining
+                self._future.result()
+            except StopIteration as exc:
+                # Raising StopIteration here would be turned into a
+                # RuntimeError by PEP 479 and silently end the iteration.
+                raise RuntimeError(
+                    'the producer raised StopIteration'
+                ) from exc
 
 
 def windowed_complete(iterable, n):
