@@ -12,6 +12,8 @@ import types
 import typing
 from typing import (
     Any,
+    AsyncIterable,
+    AsyncIterator,
     Callable,
     Dict,
     Iterable,
@@ -184,6 +186,59 @@ class ReaderWriterBase:
         self.close()
 
 
+def _decode_line(
+    line: Union[str, bytes],
+    lineno: int,
+    loads: LoadsCallable,
+    type: Optional[Type[Any]],
+    allow_none: bool,
+) -> Optional[JSONValue]:
+    """
+    Decode a single line, shared by :py:class:`Reader` and
+    :py:class:`AsyncReader` so that both behave exactly the same
+    (including line numbers) for the same input.
+
+    The `loads` callable is invoked directly (synchronously) in the
+    caller's thread; it is never off-loaded to a thread pool.
+    """
+    if isinstance(line, bytes):
+        try:
+            line = line.decode("utf-8")
+        except UnicodeDecodeError as orig_exc:
+            exc = InvalidLineError(
+                f"line is not valid utf-8: {orig_exc}", line, lineno
+            )
+            raise exc from orig_exc
+
+    if line.startswith(SKIPPABLE_SINGLE_INITIAL_CHARS):
+        line = line[1:]
+
+    try:
+        value: JSONValue = loads(line)
+    except ValueError as orig_exc:
+        exc = InvalidLineError(
+            f"line contains invalid json: {orig_exc}", line, lineno
+        )
+        raise exc from orig_exc
+
+    if value is None:
+        if allow_none:
+            return None
+        raise InvalidLineError("line contains null value", line, lineno)
+
+    if type is not None:
+        valid = isinstance(value, type)
+        if type is int and isinstance(value, bool):
+            # isinstance() is not sufficient, since bool is an int subclass
+            valid = False
+        if not valid:
+            raise InvalidLineError(
+                "line does not match requested type", line, lineno
+            )
+
+    return value
+
+
 @attr.s(auto_attribs=True, repr=False)
 class Reader(ReaderWriterBase):
     """
@@ -310,42 +365,7 @@ class Reader(ReaderWriterBase):
         except StopIteration:
             raise EOFError from None
 
-        if isinstance(line, bytes):
-            try:
-                line = line.decode("utf-8")
-            except UnicodeDecodeError as orig_exc:
-                exc = InvalidLineError(
-                    f"line is not valid utf-8: {orig_exc}", line, lineno
-                )
-                raise exc from orig_exc
-
-        if line.startswith(SKIPPABLE_SINGLE_INITIAL_CHARS):
-            line = line[1:]
-
-        try:
-            value: JSONValue = self._loads(line)
-        except ValueError as orig_exc:
-            exc = InvalidLineError(
-                f"line contains invalid json: {orig_exc}", line, lineno
-            )
-            raise exc from orig_exc
-
-        if value is None:
-            if allow_none:
-                return None
-            raise InvalidLineError("line contains null value", line, lineno)
-
-        if type is not None:
-            valid = isinstance(value, type)
-            if type is int and isinstance(value, bool):
-                # isinstance() is not sufficient, since bool is an int subclass
-                valid = False
-            if not valid:
-                raise InvalidLineError(
-                    "line does not match requested type", line, lineno
-                )
-
-        return value
+        return _decode_line(line, lineno, self._loads, type, allow_none)
 
     # No type specified, None not allowed
     @overload
@@ -451,6 +471,268 @@ class Reader(ReaderWriterBase):
             return repr_for_fp(self._fp)
         class_name = type(self._file_or_iterable).__name__
         return f"<{class_name} at 0x{id(self._file_or_iterable):x}>"
+
+
+@attr.s(auto_attribs=True, repr=False)
+class AsyncReader(ReaderWriterBase):
+    """
+    Async reader for the jsonlines format.
+
+    This is the asynchronous counterpart of :py:class:`Reader`. The
+    first argument must be an async iterable yielding JSON encoded
+    strings (or bytes), e.g. an async generator.
+
+    Lines are pulled from the wrapped source lazily: the next line is
+    only requested from the source when the caller asks for it, and at
+    most one line is consumed per :py:meth:`~AsyncReader.read()` call
+    (or per iteration step). No buffering or prefetching takes place.
+
+    The `loads` argument can be used to replace the standard json
+    decoder. If specified, it must be a *synchronous* callable that
+    accepts a (unicode) string and returns the decoded object. It is
+    invoked directly in the event loop's thread; it is never off-loaded
+    to a hidden thread pool, so a slow ``loads`` blocks the event loop
+    just like any other slow synchronous call would.
+
+    Cancellation semantics: the only suspension point in
+    :py:meth:`~AsyncReader.read()` is awaiting the next line from the
+    source. If that wait is cancelled, the ``CancelledError`` propagates
+    to the caller (it is never swallowed), and no successfully fetched
+    line is lost: a line is only considered consumed once its fetch
+    completed, and decoding afterwards is fully synchronous, so a
+    cancelled ``read()`` never drops an already fetched line.
+
+    Closing this reader (via :py:meth:`~ReaderWriterBase.close()` or a
+    context manager) only marks the reader itself as closed; the wrapped
+    source is *not* closed, since its life span is controlled by the
+    calling code. In particular, ``aclose()`` is never called on the
+    source, even if it is an async generator.
+
+    Instances are async iterable and can be used as an (async or plain)
+    context manager.
+
+    :param async_iterable: async iterable yielding lines as strings or bytes
+    :param loads: custom json decoder callable (synchronous)
+    """
+
+    _async_iterable: AsyncIterable[Union[str, bytes]]
+    _line_iter: AsyncIterator[Union[str, bytes]] = attr.ib(init=False)
+    _lineno: int = attr.ib(default=0, init=False)
+    _loads: LoadsCallable = attr.ib(default=default_loads, kw_only=True)
+
+    def __attrs_post_init__(self) -> None:
+        self._line_iter = self._async_iterable.__aiter__()
+
+    async def _next_line(self) -> Tuple[int, Union[str, bytes]]:
+        """
+        Fetch a single line from the source.
+
+        This is the only suspension point when reading. The line number
+        is only incremented after the fetch completed, so a cancelled
+        wait does not consume a line.
+        """
+        line = await self._line_iter.__anext__()
+        self._lineno += 1
+        return self._lineno, line
+
+    # No type specified, None not allowed
+    @overload
+    async def read(
+        self,
+        *,
+        type: Literal[None] = ...,
+        allow_none: Literal[False] = ...,
+        skip_empty: bool = ...,
+    ) -> JSONValue:
+        ...  # pragma: no cover
+
+    # No type specified, None allowed
+    @overload
+    async def read(
+        self,
+        *,
+        type: Literal[None] = ...,
+        allow_none: Literal[True],
+        skip_empty: bool = ...,
+    ) -> Optional[JSONValue]:
+        ...  # pragma: no cover
+
+    # Type specified, None not allowed
+    @overload
+    async def read(
+        self,
+        *,
+        type: Type[TJSONValue],
+        allow_none: Literal[False] = ...,
+        skip_empty: bool = ...,
+    ) -> TJSONValue:
+        ...  # pragma: no cover
+
+    # Type specified, None allowed
+    @overload
+    async def read(
+        self,
+        *,
+        type: Type[TJSONValue],
+        allow_none: Literal[True],
+        skip_empty: bool = ...,
+    ) -> Optional[TJSONValue]:
+        ...  # pragma: no cover
+
+    # Generic definition
+    @overload
+    async def read(
+        self,
+        *,
+        type: Optional[Type[Any]] = ...,
+        allow_none: bool = ...,
+        skip_empty: bool = ...,
+    ) -> Optional[JSONValue]:
+        ...  # pragma: no cover
+
+    async def read(
+        self,
+        *,
+        type: Optional[Type[Any]] = None,
+        allow_none: bool = False,
+        skip_empty: bool = False,
+    ) -> Optional[JSONValue]:
+        """
+        Read and decode a line.
+
+        This behaves exactly like :py:meth:`Reader.read()`, except that
+        fetching the next line from the source is awaited. See
+        :py:class:`AsyncReader` for the cancellation semantics.
+
+        See :py:meth:`Reader.read()` for a description of the arguments.
+        """
+        if self._closed:
+            raise RuntimeError("reader is closed")
+        if type is not None and type not in VALID_TYPES:
+            raise ValueError("invalid type specified")
+
+        try:
+            lineno, line = await self._next_line()
+            while skip_empty and not line.rstrip():
+                lineno, line = await self._next_line()
+        except StopAsyncIteration:
+            raise EOFError from None
+
+        return _decode_line(line, lineno, self._loads, type, allow_none)
+
+    # No type specified, None not allowed
+    @overload
+    def iter(
+        self,
+        *,
+        type: Literal[None] = ...,
+        allow_none: Literal[False] = ...,
+        skip_empty: bool = ...,
+        skip_invalid: bool = ...,
+    ) -> AsyncIterator[JSONValue]:
+        ...  # pragma: no cover
+
+    # No type specified, None allowed
+    @overload
+    def iter(
+        self,
+        *,
+        type: Literal[None] = ...,
+        allow_none: Literal[True],
+        skip_empty: bool = ...,
+        skip_invalid: bool = ...,
+    ) -> AsyncIterator[JSONValue]:
+        ...  # pragma: no cover
+
+    # Type specified, None not allowed
+    @overload
+    def iter(
+        self,
+        *,
+        type: Type[TJSONValue],
+        allow_none: Literal[False] = ...,
+        skip_empty: bool = ...,
+        skip_invalid: bool = ...,
+    ) -> AsyncIterator[TJSONValue]:
+        ...  # pragma: no cover
+
+    # Type specified, None allowed
+    @overload
+    def iter(
+        self,
+        *,
+        type: Type[TJSONValue],
+        allow_none: Literal[True],
+        skip_empty: bool = ...,
+        skip_invalid: bool = ...,
+    ) -> AsyncIterator[Optional[TJSONValue]]:
+        ...  # pragma: no cover
+
+    # Generic definition
+    @overload
+    def iter(
+        self,
+        *,
+        type: Optional[Type[TJSONValue]] = ...,
+        allow_none: bool = ...,
+        skip_empty: bool = ...,
+        skip_invalid: bool = ...,
+    ) -> AsyncIterator[Optional[TJSONValue]]:
+        ...  # pragma: no cover
+
+    async def iter(
+        self,
+        type: Optional[Type[Any]] = None,
+        allow_none: bool = False,
+        skip_empty: bool = False,
+        skip_invalid: bool = False,
+    ) -> AsyncIterator[Optional[JSONValue]]:
+        """
+        Iterate over all lines.
+
+        This is the async iterator equivalent to repeatedly calling
+        :py:meth:`~AsyncReader.read()`. If no arguments are specified,
+        this is the same as directly iterating over this
+        :py:class:`AsyncReader` instance.
+
+        When `skip_invalid` is set to ``True``, invalid lines will be
+        silently ignored.
+
+        See :py:meth:`Reader.read()` for a description of the other
+        arguments.
+        """
+        try:
+            while True:
+                try:
+                    yield await self.read(
+                        type=type, allow_none=allow_none, skip_empty=skip_empty
+                    )
+                except InvalidLineError:
+                    if not skip_invalid:
+                        raise
+        except EOFError:
+            pass
+
+    def __aiter__(self) -> AsyncIterator[Any]:
+        """
+        See :py:meth:`~AsyncReader.iter()`.
+        """
+        return self.iter()
+
+    async def __aenter__(self) -> "AsyncReader":
+        return self
+
+    async def __aexit__(
+        self,
+        exc_type: Optional[Type[BaseException]],
+        exc_val: Optional[BaseException],
+        exc_tb: Optional[types.TracebackType],
+    ) -> None:
+        self.close()
+
+    def _repr_for_wrapped(self) -> str:
+        class_name = type(self._async_iterable).__name__
+        return f"<{class_name} at 0x{id(self._async_iterable):x}>"
 
 
 @attr.s(auto_attribs=True, repr=False)

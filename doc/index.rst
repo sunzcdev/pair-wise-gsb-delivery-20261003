@@ -54,6 +54,14 @@ Features
   * allows complete control over decoding using a custom ``loads``
     callable
 
+* Flexible :py:class:`~jsonlines.AsyncReader`
+
+  * wraps any async iterable yielding lines
+  * async counterpart of :py:class:`~jsonlines.Reader` with the same
+    decoding, validation, and skipping behaviour
+  * pulls lines from the source lazily, one at a time
+  * never closes the caller-provided source
+
 * Flexible :py:class:`~jsonlines.Writer`
 
   * wraps a file-like object
@@ -123,6 +131,23 @@ calling :py:meth:`Reader.iter()` instead::
   for obj in reader.iter(type=dict, skip_invalid=True):
       ...
 
+For asynchronous code, an :py:class:`AsyncReader` can wrap any async
+iterable yielding lines, and behaves exactly like a regular
+:py:class:`Reader` otherwise::
+
+  async def lines():
+      yield '{"a": 1}'
+      yield '{"b": 2}'
+
+  async with jsonlines.AsyncReader(lines()) as reader:
+      async for obj in reader:
+          ...
+
+Lines are pulled from the source lazily: the next line is only
+requested when it is actually needed. Closing the reader does not
+close the wrapped source, since its life span is controlled by the
+calling code.
+
 A :py:class:`Writer` wraps a file-like object, and can write a single
 object, or multiple objects at once::
 
@@ -164,6 +189,10 @@ API
 .. autofunction:: jsonlines.open
 
 .. autoclass:: jsonlines.Reader
+   :members:
+   :inherited-members:
+
+.. autoclass:: jsonlines.AsyncReader
    :members:
    :inherited-members:
 

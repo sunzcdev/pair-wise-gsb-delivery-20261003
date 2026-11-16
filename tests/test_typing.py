@@ -7,7 +7,16 @@ import json
 import random
 
 import numbers
-from typing import TYPE_CHECKING, Any, Dict, Iterable, List, Optional
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    AsyncIterable,
+    AsyncIterator,
+    Dict,
+    Iterable,
+    List,
+    Optional,
+)
 
 
 if not TYPE_CHECKING:
@@ -54,6 +63,41 @@ def something_with_reader() -> None:
     iter_str: Iterable[str] = reader.iter(type=str)
     iter_dict: Iterable[Dict[str, Any]] = reader.iter(type=dict)
     iter_optional_str: Iterable[Optional[str]] = reader.iter(type=str, allow_none=True)
+
+    locals()  # Silence flake8 F841
+
+
+async def something_with_async_reader() -> None:
+    async def lines() -> AsyncIterator[str]:
+        yield '"text"'
+
+    source: AsyncIterable[str] = lines()
+    reader: jsonlines.AsyncReader
+    reader = jsonlines.AsyncReader(lines())
+    reader = jsonlines.AsyncReader(source)
+
+    r1 = await reader.read()
+    r2 = await reader.read(allow_none=True)
+    r3: numbers.Number = await reader.read(type=random.choice([int, float]))
+
+    # For debugging:
+    # reveal_type(r1)
+    # reveal_type(r2)
+    # reveal_type(r3)
+
+    some_int: int = await reader.read(type=int)
+    maybe_int: Optional[int] = await reader.read(type=int, allow_none=True)
+
+    some_dict: Dict[str, Any] = await reader.read(type=dict)
+    optional_dict: Optional[Dict[str, Any]] = await reader.read(
+        type=dict, allow_none=True
+    )
+
+    iter_int: AsyncIterable[int] = reader.iter(type=int)
+    iter_dict: AsyncIterable[Dict[str, Any]] = reader.iter(type=dict)
+    iter_optional_str: AsyncIterable[Optional[str]] = reader.iter(
+        type=str, allow_none=True
+    )
 
     locals()  # Silence flake8 F841
 
