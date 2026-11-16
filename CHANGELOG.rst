@@ -1,6 +1,22 @@
 Changelog
 =========
 
+4.5.0 (unreleased)
+------------------
+
+Features:
+
+- Detect overlapping load target paths (exact duplicates and
+  ancestor/descendant ``attribute`` paths such as ``"a"`` and ``"a.b"``)
+  at schema initialization. Ambiguous configurations are rejected with a
+  `ValueError` unless an explicit ``attribute_conflict_merger`` callable is
+  passed to the `Schema <marshmallow.Schema>` (or set on
+  `class Meta <marshmallow.Schema.Meta>`), which is then used to merge the
+  conflicting values at load time. If the merger fails, no partial result is
+  produced for the conflicting group and the error is reported against both
+  declaring fields. ``data_key`` only affects source naming, and dump-only
+  fields do not occupy load targets.
+
 4.4.0 (2026-11-03)
 ------------------
 

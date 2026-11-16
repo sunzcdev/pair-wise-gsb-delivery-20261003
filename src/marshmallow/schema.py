@@ -86,6 +86,41 @@ def _get_fields_by_mro(klass: SchemaMeta):
     )
 
 
+def _paths_overlap(path1: tuple[str, ...], path2: tuple[str, ...]) -> bool:
+    """Return `True` if two dot-delimited target paths overlap, i.e. one path
+    is equal to or a strict prefix (ancestor) of the other.
+    """
+    return path1[: len(path2)] == path2 or path2[: len(path1)] == path1
+
+
+def _find_conflicting_paths(
+    paths: list[tuple[str, tuple[str, ...]]],
+) -> list[list[tuple[str, tuple[str, ...]]]]:
+    """Group ``(field_name, path)`` pairs whose target paths overlap.
+
+    Returns a list of groups (each with at least two members) in which every
+    field's target path is equal to, an ancestor of, or a descendant of another
+    field's target path in the same group.
+    """
+    groups: list[list[tuple[str, tuple[str, ...]]]] = []
+    for item in paths:
+        matched = [
+            group
+            for group in groups
+            if any(_paths_overlap(item[1], existing[1]) for existing in group)
+        ]
+        if not matched:
+            groups.append([item])
+            continue
+        merged = []
+        for group in matched:
+            merged.extend(group)
+            groups.remove(group)
+        merged.append(item)
+        groups.append(merged)
+    return [group for group in groups if len(group) > 1]
+
+
 class SchemaMeta(ABCMeta):
     """Metaclass for the Schema class. Binds the declared fields to
     a ``_declared_fields`` attribute, which is a dictionary mapping attribute
@@ -220,6 +255,9 @@ class SchemaOpts:
         self.unknown = getattr(meta, "unknown", RAISE)
         self.register = getattr(meta, "register", True)
         self.many = getattr(meta, "many", False)
+        self.attribute_conflict_merger = getattr(
+            meta, "attribute_conflict_merger", None
+        )
 
 
 class Schema(metaclass=SchemaMeta):
@@ -268,6 +306,14 @@ class Schema(metaclass=SchemaMeta):
         will be ignored. Use dot delimiters to specify nested fields.
     :param unknown: Whether to exclude, include, or raise an error for unknown
         fields in the data. Use `EXCLUDE`, `INCLUDE` or `RAISE`.
+    :param attribute_conflict_merger: Optional callable used to merge the
+        deserialized values of load fields whose target paths (``attribute``
+        or field name) overlap, either exactly or as ancestor/descendant
+        paths (e.g. ``"a"`` and ``"a.b"``). It is called as
+        ``merger(existing, incoming)`` in field declaration order and the
+        result is written to the common root path. If `None` (the default),
+        overlapping load target paths raise a `ValueError` at schema
+        initialization.
 
     .. versionchanged:: 3.0.0
         Remove ``prefix`` parameter.
@@ -314,6 +360,11 @@ class Schema(metaclass=SchemaMeta):
     opts: typing.Any
     _declared_fields: dict[str, Field] = {}
     _hooks: dict[str, list[tuple[str, bool, dict]]] = {}
+
+    # These get set in _init_fields
+    _attribute_conflict_groups: list[list[tuple[str, str]]] = []
+    _attribute_conflict_roots: list[str] = []
+    _load_field_conflict_group: dict[str, int] = {}
 
     class Meta:
         """Options object for a Schema.
@@ -404,6 +455,14 @@ class Schema(metaclass=SchemaMeta):
         by class name in `Nested` fields. Only set this to `False` when memory
         usage is critical. Defaults to `True`.
         """
+        attribute_conflict_merger: typing.ClassVar[
+            typing.Callable[[typing.Any, typing.Any], typing.Any] | None
+        ]
+        """Optional callable used to merge the deserialized values of load fields
+        whose target paths (``attribute`` or field name) overlap. If `None` (the
+        default), overlapping load target paths raise a `ValueError` at schema
+        initialization.
+        """
 
     def __init__(
         self,
@@ -415,6 +474,9 @@ class Schema(metaclass=SchemaMeta):
         dump_only: types.StrSequenceOrSet = (),
         partial: bool | types.StrSequenceOrSet | None = None,
         unknown: types.UnknownOption | None = None,
+        attribute_conflict_merger: (
+            typing.Callable[[typing.Any, typing.Any], typing.Any] | None
+        ) = None,
     ):
         # Raise error if only or exclude is passed as string, not list of strings
         if only is not None and not is_collection(only):
@@ -433,6 +495,11 @@ class Schema(metaclass=SchemaMeta):
         self.partial = partial
         self.unknown: types.UnknownOption = (
             self.opts.unknown if unknown is None else unknown
+        )
+        self.attribute_conflict_merger = (
+            self.opts.attribute_conflict_merger
+            if attribute_conflict_merger is None
+            else attribute_conflict_merger
         )
         self._normalize_nested_options()
         #: Dictionary mapping field_names -> :class:`Field` objects
@@ -644,6 +711,9 @@ class Schema(metaclass=SchemaMeta):
             error_store.store_error([self.error_messages["type"]], index=index)
         else:
             partial_is_collection = is_collection(partial)
+            # Values of fields with overlapping load target paths, keyed by
+            # conflict group index. Merged after all fields are deserialized.
+            conflict_pending: dict[int, list[tuple[str, str, typing.Any]]] = {}
             for attr_name, field_obj in self.load_fields.items():
                 field_name = (
                     field_obj.data_key if field_obj.data_key is not None else attr_name
@@ -686,7 +756,19 @@ class Schema(metaclass=SchemaMeta):
                 )
                 if value is not missing:
                     key = field_obj.attribute or attr_name
-                    set_value(ret_d, key, value)
+                    group_index = self._load_field_conflict_group.get(attr_name)
+                    if group_index is None:
+                        set_value(ret_d, key, value)
+                    else:
+                        conflict_pending.setdefault(group_index, []).append(
+                            (attr_name, key, value)
+                        )
+            self._merge_attribute_conflicts(
+                ret_d,
+                conflict_pending,
+                error_store=error_store,
+                index=index,
+            )
             if unknown != EXCLUDE:
                 fields = {
                     field_obj.data_key if field_obj.data_key is not None else field_name
@@ -703,6 +785,54 @@ class Schema(metaclass=SchemaMeta):
                             index,
                         )
         return ret_d
+
+    def _merge_attribute_conflicts(
+        self,
+        ret_d: dict,
+        conflict_pending: dict[int, list[tuple[str, str, typing.Any]]],
+        *,
+        error_store: ErrorStore,
+        index: int | None,
+    ) -> None:
+        """Merge the deserialized values of fields with overlapping load target
+        paths using ``attribute_conflict_merger`` and write the results.
+
+        If the merger fails, no partial result is written for the conflicting
+        group and the error is stored against each declaring field.
+        This method is private API.
+        """
+        for group_index, items in conflict_pending.items():
+            if len(items) == 1:
+                # Only one field of the group produced a value, so there is
+                # no conflict to resolve. Write to the field's own path.
+                _, key, value = items[0]
+                set_value(ret_d, key, value)
+                continue
+            field_names = [name for name, _, _ in items]
+            try:
+                merged = items[0][2]
+                for _, _, value in items[1:]:
+                    merged = self.attribute_conflict_merger(merged, value)
+            except ValidationError as err:
+                messages = (
+                    err.messages if isinstance(err.messages, list) else [err.messages]
+                )
+            except Exception as err:  # noqa: BLE001
+                messages = [
+                    "Failed to merge conflicting load values for fields "
+                    f"{field_names}: {err}"
+                ]
+            else:
+                set_value(ret_d, self._attribute_conflict_roots[group_index], merged)
+                continue
+            # The merger failed: this group contributes no partial result.
+            # Report the error against both declaring fields.
+            for name in field_names:
+                field_obj = self.load_fields[name]
+                error_key = (
+                    field_obj.data_key if field_obj.data_key is not None else name
+                )
+                error_store.store_error(messages, error_key, index=index)
 
     def load(
         self,
@@ -1036,17 +1166,47 @@ class Schema(metaclass=SchemaMeta):
                 "Check the following field names and "
                 f"data_key arguments: {list(data_keys_duplicates)}"
             )
-        load_attributes = [obj.attribute or name for name, obj in load_fields.items()]
-        if len(load_attributes) != len(set(load_attributes)):
-            attributes_duplicates = {
-                x for x in load_attributes if load_attributes.count(x) > 1
-            }
-            raise ValueError(
-                "The attribute argument for one or more fields collides "
-                "with another field's name or attribute argument. "
-                "Check the following field names and "
-                f"attribute arguments: {list(attributes_duplicates)}"
-            )
+        # Detect overlapping load target paths: exact duplicates as well as
+        # ancestor/descendant paths (e.g. "a" and "a.b"), where the later
+        # field could overwrite the structure created by the earlier one.
+        # data_key only affects the source name, not the target path, and
+        # dump_only fields never write to load targets, so only load fields
+        # are considered here.
+        load_paths = [
+            (name, tuple((obj.attribute or name).split(".")))
+            for name, obj in load_fields.items()
+        ]
+        conflict_groups = _find_conflicting_paths(load_paths)
+        #: Groups of (field_name, target_path) pairs with overlapping load
+        #: target paths, resolved at load time with attribute_conflict_merger.
+        self._attribute_conflict_groups: list[list[tuple[str, str]]] = []
+        #: Common root path for each group in _attribute_conflict_groups.
+        self._attribute_conflict_roots: list[str] = []
+        #: Mapping of field name -> index into _attribute_conflict_groups.
+        self._load_field_conflict_group: dict[str, int] = {}
+        if conflict_groups:
+            if self.attribute_conflict_merger is None:
+                conflicts = [
+                    f"{name} -> {'.'.join(path)}"
+                    for group in conflict_groups
+                    for name, path in group
+                ]
+                raise ValueError(
+                    "The attribute argument for one or more fields collides "
+                    "with another field's name or attribute argument, "
+                    "producing overlapping load target paths. "
+                    "Check the following field names and "
+                    f"load target paths: {conflicts}. "
+                    "Pass attribute_conflict_merger to the Schema "
+                    "to resolve the conflicts explicitly."
+                )
+            for group_index, group in enumerate(conflict_groups):
+                named_group = [(name, ".".join(path)) for name, path in group]
+                self._attribute_conflict_groups.append(named_group)
+                root_path = min((path for _, path in group), key=len)
+                self._attribute_conflict_roots.append(".".join(root_path))
+                for name, _ in group:
+                    self._load_field_conflict_group[name] = group_index
 
         self.fields = fields_dict
         self.dump_fields = dump_fields

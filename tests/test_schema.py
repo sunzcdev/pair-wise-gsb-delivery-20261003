@@ -1297,6 +1297,118 @@ def test_attribute_collision(attribute):
             MySchema()
 
 
+class TestAttributePathConflicts:
+    def test_parent_child_path_conflict_rejected_by_default(self):
+        class MySchema(Schema):
+            f1 = fields.Raw(attribute="a")
+            f2 = fields.Raw(attribute="a.b")
+
+        with pytest.raises(ValueError, match="overlapping load target paths"):
+            MySchema()
+
+    def test_child_parent_path_conflict_rejected_by_default(self):
+        class MySchema(Schema):
+            f1 = fields.Raw(attribute="a.b")
+            f2 = fields.Raw(attribute="a")
+
+        with pytest.raises(ValueError, match="overlapping load target paths"):
+            MySchema()
+
+    def test_data_key_does_not_affect_target_path_identity(self):
+        class MySchema(Schema):
+            f1 = fields.Raw(data_key="F1")
+            f2 = fields.Raw(attribute="f1", data_key="F2")
+
+        with pytest.raises(ValueError, match="overlapping load target paths"):
+            MySchema()
+
+    def test_dump_only_field_does_not_occupy_load_target(self):
+        class MySchema(Schema):
+            f1 = fields.Raw()
+            f2 = fields.Raw(attribute="f1", dump_only=True)
+            f3 = fields.Raw(attribute="f1.sub", dump_only=True)
+
+        schema = MySchema()
+        assert schema.load({"f1": 1}) == {"f1": 1}
+
+    def test_non_overlapping_nested_attributes_are_allowed(self):
+        class MySchema(Schema):
+            f1 = fields.Raw(attribute="a.b")
+            f2 = fields.Raw(attribute="a.c")
+
+        schema = MySchema()
+        assert schema.load({"f1": 1, "f2": 2}) == {"a": {"b": 1, "c": 2}}
+
+    def test_merger_resolves_exact_duplicate_paths(self):
+        class MySchema(Schema):
+            f1 = fields.Int(attribute="a")
+            f2 = fields.Int(attribute="a")
+
+        schema = MySchema(attribute_conflict_merger=lambda v1, v2: v1 + v2)
+        assert schema.load({"f1": 1, "f2": 2}) == {"a": 3}
+
+    def test_merger_resolves_parent_child_paths(self):
+        class MySchema(Schema):
+            f1 = fields.Dict(attribute="a")
+            f2 = fields.Raw(attribute="a.b")
+
+            class Meta:
+                attribute_conflict_merger = staticmethod(
+                    lambda existing, incoming: {**existing, "b": incoming}
+                )
+
+        schema = MySchema()
+        assert schema.load({"f1": {"c": 1}, "f2": 2}) == {"a": {"c": 1, "b": 2}}
+
+    def test_merger_not_called_when_only_one_field_has_value(self):
+        calls = []
+
+        def merger(v1, v2):
+            calls.append((v1, v2))
+            return v1
+
+        class MySchema(Schema):
+            f1 = fields.Dict(attribute="a")
+            f2 = fields.Raw(attribute="a.b")
+
+        schema = MySchema(attribute_conflict_merger=merger)
+        assert schema.load({"f2": 5}) == {"a": {"b": 5}}
+        assert calls == []
+
+    def test_merger_failure_reports_error_on_both_fields(self):
+        def bad_merger(v1, v2):
+            raise RuntimeError("cannot combine")
+
+        class MySchema(Schema):
+            f1 = fields.Raw(attribute="a")
+            f2 = fields.Raw(attribute="a", data_key="F2")
+
+        schema = MySchema(attribute_conflict_merger=bad_merger)
+        with pytest.raises(ValidationError) as excinfo:
+            schema.load({"f1": 1, "F2": 2})
+        errors = excinfo.value.messages
+        assert set(errors) == {"f1", "F2"}
+        assert "cannot combine" in errors["f1"][0]
+        # No partial result is produced for the conflicting group
+        assert "a" not in excinfo.value.valid_data
+
+    def test_merger_raising_validation_error_uses_its_messages(self):
+        def bad_merger(v1, v2):
+            raise ValidationError("custom merge error")
+
+        class MySchema(Schema):
+            f1 = fields.Raw(attribute="a")
+            f2 = fields.Raw(attribute="a")
+
+        schema = MySchema(attribute_conflict_merger=bad_merger)
+        with pytest.raises(ValidationError) as excinfo:
+            schema.load({"f1": 1, "f2": 2})
+        assert excinfo.value.messages == {
+            "f1": ["custom merge error"],
+            "f2": ["custom merge error"],
+        }
+
+
 class TestDeeplyNestedLoadOnly:
     @pytest.fixture
     def schema(self):
