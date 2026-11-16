@@ -556,16 +556,45 @@ Encoders and decoders
       :func:`loads` for details. It is preferable to use that rather
       than this class.
 
-   .. method:: raw_decode(s[, idx=0])
+   .. method:: raw_decode(s[, idx=0[, strict_idx=False]])
 
       Decode a JSON document from *s* (a :class:`str` or :class:`unicode`
       beginning with a JSON document) starting from the index *idx* and return
       a 2-tuple of the Python representation and the index in *s* where the
-      document ended.
+      document ended. The returned end index is always an offset into the
+      original *s*, so it can be passed back as the next *idx* when several
+      documents share one buffer.
 
       This can be used to decode a JSON document from a string that may have
       extraneous data at the end, or to decode a string that has a series of
       JSON objects.
+
+      The starting point follows these rules:
+
+      * A negative *idx* raises :exc:`JSONDecodeError` and is never resolved
+        through Python's negative indexing.
+      * An *idx* greater than ``len(s)`` raises :exc:`JSONDecodeError` with
+        the message ``"idx out of range"``; it is never clamped to the end of
+        the buffer. ``idx == len(s)`` is in range and fails with
+        ``"Expecting value"``.
+      * A leading byte order mark is consumed only when *idx* is ``0``, that
+        is at the very start of the buffer. A BOM at any other offset is
+        ordinary invalid JSON content, not a document separator.
+      * Leading JSON whitespace at *idx* is skipped unless *strict_idx* is
+        true.
+      * The decoder never scans forward past damaged or unrelated characters
+        looking for a legal value. The first character examined is ``s[idx]``
+        in strict mode, or the first non-BOM, non-whitespace character at or
+        after *idx* otherwise, so an offset inside a token (for example on
+        the backslash or the ``u`` of a ``\\uXXXX`` escape, or between the
+        quotes of a string) fails at that offset.
+
+      When *strict_idx* is true the offset is treated as exact: neither a BOM
+      nor leading whitespace is consumed, so decoding starts at *idx* itself
+      and any non-value character there raises :exc:`JSONDecodeError` at that
+      position. When only whitespace remains, strict mode fails at *idx*
+      whereas the default mode first advances past the whitespace and fails
+      at ``len(s)``.
 
       :exc:`JSONDecodeError` will be raised if the given JSON
       document is not valid.
