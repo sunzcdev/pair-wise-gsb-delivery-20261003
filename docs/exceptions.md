@@ -32,6 +32,7 @@ For an overview of how to work with HTTPX exceptions, see [Exceptions (Quickstar
 * StreamError
     * StreamConsumed
     * ResponseNotRead
+    * ResponseContentTruncated
     * RequestNotRead
     * StreamClosed
 
@@ -118,6 +119,9 @@ For an overview of how to work with HTTPX exceptions, see [Exceptions (Quickstar
     :docstring:
 
 ::: httpx.ResponseNotRead
+    :docstring:
+
+::: httpx.ResponseContentTruncated
     :docstring:
 
 ::: httpx.RequestNotRead

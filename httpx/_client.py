@@ -196,6 +196,7 @@ class BaseClient:
         timeout: TimeoutTypes = DEFAULT_TIMEOUT_CONFIG,
         follow_redirects: bool = False,
         max_redirects: int = DEFAULT_MAX_REDIRECTS,
+        max_history_body_bytes: int | None = None,
         event_hooks: None | (typing.Mapping[str, list[EventHook]]) = None,
         base_url: URL | str = "",
         trust_env: bool = True,
@@ -212,6 +213,9 @@ class BaseClient:
         self._timeout = Timeout(timeout)
         self.follow_redirects = follow_redirects
         self.max_redirects = max_redirects
+        if max_history_body_bytes is not None and max_history_body_bytes < 0:
+            raise ValueError("max_history_body_bytes must be a non-negative integer.")
+        self.max_history_body_bytes = max_history_body_bytes
         self._event_hooks = {
             "request": list(event_hooks.get("request", [])),
             "response": list(event_hooks.get("response", [])),
@@ -590,6 +594,30 @@ class BaseClient:
             )
             request.extensions = dict(**request.extensions, timeout=timeout.as_dict())
 
+    def _read_history_response(self, response: Response) -> None:
+        """
+        Read a response that is about to be retained in `response.history`,
+        applying the `max_history_body_bytes` limit if one is configured.
+
+        The response is always read to completion (or closed) so that the
+        connection is released, but if a limit is configured then only a
+        prefix of the body is retained, and the response is marked with
+        `is_content_truncated`.
+        """
+        if self.max_history_body_bytes is None:
+            response.read()
+        else:
+            response._read_truncated(self.max_history_body_bytes)
+
+    async def _aread_history_response(self, response: Response) -> None:
+        """
+        The async equivalent of `_read_history_response()`.
+        """
+        if self.max_history_body_bytes is None:
+            await response.aread()
+        else:
+            await response._aread_truncated(self.max_history_body_bytes)
+
 
 class Client(BaseClient):
     """
@@ -625,6 +653,13 @@ class Client(BaseClient):
     * **limits** - *(optional)* The limits configuration to use.
     * **max_redirects** - *(optional)* The maximum number of redirect responses
     that should be followed.
+    * **max_history_body_bytes** - *(optional)* The maximum number of response
+    body bytes retained for each response in `response.history` when following
+    redirects or authentication challenges. Intermediate responses are still
+    read to completion so that connections are released, but only a prefix of
+    the body is kept. The limit applies to the decoded body, i.e. the bytes
+    that `response.content` would have returned. `None` (the default) retains
+    the full bodies.
     * **base_url** - *(optional)* A URL to use as the base when building
     request URLs.
     * **transport** - *(optional)* A transport class to use for sending requests
@@ -654,6 +689,7 @@ class Client(BaseClient):
         follow_redirects: bool = False,
         limits: Limits = DEFAULT_LIMITS,
         max_redirects: int = DEFAULT_MAX_REDIRECTS,
+        max_history_body_bytes: int | None = None,
         event_hooks: None | (typing.Mapping[str, list[EventHook]]) = None,
         base_url: URL | str = "",
         transport: BaseTransport | None = None,
@@ -667,6 +703,7 @@ class Client(BaseClient):
             timeout=timeout,
             follow_redirects=follow_redirects,
             max_redirects=max_redirects,
+            max_history_body_bytes=max_history_body_bytes,
             event_hooks=event_hooks,
             base_url=base_url,
             trust_env=trust_env,
@@ -951,7 +988,7 @@ class Client(BaseClient):
                         return response
 
                     response.history = list(history)
-                    response.read()
+                    self._read_history_response(response)
                     request = next_request
                     history.append(response)
 
@@ -989,7 +1026,7 @@ class Client(BaseClient):
                 history = history + [response]
 
                 if follow_redirects:
-                    response.read()
+                    self._read_history_response(response)
                 else:
                     response.next_request = request
                     return response
@@ -1339,6 +1376,13 @@ class AsyncClient(BaseClient):
     * **limits** - *(optional)* The limits configuration to use.
     * **max_redirects** - *(optional)* The maximum number of redirect responses
     that should be followed.
+    * **max_history_body_bytes** - *(optional)* The maximum number of response
+    body bytes retained for each response in `response.history` when following
+    redirects or authentication challenges. Intermediate responses are still
+    read to completion so that connections are released, but only a prefix of
+    the body is kept. The limit applies to the decoded body, i.e. the bytes
+    that `response.content` would have returned. `None` (the default) retains
+    the full bodies.
     * **base_url** - *(optional)* A URL to use as the base when building
     request URLs.
     * **transport** - *(optional)* A transport class to use for sending requests
@@ -1367,6 +1411,7 @@ class AsyncClient(BaseClient):
         follow_redirects: bool = False,
         limits: Limits = DEFAULT_LIMITS,
         max_redirects: int = DEFAULT_MAX_REDIRECTS,
+        max_history_body_bytes: int | None = None,
         event_hooks: None | (typing.Mapping[str, list[EventHook]]) = None,
         base_url: URL | str = "",
         transport: AsyncBaseTransport | None = None,
@@ -1381,6 +1426,7 @@ class AsyncClient(BaseClient):
             timeout=timeout,
             follow_redirects=follow_redirects,
             max_redirects=max_redirects,
+            max_history_body_bytes=max_history_body_bytes,
             event_hooks=event_hooks,
             base_url=base_url,
             trust_env=trust_env,
@@ -1666,7 +1712,7 @@ class AsyncClient(BaseClient):
                         return response
 
                     response.history = list(history)
-                    await response.aread()
+                    await self._aread_history_response(response)
                     request = next_request
                     history.append(response)
 
@@ -1705,7 +1751,7 @@ class AsyncClient(BaseClient):
                 history = history + [response]
 
                 if follow_redirects:
-                    await response.aread()
+                    await self._aread_history_response(response)
                 else:
                     response.next_request = request
                     return response

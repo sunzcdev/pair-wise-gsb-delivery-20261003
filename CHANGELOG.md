@@ -13,6 +13,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 ### Added
 
 * Expose `FunctionAuth` from the public API. (#3699)
+* Add `max_history_body_bytes` client option, capping how much of each redirect or authentication challenge response body is retained in `response.history`. Truncated history responses expose `response.is_content_truncated` and `response.content_prefix`, and accessing their `.content` raises `httpx.ResponseContentTruncated`. The default of `None` retains the existing behaviour.
 
 ## 0.28.1 (6th December, 2024)
 

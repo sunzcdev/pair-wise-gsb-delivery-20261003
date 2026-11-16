@@ -28,6 +28,7 @@ Our exception hierarchy:
   x StreamConsumed
   x StreamClosed
   x ResponseNotRead
+  x ResponseContentTruncated
   x RequestNotRead
 """
 
@@ -58,6 +59,7 @@ __all__ = [
     "RemoteProtocolError",
     "RequestError",
     "RequestNotRead",
+    "ResponseContentTruncated",
     "ResponseNotRead",
     "StreamClosed",
     "StreamConsumed",
@@ -344,6 +346,21 @@ class ResponseNotRead(StreamError):
         message = (
             "Attempted to access streaming response content,"
             " without having called `read()`."
+        )
+        super().__init__(message)
+
+
+class ResponseContentTruncated(StreamError):
+    """
+    Attempted to access the full content of a response, but the response
+    body was truncated by the client's `max_history_body_bytes` limit.
+    """
+
+    def __init__(self) -> None:
+        message = (
+            "Attempted to access the full response content, but the response "
+            "body was truncated by the `max_history_body_bytes` limit. "
+            "Use `response.content_prefix` to access the retained prefix."
         )
         super().__init__(message)
 

@@ -4,6 +4,8 @@ import pytest
 
 import httpx
 
+LARGE_BODY = b"x" * 10_000
+
 
 def redirects(request: httpx.Request) -> httpx.Response:
     if request.url.scheme not in ("http", "https"):
@@ -106,6 +108,11 @@ def redirects(request: httpx.Request) -> httpx.Response:
         status_code = httpx.codes.MOVED_PERMANENTLY
         headers = {"location": "market://details?id=42"}
         return httpx.Response(status_code, headers=headers)
+
+    elif request.url.path == "/redirect_large_body":
+        status_code = httpx.codes.SEE_OTHER
+        headers = {"location": "/"}
+        return httpx.Response(status_code, headers=headers, content=LARGE_BODY)
 
     if request.method == "HEAD":
         return httpx.Response(200)
@@ -445,3 +452,119 @@ async def test_async_invalid_redirect():
             await client.get(
                 "http://example.org/invalid_redirect", follow_redirects=True
             )
+
+def test_redirect_history_body_retained_by_default():
+    """
+    By default, redirect responses retained in `response.history`
+    include their full response bodies.
+    """
+    client = httpx.Client(transport=httpx.MockTransport(redirects))
+    response = client.get(
+        "https://example.org/redirect_large_body", follow_redirects=True
+    )
+    assert response.status_code == httpx.codes.OK
+    assert len(response.history) == 1
+
+    redirect_response = response.history[0]
+    assert redirect_response.is_content_truncated is False
+    assert redirect_response.content_prefix is None
+    assert redirect_response.content == LARGE_BODY
+
+
+def test_redirect_history_body_truncated():
+    """
+    With `max_history_body_bytes` set, redirect responses retained in
+    `response.history` only keep a prefix of the response body.
+    """
+    client = httpx.Client(
+        transport=httpx.MockTransport(redirects),
+        max_history_body_bytes=100,
+    )
+    response = client.get(
+        "https://example.org/redirect_large_body", follow_redirects=True
+    )
+    assert response.status_code == httpx.codes.OK
+    assert len(response.history) == 1
+
+    redirect_response = response.history[0]
+    assert redirect_response.is_content_truncated is True
+    assert redirect_response.content_prefix == LARGE_BODY[:100]
+    # The response was still read to completion, releasing the connection.
+    assert redirect_response.is_closed
+    assert redirect_response.is_stream_consumed
+    # The truncated response must not appear to hold complete content.
+    with pytest.raises(httpx.ResponseContentTruncated):
+        redirect_response.content
+    with pytest.raises(httpx.ResponseContentTruncated):
+        redirect_response.text
+
+    # The final response is unaffected by the limit.
+    assert response.is_content_truncated is False
+    assert response.content_prefix is None
+    assert response.text == "<html><body>Hello, world!</body></html>"
+
+
+def test_redirect_history_body_within_limit():
+    """
+    Redirect response bodies that fit within `max_history_body_bytes`
+    are retained in full, and are not marked as truncated.
+    """
+    client = httpx.Client(
+        transport=httpx.MockTransport(redirects),
+        max_history_body_bytes=len(LARGE_BODY),
+    )
+    response = client.get(
+        "https://example.org/redirect_large_body", follow_redirects=True
+    )
+    assert len(response.history) == 1
+
+    redirect_response = response.history[0]
+    assert redirect_response.is_content_truncated is False
+    assert redirect_response.content_prefix is None
+    assert redirect_response.content == LARGE_BODY
+
+
+def test_redirect_history_body_truncated_to_zero():
+    client = httpx.Client(
+        transport=httpx.MockTransport(redirects),
+        max_history_body_bytes=0,
+    )
+    response = client.get(
+        "https://example.org/redirect_large_body", follow_redirects=True
+    )
+    assert len(response.history) == 1
+
+    redirect_response = response.history[0]
+    assert redirect_response.is_content_truncated is True
+    assert redirect_response.content_prefix == b""
+    with pytest.raises(httpx.ResponseContentTruncated):
+        redirect_response.content
+
+
+def test_invalid_max_history_body_bytes():
+    with pytest.raises(ValueError):
+        httpx.Client(max_history_body_bytes=-1)
+
+
+@pytest.mark.anyio
+async def test_async_redirect_history_body_truncated():
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(redirects),
+        max_history_body_bytes=100,
+    ) as client:
+        response = await client.get(
+            "https://example.org/redirect_large_body", follow_redirects=True
+        )
+    assert response.status_code == httpx.codes.OK
+    assert len(response.history) == 1
+
+    redirect_response = response.history[0]
+    assert redirect_response.is_content_truncated is True
+    assert redirect_response.content_prefix == LARGE_BODY[:100]
+    assert redirect_response.is_closed
+    with pytest.raises(httpx.ResponseContentTruncated):
+        redirect_response.content
+
+    # The final response is unaffected by the limit.
+    assert response.is_content_truncated is False
+    assert response.text == "<html><body>Hello, world!</body></html>"

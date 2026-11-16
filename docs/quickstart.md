@@ -448,6 +448,49 @@ The `history` property of the response can be used to inspect any followed redir
 It contains a list of any redirect responses that were followed, in the order
 in which they were made.
 
+### Limiting the size of redirect history bodies
+
+When redirects are followed, the intermediate responses are read in full so
+that their connections can be released, and they are retained in
+`response.history`. If redirect responses may include large bodies, this can
+use an excessive amount of memory. The `max_history_body_bytes` client option
+caps how much of each history response body is retained:
+
+```python
+client = httpx.Client(max_history_body_bytes=1024)
+```
+
+The limit applies to each response retained in `response.history`, including
+intermediate responses from authentication challenges. The final response is
+never truncated. Intermediate responses are still read to completion, so
+connections are always released properly, but only a prefix of the body is
+kept. The limit is counted in **decoded** bytes, i.e. the same bytes that
+`response.content` would have returned, after any `Content-Encoding` such as
+gzip has been decoded.
+
+Truncated history responses are marked with `response.is_content_truncated`,
+and the retained prefix is available as `response.content_prefix`. Accessing
+`.content` (or `.text`, `.json()`, etc.) on a truncated response raises
+`httpx.ResponseContentTruncated`, rather than returning an incomplete body
+that could be mistaken for the complete content:
+
+```pycon
+>>> client = httpx.Client(max_history_body_bytes=16, follow_redirects=True)
+>>> response = client.get('https://example.org/redirect-with-large-body')
+>>> redirect_response = response.history[0]
+>>> redirect_response.is_content_truncated
+True
+>>> redirect_response.content_prefix
+b'<html><body><a h'
+>>> redirect_response.content
+Traceback (most recent call last):
+...
+httpx.ResponseContentTruncated: Attempted to access the full response content, but the response body was truncated by the `max_history_body_bytes` limit. Use `response.content_prefix` to access the retained prefix.
+```
+
+The default of `max_history_body_bytes=None` retains the full bodies of any
+history responses, matching the behaviour of earlier versions.
+
 ## Timeouts
 
 HTTPX defaults to including reasonable timeouts for all network operations,

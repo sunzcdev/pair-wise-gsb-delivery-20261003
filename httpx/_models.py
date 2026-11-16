@@ -25,6 +25,7 @@ from ._exceptions import (
     CookieConflict,
     HTTPStatusError,
     RequestNotRead,
+    ResponseContentTruncated,
     ResponseNotRead,
     StreamClosed,
     StreamConsumed,
@@ -543,6 +544,13 @@ class Response:
         self.is_closed = False
         self.is_stream_consumed = False
 
+        # Set when the response body has been read with a retention limit,
+        # such as the client-level `max_history_body_bytes` option.
+        # In that case only a prefix of the body is retained, and accessing
+        # `.content` raises `ResponseContentTruncated`.
+        self.is_content_truncated = False
+        self._content_prefix: bytes | None = None
+
         self.default_encoding = default_encoding
 
         if stream is None:
@@ -635,8 +643,24 @@ class Response:
     @property
     def content(self) -> bytes:
         if not hasattr(self, "_content"):
+            if self.is_content_truncated:
+                raise ResponseContentTruncated()
             raise ResponseNotRead()
         return self._content
+
+    @property
+    def content_prefix(self) -> bytes | None:
+        """
+        The retained prefix of the response body, when the body has been
+        truncated by a retention limit such as the client-level
+        `max_history_body_bytes` option. Returns `None` if the response
+        body was not truncated.
+
+        The prefix is counted in decoded bytes, i.e. the same bytes that
+        `.content` would have returned, after any `Content-Encoding`
+        such as gzip has been decoded.
+        """
+        return self._content_prefix
 
     @property
     def text(self) -> str:
@@ -881,6 +905,49 @@ class Response:
             self._content = b"".join(self.iter_bytes())
         return self._content
 
+    def _read_truncated(self, max_bytes: int) -> None:
+        """
+        Read the response to completion, so that the connection is released,
+        but retain only up to `max_bytes` of the decoded content.
+
+        Used for responses that are retained in `response.history`, where
+        keeping the entire body could use an excessive amount of memory.
+
+        The limit is counted in decoded bytes, i.e. the same bytes that
+        `.content` would have returned. If the body exceeds the limit then
+        `is_content_truncated` is set, only the retained prefix is kept in
+        `content_prefix`, and accessing `.content` raises
+        `ResponseContentTruncated`.
+        """
+        if self.is_content_truncated:
+            return
+
+        if hasattr(self, "_content"):
+            # The content has already been loaded, for example by a
+            # transport that returns pre-read responses, or by an
+            # event hook that accessed the response content.
+            if len(self._content) > max_bytes:
+                self._content_prefix = self._content[:max_bytes]
+                del self._content
+                self.is_content_truncated = True
+            return
+
+        prefix = bytearray()
+        truncated = False
+        for chunk in self.iter_bytes():
+            remaining = max_bytes - len(prefix)
+            if remaining > 0:
+                prefix += chunk[:remaining]
+                truncated = truncated or len(chunk) > remaining
+            else:
+                truncated = True
+
+        if truncated:
+            self._content_prefix = bytes(prefix)
+            self.is_content_truncated = True
+        else:
+            self._content = bytes(prefix)
+
     def iter_bytes(self, chunk_size: int | None = None) -> typing.Iterator[bytes]:
         """
         A byte-iterator over the decoded response content.
@@ -978,6 +1045,49 @@ class Response:
         if not hasattr(self, "_content"):
             self._content = b"".join([part async for part in self.aiter_bytes()])
         return self._content
+
+    async def _aread_truncated(self, max_bytes: int) -> None:
+        """
+        Read the response to completion, so that the connection is released,
+        but retain only up to `max_bytes` of the decoded content.
+
+        Used for responses that are retained in `response.history`, where
+        keeping the entire body could use an excessive amount of memory.
+
+        The limit is counted in decoded bytes, i.e. the same bytes that
+        `.content` would have returned. If the body exceeds the limit then
+        `is_content_truncated` is set, only the retained prefix is kept in
+        `content_prefix`, and accessing `.content` raises
+        `ResponseContentTruncated`.
+        """
+        if self.is_content_truncated:
+            return
+
+        if hasattr(self, "_content"):
+            # The content has already been loaded, for example by a
+            # transport that returns pre-read responses, or by an
+            # event hook that accessed the response content.
+            if len(self._content) > max_bytes:
+                self._content_prefix = self._content[:max_bytes]
+                del self._content
+                self.is_content_truncated = True
+            return
+
+        prefix = bytearray()
+        truncated = False
+        async for chunk in self.aiter_bytes():
+            remaining = max_bytes - len(prefix)
+            if remaining > 0:
+                prefix += chunk[:remaining]
+                truncated = truncated or len(chunk) > remaining
+            else:
+                truncated = True
+
+        if truncated:
+            self._content_prefix = bytes(prefix)
+            self.is_content_truncated = True
+        else:
+            self._content = bytes(prefix)
 
     async def aiter_bytes(
         self, chunk_size: int | None = None

@@ -770,3 +770,63 @@ def test_sync_auth() -> None:
 
     assert response.status_code == 200
     assert response.json() == {"auth": "sync-auth"}
+
+def test_sync_auth_history_body_truncated() -> None:
+    """
+    Intermediate responses from authentication challenges are retained in
+    `response.history`, and are subject to the `max_history_body_bytes` limit.
+    """
+    url = "https://example.org/"
+    auth = RepeatAuth(repeat=2)
+    app = App(auth_header="abc")
+
+    with httpx.Client(
+        transport=httpx.MockTransport(app), max_history_body_bytes=4
+    ) as client:
+        response = client.get(url, auth=auth)
+
+    assert response.status_code == 200
+    assert response.json() == {"auth": "Repeat abc.abc"}
+
+    assert len(response.history) == 2
+    for history_response in response.history:
+        assert history_response.is_content_truncated is True
+        assert history_response.content_prefix == b'{"au'
+        assert history_response.is_closed
+        with pytest.raises(httpx.ResponseContentTruncated):
+            history_response.content
+
+    # The final response is unaffected by the limit.
+    assert response.is_content_truncated is False
+    assert response.content_prefix is None
+
+
+@pytest.mark.anyio
+async def test_async_auth_history_body_truncated() -> None:
+    """
+    Intermediate responses from authentication challenges are retained in
+    `response.history`, and are subject to the `max_history_body_bytes` limit.
+    """
+    url = "https://example.org/"
+    auth = RepeatAuth(repeat=2)
+    app = App(auth_header="abc")
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(app), max_history_body_bytes=4
+    ) as client:
+        response = await client.get(url, auth=auth)
+
+    assert response.status_code == 200
+    assert response.json() == {"auth": "Repeat abc.abc"}
+
+    assert len(response.history) == 2
+    for history_response in response.history:
+        assert history_response.is_content_truncated is True
+        assert history_response.content_prefix == b'{"au'
+        assert history_response.is_closed
+        with pytest.raises(httpx.ResponseContentTruncated):
+            history_response.content
+
+    # The final response is unaffected by the limit.
+    assert response.is_content_truncated is False
+    assert response.content_prefix is None
