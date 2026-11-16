@@ -14,6 +14,12 @@ class Cursor:
         self.iter_chunk_size = conn._iter_chunk_size
         self._conn = conn
         self._cursor = cursor
+        self._closed = False
+        self._close_message = "Cannot operate on a closed cursor"
+
+    def _check_open(self) -> None:
+        if self._closed:
+            raise sqlite3.ProgrammingError(self._close_message)
 
     def __aiter__(self) -> AsyncIterator[sqlite3.Row]:
         """The cursor proxy is also an async iterator."""
@@ -35,6 +41,7 @@ class Cursor:
         self, sql: str, parameters: Optional[Iterable[Any]] = None
     ) -> "Cursor":
         """Execute the given query."""
+        self._check_open()
         if parameters is None:
             parameters = []
         await self._execute(self._cursor.execute, sql, parameters)
@@ -44,20 +51,24 @@ class Cursor:
         self, sql: str, parameters: Iterable[Iterable[Any]]
     ) -> "Cursor":
         """Execute the given multiquery."""
+        self._check_open()
         await self._execute(self._cursor.executemany, sql, parameters)
         return self
 
     async def executescript(self, sql_script: str) -> "Cursor":
         """Execute a user script."""
+        self._check_open()
         await self._execute(self._cursor.executescript, sql_script)
         return self
 
     async def fetchone(self) -> Optional[sqlite3.Row]:
         """Fetch a single row."""
+        self._check_open()
         return await self._execute(self._cursor.fetchone)
 
     async def fetchmany(self, size: Optional[int] = None) -> Iterable[sqlite3.Row]:
         """Fetch up to `cursor.arraysize` number of rows."""
+        self._check_open()
         args: tuple[int, ...] = ()
         if size is not None:
             args = (size,)
@@ -65,10 +76,14 @@ class Cursor:
 
     async def fetchall(self) -> Iterable[sqlite3.Row]:
         """Fetch all remaining rows."""
+        self._check_open()
         return await self._execute(self._cursor.fetchall)
 
     async def close(self) -> None:
         """Close the cursor."""
+        if self._closed:
+            return
+        self._closed = True
         await self._execute(self._cursor.close)
 
     @property

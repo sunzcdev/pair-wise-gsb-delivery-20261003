@@ -18,6 +18,12 @@ Cursors
 .. autoclass:: aiosqlite.cursor.Cursor
     :special-members: __aiter__, __anext__, __aenter__, __aexit__
 
+Transactions
+------------
+
+.. autoclass:: aiosqlite.core.Transaction
+    :special-members: __aenter__, __aexit__
+
 Errors
 ------
 
