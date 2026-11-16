@@ -472,24 +472,27 @@ class CustomSelectors(ImmutableDict[str, SelectorList]):
         if max_selectors is None:
             max_selectors = cp.SELECTOR_LIMIT
 
-        self._d = {}
+        # Validate the names and gather the definitions. The passed in mapping is only
+        # read, and nothing is published to the global caches unless every definition
+        # compiles, so a failed configuration can be corrected and retried.
+        sources: dict[str, str | SelectorList] = {}
         for k, v in arg.items():
             if not isinstance(k, str):
                 raise TypeError(f'{self.__class__.__name__} keys must be strings')
             # Validate key
             k = util.lower(cp.css_unescape(k))
-            if k in self._d:
+            if k in sources:
                 raise KeyError(f'Custom selector {k} was defined twice')
             if cp.RE_CUSTOM.match(k) is None:
                 raise cp.SelectorSyntaxError(f"The name '{k}' is not a valid custom pseudo-class name")
-            # Compile value
-            if isinstance(v, str):
-                v = cp.CSSParser(v, max_selectors=max_selectors, custom=self._d).process_selectors(flags=cp.FLG_PSEUDO)
-            elif not isinstance(v, SelectorList):
+            if not isinstance(v, (str, SelectorList)):
                 raise TypeError(f"Custom selector values must be either 'str' or 'SelectorList', not {type(v)}")
-            # Monitor count
-            max_selectors -= v.count
-            self._d[k] = v
+            sources[k] = v
+
+        # Compile the definitions in dependency order, each exactly once, reporting
+        # undefined references and dependency cycles with the full reference chain.
+        compiled, max_selectors = cp.compile_custom_selectors(sources, max_selectors)
+        self._d = {k: compiled[k] for k in sources}
         self._hash = hash(tuple([(x, y) for x, y in sorted(self._d.items())] + [max_selectors]))
 
 

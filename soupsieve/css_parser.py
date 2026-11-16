@@ -1537,3 +1537,103 @@ class CSSParser:
         """Process selectors."""
 
         return self.parse_selectors(self.selector_iter(self.pattern), index, flags)
+
+
+def custom_selector_references(pattern: str) -> list[tuple[str, int]]:
+    """
+    Collect the custom pseudo-classes that a selector pattern references.
+
+    Return the unescaped, lowercase name and end position of each reference in the
+    order in which they appear. The pattern is tokenized exactly as it is when parsed,
+    so a name that appears in an attribute string, or as part of an escaped identifier,
+    is not a reference, while references nested in functional pseudo-classes are.
+    """
+
+    references: list[tuple[str, int]] = []
+    parser = CSSParser(pattern)
+    for key, m in parser.selector_iter(parser.pattern):
+        if key == 'pseudo_class_custom':
+            references.append((util.lower(css_unescape(m.group('name'))), m.end(0)))
+    return references
+
+
+def _custom_dependencies(
+    sources: Mapping[str, str | ct.SelectorList],
+    cache: dict[str, list[tuple[str, int]]],
+    name: str
+) -> list[tuple[str, int]]:
+    """Get the custom pseudo-classes a definition references, scanning the definition only once."""
+
+    deps = cache.get(name)
+    if deps is None:
+        source = sources[name]
+        deps = custom_selector_references(source) if isinstance(source, str) else []
+        cache[name] = deps
+    return deps
+
+
+def compile_custom_selectors(
+    sources: Mapping[str, str | ct.SelectorList],
+    max_selectors: int
+) -> tuple[dict[str, ct.SelectorList], int]:
+    """
+    Compile custom selector definitions, resolving the dependencies between them.
+
+    Every definition is compiled once, no matter how many definitions reference it,
+    and only after everything it references has been compiled. A reference to an
+    undefined name is reported along with its position in the definition, and a
+    dependency cycle is reported with the full chain of references. Compilation
+    uses only local state, so a failure neither modifies the passed in definitions
+    nor publishes partial results to the global caches, and a corrected
+    configuration can be compiled by simply retrying.
+
+    Returns the compiled definitions and the remaining selector budget.
+    """
+
+    compiled: dict[str, ct.SelectorList] = {}
+    dependencies: dict[str, list[tuple[str, int]]] = {}
+
+    for root in sources:
+        if root in compiled:
+            continue
+        # Walk the dependencies depth first, without recursion, so that deeply
+        # chained definitions cannot exceed the recursion limit.
+        path = [root]
+        iterators: list[Iterator[tuple[str, int]]] = [iter(_custom_dependencies(sources, dependencies, root))]
+        while path:
+            name = path[-1]
+            descend = False
+            for dep, pos in iterators[-1]:
+                if dep in compiled:
+                    continue
+                if dep not in sources:
+                    source = sources[name]
+                    raise SelectorSyntaxError(
+                        f"Undefined custom selector '{dep}' found at position {pos} in the definition of '{name}'",
+                        source if isinstance(source, str) else None,
+                        pos if isinstance(source, str) else None
+                    )
+                if dep in path:
+                    chain = ' -> '.join(path[path.index(dep):] + [dep])
+                    raise SelectorSyntaxError(f'Circular dependency in custom selectors: {chain}')
+                path.append(dep)
+                iterators.append(iter(_custom_dependencies(sources, dependencies, dep)))
+                descend = True
+                break
+            if descend:
+                continue
+            source = sources[name]
+            if isinstance(source, str):
+                value = CSSParser(
+                    source,
+                    max_selectors=max_selectors,
+                    custom=compiled
+                ).process_selectors(flags=FLG_PSEUDO)
+            else:
+                value = source
+            max_selectors -= value.count
+            compiled[name] = value
+            path.pop()
+            iterators.pop()
+
+    return compiled, max_selectors

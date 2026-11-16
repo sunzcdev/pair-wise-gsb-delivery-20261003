@@ -303,12 +303,15 @@ soup = bs4.BeautifulSoup(markup, 'html5lib')
 sv.select(':--header', soup, custom=sv.CustomSelectors({':--header': 'h1, h2, h3, h4, h5, h6'}))
 ```
 
-Custom selectors can also be dependent upon other custom selectors. The order is important, so if a selector depends on
-another custom selector, the selector should be defined after its dependency.
+Custom selectors can also be dependent upon other custom selectors. Dependencies are resolved when the custom
+selectors are compiled, so the order in which they are defined does not matter, and a shared dependency is only
+compiled once. A reference to an undefined custom selector is reported along with its position in the definition,
+and a circular dependency is reported with the full chain of references.
 
 > [!new] Change in Behavior 3.0
 > Previous to 3.0 order did not matter and custom selectors were compiled as needed recursively. Now all custom
-> custom selectors will be compiled up front and must be organized such that selector dependencies _must_ come first.
+> selectors are compiled up front with their dependencies resolved, so order no longer matters, and circular or
+> undefined dependencies are reported with the full reference chain.
 
 Assuming the same markup as in the first example, we will now create a custom selector that should find any element that
 has child elements, we will call the selector `#!css :--parent`. Then we will create another selector called
