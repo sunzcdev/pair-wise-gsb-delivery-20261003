@@ -7,11 +7,12 @@ import sys
 from pathlib import Path
 from sqlite3 import OperationalError
 from tempfile import TemporaryDirectory
-from threading import Thread
+from threading import Event, Thread
 from unittest import IsolatedAsyncioTestCase, SkipTest
 from unittest.mock import patch
 
 import aiosqlite
+from aiosqlite.core import Operation, OperationState
 from .helpers import setup_logger
 
 
@@ -535,3 +536,270 @@ class SmokeTest(IsolatedAsyncioTestCase):
         loop.close()
 
         db.stop()
+
+    async def test_operation_state_machine(self):
+        loop = asyncio.get_running_loop()
+
+        operation = Operation(loop.create_future(), lambda: 1)
+        self.assertIs(operation.state, OperationState.PENDING)
+        self.assertTrue(operation.may_complete)
+
+        # A cancellable, still-pending operation can be prevented from running.
+        self.assertTrue(operation.cancel())
+        self.assertIs(operation.state, OperationState.CANCELLED)
+        self.assertFalse(operation.may_complete)
+        # The worker must skip cancelled operations ...
+        self.assertFalse(operation.begin())
+        # ... and cancellation is idempotent.
+        self.assertFalse(operation.cancel())
+
+        running = Operation(loop.create_future(), lambda: 2)
+        self.assertTrue(running.begin())
+        self.assertIs(running.state, OperationState.RUNNING)
+        self.assertTrue(running.may_complete)
+        # Once started, cancellation cannot prevent completion.
+        self.assertFalse(running.cancel())
+        self.assertIs(running.state, OperationState.RUNNING)
+        running.finish()
+        self.assertIs(running.state, OperationState.FINISHED)
+        self.assertFalse(running.may_complete)
+
+        cleanup = Operation(loop.create_future(), lambda: 3, cancellable=False)
+        # Cleanup operations never accept cancellation while pending.
+        self.assertFalse(cleanup.cancel())
+        self.assertIs(cleanup.state, OperationState.PENDING)
+        self.assertTrue(cleanup.begin())
+
+    async def test_cancelled_queued_operation_has_no_side_effect(self):
+        # A blocking operation occupies the worker thread so that the insert
+        # queued behind it stays pending until it is explicitly cancelled.
+        async with aiosqlite.connect(self.db) as db:
+            await db.execute("create table cancel_target (id integer)")
+            await db.commit()
+
+            started = Event()
+            release = Event()
+
+            def blocker():
+                started.set()
+                release.wait(5)
+
+            block_task = asyncio.ensure_future(db._execute(blocker))
+            while not started.is_set():
+                await asyncio.sleep(0.005)
+
+            insert_task = asyncio.ensure_future(
+                db.execute("insert into cancel_target (id) values (?)", [42])
+            )
+            await asyncio.sleep(0.05)
+            self.assertFalse(insert_task.done())
+
+            insert_task.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await insert_task
+
+            # The queued item is explicitly marked cancelled and must not run.
+            queued = db._tx.get_nowait()
+            self.assertIsInstance(queued, Operation)
+            self.assertIs(queued.state, OperationState.CANCELLED)
+            self.assertFalse(queued.may_complete)
+            db._tx.put_nowait(queued)
+
+            release.set()
+            await block_task
+
+        # Reopen the database: the cancelled insert must never have happened.
+        async with aiosqlite.connect(self.db) as db:
+            rows = await db.execute_fetchall("select count(*) from cancel_target")
+        self.assertEqual(rows, [(0,)])
+
+    async def test_cancelled_running_operation_may_still_complete(self):
+        db = await aiosqlite.connect(":memory:")
+        started = Event()
+        release = Event()
+        seen = []
+
+        def blocker():
+            started.set()
+            release.wait(5)
+            return "finished"
+
+        async def run_blocker():
+            # Track the exact operation so its state can be asserted while the
+            # worker thread is inside the blocking call.
+            future = asyncio.get_running_loop().create_future()
+            operation = Operation(future, blocker)
+            seen.append(operation)
+            db._tx.put_nowait(operation)
+            return await future
+
+        task = asyncio.ensure_future(run_blocker())
+        while not started.is_set():
+            await asyncio.sleep(0.005)
+
+        operation = seen[0]
+        self.assertIs(operation.state, OperationState.RUNNING)
+        self.assertTrue(operation.may_complete)
+
+        task.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await task
+
+        # The operation had already started: it cannot be prevented and may
+        # still complete even though the awaiting task was cancelled.
+        self.assertFalse(operation.cancel())
+        self.assertIs(operation.state, OperationState.RUNNING)
+        self.assertTrue(operation.may_complete)
+
+        release.set()
+        for _ in range(200):
+            if operation.state is OperationState.FINISHED:
+                break
+            await asyncio.sleep(0.01)
+        self.assertIs(operation.state, OperationState.FINISHED)
+        await db.close()
+
+    async def test_commit_is_not_skipped_by_cancellation(self):
+        db = await aiosqlite.connect(":memory:")
+        await db.execute("create table committed (id integer)")
+        await db.execute("insert into committed (id) values (7)")
+
+        started = Event()
+        release = Event()
+
+        def blocker():
+            started.set()
+            release.wait(5)
+
+        block_task = asyncio.ensure_future(db._execute(blocker))
+        while not started.is_set():
+            await asyncio.sleep(0.005)
+
+        commit_task = asyncio.ensure_future(db.commit())
+        await asyncio.sleep(0.05)
+        commit_operation = db._tx.get_nowait()
+        self.assertIsInstance(commit_operation, Operation)
+        self.assertFalse(commit_operation.cancellable)
+
+        commit_task.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await commit_task
+
+        # Still pending rather than cancelled: the worker must run it.
+        self.assertIs(commit_operation.state, OperationState.PENDING)
+        self.assertTrue(commit_operation.may_complete)
+        db._tx.put_nowait(commit_operation)
+
+        release.set()
+        await block_task
+        for _ in range(200):
+            if commit_operation.state is OperationState.FINISHED:
+                break
+            await asyncio.sleep(0.01)
+        self.assertIs(commit_operation.state, OperationState.FINISHED)
+        self.assertFalse(db._conn.in_transaction)
+        await db.close()
+
+    async def test_rollback_is_not_skipped_by_cancellation(self):
+        db = await aiosqlite.connect(":memory:")
+        await db.execute("create table rolled_back (id integer)")
+        await db.execute("insert into rolled_back (id) values (9)")
+        self.assertTrue(db._conn.in_transaction)
+
+        started = Event()
+        release = Event()
+
+        def blocker():
+            started.set()
+            release.wait(5)
+
+        block_task = asyncio.ensure_future(db._execute(blocker))
+        while not started.is_set():
+            await asyncio.sleep(0.005)
+
+        rollback_task = asyncio.ensure_future(db.rollback())
+        await asyncio.sleep(0.05)
+        rollback_operation = db._tx.get_nowait()
+        self.assertIsInstance(rollback_operation, Operation)
+        self.assertFalse(rollback_operation.cancellable)
+
+        rollback_task.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await rollback_task
+
+        self.assertIs(rollback_operation.state, OperationState.PENDING)
+        db._tx.put_nowait(rollback_operation)
+
+        release.set()
+        await block_task
+        for _ in range(200):
+            if rollback_operation.state is OperationState.FINISHED:
+                break
+            await asyncio.sleep(0.01)
+        self.assertIs(rollback_operation.state, OperationState.FINISHED)
+        self.assertFalse(db._conn.in_transaction)
+        await db.close()
+
+    async def test_close_is_not_skipped_by_cancellation(self):
+        db = await aiosqlite.connect(":memory:")
+
+        started = Event()
+        release = Event()
+
+        def blocker():
+            started.set()
+            release.wait(5)
+
+        block_task = asyncio.ensure_future(db._execute(blocker))
+        while not started.is_set():
+            await asyncio.sleep(0.005)
+
+        close_task = asyncio.ensure_future(db.close())
+        await asyncio.sleep(0.05)
+        close_operation = db._tx.get_nowait()
+        self.assertIsInstance(close_operation, Operation)
+        self.assertFalse(close_operation.cancellable)
+
+        close_task.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await close_task
+
+        db._tx.put_nowait(close_operation)
+        release.set()
+        await block_task
+
+        # The worker must still reach the non-cancellable shutdown sentinel.
+        db._thread.join(timeout=10)
+        self.assertFalse(db._thread.is_alive())
+        self.assertIsNone(db._connection)
+
+    def test_worker_stops_after_event_loop_closed_with_pending_ops(self):
+        db = None
+        loop = asyncio.new_event_loop()
+
+        async def inner():
+            nonlocal db
+            db = await aiosqlite.connect(":memory:")
+            await db.execute("create table t (id integer)")
+            # Enqueue operations whose futures belong to this loop; the loop
+            # will be closed before the worker has drained every item.
+            for i in range(25):
+                future = loop.create_future()
+                db._tx.put_nowait(
+                    Operation(
+                        future,
+                        lambda i=i: db._connection.execute("select ?", [i]),
+                    )
+                )
+
+        loop.run_until_complete(inner())
+        thread = db._thread
+        self.assertTrue(thread.is_alive())
+        loop.close()
+
+        # No running loop is available, yet the worker must drain the queue
+        # (tolerating the now-closed loops when delivering results) and stop.
+        self.assertIsNone(db.stop())
+        thread.join(timeout=10)
+        self.assertFalse(thread.is_alive())
+        self.assertTrue(db._tx.empty())

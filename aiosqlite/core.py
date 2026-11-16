@@ -9,17 +9,18 @@ import asyncio
 import logging
 import sqlite3
 from collections.abc import AsyncIterator, Generator, Iterable
+from enum import Enum, auto
 from functools import partial
 from pathlib import Path
 from queue import Empty, Queue, SimpleQueue
-from threading import Thread
+from threading import Lock, Thread
 from typing import Any, Callable, Literal, Optional, Union
 from warnings import warn
 
 from .context import contextmanager
 from .cursor import Cursor
 
-__all__ = ["connect", "Connection", "Cursor"]
+__all__ = ["connect", "Connection", "Cursor", "Operation", "OperationState"]
 
 AuthorizerCallback = Callable[[int, str, str, str, str], int]
 
@@ -42,7 +43,134 @@ def set_exception(fut: asyncio.Future, e: BaseException) -> None:
 
 
 _STOP_RUNNING_SENTINEL = object()
-_TxQueue = SimpleQueue[tuple[Optional[asyncio.Future], Callable[[], Any]]]
+
+
+class OperationState(Enum):
+    """Lifecycle states of a queued database operation."""
+
+    #: Queued but not yet picked up by the worker thread.
+    PENDING = auto()
+    #: Currently executing on the worker thread; it can no longer be prevented.
+    RUNNING = auto()
+    #: Cancelled while still pending; the worker must skip it entirely.
+    CANCELLED = auto()
+    #: Finished executing, either successfully or with an exception.
+    FINISHED = auto()
+
+
+class Operation:
+    """
+    A single unit of work submitted to the connection's worker thread.
+
+    Each operation carries an explicit :class:`OperationState` so that
+    cancellation of the awaiting task can prevent operations that have not
+    started yet, while operations that are already running are left to run to
+    completion (sqlite calls block the worker thread and cannot be interrupted
+    halfway).
+
+    Operations needed for connection cleanup (``commit``, ``rollback``,
+    ``close`` and thread shutdown) are created with ``cancellable=False`` so
+    that ordinary task cancellation can never skip them.
+    """
+
+    def __init__(
+        self,
+        future: Optional[asyncio.Future],
+        function: Callable[[], Any],
+        cancellable: bool = True,
+    ) -> None:
+        self.future = future
+        self.function = function
+        self.cancellable = cancellable
+        self._state = OperationState.PENDING
+        self._lock = Lock()
+
+    @property
+    def state(self) -> OperationState:
+        """Current lifecycle state of the operation."""
+        with self._lock:
+            return self._state
+
+    @property
+    def may_complete(self) -> bool:
+        """
+        Whether this operation can still run and finish on the worker thread.
+
+        Returns ``False`` only once it has been prevented from running
+        (cancelled while pending) or finished.
+        """
+        with self._lock:
+            return self._state in (OperationState.PENDING, OperationState.RUNNING)
+
+    def cancel(self) -> bool:
+        """
+        Try to cancel the operation before it starts executing.
+
+        Returns ``True`` if a cancellable, still-pending operation was marked
+        cancelled and will never run. Returns ``False`` when the operation is
+        not cancellable, has already started (and may still complete), or has
+        already finished. Safe to call more than once.
+        """
+        with self._lock:
+            if self.cancellable and self._state is OperationState.PENDING:
+                self._state = OperationState.CANCELLED
+                return True
+            return False
+
+    def begin(self) -> bool:
+        """
+        Mark the operation as running on behalf of the worker thread.
+
+        Returns ``False`` (without changing state) if it was cancelled while
+        pending, in which case the worker must skip it.
+        """
+        with self._lock:
+            if self._state is OperationState.CANCELLED:
+                return False
+            self._state = OperationState.RUNNING
+            return True
+
+    def finish(self) -> None:
+        """Mark the operation as finished, regardless of success or failure."""
+        with self._lock:
+            self._state = OperationState.FINISHED
+
+
+_TxQueue = SimpleQueue[Operation]
+
+
+def _set_future_result(fut: asyncio.Future, result: Any) -> None:
+    """Deliver a result back to the event loop, tolerating a closed loop."""
+    if fut.done():
+        return
+
+    loop = fut.get_loop()
+    if loop.is_closed():
+        LOG.debug("event loop closed; discarding result of %r", fut)
+        return
+
+    try:
+        loop.call_soon_threadsafe(set_result, fut, result)
+    except RuntimeError:
+        # The loop may have been closed between the check and this call.
+        LOG.debug("event loop closed while delivering result; discarding")
+
+
+def _set_future_exception(fut: asyncio.Future, e: BaseException) -> None:
+    """Deliver an exception back to the event loop, tolerating a closed loop."""
+    if fut.done():
+        return
+
+    loop = fut.get_loop()
+    if loop.is_closed():
+        LOG.debug("event loop closed; discarding exception of %r", fut)
+        return
+
+    try:
+        loop.call_soon_threadsafe(set_exception, fut, e)
+    except RuntimeError:
+        # The loop may have been closed between the check and this call.
+        LOG.debug("event loop closed while delivering exception; discarding")
 
 
 def _connection_worker_thread(tx: _TxQueue):
@@ -56,23 +184,31 @@ def _connection_worker_thread(tx: _TxQueue):
         # even after connection is closed (so we can finalize all
         # futures)
 
-        future, function = tx.get()
+        operation = tx.get()
+
+        # Operations cancelled while still queued must never touch sqlite;
+        # operations that already started (or are not cancellable) run through.
+        if not operation.begin():
+            LOG.debug("skipping cancelled operation %s", operation.function)
+            continue
 
         try:
-            LOG.debug("executing %s", function)
-            result = function()
+            LOG.debug("executing %s", operation.function)
+            result = operation.function()
+            operation.finish()
 
-            if future:
-                future.get_loop().call_soon_threadsafe(set_result, future, result)
-            LOG.debug("operation %s completed", function)
+            if operation.future:
+                _set_future_result(operation.future, result)
+            LOG.debug("operation %s completed", operation.function)
 
             if result is _STOP_RUNNING_SENTINEL:
                 break
 
         except BaseException as e:  # noqa B036
             LOG.debug("returning exception %s", e)
-            if future:
-                future.get_loop().call_soon_threadsafe(set_exception, future, e)
+            operation.finish()
+            if operation.future:
+                _set_future_exception(operation.future, e)
 
 
 class Connection:
@@ -124,11 +260,17 @@ class Connection:
             return _STOP_RUNNING_SENTINEL
 
         try:
-            future = asyncio.get_event_loop().create_future()
-        except Exception:
+            future: Optional[asyncio.Future] = (
+                asyncio.get_running_loop().create_future()
+            )
+        except RuntimeError:
+            # No running event loop (for example, it has already been closed);
+            # the worker thread can still drain the queue and terminate safely.
             future = None
 
-        self._tx.put_nowait((future, close_and_stop))
+        # Thread shutdown is never cancellable: the worker must reach the
+        # stop sentinel even if every other queue item was cancelled.
+        self._tx.put_nowait(Operation(future, close_and_stop, cancellable=False))
         return future
 
     @property
@@ -147,15 +289,38 @@ class Connection:
         cursor = self._conn.execute(sql, parameters)
         return cursor.fetchall()
 
-    async def _execute(self, fn, *args, **kwargs):
+    async def _execute(self, fn, *args, cancellable: bool = True, **kwargs):
         """Queue a function with the given arguments for execution."""
         if not self._running or not self._connection:
             raise ValueError("Connection closed")
 
         function = partial(fn, *args, **kwargs)
         future = asyncio.get_event_loop().create_future()
+        operation = Operation(future, function, cancellable=cancellable)
 
-        self._tx.put_nowait((future, function))
+        def _cancel_if_pending(cancelled_future: asyncio.Future) -> None:
+            # The done callback also fires for ordinary completion; only an
+            # explicitly cancelled future represents the awaiting task giving up.
+            if not cancelled_future.cancelled():
+                return
+
+            if operation.cancel():
+                # Still queued: the worker will skip it, so there is nothing
+                # to wait for and no hidden side effect to expect.
+                LOG.debug("cancelled pending operation %s", function)
+            else:
+                # Already running (or not cancellable): sqlite cannot be
+                # interrupted, so the operation may still complete and its
+                # side effects may still be applied even though the awaiting
+                # task gave up.
+                LOG.warning(
+                    "cancelled wait on %s operation %s; it may still complete",
+                    operation.state.name,
+                    function,
+                )
+
+        future.add_done_callback(_cancel_if_pending)
+        self._tx.put_nowait(operation)
 
         return await future
 
@@ -164,7 +329,11 @@ class Connection:
         if self._connection is None:
             try:
                 future = asyncio.get_event_loop().create_future()
-                self._tx.put_nowait((future, self._connector))
+                # Establishing the connection cannot be skipped; otherwise the
+                # worker would hold a never-settled future after cancellation.
+                self._tx.put_nowait(
+                    Operation(future, self._connector, cancellable=False)
+                )
                 self._connection = await future
             except BaseException:
                 self.stop()
@@ -190,11 +359,13 @@ class Connection:
 
     async def commit(self) -> None:
         """Commit the current transaction."""
-        await self._execute(self._conn.commit)
+        # Cleanup semantics must not be skipped by ordinary task cancellation.
+        await self._execute(self._conn.commit, cancellable=False)
 
     async def rollback(self) -> None:
         """Roll back the current transaction."""
-        await self._execute(self._conn.rollback)
+        # Cleanup semantics must not be skipped by ordinary task cancellation.
+        await self._execute(self._conn.rollback, cancellable=False)
 
     async def close(self) -> None:
         """Complete queued queries/cursors and close the connection."""
@@ -203,7 +374,7 @@ class Connection:
             return
 
         try:
-            await self._execute(self._conn.close)
+            await self._execute(self._conn.close, cancellable=False)
         except Exception:
             LOG.info("exception occurred while closing connection")
             raise
