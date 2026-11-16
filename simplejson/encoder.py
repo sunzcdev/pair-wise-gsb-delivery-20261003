@@ -89,6 +89,27 @@ if sys.version_info >= (3, 15):
 else:
     _dict_types = dict
 
+def _escape_match(match):
+    return ESCAPE_DCT[match.group(0)]
+
+
+def _escape_ascii_match(match):
+    s = match.group(0)
+    try:
+        return ESCAPE_DCT[s]
+    except KeyError:
+        n = ord(s)
+        if n < 0x10000:
+            return '\\u%04x' % (n,)
+        else:
+            # surrogate pair: both halves are returned as a single
+            # indivisible token so chunked output never splits them
+            n -= 0x10000
+            s1 = 0xd800 | ((n >> 10) & 0x3ff)
+            s2 = 0xdc00 | (n & 0x3ff)
+            return '\\u%04x\\u%04x' % (s1, s2)
+
+
 def py_encode_basestring(s, _PY3=PY3, _q=u'"'):
     """Return a JSON representation of a Python string
 
@@ -111,9 +132,7 @@ def py_encode_basestring(s, _PY3=PY3, _q=u'"'):
                 s = str.__str__(s)
             else:
                 s = unicode.__getnewargs__(s)[0]
-    def replace(match):
-        return ESCAPE_DCT[match.group(0)]
-    return _q + ESCAPE.sub(replace, s) + _q
+    return _q + ESCAPE.sub(_escape_match, s) + _q
 
 
 def py_encode_basestring_ascii(s, _PY3=PY3):
@@ -153,6 +172,96 @@ def py_encode_basestring_ascii(s, _PY3=PY3):
                 s2 = 0xdc00 | (n & 0x3ff)
                 return '\\u%04x\\u%04x' % (s1, s2)
     return '"' + str(ESCAPE_ASCII.sub(replace, s)) + '"'
+
+
+def _make_chunked_string_encoder(ensure_ascii, encoding, chunk_size,
+                                 _PY3=PY3):
+    """Build a generator-based string encoder for iterencode chunk budgets.
+
+    The returned ``chunk_string(s)`` generator escapes its input
+    incrementally and yields JSON string fragments of at most
+    ``chunk_size`` characters each, so a huge string no longer requires
+    allocating its entire escaped form up front.  A fragment may exceed
+    ``chunk_size`` only by the length of a single escape sequence: JSON
+    escapes (``\\n``, ``\\uXXXX``) and UTF-16 surrogate escape pairs are
+    never split across fragments.  Concatenating all fragments produces
+    exactly what the one-shot encoder would have returned.
+    """
+    if ensure_ascii:
+        pattern = ESCAPE_ASCII
+        replace = _escape_ascii_match
+    else:
+        pattern = ESCAPE
+        replace = _escape_match
+    if encoding is None:
+        encoding = 'utf-8'
+
+    def chunk_string(s, _pattern=pattern, _replace=replace,
+                     _budget=chunk_size, _encoding=encoding, _PY3=_PY3):
+        # Normalize exactly like py_encode_basestring and
+        # py_encode_basestring_ascii (including the encoding wrapper
+        # applied in JSONEncoder.iterencode).
+        if _PY3:
+            if isinstance(s, bytes):
+                s = str(s, _encoding)
+            elif type(s) is not str:
+                # convert an str subclass instance to exact str
+                # raise a TypeError otherwise
+                s = str.__str__(s)
+        else:
+            if isinstance(s, str) and HAS_UTF8.search(s) is not None:
+                s = unicode(s, _encoding)
+            elif type(s) not in (str, unicode):
+                # convert an str subclass instance to exact str
+                # convert a unicode subclass instance to exact unicode
+                # raise a TypeError otherwise
+                if isinstance(s, str):
+                    s = str.__str__(s)
+                else:
+                    s = unicode.__getnewargs__(s)[0]
+        budget = _budget
+        buf = '"'
+        pos = 0
+        for match in _pattern.finditer(s):
+            start = match.start()
+            # Unescaped run before the match: safe to slice anywhere.
+            while pos < start:
+                space = budget - len(buf)
+                if space <= 0:
+                    yield buf
+                    buf = ''
+                    space = budget
+                take = start - pos
+                if take > space:
+                    take = space
+                buf += s[pos:pos + take]
+                pos += take
+            esc = _replace(match)
+            if buf and len(buf) + len(esc) > budget:
+                # Escape sequences are atomic: flush first rather than
+                # split one across a chunk boundary.
+                yield buf
+                buf = ''
+            buf += esc
+            pos = match.end()
+        end = len(s)
+        while pos < end:
+            space = budget - len(buf)
+            if space <= 0:
+                yield buf
+                buf = ''
+                space = budget
+            take = end - pos
+            if take > space:
+                take = space
+            buf += s[pos:pos + take]
+            pos += take
+        if buf and len(buf) + 1 > budget:
+            yield buf
+            buf = ''
+        yield buf + '"'
+
+    return chunk_string
 
 
 encode_basestring_ascii = (
@@ -199,7 +308,8 @@ class JSONEncoder(object):
                  use_decimal=True, namedtuple_as_object=True,
                  tuple_as_array=True, bigint_as_string=False,
                  item_sort_key=None, for_json=False, ignore_nan=False,
-                 int_as_string_bitcount=None, iterable_as_array=False):
+                 int_as_string_bitcount=None, iterable_as_array=False,
+                 chunk_size=None):
         """Constructor for JSONEncoder, with sensible defaults.
 
         If skipkeys is false, then it is a TypeError to attempt
@@ -281,6 +391,17 @@ class JSONEncoder(object):
         as ``null`` in compliance with the ECMA-262 specification. If true,
         this will override *allow_nan*.
 
+        If *chunk_size* is a positive integer (default: ``None``), then
+        :meth:`iterencode` limits the text chunks it yields to roughly that
+        many characters: string contents (including dict keys) are escaped
+        incrementally and emitted in segments instead of allocating the
+        entire escaped string at once.  Chunk boundaries never split a JSON
+        escape sequence or a Unicode surrogate escape pair, so a chunk may
+        exceed the budget only by the length of one escape sequence.  The
+        concatenated output is identical to unchunked encoding.  Note that
+        this option forces the pure-Python encoder even when the C speedups
+        are available.
+
         """
 
         self.skipkeys = skipkeys
@@ -297,6 +418,12 @@ class JSONEncoder(object):
         self.for_json = for_json
         self.ignore_nan = ignore_nan
         self.int_as_string_bitcount = int_as_string_bitcount
+        if chunk_size is not None and (
+                not isinstance(chunk_size, integer_types) or
+                isinstance(chunk_size, bool) or chunk_size < 1):
+            raise ValueError(
+                "chunk_size must be a positive integer or None")
+        self.chunk_size = chunk_size
         if indent is not None and not isinstance(indent, string_types):
             indent = indent * ' '
         self.indent = indent
@@ -367,6 +494,11 @@ class JSONEncoder(object):
             for chunk in JSONEncoder().iterencode(bigobject):
                 mysocket.write(chunk)
 
+        If the encoder was constructed with a ``chunk_size`` budget, each
+        yielded chunk is at most roughly that many characters (see the
+        constructor documentation) and string contents are escaped
+        incrementally instead of being allocated all at once.
+
         """
         if self.check_circular:
             markers = {}
@@ -381,6 +513,13 @@ class JSONEncoder(object):
                 if isinstance(o, binary_type):
                     o = text_type(o, _encoding)
                 return _orig_encoder(o)
+        if self.chunk_size is not None:
+            # Chunked output requires incremental string escaping, which
+            # only the pure-Python encoder supports.
+            _chunk_string = _make_chunked_string_encoder(
+                self.ensure_ascii, self.encoding, self.chunk_size)
+        else:
+            _chunk_string = None
 
         def floatstr(o, allow_nan=self.allow_nan, ignore_nan=self.ignore_nan,
                 _repr=FLOAT_REPR, _inf=PosInf, _neginf=-PosInf):
@@ -412,7 +551,7 @@ class JSONEncoder(object):
         key_memo = {}
         int_as_string_bitcount = (
             53 if self.bigint_as_string else self.int_as_string_bitcount)
-        if c_make_encoder is not None:
+        if c_make_encoder is not None and _chunk_string is None:
             _iterencode = c_make_encoder(
                 markers, self.default, _encoder, self.indent,
                 self.key_separator, self.item_separator, self.sort_keys,
@@ -429,7 +568,8 @@ class JSONEncoder(object):
                 self.namedtuple_as_object, self.tuple_as_array,
                 int_as_string_bitcount,
                 self.item_sort_key, self.encoding, self.for_json,
-                self.iterable_as_array, Decimal=decimal.Decimal)
+                self.iterable_as_array, Decimal=decimal.Decimal,
+                _chunk_string=_chunk_string)
         try:
             return _iterencode(o, 0)
         finally:
@@ -494,6 +634,7 @@ def _make_iterencode(markers, _default, _encoder, _indent, _floatstr,
         str=str,
         tuple=tuple,
         iter=iter,
+        _chunk_string=None,
     ):
     if _use_decimal and Decimal is None:
         Decimal = decimal.Decimal
@@ -506,6 +647,19 @@ def _make_iterencode(markers, _default, _encoder, _indent, _floatstr,
         (_int_as_string_bitcount <= 0 or
          not isinstance(_int_as_string_bitcount, integer_types))):
         raise TypeError("int_as_string_bitcount must be a positive integer")
+
+    if _chunk_string is not None:
+        def _emit_string(value, prefix):
+            # Yield the JSON string for value in budget-limited pieces;
+            # the structural prefix (separator and/or indent) rides
+            # along with the first piece.  The generator is self-contained,
+            # so closing the outer iterator mid-string leaves no state
+            # behind beyond what the container cleanup already handles.
+            for piece in _chunk_string(value):
+                yield prefix + piece
+                prefix = ''
+    else:
+        _emit_string = None
 
     def call_method(obj, method_name):
         method = getattr(obj, method_name, None)
@@ -587,9 +741,17 @@ def _make_iterencode(markers, _default, _encoder, _indent, _floatstr,
                     buf = separator
                 try:
                     if isinstance(value, string_types):
-                        yield buf + _encoder(value)
+                        if _emit_string is not None:
+                            for piece in _emit_string(value, buf):
+                                yield piece
+                        else:
+                            yield buf + _encoder(value)
                     elif _PY3 and isinstance(value, bytes) and _encoding is not None:
-                        yield buf + _encoder(value)
+                        if _emit_string is not None:
+                            for piece in _emit_string(value, buf):
+                                yield piece
+                        else:
+                            yield buf + _encoder(value)
                     elif isinstance(value, RawJSON):
                         yield buf + value.encoded_json
                     elif value is None:
@@ -721,13 +883,25 @@ def _make_iterencode(markers, _default, _encoder, _indent, _floatstr,
                     first = False
                 else:
                     yield item_separator
-                yield _encoder(key)
+                if _emit_string is not None:
+                    for piece in _emit_string(key, ''):
+                        yield piece
+                else:
+                    yield _encoder(key)
                 yield _key_separator
                 try:
                     if isinstance(value, string_types):
-                        yield _encoder(value)
+                        if _emit_string is not None:
+                            for piece in _emit_string(value, ''):
+                                yield piece
+                        else:
+                            yield _encoder(value)
                     elif _PY3 and isinstance(value, bytes) and _encoding is not None:
-                        yield _encoder(value)
+                        if _emit_string is not None:
+                            for piece in _emit_string(value, ''):
+                                yield piece
+                        else:
+                            yield _encoder(value)
                     elif isinstance(value, RawJSON):
                         yield value.encoded_json
                     elif value is None:
@@ -788,9 +962,17 @@ def _make_iterencode(markers, _default, _encoder, _indent, _floatstr,
         # for_json() and _asdict() on o, so calling them again would run
         # them (and any side effects) twice, unlike the C encoder.
         if isinstance(o, string_types):
-            yield _encoder(o)
+            if _emit_string is not None:
+                for piece in _emit_string(o, ''):
+                    yield piece
+            else:
+                yield _encoder(o)
         elif _PY3 and isinstance(o, bytes) and _encoding is not None:
-            yield _encoder(o)
+            if _emit_string is not None:
+                for piece in _emit_string(o, ''):
+                    yield piece
+            else:
+                yield _encoder(o)
         elif isinstance(o, RawJSON):
             yield o.encoded_json
         elif o is None:

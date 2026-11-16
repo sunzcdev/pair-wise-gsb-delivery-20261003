@@ -159,7 +159,8 @@ Basic Usage
                    namedtuple_as_object=True, tuple_as_array=True, \
                    bigint_as_string=False, sort_keys=False, \
                    item_sort_key=None, for_json=None, ignore_nan=False, \
-                   int_as_string_bitcount=None, iterable_as_array=False, **kw)
+                   int_as_string_bitcount=None, iterable_as_array=False, \
+                   chunk_size=None, **kw)
 
     Serialize *obj* as a JSON formatted stream to *fp*
     (a ``.write()``-supporting file-like object) using this
@@ -190,7 +191,8 @@ Basic Usage
                     namedtuple_as_object=True, tuple_as_array=True, \
                     bigint_as_string=False, sort_keys=False, \
                     item_sort_key=None, for_json=None, ignore_nan=False, \
-                    int_as_string_bitcount=None, iterable_as_array=False, **kw)
+                    int_as_string_bitcount=None, iterable_as_array=False, \
+                    chunk_size=None, **kw)
 
     Serialize *obj* to a JSON formatted :class:`str`.
 
@@ -317,6 +319,15 @@ Basic Usage
     boundary.
 
     See also *bigint_as_string* (which is equivalent to `int_as_string_bitcount=53`).
+
+    If *chunk_size* is a positive integer (default: ``None``), the document
+    is encoded in text chunks of roughly that many characters at most, with
+    string contents escaped incrementally instead of allocating the entire
+    escaped string at once. The joined result is identical either way; see
+    :class:`JSONEncoder` for details.
+
+    .. versionchanged:: 4.4.0
+      *chunk_size* is new in 4.4.0.
 
     .. note::
 
@@ -577,7 +588,8 @@ Encoders and decoders
                        namedtuple_as_object=True, tuple_as_array=True, \
                        bigint_as_string=False, item_sort_key=None, \
                        for_json=True, ignore_nan=False, \
-                       int_as_string_bitcount=None, iterable_as_array=False)
+                       int_as_string_bitcount=None, iterable_as_array=False, \
+                       chunk_size=None)
 
    Extensible JSON encoder for Python data structures.
 
@@ -713,6 +725,19 @@ Encoders and decoders
    ``null`` in compliance with the ECMA-262 specification. If true, this will
    override *allow_nan*.
 
+   If *chunk_size* is a positive integer (default: ``None``), then
+   :meth:`iterencode` limits the text chunks it yields to roughly that many
+   characters: string contents (including dict keys) are escaped
+   incrementally and emitted in segments instead of allocating the entire
+   escaped string at once.  Chunk boundaries never split a JSON escape
+   sequence or a Unicode surrogate escape pair, so a chunk may exceed the
+   budget only by the length of one escape sequence.  The concatenated
+   output is identical to unchunked encoding.  Note that this option forces
+   the pure-Python encoder even when the C speedups are available.
+
+   .. versionchanged:: 4.4.0
+     *chunk_size* is new in 4.4.0.
+
    .. method:: default(o)
 
     Implement this method in a subclass such that it returns a serializable
@@ -756,6 +781,13 @@ Encoders and decoders
 
             for chunk in JSONEncoder().iterencode(bigobject):
                 mysocket.write(chunk)
+
+      If the encoder was constructed with a *chunk_size* budget, each
+      yielded chunk is at most roughly that many characters and string
+      contents are escaped incrementally instead of being allocated all at
+      once.  Chunk boundaries never split a JSON escape sequence or a
+      Unicode surrogate escape pair, and the concatenated output is
+      identical to unchunked encoding.
 
       Note that :meth:`encode` has much better performance than
       :meth:`iterencode`.

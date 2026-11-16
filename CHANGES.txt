@@ -1,3 +1,13 @@
+Version 4.4.0 (unreleased)
+
+* ``JSONEncoder`` (and ``dump``/``dumps``) now accept an optional
+  ``chunk_size`` output budget: ``iterencode`` escapes string contents
+  incrementally and yields text chunks of roughly that many characters
+  instead of allocating the entire escaped form of a large string up
+  front. Chunk boundaries never split a JSON escape sequence or a
+  Unicode surrogate escape pair, and the concatenated output is
+  identical to unchunked encoding
+
 Version 4.3.0 released 2026-11-10
 
 * The C encoder no longer crashes when ``default()`` or ``for_json()``
