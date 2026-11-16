@@ -77,6 +77,7 @@ def make_dict_unstructure_fn_from_attrs(
     _cattrs_use_linecache: bool = True,
     _cattrs_use_alias: bool | Literal["from_converter"] = "from_converter",
     _cattrs_include_init_false: bool = False,
+    _cattrs_self_type: Any = None,
     **kwargs: AttributeOverride,
 ) -> Callable[[T], dict[str, Any]]:
     """
@@ -96,6 +97,10 @@ def make_dict_unstructure_fn_from_attrs(
         dictionary key by default.
     :param _cattrs_include_init_false: If true, _attrs_ fields marked as `init=False`
         will be included.
+    :param _cattrs_self_type: The type to substitute for `typing.Self` in field
+        annotations. Defaults to `cl`; should be the fully-parameterized type when
+        generating hooks for a generic class, so recursive fields keep their
+        actual type arguments.
 
     .. versionadded:: 24.1.0
     .. versionchanged:: 25.2.0
@@ -108,7 +113,13 @@ def make_dict_unstructure_fn_from_attrs(
         When `_cattrs_omit_if_default` is true and the attribute has an attrs converter
         specified, the converter is applied to the default value before checking if it
         is equal to the attribute's value.
+    .. versionchanged:: NEXT
+        `typing.Self` in fields of generic classes is now resolved to the
+        fully-parameterized type.
     """
+
+    if _cattrs_self_type is None:
+        _cattrs_self_type = cl
 
     fn_name = "unstructure_" + cl.__name__
     globs = {}
@@ -160,7 +171,7 @@ def make_dict_unstructure_fn_from_attrs(
                     else:
                         handler = converter.unstructure
                 elif is_generic(t) and not is_bare(t) and not is_annotated(t):
-                    t = deep_copy_with(t, typevar_map, cl)
+                    t = deep_copy_with(t, typevar_map, _cattrs_self_type)
 
                 if handler is None:
                     if (
@@ -296,6 +307,7 @@ def make_dict_unstructure_fn(
     if _cattrs_use_alias == "from_converter":
         # BaseConverter doesn't have it so we're careful.
         _cattrs_use_alias = getattr(converter, "use_alias", False)
+    self_type = cl
     if is_generic(cl):
         mapping = generate_mapping(cl, mapping)
 
@@ -324,6 +336,7 @@ def make_dict_unstructure_fn(
             _cattrs_use_linecache=_cattrs_use_linecache,
             _cattrs_use_alias=_cattrs_use_alias,
             _cattrs_include_init_false=_cattrs_include_init_false,
+            _cattrs_self_type=self_type,
             **kwargs,
         )
     finally:
@@ -345,6 +358,7 @@ def make_dict_structure_fn_from_attrs(
     _cattrs_detailed_validation: bool | Literal["from_converter"] = "from_converter",
     _cattrs_use_alias: bool | Literal["from_converter"] = "from_converter",
     _cattrs_include_init_false: bool = False,
+    _cattrs_self_type: Any = None,
     **kwargs: AttributeOverride,
 ) -> SimpleStructureHook[Mapping[str, Any], T]:
     """
@@ -367,6 +381,10 @@ def make_dict_structure_fn_from_attrs(
         dictionary key by default.
     :param _cattrs_include_init_false: If true, _attrs_ fields marked as `init=False`
         will be included.
+    :param _cattrs_self_type: The type to substitute for `typing.Self` in field
+        annotations. Defaults to `cl`; should be the fully-parameterized type when
+        generating hooks for a generic class, so recursive fields keep their
+        actual type arguments.
 
     .. versionadded:: 24.1.0
     .. versionchanged:: 25.2.0
@@ -375,7 +393,13 @@ def make_dict_structure_fn_from_attrs(
     .. versionchanged:: 26.1.0
         `typing.Annotated[T, override()]` is now recognized and can be used to customize
         unstructuring.
+    .. versionchanged:: NEXT
+        `typing.Self` in fields of generic classes is now resolved to the
+        fully-parameterized type.
     """
+
+    if _cattrs_self_type is None:
+        _cattrs_self_type = cl
 
     cl_name = cl.__name__
     fn_name = "structure_" + cl_name
@@ -445,7 +469,7 @@ def make_dict_structure_fn_from_attrs(
             if isinstance(t, TypeVar):
                 t = typevar_map.get(t.__name__, t)
             elif is_generic(t) and not is_bare(t) and not is_annotated(t):
-                t = deep_copy_with(t, typevar_map, cl)
+                t = deep_copy_with(t, typevar_map, _cattrs_self_type)
 
             # For each attribute, we try resolving the type here and now.
             # If a type is manually overwritten, this function should be
@@ -589,7 +613,7 @@ def make_dict_structure_fn_from_attrs(
             if isinstance(t, TypeVar):
                 t = typevar_map.get(t.__name__, t)
             elif is_generic(t) and not is_bare(t) and not is_annotated(t):
-                t = deep_copy_with(t, typevar_map, cl)
+                t = deep_copy_with(t, typevar_map, _cattrs_self_type)
 
             # For each attribute, we try resolving the type here and now.
             # If a type is manually overwritten, this function should be
@@ -657,7 +681,7 @@ def make_dict_structure_fn_from_attrs(
                 if isinstance(t, TypeVar):
                     t = typevar_map.get(t.__name__, t)
                 elif is_generic(t) and not is_bare(t) and not is_annotated(t):
-                    t = deep_copy_with(t, typevar_map, cl)
+                    t = deep_copy_with(t, typevar_map, _cattrs_self_type)
 
                 # For each attribute, we try resolving the type here and now.
                 # If a type is manually overwritten, this function should be
@@ -808,6 +832,7 @@ def make_dict_structure_fn(
     """
 
     mapping = {}
+    self_type = cl
     if is_generic(cl):
         base = get_origin(cl)
         mapping = generate_mapping(cl, mapping)
@@ -846,6 +871,7 @@ def make_dict_structure_fn(
             _cattrs_detailed_validation=_cattrs_detailed_validation,
             _cattrs_use_alias=_cattrs_use_alias,
             _cattrs_include_init_false=_cattrs_include_init_false,
+            _cattrs_self_type=self_type,
             **kwargs,
         )
     finally:

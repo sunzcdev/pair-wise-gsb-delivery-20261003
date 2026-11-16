@@ -64,6 +64,7 @@ def make_dict_unstructure_fn(
     req_keys = _required_keys(origin or cl)
 
     mapping = {}
+    self_type = cl
     if is_generic(cl):
         mapping = generate_mapping(cl, mapping)
 
@@ -124,7 +125,7 @@ def make_dict_unstructure_fn(
                     # Unbound typevars use late binding.
                     handler = converter.unstructure
             elif is_generic(t) and not is_bare(t) and not is_annotated(t):
-                t = deep_copy_with(t, mapping, cl)
+                t = deep_copy_with(t, mapping, self_type)
 
             if handler is None:
                 try:
@@ -177,7 +178,7 @@ def make_dict_unstructure_fn(
                     else:
                         handler = converter.unstructure
                 elif is_generic(t) and not is_bare(t) and not is_annotated(t):
-                    t = deep_copy_with(t, mapping, cl)
+                    t = deep_copy_with(t, mapping, self_type)
 
                 if handler is None:
                     try:
@@ -261,9 +262,67 @@ def make_dict_structure_fn(
     ..  versionchanged:: 23.2.0
         The `_cattrs_forbid_extra_keys` and `_cattrs_detailed_validation` parameters
         take their values from the given converter by default.
+    ..  versionchanged:: NEXT
+        Recursive (also generic) TypedDicts are now detected directly instead of
+        relying on Python's recursion limit.
+    """
+    # We keep track of what we're generating to help with recursive
+    # class graphs.
+    working_set_key = get_origin(cl) or cl
+    try:
+        working_set = already_generating.working_set
+    except AttributeError:
+        working_set = set()
+        already_generating.working_set = working_set
+    else:
+        if working_set_key in working_set:
+            raise RecursionError()
+
+    working_set.add(working_set_key)
+
+    try:
+        return _make_dict_structure_fn(
+            cl,
+            converter,
+            _cattrs_forbid_extra_keys=_cattrs_forbid_extra_keys,
+            _cattrs_use_linecache=_cattrs_use_linecache,
+            _cattrs_detailed_validation=_cattrs_detailed_validation,
+            **kwargs,
+        )
+    finally:
+        working_set.remove(working_set_key)
+        if not working_set:
+            del already_generating.working_set
+
+
+def _make_dict_structure_fn(
+    cl: Any,
+    converter: BaseConverter,
+    _cattrs_forbid_extra_keys: bool | Literal["from_converter"] = "from_converter",
+    _cattrs_use_linecache: bool = True,
+    _cattrs_detailed_validation: bool | Literal["from_converter"] = "from_converter",
+    **kwargs: AttributeOverride,
+) -> Callable[[dict, Any], Any]:
+    """Generate a specialized dict structuring function for typed dicts.
+
+    :param cl: A `TypedDict` class.
+    :param converter: A Converter instance to use for structuring nested fields.
+    :param kwargs: A mapping of field names to an `AttributeOverride`, for
+        customization.
+    :param _cattrs_detailed_validation: Whether to use a slower mode that produces
+        more detailed errors.
+    :param _cattrs_forbid_extra_keys: Whether the structuring function should raise a
+        `ForbiddenExtraKeysError` if unknown keys are encountered.
+    :param _cattrs_detailed_validation: Whether to store the generated code in the
+        _linecache_, for easier debugging and better stack traces.
+
+    ..  versionchanged:: 23.2.0
+        The `_cattrs_forbid_extra_keys` and `_cattrs_detailed_validation` parameters
+        take their values from the given converter by default.
     """
 
     mapping = {}
+    self_type = cl
     if is_generic(cl):
         base = get_origin(cl)
         mapping = generate_mapping(cl, mapping)
@@ -352,10 +411,10 @@ def make_dict_structure_fn(
             if isinstance(t, TypeVar):
                 t = mapping.get(t.__name__, t)
             elif is_generic(t) and not is_bare(t) and not is_annotated(t):
-                t = deep_copy_with(t, mapping, cl)
+                t = deep_copy_with(t, mapping, self_type)
 
             if is_generic(t) and not is_bare(t) and not is_annotated(t):
-                t = deep_copy_with(t, mapping, cl)
+                t = deep_copy_with(t, mapping, self_type)
 
             # For each attribute, we try resolving the type here and now.
             # If a type is manually overwritten, this function should be
@@ -432,7 +491,7 @@ def make_dict_structure_fn(
             if isinstance(t, TypeVar):
                 t = mapping.get(t.__name__, t)
             elif is_generic(t) and not is_bare(t) and not is_annotated(t):
-                t = deep_copy_with(t, mapping, cl)
+                t = deep_copy_with(t, mapping, self_type)
 
             nrb = get_notrequired_base(t)
             if nrb is not NOTHING:
@@ -484,7 +543,7 @@ def make_dict_structure_fn(
                 if isinstance(t, TypeVar):
                     t = mapping.get(t.__name__, t)
                 elif is_generic(t) and not is_bare(t) and not is_annotated(t):
-                    t = deep_copy_with(t, mapping, cl)
+                    t = deep_copy_with(t, mapping, self_type)
 
                 if override.struct_hook is not None:
                     handler = override.struct_hook
