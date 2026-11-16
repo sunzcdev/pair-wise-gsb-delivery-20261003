@@ -405,3 +405,74 @@ to guess the most relevant error in a given bunch.
 
 .. autofunction:: by_relevance
     :noindex:
+
+
+Projecting missing properties
+-----------------------------
+
+Errors from the :kw:`required` and :kw:`dependentRequired` keywords describe
+an object which is *missing* a member, so their `ValidationError.path` points
+at the parent object rather than at the missing field -- there is no instance
+element at the missing location to point at. When presenting errors in an
+interface that highlights or fixes each missing field one by one, it is
+therefore convenient to have an addressable entry per missing member.
+
+`project_missing_properties` provides this as an independent view. It does
+not modify the errors produced by a validator, so iterating
+`jsonschema.protocols.Validator.iter_errors` (and `best_match`) behave
+exactly as before. Each projected `MissingProperty` keeps a reference to the
+original error it was derived from.
+
+.. testcode::
+
+    from jsonschema.exceptions import project_missing_properties
+
+    schema = {
+        "required": ["name"],
+        "dependentRequired": {"billing": ["tax_identifier"]},
+    }
+    instance = {"billing": True}
+
+    errors = list(Draft202012Validator(schema).iter_errors(instance))
+    for branch in project_missing_properties(errors):
+        for missing in branch.properties:
+            print(missing.name, missing.parent_pointer, missing.trigger)
+
+.. testoutput::
+
+    name  None
+    tax_identifier  billing
+
+A `MissingProperty` records the location of the parent object both as a
+tuple of path elements (`MissingProperty.parent_path`, where array indices
+stay integers and object keys stay strings) and as an RFC 6901 JSON Pointer
+(`MissingProperty.parent_pointer`, with ``~`` and ``/`` escaped in property
+names). The missing member's name is kept separate, and
+`MissingProperty.pointer` shows where it *would* be located if present. It
+must not be treated as the path of an existing instance element.
+
+When missing-member errors occur inside a combining keyword such as
+:kw:`anyOf`, :kw:`oneOf` or :kw:`allOf`, they are grouped per subschema
+branch in a `MissingPropertyBranch`, whose
+`~MissingPropertyBranch.branch` attribute records the
+``(keyword, subschema index)`` path used to reach them.
+
+.. autoclass:: MissingProperty
+    :noindex:
+    :members:
+
+.. autoclass:: MissingPropertyBranch
+    :noindex:
+    :members:
+
+.. autofunction:: project_missing_properties
+    :noindex:
+
+.. autofunction:: iter_missing_properties
+    :noindex:
+
+.. autofunction:: escape_json_pointer
+    :noindex:
+
+.. autofunction:: to_json_pointer
+    :noindex:

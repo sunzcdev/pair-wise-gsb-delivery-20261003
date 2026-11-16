@@ -15,6 +15,32 @@ from attrs import define
 from referencing.exceptions import Unresolvable as _Unresolvable
 
 from jsonschema import _utils
+from jsonschema._missing_properties import (
+    MissingProperty,
+    MissingPropertyBranch,
+    escape_json_pointer,
+    iter_missing_properties,
+    project_missing_properties,
+    to_json_pointer,
+)
+
+__all__ = [
+    "ErrorTree",
+    "FormatError",
+    "MissingProperty",
+    "MissingPropertyBranch",
+    "SchemaError",
+    "UndefinedTypeCheck",
+    "UnknownType",
+    "ValidationError",
+    "best_match",
+    "by_relevance",
+    "escape_json_pointer",
+    "iter_missing_properties",
+    "project_missing_properties",
+    "relevance",
+    "to_json_pointer",
+]
 
 if TYPE_CHECKING:
     from collections.abc import (

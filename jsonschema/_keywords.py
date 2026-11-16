@@ -1,6 +1,7 @@
 from fractions import Fraction
 import re
 
+from jsonschema._missing_properties import mark_missing_property
 from jsonschema._utils import (
     ensure_list,
     equal,
@@ -250,7 +251,11 @@ def dependentRequired(validator, dependentRequired, instance, schema):
         for each in dependency:
             if each not in instance:
                 message = f"{each!r} is a dependency of {property!r}"
-                yield ValidationError(message)
+                yield mark_missing_property(
+                    ValidationError(message),
+                    name=each,
+                    trigger=property,
+                )
 
 
 def dependentSchemas(validator, dependentSchemas, instance, schema):
@@ -307,7 +312,10 @@ def required(validator, required, instance, schema):
         return
     for property in required:
         if property not in instance:
-            yield ValidationError(f"{property!r} is a required property")
+            yield mark_missing_property(
+                ValidationError(f"{property!r} is a required property"),
+                name=property,
+            )
 
 
 def minProperties(validator, mP, instance, schema):

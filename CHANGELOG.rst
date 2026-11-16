@@ -1,6 +1,9 @@
 v4.27.0
 =======
 
+* Add an independent projection of ``required`` and ``dependentRequired`` errors onto addressable, per-missing-member entries via ``jsonschema.exceptions.project_missing_properties`` and ``iter_missing_properties``.
+  Each ``MissingProperty`` records the parent object's location (both as path elements and as an RFC 6901 JSON Pointer), the missing member name, the triggering dependency (for ``dependentRequired``) and the original ``ValidationError``; errors nested in combining keywords are grouped per subschema branch.
+  The original errors (including their iteration and ``best_match``) are unchanged.
 * Support for Python 3.10 and 3.11 has been dropped.
 * Improve ``best_match`` for ``anyOf`` / ``oneOf`` errors: the most relevant error is now found within each subschema separately before the deepest of those is picked (#1257, #1300).
   In particular an applicator with a single subschema now produces the same best match as the bare subschema would.
