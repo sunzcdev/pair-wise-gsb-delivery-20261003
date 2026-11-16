@@ -380,6 +380,10 @@ Abstract sets are now structured into frozensets instead of sets.
 Both [_total_ and _non-total_](https://peps.python.org/pep-0589/#totality) TypedDicts are supported, and inheritance between any combination works.
 Generic TypedDicts work on Python 3.11 and later, since that is the first Python version that supports them in general.
 
+```{versionchanged} NEXT
+TypedDicts are now also supported by {class}`BaseConverter <cattrs.BaseConverter>`, with the same handling of `Required`/`NotRequired`, inheritance and totality as {class}`Converter <cattrs.Converter>`.
+```
+
 [`typing.Required` and `typing.NotRequired`](https://peps.python.org/pep-0655/) are supported.
 
 :::{caution}

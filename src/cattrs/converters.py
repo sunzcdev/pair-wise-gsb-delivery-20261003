@@ -267,6 +267,7 @@ class BaseConverter:
                     True,
                 ),
                 (is_mapping, self._unstructure_mapping),
+                (is_typeddict, self.gen_unstructure_typeddict, True),
                 (is_sequence, self._unstructure_seq),
                 (is_mutable_set, self._unstructure_seq),
                 (is_frozenset, self._unstructure_seq),
@@ -313,6 +314,7 @@ class BaseConverter:
                 (is_tuple, self._structure_tuple),
                 (is_namedtuple, namedtuple_structure_factory, "extended"),
                 (is_mapping, self._structure_dict),
+                (is_typeddict, self.gen_structure_typeddict, True),
                 *(
                     [
                         (
@@ -946,6 +948,22 @@ class BaseConverter:
         val_conv = self._structure_func.dispatch(val_type)
         return {key_conv(k, key_type): val_conv(v, val_type) for k, v in obj.items()}
 
+    def gen_unstructure_typeddict(self, cl: Any) -> Callable[[dict], dict]:
+        """Generate a TypedDict unstructure function.
+
+        Also apply converter-scored modifications.
+        """
+        return make_typeddict_dict_unstruct_fn(cl, self)
+
+    def gen_structure_typeddict(self, cl: Any) -> Callable[[dict, Any], dict]:
+        """Generate a TypedDict structure function.
+
+        Also apply converter-scored modifications.
+        """
+        return make_typeddict_dict_struct_fn(
+            cl, self, _cattrs_detailed_validation=self.detailed_validation
+        )
+
     def _structure_optional(self, obj, union):
         if obj is None:
             return None
@@ -1242,6 +1260,9 @@ class Converter(BaseConverter):
         self.register_unstructure_hook_factory(
             is_optional, self.gen_unstructure_optional
         )
+        # Re-register the TypedDict factories (also registered on
+        # `BaseConverter`) so they take precedence over the mapping
+        # factories registered above.
         self.register_unstructure_hook_factory(
             is_typeddict, self.gen_unstructure_typeddict
         )
@@ -1259,6 +1280,9 @@ class Converter(BaseConverter):
         self.register_structure_hook_factory(
             is_defaultdict, defaultdict_structure_factory
         )
+        # Re-register the TypedDict factory (also registered on
+        # `BaseConverter`) so it takes precedence over the mapping
+        # factories registered above.
         self.register_structure_hook_factory(is_typeddict, self.gen_structure_typeddict)
         if AnnotationForwardRef is not None:
             self.register_structure_hook_factory(
@@ -1331,13 +1355,6 @@ class Converter(BaseConverter):
         hook = self.get_structure_hook(origin)
         return lambda v, _: hook(v, origin)
 
-    def gen_unstructure_typeddict(self, cl: Any) -> Callable[[dict], dict]:
-        """Generate a TypedDict unstructure function.
-
-        Also apply converter-scored modifications.
-        """
-        return make_typeddict_dict_unstruct_fn(cl, self)
-
     def gen_unstructure_attrs_fromdict(
         self, cl: type[T]
     ) -> Callable[[T], dict[str, Any]]:
@@ -1374,15 +1391,6 @@ class Converter(BaseConverter):
             return None if val is None else _handler(val)
 
         return unstructure_optional
-
-    def gen_structure_typeddict(self, cl: Any) -> Callable[[dict, Any], dict]:
-        """Generate a TypedDict structure function.
-
-        Also apply converter-scored modifications.
-        """
-        return make_typeddict_dict_struct_fn(
-            cl, self, _cattrs_detailed_validation=self.detailed_validation
-        )
 
     def gen_structure_attrs_fromdict(
         self, cl: type[T]

@@ -1,14 +1,14 @@
 """Tests for TypedDict un/structuring."""
 
 from datetime import datetime, timezone
-from typing import Generic, NewType, TypedDict, TypeVar
+from typing import Generic, NewType, Optional, TypedDict, TypeVar
 
 import pytest
 from attrs import NOTHING
 from hypothesis import assume, given
 from hypothesis.strategies import booleans
 from pytest import raises
-from typing_extensions import NotRequired, Required
+from typing_extensions import Annotated, NotRequired, Required
 
 from cattrs import BaseConverter, Converter, transform_error
 from cattrs._compat import ExtensionsTypedDict, get_notrequired_base, is_generic
@@ -534,3 +534,117 @@ def test_nondict_input():
     assert transform_error(exc.value) == [
         "invalid type (expected a mapping, not list) @ $"
     ]
+
+
+def test_missing_not_required_stays_missing(converter: BaseConverter):
+    """Missing `NotRequired` fields stay missing, and are not merged with
+    fields explicitly set to `None`."""
+    now = datetime.now(tz=timezone.utc)
+    converter.register_unstructure_hook(datetime, lambda d: d.timestamp())
+    converter.register_structure_hook(
+        datetime, lambda d, _: datetime.fromtimestamp(d, tz=timezone.utc)
+    )
+
+    class A(ExtensionsTypedDict):
+        a: datetime
+        b: NotRequired[datetime]
+        c: NotRequired[Optional[datetime]]
+
+    structured = converter.structure({"a": now.timestamp(), "c": None}, A)
+
+    assert "b" not in structured
+    assert "c" in structured
+    assert structured["c"] is None
+
+    unstructured = converter.unstructure(structured, A)
+
+    # Unstructuring must not manufacture nulls to produce a fixed key set.
+    assert "b" not in unstructured
+    assert "c" in unstructured
+    assert unstructured["c"] is None
+    assert unstructured == {"a": now.timestamp(), "c": None}
+
+
+def test_inheritance_total_false(converter: BaseConverter):
+    """`Required`/`NotRequired`, inheritance and `total=False` are handled
+    the same by all converters."""
+    now = datetime.now(tz=timezone.utc)
+    converter.register_unstructure_hook(datetime, lambda d: d.timestamp())
+    converter.register_structure_hook(
+        datetime, lambda d, _: datetime.fromtimestamp(d, tz=timezone.utc)
+    )
+
+    class Base(ExtensionsTypedDict, total=False):
+        a: Required[datetime]
+        b: int
+
+    class Child(Base):
+        c: NotRequired[datetime]
+
+    structured = converter.structure({"a": now.timestamp()}, Child)
+
+    assert structured == {"a": now}
+    assert "b" not in structured
+    assert "c" not in structured
+
+    unstructured = converter.unstructure(structured, Child)
+
+    assert unstructured == {"a": now.timestamp()}
+
+
+def test_annotated_typeddict(converter: BaseConverter):
+    """Requiredness is recognized through `Annotated` wrappers."""
+
+    class A(ExtensionsTypedDict):
+        a: int
+        b: NotRequired[int]
+
+    assert converter.structure({"a": "1"}, Annotated[A, "metadata"]) == {"a": 1}
+    assert converter.unstructure({"a": 1}, Annotated[A, "metadata"]) == {"a": 1}
+
+
+def test_typeddict_alias(converter: BaseConverter):
+    """Requiredness is recognized through type aliases."""
+
+    class A(ExtensionsTypedDict):
+        a: int
+        b: NotRequired[int]
+
+    Alias = A
+
+    assert converter.structure({"a": "1"}, Alias) == {"a": 1}
+    assert converter.unstructure({"a": 1}, Alias) == {"a": 1}
+
+
+def test_missing_required_error(converter: BaseConverter):
+    """Missing required fields produce located errors, and the input
+    dictionary is not mutated."""
+
+    class A(ExtensionsTypedDict):
+        a: int
+        b: str
+
+    inp = {"a": 1}
+
+    if converter.detailed_validation:
+        with raises(ClassValidationError) as exc:
+            converter.structure(inp, A)
+
+        assert transform_error(exc.value) == ["required field missing @ $.b"]
+    else:
+        with raises(KeyError):
+            converter.structure(inp, A)
+
+    assert inp == {"a": 1}
+
+
+def test_extra_keys_kept_by_default(converter: BaseConverter):
+    """Extra keys are preserved when `forbid_extra_keys` is not set."""
+
+    class A(ExtensionsTypedDict):
+        a: int
+
+    inp = {"a": 1, "extra": 2}
+
+    assert converter.structure(inp, A) == {"a": 1, "extra": 2}
+    assert converter.unstructure(inp, A) == {"a": 1, "extra": 2}

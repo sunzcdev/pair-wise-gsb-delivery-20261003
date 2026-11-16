@@ -13,6 +13,9 @@ Our backwards-compatibility policy can be found [here](https://github.com/python
 
 ## NEXT
 
+- {class}`BaseConverter <cattrs.BaseConverter>` now handles TypedDicts with the same specialized hooks as {class}`Converter <cattrs.Converter>`, unifying the handling of `Required`/`NotRequired`, inheritance and `total=False` between the generated and non-generated paths.
+  Missing `NotRequired` fields stay missing (and are not conflated with fields explicitly set to `None`), unstructuring no longer falls back to a plain mapping copy, and `Annotated`-wrapped TypedDicts are recognized on both converters.
+
 - Fix the msgspec converter passing typed deques directly to the encoder, which cannot serialize them. Deques are now unstructured into lists, including when nested in attrs classes or dataclasses.
   ([#818](https://github.com/python-attrs/cattrs/issues/818) [#819](https://github.com/python-attrs/cattrs/pull/819))
 

@@ -10,6 +10,7 @@ from attrs import NOTHING, Attribute
 from typing_extensions import _TypedDictMeta
 
 from .._compat import (
+    get_args,
     get_full_type_hints,
     get_notrequired_base,
     get_origin,
@@ -59,6 +60,10 @@ def make_dict_unstructure_fn(
     :param _cattrs_detailed_validation: Whether to store the generated code in the
         _linecache_, for easier debugging and better stack traces.
     """
+    if is_annotated(cl):
+        # Annotated TypedDicts are treated like their underlying type.
+        cl = get_args(cl)[0]
+
     origin = get_origin(cl)
     attrs = _adapted_fields(origin or cl)  # type: ignore
     req_keys = _required_keys(origin or cl)
@@ -262,6 +267,9 @@ def make_dict_structure_fn(
         The `_cattrs_forbid_extra_keys` and `_cattrs_detailed_validation` parameters
         take their values from the given converter by default.
     """
+    if is_annotated(cl):
+        # Annotated TypedDicts are treated like their underlying type.
+        cl = get_args(cl)[0]
 
     mapping = {}
     if is_generic(cl):
