@@ -13,6 +13,20 @@ Unreleased
 
 **Features:**
 
+- ``chardet.detect_segments()`` is a new opt-in interface for files
+  that concatenate several texts in different encodings, where a
+  single whole-input verdict would hide the switches.  It runs the
+  detection pipeline over bounded windows (``window_size``/``step``,
+  sampled from at most ``max_bytes`` of the input) and returns a
+  ``SegmentReport``: each window's candidate ranking plus the byte
+  offsets where the winning encoding changes.  A multi-byte sequence
+  clipped by a window edge is not, on its own, evidence of a change,
+  and pure-ASCII windows ground no change either.  The report covers
+  only the sampled windows and never decodes the input into one
+  string --- which spans to convert, and with which candidate, remains
+  the caller's decision.  ``detect()`` still returns a single result.
+  (`Dan Blanchard <https://github.com/dan-blanchard>`_ via Claude)
+
 - ``chardetect`` has two new flags.  ``--prefer-superset`` reports a
   detected subset encoding under its Windows code page, like
   ``Windows-1253`` for ISO-8859-7 text, the same as

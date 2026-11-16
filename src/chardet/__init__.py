@@ -10,18 +10,31 @@ from chardet._version import __version__
 from chardet.detector import UniversalDetector
 from chardet.enums import EncodingEra, LanguageFilter
 from chardet.pipeline import DetectionDict, DetectionResult
+from chardet.segments import (
+    DEFAULT_WINDOW_SIZE,
+    EncodingChange,
+    Segment,
+    SegmentReport,
+    _validate_window,
+    run_segmented_detection,
+)
 
 __all__ = [
     "DEFAULT_MAX_BYTES",
+    "DEFAULT_WINDOW_SIZE",
     "MINIMUM_THRESHOLD",
     "DetectionDict",
     "DetectionResult",
+    "EncodingChange",
     "EncodingEra",
     "LanguageFilter",
+    "Segment",
+    "SegmentReport",
     "UniversalDetector",
     "__version__",
     "detect",
     "detect_all",
+    "detect_segments",
 ]
 
 
@@ -188,3 +201,85 @@ def detect_all(  # noqa: PLR0913
         all_results=True,
         ignore_threshold=ignore_threshold,
     )
+
+
+def detect_segments(  # noqa: PLR0913
+    byte_str: bytes | bytearray,
+    window_size: int = DEFAULT_WINDOW_SIZE,
+    step: int | None = None,
+    encoding_era: EncodingEra = EncodingEra.ALL,
+    max_bytes: int = DEFAULT_MAX_BYTES,
+    *,
+    prefer_superset: bool = False,
+    compat_names: bool = True,
+    include_encodings: Iterable[str] | None = None,
+    exclude_encodings: Iterable[str] | None = None,
+    no_match_encoding: str = "cp1252",
+    empty_input_encoding: str = "utf-8",
+) -> SegmentReport:
+    """Detect encodings window by window, for concatenated inputs.
+
+    A harvested file is sometimes several texts in different encodings
+    concatenated into one byte stream, and a single whole-input verdict
+    hides that: the dominant region wins and the rest is mislabeled.
+    This function is the opt-in alternative to :func:`detect`: it runs
+    the same detection pipeline independently over bounded windows of
+    the input and reports each window's candidate ranking plus the byte
+    offsets where the winning encoding changes.  It never decodes the
+    input into one string --- which spans to convert, and with which
+    candidate, remains the caller's decision.
+
+    The conclusions cover only the sampled windows: at most *max_bytes*
+    of *byte_str* is examined, and :attr:`SegmentReport.truncated` says
+    whether the input was longer.  Windows start at multiples of *step*
+    and span up to *window_size* bytes; both default to
+    :data:`DEFAULT_WINDOW_SIZE` (non-overlapping).
+
+    Two rules keep window-boundary artifacts from reading as switches:
+    a multi-byte sequence clipped by a window edge is not, on its own,
+    evidence of an encoding change (weak verdicts and isolated
+    one-window deviations ground no change), and a pure-ASCII window
+    grounds no change either, since ASCII decodes identically under
+    every candidate.
+
+    :param byte_str: The byte sequence to detect encodings for.
+    :param window_size: Maximum bytes examined per window.
+    :param step: Distance between window starts.  Defaults to
+        *window_size* (non-overlapping windows).  A smaller *step*
+        overlaps windows, which localizes changes more precisely at
+        proportionally higher cost.
+    :param encoding_era: Restrict candidate encodings to the given era.
+    :param max_bytes: Maximum number of bytes to sample from *byte_str*.
+    :param prefer_superset: If ``True``, remap subset encodings in the
+        per-window candidates to their decode-safe Windows/CP superset
+        equivalents.  If ``False`` (default), skip the renaming.  See
+        :func:`detect` for details.
+    :param compat_names: If ``True`` (default), report encoding names
+        compatible with chardet 5.x/6.x.  If ``False``, report raw
+        Python codec names.
+    :param include_encodings: If given, restrict detection to only these
+        encodings (names or aliases).
+    :param exclude_encodings: If given, remove these encodings from the
+        candidate set.
+    :param no_match_encoding: Encoding to report for a window where no
+        candidate survives the pipeline.  Defaults to ``"cp1252"``.
+    :param empty_input_encoding: Encoding to report for empty windows
+        (only reachable for empty input, which yields no windows).
+    :returns: A :class:`SegmentReport` with one :class:`Segment` per
+        window and the :class:`EncodingChange` offsets derived from
+        their verdicts.
+    """
+    effective_step = _validate_window(window_size, step)
+    request = DetectionRequest.resolve(
+        encoding_era=encoding_era,
+        max_bytes=max_bytes,
+        prefer_superset=prefer_superset,
+        compat_names=compat_names,
+        include_encodings=include_encodings,
+        exclude_encodings=exclude_encodings,
+        no_match_encoding=no_match_encoding,
+        empty_input_encoding=empty_input_encoding,
+        stacklevel=3,
+    )
+    data = byte_str if isinstance(byte_str, bytes) else bytes(byte_str)
+    return run_segmented_detection(request, data, window_size, effective_step)
