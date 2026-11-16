@@ -7,7 +7,7 @@ from collections import Counter, defaultdict, deque
 from collections.abc import Sequence
 from contextlib import suppress
 from functools import cached_property, partial, wraps
-from heapq import heapify, heapreplace
+from heapq import heapify, heappop, heappush, heapreplace
 from itertools import (
     chain,
     combinations,
@@ -170,6 +170,7 @@ __all__ = [
     'synchronized',
     'takewhile_inclusive',
     'time_limited',
+    'unique_in_event_window',
     'unique_in_window',
     'unique_to_each',
     'unzip',
@@ -4783,6 +4784,99 @@ def unique_in_window(iterable, n, key=None):
             yield item
         counts[k] += 1
         window.append(k)
+
+
+def unique_in_event_window(iterable, span, time, key=None, *, max_lateness=0):
+    """Yield the items from *iterable* whose keys have not been seen within
+    the last *span* of event time.
+
+    *time* is a function that returns the event time of an item, and *key*
+    is a function that returns the identity used for de-duplication:
+
+        >>> records = [('a', 0), ('b', 1), ('a', 2), ('c', 3), ('a', 6)]
+        >>> list(unique_in_event_window(
+        ...     records, 3, time=lambda r: r[1], key=lambda r: r[0]
+        ... ))
+        [('a', 0), ('b', 1), ('c', 3), ('a', 6)]
+
+    A *watermark* tracks the highest event time observed so far. A key
+    filters out duplicates while ``watermark - last_seen <= span``, where
+    *last_seen* is the most recent event time at which the key was
+    processed. Whenever an occurrence of a key is processed - whether or
+    not it is yielded - the key's last-seen time is updated to the later
+    of its stored value and the record's event time. Keys are reclaimed
+    from the cache as the watermark advances past their last-seen time
+    plus *span*.
+
+    By default event times must be non-decreasing. Set *max_lateness* to
+    accept records that arrive up to that much behind the watermark; such
+    records are de-duplicated normally but never move the watermark
+    backwards:
+
+        >>> records = [('a', 0), ('b', 5), ('a', 2)]
+        >>> list(unique_in_event_window(
+        ...     records, 5, time=lambda r: r[1], key=lambda r: r[0],
+        ...     max_lateness=4,
+        ... ))
+        [('a', 0), ('b', 5)]
+
+    Records arriving even later - with an event time below
+    ``watermark - max_lateness`` - are too late to de-duplicate reliably.
+    They are yielded as-is and update neither the watermark nor the cache,
+    so they never corrupt the state of on-time records:
+
+        >>> records = [('a', 0), ('b', 5), ('c', 1), ('c', 6)]
+        >>> list(unique_in_event_window(
+        ...     records, 5, time=lambda r: r[1], key=lambda r: r[0],
+        ...     max_lateness=2,
+        ... ))
+        [('a', 0), ('b', 5), ('c', 1), ('c', 6)]
+
+    If *key* is not provided, the items themselves are used as keys.
+    ``None`` and other "empty" keys are ordinary keys; they are not
+    conflated with one another or with missing keys.
+
+    The keys must be hashable. Event times must be orderable and must
+    support subtraction with *span* and *max_lateness*.
+
+    """
+    if span < 0:
+        raise ValueError('span must be non-negative')
+    if max_lateness < 0:
+        raise ValueError('max_lateness must be non-negative')
+
+    cache = {}
+    expiry = []
+    sequence = count()
+    watermark = _marker
+    use_key = key is not None
+
+    for item in iterable:
+        t = time(item)
+
+        if watermark is _marker or t > watermark:
+            # Advance the watermark and reclaim the expired keys.
+            watermark = t
+            cutoff = t - span
+            while expiry and expiry[0][0] < cutoff:
+                last_seen, _, expired_key = heappop(expiry)
+                if cache.get(expired_key, _marker) == last_seen:
+                    del cache[expired_key]
+        elif t < watermark - max_lateness:
+            # The record is too late: yield it without touching the
+            # watermark or the cache.
+            yield item
+            continue
+
+        k = key(item) if use_key else item
+        if k in cache:
+            if t > cache[k]:
+                cache[k] = t
+                heappush(expiry, (t, next(sequence), k))
+        else:
+            cache[k] = t
+            heappush(expiry, (t, next(sequence), k))
+            yield item
 
 
 def duplicates_everseen(iterable, key=None):

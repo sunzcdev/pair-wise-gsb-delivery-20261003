@@ -208,6 +208,7 @@ These tools yield certain items from an iterable.
 .. autofunction:: nth_or_last(iterable, n[, default])
 .. autofunction:: extract
 .. autofunction:: unique_in_window
+.. autofunction:: unique_in_event_window
 .. autofunction:: duplicates_everseen
 .. autofunction:: duplicates_justseen
 .. autofunction:: classify_unique

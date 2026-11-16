@@ -143,6 +143,7 @@ __all__ = [
     'synchronized',
     'takewhile_inclusive',
     'time_limited',
+    'unique_in_event_window',
     'unique_in_window',
     'unique_to_each',
     'unzip',
@@ -892,6 +893,14 @@ def zip_broadcast(
 ) -> Iterable[tuple[_T, ...]]: ...
 def unique_in_window(
     iterable: Iterable[_T], n: int, key: Callable[[_T], _U] | None = ...
+) -> Iterator[_T]: ...
+def unique_in_event_window(
+    iterable: Iterable[_T],
+    span: Any,
+    time: Callable[[_T], Any],
+    key: Callable[[_T], _U] | None = ...,
+    *,
+    max_lateness: Any = ...,
 ) -> Iterator[_T]: ...
 def duplicates_everseen(
     iterable: Iterable[_T], key: Callable[[_T], _U] | None = ...

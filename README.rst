@@ -106,6 +106,7 @@ Python iterables.
 |                        | `nth_or_last <https://more-itertools.readthedocs.io/en/stable/api.html#more_itertools.nth_or_last>`_,                                                                       |
 |                        | `extract <https://more-itertools.readthedocs.io/en/stable/api.html#more_itertools.extract>`_,                                                                               |
 |                        | `unique_in_window <https://more-itertools.readthedocs.io/en/stable/api.html#more_itertools.unique_in_window>`_,                                                             |
+|                        | `unique_in_event_window <https://more-itertools.readthedocs.io/en/stable/api.html#more_itertools.unique_in_event_window>`_,                                                 |
 |                        | `before_and_after <https://more-itertools.readthedocs.io/en/stable/api.html#more_itertools.before_and_after>`_,                                                             |
 |                        | `nth <https://more-itertools.readthedocs.io/en/stable/api.html#more_itertools.nth>`_,                                                                                       |
 |                        | `take <https://more-itertools.readthedocs.io/en/stable/api.html#more_itertools.take>`_,                                                                                     |

@@ -5834,6 +5834,178 @@ class UniqueInWindowTests(TestCase):
         self.assertEqual(actual, expected)
 
 
+class UniqueInEventWindowTests(TestCase):
+    def test_invalid_span(self):
+        with self.assertRaises(ValueError):
+            list(mi.unique_in_event_window([], -1, time=lambda x: x))
+
+    def test_invalid_max_lateness(self):
+        with self.assertRaises(ValueError):
+            list(
+                mi.unique_in_event_window(
+                    [], 1, time=lambda x: x, max_lateness=-1
+                )
+            )
+
+    def test_basic(self):
+        # (key, event time) records; span 3
+        records = [
+            ('a', 0),
+            ('b', 1),
+            ('a', 2),  # duplicate of ('a', 0) within the span
+            ('c', 3),
+            ('a', 6),  # 'a' last seen at 2; 6 - 2 > 3, so it expired
+        ]
+        actual = list(
+            mi.unique_in_event_window(
+                records, 3, time=lambda r: r[1], key=lambda r: r[0]
+            )
+        )
+        expected = [('a', 0), ('b', 1), ('c', 3), ('a', 6)]
+        self.assertEqual(actual, expected)
+
+    def test_boundary(self):
+        # A key seen exactly span ago still filters duplicates.
+        records = [('a', 0), ('b', 3), ('a', 3), ('a', 7)]
+        actual = list(
+            mi.unique_in_event_window(
+                records, 3, time=lambda r: r[1], key=lambda r: r[0]
+            )
+        )
+        expected = [('a', 0), ('b', 3), ('a', 7)]
+        self.assertEqual(actual, expected)
+
+    def test_last_seen_updates(self):
+        # Duplicates refresh the key's last-seen time, extending the
+        # span over which the key filters.
+        records = [('a', 0), ('a', 2), ('a', 4), ('a', 8)]
+        actual = list(
+            mi.unique_in_event_window(
+                records, 3, time=lambda r: r[1], key=lambda r: r[0]
+            )
+        )
+        expected = [('a', 0), ('a', 8)]
+        self.assertEqual(actual, expected)
+
+    def test_default_key(self):
+        # Without a key function the items themselves are the keys.
+        iterable = [0, 1, 1, 2, 3, 3]
+        actual = list(mi.unique_in_event_window(iterable, 1, time=lambda x: x))
+        expected = [0, 1, 2, 3]
+        self.assertEqual(actual, expected)
+
+    def test_none_and_empty_keys_not_conflated(self):
+        # None and other "empty" keys are ordinary keys.
+        records = [(None, 0), ('', 1), (None, 2), ('', 2), (None, 9)]
+        actual = list(
+            mi.unique_in_event_window(
+                records, 3, time=lambda r: r[1], key=lambda r: r[0]
+            )
+        )
+        expected = [(None, 0), ('', 1), (None, 9)]
+        self.assertEqual(actual, expected)
+
+    def test_strictly_monotonic_by_default(self):
+        # With max_lateness=0 any record behind the watermark is too
+        # late: it is yielded as-is and touches no state.
+        records = [('a', 0), ('b', 5), ('a', 2), ('a', 6)]
+        actual = list(
+            mi.unique_in_event_window(
+                records, 7, time=lambda r: r[1], key=lambda r: r[0]
+            )
+        )
+        # ('a', 2) is too late, so it neither filters nor refreshes 'a';
+        # ('a', 6) is then a duplicate of ('a', 0) within the span.
+        expected = [('a', 0), ('b', 5), ('a', 2)]
+        self.assertEqual(actual, expected)
+
+    def test_bounded_lateness(self):
+        # Records within max_lateness of the watermark are de-duplicated
+        # normally but do not advance the watermark.
+        records = [
+            ('a', 0),
+            ('b', 5),
+            ('a', 2),  # late but allowed; duplicate of ('a', 0)
+            ('c', 4),  # late but allowed; new key
+            ('b', 9),  # 'b' last seen at 5; 9 - 5 <= 5, still filtered
+        ]
+        actual = list(
+            mi.unique_in_event_window(
+                records, 5, time=lambda r: r[1], key=lambda r: r[0],
+                max_lateness=4,
+            )
+        )
+        expected = [('a', 0), ('b', 5), ('c', 4)]
+        self.assertEqual(actual, expected)
+
+    def test_late_record_does_not_advance_watermark(self):
+        # A late record for a new key is cached at its own event time and
+        # expires according to the watermark, not its arrival order.
+        records = [
+            ('a', 10),
+            ('b', 7),  # late but allowed; cached with last-seen 7
+            ('c', 13),  # watermark 13; 'b' expired since 13 - 7 > 5
+            ('b', 14),  # 'b' is new again
+        ]
+        actual = list(
+            mi.unique_in_event_window(
+                records, 5, time=lambda r: r[1], key=lambda r: r[0],
+                max_lateness=5,
+            )
+        )
+        expected = [('a', 10), ('b', 7), ('c', 13), ('b', 14)]
+        self.assertEqual(actual, expected)
+
+    def test_too_late_record_updates_nothing(self):
+        # A too-late record must not refresh its key's last-seen time.
+        records = [
+            ('a', 0),
+            ('b', 10),
+            ('a', 5),  # too late (5 < 10 - 4); yielded, no state change
+            ('a', 12),  # 'a' expired at watermark 12 (12 - 0 > 5)
+        ]
+        actual = list(
+            mi.unique_in_event_window(
+                records, 5, time=lambda r: r[1], key=lambda r: r[0],
+                max_lateness=4,
+            )
+        )
+        expected = [('a', 0), ('b', 10), ('a', 5), ('a', 12)]
+        self.assertEqual(actual, expected)
+
+    def test_late_duplicate_keeps_max_last_seen(self):
+        # A late duplicate refreshes the last-seen time to the later of
+        # the stored value and the record's event time.
+        records = [
+            ('a', 4),
+            ('b', 6),
+            ('a', 3),  # late duplicate; last-seen stays max(4, 3) == 4
+            ('a', 8),  # 8 - 4 > 3, so 'a' expired
+        ]
+        actual = list(
+            mi.unique_in_event_window(
+                records, 3, time=lambda r: r[1], key=lambda r: r[0],
+                max_lateness=4,
+            )
+        )
+        expected = [('a', 4), ('b', 6), ('a', 8)]
+        self.assertEqual(actual, expected)
+
+    def test_equal_event_times(self):
+        records = [('a', 1), ('b', 1), ('a', 1), ('b', 2)]
+        actual = list(
+            mi.unique_in_event_window(
+                records, 2, time=lambda r: r[1], key=lambda r: r[0]
+            )
+        )
+        expected = [('a', 1), ('b', 1)]
+        self.assertEqual(actual, expected)
+
+    def test_empty_iterable(self):
+        actual = list(mi.unique_in_event_window([], 3, time=lambda x: x))
+        self.assertEqual(actual, [])
+
+
 class StrictlyNTests(TestCase):
     def test_basic(self):
         iterable = ['a', 'b', 'c', 'd']
