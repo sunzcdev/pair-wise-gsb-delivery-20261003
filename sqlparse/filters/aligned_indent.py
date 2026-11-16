@@ -5,6 +5,8 @@
 # This module is part of python-sqlparse and is released under
 # the BSD License: https://opensource.org/licenses/BSD-3-Clause
 
+import copy
+
 from sqlparse import sql
 from sqlparse import tokens as T
 from sqlparse.utils import indent, offset
@@ -24,10 +26,23 @@ class AlignedIndentFilter:
 
     def __init__(self, char=' ', n='\n'):
         self.n = n
-        self.offset = 0
-        self.indent = 0
         self.char = char
         self._max_kwd_len = len('select')
+        # Per-run state, reset by new_session() for every run.
+        self.offset = 0
+        self.indent = 0
+
+    def _reset_session(self):
+        """Reset the state that belongs to a single run."""
+        self.offset = 0
+        self.indent = 0
+
+    def new_session(self):
+        """Return an independent instance for a single
+        :meth:`~sqlparse.engine.FilterStack.run`."""
+        session = copy.copy(self)
+        session._reset_session()
+        return session
 
     def nl(self, offset=1):
         # offset = 1 represent a single space after SELECT

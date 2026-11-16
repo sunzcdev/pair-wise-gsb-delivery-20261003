@@ -1,3 +1,18 @@
+Development Version
+-------------------
+
+Notable Changes
+
+* A `FilterStack` can now be reused across runs. Every call to
+  `FilterStack.run()` is a session with its own filter state: built-in
+  stateful filters (reindent, reindent_aligned, right_margin, the python
+  and php output formats) no longer leak state into the next run, and
+  runs that are consumed interleaved, abandoned or failed no longer affect
+  each other. Custom stateful filters opt in by implementing a
+  `new_session()` method. Filters without it keep working unchanged, but
+  their state remains shared between runs. See
+  "Reusing a FilterStack" in the documentation.
+
 Release 0.6.1 (Nov 01, 2026)
 ----------------------------
 

@@ -5,6 +5,7 @@
 # This module is part of python-sqlparse and is released under
 # the BSD License: https://opensource.org/licenses/BSD-3-Clause
 
+import copy
 import re
 
 from sqlparse import sql
@@ -20,6 +21,13 @@ class RightMarginFilter:
     def __init__(self, width=79):
         self.width = width
         self.line = ''
+
+    def new_session(self):
+        """Return an independent instance for a single
+        :meth:`~sqlparse.engine.FilterStack.run`."""
+        session = copy.copy(self)
+        session.line = ''
+        return session
 
     def _process(self, group, stream):
         for token in stream:

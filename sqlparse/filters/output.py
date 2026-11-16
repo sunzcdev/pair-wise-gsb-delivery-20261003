@@ -5,6 +5,8 @@
 # This module is part of python-sqlparse and is released under
 # the BSD License: https://opensource.org/licenses/BSD-3-Clause
 
+import copy
+
 from sqlparse import sql
 from sqlparse import tokens as T
 
@@ -15,6 +17,17 @@ class OutputFilter:
     def __init__(self, varname='sql'):
         self.varname = self.varname_prefix + varname
         self.count = 0
+
+    def new_session(self):
+        """Return an independent instance for a single
+        :meth:`~sqlparse.engine.FilterStack.run`.
+
+        The counter names the generated variables and must start over in
+        every run, otherwise a reused stack would continue with ``sql3``.
+        """
+        session = copy.copy(self)
+        session.count = 0
+        return session
 
     def _process(self, stream, varname, has_nl):
         raise NotImplementedError

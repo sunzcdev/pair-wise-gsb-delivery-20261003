@@ -84,3 +84,95 @@ a keyword to the lexer:
 
     # no configuration is passed here. The lexer is used as a singleton.
     sqlparse.parse("select * from foo zorder by bar;")
+
+
+.. _filter-stack:
+
+Reusing a FilterStack
+---------------------
+
+A :class:`~sqlparse.engine.FilterStack` applies a sequence of filters to a
+token stream. The module-level functions :func:`sqlparse.format`,
+:func:`sqlparse.parse` and :func:`sqlparse.split` build a fresh stack for
+every call, but a stack can also be built once and used for many inputs,
+for example when one formatter serves several files or requests:
+
+..  code-block:: python
+
+    from sqlparse import filters
+    from sqlparse.engine import FilterStack
+
+    stack = FilterStack()
+    stack.enable_grouping()
+    stack.postprocess.append(filters.SerializerUnicode())
+
+    for sql in ['select a from foo', 'select b from bar']:
+        print(''.join(stack.run(sql)))
+
+Every call to :meth:`~sqlparse.engine.FilterStack.run` is a *session*. A
+run that is consumed interleaved with another run, abandoned before its
+last statement, or that raises halfway through does not affect any other
+run of the same stack, and a later run starts from a clean state. In
+particular a filter's state may not be observed across sessions: for
+example, the reindent filter does not keep the last statement of a
+previous run, and the python and php output filters name their variables
+``sql``, ``sql2``, ... starting over in every run.
+
+Filters that keep state for the duration of one run therefore implement a
+``new_session()`` method. It is called once per run and per filter instance,
+and returns the object that handles that run. The filters in
+:mod:`sqlparse.filters` that keep state do this already. A custom filter
+follows the same pattern:
+
+..  code-block:: python
+
+    class CountStatementsFilter:
+        def __init__(self):
+            self.count = 0
+
+        def new_session(self):
+            # called once when a run starts, so every run starts at zero
+            return CountStatementsFilter()
+
+        def process(self, stmt):
+            self.count += 1
+            return stmt
+
+The session instance is a plain object: it is not required to be a copy of
+the filter itself, and the stack never copies filter attributes on its own.
+A filter that returns ``None`` from ``new_session()`` is rejected with a
+:exc:`TypeError`, and declaring ``new_session = None`` opts out explicitly.
+
+..  important::
+
+   Filters that don't declare ``new_session()`` are used as they are and
+   keep the behaviour they had before sessions were introduced. This keeps
+   custom filters working, but it also means that such a filter's state is
+   shared by all runs of the stack and survives an abandoned or failed run.
+   If a filter keeps state that belongs to a single input, it must declare
+   ``new_session()`` to be safe to reuse.
+
+Token streams created by preprocessing filters are closed when the run
+finishes, also when it is abandoned or fails. Only generator objects are
+closed; a filter that returns another kind of iterable is responsible for
+it itself.
+
+Because the state belongs to the run, a failed run does not have to be
+discarded along with the stack:
+
+..  code-block:: python
+
+    from sqlparse.exceptions import SQLParseError
+
+    sql = 'select a, b from foo'
+    try:
+        for stmt in stack.run(sql):
+            process(stmt)
+    except SQLParseError:
+        # The failed run is over; the stack is not left in a half-formatted
+        # state, so the next run starts from scratch.
+        pass
+
+    # produces the same output as a stack that never failed
+    for stmt in stack.run('select c from bar'):
+        process(stmt)

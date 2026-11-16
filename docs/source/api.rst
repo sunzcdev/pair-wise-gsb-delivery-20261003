@@ -16,6 +16,13 @@ In most cases there's no need to set the `encoding` parameter. If
 `encoding` is not set, sqlparse assumes that the given SQL statement
 is encoded either in utf-8 or latin-1.
 
+For more control than these functions offer, :class:`~sqlparse.engine.FilterStack`
+runs a custom sequence of filters over a token stream. See
+:ref:`filter-stack` for details.
+
+.. autoclass:: sqlparse.engine.FilterStack
+   :members: run
+
 
 .. _formatting:
 

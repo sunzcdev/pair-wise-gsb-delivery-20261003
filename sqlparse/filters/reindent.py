@@ -5,6 +5,8 @@
 # This module is part of python-sqlparse and is released under
 # the BSD License: https://opensource.org/licenses/BSD-3-Clause
 
+import copy
+
 from sqlparse import sql
 from sqlparse import tokens as T
 from sqlparse.utils import indent, offset
@@ -17,15 +19,38 @@ class ReindentFilter:
         self.n = n
         self.width = width
         self.char = char
-        self.indent = 1 if indent_after_first else 0
-        self.offset = 0
+        self.indent_after_first = indent_after_first
         self.wrap_after = wrap_after
         self.comma_first = comma_first
         self.indent_columns = indent_columns
         self.compact = compact
+        # Per-run state.  new_session() copies this filter and resets these
+        # attributes again, so a reused stack never continues from where a
+        # previous (or failed) run stopped.  Subclasses that add per-run
+        # state reset it in _reset_session() the same way.
+        self.indent = 1 if indent_after_first else 0
+        self.offset = 0
         self._curr_stmt = None
         self._last_stmt = None
         self._last_func = None
+
+    def _reset_session(self):
+        """Reset the state that belongs to a single run."""
+        self.indent = 1 if self.indent_after_first else 0
+        self.offset = 0
+        self._curr_stmt = None
+        self._last_stmt = None
+        self._last_func = None
+
+    def new_session(self):
+        """Return an independent instance for a single
+        :meth:`~sqlparse.engine.FilterStack.run`."""
+        # A shallow copy is enough: the per-run state is replaced by
+        # _reset_session(), and configuration is only ever read.  Copying
+        # recursively could choke on objects a subclass holds.
+        session = copy.copy(self)
+        session._reset_session()
+        return session
 
     @property
     def leading_ws(self):
