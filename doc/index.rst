@@ -60,6 +60,9 @@ Features
   * can produce compact output
   * can sort keys (deterministic output)
   * can flush the underlying stream after each write
+  * can explicitly commit a batch of lines at a chosen durability
+    level (flushed or synced to disk) via
+    :py:meth:`~jsonlines.Writer.commit()`
   * can be used as a context manager
   * allows complete control over encoding using a custom ``dumps``
     callable
@@ -154,6 +157,24 @@ calling code. That means no ``.close()`` is needed there::
   with jsonlines.open('input.jsonl') as reader:
       ...
 
+When a batch of lines must be durable before it is reported as such
+(e.g. by a collection process), use :py:meth:`Writer.commit()`. It
+returns the durability level actually achieved along with the number
+of complete lines it covers::
+
+  with jsonlines.open('output.jsonl', mode='w') as writer:
+      writer.write_all(batch)
+      result = writer.commit(jsonlines.DurabilityLevel.SYNCED)
+      if result.level >= jsonlines.DurabilityLevel.FLUSHED:
+          report_batch_persisted(result.lines)
+
+Streams that are not backed by a real file descriptor (such as
+``io.BytesIO``) can never be reported as
+:py:attr:`~jsonlines.DurabilityLevel.SYNCED`; committing them at that
+level reports :py:attr:`~jsonlines.DurabilityLevel.FLUSHED` instead.
+Closing a writer does not perform any fsync, so commit explicitly if
+durability matters.
+
 This should be enough to get started. See the API docs below for
 more details.
 
@@ -170,6 +191,12 @@ API
 .. autoclass:: jsonlines.Writer
    :members:
    :inherited-members:
+
+.. autoclass:: jsonlines.DurabilityLevel
+   :members:
+
+.. autoclass:: jsonlines.CommitResult
+   :members:
 
 .. autoclass:: jsonlines.Error
    :members:

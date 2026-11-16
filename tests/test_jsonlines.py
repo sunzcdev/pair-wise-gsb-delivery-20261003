@@ -6,6 +6,7 @@ import codecs
 import collections
 import io
 import json
+import os
 import tempfile
 
 import jsonlines
@@ -230,6 +231,134 @@ def test_writer_flags() -> None:
             )
         )
     assert fp.getvalue() == b'{"a":1,"b":2}\n'
+
+
+def test_commit_handed_to_stream() -> None:
+    fp = io.BytesIO()
+    with jsonlines.Writer(fp) as writer:
+        writer.write({"a": 1})
+        result = writer.commit(jsonlines.DurabilityLevel.HANDED_TO_STREAM)
+        assert result.level == jsonlines.DurabilityLevel.HANDED_TO_STREAM
+        assert result.lines == 1
+        assert writer.lines_written == 1
+
+
+def test_commit_flushed() -> None:
+    fp = io.BytesIO()
+    with jsonlines.Writer(fp) as writer:
+        writer.write_all([{"a": 1}, {"b": 2}])
+        result = writer.commit(jsonlines.DurabilityLevel.FLUSHED)
+        assert result.level == jsonlines.DurabilityLevel.FLUSHED
+        assert result.lines == 2
+
+
+def test_commit_synced_without_fileno_reports_flushed() -> None:
+    """
+    Streams without a file descriptor cannot be marked as synced to
+    disk; the actually achieved level is reported instead.
+    """
+    fp = io.BytesIO()
+    with jsonlines.Writer(fp) as writer:
+        writer.write({"a": 1})
+        result = writer.commit(jsonlines.DurabilityLevel.SYNCED)
+        assert result.level == jsonlines.DurabilityLevel.FLUSHED
+        assert result.lines == 1
+
+
+def test_commit_synced_to_disk() -> None:
+    with tempfile.TemporaryDirectory() as tmpdir:
+        path = os.path.join(tmpdir, "out.jsonl")
+        with jsonlines.open(path, mode="w") as writer:
+            assert isinstance(writer, jsonlines.Writer)
+            writer.write({"a": 1})
+            result = writer.commit()
+            assert result.level == jsonlines.DurabilityLevel.SYNCED
+            assert result.lines == 1
+            writer.write({"b": 2})
+            result = writer.commit(jsonlines.DurabilityLevel.SYNCED)
+            assert result.level == jsonlines.DurabilityLevel.SYNCED
+            assert result.lines == 2
+        with open(path, "r", encoding="utf-8") as fp:
+            assert fp.read() == SAMPLE_TEXT
+
+
+def test_commit_reports_total_complete_lines() -> None:
+    fp = io.BytesIO()
+    with jsonlines.Writer(fp) as writer:
+        writer.write(1)
+        assert writer.commit(jsonlines.DurabilityLevel.HANDED_TO_STREAM).lines == 1
+        writer.write(2)
+        result = writer.commit(jsonlines.DurabilityLevel.HANDED_TO_STREAM)
+        assert result.lines == 2
+
+
+def test_commit_does_not_reserialize_records() -> None:
+    calls = []
+
+    def dumps(obj: object) -> str:
+        calls.append(obj)
+        return json.dumps(obj)
+
+    fp = io.BytesIO()
+    with jsonlines.Writer(fp, dumps=dumps) as writer:
+        calls.clear()  # ignore the sample dumps() call at construction
+        writer.write({"a": 1})
+        writer.commit()
+        writer.write({"b": 2})
+        writer.commit()
+        writer.commit()
+        assert calls == [{"a": 1}, {"b": 2}]
+    assert fp.getvalue() == SAMPLE_BYTES
+
+
+def test_commit_on_closed_writer() -> None:
+    writer = jsonlines.Writer(io.BytesIO())
+    writer.close()
+    with pytest.raises(RuntimeError):
+        writer.commit()
+
+
+def test_commit_invalid_level() -> None:
+    with jsonlines.Writer(io.BytesIO()) as writer:
+        with pytest.raises(ValueError):
+            writer.commit("synced")  # type: ignore[arg-type]
+        with pytest.raises(ValueError):
+            # a boolean is not a durability level
+            writer.commit(True)  # type: ignore[arg-type]
+
+
+def test_commit_flush_failure_preserves_exception_and_state() -> None:
+    class FailingFlush(io.BytesIO):
+        def flush(self) -> None:
+            raise OSError("boom")
+
+    fp = FailingFlush()
+    writer = jsonlines.Writer(fp)
+    writer.write({"a": 1})
+    with pytest.raises(OSError) as excinfo:
+        writer.commit(jsonlines.DurabilityLevel.FLUSHED)
+    assert str(excinfo.value) == "boom"
+    # the fact that the line was handed to the stream is preserved
+    assert writer.lines_written == 1
+    writer.close()
+
+
+def test_commit_fsync_failure_preserves_exception_and_state(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def failing_fsync(fd: int) -> None:
+        raise OSError("no sync for you")
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        path = os.path.join(tmpdir, "out.jsonl")
+        with jsonlines.open(path, mode="w") as writer:
+            assert isinstance(writer, jsonlines.Writer)
+            writer.write({"a": 1})
+            monkeypatch.setattr(os, "fsync", failing_fsync)
+            with pytest.raises(OSError) as excinfo:
+                writer.commit(jsonlines.DurabilityLevel.SYNCED)
+            assert str(excinfo.value) == "no sync for you"
+            assert writer.lines_written == 1
 
 
 def test_custom_dumps() -> None:

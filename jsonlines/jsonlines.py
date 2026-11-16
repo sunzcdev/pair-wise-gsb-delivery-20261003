@@ -65,6 +65,52 @@ class DumpsResultConversion(enum.Enum):
     DecodeToString = enum.auto()
 
 
+class DurabilityLevel(enum.IntEnum):
+    """
+    Durability level for a committed batch of lines.
+
+    The levels are ordered: each level implies the guarantees of all
+    lower levels. This is deliberately not a boolean, since ‘the data
+    was written’ can mean very different things depending on how far
+    the data has travelled towards stable storage.
+    """
+
+    #: The lines have been handed to the underlying file-like object
+    #: via its ``.write()`` method. The data may still sit in
+    #: user-space buffers and can be lost on process or OS crashes.
+    HANDED_TO_STREAM = 1
+
+    #: The file-like object's ``.flush()`` method has been called,
+    #: pushing buffered data out of user-space buffers into the OS.
+    FLUSHED = 2
+
+    #: In addition to flushing, ``os.fsync()`` has been called on the
+    #: underlying file descriptor, asking the operating system to
+    #: persist the data to stable storage. This level is only
+    #: achievable for streams backed by a real file descriptor.
+    SYNCED = 3
+
+
+@attr.s(auto_attribs=True, frozen=True)
+class CommitResult:
+    """
+    Result of :py:meth:`Writer.commit()`.
+
+    This describes the durability guarantee that was *actually*
+    achieved for a batch of lines, which may be lower than the
+    requested level (e.g. streams without a file descriptor cannot be
+    synced to disk).
+    """
+
+    #: The durability level that was actually achieved.
+    level: DurabilityLevel
+
+    #: The total number of complete lines written to the stream so
+    #: far. All of these lines are covered by the achieved durability
+    #: level.
+    lines: int
+
+
 # https://docs.python.org/3/library/functions.html#open
 Openable = Union[str, bytes, int, os.PathLike]
 
@@ -157,6 +203,12 @@ class ReaderWriterBase:
         This closes the underlying file if that file has been opened by
         this reader/writer. When an already opened file-like object was
         provided, the caller is responsible for closing it.
+
+        Note that for writers, closing does not provide any durability
+        guarantee beyond what the underlying file object itself does
+        when closed; in particular, no ``os.fsync()`` is performed. Use
+        :py:meth:`Writer.commit()` to explicitly obtain a durability
+        guarantee before closing.
         """
         if self._closed:
             return
@@ -475,6 +527,12 @@ class Writer(ReaderWriterBase):
     When the `flush` argument is set to ``True``, the writer will call
     ``fp.flush()`` after each written line.
 
+    The :py:meth:`~Writer.commit()` method can be used to explicitly
+    commit a batch of written lines at a chosen durability level
+    (handed to the stream, flushed, or synced to disk), and reports
+    the level that was actually achieved along with the number of
+    complete lines it covers.
+
     :param fp: writable file-like object
     :param compact: whether to use a compact output format
     :param sort_keys: whether to sort object keys
@@ -491,6 +549,7 @@ class Writer(ReaderWriterBase):
     _dumps_result_conversion: DumpsResultConversion = attr.ib(
         default=DumpsResultConversion.LeaveAsIs, init=False
     )
+    _lines_written: int = attr.ib(default=0, init=False)
 
     def __attrs_post_init__(self) -> None:
         if isinstance(self._fp, io.TextIOBase):
@@ -545,11 +604,90 @@ class Writer(ReaderWriterBase):
         fp = self._fp
         fp.write(line)  # type: ignore[arg-type]
         fp.write(b"\n" if self._fp_is_binary else "\n")  # type: ignore[call-overload]
+        self._lines_written += 1
 
         if self._flush:
             fp.flush()
 
         return len(line) + 1  # including newline
+
+    @property
+    def lines_written(self) -> int:
+        """
+        The total number of complete lines handed to the underlying
+        stream so far.
+        """
+        return self._lines_written
+
+    def commit(
+        self, level: DurabilityLevel = DurabilityLevel.SYNCED
+    ) -> CommitResult:
+        """
+        Commit all lines written so far at the requested durability level.
+
+        This does not (re-)write or (re-)serialize any records; it only
+        performs the flush and/or fsync operations needed to reach the
+        requested :py:class:`DurabilityLevel` for the lines already
+        handed to the stream. Calling this method multiple times is
+        cheap and safe.
+
+        If the requested level cannot be reached, the strongest level
+        that *was* reached is reported instead. In particular, streams
+        that do not expose a usable file descriptor (via ``fileno()``)
+        can never be reported as :py:attr:`DurabilityLevel.SYNCED`;
+        committing such a stream at that level reports
+        :py:attr:`DurabilityLevel.FLUSHED` instead.
+
+        If flushing or syncing fails, the original exception propagates
+        unchanged, and the fact that the lines were handed to the
+        stream is preserved: :py:attr:`lines_written` (and the
+        ``lines`` field of subsequent successful commits) still
+        reflects them.
+
+        :param level: the requested durability level
+        :return: a :py:class:`CommitResult` with the actually achieved
+            level and the total number of complete lines it covers
+        """
+        if self._closed:
+            raise RuntimeError("writer is closed")
+        if not isinstance(level, DurabilityLevel):
+            raise ValueError("invalid durability level specified")
+
+        achieved = DurabilityLevel.HANDED_TO_STREAM
+
+        if level >= DurabilityLevel.FLUSHED:
+            # On failure the original exception propagates unchanged;
+            # the lines written so far remain handed to the stream and
+            # self._lines_written keeps reflecting that fact.
+            self._fp.flush()
+            achieved = DurabilityLevel.FLUSHED
+
+        if level >= DurabilityLevel.SYNCED:
+            fileno = self._fileno()
+            if fileno is not None:
+                # Same error handling policy as the flush above.
+                os.fsync(fileno)
+                achieved = DurabilityLevel.SYNCED
+
+        return CommitResult(level=achieved, lines=self._lines_written)
+
+    def _fileno(self) -> Optional[int]:
+        """
+        Return the file descriptor of the underlying stream, if any.
+        """
+        fileno_method = getattr(self._fp, "fileno", None)
+        if fileno_method is None:
+            return None
+        try:
+            fileno = fileno_method()
+        except (OSError, ValueError):
+            # Streams not backed by a file descriptor raise
+            # io.UnsupportedOperation (a subclass of both OSError and
+            # ValueError); closed streams may raise ValueError.
+            return None
+        if not isinstance(fileno, int) or fileno < 0:
+            return None
+        return fileno
 
     def write_all(self, iterable: Iterable[Any]) -> int:
         """
