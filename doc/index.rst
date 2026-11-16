@@ -60,6 +60,7 @@ Features
   * can produce compact output
   * can sort keys (deterministic output)
   * can flush the underlying stream after each write
+  * completes lines even if the stream performs short writes
   * can be used as a context manager
   * allows complete control over encoding using a custom ``dumps``
     callable
@@ -177,6 +178,9 @@ API
 .. autoclass:: jsonlines.InvalidLineError
    :members:
 
+.. autoclass:: jsonlines.WriteError
+   :members:
+
 
 Contributing
 ============
@@ -188,6 +192,17 @@ The source code and issue tracker for this package can be found on GitHub:
 
 Version history
 ===============
+
+* 4.1.0, not yet released
+
+  * handle partial writes in :py:class:`~jsonlines.Writer`; each line
+    (including its terminating newline) is written completely, and a
+    stream that accepts only part of the data no longer causes
+    characters or bytes to be lost silently
+
+  * add :py:exc:`~jsonlines.WriteError`, raised when a line cannot be
+    written completely; it reports how many characters (text streams)
+    or bytes (binary streams) of that line were written
 
 * 4.0.0, released at 2023-09-01
 

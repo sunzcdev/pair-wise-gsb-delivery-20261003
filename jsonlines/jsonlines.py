@@ -138,6 +138,41 @@ class InvalidLineError(Error, ValueError):
         super().__init__(f"{message} (line {lineno})")
 
 
+@attr.s(auto_exc=True, auto_attribs=True, init=False)
+class WriteError(Error, OSError):
+    """
+    Error raised when a line could not be written completely.
+
+    This happens when the underlying file-like object does not accept all
+    characters (text streams) or bytes (binary streams) passed to its
+    ``write()`` method, and stops making progress, or returns a value that
+    cannot be a valid number of written characters or bytes.
+
+    The number of characters or bytes of the current line that were written
+    before the error occurred is stored on the exception instance as the
+    ``.written`` attribute, and the total number of characters or bytes in
+    that line (including the newline) as the ``.total`` attribute.
+
+    Data that was accepted by the file-like object before the error occurred
+    cannot be removed again: not all streams are seekable, so this library
+    does not attempt to retract a partial line.
+
+    This class subclasses both ``jsonlines.Error`` and the built-in
+    ``OSError``.
+    """
+
+    #: Number of characters or bytes of the current line that were written
+    written: int
+
+    #: Total number of characters or bytes in the current line
+    total: int
+
+    def __init__(self, message: str, written: int, total: int) -> None:
+        self.written = written
+        self.total = total
+        super().__init__(message)
+
+
 @attr.s(auto_attribs=True, repr=False)
 class ReaderWriterBase:
     """
@@ -475,6 +510,12 @@ class Writer(ReaderWriterBase):
     When the `flush` argument is set to ``True``, the writer will call
     ``fp.flush()`` after each written line.
 
+    File-like objects are allowed to accept only part of the provided data in
+    a single ``write()`` call. Each line (including its terminating newline)
+    is therefore written completely before :py:meth:`~Writer.write()` returns,
+    and a partial line results in :py:exc:`WriteError` rather than silently
+    losing characters or bytes.
+
     :param fp: writable file-like object
     :param compact: whether to use a compact output format
     :param sort_keys: whether to sort object keys
@@ -523,9 +564,63 @@ class Writer(ReaderWriterBase):
         elif isinstance(sample_dumps_result, bytes) and not self._fp_is_binary:
             self._dumps_result_conversion = DumpsResultConversion.DecodeToString
 
+    def _write_piece(self, data: Union[str, bytes], written: int, total: int) -> int:
+        """
+        Write a single piece of a line completely.
+
+        The file-like object is allowed to accept only part of the data in a
+        single ``write()`` call; the remaining data is passed to it again
+        until everything has been written.
+
+        Returns the number of characters or bytes written for this piece. If
+        the file-like object reports no progress or an invalid result, a
+        :py:exc:`WriteError` is raised; ``written`` is the number of
+        characters or bytes of the whole line that were accepted before the
+        error occurred, and ``total`` is the full line length.
+        """
+        unit = "byte" if self._fp_is_binary else "character"
+        fp = self._fp
+        offset = 0
+        while offset < len(data):
+            chunk = data[offset:]
+            result = fp.write(chunk)  # type: ignore[arg-type]
+            progress = written + offset
+            if isinstance(result, bool) or not isinstance(result, int):
+                reason = (
+                    f"stream.write() returned {type(result).__name__},"
+                    f" not a number of {unit}s written"
+                )
+            elif result == 0:
+                reason = "stream.write() made no progress"
+            elif result < 0:
+                reason = f"stream.write() returned a negative count ({result})"
+            elif result > len(chunk):
+                reason = (
+                    f"stream.write() reported {result} {unit}s written,"
+                    f" but only {len(chunk)} were passed to it"
+                )
+            else:
+                offset += result
+                continue
+            raise WriteError(
+                f"{reason}; {progress} of {total} {unit}s of this line written",
+                progress,
+                total,
+            )
+        return offset
+
     def write(self, obj: Any) -> int:
         """
         Encode and write a single object.
+
+        The encoded object and its terminating newline are both written
+        completely, even if the underlying file-like object accepts only part
+        of the data in a single ``write()`` call. When the file-like object
+        stops making progress, or returns a value that cannot be a number of
+        characters (text streams) or bytes (binary streams) written, a
+        :py:exc:`WriteError` is raised instead of silently losing output.
+        Data that was already accepted cannot be removed again, since not all
+        streams are seekable.
 
         :param obj: the object to encode and write
         :return: number of characters or bytes written
@@ -542,23 +637,34 @@ class Writer(ReaderWriterBase):
         elif self._dumps_result_conversion == DumpsResultConversion.DecodeToString:
             line = line.decode()  # type: ignore[union-attr]
 
-        fp = self._fp
-        fp.write(line)  # type: ignore[arg-type]
-        fp.write(b"\n" if self._fp_is_binary else "\n")  # type: ignore[call-overload]
+        newline: Union[str, bytes] = b"\n" if self._fp_is_binary else "\n"
+        total = len(line) + 1  # including newline
+        written = self._write_piece(line, written=0, total=total)
+        written += self._write_piece(newline, written=written, total=total)
 
+        # Only flush once the line has been written completely; flushing after
+        # a partial write would suggest a whole line was written successfully.
         if self._flush:
-            fp.flush()
+            self._fp.flush()
 
-        return len(line) + 1  # including newline
+        return written
 
     def write_all(self, iterable: Iterable[Any]) -> int:
         """
         Encode and write multiple objects.
 
+        The returned count only includes completely written lines. When
+        writing a line fails, the resulting :py:exc:`WriteError` is raised and
+        no count is returned, so partially written characters or bytes are
+        never reported as if a whole line had been written.
+
         :param iterable: an iterable of objects
         :return: number of characters or bytes written
         """
-        return sum(self.write(obj) for obj in iterable)
+        written = 0
+        for obj in iterable:
+            written += self.write(obj)
+        return written
 
     def _repr_for_wrapped(self) -> str:
         return repr_for_fp(self._fp)

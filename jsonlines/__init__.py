@@ -8,6 +8,7 @@ from .jsonlines import (
     InvalidLineError,
     Reader,
     Writer,
+    WriteError,
     open,
 )
 
@@ -16,5 +17,6 @@ __all__ = [
     "InvalidLineError",
     "Reader",
     "Writer",
+    "WriteError",
     "open",
 ]

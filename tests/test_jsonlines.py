@@ -7,6 +7,7 @@ import collections
 import io
 import json
 import tempfile
+from typing import Any
 
 import jsonlines
 import pytest
@@ -27,6 +28,107 @@ def is_json_decode_error(exc: object) -> bool:
         # Otherwise, this should be a stdlib json.JSONDecodeError, which also
         # works for orjson since orjson.JSONDecodeError inherits from it.
         return isinstance(exc, json.JSONDecodeError)
+
+
+class PartialWriteTextStream(io.StringIO):
+    """
+    Text stream that accepts only a limited number of chars per write() call.
+
+    Mimics a custom collection output stream that performs short writes.
+    """
+
+    def __init__(self, limit: int) -> None:
+        super().__init__()
+        self.limit = limit
+        self.flushes = 0
+
+    def write(self, data: Any) -> int:
+        chunk = data[: self.limit]
+        super().write(chunk)
+        return len(chunk)
+
+    def flush(self) -> None:
+        self.flushes += 1
+
+
+class PartialWriteBinaryStream(io.BytesIO):
+    """
+    Binary version of :py:class:`PartialWriteTextStream`.
+    """
+
+    def __init__(self, limit: int) -> None:
+        super().__init__()
+        self.limit = limit
+        self.flushes = 0
+
+    def write(self, data: Any) -> int:
+        chunk = bytes(data)[: self.limit]
+        super().write(chunk)
+        return len(chunk)
+
+    def flush(self) -> None:
+        self.flushes += 1
+
+
+class BrokenWriteStream(io.BytesIO):
+    """
+    Binary stream whose write() returns an invalid result from the start.
+    """
+
+    def __init__(self, result: object) -> None:
+        super().__init__()
+        self.result = result
+
+    def write(self, data: Any) -> Any:
+        super().write(bytes(data))
+        return self.result
+
+    def flush(self) -> None:
+        raise AssertionError("flush() must not be called")
+
+
+class DyingWriteStream(io.BytesIO):
+    """
+    Binary stream that accepts a few bytes and then reports no progress.
+    """
+
+    def __init__(self, accept: int) -> None:
+        super().__init__()
+        self.accept = accept
+        self.flushes = 0
+
+    def write(self, data: Any) -> int:
+        if len(self.getvalue()) >= self.accept:
+            return 0
+        chunk = bytes(data)[: self.accept - len(self.getvalue())]
+        super().write(chunk)
+        return len(chunk)
+
+    def flush(self) -> None:
+        self.flushes += 1
+
+
+class SeekSpyStream(io.BytesIO):
+    """
+    Seekable stream that records (and forbids) any attempt to roll back.
+    """
+
+    def __init__(self, accept: int) -> None:
+        super().__init__()
+        self.accept = accept
+
+    def write(self, data: Any) -> int:
+        if len(self.getvalue()) >= self.accept:
+            return 0
+        chunk = bytes(data)[: self.accept - len(self.getvalue())]
+        super().write(chunk)
+        return len(chunk)
+
+    def seek(self, *args: Any, **kwargs: Any) -> int:
+        raise AssertionError("partial writes must not be rolled back via seek()")
+
+    def truncate(self, *args: Any, **kwargs: Any) -> int:
+        raise AssertionError("partial writes must not be rolled back via truncate()")
 
 
 def test_reader() -> None:
@@ -311,3 +413,162 @@ def test_single_char_stripping() -> None:
     Sanity check that a helper constant actually contains single-char strings.
     """
     assert all(len(s) == 1 for s in jsonlines.jsonlines.SKIPPABLE_SINGLE_INITIAL_CHARS)
+
+
+def test_writer_partial_writes_text() -> None:
+    """
+    A stream that accepts a single character per call still gets the whole line.
+    """
+    fp = PartialWriteTextStream(limit=1)
+    with jsonlines.Writer(fp) as writer:
+        nchars = writer.write({"a": 1})
+    assert fp.getvalue() == '{"a": 1}\n'
+    assert nchars == len('{"a": 1}\n')
+
+
+def test_writer_partial_writes_binary() -> None:
+    """
+    Binary streams count bytes, and the newline is subject to short writes too.
+    """
+    fp = PartialWriteBinaryStream(limit=3)
+    with jsonlines.Writer(fp) as writer:
+        nbytes = writer.write({"a": 1})
+        nbytes += writer.write({"b": 2})
+    assert fp.getvalue() == SAMPLE_BYTES
+    assert nbytes == len(SAMPLE_BYTES)
+
+
+def test_writer_partial_write_newline() -> None:
+    """
+    A stream that accepts everything except the final newline still gets it.
+    """
+    line = b'{"a": 1}'
+    fp = PartialWriteBinaryStream(limit=len(line))
+    writer = jsonlines.Writer(fp)
+    assert writer.write({"a": 1}) == len(line) + 1
+    assert fp.getvalue() == line + b"\n"
+
+
+def test_writer_partial_writes_are_not_duplicated() -> None:
+    """
+    Only the remainder of the line is retried, never already accepted data.
+    """
+    fp = PartialWriteBinaryStream(limit=4)
+    writer = jsonlines.Writer(fp)
+    writer.write(12345)
+    assert fp.getvalue() == b"12345\n"
+
+
+@pytest.mark.parametrize("result", [0, -1, 1.0, None, "5", True])
+def test_writer_invalid_write_result(result: object) -> None:
+    """
+    Invalid write() results raise WriteError instead of silently losing data.
+    """
+    fp = BrokenWriteStream(result)
+    writer = jsonlines.Writer(fp)
+    with pytest.raises(jsonlines.WriteError) as excinfo:
+        writer.write(123)
+
+    exc = excinfo.value
+    assert exc.written == 0
+    assert exc.total == len(b"123\n")
+    assert "stream.write()" in str(exc)
+    assert isinstance(exc, jsonlines.Error)
+    assert isinstance(exc, OSError)
+
+
+def test_writer_write_zero_progress_mid_line() -> None:
+    """
+    A stream that stops accepting data reports how much of the line got through.
+    """
+    fp = DyingWriteStream(accept=2)
+    writer = jsonlines.Writer(fp)
+    with pytest.raises(jsonlines.WriteError) as excinfo:
+        writer.write(123)
+
+    exc = excinfo.value
+    assert fp.getvalue() == b"12"
+    assert exc.written == 2
+    assert exc.total == len(b"123\n")
+    assert "no progress" in str(exc)
+    assert fp.flushes == 0
+
+
+def test_writer_write_error_keeps_partial_output() -> None:
+    """
+    Output accepted before the failure is kept; it cannot be retracted.
+    """
+    fp = DyingWriteStream(accept=2)
+    writer = jsonlines.Writer(fp)
+    with pytest.raises(jsonlines.WriteError):
+        writer.write(123)
+    # The partial line remains; nothing pretends it was rolled back.
+    assert fp.getvalue() == b"12"
+
+
+def test_writer_partial_write_counts_are_per_stream_kind() -> None:
+    """
+    Text streams count characters; binary streams count bytes.
+    """
+    text_fp = PartialWriteTextStream(limit=2)
+    binary_fp = PartialWriteBinaryStream(limit=2)
+
+    with jsonlines.Writer(text_fp) as writer:
+        assert writer.write("é") == len('"é"') + 1
+        assert text_fp.getvalue() == '"é"\n'
+
+    with jsonlines.Writer(binary_fp) as writer:
+        assert writer.write("é") == len('"é"\n'.encode("utf-8"))
+        assert binary_fp.getvalue() == '"é"\n'.encode("utf-8")
+
+
+def test_writer_flush_only_after_complete_line() -> None:
+    """
+    A partial write must not be followed by a flush that claims success.
+    """
+    fp = DyingWriteStream(accept=1)
+    writer = jsonlines.Writer(fp, flush=True)
+    with pytest.raises(jsonlines.WriteError):
+        writer.write(123)
+    assert fp.flushes == 0
+
+    ok_fp = PartialWriteBinaryStream(limit=1)
+    with jsonlines.Writer(ok_fp, flush=True) as flushing_writer:
+        flushing_writer.write(123)
+    assert ok_fp.flushes == 1  # once per completely written line
+
+
+def test_writer_write_all_stops_at_failing_line() -> None:
+    """
+    write_all only counts complete lines, and reports the failure.
+    """
+    fp = DyingWriteStream(accept=len(b"1\n") + len(b"22\n") + 1)
+    writer = jsonlines.Writer(fp)
+    with pytest.raises(jsonlines.WriteError) as excinfo:
+        writer.write_all([1, 22, 333])
+
+    exc = excinfo.value
+    # The first two lines were written completely; the third stopped halfway.
+    assert fp.getvalue() == b"1\n22\n3"
+    assert exc.written == len(b"3")
+    assert exc.total == len(b"333\n")
+
+
+def test_writer_write_all_counts_complete_records() -> None:
+    fp = PartialWriteBinaryStream(limit=1)
+    writer = jsonlines.Writer(fp)
+    assert writer.write_all([1, 2, 3]) == len(b"1\n2\n3\n")
+    assert fp.getvalue() == b"1\n2\n3\n"
+
+
+def test_writer_no_rollback_of_partial_line() -> None:
+    """
+    A partial line is never retracted, even on a seekable stream.
+    """
+    fp = SeekSpyStream(accept=1)
+    writer = jsonlines.Writer(fp)
+    with pytest.raises(jsonlines.WriteError):
+        writer.write({"a": 1})
+
+    # The already accepted character stays; no seek()/truncate() was attempted.
+    assert fp.getvalue() == b"{"
