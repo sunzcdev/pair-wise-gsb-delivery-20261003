@@ -1,0 +1,11 @@
+Added
+-----
+
+*   Add ``feedparser.paginate()``, an optional iterator that follows a
+    feed's ``rel="next"`` links page by page, returning each page's entries
+    alongside its final source URL.  Callers explicitly set the maximum
+    number of pages, the maximum number of entries, and whether cross-origin
+    jumps are allowed; cycles, equivalent page addresses, ambiguous next
+    links, and later request or parse failures terminate the crawl without
+    ever reporting a successful end state.  The regular ``parse()`` function
+    continues to process a single resource.

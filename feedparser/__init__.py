@@ -34,6 +34,20 @@ from .exceptions import (
     NonXMLContentType,
     UndeclaredNamespace,
 )
+from .pagination import (
+    STOP_AMBIGUOUS_NEXT,
+    STOP_CROSS_ORIGIN,
+    STOP_CYCLE,
+    STOP_INVALID_NEXT,
+    STOP_MAX_ENTRIES,
+    STOP_MAX_PAGES,
+    STOP_NO_NEXT,
+    STOP_PARSE_FAILED,
+    STOP_REQUEST_FAILED,
+    Page,
+    Paginator,
+    paginate,
+)
 from .util import FeedParserDict
 
 # If you want feedparser to automatically resolve all relative URIs, set this
@@ -52,6 +66,18 @@ OPTIMISTIC_ENCODING_DETECTION = 1
 
 __all__ = (
     "parse",
+    "paginate",
+    "Paginator",
+    "Page",
+    "STOP_NO_NEXT",
+    "STOP_MAX_PAGES",
+    "STOP_MAX_ENTRIES",
+    "STOP_CYCLE",
+    "STOP_CROSS_ORIGIN",
+    "STOP_AMBIGUOUS_NEXT",
+    "STOP_INVALID_NEXT",
+    "STOP_REQUEST_FAILED",
+    "STOP_PARSE_FAILED",
     "registerDateHandler",
     "FeedParserDict",
     "FeedparserError",
