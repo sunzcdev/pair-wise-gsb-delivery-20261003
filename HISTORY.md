@@ -2,6 +2,7 @@
 
 ## Unreleased
 * Fix `ValueError` when a response has an invalid `Expires` date (for example `Expires: garbage`); it is now treated as already expired
+* Fix cache hits sharing state: modifying a cached response (for example, in a response hook) no longer affects the stored response or any other cache hit. This applies to headers, cookies, request data, redirect history, and the raw response body read position, for both in-memory and deserialized (for example SQLite) responses. The response body itself is still shared instead of copied, since it's immutable and may be large
 * Fix JSON refresh comparisons for mixed-case `Content-Type` values
 * Keep caller-supplied MongoDB clients open when closing MongoDB or GridFS caches
 * Fix unhandled `EOFError` when a cache value fails to deserialize

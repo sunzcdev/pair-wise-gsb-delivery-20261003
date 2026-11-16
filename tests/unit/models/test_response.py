@@ -7,7 +7,8 @@ import pytest
 from requests import Response
 from urllib3.response import HTTPResponse
 
-from requests_cache.models.response import CachedResponse, OriginalResponse, format_file_size
+from requests_cache.models import CachedRequest, CachedResponse
+from requests_cache.models.response import OriginalResponse, format_file_size
 from requests_cache.policy import CacheActions, utcnow
 from tests.conftest import MOCKED_URL
 
@@ -78,6 +79,89 @@ def test_history(mock_session):
     response = CachedResponse.from_response(original_response)
     assert len(response.history) == 3
     assert all(isinstance(r, CachedResponse) for r in response.history)
+
+
+def test_from_response__isolated(mock_session):
+    """A cached response should not share mutable attributes with the original response"""
+    original_response = mock_session.get(MOCKED_URL)
+    response = CachedResponse.from_response(original_response)
+    original_response.headers['X-Hook'] = '1'
+    original_response.cookies.set('hook', '1')
+    original_response.request.headers['X-Hook'] = '1'
+
+    assert 'X-Hook' not in response.headers
+    assert 'hook' not in response.cookies
+    assert 'X-Hook' not in response.request.headers
+
+
+def test_copy__isolated(mock_session):
+    """Copies of a cached response should not share mutable attributes with the original, either
+    directly or via its history
+    """
+    response = CachedResponse.from_response(mock_session.get(MOCKED_URL))
+    response.headers['X-Hook'] = '1'
+    response.cookies.set('hook', '1')
+    response.request.headers['X-Hook'] = '1'
+    response.history = [CachedResponse.from_response(mock_session.get(MOCKED_URL))]
+    response.history[0].headers['X-Hook'] = '1'
+    response.history[0].cookies.set('hook', '1')
+    response.history[0].request.headers['X-Hook'] = '1'
+
+    response_copy = response.copy()
+    response_copy.headers['X-Hook'] = '2'
+    response_copy.cookies.set('hook', '2')
+    response_copy.request.headers['X-Hook'] = '2'
+    response_copy.history[0].headers['X-Hook'] = '2'
+    response_copy.history[0].cookies.set('hook', '2')
+    response_copy.history[0].request.headers['X-Hook'] = '2'
+
+    assert response.headers['X-Hook'] == '1'
+    assert response.cookies['hook'] == '1'
+    assert response.request.headers['X-Hook'] == '1'
+    assert response.history[0].headers['X-Hook'] == '1'
+    assert response.history[0].cookies['hook'] == '1'
+    assert response.history[0].request.headers['X-Hook'] == '1'
+
+
+def test_copy__body_not_duplicated():
+    """Copying a response should share the (immutable) response body instead of duplicating it,
+    but each copy should have its own body read position
+    """
+    response = CachedResponse(content=b'mock response', headers={'Content-Type': 'text/plain'})
+    response_copy = response.copy()
+
+    assert response_copy._content is response._content
+    assert response_copy.raw is not response.raw
+    assert response.raw.read(4) == response_copy.raw.read(4) == b'mock'
+
+
+def test_copy__raw_position_isolated():
+    """Reading one copy of a cached response should not affect any other copy"""
+    response = CachedResponse(content=b'mock response', headers={'Content-Type': 'text/plain'})
+    response_copy = response.copy()
+
+    assert response_copy.raw.read(None) == b'mock response'
+    # The other copy should still be readable from its own position
+    assert response.raw.read(None) == b'mock response'
+
+
+def test_next__isolated():
+    """The prepared request for a redirect's next request should not share mutable data with the
+    CachedRequest stored in the cache, so it can't be written back to it
+    """
+    next_request = CachedRequest(headers={'foo': 'bar'}, method='GET', url=MOCKED_URL)
+    next_request.cookies.set('foo', 'bar')
+    response = CachedResponse(next=next_request)
+
+    prepared_request = response.next
+    prepared_request.headers['foo'] = 'modified'
+    prepared_request._cookies.set('foo', 'modified')
+
+    assert response._next.headers['foo'] == 'bar'
+    assert response._next.cookies['foo'] == 'bar'
+    # A second call should also get the original values
+    assert response.next.headers['foo'] == 'bar'
+    assert response.next._cookies['foo'] == 'bar'
 
 
 @pytest.mark.parametrize(

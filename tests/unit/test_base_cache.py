@@ -322,6 +322,49 @@ def test_save_response__manual(mock_session):
     mock_session.cache.save_response(response)
 
 
+def test_get_response__isolated_response(mock_session):
+    """Modifying a response returned from the cache should not affect the stored response, even
+    when it hasn't gone through a serialize/deserialize round trip (as with in-memory storage)
+    """
+    response = CachedResponse(
+        content=b'mock response',
+        headers={'Content-Type': 'text/plain'},
+        request=CachedRequest(headers={'foo': 'bar'}, method='GET', url=MOCKED_URL),
+        status_code=200,
+        url=MOCKED_URL,
+    )
+    response.cookies.set('foo', 'bar')
+    mock_session.cache.responses['key'] = response
+
+    cached_response = mock_session.cache.get_response('key')
+    cached_response.headers['X-Custom'] = 'true'
+    cached_response.cookies.set('custom', 'true')
+    cached_response.request.headers['X-Custom'] = 'true'
+
+    stored_response = mock_session.cache.responses['key']
+    assert 'X-Custom' not in stored_response.headers
+    assert 'custom' not in stored_response.cookies
+    assert 'X-Custom' not in stored_response.request.headers
+    # Unmodified values should still be present
+    assert stored_response.headers['Content-Type'] == 'text/plain'
+    assert stored_response.cookies['foo'] == 'bar'
+    assert stored_response.request.headers['foo'] == 'bar'
+
+
+def test_get_response__isolated_body_read_position():
+    """Each response read from in-memory storage should have its own body read position. Otherwise,
+    reading one response would consume the body for every other response.
+    """
+    cache = BaseCache()
+    cache.responses['key'] = CachedResponse(content=b'mock response', status_code=200)
+
+    cached_response_1 = cache.get_response('key')
+    cached_response_2 = cache.get_response('key')
+    assert cached_response_1._content is cached_response_2._content
+    assert cached_response_1.raw.read(4) == cached_response_2.raw.read(4) == b'mock'
+    assert cached_response_1.raw.read(None) == cached_response_2.raw.read(None) == b' response'
+
+
 def test_update(mock_session):
     src_cache = BaseCache()
     for i in range(20):

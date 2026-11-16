@@ -30,6 +30,17 @@ DESERIALIZE_ERRORS = (AttributeError, EOFError, ImportError, PickleError, TypeEr
 logger = getLogger(__name__)
 
 
+def _copy_response(value):
+    """Get an isolated copy of a cached response, if applicable.
+
+    Backends that deserialize responses (all persistent backends) already produce a new object for
+    each read. ``DictStorage``, however, returns the object that is still stored in memory. Copying
+    it here ensures that response hooks or other post-processing of one cache hit can't leak into
+    the cache or into any other cache hit, regardless of backend.
+    """
+    return value.copy() if isinstance(value, CachedResponse) else value
+
+
 class BaseCache:
     """Base class for cache backends. Can be used as a non-persistent, in-memory cache.
 
@@ -393,13 +404,12 @@ class DictStorage(UserDict, BaseStorage):
         self.serializer = None
 
     def __getitem__(self, key):
-        """An additional step is needed here for response data. The original response object
-        is still in memory, and hasn't gone through a serialize/deserialize loop. So, the file-like
-        response body has already been read, and needs to be reset.
+        """Return a copy of the stored response, so that modifying a response, reading its body,
+        or otherwise changing its state won't affect the cached response or any other response
+        read from this storage. This is an additional step needed only for in-memory storage, since
+        other backends create a new object on each read.
         """
-        item = super().__getitem__(key)
-        if getattr(item, 'raw', None):
-            item.raw.reset()
+        item = _copy_response(super().__getitem__(key))
         try:
             item.cache_key = key
         except AttributeError:

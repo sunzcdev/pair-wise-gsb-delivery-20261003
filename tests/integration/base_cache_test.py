@@ -16,7 +16,7 @@ import requests
 from requests import ConnectionError, PreparedRequest, Session
 
 from requests_cache import ALL_METHODS, CachedResponse, CachedSession
-from requests_cache.backends import BaseCache
+from requests_cache.backends import BaseCache, DictStorage
 from requests_cache.policy import utcnow
 from tests.conftest import (
     CACHE_NAME,
@@ -28,6 +28,8 @@ from tests.conftest import (
     LAST_MODIFIED,
     MOCKED_URL_JSON,
     MOCKED_URL_JSON_LIST,
+    MOCKED_URL,
+    MOCKED_URL_REDIRECT,
     N_ITERATIONS,
     N_REQUESTS_PER_ITERATION,
     N_WORKERS,
@@ -111,6 +113,97 @@ class BaseCacheTest:
 
             session.get(httpbin('get'))
             assert getitem.call_count == 2
+
+    def test_response_isolation__cache_hit(self):
+        """Modifying a response after a cache hit (for example, in a response hook) should not
+        affect the cached response or any other cache hit
+        """
+        session = mount_mock_adapter(self.init_session())
+
+        def hook(response, *args, **kwargs):
+            response.headers['X-Custom'] = 'true'
+            response.cookies.set('custom', 'true')
+            response.request.headers['X-Custom'] = 'true'
+            return response
+
+        session.get(MOCKED_URL)
+        hit_1 = session.get(MOCKED_URL, hooks={'response': hook})
+        hit_2 = session.get(MOCKED_URL)
+
+        assert hit_1.headers['X-Custom'] == 'true'
+        assert hit_1.cookies['custom'] == 'true'
+        assert hit_1.request.headers['X-Custom'] == 'true'
+        assert 'X-Custom' not in hit_2.headers
+        assert 'custom' not in hit_2.cookies
+        assert 'X-Custom' not in hit_2.request.headers
+
+        # The cached response itself should also be unaffected
+        stored_response = session.cache.responses[hit_2.cache_key]
+        assert 'X-Custom' not in stored_response.headers
+        assert 'custom' not in stored_response.cookies
+        assert 'X-Custom' not in stored_response.request.headers
+
+    def test_response_isolation__history(self):
+        """Redirect history nested in a cached response should be isolated the same way"""
+        session = mount_mock_adapter(self.init_session())
+
+        def hook(response, *args, **kwargs):
+            for redirect in response.history:
+                redirect.headers['X-Custom'] = 'true'
+                redirect.cookies.set('custom', 'true')
+                redirect.request.headers['X-Custom'] = 'true'
+            return response
+
+        session.get(MOCKED_URL_REDIRECT)
+        hit_1 = session.get(MOCKED_URL_REDIRECT, hooks={'response': hook})
+        hit_2 = session.get(MOCKED_URL_REDIRECT)
+
+        assert hit_1.history[0].headers['X-Custom'] == 'true'
+        assert hit_2.history[0].headers.get('X-Custom') is None
+        assert 'custom' not in hit_2.history[0].cookies
+        assert 'X-Custom' not in hit_2.history[0].request.headers
+
+    def test_response_isolation__body_read_position(self):
+        """Reading a response body should not affect the body read position of any other cache
+        hit
+        """
+        session = mount_mock_adapter(self.init_session())
+        session.get(MOCKED_URL)
+
+        hit_1 = session.get(MOCKED_URL)
+        hit_2 = session.get(MOCKED_URL)
+
+        # If the read position were shared, the second read would return an empty result
+        assert hit_1.raw.read(4) == hit_2.raw.read(4)
+        assert b''.join(hit_1.raw.stream(4)) == b''.join(hit_2.raw.stream(4))
+        # Reading one body should not affect the content of the other
+        assert hit_1.content == hit_2.content == b'mock response'
+
+    def test_response_isolation__streaming(self):
+        """Streaming a cached response body should not affect any other cache hit"""
+        session = mount_mock_adapter(self.init_session())
+        session.get(MOCKED_URL)
+
+        hit_1 = session.get(MOCKED_URL, stream=True)
+        hit_2 = session.get(MOCKED_URL, stream=True)
+
+        chunks = list(hit_1.iter_content(4))
+        assert chunks == list(hit_2.iter_content(4))
+        assert b''.join(chunks) == b'mock response'
+
+    def test_response_isolation__in_memory_body(self):
+        """For in-memory storage, copies of a cached response should share the same (immutable)
+        response body instead of duplicating it
+        """
+        session = mount_mock_adapter(self.init_session())
+        if not isinstance(session.cache.responses, DictStorage):
+            pytest.skip('Only applicable to in-memory storage')
+
+        session.get(MOCKED_URL)
+        hit_1 = session.get(MOCKED_URL)
+        hit_2 = session.get(MOCKED_URL)
+
+        assert hit_1._content is hit_2._content == b'mock response'
 
     @pytest.mark.parametrize('n_redirects', range(1, 5))
     @pytest.mark.parametrize('endpoint', ['redirect', 'absolute-redirect', 'relative-redirect'])

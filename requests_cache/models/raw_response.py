@@ -19,6 +19,68 @@ if TYPE_CHECKING:
     from . import CachedResponse
 
 
+class BytesReader:
+    """A minimal, read-only file-like wrapper around an immutable ``bytes`` object.
+
+    This is used instead of ``io.BytesIO`` so that each copy of a cached response can have its own
+    independent read position without duplicating the (potentially large) response body in memory.
+    Only the subset of file-like behavior used by :py:class:`.CachedHTTPResponse` and urllib3 is
+    implemented.
+    """
+
+    def __init__(self, body: bytes = b''):
+        self._body = body
+        self._pos = 0
+        self._closed = False
+
+    @property
+    def closed(self) -> bool:
+        return self._closed
+
+    def isclosed(self) -> bool:
+        return self._closed
+
+    def close(self):
+        self._closed = True
+
+    def readable(self) -> bool:
+        return True
+
+    def seekable(self) -> bool:
+        return True
+
+    def tell(self) -> int:
+        return self._pos
+
+    def seek(self, pos: int, whence: int = 0) -> int:
+        if self._closed:
+            raise ValueError('I/O operation on closed file')
+        if whence == 0:
+            new_pos = pos
+        elif whence == 1:
+            new_pos = self._pos + pos
+        else:
+            new_pos = len(self._body) + pos
+        self._pos = min(max(new_pos, 0), len(self._body))
+        return self._pos
+
+    def read(self, amt: Optional[int] = None) -> bytes:
+        """Read ``amt`` bytes, or all remaining bytes if ``amt`` is ``None`` or negative"""
+        if self._closed:
+            raise ValueError('I/O operation on closed file')
+        if amt is None or amt < 0:
+            amt = len(self._body) - self._pos
+        data = self._body[self._pos : self._pos + amt]
+        self._pos += len(data)
+        return data
+
+    def read1(self, amt: Optional[int] = None) -> bytes:
+        return self.read(amt)
+
+    def __len__(self) -> int:
+        return len(self._body)
+
+
 @define(auto_attribs=False, repr=False, slots=False)
 class CachedHTTPResponse(RichMixin, HTTPResponse):
     """A wrapper class that emulates :py:class:`~urllib3.response.HTTPResponse`.
@@ -39,10 +101,11 @@ class CachedHTTPResponse(RichMixin, HTTPResponse):
     def __init__(self, body: Optional[bytes] = None, **kwargs):
         """First initialize via HTTPResponse.__init__, then via __attrs_init__"""
         kwargs = {k: v for k, v in kwargs.items() if v is not None}
-        super().__init__(body=BytesIO(body or b''), preload_content=False, **kwargs)
+        body = body or b''
+        super().__init__(body=BytesReader(body), preload_content=False, **kwargs)
         self._body = body
         self._fp_bytes_read = 0
-        self.length_remaining = len(body or b'')
+        self.length_remaining = len(body)
         self.__attrs_init__(**kwargs)  # type: ignore # False positive in mypy 0.920+?
 
     @classmethod
@@ -56,6 +119,8 @@ class CachedHTTPResponse(RichMixin, HTTPResponse):
         kwargs = {k: getattr(response.raw, k, None) for k in fields_dict(cls).keys()}
         # Init kwarg for HTTPResponse._request_url has no leading '_'
         kwargs['request_url'] = response.raw._request_url  # type: ignore[attr-defined]
+        # Copy headers, so the cached response can't be affected by changes to the original response
+        kwargs['headers'] = HTTPHeaderDict(getattr(response.raw, 'headers', None) or {})
         kwargs['body'] = _copy_body(response)
         return cls(**kwargs)  # type: ignore[arg-type]  # False positive in mypy 0.920+?
 
@@ -105,7 +170,13 @@ class CachedHTTPResponse(RichMixin, HTTPResponse):
 
     def reset(self, body: Optional[bytes] = None):
         """Reset raw response file pointer, and optionally update content"""
-        _reset_fp(self, body or self._body)
+        body = body or self._body or b''
+        self._body = body
+        self._fp_bytes_read = 0
+        # Use a new reader over the same immutable body, so the read position is independent of
+        # any other copy of this response (and no body data is copied)
+        self._fp = BytesReader(body)
+        self.length_remaining = len(body)
 
     def stream(self, amt=None, **kwargs):
         """Simplified generator over cached content that emulates
@@ -139,7 +210,12 @@ def _copy_body(response: Response) -> Optional[bytes]:
 
 
 def _reset_fp(raw: HTTPResponse, body: Optional[bytes] = None):
-    """Set content and reset raw response file pointer"""
+    """Set content and reset raw response file pointer.
+
+    This is used for the raw response of an original (non-cached) response, so it keeps using a
+    standard file-like object. Cached responses use :py:class:`.BytesReader` instead, so their
+    copies can share the same body without sharing a read position.
+    """
     body = body or b''
     raw._body = body  # type: ignore[attr-defined]
     raw._fp_bytes_read = 0  # type: ignore[attr-defined]

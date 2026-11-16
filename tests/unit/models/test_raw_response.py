@@ -50,6 +50,18 @@ def test_reset():
     assert raw.read(None) == b'mock response'
 
 
+def test_reset__independent_read_position():
+    """Each raw response should have its own read position, without copying the body"""
+    body = b'mock response'
+    raw_1 = CachedHTTPResponse(body=body)
+    raw_2 = CachedHTTPResponse(body=body)
+
+    assert raw_1._body is raw_2._body is body
+    assert raw_1._fp is not raw_2._fp
+    assert raw_1.read(4) == b'mock'
+    assert raw_2.read(4) == b'mock'
+
+
 def test_stream():
     raw = CachedHTTPResponse(body=b'mock response')
     data = b''
@@ -57,3 +69,12 @@ def test_stream():
         data += chunk
     assert data == b'mock response'
     assert raw._fp.closed
+
+
+def test_from_response__headers_isolated(mock_session):
+    """A raw cached response should not share headers with the original raw response"""
+    response = mock_session.get(MOCKED_URL)
+    raw = CachedHTTPResponse.from_response(response)
+    response.raw.headers['X-Custom'] = 'true'
+
+    assert 'X-Custom' not in raw.headers

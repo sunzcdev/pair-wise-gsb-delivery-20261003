@@ -35,6 +35,14 @@ It can be used, for example, for request throttling:
 ```
 :::
 
+```{note}
+Responses returned from the cache are copies. Modifying a cached response (for example, adding
+headers or cookies in a response hook) won't affect the stored response or any other request served
+from the cache. This also applies to redirect history, the cached request, and the response body
+read position. The response body itself is shared instead of copied, since it's immutable and may be
+large.
+```
+
 ## Streaming Requests
 If you use [streaming requests](https://requests.readthedocs.io/en/latest/user/advanced/#id9), you
 can use the same code to iterate over both cached and non-cached requests. Cached response content

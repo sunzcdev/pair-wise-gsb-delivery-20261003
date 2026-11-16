@@ -5,8 +5,7 @@ from json import JSONDecodeError, dumps
 from logging import getLogger
 from typing import TYPE_CHECKING, Dict, List, Optional, Union
 
-import attr
-from attrs import define, field
+from attrs import define, evolve, field
 from requests import PreparedRequest, RequestException, Response
 from requests.cookies import RequestsCookieJar
 from requests.structures import CaseInsensitiveDict
@@ -14,6 +13,7 @@ from requests.structures import CaseInsensitiveDict
 from .._utils import is_json_content_type
 from ..policy import ExpirationTime, add_tzinfo, get_expiration_datetime, utcnow
 from . import CachedHTTPResponse, CachedRequest, RichMixin
+from .request import copy_cookie_jar, copy_headers
 
 if TYPE_CHECKING:
     from ..policy.actions import CacheActions
@@ -101,7 +101,11 @@ def _comparable_content(response: Response) -> Union[DecodedContent, bytes]:
 
 @define(auto_attribs=False, repr=False, slots=False)
 class CachedResponse(RichMixin, BaseResponse):
-    """A class that emulates :py:class:`requests.Response`, optimized for serialization"""
+    """A class that emulates :py:class:`requests.Response`, optimized for serialization.
+
+    Responses returned from the cache are copies, so that modifying one response (for example, in
+    a response hook) won't affect the cached response or any other response returned from the cache.
+    """
 
     _content: bytes = field(default=None)
     _decoded_content: DecodedContent = field(default=None)
@@ -129,9 +133,7 @@ class CachedResponse(RichMixin, BaseResponse):
     def from_response(cls, response: Response, **kwargs) -> 'CachedResponse':
         """Create a CachedResponse based on an original Response or another CachedResponse object"""
         if isinstance(response, CachedResponse):
-            obj = attr.evolve(response, **kwargs)
-            obj._convert_redirects()
-            return obj
+            return response.copy(**kwargs)
 
         obj = cls(**kwargs)
 
@@ -139,16 +141,48 @@ class CachedResponse(RichMixin, BaseResponse):
         for k in Response.__attrs__:
             setattr(obj, k, getattr(response, k, None))
 
+        # Copy mutable attributes, so that changes to the original response (for example, in a
+        # response hook) can't be written back to the cached response
+        obj.cookies = copy_cookie_jar(response.cookies)
+        obj.headers = copy_headers(response.headers)
+
         # Store request, raw response, and next response (if it's a redirect response)
         obj.raw = CachedHTTPResponse.from_response(response)
         obj.request = CachedRequest.from_request(response.request)
         obj._next = CachedRequest.from_request(response.next) if response.next else None
 
         # Store response body, which will have been read & decoded by requests.Response by now
+        # Note: this is not copied, since bytes are immutable
         obj._content = response.content
 
         obj._convert_redirects()
         return obj
+
+    def copy(self, **kwargs) -> 'CachedResponse':
+        """Get a copy of this response, so that modifying it (for example, in a response hook)
+        won't affect the cached response it was copied from, or any other response returned from
+        the cache.
+
+        Mutable attributes (headers, cookies, request, and history) are copied, and a new raw
+        response is created, so nested responses are isolated as well and the body read position
+        isn't shared. The response body itself is *not* copied, since it's immutable and may be
+        large; copies simply reference the same ``bytes`` object.
+        """
+        copy_kwargs = dict(
+            content=self._content,
+            decoded_content=self._decoded_content,
+            next=self._next.copy() if self._next else None,
+            cookies=copy_cookie_jar(self.cookies),
+            headers=copy_headers(self.headers),
+            history=[
+                r.copy() if isinstance(r, CachedResponse) else self.from_response(r)
+                for r in self.history
+            ],
+            request=self.request.copy() if self.request is not None else CachedRequest(),
+        )
+        copy_kwargs.update(kwargs)
+        # Note: this also preserves any attributes from CachedResponse subclasses
+        return evolve(self, **copy_kwargs)  # type: ignore[return-value]
 
     def _convert_redirects(self):
         """Convert redirect history, if any; avoid recursion by not copying redirects of redirects"""

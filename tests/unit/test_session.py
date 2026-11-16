@@ -839,6 +839,72 @@ def test_hooks(mock_session):
         assert state[hook] == 5
 
 
+@pytest.mark.parametrize('backend', ['memory', 'sqlite'])
+def test_hooks__cache_hit_isolation(backend, tmp_path):
+    """Modifying a cached response in a response hook should not affect the cache or any other
+    cache hit, for both in-memory and deserialized responses
+    """
+    session = mount_mock_adapter(CachedSession(tmp_path / 'cache', backend=backend))
+    session.get(MOCKED_URL_REDIRECT)
+    initial_response = session.get(MOCKED_URL_REDIRECT)
+
+    def hook_func(r, *args, **kwargs):
+        r.headers['X-Custom'] = 'true'
+        r.cookies.set('custom', 'true')
+        r.request.headers['X-Custom'] = 'true'
+        for redirect in r.history:
+            redirect.headers['X-Custom'] = 'true'
+            redirect.cookies.set('custom', 'true')
+            redirect.request.headers['X-Custom'] = 'true'
+        # Consume part of the body, as a streaming consumer might
+        r.raw.read(4)
+        return r
+
+    hit_1 = session.get(MOCKED_URL_REDIRECT, hooks={'response': hook_func})
+    assert hit_1.headers['X-Custom'] == 'true'
+    assert hit_1.cookies['custom'] == 'true'
+    assert hit_1.request.headers['X-Custom'] == 'true'
+    assert hit_1.history[0].headers['X-Custom'] == 'true'
+
+    hit_2 = session.get(MOCKED_URL_REDIRECT)
+    assert 'X-Custom' not in hit_2.headers
+    assert 'custom' not in hit_2.cookies
+    assert 'X-Custom' not in hit_2.request.headers
+    assert 'X-Custom' not in hit_2.history[0].headers
+    assert 'custom' not in hit_2.history[0].cookies
+    assert 'X-Custom' not in hit_2.history[0].request.headers
+    # The body read position should also be isolated
+    assert hit_2.raw.read(None) == b'mock redirect response (2/2)'
+    assert initial_response.raw.read(None) == b'mock redirect response (2/2)'
+
+    # The stored response should not have been modified
+    stored_response = session.cache.responses[hit_2.cache_key]
+    assert 'X-Custom' not in stored_response.headers
+    assert 'custom' not in stored_response.cookies
+    assert 'X-Custom' not in stored_response.request.headers
+
+
+@pytest.mark.parametrize('backend', ['memory', 'sqlite'])
+def test_hooks__cache_miss_does_not_leak(backend, tmp_path):
+    """Modifying a new (non-cached) response after it has been written to the cache should not
+    write anything back to the stored response
+    """
+    session = mount_mock_adapter(CachedSession(tmp_path / 'cache', backend=backend))
+
+    def hook_func(r, *args, **kwargs):
+        return r
+
+    response = session.get(MOCKED_URL, hooks={'response': hook_func})
+    response.headers['X-Custom'] = 'true'
+    response.cookies.set('custom', 'true')
+    response.request.headers['X-Custom'] = 'true'
+
+    stored_response = session.cache.responses[response.cache_key]
+    assert 'X-Custom' not in stored_response.headers
+    assert 'custom' not in stored_response.cookies
+    assert 'X-Custom' not in stored_response.request.headers
+
+
 def test_expire_after_alias(mock_session):
     """CachedSession has an `expire_after` property for backwards-compatibility"""
     mock_session.expire_after = 60
