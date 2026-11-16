@@ -4,6 +4,8 @@ Module for the jsonlines data format.
 
 # expose only public api
 from .jsonlines import (
+    Bookmark,
+    BookmarkError,
     Error,
     InvalidLineError,
     Reader,
@@ -12,6 +14,8 @@ from .jsonlines import (
 )
 
 __all__ = [
+    "Bookmark",
+    "BookmarkError",
     "Error",
     "InvalidLineError",
     "Reader",

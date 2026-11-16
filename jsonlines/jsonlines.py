@@ -5,6 +5,7 @@ jsonlines implementation
 import builtins
 import codecs
 import enum
+import hashlib
 import io
 import json
 import os
@@ -57,6 +58,13 @@ SKIPPABLE_SINGLE_INITIAL_CHARS = (
     "\x1e",  # RFC7464 text sequence
     codecs.BOM_UTF8.decode(),
 )
+
+# Version of the bookmark serialization format produced by this module. Bump
+# this when the meaning or layout of the bookmark fields changes.
+BOOKMARK_FORMAT_VERSION = 1
+
+# Hash algorithm used to verify the immutable file prefix up to a bookmark.
+BOOKMARK_HASH_ALGORITHM = "sha256"
 
 
 class DumpsResultConversion(enum.Enum):
@@ -138,6 +146,132 @@ class InvalidLineError(Error, ValueError):
         super().__init__(f"{message} (line {lineno})")
 
 
+@attr.s(auto_exc=True, auto_attribs=True)
+class BookmarkError(Error):
+    """
+    Error raised when bookmark handling fails.
+
+    This happens when:
+
+    * a bookmark is requested for a stream that is not binary and
+      seekable (e.g. a text stream or a plain iterable),
+    * a bookmark is requested while the stream is positioned past the
+      last fully delivered record (for example, directly after an
+      invalid line was read),
+    * a bookmark cannot be restored because its stream does not match
+      the recorded file identity (a changed prefix, truncation, or an
+      unsupported bookmark version).
+    """
+
+
+@attr.s(auto_attribs=True, frozen=True)
+class Bookmark:
+    """
+    Resumable reading position for a binary, seekable jsonlines stream.
+
+    A bookmark captures the position *after* the last record that has
+    been fully and successfully delivered to the caller. Reopening the
+    same file and restoring the bookmark makes the reader continue with
+    the next record, without re-delivering already processed records.
+
+    Bookmarks only work with binary, seekable file-like objects, since
+    only those expose reliable byte offsets.
+
+    The recorded file identity consists of a size and a cryptographic
+    digest of the file prefix up to :attr:`offset`. On restore, data may
+    have been appended (a larger current size is accepted), but any
+    change within the already delivered prefix is rejected with
+    :py:class:`BookmarkError`.
+
+    Instances are immutable and can be (de)serialized to plain ``dict``
+    or JSON strings for persistent storage.
+
+    :ivar version: bookmark format version
+    :ivar offset: byte position after the last delivered record
+    :ivar lineno: number of physical lines fully delivered so far
+    :ivar size: size of the source file when the bookmark was created
+    :ivar digest: hex digest of the file prefix up to ``offset``
+    :ivar algorithm: hash algorithm used for :attr:`digest`
+    :ivar name: optional, informational name of the source file
+    """
+
+    #: Bookmark format version.
+    version: int = BOOKMARK_FORMAT_VERSION
+
+    #: Byte offset after the last fully delivered record.
+    offset: int = 0
+
+    #: Number of physical lines fully delivered so far.
+    lineno: int = 0
+
+    #: Size of the source file at bookmark creation time.
+    size: int = 0
+
+    #: Hex digest of the file prefix up to :attr:`offset`.
+    digest: str = ""
+
+    #: Hash algorithm used for :attr:`digest`.
+    algorithm: str = BOOKMARK_HASH_ALGORITHM
+
+    #: Optional, informational name of the source file.
+    name: Optional[str] = None
+
+    def to_dict(self) -> Dict[str, Any]:
+        """
+        Return the bookmark data as a plain, JSON-serializable dict.
+        """
+        return attr.asdict(self)
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "Bookmark":
+        """
+        Create a bookmark from a dict previously produced by
+        :py:meth:`to_dict`.
+
+        Unknown fields are ignored so that newer bookmark files remain
+        readable by older code, while a missing or unsupported
+        :attr:`version` results in :py:class:`BookmarkError`.
+        """
+        try:
+            version = data["version"]
+        except (KeyError, TypeError) as orig_exc:
+            raise BookmarkError("bookmark is missing a 'version' field") from orig_exc
+        if version != BOOKMARK_FORMAT_VERSION:
+            raise BookmarkError(
+                f"unsupported bookmark version: {version!r} "
+                f"(supported: {BOOKMARK_FORMAT_VERSION})"
+            )
+        fields = {
+            field.name: data[field.name]
+            for field in attr.fields(cls)
+            if field.name in data
+        }
+        try:
+            return cls(**fields)
+        except (TypeError, ValueError) as orig_exc:
+            raise BookmarkError(f"invalid bookmark data: {orig_exc}") from orig_exc
+
+    def to_json(self) -> str:
+        """
+        Serialize the bookmark to a JSON string.
+        """
+        return json.dumps(self.to_dict(), sort_keys=True)
+
+    @classmethod
+    def from_json(cls, value: Union[str, bytes]) -> "Bookmark":
+        """
+        Restore a bookmark from a JSON string produced by
+        :py:meth:`to_json`.
+        """
+        try:
+            data = json.loads(value)
+        except ValueError as orig_exc:
+            raise BookmarkError(f"bookmark is not valid json: {orig_exc}") from orig_exc
+        if not isinstance(data, dict):
+            raise BookmarkError("bookmark json must contain an object")
+        return cls.from_dict(data)
+
+
 @attr.s(auto_attribs=True, repr=False)
 class ReaderWriterBase:
     """
@@ -196,6 +330,12 @@ class Reader(ReaderWriterBase):
 
     Instances are iterable and can be used as a context manager.
 
+    When wrapping a binary, seekable file-like object, a reader can
+    create resumable :py:class:`Bookmark` instances via
+    :py:meth:`bookmark` and resume from them using
+    :py:meth:`restore`. This enables processing large jsonlines streams
+    in batches while keeping a durable, verifiable reading position.
+
     The `loads` argument can be used to replace the standard json
     decoder. If specified, it must be a callable that accepts a
     (unicode) string and returns the decoded object.
@@ -211,14 +351,242 @@ class Reader(ReaderWriterBase):
     _line_iter: Iterator[Tuple[int, Union[bytes, str]]] = attr.ib(init=False)
     _loads: LoadsCallable = attr.ib(default=default_loads, kw_only=True)
 
+    # Bookmark support. This only works for binary, seekable streams, since
+    # those expose meaningful byte offsets. All state is updated lazily so
+    # that readers which never use bookmarks pay (almost) nothing.
+    _bookmark_fp: Optional[typing.IO[bytes]] = attr.ib(default=None, init=False)
+    _bookmark_hasher: Optional["hashlib._Hash"] = attr.ib(default=None, init=False)
+    # Position after the last *fully delivered* record (committed state).
+    _bookmark_offset: int = attr.ib(default=0, init=False)
+    _bookmark_lineno: int = attr.ib(default=0, init=False)
+    # First physical line number yielded by the line iterator. This is 1 for
+    # a fresh reader, or ``bookmark.lineno + 1`` for a restored reader.
+    _first_lineno: int = attr.ib(default=1, init=False)
+    # Name to embed in bookmarks, purely informational.
+    _bookmark_name: Optional[str] = attr.ib(default=None, init=False)
+
     def __attrs_post_init__(self) -> None:
         if isinstance(self._file_or_iterable, io.IOBase):
             self._fp = cast(
                 Union[typing.IO[str], typing.IO[bytes]],
                 self._file_or_iterable,
             )
+            if (
+                isinstance(self._file_or_iterable, (io.RawIOBase, io.BufferedIOBase))
+                and self._file_or_iterable.seekable()
+            ):
+                self._bookmark_fp = cast(
+                    typing.IO[bytes], self._file_or_iterable
+                )
+                self._bookmark_name = repr_for_fp(self._bookmark_fp)
+                # If the stream does not start at its beginning, the bytes
+                # before the current position were never seen by this reader
+                # but still belong to the file prefix. Prime the hasher with
+                # them so later bookmarks digest the whole prefix, and treat
+                # the starting position as the initial committed offset.
+                start_position = self._bookmark_fp.tell()
+                if start_position:
+                    self._bookmark_offset = start_position
+                    self._bookmark_hasher = self._hash_prefix(
+                        self._bookmark_fp, start_position
+                    )
 
-        self._line_iter = enumerate(self._file_or_iterable, 1)
+        self._line_iter = enumerate(self._file_or_iterable, self._first_lineno)
+
+    @staticmethod
+    def _hash_prefix(
+        fp: typing.IO[bytes], length: int
+    ) -> "hashlib._Hash":
+        """
+        Hash the first ``length`` bytes of ``fp`` and restore its position.
+        """
+        hasher = hashlib.new(BOOKMARK_HASH_ALGORITHM)
+        current_position = fp.tell()
+        fp.seek(0)
+        try:
+            remaining = length
+            while remaining:
+                chunk = fp.read(min(remaining, 1024 * 1024))
+                if not chunk:
+                    break
+                hasher.update(chunk)
+                remaining -= len(chunk)
+        finally:
+            fp.seek(current_position)
+        return hasher
+
+    def _get_hasher(self) -> "hashlib._Hash":
+        """
+        Return the running hash of the delivered file prefix.
+
+        The hasher is either primed up front (a restored reader, or a
+        stream opened at a non-zero offset) or created lazily and fed the
+        raw bytes of each line incrementally as records are committed.
+        """
+        if self._bookmark_hasher is None:
+            # Make sure this stream actually supports bookmarks.
+            self._require_bookmark_stream()
+            self._bookmark_hasher = hashlib.new(BOOKMARK_HASH_ALGORITHM)
+        return self._bookmark_hasher
+
+    def _require_bookmark_stream(self) -> typing.IO[bytes]:
+        """
+        Return the underlying stream if bookmarks are supported.
+        """
+        if self._bookmark_fp is None:
+            raise BookmarkError(
+                "bookmarks require a binary, seekable file-like object; "
+                "text streams and plain iterables do not provide byte offsets"
+            )
+        return self._bookmark_fp
+
+    def _stream_size(self, fp: typing.IO[bytes]) -> int:
+        """
+        Return the current size of the underlying stream.
+
+        This temporarily seeks to the end and restores the position, so it
+        does not disturb ongoing iteration.
+        """
+        current_position = fp.tell()
+        try:
+            return fp.seek(0, io.SEEK_END)
+        finally:
+            fp.seek(current_position)
+
+    def bookmark(self) -> Bookmark:
+        """
+        Return a :py:class:`Bookmark` for the current reading position.
+
+        The bookmark points at the byte (and line) directly *after* the
+        last record that was fully and successfully delivered. It can be
+        persisted and later passed to :py:meth:`restore` to continue
+        reading without re-processing delivered records.
+
+        A bookmark is only available for a binary, seekable stream. It is
+        an error to request one while the stream is positioned past the
+        last delivered record, e.g. directly after an
+        :py:exc:`InvalidLineError`, since a bookmark must never point at a
+        half UTF-8 character or an undelivered (bad) line. Continue
+        reading to get past the offending line, or use the previously
+        returned bookmark instead.
+
+        :raises BookmarkError: if bookmarks are not supported, or if the
+            stream is not positioned at a safe record boundary
+        """
+        fp = self._require_bookmark_stream()
+        if self._closed:
+            raise RuntimeError("reader is closed")
+        if fp.tell() != self._bookmark_offset:
+            raise BookmarkError(
+                "stream is positioned past the last fully delivered record; "
+                "a bookmark can only be created on a record boundary, not on "
+                "a partial UTF-8 character or an undelivered (bad) line"
+            )
+        digest = self._get_hasher().hexdigest()
+        return Bookmark(
+            offset=self._bookmark_offset,
+            lineno=self._bookmark_lineno,
+            size=self._stream_size(fp),
+            digest=digest,
+            algorithm=BOOKMARK_HASH_ALGORITHM,
+            name=self._bookmark_name,
+        )
+
+    @classmethod
+    def restore(
+        cls,
+        file_or_iterable: Union[typing.IO[bytes], "os.PathLike[str]", str, int],
+        bookmark: Bookmark,
+        *,
+        loads: Optional[LoadsCallable] = None,
+    ) -> "Reader":
+        """
+        Reopen a jsonlines stream and continue reading at a bookmark.
+
+        The given stream must be binary and seekable. Its already
+        delivered prefix is verified against the bookmark's recorded file
+        identity before anything is returned:
+
+        * the current size must be at least the recorded offset,
+        * the digest of the file prefix must match the bookmark digest.
+
+        Data appended after the bookmark is accepted, but any change to
+        the already delivered prefix (or truncation before the offset) is
+        rejected with :py:class:`BookmarkError`.
+
+        On success the stream is positioned exactly at
+        :attr:`Bookmark.offset`, so the next :py:meth:`read` yields the
+        first not-yet-delivered record. This method never re-delivers
+        already committed records.
+
+        The caller retains ownership of the stream: it is not closed by
+        the reader, and the caller remains responsible for closing it.
+
+        :param file_or_iterable: a binary, seekable file-like object, or
+            a path / file descriptor to open in binary mode
+        :param bookmark: the bookmark to restore
+        :param loads: optional custom json decoder callable
+        """
+        opened_here = not isinstance(file_or_iterable, io.IOBase)
+        fp: typing.IO[bytes]
+        if opened_here:
+            fp = builtins.open(file_or_iterable, mode="rb")  # type: ignore[arg-type]
+        else:
+            fp = cast(typing.IO[bytes], file_or_iterable)
+            if not isinstance(fp, (io.RawIOBase, io.BufferedIOBase)):
+                raise BookmarkError(
+                    "restoring a bookmark requires a binary, seekable "
+                    "file-like object"
+                )
+
+        if not fp.seekable():
+            raise BookmarkError("restoring a bookmark requires a seekable stream")
+
+        try:
+            current_size = fp.seek(0, io.SEEK_END)
+            if current_size < bookmark.offset:
+                raise BookmarkError(
+                    f"stream was truncated: size {current_size} is smaller than "
+                    f"bookmark offset {bookmark.offset}"
+                )
+            if bookmark.algorithm != BOOKMARK_HASH_ALGORITHM:
+                raise BookmarkError(
+                    f"unsupported bookmark hash algorithm: "
+                    f"{bookmark.algorithm!r} (supported: {BOOKMARK_HASH_ALGORITHM})"
+                )
+
+            # Verify the immutable, already delivered prefix.
+            hasher = cls._hash_prefix(fp, bookmark.offset)
+            if hasher.hexdigest() != bookmark.digest:
+                raise BookmarkError(
+                    "file prefix does not match bookmark: the already "
+                    "delivered data has changed"
+                )
+
+            # Position exactly on the record boundary. This is guaranteed to
+            # start a complete UTF-8 sequence, since the bookmark only points
+            # at record boundaries. The Reader constructor will prime its own
+            # hasher with this same verified prefix.
+            fp.seek(bookmark.offset)
+        except BaseException:
+            if opened_here:
+                fp.close()
+            raise
+
+        kwargs: Dict[str, Any] = {}
+        if loads is not None:
+            kwargs["loads"] = loads
+        reader = cls(fp, **kwargs)
+        if opened_here:
+            # Keep stream ownership explicit: only close what we opened.
+            reader._should_close_fp = True
+        reader._bookmark_offset = bookmark.offset
+        reader._bookmark_lineno = bookmark.lineno
+        reader._first_lineno = bookmark.lineno + 1
+        # The line iterator was created in __attrs_post_init__ starting at
+        # line 1; rebuild it so line numbering continues past the prefix.
+        reader._line_iter = enumerate(fp, reader._first_lineno)
+        return reader
 
     # No type specified, None not allowed
     @overload
@@ -303,13 +671,23 @@ class Reader(ReaderWriterBase):
         if type is not None and type not in VALID_TYPES:
             raise ValueError("invalid type specified")
 
+        # When bookmarking is possible, remember the raw bytes of every
+        # physical line consumed by this call. Empty lines skipped via
+        # 'skip_empty' are part of the stream and therefore included. The
+        # state is only *committed* below, once the record has been fully
+        # decoded and validated, so a failure never advances the bookmark.
+        raw_lines: List[bytes] = []
+        track_bytes = self._bookmark_fp is not None
         try:
             lineno, line = next(self._line_iter)
+            if track_bytes and isinstance(line, bytes):
+                raw_lines.append(line)
             while skip_empty and not line.rstrip():
                 lineno, line = next(self._line_iter)
+                if track_bytes and isinstance(line, bytes):
+                    raw_lines.append(line)
         except StopIteration:
             raise EOFError from None
-
         if isinstance(line, bytes):
             try:
                 line = line.decode("utf-8")
@@ -332,6 +710,7 @@ class Reader(ReaderWriterBase):
 
         if value is None:
             if allow_none:
+                self._commit_bookmark(raw_lines, lineno)
                 return None
             raise InvalidLineError("line contains null value", line, lineno)
 
@@ -345,7 +724,27 @@ class Reader(ReaderWriterBase):
                     "line does not match requested type", line, lineno
                 )
 
+        self._commit_bookmark(raw_lines, lineno)
         return value
+
+    def _commit_bookmark(
+        self, raw_lines: List[bytes], lineno: int
+    ) -> None:
+        """
+        Advance the committed bookmark position after a delivered record.
+
+        This is only called once a line has been read completely and
+        decoded successfully, so the recorded offset always points at the
+        boundary *after* a full record (and a full UTF-8 sequence), never
+        at a half character or an undelivered (bad) line.
+        """
+        if self._bookmark_fp is None:
+            return
+        hasher = self._get_hasher()
+        for raw_line in raw_lines:
+            hasher.update(raw_line)
+        self._bookmark_offset = self._bookmark_fp.tell()
+        self._bookmark_lineno = lineno
 
     # No type specified, None not allowed
     @overload

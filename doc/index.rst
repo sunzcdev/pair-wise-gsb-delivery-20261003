@@ -53,6 +53,8 @@ Features
   * can be used as a context manager
   * allows complete control over decoding using a custom ``loads``
     callable
+  * supports resumable batch processing of large binary files through
+    :py:class:`~jsonlines.Bookmark`
 
 * Flexible :py:class:`~jsonlines.Writer`
 
@@ -158,6 +160,66 @@ This should be enough to get started. See the API docs below for
 more details.
 
 
+Resumable reading with bookmarks
+================================
+
+When processing a large jsonlines file in batches, it is useful to
+remember how far processing has progressed so that a restart does not
+re-process records that were already handled. The
+:py:class:`Reader` supports this with :py:class:`Bookmark` objects,
+but only when wrapping a **binary, seekable** file-like object (for
+example a file opened with ``open(path, "rb")``). Text streams and
+plain iterables do not expose reliable byte offsets and therefore
+cannot produce bookmarks.
+
+A bookmark records the position *after* the last record that was fully
+and successfully delivered to the caller:
+
+* the byte :py:attr:`~Bookmark.offset` at which to resume,
+* the physical :py:attr:`~Bookmark.lineno` delivered so far,
+* a verifiable file identity, namely the file :py:attr:`~Bookmark.size`
+  and a cryptographic :py:attr:`~Bookmark.digest` of the delivered
+  file prefix.
+
+Because the state is only committed once a record has been read and
+decoded completely, a bookmark always lands on a record boundary,
+never in the middle of a multi-byte UTF-8 character or an undelivered
+(bad) line. Requesting a bookmark while the stream is positioned past
+the last delivered record — for example, directly after an
+:py:class:`InvalidLineError` — raises :py:class:`BookmarkError`;
+continue reading to get past the offending line, or reuse the previous
+bookmark.
+
+::
+
+  with open("events.jsonl", "rb") as fp:
+      reader = jsonlines.Reader(fp)
+      for obj in reader:
+          handle(obj)
+          bookmark = reader.bookmark()   # safe record boundary
+          save(bookmark.to_json())       # persist wherever you like
+
+On restart, pass the stored bookmark back to
+:py:meth:`Reader.restore`. The already delivered prefix is verified
+before any data is returned. Data appended after the bookmark is
+accepted, while any change within the delivered prefix — or
+truncation before the bookmark offset — raises
+:py:class:`BookmarkError`:
+
+::
+
+  bookmark = jsonlines.Bookmark.from_json(saved_bookmark)
+  with jsonlines.Reader.restore("events.jsonl", bookmark) as reader:
+      for obj in reader:                # already delivered records are
+          handle(obj)                   # never re-delivered
+
+When a path (or file descriptor) is passed to
+:py:meth:`~Reader.restore`, the opened file is owned and closed by the
+reader. When an already opened file-like object is passed, the caller
+keeps ownership and remains responsible for closing it, just like with
+a regular :py:class:`Reader`.
+
+
 API
 ===
 
@@ -171,10 +233,16 @@ API
    :members:
    :inherited-members:
 
+.. autoclass:: jsonlines.Bookmark
+   :members:
+
 .. autoclass:: jsonlines.Error
    :members:
 
 .. autoclass:: jsonlines.InvalidLineError
+   :members:
+
+.. autoclass:: jsonlines.BookmarkError
    :members:
 
 
@@ -188,6 +256,17 @@ The source code and issue tracker for this package can be found on GitHub:
 
 Version history
 ===============
+
+* 4.1.0, not yet released
+
+  * add resumable reading for binary, seekable streams through
+    :py:class:`Bookmark`, created by
+    :py:meth:`Reader.bookmark()` and restored by
+    :py:meth:`Reader.restore()`. A bookmark records the byte offset
+    and line number after the last fully delivered record plus a
+    verifiable file identity (size and a digest of the delivered
+    prefix). Appended data is accepted on restore while a changed
+    prefix or truncation is rejected.
 
 * 4.0.0, released at 2023-09-01
 
