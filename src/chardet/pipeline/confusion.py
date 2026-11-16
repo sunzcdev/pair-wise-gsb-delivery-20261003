@@ -17,6 +17,7 @@ import struct
 import unicodedata
 import warnings
 
+from chardet._lazy import lazy
 from chardet.models import (
     ART_LANGUAGE,
     BigramProfile,
@@ -115,9 +116,13 @@ def deserialize_confusion_data_from_bytes(data: bytes) -> DistinguishingMaps:
     return result
 
 
-@functools.cache
+@lazy(name="confusion.bin")
 def load_confusion_data() -> DistinguishingMaps:
     """Load confusion group data from the bundled confusion.bin file.
+
+    The lazy boundary gives concurrent first calls one shared load and
+    lets a transient read failure be retried on the next call
+    (:mod:`chardet._lazy`).
 
     :returns: A :data:`DistinguishingMaps` dictionary keyed by encoding pairs.
     """

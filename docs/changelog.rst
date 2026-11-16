@@ -67,6 +67,20 @@ Unreleased
 
 **Bug Fixes:**
 
+- Concurrent first use of a lazily loaded model no longer duplicates the
+  load or publishes a half-built table.  The model and artifact loaders
+  (``models.bin``, ``rowmax.bin``, ``langnorm.bin``, ``idf.bin``,
+  ``confusion.bin`` and the encoding index) now share one single-flight
+  publication boundary per resource: the first caller loads, other threads
+  wait for its finished, immutable result, and each resource carries its
+  own lock so two models never serialize against each other and scoring
+  takes no global lock.  A read or parse failure is handed to every waiter
+  with its original exception — format errors (``ValueError``) and
+  unreadable files (``OSError``) diagnosed separately — and is then
+  dropped, so one temporary failure is retried on the next call instead of
+  disabling detection for the rest of the process.
+  (`Dan Blanchard <https://github.com/dan-blanchard>`_ via Claude,
+  `#439 <https://github.com/chardet/chardet/pull/439>`_)
 - The warning for an excluded ``no_match_encoding`` now points at the
   caller's line when the fallback is reached past the evidence cap.  It
   used to name ``chardet/__init__.py`` on that one path.

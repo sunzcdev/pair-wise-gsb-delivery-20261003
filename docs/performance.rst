@@ -646,9 +646,18 @@ Thread Safety
 -------------
 
 :func:`chardet.detect` and :func:`chardet.detect_all` are fully thread-safe.
-Each call carries its own state; what threads share is read-only tables
-and caches that are filled idempotently. Thread safety adds no
-measurable overhead (< 0.1%).
+Each call carries its own state; what threads share is read-only tables and
+the lazily loaded model artifacts. Each artifact (``models.bin``,
+``rowmax.bin``, ``langnorm.bin``, ``idf.bin``, ``confusion.bin`` and the
+encoding index) sits behind its own single-flight publication boundary:
+concurrent first calls collapse onto one load and share its finished,
+immutable result, so no thread can observe a half-built table. The
+boundaries are per-resource — a slow read for one artifact never blocks a
+different one, and scoring itself takes no shared lock at all. A load
+failure propagates its original exception (format errors and unreadable
+files diagnosed separately) and is then dropped, so the next call retries
+instead of inheriting one transient failure for the life of the process.
+Thread safety adds no measurable overhead (< 0.1%).
 
 On free-threaded Python (GIL disabled), detection scales with threads.
 Standard GIL Python shows no scaling --- the GIL serializes threads.

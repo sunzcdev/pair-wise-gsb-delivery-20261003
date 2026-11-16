@@ -110,3 +110,55 @@ def test_cold_cache_concurrent_init():
         _confusion.load_confusion_data.cache_clear()
         _registry.lookup_encoding.cache_clear()
         _registry.get_candidates.cache_clear()
+
+
+@pytest.mark.serial
+def test_lazy_loaders_single_flight_under_contention():
+    """The lazy loaders publish one result no matter how many threads race.
+
+    Every concurrent first call must collapse onto a single loader
+    invocation per resource, and all waiters must receive the exact same
+    published object rather than racing on half-built tables.  Repeated
+    cold-cache rounds exercise the failure-forgetting retry boundary too:
+    a reset between rounds must leave the loader usable again.
+    """
+    import chardet.models as _models  # noqa: PLC0415
+
+    loaders = (_models._load_models_data, _models.get_enc_index)
+
+    def round_once() -> list[str]:
+        round_errors: list[str] = []
+        barrier = threading.Barrier(8)
+        results: list[object] = []
+
+        def worker() -> None:
+            barrier.wait()
+            try:
+                for loader in loaders:
+                    results.append(loader())
+            except Exception as exc:  # reported, not swallowed by the thread
+                round_errors.append(repr(exc))
+
+        threads = [threading.Thread(target=worker) for _ in range(8)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+
+        # One result per (thread, loader); they must all be the same two
+        # objects because each loader ran exactly once.
+        if len(results) != 16 or len({id(item) for item in results}) != 2:
+            round_errors.append(
+                f"expected two shared objects across 16 gets, got {results!r}"
+            )
+        return round_errors
+
+    try:
+        for _ in range(3):
+            for loader in loaders:
+                loader.cache_clear()
+            errors = round_once()
+            assert not errors, "Lazy single-flight violations:\n" + "\n".join(errors)
+    finally:
+        for loader in loaders:
+            loader.cache_clear()

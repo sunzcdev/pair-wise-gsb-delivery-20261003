@@ -6,7 +6,6 @@ annotations.
 """
 
 import array
-import functools
 import hashlib
 import importlib.resources
 import math
@@ -16,6 +15,7 @@ import warnings
 
 from chardet import _kernel
 from chardet._kernel import dot_packed, pack_profile
+from chardet._lazy import lazy
 from chardet.models._format import (
     langnorm_from_table,
     parse_langnorm_bin,
@@ -76,11 +76,14 @@ for _enc in REGISTRY.values():
         _SINGLE_LANG_MAP[_enc.name] = _enc.languages[0]
 
 
-@functools.cache
+@lazy(name="models.bin")
 def _load_models_data() -> tuple[dict[str, bytes], dict[str, float]]:
     """Load and parse models.bin, returning (models, norms).
 
-    Cached: only reads from disk on first call.
+    Lazily cached with a single-flight, failure-forgetting publication
+    boundary (see :class:`chardet._lazy.LazyResource`): the first caller
+    reads the file, concurrent callers share its finished result, and a
+    failed read is retried on the next call instead of being remembered.
     """
     ref = importlib.resources.files("chardet.models").joinpath("models.bin")
     data = ref.read_bytes()
@@ -131,7 +134,7 @@ def _build_enc_index(
     return index
 
 
-@functools.cache
+@lazy(name="encoding model index")
 def get_enc_index() -> dict[str, list[tuple[str | None, bytes, str]]]:
     """Return a pre-grouped index mapping encoding name -> [(lang, model, model_key), ...]."""
     return _build_enc_index(load_models())
@@ -161,7 +164,7 @@ def _get_model_norms() -> dict[str, float]:
     return _load_models_data()[1]
 
 
-@functools.cache
+@lazy(name="rowmax.bin")
 def get_rowmax() -> dict[str, bytes]:
     """Return per-model row-maximum tables for upper-bound prescreening.
 
@@ -205,7 +208,7 @@ def get_rowmax() -> dict[str, bytes]:
     return {key: rowmax_from_table(table) for key, table in models.items()}
 
 
-@functools.cache
+@lazy(name="langnorm.bin")
 def get_language_norms() -> dict[str, float]:
     """Return per-model norms for language scoring, keyed by model key.
 
@@ -250,7 +253,7 @@ def get_language_norms() -> dict[str, float]:
 _LANGUAGE_SCALE_FACTOR = 16
 
 
-@functools.cache
+@lazy(name="language scale table")
 def get_language_scale() -> bytes:
     """Return the 65536-byte root-IDF table the language profile multiplies by.
 
@@ -268,7 +271,7 @@ def get_language_scale() -> bytes:
     return bytes(roots[v] for v in idf)
 
 
-@functools.cache
+@lazy(name="idf.bin")
 def get_idf_weights() -> bytes:
     """Return a 65536-byte IDF weight table for bigram profile construction.
 
