@@ -21,12 +21,18 @@ from ._config import (
 )
 from ._decoders import SUPPORTED_DECODERS
 from ._exceptions import (
+    ClientClosed,
     InvalidURL,
     RemoteProtocolError,
     TooManyRedirects,
     request_context,
 )
 from ._models import Cookies, Headers, Request, Response
+from ._origin_limits import (
+    AsyncOriginLimiter,
+    OriginLimiter,
+    OriginPermit,
+)
 from ._status_codes import codes
 from ._transports.base import AsyncBaseTransport, BaseTransport
 from ._transports.default import AsyncHTTPTransport, HTTPTransport
@@ -140,46 +146,90 @@ class BoundSyncStream(SyncByteStream):
     """
     A byte stream that is bound to a given response instance, and that
     ensures the `response.elapsed` is set once the response is closed.
+
+    If a per-origin permit was acquired before sending the request, then the
+    stream also ensures that the permit is released once the response body has
+    been exhausted, or once the response has been closed.
     """
 
     def __init__(
-        self, stream: SyncByteStream, response: Response, start: float
+        self,
+        stream: SyncByteStream,
+        response: Response,
+        start: float,
+        permit: OriginPermit | None = None,
     ) -> None:
         self._stream = stream
         self._response = response
         self._start = start
+        self._permit = permit
 
     def __iter__(self) -> typing.Iterator[bytes]:
-        for chunk in self._stream:
-            yield chunk
+        try:
+            for chunk in self._stream:
+                yield chunk
+        except BaseException:
+            self._release_permit()
+            raise
+        self._release_permit()
 
     def close(self) -> None:
         elapsed = time.perf_counter() - self._start
         self._response.elapsed = datetime.timedelta(seconds=elapsed)
-        self._stream.close()
+        try:
+            self._stream.close()
+        finally:
+            self._release_permit()
+
+    def _release_permit(self) -> None:
+        if self._permit is not None:
+            self._permit.release()
+            self._permit = None
 
 
 class BoundAsyncStream(AsyncByteStream):
     """
     An async byte stream that is bound to a given response instance, and that
     ensures the `response.elapsed` is set once the response is closed.
+
+    If a per-origin permit was acquired before sending the request, then the
+    stream also ensures that the permit is released once the response body has
+    been exhausted, or once the response has been closed.
     """
 
     def __init__(
-        self, stream: AsyncByteStream, response: Response, start: float
+        self,
+        stream: AsyncByteStream,
+        response: Response,
+        start: float,
+        permit: OriginPermit | None = None,
     ) -> None:
         self._stream = stream
         self._response = response
         self._start = start
+        self._permit = permit
 
     async def __aiter__(self) -> typing.AsyncIterator[bytes]:
-        async for chunk in self._stream:
-            yield chunk
+        try:
+            async for chunk in self._stream:
+                yield chunk
+        except BaseException:
+            self._release_permit()
+            raise
+        self._release_permit()
 
     async def aclose(self) -> None:
         elapsed = time.perf_counter() - self._start
         self._response.elapsed = datetime.timedelta(seconds=elapsed)
-        await self._stream.aclose()
+        try:
+            await self._stream.aclose()
+        finally:
+            self._release_permit()
+
+    def _release_permit(self) -> None:
+        if self._permit is not None:
+            self._permit.release()
+            self._permit = None
 
 
 EventHook = typing.Callable[..., typing.Any]
@@ -219,6 +269,10 @@ class BaseClient:
         self._trust_env = trust_env
         self._default_encoding = default_encoding
         self._state = ClientState.UNOPENED
+
+        # Clients that are configured with a per-origin limit set this to either
+        # an `OriginLimiter` or an `AsyncOriginLimiter` instance.
+        self._origin_limiter: OriginLimiter | AsyncOriginLimiter | None = None
 
     @property
     def is_closed(self) -> bool:
@@ -673,6 +727,9 @@ class Client(BaseClient):
             default_encoding=default_encoding,
         )
 
+        if limits.max_connections_per_origin is not None:
+            self._origin_limiter = OriginLimiter(limits.max_connections_per_origin)
+
         if http2:
             try:
                 import h2  # noqa
@@ -898,7 +955,7 @@ class Client(BaseClient):
         [0]: /advanced/clients/#request-instances
         """
         if self._state == ClientState.CLOSED:
-            raise RuntimeError("Cannot send a request, as the client has been closed.")
+            raise ClientClosed("Cannot send a request, as the client has been closed.")
 
         self._state = ClientState.OPENED
         follow_redirects = (
@@ -973,10 +1030,22 @@ class Client(BaseClient):
                     "Exceeded maximum allowed redirects.", request=request
                 )
 
-            for hook in self._event_hooks["request"]:
-                hook(request)
+            # Requests queued behind a per-origin concurrency limit are admitted
+            # in arrival order. Admission happens before the request hooks run,
+            # because a request is not "about to be sent" until it has been
+            # admitted for its origin.
+            permit = self._acquire_origin_permit(request)
 
-            response = self._send_single_request(request)
+            try:
+                for hook in self._event_hooks["request"]:
+                    hook(request)
+
+                response = self._send_single_request(request, permit)
+            except BaseException:
+                if permit is not None:
+                    permit.release()
+                raise
+
             try:
                 for hook in self._event_hooks["response"]:
                     hook(response)
@@ -989,6 +1058,9 @@ class Client(BaseClient):
                 history = history + [response]
 
                 if follow_redirects:
+                    # Consuming the body releases the permit for this origin
+                    # before the next redirect is admitted, so a cross-origin
+                    # redirect never holds permits for two origins at once.
                     response.read()
                 else:
                     response.next_request = request
@@ -998,7 +1070,21 @@ class Client(BaseClient):
                 response.close()
                 raise exc
 
-    def _send_single_request(self, request: Request) -> Response:
+    def _acquire_origin_permit(self, request: Request) -> OriginPermit | None:
+        """
+        Acquire a permit for the request's origin, if per-origin limits are in
+        use. This may block while the origin is at its concurrency limit.
+        """
+        if self._origin_limiter is None:
+            return None
+
+        assert isinstance(self._origin_limiter, OriginLimiter)
+        with request_context(request=request):
+            return self._origin_limiter.acquire(request.url)
+
+    def _send_single_request(
+        self, request: Request, permit: OriginPermit | None = None
+    ) -> Response:
         """
         Sends a single request, without handling any redirections.
         """
@@ -1010,26 +1096,47 @@ class Client(BaseClient):
                 "Attempted to send an async request with a sync Client instance."
             )
 
-        with request_context(request=request):
-            response = transport.handle_request(request)
+        response: Response | None = None
+        try:
+            with request_context(request=request):
+                response = transport.handle_request(request)
 
-        assert isinstance(response.stream, SyncByteStream)
+            assert isinstance(response.stream, SyncByteStream)
 
-        response.request = request
-        response.stream = BoundSyncStream(
-            response.stream, response=response, start=start
-        )
-        self.cookies.extract_cookies(response)
-        response.default_encoding = self._default_encoding
+            response.request = request
+            response.stream = BoundSyncStream(
+                response.stream, response=response, start=start, permit=permit
+            )
+            # From this point on the permit is owned by the response stream, and
+            # is released once the body has been exhausted or the response has
+            # been closed.
 
-        logger.info(
-            'HTTP Request: %s %s "%s %d %s"',
-            request.method,
-            request.url,
-            response.http_version,
-            response.status_code,
-            response.reason_phrase,
-        )
+            if response.is_closed and permit is not None:
+                # A transport may hand back an already-completed response, in
+                # which case there is no body left to hold the permit for.
+                permit.release()
+
+            self.cookies.extract_cookies(response)
+            response.default_encoding = self._default_encoding
+
+            logger.info(
+                'HTTP Request: %s %s "%s %d %s"',
+                request.method,
+                request.url,
+                response.http_version,
+                response.status_code,
+                response.reason_phrase,
+            )
+        except BaseException:
+            # Failing to send, or failing to set up the response, must not leak
+            # the permit. The permit is released before closing the response, so
+            # it is returned even if closing is interrupted. Releasing twice is
+            # harmless, so the caller may release it again.
+            if permit is not None:
+                permit.release()
+            if response is not None and isinstance(response.stream, SyncByteStream):
+                response.close()
+            raise
 
         return response
 
@@ -1263,9 +1370,15 @@ class Client(BaseClient):
     def close(self) -> None:
         """
         Close transport and proxies.
+
+        Any requests that are still queued behind a per-origin concurrency
+        limit are woken up and fail with `httpx.ClientClosed`.
         """
         if self._state != ClientState.CLOSED:
             self._state = ClientState.CLOSED
+
+            if self._origin_limiter is not None:
+                self._origin_limiter.close()
 
             self._transport.close()
             for transport in self._mounts.values():
@@ -1297,6 +1410,9 @@ class Client(BaseClient):
         traceback: TracebackType | None = None,
     ) -> None:
         self._state = ClientState.CLOSED
+
+        if self._origin_limiter is not None:
+            self._origin_limiter.close()
 
         self._transport.__exit__(exc_type, exc_value, traceback)
         for transport in self._mounts.values():
@@ -1386,6 +1502,9 @@ class AsyncClient(BaseClient):
             trust_env=trust_env,
             default_encoding=default_encoding,
         )
+
+        if limits.max_connections_per_origin is not None:
+            self._origin_limiter = AsyncOriginLimiter(limits.max_connections_per_origin)
 
         if http2:
             try:
@@ -1613,7 +1732,7 @@ class AsyncClient(BaseClient):
         [0]: /advanced/clients/#request-instances
         """
         if self._state == ClientState.CLOSED:
-            raise RuntimeError("Cannot send a request, as the client has been closed.")
+            raise ClientClosed("Cannot send a request, as the client has been closed.")
 
         self._state = ClientState.OPENED
         follow_redirects = (
@@ -1688,10 +1807,22 @@ class AsyncClient(BaseClient):
                     "Exceeded maximum allowed redirects.", request=request
                 )
 
-            for hook in self._event_hooks["request"]:
-                await hook(request)
+            # Requests queued behind a per-origin concurrency limit are admitted
+            # in arrival order. Admission happens before the request hooks run,
+            # because a request is not "about to be sent" until it has been
+            # admitted for its origin.
+            permit = await self._acquire_origin_permit(request)
 
-            response = await self._send_single_request(request)
+            try:
+                for hook in self._event_hooks["request"]:
+                    await hook(request)
+
+                response = await self._send_single_request(request, permit)
+            except BaseException:
+                if permit is not None:
+                    permit.release()
+                raise
+
             try:
                 for hook in self._event_hooks["response"]:
                     await hook(response)
@@ -1705,6 +1836,9 @@ class AsyncClient(BaseClient):
                 history = history + [response]
 
                 if follow_redirects:
+                    # Consuming the body releases the permit for this origin
+                    # before the next redirect is admitted, so a cross-origin
+                    # redirect never holds permits for two origins at once.
                     await response.aread()
                 else:
                     response.next_request = request
@@ -1714,7 +1848,21 @@ class AsyncClient(BaseClient):
                 await response.aclose()
                 raise exc
 
-    async def _send_single_request(self, request: Request) -> Response:
+    async def _acquire_origin_permit(self, request: Request) -> OriginPermit | None:
+        """
+        Acquire a permit for the request's origin, if per-origin limits are in
+        use. This may wait while the origin is at its concurrency limit.
+        """
+        if self._origin_limiter is None:
+            return None
+
+        assert isinstance(self._origin_limiter, AsyncOriginLimiter)
+        with request_context(request=request):
+            return await self._origin_limiter.acquire(request.url)
+
+    async def _send_single_request(
+        self, request: Request, permit: OriginPermit | None = None
+    ) -> Response:
         """
         Sends a single request, without handling any redirections.
         """
@@ -1726,25 +1874,47 @@ class AsyncClient(BaseClient):
                 "Attempted to send a sync request with an AsyncClient instance."
             )
 
-        with request_context(request=request):
-            response = await transport.handle_async_request(request)
+        response: Response | None = None
+        try:
+            with request_context(request=request):
+                response = await transport.handle_async_request(request)
 
-        assert isinstance(response.stream, AsyncByteStream)
-        response.request = request
-        response.stream = BoundAsyncStream(
-            response.stream, response=response, start=start
-        )
-        self.cookies.extract_cookies(response)
-        response.default_encoding = self._default_encoding
+            assert isinstance(response.stream, AsyncByteStream)
+            response.request = request
+            response.stream = BoundAsyncStream(
+                response.stream, response=response, start=start, permit=permit
+            )
+            # From this point on the permit is owned by the response stream, and
+            # is released once the body has been exhausted or the response has
+            # been closed.
 
-        logger.info(
-            'HTTP Request: %s %s "%s %d %s"',
-            request.method,
-            request.url,
-            response.http_version,
-            response.status_code,
-            response.reason_phrase,
-        )
+            if response.is_closed and permit is not None:
+                # A transport may hand back an already-completed response, in
+                # which case there is no body left to hold the permit for.
+                permit.release()
+
+            self.cookies.extract_cookies(response)
+            response.default_encoding = self._default_encoding
+
+            logger.info(
+                'HTTP Request: %s %s "%s %d %s"',
+                request.method,
+                request.url,
+                response.http_version,
+                response.status_code,
+                response.reason_phrase,
+            )
+        except BaseException:
+            # Failing to send, or failing to set up the response, must not leak
+            # the permit. Cancelling the request also falls through here. The
+            # permit is released before closing the response, so it is returned
+            # even if closing is interrupted. Releasing twice is harmless, so
+            # the caller may release it again.
+            if permit is not None:
+                permit.release()
+            if response is not None and isinstance(response.stream, AsyncByteStream):
+                await response.aclose()
+            raise
 
         return response
 
@@ -1978,9 +2148,15 @@ class AsyncClient(BaseClient):
     async def aclose(self) -> None:
         """
         Close transport and proxies.
+
+        Any requests that are still queued behind a per-origin concurrency
+        limit are woken up and fail with `httpx.ClientClosed`.
         """
         if self._state != ClientState.CLOSED:
             self._state = ClientState.CLOSED
+
+            if self._origin_limiter is not None:
+                self._origin_limiter.close()
 
             await self._transport.aclose()
             for proxy in self._mounts.values():
@@ -2012,6 +2188,9 @@ class AsyncClient(BaseClient):
         traceback: TracebackType | None = None,
     ) -> None:
         self._state = ClientState.CLOSED
+
+        if self._origin_limiter is not None:
+            self._origin_limiter.close()
 
         await self._transport.__aexit__(exc_type, exc_value, traceback)
         for proxy in self._mounts.values():

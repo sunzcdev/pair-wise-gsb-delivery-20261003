@@ -160,6 +160,21 @@ what gets sent over the wire.*
 * `def clear([domain], [path])`
 * *Standard mutable mapping interface*
 
+## `Limits`
+
+*A configuration of the connection pool and of any per-origin concurrency limits.*
+
+```pycon
+>>> limits = Limits(max_connections=100, max_connections_per_origin=4)
+>>> client = Client(limits=limits)
+```
+
+* `def __init__(*, [max_connections], [max_keepalive_connections], [keepalive_expiry], [max_connections_per_origin])`
+* `.max_connections` - **Optional[int]**
+* `.max_keepalive_connections` - **Optional[int]**
+* `.keepalive_expiry` - **Optional[float]**
+* `.max_connections_per_origin` - **Optional[int]**
+
 ## `Proxy`
 
 *A configuration of the proxy server.*

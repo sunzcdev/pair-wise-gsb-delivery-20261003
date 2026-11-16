@@ -40,6 +40,7 @@ __all__ = [
     "BasicAuth",
     "ByteStream",
     "Client",
+    "ClientClosed",
     "CloseError",
     "codes",
     "ConnectError",

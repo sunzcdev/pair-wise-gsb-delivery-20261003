@@ -24,6 +24,7 @@ Our exception hierarchy:
   x HTTPStatusError
 * InvalidURL
 * CookieConflict
+* ClientClosed
 * StreamError
   x StreamConsumed
   x StreamClosed
@@ -40,6 +41,7 @@ if typing.TYPE_CHECKING:
     from ._models import Request, Response  # pragma: no cover
 
 __all__ = [
+    "ClientClosed",
     "CloseError",
     "ConnectError",
     "ConnectTimeout",
@@ -286,6 +288,18 @@ class CookieConflict(Exception):
 
     def __init__(self, message: str) -> None:
         super().__init__(message)
+
+
+class ClientClosed(RequestError, RuntimeError):
+    """
+    Attempted to send a request on a client that has been closed.
+
+    This is also raised for requests that were still queued behind a
+    per-origin concurrency limit when the client was closed.
+    """
+
+    def __init__(self, message: str, *, request: Request | None = None) -> None:
+        super().__init__(message, request=request)
 
 
 # Stream exceptions...

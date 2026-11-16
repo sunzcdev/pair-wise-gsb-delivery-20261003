@@ -26,6 +26,7 @@ For an overview of how to work with HTTPX exceptions, see [Exceptions (Quickstar
             * UnsupportedProtocol
         * DecodingError
         * TooManyRedirects
+        * ClientClosed
     * HTTPStatusError
 * InvalidURL
 * CookieConflict
@@ -97,6 +98,9 @@ For an overview of how to work with HTTPX exceptions, see [Exceptions (Quickstar
     :docstring:
 
 ::: httpx.TooManyRedirects
+    :docstring:
+
+::: httpx.ClientClosed
     :docstring:
 
 ::: httpx.HTTPStatusError

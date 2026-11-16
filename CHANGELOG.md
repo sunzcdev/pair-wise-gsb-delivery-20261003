@@ -13,6 +13,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 ### Added
 
 * Expose `FunctionAuth` from the public API. (#3699)
+* Add `Limits(max_connections_per_origin=...)` for capping the number of
+  in-flight requests per origin, along with the `httpx.ClientClosed` exception
+  used to report requests that were still queued when a client was closed.
 
 ## 0.28.1 (6th December, 2024)
 
