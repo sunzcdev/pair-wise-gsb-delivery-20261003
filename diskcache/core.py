@@ -39,6 +39,10 @@ DBNAME = 'cache.db'
 ENOVAL = Constant('ENOVAL')
 UNKNOWN = Constant('UNKNOWN')
 
+# Pins are leased so that pins abandoned by processes that exit abnormally
+# are reclaimed within a bounded time. The lease is clamped to one hour.
+PIN_LEASE_MAX = 3600.0
+
 MODE_NONE = 0
 MODE_RAW = 1
 MODE_BINARY = 2
@@ -372,6 +376,100 @@ class JSONDisk(Disk):
         return data
 
 
+class Pin:
+    """Handle to a pinned file-backed cache value.
+
+    Acquired by calling :meth:`Cache.pin <diskcache.Cache.pin>`. Wraps an
+    open file handle for the value's file and guarantees the file is not
+    removed until the pin is released, even if the corresponding key is
+    replaced, evicted, expired, or deleted by another thread or process.
+
+    The pin protects the version of the value that was current when the pin
+    was acquired. It does not prevent new versions of the value from being
+    written. The old file is removed once the last pin referencing it is
+    released.
+
+    Pins are leased. If a process exits abnormally, the pin is reclaimed
+    after its lease expires. Releasing an expired pin that was already
+    reclaimed is a no-op and will never remove a newer file.
+
+    Use as a context manager or call :meth:`release` explicitly:
+
+    >>> cache = Cache()
+    >>> _ = cache.set('key', b'abcd' * 2**13)  # Large enough for file.
+    >>> with cache.pin('key') as pin:
+    ...     _ = cache.set('key', b'wxyz' * 2**13)  # Replace value.
+    ...     len(pin.read())  # Old version still readable.
+    32768
+    >>> cache.get('key') == b'wxyz' * 2**13
+    True
+    >>> cache.close()
+
+    File methods like `read`, `seek`, and `readline` are delegated to the
+    underlying file handle.
+
+    """
+
+    def __init__(self, cache, pin_id, filename, handle):
+        self._cache = cache
+        self._pin_id = pin_id
+        self._filename = filename
+        self._handle = handle
+        self._released = False
+
+    def __getattr__(self, name):
+        handle = self.__dict__.get('_handle')
+        if handle is None:
+            raise AttributeError(name)
+        return getattr(handle, name)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exception):
+        self.release()
+
+    def __del__(self):
+        try:
+            self.release()
+        except Exception:  # pylint: disable=broad-except
+            pass
+
+    @property
+    def filename(self):
+        """Filename of the pinned value relative to the cache directory."""
+        return self._filename
+
+    @property
+    def closed(self):
+        """True if the pin has been released."""
+        return self._released
+
+    def release(self):
+        """Close the file handle and release the pin.
+
+        When the last pin for a file is released and no cache item refers to
+        the file, the file is removed. Releasing an already released or
+        reclaimed pin is a no-op.
+
+        """
+        if self._released:
+            return
+        self._released = True
+        try:
+            self._handle.close()
+        finally:
+            self._cache._release_pin(self._pin_id, self._filename)
+
+    def close(self):
+        """Close the file handle and release the pin.
+
+        Alias for :meth:`release`.
+
+        """
+        self.release()
+
+
 class Timeout(Exception):
     """Database timeout expired."""
 
@@ -538,6 +636,25 @@ class Cache:
 
         if query is not None:
             sql(query)
+
+        # Setup Pin table for pinned file handles.
+
+        sql(
+            'CREATE TABLE IF NOT EXISTS Pin ('
+            ' pin_id INTEGER PRIMARY KEY,'
+            ' filename TEXT NOT NULL,'
+            ' expire_time REAL NOT NULL)'
+        )
+
+        sql(
+            'CREATE INDEX IF NOT EXISTS Pin_filename ON'
+            ' Pin (filename)'
+        )
+
+        sql(
+            'CREATE INDEX IF NOT EXISTS Pin_expire_time ON'
+            ' Pin (expire_time)'
+        )
 
         # Use triggers to keep Metadata updated.
 
@@ -742,9 +859,7 @@ class Cache:
                 assert self._txn_id == tid
                 self._txn_id = None
                 sql('COMMIT')
-            for name in filenames:
-                if name is not None:
-                    _disk_remove(name)
+            self._remove_files(filenames)
 
     def set(self, key, value, expire=None, read=False, tag=None, retry=False):
         """Set `key` and `value` item in cache.
@@ -1237,6 +1352,9 @@ class Cache:
     def read(self, key, retry=False):
         """Return file handle value corresponding to `key` from cache.
 
+        The returned handle is not protected from removal if the key is
+        replaced or evicted. Use :meth:`pin` to protect long-running reads.
+
         Raises :exc:`Timeout` error when database timeout occurs and `retry` is
         `False` (default).
 
@@ -1251,6 +1369,198 @@ class Cache:
         if handle is ENOVAL:
             raise KeyError(key)
         return handle
+
+    def pin(self, key, default=None, lease=60.0, retry=False):
+        """Pin the file backing the value for `key` and return a handle.
+
+        Like ``get(key, read=True)`` but returns a :class:`Pin` handle that
+        protects the value's file from removal while the pin is held. The
+        key itself may still be replaced, evicted, expired, or deleted by
+        any thread or process. The pinned file is removed once the last pin
+        referencing it is released.
+
+        The pin protects the version of the value that was current when the
+        pin was acquired. It does not prevent new versions from being
+        written.
+
+        Pins are leased for `lease` seconds (clamped to
+        :data:`PIN_LEASE_MAX`). If a process exits abnormally, the pin is
+        reclaimed after its lease expires. Releasing a reclaimed pin is a
+        no-op and will never remove a newer file.
+
+        Values stored in the database rather than in files (small values)
+        incur no pin overhead: the value is fetched and returned directly
+        like :meth:`get`.
+
+        Raises :exc:`Timeout` error when database timeout occurs and `retry`
+        is `False` (default).
+
+        :param key: key for item
+        :param default: value to return if key is missing (default None)
+        :param float lease: seconds until the pin lease expires
+            (default 60.0)
+        :param bool retry: retry if database timeout occurs (default False)
+        :return: :class:`Pin` handle, value, or default if key not found
+        :raises Timeout: if database timeout occurs
+
+        """
+        now = time.time()
+        lease = min(max(lease, 0.0), PIN_LEASE_MAX)
+        db_key, raw = self._disk.put(key)
+        select = (
+            'SELECT rowid, mode, filename, value FROM Cache'
+            ' WHERE key = ? AND raw = ?'
+            ' AND (expire_time IS NULL OR expire_time > ?)'
+        )
+
+        with self._transact(retry) as (sql, _):
+            rows = sql(select, (db_key, raw, now)).fetchall()
+
+            if not rows:
+                return default
+
+            ((_, mode, filename, db_value),) = rows
+
+            if filename is None or mode != MODE_BINARY:
+                # Small values and non-binary modes are fetched directly.
+                # No pin overhead is incurred.
+                try:
+                    return self._disk.fetch(mode, filename, db_value, False)
+                except IOError:
+                    # Key was deleted before we could retrieve result.
+                    return default
+
+            cursor = sql(
+                'INSERT INTO Pin (filename, expire_time) VALUES (?, ?)',
+                (filename, now + lease),
+            )
+            pin_id = cursor.lastrowid
+
+            try:
+                handle = self._disk.fetch(mode, filename, db_value, True)
+            except IOError:
+                # File was removed before the pin could be acquired.
+                sql('DELETE FROM Pin WHERE pin_id = ?', (pin_id,))
+                return default
+
+        return Pin(self, pin_id, filename, handle)
+
+    def _release_pin(self, pin_id, filename):
+        remove = False
+
+        with self._transact(retry=True) as (sql, _):
+            cursor = sql('DELETE FROM Pin WHERE pin_id = ?', (pin_id,))
+
+            if cursor.rowcount == 0:
+                # Pin was already reclaimed after its lease expired. Do
+                # nothing: the filename may now belong to a new value.
+                return
+
+            rows = sql(
+                'SELECT rowid FROM Cache WHERE filename = ? LIMIT 1',
+                (filename,),
+            ).fetchall()
+
+            if rows:
+                return
+
+            rows = sql(
+                'SELECT pin_id FROM Pin WHERE filename = ? LIMIT 1',
+                (filename,),
+            ).fetchall()
+
+            if rows:
+                return
+
+            remove = True
+
+        if remove:
+            self._disk.remove(filename)
+
+    def _remove_files(self, filenames):
+        """Remove files unless pinned, reaping expired pins.
+
+        Files with an active pin are kept until the last pin is released.
+        Expired pins are reclaimed and their files are removed when no cache
+        item refers to them.
+
+        :param filenames: list of filenames relative to the cache directory
+
+        """
+        names = [name for name in filenames if name is not None]
+
+        if not names:
+            return
+
+        ((count,),) = self._sql('SELECT COUNT(pin_id) FROM Pin').fetchall()
+
+        if count == 0:
+            # Fast path: with no pins, remove files directly.
+            for name in names:
+                self._disk.remove(name)
+            return
+
+        now = time.time()
+
+        with self._transact(retry=True) as (sql, _):
+            # Reap expired pins. Processes that exit abnormally leave pins
+            # behind; the bounded lease allows their reclamation.
+            rows = sql(
+                'SELECT DISTINCT filename FROM Pin WHERE expire_time < ?',
+                (now,),
+            ).fetchall()
+            sql('DELETE FROM Pin WHERE expire_time < ?', (now,))
+
+            names.extend(row[0] for row in rows)
+            deletable = self._select_deletable(sql, names)
+
+        for name in deletable:
+            self._disk.remove(name)
+
+    @staticmethod
+    def _select_deletable(sql, names):
+        deletable = []
+
+        for name in names:
+            rows = sql(
+                'SELECT rowid FROM Cache WHERE filename = ? LIMIT 1',
+                (name,),
+            ).fetchall()
+
+            if rows:
+                continue
+
+            rows = sql(
+                'SELECT pin_id FROM Pin WHERE filename = ? LIMIT 1',
+                (name,),
+            ).fetchall()
+
+            if rows:
+                continue
+
+            deletable.append(name)
+
+        return deletable
+
+    def _reap_pins(self, now=None):
+        """Reclaim expired pins and remove their unreferenced files."""
+        ((count,),) = self._sql('SELECT COUNT(pin_id) FROM Pin').fetchall()
+
+        if count == 0:
+            return
+
+        now = time.time() if now is None else now
+
+        with self._transact(retry=True) as (sql, _):
+            rows = sql(
+                'SELECT DISTINCT filename FROM Pin WHERE expire_time < ?',
+                (now,),
+            ).fetchall()
+            sql('DELETE FROM Pin WHERE expire_time < ?', (now,))
+            deletable = self._select_deletable(sql, [row[0] for row in rows])
+
+        for name in deletable:
+            self._disk.remove(name)
 
     def __contains__(self, key):
         """Return `True` if `key` matching item is found in cache.
@@ -1322,7 +1632,7 @@ class Cache:
             return default
         finally:
             if filename is not None:
-                self._disk.remove(filename)
+                self._remove_files([filename])
 
         if expire_time and tag:
             return value, db_expire_time, db_tag
@@ -1591,7 +1901,7 @@ class Cache:
                 continue
             finally:
                 if name is not None:
-                    self._disk.remove(name)
+                    self._remove_files([name])
             break
 
         if expire_time and tag:
@@ -1960,6 +2270,13 @@ class Cache:
                     if fix:
                         sql('DELETE FROM Cache WHERE rowid = ?', (rowid,))
 
+                # Check Pin.filename against file system.
+
+                rows = sql('SELECT filename FROM Pin').fetchall()
+
+                for (filename,) in rows:
+                    filenames.add(op.join(self._directory, filename))
+
                 # Check file system against Cache.filename.
 
                 for dirpath, _, files in os.walk(self._directory):
@@ -2095,8 +2412,14 @@ class Cache:
             ' WHERE ? < expire_time AND expire_time < ?'
             ' ORDER BY expire_time LIMIT ?'
         )
-        args = [0, now or time.time(), 100]
-        return self._select_delete(select, args, row_index=1, retry=retry)
+        now = now or time.time()
+        args = [0, now, 100]
+        count = self._select_delete(select, args, row_index=1, retry=retry)
+
+        # Reclaim pins whose leases have expired.
+        self._reap_pins(now)
+
+        return count
 
     def cull(self, retry=False):
         """Cull items from cache until volume is less than size limit.

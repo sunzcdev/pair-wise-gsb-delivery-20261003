@@ -13,6 +13,14 @@ Read the :ref:`Cache tutorial <tutorial-cache>` for example usage.
    :special-members:
    :exclude-members: __weakref__
 
+Pin
+---
+
+.. autoclass:: diskcache.Pin
+   :members:
+   :special-members:
+   :exclude-members: __weakref__
+
 FanoutCache
 -----------
 

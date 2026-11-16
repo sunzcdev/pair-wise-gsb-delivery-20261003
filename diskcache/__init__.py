@@ -14,6 +14,7 @@ from .core import (
     Disk,
     EmptyDirWarning,
     JSONDisk,
+    Pin,
     Timeout,
     UnknownFileWarning,
 )
@@ -43,6 +44,7 @@ __all__ = [
     'Index',
     'JSONDisk',
     'Lock',
+    'Pin',
     'RLock',
     'Timeout',
     'UNKNOWN',
