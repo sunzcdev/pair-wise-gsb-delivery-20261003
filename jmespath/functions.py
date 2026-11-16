@@ -1,9 +1,17 @@
 import math
 import json
+from collections.abc import Iterator
 
 from jmespath import exceptions
 from jmespath.compat import string_type as STRING_TYPE
 from jmespath.compat import get_methods
+
+
+# Attribute used to mark the functions shipped with the library.  The
+# return values of builtin functions are trusted and therefore skip the
+# explicit return value contract validation that user defined functions
+# are subject to.
+_BUILTIN_FUNCTION = '_jmespath_builtin_function'
 
 
 # python types -> jmespath types
@@ -69,6 +77,14 @@ class Functions(metaclass=FunctionRegistry):
     FUNCTION_TABLE = {
     }
 
+    #: Mapping of python type names to adapter callables.  Adapters declare
+    #: which non JSON values a custom function is allowed to return.  When a
+    #: value whose type name matches a key is encountered, the adapter is
+    #: called with the value and must return a JSON representable value.
+    #: Subclasses can extend or override this mapping to declare the adapters
+    #: they support.
+    RETURN_ADAPTERS = {}
+
     def call_function(self, function_name, resolved_args):
         try:
             spec = self.FUNCTION_TABLE[function_name]
@@ -78,7 +94,120 @@ class Functions(metaclass=FunctionRegistry):
         function = spec['function']
         signature = spec['signature']
         self._validate_arguments(resolved_args, signature, function_name)
-        return function(self, *resolved_args)
+        result = function(self, *resolved_args)
+        # The return value contract is only enforced at the function
+        # boundary and only for user defined functions.  The legal output
+        # of the standard builtin functions is trusted and left untouched.
+        if not getattr(function, _BUILTIN_FUNCTION, False):
+            result = self._validate_return_value(function_name, result)
+        return result
+
+    def _validate_return_value(self, function_name, result):
+        # Validation walks the value the function actually returned and
+        # nothing else, so the interpreter inputs are never retraversed.
+        return self._check_json_value(
+            function_name, result, '$', set())
+
+    def _check_json_value(self, function_name, current, path, seen):
+        # Iterators (and therefore generators) are rejected up front,
+        # without ever being iterated.  Probing them would consume their
+        # items, potentially draining an infinite iterator.
+        if isinstance(current, Iterator):
+            raise exceptions.ReturnValueContractError(
+                function_name,
+                'expected a JSON value but received %s, which is an '
+                'iterator/generator and cannot be returned from a '
+                'function' % type(current).__name__,
+                path)
+        if current is None or isinstance(current, (str, bool, int)):
+            return current
+        if isinstance(current, float):
+            if math.isnan(current) or math.isinf(current):
+                raise exceptions.ReturnValueContractError(
+                    function_name,
+                    'expected a finite JSON number but received %s'
+                    % current,
+                    path)
+            return current
+        if isinstance(current, list):
+            return self._check_json_container(
+                function_name, current, path, seen)
+        if isinstance(current, dict):
+            return self._check_json_object(
+                function_name, current, path, seen)
+        return self._adapt_return_value(
+            function_name, current, path, seen)
+
+    def _check_json_container(self, function_name, current, path, seen):
+        object_id = id(current)
+        # A list is a concrete, re-iterable container, so locating a cycle
+        # by identity is safe and does not risk exhausting an iterator.
+        if object_id in seen:
+            raise exceptions.ReturnValueContractError(
+                function_name,
+                'circular reference detected in returned array',
+                path)
+        seen.add(object_id)
+        try:
+            return [
+                self._check_json_value(
+                    function_name, element,
+                    '%s[%d]' % (path, index), seen)
+                for index, element in enumerate(current)
+            ]
+        finally:
+            seen.remove(object_id)
+
+    def _check_json_object(self, function_name, current, path, seen):
+        object_id = id(current)
+        if object_id in seen:
+            raise exceptions.ReturnValueContractError(
+                function_name,
+                'circular reference detected in returned object',
+                path)
+        for key in current:
+            if not isinstance(key, STRING_TYPE):
+                raise exceptions.ReturnValueContractError(
+                    function_name,
+                    'object keys must be strings but received key %r of '
+                    'type %s' % (key, type(key).__name__),
+                    path)
+        seen.add(object_id)
+        try:
+            checked = {}
+            for key, value in current.items():
+                checked[key] = self._check_json_value(
+                    function_name, value,
+                    '%s.%s' % (path, key), seen)
+            return checked
+        finally:
+            seen.remove(object_id)
+
+    def _adapt_return_value(self, function_name, current, path, seen):
+        adapter = self.RETURN_ADAPTERS.get(type(current).__name__)
+        if adapter is None:
+            raise exceptions.ReturnValueContractError(
+                function_name,
+                'expected a JSON value (string, number, boolean, array, '
+                'object or null) but received unsupported type %s'
+                % type(current).__name__,
+                path)
+        try:
+            adapted = adapter(current)
+        except exceptions.ReturnValueContractError:
+            raise
+        except Exception as exc:
+            # Preserve the original failure so misbehaving adapters remain
+            # explainable.
+            raise exceptions.ReturnValueContractError(
+                function_name,
+                'adapter for type %s failed: %s'
+                % (type(current).__name__, exc),
+                path) from exc
+        # The adapted value has to satisfy the same contract as any other
+        # returned value.
+        return self._check_json_value(
+            function_name, adapted, path, seen)
 
     def _validate_arguments(self, args, signature, function_name):
         if signature and signature[-1].get('variadic'):
@@ -360,3 +489,11 @@ class Functions(metaclass=FunctionRegistry):
 
     def _convert_to_jmespath_type(self, pyobject):
         return TYPES_MAP.get(pyobject, 'unknown')
+
+
+# Every function declared directly on the standard Functions class is a
+# builtin: its legal output is part of the library's contract and must not
+# be revalidated.  Methods that subclasses override lose this marker and
+# are checked against the return value contract instead.
+for _builtin_spec in Functions.FUNCTION_TABLE.values():
+    setattr(_builtin_spec['function'], _BUILTIN_FUNCTION, True)

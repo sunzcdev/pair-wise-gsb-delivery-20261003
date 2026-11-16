@@ -1,7 +1,16 @@
 Next Release (TBD)
 ==================
 
-* No changes yet.
+* Add an explicit return value contract for custom functions.  Values
+  returned by user defined functions are now checked at the function
+  boundary against the JSON value domain: generators/iterators are
+  rejected without being probed (so infinite iterators are never drained),
+  mappings with non-string keys and non-finite numbers (``NaN``/
+  ``Infinity``) are rejected, and circular containers are located and
+  reported with their path.  Custom function classes can declare
+  ``RETURN_ADAPTERS`` to convert otherwise unsupported types; adapter
+  failures preserve the original exception as their cause.  The legal
+  output of the standard builtin functions is unaffected.
 
 
 1.1.0

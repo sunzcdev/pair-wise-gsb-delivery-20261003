@@ -120,3 +120,30 @@ class EmptyExpressionError(JMESPathError):
 
 class UnknownFunctionError(JMESPathError):
     pass
+
+
+@with_str_method
+class ReturnValueContractError(JMESPathError):
+    """Raised when a custom function returns a value that cannot be
+    represented by the JMESPath data model.
+
+    JMESPath values must be valid JSON values: strings, numbers (with the
+    restriction that NaN and Infinity are not representable), booleans,
+    arrays of JSON values, objects whose keys are strings and whose values
+    are JSON values, or null.  Values such as generators, mappings with
+    non-string keys, NaN/Infinity numbers, or arbitrary Python objects are
+    rejected at the function boundary instead of producing confusing
+    failures later in the evaluation.
+    """
+
+    def __init__(self, function_name, reason, path=None):
+        self.function_name = function_name
+        self.reason = reason
+        self.path = path
+
+    def __str__(self):
+        message = 'In function %s(), invalid return value: %s' % (
+            self.function_name, self.reason)
+        if self.path:
+            message += ' (at %s)' % self.path
+        return message
