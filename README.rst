@@ -180,6 +180,79 @@ JMESPath libraries, not just python), please let us know at
 `jmespath.site <https://github.com/jmespath/jmespath.site/issues>`__.
 
 
+Static preparation
+~~~~~~~~~~~~~~~~~~
+
+``compile`` never depends on a particular ``Functions`` implementation,
+which keeps compilation cheap.  The trade off is that a misspelled
+function name, or an argument count that can never work, is normally only
+discovered when the expression actually evaluates a document.
+
+If you want to catch those problems before publishing a query, use the
+optional ``prepare`` interface.  It takes the ``Functions`` instance (or
+``jmespath.Options``) you intend to run with, inspects the parsed AST, and
+raises ``UnknownFunctionError`` / ``ArityError`` /
+``VariadictArityError`` for calls that can never succeed:
+
+.. code:: python
+
+    >>> import jmespath
+    >>> from jmespath import functions
+    >>>
+    >>> class CustomFunctions(functions.Functions):
+    ...     @functions.signature({'types': ['string']})
+    ...     def _func_unique_letters(self, s):
+    ...         return ''.join(sorted(set(s)))
+    ...
+    >>> options = jmespath.Options(custom_functions=CustomFunctions())
+    >>> prepared = jmespath.prepare(
+    ...     'foo.bar | unique_letters(@)', options=options)
+    >>> prepared.required_functions
+    ('unique_letters',)
+    >>> prepared.search({'foo': {'bar': 'ccbbadd'}})
+    'abcd'
+    >>> jmespath.prepare('uniqe_letters(@)', options=options)
+    Traceback (most recent call last):
+        ...
+    jmespath.exceptions.UnknownFunctionError: Unknown function: uniqe_letters()
+
+The prepared result reports two things:
+
+* ``function_requirements`` (also available as ``required_functions``)
+  describes every function the expression calls, including the minimum
+  and maximum argument count.  Variadic functions report
+  ``maximum_arity = None``.
+* ``type_requirements`` lists the argument type checks that can only be
+  confirmed at run time because the value comes from the document.  JSON
+  literals are checked immediately; expression references (``&expr``) are
+  never evaluated while preparing, but their bodies are walked so nested
+  calls are validated too.
+
+``prepare`` can also be called on a compiled result, or on a ``Functions``
+instance:
+
+.. code:: python
+
+    >>> parsed = jmespath.compile('unique_letters(@)')
+    >>> parsed.prepare(options=options).search('aabb')
+    'ab'
+    >>> CustomFunctions().prepare('unique_letters(@)').search('aabb')
+    'ab'
+
+A prepared expression is bound to the capability fingerprint of the
+functions it needs.  If it is later run with a function table that no
+longer provides a required function (or provides it with a different
+signature), it raises ``FunctionCapabilityMismatchError`` instead of
+quietly pretending it was prepared for that table.  Unrelated functions
+being added to or removed from the table do not invalidate it:
+
+.. code:: python
+
+    >>> prepared = jmespath.prepare('length(@)')
+    >>> prepared.is_prepared_for(functions.Functions())
+    True
+
+
 Specification
 =============
 

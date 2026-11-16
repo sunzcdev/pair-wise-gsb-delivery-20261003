@@ -1,7 +1,17 @@
 Next Release (TBD)
 ==================
 
-* No changes yet.
+* Add an optional static preparation interface (``jmespath.prepare``,
+  ``ParsedResult.prepare`` and ``Functions.prepare``).  Given a ``Functions``
+  instance it inspects the parsed AST, raises ``UnknownFunctionError`` for
+  functions that do not exist and ``ArityError`` / ``VariadictArityError``
+  for impossible argument counts, and reports the functions the expression
+  needs plus the argument type checks that can only be confirmed at run
+  time.  Expression references are never evaluated while preparing,
+  variadic signatures and inherited function registration are handled
+  correctly, and the prepared result is bound to the capability fingerprint
+  of the functions it requires.  ``compile`` remains independent of any
+  particular ``Functions`` implementation.
 
 
 1.1.0

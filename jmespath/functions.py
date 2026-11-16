@@ -1,5 +1,6 @@
-import math
+import hashlib
 import json
+import math
 
 from jmespath import exceptions
 from jmespath.compat import string_type as STRING_TYPE
@@ -42,6 +43,123 @@ def signature(*arguments):
     return _record_signature
 
 
+def canonical_signature(signature):
+    """Return a normalized, JSON-friendly form of a function signature.
+
+    Normalizing the declared types (sorting/deduplicating them) means two
+    signatures that accept the same set of types compare equal, which is
+    what matters when deciding whether a function table still provides the
+    capability an expression was prepared against.
+    """
+    canonical = []
+    for argument in signature or ():
+        canonical.append({
+            'types': sorted(set(argument.get('types') or ())),
+            'variadic': bool(argument.get('variadic')),
+        })
+    return canonical
+
+
+def signature_arity(signature):
+    """Return the ``(minimum, maximum)`` argument count for a signature.
+
+    ``maximum`` is ``None`` for variadic signatures.  The minimum is the
+    number of declared arguments, mirroring the run time behavior of
+    ``Functions._validate_arguments``: a variadic function such as
+    ``not_null`` still requires at least one argument because its
+    signature declares a single variadic argument.
+    """
+    if signature and signature[-1].get('variadic'):
+        return len(signature), None
+    return len(signature), len(signature)
+
+
+def function_table_fingerprint(function_table):
+    """Compute a stable capability fingerprint for a function table.
+
+    The fingerprint covers the registered function names and their
+    (normalized) signatures, so it changes whenever a function is added,
+    removed, renamed, re-signatured or loses its registration (for
+    example by a subclass that overrides ``_func_*`` without a
+    ``@signature`` decorator).
+    """
+    entries = []
+    for name in sorted(function_table):
+        entries.append([
+            name,
+            canonical_signature(function_table[name]['signature']),
+        ])
+    payload = json.dumps(entries, sort_keys=True, separators=(',', ':'))
+    return hashlib.sha256(payload.encode('utf-8')).hexdigest()
+
+
+def check_arity(signature, argument_count, function_name):
+    """Raise if ``argument_count`` cannot satisfy ``signature``.
+
+    This is the single source of truth for arity validation so that static
+    preparation and run time evaluation agree exactly.  Variadic functions
+    require at least as many arguments as the signature declares (a
+    variadic signature still declares its variadic argument), and accept
+    any number beyond that.
+    """
+    minimum, maximum = signature_arity(signature)
+    if maximum is None:
+        if argument_count < minimum:
+            raise exceptions.VariadictArityError(
+                minimum, argument_count, function_name)
+    elif argument_count != maximum:
+        raise exceptions.ArityError(minimum, argument_count, function_name)
+
+
+def allowed_pytypes(types):
+    """Resolve declared jmespath types to python type names.
+
+    Returns ``(allowed_types, allowed_subtypes)``.  ``allowed_subtypes`` is
+    only non-empty for ``array-<subtype>`` declarations.  This is shared by
+    run time type checking and static preparation so both agree.
+    """
+    allowed_types = []
+    allowed_subtypes = []
+    for declared in types:
+        parts = declared.split('-', 1)
+        if len(parts) == 2:
+            base, subtype = parts
+            allowed_types.extend(REVERSE_TYPES_MAP[base])
+            allowed_subtypes.append(REVERSE_TYPES_MAP[subtype])
+        else:
+            allowed_types.extend(REVERSE_TYPES_MAP[declared])
+    return allowed_types, allowed_subtypes
+
+
+def value_matches_types(value, types):
+    """Return ``True`` if ``value`` satisfies the declared ``types``.
+
+    This mirrors ``Functions._type_check_single``/``_subtype_check`` and is
+    used by static preparation, where it is only applied to values that are
+    known ahead of time (JSON literals), so ``False`` is a definite error.
+    """
+    allowed_types, allowed_subtypes = allowed_pytypes(types)
+    if type(value).__name__ not in allowed_types:
+        return False
+    if not allowed_subtypes:
+        return True
+    if not isinstance(value, list):
+        return False
+    if len(allowed_subtypes) == 1:
+        allowed = allowed_subtypes[0]
+        return all(type(element).__name__ in allowed for element in value)
+    # Multiple subtype groups: like the run time implementation, the first
+    # element decides which group the whole array must use.
+    if not value:
+        return True
+    first = type(value[0]).__name__
+    for subtypes in allowed_subtypes:
+        if first in subtypes:
+            return all(type(element).__name__ in subtypes
+                       for element in value)
+    return False
+
+
 class FunctionRegistry(type):
     def __init__(cls, name, bases, attrs):
         cls._populate_function_table()
@@ -80,14 +198,26 @@ class Functions(metaclass=FunctionRegistry):
         self._validate_arguments(resolved_args, signature, function_name)
         return function(self, *resolved_args)
 
+    def capability_fingerprint(self):
+        """Return a fingerprint of this instance's function capabilities.
+
+        Two ``Functions`` instances with the same registered functions and
+        signatures produce the same fingerprint, regardless of class name or
+        instance identity.
+        """
+        return function_table_fingerprint(self.FUNCTION_TABLE)
+
+    def prepare(self, expression):
+        """Statically check ``expression`` against this function table.
+
+        ``expression`` may be a JMESPath string or an already compiled
+        result.  Returns a ``jmespath.preparation.PreparedExpression``.
+        """
+        from jmespath import preparation
+        return preparation.prepare(expression, functions=self)
+
     def _validate_arguments(self, args, signature, function_name):
-        if signature and signature[-1].get('variadic'):
-            if len(args) < len(signature):
-                raise exceptions.VariadictArityError(
-                    len(signature), len(args), function_name)
-        elif len(args) != len(signature):
-            raise exceptions.ArityError(
-                len(signature), len(args), function_name)
+        check_arity(signature, len(args), function_name)
         return self._type_check(args, signature, function_name)
 
     def _type_check(self, actual, signature, function_name):
@@ -121,17 +251,7 @@ class Functions(metaclass=FunctionRegistry):
                                 types, function_name)
 
     def _get_allowed_pytypes(self, types):
-        allowed_types = []
-        allowed_subtypes = []
-        for t in types:
-            type_ = t.split('-', 1)
-            if len(type_) == 2:
-                type_, subtype = type_
-                allowed_subtypes.append(REVERSE_TYPES_MAP[subtype])
-            else:
-                type_ = type_[0]
-            allowed_types.extend(REVERSE_TYPES_MAP[type_])
-        return allowed_types, allowed_subtypes
+        return allowed_pytypes(types)
 
     def _subtype_check(self, current, allowed_subtypes, types, function_name):
         if len(allowed_subtypes) == 1:

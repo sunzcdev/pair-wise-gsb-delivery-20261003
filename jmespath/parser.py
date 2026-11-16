@@ -516,6 +516,20 @@ class ParsedResult(object):
         result = interpreter.visit(self.parsed, value)
         return result
 
+    def prepare(self, functions=None, options=None):
+        """Statically check this expression against a function table.
+
+        This is the optional pre-flight counterpart to :meth:`search`.
+        Compilation itself remains independent of any ``Functions``
+        implementation; this method is only called when callers want to
+        verify function names, arity and argument types ahead of run time.
+
+        See :func:`jmespath.prepare` for the accepted arguments.
+        """
+        from jmespath import preparation
+        return preparation.prepare(
+            self, functions=functions, options=options)
+
     def _render_dot_file(self):
         """Render the parsed AST as a dot file.
 

@@ -120,3 +120,17 @@ class EmptyExpressionError(JMESPathError):
 
 class UnknownFunctionError(JMESPathError):
     pass
+
+
+@with_str_method
+class FunctionCapabilityMismatchError(JMESPathError):
+    def __init__(self, message, missing=None, changed=None):
+        super(FunctionCapabilityMismatchError, self).__init__(message)
+        self.message = message
+        #: Functions the prepared expression needs but the table lacks.
+        self.missing = list(missing or ())
+        #: Functions whose signature no longer matches the prepared one.
+        self.changed = list(changed or ())
+
+    def __str__(self):
+        return self.message
