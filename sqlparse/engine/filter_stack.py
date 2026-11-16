@@ -7,28 +7,49 @@
 
 """filter"""
 
-from sqlparse import lexer
 from sqlparse.engine import grouping
 from sqlparse.engine.statement_splitter import StatementSplitter
 from sqlparse.exceptions import SQLParseError
 from sqlparse.filters import StripTrailingSemicolonFilter
+from sqlparse.lexer import Lexer, LexerConfig
 
 
 class FilterStack:
-    def __init__(self, strip_semicolon=False):
+    def __init__(self, strip_semicolon=False, lexer=None):
         self.preprocess = []
         self.stmtprocess = []
         self.postprocess = []
         self._grouping = False
+        self._lexer = self._resolve_lexer(lexer)
         if strip_semicolon:
             self.stmtprocess.append(StripTrailingSemicolonFilter())
+
+    @staticmethod
+    def _resolve_lexer(lexer):
+        """Resolve the lexer to use for this stack.
+
+        ``None`` selects the shared default lexer instance (the historical
+        singleton behavior). A :class:`~sqlparse.lexer.LexerConfig` is
+        materialized into a fresh lexer, and a :class:`~sqlparse.lexer.Lexer`
+        is used as-is. Anything else is rejected right away instead of
+        silently falling back to the default lexer.
+        """
+        if lexer is None:
+            return Lexer.get_default_instance()
+        if isinstance(lexer, LexerConfig):
+            return lexer.build_lexer()
+        if isinstance(lexer, Lexer):
+            return lexer
+        raise SQLParseError(
+            'lexer must be None, a sqlparse.lexer.Lexer instance or a '
+            f'sqlparse.lexer.LexerConfig, got {lexer!r}')
 
     def enable_grouping(self):
         self._grouping = True
 
     def run(self, sql, encoding=None):
         try:
-            stream = lexer.tokenize(sql, encoding)
+            stream = self._lexer.get_tokens(sql, encoding)
             # Process token stream
             for filter_ in self.preprocess:
                 stream = filter_.process(stream)

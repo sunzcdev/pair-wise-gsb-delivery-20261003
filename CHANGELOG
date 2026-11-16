@@ -1,3 +1,19 @@
+Unreleased
+----------
+
+Notable Changes
+
+* Added `sqlparse.lexer.LexerConfig`, an independent lexical configuration
+  that can be passed as the ``lexer`` argument to `parse()`, `parsestream()`,
+  `split()` and `format()`. A config inherits the default keyword tables and
+  can add, override or remove keywords (or replace the tokenizing regexes),
+  so one process can audit SQL from different sources with different
+  vocabularies without mutating the shared default lexer. Configurations
+  are validated eagerly and copied at construction; `FilterStack` rejects
+  invalid lexer arguments instead of silently falling back to the default
+  lexer.
+
+
 Release 0.6.1 (Nov 01, 2026)
 ----------------------------
 

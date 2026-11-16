@@ -12,10 +12,12 @@ import re
 # http://pygments.org/
 # It's separated from the rest of pygments to increase performance
 # and to allow some customizations.
+from collections.abc import Iterable, Mapping
 from io import TextIOBase
 from threading import Lock
 
 from sqlparse import keywords, tokens
+from sqlparse.exceptions import SQLParseError
 from sqlparse.utils import consume
 
 
@@ -34,15 +36,15 @@ class Lexer:
     #   instance-getter method get_default_instance(). This mechanism has
     #   the advantage that the call signature of the entry-points to the
     #   sqlparse library are not affected. Also, usage of sqlparse in third
-    #   party code does not need to be adapted. On the other hand, the current
-    #   implementation does not easily allow for multiple SQL dialects to be
+    #   party code does not need to be adapted. On the other hand, mutating
+    #   the default instance does not allow for multiple SQL dialects to be
     #   parsed in the same process.
-    #   Such behavior can be supported in the future by passing a
-    #   suitably initialized lexer object as an additional parameter to the
-    #   entry-point functions (such as `parse`). Code will need to be written
-    #   to pass down and utilize such an object. The current implementation
-    #   is prepared to support this thread safe approach without the
-    #   default_instance part needing to change interface.
+    #   Such behavior is supported by passing a LexerConfig (or a suitably
+    #   initialized Lexer) as the ``lexer`` argument to the entry-point
+    #   functions (such as `parse`). The lexer object is passed down through
+    #   FilterStack, which never falls back to the default instance when an
+    #   explicit lexer was given. The default_instance part does not need
+    #   to change interface for this thread safe approach.
 
     @classmethod
     def get_default_instance(cls):
@@ -172,3 +174,166 @@ def tokenize(sql, encoding=None):
     of ``(token type, value)`` items.
     """
     return Lexer.get_default_instance().get_tokens(sql, encoding)
+
+
+class LexerConfig:
+    """An independent lexical configuration.
+
+    A ``LexerConfig`` can be passed as the ``lexer`` argument to
+    :func:`sqlparse.parse`, :func:`sqlparse.parsestream`,
+    :func:`sqlparse.split` and :func:`sqlparse.format`. It allows a single
+    process to audit SQL from different sources with different keyword
+    tables without mutating the shared default :class:`Lexer` instance.
+
+    The configuration is validated eagerly: invalid keyword mappings,
+    removals or regex definitions raise :class:`~sqlparse.exceptions.
+    SQLParseError` at construction time, i.e. before any SQL is read.
+
+    Everything passed in is copied, so later mutations of the dictionaries
+    or lists used at construction time do not affect the configuration.
+
+    :param keywords: Optional mapping of keyword (str) to token type,
+        added on top of (and taking precedence over) the inherited tables.
+    :param inherit: If True (default), start from the same keyword tables
+        the default lexer uses. If False, only *keywords* are recognized.
+    :param remove_keywords: Optional iterable of keywords to delete from
+        the inherited tables.
+    :param sql_regex: Optional list of ``(regex, token type)`` pairs
+        replacing the default tokenizing regexes. A token type of
+        ``sqlparse.keywords.PROCESS_AS_KEYWORD`` routes matches through
+        the keyword lookup.
+    """
+
+    _BASE_TABLES = (
+        keywords.KEYWORDS_COMMON,
+        keywords.KEYWORDS_ORACLE,
+        keywords.KEYWORDS_MYSQL,
+        keywords.KEYWORDS_PLPGSQL,
+        keywords.KEYWORDS_HQL,
+        keywords.KEYWORDS_MSACCESS,
+        keywords.KEYWORDS_SNOWFLAKE,
+        keywords.KEYWORDS_BIGQUERY,
+        keywords.KEYWORDS,
+    )
+    _DEFAULT_SQL_REGEX = keywords.SQL_REGEX
+    _PROCESS_AS_KEYWORD = keywords.PROCESS_AS_KEYWORD
+
+    def __init__(self, keywords=None, *, inherit=True,
+                 remove_keywords=(), sql_regex=None):
+        if not isinstance(inherit, bool):
+            raise SQLParseError(
+                f'inherit must be a boolean, got {inherit!r}')
+        self._inherit = inherit
+
+        self._extra_keywords = self._validate_keywords(keywords)
+        self._remove_keywords = self._validate_removals(remove_keywords)
+        self._sql_regex = self._validate_sql_regex(sql_regex)
+
+    @staticmethod
+    def _validate_keywords(mapping):
+        if mapping is None:
+            return {}
+        if not isinstance(mapping, Mapping):
+            raise SQLParseError(
+                'keywords must be a mapping of keyword -> token type, '
+                f'got {mapping!r}')
+        extra = {}
+        for word, ttype in mapping.items():
+            if not isinstance(word, str) or not word.strip():
+                raise SQLParseError(
+                    f'keyword must be a non-empty string, got {word!r}')
+            if not isinstance(ttype, tokens._TokenType):
+                raise SQLParseError(
+                    f'token type for keyword {word!r} must be a token '
+                    f'type, got {ttype!r}')
+            extra[word.upper()] = ttype
+        return extra
+
+    @staticmethod
+    def _validate_removals(removals):
+        if removals is None:
+            return frozenset()
+        if isinstance(removals, (str, bytes)) \
+                or not isinstance(removals, Iterable):
+            raise SQLParseError(
+                'remove_keywords must be an iterable of keywords, '
+                f'got {removals!r}')
+        removed = set()
+        for word in removals:
+            if not isinstance(word, str) or not word.strip():
+                raise SQLParseError(
+                    f'removed keyword must be a non-empty string, '
+                    f'got {word!r}')
+            removed.add(word.upper())
+        return frozenset(removed)
+
+    @classmethod
+    def _validate_sql_regex(cls, sql_regex):
+        if sql_regex is None:
+            return list(cls._DEFAULT_SQL_REGEX)
+        if isinstance(sql_regex, (str, bytes)) \
+                or not isinstance(sql_regex, Iterable):
+            raise SQLParseError(
+                'sql_regex must be an iterable of (regex, token type) '
+                f'pairs, got {sql_regex!r}')
+        validated = []
+        for item in sql_regex:
+            try:
+                rx, action = item
+            except (TypeError, ValueError):
+                raise SQLParseError(
+                    'sql_regex entries must be (regex, token type) '
+                    f'pairs, got {item!r}') from None
+            if not isinstance(rx, str):
+                raise SQLParseError(
+                    f'sql_regex pattern must be a string, got {rx!r}')
+            if not isinstance(action, tokens._TokenType) \
+                    and action is not cls._PROCESS_AS_KEYWORD:
+                raise SQLParseError(
+                    f'sql_regex action for {rx!r} must be a token type '
+                    f'or keywords.PROCESS_AS_KEYWORD, got {action!r}')
+            try:
+                re.compile(rx, re.IGNORECASE | re.UNICODE)
+            except re.error as err:
+                raise SQLParseError(
+                    f'invalid sql_regex pattern {rx!r}: {err}') from err
+            validated.append((rx, action))
+        return validated
+
+    @property
+    def keywords(self):
+        """A copy of the additional keyword mapping."""
+        return dict(self._extra_keywords)
+
+    @property
+    def remove_keywords(self):
+        """The frozenset of keywords removed from the inherited tables."""
+        return self._remove_keywords
+
+    @property
+    def inherit(self):
+        """Whether the default keyword tables are inherited."""
+        return self._inherit
+
+    def build_lexer(self):
+        """Create a fresh :class:`Lexer` from this configuration.
+
+        Each call returns a new, independent lexer; the shared default
+        instance is never touched.
+        """
+        lex = Lexer()
+        lex.clear()
+        lex.set_SQL_REGEX(self._sql_regex)
+        if self._extra_keywords:
+            # Added first so that it takes precedence over (overrides)
+            # the inherited tables.
+            lex.add_keywords(dict(self._extra_keywords))
+        if self._inherit:
+            removed = self._remove_keywords
+            merged = {}
+            for table in self._BASE_TABLES:
+                for word, ttype in table.items():
+                    if word not in removed and word not in merged:
+                        merged[word] = ttype
+            lex.add_keywords(merged)
+        return lex
