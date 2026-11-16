@@ -360,17 +360,48 @@ class ErrorTree:
         self.errors: MutableMapping[str, ValidationError] = {}
         self._contents: MutableMapping[str | int, ErrorTree] = {}
         self._instance = instance
+        self._own_errors: list[ValidationError] = []
+        self._errors_by_validator: MutableMapping[str, list[ValidationError]]
+        self._errors_by_validator = {}
 
+        # The errors iterable is consumed exactly once, so one-shot
+        # generators (e.g. ``validator.iter_errors(instance)``) are fine.
         for error in errors:
-            container = self
-            for element in error.path:
-                container = container._contents.setdefault(
-                    element,
-                    self.__class__(),
-                )
-            container.errors[error.validator] = error
+            self._add(error, tuple(error.path))
 
-            container._instance = error.instance
+    def _add(self, error: ValidationError, path: tuple):
+        """
+        Add a single error to the tree at the node for ``path``.
+
+        The error itself is stored on the node matching its instance
+        path. Any errors in its ``context`` (e.g. the sub-errors of a
+        failed :kw:`anyOf` or :kw:`oneOf`) are attributed to the nodes
+        matching their own paths, so they count as errors of those
+        (descendant) nodes rather than of this one. Context paths are
+        relative to the path of the error carrying them.
+        """
+        container = self
+        for element in path:
+            container = container._contents.setdefault(
+                element,
+                self.__class__(),
+            )
+
+        # Keep the first error per keyword in ``errors`` for backwards
+        # compatibility, but retain *all* errors (in insertion order) so
+        # that multiple failures for the same keyword at the same path
+        # are not lost.
+        container.errors.setdefault(error.validator, error)
+        container._errors_by_validator.setdefault(
+            error.validator,
+            [],
+        ).append(error)
+        container._own_errors.append(error)
+
+        container._instance = error.instance
+
+        for suberror in error.context:
+            self._add(suberror, (*path, *suberror.path))
 
     def __contains__(self, index: str | int):
         """
@@ -416,6 +447,58 @@ class ErrorTree:
         """
         return iter(self._contents)
 
+    @property
+    def own_errors(self) -> tuple[ValidationError, ...]:
+        """
+        The errors which occurred at this level of the tree.
+
+        All errors whose instance path ends exactly at this node are
+        included, even multiple failures for the same validation
+        keyword, in the stable order in which they were added to the
+        tree. Errors of descendants are not included here; see
+        `ErrorTree.total_errors` and `ErrorTree.descendant_errors`.
+        """
+        return tuple(self._own_errors)
+
+    def errors_for(self, validator: str) -> list[ValidationError]:
+        """
+        Return all errors for the given validation keyword at this level.
+
+        Multiple failures for the same keyword at the same instance
+        path are all returned, in the stable order in which they were
+        added to the tree. If the keyword did not fail at this level,
+        an empty list is returned.
+        """
+        return list(self._errors_by_validator.get(validator, ()))
+
+    def subtree(self, path: Iterable[str | int]) -> ErrorTree:
+        """
+        Retrieve the subtree at the given instance path.
+
+        Each element of ``path`` is descended into in turn, so an empty
+        path returns this tree itself. Unlike `ErrorTree.__getitem__`,
+        indices which are not known to the tree (or which are not
+        present in the corresponding instance) do not raise: an empty
+        tree, containing no errors, is returned instead.
+        """
+        tree = self
+        for element in path:
+            if element not in tree:
+                return self.__class__()
+            tree = tree._contents[element]
+        return tree
+
+    @property
+    def descendant_errors(self) -> int:
+        """
+        The number of errors in the children of this tree.
+
+        This does not include this node's `own errors
+        <ErrorTree.own_errors>`; the sum of the two is
+        `ErrorTree.total_errors`.
+        """
+        return sum(tree.total_errors for tree in self._contents.values())
+
     def __len__(self):
         """
         Return the `total_errors`.
@@ -432,8 +515,7 @@ class ErrorTree:
         """
         The total number of errors in the entire tree, including children.
         """
-        child_errors = sum(len(tree) for _, tree in self._contents.items())
-        return len(self.errors) + child_errors
+        return len(self._own_errors) + self.descendant_errors
 
 
 def by_relevance(weak=WEAK_MATCHES, strong=STRONG_MATCHES):

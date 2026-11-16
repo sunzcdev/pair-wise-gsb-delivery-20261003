@@ -240,6 +240,8 @@ failed when validating a given instance, you may want to do so using
 
         The mapping of validation keywords to the error objects (usually `jsonschema.exceptions.ValidationError`\s) at this level of the tree.
 
+        If the same keyword failed multiple times at this level, the first such error is stored here; use `jsonschema.exceptions.ErrorTree.errors_for` or `jsonschema.exceptions.ErrorTree.own_errors` to retrieve all of them.
+
 Consider the following example:
 
 .. testcode::

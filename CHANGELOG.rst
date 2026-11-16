@@ -9,6 +9,9 @@ v4.27.0
 * Errors produced by a ``false`` subschema now have the correct ``path`` and ``schema_path``, rather than empty ones.
 * Accessing an index with no errors on an ``ErrorTree`` no longer causes that index to appear in the tree (#1328).
   Subtrees also properly propagate lookup errors which were previously missing when accessing indices not in the subtree.
+* ``ErrorTree`` no longer drops repeated failures of the same keyword at the same instance path, and now also places errors found in an error's ``context`` (e.g. the sub-errors of ``anyOf`` / ``oneOf`` failures) at the nodes matching their own paths.
+  The tree gained a multi-error reading interface: ``own_errors`` (all errors at one node, in stable order), ``errors_for`` (all errors for one keyword at one node), ``descendant_errors`` (the count of errors below a node, separate from its own) and ``subtree`` (retrieving a subtree by an instance path, returning an empty tree for unknown paths).
+  The single-error ``errors`` mapping is unchanged, and still exposes one error per keyword.
 
 v4.26.0
 =======
