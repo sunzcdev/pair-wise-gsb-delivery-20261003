@@ -94,12 +94,19 @@ def validates(*field_names: str) -> typing.Callable[..., typing.Any]:
     return set_hook(None, VALIDATES, field_names=field_names)
 
 
+#: Valid policies for handling missing ``requires`` dependencies of
+#: schema-level validators.
+ON_MISSING_POLICIES = ("skip", "error", "run")
+
+
 def validates_schema(
     fn: typing.Callable[..., typing.Any] | None = None,
     *,
     pass_collection: bool = False,
     pass_original: bool = False,
     skip_on_field_errors: bool = True,
+    requires: typing.Iterable[str] | None = None,
+    on_missing: typing.Literal["skip", "error", "run"] = "skip",
 ) -> typing.Callable[..., typing.Any]:
     """Register a schema-level validator.
 
@@ -113,6 +120,28 @@ def validates_schema(
     If ``skip_on_field_errors=True``, this validation method will be skipped whenever
     validation errors have been detected when validating fields.
 
+    :param requires: Canonical field names (attribute names, not ``data_key`` values)
+        that this validator depends on. After field projection (``only``/``exclude``),
+        dependencies that are no longer part of the schema are considered missing.
+        Dependencies of validators on ``Nested`` schemas are resolved against the
+        nested schema's own fields. Depending on an undeclared field raises
+        `ValueError`.
+    :param on_missing: Policy applied when a dependency declared in ``requires``
+        is missing from the projected schema:
+
+        - ``"skip"`` (default): Do not run the validator. A diagnostic is recorded
+          on `Schema.validation_diagnostics <marshmallow.Schema.validation_diagnostics>`
+          explaining why the validator did not run; the skip is not treated as a
+          validation success.
+        - ``"error"``: Record the diagnostic and report a schema-level validation
+          error listing the missing dependencies.
+        - ``"run"``: Run the validator anyway; the method is responsible for
+          handling absent keys.
+
+        Note this is independent of ``skip_on_field_errors``: a dependency that
+        failed to deserialize at runtime is a field error, not a missing
+        dependency.
+
     .. versionchanged:: 3.0.0b1 ``skip_on_field_errors`` defaults to `True`.
     .. versionchanged:: 3.0.0 ``partial`` and ``many`` are always passed as keyword arguments to
         the decorated method.
@@ -120,13 +149,20 @@ def validates_schema(
     .. versionchanged:: 4.0.0 ``pass_many`` is renamed to ``pass_collection``.
     .. versionchanged:: 4.0.0 ``pass_collection``, ``pass_original``, and ``skip_on_field_errors``
         are keyword-only arguments.
+    .. versionchanged:: 4.5.0 Added ``requires`` and ``on_missing`` parameters.
     """
+    if on_missing not in ON_MISSING_POLICIES:
+        raise ValueError(
+            f"on_missing must be one of {ON_MISSING_POLICIES}, got {on_missing!r}."
+        )
     return set_hook(
         fn,
         VALIDATES_SCHEMA,
         many=pass_collection,
         pass_original=pass_original,
         skip_on_field_errors=skip_on_field_errors,
+        requires=tuple(requires) if requires is not None else (),
+        on_missing=on_missing,
     )
 
 

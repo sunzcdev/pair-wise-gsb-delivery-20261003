@@ -1,6 +1,20 @@
 Changelog
 =========
 
+4.5.0 (unreleased)
+------------------
+
+Features:
+
+- Schema-level validators can declare field dependencies with the new
+  ``requires`` and ``on_missing`` parameters of
+  `validates_schema <marshmallow.decorators.validates_schema>`. After field
+  projection (``only``/``exclude``), a validator with missing dependencies is
+  skipped, reported as an error, or run anyway, according to ``on_missing``.
+  Skipped validators are recorded on the new
+  ``Schema.validation_diagnostics`` attribute so a skip is never treated as a
+  silent validation success.
+
 4.4.0 (2026-11-03)
 ------------------
 

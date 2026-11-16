@@ -439,6 +439,9 @@ class Schema(metaclass=SchemaMeta):
         self.fields: dict[str, Field] = {}
         self.load_fields: dict[str, Field] = {}
         self.dump_fields: dict[str, Field] = {}
+        #: Diagnostics explaining why schema-level validators did not run
+        #: during the last `load`/`validate` call. Reset on every call.
+        self.validation_diagnostics: list[dict[str, typing.Any]] = []
         self._init_fields()
         messages = {}
         messages.update(self._default_error_messages)
@@ -866,6 +869,7 @@ class Schema(metaclass=SchemaMeta):
         """
         error_store = ErrorStore()
         errors: dict[str, list[str]] = {}
+        self.validation_diagnostics = []
         many = self.many if many is None else bool(many)
         unknown = self.unknown if unknown is None else unknown
         if partial is None:
@@ -1171,6 +1175,25 @@ class Schema(metaclass=SchemaMeta):
                         if validated_value is missing:
                             data.pop(field_name, None)
 
+    def _missing_validator_dependencies(
+        self, attr_name: str, requires: typing.Iterable[str]
+    ) -> list[str]:
+        """Return the dependencies of a schema-level validator that are not
+        part of the projected schema (e.g. removed by ``only``/``exclude``).
+
+        Dependencies are canonical field names; ``data_key`` does not change a
+        field's identity. Depending on a field that is not declared at all is a
+        configuration error and raises `ValueError`.
+        """
+        undeclared = [name for name in requires if name not in self.declared_fields]
+        if undeclared:
+            message = (
+                f"Schema-level validator {attr_name!r} of {self} depends on "
+                f"undeclared fields: {undeclared}."
+            )
+            raise ValueError(message)
+        return [name for name in requires if name not in self.fields]
+
     def _invoke_schema_validators(
         self,
         *,
@@ -1188,7 +1211,38 @@ class Schema(metaclass=SchemaMeta):
                 continue
             validator = getattr(self, attr_name)
             if field_errors and validator_kwargs["skip_on_field_errors"]:
+                self.validation_diagnostics.append(
+                    {
+                        "validator": attr_name,
+                        "reason": "field_errors",
+                        "policy": "skip",
+                    }
+                )
                 continue
+            requires = validator_kwargs.get("requires") or ()
+            if requires:
+                missing_dependencies = self._missing_validator_dependencies(
+                    attr_name, requires
+                )
+                if missing_dependencies:
+                    on_missing = validator_kwargs.get("on_missing", "skip")
+                    if on_missing != "run":
+                        self.validation_diagnostics.append(
+                            {
+                                "validator": attr_name,
+                                "reason": "missing_dependencies",
+                                "missing_fields": list(missing_dependencies),
+                                "policy": on_missing,
+                            }
+                        )
+                        if on_missing == "error":
+                            message = (
+                                f"Schema-level validator {attr_name!r} did not run: "
+                                "missing required fields: "
+                                f"{', '.join(missing_dependencies)}."
+                            )
+                            error_store.store_error([message], SCHEMA)
+                        continue
             pass_original = validator_kwargs.get("pass_original", False)
 
             if many and not pass_collection:

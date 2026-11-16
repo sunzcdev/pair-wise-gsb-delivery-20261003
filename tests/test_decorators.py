@@ -985,3 +985,197 @@ def test_post_load_method_that_appends_to_data():
 
     schema = MySchema(many=True)
     assert schema.load([{"foo": 24}]) == [{"foo": 24}, {"foo": 42}]
+
+
+class TestValidatesSchemaRequires:
+    class RangeSchema(Schema):
+        start = fields.Int(required=True)
+        end = fields.Int(required=True)
+        label = fields.Str()
+
+        @validates_schema(requires=("start", "end"))
+        def validate_range(self, data, **kwargs):
+            if data["start"] > data["end"]:
+                raise ValidationError("start must not exceed end")
+
+    def test_runs_when_all_dependencies_present(self):
+        schema = self.RangeSchema()
+        errors = schema.validate({"start": 5, "end": 1})
+        assert errors["_schema"] == ["start must not exceed end"]
+        assert schema.validation_diagnostics == []
+
+    def test_skip_policy_records_diagnostic_on_exclude(self):
+        schema = self.RangeSchema(exclude=("end",))
+        # Excluded dependency -> validator skipped, no error, but a diagnostic
+        # is recorded so the skip is not silently treated as a success.
+        assert schema.validate({"start": 5}) == {}
+        assert schema.validation_diagnostics == [
+            {
+                "validator": "validate_range",
+                "reason": "missing_dependencies",
+                "missing_fields": ["end"],
+                "policy": "skip",
+            }
+        ]
+
+    def test_skip_policy_records_diagnostic_on_only(self):
+        schema = self.RangeSchema(only=("start",))
+        assert schema.validate({"start": 5}) == {}
+        assert schema.validation_diagnostics[0]["reason"] == "missing_dependencies"
+        assert schema.validation_diagnostics[0]["missing_fields"] == ["end"]
+
+    def test_error_policy_reports_missing_dependencies(self):
+        class MySchema(Schema):
+            start = fields.Int()
+            end = fields.Int()
+
+            @validates_schema(requires=("start", "end"), on_missing="error")
+            def validate_range(self, data, **kwargs):
+                pass
+
+        schema = MySchema(exclude=("end",))
+        errors = schema.validate({"start": 5})
+        assert errors["_schema"] == [
+            "Schema-level validator 'validate_range' did not run: "
+            "missing required fields: end."
+        ]
+        assert schema.validation_diagnostics == [
+            {
+                "validator": "validate_range",
+                "reason": "missing_dependencies",
+                "missing_fields": ["end"],
+                "policy": "error",
+            }
+        ]
+
+    def test_run_policy_executes_despite_missing_dependencies(self):
+        class MySchema(Schema):
+            start = fields.Int()
+            end = fields.Int()
+
+            @validates_schema(requires=("start", "end"), on_missing="run")
+            def validate_range(self, data, **kwargs):
+                if "end" not in data:
+                    raise ValidationError("end was projected out")
+
+        schema = MySchema(exclude=("end",))
+        errors = schema.validate({"start": 5})
+        assert errors["_schema"] == ["end was projected out"]
+        assert schema.validation_diagnostics == []
+
+    def test_dependencies_use_canonical_names_not_data_key(self):
+        class MySchema(Schema):
+            start = fields.Int(data_key="startDate")
+            end = fields.Int()
+
+            @validates_schema(requires=("start", "end"))
+            def validate_range(self, data, **kwargs):
+                if data["start"] > data["end"]:
+                    raise ValidationError("start must not exceed end")
+
+        # data_key does not change field identity: both deps are present
+        schema = MySchema()
+        errors = schema.validate({"startDate": 5, "end": 1})
+        assert errors["_schema"] == ["start must not exceed end"]
+        assert schema.validation_diagnostics == []
+
+        # Excluding by canonical name removes the dependency
+        schema = MySchema(exclude=("start",))
+        assert schema.validate({"end": 1}) == {}
+        assert schema.validation_diagnostics[0]["missing_fields"] == ["start"]
+
+    def test_undeclared_dependency_raises_value_error(self):
+        class MySchema(Schema):
+            start = fields.Int()
+
+            @validates_schema(requires=("nonexistent",))
+            def validate_range(self, data, **kwargs):
+                pass
+
+        with pytest.raises(ValueError, match="undeclared fields"):
+            MySchema().validate({"start": 1})
+
+    def test_invalid_on_missing_policy_raises_value_error(self):
+        with pytest.raises(ValueError, match="on_missing"):
+            validates_schema(on_missing="bogus")
+
+    def test_field_errors_are_distinct_from_missing_dependencies(self):
+        # A dependency that fails to deserialize at runtime is a field error,
+        # not a missing dependency.
+        class MySchema(Schema):
+            start = fields.Int(required=True)
+            end = fields.Int(required=True)
+
+            @validates_schema(requires=("start", "end"))
+            def validate_range(self, data, **kwargs):
+                raise ValidationError("should not run")
+
+        schema = MySchema()
+        errors = schema.validate({"start": "not-an-int", "end": 1})
+        assert errors["start"] == ["Not a valid integer."]
+        assert "_schema" not in errors
+        assert schema.validation_diagnostics == [
+            {"validator": "validate_range", "reason": "field_errors", "policy": "skip"}
+        ]
+
+    def test_nested_dependencies_resolve_at_their_own_level(self):
+        class InnerSchema(Schema):
+            low = fields.Int()
+            high = fields.Int()
+
+            @validates_schema(requires=("low", "high"))
+            def validate_bounds(self, data, **kwargs):
+                if data["low"] > data["high"]:
+                    raise ValidationError("low must not exceed high")
+
+        class OuterSchema(Schema):
+            name = fields.Str()
+            inner = fields.Nested(InnerSchema)
+
+        # Parent-level projection does not affect the nested level
+        schema = OuterSchema(exclude=("name",))
+        errors = schema.validate({"inner": {"low": 5, "high": 1}})
+        assert errors["inner"]["_schema"] == ["low must not exceed high"]
+
+        # Dotted exclude removes the dependency at the nested level
+        schema = OuterSchema(exclude=("inner.high",))
+        assert schema.validate({"inner": {"low": 5}}) == {}
+        inner_schema = schema.fields["inner"].schema
+        assert inner_schema.validation_diagnostics == [
+            {
+                "validator": "validate_bounds",
+                "reason": "missing_dependencies",
+                "missing_fields": ["high"],
+                "policy": "skip",
+            }
+        ]
+
+    def test_diagnostics_with_many(self):
+        schema = self.RangeSchema(exclude=("end",), many=True)
+        assert schema.validate([{"start": 1}, {"start": 2}]) == {}
+        # Recorded once per validator, not once per item
+        assert len(schema.validation_diagnostics) == 1
+        assert schema.validation_diagnostics[0]["reason"] == "missing_dependencies"
+
+    def test_diagnostics_reset_between_calls(self):
+        schema = self.RangeSchema(exclude=("end",))
+        schema.validate({"start": 1})
+        assert len(schema.validation_diagnostics) == 1
+        schema.validate({"start": 2})
+        assert len(schema.validation_diagnostics) == 1
+
+    def test_multi_field_validates_unaffected(self):
+        class MySchema(Schema):
+            a = fields.Int()
+            b = fields.Int()
+
+            @validates("a", "b")
+            def validate_fields(self, value, **kwargs):
+                if value < 0:
+                    raise ValidationError("Must be non-negative")
+
+        schema = MySchema()
+        errors = schema.validate({"a": -1, "b": -2})
+        assert errors["a"] == ["Must be non-negative"]
+        assert errors["b"] == ["Must be non-negative"]
+        assert schema.validation_diagnostics == []
