@@ -1,5 +1,6 @@
 import math
 import json
+from collections import OrderedDict
 
 from jmespath import exceptions
 from jmespath.compat import string_type as STRING_TYPE
@@ -345,6 +346,73 @@ class Functions(metaclass=FunctionRegistry):
             return max(array, key=keyfunc)
         else:
             return None
+
+    @signature({'types': ['array']}, {'types': ['expref']})
+    def _func_group_by(self, array, expref):
+        # Groups the members of ``array`` into an ordered list of groups.
+        # Each member is evaluated exactly once against the expression
+        # reference to produce a key.  Keys are kept as their original
+        # JSON values (they are never converted to strings) and the order
+        # of the groups follows the first appearance of each key.
+        groups = OrderedDict()
+        for index, element in enumerate(array):
+            # The expression is evaluated exactly once per member.
+            key = expref.visit(expref.expression, element)
+            # The canonical form is only used for equality/lookup, the
+            # original key is preserved in the output.
+            canonical = self._canonical_group_key(key, index)
+            if canonical not in groups:
+                groups[canonical] = {
+                    'key': key,
+                    'members': [],
+                }
+            groups[canonical]['members'].append(element)
+        return list(groups.values())
+
+    def _canonical_group_key(self, key, index):
+        # Converts a JSON value produced by the group_by expression into a
+        # hashable canonical form while preserving the JSON semantics used
+        # for grouping:
+        #
+        # * object key order does not affect key equality
+        # * array order is significant
+        # * ``true``/``false`` are distinct from the numbers ``1``/``0``
+        #
+        # Values that cannot be used as a legal JSON key (``null`` is a
+        # legal key) raise an error that carries the offending member's
+        # index within the grouped array.
+        if key is None:
+            return ('null',)
+        # bool has to be checked before int/float because ``bool`` is a
+        # subclass of ``int`` in python, yet JSON treats them as distinct
+        # key types (true and 1 must not collide).
+        if isinstance(key, bool):
+            return ('boolean', key)
+        if isinstance(key, (int, float)):
+            # NaN and Infinity are not representable as JSON values, so
+            # they cannot be used as a JSON key.
+            if isinstance(key, float) and not math.isfinite(key):
+                raise exceptions.JMESPathError(
+                    'In function group_by(), the expression evaluated to '
+                    'an invalid JSON key (%s) for the member at index %s'
+                    % (key, index))
+            return ('number', key)
+        if isinstance(key, STRING_TYPE):
+            return ('string', key)
+        if isinstance(key, list):
+            return ('array', tuple(
+                self._canonical_group_key(item, index) for item in key))
+        if isinstance(key, dict):
+            # Sorting the items makes object key order irrelevant to
+            # equality while leaving the nested values' own semantics
+            # (including array order) intact.
+            return ('object', tuple(sorted(
+                (name, self._canonical_group_key(value, index))
+                for name, value in key.items())))
+        raise exceptions.JMESPathError(
+            'In function group_by(), the expression evaluated to an '
+            'invalid JSON key (%s) for the member at index %s'
+            % (key, index))
 
     def _create_key_func(self, expref, allowed_types, function_name):
         def keyfunc(x):

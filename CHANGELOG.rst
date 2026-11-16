@@ -1,7 +1,14 @@
 Next Release (TBD)
 ==================
 
-* No changes yet.
+* Add a ``group_by(array, &expr)`` function that partitions an array into
+  ordered groups keyed by the JSON scalar or composite value produced by
+  the expression reference. Group order follows the first appearance of
+  each key, object key order is ignored when comparing keys while array
+  order is significant, and ``true``/``false`` are distinct keys from
+  ``1``/``0``. The original keys and members are preserved without being
+  converted to strings, and a return value that cannot be used as a legal
+  JSON key raises an error naming the offending member's index.
 
 
 1.1.0

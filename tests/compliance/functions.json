@@ -837,5 +837,187 @@
       "result": [[1, 2, 3, 4], [5, 6, 7, 8, 9]]
     }
   ]
+}, {
+  "given": {
+    "records": [
+      {"g": "b", "k": true, "c": {"a": 1, "b": 2}, "p": [1, 2], "maybe": "x"},
+      {"g": "a", "k": 1, "c": {"b": 2, "a": 1}, "p": [2, 1], "maybe": null},
+      {"g": "b", "k": true, "c": {"a": 1, "b": 2}, "p": [1, 2], "maybe": "x"},
+      {"g": "a", "k": false, "c": {"a": 2}, "p": [1, 2]},
+      {"g": "c", "k": 0, "c": {"a": 2}, "p": [1]}
+    ]
+  },
+  "cases": [
+    {
+      "expression": "group_by(records, &g)",
+      "result": [
+        {
+          "key": "b",
+          "members": [
+            {"g": "b", "k": true, "c": {"a": 1, "b": 2}, "p": [1, 2], "maybe": "x"},
+            {"g": "b", "k": true, "c": {"a": 1, "b": 2}, "p": [1, 2], "maybe": "x"}
+          ]
+        },
+        {
+          "key": "a",
+          "members": [
+            {"g": "a", "k": 1, "c": {"b": 2, "a": 1}, "p": [2, 1], "maybe": null},
+            {"g": "a", "k": false, "c": {"a": 2}, "p": [1, 2]}
+          ]
+        },
+        {
+          "key": "c",
+          "members": [
+            {"g": "c", "k": 0, "c": {"a": 2}, "p": [1]}
+          ]
+        }
+      ]
+    },
+    {
+      "expression": "group_by(records, &k)",
+      "result": [
+        {
+          "key": true,
+          "members": [
+            {"g": "b", "k": true, "c": {"a": 1, "b": 2}, "p": [1, 2], "maybe": "x"},
+            {"g": "b", "k": true, "c": {"a": 1, "b": 2}, "p": [1, 2], "maybe": "x"}
+          ]
+        },
+        {
+          "key": 1,
+          "members": [
+            {"g": "a", "k": 1, "c": {"b": 2, "a": 1}, "p": [2, 1], "maybe": null}
+          ]
+        },
+        {
+          "key": false,
+          "members": [
+            {"g": "a", "k": false, "c": {"a": 2}, "p": [1, 2]}
+          ]
+        },
+        {
+          "key": 0,
+          "members": [
+            {"g": "c", "k": 0, "c": {"a": 2}, "p": [1]}
+          ]
+        }
+      ]
+    },
+    {
+      "expression": "group_by(records, &c)",
+      "result": [
+        {
+          "key": {"a": 1, "b": 2},
+          "members": [
+            {"g": "b", "k": true, "c": {"a": 1, "b": 2}, "p": [1, 2], "maybe": "x"},
+            {"g": "a", "k": 1, "c": {"b": 2, "a": 1}, "p": [2, 1], "maybe": null},
+            {"g": "b", "k": true, "c": {"a": 1, "b": 2}, "p": [1, 2], "maybe": "x"}
+          ]
+        },
+        {
+          "key": {"a": 2},
+          "members": [
+            {"g": "a", "k": false, "c": {"a": 2}, "p": [1, 2]},
+            {"g": "c", "k": 0, "c": {"a": 2}, "p": [1]}
+          ]
+        }
+      ]
+    },
+    {
+      "expression": "group_by(records, &p)",
+      "result": [
+        {
+          "key": [1, 2],
+          "members": [
+            {"g": "b", "k": true, "c": {"a": 1, "b": 2}, "p": [1, 2], "maybe": "x"},
+            {"g": "b", "k": true, "c": {"a": 1, "b": 2}, "p": [1, 2], "maybe": "x"},
+            {"g": "a", "k": false, "c": {"a": 2}, "p": [1, 2]}
+          ]
+        },
+        {
+          "key": [2, 1],
+          "members": [
+            {"g": "a", "k": 1, "c": {"b": 2, "a": 1}, "p": [2, 1], "maybe": null}
+          ]
+        },
+        {
+          "key": [1],
+          "members": [
+            {"g": "c", "k": 0, "c": {"a": 2}, "p": [1]}
+          ]
+        }
+      ]
+    },
+    {
+      "expression": "group_by(records, &[g, k])",
+      "result": [
+        {
+          "key": ["b", true],
+          "members": [
+            {"g": "b", "k": true, "c": {"a": 1, "b": 2}, "p": [1, 2], "maybe": "x"},
+            {"g": "b", "k": true, "c": {"a": 1, "b": 2}, "p": [1, 2], "maybe": "x"}
+          ]
+        },
+        {
+          "key": ["a", 1],
+          "members": [
+            {"g": "a", "k": 1, "c": {"b": 2, "a": 1}, "p": [2, 1], "maybe": null}
+          ]
+        },
+        {
+          "key": ["a", false],
+          "members": [
+            {"g": "a", "k": false, "c": {"a": 2}, "p": [1, 2]}
+          ]
+        },
+        {
+          "key": ["c", 0],
+          "members": [
+            {"g": "c", "k": 0, "c": {"a": 2}, "p": [1]}
+          ]
+        }
+      ]
+    },
+    {
+      "expression": "group_by(records, &maybe)",
+      "result": [
+        {
+          "key": "x",
+          "members": [
+            {"g": "b", "k": true, "c": {"a": 1, "b": 2}, "p": [1, 2], "maybe": "x"},
+            {"g": "b", "k": true, "c": {"a": 1, "b": 2}, "p": [1, 2], "maybe": "x"}
+          ]
+        },
+        {
+          "key": null,
+          "members": [
+            {"g": "a", "k": 1, "c": {"b": 2, "a": 1}, "p": [2, 1], "maybe": null},
+            {"g": "a", "k": false, "c": {"a": 2}, "p": [1, 2]},
+            {"g": "c", "k": 0, "c": {"a": 2}, "p": [1]}
+          ]
+        }
+      ]
+    },
+    {
+      "expression": "group_by(`[]`, &g)",
+      "result": []
+    },
+    {
+      "expression": "group_by(records, g)",
+      "error": "invalid-type"
+    },
+    {
+      "expression": "group_by(`1`, &g)",
+      "error": "invalid-type"
+    },
+    {
+      "expression": "group_by(records)",
+      "error": "invalid-arity"
+    },
+    {
+      "expression": "group_by(records, &g, &g)",
+      "error": "invalid-arity"
+    }
+  ]
 }
 ]
