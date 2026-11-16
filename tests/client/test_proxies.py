@@ -263,3 +263,117 @@ def test_proxy_with_mounts():
 
     transport = client._transport_for_url(httpx.URL("http://example.com"))
     assert transport == proxy_transport
+
+
+@pytest.mark.parametrize("client_class", [httpx.Client, httpx.AsyncClient])
+def test_proxy_with_cidr_exclusion_mounts(client_class):
+    proxy_transport = httpx.HTTPTransport(proxy="http://127.0.0.1")
+    client = client_class(
+        trust_env=False,
+        mounts={
+            "all://": proxy_transport,
+            "all://10.0.0.0/8": None,
+            "all://[fd00::/8]": None,
+        },
+    )
+
+    # Literal IP addresses within the excluded networks bypass the proxy.
+    for url in [
+        "http://10.1.2.3",
+        "http://10.1.2.3:8080",
+        "https://10.0.0.1",
+        "http://[fd00::1]",
+        "http://[fd00::1]:8080",
+    ]:
+        assert client._transport_for_url(httpx.URL(url)) is client._transport
+
+    # Everything else is routed through the proxy. Hostnames are never
+    # resolved, so they cannot match an excluded network.
+    for url in ["http://11.0.0.1", "http://[::1]", "http://example.com"]:
+        assert client._transport_for_url(httpx.URL(url)) is proxy_transport
+
+
+@pytest.mark.parametrize("client_class", [httpx.Client, httpx.AsyncClient])
+def test_proxy_with_cidr_mounts_route_to_transport(client_class):
+    proxy_transport = httpx.HTTPTransport(proxy="http://127.0.0.1")
+    client = client_class(trust_env=False, mounts={"all://10.0.0.0/8": proxy_transport})
+
+    # CIDR mounts are not only exclusions, but may also route to a transport.
+    transport = client._transport_for_url(httpx.URL("http://10.1.2.3"))
+    assert transport is proxy_transport
+    assert client._transport_for_url(httpx.URL("http://11.0.0.1")) is client._transport
+
+
+@pytest.mark.parametrize("client_class", [httpx.Client, httpx.AsyncClient])
+def test_proxy_with_port_qualified_cidr_mounts(client_class):
+    proxy_transport = httpx.HTTPTransport(proxy="http://127.0.0.1")
+    other_transport = httpx.HTTPTransport()
+    client = client_class(
+        trust_env=False,
+        mounts={
+            "all://10.0.0.0/8": proxy_transport,
+            "all://10.0.0.0/8:8080": other_transport,
+        },
+    )
+
+    # Port-qualified mounts take priority over plain mounts.
+    transport = client._transport_for_url(httpx.URL("http://10.1.2.3:8080"))
+    assert transport is other_transport
+    transport = client._transport_for_url(httpx.URL("http://10.1.2.3:9090"))
+    assert transport is proxy_transport
+
+
+@pytest.mark.parametrize("client_class", [httpx.Client, httpx.AsyncClient])
+def test_proxy_argument_with_cidr_exclusion_mounts(client_class):
+    client = client_class(
+        trust_env=False,
+        proxy="http://127.0.0.1",
+        mounts={"all://10.0.0.0/8": None},
+    )
+
+    # The broad `proxy=` mount is overridden by an explicit CIDR exclusion.
+    assert client._transport_for_url(httpx.URL("http://10.1.2.3")) is client._transport
+    transport = client._transport_for_url(httpx.URL("http://11.1.1.1"))
+    assert transport is not client._transport
+    assert isinstance(transport._pool, (httpcore.HTTPProxy, httpcore.AsyncHTTPProxy))
+
+
+@pytest.mark.parametrize("client_class", [httpx.Client, httpx.AsyncClient])
+def test_proxy_with_invalid_cidr_mount(client_class):
+    with pytest.raises(ValueError):
+        client_class(trust_env=False, mounts={"all://10.0.0.0/33": None})
+    with pytest.raises(ValueError):
+        client_class(trust_env=False, mounts={"all://[fd00::/129]": None})
+    with pytest.raises(ValueError):
+        client_class(trust_env=False, mounts={"all://10.0.0.0/8:not-a-port": None})
+
+
+@pytest.mark.parametrize(
+    ["url", "no_proxy", "expected"],
+    [
+        # Not proxied if NO_PROXY excludes a matching IPv4 network.
+        ("http://192.168.1.1", "192.168.0.0/16", None),
+        ("http://192.168.1.1:8080", "192.168.0.0/16", None),
+        # Proxied if the IP address is outside the NO_PROXY network.
+        ("http://192.167.1.1", "192.168.0.0/16", "http://localhost:123"),
+        # Not proxied if NO_PROXY excludes a matching IPv6 network.
+        ("http://[fd00::1]", "fd00::/8", None),
+        ("http://[fd00::1]:8080", "fd00::/8", None),
+        ("http://[fd00::1]", "[fd00::/8]", None),
+        ("http://[::1]", "fd00::/8", "http://localhost:123"),
+        # Hostnames are never resolved, so they cannot match a NO_PROXY network.
+        ("http://example.com", "0.0.0.0/0", "http://localhost:123"),
+    ],
+)
+@pytest.mark.parametrize("client_class", [httpx.Client, httpx.AsyncClient])
+def test_proxies_environ_cidr(monkeypatch, client_class, url, no_proxy, expected):
+    monkeypatch.setenv("ALL_PROXY", "http://localhost:123")
+    monkeypatch.setenv("NO_PROXY", no_proxy)
+
+    client = client_class()
+    transport = client._transport_for_url(httpx.URL(url))
+
+    if expected is None:
+        assert transport is client._transport
+    else:
+        assert transport._pool._proxy_url == url_to_origin(expected)
