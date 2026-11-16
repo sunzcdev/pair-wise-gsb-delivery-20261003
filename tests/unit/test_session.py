@@ -4,6 +4,7 @@ import json
 import pickle
 import sys
 from collections import UserDict, defaultdict
+from contextlib import nullcontext
 from datetime import datetime, timedelta
 from logging import getLogger
 from pathlib import Path
@@ -14,7 +15,7 @@ from urllib.parse import urlencode
 
 import pytest
 import requests
-from requests import HTTPError, Request, RequestException, Session
+from requests import ConnectionError, HTTPError, Request, RequestException, Session
 from requests.structures import CaseInsensitiveDict
 
 from requests_cache import ALL_METHODS, CachedSession
@@ -513,17 +514,167 @@ def test_expired_request_error(url, mock_session):
 @skip_pypy
 @pytest.mark.parametrize('url', [MOCKED_URL, MOCKED_URL_ETAG])
 def test_stale_if_error__exception(url, mock_session):
-    """With stale_if_error, expect to get old cache data if there is an exception during a request"""
+    """With stale_if_error, expect to get old cache data if a transport exception occurs while
+    re-sending the request. The fallback should be visible via public diagnostics.
+    """
     mock_session.settings.stale_if_error = True
     mock_session.settings.expire_after = 1
     with time_travel(START_DT):
         assert mock_session.get(url).from_cache is False
         assert mock_session.get(url).from_cache is True
 
-    with patch.object(mock_session.cache, 'save_response', side_effect=RequestException):
+    mock_session.mock_adapter.register_uri('GET', url, exc=ConnectionError)
+    with time_travel(START_DT + timedelta(seconds=1.1)):
+        response = mock_session.get(url)
+        assert response.from_cache is True and response.is_expired is True
+        assert response.is_stale_error is True
+        assert response.stale_error_type == 'transport'
+
+
+@skip_pypy
+@pytest.mark.parametrize('url', [MOCKED_URL, MOCKED_URL_ETAG])
+def test_stale_if_error__cache_write_error_propagates(url, mock_session):
+    """A local cache storage/serialization error is not an origin failure: it must propagate even
+    when stale_if_error is enabled, and the previously cached response must remain untouched.
+    """
+    mock_session.settings.stale_if_error = True
+    mock_session.settings.expire_after = 1
+    with time_travel(START_DT):
+        mock_session.get(url)
+
+    with patch.object(mock_session.cache, 'save_response', side_effect=ValueError):
         with time_travel(START_DT + timedelta(seconds=1.1)):
-            response = mock_session.get(url)
-            assert response.from_cache is True and response.is_expired is True
+            with pytest.raises(ValueError):
+                mock_session.get(url)
+
+    # The stale cached response must not have been deleted or marked as a stale-error fallback
+    cached = list(mock_session.cache.responses.values())[0]
+    assert cached.is_stale_error is False
+    assert cached.stale_error_type is None
+
+
+@skip_pypy
+def test_stale_if_error__filter_fn_error_propagates(mock_session):
+    """An error raised by the user's filter callback while processing a fresh response is a
+    programming error, not an origin failure: it must propagate and must not delete the existing
+    cached response or be recorded as a stale-if-error fallback.
+    """
+    url = f'{MOCKED_URL}/filter-error'
+    mock_session.settings.stale_if_error = True
+    mock_session.settings.expire_after = 1
+    mock_session.mock_adapter.register_uri('GET', url, text='original content')
+
+    with time_travel(START_DT):
+        assert mock_session.get(url).text == 'original content'
+
+    mock_session.mock_adapter.register_uri('GET', url, text='refreshed content')
+
+    def broken_filter(response):
+        raise RuntimeError('broken filter')
+
+    mock_session.settings.filter_fn = broken_filter
+    with time_travel(START_DT + timedelta(seconds=1.1)):
+        with pytest.raises(RuntimeError, match='broken filter'):
+            mock_session.get(url)
+
+    # Existing cached response is still present and was not marked as a stale-error fallback
+    entries = list(mock_session.cache.responses.values())
+    assert any(r.text == 'original content' for r in entries)
+    assert all(r.is_stale_error is False for r in entries)
+
+
+@skip_pypy
+def test_stale_if_error__hook_error_propagates(mock_session):
+    """An error raised by a response hook while processing a fresh response is not an origin
+    failure: it must propagate instead of being masked as a stale response, and the old cached
+    response must remain in place.
+    """
+    url = f'{MOCKED_URL}/hook-error'
+    mock_session.settings.stale_if_error = True
+    mock_session.settings.expire_after = 1
+    mock_session.mock_adapter.register_uri('GET', url, text='original content')
+
+    with time_travel(START_DT):
+        mock_session.get(url)
+
+    # Origin responds successfully; the failure occurs only in the response hook
+    mock_session.mock_adapter.register_uri('GET', url, text='refreshed content')
+
+    def broken_hook(response, *args, **kwargs):
+        raise RuntimeError('broken hook')
+
+    with time_travel(START_DT + timedelta(seconds=1.1)):
+        with pytest.raises(RuntimeError, match='broken hook'):
+            mock_session.get(url, hooks={'response': [broken_hook]})
+
+    # The hook failure must not be recorded as an origin failure on the cached response
+    entries = list(mock_session.cache.responses.values())
+    assert all(r.is_stale_error is False for r in entries)
+
+
+@skip_pypy
+@pytest.mark.parametrize(
+    'failure, expect_stale_fallback, expect_raises',
+    [
+        ('network', True, None),  # Origin transport failure -> stale-if-error fallback
+        ('hook', False, RuntimeError),  # Response hook failure -> propagate
+        ('write', False, ValueError),  # Local cache write failure -> propagate
+    ],
+)
+def test_stale_if_error__failure_scope(failure, expect_stale_fallback, expect_raises, mock_session):
+    """The same request must produce three distinct outcomes depending on where it fails:
+
+    * an origin/transport failure falls back to the stale cached response
+    * a response hook (processing callback) failure propagates and is never logged as an origin
+      failure
+    * a local cache write failure propagates and leaves the existing cached response in place
+    """
+    url = f'{MOCKED_URL}/failure-scope'
+    mock_session.settings.stale_if_error = True
+    mock_session.settings.expire_after = 1
+    mock_session.mock_adapter.register_uri('GET', url, text='original content')
+
+    with time_travel(START_DT):
+        assert mock_session.get(url).text == 'original content'
+
+    # Origin fails with a transport error for the network case; the origin succeeds (but a later
+    # stage fails) for the hook and cache-write cases
+    if failure == 'network':
+        mock_session.mock_adapter.register_uri('GET', url, exc=ConnectionError)
+    else:
+        mock_session.mock_adapter.register_uri('GET', url, text='refreshed content')
+
+    def broken_hook(response, *args, **kwargs):
+        raise RuntimeError('broken hook')
+
+    hooks = {'response': [broken_hook]} if failure == 'hook' else None
+    save_patch = (
+        patch.object(mock_session.cache, 'save_response', side_effect=ValueError)
+        if failure == 'write'
+        else nullcontext()
+    )
+
+    with time_travel(START_DT + timedelta(seconds=1.1)):
+        with save_patch:
+            if expect_raises is not None:
+                with pytest.raises(expect_raises):
+                    mock_session.get(url, hooks=hooks)
+                response = None
+            else:
+                response = mock_session.get(url, hooks=hooks)
+
+    if expect_stale_fallback:
+        assert response is not None
+        assert response.from_cache is True
+        assert response.text == 'original content'
+        assert response.is_stale_error is True
+        assert response.stale_error_type == 'transport'
+
+    # The previously cached response survives every failure mode and is only flagged as a stale
+    # error when the failure genuinely originated at the origin
+    stored = list(mock_session.cache.responses.values())
+    assert any(r.text == 'original content' for r in stored)
+    assert all(r.is_stale_error is False for r in stored)
 
 
 @skip_pypy
@@ -545,6 +696,32 @@ def test_stale_if_error__error_code(url, mock_session):
         assert response.status_code == 200
         assert response.from_cache is True
         assert response.is_expired is True
+        assert response.is_stale_error is True
+        assert response.stale_error_type == 'status'
+
+
+@skip_pypy
+def test_stale_if_error__must_revalidate(mock_session):
+    """A cached response that requires revalidation must not be served stale on an origin error,
+    even with stale_if_error enabled (RFC 9111). The origin error is re-raised instead.
+    """
+    url = f'{MOCKED_URL}/must-revalidate'
+    mock_session.settings.cache_control = True
+    mock_session.settings.stale_if_error = True
+    mock_session.mock_adapter.register_uri(
+        'GET',
+        url,
+        text='original content',
+        headers={'Cache-Control': 'max-age=0, must-revalidate', 'ETag': 'original'},
+    )
+    mock_session.get(url)
+
+    mock_session.mock_adapter.register_uri('GET', url, exc=ConnectionError)
+    with pytest.raises(ConnectionError):
+        mock_session.get(url)
+
+    # The cached entry remains available for a later successful revalidation
+    assert mock_session.cache.contains(url=url)
 
 
 @skip_pypy

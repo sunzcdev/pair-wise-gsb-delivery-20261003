@@ -1,6 +1,9 @@
 # History
 
 ## Unreleased
+* Limit `stale_if_error` fallbacks to origin failures (transport `RequestException` and non-allowable response status codes); errors from user callbacks (`filter_fn`, hooks) and local cache storage/serialization are now raised instead of being masked as a stale response
+* Add `CachedResponse.is_stale_error` and `CachedResponse.stale_error_type` diagnostics (`'transport'` or `'status'`) for responses served via stale-if-error
+* Never serve a `must-revalidate`/`no-cache` cached response stale on an origin error, per RFC 9111
 * Fix `ValueError` when a response has an invalid `Expires` date (for example `Expires: garbage`); it is now treated as already expired
 * Fix JSON refresh comparisons for mixed-case `Content-Type` values
 * Keep caller-supplied MongoDB clients open when closing MongoDB or GridFS caches

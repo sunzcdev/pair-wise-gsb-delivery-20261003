@@ -125,10 +125,42 @@ maximum staleness you are willing to accept:
 session = CachedSession(stale_if_error=timedelta(minutes=5))
 ```
 
-In addition to HTTP error codes, `stale_if_error` also applies to python exceptions (typically a
+In addition to HTTP error codes, `stale_if_error` also applies to transport exceptions (typically a
 {py:exc}`~requests.RequestException`). See `requests` documentation on
 [Errors and Exceptions](https://requests.readthedocs.io/en/latest/user/quickstart/#errors-and-exceptions)
 for more details on request errors in general.
+
+### What counts as an error?
+Only failures originating from the remote server can trigger a stale-if-error fallback:
+
+* A transport-level {py:exc}`~requests.RequestException` while sending the request
+  (e.g. {py:exc}`~requests.ConnectionError`, {py:exc}`~requests.Timeout`)
+* A response whose status code is not in {py:attr}`.CacheSettings.allowable_codes`
+  (e.g. a 404 or 500 when only 2xx responses are cached)
+
+Other failures are local programming or storage errors rather than origin failures, so they are
+**not** caught by `stale_if_error` and are raised normally instead of being masked as a stale
+response:
+
+* Exceptions raised by user callbacks such as `filter_fn` or response hooks
+* Errors while writing to or reading from the local cache (serialization, backend I/O, etc.)
+
+A stale-if-error fallback still respects the configured maximum staleness, and, when
+`cache_control` is enabled, a cached response that carries a `must-revalidate` (or `no-cache`)
+directive is never served stale on error, per RFC 9111; in that case the original error is
+re-raised.
+
+### Stale-error diagnostics
+When a stale response is returned because the origin failed, the response exposes the category of
+the failure that triggered the fallback:
+
+* {py:attr}`.CachedResponse.is_stale_error`: `True` when this response was served from cache due
+  to an origin failure
+* {py:attr}`.CachedResponse.stale_error_type`: `'transport'` for a request exception, or
+  `'status'` for a non-allowable response status code
+
+Both are runtime-only attributes (they are not persisted to the cache) and default to `False` /
+`None` on ordinary cache hits and fresh responses.
 
 (reset)=
 ## Resetting Expiration

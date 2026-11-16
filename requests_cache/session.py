@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING, Iterable, Mapping, Optional, Union
 
 from requests import PreparedRequest
 from requests import Session as OriginalSession
+from requests.exceptions import HTTPError, RequestException
 from requests.hooks import dispatch_hook
 
 from ._utils import get_valid_kwargs, patch_form_boundary
@@ -310,6 +311,12 @@ class CacheMixin(MIXIN_BASE):
     ) -> AnyResponse:
         """Handle a stale cached response by attempting to resend the request and cache a fresh
         response
+
+        Only origin failures (transport-level ``RequestException`` and, with stale-if-error
+        enabled, response status codes outside ``allowable_codes``) may fall back to the stale
+        cached response. Errors raised by user callbacks (e.g. ``filter_fn``) or by local cache
+        storage/serialization are not origin failures, so they propagate to the caller instead of
+        being masked as a successful stale response.
         """
         logger.debug('Stale response; attempting to re-send request')
         try:
@@ -320,8 +327,10 @@ class CacheMixin(MIXIN_BASE):
             ):
                 response.raise_for_status()
             return response
-        except Exception:
-            return self._handle_error(cached_response, actions)
+        except RequestException as e:
+            # Transport errors and non-allowable origin status codes (raised above) are the only
+            # failures eligible for a stale-if-error fallback; any other exception propagates.
+            return self._handle_error(cached_response, actions, error=e)
 
     def _resend_async(self, *args, **kwargs):
         """Send a non-blocking request to refresh a cached response"""
@@ -329,16 +338,27 @@ class CacheMixin(MIXIN_BASE):
         thread = Thread(target=self._send_and_cache, args=args, kwargs=kwargs)
         thread.start()
 
-    def _handle_error(self, cached_response: CachedResponse, actions: CacheActions) -> AnyResponse:
-        """Handle a request error based on settings:
+    def _handle_error(
+        self,
+        cached_response: CachedResponse,
+        actions: CacheActions,
+        error: Optional[RequestException] = None,
+    ) -> AnyResponse:
+        """Handle an origin request error based on settings:
         * Default behavior: re-raise the error
-        * stale-if-error: Ignore the error and and return the stale cache item
+        * stale-if-error: Ignore the error and return the stale cache item, provided it is within
+          the configured staleness limit and not subject to ``must-revalidate``
         """
         if actions.is_usable(cached_response, error=True):
+            # Classify the origin failure for public diagnostics
+            error_type = 'status' if isinstance(error, HTTPError) else 'transport'
             logger.warning(
-                f'Request for URL {cached_response.request.url} failed; using cached response',
+                f'Request for URL {cached_response.request.url} failed ({error_type}); using '
+                f'cached response',
                 exc_info=True,
             )
+            cached_response.is_stale_error = True
+            cached_response.stale_error_type = error_type
             return cached_response
         else:
             raise

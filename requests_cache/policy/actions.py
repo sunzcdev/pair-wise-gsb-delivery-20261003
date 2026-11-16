@@ -171,6 +171,12 @@ class CacheActions(RichMixin):
         """
         if cached_response is None:
             return False
+        # On an origin error, stale-if-error must not override a cached response that requires
+        # revalidation (RFC 9111): `must-revalidate` and `no-cache` forbid serving stale content
+        # even when the origin is unreachable. Response directives are only honored when
+        # cache_control is enabled, consistent with the rest of the cache policy.
+        if error and self._settings.cache_control and self._requires_revalidation(cached_response):
+            return False
         elif (
             cached_response.expires is None
             or (cached_response.is_expired and self._stale_while_revalidate is True)
@@ -313,6 +319,15 @@ class CacheActions(RichMixin):
         self._stale_while_revalidate = (
             self._base_stale_while_revalidate or directives.stale_while_revalidate
         )
+
+    @staticmethod
+    def _requires_revalidation(cached_response: 'CachedResponse') -> bool:
+        """Check whether the cached response forbids serving stale content. Per RFC 9111,
+        ``must-revalidate`` (and the equivalent ``no-cache`` response directive) mean a stale
+        response must never be used without successful revalidation, even on origin errors.
+        """
+        directives = CacheDirectives.from_headers(cached_response.headers)
+        return directives.must_revalidate or directives.no_cache
 
     def _update_from_response_headers(self, directives: CacheDirectives):
         """Check response headers for expiration and other cache directives"""

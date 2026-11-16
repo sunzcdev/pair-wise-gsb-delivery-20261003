@@ -541,6 +541,40 @@ def test_is_usable__stale_if_error(stale_if_error, error, usable):
 
 
 @pytest.mark.parametrize(
+    'cache_control',
+    [
+        'must-revalidate',
+        'no-cache',
+    ],
+)
+@pytest.mark.parametrize('cache_control_enabled', [True, False])
+def test_is_usable__stale_if_error_blocked_by_revalidation(cache_control, cache_control_enabled):
+    """With cache_control enabled, stale-if-error must not serve a stale response whose own
+    headers require revalidation (RFC 9111), regardless of the staleness window.
+    Without cache_control, response directives are ignored and the normal stale-if-error
+    behavior applies.
+    """
+    request = Request(
+        url='https://img.site.com/base/img.jpg',
+        headers={'Cache-Control': 'stale-if-error=60'},
+    )
+    settings = CacheSettings(cache_control=cache_control_enabled)
+    actions = CacheActions.from_request('key', request, settings)
+    cached_response = CachedResponse(
+        headers={'Cache-Control': cache_control},
+        expires=utcnow() - timedelta(seconds=10),
+    )
+
+    if cache_control_enabled:
+        # The same response is usable as a plain stale entry, but not on an origin error
+        assert actions.is_usable(cached_response, error=False) is False
+        assert actions.is_usable(cached_response, error=True) is False
+    else:
+        # Response directives are ignored; stale-if-error still permits the fallback
+        assert actions.is_usable(cached_response, error=True) is True
+
+
+@pytest.mark.parametrize(
     'stale_while_revalidate, usable',
     [
         (5, False),

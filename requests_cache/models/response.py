@@ -38,6 +38,9 @@ class BaseResponse(Response):
     cache_key: str = ''  # Not serialized; set by BaseCache.get_response()
     revalidated: bool = False  # Not serialized; set by CacheActions.update_revalidated_response()
     has_content_changed: Optional[bool] = None  # Not serialized; set when refreshing a response
+    # Diagnostics for stale-if-error fallbacks; not serialized
+    is_stale_error: bool = False  # True when returned from cache due to an origin failure
+    stale_error_type: Optional[str] = None  # Category of origin failure: 'status' or 'transport'
 
     @property
     def from_cache(self) -> bool:
