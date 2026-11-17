@@ -115,9 +115,165 @@ module Dnsruby
   class Recursor
     CACHE_LIMIT = 16_384
     ADDRESS_CACHE_LIMIT = 256
+    # RFC 1034 section 3.6.2 bounds an alias chain; one more alias edge than
+    # this terminates the lookup instead of following forever.
+    MAX_ALIAS_HOPS = 255
     DEFAULT_RECURSION_LIMITS = {
       timeout: 30.0, max_queries: 128, max_steps: 256, max_workers: 8
     }.freeze
+
+    # One traversal edge recorded while a Recursor walks a name.
+    #
+    # +question+ is the actual query identity at this point of the walk: the
+    # owner name asked for together with its RR type and class. +edge+ says how
+    # the walk moved on - :alias for a CNAME/DNAME, :referral for an
+    # authoritative delegation, :answer for a terminal record, and :failure for
+    # the last hop of an unfinished lookup. +target+ is the next owner name for
+    # alias and referral edges.
+    class ResolutionHop
+      attr_reader :question, :edge, :target, :zone
+
+      def initialize(question, edge, target: nil, zone: nil)
+        name, type, klass = question
+        name = Name.create(name)
+        name.absolute = true
+        # Normalize so the recorded query identity is stable regardless of
+        # whether the caller passed mnemonics, codes or mapper objects.
+        @question = [name, Types.new(type), Classes.new(klass)]
+        @edge = edge
+        @target = target && Name.create(target).tap { |target_name| target_name.absolute = true }
+        @zone = zone
+        freeze
+      end
+
+      # The (name, type, class) identity used for loop detection. Repeating the
+      # same name under another RR type is not a loop, and a delegation edge is
+      # not an alias edge, so both belong in the identity.
+      def identity
+        name, type, klass = @question
+        [Name.create(name).canonical, Types.new(type).code, Classes.new(klass).code, @edge]
+      end
+
+      def to_s
+        name, type, klass = @question
+        detail = target ? " -> #{target}" : ''
+        "#{edge} #{name} #{Types.new(type).string} #{Classes.new(klass).string}#{detail}"
+      end
+    end
+
+    # Optional record of the exact path a recursive lookup followed.
+    #
+    # The path keeps every confirmed hop even when the lookup later fails, so a
+    # caller can distinguish a self loop (an alias pointing straight back at the
+    # question), an indirect loop (an earlier query identity reappearing), the
+    # hop limit and ordinary failures. Loop detection keys on the full query
+    # identity and edge kind, so repeated names in different RR type contexts,
+    # and authoritative referrals, can never be mistaken for an alias loop.
+    class ResolutionPath
+      # :complete       - the terminal answer for the original question was found
+      # :self_loop      - an alias target equals its own owner name
+      # :indirect_loop  - an alias reached an (name, type, class) already walked
+      # :hop_limit      - more than MAX_ALIAS_HOPS alias edges were required
+      # :failure        - a query raised after at least one hop was confirmed
+      # :incomplete     - the walk ended without a terminal answer or error detail
+      TERMINALS = %i[complete self_loop indirect_loop hop_limit failure incomplete].freeze
+      LOOP_TERMINALS = %i[self_loop indirect_loop].freeze
+
+      attr_reader :hops, :terminal, :error
+
+      def initialize
+        @hops = []
+        @seen = {}
+        @terminal = nil
+        @error = nil
+        @mutex = Mutex.new
+      end
+
+      def add_referral(name, type, klass, target, zone)
+        add_edge(ResolutionHop.new([name, type, klass], :referral, target: target, zone: zone))
+      end
+
+      def add_answer(name, type, klass)
+        add_edge(ResolutionHop.new([name, type, klass], :answer))
+      end
+
+      def add_failure(name, type, klass)
+        add_edge(ResolutionHop.new([name, type, klass], :failure))
+      end
+
+      # Records an alias edge and classifies it. Returns one of:
+      # :self_loop, :indirect_loop, :hop_limit or :ok. The same owner name
+      # under a different type/class, and referral edges, remain distinct
+      # identities, so neither can be mistaken for an alias loop.
+      def record_alias(name, type, klass, target)
+        @mutex.synchronize do
+          identity = ResolutionHop.new([name, type, klass], :alias).identity
+          hop = ResolutionHop.new([name, type, klass], :alias, target: target)
+          # Record the edge first so even a terminal loop keeps the full path.
+          if Name.create(target).canonical == identity.first
+            @hops << hop
+            return :self_loop
+          end
+          if @seen[identity]
+            @hops << hop
+            return :indirect_loop
+          end
+          if @hops.count { |entry| entry.edge == :alias } >= Recursor::MAX_ALIAS_HOPS
+            @hops << hop
+            return :hop_limit
+          end
+          @seen[identity] = true
+          @hops << hop
+          :ok
+        end
+      end
+
+      def finish(terminal, error = nil)
+        @mutex.synchronize do
+          raise ArgumentError, "Unknown resolution terminal #{terminal}" unless TERMINALS.include?(terminal)
+          # The first terminal decision stands: a loop or failure must not be
+          # relabelled by an outer layer's generic completion handling.
+          return self if @terminal
+          @terminal = terminal
+          @error = error
+        end
+        self
+      end
+
+      def complete?
+        @terminal == :complete
+      end
+
+      def loop?
+        LOOP_TERMINALS.include?(@terminal)
+      end
+
+      def incomplete?
+        !@terminal.nil? && @terminal != :complete
+      end
+
+      def aliases
+        @mutex.synchronize { @hops.select { |hop| hop.edge == :alias }.dup }
+      end
+
+      def each_hop(&block)
+        @mutex.synchronize { @hops.dup }.each(&block)
+      end
+
+      def questions
+        @mutex.synchronize { @hops.map(&:question).dup }
+      end
+
+      def to_s
+        @mutex.synchronize { "#{@hops.map(&:to_s).join(' | ')} [#{@terminal}]" }
+      end
+
+      private
+
+      def add_edge(hop)
+        @mutex.synchronize { @hops << hop }
+      end
+    end
 
     # TransmissionBudget carries this across address and validation workers.
     class Budget # :nodoc:
@@ -608,9 +764,26 @@ module Dnsruby
       end
     end
 
-    def query_no_validation_or_recursion(name, type=Types.A, klass=Classes.IN) # :nodoc: all
-      return query(name, type, klass, true)
+    def query_no_validation_or_recursion(name, type=Types.A, klass=Classes.IN, trace_path: nil) # :nodoc: all
+      return query(name, type, klass, true, trace_path: trace_path)
     end
+
+    # The ResolutionPath attached to the lookup running on this thread, when
+    # query was called with trace_path enabled. Nested supporting lookups and
+    # address workers inherit it only when the enclosing loop passes it on.
+    def self.current_path
+      Thread.current[:dnsruby_resolution_path]
+    end
+    private_class_method :current_path
+
+    def self.with_resolution_path(path)
+      previous = Thread.current[:dnsruby_resolution_path]
+      Thread.current[:dnsruby_resolution_path] = path
+      yield
+    ensure
+      Thread.current[:dnsruby_resolution_path] = previous
+    end
+    private_class_method :with_resolution_path
 
     # This method is much like the normal query() method except it disables
     # the recurse flag in the packet and explicitly performs the recursion.
@@ -620,24 +793,47 @@ module Dnsruby
     # 
     # The Recursor maintains a cache of known nameservers.
     # DNSSEC validation is performed unless true is passed as the fourth parameter.
-    def query(name, type=Types.A, klass=Classes.IN, no_validation = false)
+    #
+    # Pass +trace_path: true+ (or a Dnsruby::Recursor::ResolutionPath instance)
+    # to keep an optional record of the exact owner names, query identities and
+    # edge kinds (alias versus authoritative referral) the recursion followed.
+    # The same path is attached to a raised Dnsruby::ResolvError as
+    # #resolution_path, and with a block it is yielded as |message, path|.
+    # Without tracing the behaviour is unchanged.
+    def query(name, type=Types.A, klass=Classes.IN, no_validation = false, trace_path: nil)
+      path = case trace_path
+        when true then ResolutionPath.new
+        when ResolutionPath then trace_path
+        else nil
+      end
       Recursor.send(:with_limits, @resolver, recursion_limits) do
-        if no_validation
-          query_internal(name, type, klass, no_validation)
+        run = lambda do
+          if no_validation
+            query_internal(name, type, klass, no_validation, path)
+          else
+            transmissions = SelectThread::TransmissionBudget.current
+            budget = transmissions.context(:validation) { ValidationBudget.current || ValidationBudget.new }
+            ValidationBudget.with(budget) { query_internal(name, type, klass, no_validation, path) }
+          end
+        end
+        if path
+          Recursor.send(:with_resolution_path, path) do
+            result = run.call
+            path.finish(:complete) unless path.incomplete?
+            block_given? ? yield(result, path) : result
+          end
         else
-          transmissions = SelectThread::TransmissionBudget.current
-          budget = transmissions.context(:validation) { ValidationBudget.current || ValidationBudget.new }
-          ValidationBudget.with(budget) { query_internal(name, type, klass, no_validation) }
+          run.call
         end
       end
     end
 
-    def query_internal(name, type, klass, no_validation)
+    def query_internal(name, type, klass, no_validation, path = Recursor.current_path)
       previous_generation = Thread.current[:dnsruby_recursor_generation]
       QueryControl.current&.check!
       unless SelectThread::TransmissionBudget.current
         return SelectThread::TransmissionBudget.with(SelectThread::TransmissionBudget.new) do
-          query_internal(name, type, klass, no_validation)
+          query_internal(name, type, klass, no_validation, path)
         end
       end
       #  @TODO@ PROVIDE AN ASYNCHRONOUS SEND WHICH RETURNS MESSAGE WITH ERROR!!!
@@ -651,6 +847,7 @@ module Dnsruby
       if scope && (cached = @response_cache.find(query_message, scope))
         response, error = cached
         error.response = response if error.is_a?(ResolvError)
+        error.resolution_path = path if error.is_a?(ResolvError) && path
         raise error if error
         return response
       end
@@ -672,7 +869,7 @@ module Dnsruby
       #  Seed name servers with the closest known authority
       #       ret =  _dorecursion( name, type, klass, ".", @hints, 0)
       begin
-        ret = follow_aliases(name, type, klass, known_zone, known_authorities, 0, no_validation)
+        ret = follow_aliases(name, type, klass, known_zone, known_authorities, 0, no_validation, path)
         Dnssec.validate(ret) if ret && !no_validation
         if scope && scope == recursion_cache_scope(no_validation)
           @response_cache.add(query_message, scope, ret, nil,
@@ -680,6 +877,11 @@ module Dnsruby
         end
         ret
       rescue StandardError => error
+        if path && !path.incomplete?
+          path.add_failure(name, type, klass)
+          path.finish(:failure, error)
+        end
+        error.resolution_path = path if error.is_a?(ResolvError) && path
         if scope && scope == recursion_cache_scope(no_validation)
           failed_response = ret || (error.response if error.is_a?(ResolvError))
           @response_cache.add(query_message, scope, failed_response, error, control: QueryControl.current)
@@ -694,8 +896,10 @@ module Dnsruby
 
     # An authoritative server may finish its answer at an alias whose target
     # belongs to another zone. Continue within this lookup's budgets, retaining
-    # the caller's question and every answer in the alias chain.
-    def follow_aliases(name, type, klass, known_zone, authorities, depth, no_validation)
+    # the caller's question and every answer in the alias chain. When a path is
+    # supplied, every confirmed hop is recorded; loops and the hop limit finish
+    # it as incomplete instead of only raising a terminal failure.
+    def follow_aliases(name, type, klass, known_zone, authorities, depth, no_validation, path = nil)
       original_name = Name.create(name)
       original_name.absolute = true
       qtype, qclass = Types.new(type), Classes.new(klass)
@@ -705,22 +909,51 @@ module Dnsruby
       loop do
         QueryControl.current&.check!
         begin
-          packet = _dorecursion(current_name.to_s(true), type, klass, known_zone, authorities, depth, no_validation)
+          packet = if path
+            _dorecursion(current_name.to_s(true), type, klass, known_zone, authorities,
+              depth, no_validation, path: path)
+          else
+            _dorecursion(current_name.to_s(true), type, klass, known_zone, authorities,
+              depth, no_validation)
+          end
         rescue ResolvError => error
           if error.response && !responses.empty?
-            error.response = combine_alias_responses(responses + [error.response], original_name, qtype, qclass)
+            combined = combine_alias_responses(responses + [error.response], original_name, qtype, qclass)
+            mark_incomplete(combined, path) if path
+            error.response = combined
           end
+          if path && !path.incomplete?
+            path.add_failure(current_name, type, klass)
+            path.finish(:failure, error)
+          end
+          error.resolution_path = path if path
           raise
         end
-        return nil unless packet
+        if packet.nil?
+          path&.finish(:incomplete)
+          return nil
+        end
         responses << packet
         # Explicit alias queries and ANY request the records themselves.
         if [Types::CNAME, Types::DNAME, Types::ANY].include?(qtype) ||
             packet.rcode != RCode::NOERROR || Cache.negative_soa(packet)
-          return combine_alias_responses(responses, original_name, qtype, qclass)
+          result = combine_alias_responses(responses, original_name, qtype, qclass)
+          path&.add_answer(current_name, type, klass)
+          return result
         end
-        target, complete = alias_target(packet, current_name, qtype, qclass, seen)
+        target, complete, loop_state = alias_target(packet, current_name, qtype, qclass, seen, path)
+        if loop_state
+          result = combine_alias_responses(responses, original_name, qtype, qclass)
+          mark_incomplete(result, path)
+          error = RecursionLimitError.new(loop_state == :hop_limit ?
+            'Recursive alias chain is too long' : 'Recursive alias loop')
+          error.response = result
+          path.finish(loop_state, error)
+          error.resolution_path = path
+          raise error
+        end
         if complete || target == current_name
+          path&.add_answer(current_name, type, klass)
           return combine_alias_responses(responses, original_name, qtype, qclass)
         end
         current_name = target
@@ -731,18 +964,24 @@ module Dnsruby
     end
     private :follow_aliases
 
-    def alias_target(packet, name, type, klass, seen)
+    def mark_incomplete(message, path)
+      message.incomplete = true
+      path
+    end
+    private :mark_incomplete
+
+    def alias_target(packet, name, type, klass, seen, path = nil)
       loop do
         QueryControl.current&.check!
         records = packet.answer.select { |rr| rr.klass == klass && rr.name == name }
-        return [name, true] if records.any? { |rr| rr.type == type }
+        return [name, true, nil] if records.any? { |rr| rr.type == type }
         aliases = records.select { |rr| rr.type == Types::CNAME }
         if aliases.empty?
           dnames = packet.answer.select do |rr|
             rr.type == Types::DNAME && rr.klass == klass && name.subdomain_of?(rr.name)
           end
           dname = dnames.max_by { |rr| rr.name.labels.length }
-          return [name, false] unless dname
+          return [name, false, nil] unless dname
           if dnames.any? { |rr| rr.name == dname.name && rr.domainname != dname.domainname }
             raise ResolvError, 'Conflicting DNAME targets in recursive answer'
           end
@@ -760,9 +999,16 @@ module Dnsruby
           target = targets.first
         end
         Recursor.send(:current_budget)&.step!
-        raise RecursionLimitError, 'Recursive alias chain is too long' if seen.length >= 255
-        raise RecursionLimitError, 'Recursive alias loop' if seen[name.canonical]
-        seen[name.canonical] = true
+        if path
+          state = path.record_alias(name, type, klass, target)
+          return [target, false, state] unless state == :ok
+        else
+          # Untraced lookups retain the original name-keyed guard. Referrals
+          # never reach here, so this only observes alias edges.
+          raise RecursionLimitError, 'Recursive alias chain is too long' if seen.length >= MAX_ALIAS_HOPS
+          raise RecursionLimitError, 'Recursive alias loop' if seen[name.canonical]
+          seen[name.canonical] = true
+        end
         name = target
       end
     end
@@ -882,7 +1128,19 @@ module Dnsruby
       return known_zone, known_authorities # @TODO@ Need to synchronize access to these!
     end
 
-    def _dorecursion(name, type, klass, known_zone, known_authorities, depth, no_validation) # :nodoc:
+    # Internal calls only forward the tracing keyword when a path exists, so
+    # test doubles and subclasses overriding _dorecursion keep the original
+    # seven-argument contract for untraced lookups.
+    def recurse_with_path(name, type, klass, zone, authorities, depth, no_validation, path)
+      if path
+        _dorecursion(name, type, klass, zone, authorities, depth, no_validation, path: path)
+      else
+        _dorecursion(name, type, klass, zone, authorities, depth, no_validation)
+      end
+    end
+    private :recurse_with_path
+
+    def _dorecursion(name, type, klass, known_zone, known_authorities, depth, no_validation, path: nil) # :nodoc:
       QueryControl.current&.check!
       Recursor.send(:current_budget)&.step!
 
@@ -1070,7 +1328,8 @@ module Dnsruby
         end
         if (found_auth > 0)
           TheLog.debug(";; _dorecursion() Found #{found_auth} new NS authorities...")
-          return _dorecursion(name, type, klass, known_zone, known_authorities, depth + 1, no_validation)
+          return recurse_with_path(name, type, klass, known_zone, known_authorities,
+            depth + 1, no_validation, path)
         end
         TheLog.debug(";; _dorecursion() No authority information could be obtained.")
         return nil
@@ -1127,7 +1386,8 @@ module Dnsruby
         # discovery. Try the latter if all immediately usable servers fail.
         unresolved = known_authorities.select { |server, _| missing_authorities.include?(server) }
         begin
-          alternative = _dorecursion(name, type, klass, known_zone, unresolved, depth + 1, no_validation)
+          alternative = recurse_with_path(name, type, klass, known_zone, unresolved,
+            depth + 1, no_validation, path)
           return alternative if alternative
         rescue ResolvTimeout, IOError, ServFail, Refused, NotImp, FormErr, SocketEofResolvError => error
           QueryControl.current&.check!
@@ -1160,8 +1420,11 @@ module Dnsruby
             referral = referral_authorities(packet, known_zone, name, klass)
             return nil unless referral
             of, auth, delegation_ttl = referral
+            # A referral is an authoritative delegation edge, not an alias. It
+            # is recorded separately so it can never count towards an alias loop.
+            path&.add_referral(name, type, klass, of, known_zone)
             @@mutex.synchronize { Recursor.cache_zone(of, auth.dup, delegation_ttl, parent: known_zone) }
-            return _dorecursion(name, type, klass, of, auth, depth + 1, no_validation)
+            return recurse_with_path(name, type, klass, of, auth, depth + 1, no_validation, path)
           end
         end
       end

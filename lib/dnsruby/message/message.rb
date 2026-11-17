@@ -91,6 +91,16 @@ module Dnsruby
     #  true. It will be false otherwise.
     attr_accessor :cached
 
+    # True when a recursive lookup assembled this answer from a confirmed
+    # prefix of an alias chain but could not complete the remaining hops
+    # (a failure, a loop or the hop limit). Such a partial result must never
+    # be stored in the resolution cache.
+    attr_accessor :incomplete
+
+    def incomplete?
+      @incomplete == true
+    end
+
 
 
     #  Create a new Message. Takes optional name, type and class
@@ -135,6 +145,7 @@ module Dnsruby
       @security_level = SecurityLevel.UNCHECKED
       @security_error = nil
       @cached = false
+      @incomplete = false
     end
 
     # The question section, an array of Dnsruby::Question objects.

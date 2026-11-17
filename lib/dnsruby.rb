@@ -156,6 +156,10 @@ module Dnsruby
   # An error raised while querying for a resource
   class ResolvError < StandardError
     attr_accessor :response
+    # Set by the Recursor when a traced lookup ends here. Carries the
+    # confirmed alias path, including self loops, indirect loops and the
+    # hops reached before a failure made the resolution incomplete.
+    attr_accessor :resolution_path
   end
 
   # A recursive lookup exceeded its aggregate work or query limit.

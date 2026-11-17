@@ -248,6 +248,10 @@ module Dnsruby
           return
         end
         return if response && (response.tsig || response.signed? || response.header.tc)
+        # A confirmed prefix of an alias chain is not a usable resolution:
+        # neither the negative cache nor the short-lived failure cache may
+        # hand back half of a successful chain to a later lookup.
+        return if response && response.incomplete?
         @mutex.synchronize do
           question = query.question.first
           key = [scope, CacheKey.new(question.qname, question.qtype, question.qclass).to_s]

@@ -53,6 +53,7 @@ TESTS = %w(
     release_auxiliary_fixes
     recursor_address_fallback
     recursor_limits
+    recursor_resolution_path
     resolver_configuration_contracts
     release_review_transport
     release_review_transport_native
