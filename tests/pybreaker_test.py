@@ -1315,6 +1315,573 @@ class CircuitBreakerRedisConcurrencyTestCase(unittest.TestCase):
         assert self.breaker.fail_counter < self.breaker.fail_max + num_threads
 
 
+class CircuitBreakerListenerFailureTestCase(unittest.TestCase):
+    """Tests for listener error isolation and the listener error policy."""
+
+    def test_listener_failure_on_success_does_not_mark_call_as_failed(self):
+        """Listeners: a broken success listener must not turn a successful
+        dependency call into a failure or a trip.
+        """
+
+        class BrokenListener(CircuitBreakerListener):
+            def success(self, cb):
+                raise RuntimeError("audit unavailable")
+
+        func = mock.MagicMock(return_value="payload")
+        breaker = CircuitBreaker(fail_max=1, listeners=[BrokenListener()])
+
+        assert breaker.call(func) == "payload"
+        func.assert_called_once_with()
+        assert breaker.fail_counter == 0
+        assert breaker.current_state == "closed"
+        assert breaker.listener_error_policy is ListenerErrorPolicy.IGNORE
+
+        failures = breaker.listener_failures
+        assert len(failures) == 1
+        assert failures[0].event == "success"
+        assert isinstance(failures[0].exception, RuntimeError)
+
+    def test_listener_failure_details_are_kept_even_when_ignored(self):
+        """Listeners: failure details are retained for auditing under the
+        default policy, including listener identity and the original exception.
+        """
+
+        class AuditListener(CircuitBreakerListener):
+            def failure(self, cb, exc):
+                raise ValueError("audit boom")
+
+        dep_error = NotImplementedError("dependency down")
+
+        def func():
+            raise dep_error
+
+        breaker = CircuitBreaker(listeners=[AuditListener()])
+        with pytest.raises(NotImplementedError) as excinfo:
+            breaker.call(func)
+
+        # The dependency error always wins over the listener error.
+        assert excinfo.value is dep_error
+        assert breaker.fail_counter == 1
+
+        (failure,) = breaker.listener_failures
+        assert failure.listener_name.endswith("AuditListener")
+        assert failure.event == "failure"
+        assert isinstance(failure.exception, ValueError)
+        assert breaker.last_listener_report is not None
+        assert not breaker.last_listener_report.ok
+
+    def test_listeners_run_in_registration_order_and_all_are_invoked(self):
+        """Listeners: registration order is preserved and one broken listener
+        does not prevent the remaining listeners from being notified.
+        """
+        calls = []
+
+        class RecordingListener(CircuitBreakerListener):
+            def __init__(self, name, fail=False):
+                self.name = name
+                self.fail = fail
+
+            def before_call(self, cb, func, *args, **kwargs):
+                calls.append(("before", self.name))
+
+            def success(self, cb):
+                calls.append(("success", self.name))
+                if self.fail:
+                    raise RuntimeError(self.name)
+
+        breaker = CircuitBreaker(
+            listeners=[RecordingListener("first"), RecordingListener("second", fail=True), RecordingListener("third")]
+        )
+        func = mock.MagicMock(return_value=1)
+
+        assert breaker.call(func) == 1
+
+        # Business function ran exactly once even though a listener failed.
+        func.assert_called_once_with()
+        assert calls == [
+            ("before", "first"),
+            ("before", "second"),
+            ("before", "third"),
+            ("success", "first"),
+            ("success", "second"),
+            ("success", "third"),
+        ]
+        assert [failure.listener_name.rsplit(".", 1)[-1] for failure in breaker.listener_failures] == [
+            "RecordingListener"
+        ]
+
+    def test_strict_policy_raises_notification_error_after_settling(self):
+        """Listeners: strict mode reports listener failures, but only after the
+        successful call has been fully settled and counted.
+        """
+        invocations = []
+
+        class BrokenListener(CircuitBreakerListener):
+            def success(self, cb):
+                raise RuntimeError("boom")
+
+        breaker = CircuitBreaker(listeners=[BrokenListener()], listener_error_policy=ListenerErrorPolicy.STRICT)
+
+        with pytest.raises(ListenerNotificationError) as excinfo:
+            breaker.call(lambda: invocations.append("called"))
+
+        assert invocations == ["called"]
+        assert breaker.fail_counter == 0
+        assert breaker.current_state == "closed"
+        assert not isinstance(excinfo.value, CircuitBreakerError)
+
+        assert len(excinfo.value.failures) == 1
+        assert excinfo.value.failures[0].event == "success"
+
+    def test_strict_policy_collects_every_listener_failure(self):
+        """Listeners: strict mode reports all listener failures, not just the
+        first one, once the notification round has finished.
+        """
+
+        class BrokenListener(CircuitBreakerListener):
+            def __init__(self, name):
+                self.name = name
+
+            def success(self, cb):
+                raise RuntimeError(self.name)
+
+        breaker = CircuitBreaker(
+            listeners=[BrokenListener("a"), BrokenListener("b"), BrokenListener("c")],
+            listener_error_policy="strict",
+        )
+
+        with pytest.raises(ListenerNotificationError) as excinfo:
+            breaker.call(lambda: "ok")
+
+        assert [failure.exception.args[0] for failure in excinfo.value.failures] == ["a", "b", "c"]
+
+    def test_strict_policy_does_not_hide_the_dependency_error(self):
+        """Listeners: strict mode must not replace the original dependency
+        error, and must not trip on a listener problem alone.
+        """
+
+        class BrokenListener(CircuitBreakerListener):
+            def failure(self, cb, exc):
+                raise RuntimeError("audit boom")
+
+        dep_error = NotImplementedError("dependency down")
+
+        def func():
+            raise dep_error
+
+        breaker = CircuitBreaker(listeners=[BrokenListener()], listener_error_policy="strict")
+
+        with pytest.raises(NotImplementedError) as excinfo:
+            breaker.call(func)
+
+        assert excinfo.value is dep_error
+        assert breaker.fail_counter == 1
+        assert breaker.current_state == "closed"
+
+    def test_strict_state_change_failure_keeps_new_state(self):
+        """Listeners: a state_change listener failure cannot roll back the state
+        transition that has already happened.
+        """
+
+        class BrokenListener(CircuitBreakerListener):
+            def state_change(self, cb, old_state, new_state):
+                raise RuntimeError("observer down")
+
+        breaker = CircuitBreaker(listeners=[BrokenListener()], listener_error_policy="strict")
+
+        with pytest.raises(ListenerNotificationError):
+            breaker.open()
+
+        assert breaker.current_state == "open"
+        assert breaker._state_storage.opened_at is not None
+        assert breaker.state.name == "open"
+
+    def test_strict_trip_notification_does_not_retry_guarded_call(self):
+        """Listeners: a strict listener failure while the circuit trips must not
+        cause the guarded dependency call to run a second time.
+        """
+
+        class BrokenListener(CircuitBreakerListener):
+            def state_change(self, cb, old_state, new_state):
+                raise RuntimeError("observer down")
+
+        invocations = []
+
+        def func():
+            invocations.append("called")
+            raise NotImplementedError
+
+        breaker = CircuitBreaker(fail_max=1, listeners=[BrokenListener()], listener_error_policy="strict")
+
+        with pytest.raises((NotImplementedError, CircuitBreakerError)):
+            breaker.call(func)
+
+        assert invocations == ["called"]
+        assert breaker.fail_counter == 1
+        assert breaker.current_state == "open"
+
+    def test_log_policy_keeps_outcome_and_logs(self):
+        """Listeners: the log policy records and logs the failure but keeps the
+        original outcome.
+        """
+
+        class BrokenListener(CircuitBreakerListener):
+            def success(self, cb):
+                raise RuntimeError("boom")
+
+        breaker = CircuitBreaker(listeners=[BrokenListener()], listener_error_policy="log")
+
+        with mock.patch("pybreaker.logger") as mocked_logger:
+            assert breaker.call(lambda: "ok") == "ok"
+
+        assert breaker.fail_counter == 0
+        mocked_logger.error.assert_called_once()
+        assert len(breaker.listener_failures) == 1
+
+    def test_propagate_policy_reraises_after_all_listeners_run(self):
+        """Listeners: the propagate policy surfaces the first listener error
+        only after every listener was invoked and the outcome was settled.
+        """
+        seen = []
+
+        class BrokenListener(CircuitBreakerListener):
+            def __init__(self, name, fail=False):
+                self.name = name
+                self.fail = fail
+
+            def success(self, cb):
+                seen.append(self.name)
+                if self.fail:
+                    raise RuntimeError(self.name)
+
+        breaker = CircuitBreaker(
+            listeners=[BrokenListener("a", fail=True), BrokenListener("b")],
+            listener_error_policy="propagate",
+        )
+
+        with pytest.raises(RuntimeError, match="a"):
+            breaker.call(lambda: "ok")
+
+        assert seen == ["a", "b"]
+        assert breaker.fail_counter == 0
+        assert breaker.current_state == "closed"
+
+    def test_unknown_policy_is_rejected(self):
+        """Listeners: an unknown policy raises a clear ValueError."""
+        with pytest.raises(ValueError):
+            CircuitBreaker(listener_error_policy="bogus")
+
+        breaker = CircuitBreaker()
+        with pytest.raises(ValueError):
+            breaker.listener_error_policy = "bogus"
+
+    def test_policy_can_be_changed_at_runtime(self):
+        """Listeners: the policy may be switched after construction."""
+        breaker = CircuitBreaker()
+        assert breaker.listener_error_policy is ListenerErrorPolicy.IGNORE
+
+        breaker.listener_error_policy = "strict"
+        assert breaker.listener_error_policy is ListenerErrorPolicy.STRICT
+
+        breaker.listener_error_policy = ListenerErrorPolicy.LOG
+        assert breaker.listener_error_policy is ListenerErrorPolicy.LOG
+
+        breaker.listener_error_policy = None
+        assert breaker.listener_error_policy is ListenerErrorPolicy.IGNORE
+
+    def test_clear_listener_failures(self):
+        """Listeners: recorded failures can be cleared for auditing purposes."""
+
+        class BrokenListener(CircuitBreakerListener):
+            def success(self, cb):
+                raise RuntimeError("boom")
+
+        breaker = CircuitBreaker(listeners=[BrokenListener()])
+        breaker.call(lambda: "ok")
+        assert len(breaker.listener_failures) == 1
+
+        breaker.clear_listener_failures()
+        assert breaker.listener_failures == ()
+        assert breaker.last_listener_report is None
+
+    def test_listener_failure_history_is_bounded(self):
+        """Listeners: the notification failure log is bounded so a permanently
+        broken listener cannot grow memory without limit.
+        """
+
+        class BrokenListener(CircuitBreakerListener):
+            def success(self, cb):
+                raise RuntimeError("boom")
+
+        breaker = CircuitBreaker(listeners=[BrokenListener()], listener_failure_history=3)
+        for _ in range(10):
+            assert breaker.call(lambda: "ok") == "ok"
+
+        assert len(breaker.listener_failures) == 3
+
+    def test_listener_failure_history_can_be_disabled_or_unbounded(self):
+        """Listeners: a zero history keeps nothing, ``None`` keeps everything."""
+
+        class BrokenListener(CircuitBreakerListener):
+            def success(self, cb):
+                raise RuntimeError("boom")
+
+        disabled = CircuitBreaker(listeners=[BrokenListener()], listener_failure_history=0)
+        for _ in range(3):
+            disabled.call(lambda: "ok")
+        assert disabled.listener_failures == ()
+        # The last report is still available even when history is disabled.
+        assert disabled.last_listener_report is not None
+        assert not disabled.last_listener_report.ok
+
+        unbounded = CircuitBreaker(listeners=[BrokenListener()], listener_failure_history=None)
+        for _ in range(20):
+            unbounded.call(lambda: "ok")
+        assert len(unbounded.listener_failures) == 20
+
+    def test_negative_listener_failure_history_is_rejected(self):
+        """Listeners: a negative history size is a configuration error."""
+        with pytest.raises(ValueError):
+            CircuitBreaker(listener_failure_history=-1)
+
+    def test_listener_failure_on_excluded_exception_is_isolated(self):
+        """Listeners: an excluded exception is still treated as a success, and a
+        broken listener cannot change that either.
+        """
+
+        class BrokenListener(CircuitBreakerListener):
+            def success(self, cb):
+                raise RuntimeError("boom")
+
+        class BusinessError(Exception):
+            pass
+
+        def func():
+            raise BusinessError
+
+        breaker = CircuitBreaker(listeners=[BrokenListener()], exclude=[BusinessError], fail_max=1)
+
+        with pytest.raises(BusinessError):
+            breaker.call(func)
+
+        assert breaker.fail_counter == 0
+        assert breaker.current_state == "closed"
+        assert [failure.event for failure in breaker.listener_failures] == ["success"]
+
+    def test_reentrant_listener_does_not_deadlock(self):
+        """Listeners: a listener that reads or calls the same breaker while it is
+        being notified must not deadlock.
+        """
+        observed = []
+
+        class ReentrantListener(CircuitBreakerListener):
+            def success(self, cb):
+                observed.append((cb.current_state, cb.fail_counter, cb.success_counter))
+
+        breaker = CircuitBreaker(listeners=[ReentrantListener()])
+
+        def run():
+            assert breaker.call(lambda: "ok") == "ok"
+
+        thread = threading.Thread(target=run, daemon=True)
+        thread.start()
+        thread.join(5)
+
+        assert not thread.is_alive(), "listener notification deadlocked"
+        assert observed == [("closed", 0, 0)]
+
+    def test_reentrant_listener_can_call_the_same_breaker(self):
+        """Listeners: a listener may issue a nested guarded call; the outer call
+        still settles exactly once.
+        """
+        nested_results = []
+
+        class NestedListener(CircuitBreakerListener):
+            def __init__(self):
+                self.in_nested_call = False
+
+            def success(self, cb):
+                if self.in_nested_call:
+                    return
+                self.in_nested_call = True
+                try:
+                    nested_results.append(cb.call(lambda: "nested"))
+                finally:
+                    self.in_nested_call = False
+
+        listener = NestedListener()
+        breaker = CircuitBreaker(listeners=[listener])
+
+        assert breaker.call(lambda: "outer") == "outer"
+        assert nested_results == ["nested"]
+        assert breaker.fail_counter == 0
+        assert breaker.current_state == "closed"
+
+    def test_reentrant_strict_listener_raises_only_once_at_outer_level(self):
+        """Listeners: with the strict policy, a nested breaker call does not
+        raise in the middle of the outer operation; the error surfaces once.
+        """
+        raised = []
+
+        class ReentrantBrokenListener(CircuitBreakerListener):
+            def success(self, cb):
+                raise RuntimeError("boom")
+
+        breaker = CircuitBreaker(listeners=[ReentrantBrokenListener()], listener_error_policy="strict")
+
+        with pytest.raises(ListenerNotificationError) as excinfo:
+            breaker.call(lambda: "ok")
+
+        assert len(excinfo.value.failures) >= 1
+        raised.append(excinfo.value)
+        assert breaker.current_state == "closed"
+
+    def test_generator_listener_failure_does_not_mark_success_as_failure(self):
+        """Listeners: when a guarded generator finishes successfully, a broken
+        success listener must not record the iteration as a failure.
+        """
+
+        class BrokenListener(CircuitBreakerListener):
+            def success(self, cb):
+                raise RuntimeError("boom")
+
+        breaker = CircuitBreaker(fail_max=1, listeners=[BrokenListener()])
+
+        @breaker
+        def gen():
+            yield 1
+
+        iterator = gen()
+        assert next(iterator) == 1
+        with pytest.raises(StopIteration):
+            next(iterator)
+
+        assert breaker.fail_counter == 0
+        assert breaker.current_state == "closed"
+
+    def test_generator_listener_failure_does_not_mask_dependency_error(self):
+        """Listeners: when a guarded generator raises, the dependency error must
+        win over a listener error raised while reporting the failure.
+        """
+
+        class BrokenListener(CircuitBreakerListener):
+            def failure(self, cb, exc):
+                raise RuntimeError("boom")
+
+        dep_error = NotImplementedError("dep")
+
+        breaker = CircuitBreaker(fail_max=5, listeners=[BrokenListener()], listener_error_policy="strict")
+
+        @breaker
+        def gen():
+            yield 1
+            raise dep_error
+
+        iterator = gen()
+        assert next(iterator) == 1
+
+        with pytest.raises(NotImplementedError) as excinfo:
+            next(iterator)
+
+        assert excinfo.value is dep_error
+        assert breaker.fail_counter == 1
+        assert [failure.event for failure in breaker.listener_failures] == ["failure"]
+
+    def test_calling_context_manager_with_broken_listener(self):
+        """Listeners: the context manager form also isolates listener failures."""
+
+        class BrokenListener(CircuitBreakerListener):
+            def success(self, cb):
+                raise RuntimeError("boom")
+
+        breaker = CircuitBreaker(fail_max=1, listeners=[BrokenListener()])
+
+        with breaker.calling():
+            pass
+
+        assert breaker.fail_counter == 0
+        assert breaker.current_state == "closed"
+
+
+class CircuitBreakerAsyncListenerFailureTestCase(testing.AsyncTestCase):
+    """Tests for listener error isolation on Tornado async guarded calls."""
+
+    @testing.gen_test
+    def test_async_listener_failure_is_isolated(self):
+        """Listeners: async guarded calls keep their successful outcome when a
+        listener fails.
+        """
+
+        class BrokenListener(CircuitBreakerListener):
+            def success(self, cb):
+                raise RuntimeError("boom")
+
+        breaker = CircuitBreaker(fail_max=1, listeners=[BrokenListener()])
+
+        @gen.coroutine
+        def func():
+            raise gen.Return("payload")
+
+        assert (yield breaker.call_async(func)) == "payload"
+        assert breaker.fail_counter == 0
+        assert breaker.current_state == "closed"
+        assert [failure.event for failure in breaker.listener_failures] == ["success"]
+
+    @testing.gen_test
+    def test_async_strict_policy_raises_after_settling(self):
+        """Listeners: strict mode also applies to async guarded calls."""
+
+        class BrokenListener(CircuitBreakerListener):
+            def success(self, cb):
+                raise RuntimeError("boom")
+
+        breaker = CircuitBreaker(listeners=[BrokenListener()], listener_error_policy="strict")
+
+        @gen.coroutine
+        def func():
+            raise gen.Return("payload")
+
+        try:
+            yield breaker.call_async(func)
+        except ListenerNotificationError as error:
+            assert [failure.event for failure in error.failures] == ["success"]
+        else:  # pragma: no cover - defensive
+            pytest.fail("ListenerNotificationError should have been raised")
+
+        assert breaker.fail_counter == 0
+        assert breaker.current_state == "closed"
+
+    @testing.gen_test
+    def test_async_excluded_exception_with_broken_listener(self):
+        """Listeners: an async excluded exception is still a success for the
+        breaker even when a listener fails.
+        """
+
+        class BrokenListener(CircuitBreakerListener):
+            def success(self, cb):
+                raise RuntimeError("boom")
+
+        class BusinessError(Exception):
+            pass
+
+        breaker = CircuitBreaker(fail_max=1, listeners=[BrokenListener()], exclude=[BusinessError])
+
+        @gen.coroutine
+        def func():
+            raise BusinessError
+
+        try:
+            yield breaker.call_async(func)
+        except BusinessError:
+            pass
+        else:  # pragma: no cover - defensive
+            pytest.fail("BusinessError should have propagated")
+
+        assert breaker.fail_counter == 0
+        assert breaker.current_state == "closed"
+        assert [failure.event for failure in breaker.listener_failures] == ["success"]
+
+
 class CircuitBreakerContextManagerTestCase(unittest.TestCase):
     """Tests for the CircuitBreaker class, when used as a context manager."""
 

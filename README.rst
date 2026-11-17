@@ -17,6 +17,7 @@ Features
 * Configurable list of excluded exceptions (e.g. business exceptions)
 * Configurable failure threshold and reset timeout
 * Support for several event listeners per circuit breaker
+* Configurable listener error policy with isolated, auditable notifications
 * Can guard generator functions
 * Functions and properties for easy monitoring and management
 * Thread-safe
@@ -175,6 +176,70 @@ To add listeners to a circuit breaker:
 
     # ...or later
     db_breaker.add_listeners(OneListener(), AnotherListener())
+
+
+Listener Failure Policy
+```````````````````````
+
+Listeners are observers: they are notified only *after* the guarded operation
+and the circuit breaker state have been settled. A listener that raises can
+therefore never turn an already successful dependency call into a failure, trip
+the circuit, or cause the guarded function to be invoked again.
+
+Every listener is invoked exactly once, in registration order, even when an
+earlier listener failed. The original outcome of the guarded call always wins
+over a listener error.
+
+By default listener errors are swallowed, which preserves the historical
+behaviour. That behaviour, and the ways to make listener errors visible, are
+selected with ``listener_error_policy``:
+
+.. code:: python
+
+    import pybreaker
+
+    # Default: ignore listener errors, keep the original outcome
+    db_breaker = pybreaker.CircuitBreaker(listeners=[DBListener()])
+
+    # Log listener errors (with traceback) and keep the original outcome
+    db_breaker = pybreaker.CircuitBreaker(
+        listeners=[DBListener()], listener_error_policy="log")
+
+    # Collect every listener error and raise a ListenerNotificationError once
+    # the whole operation has settled. The guarded function is not retried and
+    # the breaker state is not rolled back.
+    db_breaker = pybreaker.CircuitBreaker(
+        listeners=[DBListener()], listener_error_policy="strict")
+
+    # Run every listener, then re-raise the first listener error (the legacy
+    # "listener error reaches the caller" behaviour, but without retrying the
+    # guarded call).
+    db_breaker = pybreaker.CircuitBreaker(
+        listeners=[DBListener()], listener_error_policy="propagate")
+
+The policy can also be changed at runtime through
+``db_breaker.listener_error_policy``.
+
+Regardless of the policy, the details of the most recent listener failures are
+kept for auditing, so an operator can tell an observability problem apart from
+a dependency failure:
+
+.. code:: python
+
+    for failure in db_breaker.listener_failures:
+        print(failure.listener_name, failure.event, repr(failure.exception))
+
+    # Outcome of the last notification round (delivered count + failures)
+    report = db_breaker.last_listener_report
+    if report is not None and not report.ok:
+        print("audit notification failed:", report.failures)
+
+    # Forget the recorded failures
+    db_breaker.clear_listener_failures()
+
+The history is bounded by ``listener_failure_history`` (default ``100``).
+Listeners are also free to re-enter the breaker (read its properties, or issue
+another guarded call) while they are being notified, without deadlocking.
 
 
 What Does a Circuit Breaker Do?

@@ -8,7 +8,9 @@ book at https://pragprog.com/titles/mnee2/release-it-second-edition/
 from __future__ import annotations
 
 import calendar
+import collections
 import contextlib
+import dataclasses
 import logging
 import sys
 import threading
@@ -16,6 +18,7 @@ import time
 import types
 from abc import abstractmethod
 from datetime import datetime, timedelta
+from enum import Enum
 from functools import wraps
 from typing import (
     TYPE_CHECKING,
@@ -63,6 +66,10 @@ __all__ = (
     "CircuitBreakerError",
     "CircuitMemoryStorage",
     "CircuitRedisStorage",
+    "ListenerErrorPolicy",
+    "ListenerNotificationError",
+    "ListenerNotificationFailure",
+    "ListenerNotificationReport",
     "STATE_OPEN",
     "STATE_CLOSED",
     "STATE_HALF_OPEN",
@@ -71,6 +78,158 @@ __all__ = (
 STATE_OPEN = "open"
 STATE_CLOSED = "closed"
 STATE_HALF_OPEN = "half-open"
+
+logger = logging.getLogger(__name__)
+
+
+class ListenerErrorPolicy(str, Enum):
+    """Policy applied when a listener callback raises an exception.
+
+    Listeners are observers: they never participate in the bookkeeping of the
+    guarded operation. This policy only decides whether a listener failure is
+    reported back to the caller, never whether the guarded function is retried
+    or its already-settled outcome is rewritten.
+
+    In every mode the guarded operation has already been settled by the time a
+    listener runs, so a listener error can never cause the guarded function to
+    be invoked again. If the guarded operation itself failed, that error is
+    always the one propagated to the caller; the listener failures are still
+    recorded in :attr:`CircuitBreaker.listener_failures`.
+    """
+
+    IGNORE = "ignore"
+    """Swallow the error and keep the original outcome. This is the default and
+    preserves the historical (pre-policy) behaviour of the library."""
+
+    LOG = "log"
+    """Log the error (with traceback) and keep the original outcome."""
+
+    STRICT = "strict"
+    """Collect every listener failure and, once all listeners have run, raise a
+    :class:`ListenerNotificationError` if the guarded operation succeeded. The
+    guarded function is *not* called again and the circuit breaker state is
+    *not* rolled back."""
+
+    PROPAGATE = "propagate"
+    """Run every listener, then re-raise the first listener exception to the
+    caller once a successful operation has settled. The guarded function is
+    *not* invoked a second time."""
+
+    @classmethod
+    def parse(cls, value: ListenerErrorPolicy | str | None) -> ListenerErrorPolicy:
+        """Coerce a user supplied value into a :class:`ListenerErrorPolicy`."""
+        if value is None:
+            return cls.IGNORE
+        if isinstance(value, cls):
+            return value
+        try:
+            return cls(str(value).lower())
+        except ValueError as e:
+            valid = ", ".join(policy.value for policy in cls)
+            msg = f"Unknown listener error policy {value!r}, valid policies: {valid}"
+            raise ValueError(msg) from e
+
+
+@dataclasses.dataclass(frozen=True)
+class ListenerNotificationFailure:
+    """Describe a single listener callback that raised an exception."""
+
+    listener: CircuitBreakerListener
+    event: str
+    exception: BaseException
+
+    @property
+    def listener_name(self) -> str:
+        """Return a stable, human friendly name for the failing listener."""
+        return type(self.listener).__qualname__
+
+
+class ListenerNotificationError(RuntimeError):
+    """Raised in strict mode when one or more listener callbacks failed.
+
+    The exception carries the full list of :class:`ListenerNotificationFailure`
+    entries so audit code can inspect every failure instead of only the first
+    one. It is deliberately *not* a subclass of ``CircuitBreakerError``: a
+    listener problem is an observability issue, not a sign that the guarded
+    dependency failed.
+    """
+
+    def __init__(self, failures: Sequence[ListenerNotificationFailure]) -> None:
+        self.failures: tuple[ListenerNotificationFailure, ...] = tuple(failures)
+        details = ", ".join(f"{failure.listener_name}.{failure.event}" for failure in self.failures)
+        msg = f"{len(self.failures)} listener notification(s) failed: {details}"
+        super().__init__(msg)
+
+
+@dataclasses.dataclass(frozen=True)
+class ListenerNotificationReport:
+    """Outcome of notifying every registered listener for a single event."""
+
+    event: str
+    delivered: int
+    failures: tuple[ListenerNotificationFailure, ...] = ()
+
+    @property
+    def ok(self) -> bool:
+        """Return whether every listener was notified without error."""
+        return not self.failures
+
+
+class _NotificationScope:
+    """Track the logical breaker operation that notifications belong to.
+
+    A single public breaker operation (``call``, ``open``, setting ``state``,
+    ...) may settle several things and fire many notifications, and those
+    operations may re-enter the breaker (a listener calling the same breaker,
+    ``CircuitOpenState`` delegating to ``half_open`` + ``call``, ...). Only the
+    *outermost* operation gets to raise :class:`ListenerNotificationError`, so
+    listener failures collected by nested operations are attributed to the
+    operation the caller actually invoked.
+    """
+
+    def __init__(self) -> None:
+        self._local = threading.local()
+
+    @property
+    def _stack(self) -> list[list[ListenerNotificationFailure]]:
+        stack = getattr(self._local, "stack", None)
+        if stack is None:
+            stack = []
+            self._local.stack = stack
+        return stack  # type: ignore[no-any-return]
+
+    @property
+    def is_active(self) -> bool:
+        """Return whether a breaker operation is currently settling."""
+        return bool(self._stack)
+
+    def enter(self) -> bool:
+        """Start a settling scope and return whether it is the outermost one."""
+        stack = self._stack
+        stack.append([])
+        return len(stack) == 1
+
+    def leave(self) -> list[ListenerNotificationFailure]:
+        """Close the current scope.
+
+        The returned list is non-empty only for the outermost scope; nested
+        scopes contribute their failures to the enclosing one.
+        """
+        stack = self._stack
+        if not stack:
+            return []
+        failures = stack.pop()
+        if stack:
+            stack[-1].extend(failures)
+            return []
+        return failures
+
+    def record(self, failure: ListenerNotificationFailure) -> None:
+        """Add `failure` to the innermost scope, if there is one."""
+        stack = self._stack
+        if stack:
+            stack[-1].append(failure)
+
 
 T = TypeVar("T")
 ExceptionType = TypeVar("ExceptionType", bound=BaseException)
@@ -98,8 +257,18 @@ class CircuitBreaker:
         state_storage: CircuitBreakerStorage | None = None,
         name: str | None = None,
         throw_new_error_on_trip: bool = True,
+        listener_error_policy: ListenerErrorPolicy | str | None = None,
+        listener_failure_history: int | None = 100,
     ) -> None:
-        """Create a new circuit breaker with the given parameters."""
+        """Create a new circuit breaker with the given parameters.
+
+        ``listener_error_policy`` decides what happens when a listener callback
+        raises; see :class:`ListenerErrorPolicy`. The default (``ignore``)
+        preserves the historical behaviour of swallowing listener errors.
+
+        ``listener_failure_history`` bounds how many listener failures are kept
+        for auditing (``0`` disables the history, ``None`` keeps it unbounded).
+        """
         self._lock = threading.RLock()
         self._state_storage = state_storage or CircuitMemoryStorage(STATE_CLOSED)
         self._state = self._create_new_state(self.current_state)
@@ -113,6 +282,17 @@ class CircuitBreaker:
         self._name = name
 
         self._throw_new_error_on_trip = throw_new_error_on_trip
+
+        if listener_failure_history is not None and listener_failure_history < 0:
+            msg = "listener_failure_history must be a non-negative integer or None"
+            raise ValueError(msg)
+
+        self._listener_error_policy = ListenerErrorPolicy.parse(listener_error_policy)
+        self._listener_failures: collections.deque[ListenerNotificationFailure] = collections.deque(
+            maxlen=listener_failure_history
+        )
+        self._last_listener_report: ListenerNotificationReport | None = None
+        self._notification_scope = _NotificationScope()
 
     @property
     def fail_counter(self) -> int:
@@ -190,7 +370,7 @@ class CircuitBreaker:
     @state.setter
     def state(self, state_str: str) -> None:
         """Set cached state and notify listeners of newly cached state."""
-        with self._lock:
+        with self._lock, self._settling():
             self._state = self._create_new_state(state_str, prev_state=self._state, notify=True)
 
     @property
@@ -224,6 +404,114 @@ class CircuitBreaker:
         with self._lock:
             self._excluded_exceptions.remove(exception)
 
+    @property
+    def listener_error_policy(self) -> ListenerErrorPolicy:
+        """Return the policy applied when a listener callback raises."""
+        return self._listener_error_policy
+
+    @listener_error_policy.setter
+    def listener_error_policy(self, policy: ListenerErrorPolicy | str | None) -> None:
+        """Set the policy applied when a listener callback raises."""
+        self._listener_error_policy = ListenerErrorPolicy.parse(policy)
+
+    @property
+    def listener_failures(self) -> tuple[ListenerNotificationFailure, ...]:
+        """Return the most recent listener notification failures.
+
+        The details are kept regardless of the configured policy, so that audit
+        code can inspect failures even when they are only logged or ignored.
+        """
+        with self._lock:
+            return tuple(self._listener_failures)
+
+    @property
+    def last_listener_report(self) -> ListenerNotificationReport | None:
+        """Return the outcome of the most recent listener notification round."""
+        return self._last_listener_report
+
+    def clear_listener_failures(self) -> None:
+        """Forget the recorded listener notification failures."""
+        with self._lock:
+            self._listener_failures.clear()
+            self._last_listener_report = None
+
+    @contextlib.contextmanager
+    def _settling(self, *, raise_errors: bool = True) -> Generator[None, None, None]:
+        """Group the bookkeeping of one public operation.
+
+        Every listener failure raised while the operation settles is collected
+        here instead of escaping from wherever the callback was invoked. Only
+        the outermost operation raises :class:`ListenerNotificationError` (and
+        only in strict mode), so nested or re-entrant breaker usage never turns
+        a notification problem into a dependency failure half way through.
+
+        The error raised by the guarded operation always wins: a listener
+        failure is reported on its own only when the operation `succeeded`
+        from the breaker's point of view. ``raise_errors=False`` records the
+        failures without reporting them, for call sites that are about to
+        propagate a dependency error anyway.
+        """
+        outermost = self._notification_scope.enter()
+        body_failed = False
+        failures: list[ListenerNotificationFailure] = []
+        try:
+            yield
+        except BaseException:
+            body_failed = True
+            raise
+        finally:
+            failures = self._notification_scope.leave()
+
+        if outermost and failures and not body_failed and raise_errors:
+            if self._listener_error_policy is ListenerErrorPolicy.STRICT:
+                raise ListenerNotificationError(failures)
+            if self._listener_error_policy is ListenerErrorPolicy.PROPAGATE:
+                raise failures[0].exception
+
+    def _record_listener_failure(self, failure: ListenerNotificationFailure) -> None:
+        with self._lock:
+            self._listener_failures.append(failure)
+        self._notification_scope.record(failure)
+
+        if self._listener_error_policy in (ListenerErrorPolicy.LOG, ListenerErrorPolicy.STRICT):
+            logger.error(
+                "Listener %s failed while handling %r on circuit breaker %r",
+                failure.listener_name,
+                failure.event,
+                self._name,
+                exc_info=(type(failure.exception), failure.exception, failure.exception.__traceback__),
+            )
+
+    def _notify(self, event: str, *args: Any, **kwargs: Any) -> ListenerNotificationReport:
+        """Notify every listener of `event`, isolating each callback.
+
+        Listeners run in registration order and each one is invoked exactly
+        once. A failing listener never stops the remaining listeners from being
+        notified, never marks the guarded call as failed and never causes the
+        guarded function to be invoked again, so observers cannot rewrite the
+        outcome that has already been settled.
+        """
+        failures: list[ListenerNotificationFailure] = []
+        delivered = 0
+        for listener in self.listeners:
+            try:
+                getattr(listener, event)(self, *args, **kwargs)
+            except Exception as exc:  # noqa: BLE001 - isolating listeners is the point
+                failure = ListenerNotificationFailure(listener=listener, event=event, exception=exc)
+                failures.append(failure)
+                self._record_listener_failure(failure)
+            else:
+                delivered += 1
+
+        report = ListenerNotificationReport(event=event, delivered=delivered, failures=tuple(failures))
+        with self._lock:
+            self._last_listener_report = report
+
+        # Failures are reported by the enclosing `_settling` scope once the whole
+        # operation has finished, so that the caller can never observe a
+        # partially-applied notification round.
+        return report
+
     def _inc_counter(self) -> None:
         """Increment the counter of failed calls."""
         self._state_storage.increment_counter()
@@ -247,7 +535,7 @@ class CircuitBreaker:
         """Call `func` with the given `args` and `kwargs` according to the rules
         implemented by the current state of this circuit breaker.
         """
-        with self._lock:
+        with self._lock, self._settling():
             return self.state.call(func, *args, **kwargs)
 
     @contextlib.contextmanager
@@ -272,15 +560,15 @@ class CircuitBreaker:
 
         @gen.coroutine
         def wrapped():  # type: ignore[no-untyped-def]
-            with self._lock:
+            with self._lock, self._settling():
                 ret = yield self.state.call_async(func, *args, **kwargs)
-                raise gen.Return(ret)
+            raise gen.Return(ret)
 
         return wrapped()
 
     def open(self) -> bool:
         """Open the circuit, e.g., the following calls will immediately fail until timeout elapses."""
-        with self._lock:
+        with self._lock, self._settling():
             self._state_storage.opened_at = datetime.now(UTC)
             self.state = self._state_storage.state = STATE_OPEN  # type: ignore[assignment]
 
@@ -291,12 +579,12 @@ class CircuitBreaker:
         opens the circuit if the call fails (or closes the circuit if the call
         succeeds).
         """
-        with self._lock:
+        with self._lock, self._settling():
             self.state = self._state_storage.state = STATE_HALF_OPEN  # type: ignore[assignment]
 
     def close(self) -> None:
         """Close the circuit, e.g. lets the following calls execute as usual."""
-        with self._lock:
+        with self._lock, self._settling():
             self._state_storage.reset_success_counter()  # Reset success counter when closing
             self.state = self._state_storage.state = STATE_CLOSED  # type: ignore[assignment]
 
@@ -687,11 +975,20 @@ class CircuitBreakerState:
         ...
 
     def _handle_error(self, exc: BaseException, reraise: bool = True) -> None:
-        """Handle a failed call to the guarded operation."""
+        """Handle a failed call to the guarded operation.
+
+        The failure counter is updated first and notifications are isolated, so
+        a failing listener can neither change the recorded failure nor stop the
+        state transition below from happening.
+        """
         if self._breaker.is_system_error(exc):
             self._breaker._inc_counter()
-            for listener in self._breaker.listeners:
-                listener.failure(self._breaker, exc)
+            # Notifications are isolated, so both the failure report and the
+            # state transition that may follow are settled independently of
+            # whether an observer is broken. A listener error is recorded and,
+            # depending on the policy, surfaced only once the whole operation
+            # has finished - never instead of the dependency error below.
+            self._breaker._notify("failure", exc)
             self.on_failure(exc)
         else:
             self._handle_success()
@@ -703,8 +1000,7 @@ class CircuitBreakerState:
         """Handle a successful call to the guarded operation."""
         self._breaker._state_storage.reset_counter()
         self.on_success()
-        for listener in self._breaker.listeners:
-            listener.success(self._breaker)
+        self._breaker._notify("success")
 
     def call(self, func: Callable[..., T], *args: Any, **kwargs: Any) -> T:
         """Calls `func` with the given `args` and `kwargs`, and updates the
@@ -713,8 +1009,7 @@ class CircuitBreakerState:
         ret = None
 
         self.before_call(func, *args, **kwargs)
-        for listener in self._breaker.listeners:
-            listener.before_call(self._breaker, func, *args, **kwargs)
+        self._breaker._notify("before_call", func, *args, **kwargs)
 
         try:
             ret = func(*args, **kwargs)
@@ -739,8 +1034,7 @@ class CircuitBreakerState:
             ret = None
 
             self.before_call(func, *args, **kwargs)
-            for listener in self._breaker.listeners:
-                listener.before_call(self._breaker, func, *args, **kwargs)
+            self._breaker._notify("before_call", func, *args, **kwargs)
 
             try:
                 ret = yield func(*args, **kwargs)
@@ -755,16 +1049,24 @@ class CircuitBreakerState:
 
         return wrapped()
 
-    def generator_call(self, wrapped_generator):  # type: ignore[no-untyped-def]
+    def generator_call(self, wrapped_generator: Generator) -> Generator:
+        # The generator is resumed by the caller long after `call` returned, so
+        # the outcome is settled here inside its own group; a listener failure
+        # must not be able to turn a finished generator into a failed one.
         try:
             value = yield next(wrapped_generator)
             while True:
                 value = yield wrapped_generator.send(value)
         except StopIteration:
-            self._handle_success()
+            with self._breaker._settling():
+                self._handle_success()
             return
         except BaseException as e:
-            self._handle_error(e, reraise=False)
+            # The wrapped generator is about to re-raise the dependency error,
+            # which must win over any listener failure; that failure is still
+            # recorded for auditing, but not reported a second time.
+            with self._breaker._settling(raise_errors=False):
+                self._handle_error(e, reraise=False)
             wrapped_generator.throw(e)
 
     def before_call(self, func: Callable[..., Any], *args: Any, **kwargs: Any) -> None:
@@ -801,8 +1103,7 @@ class CircuitClosedState(CircuitBreakerState):
             # share a central source of truth (as would be the case with the redis
             # storage).
             self._breaker._state_storage.reset_counter()
-            for listener in self._breaker.listeners:
-                listener.state_change(self._breaker, prev_state, self)
+            self._breaker._notify("state_change", prev_state, self)
 
     def on_failure(self, exc: BaseException) -> None:
         """Move the circuit breaker to the "open" state once the failures threshold is reached."""
@@ -835,8 +1136,7 @@ class CircuitOpenState(CircuitBreakerState):
         if notify:
             # Reset success counter when opening the circuit
             self._breaker._state_storage.reset_success_counter()
-            for listener in self._breaker.listeners:
-                listener.state_change(self._breaker, prev_state, self)
+            self._breaker._notify("state_change", prev_state, self)
 
     def before_call(self, func: Callable[..., T], *args: Any, **kwargs: Any) -> T:
         """After the timeout elapses, move the circuit breaker to the "half-open"
@@ -877,8 +1177,7 @@ class CircuitHalfOpenState(CircuitBreakerState):
         if notify:
             # Reset success counter when entering half-open state
             self._breaker._state_storage.reset_success_counter()
-            for listener in self._breaker._listeners:
-                listener.state_change(self._breaker, prev_state, self)
+            self._breaker._notify("state_change", prev_state, self)
 
     def on_failure(self, exc: BaseException) -> NoReturn:
         """Opens the circuit breaker."""

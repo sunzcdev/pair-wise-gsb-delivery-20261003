@@ -1,6 +1,18 @@
 Changelog
 =========
 
+Unreleased
+
+* Add ``listener_error_policy`` (``ignore``, ``log``, ``strict``,
+  ``propagate``) so a failing listener can no longer turn a successful guarded
+  call into a failure, trip the circuit, or retry the guarded function
+* Notify listeners only after the guarded call and the breaker state have been
+  settled; every listener runs once, in registration order
+* Keep audit details of listener failures (``listener_failures``,
+  ``last_listener_report``, ``ListenerNotificationError``) independently of the
+  configured policy
+* Make listener notifications safe to re-enter without deadlocking
+
 Version 1.4.0 (July 6, 2025)
 
 * Add success_threshold parameter (Thanks @sideshowbandana)
