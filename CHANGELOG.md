@@ -15,6 +15,13 @@ You can find our backwards-compatibility policy [here](https://github.com/hynek/
 
 ## [Unreleased](https://github.com/hynek/structlog/compare/26.1.0...HEAD)
 
+### Added
+
+- `structlog.processors.ProcessorBrancher` (together with `Branch`, `BranchOutputs`, `BranchError`, `BranchDropped`, and the `BRANCH_DROPPED` marker) for fanning one event out into independent processor branches.
+  The common chain runs exactly once; each branch then processes its own shallow copy of the event dictionary and can write to its own `sink`.
+  A branch raising `DropEvent` (or mutating/dropping keys) does not affect its siblings, while genuine processing exceptions either abort the whole event (`on_error="raise"`, the default) or are recorded as `BranchError` while the remaining branches keep running (`on_error="continue"`).
+  Only shallow copying is performed -- nested mutable values stay shared by reference and arbitrary business objects are never deep-copied.
+
 ### Changed
 
 - On Python 3.15 and later, *structlog* uses [PEP 810](https://peps.python.org/pep-0810/) lazy imports for modules that are only needed once you log.

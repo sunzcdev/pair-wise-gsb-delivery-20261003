@@ -290,6 +290,18 @@ API Reference
 
 .. autoclass:: CallsiteParameterAdder
 
+.. autoclass:: ProcessorBrancher
+
+.. autoclass:: Branch
+
+.. autoclass:: BranchOutputs
+
+.. autoclass:: BranchError
+
+.. autoclass:: BranchDropped
+
+.. autodata:: BRANCH_DROPPED
+
 
 `structlog.stdlib` Module
 -------------------------

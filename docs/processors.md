@@ -132,6 +132,88 @@ class ConditionalDropper:
 Since it's so common to filter by the log level, *structlog* comes with {func}`structlog.make_filtering_bound_logger` that filters log entries before they even enter the processor chain.
 It does **not** use the standard library, but it does use its names and order of log levels.
 
+(branching)=
+
+## Branching to multiple outputs
+
+Sometimes the *same* structured event has to go to two independent outlets -- for example a tamper-resistant audit log and a human-friendly diagnostics stream.
+Running two separately configured loggers would execute the common enrichment processors (timestamps, log levels, context merging, ...) twice and is easy to get out of sync.
+
+{class}`~structlog.processors.ProcessorBrancher` is an explicit branch processor:
+the common chain before it runs **exactly once**, and then each {class}`~structlog.processors.Branch` processes its own shallow copy of the event dictionary independently.
+
+```python
+import structlog
+
+from structlog.processors import (
+    Branch,
+    JSONRenderer,
+    ProcessorBrancher,
+)
+
+
+def audit_sink(method_name, output):
+    # Send the rendered audit event to its own destination.
+    audit_file.write(output + "\n")
+
+
+def diagnostics_sink(method_name, output):
+    # Send the rendered diagnostic event to its own destination.
+    diagnostics_logger.info(output)
+
+
+structlog.configure(
+    processors=[
+        # Common preprocessing -- runs once per event.
+        structlog.processors.add_log_level,
+        structlog.processors.TimeStamper(fmt="iso"),
+        ProcessorBrancher(
+            [
+                Branch(
+                    "audit",
+                    [JSONRenderer(sort_keys=True)],
+                    sink=audit_sink,
+                ),
+                Branch(
+                    "diagnostics",
+                    [JSONRenderer(sort_keys=True)],
+                    sink=diagnostics_sink,
+                ),
+            ]
+        ),
+    ]
+)
+```
+
+### Isolation guarantees
+
+- A branch that raises {class}`structlog.DropEvent` only drops **that** branch.
+  It is recorded as {any}`~structlog.processors.BRANCH_DROPPED` in the result; the other branches keep running.
+  If *every* branch drops, the brancher raises `DropEvent` itself, so nothing reaches the wrapped logger.
+- Top-level changes inside a branch never leak into a sibling, because every branch receives its own dictionary.
+- A real processing exception is handled according to the `on_error` setting:
+
+  - `"raise"` (the default) propagates the exception and aborts the whole event, or
+  - `"continue"` records the failure as a {class}`~structlog.processors.BranchError` while the remaining branches still run.
+
+`DropEvent` itself is never considered an error.
+
+### Copying convention
+
+Each branch receives a **shallow** copy (`dict(event_dict)`) of the event dictionary.
+Top-level keys are independent, but *nested* mutable values -- lists, sets, or arbitrary business objects -- remain shared by reference between branches.
+*structlog* deliberately does **not** deep-copy arbitrary business objects.
+If a branch needs to mutate a nested value in isolation, it must copy that value itself, for example with {func}`copy.deepcopy` on the specific key.
+
+### Results and the single-chain interface
+
+The brancher returns a {class}`~structlog.processors.BranchOutputs` mapping of branch name to that branch's output.
+It is a plain `dict` subclass, so it remains a valid return value for the final processor of an ordinary chain and the single-chain interface is unchanged -- you only opt into branching where you actually put the brancher.
+Branches that own their destination can hand it over via their `sink`, which receives the wrapped method name and the branch's final output.
+
+Common processors are never re-executed to "fill in" another branch:
+anything that must differ between outlets belongs in that branch's own processor chain.
+
 (adapting)=
 
 ## Adapting and rendering

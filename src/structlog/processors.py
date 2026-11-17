@@ -22,7 +22,7 @@ import sys
 import threading
 import time
 
-from collections.abc import Callable, Collection, Sequence
+from collections.abc import Callable, Collection, Iterable, Sequence
 from types import FrameType, TracebackType
 from typing import (
     Any,
@@ -41,17 +41,25 @@ from ._frames import (
 from ._log_levels import NAME_TO_LEVEL, add_log_level
 from ._utils import get_processname
 from .contextvars import _ASYNC_CALLING_THREAD
+from .exceptions import DropEvent
 from .tracebacks import ExceptionDictTransformer
 from .typing import (
     EventDict,
     ExceptionTransformer,
     ExcInfo,
+    Processor,
+    ProcessorReturnValue,
     WrappedLogger,
 )
 
 
 __all__ = [
+    "BRANCH_DROPPED",
     "NAME_TO_LEVEL",  # some people rely on it being here
+    "Branch",
+    "BranchDropped",
+    "BranchError",
+    "BranchOutputs",
     "CallsiteParameter",
     "CallsiteParameterAdder",
     "EventRenamer",
@@ -59,6 +67,7 @@ __all__ = [
     "JSONRenderer",
     "KeyValueRenderer",
     "LogfmtRenderer",
+    "ProcessorBrancher",
     "StackInfoRenderer",
     "TimeStamper",
     "UnicodeDecoder",
@@ -1006,3 +1015,231 @@ class EventRenamer:
                 event_dict["event"] = replace_by
 
         return event_dict
+
+
+class BranchDropped:
+    """
+    Marker placed in `BranchOutputs` for branches whose chain raised
+    `structlog.DropEvent`.
+
+    It deliberately does **not** derive from `BaseException`: a dropped branch
+    is a regular result, not an error.  There is only one instance of this
+    class, exposed as `BRANCH_DROPPED`.
+
+    .. versionadded:: 26.2.0
+    """
+
+    __slots__ = ()
+
+    def __repr__(self) -> str:
+        return "<BRANCH_DROPPED>"
+
+    def __reduce__(self) -> str:
+        # Ensure the singleton survives pickle round-trips.
+        return "BRANCH_DROPPED"
+
+
+BRANCH_DROPPED: Final = BranchDropped()
+"""
+Singleton marker for a branch that raised `structlog.DropEvent`.
+
+.. versionadded:: 26.2.0
+"""
+
+
+class BranchError(NamedTuple):
+    """
+    A branch failure recorded by `ProcessorBrancher` when
+    ``on_error="continue"``.
+
+    Attributes:
+        branch: Name of the branch that failed.
+        exception: The exception that the branch's chain (or sink) raised.
+
+    .. versionadded:: 26.2.0
+    """
+
+    branch: str
+    exception: Exception
+
+
+class Branch(NamedTuple):
+    """
+    One independent branch of a `ProcessorBrancher`.
+
+    Attributes:
+        name:
+            Unique name under which the branch's output appears in
+            `BranchOutputs`.
+
+        processors:
+            The branch-specific processor chain.  Only these processors are
+            run for this branch; the processors configured *before* the
+            `ProcessorBrancher` (the common chain) are never re-executed.
+
+        sink:
+            Optional callable taking ``(method_name, output)`` that receives
+            the branch's final return value -- for example a call that writes
+            to an audit log.  Exceptions raised by the sink are subject to the
+            brancher's ``on_error`` policy.
+
+    .. versionadded:: 26.2.0
+    """
+
+    name: str
+    processors: Iterable[Processor]
+    sink: Callable[[str, ProcessorReturnValue], Any] | None = None
+
+
+class BranchOutputs(dict[str, Any]):
+    """
+    Mapping of branch names to their individual outputs.
+
+    Dropped branches map to `BRANCH_DROPPED`; failed branches (only possible
+    with ``on_error="continue"``) map to `BranchError`.
+
+    It is a plain `dict` subclass, so it remains a valid return value for the
+    final processor of an ordinary single chain: it gets passed to the wrapped
+    logger as ``**kwargs`` without any changes to the single-chain interface.
+
+    .. versionadded:: 26.2.0
+    """
+
+
+# A branch result is either a processor return value, the drop marker, or a
+# recorded failure.
+_BranchResult = ProcessorReturnValue | BranchDropped | BranchError
+
+
+class ProcessorBrancher:
+    """
+    Fan one event dictionary out into independent processor branches.
+
+    Place this processor at the point in your processor chain where the
+    common preprocessing (adding timestamps, log levels, context, ...) is
+    finished.  The common chain runs exactly **once**; afterwards each
+    `Branch` receives a shallow copy of the resulting event dictionary and
+    runs its own chain independently:
+
+    - A branch raising `structlog.DropEvent` only drops that branch; the other
+      branches are unaffected.  The dropped branch is recorded as
+      `BRANCH_DROPPED`.
+    - A branch mutating its event dictionary (including dropping keys) cannot
+      affect any other branch.
+    - A branch's optional ``sink`` is called with its final output, allowing
+      each branch to write to its own destination (e.g. audit vs.
+      diagnostics).
+
+    Args:
+        branches:
+            At least one `Branch`.  Branch names must be unique.
+
+        on_error:
+            What to do when a branch's chain or sink raises a real exception
+            (anything except `structlog.DropEvent`):
+
+            - ``"raise"`` (default): the exception propagates immediately,
+              aborting the whole event, including branches that have not run
+              yet.
+            - ``"continue"``: the failure is recorded as a `BranchError` and
+              the remaining branches still run.
+
+    Returns:
+        A `BranchOutputs` mapping of branch name to output.  If *every* branch
+        was dropped, `structlog.DropEvent` is raised instead, so that nothing
+        reaches the wrapped logger.
+
+    .. note::
+
+        **Copying convention.**  Each branch receives a *shallow* copy
+        (``dict(event_dict)``) of the event dictionary.  Top-level keys are
+        independent, but nested mutable values -- lists, sets, custom business
+        objects, ... -- are shared by reference between all branches.
+        *structlog* never deep-copies arbitrary business objects.  If a branch
+        needs to mutate nested values without affecting its siblings, it must
+        copy those values itself (for example with `copy.deepcopy` on the
+        specific value).
+
+    .. note::
+
+        The common processors are executed once and are **not** rerun to
+        produce another branch's result.  Anything that must differ between
+        branches belongs inside that branch's own processor chain.
+
+    .. versionadded:: 26.2.0
+    """
+
+    __slots__ = ("_branches", "_on_error")
+
+    def __init__(
+        self,
+        branches: Sequence[Branch],
+        *,
+        on_error: str = "raise",
+    ) -> None:
+        if not branches:
+            msg = "ProcessorBrancher requires at least one Branch."
+            raise ValueError(msg)
+        names = [branch.name for branch in branches]
+        if len(set(names)) != len(names):
+            msg = f"Branch names must be unique, got: {names!r}"
+            raise ValueError(msg)
+        if on_error not in ("raise", "continue"):
+            msg = f"on_error must be 'raise' or 'continue', got {on_error!r}."
+            raise ValueError(msg)
+
+        # Materialize the branches and their chains once: a generator passed
+        # as a processor chain would otherwise be exhausted after the first
+        # event.
+        self._branches = tuple(
+            Branch(branch.name, tuple(branch.processors), branch.sink)
+            for branch in branches
+        )
+        self._on_error = on_error
+
+    def __call__(
+        self,
+        logger: WrappedLogger,
+        method_name: str,
+        event_dict: EventDict,
+    ) -> BranchOutputs:
+        outputs: BranchOutputs = BranchOutputs()
+
+        for branch in self._branches:
+            try:
+                result: _BranchResult = self._run_branch(
+                    branch, logger, method_name, event_dict
+                )
+            except DropEvent:
+                result = BRANCH_DROPPED
+            except Exception as exc:
+                if self._on_error == "raise":
+                    raise
+                # ``raise`` keeps the original traceback; for ``continue`` we
+                # record the failure and keep going.
+                result = BranchError(branch.name, exc)
+
+            outputs[branch.name] = result
+
+        if all(isinstance(value, BranchDropped) for value in outputs.values()):
+            raise DropEvent
+
+        return outputs
+
+    def _run_branch(
+        self,
+        branch: Branch,
+        logger: WrappedLogger,
+        method_name: str,
+        event_dict: EventDict,
+    ) -> ProcessorReturnValue | BranchDropped:
+        # Shallow copy only: top-level keys are independent, nested mutable
+        # values remain shared by reference by design.
+        branch_dict: Any = dict(event_dict)
+        for proc in branch.processors:
+            branch_dict = proc(logger, method_name, branch_dict)
+
+        if branch.sink is not None:
+            branch.sink(method_name, branch_dict)
+
+        return branch_dict

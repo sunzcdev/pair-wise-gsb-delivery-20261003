@@ -17,7 +17,15 @@ from typing import Any
 
 import structlog
 
-from structlog.processors import CallsiteParameter
+from structlog.processors import (
+    BRANCH_DROPPED,
+    Branch,
+    BranchDropped,
+    BranchError,
+    BranchOutputs,
+    CallsiteParameter,
+    ProcessorBrancher,
+)
 from structlog.typing import FilteringBoundLogger
 
 
@@ -412,3 +420,32 @@ cr.event_key = "le event"
 
 cr.repr_native_str
 cr.repr_native_str = True
+
+
+# ProcessorBrancher
+
+
+def audit_sink(method_name: str, output: object) -> None:
+    pass
+
+
+brancher = ProcessorBrancher(
+    [
+        Branch("audit", [structlog.processors.JSONRenderer()], audit_sink),
+        Branch("diagnostics", [structlog.processors.JSONRenderer()]),
+    ],
+    on_error="continue",
+)
+
+outputs: BranchOutputs = brancher(None, "info", {"event": "e"})
+audit_output: object = outputs["audit"]
+marker: BranchDropped = BRANCH_DROPPED
+failure: BranchError = BranchError("audit", RuntimeError("boom"))
+branch: Branch = Branch("diagnostics", [])
+
+structlog.configure(
+    processors=[
+        structlog.processors.add_log_level,
+        brancher,
+    ]
+)
