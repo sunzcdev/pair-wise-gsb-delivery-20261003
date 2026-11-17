@@ -250,6 +250,110 @@ The ``import_set()`` method also supports a ``skip_lines`` parameter that you
 can set to a number of lines that should be skipped before starting to read
 data.
 
+Date systems
+~~~~~~~~~~~~
+
+Excel workbooks store dates as serial numbers relative to one of two date
+systems: the "1900" system (serial 1 is 1900-01-01, and serial 60 is the
+fictitious 1900-02-29 that does not exist as a real date) or the "1904" system
+used by legacy Mac Excel (serial 0 is 1904-01-01).  The same date therefore has
+different serial numbers in each system.
+
+On import, Tablib records the date system of the workbook on the dataset as
+``xlsx_date_epoch`` (``1900`` or ``1904``).  :meth:`export('xlsx') <.export>`
+reuses it, so re-exported date serial numbers are not read against the other
+epoch.  A workbook has a single date system, so a ``Databook`` uses the first
+sheet that records one.
+
+.. versionchanged:: 3.12.0
+
+    The workbook date system is recorded on import and reused on export.
+
+Date provenance
+~~~~~~~~~~~~~~~
+
+Pass ``date_provenance=True`` to ``import_set()`` or ``import_book()`` to also
+attach a ``date_provenance`` mapping to each dataset::
+
+    {
+        'date_system': 1900,          # or 1904, None when unknown
+        'cells': {
+            # (data row, column), 0-based, headers and skipped lines excluded.
+            (0, 0): {
+                'kind': 'datetime',   # kind of the imported value
+                'source': 'literal',  # where the value came from
+                'format_kind': 'date',# Excel number-format kind, date cells only
+                'serial': 45418,      # raw Excel serial number, date cells only
+                'has_time': False,    # serial has a time-of-day fraction
+                'anomaly': None,      # e.g. 'fictitious_leap_day'
+            },
+        },
+    }
+
+``kind`` describes the imported value: ``empty``, ``bool``, ``date``,
+``datetime``, ``time``, ``timedelta``, ``number``, ``text`` or ``error``.
+``format_kind`` describes the cell's Excel number format (``date``,
+``datetime``, ``time`` or ``timedelta``) and is only present for date-formatted
+cells.  Cells are recognised as dates by their number format, never by their
+value, so a plain number that happens to look like a date serial is recorded as
+``'number'`` without a ``serial``.
+
+``source`` records where the imported value actually came from: ``'empty'`` for
+an empty cell, ``'literal'`` for a stored value, ``'formula_cache'`` for the
+cached result of a formula, and ``'formula_cache_missing'`` for a formula cell
+without a cached result.  ``'unknown'`` means the package could not be scanned,
+so the origin cannot be told apart.
+
+Date cells without a timezone are imported as naive datetimes; the local
+timezone is never applied to them, so their values are not shifted.
+
+The provenance describes the imported rows and columns, so it is dropped when
+they change: ``wipe()`` removes both ``date_provenance`` and
+``xlsx_date_epoch``, while an operation that changes row or column positions
+(for example ``append()``, ``insert_col()``, ``filter()`` or
+``remove_duplicates()``) only removes ``date_provenance``.  The date system is
+not position-dependent, so ``xlsx_date_epoch`` is kept, including on datasets
+derived with ``sort()``, ``subset()``, ``transpose()`` or ``stack_cols()``, and
+still applies to a later export.
+
+.. versionchanged:: 3.12.0
+
+    The ``date_provenance`` parameter for ``import_set()`` and
+    ``import_book()`` was added.
+
+Anomalous date serial numbers
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+A date-formatted cell can hold a serial number that cannot be turned into a
+date: the fictitious 1900-02-29 (serial 60 of the 1900 system), a negative
+serial, or a serial outside the representable date range.  openpyxl itself
+maps serial 60 onto 1900-02-28 and turns out-of-range serials into ``#VALUE!``,
+so Tablib reads the raw serial from the sheet XML and handles it explicitly.
+
+The ``date_serial_policy`` parameter selects the behaviour:
+
+``'reject'`` (the default)
+    Raise :class:`tablib.exceptions.InvalidDateSerial`, naming the cell, the
+    serial value and the kind of anomaly.
+
+``'keep_serial'``
+    Keep the raw serial number as the cell value instead of a converted date,
+    and mark the cell with ``'serial_preserved': True`` in its provenance.  A
+    re-export writes the same number as a plain number, so it cannot be read as
+    a different date under either epoch.  The cell keeps its date
+    ``kind``/``format_kind`` in the provenance, so it is not reported as an
+    ordinary number.
+
+Time-only and duration cells hold fractions of a day or elapsed time rather
+than dates, so a negative duration is not an anomaly and serial 60 in a
+time cell is not the leap day.  In the 1904 system, serial 60 is a real date
+(1904-03-01) and is imported normally.
+
+.. versionchanged:: 3.12.0
+
+    The ``date_serial_policy`` parameter for ``import_set()`` and
+    ``import_book()`` was added.
+
 The ``export_set()`` method supports a ``column_width`` parameter. Depending
 on the value passed, the column width will be set accordingly. It can be
 either ``None``, an integer, or default "adaptive". If "adaptive" is passed,

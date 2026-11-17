@@ -8,6 +8,8 @@ import pickle
 import re
 import tempfile
 import unittest
+import warnings
+import zipfile
 from decimal import Decimal
 from io import BytesIO, StringIO
 from pathlib import Path
@@ -15,11 +17,13 @@ from uuid import uuid4
 
 import xlrd
 from odf import opendocument, table
+from openpyxl import Workbook
 from openpyxl.reader.excel import load_workbook
+from openpyxl.utils.datetime import MAC_EPOCH
 
 import tablib
 from tablib.core import Row, detect_format
-from tablib.exceptions import UnsupportedFormat
+from tablib.exceptions import InvalidDateSerial, UnsupportedFormat
 from tablib.formats import registry
 
 try:
@@ -1708,6 +1712,622 @@ class XLSXTests(BaseTestCase):
         """Raise ValueError if column_width is not a valid input for a databook"""
         with self.assertRaises(ValueError):
             self._book_helper_export_column_width("invalid input")
+
+
+def build_xlsx(rows, epoch=1900, title=None, extra_sheets=()):
+    """Build an XLSX stream from ``(reference, value, number_format)`` rows.
+
+    A ``None`` value is skipped, so a styled-but-empty cell can be created by
+    passing ``None`` as the value together with a number format.  ``epoch``
+    1904 selects the 1904 date system.  ``extra_sheets`` adds
+    ``(title, rows)`` sheets after the first.
+    """
+    workbook = Workbook()
+    if epoch == 1904:
+        workbook.epoch = MAC_EPOCH
+    sheet = workbook.active
+    if title:
+        sheet.title = title
+    for reference, value, number_format in rows:
+        if value is not None:
+            sheet[reference] = value
+        if number_format:
+            sheet[reference].number_format = number_format
+    for sheet_title, sheet_rows in extra_sheets:
+        extra_sheet = workbook.create_sheet(sheet_title)
+        for reference, value, number_format in sheet_rows:
+            if value is not None:
+                extra_sheet[reference] = value
+            if number_format:
+                extra_sheet[reference].number_format = number_format
+    stream = BytesIO()
+    workbook.save(stream)
+    return stream.getvalue()
+
+
+def patch_xlsx_part(data, part, replacements):
+    """Return *data* with the first occurrence of each old/new pair replaced."""
+    output = BytesIO()
+    with zipfile.ZipFile(BytesIO(data)) as source:
+        with zipfile.ZipFile(output, 'w', zipfile.ZIP_DEFLATED) as target:
+            for item in source.infolist():
+                payload = source.read(item.filename)
+                if item.filename == part:
+                    text = payload.decode()
+                    for old, new in replacements.items():
+                        if old not in text:
+                            raise AssertionError(f'{old!r} not found in {part}')
+                        text = text.replace(old, new, 1)
+                    payload = text.encode()
+                target.writestr(item, payload)
+    return output.getvalue()
+
+
+class XLSXDateFormatTestCase(BaseTestCase):
+    """Date systems, raw serial values and import provenance."""
+
+    def load(self, data, **kwargs):
+        with warnings.catch_warnings():
+            # openpyxl warns about out-of-range serials.
+            warnings.simplefilter('ignore')
+            return tablib.Dataset().load(data, 'xlsx', **kwargs)
+
+    def test_date_system_recorded_for_1900(self):
+        data = build_xlsx([
+            ('A1', 'date', None),
+            ('A2', dt.date(2024, 5, 6), 'yyyy-mm-dd'),
+        ])
+        dset = self.load(data)
+        self.assertEqual(dset.xlsx_date_epoch, 1900)
+        self.assertEqual(dset[0][0], dt.datetime(2024, 5, 6))
+
+    def test_date_system_recorded_for_1904(self):
+        data = build_xlsx([
+            ('A1', 'date', None),
+            ('A2', dt.date(2024, 5, 6), 'yyyy-mm-dd'),
+        ], epoch=1904)
+        dset = self.load(data)
+        self.assertEqual(dset.xlsx_date_epoch, 1904)
+        self.assertEqual(dset[0][0], dt.datetime(2024, 5, 6))
+
+    def test_1904_export_reuses_date_system(self):
+        data = build_xlsx([
+            ('A1', 'date', None),
+            ('A2', dt.datetime(2024, 5, 6, 13, 45, 30), 'yyyy-mm-dd hh:mm:ss'),
+        ], epoch=1904)
+        dset = self.load(data)
+        exported = dset.export('xlsx')
+        with zipfile.ZipFile(BytesIO(exported)) as archive:
+            self.assertIn(b'date1904="1"', archive.read('xl/workbook.xml'))
+        # Round-trip twice: the epoch must survive repeated re-exports.
+        twice = self.load(dset.export('xlsx'))
+        self.assertEqual(twice.xlsx_date_epoch, 1904)
+        self.assertEqual(twice[0][0], dt.datetime(2024, 5, 6, 13, 45, 30))
+        self.assertEqual(twice.dict, dset.dict)
+
+    def test_1900_export_does_not_switch_date_system(self):
+        data = build_xlsx([
+            ('A1', 'date', None),
+            ('A2', dt.date(2024, 5, 6), 'yyyy-mm-dd'),
+        ])
+        exported = self.load(data).export('xlsx')
+        with zipfile.ZipFile(BytesIO(exported)) as archive:
+            self.assertNotIn(b'date1904', archive.read('xl/workbook.xml'))
+
+    def test_databook_shares_one_date_system(self):
+        data = build_xlsx(
+            [('A1', 'date', None), ('A2', dt.date(2024, 5, 6), 'yyyy-mm-dd')],
+            epoch=1904,
+            extra_sheets=[('Second', [('A1', 'date', None), ('A2', 60, 'yyyy-mm-dd')])],
+        )
+        with warnings.catch_warnings():
+            warnings.simplefilter('ignore')
+            dbook = tablib.Databook().load(data, 'xlsx', date_provenance=True)
+        first, second = dbook.sheets()
+        self.assertEqual(first.xlsx_date_epoch, 1904)
+        self.assertEqual(second.xlsx_date_epoch, 1904)
+        # Serial 60 is a valid date in the 1904 system (1904-03-01).
+        self.assertEqual(second[0][0], dt.datetime(1904, 3, 1))
+        exported = dbook.export('xlsx')
+        with zipfile.ZipFile(BytesIO(exported)) as archive:
+            self.assertIn(b'date1904="1"', archive.read('xl/workbook.xml'))
+        reloaded = tablib.Databook().load(exported, 'xlsx')
+        self.assertEqual([sheet.dict for sheet in reloaded.sheets()],
+                         [sheet.dict for sheet in dbook.sheets()])
+
+    def test_fictitious_leap_day_is_rejected_by_default(self):
+        data = build_xlsx([
+            ('A1', 'date', None),
+            ('A2', 60, 'yyyy-mm-dd'),
+        ])
+        with self.assertRaises(InvalidDateSerial) as caught:
+            self.load(data)
+        self.assertIsInstance(caught.exception, ValueError)
+        self.assertIn('A2', str(caught.exception))
+        self.assertIn('fictitious_leap_day', str(caught.exception))
+
+    def test_fictitious_leap_day_with_time_fraction_is_rejected(self):
+        data = build_xlsx([
+            ('A1', 'date', None),
+            ('A2', 60.5, 'yyyy-mm-dd hh:mm:ss'),
+        ])
+        with self.assertRaises(InvalidDateSerial):
+            self.load(data)
+
+    def test_fictitious_leap_day_kept_as_serial(self):
+        data = build_xlsx([
+            ('A1', 'date', None),
+            ('A2', 60, 'yyyy-mm-dd'),
+        ])
+        dset = self.load(data, date_serial_policy='keep_serial', date_provenance=True)
+        self.assertEqual(dset[0][0], 60)
+        self.assertIsInstance(dset[0][0], int)
+        self.assertEqual(dset.date_provenance['cells'][(0, 0)]['anomaly'],
+                         'fictitious_leap_day')
+        self.assertTrue(dset.date_provenance['cells'][(0, 0)]['serial_preserved'])
+
+    def test_kept_serial_is_not_reinterpreted_on_reexport(self):
+        data = build_xlsx([
+            ('A1', 'date', None),
+            ('A2', 60, 'yyyy-mm-dd'),
+        ])
+        dset = self.load(data, date_serial_policy='keep_serial')
+        exported = dset.export('xlsx')
+        workbook = load_workbook(BytesIO(exported))
+        cell = workbook.active['A2']
+        self.assertEqual(cell.value, 60)
+        self.assertEqual(cell.data_type, 'n')
+        self.assertEqual(cell.number_format, 'General')
+        self.assertEqual(self.load(exported).dict, [{'date': 60}])
+
+    def test_real_1900_02_28_is_not_the_fictitious_day(self):
+        data = build_xlsx([
+            ('A1', 'date', None),
+            ('A2', 59, 'yyyy-mm-dd'),
+            ('A3', 61, 'yyyy-mm-dd'),
+        ])
+        dset = self.load(data, date_provenance=True)
+        self.assertEqual(dset[0][0], dt.datetime(1900, 2, 28))
+        self.assertEqual(dset[1][0], dt.datetime(1900, 3, 1))
+        self.assertNotIn('anomaly', dset.date_provenance['cells'][(0, 0)])
+        self.assertEqual(dset.date_provenance['cells'][(0, 0)]['serial'], 59)
+
+    def test_serial_60_is_a_valid_date_in_the_1904_system(self):
+        data = build_xlsx([
+            ('A1', 'date', None),
+            ('A2', 60, 'yyyy-mm-dd'),
+        ], epoch=1904)
+        dset = self.load(data)
+        self.assertEqual(dset[0][0], dt.datetime(1904, 3, 1))
+
+    def test_time_based_serials_are_never_leap_days(self):
+        data = build_xlsx([
+            ('A1', 'time', None),
+            ('A2', 0.5, 'hh:mm:ss'),
+            ('A3', 60, 'hh:mm:ss'),
+        ])
+        dset = self.load(data, date_provenance=True)
+        self.assertEqual(dset[0][0], dt.time(12, 0))
+        for index in range(2):
+            record = dset.date_provenance['cells'][(index, 0)]
+            self.assertEqual(record['format_kind'], 'time')
+            self.assertNotIn('anomaly', record)
+        self.assertTrue(dset.date_provenance['cells'][(0, 0)]['has_time'])
+        self.assertFalse(dset.date_provenance['cells'][(1, 0)]['has_time'])
+
+    def test_time_delta_serial_is_not_a_date(self):
+        data = build_xlsx([
+            ('A1', 'elapsed', None),
+            ('A2', 1.5, '[h]:mm:ss'),
+        ])
+        dset = self.load(data, date_provenance=True)
+        self.assertEqual(dset[0][0], dt.timedelta(days=1, seconds=43200))
+        record = dset.date_provenance['cells'][(0, 0)]
+        self.assertEqual(record['kind'], 'timedelta')
+        self.assertNotIn('anomaly', record)
+
+    def test_negative_serial_rejected(self):
+        data = build_xlsx([
+            ('A1', 'date', None),
+            ('A2', -2, 'yyyy-mm-dd'),
+        ])
+        with self.assertRaises(InvalidDateSerial):
+            self.load(data)
+
+    def test_negative_serial_kept(self):
+        data = build_xlsx([
+            ('A1', 'date', None),
+            ('A2', -2, 'yyyy-mm-dd'),
+        ])
+        dset = self.load(data, date_serial_policy='keep_serial', date_provenance=True)
+        self.assertEqual(dset[0][0], -2)
+        self.assertEqual(dset.date_provenance['cells'][(0, 0)]['anomaly'], 'negative_serial')
+
+    def test_out_of_range_serial_rejected(self):
+        data = build_xlsx([
+            ('A1', 'date', None),
+            ('A2', 2958466, 'yyyy-mm-dd'),
+        ])
+        with self.assertRaises(InvalidDateSerial) as caught:
+            self.load(data)
+        self.assertIn('serial_out_of_range', str(caught.exception))
+
+    def test_out_of_range_serial_kept(self):
+        data = build_xlsx([
+            ('A1', 'date', None),
+            ('A2', 2958466, 'yyyy-mm-dd'),
+        ])
+        dset = self.load(data, date_serial_policy='keep_serial', date_provenance=True)
+        self.assertEqual(dset[0][0], 2958466)
+        record = dset.date_provenance['cells'][(0, 0)]
+        self.assertEqual(record['anomaly'], 'serial_out_of_range')
+        # A date-formatted cell is never reported as a plain number.
+        self.assertEqual(record['kind'], 'date')
+
+    def test_invalid_policy_is_rejected(self):
+        data = build_xlsx([
+            ('A1', 'date', None),
+            ('A2', 60, 'yyyy-mm-dd'),
+        ])
+        with self.assertRaises(ValueError):
+            self.load(data, date_serial_policy='ignore')
+
+    def test_plain_number_is_not_a_date(self):
+        data = build_xlsx([
+            ('A1', 'looks_like_a_date', None),
+            ('A2', 45000, 'General'),
+            ('A3', 45000.5, '0.00'),
+        ])
+        dset = self.load(data, date_provenance=True)
+        self.assertEqual(dset[0][0], 45000)
+        self.assertEqual(dset[1][0], 45000.5)
+        for index in range(2):
+            record = dset.date_provenance['cells'][(index, 0)]
+            self.assertEqual(record['kind'], 'number')
+            self.assertNotIn('serial', record)
+            self.assertNotIn('format_kind', record)
+
+    def test_missing_stylesheet_keeps_numbers_as_numbers(self):
+        """A package without its stylesheet cannot mark dates as dates."""
+        data = build_xlsx([
+            ('A1', 'value', None),
+            ('A2', 45418, 'yyyy-mm-dd'),
+        ])
+        output = BytesIO()
+        with zipfile.ZipFile(BytesIO(data)) as source:
+            with zipfile.ZipFile(output, 'w', zipfile.ZIP_DEFLATED) as target:
+                for item in source.infolist():
+                    if item.filename == 'xl/styles.xml':
+                        continue
+                    target.writestr(item, source.read(item.filename))
+        dset = self.load(output.getvalue(), date_provenance=True)
+        self.assertEqual(dset[0][0], 45418)
+        self.assertEqual(dset.date_provenance['cells'][(0, 0)]['kind'], 'number')
+        self.assertNotIn('serial', dset.date_provenance['cells'][(0, 0)])
+
+    def test_iso_date_literal_records_a_derived_serial(self):
+        data = build_xlsx([
+            ('A1', 'date', None),
+            ('A2', 'placeholder', 'yyyy-mm-dd'),
+        ])
+        # An ISO 8601 date cell (t="d") has no serial in the sheet XML.
+        data = patch_xlsx_part(data, 'xl/worksheets/sheet1.xml', {
+            '<c r="A2" s="1" t="inlineStr"><is><t>placeholder</t></is></c>':
+                '<c r="A2" s="1" t="d"><v>1900-02-28T00:00:00</v></c>',
+        })
+        dset = self.load(data, date_provenance=True)
+        self.assertEqual(dset[0][0], dt.datetime(1900, 2, 28))
+        record = dset.date_provenance['cells'][(0, 0)]
+        self.assertEqual(record['source'], 'literal')
+        # The genuine 1900-02-28 is serial 59, not the fictitious leap day.
+        self.assertEqual(record['serial'], 59)
+        self.assertNotIn('anomaly', record)
+
+    def test_number_with_date_like_text_format_is_not_a_date(self):
+        data = build_xlsx([
+            ('A1', 'styled_as_text', None),
+            ('A2', 45000, '@'),
+        ])
+        record = self.load(data, date_provenance=True).date_provenance['cells'][(0, 0)]
+        self.assertEqual(record['kind'], 'number')
+
+    def test_provenance_preserves_raw_date_serial(self):
+        data = build_xlsx([
+            ('A1', 'date', None),
+            ('A2', dt.date(2024, 5, 6), 'yyyy-mm-dd'),
+        ])
+        record = self.load(data, date_provenance=True).date_provenance['cells'][(0, 0)]
+        # ``kind`` describes the imported value, ``format_kind`` the Excel format.
+        self.assertEqual(record['kind'], 'datetime')
+        self.assertEqual(record['format_kind'], 'date')
+        self.assertEqual(record['source'], 'literal')
+        self.assertEqual(record['serial'], 45418)
+        self.assertIsInstance(record['serial'], int)
+        self.assertFalse(record['has_time'])
+        self.assertNotIn('anomaly', record)
+
+    def test_provenance_reports_time_fraction(self):
+        data = build_xlsx([
+            ('A1', 'date', None),
+            ('A2', 45000.25, 'yyyy-mm-dd hh:mm:ss'),
+            ('A3', 45000, 'yyyy-mm-dd'),
+        ])
+        dset = self.load(data, date_provenance=True)
+        self.assertTrue(dset.date_provenance['cells'][(0, 0)]['has_time'])
+        self.assertFalse(dset.date_provenance['cells'][(1, 0)]['has_time'])
+
+    def test_provenance_reports_empty_cells(self):
+        data = build_xlsx([
+            ('A1', 'first', None),
+            ('B1', 'second', None),
+            ('A2', None, 'yyyy-mm-dd'),
+            ('A3', 'value', None),
+        ])
+        dset = self.load(data, date_provenance=True)
+        self.assertIsNone(dset[0][0])
+        record = dset.date_provenance['cells'][(0, 0)]
+        self.assertEqual(record['kind'], 'empty')
+        self.assertEqual(record['source'], 'empty')
+        # A styled but empty cell stays empty, not a date.
+        self.assertNotIn('serial', record)
+
+    def test_provenance_reports_formula_cached_date(self):
+        data = build_xlsx([
+            ('A1', 'date', None),
+            ('A2', '=DATE(2024,5,6)', 'yyyy-mm-dd'),
+        ])
+        data = patch_xlsx_part(
+            data, 'xl/worksheets/sheet1.xml', {'<v />': '<v>45418</v>'},
+        )
+        dset = self.load(data, date_provenance=True)
+        self.assertEqual(dset[0][0], dt.datetime(2024, 5, 6))
+        record = dset.date_provenance['cells'][(0, 0)]
+        self.assertEqual(record['source'], 'formula_cache')
+        self.assertEqual(record['serial'], 45418)
+
+    def test_provenance_reports_formula_without_cached_value(self):
+        data = build_xlsx([
+            ('A1', 'date', None),
+            ('A2', '=DATE(2024,5,6)', 'yyyy-mm-dd'),
+        ])
+        dset = self.load(data, date_provenance=True)
+        self.assertIsNone(dset[0][0])
+        record = dset.date_provenance['cells'][(0, 0)]
+        self.assertEqual(record['source'], 'formula_cache_missing')
+        self.assertEqual(record['kind'], 'empty')
+
+    def test_provenance_reports_error_and_text_cells(self):
+        data = build_xlsx([
+            ('A1', 'error', None),
+            ('B1', 'text', None),
+            ('A2', '#DIV/0!', None),
+            ('B2', 'plain', None),
+        ])
+        dset = self.load(data, date_provenance=True)
+        cells = dset.date_provenance['cells']
+        self.assertEqual(cells[(0, 0)]['kind'], 'error')
+        self.assertEqual(cells[(0, 0)]['source'], 'literal')
+        self.assertEqual(cells[(0, 1)]['kind'], 'text')
+
+    def test_provenance_aligns_with_headers_and_skip_lines(self):
+        data = build_xlsx([
+            ('A1', 'garbage', None),
+            ('A2', 'header', None),
+            ('A3', dt.date(2024, 5, 6), 'yyyy-mm-dd'),
+        ])
+        dset = self.load(data, skip_lines=1, date_provenance=True)
+        self.assertEqual(dset.headers, ['header'])
+        self.assertEqual(dset[0][0], dt.datetime(2024, 5, 6))
+        record = dset.date_provenance['cells'][(0, 0)]
+        self.assertEqual(record['kind'], 'datetime')
+        self.assertEqual(record['format_kind'], 'date')
+        self.assertEqual(record['serial'], 45418)
+
+    def test_provenance_records_date_system(self):
+        for epoch, expected in ((1900, 1900), (1904, 1904)):
+            with self.subTest(epoch=epoch):
+                data = build_xlsx([
+                    ('A1', 'date', None),
+                    ('A2', dt.date(2024, 5, 6), 'yyyy-mm-dd'),
+                ], epoch=epoch)
+                dset = self.load(data, date_provenance=True)
+                self.assertEqual(dset.date_provenance['date_system'], expected)
+
+    def test_provenance_is_opt_in(self):
+        data = build_xlsx([
+            ('A1', 'date', None),
+            ('A2', dt.date(2024, 5, 6), 'yyyy-mm-dd'),
+        ])
+        dset = self.load(data)
+        self.assertFalse(hasattr(dset, 'date_provenance'))
+
+    def test_provenance_dropped_by_wipe(self):
+        data = build_xlsx([
+            ('A1', 'date', None),
+            ('A2', dt.date(2024, 5, 6), 'yyyy-mm-dd'),
+        ], epoch=1904)
+        dset = self.load(data, date_provenance=True)
+        dset.wipe()
+        self.assertFalse(hasattr(dset, 'date_provenance'))
+        self.assertFalse(hasattr(dset, 'xlsx_date_epoch'))
+
+    def test_structural_changes_drop_positional_provenance(self):
+        data = build_xlsx([
+            ('A1', 'date', None),
+            ('A2', dt.date(2024, 5, 6), 'yyyy-mm-dd'),
+        ], epoch=1904)
+
+        def loaded():
+            return self.load(data, date_provenance=True)
+
+        # Row and column positions change under these operations, so the
+        # positional provenance no longer describes the data.
+        for label, mutate in (
+            ('append', lambda dset: dset.append([dt.datetime(2024, 5, 7)])),
+            ('insert', lambda dset: dset.insert(0, [dt.datetime(2024, 5, 7)])),
+            ('insert_col', lambda dset: dset.insert_col(0, ['x'], header='new')),
+            ('remove_duplicates', lambda dset: dset.remove_duplicates()),
+            ('setitem', lambda dset: dset.__setitem__(0, [dt.datetime(2024, 5, 7)])),
+            ('delitem', lambda dset: dset.__delitem__(0)),
+        ):
+            with self.subTest(operation=label):
+                dset = loaded()
+                mutate(dset)
+                self.assertFalse(hasattr(dset, 'date_provenance'))
+                # The date system still applies to every date cell.
+                self.assertEqual(dset.xlsx_date_epoch, 1904)
+
+    def test_filter_drops_positional_provenance_but_keeps_date_system(self):
+        data = build_xlsx([
+            ('A1', 'date', None),
+            ('A2', dt.date(2024, 5, 6), 'yyyy-mm-dd'),
+        ], epoch=1904)
+        dset = self.load(data, date_provenance=True)
+        dset.append([dt.datetime(2024, 5, 7)], tags=['keep'])
+        # Restore the imported provenance so the filtering step is the only
+        # thing that invalidates it.
+        dset.date_provenance = {'date_system': 1904, 'cells': {(0, 0): {}}}
+        filtered = dset.filter('keep')
+        self.assertEqual(filtered.height, 1)
+        self.assertFalse(hasattr(filtered, 'date_provenance'))
+        self.assertEqual(filtered.xlsx_date_epoch, 1904)
+
+    def test_import_clears_previous_date_metadata(self):
+        data_1904 = build_xlsx([
+            ('A1', 'date', None),
+            ('A2', dt.date(2024, 5, 6), 'yyyy-mm-dd'),
+        ], epoch=1904)
+        data_1900 = build_xlsx([
+            ('A1', 'date', None),
+            ('A2', dt.date(2024, 5, 6), 'yyyy-mm-dd'),
+        ])
+        dset = self.load(data_1904, date_provenance=True)
+        self.assertEqual(dset.xlsx_date_epoch, 1904)
+        with warnings.catch_warnings():
+            warnings.simplefilter('ignore')
+            # Importing again through the same dataset must not keep the
+            # previous workbook's metadata.
+            tablib.formats.registry.get_format('xlsx').import_set(
+                dset, BytesIO(data_1900),
+            )
+        self.assertEqual(dset.xlsx_date_epoch, 1900)
+        self.assertFalse(hasattr(dset, 'date_provenance'))
+
+    def test_derived_datasets_keep_the_date_system(self):
+        data = build_xlsx([
+            ('A1', 'date', None),
+            ('A2', dt.date(2024, 5, 6), 'yyyy-mm-dd'),
+            ('A3', dt.date(2024, 5, 7), 'yyyy-mm-dd'),
+        ], epoch=1904)
+        dset = self.load(data, date_provenance=True)
+        for label, derived in (
+            ('sort', dset.sort(0)),
+            ('subset', dset.subset()),
+            ('transpose', dset.transpose()),
+            ('stack', dset.stack(self.load(data))),
+            ('stack_cols', dset.stack_cols(self.load(data))),
+        ):
+            with self.subTest(operation=label):
+                self.assertEqual(derived.xlsx_date_epoch, 1904)
+                # Positions changed, so positional provenance does not apply.
+                self.assertFalse(hasattr(derived, 'date_provenance'))
+
+    def test_naive_cell_values_stay_naive(self):
+        data = build_xlsx([
+            ('A1', 'date', None),
+            ('A2', dt.datetime(2024, 5, 6, 13, 45, 30), 'yyyy-mm-dd hh:mm:ss'),
+        ], epoch=1904)
+        dset = self.load(data, date_provenance=True)
+        value = dset[0][0]
+        self.assertIsNone(value.tzinfo)
+        # A naive value must survive a re-export unchanged: no local timezone
+        # shift is applied to it.
+        self.assertEqual(self.load(dset.export('xlsx'))[0][0], value)
+
+    def test_read_only_false_uses_same_metadata(self):
+        data = build_xlsx([
+            ('A1', 'date', None),
+            ('A2', dt.date(2024, 5, 6), 'yyyy-mm-dd'),
+        ])
+        eager = self.load(data, read_only=False, date_provenance=True)
+        lazy = self.load(data, read_only=True, date_provenance=True)
+        self.assertEqual(eager.dict, lazy.dict)
+        self.assertEqual(eager.date_provenance, lazy.date_provenance)
+
+    def test_import_set_reads_metadata_of_the_active_sheet(self):
+        workbook = Workbook()
+        first = workbook.active
+        first.title = 'First'
+        first['A1'] = 'date'
+        first['A2'] = 60
+        first['A2'].number_format = 'yyyy-mm-dd'
+        second = workbook.create_sheet('Second')
+        second['A1'] = 'date'
+        second['A2'] = dt.date(2024, 5, 6)
+        second['A2'].number_format = 'yyyy-mm-dd'
+        workbook.active = 1
+        stream = BytesIO()
+        workbook.save(stream)
+
+        dset = self.load(stream.getvalue(), date_provenance=True)
+        self.assertEqual(dset.title, 'Second')
+        self.assertEqual(dset[0][0], dt.datetime(2024, 5, 6))
+        self.assertEqual(dset.date_provenance['cells'][(0, 0)]['serial'], 45418)
+
+    def test_import_book_records_date_metadata(self):
+        data = build_xlsx(
+            [('A1', 'date', None), ('A2', dt.date(2024, 5, 6), 'yyyy-mm-dd')],
+            epoch=1904,
+            extra_sheets=[('Second', [('A1', 'date', None),
+                                      ('A2', dt.date(2024, 5, 7), 'yyyy-mm-dd')])],
+        )
+        with warnings.catch_warnings():
+            warnings.simplefilter('ignore')
+            dbook = tablib.Databook().load(data, 'xlsx', date_provenance=True)
+        for sheet in dbook.sheets():
+            self.assertEqual(sheet.xlsx_date_epoch, 1904)
+            self.assertEqual(sheet.date_provenance['date_system'], 1904)
+            self.assertEqual(sheet.date_provenance['cells'][(0, 0)]['source'], 'literal')
+
+    def test_import_book_applies_policy_per_sheet(self):
+        data = build_xlsx(
+            [('A1', 'date', None), ('A2', dt.date(2024, 5, 6), 'yyyy-mm-dd')],
+            extra_sheets=[('Second', [('A1', 'date', None),
+                                      ('A2', 60, 'yyyy-mm-dd')])],
+        )
+        with self.assertRaises(InvalidDateSerial):
+            with warnings.catch_warnings():
+                warnings.simplefilter('ignore')
+                tablib.Databook().load(data, 'xlsx')
+        with warnings.catch_warnings():
+            warnings.simplefilter('ignore')
+            dbook = tablib.Databook().load(data, 'xlsx', date_serial_policy='keep_serial')
+        self.assertEqual(dbook.sheets()[1][0][0], 60)
+
+    def test_1904_round_trip_in_both_reader_modes(self):
+        data = build_xlsx([
+            ('A1', 'date', None),
+            ('A2', dt.datetime(2024, 5, 6, 13, 45, 30), 'yyyy-mm-dd hh:mm:ss'),
+        ], epoch=1904)
+        for read_only in (True, False):
+            with self.subTest(read_only=read_only):
+                dset = self.load(data, read_only=read_only)
+                exported = dset.export('xlsx')
+                with zipfile.ZipFile(BytesIO(exported)) as archive:
+                    self.assertIn(b'date1904="1"', archive.read('xl/workbook.xml'))
+                again = self.load(exported, read_only=read_only)
+                self.assertEqual(again.dict, dset.dict)
+
+    def test_invalid_date_serial_is_exported_by_tablib(self):
+        self.assertTrue(issubclass(InvalidDateSerial, ValueError))
+        self.assertIs(tablib.InvalidDateSerial, InvalidDateSerial)
+
+    def test_detect_still_works_with_date_metadata(self):
+        data = build_xlsx([
+            ('A1', 'date', None),
+            ('A2', dt.date(2024, 5, 6), 'yyyy-mm-dd'),
+        ])
+        self.assertEqual(detect_format(data), 'xlsx')
 
 
 class JSONTests(BaseTestCase):

@@ -154,6 +154,17 @@ class Dataset:
 
     """
 
+    #: Attributes an importer may set on a dataset to describe the data it
+    #: read.  They are removed by :meth:`wipe`, because they describe content
+    #: that a wipe discards.  Importers adding their own metadata should list
+    #: the attribute names here on a subclass.
+    _import_metadata_attributes = ('xlsx_date_epoch', 'date_provenance')
+
+    #: The subset of :attr:`_import_metadata_attributes` that is keyed by row
+    #: and column positions.  It is dropped when rows are removed, because it
+    #: would describe the wrong rows.
+    _positional_metadata_attributes = ('date_provenance',)
+
     def __init__(self, *args, **kwargs):
         self._data = [Row(arg) for arg in args]
         self.__headers = None
@@ -193,6 +204,7 @@ class Dataset:
     def __setitem__(self, key, value):
         self._validate(value)
         self._data[key] = Row(value)
+        self._drop_positional_metadata()
 
     def __delitem__(self, key):
         if isinstance(key, str):
@@ -214,6 +226,7 @@ class Dataset:
                 raise KeyError
         else:
             del self._data[key]
+        self._drop_positional_metadata()
 
     def __repr__(self):
         try:
@@ -464,6 +477,7 @@ class Dataset:
                 row = list(row)
                 row.insert(pos, func(row))
         self._data.insert(index, Row(row, tags=tags))
+        self._drop_positional_metadata()
 
     def rpush(self, row, tags=()):
         """Adds a row to the end of the :class:`Dataset`.
@@ -575,6 +589,7 @@ class Dataset:
                 self._data[i] = row
         else:
             self._data = [Row([row]) for row in col]
+        self._drop_positional_metadata()
 
     def rpush_col(self, col, header=None):
         """Adds a column to the end of the :class:`Dataset`.
@@ -651,6 +666,9 @@ class Dataset:
         """
         _dset = copy(self)
         _dset._data = [row for row in _dset._data if row.has_tag(tag)]
+        # Rows have been removed, so row-keyed metadata no longer describes
+        # the remaining rows.
+        _dset._drop_positional_metadata()
 
         return _dset
 
@@ -689,6 +707,7 @@ class Dataset:
                     row = item
                 _dset.append(row=row)
 
+        _dset._copy_non_positional_metadata(self)
         return _dset
 
     def _transpose_with_headers(self):
@@ -713,6 +732,7 @@ class Dataset:
             row_data = [column] + self.get_col(index)
             row_data = Row(row_data)
             _dset.append(row=row_data)
+        _dset._copy_non_positional_metadata(self)
         return _dset
 
     def _transpose_without_headers(self):
@@ -727,6 +747,7 @@ class Dataset:
             row_data = self.get_col(index)
             _dset.append(row=row_data)
 
+        _dset._copy_non_positional_metadata(self)
         return _dset
 
     def transpose(self):
@@ -763,6 +784,9 @@ class Dataset:
 
         rows_to_stack.extend(other_rows)
         _dset._data = rows_to_stack
+        # Rows from *other* are not covered by positional metadata imported
+        # from *self*, so that metadata no longer describes the data.
+        _dset._drop_positional_metadata()
 
         return _dset
 
@@ -804,6 +828,9 @@ class Dataset:
 
         _dset.headers = new_headers
 
+        _dset._copy_non_positional_metadata(self)
+        _dset._copy_non_positional_metadata(other)
+
         return _dset
 
     def remove_duplicates(self):
@@ -813,11 +840,40 @@ class Dataset:
         self._data[:] = [
             row for row in self._data if not (tuple(row) in seen or seen.add(tuple(row)))
         ]
+        self._drop_positional_metadata()
 
     def wipe(self):
         """Removes all content and headers from the :class:`Dataset` object."""
         self._data = []
         self.__headers = None
+        # Import metadata describes the content being wiped, so it must not
+        # survive and be applied to a later export.
+        for attribute in self._import_metadata_attributes:
+            self.__dict__.pop(attribute, None)
+
+    def _drop_positional_metadata(self):
+        """Remove import metadata keyed by row and column positions.
+
+        Used when rows are removed, so the remaining data is not described by
+        records that pointed at the old row numbers.
+        """
+        for attribute in self._positional_metadata_attributes:
+            self.__dict__.pop(attribute, None)
+
+    def _copy_non_positional_metadata(self, other):
+        """Copy import metadata from *other* that does not depend on position.
+
+        Deriving a new dataset (by sorting, subsetting, transposing or stacking
+        columns) keeps values that are not tied to row and column numbers, such
+        as the workbook date system a date serial number belongs to.
+        """
+        positional = set(self._positional_metadata_attributes)
+        for attribute in self._import_metadata_attributes:
+            if attribute in positional:
+                continue
+            value = other.__dict__.get(attribute)
+            if value is not None:
+                setattr(self, attribute, value)
 
     def subset(self, rows=None, cols=None):
         """Returns a new instance of the :class:`Dataset`,
@@ -856,6 +912,7 @@ class Dataset:
             if row_no in rows:
                 _dset.append(row=Row(data_row))
 
+        _dset._copy_non_positional_metadata(self)
         return _dset
 
 

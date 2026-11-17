@@ -20,3 +20,13 @@ class HeadersNeeded(TablibException, AttributeError):
 
 class UnsupportedFormat(TablibException, NotImplementedError):
     """Format not supported."""
+
+
+class InvalidDateSerial(TablibException, ValueError):
+    """A date cell holds a serial value that cannot be turned into a date.
+
+    Raised while importing an XLSX sheet when a date-formatted cell holds an
+    anomalous serial value (the fictitious 1900-02-29, a negative serial, or a
+    serial outside the representable date range) and the ``date_serial_policy``
+    is ``'reject'``.
+    """
