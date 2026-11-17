@@ -143,6 +143,28 @@ push_to_gateway('localhost:9091', job='batchA', registry=registry,
                 grouping_key=instance_ip_grouping_key())
 ```
 
+### `parse_grouping_path(path)`
+
+Parses a pushgateway grouping path (or full request URL) back into its
+`(job, grouping_key)` identity. All three pushgateway operations build their
+URLs from the same grouping identity, so the parsed result identifies exactly
+the group that `push_to_gateway`, `pushadd_to_gateway` and
+`delete_from_gateway` would target.
+
+- Values carrying the protocol's `@base64` marker are decoded; an empty label
+  value is returned as `''` and stays distinct from a label that is absent.
+- Label ordering in the path does not affect the returned grouping key.
+- Grouping key label names that are empty, contain `/`, or end with
+  `@base64` are rejected with `ValueError` when pushing, since they would
+  make the grouping path ambiguous.
+
+```python
+from prometheus_client import parse_grouping_path
+
+parse_grouping_path('http://pushgateway:9091/metrics/job/batchA/instance@base64/=')
+# ('batchA', {'instance': ''})
+```
+
 ## Handlers
 
 A handler is a callable with the signature:

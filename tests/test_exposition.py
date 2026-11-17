@@ -13,7 +13,7 @@ from prometheus_client import (
     CollectorRegistry, CONTENT_TYPE_LATEST, CONTENT_TYPE_PLAIN_0_0_4,
     CONTENT_TYPE_PLAIN_1_0_0, core, Counter, delete_from_gateway, Enum, Gauge,
     generate_latest, Histogram, Info, instance_ip_grouping_key, Metric,
-    push_to_gateway, pushadd_to_gateway, Summary,
+    parse_grouping_path, push_to_gateway, pushadd_to_gateway, Summary,
 )
 from prometheus_client.core import GaugeHistogramMetricFamily, Timestamp
 from prometheus_client.exposition import (
@@ -477,6 +477,140 @@ class TestPushGateway(unittest.TestCase):
         handler = subclass.factory(self.registry)
 
         self.assertTrue(issubclass(handler, (MetricsHandler, subclass)))
+
+
+class TestPushGatewayGroupingIdentity(unittest.TestCase):
+    """Grouping identity tests using a local recording handler.
+
+    No pushgateway server is involved: the handler simply records the
+    requests it would have sent.
+    """
+
+    def setUp(self):
+        self.registry = CollectorRegistry()
+        Gauge('g', 'help', registry=self.registry)
+        self.requests = []
+
+        def recording_handler(url, method, timeout, headers, data):
+            self.requests.append({
+                'url': url, 'method': method, 'timeout': timeout,
+                'headers': list(headers), 'data': data,
+            })
+            return lambda: None
+
+        self.handler = recording_handler
+        self.gateway = 'http://pushgateway.example:9091'
+
+    def _grouping(self, request):
+        """Parse the recorded request URL back into its grouping identity."""
+        return parse_grouping_path(request['url'])
+
+    def test_all_operations_target_same_group(self):
+        grouping_key = {'a': '1', 'b': 'x/y', 'empty': ''}
+        push_to_gateway(self.gateway, 'my/job', self.registry,
+                        grouping_key=grouping_key, handler=self.handler)
+        pushadd_to_gateway(self.gateway, 'my/job', self.registry,
+                           grouping_key=grouping_key, handler=self.handler)
+        delete_from_gateway(self.gateway, 'my/job',
+                            grouping_key=grouping_key, handler=self.handler)
+
+        self.assertEqual(['PUT', 'POST', 'DELETE'],
+                         [r['method'] for r in self.requests])
+        paths = [urllib.parse.urlparse(r['url']).path for r in self.requests]
+        self.assertEqual(3, len(paths))
+        self.assertEqual(paths[0], paths[1])
+        self.assertEqual(paths[1], paths[2])
+        self.assertEqual(
+            ('my/job', {'a': '1', 'b': 'x/y', 'empty': ''}),
+            self._grouping(self.requests[0]))
+
+    def test_key_order_does_not_affect_identity(self):
+        push_to_gateway(self.gateway, 'job', self.registry,
+                        grouping_key={'b': '2', 'a': '1'}, handler=self.handler)
+        delete_from_gateway(self.gateway, 'job',
+                            grouping_key={'a': '1', 'b': '2'}, handler=self.handler)
+        self.assertEqual(
+            urllib.parse.urlparse(self.requests[0]['url']).path,
+            urllib.parse.urlparse(self.requests[1]['url']).path)
+
+    def test_empty_label_value_distinct_from_missing_label(self):
+        push_to_gateway(self.gateway, 'job', self.registry,
+                        grouping_key={'a': ''}, handler=self.handler)
+        push_to_gateway(self.gateway, 'job', self.registry,
+                        grouping_key={}, handler=self.handler)
+        with_empty, without = self.requests
+        self.assertNotEqual(with_empty['url'], without['url'])
+        self.assertEqual(('job', {'a': ''}), self._grouping(with_empty))
+        self.assertEqual(('job', {}), self._grouping(without))
+        # The empty value keeps its protocol-required base64 marker.
+        self.assertIn('/a@base64/=', urllib.parse.urlparse(with_empty['url']).path)
+
+    def test_base64_marker_preserved_for_special_values(self):
+        grouping_key = {'slash': 'a/b', 'space': 'a b', 'dot': '.', 'dots': '..'}
+        push_to_gateway(self.gateway, 'job', self.registry,
+                        grouping_key=grouping_key, handler=self.handler)
+        path = urllib.parse.urlparse(self.requests[0]['url']).path
+        for name in ('slash', 'space', 'dot', 'dots'):
+            self.assertIn(f'/{name}@base64/', path)
+        self.assertEqual(('job', grouping_key), self._grouping(self.requests[0]))
+
+    def test_non_ascii_and_slash_job_roundtrip(self):
+        grouping_key = {'instance': '实例/α'}
+        push_to_gateway(self.gateway, '作业/1', self.registry,
+                        grouping_key=grouping_key, handler=self.handler)
+        self.assertEqual(('作业/1', grouping_key), self._grouping(self.requests[0]))
+
+    def test_parse_grouping_path_accepts_full_url_and_path(self):
+        push_to_gateway(self.gateway, 'my_job', self.registry,
+                        grouping_key={'a': '9'}, handler=self.handler)
+        url = self.requests[0]['url']
+        expected = ('my_job', {'a': '9'})
+        self.assertEqual(expected, parse_grouping_path(url))
+        self.assertEqual(expected, parse_grouping_path(urllib.parse.urlparse(url).path))
+        self.assertEqual(expected, parse_grouping_path('job/my_job/a/9'))
+
+    def test_ambiguous_key_names_rejected(self):
+        for bad_key in ('a@base64', 'x/y', ''):
+            for operation in (
+                    lambda: push_to_gateway(self.gateway, 'job', self.registry,
+                                            grouping_key={bad_key: '1'}, handler=self.handler),
+                    lambda: pushadd_to_gateway(self.gateway, 'job', self.registry,
+                                               grouping_key={bad_key: '1'}, handler=self.handler),
+                    lambda: delete_from_gateway(self.gateway, 'job',
+                                                grouping_key={bad_key: '1'}, handler=self.handler),
+            ):
+                with self.assertRaises(ValueError):
+                    operation()
+        self.assertEqual([], self.requests)
+
+    def test_auth_handler_receives_final_url(self):
+        seen = []
+
+        def my_auth_handler(url, method, timeout, headers, data):
+            # Emulates an auth handler: records the final URL it received
+            # and adds credentials, without any network access.
+            def handle():
+                headers.append(('Authorization', 'Basic Zm9vOmJhcg=='))
+                seen.append((url, method, list(headers)))
+
+            return handle
+
+        push_to_gateway(self.gateway, 'my/job', self.registry,
+                        grouping_key={'a': ''}, handler=my_auth_handler)
+        self.assertEqual(1, len(seen))
+        url, method, headers = seen[0]
+        self.assertEqual('PUT', method)
+        parsed = urllib.parse.urlparse(url)
+        self.assertEqual('pushgateway.example', parsed.hostname)
+        self.assertEqual(9091, parsed.port)
+        self.assertEqual(('my/job', {'a': ''}), parse_grouping_path(url))
+        self.assertIn(('Authorization', 'Basic Zm9vOmJhcg=='), headers)
+
+    def test_parse_rejects_malformed_paths(self):
+        for bad in ('', '/', '/metrics', 'job', 'job/a/b',
+                    '/metrics/instance/1', 'job/a/job/b', 'job/a/x/1/x/2'):
+            with self.assertRaises(ValueError, msg=bad):
+                parse_grouping_path(bad)
 
 
 @pytest.fixture

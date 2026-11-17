@@ -13,7 +13,7 @@ from typing import (
     Any, Callable, Dict, List, Literal, Optional, Sequence, Tuple, Union,
 )
 from urllib.error import HTTPError
-from urllib.parse import parse_qs, quote_plus, urlparse
+from urllib.parse import parse_qs, quote_plus, unquote_plus, urlparse
 from urllib.request import (
     BaseHandler, build_opener, HTTPHandler, HTTPRedirectHandler, HTTPSHandler,
     Request,
@@ -41,6 +41,7 @@ __all__ = (
     'make_asgi_app',
     'make_wsgi_app',
     'MetricsHandler',
+    'parse_grouping_path',
     'push_to_gateway',
     'pushadd_to_gateway',
     'start_http_server',
@@ -769,13 +770,7 @@ def _use_gateway(
         gateway = f'http://{gateway}'
 
     gateway = gateway.rstrip('/')
-    url = '{}/metrics/{}/{}'.format(gateway, *_escape_grouping_key("job", job))
-
-    if grouping_key is None:
-        grouping_key = {}
-    url += ''.join(
-        '/{}/{}'.format(*_escape_grouping_key(str(k), str(v)))
-        for k, v in sorted(grouping_key.items()))
+    url = '{}/metrics/{}'.format(gateway, _grouping_path(job, grouping_key))
 
     data = b''
     headers: List[Tuple[str, str]] = []
@@ -818,18 +813,101 @@ def _compress_payload(data: bytes, compression: CompressionType) -> Tuple[bytes,
     raise ValueError(f"Unsupported compression type: {compression}")
 
 
-def _escape_grouping_key(k, v):
+_BASE64_SUFFIX = '@base64'
+"""Marker appended to label names whose values are base64-encoded in the URL."""
+
+
+def _validate_grouping_key_name(name: str) -> None:
+    """Reject label names that would make the grouping path ambiguous."""
+    if not name:
+        raise ValueError('Grouping key label names must not be empty.')
+    if '/' in name:
+        raise ValueError(
+            f'Grouping key label name {name!r} must not contain "/", '
+            'as it would corrupt the grouping path structure.')
+    if name.endswith(_BASE64_SUFFIX):
+        raise ValueError(
+            f'Grouping key label name {name!r} must not end with "{_BASE64_SUFFIX}", '
+            'as it would be indistinguishable from the base64 escaping marker.')
+
+
+def _escape_grouping_key(k: str, v: str) -> Tuple[str, str]:
+    _validate_grouping_key_name(k)
     if v == "":
         # Per https://github.com/prometheus/pushgateway/pull/346.
-        return k + "@base64", "="
+        return k + _BASE64_SUFFIX, "="
     elif '/' in v or ' ' in v or v in ('.', '..'):
         # Added in Pushgateway 0.9.0.
         # Use base64 encoding for values containing slashes or spaces, and
         # for "." and "..", which would otherwise be removed from the URL
         # path as dot segments (the Pushgateway answers with a redirect).
-        return k + "@base64", base64.urlsafe_b64encode(v.encode("utf-8")).decode("utf-8")
+        return k + _BASE64_SUFFIX, base64.urlsafe_b64encode(v.encode("utf-8")).decode("utf-8")
     else:
         return k, quote_plus(v)
+
+
+def _unescape_grouping_key(k: str, v: str) -> Tuple[str, str]:
+    """Inverse of _escape_grouping_key."""
+    if k.endswith(_BASE64_SUFFIX):
+        name = k[:-len(_BASE64_SUFFIX)]
+        _validate_grouping_key_name(name)
+        if v == '=':
+            # Empty string, encoded as "=" so the path segment is not empty.
+            return name, ''
+        return name, base64.urlsafe_b64decode(v.encode("utf-8")).decode("utf-8")
+    return k, unquote_plus(v)
+
+
+def _grouping_path(job: str, grouping_key: Optional[Dict[str, Any]]) -> str:
+    """Build the escaped URL path identifying a pushgateway group.
+
+    This is the single definition of grouping identity shared by
+    push_to_gateway, pushadd_to_gateway and delete_from_gateway, so all
+    three operations are guaranteed to address the same group. Label
+    names are sorted, so the ordering of the grouping_key mapping does
+    not affect the resulting identity.
+    """
+    path = '{}/{}'.format(*_escape_grouping_key('job', str(job)))
+    if grouping_key:
+        path += ''.join(
+            '/{}/{}'.format(*_escape_grouping_key(str(k), str(v)))
+            for k, v in sorted(grouping_key.items()))
+    return path
+
+
+def parse_grouping_path(path: str) -> Tuple[str, Dict[str, str]]:
+    """Parse a pushgateway grouping path back into its identity.
+
+    Accepts either a full request path (e.g. '/metrics/job/my_job/a/9')
+    or just the grouping portion ('job/my_job/a/9'), and returns a
+    (job, grouping_key) tuple. Base64-encoded values (marked with the
+    '@base64' label name suffix) are decoded, and an empty label value
+    is returned as '' rather than being confused with a missing label.
+    Label ordering in the path does not affect the result.
+    """
+    path = urlparse(path).path if '://' in path else path
+    segments = [segment for segment in path.split('/') if segment]
+    if segments and segments[0] == 'metrics':
+        segments = segments[1:]
+    if not segments or len(segments) % 2 != 0:
+        raise ValueError(
+            f'Invalid grouping path {path!r}: expected name/value segment pairs.')
+
+    job: Optional[str] = None
+    grouping_key: Dict[str, str] = {}
+    for i in range(0, len(segments), 2):
+        name, value = _unescape_grouping_key(segments[i], segments[i + 1])
+        if name == 'job':
+            if job is not None:
+                raise ValueError(f'Invalid grouping path {path!r}: duplicate "job" label.')
+            job = value
+        else:
+            if name in grouping_key:
+                raise ValueError(f'Invalid grouping path {path!r}: duplicate label {name!r}.')
+            grouping_key[name] = value
+    if job is None:
+        raise ValueError(f'Invalid grouping path {path!r}: missing "job" label.')
+    return job, grouping_key
 
 
 def instance_ip_grouping_key() -> Dict[str, Any]:
