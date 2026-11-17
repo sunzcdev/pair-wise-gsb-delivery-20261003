@@ -1,4 +1,5 @@
 import gzip
+import http.client
 from http.server import BaseHTTPRequestHandler, HTTPServer
 import os
 import ssl
@@ -17,8 +18,9 @@ from prometheus_client import (
 )
 from prometheus_client.core import GaugeHistogramMetricFamily, Timestamp
 from prometheus_client.exposition import (
-    basic_auth_handler, choose_encoder, default_handler, MetricsHandler,
-    passthrough_redirect_handler, start_wsgi_server, tls_auth_handler,
+    basic_auth_handler, choose_compression, choose_encoder, default_handler,
+    gzip_accepted, MetricsHandler, passthrough_redirect_handler,
+    start_wsgi_server, tls_auth_handler,
 )
 import prometheus_client.openmetrics.exposition as openmetrics
 
@@ -674,6 +676,104 @@ class TestChooseEncoder(unittest.TestCase):
                 exp = generator(self.registry).decode('utf-8')
                 self.assert_is_escaped(exp)
                 self.assert_is_prom(exp)
+
+
+class TestChooseCompression(unittest.TestCase):
+    def test_negotiation(self):
+        for accept_encoding_header, expected in (
+            (None, None),
+            ('', None),
+            ('gzip', 'gzip'),
+            ('GZip', 'gzip'),
+            ('gzip;q=1.0', 'gzip'),
+            ('gzip;q=0.5', 'gzip'),
+            ('gzip;q=0', None),
+            ('gzip;q=0.0', None),
+            ('gzip;q=bogus', None),
+            ('br, GZip; Q=0', None),
+            ('identity', None),
+            ('identity;q=0.5', None),
+            ('gzip, identity', 'gzip'),
+            ('gzip;q=0, identity', None),
+            ('identity;q=0, gzip;q=0.1', 'gzip'),
+            ('*', 'gzip'),
+            ('*;q=0.5', 'gzip'),
+            ('*;q=0', None),
+            # An explicit gzip entry takes precedence over the wildcard.
+            ('gzip;q=0, *;q=1', None),
+            ('br', None),
+            ('deflate, br', None),
+        ):
+            with self.subTest(accept_encoding_header=accept_encoding_header):
+                self.assertEqual(choose_compression(accept_encoding_header), expected)
+                self.assertEqual(gzip_accepted(accept_encoding_header), expected is not None)
+
+
+class TestMetricsHandlerHTTP(unittest.TestCase):
+    def setUp(self):
+        self.registry = CollectorRegistry()
+        c = Counter('cc', 'A counter', registry=self.registry)
+        c.inc()
+        self.server = HTTPServer(('127.0.0.1', 0), MetricsHandler.factory(self.registry))
+        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.thread.start()
+        self.port = self.server.server_address[1]
+
+    def tearDown(self):
+        self.server.shutdown()
+        self.server.server_close()
+        self.thread.join()
+
+    def request(self, method, headers=None):
+        conn = http.client.HTTPConnection('127.0.0.1', self.port)
+        conn.request(method, '/', headers=headers or {})
+        resp = conn.getresponse()
+        body = resp.read()
+        conn.close()
+        return resp, body
+
+    def test_get_gzip(self):
+        resp, body = self.request('GET', {'Accept-Encoding': 'gzip'})
+        self.assertEqual(resp.status, 200)
+        self.assertEqual(resp.getheader('Content-Encoding'), 'gzip')
+        self.assertEqual(resp.getheader('Vary'), 'Accept-Encoding')
+        self.assertEqual(int(resp.getheader('Content-Length')), len(body))
+        self.assertIn(b'cc_total 1.0', gzip.decompress(body))
+
+    def test_get_gzip_forbidden(self):
+        resp, body = self.request('GET', {'Accept-Encoding': 'gzip;q=0'})
+        self.assertEqual(resp.status, 200)
+        self.assertIsNone(resp.getheader('Content-Encoding'))
+        self.assertEqual(int(resp.getheader('Content-Length')), len(body))
+        self.assertIn(b'cc_total 1.0', body)
+
+    def test_head_matches_get(self):
+        get_resp, get_body = self.request('GET', {'Accept-Encoding': 'gzip'})
+        head_resp, head_body = self.request('HEAD', {'Accept-Encoding': 'gzip'})
+        self.assertEqual(head_resp.status, 200)
+        self.assertEqual(head_body, b'')
+        self.assertEqual(head_resp.getheader('Content-Encoding'), 'gzip')
+        self.assertEqual(head_resp.getheader('Vary'), 'Accept-Encoding')
+        self.assertEqual(
+            head_resp.getheader('Content-Length'),
+            get_resp.getheader('Content-Length'),
+        )
+        self.assertEqual(int(get_resp.getheader('Content-Length')), len(get_body))
+
+    def test_metrics_error(self):
+        class BrokenCollector:
+            def describe(self):
+                return []
+
+            def collect(self):
+                raise RuntimeError('boom')
+
+        self.registry.register(BrokenCollector())
+        resp, body = self.request('GET', {'Accept-Encoding': 'gzip'})
+        self.assertEqual(resp.status, 500)
+        self.assertIsNone(resp.getheader('Content-Encoding'))
+        self.assertEqual(int(resp.getheader('Content-Length')), len(body))
+        self.assertIn(b'boom', body)
 
 
 class TestWsgiTLS(unittest.TestCase):

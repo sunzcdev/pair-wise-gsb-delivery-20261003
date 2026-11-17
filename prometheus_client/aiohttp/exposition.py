@@ -17,23 +17,20 @@ def make_aiohttp_handler(
         # Prepare parameters
         params = {key: request.query.getall(key) for key in request.query.keys()}
         accept_header = ",".join(request.headers.getall(hdrs.ACCEPT, []))
-        accept_encoding_header = ""
-        # Bake output
+        accept_encoding_header = ",".join(request.headers.getall(hdrs.ACCEPT_ENCODING, []))
+        # Bake output. Compression is negotiated uniformly with the other
+        # exporter entry points, honouring quality values and identity.
         status, headers, output = _bake_output(
             registry,
             accept_header,
             accept_encoding_header,
             params,
-            # use AIOHTTP's compression
-            disable_compression=True,
+            disable_compression,
         )
-        response = web.Response(
+        return web.Response(
             status=int(status.split(" ")[0]),
             headers=headers,
             body=output,
         )
-        if not disable_compression:
-            response.enable_compression()
-        return response
 
     return prometheus_handler

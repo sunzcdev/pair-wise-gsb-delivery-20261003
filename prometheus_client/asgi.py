@@ -40,6 +40,10 @@ def make_asgi_app(registry: Collector = REGISTRY, disable_compression: bool = Fa
         ])
         # Bake output
         status, headers, output = _bake_output(registry, accept_header, accept_encoding_header, params, disable_compression)
+        if scope.get('method') == 'HEAD':
+            # HEAD responses carry the same metadata as the corresponding GET
+            # response, but no body.
+            output = b''
         formatted_headers = []
         for header in headers:
             formatted_headers.append(tuple(x.encode('utf8') for x in header))

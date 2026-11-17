@@ -33,9 +33,11 @@ class WSGITest(TestCase):
         # Status code
         self.assertEqual(self.captured_status, "200 OK")
         # Headers
-        num_of_headers = 2 if compressed else 1
+        num_of_headers = 4 if compressed else 3
         self.assertEqual(len(self.captured_headers), num_of_headers)
         self.assertIn(("Content-Type", CONTENT_TYPE_PLAIN_0_0_4), self.captured_headers)
+        self.assertIn(("Content-Length", str(len(outputs[0]))), self.captured_headers)
+        self.assertIn(("Vary", "Accept-Encoding"), self.captured_headers)
         if compressed:
             self.assertIn(("Content-Encoding", "gzip"), self.captured_headers)
         # Body
@@ -122,9 +124,70 @@ class WSGITest(TestCase):
             ("br, GZip; Q=0", False),
             ("gzip;q=0.5", True),
             ("gzip;q=bogus", False),
+            ("identity", False),
+            ("identity;q=0.5", False),
+            ("gzip;q=0, identity", False),
+            ("gzip;q=0, *;q=1", False),
+            ("*", True),
+            ("br, *;q=0.5", True),
+            ("*;q=0", False),
         ]:
             with self.subTest(encoding=encoding):
                 environ = dict(self.environ)
                 environ['HTTP_ACCEPT_ENCODING'] = encoding
                 outputs = app(environ, self.capture)
                 self.assert_outputs(outputs, "counter", "A counter", 2, compressed)
+
+    def test_head(self):
+        # HEAD returns the same metadata as GET, but no body.
+        self.increment_metrics("counter", "A counter", 2)
+        app = make_wsgi_app(self.registry)
+        get_outputs = app(dict(self.environ), self.capture)
+        get_headers = list(self.captured_headers)
+
+        head_environ = dict(self.environ)
+        head_environ['REQUEST_METHOD'] = 'HEAD'
+        head_outputs = app(head_environ, self.capture)
+
+        self.assertEqual(self.captured_status, "200 OK")
+        self.assertEqual(self.captured_headers, get_headers)
+        self.assertEqual(head_outputs, [b''])
+        self.assertEqual(
+            dict(get_headers)["Content-Length"], str(len(get_outputs[0]))
+        )
+
+    def test_head_gzip(self):
+        # HEAD with gzip accepted advertises the compressed GET metadata.
+        self.increment_metrics("counter", "A counter", 2)
+        app = make_wsgi_app(self.registry)
+        environ = dict(self.environ)
+        environ['REQUEST_METHOD'] = 'HEAD'
+        environ['HTTP_ACCEPT_ENCODING'] = 'gzip'
+        outputs = app(environ, self.capture)
+        self.assertEqual(outputs, [b''])
+        self.assertIn(("Content-Encoding", "gzip"), self.captured_headers)
+        self.assertIn(("Vary", "Accept-Encoding"), self.captured_headers)
+        content_length = dict(self.captured_headers)["Content-Length"]
+        self.assertGreater(int(content_length), 0)
+
+    def test_metrics_error(self):
+        # A failing collector must not produce a success status or a
+        # partial compressed body.
+        class BrokenCollector:
+            def describe(self):
+                return []
+
+            def collect(self):
+                raise RuntimeError("boom")
+
+        self.registry.register(BrokenCollector())
+        app = make_wsgi_app(self.registry)
+        environ = dict(self.environ)
+        environ['HTTP_ACCEPT_ENCODING'] = 'gzip'
+        outputs = app(environ, self.capture)
+        self.assertEqual(self.captured_status, "500 Internal Server Error")
+        self.assertNotIn(("Content-Encoding", "gzip"), self.captured_headers)
+        self.assertEqual(
+            dict(self.captured_headers)["Content-Length"], str(len(outputs[0]))
+        )
+        self.assertIn(b"boom", outputs[0])

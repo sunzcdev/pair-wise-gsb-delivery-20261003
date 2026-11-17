@@ -116,9 +116,11 @@ class ASGITest(TestCase):
         # Status code
         self.assertEqual(response_start['status'], 200)
         # Headers
-        num_of_headers = 2 if compressed else 1
+        num_of_headers = 4 if compressed else 3
         self.assertEqual(len(response_start['headers']), num_of_headers)
         self.assertIn((b"Content-Type", CONTENT_TYPE_PLAIN_0_0_4.encode('utf8')), response_start['headers'])
+        self.assertIn((b"Content-Length", str(len(response_body['body'])).encode('utf8')), response_start['headers'])
+        self.assertIn((b"Vary", b"Accept-Encoding"), response_start['headers'])
         if compressed:
             self.assertIn((b"Content-Encoding", b"gzip"), response_start['headers'])
         # Body
@@ -184,6 +186,35 @@ class ASGITest(TestCase):
         # Assert outputs are not compressed.
         outputs = self.get_all_output()
         self.assert_outputs(outputs, metric_name, help_text, increments, compressed=False)
+
+    def test_gzip_forbidden(self):
+        # A client may explicitly forbid gzip with a zero quality value.
+        metric_name = "counter"
+        help_text = "A counter"
+        increments = 2
+        self.increment_metrics(metric_name, help_text, increments)
+        app = make_asgi_app(self.registry)
+        self.scope["headers"] = [(b"accept-encoding", b"gzip;q=0, identity")]
+        self.seed_app(app)
+        self.send_input({"type": "http.request", "body": b""})
+        outputs = self.get_all_output()
+        self.assert_outputs(outputs, metric_name, help_text, increments, compressed=False)
+
+    def test_head(self):
+        # HEAD returns the same metadata as GET, but no body.
+        self.increment_metrics("counter", "A counter", 2)
+        app = make_asgi_app(self.registry)
+        self.scope["method"] = "HEAD"
+        self.seed_app(app)
+        self.send_default_request()
+        outputs = self.get_all_output()
+        self.assertEqual(len(outputs), 2)
+        response_start = outputs[0]
+        self.assertEqual(response_start['status'], 200)
+        header_names = [name for name, _ in response_start['headers']]
+        self.assertIn(b"Content-Length", header_names)
+        self.assertIn(b"Vary", header_names)
+        self.assertEqual(outputs[1]['body'], b'')
 
     def test_openmetrics_encoding(self):
         """Response content type is application/openmetrics-text when appropriate Accept header is in request"""

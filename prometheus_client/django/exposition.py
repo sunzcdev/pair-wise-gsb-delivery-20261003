@@ -38,6 +38,13 @@ class PrometheusDjangoView(View):
             headers=headers,
         )
 
+    def head(self, request, *args, **kwargs):
+        # HEAD responses carry the same metadata (including Content-Length)
+        # as the corresponding GET response, but no body.
+        response = self.get(request, *args, **kwargs)
+        response.content = b""
+        return response
+
     def options(self, request, *args, **kwargs):
         return HttpResponse(
             status=200,

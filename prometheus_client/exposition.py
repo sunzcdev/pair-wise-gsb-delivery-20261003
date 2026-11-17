@@ -119,12 +119,27 @@ def _bake_output(registry, accept_header, accept_encoding_header, params, disabl
     encoder, content_type = choose_encoder(accept_header)
     if 'name[]' in params:
         registry = registry.restricted_registry(params['name[]'])
-    output = encoder(registry)
+    try:
+        output = encoder(registry)
+    except Exception as exc:
+        # Metric generation failed. Report a failure status with a plain,
+        # unencoded body rather than emitting a success status followed by
+        # a partial (compressed) body.
+        error_output = f'Error generating metrics: {exc}\n'.encode('utf-8')
+        return '500 Internal Server Error', [
+            ('Content-Type', 'text/plain; charset=utf-8'),
+            ('Content-Length', str(len(error_output))),
+        ], error_output
+    # Negotiate the content encoding. Compression is only applied when the
+    # client accepts it with a non-zero quality value.
     headers = [('Content-Type', content_type)]
-    # If gzip encoding required, gzip the output.
-    if not disable_compression and gzip_accepted(accept_encoding_header):
+    if not disable_compression and choose_compression(accept_encoding_header) == 'gzip':
         output = gzip.compress(output)
         headers.append(('Content-Encoding', 'gzip'))
+    # Content-Length and Vary must reflect the actual (possibly compressed)
+    # encoding of the body.
+    headers.append(('Content-Length', str(len(output))))
+    headers.append(('Vary', 'Accept-Encoding'))
     return '200 OK', headers, output
 
 
@@ -140,12 +155,12 @@ def make_wsgi_app(registry: Collector = REGISTRY, disable_compression: bool = Fa
 
         if method == 'OPTIONS':
             status = '200 OK'
-            headers = [('Allow', 'OPTIONS,GET')]
+            headers = [('Allow', 'OPTIONS,GET,HEAD')]
             output = b''
-        elif method != 'GET':
+        elif method not in ('GET', 'HEAD'):
             status = '405 Method Not Allowed'
-            headers = [('Allow', 'OPTIONS,GET')]
-            output = '# HTTP {}: {}; use OPTIONS or GET\n'.format(status, method).encode()
+            headers = [('Allow', 'OPTIONS,GET,HEAD')]
+            output = '# HTTP {}: {}; use OPTIONS, GET or HEAD\n'.format(status, method).encode()
         elif environ['PATH_INFO'] == '/favicon.ico':
             # Serve empty response for browsers
             status = '200 OK'
@@ -156,6 +171,10 @@ def make_wsgi_app(registry: Collector = REGISTRY, disable_compression: bool = Fa
             # constrained to the documented /metrics, but any path is allowed.
             # Bake output
             status, headers, output = _bake_output(registry, accept_header, accept_encoding_header, params, disable_compression)
+            if method == 'HEAD':
+                # HEAD responses carry the same metadata as the corresponding
+                # GET response, but no body.
+                output = b''
         # Return output
         start_response(status, headers)
         return [output]
@@ -437,22 +456,48 @@ def _get_escaping(accept_header: List[str]) -> str:
     return openmetrics.UNDERSCORES
 
 
-def gzip_accepted(accept_encoding_header: str) -> bool:
-    accept_encoding_header = accept_encoding_header or ''
-    for accepted in accept_encoding_header.split(','):
-        encoding, *params = accepted.split(';')
-        if encoding.strip().lower() != 'gzip':
+def _parse_accept_encoding(accept_encoding_header: Optional[str]) -> Dict[str, float]:
+    """Parse an Accept-Encoding header into a mapping of encoding to quality.
+
+    Encoding names are lowercased. Entries with an unparseable quality value
+    are treated as unacceptable (q=0)."""
+    qualities: Dict[str, float] = {}
+    for entry in (accept_encoding_header or '').split(','):
+        entry = entry.strip()
+        if not entry:
             continue
+        encoding, *params = entry.split(';')
+        encoding = encoding.strip().lower()
+        if not encoding:
+            continue
+        quality = 1.0
         for param in params:
-            key, sep, value = param.strip().partition('=')
+            key, sep, value = param.partition('=')
             if sep and key.strip().lower() == 'q':
                 try:
                     quality = float(value.strip())
                 except ValueError:
-                    return False
-                return 0 < quality <= 1
-        return True
-    return False
+                    quality = 0.0
+        qualities[encoding] = quality
+    return qualities
+
+
+def choose_compression(accept_encoding_header: Optional[str]) -> Optional[str]:
+    """Choose a response Content-Encoding for an Accept-Encoding header.
+
+    Returns 'gzip' if the client accepts gzip, either explicitly or via the
+    '*' wildcard, with a non-zero quality value. Returns None (the identity
+    encoding) otherwise, including when gzip is explicitly forbidden with
+    'gzip;q=0'. An explicit gzip entry takes precedence over the wildcard.
+    """
+    qualities = _parse_accept_encoding(accept_encoding_header)
+    if qualities.get('gzip', qualities.get('*', 0.0)) > 0:
+        return 'gzip'
+    return None
+
+
+def gzip_accepted(accept_encoding_header: str) -> bool:
+    return choose_compression(accept_encoding_header) is not None
 
 
 class MetricsHandler(BaseHTTPRequestHandler):
@@ -460,6 +505,12 @@ class MetricsHandler(BaseHTTPRequestHandler):
     registry: Collector = REGISTRY
 
     def do_GET(self) -> None:
+        self._serve_metrics(send_body=True)
+
+    def do_HEAD(self) -> None:
+        self._serve_metrics(send_body=False)
+
+    def _serve_metrics(self, send_body: bool) -> None:
         # Prepare parameters
         registry = self.registry
         accept_header = self.headers.get('Accept')
@@ -467,12 +518,14 @@ class MetricsHandler(BaseHTTPRequestHandler):
         params = parse_qs(urlparse(self.path).query)
         # Bake output
         status, headers, output = _bake_output(registry, accept_header, accept_encoding_header, params, False)
-        # Return output
+        # Return output. For HEAD requests only the metadata (status line and
+        # headers) of the corresponding GET response is sent, without a body.
         self.send_response(int(status.split(' ')[0]))
         for header in headers:
             self.send_header(*header)
         self.end_headers()
-        self.wfile.write(output)
+        if send_body:
+            self.wfile.write(output)
 
     def log_message(self, format: str, *args: Any) -> None:
         """Log nothing."""
