@@ -9,14 +9,16 @@ import pytest
 
 from prometheus_client import metrics
 from prometheus_client.core import (
-    CollectorRegistry, Counter, CounterMetricFamily, DuplicateTimeseries, Enum,
-    Gauge, GaugeHistogramMetricFamily, GaugeMetricFamily, Histogram,
-    HistogramMetricFamily, Info, InfoMetricFamily, Metric, Sample,
+    CollectorRegistry, CompositeRegistry, Counter, CounterMetricFamily,
+    DuplicateTimeseries, Enum, Gauge, GaugeHistogramMetricFamily,
+    GaugeMetricFamily, Histogram, HistogramMetricFamily, Info,
+    InfoMetricFamily, Metric, NamespaceConflict, NamespaceView, Sample,
     StateSetMetricFamily, Summary, SummaryMetricFamily, UntypedMetricFamily,
 )
 from prometheus_client.decorator import getargspec
 from prometheus_client.exposition import generate_latest
 from prometheus_client.metrics import _get_use_created
+from prometheus_client.openmetrics import exposition as openmetrics
 from prometheus_client.validation import (
     disable_legacy_validation, enable_legacy_validation,
 )
@@ -1258,6 +1260,237 @@ class TestCollectorRegistry(unittest.TestCase):
         m.samples = [Sample('target_info', {'foo': 'bar'}, 1)]
         for _ in registry.restricted_registry(['target_info', 's_sum']).collect():
             self.assertFalse(registry._lock.locked())
+
+
+class TestCompositeRegistry(unittest.TestCase):
+    def setUp(self):
+        self.a = CollectorRegistry()
+        self.b = CollectorRegistry()
+
+    def _combined(self, *pairs):
+        return CompositeRegistry(pairs)
+
+    def test_namespace_applied_to_family_and_derived_samples(self):
+        Histogram('lat', 'Latency', buckets=(1, 2), registry=self.a).observe(1.5)
+        Counter('calls_total', 'Calls', registry=self.b).inc(3)
+
+        composite = CompositeRegistry([(self.a, 'svc'), (self.b, 'db')])
+        metrics = {m.name: m for m in composite.collect()}
+
+        self.assertEqual({'svc_lat', 'db_calls'}, set(metrics))
+        self.assertEqual(
+            ['svc_lat_bucket', 'svc_lat_bucket', 'svc_lat_bucket',
+             'svc_lat_count', 'svc_lat_sum', 'svc_lat_created'],
+            [s.name for s in metrics['svc_lat'].samples])
+        self.assertEqual(
+            ['db_calls_total', 'db_calls_created'],
+            [s.name for s in metrics['db_calls'].samples])
+
+    def test_documentation_and_unit_are_preserved(self):
+        Histogram('lat', 'Latency in seconds', unit='seconds',
+                  buckets=(1,), registry=self.a)
+
+        composite = CompositeRegistry([(self.a, 'svc')])
+        [metric] = list(composite.collect())
+
+        self.assertEqual('svc_lat_seconds', metric.name)
+        self.assertEqual('Latency in seconds', metric.documentation)
+        self.assertEqual('seconds', metric.unit)
+        output = openmetrics.generate_latest(composite).decode()
+        self.assertIn('# HELP svc_lat_seconds Latency in seconds\n', output)
+        self.assertIn('# UNIT svc_lat_seconds seconds\n', output)
+
+    def test_source_registry_keeps_original_names(self):
+        Histogram('lat', 'Latency', buckets=(1,), registry=self.a)
+
+        composite = CompositeRegistry([(self.a, 'svc')])
+        list(composite.collect())
+
+        self.assertEqual(['lat'], [m.name for m in self.a.collect()])
+        self.assertEqual(
+            ['lat_bucket', 'lat_bucket', 'lat_count', 'lat_sum', 'lat_created'],
+            [s.name for m in self.a.collect() for s in m.samples])
+
+    def test_repeated_collection_does_not_accumulate_prefix(self):
+        Counter('calls_total', 'Calls', registry=self.a).inc()
+        composite = CompositeRegistry([(self.a, 'svc')])
+
+        for _ in range(3):
+            self.assertEqual(['svc_calls'], [m.name for m in composite.collect()])
+            self.assertEqual(
+                ['svc_calls_total', 'svc_calls_created'],
+                [s.name for m in composite.collect() for s in m.samples])
+        self.assertEqual(['calls'], [m.name for m in self.a.collect()])
+
+    def test_namespace_view_is_read_only_and_idempotent(self):
+        Counter('calls_total', 'Calls', registry=self.a)
+        view = NamespaceView(self.a, 'svc')
+
+        self.assertIs(self.a, view.registry)
+        self.assertEqual('svc', view.namespace)
+        self.assertEqual(['svc_calls'], [m.name for m in view.collect()])
+        self.assertEqual(['svc_calls'], [m.name for m in view.collect()])
+
+    def test_conflict_between_namespaces_reported_before_collect(self):
+        # 'svc' + 'db_queue' and 'svc_db' + 'queue' both publish svc_db_queue.
+        Gauge('db_queue', 'Queue depth', registry=self.a)
+        Gauge('queue', 'Queue depth', registry=self.b)
+
+        with self.assertRaises(NamespaceConflict) as caught:
+            CompositeRegistry([(self.a, 'svc'), (self.b, 'svc_db')])
+        self.assertEqual({'svc_db_queue'}, caught.exception.duplicates)
+        self.assertEqual(('svc', 'svc_db'), caught.exception.namespaces['svc_db_queue'])
+        self.assertTrue(isinstance(caught.exception, DuplicateTimeseries))
+
+    def test_conflict_across_namespace_boundary_reported(self):
+        # 'a_b' + 'c' and 'a' + 'b_c' both publish a_b_c.
+        Gauge('c', 'help', registry=self.a)
+        Gauge('b_c', 'help', registry=self.b)
+
+        with self.assertRaises(NamespaceConflict) as caught:
+            CompositeRegistry([(self.a, 'a_b'), (self.b, 'a')])
+        self.assertEqual({'a_b_c'}, caught.exception.duplicates)
+        self.assertEqual(('a', 'a_b'), caught.exception.namespaces['a_b_c'])
+
+    def test_conflict_on_derived_sample_reported(self):
+        # The histogram publishes x_m_bucket; the same public name is the
+        # whole family name of the gauge under the x_m namespace.
+        Histogram('m', 'help', buckets=(1,), registry=self.a)
+        Gauge('bucket', 'help', registry=self.b)
+
+        with self.assertRaises(NamespaceConflict) as caught:
+            CompositeRegistry([(self.a, 'x'), (self.b, 'x_m')])
+        self.assertEqual({'x_m_bucket'}, caught.exception.duplicates)
+
+    def test_conflict_on_created_sample_reported(self):
+        Counter('c', 'help', registry=self.a)
+        Gauge('created', 'help', registry=self.b)
+
+        with self.assertRaises(NamespaceConflict) as caught:
+            CompositeRegistry([(self.a, 'x'), (self.b, 'x_c')])
+        self.assertEqual({'x_c_created'}, caught.exception.duplicates)
+
+    def test_duplicate_namespace_rejected(self):
+        Gauge('g', 'help', registry=self.a)
+        with self.assertRaises(ValueError):
+            CompositeRegistry([(self.a, 'dup'), (self.b, 'dup')])
+
+    def test_invalid_namespace_rejected(self):
+        self.assertRaises(ValueError, NamespaceView, self.a, '')
+        self.assertRaises(ValueError, NamespaceView, self.a, None)
+
+    def test_conflict_detected_at_collect_for_undescribed_collectors(self):
+        class Bare:
+            def __init__(self, name):
+                self._name = name
+
+            def collect(self):
+                return [GaugeMetricFamily(self._name, 'help', value=1)]
+
+        # No describe() means the clash can only be learnt by collecting, so
+        # it must still be raised before the first metric is yielded. Both
+        # views publish one_x_same.
+        composite = CompositeRegistry([(Bare('x_same'), 'one')])
+        composite.add(Bare('same'), 'one_x')
+
+        yielded = []
+        with self.assertRaises(NamespaceConflict) as caught:
+            for metric in composite.collect():
+                yielded.append(metric)
+        self.assertEqual({'one_x_same'}, caught.exception.duplicates)
+        self.assertEqual([], yielded)
+        self.assertRaises(NamespaceConflict, composite.check)
+
+    def test_known_names_still_checked_when_another_source_is_opaque(self):
+        class Bare:
+            def collect(self):
+                return [GaugeMetricFamily('opaque', 'help', value=1)]
+
+        Gauge('x_same', 'help', registry=self.a)   # -> one_x_same
+        Gauge('same', 'help', registry=self.b)     # -> one_x_same
+
+        composite = CompositeRegistry([(self.a, 'one'), (Bare(), 'zzz')])
+        # The opaque source cannot hide the clash between the two registries
+        # whose declared names are known.
+        with self.assertRaises(NamespaceConflict) as caught:
+            composite.add(self.b, 'one_x')
+        self.assertEqual({'one_x_same'}, caught.exception.duplicates)
+
+    def test_no_false_conflict_across_namespaces(self):
+        Gauge('latency', 'help', registry=self.a)
+        Gauge('latency', 'help', registry=self.b)
+
+        composite = CompositeRegistry([(self.a, 'a'), (self.b, 'b')])
+        self.assertEqual(
+            ['a_latency', 'b_latency'], [m.name for m in composite.collect()])
+
+    def test_restricted_view_uses_public_names(self):
+        Histogram('lat', 'Latency', buckets=(1, 2), registry=self.a).observe(1.5)
+        Counter('calls_total', 'Calls', registry=self.b)
+        composite = CompositeRegistry([(self.a, 'svc'), (self.b, 'db')])
+
+        metrics = list(composite.restricted_registry(['svc_lat_sum']).collect())
+        self.assertEqual(['svc_lat'], [m.name for m in metrics])
+        self.assertEqual(['svc_lat_sum'], [s.name for m in metrics for s in m.samples])
+
+        # The source name is not a public name of the view.
+        self.assertEqual([], list(composite.restricted_registry(['lat_sum']).collect()))
+
+        full = {m.name for m in composite.restricted_registry(
+            ['svc_lat_sum', 'db_calls_total']).collect()}
+        self.assertEqual({'svc_lat', 'db_calls'}, full)
+
+    def test_restricted_view_drops_family_without_selected_samples(self):
+        Gauge('g', 'help', registry=self.a)
+        composite = CompositeRegistry([(self.a, 'svc')])
+        self.assertEqual([], list(composite.restricted_registry(['svc_other']).collect()))
+
+    def test_restricted_view_reports_namespace_conflict(self):
+        class Bare:
+            def __init__(self, name):
+                self._name = name
+
+            def collect(self):
+                return [GaugeMetricFamily(self._name, 'help', value=1)]
+
+        composite = CompositeRegistry([(Bare('x_same'), 'one')])
+        composite.add(Bare('same'), 'one_x')
+        self.assertRaises(
+            NamespaceConflict,
+            lambda: list(composite.restricted_registry(['one_x_same']).collect()))
+
+    def test_exemplar_label_values_are_not_rewritten(self):
+        counter = Counter('jobs_total', 'Jobs', registry=self.a)
+        counter.inc(2, exemplar={'trace_id': 'jobs_total', 'span': 'a_b'})
+
+        composite = CompositeRegistry([(self.a, 'w')])
+        [metric] = list(composite.collect())
+
+        exemplar = metric.samples[0].exemplar
+        self.assertEqual({'trace_id': 'jobs_total', 'span': 'a_b'}, exemplar.labels)
+        # The source object's exemplar is untouched as well.
+        self.assertEqual('jobs_total', counter.collect()[0].samples[0].exemplar.labels['trace_id'])
+
+    def test_get_sample_value_uses_public_names(self):
+        Counter('calls_total', 'Calls', registry=self.a).inc(4)
+        composite = CompositeRegistry([(self.a, 'svc')])
+
+        self.assertEqual(4, composite.get_sample_value('svc_calls_total'))
+        self.assertIsNone(composite.get_sample_value('calls_total'))
+
+    def test_composite_of_composite(self):
+        Counter('calls_total', 'Calls', registry=self.a).inc()
+        inner = CompositeRegistry([(self.a, 'inner')])
+        outer = CompositeRegistry([(inner, 'outer')])
+
+        self.assertEqual(['outer_inner_calls'], [m.name for m in outer.collect()])
+
+    def test_target_info_is_namespaced(self):
+        self.a.set_target_info({'env': 'prod'})
+        composite = CompositeRegistry([(self.a, 'svc')])
+
+        metrics = {m.name: m for m in composite.collect()}
+        self.assertEqual(['svc_target_info'], [s.name for s in metrics['svc_target'].samples])
 
 
 class LegacyValidationContextManager:

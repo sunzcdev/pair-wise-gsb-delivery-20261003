@@ -19,11 +19,18 @@ from .metrics import (
 from .metrics_core import Metric
 from .platform_collector import PLATFORM_COLLECTOR, PlatformCollector
 from .process_collector import PROCESS_COLLECTOR, ProcessCollector
-from .registry import CollectorRegistry, REGISTRY
+from .registry import (
+    CollectorRegistry, CompositeRegistry, NamespaceConflict, NamespaceView,
+    REGISTRY, RestrictedCompositeRegistry,
+)
 
 __all__ = (
     'CollectorRegistry',
     'REGISTRY',
+    'CompositeRegistry',
+    'NamespaceView',
+    'RestrictedCompositeRegistry',
+    'NamespaceConflict',
     'Metric',
     'Counter',
     'Gauge',

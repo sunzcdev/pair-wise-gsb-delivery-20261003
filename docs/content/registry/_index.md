@@ -80,6 +80,19 @@ subset = REGISTRY.restricted_registry(['python_info', 'process_cpu_seconds_total
 output = generate_latest(subset)
 ```
 
+### Combining registries
+
+To expose several registries at once with a stable namespace per registry,
+use [`CompositeRegistry`](../composite-registry/). It is a read-only view: the
+wrapped registries keep their original names.
+
+```python
+from prometheus_client import CompositeRegistry, generate_latest
+
+composite = CompositeRegistry([(first_registry, 'first'), (second_registry, 'second')])
+output = generate_latest(composite)
+```
+
 ### `get_sample_value(name, labels=None)`
 
 Return the current value of a single sample, or `None` if not found. Intended

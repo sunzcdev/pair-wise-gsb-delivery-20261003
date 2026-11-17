@@ -4,12 +4,16 @@ from .metrics_core import (
     HistogramMetricFamily, InfoMetricFamily, Metric, StateSetMetricFamily,
     SummaryMetricFamily, UnknownMetricFamily, UntypedMetricFamily,
 )
-from .registry import CollectorRegistry, DuplicateTimeseries, REGISTRY
+from .registry import (
+    CollectorRegistry, CompositeRegistry, DuplicateTimeseries,
+    NamespaceConflict, NamespaceView, REGISTRY, RestrictedCompositeRegistry,
+)
 from .samples import BucketSpan, Exemplar, NativeHistogram, Sample, Timestamp
 
 __all__ = (
     'BucketSpan',
     'CollectorRegistry',
+    'CompositeRegistry',
     'Counter',
     'CounterMetricFamily',
     'DuplicateTimeseries',
@@ -23,8 +27,11 @@ __all__ = (
     'Info',
     'InfoMetricFamily',
     'Metric',
+    'NamespaceConflict',
+    'NamespaceView',
     'NativeHistogram',
     'REGISTRY',
+    'RestrictedCompositeRegistry',
     'Sample',
     'StateSetMetricFamily',
     'Summary',
