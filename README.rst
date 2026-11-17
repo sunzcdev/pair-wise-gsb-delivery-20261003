@@ -81,6 +81,46 @@ connections.  Cursors are similarly proxies to the real cursors, and provide
 async iterators to query results.
 
 
+Asynchronous lock waiting
+~~~~~~~~~~~~~~~~~~~~~~~~~
+
+SQLite serializes writers with database-level locks. When another connection
+briefly holds the lock, a statement fails with ``SQLITE_BUSY``
+(``"database is locked"``) or ``SQLITE_LOCKED``
+(``"database table is locked"``). The synchronous ``timeout`` parameter
+(SQLite's own busy handler) makes the connection's single worker thread block,
+so no other statement on that connection can make progress while it waits.
+
+As an alternative, ``aiosqlite.connect()`` accepts an optional ``busy_wait``
+budget (in seconds). With it enabled, a statement executed through
+``Connection.execute()`` or ``Cursor.execute()`` that fails with a
+recognizable busy/locked result is retried on the event loop, sleeping for
+``busy_wait_interval`` seconds between attempts, until it succeeds or the
+total deadline is reached. Waiting never blocks the worker thread, so the
+event loop and the connection stay responsive, and the wait can be
+cancelled like any other coroutine:
+
+.. code-block:: python
+
+    async with aiosqlite.connect(
+        "example.db",
+        timeout=0,          # let busy_wait own the waiting, do not block the thread
+        busy_wait=5.0,      # retry for at most five seconds in total
+        busy_wait_interval=0.1,
+    ) as db:
+        await db.execute("INSERT INTO some_table ...")
+
+Only statements that have produced neither rows nor write side effects are
+retried, so helpers such as ``executemany()``, ``executescript()``,
+``execute_insert()`` and fetch operations simply propagate the error rather
+than being blindly retried. Integrity constraint violations (for example
+``UNIQUE`` failures) and errors raised by user-defined functions are never
+treated as lock contention. Transaction modes and every other
+``sqlite3.connect()`` parameter are passed through unchanged. When
+``busy_wait`` is left at its default of ``0.0``, behavior is unchanged and
+busy/locked errors propagate immediately.
+
+
 License
 -------
 

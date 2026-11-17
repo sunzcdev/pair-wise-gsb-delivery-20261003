@@ -8,6 +8,7 @@ Core implementation of aiosqlite proxies
 import asyncio
 import logging
 import sqlite3
+import time
 from collections.abc import AsyncIterator, Generator, Iterable
 from functools import partial
 from pathlib import Path
@@ -27,6 +28,39 @@ LOG = logging.getLogger("aiosqlite")
 
 
 IsolationLevel = Optional[Literal["DEFERRED", "IMMEDIATE", "EXCLUSIVE"]]
+
+# Primary SQLite result codes identifying contention on the database file,
+# as opposed to application-level errors such as constraint violations.
+# Read via getattr because the sqlite3 type stubs do not export these names.
+_BUSY_RESULT_CODES = frozenset(
+    {
+        getattr(sqlite3, "SQLITE_BUSY", 5),
+        getattr(sqlite3, "SQLITE_LOCKED", 6),
+    }
+)
+
+# Message fallbacks for Python builds (3.9/3.10) that do not expose the
+# ``sqlite_errorcode`` attribute on raised exceptions.
+_BUSY_RESULT_MESSAGES = ("database is locked", "database table is locked")
+
+
+def _is_busy_error(error: BaseException) -> bool:
+    """
+    Return true only when *error* reports a SQLite busy/locked result.
+
+    Integrity constraint failures, errors raised from user-defined functions
+    and every other failure are deliberately not treated as lock contention.
+    """
+    if not isinstance(error, sqlite3.OperationalError):
+        return False
+
+    code = getattr(error, "sqlite_errorcode", None)
+    if code is not None:
+        # Extended busy/locked codes share the same primary result code.
+        return (code & 0xFF) in _BUSY_RESULT_CODES
+
+    message = str(error).lower()
+    return any(text in message for text in _BUSY_RESULT_MESSAGES)
 
 
 def set_result(fut: asyncio.Future, result: Any) -> None:
@@ -81,13 +115,24 @@ class Connection:
         connector: Callable[[], sqlite3.Connection],
         iter_chunk_size: int,
         loop: Optional[asyncio.AbstractEventLoop] = None,
+        busy_wait: float = 0.0,
+        busy_wait_interval: float = 0.1,
     ) -> None:
+        # Initialize all instance state before validating arguments so that
+        # ``__del__`` remains safe if construction is abandoned.
         self._running = True
         self._connection: Optional[sqlite3.Connection] = None
         self._connector = connector
         self._tx: _TxQueue = SimpleQueue()
         self._iter_chunk_size = iter_chunk_size
+        self._busy_wait = busy_wait
+        self._busy_wait_interval = busy_wait_interval
         self._thread = Thread(target=_connection_worker_thread, args=(self._tx,))
+
+        if busy_wait < 0:
+            raise ValueError("busy_wait must be a non-negative number of seconds")
+        if busy_wait_interval <= 0:
+            raise ValueError("busy_wait_interval must be a positive number of seconds")
 
         if loop is not None:
             warn(
@@ -147,17 +192,39 @@ class Connection:
         cursor = self._conn.execute(sql, parameters)
         return cursor.fetchall()
 
-    async def _execute(self, fn, *args, **kwargs):
-        """Queue a function with the given arguments for execution."""
+    async def _execute(self, fn, *args, retryable: bool = False, **kwargs):
+        """Queue a function with the given arguments for execution.
+
+        When *retryable* is true and the connection was created with a
+        positive ``busy_wait`` budget, operations that fail with a
+        recognizable SQLite busy/locked result are retried until they
+        succeed or the total waiting deadline is reached. The waiting
+        happens on the event loop, never on the single worker thread, so
+        other queued operations and the loop stay responsive. Only a
+        statement that produced neither rows nor write side effects is
+        ever retried; every other error propagates unchanged.
+        """
         if not self._running or not self._connection:
             raise ValueError("Connection closed")
 
         function = partial(fn, *args, **kwargs)
-        future = asyncio.get_event_loop().create_future()
+        deadline: Optional[float] = None
+        if retryable and self._busy_wait > 0:
+            deadline = time.monotonic() + self._busy_wait
 
-        self._tx.put_nowait((future, function))
+        while True:
+            future = asyncio.get_event_loop().create_future()
+            self._tx.put_nowait((future, function))
 
-        return await future
+            try:
+                return await future
+            except sqlite3.OperationalError as error:
+                if deadline is None or not _is_busy_error(error):
+                    raise
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise
+                await asyncio.sleep(min(self._busy_wait_interval, remaining))
 
     async def _connect(self) -> "Connection":
         """Connect to the actual sqlite database."""
@@ -217,10 +284,18 @@ class Connection:
     async def execute(
         self, sql: str, parameters: Optional[Iterable[Any]] = None
     ) -> Cursor:
-        """Helper to create a cursor and execute the given query."""
+        """Helper to create a cursor and execute the given query.
+
+        If the statement fails with a recognizable SQLite busy/locked result
+        and the connection has a ``busy_wait`` budget, it is retried until
+        the budget is exhausted. The statement has not produced any rows or
+        side effects when such a failure is reported, so retrying is safe.
+        """
         if parameters is None:
             parameters = []
-        cursor = await self._execute(self._conn.execute, sql, parameters)
+        cursor = await self._execute(
+            self._conn.execute, sql, parameters, retryable=True
+        )
         return Cursor(self, cursor)
 
     @contextmanager
@@ -445,9 +520,35 @@ def connect(
     *,
     iter_chunk_size=64,
     loop: Optional[asyncio.AbstractEventLoop] = None,
+    busy_wait: float = 0.0,
+    busy_wait_interval: float = 0.1,
     **kwargs: Any,
 ) -> Connection:
-    """Create and return a connection proxy to the sqlite database."""
+    """Create and return a connection proxy to the sqlite database.
+
+    :param busy_wait: total time budget, in seconds, for an asynchronous
+        lock-wait strategy. When a statement executed through
+        :meth:`Connection.execute` fails with a recognizable SQLite
+        "busy"/"locked" result (``SQLITE_BUSY`` or ``SQLITE_LOCKED``), the
+        statement is retried on the event loop after
+        *busy_wait_interval* seconds until it succeeds or this deadline is
+        reached. Waiting never blocks the connection's single worker thread,
+        so the event loop and other connections keep running. Defaults to
+        ``0.0``, which preserves the previous behavior of propagating the
+        error immediately. Integrity constraint errors, user-defined
+        function errors and any other failures are never retried, and
+        operations that already produced rows or write side effects are not
+        retried either.
+    :param busy_wait_interval: delay, in seconds, between retries while the
+        database remains locked. Must be strictly positive.
+
+        The synchronous ``timeout`` keyword (SQLite's own ``busy_timeout``)
+        and every other :func:`sqlite3.connect` parameter are passed through
+        unchanged, as are transaction modes. When using *busy_wait*, passing
+        ``timeout=0`` lets busy results surface immediately so that the
+        asynchronous strategy, rather than the worker thread's blocking
+        busy handler, owns the waiting.
+    """
 
     if loop is not None:
         warn(
@@ -465,4 +566,9 @@ def connect(
 
         return sqlite3.connect(loc, **kwargs)
 
-    return Connection(connector, iter_chunk_size)
+    return Connection(
+        connector,
+        iter_chunk_size,
+        busy_wait=busy_wait,
+        busy_wait_interval=busy_wait_interval,
+    )

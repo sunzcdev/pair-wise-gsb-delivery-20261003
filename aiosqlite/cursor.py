@@ -34,10 +34,16 @@ class Cursor:
     async def execute(
         self, sql: str, parameters: Optional[Iterable[Any]] = None
     ) -> "Cursor":
-        """Execute the given query."""
+        """Execute the given query.
+
+        A recognizable SQLite busy/locked result is retried on the event
+        loop according to the connection's ``busy_wait`` budget. Other
+        failures, including integrity constraint violations and errors from
+        user-defined functions, propagate immediately.
+        """
         if parameters is None:
             parameters = []
-        await self._execute(self._cursor.execute, sql, parameters)
+        await self._execute(self._cursor.execute, sql, parameters, retryable=True)
         return self
 
     async def executemany(
