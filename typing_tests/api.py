@@ -371,6 +371,35 @@ def f() -> None:
         pass
 
 
+tc = structlog.contextvars.parse_trace_context("traceparent", "tracestate")
+status: structlog.contextvars.TraceContextStatus = tc.status
+trace_id: str | None = tc.trace_id
+span_id: str | None = tc.span_id
+trace_flags: int = tc.trace_flags
+tracestate: tuple[tuple[str, str], ...] = tc.tracestate
+error: str | None = tc.error
+sampled: bool = tc.sampled
+event_dict: dict[str, Any] = tc.as_event_dict()
+
+with structlog.contextvars.bound_trace_context(tc) as bound_tc:
+    bound_tc: structlog.contextvars.TraceContext
+
+with structlog.contextvars.bound_trace_context("traceparent", "tracestate"):
+    pass
+
+with structlog.contextvars.bound_trace_context(
+    "traceparent", key_prefix="http_"
+):
+    pass
+
+tokens = structlog.contextvars.bind_trace_context("traceparent")
+structlog.contextvars.reset_contextvars(**tokens)
+
+structlog.contextvars.bind_trace_context(tc)
+structlog.contextvars.unbind_trace_context()
+structlog.contextvars.unbind_trace_context(key_prefix="http_")
+
+
 # ConsoleRenderer properties
 
 cr = structlog.dev.ConsoleRenderer.get_active()

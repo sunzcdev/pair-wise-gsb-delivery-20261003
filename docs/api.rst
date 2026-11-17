@@ -139,6 +139,20 @@ API Reference
 .. autofunction:: unbind_contextvars
 .. autofunction:: reset_contextvars
 
+.. autofunction:: parse_trace_context
+
+.. autoclass:: TraceContext
+   :members: sampled, as_event_dict
+
+.. autoclass:: TraceContextStatus
+   :members:
+
+.. autofunction:: bind_trace_context
+.. autofunction:: bound_trace_context
+.. autofunction:: unbind_trace_context
+
+.. autodata:: TRACE_CONTEXT_KEYS
+
 `structlog.threadlocal` Module
 ------------------------------
 

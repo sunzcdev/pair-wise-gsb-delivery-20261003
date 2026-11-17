@@ -15,6 +15,13 @@ You can find our backwards-compatibility policy [here](https://github.com/hynek/
 
 ## [Unreleased](https://github.com/hynek/structlog/compare/26.1.0...HEAD)
 
+### Added
+
+- `structlog.contextvars` can now import [W3C Trace Context](https://www.w3.org/TR/trace-context/) from inbound `traceparent` / `tracestate` headers.
+  `structlog.contextvars.parse_trace_context()` validates version, hex IDs, all-zero IDs, trace flags, and trace state members without raising, and reports the outcome -- including `missing` and `invalid` -- in `TraceContextStatus` instead of passing untrusted values through as `trace_id` or `span_id`.
+  `structlog.contextvars.bind_trace_context()` and `structlog.contextvars.bound_trace_context()` bind the resulting correlation fields to the context-local context; the context manager restores the previous trace context on exit, so nested entry points and concurrent tasks stay isolated.
+  Regular `structlog.contextvars.bind_contextvars()` is unchanged and keeps binding arbitrary fields without any Trace-specific validation.
+
 ### Changed
 
 - On Python 3.15 and later, *structlog* uses [PEP 810](https://peps.python.org/pep-0810/) lazy imports for modules that are only needed once you log.

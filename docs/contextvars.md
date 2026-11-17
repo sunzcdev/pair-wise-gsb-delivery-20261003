@@ -100,6 +100,97 @@ def _helper():
     reset_contextvars(**tokens)
 ```
 
+(importing-trace-context)=
+
+## Importing Trace Context
+
+Inbound requests usually carry [W3C Trace Context](https://www.w3.org/TR/trace-context/) in the `traceparent` and `tracestate` headers.
+To correlate your logs with your traces, *structlog* can validate those headers and bind the result to the context-local context.
+
+The parsing is separate from the binding, so you can inspect -- or re-validate -- a header without touching any context.
+It takes either the raw header values or a mapping of headers:
+
+```{doctest}
+>>> from structlog.contextvars import parse_trace_context
+>>> ctx = parse_trace_context(
+...     "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01",
+...     "congo=t61rcWkgMzE",
+... )
+>>> ctx.status
+<TraceContextStatus.SAMPLED: 'sampled'>
+>>> ctx.trace_id
+'4bf92f3577b34da6a3ce929d0e0e4736'
+>>> ctx.span_id
+'00f067aa0ba902b7'
+>>> ctx.tracestate
+(('congo', 't61rcWkgMzE'),)
+>>> ctx.as_event_dict()
+{'trace_context_status': 'sampled', 'trace_id': '4bf92f3577b34da6a3ce929d0e0e4736', 'span_id': '00f067aa0ba902b7', 'trace_flags': 1, 'trace_sampled': True, 'tracestate': 'congo=t61rcWkgMzE'}
+>>> parse_trace_context({"TraceParent": "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"}).trace_id
+'4bf92f3577b34da6a3ce929d0e0e4736'
+```
+
+{func}`~structlog.contextvars.parse_trace_context` never raises for bad input.
+Instead, it reports the outcome in `TraceContext.status` -- one of `missing`, `invalid`, `not_sampled`, or `sampled` -- and in `TraceContext.error`.
+**Invalid values are never echoed back as trusted IDs**:
+
+```{doctest}
+>>> from structlog.contextvars import parse_trace_context
+>>> broken = parse_trace_context("00-00000000000000000000000000000000-00f067aa0ba902b7-01")
+>>> broken.status
+<TraceContextStatus.INVALID: 'invalid'>
+>>> broken.error
+'zero_trace_id'
+>>> broken.trace_id is None
+True
+>>> parse_trace_context(None).status
+<TraceContextStatus.MISSING: 'missing'>
+>>> parse_trace_context("00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-00").status
+<TraceContextStatus.NOT_SAMPLED: 'not_sampled'>
+```
+
+To put the correlation fields into the context-local context, use {func}`~structlog.contextvars.bind_trace_context` -- typically in your trace middleware.
+It accepts the header values, an already parsed {class}`~structlog.contextvars.TraceContext`, or -- most conveniently -- the request's header mapping, which is looked up case-insensitively:
+
+```python
+from structlog.contextvars import (
+    bind_contextvars,
+    bind_trace_context,
+    clear_contextvars,
+)
+
+
+def trace_middleware(request):
+    clear_contextvars()
+    bind_contextvars(path=request.path)
+    bind_trace_context(request.headers)
+
+    return handle(request)
+```
+
+The fields are ordinary context-local values -- `trace_id`, `span_id`, `trace_flags`, `trace_sampled`, `tracestate`, `trace_context_status`, and `trace_context_error` -- merged by {func}`~structlog.contextvars.merge_contextvars` like any other.
+Nothing special is enforced: {func}`~structlog.contextvars.bind_contextvars` keeps binding arbitrary business fields, and *structlog* never validates or rewrites values that you bind yourself.
+
+For scoped entry points, {func}`~structlog.contextvars.bound_trace_context` restores the previous trace context -- including the absence of one -- on exit, and is isolated between {mod}`asyncio` tasks like any other context-local data:
+
+```python
+from structlog.contextvars import bound_trace_context
+
+
+def handle_request(headers):
+    with bound_trace_context(headers):
+        # Logs in here use this request's trace context...
+        run_handlers()
+
+
+# ... and here, the previous -- probably empty -- context is active again.
+```
+
+:::{note}
+Traceparent versions other than `00` are accepted as long as they follow the same field layout, but `ff` is forbidden by the specification.
+A malformed `tracestate` only drops the trace state; a valid `traceparent` is still used.
+:::
+
 (flask-example)=
 
 ## Example: Flask and thread-local data
