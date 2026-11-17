@@ -19,6 +19,7 @@ All notable changes to this project will be documented in this file. For info on
 - Add `Rack::Request#headers` for simpler access to request headers by header name. ([#1881](https://github.com/rack/rack/pull/1881), [@jeremyevans](https://github.com/jeremyevans))
 - Allow disabling the `Rack::QueryParser` bytesize and params limits by passing `nil` for the `bytesize_limit`/`params_limit` keyword arguments, or a negative value for `RACK_QUERY_PARSER_BYTESIZE_LIMIT`/`RACK_QUERY_PARSER_PARAMS_LIMIT`. ([#2492](https://github.com/rack/rack/pull/2492), [@alpaca-tc](https://github.com/alpaca-tc))
 - Add `Rack::Request#multipart_parser`, and `Rack::Multipart::Parser.parse_from_env`, `.default_tempfile_factory`, `.default_bufsize`, and `.default_query_parser`. ([#2497](https://github.com/rack/rack/pull/2497) ([@jeremyevans](https://github.com/jeremyevans))
+- Add `Rack::QueryParser::ParamBudget`, an explicit per-request parameter ledger that can be shared across query string and form body parsing. It counts consumed keys, expanded structural nodes (including nested arrays), and decoded bytes against a single quota, and limit errors report the source and parsing phase that exceeded the budget. `Rack::Request#param_budget` exposes the request-local ledger.
 
 ### Changed
 

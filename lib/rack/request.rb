@@ -61,7 +61,7 @@ module Rack
 
     def initialize(env)
       @env = env
-      @ip = @params = @headers = @query_parser = nil
+      @ip = @params = @headers = @query_parser = @param_budget = nil
     end
 
     def ip
@@ -595,7 +595,8 @@ module Rack
 
       # Returns the data received in the query string.
       def GET
-        get_header(RACK_REQUEST_QUERY_HASH) || set_header(RACK_REQUEST_QUERY_HASH, parse_query(query_string, '&'))
+        get_header(RACK_REQUEST_QUERY_HASH) ||
+          set_header(RACK_REQUEST_QUERY_HASH, parse_query(query_string, '&'))
       end
 
       # Returns the form data pairs received in the request body.
@@ -617,7 +618,14 @@ module Rack
             set_header(RACK_REQUEST_FORM_PAIRS, [])
           elsif parse_type = form_pairs_parse_type
             if parse_type == :multipart
-              set_header(RACK_REQUEST_FORM_PAIRS, multipart_parser&.parse_from_env(env) || [])
+              # The multipart parser emits flat [key, value] pairs directly, so
+              # charge the field keys against the shared budget here. Nodes
+              # produced while expanding the pairs are charged in POST.
+              pairs = multipart_parser&.parse_from_env(env) || []
+              pairs.each do |k, _v|
+                param_budget.account_pair!(:form_body, k, nil)
+              end
+              set_header(RACK_REQUEST_FORM_PAIRS, pairs)
             else # :url_encoded
               # Add 2 bytes. One to check whether it is over the limit, and a second
               # in case the slice! call below removes the last byte
@@ -630,7 +638,8 @@ module Rack
               form_vars.slice!(-1) if form_vars.end_with?("\0")
 
               set_header RACK_REQUEST_FORM_VARS, form_vars
-              pairs = query_parser.parse_query_pairs(form_vars, '&')
+              pairs = query_parser.parse_query_pairs(form_vars, '&',
+                budget: param_budget, source: :form_body)
               set_header(RACK_REQUEST_FORM_PAIRS, pairs)
             end
           else
@@ -667,6 +676,24 @@ module Rack
       # Allow overriding the query parser that the receiver will use.
       # By default Rack::Utils.default_query_parser is used.
       attr_writer :query_parser
+
+      # The per-request parameter budget ledger shared by query string and form
+      # body parsing, so the two segments draw from a single quota instead of
+      # each receiving a full quota of their own.
+      #
+      # The ledger is request-local state: it is never shared between requests
+      # and nothing is stored globally. It can be assigned explicitly (for
+      # example from rack.request.config) to customize the limits; otherwise a
+      # budget derived from the query parser's limits is created lazily on
+      # first use.
+      attr_writer :param_budget
+
+      def param_budget
+        # Memoize the lazily created ledger so every parsing stage of this
+        # request charges the same instance. A ledger supplied through
+        # rack.request.config is cached on first use as well.
+        @param_budget ||= config_value(:param_budget) || query_parser.make_budget
+      end
 
       # Destructively update a parameter, whether it's in GET and/or POST. Returns nil.
       #
@@ -810,7 +837,8 @@ module Rack
       end
 
       def parse_query(qs, d = '&')
-        query_parser.parse_nested_query(qs, d)
+        query_parser.parse_nested_query(qs, d,
+          budget: param_budget, source: :query_string)
       end
 
       def parse_multipart
@@ -822,7 +850,8 @@ module Rack
         params = query_parser.make_params
 
         pairs.each do |k, v|
-          query_parser.normalize_params(params, k, v)
+          query_parser.normalize_params(params, k, v, nil,
+            budget: param_budget, source: :form_body)
         end
 
         params.to_params_hash

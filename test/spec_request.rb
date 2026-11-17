@@ -2599,6 +2599,160 @@ EOF
     c.new(h).env.must_be_same_as h
   end
 
+  describe "parameter budget" do
+    it "creates a per-request ledger derived from the query parser limits" do
+      req = make_request(Rack::MockRequest.env_for("/?a=1"))
+      req.param_budget.must_be_kind_of Rack::QueryParser::ParamBudget
+      # memoized for the lifetime of the request:
+      req.param_budget.must_be_same_as req.param_budget
+    end
+
+    it "does not share a ledger between different requests" do
+      one = make_request(Rack::MockRequest.env_for("/?a=1"))
+      two = make_request(Rack::MockRequest.env_for("/?a=1"))
+      one.param_budget.wont_be_same_as two.param_budget
+    end
+
+    it "accepts an explicitly assigned ledger" do
+      budget = Rack::QueryParser::ParamBudget.new
+      req = make_request(Rack::MockRequest.env_for("/?a=1"))
+      req.param_budget = budget
+      req.param_budget.must_be_same_as budget
+    end
+
+    it "accepts a ledger supplied through rack.request.config" do
+      budget = Rack::QueryParser::ParamBudget.new
+      env = Rack::MockRequest.env_for("/?a=1")
+      env[Rack::RACK_REQUEST_CONFIG] = {param_budget: budget}
+      req = make_request(env)
+      req.param_budget.must_be_same_as budget
+    end
+
+    it "enforces a single shared key quota across query string and form body" do
+      budget = Rack::QueryParser::ParamBudget.new(keys_limit: 3)
+      env = Rack::MockRequest.env_for("/?a=1&b=2",
+        "REQUEST_METHOD" => "POST", :input => "c=3&d=4")
+      req = make_request(env)
+      req.param_budget = budget
+
+      error = proc { req.params }.must_raise Rack::QueryParser::QueryLimitError
+      error.source.must_equal :form_body
+      error.phase.must_equal :pair_parsing
+      error.counter.must_equal :keys
+      # both query pairs were charged, the form body could only fit one more
+      budget.keys.must_equal 3
+    end
+
+    it "still allows query and form data when together they fit the quota" do
+      budget = Rack::QueryParser::ParamBudget.new(keys_limit: 4)
+      env = Rack::MockRequest.env_for("/?a=1&b=2",
+        "REQUEST_METHOD" => "POST", :input => "c=3&d=4")
+      req = make_request(env)
+      req.param_budget = budget
+
+      req.params.must_equal "a" => "1", "b" => "2", "c" => "3", "d" => "4"
+      budget.keys.must_equal 4
+    end
+
+    it "attributes query string overages to the query string source" do
+      budget = Rack::QueryParser::ParamBudget.new(keys_limit: 1)
+      req = make_request(Rack::MockRequest.env_for("/?a=1&b=2"))
+      req.param_budget = budget
+
+      error = proc { req.GET }.must_raise Rack::QueryParser::QueryLimitError
+      error.source.must_equal :query_string
+      error.phase.must_equal :pair_parsing
+    end
+
+    it "charges nested form expansion nodes against the shared budget" do
+      budget = Rack::QueryParser::ParamBudget.new(nodes_limit: 2)
+      env = Rack::MockRequest.env_for("/",
+        "REQUEST_METHOD" => "POST",
+        "CONTENT_TYPE" => "application/x-www-form-urlencoded",
+        :input => "a[b][c]=1")
+      req = make_request(env)
+      req.param_budget = budget
+
+      error = proc { req.POST }.must_raise Rack::QueryParser::QueryLimitError
+      error.source.must_equal :form_body
+      error.phase.must_equal :nested_expansion
+      error.counter.must_equal :nodes
+    end
+
+    it "charges decoded form bytes against the shared byte budget" do
+      budget = Rack::QueryParser::ParamBudget.new(bytes_limit: 3)
+      env = Rack::MockRequest.env_for("/",
+        "REQUEST_METHOD" => "POST",
+        "CONTENT_TYPE" => "application/x-www-form-urlencoded",
+        :input => "abcd=1")
+      req = make_request(env)
+      req.param_budget = budget
+
+      error = proc { req.POST }.must_raise Rack::QueryParser::QueryLimitError
+      error.counter.must_equal :bytes
+      error.usage.must_equal 5
+    end
+
+    it "does not charge again when cached parameter results are reused" do
+      budget = Rack::QueryParser::ParamBudget.new
+      req = make_request(Rack::MockRequest.env_for("/?a=1",
+        "REQUEST_METHOD" => "POST", :input => "b=2"))
+      req.param_budget = budget
+
+      req.GET
+      req.POST
+      req.params
+      # one charge per pair, regardless of how often the caches are read
+      budget.keys.must_equal 2
+    end
+
+    it "keeps a failing form parse cached as an error without re-charging" do
+      budget = Rack::QueryParser::ParamBudget.new(keys_limit: 1)
+      env = Rack::MockRequest.env_for("/",
+        "REQUEST_METHOD" => "POST", :input => "a=1&b=2")
+      req = make_request(env)
+      req.param_budget = budget
+
+      proc { req.POST }.must_raise Rack::QueryParser::QueryLimitError
+      budget.keys.must_equal 1
+      proc { req.form_pairs }.must_raise Rack::QueryParser::QueryLimitError
+      # the second call replayed the cached error, it did not parse again
+      budget.keys.must_equal 1
+    end
+
+    it "leaves standalone query parser usage free of global ledger state" do
+      parser = Rack::QueryParser.make_default(32)
+      parser.parse_nested_query("a=1&b=2", '&').
+        must_equal "a" => "1", "b" => "2"
+      parser.parse_query_pairs("a=1", '&').must_equal [["a", "1"]]
+    end
+
+    it "charges multipart form fields against the shared budget and caches errors" do
+      file = Rack::Multipart::UploadedFile.new(
+        File.join(File.dirname(__FILE__), "multipart", "file1.txt"))
+      body = Rack::Multipart.build_multipart(
+        "a" => "1", "b" => "2", "submit" => file)
+      env = Rack::MockRequest.env_for("/?q=1",
+        "REQUEST_METHOD" => "POST",
+        "CONTENT_TYPE" => "multipart/form-data; boundary=AaB03x",
+        :input => body)
+      # one query pair already consumes one slot, only one form field fits
+      budget = Rack::QueryParser::ParamBudget.new(keys_limit: 2)
+      req = make_request(env)
+      req.param_budget = budget
+
+      error = proc { req.POST }.must_raise Rack::QueryParser::QueryLimitError
+      error.source.must_equal :form_body
+      error.phase.must_equal :pair_parsing
+      req.env[Rack::RACK_REQUEST_FORM_ERROR].must_be_kind_of Rack::QueryParser::QueryLimitError
+
+      charged = budget.keys
+      # replaying the cached parse error must not parse or charge again
+      proc { req.form_pairs }.must_raise Rack::QueryParser::QueryLimitError
+      budget.keys.must_equal charged
+    end
+  end
+
   class NonDelegate < Rack::Request
     def delegate?; false; end
     def query_parser
