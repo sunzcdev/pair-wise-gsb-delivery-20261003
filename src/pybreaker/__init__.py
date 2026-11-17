@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import calendar
 import contextlib
+import inspect
 import logging
 import sys
 import threading
@@ -61,12 +62,15 @@ __all__ = (
     "CircuitBreaker",
     "CircuitBreakerListener",
     "CircuitBreakerError",
+    "CircuitBreakerFallbackError",
     "CircuitMemoryStorage",
     "CircuitRedisStorage",
     "STATE_OPEN",
     "STATE_CLOSED",
     "STATE_HALF_OPEN",
 )
+
+logger = logging.getLogger(__name__)
 
 STATE_OPEN = "open"
 STATE_CLOSED = "closed"
@@ -98,8 +102,27 @@ class CircuitBreaker:
         state_storage: CircuitBreakerStorage | None = None,
         name: str | None = None,
         throw_new_error_on_trip: bool = True,
+        fallback: Callable[..., Any] | None = None,
+        fallback_exceptions: Iterable[type[BaseException]] | None = None,
+        fallback_on_open: bool = True,
     ) -> None:
-        """Create a new circuit breaker with the given parameters."""
+        """Create a new circuit breaker with the given parameters.
+
+        The optional `fallback` callable is invoked with the same arguments as
+        the guarded function when (and only when):
+
+        - the call is short-circuited by this circuit breaker, i.e. a
+          ``CircuitBreakerError`` is raised because the circuit is open (or has
+          just tripped), and `fallback_on_open` is true; or
+        - the guarded call raises an exception that is an instance of one of
+          the agreed dependency exception categories in `fallback_exceptions`.
+
+        Exceptions not matching these rules (e.g. business exceptions listed
+        in `exclude`) are never swallowed: they propagate to the caller
+        untouched. The fallback runs at most once per call, and a successful
+        fallback result is never counted as a recovery of the guarded
+        operation.
+        """
         self._lock = threading.RLock()
         self._state_storage = state_storage or CircuitMemoryStorage(STATE_CLOSED)
         self._state = self._create_new_state(self.current_state)
@@ -113,6 +136,10 @@ class CircuitBreaker:
         self._name = name
 
         self._throw_new_error_on_trip = throw_new_error_on_trip
+
+        self._fallback = fallback
+        self._fallback_exceptions = tuple(fallback_exceptions or ())
+        self._fallback_on_open = fallback_on_open
 
     @property
     def fail_counter(self) -> int:
@@ -243,12 +270,88 @@ class CircuitBreaker:
                     return False
         return True
 
+    @property
+    def fallback(self) -> Callable[..., Any] | None:
+        """Return the fallback callable invoked when a call is short-circuited
+        or fails with an accepted dependency exception, or `None` if no
+        fallback is configured.
+        """
+        return self._fallback
+
+    @property
+    def fallback_exceptions(self) -> tuple[type[BaseException], ...]:
+        """Return the dependency exception categories accepted for fallback."""
+        return self._fallback_exceptions
+
+    def _should_run_fallback(self, exc: BaseException) -> bool:
+        """Return whether a call that failed with `exc` should be answered by
+        the configured fallback instead of propagating the error.
+        """
+        if self._fallback is None:
+            return False
+        if isinstance(exc, CircuitBreakerFallbackError):
+            # The fallback itself already failed for this call; never attempt
+            # it more than once per call.
+            return False
+        if isinstance(exc, CircuitBreakerError):
+            # Explicit short-circuit: the circuit is open (or just tripped).
+            return self._fallback_on_open
+        return isinstance(exc, self._fallback_exceptions)
+
+    def _notify_fallback_call(self, exc: BaseException) -> None:
+        logger.info("Circuit breaker %r: running fallback due to %r", self._name or "unnamed", exc)
+        for listener in self._listeners:
+            listener.fallback_call(self, exc)
+
+    def _notify_fallback_success(self, exc: BaseException) -> None:
+        logger.info("Circuit breaker %r: fallback succeeded after %r", self._name or "unnamed", exc)
+        for listener in self._listeners:
+            listener.fallback_success(self, exc)
+
+    def _notify_fallback_failure(self, exc: BaseException, fallback_exc: BaseException) -> None:
+        logger.warning(
+            "Circuit breaker %r: fallback failed with %r after primary failure %r",
+            self._name or "unnamed",
+            fallback_exc,
+            exc,
+        )
+        for listener in self._listeners:
+            listener.fallback_failure(self, exc, fallback_exc)
+
+    def _run_fallback(self, exc: BaseException, args: tuple, kwargs: dict) -> Any:
+        """Run the configured fallback for a call that failed with `exc`, or
+        re-raise `exc` if the failure is not accepted for fallback.
+
+        A successful fallback result is returned to the caller but is *not*
+        reported as a success of the guarded operation, so it never resets
+        the failure counter nor closes the circuit. If the fallback itself
+        fails, a ``CircuitBreakerFallbackError`` preserving both the primary
+        and the fallback causes is raised.
+        """
+        if not self._should_run_fallback(exc):
+            raise exc
+        self._notify_fallback_call(exc)
+        try:
+            result = self._fallback(*args, **kwargs)  # type: ignore[misc]
+        except BaseException as fallback_exc:
+            self._notify_fallback_failure(exc, fallback_exc)
+            raise CircuitBreakerFallbackError(exc, fallback_exc) from exc
+        self._notify_fallback_success(exc)
+        return result
+
     def call(self, func: Callable[..., T], *args: Any, **kwargs: Any) -> T:
         """Call `func` with the given `args` and `kwargs` according to the rules
         implemented by the current state of this circuit breaker.
+
+        If the call is short-circuited or fails with an accepted dependency
+        exception and a fallback is configured, the fallback result is
+        returned instead.
         """
         with self._lock:
-            return self.state.call(func, *args, **kwargs)
+            try:
+                return self.state.call(func, *args, **kwargs)
+            except BaseException as exc:
+                return cast(T, self._run_fallback(exc, args, kwargs))
 
     @contextlib.contextmanager
     def calling(self) -> Any:
@@ -267,14 +370,46 @@ class CircuitBreaker:
         """Call async `func` with the given `args` and `kwargs` according to the rules
         implemented by the current state of this circuit breaker.
 
+        If a fallback is configured and the call is short-circuited or fails
+        with an accepted dependency exception, the fallback is invoked with
+        the same arguments; if it returns an awaitable, it is awaited
+        according to the same rules as the guarded function.
+
         Return a closure to prevent import errors when using without tornado present
         """
 
         @gen.coroutine
         def wrapped():  # type: ignore[no-untyped-def]
             with self._lock:
-                ret = yield self.state.call_async(func, *args, **kwargs)
+                try:
+                    ret = yield self.state.call_async(func, *args, **kwargs)
+                except BaseException as exc:
+                    ret = yield self._run_fallback_async(exc, args, kwargs)
                 raise gen.Return(ret)
+
+        return wrapped()
+
+    def _run_fallback_async(self, exc, args, kwargs):  # type: ignore[no-untyped-def]
+        """Asynchronous counterpart of `_run_fallback`; awaits the fallback
+        result when it is awaitable.
+
+        Return a closure to prevent import errors when using without tornado present
+        """
+
+        @gen.coroutine
+        def wrapped():  # type: ignore[no-untyped-def]
+            if not self._should_run_fallback(exc):
+                raise exc
+            self._notify_fallback_call(exc)
+            try:
+                result = self._fallback(*args, **kwargs)
+                if inspect.isawaitable(result):
+                    result = yield result
+            except BaseException as fallback_exc:
+                self._notify_fallback_failure(exc, fallback_exc)
+                raise CircuitBreakerFallbackError(exc, fallback_exc) from exc
+            self._notify_fallback_success(exc)
+            raise gen.Return(result)
 
         return wrapped()
 
@@ -664,6 +799,25 @@ class CircuitBreakerListener:
     ) -> None:
         """This callback function is called when the state of the circuit breaker `cb` state changes."""
 
+    def fallback_call(self, cb: CircuitBreaker, exc: BaseException) -> None:
+        """This callback function is called when the circuit breaker `cb` is
+        about to invoke its configured fallback because the guarded call
+        failed with `exc`.
+        """
+
+    def fallback_success(self, cb: CircuitBreaker, exc: BaseException) -> None:
+        """This callback function is called when the fallback of the circuit
+        breaker `cb` returns successfully after the guarded call failed with
+        `exc`. Note that this does *not* mean the guarded operation recovered:
+        the failure was still recorded by the circuit breaker.
+        """
+
+    def fallback_failure(self, cb: CircuitBreaker, exc: BaseException, fallback_exc: BaseException) -> None:
+        """This callback function is called when the fallback of the circuit
+        breaker `cb` itself fails with `fallback_exc` after the guarded call
+        failed with `exc`.
+        """
+
 
 class CircuitBreakerState:
     """Implement the behavior needed by all circuit breaker states."""
@@ -901,3 +1055,20 @@ class CircuitBreakerError(Exception):
     """When calls to a service fails because the circuit is open, this error is
     raised to allow the caller to handle this type of exception differently.
     """
+
+
+class CircuitBreakerFallbackError(CircuitBreakerError):
+    """Raised when the guarded operation fails and the configured fallback
+    fails as well.
+
+    Both causes are preserved: `primary_error` is the exception raised by the
+    guarded operation (or the short-circuit ``CircuitBreakerError``), and
+    `fallback_error` is the exception raised by the fallback callable.
+    """
+
+    def __init__(self, primary_error: BaseException, fallback_error: BaseException) -> None:
+        """Create a new error carrying the primary and fallback causes."""
+        self.primary_error = primary_error
+        self.fallback_error = fallback_error
+        message = f"Fallback failed after primary failure (primary: {primary_error!r}; fallback: {fallback_error!r})"
+        super().__init__(message)

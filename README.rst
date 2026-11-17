@@ -234,6 +234,47 @@ After 60 seconds, the circuit breaker will allow the next call to
 ``update_customer`` pass through. If that call succeeds, the circuit is closed;
 if it fails, however, the circuit is opened again until another timeout elapses.
 
+Fallback
+````````
+
+A circuit breaker can optionally return a fallback result instead of raising
+when a call cannot be served by the guarded operation. The fallback strategy is
+explicit: nothing is swallowed unless you opt in.
+
+.. code:: python
+
+    def cached_customer(cust):
+        # Return a stale but safe representation...
+        pass
+
+    db_breaker = pybreaker.CircuitBreaker(
+        fallback=cached_customer,               # called with the same arguments
+        fallback_exceptions=(DBConnectionError,),  # agreed dependency exceptions
+        fallback_on_open=True,                  # also answer when short-circuited
+    )
+
+The fallback is invoked (at most once per call) only when:
+
+* the call is short-circuited by the circuit breaker, i.e. a
+  ``CircuitBreakerError`` is raised because the circuit is open or has just
+  tripped, and ``fallback_on_open`` is true; or
+* the guarded call raises an exception matching one of the agreed dependency
+  exception categories in ``fallback_exceptions``.
+
+Any other exception - in particular business exceptions listed in ``exclude`` -
+still propagates to the caller untouched.
+
+A successful fallback result is *not* counted as a recovery of the guarded
+operation: the failure is still recorded, so the fallback can never close an
+open circuit by itself. If the fallback itself fails, a
+``CircuitBreakerFallbackError`` is raised, preserving both the primary cause
+(``primary_error``) and the fallback cause (``fallback_error``).
+
+Async fallbacks used with ``call_async`` are awaited according to the same
+rules as the guarded function. To tell which side produced a result, listen to
+the ``fallback_call``, ``fallback_success`` and ``fallback_failure`` events of
+``CircuitBreakerListener``.
+
 Optional Tornado Support
 ````````````````````````
 A circuit breaker can (optionally) be used to call asynchronous Tornado functions:

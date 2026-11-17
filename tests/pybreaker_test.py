@@ -1352,5 +1352,295 @@ class CircuitBreakerContextManagerTestCase(unittest.TestCase):
         assert breaker.current_state == "closed"
 
 
+class CircuitBreakerFallbackTestCase(testing.AsyncTestCase):
+    """Tests for the explicit fallback strategy of the CircuitBreaker class."""
+
+    def test_errors_propagate_when_no_fallback_configured(self):
+        """CircuitBreaker: it should not swallow any error when no fallback is
+        configured.
+        """
+        breaker = CircuitBreaker(fail_max=1)
+
+        def err():
+            raise NotImplementedError
+
+        with pytest.raises(CircuitBreakerError):
+            breaker.call(err)
+        with pytest.raises(CircuitBreakerError):
+            breaker.call(err)
+
+    def test_fallback_on_open_circuit(self):
+        """CircuitBreaker: it should answer short-circuited calls with the
+        fallback result.
+        """
+        breaker = CircuitBreaker(fail_max=1, fallback=lambda: "fallback")
+
+        def err():
+            raise NotImplementedError
+
+        # The first call trips the circuit, which is an explicit short-circuit.
+        assert breaker.call(err) == "fallback"
+        assert breaker.current_state == "open"
+
+        # The fallback success must not be counted as a recovery of the
+        # guarded operation.
+        assert breaker.fail_counter == 1
+
+        # While open, calls are short-circuited to the fallback.
+        assert breaker.call(err) == "fallback"
+        assert breaker.fail_counter == 1
+
+    def test_fallback_on_open_disabled(self):
+        """CircuitBreaker: it should propagate the short-circuit error when
+        `fallback_on_open` is disabled.
+        """
+        breaker = CircuitBreaker(fail_max=1, fallback=lambda: "fallback", fallback_on_open=False)
+
+        def err():
+            raise NotImplementedError
+
+        with pytest.raises(CircuitBreakerError):
+            breaker.call(err)
+
+    def test_fallback_on_accepted_dependency_exception(self):
+        """CircuitBreaker: it should answer calls failing with an accepted
+        dependency exception with the fallback result.
+        """
+        breaker = CircuitBreaker(fallback=lambda: "fallback", fallback_exceptions=(IOError,))
+
+        def err():
+            raise OSError("dependency down")
+
+        assert breaker.call(err) == "fallback"
+        assert breaker.fail_counter == 1
+        assert breaker.current_state == "closed"
+
+    def test_business_exceptions_still_propagate(self):
+        """CircuitBreaker: it should not swallow business or otherwise not
+        accepted exceptions, even when a fallback is configured.
+        """
+        fallback = mock.MagicMock(return_value="fallback")
+        breaker = CircuitBreaker(
+            exclude=(ValueError,),
+            fallback=fallback,
+            fallback_exceptions=(IOError,),
+        )
+
+        def business_err():
+            raise ValueError("business")
+
+        def other_err():
+            raise KeyError("not accepted")
+
+        with pytest.raises(ValueError):
+            breaker.call(business_err)
+        with pytest.raises(KeyError):
+            breaker.call(other_err)
+        fallback.assert_not_called()
+        # The business exception is excluded, the other one is recorded.
+        assert breaker.fail_counter == 1
+
+    def test_fallback_not_called_on_success(self):
+        """CircuitBreaker: it should not invoke the fallback when the guarded
+        call succeeds.
+        """
+        fallback = mock.MagicMock(return_value="fallback")
+        breaker = CircuitBreaker(fallback=fallback, fallback_exceptions=(IOError,))
+
+        assert breaker.call(lambda: "primary") == "primary"
+        fallback.assert_not_called()
+
+    def test_fallback_receives_same_arguments(self):
+        """CircuitBreaker: it should invoke the fallback with the same
+        arguments as the guarded function.
+        """
+        fallback = mock.MagicMock(return_value="fallback")
+        breaker = CircuitBreaker(fallback=fallback, fallback_exceptions=(IOError,))
+
+        def err(a, b=None):
+            raise OSError
+
+        assert breaker.call(err, 1, b=2) == "fallback"
+        fallback.assert_called_once_with(1, b=2)
+
+    def test_fallback_failure_preserves_both_causes(self):
+        """CircuitBreaker: it should preserve the primary and the fallback
+        causes when the fallback itself fails.
+        """
+        primary = OSError("dependency down")
+        fallback_cause = RuntimeError("fallback broken")
+
+        def err():
+            raise primary
+
+        def fallback():
+            raise fallback_cause
+
+        breaker = CircuitBreaker(fallback=fallback, fallback_exceptions=(IOError,))
+        with pytest.raises(CircuitBreakerFallbackError) as exc_info:
+            breaker.call(err)
+
+        assert exc_info.value.primary_error is primary
+        assert exc_info.value.fallback_error is fallback_cause
+        assert exc_info.value.__cause__ is primary
+        assert breaker.fail_counter == 1
+
+    def test_fallback_runs_at_most_once_per_call(self):
+        """CircuitBreaker: it should never attempt the fallback more than once
+        for a single call.
+        """
+        fallback = mock.MagicMock(side_effect=RuntimeError("broken"))
+        breaker = CircuitBreaker(fail_max=1, fallback=fallback)
+
+        def err():
+            raise NotImplementedError
+
+        with pytest.raises(CircuitBreakerFallbackError):
+            breaker.call(err)
+        fallback.assert_called_once_with()
+
+    def test_fallback_success_does_not_close_circuit(self):
+        """CircuitBreaker: it should not count a fallback success as a recovery
+        of the guarded operation.
+        """
+        breaker = CircuitBreaker(
+            fail_max=1,
+            reset_timeout=0.01,
+            throw_new_error_on_trip=False,
+            fallback=lambda: "fallback",
+            fallback_exceptions=(IOError,),
+        )
+
+        def err():
+            raise OSError
+
+        assert breaker.call(err) == "fallback"
+        assert breaker.current_state == "open"
+
+        sleep(0.02)
+
+        # The half-open trial call fails again and the fallback answers, but
+        # the circuit must go back to open instead of being closed by the
+        # fallback success.
+        assert breaker.call(err) == "fallback"
+        assert breaker.current_state == "open"
+        assert breaker.success_counter == 0
+
+    def test_fallback_listener_diagnostics(self):
+        """CircuitBreaker: it should notify listeners so diagnostics can tell
+        which side produced the result.
+        """
+        events = []
+
+        class Listener(CircuitBreakerListener):
+            def fallback_call(self, cb, exc):
+                events.append(("fallback_call", type(exc)))
+
+            def fallback_success(self, cb, exc):
+                events.append(("fallback_success", type(exc)))
+
+            def fallback_failure(self, cb, exc, fallback_exc):
+                events.append(("fallback_failure", type(exc), type(fallback_exc)))
+
+            def success(self, cb):
+                events.append(("success",))
+
+        breaker = CircuitBreaker(
+            fallback=lambda: "fallback",
+            fallback_exceptions=(IOError,),
+            listeners=[Listener()],
+        )
+
+        def err():
+            raise OSError
+
+        assert breaker.call(err) == "fallback"
+        assert events == [("fallback_call", OSError), ("fallback_success", OSError)]
+
+        def broken_fallback():
+            raise RuntimeError("broken")
+
+        breaker = CircuitBreaker(
+            fallback=broken_fallback,
+            fallback_exceptions=(IOError,),
+            listeners=[Listener()],
+        )
+        with pytest.raises(CircuitBreakerFallbackError):
+            breaker.call(err)
+        assert events[-1] == ("fallback_failure", OSError, RuntimeError)
+
+    @testing.gen_test
+    def test_async_fallback_awaited(self):
+        """CircuitBreaker: it should await an async fallback according to the
+        same rules as the guarded function.
+        """
+
+        @gen.coroutine
+        def err():
+            raise OSError
+
+        @gen.coroutine
+        def fallback():
+            raise gen.Return("fallback")
+
+        breaker = CircuitBreaker(fallback=fallback, fallback_exceptions=(IOError,))
+        ret = yield breaker.call_async(err)
+        assert ret == "fallback"
+        assert breaker.fail_counter == 1
+
+    @testing.gen_test
+    def test_async_fallback_failure(self):
+        """CircuitBreaker: it should preserve both causes when an async
+        fallback fails.
+        """
+
+        @gen.coroutine
+        def err():
+            raise OSError("primary")
+
+        @gen.coroutine
+        def fallback():
+            raise RuntimeError("fallback broken")
+
+        breaker = CircuitBreaker(fallback=fallback, fallback_exceptions=(IOError,))
+        with pytest.raises(CircuitBreakerFallbackError) as exc_info:
+            yield breaker.call_async(err)
+
+        assert isinstance(exc_info.value.primary_error, OSError)
+        assert isinstance(exc_info.value.fallback_error, RuntimeError)
+
+    @testing.gen_test
+    def test_async_business_exception_propagates(self):
+        """CircuitBreaker: it should not swallow async business exceptions,
+        even when a fallback is configured.
+        """
+
+        @gen.coroutine
+        def err():
+            raise ValueError
+
+        fallback = mock.MagicMock()
+        breaker = CircuitBreaker(fallback=fallback, fallback_exceptions=(IOError,))
+        with pytest.raises(ValueError):
+            yield breaker.call_async(err)
+        fallback.assert_not_called()
+
+    @testing.gen_test
+    def test_async_fallback_on_open_circuit(self):
+        """CircuitBreaker: it should answer short-circuited async calls with
+        the fallback result.
+        """
+
+        @gen.coroutine
+        def err():
+            raise NotImplementedError
+
+        breaker = CircuitBreaker(fail_max=1, fallback=lambda: "fallback")
+        ret = yield breaker.call_async(err)
+        assert ret == "fallback"
+        assert breaker.current_state == "open"
+        assert breaker.fail_counter == 1
+
+
 if __name__ == "__main__":
     unittest.main()

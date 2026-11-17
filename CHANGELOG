@@ -1,6 +1,13 @@
 Changelog
 =========
 
+Unreleased
+
+* Add explicit fallback strategy: new `fallback`, `fallback_exceptions` and `fallback_on_open`
+  parameters on `CircuitBreaker`, the `CircuitBreakerFallbackError` exception preserving both
+  the primary and fallback causes, and the `fallback_call` / `fallback_success` /
+  `fallback_failure` listener hooks for diagnostics
+
 Version 1.4.0 (July 6, 2025)
 
 * Add success_threshold parameter (Thanks @sideshowbandana)
