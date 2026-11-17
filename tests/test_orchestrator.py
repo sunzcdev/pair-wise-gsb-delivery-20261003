@@ -450,7 +450,9 @@ def test_fallback_when_no_valid_candidates(monkeypatch: pytest.MonkeyPatch):
     """When validity filtering eliminates all candidates, return fallback."""
     from chardet.pipeline import orchestrator  # noqa: PLC0415
 
-    monkeypatch.setattr(orchestrator, "filter_by_validity", lambda _data, _cands: ())
+    monkeypatch.setattr(
+        orchestrator, "assess_candidates", lambda _data, _cands, **_kw: ()
+    )
     # Data must bypass BOM, UTF-16/32, escape, binary, markup, ASCII, and UTF-8
     data = bytes(range(0x80, 0x100)) * 2
     result = run_pipeline(data, EncodingEra.ALL)

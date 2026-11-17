@@ -19,7 +19,9 @@ import pytest
 import chardet
 from chardet import UniversalDetector
 from chardet._utils import (
+    DECODE_TAIL_INCOMPLETE,
     DEFAULT_MAX_BYTES,
+    assess_decode,
     dangling_tail_with_ascii_prefix,
     decodes_completely,
     decodes_without_error,
@@ -27,7 +29,7 @@ from chardet._utils import (
 from chardet.enums import EncodingEra
 from chardet.output_names import decodes_under_public_name
 from chardet.pipeline.markup import detect_markup_charset
-from chardet.pipeline.validity import filter_by_validity
+from chardet.pipeline.validity import assess_candidates, filter_by_validity
 from chardet.registry import REGISTRY, get_candidates
 
 _ZH = "這是一個用於測試編碼偵測的中文句子，內容足夠長以便統計模型能夠正確判斷。"
@@ -72,6 +74,98 @@ def test_truncated_tail_keeps_encoding_as_candidate():
     )
     assert candidates
     assert filter_by_validity(data, candidates)
+
+
+def test_tail_tolerance_is_only_for_a_character_the_data_could_finish():
+    """A cut sequence at the end is tolerated; a dead one is not.
+
+    The window really was cut through the next character: the trailing byte
+    is a lead and one more byte completes it.  A lead no character begins
+    with is corruption at the end of the window exactly as it would be in
+    the middle -- the tolerance is for a prefix of a valid sequence, not for
+    whatever byte happens to be last.
+    """
+    cp932_text = "これはテストです".encode("cp932")
+    assert assess_decode(cp932_text[:-1], "cp932").is_valid
+    # 0xEB leads no CP932 character under any second byte.
+    assert not assess_decode(cp932_text + b"\xeb", "cp932").is_valid
+    cp932_only = tuple(e for e in get_candidates(EncodingEra.ALL) if e.name == "cp932")
+    assert filter_by_validity(cp932_text + b"\xeb", cp932_only) == ()
+
+
+def test_dead_lead_bytes_eliminate_the_candidate():
+    """Leads no character begins with are corruption, not cut characters.
+
+    CPython's incremental decoders defer these prefixes instead of raising,
+    so a ``final=False`` decode alone used to accept them -- and the codec
+    would still reject the same bytes as a complete file.
+    """
+    for data, encoding, tail in (
+        (b"hello ", "cp932", b"\xeb"),
+        (b"hello ", "cp932", b"\x85"),
+        (b"\xbf\xc8\xb3\xe7", "euc_kr", b"\xff"),
+        (b"\xbf\xc8\xb3\xe7", "euc_kr", b"\x80"),
+        (b"\xd6\xd0\xce\xc4", "gbk", b"\x80"),
+        (b"h\xc3\xa9llo ", "utf-8", b"\xed\xa0"),
+    ):
+        candidate = data + tail
+        assert not decodes_without_error(candidate, encoding), (encoding, tail)
+        assert not decodes_completely(candidate, encoding), (encoding, tail)
+
+
+def test_a_cut_character_is_deferred_not_invalid():
+    """The same path must still keep a real prefix of a character."""
+    for data, encoding in (
+        (b"\x82\xb1\x82\xf1\x82", "shift_jis"),
+        (b"\xbf\xc8\xb3\xe7\xa1", "euc_kr"),
+        (b"\xd6\xd0\xce\xc4\xd6", "gbk"),
+        (b"h\xc3\xa9llo caf\xc3", "utf-8"),
+        (b"h\xc3\xa9llo caf\xe3\x81", "utf-8"),
+    ):
+        assert decodes_without_error(data, encoding), (encoding, data)
+        assert not decodes_completely(data, encoding), (encoding, data)
+
+
+def test_cut_character_after_real_text_survives_a_complete_window():
+    """Real multi-byte text is evidence; validity keeps the candidate for it.
+
+    A whole file genuinely ending mid-character cannot be decoded by anybody,
+    so validity does not pretend the candidate is bad -- the ranking's own
+    decode-safety tiebreak picks among the candidates that can decode it.
+    """
+    body = (_ZH * 4).encode("gbk")[:-1]
+    gbk_only = tuple(e for e in get_candidates(EncodingEra.ALL) if e.name == "gbk")
+    assert filter_by_validity(body, gbk_only, window_complete=True) == gbk_only
+
+
+def test_tail_only_evidence_does_not_survive_a_complete_window():
+    """ASCII plus a cut sequence is not evidence on the caller's whole file.
+
+    Nothing follows the file, so the missing character can never arrive; the
+    candidate's only non-ASCII was the byte that is not there.
+    """
+    data = b"hello world caf\xc3"
+    utf8_only = tuple(e for e in get_candidates(EncodingEra.ALL) if e.name == "utf-8")
+    assert filter_by_validity(data, utf8_only) == utf8_only
+    assert filter_by_validity(data, utf8_only, window_complete=True) == ()
+
+
+def test_assess_candidates_carries_the_decode_state():
+    """Candidates leave validity with their verdict, not just their names."""
+    cut = "これはテストです".encode("cp932")[:-1]
+    cp932_only = tuple(e for e in get_candidates(EncodingEra.ALL) if e.name == "cp932")
+    assessed = assess_candidates(cut, cp932_only, window_complete=False)
+    assert len(assessed) == 1
+    encoding, assessment = assessed[0]
+    assert encoding.name == "cp932"
+    assert assessment.status == DECODE_TAIL_INCOMPLETE
+    assert assessment.pending
+    assert not assessment.tail_is_all_evidence
+
+    ascii_cut = b"hello world caf\xc3"
+    utf8_only = tuple(e for e in get_candidates(EncodingEra.ALL) if e.name == "utf-8")
+    (_, assessment) = assess_candidates(ascii_cut, utf8_only, window_complete=False)[0]
+    assert assessment.tail_is_all_evidence
 
 
 def test_illegal_trail_byte_still_eliminates_encoding():

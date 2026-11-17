@@ -128,6 +128,31 @@ Unreleased
   the declared name.
   (`Dan Blanchard <https://github.com/dan-blanchard>`_ via Claude,
   `#438 <https://github.com/chardet/chardet/pull/438>`_)
+- Byte-validity filtering no longer excuses an illegal sequence just
+  because it sits at the end of the data.  Only a *prefix of a valid
+  character* cut off by the end of the window is tolerated; a byte the
+  codec cannot read, or a lead no character begins with, is corruption
+  wherever it lands.  CPython's incremental decoders defer several such
+  prefixes instead of raising, so a ``final=False`` decode accepted them:
+  ``EB`` under CP932, ``FF`` and ``80`` under EUC-KR, ``80`` under GBK,
+  ``ED A0`` under UTF-8.  A candidate the codec cannot decode as a
+  complete file could therefore stay in the set and win.
+  (`Dan Blanchard <https://github.com/dan-blanchard>`_ via Claude)
+- The tail exemption is now withheld where it would credit a byte that is
+  not there.  A tail that is a candidate's *only* non-ASCII evidence
+  supports nothing, since the missing byte is what it rests on; on a
+  caller's complete file that candidate is dropped, because nothing can
+  complete the cut and the caller's own ``.decode()`` would hit it.  Text
+  with real multi-byte content cut mid-character, by the caller or by
+  ``max_bytes``, keeps its answer.
+  (`Dan Blanchard <https://github.com/dan-blanchard>`_ via Claude)
+- Each validity survivor now carries its decode verdict — complete, cut
+  at the end, or invalid — instead of the verdict being thrown away and
+  re-derived by later stages.  ``detect_all`` uses it to check every
+  listed candidate against the whole window past the evidence cap, not
+  just the entries down to the winner; a long window whose tail breaks
+  some runner-ups used to report them as if they had passed.
+  (`Dan Blanchard <https://github.com/dan-blanchard>`_ via Claude)
 
 **Build:**
 

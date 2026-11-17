@@ -11,6 +11,8 @@ winner-first decode of the ranking after the bounded stages settle.
 
 from __future__ import annotations
 
+import codecs
+
 import chardet
 from chardet._utils import DEFAULT_MAX_BYTES, EVIDENCE_CAP_BYTES
 from chardet.pipeline import DetectionResult
@@ -79,12 +81,71 @@ def test_no_candidate_decoding_the_window_falls_back() -> None:
     assert (result["encoding"], result["confidence"]) == ("Windows-1252", 0.10)
 
 
+def test_detect_all_verifies_every_listed_candidate_past_the_cap() -> None:
+    """Every candidate ``detect_all`` reports passed the whole-window decode.
+
+    ``detect()`` needs only its winner checked, but ``detect_all`` reports
+    the whole ranking, and an entry that fails the same validity rule the
+    ranking was filtered by is not a candidate at all.  Before, only the
+    entries down to the first decodable one were re-examined past the cap,
+    so entries that cannot decode the window were still printed as if they
+    had passed -- five of them on the input below.
+    """
+    body = _beyond_cap(
+        "Le cœur a ses raisons que la raison ne connaît point. ".encode("cp1252")
+    )
+    with_garbage = body + b"\x81\x8d\x9d" * 50
+
+    ranking = chardet.detect_all(
+        with_garbage, max_bytes=len(with_garbage), ignore_threshold=True
+    )
+    assert ranking
+    assert len(ranking) > 1
+    checked = 0
+    for entry in ranking:
+        encoding = entry["encoding"]
+        if encoding is None:
+            continue
+        checked += 1
+        # Every listed name decodes the window under the same judgment
+        # validity applies, so the reported ranking is one that was checked.
+        assert not _fails_whole_window(with_garbage, encoding), encoding
+    # The ranking really did reach past the winner: the old winner-first
+    # walk left several failing entries in the list, and at least this many
+    # entries survive the check.
+    assert checked > 5
+    # And the winner is the top of that same ranking.
+    assert chardet.detect(with_garbage, max_bytes=len(with_garbage))["encoding"] == (
+        ranking[0]["encoding"]
+    )
+
+
+def _fails_whole_window(data: bytes, encoding: str) -> bool:
+    """Whether *encoding* raises anywhere while decoding *data*."""
+    decoder = codecs.getincrementaldecoder(encoding)()
+    try:
+        decoder.decode(data, final=False)
+    except UnicodeError:
+        return True
+    try:
+        decoder.decode(b"", final=True)
+    except UnicodeError:
+        # A cut character at the end is the one thing validity tolerates.
+        return not decoder.getstate()[0]
+    return False
+
+
 def test_validity_hold_skips_entries_without_an_encoding() -> None:
     """An encoding-less entry is not decodable and cannot satisfy the hold."""
     data = b"x" * (EVIDENCE_CAP_BYTES + 1)
     results = [DetectionResult(None, 0.0, None), DetectionResult("ascii", 0.5, None)]
     held = _hold_validity_past_cap(
-        data, data[:EVIDENCE_CAP_BYTES], results, frozenset({"ascii"}), "ascii"
+        data,
+        data[:EVIDENCE_CAP_BYTES],
+        results,
+        frozenset({"ascii"}),
+        "ascii",
+        window_complete=True,
     )
     assert [r.encoding for r in held] == ["ascii"]
 

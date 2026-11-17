@@ -75,14 +75,22 @@ order:
 
 9. **Byte Validity Filtering** — Attempts to decode the data with each
    candidate encoding's Python codec. Any encoding that raises a decode
-   error is eliminated. An incomplete multi-byte sequence at the very end
-   of the data does not count as an error: detection input is usually a
-   prefix of a larger whole, so a partial trailing character means the
-   input was cut mid-character rather than that the encoding is wrong.
-   This stage and the four after it read at most the first 256 KiB of
-   the window, which is above the default ``max_bytes``; past that cap
-   the winner is still decoded over the whole window, and a winner that
-   fails yields to the next candidate that decodes.
+   error is eliminated. The end of the data is treated differently from the
+   middle, but only in one direction: a *prefix of a valid character* cut
+   off by the end of the data is not an error, because detection input is
+   usually a prefix of a larger whole and a partial trailing character
+   means the input was cut mid-character. An *illegal* sequence is an error
+   wherever it sits — a byte the codec cannot map, or a lead no character
+   begins with, is corruption even when it is the last thing in the window.
+   A cut that is a candidate's *only* non-ASCII evidence is dropped once
+   the caller's whole file has been examined: nothing can complete it, and
+   their own ``.decode()`` will hit the tail. Each candidate leaves this
+   stage with its verdict — complete, cut at the end, or invalid — so
+   later stages never re-decode to ask the same question. This stage and
+   the four after it read at most the first 256 KiB of the window, which
+   is above the default ``max_bytes``; past that cap every listed answer is
+   decoded over the whole window, and a winner that fails yields to the
+   next candidate that decodes.
 
 10. **CJK Gating** — Eliminates CJK candidates that lack genuine
     multi-byte structure. Checks pair ratio, high-byte count, byte

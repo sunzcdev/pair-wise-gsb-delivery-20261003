@@ -7,7 +7,12 @@ annotations.
 
 import warnings
 
-from chardet._utils import DEFAULT_MAX_BYTES, EVIDENCE_CAP_BYTES, decodes_without_error
+from chardet._utils import (
+    DEFAULT_MAX_BYTES,
+    EVIDENCE_CAP_BYTES,
+    assess_decode,
+    decodes_without_error,
+)
 from chardet.enums import EncodingEra
 from chardet.pipeline import (
     _NONE_RESULT,
@@ -32,7 +37,7 @@ from chardet.pipeline.structural import (
 )
 from chardet.pipeline.utf8 import scan_utf8
 from chardet.pipeline.utf1632 import detect_utf1632_patterns
-from chardet.pipeline.validity import filter_by_validity
+from chardet.pipeline.validity import assess_candidates
 from chardet.registry import EncodingInfo, get_candidates
 
 _BINARY_RESULT = DetectionResult(
@@ -83,34 +88,65 @@ def _hold_validity_past_cap(
     results: list[DetectionResult],
     allowed: frozenset[str],
     no_match_encoding: str,
+    *,
+    window_complete: bool,
+    verify_whole_ranking: bool = False,
 ) -> list[DetectionResult]:
     """Keep the validity contract for the part of the window past the evidence cap.
 
     Byte-validity filtering converges on the first ``EVIDENCE_CAP_BYTES``
     of the window (ADR-0006), so on a longer window a candidate that
     cannot decode the rest can still reach the top.  What callers rely on
-    is that the answer decodes the window chardet examined: they pass
-    ``max_bytes`` precisely to say how much of the input the verdict is
-    about.  So walk the corrected ranking and drop every entry ahead of
-    the first one that decodes the whole window, under the same tolerant
-    judgment the validity filter passes on the evidence slice.  Those
-    entries are what validity would have removed had it seen the bytes;
-    the survivors keep their own ranks and confidences, since nothing
-    about the evidence they were scored on has changed.
+    is that every answer decodes the window chardet examined -- the same
+    judgment the validity stage passed on the evidence slice, now applied
+    to the bytes it never saw.  So walk the corrected ranking and drop
+    every entry that fails it, by the same
+    :meth:`~chardet._utils.DecodeAssessment.is_acceptable` rule validity
+    used, which is why *window_complete* travels down here too.  Entries
+    that survive keep their own ranks and confidences, since nothing about
+    the evidence they were scored on has changed.
+
+    ``detect()`` needs only the winner, so the walk stops at the first
+    entry that passes and drops the ones ahead of it.  ``detect_all``
+    reports the whole ranking, so every listed candidate has to have been
+    checked: with *verify_whole_ranking*, entries below the first passing
+    one are decoded too, and the ones that fail are removed rather than
+    left in place to be reported as if they had passed.  That is the
+    difference between a verified ranking and one where only the winner was
+    ever tested against the bytes it is a claim about.
 
     The walk is bounded by the ranking's length, each step is one C-speed
     decode that stops at the first bad byte, and it costs nothing at all
     when the window fits inside the cap, which every default call does.
-    Entries below the first decodable one are not re-examined, so a
-    ``detect_all`` ranking on a long window is exact down to its winner
-    and unverified past it.  When no listed entry decodes, the answer is
-    the no-match fallback, as it is when validity leaves nothing.
+    When no listed entry passes, the answer is the no-match fallback, as it
+    is when validity leaves nothing.
     """
     if len(data) <= len(evidence):
         return results
-    for i, r in enumerate(results):
-        if r.encoding is not None and decodes_without_error(data, r.encoding):
-            return results if i == 0 else results[i:]
+
+    def acceptable(encoding: str) -> bool:
+        # Reassessed on *data*, not read from ``ctx.decode_assessments``:
+        # those verdicts are about the evidence slice, which is a prefix of
+        # the window, and the question here is the bytes it never saw.
+        return assess_decode(data, encoding).is_acceptable(
+            window_complete=window_complete
+        )
+
+    if verify_whole_ranking:
+        survivors = [
+            r for r in results if r.encoding is not None and acceptable(r.encoding)
+        ]
+        if survivors:
+            return survivors
+    else:
+        for i, r in enumerate(results):
+            if r.encoding is not None and acceptable(r.encoding):
+                # ``detect()`` reports the winner; the entries behind it were
+                # never part of this contract and are left as the ranking
+                # produced them.
+                return results[i:]
+            # Nothing ahead of the winner is verified: ``detect()`` reads
+            # only the first entry, and that one has to decode.
     return _make_fallback_or_none(
         no_match_encoding, allowed, "no_match_encoding", stacklevel=7
     )
@@ -281,6 +317,14 @@ def _run_pipeline_core(  # noqa: PLR0913, PLR0915
     input_truncated = input_truncated or len(data) > max_bytes
     data = data[:max_bytes]
 
+    # Whether the window is the caller's whole input.  This is the one bit
+    # of truncation information every stage that judges decode validity
+    # needs, so it is computed once here and passed down: a window that is
+    # complete must decode completely (the caller is about to run the same
+    # ``.decode()``), while a window cut by ``max_bytes`` or by a caller's
+    # own buffer may end inside a character.
+    window_complete = not input_truncated
+
     # Build candidate set once — used for both early-exit gating and
     # statistical scoring.  The set incorporates encoding_era, include, and
     # exclude filters so all pipeline stages are gated consistently.
@@ -402,8 +446,17 @@ def _run_pipeline_core(  # noqa: PLR0913, PLR0915
     evidence = data[:EVIDENCE_CAP_BYTES]
     evidence_truncated = input_truncated or len(data) > len(evidence)
 
-    # Stage 2a: Byte validity filtering
-    valid_candidates = filter_by_validity(evidence, candidates)
+    # Stage 2a: Byte validity filtering.  The truncation information is the
+    # one bit that decides whether a tail-only candidate survives, and it is
+    # the *evidence slice's* completeness that matters here: a slice cut at
+    # the cap is a prefix of bytes chardet does hold, so the character it
+    # ends inside may well be completed by them.  Only when the slice is the
+    # caller's whole input is nothing left to complete it, and only then is
+    # the tail-only exemption withdrawn.
+    assessed = assess_candidates(
+        evidence, candidates, window_complete=not evidence_truncated
+    )
+    valid_candidates = tuple(enc for enc, _ in assessed)
 
     # The exhaustive UTF-8 check saw the whole window; when it *rejected*
     # the data but the window extends past the evidence cap, the slice
@@ -456,7 +509,13 @@ def _run_pipeline_core(  # noqa: PLR0913, PLR0915
                     evidence, results, input_truncated=evidence_truncated
                 )
                 return _hold_validity_past_cap(
-                    data, evidence, results, allowed, no_match_encoding
+                    data,
+                    evidence,
+                    results,
+                    allowed,
+                    no_match_encoding,
+                    window_complete=window_complete,
+                    verify_whole_ranking=full_ranking,
                 )
 
     # Stage 3: Statistical scoring for all remaining candidates.
@@ -472,7 +531,15 @@ def _run_pipeline_core(  # noqa: PLR0913, PLR0915
     # Rank corrections reason about the same evidence window the ranking
     # came from, which also bounds their byte-presence scans.
     results = postprocess_results(evidence, results, input_truncated=evidence_truncated)
-    return _hold_validity_past_cap(data, evidence, results, allowed, no_match_encoding)
+    return _hold_validity_past_cap(
+        data,
+        evidence,
+        results,
+        allowed,
+        no_match_encoding,
+        window_complete=window_complete,
+        verify_whole_ranking=full_ranking,
+    )
 
 
 def run_pipeline(  # noqa: PLR0913

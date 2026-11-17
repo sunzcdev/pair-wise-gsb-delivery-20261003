@@ -46,7 +46,7 @@ Listed in execution order. Each stage's name matches its module in `chardet.pipe
 6. **Markup charset** — `<meta charset>`, `<?xml encoding>`, PEP 263 coding-declaration extraction, including declarations inside EBCDIC-encoded markup. The stage owns the whole decision: it walks the **declaration**s the parser yields, stops at the first whose name (or Windows superset, see **markup superset promotion**) decodes the window, answers with it if the caller's filters allow it and with nothing if they don't, decodes each failed encoding once however often the head repeats it, and yields to the UTF-8 precheck when the data has genuine multi-byte UTF-8 structure, keeping the declaration's MIME type.
 7. **ASCII** — pure-7-bit fast path.
 8. **UTF-8 validation** — multi-byte structural check.
-9. **Byte-validity filtering** — drop candidates whose codec cannot decode the data. An incomplete multi-byte sequence at the very end is tolerated, since the input is usually a prefix of a larger whole.
+9. **Byte-validity filtering** — drop candidates whose codec cannot decode the data. One whole-window decode per candidate, and the verdict travels on: **complete**, **tail-incomplete** (a character the window ends inside, with the deferred bytes kept), or **invalid**. Only a prefix of a valid sequence counts as a cut; a deferred prefix no continuation could complete is corruption. A cut after real multi-byte text is tolerated. A cut that is a candidate's *only* evidence is dropped once the window is confirmed complete.
 10. **CJK gating** — drop CJK candidates lacking multi-byte structure (pair ratio, high-byte count, byte coverage, lead-byte diversity).
 11. **Structural probing** — score multi-byte encoding fit (`pipeline/structural.py`).
 12. **Statistical scoring** — bigram cosine similarity against language-specific **BigramProfile**s.
@@ -63,6 +63,15 @@ The caller-controlled bound on how much of the input detection looks at, set by 
 
 **Exhaustive check**:
 A detection check that is exact over every byte of the **examination window**: BOM, magic numbers, UTF-8 structural validation, ASCII, binary detection, and escape-sequence *presence*. An exhaustive check's verdict cannot be wrong about bytes it was given — chardet never calls data UTF-8 that is not valid UTF-8 throughout the window.
+
+**Decode assessment** (`_utils.DecodeAssessment`):
+One candidate's whole-window decode verdict, produced by `_utils.assess_decode`. `status` is `DECODE_COMPLETE` (ended on a character boundary), `DECODE_TAIL_INCOMPLETE` (stopped inside a sequence some continuation could finish, with those bytes in `pending`), or `DECODE_INVALID` (a byte the codec cannot read, or a deferred prefix no continuation could complete). `tail_is_all_evidence` marks a tail that is the candidate's only non-ASCII output. The validity stage keeps it on every survivor so later stages never re-decode to ask the same question.
+
+**Cut character vs. corruption**:
+The distinction the **Decode assessment** exists to draw. A *cut character* is a prefix of a valid sequence the window ends inside — the data may simply go on past the exam. *Corruption* is a byte the codec cannot read, or a lead no continuation completes (`0xEB` for CP932, `ED A0` for UTF-8). Validity tolerates the first and rejects the second, whether it sits mid-window or at the very end; position does not make an illegal sequence legal.
+
+**Tail exemption**:
+Whether a **cut character** at the end of the window may be credited as evidence. A cut after real multi-byte text stands everywhere — the evidence is present and a file genuinely ending mid-character cannot be decoded by anyone, so the decode-safety tiebreak picks among the candidates that can. A cut that is the candidate's *only* evidence is dropped once the window is confirmed complete: nothing can finish it, and the caller's own `.decode()` hits the tail.
 
 **Evidence cap**:
 An internal, unoverridable bound on how much of the **examination window** a filtering, validation, or scoring stage consumes before its answer is considered converged (statistical scoring, language detection, postprocess evidence scans, UTF-16/32 sampling all carry one). A convergence bound, not a correctness bound: more bytes are not expected to change the answer. Evidence caps are documented, not hidden; **exhaustive checks** take none.
