@@ -333,6 +333,445 @@ class SmokeTest(IsolatedAsyncioTestCase):
             # Non-deterministic functions cannot be used in indexes
             await db.execute("create index t on foo(one_arg(bar))")
 
+    async def test_create_function_errors_are_opaque_by_default(self):
+        """Without diagnostics, callback failures look exactly like before"""
+
+        def boom(value):
+            raise ValueError("kaboom")
+
+        async with aiosqlite.connect(self.db) as db:
+            await db.create_function("boom", 1, boom)
+            with self.assertRaisesRegex(
+                OperationalError, "user-defined function raised exception"
+            ) as caught:
+                await db.execute("select boom(1)")
+
+        exc = caught.exception
+        self.assertFalse(hasattr(exc, "udf_diagnostics"))
+        self.assertIsNone(exc.__cause__)
+        self.assertEqual(db.last_udf_failures, ())
+
+    async def test_create_function_diagnostics_capture_cause(self):
+        """Diagnostics attach the real Python exception and keep the type"""
+
+        def boom(value):
+            raise ValueError("kaboom")
+
+        async with aiosqlite.connect(self.db) as db:
+            await db.set_function_diagnostics(True)
+            await db.create_function("boom", 1, boom)
+
+            with self.assertRaises(OperationalError) as caught:
+                await db.execute("select boom(1)")
+
+            failures = caught.exception.udf_diagnostics
+            self.assertIs(caught.exception.udf_failure, failures[0])
+            self.assertEqual(len(failures), 1)
+
+            failure = failures[0]
+            self.assertEqual(failure.function, "boom")
+            self.assertEqual(failure.phase, aiosqlite.UDF_PHASE_CALL)
+            self.assertEqual(failure.operation, "execute")
+            self.assertIsInstance(failure.exception, ValueError)
+            self.assertEqual(str(failure.exception), "kaboom")
+            self.assertIs(failure.cause, failure.exception)
+            self.assertEqual(failure.callable_name, "boom")
+            self.assertIn("boom", str(failure))
+
+            # The SQLite error keeps its identity, and the Python cause travels
+            # from the worker thread back to the event loop.
+            self.assertIsInstance(caught.exception, sqlite3.Error)
+            self.assertIs(caught.exception.__cause__, failure.exception)
+            self.assertEqual(
+                caught.exception.args,
+                ("user-defined function raised exception",),
+            )
+
+            # Values are not captured by default.
+            self.assertIsNone(failure.arguments)
+            self.assertIsNone(failure.sql)
+
+            self.assertEqual(db.last_udf_failures, failures)
+
+    async def test_create_function_diagnostics_include_worker_thread(self):
+        """Failure records identify the worker thread and connection"""
+
+        def boom(value):
+            raise RuntimeError("nope")
+
+        async with aiosqlite.connect(self.db) as db:
+            await db.set_function_diagnostics(True)
+            await db.create_function("boom", 1, boom)
+            worker = db._thread
+
+            with self.assertRaises(OperationalError) as caught:
+                await db.execute("select boom(1)")
+
+        failure = caught.exception.udf_diagnostics[0]
+        self.assertEqual(failure.thread_name, worker.name)
+        self.assertNotEqual(failure.thread_id, None)
+        self.assertEqual(failure.connection_id, db._connection_id)
+
+    async def test_create_function_diagnostics_distinguish_return_phase(self):
+        """A rejected return value is separate from a raised exception"""
+
+        def raised(value):
+            raise TypeError("internal blow up")
+
+        def returned(value):
+            return object()
+
+        async with aiosqlite.connect(self.db) as db:
+            await db.set_function_diagnostics(True)
+            await db.create_function("raised", 1, raised)
+            await db.create_function("returned", 1, returned)
+
+            with self.assertRaises(OperationalError) as caught:
+                await db.execute("select raised(1)")
+            raised_failure = caught.exception.udf_diagnostics[0]
+
+            with self.assertRaises(OperationalError) as caught:
+                await db.execute("select returned(1)")
+            returned_failure = caught.exception.udf_diagnostics[0]
+
+        self.assertEqual(raised_failure.phase, aiosqlite.UDF_PHASE_CALL)
+        self.assertIsInstance(raised_failure.exception, TypeError)
+        self.assertEqual(raised_failure.function, "raised")
+
+        self.assertEqual(returned_failure.phase, aiosqlite.UDF_PHASE_RETURN)
+        self.assertEqual(returned_failure.function, "returned")
+        self.assertEqual(returned_failure.returned_type, "object")
+        self.assertIsInstance(
+            returned_failure.exception, aiosqlite.UDFReturnValueError
+        )
+        # Both surface as the same SQLite error class.
+        self.assertNotEqual(raised_failure.phase, returned_failure.phase)
+
+    async def test_create_function_diagnostics_do_not_leak_between_statements(self):
+        """A failing statement must not taint the next one"""
+
+        def boom(value):
+            raise ValueError("kaboom")
+
+        def fine(value):
+            return value
+
+        async with aiosqlite.connect(self.db) as db:
+            await db.set_function_diagnostics(True)
+            await db.create_function("boom", 1, boom)
+            await db.create_function("fine", 1, fine)
+
+            with self.assertRaises(OperationalError):
+                await db.execute("select boom(1)")
+
+            async with db.execute("select fine(7)") as cursor:
+                self.assertEqual(await cursor.fetchall(), [(7,)])
+
+            # A completely unrelated sqlite error carries no stale diagnostics.
+            with self.assertRaises(OperationalError) as caught:
+                await db.execute("select * from not_a_table")
+            self.assertFalse(hasattr(caught.exception, "udf_diagnostics"))
+
+    async def test_create_function_diagnostics_keep_transaction_state(self):
+        """Diagnostics must not change transaction outcomes or re-run calls"""
+
+        calls = []
+
+        def boom(value):
+            calls.append(value)
+            raise ValueError("kaboom")
+
+        async with aiosqlite.connect(self.db) as db:
+            await db.set_function_diagnostics(True)
+            await db.execute("create table usage (value integer)")
+            await db.create_function("boom", 1, boom)
+
+            with self.assertRaises(OperationalError):
+                await db.execute("insert into usage values (boom(11))")
+
+            self.assertEqual(calls, [11])
+            self.assertTrue(db.in_transaction)
+            cursor = await db.execute("select count(*) from usage")
+            self.assertEqual(await cursor.fetchone(), (0,))
+            await db.rollback()
+            self.assertFalse(db.in_transaction)
+
+    async def test_create_function_capture_values_is_opt_in(self):
+        """Argument values are only recorded when explicitly requested"""
+
+        def boom(value):
+            raise ValueError("kaboom")
+
+        async with aiosqlite.connect(self.db) as db:
+            await db.set_function_diagnostics(
+                True, capture_values=True, capture_sql=True
+            )
+            await db.create_function("boom", 1, boom)
+
+            with self.assertRaises(OperationalError) as caught:
+                await db.execute("select boom(?)", ["secret-value"])
+
+            failure = caught.exception.udf_diagnostics[0]
+            self.assertEqual(failure.arguments, ("'secret-value'",))
+            self.assertEqual(failure.sql, "select boom(?)")
+
+    async def test_create_function_capture_sql_is_opt_in(self):
+        """Statement text is withheld unless capture_sql is requested"""
+
+        def boom(value):
+            raise ValueError("kaboom")
+
+        async with aiosqlite.connect(self.db) as db:
+            await db.set_function_diagnostics(True, capture_values=True)
+            await db.create_function("boom", 1, boom)
+
+            with self.assertRaises(OperationalError) as caught:
+                await db.execute("select boom(?)", ["secret-value"])
+
+        failure = caught.exception.udf_diagnostics[0]
+        self.assertEqual(failure.arguments, ("'secret-value'",))
+        self.assertIsNone(failure.sql)
+
+    async def test_create_function_diagnostics_bound_recorded_arguments(self):
+        """Captured arguments stay short instead of holding whole payloads"""
+
+        def boom(value):
+            raise ValueError("kaboom")
+
+        async with aiosqlite.connect(self.db) as db:
+            await db.set_function_diagnostics(True, capture_values=True)
+            await db.create_function("boom", 1, boom)
+
+            with self.assertRaises(OperationalError) as caught:
+                await db.execute("select boom(?)", ["z" * 5000])
+
+        rendered = caught.exception.udf_diagnostics[0].arguments[0]
+        self.assertLess(len(rendered), 100)
+        self.assertIn("5000 chars", rendered)
+
+    async def test_create_function_diagnostics_can_be_pinned_per_function(self):
+        """Per-function settings override the connection default"""
+
+        def boom(value):
+            raise ValueError("kaboom")
+
+        def other(value):
+            raise ValueError("also kaboom")
+
+        async with aiosqlite.connect(self.db) as db:
+            await db.set_function_diagnostics(False)
+            await db.create_function("boom", 1, boom, diagnostics=True)
+            await db.create_function("other", 1, other)
+
+            with self.assertRaises(OperationalError) as caught:
+                await db.execute("select boom(1)")
+            self.assertEqual(caught.exception.udf_diagnostics[0].function, "boom")
+
+            with self.assertRaises(OperationalError) as caught:
+                await db.execute("select other(1)")
+            self.assertFalse(hasattr(caught.exception, "udf_diagnostics"))
+
+    async def test_create_function_diagnostics_ignore_valid_returns(self):
+        """Normal SQLite return types are never reported as return failures"""
+
+        values = {
+            "nothing": None,
+            "number": 7,
+            "flag": True,
+            "ratio": 1.5,
+            "text": "value",
+            "blob": b"value",
+            "buffer": bytearray(b"value"),
+            "limit": 2**63 - 1,
+        }
+
+        async with aiosqlite.connect(self.db) as db:
+            await db.set_function_diagnostics(True)
+            for name, value in values.items():
+                await db.create_function("value_" + name, 0, lambda value=value: value)
+
+            for name in values:
+                cursor = await db.execute(f"select value_{name}()")
+                row = await cursor.fetchone()
+                self.assertEqual(len(row), 1)
+            self.assertEqual(db.last_udf_failures, ())
+
+    async def test_create_function_diagnostics_keep_sqlite_error_type(self):
+        """A callback raising a sqlite3 error still yields a sqlite3 error"""
+
+        def boom(value):
+            raise sqlite3.IntegrityError("conflict")
+
+        async with aiosqlite.connect(self.db) as db:
+            await db.set_function_diagnostics(True)
+            await db.create_function("boom", 1, boom)
+
+            with self.assertRaises(sqlite3.Error) as caught:
+                await db.execute("select boom(1)")
+
+        failure = caught.exception.udf_diagnostics[0]
+        self.assertEqual(failure.phase, aiosqlite.UDF_PHASE_CALL)
+        self.assertIsInstance(failure.exception, sqlite3.IntegrityError)
+
+    async def test_create_function_diagnostics_survive_fetch(self):
+        """Failures raised while fetching rows are attributed too"""
+
+        def boom(value):
+            if value == 3:
+                raise ValueError("kaboom")
+            return value
+
+        async with aiosqlite.connect(self.db) as db:
+            await db.set_function_diagnostics(True)
+            await db.create_function("boom", 1, boom)
+            await db.execute("create table rows (value integer)")
+            await db.executemany(
+                "insert into rows values (?)", [(i,) for i in range(1, 4)]
+            )
+
+            cursor = await db.cursor()
+            # The first row is computed eagerly, so the failing third row is
+            # only reached by the fetch call.
+            await cursor.execute("select boom(value) from rows")
+            with self.assertRaises(OperationalError) as caught:
+                await cursor.fetchall()
+
+            failure = caught.exception.udf_diagnostics[0]
+            self.assertEqual(failure.operation, "fetchall")
+            self.assertEqual(failure.function, "boom")
+
+    async def test_create_function_diagnostics_sequence_is_per_statement(self):
+        """Each statement records its own failures with fresh context"""
+
+        def boom(value):
+            raise ValueError("kaboom")
+
+        async with aiosqlite.connect(self.db) as db:
+            await db.set_function_diagnostics(True)
+            await db.create_function("boom", 1, boom)
+
+            first = second = None
+            for _ in range(2):
+                with self.assertRaises(OperationalError) as caught:
+                    await db.execute("select boom(1)")
+                failures = caught.exception.udf_diagnostics
+                self.assertEqual(len(failures), 1)
+                if first is None:
+                    first = failures[0]
+                else:
+                    second = failures[0]
+
+        # SQLite aborts the statement on the first callback failure, so an
+        # operation never inherits the previous statement's record.
+        self.assertLess(first.sequence, second.sequence)
+        self.assertIsNot(first.exception, second.exception)
+        self.assertIsNot(first, second)
+
+    async def test_create_function_diagnostics_survive_row_level_failure(self):
+        """A failure mid-way through executemany is still attributable"""
+
+        def boom(value):
+            if value == 2:
+                raise ValueError("kaboom")
+            return value
+
+        async with aiosqlite.connect(self.db) as db:
+            await db.set_function_diagnostics(True)
+            await db.execute("create table pairs (value integer)")
+            await db.create_function("boom", 1, boom)
+
+            with self.assertRaises(OperationalError) as caught:
+                await db.executemany(
+                    "insert into pairs values (boom(?))", [(1,), (2,), (3,)]
+                )
+
+            failure = caught.exception.udf_diagnostics[0]
+            self.assertEqual(failure.operation, "executemany")
+            self.assertEqual(failure.function, "boom")
+            self.assertEqual(str(failure.exception), "kaboom")
+
+    async def test_create_function_diagnostics_without_arguments(self):
+        """Zero-argument callbacks are recorded with an empty argument tuple"""
+
+        def boom():
+            raise ValueError("kaboom")
+
+        async with aiosqlite.connect(self.db) as db:
+            await db.set_function_diagnostics(True, capture_values=True)
+            await db.create_function("boom", 0, boom)
+
+            with self.assertRaises(OperationalError) as caught:
+                await db.execute("select boom()")
+
+        failure = caught.exception.udf_diagnostics[0]
+        self.assertEqual(failure.arguments, ())
+        self.assertEqual(failure.function, "boom")
+
+    async def test_authorizer_diagnostics(self):
+        """Authorizer failures are recorded with their own callback kind"""
+
+        def boom(action_code, arg1, arg2, db_name, trigger_name):
+            raise ValueError("authorizer kaboom")
+
+        async with aiosqlite.connect(self.db) as db:
+            await db.set_function_diagnostics(True)
+            await db.set_authorizer(boom)
+
+            with self.assertRaises(sqlite3.DatabaseError) as caught:
+                await db.execute("create table denied (id integer)")
+
+        failure = caught.exception.udf_diagnostics[0]
+        self.assertEqual(failure.kind, "authorizer")
+        self.assertEqual(failure.phase, aiosqlite.UDF_PHASE_CALL)
+        self.assertIsInstance(failure.exception, ValueError)
+        self.assertEqual(failure.operation, "execute")
+
+    async def test_progress_handler_diagnostics(self):
+        """Progress handler failures carry a distinct callback kind"""
+
+        def boom():
+            raise ValueError("progress kaboom")
+
+        async with aiosqlite.connect(self.db) as db:
+            await db.set_function_diagnostics(True)
+            await db.set_progress_handler(boom, 1)
+
+            with self.assertRaises(OperationalError) as caught:
+                await db.execute("create table never (id integer)")
+
+        failure = caught.exception.udf_diagnostics[0]
+        self.assertEqual(failure.kind, "progress_handler")
+        self.assertEqual(failure.function, "progress_handler")
+        self.assertEqual(str(failure.exception), "progress kaboom")
+
+    async def test_trace_callback_diagnostics_do_not_change_results(self):
+        """Trace callbacks keep running even when diagnostics record failures"""
+
+        statements = []
+
+        def boom(statement):
+            statements.append(statement)
+            raise ValueError("trace kaboom")
+
+        async with aiosqlite.connect(self.db) as db:
+            await db.set_function_diagnostics(True)
+            await db.set_trace_callback(boom)
+
+            cursor = await db.execute("select 1")
+
+            # SQLite swallows trace callback errors, so nothing is attached to
+            # an exception; the records stay inspectable on the connection.
+            trace_failures = [
+                failure
+                for failure in db.last_udf_failures
+                if failure.kind == "trace_callback"
+            ]
+            self.assertEqual(len(trace_failures), 1)
+            self.assertEqual(str(trace_failures[0].exception), "trace kaboom")
+
+            self.assertEqual(await cursor.fetchall(), [(1,)])
+            self.assertIn("select 1", statements)
+
     async def test_set_trace_callback(self):
         statements = []
 

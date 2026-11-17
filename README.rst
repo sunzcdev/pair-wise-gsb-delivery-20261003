@@ -55,6 +55,47 @@ aiosqlite also replicates most of the advanced features of ``sqlite3``:
         assert db.total_changes > 0
 
 
+Diagnosing user-defined functions
+---------------------------------
+
+SQLite reports every callback failure as the same opaque
+``OperationalError("user-defined function raised exception")``.  Enable
+diagnostics on the connection to keep the real Python failure attached:
+
+.. code-block:: python
+
+    import sqlite3
+
+    async with aiosqlite.connect(...) as db:
+        await db.set_function_diagnostics(True)
+
+        def parse_amount(value):
+            return float(value)  # raises ValueError on garbage input
+
+        await db.create_function("parse_amount", 1, parse_amount)
+
+        try:
+            await db.execute("SELECT parse_amount(?)", ["not a number"])
+        except sqlite3.OperationalError as exc:
+            failure = exc.udf_failure
+            print(failure.function)   # parse_amount
+            print(failure.phase)      # call
+            print(failure.exception)  # could not convert string to float
+
+The raised exception is still a normal ``sqlite3`` error, so existing
+``except sqlite3.Error`` handlers keep working.  ``exc.udf_diagnostics`` holds
+one record per callback failure seen during the operation, and the original
+callback exception is set as ``exc.__cause__`` so a normal traceback walks from
+the failing statement into your code.  Callback argument values and statement
+text are not recorded unless ``capture_values`` / ``capture_sql`` are passed
+explicitly, and enabling diagnostics never re-runs the callback or changes the
+number of rows a statement affects.
+
+Failures are split by phase: ``UDF_PHASE_CALL`` means the callback raised, while
+``UDF_PHASE_RETURN`` means it returned a value SQLite cannot store.  Each
+statement starts with a fresh record set, so a failure is never carried over to
+the next query.
+
 Install
 -------
 

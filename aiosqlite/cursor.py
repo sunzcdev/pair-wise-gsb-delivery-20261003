@@ -37,35 +37,50 @@ class Cursor:
         """Execute the given query."""
         if parameters is None:
             parameters = []
-        await self._execute(self._cursor.execute, sql, parameters)
+        await self._execute(
+            self._cursor.execute, sql, parameters, _operation="execute", _sql=sql
+        )
         return self
 
     async def executemany(
         self, sql: str, parameters: Iterable[Iterable[Any]]
     ) -> "Cursor":
         """Execute the given multiquery."""
-        await self._execute(self._cursor.executemany, sql, parameters)
+        await self._execute(
+            self._cursor.executemany,
+            sql,
+            parameters,
+            _operation="executemany",
+            _sql=sql,
+        )
         return self
 
     async def executescript(self, sql_script: str) -> "Cursor":
         """Execute a user script."""
-        await self._execute(self._cursor.executescript, sql_script)
+        await self._execute(
+            self._cursor.executescript,
+            sql_script,
+            _operation="executescript",
+            _sql=sql_script,
+        )
         return self
 
     async def fetchone(self) -> Optional[sqlite3.Row]:
         """Fetch a single row."""
-        return await self._execute(self._cursor.fetchone)
+        return await self._execute(self._cursor.fetchone, _operation="fetchone")
 
     async def fetchmany(self, size: Optional[int] = None) -> Iterable[sqlite3.Row]:
         """Fetch up to `cursor.arraysize` number of rows."""
         args: tuple[int, ...] = ()
         if size is not None:
             args = (size,)
-        return await self._execute(self._cursor.fetchmany, *args)
+        return await self._execute(
+            self._cursor.fetchmany, *args, _operation="fetchmany"
+        )
 
     async def fetchall(self) -> Iterable[sqlite3.Row]:
         """Fetch all remaining rows."""
-        return await self._execute(self._cursor.fetchall)
+        return await self._execute(self._cursor.fetchall, _operation="fetchall")
 
     async def close(self) -> None:
         """Close the cursor."""

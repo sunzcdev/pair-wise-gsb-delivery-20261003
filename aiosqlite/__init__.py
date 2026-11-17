@@ -21,7 +21,15 @@ from sqlite3 import (  # pylint: disable=redefined-builtin
 
 __author__ = "Amethyst Reese"
 from .__version__ import __version__
-from .core import connect, Connection, Cursor
+from .core import (
+    connect,
+    Connection,
+    Cursor,
+    UDF_PHASE_CALL,
+    UDF_PHASE_RETURN,
+    UDFFailure,
+    UDFReturnValueError,
+)
 
 __all__ = [
     "__version__",
@@ -41,4 +49,8 @@ __all__ = [
     "ProgrammingError",
     "OperationalError",
     "NotSupportedError",
+    "UDFFailure",
+    "UDFReturnValueError",
+    "UDF_PHASE_CALL",
+    "UDF_PHASE_RETURN",
 ]

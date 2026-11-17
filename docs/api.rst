@@ -49,3 +49,15 @@ Advanced
 
 .. autofunction:: register_converter
 
+Callback diagnostics
+--------------------
+
+.. autoclass:: UDFFailure
+
+.. autoexception:: UDFReturnValueError
+    :members:
+
+.. autodata:: UDF_PHASE_CALL
+
+.. autodata:: UDF_PHASE_RETURN
+
