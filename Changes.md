@@ -1,5 +1,16 @@
 # connection_pool Changelog
 
+HEAD
+----
+
+- Add optional `:health_check` and `:cleanup` options. A health check runs on
+  checkout and checkin, outside the pool's internal lock. Connections that fail
+  are removed (their capacity is released) and replaced, with rebuilds bounded
+  by the pool size so a permanently unhealthy pool cannot loop forever.
+  Checkin health failures never raise and therefore cannot mask the exception
+  raised inside a `with` block. A per-checkout `health_check:` override is also
+  supported.
+
 3.0.3
 ------
 

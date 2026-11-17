@@ -403,4 +403,209 @@ class TestConnectionPoolTimedStack < Minitest::Test
 
     assert_equal 2, close_attempts
   end
+
+  def test_pop_runs_health_check_and_returns_healthy_connection
+    stack = ConnectionPool::TimedStack.new(size: 1, health_check: ->(conn) { conn.respond_to?(:healthy?) && conn.healthy? }) {
+      Object.new.tap { |o| def o.healthy?; true; end }
+    }
+
+    conn = stack.pop
+
+    refute_nil conn
+    assert_empty stack
+  end
+
+  def test_pop_replaces_connection_failing_health_check
+    created = []
+    stack = ConnectionPool::TimedStack.new(size: 1, health_check: ->(conn) { conn[:healthy] }) do
+      o = {id: created.size, healthy: true}
+      created << o
+      o
+    end
+
+    first = stack.pop
+    stack.push(first)
+    first[:healthy] = false
+
+    replacement = stack.pop
+
+    refute_same first, replacement
+    assert_equal 2, created.size
+    # The dead connection's slot was released (created back to 0) before the
+    # replacement was created, so capacity accounting never leaks a slot.
+    assert_equal 1, stack.instance_variable_get(:@created)
+    assert_equal 0, stack.length
+    assert_empty stack
+  end
+
+  def test_pop_treats_raising_health_check_as_failure
+    error = RuntimeError.new("socket gone")
+    stack = ConnectionPool::TimedStack.new(size: 1, health_check: ->(_conn) { raise error }) { Object.new }
+
+    raised = assert_raises(ConnectionPool::HealthCheckFailedError) do
+      stack.pop
+    end
+
+    assert_same error, raised.cause
+    assert_equal 0, stack.idle
+    assert_equal 1, stack.length
+  end
+
+  def test_pop_health_check_failure_is_bounded
+    creations = 0
+    stack = ConnectionPool::TimedStack.new(size: 3, health_check: ->(_conn) { false }) do
+      creations += 1
+      Object.new
+    end
+
+    assert_raises(ConnectionPool::HealthCheckFailedError) do
+      stack.pop
+    end
+
+    # One checkout may replace at most @max connections, creating @max + 1 total.
+    assert_equal 4, creations
+    assert_equal 0, stack.instance_variable_get(:@created)
+    assert_equal 3, stack.length
+  end
+
+  def test_pop_health_check_runs_outside_the_mutex
+    stack = ConnectionPool::TimedStack.new(size: 2) { Object.new }
+    stack.push(stack.pop) # warm an idle entry in slot 1
+
+    entered = Queue.new
+    release = Queue.new
+    checker = Thread.new do
+      stack.pop(health_check: ->(_conn) {
+        entered << true
+        release.pop # park while the health check is in progress
+        true
+      })
+    end
+    entered.pop
+
+    # Slot 2 is free; it must be acquirable while the health check is parked,
+    # which is only possible if the health check does not hold the mutex.
+    other = Thread.new { stack.pop }
+    acquired = other.join(2)
+    refute_nil acquired, "pool was locked while a health check was running"
+
+    release << true
+    checker.join(2)
+    other.join(2)
+  end
+
+  def test_pop_per_call_health_check_overrides_stack_default
+    stack = ConnectionPool::TimedStack.new(size: 1, health_check: ->(_conn) { true }) { Object.new }
+    original = stack.pop
+    stack.push(original)
+
+    replacement = stack.pop(health_check: ->(conn) { !conn.equal?(original) })
+
+    refute_same original, replacement
+    stack.push(replacement)
+    assert_same replacement, stack.pop
+  end
+
+  def test_push_discards_connection_failing_health_check
+    cleaned = []
+    stack = ConnectionPool::TimedStack.new(
+      size: 1,
+      cleanup: ->(conn) { cleaned << conn }
+    ) { Object.new }
+
+    conn = stack.pop
+    stack.push(conn, health_check: ->(_c) { false })
+
+    assert_equal [conn], cleaned
+    assert_equal 0, stack.idle
+    assert_equal 1, stack.length
+  end
+
+  def test_push_health_check_failure_never_raises
+    stack = ConnectionPool::TimedStack.new(size: 1) { Object.new }
+    conn = stack.pop
+
+    assert_nil stack.push(conn, health_check: ->(_c) { raise "boom" })
+    assert_equal 0, stack.idle
+    assert_equal 1, stack.length
+  end
+
+  def test_push_health_check_runs_outside_the_mutex
+    stack = ConnectionPool::TimedStack.new(size: 2) { Object.new }
+    conn = stack.pop                    # slot 1 held for the pushing thread
+    second = stack.pop                  # occupy slot 2, then return it
+    stack.push(second)
+
+    entered = Queue.new
+    release = Queue.new
+    pusher = Thread.new do
+      stack.push(conn, health_check: ->(_c) {
+        entered << true
+        release.pop # park during the checkin health check
+        true
+      })
+    end
+    entered.pop
+
+    # The returned entry must be fetchable while the checkin check is parked,
+    # proving the internal lock is not held during the callback.
+    getter = Thread.new { stack.pop }
+    acquired = getter.join(2)
+    refute_nil acquired, "pool was locked while a checkin health check was running"
+
+    release << true
+    pusher.join(2)
+    getter.join(2)
+  end
+
+  def test_cleanup_errors_are_swallowed_but_capacity_is_released
+    stack = ConnectionPool::TimedStack.new(
+      size: 1,
+      cleanup: ->(_conn) { raise "cleanup failed" }
+    ) { Object.new }
+
+    conn = stack.pop
+    stack.push(conn, health_check: ->(_conn) { false })
+
+    assert_equal 1, stack.length
+    assert_equal 0, stack.idle
+  end
+
+  def test_discard_releases_capacity_and_runs_cleanup
+    cleaned = []
+    stack = ConnectionPool::TimedStack.new(size: 1, cleanup: ->(conn) { cleaned << conn }) { Object.new }
+    conn = stack.pop
+
+    stack.discard(conn)
+
+    assert_equal [conn], cleaned
+    assert_equal 1, stack.length
+    assert_equal 0, stack.idle
+  end
+
+  def test_discard_swallows_cleanup_errors
+    stack = ConnectionPool::TimedStack.new(size: 1) { Object.new }
+    conn = stack.pop
+
+    assert_nil stack.discard(conn) { |_| raise "cleanup failed" }
+    assert_equal 1, stack.length
+  end
+
+  def test_pop_does_not_recreate_connections_while_shutting_down
+    creations = 0
+    stack = ConnectionPool::TimedStack.new(
+      size: 1,
+      health_check: ->(_conn) { true }
+    ) do
+      creations += 1
+      Object.new
+    end
+    stack.push(stack.pop)
+    stack.shutdown {}
+
+    assert_raises(ConnectionPool::PoolShuttingDownError) do
+      stack.pop
+    end
+    assert_equal 1, creations
+  end
 end

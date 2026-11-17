@@ -22,8 +22,16 @@ class ConnectionPool::TimedStack
   ##
   # Creates a new pool with +size+ connections that are created from the given
   # +block+.
-  def initialize(size: 0, &block)
+  #
+  # @option options [Proc, nil] :health_check called with a connection on checkout
+  #   and checkin. Returning a falsey value (or raising) marks the connection as
+  #   invalid: it is removed from the pool and replaced.
+  # @option options [Proc, nil] :cleanup called with a connection outside the
+  #   internal lock whenever one is removed due to a failed health check.
+  def initialize(size: 0, health_check: nil, cleanup: nil, &block)
     @create_block = block
+    @health_check = health_check
+    @cleanup = cleanup
     @created = 0
     @que = []
     @max = size
@@ -35,7 +43,24 @@ class ConnectionPool::TimedStack
   ##
   # Returns +obj+ to the stack. Additional kwargs are ignored in TimedStack but may be
   # used by subclasses that extend TimedStack.
+  #
+  # If a +:health_check+ is configured (or passed per call), it runs against
+  # +obj+ *outside* of the internal lock. A failed check discards the connection
+  # instead of storing it. Health-check failures on the checkin path never raise
+  # so they cannot mask an exception raised by the caller's own code.
   def push(obj, **kwargs)
+    health_check = kwargs.delete(:health_check) { @health_check }
+
+    if health_check
+      healthy, = check_health(obj, health_check)
+      unless healthy
+        # discard_connection never raises: capacity is released under the lock
+        # and cleanup errors are swallowed inside it.
+        discard_connection(obj)
+        return
+      end
+    end
+
     @mutex.synchronize do
       if @shutdown_block
         @created -= 1 unless @created == 0
@@ -46,8 +71,29 @@ class ConnectionPool::TimedStack
 
       @resource.broadcast
     end
+    nil
   end
   alias_method :<<, :push
+
+  ##
+  # Permanently removes +obj+ from the pool, decrementing the created count and
+  # invoking +block+ (or the configured cleanup callback) outside of the
+  # internal lock. Errors raised by the callback are swallowed.
+  def discard(obj, &block)
+    decrement_created
+
+    begin
+      if block
+        block.call(obj)
+      else
+        cleanup_connection(obj)
+      end
+    rescue
+      nil
+    end
+
+    nil
+  end
 
   ##
   # Retrieves a connection from the stack. If a connection is available it is
@@ -57,30 +103,75 @@ class ConnectionPool::TimedStack
   # @option options [Float] :timeout (0.5) Wait this many seconds for an available entry
   # @option options [Class] :exception (ConnectionPool::TimeoutError) Exception class to raise
   #   if an entry was not available within the timeout period. Use `exception: false` to return nil.
+  # @option options [Proc, nil] :health_check overrides the stack's health check
+  #   for this checkout.
   #
-  # Other options may be used by subclasses that extend TimedStack.
+  # When a health check is active it runs *outside* of the internal lock against
+  # every connection before it is handed to the caller. A connection that fails
+  # the check is removed from the pool (its capacity is released) and another
+  # resource is acquired instead, but at most +@max+ failed connections are
+  # replaced per checkout, so a permanently unhealthy pool can never trigger an
+  # unbounded rebuild.
   def pop(timeout: 0.5, exception: ConnectionPool::TimeoutError, **kwargs)
     deadline = current_time + timeout
-    @mutex.synchronize do
-      loop do
-        raise ConnectionPool::PoolShuttingDownError if @shutdown_block
-        if (conn = try_fetch_connection(**kwargs))
-          return conn
-        end
+    health_check = kwargs.delete(:health_check) { @health_check }
+    # One replacement per pool slot per checkout bounds the total work and the
+    # number of connections created to @max + 1.
+    failures = 0
+    last_health_error = nil
 
-        connection = try_create(**kwargs)
-        return connection if connection
-
-        to_wait = deadline - current_time
-        if to_wait <= 0
-          if exception
-            raise exception, "Waited #{timeout} sec, #{length}/#{@max} available"
+    loop do
+      # Fetching/creating and waiting happen inside one synchronized section so
+      # a concurrent push/broadcast cannot be lost. The result tuple tells the
+      # lock-free code below what to do next.
+      status, conn = @mutex.synchronize do
+        if @shutdown_block
+          [:shutdown, nil]
+        elsif (connection = try_fetch_connection(**kwargs))
+          [:connection, connection]
+        elsif (connection = try_create(**kwargs))
+          [:connection, connection]
+        else
+          to_wait = deadline - current_time
+          if to_wait <= 0
+            [:timeout, nil]
           else
-            return nil
+            @resource.wait(@mutex, to_wait)
+            [:retry, nil]
           end
         end
-        @resource.wait(@mutex, to_wait)
       end
+
+      case status
+      when :shutdown
+        raise ConnectionPool::PoolShuttingDownError
+      when :timeout
+        return nil unless exception
+
+        raise exception, "Waited #{timeout} sec, #{length}/#{@max} available"
+      when :retry
+        next
+      end
+
+      if health_check
+        # The user callback runs without holding the internal lock so a slow
+        # or blocking health check cannot stall other pool operations.
+        healthy, error = check_health(conn, health_check)
+        unless healthy
+          discard_connection(conn)
+          failures += 1
+          last_health_error = error
+          if failures > @max
+            raise ConnectionPool::HealthCheckFailedError.new(
+              "All connections failed the health check after #{failures} attempts",
+              last_health_error
+            )
+          end
+          next
+        end
+      end
+
+      return conn
     end
   end
 
@@ -151,6 +242,34 @@ class ConnectionPool::TimedStack
 
   def current_time
     Process.clock_gettime(Process::CLOCK_MONOTONIC)
+  end
+
+  ##
+  # Runs +health_check+ against +conn+ outside of the internal lock. A falsey
+  # return value or a raised exception both mean the connection is unhealthy.
+  # Returns [healthy, error].
+  def check_health(conn, health_check)
+    [!!health_check.call(conn), nil]
+  rescue => error
+    [false, error]
+  end
+
+  ##
+  # Removes +conn+ from the pool's capacity accounting and runs the configured
+  # cleanup callback outside of the internal lock. Used when a connection fails
+  # a health check so its slot can be reused.
+  def discard_connection(conn)
+    decrement_created
+    cleanup_connection(conn)
+  end
+
+  ##
+  # Invokes the cleanup callback for +conn+ outside of the internal lock.
+  # Errors raised by user cleanup code must not affect pool bookkeeping.
+  def cleanup_connection(conn)
+    @cleanup&.call(conn)
+  rescue
+    nil
   end
 
   ##

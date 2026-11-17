@@ -7,6 +7,18 @@ class ConnectionPool
   class PoolShuttingDownError < ::ConnectionPool::Error; end
 
   class TimeoutError < ::Timeout::Error; end
+
+  # Raised when every connection available during a checkout fails the
+  # configured health check. The original error raised by the last health
+  # check (if any) is available via +#cause+.
+  class HealthCheckFailedError < ::ConnectionPool::Error
+    attr_reader :cause
+
+    def initialize(message = nil, cause = nil)
+      super(message)
+      @cause = cause
+    end
+  end
 end
 
 # Generic connection pool class for sharing a limited number of objects or network connections
@@ -37,12 +49,20 @@ end
 # - :size - number of connections to pool, defaults to 5
 # - :timeout - amount of time to wait for a connection if none currently available, defaults to 5 seconds
 # - :auto_reload_after_fork - automatically drop all connections after fork, defaults to true
+# - :health_check - optional block called with a connection on checkout and checkin.
+#   Return a falsey value (or raise) to declare the connection dead: it is removed
+#   from the pool and replaced rather than handed to the caller.
+# - :cleanup - optional block called with a dead connection (outside the pool's
+#   internal lock) whenever one is discarded or fails a health check.
 #
 class ConnectionPool
   # Built once: a Hash literal argument costs a Hash and its keyword copy per call.
   DEFER_INTERRUPTS = {Exception => :never}.freeze
   IMMEDIATE_INTERRUPTS = {Exception => :immediate}.freeze
-  private_constant :DEFER_INTERRUPTS, :IMMEDIATE_INTERRUPTS
+  # Marks a checkout for discard without a caller-supplied cleanup block, so the
+  # pool's own +:cleanup+ callback is used instead.
+  DISCARD_WITHOUT_BLOCK = Object.new.freeze
+  private_constant :DEFER_INTERRUPTS, :IMMEDIATE_INTERRUPTS, :DISCARD_WITHOUT_BLOCK
 
   def self.wrap(**kwargs, &block)
     Wrapper.new(**kwargs, &block)
@@ -50,14 +70,14 @@ class ConnectionPool
 
   attr_reader :size
 
-  def initialize(timeout: 5, size: 5, auto_reload_after_fork: true, name: nil, &block)
+  def initialize(timeout: 5, size: 5, auto_reload_after_fork: true, name: nil, health_check: nil, cleanup: nil, &block)
     raise ArgumentError, "Connection pool requires a block" unless block_given?
 
     @size = Integer(size)
     raise ArgumentError, "Connection pool size cannot be negative" if @size.negative?
 
     @timeout = Float(timeout)
-    @available = TimedStack.new(size: @size, &block)
+    @available = TimedStack.new(size: @size, health_check: health_check, cleanup: cleanup, &block)
     @key = :"pool-#{@available.object_id}"
     @key_count = :"pool-#{@available.object_id}-count"
     @key_kwargs = :"pool-#{@available.object_id}-kwargs"
@@ -113,7 +133,7 @@ class ConnectionPool
   #     end
   #   end
   def discard_current_connection(&block)
-    ::Thread.current[@discard_key] = block || proc { |conn| conn }
+    ::Thread.current[@discard_key] = block || DISCARD_WITHOUT_BLOCK
   end
 
   def checkout(timeout: @timeout, **kwargs)
@@ -121,7 +141,10 @@ class ConnectionPool
       ::Thread.current[@key_count] += 1
       ::Thread.current[@key]
     else
+      # The health check only applies to this checkout; it must not be stored and
+      # replayed on checkin alongside the other stack-routing kwargs.
       conn = @available.pop(timeout:, **kwargs)
+      kwargs.delete(:health_check)
       ::Thread.current[@key] = conn
       ::Thread.current[@key_count] = 1
       ::Thread.current[@key_kwargs] = kwargs
@@ -132,23 +155,28 @@ class ConnectionPool
   def checkin(force: false)
     if ::Thread.current[@key]
       if ::Thread.current[@key_count] == 1 || force
+        conn = ::Thread.current[@key]
+        # A marker means the connection must be discarded. A Proc marker is the
+        # caller's own cleanup block; the sentinel falls back to the pool's
+        # configured +:cleanup+ callback.
+        discard_marker = ::Thread.current[@discard_key]
         begin
-          if ::Thread.current[@discard_key]
-            begin
-              @available.decrement_created
-              ::Thread.current[@discard_key].call(::Thread.current[@key])
-            rescue
-              nil
-            ensure
-              ::Thread.current[@discard_key] = nil
+          if discard_marker
+            # TimedStack#discard releases the capacity under the lock and runs
+            # the cleanup callback outside of it, swallowing callback errors.
+            if discard_marker.is_a?(Proc)
+              @available.discard(conn, &discard_marker)
+            else
+              @available.discard(conn)
             end
           else
-            @available.push(::Thread.current[@key], **::Thread.current[@key_kwargs])
+            @available.push(conn, **::Thread.current[@key_kwargs])
           end
         ensure
           ::Thread.current[@key] = nil
           ::Thread.current[@key_count] = nil
           ::Thread.current[@key_kwargs] = nil
+          ::Thread.current[@discard_key] = nil
         end
       else
         ::Thread.current[@key_count] -= 1

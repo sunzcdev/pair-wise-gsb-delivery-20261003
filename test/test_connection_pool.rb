@@ -834,4 +834,243 @@ class TestConnectionPool < Minitest::Test
       refute_equal obj.object_id, result.object_id # was copied across Ractor boundary
     end
   end
+
+  class HealthConnection
+    attr_accessor :alive
+
+    def initialize
+      @alive = true
+    end
+
+    def close
+      @alive = false
+    end
+  end
+
+  def health_pool(size: 1, **options, &block)
+    block ||= -> { HealthConnection.new }
+    ConnectionPool.new(size: size, timeout: 1, **options, &block)
+  end
+
+  def test_checkout_does_not_hand_out_unhealthy_connection
+    pool = health_pool(health_check: ->(conn) { conn.alive })
+    original = pool.checkout
+    pool.checkin
+    original.alive = false
+
+    replacement = pool.checkout
+
+    refute_same original, replacement
+    assert replacement.alive
+    assert_equal 0, pool.available # replacement is checked out, the dead slot was reused
+    pool.checkin
+    assert_equal pool.size, pool.available
+  end
+
+  def test_unhealthy_connection_removed_from_capacity_and_cleaned_up
+    cleaned = []
+    pool = health_pool(
+      health_check: ->(conn) { conn.alive },
+      cleanup: ->(conn) { cleaned << conn; conn.close }
+    )
+    original = pool.checkout
+    pool.checkin
+    original.alive = false
+
+    replacement = pool.checkout
+
+    assert_equal [original], cleaned
+    refute original.alive
+    assert_equal pool.size, pool.available + 1 # one slot in use, none leaked
+    pool.checkin
+    assert_equal pool.size, pool.available
+  end
+
+  def test_checkout_rebuild_is_bounded_by_pool_size
+    creations = 0
+    pool = ConnectionPool.new(size: 2, timeout: 1, health_check: ->(_conn) { false }) do
+      creations += 1
+      Object.new
+    end
+
+    assert_raises(ConnectionPool::HealthCheckFailedError) do
+      pool.checkout
+    end
+
+    assert_equal pool.size + 1, creations
+    assert_equal pool.size, pool.available
+    assert_equal 0, pool.idle
+  end
+
+  def test_health_check_error_is_available_as_cause
+    source = RuntimeError.new("connection reset")
+    pool = ConnectionPool.new(size: 1, health_check: ->(_conn) { raise source }) { Object.new }
+
+    error = assert_raises(ConnectionPool::HealthCheckFailedError) { pool.checkout }
+    assert_same source, error.cause
+  end
+
+  def test_checkin_health_failure_does_not_mask_business_exception
+    state = {dead: false}
+    pool = health_pool(health_check: ->(conn) { !state[:dead] })
+
+    error = assert_raises(RuntimeError) do
+      pool.with do |_conn|
+        state[:dead] = true
+        raise "business failure"
+      end
+    end
+
+    assert_equal "business failure", error.message
+    assert_equal pool.size, pool.available
+    assert_equal 0, pool.idle
+  end
+
+  def test_raising_checkin_health_check_does_not_mask_business_exception
+    checks = 0
+    pool = health_pool
+    stack = pool.instance_variable_get(:@available)
+    stack.instance_variable_set(:@health_check, ->(_conn) {
+      checks += 1
+      raise "checkin exploded" if checks > 1
+      true
+    })
+
+    error = assert_raises(RuntimeError) do
+      pool.with { raise "business failure" }
+    end
+
+    assert_equal "business failure", error.message
+    assert_equal pool.size, pool.available
+  end
+
+  def test_successful_with_returns_block_value_when_checkin_check_fails
+    checks = 0
+    pool = ConnectionPool.new(size: 1) do
+      HealthConnection.new
+    end
+    stack = pool.instance_variable_get(:@available)
+    stack.instance_variable_set(:@health_check, ->(_conn) {
+      checks += 1
+      checks == 1 # pass at checkout, fail at checkin
+    })
+
+    assert_equal 42, pool.with { 42 }
+    assert_equal pool.size, pool.available
+    assert_equal 0, pool.idle
+  end
+
+  def test_nested_with_checks_only_real_borrow_and_final_return
+    events = []
+    pool = ConnectionPool.new(size: 1, health_check: ->(_conn) { events << :check; true }) do
+      events << :create
+      Object.new
+    end
+
+    pool.with do
+      pool.with do
+        pool.with { }
+      end
+    end
+
+    assert_equal [:create, :check, :check], events
+  end
+
+  def test_nested_with_rechecks_after_outermost_checkin
+    pool = health_pool(health_check: ->(conn) { conn.alive })
+    pool.with do
+      pool.with { }
+    end
+
+    conn = pool.checkout
+    assert conn.alive
+    pool.checkin
+  end
+
+  def test_checkout_after_shutdown_never_recreates_connections
+    creations = 0
+    pool = ConnectionPool.new(size: 1, health_check: ->(conn) { conn.alive }) do
+      creations += 1
+      HealthConnection.new
+    end
+    pool.with { |conn| conn }
+    pool.shutdown(&:close)
+
+    assert_raises(ConnectionPool::PoolShuttingDownError) do
+      pool.checkout
+    end
+    assert_equal 1, creations
+  end
+
+  def test_cleanup_runs_on_discard_when_no_discard_block_given
+    cleaned = []
+    pool = health_pool(cleanup: ->(conn) { cleaned << conn; conn.close })
+    conn = pool.checkout
+    pool.discard_current_connection
+    pool.checkin
+
+    assert_equal [conn], cleaned
+    refute conn.alive
+    assert_equal pool.size, pool.available
+  end
+
+  def test_discard_block_takes_precedence_over_pool_cleanup
+    pool_cleaned = []
+    block_cleaned = []
+    pool = health_pool(cleanup: ->(conn) { pool_cleaned << conn })
+    conn = pool.checkout
+    pool.discard_current_connection { |c| block_cleaned << c }
+    pool.checkin
+
+    assert_equal [conn], block_cleaned
+    assert_empty pool_cleaned
+    assert_equal pool.size, pool.available
+  end
+
+  def test_per_call_health_check_overrides_pool_default
+    pool = health_pool(health_check: ->(conn) { conn.alive })
+    original = pool.checkout
+    pool.checkin
+
+    replacement = pool.checkout(health_check: ->(conn) { !conn.equal?(original) })
+
+    refute_same original, replacement
+    pool.checkin
+    assert_same replacement, pool.checkout
+    pool.checkin
+  end
+
+  def test_per_call_health_check_does_not_leak_into_checkin
+    default_calls = []
+    pool = health_pool(health_check: ->(conn) { default_calls << conn; conn.alive })
+    original = pool.checkout
+    pool.checkin
+    default_calls.clear
+
+    # A strict per-call override governs only this checkout. If it leaked into
+    # checkin, the healthy replacement would be wrongly discarded.
+    replacement = pool.checkout(health_check: ->(conn) { !conn.equal?(original) })
+    refute_same original, replacement
+    pool.checkin
+
+    assert_equal 1, pool.idle
+    assert_same replacement, pool.checkout
+    pool.checkin
+  end
+
+  def test_health_check_and_cleanup_run_without_holding_pool_lock
+    # The precise lock-free guarantee is verified at the TimedStack layer; here
+    # we ensure concurrent checkouts still work when a health check is enabled
+    # and that every handed-out connection passes the check.
+    pool = health_pool(size: 2, health_check: ->(conn) { conn.alive })
+
+    threads = Array.new(4) do
+      Thread.new do
+        3.times { pool.with { |conn| assert conn.alive } }
+      end
+    end
+    threads.each { |t| assert t.join(2) }
+
+    assert_equal 2, pool.available
+  end
 end

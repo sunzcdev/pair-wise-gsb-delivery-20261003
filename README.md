@@ -136,6 +136,42 @@ pool.with do |conn|
 end
 ```
 
+## Health Checks
+
+You can provide a `:health_check` block to validate a connection whenever it is
+checked out **and** when it is checked back in. Returning a falsey value (or
+raising) declares the connection dead: it is removed from the pool, passed to
+the optional `:cleanup` block, and replaced so a dead connection is never
+handed to the caller.
+
+```ruby
+pool = ConnectionPool.new(
+  size: 5,
+  health_check: ->(conn) { conn.ping },                 # returns true/false
+  cleanup: ->(conn) { conn.close }                      # called with dead connections
+) { MyClient.new }
+
+pool.with { |conn| conn.work }
+```
+
+The health check and cleanup callbacks run **outside** the pool's internal
+lock, so a slow check (e.g. a network round-trip) does not block other threads
+using different connections.
+
+On checkout, a connection that fails the check is discarded and another is
+acquired instead. Rebuilds are bounded by the pool size: if more than `size`
+consecutive connections fail during a single checkout, a
+`ConnectionPool::HealthCheckFailedError` is raised rather than looping forever.
+The original error from the last check (if any) is available as `error.cause`.
+
+On checkin, a connection that fails the check is discarded instead of being
+reused. Checkin failures never raise, so they cannot mask an exception raised
+inside your `with` block.
+
+A health check can also be supplied per checkout (for example via
+`pool.checkout(health_check: ...)`); it applies only to that checkout and does
+not affect checkin or later checkouts.
+
 ## Current State
 
 There are several methods that return information about a pool.
