@@ -8,6 +8,13 @@ module Concurrent
   # Raised when an asynchronous operation is cancelled before execution.
   CancelledOperationError = Class.new(Error)
 
+  # Raised when accessing the value of a cancelled
+  # {Concurrent::Promises::Future}. Cancellation is an independent terminal
+  # state of a future, therefore it has its own error class. A regular business
+  # exception stored as a rejection reason can never be confused with
+  # cancellation.
+  CancelledFutureError = Class.new(Error)
+
   # Raised when a lifecycle method (such as `stop`) is called in an improper
   # sequence or when the object is in an inappropriate state.
   LifecycleError = Class.new(Error)

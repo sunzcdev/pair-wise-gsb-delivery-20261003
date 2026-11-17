@@ -1,11 +1,33 @@
 # TODO try stealing pool, each thread has it's own queue
 
 require 'concurrent/promises'
+require 'concurrent/edge/cancellation_scope'
 
 module Concurrent
   module Promises
 
     class Future < AbstractEventFuture
+
+      # Explicit cancellation configuration for derived futures.
+      # @!macro warn.edge
+      module CancellationIntegration
+
+        # Cancels this single derived result without affecting a shared
+        # upstream still needed by another branch. The scope owning this future
+        # is taken from its explicit cancellation relationships, so the call
+        # does not have to happen inside the scope block.
+        #
+        # @param reason [Exception] optional cancellation reason
+        # @return [true, false] true if this call cancelled the future
+        # @raise [Concurrent::Error] when the future belongs to no scope
+        def cancel(reason = nil)
+          scope = CancellationScope.current || owned_by.first
+          raise Concurrent::Error, 'future is not a member of any cancellation scope' unless scope
+          apply_cancellation scope, reason
+        end
+      end
+
+      include CancellationIntegration
 
       # @!macro warn.edge
       module ActorIntegration
@@ -66,6 +88,35 @@ module Concurrent
     end
 
     module FactoryMethods
+
+      # @return [CancellationScope, nil] the scope active on this thread.
+      # @!visibility private
+      remove_method :current_cancellation_scope if method_defined? :current_cancellation_scope
+      def current_cancellation_scope
+        CancellationScope.current
+      end
+
+      # Creates a {CancellationScope}, makes it active for the duration of the
+      # block so every future created inside becomes its member, then returns
+      # the scope together with whatever the block returned.
+      #
+      # @example
+      #   scope, result = Concurrent::Promises.cancellation_scope do
+      #     future { 1 + 1 }.then(&:succ)
+      #   end
+      #   scope.cancelled? # => false
+      #   result.value!    # => 3
+      #
+      # @yield block building the cancellable graph
+      # @return [Array(CancellationScope, Object)] the scope and the block's
+      #   return value
+      # @!macro warn.edge
+      def cancellation_scope
+        scope = CancellationScope.new
+        value = CancellationScope.run(scope, Proc.new { yield })
+        [scope, value]
+      end
+
       # @!macro promises.shortcut.on
       # @return [Future]
       # @!macro warn.edge

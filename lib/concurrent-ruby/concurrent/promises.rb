@@ -58,6 +58,23 @@ module Concurrent
 
       include Configuration
 
+      # Registers a freshly created root event/future with the cancellation
+      # scope currently active on this thread (if any). The edge gem defines
+      # the real scope; the core only knows the duck-typed hook.
+      # @!visibility private
+      def register_with_current_cancellation_scope(event_or_future)
+        scope = current_cancellation_scope
+        event_or_future.add_cancellation_edge(scope, true) if scope
+        event_or_future
+      end
+
+      # Overridden by the edge gem to return the active
+      # {Concurrent::Promises::CancellationScope}, nil in the core.
+      # @!visibility private
+      def current_cancellation_scope
+        nil
+      end
+
       # @!macro promises.shortcut.on
       # @return [ResolvableEvent]
       def resolvable_event
@@ -70,7 +87,7 @@ module Concurrent
       # @!macro promises.param.default_executor
       # @return [ResolvableEvent]
       def resolvable_event_on(default_executor = self.default_executor)
-        ResolvableEventPromise.new(default_executor).future
+        register_with_current_cancellation_scope(ResolvableEventPromise.new(default_executor).future)
       end
 
       # @!macro promises.shortcut.on
@@ -86,7 +103,7 @@ module Concurrent
       # @!macro promises.param.default_executor
       # @return [ResolvableFuture]
       def resolvable_future_on(default_executor = self.default_executor)
-        ResolvableFuturePromise.new(default_executor).future
+        register_with_current_cancellation_scope(ResolvableFuturePromise.new(default_executor).future)
       end
 
       # @!macro promises.shortcut.on
@@ -104,7 +121,8 @@ module Concurrent
       # @!macro promise.param.task-future
       # @return [Future]
       def future_on(default_executor, *args, &task)
-        ImmediateEventPromise.new(default_executor).future.then(*args, &task)
+        register_with_current_cancellation_scope(ImmediateEventPromise.new(default_executor).future).
+            then(*args, &task)
       end
 
       # Creates a resolved future with will be either fulfilled with the given value or rejected with
@@ -116,7 +134,8 @@ module Concurrent
       # @!macro promises.param.default_executor
       # @return [Future]
       def resolved_future(fulfilled, value, reason, default_executor = self.default_executor)
-        ImmediateFuturePromise.new(default_executor, fulfilled, value, reason).future
+        register_with_current_cancellation_scope(
+          ImmediateFuturePromise.new(default_executor, fulfilled, value, reason).future)
       end
 
       # Creates a resolved future which will be fulfilled with the given value.
@@ -142,7 +161,7 @@ module Concurrent
       # @!macro promises.param.default_executor
       # @return [Event]
       def resolved_event(default_executor = self.default_executor)
-        ImmediateEventPromise.new(default_executor).event
+        register_with_current_cancellation_scope(ImmediateEventPromise.new(default_executor).event)
       end
 
       # General constructor. Behaves differently based on the argument's type. It's provided for convenience
@@ -205,7 +224,7 @@ module Concurrent
       #   If no task is provided, it returns an {Event}
       #   @return [Event]
       def delay_on(default_executor, *args, &task)
-        event = DelayPromise.new(default_executor).event
+        event = register_with_current_cancellation_scope(DelayPromise.new(default_executor).event)
         task ? event.chain(*args, &task) : event
       end
 
@@ -231,7 +250,7 @@ module Concurrent
       #   If no task is provided, it returns an {Event}
       #   @return [Event]
       def schedule_on(default_executor, intended_time, *args, &task)
-        event = ScheduledPromise.new(default_executor, intended_time).event
+        event = register_with_current_cancellation_scope(ScheduledPromise.new(default_executor, intended_time).event)
         task ? event.chain(*args, &task) : event
       end
 
@@ -484,6 +503,74 @@ module Concurrent
         end
       end
 
+      # Cancellation is an independent terminal state of a Future. It is neither
+      # fulfillment nor rejection, therefore it is deliberately not represented
+      # by an arbitrary rejection reason (which could be a business exception).
+      # It carries its own reason, always a {CancelledFutureError} by default,
+      # which is available through {Future#reason}.
+      # @!visibility private
+      class Cancelled < ResolvedWithResult
+        def initialize(reason = nil)
+          @Reason = reason || CancelledFutureError.new('future was cancelled')
+        end
+
+        def fulfilled?
+          false
+        end
+
+        def value
+          nil
+        end
+
+        def reason
+          @Reason
+        end
+
+        def to_sym
+          :cancelled
+        end
+
+        def result
+          [false, nil, @Reason]
+        end
+
+        def apply(args, block)
+          block.call @Reason, *args
+        end
+      end
+
+      # Terminal state of a zip future when some of its inputs were cancelled
+      # while the rest were resolved normally. It preserves all the information,
+      # similarly to {PartiallyRejected}.
+      # @!visibility private
+      class PartiallyCancelled < ResolvedWithResult
+        def initialize(value, reason)
+          super()
+          @Value  = value
+          @Reason = reason
+        end
+
+        def fulfilled?
+          false
+        end
+
+        def to_sym
+          :cancelled
+        end
+
+        def value
+          @Value
+        end
+
+        def reason
+          @Reason
+        end
+
+        def apply(args, block)
+          block.call(*reason, *args)
+        end
+      end
+
       # @!visibility private
       PENDING = Pending.new
       # @!visibility private
@@ -527,6 +614,11 @@ module Concurrent
         @DefaultExecutor    = default_executor
         @Callbacks          = LockFreeStack.new
         @Waiters            = AtomicFixnum.new 0
+        # The cancellation ownership graph. Each entry is [CancellationScope, owned?].
+        # A `owned?` edge means this node's execution is cancellable through the
+        # scope; a borrowed edge (owned? == false) only observes resolution and
+        # never causes this node to be cancelled.
+        @CancellationEdges  = LockFreeStack.new
         self.internal_state = PENDING
       end
 
@@ -554,6 +646,15 @@ module Concurrent
       # @return [Boolean]
       def resolved?
         internal_state.resolved?
+      end
+
+      # Is it in the independent cancelled terminal state? A rejected future
+      # with an arbitrary business reason is not cancelled even if the reason
+      # happens to be named similarly; cancellation can only be produced by an
+      # explicit cancellation relationship.
+      # @return [Boolean]
+      def cancelled?
+        internal_state.to_sym == :cancelled
       end
 
       # Propagates touch. Requests all the delayed futures, which it depends on, to be
@@ -705,6 +806,27 @@ module Concurrent
         end
       end
 
+      # For inspection. The cancellation scopes this node is a member of.
+      # Each entry is `[scope, owned?]`, there is at most one entry per scope.
+      # @!visibility private
+      def cancellation_edges
+        @CancellationEdges.each.to_a
+      end
+
+      # For inspection. Scopes which only borrow this node, i.e. the node is a
+      # shared dependency whose execution must not be cancelled by that scope.
+      # @!visibility private
+      def borrowed_by
+        @CancellationEdges.each_with_object([]) { |(scope, owned), scopes| scopes.push scope unless owned }
+      end
+
+      # For inspection. Scopes which own this node, i.e. may cancel its
+      # not-yet-started execution.
+      # @!visibility private
+      def owned_by
+        @CancellationEdges.each_with_object([]) { |(scope, owned), scopes| scopes.push scope if owned }
+      end
+
       # For inspection.
       # @!visibility private
       def callbacks
@@ -732,6 +854,44 @@ module Concurrent
       # @!visibility private
       def add_callback_notify_blocked(promise, index)
         add_callback :callback_notify_blocked, promise, index
+      end
+
+      # Registers an explicit cancellation relationship. At most one edge per
+      # scope is kept; an owned relationship wins over a borrowed one but a
+      # borrowed edge is never downgraded by another borrower.
+      #
+      # @param scope [Object] the scope owning or borrowing this node
+      # @param owned [true, false] when true this node's not-yet-started
+      #   execution may be cancelled by the scope (an *owned, cancellable*
+      #   dependency). When false the scope only borrows this node.
+      # @!visibility private
+      def add_cancellation_edge(scope, owned)
+        existing = @CancellationEdges.each.find { |s, _| s.equal? scope }
+        if existing
+          existing[1] = true if owned
+        else
+          @CancellationEdges.push [scope, owned]
+        end
+        scope.register_node(self, owned) if scope.respond_to?(:register_node)
+        self
+      end
+
+      # Cancels this node if it is still pending and the scope owns it. Whether
+      # the node is still needed by another member is decided by the scope's
+      # graph traversal, not here. Already running user blocks are never
+      # interrupted; they run to completion and their resolution wins.
+      # @!visibility private
+      def cancel_with(scope, reason)
+        owned = @CancellationEdges.each.any? { |s, is_owned| s.equal?(scope) && is_owned }
+        return false unless owned
+        resolve_with(Cancelled.new(reason), false) ? true : false
+      end
+
+      # The nodes directly depending on this one (its derived promises'
+      # futures). Used to walk the dependency graph during cancellation.
+      # @!visibility private
+      def dependent_nodes
+        blocks.map(&:future)
       end
 
       # @!visibility private
@@ -928,7 +1088,7 @@ module Concurrent
       # @return [Boolean]
       def rejected?
         state = internal_state
-        state.resolved? && !state.fulfilled?
+        state.resolved? && !state.fulfilled? && state.to_sym == :rejected
       end
 
       # @!macro promises.warn.nil
@@ -1003,16 +1163,16 @@ module Concurrent
         end
       end
 
-      # Allows rejected Future to be risen with `raise` method.
+      # Allows rejected or cancelled Future to be risen with `raise` method.
       # If the reason is not an exception `Runtime.new(reason)` is returned.
       #
       # @example
       #   raise Promises.rejected_future(StandardError.new("boom"))
       #   raise Promises.rejected_future("or just boom")
-      # @raise [Concurrent::Error] when raising not rejected future
+      # @raise [Concurrent::Error] when raising a fulfilled future
       # @return [Exception]
       def exception(*args)
-        raise Concurrent::Error, 'it is not rejected' unless rejected?
+        raise Concurrent::Error, 'it is not rejected or cancelled' unless resolved? && !fulfilled?
         raise ArgumentError unless args.size <= 1
         reason = Array(internal_state.reason).flatten.compact
         callsites = SET_BACKTRACE_LOCATIONS_SUPPORTED ? caller_locations : caller
@@ -1248,6 +1408,20 @@ module Concurrent
 
       alias_method :inspect, :to_s
 
+      # Cancels the future if it is still pending. Only works for futures which
+      # are owned by the given scope through an explicit cancellation
+      # relationship. It is a terminal independent state, distinct from
+      # rejection with a business reason.
+      #
+      # @param scope [CancellationScope] the scope requesting cancellation
+      # @param reason [Exception] reason recorded in the cancelled state
+      # @return [true, false] true if this call cancelled the future, false if
+      #   it was already resolved (including a running block which finished first)
+      # @!visibility private
+      def apply_cancellation(scope, reason = nil)
+        cancel_with(scope, reason)
+      end
+
       private
 
       def run_test(v)
@@ -1271,7 +1445,7 @@ module Concurrent
 
       def wait_until_resolved!(timeout = nil)
         result = wait_until_resolved(timeout)
-        raise self if rejected?
+        raise self if resolved? && !fulfilled?
         result
       end
 
@@ -1292,7 +1466,9 @@ module Concurrent
       end
 
       def callback_on_rejection(state, args, callback)
-        state.apply args, callback unless state.fulfilled?
+        # cancellation is a separate terminal state, it does not trigger
+        # rejection callbacks
+        state.apply args, callback if !state.fulfilled? && state.to_sym == :rejected
       end
 
       def callback_on_resolution(state, args, callback)
@@ -1594,6 +1770,13 @@ module Concurrent
         @Future.resolve_with(new_state, raise_on_reassign)
       end
 
+      # Resolves only when the future is still pending. Used by cancellation
+      # propagation paths which can race with an independent cancellation of
+      # the same node; the first terminal state always wins.
+      def resolve_if_pending(new_state)
+        resolve_with new_state, false
+      end
+
       # @return [Future]
       def evaluate_to(*args, block)
         resolve_with Fulfilled.new(block.call(*args))
@@ -1626,14 +1809,21 @@ module Concurrent
 
       private_class_method :new
 
+      # @param owned [true, false, Array(true, false)] explicit cancellation
+      #   relationship of the blocker(s). `true` means an owned, cancellable
+      #   dependency; `false` means a borrowed dependency which must never be
+      #   cancelled through this node. A bare boolean applies to every blocker.
       def self.new_blocked_by1(blocker, *args, &block)
+        owned = extract_owned(args)
         blocker_delayed = blocker.promise.delayed_because
         promise         = new(blocker_delayed, 1, *args, &block)
         blocker.add_callback_notify_blocked promise, 0
+        promise.establish_cancellation_edges [blocker], Array(owned)
         promise
       end
 
       def self.new_blocked_by2(blocker1, blocker2, *args, &block)
+        owned = extract_owned(args)
         blocker_delayed1 = blocker1.promise.delayed_because
         blocker_delayed2 = blocker2.promise.delayed_because
         delayed          = if blocker_delayed1 && blocker_delayed2
@@ -1645,14 +1835,38 @@ module Concurrent
         promise          = new(delayed, 2, *args, &block)
         blocker1.add_callback_notify_blocked promise, 0
         blocker2.add_callback_notify_blocked promise, 1
+        promise.establish_cancellation_edges [blocker1, blocker2], normalize_owned(owned, 2)
         promise
       end
 
       def self.new_blocked_by(blockers, *args, &block)
+        owned = extract_owned(args)
         delayed = blockers.reduce(nil) { |d, f| add_delayed d, f.promise.delayed_because }
         promise = new(delayed, blockers.size, *args, &block)
         blockers.each_with_index { |f, i| f.add_callback_notify_blocked promise, i }
+        promise.establish_cancellation_edges blockers, normalize_owned(owned, blockers.size)
         promise
+      end
+
+      # Pops the trailing `:owned` option hash from the task arguments used to
+      # configure the explicit cancellation relationship without changing the
+      # positional arguments passed to the user block. The task arguments are
+      # always the last positional element, themselves an Array. When no option
+      # is given the relationship defaults to owned inside an active
+      # cancellation scope (a normal derived execution which the scope may
+      # cancel) and to borrowed outside of any scope.
+      def self.extract_owned(args)
+        task_args = args.last
+        if task_args.is_a?(::Array) && task_args.last.is_a?(::Hash) && task_args.last.key?(:owned)
+          options = task_args.pop
+          options[:owned]
+        else
+          Concurrent::Promises.current_cancellation_scope ? true : false
+        end
+      end
+
+      def self.normalize_owned(owned, size)
+        owned.is_a?(::Array) ? owned : ::Array.new(size) { owned }
       end
 
       def self.add_delayed(delayed1, delayed2)
@@ -1690,6 +1904,26 @@ module Concurrent
         blocked_by = []
         ObjectSpace.each_object(AbstractEventFuture) { |o| blocked_by.push o if o.blocks.include? self }
         blocked_by
+      end
+
+      # Builds the explicit cancellation graph between the blocker(s) and this
+      # node's future.
+      #
+      # For every scope having an edge on a blocker, this node joins the same
+      # scope. Its edge is *owned* when `owned` is true for this blocker (an
+      # owned, cancellable execution), otherwise it *borrows* the scope. The
+      # blocker keeps its own edges untouched: whether it may be cancelled is
+      # decided from the dependency graph at cancellation time, so a shared
+      # upstream still needed by a surviving branch is never cancelled.
+      #
+      # @!visibility private
+      def establish_cancellation_edges(blockers, owned_per_blocker)
+        node = future
+        blockers.each_with_index do |blocker, i|
+          blocker.cancellation_edges.map(&:first).uniq.each do |scope|
+            node.add_cancellation_edge scope, owned_per_blocker[i]
+          end
+        end
       end
 
       private
@@ -1731,6 +1965,17 @@ module Concurrent
       def executor
         @Executor
       end
+
+      private
+
+      # Posts the task only if this future is still pending. If a scope
+      # cancellation already reached this node the task is never accepted by
+      # the executor (its acceptance count stays unchanged), guaranteeing that
+      # a cancelled node's block is neither run nor scheduled.
+      def post_task(&block)
+        return if future.resolved?
+        Concurrent.executor(@Executor).post(&block)
+      end
     end
 
     class ThenPromise < BlockedTaskPromise
@@ -1742,11 +1987,16 @@ module Concurrent
 
       def on_resolvable(resolved_future, index)
         if resolved_future.fulfilled?
-          Concurrent.executor(@Executor).post(resolved_future, @Args, @Task) do |future, args, task|
-            evaluate_to lambda { future.apply args, task }
+          post_task do
+            # re-check on the executor thread: a cancellation may have arrived
+            # after the task was accepted but before it started running.
+            next if future.cancelled?
+            evaluate_to lambda { resolved_future.apply @Args, @Task }
           end
         else
-          resolve_with resolved_future.internal_state
+          # rejections and cancellations propagate without running the task;
+          # the independent cancelled state is preserved as-is
+          resolve_if_pending resolved_future.internal_state
         end
       end
     end
@@ -1760,11 +2010,14 @@ module Concurrent
 
       def on_resolvable(resolved_future, index)
         if resolved_future.rejected?
-          Concurrent.executor(@Executor).post(resolved_future, @Args, @Task) do |future, args, task|
-            evaluate_to lambda { future.apply args, task }
+          post_task do
+            next if future.cancelled?
+            evaluate_to lambda { resolved_future.apply @Args, @Task }
           end
         else
-          resolve_with resolved_future.internal_state
+          # fulfilled futures and cancelled futures (cancellation is a terminal
+          # state which cannot be rescued by a business block) propagate directly
+          resolve_if_pending resolved_future.internal_state
         end
       end
     end
@@ -1774,12 +2027,14 @@ module Concurrent
 
       def on_resolvable(resolved_future, index)
         if Future === resolved_future
-          Concurrent.executor(@Executor).post(resolved_future, @Args, @Task) do |future, args, task|
-            evaluate_to(*future.result, *args, task)
+          post_task do
+            next if future.cancelled?
+            evaluate_to(*resolved_future.result, *@Args, @Task)
           end
         else
-          Concurrent.executor(@Executor).post(@Args, @Task) do |args, task|
-            evaluate_to(*args, task)
+          post_task do
+            next if future.cancelled?
+            evaluate_to(*@Args, @Task)
           end
         end
       end
@@ -1824,7 +2079,7 @@ module Concurrent
       end
 
       def on_resolvable(resolved_future, index)
-        resolve_with resolved_future.internal_state
+        resolve_if_pending resolved_future.internal_state
       end
 
       def resolvable?(countdown, future, index)
@@ -1839,6 +2094,14 @@ module Concurrent
           BlockedPromise.add_delayed @DelayedBecause, delayed
           clear_and_propagate_touch @DelayedBecause if touched?
         end
+      end
+
+      # A flattened future depends on an inner future discovered at runtime.
+      # The explicit cancellation relationships have to be extended to it so
+      # the shared graph stays accurate after flattening: the inner future is
+      # borrowed by the scopes and this flat node joins them as a borrower.
+      def inherit_cancellation_edges_of(inner_future)
+        establish_cancellation_edges [inner_future], [false]
       end
 
     end
@@ -1857,7 +2120,7 @@ module Concurrent
           internal_state = future.internal_state
 
           unless internal_state.fulfilled?
-            resolve_with RESOLVED
+            resolve_if_pending RESOLVED
             return countdown
           end
 
@@ -1865,10 +2128,11 @@ module Concurrent
           case value
           when AbstractEventFuture
             add_delayed_of value
+            inherit_cancellation_edges_of value
             value.add_callback_notify_blocked self, nil
             countdown
           else
-            resolve_with RESOLVED
+            resolve_if_pending RESOLVED
           end
         end
         countdown
@@ -1893,7 +2157,7 @@ module Concurrent
           internal_state = future.internal_state
 
           unless internal_state.fulfilled?
-            resolve_with internal_state
+            resolve_if_pending internal_state
             return countdown
           end
 
@@ -1901,6 +2165,7 @@ module Concurrent
           case value
           when AbstractEventFuture
             add_delayed_of value
+            inherit_cancellation_edges_of value
             value.add_callback_notify_blocked self, nil
             countdown
           else
@@ -1925,7 +2190,7 @@ module Concurrent
         internal_state = future.internal_state
 
         unless internal_state.fulfilled?
-          resolve_with internal_state
+          resolve_if_pending internal_state
           return 0
         end
 
@@ -1934,9 +2199,10 @@ module Concurrent
 
         if continuation_future
           add_delayed_of continuation_future
+          inherit_cancellation_edges_of continuation_future
           continuation_future.add_callback_notify_blocked self, nil
         else
-          resolve_with internal_state
+          resolve_if_pending internal_state
         end
 
         1
@@ -1951,7 +2217,7 @@ module Concurrent
       private
 
       def on_resolvable(resolved_future, index)
-        resolve_with RESOLVED
+        resolve_if_pending RESOLVED
       end
     end
 
@@ -1971,7 +2237,7 @@ module Concurrent
       end
 
       def on_resolvable(resolved_future, index)
-        resolve_with @result
+        resolve_if_pending @result
       end
     end
 
@@ -1983,7 +2249,7 @@ module Concurrent
       private
 
       def on_resolvable(resolved_future, index)
-        resolve_with RESOLVED
+        resolve_if_pending RESOLVED
       end
     end
 
@@ -1995,7 +2261,7 @@ module Concurrent
       private
 
       def on_resolvable(resolved_future, index)
-        resolve_with resolved_future.internal_state
+        resolve_if_pending resolved_future.internal_state
       end
     end
 
@@ -2018,18 +2284,24 @@ module Concurrent
 
       def on_resolvable(resolved_future, index)
         all_fulfilled = true
+        any_cancelled = false
         values        = ::Array.new(@Resolutions.size)
         reasons       = ::Array.new(@Resolutions.size)
 
         @Resolutions.each_with_index do |internal_state, i|
           fulfilled, values[i], reasons[i] = internal_state.result
           all_fulfilled                    &&= fulfilled
+          any_cancelled                    ||= internal_state.to_sym == :cancelled
         end
 
         if all_fulfilled
-          resolve_with FulfilledArray.new(values)
+          resolve_if_pending FulfilledArray.new(values)
+        elsif any_cancelled
+          # cancellation is kept distinct from business rejection even when it
+          # is only one of the zipped inputs which was cancelled
+          resolve_if_pending PartiallyCancelled.new(values, reasons)
         else
-          resolve_with PartiallyRejected.new(values, reasons)
+          resolve_if_pending PartiallyRejected.new(values, reasons)
         end
       end
     end
@@ -2045,7 +2317,7 @@ module Concurrent
       end
 
       def on_resolvable(resolved_future, index)
-        resolve_with RESOLVED
+        resolve_if_pending RESOLVED
       end
     end
 
