@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 from itertools import count
-from threading import local
+from threading import Condition, local
+from time import monotonic
 from typing import TYPE_CHECKING
 
 from .common import maybe_declare
@@ -17,9 +18,88 @@ from .utils.functional import ChannelPromise, maybe_list
 if TYPE_CHECKING:
     from types import TracebackType
 
-__all__ = ('Exchange', 'Queue', 'Producer', 'Consumer')
+__all__ = (
+    'Exchange', 'Queue', 'Producer', 'Consumer', 'GracefulCancelResult',
+)
 
 DEFAULT_BATCH_SIZE = 1000
+
+#: How often :meth:`Consumer.cancel_gracefully` re-checks the channel
+#: state while waiting for in-flight callbacks to finish.
+GRACEFUL_CANCEL_POLL_INTERVAL = 0.1
+
+
+def _channel_closed(channel):
+    """Return true if the channel is known to be (or become) unusable."""
+    if channel is None:
+        return True
+    closed = getattr(channel, 'closed', None)
+    if closed is not None:
+        return bool(closed)
+    is_open = getattr(channel, 'is_open', None)
+    if is_open is not None:
+        return not is_open
+    return False
+
+
+class GracefulCancelResult:
+    """Outcome of :meth:`Consumer.cancel_gracefully`.
+
+    Attributes:
+    ----------
+        completed (list): Identities of messages whose callback finished
+            (entered an acknowledged or otherwise final state) before
+            the wait ended.
+        unfinished (list): Identities of messages still being processed
+            when the wait ended (timeout or channel loss).  These are
+            *not* acknowledged automatically; deciding their fate is
+            left to the caller.
+        callback_errors (list): Exceptions raised by message callbacks
+            while they were being waited on.
+        cancel_errors (list): Exceptions raised while cancelling the
+            underlying AMQP consumers.
+        interrupted (bool): True if the wait ended early because the
+            channel was closed or replaced.
+    """
+
+    def __init__(self, completed=None, unfinished=None,
+                 callback_errors=None, cancel_errors=None,
+                 interrupted=False):
+        self.completed = list(completed or [])
+        self.unfinished = list(unfinished or [])
+        self.callback_errors = list(callback_errors or [])
+        self.cancel_errors = list(cancel_errors or [])
+        self.interrupted = interrupted
+
+    @property
+    def ok(self):
+        """True if nothing is unfinished and no errors were recorded."""
+        return not (self.unfinished or self.callback_errors or
+                    self.cancel_errors)
+
+    def __bool__(self):
+        return self.ok
+
+    def __repr__(self):
+        return (
+            f'<{type(self).__name__}: completed={self.completed!r} '
+            f'unfinished={self.unfinished!r} '
+            f'callback_errors={self.callback_errors!r} '
+            f'cancel_errors={self.cancel_errors!r} '
+            f'interrupted={self.interrupted!r}>'
+        )
+
+
+class _InflightDelivery:
+    """Tracks a message whose callback is currently being executed."""
+
+    __slots__ = ('identity', 'done', 'acknowledged', 'error')
+
+    def __init__(self, identity):
+        self.identity = identity
+        self.done = False
+        self.acknowledged = False
+        self.error = None
 
 
 class _ProducerBatchState:
@@ -572,6 +652,8 @@ class Consumer:
         self.tag_prefix = tag_prefix
         self._active_tags = {}
         self._active_queue_no_ack = {}
+        self._inflight = {}
+        self._inflight_condition = Condition()
         if auto_declare is not None:
             self.auto_declare = auto_declare
         if on_decode_error is not None:
@@ -612,6 +694,12 @@ class Consumer:
         # re-register the AMQP consumers, but only for queues that were
         # actually being consumed from before (not merely registered).
         self._consume_previously_active(previous_no_ack)
+
+        # wake up any cancel_gracefully() waiters: the channel they were
+        # waiting on is gone, so their in-flight messages will never
+        # reach a final state.
+        with self._inflight_condition:
+            self._inflight_condition.notify_all()
 
     def declare(self):
         """Declare queues, exchanges and bindings.
@@ -723,6 +811,10 @@ class Consumer:
         ----
             This does not affect already delivered messages, but it does
             mean the server will not send any more messages for this consumer.
+
+            This returns immediately without waiting for already
+            dispatched callbacks to finish.  Use :meth:`cancel_gracefully`
+            if you need to wait for in-flight callbacks.
         """
         cancel = self.channel.basic_cancel
         for tag in self._active_tags.values():
@@ -731,6 +823,72 @@ class Consumer:
         self._active_queue_no_ack.clear()
 
     close = cancel
+
+    def cancel_gracefully(self, timeout=None):
+        """Cancel consumers, then wait for in-flight callbacks to finish.
+
+        This first stops accepting new deliveries (like :meth:`cancel`),
+        then waits until every message callback that was already
+        dispatched *before* the cancel has reached a final state
+        (acknowledged/rejected/requeued, or the callback returned or
+        raised).  Deliveries arriving after the cancel are still
+        dispatched, but they are never waited for.
+
+        Arguments:
+        ---------
+            timeout (float): Maximum number of seconds to wait for
+                in-flight callbacks.  If not set, waits indefinitely
+                (unless the channel is closed or revived, which always
+                wakes the wait up).
+
+        Returns:
+        -------
+            GracefulCancelResult: Describes what completed.  If the wait
+                timed out (or the channel was lost), its
+                :attr:`~GracefulCancelResult.unfinished` attribute lists
+                the identities (delivery tags) of the messages whose
+                callbacks were still running.  These messages are *not*
+                acknowledged automatically.  Callback exceptions and
+                cancellation failures are preserved separately in
+                :attr:`~GracefulCancelResult.callback_errors` and
+                :attr:`~GracefulCancelResult.cancel_errors`.
+        """
+        channel = self.channel
+        with self._inflight_condition:
+            snapshot = list(self._inflight.values())
+
+        cancel_errors = []
+        try:
+            self.cancel()
+        except Exception as exc:
+            cancel_errors.append(exc)
+
+        deadline = None if timeout is None else monotonic() + timeout
+        interrupted = False
+        with self._inflight_condition:
+            while True:
+                if all(record.done for record in snapshot):
+                    break
+                if self.channel is not channel or _channel_closed(channel):
+                    interrupted = True
+                    break
+                wait_time = GRACEFUL_CANCEL_POLL_INTERVAL
+                if deadline is not None:
+                    remaining = deadline - monotonic()
+                    if remaining <= 0:
+                        break
+                    wait_time = min(wait_time, remaining)
+                self._inflight_condition.wait(wait_time)
+
+        unfinished = [r.identity for r in snapshot if not r.done]
+        return GracefulCancelResult(
+            completed=[r.identity for r in snapshot if r.done],
+            unfinished=unfinished,
+            callback_errors=[r.error for r in snapshot
+                             if r.error is not None],
+            cancel_errors=cancel_errors,
+            interrupted=interrupted,
+        )
 
     def cancel_by_queue(self, queue):
         """Cancel consumer by queue name."""
@@ -872,7 +1030,44 @@ class Consumer:
                 raise
             self.on_decode_error(message, exc)
         else:
+            return self._dispatch_message(message, on_m, decoded)
+
+    def _dispatch_message(self, message, on_m, decoded):
+        """Run the message callback while tracking it as in-flight.
+
+        The message is registered in :attr:`_inflight` for the duration
+        of the callback so that :meth:`cancel_gracefully` can wait for
+        it.  Callback exceptions are recorded on the tracking record and
+        then re-raised, preserving the original behavior.
+        """
+        record = _InflightDelivery(self._message_identity(message))
+        with self._inflight_condition:
+            self._inflight[record.identity] = record
+        try:
             return on_m(message) if on_m else self.receive(decoded, message)
+        except Exception as exc:
+            record.error = exc
+            raise
+        finally:
+            record.acknowledged = bool(
+                getattr(message, 'acknowledged', False))
+            record.done = True
+            with self._inflight_condition:
+                self._inflight.pop(record.identity, None)
+                self._inflight_condition.notify_all()
+
+    @staticmethod
+    def _message_identity(message):
+        """Return a stable identity for a delivered message.
+
+        This is the delivery tag when the transport provides one,
+        falling back to the object id otherwise.
+        """
+        delivery_tag = getattr(message, 'delivery_tag', None)
+        if delivery_tag is None:
+            delivery_info = getattr(message, 'delivery_info', None) or {}
+            delivery_tag = delivery_info.get('delivery_tag')
+        return delivery_tag if delivery_tag is not None else id(message)
 
     def __repr__(self):
         return f'<{type(self).__name__}: {self.queues}>'

@@ -3,6 +3,7 @@ from __future__ import annotations
 import pickle
 import sys
 import threading
+import time
 from collections import defaultdict
 from unittest.mock import ANY, Mock, patch
 
@@ -1230,3 +1231,288 @@ class test_Consumer:
         p = self.connection.Consumer()
         p.channel = object()
         assert p.connection is None
+
+
+class test_Consumer_graceful_cancel:
+
+    def setup_method(self):
+        self.connection = Connection(transport=Transport)
+        self.connection.connect()
+        assert self.connection.connection.connected
+        self.exchange = Exchange('foo', 'direct')
+
+    def _consumer(self):
+        channel = self.connection.channel()
+        q = Queue('qname', self.exchange, 'rkey')
+        consumer = Consumer(channel, [q])
+        consumer.consume()
+        return consumer, channel
+
+    def _wait_for(self, predicate, timeout=5):
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if predicate():
+                return True
+            time.sleep(0.01)
+        return False
+
+    def test_no_inflight_returns_ok(self):
+        consumer, channel = self._consumer()
+        result = consumer.cancel_gracefully(timeout=1)
+        assert result.ok
+        assert result.completed == []
+        assert result.unfinished == []
+        assert result.callback_errors == []
+        assert result.cancel_errors == []
+        assert not result.interrupted
+        assert 'basic_cancel' in channel
+
+    def test_waits_for_inflight_callback(self):
+        consumer, channel = self._consumer()
+        started, release = threading.Event(), threading.Event()
+
+        def callback(body, message):
+            started.set()
+            release.wait(5)
+            message.ack()
+
+        consumer.register_callback(callback)
+        t = threading.Thread(
+            target=consumer._receive_callback, args=({'foo': 'bar'},))
+        t.start()
+        assert started.wait(5)
+
+        holder = {}
+
+        def _cancel():
+            holder['result'] = consumer.cancel_gracefully(timeout=5)
+
+        ct = threading.Thread(target=_cancel)
+        ct.start()
+        assert self._wait_for(lambda: 'basic_cancel' in channel)
+        time.sleep(0.2)
+        # still waiting for the in-flight callback
+        assert ct.is_alive()
+        release.set()
+        ct.join(5)
+        t.join(5)
+        assert not ct.is_alive()
+
+        result = holder['result']
+        assert result.ok
+        assert result.completed == [1]
+        assert result.unfinished == []
+        assert 'basic_ack' in channel
+
+    def test_timeout_returns_unfinished_without_auto_ack(self):
+        consumer, channel = self._consumer()
+        started, release = threading.Event(), threading.Event()
+
+        def callback(body, message):
+            started.set()
+            release.wait(5)
+
+        consumer.register_callback(callback)
+        t = threading.Thread(
+            target=consumer._receive_callback, args=({'foo': 'bar'},))
+        t.start()
+        assert started.wait(5)
+
+        result = consumer.cancel_gracefully(timeout=0.2)
+        assert result.unfinished == [1]
+        assert result.completed == []
+        assert not result.ok
+        # the unfinished message was not acknowledged on our behalf
+        assert 'basic_ack' not in channel
+
+        release.set()
+        t.join(5)
+
+    def test_does_not_wait_for_post_cancel_deliveries(self):
+        consumer, channel = self._consumer()
+        started1, release1 = threading.Event(), threading.Event()
+        started2, release2 = threading.Event(), threading.Event()
+        first = [True]
+
+        def callback(body, message):
+            if first[0]:
+                first[0] = False
+                started1.set()
+                release1.wait(5)
+            else:
+                started2.set()
+                release2.wait(5)
+
+        consumer.register_callback(callback)
+        t1 = threading.Thread(
+            target=consumer._receive_callback, args=({'n': 1},))
+        t1.start()
+        assert started1.wait(5)
+
+        holder = {}
+
+        def _cancel():
+            holder['result'] = consumer.cancel_gracefully(timeout=5)
+
+        ct = threading.Thread(target=_cancel)
+        ct.start()
+        assert self._wait_for(lambda: 'basic_cancel' in channel)
+
+        # a delivery that arrives after the cancel must not be waited for
+        t2 = threading.Thread(
+            target=consumer._receive_callback, args=({'n': 2},))
+        t2.start()
+        assert started2.wait(5)
+
+        release1.set()
+        ct.join(5)
+        t1.join(5)
+        assert not ct.is_alive()
+
+        result = holder['result']
+        assert result.ok
+        assert result.completed == [1]
+        assert result.unfinished == []
+
+        release2.set()
+        t2.join(5)
+
+    def test_callback_error_preserved_separately(self):
+        consumer, channel = self._consumer()
+        started, release = threading.Event(), threading.Event()
+
+        def callback(body, message):
+            started.set()
+            release.wait(5)
+            raise KeyError('boom')
+
+        consumer.register_callback(callback)
+
+        def _receive():
+            with pytest.raises(KeyError):
+                consumer._receive_callback({'foo': 'bar'})
+
+        t = threading.Thread(target=_receive)
+        t.start()
+        assert started.wait(5)
+
+        holder = {}
+
+        def _cancel():
+            holder['result'] = consumer.cancel_gracefully(timeout=5)
+
+        ct = threading.Thread(target=_cancel)
+        ct.start()
+        assert self._wait_for(lambda: 'basic_cancel' in channel)
+        release.set()
+        ct.join(5)
+        t.join(5)
+
+        result = holder['result']
+        assert len(result.callback_errors) == 1
+        assert isinstance(result.callback_errors[0], KeyError)
+        assert result.cancel_errors == []
+        assert result.completed == [1]
+        assert not result.ok
+
+    def test_cancel_error_preserved_separately(self):
+        consumer, channel = self._consumer()
+
+        def _boom(tag):
+            raise OperationalError('cancel failed')
+        channel.basic_cancel = _boom
+
+        result = consumer.cancel_gracefully(timeout=1)
+        assert len(result.cancel_errors) == 1
+        assert isinstance(result.cancel_errors[0], OperationalError)
+        assert result.callback_errors == []
+        assert not result.ok
+
+    def test_channel_close_wakes_waiter(self):
+        consumer, channel = self._consumer()
+        started, release = threading.Event(), threading.Event()
+
+        def callback(body, message):
+            started.set()
+            release.wait(5)
+
+        consumer.register_callback(callback)
+        t = threading.Thread(
+            target=consumer._receive_callback, args=({'foo': 'bar'},))
+        t.start()
+        assert started.wait(5)
+
+        holder = {}
+
+        def _cancel():
+            holder['result'] = consumer.cancel_gracefully(timeout=30)
+
+        ct = threading.Thread(target=_cancel)
+        ct.start()
+        assert self._wait_for(lambda: 'basic_cancel' in channel)
+        channel.closed = True
+        ct.join(5)
+        assert not ct.is_alive()
+
+        result = holder['result']
+        assert result.interrupted
+        assert result.unfinished == [1]
+        assert 'basic_ack' not in channel
+
+        release.set()
+        t.join(5)
+
+    def test_revive_wakes_waiter(self):
+        consumer, channel = self._consumer()
+        started, release = threading.Event(), threading.Event()
+
+        def callback(body, message):
+            started.set()
+            release.wait(5)
+
+        consumer.register_callback(callback)
+        t = threading.Thread(
+            target=consumer._receive_callback, args=({'foo': 'bar'},))
+        t.start()
+        assert started.wait(5)
+
+        holder = {}
+
+        def _cancel():
+            holder['result'] = consumer.cancel_gracefully(timeout=30)
+
+        ct = threading.Thread(target=_cancel)
+        ct.start()
+        assert self._wait_for(lambda: 'basic_cancel' in channel)
+        consumer.revive(self.connection.channel())
+        ct.join(5)
+        assert not ct.is_alive()
+
+        result = holder['result']
+        assert result.interrupted
+        assert result.unfinished == [1]
+
+        release.set()
+        t.join(5)
+
+    def test_cancel_remains_immediate(self):
+        consumer, channel = self._consumer()
+        started, release = threading.Event(), threading.Event()
+
+        def callback(body, message):
+            started.set()
+            release.wait(5)
+
+        consumer.register_callback(callback)
+        t = threading.Thread(
+            target=consumer._receive_callback, args=({'foo': 'bar'},))
+        t.start()
+        assert started.wait(5)
+
+        # the plain cancel() must not wait for the in-flight callback
+        consumer.cancel()
+        assert 'basic_cancel' in channel
+        assert not consumer._active_tags
+
+        release.set()
+        t.join(5)
