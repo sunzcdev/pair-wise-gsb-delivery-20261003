@@ -46,6 +46,7 @@ TESTS = %w(
     v2_release_transport
     v2_zone_transfer_native
     release_negative_cache
+    negative_entry
     release_recursor_cache
     release_zone_ttls
     release_zone_defaults

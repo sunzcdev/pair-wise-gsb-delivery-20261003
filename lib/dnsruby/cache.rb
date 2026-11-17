@@ -23,6 +23,18 @@
 # overwrite the previous Message.
 # When a Message is retrieved from the cache, the header
 # and ttls will be "fixed" - i.e. AA cleared, etc.
+#
+# Negative responses (RFC 2308) are cached only when the response carries
+# an authoritative basis: an SOA in the authority section enclosing the
+# name where non-existence was proved. Each negative is described by a
+# NegativeEntry recording the exact question scope, the authoritative SOA,
+# the lifetime computed from it (the lesser of the SOA TTL and MINIMUM),
+# and the position on the alias chain where non-existence was found.
+# NXDOMAIN for the queried name itself covers every type; NODATA covers
+# only its own qname-qclass-qtype tuple and is never widened into a name
+# error. Entries expire on their computed lifetime or when the zone
+# changes (a different SOA serial), and an unexpired positive answer
+# always outranks a contradictory negative.
 
 
 
@@ -38,6 +50,7 @@ module Dnsruby
     def initialize(preserve_security: false)
     @preserve_security = preserve_security
     @cache = Hash.new
+    @negative_index = Hash.new
     @mutex = Mutex.new
     end
     def cache
@@ -46,6 +59,7 @@ module Dnsruby
     def clear()
       @mutex.synchronize {
         @cache = Hash.new
+        @negative_index = Hash.new
       }
     end
     def delete(qname, qtype, qclass = Classes.IN, scope: nil)
@@ -54,7 +68,7 @@ module Dnsruby
       keys = [CacheKey.new(qname, qtype, qclass).to_s,
         CacheKey.new(qname, Types::ANY, qclass).to_s + ' NXDOMAIN']
       keys.map! { |key| [scope, key] } if scope
-      @mutex.synchronize { keys.each { |key| @cache.delete(key) } }
+      @mutex.synchronize { keys.each { |key| drop(key) } }
     end
     def length
       @mutex.synchronize { @cache.length }
@@ -62,9 +76,16 @@ module Dnsruby
     def Cache.max_size=(length)
        @@max_size = length
     end
+    # The authoritative content of a negative response: the question it
+    # answers, the name on the alias chain where non-existence was proved,
+    # the enclosing SOA, and whether the whole name is denied.
+    NegativeProof = Struct.new(:question, :rcode, :terminal, :soa, :name_error) do
+      alias name_error? name_error
+    end
+
     # A negative response requires an enclosing SOA. Following aliases here
     # keeps a CNAME-only positive answer distinct from a NODATA response.
-    def self.negative_soa(message)
+    def self.negative_proof(message)
       q = message.question.first
       return unless q && [RCode::NOERROR, RCode::NXDOMAIN].include?(message.rcode)
       terminal = q.qname
@@ -90,32 +111,64 @@ module Dnsruby
             dname.domainname.labels, true)
         end
       end
-      message.authority.select { |rr| rr.type == Types::SOA && rr.klass == q.qclass &&
+      soa = message.authority.select { |rr| rr.type == Types::SOA && rr.klass == q.qclass &&
         (terminal == rr.name || terminal.subdomain_of?(rr.name)) }.max_by { |rr| rr.name.labels.length }
+      return unless soa
+      # Only a bare NXDOMAIN (no aliases in the answer) denies the queried
+      # name itself, and with it every type at that name.
+      NegativeProof.new(q, message.rcode, terminal, soa,
+        message.rcode == RCode::NXDOMAIN && message.answer.empty?)
     rescue ResolvError
       nil
+    end
+
+    def self.negative_soa(message)
+      proof = negative_proof(message)
+      proof && proof.soa
     end
 
     def add(message, scope: nil, error: nil)
       return if message.header.tc
       q = message.question.first
       return unless q
-      soa = Cache.negative_soa(message)
-      return if message.rcode == RCode::NXDOMAIN && !soa
-      return if message.rcode == RCode::NOERROR && message.answer.empty? && !soa
+      now = Time.now.to_i
+      proof = Cache.negative_proof(message)
+      # Failures without an authoritative basis never enter the negative
+      # cache: no enclosing SOA, no negative entry.
+      return if message.rcode == RCode::NXDOMAIN && !proof
+      return if message.rcode == RCode::NOERROR && message.answer.empty? && !proof
       key = CacheKey.new(q.qname, q.qtype, q.qclass).to_s
+      entry = proof && NegativeEntry.new(proof, now)
+      return if entry && entry.expiration <= now
       # A bare NXDOMAIN applies to all types. With aliases, retain the full
       # original question so a CNAME query never receives a false name error.
-      if soa && message.rcode == RCode::NXDOMAIN && message.answer.empty?
-        key = CacheKey.new(q.qname, Types::ANY, q.qclass).to_s + ' NXDOMAIN'
-      end
+      key = CacheKey.new(q.qname, Types::ANY, q.qclass).to_s + ' NXDOMAIN' if entry && entry.name_error?
       key = [scope, key] if scope
       data = CacheData.new(message, preserve_security: @preserve_security, error: error)
-      return if data.expiration <= Time.now.to_i
+      data.negative_entry = entry if entry
+      return if data.expiration <= now
       @mutex.synchronize do
-        @cache.delete(key)
+        if entry
+          # Fixed priority: an unexpired positive answer outranks any
+          # negative for the identical question.
+          existing = @cache[key]
+          return if existing && !existing.negative? && existing.expiration > now
+          purge_conflicting_negatives(entry, key)
+          purge_superseded_zone_entries(entry)
+        elsif message.rcode == RCode::NOERROR && !message.answer.empty?
+          # Fixed priority: a positive answer supersedes a contradictory
+          # whole-name error for the same name.
+          name_error_key = CacheKey.new(q.qname, Types::ANY, q.qclass).to_s + ' NXDOMAIN'
+          name_error_key = [scope, name_error_key] if scope
+          drop(name_error_key)
+        end
+        drop(key)
         @cache[key] = data
-        @cache.shift while @cache.size > @@max_size
+        @negative_index[key] = entry if entry
+        while @cache.size > @@max_size
+          evicted, = @cache.shift
+          @negative_index.delete(evicted)
+        end
       end
       data
     end
@@ -124,6 +177,9 @@ module Dnsruby
     def find(qname, qtype, qclass = Classes.IN, scope: nil)
       qn = Name.create(qname)
       qn.absolute = true
+      # One fixed clock reading per lookup decides the hit scope and the
+      # remaining TTL of everything this call returns.
+      now = Time.now.to_i
       key = CacheKey.new(qn, qtype, qclass).to_s
       name_error_key = CacheKey.new(qn, Types::ANY, qclass).to_s + ' NXDOMAIN'
       key, name_error_key = [scope, key], [scope, name_error_key] if scope
@@ -133,18 +189,25 @@ module Dnsruby
         if (!data)
           return nil
         end
-        if (data.expiration <= Time.now.to_i)
-          @cache.delete(key)
+        if (data.expiration <= now)
+          drop(key)
           TheLog.debug("CACHE lookup stale\n")
           return nil
         end
         data
       }
+      entry = data.negative_entry
+      # A cached negative answers only its recorded question scope: one
+      # type's absence is never widened into the absence of the whole name.
+      if entry && !entry.covers?(qn, qtype, qclass)
+        TheLog.debug("CACHE negative scope mismatch\n")
+        return nil
+      end
       # CacheData owns an immutable wire snapshot, so decoding does not need to
       # serialize other cache lookups, insertions or clears behind this lock.
       m = data.message
-      if data.expiration <= Time.now.to_i
-        @mutex.synchronize { @cache.delete(key) if @cache[key].equal?(data) }
+      if (data.expiration <= Time.now.to_i)
+        @mutex.synchronize { drop(key) if @cache[key].equal?(data) }
         return nil
       end
       TheLog.debug("CACHE found\n")
@@ -283,6 +346,102 @@ module Dnsruby
       end
     end
 
+    private
+
+    # Caller holds @mutex.
+    def drop(key)
+      @cache.delete(key)
+      @negative_index.delete(key)
+    end
+
+    # A whole-name error and a type-specific NODATA at the same name cannot
+    # both be true; the most recent authoritative answer wins. Caller holds
+    # @mutex.
+    def purge_conflicting_negatives(entry, keep_key)
+      @negative_index.each do |key, other|
+        next if key == keep_key
+        next unless other.qname == entry.qname && other.qclass == entry.qclass
+        next unless other.name_error? || entry.name_error?
+        drop(key)
+      end
+    end
+
+    # Negatives are authorised by the zone's SOA. Once the zone changes
+    # (a different serial), earlier negatives from that zone must not be
+    # reused. Caller holds @mutex.
+    def purge_superseded_zone_entries(entry)
+      @negative_index.each do |key, other|
+        next unless other.zone_key == entry.zone_key && other.zone_serial != entry.zone_serial
+        drop(key)
+      end
+    end
+
+    public
+
+    # A negative cache entry: the exact question scope it may answer, the
+    # authoritative SOA, the lifetime computed from that SOA, and the
+    # position on the alias chain where non-existence was proved.
+    class NegativeEntry # :nodoc: all
+      attr_reader :qname, :qtype, :qclass, :terminal, :soa, :received_at
+
+      def initialize(proof, received_at = Time.now.to_i)
+        @qname = proof.question.qname
+        @qclass = proof.question.qclass
+        @name_error = proof.name_error?
+        @qtype = @name_error ? Types::ANY : proof.question.qtype
+        @terminal = proof.terminal
+        @soa = proof.soa
+        @received_at = received_at
+      end
+
+      # NXDOMAIN for the queried name itself denies every type at that
+      # name. Anything else (NODATA, or non-existence further along an
+      # alias chain) denies only the recorded question.
+      def name_error?
+        @name_error
+      end
+
+      def nodata?
+        !@name_error
+      end
+
+      # RFC 2308: the negative lifetime is the lesser of the SOA TTL and
+      # the SOA MINIMUM field, counted from when the response was received.
+      def lifetime
+        [@soa.ttl, @soa.minimum].min
+      end
+
+      def expiration
+        @received_at + lifetime
+      end
+
+      def expired?(now = Time.now.to_i)
+        expiration <= now
+      end
+
+      def remaining_ttl(now = Time.now.to_i)
+        [expiration - now, 0].max
+      end
+
+      # The exact question scope this entry may answer. One type's absence
+      # is never widened into the absence of the whole name.
+      def covers?(qname, qtype, qclass = Classes::IN)
+        name = Name.create(qname)
+        name.absolute = true
+        return false unless name == @qname && Classes.new(qclass) == @qclass
+        name_error? || Types.new(qtype) == @qtype
+      end
+
+      # Identity of the zone whose SOA authorised this entry.
+      def zone_key
+        "#{@soa.name.inspect.downcase} #{@soa.klass.code}"
+      end
+
+      def zone_serial
+        @soa.serial
+      end
+    end
+
     class CacheKey # :nodoc: all
       attr_accessor :qname, :qtype, :qclass
       def initialize(*args)
@@ -309,6 +468,13 @@ module Dnsruby
       Snapshot = Struct.new(:wire, :expiration, :record_expirations, :authenticated_expirations)
       private_constant :Snapshot
 
+      # The NegativeEntry describing this response, when it is negative.
+      attr_accessor :negative_entry
+
+      def negative?
+        !@negative_entry.nil?
+      end
+
       def expiration
         @snapshot.expiration
       end
@@ -333,7 +499,7 @@ module Dnsruby
           @lifetime ? now + @lifetime : (record_expirations.compact.min || 0), record_expirations.freeze,
           authenticated_expirations.freeze).freeze
       end
-      def message
+      def message(now = Time.now.to_i)
         snapshot = @snapshot
         m = Message.decode(snapshot.wire)
         m.cached = true
@@ -348,7 +514,6 @@ module Dnsruby
         #  @TODO@ What do we do about answerfrom, answersize, etc.?
         m.header.aa = false # Anything else to do here?
         #  Fix up TTLs!!
-        now = Time.now.to_i
         index = -1
         m.each_resource {|rr|
           index += 1
