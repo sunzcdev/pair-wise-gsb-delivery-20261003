@@ -1,5 +1,19 @@
 # connection_pool Changelog
 
+Unreleased
+----------
+
+- Add `ConnectionPool::Partitioned`, a pool which partitions idle
+  connections by an explicit, caller-normalized partition key. Clients
+  borrowing connections by address/session configuration only reuse idle
+  connections from the same partition; all partitions share the pool-wide
+  `size` capacity ledger. The factory block receives the normalized
+  partition key, nested `with` for a different partition raises
+  `ConnectionPool::Error` instead of silently reusing the wrong
+  connection, `reap`/`idle` operate per partition, unknown partitions
+  pre-create nothing, and diagnostics only contain a one-way fingerprint
+  of the key, never raw credentials.
+
 3.0.3
 ------
 

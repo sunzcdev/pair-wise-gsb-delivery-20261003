@@ -136,6 +136,38 @@ pool.with do |conn|
 end
 ```
 
+## Partitioned Pools
+
+If your clients borrow connections by address or session configuration, a
+plain pool can hand you an idle connection created for the wrong
+configuration. `ConnectionPool::Partitioned` partitions idle connections by
+an explicit key so a checkout only ever reuses an idle connection from the
+same partition, while every partition still shares the pool-wide `size`
+limit.
+
+```ruby
+# The caller owns key normalization; the factory receives the normalized
+# key (its "tag") so the connection's identity matches what was borrowed.
+pool = ConnectionPool::Partitioned.new(size: 5, normalize_key: ->(cfg) { [cfg[:host], cfg[:db]] }) do |key|
+  Redis.new(host: key[0], db: key[1])
+end
+
+pool.with(key: {host: "a.example", db: 0}) do |redis|
+  redis.lpop("my-list")
+end
+```
+
+Notes:
+
+- Connections are created lazily; a partition that was never checked out
+  holds no resources.
+- Nesting `with` for the same partition reuses the current connection, but
+  nesting a *different* partition raises `ConnectionPool::Error` rather
+  than silently reusing the wrong connection.
+- `reap` and `idle` accept a `key:` and operate on that partition only.
+- Partition keys may embed credentials; diagnostics only contain a one-way
+  fingerprint of the key, never the raw key.
+
 ## Current State
 
 There are several methods that return information about a pool.

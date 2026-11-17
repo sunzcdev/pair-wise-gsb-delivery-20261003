@@ -194,5 +194,7 @@ class ConnectionPool
 end
 
 require_relative "connection_pool/timed_stack"
+require_relative "connection_pool/partitioned_timed_stack"
+require_relative "connection_pool/partitioned"
 require_relative "connection_pool/wrapper"
 require_relative "connection_pool/fork"
