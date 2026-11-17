@@ -1,0 +1,15 @@
+*.bak
+*.rbc
+*.swp
+*~
+.#*
+.DS_Store
+.idea
+.rbx
+/.rdoc
+/TAGS
+/coverage
+/html
+/_site
+/pkg
+Gemfile.lock
