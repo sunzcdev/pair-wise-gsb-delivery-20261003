@@ -6,13 +6,14 @@ Core implementation of aiosqlite proxies
 """
 
 import asyncio
+import contextlib
 import logging
 import sqlite3
 from collections.abc import AsyncIterator, Generator, Iterable
 from functools import partial
 from pathlib import Path
 from queue import Empty, Queue, SimpleQueue
-from threading import Thread
+from threading import Event, Thread
 from typing import Any, Callable, Literal, Optional, Union
 from warnings import warn
 
@@ -73,6 +74,45 @@ def _connection_worker_thread(tx: _TxQueue):
             LOG.debug("returning exception %s", e)
             if future:
                 future.get_loop().call_soon_threadsafe(set_exception, future, e)
+
+
+class _Borrowed:
+    """
+    A raw sqlite3 connection exclusively borrowed from its worker thread.
+
+    While borrowed, the owning connection's worker thread is paused, so no
+    queued operations will execute until the borrow is released. Callables
+    may still be run on the worker thread via `run()`, preserving sqlite3
+    thread affinity for the borrowed connection.
+
+    :meta private:
+    """
+
+    def __init__(
+        self,
+        raw: sqlite3.Connection,
+        loop: asyncio.AbstractEventLoop,
+        work: "Queue[Optional[tuple[Callable[[], Any], asyncio.Future]]]",
+    ) -> None:
+        self.raw = raw
+        self._loop = loop
+        self._work = work
+        self._released = False
+
+    def release(self) -> None:
+        """Release the borrow, resuming the worker thread."""
+        if not self._released:
+            self._released = True
+            self._work.put_nowait(None)
+
+    async def run(self, fn: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
+        """Run a callable on the owning worker thread and await its result."""
+        if self._released:
+            raise RuntimeError("borrowed connection has been released")
+
+        future = self._loop.create_future()
+        self._work.put_nowait((partial(fn, *args, **kwargs), future))
+        return await future
 
 
 class Connection:
@@ -158,6 +198,65 @@ class Connection:
         self._tx.put_nowait((future, function))
 
         return await future
+
+    @contextlib.asynccontextmanager
+    async def _borrow(self) -> AsyncIterator[_Borrowed]:
+        """
+        Exclusively borrow the raw sqlite3 connection from the worker thread.
+
+        Waits until all previously queued operations have completed, then
+        pauses the worker thread for the duration of the borrow. Operations
+        queued while borrowed will only execute after the borrow is released.
+        """
+        if not self._running or self._connection is None:
+            raise ValueError("Connection closed")
+
+        loop = asyncio.get_event_loop()
+        acquired = loop.create_future()
+        work: "Queue[Optional[tuple[Callable[[], Any], asyncio.Future]]]" = Queue()
+        cancelled = Event()
+
+        def barrier() -> None:
+            # Runs on the worker thread, after all previously queued
+            # operations have completed. Pauses the worker thread until the
+            # borrow is released, optionally running callables submitted via
+            # `_Borrowed.run()` so they keep correct thread affinity.
+            if cancelled.is_set():
+                return
+
+            loop.call_soon_threadsafe(set_result, acquired, self._connection)
+
+            while True:
+                item = work.get()
+                if item is None:
+                    break
+
+                function, future = item
+                try:
+                    LOG.debug("executing borrowed %s", function)
+                    result = function()
+                except BaseException as e:  # noqa B036
+                    loop.call_soon_threadsafe(set_exception, future, e)
+                else:
+                    loop.call_soon_threadsafe(set_result, future, result)
+
+        self._tx.put_nowait((None, barrier))
+
+        try:
+            raw = await acquired
+        except BaseException:
+            # Cancelled or failed while waiting for the reservation: make sure
+            # the queued barrier does not block the worker thread when it is
+            # eventually reached.
+            cancelled.set()
+            work.put_nowait(None)
+            raise
+
+        borrowed = _Borrowed(raw, loop, work)
+        try:
+            yield borrowed
+        finally:
+            borrowed.release()
 
     async def _connect(self) -> "Connection":
         """Connect to the actual sqlite database."""
@@ -426,18 +525,56 @@ class Connection:
         Make a backup of the current database to the target database.
 
         Takes either a standard sqlite3 or aiosqlite Connection object as the target.
-        """
-        if isinstance(target, Connection):
-            target = target._conn
 
-        await self._execute(
-            self._conn.backup,
-            target,
-            pages=pages,
-            progress=progress,
-            name=name,
-            sleep=sleep,
-        )
+        When the target is an aiosqlite Connection, both connections are
+        exclusively reserved for the duration of the backup: already queued
+        operations on both connections complete first, and operations queued
+        while the backup is running only execute afterwards. Reservations are
+        always acquired in the same global order, so concurrent backups in
+        opposite directions (A to B and B to A) do not deadlock. The backup
+        itself runs on the source connection's worker thread, preserving
+        sqlite3 thread affinity, and neither connection is closed or left
+        unusable if the backup fails.
+        """
+        if not isinstance(target, Connection):
+            await self._execute(
+                self._conn.backup,
+                target,
+                pages=pages,
+                progress=progress,
+                name=name,
+                sleep=sleep,
+            )
+            return
+
+        if target is self:
+            raise ValueError("cannot back up a database to itself")
+
+        # Reserve both connections in a deterministic global order so that
+        # concurrent backups in opposite directions cannot deadlock.
+        first, second = (self, target) if id(self) < id(target) else (target, self)
+
+        async with (
+            first._borrow() as borrowed_first,
+            second._borrow() as borrowed_second,
+        ):
+            if first is self:
+                source, dest = borrowed_first, borrowed_second
+            else:
+                source, dest = borrowed_second, borrowed_first
+
+            # The backup must run on the source connection's own worker
+            # thread to preserve sqlite3 thread affinity. The borrowed target
+            # is only touched from that thread while its own worker thread
+            # is paused.
+            await source.run(
+                source.raw.backup,
+                dest.raw,
+                pages=pages,
+                progress=progress,
+                name=name,
+                sleep=sleep,
+            )
 
 
 def connect(

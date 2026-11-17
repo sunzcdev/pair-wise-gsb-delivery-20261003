@@ -7,7 +7,7 @@ import sys
 from pathlib import Path
 from sqlite3 import OperationalError
 from tempfile import TemporaryDirectory
-from threading import Thread
+from threading import Event, Thread, get_ident
 from unittest import IsolatedAsyncioTestCase, SkipTest
 from unittest.mock import patch
 
@@ -510,6 +510,126 @@ class SmokeTest(IsolatedAsyncioTestCase):
                 cursor = db2.execute("select * from foo")
                 rows = cursor.fetchall()
                 self.assertEqual(rows, [(1, "hello"), (2, "world")])
+
+    async def test_backup_both_directions_no_deadlock(self):
+        with TemporaryDirectory() as td:
+            path_a = Path(td) / "a.db"
+            path_b = Path(td) / "b.db"
+            async with (
+                aiosqlite.connect(path_a) as db_a,
+                aiosqlite.connect(path_b) as db_b,
+            ):
+                await db_a.execute("create table t (v text)")
+                await db_a.execute("insert into t values ('from-a')")
+                await db_a.commit()
+                await db_b.execute("create table t (v text)")
+                await db_b.execute("insert into t values ('from-b')")
+                await db_b.commit()
+
+                progress_threads = []
+
+                def progress(status, remaining, total):
+                    progress_threads.append(get_ident())
+
+                # simultaneous backups in opposite directions must not deadlock
+                await asyncio.wait_for(
+                    asyncio.gather(
+                        db_a.backup(db_b, progress=progress),
+                        db_b.backup(db_a),
+                    ),
+                    timeout=30,
+                )
+
+                # whichever backup ran last wins; both databases must agree
+                rows_a = await db_a.execute_fetchall("select * from t")
+                rows_b = await db_b.execute_fetchall("select * from t")
+                self.assertEqual(rows_a, rows_b)
+                self.assertIn(rows_a, [[("from-a",)], [("from-b",)]])
+
+                # the backup ran on the source connection's own worker thread
+                self.assertTrue(progress_threads)
+                self.assertEqual(set(progress_threads), {db_a._thread.ident})
+
+                # both connections still execute on their own worker threads
+                await db_a.create_function("my_thread", 0, get_ident)
+                await db_b.create_function("my_thread", 0, get_ident)
+                [(thread_a,)] = await db_a.execute_fetchall("select my_thread()")
+                [(thread_b,)] = await db_b.execute_fetchall("select my_thread()")
+                self.assertEqual(thread_a, db_a._thread.ident)
+                self.assertEqual(thread_b, db_b._thread.ident)
+                self.assertNotEqual(thread_a, thread_b)
+
+    async def test_backup_to_self_rejected(self):
+        async with aiosqlite.connect(self.db) as db:
+            with self.assertRaisesRegex(ValueError, "itself"):
+                await db.backup(db)
+
+            # the connection is left untouched and usable
+            async with db.execute("select 1") as cursor:
+                self.assertEqual(await cursor.fetchall(), [(1,)])
+
+    async def test_backup_cancelled_while_waiting_releases_reservation(self):
+        async with (
+            aiosqlite.connect(":memory:") as db_a,
+            aiosqlite.connect(":memory:") as db_b,
+        ):
+            blocker = Event()
+
+            def block():
+                blocker.wait(timeout=30)
+
+            await db_a.create_function("block", 0, block)
+            await db_b.create_function("block", 0, block)
+
+            # occupy both worker threads so the backup must wait for reservations
+            task_a = asyncio.ensure_future(db_a.execute("select block()"))
+            task_b = asyncio.ensure_future(db_b.execute("select block()"))
+            await asyncio.sleep(0.1)
+
+            backup_task = asyncio.ensure_future(db_a.backup(db_b))
+            await asyncio.sleep(0.1)
+            backup_task.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await backup_task
+
+            blocker.set()
+            await asyncio.wait_for(asyncio.gather(task_a, task_b), timeout=30)
+
+            # the cancelled backup must not leave either worker thread stuck
+            # behind a dangling reservation
+            rows_a = await asyncio.wait_for(db_a.execute_fetchall("select 1"), 30)
+            rows_b = await asyncio.wait_for(db_b.execute_fetchall("select 1"), 30)
+            self.assertEqual(rows_a, [(1,)])
+            self.assertEqual(rows_b, [(1,)])
+
+    async def test_backup_failure_keeps_both_connections_usable(self):
+        async with (
+            aiosqlite.connect(":memory:") as db_a,
+            aiosqlite.connect(":memory:") as db_b,
+        ):
+            await db_a.execute("create table t (v integer)")
+            await db_a.execute("insert into t values (1)")
+            await db_a.commit()
+
+            def bad_progress(status, remaining, total):
+                raise RuntimeError("boom")
+
+            with self.assertRaisesRegex(RuntimeError, "boom"):
+                await db_a.backup(db_b, progress=bad_progress)
+
+            with self.assertRaisesRegex(OperationalError, "unknown database"):
+                await db_a.backup(db_b, name="nonexistent")
+
+            # the borrowed target was not closed, and both ends still query
+            await db_b.execute("create table u (v integer)")
+            await db_b.execute("insert into u values (2)")
+            await db_b.commit()
+            self.assertEqual(await db_a.execute_fetchall("select * from t"), [(1,)])
+            self.assertEqual(await db_b.execute_fetchall("select * from u"), [(2,)])
+
+            # and a subsequent backup between them still succeeds
+            await db_a.backup(db_b)
+            self.assertEqual(await db_b.execute_fetchall("select * from t"), [(1,)])
 
     async def test_emits_warning_when_left_open(self):
         db = await aiosqlite.connect(":memory:")
