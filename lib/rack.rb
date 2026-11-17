@@ -25,6 +25,7 @@ module Rack
   autoload :ContentLength, "rack/content_length"
   autoload :ContentType, "rack/content_type"
   autoload :Deflater, "rack/deflater"
+  autoload :Diagnostics, "rack/diagnostics"
   autoload :Directory, "rack/directory"
   autoload :ETag, "rack/etag"
   autoload :Events, "rack/events"

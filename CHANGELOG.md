@@ -10,6 +10,7 @@ All notable changes to this project will be documented in this file. For info on
 
 ### Added
 
+- Add opt-in `Rack::Diagnostics` layered contract diagnostics for `Rack::Builder`. Enable with the `diagnose: true` builder option or the `diagnose` DSL method to wrap every component in a boundary that validates the Rack contract on both sides. Violations raise `Rack::Diagnostics::ContractViolation` naming the responsible component and including a redacted summary of the previous boundary. The application is never re-invoked, streaming/enumerable bodies are not iterated eagerly, and header values and body contents are never written into a report.
 - Add `Rack::Files#assign_headers` to allow overriding how the configured file headers are set. ([#2377](https://github.com/rack/rack/pull/2377), [@codergeek121](https://github.com/codergeek121))
 - Add support for `rack.response_finished` to `Rack::TempfileReaper`. ([#2363](https://github.com/rack/rack/pull/2363), [@skipkayhil](https://github.com/skipkayhil))
 - Add support for streaming bodies when using `Rack::Events`. ([#2375](github.com/rack/rack/pull/2375), [@unflxw](https://github.com/unflxw))
