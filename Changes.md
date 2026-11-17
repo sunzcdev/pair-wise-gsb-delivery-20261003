@@ -1,5 +1,19 @@
 # connection_pool Changelog
 
+HEAD
+----
+
+- Add an explicit leasing API for cross-thread connection ownership.
+  `ConnectionPool#lease` returns a thread-independent `ConnectionPool::Lease`
+  handle that can be passed to another thread and settled through `#release` or
+  `#invalidate`. Leases are single-use and queryable (`#active?`, `#returned?`,
+  `#invalidated?`, `#transferred?`, `#released?`); duplicate settlement is a
+  no-op, late releases after `shutdown` are still cleaned up, and `#transfer`
+  hands ownership to a new handle while the stale handle can no longer settle
+  the checkout. Clean-up errors raised during invalidation are captured on
+  `#cleanup_exception` rather than swallowed. The existing `with`/`checkout`
+  reentrant behavior is unchanged.
+
 3.0.3
 ------
 

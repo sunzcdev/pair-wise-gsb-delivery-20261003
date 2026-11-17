@@ -129,6 +129,35 @@ class ConnectionPool
     end
   end
 
+  ##
+  # Checks out a connection and returns an explicit, thread-independent
+  # ConnectionPool::Lease handle for it.
+  #
+  # Use this when the connection must be handed to another thread (or any other
+  # owner) to do its work. Unlike +checkout+, ownership is not stored in the
+  # calling thread's local variables: the returned Lease alone is enough to
+  # release or invalidate the connection, and it records whether it has already
+  # been settled.
+  #
+  #   lease = pool.lease
+  #   Thread.new do
+  #     begin
+  #       do_work(lease.connection)
+  #     rescue IOError
+  #       lease.invalidate(&:close)
+  #       raise
+  #     else
+  #       lease.release
+  #     end
+  #   end
+  #
+  # The current thread's reentrant +checkout+/+with+ state is deliberately left
+  # untouched, so nested +with+ nesting counts continue to work independently.
+  def lease(timeout: @timeout, **kwargs)
+    conn = @available.pop(timeout:, **kwargs)
+    Lease.new(self, conn, kwargs)
+  end
+
   def checkin(force: false)
     if ::Thread.current[@key]
       if ::Thread.current[@key_count] == 1 || force
@@ -159,6 +188,30 @@ class ConnectionPool
 
     nil
   end
+
+  ##
+  # Returns a connection owned by a Lease. Called only from
+  # ConnectionPool::Lease#release; it never touches thread-local checkout
+  # state. Late releases after +shutdown+ are cleaned up by the TimedStack's
+  # shutdown block.
+  #
+  # :nodoc:
+  def return_leased_connection(conn, kwargs)
+    @available.push(conn, **kwargs)
+    nil
+  end
+
+  ##
+  # Removes a connection owned by a Lease from the pool's accounting. Called
+  # only from ConnectionPool::Lease#invalidate; it never touches thread-local
+  # checkout state.
+  #
+  # :nodoc:
+  def discard_leased_connection(_conn)
+    @available.decrement_created
+    nil
+  end
+  protected :return_leased_connection, :discard_leased_connection
 
   ##
   # Shuts down the ConnectionPool by passing each connection to +block+ and
@@ -194,5 +247,6 @@ class ConnectionPool
 end
 
 require_relative "connection_pool/timed_stack"
+require_relative "connection_pool/lease"
 require_relative "connection_pool/wrapper"
 require_relative "connection_pool/fork"

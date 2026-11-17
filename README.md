@@ -136,6 +136,69 @@ pool.with do |conn|
 end
 ```
 
+## Leasing Connections (Cross-Thread Ownership)
+
+`checkout` records ownership in the calling thread's local state, so it cannot
+express a connection whose work is finished by a *different* thread. `lease`
+returns an explicit, thread-independent **handle** (`ConnectionPool::Lease`)
+that travels with the work. The connection is returned or discarded using only
+that handle, without any thread pretending to own another thread's state.
+
+```ruby
+lease = pool.lease
+
+Thread.new do
+  begin
+    do_work(lease.connection)
+  rescue SomeConnectionError
+    lease.invalidate(&:close)   # remove the broken connection from the pool
+    raise
+  else
+    lease.release                # hand the connection back
+  end
+end
+```
+
+A lease is single-use and tracks its own lifecycle, which you can query:
+
+```ruby
+lease.active?       # still owns the connection
+lease.returned?     # released back to the pool
+lease.invalidated?  # removed from the pool
+lease.transferred?  # ownership was handed to another lease
+lease.released?     # settled in any of the ways above
+```
+
+Settlement is idempotent: releasing or invalidating an already-settled lease is
+a no-op that returns `false`, so a connection is never settled twice. A late
+release after `shutdown` is still cleaned up via the shutdown block rather than
+leaked.
+
+### Handing Over Ownership
+
+`transfer` hands the checked-out connection to a brand new lease. The old
+handle is immediately invalidated for settlement, so the previous owner cannot
+use its stale handle to release a later round of borrowing:
+
+```ruby
+new_lease = lease.transfer
+lease.release       # => false, the old handle can no longer settle the checkout
+new_lease.release   # => true, only the new handle owns the connection
+```
+
+### Clean-up Errors Are Reported Separately
+
+When `invalidate`'s clean-up block raises, the resource is still removed from
+the pool's accounting and the exception is captured on the lease instead of
+being swallowed or disguised as a pool failure:
+
+```ruby
+lease.invalidate { |conn| conn.close }
+lease.cleanup_exception # => the exception raised by #close, or nil
+```
+
+The traditional `with` API and its nested reentrant counting are unchanged.
+
 ## Current State
 
 There are several methods that return information about a pool.
