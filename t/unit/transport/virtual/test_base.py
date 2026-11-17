@@ -301,6 +301,24 @@ class test_Channel:
         assert not c.state.has_binding(ex, ex, ex)
         assert ex in c.purged
 
+    def test_exchange_delete_multiple_queues(self,
+                                             n='test_exchange_delete_multi'):
+        # queue_delete mutates the exchange's routing table, so
+        # exchange_delete must iterate over a snapshot otherwise some
+        # bindings/queues are skipped.
+        c = memory_client().channel()
+        c.exchange_declare(n, type='topic')
+        for index in range(4):
+            queue = f'{n}_q{index}'
+            c.queue_declare(queue)
+            c.queue_bind(queue, n, f'k{index}.#')
+
+        c.exchange_delete(n)
+
+        assert n not in c.state.exchanges
+        assert c.state.bindings == {}
+        assert dict(c.state.queue_index) == {}
+
     def test_queue_delete__if_empty(self, n='test_queue_delete__if_empty'):
         class PurgeChannel(virtual.Channel):
             purged = []
@@ -611,6 +629,49 @@ class test_Channel:
 
     def test_queue_delete_unknown_queue(self):
         assert self.channel.queue_delete('xiwjqjwel') is None
+
+    def test_queue_delete_removes_routing_table_entries(self,
+                                                        n='test_queue_delete_table'):
+        class PurgeChannel(virtual.Channel):
+            purged = []
+
+            def _purge(self, queue):
+                self.purged.append(queue)
+
+        c = PurgeChannel(self.channel.connection)
+        c.exchange_declare(n, type='topic')
+        c.queue_declare('q_a')
+        c.queue_declare('q_b')
+        c.queue_bind('q_a', n, 'stock.#')
+        c.queue_bind('q_b', n, 'news.*')
+
+        c.queue_delete('q_a')
+
+        # the deleted queue's binding is gone from both registries,
+        # while the surviving queue keeps its binding.
+        assert not c.state.has_binding('q_a', n, 'stock.#')
+        assert c.state.has_binding('q_b', n, 'news.*')
+        assert c.get_table(n) == [
+            c.typeof(n).prepare_bind('q_b', n, 'news.*', None),
+        ]
+
+    def test_queue_delete_then_publish_does_not_recreate_queue(
+            self, n='test_queue_delete_no_recreate'):
+        c = memory_client().channel()
+        c.exchange_declare(n, type='topic')
+        c.queue_declare('gone')
+        c.queue_bind('gone', n, 'stock.#')
+        c.queue_declare('kept')
+        c.queue_bind('kept', n, 'news.*')
+
+        c.queue_delete('gone')
+        message = c.prepare_message('payload')
+        c.basic_publish(message, n, 'stock.us.nasdaq')
+
+        # no phantom queue for the deleted destination, and the message
+        # is not redirected to an unrelated queue.
+        assert not c._has_queue('gone')
+        assert c.basic_get('kept') is None
 
     def test_queue_declare_passive(self):
         has_queue = self.channel._has_queue = Mock()

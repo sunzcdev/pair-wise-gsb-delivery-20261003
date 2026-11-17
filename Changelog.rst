@@ -5,6 +5,19 @@
 ================
 
 
+.. _version-5.7.1:
+
+5.7.1
+=====
+:release-date: TBA
+
+What's Changed
+~~~~~~~~~~~~~~
+- fix(virtual): match topic ``#`` against zero words like AMQP/RabbitMQ, using word-level routing-key comparison (``*`` matches exactly one non-empty word, ``#`` matches zero or more words).
+- fix(virtual): remove a deleted queue's bindings from the exchange routing table so later publishes do not silently recreate the queue or get misrouted to an unrelated queue.
+- fix(virtual): iterate over a snapshot of the routing table in ``exchange_delete`` to avoid skipping bindings while ``queue_delete`` mutates it.
+
+
 .. _version-5.7.0:
 
 5.7.0

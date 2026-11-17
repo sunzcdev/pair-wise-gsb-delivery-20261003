@@ -6,10 +6,6 @@ by the AMQ protocol  (excluding the `headers` exchange).
 
 from __future__ import annotations
 
-import re
-
-from kombu.utils.text import escape_regex
-
 
 class ExchangeType:
     """Base class for exchanges.
@@ -40,8 +36,10 @@ class ExchangeType:
 
         Returns
         -------
-            Tuple[str, Pattern, str]: of `(routing_key, regex, queue)`
-                to be stored for bindings to this exchange.
+            Tuple[str, object, str]: of `(routing_key, pattern, queue)`
+                to be stored for bindings to this exchange.  The pattern
+                is exchange specific: ``None`` for the direct exchange,
+                and a tuple of words for the topic exchange.
         """
         return routing_key, None, queue
 
@@ -79,23 +77,23 @@ class TopicExchange(ExchangeType):
     """Topic exchange.
 
     The `topic` exchange routes messages based on words separated by
-    dots, using wildcard characters ``*`` (any single word), and ``#``
-    (one or more words).
+    dots, using wildcard characters ``*`` (exactly one word), and ``#``
+    (zero or more words).
     """
 
     type = 'topic'
 
-    #: map of wildcard to regex conversions
-    wildcards = {'*': r'[^\.]+',
-                 '#': r'.*?'}
+    #: wildcard words and their meaning.
+    STAR = '*'   #: matches exactly one word.
+    HASH = '#'   #: matches zero or more words.
 
-    #: compiled regex cache
+    #: cache of binding key -> tuple of words used for matching.
     _compiled = {}
 
     def lookup(self, table, exchange, routing_key, default):
         return {
-            queue for rkey, pattern, queue in table
-            if self._match(pattern, routing_key)
+            queue for rkey, words, queue in table
+            if self._match(words, routing_key)
         }
 
     def deliver(self, message, exchange, routing_key, **kwargs):
@@ -110,23 +108,66 @@ class TopicExchange(ExchangeType):
         return routing_key, self.key_to_pattern(routing_key), queue
 
     def key_to_pattern(self, rkey):
-        """Get the corresponding regex for any routing key."""
-        return '^%s$' % (r'\.'.join(
-            self.wildcards.get(word, word)
-            for word in escape_regex(rkey, '.#*').split('.')
-        ))
+        """Get the matching pattern (tuple of words) for a routing key.
 
-    def _match(self, pattern, string):
-        """Match regular expression (cached).
-
-        Same as :func:`re.match`, except the regex is compiled and cached,
-        then reused on subsequent matches with the same pattern.
+        The binding key is split on dots into its words.  Literal words
+        keep their literal meaning while ``*`` and ``#`` stay available
+        as wildcard words for :meth:`_match`.  The resulting tuple is
+        cached and reused for subsequent bindings with the same key.
         """
         try:
-            compiled = self._compiled[pattern]
+            return self._compiled[rkey]
         except KeyError:
-            compiled = self._compiled[pattern] = re.compile(pattern, re.U)
-        return compiled.match(string)
+            pattern = tuple(rkey.split('.'))
+            self._compiled[rkey] = pattern
+            return pattern
+
+    def _match(self, pattern, string):
+        """Match a message routing key against a binding pattern.
+
+        Arguments:
+        ---------
+            pattern (Tuple[str, ...]): words of the binding routing key,
+                as produced by :meth:`key_to_pattern`.  ``*`` matches
+                exactly one word and ``#`` matches zero or more words.
+            string (str): the message routing key, a dot separated list
+                of words.
+
+        Returns:
+        -------
+            bool: :const:`True` when the routing key matches the binding.
+        """
+        words = string.split('.')
+        # ``pi``/``wi`` walk the pattern and routing key words.  When a
+        # ``#`` is seen, remember its position and let it match zero words
+        # first; backtrack by extending it one word whenever the rest of
+        # the pattern fails to line up.
+        pi = wi = 0
+        hash_pi = -1
+        hash_wi = -1
+        plen, wlen = len(pattern), len(words)
+        while wi < wlen:
+            if pi < plen and pattern[pi] == self.HASH:
+                hash_pi = pi
+                hash_wi = wi
+                pi += 1
+            elif pi < plen and pattern[pi] == words[wi]:
+                # a literal word (including an empty word) matches itself.
+                pi += 1
+                wi += 1
+            elif pi < plen and pattern[pi] == self.STAR and words[wi]:
+                # '*' matches exactly one, non-empty word.
+                pi += 1
+                wi += 1
+            elif hash_pi != -1:
+                # backtrack: the previous '#' consumes one more word.
+                pi = hash_pi + 1
+                hash_wi += 1
+                wi = hash_wi
+            else:
+                return False
+        # remaining pattern words may only be '#' (matching zero words).
+        return all(word == self.HASH for word in pattern[pi:])
 
 
 class FanoutExchange(ExchangeType):

@@ -530,7 +530,9 @@ class Channel(AbstractChannel, base.StdChannel):
 
     def exchange_delete(self, exchange, if_unused=False, nowait=False):
         """Delete `exchange` and all its bindings."""
-        for rkey, _, queue in self.get_table(exchange):
+        # Iterate over a snapshot: queue_delete mutates the exchange's
+        # routing table while we are walking it.
+        for rkey, _, queue in list(self.get_table(exchange)):
             self.queue_delete(queue, if_unused=True, if_empty=True)
         self.state.exchanges.pop(exchange, None)
 
@@ -556,6 +558,15 @@ class Channel(AbstractChannel, base.StdChannel):
                 queue, exchange, routing_key, args,
             )
             self._delete(queue, exchange, *meta, **kwargs)
+            # Remove the binding from the exchange's routing table as
+            # well, otherwise a later publish that matches the stale
+            # binding would silently recreate the deleted queue instead
+            # of being reported as undeliverable.
+            try:
+                table = self.get_table(exchange)
+            except KeyError:
+                continue
+            table[:] = [entry for entry in table if entry != meta]
         self.state.queue_bindings_delete(queue)
 
     def after_reply_message_received(self, queue):

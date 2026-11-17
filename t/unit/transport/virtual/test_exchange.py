@@ -77,7 +77,7 @@ class test_Topic(ExchangeCase):
 
     def test_prepare_bind(self):
         x = self.e.prepare_bind('qFoo', 'eFoo', 'stock.#', {})
-        assert x == ('stock.#', r'^stock\..*?$', 'qFoo')
+        assert x == ('stock.#', ('stock', '#'), 'qFoo')
 
     @pytest.mark.parametrize('exchange,routing_key,default,expected', [
         ('eFoo', 'stock.us.nasdaq', None, {'rFoo', 'rBar'}),
@@ -86,6 +86,8 @@ class test_Topic(ExchangeCase):
         ('eFoo', 'candy.schleckpulver.snap_crackle', None, set()),
         # '*' is a single word: only 'stock.#' may match a longer key.
         ('eFoo', 'stock.us.nasdaq.tech', None, {'rFoo'}),
+        # '#' matches zero words as well (AMQP/RabbitMQ topic semantics).
+        ('eFoo', 'stock', None, {'rFoo'}),
     ])
     def test_lookup(self, exchange, routing_key, default, expected):
         assert self.e.lookup(
@@ -132,6 +134,90 @@ class test_TopicMultibind(ExchangeCase):
         assert self.e._compiled
         assert self.e.lookup(
             self.table, exchange, routing_key, default) == expected
+
+
+class test_TopicMatching(ExchangeCase):
+    # The topic exchange must follow AMQP/RabbitMQ topic semantics:
+    # '*' matches exactly one (non-empty) word, '#' matches zero or more
+    # words, and words are separated by dots.
+    type = exchange.TopicExchange
+
+    @pytest.mark.parametrize('binding,routing_key,matches', [
+        # exact words
+        ('stock.us.nasdaq', 'stock.us.nasdaq', True),
+        ('stock.us.nasdaq', 'stock.us.nyse', False),
+        # '*' matches exactly one word
+        ('stock.*.nasdaq', 'stock.us.nasdaq', True),
+        ('stock.*', 'stock.us', True),
+        ('stock.*', 'stock', False),
+        ('stock.*', 'stock.us.nasdaq', False),
+        ('*', 'stock', True),
+        ('*', 'stock.us', False),
+        ('*', '', False),
+        # '#' matches zero or more words, including a leading/trailing '#'
+        ('stock.#', 'stock', True),
+        ('stock.#', 'stock.us', True),
+        ('stock.#', 'stock.us.nasdaq.tech', True),
+        ('stock.#', 'bond', False),
+        ('#.nasdaq', 'nasdaq', True),
+        ('#.nasdaq', 'stock.us.nasdaq', True),
+        ('#.nasdaq', 'nasdaq.stock', False),
+        ('#', '', True),
+        ('#', 'stock.us.nasdaq', True),
+        # '#' in the middle, including the zero-words case and backtracking
+        ('stock.#.nasdaq', 'stock.nasdaq', True),
+        ('stock.#.nasdaq', 'stock.us.nasdaq', True),
+        ('stock.#.nasdaq', 'stock.eu.de.nasdaq', True),
+        ('stock.#.nasdaq', 'stock.us.nyse', False),
+        ('#.a.#', 'a', True),
+        ('#.a.#', 'x.a', True),
+        ('#.a.#', 'a.y', True),
+        ('#.a.#', 'x.a.y', True),
+        ('#.a.#', 'x.y', False),
+        ('#.#', '', True),
+        ('#.#', 'stock', True),
+        ('#.#', 'stock.us', True),
+        # empty segments: a literal empty word only matches an empty word
+        ('', '', True),
+        ('', 'stock', False),
+        ('a..b', 'a..b', True),
+        ('a..b', 'a.x.b', False),
+        ('.', '.', True),
+        ('.', '', False),
+        ('a.', 'a.', True),
+        ('.b', '.b', True),
+        # wildcard '*' never matches an empty word, '#' does
+        ('a.*', 'a.', False),
+        ('a.#', 'a.', True),
+        ('a.#.b', 'a..b', True),
+        # regular regex metacharacters are treated as literal characters
+        ('a+b', 'a+b', True),
+        ('a+b', 'aab', False),
+        ('a(b)', 'a(b)', True),
+        ('a(b)', 'ab', False),
+    ])
+    def test_match(self, binding, routing_key, matches):
+        pattern = self.e.key_to_pattern(binding)
+        assert self.e._match(pattern, routing_key) is matches
+
+    def test_lookup_deduplicates_overlapping_bindings(self):
+        # Several bindings of the same queue matching the same key must
+        # produce the queue only once.
+        table = [
+            (rkey, self.e.key_to_pattern(rkey), 'q')
+            for rkey in ('#', 'stock.#', 'stock.us.*', 'stock.us.#')
+        ]
+        table += [
+            ('other.*', self.e.key_to_pattern('other.*'), 'q2'),
+        ]
+        assert self.e.lookup(
+            table, 'e', 'stock.us.nasdaq', None) == {'q'}
+
+    def test_key_to_pattern_is_cached(self):
+        first = self.e.key_to_pattern('stock.#')
+        second = self.e.key_to_pattern('stock.#')
+        assert first is second
+        assert first == ('stock', '#')
 
 
 class test_ExchangeType(ExchangeCase):
