@@ -132,7 +132,12 @@ how encoding names are returned:
   Windows-1252, ISO-8859-1 → Windows-1252).  The remap is skipped when
   the superset cannot decode the examined bytes, or when
   ``include_encodings``/``exclude_encodings`` or ``encoding_era`` rule the
-  superset out; the detected name is kept in those cases.
+  superset out; the detected name is kept in those cases.  The replacement
+  target is a candidate in its own right: with
+  ``include_encodings=["iso-8859-1"]`` the target ``cp1252`` is not in the
+  set, so no remap happens, even though the reported name might have been
+  ``ISO-8859-1`` of the same identity.  Name the target's identity
+  (``"cp1252"``, ``"windows-1252"``, or ``"Windows-1252"``) to allow it.
 
 .. code-block:: python
 
@@ -410,6 +415,34 @@ Encoding names are resolved through Python's codec system, so aliases work
 (e.g., ``"latin-1"`` for ``"iso8859-1"``).  An empty iterable raises
 :class:`ValueError` — pass ``None`` (the default) to disable filtering.
 
+Both filters are read once, so a one-shot iterator (a generator, ``map``,
+``dict_keys``) is a valid value; a list is not required.
+
+Every spelling of one encoding is the same encoding to the filters.  An
+alias, a canonical name, a Python codec name, and the display name chardet
+reports all fold onto one identity, so ``include_encodings`` and
+``exclude_encodings`` are compared on that identity:
+
+.. code-block:: python
+
+   # These two spellings name the same encoding, so this excludes it:
+   chardet.detect(data, include_encodings=["windows-1252"],
+                  exclude_encodings=["cp1252"])
+
+   # These do too: shift_jis_2004 is reported as SHIFT_JIS, and the
+   # codec name shift_jis resolves to the same entry.
+   chardet.detect(data, exclude_encodings=["SHIFT_JIS"])
+   chardet.detect(data, exclude_encodings=["shift_jis"])
+
+   # A registry label can name another entry's codec.  ms_kanji is listed
+   # under shift_jis_2004 but Python reads it as the cp932 codec, so
+   # excluding it excludes cp932.
+   chardet.detect(data, exclude_encodings=["ms_kanji"])
+
+Once a name is excluded, no spelling of it comes back: the candidate is
+removed from the set the pipeline scores, so it cannot be reported under an
+alias or a display name later.
+
 When filtering removes all candidates, chardet returns the
 ``no_match_encoding`` (default ``"cp1252"``) with confidence 0.10.  That
 answer is the caller's sentinel for "nothing fit", so it is the one
@@ -420,8 +453,11 @@ and decoding it strictly will raise.  Treat a 0.10 result under a filter
 as a miss rather than a detection.  The name is canonicalized and
 display-renamed like any other result, so ``no_match_encoding="latin-1"``
 reports ``ISO-8859-1``.  If even that encoding is excluded by the
-filters, chardet returns ``encoding=None`` with a warning.  Similarly,
-``empty_input_encoding``
+filters, chardet returns ``encoding=None`` with a warning — a fallback the
+filters rule out is never filled back in.  That check uses the same
+identity as the candidate filters, so ``no_match_encoding="cp1252"`` with
+``exclude_encodings=["Windows-1252"]`` also yields ``encoding=None``.
+Similarly, ``empty_input_encoding``
 (default ``"utf-8"``) controls the result for empty input:
 
 .. code-block:: python

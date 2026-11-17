@@ -144,11 +144,17 @@ The encoding name the caller sees after **rendering**. `output_names.decodes_und
 **Canonical name**:
 The internal codec name a stage produces (e.g. `windows-1252`, `cp932`). Lowercase, codec-registry-matched.
 
+**Encoding identity**:
+The one encoding behind every name that denotes it: a **canonical name**, a registry alias, a Python codec name (`euc_jp`), and the **display name** (`EUC-JP`) all resolve to one canonical name. Owned by `registry._option_encoding`, which resolves through the real codec before the alias table, because the two disagree where a label names another entry's codec (`ms_kanji` is listed under `shift_jis_2004` but Python reads it as `cp932`; `ksc5601` is listed under `cp949` but reads as `euc_kr`). `normalize_encodings` folds the caller's spellings onto identities, so the **encoding filter** compares like with like.
+
+**Encoding filter** (`registry.EncodingFilter`, `registry.allows_encoding`):
+One call's `encoding_era`, `include_encodings`, and `exclude_encodings`, in canonical form, with the one predicate for "may this encoding be named?". The pipeline's candidate set, the **preferred-superset remapping** target, and the `no_match_encoding`/`empty_input_encoding` fallbacks all ask it, so a name a filter excludes cannot return through any of them. The replacement target is checked as a *candidate* (its canonical identity), not as the string a **display name** would spell: `include_encodings=["iso8859-1"]` names no superset, so no remap happens.
+
 **Display name**:
 The string returned to library callers after `apply_compat_names` runs (e.g. `Windows-1252`, `CP932`). Driven by `compat_names=True` (the default), which maps internal canonical names to chardet's historical display casing.
 
 **Preferred-superset remapping** (`prefer_superset=True`):
-The output transform in `output_names.apply_preferred_superset` that remaps a detected subset codec to its Windows superset before returning. Off by default; opt-in. The pairs it applies are `output_names.PREFERRED_SUPERSET`, a frozen *selection* of the **encoding superset relationship**, not the relation itself: the table is public through `UniversalDetector.LEGACY_MAP`, so adding a pair changes the option's output (ADR-0007).
+The output transform in `output_names.apply_preferred_superset` that remaps a detected subset codec to its Windows superset before returning. Off by default; opt-in. The pairs it applies are `output_names.PREFERRED_SUPERSET`, a frozen *selection* of the **encoding superset relationship**, not the relation itself: the table is public through `UniversalDetector.LEGACY_MAP`, so adding a pair changes the option's output (ADR-0007). The replacement target is held to the caller's **encoding filter**, so a superset the filters exclude is not substituted.
 
 ### Accuracy evaluation
 
@@ -191,6 +197,7 @@ The mechanism in `scripts/verify_no_overlap.py` that excludes any training-data 
 - A **Confusion group** is 2+ encodings; **Distinguishing byte maps** are keyed by ordered pairs within the group.
 - **Markup superset promotion**, **Dead-heat superset promotion**, **Preferred-superset remapping**, and **Superset acceptance** all rely on the same **Encoding superset relationship** but apply it at different times — detection / ranking / output / evaluation respectively. The first two derive their tables from the registry field; the third is a frozen public selection; the fourth is test-only (ADR-0002).
 - Every public entry point is an adapter over one **Detection request**; **rendering** is the only place output names are applied.
+- An **encoding identity** is what the **encoding filter** compares; every alias, codec name, and **display name** of one **canonical name** is that identity, so a filtered encoding cannot return under another spelling.
 
 ## Example dialogue
 

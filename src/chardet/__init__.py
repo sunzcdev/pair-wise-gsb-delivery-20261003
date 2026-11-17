@@ -92,13 +92,19 @@ def detect(  # noqa: PLR0913
     :param include_encodings: If given, restrict detection to only these
         encodings (names or aliases).
     :param exclude_encodings: If given, remove these encodings from the
-        candidate set.
+        candidate set.  Every spelling of one encoding -- an alias, a
+        canonical name, a Python codec name, or the display name chardet
+        reports -- is that encoding, so excluding one spelling excludes the
+        encoding itself and it cannot come back under another.
     :param no_match_encoding: Encoding to return when no candidate survives
         the pipeline.  Defaults to ``"cp1252"``.  It is returned as given,
         at confidence 0.10, and is the one answer that is not checked
         against the data: it is the caller's sentinel for "nothing fit".
+        A fallback the filters exclude is not returned; the result is
+        ``encoding=None`` with a warning instead.
     :param empty_input_encoding: Encoding to return for empty input.  Defaults
-        to ``"utf-8"``.
+        to ``"utf-8"``.  Like *no_match_encoding*, a value the filters
+        exclude yields ``encoding=None`` with a warning.
     :returns: A dictionary with keys ``"encoding"``, ``"confidence"``,
         ``"language"``, and ``"mime_type"``.
     """
@@ -160,11 +166,15 @@ def detect_all(  # noqa: PLR0913
     :param include_encodings: If given, restrict detection to only these
         encodings (names or aliases).
     :param exclude_encodings: If given, remove these encodings from the
-        candidate set.
+        candidate set.  Every spelling of one encoding is that encoding, so
+        excluding one spelling excludes the encoding and it cannot return
+        under another.  See :func:`detect`.
     :param no_match_encoding: Encoding to return when no candidate survives
-        the pipeline.  Defaults to ``"cp1252"``.
+        the pipeline.  Defaults to ``"cp1252"``.  A fallback the filters
+        exclude yields ``encoding=None`` with a warning instead.
     :param empty_input_encoding: Encoding to return for empty input.  Defaults
-        to ``"utf-8"``.
+        to ``"utf-8"``.  A value the filters exclude yields ``encoding=None``
+        with a warning.
     :returns: A list of dictionaries, sorted by descending confidence, one
         per encoding name.
     """

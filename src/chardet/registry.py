@@ -195,6 +195,86 @@ def get_candidates(
     return tuple(candidates)
 
 
+def allows_encoding(
+    encoding: str | None,
+    *,
+    encoding_era: EncodingEra = EncodingEra.ALL,
+    include_encodings: frozenset[str] | None = None,
+    exclude_encodings: frozenset[str] | None = None,
+) -> bool:
+    """Return whether the caller's filters permit *encoding* to be named.
+
+    The one predicate behind every filter check: which candidates the
+    pipeline may score (:func:`get_candidates`), whether the ``prefer_superset``
+    replacement target may be used, and whether a fallback may be returned
+    when nothing else survives.  A name is permitted when it is a registry
+    entry inside *encoding_era*, is not in *exclude_encodings*, and -- when
+    *include_encodings* is given -- is in it.  Exclusion wins over inclusion,
+    so an encoding named in both is allowed by neither.
+
+    All the name arguments are canonical registry names, the form
+    :func:`normalize_encodings` returns, so every spelling of one encoding
+    reaches the same answer here.
+
+    ``None`` is permitted: a binary result names no encoding, and the
+    filters have never had anything to say about it.
+
+    :param encoding: The canonical name to check, or ``None``.
+    :param encoding_era: The eras the name may belong to.
+    :param include_encodings: The only names allowed, or ``None`` for any.
+    :param exclude_encodings: Names forbidden, or ``None`` for none.
+    :returns: ``True`` if *encoding* may be reported.
+    """
+    if encoding is None:
+        return True
+    if exclude_encodings is not None and encoding in exclude_encodings:
+        return False
+    if include_encodings is not None and encoding not in include_encodings:
+        return False
+    info = REGISTRY.get(encoding)
+    return info is not None and bool(info.era & encoding_era)
+
+
+@dataclasses.dataclass(frozen=True, slots=True)
+class EncodingFilter:
+    """One call's candidate filters, as a reusable rule.
+
+    ``detect``, ``detect_all``, ``UniversalDetector`` and the output-name
+    transforms all have to answer "may this encoding be named?" with the
+    options the caller passed.  This type carries those options in their
+    canonical form and answers through :func:`allows_encoding`, so the
+    pipeline's candidate set and the output remaps cannot drift apart.
+
+    The fields hold canonical registry names only; the alias, codec, and
+    display spellings a caller may have used were folded onto them by
+    :func:`normalize_encodings` when the options were resolved.
+    """
+
+    encoding_era: EncodingEra = EncodingEra.ALL
+    include_encodings: frozenset[str] | None = None
+    exclude_encodings: frozenset[str] | None = None
+
+    def candidates(self) -> tuple[EncodingInfo, ...]:
+        """Return the registry entries the pipeline may score."""
+        return get_candidates(
+            self.encoding_era, self.include_encodings, self.exclude_encodings
+        )
+
+    @property
+    def allowed(self) -> frozenset[str]:
+        """Return the canonical names of :meth:`candidates`, as a set."""
+        return frozenset(enc.name for enc in self.candidates())
+
+    def allows(self, encoding: str | None) -> bool:
+        """Return whether *encoding* may be reported under these filters."""
+        return allows_encoding(
+            encoding,
+            encoding_era=self.encoding_era,
+            include_encodings=self.include_encodings,
+            exclude_encodings=self.exclude_encodings,
+        )
+
+
 # Era assignments match chardet 6.0.0's chardet/metadata/charsets.py
 
 _REGISTRY_ENTRIES = (
@@ -1018,6 +1098,7 @@ REGISTRY: MappingProxyType[str, EncodingInfo] = MappingProxyType(
     {e.name: e for e in _REGISTRY_ENTRIES}
 )
 
+
 #: The Windows superset of each multi-byte CJK encoding that has one
 #: (``shift_jis_2004`` -> ``cp932``, ``euc_kr`` -> ``cp949``).  The one
 #: selection the markup promotion and the dead-heat promotion share; the
@@ -1086,15 +1167,109 @@ def lookup_encoding(name: str) -> EncodingName | None:
     return None
 
 
-def _validate_encoding(name: str, param_name: str) -> str:
+def _codec_identity(name: str) -> str | None:
+    """Return the Python codec *name* resolves to, if it is a known one.
+
+    Only names the standard library can answer are handed to
+    ``codecs.lookup``, for the reason given at :data:`_STDLIB_CODEC_NAMES`.
+
+    :param name: Any encoding name string.
+    :returns: The codec's name (``"euc_jp"`` for ``"EUC-JP"``), or ``None``.
+    """
+    normalized = encodings.normalize_encoding(name.lower())
+    if (
+        normalized not in _STDLIB_CODEC_NAMES
+        and normalized.replace(".", "_") not in _STDLIB_CODEC_NAMES
+    ):
+        return None
+    try:
+        return codecs.lookup(name).name
+    except (LookupError, ValueError):
+        return None
+
+
+#: Every registry canonical name, lowercased, for the fast path that answers
+#: the common case without touching the codec registry (see
+#: :func:`_option_encoding`).
+_CANONICAL_NAMES: frozenset[str] = frozenset(entry.name for entry in _REGISTRY_ENTRIES)
+
+
+@functools.cache
+def _codec_identities() -> MappingProxyType[str, str]:
+    """Return the codec-name -> canonical-name table the option filters use.
+
+    Built on first use rather than at import: most calls never name an
+    encoding in a form that needs it, and the build asks ``codecs.lookup``
+    about every spelling in the registry.  The table maps every codec a
+    registry spelling names onto that spelling's entry.  An alias may name
+    another entry's codec: ``ms_kanji`` is listed under ``shift_jis_2004``
+    but Python resolves it to the ``cp932`` codec, and ``ksc5601`` is
+    listed under ``cp949`` but resolves to ``euc_kr``.  An entry's own name
+    settles a disputed codec, so the entries named after a codec keep it; a
+    codec no entry is named after goes to the entry that lists it, and one
+    claimed by several entries stays unmapped rather than guessing.
+    """
+    claims: dict[str, set[str]] = {}
+    for entry in _REGISTRY_ENTRIES:
+        for spelling in (entry.name, *entry.aliases):
+            codec = _codec_identity(spelling)
+            if codec is not None:
+                claims.setdefault(codec, set()).add(entry.name)
+    identities = {
+        codec: entry.name
+        for entry in _REGISTRY_ENTRIES
+        if (codec := _codec_identity(entry.name)) is not None
+    }
+    for codec, owners in claims.items():
+        if codec not in identities and len(owners) == 1:
+            identities[codec] = next(iter(owners))
+    return MappingProxyType(identities)
+
+
+def _option_encoding(name: object) -> str | None:
+    """Resolve an option's encoding name to the entry it stands for.
+
+    A canonical name is answered as itself, which is the case every default
+    fallback hits.  Everything else resolves through the *codec* the name
+    denotes before the alias table is consulted, because the alias table
+    answers a slightly different question: which entry may be *reported*
+    under that label.  The two disagree for exactly the labels whose codec
+    belongs to another entry (``exclude_encodings=["ms_kanji"]`` means the
+    ``cp932`` codec, which the alias table routes to ``shift_jis_2004``) and
+    for bare codec spellings no label lists (``euc_jp``, ``iso2022_jp`` --
+    the very names the display step reports as ``EUC-JP`` and
+    ``ISO-2022-JP``).  Keying the filters on the codec makes every spelling
+    of one encoding -- alias, canonical, Python codec name, or display name
+    -- one identity, so an include/exclude conflict is checked on that
+    identity and an excluded encoding cannot return under another spelling.
+
+    :param name: A name as the caller passed it.
+    :returns: The canonical registry name, or ``None`` if unknown.
+    """
+    if not isinstance(name, str):
+        # A non-string would otherwise fail deep inside ``codecs.lookup``
+        # with an AttributeError naming neither the value nor the option.
+        return None
+    lowered = name.lower()
+    if lowered in _CANONICAL_NAMES:
+        return lowered
+    codec = _codec_identity(name)
+    if codec is not None:
+        identity = _codec_identities().get(codec)
+        if identity is not None:
+            return identity
+    return lookup_encoding(name)
+
+
+def _validate_encoding(name: object, param_name: str) -> str:
     """Validate and normalize a single encoding name.
 
     :param name: The encoding name to validate.
     :param param_name: Parameter name for error messages.
     :returns: The canonical encoding name.
-    :raises ValueError: If the encoding name is unknown.
+    :raises ValueError: If the encoding name is unknown or not a string.
     """
-    canonical = lookup_encoding(name)
+    canonical = _option_encoding(name)
     if canonical is None:
         msg = f"Unknown encoding {name!r} in {param_name}"
         raise ValueError(msg)
@@ -1106,6 +1281,10 @@ def normalize_encodings(
     param_name: str,
 ) -> frozenset[str] | None:
     """Normalize an iterable of encoding names to canonical forms.
+
+    Every spelling of one encoding -- canonical name, registry alias, Python
+    codec name, or chardet display name -- normalizes to the same canonical
+    name, so the returned set is the set of *identities* the caller named.
 
     :param encodings: Encoding names to normalize, or ``None``.
     :param param_name: Parameter name for error messages.

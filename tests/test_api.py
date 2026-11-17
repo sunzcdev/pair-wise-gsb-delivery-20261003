@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import warnings
+from collections.abc import Iterator
 
 import pytest
 
@@ -859,6 +860,298 @@ def test_detect_include_exclude_overlap():
         assert result["confidence"] == 0.0
         user_warnings = [x for x in w if issubclass(x.category, UserWarning)]
         assert len(user_warnings) >= 1
+
+
+# --- filter conflicts are checked on one canonical identity ---
+
+_SHIFT_JIS_TEXT = "日本語のテキストです。文字コードを判定します。 " * 8
+_KOREAN_TEXT = "한국어 텍스트입니다. 인코딩을 감지합니다. 이것은 테스트입니다. " * 8
+
+
+def _identity(encoding: str | None) -> frozenset[str] | None:
+    """Return the canonical identity of a reported name, as the filters see it."""
+    return normalize_encodings([encoding], "detect") if encoding else None
+
+
+@pytest.mark.parametrize(
+    ("data", "exclude", "leaked_identity"),
+    [
+        # The label and the codec it names are one identity: excluding either
+        # must keep the encoding out, however the result spells it.
+        (_SHIFT_JIS_TEXT.encode("shift_jis"), ["ms_kanji"], "cp932"),
+        (_SHIFT_JIS_TEXT.encode("shift_jis"), ["CP932"], "cp932"),
+        (_KOREAN_TEXT.encode("euc_kr"), ["ksc5601"], "euc_kr"),
+        (_KOREAN_TEXT.encode("euc_kr"), ["EUC-KR"], "euc_kr"),
+        (_SHIFT_JIS_TEXT.encode("euc_jp"), ["euc_jp"], "euc_jis_2004"),
+        (_SHIFT_JIS_TEXT.encode("euc_jp"), ["EUC-JP"], "euc_jis_2004"),
+    ],
+    ids=[
+        "shift_jis-label-for-cp932",
+        "cp932-display-name",
+        "ksc5601-label-for-euc_kr",
+        "euc-kr-display-name",
+        "euc_jp-codec-name",
+        "euc-jp-display-name",
+    ],
+)
+@pytest.mark.parametrize("api", ["detect", "detect_all", "stream"])
+def test_excluded_encoding_cannot_return_under_another_spelling(
+    api: str, data: bytes, exclude: list[str], leaked_identity: str
+):
+    """An exclusion holds for every spelling of the encoding it names.
+
+    ``ms_kanji`` is a registry alias whose Python codec is ``cp932``;
+    ``euc_jp`` and ``EUC-JP`` are the codec name and the display name of
+    ``euc_jis_2004``.  Filtering on any one of them must filter the identity,
+    or the excluded encoding simply comes back under another name.
+    """
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", UserWarning)
+        if api == "stream":
+            detector = UniversalDetector(exclude_encodings=exclude)
+            detector.feed(data)
+            results = [detector.close()]
+        elif api == "detect_all":
+            results = chardet.detect_all(data, exclude_encodings=exclude)
+        else:
+            results = [chardet.detect(data, exclude_encodings=exclude)]
+    for result in results:
+        assert _identity(result["encoding"]) != frozenset({leaked_identity}), result
+
+
+@pytest.mark.parametrize("api", ["detect", "detect_all", "stream"])
+@pytest.mark.parametrize(
+    ("include", "exclude"),
+    [
+        (["Windows-1252"], ["cp1252"]),
+        (["cp1252"], ["windows-1252"]),
+        (["latin-1"], ["ISO-8859-1"]),
+        (["shift_jis"], ["ms_kanji"]),
+    ],
+    ids=["display-vs-canonical", "canonical-vs-display", "alias-vs-alias", "codec-vs-alias"],
+)
+def test_include_exclude_conflict_uses_the_canonical_identity(
+    api: str, include: list[str], exclude: list[str]
+):
+    """Including one spelling and excluding another is still a conflict.
+
+    The two spellings name the same encoding, so the conflict must be seen
+    on that identity: the candidate set is empty and the result is
+    ``encoding=None``, not the encoding under whichever spelling won.
+    """
+    data = "Héllo wörld café résumé naïve".encode()
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", UserWarning)
+        if api == "stream":
+            detector = UniversalDetector(
+                include_encodings=include, exclude_encodings=exclude
+            )
+            detector.feed(data)
+            results = [detector.close()]
+        elif api == "detect_all":
+            results = chardet.detect_all(
+                data, include_encodings=include, exclude_encodings=exclude
+            )
+        else:
+            results = [
+                chardet.detect(
+                    data, include_encodings=include, exclude_encodings=exclude
+                )
+            ]
+    assert results
+    assert all(result["encoding"] is None for result in results), results
+
+
+# --- an excluded fallback is never filled back in ---
+
+
+@pytest.mark.parametrize("api", ["detect", "detect_all", "stream"])
+@pytest.mark.parametrize(
+    ("data", "option", "fallback", "filters"),
+    [
+        # No candidate survives, the fallback is excluded under a display
+        # name: no_match must not hand back the excluded encoding.
+        (
+            b"\x80\x81\x82\x83\x84\x85",
+            "no_match_encoding",
+            "cp1252",
+            {"include_encodings": ["ascii"], "exclude_encodings": ["Windows-1252"]},
+        ),
+        # ... nor under a registry label whose codec it is known by.
+        (
+            b"\x80\x81\x82\x83\x84\x85",
+            "no_match_encoding",
+            "cp932",
+            {"include_encodings": ["ascii"], "exclude_encodings": ["ms_kanji"]},
+        ),
+        # Empty input, fallback excluded under an alias.
+        (
+            b"",
+            "empty_input_encoding",
+            "iso8859-1",
+            {"exclude_encodings": ["latin-1"]},
+        ),
+        (
+            b"",
+            "empty_input_encoding",
+            "utf-8",
+            {"exclude_encodings": ["utf8"]},
+        ),
+    ],
+    ids=["no-match-display", "no-match-codec-alias", "empty-alias", "empty-codec-alias"],
+)
+def test_excluded_fallback_is_not_filled_back_in(
+    api: str,
+    data: bytes,
+    option: str,
+    fallback: str,
+    filters: dict[str, list[str]],
+):
+    """A fallback the filters exclude yields ``encoding=None``, not the fallback.
+
+    The fallback is a candidate like any other.  Returning it because "no
+    candidate survived" would re-admit exactly the encoding the caller
+    excluded, so the result is ``encoding=None`` at confidence 0.0 with a
+    warning instead -- through all three entry points alike.
+    """
+    kwargs: dict[str, object] = {**filters, option: fallback}
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        if api == "stream":
+            detector = UniversalDetector(**kwargs)
+            detector.feed(data)
+            results = [detector.close()]
+        elif api == "detect_all":
+            results = chardet.detect_all(data, **kwargs)
+        else:
+            results = [chardet.detect(data, **kwargs)]
+    assert results
+    for result in results:
+        assert result["encoding"] is None, result
+        assert result["confidence"] == 0.0
+    assert any(issubclass(w.category, UserWarning) for w in caught)
+
+
+@pytest.mark.parametrize("api", ["detect", "detect_all", "stream"])
+@pytest.mark.parametrize(
+    ("include", "exclude", "fallback"),
+    [
+        # The baseline routes ms_kanji to shift_jis_2004 and would return it;
+        # the codec name is cp932, which the caller excluded.
+        (["shift_jis_2004", "ascii"], ["cp932"], "ms_kanji"),
+        # The baseline routes ksc5601 to cp949 and would return it; the codec
+        # name is euc_kr, which the caller excluded.
+        (["cp949", "ascii"], ["euc_kr"], "ksc5601"),
+    ],
+    ids=["ms_kanji-is-cp932", "ksc5601-is-euc_kr"],
+)
+def test_fallback_name_resolves_through_the_codec_identity(
+    api: str, include: list[str], exclude: list[str], fallback: str
+):
+    """A fallback whose codec the filters exclude yields ``encoding=None``.
+
+    A registry label can name a codec that belongs to another entry.
+    Normalizing the label through the alias table alone would let the
+    fallback through as that other entry; the codec identity is what the
+    caller excluded, so the fallback is excluded too.
+    """
+    data = b"\x80\x81\x82\x83\x84\x85"
+    kwargs: dict[str, object] = {
+        "include_encodings": include,
+        "exclude_encodings": exclude,
+        "no_match_encoding": fallback,
+    }
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", UserWarning)
+        if api == "stream":
+            detector = UniversalDetector(**kwargs)
+            detector.feed(data)
+            results = [detector.close()]
+        elif api == "detect_all":
+            results = chardet.detect_all(data, **kwargs)
+        else:
+            results = [chardet.detect(data, **kwargs)]
+    assert results
+    assert all(result["encoding"] is None for result in results), results
+
+
+# --- iterator configuration is read exactly once ---
+
+
+class _CountingIterable:
+    """An iterable that records how many times ``iter()`` is called on it."""
+
+    def __init__(self, items: list[str]) -> None:
+        self._items = items
+        self.reads = 0
+
+    def __iter__(self) -> Iterator[str]:
+        self.reads += 1
+        return iter(self._items)
+
+
+@pytest.mark.parametrize("api", ["detect", "detect_all", "stream"])
+@pytest.mark.parametrize("option", ["include_encodings", "exclude_encodings"])
+def test_encoding_iterators_are_read_once(api: str, option: str):
+    """Each filter iterable is consumed once, whatever the entry point.
+
+    A one-shot iterator read twice would come back empty the second time and
+    raise "must not be empty" on a value that was not.
+    """
+    data = "Héllo wörld café résumé naïve".encode()
+    items = ["cp1252"] if option == "include_encodings" else ["utf-8"]
+    source = _CountingIterable(items)
+    kwargs = {option: source}
+    if api == "stream":
+        detector = UniversalDetector(**kwargs)
+        detector.feed(data)
+        detector.close()
+    elif api == "detect_all":
+        chardet.detect_all(data, **kwargs)
+    else:
+        chardet.detect(data, **kwargs)
+    assert source.reads == 1
+
+
+@pytest.mark.parametrize("api", ["detect", "detect_all", "stream"])
+def test_one_iterator_for_both_filters_is_read_once(api: str):
+    """Passing one iterable to both filters reads it once, for both.
+
+    The include/exclude conflict is still checked on the same names rather
+    than the second read seeing an exhausted iterator and reporting an empty
+    filter.
+    """
+    data = "Héllo wörld café résumé naïve".encode()
+    source = _CountingIterable(["cp1252"])
+    kwargs = {"include_encodings": source, "exclude_encodings": source}
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", UserWarning)
+        if api == "stream":
+            detector = UniversalDetector(**kwargs)
+            detector.feed(data)
+            results = [detector.close()]
+        elif api == "detect_all":
+            results = chardet.detect_all(data, **kwargs)
+        else:
+            results = [chardet.detect(data, **kwargs)]
+    assert source.reads == 1
+    assert all(result["encoding"] is None for result in results)
+
+
+@pytest.mark.parametrize("api", ["detect", "detect_all", "stream"])
+def test_a_generator_filter_is_usable(api: str):
+    """A generator is a valid filter value, not only a list."""
+    data = "Héllo wörld café résumé naïve".encode()
+    kwargs = {"include_encodings": (name for name in ["cp1252"])}
+    if api == "stream":
+        detector = UniversalDetector(**kwargs)
+        detector.feed(data)
+        results = [detector.close()]
+    elif api == "detect_all":
+        results = chardet.detect_all(data, **kwargs)
+    else:
+        results = [chardet.detect(data, **kwargs)]
+    assert results[0]["encoding"] == "Windows-1252"
 
 
 # --- UniversalDetector include/exclude/fallback/empty tests ---

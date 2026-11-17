@@ -128,6 +128,24 @@ Unreleased
   the declared name.
   (`Dan Blanchard <https://github.com/dan-blanchard>`_ via Claude,
   `#438 <https://github.com/chardet/chardet/pull/438>`_)
+- ``include_encodings`` and ``exclude_encodings`` now compare encodings by
+  their real codec identity, so every spelling of one encoding is the same
+  encoding to the filters.  An exclusion can no longer come back under
+  another name: excluding ``ms_kanji`` used to leave CP932 free to win,
+  because the alias maps to ``shift_jis_2004`` in the label table while
+  Python reads the same name as the ``cp932`` codec, and excluding
+  ``EUC-JP`` used to leave ``euc_jis_2004`` free, because the display step
+  reports it under a codec name no label listed.  An
+  ``include_encodings`` on one spelling and an ``exclude_encodings`` on
+  another now conflict on that identity, and the candidate set is empty.
+  The ``prefer_superset`` replacement target is a candidate too, so a
+  target the filters exclude, or one outside ``encoding_era``, is not
+  substituted.  A ``no_match_encoding`` or ``empty_input_encoding`` the
+  filters exclude now yields ``encoding=None`` with a warning instead of
+  reporting the excluded encoding at 0.10.  The filters are also read
+  exactly once, so a generator is a valid value, and passing one iterable
+  to both parameters reads it once for both.
+  (`Dan Blanchard <https://github.com/dan-blanchard>`_ via Claude)
 
 **Build:**
 

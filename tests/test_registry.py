@@ -11,10 +11,14 @@ import pytest
 from chardet.enums import EncodingEra
 from chardet.registry import (
     REGISTRY,
+    EncodingFilter,
     EncodingInfo,
     EncodingName,
+    _codec_identities,
+    allows_encoding,
     get_candidates,
     lookup_encoding,
+    normalize_encodings,
 )
 
 
@@ -422,3 +426,181 @@ def test_superset_values_are_canonical_registry_names():
     for name, superset in with_superset.items():
         assert superset in REGISTRY, name
         assert superset != name
+
+
+# ---------------------------------------------------------------------------
+# Option identities: one encoding, one canonical name, whatever it is called
+# ---------------------------------------------------------------------------
+
+
+def test_normalize_encodings_folds_aliases_onto_one_identity():
+    """An alias, its canonical, and its codec name are one identity."""
+    for spelling in ("windows-1252", "cp1252", "Windows-1252", "x-cp1252"):
+        assert normalize_encodings([spelling], "include_encodings") == frozenset(
+            {"cp1252"}
+        )
+
+
+@pytest.mark.parametrize(
+    ("spelling", "canonical"),
+    [
+        # A registry alias that names another entry's real codec: the codec,
+        # not the label, decides which identity the filter is about.
+        ("ms_kanji", "cp932"),
+        ("ksc5601", "euc_kr"),
+        ("ks_c_5601-1987", "euc_kr"),
+    ],
+)
+def test_normalize_encodings_uses_the_codec_identity(spelling, canonical):
+    """Labels whose Python codec belongs to another entry filter that entry.
+
+    ``ms_kanji`` is listed under ``shift_jis_2004`` but Python resolves it to
+    the ``cp932`` codec; ``ksc5601`` is listed under ``cp949`` but resolves
+    to ``euc_kr``.  Excluding the label must exclude the codec it denotes,
+    or the excluded encoding simply returns under the other name.
+    """
+    assert normalize_encodings([spelling], "exclude_encodings") == frozenset(
+        {canonical}
+    )
+
+
+@pytest.mark.parametrize(
+    ("spelling", "canonical"),
+    [
+        # Codec names no label lists, but which the display step reports as
+        # the compat names below.
+        ("euc_jp", "euc_jis_2004"),
+        ("iso2022_jp", "iso2022_jp_2"),
+        ("big5", "big5hkscs"),
+        ("cp950", "big5hkscs"),
+        ("shift_jis", "shift_jis_2004"),
+        ("gb2312", "gb18030"),
+        ("gbk", "gb18030"),
+    ],
+)
+def test_normalize_encodings_accepts_bare_codec_names(spelling, canonical):
+    """The Python codec name of an entry resolves to that entry."""
+    assert normalize_encodings([spelling], "include_encodings") == frozenset(
+        {canonical}
+    )
+
+
+def test_normalize_encodings_accepts_compat_display_names():
+    """Every chardet display name folds onto the identity that produced it."""
+    from chardet.output_names import _COMPAT_NAMES  # noqa: PLC0415
+
+    mismatched = {
+        internal: normalize_encodings([display], "include_encodings")
+        for internal, display in _COMPAT_NAMES.items()
+        if normalize_encodings([display], "include_encodings")
+        != frozenset({internal})
+    }
+    assert not mismatched
+
+
+def test_normalize_encodings_every_canonical_resolves_to_itself():
+    for entry in REGISTRY.values():
+        assert normalize_encodings([entry.name], "include_encodings") == frozenset(
+            {entry.name}
+        )
+
+
+def test_normalize_encodings_rejects_non_strings():
+    """A non-string fails like an unknown name, naming the option."""
+    for bad in (None, 123, b"utf-8", 1.5):
+        with pytest.raises(ValueError, match="Unknown encoding .* in include_encodings"):
+            normalize_encodings([bad], "include_encodings")  # ty: ignore[invalid-argument-type]
+
+
+@pytest.mark.parametrize(
+    ("encoding", "kwargs", "expected"),
+    [
+        ("cp1252", {}, True),
+        (None, {}, True),
+        ("cp1252", {"exclude_encodings": frozenset({"cp1252"})}, False),
+        ("cp1252", {"include_encodings": frozenset({"utf-8"})}, False),
+        ("cp1252", {"include_encodings": frozenset({"cp1252"})}, True),
+        # Exclusion wins over inclusion when a name is in both.
+        (
+            "cp1252",
+            {
+                "include_encodings": frozenset({"cp1252"}),
+                "exclude_encodings": frozenset({"cp1252"}),
+            },
+            False,
+        ),
+        # Outside the requested era.
+        (
+            "iso8859-1",
+            {"encoding_era": EncodingEra.MODERN_WEB},
+            False,
+        ),
+    ],
+)
+def test_allows_encoding_is_the_one_filter_rule(
+    encoding: str | None, kwargs: dict[str, object], expected: bool
+):
+    assert allows_encoding(encoding, **kwargs) is expected  # ty: ignore[invalid-argument-type]
+
+
+def test_allows_encoding_rejects_a_name_the_registry_does_not_list():
+    assert not allows_encoding("not-an-encoding")
+
+
+def test_encoding_filter_matches_get_candidates():
+    """The value object and the raw registry call agree on the candidate set."""
+    include = frozenset({"cp1252", "utf-8"})
+    exclude = frozenset({"utf-8"})
+    expected = get_candidates(EncodingEra.ALL, include, exclude)
+    rule = EncodingFilter(
+        EncodingEra.ALL, include_encodings=include, exclude_encodings=exclude
+    )
+    assert rule.candidates() == expected
+    assert rule.allowed == frozenset(enc.name for enc in expected)
+    assert rule.allows("cp1252")
+    assert not rule.allows("utf-8")
+
+
+def test_encoding_filter_defaults_allow_everything():
+    rule = EncodingFilter()
+    assert rule.candidates() == get_candidates(EncodingEra.ALL)
+    assert rule.allows("cp1252")
+    assert rule.allows(None)
+
+
+def test_codec_identity_table_is_owned_by_the_entries_that_name_the_codec():
+    """Every mapped codec resolves to an entry that actually names it.
+
+    The identity table is built from the registry, so each codec it maps
+    must be a codec some spelling of the entry it maps to resolves to.  A
+    mapping to an unrelated entry would silently exclude or include the
+    wrong encoding.
+    """
+    identities = _codec_identities()
+    assert identities
+    wrong: list[tuple[str, str]] = []
+    for codec, canonical in identities.items():
+        spellings = (REGISTRY[canonical].name, *REGISTRY[canonical].aliases)
+        codecs_named = set()
+        for spelling in spellings:
+            try:
+                codecs_named.add(codecs.lookup(spelling).name)
+            except (LookupError, ValueError):
+                continue  # a registry-only label Python has no codec for
+        if codec not in codecs_named:
+            wrong.append((codec, canonical))
+    assert not wrong, f"codecs mapped to entries that never name them: {wrong}"
+
+
+def test_codec_identity_table_gives_a_codec_to_the_entry_named_after_it():
+    """A disputed codec goes to the entry whose name *is* that codec.
+
+    ``cp932`` is both its own entry's name and ``shift_jis_2004``'s
+    ``ms_kanji`` alias; the codec belongs to ``cp932``.
+    """
+    identities = _codec_identities()
+    assert identities["cp932"] == "cp932"
+    assert identities["euc_kr"] == "euc_kr"
+    # And the alias still routes the *label* the way the markup stage wants.
+    assert lookup_encoding("ms_kanji") == "shift_jis_2004"
+    assert lookup_encoding("ksc5601") == "cp949"

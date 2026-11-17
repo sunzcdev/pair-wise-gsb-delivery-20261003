@@ -2,9 +2,11 @@
 from __future__ import annotations
 
 import codecs
+from unittest.mock import patch
 
 import pytest
 
+from chardet.enums import EncodingEra
 from chardet.output_names import (
     _COMPAT_NAMES,
     NARROWER_DISPLAY_NAMES,
@@ -15,7 +17,7 @@ from chardet.output_names import (
     decodes_under_public_name,
     display_codec,
 )
-from chardet.registry import REGISTRY, lookup_encoding
+from chardet.registry import REGISTRY, lookup_encoding, normalize_encodings
 
 
 def test_apply_preferred_superset_ascii():
@@ -52,6 +54,92 @@ def test_apply_preferred_superset_none():
 def test_apply_legacy_rename_is_alias_of_apply_preferred_superset():
     """``apply_legacy_rename`` is the deprecated alias for the same function."""
     assert apply_legacy_rename is apply_preferred_superset
+
+
+# --- the replacement target is a candidate, held to the same filters ---
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "expected"),
+    [
+        ({}, "cp1252"),
+        # include_encodings names the *target*: the remap happens.
+        ({"include_encodings": frozenset({"cp1252"})}, "cp1252"),
+        # include_encodings names only the source candidate, not the target:
+        # the target is a candidate in its own right, so it is not used.
+        ({"include_encodings": frozenset({"iso8859-1"})}, "iso8859-1"),
+        # exclude_encodings names the target: no remap.
+        ({"exclude_encodings": frozenset({"cp1252"})}, "iso8859-1"),
+        # The target's era must be one the caller asked for.
+        ({"encoding_era": EncodingEra.LEGACY_ISO}, "iso8859-1"),
+        (
+            {"encoding_era": EncodingEra.MODERN_WEB | EncodingEra.LEGACY_ISO},
+            "cp1252",
+        ),
+    ],
+    ids=[
+        "unfiltered",
+        "target-included",
+        "source-only-included",
+        "target-excluded",
+        "target-outside-era",
+        "target-inside-era",
+    ],
+)
+def test_preferred_superset_target_follows_the_filters(
+    kwargs: dict[str, object], expected: str
+):
+    """The superset is filtered as the candidate it is, not as a display name.
+
+    ``include_encodings=["iso8859-1"]`` names exactly one candidate; a remap
+    to ``cp1252`` would report a candidate the caller did not include.  The
+    check reads the target's canonical identity, so naming it in any spelling
+    (``Windows-1252`` folded by ``normalize_encodings``) is the same answer.
+    """
+    result = {"encoding": "iso8859-1", "confidence": 0.9, "language": "fr"}
+    apply_preferred_superset(result, b"caf\xe9", **kwargs)  # ty: ignore[invalid-argument-type]
+    assert result["encoding"] == expected
+
+
+def test_preferred_superset_target_check_uses_canonical_identities():
+    """The filter checks the target's identity, not the string it writes."""
+    result = {"encoding": "iso8859-1", "confidence": 0.9, "language": "fr"}
+    apply_preferred_superset(
+        result, b"caf\xe9", exclude_encodings=frozenset({"cp1252"})
+    )
+    assert result["encoding"] == "iso8859-1"
+    # The reported name would be "Windows-1252" after the display step; the
+    # filter names the candidate as "cp1252", and both are one identity.
+    assert normalize_encodings(["Windows-1252"], "exclude_encodings") == frozenset(
+        {"cp1252"}
+    )
+
+
+def test_preferred_superset_rebound_target_keeps_the_explicit_filters():
+    """A target the registry does not list still honors the caller's filters.
+
+    A caller may rebind ``PREFERRED_SUPERSET``; a replacement name the
+    registry has no entry for has no era or identity to check, so only the
+    filters the caller passed explicitly can apply.
+    """
+    result = {"encoding": "iso8859-1", "confidence": 0.9, "language": "fr"}
+    with patch.dict(PREFERRED_SUPERSET, {"iso8859-1": "not-a-registry-name"}):
+        assert (
+            apply_preferred_superset(
+                dict(result), exclude_encodings=frozenset({"not-a-registry-name"})
+            )["encoding"]
+            == "iso8859-1"
+        )
+        assert (
+            apply_preferred_superset(
+                dict(result), include_encodings=frozenset({"cp1252"})
+            )["encoding"]
+            == "iso8859-1"
+        )
+        assert (
+            apply_preferred_superset(dict(result))["encoding"]
+            == "not-a-registry-name"
+        )
 
 
 def test_compat_names_maps_codec_to_display() -> None:

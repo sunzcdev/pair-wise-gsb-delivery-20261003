@@ -73,11 +73,15 @@ class UniversalDetector:
         :param include_encodings: If given, restrict detection to only these
             encodings (names or aliases).
         :param exclude_encodings: If given, remove these encodings from the
-            candidate set.
+            candidate set.  Every spelling of one encoding is that encoding,
+            so excluding one spelling excludes the encoding itself.  See
+            :func:`chardet.detect`.
         :param no_match_encoding: Encoding to return when no candidate
-            survives the pipeline.  Defaults to ``"cp1252"``.
+            survives the pipeline.  Defaults to ``"cp1252"``.  A fallback
+            the filters exclude yields ``encoding=None`` with a warning.
         :param empty_input_encoding: Encoding to return for empty input.
-            Defaults to ``"utf-8"``.
+            Defaults to ``"utf-8"``.  A value the filters exclude yields
+            ``encoding=None`` with a warning.
         """
         if lang_filter != LanguageFilter.ALL:
             warnings.warn(

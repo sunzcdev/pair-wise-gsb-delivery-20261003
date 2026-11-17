@@ -33,7 +33,7 @@ from chardet.pipeline.structural import (
 from chardet.pipeline.utf8 import scan_utf8
 from chardet.pipeline.utf1632 import detect_utf1632_patterns
 from chardet.pipeline.validity import filter_by_validity
-from chardet.registry import EncodingInfo, get_candidates
+from chardet.registry import EncodingFilter, EncodingInfo
 
 _BINARY_RESULT = DetectionResult(
     encoding=None,
@@ -55,18 +55,27 @@ _STAT_SCORE_MAX_BYTES = 16384
 
 def _make_fallback_or_none(
     encoding: str,
-    allowed: frozenset[str],
+    encoding_filter: EncodingFilter,
     param_name: str,
     stacklevel: int = 6,
 ) -> list[DetectionResult]:
     """Return a low-confidence result for *encoding*, or ``encoding=None`` if filtered out.
+
+    The fallback is a candidate like any other, so the caller's filters are
+    asked through the same rule the pipeline's candidate set uses
+    (:meth:`~chardet.registry.EncodingFilter.allows`).  A fallback the
+    filters exclude is never filled back in: that would be exactly the
+    "excluded encoding under another spelling" hole the filters exist to
+    close, and a caller who excluded ``cp1252`` would get it back at
+    confidence 0.10 on every input that fits nothing.  The caller gets
+    ``encoding=None`` at confidence 0.0 with a warning instead.
 
     The default ``stacklevel=6`` targets the public caller: detect() ->
     DetectionRequest.run() -> run_pipeline() -> _run_pipeline_core() ->
     _make_fallback_or_none().  A caller one frame deeper
     (:func:`_hold_validity_past_cap`) passes 7.
     """
-    if encoding not in allowed:
+    if not encoding_filter.allows(encoding):
         warnings.warn(
             f"{param_name} {encoding!r} is excluded by "
             f"include_encodings/exclude_encodings; returning encoding=None",
@@ -81,7 +90,7 @@ def _hold_validity_past_cap(
     data: bytes,
     evidence: bytes,
     results: list[DetectionResult],
-    allowed: frozenset[str],
+    encoding_filter: EncodingFilter,
     no_match_encoding: str,
 ) -> list[DetectionResult]:
     """Keep the validity contract for the part of the window past the evidence cap.
@@ -112,7 +121,7 @@ def _hold_validity_past_cap(
         if r.encoding is not None and decodes_without_error(data, r.encoding):
             return results if i == 0 else results[i:]
     return _make_fallback_or_none(
-        no_match_encoding, allowed, "no_match_encoding", stacklevel=7
+        no_match_encoding, encoding_filter, "no_match_encoding", stacklevel=7
     )
 
 
@@ -284,12 +293,17 @@ def _run_pipeline_core(  # noqa: PLR0913, PLR0915
     # Build candidate set once — used for both early-exit gating and
     # statistical scoring.  The set incorporates encoding_era, include, and
     # exclude filters so all pipeline stages are gated consistently.
-    candidates = get_candidates(encoding_era, include_encodings, exclude_encodings)
-    allowed: frozenset[str] = frozenset(enc.name for enc in candidates)
+    encoding_filter = EncodingFilter(
+        encoding_era,
+        include_encodings=include_encodings,
+        exclude_encodings=exclude_encodings,
+    )
+    candidates = encoding_filter.candidates()
+    allowed: frozenset[str] = encoding_filter.allowed
 
     if not data:
         return _make_fallback_or_none(
-            empty_input_encoding, allowed, "empty_input_encoding"
+            empty_input_encoding, encoding_filter, "empty_input_encoding"
         )
 
     # Stage 1a: BOM detection (runs first — BOMs are definitive and
@@ -418,14 +432,18 @@ def _run_pipeline_core(  # noqa: PLR0913, PLR0915
         valid_candidates = tuple(e for e in valid_candidates if e.name != "utf-8")
 
     if not valid_candidates:
-        return _make_fallback_or_none(no_match_encoding, allowed, "no_match_encoding")
+        return _make_fallback_or_none(
+            no_match_encoding, encoding_filter, "no_match_encoding"
+        )
 
     # Gate: eliminate CJK multi-byte candidates that lack genuine
     # multi-byte structure.  Cache structural scores for Stage 2b.
     valid_candidates = _gate_cjk_candidates(evidence, valid_candidates, ctx)
 
     if not valid_candidates:
-        return _make_fallback_or_none(no_match_encoding, allowed, "no_match_encoding")
+        return _make_fallback_or_none(
+            no_match_encoding, encoding_filter, "no_match_encoding"
+        )
 
     # Stage 2b: Structural probing for multi-byte encodings
     # Reuse scores already computed during the CJK gate above.
@@ -456,7 +474,7 @@ def _run_pipeline_core(  # noqa: PLR0913, PLR0915
                     evidence, results, input_truncated=evidence_truncated
                 )
                 return _hold_validity_past_cap(
-                    data, evidence, results, allowed, no_match_encoding
+                    data, evidence, results, encoding_filter, no_match_encoding
                 )
 
     # Stage 3: Statistical scoring for all remaining candidates.
@@ -467,12 +485,16 @@ def _run_pipeline_core(  # noqa: PLR0913, PLR0915
         score_candidates(stat_data, tuple(valid_candidates), full_ranking=full_ranking)
     )
     if not results:
-        return _make_fallback_or_none(no_match_encoding, allowed, "no_match_encoding")
+        return _make_fallback_or_none(
+            no_match_encoding, encoding_filter, "no_match_encoding"
+        )
 
     # Rank corrections reason about the same evidence window the ranking
     # came from, which also bounds their byte-presence scans.
     results = postprocess_results(evidence, results, input_truncated=evidence_truncated)
-    return _hold_validity_past_cap(data, evidence, results, allowed, no_match_encoding)
+    return _hold_validity_past_cap(
+        data, evidence, results, encoding_filter, no_match_encoding
+    )
 
 
 def run_pipeline(  # noqa: PLR0913

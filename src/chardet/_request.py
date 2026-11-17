@@ -58,6 +58,33 @@ def _resolve_prefer_superset(
     return prefer_superset
 
 
+def _normalize_filter_pair(
+    include_encodings: Iterable[str] | None,
+    exclude_encodings: Iterable[str] | None,
+) -> tuple[frozenset[str] | None, frozenset[str] | None]:
+    """Normalize both encoding filters, reading each iterable only once.
+
+    A caller may hand in an iterator -- a generator, ``map``, ``dict_keys``
+    over a view -- rather than a list, and each one must be consumed exactly
+    once: a second pass over an exhausted iterator silently reads as empty
+    and trips the "must not be empty" check on a value that was not empty.
+    When one iterable object is passed to *both* parameters, it is
+    materialized once and the two filters share that one read, so the
+    include/exclude conflict is still checked on the same set of names
+    instead of the second read seeing nothing.
+    """
+    if include_encodings is not None and include_encodings is exclude_encodings:
+        shared = tuple(include_encodings)
+        return (
+            normalize_encodings(shared, "include_encodings"),
+            normalize_encodings(shared, "exclude_encodings"),
+        )
+    return (
+        normalize_encodings(include_encodings, "include_encodings"),
+        normalize_encodings(exclude_encodings, "exclude_encodings"),
+    )
+
+
 @dataclasses.dataclass(frozen=True, slots=True)
 class DetectionRequest:
     """The resolved options of one detection, and the work they drive.
@@ -112,17 +139,14 @@ class DetectionRequest:
             prefer_superset=prefer_superset,
             stacklevel=stacklevel + 1,
         )
+        include, exclude = _normalize_filter_pair(include_encodings, exclude_encodings)
         return cls(
             encoding_era=encoding_era,
             max_bytes=max_bytes,
             prefer_superset=prefer_superset,
             compat_names=compat_names,
-            include_encodings=normalize_encodings(
-                include_encodings, "include_encodings"
-            ),
-            exclude_encodings=normalize_encodings(
-                exclude_encodings, "exclude_encodings"
-            ),
+            include_encodings=include,
+            exclude_encodings=exclude,
             no_match_encoding=_validate_encoding(
                 no_match_encoding, "no_match_encoding"
             ),

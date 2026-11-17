@@ -138,7 +138,11 @@ Tables and predicates for asking "is this detection acceptable, given what was e
 
 ### Public-API Encoding Names (`output_names.py`)
 
-Two output transforms applied to detection results before they cross the public API: `apply_preferred_superset` (for the `prefer_superset=True` option, remaps ISO subsets to Windows supersets) and `apply_compat_names` (for the default `compat_names=True` mode, maps internal codec names to chardet 5.x/6.x display names). Both take the examined window and keep the internal name when the new name cannot decode it; the superset remap also honors `include_encodings`/`exclude_encodings`. Used by `__init__.py` and `detector.py`.
+Two output transforms applied to detection results before they cross the public API: `apply_preferred_superset` (for the `prefer_superset=True` option, remaps ISO subsets to Windows supersets) and `apply_compat_names` (for the default `compat_names=True` mode, maps internal codec names to chardet 5.x/6.x display names). Both take the examined window and keep the internal name when the new name cannot decode it; the superset remap also honors `include_encodings`/`exclude_encodings`/`encoding_era` through `registry.allows_encoding`. Used by `__init__.py` and `detector.py`.
+
+### Encoding filters (`registry.py`)
+
+`include_encodings` and `exclude_encodings` compare **encoding identities**, not spellings. `normalize_encodings`/`registry._option_encoding` fold every spelling of one encoding — canonical name, registry alias, Python codec name (`euc_jp`), display name (`EUC-JP`) — onto one canonical name, resolving through the real codec *before* the alias table because the two disagree where a label names another entry's codec (`ms_kanji` → `cp932`, `ksc5601` → `euc_kr`; the label table routes those to `shift_jis_2004`/`cp949` for markup). `registry.allows_encoding` is the single predicate for "may this encoding be named?", used by the pipeline's candidate set (`EncodingFilter`), the `prefer_superset` target, and the `no_match_encoding`/`empty_input_encoding` fallbacks — so an excluded encoding cannot return under another name, and an excluded fallback yields `encoding=None`. Both filter iterables are read once (`_request._normalize_filter_pair`), so generators are valid.
 
 `equivalences.py` is a deprecation shim that proxies attribute access to both modules, warning per name, until 8.0.
 

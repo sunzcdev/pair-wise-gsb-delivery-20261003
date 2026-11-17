@@ -24,7 +24,7 @@ import codecs
 from chardet._utils import decodes_completely, decodes_without_error
 from chardet.enums import EncodingEra
 from chardet.pipeline import DetectionDict
-from chardet.registry import REGISTRY
+from chardet.registry import REGISTRY, allows_encoding
 
 # Preferred superset name for each encoding, used by the ``prefer_superset``
 # API option.  When enabled, detected encoding names are replaced with the
@@ -135,6 +135,20 @@ def apply_preferred_superset(
     remap applies only if the superset decodes it; otherwise the detected
     name stands, being the one that does.
 
+    The replacement *target* is a candidate in its own right, so it is held
+    to the caller's filters through the same predicate the pipeline uses
+    (:func:`~chardet.registry.allows_encoding`): a superset the filters
+    exclude, or one outside *encoding_era*, is not substituted, and the
+    detected name stands.  The check reads the target's canonical identity,
+    not the string this function writes: the source candidate and the
+    reported display name are different units (``iso8859-1`` may be reported
+    as ``ISO-8859-1`` while the remap target is ``cp1252``), so a name may
+    be filtered without the filter having anything to say about its
+    spelling.  ``include_encodings`` and ``exclude_encodings`` are the
+    canonical sets :func:`~chardet.registry.normalize_encodings` returns, in
+    which every alias, codec spelling, and display name of one encoding has
+    already collapsed onto one identity.
+
     :param result: A detection result dict containing an ``"encoding"`` key.
     :param data: The bytes *result* was detected from, when known.
     :param include_encodings: Canonical encoding names (as returned by
@@ -152,13 +166,20 @@ def apply_preferred_superset(
     superset = PREFERRED_SUPERSET.get(enc)
     if superset is None:
         return result
-    if include_encodings is not None and superset not in include_encodings:
-        return result
-    if exclude_encodings is not None and superset in exclude_encodings:
-        return result
-    # A rebound table may name a codec the registry does not list.
-    info = REGISTRY.get(superset)
-    if info is not None and not info.era & encoding_era:
+    if REGISTRY.get(superset) is None:
+        # A rebound table may name something the registry does not list:
+        # there is no identity or era to check, so the caller's explicitly
+        # named filters are all that can apply.
+        if include_encodings is not None and superset not in include_encodings:
+            return result
+        if exclude_encodings is not None and superset in exclude_encodings:
+            return result
+    elif not allows_encoding(
+        superset,
+        encoding_era=encoding_era,
+        include_encodings=include_encodings,
+        exclude_encodings=exclude_encodings,
+    ):
         return result
     if data is None or decodes_without_error(data, superset):
         result["encoding"] = superset

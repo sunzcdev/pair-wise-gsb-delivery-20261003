@@ -41,6 +41,12 @@ _OPTIONS: dict[str, dict[str, Any]] = {
         "prefer_superset": True,
         "exclude_encodings": ["windows-1253"],
     },
+    # The excluded name is a spelling of the included one: the conflict is on
+    # one identity, so the candidate set is empty.
+    "conflicting-spellings": {
+        "include_encodings": ["euc_kr"],
+        "exclude_encodings": ["ksc5601"],
+    },
     "small-window": {"max_bytes": 16},
     "modern-era": {"encoding_era": EncodingEra.MODERN_WEB},
 }
@@ -98,6 +104,52 @@ def test_resolve_folds_should_rename_legacy_into_prefer_superset():
 def test_resolve_warns_about_chunk_size():
     with pytest.warns(DeprecationWarning, match="chunk_size"):
         DetectionRequest.resolve(chunk_size=1024)
+
+
+class _CountingIterable:
+    """An iterable that records how many times ``iter()`` is called on it."""
+
+    def __init__(self, items: list[str]) -> None:
+        self._items = items
+        self.reads = 0
+
+    def __iter__(self) -> Iterator[str]:
+        self.reads += 1
+        return iter(self._items)
+
+
+def test_resolve_reads_each_filter_once():
+    """Resolving the options consumes each filter iterable exactly once."""
+    include = _CountingIterable(["utf-8", "cp1252"])
+    exclude = _CountingIterable(["cp1252"])
+    request = DetectionRequest.resolve(
+        include_encodings=include, exclude_encodings=exclude
+    )
+    assert include.reads == 1
+    assert exclude.reads == 1
+    assert request.include_encodings == frozenset({"utf-8", "cp1252"})
+    assert request.exclude_encodings == frozenset({"cp1252"})
+
+
+def test_resolve_reads_a_shared_iterable_once():
+    """One iterable passed to both filters is read once, for both."""
+    shared = _CountingIterable(["cp1252"])
+    request = DetectionRequest.resolve(
+        include_encodings=shared, exclude_encodings=shared
+    )
+    assert shared.reads == 1
+    assert request.include_encodings == frozenset({"cp1252"})
+    assert request.exclude_encodings == frozenset({"cp1252"})
+
+
+def test_resolve_folds_filter_spellings_onto_one_identity():
+    """Include and exclude name the same encoding however it is spelled."""
+    request = DetectionRequest.resolve(
+        include_encodings=["Windows-1252"], exclude_encodings=["cp1252"]
+    )
+    assert request.include_encodings == request.exclude_encodings == frozenset(
+        {"cp1252"}
+    )
 
 
 # ---------------------------------------------------------------------------

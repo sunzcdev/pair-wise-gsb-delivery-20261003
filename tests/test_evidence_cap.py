@@ -15,6 +15,7 @@ import chardet
 from chardet._utils import DEFAULT_MAX_BYTES, EVIDENCE_CAP_BYTES
 from chardet.pipeline import DetectionResult
 from chardet.pipeline.orchestrator import _hold_validity_past_cap
+from chardet.registry import EncodingFilter
 
 
 def test_cap_covers_default_window() -> None:
@@ -84,7 +85,11 @@ def test_validity_hold_skips_entries_without_an_encoding() -> None:
     data = b"x" * (EVIDENCE_CAP_BYTES + 1)
     results = [DetectionResult(None, 0.0, None), DetectionResult("ascii", 0.5, None)]
     held = _hold_validity_past_cap(
-        data, data[:EVIDENCE_CAP_BYTES], results, frozenset({"ascii"}), "ascii"
+        data,
+        data[:EVIDENCE_CAP_BYTES],
+        results,
+        EncodingFilter(include_encodings=frozenset({"ascii"})),
+        "ascii",
     )
     assert [r.encoding for r in held] == ["ascii"]
 
