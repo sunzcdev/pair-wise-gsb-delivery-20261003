@@ -142,3 +142,38 @@ not currently supported.
 === All Others
 
 Support is emulated.
+
+== Bind Variable Namespaces (bind_namespaces extension)
+
+When two reusable datasets both declare a placeholder with the same name
+(for example +:$id+), combining them into one query cannot assume the two
+placeholders share a single value. The +bind_namespaces+ extension gives
+each dataset an explicit parameter namespace so the collision is either
+isolated or deliberately shared.
+
+Load it for a whole database (or a single dataset with Dataset#extension):
+
+  DB.extension :bind_namespaces
+
+Assign an isolated namespace and the values to bind. Colliding names are
+rewritten into distinct final names:
+
+  orders  = DB[:orders].where(id: :$id).bind_namespace(:orders,  id: 1)
+  refunds = DB[:refunds].where(id: :$id).bind_namespace(:refunds, id: 2)
+
+  cq = DB[:t].with(:o, orders).with(:r, refunds).compile_bindings
+  cq.sql
+  # WITH o AS (... id = ?), r AS (... id = ?) SELECT * FROM t
+  cq.bindings       # {:"$orders__id"=>1, :"$refunds__id"=>2}
+  cq.bind_arguments # [1, 2]
+
+To share one value on purpose, use #shared_bind_namespace. Reusing a shared
+name with values of incompatible types raises an error when the datasets are
+combined, instead of letting the last hash value silently overwrite the
+first. Different numeric classes (Integer/Float) are considered compatible.
+
+Placeholders are handled wherever they appear: nested CTEs, subqueries, and
+the arguments of literal SQL (+Sequel.lit+). Text inside string constants is
+never rewritten, so +":$id"+ inside a quoted string is left untouched.
+#compile_bindings takes an optional statement type (+:insert+, +:update+,
++:delete+) and values, mirroring Dataset#prepare.
