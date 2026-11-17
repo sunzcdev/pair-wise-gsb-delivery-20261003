@@ -1,6 +1,20 @@
 Changelog
 =========
 
+Unreleased
+
+* Add native asyncio support: ``CircuitBreaker.call_asyncio`` awaits the
+  guarded coroutine and records its real outcome, and the decorator detects
+  ``async def`` functions automatically
+* Add ``count_cancellations`` option to decide explicitly whether
+  ``asyncio.CancelledError`` participates in the failure statistics; the
+  original cancellation is always re-raised and never converted into a
+  ``CircuitBreakerError``
+* Half-open trial coroutines are serialized by an event-loop-local permit whose
+  wait is cancellable and which is discarded when the event loop closes
+* Reject coroutine objects on the synchronous ``call`` path instead of treating
+  the returned coroutine as a successful call
+
 Version 1.4.0 (July 6, 2025)
 
 * Add success_threshold parameter (Thanks @sideshowbandana)

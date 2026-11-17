@@ -21,6 +21,7 @@ Features
 * Functions and properties for easy monitoring and management
 * Thread-safe
 * Optional redis backing
+* Native ``asyncio`` support for ``async def`` coroutines
 * Optional support for asynchronous Tornado calls
 
 
@@ -258,6 +259,52 @@ Or if you don't want to use the decorator syntax:
         pass
 
     updated_customer = db_breaker.call_async(async_update, my_customer)
+
+
+Native asyncio Support
+``````````````````````
+Native ``async def`` coroutines are supported through ``call_asyncio``, which
+awaits the guarded operation and only updates the circuit breaker state once
+the real result or exception is known:
+
+.. code:: python
+
+    async def async_update(cust):
+        # Do async stuff here...
+        pass
+
+    updated_customer = await db_breaker.call_asyncio(async_update, my_customer)
+
+The decorator detects ``async def`` functions automatically, so the decorated
+function stays a coroutine function:
+
+.. code:: python
+
+    @db_breaker
+    async def async_update(cust):
+        # Do async stuff here...
+        pass
+
+    updated_customer = await async_update(my_customer)
+
+Coroutine objects cannot be passed through the synchronous ``call`` method:
+doing so raises a ``TypeError`` instead of being mistaken for a successful
+call. The asynchronous path does not start a nested event loop and never runs
+the coroutine in a thread pool.
+
+By default, ``asyncio.CancelledError`` is not counted as a failure, since a
+cancellation usually means the caller abandoned the request rather than the
+guarded operation malfunctioned. Pass ``count_cancellations=True`` to count
+cancellations in the failure statistics instead. In either case the original
+``CancelledError`` is re-raised and never replaced by a ``CircuitBreakerError``:
+
+.. code:: python
+
+    db_breaker = pybreaker.CircuitBreaker(count_cancellations=True)
+
+In the half-open state, trial coroutines are serialized by an event-loop-local
+permit. Coroutines waiting for that permit can be cancelled without consuming
+it, and closing the event loop leaves no locked permit behind.
 
 
 Excluding Exceptions

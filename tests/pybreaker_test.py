@@ -1,4 +1,6 @@
+import asyncio
 import unittest
+import warnings
 from contextlib import contextmanager
 from datetime import datetime
 from time import sleep
@@ -1350,6 +1352,455 @@ class CircuitBreakerContextManagerTestCase(unittest.TestCase):
         mock_fn.assert_called_once()
         assert breaker.fail_counter == 0
         assert breaker.current_state == "closed"
+
+
+class CircuitBreakerAsyncioTestCase(unittest.TestCase):
+    """Tests for the native asyncio interface.
+
+    Event loops are managed explicitly so these tests do not rely on any
+    pytest-asyncio plugin, and so the library itself is never in charge of
+    starting (let alone nesting) an event loop.
+    """
+
+    def setUp(self):
+        self.loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(self.loop)
+
+    def tearDown(self):
+        self.loop.close()
+        asyncio.set_event_loop(None)
+
+    def run_coro(self, coro):
+        return self.loop.run_until_complete(coro)
+
+    def test_successful_async_call(self):
+        """call_asyncio must await the coroutine and only then register success."""
+        breaker = CircuitBreaker()
+
+        async def func():
+            return True
+
+        assert self.run_coro(breaker.call_asyncio(func)) is True
+        assert breaker.fail_counter == 0
+        assert breaker.current_state == "closed"
+
+    def test_async_call_actually_awaited(self):
+        """The breaker state must reflect the awaited outcome, not the mere
+        creation of a coroutine object.
+        """
+        breaker = CircuitBreaker(fail_max=2)
+        started = asyncio.Event()
+
+        async def func():
+            started.set()
+            raise NotImplementedError
+
+        coro = breaker.call_asyncio(func)
+        # Nothing has run until the returned coroutine is awaited.
+        assert not started.is_set()
+        with pytest.raises(NotImplementedError):
+            self.run_coro(coro)
+        assert started.is_set()
+        assert breaker.fail_counter == 1
+
+    def test_sync_call_rejects_coroutine_function(self):
+        """A coroutine function cannot be guarded by the synchronous path, as
+        its coroutine object would otherwise be treated as a success.
+        """
+        breaker = CircuitBreaker()
+
+        async def func():
+            return True
+
+        with pytest.raises(TypeError):
+            breaker.call(func)
+        assert breaker.fail_counter == 0
+
+    def test_sync_call_rejects_returned_coroutine(self):
+        """A regular function that returns a coroutine object must not count as
+        a successful call, and the orphan coroutine must be closed.
+        """
+        breaker = CircuitBreaker()
+
+        async def inner():
+            return True
+
+        def func():
+            return inner()
+
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            with pytest.raises(TypeError):
+                breaker.call(func)
+        assert breaker.fail_counter == 0
+
+    def test_one_failed_async_call(self):
+        breaker = CircuitBreaker()
+
+        async def func():
+            raise NotImplementedError
+
+        with pytest.raises(NotImplementedError):
+            self.run_coro(breaker.call_asyncio(func))
+        assert breaker.fail_counter == 1
+        assert breaker.current_state == "closed"
+
+    def test_async_failures_share_counter_semantics_with_sync_calls(self):
+        """The failure counter has the exact same meaning for regular and
+        asynchronous functions: mixed failures accumulate together and a
+        success (of either kind) resets the counter.
+        """
+        breaker = CircuitBreaker(fail_max=4)
+
+        def sync_err():
+            raise NotImplementedError
+
+        async def async_err():
+            raise NotImplementedError
+
+        async def async_ok():
+            return True
+
+        with pytest.raises(NotImplementedError):
+            breaker.call(sync_err)
+        with pytest.raises(NotImplementedError):
+            self.run_coro(breaker.call_asyncio(async_err))
+        assert breaker.fail_counter == 2
+
+        assert self.run_coro(breaker.call_asyncio(async_ok)) is True
+        assert breaker.fail_counter == 0
+
+        with pytest.raises(NotImplementedError):
+            self.run_coro(breaker.call_asyncio(async_err))
+        with pytest.raises(NotImplementedError):
+            breaker.call(sync_err)
+        assert breaker.fail_counter == 2
+
+    def test_async_opens_circuit_at_fail_max(self):
+        breaker = CircuitBreaker(fail_max=3)
+
+        async def func():
+            raise NotImplementedError
+
+        with pytest.raises(NotImplementedError):
+            self.run_coro(breaker.call_asyncio(func))
+        with pytest.raises(NotImplementedError):
+            self.run_coro(breaker.call_asyncio(func))
+        with pytest.raises(CircuitBreakerError):
+            self.run_coro(breaker.call_asyncio(func))
+        assert breaker.fail_counter == 3
+        assert breaker.current_state == "open"
+
+    def test_async_open_state_fails_fast(self):
+        breaker = CircuitBreaker(fail_max=2, reset_timeout=60)
+
+        async def err():
+            raise NotImplementedError
+
+        with pytest.raises(NotImplementedError):
+            self.run_coro(breaker.call_asyncio(err))
+        with pytest.raises(CircuitBreakerError):
+            self.run_coro(breaker.call_asyncio(err))
+        assert breaker.current_state == "open"
+
+        called = False
+
+        async def tracked():
+            nonlocal called
+            called = True
+            return True
+
+        with pytest.raises(CircuitBreakerError):
+            self.run_coro(breaker.call_asyncio(tracked))
+        assert called is False
+
+    def test_async_half_open_success_closes(self):
+        breaker = CircuitBreaker(fail_max=1, reset_timeout=0.05)
+        breaker.open()
+        sleep(0.06)
+
+        async def ok():
+            return True
+
+        assert self.run_coro(breaker.call_asyncio(ok)) is True
+        assert breaker.current_state == "closed"
+        assert breaker.fail_counter == 0
+
+    def test_async_half_open_failure_reopens(self):
+        breaker = CircuitBreaker(fail_max=1, reset_timeout=0.05)
+        breaker.open()
+        sleep(0.06)
+
+        async def err():
+            raise NotImplementedError
+
+        with pytest.raises(CircuitBreakerError):
+            self.run_coro(breaker.call_asyncio(err))
+        assert breaker.current_state == "open"
+        assert breaker.fail_counter == 1
+
+    def test_async_success_threshold(self):
+        breaker = CircuitBreaker(fail_max=1, reset_timeout=0.05, success_threshold=3)
+        breaker.open()
+        sleep(0.06)
+
+        async def ok():
+            return True
+
+        for expected in (1, 2):
+            assert self.run_coro(breaker.call_asyncio(ok)) is True
+            assert breaker.current_state == "half-open"
+            assert breaker.success_counter == expected
+        assert self.run_coro(breaker.call_asyncio(ok)) is True
+        assert breaker.current_state == "closed"
+        assert breaker.success_counter == 0
+
+    def test_cancellation_not_counted_by_default(self):
+        breaker = CircuitBreaker(fail_max=1)
+        gate = asyncio.Event()
+
+        async def guarded():
+            await gate.wait()
+
+        async def scenario():
+            task = asyncio.create_task(breaker.call_asyncio(guarded))
+            await asyncio.sleep(0)
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+
+        self.run_coro(scenario())
+        assert breaker.fail_counter == 0
+        assert breaker.current_state == "closed"
+
+    def test_cancellation_never_becomes_circuit_breaker_error(self):
+        # Even when counted, CancelledError must propagate unchanged.
+        breaker = CircuitBreaker(fail_max=1, count_cancellations=True)
+        gate = asyncio.Event()
+
+        async def guarded():
+            await gate.wait()
+
+        async def scenario():
+            task = asyncio.create_task(breaker.call_asyncio(guarded))
+            await asyncio.sleep(0)
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+
+        self.run_coro(scenario())
+        assert isinstance(breaker.fail_counter, int)
+        assert breaker.fail_counter == 1
+        assert breaker.current_state == "open"
+
+    def test_count_cancellations_property(self):
+        breaker = CircuitBreaker()
+        assert breaker.count_cancellations is False
+        breaker.count_cancellations = True
+        assert breaker.count_cancellations is True
+        breaker = CircuitBreaker(count_cancellations=True)
+        assert breaker.count_cancellations is True
+
+    def test_counted_cancellation_opens_at_threshold(self):
+        breaker = CircuitBreaker(fail_max=2, count_cancellations=True)
+        gate = asyncio.Event()
+
+        async def guarded():
+            await gate.wait()
+
+        async def scenario():
+            for _ in range(2):
+                task = asyncio.create_task(breaker.call_asyncio(guarded))
+                await asyncio.sleep(0)
+                task.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    await task
+
+        self.run_coro(scenario())
+        assert breaker.fail_counter == 2
+        assert breaker.current_state == "open"
+
+    def test_cancelled_half_open_wait_does_not_consume_permit(self):
+        breaker = CircuitBreaker(fail_max=1, reset_timeout=0.05)
+        breaker.open()
+        sleep(0.06)
+        gate = asyncio.Event()
+
+        async def slow():
+            await gate.wait()
+            return True
+
+        async def scenario():
+            first = asyncio.create_task(breaker.call_asyncio(slow))
+            await asyncio.sleep(0.02)
+            second = asyncio.create_task(breaker.call_asyncio(slow))
+            await asyncio.sleep(0.02)
+            second.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await second
+            # Waiting coroutine was cancelled before acquiring the permit.
+            assert breaker.fail_counter == 0
+            assert breaker._get_half_open_lock().locked()
+            gate.set()
+            assert await first is True
+
+        self.run_coro(scenario())
+
+    def test_half_open_allows_single_trial_coroutine(self):
+        breaker = CircuitBreaker(fail_max=1, reset_timeout=0.05)
+        breaker.open()
+        sleep(0.06)
+
+        active = 0
+        max_active = 0
+        release = asyncio.Event()
+
+        async def trial():
+            nonlocal active, max_active
+            active += 1
+            max_active = max(max_active, active)
+            await release.wait()
+            active -= 1
+            return True
+
+        async def scenario():
+            first = asyncio.create_task(breaker.call_asyncio(trial))
+            second = asyncio.create_task(breaker.call_asyncio(trial))
+            await asyncio.sleep(0.05)
+            assert max_active == 1
+            release.set()
+            assert await first is True
+            assert await second is True
+
+        self.run_coro(scenario())
+        assert breaker.current_state == "closed"
+
+    def test_event_loop_closure_leaves_no_permit(self):
+        breaker = CircuitBreaker(fail_max=1, reset_timeout=0.05)
+        breaker.open()
+        sleep(0.06)
+        gate = asyncio.Event()
+
+        async def slow():
+            await gate.wait()
+            return True
+
+        async def hold():
+            task = asyncio.create_task(breaker.call_asyncio(slow))
+            await asyncio.sleep(0.02)
+            assert breaker._get_half_open_lock().locked()
+            # Let the trial finish cleanly, still holding the permit for this loop.
+            gate.set()
+            assert await task is True
+            assert breaker.current_state == "closed"
+
+        self.loop.run_until_complete(hold())
+        # Closing the loop must discard the loop-local permit instead of
+        # leaving a lock that a later loop could observe as held.
+        self.loop.close()
+        asyncio.set_event_loop(None)
+
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        try:
+
+            async def use_fresh_loop():
+                # The new loop gets a brand-new, unlocked permit.
+                assert not breaker._get_half_open_lock().locked()
+                return await breaker.call_asyncio(lambda: True)
+
+            assert loop.run_until_complete(use_fresh_loop()) is True
+        finally:
+            loop.close()
+            asyncio.set_event_loop(None)
+
+    def test_loop_shutdown_mid_trial_is_not_a_failure(self):
+        """A ``GeneratorExit`` raised while a trial coroutine is being torn down
+        must not be recorded as a failure or converted into a
+        ``CircuitBreakerError``; it is loop/interpreter teardown.
+        """
+        breaker = CircuitBreaker(fail_max=1)
+        breaker.half_open()
+
+        async def func():
+            raise GeneratorExit
+
+        coro = breaker.call_asyncio(func)
+        with pytest.raises(GeneratorExit):
+            self.loop.run_until_complete(coro)
+        assert breaker.fail_counter == 0
+        assert breaker.current_state == "half-open"
+
+    def test_async_never_uses_thread_pool(self):
+        breaker = CircuitBreaker()
+
+        async def ok():
+            return True
+
+        with mock.patch("asyncio.to_thread") as to_thread, mock.patch(
+            "asyncio.base_events.BaseEventLoop.run_in_executor"
+        ) as run_in_executor:
+            assert self.run_coro(breaker.call_asyncio(ok)) is True
+            to_thread.assert_not_called()
+            run_in_executor.assert_not_called()
+
+    def test_async_decorator(self):
+        breaker = CircuitBreaker()
+
+        @breaker
+        async def suc(value):
+            "Docstring"
+            return value
+
+        @breaker
+        async def err(value):
+            "Docstring"
+            raise NotImplementedError
+
+        assert asyncio.iscoroutinefunction(suc)
+        assert suc.__name__ == "suc"
+        assert suc.__doc__ == "Docstring"
+
+        with pytest.raises(NotImplementedError):
+            self.run_coro(err(True))
+        assert breaker.fail_counter == 1
+        assert self.run_coro(suc(True)) is True
+        assert breaker.fail_counter == 0
+
+    def test_async_listener_events(self):
+        events = []
+
+        class Listener(CircuitBreakerListener):
+            def before_call(self, cb, func, *args, **kwargs):
+                events.append("before")
+
+            def success(self, cb):
+                events.append("success")
+
+            def failure(self, cb, exc):
+                events.append("failure")
+
+        breaker = CircuitBreaker(listeners=(Listener(),))
+
+        async def ok():
+            return True
+
+        async def err():
+            raise NotImplementedError
+
+        self.run_coro(breaker.call_asyncio(ok))
+        with pytest.raises(NotImplementedError):
+            self.run_coro(breaker.call_asyncio(err))
+        assert events == ["before", "success", "before", "failure"]
+
+    def test_async_can_guard_regular_function(self):
+        breaker = CircuitBreaker()
+
+        def func():
+            return 12
+
+        assert self.run_coro(breaker.call_asyncio(func)) == 12
+        assert breaker.fail_counter == 0
 
 
 if __name__ == "__main__":
