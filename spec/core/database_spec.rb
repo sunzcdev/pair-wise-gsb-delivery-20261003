@@ -1544,7 +1544,142 @@ describe "Database#transaction with savepoint support" do
     @db.sqls.must_equal ['BEGIN', 'ROLLBACK']
   end
 end
-  
+
+describe "Database#after_commit_coalesced" do
+  before do
+    @db = Sequel.mock(:servers=>{:test=>{}})
+  end
+
+  it "should raise an Error if called without a block" do
+    proc{@db.after_commit_coalesced(:foo)}.must_raise(Sequel::Error)
+  end
+
+  it "should dispatch immediately outside transactions and return a delivered diagnostic" do
+    d = @db.after_commit_coalesced(:foo){@db.execute('foo')}
+    @db.sqls.must_equal ['foo']
+    d.must_be_kind_of(Sequel::NotificationDiagnostic)
+    d.key.must_equal :foo
+    d.delivered?.must_equal true
+    d.status.must_equal :delivered
+    d.error.must_be_nil
+  end
+
+  it "should dispatch keyed notifications once after the transaction commits" do
+    d = nil
+    @db.transaction{d = @db.after_commit_coalesced(:foo){@db.execute('foo')}}
+    @db.sqls.must_equal ['BEGIN', 'COMMIT', 'foo']
+    d.delivered?.must_equal true
+  end
+
+  it "should replace a pending notification with the same key and dispatch in first-registration order" do
+    ds = []
+    @db.transaction do
+      ds << @db.after_commit_coalesced(:a){@db.execute('a1')}
+      ds << @db.after_commit_coalesced(:b){@db.execute('b1')}
+      ds << @db.after_commit_coalesced(:a){@db.execute('a2')}
+    end
+    @db.sqls.must_equal ['BEGIN', 'COMMIT', 'a2', 'b1']
+    ds[0].superseded?.must_equal true
+    ds[1].delivered?.must_equal true
+    ds[2].delivered?.must_equal true
+  end
+
+  it "should not dispatch and should discard diagnostics if the transaction rolls back" do
+    d = nil
+    @db.transaction{d = @db.after_commit_coalesced(:foo){@db.execute('foo')}; raise Sequel::Rollback}
+    @db.sqls.must_equal ['BEGIN', 'ROLLBACK']
+    d.discarded?.must_equal true
+  end
+
+  it "should record notification failures in the diagnostic without raising, keeping the committed state" do
+    error = RuntimeError.new('notification failed')
+    d1 = d2 = nil
+    @db.transaction do
+      d1 = @db.after_commit_coalesced(:a){raise error}
+      d2 = @db.after_commit_coalesced(:b){@db.execute('foo')}
+    end
+    @db.sqls.must_equal ['BEGIN', 'COMMIT', 'foo']
+    d1.failed?.must_equal true
+    d1.error.must_be_same_as error
+    d2.delivered?.must_equal true
+  end
+
+  it "should record notification failures in the diagnostic when dispatching outside transactions" do
+    error = RuntimeError.new('notification failed')
+    d = @db.after_commit_coalesced(:a){raise error}
+    d.failed?.must_equal true
+    d.error.must_be_same_as error
+  end
+
+  it "should raise an error if used inside a prepared transaction" do
+    @db.define_singleton_method(:supports_prepared_transactions?){true}
+    proc{@db.transaction(:prepare=>'XYZ'){@db.after_commit_coalesced(:foo){@db.execute('foo')}}}.must_raise(Sequel::Error)
+    @db.sqls.must_equal ['BEGIN', 'ROLLBACK']
+  end
+
+  it "should respect the :server option" do
+    @db.transaction(:server=>:test){@db.after_commit_coalesced(:foo, :server=>:test){@db.execute('foo', :server=>:test)}}
+    @db.sqls.must_equal ['BEGIN -- test', 'COMMIT -- test', 'foo -- test']
+  end
+
+  it "should dispatch notifications registered inside savepoints only after transaction commit" do
+    @db.transaction do
+      @db.after_commit_coalesced(:a){@db.execute('foo')}
+      @db.transaction(:savepoint=>true){@db.after_commit_coalesced(:b){@db.execute('bar')}}
+      @db.after_commit_coalesced(:c){@db.execute('baz')}
+    end
+    @db.sqls.must_equal ['BEGIN', 'SAVEPOINT autopoint_1', 'RELEASE SAVEPOINT autopoint_1', 'COMMIT', 'foo', 'bar', 'baz']
+  end
+
+  it "should discard notifications registered at a savepoint level when that savepoint is rolled back" do
+    d1 = d2 = nil
+    @db.transaction do
+      d1 = @db.after_commit_coalesced(:a, :savepoint=>true){@db.execute('foo')}
+      @db.transaction(:savepoint=>true, :rollback=>:always){d2 = @db.after_commit_coalesced(:b, :savepoint=>true){@db.execute('bar')}}
+    end
+    @db.sqls.must_equal ['BEGIN', 'SAVEPOINT autopoint_1', 'ROLLBACK TO SAVEPOINT autopoint_1', 'COMMIT', 'foo']
+    d1.delivered?.must_equal true
+    d2.discarded?.must_equal true
+  end
+
+  it "should merge notifications into the enclosing level when a savepoint is released" do
+    ds = []
+    @db.transaction do
+      ds << @db.after_commit_coalesced(:a, :savepoint=>true){@db.execute('a1')}
+      @db.transaction(:savepoint=>true) do
+        ds << @db.after_commit_coalesced(:b, :savepoint=>true){@db.execute('b1')}
+        ds << @db.after_commit_coalesced(:a, :savepoint=>true){@db.execute('a2')}
+      end
+    end
+    @db.sqls.must_equal ['BEGIN', 'SAVEPOINT autopoint_1', 'RELEASE SAVEPOINT autopoint_1', 'COMMIT', 'a2', 'b1']
+    ds[0].superseded?.must_equal true
+    ds[1].delivered?.must_equal true
+    ds[2].delivered?.must_equal true
+  end
+
+  it "should not dispatch merged notifications if the enclosing transaction rolls back after the savepoint was released" do
+    d1 = d2 = nil
+    @db.transaction do
+      @db.transaction(:savepoint=>true){d1 = @db.after_commit_coalesced(:a, :savepoint=>true){@db.execute('foo')}}
+      d2 = @db.after_commit_coalesced(:b){@db.execute('bar')}
+      raise Sequel::Rollback
+    end
+
+    @db.sqls.must_equal ['BEGIN', 'SAVEPOINT autopoint_1', 'RELEASE SAVEPOINT autopoint_1', 'ROLLBACK']
+    d1.discarded?.must_equal true
+    d2.discarded?.must_equal true
+  end
+
+  it "should not dispatch notifications registered without :savepoint inside a savepoint until transaction commit" do
+    d = nil
+    @db.transaction do
+      @db.transaction(:savepoint=>true, :rollback=>:always){d = @db.after_commit_coalesced(:a){@db.execute('foo')}}
+    end
+    @db.sqls.must_equal ['BEGIN', 'SAVEPOINT autopoint_1', 'ROLLBACK TO SAVEPOINT autopoint_1', 'COMMIT', 'foo']
+    d.delivered?.must_equal true
+  end
+end
+
 describe "Database#transaction without savepoint support" do
   before do
     @db = Sequel.mock(:servers=>{:test=>{}})

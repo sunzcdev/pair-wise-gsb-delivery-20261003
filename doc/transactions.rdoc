@@ -83,6 +83,46 @@ You can add hooks to an in progress transaction that are called after the transa
   end
   x # 2
 
+== Keyed After-Commit Notifications
+
+When the same platform resource can be modified multiple times in a single
+transaction, you often want to send only a single final notification after
+the transaction actually commits.  +after_commit_coalesced+ is a keyed,
+coalescing variant of +after_commit+ designed for this case:
+
+  DB.transaction do
+    DB.after_commit_coalesced(:user_1){notify_user(1, :created)}
+    DB.after_commit_coalesced(:user_1){notify_user(1, :updated)}
+  end
+  # Only notify_user(1, :updated) is called, once, after COMMIT
+
+Registering a new block with the same key replaces the pending (not yet
+committed) block for that key, and blocks are dispatched in the order their
+keys were first registered.  If the transaction rolls back, the registered
+blocks are discarded without being called.  With the <tt>savepoint: true</tt>
+option, a notification registered inside a savepoint is discarded if that
+savepoint is rolled back, and merged into the enclosing level (replacing a
+pending notification with the same key there) when the savepoint is released;
+if an enclosing transaction or savepoint later rolls back, the notification
+is still discarded.
+
+Because dispatch happens after the transaction has already committed, a
+failing notification block does not raise (the committed database changes
+must not be mistaken for a safely retryable transaction failure).  Instead,
++after_commit_coalesced+ returns a Sequel::NotificationDiagnostic object
+that records the outcome:
+
+  diagnostic = DB.after_commit_coalesced(:user_1){notify_user(1)}
+  # ...
+  diagnostic.delivered? # true if the block completed successfully
+  diagnostic.failed?    # true if the block raised after commit
+  diagnostic.error      # the exception the block raised, if any
+  diagnostic.superseded? # true if replaced by a newer block with the same key
+  diagnostic.discarded? # true if discarded due to rollback
+
+Sequel only orchestrates the registration and dispatch of the given blocks;
+it does not itself call any external messaging service.
+
 == Nested Transaction Calls / Savepoints
 
 You can nest calls to transaction, which by default just reuses the existing transaction:

@@ -1,6 +1,102 @@
 # frozen-string-literal: true
 
 module Sequel
+  # Diagnostic result for a keyed after-commit notification registered via
+  # Database#after_commit_coalesced.  Keyed notifications are dispatched
+  # only after the database transaction has actually committed, so a
+  # notification failure cannot and must not change the already committed
+  # state of the transaction.  Instead of raising (which would make the
+  # committed transaction look like a safely retryable failure), the
+  # dispatch records the outcome in this object, separate from the
+  # transaction result, so callers can diagnose and handle notification
+  # failures (e.g. retrying the notification) without risking retrying
+  # the already committed database changes.
+  class NotificationDiagnostic
+    # The key given to Database#after_commit_coalesced.
+    attr_reader :key
+
+    # The exception raised by the notification block, if the notification
+    # was dispatched and failed.
+    attr_reader :error
+
+    # The current status of the notification, one of:
+    #
+    # :pending :: Registered, but the transaction has not finished yet.
+    # :delivered :: The transaction committed and the notification block
+    #               completed successfully.
+    # :failed :: The transaction committed, but the notification block
+    #            raised an exception (available via #error).  The database
+    #            transaction is still committed; only the notification
+    #            failed.
+    # :superseded :: Replaced by a newer notification registered with the
+    #                same key before the transaction committed.  The block
+    #                for this diagnostic will never be called.
+    # :discarded :: The transaction (or the savepoint level the
+    #               notification was registered at) rolled back, so the
+    #               notification was discarded without being dispatched.
+    attr_reader :status
+
+    def initialize(key)
+      @key = key
+      @status = :pending
+      @error = nil
+    end
+
+    # Whether the notification is still pending dispatch.
+    def pending?
+      @status == :pending
+    end
+
+    # Whether the notification block completed successfully after commit.
+    def delivered?
+      @status == :delivered
+    end
+
+    # Whether the notification block raised an exception after commit.
+    def failed?
+      @status == :failed
+    end
+
+    # Whether the notification was replaced by a newer notification
+    # registered with the same key before commit.
+    def superseded?
+      @status == :superseded
+    end
+
+    # Whether the notification was discarded due to a rollback.
+    def discarded?
+      @status == :discarded
+    end
+
+    # Mark the notification as successfully dispatched.  For internal use only.
+    def delivered!
+      @status = :delivered
+      nil
+    end
+
+    # Mark the notification as failed with the given exception.
+    # For internal use only.
+    def failed!(error)
+      @status = :failed
+      @error = error
+      nil
+    end
+
+    # Mark the notification as replaced by a newer notification with the
+    # same key.  For internal use only.
+    def superseded!
+      @status = :superseded if @status == :pending
+      nil
+    end
+
+    # Mark the notification as discarded due to rollback.
+    # For internal use only.
+    def discarded!
+      @status = :discarded if @status == :pending
+      nil
+    end
+  end
+
   class Database
     # ---------------------
     # :section: 8 - Methods related to database transactions
@@ -43,7 +139,55 @@ module Sequel
         end
       end
     end
-    
+
+    # Keyed, coalescing variant of after_commit, designed for notifying
+    # about changes to platform resources when the same resource may be
+    # modified multiple times in a single transaction.  Registers the
+    # block under the given key, and only the final block registered for
+    # each key is called, once, after the transaction actually commits.
+    # If a transaction is not currently in progress, the block is called
+    # immediately.
+    #
+    # Registering a new block with the same key replaces the pending
+    # (not yet committed) block for that key, and blocks are dispatched
+    # in the order their keys were first registered.
+    #
+    # Returns a NotificationDiagnostic for the registered block.  Because
+    # dispatch happens after the transaction has already committed, a
+    # failing notification block does not raise (the committed database
+    # changes must not be treated as a safely retryable failure); the
+    # failure is recorded in the returned diagnostic instead.  Sequel
+    # only orchestrates registration and dispatch of the given blocks;
+    # it does not itself call any external messaging service.
+    #
+    # Options:
+    # :savepoint :: If currently inside a savepoint, only run this
+    #               notification on transaction commit if all enclosing
+    #               savepoints have been released.  If an enclosing
+    #               savepoint is rolled back, the notification registered
+    #               at that level is discarded.  When a savepoint is
+    #               released successfully, its pending notifications are
+    #               merged into the enclosing level, replacing pending
+    #               notifications with the same keys there.
+    # :server :: The server/shard to use.
+    def after_commit_coalesced(key, opts=OPTS, &block)
+      raise Error, "must provide block to after_commit_coalesced" unless block
+      diagnostic = NotificationDiagnostic.new(key)
+      synchronize(opts[:server]) do |conn|
+        if h = _trans(conn)
+          raise Error, "cannot call after_commit_coalesced in a prepared transaction" if h[:prepare]
+          if opts[:savepoint] && in_savepoint?(conn)
+            add_coalesced_notification(h[:savepoints].last, key, block, diagnostic)
+          else
+            add_coalesced_notification(h, key, block, diagnostic)
+          end
+        else
+          dispatch_coalesced_notification(block, diagnostic)
+        end
+      end
+      diagnostic
+    end
+
     # If a transaction is not currently in progress, ignore the block.
     # Otherwise, add the block to the list of the blocks to call after the currently
     # in progress transaction rolls back (and only if it rolls back).
@@ -331,6 +475,18 @@ module Sequel
       hooks << block
     end
 
+    # Register a keyed after-commit notification in the given transaction
+    # or savepoint hash.  A new notification with the same key replaces the
+    # pending (not yet committed) one, while keeping the position of the
+    # first registration for dispatch order.
+    def add_coalesced_notification(hash, key, block, diagnostic)
+      notifications = hash[:coalesced_notifications] ||= {}
+      if old = notifications[key]
+        old[1].superseded!
+      end
+      notifications[key] = [block, diagnostic]
+    end
+
     # Whether the given connection is already inside a transaction
     def already_in_transaction?(conn, opts)
       _trans(conn) && (!supports_savepoints? || !opts[:savepoint])
@@ -420,9 +576,62 @@ module Sequel
       []
     end
 
+    # Mark all keyed notifications as discarded due to a rollback of the
+    # transaction or savepoint level they were registered at.
+    def discard_coalesced_notifications(notifications)
+      notifications.each_value do |_, diagnostic|
+        diagnostic.discarded!
+      end
+      nil
+    end
+
+    # Dispatch a single keyed notification, recording the outcome in the
+    # diagnostic instead of raising.  Since dispatch happens after the
+    # database transaction has committed, raising here would incorrectly
+    # suggest the committed transaction failed and could be safely retried.
+    def dispatch_coalesced_notification(block, diagnostic)
+      begin
+        block.call
+        diagnostic.delivered!
+      rescue StandardError => e
+        diagnostic.failed!(e)
+      end
+      nil
+    end
+
+    # Dispatch all keyed notifications in first-registration order,
+    # recording any failures in each notification's diagnostic.
+    def dispatch_coalesced_notifications(notifications)
+      notifications.each_value do |block, diagnostic|
+        dispatch_coalesced_notification(block, diagnostic)
+      end
+      nil
+    end
+
     # Whether the connection is currently inside a savepoint.
     def in_savepoint?(conn)
       supports_savepoints? && savepoint_level(conn) > 1
+    end
+
+    # Merge keyed notifications from a released savepoint into the
+    # enclosing transaction or savepoint level.  Notifications from the
+    # released savepoint replace pending notifications with the same keys
+    # in the enclosing level, keeping the enclosing level's first
+    # registration positions; new keys are appended in order.
+    def merge_coalesced_notifications(conn, notifications)
+      hash = if in_savepoint?(conn)
+        _trans(conn)[:savepoints].last
+      else
+        _trans(conn)
+      end
+      target = hash[:coalesced_notifications] ||= {}
+      notifications.each do |key, entry|
+        if old = target[key]
+          old[1].superseded!
+        end
+        target[key] = entry
+      end
+      nil
     end
 
     # Retrieve the savepoint hooks that should be run for the given
@@ -430,6 +639,13 @@ module Sequel
     # already inside a savepoint when calling.
     def savepoint_hooks(conn, committed)
       _trans(conn)[:savepoints].last[committed ? :after_commit : :after_rollback]
+    end
+
+    # Retrieve the keyed after-commit notifications registered at the
+    # current savepoint level.  This expects that you are already inside
+    # a savepoint when calling.
+    def savepoint_notification_hooks(conn)
+      _trans(conn)[:savepoints].last[:coalesced_notifications]
     end
 
     # Retrieve the transaction hooks that should be run for the given
@@ -440,11 +656,21 @@ module Sequel
       end
     end
 
+    # Retrieve the keyed after-commit notifications registered at the
+    # transaction level, unless currently inside a savepoint.
+    def transaction_notification_hooks(conn)
+      unless in_savepoint?(conn)
+        _trans(conn)[:coalesced_notifications]
+      end
+    end
+
     # Remove the current thread from the list of active transactions
     def remove_transaction(conn, committed)
       callbacks = transaction_hooks(conn, committed)
+      notifications = transaction_notification_hooks(conn)
       if in_savepoint?(conn)
         savepoint_callbacks = savepoint_hooks(conn, committed)
+        savepoint_notifications = savepoint_notification_hooks(conn)
         if committed
           savepoint_rollback_callbacks = savepoint_hooks(conn, false)
         end
@@ -455,27 +681,46 @@ module Sequel
         rolled_back = !committed
         Sequel.synchronize{h[:rolled_back] = rolled_back}
         Sequel.synchronize{@transactions.delete(conn)}
-      elsif savepoint_callbacks || savepoint_rollback_callbacks
+        finished_notifications = notifications
+      elsif savepoint_callbacks || savepoint_rollback_callbacks || savepoint_notifications
         if committed
-          meth = in_savepoint?(conn) ? :add_savepoint_hook : :add_transaction_hook 
+          meth = in_savepoint?(conn) ? :add_savepoint_hook : :add_transaction_hook
 
           if savepoint_callbacks
             savepoint_callbacks.each do |block|
               send(meth, conn, :after_commit, block)
             end
           end
-          
+
           if savepoint_rollback_callbacks
             savepoint_rollback_callbacks.each do |block|
               send(meth, conn, :after_rollback, block)
             end
           end
+
+          # The savepoint was released successfully, so its keyed
+          # notifications are merged into the enclosing level.
+          merge_coalesced_notifications(conn, savepoint_notifications) if savepoint_notifications
         else
-          savepoint_callbacks.each(&:call)
+          savepoint_callbacks.each(&:call) if savepoint_callbacks
+          # The savepoint was rolled back, so keyed notifications
+          # registered at this level are discarded without dispatch.
+          discard_coalesced_notifications(savepoint_notifications) if savepoint_notifications
         end
       end
 
       callbacks.each(&:call) if callbacks
+
+      # Keyed notifications are only dispatched once the outermost
+      # transaction has actually committed.  If it rolled back, they are
+      # discarded without dispatch.
+      if finished_notifications
+        if committed
+          dispatch_coalesced_notifications(finished_notifications)
+        else
+          discard_coalesced_notifications(finished_notifications)
+        end
+      end
     end
 
     # SQL to rollback to a savepoint
