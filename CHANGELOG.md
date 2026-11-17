@@ -1,5 +1,18 @@
 ## Current
 
+concurrent-ruby:
+
+* `Concurrent::Async` gains an optional pre-submission signature check. Calling
+  `object.async(validate: true).method(...)` or `object.await(validate:
+  true).method(...)` validates the arguments against the target method's public
+  signature *before* the call enters the execution queue, raising
+  `Concurrent::Async::SignatureError` synchronously on a mismatch. Keyword
+  arguments, positional hashes, splats and blocks are interpreted according to
+  the real signature, private methods stay private, and dynamic
+  (`method_missing`) methods are reported as unknown rather than guessed. The
+  target method is never invoked by the check, so a valid call whose method
+  raises internally remains a rejected future. Default behavior is unchanged.
+
 ## Release v1.3.8 (19 July 2026)
 
 concurrent-ruby:

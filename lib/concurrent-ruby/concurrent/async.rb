@@ -216,6 +216,17 @@ module Concurrent
   # @see http://c2.com/cgi/wiki?LetItCrash "Let It Crash" at http://c2.com/
   module Async
 
+    # Raised by the optional pre-submission signature check when a delegated
+    # call cannot possibly be accepted by the target method's public
+    # signature. It is raised synchronously, *before* the call enters the
+    # execution queue, so it never takes the place of an execution failure.
+    #
+    # A call whose signature is valid but whose method raises while running is
+    # still reported through the returned {Concurrent::IVar} as a rejected
+    # future, never as this error.
+    class SignatureError < ArgumentError
+    end
+
     # @!method self.new(*args, &block)
     #
     #   Instantiate a new object and ensure proper initialization of the
@@ -258,6 +269,184 @@ module Concurrent
       end
     end
 
+    # Validates a delegated call against the *public* method signature of the
+    # target object without ever invoking the target method. Only the method's
+    # introspection information ({Method#parameters}) is consulted.
+    #
+    # The check interprets Ruby keyword arguments, positional hashes, variable
+    # arguments (`*args`/`**opts`) and blocks exactly as the target method's
+    # real signature does, mirroring the argument binding performed by the
+    # Ruby VM. Because the method itself is never run, a validly-shaped call
+    # whose method raises internally remains an ordinary execution failure
+    # reported through the future protocol rather than a submission rejection.
+    #
+    # @!visibility private
+    class SignatureChecker
+      # Outcome returned when the call is statically known to match the
+      # target method signature.
+      ACCEPTED = :accepted
+      # Outcome returned when the call is statically known not to match the
+      # target method signature.
+      REJECTED = :rejected
+      # Outcome returned when no reliable static signature exists, e.g. a
+      # method simulated with `method_missing`. Such calls are allowed into
+      # the queue and left to the method itself.
+      UNKNOWN = :unknown
+
+      # Validate a delegated call and raise {SignatureError} when it is
+      # statically rejected. Calls marked {UNKNOWN} are deliberately allowed
+      # through to the execution queue.
+      #
+      # @param [Object] receiver the object the call would be sent to
+      # @param [Symbol] method_name the name of the method being called
+      # @param [Array] positional the positional arguments of the call
+      # @param [Hash] keyword_arguments the keyword arguments of the call
+      # @param [Boolean] block_given whether a block was supplied
+      #
+      # @raise [SignatureError] when the call is statically rejected
+      # @return [Symbol] {ACCEPTED} or {UNKNOWN}
+      def self.validate!(receiver, method_name, positional, keyword_arguments, block_given)
+        outcome, reason = check(receiver, method_name, positional, keyword_arguments, block_given)
+        raise SignatureError.new(reason) if outcome == REJECTED
+        outcome
+      end
+
+      # @return [Array(Symbol, String)] a tuple of the outcome and a human
+      #   readable reason (empty when not rejected)
+      def self.check(receiver, method_name, positional, keyword_arguments, block_given)
+        unless receiver.respond_to?(method_name, false)
+          return [REJECTED,
+                  "undefined method `#{method_name}' for #{inspect_receiver(receiver)}"]
+        end
+
+        method_object = resolve_public_method(receiver, method_name)
+        if method_object.nil? || dynamic_method?(method_name, method_object)
+          # `respond_to?` succeeded but no concrete public method exists: the
+          # method is simulated dynamically (e.g. method_missing). Its
+          # signature cannot be inferred reliably.
+          return [UNKNOWN, '']
+        end
+
+        reason = mismatch_reason(method_object, positional, keyword_arguments, block_given)
+        reason ? [REJECTED, reason] : [ACCEPTED, '']
+      end
+
+      def self.resolve_public_method(receiver, method_name)
+        # `public_method` only resolves callable public methods. A private or
+        # protected method (which `respond_to?` already hides) raises
+        # NameError; a purely dynamic `method_missing` target may return a
+        # synthesized Method and is handled separately by `dynamic_method?`.
+        receiver.public_method(method_name)
+      rescue NameError
+        nil
+      end
+      private_class_method :resolve_public_method
+
+      # A method is dynamic when its resolved Method object is not backed by a
+      # concrete method definition. Ruby synthesizes such objects for
+      # `method_missing` handlers; their reported parameters only describe the
+      # handler (typically `[[:rest]]`), never the simulated method, so they
+      # cannot be validated reliably and are reported as unknown.
+      def self.dynamic_method?(method_name, method_object)
+        owner = method_object.owner
+        return true unless owner.respond_to?(:method_defined?)
+        !owner.method_defined?(method_name) &&
+          !owner.private_method_defined?(method_name) &&
+          !owner.protected_method_defined?(method_name)
+      end
+      private_class_method :dynamic_method?
+
+      def self.mismatch_reason(method_object, positional, keyword_arguments, block_given)
+        minimum = 0
+        maximum = 0
+        has_rest = false
+        has_keyrest = false
+        has_any_keyword_parameter = false
+        required_keywords = []
+        allowed_keywords = []
+
+        method_object.parameters.each do |kind, name|
+          case kind
+          when :req
+            minimum += 1
+            maximum += 1
+          when :opt
+            maximum += 1
+          when :rest
+            has_rest = true
+          when :keyreq
+            has_any_keyword_parameter = true
+            required_keywords << name
+            allowed_keywords << name
+          when :key
+            has_any_keyword_parameter = true
+            allowed_keywords << name
+          when :keyrest
+            has_any_keyword_parameter = true
+            has_keyrest = true
+          when :block
+            # Recorded for completeness. A block is never statically rejected:
+            # Ruby silently accepts a block for any method and simply ignores
+            # it when there is no block parameter, while a method that calls
+            # `yield` without a block can only be detected by running it, which
+            # the pre-submission check must never do. Such a failure therefore
+            # remains an execution failure reported through the future.
+          end
+        end
+
+        # When the method declares no keyword parameters at all, Ruby converts
+        # a trailing keyword argument list into a positional Hash (or folds it
+        # into a `*rest` splat), so the keywords occupy one positional slot.
+        effective_positional = positional
+        if !has_any_keyword_parameter && !keyword_arguments.empty?
+          effective_positional = positional + [keyword_arguments]
+        end
+
+        argc = effective_positional.length
+        # A splat (`*rest`) relaxes only the upper bound: extra positional
+        # arguments are absorbed. Required and optional parameters still
+        # impose a minimum count.
+        if argc < minimum || (!has_rest && argc > maximum)
+          return "wrong number of positional arguments (given #{argc}, expected #{arity_description(minimum, maximum, has_rest)})"
+        end
+
+        if has_any_keyword_parameter
+          missing = required_keywords.reject { |key| keyword_arguments.key?(key) }
+          unless missing.empty?
+            return "missing keyword#{'s' if missing.length > 1}: #{missing.map { |key| ":#{key}" }.join(', ')}"
+          end
+
+          unless has_keyrest
+            unknown = keyword_arguments.keys - allowed_keywords
+            unless unknown.empty?
+              return "unknown keyword#{'s' if unknown.length > 1}: #{unknown.map { |key| ":#{key}" }.join(', ')}"
+            end
+          end
+        end
+
+        nil
+      end
+      private_class_method :mismatch_reason
+
+      def self.arity_description(minimum, maximum, has_rest)
+        if has_rest
+          "#{minimum}..*"
+        elsif minimum == maximum
+          minimum.to_s
+        else
+          "#{minimum}..#{maximum}"
+        end
+      end
+      private_class_method :arity_description
+
+      def self.inspect_receiver(receiver)
+        receiver.class.name || receiver.class.inspect
+      rescue StandardError
+        receiver.class.inspect
+      end
+      private_class_method :inspect_receiver
+    end
+
     # @!visibility private
     def self.included(base)
       base.singleton_class.send(:alias_method, :original_new, :new)
@@ -285,34 +474,73 @@ module Concurrent
       # Create a new delegator object wrapping the given delegate.
       #
       # @param [Object] delegate the object to wrap and delegate method calls to
-      def initialize(delegate)
+      # @param [Boolean] validate_signature when true, every delegated call is
+      #   checked against the target method's public signature before it enters
+      #   the execution queue
+      # @param [AsyncDelegator, nil] shared when given, the new delegator
+      #   reuses this delegator's lock and execution queue so that calls made
+      #   through either delegator are serialized in a single order.
+      def initialize(delegate, validate_signature = false, shared = nil)
         super()
         @delegate = delegate
-        @queue = []
-        @executor = Concurrent.global_io_executor
-        @ruby_pid = $$
+        @validate_signature = validate_signature
+        if shared
+          @shared = shared
+        else
+          @shared = nil
+          @queue = []
+          @executor = Concurrent.global_io_executor
+          @ruby_pid = $$
+        end
+      end
+
+      # Whether calls are checked against the target method's public
+      # signature before being enqueued.
+      def validate_signature?
+        @validate_signature
+      end
+
+      # Statically classify a prospective call without enqueuing or running
+      # anything. The target method is never invoked.
+      #
+      # @return [Symbol] one of {SignatureChecker::ACCEPTED},
+      #   {SignatureChecker::REJECTED} or {SignatureChecker::UNKNOWN}
+      def signature_status(method, *args, **kwargs, &block)
+        SignatureChecker.check(@delegate, method, args, kwargs, !block.nil?).first
       end
 
       # Delegates method calls to the wrapped object.
       #
       # @param [Symbol] method the method being called
-      # @param [Array] args zero or more arguments to the method
+      # @param [Array] args zero or more positional arguments to the method
+      # @param [Hash] kwargs zero or more keyword arguments to the method
       #
       # @return [IVar] the result of the method call
       #
       # @raise [NameError] the object does not respond to `method` method
-      # @raise [ArgumentError] the given `args` do not match the arity of `method`
-      def method_missing(method, *args, &block)
-        super unless @delegate.respond_to?(method)
-        Async::validate_argc(@delegate, method, *args)
-
-        ivar = Concurrent::IVar.new
-        synchronize do
-          reset_if_forked
-          @queue.push [ivar, method, args, block]
-          @executor.post { perform } if @queue.length == 1
+      # @raise [ArgumentError] the given arguments do not match the arity of
+      #   `method` (legacy arity check)
+      # @raise [SignatureError] when signature validation is enabled and the
+      #   call cannot match the target method's public signature
+      def method_missing(method, *args, **kwargs, &block)
+        if @validate_signature
+          # The check only introspects the method signature; it never invokes
+          # the business method, so a method that raises internally still
+          # surfaces as a rejected future rather than a submission rejection.
+          # It also rejects private/protected methods and missing methods with
+          # a single, explicit pre-submission error.
+          SignatureChecker.validate!(@delegate, method, args, kwargs, !block.nil?)
+        else
+          super unless @delegate.respond_to?(method)
+          # Preserve the legacy arity check, which historically saw keyword
+          # arguments folded into the positional argument list because the
+          # proxy forwarded a single `*args` splat.
+          legacy_args = kwargs.empty? ? args : args + [kwargs]
+          Async::validate_argc(@delegate, method, *legacy_args)
         end
 
+        ivar = Concurrent::IVar.new
+        enqueue(ivar, method, args, kwargs, block)
         ivar
       end
 
@@ -329,11 +557,11 @@ module Concurrent
       # called while already running. It will loop until the queue is empty.
       def perform
         loop do
-          ivar, method, args, block = synchronize { @queue.first }
+          ivar, method, args, kwargs, block = synchronize { @queue.first }
           break unless ivar # queue is empty
 
           begin
-            ivar.set(@delegate.send(method, *args, &block))
+            ivar.set(@delegate.send(method, *args, **kwargs, &block))
           rescue => error
             ivar.fail(error)
           end
@@ -351,6 +579,35 @@ module Concurrent
           @ruby_pid = $$
         end
       end
+
+      # Push a call into the shared, serialized execution queue.
+      #
+      # @!visibility private
+      def enqueue_shared(ivar, method, args, kwargs, block)
+        synchronize do
+          reset_if_forked
+          @queue.push [ivar, method, args, kwargs, block]
+          @executor.post { perform } if @queue.length == 1
+        end
+      end
+
+      protected
+
+      # A shared delegator takes the owning delegator's lock so all calls keep
+      # a single serialized execution order.
+      def synchronize(&block)
+        @shared ? @shared.synchronize(&block) : super
+      end
+
+      private
+
+      def enqueue(ivar, method, args, kwargs, block)
+        if @shared
+          @shared.enqueue_shared(ivar, method, args, kwargs, block)
+        else
+          enqueue_shared(ivar, method, args, kwargs, block)
+        end
+      end
     end
     private_constant :AsyncDelegator
 
@@ -366,19 +623,34 @@ module Concurrent
         @delegate = delegate
       end
 
-      # Delegates method calls to the wrapped object.
+      # Delegates method calls to the wrapped object. The same pre-submission
+      # check rules as {AsyncDelegator} apply because the call is routed
+      # through it; nothing is checked a second time with different rules.
       #
       # @param [Symbol] method the method being called
-      # @param [Array] args zero or more arguments to the method
+      # @param [Array] args zero or more positional arguments to the method
+      # @param [Hash] kwargs zero or more keyword arguments to the method
       #
       # @return [IVar] the result of the method call
       #
       # @raise [NameError] the object does not respond to `method` method
-      # @raise [ArgumentError] the given `args` do not match the arity of `method`
-      def method_missing(method, *args, &block)
-        ivar = @delegate.send(method, *args, &block)
+      # @raise [ArgumentError] the given arguments do not match the arity of
+      #   `method` (legacy arity check)
+      # @raise [SignatureError] when signature validation is enabled and the
+      #   call cannot match the target method's public signature
+      def method_missing(method, *args, **kwargs, &block)
+        ivar = @delegate.send(method, *args, **kwargs, &block)
         ivar.wait
         ivar
+      end
+
+      # Statically classify a prospective call using the same rules as the
+      # asynchronous proxy, without enqueuing or running anything.
+      #
+      # @return [Symbol] one of {SignatureChecker::ACCEPTED},
+      #   {SignatureChecker::REJECTED} or {SignatureChecker::UNKNOWN}
+      def signature_status(method, *args, **kwargs, &block)
+        @delegate.signature_status(method, *args, **kwargs, &block)
       end
 
       # Check whether the method is responsive
@@ -404,13 +676,29 @@ module Concurrent
     #     guarantees. Do NOT mix direct method calls with delegated method calls.
     #     Use *only* delegated method calls when sharing the object between threads.
     #
+    # @param [Boolean] validate when true, the chained call is checked against
+    #   the target method's public signature *before* it enters the execution
+    #   queue. A call that cannot match the signature raises
+    #   {Concurrent::Async::SignatureError} synchronously and is never enqueued.
+    #   Keyword arguments, positional hashes, variable arguments and blocks
+    #   are interpreted according to the real signature; private methods stay
+    #   private and dynamic (`method_missing`) methods are reported as unknown
+    #   rather than guessed. A valid call whose method raises while running is
+    #   still reported as a rejected future, not a submission rejection.
+    #
     # @return [Concurrent::IVar] the pending result of the asynchronous operation
     #
     # @raise [NameError] the object does not respond to the requested method
     # @raise [ArgumentError] the given `args` do not match the arity of
     #   the requested method
-    def async
-      @__async_delegator__
+    # @raise [SignatureError] when `validate: true` is given and the call
+    #   cannot match the requested method's public signature
+    def async(validate: false)
+      if validate
+        AsyncDelegator.new(self, true, @__async_delegator__)
+      else
+        @__async_delegator__
+      end
     end
     alias_method :cast, :async
 
@@ -422,13 +710,25 @@ module Concurrent
     #
     # @!macro async_thread_safety_warning
     #
+    # @param [Boolean] validate when true, the chained call is checked against
+    #   the target method's public signature before it enters the execution
+    #   queue. See {#async} for the exact check semantics; the synchronous and
+    #   asynchronous proxies share the same rules.
+    #
     # @return [Concurrent::IVar] the completed result of the synchronous operation
     #
     # @raise [NameError] the object does not respond to the requested method
     # @raise [ArgumentError] the given `args` do not match the arity of the
     #   requested method
-    def await
-      @__await_delegator__
+    # @raise [SignatureError] when `validate: true` is given and the call
+    #   cannot match the requested method's public signature
+    def await(validate: false)
+      if validate
+        validated = AsyncDelegator.new(self, true, @__async_delegator__)
+        AwaitDelegator.new(validated)
+      else
+        @__await_delegator__
+      end
     end
     alias_method :call, :await
 
