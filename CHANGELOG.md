@@ -15,6 +15,13 @@ You can find our backwards-compatibility policy [here](https://github.com/hynek/
 
 ## [Unreleased](https://github.com/hynek/structlog/compare/26.1.0...HEAD)
 
+### Added
+
+- `structlog.publish_config()` validates and publishes a whole configuration -- processors, wrapper class, context class, and logger factory -- as one atomic generation.
+  If validation fails, the previous configuration stays in effect.
+  Lazy loggers always assemble themselves from exactly one generation, so a hot reload can never leave them with a chain that mixes old and new components.
+  Whether already-materialized (cached) loggers keep their old generation or re-assemble themselves from the new one is controlled by the new `structlog.MaterializedLoggerPolicy` enum that is passed as `materialized_loggers`.
+
 ### Changed
 
 - On Python 3.15 and later, *structlog* uses [PEP 810](https://peps.python.org/pep-0810/) lazy imports for modules that are only needed once you log.

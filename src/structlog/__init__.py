@@ -31,12 +31,14 @@ from structlog import (
 )
 from structlog._base import BoundLoggerBase, get_context
 from structlog._config import (
+    MaterializedLoggerPolicy,
     configure,
     configure_once,
     get_config,
     get_logger,
     getLogger,
     is_configured,
+    publish_config,
     reset_defaults,
     wrap_logger,
 )
@@ -74,6 +76,7 @@ __all__ = [
     "BytesLogger",
     "BytesLoggerFactory",
     "DropEvent",
+    "MaterializedLoggerPolicy",
     "PrintLogger",
     "PrintLoggerFactory",
     "ReturnLogger",
@@ -91,6 +94,7 @@ __all__ = [
     "is_configured",
     "make_filtering_bound_logger",
     "processors",
+    "publish_config",
     "reset_defaults",
     "stdlib",
     "testing",

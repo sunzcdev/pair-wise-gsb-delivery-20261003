@@ -105,3 +105,23 @@ We don't believe silent loggers are a sensible default.
 
 You will meet {doc}`processors` in the next chapter.
 They are configured using the `processors` keyword that takes an {class}`~collections.abc.Iterable` of callables that act as processors.
+
+
+## Hot reloading
+
+If you need to swap the configuration of a *running* application, use {func}`structlog.publish_config`.
+It validates the new configuration first -- if validation fails, the previous configuration stays in effect -- and then publishes *processors*, *wrapper class*, *context class*, and *logger factory* as **one atomic generation**.
+
+Lazy loggers (like those returned by {func}`structlog.get_logger`) always assemble themselves from exactly one generation, so they never end up with a chain that mixes components from the old and the new configuration -- even if another thread publishes a new configuration at the same time.
+
+Loggers that have already been materialized (for example, because `cache_logger_on_first_use` is active) keep their generation by default.
+Pass `materialized_loggers=structlog.MaterializedLoggerPolicy.REFRESH` to make them lazily re-assemble themselves from the new generation on their next use:
+
+```pycon
+>>> gen = structlog.publish_config(
+...     processors=[structlog.processors.JSONRenderer()],
+...     materialized_loggers=structlog.MaterializedLoggerPolicy.REFRESH,
+... )
+```
+
+The return value is the id of the published generation; ids are monotonically increasing.

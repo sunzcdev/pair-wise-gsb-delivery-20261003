@@ -5,6 +5,7 @@
 
 import abc
 import pickle
+import threading
 import warnings
 
 from unittest.mock import call
@@ -21,11 +22,14 @@ from structlog._config import (
     _BUILTIN_DEFAULT_WRAPPER_CLASS,
     _CONFIG,
     BoundLoggerLazyProxy,
+    MaterializedLoggerPolicy,
     configure,
     configure_once,
     get_logger,
+    publish_config,
     wrap_logger,
 )
+from structlog.testing import ReturnLogger
 from structlog.typing import BindableLogger
 
 from .helpers import call_recorder, stub
@@ -466,3 +470,301 @@ class TestFunctions:
         get_logger("test").bind(x=42)
 
         assert [call("test")] == factory.call_args_list
+
+
+class OtherWrapper(BoundLoggerBase):
+    """
+    Another custom wrapper class for testing.
+    """
+
+
+class TestPublishConfig:
+    def test_publishes_whole_config_atomically(self, proxy):
+        """
+        processors, wrapper_class, context_class, and logger_factory switch
+        together: a lazy proxy materializes a chain that consistently
+        belongs to the published generation.
+        """
+        x = stub()
+        publish_config(
+            processors=[x],
+            wrapper_class=Wrapper,
+            context_class=dict,
+            logger_factory=lambda: "wrapped",
+            cache_logger_on_first_use=True,
+        )
+
+        b = proxy.bind()
+
+        assert [x] == b._processors
+        assert isinstance(b, Wrapper)
+        assert "wrapped" is b._logger
+        assert dict is b._context.__class__
+
+    def test_returns_monotonically_increasing_generations(self):
+        """
+        Each publish returns a generation id higher than the previous one.
+        """
+        gen1 = publish_config(processors=[stub()])
+        gen2 = publish_config(processors=[stub()])
+
+        assert isinstance(gen1, int)
+        assert gen2 > gen1
+
+    def test_sets_is_configured(self):
+        """
+        publish_config marks structlog as configured.
+        """
+        assert False is structlog.is_configured()
+
+        publish_config(processors=[stub()])
+
+        assert True is structlog.is_configured()
+
+    def test_get_config_reflects_published_config(self):
+        """
+        get_config returns the published values.
+        """
+        x = stub()
+        publish_config(processors=[x], wrapper_class=Wrapper)
+
+        config = structlog.get_config()
+
+        assert [x] == config["processors"]
+        assert Wrapper is config["wrapper_class"]
+
+    @pytest.mark.parametrize(
+        "kwargs",
+        [
+            {"processors": "not-an-iterable-of-callables"},
+            {"processors": [stub(), 42]},
+            {"wrapper_class": 42},
+            {"context_class": 42},
+            {"logger_factory": 42},
+            {"cache_logger_on_first_use": "yes"},
+        ],
+    )
+    def test_validation_failure_keeps_old_config(self, kwargs):
+        """
+        If validation fails, the previous configuration stays fully in
+        effect and the error is raised.
+        """
+        x = stub()
+        configure(processors=[x], wrapper_class=Wrapper)
+        before = structlog.get_config()
+
+        with pytest.raises(TypeError):
+            publish_config(**kwargs)
+
+        assert before == structlog.get_config()
+
+    def test_invalid_materialized_loggers_keeps_old_config(self):
+        """
+        An invalid materialized_loggers policy raises and keeps the old
+        configuration.
+        """
+        configure(processors=[stub()])
+        before = structlog.get_config()
+
+        with pytest.raises(ValueError, match="bogus"):
+            publish_config(
+                processors=[stub()], materialized_loggers="bogus"
+            )
+
+        assert before == structlog.get_config()
+
+    def test_caller_processor_list_is_not_modified(self):
+        """
+        The processor list passed by the caller is never modified -- not by
+        publishing, not by disabling the cache, and not by refreshing
+        materialized loggers.
+        """
+        procs = [stub(), stub()]
+        original = procs[:]
+
+        publish_config(
+            processors=procs,
+            cache_logger_on_first_use=True,
+            materialized_loggers=MaterializedLoggerPolicy.REFRESH,
+        )
+        proxy = BoundLoggerLazyProxy(None)
+        proxy.bind()
+
+        # Force a refresh of the materialized logger.
+        publish_config(
+            processors=[stub()],
+            cache_logger_on_first_use=False,
+            materialized_loggers=MaterializedLoggerPolicy.REFRESH,
+        )
+        proxy.bind()
+
+        assert original == procs
+
+    def test_published_generation_is_immune_to_caller_mutation(self):
+        """
+        Mutating the caller's list after publish_config does not leak into
+        the published generation.
+        """
+        x = stub()
+        procs = [x]
+        publish_config(processors=procs)
+
+        procs.clear()
+
+        assert [x] == BoundLoggerLazyProxy(None).bind()._processors
+
+    def test_materialized_loggers_keep_old_generation_by_default(self):
+        """
+        Already-materialized (cached) loggers keep serving the generation
+        they were built from unless told otherwise.
+        """
+        configure(cache_logger_on_first_use=True)
+        proxy = BoundLoggerLazyProxy(None)
+        b1 = proxy.bind()
+
+        publish_config(processors=[stub()], wrapper_class=Wrapper)
+        b2 = proxy.bind()
+
+        assert b1 is b2
+        assert not isinstance(b2, Wrapper)
+
+    @pytest.mark.parametrize(
+        "policy", [MaterializedLoggerPolicy.REFRESH, "refresh"]
+    )
+    def test_materialized_loggers_refresh_if_policy_says_so(self, policy):
+        """
+        If the published generation carries the REFRESH policy, cached
+        loggers re-assemble themselves from the new generation on next use.
+        """
+        configure(cache_logger_on_first_use=True)
+        proxy = BoundLoggerLazyProxy(None)
+        b1 = proxy.bind()
+
+        x = stub()
+        publish_config(
+            processors=[x], wrapper_class=Wrapper, materialized_loggers=policy
+        )
+        b2 = proxy.bind()
+
+        assert b1 is not b2
+        assert isinstance(b2, Wrapper)
+        assert [x] == b2._processors
+
+        # The refreshed logger is cached again.
+        assert b2 is proxy.bind()
+
+    def test_refresh_keeps_explicit_proxy_arguments(self):
+        """
+        A refreshed proxy still prefers its explicit arguments over the
+        published configuration.
+        """
+        y = stub()
+        proxy = BoundLoggerLazyProxy(
+            None, processors=[y], cache_logger_on_first_use=True
+        )
+        proxy.bind()
+
+        publish_config(
+            processors=[stub()],
+            materialized_loggers=MaterializedLoggerPolicy.REFRESH,
+        )
+        b = proxy.bind()
+
+        assert [y] == b._processors
+
+    def test_lazy_proxy_binds_complete_generation(self):
+        """
+        A lazy proxy that materializes after a publish uses only components
+        of the new generation -- never a mix with the previous one.
+        """
+        old = stub()
+        configure(processors=[old], wrapper_class=OtherWrapper)
+        proxy = BoundLoggerLazyProxy(None)
+
+        new = stub()
+        publish_config(processors=[new], wrapper_class=Wrapper)
+        b = proxy.bind()
+
+        assert [new] == b._processors
+        assert isinstance(b, Wrapper)
+
+    def test_concurrent_first_bind_never_mixes_generations(self):
+        """
+        Two threads materializing lazy loggers for the first time while
+        another thread publishes configurations never end up with a chain
+        that mixes components from different generations.
+        """
+        p_old, p_new = stub(), stub()
+        configure(processors=[p_old], wrapper_class=OtherWrapper)
+
+        barrier = threading.Barrier(3)
+        results = []
+        errors = []
+
+        def materialize():
+            try:
+                barrier.wait()
+                for _ in range(200):
+                    results.append(BoundLoggerLazyProxy(None).bind())
+            except Exception as e:  # noqa: BLE001
+                errors.append(e)
+
+        threads = [threading.Thread(target=materialize) for _ in range(2)]
+        for t in threads:
+            t.start()
+
+        barrier.wait()
+        for _ in range(200):
+            publish_config(processors=[p_new], wrapper_class=Wrapper)
+            publish_config(processors=[p_old], wrapper_class=OtherWrapper)
+
+        for t in threads:
+            t.join()
+
+        assert not errors
+        assert results
+
+        for b in results:
+            if isinstance(b, Wrapper):
+                assert [p_new] == b._processors
+            else:
+                assert isinstance(b, OtherWrapper)
+                assert [p_old] == b._processors
+
+    def test_concurrent_cached_first_bind_never_mixes_generations(self):
+        """
+        Two threads racing the *first* cached bind of the same lazy proxy
+        both end up with a complete chain from exactly one generation.
+        """
+        p_old, p_new = stub(), stub()
+        configure(
+            processors=[p_old],
+            wrapper_class=OtherWrapper,
+            cache_logger_on_first_use=True,
+        )
+        proxy = BoundLoggerLazyProxy(None)
+
+        barrier = threading.Barrier(2)
+        results = []
+
+        def first_bind():
+            barrier.wait()
+            results.append(proxy.bind())
+
+        t1 = threading.Thread(target=first_bind)
+        t2 = threading.Thread(target=first_bind)
+
+        t1.start()
+        publish_config(processors=[p_new], wrapper_class=Wrapper)
+        t2.start()
+
+        t1.join()
+        t2.join()
+
+        assert 2 == len(results)
+        for b in results:
+            if isinstance(b, Wrapper):
+                assert [p_new] == b._processors
+            else:
+                assert isinstance(b, OtherWrapper)
+                assert [p_old] == b._processors

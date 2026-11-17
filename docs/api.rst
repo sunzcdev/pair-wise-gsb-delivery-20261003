@@ -36,6 +36,11 @@ API Reference
 
 .. autofunction:: configure_once
 
+.. autofunction:: publish_config
+
+.. autoclass:: MaterializedLoggerPolicy
+   :members:
+
 .. autofunction:: reset_defaults
 
 .. autofunction:: is_configured
