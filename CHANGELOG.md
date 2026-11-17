@@ -10,6 +10,7 @@ All notable changes to this project will be documented in this file. For info on
 
 ### Added
 
+- Add `Rack::Builder#to_plan`, returning an explicit, reviewable build plan (`Rack::Builder::Plan`) that preserves the middleware/map hierarchy, component identity and initialization arguments without calling the application. Plans can be materialized repeatedly via `Rack::Builder::Plan#to_app` (each call builds a fully fresh stack, so a new instance can be prepared and warmed up before being published); on build/warmup failure, resources created by the failed build are closed and the error re-raised, leaving any previously built application usable. Components containing arbitrary Ruby code are marked as opaque (`Rack::Builder::Plan#opaque?`, `#to_h`).
 - Add `Rack::Files#assign_headers` to allow overriding how the configured file headers are set. ([#2377](https://github.com/rack/rack/pull/2377), [@codergeek121](https://github.com/codergeek121))
 - Add support for `rack.response_finished` to `Rack::TempfileReaper`. ([#2363](https://github.com/rack/rack/pull/2363), [@skipkayhil](https://github.com/skipkayhil))
 - Add support for streaming bodies when using `Rack::Events`. ([#2375](github.com/rack/rack/pull/2375), [@unflxw](https://github.com/unflxw))

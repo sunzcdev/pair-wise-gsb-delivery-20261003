@@ -278,6 +278,218 @@ describe Rack::Builder do
     end.must_raise(RuntimeError)
   end
 
+  describe "to_plan" do
+    it "captures middleware identity, arguments and map hierarchy without instantiating anything" do
+      middleware = Class.new do
+        def initialize(app, *); raise "must not be instantiated"; end
+      end
+
+      endpoint = lambda { |env| [200, { "content-type" => "text/plain" }, ["OK"]] }
+      builder = Rack::Builder.new do
+        use Rack::ContentLength
+        use middleware, 1, 2, key: :value
+        map '/sub' do
+          use Rack::ContentLength
+          run lambda { |env| [200, { "content-type" => "text/plain" }, ['sub']] }
+        end
+        run endpoint
+      end
+
+      plan = builder.to_plan
+      plan.must_be_kind_of Rack::Builder::Plan
+      plan.run.must_equal endpoint
+
+      layers = plan.layers
+      layers.size.must_equal 3
+
+      layers[0].must_be_kind_of Rack::Builder::Plan::Map
+      layers[0].mapping.keys.must_equal ['/sub']
+      nested = layers[0].mapping['/sub']
+      nested.must_be_kind_of Rack::Builder::Plan
+      nested.layers.size.must_equal 1
+      nested.layers[0].middleware.must_equal Rack::ContentLength
+
+      layers[1].must_be_kind_of Rack::Builder::Plan::Use
+      layers[1].middleware.must_equal middleware
+      layers[1].arguments.must_equal [1, 2]
+      layers[1].keywords.must_equal({ key: :value })
+
+      layers[2].middleware.must_equal Rack::ContentLength
+    end
+
+    it "provides a reviewable nested hash via #to_h" do
+      builder = Rack::Builder.new(foo: :bar) do
+        use Rack::ContentLength, 5
+        map('/sub') { run lambda { |env| [200, {}, []] } }
+        run Object.new
+      end
+
+      plan = builder.to_plan
+      review = plan.to_h
+
+      review[:freeze_app].must_equal false
+      review[:options].must_equal({ foo: :bar })
+      review[:warmup].must_be_nil
+      review[:layers][0][:type].must_equal :map
+      review[:layers][0][:mapping]['/sub'][:run].must_equal :opaque
+      review[:layers][1][:type].must_equal :use
+      review[:layers][1][:middleware].must_equal Rack::ContentLength
+      review[:layers][1][:arguments].must_equal [5]
+      review[:layers][1][:block].must_be_nil
+    end
+
+    it "marks arbitrary Ruby code as opaque" do
+      static = Rack::Builder.new do
+        use Rack::ContentLength
+        run Object.new
+      end.to_plan
+      static.opaque?.must_equal false
+      static.reviewable?.must_equal true
+
+      with_run_block = Rack::Builder.new do
+        run lambda { |env| [200, {}, []] }
+      end.to_plan
+      with_run_block.opaque?.must_equal true
+
+      with_use_block = Rack::Builder.new do
+        use(Rack::Auth::Basic) { |user, pass| true }
+        run Object.new
+      end.to_plan
+      with_use_block.opaque?.must_equal true
+      with_use_block.to_h[:layers][0][:block].must_equal :opaque
+
+      with_warmup = Rack::Builder.new do
+        warmup { |app| }
+        run Object.new
+      end.to_plan
+      with_warmup.opaque?.must_equal true
+      with_warmup.to_h[:warmup].must_equal :opaque
+
+      with_nested_opaque = Rack::Builder.new do
+        map('/sub') { run lambda { |env| [200, {}, []] } }
+        run Object.new
+      end.to_plan
+      with_nested_opaque.opaque?.must_equal true
+    end
+
+    it "builds a working application from the plan" do
+      plan = Rack::Builder.new do
+        use Rack::ContentLength
+        map '/sub' do
+          run lambda { |env| [200, { "content-type" => "text/plain" }, ['sub']] }
+        end
+        run lambda { |env| [200, { "content-type" => "text/plain" }, ['root']] }
+      end.to_plan
+
+      app = Rack::Lint.new(plan.to_app)
+      Rack::MockRequest.new(app).get("/").body.to_s.must_equal 'root'
+      Rack::MockRequest.new(app).get("/sub").body.to_s.must_equal 'sub'
+    end
+
+    it "builds completely fresh instances on each #to_app" do
+      instances = []
+      middleware = Class.new do
+        define_method(:initialize) do |app|
+          instances << self
+          @app = app
+        end
+        define_method(:call) { |env| @app.call(env) }
+      end
+
+      plan = Rack::Builder.new do
+        use middleware
+        run lambda { |env| [200, { "content-type" => "text/plain" }, ['OK']] }
+      end.to_plan
+
+      plan.to_app
+      plan.to_app
+      instances.size.must_equal 2
+      instances[0].wont_equal instances[1]
+    end
+
+    it "keeps the old application usable and closes owned resources when warmup fails" do
+      closed = []
+      middleware = Class.new do
+        define_method(:initialize) { |app| @app = app }
+        define_method(:call) { |env| @app.call(env) }
+        define_method(:close) { closed << self }
+      end
+
+      should_fail = false
+      plan = Rack::Builder.new do
+        use middleware
+        warmup { |app| raise "warmup failed" if should_fail }
+        run lambda { |env| [200, { "content-type" => "text/plain" }, ['OK']] }
+      end.to_plan
+
+      old_app = plan.to_app
+
+      should_fail = true
+      error = proc { plan.to_app }.must_raise(RuntimeError)
+      error.message.must_equal "warmup failed"
+
+      # Resources created by the failed build were closed:
+      closed.size.must_equal 1
+
+      # The previously built application is untouched and still works:
+      Rack::MockRequest.new(Rack::Lint.new(old_app)).get("/").body.to_s.must_equal 'OK'
+
+      # And a subsequent successful build does not reuse the failed build's instance:
+      should_fail = false
+      new_app = plan.to_app
+      Rack::MockRequest.new(Rack::Lint.new(new_app)).get("/").body.to_s.must_equal 'OK'
+      closed.size.must_equal 1
+    end
+
+    it "closes owned resources when middleware instantiation fails" do
+      closed = []
+      good = Class.new do
+        define_method(:initialize) { |app| @app = app }
+        define_method(:call) { |env| @app.call(env) }
+        define_method(:close) { closed << self }
+      end
+      bad = Class.new do
+        def initialize(app)
+          raise "cannot instantiate"
+        end
+      end
+
+      plan = Rack::Builder.new do
+        use bad
+        use good
+        run lambda { |env| [200, {}, []] }
+      end.to_plan
+
+      proc { plan.to_app }.must_raise(RuntimeError)
+      closed.size.must_equal 1
+    end
+
+    it "does not close externally supplied applications on failure" do
+      endpoint = Object.new
+      def endpoint.call(env); [200, {}, []]; end
+      def endpoint.close; raise "must not be closed"; end
+
+      plan = Rack::Builder.new do
+        warmup { |app| raise "warmup failed" }
+        run endpoint
+      end.to_plan
+
+      proc { plan.to_app }.must_raise(RuntimeError)
+    end
+
+    it "does not mutate the builder when capturing a plan" do
+      builder = Rack::Builder.new do
+        map('/sub') { run lambda { |env| [200, {}, ['sub']] } }
+        run lambda { |env| [200, {}, ['root']] }
+      end
+
+      builder.to_plan
+      app = Rack::Lint.new(builder.to_app)
+      Rack::MockRequest.new(app).get("/").body.to_s.must_equal 'root'
+      Rack::MockRequest.new(app).get("/sub").body.to_s.must_equal 'sub'
+    end
+  end
+
   describe "parse_file" do
     def config_file(name)
       File.join(File.dirname(__FILE__), 'builder', name)
