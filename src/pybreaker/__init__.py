@@ -15,6 +15,7 @@ import threading
 import time
 import types
 from abc import abstractmethod
+from dataclasses import dataclass
 from datetime import datetime, timedelta
 from functools import wraps
 from typing import (
@@ -61,8 +62,14 @@ __all__ = (
     "CircuitBreaker",
     "CircuitBreakerListener",
     "CircuitBreakerError",
+    "CircuitBreakerStorage",
     "CircuitMemoryStorage",
     "CircuitRedisStorage",
+    "CircuitBreakerSnapshot",
+    "CircuitBreakerStorageError",
+    "CircuitBreakerStorageVersionConflictError",
+    "CircuitBreakerStorageUnsupportedError",
+    "MAX_CONDITIONAL_ATTEMPTS",
     "STATE_OPEN",
     "STATE_CLOSED",
     "STATE_HALF_OPEN",
@@ -71,6 +78,62 @@ __all__ = (
 STATE_OPEN = "open"
 STATE_CLOSED = "closed"
 STATE_HALF_OPEN = "half-open"
+
+# Maximum number of times a version-conditional (CAS) storage operation is
+# retried before giving up on an apparently contended storage backend.
+MAX_CONDITIONAL_ATTEMPTS = 10
+
+
+class CircuitBreakerStorageError(Exception):
+    """Base class for errors raised by circuit breaker state storage.
+
+    These errors describe problems with the storage itself, and are therefore
+    distinct from exceptions raised by the guarded (dependency) calls.
+    """
+
+
+class CircuitBreakerStorageVersionConflictError(CircuitBreakerStorageError):
+    """Raised when a version-conditional update cannot be applied because the
+    shared state was modified by another breaker instance (or process) after
+    the expected version was read.
+
+    The stale snapshot is attached so callers can inspect or re-read the
+    current state before retrying.
+    """
+
+    def __init__(self, storage_name: str, expected_version: int) -> None:
+        """Create the conflict error for `storage_name` at `expected_version`."""
+        self.storage_name = storage_name
+        self.expected_version = expected_version
+        super().__init__(f"Version conflict on storage {storage_name!r}: state no longer at version {expected_version}")
+
+
+class CircuitBreakerStorageUnsupportedError(CircuitBreakerStorageError):
+    """Raised when a storage backend does not support a requested operation,
+    e.g. version-conditional updates on a backend that cannot guarantee them.
+
+    This makes it impossible to silently fall back to a read-then-write
+    sequence that would overwrite concurrent updates.
+    """
+
+
+@dataclass(frozen=True)
+class CircuitBreakerSnapshot:
+    """Immutable, consistent view of a circuit breaker's state.
+
+    The probe round (`state`), the moment the circuit was opened
+    (`opened_at`) and the current-round counters are read together so that a
+    decision is never made on a mixture of different storage versions. The
+    `version` is an opaque token that changes whenever the stored state
+    changes; it is used by version-conditional updates.
+    """
+
+    state: str
+    fail_counter: int
+    success_counter: int
+    opened_at: datetime | None
+    version: int
+
 
 T = TypeVar("T")
 ExceptionType = TypeVar("ExceptionType", bound=BaseException)
@@ -98,11 +161,33 @@ class CircuitBreaker:
         state_storage: CircuitBreakerStorage | None = None,
         name: str | None = None,
         throw_new_error_on_trip: bool = True,
+        *,
+        conditional_updates: bool = False,
     ) -> None:
-        """Create a new circuit breaker with the given parameters."""
+        """Create a new circuit breaker with the given parameters.
+
+        When `conditional_updates` is ``True``, every state transition and
+        current-round counter update is performed as a single
+        version-conditional storage operation (with retry on conflict). This
+        is required when several breaker instances share the same storage;
+        separate read-then-write steps would otherwise overwrite each other's
+        updates. The storage backend must report
+        ``supports_conditional_updates`` as ``True``, otherwise a
+        `CircuitBreakerStorageUnsupportedError` error is raised rather than
+        silently pretending the local lock provides cross-process safety.
+        """
         self._lock = threading.RLock()
         self._state_storage = state_storage or CircuitMemoryStorage(STATE_CLOSED)
+        self._conditional_updates = conditional_updates
+        if self._conditional_updates and not self._state_storage.supports_conditional_updates:
+            message = (
+                f"Storage {self._state_storage.name!r} does not support version-conditional "
+                "updates; cannot safely share its state between breaker instances"
+            )
+            raise CircuitBreakerStorageUnsupportedError(message)
+
         self._state = self._create_new_state(self.current_state)
+        self._latest_snapshot: CircuitBreakerSnapshot | None = None
 
         self._fail_max = fail_max
         self._reset_timeout = reset_timeout
@@ -113,6 +198,13 @@ class CircuitBreaker:
         self._name = name
 
         self._throw_new_error_on_trip = throw_new_error_on_trip
+
+    @property
+    def conditional_updates(self) -> bool:
+        """Return whether this breaker drives storage through version-conditional
+        (compare-and-swap) operations instead of separate read-then-write steps.
+        """
+        return self._conditional_updates
 
     @property
     def fail_counter(self) -> int:
@@ -181,10 +273,17 @@ class CircuitBreaker:
         # Ensure cached state is up-to-date
         if self.current_state != self._state.name:
             # If cached state is out-of-date, that means that it was likely
-            # changed elsewhere (e.g. another process instance). We still send
-            # out a notification, informing others that this particular circuit
+            # changed elsewhere (e.g. another process instance). In the
+            # conditional mode we refresh the cached state without running
+            # the notify side effects (counter resets), since the storage is
+            # the single source of truth and those resets would themselves
+            # mutate the shared state and bump its version. We still send out
+            # a notification, informing others that this particular circuit
             # breaker instance noticed the changed circuit.
-            self.state = self.current_state  # type: ignore[assignment]
+            if self._conditional_updates:
+                self._sync_cached_state()
+            else:
+                self.state = self.current_state  # type: ignore[assignment]
         return self._state
 
     @state.setter
@@ -226,7 +325,152 @@ class CircuitBreaker:
 
     def _inc_counter(self) -> None:
         """Increment the counter of failed calls."""
-        self._state_storage.increment_counter()
+        if self._conditional_updates:
+            self._latest_snapshot = self._state_storage.conditional_increment_counter(self._require_snapshot().version)
+        else:
+            self._state_storage.increment_counter()
+
+    def _current_snapshot(self) -> CircuitBreakerSnapshot:
+        """Read the whole circuit state (probe round, opened moment and the
+        current-round counters) as a single consistent snapshot.
+        """
+        snapshot = self._state_storage.get_snapshot()
+        self._latest_snapshot = snapshot
+        return snapshot
+
+    def _require_snapshot(self) -> CircuitBreakerSnapshot:
+        """Return the most recent snapshot, reading one if none is cached."""
+        if self._latest_snapshot is None:
+            return self._current_snapshot()
+        return self._latest_snapshot
+
+    def _run_conditional(
+        self, operation: Callable[[CircuitBreakerSnapshot], CircuitBreakerSnapshot]
+    ) -> CircuitBreakerSnapshot:
+        """Run a version-conditional storage `operation`, re-reading the
+        consistent snapshot and retrying while another instance wins the
+        version race. Each attempt applies `operation` to the latest
+        snapshot, so a retry never double-applies an already committed
+        counter update. A storage error other than a version conflict is
+        reported as-is: no partial round is committed and the guarded call's
+        outcome remains separate from the storage failure.
+        """
+        snapshot = self._current_snapshot()
+        for _ in range(MAX_CONDITIONAL_ATTEMPTS):
+            try:
+                new_snapshot = operation(snapshot)
+            except CircuitBreakerStorageVersionConflictError:
+                # Another breaker instance moved the shared state first;
+                # re-read and re-apply our decision against the new version.
+                snapshot = self._current_snapshot()
+                continue
+            self._latest_snapshot = new_snapshot
+            return new_snapshot
+        raise CircuitBreakerStorageVersionConflictError(self._state_storage.name, snapshot.version)
+
+    def _adopt_snapshot(self, snapshot: CircuitBreakerSnapshot) -> None:
+        """Refresh the cached state object from `snapshot` without triggering
+        the state-construction side effects (counter resets), and notify
+        listeners if the probe round actually changed.
+        """
+        with self._lock:
+            self._latest_snapshot = snapshot
+            if snapshot.state != self._state.name:
+                prev_state = self._state
+                # notify=False: in conditional mode the storage is the single
+                # source of truth for counters, so constructing the state
+                # object must not reset anything.
+                self._state = self._create_new_state(snapshot.state, prev_state=prev_state, notify=False)
+                for listener in self._listeners:
+                    listener.state_change(self, prev_state, self._state)
+
+    def _sync_cached_state(self) -> None:
+        """Re-read the shared storage and adopt its latest snapshot."""
+        with self._lock:
+            self._adopt_snapshot(self._current_snapshot())
+
+    def _record_failure_round(self) -> CircuitBreakerSnapshot:
+        """Atomically account for one failed call.
+
+        The failure counter increment and the possible state transition to
+        'open' (together with its opened moment and success-counter reset)
+        are committed as one version-conditional operation, so a failure can
+        never leave a half-written round behind. This covers both a threshold
+        trip in 'closed' state and a failed trial call in 'half-open' state.
+        """
+
+        def apply(snapshot: CircuitBreakerSnapshot) -> CircuitBreakerSnapshot:
+            new_fail_counter = snapshot.fail_counter + 1
+            if snapshot.state == STATE_CLOSED and new_fail_counter >= self._fail_max:
+                return self._state_storage.compare_and_swap_state(
+                    snapshot.version,
+                    STATE_OPEN,
+                    opened_at=datetime.now(UTC),
+                    fail_counter=new_fail_counter,
+                    success_counter=0,
+                )
+            if snapshot.state == STATE_HALF_OPEN:
+                return self._state_storage.compare_and_swap_state(
+                    snapshot.version,
+                    STATE_OPEN,
+                    opened_at=datetime.now(UTC),
+                    fail_counter=new_fail_counter,
+                    success_counter=0,
+                )
+            return self._state_storage.conditional_increment_counter(snapshot.version)
+
+        snapshot = self._run_conditional(apply)
+        self._adopt_snapshot(snapshot)
+        return snapshot
+
+    def _record_success_round(self) -> CircuitBreakerSnapshot:
+        """Atomically account for one successful call.
+
+        In 'half-open' the success counter is incremented (and the stale
+        failure counter cleared) in one operation; if the success threshold
+        is reached, the transition back to 'closed' is committed in the very
+        same compare-and-swap.
+        """
+
+        def apply(snapshot: CircuitBreakerSnapshot) -> CircuitBreakerSnapshot:
+            if snapshot.state == STATE_HALF_OPEN:
+                new_success_counter = snapshot.success_counter + 1
+                if new_success_counter >= self._success_threshold:
+                    return self._state_storage.compare_and_swap_state(
+                        snapshot.version,
+                        STATE_CLOSED,
+                        opened_at=None,
+                        fail_counter=0,
+                        success_counter=0,
+                    )
+                return self._state_storage.conditional_increment_success_counter(
+                    snapshot.version, reset_fail_counter=True
+                )
+            return self._state_storage.conditional_reset_counter(snapshot.version)
+
+        snapshot = self._run_conditional(apply)
+        self._adopt_snapshot(snapshot)
+        return snapshot
+
+    def _enter_half_open_if_due(self) -> None:
+        """Move an expired 'open' circuit to 'half-open' using a
+        version-conditional transition that also resets the success counter,
+        retrying if another instance transitioned first.
+        """
+
+        def apply(snapshot: CircuitBreakerSnapshot) -> CircuitBreakerSnapshot:
+            if snapshot.state == STATE_OPEN:
+                return self._state_storage.compare_and_swap_state(
+                    snapshot.version,
+                    STATE_HALF_OPEN,
+                    opened_at=snapshot.opened_at,
+                    fail_counter=snapshot.fail_counter,
+                    success_counter=0,
+                )
+            return snapshot
+
+        snapshot = self._run_conditional(apply)
+        self._adopt_snapshot(snapshot)
 
     def is_system_error(self, exception: ExceptionType) -> bool:
         """Return whether the exception `exception` is considered a signal of
@@ -281,8 +525,20 @@ class CircuitBreaker:
     def open(self) -> bool:
         """Open the circuit, e.g., the following calls will immediately fail until timeout elapses."""
         with self._lock:
-            self._state_storage.opened_at = datetime.now(UTC)
-            self.state = self._state_storage.state = STATE_OPEN  # type: ignore[assignment]
+            if self._conditional_updates:
+                snapshot = self._run_conditional(
+                    lambda snapshot: self._state_storage.compare_and_swap_state(
+                        snapshot.version,
+                        STATE_OPEN,
+                        opened_at=datetime.now(UTC),
+                        fail_counter=snapshot.fail_counter,
+                        success_counter=0,
+                    )
+                )
+                self._adopt_snapshot(snapshot)
+            else:
+                self._state_storage.opened_at = datetime.now(UTC)
+                self.state = self._state_storage.state = STATE_OPEN  # type: ignore[assignment]
 
             return self._throw_new_error_on_trip
 
@@ -292,13 +548,37 @@ class CircuitBreaker:
         succeeds).
         """
         with self._lock:
-            self.state = self._state_storage.state = STATE_HALF_OPEN  # type: ignore[assignment]
+            if self._conditional_updates:
+                snapshot = self._run_conditional(
+                    lambda snapshot: self._state_storage.compare_and_swap_state(
+                        snapshot.version,
+                        STATE_HALF_OPEN,
+                        opened_at=snapshot.opened_at,
+                        fail_counter=snapshot.fail_counter,
+                        success_counter=0,
+                    )
+                )
+                self._adopt_snapshot(snapshot)
+            else:
+                self.state = self._state_storage.state = STATE_HALF_OPEN  # type: ignore[assignment]
 
     def close(self) -> None:
         """Close the circuit, e.g. lets the following calls execute as usual."""
         with self._lock:
-            self._state_storage.reset_success_counter()  # Reset success counter when closing
-            self.state = self._state_storage.state = STATE_CLOSED  # type: ignore[assignment]
+            if self._conditional_updates:
+                snapshot = self._run_conditional(
+                    lambda snapshot: self._state_storage.compare_and_swap_state(
+                        snapshot.version,
+                        STATE_CLOSED,
+                        opened_at=None,
+                        fail_counter=0,
+                        success_counter=0,
+                    )
+                )
+                self._adopt_snapshot(snapshot)
+            else:
+                self._state_storage.reset_success_counter()  # Reset success counter when closing
+                self.state = self._state_storage.state = STATE_CLOSED  # type: ignore[assignment]
 
     def __call__(self, *call_args: Any, **call_kwargs: bool) -> Callable:
         """Return a wrapper that calls the function `func` according to the rules
@@ -373,6 +653,77 @@ class CircuitBreakerStorage:
         return self._name
 
     @property
+    def supports_conditional_updates(self) -> bool:
+        """Return whether this storage can perform version-conditional
+        (compare-and-swap) updates. Only backends able to atomically check a
+        version and commit a new consistent state should return ``True``.
+        Remote backends that cannot provide this guarantee must return
+        ``False`` so that the conditional sharing mode is rejected explicitly
+        instead of silently corrupting shared state.
+        """
+        return False
+
+    def get_snapshot(self) -> CircuitBreakerSnapshot:
+        """Return a consistent snapshot of the full circuit state: the probe
+        round (state), the opened moment and both counters, together with the
+        version token required by the conditional update methods.
+        """
+        raise CircuitBreakerStorageUnsupportedError(f"Storage {self._name!r} does not implement get_snapshot()")
+
+    def compare_and_swap_state(
+        self,
+        expected_version: int,
+        new_state: str,
+        opened_at: datetime | None,
+        fail_counter: int,
+        success_counter: int,
+    ) -> CircuitBreakerSnapshot:
+        """Atomically transition the circuit state, but only if the stored
+        version still equals `expected_version`. The opened moment and both
+        current-round counters are committed together with the new state, so
+        a transition can never leave half-round data behind. Return the
+        resulting snapshot; raise `CircuitBreakerStorageVersionConflictError` if
+        the version moved, or `CircuitBreakerStorageUnsupportedError` if the
+        backend cannot perform conditional updates.
+        """
+        raise CircuitBreakerStorageUnsupportedError(
+            f"Storage {self._name!r} cannot apply transition to {new_state!r} at version "
+            f"{expected_version} (fail_counter={fail_counter}, success_counter={success_counter}, "
+            f"opened_at={opened_at!r}): version-conditional state transitions are unsupported"
+        )
+
+    def conditional_increment_counter(self, expected_version: int) -> CircuitBreakerSnapshot:
+        """Atomically increment the failure counter conditional on
+        `expected_version`, returning the resulting consistent snapshot.
+        """
+        raise CircuitBreakerStorageUnsupportedError(
+            f"Storage {self._name!r} cannot increment the failure counter at version "
+            f"{expected_version}: version-conditional counter updates are unsupported"
+        )
+
+    def conditional_increment_success_counter(
+        self, expected_version: int, reset_fail_counter: bool = False
+    ) -> CircuitBreakerSnapshot:
+        """Atomically increment the success counter conditional on
+        `expected_version`, optionally clearing the failure counter in the
+        same operation, returning the resulting consistent snapshot.
+        """
+        raise CircuitBreakerStorageUnsupportedError(
+            f"Storage {self._name!r} cannot increment the success counter at version "
+            f"{expected_version} (reset_fail_counter={reset_fail_counter}): "
+            "version-conditional counter updates are unsupported"
+        )
+
+    def conditional_reset_counter(self, expected_version: int) -> CircuitBreakerSnapshot:
+        """Atomically reset the failure counter conditional on
+        `expected_version`, returning the resulting consistent snapshot.
+        """
+        raise CircuitBreakerStorageUnsupportedError(
+            f"Storage {self._name!r} cannot reset the failure counter at version "
+            f"{expected_version}: version-conditional counter updates are unsupported"
+        )
+
+    @property
     @abstractmethod
     def state(self) -> str:
         """Override this method to retrieve the current circuit breaker state."""
@@ -414,61 +765,160 @@ class CircuitBreakerStorage:
 
 
 class CircuitMemoryStorage(CircuitBreakerStorage):
-    """Implement a `CircuitBreakerStorage` in local memory."""
+    """Implement a `CircuitBreakerStorage` in local memory.
+
+    A reentrant lock serializes every read and write within this process, and
+    a monotonically increasing `version` enables optimistic,
+    version-conditional updates when several `CircuitBreaker` instances share
+    the same storage object. Note that this lock only protects threads inside
+    one process; it cannot coordinate separate processes, for which a storage
+    with real compare-and-swap semantics would be required.
+    """
 
     def __init__(self, state: str) -> None:
         """Create a new instance with the given `state`."""
         super().__init__("memory")
+        self._lock = threading.RLock()
         self._fail_counter = 0
         self._success_counter = 0
         self._opened_at: datetime | None = None
         self._state = state
+        self._version = 0
+
+    def _snapshot_locked(self) -> CircuitBreakerSnapshot:
+        return CircuitBreakerSnapshot(
+            state=self._state,
+            fail_counter=self._fail_counter,
+            success_counter=self._success_counter,
+            opened_at=self._opened_at,
+            version=self._version,
+        )
+
+    def _check_version_locked(self, expected_version: int) -> None:
+        if self._version != expected_version:
+            raise CircuitBreakerStorageVersionConflictError(self._name, expected_version)
+
+    @property
+    def supports_conditional_updates(self) -> bool:
+        """Memory storage fully supports version-conditional updates."""
+        return True
+
+    def get_snapshot(self) -> CircuitBreakerSnapshot:
+        """Return a consistent snapshot of state, counters, opened moment and version."""
+        with self._lock:
+            return self._snapshot_locked()
+
+    def compare_and_swap_state(
+        self,
+        expected_version: int,
+        new_state: str,
+        opened_at: datetime | None,
+        fail_counter: int,
+        success_counter: int,
+    ) -> CircuitBreakerSnapshot:
+        """Commit the new state together with its opened moment and counters
+        in one locked, version-conditional step.
+        """
+        with self._lock:
+            self._check_version_locked(expected_version)
+            self._state = new_state
+            self._opened_at = opened_at
+            self._fail_counter = fail_counter
+            self._success_counter = success_counter
+            self._version += 1
+            return self._snapshot_locked()
+
+    def conditional_increment_counter(self, expected_version: int) -> CircuitBreakerSnapshot:
+        """Conditionally increment the failure counter in one locked step."""
+        with self._lock:
+            self._check_version_locked(expected_version)
+            self._fail_counter += 1
+            self._version += 1
+            return self._snapshot_locked()
+
+    def conditional_increment_success_counter(
+        self, expected_version: int, reset_fail_counter: bool = False
+    ) -> CircuitBreakerSnapshot:
+        """Conditionally increment the success counter, optionally clearing
+        the failure counter, in one locked step.
+        """
+        with self._lock:
+            self._check_version_locked(expected_version)
+            self._success_counter += 1
+            if reset_fail_counter:
+                self._fail_counter = 0
+            self._version += 1
+            return self._snapshot_locked()
+
+    def conditional_reset_counter(self, expected_version: int) -> CircuitBreakerSnapshot:
+        """Conditionally reset the failure counter in one locked step."""
+        with self._lock:
+            self._check_version_locked(expected_version)
+            self._fail_counter = 0
+            self._version += 1
+            return self._snapshot_locked()
 
     @property
     def state(self) -> str:
         """Return the current circuit breaker state."""
-        return self._state
+        with self._lock:
+            return self._state
 
     @state.setter
     def state(self, state: str) -> None:
         """Set the current circuit breaker state to `state`."""
-        self._state = state
+        with self._lock:
+            self._state = state
+            self._version += 1
 
     def increment_counter(self) -> None:
         """Increase the failure counter by one."""
-        self._fail_counter += 1
+        with self._lock:
+            self._fail_counter += 1
+            self._version += 1
 
     def reset_counter(self) -> None:
         """Set the failure counter to zero."""
-        self._fail_counter = 0
+        with self._lock:
+            self._fail_counter = 0
+            self._version += 1
 
     def increment_success_counter(self) -> None:
         """Increase the success counter by one."""
-        self._success_counter += 1
+        with self._lock:
+            self._success_counter += 1
+            self._version += 1
 
     def reset_success_counter(self) -> None:
         """Set the success counter to zero."""
-        self._success_counter = 0
+        with self._lock:
+            self._success_counter = 0
+            self._version += 1
 
     @property
     def counter(self) -> int:
         """Return the current value of the failure counter."""
-        return self._fail_counter
+        with self._lock:
+            return self._fail_counter
 
     @property
     def success_counter(self) -> int:
         """Return the current value of the success counter."""
-        return self._success_counter
+        with self._lock:
+            return self._success_counter
 
     @property
     def opened_at(self) -> datetime | None:
         """Return the most recent value of when the circuit was opened."""
-        return self._opened_at
+        with self._lock:
+            return self._opened_at
 
     @opened_at.setter
     def opened_at(self, datetime: datetime) -> None:
         """Set the most recent value of when the circuit was opened to `datetime`."""
-        self._opened_at = datetime
+        with self._lock:
+            self._opened_at = datetime
+            self._version += 1
 
 
 class CircuitRedisStorage(CircuitBreakerStorage):
@@ -510,6 +960,54 @@ class CircuitRedisStorage(CircuitBreakerStorage):
         self._redis.setnx(self._namespace("fail_counter"), 0)
         self._redis.setnx(self._namespace("success_counter"), 0)
         self._redis.setnx(self._namespace("state"), state)
+
+    @property
+    def supports_conditional_updates(self) -> bool:
+        """Redis storage does not implement the version-conditional protocol.
+
+        The independent keys used here cannot be checked-and-swapped as one
+        consistent unit without an additional distributed-locking scheme, so
+        this backend explicitly refuses the conditional sharing mode instead
+        of letting local locks masquerade as cross-process safety.
+        """
+        return False
+
+    def _reject_conditional(self, operation: str) -> NoReturn:
+        message = (
+            f"CircuitRedisStorage cannot perform {operation}: state, counters and opened-at live "
+            "in independent keys that cannot be checked-and-swapped atomically"
+        )
+        raise CircuitBreakerStorageUnsupportedError(message)
+
+    def get_snapshot(self) -> CircuitBreakerSnapshot:
+        self._reject_conditional("get_snapshot()")
+
+    def compare_and_swap_state(
+        self,
+        expected_version: int,
+        new_state: str,
+        opened_at: datetime | None,
+        fail_counter: int,
+        success_counter: int,
+    ) -> CircuitBreakerSnapshot:
+        self._reject_conditional(
+            f"compare_and_swap_state(version={expected_version}, new_state={new_state!r}, "
+            f"opened_at={opened_at!r}, fail_counter={fail_counter}, success_counter={success_counter})"
+        )
+
+    def conditional_increment_counter(self, expected_version: int) -> CircuitBreakerSnapshot:
+        self._reject_conditional(f"conditional_increment_counter(version={expected_version})")
+
+    def conditional_increment_success_counter(
+        self, expected_version: int, reset_fail_counter: bool = False
+    ) -> CircuitBreakerSnapshot:
+        self._reject_conditional(
+            f"conditional_increment_success_counter(version={expected_version}, "
+            f"reset_fail_counter={reset_fail_counter})"
+        )
+
+    def conditional_reset_counter(self, expected_version: int) -> CircuitBreakerSnapshot:
+        self._reject_conditional(f"conditional_reset_counter(version={expected_version})")
 
     @property
     def state(self) -> str:
@@ -689,7 +1187,12 @@ class CircuitBreakerState:
     def _handle_error(self, exc: BaseException, reraise: bool = True) -> None:
         """Handle a failed call to the guarded operation."""
         if self._breaker.is_system_error(exc):
-            self._breaker._inc_counter()
+            if self._breaker.conditional_updates:
+                # Counter update and possible trip are one conditional
+                # operation, so the failure cannot leave half-round data.
+                self._breaker._record_failure_round()
+            else:
+                self._breaker._inc_counter()
             for listener in self._breaker.listeners:
                 listener.failure(self._breaker, exc)
             self.on_failure(exc)
@@ -701,7 +1204,10 @@ class CircuitBreakerState:
 
     def _handle_success(self) -> None:
         """Handle a successful call to the guarded operation."""
-        self._breaker._state_storage.reset_counter()
+        if self._breaker.conditional_updates:
+            self._breaker._record_success_round()
+        else:
+            self._breaker._state_storage.reset_counter()
         self.on_success()
         for listener in self._breaker.listeners:
             listener.success(self._breaker)
@@ -806,13 +1312,24 @@ class CircuitClosedState(CircuitBreakerState):
 
     def on_failure(self, exc: BaseException) -> None:
         """Move the circuit breaker to the "open" state once the failures threshold is reached."""
-        if self._breaker._state_storage.counter >= self._breaker.fail_max:
+        if self._breaker.conditional_updates:
+            # The failure round (counter increment plus possible trip) was
+            # already committed as one conditional operation. Read the probe
+            # round from the same consistent snapshot rather than issuing a
+            # separate storage read that could observe a newer round.
+            tripped = self._breaker._require_snapshot().state == STATE_OPEN
+            if not tripped:
+                return
+            throw_new_error = self._breaker._throw_new_error_on_trip
+        else:
+            if self._breaker._state_storage.counter < self._breaker.fail_max:
+                return
             throw_new_error = self._breaker.open()
 
-            if throw_new_error:
-                error_msg = "Failures threshold reached, circuit breaker opened"
-                raise CircuitBreakerError(error_msg).with_traceback(sys.exc_info()[2])
-            raise exc
+        if throw_new_error:
+            error_msg = "Failures threshold reached, circuit breaker opened"
+            raise CircuitBreakerError(error_msg).with_traceback(sys.exc_info()[2])
+        raise exc
 
 
 class CircuitOpenState(CircuitBreakerState):
@@ -843,6 +1360,19 @@ class CircuitOpenState(CircuitBreakerState):
         state; otherwise, raises ``CircuitBreakerError`` without any attempt
         to execute the real operation.
         """
+        if self._breaker.conditional_updates:
+            # Read the probe round, opened moment and counters as one
+            # consistent snapshot; the timeout decision and the conditional
+            # transition therefore cannot be based on mixed versions.
+            snapshot = self._breaker._current_snapshot()
+            opened_at = snapshot.opened_at
+            timed_out = not opened_at or datetime.now(UTC) >= opened_at + timedelta(seconds=self._breaker.reset_timeout)
+            if not timed_out:
+                error_msg = "Timeout not elapsed yet, circuit breaker still open"
+                raise CircuitBreakerError(error_msg)
+            self._breaker._enter_half_open_if_due()
+            return self._breaker.call(func, *args, **kwargs)
+
         timeout = timedelta(seconds=self._breaker.reset_timeout)
         opened_at = self._breaker._state_storage.opened_at
         if opened_at and datetime.now(UTC) < opened_at + timeout:
@@ -882,7 +1412,12 @@ class CircuitHalfOpenState(CircuitBreakerState):
 
     def on_failure(self, exc: BaseException) -> NoReturn:
         """Opens the circuit breaker."""
-        throw_new_error = self._breaker.open()
+        if self._breaker.conditional_updates:
+            # The failed trial call was already re-opened atomically (new
+            # opened moment plus counter reset) while recording the round.
+            throw_new_error = self._breaker._throw_new_error_on_trip
+        else:
+            throw_new_error = self._breaker.open()
 
         if throw_new_error:
             error_msg = "Trial call failed, circuit breaker opened"
@@ -891,6 +1426,12 @@ class CircuitHalfOpenState(CircuitBreakerState):
 
     def on_success(self) -> None:
         """Increment success counter and close the circuit breaker if threshold is reached."""
+        if self._breaker.conditional_updates:
+            # The success counter increment, stale failure-counter cleanup and
+            # the possible transition to 'closed' were committed together as
+            # one conditional operation; nothing else needs to be written.
+            return
+
         self._breaker._state_storage.increment_success_counter()
 
         if self._breaker._state_storage.success_counter >= self._breaker.success_threshold:

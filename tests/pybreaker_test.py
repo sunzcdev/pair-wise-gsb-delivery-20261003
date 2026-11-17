@@ -6,6 +6,7 @@ from unittest import mock
 
 import pytest
 from pybreaker import *
+from pybreaker import UTC
 from tornado import gen, testing
 
 
@@ -1036,6 +1037,479 @@ class CircuitBreakerRedisTestCase(unittest.TestCase, CircuitBreakerStorageBasedT
 
 import threading
 from types import MethodType
+
+
+class ConflictInjectingMemoryStorage(CircuitMemoryStorage):
+    """Shared test double used to arrange version conflicts and retries.
+
+    It behaves exactly like the memory storage, except a configurable number
+    of conditional operations deliberately fail with a version conflict
+    before succeeding. Because the same instance is shared between several
+    `CircuitBreaker` objects, it emulates another breaker instance winning
+    the version race.
+    """
+
+    def __init__(self, state: str):
+        super().__init__(state)
+        self.conflict_once = 0
+        self.conditional_calls = 0
+        self.snapshot_reads = 0
+        self.snapshot_error: Exception | None = None
+        self.cas_error: Exception | None = None
+        self.counter_error: Exception | None = None
+
+    def get_snapshot(self):
+        self.snapshot_reads += 1
+        if self.snapshot_error is not None:
+            raise self.snapshot_error
+        return super().get_snapshot()
+
+    def compare_and_swap_state(self, expected_version, new_state, opened_at, fail_counter, success_counter):
+        self.conditional_calls += 1
+        if self.cas_error is not None:
+            raise self.cas_error
+        if self.conflict_once > 0:
+            self.conflict_once -= 1
+            # Another writer moved the version before our CAS is applied.
+            with self._lock:
+                self._version += 1
+            raise CircuitBreakerStorageVersionConflictError(self.name, expected_version)
+        return super().compare_and_swap_state(
+            expected_version, new_state, opened_at, fail_counter, success_counter
+        )
+
+    def conditional_increment_counter(self, expected_version):
+        self.conditional_calls += 1
+        if self.counter_error is not None:
+            raise self.counter_error
+        if self.conflict_once > 0:
+            self.conflict_once -= 1
+            with self._lock:
+                self._version += 1
+            raise CircuitBreakerStorageVersionConflictError(self.name, expected_version)
+        return super().conditional_increment_counter(expected_version)
+
+    def conditional_increment_success_counter(self, expected_version, reset_fail_counter=False):
+        self.conditional_calls += 1
+        if self.counter_error is not None:
+            raise self.counter_error
+        if self.conflict_once > 0:
+            self.conflict_once -= 1
+            with self._lock:
+                self._version += 1
+            raise CircuitBreakerStorageVersionConflictError(self.name, expected_version)
+        return super().conditional_increment_success_counter(expected_version, reset_fail_counter)
+
+    def conditional_reset_counter(self, expected_version):
+        self.conditional_calls += 1
+        if self.counter_error is not None:
+            raise self.counter_error
+        if self.conflict_once > 0:
+            self.conflict_once -= 1
+            with self._lock:
+                self._version += 1
+            raise CircuitBreakerStorageVersionConflictError(self.name, expected_version)
+        return super().conditional_reset_counter(expected_version)
+
+
+class CircuitMemoryStorageConditionalTestCase(unittest.TestCase):
+    """Tests for the version-conditional protocol on the memory storage."""
+
+    def setUp(self):
+        self.storage = CircuitMemoryStorage(STATE_CLOSED)
+
+    def test_supports_conditional_updates(self):
+        assert self.storage.supports_conditional_updates is True
+
+    def test_snapshot_is_consistent_and_bumps_version(self):
+        snapshot = self.storage.get_snapshot()
+        assert snapshot.state == STATE_CLOSED
+        assert snapshot.fail_counter == 0
+        assert snapshot.success_counter == 0
+        assert snapshot.opened_at is None
+        assert snapshot.version == 0
+
+        next_snapshot = self.storage.conditional_increment_counter(snapshot.version)
+        assert next_snapshot.fail_counter == 1
+        assert next_snapshot.version == 1
+        # The returned snapshot reflects the whole state consistently.
+        assert next_snapshot.state == snapshot.state
+
+    def test_compare_and_swap_state_commits_whole_round_atomically(self):
+        opened = datetime.now(UTC)
+        snapshot = self.storage.get_snapshot()
+        new_snapshot = self.storage.compare_and_swap_state(
+            snapshot.version, STATE_OPEN, opened_at=opened, fail_counter=5, success_counter=0
+        )
+        assert new_snapshot.state == STATE_OPEN
+        assert new_snapshot.opened_at == opened
+        assert new_snapshot.fail_counter == 5
+        assert new_snapshot.success_counter == 0
+        assert new_snapshot.version == snapshot.version + 1
+
+        # The independent views agree with the committed consistent snapshot.
+        assert self.storage.state == STATE_OPEN
+        assert self.storage.opened_at == opened
+        assert self.storage.counter == 5
+
+    def test_stale_version_is_rejected(self):
+        stale = self.storage.get_snapshot()
+        # Some other writer advances the state in between.
+        self.storage.increment_counter()
+        with pytest.raises(CircuitBreakerStorageVersionConflictError):
+            self.storage.conditional_increment_counter(stale.version)
+        # The rejected attempt must not have mutated anything.
+        assert self.storage.counter == 1
+
+    def test_stale_compare_and_swap_leaves_no_partial_data(self):
+        stale = self.storage.get_snapshot()
+        self.storage.compare_and_swap_state(
+            self.storage.get_snapshot().version, STATE_OPEN, opened_at=datetime.now(UTC),
+            fail_counter=3, success_counter=0,
+        )
+        with pytest.raises(CircuitBreakerStorageVersionConflictError):
+            self.storage.compare_and_swap_state(
+                stale.version, STATE_CLOSED, opened_at=None, fail_counter=0, success_counter=0
+            )
+        # State, counters and opened moment are untouched after the rejection.
+        current = self.storage.get_snapshot()
+        assert current.state == STATE_OPEN
+        assert current.fail_counter == 3
+        assert current.success_counter == 0
+        assert current.opened_at is not None
+
+
+class CircuitBreakerConditionalModeTestCase(unittest.TestCase):
+    """Tests for a breaker driving storage through version-conditional ops."""
+
+    def setUp(self):
+        self.storage = ConflictInjectingMemoryStorage(STATE_CLOSED)
+        self.breaker = CircuitBreaker(fail_max=3, state_storage=self.storage, conditional_updates=True)
+
+    def test_conditional_mode_flag(self):
+        assert self.breaker.conditional_updates is True
+
+    def test_legacy_mode_does_not_use_conditional_ops(self):
+        storage = ConflictInjectingMemoryStorage(STATE_CLOSED)
+        breaker = CircuitBreaker(fail_max=3, state_storage=storage)
+        assert breaker.conditional_updates is False
+
+        def func():
+            raise NotImplementedError
+
+        with pytest.raises(NotImplementedError):
+            breaker.call(func)
+        assert storage.conditional_calls == 0
+
+    def test_failure_round_uses_single_conditional_operation(self):
+        def func():
+            raise NotImplementedError
+
+        with pytest.raises(NotImplementedError):
+            self.breaker.call(func)
+        assert self.breaker.fail_counter == 1
+        assert self.storage.conditional_calls == 1
+
+    def test_conflict_is_retried_and_update_is_not_lost(self):
+        # Arrange one conflicting writer before the conditional update lands.
+        self.storage.conflict_once = 1
+
+        def func():
+            raise NotImplementedError
+
+        with pytest.raises(NotImplementedError):
+            self.breaker.call(func)
+        assert self.breaker.fail_counter == 1
+        # One rejected attempt plus the successful retry, and an extra
+        # snapshot read to re-apply the decision against the new version.
+        assert self.storage.conditional_calls == 2
+        assert self.storage.snapshot_reads >= 2
+
+    def test_exhausted_retries_raise_version_conflict(self):
+        # Every conditional attempt conflicts forever.
+        self.storage.conflict_once = 10**6
+
+        def func():
+            raise NotImplementedError
+
+        with pytest.raises(CircuitBreakerStorageVersionConflictError):
+            self.breaker.call(func)
+        # Bounded retries stop rather than looping indefinitely.
+        assert self.storage.conditional_calls == MAX_CONDITIONAL_ATTEMPTS
+
+    def test_shared_storage_does_not_lose_updates_between_breakers(self):
+        other_breaker = CircuitBreaker(fail_max=3, state_storage=self.storage, conditional_updates=True)
+
+        def func():
+            raise NotImplementedError
+
+        def fail(breaker):
+            with pytest.raises(NotImplementedError):
+                breaker.call(func)
+
+        # First breaker hits an arranged conflict, then both keep failing.
+        self.storage.conflict_once = 1
+        fail(self.breaker)
+        fail(other_breaker)
+        # The third failure trips the shared circuit.
+        with pytest.raises(CircuitBreakerError):
+            self.breaker.call(func)
+
+        # Both breakers observe the same shared, consistent state.
+        assert self.breaker.fail_counter == 3
+        assert other_breaker.fail_counter == 3
+        assert self.breaker.current_state == STATE_OPEN
+        assert other_breaker.current_state == STATE_OPEN
+        assert self.storage.get_snapshot().fail_counter == 3
+
+    def test_trip_is_one_atomic_conditional_round(self):
+        def func():
+            raise NotImplementedError
+
+        # A conflict injected on the tripping round must be retried, and the
+        # trip (state + opened moment + counters) still lands atomically.
+        self.storage.conflict_once = 1
+        for _ in range(2):
+            with pytest.raises(NotImplementedError):
+                self.breaker.call(func)
+        with pytest.raises(CircuitBreakerError):
+            self.breaker.call(func)
+
+        snapshot = self.storage.get_snapshot()
+        assert snapshot.state == STATE_OPEN
+        assert snapshot.fail_counter == 3
+        assert snapshot.success_counter == 0
+        assert snapshot.opened_at is not None
+
+    def test_success_in_half_open_closes_in_one_round(self):
+        self.breaker.half_open()
+
+        def func():
+            return True
+
+        assert self.breaker.call(func)
+        snapshot = self.storage.get_snapshot()
+        assert snapshot.state == STATE_CLOSED
+        assert snapshot.fail_counter == 0
+        assert snapshot.success_counter == 0
+        assert snapshot.opened_at is None
+
+    def test_success_threshold_accumulates_then_closes(self):
+        breaker = CircuitBreaker(
+            fail_max=3, success_threshold=3, state_storage=self.storage, conditional_updates=True
+        )
+        breaker.half_open()
+
+        def func():
+            return True
+
+        breaker.call(func)
+        assert self.storage.get_snapshot().success_counter == 1
+        assert breaker.current_state == STATE_HALF_OPEN
+        breaker.call(func)
+        assert self.storage.get_snapshot().success_counter == 2
+        assert breaker.current_state == STATE_HALF_OPEN
+        breaker.call(func)
+        snapshot = self.storage.get_snapshot()
+        assert snapshot.state == STATE_CLOSED
+        assert snapshot.success_counter == 0
+
+    def test_failed_trial_call_reopens_atomically(self):
+        self.breaker.half_open()
+
+        def func():
+            raise NotImplementedError
+
+        with pytest.raises(CircuitBreakerError):
+            self.breaker.call(func)
+        snapshot = self.storage.get_snapshot()
+        assert snapshot.state == STATE_OPEN
+        assert snapshot.opened_at is not None
+        assert snapshot.success_counter == 0
+
+    def test_storage_error_is_distinct_from_dependency_error(self):
+        class DependencyError(Exception):
+            pass
+
+        class HardStorageError(CircuitBreakerStorageError):
+            pass
+
+        # The storage fails while committing the round; this must surface as a
+        # storage error, never as the dependency's exception, and no partial
+        # round may be committed.
+        self.storage.counter_error = HardStorageError("backend down")
+        before = self.storage.get_snapshot()
+
+        def func():
+            raise DependencyError
+
+        with pytest.raises(HardStorageError):
+            self.breaker.call(func)
+
+        after = self.storage.get_snapshot()
+        assert after.state == before.state
+        assert after.fail_counter == before.fail_counter
+        assert after.version == before.version
+
+    def test_snapshot_read_error_aborts_before_the_dependency_runs(self):
+        class HardStorageError(CircuitBreakerStorageError):
+            pass
+
+        # Make the cached state stale so that `state` must consult the shared
+        # storage (via a snapshot read) before the call can proceed.
+        self.storage.state = STATE_OPEN
+        self.storage.snapshot_error = HardStorageError("cannot read state")
+        called = False
+
+        def func():
+            nonlocal called
+            called = True
+            return True
+
+        with pytest.raises(HardStorageError):
+            self.breaker.call(func)
+        assert called is False
+
+    def test_manual_transitions_are_conditional(self):
+        opened = self.breaker.open()
+        assert opened is True
+        assert self.storage.get_snapshot().state == STATE_OPEN
+        self.breaker.half_open()
+        assert self.storage.get_snapshot().state == STATE_HALF_OPEN
+        self.breaker.close()
+        snapshot = self.storage.get_snapshot()
+        assert snapshot.state == STATE_CLOSED
+        assert snapshot.fail_counter == 0
+        assert snapshot.success_counter == 0
+
+    def test_remote_storage_is_explicitly_rejected(self):
+        import fakeredis
+
+        redis_storage = CircuitRedisStorage(STATE_CLOSED, fakeredis.FakeStrictRedis())
+        assert redis_storage.supports_conditional_updates is False
+        with pytest.raises(CircuitBreakerStorageUnsupportedError):
+            CircuitBreaker(state_storage=redis_storage, conditional_updates=True)
+        # The rejected mode never touched any conditional operation.
+        with pytest.raises(CircuitBreakerStorageUnsupportedError):
+            redis_storage.get_snapshot()
+        with pytest.raises(CircuitBreakerStorageUnsupportedError):
+            redis_storage.compare_and_swap_state(0, STATE_OPEN, None, 1, 0)
+
+
+class CircuitBreakerConditionalConcurrencyTestCase(unittest.TestCase):
+    """Shared-storage conflict/retry behavior across breaker instances."""
+
+    def _start_threads(self, target, n):
+        threads = [threading.Thread(target=target) for _ in range(n)]
+        [t.start() for t in threads]
+        [t.join() for t in threads]
+        return threads
+
+    def test_concurrent_failures_never_overwrite_the_counter(self):
+        storage = ConflictInjectingMemoryStorage(STATE_CLOSED)
+        breakers = [
+            CircuitBreaker(fail_max=10000, reset_timeout=60, state_storage=storage, conditional_updates=True)
+            for _ in range(4)
+        ]
+
+        class SpecificException(Exception):
+            pass
+
+        def trigger_error(index):
+            breaker = breakers[index]
+            for _ in range(250):
+                try:
+                    breaker.call(_raise_specific)
+                except SpecificException:
+                    pass
+                except CircuitBreakerError:
+                    pass
+
+        def _raise_specific():
+            raise SpecificException
+
+        threads = [threading.Thread(target=trigger_error, args=(i,)) for i in range(4)]
+        [t.start() for t in threads]
+        [t.join() for t in threads]
+        # 4 threads x 250 failures, none may be lost to a read-then-write race.
+        assert storage.get_snapshot().fail_counter == 1000
+
+    def test_conflicting_writers_both_commit_their_rounds(self):
+        storage = ConflictInjectingMemoryStorage(STATE_CLOSED)
+        breaker_a = CircuitBreaker(fail_max=20, state_storage=storage, conditional_updates=True)
+        breaker_b = CircuitBreaker(fail_max=20, state_storage=storage, conditional_updates=True)
+
+        def fail():
+            raise NotImplementedError
+
+        # Every operation of breaker A conflicts once, simulating breaker B
+        # winning the race each time.
+        storage.conflict_once = 5
+        for _ in range(5):
+            with pytest.raises(NotImplementedError):
+                breaker_a.call(fail)
+            with pytest.raises(NotImplementedError):
+                breaker_b.call(fail)
+
+        assert storage.get_snapshot().fail_counter == 10
+        assert breaker_a.fail_counter == 10
+        assert breaker_b.fail_counter == 10
+
+    def test_second_breaker_observes_remote_open_and_rejects_calls(self):
+        storage = ConflictInjectingMemoryStorage(STATE_CLOSED)
+        breaker_a = CircuitBreaker(fail_max=2, reset_timeout=60, state_storage=storage, conditional_updates=True)
+        breaker_b = CircuitBreaker(fail_max=2, reset_timeout=60, state_storage=storage, conditional_updates=True)
+
+        def fail():
+            raise NotImplementedError
+
+        with pytest.raises(NotImplementedError):
+            breaker_a.call(fail)
+        with pytest.raises(CircuitBreakerError):
+            breaker_a.call(fail)
+
+        # Breaker B never made a call, yet its stale cached 'closed' state is
+        # refreshed from the shared snapshot and the call is rejected without
+        # running the dependency.
+        called = []
+
+        def dependency():
+            called.append(True)
+            return True
+
+        with pytest.raises(CircuitBreakerError):
+            breaker_b.call(dependency)
+        assert called == []
+        assert breaker_b.current_state == STATE_OPEN
+
+    def test_half_open_transition_is_single_winner_under_conflict(self):
+        storage = ConflictInjectingMemoryStorage(STATE_OPEN)
+        storage.opened_at = datetime.now(UTC)
+        breaker = CircuitBreaker(fail_max=2, reset_timeout=0.01, state_storage=storage,
+                                 conditional_updates=True)
+        sleep(0.02)
+
+        changes = []
+
+        class StateListener(CircuitBreakerListener):
+            def state_change(self, cb, old_state, new_state):
+                changes.append((old_state.name if old_state else None, new_state.name))
+
+        breaker.add_listener(StateListener())
+        # Arrange a conflict exactly when the open -> half-open CAS runs.
+        storage.conflict_once = 1
+
+        def succeed():
+            return True
+
+        # The conflict is retried against the newer version and the trial
+        # call still succeeds exactly once.
+        assert breaker.call(succeed)
+        assert storage.get_snapshot().state == STATE_CLOSED
+        assert ("open", "half-open") in changes
+        assert ("half-open", "closed") in changes
+        # No duplicated half-open notifications after retrying the CAS.
+        assert changes.count(("open", "half-open")) == 1
 
 
 class CircuitBreakerThreadsTestCase(unittest.TestCase):

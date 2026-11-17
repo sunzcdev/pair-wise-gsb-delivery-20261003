@@ -100,6 +100,60 @@ fail with:
     `AttributeError: 'str' object has no attribute 'decode'`
 
 
+Sharing State Between Breaker Instances
+```````````````````````````````````````
+
+When several ``CircuitBreaker`` instances share the same storage (for example,
+one instance per worker process), reading the state and then writing back a
+counter in two separate steps is unsafe: two instances can read the same
+version and overwrite each other's updates.
+
+Pass ``conditional_updates=True`` to opt into version-conditional
+(compare-and-swap) storage operations. Every state transition and every
+current-round counter update is then committed as a single atomic operation
+guarded by a version token; if another instance moved the shared state first,
+the operation is retried against the fresh state instead of overwriting it:
+
+.. code:: python
+
+    import pybreaker
+
+    storage = pybreaker.CircuitMemoryStorage(pybreaker.STATE_CLOSED)
+    # Both breakers operate on the same shared, versioned state.
+    breaker_a = pybreaker.CircuitBreaker(state_storage=storage, conditional_updates=True)
+    breaker_b = pybreaker.CircuitBreaker(state_storage=storage, conditional_updates=True)
+
+Under this mode the probe round (``closed``/``open``/``half-open``), the opened
+moment and both counters are always read together as one consistent snapshot,
+so a failed call can never leave a half-written round. Storage problems are
+reported through the dedicated ``CircuitBreakerStorageError`` hierarchy
+(``CircuitBreakerStorageVersionConflictError`` and
+``CircuitBreakerStorageUnsupportedError``), which is kept separate from the
+exceptions raised by the guarded calls.
+
+A storage backend advertises its capabilities through
+``supports_conditional_updates``. The memory storage fully supports the
+protocol; its lock only coordinates threads inside one process, though, and
+must not be mistaken for cross-process safety. Backends that cannot guarantee
+atomic compare-and-swap — including ``CircuitRedisStorage``, whose state,
+counters and opened moment live in independent keys — explicitly reject the
+mode by raising ``CircuitBreakerStorageUnsupportedError`` rather than silently
+corrupting shared state.
+
+.. code:: python
+
+    import pybreaker
+    import redis
+
+    redis_storage = pybreaker.CircuitRedisStorage(pybreaker.STATE_CLOSED, redis.StrictRedis())
+    assert redis_storage.supports_conditional_updates is False
+    pybreaker.CircuitBreaker(state_storage=redis_storage, conditional_updates=True)
+    # raises CircuitBreakerStorageUnsupportedError
+
+Without ``conditional_updates``, the legacy read-then-write behavior is kept
+unchanged, including the best-effort Redis semantics.
+
+
 .. note::
 
   You may want to reuse a connection already created in your application, if you're

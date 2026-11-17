@@ -1,6 +1,20 @@
 Changelog
 =========
 
+Unreleased
+
+* Add version-conditional (compare-and-swap) storage protocol for safely sharing
+  state between breaker instances: consistent snapshots, conditional state
+  transitions and conditional current-round counter updates with retry on
+  version conflict
+* `CircuitMemoryStorage` fully implements the conditional protocol;
+  `CircuitRedisStorage` explicitly rejects it via
+  `CircuitBreakerStorageUnsupportedError` instead of pretending local locks
+  provide cross-process safety
+* Add `CircuitBreakerStorageError`, `CircuitBreakerStorageVersionConflictError`
+  and `CircuitBreakerStorageUnsupportedError` so storage failures are reported
+  separately from guarded-call exceptions
+
 Version 1.4.0 (July 6, 2025)
 
 * Add success_threshold parameter (Thanks @sideshowbandana)
