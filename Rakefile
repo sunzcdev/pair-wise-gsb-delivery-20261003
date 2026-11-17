@@ -1,0 +1,223 @@
+require "rake"
+require "rake/clean"
+
+NAME = 'sequel'
+VERS = lambda do
+  require File.expand_path("../lib/sequel/version", __FILE__)
+  Sequel.version
+end
+CLEAN.include ["sequel-*.gem", "rdoc", "coverage", "www/public/*.html", "www/public/rdoc*", "www/public/doc*", "spec/bin-sequel-*"]
+
+# Gem Packaging
+
+desc "Build sequel gem"
+task :package=>[:clean] do |p|
+  sh %{#{FileUtils::RUBY} -S gem build sequel.gemspec}
+end
+
+### Website
+
+desc "Make local version of website"
+task :website=>:website_guides do
+  sh %{#{FileUtils::RUBY} www/make_www.rb}
+end
+
+### RDoc
+
+def self.rdoc_task(name, rdoc_dir, main, files)
+  index = File.join(rdoc_dir, 'index.html')
+
+  task name=>index
+
+  file index=>files do
+    generate_rdoc(rdoc_dir, main, files)
+  end
+end
+
+def self.generate_rdoc(rdoc_dir, main, files)
+  rdoc_opts = ["--line-numbers", "--inline-source", '--title', 'Sequel: The Database Toolkit for Ruby']
+
+  begin
+    gem 'hanna'
+    rdoc_opts.concat(['-f', 'hanna'])
+  rescue Gem::LoadError
+  end
+
+  rdoc_opts.concat(['--main', main, "-o", rdoc_dir])
+
+  FileUtils.rm_rf(rdoc_dir)
+
+  require "rdoc"
+  RDoc::RDoc.new.document(rdoc_opts + files)
+end
+
+desc "Generate rdoc"
+rdoc_task(:rdoc, "rdoc", 'README.rdoc',
+    %w"README.rdoc CHANGELOG doc/CHANGELOG.old MIT-LICENSE" +
+    Dir["lib/**/*.rb"] +
+    Dir["doc/*.rdoc"] +
+    Dir['doc/release_notes/*.txt']
+  )
+
+desc "Generate all rdoc for Sequel website"
+task :website_rdoc=>[:website_rdoc_main, :website_rdoc_adapters, :website_rdoc_plugins, :website_guides]
+
+desc "Generate rdoc for core/model for Sequel website"
+rdoc_task(:website_rdoc_main, "www/public/rdoc", 'README.rdoc',
+    %w"README.rdoc CHANGELOG doc/CHANGELOG.old MIT-LICENSE" +
+    Dir["lib/*.rb"] +
+    Dir["lib/sequel/*.rb"] +
+    Dir["lib/sequel/{connection_pool,dataset,database,model}/*.rb"] +
+    ["lib/sequel/extensions/migration.rb"] +
+    Dir["doc/*.rdoc"] +
+    Dir["doc/release_notes/*.txt"]
+  )
+
+desc "Generate rdoc for adapters for Sequel website"
+rdoc_task(:website_rdoc_adapters, "www/public/rdoc-adapters", 'Sequel',
+    Dir["lib/sequel/adapters/**/*.rb"]
+  )
+
+desc "Generate rdoc for plugins/extensions for Sequel website"
+rdoc_task(:website_rdoc_plugins, "www/public/rdoc-plugins", 'Sequel',
+    Dir["lib/sequel/{extensions,plugins}/**/*.rb"] +
+    Dir["doc/{advanced_associations,association_basics,core_extensions,mass_assignment,reflection,schema_modification}.rdoc"]
+  )
+
+desc "Generate the guides for the website from the rdoc pages"
+task :website_guides=>:website_rdoc_main do
+  require_relative 'www/make_guides'
+  src_dir = 'www/public/rdoc/files'
+  target_dir = 'www/public/doc'
+
+  unless File.directory?(src_dir)
+    raise "#{src_dir} does not exist. The guides need rdoc generated with the hanna formatter. Install the hanna gem, do rake clean and run this task again."
+  end
+
+  # the 'main' page is index on rdoc 8+ and README_rdoc otherwise
+  main_page = File.join(src_dir, 'index.html')
+  main_page = File.join(src_dir, 'README_rdoc.html') unless File.file?(main_page)
+
+  FileUtils.mkdir_p target_dir
+  rdoc_pages = Dir[File.join(src_dir, 'doc/*_rdoc.html')]
+  MakeGuides.new(target_dir, rdoc_pages, main_page).execute
+end
+
+### Specs
+
+run_spec = proc do |file|
+  lib_dir = File.join(File.dirname(File.expand_path(__FILE__)), 'lib')
+  rubylib = ENV['RUBYLIB']
+  ENV['RUBYLIB'] ? (ENV['RUBYLIB'] += ":#{lib_dir}") : (ENV['RUBYLIB'] = lib_dir)
+  sh "#{FileUtils::RUBY} #{"-w" if RUBY_VERSION >= '3'} #{'-W:strict_unused_block' if RUBY_VERSION >= '3.4' && !ENV['SEQUEL_MERGE_COVERAGE']} #{file}"
+  ENV['RUBYLIB'] = rubylib
+end
+
+spec_task = proc do |description, name, file, coverage, visibility|
+  desc description
+  task name do
+    run_spec.call(file)
+  end
+
+  if coverage
+    desc "#{description} with coverage"
+    task :"#{name}_cov" do
+      ENV['COVERAGE'] = coverage == true ? '1' : coverage
+      run_spec.call(file)
+      ENV.delete('COVERAGE')
+    end
+  end
+
+  if visibility
+    desc "Run specs with method visibility checking"
+    task :"#{name}_vis" do
+      ENV['CHECK_METHOD_VISIBILITY'] = '1'
+      run_spec.call(file)
+      ENV.delete('CHECK_METHOD_VISIBILITY')
+    end
+  end
+end
+
+desc "Run the core, model, and extension/plugin specs"
+task :default => :spec
+
+desc "Run the core, model, and extension/plugin specs"
+task :spec => [:spec_core, :spec_model, :spec_plugin]
+
+spec_task.call("Run core and model specs together", :spec_core_model, 'spec/core_model_spec.rb', "core-model", false)
+spec_task.call("Run core specs", :spec_core, 'spec/core_spec.rb', false, false)
+spec_task.call("Run model specs", :spec_model, 'spec/model_spec.rb', false, false)
+spec_task.call("Run plugin/extension specs", :spec_plugin, 'spec/plugin_spec.rb', "plugin-extension", true)
+spec_task.call("Run bin/sequel specs", :spec_bin, 'spec/bin_spec.rb', 'bin', false)
+spec_task.call("Run core extensions specs", :spec_core_ext, 'spec/core_extensions_spec.rb', 'core-ext', true)
+spec_task.call("Run virtual row core refinements specs", :spec_vr_core_refinements, 'spec/virtual_row_core_refinements_spec.rb', 'vr-core-refinements', true) if RUBY_VERSION >= "4.1"
+spec_task.call("Run integration tests", :spec_integration, 'spec/adapter_spec.rb none', '1', true)
+
+%w'postgres sqlite mysql oracle mssql db2 sqlanywhere'.each do |adapter|
+  spec_task.call("Run #{adapter} tests", :"spec_#{adapter}", "spec/adapter_spec.rb #{adapter}", adapter, true)
+end
+
+spec_task.call("Run model specs without the associations code", :_spec_model_no_assoc, 'spec/model_no_assoc_spec.rb', false, false)
+desc "Run model specs without the associations code"
+task :spec_model_no_assoc do
+  ENV['SEQUEL_NO_ASSOCIATIONS'] = '1'
+  Rake::Task['_spec_model_no_assoc'].invoke
+end
+
+desc "Run core/model/extension/plugin specs with coverage"
+task :spec_cov do
+  Rake::Cleaner.cleanup_files(::Rake::FileList["coverage"])
+  ENV['SEQUEL_MERGE_COVERAGE'] = '1'
+  Rake::Task['spec_bin_cov'].invoke
+  Rake::Task['spec_core_model_cov'].invoke
+  Rake::Task['spec_plugin_cov'].invoke
+  Rake::Task['spec_core_ext_cov'].invoke
+  Rake::Task['spec_vr_core_refinements_cov'].invoke if RUBY_VERSION >= "4.1"
+  ENV['NO_SEQUEL_PG'] = '1'
+  Rake::Task['spec_postgres_cov'].invoke
+end
+
+task :spec_ci=>[:spec_core, :spec_model, :spec_plugin, :spec_core_ext] do
+  next if RUBY_VERSION < '2.4'
+
+  if RUBY_VERSION.split('.')[1].to_i.send(Time.now.yday.even? ? :even? : :odd?)
+    # MariaDB
+    mysql_port = ":3307"
+  else
+    # MySQL
+    mysql_jdbc = "&allowPublicKeyRetrieval=true"
+  end
+
+  if RUBY_ENGINE == 'jruby'
+    ENV['SEQUEL_SQLITE_URL'] = "jdbc:sqlite::memory:"
+    ENV['SEQUEL_POSTGRES_URL'] = "jdbc:postgresql://localhost/?user=postgres&password=postgres"
+    ENV['SEQUEL_MYSQL_URL'] = "jdbc:mysql://127.0.0.1#{mysql_port}/sequel_test?user=root&password=root&useSSL=false#{mysql_jdbc}"
+  else
+    ENV['SEQUEL_SQLITE_URL'] = "sqlite:/"
+    ENV['SEQUEL_POSTGRES_URL'] = "postgres://localhost?user=postgres&password=postgres"
+    ENV['SEQUEL_MYSQL_URL'] = "mysql2://127.0.0.1#{mysql_port}/sequel_test?user=root&password=root&useSSL=false"
+  end
+
+  Rake::Task['spec_postgres'].invoke
+  Rake::Task['spec_sqlite'].invoke
+  Rake::Task['spec_mysql'].invoke
+end
+
+desc "Print Sequel version"
+task :version do
+  puts VERS.call
+end
+
+desc "Check syntax of all .rb files"
+task :check_syntax do
+  Dir['**/*.rb'].each{|file| print `#{FileUtils::RUBY} -c #{file} | fgrep -v "Syntax OK"`}
+end
+
+desc "Check documentation for plugin/extension files"
+task :check_plugin_doc do
+  text = File.binread('www/pages/plugins.html.erb')
+  skip = %w'before_after_save freeze_datasets from_block no_auto_literal_strings auto_validations_constraint_validations_presence_message optimistic_locking_base'
+  Dir['lib/sequel/{plugins,extensions}/*.rb'].map{|f| File.basename(f).sub('.rb', '') if File.size(f)}.sort.each do |f|
+    puts f if !f.start_with?('_') && !skip.include?(f) && !text.include?(f)
+  end
+end

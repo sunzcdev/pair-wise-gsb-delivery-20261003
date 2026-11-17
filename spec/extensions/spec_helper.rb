@@ -1,0 +1,76 @@
+# frozen_string_literal: true
+if ENV['COVERAGE']
+  require_relative "../sequel_coverage"
+  SimpleCov.sequel_coverage(:filter=>%r{lib/sequel/(extensions|plugins)/\w+\.rb\z})
+end
+
+ENV["SEQUEL_NAMED_TIMEZONES_USE_TIME"] = "1" # SEQUEL6: Remove
+ENV['MT_NO_PLUGINS'] = '1' # Work around stupid autoloading of plugins
+gem 'minitest'
+require 'minitest/global_expectations/autorun'
+require 'minitest/hooks/default'
+
+$:.unshift(File.join(File.dirname(File.expand_path(__FILE__)), "../../lib/"))
+require_relative "../../lib/sequel"
+
+require_relative "../visibility_checking_after_hook" if ENV['CHECK_METHOD_VISIBILITY']
+
+require_relative '../deprecation_helper'
+
+if ENV['SEQUEL_TZINFO_VERSION']
+  # Allow forcing specific TZInfo versions, useful when testing
+  gem 'tzinfo', ENV['SEQUEL_TZINFO_VERSION']
+end
+
+begin
+  # Attempt to load ActiveSupport blank extension and inflector first, so Sequel
+  # can override them.
+  require 'active_support'
+  require 'active_support/core_ext/object/blank'
+  require 'active_support/inflector'
+  require 'active_support/core_ext/string/inflections'
+rescue LoadError
+  nil
+end
+
+if RUBY_ENGINE == 'ruby' || (RUBY_ENGINE == 'jruby' && (JRUBY_VERSION.to_r >= Rational('9.3') || (JRUBY_VERSION.match(/\A9\.2\.(\d+)/) && $1.to_i >= 7)))
+  Sequel.extension :core_refinements
+end
+
+class << Sequel::Model
+  attr_writer :db_schema
+  alias orig_columns columns
+  def columns(*cols)
+    return super if cols.empty?
+    define_method(:columns){cols}
+    alias_method(:columns, :columns)
+    @dataset.send(:columns=, cols) if @dataset
+    def_column_accessor(*cols)
+    @columns = cols
+    @db_schema = {}
+    cols.each{|c| @db_schema[c] = {}}
+  end
+end
+
+Sequel::DB = nil
+Sequel::Model.use_transactions = false
+Sequel::Model.cache_anonymous_models = false
+Sequel::Model.shape_friendly = true if ENV["SEQUEL_MODEL_SHAPE_FRIENDLY"]
+
+db = Sequel.mock(:fetch=>{:id => 1, :x => 1}, :numrows=>1, :autoid=>proc{|sql| 10})
+def db.schema(*) [[:id, {:primary_key=>true}]] end
+def db.reset() sqls end
+def db.supports_schema_parsing?() true end
+Sequel::Model.db = DB = db
+Sequel::DATABASES.clear
+
+if ENV['SEQUEL_COLUMNS_INTROSPECTION']
+  Sequel.extension :columns_introspection
+  Sequel::Database.extension :columns_introspection
+  Sequel::Mock::Dataset.send(:include, Sequel::ColumnsIntrospection)
+end
+if ENV['SEQUEL_NO_CACHE_ASSOCIATIONS']
+  Sequel::Model.cache_associations = false
+end
+Sequel::Model.plugin :throw_failures if ENV['SEQUEL_MODEL_THROW_FAILURES']
+Sequel::Database.extension :lit_require_frozen if ENV["SEQUEL_LIT_REQUIRE_FROZEN"]

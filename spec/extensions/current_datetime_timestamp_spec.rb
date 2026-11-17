@@ -1,0 +1,34 @@
+# frozen_string_literal: true
+require_relative "spec_helper"
+
+describe "current_datetime_timestamp extension" do
+  before do
+    @ds = Sequel.mock[:table].extension(:current_datetime_timestamp)
+  end
+
+  it "should have current_timestamp respect Sequel.datetime_class" do
+    t = Sequel::Dataset.new(nil).current_datetime 
+    t.must_be_kind_of(Time)
+    (Time.now - t < 0.1).must_equal true
+
+    with_datetime_class_datetime do
+      t = Sequel::Dataset.new(nil).current_datetime 
+      t.must_be_kind_of(DateTime)
+      (DateTime.now - t < (0.1/86400)).must_equal true
+    end
+  end
+
+  it "should have current_timestamp value be literalized as CURRENT_TIMESTAMP" do
+    @ds.literal(@ds.current_datetime).must_equal 'CURRENT_TIMESTAMP'
+    with_datetime_class_datetime do
+      @ds.literal(@ds.current_datetime).must_equal 'CURRENT_TIMESTAMP'
+    end
+  end
+
+
+  it "should have other Date/Time values literalized normally" do
+    t = Time.at(1594239778).getutc
+    @ds.literal(t).must_equal "'2020-07-08 20:22:58.000000'"
+    @ds.literal(t.to_datetime).must_equal "'2020-07-08 20:22:58.000000'"
+  end
+end

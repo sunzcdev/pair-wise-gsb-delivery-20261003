@@ -1,0 +1,100 @@
+# This file is only used for CI.
+
+source 'http://rubygems.org'
+
+gem 'minitest-hooks', '>=1.5.1'
+gem 'minitest-global_expectations'
+
+# Plugin/Extension Dependencies
+gem 'tzinfo'
+
+if RUBY_VERSION >= '3.3'
+  gem 'csv'
+end
+
+if RUBY_VERSION < '2.1'
+  gem 'nokogiri', '<1.7'
+elsif RUBY_VERSION < '2.3'
+  gem 'nokogiri', '<1.10'
+elsif RUBY_VERSION < '2.4'
+  gem 'nokogiri', '<1.11'
+elsif RUBY_VERSION < '2.5'
+  gem 'nokogiri', '<1.12'
+elsif RUBY_VERSION < '2.6'
+  gem 'nokogiri', '<1.13'
+else
+  gem 'nokogiri'
+end
+
+if RUBY_VERSION < '2.3'
+  gem 'i18n', '<1.5'
+end
+
+if RUBY_VERSION < '2.2.0'
+  gem 'activemodel', '<5.0.0'
+  gem 'concurrent-ruby', '<1.1.10'
+elsif RUBY_VERSION < '2.4.0'
+  gem 'activemodel', '<6.0.0'
+elsif RUBY_VERSION < '2.7.0'
+  gem 'activemodel', '<7.0.0'
+  gem 'concurrent-ruby', '1.3.4'
+else
+  gem 'activemodel'
+end
+
+if RUBY_VERSION < '3.1.0' && RUBY_VERSION >= '3.0.0'
+  gem 'json', '2.5.1'
+elsif RUBY_VERSION < '2.3.0'
+  gem 'json', '<2.6'
+else
+  gem 'json'
+end
+
+if RUBY_VERSION < '2.3.0'
+  gem 'rake', '<13'
+else
+  gem 'rake'
+end
+
+if RUBY_VERSION < '2.4.0'
+  # Until mintest 5.12.0 is fixed
+  gem 'minitest', '5.11.3'
+else
+  gem 'minitest', '>= 5.7.0'
+end
+
+if RUBY_VERSION < '2.1'
+  # don't require bigdecimal, use standard library bigdecimal,
+  # as gem bigdecimal causes CI segfaults
+elsif RUBY_VERSION < '2.4'
+  gem 'bigdecimal', '<1.3'
+else
+  gem 'bigdecimal'
+end
+
+# MRI Adapter Dependencies
+platforms :ruby do
+  sequel_pg = RUBY_VERSION.split('.')[1].to_i.send(Time.now.yday.even? ? :even? : :odd?)
+
+  if RUBY_VERSION < '2.5'
+    gem 'sqlite3', '< 1.5'
+  else
+    gem 'sqlite3'
+  end
+
+  gem "pg", RUBY_VERSION < '2.2.0' ? '<1.2.0' : '>0'
+  gem "mysql2", "!= 0.5.7"
+
+  # Test current sequel_pg on half of the MRIs, and pure-ruby on the other half
+  # Avoid pulling in bigdecimal gem on Ruby < 2.1
+  if sequel_pg && RUBY_VERSION >= '2.1'
+    gem 'sequel_pg', git: 'https://github.com/jeremyevans/sequel_pg', require: 'sequel'
+  end
+end
+
+# JRuby Adapter Dependencies
+platforms :jruby do
+  gem 'jdbc-sqlite3', '<3.42'
+  gem 'jdbc-mysql'
+  gem 'jdbc-postgres'
+end

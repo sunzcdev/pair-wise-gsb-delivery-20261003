@@ -1,0 +1,11 @@
+*.lock
+*.rbc
+*.swp
+/coverage
+/rdoc
+/sequel-*.gem
+/spec/bin-sequel-*
+/spec/spec_config.rb
+/www/public/*.html
+/www/public/rdoc*
+/www/public/doc*
