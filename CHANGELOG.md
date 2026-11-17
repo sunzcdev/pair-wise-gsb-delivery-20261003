@@ -1,5 +1,15 @@
 ## Current
 
+concurrent-ruby:
+
+* Add `Concurrent::Map#snapshot`, returning a fixed, point-in-time read-only
+  `Concurrent::Map::Snapshot` view of the map's entries. Unlike the weakly
+  consistent `#each_pair`/`#keys`/`#values` iterators, a snapshot fixes the
+  key and value references at capture time so later insertion, deletion or
+  value replacement does not affect the view. The view is shallow (values are
+  shared by reference, not deep-copied or frozen) and iterating it never holds
+  the map's internal lock.
+
 ## Release v1.3.8 (19 July 2026)
 
 concurrent-ruby:

@@ -278,6 +278,40 @@ module Concurrent
 
     alias_method :each, :each_pair unless method_defined?(:each)
 
+    # Returns a fixed, point-in-time view of the map's current entries.
+    #
+    # The key and value object references are determined when this method is
+    # called. Subsequent insertion, deletion or value replacement on this map
+    # does not change the returned view, and repeatedly iterating the same
+    # view always yields the same entries. This differs from the map's weakly
+    # consistent iterators ({#each_pair}, {#keys}, {#values}, ...), which read
+    # the live map and may observe concurrent modifications.
+    #
+    # The view is shallow: value objects are shared by reference and are not
+    # deep-copied, so changes made to a value object's internal state remain
+    # visible through the view. Neither the view nor the stored values are
+    # frozen in a way that would protect against such internal concurrent
+    # modification.
+    #
+    # Only the short capture of the entries may synchronize on the map's
+    # internal lock; iteration of the returned view never holds that lock, so
+    # a view iteration block may safely access the original map.
+    #
+    # @return [Concurrent::Map::Snapshot] the fixed view of the current entries
+    def snapshot
+      entries = if respond_to?(:snapshot_entries, true)
+                  snapshot_entries
+                else
+                  # Native backends (JRuby, TruffleRuby) expose only the weakly
+                  # consistent each_pair; drain it once here to fix the entry
+                  # references. No user code runs during the drain.
+                  arr = []
+                  each_pair { |key, value| arr << [key, value] }
+                  arr
+                end
+      Map::Snapshot.new(entries)
+    end
+
     # Find key of a value.
     # @param [Object] value
     # @return [Object, nil] key or nil when not found
@@ -347,4 +381,6 @@ module Concurrent
       end
     end
   end
+
+  require 'concurrent/collection/map/map_snapshot'
 end

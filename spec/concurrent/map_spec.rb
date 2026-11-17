@@ -685,6 +685,54 @@ module Concurrent
       end
     end
 
+    describe '#snapshot' do
+      it 'returns a Concurrent::Map::Snapshot fixed view' do
+        expect(@cache.snapshot).to be_an_instance_of Concurrent::Map::Snapshot
+      end
+
+      it 'captures the current entries and is isolated from later changes' do
+        @cache[:a] = 1
+        @cache[:b] = 2
+        snapshot = @cache.snapshot
+
+        @cache[:c] = 3
+        @cache.delete(:a)
+        @cache[:b] = 999
+
+        expect(snapshot.to_h).to eq(a: 1, b: 2)
+        expect(@cache.key?(:a)).to be false
+        expect(@cache[:b]).to eq 999
+      end
+
+      it 'produces an empty view of an empty map' do
+        snapshot = @cache.snapshot
+        expect(snapshot).to be_empty
+        expect(snapshot.to_a).to eq []
+        expect(snapshot).to eq @cache.snapshot
+      end
+
+      it 'keeps the value references captured at that point in time' do
+        value = 'original'
+        @cache[:k] = value
+        snapshot = @cache.snapshot
+        @cache[:k] = 'replaced'
+
+        expect(snapshot[:k]).to be value
+      end
+
+      it 'can be iterated repeatedly with identical results' do
+        @cache[:a] = 1
+        @cache[:b] = 2
+        snapshot = @cache.snapshot
+
+        first  = []
+        second = []
+        snapshot.each_pair { |k, v| first << [k, v] }
+        snapshot.each_pair { |k, v| second << [k, v] }
+        expect(first).to eq second
+      end
+    end
+
     describe '#each' do
       it_should_behave_like :collection_each do
         let(:method) { :each }

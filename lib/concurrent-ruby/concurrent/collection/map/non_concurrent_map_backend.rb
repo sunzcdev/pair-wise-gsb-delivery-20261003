@@ -103,6 +103,18 @@ module Concurrent
         self
       end
 
+      # Captures the key/value pairs currently stored in the map as a plain
+      # Array of `[key, value]` pairs. Only the mapping between keys and value
+      # references is copied; the stored objects are not deep-copied.
+      # Backends holding a global lock override this method so that the whole
+      # capture happens under the lock without running any user code.
+      #
+      # Note: intentionally does not call +dupped_backend+, which the
+      # SynchronizedMapBackend wraps in its own non-reentrant mutex.
+      def snapshot_entries
+        @backend.dup.to_a
+      end
+
       def size
         @backend.size
       end

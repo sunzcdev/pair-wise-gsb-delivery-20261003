@@ -72,6 +72,13 @@ module Concurrent
         @mutex.synchronize { super }
       end
 
+      # Capture under the global mutex so the fixed view reflects one consistent
+      # point in time; only the key/value references are copied, no user code
+      # runs while the mutex is held.
+      def snapshot_entries
+        @mutex.synchronize { super }
+      end
+
       def get_or_default(key, default_value)
         @mutex.synchronize { super }
       end
