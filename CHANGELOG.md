@@ -20,6 +20,12 @@ You can find our backwards-compatibility policy [here](https://github.com/hynek/
 - On Python 3.15 and later, *structlog* uses [PEP 810](https://peps.python.org/pep-0810/) lazy imports for modules that are only needed once you log.
   This makes `import structlog` significantly faster.
 
+- `structlog.stdlib.ExtraAdder` no longer silently overwrites event dictionary keys with `logging` *extra* attributes.
+  Business fields, standard `logging.LogRecord` attributes, and *structlog*'s internal markers (``_record`` / ``_from_structlog``) are now strictly partitioned: a colliding *extra* either raises a `ValueError` (default) or is preserved under the ``_foreign_extra`` key with the new ``on_collision="nest"`` option.
+
+- `structlog.stdlib.ProcessorFormatter` no longer misclassifies foreign log records that carry ``_logger``/``_name`` *extra* attributes as *structlog* records.
+  Business extras can't hijack the event source identity anymore.
+
 
 ## [26.1.0](https://github.com/hynek/structlog/compare/25.5.0...26.1.0) - 2026-06-06
 

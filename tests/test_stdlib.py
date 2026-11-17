@@ -654,6 +654,9 @@ class TestExtraAdder:
         if allow is None:
             actual = ExtraAdder()(None, None, event_dict)
             assert expected == actual
+            # Rebuild the event dict: re-applying ExtraAdder to an event
+            # dict that already contains the extras is a name collision.
+            event_dict = {"_record": record, "ed_key": "ed_value"}
         actual = ExtraAdder(allow)(None, None, event_dict)
         assert expected == actual
         if misses:
@@ -666,6 +669,77 @@ class TestExtraAdder:
         actual = ExtraAdder()(None, None, {})
 
         assert {} == actual
+
+    def test_collision_raises(self, make_log_record):
+        """
+        Business fields whose names are already taken in the event dict --
+        including ProcessorFormatter's internal markers -- raise a ValueError
+        and leave the event dict unmodified.
+        """
+        record = make_log_record()
+        record.__dict__.update({"event": "biz", "_from_structlog": "biz"})
+        event_dict = {
+            "event": "orig",
+            "_record": record,
+            "_from_structlog": False,
+        }
+        before = event_dict.copy()
+
+        with pytest.raises(ValueError, match="would overwrite"):
+            ExtraAdder()(None, None, event_dict)
+
+        assert before == event_dict
+
+    def test_collision_nest(self, make_log_record):
+        """
+        With on_collision="nest", colliding business fields are preserved
+        under the _foreign_extra key while existing keys and clean extras are
+        unaffected. The _foreign_extra key itself is reserved.
+        """
+        record = make_log_record()
+        record.__dict__.update(
+            {"event": "biz", "ok": 1, "_foreign_extra": "biz"}
+        )
+        event_dict = {"event": "orig", "_record": record}
+
+        ed = ExtraAdder(on_collision="nest")(None, None, event_dict)
+
+        assert "orig" == ed["event"]
+        assert 1 == ed["ok"]
+        assert {"event": "biz", "_foreign_extra": "biz"} == ed[
+            "_foreign_extra"
+        ]
+
+    def test_invalid_on_collision(self):
+        """
+        An unknown on_collision policy is rejected.
+        """
+        with pytest.raises(ValueError, match="on_collision"):
+            ExtraAdder(on_collision="bogus")
+
+    def test_collision_e2e(self):
+        """
+        A foreign log entry whose extra collides with the event key keeps its
+        real event; the business field is preserved under _foreign_extra.
+        """
+        logger = logging.Logger(sys._getframe().f_code.co_name)
+        string_io = StringIO()
+        handler = logging.StreamHandler(string_io)
+        formatter = ProcessorFormatter(
+            foreign_pre_chain=[ExtraAdder(on_collision="nest")],
+            processors=[JSONRenderer()],
+        )
+        handler.setFormatter(formatter)
+        handler.setLevel(0)
+        logger.addHandler(handler)
+        logger.setLevel(0)
+
+        logger.info("Some text", extra={"event": "business"})
+
+        actual = json.loads(string_io.getvalue())
+
+        assert "Some text" == actual["event"]
+        assert {"event": "business"} == actual["_foreign_extra"]
 
     @pytest.mark.parametrize(
         ("allow", "misses"),
@@ -1277,6 +1351,153 @@ class TestProcessorFormatter:
         handler2_record = handler2.handle.call_args_list[0].args[0]
 
         assert "meh" == handler2_record.msg
+
+    def test_foreign_record_with_internal_marker_extras(self, capsys):
+        """
+        A foreign record carrying `_logger`/`_name` business extras is still
+        treated as foreign: business extras can't hijack the event source
+        identity.
+        """
+        eds = configure_logging(None)
+
+        logging.getLogger().warning(
+            "foo", extra={"_logger": object(), "_name": "info"}
+        )
+
+        assert (
+            "",
+            "foo [in test_foreign_record_with_internal_marker_extras]\n",
+        ) == capsys.readouterr()
+        assert eds[0]["_from_structlog"] is False
+        assert isinstance(eds[0]["_record"], logging.LogRecord)
+
+    def test_format_does_not_modify_record(self):
+        """
+        format() works on a copy: the original record's msg, args, and
+        exc_info are left untouched, so formatting is idempotent and other
+        handlers see a pristine record.
+        """
+        formatter = ProcessorFormatter(
+            processors=[
+                ProcessorFormatter.remove_processors_meta,
+                JSONRenderer(),
+            ]
+        )
+        record = logging.LogRecord(
+            "name", logging.INFO, "path", 1, "hello %s", ("world",), None
+        )
+        record.exc_info = (ValueError, ValueError("boom"), None)
+
+        first = formatter.format(record)
+        second = formatter.format(record)
+
+        assert "hello %s" == record.msg
+        assert ("world",) == record.args
+        assert record.exc_info is not None
+        assert first == second
+
+    def test_two_processor_formatters_no_cross_contamination(self):
+        """
+        Two handlers with ProcessorFormatters format the same foreign record
+        independently: neither record mutations (cleared args, replaced msg)
+        nor foreign_pre_chain additions leak from one into the other.
+        """
+
+        def add_key(key):
+            def proc(_, __, ed):
+                ed[key] = True
+                return ed
+
+            return proc
+
+        stream1, stream2 = StringIO(), StringIO()
+        handler1 = logging.StreamHandler(stream1)
+        handler1.setFormatter(
+            ProcessorFormatter(
+                foreign_pre_chain=[add_key("one")],
+                processors=[
+                    ProcessorFormatter.remove_processors_meta,
+                    JSONRenderer(),
+                ],
+            )
+        )
+        handler2 = logging.StreamHandler(stream2)
+        handler2.setFormatter(
+            ProcessorFormatter(
+                foreign_pre_chain=[add_key("two")],
+                processors=[
+                    ProcessorFormatter.remove_processors_meta,
+                    JSONRenderer(),
+                ],
+            )
+        )
+        logger = logging.Logger("no-cross-contamination")
+        logger.addHandler(handler1)
+        logger.addHandler(handler2)
+        logger.setLevel(0)
+
+        logger.info("hello %s", "world")
+
+        out1 = json.loads(stream1.getvalue())
+        out2 = json.loads(stream2.getvalue())
+
+        assert "hello world" == out1["event"]
+        assert "hello world" == out2["event"]
+        assert out1["one"] is True
+        assert "two" not in out1
+        assert out2["two"] is True
+        assert "one" not in out2
+
+    def test_structlog_record_two_formatters_no_cross_contamination(self):
+        """
+        A structlog record formatted by two ProcessorFormatters keeps its
+        event dict intact for the second formatter.
+        """
+
+        def add_key(key):
+            def proc(_, __, ed):
+                ed[key] = True
+                return ed
+
+            return proc
+
+        stream1, stream2 = StringIO(), StringIO()
+        handler1 = logging.StreamHandler(stream1)
+        handler1.setFormatter(
+            ProcessorFormatter(
+                processors=[
+                    add_key("one"),
+                    ProcessorFormatter.remove_processors_meta,
+                    JSONRenderer(),
+                ]
+            )
+        )
+        handler2 = logging.StreamHandler(stream2)
+        handler2.setFormatter(
+            ProcessorFormatter(
+                processors=[
+                    ProcessorFormatter.remove_processors_meta,
+                    JSONRenderer(),
+                ]
+            )
+        )
+        logger = logging.Logger("structlog-no-cross-contamination")
+        logger.addHandler(handler1)
+        logger.addHandler(handler2)
+        logger.setLevel(0)
+
+        bl = BoundLogger(
+            logger, [ProcessorFormatter.wrap_for_formatter], {}
+        )
+        bl.info("hello")
+
+        out1 = json.loads(stream1.getvalue())
+        out2 = json.loads(stream2.getvalue())
+
+        assert "hello" == out1["event"]
+        assert "hello" == out2["event"]
+        assert out1["one"] is True
+        assert "one" not in out2
 
     @pytest.mark.parametrize("keep", [True, False])
     def test_formatter_unsets_exc_info(self, capsys, keep):

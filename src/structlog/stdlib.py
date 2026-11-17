@@ -24,7 +24,7 @@ import warnings
 
 from collections.abc import Callable, Collection, Iterable, Sequence
 from functools import partial
-from typing import Any, cast
+from typing import Any, Literal, cast
 
 
 if sys.version_info >= (3, 11):
@@ -886,6 +886,16 @@ _LOG_RECORD_KEYS = logging.LogRecord(
     "name", 0, "pathname", 0, "msg", (), None
 ).__dict__.keys()
 
+#: Keys that `ProcessorFormatter` adds to event dictionaries for its own
+#: bookkeeping. Together with the ``_logger``/``_name`` attributes that
+#: `ProcessorFormatter.wrap_for_formatter` attaches to log records, they form
+#: the *internal fields* partition that business extras must never overwrite.
+_INTERNAL_EVENT_DICT_KEYS = frozenset({"_record", "_from_structlog"})
+
+#: Event dictionary key under which `ExtraAdder` nests colliding business
+#: fields when it is configured with ``on_collision="nest"``.
+_FOREIGN_EXTRA_KEY = "_foreign_extra"
+
 
 class ExtraAdder:
     """
@@ -894,6 +904,22 @@ class ExtraAdder:
 
     This processor can be used for adding data passed in the ``extra``
     parameter of the `logging` module's log methods to the event dictionary.
+
+    The event dictionary is partitioned into three kinds of fields and this
+    processor keeps them apart:
+
+    - *Standard fields*: attributes that exist on every `logging.LogRecord`
+      (like ``msg`` or ``levelname``). They are never copied; they remain
+      available on the record under the ``_record`` key.
+    - *Internal fields*: markers that `ProcessorFormatter` adds itself
+      (``_record``, ``_from_structlog``) along with keys that are already
+      present in the event dictionary (like ``event``). Business extras never
+      overwrite them.
+    - *Business fields*: everything else that has been passed via ``extra``.
+
+    Business fields are only ever **added** to the event dictionary. What
+    happens when a business field's name is already taken is controlled by
+    *on_collision*; colliding fields are never silently dropped.
 
     Args:
         allow:
@@ -904,13 +930,39 @@ class ExtraAdder:
             that do not exist on a standard `logging.LogRecord` object will be
             copied to event dictionaries.
 
+        on_collision:
+            What to do if a business field's name is already present in the
+            event dictionary:
+
+            - ``"raise"`` (default): raise a `ValueError` that names the
+              colliding fields. The event dictionary is left unmodified.
+            - ``"nest"``: put colliding business fields into a separate
+              mapping under the ``_foreign_extra`` key of the event
+              dictionary, preserving both the existing keys and the colliding
+              business fields.
+
     .. versionadded:: 21.5.0
+    .. versionchanged:: 26.2.0
+       Extra attributes no longer silently overwrite existing event
+       dictionary keys. Added *on_collision*.
     """
 
-    __slots__ = ("_copier",)
+    __slots__ = ("_copier", "_on_collision")
 
-    def __init__(self, allow: Collection[str] | None = None) -> None:
-        self._copier: Callable[[EventDict, logging.LogRecord], None]
+    def __init__(
+        self,
+        allow: Collection[str] | None = None,
+        on_collision: Literal["raise", "nest"] = "raise",
+    ) -> None:
+        if on_collision not in ("raise", "nest"):
+            msg = (
+                f"Invalid on_collision value {on_collision!r}; "
+                "must be 'raise' or 'nest'."
+            )
+            raise ValueError(msg)
+
+        self._on_collision = on_collision
+        self._copier: Callable[[logging.LogRecord], dict[str, Any]]
         if allow is not None:
             # The contents of allow is copied to a new list so that changes to
             # the list passed into the constructor does not change the
@@ -924,27 +976,65 @@ class ExtraAdder:
     ) -> EventDict:
         record: logging.LogRecord | None = event_dict.get("_record")
         if record is not None:
-            self._copier(event_dict, record)
+            self._merge(event_dict, self._copier(record))
         return event_dict
 
-    @classmethod
-    def _copy_all(
-        cls, event_dict: EventDict, record: logging.LogRecord
-    ) -> None:
-        for key, value in record.__dict__.items():
-            if key not in _LOG_RECORD_KEYS:
-                event_dict[key] = value
+    def _merge(self, event_dict: EventDict, items: dict[str, Any]) -> None:
+        """
+        Merge business *items* into *event_dict* according to the configured
+        collision policy.
 
-    @classmethod
+        Existing keys always keep their values; colliding business fields are
+        either rejected or preserved under ``_foreign_extra``.
+        """
+        clean: dict[str, Any] = {}
+        colliding: dict[str, Any] = {}
+        for key, value in items.items():
+            # Internal markers and _FOREIGN_EXTRA_KEY are always reserved --
+            # even if not present in this event dict -- so a business field
+            # can never claim (and thus shadow) them.
+            if (
+                key in event_dict
+                or key in _INTERNAL_EVENT_DICT_KEYS
+                or key == _FOREIGN_EXTRA_KEY
+            ):
+                colliding[key] = value
+            else:
+                clean[key] = value
+
+        if colliding and self._on_collision == "raise":
+            msg = (
+                "Extra attribute(s) "
+                + ", ".join(sorted(repr(k) for k in colliding))
+                + " would overwrite existing event dictionary key(s). "
+                "Rename the extra attribute(s), or pass "
+                "on_collision='nest' to ExtraAdder to preserve them under "
+                f"the {_FOREIGN_EXTRA_KEY!r} key."
+            )
+            raise ValueError(msg)
+
+        event_dict.update(clean)
+        if colliding:
+            nest = event_dict.setdefault(_FOREIGN_EXTRA_KEY, {})
+            nest.update(colliding)
+
+    @staticmethod
+    def _copy_all(record: logging.LogRecord) -> dict[str, Any]:
+        return {
+            key: value
+            for key, value in record.__dict__.items()
+            if key not in _LOG_RECORD_KEYS
+        }
+
+    @staticmethod
     def _copy_allowed(
-        cls,
-        allow: Collection[str],
-        event_dict: EventDict,
-        record: logging.LogRecord,
-    ) -> None:
-        for key in allow:
-            if key in record.__dict__:
-                event_dict[key] = record.__dict__[key]
+        allow: Collection[str], record: logging.LogRecord
+    ) -> dict[str, Any]:
+        return {
+            key: record.__dict__[key]
+            for key in allow
+            if key in record.__dict__
+        }
 
 
 LOG_KWARG_NAMES = ("exc_info", "stack_info", "stacklevel")
@@ -1085,6 +1175,31 @@ class ProcessorFormatter(logging.Formatter):
             If True, use ``record.getMessage`` to get a fully rendered log
             message, otherwise use ``str(record.msg)``. (default: True)
 
+    .. _field-partitions:
+
+    **Field partitions and record identity**
+
+    Regardless of whether a log entry was created by *structlog* or by plain
+    `logging`, it passes through *processors* with the same public contract
+    and the event dictionary is partitioned into three kinds of fields:
+
+    - *Standard fields*: attributes that exist on every `logging.LogRecord`.
+      They are never copied into the event dictionary implicitly and remain
+      available under the ``_record`` key.
+    - *Internal fields*: the ``_record`` and ``_from_structlog`` keys (plus
+      the ``_logger``/``_name`` attributes that `wrap_for_formatter`
+      attaches to records). They are reserved; business extras can never
+      overwrite them and a foreign record carrying ``_logger``/``_name``
+      extras is still recognized as foreign.
+    - *Business fields*: everything else, for example values passed via
+      `logging`'s ``extra`` parameter. `ExtraAdder` copies them only into
+      unoccupied names; collisions are either rejected or preserved under a
+      separate mapping -- never silently dropped.
+
+    `format` works on a copy of the record, so the original
+    `logging.LogRecord` is never modified and multiple handlers/formatters
+    can format the same record without affecting each other's output.
+
     Raises:
         TypeError: If both or neither *processor* and *processors* are passed.
 
@@ -1097,6 +1212,9 @@ class ProcessorFormatter(logging.Formatter):
        *processor* (singular) in favor of *processors* (plural). Removal is not
        planned.
     .. versionadded:: 23.3.0 *use_get_message*
+    .. versionchanged:: 26.2.0
+       Foreign records carrying ``_logger``/``_name`` extras are no longer
+       misclassified as *structlog* records.
     """
 
     processors: Sequence[Processor]
@@ -1160,8 +1278,14 @@ class ProcessorFormatter(logging.Formatter):
         meth_name = getattr(record, "_name", "__structlog_sentinel__")
 
         ed: ProcessorReturnValue
-        if logger is not _SENTINEL and meth_name != "__structlog_sentinel__":
-            # Both attached by wrap_for_formatter
+        if (
+            logger is not _SENTINEL
+            and meth_name != "__structlog_sentinel__"
+            and isinstance(record.msg, dict)
+        ):
+            # Both attached by wrap_for_formatter. The isinstance check keeps
+            # foreign records that merely carry `_logger`/`_name` business
+            # extras from being misclassified as structlog records.
             if self.logger is not None:
                 logger = self.logger
             meth_name = cast(str, record._name)  # type:ignore[attr-defined]
