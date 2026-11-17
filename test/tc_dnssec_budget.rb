@@ -181,6 +181,167 @@ class KeyCacheIdentityTest
     end
     assert_empty(@verifier.trusted_keys)
   end
+
+  def test_query_charges_are_normalized_deduplicated_and_inspectable
+    budget = Dnsruby::ValidationBudget.new
+    Dnsruby::ValidationBudget.with(budget) do
+      assert(budget.charge_query('Example.INVALID.', 'DS'))
+      refute(budget.charge_query('example.invalid.', Dnsruby::Types.DS))
+      budget.child.charge_query(Dnsruby::Name.create('other.invalid.'), Dnsruby::Types.DNSKEY)
+      budget.signature!
+    end
+    charges = budget.charges
+    assert(charges.frozen?)
+    assert(charges.all?(&:frozen?))
+    assert_equal([:query, :reused_query, :query, :signature], charges.map(&:kind))
+    assert_equal('DS example.invalid.', charges[0].detail)
+    assert_equal(Dnsruby::ValidationBudget::DERIVED_QUERY_WORK, charges[0].work)
+    assert_equal(0, charges[1].work)
+    assert_equal('DNSKEY other.invalid.', charges[2].detail)
+    assert_equal({
+      work: 2 * Dnsruby::ValidationBudget::DERIVED_QUERY_WORK,
+      signature_verifications: 1,
+      derived_queries: 2,
+      reused_queries: 1,
+      recorded_charges: 4,
+      unrecorded_charges: 0
+    }, budget.summary)
+  end
+
+  def test_ledger_survives_exhaustion_and_failed_queries_are_not_charged
+    limits = Dnsruby::Dnssec.validation_limits.merge(
+      max_work: Dnsruby::ValidationBudget::DERIVED_QUERY_WORK)
+    budget = Dnsruby::ValidationBudget.new(limits: limits)
+    budget.charge_query('example.', 'DNSKEY')
+    budget.signature!
+    assert_raises(Dnsruby::ValidationLimitError) { budget.charge_query('other.example.', 'DS') }
+    # Exhaustion is an incomplete validation, but the completed charges remain
+    # inspectable; the refused query was never a real network request.
+    assert_equal([:query, :signature], budget.charges.map(&:kind))
+    assert_equal(1, budget.summary[:derived_queries])
+    assert_equal(2, budget.summary[:recorded_charges])
+    assert_raises(Dnsruby::ValidationLimitError) { budget.check! }
+  end
+
+  def test_derived_lookups_are_itemized_and_completed_dependencies_not_recharged
+    parent_key, responses, build_message = chain_fixtures
+    @verifier.add_trust_anchor(parent_key)
+    budget = Dnsruby::ValidationBudget.new
+    message = build_message.call
+    queries = with_derived_query_double(responses) do |seen|
+      Dnsruby::ValidationBudget.with(budget) do
+        assert(@verifier.validate(message, Dnsruby::Message.new('collision.invalid.', 'A')))
+      end
+      seen
+    end
+    assert_equal(Dnsruby::Message::SecurityLevel.SECURE, message.security_level)
+    assert_equal([['invalid.', Dnsruby::Types.DNSKEY], ['collision.invalid.', Dnsruby::Types.DS],
+      ['collision.invalid.', Dnsruby::Types.DNSKEY]], queries)
+    derived = budget.charges.select { |charge| charge.kind == :query }
+    assert_equal(['DNSKEY invalid.', 'DS collision.invalid.', 'DNSKEY collision.invalid.'],
+      derived.map(&:detail))
+    assert(derived.all? { |charge| charge.work == Dnsruby::ValidationBudget::DERIVED_QUERY_WORK })
+    signatures = budget.charges.select { |charge| charge.kind == :signature }
+    assert_includes(signatures.map(&:detail), 'A collision.invalid.')
+    summary = budget.summary
+    assert_equal(3, summary[:derived_queries])
+    assert_equal(0, summary[:reused_queries])
+    assert_equal(summary[:signature_verifications], signatures.length)
+    assert_operator(summary[:work], :>=, 3 * Dnsruby::ValidationBudget::DERIVED_QUERY_WORK)
+
+    # A second validation of the same graph reuses the completed dependencies.
+    # The repeated DNSKEY lookup is itemized as a reuse, not charged as
+    # another network request.
+    work_before = budget.summary[:work]
+    second = build_message.call
+    with_derived_query_double(responses) do
+      Dnsruby::ValidationBudget.with(budget) do
+        assert(@verifier.validate(second, Dnsruby::Message.new('collision.invalid.', 'A')))
+      end
+    end
+    assert_equal(Dnsruby::Message::SecurityLevel.SECURE, second.security_level)
+    summary = budget.summary
+    assert_equal(3, summary[:derived_queries])
+    assert_equal(1, summary[:reused_queries])
+    assert_operator(summary[:work] - work_before, :<, Dnsruby::ValidationBudget::DERIVED_QUERY_WORK)
+    reused = budget.charges.select { |charge| charge.kind == :reused_query }
+    assert_equal(['DNSKEY collision.invalid.'], reused.map(&:detail))
+    assert(reused.all? { |charge| charge.work == 0 })
+  end
+
+  def test_cancellation_during_a_derived_query_converges_without_learning_trust
+    parent_key, responses, build_message = chain_fixtures
+    @verifier.add_trust_anchor(parent_key)
+    budget = Dnsruby::ValidationBudget.new
+    message = build_message.call
+    cancel = ->(_name, _type) { Dnsruby::ValidationBudget.current.cancel }
+    with_derived_query_double(responses, cancel) do
+      assert_raises(Dnsruby::ValidationCancelled) do
+        Dnsruby::ValidationBudget.with(budget) do
+          @verifier.validate(message, Dnsruby::Message.new('collision.invalid.', 'A'))
+        end
+      end
+    end
+    # Cancellation converged the subqueries: nothing was learned, and the
+    # interrupted validation is neither secure nor insecure.
+    refute_equal(Dnsruby::Message::SecurityLevel.SECURE, message.security_level)
+    refute_equal(Dnsruby::Message::SecurityLevel.INSECURE, message.security_level)
+    assert_empty(@verifier.trusted_keys)
+    assert_equal(['DNSKEY invalid.'],
+      budget.charges.select { |charge| charge.kind == :query }.map(&:detail))
+    assert_equal(1, budget.summary[:derived_queries])
+  end
+
+  private
+
+  # A two-zone chain (invalid. -> collision.invalid.) built entirely from the
+  # local test keys, plus the responses a resolver double must serve for the
+  # derived DS/DNSKEY lookups. No network is involved.
+  def chain_fixtures
+    parent_key = Dnsruby::RR.create(@a.to_s)
+    parent_key.name = 'invalid.'
+    invalid_keys = Dnsruby::Message.new('invalid.', 'DNSKEY')
+    signed(parent_key, parent_key, 0).each { |rr| invalid_keys.add_answer(rr) }
+    ds_response = Dnsruby::Message.new('collision.invalid.', 'DS')
+    signed(Dnsruby::RR::DS.from_key(@a, 2), parent_key, 0).each { |rr| ds_response.add_answer(rr) }
+    key_response = Dnsruby::Message.new('collision.invalid.', 'DNSKEY')
+    signed(@a, @a, 0).each { |rr| key_response.add_answer(rr) }
+    responses = {
+      ['invalid.', Dnsruby::Types.DNSKEY.code] => invalid_keys,
+      ['collision.invalid.', Dnsruby::Types.DS.code] => ds_response,
+      ['collision.invalid.', Dnsruby::Types.DNSKEY.code] => key_response
+    }
+    build_message = lambda do
+      message = Dnsruby::Message.new('collision.invalid.', 'A')
+      signed(Dnsruby::RR.create('collision.invalid. 300 IN A 192.0.2.9'), @a, 0).each do |rr|
+        message.add_answer(rr)
+      end
+      message
+    end
+    [parent_key, responses, build_message]
+  end
+
+  # A resolver stand-in serving the given responses and recording the derived
+  # queries it is asked for. An optional hook runs inside each lookup.
+  def with_derived_query_double(responses, hook = nil)
+    queries = []
+    resolver = Object.new
+    resolver.define_singleton_method(:query_no_validation_or_recursion) do |name, type|
+      queries << [name.to_s(true), type]
+      hook.call(name, type) if hook
+      responses.fetch([name.to_s(true), type.code])
+    end
+    Dnsruby::Dnssec.stub(:do_validation_with_recursor?, false) do
+      Dnsruby::Dnssec.stub(:default_resolver, resolver) do
+        @verifier.stub(:get_nameservers_for, resolver) do
+          @verifier.stub(:get_nameservers_from_message, resolver) do
+            yield queries
+          end
+        end
+      end
+    end
+    queries
+  end
 end
 
 class DnssecBudgetTest < Minitest::Test

@@ -195,6 +195,7 @@ module Dnsruby
       #       print "Sending query : res.dnssec = #{@res.dnssec}"
       ret = nil
       begin
+        charge_derived_query("dlv.isc.org.", Types.DNSKEY)
         ret = @res.query_no_validation_or_recursion("dlv.isc.org.", Types.DNSKEY)
         if (!ret)
           raise ResolvError.new("Couldn't get response from Recursor")
@@ -1398,7 +1399,7 @@ module Dnsruby
           end
           next if parent_provenance && !usable_provenance?(parent_provenance)
           parent_provenance = admit_provenance(parent_provenance)
-          ValidationBudget.current&.signature!
+          ValidationBudget.current&.signature!("#{sigrec.type_covered} #{rrset.name.to_s(true).downcase}")
           ttl_expiration = received_at + [rrset.ttl, sigrec.ttl, sigrec.original_ttl].min
           previous_expirations = (rrset.rrs + [sigrec]).map do |rr|
             rr.instance_variable_get(:@dnsruby_authenticated_expiration)
@@ -1696,6 +1697,7 @@ module Dnsruby
       ret = nil
       begin
         #         ret = res.send_message(query)
+        charge_derived_query(name, Types.DNSKEY)
         ret = res.query_no_validation_or_recursion(name, Types.DNSKEY)
         if (!ret)
           raise ResolvError.new("Couldn't get DNSKEY from Recursor")
@@ -1736,6 +1738,7 @@ module Dnsruby
         ret = nil
         begin
           #           ret = @res.send_message(query)
+          charge_derived_query(name_to_query, Types.DLV)
           ret = @res.query_no_validation_or_recursion(name_to_query, Types.DLV)
           if (!ret)
             raise ResolvError.new("Couldn't get DLV record from Recursor")
@@ -1917,6 +1920,7 @@ module Dnsruby
             TheLog.debug("Trying to find DS records for #{child} from servers for #{parent}")
             ds_ret = nil
             begin
+              charge_derived_query(child, Types.DS)
               ds_ret = parent_res.query_no_validation_or_recursion(child, Types.DS)
               if (!ds_ret)
                 raise ResolvError.new("Couldn't get DS records from Recursor")
@@ -1991,6 +1995,7 @@ module Dnsruby
         key_ret = nil
         begin
           #           key_ret = child_res.send_message(query)
+          charge_derived_query(child, Types.DNSKEY)
           key_ret = child_res.query_no_validation_or_recursion(child, Types.DNSKEY)
           if (!key_ret)
             raise ResolvError.new("Couldn't get info from Recursor")
@@ -2034,6 +2039,15 @@ module Dnsruby
       algorithm_supported?(record.algorithm, operational: true) && [1, 2, 4].include?(record.digest_type.code)
     end
     private :supported_ds?
+
+    # A lookup this validation derives (DS, DNSKEY, DLV) is a real network
+    # request against the shared graph budget. The budget ledger itemizes it;
+    # a repeated lookup reuses the completed dependency and is not charged as
+    # another network request.
+    def charge_derived_query(name, type)
+      ValidationBudget.current&.charge_query(name, type)
+    end
+    private :charge_derived_query
 
     # Apply digest preference to the complete authenticated/trusted RRset,
     # before matching individual keys (RFC 4509 section 3).

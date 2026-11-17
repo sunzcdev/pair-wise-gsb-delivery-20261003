@@ -28,6 +28,18 @@ module Dnsruby
       timeout: 5.0
     }.freeze
 
+    # One recorded unit of validation work: a derived lookup, its reuse, or a
+    # signature verification. Entries are frozen so a completed validation
+    # graph can be inspected without retaining any mutable operation state.
+    Charge = Struct.new(:kind, :detail, :work)
+
+    # Work charged for one derived lookup (DS/DNSKEY/DLV). Repeating an
+    # already completed lookup reuses that dependency and charges nothing.
+    DERIVED_QUERY_WORK = 100
+    # The ledger is diagnostic; bound it so a hostile graph cannot grow it
+    # without limit. Counters in the summary remain exact past the cap.
+    MAX_LEDGER_ENTRIES = 4096
+
     attr_reader :control, :transaction
 
     def self.current
@@ -71,7 +83,8 @@ module Dnsruby
         @limits = limits
         deadline = [deadline, TransportClock.now + limits[:timeout]].compact.min
         @control = QueryControl.new(deadline: deadline, parent: QueryControl.current)
-        @state = { mutex: Mutex.new, signature_verifications: 0, work: 0 }
+        @state = { mutex: Mutex.new, signature_verifications: 0, work: 0,
+          queries: {}, reused_queries: 0, ledger: [], ledger_overflow: 0 }
       end
     end
 
@@ -127,17 +140,73 @@ module Dnsruby
     end
     private :check_counts!
 
-    def signature!
+    def signature!(detail = nil)
       check!
       @state[:mutex].synchronize do
         @state[:signature_verifications] += 1
+        record(:signature, detail, 0)
         check_counts!
       end
       true
     end
 
+    # Charge a lookup derived from this validation (DS, DNSKEY, DLV, ...).
+    # The first occurrence of each owner/type is a real network request and
+    # counts against the work limit. A repeat reuses the completed dependency:
+    # it is recorded as a reuse and never charged as another network request.
+    # Returns true when the charge was for a fresh lookup.
+    def charge_query(name, type)
+      check!
+      owner = name.is_a?(Name) ? name : Name.create(name)
+      code = type.is_a?(Types) ? type.code : Types.to_code(type)
+      identity = [owner.canonical, code]
+      detail = "#{Types.to_string(code)} #{owner.to_s(true).downcase}"
+      fresh = false
+      @state[:mutex].synchronize do
+        fresh = !@state[:queries].key?(identity)
+        @state[:work] += DERIVED_QUERY_WORK if fresh
+        check_counts!
+        @state[:queries][identity] = true if fresh
+        @state[:reused_queries] += 1 unless fresh
+        record(fresh ? :query : :reused_query, detail, fresh ? DERIVED_QUERY_WORK : 0)
+      end
+      fresh
+    end
+
+    # Inspectable breakdown of everything this validation graph was charged,
+    # shared with every child budget. Remains readable after exhaustion or
+    # cancellation so an incomplete validation can report what it attempted.
+    def charges
+      @state[:mutex].synchronize { @state[:ledger].dup.freeze }
+    end
+
+    # Exact counters for the whole graph, independent of the ledger cap.
+    def summary
+      @state[:mutex].synchronize do
+        {
+          work: @state[:work],
+          signature_verifications: @state[:signature_verifications],
+          derived_queries: @state[:queries].length,
+          reused_queries: @state[:reused_queries],
+          recorded_charges: @state[:ledger].length,
+          unrecorded_charges: @state[:ledger_overflow]
+        }.freeze
+      end
+    end
+
     protected
 
     attr_reader :limits, :state
+
+    private
+
+    # Caller holds the state mutex.
+    def record(kind, detail, work)
+      if @state[:ledger].length < MAX_LEDGER_ENTRIES
+        @state[:ledger] << Charge.new(kind, detail, work).freeze
+      else
+        @state[:ledger_overflow] += 1
+      end
+    end
   end
 end
