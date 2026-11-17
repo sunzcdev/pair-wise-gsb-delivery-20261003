@@ -19,10 +19,14 @@ from .metrics import (
 from .metrics_core import Metric
 from .platform_collector import PLATFORM_COLLECTOR, PlatformCollector
 from .process_collector import PROCESS_COLLECTOR, ProcessCollector
-from .registry import CollectorRegistry, REGISTRY
+from .registry import (
+    CollectorFailure, CollectorRegistry, REGISTRY, TolerantCollectionResult,
+)
 
 __all__ = (
     'CollectorRegistry',
+    'CollectorFailure',
+    'TolerantCollectionResult',
     'REGISTRY',
     'Metric',
     'Counter',

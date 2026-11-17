@@ -1,6 +1,6 @@
 import copy
 from threading import Lock
-from typing import Dict, Iterable, List, Optional, Protocol, Set
+from typing import Dict, Iterable, Iterator, List, Optional, Protocol, Set
 
 from .metrics_core import Metric
 
@@ -8,6 +8,52 @@ from .metrics_core import Metric
 class Collector(Protocol):
     def collect(self) -> Iterable[Metric]:
         """Collect metrics."""
+
+
+class CollectorFailure:
+    """Diagnostic information about a collector that raised during a tolerant collect.
+
+    This is plain data, not a metric, so inspecting it can never trigger
+    further collection.
+    """
+
+    def __init__(self, collector: "Collector", exception: BaseException):
+        self.collector = collector
+        self.collector_name = type(collector).__name__
+        self.exception = exception
+        self.error_type = type(exception).__name__
+        self.error_message = str(exception)
+
+    def __repr__(self) -> str:
+        return "CollectorFailure({!r}, {}: {})".format(
+            self.collector_name, self.error_type, self.error_message)
+
+
+class TolerantCollectionResult:
+    """Result of a fault-tolerant collect.
+
+    Attributes:
+        metrics: Complete metric families from collectors that succeeded.
+            A collector that fails part-way through contributes nothing, so
+            no partial metric family (e.g. half a Histogram) is ever present.
+        failures: Diagnostics for each collector that raised, in collection
+            order. Empty when every collector succeeded.
+    """
+
+    def __init__(self, metrics: List[Metric], failures: List[CollectorFailure]):
+        self.metrics = metrics
+        self.failures = failures
+
+    @property
+    def ok(self) -> bool:
+        """True only if every collector completed without error."""
+        return not self.failures
+
+    def __iter__(self) -> Iterator[Metric]:
+        return iter(self.metrics)
+
+    def __len__(self) -> int:
+        return len(self.metrics)
 
 
 class _EmptyCollector:
@@ -40,6 +86,10 @@ class CollectorRegistry:
         self._target_info: Optional[Dict[str, str]] = {}
         self._support_collectors_without_names = support_collectors_without_names
         self._collectors_without_names: List[Collector] = []
+        # Plain in-memory counters of collection failures per collector.
+        # Deliberately not metrics and not a registered collector, so the
+        # diagnostics can never recursively trigger their own collection.
+        self._collector_failure_totals: Dict[Collector, int] = {}
         self.set_target_info(target_info)
 
     def register(self, collector: Collector) -> None:
@@ -105,6 +155,62 @@ class CollectorRegistry:
             yield ti
         for collector in collectors:
             yield from collector.collect()
+
+    def collect_tolerant(self) -> TolerantCollectionResult:
+        """Collects metrics, tolerating collectors that raise.
+
+        Unlike collect(), a collector that raises does not abort the scrape:
+        the complete metric families of every healthy collector are returned
+        in the result's metrics, and each failed collector is reported in the
+        result's failures so the scrape is not mistaken for a full success.
+
+        Collection is all-or-nothing per collector: if a collector yields
+        some metrics and then raises, everything it produced during this
+        scrape is discarded, so no partial metric family (e.g. half a
+        Histogram) is exposed.
+
+        Nothing is cached or replayed: every call invokes collect() on every
+        collector afresh, so a collector that failed on a previous scrape is
+        retried on the next one and stale values are never served in place of
+        current ones.
+
+        Failure diagnostics are kept as plain data (and plain in-memory
+        counters, see get_collector_failure_totals), never as registered
+        collectors, so they cannot recursively trigger their own collection.
+        """
+        with self._lock:
+            collectors = copy.copy(self._collector_to_names)
+            ti = self._target_info_metric() if self._target_info else None
+        metrics: List[Metric] = []
+        failures: List[CollectorFailure] = []
+        if ti:
+            metrics.append(ti)
+        for collector in collectors:
+            try:
+                # Materialize fully before accepting anything, so a collector
+                # that fails part-way through contributes no partial output.
+                collected = list(collector.collect())
+            except Exception as e:
+                failures.append(CollectorFailure(collector, e))
+                with self._lock:
+                    self._collector_failure_totals[collector] = \
+                        self._collector_failure_totals.get(collector, 0) + 1
+                continue
+            metrics.extend(collected)
+        return TolerantCollectionResult(metrics, failures)
+
+    def get_collector_failure_totals(self) -> Dict[str, int]:
+        """Returns per-collector failure counts observed by collect_tolerant().
+
+        Keyed by collector class name. These are plain counters, not metrics,
+        so reading them never triggers collection.
+        """
+        with self._lock:
+            totals: Dict[str, int] = {}
+            for collector, count in self._collector_failure_totals.items():
+                name = type(collector).__name__
+                totals[name] = totals.get(name, 0) + count
+            return totals
 
     def restricted_registry(self, names: Iterable[str]) -> "RestrictedRegistry":
         """Returns object that only collects some metrics.
