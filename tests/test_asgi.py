@@ -5,7 +5,7 @@ from unittest import skipUnless, TestCase
 
 from asgiref.testing import ApplicationCommunicator
 
-from prometheus_client import CollectorRegistry, Counter, make_asgi_app
+from prometheus_client import CollectorRegistry, Counter, Histogram, make_asgi_app
 from prometheus_client.exposition import CONTENT_TYPE_PLAIN_0_0_4
 
 try:
@@ -261,6 +261,51 @@ class ASGITest(TestCase):
         self.assert_metrics(output, *metrics[0])
         self.assert_metrics(output, *metrics[1])
         self.assert_not_metrics(output, *metrics[2])
+
+        self.loop.run_until_complete(
+            self.communicator.wait()
+        )
+
+    def test_qs_parsing_family(self):
+        """The 'family[]' query string param selects a whole family"""
+
+        app = make_asgi_app(self.registry)
+        Histogram('hh', 'A histogram', registry=self.registry).observe(0.05)
+        self.increment_metrics("other", "other metric", 1)
+
+        self.scope['query_string'] = b"family[]=hh"
+        self.seed_app(app)
+        self.send_default_request()
+
+        outputs = self.get_all_output()
+        output = outputs[1]['body'].decode('utf8')
+        self.assertIn("# HELP hh A histogram\n", output)
+        self.assertIn("# TYPE hh histogram\n", output)
+        self.assertIn('hh_bucket{le="+Inf"} 1.0\n', output)
+        self.assertIn('hh_count 1.0\n', output)
+        self.assertIn('hh_sum 0.05\n', output)
+        self.assertNotIn('other_total', output)
+
+        self.loop.run_until_complete(
+            self.communicator.wait()
+        )
+
+    def test_qs_parsing_family_openmetrics(self):
+        """Family selection applies identically to the OpenMetrics encoder"""
+
+        app = make_asgi_app(self.registry)
+        Histogram('hh', 'A histogram', registry=self.registry).observe(0.05)
+
+        self.scope['headers'] = [(b"Accept", b"application/openmetrics-text; version=1.0.0")]
+        self.scope['query_string'] = b"family[]=hh"
+        self.seed_app(app)
+        self.send_default_request()
+
+        output = self.get_all_output()[1]['body'].decode('utf8')
+        self.assertIn("# HELP hh A histogram\n", output)
+        self.assertIn("# TYPE hh histogram\n", output)
+        self.assertIn('hh_bucket{le="+Inf"} 1.0\n', output)
+        self.assertIn('hh_count 1.0\n', output)
 
         self.loop.run_until_complete(
             self.communicator.wait()

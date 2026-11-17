@@ -55,11 +55,28 @@ class Metric:
             self.samples,
         )
 
-    def _restricted_metric(self, names):
-        """Build a snapshot of a metric with samples restricted to a given set of names."""
-        samples = [s for s in self.samples if s[0] in names]
+    def _restricted_metric(self, names, families=()):
+        """Build a snapshot of a metric with samples restricted by selection.
+
+        ``names`` holds exact public sample names. A sample is retained only
+        when its own name is present, so a selector can never pull in a
+        different series that merely starts with the same characters.
+
+        ``families`` holds metric family names (the ``Metric.name`` of the
+        family, before any derived sample suffix). Naming a family selects
+        every sample the family actually exposes at this moment, which keeps
+        composite families such as a Histogram complete and interpretable.
+
+        The family metadata (name, documentation, type and unit) is always
+        preserved. When nothing is selected the family is dropped entirely,
+        so exposition never emits metadata without any sample behind it.
+        """
+        if self.name in families:
+            samples = list(self.samples)
+        else:
+            samples = [s for s in self.samples if s.name in names]
         if samples:
-            m = Metric(self.name, self.documentation, self.type)
+            m = Metric(self.name, self.documentation, self.type, self.unit)
             m.samples = samples
             return m
         return None

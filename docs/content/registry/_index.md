@@ -67,17 +67,24 @@ for metric in REGISTRY.collect():
     print(metric.name, metric.type)
 ```
 
-### `restricted_registry(names)`
+### `restricted_registry(names, families=())`
 
-Return a view of this registry that only exposes the named metrics. Useful
+Return a view of this registry that only exposes the selected metrics. Useful
 for partial scrapes. See [Restricted registry](../restricted-registry/) for
 usage with `generate_latest` and the built-in HTTP server.
+
+`names` selects individual public sample names (matched exactly, never as a
+prefix); `families` selects whole metric families by family name. Both may be
+combined.
 
 ```python
 from prometheus_client import generate_latest
 
 subset = REGISTRY.restricted_registry(['python_info', 'process_cpu_seconds_total'])
 output = generate_latest(subset)
+
+# Keep a composite family complete and interpretable
+whole_histogram = REGISTRY.restricted_registry(families=['request_duration_seconds'])
 ```
 
 ### `get_sample_value(name, labels=None)`

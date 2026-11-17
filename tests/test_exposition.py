@@ -236,6 +236,52 @@ ts{foo="e"} 0.0 123000
 ts{foo="f"} 0.0 123000
 """, generate_latest(self.registry))
 
+    def test_restricted_family_selector_keeps_family_complete(self):
+        h = Histogram('hh', 'A histogram', registry=self.registry)
+        h.observe(0.05)
+
+        output = generate_latest(self.registry.restricted_registry(families=['hh']))
+        self.assertIn(b'# HELP hh A histogram\n# TYPE hh histogram\n', output)
+        self.assertIn(b'hh_bucket{le="0.05"} 1.0\n', output)
+        self.assertIn(b'hh_bucket{le="+Inf"} 1.0\n', output)
+        self.assertIn(b'hh_count 1.0\n', output)
+        self.assertIn(b'hh_sum 0.05\n', output)
+
+    def test_restricted_sample_selector_keeps_metadata(self):
+        h = Histogram('hh', 'A histogram', registry=self.registry)
+        h.observe(0.05)
+
+        output = generate_latest(self.registry.restricted_registry(['hh_sum']))
+        self.assertEqual(b'# HELP hh A histogram\n# TYPE hh histogram\nhh_sum 0.05\n', output)
+
+    def test_restricted_selector_does_not_match_similar_names(self):
+        Gauge('hh_summary', 'Another metric', registry=self.registry).set(3)
+        h = Histogram('hh', 'A histogram', registry=self.registry)
+        h.observe(0.05)
+
+        output = generate_latest(self.registry.restricted_registry(['hh_sum']))
+        self.assertNotIn(b'hh_summary', output)
+        self.assertIn(b'hh_sum ', output)
+
+    def test_restricted_fully_filtered_family_has_no_orphan_metadata(self):
+        Histogram('hh', 'A histogram', registry=self.registry).observe(0.05)
+        Summary('ss', 'A summary', registry=self.registry).observe(7)
+
+        output = generate_latest(self.registry.restricted_registry(['hh_count']))
+        self.assertNotIn(b'ss', output)
+        self.assertIn(b'# HELP hh A histogram\n# TYPE hh histogram\nhh_count 1.0\n', output)
+
+    def test_restricted_created_only_family_has_no_orphan_metadata(self):
+        h = Histogram('hh', 'A histogram', registry=self.registry)
+        h.observe(0.05)
+
+        # In the text format _created is written as its own gauge family, so
+        # the histogram header must not be emitted without any bucket.
+        output = generate_latest(self.registry.restricted_registry(['hh_created']))
+        self.assertIn(b'# HELP hh_created A histogram\n# TYPE hh_created gauge\n', output)
+        self.assertNotIn(b'# TYPE hh histogram', output)
+        self.assertNotIn(b'hh_bucket', output)
+
 
 class TestPushGateway(unittest.TestCase):
     def setUp(self):

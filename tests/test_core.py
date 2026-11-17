@@ -1246,6 +1246,118 @@ class TestCollectorRegistry(unittest.TestCase):
         self.assertEqual(list(registry.restricted_registry(['metric']).collect()), [])
         mock_collector.collect.assert_called()
 
+    def test_restricted_registry_family_keeps_composite_family(self):
+        registry = CollectorRegistry()
+        Histogram('h', 'help', registry=registry).observe(0.05)
+
+        metrics = list(registry.restricted_registry(families=['h']).collect())
+        self.assertEqual(1, len(metrics))
+        metric = metrics[0]
+        self.assertEqual('h', metric.name)
+        self.assertEqual('histogram', metric.type)
+        self.assertEqual('help', metric.documentation)
+        # The whole family is kept, including buckets and the count/sum pair.
+        self.assertIn(Sample('h_count', {}, 1.0), metric.samples)
+        self.assertIn(Sample('h_sum', {}, 0.05), metric.samples)
+        self.assertIn(Sample('h_bucket', {'le': '+Inf'}, 1.0), metric.samples)
+
+    def test_restricted_registry_sample_keeps_only_selected_sample(self):
+        registry = CollectorRegistry()
+        Histogram('h', 'help', registry=registry).observe(0.05)
+
+        metrics = list(registry.restricted_registry(['h_sum']).collect())
+        self.assertEqual(1, len(metrics))
+        metric = metrics[0]
+        # Metadata stays complete and interpretable even for one sample.
+        self.assertEqual('h', metric.name)
+        self.assertEqual('histogram', metric.type)
+        self.assertEqual('help', metric.documentation)
+        self.assertEqual([Sample('h_sum', {}, 0.05)], metric.samples)
+
+    def test_restricted_registry_matches_exact_sample_names(self):
+        registry = CollectorRegistry()
+        # A different metric whose name merely starts with the selector.
+        Gauge('h_summary_gauge', 'help', registry=registry)
+        Histogram('h', 'help', registry=registry).observe(0.05)
+
+        m = Metric('h', 'help', 'histogram')
+        m.samples = [Sample('h_sum', {}, 0.05)]
+        self.assertEqual([m], list(registry.restricted_registry(['h_sum']).collect()))
+
+    def test_restricted_registry_unknown_selector_collects_nothing(self):
+        registry = CollectorRegistry()
+        Gauge('g', 'help', registry=registry)
+        self.assertEqual([], list(registry.restricted_registry(['g_extra']).collect()))
+        self.assertEqual([], list(registry.restricted_registry(families=['gx']).collect()))
+
+    def test_restricted_registry_family_selector_survives_late_registration(self):
+        registry = CollectorRegistry()
+        restricted_registry = registry.restricted_registry(families=['s'])
+        Summary('s', 'help', registry=registry).observe(7)
+
+        metrics = list(restricted_registry.collect())
+        self.assertEqual(['s'], [m.name for m in metrics])
+        self.assertEqual(['s_count', 's_sum', 's_created'],
+                         [s.name for s in metrics[0].samples])
+
+    def test_restricted_registry_fully_filtered_family_is_not_yielded(self):
+        registry = CollectorRegistry()
+        Histogram('h', 'help', registry=registry).observe(0.05)
+        Summary('s', 'help', registry=registry).observe(7)
+
+        # Only h_count is selected, so the summary family has no samples left
+        # and must not appear as metadata on its own.
+        metrics = list(registry.restricted_registry(['h_count']).collect())
+        self.assertEqual(['h'], [m.name for m in metrics])
+
+    def test_target_info_restricted_registry_modes(self):
+        registry = CollectorRegistry(target_info={'foo': 'bar'})
+        Summary('s', 'help', registry=registry).observe(7)
+
+        expected = Metric('target', 'Target metadata', 'info')
+        expected.samples = [Sample('target_info', {'foo': 'bar'}, 1)]
+
+        # Accepted by its public sample name as a sample selector.
+        self.assertEqual([expected], list(registry.restricted_registry(['target_info']).collect()))
+        # Accepted by its family name as a family selector.
+        self.assertEqual([expected], list(registry.restricted_registry(families=['target']).collect()))
+        # The two modes stay distinct: neither selector names the other form.
+        self.assertEqual([], list(registry.restricted_registry(['target']).collect()))
+        self.assertEqual([], list(registry.restricted_registry(families=['target_info']).collect()))
+
+    def test_target_info_restricted_registry_requires_target_info(self):
+        registry = CollectorRegistry()
+        Summary('s', 'help', registry=registry).observe(7)
+        self.assertEqual([], list(registry.restricted_registry(['target_info']).collect()))
+        self.assertEqual([], list(registry.restricted_registry(families=['target']).collect()))
+
+    def test_restricted_registry_collects_each_collector_once(self):
+        registry = CollectorRegistry()
+
+        class CountingCollector:
+            def __init__(self):
+                self.collect_calls = 0
+
+            def describe(self):
+                return [Metric('hh', 'help', 'histogram')]
+
+            def collect(self):
+                self.collect_calls += 1
+                h = HistogramMetricFamily('hh', 'help')
+                h.add_metric([], [('1.0', 1), ('+Inf', 1)], 1)
+                return [h]
+
+        collector = CountingCollector()
+        registry.register(collector)
+
+        list(registry.restricted_registry(['hh_sum', 'hh_count']).collect())
+        self.assertEqual(1, collector.collect_calls)
+
+        # Several selectors resolving to the same collector run it only once.
+        list(registry.restricted_registry(['hh_sum', 'hh_count'],
+                                          families=['hh']).collect())
+        self.assertEqual(2, collector.collect_calls)
+
     def test_restricted_registry_does_not_yield_while_locked(self):
         registry = CollectorRegistry(target_info={'foo': 'bar'})
         Summary('s', 'help', registry=registry).observe(7)

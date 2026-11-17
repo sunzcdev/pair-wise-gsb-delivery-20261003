@@ -194,6 +194,59 @@ hh_created 123.456
 """, generate_latest(self.registry, version="1.0.0"))
 
 
+    def test_restricted_family_selector_keeps_family_complete(self) -> None:
+        s = Histogram('hh', 'A histogram', registry=self.registry)
+        s.observe(0.05)
+
+        output = generate_latest(self.registry.restricted_registry(families=['hh']), version="1.0.0")
+        self.assertIn(b'# HELP hh A histogram\n# TYPE hh histogram\n', output)
+        self.assertIn(b'hh_bucket{le="0.05"} 1.0\n', output)
+        self.assertIn(b'hh_bucket{le="+Inf"} 1.0\n', output)
+        self.assertIn(b'hh_count 1.0\n', output)
+        self.assertIn(b'hh_sum 0.05\n', output)
+        self.assertIn(b'hh_created 123.456\n', output)
+
+    def test_restricted_sample_selector_keeps_metadata(self) -> None:
+        s = Histogram('hh', 'A histogram', registry=self.registry)
+        s.observe(0.05)
+
+        output = generate_latest(self.registry.restricted_registry(['hh_sum']), version="1.0.0")
+        self.assertEqual(b'# HELP hh A histogram\n# TYPE hh histogram\nhh_sum 0.05\n# EOF\n', output)
+
+    def test_restricted_selection_keeps_unit_metadata(self) -> None:
+        c = Counter('cc_seconds', 'A counter', registry=self.registry, unit='seconds')
+        c.inc()
+
+        output = generate_latest(self.registry.restricted_registry(['cc_seconds_total']), version="1.0.0")
+        self.assertEqual(
+            b'# HELP cc_seconds A counter\n# TYPE cc_seconds counter\n'
+            b'# UNIT cc_seconds seconds\ncc_seconds_total 1.0\n# EOF\n',
+            output,
+        )
+
+    def test_restricted_selection_matches_text_format(self) -> None:
+        # The same restricted view must select the same samples for both
+        # encoders, so only the selected sample of the family is exposed.
+        from prometheus_client.exposition import generate_latest as text_generate_latest
+
+        s = Histogram('hh', 'A histogram', registry=self.registry)
+        s.observe(0.05)
+        Gauge('hh_summary', 'Another metric', registry=self.registry).set(3)
+
+        restricted = self.registry.restricted_registry(['hh_sum'])
+        self.assertIn(b'hh_sum 0.05\n', text_generate_latest(restricted))
+        self.assertNotIn(b'hh_summary', text_generate_latest(restricted))
+        self.assertIn(b'hh_sum 0.05\n', generate_latest(restricted, version="1.0.0"))
+        self.assertNotIn(b'hh_summary', generate_latest(restricted, version="1.0.0"))
+
+    def test_restricted_fully_filtered_family_has_no_orphan_metadata(self) -> None:
+        Histogram('hh', 'A histogram', registry=self.registry).observe(0.05)
+        Summary('ss', 'A summary', registry=self.registry).observe(7)
+
+        output = generate_latest(self.registry.restricted_registry(['hh_count']), version="1.0.0")
+        self.assertNotIn(b'ss', output)
+        self.assertIn(b'# HELP hh A histogram\n# TYPE hh histogram\nhh_count 1.0\n', output)
+
     def test_native_histogram(self) -> None:
         hfm = HistogramMetricFamily("nh", "nh")
         hfm.add_sample("nh", {}, 0, None, None, NativeHistogram(24, 100, 0, 0.001, 4, (BucketSpan(0, 2), BucketSpan(1, 2)), (BucketSpan(0, 2), BucketSpan(1, 2)), (2, 1, -3, 3), (2, 1, -2, 3)))

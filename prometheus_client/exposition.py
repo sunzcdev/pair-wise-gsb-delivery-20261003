@@ -117,8 +117,12 @@ def _bake_output(registry, accept_header, accept_encoding_header, params, disabl
     """Bake output for metrics output."""
     # Choose the correct plain text format of the output.
     encoder, content_type = choose_encoder(accept_header)
-    if 'name[]' in params:
-        registry = registry.restricted_registry(params['name[]'])
+    names = params.get('name[]', ())
+    families = params.get('family[]', ())
+    if names or families:
+        # The same restricted view feeds whichever encoder was negotiated,
+        # so the text and OpenMetrics outputs obey an identical selection.
+        registry = registry.restricted_registry(names, families=families)
     output = encoder(registry)
     headers = [('Content-Type', content_type)]
     # If gzip encoding required, gzip the output.
@@ -333,11 +337,8 @@ def generate_latest(registry: Collector = REGISTRY, escaping: str = openmetrics.
             elif mtype == 'unknown':
                 mtype = 'untyped'
 
-            output.append('# HELP {} {}\n'.format(
-                openmetrics.escape_metric_name(mname, escaping), metric.documentation.replace('\\', r'\\').replace('\n', r'\n')))
-            output.append(f'# TYPE {openmetrics.escape_metric_name(mname, escaping)} {mtype}\n')
-
             om_samples: Dict[str, List[str]] = {}
+            family_lines: List[str] = []
             for s in metric.samples:
                 for suffix in ['_created', '_gsum', '_gcount']:
                     if s.name == metric.name + suffix:
@@ -345,7 +346,18 @@ def generate_latest(registry: Collector = REGISTRY, escaping: str = openmetrics.
                         om_samples.setdefault(suffix, []).append(sample_line(s))
                         break
                 else:
-                    output.append(sample_line(s))
+                    family_lines.append(sample_line(s))
+            # A restricted view can leave a family whose only selected
+            # samples are OpenMetrics specific (_created, _gsum, _gcount).
+            # Those are written below as their own gauge families, so
+            # emitting this header too would be metadata without a sample of
+            # its own behind it. An empty family without any sample keeps its
+            # historical HELP/TYPE output.
+            if family_lines or not metric.samples:
+                output.append('# HELP {} {}\n'.format(
+                    openmetrics.escape_metric_name(mname, escaping), metric.documentation.replace('\\', r'\\').replace('\n', r'\n')))
+                output.append(f'# TYPE {openmetrics.escape_metric_name(mname, escaping)} {mtype}\n')
+                output.extend(family_lines)
         except Exception as exception:
             exception.args = (exception.args or ('',)) + (metric,)
             raise
