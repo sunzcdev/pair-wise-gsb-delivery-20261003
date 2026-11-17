@@ -1,5 +1,12 @@
 ## Current
 
+concurrent-ruby:
+
+* `Concurrent::TimerTask` gains an explicit `:overlap_policy` (`:skip`, `:coalesce` or `:queue`, the latter bounded by `:max_queue`) for ticks that become due while the previous execution is still running. Executions never overlap and queued ticks never accumulate without bound.
+* `Concurrent::TimerTask` now tracks every scheduled tick with a stable identity and exposes the mapping between scheduled ticks and actual executions via `#tick_history`, `#statistics`, `#last_tick`, `#running_tick` and `#pending_ticks`. Changing `#execution_interval` no longer alters the identity of already scheduled ticks.
+* `Concurrent::TimerTask` no longer accepts new ticks after `#shutdown`/`#kill`, while executions already in flight still finish and are correctly attributed; scheduling and dispatch failures are logged instead of silently stopping the timing thread.
+* `Concurrent::TimerTask` accepts an injectable `:scheduler` clock so scheduling behaviour can be tested deterministically without waiting through real intervals.
+
 ## Release v1.3.8 (19 July 2026)
 
 concurrent-ruby:

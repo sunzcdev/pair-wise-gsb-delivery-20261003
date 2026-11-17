@@ -244,7 +244,7 @@ module Concurrent
         expect(latch.wait(1)).to be_truthy
         subject.kill
 
-        expect(executor).to have_received(:post)
+        expect(executor).to have_received(:post).at_least(:once)
       end
 
       it 'uses a custom executor when given' do
@@ -257,7 +257,7 @@ module Concurrent
         expect(latch.wait(1)).to be_truthy
         subject.kill
 
-        expect(executor).to have_received(:post)
+        expect(executor).to have_received(:post).at_least(:once)
       end
 
       it 'uses a fixed delay when set' do
