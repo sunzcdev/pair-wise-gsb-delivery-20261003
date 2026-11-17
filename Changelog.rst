@@ -5,6 +5,23 @@
 ================
 
 
+.. _version-unreleased:
+
+unreleased
+==========
+
+What's Changed
+~~~~~~~~~~~~~~
+- Add an explicit ``AckCoordinator`` to the virtual transports so parallel
+  consumers can no longer issue a ``multiple`` acknowledgment that crosses a
+  still-unfinished delivery.  Deliveries are tracked per channel (and channel
+  epoch), only the contiguous completed prefix is batched, rejections and
+  requeues keep their own terminal states, stale tags from a reconnected
+  channel are quarantined, and a failed channel call leaves the affected
+  deliveries in an inspectable uncertain state instead of being optimistically
+  marked as acknowledged.
+
+
 .. _version-5.7.0:
 
 5.7.0

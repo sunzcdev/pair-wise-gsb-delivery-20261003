@@ -26,6 +26,7 @@ from kombu.utils.encoding import bytes_to_str, str_to_bytes
 from kombu.utils.scheduling import FairCycle
 from kombu.utils.uuid import uuid
 
+from .ack import AckCoordinator, DeliveryState, UnknownDeliveryTag
 from .exchange import STANDARD_EXCHANGE_TYPES
 
 if TYPE_CHECKING:
@@ -157,6 +158,14 @@ class QoS:
 
     Only supports `prefetch_count` at this point.
 
+    Deliveries and their completions are additionally tracked by an
+    :class:`~kombu.transport.virtual.ack.AckCoordinator`, which guarantees
+    that a batched (``multiple``) acknowledgment only ever covers a
+    contiguous prefix of completed deliveries belonging to the current
+    channel epoch.  The ``_delivered`` ordered dict and the ``_dirty`` tag
+    set are retained as the local, transport-facing bookkeeping that
+    subclasses (e.g. the Redis and SQS transports) build on.
+
     Arguments:
     ---------
         channel (ChannelT): Connection channel.
@@ -190,9 +199,22 @@ class QoS:
         self._dirty = set()
         self._quick_ack = self._dirty.add
         self._quick_append = self._delivered.__setitem__
+        self.ack_coordinator = AckCoordinator(
+            # Resolve the primitives lazily so subclasses (and tests) can
+            # override ``_coordinator_ack`` / ``_coordinator_reject`` after
+            # the QoS object has been constructed.
+            on_ack=lambda *a, **kw: self._coordinator_ack(*a, **kw),
+            on_reject=lambda *a, **kw: self._coordinator_reject(*a, **kw),
+        )
+        self.ack_coordinator.register_channel(self.channel_key)
         self._on_collect = Finalize(
             self, self.restore_unacked_once, exitpriority=1,
         )
+
+    @property
+    def channel_key(self):
+        """Identity used to scope deliveries to their channel."""
+        return self.channel
 
     def can_consume(self):
         """Return true if the channel can be consumed from.
@@ -224,30 +246,170 @@ class QoS:
         if self._dirty:
             self._flush()
         self._quick_append(delivery_tag, message)
+        self.ack_coordinator.track(
+            self.channel_key, delivery_tag, message=message,
+        )
 
     def get(self, delivery_tag):
         return self._delivered[delivery_tag]
 
     def _flush(self):
-        """Flush dirty (acked/rejected) tags from."""
-        dirty = self._dirty
-        delivered = self._delivered
-        while 1:
-            try:
-                dirty_tag = dirty.pop()
-            except KeyError:
-                break
-            delivered.pop(dirty_tag, None)
+        """Flush dirty (acked/rejected) tags from local bookkeeping.
+
+        Tags whose channel call is still uncertain are retained: they
+        remain in ``_dirty`` and in the coordinator, blocking the prefetch
+        window until the outcome is resolved.
+        """
+        for dirty_tag in list(self._dirty):
+            if self._is_uncertain(dirty_tag):
+                continue
+            self._dirty.discard(dirty_tag)
+            self._delivered.pop(dirty_tag, None)
+
+    def _is_uncertain(self, delivery_tag):
+        try:
+            return self.ack_coordinator.get(
+                delivery_tag, channel_key=self.channel_key).uncertain
+        except UnknownDeliveryTag:
+            return False
+
+    def _sync_dirty(self):
+        """Reconcile the local dirty set with the coordinator state.
+
+        Every tag still present in ``_delivered`` that the coordinator no
+        longer considers pending is dirty (completed-and-sent), so the
+        prefetch accounting in :meth:`can_consume` stays correct even before
+        the next :meth:`_flush`.  Deliveries whose channel call is uncertain
+        are deliberately *not* dirtied: their broker outcome is unknown, so
+        they must keep occupying a prefetch slot until resolved.
+        """
+        coordinator = self.ack_coordinator
+        uncertain_tags = {
+            record.delivery_tag for record in coordinator.uncertain
+        }
+        pending_tags = {
+            record.delivery_tag for record in coordinator.pending
+        }
+        self._dirty = {
+            tag for tag in self._delivered
+            if tag not in pending_tags and tag not in uncertain_tags
+        }
+        self._quick_ack = self._dirty.add
 
     def ack(self, delivery_tag):
-        """Acknowledge message and remove from transactional state."""
+        """Acknowledge message and remove from transactional state.
+
+        The completion is recorded with the ack coordinator first; the
+        actual channel bookkeeping only runs when the delivery becomes part
+        of a contiguous completed prefix, so a ``multiple`` ack can never
+        cross an unfinished delivery.
+        """
+        if not self._ensure_tracked(delivery_tag):
+            # The tag is unknown to both the local state and the
+            # coordinator (e.g. a concurrent restore already disposed of it);
+            # preserve the historical best-effort behaviour instead of
+            # raising.  Record it locally so duplicate handling stays intact.
+            self._quick_ack(delivery_tag)
+            return
+        # Record the local completion intent before the channel call, so a
+        # failed flush still leaves an inspectable marker instead of looking
+        # like the message was never acknowledged.
         self._quick_ack(delivery_tag)
+        self.ack_coordinator.mark(
+            delivery_tag, outcome='ack', channel_key=self.channel_key)
+        try:
+            self.ack_coordinator.flush(self.channel_key)
+        finally:
+            # Reconcile even when the channel call raised, so an uncertain
+            # delivery keeps its prefetch slot instead of being treated as
+            # fully acknowledged.
+            self._sync_dirty()
 
     def reject(self, delivery_tag, requeue=False):
         """Remove from transactional state and requeue message."""
+        if not self._ensure_tracked(delivery_tag):
+            self._quick_ack(delivery_tag)
+            return
+        self._quick_ack(delivery_tag)
+        outcome = 'requeue' if requeue else 'reject'
+        self.ack_coordinator.mark(
+            delivery_tag, outcome=outcome, channel_key=self.channel_key)
+        try:
+            self.ack_coordinator.flush(self.channel_key)
+        finally:
+            self._sync_dirty()
+
+    def _ensure_tracked(self, delivery_tag):
+        """Make sure the coordinator knows about ``delivery_tag``.
+
+        Local state can legitimately hold a delivery the coordinator has
+        never seen (redelivery after restore, or a concurrent ack racing a
+        restore that reset coordination state).  Such a tag is adopted as a
+        fresh delivery rather than rejected, matching the previous behaviour
+        where every tag present in ``_delivered`` could be acknowledged.
+
+        Returns :const:`False` when the tag cannot be adopted because it is
+        absent from the local state as well, in which case the caller keeps
+        the legacy best-effort semantics.
+        """
+        try:
+            self.ack_coordinator.get(
+                delivery_tag, channel_key=self.channel_key)
+        except UnknownDeliveryTag:
+            if delivery_tag not in self._delivered:
+                return False
+            self.ack_coordinator.track(
+                self.channel_key, delivery_tag,
+                message=self._delivered[delivery_tag],
+            )
+        return True
+
+    def revive(self, channel=None):
+        """Reset coordination state after a channel reconnect.
+
+        Every delivery still owned by the previous channel epoch is
+        quarantined as stale: its tag must never be acknowledged on the
+        replacement channel.  The local transactional state is reset as
+        well because the broker is responsible for redelivering those
+        messages.
+        """
+        if channel is not None:
+            self.channel = channel
+        self.ack_coordinator.revive_channel(self.channel_key)
+        self._dirty = set()
+        self._quick_ack = self._dirty.add
+        self._delivered.clear()
+
+    # -- coordinator callbacks (the actual channel-facing operations) ----
+    def _coordinator_ack(self, channel_key, delivery_tag, multiple=False):
+        """Ack primitive invoked by the coordinator for a completed prefix.
+
+        ``multiple`` is safe here because the coordinator only batches tags
+        that form an uninterrupted run of completed deliveries.  If this
+        raises, the coordinator keeps the affected records in an uncertain
+        state and the local tags stay unflushed.
+        """
+        if multiple:
+            self._mark_prefix_dirty(delivery_tag)
+        else:
+            self._quick_ack(delivery_tag)
+
+    def _coordinator_reject(self, channel_key, delivery_tag, requeue=False):
         if requeue:
             self.channel._restore_at_beginning(self._delivered[delivery_tag])
         self._quick_ack(delivery_tag)
+
+    def _mark_prefix_dirty(self, last_delivery_tag):
+        """Mark every local tag up to ``last_delivery_tag`` as dirty."""
+        for tag in self._delivered:
+            self._dirty.add(tag)
+            if tag == last_delivery_tag:
+                break
+
+    @property
+    def uncertain(self):
+        """Deliveries whose ack/reject call failed with an unknown outcome."""
+        return self.ack_coordinator.uncertain
 
     def restore_unacked(self):
         """Restore all unacknowledged messages."""
@@ -266,13 +428,36 @@ class QoS:
             try:
                 restore(message)
             except BaseException as exc:
-                if key not in self._dirty:
+                if not self._is_locally_settled(key):
                     # Another thread may have acked the message after the earlier '_flush' call.
                     # This may cause the restore attempt to fail (e.g. in SQS).
                     # If restore fails, we only care about errors for messages that have not been 'acked'.
                     errors.append((exc, message))
+            finally:
+                # The channel is taking ownership of the redelivery, so the
+                # coordinator must not keep the tag around for a later ack.
+                self.ack_coordinator.forget(
+                    key, channel_key=self.channel_key)
         delivered.clear()
         return errors
+
+    def _is_locally_settled(self, delivery_tag):
+        """True if local/coordinator state no longer treats the tag pending.
+
+        Covers tags flushed into ``_dirty`` and coordinator-tracked
+        deliveries that are completed, uncertain or already settled.  A tag
+        the coordinator never knew about is *not* considered settled here,
+        preserving the historical restore semantics for externally managed
+        local state.
+        """
+        if delivery_tag in self._dirty:
+            return True
+        try:
+            record = self.ack_coordinator.get(
+                delivery_tag, channel_key=self.channel_key)
+        except UnknownDeliveryTag:
+            return False
+        return record.state is not DeliveryState.PENDING
 
     def restore_unacked_once(self, stderr=None):
         """Restore all unacknowledged messages at shutdown/gc collect.
@@ -676,8 +861,25 @@ class Channel(AbstractChannel, base.StdChannel):
             pass
 
     def basic_ack(self, delivery_tag, multiple=False):
-        """Acknowledge message."""
+        """Acknowledge message.
+
+        The ``multiple`` flag is handled safely by the channel's
+        :class:`~kombu.transport.virtual.ack.AckCoordinator`: only tags that
+        form a contiguous prefix of completed deliveries are ever covered by
+        a batched acknowledgment, regardless of the order in which parallel
+        consumers reported completion.
+        """
         self.qos.ack(delivery_tag)
+
+    def revive(self):
+        """Reset ack coordination after this channel has been reconnected.
+
+        Tags issued by the previous channel epoch become stale and can no
+        longer be acknowledged here; the broker is expected to redeliver the
+        affected messages.
+        """
+        if self._qos is not None:
+            self._qos.revive(channel=self)
 
     def basic_recover(self, requeue=False):
         """Recover unacked messages."""
