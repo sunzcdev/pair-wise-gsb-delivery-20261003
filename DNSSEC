@@ -1,0 +1,20 @@
+DNSSEC support in Dnsruby
+=========================
+
+DNSSEC defines a set of security extensions to DNS which provide a way for a resolver to verify cryptographically the DNS RRSets returned by an upstream resolver. The main standard is defined in RFCs 4033, 4034 and 4035.
+
+Dnsruby provides a recursive, validating security-aware stub resolver which maintains a cache of trusted keys and verifies RRSIG-signed messages with those keys (adding new trusted keys from signed DNSKEY RRSets and DS records). If dnsruby does not currently have the required key, it will attempt to walk the tree from the nearest known trusted key.
+
+The dnssec security status of a message is stored in Message#security_level (defined by Message::SecurityLevel).
+
+It is possible to tell Dnsruby to use a Recursor or a defined (or system default) Resolver to perform the validation. The default is to use a Recursor, as many systems are behind dodgy servers which mangle the DNS records. Using a Recursor means that only authoritative nameservers are queried for the DNSSEC records.
+
+Dnsruby includes the IANA root DS trust anchors for KSK-2017 (key tag 20326) and KSK-2024 (key tag 38696). KSK-2024 began signing the root DNSKEY RRSet on 11 October 2026. The revoked KSK-2010 (key tag 19036) is no longer trusted. Applications may also configure local DNSKEY or DS trust anchors using Dnsruby::Dnssec.add_trust_anchor. Obtain trust anchors through a trusted channel; IANA publishes the root anchors and their validity periods at https://www.iana.org/dnssec/files. Dnsruby does not automatically update these configured anchors using RFC 5011, so they must be kept current through software or application updates.
+
+It is possible to turn off dnssec validation on a per-message basis. Simply set Message#do_validation to false.
+
+Resolver#do_validation defaults to false; set it to true to enable local DNSSEC validation. The dnssec flag controls requesting DNSSEC records and is distinct from local validation. Recursor#query attempts validation unless its no_validation argument is true. Missing root anchors affect queries that need to establish trust from the root; an application using local trust anchors or previously authenticated cached keys may behave differently.
+
+Dnsruby maintains a cache of responses, and a cache of trusted keys. Once the initial keys have been downloaded, and a set of trusted keys built up, very little overhead is required to enjoy the benefits of DNSSEC. There is, however, some initial cost (to build up the caches).
+
+Dnsruby::Dnssec.clear_trusted_keys clears learned DNSKEYs and all DS/DLV anchors, including the built-in root DS anchors; configured DNSKEY anchors are retained. To remove local anchors and built-in root trust, call clear_trust_anchors followed by clear_trusted_keys. Use remove_trust_anchor or clear_trust_anchors to remove local anchors explicitly. Dnsruby::Dnssec.reset restores the built-in root anchors, clears local anchors and cached keys, and resets the validation policy and resolver settings to their defaults.

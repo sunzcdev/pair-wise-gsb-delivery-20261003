@@ -1,0 +1,536 @@
+# --
+# Copyright 2009 Nominet UK
+# 
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+# 
+#     http://www.apache.org/licenses/LICENSE-2.0
+# 
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+# ++
+
+# This class provides the facility to load a zone file.
+# It can either process one line at a time, or return an entire zone as a list of
+# records.
+module Dnsruby
+  class ZoneReader
+    class ParseException < Exception
+
+    end
+    #  Create a new ZoneReader. The zone origin is required. If the desired SOA minimum
+    #  and TTL are passed in, then they are used as default values.
+    def initialize(origin, soa_minimum = nil, soa_ttl = nil)
+      origin_name = parse_zone_name(origin)
+      @origin = Name.new(origin_name.labels, true).to_s(true)
+      @soa_ttl = soa_ttl
+      @default_ttl = nil
+      if (soa_minimum && !@last_explicit_ttl)
+        @last_explicit_ttl = soa_minimum
+      else
+        @last_explicit_ttl = 0
+      end
+      @last_explicit_class = Classes.new("IN")
+      @last_name = nil
+      @continued_line = nil
+      @group_depth = 0
+      @in_quoted_section = false
+    end
+
+    #  Takes a filename string, or any type of IO object, and attempts to load a zone.
+    #  Returns a list of RRs if successful, nil otherwise.
+    def process_file(source)
+      if source.is_a?(String)
+        File.open(source) do |file|
+          process_io(file)
+        end
+      else
+        process_io(source)
+      end
+    end
+
+    #  Iterate over each line in a IO object, and process it.
+    #  Returns a list of RRs if successful, nil otherwise.
+    def process_io(io)
+      zone = nil
+      io.each do |line|
+        begin
+          ret = process_line(line)
+          if (ret)
+            rr = RR.create(ret)
+            if (!zone)
+              zone = []
+            end
+            zone.push(rr)
+          end
+        rescue Exception
+          raise ParseException.new("Error reading line #{io.lineno} of #{io.inspect} : [#{line}]")
+        end
+      end
+      if @continued_line
+        raise ParseException.new("Unclosed parenthesis at end of #{io.inspect}")
+      end
+      return zone
+    end
+
+    #  Process the next line of the file
+    #  Returns a string representing the normalised line.
+    def process_line(line, do_prefix_hack = false)
+      if !@continued_line
+        @in_quoted_section = false
+        @single_quoted_start = if /['(]/.match?(line)
+          Presentation.single_quoted_start(line, owner_omitted: line.start_with?(' ', "\t"))
+        end
+      end
+      previous_quote = @in_quoted_section
+      line, @group_depth, @in_quoted_section =
+        Presentation.scan(line, @group_depth, @in_quoted_section,
+          single_quoted_from: @continued_line && @single_quoted_start ? 0 : @single_quoted_start)
+
+      if @continued_line
+        # The scanner keeps literal newlines inside quotes and turns layout
+        # newlines into spaces. Do not strip trailing quoted data. Callers of
+        # process_line may also supply lines without a terminating newline.
+        separator = previous_quote ? (@continued_line.end_with?("\n") ? '' : "\n") : ' '
+        line = @continued_line + separator + line
+      end
+      if @group_depth.positive?
+        @continued_line = line
+        return nil
+      end
+      @continued_line = nil
+      return nil if line.strip.empty?
+
+      if (line.index("$ORIGIN") == 0)
+        @origin = absolute_name(Presentation.tokens(line)[1]).to_s(true) # $ORIGIN <domain-name>
+        #                 print "Setting $ORIGIN to #{@origin}\n"
+        return nil
+      end
+      if (line.index("$TTL") == 0)
+        @default_ttl = get_ttl(line.split()[1].strip) #  $TTL <ttl>
+        #                 print "Setting $TTL to #{ttl}\n"
+        return nil
+      end
+      line += "\n"
+
+      # Preserve the public normalization hook for subclasses and prepends.
+      # Only unchanged input has already been scanned. Overrides may replace
+      # or mutate the String before calling super, introducing new syntax.
+      previous_scanned_line = @scanned_line
+      begin
+        @scanned_line = [line, line.dup]
+        normalise_line(line, do_prefix_hack)
+      ensure
+        @scanned_line = previous_scanned_line
+      end
+    end
+
+    def strip_comments(line)
+      last_index = 0
+      #  Are we currently in a quoted section?
+      #  Does a quoted section begin or end in this line?
+      #  Are there any semi-colons?
+      #  Ary any of the semi-colons inside a quoted section?
+      #  Handle escape characters
+      if (line.index"\\")
+        return strip_comments_meticulously(line)
+      end
+      while (next_index = line.index(";", last_index + 1))
+        #  Have there been any quotes since we last looked?
+        process_quotes(line[last_index, next_index - last_index])
+
+        #  Now use @in_quoted_section to work out if the ';' terminates the line
+        if (!@in_quoted_section)
+          return line[0,next_index]
+        end
+
+        last_index = next_index
+      end
+      #  Check out the quote situation to the end of the line
+      process_quotes(line[last_index, line.length-1])
+
+      return line
+    end
+
+    def strip_comments_meticulously(line)
+      #  We have escape characters in the text. Go through it character by
+      #  character and work out what's escaped and quoted and what's not
+      escaped = false
+      quoted = false
+      pos = 0
+      line.each_char {|c|
+        if (c == "\\")
+          if (!escaped)
+            escaped = true
+          else
+            escaped = false
+          end
+        else
+          if (escaped)
+            if (c >= "0" && c <= "9") # rfc 1035 5.1 \DDD
+              pos = pos + 2
+            end
+            escaped = false
+            next
+          else
+            if (c == "\"")
+              if (quoted)
+                quoted = false
+              else
+                quoted = true
+              end
+            else
+              if (c == ";")
+                if (!quoted)
+                  return line[0, pos+1]
+                end
+              end
+            end
+          end
+        end
+        pos +=1
+      }
+      return line
+    end
+
+    def process_quotes(section)
+      #  Look through the section of text and set the @in_quoted_section
+      #  as it should be at the end of the given section
+      last_index = 0
+      while (next_index = section.index("\"", last_index + 1))
+        @in_quoted_section = !@in_quoted_section
+        last_index = next_index
+      end
+    end
+
+    #  Take a line from the input zone file, and return the normalised form
+    #  do_prefix_hack should always be false
+    def normalise_line(line, do_prefix_hack = false)
+      # Direct callers historically accepted unmatched grouping, just like
+      # RR.create. process_line has already scanned and checked its input.
+      unless @scanned_line && line.equal?(@scanned_line[0]) && line == @scanned_line[1]
+        single_quoted_start = if line.include?("'")
+          Presentation.single_quoted_start(line, owner_omitted: line.start_with?(' ', "\t"))
+        end
+        line, = Presentation.scan(line, allow_unbalanced: true, single_quoted_from: single_quoted_start)
+      end
+      normalise_scanned_line(line, do_prefix_hack)
+    end
+
+    def normalise_scanned_line(line, do_prefix_hack = false)
+
+      line = Presentation.escape_whitespace(line) if line.include?('\\')
+
+      #  Note that a freestanding "@" is used to denote the current origin - we can simply replace that straight away
+      #  Note that no domain name may be specified in the RR - in that case, last_name should be used. How do we tell? Tab or space at start of line.
+
+      #  If we have text in the record, then ignore that in the parsing, and stick it on again at the end
+      stored_line = "";
+      #  TXT quotes a whole token, but SVCB and HTTPS quote mid-token
+      #  (alpn="h2,h3"), so remember which to put the text back as it came.
+      #  A parenthesis separates too, and the strip below may remove it first.
+      stored_line_was_separate = true
+      quote_index = Presentation.unescaped_quote(line)
+      if line.include?("'") && (rdata_start = Presentation.single_quoted_start(line,
+          owner_omitted: line.start_with?(' ', "\t")))
+        quote_index = [quote_index, line.index(/(?<=[\s(])'/, rdata_start)].compact.min
+      end
+      if quote_index
+          stored_line_was_separate = (quote_index == 0) || !(/[\s()]/ =~ line[quote_index - 1]).nil?
+          stored_line = line[quote_index, line.length];
+          line = line [0, quote_index]
+      end
+      if ((line[0,1] == " ") || (line[0,1] == "\t"))
+        line = @last_name + " " + line
+      end
+      line.chomp!
+      line.sub!(/\s+@$/) { " #{@origin}" } # IN CNAME @
+      line.sub!(/^@\s+/) { "#{@origin} " } # IN CNAME @
+      line.sub!(/\s+@\s+/) { " #{@origin} " }
+      line.strip!
+
+
+      #  o We need to identify the domain name in the record, and then
+      split = Presentation.tokens(line)
+      name = split[0]
+      new_name = absolute_name(name).to_s(true)
+      line.sub!(name) { new_name }
+      name = new_name
+      split = line.split
+
+      # RFC 1035 section 5.1 permits either TTL/class or class/TTL.
+      # Canonicalize the latter before applying the inherited defaults below.
+      if split[2] && /\A(?:[0-9]+[smhdwSMHDW])*[0-9]*\z/.match?(split[2]) && !split[2].empty?
+        begin
+          Classes.new(split[1])
+          split[1], split[2] = split[2], split[1]
+          line = split.join(' ') + "\n"
+        rescue ArgumentError
+          # The second token is a TTL or record type, not a class.
+        end
+      end
+
+      #  If the second field is not a number, then we should add the TTL to the line
+      #  Remember we can get "m" "w" "y" here! So need to check for appropriate regexp...
+      found_ttl_regexp = (split[1]=~/^[0-9]+[smhdwSMHDW]/)
+      if (found_ttl_regexp == 0)
+        #  Replace the formatted ttl with an actual number
+        ttl = get_ttl(split[1])
+        line = name + " #{ttl} "
+        @last_explicit_ttl = ttl
+        (split.length - 2).times {|i| line += "#{split[i+2]} "}
+        line += "\n"
+        split = line.split
+      elsif (((split[1]).to_i == 0) && (split[1] != "0"))
+        #  Add the TTL
+        inherited_ttl = @default_ttl || @last_explicit_ttl
+        if (!inherited_ttl)
+          #  If this is the SOA record, and no @last_explicit_ttl is defined,
+          #  then we need to try the SOA TTL element from the config. Otherwise,
+          #  find the SOA Minimum field, and use that.
+          #  We should also generate a warning to that effect
+          #  How do we know if it is an SOA record at this stage? It must be, or
+          #  else @last_explicit_ttl should be defined
+          #  We could put a marker in the RR for now - and replace it once we know
+          #  the actual type. If the type is not SOA then, then we can raise an error
+          line = name + " %MISSING_TTL% "
+        else
+          line = name + " #{inherited_ttl} "
+        end
+        (split.length - 1).times {|i| line += "#{split[i+1]} "}
+        line += "\n"
+        split = line.split
+      else
+        @last_explicit_ttl = split[1].to_i
+      end
+
+      #  Now see if the clas is included. If not, then we should default to the last class used.
+      begin
+        class_text = split[2]
+        if /\ACLASS\d+\z/.match?(class_text)
+          class_text = Classes.classesbyval(Classes.classesbyname(class_text))
+        end
+        klass = Classes.new(class_text)
+        @last_explicit_class = klass
+      rescue ArgumentError
+        #  Wasn't a CLASS
+        #  So add the last explicit class in
+        line = ""
+        (2).times {|i| line += "#{split[i]} "}
+        line += " #{@last_explicit_class} "
+        (split.length - 2).times {|i| line += "#{split[i+2]} "}
+        line += "\n"
+        split = line.split
+      rescue Error
+      end
+
+      #  Add the type so we can load the zone one RRSet at a time.
+      type_text = split[3].strip
+      if /\ATYPE\d+\z/.match?(type_text)
+        type_text = Types.typesbyval(Types.typesbyname(type_text))
+      end
+      type = Types.new(type_text)
+      is_soa = (type == Types::SOA)
+      type_was = type
+      # RFC 3597 RDATA is already encoded wire data, even for known types.
+      # Its tokens must not be treated as textual names or SOA intervals.
+      generic_rdata = split[4]&.start_with?('\\#')
+      if (type == Types.RRSIG)
+        #  If this is an RRSIG record, then add the TYPE COVERED rather than the type - this allows us to load a complete RRSet at a time
+        if generic_rdata
+          type = Dnsruby::RR.send(:new_from_normalised_string, line).type_covered if do_prefix_hack
+        else
+          type = Types.new(split[4].strip)
+        end
+      end
+
+      type_string=prefix_for_rrset_order(type, type_was)
+      @last_name = name
+
+      if (is_soa)
+        if (@soa_ttl)
+          #  Replace the %MISSING_TTL% text with the SOA TTL from the config
+          line.sub!(" %MISSING_TTL% ", " #{@soa_ttl} ")
+        else
+          #  Can we try the @last_explicit_ttl?
+          if (@last_explicit_ttl)
+            line.sub!(" %MISSING_TTL% ", " #{@last_explicit_ttl} ")
+          end
+        end
+        line = replace_soa_ttl_fields(line) unless generic_rdata
+        if (!@last_explicit_ttl)
+          soa_rr = Dnsruby::RR.send(:new_from_normalised_string, line)
+          @last_explicit_ttl = soa_rr.minimum
+        end
+      end
+
+      line = line.strip
+
+      if (stored_line && stored_line != "")
+        line += " " if stored_line_was_separate
+        line += stored_line.strip
+      end
+
+      if generic_rdata
+        return line + "\n", type_string, @last_name if do_prefix_hack
+        return line + "\n"
+      end
+
+      if [Types::TXT, Types::SPF].include?(type_was) && line.include?('\\')
+        header_and_data = line.split(/\s+/, 5)
+        if header_and_data[4]
+          header_and_data[4] = Presentation.character_string_escapes(header_and_data[4])
+          line = header_and_data.join(' ')
+        end
+      end
+
+      # Qualify parsed labels so an escaped final dot stays inside its label.
+      if [Types::MX, Types::KX, Types::NS, Types::AFSDB, Types::NAPTR, Types::RT,
+          Types::SRV, Types::CNAME, Types::MB, Types::MG, Types::MR,
+          Types::PTR, Types::DNAME].include?(type_was)
+        line = line.sub(/\S+\z/) { |target| absolute_name(target).to_s(true) }
+      end
+      name_fields = case type_was
+      when Types::SOA then [:mname, :rname]
+      when Types::MINFO then [:rmailbx, :emailbx]
+      when Types::PX then [:map822, :mapx400]
+      when Types::RP then [:mailbox, :txtdomain]
+      end
+      if name_fields
+        parsed_rr = Dnsruby::RR.send(:new_from_normalised_string, line)
+        name_fields.each do |field|
+          parsed_rr.public_send("#{field}=", absolute_name(parsed_rr.public_send(field)))
+        end
+        line = parsed_rr.to_s
+      end
+      # These name fields precede other RDATA. Qualify their presentation
+      # tokens directly, preserving the remaining signature/key text and
+      # avoiding record serializers which omit a name's trailing dot.
+      case type_was
+      when Types::NSEC, Types::NXT, Types::RRSIG, Types::IPSECKEY, Types::HIP
+        fields = line.split
+        domain_fields = case type_was
+        when Types::NSEC, Types::NXT then [4]
+        when Types::RRSIG then [11]
+        when Types::IPSECKEY then fields[5].to_i == 3 ? [7] : []
+        when Types::HIP then (7...fields.length).to_a
+        end
+        domain_fields.each { |index| fields[index] = absolute_name(fields.fetch(index)).to_s(true) }
+        line = fields.join(' ')
+      end
+      #  SVCB and HTTPS carry their TargetName in the middle of the RDATA
+      #  (before the SvcParams), so the trailing-name logic above cannot reach
+      #  it. Parse the record and qualify a relative TargetName against the
+      #  origin; the root (".") is absolute, so the absolute? guard skips it.
+      if ([Types::SVCB, Types::HTTPS].include?type_was)
+        parsed_rr = Dnsruby::RR.send(:new_from_normalised_string, line)
+        if parsed_rr.is_a?(RR::SVCB) && parsed_rr.target && !parsed_rr.target.absolute?
+          origin = RR::SVCB.create_target_name(@origin.to_s)
+          parsed_rr.target = Name.new(parsed_rr.target.labels + origin.labels, true)
+        end
+        line = parsed_rr.to_s
+      end
+      if (do_prefix_hack)
+        return line + "\n", type_string, @last_name
+      end
+      return line+"\n"
+    end
+    private :normalise_scanned_line
+
+    def absolute_name(value)
+      name = parse_zone_name(value)
+      return name if name.absolute?
+      Name.new(name.labels + parse_zone_name(@origin).labels, true)
+    end
+    private :absolute_name
+
+    # Zone-file ASCII already represents wire octets. Preserve its case for
+    # record types such as SVCB whose signed TargetName is not case-folded.
+    def parse_zone_name(value)
+      if value.is_a?(String) && value.ascii_only?
+        Name.new(Name.split_escaped(value), /(?<!\\)(?:\\\\)*\.\z/.match?(value))
+      else
+        Name.create(value)
+      end
+    end
+    private :parse_zone_name
+
+    #  Get the TTL in seconds from the m, h, d, w format
+    def get_ttl(ttl_text_in)
+      #  If no letter afterwards, then in seconds already
+      #  Could be e.g. "3d4h12m" - unclear if "4h5w" is legal - best assume it is
+      #  So, search out each letter in the string, and get the number before it.
+      ttl_text = ttl_text_in.downcase
+      index = ttl_text.index(/[whdms]/)
+      if (!index)
+        return ttl_text.to_i
+      end
+      last_index = -1
+      total = 0
+      while (index)
+        letter = ttl_text[index]
+        number = ttl_text[last_index + 1, index-last_index-1].to_i
+        new_number = 0
+        case letter
+        when "s"
+          new_number = number
+        when "m"
+          new_number = number * 60
+        when "h"
+          new_number = number * 3600
+        when "d"
+          new_number = number * 86400
+        when "w"
+          new_number = number * 604800
+        end
+        total += new_number
+
+        last_index = index
+        index = ttl_text.index(/[whdms]/, last_index + 1)
+      end
+      total += ttl_text[last_index + 1..].to_i
+      return total
+    end
+
+    def replace_soa_ttl_fields(line)
+      #  Replace any fields which evaluate to 0
+      split = line.split
+      4.times {|i|
+        x = i + 7
+        split[x].strip!
+        split[x] = get_ttl(split[x]).to_s
+      }
+      return split.join(" ") + "\n"
+    end
+
+    #  This method is included only for OpenDNSSEC support. It should not be
+    #  used otherwise.
+    #  Frig the RR type so that NSEC records appear last in the RRSets.
+    #  Also make sure that DNSKEYs come first (so we have a key to verify
+    #  the RRSet with!).
+    def prefix_for_rrset_order(type, type_was) # :nodoc: all
+      #  Now make sure that NSEC(3) RRs go to the back of the list
+      if ['NSEC', 'NSEC3'].include?type.string
+        if (type_was == Types::RRSIG)
+          #  Get the RRSIG first
+          type_string = "ZZ" + type.string
+        else
+          type_string = "ZZZ" + type.string
+        end
+      elsif type == Types::DNSKEY
+        type_string = "0" + type.string
+      elsif type == Types::NS
+        #  Make sure that we see the NS records first so we know the delegation status
+        type_string = "1" + type.string
+      else
+        type_string = type.string
+      end
+      return type_string
+    end
+
+  end
+end

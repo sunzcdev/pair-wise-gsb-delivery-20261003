@@ -1,0 +1,463 @@
+# Superclass for all Dnsruby resource records.
+#
+# Represents a DNS RR (resource record) [RFC1035, section 3.2]
+#
+# Use Dnsruby::RR::create(...) to create a new RR record.
+#
+#   mx = Dnsruby::RR.create("example.com. 7200 MX 10 mailhost.example.com.")
+#
+#   rr = Dnsruby::RR.create({:name => "example.com", :type => "MX", :ttl => 7200,
+#                                  :preference => 10, :exchange => "mailhost.example.com"})
+#
+#   s = rr.to_s # Get a String representation of the RR (in zone file format)
+#   rr_again = Dnsruby::RR.create(s)
+#
+
+require 'dnsruby/code_mappers'
+require 'dnsruby/presentation'
+
+module Dnsruby
+class RR
+
+  include Comparable
+
+  def <=>(other)
+    #       return 1 if ((!other) || !(other.name) || !(other.type))
+    #       return -1 if (!@name)
+    if @name.canonical == other.name.canonical
+      @type.code != other.type.code ? (@type.code <=> other.type.code) : (@rdata <=> other.rdata)
+    else
+      @name <=> other.name
+    end
+  end
+
+  #  A regular expression which catches any valid resource record.
+  @@RR_REGEX = Regexp.new("^\\s*((?:\\\\.|\\S)+)\\s*(\\d+)?\\s*(#{Classes.regexp +
+      "|CLASS\\d+"})?\\s*(#{Types.regexp + '|TYPE\\d+'})?\\s*([\\s\\S]*)\$") #:nodoc: all
+
+  @@implemented_rr_map = nil
+
+  # The Resource's domain name
+  attr_reader :name
+
+  # The Resource type
+  attr_reader :type
+
+  # The Resource class
+  attr_reader :klass
+
+  # The Resource Time-To-Live
+  attr_accessor :ttl
+
+  # The Resource data section
+  attr_accessor :rdata
+
+  def rdlength
+    rdata.length
+  end
+
+  def name=(new_name)
+    @name = new_name.kind_of?(Name) ? new_name : Name.create(new_name)
+  end
+
+  def type=(type)
+    @type = Types.new(type)
+  end
+  alias :rr_type :type
+
+  def klass=(klass)
+    if @type != Types::OPT
+      @klass = Classes.new(klass)
+    else
+      @klass = klass.is_a?(Classes) ? klass : Classes.new("CLASS#{klass}")
+    end
+  end
+
+  def clone
+    encoded = MessageEncoder.new { |encoder| encoder.put_rr(self, true) }.to_s
+    copy = MessageDecoder.new(encoded).get_rr
+    [:@dnsruby_received_at, :@dnsruby_authenticated_expiration, :@dnsruby_learned_trust].each do |field|
+      copy.instance_variable_set(field, instance_variable_get(field)) if instance_variable_defined?(field)
+    end
+    copy
+  end
+
+
+  #  Determines if two Records could be part of the same RRset.
+  #  This compares the name, type, and class of the Records; the ttl and
+  #  rdata are not compared.
+  def sameRRset(rec)
+    if @klass != rec.klass || @name.downcase != rec.name.downcase
+      return false
+    elsif (rec.type == Types.RRSIG) && (@type == Types.RRSIG)
+      return rec.type_covered == self.type_covered
+    end
+    [rec, self].each do |rr|
+      if rr.type == Types::RRSIG
+        return (@type == rr.type_covered) || (rec.type == rr.type_covered)
+      end
+    end
+    @type == rec.type
+  end
+
+  def init_defaults
+    #  Default to do nothing
+  end
+
+  private
+  def initialize(*args) #:nodoc: all
+    init_defaults
+    if args.length > 0
+      if args[0].class == Hash
+        from_hash(args[0])
+        return
+      else
+        @rdata = args[0]
+        #           print "Loading RR from #{args[0]}, class : #{args[0].class}\n"
+        if args[0].class == String
+          from_string(args[0])
+          return
+        else
+          from_data(args[0])
+          return
+        end
+      end
+    end
+    #       raise ArgumentError.new("Don't call new! Use Dnsruby::RR::create() instead")
+  end
+  public
+
+  def from_hash(hash) #:nodoc: all
+    hash.keys.each do |param|
+      send("#{param}=", hash[param])
+    end
+  end
+
+  # Create a new RR from the hash. The name is required; all other fields are optional.
+  # Type defaults to ANY and the Class defaults to IN. The TTL defaults to 0.
+  #
+  # If the type is specified, then it is necessary to provide ALL of the resource record fields which
+  # are specific to that record; i.e. for
+  # an MX record, you would need to specify the exchange and the preference
+  #
+  #    require 'Dnsruby'
+  #    rr = Dnsruby::RR.new_from_hash({:name => "example.com"})
+  #    rr = Dnsruby::RR.new_from_hash({:name => "example.com", :type => Types.MX, :ttl => 10, :preference => 5, :exchange => "mx1.example.com"})
+  def RR.new_from_hash(inhash)
+    hash = inhash.clone
+    type = hash[:type] || Types::ANY
+    klass = Classes.new(hash[:klass] || Classes::IN)
+    ttl = hash[:ttl] || 0
+    record_class = get_class(type, klass)
+    record = record_class.new
+    record.name = hash[:name]
+    unless record.name.kind_of?(Name)
+      record.name = Name.create(record.name)
+    end
+    record.ttl = ttl
+    record.type = type
+    record.klass = Classes.new(klass)
+    hash.delete(:name)
+    hash.delete(:type)
+    hash.delete(:ttl)
+    hash.delete(:klass)
+    record.from_hash(hash)
+    record
+  end
+
+  # Returns a Dnsruby::RR object of the appropriate type and
+  # initialized from the string passed by the user.  The format of the
+  # string is that used in zone files, and is compatible with the string
+  # returned by Net::DNS::RR.inspect
+  #
+  # The name and RR type are required; all other information is optional.
+  # If omitted, the TTL defaults to 0 and the RR class defaults to IN.
+  #
+  # All names must be fully qualified.  The trailing dot (.) is optional.
+  #
+  #
+  #    a     = Dnsruby::RR.new_from_string("foo.example.com. 86400 A 10.1.2.3")
+  #    mx    = Dnsruby::RR.new_from_string("example.com. 7200 MX 10 mailhost.example.com.")
+  #    cname = Dnsruby::RR.new_from_string("www.example.com 300 IN CNAME www1.example.com")
+  #    txt   = Dnsruby::RR.new_from_string('baz.example.com 3600 HS TXT "text record"')
+  #
+  #
+  def RR.new_from_string(rrstring)
+    # Standalone records allow unmatched parentheses, as in 1.74.0; ZoneReader
+    # requires balanced continuations. Skip the scanner for records without
+    # quotes, escapes, comments, parentheses or line breaks.
+    if /[\\'"();\r\n]/.match?(rrstring)
+      rrstring, = Presentation.scan(rrstring, allow_unbalanced: true,
+        single_quoted_from: rrstring.include?("'") ? Presentation.single_quoted_start(rrstring) : nil)
+    end
+    new_from_normalised_string(rrstring)
+  end
+
+  # ZoneReader already handles comments, grouping and quoted continuations.
+  # Keep this internal path separate from the public string constructors so
+  # normalized records need not run through the lexical scanner again.
+  def RR.new_from_normalised_string(rrstring) #:nodoc: all
+    matches = (/#{@@RR_REGEX}/xo).match(rrstring)
+    unless matches
+      raise "#{rrstring} did not match RR pattern. Please report this to the author!"
+    end
+
+    name    = matches[1]
+    ttl     = matches[2].to_i || 0
+    rrclass = matches[3] || ''
+    rrtype  = matches[4] || ''
+    rdata   = matches[5] || ''
+
+    # Only remove trailing record layout. `$` also matches before an embedded
+    # newline and would delete spaces that belong to a quoted TXT value.
+    rdata.sub!(/\s+\z/o, '') if rdata
+
+    #  RFC3597 tweaks
+    #  This converts to known class and type if specified as TYPE###
+    if rrtype  =~/^TYPE\d+/o
+      rrtype  = Dnsruby::Types.typesbyval(Dnsruby::Types::typesbyname(rrtype))
+    end
+    if rrclass =~/^CLASS\d+/o
+      rrclass = Dnsruby::Classes.classesbyval(Dnsruby::Classes::classesbyname(rrclass))
+    end
+
+    if rrtype == '' && rrclass == 'ANY'
+      rrtype  = 'ANY'
+      rrclass = 'IN'
+    elsif rrclass == ''
+      rrclass = 'IN'
+    end
+
+    if rrtype == ''
+      rrtype = 'ANY'
+    end
+
+    if ttl == 0 && rdata.empty? && empty_update_type?(rrtype, rrclass)
+      return empty_update_record(name, rrtype, rrclass)
+    end
+
+    if /\A\s*\\#/.match?(rdata)
+      # RFC 3597 section 5 permits zero octets with no hexadecimal field.
+      # Validate before packing: pack('H*') alone also accepts non-hex input.
+      generic = /\A\s*\\#\s+(\d+)(?:\s+([0-9a-fA-F\s]*))?\z/.match(rdata)
+      raise DecodeError, 'Expected RFC3597 representation of RDATA' unless generic
+      rdlength = generic[1].to_i
+      hexdump = (generic[2] || '').gsub(/\s+/, '')
+      if rdlength > 0xffff || hexdump.length != rdlength * 2
+        raise DecodeError, "#{rdata} is inconsistent with its RDATA length #{rdlength}."
+      end
+      return new_from_data(name, rrtype, rrclass, ttl, rdlength, [hexdump].pack('H*'), 0)
+    elsif implemented_rrs.include?(rrtype)
+      return _get_subclass(name, rrtype, rrclass, ttl, rdata)
+    else
+      # God knows how to handle these...
+      return _get_subclass(name, rrtype, rrclass, ttl, '')
+    end
+  end
+  private_class_method :new_from_normalised_string
+
+  def RR.new_from_data(*args) #:nodoc: all
+    name, rrtype, rrclass, ttl, rdlength, data, offset = args
+    rdata = data ? data[offset, rdlength] : []
+    decoder = MessageDecoder.new(rdata)
+    record_class = get_class(rrtype, rrclass)
+    record = if rdlength == 0 && ttl == 0 && empty_update_type?(rrtype, rrclass)
+      empty_update_record(name, rrtype, rrclass)
+    else
+      record_class.decode_rdata(decoder)
+    end
+    record.name = Name.create(name)
+    record.ttl = ttl
+    record.type = rrtype
+    record.klass = Classes.new(rrclass)
+    record.validate_decoded_rdata
+    record
+  end
+
+  # Some formats depend on the actual RR class, which is assigned after the
+  # format-specific decoder runs (notably ANY/NONE UPDATE markers).
+  def validate_decoded_rdata #:nodoc: all
+  end
+
+  # RFC 2136 prerequisites and whole-RRset deletes carry no RDATA, including
+  # for types whose ordinary records require fields. Keep the familiar typed
+  # record while representing this operation separately from an empty value.
+  module EmptyUpdateData #:nodoc: all
+    def rdata_to_string
+      ''
+    end
+
+    def data
+      ''
+    end
+
+    def rdlength
+      0
+    end
+
+    def encode_rdata(_encoder, _canonical = false)
+      unless ttl == 0 && RR.empty_update_type?(type, klass)
+        raise EncodeError, 'Empty UPDATE records require TTL zero and class ANY or NONE'
+      end
+    end
+
+    def validate_decoded_rdata
+    end
+  end
+
+  def self.empty_update_type?(type, klass) #:nodoc: all
+    code = Types.new(type).code
+    [Classes::ANY, Classes::NONE].include?(Classes.new(klass)) &&
+      code > 0 && code != Types::OPT && !(128..254).cover?(code)
+  end
+
+  def self.empty_update_record(name, type, klass) #:nodoc: all
+    raise ArgumentError, 'Invalid empty UPDATE record type or class' unless empty_update_type?(type, klass)
+    record_class = get_class(type, klass)
+    record = record_class <= RR::DomainName ? record_class.new(Name.new([])) : record_class.new
+    record.name, record.type, record.klass, record.ttl, record.rdata = name, type, klass, 0, ''
+    record.extend(EmptyUpdateData)
+  end
+
+  # Return an array of all the currently implemented RR types
+  def RR.implemented_rrs
+    @@implemented_rr_map ||= ClassHash.keys.map { |key| Dnsruby::Types.to_string(key[0]) }
+  end
+
+  class << self
+    private
+    def _get_subclass(name, rrtype, rrclass, ttl, rdata) #:nodoc: all
+      return unless (rrtype!=nil)
+      record = get_class(rrtype, rrclass).new(rdata)
+      record.name = Name.create(name)
+      record.ttl = ttl
+      record.type = rrtype
+      record.klass = Classes.new(rrclass)
+      return record
+    end
+  end
+
+  # Returns a string representation of the RR in zone file format
+  def to_s
+    s = name ? (name.to_s(true) + "\t") : ''
+    s << [ttl, klass, type, rdata_to_string].map(&:to_s).join("\t")
+  end
+
+  # Get a string representation of the data section of the RR (in zone file format)
+  def rdata_to_string
+    (@rdata && @rdata.length > 0) ? @rdata : 'no rdata'
+  end
+
+  def from_data(data) #:nodoc: all
+    #  to be implemented by subclasses
+    raise NotImplementedError.new
+  end
+
+  def from_string(input) #:nodoc: all
+    #  to be implemented by subclasses
+    #       raise NotImplementedError.new
+  end
+
+  def encode_rdata(msg, canonical=false) #:nodoc: all
+    #  to be implemented by subclasses
+    raise EncodeError.new("#{self.class} is RR.")
+  end
+
+  def self.decode_rdata(msg) #:nodoc: all
+    #  to be implemented by subclasses
+    raise DecodeError.new("#{self.class} is RR.")
+  end
+
+  # Metadata and alternate presentations are not part of record identity.
+  def equality_fields #:nodoc:
+    fields = instance_variables - [:@ttl, :@rdata, :@dnsruby_learned_trust,
+      :@dnsruby_authenticated_expiration, :@dnsruby_received_at]
+    fields.delete(:@digest) if is_a?(RR::DS)
+    fields.sort
+  end
+  protected :equality_fields
+
+  def ==(other)
+    return false unless self.class == other.class
+    fields = equality_fields
+    fields == other.equality_fields && fields.all? do |field|
+      instance_variable_get(field) == other.instance_variable_get(field)
+    end
+  end
+
+  def eql?(other) #:nodoc:
+    self == other
+  end
+
+  def hash # :nodoc:
+    equality_fields.inject(0) do |hash_value, field|
+      hash_value ^ instance_variable_get(field).hash
+    end
+  end
+
+  def self.find_class(type_value, class_value) # :nodoc: all
+    if !! (ret = ClassHash[[type_value, class_value]])
+      return ret
+    elsif !! (ret = GenericCache.find(type_value, class_value))
+      return ret
+    elsif !! (val = ClassInsensitiveTypes[type_value])
+      klass = Class.new(val)
+      klass.const_set(:TypeValue, type_value)
+      klass.const_set(:ClassValue, class_value)
+      return klass
+    else
+      return GenericCache.factory(type_value, class_value) do
+        Generic.create(type_value, class_value)
+      end
+    end
+  end
+
+  # Get an RR of the specified type and class
+  def self.get_class(type_value, class_value) #:nodoc: all
+    if type_value == Types::OPT
+      return Class.new(OPT)
+    elsif type_value.class == Class
+      type_value = type_value.const_get(:TypeValue)
+      return find_class(type_value, Classes.to_code(class_value))
+    else
+      type_value = (type_value.class == Types) ? type_value.code : Types.new(type_value).code
+      class_value = (class_value.class == Classes) ? class_value.code : Classes.new(class_value).code
+      return find_class(type_value, class_value)
+    end
+  end
+
+
+  # Create a new RR from the arguments, which can be either a String or a Hash.
+  # See new_from_string and new_from_hash for details
+  #
+  #    a     = Dnsruby::RR.create('foo.example.com. 86400 A 10.1.2.3')
+  #    mx    = Dnsruby::RR.create('example.com. 7200 MX 10 mailhost.example.com.')
+  #    cname = Dnsruby::RR.create('www.example.com 300 IN CNAME www1.example.com')
+  #    txt   = Dnsruby::RR.create('baz.example.com 3600 HS TXT 'text record'')
+  #
+  #    rr = Dnsruby::RR.create({:name => 'example.com'})
+  #    rr = Dnsruby::RR.create({:name => 'example.com', :type => 'MX', :ttl => 10,
+  #                                   :preference => 5, :exchange => 'mx1.example.com'})
+  #
+  def RR.create(*args)
+    case args[0]
+      when String
+        new_from_string(args[0])
+      when Hash
+        new_from_hash(args[0])
+      else
+        new_from_data(args)
+    end
+  end
+
+  def self.get_num(bytes)
+    ret = 0
+    shift = (bytes.length - 1) * 8
+    bytes.each_byte do |byte|
+      ret += byte.to_i << shift
+      shift -= 8
+    end
+    ret
+  end
+end
+end
