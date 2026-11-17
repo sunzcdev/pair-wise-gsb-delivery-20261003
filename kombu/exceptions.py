@@ -18,7 +18,7 @@ __all__ = (
     'ChannelLimitExceeded', 'ConnectionError', 'ChannelError',
     'VersionMismatch', 'SerializerNotInstalled', 'ResourceError',
     'SerializationError', 'EncodeError', 'DecodeError', 'HttpError',
-    'InconsistencyError',
+    'InconsistencyError', 'RecoveryStageError', 'RecoveryAborted',
 )
 
 BaseExceptionType = TypeVar('BaseExceptionType', bound=BaseException)
@@ -114,3 +114,29 @@ class HttpError(Exception):
 
     def __str__(self) -> str:
         return 'HTTP {0.code}: {0.message}'.format(self)
+
+
+class RecoveryStageError(OperationalError):
+    """A single consumer recovery stage could not be completed.
+
+    The stage recorded on the exception is left in a non-completed state,
+    so a retry can resume from that point instead of re-running the stages
+    that already succeeded.
+    """
+
+    def __init__(self, stage, cause):
+        self.stage = stage
+        self.cause = cause
+        super().__init__(
+            f'Consumer recovery stage {stage!r} failed: {cause!r}'
+        )
+
+
+class RecoveryAborted(KombuError):
+    """Consumer recovery was stopped deliberately and must not be retried.
+
+    Raised when the consumer is closed (or its connection is released)
+    while a recovery round is in progress.  Unlike a transport error this
+    is not recoverable: the surrounding retry loop must give up rather
+    than reconnecting and re-registering consumers that are shutting down.
+    """

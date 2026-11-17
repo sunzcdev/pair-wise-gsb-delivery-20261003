@@ -5,6 +5,23 @@
 ================
 
 
+.. _version-5.7.1:
+
+5.7.1
+=====
+:release-date: TBA
+
+What's Changed
+~~~~~~~~~~~~~~
+- feat(messaging): make consumer connection recovery staged and inspectable
+  (channel -> declare -> qos -> consume) so a stage only runs after its
+  dependencies complete, a same-channel retry resumes at the failed stage
+  without re-registering restored consumers, a second disconnect during
+  recovery discards the partial round, and closing the consumer raises
+  ``RecoveryAborted`` to block further reconnection.  Deliveries from a
+  retired channel can no longer be acknowledged on the replacement channel.
+
+
 .. _version-5.7.0:
 
 5.7.0

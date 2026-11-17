@@ -10,7 +10,12 @@ from .common import maybe_declare
 from .compression import compress
 from .connection import PooledConnection, is_connection, maybe_channel
 from .entity import Exchange, Queue, maybe_delivery_mode
-from .exceptions import ContentDisallowed
+from .exceptions import (
+    ContentDisallowed,
+    MessageStateError,
+    RecoveryAborted,
+    RecoveryStageError,
+)
 from .serialization import dumps, prepare_accept_content
 from .utils.functional import ChannelPromise, maybe_list
 
@@ -20,6 +25,23 @@ if TYPE_CHECKING:
 __all__ = ('Exchange', 'Queue', 'Producer', 'Consumer')
 
 DEFAULT_BATCH_SIZE = 1000
+
+#: Ordered stages of a Consumer recovery round.  A stage may only run once
+#: every stage before it has completed, which makes the progress of a
+#: recovery independently inspectable instead of being implicit in the
+#: call stack of :meth:`Consumer.revive`.
+RECOVERY_STAGE_CHANNEL = 'channel'
+RECOVERY_STAGE_DECLARE = 'declare'
+RECOVERY_STAGE_QOS = 'qos'
+RECOVERY_STAGE_CONSUME = 'consume'
+
+#: Stages in the exact order recovery must perform them.
+RECOVERY_STAGES = (
+    RECOVERY_STAGE_CHANNEL,
+    RECOVERY_STAGE_DECLARE,
+    RECOVERY_STAGE_QOS,
+    RECOVERY_STAGE_CONSUME,
+)
 
 
 class _ProducerBatchState:
@@ -472,6 +494,212 @@ class Producer:
             pass
 
 
+class ConsumerRecovery:
+    """Inspectable, staged state of a consumer connection recovery.
+
+    Recovering a consumer after the connection is lost is not one atomic
+    operation; it is a fixed sequence of stages where every stage depends
+    on the previous one:
+
+    1. :data:`~kombu.messaging.RECOVERY_STAGE_CHANNEL` -- a fresh channel
+       replaces the dead one,
+    2. :data:`~kombu.messaging.RECOVERY_STAGE_DECLARE` -- queues,
+       exchanges and bindings are re-declared,
+    3. :data:`~kombu.messaging.RECOVERY_STAGE_QOS` -- the prefetch window
+       is re-applied,
+    4. :data:`~kombu.messaging.RECOVERY_STAGE_CONSUME` -- the consumers
+       that were active before the loss are re-registered.
+
+    The object records which stages have completed for the *current*
+    recovery round, which makes recovery progress independently
+    inspectable instead of being implicit in the call stack of
+    :meth:`Consumer.revive`.  A failed stage leaves the earlier stages
+    marked, so retrying on the same channel resumes at the failed stage
+    instead of repeating work -- in particular a consumer that was already
+    re-registered is never registered twice.
+
+    The object also tracks channel lineage.  Every channel superseded by
+    a recovery round is retired, and a delivery received on a retired
+    channel can never be acknowledged through the replacement channel:
+    a delivery tag is only meaningful on the channel that issued it.
+    """
+
+    def __init__(self):
+        #: Stages completed by the current recovery round.
+        self._completed = set()
+        #: Queue names with a consumer the broker confirmed on this channel.
+        self._consumers = set()
+        #: Queue names whose basic_consume was attempted this round.
+        self._pending_consumers = set()
+        #: The channel the current round is (being) built on.
+        self._active_channels = []
+        #: Channels superseded by earlier rounds.
+        self._retired_channels = []
+        #: Set once the consumer is shutting down; blocks any new round.
+        self._closed = False
+        #: Monotonic counter of recovery rounds (channel replacements).
+        self._round = 0
+
+    # -- lifecycle ---------------------------------------------------------
+
+    def begin(self, channel):
+        """Start a recovery round bound to ``channel``.
+
+        When ``channel`` is the channel of an already running round this
+        is a retry and the recorded progress is kept, so stages can resume
+        instead of re-running.  A different channel starts a genuinely new
+        round: any half-restored channel is retired and all stage progress
+        / registrations are cleared because the new channel starts with
+        nothing declared, no QoS and no consumers.
+        """
+        if channel is not None and channel is self.channel:
+            return self._round
+        if self._active_channels:
+            self._retired_channels.extend(self._active_channels)
+        self._active_channels = [channel] if channel is not None else []
+        self._completed.clear()
+        self._consumers.clear()
+        self._pending_consumers.clear()
+        self._round += 1
+        return self._round
+
+    def abort(self):
+        """Discard the state of the current recovery round.
+
+        Used when a round is interrupted by another disconnect or by a
+        shutdown, so half-restored state is never mistaken for a completed
+        recovery.
+        """
+        if self._active_channels:
+            self._retired_channels.extend(self._active_channels)
+            self._active_channels = []
+        self._completed.clear()
+        self._consumers.clear()
+        self._pending_consumers.clear()
+
+    def close(self):
+        """Record a terminal shutdown request and stop recovery."""
+        self._closed = True
+        self.abort()
+
+    def ensure_open(self):
+        """Raise :class:`RecoveryAborted` if shutdown was requested."""
+        if self._closed:
+            raise RecoveryAborted(
+                'Consumer is closed; connection recovery is not permitted'
+            )
+
+    # -- stage tracking ----------------------------------------------------
+
+    def require(self, stage):
+        """Assert that every stage preceding ``stage`` is completed."""
+        self.ensure_open()
+        index = RECOVERY_STAGES.index(stage)
+        for predecessor in RECOVERY_STAGES[:index]:
+            if predecessor not in self._completed:
+                raise RecoveryStageError(
+                    stage,
+                    RuntimeError(
+                        f'stage {predecessor!r} must complete before '
+                        f'{stage!r}'
+                    ),
+                )
+
+    def complete(self, stage):
+        self._completed.add(stage)
+
+    def is_complete(self, stage):
+        return stage in self._completed
+
+    @property
+    def stage(self):
+        """Name of the stage the current round is waiting on.
+
+        :const:`None` means no round is active or every stage has
+        completed.
+        """
+        for name in RECOVERY_STAGES:
+            if name not in self._completed:
+                return name
+        return None
+
+    @property
+    def recovered(self):
+        """Return :const:`True` only when every stage has completed."""
+        return all(name in self._completed for name in RECOVERY_STAGES)
+
+    @property
+    def completed_stages(self):
+        """Names of completed stages, in recovery order."""
+        return tuple(
+            name for name in RECOVERY_STAGES if name in self._completed
+        )
+
+    @property
+    def round(self):
+        return self._round
+
+    # -- consumer registration bookkeeping ---------------------------------
+
+    def consumer_pending(self, queue_name):
+        """Record that a ``basic_consume`` for the queue was attempted."""
+        self._pending_consumers.add(queue_name)
+
+    def consumer_registered(self, queue_name):
+        """Record that the broker confirmed the queue's consumer."""
+        self._pending_consumers.discard(queue_name)
+        self._consumers.add(queue_name)
+
+    def is_consumer_registered(self, queue_name):
+        """Return whether the consumer was confirmed on this channel."""
+        return queue_name in self._consumers
+
+    def is_consumer_pending(self, queue_name):
+        """Return whether an attempted registration is still unconfirmed."""
+        return queue_name in self._pending_consumers
+
+    @property
+    def pending_consumers(self):
+        return frozenset(self._pending_consumers)
+
+    # -- channel lineage ---------------------------------------------------
+
+    @property
+    def channel(self):
+        return self._active_channels[-1] if self._active_channels else None
+
+    def retire(self, channel):
+        """Move ``channel`` out of the active lineage."""
+        if channel is None:
+            return
+        self._active_channels = [
+            ch for ch in self._active_channels if ch is not channel
+        ]
+        if channel not in self._retired_channels:
+            self._retired_channels.append(channel)
+
+    def owns_delivery(self, channel):
+        """Return whether ``channel`` may still acknowledge a delivery.
+
+        Only the channel of the current round is valid.  Channels retired
+        by earlier rounds must not confirm anything: messages still in
+        flight on them are redelivered by the broker.
+        """
+        if channel is None or channel in self._retired_channels:
+            return False
+        return channel in self._active_channels
+
+    def assert_delivery_channel(self, message):
+        """Reject acknowledgments of messages from a retired channel."""
+        if self.owns_delivery(getattr(message, 'channel', None)):
+            return
+        raise MessageStateError(
+            'Message was delivered on a channel that is no longer active; '
+            'it cannot be acknowledged on the recovery channel and will be '
+            'redelivered by the broker'
+        )
+
+
 class Consumer:
     """Message consumer.
 
@@ -578,6 +806,8 @@ class Consumer:
             self.on_decode_error = on_decode_error
         self.accept = prepare_accept_content(accept)
         self.prefetch_count = prefetch_count
+        #: Staged, inspectable state of the (re)connection process.
+        self.recovery = ConsumerRecovery()
 
         if self.channel:
             self.revive(self.channel)
@@ -591,27 +821,112 @@ class Consumer:
         self._queues = {q.name: q for q in queues}
 
     def revive(self, channel):
-        """Revive consumer after connection loss."""
+        """Revive consumer after connection loss.
+
+        This drives the staged recovery described on
+        :class:`ConsumerRecovery`.  A genuinely new channel starts a fresh
+        round (channel -> declare -> qos -> consume); calling it again with
+        the same channel resumes the unfinished round at its failed stage
+        without repeating completed work.
+
+        Raises
+        ------
+            RecoveryAborted: if the consumer has been closed and must not
+                reconnect.
+        """
+        self.recovery.ensure_open()
         previous_no_ack = self._active_queue_no_ack.copy()
-        self._active_tags.clear()
-        self._active_queue_no_ack.clear()
-        channel = self.channel = maybe_channel(channel)
+        channel = maybe_channel(channel)
+
+        if channel is not self.recovery.channel:
+            # A new channel means a new round.  Anything half-restored on
+            # the previous (dead) channel is cleaned up before work on the
+            # replacement channel begins; its in-flight deliveries are never
+            # moved across.
+            old_channel = self.recovery.channel
+            if old_channel is not None and old_channel is not channel:
+                self._safe_close_channel(old_channel)
+            self.recovery.begin(channel)
+            self._active_tags.clear()
+            self._active_queue_no_ack.clear()
+
+        self.channel = channel
+        self._run_recovery_stages(previous_no_ack)
+
+    def _run_recovery_stages(self, active_no_ack):
+        """Execute the recovery stages that the current round still needs.
+
+        Every stage is entered only when its predecessors are marked
+        complete, and a failure is wrapped as
+        :class:`~kombu.exceptions.RecoveryStageError` with the failing
+        stage while earlier progress is retained for a same-channel retry.
+        """
+        stages = (
+            (RECOVERY_STAGE_CHANNEL, self._recover_channel),
+            (RECOVERY_STAGE_DECLARE, self._recover_declare),
+            (RECOVERY_STAGE_QOS, self._recover_qos),
+            (RECOVERY_STAGE_CONSUME,
+             lambda: self._recover_consume(active_no_ack)),
+        )
+        for name, action in stages:
+            if self.recovery.is_complete(name):
+                continue
+            try:
+                self.recovery.require(name)
+                action()
+            except RecoveryStageError:
+                raise
+            except RecoveryAborted:
+                raise
+            except Exception as exc:
+                raise RecoveryStageError(name, exc) from exc
+            self.recovery.complete(name)
+
+    def _recover_channel(self):
+        """Stage 1: bind every queue/exchange to the replacement channel."""
+        channel = self.channel
         # modify dict size while iterating over it is not allowed
         for qname, queue in list(self._queues.items()):
             # name may have changed after declare
             self._queues.pop(qname, None)
-            queue = self._queues[queue.name] = queue(self.channel)
+            queue = self._queues[queue.name] = queue(channel)
             queue.revive(channel)
 
+    def _recover_declare(self):
+        """Stage 2: re-declare queues, exchanges and bindings."""
         if self.auto_declare:
             self.declare()
 
+    def _recover_qos(self):
+        """Stage 3: re-apply the prefetch window."""
         if self.prefetch_count is not None:
             self.qos(prefetch_count=self.prefetch_count)
 
-        # re-register the AMQP consumers, but only for queues that were
-        # actually being consumed from before (not merely registered).
-        self._consume_previously_active(previous_no_ack)
+    def _recover_consume(self, active_no_ack):
+        """Stage 4: re-register only the consumers that were active."""
+        self._consume_previously_active(active_no_ack)
+
+    def _safe_close_channel(self, channel):
+        """Best-effort close of a channel from an abandoned round.
+
+        The channel is usually already dead, so transport errors must not
+        mask the recovery that is replacing it.
+        """
+        try:
+            connection = self.connection
+            errors = (
+                connection.connection_errors + connection.channel_errors
+            ) if connection is not None else ()
+        except Exception:
+            errors = ()
+        try:
+            channel.close()
+        except errors:
+            pass
+        except Exception:
+            pass
+        finally:
+            self.recovery.retire(channel)
 
     def declare(self):
         """Declare queues, exchanges and bindings.
@@ -707,6 +1022,16 @@ class Consumer:
         ]
         if not queues:
             return
+        # A resumed round must not re-register a consumer that an earlier
+        # attempt of the consume stage already got confirmed on this
+        # channel.  A queue whose attempt is still pending (the broker call
+        # failed) is retried, exactly once.
+        queues = [
+            q for q in queues
+            if not self.recovery.is_consumer_registered(q.name)
+        ]
+        if not queues:
+            return
         H, T = queues[:-1], queues[-1]
         for queue in H:
             self._basic_consume(
@@ -729,8 +1054,36 @@ class Consumer:
             cancel(tag)
         self._active_tags.clear()
         self._active_queue_no_ack.clear()
+        self.recovery._consumers.clear()
+        self.recovery._pending_consumers.clear()
 
-    close = cancel
+    def close(self):
+        """Shut the consumer down and forbid any further recovery.
+
+        This is the explicit exit request: besides cancelling the active
+        consumers it marks the recovery state as closed, so a disconnect
+        observed afterwards raises :class:`~kombu.exceptions.RecoveryAborted`
+        instead of triggering another reconnect/re-register round.
+        """
+        self.recovery.close()
+        if self.channel is not None:
+            try:
+                self.cancel()
+            except Exception:
+                pass
+
+    def ack_message(self, message, multiple=False):
+        """Acknowledge a message, guarding the delivery channel lineage.
+
+        A message delivered on a channel that recovery has since retired
+        is never acknowledged through the replacement channel: the
+        delivery tag belongs to the dead channel and the broker redelivers
+        the message.  Attempting it raises
+        :class:`~kombu.exceptions.MessageStateError` rather than silently
+        confirming nothing (or the wrong delivery) on the new channel.
+        """
+        self.recovery.assert_delivery_channel(message)
+        message.ack(multiple=multiple)
 
     def cancel_by_queue(self, queue):
         """Cancel consumer by queue name."""
@@ -840,13 +1193,24 @@ class Consumer:
 
     def _basic_consume(self, queue, consumer_tag=None,
                        no_ack=no_ack, nowait=True):
+        already_confirmed = self.recovery.is_consumer_registered(queue.name)
         tag = self._active_tags.get(queue.name)
         if tag is None:
             no_ack = queue.no_ack if no_ack is None else no_ack
             tag = self._add_tag(queue, consumer_tag)
             self._active_queue_no_ack[queue.name] = no_ack
+        else:
+            # a resumed attempt reuses the tag and its original no_ack
+            no_ack = self._active_queue_no_ack.get(queue.name, no_ack)
+        if not already_confirmed:
+            # Either a first attempt or a retry of an attempt that the
+            # broker never confirmed.  Mark it pending before the call so a
+            # failure is distinguishable from a confirmed registration, then
+            # confirm on success; a confirmed queue is never re-registered.
+            self.recovery.consumer_pending(queue.name)
             queue.consume(tag, self._receive_callback,
                           no_ack=no_ack, nowait=nowait)
+            self.recovery.consumer_registered(queue.name)
         return tag
 
     def _add_tag(self, queue, consumer_tag=None):
