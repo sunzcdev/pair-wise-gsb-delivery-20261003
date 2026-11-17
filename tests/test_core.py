@@ -8,6 +8,7 @@ import unittest
 import pytest
 
 from prometheus_client import metrics
+from prometheus_client import values
 from prometheus_client.core import (
     CollectorRegistry, Counter, CounterMetricFamily, DuplicateTimeseries, Enum,
     Gauge, GaugeHistogramMetricFamily, GaugeMetricFamily, Histogram,
@@ -562,6 +563,222 @@ class TestHistogram(unittest.TestCase):
                 'zyxwvutsrqponmlkjihgfedcba': '26+16 characters',
                 'y123456': '7+15 characters',
             })
+
+
+def _sample_value(metric, name, labels=None):
+    """Fetch a single sample's value from a collected Metric by name/labels."""
+    labels = labels or {}
+    for sample in metric.samples:
+        if sample.name == name and sample.labels == labels:
+            return sample.value
+    raise KeyError((name, labels))
+
+
+class _BlockingValue(values.MutexValue):
+    """MutexValue that parks on inc() once explicitly armed.
+
+    Arming is opt-in and shared at class level, so histogram construction and
+    baseline observations never block. This yields a deterministic interleave
+    between an in-flight observe() and a collect() without random sleeps.
+    """
+
+    armed = False
+    entered = None
+    proceed = None
+
+    def inc(self, amount):
+        if type(self).armed:
+            # Only the first increment after arming parks; the rest run freely.
+            type(self).armed = False
+            type(self).entered.set()
+            if not type(self).proceed.wait(timeout=5):
+                raise RuntimeError('Blocked observation was never released')
+        super().inc(amount)
+
+
+class TestHistogramSnapshotConsistency(unittest.TestCase):
+    """Histogram.collect must expose one logical point in time per child."""
+
+    def setUp(self):
+        self.registry = CollectorRegistry()
+        # Small, well-known bucket layout keeps the assertions explicit.
+        self.buckets = (1.0, 2.0, float('inf'))
+
+    def _blocking_histogram(self, name):
+        """Build a Histogram whose next armed observation parks mid-flight."""
+        original = values.ValueClass
+        events = {'entered': Event(), 'proceed': Event()}
+
+        class ConfiguredBlockingValue(_BlockingValue):
+            pass
+
+        ConfiguredBlockingValue.armed = False
+        ConfiguredBlockingValue.entered = events['entered']
+        ConfiguredBlockingValue.proceed = events['proceed']
+
+        values.ValueClass = ConfiguredBlockingValue
+        try:
+            histogram = Histogram(
+                name, 'help', buckets=self.buckets, registry=None)
+        finally:
+            values.ValueClass = original
+        return histogram, events, ConfiguredBlockingValue
+
+    def test_snapshot_waits_for_in_flight_observation(self):
+        # A controlled interleave: observe() is parked *inside* its critical
+        # section (after taking the child lock). A concurrent collect() must not
+        # return a torn view; it blocks until the observation completes.
+        histogram, events, blocking_value = self._blocking_histogram('hb')
+        histogram.observe(1.0)  # Establish a clean baseline.
+
+        # Arm the trap so the next observation parks on its first increment,
+        # which happens while the child lock is held.
+        blocking_value.armed = True
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            observing = pool.submit(histogram.observe, 1.0)
+            self.assertTrue(events['entered'].wait(timeout=5))
+
+            # The observation now holds the child lock mid-way. The snapshot
+            # cannot start, proving the two paths are mutually exclusive rather
+            # than independently reading the values one at a time.
+            collected = pool.submit(histogram.collect)
+            self.assertFalse(collected.done())
+            # Give the collector thread a deterministic, bounded chance to run
+            # and prove it is parked on the child lock.
+            time.sleep(0.05)
+            self.assertFalse(collected.done())
+
+            events['proceed'].set()
+            metric = collected.result(timeout=5)[0]
+            observing.result(timeout=5)
+
+        # Only after the full observation is published do sum and count move,
+        # and they move together: sum == 2.0 and count == +Inf bucket == 2.
+        self.assertEqual(2.0, _sample_value(metric, 'hb_sum'))
+        self.assertEqual(2.0, _sample_value(metric, 'hb_count'))
+        self.assertEqual(
+            2.0, _sample_value(metric, 'hb_bucket', {'le': '+Inf'}))
+        self.assertEqual(
+            2.0, _sample_value(metric, 'hb_bucket', {'le': '1.0'}))
+        self.assertEqual(
+            2.0, _sample_value(metric, 'hb_bucket', {'le': '2.0'}))
+
+    def test_unlabeled_histogram_snapshot_is_self_consistent(self):
+        histogram = Histogram(
+            'h', 'help', buckets=self.buckets, registry=self.registry)
+
+        def observe_forever(stop):
+            while not stop.is_set():
+                histogram.observe(1.0)
+
+        stop = Event()
+        with ThreadPoolExecutor(max_workers=4) as pool:
+            workers = [pool.submit(observe_forever, stop) for _ in range(4)]
+            try:
+                for _ in range(500):
+                    metric = histogram.collect()[0]
+                    count = _sample_value(metric, 'h_count')
+                    sum_value = _sample_value(metric, 'h_sum')
+                    inf = _sample_value(
+                        metric, 'h_bucket', {'le': '+Inf'})
+                    cumulative = [
+                        _sample_value(metric, 'h_bucket', {'le': '1.0'}),
+                        _sample_value(metric, 'h_bucket', {'le': '2.0'}),
+                        inf,
+                    ]
+                    # Cumulative buckets never regress within one scrape and
+                    # the highest bucket is exactly the count.
+                    self.assertTrue(
+                        all(left <= right
+                            for left, right in zip(cumulative, cumulative[1:])))
+                    self.assertEqual(count, inf)
+                    # Every observation is exactly 1.0, so a point-in-time
+                    # snapshot must always have sum == count.
+                    self.assertEqual(count, sum_value)
+            finally:
+                stop.set()
+            for worker in workers:
+                worker.result(timeout=5)
+
+    def test_labeled_children_each_have_consistent_snapshots(self):
+        histogram = Histogram(
+            'hl', 'help', ['l'], buckets=self.buckets,
+            registry=self.registry)
+        histogram.labels('a').observe(1.0)
+        histogram.labels('b').observe(2.0)
+        histogram.labels('b').observe(2.0)
+
+        metric = histogram.collect()[0]
+
+        def labeled(name, label_value, le=None):
+            labels = {'l': label_value}
+            if le is not None:
+                labels['le'] = le
+            return _sample_value(metric, name, labels)
+
+        # Child 'a': one observation of 1.0.
+        self.assertEqual(1.0, labeled('hl_count', 'a'))
+        self.assertEqual(1.0, labeled('hl_sum', 'a'))
+        self.assertEqual(1.0, labeled('hl_bucket', 'a', '+Inf'))
+        # Child 'b': two observations of 2.0 each.
+        self.assertEqual(2.0, labeled('hl_count', 'b'))
+        self.assertEqual(4.0, labeled('hl_sum', 'b'))
+        self.assertEqual(2.0, labeled('hl_bucket', 'b', '+Inf'))
+        # The two children are independent series. An observation of 1.0 lands
+        # in the 1.0 bucket; an observation of 2.0 lands in the 2.0 bucket.
+        self.assertEqual(1.0, labeled('hl_bucket', 'a', '1.0'))
+        self.assertEqual(1.0, labeled('hl_bucket', 'a', '2.0'))
+        self.assertEqual(0.0, labeled('hl_bucket', 'b', '1.0'))
+        self.assertEqual(2.0, labeled('hl_bucket', 'b', '2.0'))
+
+    def test_independent_metrics_collect_without_shared_lock(self):
+        # Two separate Histograms must not serialize on a global lock: an
+        # in-flight observation on one never blocks collection of the other.
+        blocked, blocked_events, blocking_value = (
+            self._blocking_histogram('blocked'))
+        free = Histogram(
+            'hf', 'help', buckets=self.buckets, registry=None)
+        free.observe(1.0)
+
+        blocking_value.armed = True
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            observing = pool.submit(blocked.observe, 1.0)
+            self.assertTrue(blocked_events['entered'].wait(timeout=5))
+
+            # The blocked metric is stuck, but the independent metric must still
+            # be observable and collectible immediately.
+            free.observe(1.0)
+            free_metric = free.collect()[0]
+            self.assertEqual(
+                2.0, _sample_value(free_metric, 'hf_count'))
+            self.assertEqual(
+                2.0, _sample_value(free_metric, 'hf_sum'))
+
+            blocked_events['proceed'].set()
+            observing.result(timeout=5)
+
+    def test_snapshot_is_a_copy_not_a_live_view(self):
+        histogram = Histogram(
+            'hc', 'help', buckets=self.buckets, registry=None)
+        histogram.observe(1.0)
+
+        bucket_values, _, sum_value, _ = histogram._snapshot()
+        histogram.observe(1.0)
+
+        # Mutating the metric after the snapshot must not change the returned
+        # data, i.e. the snapshot is a defensively copied point-in-time view.
+        # The snapshot exposes *raw* per-bucket counts: one observation landed
+        # only in the 1.0 bucket, so the other two are still zero.
+        self.assertEqual([1.0, 0.0, 0.0], bucket_values)
+        self.assertEqual(1.0, sum_value)
+
+        # A fresh snapshot after the second observation reflects the new state,
+        # confirming the first snapshot was an independent copy.
+        bucket_values_after, _, sum_value_after, _ = histogram._snapshot()
+        self.assertEqual([2.0, 0.0, 0.0], bucket_values_after)
+        self.assertEqual(2.0, sum_value_after)
+        # The earlier snapshot is unchanged.
+        self.assertEqual([1.0, 0.0, 0.0], bucket_values)
 
 
 class TestInfo(unittest.TestCase):

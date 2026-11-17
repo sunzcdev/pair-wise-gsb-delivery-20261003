@@ -1,6 +1,6 @@
 import math
 import os
-from threading import Lock
+from threading import Lock, RLock
 import time
 import types
 from typing import (
@@ -660,6 +660,11 @@ class Histogram(MetricWrapperBase):
         self._upper_bounds = buckets
 
     def _metric_init(self) -> None:
+        # Per-child lock making observe() and the snapshot taken by collect()
+        # atomic. It is deliberately scoped to a single child rather than the
+        # whole registry, so distinct metrics (and distinct label children) can
+        # still be observed and scraped concurrently.
+        self._lock = RLock()
         self._buckets: List[values.ValueClass] = []
         self._created = time.time()
         bucket_labelnames = self._labelnames + ('le',)
@@ -687,16 +692,21 @@ class Histogram(MetricWrapperBase):
         NaN observations are counted in the +Inf bucket and make the sum NaN.
         """
         self._raise_if_not_observable()
-        self._sum.inc(amount)
-        for i, bound in enumerate(self._upper_bounds):
-            if amount <= bound:
-                self._buckets[i].inc(1)
-                if exemplar:
-                    _validate_exemplar(exemplar)
-                    self._buckets[i].set_exemplar(Exemplar(exemplar, amount, time.time()))
-                break
-        else:
-            self._buckets[-1].inc(1)
+        # Hold the child lock for the whole observation so the sum increment
+        # and the matching bucket increment (plus exemplar) are published as a
+        # single logical state. A concurrent collect() therefore can never see
+        # the sum move without the corresponding bucket/count moving too.
+        with self._lock:
+            self._sum.inc(amount)
+            for i, bound in enumerate(self._upper_bounds):
+                if amount <= bound:
+                    self._buckets[i].inc(1)
+                    if exemplar:
+                        _validate_exemplar(exemplar)
+                        self._buckets[i].set_exemplar(Exemplar(exemplar, amount, time.time()))
+                    break
+            else:
+                self._buckets[-1].inc(1)
 
     def time(self) -> Timer:
         """Time a block of code or function, and observe the duration in seconds.
@@ -705,16 +715,38 @@ class Histogram(MetricWrapperBase):
         """
         return Timer(self, 'observe')
 
+    def _snapshot(self) -> Tuple[List[float], List[Optional[Exemplar]], float, float]:
+        """Return a consistent, point-in-time copy of this child's state.
+
+        All reads happen while holding the per-child lock that also guards
+        :meth:`observe`, so the returned raw bucket counts, exemplars, sum and
+        creation timestamp all correspond to one logical instant: no
+        observation can be applied half-way through the snapshot. The data is
+        copied (rather than returned by reference) so later observations can
+        never mutate it.
+        """
+        with self._lock:
+            bucket_values = [bucket.get() for bucket in self._buckets]
+            bucket_exemplars = [bucket.get_exemplar() for bucket in self._buckets]
+            sum_value = self._sum.get()
+            created = self._created
+        return bucket_values, bucket_exemplars, sum_value, created
+
     def _child_samples(self) -> Iterable[Sample]:
+        # Build the whole scrape from one frozen snapshot. Because the raw
+        # bucket counts and the sum were read atomically, the cumulative
+        # buckets are monotonic within the scrape and the +Inf bucket, the
+        # _count sample and the number of observations all agree.
+        bucket_values, bucket_exemplars, sum_value, created = self._snapshot()
         samples = []
         acc = 0.0
         for i, bound in enumerate(self._upper_bounds):
-            acc += self._buckets[i].get()
-            samples.append(Sample('_bucket', {'le': floatToGoString(bound)}, acc, None, self._buckets[i].get_exemplar()))
+            acc += bucket_values[i]
+            samples.append(Sample('_bucket', {'le': floatToGoString(bound)}, acc, None, bucket_exemplars[i]))
         samples.append(Sample('_count', {}, acc, None, None))
-        samples.append(Sample('_sum', {}, self._sum.get(), None, None))
+        samples.append(Sample('_sum', {}, sum_value, None, None))
         if _use_created:
-            samples.append(Sample('_created', {}, self._created, None, None))
+            samples.append(Sample('_created', {}, created, None, None))
         return tuple(samples)
 
 
