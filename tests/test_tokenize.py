@@ -207,6 +207,73 @@ def test_parse_order_by():
     assert p.tokens[0].ttype is T.Keyword
 
 
+@pytest.mark.parametrize('s', [
+    'order /* a comment */ by',
+    'order -- a comment\nby',
+    'order\n/* a comment */\nby',
+    'group /* a comment */ by',
+    'order /* a */ /* b */ by',
+    'order/**/by',
+])
+def test_parse_composite_keyword_across_comment(s):
+    p = sqlparse.parse(s)[0]
+    assert len(p.tokens) == 1
+    token = p.tokens[0]
+    assert isinstance(token, sql.CompositeKeyword)
+    # Behaves like the keyword it spells ...
+    assert token.ttype is T.Keyword
+    assert token.is_keyword
+    assert token.normalized in ('ORDER BY', 'GROUP BY')
+    # ... but the words keep their own types and the text is unchanged.
+    assert str(token) == s
+    assert [tok.ttype for tok in token.flatten()
+            if tok.ttype in T.Keyword] == [T.Keyword, T.Keyword]
+    assert any(tok.ttype in T.Comment for tok in token.flatten())
+
+
+def test_parse_composite_keyword_not_across_comment_for_single_word():
+    # Only the words of a keyword are joined; whitespace between them is
+    # already handled by the lexer.
+    p = sqlparse.parse('order     by')[0]
+    assert len(p.tokens) == 1
+    assert not isinstance(p.tokens[0], sql.CompositeKeyword)
+    assert p.tokens[0].value == 'order     by'
+
+
+@pytest.mark.parametrize('s', [
+    "'order' /* a comment */ by",
+    '"order" /* a comment */ by',
+    '`order` /* a comment */ by',
+    '[order] /* a comment */ by',
+])
+def test_parse_composite_keyword_ignores_quoted_words(s):
+    p = sqlparse.parse(s)[0]
+    assert not any(isinstance(tok, sql.CompositeKeyword)
+                   for tok in p.flatten())
+    assert str(p) == s
+
+
+@pytest.mark.parametrize('s', [
+    'order /* a comment */ where',
+    'order /* a comment */ asc',
+    'order /* a comment */',
+])
+def test_parse_composite_keyword_incomplete(s):
+    p = sqlparse.parse(s)[0]
+    assert not any(isinstance(tok, sql.CompositeKeyword)
+                   for tok in p.flatten())
+    assert str(p) == s
+
+
+def test_parse_composite_keyword_does_not_cross_statements():
+    text = 'select 1 order /* c */; select 2 by'
+    stmts = sqlparse.parse(text)
+    assert [str(stmt) for stmt in stmts] == [
+        'select 1 order /* c */; ', 'select 2 by']
+    assert not any(isinstance(tok, sql.CompositeKeyword)
+                   for stmt in stmts for tok in stmt.flatten())
+
+
 def test_parse_window_as():
     p = sqlparse.parse('WINDOW w AS')[0]
     assert len(p.tokens) == 5

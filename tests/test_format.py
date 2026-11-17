@@ -19,6 +19,37 @@ class TestFormat:
         with pytest.raises(SQLParseError):
             sqlparse.format(sql, keyword_case='foo')
 
+    @pytest.mark.parametrize('sql, expected', [
+        ('select a from t order /* c */ by a',
+         'SELECT a FROM t ORDER /* c */ BY a'),
+        ('select a from t group /* c */ by a',
+         'SELECT a FROM t GROUP /* c */ BY a'),
+        ('select a from t order -- c\nby a',
+         'SELECT a FROM t ORDER -- c\nBY a'),
+        # Without a comment the lexer sees one keyword, as before.
+        ('select a from t order by a',
+         'SELECT a FROM t ORDER BY a'),
+    ])
+    def test_keywordcase_across_comment(self, sql, expected):
+        res = sqlparse.format(sql, keyword_case='upper')
+        assert res == expected
+
+    def test_keywordcase_capitalize_across_comment(self):
+        # The words are converted as the single keyword they spell, so only
+        # the first word keeps its capital letter.
+        sql = 'select a from t order /* c */ by a'
+        res = sqlparse.format(sql, keyword_case='capitalize')
+        assert res == 'Select a From t Order /* c */ by a'
+        sql = 'SELECT a FROM t ORDER /* c */ BY a'
+        res = sqlparse.format(sql, keyword_case='lower')
+        assert res == 'select a from t order /* c */ by a'
+
+    def test_keywordcase_across_comment_keeps_comment_text(self):
+        # Comments and strings are not keywords and must be left alone.
+        sql = "select a from t order /* ORDER BY */ by 'GROUP BY'"
+        res = sqlparse.format(sql, keyword_case='upper')
+        assert res == "SELECT a FROM t ORDER /* ORDER BY */ BY 'GROUP BY'"
+
     def test_identifiercase(self):
         sql = 'select * from bar; -- select foo\n'
         res = sqlparse.format(sql, identifier_case='upper')
@@ -327,6 +358,29 @@ class TestFormatReindentAligned:
             '                  z',
             '       )',
             ' order by 1,',
+            '          2'])
+
+    def test_group_by_across_comment(self):
+        # A comment between the words of a composite keyword doesn't stop
+        # the keyword from being recognized: the clause is laid out as if
+        # it was spelled without the comment.
+        sql = """
+            select a, b, sum(x) as sum_x
+            from table
+            group /* keep */ by a, b
+            having sum(x) > 1
+            order -- rest\nby 1, 2
+            """
+        assert self.formatter(sql) == '\n'.join([
+            'select a,',
+            '       b,',
+            '       sum(x) as sum_x',
+            '  from table',
+            ' group /* keep */ by a,',
+            '          b',
+            'having sum(x) > 1',
+            ' order -- rest',
+            'by 1,',
             '          2'])
 
     def test_window_functions(self):

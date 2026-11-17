@@ -274,6 +274,41 @@ def test_grouping_where():
     assert isinstance(p.tokens[-1].tokens[0].tokens[-2], sql.Where)
 
 
+@pytest.mark.parametrize('s', [
+    'select * from foo where bar = 1 order /* c */ by id desc',
+    'select * from foo where bar = 1 order -- c\nby id desc',
+    'select * from foo where bar = 1 group /* c */ by id',
+])
+def test_grouping_where_ends_at_commented_keyword(s):
+    # The keyword that ends the WHERE clause is the same token as without
+    # the comment, so neither the keyword nor its comment ends up in the
+    # WHERE group.
+    p = sqlparse.parse(s)[0]
+    assert str(p) == s
+    tidx = next(idx for idx, tok in enumerate(p.tokens)
+                if isinstance(tok, sql.Where))
+    where, keyword = p.tokens[tidx], p.tokens[tidx + 1]
+    assert where.value.startswith('where')
+    assert '/* c */' not in where.value and '-- c' not in where.value
+    assert isinstance(keyword, sql.CompositeKeyword)
+    assert keyword.normalized in ('ORDER BY', 'GROUP BY')
+    assert '/* c */' in keyword.value or '-- c' in keyword.value
+
+
+def test_grouping_comment_after_composite_keyword_stays_outside():
+    # Grouping comments must not extend the keyword group: a comment that
+    # follows the keyword is not one of its words.
+    s = 'select a from t order /* a */ by /* b */ a'
+    p = sqlparse.parse(s)[0]
+    assert str(p) == s
+    keyword = next(tok for tok in p.tokens
+                   if isinstance(tok, sql.CompositeKeyword))
+    assert keyword.value == 'order /* a */ by'
+    assert keyword.normalized == 'ORDER BY'
+    assert [tok.value for tok in p.tokens
+            if not tok.is_whitespace][-2:] == ['/* b */', 'a']
+
+
 @pytest.mark.parametrize('s', (
     'select 1 where 1 = 2 union select 2',
     'select 1 where 1 = 2 union all select 2',

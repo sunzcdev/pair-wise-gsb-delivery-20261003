@@ -8,6 +8,7 @@
 from sqlparse import sql
 from sqlparse import tokens as T
 from sqlparse.exceptions import SQLParseError
+from sqlparse.keywords import COMPOSITE_KEYWORDS, is_keyword_filler
 from sqlparse.utils import imt, recurse
 
 # Maximum recursion depth for grouping operations to prevent DoS attacks
@@ -350,6 +351,54 @@ def group_comments(tlist):
         tidx, token = tlist.token_next_by(t=T.Comment, idx=tidx)
 
 
+def _composite_keyword_end(tlist, start, tail_word):
+    """Return the index of the word completing a composite keyword.
+
+    *start* is the index of the first word inside *tlist* and *tail_word*
+    the word that has to follow it. Whitespace and comments may sit
+    between the two words; any other token -- a string literal, a quoted
+    identifier, a punctuation mark or a statement separator -- ends the
+    keyword and yields ``None``.
+    """
+    for idx in range(start + 1, len(tlist.tokens)):
+        token = tlist.tokens[idx]
+        if is_keyword_filler(token.ttype) or isinstance(token, sql.Comment):
+            continue
+        if (token.is_keyword and not token.is_group
+                and token.normalized == tail_word):
+            return idx
+        return None
+    return None
+
+
+@recurse(sql.CompositeKeyword)
+def group_keywords(tlist):
+    """Group composite keywords whose words are separated by a comment.
+
+    The lexer recognizes keywords like ``ORDER BY`` or ``GROUP BY`` as a
+    single token as long as only whitespace separates the words. With a
+    comment in between, the words arrive as separate tokens. Grouping them
+    into a :class:`~sqlparse.sql.CompositeKeyword` gives the later stages
+    -- clause grouping, keyword case conversion and reindentation -- the
+    same view they have for the comment-free spelling. The comment and the
+    whitespace around it stay children of the group, so joining the leaf
+    tokens still reproduces the original text.
+    """
+    idx = 0
+    while idx < len(tlist.tokens):
+        token = tlist.tokens[idx]
+        tail_word = None
+        if token.is_keyword and not token.is_group:
+            tail_word = COMPOSITE_KEYWORDS.get(token.normalized)
+        if tail_word is not None:
+            end = _composite_keyword_end(tlist, idx, tail_word)
+            if end is not None:
+                tlist.group_tokens(sql.CompositeKeyword, idx, end)
+                idx += 1
+                continue
+        idx += 1
+
+
 @recurse(sql.Where)
 def group_where(tlist):
     tidx, token = tlist.token_next_by(m=sql.Where.M_OPEN)
@@ -425,7 +474,10 @@ def align_comments(tlist):
     tidx, token = tlist.token_next_by(i=sql.Comment)
     while token:
         pidx, prev_ = tlist.token_prev(tidx)
-        if isinstance(prev_, sql.TokenList):
+        # A composite keyword is a lexical unit, a comment following it
+        # doesn't belong to it and must not be folded into it.
+        if (isinstance(prev_, sql.TokenList)
+                and not isinstance(prev_, sql.CompositeKeyword)):
             tlist.group_tokens(sql.TokenList, pidx, tidx, extend=True)
             tidx = pidx
         tidx, token = tlist.token_next_by(i=sql.Comment, idx=tidx)
@@ -445,6 +497,7 @@ def group_values(tlist):
 
 def group(stmt):
     for func in [
+        group_keywords,
         group_comments,
 
         # _group_matching

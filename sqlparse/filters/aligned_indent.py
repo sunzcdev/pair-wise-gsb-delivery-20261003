@@ -65,6 +65,12 @@ class AlignedIndentFilter:
         [tlist.insert_before(token, self.nl()) for token in identifiers]
         self._process_default(tlist)
 
+    def _process_compositekeyword(self, tlist):
+        # A composite keyword whose words are separated by a comment, see
+        # grouping.group_keywords(). It is laid out like the keyword it
+        # spells; its words must not be split again on their own.
+        pass
+
     def _process_case(self, tlist):
         offset_ = len('case ') + len('when ')
         cases = tlist.get_cases(skip_ws=True)
@@ -104,12 +110,13 @@ class AlignedIndentFilter:
         tidx, token = self._next_token(tlist)
         while token:
             # joins, group/order by are special case. only consider the first
-            # word as aligner
+            # word as aligner. ``normalized`` spells the keyword without
+            # the comments that may sit between its words.
             if (
                 token.match(T.Keyword, self.join_words, regex=True)
                 or token.match(T.Keyword, self.by_words, regex=True)
             ):
-                token_indent = token.value.split()[0]
+                token_indent = token.normalized.split()[0]
             else:
                 token_indent = str(token)
             tlist.insert_before(token, self.nl(token_indent))

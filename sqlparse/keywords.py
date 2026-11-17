@@ -16,6 +16,27 @@ from sqlparse import tokens
 # shall be processed further through a lookup in the KEYWORDS dictionaries
 PROCESS_AS_KEYWORD = object()
 
+# Composite keywords are made up of more than one word. The lexer recognizes
+# them with a single regex (e.g. ``ORDER\s+BY``) as long as only whitespace
+# is in between. When a comment is inserted, ``ORDER`` and ``BY`` end up as
+# separate tokens; the table below maps the first word to the word that
+# closes the same keyword so that the token stream can still recognize the
+# composite keyword. Only whitespace and comments are allowed in between --
+# anything else, and in particular a statement separator, ends the search.
+COMPOSITE_KEYWORDS = {
+    'GROUP': 'BY',
+    'ORDER': 'BY',
+}
+
+
+def is_keyword_filler(ttype):
+    """Return ``True`` for token types that don't interrupt a keyword.
+
+    Whitespace and comments may be placed between the words of a composite
+    keyword without ending it.
+    """
+    return ttype in tokens.Whitespace or ttype in tokens.Comment
+
 
 # Dollar-quoted literals (`$tag$...$tag$`) and multiline comments
 # (`/*...*/`, `/*+...*/`) used to be matched with per-position regexes

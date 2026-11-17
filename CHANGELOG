@@ -1,3 +1,21 @@
+Development Version
+-------------------
+
+Notable Changes
+
+* Composite keywords such as `ORDER BY` and `GROUP BY` are now recognized
+  even when a comment sits between their words, e.g.
+  `order /* hint */ by a`. Such words are grouped into
+  `sqlparse.sql.CompositeKeyword`, which behaves like the single keyword
+  token the lexer produces when only whitespace separates them. Clause
+  grouping, `keyword_case` conversion and both reindentation filters use
+  the same recognition, so a comment doesn't change how a statement is
+  grouped or laid out. The comment and the surrounding whitespace are
+  preserved as their own tokens: joining the leaf tokens still reproduces
+  the input unchanged. Words in string literals or quoted identifiers are
+  not combined, and a statement separator always ends the search.
+
+
 Release 0.6.1 (Nov 01, 2026)
 ----------------------------
 

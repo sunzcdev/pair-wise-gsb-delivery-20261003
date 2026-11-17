@@ -641,3 +641,41 @@ def test_json_operators(sql):
     assert len(p) == 1
     assert len(p[0].tokens) == 1
     assert p[0].tokens[0].ttype == sqlparse.tokens.Operator
+
+
+@pytest.mark.parametrize('sql', [
+    'select a from t order /* a comment */ by a',
+    'select a from t order -- a comment\nby a',
+    'select a from t order\n/* a comment */\nby a',
+    'select a from t group /* a */\n-- b\nby a',
+    'select a from t order /* a */ /* b */ by a',
+    'select a from t order/**/by a',
+    'select a from t group /* a */ by a order /* b */ by b',
+    'select a from t order /* a */ by a; -- trailing\n',
+])
+def test_composite_keyword_preserves_original_text(sql):
+    # Grouping the words of a keyword must not touch the text: joining the
+    # leaf tokens reproduces the input byte for byte, comments, newlines
+    # and the whitespace around them included.
+    stmt = sqlparse.parse(sql)[0]
+    assert str(stmt) == sql
+    assert ''.join(tok.value for tok in stmt.flatten()) == sql
+
+
+@pytest.mark.parametrize('text, first_word', [
+    ('select a from t order /* a comment */ by a', 'order'),
+    ('select a from t group /* a comment */ by a', 'group'),
+])
+def test_composite_keyword_leaves_keep_comment_type(text, first_word):
+    # The comment stays a comment; it is not folded into a keyword token.
+    # The whitespace around it is preserved as well.
+    stmt = sqlparse.parse(text)[0]
+    keyword = next(tok for tok in stmt.tokens
+                   if isinstance(tok, sql.CompositeKeyword))
+    leaves = list(keyword.flatten())
+    assert [tok.value for tok in leaves] == [
+        first_word, ' ', '/* a comment */', ' ', 'by']
+    assert [tok.ttype for tok in leaves if tok.is_keyword] == [
+        T.Keyword, T.Keyword]
+    assert leaves[2].ttype in T.Comment
+    assert [tok.value for tok in leaves if tok.is_whitespace] == [' ', ' ']

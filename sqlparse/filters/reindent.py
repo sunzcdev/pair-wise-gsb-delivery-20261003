@@ -167,6 +167,12 @@ class ReindentFilter:
         self._last_func = tlist[0]
         self._process_default(tlist)
 
+    def _process_compositekeyword(self, tlist):
+        # A composite keyword whose words are separated by a comment, see
+        # grouping.group_keywords(). It is laid out like the keyword it
+        # spells; its words must not be split again on their own.
+        pass
+
     def _process_identifierlist(self, tlist):
         identifiers = list(tlist.get_identifiers())
         if self.indent_columns:

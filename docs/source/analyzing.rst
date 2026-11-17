@@ -35,6 +35,9 @@ The following classes represent distinct parts of a SQL statement.
 .. autoclass:: sqlparse.sql.Comment
    :members:
 
+.. autoclass:: sqlparse.sql.CompositeKeyword
+   :members:
+
 .. autoclass:: sqlparse.sql.Identifier
    :members:
 

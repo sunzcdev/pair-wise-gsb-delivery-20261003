@@ -554,6 +554,32 @@ class Comment(TokenList):
         return self.tokens and self.tokens[0].ttype == T.Comment.Multiline
 
 
+class CompositeKeyword(TokenList):
+    """A keyword spelled as more than one word.
+
+    The lexer already produces a single token for keywords such as
+    ``ORDER BY`` when only whitespace separates the words. If a comment is
+    put in between, the words end up as separate tokens. They are grouped
+    into this class so that later stages -- clause grouping, keyword case
+    conversion and reindentation -- see the same keyword they would see
+    without the comment.
+
+    The children keep their own token types, comments and whitespace
+    included, so joining the leaf tokens reproduces the original text. The
+    group as a whole behaves like the keyword formed by its words, e.g.
+    ``normalized`` is ``'ORDER BY'`` and ``ttype`` is ``T.Keyword``.
+    """
+
+    def __init__(self, tokens=None):
+        super().__init__(tokens)
+        self.ttype = T.Keyword
+        self.is_keyword = True
+        # The words of the keyword, without the whitespace and comments in
+        # between, e.g. "ORDER BY".
+        self.normalized = ' '.join(
+            token.normalized for token in self.flatten() if token.is_keyword)
+
+
 class Where(TokenList):
     """A WHERE clause."""
     M_OPEN = T.Keyword, 'WHERE'
