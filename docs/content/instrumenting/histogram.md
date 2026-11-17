@@ -132,3 +132,9 @@ myapp_request_duration_seconds_bucket{method="GET",endpoint="/api/users",le="0.1
 myapp_request_duration_seconds_sum{method="GET",endpoint="/api/users"} 3.7
 myapp_request_duration_seconds_count{method="GET",endpoint="/api/users"} 50
 ```
+
+## Coarser bucket views
+
+To expose the same histogram with fewer, wider buckets to a different
+collection endpoint without changing the instrumented metric, see
+[Bucket projection](../bucket-projection/).

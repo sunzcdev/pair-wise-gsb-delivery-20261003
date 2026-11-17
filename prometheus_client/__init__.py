@@ -12,6 +12,9 @@ from .exposition import (
     write_to_textfile,
 )
 from .gc_collector import GC_COLLECTOR, GCCollector
+from .histogram_projection import (
+    BucketProjectionCollector, project_histogram_buckets,
+)
 from .metrics import (
     Counter, disable_created_metrics, enable_created_metrics, Enum, Gauge,
     Histogram, Info, Summary,
@@ -31,6 +34,8 @@ __all__ = (
     'Histogram',
     'Info',
     'Enum',
+    'BucketProjectionCollector',
+    'project_histogram_buckets',
     'enable_created_metrics',
     'disable_created_metrics',
     'CONTENT_TYPE_LATEST',
