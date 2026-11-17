@@ -67,6 +67,61 @@ for metric in REGISTRY.collect():
     print(metric.name, metric.type)
 ```
 
+This entry point is strictly synchronous: it never starts or runs an event
+loop. If any registered collector provides an asynchronous `collect()`
+coroutine, calling `collect()` raises `RuntimeError`; use
+[`async_collect()`](#asynccollectmax_concurrencydefault_async_concurrencytimeoutdefault_collector_timeout)
+from inside a running event loop instead. Each collector's whole metric
+family is materialised before it is yielded, so a collector that raises
+partway through cannot leave a partially populated family in the output.
+
+### `async_collect(max_concurrency=DEFAULT_ASYNC_CONCURRENCY, timeout=DEFAULT_COLLECTOR_TIMEOUT)`
+
+Asynchronously collect metrics from every registered collector.
+
+```python
+import asyncio
+from prometheus_client.registry import CollectorRegistry
+
+class AsyncServiceCollector:
+    async def collect(self):
+        state = await fetch_service_state()  # e.g. an async HTTP or DB call
+        return [GaugeMetricFamily('service_up', 'Service health', value=state)]
+
+async def scrape():
+    registry = CollectorRegistry()
+    registry.register(AsyncServiceCollector())
+    metrics = await registry.async_collect()
+```
+
+Synchronous and asynchronous collectors may be mixed freely in the same
+registry:
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `max_concurrency` | `int` | `DEFAULT_ASYNC_CONCURRENCY` (8) | Maximum number of collector coroutines allowed to run at the same time. Must be at least 1. |
+| `timeout` | `Optional[float]` | `DEFAULT_COLLECTOR_TIMEOUT` (10.0 seconds) | Per-collector timeout in seconds for asynchronous collectors. Pass `None` to disable timeouts. Synchronous collectors block the event loop and therefore cannot be interrupted by a timeout. |
+
+Guarantees:
+
+- **Bounded concurrency.** At most `max_concurrency` collectors execute
+  concurrently. Synchronous collectors run inline on the event loop thread;
+  they are never dispatched into a hidden thread pool.
+- **Stable ordering.** Metric families are returned in collector
+  registration order, regardless of which collector finishes first.
+- **Failure isolation.** A collector that times out or raises a business
+  exception is logged and its entire family is dropped; the rest of the
+  scrape still succeeds. Timeouts and business exceptions are logged
+  separately. A failing family can never reach the output half-collected.
+- **Cancellation convergence.** If the coroutine is cancelled while a
+  scrape is in flight, collectors that have already started are awaited to
+  completion (or their own timeout) before the `CancelledError`
+  propagates, rather than being abandoned mid-collection.
+
+`RestrictedRegistry` exposes the same `async_collect()` method, applying
+the name restriction to each family while preserving the same ordering and
+failure-isolation guarantees.
+
 ### `restricted_registry(names)`
 
 Return a view of this registry that only exposes the named metrics. Useful

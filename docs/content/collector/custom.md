@@ -59,6 +59,43 @@ names the collector produces. Samples on the returned objects are ignored. If
 not implemented and the registry has `auto_describe=True`, `collect` is called
 at registration time instead.
 
+## Asynchronous collectors
+
+A collector whose `collect` is a coroutine function is treated as an
+asynchronous collector. It is useful when reading state requires `await`-ing
+another service (for example an asynchronous HTTP client or database driver):
+
+```python
+from prometheus_client.core import GaugeMetricFamily
+from prometheus_client.registry import CollectorRegistry
+
+class AsyncServiceCollector:
+    def describe(self):
+        # Registration-time name discovery stays synchronous.
+        return [GaugeMetricFamily('service_up', 'Service health')]
+
+    async def collect(self):
+        state = await client.fetch_status()  # asynchronous I/O
+        return [GaugeMetricFamily('service_up', 'Service health', value=state)]
+
+registry = CollectorRegistry()
+registry.register(AsyncServiceCollector())
+
+metrics = await registry.async_collect()
+```
+
+Asynchronous collectors are only collected through
+[`CollectorRegistry.async_collect()`](../../registry/#asynccollectmax_concurrencydefault_async_concurrencytimeoutdefault_collector_timeout),
+which must be awaited from inside a running event loop. The synchronous
+`collect()` entry point never runs an event loop and raises `RuntimeError` if
+the registry contains an asynchronous collector. Synchronous and asynchronous
+collectors may be registered in the same registry; the synchronous ones run
+inline on the event loop rather than in an implicit thread pool.
+
+Because `describe` is called synchronously at registration time when
+`auto_describe=True`, asynchronous collectors should implement a synchronous
+`describe()` instead of relying on `auto_describe`.
+
 ## value vs labels
 
 Every metric family constructor accepts either inline data or `labels`, but not
