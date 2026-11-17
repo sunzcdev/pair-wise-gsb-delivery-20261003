@@ -1,5 +1,22 @@
 ## Current
 
+concurrent-ruby:
+
+* `Concurrent::Atom` observation is now tied to commits instead of update
+  attempts. Observers are notified only for values which passed validation and
+  won the compare-and-set, with a new fourth `version` argument identifying the
+  commit order, and a matching `Atom#version`. Observers written for the older
+  three argument form keep working.
+* Notifications are delivered in commit order, including when an observer
+  triggers a further update of the same atom; a failing observer is logged and
+  does not roll back the committed value or prevent the other observers from
+  being notified.
+* `Concurrent::Collection::CopyOnNotifyObserverSet#notify_observers_safely`
+  notifies every observer and collects the exceptions instead of aborting on
+  the first failure.
+* Documented that the `Atom#swap` block may be retried and must therefore be
+  free of externally visible side effects.
+
 ## Release v1.3.8 (19 July 2026)
 
 concurrent-ruby:

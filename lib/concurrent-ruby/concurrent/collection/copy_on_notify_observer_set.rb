@@ -75,6 +75,44 @@ module Concurrent
         self
       end
 
+      # Notifies all registered observers, isolating observers from each other.
+      #
+      # Every observer is called exactly once, in registration order. Unlike
+      # {#notify_observers}, an exception raised by one observer neither
+      # prevents the remaining observers from being notified nor propagates to
+      # the caller; the failures are collected and returned instead. This makes
+      # the method suitable for announcing a change which has already been
+      # committed and therefore cannot be undone by a failing observer.
+      #
+      # The arguments passed to each observer are either `args`, or the value
+      # returned by the block, which is called once per observer and receives
+      # the observer and the function name so the caller can tailor the payload
+      # to the observer's arity.
+      #
+      # @param [Object] args arguments to be passed to each observer
+      # @yield [observer, function] computes the arguments for a single observer
+      # @return [Array<Array(Object, Exception)>] the observer/exception pairs
+      #   in the order the failures happened, empty when nobody raised
+      def notify_observers_safely(*args, &block)
+        observers = duplicate_observers
+        errors    = []
+
+        observers.each do |observer, function|
+          begin
+            call_args = block ? block.call(observer, function) : args
+            observer.send(function, *call_args)
+          rescue Exception => error
+            # `Exception` (not just `StandardError`) so that a `SystemExit` or
+            # `Interrupt` raised by one observer does not stop the remaining
+            # observers from being notified. The caller decides what to
+            # propagate once everybody has been called.
+            errors << [observer, error]
+          end
+        end
+
+        errors
+      end
+
       protected
 
       def ns_initialize
