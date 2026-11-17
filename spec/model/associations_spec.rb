@@ -5362,3 +5362,300 @@ describe Sequel::Model, ".dataset_module" do
     @c.where(:bar).foo.opts[:eager].must_equal(:foo=>{:bar=>:baz}, :quux=>nil)
   end
 end
+
+describe "Model.eager_load_with_limits" do
+  def mock_db(opts={}, &block)
+    db = Sequel.mock(opts)
+    db.extend_datasets do
+      def supports_window_functions?; true; end
+    end
+    db
+  end
+
+  def setup_models(db)
+    artist = Class.new(Sequel::Model(db[:artists]))
+    album = Class.new(Sequel::Model(db[:albums]))
+    artist.one_to_many :albums, :class=>album, :key=>:artist_id
+    [artist, album]
+  end
+
+  describe "with window function support" do
+    before do
+      @db = mock_db
+      @Artist, @Album = setup_models(@db)
+      @owners = [@Artist.load(:id=>1), @Artist.load(:id=>2)]
+    end
+
+    it "should select the window function strategy when limits are present" do
+      @Artist.per_owner_limit_plan(:albums, @owners, 1=>2, 2=>[3, 1]).strategy.must_equal :window_function
+    end
+
+    it "should provide the SQL for the window function strategy without executing it" do
+      @Artist.per_owner_limit_plan(:albums, @owners, 1=>2, 2=>[3, 1]).sql.must_equal "SELECT * FROM (SELECT *, albums.artist_id AS x_sequel_per_owner_key_0_x, row_number() OVER (PARTITION BY albums.artist_id ORDER BY albums.id) AS x_sequel_row_number_x FROM albums WHERE (albums.artist_id IN (1, 2))) AS t1 WHERE ((x_sequel_row_number_x > (CASE WHEN (x_sequel_per_owner_key_0_x = 2) THEN 1 ELSE 0 END)) AND (((CASE WHEN (x_sequel_per_owner_key_0_x = 1) THEN 2 WHEN (x_sequel_per_owner_key_0_x = 2) THEN 4 ELSE NULL END) IS NULL) OR (x_sequel_row_number_x <= (CASE WHEN (x_sequel_per_owner_key_0_x = 1) THEN 2 WHEN (x_sequel_per_owner_key_0_x = 2) THEN 4 ELSE NULL END)))) ORDER BY x_sequel_per_owner_key_0_x, x_sequel_row_number_x"
+      @db.sqls.must_equal ["SELECT * FROM artists LIMIT 0", "SELECT * FROM albums LIMIT 0"]
+    end
+
+    it "should handle an offset without a limit" do
+      @Artist.per_owner_limit_plan(:albums, @owners, 1=>[nil, 1], 2=>[nil, 2]).sql.must_equal "SELECT * FROM (SELECT *, albums.artist_id AS x_sequel_per_owner_key_0_x, row_number() OVER (PARTITION BY albums.artist_id ORDER BY albums.id) AS x_sequel_row_number_x FROM albums WHERE (albums.artist_id IN (1, 2))) AS t1 WHERE (x_sequel_row_number_x > (CASE WHEN (x_sequel_per_owner_key_0_x = 1) THEN 1 WHEN (x_sequel_per_owner_key_0_x = 2) THEN 2 ELSE 0 END)) ORDER BY x_sequel_per_owner_key_0_x, x_sequel_row_number_x"
+    end
+
+    it "should include the fallback primary key in the window order when the association has an order" do
+      @Artist.one_to_many :ordered_albums, :class=>@Album, :key=>:artist_id, :order=>Sequel.desc(:name)
+      @Artist.per_owner_limit_plan(:ordered_albums, @owners, 1=>1, 2=>2).sql.must_equal "SELECT * FROM (SELECT *, albums.artist_id AS x_sequel_per_owner_key_0_x, row_number() OVER (PARTITION BY albums.artist_id ORDER BY name DESC, albums.id) AS x_sequel_row_number_x FROM albums WHERE (albums.artist_id IN (1, 2))) AS t1 WHERE (((CASE WHEN (x_sequel_per_owner_key_0_x = 1) THEN 1 WHEN (x_sequel_per_owner_key_0_x = 2) THEN 2 ELSE NULL END) IS NULL) OR (x_sequel_row_number_x <= (CASE WHEN (x_sequel_per_owner_key_0_x = 1) THEN 1 WHEN (x_sequel_per_owner_key_0_x = 2) THEN 2 ELSE NULL END))) ORDER BY x_sequel_per_owner_key_0_x, x_sequel_row_number_x"
+    end
+
+    it "should use the unbounded strategy when no owner has a limit or offset" do
+      plan = @Artist.per_owner_limit_plan(:albums, @owners, 1=>nil, 2=>nil)
+      plan.strategy.must_equal :unbounded
+      plan.sql.must_equal "SELECT *, albums.artist_id AS x_sequel_per_owner_key_0_x FROM albums WHERE (albums.artist_id IN (1, 2)) ORDER BY albums.id"
+    end
+
+    it "should use the none strategy without a query when every owner has a zero limit" do
+      plan = @Artist.per_owner_limit_plan(:albums, @owners, 1=>0, 2=>[0, 3])
+      plan.strategy.must_equal :none
+      plan.sql.must_be_nil
+      @db.sqls.must_equal ["SELECT * FROM artists LIMIT 0", "SELECT * FROM albums LIMIT 0"]
+    end
+
+    it "should use the none strategy without a query for an empty batch" do
+      plan = @Artist.per_owner_limit_plan(:albums, [], {})
+      plan.strategy.must_equal :none
+      plan.sql.must_be_nil
+    end
+
+    it "should assign records to each owner and return a result object" do
+      db = mock_db(:fetch=>[{:id=>1, :artist_id=>1, :x_sequel_per_owner_key_0_x=>1, :x_sequel_row_number_x=>1}, {:id=>2, :artist_id=>1, :x_sequel_per_owner_key_0_x=>1, :x_sequel_row_number_x=>2}, {:id=>3, :artist_id=>2, :x_sequel_per_owner_key_0_x=>2, :x_sequel_row_number_x=>1}])
+      artist, = setup_models(db)
+      owners = [artist.load(:id=>1), artist.load(:id=>2)]
+      result = artist.eager_load_with_limits(:albums, owners, 1=>1, 2=>0)
+      result.strategy.must_equal :window_function
+      result.must_be_kind_of Sequel::Model::Associations::PerOwnerLimitResult
+      owners.map{|o| o.albums.map(&:id)}.must_equal [[1, 2], []]
+      result[owners[0]].map(&:id).must_equal [1, 2]
+      result[owners[1]].must_equal []
+      result.fetch(1).map(&:id).must_equal [1, 2]
+      result.fetch(2).must_equal []
+      result.records_for(3).must_equal []
+      result[3].must_be_nil
+      proc{result.fetch(3)}.must_raise KeyError
+      result.fetch(3, :default).must_equal :default
+      result.to_h.keys.must_equal owners
+      result.length.must_equal 2
+      result.empty?.must_equal false
+      result.association_name.must_equal :albums
+      result.each.to_a.map{|o, recs| [o, recs.map(&:id)]}.must_equal [[owners[0], [1, 2]], [owners[1], []]]
+    end
+
+    it "should give distinct owners with the same key their own copy of the records" do
+      db = mock_db(:fetch=>[{:id=>1, :artist_id=>1, :x_sequel_per_owner_key_0_x=>1, :x_sequel_row_number_x=>1}])
+      artist, = setup_models(db)
+      owner1 = artist.load(:id=>1)
+      owner2 = artist.load(:id=>1)
+      result = artist.eager_load_with_limits(:albums, [owner1, owner2], 1=>1)
+      owner1.albums.map(&:id).must_equal [1]
+      owner2.albums.map(&:id).must_equal [1]
+      first, second = result.each.to_a.map(&:last)
+      first.wont_be_same_as second
+      first.must_equal second
+    end
+
+    it "should accept a dataset of owners" do
+      db = mock_db(:fetch=>[{:id=>1, :artist_id=>1, :x_sequel_per_owner_key_0_x=>1, :x_sequel_row_number_x=>1}])
+      artist, = setup_models(db)
+      db.fetch = [{:id=>1}, {:id=>2}]
+      owners = artist.dataset
+      result = artist.eager_load_with_limits(:albums, owners, 1=>1)
+      result.strategy.must_equal :window_function
+      result.owners.must_equal owners.all
+    end
+
+    it "should treat owners with a NULL key value as having no associated records without including them in the query" do
+      db = mock_db(:fetch=>[{:id=>1, :artist_id=>1, :x_sequel_per_owner_key_0_x=>1, :x_sequel_row_number_x=>1}])
+      artist, = setup_models(db)
+      with_key = artist.load(:id=>1)
+      without_key = artist.load(:id=>nil)
+      result = artist.eager_load_with_limits(:albums, [with_key, without_key], 1=>1)
+      with_key.albums.map(&:id).must_equal [1]
+      without_key.albums.must_equal []
+      result[without_key].must_equal []
+      result[with_key].map(&:id).must_equal [1]
+      sql = db.sqls.last
+      sql.must_include "albums.artist_id IN (1)"
+      sql.wont_include "IN (1, NULL"
+    end
+
+    it "should use the association's :limit as the default quota for owners without an explicit quota" do
+      @Artist.one_to_many :limited_albums, :class=>@Album, :key=>:artist_id, :limit=>3
+      plan = @Artist.per_owner_limit_plan(:limited_albums, @owners, {})
+      plan.strategy.must_equal :window_function
+      plan.sql.must_include "(CASE WHEN (x_sequel_per_owner_key_0_x = 1) THEN 3 WHEN (x_sequel_per_owner_key_0_x = 2) THEN 3 ELSE NULL END)"
+    end
+
+    it "should not inherit the association's :limit when an owner's quota is explicitly nil" do
+      @Artist.one_to_many :limited_albums, :class=>@Album, :key=>:artist_id, :limit=>3
+      plan = @Artist.per_owner_limit_plan(:limited_albums, @owners, 1=>nil)
+      plan.strategy.must_equal :window_function
+      plan.sql.must_equal "SELECT * FROM (SELECT *, albums.artist_id AS x_sequel_per_owner_key_0_x, row_number() OVER (PARTITION BY albums.artist_id ORDER BY albums.id) AS x_sequel_row_number_x FROM albums WHERE (albums.artist_id IN (1, 2))) AS t1 WHERE (((CASE WHEN (x_sequel_per_owner_key_0_x = 2) THEN 3 ELSE NULL END) IS NULL) OR (x_sequel_row_number_x <= (CASE WHEN (x_sequel_per_owner_key_0_x = 2) THEN 3 ELSE NULL END))) ORDER BY x_sequel_per_owner_key_0_x, x_sequel_row_number_x"
+    end
+
+    it "should raise an error before querying if the owners are not model instances" do
+      proc{@Artist.per_owner_limit_plan(:albums, [1, 2], 1=>1)}.must_raise Sequel::Error
+      @db.sqls.must_equal ["SELECT * FROM artists LIMIT 0", "SELECT * FROM albums LIMIT 0"]
+    end
+
+    it "should raise an error before querying for an undefined association" do
+      proc{@Artist.per_owner_limit_plan(:blah, @owners, 1=>1)}.must_raise Sequel::Error
+      @db.sqls.must_equal ["SELECT * FROM artists LIMIT 0", "SELECT * FROM albums LIMIT 0"]
+    end
+
+    it "should raise an error before querying for associations returning a single record" do
+      @Artist.one_to_one :first_album, :class=>@Album, :key=>:artist_id
+      proc{@Artist.per_owner_limit_plan(:first_album, @owners, 1=>1)}.must_raise Sequel::Error
+      @Artist.many_to_one :no_album, :class=>@Album, :key=>:artist_id
+      proc{@Artist.per_owner_limit_plan(:no_album, @owners, 1=>1)}.must_raise Sequel::Error
+    end
+
+    it "should raise an error before querying for invalid quotas" do
+      proc{@Artist.per_owner_limit_plan(:albums, @owners, 1=>-1)}.must_raise ArgumentError
+      proc{@Artist.per_owner_limit_plan(:albums, @owners, 1=>[1, -1])}.must_raise ArgumentError
+      proc{@Artist.per_owner_limit_plan(:albums, @owners, 1=>[1, 2, 3])}.must_raise ArgumentError
+      proc{@Artist.per_owner_limit_plan(:albums, @owners, 1=>'2')}.must_raise ArgumentError
+      proc{@Artist.per_owner_limit_plan(:albums, @owners, [1, 2]=>1)}.must_raise ArgumentError
+    end
+
+    it "should raise an error before querying if there is no stable order fallback" do
+      db = mock_db
+      artist = Class.new(Sequel::Model(db[:artists]))
+      album = Class.new(Sequel::Model(db[:albums]))
+      album.no_primary_key
+      artist.one_to_many :albums, :class=>album, :key=>:artist_id
+      proc{artist.per_owner_limit_plan(:albums, [artist.load(:id=>1)], 1=>1)}.must_raise Sequel::Error
+      db.sqls.must_equal ["SELECT * FROM artists LIMIT 0", "SELECT * FROM albums LIMIT 0"]
+    end
+
+    it "should raise an error before querying if the association dataset is already limited or grouped" do
+      @Artist.one_to_many :limited_block_albums, :class=>@Album, :key=>:artist_id, &proc{|ds| ds.limit(3)}
+      proc{@Artist.per_owner_limit_plan(:limited_block_albums, @owners, 1=>1)}.must_raise Sequel::Error
+      @Artist.one_to_many :grouped_albums, :class=>@Album, :key=>:artist_id, &proc{|ds| ds.group(:id)}
+      proc{@Artist.per_owner_limit_plan(:grouped_albums, @owners, 1=>1)}.must_raise Sequel::Error
+      @db.sqls.must_equal ["SELECT * FROM artists LIMIT 0", "SELECT * FROM albums LIMIT 0"]
+    end
+
+    it "should raise an error before querying if the strategy is invalid for the quotas" do
+      proc{@Artist.per_owner_limit_plan(:albums, @owners, 1=>1, :strategy=>:none)}.must_raise Sequel::Error
+      proc{@Artist.per_owner_limit_plan(:albums, @owners, 1=>0, 2=>0, :strategy=>:window_function)}.must_raise Sequel::Error
+      proc{@Artist.per_owner_limit_plan(:albums, @owners, 1=>nil, 2=>nil, :strategy=>:union)}.must_raise Sequel::Error
+      proc{@Artist.per_owner_limit_plan(:albums, @owners, 1=>1, :strategy=>:bogus)}.must_raise Sequel::Error
+      @db.sqls.must_equal ["SELECT * FROM artists LIMIT 0", "SELECT * FROM albums LIMIT 0"]
+    end
+
+    it "should support a :strategy option to force the union strategy" do
+      plan = @Artist.per_owner_limit_plan(:albums, @owners, {1=>2, 2=>[3, 1]}, :strategy=>:union)
+      plan.strategy.must_equal :union
+      plan.sql.must_include "UNION ALL"
+    end
+
+    it "should support composite owner keys" do
+      db = mock_db
+      artist = Class.new(Sequel::Model(db[:artists]))
+      album = Class.new(Sequel::Model(db[:albums]))
+      artist.columns :id, :id2
+      artist.set_primary_key [:id, :id2]
+      artist.one_to_many :albums, :class=>album, :key=>[:artist_id, :artist_id2], :primary_key=>[:id, :id2]
+      owners = [artist.load(:id=>1, :id2=>2), artist.load(:id=>3, :id2=>4)]
+      plan = artist.per_owner_limit_plan(:albums, owners, [1, 2]=>[2, 1], [3, 4]=>1)
+      plan.strategy.must_equal :window_function
+      plan.sql.must_equal "SELECT * FROM (SELECT *, albums.artist_id AS x_sequel_per_owner_key_0_x, albums.artist_id2 AS x_sequel_per_owner_key_1_x, row_number() OVER (PARTITION BY albums.artist_id, albums.artist_id2 ORDER BY albums.id) AS x_sequel_row_number_x FROM albums WHERE (((albums.artist_id = 1) AND (albums.artist_id2 = 2)) OR ((albums.artist_id = 3) AND (albums.artist_id2 = 4)))) AS t1 WHERE ((x_sequel_row_number_x > (CASE WHEN ((x_sequel_per_owner_key_0_x = 1) AND (x_sequel_per_owner_key_1_x = 2)) THEN 1 ELSE 0 END)) AND (((CASE WHEN ((x_sequel_per_owner_key_0_x = 1) AND (x_sequel_per_owner_key_1_x = 2)) THEN 3 WHEN ((x_sequel_per_owner_key_0_x = 3) AND (x_sequel_per_owner_key_1_x = 4)) THEN 1 ELSE NULL END) IS NULL) OR (x_sequel_row_number_x <= (CASE WHEN ((x_sequel_per_owner_key_0_x = 1) AND (x_sequel_per_owner_key_1_x = 2)) THEN 3 WHEN ((x_sequel_per_owner_key_0_x = 3) AND (x_sequel_per_owner_key_1_x = 4)) THEN 1 ELSE NULL END)))) ORDER BY x_sequel_per_owner_key_0_x, x_sequel_per_owner_key_1_x, x_sequel_row_number_x"
+
+      result_db = mock_db(:fetch=>[{:id=>1, :artist_id=>1, :artist_id2=>2, :x_sequel_per_owner_key_0_x=>1, :x_sequel_per_owner_key_1_x=>2, :x_sequel_row_number_x=>1}])
+      artist2 = Class.new(Sequel::Model(result_db[:artists]))
+      album2 = Class.new(Sequel::Model(result_db[:albums]))
+      artist2.columns :id, :id2
+      artist2.set_primary_key [:id, :id2]
+      artist2.one_to_many :albums, :class=>album2, :key=>[:artist_id, :artist_id2], :primary_key=>[:id, :id2]
+      owners2 = [artist2.load(:id=>1, :id2=>2), artist2.load(:id=>3, :id2=>4)]
+      result = artist2.eager_load_with_limits(:albums, owners2, [1, 2]=>1, [3, 4]=>0)
+      owners2.map{|o| o.albums.map(&:id)}.must_equal [[1], []]
+      result[[1, 2]].map(&:id).must_equal [1]
+      result[[3, 4]].must_equal []
+      result[owners2[0]].map(&:id).must_equal [1]
+      proc{result[[1]]}.must_raise ArgumentError
+    end
+
+    it "should handle many_to_many associations with a single query" do
+      @Artist.many_to_many :tags, :class=>@Album, :join_table=>:albums_tags, :left_key=>:album_id, :right_key=>:tag_id
+      plan = @Artist.per_owner_limit_plan(:tags, @owners, 1=>1, 2=>2)
+      plan.strategy.must_equal :window_function
+      plan.sql.must_equal "SELECT * FROM (SELECT albums.*, albums_tags.album_id AS x_sequel_per_owner_key_0_x, row_number() OVER (PARTITION BY albums_tags.album_id ORDER BY albums.id) AS x_sequel_row_number_x FROM albums INNER JOIN albums_tags ON (albums_tags.tag_id = albums.id) WHERE (albums_tags.album_id IN (1, 2))) AS t1 WHERE (((CASE WHEN (x_sequel_per_owner_key_0_x = 1) THEN 1 WHEN (x_sequel_per_owner_key_0_x = 2) THEN 2 ELSE NULL END) IS NULL) OR (x_sequel_row_number_x <= (CASE WHEN (x_sequel_per_owner_key_0_x = 1) THEN 1 WHEN (x_sequel_per_owner_key_0_x = 2) THEN 2 ELSE NULL END))) ORDER BY x_sequel_per_owner_key_0_x, x_sequel_row_number_x"
+    end
+  end
+
+  describe "without window function support" do
+    before do
+      @db = Sequel.mock(:host=>:mysql)
+      @Artist, @Album = setup_models(@db)
+      @owners = [@Artist.load(:id=>1), @Artist.load(:id=>2)]
+    end
+
+    it "should select the union strategy" do
+      @Artist.per_owner_limit_plan(:albums, @owners, 1=>2, 2=>[3, 1]).strategy.must_equal :union
+    end
+
+    it "should provide the SQL for the union strategy without executing it" do
+      @Artist.per_owner_limit_plan(:albums, @owners, 1=>2, 2=>[3, 1]).sql.must_equal "SELECT * FROM (SELECT * FROM (SELECT *, `albums`.`artist_id` AS `x_sequel_per_owner_key_0_x` FROM `albums` WHERE (`albums`.`artist_id` IN (1)) ORDER BY `albums`.`id` LIMIT 2) AS `t1` UNION ALL SELECT * FROM (SELECT *, `albums`.`artist_id` AS `x_sequel_per_owner_key_0_x` FROM `albums` WHERE (`albums`.`artist_id` IN (2)) ORDER BY `albums`.`id` LIMIT 3 OFFSET 1) AS `t1`) AS `t1` ORDER BY `x_sequel_per_owner_key_0_x`, `id`"
+      @db.sqls.must_equal ["SELECT version()", "SHOW FULL COLUMNS FROM `artists`", "SELECT * FROM `artists` LIMIT 0", "SHOW FULL COLUMNS FROM `albums`", "SELECT * FROM `albums` LIMIT 0"]
+    end
+
+    it "should preserve the association's order in each union branch and the outer order" do
+      @Artist.one_to_many :ordered_albums, :class=>@Album, :key=>:artist_id, :order=>Sequel.desc(:name)
+      @Artist.per_owner_limit_plan(:ordered_albums, @owners, 1=>1, 2=>2).sql.must_equal "SELECT * FROM (SELECT * FROM (SELECT *, `albums`.`artist_id` AS `x_sequel_per_owner_key_0_x` FROM `albums` WHERE (`albums`.`artist_id` IN (1)) ORDER BY `name` DESC, `albums`.`id` LIMIT 1) AS `t1` UNION ALL SELECT * FROM (SELECT *, `albums`.`artist_id` AS `x_sequel_per_owner_key_0_x` FROM `albums` WHERE (`albums`.`artist_id` IN (2)) ORDER BY `name` DESC, `albums`.`id` LIMIT 2) AS `t1`) AS `t1` ORDER BY `x_sequel_per_owner_key_0_x`, `name` DESC, `id`"
+    end
+
+    it "should give each bounded owner its own union branch, and combine unbounded owners into one" do
+      sql = @Artist.per_owner_limit_plan(:albums, @owners, 1=>2, 2=>2).sql
+      sql.scan("UNION ALL").length.must_equal 1
+      sql.scan("LIMIT 2").length.must_equal 2
+      sql = @Artist.per_owner_limit_plan(:albums, @owners, 1=>nil, 2=>nil).sql
+      sql.wont_include "UNION ALL"
+    end
+
+    it "should not combine bounded owners into a single union branch" do
+      sql = @Artist.per_owner_limit_plan(:albums, @owners, 1=>2, 2=>3).sql
+      sql.scan("UNION ALL").length.must_equal 1
+      sql.must_include "`albums`.`artist_id` IN (1)) ORDER BY `albums`.`id` LIMIT 2"
+      sql.must_include "`albums`.`artist_id` IN (2)) ORDER BY `albums`.`id` LIMIT 3"
+    end
+
+    it "should use the unbounded strategy when no owner has a limit or offset" do
+      @Artist.per_owner_limit_plan(:albums, @owners, 1=>nil).strategy.must_equal :unbounded
+    end
+
+    it "should support a :strategy option to force the window function strategy only if supported" do
+      proc{@Artist.per_owner_limit_plan(:albums, @owners, 1=>1, :strategy=>:window_function)}.must_raise Sequel::Error
+    end
+
+    it "should raise an error before querying if too many union branches are needed" do
+      @Artist.one_to_many :limited_albums, :class=>@Album, :key=>:artist_id, :subqueries_per_union=>2
+      owners = [@Artist.load(:id=>1), @Artist.load(:id=>2), @Artist.load(:id=>3)]
+      proc{@Artist.per_owner_limit_plan(:limited_albums, owners, 1=>1, 2=>2, 3=>3)}.must_raise Sequel::Error
+      @db.sqls.last.must_equal "SELECT * FROM `albums` LIMIT 0"
+    end
+
+    it "should raise an error before querying if there is no stable order fallback" do
+      album = Class.new(Sequel::Model(@db[:no_pk_albums]))
+      album.no_primary_key
+      @Artist.one_to_many :no_pk_albums, :class=>album, :key=>:artist_id
+      proc{@Artist.per_owner_limit_plan(:no_pk_albums, @owners, 1=>1)}.must_raise Sequel::Error
+    end
+
+    it "should handle many_to_many associations with one union branch per bounded owner" do
+      @Artist.many_to_many :tags, :class=>@Album, :join_table=>:albums_tags, :left_key=>:album_id, :right_key=>:tag_id
+      plan = @Artist.per_owner_limit_plan(:tags, @owners, 1=>1, 2=>2)
+      plan.strategy.must_equal :union
+      plan.sql.scan("UNION ALL").length.must_equal 1
+      plan.sql.must_include "`albums_tags`.`album_id` IN (1)"
+      plan.sql.must_include "`albums_tags`.`album_id` IN (2)"
+    end
+  end
+end
+

@@ -458,6 +458,97 @@ You can also customize the :eager_limit_strategy on a case-by-case basis by pass
 The :eager_limit and :eager_limit_strategy options currently only work when
 eager loading via #eager, not with #eager_graph.
 
+=== Per-Owner Eager Loading Limits
+
+The :eager_limit dataset option applies the same limit to every owner in the
+batch.  If different owners need different limits and offsets, use the
++eager_load_with_limits+ class method, which accepts a hash mapping owner key
+values to quotas:
+
+  Artist.eager_load_with_limits(:albums, [artist1, artist2, artist3],
+    artist1.id=>2,
+    artist2.id=>[3, 1],
+    artist3.id=>0)
+
+The hash keys are the owner key values (for composite key associations, the
+value for the key should be an array with the same number of elements as the
+association keys).  Quotas can be an Integer limit, a <tt>[limit, offset]</tt>
+array, or nil, and the following rules are used:
+
+* An owner with no entry in the hash uses the association's :limit option if it
+  has one, or is unbounded otherwise.
+* An owner with a nil quota is unbounded, and does not inherit the
+  association's :limit option.
+* An owner with a limit of 0 receives an empty array.  If every owner in the
+  batch has a limit of 0, no query is issued.
+* An owner whose key contains a NULL value cannot be associated to anything,
+  and receives an empty array.
+* Owners without matching associated records receive an empty array.
+
+Unlike the :ruby eager limit strategy, this never falls back to one query per
+owner, and it does not load all associated records and slice them in Ruby.
+Records are loaded with a single query using a database-appropriate strategy.
+Ordering uses the association's :order, falling back to the associated class's
+primary key (and the row number for the window function strategy) so results
+are stable.  If the associated class has no primary key and the association has
+no order, an error is raised.
+
+The strategy is chosen before any query is issued.  On databases that support
+window functions, a single query using +row_number()+ partitioned by the owner
+key is used (the :window_function strategy):
+
+  # artist1 gets up to 2 albums, artist2 gets up to 3 albums, skipping the first,
+  # artist3 gets none
+  Artist.eager_load_with_limits(:albums, [artist1, artist2, artist3], artist1.id=>2, artist2.id=>[3, 1], artist3.id=>0)
+  # SELECT * FROM (
+  #   SELECT *, albums.artist_id AS x_sequel_per_owner_key_0_x,
+  #     row_number() OVER (PARTITION BY albums.artist_id ORDER BY albums.id) AS x_sequel_row_number_x
+  #   FROM albums
+  #   WHERE (albums.artist_id IN (artist1.id, artist2.id))
+  # ) AS t1
+  # WHERE (...)
+  # ORDER BY x_sequel_per_owner_key_0_x, x_sequel_row_number_x
+
+On databases that do not support window functions, a single query using a
+UNION ALL of one subquery per owner that has a limit or offset is used (the
+:union strategy), with each owner's key values only included in that owner's
+subquery so the limit/offset applies to only that owner's records.  Owners
+without a limit or offset share a single subquery.  If all owners are
+unbounded, a single query without per-owner bounds is used (the :unbounded
+strategy).  If every owner in the batch has a zero limit, or the batch is
+empty, no query is used (the :none strategy).
+
+If the association, owner, or limit combination is not supported (for example,
+an association returning a single record, an association with an instance
+specific dataset, or a database that supports neither window functions nor the
+needed UNION query), a Sequel::Error is raised when the plan is built, before
+any query is issued.  A Sequel::Error is also raised if the limits hash is not
+valid for the association's key.
+
++eager_load_with_limits+ returns a Sequel::Model::Associations::PerOwnerLimitResult,
+which assigns the loaded records to the association cache for each owner, and
+allows retrieving the records for a given owner:
+
+  result = Artist.eager_load_with_limits(:albums, artists, artist1.id=>2)
+  result.strategy        # => :window_function, :union, :unbounded, or :none
+  result[artist1]        # => records loaded for artist1
+  result.fetch(artist2)  # => records loaded for the owner with key artist2.id
+  result.records_for(3)  # => records loaded for the owner with key 3, or []
+
+To check the strategy that would be used, or the SQL that would be issued,
+without executing the query, use +per_owner_limit_plan+:
+
+  plan = Artist.per_owner_limit_plan(:albums, artists, artist1.id=>2)
+  plan.strategy  # => :window_function
+  plan.sql
+  # => "SELECT * FROM ..."
+
++eager_load_with_limits+ and +per_owner_limit_plan+ accept an options hash as
+the final argument.  The only currently supported option is :strategy, which
+forces a specific strategy (:window_function, :union, :unbounded, or :none)
+instead of choosing one automatically.  A Sequel::Error is raised if the forced
+strategy cannot express the given quotas.
+
 === Eager Loading via eager_graph_with_options
 
 When eager loading an association via eager_graph (which uses JOINs), the

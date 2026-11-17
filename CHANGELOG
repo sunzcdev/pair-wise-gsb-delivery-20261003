@@ -1,5 +1,7 @@
 === master
 
+* Add Model.eager_load_with_limits for eagerly loading an association with a different limit and offset per owner, using a single window function or union query (jeremyevans)
+
 * Avoid duplicating table when adding/dropping CHECK or NOT NULL constraints on SQLite 3.53+ (jeremyevans)
 
 * Add Database#wait_for_lsn on PostgreSQL 19+ to support WAIT FOR LSN (jeremyevans)

@@ -2079,6 +2079,93 @@ describe "Sequel::Model Simple Associations" do
     artists.each{|a| a.first_two_albums.length.must_equal 1}
   end
 
+  describe "with per-owner limits" do
+    def setup_per_owner_artists
+      artists = [@artist, Artist.create(:name=>'Ar2'), Artist.create(:name=>'Ar3')]
+      artists.each_with_index do |artist, i|
+        # Ar has no albums, Ar2 has 3 albums, Ar3 has 1 album
+        next if i == 0
+        count = i == 1 ? 3 : 1
+        count.times{|n| Album.create(:name=>"A#{n}-#{i}", :artist_id=>artist.id)}
+      end
+      artists
+    end
+
+    it "should only apply each owner's quota to that owner's records" do
+      artists = setup_per_owner_artists
+      a1, a2, a3 = artists
+      result = Artist.eager_load_with_limits(:albums, artists, a1.id=>2, a2.id=>[1, 1], a3.id=>0)
+      result.owners.must_equal artists
+      a1.albums.must_equal []
+      a2.albums.map(&:name).must_equal ["A1-1"]
+      a3.albums.must_equal []
+      result[a1].must_equal []
+      result[a2].map(&:name).must_equal ["A1-1"]
+      result[a3].must_equal []
+    end
+
+    it "should handle an integer limit, a limit/offset array, an explicit nil, and an unspecified owner" do
+      artists = setup_per_owner_artists
+      a1, a2, a3 = artists
+      Album.create(:name=>'Al-2', :artist_id=>a1.id)
+      Album.create(:name=>'Al-3', :artist_id=>a1.id)
+      result = Artist.eager_load_with_limits(:albums, artists,
+        a1.id=>1,
+        a2.id=>[2, 1],
+        a3.id=>nil)
+      a1.albums.map(&:name).must_equal ["Al-2"]
+      a2.albums.map(&:name).must_equal ["A1-1", "A2-1"]
+      a3.albums.map(&:name).must_equal ["A0-2"]
+      [:window_function, :union].must_include result.strategy
+    end
+
+    it "should give owners with no matching records an empty array" do
+      artists = setup_per_owner_artists
+      a1, _, _ = artists
+      result = Artist.eager_load_with_limits(:albums, artists, a1.id=>3, 123456=>3)
+      artists.each{|a| a.albums.must_be_kind_of Array}
+      a1.albums.must_equal []
+      result[123456].must_be_nil
+    end
+
+    it "should not issue a query if every owner has a zero limit" do
+      artists = setup_per_owner_artists
+      result = Artist.eager_load_with_limits(:albums, artists, artists[0].id=>0, artists[1].id=>0, artists[2].id=>0)
+      result.strategy.must_equal :none
+      artists.each{|a| a.albums.must_equal []}
+    end
+
+    it "should produce the same records with the window function and union strategies" do
+      artists = setup_per_owner_artists
+      quotas = {artists[0].id=>[1, 0], artists[1].id=>[2, 1], artists[2].id=>nil}
+      window_names = if DB.dataset.supports_window_functions?
+        Artist.eager_load_with_limits(:albums, artists, quotas, :strategy=>:window_function)
+        artists.map{|a| a.albums.map(&:name)}
+      end
+      artists.each{|a| a.associations.delete(:albums)}
+      union = Artist.eager_load_with_limits(:albums, artists, quotas, :strategy=>:union)
+      union.strategy.must_equal :union
+      union_names = artists.map{|a| a.albums.map(&:name)}
+      window_names.must_equal union_names if window_names
+      union_names.must_equal [[], ["A1-1", "A2-1"], ["A0-2"]]
+    end
+
+    it "should use the association's order and a stable primary key fallback for ties" do
+      artist = @artist
+      3.times{Album.create(:name=>'same', :artist_id=>artist.id)}
+      result = Artist.eager_load_with_limits(:albums, [artist], artist.id=>[2, 1])
+      [:window_function, :union].must_include result.strategy
+      ordered = Album.where(:artist_id=>artist.id).order(:name, :id).all
+      artist.albums.must_equal ordered[1, 2]
+    end
+
+    it "should raise before querying for unsupported combinations" do
+      artist = @artist
+      proc{Artist.eager_load_with_limits(:first_album, [artist], artist.id=>1)}.must_raise Sequel::Error
+      proc{Artist.eager_load_with_limits(:first_two_albums, [artist], artist.id=>-1)}.must_raise ArgumentError
+    end
+  end
+
   it "should handle eager loading limited associations with association blocks" do
     artists = Artist.eager(:first_restricted_album).order(:name).all
     artists.map(&:name).must_equal ["Ar"]
@@ -2398,6 +2485,47 @@ describe "Sequel::Model Composite Key Associations" do
     include filter_by_associations_one_to_one_limit_strategies
     include filter_by_associations_one_to_many_limit_strategies
   end if DB.dataset.supports_limits_in_correlated_subqueries? && DB.dataset.supports_multiple_column_in?
+
+  describe "with per-owner limits and composite owner keys" do
+    it "should apply each owner's quota using the composite key values" do
+      a1 = Artist.create(:name=>'CA1', :id1=>101, :id2=>102)
+      a2 = Artist.create(:name=>'CA2', :id1=>103, :id2=>104)
+      a3 = Artist.create(:name=>'CA3', :id1=>105, :id2=>106)
+      3.times{|i| Album.create(:name=>"B#{i}", :id1=>30+i, :id2=>40+i, :artist_id1=>a1.id1, :artist_id2=>a1.id2)}
+      Album.create(:name=>'C0', :id1=>50, :id2=>51, :artist_id1=>a2.id1, :artist_id2=>a2.id2)
+      artists = [a1, a2, a3]
+      result = Artist.eager_load_with_limits(:albums, artists,
+        [a1.id1, a1.id2]=>[2, 1],
+        [a2.id1, a2.id2]=>0,
+        [a3.id1, a3.id2]=>nil)
+      result.owners.must_equal artists
+      a1.albums.map(&:name).must_equal ['B1', 'B2']
+      a2.albums.must_equal []
+      a3.albums.must_equal []
+      result[[a1.id1, a1.id2]].map(&:name).must_equal ['B1', 'B2']
+      result[[a2.id1, a2.id2]].must_equal []
+      result[[a3.id1, a3.id2]].must_equal []
+      result[a1].map(&:name).must_equal ['B1', 'B2']
+      proc{result[[a1.id1]]}.must_raise ArgumentError
+    end
+
+    it "should support forcing the union strategy with composite keys" do
+      a1 = Artist.create(:name=>'UA1', :id1=>111, :id2=>112)
+      a2 = Artist.create(:name=>'UA2', :id1=>113, :id2=>114)
+      2.times{|i| Album.create(:name=>"D#{i}", :id1=>60+i, :id2=>70+i, :artist_id1=>a1.id1, :artist_id2=>a1.id2)}
+      artists = [a1, a2]
+      union = Artist.eager_load_with_limits(:albums, artists, {[a1.id1, a1.id2]=>1, [a2.id1, a2.id2]=>1}, :strategy=>:union)
+      union.strategy.must_equal :union
+      a1.albums.map(&:name).must_equal ['D0']
+      a2.albums.must_equal []
+      if DB.dataset.supports_window_functions?
+        artists.each{|a| a.associations.delete(:albums)}
+        Artist.eager_load_with_limits(:albums, artists, {[a1.id1, a1.id2]=>1, [a2.id1, a2.id2]=>1}, :strategy=>:window_function)
+        a1.albums.map(&:name).must_equal ['D0']
+        a2.albums.must_equal []
+      end
+    end
+  end
 
   it "should have add method accept hashes and create new records" do
     @artist.remove_all_albums

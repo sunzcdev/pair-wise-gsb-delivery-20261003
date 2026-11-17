@@ -1712,6 +1712,602 @@ module Sequel
         end
       end
       
+      # The result of an explicit per-owner limit eager load.  It stores the
+      # records loaded for each owner, and allows introspection of the
+      # database strategy that was used to load them.
+      #
+      # Instances are returned by PerOwnerLimitPlan#load and
+      # Model.eager_load_with_limits.  They behave like a hash of owners to
+      # arrays of associated objects:
+      #
+      #   result = Artist.eager_load_with_limits(:albums, [a1, a2], a1.id=>2, a2.id=>0)
+      #   result[a1]        # => [album1, album2]
+      #   result[a2]        # => []
+      #   result.strategy   # => :window_function or :union or :unbounded or :none
+      #   result.each{|artist, albums| ...}
+      class PerOwnerLimitResult
+        include Enumerable
+
+        # The PerOwnerLimitPlan that produced this result.
+        attr_reader :plan
+
+        # The owners in the order they were given to the plan.
+        attr_reader :owners
+
+        def initialize(plan, owner_records)
+          @plan = plan
+          @owners = owner_records.map(&:first)
+          @by_owner = {}.compare_by_identity
+          @by_key = {}
+          owner_records.each do |owner, records|
+            @by_owner[owner] = records
+            if key = @plan.canonical_owner_key(owner)
+              @by_key[key] = records
+            end
+          end
+        end
+
+        # The limit strategy used for the load.  One of:
+        #
+        # :none :: No query was necessary, since every owner in the batch had a zero limit.
+        # :unbounded :: A single query without any per-owner bounds, since no owner had a limit or offset.
+        # :window_function :: A single query using a row number window function, bounded per owner.
+        # :union :: A single compound query with one UNION ALL branch per owner with a limit or offset (owners without bounds share a single branch).
+        def strategy
+          @plan.strategy
+        end
+        alias eager_limit_strategy strategy
+
+        # The name of the association that was loaded.
+        def association_name
+          @plan.association_name
+        end
+
+        # Return the records loaded for the given owner, owner key, or array of
+        # owner key values.  Returns nil if the given owner/key was not part of
+        # the batch.  Owners that could not be associated with anything (because
+        # part of their key is NULL) and owners with no matching records return
+        # an empty array.
+        def [](owner)
+          found, records = lookup(owner)
+          records if found
+        end
+
+        # Return the records loaded for the given owner, owner key, or array of
+        # owner key values.  Raises a KeyError if the given owner/key was not
+        # part of the batch, unless a default value is provided.
+        def fetch(owner, *default)
+          found, records = lookup(owner)
+          return records if found
+          return default.first unless default.empty?
+          raise KeyError, "no per-owner limit results were loaded for #{owner.inspect}"
+        end
+
+        # Return the records loaded for the given owner, owner key, or array of
+        # owner key values, returning an empty array (instead of nil) if the
+        # owner/key was not part of the batch.
+        def records_for(owner)
+          _, records = lookup(owner)
+          records || []
+        end
+
+        # Yield each owner and the records loaded for that owner.  Returns an
+        # enumerator if no block is given.
+        def each(&block)
+          return to_enum(:each) unless block
+          @owners.each do |owner|
+            yield owner, records_for(owner)
+          end
+          self
+        end
+        alias each_pair each
+
+        # A hash with owners as keys and the records loaded for each owner as
+        # values.
+        def to_h
+          h = {}
+          each{|owner, records| h[owner] = records}
+          h
+        end
+
+        # Whether the batch contains no owners.
+        def empty?
+          @owners.empty?
+        end
+
+        # The number of owners in the batch.
+        def length
+          @owners.length
+        end
+        alias size length
+
+        def inspect
+          "#<#{self.class} association=#{association_name.inspect} strategy=#{strategy.inspect} owners=#{length}>"
+        end
+
+        private
+
+        def lookup(owner)
+          if owner.respond_to?(:get_column_value) && !owner.is_a?(Array)
+            return [true, @by_owner[owner]] if @by_owner.key?(owner)
+            if key = @plan.canonical_owner_key(owner)
+              [@by_key.key?(key), @by_key[key]]
+            else
+              [false, nil]
+            end
+          else
+            key = @plan.canonical_key_from(owner)
+            [@by_key.key?(key), @by_key[key]]
+          end
+        end
+      end
+
+      # A plan for eagerly loading an association with a different limit and
+      # offset for each owner in a batch, using one query (or no query), without
+      # falling back to a query per owner and without loading all associated
+      # records and slicing in Ruby.
+      #
+      # The limit strategy is selected when the plan is built, before any query
+      # is executed.  Unsupported combinations raise a Sequel::Error at that
+      # point, so they are reported before any SQL is sent to the database.
+      #
+      # See Model.eager_load_with_limits for the public entry point.
+      class PerOwnerLimitPlan
+        # The valid values for the :strategy option.
+        STRATEGIES = [:auto, :window_function, :union, :unbounded, :none].freeze
+
+        # The association reflection being loaded.
+        attr_reader :reflection
+
+        # The owners in the batch.
+        attr_reader :owners
+
+        # Hash with canonical owner keys (always arrays of key values) as keys,
+        # and the explicit limit/offset quotas provided for those keys as
+        # values.  A value of nil means the quota was provided as nil.
+        attr_reader :quotas
+
+        def initialize(reflection, owners, limits=OPTS, opts=OPTS)
+          @reflection = reflection
+          @key_aliases = reflection.predicate_keys.each_index.map{|i| :"x_sequel_per_owner_key_#{i}_x"}
+          @pks = Array(reflection.associated_class.primary_key)
+          validate_association!
+
+          limits, opts = normalize_limits_and_options(limits, opts)
+          @strategy_option = opts[:strategy]
+          unless @strategy_option.nil? || STRATEGIES.include?(@strategy_option)
+            raise Error, "invalid per-owner limit strategy: #{@strategy_option.inspect}, expected one of #{STRATEGIES.map(&:inspect).join(', ')}"
+          end
+
+          @owners = owners.is_a?(Sequel::Dataset) ? owners.all : Array(owners)
+          unless @owners.all?{|o| o.respond_to?(:get_column_value) && !o.is_a?(Array)}
+            raise Error, "owners must be an array of model instances"
+          end
+
+          @quotas = {}
+          limits.each_pair do |key, quota|
+            canonical = canonical_key_from(key)
+            @quotas[canonical] = normalize_quota(quota, key)
+          end
+
+          compute_effective_quotas
+          @strategy = determine_strategy
+        end
+
+        # The limit strategy selected for this plan.  See
+        # PerOwnerLimitResult#strategy for the possible values.
+        def strategy
+          @strategy
+        end
+        alias eager_limit_strategy strategy
+
+        # The name of the association being loaded.
+        def association_name
+          @reflection[:name]
+        end
+
+        # The dataset that will be used to load the associated records, or nil
+        # if no query is necessary (zero limits for all owners, or an empty
+        # batch).  Useful for checking the SQL that would be used before
+        # executing the plan.
+        def dataset
+          return @dataset if defined?(@dataset)
+          @dataset = case @strategy
+          when :none
+            nil
+          when :unbounded
+            unbounded_dataset
+          when :window_function
+            window_function_dataset
+          when :union
+            union_dataset
+          end
+        end
+
+        # The SQL for the dataset that will be used to load the associated
+        # records, or nil if no query is necessary.
+        def sql
+          dataset.sql if dataset
+        end
+
+        # Execute the plan, assigning the associated records to the association
+        # cache of each owner, and returning a PerOwnerLimitResult.
+        def load
+          records_by_key = {}
+          if (ds = dataset)
+            rn = @strategy == :window_function ? row_number_column : nil
+            ds.each do |row|
+              key = if @key_aliases.length == 1
+                [row.remove_key!(@key_aliases.first)]
+              else
+                @key_aliases.map{|a| row.remove_key!(a)}
+              end
+              row.remove_key!(rn) if rn
+              (records_by_key[key] ||= []) << row
+            end
+          end
+
+          name = @reflection[:name]
+          reciprocal = @reflection.set_reciprocal_to_self? ? @reflection.reciprocal : nil
+          owner_records = @owners.map do |owner|
+            records = records_for_owner(owner, records_by_key)
+            owner.associations[name] = records
+            records.each{|r| r.associations[reciprocal] ||= owner} if reciprocal
+            owner.send(:run_association_callbacks, @reflection, :after_load, records)
+            [owner, records]
+          end
+
+          PerOwnerLimitResult.new(self, owner_records)
+        end
+
+        # The canonical owner key for the given owner (an array of the values of
+        # the association's predicate key methods), or nil if any of the key
+        # values are NULL (in which case the owner cannot have associated
+        # objects and is treated as having no associated records).
+        def canonical_owner_key(owner)
+          values = @reflection.predicate_key_values(owner)
+          values unless values.any?(&:nil?)
+        end
+
+        # Convert the given owner key, array of owner key values, or owner model
+        # instance into a canonical owner key (an array of key values),
+        # validating that it has the right number of values for the
+        # association's key.
+        def canonical_key_from(key)
+          values = if key.respond_to?(:get_column_value) && !key.is_a?(Array)
+            @reflection.predicate_key_values(key)
+          else
+            Array(key)
+          end
+          unless values.length == @reflection.predicate_keys.length
+            raise ArgumentError, "owner key #{key.inspect} has #{values.length} value(s), but the #{@reflection.inspect} association uses #{@reflection.predicate_keys.length} key column(s)"
+          end
+          values
+        end
+
+        private
+
+        # Separate the :strategy option from the limits hash, if it was given
+        # there for convenience (as calling with a hash argument and keyword
+        # style options does not separate them) instead of in the separate
+        # options hash.
+        def normalize_limits_and_options(limits, opts)
+          limits = OPTS unless limits
+          opts = OPTS unless opts
+          if !opts.key?(:strategy) && limits.key?(:strategy)
+            opts = opts.merge(:strategy=>limits[:strategy])
+            limits = limits.reject{|k,| k == :strategy}
+          end
+          [limits, opts]
+        end
+
+        def compute_effective_quotas
+          @default_quota = @reflection.limit_and_offset if @reflection[:limit]
+          @effective_quotas = {}
+          @owners.each do |owner|
+            next unless key = canonical_owner_key(owner)
+            unless @effective_quotas.key?(key)
+              @effective_quotas[key] = @quotas.fetch(key){@default_quota}
+            end
+          end
+          @query_quotas = {}
+          @effective_quotas.each do |key, quota|
+            next if zero_quota?(quota)
+            @query_quotas[key] = quota
+          end
+        end
+
+        def zero_quota?(quota)
+          quota && quota.first == 0
+        end
+
+        # Whether the given canonical quota places no bounds on the owner's
+        # records.  normalize_quota collapses all such quotas to nil.
+        def unbounded_quota?(quota)
+          quota.nil?
+        end
+
+        def normalize_quota(quota, key)
+          limit, offset = case quota
+          when nil
+            return nil
+          when Integer
+            [quota, 0]
+          when Array
+            unless quota.length == 2
+              raise ArgumentError, "per-owner limit for #{key.inspect} must be an Integer, [limit, offset], or nil, not #{quota.inspect}"
+            end
+            quota
+          else
+            raise ArgumentError, "per-owner limit for #{key.inspect} must be an Integer, [limit, offset], or nil, not #{quota.inspect}"
+          end
+
+          unless limit.nil? || (limit.is_a?(Integer) && limit >= 0)
+            raise ArgumentError, "per-owner limit for #{key.inspect} must be a non-negative Integer or nil, not #{limit.inspect}"
+          end
+          unless offset.nil? || (offset.is_a?(Integer) && offset >= 0)
+            raise ArgumentError, "per-owner offset for #{key.inspect} must be a non-negative Integer or nil, not #{offset.inspect}"
+          end
+
+          # Canonicalize equivalently unbounded quotas, so owners with an
+          # implicit or explicit offset of 0 are grouped together.
+          offset = nil if offset == 0
+          return nil if limit.nil? && offset.nil?
+
+          [limit, offset]
+        end
+
+        def determine_strategy
+          forced = @strategy_option
+          forced = nil if forced == :auto
+
+          if @query_quotas.empty?
+            if forced && forced != :none
+              raise Error, "cannot use the #{forced.inspect} per-owner limit strategy when every owner in the batch has a zero limit or an unusable key"
+            end
+            return :none
+          end
+
+          if @query_quotas.each_value.all?{|q| unbounded_quota?(q)}
+            if forced && forced != :unbounded
+              raise Error, "cannot use the #{forced.inspect} per-owner limit strategy when no owner in the batch has a limit or offset"
+            end
+            return :unbounded
+          end
+
+          # A stable order is only required when limits/offsets are used, as
+          # the order determines which records are inside each owner's window.
+          ds = base_eager_dataset
+          validate_stable_order!(ds)
+
+          if forced
+            case forced
+            when :window_function
+              unless ds.supports_window_functions?
+                raise Error, "the :window_function per-owner limit strategy is not supported by #{ds.db.database_type}, which does not support window functions"
+              end
+            when :union
+              validate_union_supported!
+            when :unbounded, :none
+              raise Error, "cannot use the #{forced.inspect} per-owner limit strategy when some owners in the batch have a limit or offset"
+            end
+            return forced
+          end
+
+          if ds.supports_window_functions?
+            :window_function
+          elsif reason = union_unsupported_reason
+            raise Error, "no per-owner limit strategy is supported for #{ds.db.database_type}: it does not support window functions, and the per-owner limits cannot be expressed as a single UNION ALL query because #{reason}"
+          else
+            :union
+          end
+        end
+
+        # If the per-owner limits can be expressed as a single UNION ALL query
+        # (one branch per owner), returns nil.  Otherwise, returns a string
+        # explaining why they cannot.
+        def union_unsupported_reason
+          if @pks.empty?
+            "#{@reflection.associated_class} does not have a primary key to use as a stable order fallback"
+          elsif stable_order.any?{|c| order_column_identifier(c).nil?}
+            "the association's order includes an expression that cannot be referenced by name in a compound query's ORDER BY"
+          elsif (owner_count = union_branch_key_groups.length) > @reflection.send(:subqueries_per_union)
+            "the batch needs #{owner_count} UNION ALL branches, which is more than the supported maximum of #{@reflection.send(:subqueries_per_union)}"
+          end
+        end
+
+        def validate_union_supported!
+          if reason = union_unsupported_reason
+            raise Error, "the :union per-owner limit strategy is not supported for this batch: #{reason}"
+          end
+        end
+
+        def validate_stable_order!(ds)
+          if @pks.empty? && Array(ds.opts[:order]).empty?
+            raise Error, "cannot use per-owner limits for #{@reflection.inspect}: the associated class has no primary key and the association has no order, so there is no stable order to use as a fallback"
+          end
+        end
+
+        def base_eager_dataset
+          @base_eager_dataset ||= begin
+            ds = @reflection.send(:associated_eager_dataset)
+            validate_dataset!(ds)
+            ds
+          end
+        end
+
+        def validate_dataset!(ds)
+          if ds.opts[:limit] || ds.opts[:offset]
+            raise Error, "per-owner limits cannot be combined with a limit or offset already applied to the association dataset"
+          end
+          if ds.opts[:group] || ds.opts[:having]
+            raise Error, "per-owner limits cannot be combined with grouping of the association dataset"
+          end
+          if ds.opts[:eager_graph]
+            raise Error, "per-owner limits cannot be combined with eager_graph on the association dataset"
+          end
+        end
+
+        def validate_association!
+          unless @reflection.returns_array?
+            raise Error, "per-owner limits are not supported for associations returning a single record, such as #{@reflection.inspect}"
+          end
+          if @reflection[:distinct]
+            raise Error, "per-owner limits are not supported for associations using a DISTINCT dataset, such as #{@reflection.inspect}"
+          end
+          if @reflection[:instance_specific]
+            raise Error, "per-owner limits are not supported for instance-specific associations, such as #{@reflection.inspect}"
+          end
+          if @reflection[:eager_graph]
+            raise Error, "per-owner limits are not supported for associations using :eager_graph, such as #{@reflection.inspect}"
+          end
+          if @reflection[:separate_query_per_table] || @reflection[:allow_eager] == false
+            raise Error, "per-owner limits are not supported for associations that cannot be eagerly loaded in a single query, such as #{@reflection.inspect}"
+          end
+        end
+
+        def predicate_condition(keys)
+          predicate_keys = @reflection.predicate_keys
+          if predicate_keys.length == 1
+            {predicate_keys.first => keys.map(&:first)}
+          else
+            # Use an OR of AND conditions instead of a composite IN, since not
+            # all databases (or versions of databases) support multiple
+            # columns in IN, and this works consistently everywhere.
+            conditions = keys.map{|key| Hash[predicate_keys.zip(key)]}
+            conditions.length == 1 ? conditions.first : Sequel.|(*conditions)
+          end
+        end
+
+        def key_condition(key)
+          Hash[@key_aliases.zip(key)]
+        end
+
+        def key_alias_expressions
+          @key_alias_expressions ||= @reflection.predicate_keys.zip(@key_aliases).map{|k, a| Sequel.as(k, a)}
+        end
+
+        def dataset_for_keys(keys)
+          base_eager_dataset.unordered.
+            where(predicate_condition(keys)).
+            select_append(*key_alias_expressions)
+        end
+
+        def stable_order
+          @stable_order ||= begin
+            order = Array(base_eager_dataset.opts[:order]).dup
+            @pks.each do |column|
+              qualified = @reflection.qualify_assoc(column)
+              order << qualified unless order.any?{|o| o == qualified || o == column}
+            end
+            order
+          end
+        end
+
+        def row_number_column
+          @row_number_column ||= base_eager_dataset.row_number_column
+        end
+
+        def unbounded_dataset
+          dataset_for_keys(@query_quotas.keys).order(*stable_order)
+        end
+
+        def offset_bound_expression
+          pairs = []
+          @query_quotas.each do |key, quota|
+            next unless quota
+            offset = quota.last
+            pairs << [key_condition(key), offset] if offset && offset > 0
+          end
+          return if pairs.empty?
+          Sequel.case(pairs, 0)
+        end
+
+        def limit_bound_expression
+          pairs = []
+          @query_quotas.each do |key, quota|
+            next unless quota && (limit = quota.first)
+            pairs << [key_condition(key), limit + (quota.last || 0)]
+          end
+          return if pairs.empty?
+          Sequel.case(pairs, nil)
+        end
+
+        def window_function_dataset
+          ds = dataset_for_keys(@query_quotas.keys)
+          rn = row_number_column
+          outer = ds.select_append{|o| o.row_number.function.over(:partition=>@reflection.predicate_keys, :order=>stable_order).as(rn)}.from_self
+          if lower = offset_bound_expression
+            outer = outer.where(Sequel[rn] > lower)
+          end
+          if upper = limit_bound_expression
+            outer = outer.where(Sequel.|({upper=>nil}, Sequel[rn] <= upper))
+          end
+          outer.order(*@key_aliases.map{|a| Sequel.identifier(a)}, Sequel.identifier(rn))
+        end
+
+        # Each owner with a limit or offset needs its own UNION ALL branch, since
+        # a LIMIT or OFFSET on a branch containing multiple owners would apply
+        # to the owners collectively instead of individually.  Owners without
+        # bounds can safely be combined into a single branch.
+        def union_branch_key_groups
+          @union_branch_key_groups ||= begin
+            grouped = @query_quotas.keys.group_by{|key| @query_quotas[key].nil?}
+            branches = []
+            branches << grouped[true] if grouped[true]
+            branches.concat(grouped[false].map{|key| [key]}) if grouped[false]
+            branches
+          end
+        end
+
+        def union_dataset
+          combined = nil
+          union_branch_key_groups.each do |keys|
+            quota = @query_quotas[keys.first]
+            branch = dataset_for_keys(keys).order(*stable_order)
+            if quota
+              limit, offset = quota
+              branch = branch.limit(limit) if limit
+              branch = branch.offset(offset) if offset
+            end
+            combined = combined ? combined.union(branch, :all=>true) : branch
+          end
+
+          combined.order(*@key_aliases.map{|a| Sequel.identifier(a)}, *outer_order_expressions)
+        end
+
+        # The order expressions to use for the outer query when combining
+        # branches with a compound query.  Compound queries can only order by
+        # columns/aliases from the select list, not by qualified identifiers or
+        # arbitrary expressions in all databases, so this uses the plain column
+        # names, preserving the direction of any ordered expression.
+        def outer_order_expressions
+          @outer_order_expressions ||= stable_order.map{|c| order_column_identifier(c)}
+        end
+
+        def order_column_identifier(column)
+          case column
+          when Symbol
+            Sequel.identifier(Sequel.split_symbol(column)[1] || column)
+          when SQL::QualifiedIdentifier
+            Sequel.identifier(column.column)
+          when SQL::AliasedExpression
+            Sequel.identifier(column.alias)
+          when SQL::OrderedExpression
+            if identifier = order_column_identifier(column.expression)
+              Sequel::SQL::OrderedExpression.new(identifier, column.descending, :nulls=>column.nulls)
+            end
+          end
+        end
+
+        def records_for_owner(owner, records_by_key)
+          return [] unless key = canonical_owner_key(owner)
+          quota = @effective_quotas.fetch(key){@default_quota}
+          return [] if zero_quota?(quota)
+          (records_by_key[key] || []).dup
+        end
+      end
+
       # Each kind of association adds a number of instance methods to the model class which
       # are specialized according to the association type and optional parameters
       # given in the definition. Example:
@@ -2128,6 +2724,104 @@ module Sequel
         # Eager load the association with the given eager loader options.
         def eager_load_results(opts, eo, &block)
           opts.eager_load_results(eo, &block)
+        end
+
+        # Eager load the given association for the given owners, applying a
+        # different limit and offset for each owner in the batch.  Unlike
+        # eager loading an association with a single :limit option (which
+        # applies the same limit to every owner), this accepts a quota per
+        # owner, selected by the association's owner keys.
+        #
+        # This uses a single query (or no query at all), and never falls back to
+        # one query per owner, nor loads all associated records and slices them
+        # in Ruby.  The database strategy is chosen before any query is
+        # executed, and if the association/owner/limit combination is not
+        # supported, a Sequel::Error is raised at that point, before any SQL is
+        # sent to the database.
+        #
+        # Arguments:
+        #
+        # association :: The association name symbol to load.
+        # owners :: An array of model instances (or a dataset that returns them)
+        #           to load the association for.
+        # limits :: A hash mapping owner key values to quotas.  The key can be
+        #           a single key value for single key associations, or an array
+        #           of key values for composite key associations.  A quota is
+        #           an Integer limit, a [limit, offset] array, or nil.
+        #
+        # Options:
+        #
+        # :strategy :: Force a specific strategy instead of automatically
+        #              selecting one.  One of :window_function, :union,
+        #              :unbounded, or :none.  This will raise a Sequel::Error if
+        #              the given strategy cannot express the given quotas.
+        #              As a convenience, this option may also be included in the
+        #              limits hash (e.g. <tt>1=>2, :strategy=>:union</tt>).  If
+        #              an association's owner key values can themselves be the
+        #              :strategy symbol, pass the limits as an explicit hash
+        #              and the options in a separate hash argument.
+        #
+        # Quota semantics (each is significant and deterministic):
+        #
+        # * An owner with no entry in the limits hash uses the association's
+        #   :limit option if it has one, or has no limit otherwise.
+        # * An owner with an entry whose quota is nil has no limit (it does not
+        #   inherit the association's :limit).
+        # * An owner with an Integer limit or a [limit, offset] quota only gets
+        #   records within the resulting window of that owner's records.
+        # * An owner with a limit of 0 gets an empty array, and no query is used
+        #   for that owner.  If every owner in the batch has a limit of 0 (or a
+        #   key containing NULL), no query is executed at all.
+        # * An owner whose key contains a NULL value cannot be associated with
+        #   anything, and gets an empty array.  Such an owner is identified
+        #   within the batch (so lookups for it work), but is not included in
+        #   the query for other owners.
+        # * Owners with no matching associated records get an empty array.
+        # * If an owner appears multiple times in the batch (or has the same key
+        #   values as another owner), each such owner is assigned its own copy
+        #   of the same records.
+        #
+        # Ordering uses the association's order, falling back to the associated
+        # class's primary key (and then the row number) so that results are
+        # stable and offsets are deterministic.  If the associated class has no
+        # primary key and the association has no order, a Sequel::Error is
+        # raised.
+        #
+        # The return value is a PerOwnerLimitResult, which can be used to
+        # retrieve the records loaded for each owner (and which also assigns
+        # them to each owner's association cache).  The result's #strategy
+        # method returns the chosen database strategy.
+        #
+        # Examples:
+        #
+        #   result = Artist.eager_load_with_limits(:albums, [a1, a2, a3],
+        #     a1.id=>2, a2.id=>[3, 1], a3.id=>0)
+        #   # SELECT * FROM (SELECT *, albums.artist_id AS x_sequel_per_owner_key_0_x,
+        #   #  row_number() OVER (PARTITION BY albums.artist_id
+        #   #  ORDER BY albums.id) AS x_sequel_row_number_x
+        #   #  FROM albums WHERE (albums.artist_id IN (a1.id, a2.id))) AS t1
+        #   #  WHERE ... ORDER BY x_sequel_per_owner_key_0_x, x_sequel_row_number_x
+        #   result[a1] # => up to 2 albums
+        #   result[a2] # => up to 3 albums, skipping the first
+        #   result[a3] # => []
+        #   result.strategy # => :window_function
+        #
+        #   # Composite owner keys can be given as an array of key values:
+        #   Artist.eager_load_with_limits(:albums, owners, [1, 2]=>[2, 0], [3, 4]=>[1, 1])
+        def eager_load_with_limits(association, owners, limits=OPTS, opts=OPTS)
+          plan = per_owner_limit_plan(association, owners, limits, opts)
+          plan.load
+        end
+
+        # Build the PerOwnerLimitPlan that would be used by
+        # eager_load_with_limits, without executing it.  This can be used to
+        # check the chosen strategy (via PerOwnerLimitPlan#strategy) or the SQL
+        # that would be used (via PerOwnerLimitPlan#sql) before loading the
+        # records.
+        def per_owner_limit_plan(association, owners, limits=OPTS, opts=OPTS)
+          reflection = association_reflection(association)
+          raise Error, "undefined association #{association.inspect} for #{inspect}" unless reflection
+          PerOwnerLimitPlan.new(reflection, owners, limits, opts)
         end
 
         # Freeze association related metadata when freezing model class.
