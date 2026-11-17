@@ -215,6 +215,12 @@ module Dnsruby
   class SocketEofResolvError < ResolvError
   end
 
+  # A multiplexed TCP connection has no free 16-bit message ID left. The
+  # reservation table is never overwritten; the query is rejected or moved to a
+  # fresh connection generation instead of being silently corrupted.
+  class TcpPipelineSaturated < ResolvError
+  end
+
   # An error occurred processing the TSIG
   class TsigError < OtherResolvError
   end

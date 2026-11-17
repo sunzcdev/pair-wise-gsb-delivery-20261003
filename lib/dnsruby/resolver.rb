@@ -1407,10 +1407,12 @@ module Dnsruby
         return
       end
       retryable_eof = error.kind_of?(SocketEofResolvError)
-      if error.kind_of?(ResolvTimeout) || retryable_eof
+      if error.kind_of?(ResolvTimeout) || retryable_eof || error.kind_of?(TcpPipelineSaturated)
         # A server can close a TCP connection before answering (RFC 7766
         # section 6.2.4). Keep the finite retry plan and original total deadline,
         # just as for a lost UDP packet; reconnecting must not add new retries.
+        # A saturated pipeline is transient local backpressure: once outstanding
+        # IDs drain, the same server becomes usable again, so never demote it.
         # An UPDATE may already have changed the server and must not be replayed
         # merely because its reply was lost.
         #    - if it was a timeout, then check which number it was, and how many retries are expected on that server
@@ -1418,7 +1420,9 @@ module Dnsruby
         #        - otherwise, continue
         #  Do we have any more packets to send to this resolver?
 
-        decrement_resolver_priority(resolver)
+        # Local pipeline saturation is not a server failure, so keep its
+        # priority; timeouts and EOF still demote the unresponsive server.
+        decrement_resolver_priority(resolver) unless error.kind_of?(TcpPipelineSaturated)
         timeouts = @timeouts[client_query_id]
         if outstanding.empty? && timeouts && timeouts[1].values.empty?
           Dnsruby.log.debug{'Sending timeout to client'}

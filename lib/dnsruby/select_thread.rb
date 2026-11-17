@@ -26,6 +26,7 @@ require 'dnsruby/validator_thread.rb'
 require 'dnsruby/transport_clock'
 require 'dnsruby/query_control'
 require 'dnsruby/deadline_queue'
+require 'dnsruby/tcp_message_registry'
 module Dnsruby
   class SelectThread #:nodoc: all
     class SelectWakeup < RuntimeError; end
@@ -83,6 +84,10 @@ module Dnsruby
         @@tcp_buffers=Hash.new
         @@socket_remaining_queries = Hash.new
         @@socket_idle_deadlines = Hash.new
+        # Per-connection 16-bit message ID reservations. Every persistent TCP
+        # stream owns one registry and one generation; rollovers get a fresh pair.
+        @@tcp_message_registries = Hash.new
+        @@next_tcp_generation = 0
         @@tick_observers = []
         @@queued_exceptions=[]
         @@queued_responses=[]
@@ -155,7 +160,9 @@ module Dnsruby
       attr_accessor :query_bytes, :query, :ignore_truncation, :client_queue,
         :client_query_id, :socket, :dest_server, :dest_port, :endtime, :udp_packet_size,
         :single_resolver, :is_persistent_socket, :tcp_pipelining_max_queries, :send_token,
-        :retire_connection, :disable_edns, :authentication_error, :cache_scope, :transport_configuration
+        :retire_connection, :disable_edns, :authentication_error, :cache_scope,
+        :transport_configuration, :connection_generation, :tcp_id_serial,
+        :bypass_tcp_id_registry
       #  new(query_bytes, query, ignore_truncation, client_queue, client_query_id,
       #      socket, dest_server, dest_port, endtime, , udp_packet_size, single_resolver)
       def initialize(*args)
@@ -175,6 +182,10 @@ module Dnsruby
         @send_token = SendToken.new
         @retire_connection = false
         @disable_edns = false
+        # Only a real PacketSender pipeline admission opts into the 16-bit ID
+        # registry. Settings constructed directly by helper callers (including
+        # test doubles that deliberately share IDs) keep the socket index path.
+        @bypass_tcp_id_registry = true
       end
 
       def no_tcp
@@ -410,6 +421,10 @@ module Dnsruby
       #  Add the query to sockets, and then wake the select thread up
       state_mutex.synchronize {
         check_select_thread_synchronized
+        if query_settings.is_persistent_socket && !query_settings.bypass_tcp_id_registry
+          outcome = reserve_persistent_socket_from_mutex_synchronized_block(query_settings)
+          return outcome unless outcome == true
+        end
         add_query_from_mutex_synchronized_block(query_settings)
       }
       wake_up_select_thread
@@ -425,6 +440,13 @@ module Dnsruby
 
     # Reserve a pipeline query before writing, or replace a protocol retry.
     # A deferred retry must not replace an attempt already completed or replaced.
+    #
+    # Return values:
+    # * true - registered, including a fresh 16-bit ID reservation
+    # * false - the attempt was already completed/replaced; nothing changed
+    # * :retry_connection - the stream retired while admission was in flight
+    # * :id_collision - the header ID is reserved on this connection generation
+    # * :saturated - every 16-bit ID on this generation is reserved
     def register_query_if_current(query_settings, previous_settings)
       registered = state_mutex.synchronize do
         return false unless @@query_hash[query_settings.client_query_id].equal?(previous_settings)
@@ -435,6 +457,10 @@ module Dnsruby
             (query_settings.socket.closed? || (@@retiring_sockets ||= Set.new).include?(query_settings.socket))
           return :retry_connection
         end
+        if query_settings.is_persistent_socket && !query_settings.bypass_tcp_id_registry
+          outcome = reserve_persistent_socket_from_mutex_synchronized_block(query_settings)
+          return outcome unless outcome == true
+        end
         query_settings.retire_connection = previous_settings.retire_connection if previous_settings
         check_select_thread_synchronized
         add_query_from_mutex_synchronized_block(query_settings)
@@ -442,6 +468,50 @@ module Dnsruby
       wake_up_select_thread
       registered
     end
+
+    # Called only with @@mutex held. Allocates (or adopts) the connection
+    # generation for a persistent socket and reserves its caller-chosen header
+    # ID before any socket membership is published. Never overwrites a live
+    # reservation; returns :id_collision or :saturated for the sender to handle.
+    def reserve_persistent_socket_from_mutex_synchronized_block(query_settings)
+      registries = tcp_message_registries_synchronized
+      # A socket created through the real PacketSender already has a generation
+      # from tcp_pipeline_socket. Lazily create one for sockets registered
+      # directly through add_to_select (test doubles and helper callers), keyed
+      # to this descriptor so it stays off a reused object.
+      registry = registries[query_settings.socket]
+      unless registry
+        generation = (@@next_tcp_generation ||= 0) + 1
+        @@next_tcp_generation = generation
+        registry = TcpMessageRegistry.new(generation: generation)
+        registries[query_settings.socket] = registry
+      end
+      unless registry.generation == (query_settings.connection_generation || registry.generation)
+        return :retry_connection
+      end
+      reservation = registry.reserve(query_settings.query.header.id,
+        query_settings.client_query_id,
+        TcpMessageRegistry.question_signature(query_settings.query.question),
+        question_optional: query_settings.query.send_raw ||
+          query_settings.query.kind_of?(Update))
+      return reservation if reservation == TcpMessageRegistry::ID_COLLISION ||
+        reservation == TcpMessageRegistry::SATURATED
+      query_settings.tcp_id_serial = reservation
+      true
+    end
+    private :reserve_persistent_socket_from_mutex_synchronized_block
+
+    # Fixtures and forked processes can replace the selector's class variables
+    # wholesale. Lazily provide the registry table so a missing key never raises
+    # NameError against a selector that skipped the normal initializer.
+    def tcp_message_registries_synchronized
+      unless defined?(@@tcp_message_registries) && @@tcp_message_registries
+        @@tcp_message_registries = {}
+        @@next_tcp_generation ||= 0
+      end
+      @@tcp_message_registries
+    end
+    private :tcp_message_registries_synchronized
 
     # Called only with @@mutex held. Retrying a client ID also retires its old
     # socket membership, so stale EOF/timeout work cannot consume the retry.
@@ -527,6 +597,8 @@ module Dnsruby
 
     def query_id_in_use?(socket, header_id)
       state_mutex.synchronize do
+        registry = tcp_message_registries_synchronized[socket]
+        return registry.reserved?(header_id) if registry
         !socket_ids_for_header(socket, header_id).empty?
       end
     end
@@ -544,6 +616,77 @@ module Dnsruby
     def reusable_socket?(socket)
       state_mutex.synchronize do
         !socket.closed? && !(@@retiring_sockets ||= Set.new).include?(socket)
+      end
+    end
+
+    # Begin a fresh connection generation and its ID registry. Called when a
+    # persistent stream is created or recreated. A new object guarantees a
+    # response from the old stream cannot match a reservation on the new one,
+    # even when both would otherwise carry the same header ID.
+    def begin_tcp_generation(socket, capacity = TcpMessageRegistry::CAPACITY)
+      state_mutex.synchronize do
+        generation = (@@next_tcp_generation ||= 0) + 1
+        @@next_tcp_generation = generation
+        registry = TcpMessageRegistry.new(generation: generation, capacity: capacity)
+        tcp_message_registries_synchronized[socket] = registry
+        registry
+      end
+    end
+
+    def tcp_generation(socket)
+      state_mutex.synchronize { tcp_message_registries_synchronized[socket]&.generation }
+    end
+
+    # Reserve the caller's 16-bit ID before a frame is written. The question
+    # section and generation make the reservation verifiable on response.
+    # Returns the registry's reservation token, or :id_collision/:saturated.
+    def reserve_tcp_message_id(socket, settings)
+      state_mutex.synchronize do
+        registry = tcp_message_registries_synchronized[socket]
+        raise ArgumentError, 'TCP message ID reserved without a connection generation' unless registry
+        registry.reserve(settings.query.header.id, settings.client_query_id,
+          TcpMessageRegistry.question_signature(settings.query.question),
+          question_optional: settings.query.send_raw || settings.query.kind_of?(Update))
+      end
+    end
+
+    # Explicit release boundary. answered=true marks a completed transaction;
+    # cancellation and timeout release unanswered IDs and retire the stream so a
+    # late reply cannot be handed to a later query reusing the ID.
+    def release_tcp_message_id(socket, client_query_id, header_id, answered: false)
+      state_mutex.synchronize do
+        registry = tcp_message_registries_synchronized[socket]
+        registry&.release(header_id, client_query_id, answered: answered)
+      end
+    end
+
+    def tcp_message_id_in_use?(socket, header_id)
+      state_mutex.synchronize do
+        registry = tcp_message_registries_synchronized[socket]
+        !registry.nil? && registry.reserved?(header_id)
+      end
+    end
+
+    # Match a received frame against the exact live reservation, checking the
+    # connection generation and the question section in addition to the header
+    # ID. TCP error replies may legitimately omit the question section.
+    def match_tcp_response(socket, message)
+      state_mutex.synchronize do
+        registry = tcp_message_registries_synchronized[socket]
+        return nil unless registry
+        registry.match(message.header.id, message.question,
+          allow_questionless_error: message.question.empty?)
+      end
+    end
+
+    # Tear down a connection generation and reclaim every reservation it still
+    # owns. Each entry is returned once so disconnect handling can fail its
+    # query; the registry itself is removed so no later frame has an owner.
+    def discard_tcp_generation(socket)
+      state_mutex.synchronize do
+        registry = tcp_message_registries_synchronized.delete(socket)
+        return [] unless registry
+        registry.each_entry.map(&:itself)
       end
     end
 
@@ -721,6 +864,9 @@ module Dnsruby
       (@@socket_idle_deadlines ||= {}).delete(socket)
       @idle_deadlines&.delete(socket)
       @@socket_is_persistent.delete(socket)
+      # Closing the stream ends its connection generation. Reclaim every ID it
+      # still held so a late frame has no owner and no reservation leaks.
+      tcp_message_registries_synchronized.delete(socket)
       owner = (@@socket_owners ||= {}).delete(socket)
       if (sockets = (@@sockets_by_sender ||= {}.compare_by_identity)[owner])
         sockets.delete(socket)
@@ -768,6 +914,17 @@ module Dnsruby
       send_response_to_client(msg, bytes, socket)
     end
 
+    # Fixtures can register helper settings on a descriptor that also has a
+    # lazily created registry. Only treat the registry as authoritative when at
+    # least one owner on this socket actually reserved through it; otherwise
+    # keep the legacy socket-index matching for helper/duplicate-ID settings.
+    def settings_bypass_registry_synchronized?(socket)
+      ids = @@socket_hash[socket]
+      return true unless ids && !ids.empty?
+      ids.all? { |id| (settings = @@query_hash[id]) && settings.bypass_tcp_id_registry }
+    end
+    private :settings_bypass_registry_synchronized?
+
     def matching_questions?(response, query)
       response.question.length == query.question.length &&
         response.question.zip(query.question).all? do |answer, request|
@@ -778,10 +935,20 @@ module Dnsruby
     private :matching_questions?
 
     def send_response_to_client(msg, bytes, socket)
-      # Match the header ID against queries outstanding on this connection.
+      # Match the header ID against queries outstanding on this connection
+      # generation. A registered TCP pipeline additionally verifies the
+      # generation and question section, so a late reply from a retired stream
+      # or an ID reused after wraparound cannot reach the wrong query.
       client_ids=[]
       state_mutex.synchronize{
-        client_ids = socket_ids_for_header(socket, msg.header.id)
+        registry = tcp_message_registries_synchronized[socket]
+        if registry && !settings_bypass_registry_synchronized?(socket)
+          entry = registry.match(msg.header.id, msg.question,
+            allow_questionless_error: msg.question.empty?)
+          client_ids = entry ? [entry.client_query_id] : []
+        else
+          client_ids = socket_ids_for_header(socket, msg.header.id)
+        end
       }
       #  get the queries associated with them
       client_ids.each do |id|
@@ -789,11 +956,13 @@ module Dnsruby
         next unless settings && settings.socket == socket
         query_header_id = settings.query.header.id
         if (query_header_id == msg.header.id)
-          # IDs can collide on a pipeline. Select the matching question before
-          # query-specific TSIG checks or retries, which may consume the attempt.
+          # The registry already proved generation and question ownership for
+          # pipeline sockets. Keep this check for unregistered (one-use) TCP and
+          # any helper-registered settings, selecting the matching question
+          # before query-specific TSIG checks or retries that consume the attempt.
           # Preserve raw/update responses and questionless FORMERR handling.
           query = settings.query
-          unless query.send_raw || query.kind_of?(Update) || msg.question.empty?
+          unless settings.tcp_id_serial || query.send_raw || query.kind_of?(Update) || msg.question.empty?
             next unless matching_questions?(msg, query)
           end
           #  process the response
@@ -867,6 +1036,13 @@ module Dnsruby
       @packet_deadlines&.delete(id)
       socket = settings.socket
       return unless socket # A queued send may not have acquired a socket yet.
+      # Explicit ID release boundary. A completed answer frees its header ID;
+      # cancellation/timeout release an unanswered one and retire the stream so
+      # the ID cannot be handed to a new query before any late reply is gone.
+      registry = tcp_message_registries_synchronized[socket]
+      if registry && settings.tcp_id_serial
+        registry.release(settings.query.header.id, id, answered: response_received)
+      end
       (@@socket_hash[socket] || []).delete(id)
 
       if persistent?(socket)
@@ -1139,10 +1315,18 @@ module Dnsruby
       end
 
       if is_tcp
-        # This supplies peer metadata only. Normal response checks below still
-        # validate the question and TSIG, including sequential duplicate IDs.
+        # This supplies peer metadata only. Prefer the registered connection's
+        # generation/question match so a late reply on a retired stream has no
+        # owner; fall back to the socket index for one-use helper sockets.
         settings = state_mutex.synchronize do
-          id = socket_ids_for_header(socket, ans.header.id).first
+          registry = tcp_message_registries_synchronized[socket]
+          id = if registry && !settings_bypass_registry_synchronized?(socket)
+            entry = registry.match(ans.header.id, ans.question,
+              allow_questionless_error: ans.question.empty?)
+            entry&.client_query_id
+          else
+            socket_ids_for_header(socket, ans.header.id).first
+          end
           @@query_hash[id]
         end
         unless settings

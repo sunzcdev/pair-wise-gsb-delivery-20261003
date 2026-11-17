@@ -39,6 +39,8 @@ TESTS = %w(
     pipeline_send
     pipeline_retirement
     pipeline_retry
+    tcp_message_registry
+    tcp_message_id_lifecycle
     resolver_concurrency
     resolver_validation
     release_transport

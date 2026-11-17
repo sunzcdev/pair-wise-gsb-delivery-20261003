@@ -296,6 +296,7 @@ module Dnsruby
           @use_counts = {}
           @pipeline_socket = @pipeline_socket_configuration = @pipeline_socket_max_queries = nil
           @pipeline_mutex = @pipeline_connect_context = @tcp_pipeline_local_port = nil
+          @pipeline_generation = nil
           @selector = nil
           @process_pid = Process.pid
         end
@@ -544,6 +545,14 @@ module Dnsruby
       new_socket = @pipeline_socket.nil?
       create_pipeline_socket.() unless @pipeline_socket
 
+      if new_socket
+        # A fresh stream starts a fresh connection generation and an empty 16-bit
+        # ID registry. Late responses from the retired stream can never match
+        # reservations admitted on this one.
+        registry = SelectThread.instance.begin_tcp_generation(@pipeline_socket)
+        @pipeline_generation = registry.generation
+      end
+
       @use_counts[@pipeline_socket] += 1
 
       [@pipeline_socket, new_socket]
@@ -748,6 +757,10 @@ module Dnsruby
       socket = nil
       runnextportloop = true
       numtries = 0
+      # Generations on which this exact header ID was found busy. Bound the
+      # collision rollover so a stubbed or malfunctioning transport cannot spin
+      # forever; the deadline below is the normal production backstop.
+      collided_generations = []
       source_port_configuration = configuration[:src_port]
       source_ports = source_port_configuration.uniq
       random_source_port = source_ports.first == 0
@@ -775,9 +788,11 @@ module Dnsruby
               if pipeline
                 begin
                   # RFC 7766 requires unique outstanding IDs on a connection.
-                  # Moving a collision to a fresh stream preserves caller IDs,
-                  # including raw messages and bytes covered by TSIG.
-                  if @pipeline_socket && st.query_id_in_use?(@pipeline_socket, query.header.id)
+                  # The selector's registry is the authoritative boundary; this
+                  # precheck moves an obvious collision to a fresh generation
+                  # while preserving caller IDs (raw messages and TSIG-covered
+                  # bytes). The atomic registration still rechecks under lock.
+                  if @pipeline_socket && st.tcp_message_id_in_use?(@pipeline_socket, query.header.id)
                     st.retire_socket(@pipeline_socket)
                     @use_counts.delete(@pipeline_socket)
                     @pipeline_socket = nil
@@ -862,8 +877,19 @@ module Dnsruby
         query_settings.disable_edns = previous_settings.disable_edns
         query_settings.cache_scope = previous_settings.cache_scope
         query_settings.is_persistent_socket = pipeline
+        # Real pipeline admissions own an explicit 16-bit ID reservation;
+        # helper-constructed settings keep the legacy socket index behaviour.
+        query_settings.bypass_tcp_id_registry = !pipeline
         query_settings.tcp_pipelining_max_queries = (@pipeline_socket_max_queries || configuration[:tcp_pipelining_max_queries]) if pipeline
         if use_tcp
+          if pipeline
+            # Bind this attempt to the exact connection generation returned by
+            # tcp_pipeline_socket. A rollover racing this admission cannot make
+            # the registration land on a different registry; absent one (a test
+            # double or helper socket) the selector allocates it under its lock.
+            query_settings.connection_generation =
+              st.respond_to?(:tcp_generation) ? st.tcp_generation(socket) : nil
+          end
           registered = st.register_query_if_current(query_settings, previous_settings)
           if registered == :retry_connection
             # No bytes were written and the original reservation still owns the
@@ -871,6 +897,31 @@ module Dnsruby
             @use_counts.delete(socket)
             @pipeline_socket = nil if @pipeline_socket == socket
             next
+          elsif registered == :id_collision
+            # The locked registry caught a collision the precheck missed. Do not
+            # touch the existing reservation or retire a stream that still serves
+            # other peers: drop only this sender's reference to it and reconnect
+            # on a fresh generation, preserving the caller's header ID and bytes.
+            busy_generation = query_settings.connection_generation || st.tcp_generation(socket)
+            if busy_generation && collided_generations.include?(busy_generation)
+              report_error.call(TcpPipelineSaturated.new(
+                "TCP pipeline header ID #{query.header.id} remained busy after reconnect"))
+              @use_counts[socket] -= 1 if @use_counts[socket]
+              return
+            end
+            collided_generations << busy_generation if busy_generation
+            @use_counts[socket] -= 1 if @use_counts[socket]
+            @use_counts.delete(socket) if @use_counts[socket] && @use_counts[socket] <= 0
+            @pipeline_socket = nil if @pipeline_socket == socket
+            next
+          elsif registered == :saturated
+            # Every 16-bit ID on this generation is outstanding. Reject with an
+            # explicit error rather than overwriting a live entry. The caller can
+            # drain outstanding answers and retry once IDs have been released.
+            report_error.call(TcpPipelineSaturated.new(
+              "TCP pipeline to #{server}:#{port} has no free 16-bit message ID"))
+            @use_counts[socket] -= 1 if pipeline && @use_counts[socket]
+            return
           end
           unless registered
             # Completion can win during connect. Release only this unused socket
