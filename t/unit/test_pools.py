@@ -63,10 +63,23 @@ class test_ProducerPool:
     def test_release_releases_connection(self):
         p = Mock()
         p.__connection__ = Mock()
+        self.pool._dirty.add(p)
         self.pool.release(p)
         p.__connection__.release.assert_called_with()
         p.__connection__ = None
+        # releasing the same resource again is a no-op: the pool no
+        # longer owns it, so it must not be put back a second time.
         self.pool.release(p)
+        assert p not in self.pool._resource.queue
+
+    def test_release_not_owned_is_ignored(self):
+        # a resource that was never acquired (or was released already)
+        # must not be returned to the idle queue.
+        p = Mock()
+        p.__connection__ = Mock()
+        self.pool.release(p)
+        p.__connection__.release.assert_not_called()
+        assert p not in self.pool._resource.queue
 
     def test_init(self):
         assert self.pool.connections is self.connections
@@ -122,9 +135,37 @@ class test_ProducerPool:
         p = Mock()
         p.channel = Mock()
         p.__connection__ = Mock()
+        self.pool._dirty.add(p)
         self.pool.release(p)
         p.__connection__.release.assert_called_with()
         assert p.channel is None
+
+    def test_setup_accounts_for_dirty(self):
+        # growing the pool only fills up to limit minus resources in use,
+        # same rule as the connection pool.
+        pool = self.Pool(self.connections, limit=2)
+        p1 = pool.acquire()
+        assert len(pool._resource.queue) == 1
+        pool.resize(4)
+        assert len(pool._resource.queue) == 3
+        p1.release()
+        assert len(pool._resource.queue) == 4
+
+    def test_shrink_reclaims_returned_producers(self):
+        pool = self.Pool(self.connections, limit=3)
+        prods = [pool.acquire() for _ in range(3)]
+        pool.resize(1, ignore_errors=True)
+        assert pool.shrink_target == 1
+        assert pool.shrink_in_progress
+        # producers in use are not closed, but returned ones are
+        # reclaimed instead of piling up above the new limit.
+        prods[0].release()
+        assert len(pool._resource.queue) == 0
+        prods[1].release()
+        assert len(pool._resource.queue) == 0
+        prods[2].release()
+        assert len(pool._resource.queue) == 1
+        assert not pool.shrink_in_progress
 
 
 class test_PoolGroup:

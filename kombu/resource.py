@@ -39,6 +39,11 @@ class Resource:
 
         self._resource = LifoQueue()
         self._dirty = set()
+        # Reviewable graceful-shrink state: set to the lowered limit while
+        # borrowed resources still exceed it, None when not shrinking.
+        self._shrink_target = None
+        # Number of acquirers currently blocked waiting for a resource.
+        self._acquire_waiters = 0
         if self.close_after_fork and register_after_fork is not None:
             register_after_fork(self, _after_fork_cleanup_resource)
         self.setup()
@@ -72,6 +77,8 @@ class Resource:
             raise RuntimeError('Acquire on closed pool')
         if self.limit:
             while 1:
+                if block:
+                    self._acquire_waiters += 1
                 try:
                     R = self._resource.get(block=block, timeout=timeout)
                 except Empty:
@@ -84,11 +91,17 @@ class Resource:
                             # not evaluated yet, just put it back
                             self._resource.put_nowait(R)
                         else:
-                            # evaluated so must try to release/close first.
+                            # Evaluated: hand ownership back through the
+                            # normal release path so that pool accounting
+                            # stays consistent.
+                            self._dirty.add(R)
                             self.release(R)
                         raise
                     self._dirty.add(R)
                     break
+                finally:
+                    if block:
+                        self._acquire_waiters -= 1
         else:
             R = self.prepare(self.new())
 
@@ -126,11 +139,64 @@ class Resource:
 
     def release(self, resource):
         if self.limit:
+            if resource not in self._dirty:
+                # Not owned by this pool (e.g. released twice): never
+                # return a duplicate copy to the idle queue.
+                return
             self._dirty.discard(resource)
-            self._resource.put_nowait(resource)
+            if self._should_reclaim():
+                # The pool is shrinking: reclaim the returned resource
+                # instead of keeping an idle item above the new limit.
+                self._reclaim_resource(resource)
+            else:
+                self._resource.put_nowait(resource)
             self.release_resource(resource)
+            self._update_shrink_state()
         else:
             self.close_resource(resource)
+
+    def _should_reclaim(self):
+        """Whether a returned resource would exceed the current capacity.
+
+        Blocked acquirers are handed the resource instead, so that they
+        always get a deterministic result.
+        """
+        return (
+            self._resource.qsize() + len(self._dirty) >= self.limit
+            and not self._acquire_waiters
+        )
+
+    def _reclaim_resource(self, resource):
+        """Gracefully collect a resource removed by shrinking.
+
+        Errors are ignored: the resource is considered reclaimed either
+        way, so pool accounting stays consistent.
+        """
+        try:
+            self.collect_resource(resource)
+        except Exception:
+            pass
+
+    def _update_shrink_state(self):
+        if (self._shrink_target is not None and
+                len(self._dirty) + self._resource.qsize()
+                <= self._shrink_target):
+            self._shrink_target = None
+
+    @property
+    def shrink_target(self):
+        """Limit the pool is gracefully shrinking to (None if not shrinking).
+
+        Borrowed resources are never closed by a graceful shrink; they are
+        reclaimed as they are released, until the pool is back within this
+        target.
+        """
+        return self._shrink_target
+
+    @property
+    def shrink_in_progress(self):
+        """True while a graceful shrink still waits for borrowed resources."""
+        return self._shrink_target is not None
 
     def collect_resource(self, resource):
         pass
@@ -141,6 +207,10 @@ class Resource:
         Used to close resources from parent processes after fork
         (e.g. sockets/connections).
 
+        This is the immediate, forceful counterpart of the graceful
+        shrink performed by :meth:`resize`: borrowed resources are
+        collected right away instead of when they are released.
+
         Arguments:
         ---------
             close_pool (bool): If True (default) then the pool is marked
@@ -149,6 +219,7 @@ class Resource:
         if self._closed:
             return
         self._closed = close_pool
+        self._shrink_target = None
         dirty = self._dirty
         resource = self._resource
         while 1:  # - acquired
@@ -176,21 +247,33 @@ class Resource:
         if isinstance(limit, bool):
             raise TypeError("limit must be an int, not bool")
         prev_limit = self._limit
-        if (self._dirty and 0 < limit < self._limit) and not ignore_errors:
+        if (self._dirty and prev_limit and
+                0 < limit < prev_limit) and not ignore_errors:
             if not force:
                 raise RuntimeError(
                     "Can't shrink pool when in use: was={} now={}".format(
-                        self._limit, limit))
+                        prev_limit, limit))
             reset = True
         self._limit = limit
         if reset:
+            self._shrink_target = None
             try:
                 self.force_close_all(close_pool=False)
             except Exception:
                 pass
         self.setup()
-        if limit < prev_limit:
+        if prev_limit is not None and limit < prev_limit:
+            # Graceful shrink: excess idle resources are reclaimed now,
+            # resources still in use keep working and are reclaimed as
+            # they are released (see ``shrink_target``).
+            # A limit of 0 means "unlimited", so no shrink is pending.
+            self._shrink_target = limit or None
             self._shrink_down(collect=limit > 0)
+            self._update_shrink_state()
+        elif limit > (prev_limit or 0):
+            # Growing the pool adds idle resources, which wakes up
+            # acquirers blocked waiting for a resource.
+            self._shrink_target = None
 
     def _shrink_down(self, collect=True):
         resource = self._resource
@@ -201,7 +284,7 @@ class Resource:
             while len(resource.queue) and (len(resource.queue) + len(self._dirty)) > self.limit:
                 R = resource.queue.pop()
                 if collect:
-                    self.collect_resource(R)
+                    self._reclaim_resource(R)
 
     @property
     def limit(self):

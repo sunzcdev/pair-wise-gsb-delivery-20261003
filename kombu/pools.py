@@ -50,7 +50,9 @@ class ProducerPool(Resource):
 
     def setup(self):
         if self.limit:
-            for _ in range(self.limit):
+            q = self._resource.queue
+            # Keep in mind dirty/used resources
+            while len(q) < self.limit - len(self._dirty):
                 self._resource.put_nowait(self.new())
 
     def close_resource(self, resource):
@@ -69,6 +71,11 @@ class ProducerPool(Resource):
         return p
 
     def release(self, resource):
+        if self.limit and resource not in self._dirty:
+            # Not owned by this pool (e.g. released twice): never return
+            # a duplicate copy to the idle queue, same rule as the
+            # connection pool.
+            return
         if resource.__connection__:
             resource.__connection__.release()
         resource.channel = None

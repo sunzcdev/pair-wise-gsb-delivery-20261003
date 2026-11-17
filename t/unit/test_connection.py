@@ -1225,9 +1225,15 @@ class ResourceCase:
         chans = [P.acquire() for _ in range(5)]
         self.assert_state(P, 0, 5)
         P.resize(4, ignore_errors=True)
+        # borrowed resources are not closed while in use...
         self.assert_state(P, 0, 5)
+        assert P.shrink_target == 4
+        assert P.shrink_in_progress
+        # ...but returned resources are reclaimed down to the new limit,
+        # so no idle items above the limit are left in the pool.
         [chan.release() for chan in chans]
-        self.assert_state(P, 5, 0)
+        self.assert_state(P, 4, 0)
+        assert not P.shrink_in_progress
 
     def test_acquire_resize_ignore_err_shrink(self):
         P = self.create_resource(5)
@@ -1252,6 +1258,141 @@ class ResourceCase:
         self.assert_state(P, 0, 2)
         c1.release()
         c2.release()
+        self.assert_state(P, 2, 0)
+
+    def test_double_release_does_not_duplicate(self):
+        P = self.create_resource(2)
+        c = P.acquire()
+        self.assert_state(P, 1, 1)
+        c.release()
+        self.assert_state(P, 2, 0)
+        # releasing the same resource again must not put back a copy
+        c.release()
+        self.assert_state(P, 2, 0)
+        assert list(P._resource.queue).count(c) == 1
+
+    def test_acquire_prepare_raises_evaluated_keeps_counts(self):
+        P = self.create_resource(1)
+        r = P.acquire()  # evaluate the resource
+        r.release()
+        P.prepare = Mock(side_effect=KeyError())
+        with pytest.raises(KeyError):
+            P.acquire()
+        # the evaluated resource went back through the release path:
+        # nothing leaked and nothing was duplicated.
+        self.assert_state(P, 1, 0)
+
+    def test_acquire_new_raises_keeps_counts(self):
+        P = self.create_resource(2)
+        P._resource.queue.clear()
+        P.new = Mock(side_effect=IOError())
+        with pytest.raises(IOError):
+            P.acquire()
+        self.assert_state(P, 0, 0)
+
+    def test_shrink_reclaim_collect_raises_keeps_counts(self):
+        P = self.create_resource(3)
+        chans = [P.acquire() for _ in range(3)]
+        P.resize(1, ignore_errors=True)
+        P.collect_resource = Mock(side_effect=IOError())
+        [chan.release() for chan in chans]
+        # failing collects are ignored: accounting settles at the new limit
+        self.assert_state(P, 1, 0)
+        assert not P.shrink_in_progress
+
+    def test_force_close_all_clears_shrink_state(self):
+        P = self.create_resource(5)
+        chans = [P.acquire() for _ in range(5)]
+        P.resize(4, ignore_errors=True)
+        assert P.shrink_in_progress
+        P.force_close_all(close_pool=False)
+        assert not P.shrink_in_progress
+        assert P.shrink_target is None
+        # resources borrowed before the force close are no longer owned
+        [chan.release() for chan in chans]
+        self.assert_state(P, 0, 0)
+
+    def test_resize_from_unlimited(self):
+        P = self.create_resource(None)
+        r = P.acquire()
+        P.resize(2)  # must not raise comparing with None
+        r.release()
+        self.assert_state(P, 2, 0)
+
+    def test_blocked_acquire_timeout_deterministic_error(self):
+        P = self.create_resource(2)
+        c1 = P.acquire()
+        c2 = P.acquire()
+        P.resize(1, ignore_errors=True)
+        with pytest.raises(P.LimitExceeded):
+            P.acquire(block=True, timeout=0.1)
+        # the waiter counter is balanced after the timed-out acquire
+        assert P._acquire_waiters == 0
+        c1.release()
+        c2.release()
+        self.assert_state(P, 1, 0)
+
+    def test_shrink_release_wakes_blocked_acquirer(self):
+        import threading
+        import time
+        P = self.create_resource(2)
+        c1 = P.acquire()
+        c2 = P.acquire()
+        P.resize(1, ignore_errors=True)
+        assert P.shrink_in_progress
+        acquired = []
+
+        def worker():
+            acquired.append(P.acquire(block=True, timeout=10))
+
+        t = threading.Thread(target=worker)
+        t.start()
+        try:
+            for _ in range(1000):
+                if P._acquire_waiters:
+                    break
+                time.sleep(0.001)
+            assert P._acquire_waiters == 1
+            c1.release()
+            t.join(10)
+            # the queued acquirer got a deterministic result: the
+            # returned resource is handed over instead of reclaimed.
+            assert not t.is_alive()
+            assert acquired == [c1]
+        finally:
+            t.join(10)
+        acquired[0].release()
+        c2.release()
+        self.assert_state(P, 1, 0)
+        assert not P.shrink_in_progress
+
+    def test_resize_grow_wakes_blocked_acquirer(self):
+        import threading
+        import time
+        P = self.create_resource(1)
+        c1 = P.acquire()
+        acquired = []
+
+        def worker():
+            acquired.append(P.acquire(block=True, timeout=10))
+
+        t = threading.Thread(target=worker)
+        t.start()
+        try:
+            for _ in range(1000):
+                if P._acquire_waiters:
+                    break
+                time.sleep(0.001)
+            assert P._acquire_waiters == 1
+            # growing the pool must wake up the waiting acquirer
+            P.resize(2)
+            t.join(10)
+            assert not t.is_alive()
+            assert len(acquired) == 1
+        finally:
+            t.join(10)
+        acquired[0].release()
+        c1.release()
         self.assert_state(P, 2, 0)
 
     def test_acquire_resize_force_smaller(self):
