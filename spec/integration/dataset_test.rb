@@ -706,6 +706,25 @@ describe "Simple Dataset operations" do
     @ds.exclude_or_null(false=>:flag).map(:number).must_equal [1, 3]
     @ds.exclude_or_null(nil=>:flag).map(:number).must_equal [1, 2, 3]
   end
+
+  it "should have exclude_complement keep rows where the condition is NULL" do
+    @ds = @ds.extension(:exclude_complement)
+
+    # Set complement keeps the NULL row (number 3), unlike Dataset#exclude,
+    # which uses SQL 3-valued logic and drops it.
+    @ds.exclude_complement(flag: false).map(:number).must_equal [1, 3]
+    @ds.exclude_complement(flag: true).map(:number).must_equal [2, 3]
+
+    # Complementing IS NULL keeps only the non-NULL rows, with no NULL handling.
+    @ds.exclude_complement(flag: nil).map(:number).must_equal [1, 2]
+
+    # Complementing a boolean column keeps both false and NULL rows.
+    @ds.exclude_complement(:flag).map(:number).must_equal [2, 3]
+
+    # The complement and the matching set partition every row.
+    @ds.filter(flag: false).map(:number).sort.
+      concat(@ds.exclude_complement(flag: false).map(:number)).sort.must_equal [1, 2, 3]
+  end
 end
 
 describe "Simple Dataset operations in transactions" do
