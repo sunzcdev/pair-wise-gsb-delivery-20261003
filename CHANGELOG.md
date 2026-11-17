@@ -15,6 +15,12 @@ You can find our backwards-compatibility policy [here](https://github.com/hynek/
 
 ## [Unreleased](https://github.com/hynek/structlog/compare/26.1.0...HEAD)
 
+### Added
+
+- New `structlog.syslog.RFC5424Renderer` that renders event dictionaries as [RFC 5424](https://www.rfc-editor.org/rfc/rfc5424) syslog records (UTF-8-encoded `bytes`), with optional [RFC 6587](https://www.rfc-editor.org/rfc/rfc6587) octet-counting framing.
+  It only encodes -- it neither opens network connections nor modifies the passed event dictionary.
+
+
 ### Changed
 
 - On Python 3.15 and later, *structlog* uses [PEP 810](https://peps.python.org/pep-0810/) lazy imports for modules that are only needed once you log.

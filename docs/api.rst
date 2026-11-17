@@ -291,6 +291,22 @@ API Reference
 .. autoclass:: CallsiteParameterAdder
 
 
+`structlog.syslog` Module
+-------------------------
+
+.. automodule:: structlog.syslog
+
+.. autoclass:: RFC5424Renderer
+
+   .. doctest::
+
+      >>> from structlog.syslog import RFC5424Renderer
+      >>> RFC5424Renderer(hostname="myhost", app_name="myapp")(
+      ...     None, "", {"event": "hello", "answer": 42}
+      ... )  # doctest: +ELLIPSIS
+      b'<14>1 - myhost myapp ... - [structlog answer="42"] \xef\xbb\xbfhello'
+
+
 `structlog.stdlib` Module
 -------------------------
 
