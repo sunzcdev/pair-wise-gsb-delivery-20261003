@@ -186,6 +186,13 @@ class Connection:
     #: in case the server loses data.
     declared_entities = None
 
+    #: Generation of the current broker connection.  It is part of every
+    #: declaration cache identity: bumping it (together with clearing
+    #: :attr:`declared_entities`) invalidates all cached declarations, so
+    #: the necessary exchange/queue/binding topology is redeclared after a
+    #: connection or channel has been recovered.
+    declaration_generation = 0
+
     #: Iterator returning the next broker URL to try in the event
     #: of connection failure (initialized by :attr:`failover_strategy`).
     cycle = None
@@ -286,6 +293,19 @@ class Connection:
             self.uri_prefix = uri_prefix
 
         self.declared_entities = set()
+        self.declaration_generation = 0
+
+    def invalidate_declaration_cache(self):
+        """Forget all cached entity declarations.
+
+        Called whenever the broker connection is closed, switched or
+        re-established.  Bumping :attr:`declaration_generation` makes sure
+        identities produced before the recovery can never match the new
+        connection generation, even if the cache set is replaced rather
+        than mutated.
+        """
+        self.declared_entities.clear()
+        self.declaration_generation += 1
 
     def switch(self, conn_str):
         """Switch connection parameters to use a new URL or hostname.
@@ -299,7 +319,7 @@ class Connection:
             conn_str (str): either a hostname or URL.
         """
         self.close()
-        self.declared_entities.clear()
+        self.invalidate_declaration_cache()
         self._closed = False
         conn_params = (
             parse_url(conn_str) if "://" in conn_str else {"hostname": conn_str}
@@ -407,7 +427,7 @@ class Connection:
 
     def _do_close_self(self):
         # Close only connection and channel(s), but not transport.
-        self.declared_entities.clear()
+        self.invalidate_declaration_cache()
         if self._default_channel:
             self.maybe_close_channel(self._default_channel)
         if self._connection:
@@ -448,7 +468,7 @@ class Connection:
             gc_transport(self._connection)
 
         self._do_close_transport()
-        self.declared_entities.clear()
+        self.invalidate_declaration_cache()
         self._connection = None
 
     def release(self):
@@ -1029,7 +1049,7 @@ class Connection:
             return self._connection
 
     def _connection_factory(self):
-        self.declared_entities.clear()
+        self.invalidate_declaration_cache()
         self._default_channel = None
         self._connection = self._establish_connection()
         self._closed = False

@@ -104,7 +104,43 @@ class Broadcast(Queue):
 
 
 def declaration_cached(entity, channel):
-    return entity in channel.connection.client.declared_entities
+    client = channel.connection.client
+    return _declaration_identity(entity, channel) in \
+        _declaration_cache(client)
+
+
+def _declaration_cache(client):
+    """Return the declaration cache of a connection client.
+
+    Falls back to an ephemeral set for lightweight channel doubles that do
+    not configure a real, connection-scoped cache; in that case nothing is
+    remembered between calls and every declaration reaches the entity.
+    """
+    declared = getattr(client, 'declared_entities', None)
+    if isinstance(declared, set):
+        return declared
+    return set()
+
+
+def _declaration_identity(entity, channel):
+    """Cache key for an entity declaration.
+
+    The identity covers every broker-facing setting of the entity (so a
+    same-named queue or exchange declared with different arguments is not
+    silently skipped) as well as the generation of the connection it was
+    declared on.  A new connection generation invalidates every cached
+    declaration, letting the necessary topology be redeclared after a
+    channel/connection recovery without deleting broker entities first.
+    """
+    client = channel.connection.client
+    if hasattr(entity, 'declaration_identity'):
+        ident = entity.declaration_identity()
+    else:
+        # Entities without a structured identity (e.g. test doubles) keep
+        # the legacy name-based behavior.
+        ident = hash(entity)
+    generation = getattr(client, 'declaration_generation', 0)
+    return ident, generation
 
 
 def maybe_declare(entity, channel=None, retry=False, **retry_policy):
@@ -146,8 +182,8 @@ def _maybe_declare(entity, channel):
 
     declared = ident = None
     if channel.connection and entity.can_cache_declaration:
-        declared = channel.connection.client.declared_entities
-        ident = hash(entity)
+        declared = _declaration_cache(channel.connection.client)
+        ident = _declaration_identity(entity, channel)
         if ident in declared:
             return False
 
@@ -156,8 +192,14 @@ def _maybe_declare(entity, channel):
     entity.declare(channel=channel)
     if declared is not None and ident:
         declared.add(ident)
+    # Propagate the broker-generated name back to the original, unbound
+    # entity for anonymous queues.  Other declaration entities (exchanges,
+    # bindings, bind operations) do not own a settable name.
     if orig is not None:
-        orig.name = entity.name
+        try:
+            orig.name = entity.name
+        except AttributeError:
+            pass
     return True
 
 

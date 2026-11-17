@@ -301,6 +301,26 @@ class test_Connection:
         assert connection._transport is None
         assert connection._connection is None
 
+    def test_invalidate_declaration_cache_bumps_generation(self):
+        connection = Connection('memory://')
+        connection.declared_entities.add(('identity', 0))
+        generation = connection.declaration_generation
+
+        connection.invalidate_declaration_cache()
+
+        assert connection.declaration_generation == generation + 1
+        assert len(connection.declared_entities) == 0
+
+    def test_close_invalidates_declaration_cache(self):
+        connection = Connection('memory://')
+        generation = connection.declaration_generation
+        connection.declared_entities.add(('identity', generation))
+
+        connection._do_close_self()
+
+        assert connection.declaration_generation == generation + 1
+        assert len(connection.declared_entities) == 0
+
     def test_prefer_librabbitmq_over_amqp_when_available(self):
         with patch('kombu.connection.supports_librabbitmq',
                    return_value=True):

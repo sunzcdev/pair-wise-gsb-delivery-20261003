@@ -58,6 +58,58 @@ class test_binding:
         assert 'foo' in repr(b)
         assert 'rkey' in repr(b)
 
+    def test_declaration_identity(self) -> None:
+        b1 = binding(Exchange('foo'), 'rkey', arguments={'x': 1})
+        b2 = binding(Exchange('foo'), 'rkey', arguments={'x': 1})
+        assert b1.declaration_identity() == b2.declaration_identity()
+        assert hash(b1) == hash(b2)
+
+        assert b1.declaration_identity() != binding(
+            Exchange('bar'), 'rkey', arguments={'x': 1},
+        ).declaration_identity()
+        assert b1.declaration_identity() != binding(
+            Exchange('foo'), 'other', arguments={'x': 1},
+        ).declaration_identity()
+        assert b1.declaration_identity() != binding(
+            Exchange('foo'), 'rkey', arguments={'x': 2},
+        ).declaration_identity()
+
+    def test_declaration_identity_nested_arguments(self) -> None:
+        args = {'nested': {'k': [1, 2]}}
+        b1 = binding(Exchange('foo'), 'rkey', arguments=args)
+        b2 = binding(
+            Exchange('foo'), 'rkey', arguments={'nested': {'k': [1, 2]}},
+        )
+        assert b1.declaration_identity() == b2.declaration_identity()
+        # The original configuration is left untouched.
+        assert args == {'nested': {'k': [1, 2]}}
+
+    def test_can_cache_declaration(self) -> None:
+        assert binding(Exchange('foo')).can_cache_declaration
+
+    def test_equality_matches_identity(self) -> None:
+        b1 = binding(Exchange('foo'), 'rkey', arguments={'x': 1})
+        b2 = binding(Exchange('foo'), 'rkey', arguments={'x': 1})
+        assert b1 == b2
+        assert hash(b1) == hash(b2)
+        assert b1 != binding(Exchange('foo'), 'rkey', arguments={'x': 2})
+        assert b1.__eq__(True) is NotImplemented
+
+    def test_duplicate_bindings_dedupe_in_queue(self) -> None:
+        b1 = binding(Exchange('e'), 'rk', arguments={'x': 1})
+        b2 = binding(Exchange('e'), 'rk', arguments={'x': 1})
+        queue = Queue('q', bindings=[b1, b2])
+        assert len(queue.bindings) == 1
+
+    def test_bind_to_channel(self) -> None:
+        # A channel argument binds the declaration instead of issuing a
+        # broker bind.
+        chan = get_conn().channel()
+        b = binding(Exchange('foo'))
+        bound = b.bind(chan)
+        assert bound.is_bound
+        assert 'exchange_bind' not in chan
+
 
 class test_Exchange:
 
@@ -75,6 +127,39 @@ class test_Exchange:
     def test_hash(self) -> None:
         assert hash(Exchange('a')) == hash(Exchange('a'))
         assert hash(Exchange('a')) != hash(Exchange('b'))
+
+    def test_declaration_identity_distinguishes_arguments(self) -> None:
+        # Same name, different broker-facing configuration must yield
+        # different declaration identities.
+        base = Exchange('a', 'direct')
+        assert base.declaration_identity() == Exchange('a', 'direct') \
+            .declaration_identity()
+        assert base.declaration_identity() != \
+            Exchange('a', 'topic').declaration_identity()
+        assert base.declaration_identity() != Exchange(
+            'a', 'direct', durable=False).declaration_identity()
+        assert base.declaration_identity() != Exchange(
+            'a', 'direct', auto_delete=True).declaration_identity()
+        assert base.declaration_identity() != Exchange(
+            'a', 'direct', arguments={'x': 1}).declaration_identity()
+
+    def test_declaration_identity_compares_nested_arguments(self) -> None:
+        left = Exchange('a', arguments={'nested': {'k': [1, 2]}})
+        right = Exchange('a', arguments={'nested': {'k': [1, 2]}})
+        other = Exchange('a', arguments={'nested': {'k': [1, 3]}})
+        assert left.declaration_identity() == right.declaration_identity()
+        assert left.declaration_identity() != other.declaration_identity()
+        # Building the identity must not mutate the original arguments.
+        original = {'nested': {'k': [1, 2]}}
+        Exchange('a', arguments=original).declaration_identity()
+        assert original == {'nested': {'k': [1, 2]}}
+
+    def test_declaration_identity_mixed_type_argument_keys(self) -> None:
+        # Mapping keys of different types must not break the hashable
+        # identity, and key order must not matter.
+        left = Exchange('a', arguments={1: 'x', 'b': [2]})
+        right = Exchange('a', arguments={'b': [2], 1: 'x'})
+        assert left.declaration_identity() == right.declaration_identity()
 
     def test_can_cache_declaration(self) -> None:
         assert Exchange('a', durable=True).can_cache_declaration
@@ -244,6 +329,47 @@ class test_Queue:
     def test_hash(self) -> None:
         assert hash(Queue('a')) == hash(Queue('a'))
         assert hash(Queue('a')) != hash(Queue('b'))
+
+    def test_declaration_identity_same_name_different_arguments(self) -> None:
+        # A queue name alone must not determine the declaration identity.
+        base = Queue('a', exchange=Exchange('e'), routing_key='rk')
+        assert base.declaration_identity() == Queue(
+            'a', exchange=Exchange('e'), routing_key='rk',
+        ).declaration_identity()
+
+        assert base.declaration_identity() != Queue(
+            'a', exchange=Exchange('e'), routing_key='rk', durable=False,
+        ).declaration_identity()
+        assert base.declaration_identity() != Queue(
+            'a', exchange=Exchange('e'), routing_key='rk', exclusive=True,
+        ).declaration_identity()
+        assert base.declaration_identity() != Queue(
+            'a', exchange=Exchange('e'), routing_key='rk',
+            queue_arguments={'x-max-length': 100},
+        ).declaration_identity()
+        assert base.declaration_identity() != Queue(
+            'a', exchange=Exchange('e'), routing_key='rk',
+            binding_arguments={'x-match': 'all'},
+        ).declaration_identity()
+        assert base.declaration_identity() != Queue(
+            'a', exchange=Exchange('e'), routing_key='rk', message_ttl=30,
+        ).declaration_identity()
+        assert base.declaration_identity() != Queue(
+            'a', exchange=Exchange('other'), routing_key='rk',
+        ).declaration_identity()
+        assert base.declaration_identity() != Queue(
+            'a', exchange=Exchange('e'), routing_key='other',
+        ).declaration_identity()
+
+    def test_declaration_identity_nested_arguments(self) -> None:
+        args = {'nested': {'k': [1, 2]}}
+        q1 = Queue('a', queue_arguments=args)
+        q2 = Queue('a', queue_arguments={'nested': {'k': [1, 2]}})
+        q3 = Queue('a', queue_arguments={'nested': {'k': [1, 3]}})
+        assert q1.declaration_identity() == q2.declaration_identity()
+        assert q1.declaration_identity() != q3.declaration_identity()
+        # Original configuration must not be mutated.
+        assert args == {'nested': {'k': [1, 2]}}
 
     def test_repr_with_bindings(self) -> None:
         ex = Exchange('foo')

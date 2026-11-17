@@ -7,7 +7,7 @@ from unittest.mock import Mock, patch
 import pytest
 from amqp import RecoverableConnectionError
 
-from kombu import Exchange, common
+from kombu import Connection, Exchange, Queue, binding, common
 from kombu.common import (PREFETCH_COUNT_MAX, Broadcast, QoS, collect_replies,
                           declaration_cached, generate_oid, ignore_errors,
                           maybe_declare, send_reply)
@@ -146,13 +146,28 @@ class test_declaration_cached:
 
     def test_when_cached(self):
         chan = Mock()
-        chan.connection.client.declared_entities = ['foo']
-        assert declaration_cached('foo', chan)
+        entity = Exchange('foo')
+        chan.connection.client.declared_entities = {
+            (entity.declaration_identity(), 0),
+        }
+        chan.connection.client.declaration_generation = 0
+        assert declaration_cached(entity, chan)
 
     def test_when_not_cached(self):
         chan = Mock()
-        chan.connection.client.declared_entities = ['bar']
-        assert not declaration_cached('foo', chan)
+        chan.connection.client.declared_entities = set()
+        chan.connection.client.declaration_generation = 0
+        assert not declaration_cached(Exchange('foo'), chan)
+
+    def test_different_generation_is_not_cached(self):
+        chan = Mock()
+        entity = Exchange('foo')
+        # Declared on an earlier connection generation.
+        chan.connection.client.declared_entities = {
+            (entity.declaration_identity(), 0),
+        }
+        chan.connection.client.declaration_generation = 1
+        assert not declaration_cached(entity, chan)
 
 
 class test_Broadcast:
@@ -223,7 +238,11 @@ class test_maybe_declare:
 
         # Then: It called declare on the entity queue and added it to list
         assert entity.declare.call_count == 1
-        assert hash(entity) in channel.connection.client.declared_entities
+        ident = (
+            entity.declaration_identity(),
+            channel.connection.client.declaration_generation,
+        )
+        assert ident in channel.connection.client.declared_entities
 
         # When: Calling maybe_declare default (again)
         maybe_declare(entity, channel)
@@ -313,6 +332,108 @@ class test_maybe_declare:
         channel.exchange_declare.assert_called_once()
         old_channel.exchange_declare.assert_not_called()
         assert exchange.channel is channel
+
+
+class test_maybe_declare_identity:
+
+    def setup_method(self):
+        self.connection = Connection('memory://')
+        self.channel = self.connection.channel()
+
+    def test_repeated_identical_declaration_hits_cache(self):
+        queue = Queue(
+            'cached', Exchange('cached-ex', 'direct'), 'rk',
+            queue_arguments={'x-max-length': 10},
+        )
+        assert maybe_declare(queue, self.channel) is True
+        assert maybe_declare(queue, self.channel) is False
+
+    def test_same_name_changed_arguments_is_redeclared(self):
+        # The cache must not skip a same-named queue whose broker-facing
+        # arguments changed.
+        first = Queue('same', queue_arguments={'x-max-length': 10})
+        second = Queue('same', queue_arguments={'x-max-length': 20})
+
+        assert maybe_declare(first, self.channel) is True
+        assert maybe_declare(second, self.channel) is True
+        # An identical follow-up declaration is cached again.
+        assert maybe_declare(second, self.channel) is False
+
+    def test_same_name_changed_exchange_arguments_is_redeclared(self):
+        from kombu.transport.virtual.base import NotEquivalentError
+
+        first = Exchange('same-ex', 'direct', arguments={'x': 1})
+        second = Exchange('same-ex', 'direct', arguments={'x': 2})
+
+        assert maybe_declare(first, self.channel) is True
+        # The cache lets the changed declaration reach the broker instead
+        # of silently skipping it; the broker keeps rejecting incompatible
+        # redeclarations itself.
+        with pytest.raises(NotEquivalentError):
+            maybe_declare(second, self.channel)
+        # An identical follow-up declaration is still cached.
+        assert maybe_declare(first, self.channel) is False
+
+    def test_nested_arguments_compared_by_content(self):
+        first = Queue('nested', queue_arguments={'a': {'b': [1, 2]}})
+        same = Queue('nested', queue_arguments={'a': {'b': [1, 2]}})
+        different = Queue('nested', queue_arguments={'a': {'b': [1, 3]}})
+
+        assert maybe_declare(first, self.channel) is True
+        assert maybe_declare(same, self.channel) is False
+        assert maybe_declare(different, self.channel) is True
+
+    def test_original_arguments_are_not_mutated(self):
+        arguments = {'x-max-length': 10}
+        queue = Queue('immutable', queue_arguments=arguments)
+        maybe_declare(queue, self.channel)
+        maybe_declare(
+            Queue('immutable', queue_arguments=dict(arguments)),
+            self.channel,
+        )
+        assert arguments == {'x-max-length': 10}
+
+    def test_connection_generation_invalidates_cache(self):
+        queue = Queue('gen', Exchange('gen-ex'), 'rk')
+        assert maybe_declare(queue, self.channel) is True
+
+        generation_before = self.connection.declaration_generation
+        self.connection.invalidate_declaration_cache()
+        assert self.connection.declaration_generation == \
+            generation_before + 1
+        assert len(self.connection.declared_entities) == 0
+
+        # The same declaration must reach the broker again after recovery.
+        assert maybe_declare(queue, self.channel) is True
+
+    def test_old_generation_identity_never_matches(self):
+        queue = Queue('stale', Exchange('stale-ex'), 'rk')
+        maybe_declare(queue, self.channel)
+        current = self.connection.declaration_generation
+        # Keep only an identity produced by an earlier connection
+        # generation; it must not satisfy the cache for the current one.
+        self.connection.declared_entities.clear()
+        self.connection.declared_entities.add(
+            (queue.declaration_identity(), current - 100),
+        )
+        assert maybe_declare(queue, self.channel) is True
+
+    def test_binding_declaration_is_cached(self):
+        queue = Queue('bound', bindings=[
+            binding(Exchange('bound-ex'), 'rk', arguments={'x': 1}),
+        ])
+        assert maybe_declare(queue, self.channel) is True
+        bindings_before = set(self.connection.transport.state.bindings)
+        # Re-declaring must not issue the bind again.
+        assert maybe_declare(queue, self.channel) is False
+        assert set(self.connection.transport.state.bindings) == \
+            bindings_before
+
+    def test_changed_binding_arguments_get_distinct_identity(self):
+        first = binding(Exchange('b-ex'), 'rk', arguments={'x': 1})
+        second = binding(Exchange('b-ex'), 'rk', arguments={'x': 2})
+        assert first.declaration_identity() != \
+            second.declaration_identity()
 
 
 class test_replies:

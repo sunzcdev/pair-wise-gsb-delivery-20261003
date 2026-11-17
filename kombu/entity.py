@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
+import collections.abc
 import numbers
 
-from .abstract import MaybeChannelBound, Object
+from .abstract import MaybeChannelBound
 from .exceptions import ContentDisallowed
 from .serialization import prepare_accept_content
 
@@ -23,6 +24,33 @@ def _reprstr(s):
     if isinstance(s, str) and s.startswith("u'"):
         return s[2:-1]
     return s[1:-1]
+
+
+def _freeze(value):
+    """Return a hashable, content-based view of a declaration value.
+
+    Nested mappings and sequences are converted to frozen tuples so that
+    declaration arguments can be compared by their contents even when they
+    contain other containers.  The original configuration is never copied
+    into the entity or mutated; the frozen view is only used to build the
+    declaration identity used by the declaration cache.
+    """
+    if isinstance(value, collections.abc.Mapping):
+        # Sort on the string representation of the keys rather than on the
+        # keys themselves: argument maps may mix key types that do not
+        # support mutual ordering.
+        items = (
+            (key, _freeze(item)) for key, item in value.items()
+        )
+        return tuple(sorted(items, key=lambda item: repr(item[0])))
+    if isinstance(value, (list, tuple, set, frozenset)):
+        try:
+            return frozenset(_freeze(item) for item in value)
+        except TypeError:
+            # Unhashable members (e.g. nested containers): keep the order
+            # instead of losing information.
+            return tuple(_freeze(item) for item in value)
+    return value
 
 
 def pretty_bindings(bindings):
@@ -163,6 +191,23 @@ class Exchange(MaybeChannelBound):
 
     def __hash__(self):
         return hash(f'E|{self.name}')
+
+    def declaration_identity(self):
+        """Identity of the exchange as declared on the broker.
+
+        Two exchanges with the same name but different broker-facing
+        configuration (type, durability, ...) must not be treated as the
+        same declaration by the declaration cache.  Nested arguments are
+        compared by contents without mutating the original configuration.
+        """
+        return (
+            'E',
+            self.name,
+            self.type,
+            self.durable,
+            self.auto_delete,
+            _freeze(self.arguments),
+        )
 
     def _can_declare(self):
         return not self.no_declare and (
@@ -325,7 +370,7 @@ class Exchange(MaybeChannelBound):
         return not self.auto_delete
 
 
-class binding(Object):
+class binding(MaybeChannelBound):
     """Represents a queue or exchange binding.
 
     Arguments:
@@ -344,11 +389,47 @@ class binding(Object):
     )
 
     def __init__(self, exchange=None, routing_key='',
-                 arguments=None, unbind_arguments=None):
+                 arguments=None, unbind_arguments=None, channel=None):
         self.exchange = exchange
         self.routing_key = routing_key
         self.arguments = arguments
         self.unbind_arguments = unbind_arguments
+        self.maybe_bind(channel)
+
+    def __hash__(self):
+        return hash(self.declaration_identity())
+
+    def __eq__(self, other):
+        if isinstance(other, binding):
+            return self.declaration_identity() == \
+                other.declaration_identity()
+        return NotImplemented
+
+    def __ne__(self, other):
+        result = self.__eq__(other)
+        return result if result is NotImplemented else not result
+
+    def declaration_identity(self):
+        """Identity of the binding as created on the broker.
+
+        A binding is identified by the exchange it targets, its routing
+        key and the arguments sent with the bind operation.  Bindings do
+        not own broker state that can disappear on their own, so their
+        declarations can always be cached.
+        """
+        exchange_name = (
+            self.exchange.name if self.exchange is not None else None
+        )
+        return (
+            'B',
+            exchange_name,
+            self.routing_key,
+            _freeze(self.arguments),
+        )
+
+    @property
+    def can_cache_declaration(self):
+        return True
 
     def declare(self, channel, nowait=False):
         """Declare destination exchange."""
@@ -356,7 +437,20 @@ class binding(Object):
             self.exchange.declare(channel=channel, nowait=nowait)
 
     def bind(self, entity, nowait=False, channel=None):
-        """Bind entity to this binding."""
+        """Bind an entity, or bind this declaration to a channel.
+
+        For backwards compatibility ``bind`` keeps its broker-binding
+        meaning when given an :class:`~kombu.entity.Queue` or
+        :class:`~kombu.entity.Exchange` to bind.  When given a channel or
+        connection it behaves like
+        :meth:`~kombu.abstract.MaybeChannelBound.bind` instead.
+        """
+        if isinstance(entity, MaybeChannelBound):
+            return self.bind_to_entity(entity, nowait=nowait, channel=channel)
+        return super().bind(entity)
+
+    def bind_to_entity(self, entity, nowait=False, channel=None):
+        """Bind entity to this binding on the broker."""
         entity.bind_to(exchange=self.exchange,
                        routing_key=self.routing_key,
                        arguments=self.arguments,
@@ -364,6 +458,12 @@ class binding(Object):
                        channel=channel)
 
     def unbind(self, entity, nowait=False, channel=None):
+        """Unbind entity from this binding on the broker."""
+        return self.unbind_from_entity(
+            entity, nowait=nowait, channel=channel,
+        )
+
+    def unbind_from_entity(self, entity, nowait=False, channel=None):
         """Unbind entity from this binding."""
         entity.unbind_from(self.exchange,
                            routing_key=self.routing_key,
@@ -377,6 +477,38 @@ class binding(Object):
     def __str__(self):
         return '{}->{}'.format(
             _reprstr(self.exchange.name), _reprstr(self.routing_key),
+        )
+
+
+class _QueueBindingDeclaration(MaybeChannelBound):
+    """Cacheable queue-to-exchange bind operation.
+
+    A :class:`binding` only describes where an entity should be bound; the
+    actual ``queue.bind`` broker command also depends on the queue being
+    bound.  This adapter pairs the two so the declaration cache can key the
+    bind operation on the queue name together with the binding identity.
+    """
+
+    can_cache_declaration = True
+
+    def __init__(self, binding, queue, nowait=False, channel=None):
+        self.binding = binding
+        self.queue = queue
+        self.nowait = nowait
+        self.maybe_bind(channel)
+
+    @property
+    def name(self):
+        return self.queue.name
+
+    def declaration_identity(self):
+        return ('QB', self.queue.name) + self.binding.declaration_identity()
+
+    def declare(self, nowait=False, channel=None):
+        self.binding.bind_to_entity(
+            self.queue,
+            nowait=self.nowait,
+            channel=channel,
         )
 
 
@@ -606,6 +738,36 @@ class Queue(MaybeChannelBound):
     def __hash__(self):
         return hash(f'Q|{self.name}')
 
+    def declaration_identity(self):
+        """Identity of the queue as declared on the broker.
+
+        Two queues sharing a name but differing in any configuration that
+        influences the broker entity (durability, exclusivity, queue or
+        binding arguments, TTL/length limits, ...) have distinct
+        identities.  The declaration cache therefore can no longer skip a
+        redeclaration based on the queue name alone.  Nested arguments are
+        compared by contents without mutating the original configuration.
+        """
+        exchange_name = (
+            self.exchange.name if self.exchange is not None else None
+        )
+        return (
+            'Q',
+            self.name,
+            exchange_name,
+            self.routing_key,
+            self.durable,
+            self.exclusive,
+            self.auto_delete,
+            _freeze(self.queue_arguments),
+            _freeze(self.binding_arguments),
+            self.expires,
+            self.message_ttl,
+            self.max_length,
+            self.max_length_bytes,
+            self.max_priority,
+        )
+
     def when_bound(self):
         if self.exchange:
             self.exchange = self.exchange(self.channel)
@@ -624,15 +786,36 @@ class Queue(MaybeChannelBound):
             self.exchange.declare(nowait=nowait, channel=channel)
 
     def _create_queue(self, nowait=False, channel=None):
+        from .common import maybe_declare
         self.queue_declare(nowait=nowait, passive=False, channel=channel)
         if self.exchange and self.exchange.name:
-            self.queue_bind(nowait=nowait, channel=channel)
+            # Route the main binding through the declaration cache as well,
+            # using the same identity mechanism as ``self.bindings``.
+            channel = channel or self.channel
+            main_binding = binding(
+                self.exchange,
+                routing_key=self.routing_key,
+                arguments=self.binding_arguments,
+            )
+            maybe_declare(
+                _QueueBindingDeclaration(
+                    main_binding, self, nowait=nowait, channel=channel,
+                ),
+                channel,
+            )
 
     def _create_bindings(self, nowait=False, channel=None):
+        from .common import maybe_declare
         for B in self.bindings:
             channel = channel or self.channel
             B.declare(channel)
-            B.bind(self, nowait=nowait, channel=channel)
+            # Cache the bind operation itself with the binding identity:
+            # identical redeclarations hit the cache, while changed
+            # binding arguments or a recovered connection reach the broker.
+            declaration = _QueueBindingDeclaration(
+                B, self, nowait=nowait, channel=channel,
+            )
+            maybe_declare(declaration, channel)
 
     def queue_declare(self, nowait=False, passive=False, channel=None):
         """Declare queue on the server.
