@@ -132,3 +132,101 @@ myapp_request_duration_seconds_bucket{method="GET",endpoint="/api/users",le="0.1
 myapp_request_duration_seconds_sum{method="GET",endpoint="/api/users"} 3.7
 myapp_request_duration_seconds_count{method="GET",endpoint="/api/users"} 50
 ```
+
+
+## Native histograms
+
+A `Histogram` with `native_histogram=True` (or a `NativeHistogram` sample you
+build yourself) stores its buckets as spans and deltas: compact run-length
+descriptions of which buckets are populated and how their populations change.
+Combining such histograms from several sources requires them to agree on a
+schema and a zero bucket threshold, which is what
+`prometheus_client.samples.merge_native_histograms` does.
+
+A native histogram's `schema` sets the bucket layout. Schema `n` splits every
+power of two into `2 ** n` buckets, so bigger schemas are finer; the supported
+range is `-4` to `8`. Two histograms with different schemas can be merged by
+reducing the finer one to the coarser schema, which only widens buckets and
+therefore never loses an observation.
+
+```python
+from prometheus_client.samples import (
+    BucketSpan, NativeHistogram, merge_native_histograms,
+    native_histogram_bucket_total,
+)
+
+# Two observations in schema 2, in buckets 1 and 2.
+fine = NativeHistogram(
+    count_value=2, sum_value=3.0, schema=2,
+    zero_threshold=0.0, zero_count=0.0,
+    pos_spans=(BucketSpan(1, 2),), pos_deltas=(1, 0),
+)
+# One observation in schema 0, also in bucket 1.
+coarse = NativeHistogram(
+    count_value=1, sum_value=1.5, schema=0,
+    zero_threshold=0.0, zero_count=0.0,
+    pos_spans=(BucketSpan(1, 1),), pos_deltas=(1,),
+)
+
+merged = merge_native_histograms(fine, coarse)
+assert merged.schema == 0
+assert merged.count_value == 3
+assert merged.sum_value == 4.5
+# Every observation is still accounted for.
+assert native_histogram_bucket_total(merged) == 3.0
+```
+
+`merge_native_histograms(histograms, schema=..., zero_threshold=...)` accepts a
+single histogram, a list of histograms, or the histograms as separate
+arguments. The result is a new `NativeHistogram` with canonical spans and
+deltas:
+
+- buckets are ordered by index and consecutive populated buckets share a span;
+- gaps between populated buckets stay span offsets, and are never expanded into
+  empty buckets, so very sparse histograms stay compact;
+- buckets whose population is zero are trimmed;
+- every delta list starts from zero relative to the first bucket of its side;
+- empty spans and negative deltas in the inputs are accepted and re-encoded.
+
+Pass `schema` to choose the result's schema. It must not be finer than the
+coarsest input, because resolution can only be reduced; the default is that
+coarsest input schema. Use `reduce_native_histogram_resolution(histogram,
+schema)` to downscale a single histogram without merging it.
+
+### Zero bucket thresholds
+
+The zero bucket counts the observations within `[-zero_threshold,
++zero_threshold]`. Merging uses the largest threshold of the inputs, because a
+zero bucket cannot be split back into regular buckets. If that threshold falls
+inside a *populated* bucket of any input, the bucket cannot be split either, so
+the threshold is raised to that bucket's upper bound and the check repeats until
+the threshold is a bucket boundary or is not inside a populated bucket at all.
+Every bucket that ends up inside the new threshold has its population added to
+the zero bucket, so still no observation is lost.
+
+Passing a larger `zero_threshold` is allowed and folds more buckets into the
+zero bucket. Passing a smaller one raises `NativeHistogramError`, as does
+requesting a schema finer than the coarsest input.
+
+### Checking counts
+
+`count_value` and `sum_value` of the result are the sums of the inputs' values.
+`native_histogram_bucket_total(histogram)` adds up the zero count and the
+absolute population of all regular buckets; comparing it with `count_value`
+shows whether a histogram accounts for every observation. Merging only moves
+populations between buckets, so the bucket total is preserved.
+
+### Unsupported schemas
+
+Only the standard exponential schemas `-4` to `8` can be merged. Other schemas
+raise `UnsupportedSchemaError`, which carries the offending `schema` and a
+`reason`:
+
+- `-53` is the custom bucket schema (NHCB). Those histograms describe their
+  buckets with custom bounds and have no spans or deltas to combine.
+- `-9` to `-5` and `9` to `52` are reserved for future resolutions. Reduce them
+  to a supported schema before merging.
+- Anything else is unknown.
+
+The inputs are never modified: spans and deltas you pass in are left exactly as
+they were, including when a merge fails.

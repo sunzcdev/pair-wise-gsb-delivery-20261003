@@ -20,6 +20,11 @@ from .metrics_core import Metric
 from .platform_collector import PLATFORM_COLLECTOR, PlatformCollector
 from .process_collector import PROCESS_COLLECTOR, ProcessCollector
 from .registry import CollectorRegistry, REGISTRY
+from .samples import (
+    BucketSpan, merge_native_histograms, native_histogram_bucket_total,
+    NativeHistogram, NativeHistogramError, reduce_native_histogram_resolution,
+    UnsupportedSchemaError,
+)
 
 __all__ = (
     'CollectorRegistry',
@@ -53,6 +58,13 @@ __all__ = (
     'PLATFORM_COLLECTOR',
     'GCCollector',
     'GC_COLLECTOR',
+    'NativeHistogram',
+    'BucketSpan',
+    'NativeHistogramError',
+    'UnsupportedSchemaError',
+    'merge_native_histograms',
+    'reduce_native_histogram_resolution',
+    'native_histogram_bucket_total',
 )
 
 if __name__ == '__main__':
