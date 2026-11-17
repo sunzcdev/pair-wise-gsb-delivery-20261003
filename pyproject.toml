@@ -1,0 +1,234 @@
+[build-system]
+requires = ["hatchling>=1.27.0", "hatch-vcs"]
+build-backend = "hatchling.build"
+
+[project]
+name = "fsspec"
+dynamic = ["version"]
+description = "File-system specification"
+readme = "README.md"
+license = "BSD-3-Clause"
+license-files = ["LICENSE"]
+requires-python = ">=3.11"
+maintainers = [{ name = "Martin Durant", email = "mdurant@anaconda.com" }]
+keywords = ["file"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Programming Language :: Python :: 3.15",
+]
+
+[project.optional-dependencies]
+# user-facing
+abfs = ["adlfs"]
+adl = ["adlfs"]
+arrow = ["pyarrow >= 1"]
+dask = ["dask", "distributed"]
+dropbox = ["dropbox", "dropboxdrivefs", "requests"]
+entrypoints = []
+fuse = ["fusepy"]
+gcs = ["gcsfs >=2026.4.0"]
+git = ["pygit2"]
+github = ["requests"]
+gs = ["fsspec[gcs]"]
+gui = ["panel"]
+hdfs = ["pyarrow >= 1"]
+http = ["aiohttp !=4.0.0a0, !=4.0.0a1"]
+libarchive = ["libarchive-c"]
+oci = ["ocifs"]
+s3 = ["s3fs >=2026.6.0"]
+sftp = ["paramiko>=3.4"]
+smb = ["smbprotocol"]
+ssh = ["paramiko>=3.4"]
+tqdm = ["tqdm"]
+full = [
+    'fsspec[abfs]',
+    'fsspec[adl]',
+    'fsspec[arrow]',
+    'fsspec[dask]',
+    'fsspec[dropbox]',
+    'fsspec[entrypoints]',
+    'fsspec[fuse]',
+    'fsspec[gcs]',
+    'fsspec[git]',
+    'fsspec[github]',
+    'fsspec[gs]',
+    'fsspec[gui]',
+    'fsspec[hdfs]',
+    'fsspec[http]',
+    'fsspec[libarchive]',
+    'fsspec[oci]',
+    'fsspec[s3]',
+    'fsspec[sftp]',
+    'fsspec[smb]',
+    'fsspec[ssh]',
+    'fsspec[tqdm]',
+]
+
+# dev-only
+dev = ["ruff >= 0.5", "pre-commit"]
+doc = [
+    'sphinx',
+    'numpydoc',
+    'sphinx-design',
+    'sphinx-rtd-theme',
+    'yarl',
+]
+test = [
+    "fsspec[http]",
+    "numpy",
+    "pytest",
+    "requests",
+    "requests-toolbelt",
+    "pytest-benchmark",
+    "pytest-cov",
+    "pytest-mock",
+    "pytest-recording",
+    "pytest-rerunfailures",
+    "pytest-asyncio !=0.22.0",
+]
+test_full = [
+    'fsspec[test]',
+    'fsspec[full]',
+    'Jinja2',
+    'cloudpickle',
+    'fastparquet',
+    "kerchunk",
+    'lz4',
+    'notebook',
+    'numpy',
+    'pandas <3.0.0',
+    'panel',
+    'pyftpdlib[ssl]',
+    'pytest',
+    'python-snappy',
+    'urllib3',
+    'zarr <3.2.0',
+    'backports.zstd; python_version < "3.14"',
+    'zstandard; python_version < "3.14"',
+]
+test_downstream = [
+    "dask[dataframe,test]",
+    "moto[server]>4,<5",
+    "pytest-timeout",
+    "xarray",
+    "zarr",
+    "aiobotocore>=2.5.4,<3.0.0",
+]
+
+[project.urls]
+Changelog = "https://filesystem-spec.readthedocs.io/en/latest/changelog.html"
+Documentation = "https://filesystem-spec.readthedocs.io/en/latest/"
+Homepage = "https://github.com/fsspec/filesystem_spec"
+
+[tool.hatch.version]
+source = "vcs"
+raw-options = { 'version_scheme' = 'post-release' }
+
+[tool.hatch.build.hooks.vcs]
+version-file = "fsspec/_version.py"
+
+[tool.hatch.build]
+exclude = ["**/tests/*", "!**/tests/abstract/"]
+
+[tool.ruff]
+exclude = [".tox", "build", "docs/source/conf.py", "fsspec/_version"]
+line-length = 88
+
+[tool.ruff.lint]
+select = [
+    # fix noqas in fsspec/implementations/http.py
+    "ASYNC",
+    "B",
+    "B904",
+    "C4",
+    "G",
+    "E4",
+    "E7",
+    "E9",
+    "F",
+    "FURB",
+    "I",
+    "LOG",
+    "PERF",
+    "PLC",
+    "PLE",
+    "PLR1722",
+    "PLR1736",
+    "PLW1501",
+    "PLW1510",
+    "PLW3301",
+    "PIE800",
+    "PIE804",
+    "PIE807",
+    "PIE810",
+    # "PT", enable in later PR
+    "PYI",
+    "RUF006",
+    "RUF015",
+    "RUF024",
+    "SIM",
+    "SLOT",
+    "SIM101",
+    "TC",
+    "UP",
+]
+ignore = [
+    # Loop control variable `loop` not used within loop body
+    "B007",
+    # Star-arg unpacking after a keyword argument is strongly discouraged
+    "B026",
+    # No explicit `stacklevel` keyword argument found
+    "B028",
+    # `zip` without explicit `strict` keyword
+    "B905",
+    # Assigning lambda expression
+    "E731",
+    # Ambiguous variable names
+    "E741",
+    # line break before binary operator
+    # uncomment when implemented in ruff
+    # "W503",
+    # whitespace before :
+    "E203",
+    # redefs
+    "F811",
+    # Fix these codes later
+    "G004",
+    "PERF203",
+    "PLC0415",
+    "UP007",
+    "UP011",
+    "UP015",
+    "UP018",
+    "SIM102",
+    "SIM105",
+    "SIM108",
+    "SIM114",
+    "SIM115",
+    "SIM117",
+    "TC003",
+    # https://docs.astral.sh/ruff/formatter/#conflicting-lint-rules
+    "W191",
+    "E111",
+    "E114",
+    "E117",
+    "D206",
+    "D300",
+    "Q000",
+    "Q001",
+    "Q002",
+    "Q003",
+    "COM812",
+    "COM819",
+    "ASYNC109"
+]
+
+[tool.pytest.ini_options]
+# custom markers, need to be defined to avoid warnings
+markers = ["asyncio", "vcr"]

@@ -1,0 +1,2122 @@
+import glob
+import io
+import json
+import os
+import pickle
+import subprocess
+import sys
+from collections import defaultdict
+from pathlib import Path
+
+import numpy as np
+import pytest
+
+import fsspec
+from fsspec.implementations.ftp import FTPFileSystem
+from fsspec.implementations.http import HTTPFileSystem
+from fsspec.implementations.local import LocalFileSystem
+from fsspec.spec import AbstractBufferedFile, AbstractFileSystem
+from fsspec.tests.conftest import data
+
+PATHS_FOR_GLOB_TESTS = (
+    {"name": "test0.json", "type": "file", "size": 100},
+    {"name": "test0.yaml", "type": "file", "size": 100},
+    {"name": "test0", "type": "directory", "size": 0},
+    {"name": "test0/test0.json", "type": "file", "size": 100},
+    {"name": "test0/test0.yaml", "type": "file", "size": 100},
+    {"name": "test0/test1", "type": "directory", "size": 0},
+    {"name": "test0/test1/test0.json", "type": "file", "size": 100},
+    {"name": "test0/test1/test0.yaml", "type": "file", "size": 100},
+    {"name": "test0/test1/test2", "type": "directory", "size": 0},
+    {"name": "test0/test1/test2/test0.json", "type": "file", "size": 100},
+    {"name": "test0/test1/test2/test0.yaml", "type": "file", "size": 100},
+    {"name": "test0/test2", "type": "directory", "size": 0},
+    {"name": "test0/test2/test0.json", "type": "file", "size": 100},
+    {"name": "test0/test2/test0.yaml", "type": "file", "size": 100},
+    {"name": "test0/test2/test1", "type": "directory", "size": 0},
+    {"name": "test0/test2/test1/test0.json", "type": "file", "size": 100},
+    {"name": "test0/test2/test1/test0.yaml", "type": "file", "size": 100},
+    {"name": "test0/test2/test1/test3", "type": "directory", "size": 0},
+    {"name": "test0/test2/test1/test3/test0.json", "type": "file", "size": 100},
+    {"name": "test0/test2/test1/test3/test0.yaml", "type": "file", "size": 100},
+    {"name": "test1.json", "type": "file", "size": 100},
+    {"name": "test1.yaml", "type": "file", "size": 100},
+    {"name": "test1", "type": "directory", "size": 0},
+    {"name": "test1/test0.json", "type": "file", "size": 100},
+    {"name": "test1/test0.yaml", "type": "file", "size": 100},
+    {"name": "test1/test0", "type": "directory", "size": 0},
+    {"name": "test1/test0/test0.json", "type": "file", "size": 100},
+    {"name": "test1/test0/test0.yaml", "type": "file", "size": 100},
+    {"name": "special_chars", "type": "directory", "size": 0},
+    {"name": "special_chars/f\\oo.txt", "type": "file", "size": 100},
+    {"name": "special_chars/f.oo.txt", "type": "file", "size": 100},
+    {"name": "special_chars/f+oo.txt", "type": "file", "size": 100},
+    {"name": "special_chars/f(oo.txt", "type": "file", "size": 100},
+    {"name": "special_chars/f)oo.txt", "type": "file", "size": 100},
+    {"name": "special_chars/f|oo.txt", "type": "file", "size": 100},
+    {"name": "special_chars/f^oo.txt", "type": "file", "size": 100},
+    {"name": "special_chars/f$oo.txt", "type": "file", "size": 100},
+    {"name": "special_chars/f{oo.txt", "type": "file", "size": 100},
+    {"name": "special_chars/f}oo.txt", "type": "file", "size": 100},
+)
+
+GLOB_POSIX_TESTS = {
+    "argnames": ("path", "expected"),
+    "argvalues": [
+        ("nonexistent", []),
+        # bare "[!]" is the literal string "[!]" (an empty negated class),
+        # and "[]" is an empty class; neither matches anything -- matching
+        # Python's glob/fnmatch and bash. See glob() docstring.
+        ("test0/[!]", []),
+        ("[]", []),
+        ("test[]0.json", []),
+        ("test0.json", ["test0.json"]),
+        ("test0", ["test0"]),
+        ("test0/", ["test0"]),
+        ("test1/test0.yaml", ["test1/test0.yaml"]),
+        ("test0/test[1-2]", ["test0/test1", "test0/test2"]),
+        ("test0/test[1-2]/", ["test0/test1", "test0/test2"]),
+        (
+            "test0/test[1-2]/*",
+            [
+                "test0/test1/test0.json",
+                "test0/test1/test0.yaml",
+                "test0/test1/test2",
+                "test0/test2/test0.json",
+                "test0/test2/test0.yaml",
+                "test0/test2/test1",
+            ],
+        ),
+        (
+            "test0/test[1-2]/*.[j]*",
+            ["test0/test1/test0.json", "test0/test2/test0.json"],
+        ),
+        ("special_chars/f\\oo.*", ["special_chars/f\\oo.txt"]),
+        ("special_chars/f.oo.*", ["special_chars/f.oo.txt"]),
+        ("special_chars/f+oo.*", ["special_chars/f+oo.txt"]),
+        ("special_chars/f(oo.*", ["special_chars/f(oo.txt"]),
+        ("special_chars/f)oo.*", ["special_chars/f)oo.txt"]),
+        ("special_chars/f|oo.*", ["special_chars/f|oo.txt"]),
+        ("special_chars/f^oo.*", ["special_chars/f^oo.txt"]),
+        ("special_chars/f$oo.*", ["special_chars/f$oo.txt"]),
+        ("special_chars/f{oo.*", ["special_chars/f{oo.txt"]),
+        ("special_chars/f}oo.*", ["special_chars/f}oo.txt"]),
+        (
+            "*",
+            [
+                "special_chars",
+                "test0.json",
+                "test0.yaml",
+                "test0",
+                "test1.json",
+                "test1.yaml",
+                "test1",
+            ],
+        ),
+        ("*.yaml", ["test0.yaml", "test1.yaml"]),
+        (
+            "**",
+            [
+                "special_chars",
+                "special_chars/f$oo.txt",
+                "special_chars/f(oo.txt",
+                "special_chars/f)oo.txt",
+                "special_chars/f+oo.txt",
+                "special_chars/f.oo.txt",
+                "special_chars/f\\oo.txt",
+                "special_chars/f^oo.txt",
+                "special_chars/f{oo.txt",
+                "special_chars/f|oo.txt",
+                "special_chars/f}oo.txt",
+                "test0.json",
+                "test0.yaml",
+                "test0",
+                "test0/test0.json",
+                "test0/test0.yaml",
+                "test0/test1",
+                "test0/test1/test0.json",
+                "test0/test1/test0.yaml",
+                "test0/test1/test2",
+                "test0/test1/test2/test0.json",
+                "test0/test1/test2/test0.yaml",
+                "test0/test2",
+                "test0/test2/test0.json",
+                "test0/test2/test0.yaml",
+                "test0/test2/test1",
+                "test0/test2/test1/test0.json",
+                "test0/test2/test1/test0.yaml",
+                "test0/test2/test1/test3",
+                "test0/test2/test1/test3/test0.json",
+                "test0/test2/test1/test3/test0.yaml",
+                "test1.json",
+                "test1.yaml",
+                "test1",
+                "test1/test0.json",
+                "test1/test0.yaml",
+                "test1/test0",
+                "test1/test0/test0.json",
+                "test1/test0/test0.yaml",
+            ],
+        ),
+        ("*/", ["special_chars", "test0", "test1"]),
+        (
+            "**/",
+            [
+                "special_chars",
+                "test0",
+                "test0/test1",
+                "test0/test1/test2",
+                "test0/test2",
+                "test0/test2/test1",
+                "test0/test2/test1/test3",
+                "test1",
+                "test1/test0",
+            ],
+        ),
+        ("*/*.yaml", ["test0/test0.yaml", "test1/test0.yaml"]),
+        (
+            "**/*.yaml",
+            [
+                "test0.yaml",
+                "test0/test0.yaml",
+                "test0/test1/test0.yaml",
+                "test0/test1/test2/test0.yaml",
+                "test0/test2/test0.yaml",
+                "test0/test2/test1/test0.yaml",
+                "test0/test2/test1/test3/test0.yaml",
+                "test1.yaml",
+                "test1/test0.yaml",
+                "test1/test0/test0.yaml",
+            ],
+        ),
+        (
+            "*/test1/*",
+            ["test0/test1/test0.json", "test0/test1/test0.yaml", "test0/test1/test2"],
+        ),
+        ("*/test1/*.yaml", ["test0/test1/test0.yaml"]),
+        (
+            "**/test1/*",
+            [
+                "test0/test1/test0.json",
+                "test0/test1/test0.yaml",
+                "test0/test1/test2",
+                "test0/test2/test1/test0.json",
+                "test0/test2/test1/test0.yaml",
+                "test0/test2/test1/test3",
+                "test1/test0.json",
+                "test1/test0.yaml",
+                "test1/test0",
+            ],
+        ),
+        (
+            "**/test1/*.yaml",
+            [
+                "test0/test1/test0.yaml",
+                "test0/test2/test1/test0.yaml",
+                "test1/test0.yaml",
+            ],
+        ),
+        ("*/test1/*/", ["test0/test1/test2"]),
+        (
+            "**/test1/*/",
+            ["test0/test1/test2", "test0/test2/test1/test3", "test1/test0"],
+        ),
+        (
+            "*/test1/**",
+            [
+                "test0/test1",
+                "test0/test1/test0.json",
+                "test0/test1/test0.yaml",
+                "test0/test1/test2",
+                "test0/test1/test2/test0.json",
+                "test0/test1/test2/test0.yaml",
+            ],
+        ),
+        (
+            "**/test1/**",
+            [
+                "test0/test1",
+                "test0/test1/test0.json",
+                "test0/test1/test0.yaml",
+                "test0/test1/test2",
+                "test0/test1/test2/test0.json",
+                "test0/test1/test2/test0.yaml",
+                "test0/test2/test1",
+                "test0/test2/test1/test0.json",
+                "test0/test2/test1/test0.yaml",
+                "test0/test2/test1/test3",
+                "test0/test2/test1/test3/test0.json",
+                "test0/test2/test1/test3/test0.yaml",
+                "test1",
+                "test1/test0.json",
+                "test1/test0.yaml",
+                "test1/test0",
+                "test1/test0/test0.json",
+                "test1/test0/test0.yaml",
+            ],
+        ),
+        ("*/test1/**/", ["test0/test1", "test0/test1/test2"]),
+        (
+            "**/test1/**/",
+            [
+                "test0/test1",
+                "test0/test1/test2",
+                "test0/test2/test1",
+                "test0/test2/test1/test3",
+                "test1",
+                "test1/test0",
+            ],
+        ),
+        (
+            "test0/*",
+            ["test0/test0.json", "test0/test0.yaml", "test0/test1", "test0/test2"],
+        ),
+        ("test0/*.yaml", ["test0/test0.yaml"]),
+        (
+            "test0/**",
+            [
+                "test0",
+                "test0/test0.json",
+                "test0/test0.yaml",
+                "test0/test1",
+                "test0/test1/test0.json",
+                "test0/test1/test0.yaml",
+                "test0/test1/test2",
+                "test0/test1/test2/test0.json",
+                "test0/test1/test2/test0.yaml",
+                "test0/test2",
+                "test0/test2/test0.json",
+                "test0/test2/test0.yaml",
+                "test0/test2/test1",
+                "test0/test2/test1/test0.json",
+                "test0/test2/test1/test0.yaml",
+                "test0/test2/test1/test3",
+                "test0/test2/test1/test3/test0.json",
+                "test0/test2/test1/test3/test0.yaml",
+            ],
+        ),
+        ("test0/*/", ["test0/test1", "test0/test2"]),
+        (
+            "test0/**/",
+            [
+                "test0",
+                "test0/test1",
+                "test0/test1/test2",
+                "test0/test2",
+                "test0/test2/test1",
+                "test0/test2/test1/test3",
+            ],
+        ),
+        ("test0/*/*.yaml", ["test0/test1/test0.yaml", "test0/test2/test0.yaml"]),
+        (
+            "test0/**/*.yaml",
+            [
+                "test0/test0.yaml",
+                "test0/test1/test0.yaml",
+                "test0/test1/test2/test0.yaml",
+                "test0/test2/test0.yaml",
+                "test0/test2/test1/test0.yaml",
+                "test0/test2/test1/test3/test0.yaml",
+            ],
+        ),
+        (
+            "test0/*/test1/*",
+            [
+                "test0/test2/test1/test0.json",
+                "test0/test2/test1/test0.yaml",
+                "test0/test2/test1/test3",
+            ],
+        ),
+        ("test0/*/test1/*.yaml", ["test0/test2/test1/test0.yaml"]),
+        (
+            "test0/**/test1/*",
+            [
+                "test0/test1/test0.json",
+                "test0/test1/test0.yaml",
+                "test0/test1/test2",
+                "test0/test2/test1/test0.json",
+                "test0/test2/test1/test0.yaml",
+                "test0/test2/test1/test3",
+            ],
+        ),
+        (
+            "test0/**/test1/*.yaml",
+            ["test0/test1/test0.yaml", "test0/test2/test1/test0.yaml"],
+        ),
+        ("test0/*/test1/*/", ["test0/test2/test1/test3"]),
+        ("test0/**/test1/*/", ["test0/test1/test2", "test0/test2/test1/test3"]),
+        (
+            "test0/*/test1/**",
+            [
+                "test0/test2/test1",
+                "test0/test2/test1/test0.json",
+                "test0/test2/test1/test0.yaml",
+                "test0/test2/test1/test3",
+                "test0/test2/test1/test3/test0.json",
+                "test0/test2/test1/test3/test0.yaml",
+            ],
+        ),
+        (
+            "test0/**/test1/**",
+            [
+                "test0/test1",
+                "test0/test1/test0.json",
+                "test0/test1/test0.yaml",
+                "test0/test1/test2",
+                "test0/test1/test2/test0.json",
+                "test0/test1/test2/test0.yaml",
+                "test0/test2/test1",
+                "test0/test2/test1/test0.json",
+                "test0/test2/test1/test0.yaml",
+                "test0/test2/test1/test3",
+                "test0/test2/test1/test3/test0.json",
+                "test0/test2/test1/test3/test0.yaml",
+            ],
+        ),
+        ("test0/*/test1/**/", ["test0/test2/test1", "test0/test2/test1/test3"]),
+        (
+            "test0/**/test1/**/",
+            [
+                "test0/test1",
+                "test0/test1/test2",
+                "test0/test2/test1",
+                "test0/test2/test1/test3",
+            ],
+        ),
+    ],
+}
+
+
+class DummyTestFS(AbstractFileSystem):
+    protocol = "mock"
+    _file_class = AbstractBufferedFile
+    _fs_contents = (
+        {"name": "top_level", "type": "directory"},
+        {"name": "top_level/second_level", "type": "directory"},
+        {"name": "top_level/second_level/date=2019-10-01", "type": "directory"},
+        {
+            "name": "top_level/second_level/date=2019-10-01/a.parquet",
+            "type": "file",
+            "size": 100,
+        },
+        {
+            "name": "top_level/second_level/date=2019-10-01/b.parquet",
+            "type": "file",
+            "size": 100,
+        },
+        {"name": "top_level/second_level/date=2019-10-02", "type": "directory"},
+        {
+            "name": "top_level/second_level/date=2019-10-02/a.parquet",
+            "type": "file",
+            "size": 100,
+        },
+        {"name": "top_level/second_level/date=2019-10-04", "type": "directory"},
+        {
+            "name": "top_level/second_level/date=2019-10-04/a.parquet",
+            "type": "file",
+            "size": 100,
+        },
+        {"name": "misc", "type": "directory"},
+        {"name": "misc/foo.txt", "type": "file", "size": 100},
+    )
+
+    def __init__(self, fs_content=None, **kwargs):
+        if fs_content is not None:
+            self._fs_contents = fs_content
+        super().__init__(**kwargs)
+
+    def __getitem__(self, name):
+        for item in self._fs_contents:
+            if item["name"] == name:
+                return item
+        raise IndexError(f"{name} not found!")
+
+    def ls(self, path, detail=True, refresh=True, **kwargs):
+        if kwargs.pop("strip_proto", True):
+            path = self._strip_protocol(path)
+
+        files = not refresh and self._ls_from_cache(path)
+        if not files:
+            files = [
+                file for file in self._fs_contents if path == self._parent(file["name"])
+            ]
+            files.sort(key=lambda file: file["name"])
+            self.dircache[path.rstrip("/")] = files
+
+        if detail:
+            return files
+        return [file["name"] for file in files]
+
+    @classmethod
+    def get_test_paths(cls, start_with=""):
+        """Helper to return directory and file paths with no details"""
+        all = [
+            file["name"]
+            for file in cls._fs_contents
+            if file["name"].startswith(start_with)
+        ]
+        return all
+
+    def _open(
+        self,
+        path,
+        mode="rb",
+        block_size=None,
+        autocommit=True,
+        cache_options=None,
+        **kwargs,
+    ):
+        return self._file_class(
+            self,
+            path,
+            mode,
+            block_size,
+            autocommit,
+            cache_options=cache_options,
+            **kwargs,
+        )
+
+
+@pytest.mark.parametrize(
+    ["test_paths", "recursive", "maxdepth", "expected"],
+    [
+        (
+            (
+                "top_level/second_level",
+                "top_level/sec*",
+                "top_level/sec*vel",
+                "top_level/*",
+            ),
+            True,
+            None,
+            [
+                "top_level/second_level",
+                "top_level/second_level/date=2019-10-01",
+                "top_level/second_level/date=2019-10-01/a.parquet",
+                "top_level/second_level/date=2019-10-01/b.parquet",
+                "top_level/second_level/date=2019-10-02",
+                "top_level/second_level/date=2019-10-02/a.parquet",
+                "top_level/second_level/date=2019-10-04",
+                "top_level/second_level/date=2019-10-04/a.parquet",
+            ],
+        ),
+        (
+            (
+                "top_level/second_level",
+                "top_level/sec*",
+                "top_level/sec*vel",
+                "top_level/*",
+            ),
+            False,
+            None,
+            [
+                "top_level/second_level",
+            ],
+        ),
+        (
+            ("top_level/second_level",),
+            True,
+            1,
+            [
+                "top_level/second_level",
+                "top_level/second_level/date=2019-10-01",
+                "top_level/second_level/date=2019-10-02",
+                "top_level/second_level/date=2019-10-04",
+            ],
+        ),
+        (
+            ("top_level/second_level",),
+            True,
+            2,
+            [
+                "top_level/second_level",
+                "top_level/second_level/date=2019-10-01",
+                "top_level/second_level/date=2019-10-01/a.parquet",
+                "top_level/second_level/date=2019-10-01/b.parquet",
+                "top_level/second_level/date=2019-10-02",
+                "top_level/second_level/date=2019-10-02/a.parquet",
+                "top_level/second_level/date=2019-10-04",
+                "top_level/second_level/date=2019-10-04/a.parquet",
+            ],
+        ),
+        (
+            ("top_level/*", "top_level/sec*", "top_level/sec*vel", "top_level/*"),
+            True,
+            1,
+            ["top_level/second_level"],
+        ),
+        (
+            ("top_level/*", "top_level/sec*", "top_level/sec*vel", "top_level/*"),
+            True,
+            2,
+            [
+                "top_level/second_level",
+                "top_level/second_level/date=2019-10-01",
+                "top_level/second_level/date=2019-10-02",
+                "top_level/second_level/date=2019-10-04",
+            ],
+        ),
+        (
+            ("top_level/**",),
+            False,
+            None,
+            [
+                "top_level",
+                "top_level/second_level",
+                "top_level/second_level/date=2019-10-01",
+                "top_level/second_level/date=2019-10-01/a.parquet",
+                "top_level/second_level/date=2019-10-01/b.parquet",
+                "top_level/second_level/date=2019-10-02",
+                "top_level/second_level/date=2019-10-02/a.parquet",
+                "top_level/second_level/date=2019-10-04",
+                "top_level/second_level/date=2019-10-04/a.parquet",
+            ],
+        ),
+        (
+            ("top_level/**",),
+            True,
+            None,
+            [
+                "top_level",
+                "top_level/second_level",
+                "top_level/second_level/date=2019-10-01",
+                "top_level/second_level/date=2019-10-01/a.parquet",
+                "top_level/second_level/date=2019-10-01/b.parquet",
+                "top_level/second_level/date=2019-10-02",
+                "top_level/second_level/date=2019-10-02/a.parquet",
+                "top_level/second_level/date=2019-10-04",
+                "top_level/second_level/date=2019-10-04/a.parquet",
+            ],
+        ),
+        (("top_level/**",), True, 1, ["top_level", "top_level/second_level"]),
+        (
+            ("top_level/**",),
+            True,
+            2,
+            [
+                "top_level",
+                "top_level/second_level",
+                "top_level/second_level/date=2019-10-01",
+                "top_level/second_level/date=2019-10-01/a.parquet",
+                "top_level/second_level/date=2019-10-01/b.parquet",
+                "top_level/second_level/date=2019-10-02",
+                "top_level/second_level/date=2019-10-02/a.parquet",
+                "top_level/second_level/date=2019-10-04",
+                "top_level/second_level/date=2019-10-04/a.parquet",
+            ],
+        ),
+        (
+            ("top_level/**/a.*",),
+            False,
+            None,
+            [
+                "top_level/second_level/date=2019-10-01/a.parquet",
+                "top_level/second_level/date=2019-10-02/a.parquet",
+                "top_level/second_level/date=2019-10-04/a.parquet",
+            ],
+        ),
+        (
+            ("top_level/**/a.*",),
+            True,
+            None,
+            [
+                "top_level/second_level/date=2019-10-01/a.parquet",
+                "top_level/second_level/date=2019-10-02/a.parquet",
+                "top_level/second_level/date=2019-10-04/a.parquet",
+            ],
+        ),
+        (
+            ("top_level/**/second_level/date=2019-10-02",),
+            False,
+            2,
+            [
+                "top_level/second_level/date=2019-10-02",
+            ],
+        ),
+        (
+            ("top_level/**/second_level/date=2019-10-02",),
+            True,
+            2,
+            [
+                "top_level/second_level/date=2019-10-02",
+                "top_level/second_level/date=2019-10-02/a.parquet",
+            ],
+        ),
+        [("misc/foo.txt", "misc/*.txt"), False, None, ["misc/foo.txt"]],
+        [("misc/foo.txt", "misc/*.txt"), True, None, ["misc/foo.txt"]],
+        (
+            ("",),
+            False,
+            None,
+            [DummyTestFS.root_marker],
+        ),
+        (
+            ("",),
+            True,
+            None,
+            DummyTestFS.get_test_paths() + [DummyTestFS.root_marker],
+        ),
+        [
+            (Path("misc/foo.txt"),),
+            False,
+            None,
+            [f"misc{os.sep}foo.txt"],
+        ],
+    ],
+)
+def test_expand_path(test_paths, recursive, maxdepth, expected):
+    """Test a number of paths and then their combination which should all yield
+    the same set of expanded paths"""
+    test_fs = DummyTestFS()
+
+    # test single query
+    for test_path in test_paths:
+        paths = test_fs.expand_path(test_path, recursive=recursive, maxdepth=maxdepth)
+        assert sorted(paths) == sorted(expected)
+
+    # test with all queries
+    paths = test_fs.expand_path(
+        list(test_paths), recursive=recursive, maxdepth=maxdepth
+    )
+    assert sorted(paths) == sorted(expected)
+
+
+def test_expand_paths_with_wrong_args():
+    test_fs = DummyTestFS()
+
+    with pytest.raises(ValueError):
+        test_fs.expand_path("top_level", recursive=True, maxdepth=0)
+    with pytest.raises(ValueError):
+        test_fs.expand_path("top_level", maxdepth=0)
+    with pytest.raises(FileNotFoundError):
+        test_fs.expand_path("top_level/**/second_level/date=2019-10-02", maxdepth=1)
+    with pytest.raises(FileNotFoundError):
+        test_fs.expand_path("nonexistent/*")
+
+
+@pytest.mark.xfail
+def test_find():
+    """Test .find() method on debian server (ftp, https) with constant folder"""
+    filesystem, host, test_path = (
+        FTPFileSystem,
+        "ftp.fau.de",
+        "ftp://ftp.fau.de/debian-cd/current/amd64/log/success",
+    )
+    test_fs = filesystem(host)
+    filenames_ftp = test_fs.find(test_path)
+    assert filenames_ftp
+
+    filesystem, host, test_path = (
+        HTTPFileSystem,
+        "https://ftp.fau.de",
+        "https://ftp.fau.de/debian-cd/current/amd64/log/success",
+    )
+    test_fs = filesystem()
+    filenames_http = test_fs.find(test_path)
+    roots = [f.rsplit("/", 1)[-1] for f in filenames_http]
+
+    assert all(f.rsplit("/", 1)[-1] in roots for f in filenames_ftp)
+
+
+def test_find_details():
+    test_fs = DummyTestFS()
+    filenames = test_fs.find("/")
+    details = test_fs.find("/", detail=True)
+    for filename in filenames:
+        assert details[filename] == test_fs.info(filename)
+
+
+def test_find_file():
+    test_fs = DummyTestFS()
+
+    filename = "misc/foo.txt"
+    assert test_fs.find(filename) == [filename]
+    assert test_fs.find(filename, detail=True) == {filename: {}}
+
+
+def test_cache():
+    fs = DummyTestFS()
+    fs2 = DummyTestFS()
+    assert fs is fs2
+
+    assert DummyTestFS.current() is fs
+    assert len(fs._cache) == 1
+    del fs2
+    assert len(fs._cache) == 1
+    del fs
+
+    # keeps and internal reference, doesn't get collected
+    assert len(DummyTestFS._cache) == 1
+
+    DummyTestFS.clear_instance_cache()
+    assert len(DummyTestFS._cache) == 0
+
+
+def test_instance_cache_concurrency():
+    import concurrent.futures
+    import time
+
+    class SleepyFS(DummyTestFS):
+        async_impl = True
+
+        def __init__(self, *args, **kwargs):
+            time.sleep(0.1)
+            super().__init__(*args, **kwargs)
+
+    SleepyFS.clear_instance_cache()
+
+    def instantiate():
+        return SleepyFS()
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
+        futures = [executor.submit(instantiate) for _ in range(50)]
+        results = [f.result() for f in futures]
+
+    assert len(SleepyFS._cache) == 1
+    assert all(r is results[0] for r in results)
+
+
+def test_instance_created_once_concurrently():
+    import concurrent.futures
+    import time
+
+    inits = []
+
+    class SleepyFS(DummyTestFS):
+        async_impl = True
+
+        def __init__(self, *args, **kwargs):
+            inits.append(None)
+            time.sleep(0.1)
+            super().__init__(*args, **kwargs)
+
+    SleepyFS.clear_instance_cache()
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
+        futures = [executor.submit(SleepyFS) for _ in range(10)]
+        results = [f.result() for f in futures]
+
+    # the threads wait for the instance instead of creating their own
+    assert len(inits) == 1
+    assert all(r is results[0] for r in results)
+    assert not SleepyFS._token_locks
+
+
+def test_instance_creation_error_concurrently():
+    import concurrent.futures
+    import threading
+    import time
+
+    n = 10
+    inits = []
+
+    class FailingOnceFS(DummyTestFS):
+        async_impl = True
+
+        def __init__(self, *args, **kwargs):
+            inits.append(None)
+            time.sleep(0.3)
+            if len(inits) == 1:
+                raise RuntimeError("failed to create the instance")
+            super().__init__(*args, **kwargs)
+
+    FailingOnceFS.clear_instance_cache()
+    barrier = threading.Barrier(n)
+
+    def create():
+        barrier.wait()
+        return FailingOnceFS()
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=n) as executor:
+        futures = [executor.submit(create) for _ in range(n)]
+        concurrent.futures.wait(futures)
+
+    # the threads waiting for the instance fail like the one creating it, instead
+    # of retrying one after another (the last one failing after n attempts)
+    assert len(inits) == 1
+    assert all(isinstance(f.exception(), RuntimeError) for f in futures)
+    assert not FailingOnceFS._token_locks
+
+    # the error is not cached, a later call tries again
+    fs = FailingOnceFS()
+    assert len(inits) == 2
+    assert fs is FailingOnceFS()
+    assert not FailingOnceFS._token_locks
+
+
+def test_instance_creation_interrupted_concurrently():
+    import concurrent.futures
+    import threading
+    import time
+
+    n = 10
+    inits = []
+
+    class Interrupted(BaseException):
+        pass
+
+    class InterruptedOnceFS(DummyTestFS):
+        async_impl = True
+
+        def __init__(self, *args, **kwargs):
+            inits.append(None)
+            time.sleep(0.3)
+            if len(inits) == 1:
+                raise Interrupted
+            super().__init__(*args, **kwargs)
+
+    InterruptedOnceFS.clear_instance_cache()
+    barrier = threading.Barrier(n)
+
+    def create():
+        barrier.wait()
+        return InterruptedOnceFS()
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=n) as executor:
+        futures = [executor.submit(create) for _ in range(n)]
+        concurrent.futures.wait(futures)
+
+    # an interruption (e.g. KeyboardInterrupt) only concerns the interrupted
+    # thread, one of the waiting threads creates the instance instead
+    errors = [f.exception() for f in futures if f.exception() is not None]
+    results = [f.result() for f in futures if f.exception() is None]
+    assert len(errors) == 1
+    assert isinstance(errors[0], Interrupted)
+    assert len(inits) == 2
+    assert len(results) == n - 1
+    assert all(r is results[0] for r in results)
+    assert not InterruptedOnceFS._token_locks
+
+
+def test_instance_created_reentrantly():
+    import threading
+
+    inits = []
+
+    class ReentrantFS(DummyTestFS):
+        async_impl = True
+
+        def __init__(self, *args, **kwargs):
+            inits.append(None)
+            if len(inits) == 1:
+                # same token, same thread, while its instance is being created
+                ReentrantFS()
+            super().__init__(*args, **kwargs)
+
+    ReentrantFS.clear_instance_cache()
+
+    results = []
+    # run in a thread so that a deadlock fails the test instead of hanging it
+    t = threading.Thread(target=lambda: results.append(ReentrantFS()), daemon=True)
+    t.start()
+    t.join(timeout=5)
+
+    assert not t.is_alive(), "deadlock when creating the instance reentrantly"
+    assert len(inits) == 2
+    assert results[0] is ReentrantFS()
+    assert not ReentrantFS._token_locks
+
+
+def test_token_locks_cleared_on_pid_change():
+    class PidFS(DummyTestFS):
+        pass
+
+    PidFS._token_locks["stale"] = object()
+    PidFS._pid = -1  # pretend the process has changed, e.g. forked
+
+    PidFS()
+
+    assert PidFS._pid == os.getpid()
+    assert not PidFS._token_locks
+
+
+def test_uncached_instantiation_concurrency():
+    import concurrent.futures
+    import time
+
+    class SleepyFS(DummyTestFS):
+        async_impl = True
+
+        def __init__(self, *args, **kwargs):
+            time.sleep(0.1)
+            super().__init__(*args, **kwargs)
+
+    SleepyFS.clear_instance_cache()
+
+    def instantiate(i):
+        return SleepyFS(skip_instance_cache=True, i=i)
+
+    t0 = time.time()
+    with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
+        futures = [executor.submit(instantiate, i) for i in range(10)]
+        results = [f.result() for f in futures]
+    t1 = time.time()
+
+    assert len(SleepyFS._cache) == 0
+    assert len(set(results)) == 10
+    assert t1 - t0 < 0.5
+
+
+def test_different_tokens_concurrency():
+    import concurrent.futures
+    import time
+
+    class SleepyFS(DummyTestFS):
+        async_impl = True
+
+        def __init__(self, *args, **kwargs):
+            time.sleep(0.1)
+            super().__init__(*args, **kwargs)
+
+    SleepyFS.clear_instance_cache()
+
+    def instantiate(i):
+        return SleepyFS(i=i)
+
+    t0 = time.time()
+    with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
+        futures = [executor.submit(instantiate, i) for i in range(10)]
+        results = [f.result() for f in futures]
+    t1 = time.time()
+
+    assert len(SleepyFS._cache) == 10
+    assert len(set(results)) == 10
+    assert t1 - t0 < 0.5
+
+
+def test_clear_instance_cache_concurrency():
+    import concurrent.futures
+
+    for i in range(10):
+        DummyTestFS(i)
+
+    def clear_cache():
+        DummyTestFS.clear_instance_cache()
+
+    def instantiate():
+        return DummyTestFS(100)
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
+        futures = []
+        for _ in range(20):
+            futures.append(executor.submit(clear_cache))
+            futures.append(executor.submit(instantiate))
+        for f in futures:
+            f.result()
+
+
+def test_fork_deadlock():
+    import multiprocessing
+    import threading
+    import time
+
+    if "fork" not in multiprocessing.get_all_start_methods():
+        pytest.skip("Fork method is not available on this platform")
+
+    def child_process(q):
+        try:
+            DummyTestFS(12345)
+            q.put(True)
+        except Exception as e:
+            q.put(str(e))
+
+    def locker_thread(started_event):
+        DummyTestFS._instantiation_lock.acquire()
+        started_event.set()
+        time.sleep(2)
+        try:
+            DummyTestFS._instantiation_lock.release()
+        except Exception:
+            pass
+
+    t_event = threading.Event()
+    t = threading.Thread(target=locker_thread, args=(t_event,))
+    t.start()
+    t_event.wait()
+
+    q = multiprocessing.Queue()
+    ctx = multiprocessing.get_context("fork")
+    p = ctx.Process(target=child_process, args=(q,))
+    p.start()
+    p.join(timeout=3)
+    t.join()
+
+    if p.is_alive():
+        p.terminate()
+        p.join()
+        pytest.fail("Child process deadlocked during instantiation")
+
+    import queue
+
+    try:
+        result = q.get(timeout=1)
+    except queue.Empty:
+        pytest.fail("Child process crashed before writing to queue")
+    assert result is True
+
+
+@pytest.mark.parametrize("content", [b"", b"hello\nworld"])
+def test_buffered_file_len(m, content):
+    m.pipe_file("data", content)
+    with AbstractBufferedFile(m, "data") as stream:
+        assert stream.full_name == m.unstrip_protocol("data")
+        assert stream.info() == m.info("data")
+        assert stream == stream and stream != object()
+        assert stream == AbstractBufferedFile(m, "data")
+        assert stream.seekable()
+        stream.flush()
+        assert stream.len == len(content)
+        stream.read(3)
+        assert stream.len == len(content)
+        stream.seek(0)
+        assert stream.len == len(content)
+        stream.seek(0, 2)
+        assert stream.len == len(content)
+        with pytest.raises(TypeError):
+            len(stream)
+
+
+def test_tree(m):
+    m.pipe(
+        {
+            "/root/a/file": b"x",
+            "/root/a/sub/data": b"xx",
+            "/root/b/sub/data": b"x",
+            "/root/z": b"x" * 1024,
+        }
+    )
+    m.makedirs("/root/empty")
+    assert m.tree(
+        "/root", recursion_limit=3, max_display=None, display_size=True
+    ).splitlines() == [
+        "/root",
+        "├── a (1 file, 1 subfolder)",
+        "│   ├── sub (1 file)",
+        "│   │   └── data (2B)",
+        "│   └── file (1B)",
+        "├── b (1 subfolder)",
+        "│   └── sub (1 file)",
+        "│       └── data (1B)",
+        "├── empty (empty folder)",
+        "└── z (1.00 kb)",
+    ]
+    assert m.tree("/root", recursion_limit=0) == "/root"
+    assert m.tree("/root", max_display=0) == "/root\n└── 4 more item(s) not displayed."
+    assert m.tree("/root", recursion_limit=1, indent_size=2) == (
+        "/root\n├ a\n├ b\n├ empty\n└ z"
+    )
+
+
+@pytest.mark.parametrize("mode", ["wb", "ab", "xb"])
+def test_buffered_file_len_without_size(m, mode):
+    with AbstractBufferedFile(m, "data", mode=mode) as stream:
+        assert not hasattr(stream, "size")
+        assert not hasattr(stream, "len")
+
+
+def test_buffered_file_len_unknown_size(m):
+    m.pipe_file("data", b"content")
+    with AbstractBufferedFile(m, "data") as stream:
+        stream.size = None
+        with pytest.raises(AttributeError, match="File size is unknown"):
+            _ = stream.len
+        assert not hasattr(stream, "len")
+        stream.size = 7
+        assert stream.len == 7
+
+
+@pytest.mark.parametrize("content", [b"", b"hello\nworld"])
+@pytest.mark.parametrize("position", [0, 3, 11])
+def test_buffered_file_multipart_encoder(m, content, position):
+    MultipartEncoder = pytest.importorskip("requests_toolbelt").MultipartEncoder
+    position = min(position, len(content))
+    m.pipe_file("data", content)
+    with AbstractBufferedFile(m, "data") as stream:
+        stream.seek(position)
+        encoder = MultipartEncoder(
+            fields={"file": ("data", stream)}, boundary="fsspec-boundary"
+        )
+        expected = MultipartEncoder(
+            fields={"file": ("data", io.BytesIO(content[position:]))},
+            boundary="fsspec-boundary",
+        ).to_string()
+        assert encoder.len == len(expected)
+        assert encoder.read(13) + encoder.read() == expected
+        assert stream.tell() == len(content)
+
+
+@pytest.mark.parametrize("cache_type", ["none", "bytes", "readahead"])
+@pytest.mark.parametrize(
+    "content",
+    [
+        b"",
+        b"hello",
+        b"hello\n",
+        b"\n\n",
+        b"hello\nworld",
+        b"hello\r\nworld\r\n",
+        b"a\rb",
+    ],
+)
+def test_buffered_readlines(m, cache_type, content):
+    m.pipe_file("lines", content)
+    with (
+        AbstractBufferedFile(m, "lines", cache_type=cache_type, block_size=2) as stream,
+        io.BytesIO(content) as expected,
+    ):
+        assert stream.readlines() == expected.readlines()
+        assert stream.readlines() == []
+        stream.seek(0)
+        assert list(stream) == io.BytesIO(content).readlines()
+
+        stream.seek(0)
+        expected.seek(0)
+        stream.read(2)
+        expected.read(2)
+        assert stream.readlines() == expected.readlines()
+        assert stream.readlines() == []
+
+    with pytest.raises(ValueError, match="closed file"):
+        stream.readlines()
+
+
+@pytest.mark.parametrize("cache_type", ["none", "bytes", "readahead"])
+@pytest.mark.parametrize("blocks", [None, 1, 2, 3, 8])
+@pytest.mark.parametrize(
+    "content, delimiter, expected",
+    [
+        (b"a\r\nb\r\ntail", b"\r\n", [b"a\r\n", b"b\r\n", b"tail"]),
+        (b"a||||b||||tail", b"||||", [b"a||||", b"b||||", b"tail"]),
+        (b"xxababaYYababaZ", b"ababa", [b"xxababa", b"YYababa", b"Z"]),
+        (b"\r\n\r\n", b"\r\n", [b"\r\n", b"\r\n"]),
+        (b"abc\r", b"\r\n", [b"abc\r"]),
+        (b"", b"\r\n", []),
+        (b"a\nb\ntail", b"\n", [b"a\n", b"b\n", b"tail"]),
+    ],
+)
+def test_buffered_readuntil_delimiters(
+    m, cache_type, blocks, content, delimiter, expected
+):
+    m.pipe_file("delimiters", b"skip" + content)
+    with AbstractBufferedFile(
+        m, "delimiters", cache_type=cache_type, block_size=2
+    ) as stream:
+        position = stream.seek(4)
+        for part in expected:
+            assert stream.readuntil(delimiter, blocks=blocks) == part
+            position += len(part)
+            assert stream.tell() == position
+        assert stream.readuntil(delimiter, blocks=blocks) == b""
+        assert stream.tell() == position
+
+
+@pytest.mark.parametrize("cache_type", ["none", "bytes", "readahead"])
+@pytest.mark.parametrize("method", ["readinto", "readinto1"])
+@pytest.mark.parametrize("position", [0, 13])
+@pytest.mark.parametrize(
+    "buffer_kind", ["bytes", "readonly-view", "readonly-numpy", "empty-readonly"]
+)
+def test_buffered_readinto_readonly(m, cache_type, method, position, buffer_kind):
+    content = bytes(range(64))
+    m.pipe_file("buffer", content)
+    if buffer_kind == "bytes":
+        target = b"readonly"
+    elif buffer_kind == "readonly-view":
+        target = memoryview(b"readonly")
+    elif buffer_kind == "readonly-numpy":
+        target = np.zeros((2, 4), dtype="uint32")
+        target.flags.writeable = False
+    else:
+        target = b""
+
+    with AbstractBufferedFile(
+        m, "buffer", cache_type=cache_type, block_size=8
+    ) as stream:
+        stream.seek(position)
+        with pytest.raises(TypeError):
+            getattr(stream, method)(target)
+        assert stream.tell() == position
+        writable = bytearray(8)
+        assert getattr(stream, method)(writable) == len(writable)
+        assert writable == content[position : position + len(writable)]
+
+
+@pytest.mark.parametrize("method", ["readinto", "readinto1"])
+def test_buffered_readinto_readonly_closed(m, method):
+    m.pipe_file("buffer", b"content")
+    stream = AbstractBufferedFile(m, "buffer")
+    stream.close()
+    with pytest.raises(ValueError, match="closed file"):
+        getattr(stream, method)(b"readonly")
+
+
+def test_cache_not_pickled(server):
+    fs = fsspec.filesystem(
+        "http",
+        cache_type="readahead",
+        headers={"give_length": "true", "head_ok": "true"},
+    )
+    filepath = server.realfile
+    length = 3
+    f = fs.open(filepath, mode="rb")
+    assert isinstance(f, AbstractBufferedFile)
+    assert not f.cache.cache  # No cache initially
+    assert f.read(length=length) == data[:length]
+    assert f.cache.cache == data  # Cache is populated
+
+    # Roundtrip through pickle
+    import pickle
+
+    f2 = pickle.loads(pickle.dumps(f))
+    assert not f2.cache.cache  # No cache initially
+    assert (
+        f2.read(length=length) == data[length : 2 * length]
+    )  # Read file from previous seek point
+    assert f2.cache.cache == data[length:]  # Cache is populated
+
+
+def test_current():
+    fs = DummyTestFS()
+    fs2 = DummyTestFS(arg=1)
+
+    assert fs is not fs2
+    assert DummyTestFS.current() is fs2
+
+    DummyTestFS()
+    assert DummyTestFS.current() is fs
+
+
+def test_alias():
+    with pytest.warns(FutureWarning, match="add_aliases"):
+        DummyTestFS(add_aliases=True)
+
+
+def test_add_docs_warns():
+    with pytest.warns(FutureWarning, match="add_docs"):
+        AbstractFileSystem(add_docs=True)
+
+
+def test_cache_options():
+    fs = DummyTestFS()
+    f = AbstractBufferedFile(fs, "misc/foo.txt", cache_type="bytes")
+    assert f.cache.trim
+
+    # TODO: dummy buffered file
+    f = AbstractBufferedFile(
+        fs, "misc/foo.txt", cache_type="bytes", cache_options={"trim": False}
+    )
+    assert f.cache.trim is False
+
+    f = fs.open("misc/foo.txt", cache_type="bytes", cache_options={"trim": False})
+    assert f.cache.trim is False
+
+
+def test_trim_kwarg_warns():
+    fs = DummyTestFS()
+    with pytest.warns(FutureWarning, match="cache_options"):
+        AbstractBufferedFile(fs, "misc/foo.txt", cache_type="bytes", trim=False)
+
+
+def tests_file_open_error(monkeypatch):
+    class InitiateError(ValueError): ...
+
+    class UploadError(ValueError): ...
+
+    class DummyBufferedFile(AbstractBufferedFile):
+        can_initiate = False
+
+        def _initiate_upload(self):
+            if not self.can_initiate:
+                raise InitiateError
+
+        def _upload_chunk(self, final=False):
+            raise UploadError
+
+    monkeypatch.setattr(DummyTestFS, "_file_class", DummyBufferedFile)
+
+    fs = DummyTestFS()
+    with pytest.raises(InitiateError):
+        with fs.open("misc/foo.txt", "wb") as stream:
+            stream.write(b"hello" * stream.blocksize * 2)
+
+    with pytest.raises(UploadError):
+        with fs.open("misc/foo.txt", "wb") as stream:
+            stream.can_initiate = True
+            stream.write(b"hello" * stream.blocksize * 2)
+
+
+def test_eq():
+    fs = DummyTestFS()
+    result = fs == 1
+    assert result is False
+
+    f = AbstractBufferedFile(fs, "misc/foo.txt", cache_type="bytes")
+    result = f == 1
+    assert result is False
+
+
+def test_pickle_multiple():
+    a = DummyTestFS(1)
+    b = DummyTestFS(2, bar=1)
+
+    x = pickle.dumps(a)
+    y = pickle.dumps(b)
+
+    del a, b
+    DummyTestFS.clear_instance_cache()
+
+    result = pickle.loads(x)
+    assert result.storage_args == (1,)
+    assert result.storage_options == {}
+
+    result = pickle.loads(y)
+    assert result.storage_args == (2,)
+    assert result.storage_options == {"bar": 1}
+
+
+def test_json():
+    a = DummyTestFS(1)
+    b = DummyTestFS(2, bar=1)
+
+    outa = a.to_json()
+    outb = b.to_json()
+
+    assert json.loads(outb)  # is valid JSON
+    assert a != b
+    assert "bar" in outb
+
+    assert DummyTestFS.from_json(outa) is a
+    assert DummyTestFS.from_json(outb) is b
+
+
+@pytest.mark.parametrize("serializer", ["dict", "json"])
+@pytest.mark.parametrize(
+    "value", [None, [None], {"key": None}, {"key": [1, None, {"nested": None}]}]
+)
+def test_serialize_none(serializer, value):
+    fs = DummyTestFS(value, bar=value)
+    out = getattr(fs, f"to_{serializer}")()
+    expected = {
+        "cls": "fsspec.tests.test_spec:DummyTestFS",
+        "protocol": "mock",
+        "args": [value],
+        "bar": value,
+    }
+
+    assert (json.loads(out) if serializer == "json" else out) == expected
+    assert getattr(DummyTestFS, f"from_{serializer}")(out) is fs
+    assert fs.storage_args == (value,)
+    assert fs.storage_options == {"bar": value}
+
+
+def test_serialize_http_none():
+    fs = HTTPFileSystem(block_size=None, cache_options=None)
+    out = fs.to_dict()
+
+    assert out["block_size"] is None
+    assert out["cache_options"] is None
+    assert json.loads(fs.to_json()) == out
+    assert HTTPFileSystem.from_dict(out) is fs
+
+
+def test_json_path_attr():
+    a = DummyTestFS(1)
+    b = DummyTestFS(2, bar=Path("baz"))
+
+    outa = a.to_json()
+    outb = b.to_json()
+
+    assert json.loads(outb)  # is valid JSON
+    assert a != b
+    assert "bar" in outb
+
+    assert DummyTestFS.from_json(outa) is a
+    assert DummyTestFS.from_json(outb) is b
+
+
+def test_json_fs_attr():
+    a = DummyTestFS(1)
+    b = DummyTestFS(2, bar=Path("baz"))
+    c = DummyTestFS(3, baz=b)
+
+    outa = a.to_json()
+    outb = b.to_json()
+    outc = c.to_json()
+
+    assert json.loads(outc)  # is valid JSON
+    assert b != c
+    assert "baz" in outc
+
+    assert DummyTestFS.from_json(outa) is a
+    assert DummyTestFS.from_json(outb) is b
+    assert DummyTestFS.from_json(outc) is c
+
+
+def test_json_dict_attr():
+    a = DummyTestFS(1)
+    b = DummyTestFS(2, bar=Path("baz"))
+    c = DummyTestFS(3, baz={"key": b})
+
+    outa = a.to_json()
+    outb = b.to_json()
+    outc = c.to_json()
+
+    assert json.loads(outc)  # is valid JSON
+    assert b != c
+    assert "baz" in outc
+
+    assert DummyTestFS.from_json(outa) is a
+    assert DummyTestFS.from_json(outb) is b
+    assert DummyTestFS.from_json(outc) is c
+
+
+def test_dict():
+    a = DummyTestFS(1)
+    b = DummyTestFS(2, bar=1)
+
+    outa = a.to_dict()
+    outb = b.to_dict()
+
+    assert isinstance(outa, dict)
+    assert a != b
+    assert "bar" in outb
+
+    assert DummyTestFS.from_dict(outa) is a
+    assert DummyTestFS.from_dict(outb) is b
+
+
+def test_dict_path_attr():
+    a = DummyTestFS(1)
+    b = DummyTestFS(2, bar=Path("baz"))
+
+    outa = a.to_dict()
+    outb = b.to_dict()
+
+    assert isinstance(outa, dict)
+    assert a != b
+    assert outb["bar"]["str"] == "baz"
+
+    assert DummyTestFS.from_dict(outa) is a
+    assert DummyTestFS.from_dict(outb) is b
+
+
+def test_dict_fs_attr():
+    a = DummyTestFS(1)
+    b = DummyTestFS(2, bar=Path("baz"))
+    c = DummyTestFS(3, baz=b)
+
+    outa = a.to_dict()
+    outb = b.to_dict()
+    outc = c.to_dict()
+
+    assert isinstance(outc, dict)
+    assert b != c
+    assert outc["baz"] == outb
+
+    assert DummyTestFS.from_dict(outa) is a
+    assert DummyTestFS.from_dict(outb) is b
+    assert DummyTestFS.from_dict(outc) is c
+
+
+def test_dict_dict_attr():
+    a = DummyTestFS(1)
+    b = DummyTestFS(2, bar=Path("baz"))
+    c = DummyTestFS(3, baz={"key": b})
+
+    outa = a.to_dict()
+    outb = b.to_dict()
+    outc = c.to_dict()
+
+    assert isinstance(outc, dict)
+    assert b != c
+    assert outc["baz"]["key"] == outb
+
+    assert DummyTestFS.from_dict(outa) is a
+    assert DummyTestFS.from_dict(outb) is b
+    assert DummyTestFS.from_dict(outc) is c
+
+
+def test_dict_idempotent():
+    a = DummyTestFS(1)
+
+    outa = a.to_dict()
+
+    assert DummyTestFS.from_dict(outa) is a
+    assert DummyTestFS.from_dict(outa) is a
+
+
+def test_dict_json_serializable():
+    a = DummyTestFS(1)
+    b = DummyTestFS(2, bar=Path("baz"))
+    c = DummyTestFS(3, baz=b)
+
+    outa = a.to_dict()
+    outb = b.to_dict()
+    outc = c.to_dict()
+
+    json.dumps(outa)
+    json.dumps(outb)
+    json.dumps(outc)
+
+
+def test_serialize_no_password():
+    fs = DummyTestFS(1, password="admin")
+
+    assert "password" not in fs.to_json(include_password=False)
+    assert "password" not in fs.to_dict(include_password=False)
+
+
+def test_serialize_no_password_nested():
+    fs = DummyTestFS(2, fs=DummyTestFS(1, password="admin"))
+
+    assert "password" not in fs.to_json(include_password=False)
+    assert "password" not in fs.to_dict(include_password=False)["fs"]
+    assert fs.to_dict(include_password=True)["fs"]["password"] == "admin"
+
+
+def test_serialize_with_password():
+    fs = DummyTestFS(1, password="admin")
+
+    assert "password" in fs.to_json(include_password=True)
+    assert "password" in fs.to_dict(include_password=True)
+
+
+def test_from_dict_valid():
+    fs = DummyTestFS.from_dict({"cls": "fsspec.tests.test_spec.DummyTestFS"})
+    assert isinstance(fs, DummyTestFS)
+
+    fs = DummyTestFS.from_dict({"cls": "fsspec.tests.test_spec.DummyTestFS", "bar": 1})
+    assert fs.storage_options["bar"] == 1
+
+    fs = DummyTestFS.from_dict({"cls": "fsspec.implementations.local.LocalFileSystem"})
+    assert isinstance(fs, LocalFileSystem)
+
+    fs = DummyTestFS.from_dict(
+        {
+            "cls": "fsspec.implementations.local.LocalFileSystem",
+            "protocol": "local",
+        }
+    )
+    assert isinstance(fs, LocalFileSystem)
+
+
+def test_from_dict_invalid():
+    with pytest.raises(ValueError, match="Not a serialized AbstractFileSystem"):
+        DummyTestFS.from_dict({})
+
+    with pytest.raises(ValueError, match="Not a serialized AbstractFileSystem"):
+        DummyTestFS.from_dict({"cls": "pathlib.Path"})
+
+    with pytest.raises(ValueError, match="Not a serialized AbstractFileSystem"):
+        DummyTestFS.from_dict({"protocol": "local"})  # cls must be present
+
+
+def test_ls_from_cache():
+    fs = DummyTestFS()
+    uncached_results = fs.ls("top_level/second_level/", refresh=True)
+
+    assert fs.ls("top_level/second_level/", refresh=False) == uncached_results
+
+    # _strip_protocol removes everything by default though
+    # for the sake of testing the _ls_from_cache interface
+    # directly, we need run one time more without that call
+    # to actually verify that our stripping in the client
+    # function works.
+    assert (
+        fs.ls("top_level/second_level/", refresh=False, strip_proto=False)
+        == uncached_results
+    )
+
+
+def test_cat_file_empty_range(tmpdir):
+    """
+    A range that ends at or before its start is empty, exactly like a python
+    slice, so ``cat_file`` must return b"" rather than the rest of the file.
+    """
+    import zipfile
+
+    archive = os.path.join(str(tmpdir), "ar.zip")
+    with zipfile.ZipFile(archive, mode="w") as z:
+        z.writestr("member.txt", b"0123456789")
+
+    fs = fsspec.filesystem("zip", fo=archive)
+    data = b"0123456789"
+
+    # end at or before start
+    assert fs.cat_file("member.txt", 3, 0) == b""
+    assert fs.cat_file("member.txt", 8, 3) == b""
+    # a negative end that reaches back past the start of the file
+    assert fs.cat_file("member.txt", 0, -20) == b""
+    assert fs.cat_file("member.txt", 3, -20) == b""
+
+    # the documented slice semantics still apply
+    assert fs.cat_file("member.txt", 3, -2) == data[3:-2]
+    assert fs.cat_file("member.txt", -3, -1) == data[-3:-1]
+    assert fs.cat_file("member.txt", 3, 20) == data[3:20]
+
+    # the same holds for the public aliases of cat_file
+    assert fs.read_bytes("member.txt", 3, 0) == b""
+    assert fs.cat_ranges(["member.txt"], [3], [0]) == [b""]
+
+
+@pytest.mark.parametrize(
+    "dt",
+    [
+        np.int8,
+        np.int16,
+        np.int32,
+        np.int64,
+        np.uint8,
+        np.uint16,
+        np.uint32,
+        np.uint64,
+        np.float32,
+        np.float64,
+    ],
+)
+def test_readinto_with_numpy(tmpdir, dt):
+    store_path = str(tmpdir / "test_arr.npy")
+    arr = np.arange(10, dtype=dt)
+    arr.tofile(store_path)
+
+    arr2 = np.empty_like(arr)
+    with fsspec.open(store_path, "rb") as f:
+        f.readinto(arr2)
+
+    assert np.array_equal(arr, arr2)
+
+
+@pytest.mark.parametrize(
+    "dt",
+    [
+        np.int8,
+        np.int16,
+        np.int32,
+        np.int64,
+        np.uint8,
+        np.uint16,
+        np.uint32,
+        np.uint64,
+        np.float32,
+        np.float64,
+    ],
+)
+def test_readinto_with_multibyte(ftp_writable, tmpdir, dt):
+    host, port, user, pw = ftp_writable
+    ftp = FTPFileSystem(host=host, port=port, username=user, password=pw)
+
+    with ftp.open("/out", "wb") as fp:
+        arr = np.arange(10, dtype=dt)
+        fp.write(arr.tobytes())
+
+    with ftp.open("/out", "rb") as fp:
+        arr2 = np.empty_like(arr)
+        fp.readinto(arr2)
+
+    assert np.array_equal(arr, arr2)
+
+
+class DummyOpenFS(DummyTestFS):
+    blocksize = 10
+
+    def _open(self, path, mode="rb", **kwargs):
+        stream = open(path, mode)
+        stream.size = os.stat(path).st_size
+        return stream
+
+
+@pytest.mark.parametrize("target_exists", [False, True])
+@pytest.mark.parametrize("trailing_slash", ["", "/"])
+def test_get_top_level_directory(tmp_path, monkeypatch, target_exists, trailing_slash):
+    monkeypatch.chdir(tmp_path)
+    source = Path("src")
+    (source / "nested").mkdir(parents=True)
+    files = {"file": b"top-level", "nested/other": b"nested"}
+    contents = [
+        {"name": "src", "type": "directory", "size": 0},
+        {"name": "src/nested", "type": "directory", "size": 0},
+    ]
+    for name, payload in files.items():
+        (source / name).write_bytes(payload)
+        contents.append({"name": "src/" + name, "type": "file", "size": len(payload)})
+    fs = DummyOpenFS(fs_content=contents)
+    target = tmp_path / "target"
+    if target_exists:
+        target.mkdir()
+
+    fs.get("src" + trailing_slash, str(target), recursive=True)
+
+    prefix = "src/" if target_exists and not trailing_slash else ""
+    assert {
+        path.relative_to(target).as_posix(): path.read_bytes()
+        for path in target.rglob("*")
+        if path.is_file()
+    } == {prefix + name: payload for name, payload in files.items()}
+
+
+class BasicCallback(fsspec.Callback):
+    def __init__(self, **kwargs):
+        self.events = []
+        super().__init__(**kwargs)
+
+    def set_size(self, size):
+        self.events.append(("set_size", size))
+
+    def relative_update(self, inc=1):
+        self.events.append(("relative_update", inc))
+
+
+def imitate_transfer(size, chunk, *, file=True):
+    events = [("set_size", size)]
+    events.extend(("relative_update", size // chunk) for _ in range(chunk))
+    if file:
+        # The reason that there is a relative_update(0) at the
+        # end is that, we don't have an early exit on the
+        # implementations of get_file/put_file so it needs to
+        # go through the callback to get catch by the while's
+        # condition and then it will stop the transfer.
+        events.append(("relative_update", 0))
+
+    return events
+
+
+def get_files(tmpdir, amount=10):
+    src, dest, base = [], [], []
+    for index in range(amount):
+        src_path = tmpdir / f"src_{index}.txt"
+        src_path.write_text("x" * 50, "utf-8")
+
+        src.append(str(src_path))
+        dest.append(str(tmpdir / f"dst_{index}.txt"))
+        base.append(str(tmpdir / f"file_{index}.txt"))
+    return src, dest, base
+
+
+def test_dummy_callbacks_file(tmpdir):
+    fs = DummyOpenFS()
+    callback = BasicCallback()
+
+    file = tmpdir / "file.txt"
+    source = tmpdir / "tmp.txt"
+    destination = tmpdir / "tmp2.txt"
+
+    size = 100
+    source.write_text("x" * 100, "utf-8")
+
+    fs.put_file(source, file, callback=callback)
+
+    # -1 here since put_file no longer has final zero-size put
+    assert callback.events == imitate_transfer(size, 10)[:-1]
+    callback.events.clear()
+
+    fs.get_file(file, destination, callback=callback)
+    assert callback.events == imitate_transfer(size, 10)
+    callback.events.clear()
+
+    assert destination.read_text("utf-8") == "x" * 100
+
+
+@pytest.mark.parametrize("supply_lpath", [False, True])
+def test_get_file_to_supplied_outfile(tmpdir, supply_lpath):
+    fs = DummyOpenFS()
+    source = tmpdir / "source.txt"
+    source.write_text("data", "utf-8")
+    lpath = io.BytesIO()
+    outfile = io.BytesIO()
+    args = (lpath,) if supply_lpath else ()
+
+    fs.get_file(source, *args, outfile=outfile)
+
+    assert not outfile.closed
+    assert outfile.getvalue() == b"data"
+    assert lpath.getvalue() == b""
+
+
+def test_dummy_callbacks_files(tmpdir):
+    fs = DummyOpenFS()
+    callback = BasicCallback()
+    src, dest, base = get_files(tmpdir)
+
+    fs.put(src, base, callback=callback)
+    assert callback.events == imitate_transfer(10, 10, file=False)
+    callback.events.clear()
+
+    fs.get(base, dest, callback=callback)
+    assert callback.events == imitate_transfer(10, 10, file=False)
+
+
+class BranchableCallback(BasicCallback):
+    def __init__(self, source, dest=None, events=None, **kwargs):
+        super().__init__(**kwargs)
+        if dest:
+            self.key = source, dest
+        else:
+            self.key = (source,)
+        self.events = events or defaultdict(list)
+
+    def branch(self, path_1, path_2, kwargs):
+        from fsspec.implementations.local import make_path_posix
+
+        path_1 = make_path_posix(path_1)
+        path_2 = make_path_posix(path_2)
+        kwargs["callback"] = BranchableCallback(path_1, path_2, events=self.events)
+
+    def set_size(self, size):
+        self.events[self.key].append(("set_size", size))
+
+    def relative_update(self, inc=1):
+        self.events[self.key].append(("relative_update", inc))
+
+
+def test_dummy_callbacks_files_branched(tmpdir):
+    fs = DummyOpenFS()
+    src, dest, base = get_files(tmpdir)
+
+    callback = BranchableCallback("top-level")
+
+    def check_events(lpaths, rpaths):
+        from fsspec.implementations.local import make_path_posix
+
+        base_keys = zip(make_path_posix(lpaths), make_path_posix(rpaths))
+        assert set(callback.events.keys()) == {("top-level",), *base_keys}
+        assert callback.events["top-level",] == imitate_transfer(10, 10, file=False)
+
+        for key in base_keys:
+            assert callback.events[key] == imitate_transfer(50, 5)
+
+    fs.put(src, base, callback=callback)
+    check_events(src, base)
+    callback.events.clear()
+
+    fs.get(base, dest, callback=callback)
+    check_events(base, dest)
+    callback.events.clear()
+
+
+def _clean_paths(paths, prefix=""):
+    """
+    Helper to cleanup paths results by doing the following:
+      - remove the prefix provided from all paths
+      - remove the trailing slashes from all paths
+      - remove duplicates paths
+      - sort all paths
+    """
+    paths_list = paths
+    if isinstance(paths, dict):
+        paths_list = list(paths)
+    paths_list = [p.replace(prefix, "").strip("/") for p in sorted(set(paths_list))]
+    if isinstance(paths, dict):
+        return {p: paths[p] for p in paths_list}
+    return paths_list
+
+
+@pytest.fixture(scope="function")
+def glob_fs():
+    return DummyTestFS(fs_content=PATHS_FOR_GLOB_TESTS)
+
+
+@pytest.fixture(scope="function")
+def glob_files_folder(tmp_path):
+    local_fs = LocalFileSystem(auto_mkdir=True)
+    local_fake_dir = str(tmp_path)
+    for path_info in PATHS_FOR_GLOB_TESTS:
+        if path_info["type"] == "file":
+            local_fs.touch(path=f"{tmp_path}/{path_info['name']}")
+    return local_fake_dir
+
+
+@pytest.mark.skipif(
+    sys.platform.startswith("win"),
+    reason="no need to run python glob posix tests on windows",
+)
+@pytest.mark.parametrize(
+    GLOB_POSIX_TESTS["argnames"],
+    GLOB_POSIX_TESTS["argvalues"],
+)
+def test_posix_tests_python_glob(path, expected, glob_files_folder):
+    """
+    Tests against python glob to check if our posix tests are accurate.
+    """
+    os.chdir(glob_files_folder)
+
+    python_output = glob.glob(pathname=path, recursive=True)
+    assert _clean_paths(python_output, glob_files_folder) == _clean_paths(expected)
+
+
+@pytest.mark.skipif(
+    sys.platform.startswith("win"),
+    reason="no need to run bash stat posix tests on windows",
+)
+@pytest.mark.parametrize(
+    GLOB_POSIX_TESTS["argnames"],
+    GLOB_POSIX_TESTS["argvalues"],
+)
+def test_posix_tests_bash_stat(path, expected, glob_files_folder):
+    """
+    Tests against bash stat to check if our posix tests are accurate.
+    """
+    try:
+        subprocess.check_output(["bash", "-c", "shopt -s globstar"])
+    except FileNotFoundError:
+        pytest.skip("bash is not available")
+    except subprocess.CalledProcessError:
+        pytest.skip("globstar option is not available")
+
+    bash_path = (
+        path.replace("\\", "\\\\")
+        .replace("$", "\\$")
+        .replace("(", "\\(")
+        .replace(")", "\\)")
+        .replace("|", "\\|")
+    )
+    bash_output = subprocess.run(
+        [
+            "bash",
+            "-c",
+            f"cd {glob_files_folder} && shopt -s globstar && stat -c %N {bash_path}",
+        ],
+        capture_output=True,
+        check=False,
+    )
+    # Remove the last element always empty
+    bash_output = bash_output.stdout.decode("utf-8").replace("'", "").split("\n")[:-1]
+    assert _clean_paths(bash_output, glob_files_folder) == _clean_paths(expected)
+
+
+@pytest.mark.parametrize(
+    GLOB_POSIX_TESTS["argnames"],
+    GLOB_POSIX_TESTS["argvalues"],
+)
+def test_glob_posix_rules(path, expected, glob_fs):
+    output = glob_fs.glob(path=f"mock://{path}")
+    assert _clean_paths(output) == _clean_paths(expected)
+
+    detailed_output = glob_fs.glob(path=f"mock://{path}", detail=True)
+    for name, info in _clean_paths(detailed_output).items():
+        assert info == glob_fs[name]
+
+    withdirs_output = glob_fs.glob(path=f"mock://{path}", detail=True, withdirs=False)
+    path_output = _clean_paths(withdirs_output)
+    for name, info in path_output.items():
+        # withdirs only respected when path has magic
+        # otherwise glob returns the path regardless of the type of the path
+        if glob.has_magic(path):
+            assert info["type"] == "file"
+        assert info == glob_fs[name]
+
+
+@pytest.fixture(scope="function")
+def tmpfs(tmpdir):
+    get_files(tmpdir)
+
+    class CustomLocalFS(LocalFileSystem):
+        def ls(self, *args, **kwargs):
+            files = super().ls(*args, **kwargs)
+            limit = kwargs.pop("limit", None)
+
+            return files[:limit] if limit else files
+
+    return CustomLocalFS(auto_mkdir=True)
+
+
+def test_cat_wildcard_path_passthrough_kwargs_to_ls(tmpfs, tmpdir):
+    file_contents = tmpfs.cat(tmpdir / "*", limit=2)
+    assert len(file_contents) == 2
+
+
+@pytest.mark.parametrize("method", ["get", "copy"])
+def test_transfer_wildcard_path_passthrough_kwargs_to_ls(tmpfs, tmpdir, method):
+    dest = tmpdir / "dest"
+    getattr(tmpfs, method)(tmpdir / "*", str(dest), limit=2)
+    assert len(dest.listdir()) == 2
+
+
+def test_expand_path_wildcard_path_passthrough_kwargs_to_ls(tmpfs, tmpdir):
+    expanded_paths = tmpfs.expand_path(tmpdir / "*", limit=2)
+    assert len(expanded_paths) == 2
+
+
+@pytest.mark.parametrize(
+    "path,expected",
+    [
+        (
+            "bucket",
+            ["bucket", "bucket/file[1].txt", "bucket/file?.txt", "bucket/normal.txt"],
+        ),
+        ("bucket/file*.txt", ["bucket/file[1].txt", "bucket/file?.txt"]),
+    ],
+)
+def test_expand_path_special_characters(path, expected):
+    fs = DummyTestFS(
+        fs_content=(
+            {"name": "bucket", "type": "directory"},
+            {"name": "bucket/file[1].txt", "type": "file", "size": 100},
+            {"name": "bucket/file?.txt", "type": "file", "size": 100},
+            {"name": "bucket/normal.txt", "type": "file", "size": 100},
+        )
+    )
+    assert sorted(fs.expand_path(path, recursive=True)) == sorted(expected)
+
+
+def test_cat_ranges_forwards_kwargs():
+    # See GH#2016: cat_ranges must forward **kwargs to cat_file, otherwise
+    # parameters such as a cache's block_size are silently dropped.
+    received = []
+
+    class RecordingFS(AbstractFileSystem):
+        cachable = False
+
+        def cat_file(self, path, start=None, end=None, **kwargs):
+            received.append(kwargs)
+            return b""
+
+    fs = RecordingFS()
+    fs.cat_ranges(["a", "b"], [0, 0], [1, 1], block_size=42)
+
+    assert received == [{"block_size": 42}, {"block_size": 42}]
+
+
+class UnreadableSubdirFS(AbstractFileSystem):
+    """A tree in which the ``locked`` subdirectory cannot be listed."""
+
+    protocol = "unreadablesub"
+    cachable = False
+
+    tree = {
+        "": ["top"],
+        "top": ["top/readable", "top/locked"],
+        "top/readable": [],
+    }
+
+    def ls(self, path, detail=True, **kwargs):
+        path = self._strip_protocol(path).rstrip("/")
+        if path == "top/locked":
+            raise PermissionError("no access to top/locked")
+        entries = [
+            {"name": name, "type": "directory", "size": 0} for name in self.tree[path]
+        ]
+        return entries if detail else [entry["name"] for entry in entries]
+
+
+def test_walk_on_error_reaches_subdirectories():
+    # on_error is documented to apply to any path whose listing fails, not only
+    # to the one handed to walk(), so the recursive call has to forward it.
+    fs = UnreadableSubdirFS()
+
+    # the default, "omit", keeps skipping the unreadable directory
+    assert list(fs.walk("")) == [
+        ("", ["top"], []),
+        ("top", ["readable", "locked"], []),
+        ("top/readable", [], []),
+    ]
+
+    with pytest.raises(PermissionError, match="no access to top/locked"):
+        list(fs.walk("", on_error="raise"))
+
+    handled = []
+    assert list(fs.walk("", on_error=handled.append)) == [
+        ("", ["top"], []),
+        ("top", ["readable", "locked"], []),
+        ("top/readable", [], []),
+    ]
+    assert [str(exc) for exc in handled] == ["no access to top/locked"]

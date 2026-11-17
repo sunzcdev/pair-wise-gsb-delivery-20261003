@@ -1,0 +1,480 @@
+import io
+import secrets
+
+import pytest
+
+pyarrow_fs = pytest.importorskip("pyarrow.fs")
+FileSystem = pyarrow_fs.FileSystem
+
+from fsspec.implementations.arrow import ArrowFSWrapper, HadoopFileSystem  # noqa: E402
+
+
+@pytest.mark.parametrize("mode", ["rb", "wb"])
+def test_arrow_file_closed_state_follows_stream(tmp_path, mode):
+    path = tmp_path / "data"
+    path.write_bytes(b"data")
+    fs = ArrowFSWrapper(pyarrow_fs.LocalFileSystem())
+    with fs.open(str(path), mode) as file:
+        assert not file.closed
+    assert file.stream.closed
+    assert file.closed
+
+
+def test_arrow_file_flushes_buffered_writes(tmp_path):
+    import pyarrow as pa
+
+    from fsspec.implementations.arrow import ArrowFile
+
+    path = tmp_path / "buffered"
+    fs = ArrowFSWrapper(pyarrow_fs.LocalFileSystem())
+    stream = pa.output_stream(str(path), buffer_size=1024)
+    with ArrowFile(fs, stream, str(path), "wb") as file:
+        file.write(b"checkpoint")
+        assert path.read_bytes() == b""
+        file.flush()
+        assert path.read_bytes() == b"checkpoint"
+
+
+def test_arrow_file_reports_external_stream_close(tmp_path):
+    path = tmp_path / "data"
+    path.write_bytes(b"data")
+    fs = ArrowFSWrapper(pyarrow_fs.LocalFileSystem())
+    with fs.open(str(path), "rb") as file:
+        file.stream.close()
+        assert file.closed
+
+
+@pytest.fixture(scope="function")
+def fs():
+    fs, _ = FileSystem.from_uri("mock://")
+    return ArrowFSWrapper(fs)
+
+
+@pytest.fixture(scope="function", params=[False, True])
+def remote_dir(fs, request):
+    directory = secrets.token_hex(16)
+    fs.makedirs(directory)
+    yield ("hdfs://" if request.param else "/") + directory
+    fs.rm(directory, recursive=True)
+
+
+@pytest.mark.parametrize("host, port", [("default", 0), ("namenode", 8020)])
+def test_hadoop_fsid(monkeypatch, host, port):
+    monkeypatch.setattr(
+        pyarrow_fs, "HadoopFileSystem", lambda **kwargs: pyarrow_fs.LocalFileSystem()
+    )
+    first = HadoopFileSystem(
+        host=host, port=port, user="alice", skip_instance_cache=True
+    )
+    second = HadoopFileSystem(
+        host=host, port=port, user="bob", skip_instance_cache=True
+    )
+
+    assert first.fsid.startswith("hdfs_")
+    assert first.fsid == second.fsid
+    assert (
+        first.fsid
+        != HadoopFileSystem(host=host, port=port + 1, skip_instance_cache=True).fsid
+    )
+    assert (
+        first.fsid
+        != HadoopFileSystem(host="other", port=port, skip_instance_cache=True).fsid
+    )
+
+
+def test_hadoop_fsid_default_endpoint(monkeypatch):
+    monkeypatch.setattr(
+        pyarrow_fs, "HadoopFileSystem", lambda **kwargs: pyarrow_fs.LocalFileSystem()
+    )
+
+    assert (
+        HadoopFileSystem(skip_instance_cache=True).fsid
+        == HadoopFileSystem(host="default", port=0, skip_instance_cache=True).fsid
+    )
+
+
+def test_protocol():
+    fs, _ = FileSystem.from_uri("mock://")
+    fss = ArrowFSWrapper(fs)
+    assert fss.protocol == "mock"
+
+
+@pytest.mark.parametrize("type_name", ["gcs", "s3"])
+def test_object_store_parent_has_no_leading_slash(type_name):
+    class ObjectStoreFileSystem:
+        def __init__(self, type_name):
+            self.type_name = type_name
+
+        def create_dir(self, path, recursive):
+            self.created_path = path
+
+    backend = ObjectStoreFileSystem(type_name)
+    fs = ArrowFSWrapper(backend, skip_instance_cache=True)
+    fs.makedirs(fs._parent("bucket/path/file"))
+
+    assert backend.created_path == "bucket/path"
+    assert fs.root_marker == ""
+
+
+def strip_keys(original_entry):
+    entry = original_entry.copy()
+    entry.pop("mtime")
+    return entry
+
+
+def test_strip(fs):
+    assert fs._strip_protocol("/a/file") == "/a/file"
+    assert fs._strip_protocol("hdfs:///a/file") == "/a/file"
+    assert fs._strip_protocol("hdfs://1.1.1.1/a/file") == "/a/file"
+    assert fs._strip_protocol("hdfs://1.1.1.1:8888/a/file") == "/a/file"
+
+
+def test_info(fs, remote_dir):
+    fs.touch(remote_dir + "/a.txt")
+    remote_dir_strip_protocol = fs._strip_protocol(remote_dir)
+    details = fs.info(remote_dir + "/a.txt")
+    assert details["type"] == "file"
+    assert details["name"] == remote_dir_strip_protocol + "/a.txt"
+    assert details["size"] == 0
+
+    fs.mkdir(remote_dir + "/dir")
+    details = fs.info(remote_dir + "/dir")
+    assert details["type"] == "directory"
+    assert details["name"] == remote_dir_strip_protocol + "/dir"
+
+    details = fs.info(remote_dir + "/dir/")
+    assert details["name"] == remote_dir_strip_protocol + "/dir/"
+
+
+def test_move(fs, remote_dir):
+    fs.touch(remote_dir + "/a.txt")
+    initial_info = fs.info(remote_dir + "/a.txt")
+
+    fs.move(remote_dir + "/a.txt", remote_dir + "/b.txt")
+    secondary_info = fs.info(remote_dir + "/b.txt")
+
+    assert not fs.exists(remote_dir + "/a.txt")
+    assert fs.exists(remote_dir + "/b.txt")
+
+    initial_info.pop("name")
+    secondary_info.pop("name")
+    assert initial_info == secondary_info
+
+
+def test_move_recursive(fs, remote_dir):
+    src = remote_dir + "/src"
+    dest = remote_dir + "/dest"
+
+    assert fs.isdir(src) is False
+    fs.mkdir(src)
+    assert fs.isdir(src)
+
+    fs.touch(src + "/a.txt")
+    fs.mkdir(src + "/b")
+    fs.touch(src + "/b/c.txt")
+    fs.move(src, dest, recursive=True)
+
+    assert fs.isdir(src) is False
+    assert not fs.exists(src)
+
+    assert fs.isdir(dest)
+    assert fs.exists(dest)
+    assert fs.cat(dest + "/b/c.txt") == fs.cat(dest + "/a.txt") == b""
+
+
+def test_copy(fs, remote_dir):
+    fs.touch(remote_dir + "/a.txt")
+    initial_info = fs.info(remote_dir + "/a.txt")
+
+    fs.copy(remote_dir + "/a.txt", remote_dir + "/b.txt")
+    secondary_info = fs.info(remote_dir + "/b.txt")
+
+    assert fs.exists(remote_dir + "/a.txt")
+    assert fs.exists(remote_dir + "/b.txt")
+
+    initial_info.pop("name")
+    secondary_info.pop("name")
+    assert strip_keys(initial_info) == strip_keys(secondary_info)
+
+
+def test_rm(fs, remote_dir):
+    fs.touch(remote_dir + "/a.txt")
+    fs.rm(remote_dir + "/a.txt", recursive=True)
+    assert not fs.exists(remote_dir + "/a.txt")
+
+    fs.mkdir(remote_dir + "/dir")
+    fs.rm(remote_dir + "/dir", recursive=True)
+    assert not fs.exists(remote_dir + "/dir")
+
+    fs.mkdir(remote_dir + "/dir")
+    fs.touch(remote_dir + "/dir/a")
+    fs.touch(remote_dir + "/dir/b")
+    fs.mkdir(remote_dir + "/dir/c/")
+    fs.touch(remote_dir + "/dir/c/a")
+    fs.rm(remote_dir + "/dir", recursive=True)
+    assert not fs.exists(remote_dir + "/dir")
+
+
+def test_ls(fs, remote_dir):
+    if remote_dir != "/":
+        remote_dir = remote_dir + "/"
+    remote_dir_strip_protocol = fs._strip_protocol(remote_dir)
+    fs.mkdir(remote_dir + "dir/")
+    files = set()
+    for no in range(8):
+        file = remote_dir + f"dir/test_{no}"
+        # we also want to make sure `fs.touch` works with protocol
+        fs.touch(file)
+        files.add(remote_dir_strip_protocol + f"dir/test_{no}")
+
+    assert set(fs.ls(remote_dir + "dir/")) == files
+
+    dirs = fs.ls(remote_dir + "dir/", detail=True)
+    expected = [fs.info(file) for file in files]
+
+    by_name = lambda details: details["name"]
+    dirs.sort(key=by_name)
+    expected.sort(key=by_name)
+
+    assert dirs == expected
+
+
+def test_ls_one(fs, remote_dir):
+    if remote_dir != "/":
+        remote_dir = remote_dir + "/"
+    fs.mkdir(remote_dir + "dir/")
+    file = remote_dir + "dir/test_one"
+    fs.touch(file)
+
+    out = fs.ls(file, detail=True)
+    assert out[0] == fs.info(file)
+
+
+def test_mkdir(fs, remote_dir):
+    if remote_dir != "/":
+        remote_dir = remote_dir + "/"
+    fs.mkdir(remote_dir + "dir/")
+    assert fs.isdir(remote_dir + "dir/")
+    assert len(fs.ls(remote_dir + "dir/")) == 0
+
+    fs.mkdir(remote_dir + "dir/sub", create_parents=False)
+    assert fs.isdir(remote_dir + "dir/sub")
+
+
+def test_makedirs(fs, remote_dir):
+    fs.makedirs(remote_dir + "dir/a/b/c/")
+    assert fs.isdir(remote_dir + "dir/a/b/c/")
+    assert fs.isdir(remote_dir + "dir/a/b/")
+    assert fs.isdir(remote_dir + "dir/a/")
+
+    fs.makedirs(remote_dir + "dir/a/b/c/", exist_ok=True)
+
+
+def test_exceptions(fs, remote_dir):
+    with pytest.raises(FileNotFoundError):
+        with fs.open(remote_dir + "/a.txt"):
+            ...
+
+    with pytest.raises(FileNotFoundError):
+        fs.copy(remote_dir + "/u.txt", remote_dir + "/y.txt")
+
+
+def test_open_rw(fs, remote_dir):
+    data = b"dvc.org"
+
+    with fs.open(remote_dir + "/a.txt", "wb") as stream:
+        stream.write(data)
+
+    with fs.open(remote_dir + "/a.txt") as stream:
+        assert stream.read() == data
+
+
+def test_open_rw_flush(fs, remote_dir):
+    data = b"dvc.org"
+
+    with fs.open(remote_dir + "/b.txt", "wb") as stream:
+        for _ in range(200):
+            stream.write(data)
+            stream.write(data)
+            stream.flush()
+
+    with fs.open(remote_dir + "/b.txt", "rb") as stream:
+        assert stream.read() == data * 400
+
+
+def test_open_append(fs, remote_dir):
+    data = b"dvc.org"
+
+    with fs.open(remote_dir + "/a.txt", "wb") as stream:
+        stream.write(data)
+
+    with fs.open(remote_dir + "/a.txt", "ab") as stream:
+        stream.write(data)
+
+    with fs.open(remote_dir + "/a.txt") as stream:
+        assert stream.read() == 2 * data
+
+
+def test_open_seekable(fs, remote_dir):
+    data = b"dvc.org"
+
+    with fs.open(remote_dir + "/a.txt", "wb") as stream:
+        stream.write(data)
+
+    with fs.open(remote_dir + "/a.txt", "rb", seekable=True) as file:
+        file.seek(2)
+        assert file.read() == data[2:]
+
+
+def test_seekable(fs, remote_dir):
+    data = b"dvc.org"
+
+    with fs.open(remote_dir + "/a.txt", "wb") as stream:
+        stream.write(data)
+
+    for seekable in [True, False]:
+        with fs.open(remote_dir + "/a.txt", "rb", seekable=seekable) as file:
+            assert file.seekable() == seekable
+            assert file.read() == data
+
+    with fs.open(remote_dir + "/a.txt", "rb", seekable=False) as file:
+        with pytest.raises(OSError):
+            file.seek(5)
+
+
+def test_readinto(fs, remote_dir):
+    data = b"dvc.org"
+
+    with fs.open(remote_dir + "/a.txt", "wb") as stream:
+        stream.write(data)
+
+    for seekable in [True, False]:
+        with fs.open(remote_dir + "/a.txt", "rb", seekable=seekable) as file:
+            buffer = bytearray(3)
+            assert file.readinto(buffer) == 3
+            assert bytes(buffer) == data[:3]
+
+
+@pytest.mark.parametrize(
+    "read",
+    [
+        lambda buffered: buffered.read(3),
+        lambda buffered: buffered.peek(3)[:3],
+        lambda buffered: buffered.read1(3),
+    ],
+    ids=["read", "peek", "read1"],
+)
+def test_readinto_supports_a_buffered_reader(fs, remote_dir, read):
+    # Each of these fills a buffer io.BufferedReader owns, so they go through
+    # readinto rather than read(); an unsized read() does not. A gzip reader takes
+    # the peek()/read1() path.
+    data = b"dvc.org"
+
+    with fs.open(remote_dir + "/a.txt", "wb") as stream:
+        stream.write(data)
+
+    with fs.open(remote_dir + "/a.txt", "rb") as file:
+        assert read(io.BufferedReader(file)) == data[:3]
+
+
+def test_get_kwargs_from_urls_hadoop_fs():
+    kwargs = HadoopFileSystem._get_kwargs_from_urls(
+        "hdfs://user@localhost:8020/?replication=2"
+    )
+    assert kwargs["user"] == "user"
+    assert kwargs["host"] == "localhost"
+    assert kwargs["port"] == 8020
+    assert kwargs["replication"] == 2
+
+    kwargs = HadoopFileSystem._get_kwargs_from_urls("hdfs://user@localhost:8020/")
+    assert kwargs["user"] == "user"
+    assert kwargs["host"] == "localhost"
+    assert kwargs["port"] == 8020
+    assert "replication" not in kwargs
+
+
+def test_get_file_seekable_default(fs, remote_dir, tmp_path):
+    """Test that get_file defaults to seekable=False but allows override."""
+    data = b"test data for seekable"
+
+    # Create a test file
+    with fs.open(remote_dir + "/test_file.txt", "wb") as f:
+        f.write(data)
+
+    # Test default behavior (seekable=False)
+    local_file = tmp_path / "test_default.txt"
+    fs.get_file(remote_dir + "/test_file.txt", str(local_file))
+    with open(local_file, "rb") as f:
+        assert f.read() == data
+
+    # Test with explicit seekable=True
+    local_file_seekable = tmp_path / "test_seekable.txt"
+    fs.get_file(remote_dir + "/test_file.txt", str(local_file_seekable), seekable=True)
+    with open(local_file_seekable, "rb") as f:
+        assert f.read() == data
+
+    # Test with explicit seekable=False
+    local_file_not_seekable = tmp_path / "test_not_seekable.txt"
+    fs.get_file(
+        remote_dir + "/test_file.txt", str(local_file_not_seekable), seekable=False
+    )
+    with open(local_file_not_seekable, "rb") as f:
+        assert f.read() == data
+
+
+def test_cat_file_seekable_override(fs, remote_dir):
+    """Test that cat_file allows seekable to be overridden."""
+    data = b"test data for cat_file seekable"
+
+    # Create a test file
+    with fs.open(remote_dir + "/test_cat.txt", "wb") as f:
+        f.write(data)
+
+    # Test default behavior - when start is None, seekable should default to False
+    result = fs.cat_file(remote_dir + "/test_cat.txt")
+    assert result == data
+
+    # Test with explicit seekable=True even when start is None
+    result = fs.cat_file(remote_dir + "/test_cat.txt", seekable=True)
+    assert result == data
+
+    # Test with explicit seekable=False
+    result = fs.cat_file(remote_dir + "/test_cat.txt", seekable=False)
+    assert result == data
+
+
+def test_seekable_true_allows_size_method(fs, remote_dir):
+    """Test that size() method works when seekable=True."""
+    data = b"test data for size method" * 10
+
+    # Create a test file
+    test_file = remote_dir + "/test_size.txt"
+    with fs.open(test_file, "wb") as f:
+        f.write(data)
+
+    # Open with seekable=True - size() should work
+    with fs.open(test_file, "rb", seekable=True) as f:
+        assert f.seekable() is True
+        # Verify size() method works and returns correct size
+        file_size = f.size
+        assert file_size == len(data)
+        # Also verify we can read the data
+        assert f.read() == data
+
+
+def test_seekable_false_prevents_size_method(fs, remote_dir):
+    """Test that size() method returns None when seekable=False."""
+    data = b"test data for size method" * 10
+
+    # Create a test file
+    test_file = remote_dir + "/test_size.txt"
+    with fs.open(test_file, "wb") as f:
+        f.write(data)
+
+    # Open with seekable=False - size() should raise OSError
+    with fs.open(test_file, "rb", seekable=False) as f:
+        assert f.seekable() is False
+        # Verify size() returns None
+        assert f.size is None
+        # Verify we can still read the data
+        assert f.read() == data

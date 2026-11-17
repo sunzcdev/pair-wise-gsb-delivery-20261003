@@ -1,0 +1,186 @@
+import os
+import subprocess
+
+import pytest
+
+import fsspec
+from fsspec.implementations.local import make_path_posix
+
+pygit2 = pytest.importorskip("pygit2")
+
+
+@pytest.fixture()
+def repo(tmp_path):
+    orig_dir = os.getcwd()
+    d = str(tmp_path.resolve())
+    try:
+        os.chdir(d)
+        subprocess.call("git init -b master", shell=True, cwd=d)
+        subprocess.call("git init -b master", shell=True, cwd=d)
+        subprocess.call('git config user.email "you@example.com"', shell=True, cwd=d)
+        subprocess.call('git config user.name "Your Name"', shell=True, cwd=d)
+        open(os.path.join(d, "file1"), "wb").write(b"data0")
+        subprocess.call("git add file1", shell=True, cwd=d)
+        subprocess.call('git commit -m "init"', shell=True, cwd=d)
+        sha = open(os.path.join(d, ".git/refs/heads/master"), "r").read().strip()
+        open(os.path.join(d, "file1"), "wb").write(b"data00")
+        subprocess.check_output('git commit -a -m "tagger"', shell=True, cwd=d)
+        subprocess.call('git tag -a thetag -m "make tag"', shell=True, cwd=d)
+        open(os.path.join(d, "file2"), "wb").write(b"data000")
+        subprocess.call("git add file2", shell=True)
+        subprocess.call('git commit -m "master tip"', shell=True, cwd=d)
+        subprocess.call("git checkout -b abranch", shell=True, cwd=d)
+        os.mkdir("inner")
+        open(os.path.join(d, "inner", "file1"), "wb").write(b"data3")
+        subprocess.call("git add inner/file1", shell=True, cwd=d)
+        subprocess.call('git commit -m "branch tip"', shell=True, cwd=d)
+        os.chdir(orig_dir)
+        yield d, sha
+    finally:
+        os.chdir(orig_dir)
+
+
+@pytest.mark.parametrize("prefix", ["", "git://"])
+@pytest.mark.parametrize("ref", [None, "master"])
+@pytest.mark.parametrize(
+    "path",
+    ["/repo", "relative/repo", "C:/repo", r"D:\repo", "//server/share/repo"],
+)
+def test_url_components(prefix, ref, path):
+    cls = fsspec.get_filesystem_class("git")
+    url = f"{prefix}{path}:{ref + '@' if ref else ''}inner/file1"
+    expected = {"path": path}
+    if ref:
+        expected["ref"] = ref
+
+    assert cls._get_kwargs_from_urls(url) == expected
+    assert cls._strip_protocol(url) == "inner/file1"
+
+
+def test_refs(repo):
+    d, sha = repo
+    with fsspec.open("git://file1", path=d, ref=sha) as f:
+        assert f.read() == b"data0"
+
+    with fsspec.open("git://file1", path=d, ref="thetag") as f:
+        assert f.read() == b"data00"
+
+    with fsspec.open("git://file2", path=d, ref="master") as f:
+        assert f.read() == b"data000"
+
+    with fsspec.open("git://file2", path=d, ref=None) as f:
+        assert f.read() == b"data000"
+
+    with fsspec.open("git://inner/file1", path=d, ref="abranch") as f:
+        assert f.read() == b"data3"
+
+
+def _check_FileNotFoundError(f, *args, **kwargs):
+    with pytest.raises(FileNotFoundError):
+        f(*args, **kwargs)
+
+
+def test_file_existence_checks(repo):
+    d, sha = repo
+
+    fs, _ = fsspec.url_to_fs(f"git://{d}:abranch@")
+
+    assert fs.lexists("inner")
+    assert fs.exists("inner")
+    assert fs.isdir("inner")
+    assert fs.info("inner")
+    assert fs.ls("inner")
+
+    assert fs.lexists("inner/file1")
+    assert fs.exists("inner/file1")
+    assert fs.info("inner/file1")
+    assert fs.ls("inner/file1")
+
+    assert not fs.lexists("non-existing-file")
+    assert not fs.exists("non-existing-file")
+
+    assert not fs.isfile("non-existing-file")
+    assert not fs.isdir("non-existing-file")
+
+    _check_FileNotFoundError(fs.info, "non-existing-file")
+    _check_FileNotFoundError(fs.size, "non-existing-file")
+    _check_FileNotFoundError(fs.ls, "non-existing-file")
+    _check_FileNotFoundError(fs.open, "non-existing-file")
+
+
+def test_url(repo):
+    d, sha = repo
+    fs, _, paths = fsspec.core.get_fs_token_paths(f"git://file1::file://{d}")
+    assert make_path_posix(d) in make_path_posix(fs.repo.path)
+    assert paths == ["file1"]
+    with fsspec.open(f"git://file1::file://{d}") as f:
+        assert f.read() == b"data00"
+
+    fs, _, paths = fsspec.core.get_fs_token_paths(f"git://{d}:master@file1")
+    assert make_path_posix(d) in make_path_posix(fs.repo.path)
+    assert paths == ["file1"]
+    with fsspec.open(f"git://{d}:master@file1") as f:
+        assert f.read() == b"data00"
+
+    with fsspec.open(f"git://{d}:file1") as f:
+        assert f.read() == b"data00"
+
+
+@pytest.mark.parametrize("path", ["file1/child", "inner/file1/child", "file1//child"])
+def test_path_below_file_is_missing(repo, path):
+    fs = fsspec.filesystem("git", path=repo[0], ref="abranch")
+    assert not fs.exists(path)
+    assert not fs.isfile(path)
+    for method in (fs.info, fs.ls, fs.open):
+        with pytest.raises(FileNotFoundError):
+            method(path)
+    assert fs.cat_file("inner/file1") == b"data3"
+
+
+@pytest.mark.parametrize("path", ["file1", "inner/file1"])
+@pytest.mark.parametrize("prefix", ["", "/", "git://"])
+@pytest.mark.parametrize("suffix", ["", "/"])
+def test_file_metadata_path(repo, path, prefix, suffix):
+    fs = fsspec.filesystem("git", path=repo[0], ref="abranch")
+    requested = prefix + path + suffix
+    info = fs.info(requested)
+    assert info["name"] == path
+    assert fs.ls(requested) == [info]
+    assert fs.ls(requested, detail=False) == [path]
+    assert fs.cat_file(info["name"]) == fs.cat_file(requested)
+
+
+@pytest.mark.parametrize("path", ["inner", "inner/", "/inner", "git://inner/"])
+def test_directory_metadata_path(repo, path):
+    fs = fsspec.filesystem("git", path=repo[0], ref="abranch")
+    assert fs.info(path)["name"] == "inner"
+    assert fs.info(path)["type"] == "directory"
+    assert fs.ls(path, detail=False) == ["inner/file1"]
+    assert fs.ls(path)[0] == fs.info("inner/file1")
+    assert fs.info("")["name"] == ""
+    assert fs.ls("", detail=False) == ["file1", "file2", "inner"]
+
+
+def test_special_objects_are_not_directories(repo):
+    git_repo = pygit2.Repository(repo[0])
+    parent = git_repo.revparse_single("abranch")
+    builder = git_repo.TreeBuilder(parent.tree)
+    builder.insert(
+        "link", git_repo.create_blob(b"inner/file1"), pygit2.GIT_FILEMODE_LINK
+    )
+    builder.insert("submodule", parent.id, pygit2.GIT_FILEMODE_COMMIT)
+    signature = pygit2.Signature("Test", "test@example.com")
+    git_repo.create_commit(
+        "refs/heads/abranch",
+        signature,
+        signature,
+        "special objects",
+        builder.write(),
+        [parent.id],
+    )
+    fs = fsspec.filesystem("git", path=repo[0], ref="abranch")
+    assert fs.cat_file("link") == b"inner/file1"
+    assert fs.info("link")["mode"] == "120000"
+    for path in ("link/child", "submodule/file1"):
+        with pytest.raises(FileNotFoundError):
+            fs.open(path)

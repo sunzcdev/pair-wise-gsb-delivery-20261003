@@ -1,0 +1,964 @@
+import io
+import os
+import random
+import re
+import sys
+import time
+from contextlib import nullcontext
+from pathlib import Path, PurePath
+from unittest.mock import Mock
+
+import pytest
+
+import fsspec.utils
+from fsspec.utils import (
+    build_name_function,
+    can_be_local,
+    check_contained,
+    common_prefix,
+    get_file_extension,
+    get_protocol,
+    glob_translate,
+    infer_storage_options,
+    merge_offset_ranges,
+    mirror_from,
+    other_paths,
+    parse_content_range_header,
+    range_response_window,
+    read_block,
+    seek_delimiter,
+    setup_logging,
+)
+
+WIN = sys.platform.startswith("win")
+
+
+@pytest.mark.parametrize(
+    "maximum", [0, 1, 9, 10, 1000, 10**7, 10**8, 10**16, 10**20, 1e8, 999.5]
+)
+def test_build_name_function_preserves_numeric_order(maximum):
+    name = build_name_function(maximum)
+    largest = int(maximum)
+    indices = sorted({0, largest // 2, largest})
+    names = [name(i) for i in indices]
+
+    assert names == sorted(names)
+    assert len({len(value) for value in names}) == 1
+
+
+@pytest.mark.parametrize("maximum", [-1, -100])
+def test_build_name_function_rejects_negative_maximum(maximum):
+    with pytest.raises(ValueError):
+        build_name_function(maximum)
+
+
+def test_read_block():
+    delimiter = b"\n"
+    data = delimiter.join([b"123", b"456", b"789"])
+    f = io.BytesIO(data)
+
+    assert read_block(f, 1, 2) == b"23"
+    assert read_block(f, 0, 1, delimiter=b"\n") == b"123\n"
+    assert read_block(f, 0, 2, delimiter=b"\n") == b"123\n"
+    assert read_block(f, 0, 3, delimiter=b"\n") == b"123\n"
+    assert read_block(f, 0, 5, delimiter=b"\n") == b"123\n456\n"
+    assert read_block(f, 0, 8, delimiter=b"\n") == b"123\n456\n789"
+    assert read_block(f, 0, 100, delimiter=b"\n") == b"123\n456\n789"
+    assert read_block(f, 1, 1, delimiter=b"\n") == b""
+    assert read_block(f, 1, 5, delimiter=b"\n") == b"456\n"
+    assert read_block(f, 1, 8, delimiter=b"\n") == b"456\n789"
+    assert read_block(f, 1, None, delimiter=b"\n") == b"456\n789"
+
+    for ols in [[(0, 3), (3, 3), (6, 3), (9, 2)], [(0, 4), (4, 4), (8, 4)]]:
+        out = [read_block(f, o, l, b"\n") for o, l in ols]
+        assert b"".join(filter(None, out)) == data
+
+
+@pytest.mark.parametrize("offset", [0, 1, 11, 12])
+@pytest.mark.parametrize("length", [None, 0, 100])
+@pytest.mark.parametrize("on_disk", [False, True])
+def test_read_block_without_delimiter_to_end(tmp_path, offset, length, on_disk):
+    data = b"123\n456\n789"
+    if on_disk:
+        path = tmp_path / "data"
+        path.write_bytes(data)
+        stream = path.open("rb")
+    else:
+        stream = io.BytesIO(data)
+    with stream:
+        expected = data[offset:] if length is None else data[offset : offset + length]
+        assert read_block(stream, offset, length) == expected
+
+
+@pytest.mark.parametrize("protocol", ["file", "memory"])
+@pytest.mark.parametrize("offset", [1, 3, 4, 5])
+@pytest.mark.parametrize("length", [None, 1])
+@pytest.mark.parametrize("delimiter", [None, b"\n"])
+def test_filesystem_read_block_at_or_past_eof(
+    tmp_path, protocol, offset, length, delimiter
+):
+    fs = fsspec.filesystem(protocol)
+    path = str(tmp_path / "data")
+    fs.pipe_file(path, b"abc")
+    try:
+        expected = (
+            b"" if offset >= 3 or delimiter else b"bc" if length is None else b"b"
+        )
+        assert fs.read_block(path, offset, length, delimiter) == expected
+    finally:
+        fs.rm(path)
+
+
+def test_read_block_split_before():
+    """Test start/middle/end cases of split_before."""
+    d = ("#header" + "".join(f">foo{i}\nFOOBAR{i}\n" for i in range(100000))).encode()
+
+    # Read single record at beginning.
+    # All reads include beginning of file and read through termination of
+    # delimited record.
+    assert read_block(io.BytesIO(d), 0, 10, delimiter=b"\n") == b"#header>foo0\n"
+    assert (
+        read_block(io.BytesIO(d), 0, 10, delimiter=b"\n", split_before=True)
+        == b"#header>foo0"
+    )
+    assert (
+        read_block(io.BytesIO(d), 0, 10, delimiter=b">") == b"#header>foo0\nFOOBAR0\n>"
+    )
+    assert (
+        read_block(io.BytesIO(d), 0, 10, delimiter=b">", split_before=True)
+        == b"#header>foo0\nFOOBAR0\n"
+    )
+
+    # Read multiple records at beginning.
+    # All reads include beginning of file and read through termination of
+    # delimited record.
+    assert (
+        read_block(io.BytesIO(d), 0, 27, delimiter=b"\n")
+        == b"#header>foo0\nFOOBAR0\n>foo1\nFOOBAR1\n"
+    )
+    assert (
+        read_block(io.BytesIO(d), 0, 27, delimiter=b"\n", split_before=True)
+        == b"#header>foo0\nFOOBAR0\n>foo1\nFOOBAR1"
+    )
+    assert (
+        read_block(io.BytesIO(d), 0, 27, delimiter=b">")
+        == b"#header>foo0\nFOOBAR0\n>foo1\nFOOBAR1\n>"
+    )
+    assert (
+        read_block(io.BytesIO(d), 0, 27, delimiter=b">", split_before=True)
+        == b"#header>foo0\nFOOBAR0\n>foo1\nFOOBAR1\n"
+    )
+
+    # Read with offset spanning into next record, splits on either side of delimiter.
+    # Read not spanning the full record returns nothing.
+    assert read_block(io.BytesIO(d), 10, 3, delimiter=b"\n") == b"FOOBAR0\n"
+    assert (
+        read_block(io.BytesIO(d), 10, 3, delimiter=b"\n", split_before=True)
+        == b"\nFOOBAR0"
+    )
+    assert read_block(io.BytesIO(d), 10, 3, delimiter=b">") == b""
+    assert read_block(io.BytesIO(d), 10, 3, delimiter=b">", split_before=True) == b""
+
+    # Read with offset spanning multiple records, splits on either side of delimiter
+    assert (
+        read_block(io.BytesIO(d), 10, 20, delimiter=b"\n")
+        == b"FOOBAR0\n>foo1\nFOOBAR1\n"
+    )
+    assert (
+        read_block(io.BytesIO(d), 10, 20, delimiter=b"\n", split_before=True)
+        == b"\nFOOBAR0\n>foo1\nFOOBAR1"
+    )
+    assert read_block(io.BytesIO(d), 10, 20, delimiter=b">") == b"foo1\nFOOBAR1\n>"
+    assert (
+        read_block(io.BytesIO(d), 10, 20, delimiter=b">", split_before=True)
+        == b">foo1\nFOOBAR1\n"
+    )
+
+    # Read record at end, all records read to end
+
+    tlen = len(d)
+
+    assert (
+        read_block(io.BytesIO(d), tlen - 30, 35, delimiter=b"\n")
+        == b">foo99999\nFOOBAR99999\n"
+    )
+
+    assert (
+        read_block(io.BytesIO(d), tlen - 30, 35, delimiter=b"\n", split_before=True)
+        == b"\n>foo99999\nFOOBAR99999\n"
+    )
+
+    assert (
+        read_block(io.BytesIO(d), tlen - 30, 35, delimiter=b">")
+        == b"foo99999\nFOOBAR99999\n"
+    )
+
+    assert (
+        read_block(io.BytesIO(d), tlen - 30, 35, delimiter=b">", split_before=True)
+        == b">foo99999\nFOOBAR99999\n"
+    )
+
+
+@pytest.mark.parametrize("split_before", [False, True])
+def test_read_block_split_before_to_end(split_before):
+    data = b"123\n456\n789"
+    f = io.BytesIO(data)
+
+    expected = b"\n456\n789" if split_before else b"456\n789"
+    assert read_block(f, 1, None, b"\n", split_before) == expected
+    assert read_block(f, 1, len(data), b"\n", split_before) == expected
+    assert read_block(f, 0, None, b"\n", split_before) == data
+
+
+def test_seek_delimiter_endline():
+    f = io.BytesIO(b"123\n456\n789")
+
+    # if at zero, stay at zero
+    seek_delimiter(f, b"\n", 5)
+    assert f.tell() == 0
+
+    # choose the first block
+    for bs in [1, 5, 100]:
+        f.seek(1)
+        seek_delimiter(f, b"\n", blocksize=bs)
+        assert f.tell() == 4
+
+    # handle long delimiters well, even with short blocksizes
+    f = io.BytesIO(b"123abc456abc789")
+    for bs in [1, 2, 3, 4, 5, 6, 10]:
+        f.seek(1)
+        seek_delimiter(f, b"abc", blocksize=bs)
+        assert f.tell() == 6
+
+    # End at the end
+    f = io.BytesIO(b"123\n456")
+    f.seek(5)
+    seek_delimiter(f, b"\n", 5)
+    assert f.tell() == 7
+
+
+def test_infer_options():
+    so = infer_storage_options("/mnt/datasets/test.csv")
+    assert so.pop("protocol") == "file"
+    assert so.pop("path") == "/mnt/datasets/test.csv"
+    assert not so
+
+    assert infer_storage_options("./test.csv")["path"] == "./test.csv"
+    assert infer_storage_options("../test.csv")["path"] == "../test.csv"
+
+    so = infer_storage_options("C:\\test.csv")
+    assert so.pop("protocol") == "file"
+    assert so.pop("path") == "C:\\test.csv"
+    assert not so
+
+    assert infer_storage_options("d:\\test.csv")["path"] == "d:\\test.csv"
+    assert infer_storage_options("\\test.csv")["path"] == "\\test.csv"
+    assert infer_storage_options(".\\test.csv")["path"] == ".\\test.csv"
+    assert infer_storage_options("test.csv")["path"] == "test.csv"
+
+    so = infer_storage_options(
+        "hdfs://username:pwd@Node:123/mnt/datasets/test.csv?q=1#fragm",
+        inherit_storage_options={"extra": "value"},
+    )
+    assert so.pop("protocol") == "hdfs"
+    assert so.pop("username") == "username"
+    assert so.pop("password") == "pwd"
+    assert so.pop("host") == "Node"
+    assert so.pop("port") == 123
+    assert so.pop("path") == "/mnt/datasets/test.csv#fragm"
+    assert so.pop("url_query") == "q=1"
+    assert so.pop("url_fragment") == "fragm"
+    assert so.pop("extra") == "value"
+    assert not so
+
+    so = infer_storage_options("hdfs://User-name@Node-name.com/mnt/datasets/test.csv")
+    assert so.pop("username") == "User-name"
+    assert so.pop("host") == "Node-name.com"
+
+    u = "http://127.0.0.1:8080/test.csv"
+    assert infer_storage_options(u) == {"protocol": "http", "path": u}
+
+    # For s3 and gcs the netloc is actually the bucket name, so we want to
+    # include it in the path. Test that:
+    # - Parsing doesn't lowercase the bucket
+    # - The bucket is included in path
+    for protocol in ["s3", "s3a", "gcs", "gs"]:
+        options = infer_storage_options(f"{protocol}://Bucket-name.com/test.csv")
+        assert options["path"] == "Bucket-name.com/test.csv"
+
+    with pytest.raises(KeyError):
+        infer_storage_options("file:///bucket/file.csv", {"path": "collide"})
+    with pytest.raises(KeyError):
+        infer_storage_options("hdfs:///bucket/file.csv", {"protocol": "collide"})
+
+
+def test_infer_simple():
+    out = infer_storage_options("//mnt/datasets/test.csv")
+    assert out["protocol"] == "file"
+    assert out["path"] == "//mnt/datasets/test.csv"
+    assert out.get("host", None) is None
+
+
+def test_infer_composite_protocol():
+    out = infer_storage_options("foo+bar-baz://db.example.org")
+    assert out["protocol"] == "foo+bar-baz"
+    assert out["host"] == "db.example.org"
+    assert out["path"] == ""
+
+
+def test_infer_options_percent_encoded_userinfo():
+    # Percent-encoded characters in the userinfo component must be decoded
+    # so that backends (ftp, sftp, smb, ...) receive the real credentials
+    # rather than the encoded form that appeared in the URL.
+    so = infer_storage_options(
+        "sftp://user%40corp:p%23ass%2Fword%20!@example.com:22/path"
+    )
+    assert so["username"] == "user@corp"
+    assert so["password"] == "p#ass/word !"
+    assert so["host"] == "example.com"
+    assert so["port"] == 22
+    assert so["path"] == "/path"
+
+    # Unencoded credentials pass through unchanged.
+    so = infer_storage_options("ftp://plainuser:plainpw@example.com/f")
+    assert so["username"] == "plainuser"
+    assert so["password"] == "plainpw"
+
+    # Backwards-compat: URLs whose password contains a bare ``%`` that is
+    # not a valid percent-escape must be preserved.  ``50%off`` (no hex
+    # after the %) and ``pass%`` (trailing %) already round-trip through
+    # ``urllib.parse.unquote``; ``pass%ab`` decodes to the byte 0xAB which
+    # is not valid UTF-8, so the loose default ``errors='replace'`` would
+    # silently corrupt it to U+FFFD.  We fall back to the raw form in that
+    # case so the caller still sees the original password.
+    for pw in ("50%off", "pass%", "pass%ab"):
+        so = infer_storage_options(f"sftp://user:{pw}@example.com/f")
+        assert so["password"] == pw, pw
+
+
+def test_infer_ipv6_host():
+    # The address itself contains colons, so only a colon after the closing
+    # bracket separates the port.
+    out = infer_storage_options("hdfs://[::1]/mnt/test.csv")
+    assert out["host"] == "[::1]"
+    assert out["path"] == "/mnt/test.csv"
+    assert "port" not in out
+
+    out = infer_storage_options("hdfs://[2001:db8::1]/mnt/test.csv")
+    assert out["host"] == "[2001:db8::1]"
+
+    # A port, a user and a password are still picked up alongside the address.
+    out = infer_storage_options("hdfs://[::1]:8020/mnt/test.csv")
+    assert out["host"] == "[::1]"
+    assert out["port"] == 8020
+
+    out = infer_storage_options("hdfs://user:pwd@[2001:db8::1]:8020/mnt/test.csv")
+    assert out["host"] == "[2001:db8::1]"
+    assert out["port"] == 8020
+    assert out["username"] == "user"
+    assert out["password"] == "pwd"
+
+
+@pytest.mark.parametrize(
+    "urlpath, expected_path",
+    (
+        (r"c:\foo\bar", r"c:\foo\bar"),
+        (r"C:\\foo\bar", r"C:\\foo\bar"),
+        (r"c:/foo/bar", r"c:/foo/bar"),
+        (r"file:///c|\foo\bar", r"c:\foo\bar"),
+        (r"file:///C|/foo/bar", r"C:/foo/bar"),
+        (r"file:///C:/foo/bar", r"C:/foo/bar"),
+    ),
+)
+def test_infer_storage_options_c(urlpath, expected_path):
+    so = infer_storage_options(urlpath)
+    assert so["protocol"] == "file"
+    assert so["path"] == expected_path
+
+
+@pytest.mark.parametrize(
+    "paths, out",
+    (
+        (["/more/dir/", "/more/dir/two", "/more/one", "/more/three"], "/more"),
+        (["/", "", "/"], ""),
+        (["/", "/"], "/"),
+        (["/more/", "/"], ""),
+        (["/more/", "/more"], "/more"),
+        (["more/dir/", "more/dir/two", "more/one", "more/three"], "more"),
+    ),
+)
+def test_common_prefix(paths, out):
+    assert common_prefix(paths) == out
+
+
+@pytest.mark.parametrize(
+    "paths, other, exists, expected",
+    (
+        (["/path1"], "/path2", False, ["/path2"]),
+        (["path1"], "/path2", False, ["/path2"]),
+        (["path1"], "/path2", True, ["/path2/path1"]),
+        (["/path1"], "/path2", True, ["/path2/path1"]),
+        (["/path1"], "/path2/", True, ["/path2/path1"]),
+        (["/path1"], ["/path2"], False, ["/path2"]),
+        (["/path1"], ["/path2"], True, ["/path2"]),
+        (["/path1", "/path2"], "/path2", False, ["/path2/path1", "/path2/path2"]),
+        (["/path1", "/path2"], "/path2", True, ["/path2/path1", "/path2/path2"]),
+        (
+            ["/more/path1", "/more/path2"],
+            "/path2",
+            False,
+            ["/path2/path1", "/path2/path2"],
+        ),
+        (
+            ["/more/path1", "/more/path2"],
+            "/path2",
+            True,
+            ["/path2/more/path1", "/path2/more/path2"],
+        ),
+        (
+            ["/more/path1", "/more/path2"],
+            "/path2/",
+            False,
+            ["/path2/path1", "/path2/path2"],
+        ),
+        (
+            ["/more/path1", "/more/path2"],
+            "/path2/",
+            True,
+            ["/path2/more/path1", "/path2/more/path2"],
+        ),
+        (
+            ["/more/path1", "/diff/path2"],
+            "/path2/",
+            False,
+            ["/path2/more/path1", "/path2/diff/path2"],
+        ),
+        (
+            ["/more/path1", "/diff/path2"],
+            "/path2/",
+            True,
+            ["/path2/more/path1", "/path2/diff/path2"],
+        ),
+        (["a", "b/", "b/c"], "dest/", False, ["dest/a", "dest/b/", "dest/b/c"]),
+        (
+            ["/a", "/b/", "/b/c"],
+            "dest/",
+            False,
+            ["dest/a", "dest/b/", "dest/b/c"],
+        ),
+    ),
+)
+def test_other_paths(paths, other, exists, expected):
+    assert other_paths(paths, other, exists) == expected
+
+
+@pytest.mark.parametrize("prefix", ["", "/", "parent/", "/parent/"])
+@pytest.mark.parametrize("exists", [False, True])
+@pytest.mark.parametrize("target", ["target", "target/"])
+def test_other_paths_directory_nesting(prefix, exists, target):
+    source = prefix + "src"
+    paths = [source, source + "/file", source + "/nested/other"]
+    root = "target/src" if exists else "target"
+    expected = [root, root + "/file", root + "/nested/other"]
+
+    assert other_paths(paths, target, exists=exists) == expected
+
+
+def test_log():
+    import logging
+
+    logger = setup_logging(logger_name="fsspec.test")
+    assert logger.level == logging.DEBUG
+    with pytest.raises(ValueError, match="Provide either"):
+        setup_logging()
+
+
+def test_package_version(monkeypatch):
+    import importlib
+    from types import SimpleNamespace
+
+    name = "__fsspec_test_version__"
+    module = SimpleNamespace(__version__="1.2")
+    monkeypatch.setitem(sys.modules, name, module)
+    assert fsspec.utils.get_package_version_without_import(name) == "1.2"
+    del module.__version__
+    assert fsspec.utils.get_package_version_without_import(name) is None
+    monkeypatch.setattr(fsspec.utils, "version", lambda _: "2.0")
+    assert fsspec.utils.get_package_version_without_import(name) == "2.0"
+    monkeypatch.delitem(sys.modules, name)
+    monkeypatch.setattr(fsspec.utils, "version", Mock(side_effect=ImportError))
+    assert fsspec.utils.get_package_version_without_import(name) is None
+    module.__version__ = "1.2"
+    monkeypatch.setattr(importlib, "import_module", lambda _: module)
+    assert fsspec.utils.get_package_version_without_import(name) == "1.2"
+
+
+@pytest.mark.parametrize(
+    "header,expected",
+    [
+        ("bytes 2-4/10", (2, 4, 10)),
+        ("bytes 2-4/*", (2, 4, None)),
+        ("bytes */10", (None, None, 10)),
+        ("invalid", (None, None, None)),
+    ],
+)
+def test_content_range(header, expected):
+    assert parse_content_range_header({"Content-Range": header}) == expected
+
+
+@pytest.mark.parametrize(
+    "status,header,start,end,expected",
+    [
+        (206, {}, 2, 5, b"012345"),
+        (200, {}, None, 3, b"012"),
+        (200, {}, -2, None, b"45"),
+        (200, {}, -4, -1, b"234"),
+        (200, {"Content-Range": "bytes 0-5/6"}, 2, 4, None),
+        (200, {}, 2, 4, None),
+        (200, {}, 0, None, b"012345"),
+    ],
+)
+def test_range_response_window(status, header, start, end, expected):
+    if expected is None:
+        with pytest.raises(ValueError, match="support range requests"):
+            range_response_window(b"012345", status, header, start, end)
+    else:
+        assert range_response_window(b"012345", status, header, start, end) == expected
+
+
+@pytest.mark.parametrize(
+    "pattern,text,expected",
+    [
+        ("[a-c]", "b", True),
+        ("[z-a]", "z", False),
+        ("[a-c-e]", "-", True),
+        ("[a-c-]", "-", True),
+        ("[!a-c]", "z", True),
+        ("[^a]", "^", True),
+        ("[[]", "[", True),
+        ("[a&&b]", "&", True),
+        (r"[a\b]", "\\", True),
+    ],
+)
+def test_glob_character_classes(pattern, text, expected):
+    assert bool(re.fullmatch(glob_translate(pattern), text)) is expected
+
+
+@pytest.mark.parametrize(
+    "par",
+    [
+        ("afile", "file"),
+        ("file://afile", "file"),
+        ("noproto://afile", "noproto"),
+        ("noproto::stuff", "noproto"),
+        ("simplecache::stuff", "simplecache"),
+        ("simplecache://stuff", "simplecache"),
+        ("s3://afile", "s3"),
+        (Path("afile"), "file"),
+    ],
+)
+def test_get_protocol(par):
+    url, outcome = par
+    assert get_protocol(url) == outcome
+
+
+@pytest.mark.parametrize(
+    ["url", "expected"],
+    (
+        ("https://example.com/q.txt", "txt"),
+        ("https://example.com/foo.parquet", "parquet"),
+        ("https://example.com/foo.parq", "parq"),
+        ("file:///home/user/no_extension", ""),
+        ("/local/path/to/file.json", "json"),
+        ("relative/path/file.yaml", "yaml"),
+        # A "." in a parent directory name is not the file's extension
+        ("/path/to.dir/file", ""),
+        ("s3://bucket.name/data/file", ""),
+        ("/path/to.dir/file.parquet", "parquet"),
+        # A leading dot marks a hidden file, it does not introduce an extension
+        ("/path/to/.bashrc", ""),
+        (".gitignore", ""),
+        ("s3://bucket/.env", ""),
+        # ... but a hidden file can still carry one
+        ("/path/to/.hidden.txt", "txt"),
+        # A trailing dot leaves an empty extension
+        ("/path/to/file.", ""),
+    ),
+)
+def test_get_file_extension(url, expected):
+    actual = get_file_extension(url)
+
+    assert actual == expected
+
+
+@pytest.mark.parametrize(
+    "par",
+    [
+        ("afile", True),
+        ("file://afile", True),
+        ("noproto://afile", False),
+        ("noproto::stuff", False),
+        ("simplecache::stuff", True),
+        ("simplecache://stuff", True),
+        (Path("afile"), True),
+    ],
+)
+def test_can_local(par):
+    url, outcome = par
+    assert can_be_local(url) == outcome
+
+
+def test_mirror_from():
+    mock = Mock()
+    mock.attr = 1
+
+    @mirror_from("client", ["attr", "func_1", "func_2"])
+    class Real:
+        @property
+        def client(self):
+            return mock
+
+        def func_2(self):
+            raise AssertionError("have to overwrite this")
+
+        def func_3(self):
+            return "should succeed"
+
+    obj = Real()
+    assert obj.attr == mock.attr
+
+    obj.func_1()
+    mock.func_1.assert_called()
+
+    obj.func_2(1, 2)
+    mock.func_2.assert_called_with(1, 2)
+
+    assert obj.func_3() == "should succeed"
+    mock.func_3.assert_not_called()
+
+
+@pytest.mark.parametrize("max_gap", [0, 32])
+@pytest.mark.parametrize("max_block", [None, 128])
+def test_merge_offset_ranges(max_gap, max_block):
+    # Input ranges
+    # (Using out-of-order ranges for full coverage)
+    paths = ["foo", "bar", "bar", "bar", "foo"]
+    starts = [0, 0, 512, 64, 32]
+    ends = [32, 32, 1024, 256, 64]
+
+    # Call merge_offset_ranges
+    (
+        result_paths,
+        result_starts,
+        result_ends,
+    ) = merge_offset_ranges(
+        paths,
+        starts,
+        ends,
+        max_gap=max_gap,
+        max_block=max_block,
+    )
+
+    # Check result
+    if max_block is None and max_gap == 32:
+        expect_paths = ["bar", "bar", "foo"]
+        expect_starts = [0, 512, 0]
+        expect_ends = [256, 1024, 64]
+    else:
+        expect_paths = ["bar", "bar", "bar", "foo"]
+        expect_starts = [0, 64, 512, 0]
+        expect_ends = [32, 256, 1024, 64]
+
+    assert expect_paths == result_paths
+    assert expect_starts == result_starts
+    assert expect_ends == result_ends
+
+
+def test_merge_offset_ranges_drops_nested():
+    paths = ["f", "f", "f", "f", "g"]
+    starts = [0, 10, 0, 100, 0]
+    ends = [50, 20, 80, 150, 10]
+
+    result_paths, result_starts, result_ends = merge_offset_ranges(
+        paths, starts, ends, max_gap=0, max_block=None
+    )
+
+    assert result_paths == ["f", "f", "g"]
+    assert result_starts == [0, 100, 0]
+    assert result_ends == [80, 150, 10]
+
+
+@pytest.mark.parametrize("sort", [True, False])
+@pytest.mark.parametrize(
+    "starts,ends,expected",
+    [
+        # Exact duplicates: keep one
+        ([0, 0], [50, 50], [(0, 50)]),
+        # Nested range
+        ([0, 10], [80, 20], [(0, 80)]),
+        # None end covers to EOF
+        ([0, 0], [None, 50], [(0, None)]),
+        ([0, 0], [50, None], [(0, None)]),
+        # None end past max_block: keep separate
+        ([0, 50], [10, None], [(0, 10), (50, None)]),
+    ],
+)
+def test_merge_offset_ranges_edges(starts, ends, expected, sort):
+    result = merge_offset_ranges(
+        ["f"] * len(starts),
+        list(starts),
+        list(ends),
+        max_gap=100,
+        max_block=1000,
+        sort=sort,
+    )
+
+    assert list(zip(*result)) == [("f", *rng) for rng in expected]
+
+
+def test_merge_offset_ranges_sorts_unsorted_nested_ranges():
+    result = merge_offset_ranges(
+        ["f", "f"],
+        [10, 0],
+        [20, 80],
+        max_gap=100,
+        max_block=1000,
+        sort=True,
+    )
+
+    assert list(zip(*result)) == [("f", 0, 80)]
+
+
+@pytest.mark.parametrize(
+    "starts,ends",
+    [
+        # Range starting behind an already emitted block
+        ([0, 100, 5], [10, 110, 7]),
+        # Range nested inside an earlier block, not the current one
+        ([102, 267, 108], [174, 286, 152]),
+        # Fully reversed
+        ([200, 100, 0], [210, 110, 10]),
+    ],
+)
+def test_merge_offset_ranges_unsorted_keeps_coverage(starts, ends):
+    # `sort=False` with out-of-order input must still cover every range
+    result = merge_offset_ranges(
+        ["f"] * len(starts), list(starts), list(ends), max_gap=0, sort=False
+    )
+
+    blocks = list(zip(*result))
+    for start, end in zip(starts, ends):
+        assert any(
+            block_start <= start and end <= block_end
+            for _, block_start, block_end in blocks
+        )
+        assert all(block_end >= block_start for _, block_start, block_end in blocks)
+
+
+@pytest.mark.parametrize(
+    "max_block,expected",
+    [
+        # Overlaps merge when the block stays within `max_block`
+        (None, [(0, 40)]),
+        (128, [(0, 40)]),
+        # Merging (8, 40) would exceed `max_block`, so it becomes its own
+        # block, overlapping the first. (12, 20) is already covered by it
+        (4, [(0, 10), (8, 40)]),
+    ],
+)
+def test_merge_offset_ranges_overlap_respects_max_block(max_block, expected):
+    result = merge_offset_ranges(
+        ["f"] * 3, [0, 8, 12], [10, 40, 20], max_gap=0, max_block=max_block
+    )
+
+    assert list(zip(*result)) == [("f", *rng) for rng in expected]
+
+
+def test_merge_offset_ranges_covers_every_input_range():
+    # Every input must be covered, and no block may exceed max_block
+    # when every input range is itself smaller than max_block
+    rand = random.Random(42)
+    paths, starts, ends = [], [], []
+    for _ in range(200):
+        path = f"f{rand.randint(0, 2)}"
+        start = rand.randrange(0, 4000)
+        paths.append(path)
+        starts.append(start)
+        ends.append(start + rand.randrange(1, 500))
+
+    result = merge_offset_ranges(paths, starts, ends, max_gap=8, max_block=512)
+
+    blocks = sorted(zip(*result))
+    for _, block_start, block_end in blocks:
+        assert block_end - block_start <= 512
+
+    for path, start, end in zip(paths, starts, ends):
+        assert any(
+            path == block_path and block_start <= start and end <= block_end
+            for block_path, block_start, block_end in blocks
+        )
+
+
+def test_merge_offset_ranges_overlap_chain_is_bounded():
+    # Regression: chained overlaps each extended the open block, so the
+    # merged block grew past max_block without bound
+    n = 20_000
+    max_block = 8_192
+    starts = list(range(0, n * 100, 100))
+    ends = [s + 150 for s in starts]
+
+    result = merge_offset_ranges(
+        ["f"] * n, starts, ends, max_gap=0, max_block=max_block
+    )
+
+    blocks = list(zip(*result))
+    assert len(blocks) > 1
+    for _, block_start, block_end in blocks:
+        assert block_end - block_start <= max_block
+
+    for start, end in zip(starts, ends):
+        assert any(
+            block_start <= start and end <= block_end
+            for _, block_start, block_end in blocks
+        )
+
+
+def test_merge_offset_ranges_many_sequential_is_fast():
+    # Regression: O(n²) nested-range filter added in #1982
+    def run(n):
+        paths = ["file"] * n
+        starts = list(range(0, n * 240, 240))
+        ends = [s + 240 for s in starts]
+        t0 = time.perf_counter()
+        result = merge_offset_ranges(
+            paths, starts, ends, max_block=8_388_608, sort=True
+        )
+        return time.perf_counter() - t0, result, ends[-1]
+
+    large_elapsed, result, expected_end = run(20_000)
+    result_paths, result_starts, result_ends = result
+
+    # Generous ceiling: the linear implementation needs ~10ms here, while the
+    # quadratic one needs tens of seconds.
+    assert large_elapsed < 1.0
+    assert result_paths == ["file"]
+    assert result_starts == [0]
+    assert result_ends == [expected_end]
+
+
+def test_size():
+    f = io.BytesIO(b"hello")
+    assert fsspec.utils.file_size(f) == 5
+    assert f.tell() == 0
+
+
+@pytest.mark.parametrize("fail", [False, True])
+def test_atomic_write(tmp_path, fail):
+    path = tmp_path / "data"
+    path.write_bytes(b"old")
+    with pytest.raises(ValueError) if fail else nullcontext():
+        with fsspec.utils.atomic_write(path) as stream:
+            stream.write(b"new")
+            assert path.read_bytes() == b"old"
+            if fail:
+                raise ValueError("abort")
+    assert path.read_bytes() == (b"old" if fail else b"new")
+    assert list(tmp_path.iterdir()) == [path]
+
+
+class _HasFspath:
+    def __fspath__(self):
+        return "foo"
+
+
+class _HasPathAttr:
+    def __init__(self):
+        self.path = "foo"
+
+
+@pytest.mark.parametrize(
+    "path,expected",
+    [
+        # coerce to string
+        ("foo", "foo"),
+        (Path("foo"), "foo"),
+        (PurePath("foo"), "foo"),
+        (_HasFspath(), "foo"),
+        (_HasPathAttr(), "foo"),
+        # passthrough
+        (b"bytes", b"bytes"),
+        (None, None),
+        (1, 1),
+        (True, True),
+        (o := object(), o),
+        ([], []),
+        ((), ()),
+        (set(), set()),
+    ],
+)
+def test_stringify_path(path, expected):
+    path = fsspec.utils.stringify_path(path)
+
+    assert path == expected
+
+
+@pytest.mark.parametrize(
+    "sep,altsep",
+    [
+        ("/", None),  # posix
+        ("\\", "/"),  # windows
+    ],
+)
+def test_glob_translate_does_not_depend_on_the_host_os(monkeypatch, sep, altsep):
+    # fsspec paths always use "/", so the pattern a given glob compiles to has to be
+    # the same everywhere. Deriving the separators from os.path made a backslash a
+    # separator on Windows only.
+    monkeypatch.setattr(os.path, "sep", sep)
+    monkeypatch.setattr(os.path, "altsep", altsep)
+
+    assert glob_translate("*") == r"(?s:[^/]+)\Z"
+    assert glob_translate("a/b*") == r"(?s:a/b[^/]*)\Z"
+    # a backslash is an ordinary character in a key, not a separator
+    assert glob_translate("we\\ird.txt") == r"(?s:we\\ird\.txt)\Z"
+
+
+def test_glob_matches_a_name_containing_a_backslash():
+    # A backslash is a legal character in an object store key. It must not be treated
+    # as a path separator, on any platform.
+    fs = fsspec.filesystem("memory")
+    for name in ["/data/plain.txt", "/data/we\\ird.txt"]:
+        with fs.open(name, "wb") as f:
+            f.write(b"x")
+
+    try:
+        assert sorted(fs.glob("/data/*")) == ["/data/plain.txt", "/data/we\\ird.txt"]
+        assert fs.glob("/data/we*") == ["/data/we\\ird.txt"]
+        assert sorted(fs.glob("/data/*.txt")) == [
+            "/data/plain.txt",
+            "/data/we\\ird.txt",
+        ]
+    finally:
+        fs.store.clear()
+
+
+@pytest.mark.parametrize(
+    "root, path, contained",
+    (
+        ("/dest", "/dest/inside.txt", True),
+        ("/dest", "/dest/a/b/inside.txt", True),
+        ("/dest", "/dest", True),
+        ("/dest", "/dest/a/../inside.txt", True),
+        ("/dest", "/escaped.txt", False),
+        ("/dest", "/dest/../escaped.txt", False),
+        # A sibling whose name starts with the root must not count as inside.
+        ("/dest", "/destination/escaped.txt", False),
+    ),
+)
+def test_check_contained(root, path, contained):
+    root = os.path.abspath(root)
+    path = os.path.abspath(path)
+    if contained:
+        check_contained(root, [path])
+    else:
+        with pytest.raises(ValueError, match="outside the destination"):
+            check_contained(root, [path])
