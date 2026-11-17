@@ -139,6 +139,61 @@ def test_to_repr_error() -> None:
     assert "<repr-error 'BAAM!'>" == tracebacks.to_repr(Baam())
 
 
+def test_to_repr_rich_error() -> None:
+    """
+    "to_repr()" does not fail if rich raises while rendering.
+    """
+
+    class Baam:
+        def __repr__(self) -> str:
+            raise ValueError("BAAM!")
+
+    class FailingPretty:
+        @staticmethod
+        def traverse(*args: Any, **kwargs: Any) -> Any:
+            raise RuntimeError("rich boom")
+
+    class FailingRich:
+        pretty = FailingPretty
+
+    with patch.object(tracebacks, "rich", FailingRich):
+        assert (
+            "<repr-error 'rich boom'>"
+            == tracebacks.to_repr(Baam(), use_rich=True)
+        )
+
+
+def test_to_repr_hard_cap() -> None:
+    """
+    Even with max_string=None, the repr is bounded by REPR_MAX_STRING.
+    """
+    value = "x" * 20_000
+    full_repr_len = len(repr(value))  # includes the surrounding quotes
+    result = tracebacks.to_repr(value, max_string=None)
+
+    assert result == (
+        f"{repr(value)[:tracebacks.REPR_MAX_STRING]!r}"
+        f"+{full_repr_len - tracebacks.REPR_MAX_STRING}"
+    )
+    assert len(result) < full_repr_len
+
+
+def test_to_repr_error_with_broken_str() -> None:
+    """
+    A repr error whose __str__ also fails still yields a marker.
+    """
+
+    class BrokenError(Exception):
+        def __str__(self) -> str:
+            raise RuntimeError("str is broken")
+
+    class Baam:
+        def __repr__(self) -> str:
+            raise BrokenError("nope")
+
+    assert "<repr-error 'BrokenError'>" == tracebacks.to_repr(Baam())
+
+
 def test_simple_exception():
     """
     Tracebacks are parsed for simple, single exceptions.
@@ -1202,3 +1257,255 @@ def test_exception_cycle():
         )
         == trace.stacks[0]
     )
+
+
+class Exploding:
+    """
+    Blows up when represented, proving that repr() was called.
+    """
+
+    def __repr__(self) -> str:
+        raise AssertionError("repr must not be called")
+
+
+class Secret:
+    """
+    Marker type used for type-based exclusion.
+    """
+
+    def __repr__(self) -> str:
+        raise AssertionError("repr must not be called")
+
+
+def _raise_with_locals() -> ZeroDivisionError:
+    password = "super-secret"
+    token = Secret()
+    resource = Exploding()
+    plain = 42
+    1 / 0  # type: ignore[unreachable]
+
+
+def test_locals_hide_value_by_name() -> None:
+    """
+    Variables listed by name are hidden without calling repr on them.
+    """
+    try:
+        _raise_with_locals()
+    except ZeroDivisionError as e:
+        trace = tracebacks.extract(
+            type(e),
+            e,
+            e.__traceback__,
+            show_locals=True,
+            locals_hide_value=("password", "resource"),
+        )
+
+    frame_locals = trace.stacks[0].frames[-1].locals
+
+    assert frame_locals["password"] == tracebacks.HIDDEN_LOCAL
+    assert frame_locals["resource"] == tracebacks.HIDDEN_LOCAL
+    assert frame_locals["plain"] == "42"
+    # The secret type is not excluded here, so it is rendered (its repr does
+    # not raise for a plain string-like usage below).
+    assert "token" in frame_locals
+
+
+def test_locals_hide_value_by_type() -> None:
+    """
+    Variables whose type is listed are hidden without calling repr on them.
+    """
+    try:
+        _raise_with_locals()
+    except ZeroDivisionError as e:
+        trace = tracebacks.extract(
+            type(e),
+            e,
+            e.__traceback__,
+            show_locals=True,
+            locals_hide_value=(Secret, Exploding),
+        )
+
+    frame_locals = trace.stacks[0].frames[-1].locals
+
+    assert frame_locals["token"] == tracebacks.HIDDEN_LOCAL
+    assert frame_locals["resource"] == tracebacks.HIDDEN_LOCAL
+    assert frame_locals["plain"] == "42"
+    assert frame_locals["password"] == "'super-secret'"
+
+
+def test_locals_hide_value_subclass() -> None:
+    """
+    Type-based exclusion also matches subclasses.
+    """
+
+    class SubSecret(Secret):
+        pass
+
+    def raise_() -> None:
+        sub = SubSecret()
+        1 / 0
+
+    try:
+        raise_()
+    except ZeroDivisionError as e:
+        trace = tracebacks.extract(
+            type(e),
+            e,
+            e.__traceback__,
+            show_locals=True,
+            locals_hide_value=(Secret,),
+        )
+
+    assert (
+        trace.stacks[0].frames[-1].locals["sub"]
+        == tracebacks.HIDDEN_LOCAL
+    )
+
+
+def test_locals_filter() -> None:
+    """
+    A callable filter can exclude variables based on name and value.
+    """
+    try:
+        _raise_with_locals()
+    except ZeroDivisionError as e:
+        trace = tracebacks.extract(
+            type(e),
+            e,
+            e.__traceback__,
+            show_locals=True,
+            locals_filter=lambda name, value: name == "password"
+            or isinstance(value, Exploding),
+        )
+
+    frame_locals = trace.stacks[0].frames[-1].locals
+
+    assert frame_locals["password"] == tracebacks.HIDDEN_LOCAL
+    assert frame_locals["resource"] == tracebacks.HIDDEN_LOCAL
+    assert frame_locals["plain"] == "42"
+
+
+def test_locals_filter_failure_hides_value() -> None:
+    """
+    If the filter raises, the value is hidden rather than leaked or propagated.
+    """
+
+    def broken_filter(name: str, value: object) -> bool:
+        raise RuntimeError("filter boom")
+
+    try:
+        _raise_with_locals()
+    except ZeroDivisionError as e:
+        trace = tracebacks.extract(
+            type(e),
+            e,
+            e.__traceback__,
+            show_locals=True,
+            locals_filter=broken_filter,
+        )
+
+    frame_locals = trace.stacks[0].frames[-1].locals
+
+    assert all(v == tracebacks.HIDDEN_LOCAL for v in frame_locals.values())
+
+
+def test_show_locals_false_does_not_access_values() -> None:
+    """
+    With show_locals=False, frame locals are not materialized or accessed.
+    """
+
+    class ExplodingFrame(dict):
+        def items(self):  # type: ignore[override]
+            raise AssertionError("frame locals must not be accessed")
+
+    class FakeFrame:
+        f_code = type(
+            "Code",
+            (),
+            {"co_filename": "x.py", "co_name": "fn"},
+        )()
+        f_lineno = 1
+        f_locals = ExplodingFrame()
+
+    class FakeTb:
+        tb_frame = FakeFrame()
+        tb_lineno = 1
+        tb_next = None
+
+    try:
+        raise ValueError("boom")
+    except ValueError as e:
+        trace = tracebacks.extract(
+            type(e), e, FakeTb(), show_locals=False  # type: ignore[arg-type]
+        )
+
+    assert trace.stacks[0].frames[-1].locals is None
+
+
+def test_extract_does_not_mutate_exception() -> None:
+    """
+    Rendering an exception does not change the exception object itself.
+    """
+    try:
+        _raise_with_locals()
+    except ZeroDivisionError as e:
+        before = (
+            e.__traceback__,
+            getattr(e, "__notes__", None),
+            e.args,
+        )
+        tracebacks.extract(
+            type(e),
+            e,
+            e.__traceback__,
+            show_locals=True,
+            locals_hide_value=("password",),
+        )
+        after = (
+            e.__traceback__,
+            getattr(e, "__notes__", None),
+            e.args,
+        )
+
+    assert before == after
+
+
+def test_transformer_hide_value_and_filter() -> None:
+    """
+    ExceptionDictTransformer forwards both exclusion strategies.
+    """
+    try:
+        _raise_with_locals()
+    except ZeroDivisionError as e:
+        transformer = tracebacks.ExceptionDictTransformer(
+            show_locals=True,
+            locals_hide_value=("password", Secret),
+            locals_filter=lambda name, value: isinstance(value, Exploding),
+        )
+        result = transformer((type(e), e, e.__traceback__))
+
+    frame_locals = result[0]["frames"][-1]["locals"]
+
+    assert frame_locals["password"] == tracebacks.HIDDEN_LOCAL
+    assert frame_locals["token"] == tracebacks.HIDDEN_LOCAL
+    assert frame_locals["resource"] == tracebacks.HIDDEN_LOCAL
+    assert frame_locals["plain"] == "42"
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"locals_hide_value": (42,)},
+        {"locals_hide_value": (object(),)},
+        {"locals_filter": "not callable"},
+    ],
+)
+def test_transformer_invalid_exclusion_arguments(
+    kwargs: dict[str, Any],
+) -> None:
+    """
+    Invalid exclusion configuration raises a ValueError naming the argument.
+    """
+    with pytest.raises(ValueError, match=next(iter(kwargs.keys()))):
+        tracebacks.ExceptionDictTransformer(**kwargs)
+

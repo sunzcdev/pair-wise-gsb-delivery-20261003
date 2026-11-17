@@ -21,7 +21,7 @@ import os
 import os.path
 import sys
 
-from collections.abc import Iterable, Sequence
+from collections.abc import Callable, Iterable, Sequence
 from dataclasses import asdict, dataclass, field
 from traceback import walk_tb
 from types import ModuleType, TracebackType
@@ -38,8 +38,11 @@ from .typing import ExcInfo
 
 
 __all__ = [
+    "HIDDEN_LOCAL",
+    "REPR_MAX_STRING",
     "ExceptionDictTransformer",
     "Frame",
+    "LocalsFilter",
     "Stack",
     "SyntaxError_",
     "Trace",
@@ -53,6 +56,17 @@ SHOW_LOCALS = True
 LOCALS_MAX_LENGTH = 10
 LOCALS_MAX_STRING = 80
 MAX_FRAMES = 50
+#: Placeholder used for local variables that are excluded by name or type, so
+#: that their value is never accessed (and thus ``repr()`` is never called).
+HIDDEN_LOCAL = "<hidden>"
+#: Absolute upper bound for the length of a rendered local value.  It applies
+#: even when *locals_max_string* is ``None`` and regardless of whether rich_ is
+#: available, so a single value can never blow up the whole event dict.
+REPR_MAX_STRING = 10_000
+
+#: Predicate deciding whether a local variable with the given name and value
+#: may be rendered.  Returning ``True`` excludes the variable.
+LocalsFilter: TypeAlias = Callable[[str, object], bool]
 
 OptExcInfo: TypeAlias = ExcInfo | tuple[None, None, None]
 
@@ -154,18 +168,25 @@ def to_repr(
        Added *max_length* argument.  Use :program:`rich` to render locals if it
        is available.  Call :func:`repr()` on strings in fallback
        implementation.
+
+    .. versionchanged:: 26.2.0
+       Errors raised while rich_ renders an object are caught and reported
+       just like errors from ``repr()``.  The result is never longer than
+       :data:`REPR_MAX_STRING`, even when *max_string* is ``None``.
     """
-    if use_rich and rich is not None:
-        # Let rich render the repr if it is available.
-        # It produces much better results for containers and dataclasses/attrs.
-        obj_repr = rich.pretty.traverse(
-            obj, max_length=max_length, max_string=max_string
-        ).render()
-    else:
-        # Generate a (truncated) repr if rich is not available.
-        # Handle str/bytes differently to get better results for truncated
-        # representations.  Also catch all errors, similarly to "safe_str()".
-        try:
+    try:
+        if use_rich and rich is not None:
+            # Let rich render the repr if it is available.
+            # It produces much better results for containers and
+            # dataclasses/attrs.
+            obj_repr = rich.pretty.traverse(
+                obj, max_length=max_length, max_string=max_string
+            ).render()
+        else:
+            # Generate a (truncated) repr if rich is not available.
+            # Handle str/bytes differently to get better results for truncated
+            # representations.  Also catch all errors, similarly to
+            # "safe_str()".
             if isinstance(obj, (str, bytes)):
                 if max_string is not None and len(obj) > max_string:
                     truncated = len(obj) - max_string
@@ -177,8 +198,20 @@ def to_repr(
                 if max_string is not None and len(obj_repr) > max_string:
                     truncated = len(obj_repr) - max_string
                     obj_repr = f"{obj_repr[:max_string]!r}+{truncated}"
-        except Exception as error:  # noqa: BLE001
-            obj_repr = f"<repr-error {str(error)!r}>"
+    except Exception as error:  # noqa: BLE001
+        # Covers both a failing __repr__() and errors raised by rich.
+        try:
+            error_repr = str(error)
+        except Exception:  # noqa: BLE001
+            # Even __str__() of the error is broken; fall back to its type.
+            error_repr = error.__class__.__name__
+        return f"<repr-error {error_repr!r}>"
+
+    # Absolute safety net against an unbounded representation, in particular
+    # when max_string is None or rich renders an unexpectedly large object.
+    if len(obj_repr) > REPR_MAX_STRING:
+        truncated = len(obj_repr) - REPR_MAX_STRING
+        obj_repr = f"{obj_repr[:REPR_MAX_STRING]!r}+{truncated}"
 
     return obj_repr
 
@@ -193,6 +226,8 @@ def extract(
     locals_max_string: int = LOCALS_MAX_STRING,
     locals_hide_dunder: bool = True,
     locals_hide_sunder: bool = False,
+    locals_hide_value: Iterable[str | type[Any]] = (),
+    locals_filter: LocalsFilter | None = None,
     use_rich: bool = True,
     _seen: set[int] | None = None,
 ) -> Trace:
@@ -207,6 +242,7 @@ def extract(
         traceback: Python Traceback object.
 
         show_locals: Enable display of local variables. Defaults to False.
+            When ``False``, the values of frame locals are never accessed.
 
         locals_max_length:
             Maximum length of containers before abbreviating, or ``None`` for
@@ -214,7 +250,8 @@ def extract(
 
         locals_max_string:
             Maximum length of string before truncating, or ``None`` to disable
-            truncating.
+            truncating.  Independently of this, a rendered value can never
+            exceed :data:`REPR_MAX_STRING`.
 
         locals_hide_dunder:
             Hide locals prefixed with double underscore.
@@ -224,6 +261,21 @@ def extract(
             Hide locals prefixed with single underscore.
             This implies hiding *locals_hide_dunder*.
             Defaults to False.
+
+        locals_hide_value:
+            Variable names (exact match) and/or types whose values must never
+            be rendered.  Excluded variables are kept in the output but their
+            value is replaced with :data:`HIDDEN_LOCAL` without ever calling
+            ``repr()`` (or otherwise accessing the value beyond an
+            ``isinstance()`` type check).  This lets you exclude values whose
+            representation would access external resources or leak secrets.
+
+        locals_filter:
+            Optional callable taking the variable name and value and returning
+            ``True`` to exclude the variable.  Excluded variables are handled
+            like those matched by *locals_hide_value*.  The callable itself is
+            responsible for not raising; any raised exception is turned into a
+            :data:`HIDDEN_LOCAL` placeholder.
 
         use_rich: If ``True`` (the default), use rich_ to compute the repr.
             If ``False`` or if rich_ is not installed, fall back to a simpler
@@ -243,6 +295,10 @@ def extract(
 
     .. versionchanged:: 25.5.0
        Handle loops in exception cause chain.
+
+    .. versionchanged:: 26.2.0
+       Added *locals_hide_value* and *locals_filter* arguments.  Excluded
+       values are never rendered.
     """
 
     stacks: list[Stack] = []
@@ -280,6 +336,8 @@ def extract(
                             locals_max_string=locals_max_string,
                             locals_hide_dunder=locals_hide_dunder,
                             locals_hide_sunder=locals_hide_sunder,
+                            locals_hide_value=locals_hide_value,
+                            locals_filter=locals_filter,
                             use_rich=use_rich,
                             _seen=_seen,
                         )
@@ -297,6 +355,29 @@ def extract(
         stacks.append(stack)
         append = stack.frames.append  # pylint: disable=no-member
 
+        # Split the exclusion policy into names and types once, instead of
+        # doing isinstance()/str checks for every local variable.
+        hidden_names = {
+            entity for entity in locals_hide_value if isinstance(entity, str)
+        }
+        hidden_types = tuple(
+            entity
+            for entity in locals_hide_value
+            if isinstance(entity, type)
+        )
+
+        def is_hidden(key: str, value: object) -> bool:
+            """Whether *value* must be kept but never rendered."""
+            if key in hidden_names or isinstance(value, hidden_types):
+                return True
+            if locals_filter is not None:
+                try:
+                    return bool(locals_filter(key, value))
+                except Exception:  # noqa: BLE001
+                    # A failing filter must never leak the value: hide it.
+                    return True
+            return False
+
         def get_locals(
             iter_locals: Iterable[tuple[str, object]],
         ) -> Iterable[tuple[str, object]]:
@@ -311,6 +392,26 @@ def extract(
                     continue
                 yield key, value
 
+        def render_locals(frame_locals: dict[str, object]) -> dict[str, str]:
+            """
+            Build the serializable locals mapping.
+
+            Excluded variables keep their name but get the HIDDEN_LOCAL
+            placeholder; their value is never passed to repr()/rich.
+            """
+            rendered: dict[str, str] = {}
+            for key, value in get_locals(frame_locals.items()):
+                if is_hidden(key, value):
+                    rendered[key] = HIDDEN_LOCAL
+                    continue
+                rendered[key] = to_repr(
+                    value,
+                    max_length=locals_max_length,
+                    max_string=locals_max_string,
+                    use_rich=use_rich,
+                )
+            return rendered
+
         for frame_summary, line_no in walk_tb(traceback):
             filename = frame_summary.f_code.co_filename
             if filename and not filename.startswith("<"):
@@ -319,25 +420,16 @@ def extract(
             # if frame_summary.f_locals.get("_rich_traceback_omit", False):
             #     continue  # noqa: ERA001
 
+            # Only touch f_locals when locals are actually requested, so a
+            # disabled path never accesses any of the frame's values.
+            frame_locals = (
+                render_locals(frame_summary.f_locals) if show_locals else None
+            )
             frame = Frame(
                 filename=filename or "?",
                 lineno=line_no,
                 name=frame_summary.f_code.co_name,
-                locals=(
-                    {
-                        key: to_repr(
-                            value,
-                            max_length=locals_max_length,
-                            max_string=locals_max_string,
-                            use_rich=use_rich,
-                        )
-                        for key, value in get_locals(
-                            frame_summary.f_locals.items()
-                        )
-                    }
-                    if show_locals
-                    else None
-                ),
+                locals=frame_locals,
             )
             append(frame)
 
@@ -396,6 +488,20 @@ class ExceptionDictTransformer:
             This implies hiding *locals_hide_dunder*.
             Defaults to False.
 
+        locals_hide_value:
+            Variable names (exact match) and/or types whose values must never
+            be rendered.  Matching variables are kept in the output but their
+            value is replaced with :data:`HIDDEN_LOCAL` without ever calling
+            ``repr()`` on the value.  Use this to protect values whose
+            representation could access external resources (sockets,
+            database connections, ...) or leak secrets.
+
+        locals_filter:
+            Optional callable taking the variable name and value and returning
+            ``True`` to exclude the variable from rendering.  Excluded
+            variables are replaced with :data:`HIDDEN_LOCAL`.  If the callable
+            raises, the variable is hidden as well.
+
         suppress:
             Optional sequence of modules or paths for which to suppress the
             display of locals even if *show_locals* is ``True``.
@@ -425,6 +531,9 @@ class ExceptionDictTransformer:
 
     .. versionchanged:: 25.4.0
        Handle exception groups.
+
+    .. versionchanged:: 26.2.0
+       Added *locals_hide_value* and *locals_filter* arguments.
     """
 
     show_locals: bool
@@ -432,6 +541,8 @@ class ExceptionDictTransformer:
     locals_max_string: int
     locals_hide_dunder: bool
     locals_hide_sunder: bool
+    locals_hide_value: tuple[str | type[Any], ...]
+    locals_filter: LocalsFilter | None
     suppress: Sequence[str]
     max_frames: int
     use_rich: bool
@@ -444,6 +555,8 @@ class ExceptionDictTransformer:
         locals_max_string: int = LOCALS_MAX_STRING,
         locals_hide_dunder: bool = True,
         locals_hide_sunder: bool = False,
+        locals_hide_value: Iterable[str | type[Any]] = (),
+        locals_filter: LocalsFilter | None = None,
         suppress: Iterable[str | ModuleType] = (),
         max_frames: int = MAX_FRAMES,
         use_rich: bool = True,
@@ -457,11 +570,24 @@ class ExceptionDictTransformer:
         if max_frames < 2:
             msg = f'"max_frames" must be >= 2: {max_frames}'
             raise ValueError(msg)
+        locals_hide_value = tuple(locals_hide_value)
+        for entity in locals_hide_value:
+            if not isinstance(entity, (str, type)):
+                msg = (
+                    '"locals_hide_value" entries must be variable names '
+                    f"(str) or types, got: {entity!r}"
+                )
+                raise ValueError(msg)
+        if locals_filter is not None and not callable(locals_filter):
+            msg = f'"locals_filter" must be callable, got: {locals_filter!r}'
+            raise ValueError(msg)
         self.show_locals = show_locals
         self.locals_max_length = locals_max_length
         self.locals_max_string = locals_max_string
         self.locals_hide_dunder = locals_hide_dunder
         self.locals_hide_sunder = locals_hide_sunder
+        self.locals_hide_value = locals_hide_value
+        self.locals_filter = locals_filter
         self.suppress = []
         for suppress_entity in suppress:
             if not isinstance(suppress_entity, str):
@@ -487,6 +613,8 @@ class ExceptionDictTransformer:
             locals_max_string=self.locals_max_string,
             locals_hide_dunder=self.locals_hide_dunder,
             locals_hide_sunder=self.locals_hide_sunder,
+            locals_hide_value=self.locals_hide_value,
+            locals_filter=self.locals_filter,
             use_rich=self.use_rich,
         )
 

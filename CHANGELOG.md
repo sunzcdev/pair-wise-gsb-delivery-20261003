@@ -15,6 +15,13 @@ You can find our backwards-compatibility policy [here](https://github.com/hynek/
 
 ## [Unreleased](https://github.com/hynek/structlog/compare/26.1.0...HEAD)
 
+### Added
+
+- `structlog.tracebacks.ExceptionDictTransformer` (and `structlog.tracebacks.extract()`) now take *locals_hide_value* and *locals_filter* arguments.
+  They allow excluding frame locals by variable name, type, or an arbitrary predicate **before** their value is rendered: excluded variables keep their name but get the new `structlog.tracebacks.HIDDEN_LOCAL` placeholder and `repr()` is never called on them.
+  This prevents secret leakage and side effects from values whose representation accesses external resources.
+- `structlog.tracebacks.to_repr()` now also catches errors raised by Rich while rendering, and never returns a string longer than the new `structlog.tracebacks.REPR_MAX_STRING`, even when *locals_max_string* is `None`.
+
 ### Changed
 
 - On Python 3.15 and later, *structlog* uses [PEP 810](https://peps.python.org/pep-0810/) lazy imports for modules that are only needed once you log.

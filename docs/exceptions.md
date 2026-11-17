@@ -32,6 +32,32 @@ The most common use-cases are already covered by the following processors:
 {class}`structlog.tracebacks.ExceptionDictTransformer` can be customized with a number of parameters.
 If these prove insufficient, see {ref}`Custom Filtering of Dict Tracebacks <custom-dict-tracebacks>`.
 
+#### Protecting Sensitive and Expensive Locals
+
+Rendering local variables calls `repr()` on their values, which can both leak secrets and trigger expensive or dangerous side effects (for example a database connection whose `__repr__()` runs a query).
+Therefore you should be deliberate about which locals are rendered:
+
+- **Variable names and types**: pass *locals_hide_value* with variable names (exact match) and/or types.
+  Matching variables remain visible by name, but their value is replaced with the `structlog.tracebacks.HIDDEN_LOCAL` placeholder (`"<hidden>"`) **without ever calling `repr()`** on the value (type matching only uses `isinstance()`).
+- **Arbitrary predicates**: pass *locals_filter*, a callable receiving the variable name and value and returning `True` to hide it.
+  If the callable itself raises, the variable is hidden as well.
+- Independently of the configured *locals_max_string*, a rendered value can never exceed `structlog.tracebacks.REPR_MAX_STRING`, even when truncation is disabled.
+  If rendering a value fails, the failure is marked inline as `"<repr-error ...>"` instead of aborting the whole traceback.
+
+Hidden variables are decided before any value formatting, so the exclusion cannot be bypassed by formatting the value first and redacting the resulting string.
+
+```python
+from structlog.tracebacks import ExceptionDictTransformer
+
+transformer = ExceptionDictTransformer(
+    show_locals=True,
+    locals_hide_value=("password", MyConnection),
+    locals_filter=lambda name, value: name.startswith("secret_"),
+)
+```
+
+If *show_locals* is `False` (or locals are suppressed for a frame), the frame's locals are never accessed at all.
+
 
 ## Console rendering
 
