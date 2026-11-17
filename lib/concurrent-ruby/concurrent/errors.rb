@@ -23,6 +23,12 @@ module Concurrent
   # properly initialized.
   InitializationError = Class.new(Error)
 
+  # Raised when a thread re-enters an operation on a synchronized object which
+  # it is already running, i.e. when the operation would block on a lock the
+  # same thread holds. Raised instead of blocking forever, the caller learns
+  # that the operation was rejected.
+  class ReentrantOperationError < IllegalOperationError; end
+
   # Raised when an object with a start/stop lifecycle has been started an
   # excessive number of times. Often used in conjunction with a restart
   # policy or strategy.

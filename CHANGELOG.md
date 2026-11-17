@@ -1,5 +1,18 @@
 ## Current
 
+* `MVar#modify` and `MVar#modify!` no longer leave the cell empty when the block
+  raises. The update has an explicit commit boundary: the block runs with the
+  cell untouched and its result (or `MVar::EMPTY`) is installed in a single
+  step, so concurrent readers and waiters only observe the state before or after
+  the transition. On failure the cell keeps the exact reference it had before
+  the block ran; mutations the block made to that object are not undone.
+* Add `MVar#update` and `MVar#try_update`, which report the outcome in a
+  `Concurrent::MVar::UpdateResult` (`:updated`, `:failed`, `:timeout` or
+  `:empty`) instead of raising.
+* Add `Concurrent::ReentrantOperationError`. A nested operation on the same
+  `MVar` from the thread running its block is now rejected instead of
+  deadlocking.
+
 ## Release v1.3.8 (19 July 2026)
 
 concurrent-ruby:
