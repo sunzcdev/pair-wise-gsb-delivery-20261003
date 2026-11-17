@@ -228,6 +228,74 @@ Read more about consumer priorities here:
 https://www.rabbitmq.com/consumer-priority.html
 
 
+Adjusting the prefetch count at runtime
+=======================================
+
+The prefetch count can be changed after the consumer was created.  Each
+:class:`~kombu.Consumer` keeps its own bookkeeping, so adjusting one consumer
+never overwrites the setting of another consumer or channel.  A
+``prefetch_count`` of zero keeps its protocol meaning of "no limit".
+
+.. note::
+
+    ``basic.qos`` applies to the whole channel, so consumers that share one
+    channel still share the broker-side prefetch window.  Use one channel
+    per consumer when their prefetch settings need to be independent.
+
+The :meth:`~kombu.Consumer.qos` method returns a
+:class:`~kombu.common.QoSState` describing the update:
+
+``desired``
+    the prefetch count the local process wants.
+
+``sent``
+    the last value the broker accepted, or ``None`` if nothing was sent yet.
+
+``pending``
+    the value still waiting to be applied, or ``None`` when nothing is
+    outstanding.
+
+``applied`` / ``in_sync``
+    whether the update is fully applied, and whether the local expectation
+    matches the value that was sent.
+
+``failures`` / ``last_error``
+    the number of consecutive failed attempts and the error raised by the
+    last one.
+
+To merge several adjustments made in one round into a single call, use
+:meth:`~kombu.Consumer.qos_batch`; leaving the block applies the merged value
+once.  If the block raises, nothing is sent and the desired value is kept
+pending for a later retry::
+
+    with consumer.qos_batch():
+        consumer.qos_update(prefetch_count=10)
+        consumer.qos_update(prefetch_count=25)
+
+    state = consumer.qos_state()
+    assert state.sent == 25
+
+A failed call never marks the value as applied.  The value is kept pending
+and the exception is re-raised, so the platform can inspect the state and
+retry later::
+
+    try:
+        consumer.qos(prefetch_count=12)
+    except ConnectionError:
+        assert consumer.qos_state().pending == 12
+
+After the connection was re-established the replacement channel has no
+knowledge of the previous value.  :meth:`~kombu.Consumer.revive` therefore
+sends the prefetch count again automatically, and
+:meth:`~kombu.Consumer.reapply_qos` can be used to force that explicitly::
+
+    consumer.reapply_qos()
+    assert consumer.qos_state().in_sync
+
+See :file:`examples/qos_update_state.py` for a complete offline example
+using a controlled ``basic_qos`` callback.
+
+
 Reference
 =========
 

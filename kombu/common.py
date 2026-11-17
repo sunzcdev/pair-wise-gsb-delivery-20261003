@@ -5,7 +5,7 @@ from __future__ import annotations
 import os
 import socket
 import threading
-from collections import deque
+from collections import deque, namedtuple
 from contextlib import contextmanager
 from functools import partial
 from itertools import count
@@ -360,8 +360,62 @@ def insured(pool, fun, args, kwargs, errback=None, on_revive=None, **opts):
         return retval
 
 
+class QoSState(namedtuple('QoSState', (
+        'desired', 'sent', 'pending', 'applied', 'failures', 'last_error'))):
+    """Snapshot of the QoS state for a single consumer or channel.
+
+    The state tracks the local expectation separately from what was
+    actually sent to the broker:
+
+    Arguments:
+    ---------
+        desired (int): The prefetch count the local platform wants.
+        sent (int or None): The last value accepted by the broker, or
+            :const:`None` when nothing has been sent yet (or the channel
+            was lost and the value has to be sent again).
+        pending (int or None): The value that still has to be applied, or
+            :const:`None` when nothing is outstanding.  A failed call keeps
+            the value here so it is never reported as applied.
+        applied (bool): :const:`True` when no value is pending.
+        failures (int): Consecutive failed applies since the last success.
+        last_error (Exception or None): The error raised by the most recent
+            failed apply, if any.
+    """
+
+    __slots__ = ()
+
+    @property
+    def in_sync(self):
+        """Return true if the broker accepted the current desired value.
+
+        A clamped value (one exceeding the protocol limit) keeps its
+        ``desired`` value, so ``sent`` differs from it and the state is
+        not reported as in sync.  Use ``sent`` to see what actually went
+        over the wire.
+        """
+        return (self.applied and self.sent is not None and
+                self.sent == self.desired)
+
+
 class QoS:
     """Thread safe increment/decrement of a channels prefetch_count.
+
+    The object keeps the local expectation (``value``) apart from the
+    value that was actually accepted by the broker (``prev``), so callers
+    can inspect whether an update is still pending with :meth:`state`.
+    Adjustments made with :meth:`increment_eventually` and
+    :meth:`decrement_eventually` are coalesced: several changes made
+    before the next :meth:`update` result in a single callback call.
+
+    Each instance owns its own bookkeeping, so the prefetch counts of
+    different consumers or channels never overwrite each other.  A zero
+    value keeps its protocol meaning of "no limit": it is still sent
+    once, and increment/decrement calls leave it untouched.
+
+    A failed callback does not mark the value as applied: the desired
+    value is kept pending, :attr:`failures` is incremented and the
+    exception is propagated.  :meth:`reapply` sends the value again,
+    which is what a consumer should do after the connection revived.
 
     Arguments:
     ---------
@@ -391,7 +445,7 @@ class QoS:
         ...     qos.decrement_eventually()
 
         >>> while 1:
-        ...    if qos.prev != qos.value:
+        ...    if qos.state().pending is not None:
         ...        qos.update()  # prefetch changed so update.
 
     It can be used with any function supporting a ``prefetch_count`` keyword
@@ -406,13 +460,69 @@ class QoS:
         >>> QoS(set_qos, 10)
     """
 
-    prev = None
-
     def __init__(self, callback, initial_value, max_prefetch=None):
         self.callback = callback
         self._mutex = threading.RLock()
         self.value = initial_value or 0
         self.max_prefetch = max_prefetch
+        #: last requested value accepted by the broker
+        #: (``None`` before the first successful call).
+        self.prev = None
+        #: last value actually handed to the callback.  This may differ
+        #: from :attr:`prev` when the value had to be clamped.
+        self._sent = None
+        self._failures = 0
+        self._last_error = None
+
+    @property
+    def desired(self):
+        """The prefetch count this object wants to be in effect."""
+        return self.value
+
+    @property
+    def sent(self):
+        """The last value accepted by the broker, or :const:`None`."""
+        return self._sent
+
+    @property
+    def pending(self):
+        """The value waiting to be applied, or :const:`None`."""
+        with self._mutex:
+            return None if self.prev == self.value else self.value
+
+    @property
+    def applied(self):
+        """Return true if no update is waiting to be applied."""
+        return self.pending is None
+
+    @property
+    def failures(self):
+        """Number of consecutive failed applies since the last success."""
+        return self._failures
+
+    @property
+    def last_error(self):
+        """The exception raised by the most recent failed apply."""
+        return self._last_error
+
+    def state(self):
+        """Return a :class:`QoSState` snapshot of this object.
+
+        The snapshot makes it possible to check whether the local
+        expectation matches the value that was sent to the broker, to see
+        the value still pending (for example after a failure), and to
+        inspect the last error.
+        """
+        with self._mutex:
+            pending = None if self.prev == self.value else self.value
+            return QoSState(
+                desired=self.value,
+                sent=self._sent,
+                pending=pending,
+                applied=pending is None,
+                failures=self._failures,
+                last_error=self._last_error,
+            )
 
     def increment_eventually(self, n=1):
         """Increment the value, but do not update the channels QoS.
@@ -422,6 +532,10 @@ class QoS:
             The MainThread will be responsible for calling :meth:`update`
             when necessary. If max_prefetch is set, the value will not
             exceed this limit.
+
+            Several increments made before the next :meth:`update` are
+            coalesced into a single call, and a zero value (no limit) is
+            left untouched.
         """
         with self._mutex:
             if self.value:
@@ -438,6 +552,9 @@ class QoS:
         ----
             The MainThread will be responsible for calling :meth:`update`
             when necessary.
+
+            As with :meth:`increment_eventually`, a zero value keeps its
+            protocol meaning and is not decremented.
         """
         with self._mutex:
             if self.value:
@@ -446,20 +563,76 @@ class QoS:
                     self.value = 1
         return self.value
 
+    def request(self, pcount):
+        """Record a new desired value without sending it yet.
+
+        The value only becomes pending; a later :meth:`update` (or
+        :meth:`reapply`) is what actually calls the broker.  This is what
+        makes it possible to merge several adjustments made in one round
+        into a single call.
+        """
+        with self._mutex:
+            self.value = pcount
+        return self.value
+
     def set(self, pcount):
-        """Set channel prefetch_count setting."""
-        if pcount != self.prev:
+        """Set channel prefetch_count setting.
+
+        The value is recorded as the new local expectation, and only
+        marked as applied once ``callback`` returns successfully.  If the
+        callback raises, the value is kept pending so it can be retried
+        with :meth:`update` or :meth:`reapply`, and the exception is
+        propagated to the caller.
+        """
+        with self._mutex:
+            self.value = pcount
+            if pcount == self.prev:
+                return pcount
             new_value = pcount
             if pcount > PREFETCH_COUNT_MAX:
                 logger.warning('QoS: Disabled: prefetch_count exceeds %r',
                                PREFETCH_COUNT_MAX)
                 new_value = 0
             logger.debug('basic.qos: prefetch_count->%s', new_value)
-            self.callback(prefetch_count=new_value)
+            try:
+                self.callback(prefetch_count=new_value)
+            except Exception as exc:
+                # The broker never accepted this value, so it must not be
+                # reported as applied.  ``prev`` is left untouched and the
+                # desired value stays visible as pending.
+                self._failures += 1
+                self._last_error = exc
+                raise
             self.prev = pcount
-        return pcount
+            self._sent = new_value
+            self._failures = 0
+            self._last_error = None
+            return pcount
 
     def update(self):
         """Update prefetch count with current value."""
         with self._mutex:
             return self.set(self.value)
+
+    def reset(self):
+        """Forget the sent value, e.g. when the channel was lost.
+
+        The desired value is kept, so it shows up as pending and the next
+        :meth:`update` or :meth:`reapply` sends it again on the new
+        channel.
+        """
+        with self._mutex:
+            self.prev = None
+            self._sent = None
+
+    def reapply(self):
+        """Send the current value again, e.g. after a connection revived.
+
+        Unlike :meth:`update` this does not assume the broker still knows
+        the value: the sent state is reset first, so the value is always
+        sent.  A failure leaves it pending for a later retry.
+        """
+        with self._mutex:
+            self.prev = None
+            self._sent = None
+            return self.update()

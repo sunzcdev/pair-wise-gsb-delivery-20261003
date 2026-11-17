@@ -975,8 +975,220 @@ class test_Consumer:
         channel = self.connection.channel()
         queue = Queue('qname', self.exchange, 'rkey')
         consumer = Consumer(channel, queue, auto_declare=True)
-        consumer.qos(30, 10, False)
+        state = consumer.qos(30, 10, False)
         assert 'basic_qos' in channel
+        assert state.desired == 10
+        assert state.sent == 10
+        assert state.applied
+
+    def test_qos_state_before_any_request(self):
+        channel = self.connection.channel()
+        consumer = Consumer(channel, auto_declare=False)
+        state = consumer.qos_state()
+        assert state.desired == 0
+        assert state.sent is None
+        assert state.pending is None
+        assert state.applied
+        assert 'basic_qos' not in channel
+
+    def test_qos_batch_merges_adjustments(self):
+        channel = self.connection.channel()
+        consumer = Consumer(channel, auto_declare=False)
+
+        with consumer.qos_batch():
+            consumer.qos_update(prefetch_count=10)
+            consumer.qos_update(prefetch_count=20)
+            consumer.qos_update(prefetch_size=1024)
+            # Nothing has been sent yet while the round is open.
+            assert 'basic_qos' not in channel
+
+        assert channel.called.count('basic_qos') == 1
+        state = consumer.qos_state()
+        assert state.desired == 20
+        assert state.sent == 20
+        assert state.in_sync
+
+    def test_qos_batch_nested_applies_once(self):
+        channel = self.connection.channel()
+        consumer = Consumer(channel, auto_declare=False)
+
+        with consumer.qos_batch():
+            consumer.qos_update(prefetch_count=5)
+            with consumer.qos_batch():
+                consumer.qos_update(prefetch_count=6)
+            assert 'basic_qos' not in channel
+
+        assert channel.called.count('basic_qos') == 1
+        assert consumer.qos_state().sent == 6
+
+    def test_qos_batch_error_keeps_value_pending(self):
+        channel = self.connection.channel()
+        consumer = Consumer(channel, auto_declare=False)
+
+        with pytest.raises(RuntimeError):
+            with consumer.qos_batch():
+                consumer.qos_update(prefetch_count=9)
+                raise RuntimeError('abort round')
+
+        assert 'basic_qos' not in channel
+        state = consumer.qos_state()
+        assert state.desired == 9
+        assert state.pending == 9
+        assert not state.applied
+
+        # The value is still there to be applied by a later round.
+        consumer.apply_qos()
+        assert 'basic_qos' in channel
+        assert consumer.qos_state().in_sync
+
+    def test_qos_batch_apply_failure_leaves_value_pending(self):
+        channel = self.connection.channel()
+
+        def _boom(*args, **kwargs):
+            raise OperationalError('broker refused')
+        channel.basic_qos = _boom
+        consumer = Consumer(channel, auto_declare=False)
+
+        with pytest.raises(OperationalError):
+            with consumer.qos_batch():
+                consumer.qos_update(prefetch_count=7)
+
+        state = consumer.qos_state()
+        assert state.pending == 7
+        assert state.sent is None
+        assert state.failures == 1
+
+        # The round is closed; a later round can retry the value.
+        assert consumer._qos_batch_depth == 0
+        channel.basic_qos = Mock()
+        consumer.apply_qos()
+        channel.basic_qos.assert_called_once_with(0, 7, False)
+        assert consumer.qos_state().in_sync
+
+    def test_qos_failure_keeps_pending_and_records_error(self):
+        channel = self.connection.channel()
+
+        def _boom(*args, **kwargs):
+            raise OperationalError('broker refused')
+        channel.basic_qos = _boom
+        consumer = Consumer(channel, auto_declare=False)
+
+        with pytest.raises(OperationalError):
+            consumer.qos(prefetch_count=11)
+
+        state = consumer.qos_state()
+        assert state.desired == 11
+        assert state.pending == 11
+        assert state.sent is None
+        assert state.failures == 1
+        assert isinstance(state.last_error, OperationalError)
+
+    def test_qos_failure_not_reported_as_applied(self):
+        channel = self.connection.channel()
+        consumer = Consumer(channel, auto_declare=False)
+        consumer.qos(prefetch_count=4)
+
+        channel.basic_qos = Mock(side_effect=OperationalError('gone'))
+        with pytest.raises(OperationalError):
+            consumer.qos(prefetch_count=8)
+
+        state = consumer.qos_state()
+        # The previously sent value is unchanged; the new one is pending.
+        assert state.sent == 4
+        assert state.desired == 8
+        assert state.pending == 8
+        assert not state.applied
+
+    def test_qos_reapplied_after_revive(self):
+        channel = self.connection.channel()
+        consumer = Consumer(channel, auto_declare=False)
+        consumer.qos(prefetch_count=10)
+        assert channel.called.count('basic_qos') == 1
+
+        new_channel = self.connection.channel()
+        consumer.revive(new_channel)
+        # Revive sends the value again on the replacement channel even
+        # though the count did not change.
+        assert new_channel.called.count('basic_qos') == 1
+        assert consumer.qos_state().in_sync
+
+    def test_qos_reapplied_after_failure_on_revive(self):
+        channel = self.connection.channel()
+        consumer = Consumer(channel, auto_declare=False)
+        consumer.qos(prefetch_count=10)
+
+        new_channel = self.connection.channel()
+
+        def _boom(*args, **kwargs):
+            raise OperationalError('still down')
+        new_channel.basic_qos = _boom
+
+        with pytest.raises(OperationalError):
+            consumer.revive(new_channel)
+
+        state = consumer.qos_state()
+        assert state.desired == 10
+        assert state.pending == 10
+        assert not state.applied
+
+        new_channel.basic_qos = Mock()
+        consumer.reapply_qos()
+        new_channel.basic_qos.assert_called_once_with(0, 10, False)
+        assert consumer.qos_state().in_sync
+
+    def test_qos_does_not_share_state_between_consumers(self):
+        channel = self.connection.channel()
+        first = Consumer(channel, auto_declare=False)
+        second = Consumer(channel, auto_declare=False)
+
+        first.qos(prefetch_count=10)
+        second.qos(prefetch_count=20)
+
+        assert first.qos_state().desired == 10
+        assert second.qos_state().desired == 20
+        assert channel.called.count('basic_qos') == 2
+
+    def test_qos_zero_means_unlimited(self):
+        channel = self.connection.channel()
+        consumer = Consumer(channel, auto_declare=False)
+        consumer.qos(prefetch_count=0)
+        assert 'basic_qos' in channel
+        state = consumer.qos_state()
+        assert state.desired == 0
+        assert state.sent == 0
+        assert state.in_sync
+
+    def test_qos_prefetch_size_and_global_are_forwarded(self):
+        channel = self.connection.channel()
+        consumer = Consumer(channel, auto_declare=False)
+        calls = []
+        channel.basic_qos = Mock(
+            side_effect=lambda size, count, glob: calls.append(
+                (size, count, glob)),
+        )
+
+        consumer.qos(prefetch_size=1024, prefetch_count=5, apply_global=True)
+        assert calls == [(1024, 5, True)]
+
+        # Only the global flag changes: the value must be sent again.
+        consumer.qos(prefetch_size=1024, prefetch_count=5, apply_global=False)
+        assert calls == [(1024, 5, True), (1024, 5, False)]
+
+    def test_qos_update_size_only_resends_value(self):
+        channel = self.connection.channel()
+        consumer = Consumer(channel, auto_declare=False)
+        calls = []
+        channel.basic_qos = Mock(
+            side_effect=lambda size, count, glob: calls.append(
+                (size, count, glob)),
+        )
+
+        consumer.qos(prefetch_count=6)
+        # Only the prefetch window changes; the count is unchanged but the
+        # previous call can't be reused because the envelope differs.
+        consumer.qos_update(prefetch_size=2048)
+        assert calls == [(0, 6, False), (2048, 6, False)]
+        assert consumer.qos_state().in_sync
 
     def test_purge(self):
         channel = self.connection.channel()

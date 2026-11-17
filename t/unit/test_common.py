@@ -696,3 +696,163 @@ class test_QoS:
         assert qos.increment_eventually(-5) == 5
         assert qos.increment_eventually(8) == 10  # Should hit limit
         assert qos.increment_eventually(-2) == 10  # Should stay at limit
+
+    def test_state_reports_pending_until_applied(self):
+        callback = Mock()
+        qos = QoS(callback, 10)
+        assert qos.state().pending == 10
+        assert not qos.state().applied
+        assert qos.state().sent is None
+
+        qos.update()
+        state = qos.state()
+        assert state.desired == 10
+        assert state.sent == 10
+        assert state.pending is None
+        assert state.applied
+        assert state.in_sync
+        callback.assert_called_once_with(prefetch_count=10)
+
+    def test_state_coalesces_adjustments_before_update(self):
+        callback = Mock()
+        qos = QoS(callback, 10)
+        qos.update()
+        callback.reset_mock()
+
+        qos.increment_eventually()
+        qos.increment_eventually()
+        qos.decrement_eventually()
+        assert qos.state().desired == 11
+        assert qos.state().pending == 11
+        callback.assert_not_called()
+
+        qos.update()
+        callback.assert_called_once_with(prefetch_count=11)
+        assert qos.state().in_sync
+
+    def test_zero_is_still_sent_but_not_adjusted(self):
+        callback = Mock()
+        qos = QoS(callback, 0)
+        qos.update()
+        # Zero means "no limit" and must still reach the broker.
+        callback.assert_called_once_with(prefetch_count=0)
+        assert qos.state().in_sync
+
+        qos.increment_eventually(5)
+        qos.decrement_eventually(5)
+        assert qos.value == 0
+        qos.update()
+        # No further call: the value did not change.
+        callback.assert_called_once_with(prefetch_count=0)
+
+    def test_failure_keeps_value_pending(self):
+        callback = Mock(name='callback')
+        callback.side_effect = OSError('broker gone')
+        qos = QoS(callback, 10)
+
+        with pytest.raises(OSError):
+            qos.update()
+
+        state = qos.state()
+        assert state.desired == 10
+        assert state.pending == 10
+        assert state.sent is None
+        assert not state.applied
+        assert not state.in_sync
+        assert state.failures == 1
+        assert isinstance(state.last_error, OSError)
+
+    def test_failure_is_not_marked_as_applied_then_retried(self):
+        callback = Mock(name='callback')
+        callback.side_effect = [OSError('broker gone'), None]
+        qos = QoS(callback, 12)
+
+        with pytest.raises(OSError):
+            qos.update()
+        assert qos.state().pending == 12
+
+        # The retry succeeds and only then is the value reported applied.
+        qos.update()
+        state = qos.state()
+        assert state.sent == 12
+        assert state.applied
+        assert state.failures == 0
+        assert state.last_error is None
+
+    def test_failure_does_not_lose_a_newer_desired_value(self):
+        callback = Mock(name='callback')
+        callback.side_effect = OSError('broker gone')
+        qos = QoS(callback, 10)
+
+        with pytest.raises(OSError):
+            qos.update()
+        qos.increment_eventually()
+        assert qos.state().pending == 11
+
+        callback.side_effect = None
+        qos.update()
+        callback.assert_called_with(prefetch_count=11)
+        assert qos.state().in_sync
+
+    def test_reapply_after_connection_loss(self):
+        callback = Mock(name='callback')
+        qos = QoS(callback, 7)
+        qos.update()
+        callback.assert_called_once_with(prefetch_count=7)
+
+        # The channel is gone: the broker no longer knows the value even
+        # though it matches the local expectation.
+        qos.reset()
+        state = qos.state()
+        assert state.sent is None
+        assert state.pending == 7
+        assert not state.in_sync
+
+        qos.reapply()
+        assert callback.call_count == 2
+        assert qos.state().in_sync
+
+    def test_reapply_sends_again_without_reset(self):
+        callback = Mock(name='callback')
+        qos = QoS(callback, 3)
+        qos.update()
+        qos.reapply()
+        assert callback.call_count == 2
+        callback.assert_called_with(prefetch_count=3)
+
+    def test_separate_instances_do_not_share_state(self):
+        first = Mock(name='first')
+        second = Mock(name='second')
+        qos1 = QoS(first, 10)
+        qos2 = QoS(second, 20)
+
+        qos1.update()
+        qos2.update()
+        first.assert_called_once_with(prefetch_count=10)
+        second.assert_called_once_with(prefetch_count=20)
+        assert qos1.state().desired == 10
+        assert qos2.state().desired == 20
+
+    def test_clamped_value_reports_sent_value(self):
+        callback = Mock(name='callback')
+        qos = QoS(callback, PREFETCH_COUNT_MAX + 1)
+        with patch('kombu.common.logger'):
+            qos.update()
+        callback.assert_called_once_with(prefetch_count=0)
+        state = qos.state()
+        assert state.desired == PREFETCH_COUNT_MAX + 1
+        assert state.sent == 0
+        assert state.applied
+        # The broker clamped the value, so it is not the desired one.
+        assert not state.in_sync
+
+    def test_request_only_records_value(self):
+        callback = Mock(name='callback')
+        qos = QoS(callback, 10)
+        qos.request(15)
+        callback.assert_not_called()
+        assert qos.state().desired == 15
+        assert qos.state().pending == 15
+
+        qos.update()
+        callback.assert_called_once_with(prefetch_count=15)

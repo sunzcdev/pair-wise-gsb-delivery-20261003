@@ -2,11 +2,12 @@
 
 from __future__ import annotations
 
+from contextlib import contextmanager
 from itertools import count
 from threading import local
 from typing import TYPE_CHECKING
 
-from .common import maybe_declare
+from .common import QoS, QoSState, maybe_declare
 from .compression import compress
 from .connection import PooledConnection, is_connection, maybe_channel
 from .entity import Exchange, Queue, maybe_delivery_mode
@@ -558,6 +559,18 @@ class Consumer:
     #: Mapping of queues we consume from.
     _queues = None
 
+    #: Per-consumer QoS coordinator, created on demand.
+    #:
+    #: Keeping one coordinator per consumer means the prefetch settings of
+    #: one consumer never overwrite those of another consumer or channel.
+    _qos = None
+
+    #: Prefetch window size last requested through :meth:`qos`.
+    prefetch_size = 0
+
+    #: Whether the last requested QoS update applied to all channels.
+    apply_global = False
+
     _tags = count(1)  # global
 
     def __init__(self, channel, queues=None, no_ack=None, auto_declare=None,
@@ -572,6 +585,8 @@ class Consumer:
         self.tag_prefix = tag_prefix
         self._active_tags = {}
         self._active_queue_no_ack = {}
+        self._qos = None
+        self._qos_batch_depth = 0
         if auto_declare is not None:
             self.auto_declare = auto_declare
         if on_decode_error is not None:
@@ -607,7 +622,12 @@ class Consumer:
             self.declare()
 
         if self.prefetch_count is not None:
-            self.qos(prefetch_count=self.prefetch_count)
+            # The channel may have been replaced: the prefetch value the
+            # broker knew about is gone, so it has to be sent again even
+            # if it matches the local expectation.  A failure here must
+            # not hide a value that is already pending, so `reapply_qos`
+            # keeps it for a later retry.
+            self.reapply_qos()
 
         # re-register the AMQP consumers, but only for queues that were
         # actually being consumed from before (not merely registered).
@@ -785,6 +805,15 @@ class Consumer:
 
         The prefetch window is Ignored if the :attr:`no_ack` option is set.
 
+        The request goes through this consumer's own QoS coordinator, so
+        the prefetch setting of one consumer never overwrites the setting
+        of another consumer or channel.  A zero ``prefetch_count`` keeps
+        its protocol meaning of "no limit".
+
+        If the broker call fails the value is kept pending, the error is
+        recorded and re-raised; it is never reported as applied.  The
+        next :meth:`apply_qos` or :meth:`reapply_qos` sends it again.
+
         Arguments:
         ---------
             prefetch_size (int): Specify the prefetch window in octets.
@@ -798,10 +827,160 @@ class Consumer:
                 whole messages.
 
             apply_global (bool): Apply new settings globally on all channels.
+
+        Returns
+        -------
+            QoSState: the state of this consumer's QoS update.
         """
-        return self.channel.basic_qos(prefetch_size,
-                                      prefetch_count,
-                                      apply_global)
+        return self._qos_change(
+            prefetch_size, prefetch_count, apply_global,
+        )
+
+    @contextmanager
+    def qos_batch(self):
+        """Collect QoS adjustments and apply them only once.
+
+        Every :meth:`qos`, :meth:`qos_update` or prefetch change made
+        inside the block updates the desired value only.  When the
+        outermost block is left successfully a single QoS call is made
+        with the merged value.  If the block raises, nothing is sent and
+        the desired value is kept pending for a later retry.
+
+        Example:
+        -------
+            >>> with consumer.qos_batch():
+            ...     consumer.qos_update(prefetch_count=10)
+            ...     consumer.qos_update(prefetch_count=20)
+            >>> consumer.qos_state().sent
+            20
+        """
+        self._qos_batch_depth += 1
+        try:
+            yield self
+        except BaseException:
+            # Do not send a partially collected value when the round
+            # failed: it stays pending so a later retry can apply it.
+            self._qos_batch_depth -= 1
+            raise
+        self._qos_batch_depth -= 1
+        # Only reached on a successful exit of the outermost round.
+        if not self._qos_batch_depth:
+            self.apply_qos()
+
+    def qos_update(self, prefetch_size=None, prefetch_count=None,
+                   apply_global=None):
+        """Change the desired prefetch values without necessarily sending.
+
+        Inside a :meth:`qos_batch` block the values are only merged; the
+        caller must leave the block (or call :meth:`apply_qos`) for a
+        single QoS call to be made.  Outside a block the change is applied
+        immediately, like :meth:`qos`.
+
+        Returns
+        -------
+            QoSState: the state of this consumer's QoS update.
+        """
+        if prefetch_size is None:
+            prefetch_size = self.prefetch_size
+        if apply_global is None:
+            apply_global = self.apply_global
+        return self._qos_change(
+            prefetch_size, prefetch_count, apply_global,
+        )
+
+    def _qos_change(self, prefetch_size, prefetch_count, apply_global):
+        """Merge a QoS request and apply it unless a round is open."""
+        envelope_changed = (
+            prefetch_size != self.prefetch_size or
+            apply_global != self.apply_global
+        )
+        if (prefetch_count is None and not envelope_changed and
+                self._qos is None):
+            # Nothing was ever requested and this call changes nothing.
+            return self.qos_state()
+        self.prefetch_size = prefetch_size
+        self.apply_global = apply_global
+        if prefetch_count is not None:
+            self.prefetch_count = prefetch_count
+        qos = self._qos_controller()
+        if envelope_changed:
+            # The count may be unchanged while the window size or the
+            # scope changed, so the previously sent value can't be reused.
+            qos.reset()
+        if prefetch_count is not None:
+            qos.request(prefetch_count)
+        if self._qos_batch_depth:
+            # Collected by the surrounding :meth:`qos_batch` context and
+            # sent once when that round finishes.
+            return qos.state()
+        return self.apply_qos()
+
+    def apply_qos(self):
+        """Send the desired prefetch count if it is not in effect yet.
+
+        Returns
+        -------
+            QoSState: the state after the call.
+
+        Raises
+        ------
+            Exception: whatever the underlying QoS callback raised.  The
+                desired value stays pending in that case.
+        """
+        qos = self._qos
+        if qos is None:
+            # Nothing has been requested for this consumer yet, so there
+            # is nothing to send and no state to change.
+            return self.qos_state()
+        qos.update()
+        return qos.state()
+
+    def reapply_qos(self, prefetch_count=None):
+        """Send the desired prefetch count again.
+
+        Used after a connection was re-established: the replacement
+        channel has no knowledge of the value, so it is sent even when it
+        matches the last value accepted by the previous channel.
+
+        Returns
+        -------
+            QoSState: the state after the call.
+        """
+        qos = self._qos_controller()
+        if prefetch_count is not None:
+            self.prefetch_count = prefetch_count
+            qos.request(prefetch_count)
+        qos.reapply()
+        return qos.state()
+
+    def qos_state(self):
+        """Return the current QoS update state of this consumer.
+
+        The returned :class:`~kombu.common.QoSState` exposes the local
+        ``desired`` value, the value last ``sent`` to the broker, the
+        ``pending`` value still to apply, whether it was ``applied``, and
+        the ``failures``/``last_error`` of the most recent apply.
+        """
+        qos = self._qos
+        if qos is None:
+            desired = self.prefetch_count or 0
+            return QoSState(
+                desired=desired, sent=None, pending=None,
+                applied=True, failures=0, last_error=None,
+            )
+        return qos.state()
+
+    def _qos_controller(self):
+        if self._qos is None:
+            self._qos = QoS(
+                self._send_qos, self.prefetch_count or 0,
+            )
+        return self._qos
+
+    def _send_qos(self, prefetch_count):
+        return self.channel.basic_qos(
+            self.prefetch_size, prefetch_count, self.apply_global,
+        )
 
     def recover(self, requeue=False):
         """Redeliver unacknowledged messages.
