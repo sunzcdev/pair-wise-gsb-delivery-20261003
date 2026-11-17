@@ -4,8 +4,8 @@ from threading import Lock
 import time
 import types
 from typing import (
-    Any, Callable, Dict, Iterable, List, Literal, Optional, Sequence, Tuple,
-    Type, TypeVar, Union,
+    Any, Callable, Dict, Iterable, List, Literal, Mapping, Optional, Sequence,
+    Tuple, Type, TypeVar, Union,
 )
 import warnings
 
@@ -21,6 +21,11 @@ from .validation import (
 
 T = TypeVar('T', bound='MetricWrapperBase')
 F = TypeVar("F", bound=Callable[..., Any])
+
+
+class LabelLimitExceededError(Exception):
+    """Raised when a metric with a label cardinality limit cannot create
+    another distinct labelset and no overflow labelset was declared."""
 
 
 def _build_full_name(metric_type, name, namespace, subsystem, unit):
@@ -109,6 +114,8 @@ class MetricWrapperBase(Collector):
                  unit: str = '',
                  registry: Optional[CollectorRegistry] = REGISTRY,
                  _labelvalues: Optional[Sequence[str]] = None,
+                 label_limit: Optional[int] = None,
+                 overflow_labels: Optional[Union[Sequence[object], Mapping[str, object]]] = None,
                  ) -> None:
 
         self._original_name = name
@@ -122,6 +129,19 @@ class MetricWrapperBase(Collector):
         self._unit = unit
 
         _validate_metric_name(self._name)
+
+        # Optional cap on the number of distinct labelsets (children) that
+        # this parent metric is allowed to keep. None means unlimited.
+        if label_limit is not None:
+            if isinstance(label_limit, bool) or not isinstance(label_limit, int):
+                raise ValueError('label_limit must be an integer, got %r' % (label_limit,))
+            if label_limit < 0:
+                raise ValueError('label_limit must be non-negative, got %d' % label_limit)
+        self._label_limit = label_limit
+
+        # Fixed labelset that receives observations once the limit is reached.
+        # It is created lazily and does not consume a slot of label_limit.
+        self._overflow_labelvalues = self._parse_overflow_labels(overflow_labels)
 
         if self._is_parent():
             # Prepare the fields needed for child metrics.
@@ -158,6 +178,19 @@ class MetricWrapperBase(Collector):
 
         See the best practices on [naming](http://prometheus.io/docs/practices/naming/)
         and [labels](http://prometheus.io/docs/practices/instrumentation/#use-labels).
+
+        If the metric was constructed with ``label_limit``, at most that many
+        distinct ordinary labelsets are kept. Existing labelsets always remain
+        usable. When a new labelset would exceed the limit, it is either routed
+        to the fixed labelset declared via ``overflow_labels`` (which does not
+        count against the limit), or raises ``LabelLimitExceededError`` when no
+        overflow labelset was declared. Concurrent first-time calls for the
+        same labelset create a single child and consume a single slot.
+
+        Children obtained before a ``remove()``/``clear()`` keep working as
+        independent objects, but they are no longer exported and never return
+        from later ``.labels()`` calls; the next ``.labels()`` call for that
+        labelset creates a fresh child (possibly subject to the limit again).
         """
         if not self._labelnames:
             raise ValueError('No label names were set when constructing %s' % self)
@@ -188,27 +221,69 @@ class MetricWrapperBase(Collector):
 
         with self._lock:
             if str_labelvalues not in self._metrics:
-
-                original_name = getattr(self, '_original_name', self._name)
-                namespace = getattr(self, '_namespace', '')
-                subsystem = getattr(self, '_subsystem', '')
-                unit = getattr(self, '_unit', '')
-
-                child_kwargs = dict(self._kwargs) if self._kwargs else {}
-                for k in ('namespace', 'subsystem', 'unit'):
-                    child_kwargs.pop(k, None)
-
-                self._metrics[str_labelvalues] = self.__class__(
-                    original_name,
-                    documentation=self._documentation,
-                    labelnames=self._labelnames,
-                    namespace=namespace,
-                    subsystem=subsystem,
-                    unit=unit,
-                    _labelvalues=str_labelvalues,
-                    **child_kwargs
-                )
+                if self._at_label_limit():
+                    if self._overflow_labelvalues is None:
+                        raise LabelLimitExceededError(
+                            'Metric %s already has %s label combination(s), the maximum '
+                            'configured via label_limit; rejecting new combination %r'
+                            % (self._name, self._label_limit, dict(zip(self._labelnames, str_labelvalues)))
+                        )
+                    str_labelvalues = self._overflow_labelvalues
+                if str_labelvalues not in self._metrics:
+                    self._metrics[str_labelvalues] = self._make_child(str_labelvalues)
             return self._metrics[str_labelvalues]
+
+    def _parse_overflow_labels(self,
+                               overflow_labels: Optional[Union[Sequence[object], Mapping[str, object]]],
+                               ) -> Optional[Tuple[str, ...]]:
+        """Validate and normalize the caller-declared fixed overflow labelset."""
+        if overflow_labels is None:
+            return None
+        if not self._labelnames:
+            raise ValueError('overflow_labels can only be used on metrics with labelnames')
+        if isinstance(overflow_labels, Mapping):
+            if sorted(overflow_labels) != sorted(self._labelnames):
+                raise ValueError('Incorrect label names in overflow_labels')
+            return tuple(str(overflow_labels[l]) for l in self._labelnames)
+        if len(overflow_labels) != len(self._labelnames):
+            raise ValueError('Incorrect label count in overflow_labels')
+        return tuple(str(v) for v in overflow_labels)
+
+    def _at_label_limit(self) -> bool:
+        """Whether a new distinct labelset must be diverted or rejected.
+
+        Only parents constructed with ``label_limit`` are bounded. The
+        overflow labelset is shared and does not consume a regular slot, so
+        the number of ordinary children is what counts against the limit.
+        Must be called while holding ``self._lock``.
+        """
+        if self._label_limit is None or not self._labelnames:
+            return False
+        ordinary = len(self._metrics)
+        if self._overflow_labelvalues is not None and self._overflow_labelvalues in self._metrics:
+            ordinary -= 1
+        return ordinary >= self._label_limit
+
+    def _make_child(self: T, str_labelvalues: Sequence[str]) -> T:
+        original_name = getattr(self, '_original_name', self._name)
+        namespace = getattr(self, '_namespace', '')
+        subsystem = getattr(self, '_subsystem', '')
+        unit = getattr(self, '_unit', '')
+
+        child_kwargs = dict(self._kwargs) if self._kwargs else {}
+        for k in ('namespace', 'subsystem', 'unit'):
+            child_kwargs.pop(k, None)
+
+        return self.__class__(
+            original_name,
+            documentation=self._documentation,
+            labelnames=self._labelnames,
+            namespace=namespace,
+            subsystem=subsystem,
+            unit=unit,
+            _labelvalues=str_labelvalues,
+            **child_kwargs
+        )
 
     def remove(self, *labelvalues: Any) -> None:
         if 'prometheus_multiproc_dir' in os.environ or 'PROMETHEUS_MULTIPROC_DIR' in os.environ:
@@ -428,6 +503,8 @@ class Gauge(MetricWrapperBase):
                  registry: Optional[CollectorRegistry] = REGISTRY,
                  _labelvalues: Optional[Sequence[str]] = None,
                  multiprocess_mode: Literal['all', 'liveall', 'min', 'livemin', 'max', 'livemax', 'sum', 'livesum', 'mostrecent', 'livemostrecent'] = 'all',
+                 label_limit: Optional[int] = None,
+                 overflow_labels: Optional[Union[Sequence[object], Mapping[str, object]]] = None,
                  ):
         self._multiprocess_mode = multiprocess_mode
         if multiprocess_mode not in self._MULTIPROC_MODES:
@@ -441,6 +518,8 @@ class Gauge(MetricWrapperBase):
             unit=unit,
             registry=registry,
             _labelvalues=_labelvalues,
+            label_limit=label_limit,
+            overflow_labels=overflow_labels,
         )
         self._kwargs['multiprocess_mode'] = self._multiprocess_mode
         self._is_most_recent = self._multiprocess_mode in self._MOST_RECENT_MODES
@@ -631,6 +710,8 @@ class Histogram(MetricWrapperBase):
                  registry: Optional[CollectorRegistry] = REGISTRY,
                  _labelvalues: Optional[Sequence[str]] = None,
                  buckets: Sequence[Union[float, str]] = DEFAULT_BUCKETS,
+                 label_limit: Optional[int] = None,
+                 overflow_labels: Optional[Union[Sequence[object], Mapping[str, object]]] = None,
                  ):
         self._prepare_buckets(buckets)
         super().__init__(
@@ -642,6 +723,8 @@ class Histogram(MetricWrapperBase):
             unit=unit,
             registry=registry,
             _labelvalues=_labelvalues,
+            label_limit=label_limit,
+            overflow_labels=overflow_labels,
         )
         self._kwargs['buckets'] = buckets
 
@@ -781,6 +864,8 @@ class Enum(MetricWrapperBase):
                  registry: Optional[CollectorRegistry] = REGISTRY,
                  _labelvalues: Optional[Sequence[str]] = None,
                  states: Optional[Sequence[str]] = None,
+                 label_limit: Optional[int] = None,
+                 overflow_labels: Optional[Union[Sequence[object], Mapping[str, object]]] = None,
                  ):
         if name in labelnames:
             raise ValueError(f'Overlapping labels for Enum metric: {name}')
@@ -795,6 +880,8 @@ class Enum(MetricWrapperBase):
             unit=unit,
             registry=registry,
             _labelvalues=_labelvalues,
+            label_limit=label_limit,
+            overflow_labels=overflow_labels,
         )
         self._kwargs['states'] = self._states = states
 

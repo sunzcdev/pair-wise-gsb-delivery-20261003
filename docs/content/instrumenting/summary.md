@@ -77,6 +77,7 @@ print(t.duration) # observed time in seconds.
 ## Labels
 
 See [Labels](../labels/) for how to use `.labels()`, `.remove()`, `.remove_by_labels()`, and `.clear()`.
+`label_limit` and `overflow_labels` can bound the number of label combinations; see [Limiting label cardinality](../labels/#limiting-label-cardinality).
 
 ## Real-world example
 

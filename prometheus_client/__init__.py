@@ -14,7 +14,7 @@ from .exposition import (
 from .gc_collector import GC_COLLECTOR, GCCollector
 from .metrics import (
     Counter, disable_created_metrics, enable_created_metrics, Enum, Gauge,
-    Histogram, Info, Summary,
+    Histogram, Info, LabelLimitExceededError, Summary,
 )
 from .metrics_core import Metric
 from .platform_collector import PLATFORM_COLLECTOR, PlatformCollector
@@ -31,6 +31,7 @@ __all__ = (
     'Histogram',
     'Info',
     'Enum',
+    'LabelLimitExceededError',
     'enable_created_metrics',
     'disable_created_metrics',
     'CONTENT_TYPE_LATEST',

@@ -16,7 +16,7 @@ from prometheus_client.core import (
 )
 from prometheus_client.decorator import getargspec
 from prometheus_client.exposition import generate_latest
-from prometheus_client.metrics import _get_use_created
+from prometheus_client.metrics import _get_use_created, LabelLimitExceededError
 from prometheus_client.validation import (
     disable_legacy_validation, enable_legacy_validation,
 )
@@ -868,6 +868,250 @@ class TestMetricWrapper(unittest.TestCase):
     def test_name_cleanup_before_unit_append(self):
         c = Counter('b_total', 'help', unit="total", labelnames=['l'], registry=self.registry)
         self.assertEqual(c._name, 'b_total')
+
+
+class TestLabelLimit(unittest.TestCase):
+    def setUp(self):
+        self.registry = CollectorRegistry()
+
+    def test_unlimited_by_default(self):
+        c = Counter('c', 'help', ['l'], registry=self.registry)
+        for i in range(100):
+            c.labels('v%d' % i).inc()
+        self.assertEqual(len(c._metrics), 100)
+
+    def test_existing_combinations_remain_usable_at_limit(self):
+        c = Counter('c', 'help', ['l'], registry=self.registry, label_limit=2)
+        c.labels('a').inc()
+        c.labels('b').inc(2)
+        with self.assertRaises(LabelLimitExceededError):
+            c.labels('c')
+        # Already-created children keep working and are not recreated.
+        c.labels('a').inc(4)
+        self.assertIs(c.labels('a'), c._metrics[('a',)])
+        self.assertEqual(5, self.registry.get_sample_value('c_total', {'l': 'a'}))
+        self.assertEqual(2, self.registry.get_sample_value('c_total', {'l': 'b'}))
+        self.assertIsNone(self.registry.get_sample_value('c_total', {'l': 'c'}))
+
+    def test_limit_applies_to_each_metric_type(self):
+        for metric_type, kwargs in (
+            (Counter, {}),
+            (Gauge, {}),
+            (Summary, {}),
+            (Histogram, {}),
+            (Info, {}),
+            (Enum, {'states': ['s0', 's1']}),
+        ):
+            with self.subTest(metric_type=metric_type):
+                registry = CollectorRegistry()
+                metric = metric_type(
+                    'm', 'help', ['l'], registry=registry, label_limit=1, **kwargs
+                )
+                metric.labels('a')
+                with self.assertRaises(LabelLimitExceededError):
+                    metric.labels('b')
+
+    def test_overflow_routes_new_combinations_to_fixed_labelset(self):
+        c = Counter(
+            'c', 'help', ['l'], registry=self.registry,
+            label_limit=2, overflow_labels=('other',),
+        )
+        c.labels('a').inc()
+        c.labels('b').inc()
+        first_overflow = c.labels('x')
+        second_overflow = c.labels('y')
+        # All rejected combinations share one overflow child.
+        self.assertIs(first_overflow, second_overflow)
+        self.assertIs(c.labels('other'), first_overflow)
+        first_overflow.inc(3)
+        second_overflow.inc(2)
+        self.assertEqual(
+            5, self.registry.get_sample_value('c_total', {'l': 'other'})
+        )
+        # Two ordinary slots plus the single overflow child.
+        self.assertEqual(len(c._metrics), 3)
+
+    def test_overflow_labels_accepted_as_mapping(self):
+        c = Counter(
+            'c', 'help', ['a', 'b'], registry=self.registry,
+            label_limit=1, overflow_labels={'a': 'ovf', 'b': 'x'},
+        )
+        c.labels('keep', '1').inc()
+        c.labels('new', '2').inc(4)
+        self.assertEqual(
+            4,
+            self.registry.get_sample_value('c_total', {'a': 'ovf', 'b': 'x'}),
+        )
+
+    def test_overflow_labelset_does_not_consume_a_slot(self):
+        c = Counter(
+            'c', 'help', ['l'], registry=self.registry,
+            label_limit=1, overflow_labels=('ovf',),
+        )
+        c.labels('a').inc()
+        c.labels('b').inc(2)  # diverted
+        c.remove('a')
+        # The freed slot can be used by an ordinary combination again.
+        c.labels('c').inc(3)
+        self.assertEqual(
+            3, self.registry.get_sample_value('c_total', {'l': 'c'})
+        )
+        # Another new combination still overflows.
+        c.labels('d').inc(4)
+        self.assertEqual(
+            6, self.registry.get_sample_value('c_total', {'l': 'ovf'})
+        )
+        self.assertEqual(set(c._metrics), {('c',), ('ovf',)})
+
+    def test_remove_and_clear_release_quota(self):
+        c = Counter('c', 'help', ['l'], registry=self.registry, label_limit=2)
+        c.labels('a')
+        c.labels('b')
+        with self.assertRaises(LabelLimitExceededError):
+            c.labels('c')
+        c.remove('a')
+        c.labels('c')  # quota freed, no exception
+        self.assertEqual(set(c._metrics), {('b',), ('c',)})
+
+        c.clear()
+        c.labels('d')
+        c.labels('e')
+        self.assertEqual(set(c._metrics), {('d',), ('e',)})
+        with self.assertRaises(LabelLimitExceededError):
+            c.labels('f')
+
+    def test_zero_limit_rejects_every_new_combination(self):
+        c = Counter('c', 'help', ['l'], registry=self.registry, label_limit=0)
+        with self.assertRaises(LabelLimitExceededError):
+            c.labels('a')
+        self.assertEqual(c._metrics, {})
+
+    def test_zero_limit_with_overflow_captures_everything(self):
+        c = Counter(
+            'c', 'help', ['l'], registry=self.registry,
+            label_limit=0, overflow_labels=('ovf',),
+        )
+        c.labels('a').inc()
+        c.labels('b').inc(2)
+        self.assertEqual(
+            3, self.registry.get_sample_value('c_total', {'l': 'ovf'})
+        )
+        self.assertEqual(set(c._metrics), {('ovf',)})
+
+    def test_histogram_derived_samples_share_one_identity(self):
+        h = Histogram(
+            'h', 'help', ['l'], registry=self.registry,
+            label_limit=1, overflow_labels=('ovf',),
+        )
+        h.labels('a').observe(0.1)
+        h.labels('b').observe(0.2)  # diverted, all buckets/count/sum shared
+        h.labels('c').observe(0.3)
+        # One ordinary child plus one overflow child, regardless of bucket count.
+        self.assertEqual(set(h._metrics), {('a',), ('ovf',)})
+        self.assertEqual(
+            2, self.registry.get_sample_value('h_count', {'l': 'ovf'})
+        )
+        self.assertEqual(
+            2, self.registry.get_sample_value(
+                'h_bucket', {'l': 'ovf', 'le': '+Inf'}
+            )
+        )
+
+    def test_gauge_derived_identity_with_custom_mode(self):
+        g = Gauge(
+            'g', 'help', ['l'], registry=self.registry,
+            label_limit=1, overflow_labels=('ovf',), multiprocess_mode='sum',
+        )
+        g.labels('a').set(1)
+        g.labels('b').set(2)
+        self.assertEqual(set(g._metrics), {('a',), ('ovf',)})
+        self.assertEqual(
+            2, self.registry.get_sample_value('g', {'l': 'ovf'})
+        )
+
+    def test_stale_child_keeps_working_but_is_not_exported(self):
+        c = Counter('c', 'help', ['l'], registry=self.registry, label_limit=1)
+        old = c.labels('a')
+        old.inc(7)
+        c.remove('a')
+        # The detached object remains observable on its own.
+        old.inc(3)
+        self.assertIsNone(self.registry.get_sample_value('c_total', {'l': 'a'}))
+        # A fresh child is created on the next lookup and starts at zero.
+        new = c.labels('a')
+        self.assertIsNot(old, new)
+        self.assertEqual(
+            0, self.registry.get_sample_value('c_total', {'l': 'a'})
+        )
+
+    def test_concurrent_distinct_combinations_never_exceed_limit(self):
+        c = Counter('c', 'help', ['l'], registry=self.registry, label_limit=5)
+        barrier = Barrier(20)
+
+        def create(i):
+            barrier.wait(timeout=5)
+            try:
+                return c.labels('v%d' % i)
+            except LabelLimitExceededError:
+                return None
+
+        with ThreadPoolExecutor(max_workers=20) as pool:
+            results = list(pool.map(create, range(20)))
+        self.assertEqual(len(c._metrics), 5)
+        self.assertEqual(sum(1 for r in results if r is not None), 5)
+        self.assertEqual(sum(1 for r in results if r is None), 15)
+
+    def test_concurrent_same_combination_consumes_one_slot(self):
+        c = Counter('c', 'help', ['l'], registry=self.registry, label_limit=1)
+        barrier = Barrier(8)
+
+        def create():
+            barrier.wait(timeout=5)
+            return c.labels('shared')
+
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            futures = [pool.submit(create) for _ in range(8)]
+            children = [future.result(timeout=5) for future in futures]
+        self.assertTrue(all(child is children[0] for child in children))
+        self.assertEqual(set(c._metrics), {('shared',)})
+
+    def test_concurrent_overflow_converges_on_single_child(self):
+        c = Counter(
+            'c', 'help', ['l'], registry=self.registry,
+            label_limit=2, overflow_labels=('ovf',),
+        )
+        c.labels('a')
+        c.labels('b')
+        barrier = Barrier(10)
+
+        def create(i):
+            barrier.wait(timeout=5)
+            return c.labels('new%d' % i)
+
+        with ThreadPoolExecutor(max_workers=10) as pool:
+            futures = [pool.submit(create, i) for i in range(10)]
+            children = [future.result(timeout=5) for future in futures]
+        self.assertTrue(all(child is children[0] for child in children))
+        self.assertEqual(set(c._metrics), {('a',), ('b',), ('ovf',)})
+
+    def test_invalid_label_limit(self):
+        for bad in (-1, 1.5, '2', True):
+            with self.subTest(bad=bad):
+                with self.assertRaises(ValueError):
+                    Counter('c', 'help', ['l'], label_limit=bad)
+
+    def test_overflow_labels_require_labelnames(self):
+        with self.assertRaisesRegex(ValueError, 'overflow_labels'):
+            Counter('c', 'help', label_limit=1, overflow_labels=('x',))
+
+    def test_invalid_overflow_labels(self):
+        with self.assertRaisesRegex(ValueError, 'Incorrect label count'):
+            Counter('c', 'help', ['l'], label_limit=1, overflow_labels=('a', 'b'))
+        with self.assertRaisesRegex(ValueError, 'Incorrect label names'):
+            Counter(
+                'c', 'help', ['l'], label_limit=1,
+                overflow_labels={'other': 'a'},
+            )
 
 
 class TestMetricFamilies(unittest.TestCase):
