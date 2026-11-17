@@ -3,7 +3,7 @@ from __future__ import annotations
 from bisect import bisect_right
 from datetime import datetime
 from math import isfinite
-from collections.abc import Hashable
+from collections.abc import Hashable, Mapping
 from . import bidi
 from . import util
 import re
@@ -91,6 +91,23 @@ SHORT_MONTH = 30
 LONG_MONTH = 31
 FEB_MONTH = 28
 FEB_LEAP_MONTH = 29
+
+# A read-only snapshot of runtime states, keyed by element, that a match can be run against:
+# `{element: {'checked': True, 'disabled': False}}`. Scraped markup only records the initial
+# value of `checked`, `selected` and `disabled`, not the state a page was left in, so the states
+# of specific elements can be overridden for the pseudo-classes that read them (`:checked`,
+# `:disabled`, `:enabled`, and the pseudo-classes built on them). Elements not covered by the
+# snapshot are matched against the static DOM.
+# `bs4` is still initializing when it imports this module, so the tag type is a forward reference.
+StateSnapshot = Mapping['bs4.Tag', Mapping[str, bool]]
+
+# The states a snapshot can override.
+STATE_ATTRIBUTES = frozenset(('checked', 'selected', 'disabled'))
+
+# The elements each state applies to. `checked` also requires an `input` type of
+# `checkbox` or `radio`, which is validated against the static DOM.
+STATE_DISABLEABLE = frozenset(('button', 'input', 'select', 'textarea', 'optgroup', 'option', 'fieldset'))
+STATE_CHECKED_TYPES = frozenset(('checkbox', 'radio'))
 
 # The latest value each date and time input type accepts in browsers. The HTML spec puts no upper
 # limit on the year, but browsers store these values as a JavaScript time, which ends at
@@ -459,7 +476,8 @@ class _DocumentNav:
     def get_classes(cls, el: bs4.Tag) -> Sequence[str]:
         """Get classes."""
 
-        classes = cls.get_attribute_by_name(el, 'class', [])
+        # Call the base directly as `CSSMatch` overrides `get_attribute_by_name` per instance.
+        classes = _DocumentNav.get_attribute_by_name(el, 'class', [])
         if isinstance(classes, str):
             classes = RE_NOT_WS.findall(classes)
         return cast(Sequence[str], classes)
@@ -651,7 +669,8 @@ class CSSMatch(_DocumentNav):
         selectors: ct.SelectorList,
         scope: bs4.Tag | None,
         namespaces: ct.Namespaces | None,
-        flags: int
+        flags: int,
+        states: StateSnapshot | None = None
     ) -> None:
         """Initialize."""
 
@@ -674,6 +693,7 @@ class CSSMatch(_DocumentNav):
         self.tree_cache: dict[int, bs4.Tag] = {}
         self.select_cache: dict[int, bs4.Tag | None] = {}
         self.index_cache: dict[int, dict[int, int]] = {}
+        self._states_by_id: dict[int, dict[str, bool]] | None = None
 
         # Find the root element for the whole tree
         doc = scope
@@ -700,6 +720,108 @@ class CSSMatch(_DocumentNav):
         # A document can be both XML and HTML (XHTML)
         self.is_xml = self.is_xml_tree(doc)
         self.is_html = not self.is_xml or self.has_html_namespace
+
+        # The top of the whole tree, document included, which identifies the tree.
+        # A state snapshot is only valid for the nodes of this one tree.
+        top: bs4.element.PageElement = cast('bs4.element.PageElement', scope)
+        while top.parent is not None:
+            top = top.parent
+        self.tree_top = top
+
+        # Diagnose snapshot problems before any matching starts.
+        if states:
+            self._states_by_id = self.validate_states(states)
+
+    def validate_states(self, states: StateSnapshot) -> dict[int, dict[str, bool]]:
+        """
+        Validate a state snapshot against the tree and return it keyed by node identity.
+
+        `bs4` hashes tags by their content, so distinct elements can compare equal; keying
+        by `id()` is what ties a state to one specific node, never to a namesake. Every key
+        must be a tag of the tree being matched, and every state must be known and applicable
+        to its element, as scraped states are only meaningful where the DOM defines them.
+        """
+
+        by_id: dict[int, dict[str, bool]] = {}
+        for node, node_states in states.items():
+            if not self.is_tag(node):
+                raise TypeError(
+                    f"State snapshot keys must be BeautifulSoup 'Tag' objects, not {type(node)}"
+                )
+            if not isinstance(node_states, Mapping):
+                raise TypeError(
+                    "State snapshot values must be mappings of state names to booleans, "
+                    f"not {type(node_states)}"
+                )
+            top: bs4.element.PageElement = node
+            while top.parent is not None:
+                top = top.parent
+            if top is not self.tree_top:
+                raise ValueError('State snapshot contains a node that is not part of the tree being matched')
+            name = self.get_tag(node) if self.is_html_tag(node) else None
+            for state, value in node_states.items():
+                if state not in STATE_ATTRIBUTES:
+                    raise ValueError(
+                        f"Unknown state {state!r}; states are 'checked', 'selected' and 'disabled'"
+                    )
+                if state == 'checked':
+                    applies = name == 'input' and util.lower(
+                        cast(str, _DocumentNav.get_attribute_by_name(node, 'type', ''))
+                    ) in STATE_CHECKED_TYPES
+                elif state == 'selected':
+                    applies = name == 'option'
+                else:
+                    applies = name in STATE_DISABLEABLE
+                if not applies:
+                    raise ValueError(f"State {state!r} does not apply to the element <{name}>")
+                by_id.setdefault(id(node), {})[state] = bool(value)
+        return by_id
+
+    def get_attribute_by_name(
+        self,
+        el: bs4.Tag,
+        name: str,
+        default: str | Sequence[str] | None = None
+    ) -> str | Sequence[str] | None:
+        """
+        Get attribute by name, with the state snapshot overriding the state attributes.
+
+        A state in the snapshot reads as the corresponding boolean attribute being present
+        (`True`) or absent (`False`), so every pseudo-class built on those attributes —
+        `:checked`, `:disabled`, `:enabled`, `:default`, `:indeterminate`, and the radio
+        button group and `select` option rules — sees one consistent state.
+        """
+
+        if name in STATE_ATTRIBUTES:
+            states = self._states_by_id
+            if states is not None:
+                node_states = states.get(id(el))
+                if node_states is not None and name in node_states:
+                    return '' if node_states[name] else default
+        return _DocumentNav.get_attribute_by_name(el, name, default)
+
+    def iter_attributes(self, el: bs4.Tag | None) -> Iterator[tuple[str, str | Sequence[str] | None]]:
+        """Iterate attributes, with the state snapshot overriding the state attributes."""
+
+        states = self._states_by_id
+        node_states = states.get(id(el)) if el is not None and states is not None else None
+        if not node_states:
+            yield from _DocumentNav.iter_attributes(el)
+            return
+        seen = set()
+        for k, v in _DocumentNav.iter_attributes(el):
+            key = k if self.is_xml else util.lower(k)
+            if key in node_states:
+                seen.add(key)
+                # A false state suppresses the attribute, a true one keeps it as a boolean attribute.
+                if node_states[key]:
+                    yield k, ''
+            else:
+                yield k, v
+        # Surface states whose attribute the static DOM does not have.
+        for name, value in node_states.items():
+            if value and name not in seen:
+                yield name, ''
 
     def reset(self) -> None:  # pragma: no cover
         """Reset."""
@@ -2219,17 +2341,17 @@ class SoupSieve(ct.Immutable):
             flags=flags
         )
 
-    def match(self, tag: bs4.Tag) -> bool:
+    def match(self, tag: bs4.Tag, states: StateSnapshot | None = None) -> bool:
         """Match."""
 
-        return CSSMatch(self.selectors, tag, self.namespaces, self.flags).match(tag)
+        return CSSMatch(self.selectors, tag, self.namespaces, self.flags, states).match(tag)
 
-    def closest(self, tag: bs4.Tag) -> bs4.Tag | None:
+    def closest(self, tag: bs4.Tag, states: StateSnapshot | None = None) -> bs4.Tag | None:
         """Match closest ancestor."""
 
-        return CSSMatch(self.selectors, tag, self.namespaces, self.flags).closest()
+        return CSSMatch(self.selectors, tag, self.namespaces, self.flags, states).closest()
 
-    def filter(self, iterable: Iterable[bs4.Tag]) -> list[bs4.Tag]:  # noqa A001
+    def filter(self, iterable: Iterable[bs4.Tag], states: StateSnapshot | None = None) -> list[bs4.Tag]:  # noqa A001
         """
         Filter.
 
@@ -2242,26 +2364,29 @@ class SoupSieve(ct.Immutable):
         """
 
         if isinstance(iterable, bs4.Tag):
-            return CSSMatch(self.selectors, iterable, self.namespaces, self.flags).filter()
+            return CSSMatch(self.selectors, iterable, self.namespaces, self.flags, states).filter()
         else:
             # There is no guarantee that elements are from the same document, evaluate them separately.
-            return [node for node in iterable if not CSSMatch.is_navigable_string(node) and self.match(node)]
+            return [
+                node for node in iterable
+                if not CSSMatch.is_navigable_string(node) and self.match(node, states=states)
+            ]
 
-    def select_one(self, tag: bs4.Tag) -> bs4.Tag | None:
+    def select_one(self, tag: bs4.Tag, states: StateSnapshot | None = None) -> bs4.Tag | None:
         """Select a single tag."""
 
-        tags = self.select(tag, limit=1)
+        tags = self.select(tag, limit=1, states=states)
         return tags[0] if tags else None
 
-    def select(self, tag: bs4.Tag, limit: int = 0) -> list[bs4.Tag]:
+    def select(self, tag: bs4.Tag, limit: int = 0, states: StateSnapshot | None = None) -> list[bs4.Tag]:
         """Select the specified tags."""
 
-        return list(self.iselect(tag, limit))
+        return list(self.iselect(tag, limit, states=states))
 
-    def iselect(self, tag: bs4.Tag, limit: int = 0) -> Iterator[bs4.Tag]:
+    def iselect(self, tag: bs4.Tag, limit: int = 0, states: StateSnapshot | None = None) -> Iterator[bs4.Tag]:
         """Iterate the specified tags."""
 
-        yield from CSSMatch(self.selectors, tag, self.namespaces, self.flags).select(limit)
+        yield from CSSMatch(self.selectors, tag, self.namespaces, self.flags, states).select(limit)
 
     def __repr__(self) -> str:  # pragma: no cover
         """Representation."""

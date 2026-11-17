@@ -36,11 +36,12 @@ from typing import Any, Mapping, Iterator, Iterable, cast
 
 __all__ = (
     'DEBUG', 'NOCACHE', 'NOSTRICT', 'SelectorSyntaxError', 'CustomSelectors', 'SoupSieve',
-    'closest', 'compile', 'filter', 'iselect', 'match', 'select', 'select_one'
+    'StateSnapshot', 'closest', 'compile', 'filter', 'iselect', 'match', 'select', 'select_one'
 )
 
 SoupSieve = cm.SoupSieve
 CustomSelectors = ct.CustomSelectors
+StateSnapshot = cm.StateSnapshot
 
 
 def compile(  # noqa: A001
@@ -91,6 +92,7 @@ def closest(
     custom: Mapping[str, str | ct.SelectorList] | None = None,
     ignore: Iterable[str] | None = None,
     max_selectors: int = cp.SELECTOR_LIMIT,
+    states: cm.StateSnapshot | None = None,
     **kwargs: Any
 ) -> bs4.Tag | None:
     """Match closest ancestor."""
@@ -103,7 +105,7 @@ def closest(
         ignore=ignore,
         max_selectors=max_selectors,
         **kwargs
-    ).closest(tag)
+    ).closest(tag, states=states)
 
 
 def match(
@@ -115,6 +117,7 @@ def match(
     custom: Mapping[str, str | ct.SelectorList] | None = None,
     ignore: Iterable[str] | None = None,
     max_selectors: int = cp.SELECTOR_LIMIT,
+    states: cm.StateSnapshot | None = None,
     **kwargs: Any
 ) -> bool:
     """Match node."""
@@ -127,7 +130,7 @@ def match(
         ignore=ignore,
         max_selectors=max_selectors,
         **kwargs
-    ).match(tag)
+    ).match(tag, states=states)
 
 
 def filter(  # noqa: A001
@@ -139,6 +142,7 @@ def filter(  # noqa: A001
     custom: Mapping[str, str | ct.SelectorList] | None = None,
     ignore: Iterable[str] | None = None,
     max_selectors: int = cp.SELECTOR_LIMIT,
+    states: cm.StateSnapshot | None = None,
     **kwargs: Any
 ) -> list[bs4.Tag]:
     """Filter list of nodes."""
@@ -151,7 +155,7 @@ def filter(  # noqa: A001
         ignore=ignore,
         max_selectors=max_selectors,
         **kwargs
-    ).filter(iterable)
+    ).filter(iterable, states=states)
 
 
 def select_one(
@@ -163,6 +167,7 @@ def select_one(
     custom: Mapping[str, str | ct.SelectorList] | None = None,
     ignore: Iterable[str] | None = None,
     max_selectors: int = cp.SELECTOR_LIMIT,
+    states: cm.StateSnapshot | None = None,
     **kwargs: Any
 ) -> bs4.Tag | None:
     """Select a single tag."""
@@ -175,7 +180,7 @@ def select_one(
         ignore=ignore,
         max_selectors=max_selectors,
         **kwargs
-    ).select_one(tag)
+    ).select_one(tag, states=states)
 
 
 def select(
@@ -188,6 +193,7 @@ def select(
     custom: Mapping[str, str | ct.SelectorList] | None = None,
     ignore: Iterable[str] | None = None,
     max_selectors: int = cp.SELECTOR_LIMIT,
+    states: cm.StateSnapshot | None = None,
     **kwargs: Any
 ) -> list[bs4.Tag]:
     """Select the specified tags."""
@@ -200,7 +206,7 @@ def select(
         ignore=ignore,
         max_selectors=max_selectors,
         **kwargs
-    ).select(tag, limit)
+    ).select(tag, limit, states=states)
 
 
 def iselect(
@@ -213,6 +219,7 @@ def iselect(
     custom: Mapping[str, str | ct.SelectorList] | None = None,
     ignore: Iterable[str] | None = None,
     max_selectors: int = cp.SELECTOR_LIMIT,
+    states: cm.StateSnapshot | None = None,
     **kwargs: Any
 ) -> Iterator[bs4.Tag]:
     """Iterate the specified tags."""
@@ -225,7 +232,7 @@ def iselect(
         ignore=ignore,
         max_selectors=max_selectors,
         **kwargs
-    ).iselect(tag, limit)
+    ).iselect(tag, limit, states=states)
 
 
 def escape(ident: str) -> str:

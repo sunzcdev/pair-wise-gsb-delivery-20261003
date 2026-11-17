@@ -374,6 +374,31 @@ except sv.SelectorSyntaxError:
     print('Not allowed')
 ```
 
+## State Snapshots
+
+Scraped markup only records the initial value of the `checked`, `selected` and `disabled` attributes, not the state a
+page was left in. All of the matching functions accept an optional `states` parameter with a read-only snapshot of
+those runtime states, which the pseudo-classes that read them ([`#!css :checked`](./selectors/pseudo-classes.md#:checked),
+[`#!css :disabled`](./selectors/pseudo-classes.md#:disabled), [`#!css :enabled`](./selectors/pseudo-classes.md#:enabled),
+and the pseudo-classes built on them) then match against. Elements not covered by the snapshot are matched against the
+static DOM, and the document is never modified.
+
+A snapshot maps elements to the states to override, and each state to a boolean. Elements are located by their
+identity, never by a shared `id` attribute, and must belong to the tree being matched.
+
+```py
+sv.select(':checked', soup, states={checkbox: {'checked': True}, option: {'selected': False}})
+```
+
+The states of a radio button group and the default option of a `select` follow the same rules as the static DOM:
+checking one radio button unchecks the others in its group, and a single `select` keeps only its last selected option,
+falling back to its first enabled option when none is selected.
+
+A snapshot is validated before any matching starts. A key that is not a tag of the tree being matched, an unknown
+state name, and a state that does not apply to its element (such as `checked` on a text `input`) all raise an error.
+As a snapshot only lives for the one call it is passed to, different snapshots can be used on the same tree without
+affecting each other.
+
 ## Selector Limits
 
 > [!new] New in 3.0
