@@ -22,6 +22,56 @@ c = Concurrent::dataflow(a, b) { |av, bv| av + bv }
 
 Using the `dataflow` method you can build up a directed acyclic graph (DAG) of tasks that depend on each other, and have the tasks run as soon as their dependencies are ready and there is CPU capacity to schedule them. This can help you create a program that uses more of the CPU resources available to you. 
 
+### Failures and explanations
+
+Every dataflow result carries an optional explanation of what happened, reachable
+through `dataflow_explanation`. It reports each dependency by its position among
+the inputs, with that dependency's state (`:fulfilled` or `:rejected`) and, when
+rejected, the reason. Positions are stable: the order in which dependencies
+settle never changes the reported order, so several simultaneous failures are
+always listed by input position. A dependency that fulfilled with `nil` is
+reported as fulfilled, never as missing.
+
+```ruby
+a = Concurrent::dataflow { 1 }
+b = Concurrent::dataflow { raise 'b failed' }
+c = Concurrent::dataflow(a, b) { |av, bv| av + bv }
+
+c.wait
+c.dataflow_explanation.dependencies.map(&:state) #=> [:fulfilled, :rejected]
+```
+
+The explanation also records whether the node's block actually started. When a
+node is rejected without its block ever running, the cause is a failed
+dependency and not the block; `started?` is then `false`. When the block itself
+raised, `started?` is `true` and the block's own exception is the reason. The
+two cases are therefore never confused.
+
+The `!` variants (`dataflow!` and `dataflow_with!`) do not run their block at all
+when a dependency failed. The node is rejected with
+`Concurrent::DataflowDependencyError`, which names the failed dependencies by
+position rather than re-raising one of them as though the block had raised it:
+
+```ruby
+a = Concurrent::dataflow { raise 'a failed' }
+b = Concurrent::dataflow { 2 }
+c = Concurrent::dataflow!(a, b) { |av, bv| av + bv }
+
+begin
+  c.value!
+rescue Concurrent::DataflowDependencyError => error
+  error.failed_indexes              #=> [0]
+  error.reasons.map(&:message)      #=> ["a failed"]
+  error.explanation.started?        #=> false
+end
+```
+
+Failure propagation schedules a node at most once: when several dependencies
+fail, the node is rejected without being posted to its executor. The explanation
+holds only copied state — not the inputs and not the node — so a settled node
+does not keep its dependency graph alive just to explain itself. Its own task
+likewise closes over the block, not over the array of inputs.
+
 ### Derivation
 
 This section describes how we could derive dataflow from other primitives in this library.

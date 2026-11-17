@@ -1,5 +1,17 @@
 ## Current
 
+* `dataflow` results now carry a `dataflow_explanation` (a `Concurrent::DataflowExplanation`)
+  that reports every dependency by its input position, its state, and whether the node's
+  block actually started. A fulfilled dependency with a `nil` value counts as fulfilled, and
+  multiple simultaneous failures are always listed in input order.
+* `dataflow!` and `dataflow_with!` no longer re-raise a failed dependency's exception as if the
+  node's own block had raised. When a dependency failed, the node is rejected with
+  `Concurrent::DataflowDependencyError`, which names the failed dependencies by position; the
+  node is not scheduled in that case. A node whose own block raised keeps that exception and is
+  reported as started.
+* The dataflow dependency explanation holds only copied state, so a settled node does not keep
+  its dependency graph alive.
+
 ## Release v1.3.8 (19 July 2026)
 
 concurrent-ruby:

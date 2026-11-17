@@ -54,6 +54,65 @@ module Concurrent
   # Raised when an operation times out.
   TimeoutError = Class.new(Error)
 
+  # Raised by a dataflow node whose dependencies were rejected, when the node's
+  # block was therefore never executed.
+  #
+  # The exception identifies the failed dependencies by their position among the
+  # node's inputs, in that same (stable) order, so a failed node is never
+  # mistaken for a node whose own block raised. The dependencies' exceptions are
+  # available via {#reasons}, and the complete account of every dependency
+  # (including dependencies that fulfilled with a `nil` value) via
+  # {#explanation}.
+  #
+  # @see Concurrent::DataflowExplanation
+  class DataflowDependencyError < Error
+    # @return [Concurrent::DataflowExplanation] the dependency account that
+    #   produced this error
+    attr_reader :explanation
+
+    # @param [Concurrent::DataflowExplanation] explanation the dependency account
+    def initialize(explanation)
+      @explanation = explanation
+      super(build_message(explanation))
+    end
+
+    # @return [Array<Concurrent::DataflowExplanation::Dependency>] the failed
+    #   dependencies, ordered by their position among the inputs
+    def failed_dependencies
+      @explanation.failed_dependencies
+    end
+
+    # @return [Array<Integer>] the inputs' positions of the failed dependencies,
+    #   in input order
+    def failed_indexes
+      @explanation.failed_indexes
+    end
+
+    # @return [Array<Exception>] the dependencies' exceptions, in input order
+    def reasons
+      failed_dependencies.map(&:reason)
+    end
+
+    private
+
+    # @!visibility private
+    def build_message(explanation)
+      failed    = explanation.failed_dependencies
+      indexes   = explanation.failed_indexes
+      subject   = indexes.size == 1 ? "dependency at index #{indexes.first}" :
+                                    "dependencies at indexes #{indexes.join(', ')}"
+      details   = failed.map do |dependency|
+        if dependency.reason.nil?
+          format('index %d: no reason given', dependency.index)
+        else
+          format('index %d: %s: %s', dependency.index, dependency.reason.class, dependency.reason.message)
+        end
+      end
+      format('dataflow %s failed, so the dataflow block was not executed (%s)',
+             subject, details.join('; '))
+    end
+  end
+
   # Aggregates multiple exceptions.
   class MultipleErrors < Error
     attr_reader :errors
