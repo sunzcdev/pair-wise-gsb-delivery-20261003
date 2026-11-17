@@ -177,6 +177,54 @@ To add listeners to a circuit breaker:
     db_breaker.add_listeners(OneListener(), AnotherListener())
 
 
+Manual Overrides
+````````````````
+
+In an emergency, an operator can set an explicit, temporary override on a
+circuit breaker, either forcing it open (calls fail immediately) or forcing
+it to allow calls through:
+
+.. code:: python
+
+    # Reject all calls for the next 10 minutes...
+    override = db_breaker.set_override(
+        pybreaker.OVERRIDE_FORCE_OPEN,
+        reason="incident #42: database failover in progress",
+        operator="oncall@example.com",
+        ttl=600,
+    )
+
+    # ...or let all calls through for the next 10 minutes
+    override = db_breaker.set_override(
+        pybreaker.OVERRIDE_FORCE_ALLOW,
+        reason="deploy: drain the queue",
+        operator="oncall@example.com",
+        ttl=600,
+    )
+
+Every override keeps the ``reason``, the ``operator`` (a free-form audit
+text, not a user account) and the expiry time (``expires_at``) for auditing.
+
+While an override is active, the automatic statistics (e.g.
+``fail_counter``) keep being recorded and remain queryable, but the
+automatic state machine never secretly replaces the human's choice. Once
+the override expires, the circuit breaker returns to its regular automatic
+behavior according to the usual public rules; a call result arriving late
+cannot reactivate an override that has already ended.
+
+Each manual update gets a new version identity, and clearing requires the
+current version, so a stale token can never clear a newer override:
+
+.. code:: python
+
+    # Returns False if a newer override has been set since `override`
+    db_breaker.clear_override(override.version)
+
+The active override (if any) is available via ``db_breaker.current_override``,
+and the most recently set one (active or expired) via
+``db_breaker.last_override``.
+
+
 What Does a Circuit Breaker Do?
 ```````````````````````````````
 

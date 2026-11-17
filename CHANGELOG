@@ -1,6 +1,12 @@
 Changelog
 =========
 
+Unreleased
+
+* Add explicit, temporary manual overrides (`set_override`/`clear_override`)
+  with audit details (reason, operator, expiry), versioned clearing, and
+  automatic return to regular behavior after expiry
+
 Version 1.4.0 (July 6, 2025)
 
 * Add success_threshold parameter (Thanks @sideshowbandana)

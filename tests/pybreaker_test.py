@@ -1352,5 +1352,224 @@ class CircuitBreakerContextManagerTestCase(unittest.TestCase):
         assert breaker.current_state == "closed"
 
 
+class CircuitBreakerOverrideTestCase(unittest.TestCase):
+    """Tests for the manual override layer of the CircuitBreaker class."""
+
+    def test_force_open_rejects_calls(self):
+        """Override: force-open should reject calls even when the circuit is closed."""
+        breaker = CircuitBreaker()
+        override = breaker.set_override(OVERRIDE_FORCE_OPEN, reason="incident #42", operator="oncall", ttl=60)
+
+        assert breaker.current_override == override
+        assert breaker.current_state == "closed"
+
+        with pytest.raises(CircuitBreakerError) as exc_info:
+            breaker.call(lambda: True)
+        assert "oncall" in str(exc_info.value)
+        assert "incident #42" in str(exc_info.value)
+
+        # The automatic state is left untouched
+        assert breaker.current_state == "closed"
+        assert breaker.fail_counter == 0
+
+    def test_force_allow_lets_calls_through_when_open(self):
+        """Override: force-allow should let calls through even when the circuit is open."""
+        breaker = CircuitBreaker(fail_max=1)
+
+        def err():
+            raise NotImplementedError
+
+        with pytest.raises(CircuitBreakerError):
+            breaker.call(err)
+        assert breaker.current_state == "open"
+
+        breaker.set_override(OVERRIDE_FORCE_ALLOW, reason="drain queue", operator="oncall", ttl=60)
+        assert breaker.call(lambda: "ok") == "ok"
+
+    def test_override_keeps_audit_details(self):
+        """Override: it should keep reason, operator and expiry time."""
+        breaker = CircuitBreaker()
+        override = breaker.set_override(OVERRIDE_FORCE_ALLOW, reason="maintenance", operator="alice", ttl=30)
+
+        assert override.reason == "maintenance"
+        assert override.operator == "alice"
+        assert override.expires_at > override.created_at
+        assert breaker.last_override == override
+
+    def test_override_requires_audit_details(self):
+        """Override: it should require a valid mode, reason, operator and ttl."""
+        breaker = CircuitBreaker()
+
+        with pytest.raises(ValueError):
+            breaker.set_override("bogus", reason="r", operator="o", ttl=60)
+        with pytest.raises(ValueError):
+            breaker.set_override(OVERRIDE_FORCE_OPEN, reason="", operator="o", ttl=60)
+        with pytest.raises(ValueError):
+            breaker.set_override(OVERRIDE_FORCE_OPEN, reason="r", operator="", ttl=60)
+        with pytest.raises(ValueError):
+            breaker.set_override(OVERRIDE_FORCE_OPEN, reason="r", operator="o", ttl=0)
+        with pytest.raises(ValueError):
+            breaker.set_override(OVERRIDE_FORCE_OPEN, reason="r", operator="o", ttl=-1)
+
+        assert breaker.current_override is None
+
+    def test_force_allow_records_stats_without_replacing_choice(self):
+        """Override: stats keep being recorded, but the automatic state machine
+        must not secretly replace the human's choice while the override lasts.
+        """
+        breaker = CircuitBreaker(fail_max=2)
+        breaker.set_override(OVERRIDE_FORCE_ALLOW, reason="deploy", operator="bob", ttl=60)
+
+        def err():
+            raise NotImplementedError
+
+        # These failures would normally trip the breaker...
+        with pytest.raises(NotImplementedError):
+            breaker.call(err)
+        with pytest.raises(NotImplementedError):
+            breaker.call(err)
+
+        # ...the statistics are still queryable...
+        assert breaker.fail_counter == 2
+        # ...but the automatic state was not changed behind the scenes
+        assert breaker.current_state == "closed"
+
+        # Successes are recorded too
+        assert breaker.call(lambda: True)
+        assert breaker.fail_counter == 0
+
+    def test_override_expiry_returns_to_automatic_rules(self):
+        """Override: after expiry, the public automatic rules apply again."""
+        breaker = CircuitBreaker(fail_max=2)
+        breaker.set_override(OVERRIDE_FORCE_ALLOW, reason="deploy", operator="bob", ttl=0.05)
+
+        def err():
+            raise NotImplementedError
+
+        with pytest.raises(NotImplementedError):
+            breaker.call(err)
+        assert breaker.current_state == "closed"
+
+        sleep(0.06)
+        assert breaker.current_override is None
+
+        # The failures recorded during the override still count, so the next
+        # failure trips the breaker according to the regular rules
+        with pytest.raises(CircuitBreakerError):
+            breaker.call(err)
+        assert breaker.current_state == "open"
+
+    def test_force_open_expires(self):
+        """Override: after a force-open override expires, calls go through again."""
+        breaker = CircuitBreaker()
+        breaker.set_override(OVERRIDE_FORCE_OPEN, reason="incident", operator="oncall", ttl=0.05)
+
+        with pytest.raises(CircuitBreakerError):
+            breaker.call(lambda: True)
+
+        sleep(0.06)
+        assert breaker.current_override is None
+        assert breaker.call(lambda: True)
+
+    def test_late_result_does_not_reactivate_ended_override(self):
+        """Override: a late call result must not reactivate an override that
+        ended while the call was in flight; it is handled by the regular
+        state machine instead.
+        """
+        breaker = CircuitBreaker(fail_max=1)
+        breaker.set_override(OVERRIDE_FORCE_ALLOW, reason="deploy", operator="bob", ttl=0.05)
+
+        def slow_err():
+            sleep(0.1)  # Override expires while this call is in flight
+            raise NotImplementedError
+
+        # The override ended before the result arrived, so the failure trips
+        # the breaker following the regular automatic rules
+        with pytest.raises(CircuitBreakerError):
+            breaker.call(slow_err)
+        assert breaker.current_state == "open"
+
+    def test_late_result_while_override_still_active_changes_no_state(self):
+        """Override: a result arriving while the override is still active
+        updates statistics but never the automatic state.
+        """
+        breaker = CircuitBreaker(fail_max=1)
+        breaker.set_override(OVERRIDE_FORCE_ALLOW, reason="deploy", operator="bob", ttl=60)
+
+        def err():
+            raise NotImplementedError
+
+        with pytest.raises(NotImplementedError):
+            breaker.call(err)
+        assert breaker.fail_counter == 1
+        assert breaker.current_state == "closed"
+
+    def test_clear_override_with_matching_version(self):
+        """Override: clearing with the current version removes the override."""
+        breaker = CircuitBreaker()
+        override = breaker.set_override(OVERRIDE_FORCE_OPEN, reason="incident", operator="oncall", ttl=60)
+
+        assert breaker.clear_override(override.version)
+        assert breaker.current_override is None
+        assert breaker.call(lambda: True)
+
+    def test_clear_override_with_stale_version_keeps_newer_override(self):
+        """Override: clearing with an old version token must not clear a newer override."""
+        breaker = CircuitBreaker()
+        first = breaker.set_override(OVERRIDE_FORCE_OPEN, reason="first", operator="alice", ttl=60)
+        second = breaker.set_override(OVERRIDE_FORCE_ALLOW, reason="second", operator="bob", ttl=60)
+
+        assert first.version != second.version
+
+        # Stale token from the first update cannot clear the second override
+        assert not breaker.clear_override(first.version)
+        assert breaker.current_override == second
+
+        # The current token clears it
+        assert breaker.clear_override(second.version)
+        assert breaker.current_override is None
+
+    def test_clear_override_without_override(self):
+        """Override: clearing with no override set is a no-op."""
+        breaker = CircuitBreaker()
+        assert not breaker.clear_override(1)
+
+    def test_override_events(self):
+        """Override: listeners should be notified when overrides are set and cleared."""
+        breaker = CircuitBreaker()
+        listener = mock.MagicMock(spec=CircuitBreakerListener)
+        breaker.add_listener(listener)
+
+        override = breaker.set_override(OVERRIDE_FORCE_ALLOW, reason="deploy", operator="bob", ttl=60)
+        listener.override_set.assert_called_once_with(breaker, override)
+
+        breaker.clear_override(override.version)
+        listener.override_cleared.assert_called_once_with(breaker, override)
+
+    def test_force_allow_notifies_call_listeners(self):
+        """Override: call listeners still fire while a force-allow override is active."""
+        breaker = CircuitBreaker()
+        breaker.set_override(OVERRIDE_FORCE_ALLOW, reason="deploy", operator="bob", ttl=60)
+        listener = mock.MagicMock(spec=CircuitBreakerListener)
+        breaker.add_listener(listener)
+
+        def func():
+            return True
+
+        assert breaker.call(func)
+        listener.before_call.assert_called_once()
+        listener.success.assert_called_once_with(breaker)
+
+    def test_override_is_per_breaker_instance(self):
+        """Override: an override set on one breaker does not affect another."""
+        breaker = CircuitBreaker()
+        other = CircuitBreaker()
+        breaker.set_override(OVERRIDE_FORCE_OPEN, reason="incident", operator="oncall", ttl=60)
+
+        with pytest.raises(CircuitBreakerError):
+            breaker.call(lambda: True)
+        assert other.call(lambda: True)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -15,6 +15,7 @@ import threading
 import time
 import types
 from abc import abstractmethod
+from dataclasses import dataclass
 from datetime import datetime, timedelta
 from functools import wraps
 from typing import (
@@ -61,21 +62,58 @@ __all__ = (
     "CircuitBreaker",
     "CircuitBreakerListener",
     "CircuitBreakerError",
+    "CircuitBreakerOverride",
     "CircuitMemoryStorage",
     "CircuitRedisStorage",
     "STATE_OPEN",
     "STATE_CLOSED",
     "STATE_HALF_OPEN",
+    "OVERRIDE_FORCE_OPEN",
+    "OVERRIDE_FORCE_ALLOW",
 )
 
 STATE_OPEN = "open"
 STATE_CLOSED = "closed"
 STATE_HALF_OPEN = "half-open"
 
+OVERRIDE_FORCE_OPEN = "force_open"
+OVERRIDE_FORCE_ALLOW = "force_allow"
+
 T = TypeVar("T")
 ExceptionType = TypeVar("ExceptionType", bound=BaseException)
 CBListenerType = TypeVar("CBListenerType", bound="CircuitBreakerListener")
 CBStateType = Union["CircuitClosedState", "CircuitHalfOpenState", "CircuitOpenState"]
+
+
+@dataclass(frozen=True)
+class CircuitBreakerOverride:
+    """An explicit, temporary manual override of a circuit breaker's behavior.
+
+    An override is an audit record as much as a control: it always carries
+    the `reason` and the `operator` (a free-form audit text, not a user
+    account) supplied by the human who set it, plus the time it `expires_at`.
+
+    While an override is active, it alone decides whether calls are admitted
+    (`OVERRIDE_FORCE_ALLOW`) or rejected (`OVERRIDE_FORCE_OPEN`); the
+    automatic state machine keeps recording statistics but does not replace
+    the human's choice. Once `expires_at` has passed, the override is inert
+    and the circuit breaker returns to its regular automatic behavior.
+
+    Each manual update gets a new `version` identity, so a stale version
+    token can never clear (or be mistaken for) a newer override.
+    """
+
+    mode: str
+    reason: str
+    operator: str
+    version: int
+    created_at: datetime
+    expires_at: datetime
+
+    def is_active(self, now: datetime | None = None) -> bool:
+        """Return whether this override is still in effect at `now` (UTC by default)."""
+        now = now or datetime.now(UTC)
+        return now < self.expires_at
 
 
 class CircuitBreaker:
@@ -113,6 +151,9 @@ class CircuitBreaker:
         self._name = name
 
         self._throw_new_error_on_trip = throw_new_error_on_trip
+
+        self._override: CircuitBreakerOverride | None = None
+        self._override_version = 0
 
     @property
     def fail_counter(self) -> int:
@@ -246,9 +287,61 @@ class CircuitBreaker:
     def call(self, func: Callable[..., T], *args: Any, **kwargs: Any) -> T:
         """Call `func` with the given `args` and `kwargs` according to the rules
         implemented by the current state of this circuit breaker.
+
+        If a manual override is in effect, the override decides instead: a
+        "force open" override rejects the call with ``CircuitBreakerError``,
+        while a "force allow" override lets the call through.
         """
         with self._lock:
+            override = self._active_override()
+            if override is not None:
+                if override.mode == OVERRIDE_FORCE_OPEN:
+                    msg = f"Circuit breaker forcibly opened by {override.operator}: {override.reason}"
+                    raise CircuitBreakerError(msg)
+                return self._call_forced_allow(func, *args, **kwargs)
             return self.state.call(func, *args, **kwargs)
+
+    def _call_forced_allow(self, func: Callable[..., T], *args: Any, **kwargs: Any) -> T:
+        """Execute `func` while a "force allow" override is in effect.
+
+        The call always runs and its outcome is recorded in the automatic
+        statistics, but the automatic state is left untouched, so the state
+        machine never secretly replaces the human's choice. If the override
+        has expired by the time the outcome arrives, the late result is
+        handed to the regular state machine instead, so a finished override
+        is never reactivated by it.
+        """
+        for listener in self.listeners:
+            listener.before_call(self, func, *args, **kwargs)
+
+        try:
+            ret = func(*args, **kwargs)
+        except BaseException as e:
+            if self._active_override() is not None:
+                self._record_forced_allow_failure(e)
+                raise
+            self.state._handle_error(e)
+        else:
+            if self._active_override() is not None:
+                self._record_forced_allow_success()
+            else:
+                self.state._handle_success()
+            return ret
+
+    def _record_forced_allow_failure(self, exc: BaseException) -> None:
+        """Record a failed call in the automatic statistics without changing state."""
+        if self.is_system_error(exc):
+            self._inc_counter()
+            for listener in self.listeners:
+                listener.failure(self, exc)
+        else:
+            self._record_forced_allow_success()
+
+    def _record_forced_allow_success(self) -> None:
+        """Record a successful call in the automatic statistics without changing state."""
+        self._state_storage.reset_counter()
+        for listener in self.listeners:
+            listener.success(self)
 
     @contextlib.contextmanager
     def calling(self) -> Any:
@@ -267,13 +360,51 @@ class CircuitBreaker:
         """Call async `func` with the given `args` and `kwargs` according to the rules
         implemented by the current state of this circuit breaker.
 
+        If a manual override is in effect, the override decides instead, just
+        like in `call`.
+
         Return a closure to prevent import errors when using without tornado present
         """
 
         @gen.coroutine
         def wrapped():  # type: ignore[no-untyped-def]
             with self._lock:
-                ret = yield self.state.call_async(func, *args, **kwargs)
+                override = self._active_override()
+                if override is not None and override.mode == OVERRIDE_FORCE_OPEN:
+                    msg = f"Circuit breaker forcibly opened by {override.operator}: {override.reason}"
+                    raise CircuitBreakerError(msg)
+                if override is not None:
+                    ret = yield self._call_async_forced_allow(func, *args, **kwargs)
+                else:
+                    ret = yield self.state.call_async(func, *args, **kwargs)
+                raise gen.Return(ret)
+
+        return wrapped()
+
+    def _call_async_forced_allow(self, func, *args, **kwargs):  # type: ignore[no-untyped-def]
+        """Async variant of `_call_forced_allow`, used while a "force allow"
+        override is in effect.
+
+        Return a closure to prevent import errors when using without tornado present
+        """
+
+        @gen.coroutine
+        def wrapped():  # type: ignore[no-untyped-def]
+            for listener in self.listeners:
+                listener.before_call(self, func, *args, **kwargs)
+
+            try:
+                ret = yield func(*args, **kwargs)
+            except BaseException as e:
+                if self._active_override() is not None:
+                    self._record_forced_allow_failure(e)
+                    raise
+                self.state._handle_error(e)
+            else:
+                if self._active_override() is not None:
+                    self._record_forced_allow_success()
+                else:
+                    self.state._handle_success()
                 raise gen.Return(ret)
 
         return wrapped()
@@ -299,6 +430,96 @@ class CircuitBreaker:
         with self._lock:
             self._state_storage.reset_success_counter()  # Reset success counter when closing
             self.state = self._state_storage.state = STATE_CLOSED  # type: ignore[assignment]
+
+    def set_override(
+        self,
+        mode: str,
+        reason: str,
+        operator: str,
+        ttl: float | timedelta,
+    ) -> CircuitBreakerOverride:
+        """Set an explicit, temporary manual override on this circuit breaker.
+
+        `mode` must be ``OVERRIDE_FORCE_OPEN`` (calls fail immediately with
+        ``CircuitBreakerError``) or ``OVERRIDE_FORCE_ALLOW`` (calls always go
+        through). `reason` and `operator` are mandatory audit texts kept on
+        the override; `operator` is just an audit label, not a user account.
+        `ttl` is a ``timedelta`` or a number of seconds after which the
+        override expires and the circuit breaker returns to its regular
+        automatic behavior.
+
+        Every call to this method replaces any previous override and returns
+        the new override with a fresh version identity.
+        """
+        if mode not in (OVERRIDE_FORCE_OPEN, OVERRIDE_FORCE_ALLOW):
+            msg = f"Unknown override mode {mode!r}, valid modes: {OVERRIDE_FORCE_OPEN}, {OVERRIDE_FORCE_ALLOW}"
+            raise ValueError(msg)
+        if not isinstance(reason, str) or not reason:
+            msg = "Override reason must be a non-empty string"
+            raise ValueError(msg)
+        if not isinstance(operator, str) or not operator:
+            msg = "Override operator must be a non-empty string"
+            raise ValueError(msg)
+
+        duration = ttl if isinstance(ttl, timedelta) else timedelta(seconds=ttl)
+        if duration <= timedelta(0):
+            msg = "Override ttl must be positive"
+            raise ValueError(msg)
+
+        with self._lock:
+            self._override_version += 1
+            now = datetime.now(UTC)
+            override = CircuitBreakerOverride(
+                mode=mode,
+                reason=reason,
+                operator=operator,
+                version=self._override_version,
+                created_at=now,
+                expires_at=now + duration,
+            )
+            self._override = override
+            for listener in self.listeners:
+                listener.override_set(self, override)
+            return override
+
+    def clear_override(self, version: int) -> bool:
+        """Clear the current override if `version` matches its version identity.
+
+        Because every manual update gets a new version, a stale `version`
+        token (from an older update) never clears a newer override. Return
+        whether an override was actually cleared.
+        """
+        with self._lock:
+            override = self._override
+            if override is None or override.version != version:
+                return False
+            self._override = None
+            for listener in self.listeners:
+                listener.override_cleared(self, override)
+            return True
+
+    @property
+    def current_override(self) -> CircuitBreakerOverride | None:
+        """Return the active override, or None if there is none or it has expired."""
+        with self._lock:
+            return self._active_override()
+
+    @property
+    def last_override(self) -> CircuitBreakerOverride | None:
+        """Return the most recently set override, whether active or expired.
+
+        Useful for auditing the reason, operator and expiry of the latest
+        manual intervention.
+        """
+        with self._lock:
+            return self._override
+
+    def _active_override(self) -> CircuitBreakerOverride | None:
+        """Return the current override if it is still in effect, else None."""
+        override = self._override
+        if override is not None and override.is_active():
+            return override
+        return None
 
     def __call__(self, *call_args: Any, **call_kwargs: bool) -> Callable:
         """Return a wrapper that calls the function `func` according to the rules
@@ -663,6 +884,16 @@ class CircuitBreakerListener:
         new_state: CircuitBreakerState,
     ) -> None:
         """This callback function is called when the state of the circuit breaker `cb` state changes."""
+
+    def override_set(self, cb: CircuitBreaker, override: CircuitBreakerOverride) -> None:
+        """This callback function is called when a manual override is set on the circuit breaker `cb`."""
+
+    def override_cleared(self, cb: CircuitBreaker, override: CircuitBreakerOverride) -> None:
+        """This callback function is called when a manual override is cleared from the circuit breaker `cb`.
+
+        Note that overrides expire lazily, so this callback is not called
+        when an override simply reaches its expiry time.
+        """
 
 
 class CircuitBreakerState:
