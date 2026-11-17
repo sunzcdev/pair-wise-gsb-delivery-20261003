@@ -1,6 +1,20 @@
 Changelog
 =========
 
+Unreleased
+
+* Distinguish short-circuited calls from real dependency failures: `CircuitBreakerError`
+  now carries a stable `reason` code (`REASON_CIRCUIT_OPEN`,
+  `REASON_FAILURES_THRESHOLD_REACHED`, `REASON_TRIAL_CALL_FAILED`) and a
+  `CircuitBreakerSnapshot` with the policy in use, the failure round, and the
+  conditions for the next trial call (never business call parameters)
+* Preserve the original dependency exception as `__cause__` when a real call
+  trips the circuit (with `throw_new_error_on_trip=True`); short-circuit
+  rejections no longer reuse the dependency exception's traceback
+* Listener callback failures are now raised as `CircuitBreakerListenerError`
+  (with the original exception as `__cause__`), so listener malfunctions are
+  never conflated with business errors from the guarded operation
+
 Version 1.4.0 (July 6, 2025)
 
 * Add success_threshold parameter (Thanks @sideshowbandana)

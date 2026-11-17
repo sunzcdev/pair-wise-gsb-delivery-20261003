@@ -380,6 +380,159 @@ class CircuitBreakerStorageBasedTestCase:
         except ValueError as e:
             assert isinstance(e, ValueError)
 
+    def test_trip_error_reason_snapshot_and_cause(self):
+        """CircuitBreaker: the failure that trips the circuit is reported as a
+        real call, with a stable reason, a state snapshot, and the original
+        exception as cause.
+        """
+        self.breaker = CircuitBreaker(fail_max=2, reset_timeout=30, **self.breaker_kwargs)
+
+        def func():
+            raise NotImplementedError
+
+        with pytest.raises(NotImplementedError):
+            self.breaker.call(func)
+
+        with pytest.raises(CircuitBreakerError) as exc_info:
+            self.breaker.call(func)
+
+        err = exc_info.value
+        assert err.reason == REASON_FAILURES_THRESHOLD_REACHED
+        assert isinstance(err.__cause__, NotImplementedError)
+
+        snapshot = err.snapshot
+        assert snapshot is not None
+        assert snapshot.state == "open"
+        assert snapshot.fail_counter == 2
+        assert snapshot.fail_max == 2
+        assert snapshot.reset_timeout == 30
+        assert snapshot.opened_at is not None
+        assert 0 <= snapshot.retry_after <= 30
+
+    def test_short_circuit_error_reason_snapshot_no_cause(self):
+        """CircuitBreaker: rejections while the circuit is open are reported as
+        short-circuits (no real call) and do not chain a dependency exception.
+        """
+        self.breaker = CircuitBreaker(fail_max=1, reset_timeout=30, **self.breaker_kwargs)
+
+        calls = []
+
+        def func():
+            calls.append(1)
+            raise NotImplementedError
+
+        with pytest.raises(CircuitBreakerError):
+            self.breaker.call(func)
+        assert len(calls) == 1
+
+        with pytest.raises(CircuitBreakerError) as exc_info:
+            self.breaker.call(func)
+
+        err = exc_info.value
+        assert err.reason == REASON_CIRCUIT_OPEN
+        assert err.__cause__ is None
+        # The dependency was not invoked again.
+        assert len(calls) == 1
+
+        snapshot = err.snapshot
+        assert snapshot is not None
+        assert snapshot.state == "open"
+        assert snapshot.fail_counter == 1
+        assert 0 < snapshot.retry_after <= 30
+
+    def test_trial_call_failure_reason_and_cause(self):
+        """CircuitBreaker: a failed trial call in half-open state is reported
+        as a real call, preserving the original exception as cause.
+        """
+        self.breaker = CircuitBreaker(fail_max=1, reset_timeout=0.1, **self.breaker_kwargs)
+
+        def func():
+            raise NotImplementedError
+
+        with pytest.raises(CircuitBreakerError):
+            self.breaker.call(func)
+
+        # Wait for the reset timeout so the next call is a half-open trial.
+        sleep(0.2)
+
+        with pytest.raises(CircuitBreakerError) as exc_info:
+            self.breaker.call(func)
+
+        err = exc_info.value
+        assert err.reason == REASON_TRIAL_CALL_FAILED
+        assert isinstance(err.__cause__, NotImplementedError)
+        assert err.snapshot is not None
+        assert err.snapshot.state == "open"
+
+    def test_snapshot_contains_no_business_parameters(self):
+        """CircuitBreaker: snapshots only carry breaker policy/counters and
+        retry conditions, never business call parameters.
+        """
+        self.breaker = CircuitBreaker(name="depsvc", **self.breaker_kwargs)
+
+        snapshot = self.breaker.snapshot()
+        assert snapshot.breaker_name == "depsvc"
+        assert snapshot.state == "closed"
+        assert snapshot.retry_after is None
+        assert set(snapshot.as_dict()) == {
+            "breaker_name",
+            "state",
+            "fail_counter",
+            "success_counter",
+            "fail_max",
+            "reset_timeout",
+            "success_threshold",
+            "opened_at",
+            "retry_after",
+        }
+
+    def test_listener_error_has_independent_attribution(self):
+        """CircuitBreaker: listener failures are wrapped in
+        CircuitBreakerListenerError with the original exception as cause, and
+        are not conflated with business errors from the guarded operation.
+        """
+
+        class Listener(CircuitBreakerListener):
+            def failure(self, cb, exc):
+                raise RuntimeError("listener boom")
+
+        listener = Listener()
+        self.breaker = CircuitBreaker(listeners=(listener,), **self.breaker_kwargs)
+
+        def func():
+            raise NotImplementedError
+
+        with pytest.raises(CircuitBreakerListenerError) as exc_info:
+            self.breaker.call(func)
+
+        err = exc_info.value
+        assert isinstance(err.__cause__, RuntimeError)
+        assert err.event == "failure"
+        assert err.listener is listener
+        assert err.breaker is self.breaker
+        # The dependency failure was still counted before the listener blew up.
+        assert self.breaker.fail_counter == 1
+
+    def test_before_call_listener_error_has_independent_attribution(self):
+        """CircuitBreaker: a failing before_call listener surfaces as
+        CircuitBreakerListenerError, not as the business exception.
+        """
+
+        class Listener(CircuitBreakerListener):
+            def before_call(self, cb, func, *args, **kwargs):
+                raise RuntimeError("listener boom")
+
+        self.breaker = CircuitBreaker(listeners=(Listener(),), **self.breaker_kwargs)
+
+        def func():
+            return True
+
+        with pytest.raises(CircuitBreakerListenerError) as exc_info:
+            self.breaker.call(func)
+
+        assert isinstance(exc_info.value.__cause__, RuntimeError)
+        assert exc_info.value.event == "before_call"
+
 
 class CircuitBreakerConfigurationTestCase:
     """Tests for the CircuitBreaker class."""

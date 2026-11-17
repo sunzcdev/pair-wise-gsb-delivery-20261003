@@ -10,7 +10,6 @@ from __future__ import annotations
 import calendar
 import contextlib
 import logging
-import sys
 import threading
 import time
 import types
@@ -61,8 +60,13 @@ __all__ = (
     "CircuitBreaker",
     "CircuitBreakerListener",
     "CircuitBreakerError",
+    "CircuitBreakerListenerError",
+    "CircuitBreakerSnapshot",
     "CircuitMemoryStorage",
     "CircuitRedisStorage",
+    "REASON_CIRCUIT_OPEN",
+    "REASON_FAILURES_THRESHOLD_REACHED",
+    "REASON_TRIAL_CALL_FAILED",
     "STATE_OPEN",
     "STATE_CLOSED",
     "STATE_HALF_OPEN",
@@ -72,10 +76,79 @@ STATE_OPEN = "open"
 STATE_CLOSED = "closed"
 STATE_HALF_OPEN = "half-open"
 
+# Stable reason codes attached to ``CircuitBreakerError`` so callers can tell
+# *why* a call was rejected without parsing human-readable messages.
+#: A real call to the guarded operation failed and that failure tripped the
+#: circuit (the dependency was actually invoked).
+REASON_FAILURES_THRESHOLD_REACHED = "failures_threshold_reached"
+#: The call was short-circuited because the circuit is open; the guarded
+#: operation was never invoked.
+REASON_CIRCUIT_OPEN = "circuit_open"
+#: A real trial call in the half-open state failed and re-opened the circuit
+#: (the dependency was actually invoked).
+REASON_TRIAL_CALL_FAILED = "trial_call_failed"
+
 T = TypeVar("T")
 ExceptionType = TypeVar("ExceptionType", bound=BaseException)
 CBListenerType = TypeVar("CBListenerType", bound="CircuitBreakerListener")
 CBStateType = Union["CircuitClosedState", "CircuitHalfOpenState", "CircuitOpenState"]
+
+
+class CircuitBreakerSnapshot:
+    """Immutable engineering snapshot of a circuit breaker's state and policy
+    at the moment a call was rejected or the circuit tripped.
+
+    It deliberately contains only breaker-level diagnostics (the policy in
+    use, the current round/counters, and the conditions under which a new
+    trial call will be allowed) - never business call parameters.
+    """
+
+    __slots__ = (
+        "breaker_name",
+        "state",
+        "fail_counter",
+        "success_counter",
+        "fail_max",
+        "reset_timeout",
+        "success_threshold",
+        "opened_at",
+        "retry_after",
+    )
+
+    def __init__(
+        self,
+        breaker_name: str | None,
+        state: str,
+        fail_counter: int,
+        success_counter: int,
+        fail_max: int,
+        reset_timeout: float,
+        success_threshold: int,
+        opened_at: datetime | None,
+        retry_after: float | None,
+    ) -> None:
+        self.breaker_name = breaker_name
+        self.state = state
+        self.fail_counter = fail_counter
+        self.success_counter = success_counter
+        self.fail_max = fail_max
+        self.reset_timeout = reset_timeout
+        self.success_threshold = success_threshold
+        self.opened_at = opened_at
+        self.retry_after = retry_after
+
+    def as_dict(self) -> dict[str, Any]:
+        """Return this snapshot as a plain dict, suitable for structured logging."""
+        return {name: getattr(self, name) for name in self.__slots__}
+
+    def __eq__(self, other: Any) -> bool:
+        if not isinstance(other, CircuitBreakerSnapshot):
+            return NotImplemented
+        return self.as_dict() == other.as_dict()
+
+    def __repr__(self) -> str:
+        attrs = ", ".join(f"{name}={getattr(self, name)!r}" for name in self.__slots__)
+        return f"CircuitBreakerSnapshot({attrs})"
 
 
 class CircuitBreaker:
@@ -199,6 +272,51 @@ class CircuitBreaker:
         reported by the _state_storage. i.e., 'closed', 'open', 'half-open'.
         """
         return self._state_storage.state
+
+    def snapshot(self) -> CircuitBreakerSnapshot:
+        """Return an immutable snapshot of this circuit breaker's current
+        state, policy, and retry conditions, for engineering diagnostics.
+
+        The snapshot never contains business call parameters.
+        """
+        state = self.current_state
+        opened_at = self._state_storage.opened_at
+        retry_after: float | None = None
+        if state == STATE_OPEN and opened_at is not None:
+            probe_at = opened_at + timedelta(seconds=self._reset_timeout)
+            retry_after = max(0.0, (probe_at - datetime.now(UTC)).total_seconds())
+        return CircuitBreakerSnapshot(
+            breaker_name=self._name,
+            state=state,
+            fail_counter=self._state_storage.counter,
+            success_counter=self._state_storage.success_counter,
+            fail_max=self._fail_max,
+            reset_timeout=self._reset_timeout,
+            success_threshold=self._success_threshold,
+            opened_at=opened_at,
+            retry_after=retry_after,
+        )
+
+    def _notify_listeners(self, event: str, *args: Any, **kwargs: Any) -> None:
+        """Notify all listeners of `event`.
+
+        Any exception raised by a listener is re-raised as a
+        ``CircuitBreakerListenerError`` (with the original exception as its
+        cause) so that listener malfunctions are never mistaken for errors
+        raised by the guarded operation itself.
+        """
+        for listener in self.listeners:
+            callback = getattr(listener, event)
+            try:
+                callback(self, *args, **kwargs)
+            except Exception as exc:
+                msg = f"Circuit breaker listener {listener!r} raised while handling {event!r}"
+                raise CircuitBreakerListenerError(
+                    msg,
+                    breaker=self,
+                    listener=listener,
+                    event=event,
+                ) from exc
 
     @property
     def excluded_exceptions(
@@ -690,8 +808,7 @@ class CircuitBreakerState:
         """Handle a failed call to the guarded operation."""
         if self._breaker.is_system_error(exc):
             self._breaker._inc_counter()
-            for listener in self._breaker.listeners:
-                listener.failure(self._breaker, exc)
+            self._breaker._notify_listeners("failure", exc)
             self.on_failure(exc)
         else:
             self._handle_success()
@@ -703,8 +820,7 @@ class CircuitBreakerState:
         """Handle a successful call to the guarded operation."""
         self._breaker._state_storage.reset_counter()
         self.on_success()
-        for listener in self._breaker.listeners:
-            listener.success(self._breaker)
+        self._breaker._notify_listeners("success")
 
     def call(self, func: Callable[..., T], *args: Any, **kwargs: Any) -> T:
         """Calls `func` with the given `args` and `kwargs`, and updates the
@@ -713,8 +829,7 @@ class CircuitBreakerState:
         ret = None
 
         self.before_call(func, *args, **kwargs)
-        for listener in self._breaker.listeners:
-            listener.before_call(self._breaker, func, *args, **kwargs)
+        self._breaker._notify_listeners("before_call", func, *args, **kwargs)
 
         try:
             ret = func(*args, **kwargs)
@@ -739,8 +854,7 @@ class CircuitBreakerState:
             ret = None
 
             self.before_call(func, *args, **kwargs)
-            for listener in self._breaker.listeners:
-                listener.before_call(self._breaker, func, *args, **kwargs)
+            self._breaker._notify_listeners("before_call", func, *args, **kwargs)
 
             try:
                 ret = yield func(*args, **kwargs)
@@ -801,8 +915,7 @@ class CircuitClosedState(CircuitBreakerState):
             # share a central source of truth (as would be the case with the redis
             # storage).
             self._breaker._state_storage.reset_counter()
-            for listener in self._breaker.listeners:
-                listener.state_change(self._breaker, prev_state, self)
+            self._breaker._notify_listeners("state_change", prev_state, self)
 
     def on_failure(self, exc: BaseException) -> None:
         """Move the circuit breaker to the "open" state once the failures threshold is reached."""
@@ -811,7 +924,11 @@ class CircuitClosedState(CircuitBreakerState):
 
             if throw_new_error:
                 error_msg = "Failures threshold reached, circuit breaker opened"
-                raise CircuitBreakerError(error_msg).with_traceback(sys.exc_info()[2])
+                raise CircuitBreakerError(
+                    error_msg,
+                    reason=REASON_FAILURES_THRESHOLD_REACHED,
+                    snapshot=self._breaker.snapshot(),
+                ) from exc
             raise exc
 
 
@@ -835,8 +952,7 @@ class CircuitOpenState(CircuitBreakerState):
         if notify:
             # Reset success counter when opening the circuit
             self._breaker._state_storage.reset_success_counter()
-            for listener in self._breaker.listeners:
-                listener.state_change(self._breaker, prev_state, self)
+            self._breaker._notify_listeners("state_change", prev_state, self)
 
     def before_call(self, func: Callable[..., T], *args: Any, **kwargs: Any) -> T:
         """After the timeout elapses, move the circuit breaker to the "half-open"
@@ -847,7 +963,11 @@ class CircuitOpenState(CircuitBreakerState):
         opened_at = self._breaker._state_storage.opened_at
         if opened_at and datetime.now(UTC) < opened_at + timeout:
             error_msg = "Timeout not elapsed yet, circuit breaker still open"
-            raise CircuitBreakerError(error_msg)
+            raise CircuitBreakerError(
+                error_msg,
+                reason=REASON_CIRCUIT_OPEN,
+                snapshot=self._breaker.snapshot(),
+            )
         self._breaker.half_open()
         return self._breaker.call(func, *args, **kwargs)
 
@@ -877,8 +997,7 @@ class CircuitHalfOpenState(CircuitBreakerState):
         if notify:
             # Reset success counter when entering half-open state
             self._breaker._state_storage.reset_success_counter()
-            for listener in self._breaker._listeners:
-                listener.state_change(self._breaker, prev_state, self)
+            self._breaker._notify_listeners("state_change", prev_state, self)
 
     def on_failure(self, exc: BaseException) -> NoReturn:
         """Opens the circuit breaker."""
@@ -886,7 +1005,11 @@ class CircuitHalfOpenState(CircuitBreakerState):
 
         if throw_new_error:
             error_msg = "Trial call failed, circuit breaker opened"
-            raise CircuitBreakerError(error_msg).with_traceback(sys.exc_info()[2])
+            raise CircuitBreakerError(
+                error_msg,
+                reason=REASON_TRIAL_CALL_FAILED,
+                snapshot=self._breaker.snapshot(),
+            ) from exc
         raise exc
 
     def on_success(self) -> None:
@@ -900,4 +1023,61 @@ class CircuitHalfOpenState(CircuitBreakerState):
 class CircuitBreakerError(Exception):
     """When calls to a service fails because the circuit is open, this error is
     raised to allow the caller to handle this type of exception differently.
+
+    Carries a stable ``reason`` code and a ``snapshot`` of the breaker's state
+    and policy at the moment of the rejection, so callers can distinguish a
+    short-circuited call (the dependency was never invoked) from a real call
+    whose failure tripped the circuit. When the failure of a real call trips
+    the circuit, the original dependency exception is preserved as the
+    ``__cause__`` of this error.
     """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        reason: str | None = None,
+        snapshot: CircuitBreakerSnapshot | None = None,
+    ) -> None:
+        super().__init__(message)
+        self._reason = reason
+        self._snapshot = snapshot
+
+    @property
+    def reason(self) -> str | None:
+        """Return the stable machine-readable reason code for this rejection,
+        e.g. ``REASON_CIRCUIT_OPEN`` (short-circuit, no call attempted) or
+        ``REASON_FAILURES_THRESHOLD_REACHED`` (a real call tripped the circuit).
+        """
+        return self._reason
+
+    @property
+    def snapshot(self) -> CircuitBreakerSnapshot | None:
+        """Return the breaker state/policy snapshot taken when this error was
+        raised. Contains only engineering diagnostics, never business call
+        parameters.
+        """
+        return self._snapshot
+
+
+class CircuitBreakerListenerError(Exception):
+    """Raised when a circuit breaker listener callback fails.
+
+    The original exception raised by the listener is preserved as the
+    ``__cause__`` of this error, so engineering diagnostics from listener
+    malfunctions are never conflated with business errors raised by the
+    guarded operation.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        breaker: CircuitBreaker | None = None,
+        listener: CircuitBreakerListener | None = None,
+        event: str | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.breaker = breaker
+        self.listener = listener
+        self.event = event
