@@ -1,0 +1,13 @@
+@import url('https://assets.hynek.me/css/bm.css');
+
+:root {
+  --pst-font-family-base: system-ui, sans-serif;
+  --pst-font-family-heading: Bahnschrift, 'DIN Alternate', 'Franklin Gothic Medium', 'Nimbus Sans Narrow', sans-serif-condensed, sans-serif;
+  --pst-font-family-monospace: BerkeleyMono, ui-monospace, 'Cascadia Code', 'Source Code Pro', Menlo, Consolas, 'DejaVu Sans Mono', monospace;
+}
+
+/* Override theme's font-size-base with higher specificity */
+html[data-theme=light],
+html[data-theme=dark] {
+  --pst-font-size-base: 1.15rem;
+}
