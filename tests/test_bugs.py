@@ -1,0 +1,182 @@
+# Copyright (C) Dnspython Contributors, see LICENSE for text of ISC license
+
+# Copyright (C) 2006-2017 Nominum, Inc.
+#
+# Permission to use, copy, modify, and distribute this software and its
+# documentation for any purpose with or without fee is hereby granted,
+# provided that the above copyright notice and this permission notice
+# appear in all copies.
+#
+# THE SOFTWARE IS PROVIDED "AS IS" AND NOMINUM DISCLAIMS ALL WARRANTIES
+# WITH REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF
+# MERCHANTABILITY AND FITNESS. IN NO EVENT SHALL NOMINUM BE LIABLE FOR
+# ANY SPECIAL, DIRECT, INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES
+# WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN AN
+# ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT
+# OF OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
+
+from io import BytesIO
+import unittest
+
+import binascii
+
+import dns.exception
+import dns.rdata
+import dns.rdataclass
+import dns.rdatatype
+import dns.rdtypes.ANY.TXT
+import dns.ttl
+
+
+class BugsTestCase(unittest.TestCase):
+    def test_float_LOC(self):
+        rdata = dns.rdata.from_text(
+            dns.rdataclass.IN,
+            dns.rdatatype.LOC,
+            "30 30 0.000 N 100 30 0.000 W 10.00m 20m 2000m 20m",
+        )
+        self.assertEqual(rdata.float_latitude, 30.5)
+        self.assertEqual(rdata.float_longitude, -100.5)
+
+    def test_noncanonical_LOC_size_from_wire(self):
+        # RFC 1876 Section 2: size/hprec/vprec are base * 10^exponent. A zero
+        # base is the value 0 for any exponent, but to_wire writes 0x00 for 0,
+        # so bytes 0x01-0x09 are non-canonical zeros that would not round-trip.
+        # version, size, hprec, vprec, latitude, longitude, altitude
+        prefix = bytes([0])
+        suffix = binascii.unhexlify("8000000080000000" + "00989680")
+        for offset in range(3):  # size, hprec, vprec in turn
+            fields = [0, 0, 0]
+            fields[offset] = 0x05
+            wire = prefix + bytes(fields) + suffix
+            with self.assertRaises(dns.exception.FormError):
+                dns.rdata.from_wire(
+                    dns.rdataclass.IN, dns.rdatatype.LOC, wire, 0, len(wire)
+                )
+        # A real zero (0x00) and a non-zero value (0x12 == 1m) still parse and
+        # round-trip.
+        for byte in (0x00, 0x12):
+            wire = prefix + bytes([byte, byte, byte]) + suffix
+            rd = dns.rdata.from_wire(
+                dns.rdataclass.IN, dns.rdatatype.LOC, wire, 0, len(wire)
+            )
+            self.assertEqual(rd.to_wire(), wire)
+
+    def test_SOA_BIND8_TTL(self):
+        rdata1 = dns.rdata.from_text(
+            dns.rdataclass.IN, dns.rdatatype.SOA, "a b 100 1s 1m 1h 1d"
+        )
+        rdata2 = dns.rdata.from_text(
+            dns.rdataclass.IN, dns.rdatatype.SOA, "a b 100 1 60 3600 86400"
+        )
+        self.assertEqual(rdata1, rdata2)
+
+    def test_empty_NSEC3_window(self):
+        rdata = dns.rdata.from_text(
+            dns.rdataclass.IN,
+            dns.rdatatype.NSEC3,
+            "1 0 100 ABCD SCBCQHKU35969L2A68P3AD59LHF30715",
+        )
+        self.assertEqual(rdata.windows, ())
+
+    def test_zero_size_APL(self):
+        rdata = dns.rdata.from_text(dns.rdataclass.IN, dns.rdatatype.APL, "")
+        rdata2 = dns.rdata.from_wire(dns.rdataclass.IN, dns.rdatatype.APL, "", 0, 0)
+        self.assertEqual(rdata, rdata2)
+
+    def test_CAA_from_wire(self):
+        rdata = dns.rdata.from_text(
+            dns.rdataclass.IN, dns.rdatatype.CAA, '0 issue "ca.example.net"'
+        )
+        f = BytesIO()
+        rdata.to_wire(f)
+        wire = f.getvalue()
+        rdlen = len(wire)
+        wire += b"trailing garbage"
+        rdata2 = dns.rdata.from_wire(
+            dns.rdataclass.IN, dns.rdatatype.CAA, wire, 0, rdlen
+        )
+        self.assertEqual(rdata, rdata2)
+
+    def test_trailing_zero_APL(self):
+        in4 = "!1:127.0.0.0/1"
+        rd4 = dns.rdata.from_text(dns.rdataclass.IN, dns.rdatatype.APL, in4)
+        out4 = rd4.to_digestable(dns.name.from_text("test"))
+        text4 = binascii.hexlify(out4).decode("ascii")
+        self.assertEqual(text4, "000101817f")
+        in6 = "!2:::1000/1"
+        rd6 = dns.rdata.from_text(dns.rdataclass.IN, dns.rdatatype.APL, in6)
+        out6 = rd6.to_digestable(dns.name.from_text("test"))
+        text6 = binascii.hexlify(out6).decode("ascii")
+        self.assertEqual(text6, "0002018f000000000000000000000000000010")
+
+    def test_trailing_zero_APL_from_wire(self):
+        # RFC 3123 4.1/4.2: the AFDPART must not have trailing zero octets.
+        # IPv4 item 1:1.2.3.0/24 with a 4-octet AFDPART ending in 0x00.
+        wire4 = bytes([0, 1, 24, 4, 1, 2, 3, 0])
+        with self.assertRaises(dns.exception.FormError):
+            dns.rdata.from_wire(
+                dns.rdataclass.IN, dns.rdatatype.APL, wire4, 0, len(wire4)
+            )
+        # IPv6 item 2:::0100:0/16 with a 16-octet AFDPART ending in 0x00.
+        wire6 = bytes([0, 2, 16, 16]) + bytes(14) + bytes([1, 0])
+        with self.assertRaises(dns.exception.FormError):
+            dns.rdata.from_wire(
+                dns.rdataclass.IN, dns.rdatatype.APL, wire6, 0, len(wire6)
+            )
+
+    def test_formatted_hex_rejects_non_hex(self):
+        # NID and L64 node/locator ids are groups of hex digits (RFC 6742).
+        # int(..., 16) also accepts a sign or underscores, which produced a
+        # record whose presentation form did not parse back the same way.
+        for rdtype in (dns.rdatatype.NID, dns.rdatatype.L64):
+            for bad in (
+                "10 0000:0000:0000:+f00",
+                "10 0000:0000:0000:1_00",
+                "10 +000:0000:0000:0000",
+            ):
+                with self.assertRaises(dns.exception.SyntaxError):
+                    dns.rdata.from_text(dns.rdataclass.IN, rdtype, bad)
+            # Valid ids, in either case, still work and round-trip.
+            good = "10 0014:4fff:ff20:ee64"
+            rd = dns.rdata.from_text(dns.rdataclass.IN, rdtype, good)
+            self.assertEqual(rd.to_text(), good)
+            rd2 = dns.rdata.from_text(
+                dns.rdataclass.IN, rdtype, "10 0014:4FFF:FF20:EE64"
+            )
+            self.assertEqual(rd.to_wire(), rd2.to_wire())
+
+    def test_base64_rejects_non_alphabet(self):
+        # base64.b64decode() silently discards characters outside the base64
+        # alphabet, so a presentation form with junk in it used to be accepted
+        # and decoded to a different record than it spelled.
+        cases = {
+            dns.rdatatype.DNSKEY: ("257 3 8 AwEAAaY=", "257 3 8 AwEA!!AaY="),
+            dns.rdatatype.CDNSKEY: ("257 3 8 AwEAAaY=", "257 3 8 AwEA!!AaY="),
+            dns.rdatatype.CERT: ("PKIX 0 8 AwEAAaY=", "PKIX 0 8 AwEA!!AaY="),
+            dns.rdatatype.OPENPGPKEY: ("AwEAAaY=", "AwEA!!AaY="),
+            dns.rdatatype.DHCID: ("AAABxg==", "AAAB!!xg=="),
+            dns.rdatatype.HTTPS: ('1 . ech="AAQAAAAA"', '1 . ech="AAQA!!AAAA"'),
+        }
+        for rdtype, (good, bad) in cases.items():
+            with self.assertRaises(dns.exception.SyntaxError):
+                dns.rdata.from_text(dns.rdataclass.IN, rdtype, bad)
+            # The valid form still parses and round-trips.
+            rd = dns.rdata.from_text(dns.rdataclass.IN, rdtype, good)
+            self.assertEqual(
+                dns.rdata.from_text(dns.rdataclass.IN, rdtype, rd.to_text()).to_wire(),
+                rd.to_wire(),
+            )
+
+    def test_TXT_conversions(self):
+        t1 = dns.rdtypes.ANY.TXT.TXT(dns.rdataclass.IN, dns.rdatatype.TXT, [b"foo"])
+        t2 = dns.rdtypes.ANY.TXT.TXT(dns.rdataclass.IN, dns.rdatatype.TXT, b"foo")
+        t3 = dns.rdtypes.ANY.TXT.TXT(dns.rdataclass.IN, dns.rdatatype.TXT, "foo")
+        t4 = dns.rdtypes.ANY.TXT.TXT(dns.rdataclass.IN, dns.rdatatype.TXT, ["foo"])
+        self.assertEqual(t1, t2)
+        self.assertEqual(t1, t2)
+        self.assertEqual(t1, t4)
+
+
+if __name__ == "__main__":
+    unittest.main()

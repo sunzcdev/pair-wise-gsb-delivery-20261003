@@ -1,0 +1,915 @@
+.. _whatsnew:
+
+What's New in dnspython
+=======================
+
+2.10.0 (in development)
+-----------------------
+
+* The text form of an IPSECKEY record may now omit the public key, which RFC
+  4025 section 3.1 makes optional, e.g. ``10 1 0 192.0.2.38`` with algorithm
+  0, which means that no key is present.  Such a record could not be read from
+  a zone file, and when one was read from the wire, ``from_text()`` could not
+  read back what ``to_text()`` wrote for it, which also ended with a space.
+
+* The text form of NSEC, NSEC3, and CSYNC type bitmaps now accepts ``TYPE0``
+  and keeps it, so a record with the TYPE0 bit set, e.g. one received in a
+  zone transfer, can be written to a zone file and read back unchanged.  The
+  bit cannot be dropped, as the record is signed and its RRSIG would no
+  longer validate.
+
+* The rdata types whose value is a single base64 block, i.e. DHCID, HHIT, BRID,
+  and OPENPGPKEY, now reject an empty value, like the TXT family does.  The
+  presentation format of these types (RFC 4701 section 3.2, RFC 7929 section
+  2.3, RFC 9886) has no way to write an empty value, so ``to_text()`` returned
+  an empty string which ``from_text()`` then rejected.  The wire parser accepted
+  a zero-length rdata, so a message received from the network could be written
+  out with ``to_text()`` and then could not be read back in.  A
+  ``dns.exception.FormError`` is now raised when such an rdata is read from the
+  wire.
+
+* The type annotation of ``public_key()`` on the ``dns.dnssecalgs`` private
+  key classes is now ``dns.dnssecalgs.base.GenericPublicKey``, as declared by
+  ``GenericPrivateKey``, instead of ``CryptographyPublicKey``, and the
+  ``public_cls`` attribute is now uniformly ``type[GenericPublicKey]``.  The
+  narrower annotations were not consistent with the base class, and were not
+  the concrete algorithm class in any case.  Runtime behavior is unchanged,
+  but code that relies on the narrower static type, e.g. to use the ``key``
+  attribute of the result, may now need an ``isinstance()`` check or a cast to
+  satisfy a type checker.
+
+2.9.2
+-----
+
+* A maliciously crafted zone file could use a WKS record to consume excessive
+  memory and CPU, possibly causing the process to exit due to memory exhaustion.
+  Thanks to Jace (GitHub @manus-use) for discovering and reporting this issue.
+
+2.9.1
+-----
+
+* LOC text parsing now converts the altitude, size, horizontal precision, and
+  vertical precision fields to centimeters exactly, and requires them to be
+  decimal numbers of meters with at most two fractional digits, as RFC 1876
+  section 3 specifies.  They were converted with ``float()``, so ``9.29m``
+  became 928 cm rather than 929 cm and the text and wire forms of the record
+  disagreed, forms such as ``1e3m``, ``1_000m``, ``+10m``, ``nanm``, and
+  ``infm`` were accepted, extra fractional digits were silently dropped, and an
+  altitude outside the representable range was accepted and then failed in
+  ``to_wire()`` with a non-DNS exception.  ``dns.exception.SyntaxError`` is
+  now raised for all of these.
+
+* The resolver now assigns a new random query id to every query.
+
+* For transports that require a 0 query id, set it in a way that does not break
+  TSIG.
+
+* ``dns.message.QueryMessage.resolve_chaining()`` now caps the minimum TTL of
+  a negative response with no SOA record at 300 seconds
+  (``dns.message.NEGATIVE_TTL_WITHOUT_SOA``).  Previously the TTL was left at
+  its initial value of 2^32 - 1, so a single NXDOMAIN or NODATA response with
+  no SOA, e.g. a spoofed one, stayed in the resolver cache for the life of
+  the process.
+
+* DNSSEC validation now rejects an RRSIG whose type covered or class does not
+  match the RRset, as RFC 4035 section 5.3.1 requires.  This was not checked,
+  so a revoked DNSKEY, which may only validate the DNSKEY RRset, still
+  validated any RRset signed with its private key if the RRSIG claimed to
+  cover DNSKEY.
+
+* ``dns.tokenizer.Tokenizer`` now ends a line at a carriage return, or at a
+  carriage return followed by a line feed, unless the carriage return is in a
+  quoted string.  The carriage return of CRLF line ends used to stay in the
+  last token of each line and in the text of a comment, so e.g.
+  ``dns.zone.from_text()`` rejected a zone with CRLF line ends.
+
+* DNSSEC validation no longer uses a DNSKEY with the REVOKE flag set to
+  validate anything other than the DNSKEY RRset.  RFC 5011 section 2.1 says a
+  revoked key must not be used for any other purpose, but it was a candidate
+  key like any other, so as long as the revoked key was still published, data
+  signed with its private key, e.g. by whoever compromised it, validated.
+
+* ``dns.ttl.from_text()`` now rejects a BIND-style TTL that ends in a 0
+  without a unit, e.g. ``1h0``, as it already did for other numbers, e.g.
+  ``1h5``, and as BIND does.  The check for a trailing number tested its value
+  instead of whether there was one, so ``1h0`` was read as one hour.
+
+* ``dns.dnssec.sign_zone()`` now adds the apex NSEC record when the origin is
+  the only name in a relativized zone.  The origin is then the empty name,
+  which is false, so the closing NSEC was skipped and the signed zone had no
+  NSEC at all, and so no authenticated denial of existence (RFC 4035 section
+  2.3).
+
+* TLSA and SMIMEA now reject a certificate association data field whose length
+  does not match the matching type (RFC 6698 section 2.1.3: type 1 is SHA-256,
+  32 octets, and type 2 is SHA-512, 64 octets), and SSHFP rejects a fingerprint
+  whose length does not match the fingerprint type (SHA-1, 20 octets, RFC 4255
+  section 3.1.3; SHA-256, 32 octets, RFC 6594 section 3.2).  Both the wire and
+  the text parser accepted any length, including empty, so they took records
+  that conforming parsers reject.  The DS family already rejects a digest of
+  the wrong length.
+
+* A ``$GENERATE`` modifier width greater than 127 is now a syntax error, as
+  BIND rejects a substitution that does not fit in 127 characters.  The width
+  was not limited, so a short line such as ``$GENERATE 1-1 ${0,100000000,d}
+  A 10.0.0.1`` built a 100 MB padded label before anything was checked, and
+  the ``dns.transaction.TransactionLimiter`` meant for untrusted zone files
+  never saw it.
+
+* ``dns.name.from_text()`` and the parsing of quoted strings and SVCB
+  parameter values no longer take time quadratic in the length of the text.
+  They appended to ``bytes`` one character at a time, so e.g. a 1 MB label
+  took about 7 seconds to be rejected as too long.
+
+* ``dns.reversename.to_address()`` now rejects IPv4 reverse-map names without
+  exactly 4 labels.  A label containing an escaped ``.`` was joined into the
+  address text, so e.g. ``4\.3\.2\.1.in-addr.arpa.`` and
+  ``2\.1.3.4.in-addr.arpa.`` were both accepted as ``4.3.2.1``, although only
+  ``1.2.3.4.in-addr.arpa.`` is its reverse-map name.
+
+* NSEC3 now rejects an empty Next Hashed Owner Name, as RFC 5155 section
+  3.1.6 requires a hash length of 1 to 255 octets.  The wire parser accepted
+  it, ``next_name()`` returned the zone origin, and ``to_text()`` wrote an
+  empty field, so reading the text back took the first type mnemonic as the
+  hash, e.g. types ``NS SOA`` came back as next ``ns`` and type ``SOA``.
+
+* BTree zones now keep delegation indexes and node flags consistent when a
+  parent delegation hides or exposes nested NS records, when nodes are copied
+  for a new version, and when CNAME replacement implicitly removes NS records.
+  An origin learned from a zone file is also correctly identified as the
+  origin rather than a delegation when names are absolute.
+
+* ``dns.asyncquery.quic()`` now verifies the server certificate against the
+  *hostname* parameter.  It passed the deprecated *server_hostname* alias to
+  the QUIC connection instead, so a query made with ``hostname=`` accepted any
+  certificate trusted by the CA set, with no check of the name or address in
+  it.  ``dns.query.quic()`` was not affected.
+
+* DNSSEC validation now rejects an ECDSA signature that is not exactly 64
+  (P-256) or 96 (P-384) octets long (RFC 6605 section 4), and a DSA signature
+  that is not 41 octets long or whose T octet differs from the key's
+  (RFC 2536 section 3).  The signature halves were read with no length check,
+  so e.g. inserting zero octets before S gave a different RRSIG that still
+  validated.
+
+* ``dns.name.Name.to_unicode()`` now raises ``dns.name.IDNAException`` for an
+  ACE label that does not decode to a U-label, i.e. one whose punycode decodes
+  to an empty or all-ASCII string, as the strict IDNA codecs already did.  The
+  default codec and the other non-strict codecs decoded e.g. ``xn--www-`` to
+  ``www``, so ``xn--www-.example.`` was shown as ``www.example.``, a different
+  name.
+
+* ``dns.name.Name.to_unicode()`` and the UTF-8 TXT output of
+  ``dns.zone.Zone.to_text()`` (``$UNICODE ... TXT``) now escape the DEL and
+  C1 control characters U+007F through U+009F as ``\DDD``, as ``to_text()``
+  and the EDNS option text already do.  A punycode label from the wire can
+  decode to any code point, so a name in an untrusted response could put e.g.
+  a NEL (U+0085) line break or a C1 terminal control sequence into the output.
+
+* ``$GENERATE`` now substitutes the iterator the way BIND does.  The nibble
+  formats ``n`` and ``N`` produced an empty label when the width was 0 and
+  dropped nibbles when the value needed more characters than the width,
+  ``$$`` and ``\$`` were not treated as a literal ``$``, and when a template
+  contained a ``$`` with a modifier, any other ``$`` in it was left
+  unsubstituted.  A malformed ``${...}`` modifier is now a syntax error
+  instead of being copied into the output.
+
+* The ``to_text()`` output of the EDE, EDE-EXTRA-TEXT-LANGUAGE,
+  FILTERING-CONTACT, FILTERING-ORGANIZATION, and FILTERING-DB EDNS options now
+  escapes backslash and control characters as ``\DDD``.  The text in these
+  options comes from the wire and was written out verbatim, so a server could
+  put newlines or terminal escape sequences into ``dns.message.Message.to_text()``
+  output, e.g. adding a forged ``;ANSWER`` section to what a tool prints.
+
+* ``dns.zone.from_xfr()`` now ignores records in a zone transfer response that
+  are not at or below the zone origin, and raises ``dns.exception.FormError``
+  for a record of the wrong class or an SOA that is
+  not at the origin.  It previously stored all of them in the zone, so a
+  primary could add data for names outside the zone being transferred.
+
+* ``dns.query.https()``, ``dns.query.quic()``, and their ``dns.asyncquery``
+  equivalents now validate the response to a TSIG-signed query against the
+  query's MAC.  They previously passed an empty request MAC, so a correctly
+  signed response failed with ``BadSignature`` and a response with no TSIG at
+  all was accepted, as the RFC 8945 section 5.4 check for a missing TSIG was
+  skipped.
+
+* ``dns.query.inbound_xfr()``, ``dns.asyncquery.inbound_xfr()``, and
+  ``dns.query.xfr()`` now check every response message with
+  ``dns.message.Message.is_response()`` and raise ``dns.query.BadResponse`` if
+  it fails, e.g. if the ID of the request is not copied, QR is not set, or the
+  opcode differs (RFC 5936 section 2.2.1).  Nothing was checked, so a spoofed
+  UDP IXFR response only had to match the source port to be applied to the
+  zone.
+
+* ``dns.message.Message.is_response()`` has a new ``xfr_continuation``
+  parameter which allows an empty question section in the messages after the
+  first one of a zone transfer response, and it now compares question names in
+  absolute form, so a response read with an origin can match its query.
+
+* ``dns.renderer.Renderer`` now draws its default message id from
+  ``dns.entropy``, as ``dns.message.Message`` already did.  The id was
+  previously taken from the ``random`` module's global generator, which is
+  seedable and predictable from its outputs, weakening the id's role as
+  anti-spoofing entropy (RFC 5452 section 9.2) for messages built directly
+  with the renderer.
+
+* The NSEC3 Next Hashed Owner Name in presentation format is now rejected when
+  it is not canonical base32hex, i.e. when the unused low-order bits of its
+  final character are not zero (RFC 4648 section 3.5).  Such a spelling decoded
+  to the same hash as the canonical one, so ``to_text`` of the result did not
+  match the input.
+
+* CAA constructors now validate the encoded tag bytes, consistently rejecting
+  non-ASCII tags supplied as Python strings just as text and wire parsing do.
+
+* LOC wire parsing now rejects a non-canonical size, horizontal precision, or
+  vertical precision octet whose base is zero but whose exponent is not.  Such
+  an octet means the value 0, which ``to_wire`` always encodes as ``0x00``, so
+  the wire form did not round-trip.
+
+* Base64 fields in presentation format (the key material of DNSKEY, CDNSKEY,
+  KEY, CERT, HIP, IPSECKEY, OPENPGPKEY, RRSIG, SIG, DHCID, TSIG, TKEY, and the
+  SVCB/HTTPS ``ech`` value) are now rejected when they contain characters
+  outside the base64 alphabet.  ``base64.b64decode`` silently discarded such
+  characters, so a record spelled with junk in it decoded to different bytes
+  and its ``to_text`` no longer matched the input.
+
+* ``dns.name.Name.to_unicode()`` now escapes the Unicode full stops U+3002,
+  U+FF0E, and U+FF61 when a punycode label decodes to one of them.
+  ``dns.name.from_unicode()`` treats these characters as label separators, so
+  the unescaped output displayed and parsed back as a name with more labels
+  than the original, e.g. the one-label ``xn--wwwexamplecom-582lha.`` was
+  shown as ``www。example。com.``, which parses back as ``www.example.com.``.
+
+2.9.0
+-----
+
+* Decompression chain length is limited to 16.  Prior to this change,
+  a maliciously crafted DNS message could cause
+  dns.name.from_wire_parser() to use excessive CPU for DNS name
+  decompression. Applications which processed untrusted DNS wire form
+  messages with dnspython could be degraded or DoS'd by the extra CPU
+  use required.
+
+  Thanks to Evgenios Gkritsis, Constantinos Patsakis, and George Stergiopoulos
+  for finding and reporting this issue.
+
+  See https://github.com/rthalley/dnspython/security/advisories/GHSA-45c3-73f7-pv4m
+
+* Httpx2 has replaced httpx for HTTPS TCP connections.
+
+* The minimum supported Python version is now 3.11.
+
+* DNSSEC now supports ML-DSA-44, a post-quantum signature algorithm.
+
+* The NSEC3 Next Hashed Owner Name in presentation format is now decoded as
+  base32hex (RFC 5155 Section 1.3, RFC 4648 Extended Hex Alphabet).  The letters
+  W, X, Y, and Z are not in that alphabet; they used to be accepted and silently
+  decoded to a different owner name, so ``to_text`` of the result did not match
+  the input.  They are now rejected.
+
+* The NID and L64 node/locator ids in presentation format are now rejected when
+  a group contains anything other than hex digits. A sign or underscore, which
+  ``int()`` silently accepts, produced a record whose text form did not parse
+  back the same way (RFC 6742).
+
+* Rdata of a known type in the generic ``\#`` syntax, such as an NS record in a
+  zone file, no longer fails to parse when it contains a name under the origin.
+  Its names are relativized as in the type's own text form.
+
+* The SVCB and HTTPS ``ech`` parameter value must now be an ECHConfigList with a
+  correct length prefix and at least 4 octets of content (RFC 9848, RFC 9849).
+  The individual ECHConfig structures are not checked.
+
+* SVCB and HTTPS SvcParamKeys in presentation format, including those listed in
+  ``mandatory``, must now be spelled as RFC 9460 requires: 1-63 lowercase
+  letters, digits, or hyphens.  Uppercase keys such as ``ALPN`` and keys with
+  underscores such as ``no_default_alpn`` are rejected.
+
+* SVCB and HTTPS presentation format parsing now follows the escaping rules of
+  RFC 9460.  SvcParamKeys may not contain escapes (e.g. ``\097lpn=h2``), and in
+  comma-separated values (``alpn``, ``docpath``) only ``\,`` and ``\\`` are
+  valid escapes after character-string decoding (e.g. ``alpn="h2\\x"`` is
+  rejected).
+
+* SVCB and HTTPS parameters whose value must not be empty (``mandatory``,
+  ``alpn``, ``port``, ``ipv4hint``, ``ech``, ``ipv6hint``) are now rejected when
+  empty in text form (e.g. ``alpn=""`` or ``key1=""``), in wire form, and in
+  the Python API.  Per RFC 9460, an omitted value is the same as an empty one.
+  This also rejects an empty ``ech`` value, which RFC 9848 does not allow.
+
+* A relative ``$ORIGIN`` in a zone file is now relative to the current origin, as
+  RFC 1035 requires.  Previously records after it were silently dropped.
+
+* ``dns.zone.Zone.verify_digest()`` now makes the two RFC 8976 section 4 checks it
+  was missing: a ZONEMD RR only verifies the zone if its serial matches the zone's
+  SOA serial (step 5.1), and a ZONEMD RR whose scheme and hash algorithm are shared
+  with another ZONEMD RR in the RRset does not verify the zone at all (step 4).
+
+* ``dns.reversename.to_address()`` now rejects IPv6 reverse-map names without
+  exactly 32 single-character labels, instead of padding missing nibbles or
+  accepting multiple nibbles in a label.
+
+* A "transaction setup" callable may be specified when reading a zone from a file,
+  a string, or an inbound zone transfer.  It is called just after the transaction is
+  created.  A ``TransactionLimiter`` setup is available to limit the size of the
+  zone.
+
+* Name and rdata "to text" is now done with the `to_styled_text()` method, allowing
+  much greater control over text output.  Application code that uses `to_text()`
+  continues to work as before, but any custom Rdata implementations need to be updated
+  to support `to_styled_text()`.
+
+* The socket type parameter to socket.getaddrinfo used to be called "socktype" in
+  Python 2, but was renamed to "type" in Python 3.  We applied this change on
+  the python3 branch almost a decade ago, but it was lost in the "single code base,
+  only Python 3" update, also quite some time ago.  It is now renamed to "type"
+  (again) so it matches the Python 3 code it is overriding.
+
+* dns.flags.to_text() and dns.flags.edns_to_text() no longer silently drop set
+  bits that have no named flag.  Such bits are now rendered as ``FLAGn``, where n
+  is the bit position, and dns.flags.from_text() / edns_from_text() parse that form
+  back, so the conversions round-trip.  See issue #1264.
+
+* dns.ttl.from_text() now raises dns.ttl.BadTTL, rather than leaking a bare
+  ValueError, when the text contains a non-decimal Unicode "digit" (e.g. the
+  superscript ``\u00b2``).  Such characters are accepted by ``str.isdigit()`` but
+  rejected by ``int()``, so they previously escaped the parser's validation.  This
+  also makes zone files with such a TTL fail with a clean dns.exception.SyntaxError.
+
+* The zone file reader no longer treats a quoted string as a directive.  A line
+  starting with ``"$TTL"`` was processed as if it were ``$TTL``, because only the
+  token's value was tested and not its type; a directive must now be an unquoted
+  identifier.  This also fixes a crash: a line beginning with an empty token
+  (e.g. an empty quoted string) made the reader raise a bare IndexError, rather
+  than the dns.exception.SyntaxError any other malformed zone file gets.
+
+* The to_text() of string-list SVCB parameters (alpn and docpath) escaped
+  non-printable bytes twice, rendering them as ``\\ddd`` instead of ``\ddd``,
+  so the output did not parse back to the original value.  Such bytes are now
+  escaped once, at the character-string level.
+
+* The SVCB/HTTPS wire parser now rejects a record whose SvcParamKeys are not in
+  strictly increasing numeric order, including one that repeats a key.  RFC 9460
+  section 2.2 requires such a record to be treated as malformed, and the
+  presentation parser already did, but the wire parser only checked for a
+  decreasing key, so a duplicate key was accepted and silently kept only its
+  last value.  The same strictly-increasing check now also applies to the keys
+  inside a ``mandatory`` parameter (section 8).
+
+* The NSEC, NSEC3, and CSYNC type-bitmap wire parser now rejects a window
+  whose bitmap ends in a zero octet, including an all-zero block.  RFC 4034
+  section 4.1.2 requires trailing zero octets to be omitted and forbids a block
+  with no types present, so the last octet of a window's bitmap is always
+  non-zero; the parser previously accepted these non-canonical encodings.
+
+* The APL wire parser now rejects an item whose address prefix (AFDPART) ends in
+  a zero octet.  RFC 3123 sections 4.1 and 4.2 require trailing zero octets to be
+  omitted so that DNSSEC has a single canonical wire encoding.  The parser
+  previously accepted these, and since to_wire() strips the trailing zeros,
+  from_wire() followed by to_wire() silently rewrote the rdata to different bytes.
+
+* The EDNS Client Subnet (ECS) option wire parser now rejects a malformed
+  option instead of silently rewriting it.  RFC 7871 section 6 requires the
+  source and scope prefix lengths to fit the address family and the address
+  bits beyond the source prefix length to be zero.  A non-zero pad was
+  previously masked off by the option constructor, so from_wire followed by
+  to_wire produced different bytes, and an out-of-range prefix length leaked a
+  low-level error rather than being reported as malformed.
+
+* ZONEMD rdata now rejects a digest shorter than 12 octets.  RFC 8976
+  section 2.2.4 requires the digest to be at least 12 octets regardless of the
+  hash algorithm, but dnspython only checked the length for the hash algorithms
+  it implements, so a record using a private-use algorithm could carry a
+  truncated (or empty) digest.
+
+* Rdata types with free-form string fields (URI, HINFO, X25, ISDN, NAPTR, and
+  CAA) processed ``\ddd`` escapes as Unicode code points and then UTF-8 encoded
+  them, so escapes greater than ``\127`` became two octets instead of one.  URI
+  also emitted its target unescaped in to_text(), raising UnicodeDecodeError
+  for wire-legal non-UTF-8 targets and corrupting backslashes and quotes on a
+  round trip.  These fields now apply escapes directly to bytes, like TXT-like
+  records, using the new Tokenizer.get_bytes(), and URI escapes its target on
+  output, so from_text(to_text()) is the identity for all octet values.
+
+* APL items with an address family other than 1 (IPv4) or 2 (IPv6) now round
+  trip through text.  to_text() rendered their hex address as a Python bytes
+  literal (``3:b'e0'/4``), from_text() rejected every such item, and the wire
+  parser rejected an address longer than 63 octets although up to 127 are
+  allowed.
+
+* Mypy type checking has been removed; ty type checking has been added.
+
+* The zone transfer code's "raise on serial went backwards" default behavior can now
+  be disabled with the ``raise_on_serial_went_backwards`` parameter.
+
+* The async `zone_from_name()` function now behaves the same as the sync version.
+
+* `dns.asyncquery.receive_udp()` with ``ignore_errors`` set again discards a datagram
+  that fails to parse and keeps listening for a valid response, matching
+  `dns.query.receive_udp()`.  It had been returning the unparsable datagram with its
+  errors recorded on the message.  The unused ``ignore_errors`` parameter added to
+  `dns.asyncquery.receive_tcp()` at the same time has been removed, as the sync
+  version has no such parameter.
+
+* Documentation has been augmented and modernized.
+
+* The HHIT and BRID rdata types are now supported, and the NXNAME metatype is defined.
+
+* ``\DDD`` escapes are now only recognized when the three characters are ASCII
+  digits, as RFC 1035 section 5.1 requires.  The escape parsers tested them with
+  ``str.isdecimal()``, which is also true for non-ASCII decimal digits such as
+  the Devanagari ``१`` (``U+0967``), and ``int()`` converts those, so a
+  ``\123``-style escape written with those digits was read as an octet instead
+  of being rejected.  This affected ``dns.name.from_unicode()``,
+  ``dns.tokenizer.Token.unescape()``, ``dns.tokenizer.Token.unescape_to_bytes()``,
+  and the SVCB/HTTPS alpn and docpath value parser, and it meant a name could be
+  written two ways, with the all-ASCII ``dns.name.from_text()`` path disagreeing
+  with the non-ASCII one.  Such a character is now an ordinary escaped
+  character, like any other.
+
+* Other text parsers that tested for digits with ``str.isdecimal()`` now also
+  require ASCII digits, so non-ASCII decimal digits are no longer read as
+  numbers.  This affects dns.ttl.from_text(), dns.grange.from_text(),
+  dns.e164.from_e164() (which now drops such characters like any other
+  non-digit), the IPv6 scope id in dns.inet.low_level_address_tuple(), the
+  ``FLAGn`` form in dns.flags.from_text(), the ``TYPEn``-style generic forms in
+  enum ``from_text()`` methods (e.g. dns.rdatatype.from_text()), SIG/RRSIG
+  signature times, and the WKS and LOC rdata text parsers.  SIG/RRSIG signature
+  times in the 14-digit ``YYYYMMDDHHmmSS`` form are now also required to be all
+  digits.
+
+* dns.tokenizer.Tokenizer.get_int() and the other integer-reading tokenizer
+  methods, which underlie most rdata text parsing, now require the token to
+  consist only of ASCII digits valid in the requested base.  They previously
+  used ``int()`` directly, which also accepts non-ASCII decimal digits, a leading
+  ``+``, underscores (``1_000``), and base prefixes such as ``0o17`` when the
+  base matched.  The *base* must now be between 2 and 36; base 0 is no longer
+  accepted.  The SVCB/HTTPS ``port`` parameter is checked the same way.
+
+* dns.message.from_text() now reads an RR's TTL as a decimal integer with the
+  tokenizer.  It previously used ``int(text, 0)``, which accepted forms such as
+  ``0x10``, ``+10``, and non-ASCII digits, and rejected decimal TTLs with a
+  leading zero such as ``010``.
+
+* APIs which accept the name of a file to open — dns.zone.from_file(),
+  dns.zone.Zone.to_file(), dns.message.from_file(), dns.tsigkeyring.from_file(),
+  Resolver.read_resolv_conf(), and the resolver constructor's *filename* parameter —
+  now also accept any ``os.PathLike``, e.g. a ``pathlib.Path``.  Previously a path
+  object was mistaken for an open file.
+
+* The *verify* parameter of the DoH/DoT/DoQ query functions and nameserver classes
+  now also accepts an ``os.PathLike`` naming the CA file or directory.  Previously a
+  path object was silently ignored and the default CA roots were used.
+
+* dns.message.from_wire() now raises dns.exception.FormError if a response to a
+  TSIG-signed request does not have a TSIG, unless *keyring* is ``False`` or *multi*
+  is ``True``.  Previously such unsigned responses were accepted.  As a result, the
+  query functions now reject unsigned responses to signed queries, and with
+  ``ignore_errors`` UDP receives discard them and keep waiting.
+
+* An inbound zone transfer made with a TSIG-signed request now requires the first
+  and the last message of the response to have a TSIG, as RFC 8945 section 5.3.1
+  specifies, and dns.xfr.Inbound.process_message() checks this before committing
+  the transaction.  Previously only the last message was checked, and only after
+  the transfer had been committed, so dns.query.inbound_xfr() and
+  dns.asyncquery.inbound_xfr() raised "missing TSIG" for an unsigned transfer
+  that had already replaced the zone, and unsigned messages sent ahead of the
+  first signed one were accepted.
+
+* Zone file reading now follows RFC 2308 section 4 by default, and no longer treats
+  the SOA MINIMUM field as the default TTL.  In a zone file with no ``$TTL``
+  directive, a record with no TTL of its own now inherits the most recently stated
+  TTL (RFC 1035 section 5.1) rather than the SOA MINIMUM; the SOA MINIMUM is still
+  used as a last resort if no TTL has been stated at all.  An explicit ``$TTL``
+  always takes precedence, as before.  The previous behavior can be requested by
+  passing ``rfc2308_ttl=False`` to dns.zone.from_text(), dns.zone.from_file(), or
+  dns.zonefile.read_rrsets().
+
+* Discovery of Designated Resolvers (DDR) now verifies an IPv6 unencrypted
+  resolver address against the designated resolver's certificate correctly.  The
+  check compared the address text with the subjectAltName text produced by
+  ``ssl``, which renders IPv6 entries uncompressed and in upper case, so the two
+  never matched and ``try_ddr()`` could not upgrade an IPv6 resolver to an
+  encrypted transport.  Addresses are now compared in binary form.
+
+2.8.0
+-----
+
+* dns/btreezone.py provides another zone versioned implementation built on top of a
+  B-tree.  It maintains DNSSEC sort order, labels nodes as delegation points or glue,
+  and can find the "bounds" of a name (useful for DNSSEC responses).
+
+* dns/query.py now provides make_socket(), make_ssl_socket(), and make_ssl_context()
+  to make using persistent connections with the query code easier.
+
+* dns/win32util.py now supports explicitly setting the configuration method used to get
+  system dns info, using the set_config_method() function.   There is a new configuration
+  method that uses the Win32 API, which can be set using
+  set_config_method(ConfigMethod.Win32).  We are considering making the Win32 API
+  the default in the future as we believe it to be the most accurate.  Any feedback on
+  it compared to the other methods is welcome.
+
+* The DSYNC record is now supported.  This type is still in draft stage at the IETF
+  and is subject to change.
+
+* The minimum supported Python version is now 3.10.
+
+2.7.0
+-----
+
+* dns.query.https() and dns.asyncquery.https() now support HTTP/3 and the http_version
+  parameter may be used to specify which version to use.
+
+* If the cryptography module is installed, then dnspython will now create deterministic
+  ECDSA signatures by default.  Cryptography, if installed, must be at least version 43.
+  Thanks to Jakob Schlyter for adding the feature.
+
+* The RESINFO and WALLET RdataTypes are now supported.
+
+* The COOKIE and Report-Channel EDNS0 options are now supported.
+
+* All supported RdataTypes can now be imported at a single time rather than lazily on
+  first use by calling dns.rdata.load_all_types().
+
+* The SVCB and HTTPS records now support the ohttp parameter.
+
+* xfr() and inbound_xfr() now share a common implementation.
+
+* Tokens are now supported for QUIC and HTTP/3.
+
+* dns.message.from_wire() now saves the input wire format in the Message's "wire"
+  attribute.  Likewise, dns.message.Message.to_wire() now records the generated
+  wire format in that attribute.
+
+* The dns.message.Message object now has a get_options() helper to retrieve EDNS0
+  options of a specified type, and an extended_errors() helper to retrieve the list
+  of EDE options in a message (if any).
+
+* dns.message.make_response() now has a copy mode which controls how sections are
+  copied.  By default, a copy mode appropriate for the opcode is used.  This is
+  currently dns.message.CopyMode.QUESTION for all opcodes.
+
+* If an IP address is used as the hostname in a URL, the https query code now passes
+  the sni_hostname to httpx2 as this is required to get httpx2 to validate the certificate
+  and check for an IP subject alternative name.
+
+* The minimum supported aioquic version is now 1.0.0.
+
+* The minimum supported Python version is now 3.9.
+
+2.6.1
+-----
+
+* The Tudoor fix ate legitimate Truncated exceptions, preventing the resolver from
+  failing over to TCP and causing the query to timeout [#1053].
+
+2.6.0
+-----
+
+* As mentioned in the "TuDoor" paper and the associated CVE-2023-29483, the dnspython
+  stub resolver is vulnerable to a potential DoS if a bad-in-some-way response from the
+  right address and port forged by an attacker arrives before a legitimate one on the
+  UDP port dnspython is using for that query.
+
+  This release addresses the issue by adopting the recommended mitigation, which is
+  ignoring the bad packets and continuing to listen for a legitimate response until
+  the timeout for the query has expired.
+
+* Added support for the NSID EDNS option.
+
+* Dnspython now looks for version metadata for optional packages and will not
+  use them if they are too old.  This prevents possible exceptions when a
+  feature like DoH is not desired in dnspython, but an old httpx2 is installed
+  along with dnspython for some other purpose.
+
+* The DoHNameserver class now allows GET to be used instead of the default POST,
+  and also passes source and source_port correctly to the underlying query
+  methods.
+
+2.5.0
+-----
+
+* Dnspython now uses hatchling for builds.
+
+* Asynchronous destinationless sockets now work on Windows.
+
+* Cython is no longer supported due to various typing issues.
+
+* Dnspython now explicitly canonicalizes IPv4 and IPv6 addresses.
+  Previously it was possible for non-canonical IPv6 forms to be stored
+  in a AAAA address, which would work correctly but possibly cause
+  problmes if the address were used as a key in a dictionary.
+
+* The number of messages in a section can be retrieved with
+  section_count().
+
+* Truncation preferences for messages can be specified.
+
+* The length of a message can be automatically prepended when
+  rendering.
+
+* dns.message.create_response() automatically adds padding when
+  required by RFC 8467.
+
+* The TLS verify parameter is now supported by dns.query.tls(),
+  and the DoH and DoT Nameserver subclasses.
+
+* The MutableMapping used to store content in a zone may now be
+  specified by a factory when subclassing.  Factories may also be
+  provided for writable verisons and immutable versions.
+
+* dns.name.Name now has predecessor() and successor() methods
+  implementing RFC 4471.
+
+* QUIC has had a number of bug fixes and also now supports session
+  tickets for faster session resumption.
+
+* The NSEC3 class now has a next_name() method for retrieving the next
+  name as a dns.name.Name.
+
+* Windows WMI interface detection should be more robust.
+
+2.4.2
+-----
+
+* Async queries could wait forever instead of respecting the timeout if the timeout was
+  0 and a packet was lost.  The timeout is now respected.
+
+* Restore HTTP/2 support which was accidentally broken during the https refactoring done
+  as part of 2.4.0.
+
+* When an inception time and lifetime are specified, the signer now sets the expiration
+  to the inception time plus lifetime, instead of the current time plus the lifetime.
+
+2.4.1
+-----
+
+* Importing dns.dnssecalgs without the cryptography module installed no longer causes
+  an ImportError.
+
+* A number of timeout bugs with the asyncio backend have been fixed.
+
+* DNS-over-QUIC for the asyncio backend now works for IPv6.
+
+* Dnspython now enforces that the candidate DNSKEYs for DNSSEC signatures
+  have protocol 3 and have the ZONE flag set.  This is a standards compliance issue more
+  than a security issue as the legitimate authority would have to have published
+  the non-compliant keys as well as updated their DS record in order for the records
+  to validate (the DS digest includes both flags and protocol).  Dnspython will not
+  make invalid keys by default, but does allow them to be created and used
+  for testing purposes.
+
+* Dependency specifications for optional features in the package metadata have been
+  improved.
+
+2.4.0
+-----
+
+* Python 3.8 or newer is required.
+
+* The stub resolver now uses instances of :py:class:`dns.nameserver.Nameserver` to represent
+  remote recursive resolvers, and can communicate using
+  DNS over UDP/TCP, HTTPS, TLS, and QUIC.  In additional to being able to specify
+  an IPv4, IPv6, or HTTPS URL as a nameserver, instances of :py:class:`dns.nameserver.Nameserver`
+  are now permitted.
+
+* The DNS-over-HTTPS bootstrap address no longer causes URL rewriting.
+
+* DNS-over-HTTPS now only uses httpx2; support for requests has been dropped.  A source
+  port may now be supplied when using httpx2.
+
+* DNSSEC zone signing with NSEC records is now supported. Thank you
+  very much (again!) Jakob Schlyter!
+
+* The resolver and async resolver now have the ``try_ddr()`` method, which will try to
+  use Discovery of Designated Resolvers (DDR) to upgrade the connection from the stub
+  resolver to the recursive server so that it uses DNS-over-HTTPS, DNS-over-TLS, or
+  DNS-over-QUIC. This feature is currently experimental as the standard is still in
+  draft stage.
+
+* The resolver and async resolver now have the ``make_resolver_at()`` and
+  ``resolve_at()`` functions, as a convenience for making queries to specific
+  recursive servers.
+
+* Curio support has been removed.
+
+2.3.0
+-----
+
+* Python 3.7 or newer is required.
+
+* Type annotations are now integrated with the source code and cover
+  far more of the library.
+
+* The get_soa() method has been added to dns.zone.Zone.
+
+* The minimum TLS version is now 1.2.
+
+* EDNS padding is now supported.  Messages with EDNS enabled and with a
+  non-zero pad option will be automatically padded appropriately when
+  converted to wire format.
+
+* :py:func:`dns.zone.from_text` and :py:func:`dns.zone.from_file` now have an
+  ``allow_directives`` parameter to allow finer control over how directives
+  in zonefiles are processed.
+
+* A preliminary implementation of DNS-over-QUIC has been added, and will be
+  available if the aioquic library is present.  See ``dns.query.quic()``,
+  ``dns.asyncquery.quic()``, and examples/doq.py for more info.  This API
+  is subject to change in future releases.  For asynchronous I/O, both
+  asyncio and Trio are supported, but Curio is not.
+
+* DNSSEC signing support has been added to the :py:mod:`dns.dnssec` module, along with
+  a number of functions to help generate DS, CDS, and CDNSKEY RRsets.  Thank you
+  very much Jakob Schlyter!
+
+* Curio asynchronous I/O support is deprecated as of this release and will
+  be removed in a future release.
+
+* The resolver object's ``nameserver`` field is planned to become a property in
+  dnspython 2.4.  Writing to this field other than by direct assignment is deprecated,
+  and so is depending on the mutability and form of the iterable returned when it is
+  read.
+
+2.2.1
+-----
+
+This release has no new features, but fixes the following issues:
+
+* dns.zone.from_text failed if relativize was False and an origin was
+  specified in the parameters.
+
+* A number of types permitted an empty "rest of the rdata".
+
+* L32, L64, LP, and NID were missing from dns/rdtypes/ANY/__init__.py
+
+* The type definition for dns.resolver.resolve_address() was incorrect.
+
+* dns/win32util.py erroneously had the executable bit set.
+
+* The type definition for a number of asynchronous query routines was
+  missing the default of None for the backend parameter.
+
+* dns/tsigkeyring.py didn't import dns.tsig.
+
+* A number of rdata types that have a "rest of the line" behavior for
+  the last field of the rdata erroneously permitted an empty string.
+
+* Timeout intervals are no longer reported with absurd precision in
+  exception text.
+
+2.2.0
+-----
+
+* SVCB and HTTPS records have been updated to track the evolving draft
+  standard.
+
+* The ZONEMD type has been added.
+
+* The resolver now returns a LifetimeTimeout exception which includes
+  an error trace like the NoNameservers exception.  This class is a subclass of
+  dns.exception.Timeout for backwards compatibility.
+
+* DNS-over-HTTPS will try to use HTTP/2 if the httpx2 and h2 packages
+  are installed.
+
+* DNS-over-HTTPS is now supported for asynchronous queries and resolutions.
+
+* :py:func:`dns.zonefile.read_rrsets` has been added, which allows rrsets in zonefile
+  format, or a restrition of it, to be read.  This function is useful for
+  applications that want to read DNS data in text format, but do not want to
+  use a Zone.
+
+* On Windows systems, if the WMI module is available, the resolver will retrieve
+  the nameserver from WMI instead of trying to figure it out by reading the
+  registry.  This may lead to more accurate results in some cases.
+
+* The CERT rdatatype now supports certificate types IPKIX, ISPKI, IPGP,
+  ACPKIX, and IACPKIX.
+
+* The CDS rdatatype now allows digest type 0.
+
+* Dnspython zones now enforces that a node is either a CNAME node or
+  an "other data" node.  A CNAME node contains only CNAME,
+  RRSIG(CNAME), NSEC, RRSIG(NSEC), NSEC3, or RRSIG(NSEC3) rdatasets.
+  An "other data" node contains any rdataset other than a CNAME or
+  RRSIG(CNAME) rdataset.  The enforcement is "last update wins".  For
+  example, if you have a node which contains a CNAME rdataset, and
+  then add an MX rdataset to it, then the CNAME rdataset will be deleted.
+  Likewise if you have a node containing an MX rdataset and add a
+  CNAME rdataset, the MX rdataset will be deleted.
+
+* Extended DNS Errors, as specified in RFC 8914, are now supported.
+
+2.1.0
+----------------------
+
+* End-of-line comments are now associated with rdata when read from text.
+  For backwards compatibility with prior versions of dnspython, they are
+  only emitted in to_text() when requested.
+
+* Synchronous I/O is a bit more efficient, as we now try the I/O and only
+  use poll() or select() if the I/O would block.
+
+* The resolver cache classes now offer basic hit and miss statistics, and
+  the LRUCache can also provide hits for every cache key.
+
+* The resolver has a canonical_name() method.
+
+* There is now a registration mechanism for EDNS option types.
+
+* The default EDNS payload size has changed from 1280 to 1232.
+
+* The SVCB, HTTPS, and SMIMEA RR types are now supported.
+
+* TSIG has been enhanced with TKEY and GSS-TSIG support.  Thanks to
+  Nick Hall for writing this.
+
+* Zones now can be updated via transactions.
+
+* A new zone subclass, dns.versioned.Zone is available which has a
+  thread-safe transaction implementation and support for keeping many
+  versions of a zone.
+
+* The zone file reading code has been adapted to use transactions, and
+  is now a public API.
+
+* Inbound zone transfer support has been rewritten and is available as
+  dns.query.inbound_xfr() and dns.asyncquery.inbound_xfr().  It uses
+  the transaction mechanism, and fully supports IXFR and AXFR.
+
+2.0.0
+-----
+
+* Python 3.6 or newer is required.
+
+* The license is now the ISC license.
+
+* Rdata is now immutable.  Use :py:meth:`dns.rdata.Rdata.replace` to make a new
+  Rdata based on an existing one.
+
+* dns.resolver.resolve() has been added, allowing control of whether search
+  lists are used.  dns.resolver.query() is retained for
+  backwards compatibility, but deprecated.  The default for search list
+  behavior can be set at in the resolver object with the
+  ``use_search_by_default`` parameter.  The default is False.
+
+* DNS-over-TLS is supported with :py:func:`dns.query.tls`.
+
+* DNS-over-HTTPS is supported with :py:func:`dns.query.https`, and the resolver
+  will use DNS-over-HTTPS for a nameserver which is an HTTPS URL.
+
+* Basic query and resolver support for the Trio, Curio, and asyncio
+  asynchronous I/O libraries has been added in :py:mod:`dns.asyncquery` and
+  :py:mod:`dns.asyncresolver`.  This API should be viewed as experimental as
+  asynchronous I/O support in dnspython is still evolving.
+
+* TSIG now defaults to using SHA-256.
+
+* Basic type info has been added to some functions.  Future releases will
+  have comprehensive type info.
+
+* from_text() functions now have a ``relativize_to`` parameter.
+
+* python-cryptography is now used for DNSSEC.
+
+* Ed25519 and Ed448 signatures are now supported.
+
+* A helper for NSEC3 generating hashes has been added.
+
+* SHA384 DS records are supported.
+
+* Rdatasets and RRsets are much faster.
+
+* dns.resolver.resolve_address() has been added, allowing easy address-to-name
+  lookups.
+
+* dns.reversename functions now allow an alternate origin to be specified.
+
+* The ``repr`` form of Rdatasets and RRsets now includes the rdata.
+
+* A number of standard resolv.conf options are now parsed.
+
+* The nameserver and port used to get a response are now part of the resolver's
+  ``Answer`` object.
+
+* The NINFO record is supported.
+
+* The ``dns.hash`` module has been removed; just use Python's native
+  ``hashlib`` module.
+
+* Rounding is done in the standard python 3 fashion; dnspython 1.x rounded
+  in the python 2 style on both python 2 and 3.
+
+* The resolver will now do negative caching if a cache has been configured.
+
+* TSIG and OPT now have rdata types.
+
+* The class for query messages is now QueryMessage.  Class Message is now a
+  base class, and is also used for messages for which we don't have a better
+  class.  Update messages are now class UpdateMessage, though class Update
+  is retained for compatibility.
+
+* Support for Windows 95, 98, and ME has been removed.

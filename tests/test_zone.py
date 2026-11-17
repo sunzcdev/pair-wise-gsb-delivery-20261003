@@ -1,0 +1,1872 @@
+# -*- coding: utf-8
+# Copyright (C) Dnspython Contributors, see LICENSE for text of ISC license
+
+# Copyright (C) 2003-2007, 2009-2011 Nominum, Inc.
+#
+# Permission to use, copy, modify, and distribute this software and its
+# documentation for any purpose with or without fee is hereby granted,
+# provided that the above copyright notice and this permission notice
+# appear in all copies.
+#
+# THE SOFTWARE IS PROVIDED "AS IS" AND NOMINUM DISCLAIMS ALL WARRANTIES
+# WITH REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF
+# MERCHANTABILITY AND FITNESS. IN NO EVENT SHALL NOMINUM BE LIABLE FOR
+# ANY SPECIAL, DIRECT, INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES
+# WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN AN
+# ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT
+# OF OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
+
+import difflib
+import os
+import pathlib
+import sys
+import unittest
+from io import BytesIO, StringIO
+from typing import cast
+
+import dns.btreezone
+import dns.exception
+import dns.message
+import dns.name
+import dns.node
+import dns.rdata
+import dns.rdataclass
+import dns.rdataset
+import dns.rdatatype
+import dns.rrset
+import dns.transaction
+import dns.versioned
+import dns.zone
+from tests.util import here
+
+example_text = """$TTL 3600
+$ORIGIN example.
+@ soa foo bar 1 2 3 4 5
+@ ns ns1
+@ ns ns2
+ns1 a 10.0.0.1
+ns2 a 10.0.0.2
+$TTL 300
+$ORIGIN foo.example.
+bar mx 0 blaz
+"""
+
+example_text_output = """@ 3600 IN SOA foo bar 1 2 3 4 5
+@ 3600 IN NS ns1
+@ 3600 IN NS ns2
+bar.foo 300 IN MX 0 blaz.foo
+ns1 3600 IN A 10.0.0.1
+ns2 3600 IN A 10.0.0.2
+"""
+
+example_text_output_class_before_ttl = """@ IN 3600 SOA foo bar 1 2 3 4 5
+@ 3600 NS ns1 ; no class
+@ NS ns2 ; no class or TTL, TTL from prior record (SOA minimum if not RFC 2308 mode)
+bar.foo IN 300 MX 0 blaz.foo
+ns1 IN 3600 A 10.0.0.1
+ns2 IN 3600 A 10.0.0.2
+"""
+
+example_generate = """@ 3600 IN SOA foo bar 1 2 3 4 5
+@ 3600 IN NS ns
+$GENERATE 9-12       a.$         A 10.0.0.$
+$GENERATE 80-254/173 b.${0,5,d}  A 10.0.1.$
+$GENERATE 80-254/173 c.${0,5,o}  A 10.0.2.$
+$GENERATE 80-254/173 d.${0,5,x}  A 10.0.3.$
+$GENERATE 80-254/173 e.${0,5,X}  A 10.0.4.$
+$GENERATE 80-254/173 f.${0,5,n}  A 10.0.5.$
+$GENERATE 80-254/173 g.${0,5,N}  A 10.0.6.$
+$GENERATE 218-218/1  h.${0,4,N}  A 10.0.7.$
+$GENERATE 218-218/1  i.${0,4,N}j A 10.0.8.$
+$GENERATE 23-24      k.${1,2,d}  A 10.0.9.${-1,2,d}
+"""
+
+example_generate_output = """@ 3600 IN SOA foo bar 1 2 3 4 5
+@ 3600 IN NS ns
+a.9 5 IN A 10.0.0.9
+a.10 5 IN A 10.0.0.10
+a.11 5 IN A 10.0.0.11
+a.12 5 IN A 10.0.0.12
+b.00080 5 IN A 10.0.1.80
+b.00253 5 IN A 10.0.1.253
+c.00120 5 IN A 10.0.2.80
+c.00375 5 IN A 10.0.2.253
+d.00050 5 IN A 10.0.3.80
+d.000fd 5 IN A 10.0.3.253
+e.00050 5 IN A 10.0.4.80
+e.000FD 5 IN A 10.0.4.253
+f.0.5.0 5 IN A 10.0.5.80
+f.d.f.0 5 IN A 10.0.5.253
+g.0.5.0 5 IN A 10.0.6.80
+g.D.F.0 5 IN A 10.0.6.253
+i.A.D.j 5 IN A 10.0.8.218
+k.24 5 IN A 10.0.9.22
+k.25 5 IN A 10.0.9.23
+"""
+
+something_quite_similar = """@ 3600 IN SOA foo bar 1 2 3 4 5
+@ 3600 IN NS ns1
+@ 3600 IN NS ns2
+bar.foo 300 IN MX 0 blaz.foo
+ns1 3600 IN A 10.0.0.1
+ns2 3600 IN A 10.0.0.3
+"""
+
+something_different = """@ 3600 IN SOA fooa bar 1 2 3 4 5
+@ 3600 IN NS ns11
+@ 3600 IN NS ns21
+bar.fooa 300 IN MX 0 blaz.fooa
+ns11 3600 IN A 10.0.0.11
+ns21 3600 IN A 10.0.0.21
+"""
+
+ttl_example_text = """$TTL 1h
+$ORIGIN example.
+@ soa foo bar 1 2 3 4 5
+@ ns ns1
+@ ns ns2
+ns1 1d1s a 10.0.0.1
+ns2 1w1D1h1m1S a 10.0.0.2
+"""
+
+# No $TTL so default TTL for RRs should be inherited from SOA minimum TTL (
+# not from the last explicit RR TTL).
+ttl_from_soa_text = """$ORIGIN example.
+@ 1h soa foo bar 1 2 3 4 5
+@ 1h ns ns1
+@ 1h ns ns2
+ns1 1w1D1h1m1S a 10.0.0.2
+ns2 a 10.0.0.1
+"""
+
+# No $TTL and no SOA, so default TTL for RRs should be inherited from last
+# explicit RR TTL.
+ttl_from_last_text = """$ORIGIN example.
+@ 1h ns ns1
+@ 1h ns ns2
+ns1 a 10.0.0.1
+ns2 1w1D1h1m1S a 10.0.0.2
+"""
+
+# An explicit $TTL is the default TTL in both TTL modes, even though a later
+# RR states a TTL of its own.
+dollar_ttl_wins_text = """$TTL 1h
+$ORIGIN example.
+@ 2h soa foo bar 1 2 3 4 5
+@ 2h ns ns1
+ns1 1w1D1h1m1S a 10.0.0.1
+ns2 a 10.0.0.2
+"""
+
+# A $TTL after the SOA replaces a default TTL taken from the SOA minimum, in
+# both TTL modes.  Before the $TTL, ns1 has no TTL of its own and so shows
+# where the default came from.
+dollar_ttl_after_soa_text = """$ORIGIN example.
+@ 1h soa foo bar 1 2 3 4 5
+@ 1h ns ns1
+ns1 a 10.0.0.1
+$TTL 300
+ns2 a 10.0.0.2
+"""
+
+# No $TTL and no TTL on the SOA, so the SOA minimum is the only TTL there is
+# and is used in both TTL modes.
+ttl_only_from_soa_minimum_text = """$ORIGIN example.
+@ soa foo bar 1 2 3 4 5
+@ ns ns1
+ns1 a 10.0.0.1
+"""
+
+# The $TTL in the included file must not outlive the $INCLUDE; ns2 gets the
+# outer default TTL, which came from the SOA minimum.
+ttl_include_text = """$ORIGIN example.
+@ 1h soa foo bar 1 2 3 4 5
+@ 1h ns ns1
+ns1 1w1D1h1m1S a 10.0.0.1
+$INCLUDE "%s"
+ns2 a 10.0.0.2
+""" % here("ttl_include.text")
+
+# No $TTL and no SOA should raise SyntaxError as no TTL can be determined.
+no_ttl_text = """$ORIGIN example.
+@ ns ns1
+@ ns ns2
+ns1 a 10.0.0.1
+ns2 a 10.0.0.2
+"""
+
+no_soa_text = """$TTL 1h
+$ORIGIN example.
+@ ns ns1
+@ ns ns2
+ns1 1d1s a 10.0.0.1
+ns2 1w1D1h1m1S a 10.0.0.2
+"""
+
+no_ns_text = """$TTL 1h
+$ORIGIN example.
+@ soa foo bar 1 2 3 4 5
+"""
+
+include_text = """$INCLUDE "%s"
+""" % here("example")
+
+bad_directive_text = """$FOO bar
+$ORIGIN example.
+@ soa foo bar 1 2 3 4 5
+@ ns ns1
+@ ns ns2
+ns1 1d1s a 10.0.0.1
+ns2 1w1D1h1m1S a 10.0.0.2
+"""
+
+codec_text = """
+@ soa foo bar 1 2 3 4 5
+@ ns ns1
+@ ns ns2
+Königsgäßchen 300 NS Königsgäßchen
+"""
+
+misc_cases_input = """
+$ORIGIN example.
+$TTL 300
+
+@ soa foo bar 1 2 3 4 5
+@ ns ns1
+@ ns ns2
+out-of-zone. in a 10.0.0.1
+"""
+
+misc_cases_expected = """
+$ORIGIN example.
+$TTL 300
+@ soa foo bar 1 2 3 4 5
+@ ns ns1
+@ ns ns2
+"""
+
+last_ttl_input = """
+$ORIGIN example.
+@ 300 ns ns1
+@ 300 ns ns2
+foo a 10.0.0.1
+@ soa foo bar 1 2 3 4 5
+"""
+
+origin_sets_input = """
+$ORIGIN example.
+@ soa foo bar 1 2 3 4 5
+@ 300 ns ns1
+@ 300 ns ns2
+"""
+
+example_comments_text = """$TTL 3600
+$ORIGIN example.
+@ soa foo bar (1 ; not kept
+2 3 4 5) ; kept
+@ ns ns1
+@ ns ns2
+ns1 a 10.0.0.1 ; comment1
+ns2 a 10.0.0.2 ; comment2
+"""
+
+example_comments_text_output = """@ 3600 IN SOA foo bar 1 2 3 4 5 ; kept
+@ 3600 IN NS ns1
+@ 3600 IN NS ns2
+ns1 3600 IN A 10.0.0.1 ; comment1
+ns2 3600 IN A 10.0.0.2 ; comment2
+"""
+
+
+example_cname = """$TTL 3600
+$ORIGIN example.
+@ soa foo bar (1 2 3 4 5)
+@ ns ns1
+@ ns ns2
+ns1 a 10.0.0.1
+ns2 a 10.0.0.2
+www a 10.0.0.3
+web cname www
+    nsec @ CNAME RRSIG
+    rrsig NSEC 1 3 3600 20200101000000 20030101000000 2143 foo MxFcby9k/yvedMfQgKzhH5er0Mu/vILz 45IkskceFGgiWCn/GxHhai6VAuHAoNUz 4YoU1tVfSCSqQYn6//11U6Nld80jEeC8 aTrO+KKmCaY=
+    rrsig CNAME 1 3 3600 20200101000000 20030101000000 2143 foo MxFcby9k/yvedMfQgKzhH5er0Mu/vILz 45IkskceFGgiWCn/GxHhai6VAuHAoNUz 4YoU1tVfSCSqQYn6//11U6Nld80jEeC8 aTrO+KKmCaY=
+web2 cname www
+    nsec3 1 1 12 aabbccdd 2t7b4g4vsa5smi47k61mv5bv1a22bojr CNAME RRSIG
+    rrsig NSEC3 1 3 3600 20200101000000 20030101000000 2143 foo MxFcby9k/yvedMfQgKzhH5er0Mu/vILz 45IkskceFGgiWCn/GxHhai6VAuHAoNUz 4YoU1tVfSCSqQYn6//11U6Nld80jEeC8 aTrO+KKmCaY=
+    rrsig CNAME 1 3 3600 20200101000000 20030101000000 2143 foo MxFcby9k/yvedMfQgKzhH5er0Mu/vILz 45IkskceFGgiWCn/GxHhai6VAuHAoNUz 4YoU1tVfSCSqQYn6//11U6Nld80jEeC8 aTrO+KKmCaY=
+"""
+
+
+example_other_data = """$TTL 3600
+$ORIGIN example.
+@ soa foo bar (1 2 3 4 5)
+@ ns ns1
+@ ns ns2
+ns1 a 10.0.0.1
+ns2 a 10.0.0.2
+www a 10.0.0.3
+web a 10.0.0.4
+    nsec @ A RRSIG
+    rrsig A 1 3 3600 20200101000000 20030101000000 2143 foo MxFcby9k/yvedMfQgKzhH5er0Mu/vILz 45IkskceFGgiWCn/GxHhai6VAuHAoNUz 4YoU1tVfSCSqQYn6//11U6Nld80jEeC8 aTrO+KKmCaY=
+    rrsig NSEC 1 3 3600 20200101000000 20030101000000 2143 foo MxFcby9k/yvedMfQgKzhH5er0Mu/vILz 45IkskceFGgiWCn/GxHhai6VAuHAoNUz 4YoU1tVfSCSqQYn6//11U6Nld80jEeC8 aTrO+KKmCaY=
+"""
+
+example_cname_and_other_data = """$TTL 3600
+$ORIGIN example.
+@ soa foo bar (1 2 3 4 5)
+@ ns ns1
+@ ns ns2
+ns1 a 10.0.0.1
+ns2 a 10.0.0.2
+www a 10.0.0.3
+web a 10.0.0.4
+    cname www
+    nsec @ A RRSIG
+    rrsig A 1 3 3600 20200101000000 20030101000000 2143 foo MxFcby9k/yvedMfQgKzhH5er0Mu/vILz 45IkskceFGgiWCn/GxHhai6VAuHAoNUz 4YoU1tVfSCSqQYn6//11U6Nld80jEeC8 aTrO+KKmCaY=
+    rrsig NSEC 1 3 3600 20200101000000 20030101000000 2143 foo MxFcby9k/yvedMfQgKzhH5er0Mu/vILz 45IkskceFGgiWCn/GxHhai6VAuHAoNUz 4YoU1tVfSCSqQYn6//11U6Nld80jEeC8 aTrO+KKmCaY=
+"""
+
+example_unicode = """$UNICODE 2008 TXT
+$ORIGIN example.
+$TTL 300
+@               SOA     ns1.example. hostmaster.example. 1 2 3 4 5
+                NS      ns1.example.
+                NS      ns2.example.
+                MX      10 boîte-aux-lettres
+ns1     60      A       10.53.0.1
+        60      A       10.53.1.1
+ns2     60      A       10.53.0.2
+élèves          TXT "Je peux manger du verre, ça me fait pas mal."
+                TXT "Puedo comer vidrio, no me hace daño."
+                TXT "ὕαλον ϕαγεῖν δύναμαι· τοῦτο οὔ με βλάπτει."
+                TXT "Я могу есть стекло, оно мне не вредит."
+                TXT "मैं काँच खा सकता हूँ और मुझे उससे कोई चोट नहीं पहुंचती."
+                TXT "أنا قادر على أكل الزجاج و هذا لا يؤلمني."
+                TXT "我能吞下玻璃而不伤身体。"
+                TXT "私はガラスを食べられます。それは私を傷つけません。"
+                TXT "나는 유리를 먹을 수 있어요. 그래도 아프지 않아요"
+"""
+
+example_unicode_expected = """$UNICODE 2008 TXT
+$ORIGIN example.
+@ 300 SOA ns1 hostmaster 1 2 3 4 5
+    300 NS ns1
+    300 NS ns2
+    300 MX 10 boîte-aux-lettres
+ns1 60 A 10.53.0.1
+    60 A 10.53.1.1
+ns2 60 A 10.53.0.2
+élèves 300 TXT "Je peux manger du verre, ça me fait pas mal."
+    300 TXT "Puedo comer vidrio, no me hace daño."
+    300 TXT "ὕαλον ϕαγεῖν δύναμαι· τοῦτο οὔ με βλάπτει."
+    300 TXT "Я могу есть стекло, оно мне не вредит."
+    300 TXT "मैं काँच खा सकता हूँ और मुझे उससे कोई चोट नहीं पहुंचती."
+    300 TXT "أنا قادر على أكل الزجاج و هذا لا يؤلمني."
+    300 TXT "我能吞下玻璃而不伤身体。"
+    300 TXT "私はガラスを食べられます。それは私を傷つけません。"
+    300 TXT "나는 유리를 먹을 수 있어요. 그래도 아프지 않아요"
+"""
+
+example_unicode_justified = """$UNICODE 2008 TXT
+$ORIGIN example.
+$TTL 300
+@                 SOA      ns1 hostmaster 1 2 3 4 5
+                  NS       ns1
+                  NS       ns2
+                  MX       10 boîte-aux-lettres
+ns1        60     A        10.53.0.1
+           60     A        10.53.1.1
+ns2        60     A        10.53.0.2
+élèves            TXT      "Je peux manger du verre, ça me fait pas mal."
+                  TXT      "Puedo comer vidrio, no me hace daño."
+                  TXT      "ὕαλον ϕαγεῖν δύναμαι· τοῦτο οὔ με βλάπτει."
+                  TXT      "Я могу есть стекло, оно мне не вредит."
+                  TXT      "मैं काँच खा सकता हूँ और मुझे उससे कोई चोट नहीं पहुंचती."
+                  TXT      "أنا قادر على أكل الزجاج و هذا لا يؤلمني."
+                  TXT      "我能吞下玻璃而不伤身体。"
+                  TXT      "私はガラスを食べられます。それは私を傷つけません。"
+                  TXT      "나는 유리를 먹을 수 있어요. 그래도 아프지 않아요"
+"""
+
+_keep_output = True
+
+
+def _rdata_sort(a):
+    return (a[0], a[2].rdclass, a[2].to_text())
+
+
+def add_rdataset(msg, name, rds):
+    rrset = msg.get_rrset(
+        msg.answer, name, rds.rdclass, rds.rdtype, create=True, force_unique=True
+    )
+    for rd in rds:
+        rrset.add(rd, ttl=rds.ttl)
+
+
+def make_xfr(zone):
+    q = dns.message.make_query(zone.origin, "AXFR")
+    msg = dns.message.make_response(q)
+    if zone.relativize:
+        msg.origin = zone.origin
+        soa_name = dns.name.empty
+    else:
+        soa_name = zone.origin
+    soa = zone.find_rdataset(soa_name, "SOA")
+    add_rdataset(msg, soa_name, soa)
+    for name, rds in zone.iterate_rdatasets():
+        if rds.rdtype == dns.rdatatype.SOA:
+            continue
+        add_rdataset(msg, name, rds)
+    add_rdataset(msg, soa_name, soa)
+    return [msg]
+
+
+def compare_files(test_name, a_name, b_name):
+    with open(a_name, encoding="utf-8") as a:
+        with open(b_name, encoding="utf-8") as b:
+            differences = list(difflib.unified_diff(a.readlines(), b.readlines()))
+            if len(differences) == 0:
+                return True
+            else:
+                print(f"{test_name} differences:")
+                sys.stdout.writelines(differences)
+                return False
+
+
+class ZoneTestCase(unittest.TestCase):
+    def testFromFile1(self):
+        z = dns.zone.from_file(here("example"), "example")
+        ok = False
+        try:
+            z.to_file(here("example1.out"), nl=b"\x0a")
+            ok = compare_files(
+                "testFromFile1", here("example1.out"), here("example1.good")
+            )
+        finally:
+            if not _keep_output:
+                os.unlink(here("example1.out"))
+        self.assertTrue(ok)
+
+    def testFromFile2(self):
+        z = dns.zone.from_file(here("example"), "example", relativize=False)
+        ok = False
+        try:
+            z.to_file(here("example2.out"), relativize=False, nl=b"\x0a")
+            ok = compare_files(
+                "testFromFile2", here("example2.out"), here("example2.good")
+            )
+        finally:
+            if not _keep_output:
+                os.unlink(here("example2.out"))
+        self.assertTrue(ok)
+
+    def testFromFileWithPath(self):
+        z = dns.zone.from_file(pathlib.Path(here("example")), "example")
+        z2 = dns.zone.from_file(here("example"), "example")
+        self.assertEqual(z, z2)
+
+    def testToFileWithPath(self):
+        z = dns.zone.from_file(here("example"), "example")
+        ok = False
+        try:
+            z.to_file(pathlib.Path(here("example-path.out")), nl=b"\x0a")
+            ok = compare_files(
+                "testToFileWithPath", here("example-path.out"), here("example1.good")
+            )
+        finally:
+            if not _keep_output:
+                os.unlink(here("example-path.out"))
+        self.assertTrue(ok)
+
+    def testToFileTextualStream(self):
+        z = dns.zone.from_text(example_text, "example.", relativize=True)
+        f = StringIO()
+        z.to_file(f)
+        out = f.getvalue()
+        f.close()
+        self.assertEqual(out, example_text_output)
+
+    def testToFileBinaryStream(self):
+        z = dns.zone.from_text(example_text, "example.", relativize=True)
+        f = BytesIO()
+        z.to_file(f, nl=b"\n")
+        out = f.getvalue()
+        f.close()
+        self.assertEqual(out, example_text_output.encode())
+
+    def testToFileTextual(self):
+        z = dns.zone.from_file(here("example"), "example")
+        try:
+            f = open(here("example3-textual.out"), "wt", encoding="utf-8")
+            z.to_file(f)
+            f.close()
+            ok = compare_files(
+                "testToFileTextual", here("example3-textual.out"), here("example3.good")
+            )
+        finally:
+            if not _keep_output:
+                os.unlink(here("example3-textual.out"))
+        self.assertTrue(ok)
+
+    def testToFileBinary(self):
+        z = dns.zone.from_file(here("example"), "example")
+        try:
+            f = open(here("example3-binary.out"), "wb")
+            z.to_file(f)
+            f.close()
+            ok = compare_files(
+                "testToFileBinary", here("example3-binary.out"), here("example3.good")
+            )
+        finally:
+            if not _keep_output:
+                os.unlink(here("example3-binary.out"))
+        self.assertTrue(ok)
+
+    def testToFileFilename(self):
+        z = dns.zone.from_file(here("example"), "example")
+        try:
+            z.to_file(here("example3-filename.out"))
+            ok = compare_files(
+                "testToFileFilename",
+                here("example3-filename.out"),
+                here("example3.good"),
+            )
+        finally:
+            if not _keep_output:
+                os.unlink(here("example3-filename.out"))
+        self.assertTrue(ok)
+
+    def testToText(self):
+        z = dns.zone.from_file(here("example"), "example")
+        ok = False
+        try:
+            text_zone = z.to_text(nl="\x0a")
+            f = open(here("example3.out"), "wt", encoding="utf-8")
+            f.write(text_zone)
+            f.close()
+            ok = compare_files(
+                "testToText", here("example3.out"), here("example3.good")
+            )
+        finally:
+            if not _keep_output:
+                os.unlink(here("example3.out"))
+        self.assertTrue(ok)
+
+    def testToFileTextualWithOrigin(self):
+        z = dns.zone.from_file(here("example"), "example")
+        try:
+            f = open(here("example4-textual.out"), "wt", encoding="utf-8")
+            z.to_file(f, want_origin=True)
+            f.close()
+            ok = compare_files(
+                "testToFileTextualWithOrigin",
+                here("example4-textual.out"),
+                here("example4.good"),
+            )
+        finally:
+            if not _keep_output:
+                os.unlink(here("example4-textual.out"))
+        self.assertTrue(ok)
+
+    def testToFileBinaryWithOrigin(self):
+        z = dns.zone.from_file(here("example"), "example")
+        try:
+            f = open(here("example4-binary.out"), "wb")
+            z.to_file(f, want_origin=True)
+            f.close()
+            ok = compare_files(
+                "testToFileBinaryWithOrigin",
+                here("example4-binary.out"),
+                here("example4.good"),
+            )
+        finally:
+            if not _keep_output:
+                os.unlink(here("example4-binary.out"))
+        self.assertTrue(ok)
+
+    def testFromText(self):
+        z = dns.zone.from_text(example_text, "example.", relativize=True)
+        f = StringIO()
+        names = list(z.nodes.keys())
+        names.sort()
+        for n in names:
+            f.write(z[n].to_text(n))
+            f.write("\n")
+        self.assertEqual(f.getvalue(), example_text_output)
+
+    def testFromTextCRLF(self):
+        z = dns.zone.from_text(
+            example_text.replace("\n", "\r\n"), "example.", relativize=True
+        )
+        self.assertEqual(z, dns.zone.from_text(example_text, "example.", True))
+        z = dns.zone.from_text(
+            example_comments_text.replace("\n", "\r\n"), "example.", relativize=True
+        )
+        f = StringIO()
+        z.to_file(f, want_comments=True)
+        self.assertEqual(f.getvalue(), example_comments_text_output)
+
+    def testGenerate(self):
+        z = dns.zone.from_text(example_generate, "example.", relativize=True)
+        f = StringIO()
+        expected = dns.zone.from_text(
+            example_generate_output, "example.", relativize=True
+        )
+        self.assertEqual(z, expected)
+
+    def testTorture1(self):
+        #
+        # Read a zone containing all our supported RR types, and
+        # for each RR in the zone, convert the rdata into wire format
+        # and then back out, and see if we get equal rdatas.
+        #
+        f = BytesIO()
+        o = dns.name.from_text("example.")
+        z = dns.zone.from_file(here("example"), o)
+        for node in z.values():
+            for rds in node:
+                for rd in rds:
+                    f.seek(0)
+                    f.truncate()
+                    rd.to_wire(f, origin=o)
+                    wire = f.getvalue()
+                    rd2 = dns.rdata.from_wire(
+                        rds.rdclass, rds.rdtype, wire, 0, len(wire), origin=o
+                    )
+                    self.assertEqual(rd, rd2)
+
+    def upcase(self, name):
+        return dns.name.Name((x.upper() for x in name.labels))
+
+    def ensure_origin_and_upcase(self, avalue, origin, root_too):
+        # Make sure any names in rd are subdomains of example. and upcase
+        # everything.  We make an exception for the root in some types
+        # as the root can have special meaning there.
+        if avalue == dns.name.root and not root_too:
+            return avalue
+        avalue = self.upcase(avalue)
+        uorigin = self.upcase(origin)
+        if not avalue.is_subdomain(uorigin):
+            if avalue.is_absolute():
+                avalue = avalue.relativize(dns.name.root)
+            avalue = avalue.concatenate(uorigin)
+        return avalue
+
+    def testToCompressOrNotToCompressAndCanonicalization(self):
+        #
+        # Read a zone containing all our supported RR types, and
+        # for each RR in the zone, convert the rdata into wire format
+        # using a compression table with example in it, and one without,
+        # and see if rdatas that should compress do, and those that should not
+        # do not.
+        #
+        f = BytesIO()
+        o = dns.name.from_text("example.")
+        z = dns.zone.from_file(here("example"), o)
+        # Only non-obsolete types in RFC 1035 may be compressed if they contain
+        # a name.  This is the list!
+        ok_to_compress = frozenset(
+            [
+                dns.rdatatype.NS,
+                dns.rdatatype.CNAME,
+                dns.rdatatype.SOA,
+                dns.rdatatype.PTR,
+                dns.rdatatype.MX,
+            ]
+        )
+        # Only non-obsolete types containing names and listed in section
+        # 6.2 item 3 of RFC 4034 get downcased, with the exception of NSEC which
+        # is listed in 4034 but removed in RFC 6840 section 5.1.  Also HINFO
+        # is omitted as it has no names.
+        ok_to_downcase = frozenset(
+            [
+                dns.rdatatype.NS,
+                dns.rdatatype.CNAME,
+                dns.rdatatype.SOA,
+                dns.rdatatype.PTR,
+                dns.rdatatype.MX,
+                dns.rdatatype.RP,
+                dns.rdatatype.AFSDB,
+                dns.rdatatype.RT,
+                dns.rdatatype.SIG,
+                dns.rdatatype.PX,
+                dns.rdatatype.NXT,
+                dns.rdatatype.NAPTR,
+                dns.rdatatype.KX,
+                dns.rdatatype.SRV,
+                dns.rdatatype.DNAME,
+                dns.rdatatype.RRSIG,
+            ]
+        )
+        for node in z.values():
+            for rds in node:
+                # We do individual rdata to wire as we don't want to test
+                # owner name compression, which is always allowed.
+                compressible = rds.rdtype in ok_to_compress
+                downcases = rds.rdtype in ok_to_downcase
+                for rd in rds:
+                    # For every attribute of the rdata that is a name and not the
+                    # root name, force it to be a subdomain of "example." and upcase
+                    # everything.
+                    replace = {}
+                    if hasattr(rd, "__dict__"):
+                        for aname, avalue in vars(rd).items():
+                            if isinstance(avalue, dns.name.Name):
+                                replace[aname] = self.ensure_origin_and_upcase(
+                                    avalue, o, compressible or downcases
+                                )
+                    cls = type(rd)
+                    seen = set()
+                    for klass in cls.__mro__:
+                        slots = getattr(klass, "__slots__", ())
+                        if isinstance(slots, str):
+                            slots = (slots,)
+                        for aname in slots:
+                            if aname in seen or aname == "__dict__":
+                                continue
+                            seen.add(aname)
+                            try:
+                                avalue = getattr(rd, aname)
+                            except AttributeError:
+                                # slot declared but never assigned
+                                continue
+                            if isinstance(avalue, dns.name.Name):
+                                replace[aname] = self.ensure_origin_and_upcase(
+                                    avalue, o, compressible or downcases
+                                )
+                    if len(replace) > 0:
+                        rd = rd.replace(**replace)
+                    # Test Compression
+                    f.seek(0)
+                    f.truncate()
+                    f.write(b"\0" * 12)
+                    compress = {}
+                    o.to_wire(f, compress=compress, origin=o)
+                    # compress ec and foo too as examples use it
+                    rd.to_wire(f, origin=o, compress=compress)
+                    wire1 = f.getvalue()
+                    f.seek(0)
+                    f.truncate()
+                    f.write(b"\0" * 12)
+                    o.to_wire(f, compress=None)
+                    rd.to_wire(f, origin=o, compress=None)
+                    wire2 = f.getvalue()
+                    # The possibly compressed wire1 must not be longer than wire2!
+                    self.assertLessEqual(len(wire1), len(wire2))
+                    if len(wire1) < len(wire2):
+                        self.assertTrue(compressible)
+                    else:
+                        self.assertFalse(compressible)
+                    # Test if canonicalization downcases.
+                    f.seek(0)
+                    f.truncate()
+                    rd.to_wire(f, origin=o, compress=None, canonicalize=False)
+                    wire1 = f.getvalue()
+                    f.seek(0)
+                    f.truncate()
+                    rd.to_wire(f, origin=o, compress=None, canonicalize=True)
+                    wire2 = f.getvalue()
+                    if wire1 != wire2:
+                        self.assertTrue(downcases)
+                    else:
+                        self.assertFalse(downcases)
+
+    def testEqual(self):
+        z1 = dns.zone.from_text(example_text, "example.", relativize=True)
+        z2 = dns.zone.from_text(example_text_output, "example.", relativize=True)
+        self.assertEqual(z1, z2)
+
+    def testEqualClassBeforeTTL(self):
+        z1 = dns.zone.from_text(
+            example_text_output_class_before_ttl, "example.", relativize=True
+        )
+        z2 = dns.zone.from_text(example_text_output, "example.", relativize=True)
+        self.assertEqual(z1, z2)
+
+    def testNotEqual1(self):
+        z1 = dns.zone.from_text(example_text, "example.", relativize=True)
+        z2 = dns.zone.from_text(something_quite_similar, "example.", relativize=True)
+        self.assertNotEqual(z1, z2)
+
+    def testNotEqual2(self):
+        z1 = dns.zone.from_text(example_text, "example.", relativize=True)
+        z2 = dns.zone.from_text(something_different, "example.", relativize=True)
+        self.assertNotEqual(z1, z2)
+
+    def testNotEqual3(self):
+        z1 = dns.zone.from_text(example_text, "example.", relativize=True)
+        z2 = dns.zone.from_text(something_different, "example2.", relativize=True)
+        self.assertNotEqual(z1, z2)
+
+    def testFindRdataset1(self):
+        z = dns.zone.from_text(example_text, "example.", relativize=True)
+        rds = z.find_rdataset("@", "soa")
+        exrds = dns.rdataset.from_text("IN", "SOA", 300, "foo bar 1 2 3 4 5")
+        self.assertEqual(rds, exrds)
+
+    def testFindRdataset2(self):
+        def bad():
+            z = dns.zone.from_text(example_text, "example.", relativize=True)
+            z.find_rdataset("@", "loc")
+
+        self.assertRaises(KeyError, bad)
+
+    def testFindRRset1(self):
+        z = dns.zone.from_text(example_text, "example.", relativize=True)
+        rrs = z.find_rrset("@", "soa")
+        exrrs = dns.rrset.from_text("@", 300, "IN", "SOA", "foo bar 1 2 3 4 5")
+        self.assertEqual(rrs, exrrs)
+
+    def testFindRRset2(self):
+        def bad():
+            z = dns.zone.from_text(example_text, "example.", relativize=True)
+            z.find_rrset("@", "loc")
+
+        self.assertRaises(KeyError, bad)
+
+    def testGetRdataset1(self):
+        z = dns.zone.from_text(example_text, "example.", relativize=True)
+        rds = z.get_rdataset("@", "soa")
+        exrds = dns.rdataset.from_text("IN", "SOA", 300, "foo bar 1 2 3 4 5")
+        self.assertEqual(rds, exrds)
+
+    def testGetRdataset2(self):
+        z = dns.zone.from_text(example_text, "example.", relativize=True)
+        rds = z.get_rdataset("@", "loc")
+        self.assertTrue(rds is None)
+
+    def testGetRdatasetWithRelativeNameFromAbsoluteZone(self):
+        z = dns.zone.from_text(example_text, "example.", relativize=False)
+        rds = z.get_rdataset(dns.name.empty, "soa")
+        self.assertIsNotNone(rds)
+        exrds = dns.rdataset.from_text(
+            "IN", "SOA", 300, "foo.example. bar.example. 1 2 3 4 5"
+        )
+        self.assertEqual(rds, exrds)
+
+    def testGetRRset1(self):
+        z = dns.zone.from_text(example_text, "example.", relativize=True)
+        rrs = z.get_rrset("@", "soa")
+        exrrs = dns.rrset.from_text("@", 300, "IN", "SOA", "foo bar 1 2 3 4 5")
+        self.assertEqual(rrs, exrrs)
+
+    def testGetRRset2(self):
+        z = dns.zone.from_text(example_text, "example.", relativize=True)
+        rrs = z.get_rrset("@", "loc")
+        self.assertTrue(rrs is None)
+
+    def testReplaceRdataset1(self):
+        z = dns.zone.from_text(example_text, "example.", relativize=True)
+        rdataset = dns.rdataset.from_text("in", "ns", 300, "ns3", "ns4")
+        z.replace_rdataset("@", rdataset)
+        rds = z.get_rdataset("@", "ns")
+        self.assertTrue(rds is rdataset)
+
+    def testReplaceRdataset2(self):
+        z = dns.zone.from_text(example_text, "example.", relativize=True)
+        rdataset = dns.rdataset.from_text("in", "txt", 300, '"foo"')
+        z.replace_rdataset("@", rdataset)
+        rds = z.get_rdataset("@", "txt")
+        self.assertTrue(rds is rdataset)
+
+    def testDeleteRdataset1(self):
+        z = dns.zone.from_text(example_text, "example.", relativize=True)
+        z.delete_rdataset("@", "ns")
+        rds = z.get_rdataset("@", "ns")
+        self.assertTrue(rds is None)
+
+    def testDeleteRdataset2(self):
+        z = dns.zone.from_text(example_text, "example.", relativize=True)
+        z.delete_rdataset("ns1", "a")
+        node = z.get_node("ns1")
+        self.assertTrue(node is None)
+
+    def testNodeFindRdataset1(self):
+        z = dns.zone.from_text(example_text, "example.", relativize=True)
+        node = z["@"]
+        rds = node.find_rdataset(dns.rdataclass.IN, dns.rdatatype.SOA)
+        exrds = dns.rdataset.from_text("IN", "SOA", 300, "foo bar 1 2 3 4 5")
+        self.assertEqual(rds, exrds)
+
+    def testNodeFindRdataset2(self):
+        def bad():
+            z = dns.zone.from_text(example_text, "example.", relativize=True)
+            node = z["@"]
+            node.find_rdataset(dns.rdataclass.IN, dns.rdatatype.LOC)
+
+        self.assertRaises(KeyError, bad)
+
+    def testNodeFindRdataset3(self):
+        z = dns.zone.from_text(example_text, "example.", relativize=True)
+        node = z["@"]
+        rds = node.find_rdataset(
+            dns.rdataclass.IN, dns.rdatatype.RRSIG, dns.rdatatype.A, create=True
+        )
+        self.assertEqual(rds.rdclass, dns.rdataclass.IN)
+        self.assertEqual(rds.rdtype, dns.rdatatype.RRSIG)
+        self.assertEqual(rds.covers, dns.rdatatype.A)
+
+    def testNodeGetRdataset1(self):
+        z = dns.zone.from_text(example_text, "example.", relativize=True)
+        node = z["@"]
+        rds = node.get_rdataset(dns.rdataclass.IN, dns.rdatatype.SOA)
+        exrds = dns.rdataset.from_text("IN", "SOA", 300, "foo bar 1 2 3 4 5")
+        self.assertEqual(rds, exrds)
+
+    def testNodeGetRdataset2(self):
+        z = dns.zone.from_text(example_text, "example.", relativize=True)
+        node = z["@"]
+        rds = node.get_rdataset(dns.rdataclass.IN, dns.rdatatype.LOC)
+        self.assertTrue(rds is None)
+
+    def testNodeDeleteRdataset1(self):
+        z = dns.zone.from_text(example_text, "example.", relativize=True)
+        node = z["@"]
+        node.delete_rdataset(dns.rdataclass.IN, dns.rdatatype.SOA)
+        rds = node.get_rdataset(dns.rdataclass.IN, dns.rdatatype.SOA)
+        self.assertTrue(rds is None)
+
+    def testNodeDeleteRdataset2(self):
+        z = dns.zone.from_text(example_text, "example.", relativize=True)
+        node = z["@"]
+        node.delete_rdataset(dns.rdataclass.IN, dns.rdatatype.LOC)
+        rds = node.get_rdataset(dns.rdataclass.IN, dns.rdatatype.LOC)
+        self.assertTrue(rds is None)
+
+    def testIterateNodes(self):
+        z = dns.zone.from_text(example_text, "example.", relativize=True)
+        count = 0
+        for n in z:
+            count += 1
+        self.assertEqual(count, 4)
+
+    def testIterateRdatasets(self):
+        z = dns.zone.from_text(example_text, "example.", relativize=True)
+        ns = [n for n, r in z.iterate_rdatasets("A")]
+        ns.sort()
+        self.assertEqual(
+            ns, [dns.name.from_text("ns1", None), dns.name.from_text("ns2", None)]
+        )
+
+    def testIterateAllRdatasets(self):
+        z = dns.zone.from_text(example_text, "example.", relativize=True)
+        ns = [n for n, r in z.iterate_rdatasets()]
+        ns.sort()
+        self.assertEqual(
+            ns,
+            [
+                dns.name.from_text("@", None),
+                dns.name.from_text("@", None),
+                dns.name.from_text("bar.foo", None),
+                dns.name.from_text("ns1", None),
+                dns.name.from_text("ns2", None),
+            ],
+        )
+
+    def testIterateRdatas(self):
+        z = dns.zone.from_text(example_text, "example.", relativize=True)
+        l = list(z.iterate_rdatas("A"))
+        l.sort()
+        exl = [
+            (
+                dns.name.from_text("ns1", None),
+                3600,
+                dns.rdata.from_text(dns.rdataclass.IN, dns.rdatatype.A, "10.0.0.1"),
+            ),
+            (
+                dns.name.from_text("ns2", None),
+                3600,
+                dns.rdata.from_text(dns.rdataclass.IN, dns.rdatatype.A, "10.0.0.2"),
+            ),
+        ]
+        self.assertEqual(l, exl)
+
+    def testIterateAllRdatas(self):
+        z = dns.zone.from_text(example_text, "example.", relativize=True)
+        l = list(z.iterate_rdatas())
+        l.sort(key=_rdata_sort)
+        exl = [
+            (
+                dns.name.from_text("@", None),
+                3600,
+                dns.rdata.from_text(dns.rdataclass.IN, dns.rdatatype.NS, "ns1"),
+            ),
+            (
+                dns.name.from_text("@", None),
+                3600,
+                dns.rdata.from_text(dns.rdataclass.IN, dns.rdatatype.NS, "ns2"),
+            ),
+            (
+                dns.name.from_text("@", None),
+                3600,
+                dns.rdata.from_text(
+                    dns.rdataclass.IN, dns.rdatatype.SOA, "foo bar 1 2 3 4 5"
+                ),
+            ),
+            (
+                dns.name.from_text("bar.foo", None),
+                300,
+                dns.rdata.from_text(dns.rdataclass.IN, dns.rdatatype.MX, "0 blaz.foo"),
+            ),
+            (
+                dns.name.from_text("ns1", None),
+                3600,
+                dns.rdata.from_text(dns.rdataclass.IN, dns.rdatatype.A, "10.0.0.1"),
+            ),
+            (
+                dns.name.from_text("ns2", None),
+                3600,
+                dns.rdata.from_text(dns.rdataclass.IN, dns.rdatatype.A, "10.0.0.2"),
+            ),
+        ]
+        exl.sort(key=_rdata_sort)
+        self.assertEqual(l, exl)
+
+    def testNodeGetSetDel(self):
+        z = dns.zone.from_text(example_text, "example.", relativize=True)
+        n = z.node_factory()
+        rds = dns.rdataset.from_text("IN", "A", 300, "10.0.0.1")
+        n.replace_rdataset(rds)
+        z["foo"] = n
+        self.assertTrue(z.find_rdataset("foo", "A") is rds)
+        self.assertEqual(z["foo"], n)
+        self.assertEqual(z.get("foo"), n)
+        del z["foo"]
+        self.assertEqual(z.get("foo"), None)
+        with self.assertRaises(KeyError):
+            z[123] = n
+        with self.assertRaises(KeyError):
+            z["foo."] = n
+        with self.assertRaises(KeyError):
+            bn = z.find_node("bar")
+        bn = z.find_node("bar", True)
+        self.assertTrue(isinstance(bn, dns.node.Node))
+        # The next two tests pass by not raising KeyError
+        z.delete_node("foo")
+        z.delete_node("bar")
+
+    def testBadReplacement(self):
+        z = dns.zone.from_text(example_text, "example.", relativize=True)
+        rds = dns.rdataset.from_text("CH", "TXT", 300, "hi")
+
+        def bad():
+            z.replace_rdataset("foo", rds)
+
+        self.assertRaises(ValueError, bad)
+
+    def testTTLs(self):
+        z = dns.zone.from_text(ttl_example_text, "example.", relativize=True)
+        n = z["@"]  # type: dns.node.Node
+        rds = cast(
+            dns.rdataset.Rdataset, n.get_rdataset(dns.rdataclass.IN, dns.rdatatype.SOA)
+        )
+        self.assertEqual(rds.ttl, 3600)
+        n = z["ns1"]
+        rds = cast(
+            dns.rdataset.Rdataset, n.get_rdataset(dns.rdataclass.IN, dns.rdatatype.A)
+        )
+        self.assertEqual(rds.ttl, 86401)
+        n = z["ns2"]
+        rds = cast(
+            dns.rdataset.Rdataset, n.get_rdataset(dns.rdataclass.IN, dns.rdatatype.A)
+        )
+        self.assertEqual(rds.ttl, 694861)
+
+    def testTTLFromSOA(self):
+        z = dns.zone.from_text(
+            ttl_from_soa_text, "example.", relativize=True, rfc2308_ttl=False
+        )
+        n = z["@"]
+        rds = cast(
+            dns.rdataset.Rdataset, n.get_rdataset(dns.rdataclass.IN, dns.rdatatype.SOA)
+        )
+        self.assertEqual(rds.ttl, 3600)
+        soa_rd = rds[0]
+        n = z["ns1"]
+        rds = cast(
+            dns.rdataset.Rdataset, n.get_rdataset(dns.rdataclass.IN, dns.rdatatype.A)
+        )
+        self.assertEqual(rds.ttl, 694861)
+        n = z["ns2"]
+        rds = cast(
+            dns.rdataset.Rdataset, n.get_rdataset(dns.rdataclass.IN, dns.rdatatype.A)
+        )
+        self.assertEqual(rds.ttl, soa_rd.minimum)
+
+    def testTTLFromLast(self):
+        z = dns.zone.from_text(ttl_from_last_text, "example.", check_origin=False)
+        n = z["@"]
+        rds = cast(
+            dns.rdataset.Rdataset, n.get_rdataset(dns.rdataclass.IN, dns.rdatatype.NS)
+        )
+        self.assertEqual(rds.ttl, 3600)
+        n = z["ns1"]
+        rds = cast(
+            dns.rdataset.Rdataset, n.get_rdataset(dns.rdataclass.IN, dns.rdatatype.A)
+        )
+        self.assertEqual(rds.ttl, 3600)
+        n = z["ns2"]
+        rds = cast(
+            dns.rdataset.Rdataset, n.get_rdataset(dns.rdataclass.IN, dns.rdatatype.A)
+        )
+        self.assertEqual(rds.ttl, 694861)
+
+    def testTTLFromLastInsteadOfSOA(self):
+        # RFC 2308 section 4 removed the "default TTL" meaning of the SOA
+        # minimum, so ns2 inherits the last stated TTL instead of the minimum.
+        z = dns.zone.from_text(
+            ttl_from_soa_text, "example.", relativize=True, rfc2308_ttl=True
+        )
+        rds = z.find_rdataset("@", "SOA")
+        self.assertEqual(rds.ttl, 3600)
+        rds = z.find_rdataset("ns1", "A")
+        self.assertEqual(rds.ttl, 694861)
+        rds = z.find_rdataset("ns2", "A")
+        self.assertEqual(rds.ttl, 694861)
+
+    def testDollarTTLWinsOverLastTTL(self):
+        z = dns.zone.from_text(
+            dollar_ttl_wins_text, "example.", relativize=True, rfc2308_ttl=False
+        )
+        self.assertEqual(z.find_rdataset("ns2", "A").ttl, 3600)
+        z = dns.zone.from_text(
+            dollar_ttl_wins_text, "example.", relativize=True, rfc2308_ttl=True
+        )
+        self.assertEqual(z.find_rdataset("ns2", "A").ttl, 3600)
+
+    def testDollarTTLAfterSOAWins(self):
+        z = dns.zone.from_text(
+            dollar_ttl_after_soa_text, "example.", relativize=True, rfc2308_ttl=False
+        )
+        # Until the $TTL is seen, the default TTL is the SOA minimum.
+        self.assertEqual(z.find_rdataset("ns1", "A").ttl, 5)
+        self.assertEqual(z.find_rdataset("ns2", "A").ttl, 300)
+        z = dns.zone.from_text(
+            dollar_ttl_after_soa_text, "example.", relativize=True, rfc2308_ttl=True
+        )
+        # In RFC 2308 mode the SOA minimum is not a default TTL, so ns1 takes
+        # the last stated TTL, but the $TTL still wins for ns2.
+        self.assertEqual(z.find_rdataset("ns1", "A").ttl, 3600)
+        self.assertEqual(z.find_rdataset("ns2", "A").ttl, 300)
+
+    def testTTLFromSOAMinimumAsLastResort(self):
+        # Nothing has stated a TTL, so even in RFC 2308 mode the minimum is
+        # the only TTL available.
+        z = dns.zone.from_text(
+            ttl_only_from_soa_minimum_text,
+            "example.",
+            relativize=True,
+            rfc2308_ttl=False,
+        )
+        self.assertEqual(z.find_rdataset("@", "SOA").ttl, 5)
+        self.assertEqual(z.find_rdataset("ns1", "A").ttl, 5)
+        z = dns.zone.from_text(
+            ttl_only_from_soa_minimum_text,
+            "example.",
+            relativize=True,
+            rfc2308_ttl=True,
+        )
+        self.assertEqual(z.find_rdataset("@", "SOA").ttl, 5)
+        self.assertEqual(z.find_rdataset("ns1", "A").ttl, 5)
+
+    def testTTLFromLastWithClassBeforeTTL(self):
+        # The <class> <ttl> <type> syntax has its own TTL inheritance code.
+        z = dns.zone.from_text(
+            example_text_output_class_before_ttl,
+            "example.",
+            relativize=True,
+            rfc2308_ttl=False,
+        )
+        self.assertEqual(z.find_rdataset("@", "NS").ttl, 5)
+        z = dns.zone.from_text(
+            example_text_output_class_before_ttl,
+            "example.",
+            relativize=True,
+            rfc2308_ttl=True,
+        )
+        self.assertEqual(z.find_rdataset("@", "NS").ttl, 3600)
+
+    def testDollarTTLInIncludeDoesNotEscape(self):
+        z = dns.zone.from_text(
+            ttl_include_text,
+            "example.",
+            relativize=True,
+            allow_include=True,
+            rfc2308_ttl=False,
+        )
+        self.assertEqual(z.find_rdataset("included", "A").ttl, 300)
+        self.assertEqual(z.find_rdataset("ns2", "A").ttl, 5)
+        z = dns.zone.from_text(
+            ttl_include_text,
+            "example.",
+            relativize=True,
+            allow_include=True,
+            rfc2308_ttl=True,
+        )
+        self.assertEqual(z.find_rdataset("included", "A").ttl, 300)
+        self.assertEqual(z.find_rdataset("ns2", "A").ttl, 694861)
+
+    def testNoTTL(self):
+        def bad():
+            dns.zone.from_text(
+                no_ttl_text, "example.", check_origin=False, rfc2308_ttl=False
+            )
+
+        self.assertRaises(dns.exception.SyntaxError, bad)
+
+    def testNoTTLRFC2308(self):
+        def bad():
+            dns.zone.from_text(
+                no_ttl_text, "example.", check_origin=False, rfc2308_ttl=True
+            )
+
+        self.assertRaises(dns.exception.SyntaxError, bad)
+
+    def testNoSOA(self):
+        def bad():
+            dns.zone.from_text(no_soa_text, "example.", relativize=True)
+
+        self.assertRaises(dns.zone.NoSOA, bad)
+
+    def testNoNS(self):
+        def bad():
+            dns.zone.from_text(no_ns_text, "example.", relativize=True)
+
+        self.assertRaises(dns.zone.NoNS, bad)
+
+    def testInclude(self):
+        z1 = dns.zone.from_text(
+            include_text, "example.", relativize=True, allow_include=True
+        )
+        z2 = dns.zone.from_file(here("example"), "example.", relativize=True)
+        self.assertEqual(z1, z2)
+
+    def testNoInclude(self):
+        def bad():
+            dns.zone.from_text(
+                include_text, "example.", relativize=True, allow_include=False
+            )
+
+        self.assertRaises(dns.exception.SyntaxError, bad)
+
+    def testExplicitInclude(self):
+        z1 = dns.zone.from_text(
+            include_text,
+            "example.",
+            relativize=True,
+            allow_directives={"$INCLUDE", "$ORIGIN", "$TTL"},
+        )
+        z2 = dns.zone.from_file(here("example"), "example.", relativize=True)
+        self.assertEqual(z1, z2)
+
+    def testExplicitIncludeNotUpperNoDollar(self):
+        z1 = dns.zone.from_text(
+            include_text,
+            "example.",
+            relativize=True,
+            allow_directives={"InClUdE", "origin", "TTL"},
+        )
+        z2 = dns.zone.from_file(here("example"), "example.", relativize=True)
+        self.assertEqual(z1, z2)
+
+    def testExplicitLowerCase(self):
+        z1 = dns.zone.from_text(
+            include_text,
+            "example.",
+            relativize=True,
+            allow_directives={"$include", "$origin", "$ttl"},
+        )
+        z2 = dns.zone.from_file(here("example"), "example.", relativize=True)
+        self.assertEqual(z1, z2)
+
+    def testExplicitWithoutInclude1(self):
+        def bad():
+            dns.zone.from_text(
+                include_text,
+                "example.",
+                relativize=True,
+                allow_include=False,
+                allow_directives={"$ORIGIN", "$TTL"},
+            )
+
+        self.assertRaises(dns.exception.SyntaxError, bad)
+
+    def testExplicitWithoutInclude2(self):
+        def bad():
+            dns.zone.from_text(
+                include_text,
+                "example.",
+                relativize=True,
+                allow_include=True,
+                allow_directives={"$ORIGIN", "$TTL"},
+            )
+
+        self.assertRaises(dns.exception.SyntaxError, bad)
+
+    def testBadDirective(self):
+        def bad():
+            dns.zone.from_text(bad_directive_text, "example.", relativize=True)
+
+        self.assertRaises(dns.exception.SyntaxError, bad)
+
+    def testAllowedButNotImplementedDirective(self):
+        def bad():
+            dns.zone.from_text(
+                bad_directive_text,
+                "example.",
+                relativize=True,
+                allow_directives={"$FOO", "$ORIGIN"},
+            )
+
+        self.assertRaises(dns.exception.SyntaxError, bad)
+
+    def testEmptyTokenAtStartOfLine(self):
+        # An empty token at the start of a line is not a directive, and used
+        # to escape as an IndexError instead of a SyntaxError.
+        def bad():
+            dns.zone.from_text('""\n', origin="example.", check_origin=False)
+
+        self.assertRaises(dns.exception.SyntaxError, bad)
+
+    def testQuotedDirectiveIsNotADirective(self):
+        # A quoted string is data, not a directive, so "$TTL" must not be
+        # processed as $TTL.
+        def bad():
+            dns.zone.from_text(
+                '"$TTL" 60\nfoo 60 IN A 10.0.0.1\n',
+                origin="example.",
+                check_origin=False,
+            )
+
+        self.assertRaises(dns.exception.SyntaxError, bad)
+
+    def testFirstRRStartsWithWhitespace(self):
+        # no name is specified, so default to the initial origin
+        z = dns.zone.from_text(
+            " 300 IN A 10.0.0.1", origin="example.", check_origin=False
+        )
+        n = z["@"]
+        rds = cast(
+            dns.rdataset.Rdataset, n.get_rdataset(dns.rdataclass.IN, dns.rdatatype.A)
+        )
+        self.assertEqual(rds.ttl, 300)
+
+    def testZoneOrigin(self):
+        z = dns.zone.Zone("example.")
+        self.assertEqual(z.origin, dns.name.from_text("example."))
+
+        def bad1():
+            o = dns.name.from_text("example", None)
+            dns.zone.Zone(o)
+
+        self.assertRaises(ValueError, bad1)
+
+        def bad2():
+            dns.zone.Zone(cast(str, 1.0))
+
+        self.assertRaises(ValueError, bad2)
+
+    def testZoneOriginNone(self):
+        dns.zone.Zone(cast(str, None))
+
+    def testZoneFromXFR(self):
+        z1_abs = dns.zone.from_text(example_text, "example.", relativize=False)
+        z2_abs = dns.zone.from_xfr(make_xfr(z1_abs), relativize=False)
+        self.assertEqual(z1_abs, z2_abs)
+
+        z1_rel = dns.zone.from_text(example_text, "example.", relativize=True)
+        z2_rel = dns.zone.from_xfr(make_xfr(z1_rel), relativize=True)
+        self.assertEqual(z1_rel, z2_rel)
+
+    def testZoneFromXFRIgnoresOutOfZoneData(self):
+        for relativize in (False, True):
+            z1 = dns.zone.from_text(example_text, "example.", relativize=relativize)
+            xfr = make_xfr(z1)
+            rrset = dns.rrset.from_text("www.victim.com.", 300, "IN", "A", "10.0.0.1")
+            xfr[0].answer.insert(-1, rrset)
+            z2 = dns.zone.from_xfr(xfr, relativize=relativize)
+            self.assertEqual(z1, z2)
+            self.assertNotIn(dns.name.from_text("www.victim.com."), z2.nodes)
+
+    def testZoneFromXFRWrongClass(self):
+        z1 = dns.zone.from_text(example_text, "example.", relativize=False)
+        xfr = make_xfr(z1)
+        rrset = dns.rrset.from_text("foo.example.", 300, "CH", "TXT", "wrong")
+        xfr[0].answer.insert(-1, rrset)
+        with self.assertRaises(dns.exception.FormError):
+            dns.zone.from_xfr(xfr, relativize=False)
+
+    def testZoneFromXFRNonOriginSOA(self):
+        z1 = dns.zone.from_text(example_text, "example.", relativize=False)
+        xfr = make_xfr(z1)
+        rrset = dns.rrset.from_text(
+            "sub.example.", 300, "IN", "SOA", "ns1.example. h.example. 1 2 3 4 5"
+        )
+        xfr[0].answer.insert(-1, rrset)
+        with self.assertRaises(dns.exception.FormError):
+            dns.zone.from_xfr(xfr, relativize=False)
+
+    def testCodec2003(self):
+        z = dns.zone.from_text(
+            codec_text, "example.", relativize=True, idna_codec=dns.name.IDNA_2003
+        )
+        n2003 = dns.name.from_text("xn--knigsgsschen-lcb0w", None)
+        n2008 = dns.name.from_text("xn--knigsgchen-b4a3dun", None)
+        self.assertTrue(n2003 in z)
+        self.assertFalse(n2008 in z)
+        rrs = z.find_rrset(n2003, "NS")
+        self.assertEqual(rrs[0].target, n2003)
+
+    @unittest.skipUnless(
+        dns.name.have_idna_2008, "Python idna cannot be imported; no IDNA2008"
+    )
+    def testCodec2008(self):
+        z = dns.zone.from_text(
+            codec_text, "example.", relativize=True, idna_codec=dns.name.IDNA_2008
+        )
+        n2003 = dns.name.from_text("xn--knigsgsschen-lcb0w", None)
+        n2008 = dns.name.from_text("xn--knigsgchen-b4a3dun", None)
+        self.assertFalse(n2003 in z)
+        self.assertTrue(n2008 in z)
+        rrs = z.find_rrset(n2008, "NS")
+        self.assertEqual(rrs[0].target, n2008)
+
+    def testZoneMiscCases(self):
+        # test that leading whitespace followed by EOL is treated like
+        # a blank line, and that out-of-zone names are dropped.
+        z1 = dns.zone.from_text(misc_cases_input, "example.")
+        z2 = dns.zone.from_text(misc_cases_expected, "example.")
+        self.assertEqual(z1, z2)
+
+    def testUnknownOrigin(self):
+        def bad():
+            dns.zone.from_text("foo 300 in a 10.0.0.1")
+
+        self.assertRaises(dns.zone.UnknownOrigin, bad)
+
+    def testRelativeDollarOriginUsesSuppliedOrigin(self):
+        text = """$ORIGIN sub
+@ 300 IN A 10.0.0.2
+$ORIGIN example.
+@ 300 IN SOA ns1 hostmaster 1 2 3 4 5
+@ 300 IN NS ns1
+"""
+        for relativize in (True, False):
+            z = dns.zone.from_text(text, "example.", relativize=relativize)
+            name = "sub" if relativize else "sub.example."
+            rds = z.find_rdataset(name, "A")
+            self.assertEqual(rds[0].address, "10.0.0.2")
+
+    def testRelativeDollarOriginUnknownOrigin(self):
+        def bad():
+            dns.zone.from_text("$ORIGIN sub\n@ 300 IN A 10.0.0.1\n")
+
+        self.assertRaises(dns.zone.UnknownOrigin, bad)
+
+    def testBadClass(self):
+        def bad():
+            dns.zone.from_text("foo 300 ch txt hi", "example.")
+
+        self.assertRaises(dns.exception.SyntaxError, bad)
+
+    def testUnknownRdatatype(self):
+        def bad():
+            dns.zone.from_text("foo 300 BOGUSTYPE hi", "example.")
+
+        self.assertRaises(dns.exception.SyntaxError, bad)
+
+    def testDangling(self):
+        def bad1():
+            dns.zone.from_text("foo", "example.")
+
+        self.assertRaises(dns.exception.SyntaxError, bad1)
+
+        def bad2():
+            dns.zone.from_text("foo 300", "example.")
+
+        self.assertRaises(dns.exception.SyntaxError, bad2)
+
+        def bad3():
+            dns.zone.from_text("foo 300 in", "example.")
+
+        self.assertRaises(dns.exception.SyntaxError, bad3)
+
+        def bad4():
+            dns.zone.from_text("foo 300 in a", "example.")
+
+        self.assertRaises(dns.exception.SyntaxError, bad4)
+
+        def bad5():
+            dns.zone.from_text("$TTL", "example.")
+
+        self.assertRaises(dns.exception.SyntaxError, bad5)
+
+        def bad6():
+            dns.zone.from_text("$ORIGIN", "example.")
+
+        self.assertRaises(dns.exception.SyntaxError, bad6)
+
+    def testUseLastTTL(self):
+        z = dns.zone.from_text(last_ttl_input, "example.")
+        rds = z.find_rdataset("foo", "A")
+        self.assertEqual(rds.ttl, 300)
+
+    def testDollarOriginSetsZoneOriginIfUnknown(self):
+        z = dns.zone.from_text(origin_sets_input)
+        self.assertEqual(z.origin, dns.name.from_text("example"))
+
+    def testValidateNameRelativizesNameInZone(self):
+        z = dns.zone.from_text(example_text, "example.", relativize=True)
+        self.assertEqual(
+            z._validate_name("foo.bar.example."), dns.name.from_text("foo.bar", None)
+        )
+
+    def testComments(self):
+        z = dns.zone.from_text(example_comments_text, "example.", relativize=True)
+        f = StringIO()
+        z.to_file(f, want_comments=True)
+        out = f.getvalue()
+        f.close()
+        self.assertEqual(out, example_comments_text_output)
+
+    def testUncomparable(self):
+        z = dns.zone.from_text(example_comments_text, "example.", relativize=True)
+        self.assertFalse(z == "a")
+
+    def testUnsorted(self):
+        z = dns.zone.from_text(example_text, "example.", relativize=True)
+        f = StringIO()
+        z.to_file(f, sorted=False)
+        out = f.getvalue()
+        f.close()
+        z2 = dns.zone.from_text(out, "example.", relativize=True)
+        self.assertEqual(z, z2)
+
+    def testNodeReplaceRdatasetConvertsRRsets(self):
+        node = dns.node.Node()
+        rrs = dns.rrset.from_text("foo", 300, "in", "a", "10.0.0.1")
+        node.replace_rdataset(rrs)
+        rds = node.find_rdataset(dns.rdataclass.IN, dns.rdatatype.A)
+        self.assertEqual(rds, rrs)
+        self.assertTrue(rds is not rrs)
+        self.assertFalse(isinstance(rds, dns.rrset.RRset))
+
+    def testCnameAndOtherDataAddOther(self):
+        z = dns.zone.from_text(example_cname, "example.", relativize=True)
+        rds = dns.rdataset.from_text("in", "a", 300, "10.0.0.1")
+        z.replace_rdataset("web", rds)
+        z.replace_rdataset("web2", rds.copy())
+        n = z.find_node("web")
+        self.assertEqual(len(n.rdatasets), 3)
+        self.assertEqual(n.find_rdataset(dns.rdataclass.IN, dns.rdatatype.A), rds)
+        self.assertIsNotNone(n.get_rdataset(dns.rdataclass.IN, dns.rdatatype.NSEC))
+        self.assertIsNotNone(
+            n.get_rdataset(dns.rdataclass.IN, dns.rdatatype.RRSIG, dns.rdatatype.NSEC)
+        )
+        n = z.find_node("web2")
+        self.assertEqual(len(n.rdatasets), 3)
+        self.assertEqual(n.find_rdataset(dns.rdataclass.IN, dns.rdatatype.A), rds)
+        self.assertIsNotNone(n.get_rdataset(dns.rdataclass.IN, dns.rdatatype.NSEC3))
+        self.assertIsNotNone(
+            n.get_rdataset(dns.rdataclass.IN, dns.rdatatype.RRSIG, dns.rdatatype.NSEC3)
+        )
+
+    def testCnameAndOtherDataAddCname(self):
+        z = dns.zone.from_text(example_other_data, "example.", relativize=True)
+        rds = dns.rdataset.from_text("in", "cname", 300, "www")
+        z.replace_rdataset("web", rds)
+        n = z.find_node("web")
+        self.assertEqual(len(n.rdatasets), 3)
+        self.assertEqual(n.find_rdataset(dns.rdataclass.IN, dns.rdatatype.CNAME), rds)
+        self.assertIsNotNone(n.get_rdataset(dns.rdataclass.IN, dns.rdatatype.NSEC))
+        self.assertIsNotNone(
+            n.get_rdataset(dns.rdataclass.IN, dns.rdatatype.RRSIG, dns.rdatatype.NSEC)
+        )
+
+    def testCnameAndOtherDataInZonefile(self):
+        with self.assertRaises(dns.zonefile.CNAMEAndOtherData):
+            dns.zone.from_text(
+                example_cname_and_other_data, "example.", relativize=True
+            )
+
+    def testNameInZoneWithStr(self):
+        z = dns.zone.from_text(example_text, "example.", relativize=False)
+        self.assertTrue("ns1.example." in z)
+        self.assertTrue("bar.foo.example." in z)
+
+    def testNameInZoneWhereNameIsNotValid(self):
+        z = dns.zone.from_text(example_text, "example.", relativize=False)
+        with self.assertRaises(KeyError):
+            self.assertTrue(1 in z)
+
+    def testRelativeNameLengthChecks(self):
+        z = dns.zone.from_text(example_cname, "example.", relativize=True)
+        rds = dns.rdataset.from_text("in", "a", 300, "10.0.0.1")
+        # This name is 246 bytes long, which along with the 8 bytes for label "example"
+        # and 1 byte for the root name is 246 + 8 + 1 = 255 bytes long, the maximum
+        # legal wire format name length.
+        ok_long_relative = dns.name.Name(["a" * 63, "a" * 63, "a" * 63, "a" * 53])
+        z.replace_rdataset(ok_long_relative, rds)
+        self.assertEqual(z.find_rdataset(ok_long_relative, "A"), rds)
+        # This is the longest possible relative name and won't work in any zone
+        # as there is no space left for any origin labels.
+        too_long_relative = dns.name.Name(["a" * 63, "a" * 63, "a" * 63, "a" * 62])
+        with self.assertRaises(KeyError):
+            z.replace_rdataset(too_long_relative, rds)
+
+    def testImmutableNodes(self):
+        z = dns.zone.from_text(example_text, "example.", relativize=True)
+        node = dns.node.ImmutableNode(z.find_node("@"))
+        self.assertTrue(node.is_immutable)
+        with self.assertRaises(TypeError):
+            node.find_rdataset(dns.rdataclass.IN, dns.rdatatype.RP, create=True)
+        node.find_rdataset(dns.rdataclass.IN, dns.rdatatype.SOA)
+        with self.assertRaises(TypeError):
+            node.get_rdataset(dns.rdataclass.IN, dns.rdatatype.RP, create=True)
+        node.get_rdataset(dns.rdataclass.IN, dns.rdatatype.SOA)
+        with self.assertRaises(TypeError):
+            node.delete_rdataset(dns.rdataclass.IN, dns.rdatatype.SOA)
+        with self.assertRaises(TypeError):
+            node.replace_rdataset(None)
+
+    def testUnicodeThereAndBack(self):
+        z1 = dns.zone.from_text(example_unicode, "example")
+        s = dns.zone.ZoneStyle(
+            deduplicate_names=True, omit_rdclass=True, want_origin=True
+        )
+        t1 = z1.to_styled_text(s)
+        self.assertEqual(t1, example_unicode_expected)
+        z2 = dns.zone.from_text(t1, "example")
+        self.assertEqual(z1, z2)
+        z1.unicode = set()
+        t2 = z1.to_text()
+        z3 = dns.zone.from_text(t2, "example.")
+        self.assertEqual(z1, z3)
+
+    def testJustificationAndDefaultTTL(self):
+        z1 = dns.zone.from_text(example_unicode, "example")
+        s = dns.zone.ZoneStyle(
+            deduplicate_names=True,
+            omit_rdclass=True,
+            want_origin=True,
+            default_ttl=300,
+            name_just=-10,
+            ttl_just=4,
+            rdclass_just=-4,
+            rdtype_just=-8,
+        )
+        t1 = z1.to_styled_text(s)
+        print(t1)
+        print("-------")
+        print(example_unicode_justified)
+        self.assertEqual(t1, example_unicode_justified)
+
+    def testToTextForwardsStyle(self):
+        # to_text() accepts a style and documents that it "overrides the
+        # other parameters", but it never passed it to to_file(), so the
+        # style was silently dropped and the legacy defaults were rebuilt.
+        z1 = dns.zone.from_text(example_unicode, "example")
+        s = dns.zone.ZoneStyle(
+            deduplicate_names=True, omit_rdclass=True, want_origin=True
+        )
+        # want_origin is only reachable through the style in this test, so if
+        # the style is forwarded the $ORIGIN line is emitted.
+        self.assertIn("$ORIGIN", z1.to_text(style=s))
+        # to_text(style=s) must agree with the styled entry point.
+        self.assertEqual(z1.to_text(style=s), z1.to_styled_text(s))
+        # nl is style-only, so it is the clearest probe that the style is not
+        # being dropped.
+        self.assertIn("\r\n", z1.to_text(style=dns.zone.ZoneStyle(nl="\r\n")))
+        # A style with no flags set must produce the same output as no style.
+        self.assertEqual(z1.to_text(style=dns.zone.ZoneStyle()), z1.to_text())
+
+    def testFromFileHittingLimit(self):
+        limiter = dns.transaction.TransactionLimiter(20)
+        with self.assertRaises(dns.transaction.TooManyChanges):
+            z = dns.zone.from_file(
+                here("example"), "example", transaction_setup=limiter
+            )
+
+    def testFromFileLimitOk(self):
+        limiter = dns.transaction.TransactionLimiter(1000)
+        z = dns.zone.from_file(here("example"), "example", transaction_setup=limiter)
+
+
+class VersionedZoneTestCase(unittest.TestCase):
+    zone_factory = dns.versioned.Zone
+
+    def testUseTransaction(self):
+        z = dns.zone.from_text(
+            example_text, "example.", relativize=True, zone_factory=self.zone_factory
+        )
+        with self.assertRaises(dns.versioned.UseTransaction):
+            z.find_node("not_there", True)
+        with self.assertRaises(dns.versioned.UseTransaction):
+            z.delete_node("not_there")
+        with self.assertRaises(dns.versioned.UseTransaction):
+            z.find_rdataset("not_there", "a", create=True)
+        with self.assertRaises(dns.versioned.UseTransaction):
+            z.get_rdataset("not_there", "a", create=True)
+        with self.assertRaises(dns.versioned.UseTransaction):
+            z.delete_rdataset("not_there", "a")
+        with self.assertRaises(dns.versioned.UseTransaction):
+            z.replace_rdataset("not_there", None)
+
+    def testImmutableNodes(self):
+        z = dns.zone.from_text(
+            example_text, "example.", relativize=True, zone_factory=self.zone_factory
+        )
+        node = z.find_node("@")
+        with self.assertRaises(TypeError):
+            node.find_rdataset(dns.rdataclass.IN, dns.rdatatype.RP, create=True)
+        with self.assertRaises(TypeError):
+            node.get_rdataset(dns.rdataclass.IN, dns.rdatatype.RP, create=True)
+        with self.assertRaises(TypeError):
+            node.delete_rdataset(dns.rdataclass.IN, dns.rdatatype.SOA)
+        with self.assertRaises(TypeError):
+            node.replace_rdataset(None)
+
+    def testSelectDefaultPruningPolicy(self):
+        z = dns.zone.from_text(
+            example_text, "example.", relativize=True, zone_factory=self.zone_factory
+        )
+        z.set_pruning_policy(None)
+        self.assertEqual(z._pruning_policy, z._default_pruning_policy)
+
+    def testSetAlternatePruningPolicyInConstructor(self):
+        def never_prune(version):
+            return False
+
+        z = dns.versioned.Zone("example", pruning_policy=never_prune)
+        self.assertEqual(z._pruning_policy, never_prune)
+
+    def testCannotSpecifyBothSerialAndVersionIdToReader(self):
+        z = dns.zone.from_text(
+            example_text, "example.", relativize=True, zone_factory=self.zone_factory
+        )
+        with self.assertRaises(ValueError):
+            z.reader(1, 1)
+
+    def testUnknownVersion(self):
+        z = dns.zone.from_text(
+            example_text, "example.", relativize=True, zone_factory=self.zone_factory
+        )
+        with self.assertRaises(KeyError):
+            z.reader(99999)
+
+    def testUnknownSerial(self):
+        z = dns.zone.from_text(
+            example_text, "example.", relativize=True, zone_factory=self.zone_factory
+        )
+        with self.assertRaises(KeyError):
+            z.reader(serial=99999)
+
+    def testNoRelativizeReader(self):
+        z = dns.zone.from_text(
+            example_text, "example.", relativize=False, zone_factory=self.zone_factory
+        )
+        with z.reader(serial=1) as txn:
+            rds = txn.get("example.", "soa")
+            self.assertEqual(rds[0].serial, 1)
+
+    def testNoRelativizeReaderOriginInText(self):
+        z = dns.zone.from_text(
+            example_text, relativize=False, zone_factory=self.zone_factory
+        )
+        with z.reader(serial=1) as txn:
+            rds = txn.get("example.", "soa")
+            self.assertEqual(rds[0].serial, 1)
+
+    def testNoRelativizeReaderAbsoluteGet(self):
+        z = dns.zone.from_text(
+            example_text, "example.", relativize=False, zone_factory=self.zone_factory
+        )
+        with z.reader(serial=1) as txn:
+            rds = txn.get(dns.name.empty, "soa")
+            self.assertEqual(rds[0].serial, 1)
+
+    def testCnameAndOtherDataAddOther(self):
+        z = dns.zone.from_text(
+            example_cname, "example.", relativize=True, zone_factory=self.zone_factory
+        )
+        rds = dns.rdataset.from_text("in", "a", 300, "10.0.0.1")
+        with z.writer() as txn:
+            txn.replace("web", rds)
+            txn.replace("web2", rds.copy())
+        n = z.find_node("web")
+        self.assertEqual(len(n.rdatasets), 3)
+        self.assertEqual(n.find_rdataset(dns.rdataclass.IN, dns.rdatatype.A), rds)
+        self.assertIsNotNone(n.get_rdataset(dns.rdataclass.IN, dns.rdatatype.NSEC))
+        self.assertIsNotNone(
+            n.get_rdataset(dns.rdataclass.IN, dns.rdatatype.RRSIG, dns.rdatatype.NSEC)
+        )
+        n = z.find_node("web2")
+        self.assertEqual(len(n.rdatasets), 3)
+        self.assertEqual(n.find_rdataset(dns.rdataclass.IN, dns.rdatatype.A), rds)
+        self.assertIsNotNone(n.get_rdataset(dns.rdataclass.IN, dns.rdatatype.NSEC3))
+        self.assertIsNotNone(
+            n.get_rdataset(dns.rdataclass.IN, dns.rdatatype.RRSIG, dns.rdatatype.NSEC3)
+        )
+
+    def testCnameAndOtherDataAddCname(self):
+        z = dns.zone.from_text(
+            example_other_data,
+            "example.",
+            relativize=True,
+            zone_factory=self.zone_factory,
+        )
+        rds = dns.rdataset.from_text("in", "cname", 300, "www")
+        with z.writer() as txn:
+            txn.replace("web", rds)
+        n = z.find_node("web")
+        self.assertEqual(len(n.rdatasets), 3)
+        self.assertEqual(n.find_rdataset(dns.rdataclass.IN, dns.rdatatype.CNAME), rds)
+        self.assertIsNotNone(n.get_rdataset(dns.rdataclass.IN, dns.rdatatype.NSEC))
+        self.assertIsNotNone(
+            n.get_rdataset(dns.rdataclass.IN, dns.rdatatype.RRSIG, dns.rdatatype.NSEC)
+        )
+
+    def testGetSoa(self):
+        z = dns.zone.from_text(
+            example_text, "example.", relativize=True, zone_factory=self.zone_factory
+        )
+        soa = z.get_soa()
+        self.assertTrue(soa.rdtype, dns.rdatatype.SOA)
+        self.assertEqual(soa.serial, 1)
+
+    def testGetSoaTxn(self):
+        z = dns.zone.from_text(
+            example_text, "example.", relativize=True, zone_factory=self.zone_factory
+        )
+        with z.reader(serial=1) as txn:
+            soa = z.get_soa(txn)
+            self.assertTrue(soa.rdtype, dns.rdatatype.SOA)
+            self.assertEqual(soa.serial, 1)
+
+    def testGetSoaEmptyZone(self):
+        z = dns.zone.Zone("example.")
+        with self.assertRaises(dns.zone.NoSOA):
+            soa = z.get_soa()
+
+    def testGetRdataset1(self):
+        z = dns.zone.from_text(
+            example_text, "example.", relativize=True, zone_factory=self.zone_factory
+        )
+        rds = z.get_rdataset("@", "soa")
+        exrds = dns.rdataset.from_text("IN", "SOA", 300, "foo bar 1 2 3 4 5")
+        self.assertEqual(rds, exrds)
+
+    def testGetRdataset2(self):
+        z = dns.zone.from_text(
+            example_text, "example.", relativize=True, zone_factory=self.zone_factory
+        )
+        rds = z.get_rdataset("@", "loc")
+        self.assertTrue(rds is None)
+
+
+class BTreeZoneTestCase(VersionedZoneTestCase):
+    zone_factory = dns.btreezone.Zone
+
+
+if __name__ == "__main__":
+    unittest.main()

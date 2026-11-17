@@ -1,0 +1,135 @@
+# Copyright (C) Dnspython Contributors, see LICENSE for text of ISC license
+
+# Copyright (C) 2006-2017 Nominum, Inc.
+#
+# Permission to use, copy, modify, and distribute this software and its
+# documentation for any purpose with or without fee is hereby granted,
+# provided that the above copyright notice and this permission notice
+# appear in all copies.
+#
+# THE SOFTWARE IS PROVIDED "AS IS" AND NOMINUM DISCLAIMS ALL WARRANTIES
+# WITH REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF
+# MERCHANTABILITY AND FITNESS. IN NO EVENT SHALL NOMINUM BE LIABLE FOR
+# ANY SPECIAL, DIRECT, INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES
+# WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN AN
+# ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT
+# OF OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
+
+import unittest
+
+import dns.exception
+import dns.rdata
+import dns.rdataclass
+import dns.rdatatype
+import dns.rdtypes.ANY.NSEC3
+import dns.rdtypes.ANY.TXT
+import dns.ttl
+
+
+class NSEC3TestCase(unittest.TestCase):
+    def test_NSEC3_bitmap(self):
+        rdata = dns.rdata.from_text(
+            dns.rdataclass.IN,
+            dns.rdatatype.NSEC3,
+            "1 0 100 ABCD SCBCQHKU35969L2A68P3AD59LHF30715 A CAA TYPE65534",
+        )
+        bitmap = bytearray(b"\0" * 32)
+        bitmap[31] = bitmap[31] | 2
+        self.assertEqual(
+            rdata.windows, ((0, b"@"), (1, b"@"), (255, bitmap))  # CAA = 257
+        )
+
+    def test_NSEC3_bad_bitmaps(self):
+        rdata = dns.rdata.from_text(
+            dns.rdataclass.IN,
+            dns.rdatatype.NSEC3,
+            "1 0 100 ABCD SCBCQHKU35969L2A68P3AD59LHF30715 A CAA",
+        )
+
+        with self.assertRaises(dns.exception.FormError):
+            copy = bytearray(rdata.to_wire())
+            copy[-3] = 0
+            dns.rdata.from_wire("IN", "NSEC3", copy, 0, len(copy))
+
+    def test_NSEC3_next_non_base32hex(self):
+        # RFC 5155 Sec 1.3: the Next Hashed Owner Name is base32hex (the
+        # Extended Hex Alphabet of RFC 4648), i.e. 0-9 and A-V.  W, X, Y, Z are
+        # not in that alphabet but are valid in plain base32, so the old decode
+        # (translate base32hex->base32, then b32decode) let them through and
+        # silently produced a different owner name than the text supplied.
+        with self.assertRaises(dns.exception.SyntaxError):
+            dns.rdata.from_text(
+                dns.rdataclass.IN,
+                dns.rdatatype.NSEC3,
+                "1 0 100 ABCD WXYZ2345 A",
+            )
+        # A valid base32hex next field still round-trips, in either case.
+        for next_field in (
+            "SCBCQHKU35969L2A68P3AD59LHF30715",
+            "scbcqhku35969l2a68p3ad59lhf30715",
+        ):
+            rdata = dns.rdata.from_text(
+                dns.rdataclass.IN,
+                dns.rdatatype.NSEC3,
+                f"1 0 100 ABCD {next_field} A",
+            )
+            self.assertEqual(rdata.to_text(), f"1 0 100 abcd {next_field.lower()} A")
+
+    def test_NSEC3_next_non_canonical_base32hex(self):
+        # RFC 4648 Sec 3.5: when the Next Hashed Owner Name does not fill a
+        # whole number of base32hex characters, the unused low-order bits of
+        # the final character MUST be zero.  base32hex decoding ignores those
+        # bits, so a non-canonical spelling decoded to the same hash as the
+        # canonical one and to_text() did not reproduce the input.  "CPNMU"
+        # and "CPNMV" both decode to the three bytes 0x666f6f; only "cpnmu"
+        # is canonical.
+        with self.assertRaises(dns.exception.SyntaxError):
+            dns.rdata.from_text(
+                dns.rdataclass.IN,
+                dns.rdatatype.NSEC3,
+                "1 0 100 ABCD CPNMV A",
+            )
+        rdata = dns.rdata.from_text(
+            dns.rdataclass.IN,
+            dns.rdatatype.NSEC3,
+            "1 0 100 ABCD CPNMU A",
+        )
+        self.assertEqual(rdata.to_text(), "1 0 100 abcd cpnmu A")
+
+    def test_NSEC3_bitmap_trailing_zero_octet(self):
+        # RFC 4034 Sec 4.1.2: a window's bitmap must not carry trailing zero
+        # octets, and a window with no types present must not appear.  The wire
+        # parser used to accept both and keep the non-canonical bytes; check
+        # that they are now FormErrors.  The prefix here is a valid NSEC3 with a
+        # single type ("A") whose bitmap is the last three octets, 00 01 40.
+        rdata = dns.rdata.from_text(
+            dns.rdataclass.IN,
+            dns.rdatatype.NSEC3,
+            "1 0 100 ABCD SCBCQHKU35969L2A68P3AD59LHF30715 A",
+        )
+        prefix = bytes(rdata.to_wire())[:-3]
+        # window 0, length 2, bitmap 40 00: a trailing zero octet.
+        trailing = prefix + bytes([0, 2, 0x40, 0])
+        with self.assertRaises(dns.exception.FormError):
+            dns.rdata.from_wire("IN", "NSEC3", trailing, 0, len(trailing))
+        # window 0, length 1, bitmap 00: a block with no types present.
+        empty = prefix + bytes([0, 1, 0])
+        with self.assertRaises(dns.exception.FormError):
+            dns.rdata.from_wire("IN", "NSEC3", empty, 0, len(empty))
+
+    def test_NSEC3_empty_next(self):
+        # RFC 5155 Sec 3.1.6: the hash length is 1 to 255 octets.  An empty
+        # Next Hashed Owner Name was accepted from wire, and to_text() wrote it
+        # as an empty field, so reading the text back took the first type
+        # mnemonic as the hash: types NS SOA came back as next "ns", type SOA.
+        wire = bytes([1, 0, 0, 0, 0, 0, 0, 1, 0x22])
+        with self.assertRaises(dns.exception.FormError):
+            dns.rdata.from_wire("IN", "NSEC3", wire, 0, len(wire))
+        with self.assertRaises(ValueError):
+            dns.rdtypes.ANY.NSEC3.NSEC3(
+                dns.rdataclass.IN, dns.rdatatype.NSEC3, 1, 0, 0, b"", b"", []
+            )
+
+
+if __name__ == "__main__":
+    unittest.main()
