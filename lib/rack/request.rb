@@ -4,6 +4,7 @@ require_relative 'constants'
 require_relative 'utils'
 require_relative 'media_type'
 require_relative 'multipart'
+require_relative 'proxy_resolution'
 
 module Rack
   # Rack::Request provides a convenient interface to a Rack
@@ -61,7 +62,7 @@ module Rack
 
     def initialize(env)
       @env = env
-      @ip = @params = @headers = @query_parser = nil
+      @ip = @params = @headers = @query_parser = @proxy_resolution = nil
     end
 
     def ip
@@ -530,6 +531,25 @@ module Rack
         remote_addresses.first
       end
 
+      # Resolve the origin and client address of the request, interpreting
+      # any +Forwarded+ and +X-Forwarded-*+ headers hop by hop, starting
+      # from the address of the direct client connection.
+      #
+      # Forwarding headers are only considered if the application instance
+      # has an explicit trusted proxy policy configured via
+      # <tt>rack.request.config</tt> (key <tt>:trusted_proxy</tt>), and the
+      # direct peer is trusted by that policy. Untrusted inbound headers
+      # never affect the interpretation of the request. The process-global
+      # Rack::Request.ip_filter default is deliberately not consulted.
+      #
+      # Returns a Rack::ProxyResolution::Result exposing the adopted
+      # origin, the adopted client address, the trusted hops that were
+      # walked, and a list of discarded forwarding information with
+      # reasons. Parsing is purely syntactic; no DNS queries are made.
+      def proxy_resolution
+        @proxy_resolution ||= build_proxy_resolution
+      end
+
       # The media type (type/subtype) portion of the CONTENT_TYPE header
       # without any media type parameters. e.g., when CONTENT_TYPE is
       # "text/plain;charset=utf-8", the media-type is "text/plain".
@@ -757,6 +777,312 @@ module Rack
       end
 
       def default_session; {}; end
+
+      # The forwarding headers interpreted by #proxy_resolution, as
+      # (environment key, header name) pairs.
+      PROXY_FORWARDING_HEADERS = {
+        HTTP_FORWARDED => 'Forwarded',
+        HTTP_X_FORWARDED_FOR => 'X-Forwarded-For',
+        HTTP_X_FORWARDED_HOST => 'X-Forwarded-Host',
+        HTTP_X_FORWARDED_PROTO => 'X-Forwarded-Proto',
+        HTTP_X_FORWARDED_SCHEME => 'X-Forwarded-Scheme',
+        HTTP_X_FORWARDED_PORT => 'X-Forwarded-Port',
+        HTTP_X_FORWARDED_SSL => 'X-Forwarded-SSL',
+      }.freeze
+      private_constant :PROXY_FORWARDING_HEADERS
+
+      # Interpret the forwarding headers hop by hop, starting from the
+      # direct client connection, and build a
+      # Rack::ProxyResolution::Result. See #proxy_resolution.
+      def build_proxy_resolution
+        discards = []
+
+        # The direct connection is the first hop:
+        peer = proxy_node_identifier(split_header(get_header('REMOTE_ADDR')).last)
+
+        # The trusted proxy policy must be configured explicitly for the
+        # application instance. The process-global default judgment
+        # function (Rack::Request.ip_filter) is deliberately not
+        # consulted here.
+        trust = proxy_trust_policy
+
+        unless peer && trust&.call(peer)
+          # The peer is not trusted, so all inbound forwarding headers
+          # are untrusted and must not affect the interpretation of the
+          # request:
+          discard_forwarding_headers(discards, :untrusted_peer)
+          return proxy_resolution_result(nil, nil, peer, peer ? [peer] : [], discards, false)
+        end
+
+        forwarded = parse_forwarded_set(discards)
+        x_forwarded = parse_x_forwarded_set(discards)
+
+        if forwarded && x_forwarded
+          forwarded_client, forwarded_hops, forwarded_unverified = walk_proxy_chain(forwarded[:chain], trust)
+          x_forwarded_client, x_forwarded_hops, x_forwarded_unverified = walk_proxy_chain(x_forwarded[:chain], trust)
+
+          if proxy_sets_conflict?(forwarded, forwarded_client, x_forwarded, x_forwarded_client)
+            # The two header families disagree. Adopting either one
+            # arbitrarily would allow header spoofing, so both are
+            # discarded and the direct connection values are used:
+            discards << ProxyResolution::Discard.new(header: 'Forwarded', value: forwarded[:value], reason: :conflicting_headers)
+            discards << ProxyResolution::Discard.new(header: 'X-Forwarded-*', value: x_forwarded[:value], reason: :conflicting_headers)
+            return proxy_resolution_result(nil, nil, peer, [peer], discards, true)
+          end
+
+          # The families agree; merge them, preferring the standard
+          # +Forwarded+ header for any component both provide:
+          set = forwarded
+          set[:scheme] ||= x_forwarded[:scheme]
+          set[:authority] ||= x_forwarded[:authority]
+          set[:port] ||= x_forwarded[:port]
+          if set[:chain].empty?
+            set[:chain] = x_forwarded[:chain]
+            client, hops, unverified = x_forwarded_client, x_forwarded_hops, x_forwarded_unverified
+          else
+            client, hops, unverified = forwarded_client, forwarded_hops, forwarded_unverified
+          end
+        elsif set = forwarded || x_forwarded
+          client, hops, unverified = walk_proxy_chain(set[:chain], trust)
+        else
+          return proxy_resolution_result(nil, nil, peer, [peer], discards, true)
+        end
+
+        if unverified && !unverified.empty?
+          discards << ProxyResolution::Discard.new(header: set[:header], value: unverified.join(', '), reason: :unverified_hops)
+        end
+
+        proxy_resolution_result(set[:scheme], set[:authority], client, [peer, *hops], discards, true, set[:port])
+      end
+
+      # The explicitly configured trusted proxy policy for this
+      # application instance, as a callable, or nil if no explicit
+      # policy is configured (in which case no hop is trusted).
+      def proxy_trust_policy
+        case policy = config_value(:trusted_proxy)
+        when nil
+          nil
+        when true, false
+          lambda { |_address| policy }
+        else
+          lambda { |address| policy.call(address) }
+        end
+      end
+
+      # Record all present forwarding headers as discarded.
+      def discard_forwarding_headers(discards, reason)
+        PROXY_FORWARDING_HEADERS.each do |key, header|
+          if value = get_header(key)
+            discards << ProxyResolution::Discard.new(header: header, value: value, reason: reason)
+          end
+        end
+      end
+
+      # Parse the RFC 7239 +Forwarded+ header, including quoted-string
+      # escaping, bracketed IPv6 addresses, ports, and multi-element
+      # values. Returns nil if the header is absent or unparsable.
+      def parse_forwarded_set(discards)
+        return nil unless header = get_header(HTTP_FORWARDED)
+
+        unless values = Utils.forwarded_values(header)
+          discards << ProxyResolution::Discard.new(header: 'Forwarded', value: header, reason: :invalid_syntax)
+          return nil
+        end
+
+        set = {header: 'Forwarded', value: header, chain: [], scheme: nil, authority: nil, port: nil}
+
+        if chain = values[:for]
+          if chain.any?{|node| node.strip.empty?}
+            # A node identifier cannot be empty per RFC 7239:
+            discards << ProxyResolution::Discard.new(header: 'Forwarded', value: header, reason: :invalid_syntax)
+            return nil
+          end
+          set[:chain] = chain
+        end
+
+        if protos = values[:proto]
+          if scheme = allowed_scheme(protos.last)
+            set[:scheme] = scheme
+          else
+            discards << ProxyResolution::Discard.new(header: 'Forwarded', value: "proto=#{protos.last}", reason: :disallowed_scheme)
+          end
+        end
+
+        if hosts = values[:host]
+          authority = hosts.last
+          if split_authority(authority).empty?
+            discards << ProxyResolution::Discard.new(header: 'Forwarded', value: "host=#{authority}", reason: :invalid_syntax)
+          else
+            set[:authority] = authority
+          end
+        end
+
+        set
+      end
+
+      # Parse the de-facto +X-Forwarded-*+ headers, including bracketed
+      # (and unbracketed) IPv6 addresses, ports, and multi-element
+      # values. Returns nil if none of the headers are present.
+      def parse_x_forwarded_set(discards)
+        set = {header: 'X-Forwarded-*', value: nil, chain: [], scheme: nil, authority: nil, port: nil}
+        present = []
+
+        if value = get_header(HTTP_X_FORWARDED_FOR)
+          present << "X-Forwarded-For: #{value}"
+          set[:chain] = split_header(value)
+        end
+
+        x_forwarded_proto_priority.each do |type|
+          next unless key = FORWARDED_SCHEME_HEADERS[type]
+          next unless value = get_header(key)
+
+          present << "#{PROXY_FORWARDING_HEADERS[key]}: #{value}"
+
+          if type == :ssl
+            if value == 'on'
+              set[:scheme] = 'https'
+              break
+            end
+          else
+            split_header(value).reverse_each do |scheme|
+              if allowed_scheme(scheme)
+                set[:scheme] = scheme
+                break
+              else
+                discards << ProxyResolution::Discard.new(header: PROXY_FORWARDING_HEADERS[key], value: scheme, reason: :disallowed_scheme)
+              end
+            end
+            break if set[:scheme]
+          end
+        end
+
+        if value = get_header(HTTP_X_FORWARDED_HOST)
+          present << "X-Forwarded-Host: #{value}"
+          if host = split_header(value).last
+            authority = wrap_ipv6(host)
+            if split_authority(authority).empty?
+              discards << ProxyResolution::Discard.new(header: 'X-Forwarded-Host', value: host, reason: :invalid_syntax)
+            else
+              set[:authority] = authority
+            end
+          end
+        end
+
+        if value = get_header(HTTP_X_FORWARDED_PORT)
+          present << "X-Forwarded-Port: #{value}"
+          if port = split_header(value).last
+            if /\A\d+\z/.match?(port)
+              set[:port] = port.to_i
+            else
+              discards << ProxyResolution::Discard.new(header: 'X-Forwarded-Port', value: port, reason: :invalid_syntax)
+            end
+          end
+        end
+
+        return nil if present.empty?
+
+        set[:value] = present.join(', ')
+        set
+      end
+
+      # Walk a chain of forwarded nodes hop by hop, from the hop
+      # closest to the server outwards. Trusted entries are proxy hops;
+      # the first untrusted entry is the adopted client. Entries beyond
+      # the client are client-supplied and cannot be verified.
+      #
+      # Returns the adopted client node, the trusted hops (closest
+      # first), and any unverified entries beyond the client.
+      def walk_proxy_chain(chain, trust)
+        hops = []
+        index = chain.length - 1
+
+        while index >= 0
+          address = proxy_node_identifier(chain[index])
+          break unless address && trust.call(address)
+          hops << address
+          index -= 1
+        end
+
+        if index < 0
+          # Every entry is trusted; the leftmost entry is the closest
+          # to the client we can adopt:
+          client = chain.first
+          hops.pop
+          unverified = nil
+        else
+          client = chain[index]
+          unverified = chain[0...index]
+        end
+
+        [client, hops, unverified]
+      end
+
+      # Whether the parsed +Forwarded+ and +X-Forwarded-*+ header
+      # families disagree about any value both provide.
+      def proxy_sets_conflict?(forwarded, forwarded_client, x_forwarded, x_forwarded_client)
+        if !forwarded[:chain].empty? && !x_forwarded[:chain].empty?
+          unless proxy_node_identifier(forwarded_client) == proxy_node_identifier(x_forwarded_client)
+            return true
+          end
+        end
+
+        if forwarded[:scheme] && x_forwarded[:scheme] && forwarded[:scheme] != x_forwarded[:scheme]
+          return true
+        end
+
+        if forwarded[:authority] && x_forwarded[:authority]
+          return true unless proxy_authority_key(forwarded) == proxy_authority_key(x_forwarded)
+        end
+
+        false
+      end
+
+      # A comparable key for an adopted authority: the downcased host
+      # and the effective port.
+      def proxy_authority_key(set)
+        _host, address, port = split_authority(set[:authority])
+        port ||= set[:port]
+        port ||= DEFAULT_PORTS[set[:scheme]] if set[:scheme]
+        [address&.downcase, port]
+      end
+
+      # The identifying address of a forwarded node: the address part
+      # of the node, without brackets or port, or the node itself if
+      # it does not parse as an authority. Never resolves names; no
+      # DNS queries are performed.
+      def proxy_node_identifier(node)
+        return nil if node.nil?
+        split_authority(wrap_ipv6(node.strip))[1] || node.strip
+      end
+
+      # Build the resolution result, falling back to the direct
+      # connection values for anything not adopted from forwarding
+      # headers.
+      def proxy_resolution_result(scheme, authority, client, hops, discards, trusted, port_override = nil)
+        scheme ||= get_header(HTTPS) == 'on' ? 'https' : get_header(RACK_URL_SCHEME)
+        authority ||= host_authority || server_authority
+
+        # Proxies sometimes record the address of their own peer, which
+        # duplicates the previous hop; collapse consecutive duplicates:
+        hops = hops.each_with_object([]) do |hop, unique|
+          unique << hop unless unique.last == hop
+        end
+
+        host = port = nil
+        if authority
+          _bracketed, host, port = split_authority(authority)
+        end
+        port ||= port_override
+
+        ProxyResolution::Result.new(
+          origin: ProxyResolution::Origin.new(scheme: scheme, host: host, port: port),
+          client_address: proxy_node_identifier(client) || hops.first,
+          hops: hops,
+          discards: discards,
+          trusted: trusted,
+        )
+      end
+
 
       # Assist with compatibility when processing `X-Forwarded-For`.
       def wrap_ipv6(host)

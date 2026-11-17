@@ -41,6 +41,7 @@ module Rack
   autoload :MockResponse, "rack/mock_response"
   autoload :Multipart, "rack/multipart"
   autoload :NullLogger, "rack/null_logger"
+  autoload :ProxyResolution, "rack/proxy_resolution"
   autoload :QueryParser, "rack/query_parser"
   autoload :Recursive, "rack/recursive"
   autoload :Reloader, "rack/reloader"
