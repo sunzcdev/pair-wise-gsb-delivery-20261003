@@ -117,6 +117,13 @@ def _bake_output(registry, accept_header, accept_encoding_header, params, disabl
     """Bake output for metrics output."""
     # Choose the correct plain text format of the output.
     encoder, content_type = choose_encoder(accept_header)
+    if encoder is None:
+        # The client explicitly excluded every format this exporter serves.
+        # Answer clearly instead of sending a format the client refused.
+        body = (b'406 Not Acceptable: the Accept header excludes every format '
+                b'this exporter can serve (text/plain versions 0.0.4 and 1.0.0, '
+                b'application/openmetrics-text versions 1.0.0 and 2.0.0).\n')
+        return '406 Not Acceptable', [('Content-Type', 'text/plain; charset=utf-8')], body
     if 'name[]' in params:
         registry = registry.restricted_registry(params['name[]'])
     output = encoder(registry)
@@ -358,83 +365,218 @@ def generate_latest(registry: Collector = REGISTRY, escaping: str = openmetrics.
     return ''.join(output).encode('utf-8')
 
 
-def choose_encoder(accept_header: str) -> Tuple[Callable[[Collector], bytes], str]:
-    # Python client library accepts a narrower range of content-types than
-    # Prometheus does.
-    accept_header = accept_header or ''
-    escaping = openmetrics.UNDERSCORES
-    for accepted in accept_header.split(','):
-        if accepted.split(';')[0].strip() == 'application/openmetrics-text':
-            toks = accepted.split(';')
-            version = _get_version(toks)
-            escaping = _get_escaping(toks)
-            # Only return an escaping header if we have a good version and
-            # mimetype.
-            if not version:
-                return (partial(openmetrics.generate_latest, escaping=openmetrics.UNDERSCORES, version="1.0.0"), openmetrics.CONTENT_TYPE_LATEST)
-            if version and _version_at_least(version, (1, 0, 0)):
-                return (partial(openmetrics.generate_latest, escaping=escaping, version=version),
-                        f'application/openmetrics-text; version={version}; charset=utf-8; escaping=' + str(escaping))
-        elif accepted.split(';')[0].strip() == 'text/plain':
-            toks = accepted.split(';')
-            version = _get_version(toks)
-            escaping = _get_escaping(toks)
-            # Only return an escaping header if we have a good version and
-            # mimetype.
-            if version and _version_at_least(version, (1, 0, 0)):
-                return (partial(generate_latest, escaping=escaping),
-                        CONTENT_TYPE_LATEST + '; escaping=' + str(escaping))
+# Versions of each exposition format this exporter can actually serve.
+# Unknown versions must never be claimed in a response Content-Type.
+_OPENMETRICS_VERSIONS = {
+    (1, 0, 0): '1.0.0',
+    (2, 0, 0): '2.0.0',
+}
+_PLAIN_VERSIONS = {
+    (0, 0, 4): '0.0.4',
+    (1, 0, 0): '1.0.0',
+}
+_ESCAPING_SCHEMES = (
+    openmetrics.ALLOWUTF8,
+    openmetrics.UNDERSCORES,
+    openmetrics.DOTS,
+    openmetrics.VALUES,
+)
+
+
+def choose_encoder(accept_header: Optional[str]) -> Tuple[Optional[Callable[[Collector], bytes]], Optional[str]]:
+    """Choose an encoder and Content-Type for the given Accept header.
+
+    The header is evaluated as a list of weighted candidates: each item's
+    q-value, version and escaping parameters decide which concrete output
+    format it refers to, not just its media type string. Items with q=0
+    explicitly exclude the formats they match, and malformed items (bad
+    q-value, unknown version, ...) are ignored so they cannot override
+    later, well-formed candidates. Between items of equal weight the more
+    specific one wins, with remaining ties broken by header order, so the
+    choice is stable.
+
+    Returns (None, None) when the header excludes every format this
+    exporter can serve, so callers can answer 406 Not Acceptable. When the
+    header is absent or mentions nothing we serve, the default Prometheus
+    text format is used, unless it was explicitly excluded.
+    """
+    candidates = []
+    exclusions = []
+    for index, (media_type, params, quality) in enumerate(_parse_accept_header(accept_header)):
+        specificity = _accept_specificity(media_type, params)
+        if quality <= 0:
+            # q=0 explicitly excludes everything this item matches.
+            exclusions.append((media_type, params.get('version'), specificity))
+            continue
+        offer = _resolve_offer(media_type, params)
+        if offer is None:
+            continue
+        concrete_type, concrete_version, encoder, content_type = offer
+        candidates.append((quality, specificity, -index, concrete_type, concrete_version, encoder, content_type))
+
+    # Highest weight first; ties go to the more specific item, then to the
+    # earliest item in the header, so the choice is deterministic.
+    candidates.sort(key=lambda candidate: (candidate[0], candidate[1], candidate[2]), reverse=True)
+    for _, specificity, _neg_index, media_type, version, encoder, content_type in candidates:
+        if _is_excluded(exclusions, media_type, version, specificity):
+            continue
+        return encoder, content_type
+
+    # Nothing acceptable was explicitly requested. Fall back to the default
+    # format (text/plain 0.0.4) unless it, too, was explicitly excluded.
+    if _is_excluded(exclusions, 'text/plain', '0.0.4', 0):
+        return None, None
     return generate_latest, CONTENT_TYPE_PLAIN_0_0_4
 
 
-def _version_at_least(version: str, minimum: Tuple[int, ...]) -> bool:
-    """Compare a version parameter from the Accept header.
+def _parse_accept_header(accept_header: Optional[str]) -> List[Tuple[str, Dict[str, str], float]]:
+    """Parse an Accept header into (media_type, params, quality) entries.
+
+    Items without a media type or with an unparsable or out-of-range
+    q-value are dropped, so a malformed item never overrides later,
+    well-formed candidates."""
+    entries = []
+    for raw_item in (accept_header or '').split(','):
+        tokens = raw_item.split(';')
+        media_type = tokens[0].strip().lower()
+        if '/' not in media_type:
+            continue
+        params: Dict[str, str] = {}
+        quality = 1.0
+        valid = True
+        for token in tokens[1:]:
+            key, sep, value = token.partition('=')
+            if not sep:
+                continue
+            key = key.strip().lower()
+            value = value.strip()
+            if key == 'q':
+                try:
+                    quality = float(value)
+                except ValueError:
+                    valid = False
+                    break
+                if not 0 <= quality <= 1:
+                    valid = False
+                    break
+            else:
+                params[key] = value
+        if valid:
+            entries.append((media_type, params, quality))
+    return entries
+
+
+def _accept_specificity(media_type: str, params: Dict[str, str]) -> int:
+    """Specificity of an Accept item.
+
+    Exact media types beat wildcards, and a version parameter makes an item
+    more specific than a bare media type."""
+    if media_type == '*/*':
+        return 0
+    if media_type.endswith('/*'):
+        return 1
+    return 3 if 'version' in params else 2
+
+
+def _resolve_offer(media_type: str, params: Dict[str, str]) -> Optional[Tuple[str, str, Callable[[Collector], bytes], str]]:
+    """Map a single Accept item to a concrete offer.
+
+    Returns (media_type, version, encoder, content_type) for items naming a
+    format this exporter actually serves, else None. Unknown or malformed
+    versions never resolve, so they cannot claim support."""
+    if media_type == 'application/openmetrics-text':
+        return _openmetrics_offer(params)
+    if media_type == 'application/*':
+        return _openmetrics_offer({})
+    if media_type == 'text/plain':
+        return _plain_offer(params)
+    if media_type in ('text/*', '*/*'):
+        return _plain_offer({})
+    return None
+
+
+def _openmetrics_offer(params: Dict[str, str]) -> Tuple[str, str, Callable[[Collector], bytes], str]:
+    version = params.get('version')
+    if version is None:
+        # No version requested: serve 1.0.0 with default escaping. The
+        # Content-Type does not claim an escaping parameter here.
+        return (
+            'application/openmetrics-text',
+            '1.0.0',
+            partial(openmetrics.generate_latest, escaping=openmetrics.UNDERSCORES, version='1.0.0'),
+            openmetrics.CONTENT_TYPE_LATEST,
+        )
+    canonical = _supported_version(version, _OPENMETRICS_VERSIONS)
+    if canonical is None:
+        return None
+    escaping = _supported_escaping(params.get('escaping'))
+    return (
+        'application/openmetrics-text',
+        canonical,
+        partial(openmetrics.generate_latest, escaping=escaping, version=canonical),
+        f'application/openmetrics-text; version={canonical}; charset=utf-8; escaping={escaping}',
+    )
+
+
+def _plain_offer(params: Dict[str, str]) -> Tuple[str, str, Callable[[Collector], bytes], str]:
+    version = params.get('version')
+    if version is None:
+        return 'text/plain', '0.0.4', generate_latest, CONTENT_TYPE_PLAIN_0_0_4
+    canonical = _supported_version(version, _PLAIN_VERSIONS)
+    if canonical is None:
+        return None
+    if canonical == '0.0.4':
+        # The 0.0.4 format has no escaping parameter.
+        return 'text/plain', '0.0.4', generate_latest, CONTENT_TYPE_PLAIN_0_0_4
+    escaping = _supported_escaping(params.get('escaping'))
+    return (
+        'text/plain',
+        canonical,
+        partial(generate_latest, escaping=escaping),
+        CONTENT_TYPE_PLAIN_1_0_0 + '; escaping=' + escaping,
+    )
+
+
+def _supported_version(value: str, known_versions: Dict[Tuple[int, ...], str]) -> Optional[str]:
+    """Return the canonical string for a supported version, else None.
 
     A version with a non-numeric part, such as 1.0.0-rc.1 or a quoted
-    value, is treated as unsupported."""
-    parsed = parse_version(version)
+    value, is never treated as supported."""
+    parsed = parse_version(value)
     if not all(isinstance(part, int) for part in parsed):
-        return False
-    return parsed >= minimum
+        return None
+    return known_versions.get(parsed)
 
 
-def _get_version(accept_header: List[str]) -> str:
-    """Return the version tag from the Accept header.
-
-    If no version is specified, returns empty string."""
-
-    for tok in accept_header:
-        if '=' not in tok:
-            continue
-        key, value = tok.strip().split('=', 1)
-        if key == 'version':
-            return value
-    return ""
-
-
-def _get_escaping(accept_header: List[str]) -> str:
-    """Return the escaping scheme from the Accept header.
-
-    If no escaping scheme is specified or the scheme is not one of the allowed
-    strings, defaults to UNDERSCORES."""
-
-    for tok in accept_header:
-        if '=' not in tok:
-            continue
-        key, value = tok.strip().split('=', 1)
-        if key != 'escaping':
-            continue
-        if value == openmetrics.ALLOWUTF8:
-            return openmetrics.ALLOWUTF8
-        elif value == openmetrics.UNDERSCORES:
-            return openmetrics.UNDERSCORES
-        elif value == openmetrics.DOTS:
-            return openmetrics.DOTS
-        elif value == openmetrics.VALUES:
-            return openmetrics.VALUES
-        else:
-            return openmetrics.UNDERSCORES
+def _supported_escaping(value: Optional[str]) -> str:
+    """Return the requested escaping scheme, defaulting to underscores."""
+    if value in _ESCAPING_SCHEMES:
+        return value
     return openmetrics.UNDERSCORES
+
+
+def _is_excluded(exclusions: List[Tuple[str, Optional[str], int]], media_type: str, version: Optional[str], specificity: int) -> bool:
+    """Check whether a concrete offer is covered by a q=0 exclusion.
+
+    An exclusion only overrides candidates that are no more specific than
+    the exclusion itself: a bare ``*/*;q=0`` cannot veto an explicitly
+    requested type, while ``text/plain;q=0`` vetoes a ``text/*`` candidate.
+    A version parameter on the exclusion narrows it to that version."""
+    for excluded_type, excluded_version, excluded_specificity in exclusions:
+        if excluded_specificity < specificity:
+            continue
+        if excluded_type == '*/*':
+            type_matches = True
+        elif excluded_type.endswith('/*'):
+            type_matches = media_type.startswith(excluded_type[:-1])
+        else:
+            type_matches = excluded_type == media_type
+        if not type_matches:
+            continue
+        if excluded_version is not None and excluded_version != version:
+            continue
+        return True
+    return False
 
 
 def gzip_accepted(accept_encoding_header: str) -> bool:

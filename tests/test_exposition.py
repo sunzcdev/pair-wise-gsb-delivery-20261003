@@ -675,6 +675,99 @@ class TestChooseEncoder(unittest.TestCase):
                 self.assert_is_escaped(exp)
                 self.assert_is_prom(exp)
 
+    def test_unknown_version_not_claimed(self):
+        # Versions this exporter does not support must not appear in the
+        # response Content-Type; the default format is used instead.
+        for accept_header in (
+            'application/openmetrics-text; version=3.0.0',
+            'application/openmetrics-text; version=1.5.0',
+            'text/plain; version=2.0.0',
+            'text/plain; version=0.0.5',
+        ):
+            with self.subTest(accept_header=accept_header):
+                generator, content_type = choose_encoder(accept_header)
+                assert content_type == CONTENT_TYPE_PLAIN_0_0_4
+                exp = generator(self.registry).decode('utf-8')
+                self.assert_is_escaped(exp)
+                self.assert_is_prom(exp)
+
+    def test_openmetrics_2_0_0(self):
+        generator, content_type = choose_encoder('application/openmetrics-text; version=2.0.0')
+        assert content_type == 'application/openmetrics-text; version=2.0.0; charset=utf-8; escaping=underscores'
+        exp = generator(self.registry).decode('utf-8')
+        self.assert_is_openmetrics(exp)
+
+    def test_quality_weighting(self):
+        # The higher weighted candidate wins even when listed later.
+        generator, content_type = choose_encoder(
+            'text/plain; version=1.0.0; q=0.5, application/openmetrics-text; version=1.0.0; q=0.9')
+        assert content_type == 'application/openmetrics-text; version=1.0.0; charset=utf-8; escaping=underscores'
+        self.assert_is_openmetrics(generator(self.registry).decode('utf-8'))
+        # And the reverse order/weights picks text/plain 1.0.0.
+        generator, content_type = choose_encoder(
+            'application/openmetrics-text; version=1.0.0; q=0.3, text/plain; version=1.0.0; q=0.8')
+        assert content_type == CONTENT_TYPE_PLAIN_1_0_0 + '; escaping=underscores'
+        self.assert_is_prom(generator(self.registry).decode('utf-8'))
+
+    def test_equal_weight_prefers_more_specific(self):
+        # Equal q-values: the item with an explicit version is more specific
+        # and wins, regardless of header order.
+        for accept_header in (
+            'application/openmetrics-text, application/openmetrics-text; version=1.0.0',
+            'application/openmetrics-text; version=1.0.0, application/openmetrics-text',
+        ):
+            with self.subTest(accept_header=accept_header):
+                _, content_type = choose_encoder(accept_header)
+                assert content_type == 'application/openmetrics-text; version=1.0.0; charset=utf-8; escaping=underscores'
+
+    def test_invalid_item_does_not_override_valid_candidate(self):
+        # An unknown version must not shadow a later valid candidate.
+        generator, content_type = choose_encoder(
+            'application/openmetrics-text; version=9.9.9, text/plain; version=1.0.0')
+        assert content_type == CONTENT_TYPE_PLAIN_1_0_0 + '; escaping=underscores'
+        self.assert_is_prom(generator(self.registry).decode('utf-8'))
+        # Neither must a malformed q-value.
+        generator, content_type = choose_encoder(
+            'text/plain; q=bogus, application/openmetrics-text; version=1.0.0')
+        assert content_type == 'application/openmetrics-text; version=1.0.0; charset=utf-8; escaping=underscores'
+        self.assert_is_openmetrics(generator(self.registry).decode('utf-8'))
+
+    def test_q_zero_excludes(self):
+        # q=0 excludes only the formats it names; others remain usable.
+        generator, content_type = choose_encoder('application/openmetrics-text; q=0, text/plain; version=1.0.0')
+        assert content_type == CONTENT_TYPE_PLAIN_1_0_0 + '; escaping=underscores'
+        self.assert_is_prom(generator(self.registry).decode('utf-8'))
+
+    def test_q_zero_excludes_everything(self):
+        # When every servable format is excluded there is nothing to send.
+        for accept_header in (
+            '*/*; q=0',
+            'text/plain; q=0',
+            'text/*; q=0',
+            'application/openmetrics-text; q=0, text/plain; q=0',
+            'text/*; q=0.5, text/plain; q=0',
+        ):
+            with self.subTest(accept_header=accept_header):
+                generator, content_type = choose_encoder(accept_header)
+                assert generator is None
+                assert content_type is None
+
+    def test_wildcard_q_zero_does_not_veto_explicit_type(self):
+        # A specific q>0 item is more specific than a wildcard exclusion.
+        generator, content_type = choose_encoder('*/*; q=0, application/openmetrics-text; version=1.0.0; q=0.5')
+        assert content_type == 'application/openmetrics-text; version=1.0.0; charset=utf-8; escaping=underscores'
+        self.assert_is_openmetrics(generator(self.registry).decode('utf-8'))
+
+    def test_no_acceptable_format_response(self):
+        from prometheus_client.exposition import _bake_output
+        status, headers, output = _bake_output(self.registry, '*/*; q=0', None, {}, False)
+        assert status == '406 Not Acceptable'
+        assert output
+        # Excluding only some formats still serves an acceptable one.
+        status, headers, output = _bake_output(self.registry, 'application/openmetrics-text; q=0', None, {}, False)
+        assert status == '200 OK'
+        assert ('Content-Type', CONTENT_TYPE_PLAIN_0_0_4) in headers
+
 
 class TestWsgiTLS(unittest.TestCase):
     def setUp(self):
