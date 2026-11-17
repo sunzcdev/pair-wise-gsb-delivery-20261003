@@ -259,4 +259,214 @@ describe Rack::URLMap do
       Rack::URLMap.new("a/" => lambda { |env| })
     end.must_raise ArgumentError
   end
+
+  it "keep the old mapping when remap fails validation" do
+    app = lambda { |env| [200, {'content-type' => 'text/plain'}, ["ok"]] }
+    urlmap = Rack::URLMap.new("/foo" => app)
+
+    # A valid request works before the failed remap.
+    res = Rack::MockRequest.new(urlmap).get("/foo")
+    res.must_be :ok?
+
+    lambda do
+      urlmap.remap("invalid-location" => app)
+    end.must_raise ArgumentError
+
+    # The old mapping is still fully functional.
+    res = Rack::MockRequest.new(urlmap).get("/foo")
+    res.must_be :ok?
+
+    # The new, invalid mapping was not installed.
+    res = Rack::MockRequest.new(urlmap).get("/")
+    res.must_be :not_found?
+  end
+
+  it "swap the whole routing table atomically with remap" do
+    old_app = lambda { |env| [200, {'content-type' => 'text/plain', 'x-app' => 'old'}, [""]] }
+    new_app = lambda { |env| [200, {'content-type' => 'text/plain', 'x-app' => 'new'}, [""]] }
+
+    urlmap = Rack::URLMap.new("/old" => old_app)
+
+    res = Rack::MockRequest.new(urlmap).get("/old")
+    res.must_be :ok?
+    res["x-app"].must_equal "old"
+
+    urlmap.remap("/new" => new_app)
+
+    res = Rack::MockRequest.new(urlmap).get("/old")
+    res.must_be :not_found?
+
+    res = Rack::MockRequest.new(urlmap).get("/new")
+    res.must_be :ok?
+    res["x-app"].must_equal "new"
+  end
+
+  it "dispatch a request against the mapping snapshot it started with" do
+    outer = nil
+    swapped = false
+    swapping_inner_app = lambda { |env|
+      unless swapped
+        # Remap the outer URLMap while an outer request is still in
+        # flight (its ensure/restore has not run yet).
+        outer.remap("/" => lambda { |inner_env|
+          [200, {'content-type' => 'text/plain', 'x-app' => 'new'}, [""]]
+        })
+        swapped = true
+      end
+      [200, {'content-type' => 'text/plain', 'x-app' => 'old'}, [""]]
+    }
+
+    inner = Rack::URLMap.new("/bar" => swapping_inner_app)
+    outer = Rack::URLMap.new("/foo" => inner)
+
+    # The in-flight outer request completes against the snapshot it
+    # started matching with, even though #remap ran during the dispatch.
+    res = Rack::MockRequest.new(outer).get("/foo/bar")
+    res.must_be :ok?
+    res["x-app"].must_equal "old"
+
+    # The next request sees the new table: it is routed to the new root
+    # app instead of the old nested /foo/bar route.
+    res = Rack::MockRequest.new(outer).get("/foo/bar")
+    res.must_be :ok?
+    res["x-app"].must_equal "new"
+
+    res = Rack::MockRequest.new(outer).get("/")
+    res.must_be :ok?
+    res["x-app"].must_equal "new"
+  end
+
+  it "match hosts case-insensitively for the known-hosts fallback as well" do
+    app = lambda { |env|
+      [200, {
+        "content-type" => "text/plain",
+        "x-host" => env["HTTP_HOST"] || env["SERVER_NAME"]
+      }, [""]]
+    }
+    map = Rack::Lint.new(Rack::URLMap.new(
+      "http://example.org/foo" => app,
+      "/" => app
+    ))
+
+    # An uppercase variant of a known host must not be treated as
+    # unknown, otherwise it would wrongly fall back to the hostless app.
+    res = Rack::MockRequest.new(map).get("/foo", "HTTP_HOST" => "EXAMPLE.ORG")
+    res.must_be :ok?
+    res["x-host"].must_equal "EXAMPLE.ORG"
+  end
+
+  it "ignore default ports when matching hosts" do
+    app = lambda { |env|
+      [200, {
+        "content-type" => "text/plain",
+        "x-position" => "example",
+        "x-host" => env["HTTP_HOST"] || env["SERVER_NAME"]
+      }, [""]]
+    }
+    fallback = lambda { |env|
+      [200, { "content-type" => "text/plain", "x-position" => "fallback" }, [""]]
+    }
+    map = Rack::Lint.new(Rack::URLMap.new(
+      "http://example.org/" => app,
+      "https://secure.example.org/" => app,
+      "/" => fallback
+    ))
+
+    res = Rack::MockRequest.new(map).get("/", "HTTP_HOST" => "example.org:80")
+    res.must_be :ok?
+    res["x-position"].must_equal "example"
+
+    res = Rack::MockRequest.new(map).get("/", "HTTP_HOST" => "EXAMPLE.ORG:80")
+    res.must_be :ok?
+    res["x-position"].must_equal "example"
+
+    res = Rack::MockRequest.new(map).get("https://secure.example.org:443/")
+    res.must_be :ok?
+    res["x-position"].must_equal "example"
+
+    # A non-default port is still part of the host identity, so it does
+    # not match the portless mapping.  The host is then treated as
+    # unknown and falls back to the hostless mapping.
+    res = Rack::MockRequest.new(map).get("/", "HTTP_HOST" => "example.org:9292", "SERVER_PORT" => "9292")
+    res.must_be :ok?
+    res["x-position"].must_equal "fallback"
+  end
+
+  it "try longest paths first regardless of insertion order" do
+    long_app  = lambda { |env| [200, { "content-type" => "text/plain", "x-position" => "long" }, [""]] }
+    short_app = lambda { |env| [200, { "content-type" => "text/plain", "x-position" => "short" }, [""]] }
+
+    # Insert the shorter path first; the longer one must still win.
+    map = Rack::Lint.new(Rack::URLMap.new(
+      "/foo" => short_app,
+      "/foo/bar" => long_app
+    ))
+
+    res = Rack::MockRequest.new(map).get("/foo/bar")
+    res.must_be :ok?
+    res["x-position"].must_equal "long"
+
+    res = Rack::MockRequest.new(map).get("/foo/baz")
+    res.must_be :ok?
+    res["x-position"].must_equal "short"
+  end
+
+  it "fall back to hostless mappings only when no mapped host matches" do
+    hosted    = lambda { |env| [200, { "content-type" => "text/plain", "x-position" => "hosted" }, [""]] }
+    hostless  = lambda { |env| [200, { "content-type" => "text/plain", "x-position" => "hostless" }, [""]] }
+
+    map = Rack::Lint.new(Rack::URLMap.new(
+      "http://example.org/" => hosted,
+      "/" => hostless
+    ))
+
+    res = Rack::MockRequest.new(map).get("/", "HTTP_HOST" => "example.org")
+    res.must_be :ok?
+    res["x-position"].must_equal "hosted"
+
+    res = Rack::MockRequest.new(map).get("/", "HTTP_HOST" => "unknown.example.com")
+    res.must_be :ok?
+    res["x-position"].must_equal "hostless"
+  end
+
+  it "restore SCRIPT_NAME and PATH_INFO when an app raises" do
+    env = Rack::MockRequest.env_for(
+      "/foo/bar/baz",
+      "SCRIPT_NAME" => "/bleh"
+    )
+    original_path_info   = env["PATH_INFO"].dup
+    original_script_name = env["SCRIPT_NAME"].dup
+
+    raising_app = lambda { |inner_env| raise "boom" }
+    urlmap = Rack::URLMap.new("/foo/bar" => raising_app)
+
+    lambda { urlmap.call(env) }.must_raise RuntimeError
+
+    env["PATH_INFO"].must_equal original_path_info
+    env["SCRIPT_NAME"].must_equal original_script_name
+  end
+
+  it "restore SCRIPT_NAME and PATH_INFO after a nested dispatch and reuse the env safely" do
+    inner = Rack::URLMap.new("/bar" => lambda { |inner_env|
+      [200,
+       {
+         "content-type" => "text/plain",
+         "x-pathinfo" => inner_env["PATH_INFO"],
+         "x-scriptname" => inner_env["SCRIPT_NAME"]
+       }, [""]]
+    })
+    outer = Rack::Lint.new(Rack::URLMap.new("/foo" => inner))
+
+    res = Rack::MockRequest.new(outer).get("/foo/bar/quux")
+    res.must_be :ok?
+    res["x-pathinfo"].must_equal "/quux"
+    res["x-scriptname"].must_equal "/foo/bar"
+
+    # The second request on a fresh environment must not inherit any
+    # leftover path pieces from the first dispatch.
+    res = Rack::MockRequest.new(outer).get("/foo/bar")
+    res.must_be :ok?
+    res["x-scriptname"].must_equal "/foo/bar"
+    res["x-pathinfo"].must_equal ""
+  end
 end
