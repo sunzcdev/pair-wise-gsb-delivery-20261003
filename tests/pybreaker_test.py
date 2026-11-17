@@ -1352,5 +1352,375 @@ class CircuitBreakerContextManagerTestCase(unittest.TestCase):
         assert breaker.current_state == "closed"
 
 
+class CircuitBreakerFailureRateTestCase(unittest.TestCase):
+    """Tests for the independent failure-rate strategies (count and time
+    windows). These strategies keep their statistics in local, bounded memory
+    and therefore do not rely on the state storage backend.
+    """
+
+    def _suc(self):
+        return True
+
+    def _err(self):
+        raise NotImplementedError
+
+    def test_default_strategy_is_cumulative(self):
+        """The default strategy preserves the cumulative fail_max behavior."""
+        breaker = CircuitBreaker()
+        assert isinstance(breaker.strategy, CumulativeFailuresStrategy)
+        assert breaker.metrics is None
+
+    def test_count_window_does_not_trip_below_min_calls(self):
+        """The circuit must not open before min_calls dependency requests have
+        been observed, no matter how many of them failed.
+        """
+        strategy = CountWindowFailureRateStrategy(failure_rate=0.5, min_calls=5, window_size=10)
+        breaker = CircuitBreaker(strategy=strategy)
+
+        for _ in range(4):
+            with pytest.raises(NotImplementedError):
+                breaker.call(self._err)
+
+        assert breaker.current_state == "closed"
+        assert breaker.metrics == FailureRateMetrics(failures=4, calls=4, rate=1.0, min_calls=5, threshold=0.5)
+
+    def test_count_window_trips_when_rate_reached(self):
+        """Once min_calls is reached, a rate at/above the threshold opens it."""
+        strategy = CountWindowFailureRateStrategy(failure_rate=0.5, min_calls=4, window_size=10)
+        breaker = CircuitBreaker(strategy=strategy)
+
+        with pytest.raises(NotImplementedError):
+            breaker.call(self._err)
+        assert breaker.call(self._suc)
+        with pytest.raises(NotImplementedError):
+            breaker.call(self._err)
+        assert breaker.current_state == "closed"
+
+        # 2 failures out of 4 calls = 0.5, and min_calls=4 is reached.
+        with pytest.raises(CircuitBreakerError):
+            breaker.call(self._err)
+        assert breaker.current_state == "open"
+        assert breaker.metrics.failures == 3
+        assert breaker.metrics.calls == 4
+        assert breaker.metrics.rate == 0.75
+
+    def test_count_window_threshold_requires_rate_not_raw_count(self):
+        """Failures alone do not trip the circuit while the observed rate
+        stays below the configured threshold.
+        """
+        strategy = CountWindowFailureRateStrategy(failure_rate=0.75, min_calls=2, window_size=4)
+        breaker = CircuitBreaker(strategy=strategy)
+
+        with pytest.raises(NotImplementedError):
+            breaker.call(self._err)
+        # Window: [fail] -> rate 1.0, but a single success dilutes it below
+        # the threshold before another failure is recorded.
+        assert breaker.call(self._suc)
+        with pytest.raises(NotImplementedError):
+            breaker.call(self._err)
+        assert breaker.metrics.failures == 2
+        assert breaker.metrics.calls == 3
+        assert breaker.metrics.rate == pytest.approx(2 / 3)
+        assert breaker.current_state == "closed"
+
+    def test_count_window_evicts_oldest_to_denominator(self):
+        """Once the window fills up, the oldest outcomes leave numerator and
+        denominator, and enough successes can bring the rate back down."""
+        strategy = CountWindowFailureRateStrategy(failure_rate=0.5, min_calls=4, window_size=4)
+        breaker = CircuitBreaker(strategy=strategy)
+
+        with pytest.raises(NotImplementedError):
+            breaker.call(self._err)
+        with pytest.raises(NotImplementedError):
+            breaker.call(self._err)
+        assert breaker.call(self._suc)
+        assert breaker.call(self._suc)
+        # Window: [fail, fail, success, success] -> rate 0.5, at the threshold.
+        assert breaker.current_state == "closed"
+
+        # One more success evicts the oldest failure:
+        # window becomes [fail, success, success, success] -> rate 0.25.
+        assert breaker.call(self._suc)
+        assert breaker.metrics.failures == 1
+        assert breaker.metrics.calls == 4
+        assert breaker.metrics.rate == 0.25
+        assert breaker.current_state == "closed"
+
+    def test_count_window_keeps_at_most_window_size_entries(self):
+        """Memory is bounded: the deque never grows past window_size."""
+        strategy = CountWindowFailureRateStrategy(failure_rate=1.0, min_calls=10, window_size=10)
+        breaker = CircuitBreaker(strategy=strategy)
+
+        for _ in range(50):
+            assert breaker.call(self._suc)
+
+        assert len(strategy._samples) == 10
+        assert breaker.metrics.calls == 10
+        assert breaker.metrics.failures == 0
+
+    def test_count_window_recovery_resets_window_on_close(self):
+        """When the circuit closes again after recovery, the window starts
+        empty instead of carrying pre-trip statistics.
+        """
+        strategy = CountWindowFailureRateStrategy(failure_rate=0.5, min_calls=2, window_size=10)
+        breaker = CircuitBreaker(strategy=strategy, reset_timeout=0.1, success_threshold=1)
+
+        with pytest.raises(NotImplementedError):
+            breaker.call(self._err)
+        with pytest.raises(CircuitBreakerError):
+            breaker.call(self._err)
+        assert breaker.current_state == "open"
+
+        sleep(0.2)
+        assert breaker.call(self._suc)
+        assert breaker.current_state == "closed"
+        assert breaker.metrics.calls == 0
+        assert breaker.metrics.failures == 0
+
+    def test_manual_close_resets_window(self):
+        """Manually closing the circuit also clears the statistics window."""
+        strategy = CountWindowFailureRateStrategy(failure_rate=0.5, min_calls=2, window_size=10)
+        breaker = CircuitBreaker(strategy=strategy)
+
+        with pytest.raises(NotImplementedError):
+            breaker.call(self._err)
+        assert breaker.metrics.calls == 1
+
+        breaker.close()
+        assert breaker.metrics.calls == 0
+        assert breaker.metrics.failures == 0
+
+    def test_excluded_exceptions_never_enter_window(self):
+        """Excluded exceptions are neither successes nor failures: they do not
+        affect the denominator, the numerator, or the trip decision.
+        """
+        strategy = CountWindowFailureRateStrategy(failure_rate=0.5, min_calls=3, window_size=10)
+        breaker = CircuitBreaker(strategy=strategy, exclude=[LookupError])
+
+        def business_err():
+            raise LookupError
+
+        for _ in range(10):
+            with pytest.raises(LookupError):
+                breaker.call(business_err)
+
+        assert breaker.current_state == "closed"
+        assert breaker.metrics.calls == 0
+        assert breaker.metrics.failures == 0
+
+        # Real failures still count, starting from an empty denominator.
+        with pytest.raises(NotImplementedError):
+            breaker.call(self._err)
+        assert breaker.metrics.calls == 1
+        assert breaker.metrics.failures == 1
+
+    def test_excluded_exceptions_fire_no_success_or_failure_listener(self):
+        """In rate mode, excluded exceptions do not emit success/failure
+        listener events, only before_call.
+        """
+
+        class Listener(CircuitBreakerListener):
+            def __init__(self):
+                self.events = []
+
+            def before_call(self, cb, func, *args, **kwargs):
+                self.events.append("before")
+
+            def success(self, cb):
+                self.events.append("success")
+
+            def failure(self, cb, exc):
+                self.events.append("failure")
+
+        listener = Listener()
+        strategy = CountWindowFailureRateStrategy(failure_rate=0.5, min_calls=2, window_size=10)
+        breaker = CircuitBreaker(strategy=strategy, exclude=[LookupError], listeners=[listener])
+
+        def business_err():
+            raise LookupError
+
+        with pytest.raises(LookupError):
+            breaker.call(business_err)
+        assert listener.events == ["before"]
+
+    def test_short_circuited_calls_are_not_recorded(self):
+        """Calls rejected while the circuit is open never reach the dependency
+        and therefore do not count as a request in the window.
+        """
+        strategy = CountWindowFailureRateStrategy(failure_rate=0.5, min_calls=2, window_size=10)
+        breaker = CircuitBreaker(strategy=strategy)
+        guarded = mock.MagicMock(return_value=True)
+
+        with pytest.raises(NotImplementedError):
+            breaker.call(self._err)
+        with pytest.raises(CircuitBreakerError):
+            breaker.call(self._err)
+        assert breaker.current_state == "open"
+
+        metrics_at_trip = breaker.metrics
+        for _ in range(5):
+            with pytest.raises(CircuitBreakerError):
+                breaker.call(guarded)
+
+        guarded.assert_not_called()
+        assert breaker.metrics == metrics_at_trip
+
+    def test_time_window_only_counts_recent_calls(self):
+        """Outcomes older than window_seconds leave the window as time passes."""
+        clock = [1000.0]
+        strategy = TimeWindowFailureRateStrategy(failure_rate=0.5, min_calls=3, window_seconds=10)
+        breaker = CircuitBreaker(strategy=strategy)
+
+        with mock.patch("pybreaker.time.monotonic", side_effect=lambda: clock[0]):
+            with pytest.raises(NotImplementedError):
+                breaker.call(self._err)
+            with pytest.raises(NotImplementedError):
+                breaker.call(self._err)
+            assert breaker.metrics.calls == 2
+
+            # Advance within the window: nothing expires.
+            clock[0] = 1005.0
+            assert breaker.metrics.calls == 2
+            assert breaker.metrics.failures == 2
+
+            # Advance past the window: every outcome expires.
+            clock[0] = 1011.0
+            assert breaker.metrics.calls == 0
+            assert breaker.metrics.failures == 0
+
+    def test_time_window_boundary_expires_exact_age(self):
+        """An outcome recorded exactly window_seconds ago is expired: the
+        window is (now - window_seconds, now].
+        """
+        clock = [0.0]
+        strategy = TimeWindowFailureRateStrategy(failure_rate=0.5, min_calls=2, window_seconds=10)
+        breaker = CircuitBreaker(strategy=strategy)
+
+        with mock.patch("pybreaker.time.monotonic", side_effect=lambda: clock[0]):
+            with pytest.raises(NotImplementedError):
+                breaker.call(self._err)
+            assert breaker.metrics.calls == 1
+
+            clock[0] = 10.0
+            assert breaker.metrics.calls == 0
+
+    def test_time_window_trips_only_within_window(self):
+        """Old failures cannot trip the circuit once they age out, even with a
+        fresh minimum of calls.
+        """
+        clock = [0.0]
+        strategy = TimeWindowFailureRateStrategy(failure_rate=1.0, min_calls=2, window_seconds=10)
+        breaker = CircuitBreaker(strategy=strategy)
+
+        def advance(seconds):
+            clock[0] += seconds
+
+        with mock.patch("pybreaker.time.monotonic", side_effect=lambda: clock[0]):
+            with pytest.raises(NotImplementedError):
+                breaker.call(self._err)
+            advance(20)
+            # The aged-out failure must not count anymore.
+            assert breaker.call(self._suc)
+            assert breaker.metrics.calls == 1
+            assert breaker.metrics.failures == 0
+            assert breaker.current_state == "closed"
+
+    def test_time_window_bounded_memory(self):
+        """Expired entries are evicted lazily on every read/write."""
+        strategy = TimeWindowFailureRateStrategy(failure_rate=0.5, min_calls=100, window_seconds=10)
+        breaker = CircuitBreaker(strategy=strategy)
+
+        for i in range(30):
+            with mock.patch("pybreaker.time.monotonic", return_value=float(i)):
+                assert breaker.call(self._suc)
+            # Eviction happens on each call, so the deque never holds the
+            # entire call history: only times in (now - 10, now] survive.
+            assert len(strategy._samples) <= 10
+
+        with mock.patch("pybreaker.time.monotonic", return_value=40.0):
+            assert breaker.metrics.calls == 0
+        assert len(strategy._samples) == 0
+
+    def test_invalid_constructor_arguments(self):
+        with pytest.raises(ValueError):
+            CountWindowFailureRateStrategy(failure_rate=1.5, min_calls=2, window_size=10)
+        with pytest.raises(ValueError):
+            CountWindowFailureRateStrategy(failure_rate=-0.1, min_calls=2, window_size=10)
+        with pytest.raises(ValueError):
+            CountWindowFailureRateStrategy(failure_rate=0.5, min_calls=0, window_size=10)
+        with pytest.raises(ValueError):
+            CountWindowFailureRateStrategy(failure_rate=0.5, min_calls=2, window_size=0)
+        with pytest.raises(ValueError):
+            CountWindowFailureRateStrategy(failure_rate=0.5, min_calls=11, window_size=10)
+        with pytest.raises(ValueError):
+            TimeWindowFailureRateStrategy(failure_rate=0.5, min_calls=2, window_seconds=0)
+        with pytest.raises(ValueError):
+            TimeWindowFailureRateStrategy(failure_rate=0.5, min_calls=0, window_seconds=10)
+
+    def test_circuit_breaker_error_carries_diagnostics(self):
+        """The raised error exposes the actual numerator and denominator."""
+        strategy = CountWindowFailureRateStrategy(failure_rate=0.5, min_calls=2, window_size=10)
+        breaker = CircuitBreaker(strategy=strategy)
+
+        with pytest.raises(NotImplementedError):
+            breaker.call(self._err)
+
+        with pytest.raises(CircuitBreakerError) as exc_info:
+            breaker.call(self._err)
+
+        metrics = exc_info.value.metrics
+        assert metrics is not None
+        assert metrics.failures == 2
+        assert metrics.calls == 2
+        assert metrics.rate == 1.0
+        assert metrics.threshold == 0.5
+        assert "2/2" in str(exc_info.value)
+
+    def test_cumulative_error_has_no_metrics(self):
+        breaker = CircuitBreaker(fail_max=1)
+        with pytest.raises(CircuitBreakerError) as exc_info:
+            breaker.call(self._err)
+        assert exc_info.value.metrics is None
+
+    def test_count_window_thread_safety(self):
+        """Concurrent recording keeps the window internally consistent."""
+        strategy = CountWindowFailureRateStrategy(failure_rate=0.5, min_calls=50, window_size=100)
+        breaker = CircuitBreaker(strategy=strategy)
+
+        def worker():
+            for i in range(200):
+                try:
+                    if i % 2:
+                        breaker.call(self._err)
+                    else:
+                        breaker.call(self._suc)
+                except (CircuitBreakerError, NotImplementedError):
+                    pass
+
+        threads = [threading.Thread(target=worker) for _ in range(8)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+
+        assert breaker.metrics.calls <= 100
+        assert breaker.metrics.failures <= breaker.metrics.calls
+
+    def test_rate_strategy_ignores_fail_max(self):
+        """fail_max stays available for the cumulative strategy but does not
+        constrain a failure-rate strategy.
+        """
+        strategy = CountWindowFailureRateStrategy(failure_rate=1.0, min_calls=3, window_size=10)
+        breaker = CircuitBreaker(fail_max=1, strategy=strategy)
+
+        # Two failures would trip a cumulative breaker with fail_max=1, but
+        # the rate strategy still waits for min_calls=3.
+        with pytest.raises(NotImplementedError):
+            breaker.call(self._err)
+        with pytest.raises(NotImplementedError):
+            breaker.call(self._err)
+        assert breaker.current_state == "closed"
+
+
 if __name__ == "__main__":
     unittest.main()

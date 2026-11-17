@@ -14,7 +14,8 @@ import sys
 import threading
 import time
 import types
-from abc import abstractmethod
+from abc import ABC, abstractmethod
+from collections import deque
 from datetime import datetime, timedelta
 from functools import wraps
 from typing import (
@@ -22,6 +23,7 @@ from typing import (
     Any,
     Callable,
     Literal,
+    NamedTuple,
     NoReturn,
     TypeVar,
     Union,
@@ -61,6 +63,12 @@ __all__ = (
     "CircuitBreaker",
     "CircuitBreakerListener",
     "CircuitBreakerError",
+    "CircuitBreakerStrategy",
+    "CumulativeFailuresStrategy",
+    "FailureRateStrategy",
+    "CountWindowFailureRateStrategy",
+    "TimeWindowFailureRateStrategy",
+    "FailureRateMetrics",
     "CircuitMemoryStorage",
     "CircuitRedisStorage",
     "STATE_OPEN",
@@ -71,6 +79,23 @@ __all__ = (
 STATE_OPEN = "open"
 STATE_CLOSED = "closed"
 STATE_HALF_OPEN = "half-open"
+
+
+class FailureRateMetrics(NamedTuple):
+    """Snapshot of the statistics used by a failure-rate strategy.
+
+    ``failures`` is the numerator (number of failed calls inside the current
+    window) and ``calls`` is the denominator (number of dependency requests
+    recorded inside the current window). Excluded exceptions and calls rejected
+    by an open circuit never contribute to either number.
+    """
+
+    failures: int
+    calls: int
+    rate: float
+    min_calls: int
+    threshold: float
+
 
 T = TypeVar("T")
 ExceptionType = TypeVar("ExceptionType", bound=BaseException)
@@ -98,8 +123,19 @@ class CircuitBreaker:
         state_storage: CircuitBreakerStorage | None = None,
         name: str | None = None,
         throw_new_error_on_trip: bool = True,
+        strategy: CircuitBreakerStrategy | None = None,
     ) -> None:
-        """Create a new circuit breaker with the given parameters."""
+        """Create a new circuit breaker with the given parameters.
+
+        The ``strategy`` decides how failures are counted and when the circuit
+        must open. By default, a :class:`CumulativeFailuresStrategy` is used:
+        failures are accumulated in ``state_storage`` until ``fail_max`` is
+        reached, which keeps the historical behavior (and works with the Redis
+        storage). Pass a :class:`CountWindowFailureRateStrategy` or
+        :class:`TimeWindowFailureRateStrategy` instead to trip based on the
+        failure rate observed over a sliding window, with a minimum number of
+        calls required before the circuit is allowed to open.
+        """
         self._lock = threading.RLock()
         self._state_storage = state_storage or CircuitMemoryStorage(STATE_CLOSED)
         self._state = self._create_new_state(self.current_state)
@@ -113,6 +149,20 @@ class CircuitBreaker:
         self._name = name
 
         self._throw_new_error_on_trip = throw_new_error_on_trip
+        self._strategy = strategy or CumulativeFailuresStrategy(self)
+
+    @property
+    def strategy(self) -> CircuitBreakerStrategy:
+        """Return the strategy that decides when this circuit breaker opens."""
+        return self._strategy
+
+    @property
+    def metrics(self) -> FailureRateMetrics | None:
+        """Return the current failure-rate statistics, or ``None`` when the
+        active strategy does not evaluate a failure rate (e.g. the default
+        cumulative failure count).
+        """
+        return self._strategy.metrics
 
     @property
     def fail_counter(self) -> int:
@@ -644,6 +694,290 @@ class CircuitRedisStorage(CircuitBreakerStorage):
         return ":".join(name_parts)
 
 
+class CircuitBreakerStrategy(ABC):
+    """Decide how call outcomes are recorded and when the circuit breaker must
+    open while in the "closed" state.
+
+    Strategies only observe calls that actually reach the guarded dependency:
+    calls rejected by an open circuit are never recorded. Excluded exceptions
+    are routed through :meth:`record_excluded` and must never be mixed into the
+    success/failure statistics.
+    """
+
+    name = "strategy"
+
+    @property
+    def metrics(self) -> FailureRateMetrics | None:
+        """Return the statistics backing the trip decision, if available."""
+        return None
+
+    @abstractmethod
+    def record_failure(self) -> None:
+        """Record a call that raised a system error."""
+
+    @abstractmethod
+    def record_success(self) -> None:
+        """Record a call that completed successfully."""
+
+    @abstractmethod
+    def record_excluded(self) -> None:
+        """Record a call that raised an excluded exception.
+
+        Excluded exceptions are neither successes nor failures: they must not
+        be counted in the denominator used to evaluate the failure rate.
+        """
+
+    @abstractmethod
+    def reset(self) -> None:
+        """Forget every recorded outcome.
+
+        This is invoked when the circuit breaker transitions back to the
+        "closed" state, so a recovered dependency starts with a fresh window.
+        """
+
+    @abstractmethod
+    def should_open(self) -> bool:
+        """Return whether the circuit breaker must open after the latest call."""
+
+    @property
+    @abstractmethod
+    def trip_message(self) -> str:
+        """Human-readable explanation of why the circuit breaker opened."""
+
+
+class CumulativeFailuresStrategy(CircuitBreakerStrategy):
+    """Historical strategy: count failures cumulatively in the state storage and
+    open the circuit once the count reaches the breaker's ``fail_max``.
+
+    A successful call (or an excluded exception, matching the historical
+    behavior) resets the counter. As the count lives in the state storage, this
+    strategy also works with :class:`CircuitRedisStorage`.
+    """
+
+    name = "cumulative"
+
+    def __init__(self, breaker: CircuitBreaker) -> None:
+        """Create a strategy that stores its failure count in the breaker's
+        state storage.
+        """
+        self._breaker = breaker
+
+    def record_failure(self) -> None:
+        self._breaker._inc_counter()
+
+    def record_success(self) -> None:
+        self._breaker._state_storage.reset_counter()
+
+    def record_excluded(self) -> None:
+        # Preserve the historical behavior: excluded exceptions reset the
+        # consecutive failure counter instead of being counted as outcomes.
+        self._breaker._state_storage.reset_counter()
+
+    def reset(self) -> None:
+        self._breaker._state_storage.reset_counter()
+
+    def should_open(self) -> bool:
+        return self._breaker._state_storage.counter >= self._breaker.fail_max
+
+    @property
+    def trip_message(self) -> str:
+        return "Failures threshold reached, circuit breaker opened"
+
+
+class FailureRateStrategy(CircuitBreakerStrategy):
+    """Base class for strategies that trip based on the proportion of failed
+    calls observed within a bounded window, rather than on an ever-growing
+    cumulative count.
+
+    The circuit only opens once at least ``min_calls`` dependency requests
+    have been recorded in the current window and the share of failures reaches
+    ``failure_rate`` (a value between 0 and 1 inclusive). Subclasses define how
+    the window is bounded and evicted.
+    """
+
+    name = "failure-rate"
+
+    def __init__(self, failure_rate: float, min_calls: int) -> None:
+        """Create a failure-rate strategy that trips at ``failure_rate`` once
+        at least ``min_calls`` calls have been recorded in the window.
+        """
+        if not 0 <= failure_rate <= 1:
+            msg = "failure_rate must be a value between 0 and 1 inclusive"
+            raise ValueError(msg)
+        if min_calls < 1:
+            msg = "min_calls must be greater than 0"
+            raise ValueError(msg)
+        self._failure_rate = failure_rate
+        self._min_calls = min_calls
+
+    @property
+    def failure_rate(self) -> float:
+        """Return the failure rate (0..1) that trips the circuit breaker."""
+        return self._failure_rate
+
+    @property
+    def min_calls(self) -> int:
+        """Return the minimum number of calls required before tripping."""
+        return self._min_calls
+
+    def record_excluded(self) -> None:
+        # Excluded exceptions do not describe the dependency's health, so they
+        # are neither successes nor failures and never enter the denominator.
+        return
+
+    def should_open(self) -> bool:
+        calls = self.call_count
+        if calls < self._min_calls:
+            return False
+        return self.failure_count / calls >= self._failure_rate
+
+    @property
+    def metrics(self) -> FailureRateMetrics:
+        calls = self.call_count
+        rate = self.failure_count / calls if calls else 0.0
+        return FailureRateMetrics(
+            failures=self.failure_count,
+            calls=calls,
+            rate=rate,
+            min_calls=self._min_calls,
+            threshold=self._failure_rate,
+        )
+
+    @property
+    def trip_message(self) -> str:
+        metrics = self.metrics
+        return (
+            f"Failure rate threshold reached, circuit breaker opened "
+            f"({metrics.failures}/{metrics.calls} calls failed, "
+            f"rate={metrics.rate:.2f}, threshold={metrics.threshold:.2f}, "
+            f"min_calls={metrics.min_calls})"
+        )
+
+    @property
+    @abstractmethod
+    def failure_count(self) -> int:
+        """Return the number of failed calls currently in the window."""
+
+    @property
+    @abstractmethod
+    def call_count(self) -> int:
+        """Return the number of dependency requests currently in the window."""
+
+
+class CountWindowFailureRateStrategy(FailureRateStrategy):
+    """Failure-rate strategy backed by a fixed-size rolling window.
+
+    Only the most recent ``window_size`` recorded outcomes (one entry per
+    dependency request) are kept. The window is therefore bounded by
+    ``window_size`` entries, no matter how many calls are made.
+    """
+
+    name = "count-window"
+
+    def __init__(self, failure_rate: float, min_calls: int, window_size: int) -> None:
+        """Create a fixed-size rolling window holding at most ``window_size``
+        outcomes.
+        """
+        super().__init__(failure_rate, min_calls)
+        if window_size < 1:
+            msg = "window_size must be greater than 0"
+            raise ValueError(msg)
+        if min_calls > window_size:
+            msg = "min_calls must not be greater than window_size"
+            raise ValueError(msg)
+        self._window_size = window_size
+        # ``True`` marks a failed call, ``False`` a successful one.
+        self._samples: deque[bool] = deque(maxlen=window_size)
+
+    @property
+    def window_size(self) -> int:
+        """Return the maximum number of outcomes retained in the window."""
+        return self._window_size
+
+    def record_failure(self) -> None:
+        self._samples.append(True)
+
+    def record_success(self) -> None:
+        self._samples.append(False)
+
+    def reset(self) -> None:
+        self._samples.clear()
+
+    @property
+    def failure_count(self) -> int:
+        return sum(self._samples)
+
+    @property
+    def call_count(self) -> int:
+        return len(self._samples)
+
+
+class TimeWindowFailureRateStrategy(FailureRateStrategy):
+    """Failure-rate strategy backed by a sliding time window.
+
+    Outcomes are timestamped with a monotonic clock and only those recorded
+    within the last ``window_seconds`` seconds are considered. Expired entries
+    are evicted lazily whenever the statistics are read or a new outcome is
+    recorded, so the deque never holds more entries than the calls that fit in
+    the configured time window.
+    """
+
+    name = "time-window"
+
+    def __init__(self, failure_rate: float, min_calls: int, window_seconds: float) -> None:
+        """Create a sliding time window retaining outcomes from the last
+        ``window_seconds`` seconds.
+        """
+        super().__init__(failure_rate, min_calls)
+        if window_seconds <= 0:
+            msg = "window_seconds must be greater than 0"
+            raise ValueError(msg)
+        self._window_seconds = window_seconds
+        # ``(monotonic timestamp, failed?)`` for each dependency request.
+        self._samples: deque[tuple[float, bool]] = deque()
+
+    @property
+    def window_seconds(self) -> float:
+        """Return the length, in seconds, of the sliding time window."""
+        return self._window_seconds
+
+    def _evict_expired(self, now: float | None = None) -> None:
+        """Drop every outcome that fell out of the time window.
+
+        The window is the half-open interval ``(now - window_seconds, now]``:
+        an outcome recorded exactly ``window_seconds`` ago is considered
+        expired and removed.
+        """
+        if now is None:
+            now = time.monotonic()
+        cutoff = now - self._window_seconds
+        while self._samples and self._samples[0][0] <= cutoff:
+            self._samples.popleft()
+
+    def record_failure(self) -> None:
+        now = time.monotonic()
+        self._evict_expired(now)
+        self._samples.append((now, True))
+
+    def record_success(self) -> None:
+        now = time.monotonic()
+        self._evict_expired(now)
+        self._samples.append((now, False))
+
+    def reset(self) -> None:
+        self._samples.clear()
+
+    @property
+    def failure_count(self) -> int:
+        self._evict_expired()
+        return sum(failed for _, failed in self._samples)
+
+    @property
+    def call_count(self) -> int:
+        self._evict_expired()
+        return len(self._samples)
+
+
 class CircuitBreakerListener:
     """Listener class used to plug code to a ``CircuitBreaker`` instance when certain events happen."""
 
@@ -688,20 +1022,24 @@ class CircuitBreakerState:
 
     def _handle_error(self, exc: BaseException, reraise: bool = True) -> None:
         """Handle a failed call to the guarded operation."""
+        strategy = self._breaker._strategy
         if self._breaker.is_system_error(exc):
-            self._breaker._inc_counter()
+            strategy.record_failure()
             for listener in self._breaker.listeners:
                 listener.failure(self._breaker, exc)
             self.on_failure(exc)
         else:
-            self._handle_success()
+            # Excluded exceptions neither succeed nor fail: keep them out of
+            # the failure-rate denominator.
+            strategy.record_excluded()
+            self.on_excluded(exc)
 
         if reraise:
             raise exc
 
     def _handle_success(self) -> None:
         """Handle a successful call to the guarded operation."""
-        self._breaker._state_storage.reset_counter()
+        self._breaker._strategy.record_success()
         self.on_success()
         for listener in self._breaker.listeners:
             listener.success(self._breaker)
@@ -773,6 +1111,12 @@ class CircuitBreakerState:
     def on_success(self) -> None:
         """Override this method to be notified when a call to the guarded operation succeeds."""
 
+    def on_excluded(self, exc: BaseException) -> None:
+        """Override this method to be notified when a call raises an excluded
+        exception. Such a call is not recorded as either a success or a
+        failure.
+        """
+
     def on_failure(self, exc: BaseException) -> None:
         """Override this method to be notified when a call to the guarded operation fails."""
 
@@ -795,23 +1139,27 @@ class CircuitClosedState(CircuitBreakerState):
         """Move the given circuit breaker `cb` to the "closed" state."""
         super().__init__(cb, STATE_CLOSED)
         if notify:
-            # We only reset the counter if notify is True, otherwise the CircuitBreaker
-            # will lose it's failure count due to a second CircuitBreaker being created
-            # using the same _state_storage object, or if the _state_storage objects
-            # share a central source of truth (as would be the case with the redis
-            # storage).
-            self._breaker._state_storage.reset_counter()
+            # We only reset the statistics if notify is True, otherwise the
+            # CircuitBreaker will lose its failure history due to a second
+            # CircuitBreaker being created using the same _state_storage
+            # object, or if the _state_storage objects share a central source
+            # of truth (as would be the case with the redis storage).
+            self._breaker._strategy.reset()
             for listener in self._breaker.listeners:
                 listener.state_change(self._breaker, prev_state, self)
 
     def on_failure(self, exc: BaseException) -> None:
-        """Move the circuit breaker to the "open" state once the failures threshold is reached."""
-        if self._breaker._state_storage.counter >= self._breaker.fail_max:
+        """Move the circuit breaker to the "open" state once the strategy's
+        trip condition is reached.
+        """
+        if self._breaker._strategy.should_open():
             throw_new_error = self._breaker.open()
 
             if throw_new_error:
-                error_msg = "Failures threshold reached, circuit breaker opened"
-                raise CircuitBreakerError(error_msg).with_traceback(sys.exc_info()[2])
+                raise CircuitBreakerError(
+                    self._breaker._strategy.trip_message,
+                    metrics=self._breaker._strategy.metrics,
+                ).with_traceback(sys.exc_info()[2])
             raise exc
 
 
@@ -901,3 +1249,18 @@ class CircuitBreakerError(Exception):
     """When calls to a service fails because the circuit is open, this error is
     raised to allow the caller to handle this type of exception differently.
     """
+
+    def __init__(self, message: str | None = None, metrics: FailureRateMetrics | None = None) -> None:
+        """Create an error with an optional ``metrics`` snapshot describing
+        the failure-rate statistics that opened the circuit.
+        """
+        super().__init__(message)
+        self._metrics = metrics
+
+    @property
+    def metrics(self) -> FailureRateMetrics | None:
+        """Return the failure-rate statistics (numerator, denominator, rate)
+        that caused the circuit to open, when a failure-rate strategy is in
+        use; otherwise return ``None``.
+        """
+        return self._metrics

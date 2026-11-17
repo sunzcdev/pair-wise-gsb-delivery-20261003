@@ -1,6 +1,30 @@
 Changelog
 =========
 
+Version 1.5.0 (unreleased)
+
+* Add independent failure-rate strategies that trip based on the proportion of
+  failed calls within a sliding window rather than on a cumulative failure
+  count:
+  - ``CountWindowFailureRateStrategy`` evaluates the rate over the most recent
+    fixed number of calls
+  - ``TimeWindowFailureRateStrategy`` evaluates the rate over the calls
+    recorded in the most recent time window
+  - both require a minimum number of calls (``min_calls``) before the circuit
+    can open and keep their statistics in bounded in-memory windows
+* Excluded exceptions are no longer mixed into the success/failure statistics:
+  they never count in the rate denominator (the historical cumulative behavior
+  is unchanged)
+* Calls short-circuited while the circuit is open are not recorded as
+  dependency requests
+* Recovering to the closed state (including a manual close) clears the
+  statistics window
+* Expose the actual numerator and denominator through ``CircuitBreaker.metrics``
+  (``FailureRateMetrics``) and through ``CircuitBreakerError.metrics`` when a
+  failure-rate strategy trips
+* The cumulative ``fail_max`` behavior remains the default and is available
+  explicitly via ``CumulativeFailuresStrategy``
+
 Version 1.4.0 (July 6, 2025)
 
 * Add success_threshold parameter (Thanks @sideshowbandana)

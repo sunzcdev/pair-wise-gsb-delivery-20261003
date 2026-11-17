@@ -16,6 +16,8 @@ Features
 
 * Configurable list of excluded exceptions (e.g. business exceptions)
 * Configurable failure threshold and reset timeout
+* Independent failure-rate strategies with count-based or time-based sliding
+  windows, minimum-call gating and bounded memory
 * Support for several event listeners per circuit breaker
 * Can guard generator functions
 * Functions and properties for easy monitoring and management
@@ -99,6 +101,80 @@ fail with:
 
     `AttributeError: 'str' object has no attribute 'decode'`
 
+Failure-Rate Strategies
+```````````````````````
+
+By default, a circuit breaker opens after ``fail_max`` failures have accumulated
+(consecutive failures, since any success resets the counter). That works well for
+steady traffic, but when call volume varies a lot, an absolute failure count does
+not reflect the actual error proportion: a handful of failures is harmless during
+a traffic spike, yet critical when almost nothing else is being called.
+
+For those cases, pass an independent failure-rate strategy. The circuit then opens
+only when the share of failed calls within a sliding window reaches
+``failure_rate`` *and* at least ``min_calls`` dependency requests have been
+observed, so a few isolated failures can never trip the breaker:
+
+.. code:: python
+
+    import pybreaker
+
+    # Trip when >= 50% of the last 100 calls failed, but only once at least
+    # 20 calls have been recorded.
+    breaker = pybreaker.CircuitBreaker(
+        strategy=pybreaker.CountWindowFailureRateStrategy(
+            failure_rate=0.5,
+            min_calls=20,
+            window_size=100,
+        )
+    )
+
+    # Or evaluate the failure rate over a fixed time window instead: outcomes
+    # older than 30 seconds are evicted automatically.
+    breaker = pybreaker.CircuitBreaker(
+        strategy=pybreaker.TimeWindowFailureRateStrategy(
+            failure_rate=0.5,
+            min_calls=20,
+            window_seconds=30,
+        )
+    )
+
+Window semantics and recovery rules:
+
+* The count window keeps only the most recent ``window_size`` outcomes (one entry
+  per call), so its memory usage is bounded by ``window_size``.
+* The time window keeps outcomes recorded in the half-open interval
+  ``(now - window_seconds, now]``; expired entries are evicted lazily, so memory
+  stays bounded by the calls that fit in the configured time span.
+* Excluded exceptions (see below) are neither successes nor failures and never
+  enter the numerator or the denominator.
+* Calls rejected while the circuit is open never reach the dependency, so they
+  are not recorded as requests and cannot distort the statistics.
+* When the circuit closes again after a successful half-open recovery (or is
+  closed manually), the window is cleared and statistics start fresh.
+
+The statistics behind the last decision can be read at any time. The
+``FailureRateMetrics`` snapshot exposes the actual numerator (``failures``) and
+denominator (``calls``), the observed ``rate``, plus the configured threshold and
+``min_calls``. The same snapshot is attached to the ``CircuitBreakerError`` raised
+when the circuit trips:
+
+.. code:: python
+
+    metrics = breaker.metrics
+    # FailureRateMetrics(failures=12, calls=20, rate=0.6, min_calls=20, threshold=0.5)
+
+    try:
+        guarded_call()
+    except pybreaker.CircuitBreakerError as exc:
+        if exc.metrics:
+            logging.error("circuit open: %s/%s calls failed", exc.metrics.failures, exc.metrics.calls)
+
+The historical cumulative behavior remains the default: simply omit the
+``strategy`` argument (or leave ``fail_max`` in use). That strategy stores its
+counter in the state storage and is therefore the only one supported by the
+Redis storage; the failure-rate strategies keep their bounded windows in local
+memory.
 
 .. note::
 
@@ -305,6 +381,11 @@ change its current state:
 
     # Get the current number of consecutive successes
     print(db_breaker.success_counter)
+
+    # With a failure-rate strategy, get the actual numerator (failures) and
+    # denominator (calls) behind the latest evaluation; None for the default
+    # cumulative strategy.
+    print(db_breaker.metrics)  # FailureRateMetrics(failures=..., calls=..., ...)
 
     # Get/set the maximum number of consecutive failures
     print(db_breaker.fail_max)
