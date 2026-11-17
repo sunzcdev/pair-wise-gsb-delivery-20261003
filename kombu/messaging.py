@@ -5,12 +5,16 @@ from __future__ import annotations
 from itertools import count
 from threading import local
 from typing import TYPE_CHECKING
+from uuid import uuid4
 
 from .common import maybe_declare
 from .compression import compress
 from .connection import PooledConnection, is_connection, maybe_channel
 from .entity import Exchange, Queue, maybe_delivery_mode
-from .exceptions import ContentDisallowed
+from .exceptions import ContentDisallowed, OperationalError
+from .publish import (BROKER_REJECTED_ERRORS, FALLBACK_PUBLISH_ERRORS,
+                      PublishAttempt, PublishResult, PublishRetryPolicy,
+                      PublishState, channel_supports_confirm)
 from .serialization import dumps, prepare_accept_content
 from .utils.functional import ChannelPromise, maybe_list
 
@@ -20,6 +24,10 @@ if TYPE_CHECKING:
 __all__ = ('Exchange', 'Queue', 'Producer', 'Consumer')
 
 DEFAULT_BATCH_SIZE = 1000
+
+#: Attempt stages used when classifying a failed publish.
+_STAGE_PREPARE = 'prepare'
+_STAGE_WRITE = 'write'
 
 
 class _ProducerBatchState:
@@ -385,6 +393,186 @@ class Producer:
         if batch is not None:
             return batch.publish(channel, message, **publish_kwargs)
         return channel.basic_publish(message, **publish_kwargs)
+
+    def publish_result(self, body, routing_key=None, delivery_mode=None,
+                       mandatory=False, immediate=False, priority=0,
+                       content_type=None, content_encoding=None,
+                       serializer=None, headers=None, compression=None,
+                       exchange=None, declare=None, expiration=None,
+                       timeout=None, confirm_timeout=None,
+                       retry_policy=None, message_id=None,
+                       **properties):
+        """Publish a message and return an explicit publish outcome.
+
+        Unlike :meth:`publish`, this never retries implicitly.  Every
+        attempt is classified and recorded in the returned
+        :class:`~kombu.publish.PublishResult`, and any retry is decided
+        solely by the declared ``retry_policy``
+        (:class:`~kombu.publish.PublishRetryPolicy`).
+
+        The same ``message_id`` is preserved across all attempts (and
+        sent to the broker as the AMQP ``message_id`` property), while
+        each attempt gets its own attempt id, also sent as the
+        ``x-publish-attempt-id`` header.  The body is serialized
+        exactly once per call, no matter how many attempts the policy
+        allows.
+
+        Note:
+        ----
+            An :attr:`~kombu.publish.PublishState.UNKNOWN` outcome means
+            the message may already have been accepted by the broker;
+            it is *not* a rejection.  Retrying it (only possible with a
+            policy that explicitly includes ``UNKNOWN``) can deliver
+            the message more than once.  No client-side mechanism can
+            guarantee exactly-once delivery: use the preserved
+            ``message_id`` to deduplicate at the broker or consumer.
+
+        Arguments:
+        ---------
+            retry_policy (PublishRetryPolicy): Declared policy deciding
+                whether another attempt is allowed after a non-terminal
+                outcome.  Defaults to a single attempt.
+            message_id (str): Optional stable identity of the logical
+                message.  Generated when not provided.
+
+        See :meth:`publish` for the remaining arguments.
+        """
+        if getattr(self._batch_local, 'current', None) is not None:
+            raise RuntimeError(
+                'publish_result cannot be used inside a publish batch')
+
+        policy = (retry_policy if retry_policy is not None
+                  else PublishRetryPolicy())
+        declare = [] if declare is None else declare
+        headers = {} if headers is None else headers
+        routing_key = self.routing_key if routing_key is None else routing_key
+        compression = self.compression if compression is None else compression
+
+        exchange_name, properties['delivery_mode'] = self._delivery_details(
+            exchange or self.exchange, delivery_mode,
+        )
+
+        if expiration is not None:
+            properties['expiration'] = str(int(expiration * 1000))
+
+        message_id = message_id or properties.get('message_id') or uuid4().hex
+        properties['message_id'] = message_id
+
+        # Serialized exactly once per call: every attempt reuses the
+        # same payload, content-type and content-encoding.
+        body, content_type, content_encoding = self._prepare(
+            body, serializer, content_type, content_encoding,
+            compression, headers)
+
+        if self.auto_declare and self.exchange.name:
+            if self.exchange not in declare:
+                declare.append(self.exchange)
+
+        result = PublishResult(message_id=message_id)
+        while True:
+            attempt_id = uuid4().hex
+            state, error = self._attempt_publish(
+                attempt_id, body, priority, content_type, content_encoding,
+                headers, properties, routing_key, mandatory, immediate,
+                exchange_name, declare, timeout, confirm_timeout,
+            )
+            result.attempts.append(PublishAttempt(attempt_id, state, error))
+            result.state = state
+            if not policy.should_retry(result):
+                break
+            self._revive_for_retry()
+        return result
+
+    def _attempt_publish(self, attempt_id, body, priority, content_type,
+                         content_encoding, headers, properties, routing_key,
+                         mandatory, immediate, exchange_name, declare,
+                         timeout, confirm_timeout):
+        """Perform one publish attempt and classify its outcome."""
+        channel = self.channel
+        stage = [_STAGE_PREPARE]
+        # Per-attempt identity, also visible to the broker so that
+        # duplicates caused by retried UNKNOWN attempts can be told
+        # apart from re-deliveries of a single attempt.  A copy is used
+        # so the caller's headers are never mutated per attempt.
+        attempt_headers = dict(headers)
+        attempt_headers['x-publish-attempt-id'] = attempt_id
+        try:
+            self._write_message(
+                channel, body, priority, content_type, content_encoding,
+                attempt_headers, properties, routing_key, mandatory,
+                immediate, exchange_name, declare, timeout,
+                confirm_timeout, stage,
+            )
+        except BROKER_REJECTED_ERRORS as exc:
+            # The broker explicitly refused the message (basic.nack).
+            return PublishState.REJECTED, exc
+        except self._publish_error_types() as exc:
+            if stage[0] != _STAGE_WRITE:
+                # Failed before any frame was written: the broker never
+                # saw this attempt, retrying cannot duplicate it.
+                return PublishState.NOT_SENT, exc
+            if getattr(channel, 'last_publish_write_completed',
+                       None) is False:
+                # Channels may report that the write never happened.
+                return PublishState.NOT_SENT, exc
+            # Dropped during/after the write: the broker may or may not
+            # have accepted the message.
+            return PublishState.UNKNOWN, exc
+        if channel_supports_confirm(channel):
+            return PublishState.CONFIRMED, None
+        # Without publisher confirms a clean return only proves the
+        # transport accepted the write; the broker outcome is unknown.
+        return PublishState.UNKNOWN, None
+
+    def _write_message(self, channel, body, priority, content_type,
+                       content_encoding, headers, properties, routing_key,
+                       mandatory, immediate, exchange_name, declare,
+                       timeout, confirm_timeout, stage):
+        message = channel.prepare_message(
+            body, priority, content_type,
+            content_encoding, headers, properties,
+        )
+        for entity in declare:
+            self.maybe_declare(entity)
+        # handle autogenerated queue names for reply_to
+        reply_to = properties.get('reply_to')
+        if isinstance(reply_to, Queue):
+            properties['reply_to'] = reply_to.name
+        stage[0] = _STAGE_WRITE
+        return channel.basic_publish(
+            message, exchange=exchange_name, routing_key=routing_key,
+            mandatory=mandatory, immediate=immediate,
+            timeout=timeout, confirm_timeout=confirm_timeout,
+        )
+
+    def _publish_error_types(self):
+        """Error types classifying a failed attempt as not-sent/unknown."""
+        connection = self.connection
+        if connection is not None:
+            try:
+                return (
+                    tuple(connection.connection_errors) +
+                    tuple(connection.channel_errors) +
+                    (OperationalError,)
+                )
+            except AttributeError:
+                pass
+        return FALLBACK_PUBLISH_ERRORS + (OperationalError,)
+
+    def _revive_for_retry(self):
+        """Best-effort reconnect between attempts.
+
+        A failed revival is ignored: the next attempt will fail and be
+        classified (usually as not-sent) instead.
+        """
+        connection = self.__connection__
+        if connection is None:
+            return
+        try:
+            connection.ensure_connection()
+            self.revive(connection.default_channel)
+        except Exception:
+            pass
 
     def _get_channel(self):
         channel = self._channel

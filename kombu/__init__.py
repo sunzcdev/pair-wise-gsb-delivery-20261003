@@ -42,6 +42,8 @@ if STATICA_HACK:  # pragma: no cover
     from kombu.message import Message  # noqa
     from kombu.messaging import Consumer, Producer  # noqa
     from kombu.pools import connections, producers  # noqa
+    from kombu.publish import PublishResult  # noqa
+    from kombu.publish import PublishRetryPolicy, PublishState  # noqa
     from kombu.serialization import disable_insecure_serializers  # noqa
     from kombu.serialization import enable_insecure_serializers  # noqa
     from kombu.utils.url import parse_url  # noqa
@@ -56,6 +58,7 @@ all_by_module = {
     'kombu.message': ['Message'],
     'kombu.messaging': ['Consumer', 'Producer'],
     'kombu.pools': ['connections', 'producers'],
+    'kombu.publish': ['PublishResult', 'PublishRetryPolicy', 'PublishState'],
     'kombu.utils.url': ['parse_url'],
     'kombu.common': ['eventloop', 'uuid'],
     'kombu.serialization': [

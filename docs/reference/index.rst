@@ -23,6 +23,7 @@ Kombu Core
     kombu.log
     kombu.connection
     kombu.message
+    kombu.publish
     kombu.compression
     kombu.pools
     kombu.abstract
