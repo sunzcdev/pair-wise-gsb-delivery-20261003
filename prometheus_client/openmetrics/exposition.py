@@ -7,6 +7,7 @@ from typing import Callable
 from ..utils import floatToGoString, parse_version
 from ..validation import (
     _is_valid_legacy_labelname, _is_valid_legacy_metric_name,
+    assert_valid_metric_family,
 )
 
 CONTENT_TYPE_LATEST = 'application/openmetrics-text; version=1.0.0; charset=utf-8'
@@ -63,10 +64,17 @@ def _is_negative_bound(le):
         return False
 
 
-def generate_latest(registry, escaping=UNDERSCORES, version="1.0.0"):
-    '''Returns the metrics from the registry in latest text format as a string.'''
+def generate_latest(registry, escaping=UNDERSCORES, version="1.0.0", strict=False):
+    '''Returns the metrics from the registry in latest text format as a string.
+
+    If strict is True, each metric family is validated with
+    prometheus_client.validation.assert_valid_metric_family before it is
+    written out, raising MetricFamilyValidationError on the first invalid
+    family. The default False keeps the compatible output unchanged.'''
     output = []
     for metric in registry.collect():
+        if strict:
+            assert_valid_metric_family(metric)
         try:
             mname = metric.name
             output.append('# HELP {} {}\n'.format(

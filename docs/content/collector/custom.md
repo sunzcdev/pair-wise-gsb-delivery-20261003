@@ -297,3 +297,43 @@ if __name__ == '__main__':
     while True:
         time.sleep(1)
 ```
+
+## Validating custom metric families
+
+Mistakes in a custom collector - unsorted histogram buckets, inconsistent
+label sets, a negative count - otherwise only surface when Prometheus
+scrapes the endpoint. `validate_metric_family` checks a single `Metric`
+family before that happens, without modifying it:
+
+```python
+from prometheus_client import validate_metric_family, assert_valid_metric_family
+
+issues = validate_metric_family(metric)
+for issue in issues:
+    print(issue.rule, issue.message, issue.sample_name, issue.sample_labels)
+
+# Or raise MetricFamilyValidationError on the first invalid family:
+assert_valid_metric_family(metric)
+```
+
+The checks cover the family type, the unit suffix, derived sample names
+(such as `_total` or `_bucket`), label consistency across the family's
+series, and the structure of composite metrics (bucket ordering, the `+Inf`
+bucket, count/sum pairs). Special float values are judged per metric type:
+NaN and negative values are rejected for counters and counts, while gauges
+and sums may use NaN and `+/-Inf`. A negative bucket boundary is legal and
+is not the same problem as a negative count.
+
+Each returned `MetricFamilyIssue` carries a machine-readable `rule` (for
+example `histogram.buckets_sorted` or `labels.inconsistent`) plus the name,
+labels and index of the specific sample at fault.
+
+Both text exporters accept an opt-in `strict` flag that runs this validation
+on each family before writing it out, raising `MetricFamilyValidationError`
+on the first invalid family. The default remains the compatible behaviour:
+
+```python
+from prometheus_client import generate_latest
+
+generate_latest(registry, strict=True)
+```

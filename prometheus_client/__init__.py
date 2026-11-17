@@ -20,6 +20,10 @@ from .metrics_core import Metric
 from .platform_collector import PLATFORM_COLLECTOR, PlatformCollector
 from .process_collector import PROCESS_COLLECTOR, ProcessCollector
 from .registry import CollectorRegistry, REGISTRY
+from .validation import (
+    assert_valid_metric_family, MetricFamilyIssue, MetricFamilyValidationError,
+    validate_metric_family,
+)
 
 __all__ = (
     'CollectorRegistry',
@@ -33,6 +37,10 @@ __all__ = (
     'Enum',
     'enable_created_metrics',
     'disable_created_metrics',
+    'validate_metric_family',
+    'assert_valid_metric_family',
+    'MetricFamilyIssue',
+    'MetricFamilyValidationError',
     'CONTENT_TYPE_LATEST',
     'CONTENT_TYPE_PLAIN_0_0_4',
     'CONTENT_TYPE_PLAIN_1_0_0',

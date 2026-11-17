@@ -23,6 +23,7 @@ from wsgiref.simple_server import make_server, WSGIRequestHandler, WSGIServer
 from .openmetrics import exposition as openmetrics
 from .registry import Collector, REGISTRY
 from .utils import floatToGoString, parse_version
+from .validation import assert_valid_metric_family
 
 try:
     import snappy  # type: ignore
@@ -280,13 +281,18 @@ def start_wsgi_server(
 start_http_server = start_wsgi_server
 
 
-def generate_latest(registry: Collector = REGISTRY, escaping: str = openmetrics.UNDERSCORES) -> bytes:
+def generate_latest(registry: Collector = REGISTRY, escaping: str = openmetrics.UNDERSCORES, strict: bool = False) -> bytes:
     """
     Generates the exposition format using the basic Prometheus text format.
 
     Params:
         registry: Collector to export data from.
         escaping: Escaping scheme used for metric and label names.
+        strict: Validate each metric family with
+            prometheus_client.validation.assert_valid_metric_family before
+            writing it out, raising MetricFamilyValidationError on the first
+            invalid family. Defaults to False, which keeps the compatible
+            output unchanged.
 
     Returns: UTF-8 encoded string containing the metrics in text format.
     """
@@ -315,6 +321,8 @@ def generate_latest(registry: Collector = REGISTRY, escaping: str = openmetrics.
 
     output = []
     for metric in registry.collect():
+        if strict:
+            assert_valid_metric_family(metric)
         try:
             mname = metric.name
             mtype = metric.type
