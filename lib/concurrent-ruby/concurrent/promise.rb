@@ -555,7 +555,7 @@ module Concurrent
       end
 
       children_to_notify.each { |child| notify_child(child) }
-      observers.notify_and_delete_observers{ [Time.now, self.value, reason] }
+      notify_observers(self.value, reason)
     end
 
     # @!visibility private

@@ -1,6 +1,7 @@
 require 'concurrent/constants'
 require 'concurrent/errors'
-require 'concurrent/collection/copy_on_write_observer_set'
+require 'concurrent/collection/ivar_observer_set'
+require 'concurrent/concern/logging'
 require 'concurrent/concern/obligation'
 require 'concurrent/concern/observable'
 require 'concurrent/executor/safe_task_executor'
@@ -48,6 +49,7 @@ module Concurrent
   class IVar < Synchronization::LockableObject
     include Concern::Obligation
     include Concern::Observable
+    include Concern::Logging
 
     # Create a new `IVar` in the `:pending` state with the (optional) initial value.
     #
@@ -75,28 +77,47 @@ module Concurrent
     # final `value` (or `nil` on rejection), and the final `reason` (or `nil` on
     # fulfillment).
     #
+    # When the `IVar` has already completed the observer is notified
+    # synchronously, from the calling thread, before this method returns.
+    # Existing observers are never notified again.
+    #
     # @param [Object] observer the object that will be notified of changes
     # @param [Symbol] func symbol naming the method to call when this
     #   `Observable` has changes`
+    # @return [Object] the added observer
+    #
+    # @see #register_observer when a handle is needed to deregister the
+    #   observer again
     def add_observer(observer = nil, func = :update, &block)
-      raise ArgumentError.new('cannot provide both an observer and a block') if observer && block
-      direct_notification = false
+      register(observer, func, block).observer
+    end
 
-      if block
-        observer = block
-        func = :call
-      end
-
-      synchronize do
-        if event.set?
-          direct_notification = true
-        else
-          observers.add_observer(observer, func)
-        end
-      end
-
-      observer.send(func, Time.now, self.value, reason) if direct_notification
-      observer
+    # Add an observer and return a {IVarObserverRegistration} handle which can
+    # be used to deregister it again and to inspect the outcome of the race
+    # between deregistration and completion.
+    #
+    # The observer is notified exactly once:
+    #
+    # - while the `IVar` is pending, the registration stays active and the
+    #   observer is notified on completion unless
+    #   {IVarObserverRegistration#deregister} wins the race first;
+    # - when the `IVar` has already completed, the observer is notified
+    #   synchronously, from the calling thread, before this method returns and
+    #   the returned handle is already in the `:notified` state.
+    #
+    # Re-registering the same observer object replaces its previous
+    # registration and returns a fresh handle; the old handle becomes
+    # deregistered and will not be notified.
+    #
+    # @param [Object] observer the object that will be notified of changes
+    # @param [Symbol] func symbol naming the method to call when this
+    #   `Observable` has changes
+    # @return [IVarObserverRegistration] the registration handle
+    #
+    # @raise [ArgumentError] when neither an observer nor a block is given, or
+    #   when both are given
+    def register_observer(observer = nil, func = :update, &block)
+      register(observer, func, block)
     end
 
     # @!macro ivar_set_method
@@ -149,13 +170,40 @@ module Concurrent
       false
     end
 
+    # Remove `observer` as an observer on this object so that it will no
+    # longer receive notifications.
+    #
+    # When the `IVar` has already completed the observer was already notified
+    # and the call simply returns it.
+    #
+    # @param [Object] observer the observer to remove
+    # @return [Object] the removed observer
+    def delete_observer(observer)
+      synchronize { observers.delete_observer(observer) }
+    end
+
+    # Remove all observers associated with this object.
+    #
+    # @return [IVar] self
+    def delete_observers
+      synchronize { observers.delete_observers }
+      self
+    end
+
+    # Return the number of observers currently associated with this object.
+    #
+    # @return [Integer] the observers count
+    def count_observers
+      synchronize { observers.count_observers }
+    end
+
     protected
 
     # @!visibility private
     def ns_initialize(value, opts)
       value = yield if block_given?
       init_obligation
-      self.observers = Collection::CopyOnWriteObserverSet.new
+      self.observers = Collection::IVarObserverSet.new(self)
       set_deref_options(opts)
 
       @state = :pending
@@ -187,8 +235,27 @@ module Concurrent
     end
 
     # @!visibility private
+    #
+    # Takes a consistent snapshot of the observers and marks them as notified
+    # while holding the lock, then runs the user callbacks outside the lock so
+    # that arbitrary user code is never executed while an internal lock is
+    # held. A failure in one callback is logged but neither prevents the other
+    # observers from being notified nor changes the value or reason of the
+    # `IVar`.
     def notify_observers(value, reason)
-      observers.notify_and_delete_observers{ [Time.now, value, reason] }
+      registrations = synchronize { observers.take_for_notification }
+      time          = Time.now
+      registrations.each { |registration| invoke_observer(registration, time, value, reason) }
+      self
+    end
+
+    # @!visibility private
+    #
+    # Invoked by {IVarObserverRegistration#deregister}. Returns `:deregistered`
+    # when the registration was removed before completion, `:notified` when
+    # completion won the race and the observer will still be notified once.
+    def deregister_observer_registration(registration)
+      synchronize { observers.deregister(registration) }
     end
 
     # @!visibility private
@@ -203,6 +270,53 @@ module Concurrent
       if (block_given && value != NULL) || (! block_given && value == NULL)
         raise ArgumentError.new('must set with either a value or a block')
       end
+    end
+
+    private
+
+    # Shared implementation of #add_observer and #register_observer. The
+    # decision whether the observer must be notified directly is made
+    # atomically with its registration under the lock; the resulting callback,
+    # if any, is only executed after releasing the lock.
+    def register(observer, func, block)
+      raise ArgumentError.new('cannot provide both an observer and a block') if observer && block
+
+      if block
+        observer = block
+        func     = :call
+      end
+
+      raise ArgumentError.new('should pass observer as a first argument or block') if observer.nil?
+
+      direct_notification = false
+      registration       = synchronize do
+        # The observer set returns the registration handle. When it is stubbed
+        # in specs and returns something else (typically `nil`) a fallback
+        # handle is built here so the caller still receives the expected API.
+        stored = observers.add_observer(observer, func)
+        reg    = stored.is_a?(Collection::IVarObserverRegistration) ? stored :
+                   Collection::IVarObserverRegistration.new(self, observer, func)
+        if event.set?
+          # The snapshot also clears the set, so an already completed `IVar`
+          # keeps no observers around and the registration is atomically
+          # marked as notified.
+          observers.take_for_notification
+          direct_notification = true
+        end
+        reg
+      end
+
+      invoke_observer(registration, Time.now, self.value, reason) if direct_notification
+      registration
+    end
+
+    # Runs a single observer callback without holding any internal lock and
+    # isolates its failures from other observers and from the `IVar` state.
+    def invoke_observer(registration, time, value, reason)
+      registration.ns_invoke(time, value, reason)
+    rescue StandardError => error
+      log(Concern::Logging::ERROR, self.class.name) { error }
+      nil
     end
   end
 end

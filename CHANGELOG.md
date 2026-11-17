@@ -1,5 +1,15 @@
 ## Current
 
+concurrent-ruby:
+
+* `IVar#register_observer` now returns an `IVarObserverRegistration` handle
+  allowing an observer to deregister itself. `#deregister` resolves the race
+  against completion, returning `:deregistered` (no notification will happen)
+  or `:notified` (the single notification is still delivered); the outcome is
+  also inspectable through the handle. Observer callbacks run outside the
+  internal lock, an exception raised by one callback no longer prevents the
+  others from being notified and never changes the `IVar` value or reason.
+
 ## Release v1.3.8 (19 July 2026)
 
 concurrent-ruby:

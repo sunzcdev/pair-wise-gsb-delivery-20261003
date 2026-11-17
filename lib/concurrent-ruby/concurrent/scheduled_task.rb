@@ -2,7 +2,6 @@ require 'concurrent/constants'
 require 'concurrent/errors'
 require 'concurrent/configuration'
 require 'concurrent/ivar'
-require 'concurrent/collection/copy_on_notify_observer_set'
 require 'concurrent/utility/monotonic_time'
 
 require 'concurrent/options'
@@ -189,7 +188,7 @@ module Concurrent
         @task = task
         self.schedule_time = nil
         @executor = Options.executor_from_options(opts) || Concurrent.global_io_executor
-        self.observers = Collection::CopyOnNotifyObserverSet.new
+        self.observers = Collection::IVarObserverSet.new(self)
       end
     end
 
