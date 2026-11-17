@@ -6,9 +6,11 @@ Core implementation of aiosqlite proxies
 """
 
 import asyncio
+import itertools
 import logging
 import sqlite3
-from collections.abc import AsyncIterator, Generator, Iterable
+import threading
+from collections.abc import AsyncIterator, Generator, Iterable, Mapping
 from functools import partial
 from pathlib import Path
 from queue import Empty, Queue, SimpleQueue
@@ -18,6 +20,7 @@ from warnings import warn
 
 from .context import contextmanager
 from .cursor import Cursor
+from .diagnostics import DiagnosticEvent, DiagnosticsListener, freeze_labels
 
 __all__ = ["connect", "Connection", "Cursor"]
 
@@ -42,10 +45,105 @@ def set_exception(fut: asyncio.Future, e: BaseException) -> None:
 
 
 _STOP_RUNNING_SENTINEL = object()
-_TxQueue = SimpleQueue[tuple[Optional[asyncio.Future], Callable[[], Any]]]
+
+_connection_ids = itertools.count(1)
+
+# Worker-thread local holding the operation currently being executed, so that
+# trace callbacks (which run on the worker thread) can be correlated with the
+# operation that triggered them.  Context variables of the submitting task
+# are not visible here, hence the explicit hand-off via the queue item.
+_worker_state = threading.local()
 
 
-def _connection_worker_thread(tx: _TxQueue):
+class _Operation:
+    """Identity and frozen metadata for a single queued operation."""
+
+    __slots__ = ("id", "name", "labels", "sql", "parameters")
+
+    _ids = itertools.count(1)
+
+    def __init__(
+        self,
+        name: str,
+        labels: Mapping[str, str],
+        sql: Optional[str] = None,
+        parameters: Any = None,
+    ) -> None:
+        self.id = next(self._ids)
+        self.name = name
+        self.labels = labels
+        self.sql = sql
+        self.parameters = parameters
+
+
+class _Diagnostics:
+    """
+    Mutable diagnostics state shared between a connection and its worker.
+
+    Kept as a separate object (not referencing the connection) so the worker
+    thread does not keep the connection alive.
+    """
+
+    __slots__ = ("connection_id", "listener", "include_parameters")
+
+    def __init__(
+        self,
+        listener: Optional[DiagnosticsListener],
+        include_parameters: bool,
+    ) -> None:
+        self.connection_id = next(_connection_ids)
+        self.listener = listener
+        self.include_parameters = include_parameters
+
+
+def _emit(
+    diagnostics: _Diagnostics,
+    kind: str,
+    operation: Optional[_Operation],
+    sql: Optional[str] = None,
+    error: Optional[BaseException] = None,
+) -> None:
+    """
+    Emit a diagnostic event to the configured listener, if any.
+
+    Listener errors are logged and swallowed: observability must never
+    interrupt the normal work queue.
+    """
+    listener = diagnostics.listener
+    if listener is None:
+        return
+
+    event = DiagnosticEvent(
+        kind=kind,
+        connection_id=diagnostics.connection_id,
+        operation_id=operation.id if operation is not None else 0,
+        operation=operation.name if operation is not None else "",
+        labels=operation.labels if operation is not None else freeze_labels(),
+        sql=sql if sql is not None else (operation.sql if operation else None),
+        parameters=(
+            operation.parameters
+            if (operation is not None and diagnostics.include_parameters)
+            else None
+        ),
+        error=error,
+    )
+    try:
+        listener(event)
+    except Exception:  # noqa: BLE001
+        LOG.exception("aiosqlite diagnostics listener raised; ignoring")
+
+
+def _current_operation() -> Optional[_Operation]:
+    """The operation currently executing on this (worker) thread, if any."""
+    return getattr(_worker_state, "operation", None)
+
+
+_TxQueue = SimpleQueue[
+    tuple[Optional[asyncio.Future], Callable[[], Any], Optional[_Operation]]
+]
+
+
+def _connection_worker_thread(tx: _TxQueue, diagnostics: _Diagnostics):
     """
     Execute function calls on a separate thread.
 
@@ -56,7 +154,9 @@ def _connection_worker_thread(tx: _TxQueue):
         # even after connection is closed (so we can finalize all
         # futures)
 
-        future, function = tx.get()
+        future, function, operation = tx.get()
+        _worker_state.operation = operation
+        _emit(diagnostics, "started", operation)
 
         try:
             LOG.debug("executing %s", function)
@@ -65,14 +165,19 @@ def _connection_worker_thread(tx: _TxQueue):
             if future:
                 future.get_loop().call_soon_threadsafe(set_result, future, result)
             LOG.debug("operation %s completed", function)
+            _emit(diagnostics, "succeeded", operation)
 
             if result is _STOP_RUNNING_SENTINEL:
                 break
 
         except BaseException as e:  # noqa B036
             LOG.debug("returning exception %s", e)
+            _emit(diagnostics, "failed", operation, error=e)
             if future:
                 future.get_loop().call_soon_threadsafe(set_exception, future, e)
+
+        finally:
+            _worker_state.operation = None
 
 
 class Connection:
@@ -81,13 +186,21 @@ class Connection:
         connector: Callable[[], sqlite3.Connection],
         iter_chunk_size: int,
         loop: Optional[asyncio.AbstractEventLoop] = None,
+        diagnostics_listener: Optional[DiagnosticsListener] = None,
+        diagnostics_include_parameters: bool = False,
     ) -> None:
         self._running = True
         self._connection: Optional[sqlite3.Connection] = None
         self._connector = connector
+        self._diagnostics = _Diagnostics(
+            diagnostics_listener, diagnostics_include_parameters
+        )
+        self._trace_handler: Optional[Callable[[str], Any]] = None
         self._tx: _TxQueue = SimpleQueue()
         self._iter_chunk_size = iter_chunk_size
-        self._thread = Thread(target=_connection_worker_thread, args=(self._tx,))
+        self._thread = Thread(
+            target=_connection_worker_thread, args=(self._tx, self._diagnostics)
+        )
 
         if loop is not None:
             warn(
@@ -128,7 +241,7 @@ class Connection:
         except Exception:
             future = None
 
-        self._tx.put_nowait((future, close_and_stop))
+        self._tx.put_nowait((future, close_and_stop, self._new_operation("stop")))
         return future
 
     @property
@@ -147,7 +260,28 @@ class Connection:
         cursor = self._conn.execute(sql, parameters)
         return cursor.fetchall()
 
-    async def _execute(self, fn, *args, **kwargs):
+    def _new_operation(
+        self,
+        name: str,
+        labels: Optional[Mapping[str, str]] = None,
+        sql: Optional[str] = None,
+        parameters: Any = None,
+    ) -> _Operation:
+        """
+        Create an operation identity, freezing the labels *now* (in the
+        submitting task) so later context changes cannot leak into this
+        already-queued item.
+        """
+        return _Operation(
+            name=name,
+            labels=freeze_labels(labels),
+            sql=sql,
+            parameters=parameters,
+        )
+
+    async def _execute(
+        self, fn, *args, _labels=None, _sql=None, _parameters=None, **kwargs
+    ):
         """Queue a function with the given arguments for execution."""
         if not self._running or not self._connection:
             raise ValueError("Connection closed")
@@ -155,7 +289,15 @@ class Connection:
         function = partial(fn, *args, **kwargs)
         future = asyncio.get_event_loop().create_future()
 
-        self._tx.put_nowait((future, function))
+        name = getattr(fn, "__qualname__", None) or getattr(fn, "__name__", None)
+        operation = self._new_operation(
+            name=name or str(fn),
+            labels=_labels,
+            sql=_sql,
+            parameters=_parameters,
+        )
+        self._tx.put_nowait((future, function, operation))
+        _emit(self._diagnostics, "queued", operation)
 
         return await future
 
@@ -164,12 +306,17 @@ class Connection:
         if self._connection is None:
             try:
                 future = asyncio.get_event_loop().create_future()
-                self._tx.put_nowait((future, self._connector))
+                self._tx.put_nowait(
+                    (future, self._connector, self._new_operation("connect"))
+                )
                 self._connection = await future
             except BaseException:
                 self.stop()
                 self._connection = None
                 raise
+
+            if self._diagnostics.listener is not None or self._trace_handler:
+                await self._execute(self._install_trace_callback)
 
         return self
 
@@ -188,13 +335,13 @@ class Connection:
         """Create an aiosqlite cursor wrapping a sqlite3 cursor object."""
         return Cursor(self, await self._execute(self._conn.cursor))
 
-    async def commit(self) -> None:
+    async def commit(self, *, labels: Optional[Mapping[str, str]] = None) -> None:
         """Commit the current transaction."""
-        await self._execute(self._conn.commit)
+        await self._execute(self._conn.commit, _labels=labels)
 
-    async def rollback(self) -> None:
+    async def rollback(self, *, labels: Optional[Mapping[str, str]] = None) -> None:
         """Roll back the current transaction."""
-        await self._execute(self._conn.rollback)
+        await self._execute(self._conn.rollback, _labels=labels)
 
     async def close(self) -> None:
         """Complete queued queries/cursors and close the connection."""
@@ -215,44 +362,98 @@ class Connection:
 
     @contextmanager
     async def execute(
-        self, sql: str, parameters: Optional[Iterable[Any]] = None
+        self,
+        sql: str,
+        parameters: Optional[Iterable[Any]] = None,
+        *,
+        labels: Optional[Mapping[str, str]] = None,
     ) -> Cursor:
         """Helper to create a cursor and execute the given query."""
         if parameters is None:
             parameters = []
-        cursor = await self._execute(self._conn.execute, sql, parameters)
+        cursor = await self._execute(
+            self._conn.execute,
+            sql,
+            parameters,
+            _labels=labels,
+            _sql=sql,
+            _parameters=parameters,
+        )
         return Cursor(self, cursor)
 
     @contextmanager
     async def execute_insert(
-        self, sql: str, parameters: Optional[Iterable[Any]] = None
+        self,
+        sql: str,
+        parameters: Optional[Iterable[Any]] = None,
+        *,
+        labels: Optional[Mapping[str, str]] = None,
     ) -> Optional[sqlite3.Row]:
         """Helper to insert and get the last_insert_rowid."""
         if parameters is None:
             parameters = []
-        return await self._execute(self._execute_insert, sql, parameters)
+        return await self._execute(
+            self._execute_insert,
+            sql,
+            parameters,
+            _labels=labels,
+            _sql=sql,
+            _parameters=parameters,
+        )
 
     @contextmanager
     async def execute_fetchall(
-        self, sql: str, parameters: Optional[Iterable[Any]] = None
+        self,
+        sql: str,
+        parameters: Optional[Iterable[Any]] = None,
+        *,
+        labels: Optional[Mapping[str, str]] = None,
     ) -> Iterable[sqlite3.Row]:
         """Helper to execute a query and return all the data."""
         if parameters is None:
             parameters = []
-        return await self._execute(self._execute_fetchall, sql, parameters)
+        return await self._execute(
+            self._execute_fetchall,
+            sql,
+            parameters,
+            _labels=labels,
+            _sql=sql,
+            _parameters=parameters,
+        )
 
     @contextmanager
     async def executemany(
-        self, sql: str, parameters: Iterable[Iterable[Any]]
+        self,
+        sql: str,
+        parameters: Iterable[Iterable[Any]],
+        *,
+        labels: Optional[Mapping[str, str]] = None,
     ) -> Cursor:
         """Helper to create a cursor and execute the given multiquery."""
-        cursor = await self._execute(self._conn.executemany, sql, parameters)
+        cursor = await self._execute(
+            self._conn.executemany,
+            sql,
+            parameters,
+            _labels=labels,
+            _sql=sql,
+            _parameters=parameters,
+        )
         return Cursor(self, cursor)
 
     @contextmanager
-    async def executescript(self, sql_script: str) -> Cursor:
+    async def executescript(
+        self,
+        sql_script: str,
+        *,
+        labels: Optional[Mapping[str, str]] = None,
+    ) -> Cursor:
         """Helper to create a cursor and execute a user script."""
-        cursor = await self._execute(self._conn.executescript, sql_script)
+        cursor = await self._execute(
+            self._conn.executescript,
+            sql_script,
+            _labels=labels,
+            _sql=sql_script,
+        )
         return Cursor(self, cursor)
 
     async def interrupt(self) -> None:
@@ -324,8 +525,68 @@ class Connection:
     ) -> None:
         await self._execute(self._conn.set_progress_handler, handler, n)
 
-    async def set_trace_callback(self, handler: Callable) -> None:
-        await self._execute(self._conn.set_trace_callback, handler)
+    async def set_diagnostics_listener(
+        self, listener: Optional[DiagnosticsListener]
+    ) -> None:
+        """
+        Set (or remove, with ``None``) a listener receiving
+        :class:`aiosqlite.DiagnosticEvent` objects for every operation.
+
+        The listener may be invoked from the event loop thread (``queued``
+        events) or from the connection worker thread (all other events).
+        Exceptions raised by the listener are logged and ignored so that
+        observability can never interrupt the work queue.
+        """
+        self._diagnostics.listener = listener
+        if self._connection is not None:
+            await self._execute(self._install_trace_callback)
+
+    def _install_trace_callback(self) -> None:
+        """
+        Install the sqlite trace callback wrapper on the real connection.
+
+        Runs on the worker thread.  The wrapper emits ``trace`` diagnostic
+        events correlated with the operation currently being executed, then
+        forwards to the user's trace callback (if any).  Errors raised by the
+        user's callback are recorded as ``callback_error`` events, separate
+        from query failures, and are never re-raised into the work queue.
+        """
+        if self._trace_handler is None and self._diagnostics.listener is None:
+            self._conn.set_trace_callback(None)
+            return
+
+        def traced(sql: str) -> None:
+            operation = _current_operation()
+            _emit(self._diagnostics, "trace", operation, sql=sql)
+
+            handler = self._trace_handler
+            if handler is not None:
+                try:
+                    handler(sql)
+                except Exception as e:  # noqa: BLE001
+                    LOG.exception("aiosqlite trace callback raised")
+                    _emit(
+                        self._diagnostics,
+                        "callback_error",
+                        operation,
+                        sql=sql,
+                        error=e,
+                    )
+
+        self._conn.set_trace_callback(traced)
+
+    async def set_trace_callback(self, handler: Optional[Callable[[str], Any]]) -> None:
+        """
+        Set a trace callback invoked with the text of each SQL statement
+        actually executed, as it runs on the worker thread.
+
+        The callback is wrapped so that statement text is also correlated
+        with the enqueued operation's labels in diagnostic events, and so
+        that errors raised by the callback are recorded separately instead
+        of disrupting the work queue.
+        """
+        self._trace_handler = handler
+        await self._execute(self._install_trace_callback)
 
     async def set_authorizer(
         self, authorizer_callback: Optional[AuthorizerCallback]
@@ -445,9 +706,19 @@ def connect(
     *,
     iter_chunk_size=64,
     loop: Optional[asyncio.AbstractEventLoop] = None,
+    diagnostics_listener: Optional[DiagnosticsListener] = None,
+    diagnostics_include_parameters: bool = False,
     **kwargs: Any,
 ) -> Connection:
-    """Create and return a connection proxy to the sqlite database."""
+    """
+    Create and return a connection proxy to the sqlite database.
+
+    :param diagnostics_listener: Optional callable receiving
+        :class:`aiosqlite.DiagnosticEvent` objects for each operation.
+    :param diagnostics_include_parameters: If true, diagnostic events include
+        bound parameter values.  Defaults to false so parameter values are
+        never emitted inadvertently.
+    """
 
     if loop is not None:
         warn(
@@ -465,4 +736,9 @@ def connect(
 
         return sqlite3.connect(loc, **kwargs)
 
-    return Connection(connector, iter_chunk_size)
+    return Connection(
+        connector,
+        iter_chunk_size,
+        diagnostics_listener=diagnostics_listener,
+        diagnostics_include_parameters=diagnostics_include_parameters,
+    )

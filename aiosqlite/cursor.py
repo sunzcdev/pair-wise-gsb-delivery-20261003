@@ -2,7 +2,7 @@
 # Licensed under the MIT license
 
 import sqlite3
-from collections.abc import AsyncIterator, Iterable
+from collections.abc import AsyncIterator, Iterable, Mapping
 from typing import Any, Callable, Optional, TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -32,24 +32,56 @@ class Cursor:
         return await self._conn._execute(fn, *args, **kwargs)
 
     async def execute(
-        self, sql: str, parameters: Optional[Iterable[Any]] = None
+        self,
+        sql: str,
+        parameters: Optional[Iterable[Any]] = None,
+        *,
+        labels: Optional[Mapping[str, str]] = None,
     ) -> "Cursor":
         """Execute the given query."""
         if parameters is None:
             parameters = []
-        await self._execute(self._cursor.execute, sql, parameters)
+        await self._execute(
+            self._cursor.execute,
+            sql,
+            parameters,
+            _labels=labels,
+            _sql=sql,
+            _parameters=parameters,
+        )
         return self
 
     async def executemany(
-        self, sql: str, parameters: Iterable[Iterable[Any]]
+        self,
+        sql: str,
+        parameters: Iterable[Iterable[Any]],
+        *,
+        labels: Optional[Mapping[str, str]] = None,
     ) -> "Cursor":
         """Execute the given multiquery."""
-        await self._execute(self._cursor.executemany, sql, parameters)
+        await self._execute(
+            self._cursor.executemany,
+            sql,
+            parameters,
+            _labels=labels,
+            _sql=sql,
+            _parameters=parameters,
+        )
         return self
 
-    async def executescript(self, sql_script: str) -> "Cursor":
+    async def executescript(
+        self,
+        sql_script: str,
+        *,
+        labels: Optional[Mapping[str, str]] = None,
+    ) -> "Cursor":
         """Execute a user script."""
-        await self._execute(self._cursor.executescript, sql_script)
+        await self._execute(
+            self._cursor.executescript,
+            sql_script,
+            _labels=labels,
+            _sql=sql_script,
+        )
         return self
 
     async def fetchone(self) -> Optional[sqlite3.Row]:

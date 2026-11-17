@@ -535,3 +535,111 @@ class SmokeTest(IsolatedAsyncioTestCase):
         loop.close()
 
         db.stop()
+
+    async def test_diagnostics_labels_frozen_at_enqueue(self):
+        events = []
+        async with aiosqlite.connect(
+            ":memory:", diagnostics_listener=events.append
+        ) as db:
+            token = aiosqlite.operation_labels.set({"request_id": "one"})
+            try:
+                first = asyncio.ensure_future(db.execute_fetchall("select 1"))
+                # mutating the context after enqueue must not affect queued items
+                aiosqlite.operation_labels.set({"request_id": "two"})
+                second = asyncio.ensure_future(
+                    db.execute_fetchall("select 2", labels={"route": "explicit"})
+                )
+            finally:
+                aiosqlite.operation_labels.reset(token)
+            await first
+            await second
+
+        started = [e for e in events if e.kind == "started" and e.sql]
+        self.assertEqual(started[0].labels, {"request_id": "one"})
+        self.assertEqual(started[1].labels, {"request_id": "two", "route": "explicit"})
+        # labels are immutable snapshots
+        with self.assertRaises(TypeError):
+            started[0].labels["request_id"] = "mutated"
+
+    async def test_diagnostics_trace_and_failure_correlation(self):
+        events = []
+        traced = []
+        async with aiosqlite.connect(
+            ":memory:", diagnostics_listener=events.append
+        ) as db:
+            await db.set_trace_callback(traced.append)
+            await db.execute_fetchall("select 1", labels={"op": "good"})
+            with self.assertRaises(OperationalError):
+                await db.execute_fetchall("select * from missing", labels={"op": "bad"})
+
+        self.assertEqual(traced, ["select 1"])
+        trace_events = [e for e in events if e.kind == "trace"]
+        self.assertEqual(len(trace_events), 1)
+        self.assertEqual(trace_events[0].sql, "select 1")
+        self.assertEqual(trace_events[0].labels, {"op": "good"})
+
+        failed = [e for e in events if e.kind == "failed"]
+        self.assertEqual(len(failed), 1)
+        self.assertEqual(failed[0].labels, {"op": "bad"})
+        self.assertIsInstance(failed[0].error, OperationalError)
+        self.assertEqual(failed[0].sql, "select * from missing")
+
+    async def test_diagnostics_parameters_not_included_by_default(self):
+        events = []
+        async with aiosqlite.connect(
+            ":memory:", diagnostics_listener=events.append
+        ) as db:
+            await db.execute_fetchall("select ?", [42], labels={"k": "v"})
+        self.assertTrue(events)
+        self.assertTrue(all(e.parameters is None for e in events))
+
+        events = []
+        async with aiosqlite.connect(
+            ":memory:",
+            diagnostics_listener=events.append,
+            diagnostics_include_parameters=True,
+        ) as db:
+            await db.execute_fetchall("select ?", [42])
+        queued = [e for e in events if e.kind == "queued" and e.sql == "select ?"]
+        self.assertEqual(queued[0].parameters, [42])
+
+    async def test_diagnostics_callback_error_separate_from_failure(self):
+        events = []
+
+        def bad_callback(sql):
+            raise RuntimeError("callback exploded")
+
+        async with aiosqlite.connect(
+            ":memory:", diagnostics_listener=events.append
+        ) as db:
+            await db.set_trace_callback(bad_callback)
+            # the query itself still succeeds despite the broken callback
+            rows = await db.execute_fetchall("select 1")
+            self.assertEqual(rows, [(1,)])
+
+        callback_errors = [e for e in events if e.kind == "callback_error"]
+        self.assertEqual(len(callback_errors), 1)
+        self.assertIsInstance(callback_errors[0].error, RuntimeError)
+        self.assertFalse([e for e in events if e.kind == "failed"])
+
+    async def test_diagnostics_listener_error_does_not_break_queue(self):
+        def bad_listener(event):
+            raise ValueError("listener exploded")
+
+        async with aiosqlite.connect(
+            ":memory:", diagnostics_listener=bad_listener
+        ) as db:
+            with self.assertLogs("aiosqlite", level="ERROR"):
+                rows = await db.execute_fetchall("select 1")
+            self.assertEqual(rows, [(1,)])
+
+    async def test_diagnostics_labels_not_in_sql(self):
+        events = []
+        async with aiosqlite.connect(
+            ":memory:", diagnostics_listener=events.append
+        ) as db:
+            await db.execute_fetchall("select 1", labels={"route": "health"})
+        for event in events:
+            if event.sql is not None:
+                self.assertNotIn("route", event.sql)
+                self.assertNotIn("health", event.sql)
