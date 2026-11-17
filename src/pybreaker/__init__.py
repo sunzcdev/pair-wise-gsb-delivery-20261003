@@ -9,7 +9,9 @@ from __future__ import annotations
 
 import calendar
 import contextlib
+import dataclasses
 import logging
+import math
 import sys
 import threading
 import time
@@ -61,8 +63,12 @@ __all__ = (
     "CircuitBreaker",
     "CircuitBreakerListener",
     "CircuitBreakerError",
+    "CircuitBreakerPolicy",
     "CircuitMemoryStorage",
     "CircuitRedisStorage",
+    "InvalidPolicyError",
+    "PolicyEvaluation",
+    "StalePolicyEvaluationError",
     "STATE_OPEN",
     "STATE_CLOSED",
     "STATE_HALF_OPEN",
@@ -76,6 +82,302 @@ T = TypeVar("T")
 ExceptionType = TypeVar("ExceptionType", bound=BaseException)
 CBListenerType = TypeVar("CBListenerType", bound="CircuitBreakerListener")
 CBStateType = Union["CircuitClosedState", "CircuitHalfOpenState", "CircuitOpenState"]
+
+# Identifies the observations a policy evaluation was based on. Two versions are
+# equal only when the recorded state, counters and open timestamp are equal.
+# Declared in a ``TYPE_CHECKING`` block so the alias is never evaluated at
+# runtime, where ``int | None`` would not be valid on older interpreters.
+if TYPE_CHECKING:
+    StateVersion = tuple[str, int | None, int | None, datetime | None]
+else:
+    StateVersion = tuple
+
+
+class InvalidPolicyError(ValueError):
+    """Raised when a circuit breaker policy (or one of its values) is not usable.
+
+    The circuit breaker always keeps its previous policy when this error is
+    raised, so a rejected configuration can never leave the breaker half
+    configured.
+    """
+
+
+class StalePolicyEvaluationError(RuntimeError):
+    """Raised when a policy evaluation is applied after the observed state changed.
+
+    Applying an evaluation recorded before newer observations (failed or
+    successful calls, manual state changes, ...) would overwrite those
+    observations with conclusions drawn from older data, so it is refused.
+    """
+
+
+def _validate_fail_max(value: object) -> int:
+    """Return `value` if it is a valid `fail_max`, otherwise raise `InvalidPolicyError`."""
+    if isinstance(value, bool) or not isinstance(value, int):
+        msg = f"fail_max must be an int, got {type(value).__name__}"
+        raise InvalidPolicyError(msg)
+    if value < 1:
+        msg = f"fail_max must be greater than or equal to 1, got {value!r}"
+        raise InvalidPolicyError(msg)
+    return value
+
+
+def _validate_reset_timeout(value: object) -> float:
+    """Return `value` if it is a valid `reset_timeout`, otherwise raise `InvalidPolicyError`."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        msg = f"reset_timeout must be a number, got {type(value).__name__}"
+        raise InvalidPolicyError(msg)
+    if not math.isfinite(value):
+        msg = f"reset_timeout must be finite, got {value!r}"
+        raise InvalidPolicyError(msg)
+    if value < 0:
+        # Zero remains valid: it means the circuit goes half-open immediately.
+        msg = f"reset_timeout must be greater than or equal to 0, got {value!r}"
+        raise InvalidPolicyError(msg)
+    return value
+
+
+def _validate_success_threshold(value: object) -> int:
+    """Return `value` if it is a valid `success_threshold`, otherwise raise `InvalidPolicyError`."""
+    if isinstance(value, bool) or not isinstance(value, int):
+        msg = f"success_threshold must be an int, got {type(value).__name__}"
+        raise InvalidPolicyError(msg)
+    if value < 1:
+        msg = f"success_threshold must be greater than or equal to 1, got {value!r}"
+        raise InvalidPolicyError(msg)
+    return value
+
+
+def _as_utc(value: datetime) -> datetime:
+    """Return `value` as a timezone-aware UTC datetime, assuming UTC when it is naive."""
+    if value.tzinfo is None:
+        return value.replace(tzinfo=UTC)
+    return value.astimezone(UTC)
+
+
+@dataclasses.dataclass(frozen=True)
+class CircuitBreakerPolicy:
+    """The tunable parameters that decide when a circuit breaker opens and recovers."""
+
+    fail_max: int = 5
+    reset_timeout: float = 60
+    success_threshold: int = 1
+
+    def __post_init__(self) -> None:
+        """Reject unusable values before a policy can be applied anywhere."""
+        object.__setattr__(self, "fail_max", _validate_fail_max(self.fail_max))
+        object.__setattr__(self, "reset_timeout", _validate_reset_timeout(self.reset_timeout))
+        object.__setattr__(self, "success_threshold", _validate_success_threshold(self.success_threshold))
+
+
+@dataclasses.dataclass(frozen=True)
+class StorageSnapshot:
+    """Read-only view of the observations currently recorded by a storage backend.
+
+    `fail_counter`, `success_counter` and `opened_at` are ``None`` when the
+    storage backend cannot provide them (for instance a legacy backend that
+    never recorded them), never when the recorded value happens to be zero.
+    """
+
+    state: str
+    fail_counter: int | None
+    success_counter: int | None
+    opened_at: datetime | None
+
+
+@dataclasses.dataclass(frozen=True)
+class PolicyEvaluation:
+    """Outcome of evaluating a proposed policy against the recorded observations.
+
+    An evaluation is purely descriptive: it never executes the guarded call,
+    never changes counters and never notifies listeners. Fields whose value
+    cannot be decided from what was actually recorded are ``None`` and the
+    names of the missing observations are listed in `missing_history`; missing
+    history is reported as unknown instead of being guessed.
+
+    The outcomes answer the question asked before a runtime change:
+
+    * `would_open`: would a call made right now be rejected with
+      `CircuitBreakerError` under the proposed policy?
+    * `would_trip_on_next_failure`: would one more recorded failure open it?
+      This is the "would the new `fail_max` trip it immediately" signal, since
+      lowering the threshold below the recorded failure count primes the
+      breaker to open on the next failure.
+    * `would_close_on_next_success`: in half-open, would the next success
+      reach the proposed `success_threshold` and close it?
+
+    ``False`` always means "decided and negative", while ``None`` means "the
+    recorded observations do not allow a decision".
+    """
+
+    policy: CircuitBreakerPolicy
+    state_version: StateVersion
+    evaluated_at: datetime
+    current_state: str
+    fail_counter: int | None
+    success_counter: int | None
+    opened_at: datetime | None
+    would_open: bool | None
+    would_trip_on_next_failure: bool | None
+    would_close_on_next_success: bool | None
+    remaining_open_seconds: float | None
+    missing_history: tuple[str, ...] = ()
+
+    @property
+    def is_determinable(self) -> bool:
+        """Whether every outcome could be decided from the recorded observations."""
+        return not self.missing_history
+
+
+def _version_of(snapshot: StorageSnapshot) -> StateVersion:
+    """Return the state version that identifies the given observations."""
+    return (snapshot.state, snapshot.fail_counter, snapshot.success_counter, snapshot.opened_at)
+
+
+def _coerce_policy(value: object) -> CircuitBreakerPolicy:
+    """Return a validated copy of `value`, raising `InvalidPolicyError` when unusable."""
+    if not isinstance(value, CircuitBreakerPolicy):
+        msg = f"policy must be a CircuitBreakerPolicy, got {type(value).__name__}"
+        raise InvalidPolicyError(msg)
+    # Rebuild the policy so that values that bypassed validation (for example
+    # through ``object.__setattr__`` on a frozen instance or through
+    # ``dataclasses.replace``) are checked again before use.
+    try:
+        return CircuitBreakerPolicy(
+            fail_max=value.fail_max,
+            reset_timeout=value.reset_timeout,
+            success_threshold=value.success_threshold,
+        )
+    except InvalidPolicyError:
+        raise
+    except Exception as e:  # any unusable attribute value is a policy error
+        msg = f"invalid policy values: {e}"
+        raise InvalidPolicyError(msg) from e
+
+
+def _evaluate(
+    policy: CircuitBreakerPolicy,
+    snapshot: StorageSnapshot,
+    moment: datetime,
+) -> PolicyEvaluation:
+    """Describe what `policy` implies for the recorded `snapshot`.
+
+    Only the observations present in `snapshot` are used. Whenever an outcome
+    depends on an observation the backend did not record, that outcome stays
+    ``None`` and the observation is listed in `missing_history`; nothing is
+    inferred from data that does not exist.
+    """
+    missing: list[str] = []
+
+    state = snapshot.state
+    fail_counter = snapshot.fail_counter
+    success_counter = snapshot.success_counter
+    opened_at = snapshot.opened_at
+
+    would_open: bool | None = None
+    would_trip_on_next_failure: bool | None = None
+    would_close_on_next_success: bool | None = None
+    remaining_open_seconds: float | None = None
+
+    if state == STATE_CLOSED:
+        if fail_counter is None:
+            missing.append("fail_counter")
+        else:
+            # A closed circuit never rejects a call now. What a new `fail_max`
+            # changes is whether the recorded failures already prime it to open
+            # on the very next failure.
+            would_open = False
+            would_trip_on_next_failure = fail_counter + 1 >= policy.fail_max
+    elif state == STATE_OPEN:
+        if opened_at is None:
+            # Without the moment the circuit opened, whether the proposed
+            # `reset_timeout` has elapsed cannot be known.
+            missing.append("opened_at")
+        else:
+            elapsed = (moment - opened_at).total_seconds()
+            remaining_open_seconds = max(0.0, policy.reset_timeout - elapsed)
+            would_open = remaining_open_seconds > 0
+            # The next failure re-opens whatever happens, but that failure can
+            # only be recorded once the timeout lets a trial call through.
+            would_trip_on_next_failure = True
+            # That trial call always records a single success first, so only a
+            # threshold of one closes the circuit right after it.
+            would_close_on_next_success = policy.success_threshold <= 1
+    elif state == STATE_HALF_OPEN:
+        # Half-open lets the call through, so it is not open now, but the next
+        # failure always re-opens it. Recovery needs the success counter, which
+        # older storage formats never recorded.
+        would_open = False
+        would_trip_on_next_failure = True
+        if success_counter is None:
+            missing.append("success_counter")
+        else:
+            would_close_on_next_success = success_counter + 1 >= policy.success_threshold
+    else:
+        # A backend reporting an unrecognized state gives no basis for a verdict.
+        missing.append("state")
+
+    return PolicyEvaluation(
+        policy=policy,
+        state_version=_version_of(snapshot),
+        evaluated_at=moment,
+        current_state=state,
+        fail_counter=fail_counter,
+        success_counter=success_counter,
+        opened_at=opened_at,
+        would_open=would_open,
+        would_trip_on_next_failure=would_trip_on_next_failure,
+        would_close_on_next_success=would_close_on_next_success,
+        remaining_open_seconds=remaining_open_seconds,
+        missing_history=tuple(missing),
+    )
+
+
+def _optional_int(value: object) -> int | None:
+    """Return `value` as an int, or ``None`` when no integer was recorded."""
+    if isinstance(value, int) and not isinstance(value, bool):
+        return value
+    return None
+
+
+def _bytes_to_int(value: object) -> int | None:
+    """Return a Redis counter stored as bytes as an int, or ``None`` when absent or unreadable."""
+    if value is None:
+        return None
+    try:
+        return int(value)  # type: ignore[call-overload]
+    except (TypeError, ValueError):
+        return None
+
+
+def _epoch_to_datetime(value: object) -> datetime | None:
+    """Return a Redis epoch timestamp stored as bytes as a UTC datetime, or ``None`` when absent or unreadable."""
+    if value is None:
+        return None
+    try:
+        return datetime(*time.gmtime(int(value))[:6], tzinfo=UTC)  # type: ignore[call-overload]
+    except (TypeError, ValueError, OSError):
+        return None
+
+
+def _optional_datetime(value: object) -> datetime | None:
+    """Return `value` as a UTC datetime, or ``None`` when no timestamp was recorded."""
+    if isinstance(value, datetime):
+        return _as_utc(value)
+    return None
+
+
+def _read_optional(instance: object, attribute: str) -> Any:
+    """Return `instance.attribute`, or ``None`` when the backend cannot report it.
+
+    Storage backends, including ones written before these fields existed, may
+    either return ``None`` or raise when asked for an observation they never
+    recorded. Both cases mean the history is unknown, not that it is empty.
+    """
+    try:
+        return getattr(instance, attribute)
+    except Exception:  # any failure to report is a missing observation
+        return None
 
 
 class CircuitBreaker:
@@ -98,21 +400,63 @@ class CircuitBreaker:
         state_storage: CircuitBreakerStorage | None = None,
         name: str | None = None,
         throw_new_error_on_trip: bool = True,
+        policy: CircuitBreakerPolicy | None = None,
     ) -> None:
-        """Create a new circuit breaker with the given parameters."""
+        """Create a new circuit breaker with the given parameters.
+
+        The tuning parameters (`fail_max`, `reset_timeout` and
+        `success_threshold`) may alternatively be supplied as a single
+        `policy` object. When `policy` is given it takes precedence and the
+        individual arguments must keep their default values; the legacy
+        keyword arguments remain supported so existing code keeps working.
+        """
+        if policy is not None:
+            defaults = CircuitBreakerPolicy()
+            overridden = {
+                "fail_max": (fail_max, defaults.fail_max),
+                "reset_timeout": (reset_timeout, defaults.reset_timeout),
+                "success_threshold": (success_threshold, defaults.success_threshold),
+            }
+            conflicting = sorted(field for field, (given, default) in overridden.items() if given != default)
+            if conflicting:
+                msg = f"pass either policy or {', '.join(conflicting)}, not both"
+                raise InvalidPolicyError(msg)
+            resolved_policy = _coerce_policy(policy)
+        else:
+            resolved_policy = CircuitBreakerPolicy(
+                fail_max=fail_max,
+                reset_timeout=reset_timeout,
+                success_threshold=success_threshold,
+            )
+
         self._lock = threading.RLock()
         self._state_storage = state_storage or CircuitMemoryStorage(STATE_CLOSED)
         self._state = self._create_new_state(self.current_state)
 
-        self._fail_max = fail_max
-        self._reset_timeout = reset_timeout
-        self._success_threshold = success_threshold
+        self._policy = resolved_policy
 
         self._excluded_exceptions = list(exclude or [])
         self._listeners = list(listeners or [])
         self._name = name
 
         self._throw_new_error_on_trip = throw_new_error_on_trip
+
+    @property
+    def policy(self) -> CircuitBreakerPolicy:
+        """Return the policy currently in effect."""
+        return self._policy
+
+    @policy.setter
+    def policy(self, policy: CircuitBreakerPolicy) -> None:
+        """Replace the current policy as a whole.
+
+        The previous policy is kept untouched if `policy` is not a usable
+        `CircuitBreakerPolicy`, because an invalid configuration must never
+        leave the breaker half configured. This is the plain setter: it does
+        not check for observations recorded since the policy was evaluated. Use
+        `apply_policy_evaluation` for that guarantee.
+        """
+        self._policy = _coerce_policy(policy)
 
     @property
     def fail_counter(self) -> int:
@@ -127,34 +471,110 @@ class CircuitBreaker:
     @property
     def fail_max(self) -> int:
         """Return the maximum number of failures tolerated before the circuit is opened."""
-        return self._fail_max
+        return self._policy.fail_max
 
     @fail_max.setter
     def fail_max(self, number: int) -> None:
-        """Set the maximum `number` of failures tolerated before the circuit is opened."""
-        self._fail_max = number
+        """Set the maximum `number` of failures tolerated before the circuit is opened.
+
+        Kept for backwards compatibility: an invalid `number` raises
+        `InvalidPolicyError` and leaves the current policy unchanged.
+        """
+        validated = _validate_fail_max(number)
+        self._policy = dataclasses.replace(self._policy, fail_max=validated)
 
     @property
     def reset_timeout(self) -> float:
         """Once this circuit breaker is opened, it should remain opened until the
         timeout period, in seconds, elapses.
         """
-        return self._reset_timeout
+        return self._policy.reset_timeout
 
     @reset_timeout.setter
     def reset_timeout(self, timeout: float) -> None:
-        """Set the `timeout` period, in seconds, this circuit breaker should be kept open."""
-        self._reset_timeout = timeout
+        """Set the `timeout` period, in seconds, this circuit breaker should be kept open.
+
+        Kept for backwards compatibility: an invalid `timeout` raises
+        `InvalidPolicyError` and leaves the current policy unchanged.
+        """
+        validated = _validate_reset_timeout(timeout)
+        self._policy = dataclasses.replace(self._policy, reset_timeout=validated)
 
     @property
     def success_threshold(self) -> int:
         """Return the number of successful requests required before transitioning from half-open to closed state."""
-        return self._success_threshold
+        return self._policy.success_threshold
 
     @success_threshold.setter
     def success_threshold(self, threshold: int) -> None:
-        """Set the number of successful requests required before transitioning from half-open to closed state."""
-        self._success_threshold = threshold
+        """Set the number of successful requests required before transitioning from half-open to closed state.
+
+        Kept for backwards compatibility: an invalid `threshold` raises
+        `InvalidPolicyError` and leaves the current policy unchanged.
+        """
+        validated = _validate_success_threshold(threshold)
+        self._policy = dataclasses.replace(self._policy, success_threshold=validated)
+
+    def _snapshot(self) -> StorageSnapshot:
+        """Return the observations recorded by the storage backend right now.
+
+        Values the backend cannot report are returned as ``None`` so callers can
+        tell missing history apart from a recorded zero. Backends can override
+        `CircuitBreakerStorage.snapshot` to report masked failures accurately.
+        """
+        return self._state_storage.snapshot()
+
+    def evaluate_policy(
+        self,
+        policy: CircuitBreakerPolicy | None = None,
+        *,
+        now: datetime | None = None,
+    ) -> PolicyEvaluation:
+        """Report what `policy` would do given the observations recorded so far.
+
+        This entry point is strictly read-only: it does not execute the guarded
+        operation, does not increment or reset any counter, does not change the
+        state and does not notify listeners. Evaluating a policy therefore
+        never depends on a real request to the protected service.
+
+        The returned `PolicyEvaluation` carries the state version it was based
+        on; pass it to `apply_policy_evaluation` to install the policy only if
+        no newer observation was recorded in the meantime. Observations the
+        storage backend never recorded are reported as unknown through
+        `PolicyEvaluation.missing_history` instead of being assumed.
+        """
+        proposed = self.policy if policy is None else _coerce_policy(policy)
+        moment = datetime.now(UTC) if now is None else _as_utc(now)
+
+        with self._lock:
+            snapshot = self._snapshot()
+            return _evaluate(proposed, snapshot, moment)
+
+    def apply_policy_evaluation(self, evaluation: PolicyEvaluation) -> None:
+        """Install the policy of `evaluation` if no newer observation was recorded.
+
+        The current observations are read again and compared with the state
+        version the evaluation was based on. If they differ, the evaluation is
+        stale and `StalePolicyEvaluationError` is raised without changing
+        anything, so an evaluation cannot overwrite observations it never saw.
+        """
+        if not isinstance(evaluation, PolicyEvaluation):
+            msg = f"evaluation must be a PolicyEvaluation, got {type(evaluation).__name__}"
+            raise InvalidPolicyError(msg)
+
+        # Re-validate in case the evaluation was built by hand rather than by
+        # `evaluate_policy`; the previous policy is kept on failure.
+        proposed = _coerce_policy(evaluation.policy)
+
+        with self._lock:
+            current_version = _version_of(self._snapshot())
+            if current_version != evaluation.state_version:
+                msg = (
+                    "policy evaluation is stale: circuit breaker observations changed since it was produced "
+                    f"(evaluated against {evaluation.state_version!r}, now {current_version!r})"
+                )
+                raise StalePolicyEvaluationError(msg)
+            self._policy = proposed
 
     def _create_new_state(
         self,
@@ -412,6 +832,22 @@ class CircuitBreakerStorage:
     def opened_at(self, datetime: datetime) -> None:
         """Override this method to set the most recent value of when the circuit was opened."""
 
+    def snapshot(self) -> StorageSnapshot:
+        """Override this method to report the observations recorded right now.
+
+        The default implementation reads the individual properties and reports
+        any that the backend cannot provide as ``None``. Backends that mask
+        failures by returning default values (for example a Redis outage being
+        reported as zero failures) should override this so a policy evaluation
+        reports the observation as unknown instead of inventing a value.
+        """
+        return StorageSnapshot(
+            state=self.state,
+            fail_counter=_optional_int(_read_optional(self, "counter")),
+            success_counter=_optional_int(_read_optional(self, "success_counter")),
+            opened_at=_optional_datetime(_read_optional(self, "opened_at")),
+        )
+
 
 class CircuitMemoryStorage(CircuitBreakerStorage):
     """Implement a `CircuitBreakerStorage` in local memory."""
@@ -642,6 +1078,40 @@ class CircuitRedisStorage(CircuitBreakerStorage):
             name_parts.insert(0, self._namespace_name)
 
         return ":".join(name_parts)
+
+    def snapshot(self) -> StorageSnapshot:
+        """Return what Redis actually holds, reporting unreadable keys as unknown.
+
+        The individual properties fall back to defaults (zero failures, zero
+        successes) when Redis is unreachable, which is right for driving the
+        breaker but would make a policy evaluation believe those values were
+        observed. Reading them in one place lets an outage be reported as
+        missing history instead.
+        """
+        try:
+            state_bytes = self._redis.get(self._namespace("state"))
+            fail_counter_bytes = self._redis.get(self._namespace("fail_counter"))
+            success_counter_bytes = self._redis.get(self._namespace("success_counter"))
+            opened_at_bytes = self._redis.get(self._namespace("opened_at"))
+        except RedisError:
+            self.logger.exception("RedisError: policy evaluation cannot read the recorded observations")
+            return StorageSnapshot(
+                state=self._fallback_circuit_state,
+                fail_counter=None,
+                success_counter=None,
+                opened_at=None,
+            )
+
+        state = self._fallback_circuit_state
+        if state_bytes is not None:
+            state = state_bytes.decode("utf-8")
+
+        return StorageSnapshot(
+            state=state,
+            fail_counter=_bytes_to_int(fail_counter_bytes),
+            success_counter=_bytes_to_int(success_counter_bytes),
+            opened_at=_epoch_to_datetime(opened_at_bytes),
+        )
 
 
 class CircuitBreakerListener:

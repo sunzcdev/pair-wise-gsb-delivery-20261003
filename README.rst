@@ -334,6 +334,75 @@ change its current state:
 These properties and functions might and should be exposed to the operations
 staff somehow as they help them to detect problems in the system.
 
+Changing the Policy at Runtime
+``````````````````````````````
+
+The parameters that decide when the circuit opens (`fail_max`) and recovers
+(`reset_timeout`, `success_threshold`) can be grouped into a
+``CircuitBreakerPolicy``:
+
+.. code:: python
+
+    import pybreaker
+
+    breaker = pybreaker.CircuitBreaker(fail_max=5, reset_timeout=60)
+
+    # Same values as a policy object; behaves exactly like the keyword arguments
+    print(breaker.policy)
+    breaker.policy = pybreaker.CircuitBreakerPolicy(fail_max=10, reset_timeout=30)
+
+The legacy attributes keep working and are validated, so
+``breaker.fail_max = 10`` remains supported. A value that cannot be used
+(a negative threshold, a non-numeric timeout, ...) raises
+``pybreaker.InvalidPolicyError`` and the circuit breaker keeps its previous
+policy, so it is never left half configured.
+
+Before changing the policy of a live circuit breaker you usually want to know
+whether the new values would open it right away. ``evaluate_policy`` reports
+that without executing the guarded operation, without touching the counters,
+the state or the listeners:
+
+.. code:: python
+
+    evaluation = breaker.evaluate_policy(
+        pybreaker.CircuitBreakerPolicy(fail_max=2, reset_timeout=10, success_threshold=1)
+    )
+
+    # Closed circuit: does the recorded failure count already prime the breaker
+    # to open on the very next failure under the new fail_max?
+    print(evaluation.would_trip_on_next_failure)
+
+    # Open circuit: would a call be rejected now, and for how much longer?
+    print(evaluation.would_open)
+    print(evaluation.remaining_open_seconds)
+
+    # Half-open: would the next success reach the new success_threshold?
+    print(evaluation.would_close_on_next_success)
+
+An outcome of ``None`` means "the recorded observations do not allow a
+decision", and the observations that were unavailable are listed in
+``evaluation.missing_history``. For example, a storage backend that predates
+success counters cannot report them, and pybreaker reports that recovery
+cannot be determined instead of assuming zero failures or successes.
+
+Because an evaluation describes the observations it saw, applying it blindly
+could overwrite newer observations recorded by concurrent calls. Apply it
+through ``apply_policy_evaluation``, which re-reads the state and refuses the
+evaluation if anything changed in the meantime:
+
+.. code:: python
+
+    evaluation = breaker.evaluate_policy(
+        pybreaker.CircuitBreakerPolicy(fail_max=2, reset_timeout=10, success_threshold=1)
+    )
+    ...
+    try:
+        breaker.apply_policy_evaluation(evaluation)
+    except pybreaker.StalePolicyEvaluationError:
+        # A call failed/succeeded, or the state changed, since the evaluation;
+        # evaluate again against the new observations before applying.
+        ...
+
 Contributing
 -------------
 

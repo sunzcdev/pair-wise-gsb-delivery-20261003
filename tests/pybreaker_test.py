@@ -1,11 +1,13 @@
 import unittest
 from contextlib import contextmanager
-from datetime import datetime
+from datetime import UTC, datetime, timedelta
 from time import sleep
 from unittest import mock
 
 import pytest
+import pybreaker
 from pybreaker import *
+from pybreaker import CircuitBreakerStorage
 from tornado import gen, testing
 
 
@@ -1350,6 +1352,553 @@ class CircuitBreakerContextManagerTestCase(unittest.TestCase):
         mock_fn.assert_called_once()
         assert breaker.fail_counter == 0
         assert breaker.current_state == "closed"
+
+
+class LegacyCircuitStorage(CircuitBreakerStorage):
+    """A storage backend written before success counters and open timestamps existed."""
+
+    def __init__(self, state=STATE_CLOSED):
+        super().__init__("legacy")
+        self._state = state
+        self._fail_counter = 0
+
+    @property
+    def state(self):
+        return self._state
+
+    @state.setter
+    def state(self, state):
+        self._state = state
+
+    def increment_counter(self):
+        self._fail_counter += 1
+
+    def reset_counter(self):
+        self._fail_counter = 0
+
+    @property
+    def counter(self):
+        return self._fail_counter
+
+    def __getattribute__(self, name):
+        if name in ("success_counter", "opened_at"):
+            raise AttributeError(f"legacy storage never recorded {name}")
+        return super().__getattribute__(name)
+
+
+class TestCircuitBreakerPolicy:
+    """Tests for the runtime policy evaluation and application API."""
+
+    def test_default_policy_matches_legacy_defaults(self):
+        breaker = CircuitBreaker()
+        assert breaker.policy == CircuitBreakerPolicy(fail_max=5, reset_timeout=60, success_threshold=1)
+        assert breaker.fail_max == 5
+        assert breaker.reset_timeout == 60
+        assert breaker.success_threshold == 1
+
+    def test_legacy_keyword_arguments_still_supported(self):
+        breaker = CircuitBreaker(fail_max=3, reset_timeout=7.5, success_threshold=2)
+        assert breaker.policy.fail_max == 3
+        assert breaker.policy.reset_timeout == 7.5
+        assert breaker.policy.success_threshold == 2
+
+    def test_policy_argument(self):
+        policy = CircuitBreakerPolicy(fail_max=2, reset_timeout=4, success_threshold=3)
+        breaker = CircuitBreaker(policy=policy)
+        assert breaker.policy == policy
+        assert breaker.fail_max == 2
+        assert breaker.reset_timeout == 4
+        assert breaker.success_threshold == 3
+
+    def test_policy_argument_conflicts_with_keyword_arguments(self):
+        with pytest.raises(InvalidPolicyError):
+            CircuitBreaker(fail_max=2, policy=CircuitBreakerPolicy(fail_max=2))
+
+    def test_direct_attribute_setters_keep_working(self):
+        breaker = CircuitBreaker()
+        breaker.fail_max = 9
+        breaker.reset_timeout = 0.5
+        breaker.success_threshold = 4
+        assert breaker.policy == CircuitBreakerPolicy(fail_max=9, reset_timeout=0.5, success_threshold=4)
+
+    def test_zero_reset_timeout_stays_supported(self):
+        """A zero timeout (recover immediately) remains valid for compatibility."""
+        breaker = CircuitBreaker()
+        breaker.reset_timeout = 0
+        assert breaker.reset_timeout == 0
+
+    @pytest.mark.parametrize(
+        ("attribute", "value"),
+        [
+            ("fail_max", 0 - 1),
+            ("fail_max", 1.5),
+            ("fail_max", True),
+            ("reset_timeout", -1),
+            ("reset_timeout", float("inf")),
+            ("reset_timeout", "60"),
+            ("success_threshold", 0),
+            ("success_threshold", None),
+        ],
+    )
+    def test_invalid_attribute_value_keeps_previous_policy(self, attribute, value):
+        breaker = CircuitBreaker(fail_max=4, reset_timeout=30, success_threshold=2)
+        before = breaker.policy
+
+        with pytest.raises(InvalidPolicyError):
+            setattr(breaker, attribute, value)
+
+        assert breaker.policy is before
+
+    def test_invalid_policy_object_is_rejected(self):
+        breaker = CircuitBreaker(fail_max=4)
+        with pytest.raises(InvalidPolicyError):
+            breaker.policy = {"fail_max": 1}
+        assert breaker.fail_max == 4
+
+    @pytest.mark.parametrize(
+        "kwargs",
+        [
+            {"fail_max": -1},
+            {"fail_max": 2.5},
+            {"reset_timeout": -0.5},
+            {"reset_timeout": float("nan")},
+            {"success_threshold": 0},
+        ],
+    )
+    def test_invalid_policy_object_cannot_be_created(self, kwargs):
+        with pytest.raises(InvalidPolicyError):
+            CircuitBreakerPolicy(**kwargs)
+
+    def test_invalid_constructor_value_does_not_create_breaker(self):
+        with pytest.raises(InvalidPolicyError):
+            CircuitBreaker(fail_max=-1)
+
+    def test_evaluate_policy_is_read_only(self):
+        breaker = CircuitBreaker(fail_max=5)
+
+        def err():
+            raise NotImplementedError
+
+        for _ in range(2):
+            with pytest.raises(NotImplementedError):
+                breaker.call(err)
+
+        before_counter = breaker.fail_counter
+        before_state = breaker.current_state
+        before_storage = breaker._state_storage
+        before_policy = breaker.policy
+        before_calls = []
+
+        listener = mock.Mock(spec=CircuitBreakerListener)
+        breaker.add_listener(listener)
+
+        evaluation = breaker.evaluate_policy(CircuitBreakerPolicy(fail_max=1))
+
+        assert evaluation.would_trip_on_next_failure is True
+        assert breaker.fail_counter == before_counter
+        assert breaker.current_state == before_state
+        assert breaker._state_storage is before_storage
+        assert breaker.policy == before_policy
+        listener.before_call.assert_not_called()
+        listener.failure.assert_not_called()
+        listener.success.assert_not_called()
+        listener.state_change.assert_not_called()
+        assert before_calls == []
+
+    def test_evaluate_policy_does_not_need_a_guarded_request(self):
+        breaker = CircuitBreaker(fail_max=2)
+
+        def err():
+            raise NotImplementedError
+
+        with pytest.raises(NotImplementedError):
+            breaker.call(err)
+
+        # One failure is recorded, so the default policy is untouched, but a
+        # lowered fail_max can be decided without invoking anything.
+        evaluation = breaker.evaluate_policy(CircuitBreakerPolicy(fail_max=1))
+        assert evaluation.current_state == STATE_CLOSED
+        assert evaluation.would_trip_on_next_failure is True
+        assert evaluation.is_determinable
+
+    @pytest.mark.parametrize(
+        ("fail_counter", "fail_max", "would_trip"),
+        [
+            (0, 5, False),
+            (3, 5, False),
+            (4, 5, True),
+            (5, 5, True),
+            (6, 3, True),
+        ],
+    )
+    def test_evaluate_policy_closed_state(self, fail_counter, fail_max, would_trip):
+        storage = CircuitMemoryStorage(STATE_CLOSED)
+        for _ in range(fail_counter):
+            storage.increment_counter()
+        breaker = CircuitBreaker(state_storage=storage)
+
+        evaluation = breaker.evaluate_policy(CircuitBreakerPolicy(fail_max=fail_max))
+
+        assert evaluation.current_state == STATE_CLOSED
+        # A closed circuit never rejects a call, whatever the new threshold is.
+        assert evaluation.would_open is False
+        assert evaluation.would_trip_on_next_failure is would_trip
+        assert evaluation.missing_history == ()
+
+    @pytest.mark.parametrize(
+        ("opened_ago", "reset_timeout", "would_open", "remaining"),
+        [
+            (10, 60, True, 50),
+            (10, 30, True, 20),
+            (10, 5, False, 0),
+            (10, 10, False, 0),
+        ],
+    )
+    def test_evaluate_policy_open_state(self, opened_ago, reset_timeout, would_open, remaining):
+        storage = CircuitMemoryStorage(STATE_OPEN)
+        now = datetime.now(UTC)
+        storage.opened_at = now - timedelta(seconds=opened_ago)
+        breaker = CircuitBreaker(state_storage=storage)
+
+        evaluation = breaker.evaluate_policy(CircuitBreakerPolicy(reset_timeout=reset_timeout), now=now)
+
+        assert evaluation.current_state == STATE_OPEN
+        assert evaluation.would_open is would_open
+        assert evaluation.remaining_open_seconds == pytest.approx(remaining)
+
+    @pytest.mark.parametrize(
+        ("success_counter", "success_threshold", "would_close"),
+        [(0, 1, True), (0, 2, False), (1, 2, True), (2, 5, False), (4, 5, True)],
+    )
+    def test_evaluate_policy_half_open_state(self, success_counter, success_threshold, would_close):
+        storage = CircuitMemoryStorage(STATE_HALF_OPEN)
+        for _ in range(success_counter):
+            storage.increment_success_counter()
+        breaker = CircuitBreaker(state_storage=storage)
+
+        evaluation = breaker.evaluate_policy(CircuitBreakerPolicy(success_threshold=success_threshold))
+
+        assert evaluation.current_state == STATE_HALF_OPEN
+        assert evaluation.would_close_on_next_success is would_close
+        assert evaluation.would_trip_on_next_failure is True
+
+    def test_evaluate_policy_without_proposal_uses_current_policy(self):
+        breaker = CircuitBreaker(fail_max=7)
+        evaluation = breaker.evaluate_policy()
+        assert evaluation.policy == breaker.policy
+        assert evaluation.policy.fail_max == 7
+
+    def test_evaluate_policy_reports_state_version(self):
+        storage = CircuitMemoryStorage(STATE_CLOSED)
+        storage.increment_counter()
+        breaker = CircuitBreaker(state_storage=storage)
+
+        evaluation = breaker.evaluate_policy()
+        assert evaluation.state_version == (STATE_CLOSED, 1, 0, None)
+
+    def test_evaluate_policy_rejects_invalid_policy(self):
+        breaker = CircuitBreaker()
+        with pytest.raises(InvalidPolicyError):
+            breaker.evaluate_policy("fast")
+
+    def test_evaluate_policy_rejects_tampered_policy(self):
+        breaker = CircuitBreaker()
+        tampered = CircuitBreakerPolicy(fail_max=3)
+        object.__setattr__(tampered, "fail_max", 0)
+
+        with pytest.raises(InvalidPolicyError):
+            breaker.evaluate_policy(tampered)
+
+        assert breaker.fail_max == 5
+
+    def test_apply_policy_evaluation(self):
+        breaker = CircuitBreaker(fail_max=5, reset_timeout=60, success_threshold=1)
+        evaluation = breaker.evaluate_policy(CircuitBreakerPolicy(fail_max=2, reset_timeout=5, success_threshold=3))
+
+        breaker.apply_policy_evaluation(evaluation)
+
+        assert breaker.policy == CircuitBreakerPolicy(fail_max=2, reset_timeout=5, success_threshold=3)
+
+    def test_evaluate_policy_does_not_consume_the_proposal(self):
+        """Evaluating repeatedly yields the same verdict; nothing is consumed."""
+        breaker = CircuitBreaker(fail_max=5, reset_timeout=60, success_threshold=1)
+        proposal = CircuitBreakerPolicy(fail_max=2, reset_timeout=60, success_threshold=1)
+
+        first = breaker.evaluate_policy(proposal)
+        second = breaker.evaluate_policy(proposal)
+
+        assert first.policy == second.policy == proposal
+        assert first.state_version == second.state_version
+        assert first.would_open == second.would_open
+        assert breaker.policy.fail_max == 5
+
+    def test_apply_policy_evaluation_after_new_observation_is_stale(self):
+        breaker = CircuitBreaker(fail_max=5)
+        evaluation = breaker.evaluate_policy(CircuitBreakerPolicy(fail_max=2))
+
+        breaker.apply_policy_evaluation(evaluation)
+        assert breaker.fail_max == 2
+
+        def err():
+            raise NotImplementedError
+
+        # A failure recorded after the evaluation changes the observed counter,
+        # so the evaluation is no longer a description of the current state.
+        with pytest.raises(NotImplementedError):
+            breaker.call(err)
+
+        with pytest.raises(StalePolicyEvaluationError):
+            breaker.apply_policy_evaluation(evaluation)
+        assert breaker.fail_max == 2
+
+    def test_apply_policy_evaluation_rejects_stale_observation(self):
+        breaker = CircuitBreaker(fail_max=5)
+        evaluation = breaker.evaluate_policy(CircuitBreakerPolicy(fail_max=1))
+
+        def err():
+            raise NotImplementedError
+
+        with pytest.raises(NotImplementedError):
+            breaker.call(err)
+        assert breaker.fail_counter == 1
+
+        # The evaluation saw zero failures; applying it now would hide the
+        # failure recorded since, so it must be refused.
+        with pytest.raises(StalePolicyEvaluationError):
+            breaker.apply_policy_evaluation(evaluation)
+
+        assert breaker.fail_max == 5
+        assert breaker.fail_counter == 1
+
+    def test_apply_policy_evaluation_rejects_stale_state_change(self):
+        breaker = CircuitBreaker(fail_max=5)
+        evaluation = breaker.evaluate_policy(CircuitBreakerPolicy(fail_max=1))
+
+        breaker.open()
+
+        with pytest.raises(StalePolicyEvaluationError):
+            breaker.apply_policy_evaluation(evaluation)
+
+        assert breaker.fail_max == 5
+        assert breaker.current_state == STATE_OPEN
+
+    def test_apply_policy_evaluation_accepts_unchanged_observations(self):
+        breaker = CircuitBreaker(fail_max=5)
+        evaluation = breaker.evaluate_policy(CircuitBreakerPolicy(fail_max=1))
+
+        # Reading the state does not change the version.
+        assert breaker.current_state == STATE_CLOSED
+        assert breaker.fail_counter == 0
+
+        breaker.apply_policy_evaluation(evaluation)
+        assert breaker.fail_max == 1
+
+    def test_apply_policy_evaluation_rejects_foreign_object(self):
+        breaker = CircuitBreaker(fail_max=5)
+        with pytest.raises(InvalidPolicyError):
+            breaker.apply_policy_evaluation({"policy": CircuitBreakerPolicy(fail_max=1)})
+        assert breaker.fail_max == 5
+
+    def test_apply_policy_evaluation_rejects_tampered_policy(self):
+        breaker = CircuitBreaker(fail_max=5)
+        evaluation = breaker.evaluate_policy(CircuitBreakerPolicy(fail_max=2))
+        object.__setattr__(evaluation.policy, "fail_max", -1)
+
+        with pytest.raises(InvalidPolicyError):
+            breaker.apply_policy_evaluation(evaluation)
+        assert breaker.fail_max == 5
+
+    def test_lowered_fail_max_opens_on_evaluation_then_apply(self):
+        breaker = CircuitBreaker(fail_max=5)
+
+        def err():
+            raise NotImplementedError
+
+        for _ in range(3):
+            with pytest.raises(NotImplementedError):
+                breaker.call(err)
+
+        evaluation = breaker.evaluate_policy(CircuitBreakerPolicy(fail_max=2))
+        assert evaluation.would_trip_on_next_failure is True
+
+        breaker.apply_policy_evaluation(evaluation)
+        assert breaker.fail_max == 2
+        assert breaker.current_state == STATE_CLOSED
+
+        # The persisted counter already exceeds the new threshold, so the very
+        # next request is rejected and the circuit opens.
+        with pytest.raises(CircuitBreakerError):
+            breaker.call(err)
+        assert breaker.current_state == STATE_OPEN
+
+    def test_evaluate_policy_reports_missing_history_as_unknown(self):
+        storage = LegacyCircuitStorage(STATE_HALF_OPEN)
+        breaker = CircuitBreaker(state_storage=storage)
+
+        evaluation = breaker.evaluate_policy(CircuitBreakerPolicy(success_threshold=2))
+
+        # The legacy backend never recorded success counts, so recovery cannot
+        # be decided; reporting False would fabricate data.
+        assert evaluation.success_counter is None
+        assert evaluation.would_close_on_next_success is None
+        assert "success_counter" in evaluation.missing_history
+        assert not evaluation.is_determinable
+
+    def test_evaluate_policy_open_state_without_timestamp_is_unknown(self):
+        storage = LegacyCircuitStorage(STATE_OPEN)
+        breaker = CircuitBreaker(state_storage=storage)
+
+        evaluation = breaker.evaluate_policy(CircuitBreakerPolicy(reset_timeout=10))
+
+        assert evaluation.opened_at is None
+        assert evaluation.would_open is None
+        assert evaluation.remaining_open_seconds is None
+        assert "opened_at" in evaluation.missing_history
+
+    def test_apply_policy_evaluation_with_missing_history(self):
+        storage = LegacyCircuitStorage(STATE_HALF_OPEN)
+        breaker = CircuitBreaker(state_storage=storage)
+        evaluation = breaker.evaluate_policy(CircuitBreakerPolicy(success_threshold=2))
+
+        # Missing history is still a stable version, so the policy can be
+        # applied; only the undecidable outcomes stay unknown.
+        breaker.apply_policy_evaluation(evaluation)
+        assert breaker.success_threshold == 2
+
+    def test_memory_storage_reports_recorded_zero(self):
+        """A zero the backend really recorded is not reported as missing history."""
+        storage = CircuitMemoryStorage(STATE_CLOSED)
+        breaker = CircuitBreaker(state_storage=storage)
+
+        evaluation = breaker.evaluate_policy()
+
+        assert evaluation.fail_counter == 0
+        assert evaluation.success_counter == 0
+        assert evaluation.missing_history == ()
+        assert evaluation.is_determinable
+
+    def test_storage_can_override_snapshot_to_report_unknown(self):
+        """A backend masking failures can report them as unknown through `snapshot`."""
+
+        class MaskingStorage(CircuitMemoryStorage):
+            def snapshot(self):
+                return pybreaker.StorageSnapshot(
+                    state=self.state, fail_counter=None, success_counter=None, opened_at=None
+                )
+
+        breaker = CircuitBreaker(state_storage=MaskingStorage(STATE_CLOSED))
+        evaluation = breaker.evaluate_policy()
+
+        assert evaluation.fail_counter is None
+        assert evaluation.would_trip_on_next_failure is None
+        assert "fail_counter" in evaluation.missing_history
+
+    def test_evaluate_policy_unknown_state(self):
+        """A backend reporting a state the library cannot interpret yields no verdict."""
+        storage = CircuitMemoryStorage(STATE_CLOSED)
+        breaker = CircuitBreaker(state_storage=storage)
+
+        # For example another process wrote a state this version does not know.
+        storage.state = "confused"
+
+        evaluation = breaker.evaluate_policy()
+
+        assert evaluation.current_state == "confused"
+        assert evaluation.would_open is None
+        assert evaluation.would_trip_on_next_failure is None
+        assert evaluation.missing_history == ("state",)
+        assert not evaluation.is_determinable
+
+    def test_open_state_naive_timestamp_is_treated_as_utc(self):
+        """A backend storing naive timestamps is compared consistently in UTC."""
+        storage = CircuitMemoryStorage(STATE_OPEN)
+        now = datetime.now(UTC)
+        storage.opened_at = now.replace(tzinfo=None) - timedelta(seconds=10)
+        breaker = CircuitBreaker(state_storage=storage)
+
+        evaluation = breaker.evaluate_policy(CircuitBreakerPolicy(reset_timeout=30), now=now)
+
+        assert evaluation.would_open is True
+        assert evaluation.remaining_open_seconds == pytest.approx(20)
+
+
+class TestCircuitBreakerPolicyRedis:
+    """Policy evaluation against a shared (Redis) backend."""
+
+    def setup_method(self):
+        self.redis = fakeredis.FakeStrictRedis()
+        self.storage = CircuitRedisStorage(STATE_CLOSED, self.redis, namespace="policy")
+        self.breaker = CircuitBreaker(fail_max=5, state_storage=self.storage)
+
+    def teardown_method(self):
+        self.redis.flushall()
+
+    def test_evaluate_and_apply_against_redis(self):
+        def err():
+            raise NotImplementedError
+
+        for _ in range(3):
+            with pytest.raises(NotImplementedError):
+                self.breaker.call(err)
+
+        evaluation = self.breaker.evaluate_policy(CircuitBreakerPolicy(fail_max=2, reset_timeout=10))
+        assert evaluation.fail_counter == 3
+        assert evaluation.would_trip_on_next_failure is True
+        assert evaluation.missing_history == ()
+
+        self.breaker.apply_policy_evaluation(evaluation)
+        assert self.breaker.fail_max == 2
+
+    def test_other_instance_observation_makes_evaluation_stale(self):
+        evaluation = self.breaker.evaluate_policy(CircuitBreakerPolicy(fail_max=2))
+
+        # Another process sharing the Redis backend records a failure after the
+        # evaluation was produced.
+        other_storage = CircuitRedisStorage(STATE_CLOSED, self.redis, namespace="policy")
+        other = CircuitBreaker(fail_max=5, state_storage=other_storage)
+
+        def err():
+            raise NotImplementedError
+
+        with pytest.raises(NotImplementedError):
+            other.call(err)
+
+        with pytest.raises(StalePolicyEvaluationError):
+            self.breaker.apply_policy_evaluation(evaluation)
+        assert self.breaker.fail_max == 5
+
+    def test_redis_outage_is_reported_as_unknown_not_zero(self):
+        """An unreachable Redis must not look like a recorded zero-failure state."""
+
+        def unavailable(key):
+            raise RedisError("connection refused")
+
+        with mock.patch.object(self.redis, "get", new=unavailable):
+            evaluation = self.breaker.evaluate_policy(CircuitBreakerPolicy(fail_max=2))
+
+            # The individual properties return 0 on error, but that is a
+            # fallback value, not something Redis recorded.
+            assert self.storage.counter == 0
+            assert evaluation.fail_counter is None
+            assert evaluation.success_counter is None
+            assert evaluation.would_trip_on_next_failure is None
+            assert evaluation.missing_history == ("fail_counter",)
+            assert not evaluation.is_determinable
+
+        assert self.breaker.fail_max == 5
+
+    def test_outage_after_evaluation_is_detected_as_stale(self):
+        """Losing the backend between evaluation and application prevents applying it."""
+
+        def unavailable(key):
+            raise RedisError("connection refused")
+
+        evaluation = self.breaker.evaluate_policy(CircuitBreakerPolicy(fail_max=2))
+
+        with mock.patch.object(self.redis, "get", new=unavailable), pytest.raises(StalePolicyEvaluationError):
+            self.breaker.apply_policy_evaluation(evaluation)
+
+        assert self.breaker.fail_max == 5
 
 
 if __name__ == "__main__":

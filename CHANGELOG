@@ -1,6 +1,21 @@
 Changelog
 =========
 
+Version 1.5.0 (November 18, 2026)
+
+* Add `CircuitBreakerPolicy` grouping `fail_max`, `reset_timeout` and
+  `success_threshold`, validated on construction
+* Add read-only `CircuitBreaker.evaluate_policy()`, reporting whether a policy
+  would open the circuit, and what is unknown because the storage backend never
+  recorded it (`PolicyEvaluation.missing_history`), without executing the
+  guarded call or consuming the proposal like a real request would
+* Add `CircuitBreaker.apply_policy_evaluation()`, refusing to apply an
+  evaluation whose observations changed since it was produced
+  (`StalePolicyEvaluationError`)
+* Invalid runtime configuration raises `InvalidPolicyError` and leaves the
+  previous policy in place; the `fail_max`, `reset_timeout` and
+  `success_threshold` attributes keep working as before
+
 Version 1.4.0 (July 6, 2025)
 
 * Add success_threshold parameter (Thanks @sideshowbandana)
