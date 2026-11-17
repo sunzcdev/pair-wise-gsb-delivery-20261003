@@ -33,6 +33,18 @@ class test_Direct(ExchangeCase):
         assert self.e.lookup(
             self.table, exchange, routing_key, default) == expected
 
+    def test_deliver(self):
+        self.e.channel = Mock()
+        self.e.channel._lookup.return_value = ['qFoo', 'qFox']
+        message = Mock()
+        assert self.e.deliver(message, 'exchange', 'rFoo') == [
+            'qFoo', 'qFox',
+        ]
+        assert self.e.channel._put.call_args_list == [
+            (('qFoo', message), {}),
+            (('qFox', message), {}),
+        ]
+
 
 class test_Fanout(ExchangeCase):
     type = exchange.FanoutExchange
@@ -50,7 +62,8 @@ class test_Fanout(ExchangeCase):
         self.e.channel.supports_fanout = True
         message = Mock()
 
-        self.e.deliver(message, 'exchange', 'rkey')
+        assert self.e.deliver(message, 'exchange', 'rkey') is (
+            self.e.channel._lookup.return_value)
         self.e.channel._put_fanout.assert_called_with(
             'exchange', message, 'rkey',
         )
@@ -59,7 +72,7 @@ class test_Fanout(ExchangeCase):
         self.e.channel = Mock()
         self.e.channel.supports_fanout = False
 
-        self.e.deliver(Mock(), 'exchange', None)
+        assert self.e.deliver(Mock(), 'exchange', None) == []
         self.e.channel._put_fanout.assert_not_called()
 
 
@@ -96,7 +109,7 @@ class test_Topic(ExchangeCase):
         self.e.channel = Mock()
         self.e.channel._lookup.return_value = ('a', 'b')
         message = Mock()
-        self.e.deliver(message, 'exchange', 'rkey')
+        assert self.e.deliver(message, 'exchange', 'rkey') == ['a', 'b']
 
         assert self.e.channel._put.call_args_list == [
             (('a', message), {}),

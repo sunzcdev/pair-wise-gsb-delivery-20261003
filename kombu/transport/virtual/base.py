@@ -38,6 +38,22 @@ Message could not be delivered: No queues bound to exchange {exchange!r} \
 using binding key {routing_key!r}.
 """
 
+UNDELIVERABLE_CHAIN_FMT = """\
+Message could not be delivered: No queues bound to exchange {exchange!r} \
+or any exchange in its alternate exchange chain \
+using binding key {routing_key!r}.
+"""
+
+UNDELIVERABLE_ALT_FMT = """\
+Message could not be delivered: alternate exchange {alternate!r} \
+declared by exchange {exchange!r} no longer exists.
+"""
+
+ALTERNATE_CYCLE_FMT = """\
+PRECONDITION_FAILED - declaring exchange {0!r} with \
+alternate-exchange {1!r} would create an alternate exchange cycle\
+"""
+
 NOT_EQUIVALENT_FMT = """\
 Cannot redeclare exchange {0!r} in vhost {1!r} with \
 different type, durable, autodelete or arguments value.\
@@ -79,6 +95,14 @@ class NotEquivalentError(Exception):
 
 class UndeliverableWarning(UserWarning):
     """The message could not be delivered to a queue."""
+
+
+class AlternateExchangeWarning(UserWarning):
+    """An alternate exchange in the routing chain no longer exists."""
+
+
+class UndeliverableError(Exception):
+    """A mandatory message could not be delivered to any queue."""
 
 
 class BrokerState:
@@ -467,6 +491,12 @@ class Channel(AbstractChannel, base.StdChannel):
     #: Set by ``transport_options['deadletter_queue']``.
     deadletter_queue = None
 
+    #: Maximum number of alternate exchanges followed when routing a
+    #: single message.  This is a safety bound against routing loops
+    #: created outside of the declaration-time cycle detection
+    #: (e.g. by deleting and redeclaring exchanges).
+    max_alternate_exchange_hops = 32
+
     # List of options to transfer from :attr:`transport_options`.
     from_transport_options = ('body_encoding', 'deadletter_queue')
 
@@ -520,6 +550,7 @@ class Channel(AbstractChannel, base.StdChannel):
                 raise NotEquivalentError(NOT_EQUIVALENT_FMT.format(
                     exchange, self.connection.client.virtual_host or '/'))
         except KeyError:
+            self._check_alternate_exchange_cycle(exchange, arguments)
             self.state.exchanges[exchange] = {
                 'type': type,
                 'durable': durable,
@@ -527,6 +558,37 @@ class Channel(AbstractChannel, base.StdChannel):
                 'arguments': arguments or {},
                 'table': [],
             }
+
+    def _check_alternate_exchange_cycle(self, exchange, arguments):
+        """Raise if declaring `exchange` creates an alternate exchange cycle.
+
+        Follows the ``alternate-exchange`` argument chain through already
+        declared exchanges; if the chain loops back to an exchange already
+        seen, declaring `exchange` would create a routing cycle and a
+        :class:`~kombu.exceptions.ChannelError` is raised.
+
+        Note:
+        ----
+            Only cycles between currently declared exchanges can be
+            detected here.  Loops created later (e.g. by deleting and
+            redeclaring exchanges) are still bounded at publish time by
+            :attr:`max_alternate_exchange_hops`.
+        """
+        visited = {exchange}
+        alternate = (arguments or {}).get('alternate-exchange')
+        while alternate:
+            if alternate in visited:
+                raise ChannelError(
+                    ALTERNATE_CYCLE_FMT.format(exchange, alternate),
+                    (50, 10), 'Channel.exchange_declare', '406',
+                )
+            visited.add(alternate)
+            try:
+                next_arguments = self.state.exchanges[alternate]['arguments']
+            except KeyError:
+                # alternate not declared (yet): cannot detect further.
+                break
+            alternate = (next_arguments or {}).get('alternate-exchange')
 
     def exchange_delete(self, exchange, if_unused=False, nowait=False):
         """Delete `exchange` and all its bindings."""
@@ -617,9 +679,15 @@ class Channel(AbstractChannel, base.StdChannel):
         """Publish message."""
         self._inplace_augment_message(message, exchange, routing_key)
         if exchange:
-            return self.typeof(exchange).deliver(
+            queues = self.typeof(exchange).deliver(
                 message, exchange, routing_key, **kwargs
             )
+            if kwargs.get('mandatory') and not queues:
+                # a mandatory message that could not be routed must not
+                # be mistaken for a successfully consumed one.
+                raise UndeliverableError(
+                    self._unrouted_reason(exchange, routing_key))
+            return queues
         # anon exchange: routing_key is the destination queue
         return self._put(routing_key, message, **kwargs)
 
@@ -717,6 +785,13 @@ class Channel(AbstractChannel, base.StdChannel):
     def _lookup(self, exchange, routing_key, default=None):
         """Find all queues matching `routing_key` for the given `exchange`.
 
+        If `exchange` does not match any queue, its declared
+        ``alternate-exchange`` (if any) is consulted with the same
+        routing key, and so on down the chain.  Every hop reads the
+        complete, current routing table of that exchange, and queues
+        are deduplicated so that a queue reachable through multiple
+        hops still receives only one copy of the message.
+
         Returns
         -------
             list[str]: queue names -- must return `[default]`
@@ -728,20 +803,95 @@ class Channel(AbstractChannel, base.StdChannel):
             return [routing_key or default]
 
         try:
-            R = self.typeof(exchange).lookup(
-                self.get_table(exchange),
-                exchange, routing_key, default,
-            )
+            R, missing = self._lookup_chain(exchange, routing_key)
         except KeyError:
-            R = []
+            R, missing = [], []
 
         if not R and default is not None:
-            warnings.warn(UndeliverableWarning(UNDELIVERABLE_FMT.format(
-                exchange=exchange, routing_key=routing_key)),
-            )
+            if missing:
+                warnings.warn(AlternateExchangeWarning(
+                    UNDELIVERABLE_ALT_FMT.format(
+                        exchange=missing[0][0], alternate=missing[0][1])),
+                )
+            else:
+                warnings.warn(UndeliverableWarning(UNDELIVERABLE_FMT.format(
+                    exchange=exchange, routing_key=routing_key)),
+                )
             self._new_queue(default)
             R = [default]
         return R
+
+    def _lookup_chain(self, exchange, routing_key):
+        """Resolve queues for `exchange`, following alternate exchanges.
+
+        An exchange only delegates to its declared ``alternate-exchange``
+        when its own routing table matches no queue; the original routing
+        key is preserved for every hop.  The walk is bounded both by a
+        visited set and by :attr:`max_alternate_exchange_hops`, so
+        routing cycles cannot cause infinite recursion.
+
+        Returns
+        -------
+            Tuple[list, list]: of ``(queues, missing)`` where ``queues``
+                is a deduplicated list of queue names and ``missing`` is
+                a list of ``(exchange, alternate)`` tuples naming
+                declared alternate exchanges that no longer exist.
+        """
+        queues, seen, missing = [], set(), []
+        visited = set()
+        current = exchange
+        for _ in range(self.max_alternate_exchange_hops):
+            if not current or current in visited:
+                break
+            visited.add(current)
+            table = self.get_table(current)
+            matched = self.typeof(current).lookup(
+                table, current, routing_key, None,
+            )
+            for queue in matched:
+                if queue not in seen:
+                    seen.add(queue)
+                    queues.append(queue)
+            if queues:
+                break
+            alternate = self._alternate_exchange_for(current)
+            if not alternate:
+                break
+            if alternate not in self.state.exchanges:
+                missing.append((current, alternate))
+                break
+            current = alternate
+        return queues, missing
+
+    def _alternate_exchange_for(self, exchange):
+        """Return the alternate exchange declared for `exchange`, if any."""
+        try:
+            arguments = self.state.exchanges[exchange]['arguments']
+        except KeyError:
+            return None
+        return (arguments or {}).get('alternate-exchange')
+
+    def _unrouted_reason(self, exchange, routing_key):
+        """Explain why a message published to `exchange` was not routed.
+
+        Distinguishes a disappeared alternate exchange from the case
+        where no exchange in the whole chain accepted the message.
+        """
+        visited = set()
+        current = exchange
+        for _ in range(self.max_alternate_exchange_hops):
+            if not current or current in visited:
+                break
+            visited.add(current)
+            alternate = self._alternate_exchange_for(current)
+            if not alternate:
+                break
+            if alternate not in self.state.exchanges:
+                return UNDELIVERABLE_ALT_FMT.format(
+                    exchange=current, alternate=alternate)
+            current = alternate
+        return UNDELIVERABLE_CHAIN_FMT.format(
+            exchange=exchange, routing_key=routing_key)
 
     def _restore(self, message):
         """Redeliver message to its original destination."""

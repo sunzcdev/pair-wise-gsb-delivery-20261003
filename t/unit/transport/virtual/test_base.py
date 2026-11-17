@@ -640,6 +640,176 @@ class test_Channel:
         ) == self.channel.max_priority - 2
 
 
+
+class test_Channel_alternate_exchange:
+
+    def setup_method(self):
+        self.channel = memory_client().channel()
+
+    def teardown_method(self):
+        if self.channel._qos is not None:
+            self.channel._qos._on_collect.cancel()
+
+    def test_declare_stores_alternate_exchange(self):
+        c = self.channel
+        c.exchange_declare(
+            'ae.main', arguments={'alternate-exchange': 'ae.alt'})
+        assert c.state.exchanges['ae.main']['arguments'] == {
+            'alternate-exchange': 'ae.alt',
+        }
+
+    def test_declare_alternate_need_not_exist(self):
+        c = self.channel
+        c.exchange_declare(
+            'ae.main2', arguments={'alternate-exchange': 'ae.gone'})
+        assert 'ae.main2' in c.state.exchanges
+
+    def test_declare_self_cycle_detected(self):
+        c = self.channel
+        with pytest.raises(ChannelError):
+            c.exchange_declare(
+                'ae.self', arguments={'alternate-exchange': 'ae.self'})
+        assert 'ae.self' not in c.state.exchanges
+
+    def test_declare_direct_cycle_detected(self):
+        c = self.channel
+        c.exchange_declare('ae.c1', arguments={'alternate-exchange': 'ae.c2'})
+        with pytest.raises(ChannelError):
+            c.exchange_declare(
+                'ae.c2', arguments={'alternate-exchange': 'ae.c1'})
+        assert 'ae.c2' not in c.state.exchanges
+
+    def test_declare_indirect_cycle_detected(self):
+        c = self.channel
+        c.exchange_declare('ae.i1', arguments={'alternate-exchange': 'ae.i2'})
+        c.exchange_declare('ae.i2', arguments={'alternate-exchange': 'ae.i3'})
+        with pytest.raises(ChannelError):
+            c.exchange_declare(
+                'ae.i3', arguments={'alternate-exchange': 'ae.i1'})
+        assert 'ae.i3' not in c.state.exchanges
+
+    def test_lookup_falls_back_to_alternate(self):
+        c = self.channel
+        c.exchange_declare('ae.f_alt')
+        c.exchange_declare(
+            'ae.f_main', arguments={'alternate-exchange': 'ae.f_alt'})
+        c.queue_declare('ae.f_q')
+        c.queue_bind('ae.f_q', 'ae.f_alt', 'rkey')
+        assert c._lookup('ae.f_main', 'rkey') == ['ae.f_q']
+
+    def test_lookup_no_fallback_when_routed(self):
+        c = self.channel
+        c.exchange_declare('ae.n_alt')
+        c.exchange_declare(
+            'ae.n_main', arguments={'alternate-exchange': 'ae.n_alt'})
+        c.queue_declare('ae.n_q1')
+        c.queue_bind('ae.n_q1', 'ae.n_main', 'rkey')
+        c.queue_declare('ae.n_q2')
+        c.queue_bind('ae.n_q2', 'ae.n_alt', 'rkey')
+        assert c._lookup('ae.n_main', 'rkey') == ['ae.n_q1']
+
+    def test_lookup_chain_multiple_hops(self):
+        c = self.channel
+        c.exchange_declare('ae.h_last')
+        c.exchange_declare(
+            'ae.h_mid', arguments={'alternate-exchange': 'ae.h_last'})
+        c.exchange_declare(
+            'ae.h_main', arguments={'alternate-exchange': 'ae.h_mid'})
+        c.queue_declare('ae.h_q')
+        c.queue_bind('ae.h_q', 'ae.h_last', 'rkey')
+        assert c._lookup('ae.h_main', 'rkey') == ['ae.h_q']
+
+    def test_lookup_missing_alternate_warns(self):
+        c = self.channel
+        c.exchange_declare(
+            'ae.m_main', arguments={'alternate-exchange': 'ae.m_gone'})
+        warnings.resetwarnings()
+        with warnings.catch_warnings(record=True) as log:
+            warnings.simplefilter('always')
+            assert c._lookup('ae.m_main', 'rkey', 'ae.m_default') == [
+                'ae.m_default',
+            ]
+        assert log
+        assert any(issubclass(w.category, virtual.AlternateExchangeWarning)
+                   for w in log)
+        assert 'ae.m_gone' in log[0].message.args[0]
+
+    def test_lookup_unrouted_chain_warns_undeliverable(self):
+        c = self.channel
+        c.exchange_declare('ae.u_alt')
+        c.exchange_declare(
+            'ae.u_main', arguments={'alternate-exchange': 'ae.u_alt'})
+        warnings.resetwarnings()
+        with warnings.catch_warnings(record=True) as log:
+            warnings.simplefilter('always')
+            assert c._lookup('ae.u_main', 'rkey', 'ae.u_default') == [
+                'ae.u_default',
+            ]
+        assert log
+        assert any(issubclass(w.category, virtual.UndeliverableWarning)
+                   for w in log)
+        assert not any(
+            issubclass(w.category, virtual.AlternateExchangeWarning)
+            for w in log)
+
+    def test_lookup_cycle_is_bounded(self):
+        c = self.channel
+        # cycles rejected at declare time can still appear if exchanges
+        # are deleted/redeclared; simulate by injecting state directly.
+        c.exchange_declare('ae.l1')
+        c.exchange_declare('ae.l2')
+        c.state.exchanges['ae.l1']['arguments'] = {
+            'alternate-exchange': 'ae.l2'}
+        c.state.exchanges['ae.l2']['arguments'] = {
+            'alternate-exchange': 'ae.l1'}
+        assert c._lookup('ae.l1', 'rkey') == []
+
+    def test_lookup_hop_limit_is_bounded(self):
+        c = self.channel
+        c.max_alternate_exchange_hops = 4
+        previous = None
+        for i in range(10):
+            name = 'ae.hop%d' % i
+            arguments = (
+                {'alternate-exchange': previous} if previous else None)
+            c.exchange_declare(name, arguments=arguments)
+            previous = name
+        assert c._lookup(previous, 'rkey') == []
+
+    def test_basic_publish_mandatory_unrouted_raises(self):
+        c = self.channel
+        c.exchange_declare('ae.p_main')
+        message = c.prepare_message('foo')
+        with pytest.raises(virtual.UndeliverableError) as exc_info:
+            c.basic_publish(message, 'ae.p_main', 'rkey', mandatory=True)
+        assert 'alternate exchange chain' in str(exc_info.value)
+
+    def test_basic_publish_mandatory_missing_alternate_raises(self):
+        c = self.channel
+        c.exchange_declare(
+            'ae.p2_main', arguments={'alternate-exchange': 'ae.p2_gone'})
+        message = c.prepare_message('foo')
+        with pytest.raises(virtual.UndeliverableError) as exc_info:
+            c.basic_publish(message, 'ae.p2_main', 'rkey', mandatory=True)
+        assert 'ae.p2_gone' in str(exc_info.value)
+        assert 'alternate exchange' in str(exc_info.value)
+
+    def test_basic_publish_mandatory_routed(self):
+        c = self.channel
+        c.exchange_declare('ae.r_main')
+        c.queue_declare('ae.r_q')
+        c.queue_bind('ae.r_q', 'ae.r_main', 'rkey')
+        message = c.prepare_message('foo')
+        assert c.basic_publish(
+            message, 'ae.r_main', 'rkey', mandatory=True) == ['ae.r_q']
+
+    def test_basic_publish_unrouted_not_mandatory(self):
+        c = self.channel
+        c.exchange_declare('ae.s_main')
+        message = c.prepare_message('foo')
+        assert c.basic_publish(message, 'ae.s_main', 'rkey') == []
+
+
 class test_Transport:
 
     def setup_method(self):
