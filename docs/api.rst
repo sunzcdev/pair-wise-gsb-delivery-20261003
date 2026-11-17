@@ -290,6 +290,11 @@ API Reference
 
 .. autoclass:: CallsiteParameterAdder
 
+.. autoclass:: DuplicateEventSuppressor
+   :members: flush
+
+.. autoclass:: SuppressionSummary
+
 
 `structlog.stdlib` Module
 -------------------------

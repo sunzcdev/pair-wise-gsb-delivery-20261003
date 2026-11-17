@@ -15,6 +15,11 @@ You can find our backwards-compatibility policy [here](https://github.com/hynek/
 
 ## [Unreleased](https://github.com/hynek/structlog/compare/26.1.0...HEAD)
 
+### Added
+
+- `structlog.processors.DuplicateEventSuppressor`, an optional processor that suppresses duplicate events sharing a stable signature within a configurable time window.
+  It passes only a limited number of events per signature per window, never lets a higher-level event get swallowed by a lower-level window, bounds its signature cache with LRU eviction, supports an injectable clock, guards against re-entrant settlement, and exposes `flush()` to retrieve `structlog.processors.SuppressionSummary` objects -- including the suppressed count and first/last timestamps -- at process shutdown.
+
 ### Changed
 
 - On Python 3.15 and later, *structlog* uses [PEP 810](https://peps.python.org/pep-0810/) lazy imports for modules that are only needed once you log.

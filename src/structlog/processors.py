@@ -22,6 +22,7 @@ import sys
 import threading
 import time
 
+from collections import OrderedDict
 from collections.abc import Callable, Collection, Sequence
 from types import FrameType, TracebackType
 from typing import (
@@ -41,6 +42,7 @@ from ._frames import (
 from ._log_levels import NAME_TO_LEVEL, add_log_level
 from ._utils import get_processname
 from .contextvars import _ASYNC_CALLING_THREAD
+from .exceptions import DropEvent
 from .tracebacks import ExceptionDictTransformer
 from .typing import (
     EventDict,
@@ -54,12 +56,14 @@ __all__ = [
     "NAME_TO_LEVEL",  # some people rely on it being here
     "CallsiteParameter",
     "CallsiteParameterAdder",
+    "DuplicateEventSuppressor",
     "EventRenamer",
     "ExceptionPrettyPrinter",
     "JSONRenderer",
     "KeyValueRenderer",
     "LogfmtRenderer",
     "StackInfoRenderer",
+    "SuppressionSummary",
     "TimeStamper",
     "UnicodeDecoder",
     "UnicodeEncoder",
@@ -1006,3 +1010,281 @@ class EventRenamer:
                 event_dict["event"] = replace_by
 
         return event_dict
+
+
+_MISSING: Final = object()
+
+
+class SuppressionSummary(NamedTuple):
+    """
+    Summary of duplicate events that were suppressed within one window.
+
+    Args:
+        signature:
+            The signature tuple the suppressed events shared, built from the
+            configured stable keys.
+        level:
+            The raw level of the events in the window (as found under
+            *level_key*), or `None` if no level was present.
+        suppressed_count: Number of events that were dropped in the window.
+        first_seen: Clock value of the first event of the window.
+        last_seen: Clock value of the last suppressed event of the window.
+
+    .. versionadded:: 26.2.0
+    """
+
+    signature: tuple[Any, ...]
+    level: Any
+    suppressed_count: int
+    first_seen: float
+    last_seen: float
+
+
+class _Window:
+    """
+    Bookkeeping for one signature inside the current suppression window.
+    """
+
+    __slots__ = ("first_seen", "last_seen", "level", "passed", "suppressed")
+
+    def __init__(self, level: Any, now: float) -> None:
+        self.level = level
+        self.passed = 0
+        self.suppressed = 0
+        self.first_seen = now
+        self.last_seen = now
+
+
+class DuplicateEventSuppressor:
+    """
+    Suppress duplicate events sharing a stable signature in a time window.
+
+    A signature is built from the values of *signature_keys* in *event_dict*.
+    The first *max_passed* events of each signature are passed through within
+    every *window* seconds; further duplicates are dropped by raising
+    `structlog.DropEvent`.  When a window expires, the cache is full and an
+    entry has to be evicted, or `flush()` is called, a `SuppressionSummary` is
+    produced for every signature that actually had events suppressed.  The
+    summaries can be retrieved with `flush()` -- which makes this processor
+    suitable for reporting at process shutdown -- and are additionally passed
+    to *on_settle* right when they are produced.
+
+    Events with a **higher** level than the events that opened the window are
+    never swallowed by an older, lower-level window: the old window is settled
+    first and the escalated event opens a fresh window.
+
+    The cache of open windows is capped at *max_signatures* entries.  When the
+    cap is reached, the least recently used entry is evicted and settled.
+    Settlement never runs this processor again, so sink callbacks that log
+    cannot trigger recursive suppression.
+
+    Args:
+        window:
+            Length of the suppression window in clock units (default: 60
+            seconds).
+        max_passed:
+            Maximum number of events with the same signature that pass through
+            per window (default: 1).
+        signature_keys:
+            Keys whose values form the event signature (default:
+            ``("event",)``).  Missing keys contribute a sentinel and
+            unhashable values fall back to their ``repr()``.
+        level_key:
+            Key that carries the event level.  Both level names (as produced by
+            `add_log_level`) and numeric level numbers are understood
+            (default: ``"level"``).
+        clock:
+            Injectable zero-argument callable returning the current time,
+            useful for deterministic tests (default:
+            :func:`time.monotonic`).
+        max_signatures:
+            Maximum number of open windows tracked at the same time.  When the
+            cache is full, the least recently used window is evicted and
+            settled (default: 1024).
+        on_settle:
+            Optional callable invoked with every `SuppressionSummary` at the
+            moment it is produced.  Re-entrant calls from within the callback
+            are guarded against.
+
+    .. versionadded:: 26.2.0
+    """
+
+    __slots__ = (
+        "_clock",
+        "_level_key",
+        "_lock",
+        "_max_passed",
+        "_max_signatures",
+        "_on_settle",
+        "_reentrant",
+        "_signature_keys",
+        "_summaries",
+        "_window",
+        "_windows",
+    )
+
+    def __init__(
+        self,
+        window: float = 60.0,
+        max_passed: int = 1,
+        signature_keys: Sequence[str] = ("event",),
+        level_key: str = "level",
+        clock: Callable[[], float] = time.monotonic,
+        max_signatures: int = 1024,
+        on_settle: Callable[[SuppressionSummary], None] | None = None,
+    ) -> None:
+        if window <= 0:
+            msg = "window must be greater than 0"
+            raise ValueError(msg)
+        if max_passed < 1:
+            msg = "max_passed must be at least 1"
+            raise ValueError(msg)
+        if max_signatures < 1:
+            msg = "max_signatures must be at least 1"
+            raise ValueError(msg)
+        if not signature_keys:
+            msg = "signature_keys must not be empty"
+            raise ValueError(msg)
+
+        self._window = window
+        self._max_passed = max_passed
+        self._signature_keys = tuple(signature_keys)
+        self._level_key = level_key
+        self._clock = clock
+        self._max_signatures = max_signatures
+        self._on_settle = on_settle
+
+        self._windows: OrderedDict[tuple[Any, ...], _Window] = OrderedDict()
+        self._summaries: list[SuppressionSummary] = []
+        self._lock = threading.RLock()
+        self._reentrant = False
+
+    def __call__(
+        self, logger: WrappedLogger, name: str, event_dict: EventDict
+    ) -> EventDict:
+        now = self._clock()
+        signature = self._make_signature(event_dict)
+
+        with self._lock:
+            window = self._windows.get(signature)
+            if window is not None and (
+                now - window.first_seen >= self._window
+                or self._is_escalation(event_dict, window)
+            ):
+                # Remove before settling so a re-entrant flush() in the sink
+                # cannot settle the same window twice.
+                del self._windows[signature]
+                self._settle(signature, window)
+                window = None
+
+            if window is None:
+                if len(self._windows) >= self._max_signatures:
+                    evicted_signature, evicted_window = self._windows.popitem(
+                        last=False
+                    )
+                    self._settle(evicted_signature, evicted_window)
+
+                window = _Window(self._raw_level(event_dict), now)
+                self._windows[signature] = window
+            else:
+                window.last_seen = now
+                self._windows.move_to_end(signature)
+
+            if window.passed < self._max_passed:
+                window.passed += 1
+
+                return event_dict
+
+            window.suppressed += 1
+
+        raise DropEvent
+
+    def flush(self) -> list[SuppressionSummary]:
+        """
+        Settle all open windows and return the produced summaries.
+
+        All pending summaries -- including ones produced earlier by expired
+        windows or cache evictions -- are returned and removed from the
+        processor.  Windows without suppressed events do not produce a
+        summary.  Call this at process shutdown to make sure no suppression
+        information is lost.
+        """
+        with self._lock:
+            # Detach the windows before settling so a re-entrant flush() from
+            # an on_settle callback does not settle the same windows twice.
+            pending = list(self._windows.items())
+            self._windows.clear()
+            for signature, window in pending:
+                self._settle(signature, window)
+
+            summaries = self._summaries
+            self._summaries = []
+
+            return summaries
+
+    def _make_signature(self, event_dict: EventDict) -> tuple[Any, ...]:
+        parts: list[Any] = []
+        for key in self._signature_keys:
+            if key in event_dict:
+                parts.append(event_dict[key])
+            else:
+                parts.append(_MISSING)
+
+        signature = tuple(parts)
+        try:
+            hash(signature)
+        except TypeError:
+            signature = tuple(repr(part) for part in parts)
+
+        return signature
+
+    def _raw_level(self, event_dict: EventDict) -> Any:
+        level = event_dict.get(self._level_key)
+        if level is None:
+            return None
+
+        return level
+
+    def _level_value(self, raw_level: Any) -> int | None:
+        if isinstance(raw_level, bool):
+            return None
+        if isinstance(raw_level, int):
+            return raw_level
+        if isinstance(raw_level, str):
+            return NAME_TO_LEVEL.get(raw_level)
+
+        return None
+
+    def _is_escalation(self, event_dict: EventDict, window: _Window) -> bool:
+        new_level = self._level_value(self._raw_level(event_dict))
+        old_level = self._level_value(window.level)
+
+        return (
+            new_level is not None
+            and old_level is not None
+            and new_level > old_level
+        )
+
+    def _settle(self, signature: tuple[Any, ...], window: _Window) -> None:
+        if window.suppressed == 0:
+            return
+
+        summary = SuppressionSummary(
+            signature=signature,
+            level=window.level,
+            suppressed_count=window.suppressed,
+            first_seen=window.first_seen,
+            last_seen=window.last_seen,
+        )
+
+        # Notify the sink before the summary is queued so a re-entrant
+        # flush() inside the callback cannot observe the summary that is
+        # currently being delivered.
+        if self._on_settle is not None and not self._reentrant:
+            self._reentrant = True
+            try:
+                self._on_settle(summary)
+            finally:
+                self._reentrant = False
+
+        self._summaries.append(summary)

@@ -412,3 +412,34 @@ cr.event_key = "le event"
 
 cr.repr_native_str
 cr.repr_native_str = True
+
+
+# DuplicateEventSuppressor
+
+
+def custom_clock() -> float:
+    return 0.0
+
+
+def on_settle(summary: structlog.processors.SuppressionSummary) -> None:
+    suppressed_count: int = summary.suppressed_count
+
+
+suppressor = structlog.processors.DuplicateEventSuppressor(
+    window=30.0,
+    max_passed=2,
+    signature_keys=("event", "service"),
+    clock=custom_clock,
+    max_signatures=128,
+    on_settle=on_settle,
+)
+
+event_dict: structlog.typing.EventDict = {"event": "boom", "level": "warning"}
+processed: structlog.typing.EventDict = suppressor(None, "warning", event_dict)
+
+summaries: list[structlog.processors.SuppressionSummary] = suppressor.flush()
+for summary in summaries:
+    sig: tuple[Any, ...] = summary.signature
+    count: int = summary.suppressed_count
+    first: float = summary.first_seen
+    last: float = summary.last_seen

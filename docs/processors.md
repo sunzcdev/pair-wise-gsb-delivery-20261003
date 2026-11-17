@@ -132,6 +132,63 @@ class ConditionalDropper:
 Since it's so common to filter by the log level, *structlog* comes with {func}`structlog.make_filtering_bound_logger` that filters log entries before they even enter the processor chain.
 It does **not** use the standard library, but it does use its names and order of log levels.
 
+(duplicate-suppression)=
+
+### Suppressing duplicate events
+
+Transient failures -- a flaky network call, a full disk -- often produce the
+same warning many times in quick succession.
+{class}`structlog.processors.DuplicateEventSuppressor` keeps a bounded cache of
+events and only lets a limited number of identical events through per time
+window:
+
+```python
+import structlog
+
+from structlog.processors import DuplicateEventSuppressor
+
+suppressor = DuplicateEventSuppressor(window=60.0)
+
+structlog.configure(processors=[structlog.processors.add_log_level, suppressor])
+```
+
+Two events are considered identical if the values of the processor's
+*signature_keys* (just `event` by default) are equal.
+The first *max_passed* events of every signature are passed through within
+each *window* seconds; further duplicates raise {class}`structlog.DropEvent`.
+
+An event with a **higher** log level is never swallowed by an older window of
+lower-severity events.
+Instead, the old window is settled first, and the escalated event opens a
+fresh one.
+
+When a window expires, when the bounded cache evicts its least recently used
+entry, or when you call `DuplicateEventSuppressor.flush()` -- for example at
+process shutdown -- every signature that actually had events suppressed yields
+a {class}`structlog.processors.SuppressionSummary` containing the number of
+suppressed events and the clock values of the first and last occurrence.
+`flush()` returns all pending summaries and clears the processor state:
+
+```python
+for summary in suppressor.flush():
+    print(
+        summary.signature,
+        "suppressed",
+        summary.suppressed_count,
+        "events between",
+        summary.first_seen,
+        "and",
+        summary.last_seen,
+    )
+```
+
+For deterministic tests, the clock can be injected through the *clock*
+parameter instead of the default {func}`time.monotonic`.
+If you want to be notified immediately when a window settles, pass an
+*on_settle* callback.
+Calls made from within that callback are guarded, so logging from it cannot
+re-enter the same suppressor.
+
 (adapting)=
 
 ## Adapting and rendering
