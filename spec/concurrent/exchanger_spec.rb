@@ -197,6 +197,100 @@ RSpec.shared_examples :exchanger do
     it_behaves_like 'exchanger method with finite timeout'
     it_behaves_like 'exchanger method cross-thread interactions'
   end
+
+  context '#exchange_result' do
+    let!(:method_name) { :exchange_result }
+
+    def get_value(result)
+      result.value
+    end
+
+    it_behaves_like 'exchanger method with indefinite timeout'
+    it_behaves_like 'exchanger method with finite timeout'
+    it_behaves_like 'exchanger method cross-thread interactions'
+
+    it 'reports a fulfilled result carrying the partner object by reference' do
+      first         = Object.new
+      second        = Object.new
+      barrier       = Concurrent::CountDownLatch.new(1)
+      done          = Concurrent::CountDownLatch.new(1)
+      first_result = nil
+      second_result = nil
+
+      in_thread do
+        barrier.wait
+        second_result = subject.exchange_result(second, 5)
+        done.count_down
+      end
+
+      barrier.count_down
+      first_result = subject.exchange_result(first, 5)
+      done.wait(5)
+
+      expect(first_result).to be_fulfilled
+      expect(second_result).to be_fulfilled
+      expect(first_result.state).to eq :fulfilled
+      expect(first_result.value).to equal second
+      expect(second_result.value).to equal first
+    end
+
+    it 'reports an unmatched timeout and keeps ownership of the offered object' do
+      mine   = Object.new
+      result = subject.exchange_result(mine, 0.05)
+
+      expect(result).to be_timeout
+      expect(result.state).to eq :timeout
+      expect(result.value).to be_nil
+
+      # the object is still mine: it can be offered again and is handed
+      # over by reference, exactly once
+      barrier     = Concurrent::CountDownLatch.new(1)
+      done        = Concurrent::CountDownLatch.new(1)
+      peer_result = nil
+
+      in_thread do
+        barrier.wait
+        peer_result = subject.exchange_result(:peer, 5)
+        done.count_down
+      end
+
+      barrier.count_down
+      retry_result = subject.exchange_result(mine, 5)
+      done.wait(5)
+
+      expect(retry_result).to be_fulfilled
+      expect(retry_result.value).to eq :peer
+      expect(peer_result).to be_fulfilled
+      expect(peer_result.value).to equal mine
+    end
+
+    it 'resolves a simultaneous timeout and match at a single commit point' do
+      20.times do
+        exchanger     = described_class.new
+        first         = Object.new
+        second        = Object.new
+        gate          = Concurrent::CountDownLatch.new(1)
+        first_result  = nil
+        second_result = nil
+
+        t1 = in_thread { gate.wait; first_result = exchanger.exchange_result(first, 0.01) }
+        t2 = in_thread { gate.wait; sleep(rand(0.02)); second_result = exchanger.exchange_result(second, 0.05) }
+        gate.count_down
+        [t1, t2].each { |t| t.join(5) }
+
+        if first_result.fulfilled?
+          # the match won the commit race: both sides observe the exchange
+          expect(second_result).to be_fulfilled
+          expect(first_result.value).to equal second
+          expect(second_result.value).to equal first
+        else
+          # the timeout won the commit race: nobody may hold the other's
+          # object; each side still owns the buffer it offered
+          expect(second_result).not_to be_fulfilled
+        end
+      end
+    end
+  end
 end
 
 module Concurrent
@@ -204,6 +298,62 @@ module Concurrent
   RSpec.describe RubyExchanger do
 
     it_behaves_like :exchanger
+
+    context 'abnormal exit' do
+
+      it 'does not leave a stale slot behind for the next exchange' do
+        t = in_thread do
+          begin
+            subject.exchange_result(:doomed, 30)
+          rescue RuntimeError
+            # expected: interrupted by the test
+          end
+        end
+        is_sleeping t
+        t.raise RuntimeError
+        t.join(5)
+
+        # the next pair must match with each other, not with the stale node
+        first_result  = nil
+        second_result = nil
+        latch         = Concurrent::CountDownLatch.new(2)
+
+        in_thread { first_result = subject.exchange_result(:first, 5); latch.count_down }
+        in_thread { second_result = subject.exchange_result(:second, 5); latch.count_down }
+        latch.wait(5)
+
+        expect(first_result).to be_fulfilled
+        expect(second_result).to be_fulfilled
+        expect(first_result.value).to eq :second
+        expect(second_result.value).to eq :first
+      end
+
+      it 'wakes the matched waiter with a cancelled result when the partner aborts mid-handoff' do
+        aborting = Class.new(RubyExchanger) do
+          # aborts after removing the occupier from the slot but before
+          # committing the handoff
+          def fulfill(*)
+            raise 'simulated abort'
+          end
+        end.new
+
+        matched = Concurrent::CountDownLatch.new(1)
+        result  = nil
+
+        t = in_thread do
+          result = aborting.exchange_result(:mine, 5)
+          matched.count_down
+        end
+        is_sleeping t
+
+        expect { aborting.exchange_result(:theirs, 5) }.to raise_error('simulated abort')
+        matched.wait(5)
+
+        expect(result).to be_cancelled
+        expect(result.state).to eq :cancelled
+        expect(result.value).to be_nil
+      end
+    end
 
     if Concurrent.on_cruby?
 
@@ -235,6 +385,45 @@ module Concurrent
         puts "Good: #{good.value}, Bad (timeout): #{bad.value}, Ugly: #{ugly.value}"
         expect(good.value + bad.value + ugly.value).to eq thread_count * exchange_count
         expect(ugly.value).to eq 0
+      end
+
+      specify 'ownership stress test: each offered object ends up owned by exactly one side' do
+        thread_count   = 50
+        exchange_count = 50
+        latch          = Concurrent::CountDownLatch.new(thread_count)
+        outcomes       = Queue.new
+
+        threads = thread_count.times.collect do
+          in_thread do
+            exchange_count.times do
+              offered = Object.new
+              result  = subject.exchange_result(offered, 1)
+              outcomes << [offered, result]
+            end
+            latch.count_down
+          end
+        end
+
+        threads.each { |t| t.join(30) }
+        latch.wait(30)
+
+        pairs = []
+        outcomes.size.times { pairs << outcomes.pop }
+
+        fulfilled          = pairs.select { |_, result| result.fulfilled? }
+        offered_by_winners = fulfilled.map(&:first)
+        received           = fulfilled.map { |_, result| result.value }
+
+        # exchanges commit in pairs
+        expect(fulfilled.size.even?).to be true
+        # every received object is an object some thread offered (passed by
+        # reference, never copied, never fabricated)
+        expect(received - pairs.map(&:first)).to be_empty
+        # no object is received twice: exactly one new owner per object
+        expect(received.uniq.size).to eq received.size
+        # the set of objects taken by partners is exactly the set of objects
+        # offered by the threads whose exchange committed
+        expect(received).to match_array(offered_by_winners)
       end
     end
   end
