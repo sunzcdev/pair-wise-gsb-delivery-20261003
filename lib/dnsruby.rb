@@ -211,6 +211,23 @@ module Dnsruby
   class OtherResolvError < ResolvError
   end
 
+  # Every configured nameserver was tried and none produced an answer that
+  # satisfied the query's question identity and validation policy. The
+  # per-server reasons are retained in the public nameserver order so callers
+  # can inspect why each side failed instead of seeing only the last one.
+  class AllServersFailed < ResolvError
+    # An Array of [server, error] pairs in the Resolver's published
+    # nameserver order. The same server may appear more than once across
+    # retries; each entry records one terminal failure for that side.
+    attr_reader :server_failures
+
+    def initialize(server_failures)
+      @server_failures = server_failures.dup
+      detail = @server_failures.map { |server, error| "#{server}: #{error.class}: #{error.message}" }
+      super("All nameservers failed; #{detail.join('; ')}")
+    end
+  end
+
   # Socket was closed by server before request was processed
   class SocketEofResolvError < ResolvError
   end

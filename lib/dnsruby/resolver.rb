@@ -40,6 +40,18 @@ module Dnsruby
   #  still receives a timeout when the original total deadline expires. Late
   #  validation results cannot complete the query a second time.
   #
+  #  == Fan-out winner rule
+  #  When several nameservers are queried concurrently, only a coherent terminal
+  #  answer can win: the SelectThread first matches the response header, opcode
+  #  and question identity (and TSIG), then the Resolver applies the query's
+  #  validation policy. An RCODE error such as SERVFAIL never wins; it retires
+  #  only that side, so a later legitimate answer from another nameserver still
+  #  gets its chance. The first accepted answer cancels every competing
+  #  transmission and timer, and any late reply is dropped without completing
+  #  the query again. If every side fails, an AllServersFailed error carries the
+  #  per-server reasons in the configured nameserver order; a single failing
+  #  side keeps its original exception type.
+  #
   #  == Methods
   #
   #  === Synchronous
@@ -978,6 +990,8 @@ module Dnsruby
       @transmission_budgets = {}
       @response_cache = Cache::ResolutionCache.new
       @query_cache_scopes = {}
+      # client_query_id => ordered Array of [server, error] terminal failures
+      @query_failures = {}
     end
     # Completed failures belong to one resolver configuration and validation
     # policy. Snapshot them at admission, and decline insertion if it changes.
@@ -1086,6 +1100,12 @@ module Dnsruby
         @query_cache_scopes[client_query_id] = scope
         outstanding = []
         @query_list[client_query_id]=[msg, client_queue, q, outstanding, control]
+        # Snapshot the public nameserver order at admission: demote_resolver
+        # reorders @single_resolvers while the query is still in flight, but the
+        # aggregate failure report must follow this original published order.
+        @query_failures[client_query_id] = {
+          order: @parent.single_resolvers.each_with_index.to_h, failures: []
+        }
         @transmission_budgets[client_query_id] = SelectThread::TransmissionBudget.current || SelectThread::TransmissionBudget.new
 
         query_timeout = TransportClock.now + @parent.query_timeout
@@ -1149,6 +1169,7 @@ module Dnsruby
           stop_querying(client_query_id)
           @validation_queries.delete(client_query_id)
           @query_cache_scopes.delete(client_query_id)
+          @query_failures.delete(client_query_id)
           SelectThread.instance.remove_observer(current[2], self)
           @query_list.delete(client_query_id)
         end
@@ -1184,6 +1205,56 @@ module Dnsruby
       @query_list[client_query_id][3].clear
     end
 
+    # The checkable winner rule for a query fanned out across nameservers.
+    # A response can only win when it is a coherent terminal answer: the
+    # SelectThread has already matched its header/opcode/question identity
+    # (RFC 5452 section 9.1) and its TSIG, and PacketSender#check_response has
+    # applied the truncation/FORMERR transport policy. A response carrying an
+    # RCODE error (e.g. SERVFAIL) never wins; its side is merely recorded so a
+    # later legitimate answer from another nameserver still gets its chance.
+    # DNSSEC policy is enforced afterwards by ValidatorThread: a BOGUS answer
+    # cannot complete the query even though it was accepted for validation.
+    # MUST BE CALLED WITH THE PARENT MUTEX HELD.
+    def acceptable_winner?(client_query_id, response, error)
+      return false unless @query_list.key?(client_query_id)
+      return false if error
+      return false unless response.is_a?(Message) && response.header.qr
+      true
+    end
+    private :acceptable_winner?
+
+    # Remember one side's terminal failure, keyed to the public nameserver
+    # order captured when the logical query was admitted. Retries of the same
+    # server append their own reason; the aggregate is sorted at completion.
+    # MUST BE CALLED WITH THE PARENT MUTEX HELD.
+    def record_server_failure(client_query_id, resolver, error)
+      return unless error
+      entry = @query_failures[client_query_id]
+      entry[:failures] << [resolver, error] if entry
+    end
+    private :record_server_failure
+
+    # Build the completion error once every attempt and scheduled send is
+    # exhausted. A single failing side keeps its original exception (and the
+    # single-server ServFail caching contract); several distinct sides are
+    # reported together with each reason in the public nameserver order.
+    # MUST BE CALLED WITH THE PARENT MUTEX HELD.
+    def exhausted_query_error(client_query_id, fallback_error)
+      entry = @query_failures[client_query_id]
+      failures = entry ? entry[:failures] : []
+      distinct = failures.uniq { |resolver, _error| resolver }
+      return fallback_error if distinct.length <= 1
+
+      order = entry[:order]
+      pairs = failures.sort_by { |resolver, _error|
+        [order.fetch(resolver, order.length), resolver.server.to_s]
+      }.map { |resolver, error| [resolver.server.to_s, error] }
+      aggregate = AllServersFailed.new(pairs)
+      aggregate.response = pairs.map { |_server, error| error.response }.compact.first
+      aggregate
+    end
+    private :exhausted_query_error
+
     # Called outside the selector lock. A completed or replaced transaction
     # cannot start validation, and validation keeps the original query deadline.
     def validation_deadline(select_queue, query_id)
@@ -1213,6 +1284,7 @@ module Dnsruby
       cache_completion(client_query_id, msg, error)
       stop_querying(client_query_id)
       @validation_queries.delete(client_query_id)
+      @query_failures.delete(client_query_id)
       #  We might still get some callbacks, which we should ignore
       st = SelectThread.instance
       st.remove_observer(select_queue, self)
@@ -1422,7 +1494,9 @@ module Dnsruby
         timeouts = @timeouts[client_query_id]
         if outstanding.empty? && timeouts && timeouts[1].values.empty?
           Dnsruby.log.debug{'Sending timeout to client'}
-          send_result_and_stop_querying(client_queue, client_query_id, select_queue, response, error)
+          record_server_failure(client_query_id, resolver, error)
+          final_error = exhausted_query_error(client_query_id, error)
+          send_result_and_stop_querying(client_queue, client_query_id, select_queue, response, final_error)
         end
       elsif error.kind_of?(NXDomain)
         #    - if it was an NXDomain, then return that to the client, and stop all new queries (and clean up)
@@ -1439,6 +1513,10 @@ module Dnsruby
         timeouts = @timeouts[client_query_id]
         unless error.to_s =~ /Errno::EMFILE/
           Dnsruby.log.debug{"Removing #{resolver.server} from resolver list for this query"}
+          # This side gave a terminal answer (e.g. SERVFAIL) rather than going
+          # quiet. Keep its reason before retiring it, so an all-failure result
+          # can explain every side while other servers still get their chance.
+          record_server_failure(client_query_id, resolver, error)
           if timeouts
             timeouts[1].each do |key, value|
               if value.first.is_a?(Array)
@@ -1459,7 +1537,8 @@ module Dnsruby
         if outstanding.empty? && ((!timeouts) || (timeouts && timeouts[1].values.empty?))
           #           if outstanding.empty?
           Dnsruby.log.debug{'Sending error to client'}
-          send_result_and_stop_querying(client_queue, client_query_id, select_queue, response, error)
+          final_error = exhausted_query_error(client_query_id, error)
+          send_result_and_stop_querying(client_queue, client_query_id, select_queue, response, final_error)
         end
       end
       #  @TODO@ If we're still sending packets for this query, but none are outstanding, then
@@ -1506,12 +1585,21 @@ module Dnsruby
       #  Should also stick resolver more to the front of the list for future queries
       Dnsruby.log.debug('Handling good response')
       resolver, _msg, client_query_id, _retry_count = query_id
-      increment_resolver_priority(resolver) unless response.cached
-      #       @mutex.synchronize{
       _query, _client_queue, s_queue, _outstanding = @query_list[client_query_id]
       if s_queue != select_queue
         Dnsruby.log_and_raise("Serious internal error : expected select queue #{s_queue}, got #{select_queue}")
       end
+      # Only a coherent, question-matching and policy-eligible answer may win.
+      # An RCODE error arrives through handle_error_response instead, so a
+      # SERVFAIL from the first server can never lock out a later valid answer.
+      unless acceptable_winner?(client_query_id, response, nil)
+        Dnsruby.log.debug { 'Response failed the winner rule; keeping competing attempts alive' }
+        return
+      end
+      increment_resolver_priority(resolver) unless response.cached
+      #       @mutex.synchronize{
+      # Accepting this answer cancels every competing transmission and timer via
+      # begin_validation; late replies are then dropped by the observer guards.
       begin_validation(client_query_id, query_id, select_queue)
       #  @TODO@ Does the client want notified at this point?
       #         client_queue.push([client_query_id, Resolver::EventType::RECEIVED, msg, nil])
