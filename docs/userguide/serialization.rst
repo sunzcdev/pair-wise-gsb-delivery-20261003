@@ -26,6 +26,41 @@ them in your consumer by using the ``accept`` argument:
 
 The accept argument can also include MIME-types.
 
+Decoder capabilities are frozen per consumer
+--------------------------------------------
+
+The serializer registry in :mod:`kombu.serialization` is global to the
+process, so registering, enabling or disabling a serializer affects every
+consumer that resolves decoders from it.  A :class:`~kombu.Consumer` takes a
+frozen snapshot of the registry instead, exposed as
+:attr:`Consumer.decoder_view <kombu.Consumer.decoder_view>`:
+
+* decoders registered after the consumer was created are never mixed into
+  its capabilities;
+* serializers disabled (or enabled) globally after the consumer was created
+  do not change what that consumer can decode, so one consumer cannot
+  weaken or widen the decoding of another one in the same process;
+* the snapshot is kept when the consumer reconnects (``Consumer.revive``),
+  so recovery reuses the capabilities of that consumer;
+* the ``accept`` argument is resolved against the same snapshot, and
+  content type aliases used in a message header (for example the serializer
+  name ``"pickle"`` instead of ``"application/x-python-serialize"``) are
+  resolved *before* the whitelist is applied, so an alias cannot be used to
+  reach a decoder that the consumer is not allowed to use.  Any content type
+  that is not allowed is refused before its decoder is executed.
+
+Consumers created without an ``accept`` argument keep working exactly as
+before: their capabilities are the ones enabled in the registry at the time
+they were created.
+
+.. code-block:: python
+
+    >>> consumer = Consumer(conn, [queue], accept=['json', 'pickle'])
+    >>> consumer.accept
+    frozenset({'application/json', 'application/x-python-serialize'})
+    >>> consumer.decoder_view.content_types  # frozen at creation time
+    frozenset({'application/json', 'application/x-msgpack', ...})
+
 .. _`JSON`: http://www.json.org/
 .. _`YAML`: http://yaml.org/
 .. _`msgpack`: https://msgpack.org/

@@ -11,7 +11,7 @@ from .compression import compress
 from .connection import PooledConnection, is_connection, maybe_channel
 from .entity import Exchange, Queue, maybe_delivery_mode
 from .exceptions import ContentDisallowed
-from .serialization import dumps, prepare_accept_content
+from .serialization import DecoderView, dumps
 from .utils.functional import ChannelPromise, maybe_list
 
 if TYPE_CHECKING:
@@ -540,14 +540,13 @@ class Consumer:
     #: that occurred while trying to decode it.
     on_decode_error = None
 
-    #: List of accepted content-types.
+    #: Frozen snapshot of the decoders this consumer is allowed to use.
     #:
-    #: An exception will be raised if the consumer receives
-    #: a message with an untrusted content type.
-    #: By default all content-types are accepted, but not if
-    #: :func:`kombu.disable_untrusted_serializers` was called,
-    #: in which case only json is allowed.
-    accept = None
+    #: The view is created when the consumer is instantiated and is kept
+    #: across connection loss/recovery, so that decoders registered,
+    #: enabled or disabled in the global registry by other consumers
+    #: running in the same process do not affect this consumer.
+    decoder_view = None
 
     #: Initial prefetch count
     #:
@@ -576,11 +575,37 @@ class Consumer:
             self.auto_declare = auto_declare
         if on_decode_error is not None:
             self.on_decode_error = on_decode_error
-        self.accept = prepare_accept_content(accept)
+        # The decoder capabilities are frozen at instantiation time and are
+        # reused for the whole lifetime of this consumer (including after a
+        # connection loss), so unrelated consumers toggling the global
+        # registry cannot change what this consumer is able to decode.
+        self.decoder_view = DecoderView.from_registry(accept)
         self.prefetch_count = prefetch_count
 
         if self.channel:
             self.revive(self.channel)
+
+    @property
+    def accept(self):
+        """List of accepted content-types.
+
+        An exception will be raised if the consumer receives a message with
+        an untrusted content type.  By default all content-types are
+        accepted, but not if :func:`kombu.disable_untrusted_serializers`
+        was called, in which case only json is allowed.
+
+        The whitelist is part of the consumer's :attr:`decoder_view`, so
+        changing it never pulls decoders out of the global registry into
+        the frozen capabilities of this consumer.
+        """
+        view = self.decoder_view
+        return None if view is None else view.accept
+
+    @accept.setter
+    def accept(self, accept):
+        view = self.decoder_view
+        self.decoder_view = (DecoderView.from_registry(accept) if view is None
+                             else view.with_accept(accept))
 
     @property
     def queues(self):  # noqa
@@ -857,11 +882,16 @@ class Consumer:
 
     def _receive_callback(self, message):
         accept = self.accept
+        decoder_view = self.decoder_view
         on_m, channel, decoded = self.on_message, self.channel, None
         try:
             m2p = getattr(channel, 'message_to_python', None)
             if m2p:
                 message = m2p(message)
+            # Decode against this consumer's frozen capabilities.  The
+            # ``accept`` whitelist is part of the view, so alias handling
+            # and the pre-decoder refusal use the same snapshot.
+            message.decoder_view = decoder_view
             if accept is not None:
                 message.accept = accept
             if message.errors:

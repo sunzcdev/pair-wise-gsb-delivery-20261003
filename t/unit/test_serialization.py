@@ -3,19 +3,19 @@
 from __future__ import annotations
 
 from base64 import b64decode
-from unittest.mock import call, patch
+from unittest.mock import Mock, call, patch
 
 import pytest
 
 import t.skip
 from kombu.exceptions import ContentDisallowed, DecodeError, EncodeError
-from kombu.serialization import (SerializerNotInstalled,
-                                 disable_insecure_serializers, dumps,
-                                 enable_insecure_serializers, loads, pickle,
-                                 pickle_protocol, prepare_accept_content,
-                                 raw_encode, register, register_msgpack,
-                                 register_pickle, register_yaml, registry,
-                                 unregister)
+from kombu.serialization import (DecoderView, SerializerNotInstalled,
+                                 decoder_view, disable_insecure_serializers,
+                                 dumps, enable_insecure_serializers, loads,
+                                 pickle, pickle_protocol,
+                                 prepare_accept_content, raw_encode, register,
+                                 register_msgpack, register_pickle,
+                                 register_yaml, registry, unregister)
 from kombu.utils.encoding import str_to_bytes
 
 # For content_encoding tests
@@ -332,3 +332,165 @@ class test_Serialization:
     def test_prepare_accept_content_bad_serializer(self):
         with pytest.raises(SerializerNotInstalled):
             prepare_accept_content(['bad_serializer'])
+
+
+class test_DecoderView:
+    """Frozen decoder capabilities must be isolated per consumer."""
+
+    content_type = 'application/x-frozen'
+    other_type = 'application/x-later'
+
+    def setup_method(self):
+        self.registry_snapshot = (
+            dict(registry._decoders),
+            set(registry._disabled_content_types),
+            dict(registry.name_to_type),
+            dict(registry.type_to_name),
+        )
+        self.decoder = Mock(name='decoder', return_value='frozen')
+        register('frozen', None, self.decoder, self.content_type)
+        self.view = decoder_view()
+
+    def teardown_method(self):
+        decoders, disabled, name_to_type, type_to_name = (
+            self.registry_snapshot)
+        registry._decoders.clear()
+        registry._decoders.update(decoders)
+        registry._disabled_content_types.clear()
+        registry._disabled_content_types.update(disabled)
+        registry.name_to_type.clear()
+        registry.name_to_type.update(name_to_type)
+        registry.type_to_name.clear()
+        registry.type_to_name.update(type_to_name)
+        registry._set_default_serializer('json')
+
+    def test_view_is_frozen_snapshot(self):
+        assert self.view.content_types == frozenset(registry._decoders)
+        assert self.view.decoder_for(self.content_type) is self.decoder
+        assert self.view.decoders[self.content_type] is self.decoder
+        assert self.view.aliases()['frozen'] == self.content_type
+
+    def test_decoders_registered_later_are_not_mixed_in(self):
+        later = Mock(name='later', return_value='later')
+        register('later', None, later, self.other_type)
+
+        assert self.other_type not in self.view.content_types
+        assert self.view.decoder_for(self.other_type) is None
+        with pytest.raises(ContentDisallowed):
+            self.view.decode(b'payload', self.other_type, 'binary')
+        later.assert_not_called()
+
+    def test_global_disable_does_not_affect_view(self):
+        registry.disable('frozen')
+        self.decoder.reset_mock()
+
+        assert self.view.decode(b'payload', self.content_type, 'binary') \
+            == 'frozen'
+        self.decoder.assert_called_once_with(b'payload')
+
+    def test_global_enable_does_not_affect_view(self):
+        registry.disable('frozen')
+        view = decoder_view()
+
+        registry.enable('frozen')
+        with pytest.raises(ContentDisallowed):
+            view.decode(b'payload', self.content_type, 'binary')
+
+    def test_refuses_before_running_decoder(self):
+        registry.disable('frozen')
+        view = decoder_view()
+        self.decoder.reset_mock()
+
+        with pytest.raises(ContentDisallowed):
+            view.decode(b'payload', self.content_type, 'binary')
+        self.decoder.assert_not_called()
+
+    def test_accept_alias_cannot_be_bypassed_by_header_alias(self):
+        view = decoder_view(accept=['json'])
+
+        # The message header uses the serializer name instead of the
+        # content type: it resolves to the same content type and must be
+        # refused.
+        with pytest.raises(ContentDisallowed):
+            view.decode(b'payload', 'frozen', 'binary')
+        self.decoder.assert_not_called()
+
+    def test_accept_allows_aliases_in_whitelist(self):
+        view = decoder_view(accept=['frozen'])
+
+        assert view.accept == {self.content_type}
+        assert view.decode(b'payload', 'frozen', 'binary') == 'frozen'
+        assert view.decode(
+            b'payload', self.content_type, 'binary') == 'frozen'
+
+    def test_accept_allows_raw_content_types(self):
+        view = decoder_view(accept=[self.content_type])
+
+        assert view.accept == {self.content_type}
+        assert view.decode(b'payload', self.content_type, 'binary') == \
+            'frozen'
+
+    def test_accept_bad_serializer(self):
+        with pytest.raises(SerializerNotInstalled):
+            decoder_view(accept=['missing-serializer'])
+
+    def test_trusted_content_is_never_refused(self):
+        view = decoder_view(accept=[])
+
+        assert view.decode(b'payload', 'application/data', 'binary') == \
+            b'payload'
+        assert view.decode(b'payload', 'application/text', 'utf-8') == \
+            'payload'
+        # ``text/plain`` is not trusted content, same as ``loads``.
+        with pytest.raises(ContentDisallowed):
+            view.decode(b'payload', 'text/plain', 'utf-8')
+
+    def test_with_accept_keeps_frozen_capabilities(self):
+        view = self.view.with_accept([self.content_type])
+        register('later', None, Mock(), self.other_type)
+
+        assert view.accept == {self.content_type}
+        assert view.content_types == self.view.content_types
+        assert view.decoder_for(self.other_type) is None
+
+    def test_with_accept_none_restores_default_behaviour(self):
+        view = self.view.with_accept(None)
+
+        assert view.accept is None
+        assert view.decode(b'payload', self.content_type, 'binary') == \
+            'frozen'
+
+    def test_decoder_view_accept_from_content_type(self):
+        view = decoder_view(accept=['application/json'])
+        assert view.accept == {'application/json'}
+
+    def test_unknown_content_type_without_decoder_is_passed_through(self):
+        assert self.view.decode(b'payload', 'text/plain', 'utf-8') == 'payload'
+        assert self.view.decode(b'payload', 'binary/thing', 'binary') == \
+            b'payload'
+
+    def test_repr(self):
+        assert 'frozen' in repr(self.view)
+
+    def test_explicit_disabled_is_recorded(self):
+        view = DecoderView(
+            {self.content_type: self.decoder},
+            disabled=[self.content_type],
+        )
+
+        assert view.accept is None
+        with pytest.raises(ContentDisallowed):
+            view.decode(b'payload', self.content_type, 'binary')
+        self.decoder.assert_not_called()
+
+    def test_decode_wraps_decoder_errors(self):
+        decoder = Mock(name='decoder', side_effect=ValueError('boom'))
+        view = DecoderView({self.content_type: decoder})
+
+        with pytest.raises(DecodeError):
+            view.decode(b'payload', self.content_type, 'binary')
+
+    def test_decode_unwraps_content_type_bytes(self):
+        assert self.view.decode(
+            b'payload', str_to_bytes(self.content_type), 'binary',
+        ) == 'frozen'

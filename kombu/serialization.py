@@ -9,13 +9,15 @@ import sys
 from collections import namedtuple
 from contextlib import contextmanager
 from io import BytesIO
+from types import MappingProxyType
 
 from .exceptions import (ContentDisallowed, DecodeError, EncodeError,
                          SerializerNotInstalled, reraise)
 from .utils.compat import entrypoints
 from .utils.encoding import bytes_to_str, str_to_bytes
 
-__all__ = ('pickle', 'loads', 'dumps', 'register', 'unregister')
+__all__ = ('DecoderView', 'decoder_view', 'pickle', 'loads', 'dumps',
+           'register', 'unregister')
 SKIP_DECODE = frozenset(['binary', 'ascii-8bit'])
 TRUSTED_CONTENT = frozenset(['application/data', 'application/text'])
 
@@ -278,12 +280,217 @@ class SerializerRegistry:
         )
 
 
+def normalize_content_type(content_type):
+    """Return the content type as ``str``, defaulting to binary data."""
+    content_type = (bytes_to_str(content_type) if content_type
+                    else 'application/data')
+    return content_type
+
+
+class DecoderView:
+    """Frozen view of the decoders available to a single consumer.
+
+    Decoders in the global :data:`registry` can be registered, unregistered,
+    enabled and disabled at any time, and a consumer that resolves decoders
+    lazily sees every such change.  A :class:`DecoderView` takes a snapshot of
+    the registry instead, so that the capabilities of one consumer cannot be
+    modified (or relied upon) by any other consumer running in the same
+    process:
+
+    * decoders registered after the view was created are not part of it and
+      can never be used to deserialize a message;
+    * decoders disabled in the registry after the view was created remain
+      usable, and decoders enabled after it was created remain unavailable,
+      so global ``enable``/``disable`` calls cannot leak across consumers.
+
+    The view resolves the serializer aliases given to the
+    :class:`~kombu.Consumer` ``accept`` argument against the same snapshot,
+    and the allowed decoder is looked up by content type.  Aliases found in a
+    message header are resolved *before* the whitelist is applied, so a
+    message cannot reach a decoder, nor skip the ``accept`` restriction, just
+    because its ``content_type`` happens to be a serializer name (for
+    example ``"pickle"`` instead of ``"application/x-python-serialize"``).
+    """
+
+    def __init__(self, decoders, disabled=(), accept=None,
+                 name_to_type=None, type_to_name=None):
+        #: Decoders frozen at the time the view was created, by content type.
+        self._decoders = dict(decoders)
+        #: Content types whose decoders were disabled when the view was made.
+        self._disabled = frozenset(disabled)
+        #: Snapshot of the serializer name/content type aliases.
+        self._name_to_type = dict(name_to_type or {})
+        self._type_to_name = dict(type_to_name or {})
+        #: Content types explicitly accepted by the owner of this view.
+        self._accept = self._prepare_accept(accept)
+
+    def _prepare_accept(self, content_types):
+        if content_types is None:
+            return None
+        resolved = set()
+        for name in content_types:
+            if '/' in name:
+                resolved.add(name)
+                continue
+            try:
+                resolved.add(self._name_to_type[name])
+            except KeyError:
+                raise SerializerNotInstalled(
+                    f'No encoder/decoder installed for {name}')
+        return frozenset(resolved)
+
+    @property
+    def accept(self):
+        """The frozen set of accepted content types (or :const:`None`)."""
+        return self._accept
+
+    def with_accept(self, accept):
+        """Return a copy of this view with a different ``accept`` whitelist.
+
+        The frozen decoders and aliases are shared with this view, so
+        changing the whitelist later never pulls in decoders that were
+        registered after the view was created.
+        """
+        view = object.__new__(type(self))
+        view._decoders = self._decoders
+        view._disabled = self._disabled
+        view._name_to_type = self._name_to_type
+        view._type_to_name = self._type_to_name
+        view._accept = view._prepare_accept(accept)
+        return view
+
+    @property
+    def decoders(self):
+        """Frozen mapping of content type to decoder."""
+        return MappingProxyType(self._decoders)
+
+    @property
+    def content_types(self):
+        """Frozen set of content types that have a decoder in this view."""
+        return frozenset(self._decoders)
+
+    def aliases(self):
+        """Return the frozen serializer name/content type alias mapping."""
+        return dict(self._name_to_type)
+
+    def resolve_content_type(self, content_type):
+        """Resolve an alias used by a message header to its content type.
+
+        Only aliases known when the view was created are resolved; the
+        lookup never consults the live registry.
+        """
+        content_type = normalize_content_type(content_type)
+        return self._name_to_type.get(content_type, content_type)
+
+    def _refusal_reason(self, content_type):
+        """Return why ``content_type`` must be refused, or :const:`None`.
+
+        The check happens before any decoder is looked up or executed, so a
+        refused content type can never reach a decoder.
+        """
+        canonical = self.resolve_content_type(content_type)
+        if canonical in TRUSTED_CONTENT:
+            # Binary and plain text content never need a decoder.
+            return None
+        if self._accept is not None:
+            # An explicit whitelist replaces the frozen registry state,
+            # exactly like ``SerializerRegistry.loads`` does.
+            if canonical not in self._accept:
+                return 'untrusted'
+        elif canonical in self._disabled:
+            return 'disabled'
+        if canonical not in self._decoders and canonical in registry._decoders:
+            # A decoder was registered after this view was frozen, so it is
+            # not one of the capabilities of the consumer owning this view.
+            return 'disabled'
+        return None
+
+    def check_content_type(self, content_type):
+        """Raise :exc:`ContentDisallowed` if the type is not allowed.
+
+        The content type is resolved through the frozen alias mapping before
+        the whitelist is applied, so a message header using an alias cannot
+        skip the check.  The canonical (alias resolved) content type is
+        returned.
+        """
+        content_type = self.resolve_content_type(content_type)
+        why = self._refusal_reason(content_type)
+        if why is not None:
+            raise self.for_untrusted_content(content_type, why)
+        return content_type
+
+    def decoder_for(self, content_type):
+        """Return the frozen decoder for ``content_type`` (or :const:`None`).
+
+        Content type aliases are resolved through the frozen alias mapping,
+        and only decoders captured by this view are returned.
+        """
+        canonical = self.resolve_content_type(content_type)
+        return self._decoders.get(canonical)
+
+    def decode(self, data, content_type, content_encoding):
+        """Deserialize ``data`` using the frozen capabilities only."""
+        content_type = self.check_content_type(content_type)
+        content_encoding = (content_encoding or 'utf-8').lower()
+
+        if data:
+            decode = self.decoder_for(content_type)
+            if decode is not None:
+                with _reraise_errors(DecodeError):
+                    return decode(data)
+            if content_encoding not in SKIP_DECODE and \
+                    not isinstance(data, str):
+                with _reraise_errors(DecodeError):
+                    return _decode(data, content_encoding)
+        return data
+
+    def for_untrusted_content(self, ctype, why):
+        ctype = normalize_content_type(ctype)
+        canonical = self.resolve_content_type(ctype)
+        return ContentDisallowed(
+            'Refusing to deserialize {} content of type {}'.format(
+                why,
+                parenthesize_alias(
+                    self._type_to_name.get(canonical, canonical),
+                    canonical,
+                ),
+            ),
+        )
+
+    def __repr__(self):
+        return '<{}: content_types={!r} accept={!r}>'.format(
+            type(self).__name__, sorted(self._decoders), self._accept,
+        )
+
+    @classmethod
+    def from_registry(cls, accept=None):
+        """Create a view frozen from the current state of the registry."""
+        return cls(
+            registry._decoders,
+            disabled=registry._disabled_content_types,
+            accept=accept,
+            name_to_type=registry.name_to_type,
+            type_to_name=registry.type_to_name,
+        )
+
+
 #: Global registry of serializers/deserializers.
 registry = SerializerRegistry()
 dumps = registry.dumps
 loads = registry.loads
 register = registry.register
 unregister = registry.unregister
+
+
+def decoder_view(accept=None):
+    """Create a frozen :class:`DecoderView` from the global registry.
+
+    Arguments:
+    ---------
+        accept (Sequence[str]): Optional whitelist of serializers or content
+            types accepted by the consumer owning the view.
+    """
+    return DecoderView.from_registry(accept)
 
 
 def raw_encode(data):

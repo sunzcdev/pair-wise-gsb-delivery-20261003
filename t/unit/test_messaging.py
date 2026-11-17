@@ -10,7 +10,10 @@ import amqp
 import pytest
 
 from kombu import Connection, Consumer, Exchange, Producer, Queue
-from kombu.exceptions import MessageStateError, OperationalError
+from kombu.exceptions import (ContentDisallowed, MessageStateError,
+                              OperationalError)
+from kombu.message import Message
+from kombu.serialization import register, registry, unregister
 from kombu.utils import json
 from kombu.utils.functional import ChannelPromise
 from t.mocks import Transport
@@ -743,6 +746,150 @@ class test_Consumer:
         c = Consumer(self.connection, accept=b.accept)
         assert b.accept == c.accept
 
+    def test_accept_setter_updates_frozen_view(self):
+        c = Consumer(self.connection)
+        before = c.decoder_view
+
+        c.accept = ['json']
+
+        assert c.accept == {'application/json'}
+        assert c.decoder_view is not before
+        assert c.decoder_view.content_types == before.content_types
+
+    def test_decoder_view_is_frozen_at_instantiation(self):
+        c = Consumer(self.connection)
+        assert c.decoder_view.content_types == frozenset(
+            registry._decoders)
+
+        def decoder(s):
+            return 'decoded'
+
+        register('frozen-consumer', None, decoder,
+                 'application/x-frozen-consumer', 'binary')
+        try:
+            assert 'application/x-frozen-consumer' not in \
+                c.decoder_view.content_types
+        finally:
+            unregister('frozen-consumer')
+
+    def test_revive_reuses_decoder_view(self):
+        c = Consumer(self.connection)
+        view = c.decoder_view
+
+        c.revive(self.connection)
+
+        assert c.decoder_view is view
+
+    def test_revive_keeps_rejecting_decoders_registered_later(self):
+        c = Consumer(self.connection)
+        register('frozen-revive', lambda s: s, lambda s: 'decoded',
+                 'application/x-frozen-revive', 'binary')
+        try:
+            c.revive(self.connection)
+
+            assert c.decoder_view.decoder_for(
+                'application/x-frozen-revive') is None
+            with pytest.raises(ContentDisallowed):
+                c.decoder_view.check_content_type('application/x-frozen-revive')
+        finally:
+            unregister('frozen-revive')
+
+    def test_receive_callback_accepts_header_alias_in_whitelist(self):
+        callback = Mock(name='callback')
+        c = Consumer(self.connection, accept=['json'], callbacks=[callback])
+        c.channel = Mock(name='channel')
+        c.channel.message_to_python = None
+        # The message header uses the serializer alias instead of the
+        # content type: it maps to the accepted content type.
+        message = Message(
+            body=json.dumps({'foo': 'bar'}).encode('utf-8'),
+            content_type='json',
+            content_encoding='utf-8',
+        )
+
+        c._receive_callback(message)
+
+        callback.assert_called_with({'foo': 'bar'}, message)
+
+    def test_receive_callback_freezes_message_decoder_view(self):
+        message = Mock(name='Message')
+        message.errors = []
+        callback = Mock(name='on_message')
+        c = Consumer(self.connection, accept=['json'], on_message=callback)
+        c.on_decode_error = None
+        c.channel = Mock(name='channel')
+        c.channel.message_to_python = None
+
+        c._receive_callback(message)
+        assert message.decoder_view is c.decoder_view
+
+    def test_receive_callback_decodes_with_frozen_view(self):
+        callback = Mock(name='callback')
+        c = Consumer(self.connection, accept=['json'], callbacks=[callback])
+        c.channel = Mock(name='channel')
+        c.channel.message_to_python = None
+        message = Message(
+            body=json.dumps({'foo': 'bar'}).encode('utf-8'),
+            content_type='application/json',
+            content_encoding='utf-8',
+        )
+
+        c._receive_callback(message)
+
+        callback.assert_called_with({'foo': 'bar'}, message)
+
+    def test_receive_callback_refuses_unallowed_content_type(self):
+        callback = Mock(name='callback')
+        c = Consumer(self.connection, accept=['json'], callbacks=[callback])
+        c.channel = Mock(name='channel')
+        c.channel.message_to_python = None
+        message = Message(
+            body=b'payload',
+            content_type='application/x-python-serialize',
+            content_encoding='binary',
+        )
+
+        with pytest.raises(ContentDisallowed):
+            c._receive_callback(message)
+        callback.assert_not_called()
+
+    def test_receive_callback_calls_on_decode_error_before_decoder(self):
+        thrown = []
+        c = Consumer(
+            self.connection, accept=['json'],
+            on_decode_error=lambda msg, exc: thrown.append(exc),
+        )
+        c.channel = Mock(name='channel')
+        c.channel.message_to_python = None
+        message = Message(
+            body=b'payload',
+            content_type='application/x-python-serialize',
+            content_encoding='binary',
+        )
+
+        c._receive_callback(message)
+
+        assert len(thrown) == 1
+        assert isinstance(thrown[0], ContentDisallowed)
+        assert message._decoded_cache is None
+
+    def test_receive_callback_refuses_header_alias(self):
+        callback = Mock(name='callback')
+        c = Consumer(self.connection, accept=['json'], callbacks=[callback])
+        c.channel = Mock(name='channel')
+        c.channel.message_to_python = None
+        # The header uses the serializer name instead of the content type,
+        # which must not be able to bypass the ``accept`` whitelist.
+        message = Message(
+            body=b'payload',
+            content_type='pickle',
+            content_encoding='binary',
+        )
+
+        with pytest.raises(ContentDisallowed):
+            c._receive_callback(message)
+        callback.assert_not_called()
+
     def test_enter_exit_cancel_raises(self):
         c = Consumer(self.connection)
         c.cancel = Mock(name='Consumer.cancel')
@@ -804,6 +951,113 @@ class test_Consumer:
         callback.assert_called()
         body, message = callback.call_args[0]
         assert body['complex']
+
+    def test_decoder_registered_later_not_used_by_existing_consumer(self):
+        conn = Connection('memory://')
+        q = Queue('foo', exchange=self.exchange)
+        consumer = conn.Consumer(queues=[q], callbacks=[Mock(name='cb')])
+        decoder = Mock(name='decoder', return_value={'decoded': True})
+        try:
+            with consumer:
+                register('frozen-later', lambda s: s, decoder,
+                         'application/x-frozen-later', 'binary')
+                conn.Producer().publish(
+                    b'payload',
+                    declare=[q], exchange=self.exchange,
+                    serializer='frozen-later',
+                )
+
+                with pytest.raises(ContentDisallowed):
+                    conn.drain_events(timeout=1)
+        finally:
+            unregister('frozen-later')
+
+        decoder.assert_not_called()
+        assert consumer.decoder_view.decoder_for(
+            'application/x-frozen-later') is None
+
+    def test_accept__global_disable_does_not_affect_consumer(self):
+        conn = Connection('memory://')
+        q = Queue('foo', exchange=self.exchange)
+        callback = Mock(name='callback')
+        consumer = conn.Consumer(
+            queues=[q], accept=['pickle'], callbacks=[callback])
+        disabled = registry._disabled_content_types
+        frozen_disabled = set(disabled)
+        try:
+            with consumer:
+                conn.Producer().publish(
+                    {'complex': object()},
+                    declare=[q], exchange=self.exchange, serializer='pickle',
+                )
+                registry.disable('pickle')
+                conn.drain_events(timeout=1)
+        finally:
+            disabled.clear()
+            disabled.update(frozen_disabled)
+
+        callback.assert_called()
+        body, _ = callback.call_args[0]
+        assert body['complex']
+        assert 'application/x-python-serialize' in \
+            consumer.decoder_view.content_types
+
+    def test_accept__default_consumer_follows_frozen_registry_state(self):
+        conn = Connection('memory://')
+        q = Queue('foo', exchange=self.exchange)
+        callback = Mock(name='callback')
+        disabled = registry._disabled_content_types
+        frozen_disabled = set(disabled)
+        disabled.add('application/x-python-serialize')
+        try:
+            consumer = conn.Consumer(queues=[q], callbacks=[callback])
+            with consumer:
+                conn.Producer().publish(
+                    {'complex': object()},
+                    declare=[q], exchange=self.exchange, serializer='pickle',
+                )
+
+                with pytest.raises(ContentDisallowed):
+                    conn.drain_events(timeout=1)
+        finally:
+            disabled.clear()
+            disabled.update(frozen_disabled)
+
+        callback.assert_not_called()
+        # The consumer froze the disabled state of the registry.
+        with pytest.raises(ContentDisallowed):
+            consumer.decoder_view.check_content_type(
+                'application/x-python-serialize')
+        # The registry itself was not modified by the consumer.
+        assert 'application/x-python-serialize' in \
+            registry._decoders
+
+    def test_accept__default_consumer_honours_registry_enable(self):
+        conn = Connection('memory://')
+        q = Queue('foo', exchange=self.exchange)
+        callback = Mock(name='callback')
+        disabled = registry._disabled_content_types
+        frozen_disabled = set(disabled)
+        disabled.add('application/x-python-serialize')
+        try:
+            consumer = conn.Consumer(queues=[q], callbacks=[callback])
+            with consumer:
+                conn.Producer().publish(
+                    {'complex': object()},
+                    declare=[q], exchange=self.exchange, serializer='pickle',
+                )
+                # Disabling then enabling globally must not change the
+                # capabilities frozen with the consumer.
+                registry.disable('pickle')
+                registry.enable('pickle')
+
+                with pytest.raises(ContentDisallowed):
+                    conn.drain_events(timeout=1)
+        finally:
+            disabled.clear()
+            disabled.update(frozen_disabled)
+
+        callback.assert_not_called()
 
     def test_set_no_channel(self):
         c = Consumer(None)

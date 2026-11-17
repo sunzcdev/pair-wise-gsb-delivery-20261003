@@ -182,6 +182,7 @@
         .. autoattribute:: callbacks
         .. autoattribute:: on_message
         .. autoattribute:: on_decode_error
+        .. autoattribute:: decoder_view
         .. autoattribute:: connection
 
         .. automethod:: declare

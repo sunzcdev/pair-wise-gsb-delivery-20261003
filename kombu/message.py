@@ -51,6 +51,11 @@ class Message:
 
     errors = None
 
+    #: Frozen decoder capability view of the consumer that received this
+    #: message.  When set, :meth:`decode` only uses the decoders frozen in
+    #: this view instead of resolving them from the global registry.
+    decoder_view = None
+
     if not IS_PYPY:  # pragma: no cover
         __slots__ = (
             '_state', 'channel', 'delivery_tag',
@@ -62,7 +67,7 @@ class Message:
     def __init__(self, body=None, delivery_tag=None,
                  content_type=None, content_encoding=None, delivery_info=None,
                  properties=None, headers=None, postencode=None,
-                 accept=None, channel=None, **kwargs):
+                 accept=None, channel=None, decoder_view=None, **kwargs):
         delivery_info = {} if not delivery_info else delivery_info
         self.errors = [] if self.errors is None else self.errors
         self.channel = channel
@@ -75,6 +80,9 @@ class Message:
         self._decoded_cache = None
         self._state = 'RECEIVED'
         self.accept = accept
+        # Only an explicit view freezes the capabilities of this message;
+        # otherwise the global registry is used as before.
+        self.decoder_view = decoder_view
 
         compression = self.headers.get('compression')
         if not self.errors and compression:
@@ -202,6 +210,13 @@ class Message:
         return self._decoded_cache
 
     def _decode(self):
+        view = self.decoder_view
+        if view is not None:
+            # Decode against the frozen capabilities of the receiving
+            # consumer: the global registry is never consulted here.
+            return view.decode(
+                self.body, self.content_type, self.content_encoding,
+            )
         return loads(self.body, self.content_type,
                      self.content_encoding, accept=self.accept)
 
