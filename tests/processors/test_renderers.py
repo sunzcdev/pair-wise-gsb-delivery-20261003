@@ -371,6 +371,255 @@ class TestJSONRenderer:
         } == json.loads(jr(None, None, event_dict))
 
 
+class TestJSONRendererExplicitMode:
+    """
+    Explicit mode: only registered adapters run, never __structlog__/repr().
+    """
+
+    def test_registered_adapter_is_used(self):
+        """
+        Registered types are converted by their adapter.
+        """
+        jr = JSONRenderer(type_adapters={dt.date: str})
+
+        rv = jr(None, None, {"date": dt.date(1980, 3, 25)})
+
+        assert '{"date": "1980-03-25"}' == rv
+
+    def test_unregistered_type_gets_type_marker(self):
+        """
+        Unregistered objects are replaced by a type marker; __structlog__
+        and __repr__ are not called.
+        """
+
+        class Sneaky:
+            def __structlog__(self):  # pragma: no cover
+                raise AssertionError("__structlog__ must not be called")
+
+            def __repr__(self):  # pragma: no cover
+                raise AssertionError("__repr__ must not be called")
+
+        jr = JSONRenderer(type_adapters={})
+
+        rv = jr(None, None, {"obj": Sneaky()})
+
+        assert "Sneaky" in rv
+        assert "unregistered-type" in rv
+
+    def test_adapter_priority_exact_type_beats_base(self):
+        """
+        An exact type registration wins over a base class registration.
+        """
+
+        class Base:
+            pass
+
+        class Child(Base):
+            pass
+
+        jr = JSONRenderer(
+            type_adapters={Base: lambda o: "base", Child: lambda o: "child"}
+        )
+
+        rv = jr(None, None, {"obj": Child()})
+
+        assert '{"obj": "child"}' == rv
+
+    def test_adapter_priority_mro(self):
+        """
+        Without an exact registration, the nearest registered ancestor in
+        the MRO applies.
+        """
+
+        class Base:
+            pass
+
+        class Middle(Base):
+            pass
+
+        class Child(Middle):
+            pass
+
+        jr = JSONRenderer(
+            type_adapters={
+                Base: lambda o: "base",
+                Middle: lambda o: "middle",
+            }
+        )
+
+        rv = jr(None, None, {"obj": Child()})
+
+        assert '{"obj": "middle"}' == rv
+
+    def test_adapter_error_marker_and_no_retry(self):
+        """
+        A failing adapter produces a dedicated marker and is called exactly
+        once.
+        """
+        calls = 0
+
+        class Boom:
+            pass
+
+        def bad_adapter(obj):
+            nonlocal calls
+            calls += 1
+            raise RuntimeError("kaputt")
+
+        jr = JSONRenderer(type_adapters={Boom: bad_adapter})
+
+        rv = jr(None, None, {"obj": Boom()})
+
+        assert 1 == calls
+        assert "adapter-error" in rv
+        assert "RuntimeError" in rv
+        assert "kaputt" not in rv
+
+    def test_circular_container_gets_marker(self):
+        """
+        Circular containers are replaced by a marker instead of recursing
+        forever.
+        """
+        jr = JSONRenderer(type_adapters={})
+        circle = [1, 2]
+        circle.append(circle)
+
+        rv = jr(None, None, {"circle": circle})
+
+        assert '{"circle": [1, 2, "<structlog:circular-reference>"]}' == rv
+
+    def test_adapter_result_is_checked_for_cycles(self):
+        """
+        Containers produced by an adapter are still checked for cycles.
+        """
+
+        class Node:
+            pass
+
+        node = Node()
+        holder = {"node": node}
+        holder["self"] = holder
+
+        jr = JSONRenderer(type_adapters={Node: lambda o: holder})
+
+        rv = jr(None, None, {"obj": node})
+
+        assert "circular-reference" in rv
+
+    def test_adapter_returning_itself_terminates(self):
+        """
+        An adapter returning the object itself does not loop forever.
+        """
+
+        class Ouroboros:
+            pass
+
+        jr = JSONRenderer(type_adapters={Ouroboros: lambda o: o})
+
+        rv = jr(None, None, {"obj": Ouroboros()})
+
+        assert "circular-reference" in rv
+
+    def test_max_items_marker(self):
+        """
+        Containers exceeding max_items are replaced by a marker.
+        """
+        jr = JSONRenderer(type_adapters={}, max_items=2)
+
+        rv = jr(None, None, {"ok": [1, 2], "big": [1, 2, 3]})
+
+        assert '{"ok": [1, 2], "big": "<structlog:max-items-exceeded>"}' == rv
+
+    def test_max_items_applies_to_adapter_results(self):
+        """
+        Containers produced by adapters are size-checked too.
+        """
+
+        class Wide:
+            pass
+
+        jr = JSONRenderer(
+            type_adapters={Wide: lambda o: [1, 2, 3]}, max_items=2
+        )
+
+        rv = jr(None, None, {"obj": Wide()})
+
+        assert '{"obj": "<structlog:max-items-exceeded>"}' == rv
+
+    def test_max_depth_marker(self):
+        """
+        Structures nested deeper than max_depth are replaced by a marker.
+        """
+        jr = JSONRenderer(type_adapters={}, max_depth=1)
+
+        rv = jr(None, None, {"deep": [[["too deep"]]]})
+
+        assert '{"deep": ["<structlog:max-depth-exceeded>"]}' == rv
+
+    def test_does_not_mutate_event_dict_or_objects(self):
+        """
+        The original event dict and contained objects are left untouched.
+        """
+
+        class Thing:
+            def __init__(self):
+                self.value = 42
+
+        thing = Thing()
+        nested = {"items": [1, 2], "thing": thing}
+        event_dict = {"nested": nested}
+
+        jr = JSONRenderer(type_adapters={Thing: lambda o: {"v": o.value}})
+        rv = jr(None, None, event_dict)
+
+        assert {"nested": {"items": [1, 2], "thing": thing}} == event_dict
+        assert 42 == thing.value
+        assert '{"nested": {"items": [1, 2], "thing": {"v": 42}}}' == rv
+
+    def test_nested_unregistered_inside_adapter_result(self):
+        """
+        Unregistered objects inside adapter results get type markers.
+        """
+
+        class Registered:
+            pass
+
+        class Unregistered:
+            pass
+
+        jr = JSONRenderer(
+            type_adapters={Registered: lambda o: {"inner": Unregistered()}}
+        )
+
+        rv = jr(None, None, {"obj": Registered()})
+
+        assert "unregistered-type" in rv
+        assert "Unregistered" in rv
+
+    def test_limits_without_type_adapters_raise(self):
+        """
+        max_depth/max_items without type_adapters are a configuration error.
+        """
+        with pytest.raises(ValueError, match="require explicit mode"):
+            JSONRenderer(max_depth=3)
+
+        with pytest.raises(ValueError, match="require explicit mode"):
+            JSONRenderer(max_items=3)
+
+    def test_non_native_dict_keys(self):
+        """
+        Non-string keys are converted; unconvertible ones become markers.
+        """
+        jr = JSONRenderer(type_adapters={dt.date: str})
+
+        rv = jr(None, None, {dt.date(1980, 3, 25): "day", (1, 2): "tuple"})
+
+        assert (
+            '{"1980-03-25": "day", "<structlog:unregistered-type builtins.tuple>": "tuple"}'
+            == rv
+        )
+
+
 class TestTimeStamper:
     def test_disallows_non_utc_unix_timestamps(self):
         """

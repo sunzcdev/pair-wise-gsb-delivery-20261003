@@ -166,6 +166,32 @@ Advanced log aggregation and analysis tools like [Logstash](https://www.elastic.
 For a list of shipped processors, check out the {ref}`API documentation <procs>`.
 
 
+(explicit-json-mode)=
+## Explicit JSON Serialization Mode
+
+By default, {class}`structlog.processors.JSONRenderer` serializes unknown objects by probing for a `__structlog__` method and falling back to {func}`repr`.
+That is convenient, but it means logging can execute arbitrary user code.
+
+If you pass *type_adapters* to {class}`structlog.processors.JSONRenderer`, **explicit mode** is enabled and only the adapters you registered run:
+
+```python
+structlog.processors.JSONRenderer(
+    type_adapters={datetime.date: str, Money: lambda m: {"amount": m.amount}},
+    max_depth=10,
+    max_items=1000,
+)
+```
+
+In explicit mode:
+
+- Adapters are resolved by exact type first, then by MRO order (the nearest registered ancestor wins).
+- Objects without a registered adapter are replaced by a type marker like `<structlog:unregistered-type datetime.date>` -- `__structlog__` and `repr()` are never called.
+- Adapter results that are containers are walked again, so cycle and size checks (*max_depth*, *max_items*) apply to them, too.
+  Violations are replaced by markers such as `<structlog:circular-reference>`.
+- If an adapter raises, the value is replaced by an adapter-error marker; the adapter is not called again to describe the failure.
+- Neither the event dictionary nor the objects within it are mutated; containers are always rebuilt.
+
+
 ## Third-Party packages
 
 *structlog* was specifically designed to be as composable and reusable as possible, so whatever you're missing:

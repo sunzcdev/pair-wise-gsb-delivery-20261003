@@ -22,7 +22,7 @@ import sys
 import threading
 import time
 
-from collections.abc import Callable, Collection, Sequence
+from collections.abc import Callable, Collection, Mapping, Sequence
 from types import FrameType, TracebackType
 from typing import (
     Any,
@@ -334,18 +334,63 @@ class JSONRenderer:
 
             .. seealso:: :doc:`performance` for examples.
 
+        type_adapters:
+            If not ``None``, *explicit mode* is enabled: a mapping of types to
+            callables that convert instances of those types into JSON-native
+            structures.
+
+            In explicit mode, ``__structlog__`` is **never** called and no
+            :func:`repr`-based fallback is used.  Objects whose type is not
+            registered are replaced by a type marker string.  See
+            :ref:`explicit-json-mode` for details.
+
+        max_depth:
+            Maximum nesting depth for containers and adapter results in
+            explicit mode.  Deeper structures are replaced by a marker.
+            ``None`` (default) means unlimited.  Ignored unless *type_adapters*
+            is given.
+
+        max_items:
+            Maximum number of items per container in explicit mode.  Larger
+            containers are replaced by a marker.  ``None`` (default) means
+            unlimited.  Ignored unless *type_adapters* is given.
+
     .. versionadded:: 0.2.0 Support for ``__structlog__`` serialization method.
     .. versionadded:: 15.4.0 *serializer* parameter.
     .. versionadded:: 18.2.0
        Serializer's *default* parameter can be overwritten now.
+    .. versionadded:: 26.2.0
+       Explicit mode via *type_adapters*, *max_depth*, and *max_items*.
     """
 
     def __init__(
         self,
         serializer: Callable[..., str | bytes] = json.dumps,
+        *,
+        type_adapters: Mapping[type, Callable[[Any], Any]] | None = None,
+        max_depth: int | None = None,
+        max_items: int | None = None,
         **dumps_kw: Any,
     ) -> None:
-        dumps_kw.setdefault("default", _json_fallback_handler)
+        if type_adapters is None:
+            if max_depth is not None or max_items is not None:
+                msg = (
+                    "max_depth and max_items require explicit mode: "
+                    "pass type_adapters (possibly empty) too."
+                )
+                raise ValueError(msg)
+
+            dumps_kw.setdefault("default", _json_fallback_handler)
+            self._transformer: _ExplicitJSONTransformer | None = None
+        else:
+            # Explicit mode: only registered adapters run.  The default
+            # handler is a last-resort safety net that must never probe
+            # __structlog__ or repr().
+            dumps_kw.setdefault("default", _explicit_safe_default)
+            self._transformer = _ExplicitJSONTransformer(
+                type_adapters, max_depth, max_items
+            )
+
         self._dumps_kw = dumps_kw
         self._dumps = serializer
 
@@ -355,6 +400,11 @@ class JSONRenderer:
         """
         The return type of this depends on the return type of self._dumps.
         """
+        if self._transformer is not None:
+            # The transformer returns a new structure; the original
+            # event_dict and the objects within it are never mutated.
+            event_dict = self._transformer(event_dict)
+
         return self._dumps(event_dict, **self._dumps_kw)
 
 
@@ -372,6 +422,180 @@ def _json_fallback_handler(obj: Any) -> Any:
         return obj.__structlog__()
     except AttributeError:
         return repr(obj)
+
+
+# Markers used by JSONRenderer's explicit mode.  They are deliberately plain
+# strings so they can never fail serialization themselves.
+_CIRCULAR_MARKER: Final = "<structlog:circular-reference>"
+_MAX_DEPTH_MARKER: Final = "<structlog:max-depth-exceeded>"
+_MAX_ITEMS_MARKER: Final = "<structlog:max-items-exceeded>"
+
+# Types that json.dumps handles natively (as values and, except for None, as
+# keys).  They are passed through by reference -- never copied, never probed.
+_JSON_NATIVE_TYPES: Final = (str, int, float, bool, type(None))
+
+
+def _explicit_type_name(obj: Any) -> str:
+    """
+    Return a stable ``module.qualname`` for *obj*'s type without calling any
+    user-defined code on *obj* itself.
+    """
+    t = type(obj)
+    return f"{t.__module__}.{t.__qualname__}"
+
+
+def _explicit_type_marker(obj: Any) -> str:
+    """
+    Marker for objects whose type has no registered adapter.
+    """
+    return f"<structlog:unregistered-type {_explicit_type_name(obj)}>"
+
+
+def _explicit_adapter_error_marker(obj: Any, exc: BaseException) -> str:
+    """
+    Marker for objects whose registered adapter raised.
+
+    Only the exception's *type name* is included -- the adapter is not called
+    again and neither repr() nor str() is used to describe the failure.
+    """
+    return (
+        f"<structlog:adapter-error {_explicit_type_name(obj)}: "
+        f"{type(exc).__name__}>"
+    )
+
+
+def _explicit_safe_default(obj: Any) -> str:
+    """
+    Last-resort ``default`` for the serializer in explicit mode.
+
+    The transformer should have replaced everything already, so this only
+    runs if a custom serializer has different ideas about what is native.
+    It must never probe ``__structlog__`` or ``repr()``.
+    """
+    return _explicit_type_marker(obj)
+
+
+class _ExplicitJSONTransformer:
+    """
+    Recursively convert *obj* into JSON-native structures using only
+    explicitly registered type adapters.
+
+    - Adapters are resolved by exact type first, then by MRO order (nearest
+      ancestor wins).
+    - Adapter results that are containers are walked again, so cycle and
+      size checks apply to them too.
+    - Adapters that raise are replaced by a dedicated marker; the adapter is
+      never called a second time for the same object.
+    - Nothing is mutated: containers are always rebuilt, scalars pass
+      through.
+    """
+
+    __slots__ = ("_adapters", "_max_depth", "_max_items")
+
+    def __init__(
+        self,
+        adapters: Mapping[type, Callable[[Any], Any]],
+        max_depth: int | None,
+        max_items: int | None,
+    ) -> None:
+        self._adapters = dict(adapters)
+        self._max_depth = max_depth
+        self._max_items = max_items
+
+    def __call__(self, obj: Any) -> Any:
+        return self._convert(obj, 0, set())
+
+    def _adapter_for(self, obj_type: type) -> Callable[[Any], Any] | None:
+        # Exact type registration wins over inherited ones.
+        adapter = self._adapters.get(obj_type)
+        if adapter is not None:
+            return adapter
+
+        # Then walk the MRO so the nearest registered ancestor applies.
+        for klass in obj_type.__mro__[1:]:
+            adapter = self._adapters.get(klass)
+            if adapter is not None:
+                return adapter
+
+        return None
+
+    def _convert(self, obj: Any, depth: int, seen: set[int]) -> Any:
+        # Fast path: JSON-native scalars pass through untouched.
+        if isinstance(obj, _JSON_NATIVE_TYPES):
+            return obj
+
+        if self._max_depth is not None and depth > self._max_depth:
+            return _MAX_DEPTH_MARKER
+
+        if isinstance(obj, dict):
+            return self._convert_container(obj, depth, seen, is_dict=True)
+
+        if isinstance(obj, (list, tuple, set, frozenset)):
+            return self._convert_container(obj, depth, seen, is_dict=False)
+
+        return self._convert_custom(obj, depth, seen)
+
+    def _convert_custom(self, obj: Any, depth: int, seen: set[int]) -> Any:
+        adapter = self._adapter_for(type(obj))
+        if adapter is None:
+            return _explicit_type_marker(obj)
+
+        # Track the object while its adapter result is converted so that
+        # adapters returning themselves (or ping-ponging) terminate.
+        oid = id(obj)
+        if oid in seen:
+            return _CIRCULAR_MARKER
+
+        seen.add(oid)
+        try:
+            try:
+                converted = adapter(obj)
+            except Exception as exc:  # noqa: BLE001
+                # Adapters are user code: any failure must become a
+                # dedicated marker; never re-run the adapter (or repr()) to
+                # describe it.
+                return _explicit_adapter_error_marker(obj, exc)
+
+            return self._convert(converted, depth + 1, seen)
+        finally:
+            seen.discard(oid)
+
+    def _convert_container(
+        self, obj: Any, depth: int, seen: set[int], *, is_dict: bool
+    ) -> Any:
+        oid = id(obj)
+        if oid in seen:
+            return _CIRCULAR_MARKER
+
+        if self._max_items is not None and len(obj) > self._max_items:
+            return _MAX_ITEMS_MARKER
+
+        seen.add(oid)
+        try:
+            if is_dict:
+                return {
+                    self._convert_key(key, depth, seen): self._convert(
+                        value, depth + 1, seen
+                    )
+                    for key, value in obj.items()
+                }
+
+            return [self._convert(item, depth + 1, seen) for item in obj]
+        finally:
+            seen.discard(oid)
+
+    def _convert_key(self, key: Any, depth: int, seen: set[int]) -> Any:
+        # json.dumps accepts str, int, float, bool, and None as keys.
+        if isinstance(key, _JSON_NATIVE_TYPES):
+            return key
+
+        converted = self._convert(key, depth + 1, seen)
+        if isinstance(converted, _JSON_NATIVE_TYPES):
+            return converted
+
+        # A container (or a marker would already be a str) can't be a JSON
+        # key; fall back to the type marker of the original key.
+        return _explicit_type_marker(key)
 
 
 class ExceptionRenderer:

@@ -15,6 +15,13 @@ You can find our backwards-compatibility policy [here](https://github.com/hynek/
 
 ## [Unreleased](https://github.com/hynek/structlog/compare/26.1.0...HEAD)
 
+### Added
+
+- `structlog.processors.JSONRenderer` now supports an *explicit mode* via the new *type_adapters* parameter: only registered type adapters are used to serialize custom objects -- `__structlog__` is never probed and no `repr()` fallback runs.
+  Unregistered objects are replaced by type markers, adapter results are still checked for cycles and size (*max_depth* / *max_items*), and failing adapters produce a dedicated marker without being called again.
+  The original event dictionary and the objects within it are never mutated.
+
+
 ### Changed
 
 - On Python 3.15 and later, *structlog* uses [PEP 810](https://peps.python.org/pep-0810/) lazy imports for modules that are only needed once you log.
