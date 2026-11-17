@@ -1,0 +1,180 @@
+# frozen_string_literal: true
+
+require "test_helper"
+
+require "redis_client/ruby_connection/buffered_io"
+require "redis_client/ruby_connection/resp3"
+
+class RedisClient
+  class RESP3Test < RedisClientTestCase
+    class StringIO < ::StringIO
+      def skip(offset)
+        seek(offset, IO::SEEK_CUR)
+        nil
+      end
+    end
+
+    class ChunkedStringIO < StringIO
+      def read_nonblock(maxlen, *args, **kwargs)
+        super([maxlen, 1024].min, *args, **kwargs)
+      end
+    end
+
+    def test_dump_mixed_encoding
+      assert_dumps ["SET", "fée", "\xC6bIJ"], "*3\r\n$3\r\nSET\r\n$4\r\nfée\r\n$4\r\n\xC6bIJ\r\n"
+    end
+
+    def test_dump_string
+      assert_dumps ["Hello World!"], "*1\r\n$12\r\nHello World!\r\n"
+      assert_dumps ["Hello\r\nWorld!"], "*1\r\n$13\r\nHello\r\nWorld!\r\n"
+    end
+
+    def test_dump_integer
+      assert_dumps [42], "*1\r\n$2\r\n42\r\n"
+    end
+
+    def test_dump_true
+      assert_raises TypeError do
+        RESP3.dump([true])
+      end
+    end
+
+    def test_dump_false
+      assert_raises TypeError do
+        RESP3.dump([false])
+      end
+    end
+
+    def test_dump_nil
+      assert_raises TypeError do
+        RESP3.dump([nil])
+      end
+    end
+
+    def test_dump_big_integer
+      assert_dumps [1_000_000_000_000_000_000_000], "*1\r\n$22\r\n1000000000000000000000\r\n"
+    end
+
+    def test_dump_float
+      assert_dumps [42.42], "*1\r\n$5\r\n42.42\r\n"
+      # TODO: What about NaN, Infinity, -Infinity
+    end
+
+    def test_dump_array
+      assert_dumps ["PRINT", [1, 2, 3]], "*4\r\n$5\r\nPRINT\r\n$1\r\n1\r\n$1\r\n2\r\n$1\r\n3\r\n"
+    end
+
+    def test_dump_hash
+      assert_dumps(["PRINT", { 'first' => 1, 'second' => 2 }], "*5\r\n$5\r\nPRINT\r\n$5\r\nfirst\r\n$1\r\n1\r\n$6\r\nsecond\r\n$1\r\n2\r\n")
+    end
+
+    def test_dump_subclasses
+      my_string_class = Class.new(String)
+      assert_dumps [my_string_class.new("Hello")], "*1\r\n$5\r\nHello\r\n"
+    end
+
+    def test_load_blob_string
+      assert_parses "Hello World!", "$12\r\nHello World!\r\n"
+    end
+
+    def test_load_simple_string
+      assert_parses "Hello World!", "+Hello World!\r\n"
+    end
+
+    def test_load_error
+      assert_parses CommandError.parse("SOMEERROR"), "-SOMEERROR\r\n"
+    end
+
+    def test_load_integer
+      assert_parses 42, ":42\r\n"
+      assert_parses(-42, ":-42\r\n")
+      assert_parses 3_492_890_328_409_238_509_324_850_943_850_943_825_024_385, "(3492890328409238509324850943850943825024385\r\n"
+    end
+
+    def test_load_double
+      assert_parses 42.42, ",42.42\r\n"
+      assert_parses(-42.42, ",-42.42\r\n")
+      assert_parses Float::INFINITY, ",inf\r\n"
+      assert_parses(-Float::INFINITY, ",-inf\r\n")
+      assert_parses(nil, ",nan\r\n") do |actual|
+        assert_predicate actual, :nan?
+      end
+    end
+
+    def test_load_null
+      assert_parses nil, "_\r\n"
+    end
+
+    def test_load_boolean
+      assert_parses true, "#t\r\n"
+      assert_parses false, "#f\r\n"
+    end
+
+    def test_load_array
+      assert_parses [1, 2, 3], "*3\r\n:1\r\n:2\r\n:3\r\n"
+    end
+
+    def test_load_multibyte_chars
+      # Check that the buffer is properly operating over bytes and not characters
+      assert_parses ["€™€™", 2], "*2\r\n$12\r\n€™€™\r\n:2\r\n"
+    end
+
+    def test_load_set
+      assert_parses ['orange', 'apple', true, 100, 999], "~5\r\n+orange\r\n+apple\r\n#t\r\n:100\r\n:999\r\n"
+    end
+
+    def test_load_map
+      assert_parses({ 'first' => 1, 'second' => 2 }, "%2\r\n+first\r\n:1\r\n+second\r\n:2\r\n")
+    end
+
+    def test_load_missing_type_byte
+      error = assert_raises RESP3::Error do
+        RESP3.load(StringIO.new("".b))
+      end
+      assert_includes error.message, "end of stream"
+    end
+
+    def test_load_large_map
+      entries = 100_000
+      payload = +"%#{entries}\r\n"
+      entries.times do |i|
+        payload << "+#{i}\r\n:#{i}\r\n"
+      end
+      expected = entries.times.each_with_object({}) { |i, h| h[i.to_s] = i }
+      assert_parses(expected, payload)
+    end
+
+    def test_load_blob_string_across_multiple_reads
+      # Each read returns at most 1KB, so the blob is assembled from many reads
+      value = Array.new(4_000) { |i| "#{i}," }.join
+      assert_parses value, "$#{value.bytesize}\r\n#{value}\r\n", io_class: ChunkedStringIO
+    end
+
+    def test_load_verbatim_string
+      assert_parses "Some string", "=15\r\ntxt:Some string\r\n"
+    end
+
+    private
+
+    def assert_parses(expected, payload, io_class: StringIO)
+      raw_io = io_class.new(payload.b)
+      io = RedisClient::RubyConnection::BufferedIO.new(raw_io, read_timeout: 1, write_timeout: 1)
+      actual = RESP3.load(io)
+      if block_given?
+        yield actual
+      elsif expected.nil?
+        assert_nil actual
+      else
+        assert_equal(expected, actual)
+      end
+
+      assert io.eof?, "Expected IO to be fully consumed: #{raw_io.read.inspect}"
+    end
+
+    def assert_dumps(payload, expected)
+      buffer = RESP3.dump(payload)
+      assert_equal expected.b, buffer
+      assert_equal Encoding::BINARY, buffer.encoding
+    end
+  end
+end

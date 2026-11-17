@@ -1,0 +1,27 @@
+# frozen_string_literal: true
+
+source "https://rubygems.org"
+
+# Specify your gem's dependencies in redis-client.gemspec
+gemspec name: "redis-client"
+
+gem "megatest"
+gem "rake", "~> 13.4"
+gem "rake-compiler"
+gem "toxiproxy"
+gem "benchmark"
+
+group :linter do
+  gem "rubocop"
+  gem "base64" # For rubocop
+  gem "ostruct" # For rubocop
+  gem "rubocop-minitest"
+end
+
+group :benchmark do
+  gem "benchmark-ips"
+  gem "hiredis"
+  gem "redis", "~> 4.6"
+  gem "cgi", ">= 0.5.0" # For Redis 4.x
+  gem "stackprof", platform: :mri
+end

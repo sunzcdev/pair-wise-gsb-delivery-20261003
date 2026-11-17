@@ -1,0 +1,17 @@
+/.bundle/
+/.yardoc
+/_yardoc/
+/coverage/
+/doc/
+/pkg/
+/hiredis-client/pkg/
+/spec/reports/
+/tmp/
+/log/
+
+/hiredis-client/tmp/
+/bin/toxiproxy-server
+*.so
+*.bundle
+*.dll
+*.rdb
