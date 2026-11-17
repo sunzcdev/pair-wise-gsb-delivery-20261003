@@ -145,10 +145,74 @@ Returns `None`. Only removes files for `live*` gauge modes (e.g. `livesum`, `liv
 for non-live modes are left in place so their last values remain visible until the directory is
 wiped on restart.
 
+Counters, histograms and summaries are never removed by this function: their values are
+cumulative and a dead process's contribution must keep being added to the aggregated totals.
+Files whose names do not follow the multi-process metric file protocol are ignored as well.
+Deletions are executed through a cleanup plan (see below), so a file that was replaced between
+planning and execution — for example because its pid was reused — is skipped rather than
+deleted.
+
 ```python
 # Gunicorn config
 from prometheus_client import multiprocess
 
 def child_exit(server, worker):
     multiprocess.mark_process_dead(worker.pid)
+```
+
+### Reviewable cleanup: `build_cleanup_plan` / `execute_cleanup_plan`
+
+When you want to inspect what would be removed before removing it, build a `CleanupPlan`
+first. Building a plan never touches the filesystem; the plan lists every file in the
+directory together with its disposition and reason:
+
+- `to_delete`: `live*` gauge files whose process is no longer running.
+- `kept`: everything that must remain, with the reason:
+  - cumulative metrics (`counter`, `histogram`, `summary`) are retained for aggregation,
+  - non-live gauges retain their last value for a dead process,
+  - files belonging to a pid outside the requested cleanup are left alone,
+  - `live*` gauges of a still running process are left alone.
+- `unrecognized`: entries that do not follow the metric file protocol (unknown metric type or
+  gauge mode, non-numeric pid, missing `.db` suffix, non-regular files). They are reported for
+  review and never deleted.
+
+`plan.summary()` renders the plan as human-readable text for auditing.
+
+```python
+from prometheus_client import multiprocess
+
+# Review first.
+plan = multiprocess.build_cleanup_plan(pid=worker.pid)
+print(plan.summary())
+
+# Then execute, or hand the plan to whoever approves the cleanup.
+result = multiprocess.execute_cleanup_plan(plan)
+print('deleted:', len(result.deleted), 'skipped:', len(result.skipped))
+```
+
+| Function / parameter | Type | Default | Description |
+|----------------------|------|---------|-------------|
+| `build_cleanup_plan(pid, path, process_is_alive)` | | | Returns a `CleanupPlan` without deleting anything. |
+| `pid` | `Optional[int]` | `None` | Only consider this pid; `None` considers every process in the directory. |
+| `path` | `Optional[str]` | `None` | Multiprocess directory; defaults to `PROMETHEUS_MULTIPROC_DIR`. |
+| `process_is_alive` | `Callable[[int], bool]` | `default_process_is_alive` | Liveness callback taking a pid. Inject a fake callback in tests, or your process manager's own liveness knowledge in production. |
+| `execute_cleanup_plan(plan, process_is_alive)` | | | Performs the planned deletions and returns a `CleanupResult` of `deleted` and `skipped` entries. |
+
+Every deletion is re-validated at execution time against the state captured in the plan:
+the file must still exist, must have the same fingerprint (device/inode/size/mtime), must still
+parse to the same protocol entry, and the pid must still be dead. If anything changed — the
+file was replaced or the pid was reused — the entry is reported in `result.skipped` and kept
+on disk instead of being removed. A stale plan can therefore never delete a file belonging to
+a new process.
+
+`default_process_is_alive(pid)` probes liveness portably: signal zero on POSIX and a limited
+`OpenProcess` query on Windows. It is safe to call natively on Windows without spawning
+subprocesses.
+
+```python
+# Clean up every dead worker in one auditable pass.
+plan = multiprocess.build_cleanup_plan()  # pid=None considers all pids
+for entry in plan.to_delete:
+    ...  # custom approval/logging before execution
+multiprocess.execute_cleanup_plan(plan)
 ```

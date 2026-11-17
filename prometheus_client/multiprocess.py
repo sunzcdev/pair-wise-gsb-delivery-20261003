@@ -1,7 +1,10 @@
 from collections import defaultdict
+from dataclasses import dataclass
+import errno
 import glob
 import json
 import os
+from typing import Callable, Dict, List, Optional, Tuple
 import warnings
 
 from .metrics import Gauge
@@ -14,6 +17,38 @@ try:  # Python3
     FileNotFoundError
 except NameError:  # Python >= 2.5
     FileNotFoundError = IOError
+
+__all__ = (
+    'MultiProcessCollector',
+    'mark_process_dead',
+    'build_cleanup_plan',
+    'execute_cleanup_plan',
+    'default_process_is_alive',
+    'CleanupPlan',
+    'CleanupEntry',
+    'MetricFile',
+    'FileFingerprint',
+    'UnrecognizedFile',
+    'CleanupResult',
+    'SkippedFile',
+)
+
+# File names produced by MultiProcessValue follow one of two protocols:
+#   gauge_<multiprocess_mode>_<pid>.db
+#   <metric_type>_<pid>.db
+# where metric_type is one of the cumulative types below.
+_DB_SUFFIX = '.db'
+_CUMULATIVE_METRIC_TYPES = frozenset(('counter', 'histogram', 'summary'))
+_LIVE_GAUGE_MULTIPROCESS_MODES = frozenset(
+    mode for mode in Gauge._MULTIPROC_MODES if mode.startswith('live'))
+
+# Human-readable, stable reasons attached to every entry of a plan so the
+# output can be audited before anything is removed.
+REASON_LIVE_GAUGE_DEAD_PROCESS = 'live gauge of a dead process'
+REASON_LIVE_GAUGE_PROCESS_ALIVE = 'live gauge of a still running process'
+REASON_CUMULATIVE_METRIC = 'cumulative metric must be retained for aggregation'
+REASON_NONLIVE_GAUGE = 'non-live gauge keeps its last value for a dead process'
+REASON_PID_NOT_REQUESTED = 'belongs to a pid not requested for cleanup'
 
 
 class MultiProcessCollector:
@@ -171,15 +206,362 @@ class MultiProcessCollector:
         return self.merge(files, accumulate=True)
 
 
-_LIVE_GAUGE_MULTIPROCESS_MODES = {m for m in Gauge._MULTIPROC_MODES if m.startswith('live')}
+def _resolve_multiproc_dir(path):
+    """Return the multiprocess directory, falling back to the environment."""
+    if path is None:
+        path = os.environ.get(
+            'PROMETHEUS_MULTIPROC_DIR',
+            os.environ.get('prometheus_multiproc_dir'))
+    return path
+
+
+@dataclass(frozen=True)
+class FileFingerprint:
+    """Identity snapshot of a file, used to detect replacement.
+
+    A file that disappears and is recreated (e.g. because its pid was reused
+    by a new process) keeps the same name but gets a different fingerprint.
+    """
+
+    device: int
+    inode: int
+    size: int
+    mtime_ns: int
+
+    @classmethod
+    def from_path(cls, path):
+        """Build a fingerprint from an existing file path."""
+        stat_result = os.stat(path)
+        return cls(
+            stat_result.st_dev,
+            stat_result.st_ino,
+            stat_result.st_size,
+            stat_result.st_mtime_ns)
+
+    def matches(self, path):
+        """Return whether the file at path still has this fingerprint."""
+        try:
+            return self == FileFingerprint.from_path(path)
+        except FileNotFoundError:
+            return False
+
+
+@dataclass(frozen=True)
+class MetricFile:
+    """A file whose name follows the multi-process metric file protocol."""
+
+    path: str
+    metric_type: str
+    pid: int
+    fingerprint: FileFingerprint
+    gauge_mode: Optional[str] = None
+
+    @property
+    def is_live_gauge(self):
+        """Whether this is a gauge file for a live* multiprocess mode."""
+        return self.gauge_mode in _LIVE_GAUGE_MULTIPROCESS_MODES
+
+    @property
+    def is_cumulative(self):
+        """Whether this file holds a monotonic, accumulable metric."""
+        return self.metric_type in _CUMULATIVE_METRIC_TYPES
+
+
+def parse_metric_filename(path):
+    """Parse a multi-process metric file name per the naming protocol.
+
+    Returns a MetricFile, or None if the name does not match the protocol
+    (wrong suffix, unknown metric type/mode or non-numeric pid).
+    """
+    name = os.path.basename(path)
+    if not name.endswith(_DB_SUFFIX):
+        return None
+    stem = name[:-len(_DB_SUFFIX)]
+    parts = stem.split('_')
+    if len(parts) < 2:
+        return None
+    metric_type = parts[0]
+    pid_text = parts[-1]
+    if not pid_text or not pid_text.isascii() or not pid_text.isdigit():
+        return None
+    pid = int(pid_text)
+    if metric_type == 'gauge':
+        if len(parts) != 3:
+            return None
+        gauge_mode = parts[1]
+        if gauge_mode not in Gauge._MULTIPROC_MODES:
+            return None
+        return MetricFile(
+            path, metric_type, pid,
+            FileFingerprint.from_path(path), gauge_mode)
+    if metric_type not in _CUMULATIVE_METRIC_TYPES or len(parts) != 2:
+        return None
+    return MetricFile(
+        path, metric_type, pid, FileFingerprint.from_path(path))
+
+
+@dataclass(frozen=True)
+class UnrecognizedFile:
+    """A directory entry that does not follow the metric file protocol.
+
+    Such entries are never deleted; they are reported so an operator can
+    investigate where they came from.
+    """
+
+    path: str
+    reason: str
+
+
+@dataclass(frozen=True)
+class CleanupEntry:
+    """A protocol-conforming file together with its cleanup disposition."""
+
+    file: MetricFile
+    reason: str
+
+    @property
+    def delete(self):
+        """Whether this entry is planned for removal."""
+        return self.reason == REASON_LIVE_GAUGE_DEAD_PROCESS
+
+
+@dataclass(frozen=True)
+class SkippedFile:
+    """A planned deletion that was not carried out, with the reason why."""
+
+    entry: CleanupEntry
+    reason: str
+
+
+@dataclass(frozen=True)
+class CleanupResult:
+    """Outcome of executing a cleanup plan."""
+
+    deleted: Tuple[CleanupEntry, ...] = ()
+    skipped: Tuple[SkippedFile, ...] = ()
+
+
+@dataclass(frozen=True)
+class CleanupPlan:
+    """Reviewable description of what a cleanup would do.
+
+    to_delete/kept cover every protocol-conforming file in the directory and
+    unrecognized covers everything else, so the plan accounts for the whole
+    directory without touching any file on its own.
+    """
+
+    path: str
+    pid: Optional[int]
+    to_delete: Tuple[CleanupEntry, ...] = ()
+    kept: Tuple[CleanupEntry, ...] = ()
+    unrecognized: Tuple[UnrecognizedFile, ...] = ()
+    process_is_alive: Optional[Callable[[int], bool]] = None
+
+    def summary(self):
+        """Return a human-readable description of the plan for review."""
+        scope = 'all pids' if self.pid is None else 'pid {}'.format(self.pid)
+        lines = [
+            'Cleanup plan for {} ({}):'.format(self.path, scope),
+            '  delete ({}):'.format(len(self.to_delete)),
+        ]
+        lines.extend(
+            '    - {} [{}]'.format(entry.file.path, entry.reason)
+            for entry in self.to_delete)
+        lines.append('  keep ({}):'.format(len(self.kept)))
+        lines.extend(
+            '    - {} [{}]'.format(entry.file.path, entry.reason)
+            for entry in self.kept)
+        lines.append('  unrecognized ({}):'.format(len(self.unrecognized)))
+        lines.extend(
+            '    - {} [{}]'.format(entry.path, entry.reason)
+            for entry in self.unrecognized)
+        return '\n'.join(lines)
+
+
+def _windows_process_is_alive(pid):
+    import ctypes
+
+    kernel32 = ctypes.WinDLL('kernel32', use_last_error=True)
+    kernel32.OpenProcess.restype = ctypes.c_void_p
+    kernel32.OpenProcess.argtypes = (ctypes.c_uint32, ctypes.c_int, ctypes.c_uint32)
+    kernel32.CloseHandle.argtypes = (ctypes.c_void_p,)
+    PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+    ERROR_INVALID_PARAMETER = 87
+    ERROR_ACCESS_DENIED = 5
+    handle = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+    if not handle:
+        # ERROR_INVALID_PARAMETER means no such process; access denied means
+        # the process exists but we are not allowed to open it.
+        return ctypes.get_last_error() == ERROR_ACCESS_DENIED
+    kernel32.CloseHandle(handle)
+    return True
+
+
+def default_process_is_alive(pid):
+    """Return whether a process with the given pid appears to be running.
+
+    The signal-0 probe is used on POSIX. Windows has no equivalent, so the
+    process is opened with limited query rights instead. Callers that already
+    track their workers (e.g. a process manager) can pass their own liveness
+    callback to build_cleanup_plan instead.
+    """
+    if pid <= 0:
+        return False
+    if os.name == 'nt':
+        return _windows_process_is_alive(pid)
+    try:
+        os.kill(pid, 0)
+    except OSError as err:
+        if err.errno == errno.ESRCH:
+            return False
+        # EPERM means the process exists but cannot be signalled.
+        return True
+    return True
+
+
+def build_cleanup_plan(pid=None, path=None, process_is_alive=default_process_is_alive):
+    """Scan the multiprocess directory and build a reviewable cleanup plan.
+
+    No file is removed by this function. Every protocol-conforming file is
+    classified as either to_delete or kept, with a stable reason, while files
+    that do not follow the naming protocol are listed as unrecognized and
+    left alone.
+
+    Only live* gauge files of a dead process are eligible for deletion:
+    counters, histograms, summaries and non-live gauges must be retained so
+    cumulative values and last gauge values keep aggregating correctly.
+
+    Pass pid=None to consider every process in the directory.
+    process_is_alive is a callback taking a pid and returning True when the
+    process still runs, which keeps this testable without real processes.
+    """
+    path = _resolve_multiproc_dir(path)
+    if not path or not os.path.isdir(path):
+        raise ValueError(
+            'env PROMETHEUS_MULTIPROC_DIR is not set or not a directory')
+
+    alive_cache: Dict[int, bool] = {}
+
+    def is_alive(checked_pid):
+        if checked_pid not in alive_cache:
+            alive_cache[checked_pid] = bool(process_is_alive(checked_pid))
+        return alive_cache[checked_pid]
+
+    to_delete: List[CleanupEntry] = []
+    kept: List[CleanupEntry] = []
+    unrecognized: List[UnrecognizedFile] = []
+
+    with os.scandir(path) as entries:
+        for entry in entries:
+            entry_path = os.path.join(path, entry.name)
+            if not entry.is_file():
+                unrecognized.append(UnrecognizedFile(
+                    entry_path, 'not a regular file'))
+                continue
+            metric_file = parse_metric_filename(entry_path)
+            if metric_file is None:
+                unrecognized.append(UnrecognizedFile(
+                    entry_path,
+                    'file name does not match the multi-process metric protocol'))
+                continue
+            if pid is not None and metric_file.pid != pid:
+                kept.append(CleanupEntry(
+                    metric_file, REASON_PID_NOT_REQUESTED))
+            elif metric_file.is_cumulative:
+                kept.append(CleanupEntry(
+                    metric_file, REASON_CUMULATIVE_METRIC))
+            elif not metric_file.is_live_gauge:
+                kept.append(CleanupEntry(
+                    metric_file, REASON_NONLIVE_GAUGE))
+            elif is_alive(metric_file.pid):
+                kept.append(CleanupEntry(
+                    metric_file, REASON_LIVE_GAUGE_PROCESS_ALIVE))
+            else:
+                to_delete.append(CleanupEntry(
+                    metric_file, REASON_LIVE_GAUGE_DEAD_PROCESS))
+
+    return CleanupPlan(
+        path=os.path.abspath(path),
+        pid=pid,
+        to_delete=tuple(to_delete),
+        kept=tuple(kept),
+        unrecognized=tuple(unrecognized),
+        process_is_alive=process_is_alive)
+
+
+def _plan_entry_still_valid(plan, entry, liveness_cache, process_is_alive):
+    """Re-check a planned deletion against the current state of the disk.
+
+    Guards against a stale plan: the file must still exist, be byte-for-byte
+    the same object fingerprinted at planning time, still match the protocol
+    with the same pid/type, and its pid must still be dead.
+    """
+    metric_file = entry.file
+    if not metric_file.fingerprint.matches(metric_file.path):
+        return False, 'file was replaced or removed after the plan was built'
+    if not os.path.abspath(metric_file.path).startswith(plan.path + os.sep):
+        return False, 'file is no longer inside the planned directory'
+    reparsed = parse_metric_filename(metric_file.path)
+    if reparsed is None or reparsed != metric_file:
+        return False, 'file no longer matches the multi-process metric protocol'
+    checked_pid = metric_file.pid
+    if checked_pid not in liveness_cache:
+        liveness_cache[checked_pid] = bool(process_is_alive(checked_pid))
+    if liveness_cache[checked_pid]:
+        return False, 'pid {} is alive again (pid reuse)'.format(checked_pid)
+    return True, ''
+
+
+def execute_cleanup_plan(plan, process_is_alive=None):
+    """Execute a previously built CleanupPlan in a controlled way.
+
+    Each planned deletion is re-validated against the current disk state, so
+    a plan cannot delete a file that was replaced after planning or one whose
+    pid was reused by a new process. Entries that fail re-validation are
+    reported in the result as skipped rather than removed. Files that were
+    only ever classified as kept or unrecognized are never touched.
+    """
+    if process_is_alive is None:
+        process_is_alive = plan.process_is_alive or default_process_is_alive
+
+    deleted: List[CleanupEntry] = []
+    skipped: List[SkippedFile] = []
+    liveness_cache: Dict[int, bool] = {}
+
+    for entry in plan.to_delete:
+        valid, reason = _plan_entry_still_valid(
+            plan, entry, liveness_cache, process_is_alive)
+        if not valid:
+            skipped.append(SkippedFile(entry, reason))
+            continue
+        try:
+            os.remove(entry.file.path)
+        except FileNotFoundError:
+            skipped.append(SkippedFile(
+                entry, 'file was replaced or removed after the plan was built'))
+        else:
+            deleted.append(entry)
+
+    return CleanupResult(
+        deleted=tuple(deleted),
+        skipped=tuple(skipped))
 
 
 def mark_process_dead(pid, path=None):
-    """Do bookkeeping for when one process dies in a multi-process setup."""
-    if path is None:
-        path = os.environ.get('PROMETHEUS_MULTIPROC_DIR', os.environ.get('prometheus_multiproc_dir'))
+    """Do bookkeeping for when one process dies in a multi-process setup.
+
+    Only the live* gauge files of the given pid are removed. Counters,
+    histograms, summaries and non-live gauges stay in place, and files that
+    do not follow the metric file protocol are ignored. The deletion goes
+    through build_cleanup_plan/execute_cleanup_plan, so a file replaced after
+    planning (e.g. via pid reuse) is skipped rather than deleted.
+
+    The caller is expected to know the process has exited (e.g. a process
+    manager's child-exit hook); use build_cleanup_plan directly when you want
+    a liveness check before deleting.
+    """
+    path = _resolve_multiproc_dir(path)
     if not path:
         return
-    for mode in _LIVE_GAUGE_MULTIPROCESS_MODES:
-        for f in glob.glob(os.path.join(path, f'gauge_{mode}_{pid}.db')):
-            os.remove(f)
+    plan = build_cleanup_plan(pid, path, process_is_alive=lambda _: False)
+    execute_cleanup_plan(plan, process_is_alive=lambda _: False)

@@ -13,10 +13,15 @@ from prometheus_client.core import (
     CollectorRegistry, Counter, Gauge, Histogram, Sample, Summary,
 )
 from prometheus_client.multiprocess import (
-    mark_process_dead, MultiProcessCollector,
+    build_cleanup_plan, default_process_is_alive, execute_cleanup_plan,
+    mark_process_dead, MultiProcessCollector, parse_metric_filename,
+    REASON_CUMULATIVE_METRIC, REASON_LIVE_GAUGE_DEAD_PROCESS,
+    REASON_LIVE_GAUGE_PROCESS_ALIVE, REASON_NONLIVE_GAUGE,
+    REASON_PID_NOT_REQUESTED,
 )
-from prometheus_client.openmetrics.exposition import \
-    generate_latest as openmetrics_generate_latest
+from prometheus_client.openmetrics.exposition import (
+    generate_latest as openmetrics_generate_latest,
+)
 from prometheus_client.values import (
     get_value_class, MultiProcessValue, MutexValue,
 )
@@ -753,3 +758,360 @@ class TestUnsetEnv(unittest.TestCase):
 
     def tearDown(self):
         os.remove(self.tmpfl)
+
+
+class TestCleanupPlan(unittest.TestCase):
+    """Reviewable, controlled cleanup of the multiprocess directory.
+
+    Everything here runs against controlled files in a temp directory with an
+    injected liveness callback, so the same tests work natively on Windows
+    without spawning or killing real processes.
+    """
+
+    def setUp(self):
+        self.tempdir = tempfile.mkdtemp()
+
+    def tearDown(self):
+        shutil.rmtree(self.tempdir)
+
+    def _touch(self, name):
+        path = os.path.join(self.tempdir, name)
+        with open(path, 'wb'):
+            pass
+        return path
+
+    def _entries_by_path(self, entries):
+        return {os.path.basename(entry.file.path): entry for entry in entries}
+
+    def _unrecognized_names(self, plan):
+        return {os.path.basename(entry.path) for entry in plan.unrecognized}
+
+    def test_plan_classifies_every_file_without_deleting_anything(self):
+        live = self._touch('gauge_liveall_123.db')
+        live_sum = self._touch('gauge_livesum_123.db')
+        nonlive = self._touch('gauge_all_123.db')
+        counter = self._touch('counter_123.db')
+        histogram = self._touch('histogram_123.db')
+        summary = self._touch('summary_123.db')
+        other_pid = self._touch('gauge_liveall_456.db')
+        for name in ('random.txt', 'counter_123', 'gauge_wrongmode_123.db',
+                     'unknown_123.db', 'gauge_liveall_abc.db'):
+            self._touch(name)
+        os.mkdir(os.path.join(self.tempdir, 'subdir_123.db'))
+
+        alive = {123: False, 456: True}
+        plan = build_cleanup_plan(
+            123, self.tempdir, process_is_alive=alive.get)
+
+        # Building the plan must not change the directory at all.
+        for path in (live, live_sum, nonlive, counter, histogram,
+                     summary, other_pid):
+            self.assertTrue(os.path.exists(path))
+
+        to_delete = self._entries_by_path(plan.to_delete)
+        kept = self._entries_by_path(plan.kept)
+        self.assertEqual(
+            set(to_delete), {'gauge_liveall_123.db', 'gauge_livesum_123.db'})
+        self.assertTrue(all(entry.delete for entry in plan.to_delete))
+        self.assertTrue(all(
+            entry.reason == REASON_LIVE_GAUGE_DEAD_PROCESS
+            for entry in plan.to_delete))
+
+        self.assertEqual(kept['gauge_all_123.db'].reason,
+                         REASON_NONLIVE_GAUGE)
+        for name in ('counter_123.db', 'histogram_123.db', 'summary_123.db'):
+            self.assertEqual(kept[name].reason, REASON_CUMULATIVE_METRIC)
+        self.assertEqual(kept['gauge_liveall_456.db'].reason,
+                         REASON_PID_NOT_REQUESTED)
+
+        # Everything outside the protocol is reported, not silently ignored.
+        self.assertEqual(
+            self._unrecognized_names(plan),
+            {'random.txt', 'counter_123', 'gauge_wrongmode_123.db',
+             'unknown_123.db', 'gauge_liveall_abc.db', 'subdir_123.db'})
+
+        # The plan is reviewable as text and accounts for every entry.
+        rendered = plan.summary()
+        self.assertIn('gauge_liveall_123.db', rendered)
+        self.assertIn(REASON_CUMULATIVE_METRIC, rendered)
+        self.assertEqual(
+            len(plan.to_delete) + len(plan.kept) + len(plan.unrecognized), 13)
+
+    def test_execute_only_removes_planned_live_gauges(self):
+        self._touch('gauge_liveall_123.db')
+        self._touch('gauge_livesum_123.db')
+        self._touch('gauge_all_123.db')
+        self._touch('counter_123.db')
+        self._touch('histogram_123.db')
+        self._touch('summary_123.db')
+        self._touch('notes.txt')
+
+        plan = build_cleanup_plan(
+            123, self.tempdir, process_is_alive=lambda _: False)
+        result = execute_cleanup_plan(plan, process_is_alive=lambda _: False)
+
+        self.assertEqual(
+            {os.path.basename(entry.file.path) for entry in result.deleted},
+            {'gauge_liveall_123.db', 'gauge_livesum_123.db'})
+        self.assertEqual(result.skipped, ())
+        remaining = set(os.listdir(self.tempdir))
+        self.assertEqual(remaining, {
+            'gauge_all_123.db', 'counter_123.db', 'histogram_123.db',
+            'summary_123.db', 'notes.txt'})
+
+    def test_live_gauge_of_live_process_is_kept(self):
+        self._touch('gauge_liveall_123.db')
+        plan = build_cleanup_plan(
+            123, self.tempdir, process_is_alive=lambda _: True)
+        self.assertEqual(plan.to_delete, ())
+        self.assertEqual(len(plan.kept), 1)
+        self.assertEqual(plan.kept[0].reason,
+                         REASON_LIVE_GAUGE_PROCESS_ALIVE)
+
+        result = execute_cleanup_plan(plan, process_is_alive=lambda _: True)
+        self.assertEqual(result.deleted, ())
+        self.assertEqual(len(result.skipped), 0)
+        self.assertTrue(
+            os.path.exists(os.path.join(self.tempdir, 'gauge_liveall_123.db')))
+
+    def test_cumulative_metrics_survive_mark_process_dead(self):
+        # A process's counters/histograms/summaries must not be wiped when it
+        # dies: their values are still part of the aggregated totals.
+        self._touch('gauge_liveall_123.db')
+        self._touch('gauge_livemin_123.db')
+        self._touch('gauge_livemax_123.db')
+        self._touch('gauge_livesum_123.db')
+        self._touch('gauge_livemostrecent_123.db')
+        self._touch('counter_123.db')
+        self._touch('histogram_123.db')
+        self._touch('summary_123.db')
+        self._touch('gauge_all_123.db')
+
+        mark_process_dead(123, self.tempdir)
+
+        remaining = set(os.listdir(self.tempdir))
+        self.assertEqual(remaining, {
+            'counter_123.db', 'histogram_123.db', 'summary_123.db',
+            'gauge_all_123.db'})
+
+    def test_stale_plan_skips_replaced_file(self):
+        path = self._touch('gauge_liveall_123.db')
+        plan = build_cleanup_plan(
+            123, self.tempdir, process_is_alive=lambda _: False)
+
+        # Simulate the file being replaced (same name, new content/inode)
+        # between planning and execution.
+        os.remove(path)
+        with open(path, 'wb') as outfp:
+            outfp.write(b'new process owns this pid now')
+
+        result = execute_cleanup_plan(plan, process_is_alive=lambda _: False)
+        self.assertEqual(result.deleted, ())
+        self.assertEqual(len(result.skipped), 1)
+        self.assertIn('replaced', result.skipped[0].reason)
+        # The replacement file must still be there.
+        self.assertTrue(os.path.exists(path))
+
+    def test_stale_plan_skips_when_pid_is_reused(self):
+        self._touch('gauge_liveall_123.db')
+        plan = build_cleanup_plan(
+            123, self.tempdir, process_is_alive=lambda _: False)
+
+        # Between planning and execution pid 123 is handed to a new process.
+        result = execute_cleanup_plan(plan, process_is_alive=lambda _: True)
+        self.assertEqual(result.deleted, ())
+        self.assertEqual(len(result.skipped), 1)
+        self.assertIn('alive again', result.skipped[0].reason)
+        self.assertTrue(
+            os.path.exists(os.path.join(self.tempdir, 'gauge_liveall_123.db')))
+
+    def test_stale_plan_skips_file_vanished_before_execution(self):
+        path = self._touch('gauge_liveall_123.db')
+        plan = build_cleanup_plan(
+            123, self.tempdir, process_is_alive=lambda _: False)
+        os.remove(path)
+
+        result = execute_cleanup_plan(plan, process_is_alive=lambda _: False)
+        self.assertEqual(result.deleted, ())
+        self.assertEqual(len(result.skipped), 1)
+
+    def test_unrecognized_files_are_never_deleted(self):
+        for name in ('readme.txt', 'counter_123', 'weird_123.db',
+                     'gauge_123.db', 'counter.db'):
+            self._touch(name)
+        plan = build_cleanup_plan(
+            123, self.tempdir, process_is_alive=lambda _: False)
+        self.assertEqual(plan.to_delete, ())
+        result = execute_cleanup_plan(plan, process_is_alive=lambda _: False)
+        self.assertEqual(result.deleted, ())
+        self.assertEqual(
+            set(os.listdir(self.tempdir)),
+            {'readme.txt', 'counter_123', 'weird_123.db',
+             'gauge_123.db', 'counter.db'})
+
+    def test_plan_for_all_pids_uses_liveness_per_pid(self):
+        self._touch('gauge_liveall_123.db')
+        self._touch('gauge_liveall_456.db')
+        self._touch('gauge_liveall_789.db')
+        self._touch('counter_123.db')
+        alive = {123: False, 456: True, 789: False}
+
+        plan = build_cleanup_plan(
+            path=self.tempdir, process_is_alive=alive.get)
+        to_delete = self._entries_by_path(plan.to_delete)
+        self.assertEqual(
+            set(to_delete), {'gauge_liveall_123.db', 'gauge_liveall_789.db'})
+        kept = self._entries_by_path(plan.kept)
+        self.assertEqual(kept['gauge_liveall_456.db'].reason,
+                         REASON_LIVE_GAUGE_PROCESS_ALIVE)
+        self.assertEqual(kept['counter_123.db'].reason,
+                         REASON_CUMULATIVE_METRIC)
+
+    def test_liveness_callback_is_called_at_most_once_per_pid(self):
+        self._touch('gauge_liveall_123.db')
+        self._touch('gauge_livesum_123.db')
+        calls = []
+
+        def process_is_alive(pid):
+            calls.append(pid)
+            return False
+
+        build_cleanup_plan(
+            123, self.tempdir, process_is_alive=process_is_alive)
+        self.assertEqual(calls, [123])
+
+    def test_build_plan_rejects_missing_directory(self):
+        missing = os.path.join(self.tempdir, 'does_not_exist')
+        with self.assertRaises(ValueError):
+            build_cleanup_plan(123, missing, process_is_alive=lambda _: False)
+
+    def test_build_plan_falls_back_to_environment_variable(self):
+        self._touch('gauge_liveall_123.db')
+        os.environ['PROMETHEUS_MULTIPROC_DIR'] = self.tempdir
+        try:
+            plan = build_cleanup_plan(
+                123, process_is_alive=lambda _: False)
+        finally:
+            os.environ.pop('PROMETHEUS_MULTIPROC_DIR', None)
+        self.assertEqual(
+            len(plan.to_delete), 1)
+        self.assertEqual(
+            os.path.basename(plan.to_delete[0].file.path),
+            'gauge_liveall_123.db')
+
+    def test_mark_process_dead_noop_without_directory(self):
+        os.environ.pop('PROMETHEUS_MULTIPROC_DIR', None)
+        os.environ.pop('prometheus_multiproc_dir', None)
+        # Must simply return rather than raise.
+        mark_process_dead(123)
+
+    def test_execute_empty_plan_touches_nothing(self):
+        self._touch('counter_123.db')
+        plan = build_cleanup_plan(
+            123, self.tempdir, process_is_alive=lambda _: False)
+        self.assertEqual(plan.to_delete, ())
+        result = execute_cleanup_plan(plan, process_is_alive=lambda _: False)
+        self.assertEqual(result.deleted, ())
+        self.assertEqual(result.skipped, ())
+        self.assertEqual(os.listdir(self.tempdir), ['counter_123.db'])
+
+    def test_execute_uses_plan_liveness_callback_by_default(self):
+        self._touch('gauge_liveall_123.db')
+        # The plan is built while the process is dead, so the file is marked
+        # for deletion...
+        plan = build_cleanup_plan(
+            123, self.tempdir, process_is_alive=lambda _: False)
+        self.assertEqual(len(plan.to_delete), 1)
+
+        # ...and without an explicit execute callback the plan's own liveness
+        # verdict (dead) is reused, so the file is deleted.
+        result = execute_cleanup_plan(plan)
+        self.assertEqual(len(result.deleted), 1)
+        self.assertEqual(result.skipped, ())
+        self.assertFalse(
+            os.path.exists(os.path.join(self.tempdir, 'gauge_liveall_123.db')))
+
+        # Rebuild: a different callback at execution time overrides the
+        # plan's verdict, simulating pid reuse discovered late.
+        self._touch('gauge_liveall_123.db')
+        plan = build_cleanup_plan(
+            123, self.tempdir, process_is_alive=lambda _: False)
+        result = execute_cleanup_plan(plan, process_is_alive=lambda _: True)
+        self.assertEqual(result.deleted, ())
+        self.assertEqual(len(result.skipped), 1)
+        self.assertTrue(
+            os.path.exists(os.path.join(self.tempdir, 'gauge_liveall_123.db')))
+
+    def test_parse_metric_filename_protocol(self):
+        gauge = parse_metric_filename(self._touch('gauge_liveall_123.db'))
+        self.assertEqual(gauge.metric_type, 'gauge')
+        self.assertEqual(gauge.gauge_mode, 'liveall')
+        self.assertEqual(gauge.pid, 123)
+        self.assertTrue(gauge.is_live_gauge)
+        self.assertFalse(gauge.is_cumulative)
+
+        counter = parse_metric_filename(self._touch('counter_456.db'))
+        self.assertEqual(counter.metric_type, 'counter')
+        self.assertIsNone(counter.gauge_mode)
+        self.assertEqual(counter.pid, 456)
+        self.assertTrue(counter.is_cumulative)
+
+        for name in ('counter_abc.db', 'gauge_bogus_1.db', 'thing_1.db',
+                     'counter_1', 'counter_.db', 'counter_1.db.bak'):
+            self.assertIsNone(
+                parse_metric_filename(self._touch(name)), name)
+
+    def test_default_process_is_alive_smoke_test(self):
+        # Uses only the current process and an implausibly large pid, so it is
+        # safe on every platform, including native Windows.
+        self.assertTrue(default_process_is_alive(os.getpid()))
+        self.assertFalse(default_process_is_alive(4194304))
+        self.assertFalse(default_process_is_alive(0))
+        self.assertFalse(default_process_is_alive(-1))
+
+    def test_aggregated_cumulative_values_survive_cleanup(self):
+        # End-to-end with real mmap files: after a worker dies and its live
+        # gauges are cleaned up, its counters/histograms must still contribute
+        # to the aggregated exposition.
+        os.environ['PROMETHEUS_MULTIPROC_DIR'] = self.tempdir
+        try:
+            values.ValueClass = MultiProcessValue(lambda: 123)
+            registry = CollectorRegistry(
+                support_collectors_without_names=True)
+            MultiProcessCollector(registry)
+
+            counter = Counter('requests', 'help', registry=None)
+            histogram = Histogram('latency', 'help', registry=None)
+            live_gauge = Gauge(
+                'inflight', 'help', registry=None,
+                multiprocess_mode='livesum')
+            counter.inc(7)
+            histogram.observe(0.5)
+            live_gauge.set(3)
+            values.close_all_multiprocess_files()
+
+            self.assertEqual(
+                7, registry.get_sample_value('requests_total'))
+            self.assertEqual(
+                1, registry.get_sample_value('latency_count'))
+            self.assertEqual(
+                3, registry.get_sample_value('inflight'))
+
+            mark_process_dead(123, self.tempdir)
+
+            remaining = set(os.listdir(self.tempdir))
+            self.assertNotIn('gauge_livesum_123.db', remaining)
+            self.assertIn('counter_123.db', remaining)
+            self.assertIn('histogram_123.db', remaining)
+            # Nothing cumulative was erased by the cleanup.
+            self.assertEqual(
+                7, registry.get_sample_value('requests_total'))
+            self.assertEqual(
+                1, registry.get_sample_value('latency_count'))
+            self.assertEqual(
+                0.5, registry.get_sample_value('latency_sum'))
+            # The dead worker no longer contributes to the live gauge.
+            self.assertIsNone(registry.get_sample_value('inflight'))
+        finally:
+            os.environ.pop('PROMETHEUS_MULTIPROC_DIR', None)
+            values.ValueClass = MutexValue
