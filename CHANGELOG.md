@@ -15,6 +15,13 @@ You can find our backwards-compatibility policy [here](https://github.com/hynek/
 
 ## [Unreleased](https://github.com/hynek/structlog/compare/26.1.0...HEAD)
 
+### Added
+
+- `structlog.processors.ByteBudget` keeps log events within a byte budget imposed by the receiving side.
+  It is a terminal processor that wraps a renderer, so it charges for the bytes that actually reach the sink -- including JSON escaping, multi-byte UTF-8 text, and structured exception trees.
+  Over-budget events are trimmed *structurally* in a configurable order, required fields (`event` by default) are never touched, every truncation is reported under a `truncated` key, and an event whose required fields alone exceed the budget is rejected with `structlog.exceptions.EventTooLargeError` instead of being cut into invalid JSON.
+  The wrapped renderer is called a hard-bounded number of times and is never used as a binary-search size oracle, so renderers with side effects stay predictable and small events are unchanged.
+
 ### Changed
 
 - On Python 3.15 and later, *structlog* uses [PEP 810](https://peps.python.org/pep-0810/) lazy imports for modules that are only needed once you log.

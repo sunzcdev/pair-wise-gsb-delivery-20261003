@@ -22,7 +22,7 @@ import sys
 import threading
 import time
 
-from collections.abc import Callable, Collection, Sequence
+from collections.abc import Callable, Collection, Mapping, Sequence
 from types import FrameType, TracebackType
 from typing import (
     Any,
@@ -41,6 +41,7 @@ from ._frames import (
 from ._log_levels import NAME_TO_LEVEL, add_log_level
 from ._utils import get_processname
 from .contextvars import _ASYNC_CALLING_THREAD
+from .exceptions import EventTooLargeError
 from .tracebacks import ExceptionDictTransformer
 from .typing import (
     EventDict,
@@ -52,6 +53,7 @@ from .typing import (
 
 __all__ = [
     "NAME_TO_LEVEL",  # some people rely on it being here
+    "ByteBudget",
     "CallsiteParameter",
     "CallsiteParameterAdder",
     "EventRenamer",
@@ -372,6 +374,746 @@ def _json_fallback_handler(obj: Any) -> Any:
         return obj.__structlog__()
     except AttributeError:
         return repr(obj)
+
+
+_NOT_FOUND: Final = object()
+
+_MAX_PLAN_ROUNDS: Final = 4
+
+
+class ByteBudget:
+    """
+    Render *event_dict* so that it fits into a UTF-8 byte budget.
+
+    Unlike most processors, this one is a *terminal* processor: it wraps the
+    renderer that produces the final output and returns its result.  That is
+    the only way to charge for the bytes that actually reach the log sink --
+    including JSON escaping (``"`` becomes ``\\"``), non-ASCII text (a single
+    CJK character is three UTF-8 bytes, six if it is ASCII-escaped), and
+    structured exception trees.
+
+    Small events that already fit are passed through untouched: the wrapped
+    *renderer* is called exactly once and its result is returned as-is.
+
+    If an event is over budget, values are shrunk *structurally* -- never by
+    slicing the rendered string -- and the event is rendered again.  The log
+    sink therefore never sees half a JSON document or half a UTF-8 sequence:
+    strings are cut on character boundaries and their container is
+    re-serialized.  Fields are shrunk in *trim_order* (default: the order they
+    appear in *event_dict*) and only as much as necessary; *required_fields*
+    are never touched.
+
+    Every truncation is recorded under *facts_key* as a compact mapping of
+    field name to the number of omitted bytes.  The in-string *marker* repeats
+    that number inline, so the fact survives even if the facts field itself
+    has to give way.
+
+    The *renderer* is called a hard-bounded number of times -- at most
+    *max_passes* -- and is **never** used as a binary-search oracle:
+    renderers may have side effects, so probing them over and over to discover
+    a size would run them for an unpredictable number of times.
+
+    Args:
+        renderer:
+            A processor returning the final ``str`` or ``bytes``, for example
+            `JSONRenderer`.  It is called as
+            ``renderer(logger, method_name, event_dict)``.
+
+        budget_bytes:
+            Maximum number of bytes (after final encoding) per event.
+
+        required_fields:
+            Keys that must never be truncated.  They're charged against the
+            budget; if they -- together with the truncation facts -- can't fit,
+            `structlog.exceptions.EventTooLargeError` is raised instead of
+            emitting an over-budget or invalid event.
+
+        trim_order:
+            Order in which fields are considered for truncation.  Keys that are
+            missing or listed in *required_fields* are skipped.  Keys of
+            *event_dict* not mentioned here are considered afterwards, largest
+            first, so a big payload absorbs the hit before a tiny field is
+            touched.
+
+        facts_key:
+            Key under which truncation facts are attached.  Any pre-existing
+            value under that key is replaced.  If ``None``, no facts are
+            attached.
+
+        marker:
+            Template for the in-string marker that replaces omitted text.
+            ``{omitted}`` is replaced with the number of omitted bytes.
+
+        container_marker:
+            Template for leaf values that can't be shrunk structurally (e.g.
+            ``bytes``).  ``{omitted}`` and ``{type}`` are replaced with the
+            number of omitted bytes and the value's type name.
+
+        max_passes:
+            Upper bound on the number of times *renderer* is called.
+
+    Raises:
+        structlog.exceptions.EventTooLargeError:
+            If the event can't be brought within *budget_bytes* without
+            touching *required_fields*.
+
+        TypeError:
+            If *renderer* returns something other than ``str`` or
+            ``bytes``-like.
+
+    .. versionadded:: 26.2.0
+    """
+
+    __slots__ = (
+        "_budget",
+        "_container_marker",
+        "_facts_key",
+        "_marker",
+        "_max_passes",
+        "_renderer",
+        "_required",
+        "_trim_order",
+    )
+
+    def __init__(
+        self,
+        renderer: Callable[[WrappedLogger, str, EventDict], str | bytes],
+        budget_bytes: int,
+        required_fields: Collection[str] = ("event",),
+        trim_order: Sequence[str] | None = None,
+        facts_key: str | None = "truncated",
+        marker: str = "…<truncated {omitted} bytes>…",
+        container_marker: str = "<truncated {omitted}-byte {type}>",
+        max_passes: int = 3,
+    ) -> None:
+        if budget_bytes < 0:
+            msg = "budget_bytes must not be negative."
+            raise ValueError(msg)
+        if max_passes < 1:
+            msg = "max_passes must be at least 1."
+            raise ValueError(msg)
+
+        self._renderer = renderer
+        self._budget = budget_bytes
+        self._required = frozenset(required_fields)
+        self._trim_order = tuple(trim_order) if trim_order is not None else ()
+        self._facts_key = facts_key
+        self._marker = marker
+        self._container_marker = container_marker
+        self._max_passes = max_passes
+
+    def __call__(
+        self, logger: WrappedLogger, name: str, event_dict: EventDict
+    ) -> str | bytes:
+        calls = 1
+        rendered = self._render(logger, name, event_dict)
+        size = _encoded_size(rendered)
+
+        if size <= self._budget:
+            return rendered
+
+        # Over budget: work on a copy so the caller's dict -- and the values
+        # inside it -- stay untouched.
+        work: EventDict = dict(event_dict)
+        # Untouched originals, so repeated passes shrink from the source
+        # instead of stacking markers.
+        originals: dict[str, Any] = {}
+        # key -> cumulative estimated bytes to remove from its original.
+        reductions: dict[str, int] = {}
+        # key -> cumulative omitted payload bytes
+        trimmed_values: dict[str, int] = {}
+
+        # Plan against our own estimate -- it's cheap and doesn't touch the
+        # renderer -- then confirm by rendering.  If the confirmed size still
+        # misses, add the measured deficit on top and re-plan, all within the
+        # hard *max_passes* renderer-call bound.
+        deficit = 0
+        while calls < self._max_passes:
+            self._plan(work, originals, reductions, trimmed_values, deficit)
+
+            rendered = self._render(logger, name, work)
+            calls += 1
+            size = _encoded_size(rendered)
+
+            if size <= self._budget:
+                break
+
+            deficit += size - self._budget
+
+        if size > self._budget:
+            msg = (
+                f"Event is {size} bytes but the budget is "
+                f"{self._budget} bytes and it can't be reduced further "
+                f"without truncating required fields "
+                f"({', '.join(sorted(self._required)) or 'none'})."
+            )
+            raise EventTooLargeError(msg)
+
+        return rendered
+
+    def _render(
+        self, logger: WrappedLogger, name: str, event_dict: EventDict
+    ) -> str | bytes:
+        rendered = self._renderer(logger, name, event_dict)
+        _encoded_size(rendered)  # validate the type early
+
+        return rendered
+
+    def _plan(
+        self,
+        work: EventDict,
+        originals: dict[str, Any],
+        reductions: dict[str, int],
+        trimmed_values: dict[str, int],
+        deficit: int,
+    ) -> None:
+        """
+        Trim *work* (recording *trimmed_values*) until its estimate fits.
+
+        *deficit* is added on top of the estimate's own overshoot, which lets
+        the caller compensate for a renderer that produces slightly more bytes
+        than the estimate predicted.  The truncation facts are kept in *work*
+        while planning, so they're paid for too.
+        """
+        for _ in range(_MAX_PLAN_ROUNDS):
+            if self._facts_key is not None and trimmed_values:
+                work[self._facts_key] = _facts(trimmed_values)
+
+            excess = _estimate_bytes(work) - self._budget + deficit
+            if excess <= 0:
+                return
+
+            if self._trim_pass(
+                work, originals, reductions, trimmed_values, excess
+            ):
+                continue
+
+            # Structural trimming can't free anything anymore (all leaf
+            # strings are at their floor, the rest is structural keys).  Fold
+            # the largest remaining field into a single marker to close the
+            # gap, and let the next round re-check.
+            if not self._fold_pass(work, trimmed_values):
+                return
+
+        if self._facts_key is not None and trimmed_values:
+            work[self._facts_key] = _facts(trimmed_values)
+
+    def _fold_pass(
+        self, work: EventDict, trimmed_values: dict[str, int]
+    ) -> bool:
+        """
+        Replace the single largest non-required field with a fold marker.
+
+        Used only when structural trimming has stalled.  Returns whether
+        anything was folded.
+        """
+        best_key: str | None = None
+        best_size = 0
+
+        for key in self._candidate_keys(work):
+            size = _estimate_bytes(work[key])
+            if size > best_size:
+                best_key, best_size = key, size
+
+        if best_key is None:
+            return False
+
+        payload = _payload_bytes(work[best_key])
+        marker = self._container_marker.format(
+            omitted=payload, type=type(work[best_key]).__name__
+        )
+
+        if _estimate_bytes(marker) >= best_size:
+            return False
+
+        work[best_key] = marker
+        _record(trimmed_values, best_key, payload)
+
+        return True
+
+    def _trim_pass(
+        self,
+        work: EventDict,
+        originals: dict[str, Any],
+        reductions: dict[str, int],
+        trimmed_values: dict[str, int],
+        excess: int,
+    ) -> bool:
+        """
+        Shrink non-required fields in declaration order until *excess* bytes
+        (by estimate) are gone.
+
+        Each field is always shrunk from its *original* value -- tracked in
+        *originals* -- with the *cumulative* reduction tracked in
+        *reductions*, so successive passes never undo or double-apply work.
+
+        Returns whether anything was actually changed.
+        """
+        trimmed = False
+        for key in self._candidate_keys(work):
+            if excess <= 0:
+                break
+
+            if key not in originals:
+                if key not in work:
+                    continue
+                originals[key] = work[key]
+
+            original_value = originals[key]
+            original = _estimate_bytes(original_value)
+
+            wanted = reductions.get(key, 0) + excess
+            new_value, kept, omitted = self._shrink(original_value, wanted)
+
+            removed = original - kept
+            if removed <= reductions.get(key, 0):
+                continue
+
+            # Never make a field bigger than it currently is.  This matters
+            # after `_fold_pass` collapsed it: re-deriving from the untouched
+            # original could otherwise grow the folded value again.
+            if _estimate_bytes(new_value) >= _estimate_bytes(work[key]):
+                continue
+
+            # Only trim if it's a net win once the field's entry in the facts
+            # mapping is paid for.  Otherwise we'd shrink something by 2 bytes
+            # and grow the facts by 12.
+            if key not in trimmed_values:
+                fact_cost = len(key) + 8  # "key": 123,
+                if removed <= fact_cost:
+                    continue
+
+            work[key] = new_value
+            excess -= removed - reductions.get(key, 0)
+            reductions[key] = removed
+            _record(trimmed_values, key, omitted)
+            trimmed = True
+
+        return trimmed
+
+    def _candidate_keys(self, event_dict: EventDict) -> list[str]:
+        """
+        Return the keys eligible for trimming, in priority order.
+
+        Keys named in *trim_order* come first, in the order declared there.
+        The remaining keys follow, largest first (insertion order breaks ties).
+        "Largest first" is what keeps a big payload from surviving while a
+        tiny, unrelated field gets wiped: the big field absorbs the hit.
+        """
+        candidates = [
+            key
+            for key in self._trim_order
+            if key in event_dict
+            and key not in self._required
+            and key != self._facts_key
+        ]
+
+        rest = [
+            key
+            for key in event_dict
+            if key not in candidates
+            and key not in self._required
+            and key != self._facts_key
+        ]
+        rest.sort(key=lambda key: -_estimate_bytes(event_dict[key]))
+
+        return candidates + rest
+
+    def _shrink(
+        self, value: Any, excess: int
+    ) -> tuple[Any, int, int]:
+        """
+        Shrink *value* by roughly *excess* bytes, structurally.
+
+        Recurses into containers (never touching keys), cuts strings on
+        character boundaries, and drops trailing sequence items once children
+        are at their floor.  If that isn't enough, the caller's `_fold_pass`
+        falls back to a coarse fold.
+
+        Returns ``(new_value, estimated_size, omitted_content_bytes)``.  The
+        last item is measured in the original value's UTF-8 payload bytes and
+        matches the number the inline markers report.  The original value --
+        including nested containers -- is never mutated.
+        """
+        return self._shrink_inner(value, excess, set())
+
+    def _shrink_inner(
+        self, value: Any, excess: int, seen: set[int]
+    ) -> tuple[Any, int, int]:
+        original = _estimate_bytes(value)
+
+        if isinstance(value, str):
+            new, omitted = _truncate_str(value, excess, self._marker)
+
+            return new, min(_estimate_bytes(new), original), omitted
+
+        identity = id(value)
+        if identity in seen:
+            # Circular reference: leave it to the renderer.
+            return value, original, 0
+
+        if isinstance(value, Mapping):
+            seen.add(identity)
+            try:
+                new_dict = dict(value)
+                remaining = excess
+                omitted = 0
+                for key in list(new_dict):
+                    if remaining <= 0:
+                        break
+                    old_item = new_dict[key]
+                    new_item, item_size, item_omitted = self._shrink_inner(
+                        old_item, remaining, seen
+                    )
+                    reduction = _estimate_bytes(old_item) - item_size
+                    if reduction > 0:
+                        new_dict[key] = new_item
+                        remaining -= reduction
+                        omitted += item_omitted
+
+                return (
+                    new_dict,
+                    min(_estimate_bytes(new_dict), original),
+                    omitted,
+                )
+            finally:
+                seen.discard(identity)
+
+        if isinstance(value, (list, tuple)):
+            seen.add(identity)
+            try:
+                remaining = excess
+                omitted = 0
+                items = []
+                for item in value:
+                    if remaining <= 0:
+                        items.append(item)
+                        continue
+
+                    new_item, item_size, item_omitted = self._shrink_inner(
+                        item, remaining, seen
+                    )
+                    reduction = _estimate_bytes(item) - item_size
+                    if reduction > 0:
+                        remaining -= reduction
+                        omitted += item_omitted
+                    items.append(new_item)
+
+                # The children are at their floor but we still need room:
+                # drop trailing items -- the coarse equivalent of max_frames.
+                while remaining > 0 and items:
+                    dropped = items.pop()
+                    remaining -= _estimate_bytes(dropped)
+                    omitted += _payload_bytes(dropped)
+
+                new_sequence: Any = (
+                    tuple(items) if isinstance(value, tuple) else items
+                )
+
+                return (
+                    new_sequence,
+                    min(_estimate_bytes(new_sequence), original),
+                    omitted,
+                )
+            finally:
+                seen.discard(identity)
+
+        # Opaque leaf (bytes etc.): replace with a marker -- but only if that
+        # actually makes the value smaller.
+        payload = _payload_bytes(value)
+        marker = self._container_marker.format(
+            omitted=payload, type=type(value).__name__
+        )
+        marker_size = _estimate_bytes(marker)
+
+        if marker_size < original:
+            return marker, marker_size, payload
+
+        return value, original, 0
+
+
+def _record(
+    trimmed_values: dict[str, int], key: str, omitted: int
+) -> None:
+    """
+    Accumulate how many payload bytes were dropped from *key*.
+    """
+    trimmed_values[key] = max(trimmed_values.get(key, 0), omitted)
+
+
+def _facts(trimmed_values: dict[str, int]) -> dict[str, int]:
+    """
+    Turn the internal bookkeeping into the public truncation facts.
+
+    The shape is deliberately compact -- ``{field: omitted_bytes}`` -- because
+    the facts are charged against the very budget they document.
+
+    The number matches the one the field's inline marker shows, so a consumer
+    can trust either one.
+    """
+    return dict(trimmed_values)
+
+
+def _encoded_size(rendered: Any) -> int:
+    """
+    Return the number of bytes *rendered* occupies once encoded.
+
+    This is the authoritative billing function: it encodes with UTF-8, so
+    multi-byte characters and escaped sequences are charged their real cost.
+
+    Raises:
+        TypeError: If *rendered* is neither ``str`` nor ``bytes``-like.
+    """
+    if isinstance(rendered, str):
+        return len(rendered.encode("utf-8"))
+    if isinstance(rendered, (bytes, bytearray)):
+        return len(rendered)
+
+    msg = (
+        "ByteBudget's renderer must return str, bytes, or bytearray -- got "
+        f"{type(rendered).__name__}."
+    )
+    raise TypeError(msg)
+
+
+def _escaped_len(value: str) -> int:
+    """
+    Upper bound on the length of *value* once JSON-escaped and UTF-8 encoded.
+
+    Non-ASCII characters count as six bytes (``\\uXXXX``), which is at least
+    their UTF-8 length, so this never underestimates a JSON renderer's output.
+    """
+    return len(json.dumps(value, ensure_ascii=True).encode("utf-8")) - 2
+
+
+def _estimate_bytes(value: Any, seen: set[int] | None = None) -> int:
+    """
+    Estimate how many bytes *value* occupies once rendered and encoded.
+
+    The estimate is renderer-agnostic and deliberately errs on the high side
+    for non-ASCII text (it assumes ``\\uXXXX`` escaping).  Shrinking a value
+    reduces this estimate by at least the requested amount -- see
+    :func:`_truncate_str` -- which is what makes a single trimming pass
+    usually sufficient.  It never slices or truncates anything and guards
+    against reference cycles.
+    """
+    if seen is None:
+        seen = set()
+
+    if isinstance(value, str):
+        return _escaped_len(value) + 2  # + surrounding quotes
+
+    if isinstance(value, (bytes, bytearray)):
+        # The fallback handler uses repr(); be generous.
+        return len(value) * 4 + 4
+
+    if value is None or isinstance(value, (bool, int, float)):
+        return len(json.dumps(value))
+
+    identity = id(value)
+    if identity in seen:
+        # Circular reference.  Renderers either fail or emit a short marker.
+        return 2
+
+    if isinstance(value, Mapping):
+        seen.add(identity)
+        try:
+            total = 2  # braces
+            for key, item in value.items():
+                total += (
+                    _estimate_bytes(key, seen)
+                    + 2  # colon + space
+                    + _estimate_bytes(item, seen)
+                    + 2  # comma + space
+                )
+            return total
+        finally:
+            seen.discard(identity)
+
+    if isinstance(value, (list, tuple, set, frozenset)):
+        seen.add(identity)
+        try:
+            total = 2 + 2 * max(0, len(value) - 1)  # brackets + ", "
+            for item in value:
+                total += _estimate_bytes(item, seen)
+            return total
+        finally:
+            seen.discard(identity)
+
+    try:
+        return _escaped_len(str(value))
+    except Exception:  # noqa: BLE001
+        return 0
+
+
+def _payload_bytes(value: Any, seen: set[int] | None = None) -> int:
+    """
+    Return the UTF-8 payload bytes of *value*, ignoring structural overhead.
+
+    Unlike :func:`_estimate_bytes`, this is *exact* for strings and bytes --
+    the two leaf types that make up the bulk of real log payloads.  It's used
+    for the reported truncation facts, so the number in a field's marker and
+    in the facts mapping add up to the original payload.
+    """
+    if seen is None:
+        seen = set()
+
+    if isinstance(value, str):
+        return _raw_len(value)
+
+    if isinstance(value, (bytes, bytearray)):
+        return len(value)
+
+    if value is None or isinstance(value, (bool, int, float)):
+        return len(_safe_str(value).encode("utf-8", "backslashreplace"))
+
+    identity = id(value)
+    if identity in seen:
+        return 0
+
+    if isinstance(value, Mapping):
+        seen.add(identity)
+        try:
+            return sum(
+                _payload_bytes(k, seen) + _payload_bytes(v, seen)
+                for k, v in value.items()
+            )
+        finally:
+            seen.discard(identity)
+
+    if isinstance(value, (list, tuple, set, frozenset)):
+        seen.add(identity)
+        try:
+            return sum(_payload_bytes(item, seen) for item in value)
+        finally:
+            seen.discard(identity)
+
+    return len(_safe_str(value).encode("utf-8", "backslashreplace"))
+
+
+def _raw_len(value: str) -> int:
+    """
+    Return the UTF-8 length of *value*, tolerating lone surrogates.
+    """
+    try:
+        return len(value.encode("utf-8"))
+    except UnicodeEncodeError:
+        return len(value.encode("utf-8", "backslashreplace"))
+
+def _safe_str(value: Any) -> str:
+    try:
+        return str(value)
+    except Exception:  # noqa: BLE001
+        return f"<{type(value).__name__}>"
+
+
+def _cut_chars(value: str, keep: int) -> str:
+    """
+    Keep *keep* bytes worth of *value*: half from the front, half from the
+    back.
+
+    *keep* is a UTF-8 byte budget and is consumed on character boundaries only,
+    so the result is always a valid sequence of code points.
+    """
+    if keep <= 0:
+        return ""
+    if len(value) <= keep:  # fast path; ASCII-ish short strings
+        return value
+
+    encoded = value.encode("utf-8", "surrogatepass")
+    if len(encoded) <= keep:
+        return value
+
+    head_size = keep // 2
+    tail_size = keep - head_size
+
+    head = encoded[:head_size].decode("utf-8", "ignore")
+    tail = encoded[len(encoded) - tail_size :].decode("utf-8", "ignore")
+
+    return head + tail
+
+
+def _fit_str(value: str, target: int, marker: str) -> tuple[str, int]:
+    """
+    Return the "largest" variant of *value* whose estimate is at most *target*.
+
+    The variant keeps a prefix and a suffix of *value* and appends *marker*.
+    The cut is on UTF-8 character boundaries.
+
+    Returns ``(variant, omitted_utf8_bytes)`` where *omitted_utf8_bytes* is the
+    payload byte count removed -- exactly the number rendered into the marker.
+    """
+    if _estimate_bytes(value) <= target:
+        return value, 0
+
+    if target <= 2:  # two quotes
+        return "", _raw_len(value)
+
+    original_bytes = _raw_len(value)
+
+    low, high = 0, original_bytes
+    best: tuple[str, int] = ("", original_bytes)
+    found = False
+
+    while low <= high:
+        mid = (low + high) // 2
+        kept = _cut_chars(value, mid)
+        omitted = original_bytes - _raw_len(kept)
+        candidate = kept + marker.format(omitted=omitted)
+
+        if _estimate_bytes(candidate) <= target:
+            best = (candidate, omitted)
+            found = True
+            low = mid + 1
+        else:
+            high = mid - 1
+
+    if found:
+        return best
+
+    # Not even the marker plus one character fits: try the bare marker, then
+    # a plain prefix/suffix -- whichever fits -- so the result stays valid.
+    rendered_marker = marker.format(omitted=original_bytes)
+    if _estimate_bytes(rendered_marker) <= target:
+        return rendered_marker, original_bytes
+
+    low, high = 0, original_bytes
+    bare: tuple[str, int] = ("", original_bytes)
+
+    while low <= high:
+        mid = (low + high) // 2
+        kept = _cut_chars(value, mid)
+        omitted = original_bytes - _raw_len(kept)
+        candidate = kept
+
+        if _estimate_bytes(candidate) <= target:
+            bare = (candidate, omitted)
+            low = mid + 1
+        else:
+            high = mid - 1
+
+    return bare
+
+
+def _truncate_str(value: str, excess: int, marker: str) -> tuple[str, int]:
+    """
+    Shrink *value* so its :func:`_estimate_bytes` drops by at least *excess*.
+
+    Returns ``(new_value, omitted_utf8_bytes)``, where the byte count is the
+    one rendered into the marker.  Returns the value unchanged (and zero
+    omitted) if it can't usefully shrink -- for instance when the marker would
+    be larger than the value itself.  The cut is on character boundaries.
+    """
+    original = _estimate_bytes(value)
+    if original <= 2:
+        return value, 0
+
+    new_value, omitted = _fit_str(value, original - excess, marker)
+
+    if omitted <= 0 or _estimate_bytes(new_value) >= original:
+        return value, 0
+
+    return new_value, omitted
 
 
 class ExceptionRenderer:

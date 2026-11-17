@@ -50,7 +50,7 @@ from structlog._output import (
     WriteLogger,
     WriteLoggerFactory,
 )
-from structlog.exceptions import DropEvent
+from structlog.exceptions import DropEvent, EventTooLargeError
 from structlog.testing import ReturnLogger, ReturnLoggerFactory
 
 
@@ -74,6 +74,7 @@ __all__ = [
     "BytesLogger",
     "BytesLoggerFactory",
     "DropEvent",
+    "EventTooLargeError",
     "PrintLogger",
     "PrintLoggerFactory",
     "ReturnLogger",

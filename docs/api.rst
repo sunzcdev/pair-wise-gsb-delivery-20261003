@@ -66,6 +66,8 @@ API Reference
 
 .. autoexception:: DropEvent
 
+.. autoexception:: EventTooLargeError
+
 .. autoclass:: BoundLoggerBase
    :members: new, bind, unbind, try_unbind, _logger, _process_event, _proxy_to_logger
 
@@ -228,6 +230,40 @@ API Reference
       'b="[1, 2, 3]" a=42 flag=true'
 
 .. autoclass:: EventRenamer
+
+.. autoclass:: ByteBudget
+
+   .. doctest::
+
+      >>> from structlog.processors import ByteBudget, JSONRenderer
+      >>> budgeted = ByteBudget(JSONRenderer(), budget_bytes=60)
+      >>> budgeted(None, "", {"event": "hi", "x": 1})
+      '{"event": "hi", "x": 1}'
+
+   A value that doesn't fit is truncated structurally -- never by cutting
+   the rendered JSON -- and the truncation is reported:
+
+   .. doctest::
+
+      >>> import json
+      >>> out = budgeted(None, "", {"event": "hi", "big": "x" * 100})
+      >>> len(out.encode()) <= 60
+      True
+      >>> json.loads(out)["truncated"]["big"]
+      96
+
+   The reported number is the number of UTF-8 payload bytes that were
+   dropped; the value's inline marker repeats it.
+
+   If the required fields alone don't fit, an explicit error is raised:
+
+   .. doctest::
+
+      >>> budgeted = ByteBudget(JSONRenderer(), budget_bytes=5)
+      >>> budgeted(None, "", {"event": "hi"})  # doctest: +IGNORE_EXCEPTION_DETAIL
+      Traceback (most recent call last):
+      ...
+      structlog.exceptions.EventTooLargeError: ...
 
 .. autofunction:: add_log_level
 

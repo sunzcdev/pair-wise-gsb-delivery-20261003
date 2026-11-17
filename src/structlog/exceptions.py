@@ -18,6 +18,21 @@ class DropEvent(BaseException):
     """
 
 
+class EventTooLargeError(ValueError):
+    """
+    A log event can't be squeezed into the configured byte budget.
+
+    Raised by `structlog.processors.ByteBudget` if the required fields --
+    together with the truncation facts that have to be attached -- are too
+    large on their own.
+
+    It derives from `ValueError` so that callers who merely want to detect an
+    unusable event can keep catching a broad exception type.
+
+    .. versionadded:: 26.2.0
+    """
+
+
 class NoConsoleRendererConfiguredError(Exception):
     """
     A user asked for the current `structlog.dev.ConsoleRenderer` but none is

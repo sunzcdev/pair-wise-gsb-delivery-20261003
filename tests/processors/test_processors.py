@@ -22,7 +22,9 @@ import structlog
 
 from structlog import BoundLogger
 from structlog._utils import get_processname
+from structlog.exceptions import EventTooLargeError
 from structlog.processors import (
+    ByteBudget,
     CallsiteParameter,
     CallsiteParameterAdder,
     EventRenamer,
@@ -32,6 +34,7 @@ from structlog.processors import (
     UnicodeDecoder,
     UnicodeEncoder,
     _figure_out_exc_info,
+    dict_tracebacks,
     format_exc_info,
 )
 from structlog.stdlib import ProcessorFormatter
@@ -762,3 +765,388 @@ class TestRenameKey:
         assert {"msg": "hi", "foo": "bar"} == EventRenamer("msg", "missing")(
             None, None, {"event": "hi", "foo": "bar"}
         )
+
+class TestByteBudget:
+    """
+    Tests for the `ByteBudget` processor.
+
+    The budget is billed on the *final* encoded output, so escaping, CJK text
+    and structured exceptions all count.
+    """
+
+    def _render(self, budget, event_dict, **kw):
+        bb = ByteBudget(JSONRenderer(), budget_bytes=budget, **kw)
+
+        return bb(None, "info", event_dict)
+
+    def test_small_event_is_untouched_and_rendered_once(self):
+        """
+        An in-budget event is passed through verbatim and the renderer runs
+        exactly once.
+        """
+        calls = []
+
+        def renderer(logger, name, event_dict):
+            calls.append(dict(event_dict))
+
+            return json.dumps(event_dict)
+
+        bb = ByteBudget(renderer, budget_bytes=1000)
+        event_dict = {"event": "hi", "n": 1}
+        out = bb(None, "info", event_dict)
+
+        assert '{"event": "hi", "n": 1}' == out
+        assert 1 == len(calls)
+        assert {"event": "hi", "n": 1} == event_dict
+
+    def test_fitting_event_has_no_facts(self):
+        """
+        No truncation facts are attached if nothing was truncated.
+        """
+        out = self._render(1000, {"event": "hi"})
+
+        assert {"event": "hi"} == json.loads(out)
+
+    def test_over_budget_event_stays_valid_and_within_budget(self):
+        """
+        Trimming never hands half a JSON document to the sink and never
+        exceeds the budget.
+        """
+        out = self._render(
+            200, {"event": "boom", "msg": "x" * 500, "other": "y" * 500}
+        )
+
+        assert len(out.encode()) <= 200
+        assert isinstance(json.loads(out), dict)
+
+    def test_cjk_is_billed_by_encoded_bytes(self):
+        """
+        Multi-byte characters are charged their UTF-8 (escaped) size.
+        """
+        out = self._render(400, {"event": "e", "big": "中文" * 100})
+
+        assert len(out.encode()) <= 400
+        # Three UTF-8 bytes per character -- six if \u-escaped.
+        assert 600 == len(("中文" * 100).encode())
+
+    def test_escapes_are_billed(self):
+        """
+        Characters that have to be escaped count by their escaped size.
+        """
+        out = self._render(200, {"event": "q", "x": '"\\\n' * 100})
+
+        assert len(out.encode()) <= 200
+        assert isinstance(json.loads(out), dict)
+
+    def test_truncation_char_boundaries(self):
+        """
+        Truncation happens on character boundaries; no lone surrogates or
+        replacement characters leak into the output.
+        """
+        out = self._render(200, {"event": "e", "big": "中文" * 100})
+        value = json.loads(out)["big"]
+
+        assert value == value.encode("utf-8").decode("utf-8")
+        assert "�" not in value
+
+    def test_truncation_facts_are_attached(self):
+        """
+        Truncated fields are reported with the number of bytes dropped, and
+        the value itself says how much it lost.
+        """
+        out = self._render(200, {"event": "e", "big": "x" * 5000})
+        data = json.loads(out)
+
+        assert {"big"} == set(data["truncated"])
+        assert 0 < data["truncated"]["big"] <= 5000
+        assert f"{data['truncated']['big']}" in data["big"]
+
+    def test_required_fields_are_never_truncated(self):
+        """
+        Required fields are preserved verbatim; the rest absorbs the hit.
+        """
+        out = self._render(
+            300,
+            {"event": "keep-me-intact", "a": "x" * 2000},
+            required_fields=("event",),
+        )
+        data = json.loads(out)
+
+        assert "keep-me-intact" == data["event"]
+        assert "a" in data["truncated"]
+
+    def test_required_field_over_budget_is_rejected(self):
+        """
+        If required fields alone blow the budget, an explicit error is raised
+        instead of emitting an over-budget or invalid event.
+        """
+        with pytest.raises(EventTooLargeError) as ei:
+            self._render(10, {"event": "x" * 500})
+
+        assert "budget" in str(ei.value)
+
+    def test_required_field_over_budget_is_a_value_error(self):
+        """
+        EventTooLargeError is a ValueError so broad handlers can catch it.
+        """
+        assert issubclass(EventTooLargeError, ValueError)
+
+    def test_facts_are_paid_for(self):
+        """
+        The truncation facts themselves are charged against the budget.
+        """
+        out = self._render(
+            250,
+            {"event": "e", "a": "x" * 4000, "b": "y" * 4000},
+        )
+        facts = json.loads(out)["truncated"]
+
+        assert len(out.encode()) <= 250
+        assert {"a", "b"} == set(facts)
+
+    def test_trimming_is_skipped_when_not_a_net_win(self):
+        """
+        A tiny field isn't trimmed if doing so would cost more bytes in
+        truncation facts than it saves.  Such an event is rejected instead of
+        being grown into a worse, over-budget shape.
+        """
+        event_dict = {"event": "e", **{f"k{i}": "ab" for i in range(40)}}
+
+        with pytest.raises(EventTooLargeError):
+            self._render(400, event_dict)
+
+    def test_trimming_fact_overhead_is_accounted(self):
+        """
+        With enough room, many small fields are simply kept, not trimmed.
+        """
+        event_dict = {"event": "e", **{f"k{i}": "ab" for i in range(40)}}
+        out = self._render(600, event_dict)
+        data = json.loads(out)
+
+        assert len(out.encode()) <= 600
+        assert "truncated" not in data
+
+
+        """
+        Fields are trimmed in the declared order.
+        """
+        out = self._render(
+            260,
+            {"event": "e", "a": "A" * 300, "b": "B" * 300},
+            trim_order=["b", "a"],
+        )
+        facts = json.loads(out)["truncated"]
+
+        # "b" is first in the trim order, so it loses at least as much.
+        assert facts["b"] >= facts["a"]
+
+    def test_only_first_fields_trimmed_when_enough(self):
+        """
+        Later fields are left alone if earlier ones free enough room.
+        """
+        out = self._render(
+            400,
+            {"event": "e", "first": "x" * 5000, "second": "keep"},
+            trim_order=["first"],
+        )
+        data = json.loads(out)
+
+        assert "keep" == data["second"]
+        assert "first" in data["truncated"]
+
+    def test_large_fields_absorb_the_hit(self):
+        """
+        Without an explicit order, the big payload is trimmed while a small
+        field is left alone -- we don't wipe tiny fields just to save a byte.
+        """
+        out = self._render(
+            300, {"event": "e", "small": "keepme", "big": "x" * 5000}
+        )
+        data = json.loads(out)
+
+        assert "keepme" == data["small"]
+        assert "big" in data["truncated"]
+        assert "small" not in data["truncated"]
+
+    def test_omitted_bytes_are_exact(self):
+        """
+        The reported omitted-byte count plus the retained content equals the
+        original payload.
+        """
+        original = "中文" * 100
+        out = self._render(400, {"event": "e", "big": original})
+        data = json.loads(out)
+
+        marker_start = data["big"].rindex("…<truncated ")
+        kept = data["big"][:marker_start]
+
+        assert len(original.encode()) == len(kept.encode()) + (
+            data["truncated"]["big"]
+        )
+
+    def test_nested_values_are_trimmed_structurally(self):
+        """
+        Nested containers stay valid and are shrunk field by field.
+        """
+        out = self._render(
+            250, {"event": "e", "payload": {"deep": ["z" * 300, "k" * 300]}}
+        )
+        data = json.loads(out)
+
+        assert len(out.encode()) <= 250
+        assert isinstance(data["payload"]["deep"], list)
+
+    def test_structured_exception_is_trimmed(self):
+        """
+        A structured exception tree counts towards the budget and is trimmed
+        to a still-valid JSON value.
+        """
+        event_dict: EventDict = {"event": "boom", "exc_info": True}
+        try:
+            raise ValueError("x" * 500)
+        except ValueError:
+            dict_tracebacks(None, "info", event_dict)
+
+        out = ByteBudget(JSONRenderer(), budget_bytes=300)(
+            None, "info", event_dict
+        )
+        data = json.loads(out)
+
+        assert len(out.encode()) <= 300
+        assert "exception" in data["truncated"]
+
+    def test_renderer_call_count_is_bounded(self):
+        """
+        The renderer is called at most max_passes times, even for over-budget
+        events -- it's never used as a size oracle.
+        """
+        calls = []
+
+        def renderer(logger, name, event_dict):
+            calls.append(1)
+
+            return json.dumps(event_dict)
+
+        bb = ByteBudget(renderer, budget_bytes=200, max_passes=3)
+        bb(None, "info", {"event": "e", "a": "x" * 5000})
+
+        assert len(calls) <= 3
+
+    def test_renderer_call_count_with_side_effects(self):
+        """
+        A side-effecting renderer that ignores trimming can't cause unbounded
+        repeats: we give up after max_passes and reject.
+        """
+        calls = []
+
+        def renderer(logger, name, event_dict):
+            calls.append(1)
+
+            return "x" * 1000
+
+        bb = ByteBudget(renderer, budget_bytes=100, max_passes=2)
+
+        with pytest.raises(EventTooLargeError):
+            bb(None, "info", {"event": "e"})
+
+        assert 2 == len(calls)
+
+    def test_original_event_dict_and_values_are_not_mutated(self):
+        """
+        The caller's event dict and the containers it holds are untouched.
+        """
+        payload = {"deep": ["z" * 300, "k" * 300]}
+        event_dict = {"event": "e", "payload": payload}
+        snapshot = json.dumps(event_dict, sort_keys=True)
+
+        self._render(200, event_dict)
+
+        assert snapshot == json.dumps(event_dict, sort_keys=True)
+        assert 300 == len(event_dict["payload"]["deep"][0])
+
+    def test_bytes_renderer_is_supported(self):
+        """
+        A renderer returning bytes works and is billed by its byte length.
+        """
+        bb = ByteBudget(
+            lambda logger, name, event_dict: json.dumps(event_dict).encode(),
+            budget_bytes=100,
+        )
+        out = bb(None, "info", {"event": "e", "a": "x" * 500})
+
+        assert isinstance(out, bytes)
+        assert len(out) <= 100
+
+    def test_non_str_renderer_result_raises(self):
+        """
+        A renderer that doesn't return str/bytes is rejected clearly.
+        """
+        bb = ByteBudget(lambda logger, name, event_dict: event_dict, 100)
+
+        with pytest.raises(TypeError, match="must return str, bytes"):
+            bb(None, "info", {"event": "e"})
+
+    def test_facts_key_none_attaches_nothing(self):
+        """
+        facts_key=None disables the truncation facts.
+        """
+        out = self._render(
+            200, {"event": "e", "a": "x" * 5000}, facts_key=None
+        )
+
+        assert "truncated" not in json.loads(out)
+
+    def test_negative_budget_rejected(self):
+        """
+        A negative budget is a configuration error.
+        """
+        with pytest.raises(ValueError, match="budget_bytes"):
+            ByteBudget(JSONRenderer(), budget_bytes=-1)
+
+    def test_zero_max_passes_rejected(self):
+        """
+        max_passes must allow at least one renderer call.
+        """
+        with pytest.raises(ValueError, match="max_passes"):
+            ByteBudget(JSONRenderer(), budget_bytes=100, max_passes=0)
+
+    def test_cycle_does_not_hang(self):
+        """
+        Self-referential values don't loop forever in the size estimator.
+        """
+        event_dict: EventDict = {"event": "e", "big": "x" * 500}
+        event_dict["self"] = event_dict
+
+        def renderer(logger, name, ed):
+            try:
+                return json.dumps(ed)
+            except ValueError:
+                return '{"event": "e"}'
+
+        bb = ByteBudget(renderer, budget_bytes=100)
+        bb(None, "info", event_dict)  # must terminate
+
+
+class TestByteBudgetIntegration:
+    def test_end_to_end_with_bound_logger(self):
+        """
+        ByteBudget works as the terminal processor in a real logger chain and
+        what reaches the sink is valid, in-budget JSON.
+        """
+        captured = []
+
+        def renderer(logger, name, event_dict):
+            out = JSONRenderer()(logger, name, event_dict)
+            captured.append(out)
+
+            return out
+
+        structlog.configure(
+            processors=[ByteBudget(renderer, budget_bytes=200)],
+        )
+        log = structlog.get_logger()
+        out = log.info("boom", a="x" * 1000)
+
+        assert 2 == len(captured)  # one measure, one confirmation
+        assert len(captured[-1].encode()) <= 200
+        assert isinstance(json.loads(captured[-1]), dict)
