@@ -138,6 +138,14 @@ API Reference
 .. autofunction:: clear_contextvars
 .. autofunction:: unbind_contextvars
 .. autofunction:: reset_contextvars
+.. autoclass:: SequenceContext
+   :members: next, fork
+.. autofunction:: sequence_context
+.. autofunction:: get_sequence_context
+.. autofunction:: bind_sequence_context
+.. autofunction:: reset_sequence_context
+.. autofunction:: fork_sequence_context
+.. autofunction:: add_sequence_number
 
 `structlog.threadlocal` Module
 ------------------------------

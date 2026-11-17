@@ -15,6 +15,12 @@ You can find our backwards-compatibility policy [here](https://github.com/hynek/
 
 ## [Unreleased](https://github.com/hynek/structlog/compare/26.1.0...HEAD)
 
+### Added
+
+- Explicit *sequence contexts* in `structlog.contextvars` for recovering the commit order of log events that one logical request emits across threads and `async` subtasks: `structlog.contextvars.sequence_context`, `structlog.contextvars.SequenceContext`, `structlog.contextvars.get_sequence_context`, `structlog.contextvars.bind_sequence_context`, `structlog.contextvars.reset_sequence_context`, `structlog.contextvars.fork_sequence_context`, and the `structlog.contextvars.add_sequence_number` processor.
+  Numbers are assigned at commit time and shared counters survive `contextvars` copies, so delayed writes keep their number and accidental duplicate sequences are impossible.
+
+
 ### Changed
 
 - On Python 3.15 and later, *structlog* uses [PEP 810](https://peps.python.org/pep-0810/) lazy imports for modules that are only needed once you log.

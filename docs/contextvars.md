@@ -181,3 +181,38 @@ event='user did something' view='/login' peer='127.0.0.1' something='shot_in_foo
 ```
 
 As you can see, `view`, `peer`, and `request_id` are present in **both** log entries.
+
+## Sequence Contexts: Recovering Commit Order
+
+*New in version 26.2.0.*
+
+When one request writes logs from multiple threads or `asyncio` subtasks -- possibly with delayed writes -- the wall-clock order of log output no longer reflects the order in which the events were committed.
+*Sequence contexts* give you an explicit, shareable counter that numbers events **at commit time**, so the original call-chain order can always be recovered by sorting on `seq`:
+
+- Wrap a request in {func}`structlog.contextvars.sequence_context` and add {func}`structlog.contextvars.add_sequence_number` to your processor chain.
+  Each committed event gets a `seq` number (starting at 1) and, if the sequence is named, a `seq_id`.
+- `asyncio` subtasks automatically *share* the parent's counter because copying a `contextvars.Context` shares the underlying `SequenceContext` object -- it can never accidentally spawn a second, same-named sequence that restarts at 1.
+- Threads don't inherit context variables, so pass the sequence explicitly using {func}`structlog.contextvars.get_sequence_context` and {func}`structlog.contextvars.bind_sequence_context`.
+  The counter is thread-safe.
+- A subtask that needs its own numbering must *explicitly* fork using {func}`structlog.contextvars.fork_sequence_context`, which creates an independent sequence with a derived name like `req/1`.
+- The rule for filtered events is fixed: events dropped before `add_sequence_number` runs (for example by log-level filtering) do **not** consume sequence numbers.
+- When the `sequence_context` block is left, numbering stops -- the next request is not numbered unless it opens its own sequence context.
+
+```{doctest}
+>>> from structlog.contextvars import sequence_context, add_sequence_number
+>>> configure(processors=[
+...     add_sequence_number,
+...     structlog.processors.KeyValueRenderer(key_order=["event", "seq"]),
+... ])
+>>> log = structlog.get_logger()
+>>> with sequence_context("req"):
+...     log.info("hello")
+...     log.info("world")
+event='hello' seq=1 seq_id='req'
+event='world' seq=2 seq_id='req'
+>>> # The context is over: no more numbers are assigned.
+>>> # (seq=None is printed due to the key_order argument passed to
+>>> # KeyValueRenderer, but no seq key is present in the event dict.)
+>>> log.info("next request")
+event='next request' seq=None
+```
