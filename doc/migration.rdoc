@@ -374,6 +374,51 @@ you should give it some thought before using it.
 
 In some cases, you may want to allow a migration in the database that does not exist in the filesystem (deploying to an older version of code without running a down migration when deploy auto-migrates, for example). If required, you can pass <tt>allow_missing_migration_files: true</tt> as an option. This will stop errors from being raised if there are migrations in the database that do not exist in the filesystem. Note that the migrations themselves can still raise an error when using this option, if the database schema isn't in the state the migrations expect it to be in.  In general, the <tt>allow_missing_migration_files: true</tt> option is very risky to use, and should only be used if it is absolutely necessary.
 
+== Tracking migration content identities
+
+By default, the migrators only keep track of migration numbers (+IntegerMigrator+) or
+filenames (+TimestampMigrator+).  That means renaming a migration file, or changing the
+contents of a migration that has already been applied, is not detected: the migrator only
+sees the same number or filename and assumes the migration was applied exactly as it
+currently exists on disk.
+
+If you want the migrator to detect such changes, you can enable explicit migration identity
+tracking by passing <tt>migration_identities: true</tt> to <tt>Sequel::Migrator.run</tt>:
+
+  Sequel::Migrator.run(DB, "db/migrations", migration_identities: true)
+
+When identity tracking is enabled, every successfully applied migration stores an explicit
+identity record in a separate table (<tt>schema_migration_identities</tt> by default, overridable
+with the <tt>:migration_identity_table</tt> option).  Each record contains:
+
+* the migration filename,
+* a full digest (SHA256) of the migration file contents at the time it was applied, and
+* the direction in which it was last applied (<tt>"up"</tt> or <tt>"down"</tt>).
+
+On every subsequent migrator run, the stored records are compared against the migration
+files on disk:
+
+* If an applied migration file has been modified since it was recorded, or a recorded
+  migration is now provided under the same filename with different contents, the migrator
+  raises a <tt>Sequel::Migrator::Error</tt> and refuses to continue.
+* Duplicate migration numbers (+IntegerMigrator+), duplicate migration filename identities,
+  and migration files whose contents change while they are being executed are also rejected.
+* If the migration itself raises an error, the whole migration transaction is rolled back and
+  no success (and no identity record) is registered for it.
+
+Migrations that were applied before identity tracking was enabled have no identity record.
+Their content identity cannot be confirmed, so they are exposed through the migrator's
+<tt>unverified_migrations</tt> and <tt>migration_identity_verified?</tt> methods instead of
+being silently marked as verified.  No identity record is fabricated for them, and attempting
+to apply such a migration in a direction that would change the schema (for example rolling it
+back) raises an error, because there is no way to know which contents were actually run in
+the past.  Once such a migration is applied again with identity tracking enabled, it gets a
+real identity record and becomes verifiable.
+
+Because the identity records are stored in the database, the checks also work when the
+database is reopened later: the migrator recomputes the digests from the files on disk and
+compares them against the records stored when the migrations originally ran.
+
 == Modifying existing migrations
 
 Just don't do it.

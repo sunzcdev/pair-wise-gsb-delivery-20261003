@@ -12,6 +12,8 @@
 # Sequel::MigrationDSL, Sequel::MigrationReverser, Sequel::MigrationAlterTableReverser,
 # Sequel::Migrator, Sequel::IntegerMigrator, Sequel::TimestampMigrator
 
+require 'digest'
+
 #
 module Sequel
   # Sequel's older migration class, available for backward compatibility.
@@ -370,6 +372,13 @@ module Sequel
   #
   #   Sequel::Migrator.run(DB, '.', target: 5, current: 1)
   #
+  # By default only the migration number or filename is stored, so renaming
+  # or modifying an already applied migration file goes undetected.  Passing
+  # the <tt>migration_identities: true</tt> option additionally records the
+  # filename, a full digest of the file contents, and the applied direction
+  # for each successfully applied migration, and refuses to continue when an
+  # applied migration file no longer matches its recorded identity.
+  #
   # Part of the +migration+ extension.
   class Migrator
     MIGRATION_FILE_PATTERN = /\A(\d+)_(.+)\.rb\z/i.freeze
@@ -422,6 +431,17 @@ module Sequel
     # :column :: The column in the :table argument storing the migration version (default: :version).
     # :current :: The current version of the database.  If not given, it is retrieved from the database
     #             using the :table and :column options.
+    # :migration_identities :: Record and verify the explicit content identity of each successfully
+    #                          applied migration, in addition to the version or filename tracking.
+    #                          For each migration the filename, a full digest of the file contents,
+    #                          and the direction in which it was last applied (:up or :down) are
+    #                          stored in a separate table.  Migrations whose recorded contents no
+    #                          longer match the file on disk, or whose identity cannot be confirmed
+    #                          because they were applied before identity tracking was enabled, are
+    #                          refused instead of being assumed to be applied.
+    # :migration_identity_table :: The table holding the explicit migration identity records
+    #                              (default: :schema_migration_identities).  Only used when
+    #                              :migration_identities is enabled.
     # :relative :: Run the given number of migrations, with a positive number being migrations to migrate
     #              up, and a negative number being migrations to migrate down (IntegerMigrator only).
     # :table :: The table containing the schema version (default: :schema_info for integer migrations and
@@ -483,6 +503,15 @@ module Sequel
     # The target version for this migrator
     attr_reader :target
 
+    # Whether explicit migration identity records are kept and verified.
+    # When true, every successfully applied migration records its filename,
+    # a full digest of its contents, and the direction in which it was applied.
+    attr_reader :migration_identities
+
+    # The table used to store explicit migration identity records, when
+    # migration identity tracking is enabled.
+    attr_reader :migration_identity_table
+
     # Setup the state for the migrator
     def initialize(db, directory, opts=OPTS)
       raise(Error, "Must supply a valid migration path") unless File.directory?(directory)
@@ -495,7 +524,49 @@ module Sequel
       @column = opts[:column] || default_schema_column
       @ds = schema_dataset
       @use_transactions = opts[:use_transactions]
+      @migration_identities = opts[:migration_identities] ? true : false
+      @migration_identity_table = opts[:migration_identity_table] || :schema_migration_identities
+      @unverified_migrations = []
+      if migration_identities
+        schema, id_table = @db.send(:schema_and_table, @migration_identity_table)
+        @migration_identity_table = schema ? Sequel::SQL::QualifiedIdentifier.new(schema, id_table) : id_table
+        @migration_identity_ds = migration_identity_dataset
+        @migration_file_digests = {}
+        @recorded_migration_identities = get_recorded_migration_identities
+      end
     end
+
+    # Whether the content identity of the given migration file has been
+    # confirmed against an explicit identity record.  Returns false when
+    # identity tracking is disabled, or when the migration was applied
+    # before identity records existed (in which case it is listed in
+    # #unverified_migrations and its identity must not be treated as verified).
+    def migration_identity_verified?(file_name)
+      return false unless migration_identities
+      fi = file_name.downcase
+      record = recorded_migration_identities[fi]
+      return false unless record
+      current = current_migration_identities[fi]
+      !!current && record[migration_identity_digest_column] == current[migration_identity_digest_column]
+    end
+
+    # Return a frozen copy of the explicit identity record stored for the
+    # given migration filename, or nil if no identity record exists.  A
+    # record only exists for migrations successfully applied while identity
+    # tracking was enabled; legacy migrations have no record and therefore
+    # no verifiable identity.
+    def migration_identity_for(file_name)
+      return nil unless migration_identities
+      record = recorded_migration_identities[file_name.downcase]
+      record && record.dup.freeze
+    end
+
+    # Filenames of migrations that are treated as applied but whose content
+    # identity cannot be confirmed, because they were applied before identity
+    # tracking was enabled.  These migrations are never marked as verified and
+    # no identity record is fabricated for them; applying them in a direction
+    # that would change the schema raises a Migrator::Error.
+    attr_reader :unverified_migrations
 
     private
 
@@ -533,6 +604,157 @@ module Sequel
     # Return the integer migration version based on the filename.
     def migration_version_from_file(filename)
       filename.split('_', 2).first.to_i
+    end
+
+    # The digest column used in the migration identity table.
+    def migration_identity_digest_column
+      :digest
+    end
+
+    # The direction column used in the migration identity table.
+    def migration_identity_direction_column
+      :direction
+    end
+
+    # The filename column used in the migration identity table.
+    def migration_identity_filename_column
+      :filename
+    end
+
+    # Return the dataset for the migration identity table, creating the
+    # table if it does not exist.  One row is kept per migration filename,
+    # holding the full digest of the file contents when it was last applied
+    # and the direction in which it was applied.
+    def migration_identity_dataset
+      c = migration_identity_filename_column
+      d = migration_identity_digest_column
+      r = migration_identity_direction_column
+      db.create_table?(migration_identity_table) do
+        String c, :primary_key=>true
+        String d, :null=>false
+        String r, :null=>false
+      end
+      db.from(migration_identity_table)
+    end
+
+    # Compute the full content digest of the migration file.  The file is
+    # read every time, so a change made while the migrator is running is
+    # detected rather than masked by a cached value.
+    def migration_file_digest(path)
+      @migration_file_digests[path] ||= Digest::SHA256.file(path).hexdigest
+    end
+
+    # Map of downcased migration filename to the identity (digest and
+    # direction) computed from the files currently on disk.
+    def current_migration_identities
+      h = {}
+      files.compact.each do |path|
+        file_name = File.basename(path)
+        fi = file_name.downcase
+        raise(Error, "Duplicate migration filename identity: #{file_name}") if h.key?(fi)
+        h[fi] = {
+          migration_identity_digest_column => migration_file_digest(path),
+          migration_identity_direction_column => nil
+        }
+      end
+      h
+    end
+
+    # Map of downcased migration filename to the identity record stored in
+    # the database for migrations applied with identity tracking enabled.
+    def get_recorded_migration_identities
+      h = {}
+      fc = migration_identity_filename_column
+      dc = migration_identity_digest_column
+      rc = migration_identity_direction_column
+      @migration_identity_ds.each do |row|
+        fi = row[fc].downcase
+        raise(Error, "Duplicate migration identity record: #{row[fc]}") if h.key?(fi)
+        h[fi] = {dc => row[dc], rc => row[rc]}
+      end
+      h
+    end
+
+    attr_reader :recorded_migration_identities
+
+    # Compare the identity records stored in the database against the
+    # migration files currently on disk and the migrations treated as
+    # applied.  Any mismatch is a safety violation and raises an error;
+    # applied migrations without an identity record are reported as
+    # unverifiable instead of being silently treated as verified.
+    def verify_migration_identities
+      current = current_migration_identities
+      recorded = recorded_migration_identities
+      dc = migration_identity_digest_column
+
+      recorded.each do |fi, record|
+        next unless current.key?(fi)
+        if record[dc] != current[fi][dc]
+          raise(Error, "Migration file has been modified since it was applied: #{fi}")
+        end
+      end
+
+      @unverified_migrations = applied_migration_filenames.select do |fi|
+        !recorded.key?(fi)
+      end.freeze
+    end
+
+    # Downcased filenames of migrations the migrator currently treats as
+    # applied based on the ordinary version/filename tracking.
+    def applied_migration_filenames
+      files.compact.map{|f| File.basename(f).downcase}.select do |fi|
+        migration_file_applied?(fi)
+      end
+    end
+
+    # Whether the migration with the given downcased filename is treated as
+    # applied by the ordinary version/filename tracking.
+    def migration_file_applied?(fi)
+      raise NotImplementedError, "#{self.class} should implement #migration_file_applied?"
+    end
+
+    # Raise unless the identity of the migration about to be applied can be
+    # confirmed.  New migrations may be applied without an existing record,
+    # but re-applying or reverting a legacy migration whose contents were
+    # never recorded is refused, since there is no way to know what was
+    # actually run in the past.  The current digest is always computed and
+    # cached before the migration runs, so a file changed while it is being
+    # executed can be detected afterwards in #record_migration_identity.
+    def check_migration_identity_before_apply(file_name, direction)
+      fi = file_name.downcase
+      if unverified_migrations.include?(fi)
+        raise(Error, "Cannot apply migration #{direction} for #{fi}, its content identity cannot be confirmed because it was applied before migration identity tracking was enabled")
+      end
+      path = files.compact.find{|f| File.basename(f).downcase == fi}
+      digest = migration_file_digest(path)
+      if (record = recorded_migration_identities[fi]) && record[migration_identity_digest_column] != digest
+        raise(Error, "Migration file has been modified since it was applied: #{fi}")
+      end
+    end
+
+    # Persist the explicit identity record for a successfully applied
+    # migration.  The file is re-read inside the migration transaction and
+    # compared to the digest computed before the migration ran, so a script
+    # changed during execution is detected and the whole migration (including
+    # its identity record and version update) is rolled back.
+    def record_migration_identity(file_name, path, direction)
+      fi = file_name.downcase
+      expected_digest = migration_file_digest(path)
+      digest = Digest::SHA256.file(path).hexdigest
+      if digest != expected_digest
+        raise(Error, "Migration file changed while it was being applied: #{fi}")
+      end
+      @migration_file_digests[path] = digest
+
+      fc = migration_identity_filename_column
+      dc = migration_identity_digest_column
+      rc = migration_identity_direction_column
+      if recorded_migration_identities.key?(fi)
+        @migration_identity_ds.where(fc=>fi).update(dc=>digest, rc=>direction.to_s)
+      else
+        @migration_identity_ds.insert(fc=>fi, dc=>digest, rc=>direction.to_s)
+      end
+      recorded_migration_identities[fi] = {dc=>digest, rc=>direction.to_s}
     end
   end
 
@@ -580,29 +802,40 @@ module Sequel
       end
 
       @migrations = get_migrations
+      verify_migration_identities if migration_identities
     end
 
     # The integer migrator is current if the current version is the same as the target version.
     def is_current?
       current_migration_version == target
     end
-    
+
     # Apply all migrations on the database
     def run
       migrations.zip(version_numbers).each do |m, v|
         timer = Sequel.start_timer
+        path = files[v]
+        file_name = File.basename(path)
         db.log_info("Begin applying migration version #{v}, direction: #{direction}")
         checked_transaction(m) do
+          check_migration_identity_before_apply(file_name, direction) if migration_identities
           m.apply(db, direction)
           set_migration_version(up? ? v : v-1)
+          record_migration_identity(file_name, path, direction) if migration_identities
         end
         db.log_info("Finished applying migration version #{v}, direction: #{direction}, took #{sprintf('%0.6f', Sequel.elapsed_seconds_since(timer))} seconds")
       end
-      
+
       target
     end
 
     private
+
+    # Whether the migration with the given downcased filename is treated as
+    # applied according to the stored integer version.
+    def migration_file_applied?(fi)
+      migration_version_from_file(fi) <= current
+    end
 
     # Gets the current migration version stored in the database. If no version
     # number is stored, 0 is returned.
@@ -709,6 +942,7 @@ module Sequel
       @target = opts[:target]
       @applied_migrations = get_applied_migrations
       @migration_tuples = get_migration_tuples
+      verify_migration_identities if migration_identities
     end
 
     # Apply the migration in the given file path.  See Migrator.run for the
@@ -741,21 +975,24 @@ module Sequel
 
       return if direction == :up ? already_applied : !already_applied
 
-      apply_migration(migration, file_name, direction)
+      apply_migration(migration, file_name, direction, path)
       nil
     end
 
     private
 
     # Apply a single migration with the given filename in the given direction.
-    def apply_migration(migration, file_name, direction)
+    def apply_migration(migration, file_name, direction, path=nil)
       fi = file_name.downcase
       t = Time.now
 
+      path ||= files.find{|f| File.basename(f).downcase == fi}
       db.log_info("Begin applying migration #{file_name}, direction: #{direction}")
       checked_transaction(migration) do
+        check_migration_identity_before_apply(file_name, direction) if migration_identities
         migration.apply(db, direction)
         direction == :up ? ds.insert(column=>fi) : ds.where(column=>fi).delete
+        record_migration_identity(file_name, path, direction) if migration_identities
       end
       db.log_info("Finished applying migration #{file_name}, direction: #{direction}, took #{sprintf('%0.6f', Time.now - t)} seconds")
     end
@@ -789,6 +1026,12 @@ module Sequel
       missing_migration_files = am - files.map{|f| File.basename(f).downcase}
       raise(Error, "Applied migration files not in file system: #{missing_migration_files.join(', ')}") if missing_migration_files.length > 0 && !@allow_missing_migration_files
       am
+    end
+
+    # Whether the migration with the given downcased filename is treated as
+    # applied according to the stored filenames.
+    def migration_file_applied?(fi)
+      applied_migrations.include?(fi)
     end
     
     # Returns any migration files found in the migrator's directory.

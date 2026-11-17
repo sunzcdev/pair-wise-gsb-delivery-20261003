@@ -1,5 +1,7 @@
 === master
 
+* Support migration_identities option in the migration extension, recording the filename, full content digest, and direction of each successfully applied migration and refusing to continue when applied migration files have been renamed or modified (jeremyevans)
+
 * Avoid duplicating table when adding/dropping CHECK or NOT NULL constraints on SQLite 3.53+ (jeremyevans)
 
 * Add Database#wait_for_lsn on PostgreSQL 19+ to support WAIT FOR LSN (jeremyevans)
