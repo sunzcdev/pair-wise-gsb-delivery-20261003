@@ -1,0 +1,25 @@
+#!/usr/bin/env gem build
+# encoding: utf-8
+
+require File.expand_path("../lib/amq/protocol/version", __FILE__)
+
+Gem::Specification.new do |s|
+  s.name = "amq-protocol"
+  s.version = AMQ::Protocol::VERSION
+  s.authors = ["Jakub Stastny", "Michael S. Klishin", "Theo Hultberg", "Mark Abramov"]
+  s.homepage = "https://github.com/ruby-amqp/amq-protocol"
+  s.summary = "AMQP 0.9.1 encoding & decoding library."
+  s.description = <<-DESC
+  amq-protocol is an AMQP 0.9.1 serialization library for Ruby. It is not a
+  client: the library only handles serialization and deserialization.
+  DESC
+  s.email = ["michael.s.klishin@gmail.com"]
+  s.licenses    = ["MIT"]
+  s.required_ruby_version = ">= 3.2"
+
+  # files
+  s.files = Dir.glob("lib/**/*.rb") + %w[LICENSE README.md ChangeLog.md]
+  s.require_paths = ["lib"]
+
+  s.extra_rdoc_files = ["README.md"]
+end

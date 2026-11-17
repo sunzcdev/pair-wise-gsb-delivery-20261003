@@ -1,0 +1,283 @@
+## Changes between 2.10.0 and 2.11.0 (unreleased)
+
+No changes yet.
+
+
+## Changes between 2.9.0 and 2.10.0 (Nov 2, 2026)
+
+### TLS Peer Verification Is No Longer Disabled by Default
+
+An `amqps://` URI without `?verify=` no longer disables peer verification,
+so clients such as Bunny apply their own default (`verify_peer: true` in Bunny's case).
+Use `?verify=false` to opt out.
+
+Brokers with self-signed or private-CA certificates now need `?cacertfile=`
+in the URI.
+
+Reported by Matthew Mongeau (Ruby Central).
+
+GitHub advisory: [GHSA-499w-x7r4-fw7p](https://github.com/ruby-amqp/amq-protocol/security/advisories/GHSA-499w-x7r4-fw7p)
+
+
+## Changes between 2.8.0 and 2.9.0 (Aug 26, 2026)
+
+### amq-protocol Now Requires Ruby 3.2
+
+Ruby 3.0 and 3.1 are end of life. The URI parser now uses
+`URI.decode_uri_component`, which Ruby 3.2 provides.
+
+
+### URI Components Are Percent-Decoded, Not Form-Decoded
+
+`AMQ::URI.parse` decoded the username, password and virtual host with
+`CGI.unescape`, so a password such as `pa+ss` was parsed as `pa ss` and failed
+to authenticate. They are now percent-decoded; use `%20` where a `+` used to
+mean a space.
+
+Contributed by @eglitobias.
+
+GitHub issue: [#89](https://github.com/ruby-amqp/amq-protocol/pull/89)
+
+
+## Changes between 2.7.0 and 2.8.0 (Apr 25, 2026)
+
+### Performance Improvements in Frame Decoding and Encoding
+
+Replacing `x == nil` with `x.nil?` in the frame layer hot path yields a
+consistent **+15–18% throughput improvement** in `Frame.decode_header`
+(called on every received frame) and **+12–14%** in `HeartbeatFrame.encode`,
+across Ruby 3.3, 3.4, and 4.0.
+
+See benchmarks/BENCHMARKS.md for instructions on how to reproduce these numbers on your machine.
+
+Contributed by @eglitobias.
+
+GitHub issue: [#86](https://github.com/ruby-amqp/amq-protocol/pull/86)
+
+
+## Changes between 2.6.0 and 2.7.0 (Mar 31, 2026)
+
+### Channel.Close Predicates Now Return True Boolean
+
+And not just truthy values (values that are not `nil` or `false`).
+
+
+## Changes between 2.5.1 and 2.6.0 (Mar 30, 2026)
+
+### Channel.Close Predicate Methods
+
+`Channel::Close` now provides predicate methods for identifying common
+channel closure reasons by reply code and text:
+
+ * `#delivery_ack_timeout?`: consumer [delivery acknowledgement timeout](https://www.rabbitmq.com/docs/consumers#acknowledgement-timeout)
+ * `#unknown_delivery_tag?`: unknown delivery tag (e.g. [double ack](https://www.rabbitmq.com/docs/channels#error-handling))
+ * `#message_too_large?`: message exceeded the configured max size
+
+
+## Changes between 2.5.0 and 2.5.1 (Jan 19, 2026)
+
+### Windows Installation Fixes
+
+`2.4.0` and `2.5.0` versions unintentionally included files that were
+symlinks, which caused installation on Windows to fail.
+
+
+## Changes between 2.4.0 and 2.5.0 (Dec 31, 2025)
+
+### Additional Consumer Hot Path Optimizations
+
+A few more decode method optimizations for consumer delivery code paths.
+
+
+## Changes between 2.3.4 and 2.4.0 (Dec 30, 2025)
+
+### Performance Improvements
+
+Optimized encoding and decoding hot paths:
+
+ * Built-in `Q>`/`q>` packing/unpacking directives are 6-7x faster than the original implementation (that originally targeted Ruby 1.8.x)
+ * Switched to `unpack1` instead of `unpack().first` throughout
+ * Use `byteslice` instead of `slice` for binary string operations
+ * Use `getbyte` for single byte access (4x faster than alternatives)
+ * Adopted the `frozen_string_literal` pragma
+
+The improvements on Ruby 3.4 are very meaningful:
+
+ * `AMQ::Pack.pack_uint64_big_endian`: about 6.6x faster
+ * `AMQ::Pack.unpack_uint64_big_endian`: about 7.2x faster
+ * `Basic.Deliver.decode`: about 1.7x faster
+ * `Basic.Ack/Nack/Reject.encode`: about 2.5x faster
+
+
+## Changes between 2.3.3 and 2.3.4 (May 12, 2025)
+
+### (Forward) Compatibility with Ruby 3.5
+
+Contributed by @Earlopain.
+
+GitHub issue: [#80](https://github.com/ruby-amqp/amq-protocol/pull/80)
+
+
+## Changes between 2.3.2 and 2.3.3 (February 17, 2025)
+
+### Improved Compatibility with Ruby 3.4
+
+Contributed by @BenTalagan.
+
+GitHub issue: [#79](https://github.com/ruby-amqp/amq-protocol/pull/79)
+
+### Support Binary-Encoded Frozen Strings for Payloads
+
+Contributed by @djrodgerspryor.
+
+GitHub issue: [#78](https://github.com/ruby-amqp/amq-protocol/pull/78)
+
+
+## Changes between 2.3.1 and 2.3.2 (July 10th, 2020)
+
+### Safer Encoding Handling When Serialising Message Properties and Headers
+
+Contributed by @bbascarevic-tti.
+
+GitHub issue: [ruby-amqp/amq-protocol#76](https://github.com/ruby-amqp/amq-protocol/issues/76)
+
+
+## Changes between 2.3.0 and 2.3.1 (April 8th, 2020)
+
+### Support for connection.update-secret
+
+Used together with the `rabbitmq-auth-backend-oauth2` plugin.
+
+### Squashed a gemspec Warning
+
+GitHub issue: [ruby-amqp/amq-protocol#75](https://github.com/ruby-amqp/amq-protocol/issues/75).
+
+
+
+## Changes between 2.2.0 and 2.3.0 (Jan 8th, 2018)
+
+### Support for Additional URI Query Parameters
+
+GitHub issue: [#67](https://github.com/ruby-amqp/amq-protocol/issues/67), [#68](https://github.com/ruby-amqp/amq-protocol/issues/68), [#69](https://github.com/ruby-amqp/amq-protocol/issues/69).
+
+Contributed by Andrew Babichev.
+
+
+
+
+## Changes between 2.1.0 and 2.2.0 (May 11th, 2017)
+
+### Timestamps are Encoded as 64-bit Unsigned Integers
+
+This is a potentially **breaking change**. It is recommended that
+all applications that use this gem and pass date/time values in message
+properties or headers are upgraded at the same time.
+
+GitHub issue: [#64](https://github.com/ruby-amqp/amq-protocol/issues/64).
+
+Contributed by Carl Hoerberg.
+
+
+
+## Changes between 2.0.0 and 2.1.0 (January 28th, 2017)
+
+### Ruby Warnings Squashed
+
+Contributed by Akira Matsuda.
+
+GitHub issue: [#62](https://github.com/ruby-amqp/amq-protocol/pull/62)
+
+### Byte Array Decoding
+
+Byte array values in types now can be
+decoded (to the extent Ruby type system
+permits) by this library.
+
+GitHub issue: [#58](https://github.com/ruby-amqp/amq-protocol/issues/58)
+
+
+
+## Changes between 1.9.x and 2.0.0
+
+2.0.0 has **breaking changes** in header encoding.
+
+### Signed Integer Encoding in Headers
+
+Integer values in headers are now encoded as signed 64-bit
+(was unsigned 32-bit previously, unintentionally).
+
+This is a breaking change: consuming messages with integers in headers
+published with older versions of this library will break!
+
+### Signed 16 Bit Integer Decoding
+
+Signed 16 bit integers are now decoded correctly.
+
+### Signed 8 Bit Integer Decoding
+
+Signed 8 bit integers are now decoded correctly.
+
+Contributed by Benjamin Conlan.
+
+
+
+## Changes between 1.8.0 and 1.9.0
+
+### Performance Improvements in AMQ::BitSet
+
+`AMQ::BitSet#next_clear_bit` is now drastically more efficient
+(down from 6 minutes for 10,000 iterations to 4 seconds for 65,536 iterations).
+
+Contributed by Doug Rohrer, Dave Anderson, and Jason Voegele from
+[Neo](http://www.neo.com).
+
+
+## Changes between 1.7.0 and 1.8.0
+
+### Body Framing Fix
+
+Messages exactly 128 Kb in size are now framed correctly.
+
+Contributed by Nicolas Viennot.
+
+
+## Changes between 1.6.0 and 1.7.0
+
+### connection.blocked Support
+
+`connection.blocked` AMQP 0.9.1 extension is now supported
+(should be available as of RabbitMQ 3.2).
+
+
+## Changes between 1.0.0 and 1.1.0
+
+### Performance Enhancements
+
+Encoding of large payloads is now done more efficiently.
+
+Contributed by Greg Brockman.
+
+
+## Changes between 1.0.0.pre6 and 1.0.0.pre7
+
+### AMQ::Settings
+
+`AMQ::Settings` extracts settings merging logic and AMQP/AMQPS URI parsing from `amq-client`.
+Parsing follows the same convention amqp gem and RabbitMQ Java client follow.
+
+Examples:
+
+``` ruby
+AMQ::Settings.parse_amqp_url("amqp://dev.rabbitmq.com")            # => vhost is nil, so default (/) will be used
+AMQ::Settings.parse_amqp_url("amqp://dev.rabbitmq.com/")           # => vhost is an empty string
+AMQ::Settings.parse_amqp_url("amqp://dev.rabbitmq.com/%2Fvault")   # => vhost is /vault
+AMQ::Settings.parse_amqp_url("amqp://dev.rabbitmq.com/production") # => vhost is production
+AMQ::Settings.parse_amqp_url("amqp://dev.rabbitmq.com/a.b.c")      # => vhost is a.b.c
+AMQ::Settings.parse_amqp_url("amqp://dev.rabbitmq.com/foo/bar")    # => ArgumentError
+```
+
+
+### AMQ::Protocol::TLS_PORT
+
+`AMQ::Protocol::TLS_PORT` is a new constant that contains default AMQPS 0.9.1 port,
+5671.
