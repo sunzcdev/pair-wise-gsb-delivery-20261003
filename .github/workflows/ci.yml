@@ -1,0 +1,29 @@
+name: CI
+
+on: [push, pull_request]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    continue-on-error: ${{ matrix.experimental }}
+    strategy:
+      fail-fast: false
+      matrix:
+        ruby: ["3.2", "3.3", "3.4", "4.0", "jruby"]
+        experimental: [false]
+        include:
+        - ruby: "truffleruby"
+          experimental: true
+    steps:
+    - uses: actions/checkout@v7
+    - uses: ruby/setup-ruby@v1
+      with:
+        ruby-version: ${{matrix.ruby}}
+        bundler-cache: true
+
+    - name: Run standardrb
+      run: bundle exec standardrb --no-fix
+
+    - name: Run tests
+      timeout-minutes: 1
+      run: bundle exec rake test
