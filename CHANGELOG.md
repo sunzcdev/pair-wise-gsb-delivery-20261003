@@ -10,6 +10,7 @@ All notable changes to this project will be documented in this file. For info on
 
 ### Added
 
+- Add `isolate`, `replay_input`, and `input_buffer_limit` options to `Rack::Cascade`. Isolation gives each application its own duplicate of the environment while keeping server-owned objects (`rack.errors`, `rack.logger`, hijack and callback entries) shared; replay mode rewinds rewindable input and stages non-rewindable input in a bounded in-memory buffer, raising `Rack::Cascade::InputReplayError` instead of silently passing an empty body. A failure while closing a replaced response body raises `Rack::Cascade::BodyCloseError` and is reported separately from a cascade status.
 - Add `Rack::Files#assign_headers` to allow overriding how the configured file headers are set. ([#2377](https://github.com/rack/rack/pull/2377), [@codergeek121](https://github.com/codergeek121))
 - Add support for `rack.response_finished` to `Rack::TempfileReaper`. ([#2363](https://github.com/rack/rack/pull/2363), [@skipkayhil](https://github.com/skipkayhil))
 - Add support for streaming bodies when using `Rack::Events`. ([#2375](github.com/rack/rack/pull/2375), [@unflxw](https://github.com/unflxw))
