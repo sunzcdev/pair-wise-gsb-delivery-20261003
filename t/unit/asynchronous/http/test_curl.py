@@ -1,0 +1,241 @@
+from __future__ import annotations
+
+from io import BytesIO
+from unittest.mock import ANY, Mock, call, patch
+
+import pytest
+
+import t.skip
+from kombu.asynchronous.http import get_client
+from kombu.asynchronous.http.curl import READ, WRITE, CurlClient
+
+pytest.importorskip('pycurl')
+
+
+@t.skip.if_pypy
+@pytest.mark.usefixtures('hub')
+class test_CurlClient:
+
+    class Client(CurlClient):
+        Curl = Mock(name='Curl')
+
+    def test_when_pycurl_missing(self, patching):
+        patching('kombu.asynchronous.http.curl.pycurl', None)
+        with pytest.raises(ImportError):
+            self.Client()
+
+    def test_max_clients_set(self):
+        x = self.Client(max_clients=303)
+        assert x.max_clients == 303
+
+    def test_init(self):
+        with patch('kombu.asynchronous.http.curl.pycurl') as _pycurl:
+            x = self.Client()
+            assert x._multi is not None
+            assert x._pending is not None
+            assert x._free_list is not None
+            assert x._fds is not None
+            assert x._socket_action == x._multi.socket_action
+            assert len(x._curls) == x.max_clients
+            assert x._timeout_check_tref
+
+            x._multi.setopt.assert_has_calls([
+                call(_pycurl.M_TIMERFUNCTION, x._set_timeout),
+                call(_pycurl.M_SOCKETFUNCTION, x._handle_socket),
+            ])
+
+    def test_close(self):
+        with patch('kombu.asynchronous.http.curl.pycurl'):
+            x = self.Client()
+            x._timeout_check_tref = Mock(name='timeout_check_tref')
+            x.close()
+            x._timeout_check_tref.cancel.assert_called_with()
+            for _curl in x._curls:
+                _curl.close.assert_called_with()
+            x._multi.close.assert_called_with()
+
+    def test_registers_close_with_hub_on_close(self, hub):
+        # A pending request left on the client when the hub closes (e.g.
+        # during worker shutdown) otherwise keeps running in the
+        # background and can deliver its result after the rest of the
+        # consumer has already torn down.
+        with patch('kombu.asynchronous.http.curl.pycurl'):
+            x = self.Client(hub)
+            assert x._on_hub_close in hub.on_close
+
+    def test_hub_close_closes_client(self, hub):
+        with patch('kombu.asynchronous.http.curl.pycurl'):
+            x = self.Client(hub)
+            x._timeout_check_tref = Mock(name='timeout_check_tref')
+            hub.close()
+            x._timeout_check_tref.cancel.assert_called_with()
+            for _curl in x._curls:
+                _curl.close.assert_called_with()
+            x._multi.close.assert_called_with()
+
+    def test_hub_reset_does_not_reuse_closed_client(self, hub):
+        # Celery calls hub.reset() after a recoverable error and then
+        # reconnects on the same hub, so get_client() must not hand back
+        # the client that reset() just closed.
+        with patch('kombu.asynchronous.http.curl.pycurl'):
+            x = get_client(hub)
+            x._timeout_check_tref = Mock(name='timeout_check_tref')
+            hub.reset()
+            # The old client's in-flight requests belong to the channels
+            # being torn down, so reset() must close it too.
+            x._multi.close.assert_called_once_with()
+            assert x._on_hub_close not in hub.on_close
+            y = get_client(hub)
+            assert y is not x
+            assert y._on_hub_close in hub.on_close
+
+    def test_closed_client_drops_new_requests(self, hub):
+        # Hub.close() runs on_close before the callbacks still queued on the
+        # hub, so a queued poll can reach the client after it was closed.
+        with patch('kombu.asynchronous.http.curl.pycurl'):
+            x = self.Client(hub)
+            x._timeout_check_tref = Mock(name='timeout_check_tref')
+            x._process_queue = Mock(name='_process_queue')
+            hub.close()
+            request = Mock(name='request')
+            assert x.add_request(request) is request
+            assert request not in x._pending
+            x._process_queue.assert_not_called()
+
+    def test_close_is_idempotent(self, hub):
+        with patch('kombu.asynchronous.http.curl.pycurl'):
+            x = self.Client(hub)
+            x._timeout_check_tref = Mock(name='timeout_check_tref')
+            x.close()
+            x.close()
+            x._multi.close.assert_called_once_with()
+
+    def test_owner_close_removes_client_from_hub(self, hub):
+        # BaseClient is a context manager, so its owner can close the
+        # cached client without the hub closing.
+        with patch('kombu.asynchronous.http.curl.pycurl'):
+            with get_client(hub) as x:
+                x._timeout_check_tref = Mock(name='timeout_check_tref')
+            assert x._on_hub_close not in hub.on_close
+            assert get_client(hub) is not x
+
+    def test_closed_clients_are_not_kept_by_hub(self, hub):
+        with patch('kombu.asynchronous.http.curl.pycurl'):
+            before = len(hub.on_close)
+            for _ in range(50):
+                x = self.Client(hub)
+                x._timeout_check_tref = Mock(name='timeout_check_tref')
+                x.close()
+            assert len(hub.on_close) == before
+
+    def test_dropped_request_is_logged(self, hub, caplog):
+        with patch('kombu.asynchronous.http.curl.pycurl'):
+            x = self.Client(hub)
+            x._timeout_check_tref = Mock(name='timeout_check_tref')
+            x.close()
+            with caplog.at_level('DEBUG', logger='kombu.asynchronous.http.curl'):
+                x.add_request(Mock(name='request'))
+            assert 'closed' in caplog.text
+
+    def test_add_request(self):
+        with patch('kombu.asynchronous.http.curl.pycurl'):
+            x = self.Client()
+            x._process_queue = Mock(name='_process_queue')
+            x._set_timeout = Mock(name='_set_timeout')
+            request = Mock(name='request')
+            x.add_request(request)
+            assert request in x._pending
+            x._process_queue.assert_called_with()
+            x._set_timeout.assert_called_with(0)
+
+    def test_handle_socket(self):
+        with patch('kombu.asynchronous.http.curl.pycurl') as _pycurl:
+            x = self.Client()
+            fd = Mock(name='fd1')
+
+            # POLL_REMOVE
+            x._fds[fd] = fd
+            x._handle_socket(_pycurl.POLL_REMOVE, fd, x._multi, None, _pycurl)
+            assert fd not in x._fds
+            x._handle_socket(_pycurl.POLL_REMOVE, fd, x._multi, None, _pycurl)
+
+            # POLL_IN
+            fds = [fd, Mock(name='fd2'), Mock(name='fd3')]
+            x._fds = {f: f for f in fds}
+            x._handle_socket(_pycurl.POLL_IN, fd, x._multi, None, _pycurl)
+            assert x._fds[fd] == READ
+
+            # POLL_OUT
+            x._handle_socket(_pycurl.POLL_OUT, fd, x._multi, None, _pycurl)
+            assert x._fds[fd] == WRITE
+
+            # POLL_INOUT
+            x._handle_socket(_pycurl.POLL_INOUT, fd, x._multi, None, _pycurl)
+            assert x._fds[fd] == READ | WRITE
+
+            # UNKNOWN EVENT
+            x._handle_socket(0xff3f, fd, x._multi, None, _pycurl)
+
+            # FD NOT IN FDS
+            x._fds.clear()
+            x._handle_socket(0xff3f, fd, x._multi, None, _pycurl)
+
+    def test_set_timeout(self):
+        hub = Mock(name='hub')
+        x = self.Client(hub)
+        x._set_timeout(100)
+        hub.call_later.assert_called_with(100, x._timeout_check)
+
+    def test_timeout_check(self):
+        with patch('kombu.asynchronous.http.curl.pycurl') as _pycurl:
+            hub = Mock(name='hub')
+            x = self.Client(hub)
+            fd1, fd2 = Mock(name='fd1'), Mock(name='fd2')
+            x._fds = {fd1: READ}
+            x._process_pending_requests = Mock(name='process_pending')
+
+            def _side_effect():
+                x._fds = {fd2: WRITE}
+                return 333, 1
+
+            x._multi.socket_all.side_effect = _side_effect
+            _pycurl.error = KeyError
+
+            x._timeout_check(_pycurl=_pycurl)
+            hub.remove.assert_called_with(fd1)
+            hub.add_writer.assert_called_with(fd2, x.on_writable, fd2)
+
+            x._multi.socket_all.return_value = None
+            x._multi.socket_all.side_effect = _pycurl.error(333)
+            x._timeout_check(_pycurl=_pycurl)
+
+    def test_on_readable_on_writeable(self):
+        with patch('kombu.asynchronous.http.curl.pycurl') as _pycurl:
+            x = self.Client()
+            x._on_event = Mock(name='on_event')
+            fd = Mock(name='fd')
+            x.on_readable(fd, _pycurl=_pycurl)
+            x._on_event.assert_called_with(fd, _pycurl.CSELECT_IN)
+            x.on_writable(fd, _pycurl=_pycurl)
+            x._on_event.assert_called_with(fd, _pycurl.CSELECT_OUT)
+
+    def test_setup_request_sets_proxy_when_specified(self):
+        with patch('kombu.asynchronous.http.curl.pycurl') as _pycurl:
+            x = self.Client()
+            proxy_host = 'http://www.example.com'
+            request = Mock(
+                name='request', headers={}, auth_mode=None, proxy_host=None
+            )
+            proxied_request = Mock(
+                name='request', headers={}, auth_mode=None,
+                proxy_host=proxy_host, proxy_port=123
+            )
+            x._setup_request(
+                x.Curl, request, BytesIO(), x.Headers(), _pycurl=_pycurl
+            )
+            with pytest.raises(AssertionError):
+                x.Curl.setopt.assert_any_call(_pycurl.PROXY, ANY)
+            x._setup_request(
+                x.Curl, proxied_request, BytesIO(), x.Headers(), _pycurl
+            )
+            x.Curl.setopt.assert_any_call(_pycurl.PROXY, proxy_host)
