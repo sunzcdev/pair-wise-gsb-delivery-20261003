@@ -2,6 +2,7 @@ require 'thread'
 require 'concurrent/atomic/event'
 require 'concurrent/concern/logging'
 require 'concurrent/executor/ruby_executor_service'
+require 'concurrent/executor/submission_receipt'
 require 'concurrent/utility/monotonic_time'
 require 'concurrent/collection/timeout_queue'
 
@@ -140,7 +141,109 @@ module Concurrent
       deprecated "#prune_pool has no effect and will be removed in next the release, see https://github.com/ruby-concurrency/concurrent-ruby/pull/1082."
     end
 
+    # Submit a task and return a {Concurrent::SubmissionReceipt} describing
+    # the actual admission (`:queued`, `:caller_runs` or `:rejected`) and the
+    # terminal state of the execution.
+    #
+    # The admission decision is made under the pool lock, exactly where
+    # {#post} makes it, so a concurrent {#shutdown} observes the same boundary.
+    # The user block is never executed while the pool lock is held, therefore
+    # a `:caller_runs` task is free to submit again to the same pool.
+    #
+    # Accounting for one execution of a task submitted with this method:
+    #
+    # * `:queued` - counted once in `scheduled_task_count` on admission and
+    #   once in `completed_task_count` when the worker finishes successfully;
+    # * `:caller_runs` - never entered the work queue, so neither counter
+    #   changes; the execution is reported only by the receipt;
+    # * `:rejected` - neither counter changes.
+    #
+    # An execution therefore never contributes more than one increment to no
+    # more than one counter, also when a fallback task submits to the same pool
+    # again. This matches the accounting of {#post} exactly.
+    #
+    # @param [Array] args zero or more arguments to be passed to the task
+    #
+    # @yield the asynchronous task to perform
+    #
+    # @return [Concurrent::SubmissionReceipt]
+    #
+    # @raise [ArgumentError] if no block is given
+    #
+    # @!macro executor_service_method_post_with_receipt
+    def post_with_receipt(*args, &task)
+      raise ArgumentError.new('no block given') unless block_given?
+      receipt = SubmissionReceipt.new
+
+      # Wraps the user block so the terminal state is recorded on whichever
+      # thread actually runs it.
+      wrapped = ->(*task_args) do
+        begin
+          value = task.call(*task_args)
+        rescue Exception => ex
+          receipt.fail!(ex)
+          raise
+        end
+        receipt.complete!(value)
+        value
+      end
+
+      admission, deferred_action = synchronize { ns_admit(*args, &wrapped) }
+
+      case admission
+      when :queued
+        receipt.mark_queued!
+      when :caller_runs
+        receipt.mark_caller_runs!
+        # Runs without the pool lock: the user block may submit here again.
+        # Falls back through exactly the same action as #post, so a
+        # StandardError is logged here while the receipt records the failure;
+        # a non-StandardError keeps propagating to the caller, like in #post.
+        deferred_action.call
+      else
+        # :abort raises RejectedExecutionError, :discard returns false; either
+        # way the task never ran and the reason belongs to the receipt.
+        begin
+          deferred_action.call
+        rescue Exception => ex
+          receipt.mark_rejected!(ex)
+          # a genuine rejection is reported only through the receipt; anything
+          # else (an unknown policy) is a programming error and still surfaces
+          raise unless ex.is_a?(RejectedExecutionError)
+        else
+          receipt.mark_rejected!(nil)
+        end
+      end
+
+      receipt
+    end
+
     private
+
+    # Decides how a submission is admitted. Must be called while holding the
+    # pool lock; the returned action (when any) has to be invoked after the
+    # lock has been released.
+    #
+    # @return [Array(Symbol, Proc, nil)] the admission and the deferred action
+    #
+    # @!visibility private
+    def ns_admit(*args, &task)
+      ns_reset_if_forked
+
+      if running? && (ns_assign_worker(*args, &task) || ns_enqueue(*args, &task))
+        @scheduled_task_count += 1
+        [:queued, nil]
+      else
+        # Reuses the very same fallback action as #post; building it does not
+        # run the user block, and the caller invokes it outside the pool lock.
+        if fallback_policy == :caller_runs
+          [:caller_runs, fallback_action(*args, &task)]
+        else
+          # :rejected is recorded once the fallback action reported its reason
+          [:rejected, fallback_action(*args, &task)]
+        end
+      end
+    end
 
     # @!visibility private
     def ns_initialize(opts)
@@ -176,14 +279,8 @@ module Concurrent
 
     # @!visibility private
     def ns_execute(*args, &task)
-      ns_reset_if_forked
-
-      if ns_assign_worker(*args, &task) || ns_enqueue(*args, &task)
-        @scheduled_task_count += 1
-        nil
-      else
-        fallback_action(*args, &task)
-      end
+      _, deferred_action = ns_admit(*args, &task)
+      deferred_action
     end
 
     # @!visibility private

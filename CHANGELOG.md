@@ -1,5 +1,12 @@
 ## Current
 
+* Add `ExecutorService#post_with_receipt`, returning a `SubmissionReceipt` which
+  distinguishes a task accepted onto the pool (`:queued`), a task executed on
+  the submitting thread by the `caller_runs` fallback (`:caller_runs`) and a
+  rejected task (`:rejected`). The receipt also reports the terminal state
+  (`:completed`, `:failed` or `:rejected`) together with the task value or the
+  raised exception. The return value contract of `#post` is unchanged.
+
 ## Release v1.3.8 (19 July 2026)
 
 concurrent-ruby:

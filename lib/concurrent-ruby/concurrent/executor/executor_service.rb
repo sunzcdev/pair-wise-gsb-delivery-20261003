@@ -1,4 +1,6 @@
+require 'concurrent/errors'
 require 'concurrent/concern/logging'
+require 'concurrent/executor/submission_receipt'
 
 module Concurrent
 
@@ -25,6 +27,34 @@ module Concurrent
   #
   #   @return [self] returns itself
 
+  # @!macro executor_service_method_post_with_receipt
+  #
+  #   Submit a task to the executor for asynchronous processing and return a
+  #   {Concurrent::SubmissionReceipt} describing how the task was actually
+  #   admitted and how it finished.
+  #
+  #   The receipt distinguishes the three possible admissions:
+  #
+  #   * `:queued` - the pool accepted the task (an idle worker took it or it
+  #     was put on the work queue) and a pool thread will execute it;
+  #   * `:caller_runs` - the pool could not accept the task and the
+  #     `:caller_runs` fallback policy executed it on the submitting thread;
+  #   * `:rejected` - the task was not accepted and will never run.
+  #
+  #   Unlike {#post}, this method does not raise {Concurrent::RejectedExecutionError}
+  #   for the `:abort` policy; the rejection, together with the reason, is
+  #   reported through the receipt instead. The return value contract of
+  #   {#post} is unchanged.
+  #
+  #   @param [Array] args zero or more arguments to be passed to the task
+  #
+  #   @yield the asynchronous task to perform
+  #
+  #   @return [Concurrent::SubmissionReceipt] the receipt describing the
+  #     admission and the terminal state of the task
+  #
+  #   @raise [ArgumentError] if no task is given
+
   # @!macro executor_service_method_can_overflow_question
   #
   #   Does the task queue have a maximum size?
@@ -48,6 +78,9 @@ module Concurrent
   #
   #   @!method <<(task)
   #     @!macro executor_service_method_left_shift
+  #
+  #   @!method post_with_receipt(*args, &task)
+  #     @!macro executor_service_method_post_with_receipt
   #
   #   @!method can_overflow?
   #     @!macro executor_service_method_can_overflow_question
@@ -166,6 +199,45 @@ module Concurrent
     def <<(task)
       post(&task)
       self
+    end
+
+    # @!macro executor_service_method_post_with_receipt
+    #
+    # @note This default implementation wraps the task so that it can observe
+    #   the terminal state, then delegates to {#post}. Tasks executed by the
+    #   submitting thread are reported as `:caller_runs`, all others as
+    #   `:queued`. Executors which own a work queue override it to report the
+    #   admission exactly.
+    def post_with_receipt(*args, &task)
+      raise ArgumentError.new('no block given') unless block_given?
+      submitter = Thread.current
+      receipt   = SubmissionReceipt.new
+      accepted  = begin
+        post(*args) do |*task_args|
+          receipt.mark_caller_runs! if Thread.current.equal?(submitter)
+          begin
+            value = task.call(*task_args)
+          rescue Exception => ex
+            # the failure belongs to the receipt, it must not escape the
+            # executor and get reported a second time
+            receipt.fail!(ex)
+            nil
+          else
+            receipt.complete!(value)
+            value
+          end
+        end
+      rescue RejectedExecutionError => ex
+        receipt.mark_rejected!(ex)
+        return receipt
+      end
+
+      if accepted
+        receipt.mark_queued!
+      else
+        receipt.mark_rejected!(nil)
+      end
+      receipt
     end
 
     # @!macro executor_service_method_can_overflow_question

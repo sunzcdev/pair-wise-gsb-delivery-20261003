@@ -92,6 +92,53 @@ pool = Concurrent::ThreadPoolExecutor.new(
 )
 ~~~
 
+## Submission receipts
+
+`#post` only tells you whether the task was taken in. When the admission path
+matters, use `#post_with_receipt`. It returns a
+{Concurrent::SubmissionReceipt} which reports both how the task was actually
+admitted and how it finished:
+
+~~~ruby
+pool = Concurrent::ThreadPoolExecutor.new(
+   min_threads: 1,
+   max_threads: 1,
+   max_queue: 1,
+   fallback_policy: :caller_runs
+)
+
+receipt = pool.post_with_receipt { do_some_work }
+
+receipt.admission #=> :queued, :caller_runs or :rejected
+receipt.wait(5)   #=> true when the execution reached a terminal state
+receipt.status    #=> :completed, :failed or :rejected
+receipt.value     #=> the block's return value, when it completed
+receipt.error     #=> the exception, when it failed
+~~~
+
+The three admissions are:
+
+* `:queued` - the pool accepted the task (an idle worker took it or it went on
+  the work queue) and a pool thread executes it;
+* `:caller_runs` - the pool could not accept the task and the `:caller_runs`
+  fallback policy executed it on the submitting thread, before
+  `#post_with_receipt` returned;
+* `:rejected` - the task was not accepted and will never run. The receipt also
+  carries the reason: a `Concurrent::RejectedExecutionError` for `:abort`, and
+  `nil` for `:discard`.
+
+Admission is still decided under the pool lock at exactly the same point as
+`#post`, so a concurrent `#shutdown` observes the same boundary. The user block
+is never executed while the pool lock is held, which means a `:caller_runs`
+task may submit to the same pool again. A `:caller_runs` execution never
+enters the work queue, so it is not counted in `scheduled_task_count`; only
+`:queued` executions are, and each of them is counted once as scheduled and
+once as completed. The return value contract of `#post` is unchanged.
+
+Executors which do not own a work queue provide a default implementation: a
+task which runs on the submitting thread is reported as `:caller_runs`, any
+other accepted task as `:queued`.
+
 ThreadPoolExecutors with `min_threads` and `max_threads` set to different values will ordinarily reclaim idle threads.  You can supply an `idletime` argument, number of seconds that a thread may be idle before being reclaimed. The default is 60 seconds.
 
 `concurrent-ruby` thread pools are based on designs from `java.util.concurrent` --  a well-designed, stable, scalable, and battle-tested concurrency library. The `ThreadPoolExecutor` is based on Java [java.util.concurrent.ThreadPoolExecutor](https://docs.oracle.com/javase/7/docs/api/java/util/concurrent/ThreadPoolExecutor.html), and is in fact implemented with a Java ThreadPoolExecutor when running under JRuby. For more information on the design and concepts, you may find the Java documentation helpful:
