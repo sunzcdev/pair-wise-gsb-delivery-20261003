@@ -1,0 +1,309 @@
+.. _transactions:
+
+Transactions
+============
+
+A *transaction* groups one or more SQL statements into a single unit of work.
+Either all of the statements succeed and are committed to the database, or none
+of them are - the database rolls back to the state it was in before the
+transaction began.
+
+Peewee operates in *autocommit mode*: every statement that runs outside an
+explicit transaction runs in its own implicit transaction.
+
+db.atomic
+---------
+
+:meth:`Database.atomic` is the recommended transaction API. :meth:`~Database.atomic`
+can be used as a context manager or a decorator, and it handles nesting
+automatically.
+
+If an unhandled exception occurs in a wrapped block, the current block will be
+rolled back. Otherwise the statements will be committed at the end of the block.
+
+As a context manager:
+
+.. code-block:: python
+
+   with db.atomic() as txn:
+       user = User.create(username='charlie')
+       tweet = Tweet.create(user=user, content='Hello')
+
+   # Both rows are committed when block exits normally.
+
+As a decorator:
+
+.. code-block:: python
+
+   @db.atomic()
+   def create_user_with_tweet(username, content):
+       user = User.create(username=username)
+       Tweet.create(user=user, content=content)
+       return user
+
+If an unhandled exception propagates out of the block, the transaction (or
+savepoint - see below) is rolled back and the exception continues to propagate:
+
+.. code-block:: python
+
+   with db.atomic() as txn:
+       User.create(username='huey')
+       # User has been INSERTed into the database but the transaction is not
+       # yet committed because we haven't left the scope of the "with" block.
+
+       raise ValueError('something went wrong')
+
+   # User('huey') was NOT committed, the transaction rolled-back.
+   # The ValueError is raised here.
+
+Manual Commit / Rollback
+------------------------
+
+You can commit or roll-back explicitly inside an :meth:`~Database.atomic`
+block. After calling ``commit()`` or ``rollback()`` a new transaction (or
+savepoint) begins automatically:
+
+.. code-block:: python
+
+   with db.atomic() as txn:
+       try:
+           save_objects()
+       except SaveError:
+           txn.rollback()  # Roll back, new transaction starts automatically.
+           log_error()
+
+       finalize()  # Runs in a new transaction.
+
+   # finalize()'s changes are committed here.
+
+Nesting Transactions
+--------------------
+
+The outermost :meth:`~Database.atomic` block creates a transaction. Any nested
+``atomic()`` blocks create *savepoints* instead. A savepoint is a named point
+within a transaction to which you can roll back without affecting the rest of
+the transaction.
+
+.. code-block:: python
+
+   with db.atomic():                        # Transaction begins.
+       User.create(username='charlie')
+
+       with db.atomic() as sp:              # Savepoint begins.
+           User.create(username='huey')
+           sp.rollback()                    # Rolls back huey only.
+           User.create(username='alice')    # New savepoint begins here.
+
+       User.create(username='mickey')
+   # Committed: charlie, alice, mickey. huey was rolled back.
+
+Savepoints can be nested arbitrarily deep:
+
+.. code-block:: python
+
+   with db.atomic():
+       with db.atomic():
+           with db.atomic() as inner:
+               do_something_risky()
+               inner.rollback()   # Only the innermost work is lost.
+           do_something_safe()
+
+Explicit Transaction
+--------------------
+
+:meth:`Database.transaction` opens an explicit transaction that does not
+nest. If an exception occurs in a wrapped block, the transaction will be rolled
+back. Otherwise the statements will be committed at the end of the wrapped block.
+
+.. code-block:: python
+
+   with db.transaction() as txn:
+       User.create(username='mickey')
+       txn.commit()         # Commit now. A new transaction begins.
+       User.create(username='huey')
+       txn.rollback()       # Roll back huey. A new transaction begins.
+       User.create(username='zaizee')
+   # zaizee is committed when the block exits.
+
+If you attempt to nest transactions with peewee using the
+:meth:`~Database.transaction` context manager, only the outer-most
+transaction will be used. As this may lead to unpredictable behavior, it is
+recommended that you use :meth:`~Database.atomic`.
+
+Explicit Savepoints
+-------------------
+
+:meth:`Database.savepoint` creates a savepoint within an active transaction.
+Savepoints must occur within a transaction, but can be nested arbitrarily deep.
+
+.. code-block:: python
+
+   with db.transaction() as txn:
+       with db.savepoint() as sp:
+           User.create(username='mickey')
+
+       with db.savepoint() as sp2:
+           User.create(username='zaizee')
+           sp2.rollback()  # "zaizee" is not saved.
+           User.create(username='huey')
+
+   # mickey and huey were created.
+
+If you manually commit or roll back a savepoint, a new savepoint will
+automatically begin.
+
+Running Code After Commit
+-------------------------
+
+:meth:`Database.after_commit` registers a callable to run after the current
+transaction commits. If the transaction rolls back the callable is discarded.
+If no transaction is active, the callable runs immediately. One use is
+enqueueing work keyed on a new row's id.
+
+.. code-block:: python
+
+   with db.atomic():
+       order = Order.create(...)
+       db.after_commit(lambda: process_order(order.id))
+
+Callbacks run in registration order after the outermost block commits. A
+savepoint that rolls back discards the callbacks registered since it began. An
+exception from a callback propagates, and later callbacks do not run. Not
+available in manual-commit mode, where peewee does not control the commit.
+
+With ``playhouse.pwasyncio`` callbacks run on the greenlet runner and may
+issue queries. A coroutine function is rejected, since it would never be
+awaited. To schedule one instead:
+
+.. code-block:: python
+
+   db.after_commit(lambda: asyncio.get_running_loop().create_task(coro()))
+
+Autocommit Mode
+---------------
+
+Peewee requires the underlying driver to run in autocommit mode and manages
+transaction boundaries itself. This differs from the DB-API 2.0 default, which
+starts a transaction implicitly and requires you to commit manually.
+
+In rare cases where you need to take direct control of ``BEGIN``/``COMMIT``/
+``ROLLBACK`` - bypassing Peewee's transaction management entirely - use
+:meth:`~Database.manual_commit`:
+
+.. code-block:: python
+
+   with db.manual_commit():
+       db.begin()  # Begin transaction explicitly.
+       try:
+           user.delete_instance(recursive=True)
+       except:
+           db.rollback()  # Rollback! An error occurred.
+           raise
+       else:
+           try:
+               db.commit()  # Commit changes.
+           except:
+               db.rollback()
+               raise
+
+``manual_commit`` suspends Peewee's transaction management for the duration
+of the block. Inside it, ``atomic()`` raises ``ValueError`` (``with db:``
+likewise), and ``transaction()`` is inert, issuing no begin, commit, or
+rollback. ``savepoint()`` works normally inside a transaction opened with
+``begin()``.
+
+.. _sqlite-locking:
+
+SQLite Transaction Locking Modes
+----------------------------------
+
+SQLite supports three locking modes for transactions. Use these when precise
+control over read-write locking is required:
+
+.. code-block:: python
+
+   with db.atomic('EXCLUSIVE'):
+       do_something()
+
+   @db.atomic('IMMEDIATE')
+   def load_data():
+       insert_records()
+
+The three modes:
+
+* ``DEFERRED`` (default) acquires the minimum necessary lock as reads and
+  writes occur: a shared lock on the first read, a reserved lock on the first
+  write. Another writer can intervene between BEGIN and your first write.
+* ``IMMEDIATE`` acquires a reserved lock at BEGIN. Other writers and other
+  IMMEDIATE or EXCLUSIVE transactions are blocked, but readers can proceed.
+* ``EXCLUSIVE`` acquires an exclusive lock at BEGIN. No other connection can
+  read or write until the transaction completes, except in WAL mode, where
+  EXCLUSIVE behaves like IMMEDIATE.
+
+DEFERRED is a common source of trouble for concurrent writers, because a block
+that reads before it writes upgrades its lock late, and the resulting
+``SQLITE_BUSY_SNAPSHOT`` does not consult the busy-timeout. The transaction
+fails immediately and retrying cannot help, since the snapshot is already
+stale. Pass ``lock_type`` to the database to make every transaction IMMEDIATE:
+
+.. code-block:: python
+
+   db = SqliteDatabase('app.db', lock_type='IMMEDIATE')
+
+An explicit ``atomic(lock_type=...)`` still takes precedence. IMMEDIATE blocks
+other writers for the whole block, so a long read-only ``atomic()`` costs more
+than it does under DEFERRED.
+
+.. seealso::
+   `SQLite locking documentation
+   <https://sqlite.org/lockingv3.html>`_.
+
+.. _postgres-isolation:
+
+Postgresql Isolation Notes
+--------------------------
+
+Postgresql supports configurable isolation levels per-transaction, from least
+to most strict:
+
+* READ UNCOMMITTED
+* READ COMMITTED (default in most deployments)
+* REPEATABLE READ
+* SERIALIZABLE
+
+See the `Postgresql transaction isolation docs <https://www.postgresql.org/docs/current/transaction-iso.html>`__
+for discussion.
+
+The default isolation level is specified when initializing :class:`PostgresqlDatabase`:
+
+.. code-block:: python
+
+   db = PostgresqlDatabase(
+       'my_app',
+       user='postgres',
+       host='10.8.0.1',
+       port=5432,
+       isolation_level='SERIALIZABLE')
+
+   # Or use the constants provided by the driver.
+
+   from psycopg2.extensions import ISOLATION_LEVEL_SERIALIZABLE
+   db = PostgresqlDatabase(
+       ...,
+       isolation_level=ISOLATION_LEVEL_SERIALIZABLE)
+
+
+   from psycopg import IsolationLevel
+   db = PostgresqlDatabase(
+       ...,
+       isolation_level=IsolationLevel.SERIALIZABLE)
+
+To control the isolation-level for a transaction, you can pass the desired
+setting to the outer-most ``atomic()`` block:
+
+.. code-block:: python
+
+   with db.atomic('SERIALIZABLE') as txn:
+       ...
+
+Isolation level cannot be specified for nested ``atomic()`` blocks.

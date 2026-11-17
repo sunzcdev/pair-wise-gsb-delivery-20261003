@@ -1,0 +1,917 @@
+"""
+Transaction semantics, savepoints, session management, and isolation level
+tests.
+
+Most test cases use the Register model (a single IntegerField) from
+base_models, via BaseTransactionTestCase.
+"""
+import threading
+
+from peewee import *
+
+from .base import DatabaseTestCase
+from .base import IS_CRDB
+from .base import IS_CRDB_NESTED_TX
+from .base import IS_MYSQL
+from .base import IS_POSTGRESQL
+from .base import IS_SQLITE
+from .base import ModelTestCase
+from .base import TestModel
+from .base import db
+from .base import db_loader
+from .base import new_connection
+from .base import requires_postgresql
+from .base import skip_if
+from .base import skip_unless
+from .base_models import Register
+
+
+class BaseTransactionTestCase(ModelTestCase):
+    requires = [Register]
+
+    def assertRegister(self, vals):
+        query = Register.select().order_by(Register.value)
+        self.assertEqual([register.value for register in query], vals)
+
+    def _save(self, *vals):
+        Register.insert([{Register.value: val} for val in vals]).execute()
+
+
+def requires_nested(fn):
+    return skip_if(IS_CRDB and not IS_CRDB_NESTED_TX,
+                   'nested transaction support is required')(fn)
+
+
+# ===========================================================================
+# Transaction commit/rollback, nesting, and savepoints
+# ===========================================================================
+
+class TestTransaction(BaseTransactionTestCase):
+    def test_simple(self):
+        self.assertFalse(db.in_transaction())
+        with db.atomic():
+            self.assertTrue(db.in_transaction())
+            self._save(1)
+
+        self.assertFalse(db.in_transaction())
+        self.assertRegister([1])
+
+        # Explicit rollback, implicit commit.
+        with db.atomic() as txn:
+            self._save(2)
+            txn.rollback()
+            self.assertTrue(db.in_transaction())
+            self._save(3)
+
+        self.assertFalse(db.in_transaction())
+        self.assertRegister([1, 3])
+
+        # Explicit rollbacks.
+        with db.atomic() as txn:
+            self._save(4)
+            txn.rollback()
+            self._save(5)
+            txn.rollback()
+
+        self.assertRegister([1, 3])
+
+        # Explicit commit, implicit rollback.
+        try:
+            with db.atomic() as txn:
+                self._save(6)
+                txn.commit()
+                self.assertTrue(db.in_transaction())  # New txn begun.
+                self._save(7)
+                raise ValueError('oops')
+        except ValueError:
+            pass
+
+        self.assertRegister([1, 3, 6])
+        self.assertFalse(db.in_transaction())
+
+    @requires_nested
+    def test_simple_nested(self):
+        self.assertFalse(db.in_transaction())
+        with db.atomic():
+            with db.atomic():
+                self._save(1)
+                self.assertTrue(db.in_transaction())
+            self.assertTrue(db.in_transaction())
+
+        self.assertFalse(db.in_transaction())
+        self.assertRegister([1])
+
+        # Explicit rollback, implicit commit.
+        with db.atomic() as txn:
+            with db.atomic() as sp:
+                self._save(2)
+                sp.rollback()
+                self.assertTrue(db.in_transaction())
+                self._save(3)
+
+        self.assertFalse(db.in_transaction())
+        self.assertRegister([1, 3])
+
+        # Explicit rollbacks.
+        with db.atomic() as txn:
+            with db.atomic() as sp:
+                self._save(4)
+                sp.rollback()
+                self._save(5)
+                sp.rollback()
+
+        self.assertRegister([1, 3])
+
+        # Explicit commit, implicit rollback.
+        with db.atomic() as txn:
+            try:
+                with db.atomic() as sp:
+                    self._save(6)
+                    sp.commit()
+                    self.assertTrue(db.in_transaction())  # New txn begun.
+                    self._save(7)
+                    raise ValueError('oops')
+            except ValueError:
+                pass
+
+        self.assertRegister([1, 3, 6])
+        self.assertFalse(db.in_transaction())
+
+    @requires_nested
+    def test_transactions(self):
+        self.assertFalse(db.in_transaction())
+
+        with db.atomic():
+            self.assertTrue(db.in_transaction())
+            self._save(1)
+
+        self.assertRegister([1])
+
+        with db.atomic() as txn:
+            self._save(2)
+            txn.rollback()
+            self._save(3)
+            with db.atomic() as sp1:
+                self._save(4)
+                with db.atomic() as sp2:
+                    self._save(5)
+                    sp2.rollback()
+                with db.atomic() as sp3:
+                    self._save(6)
+                    with db.atomic() as sp4:
+                        self._save(7)
+                        with db.atomic() as sp5:
+                            self._save(8)
+                        self.assertRegister([1, 3, 4, 6, 7, 8])
+                        sp4.rollback()
+
+                    self.assertRegister([1, 3, 4, 6])
+
+        self.assertRegister([1, 3, 4, 6])
+
+    def test_commit_rollback(self):
+        with db.atomic() as txn:
+            self._save(1)
+            txn.commit()
+            self._save(2)
+            txn.rollback()
+
+        self.assertRegister([1])
+
+        with db.atomic() as txn:
+            self._save(3)
+            txn.rollback()
+            self._save(4)
+
+        self.assertRegister([1, 4])
+
+    @requires_nested
+    def test_commit_rollback_nested(self):
+        with db.atomic() as txn:
+            self.test_commit_rollback()
+            self.assertRegister([1, 4])
+            txn.rollback()
+        self.assertRegister([])
+
+        with db.atomic():
+            self.test_commit_rollback()
+        self.assertRegister([1, 4])
+
+    def test_nesting_transaction_obj(self):
+        self.assertRegister([])
+
+        with db.transaction() as txn:
+            self._save(1)
+            with db.transaction() as txn2:
+                self._save(2)
+                txn2.rollback()  # Actually issues a rollback.
+                self.assertRegister([])
+            self._save(3)
+        self.assertRegister([3])
+
+        with db.transaction() as txn:
+            self._save(4)
+            with db.transaction() as txn2:
+                with db.transaction() as txn3:
+                    self._save(5)
+                    txn3.commit()  # Actually commits.
+            self._save(6)
+            txn2.rollback()
+
+        self.assertRegister([3, 4, 5])
+
+        with db.transaction() as txn:
+            self._save(6)
+            try:
+                with db.transaction() as txn2:
+                    self._save(7)
+                    raise ValueError()
+            except ValueError:
+                pass
+
+        self.assertRegister([3, 4, 5, 6, 7])
+
+    @requires_nested
+    def test_savepoint_commit(self):
+        with db.atomic() as txn:
+            self._save(1)
+            txn.rollback()
+
+            self._save(2)
+            txn.commit()
+
+            with db.atomic() as sp:
+                self._save(3)
+                sp.rollback()
+
+                self._save(4)
+                sp.commit()
+
+        self.assertRegister([2, 4])
+
+    def test_atomic_decorator(self):
+        @db.atomic()
+        def save(i):
+            self._save(i)
+
+        save(1)
+        self.assertRegister([1])
+
+    def test_atomic_exception(self):
+        def will_fail():
+            with db.atomic():
+                self._save(1)
+                self._save(None)
+
+        self.assertRaises(IntegrityError, will_fail)
+        self.assertRegister([])
+
+        def user_error():
+            with db.atomic():
+                self._save(2)
+                raise ValueError
+
+        self.assertRaises(ValueError, user_error)
+        self.assertRegister([])
+
+    def test_manual_commit(self):
+        with db.manual_commit():
+            db.begin()
+            self._save(1)
+            db.rollback()
+
+            db.begin()
+            self._save(2)
+            db.commit()
+
+            with db.manual_commit():
+                db.begin()
+                self._save(3)
+                db.rollback()
+
+            db.begin()
+            self._save(4)
+            db.commit()
+
+        self.assertRegister([2, 4])
+
+    def test_manual_commit_as_decorator(self):
+        @db.manual_commit()
+        def do_work():
+            db.begin()
+            self._save(100)
+            db.rollback()
+            db.begin()
+            self._save(200)
+            db.commit()
+
+        do_work()
+        self.assertRegister([200])
+
+    def test_mixing_manual_atomic(self):
+        @db.manual_commit()
+        def will_fail():
+            pass
+
+        @db.atomic()
+        def also_fails():
+            pass
+
+        with db.atomic():
+            self.assertRaises(ValueError, will_fail)
+
+        with db.manual_commit():
+            self.assertRaises(ValueError, also_fails)
+
+        with db.manual_commit():
+            with self.assertRaises(ValueError):
+                with db.atomic(): pass
+        with db.atomic():
+            with self.assertRaises(ValueError):
+                with db.manual_commit(): pass
+
+    def test_mixing_manual_db_context(self):
+        with db.manual_commit():
+            with self.assertRaises(ValueError):
+                with db: pass
+        # The aborted enter does not poison the connection-context stack.
+        self.assertEqual(db._state.ctx, [])
+        with db.connection_context():
+            pass
+        self.assertTrue(db.is_closed())
+        db.connect()
+
+    def test_commit_rollback_closed(self):
+        db.close()
+        self.assertRaises(InterfaceError, db.commit)
+        self.assertRaises(InterfaceError, db.rollback)
+        self.assertTrue(db.is_closed())
+        db.connect()
+
+    def test_closing_db_in_transaction(self):
+        with db.atomic():
+            self.assertRaises(OperationalError, db.close)
+
+    @requires_nested
+    def test_db_context_manager(self):
+        db.close()
+        self.assertTrue(db.is_closed())
+
+        with db:
+            self.assertFalse(db.is_closed())
+            self._save(1)
+            with db:
+                self._save(2)
+                try:
+                    with db:
+                        self._save(3)
+                        raise ValueError('xxx')
+                except ValueError:
+                    pass
+                self._save(4)
+
+            try:
+                with db:
+                    self._save(5)
+                    with db:
+                        self._save(6)
+                    raise ValueError('yyy')
+            except ValueError:
+                pass
+
+            self.assertFalse(db.is_closed())
+
+        self.assertTrue(db.is_closed())
+        self.assertRegister([1, 2, 4])
+
+    def test_transaction_concurrency(self):
+        barrier = threading.Barrier(5)
+        accum = []
+
+        def run_thread():
+            barrier.wait(timeout=2)
+            for i in range(10):
+                try:
+                    with db.atomic() as tx:
+                        for j in range(10):
+                            try:
+                                with db.atomic() as sp:
+                                    sp.commit()
+                                    if j % 2 == 0:
+                                        raise ValueError()
+                            except ValueError:
+                                pass
+                        if i % 1 == 0:
+                            raise ValueError()
+                except ValueError:
+                    pass
+            accum.append(True)
+
+        threads = [threading.Thread(target=run_thread) for _ in range(4)]
+        for t in threads: t.start()
+        barrier.wait(timeout=2)
+        for t in threads: t.join()
+
+        self.assertEqual(accum, [True, True, True, True])
+
+
+# ===========================================================================
+# after_commit() callbacks
+# ===========================================================================
+
+class TestAfterCommit(BaseTransactionTestCase):
+    def setUp(self):
+        super(TestAfterCommit, self).setUp()
+        self.accum = []
+
+    def hook(self, val):
+        return lambda: self.accum.append(val)
+
+    def error(self):
+        raise ValueError('error')
+
+    def test_after_commit(self):
+        db.after_commit(self.hook(1))  # No transaction: runs immediately.
+        self.assertEqual(self.accum, [1])
+
+        with db.atomic():
+            db.after_commit(self.hook(2))
+            self.assertEqual(self.accum, [1])
+        self.assertEqual(self.accum, [1, 2])
+
+    def test_after_commit_rollback(self):
+        with self.assertRaises(ValueError):
+            with db.atomic():
+                db.after_commit(self.hook(1))
+                raise ValueError('nope')
+        self.assertEqual(self.accum, [])
+
+        # Discarded callbacks do not resurface on the next commit.
+        with db.atomic():
+            db.after_commit(self.hook(2))
+        self.assertEqual(self.accum, [2])
+
+    def test_after_commit_explicit(self):
+        with db.atomic() as txn:
+            db.after_commit(self.hook(1))
+            txn.commit()
+            self.assertEqual(self.accum, [1])
+            db.after_commit(self.hook(2))
+            txn.rollback()
+            db.after_commit(self.hook(3))
+        self.assertEqual(self.accum, [1, 3])
+
+    @requires_nested
+    def test_after_commit_nested(self):
+        with db.atomic():
+            db.after_commit(self.hook(1))
+            with db.atomic():
+                db.after_commit(self.hook(2))
+            try:
+                with db.atomic():
+                    db.after_commit(self.hook(3))
+                    raise ValueError('sp')
+            except ValueError:
+                pass
+            self.assertEqual(self.accum, [])
+        self.assertEqual(self.accum, [1, 2])
+
+    @requires_nested
+    def test_after_commit_savepoint(self):
+        with db.atomic():
+            with db.atomic() as sp:
+                db.after_commit(self.hook(1))
+                sp.commit()
+                db.after_commit(self.hook(2))
+                sp.rollback()
+                db.after_commit(self.hook(3))
+        self.assertEqual(self.accum, [1, 3])
+
+    def test_after_commit_error(self):
+        with self.assertRaises(ValueError):
+            with db.atomic():
+                self._save(1)
+                db.after_commit(self.error)
+                db.after_commit(self.hook(1))
+        self.assertRegister([1])
+        self.assertEqual(self.accum, [])
+
+        with db.atomic():
+            db.after_commit(self.hook(2))
+        self.assertEqual(self.accum, [2])
+
+    def test_after_commit_error_explicit(self):
+        with db.atomic() as txn:
+            self._save(1)
+            db.after_commit(self.error)
+            self.assertRaises(ValueError, txn.commit)
+            self._save(2)
+            txn.rollback()
+        self.assertRegister([1])
+
+    @skip_unless(IS_SQLITE, 'requires sqlite')
+    def test_after_commit_conflict_rollback(self):
+        Register.create(id=1, value=1)
+        # Sqlite rolls back on conflict, the block's own rollback then fails.
+        with self.assertRaises(DatabaseError):
+            with db.atomic():
+                db.after_commit(self.hook(1))
+                (Register
+                 .insert(id=1, value=2)
+                 .on_conflict('rollback')
+                 .execute())
+        self.assertRegister([1])
+
+        with db.atomic():
+            db.after_commit(self.hook(2))
+        self.assertEqual(self.accum, [2])
+
+    def test_after_commit_reentrant(self):
+        with db.atomic():
+            db.after_commit(self.hook(1))
+            db.after_commit(lambda: db.after_commit(self.hook(2)))
+        self.assertEqual(self.accum, [1, 2])
+
+    def test_after_commit_manual(self):
+        with db.manual_commit():
+            self.assertRaises(ValueError, db.after_commit, self.hook(1))
+        self.assertEqual(self.accum, [])
+
+
+# ===========================================================================
+# Session (context manager) behavior
+# ===========================================================================
+
+@requires_nested
+class TestSession(BaseTransactionTestCase):
+    def test_session(self):
+        self.assertTrue(db.session_start())
+        self.assertTrue(db.session_start())
+        self.assertEqual(db.transaction_depth(), 2)
+
+        self._save(1)
+        self.assertTrue(db.session_commit())
+        self.assertEqual(db.transaction_depth(), 1)
+
+        self._save(2)  # Now we're in autocommit mode.
+        self.assertTrue(db.session_rollback())
+        self.assertEqual(db.transaction_depth(), 0)
+
+        self.assertTrue(db.session_start())
+        self._save(3)
+        self.assertTrue(db.session_rollback())
+        self.assertRegister([1])
+
+    def test_session_state(self):
+        # When session is not active, commit and rollback have no effect.
+        self.assertFalse(self.database.in_transaction())
+        self.assertFalse(self.database.session_commit())
+        self.assertFalse(self.database.session_rollback())
+
+        tx = self.database.session_start()
+        self.assertTrue(self.database.in_transaction())
+        self.assertEqual(self.database.transaction_depth(), 1)
+
+        tx2 = self.database.session_start()
+        self.assertTrue(self.database.in_transaction())
+        self.assertEqual(self.database.transaction_depth(), 2)
+
+        self.assertTrue(self.database.top_transaction() is tx2)
+        self.assertTrue(self.database.session_commit())
+        self.assertTrue(self.database.top_transaction() is tx)
+        self.assertTrue(self.database.in_transaction())
+        self.assertEqual(self.database.transaction_depth(), 1)
+
+        self.assertTrue(self.database.session_rollback())
+        self.assertEqual(self.database.transaction_depth(), 0)
+
+    def test_session_with_closed_db(self):
+        db.close()
+        self.assertTrue(db.session_start())
+        self.assertFalse(db.is_closed())
+        self.assertRaises(OperationalError, db.close)
+        self._save(1)
+        self.assertTrue(db.session_rollback())
+        self.assertRegister([])
+
+    def test_session_inside_context_manager(self):
+        with db.atomic():
+            self.assertTrue(db.session_start())
+            self._save(1)
+            self.assertTrue(db.session_commit())
+            self._save(2)
+            self.assertTrue(db.session_rollback())
+            db.session_start()
+            self._save(3)
+
+        self.assertRegister([1, 3])
+
+    def test_commit_rollback_mix(self):
+        db.session_start()
+
+        with db.atomic() as txn:  # Will be a savepoint.
+            self._save(1)
+            with db.atomic() as t2:
+                self._save(2)
+                with db.atomic() as t3:
+                    self._save(3)
+                t2.rollback()
+
+            txn.commit()
+            self._save(4)
+            txn.rollback()
+
+        self.assertTrue(db.session_commit())
+        self.assertRegister([1])
+
+    def test_session_rollback(self):
+        db.session_start()
+
+        self._save(1)
+        with db.atomic() as txn:
+            self._save(2)
+            with db.atomic() as t2:
+                self._save(3)
+
+        self.assertRegister([1, 2, 3])
+        self.assertTrue(db.session_rollback())
+        self.assertRegister([])
+
+        db.session_start()
+        self._save(1)
+
+        with db.transaction() as txn:
+            self._save(2)
+            with db.transaction() as t2:
+                self._save(3)
+                t2.rollback()  # Rolls back everything, starts new txn.
+
+        db.session_commit()
+        self.assertRegister([])
+
+    def test_session_commit(self):
+        db.session_start()
+
+        self._save(1)
+        with db.transaction() as txn:
+            self._save(2)
+            with db.transaction() as t2:
+                self._save(3)
+                t2.commit()  # Saves everything, starts new txn.
+            txn.rollback()
+
+        self.assertTrue(db.session_rollback())
+        self.assertRegister([1, 2, 3])
+
+
+# ===========================================================================
+# Autocommit and manual-commit integration
+# ===========================================================================
+
+class KX(TestModel):
+    key = CharField(unique=True)
+    value = IntegerField()
+
+class TestAutocommitIntegration(ModelTestCase):
+    database = db
+    requires = [KX]
+
+    def setUp(self):
+        super(TestAutocommitIntegration, self).setUp()
+        with self.database.atomic():
+            kx1 = KX.create(key='k1', value=1)
+
+    def force_integrity_error(self):
+        # Force an integrity error, then verify that the current
+        # transaction has been aborted.
+        self.assertRaises(IntegrityError, KX.create, key='k1', value=10)
+
+    def test_autocommit_default(self):
+        kx2 = KX.create(key='k2', value=2)  # Will be committed.
+        self.assertTrue(kx2.id > 0)
+        self.force_integrity_error()
+
+        self.assertEqual(KX.select().count(), 2)
+        self.assertEqual([(kx.key, kx.value)
+                          for kx in KX.select().order_by(KX.key)],
+                         [('k1', 1), ('k2', 2)])
+
+    def test_autocommit_disabled(self):
+        with self.database.manual_commit():
+            self.database.begin()
+            kx2 = KX.create(key='k2', value=2)  # Not committed.
+            self.assertTrue(kx2.id > 0)  # Yes, we have a primary key.
+            self.force_integrity_error()
+            self.database.rollback()
+
+        self.assertEqual(KX.select().count(), 1)
+        kx1_db = KX.get(KX.key == 'k1')
+        self.assertEqual(kx1_db.value, 1)
+
+    def test_atomic_block(self):
+        with self.database.atomic() as txn:
+            kx2 = KX.create(key='k2', value=2)
+            self.assertTrue(kx2.id > 0)
+            self.force_integrity_error()
+            # Restart after rollback so the block exit can commit on sqlite.
+            txn.rollback()
+
+        self.assertEqual(KX.select().count(), 1)
+        kx1_db = KX.get(KX.key == 'k1')
+        self.assertEqual(kx1_db.value, 1)
+
+    @requires_postgresql
+    def test_atomic_block_no_restart(self):
+        # Postgres tolerates the block-exit commit with no open transaction.
+        with self.database.atomic() as txn:
+            kx2 = KX.create(key='k2', value=2)
+            self.assertTrue(kx2.id > 0)
+            self.force_integrity_error()
+            txn.rollback(False)
+
+        self.assertEqual(KX.select().count(), 1)
+        kx1_db = KX.get(KX.key == 'k1')
+        self.assertEqual(kx1_db.value, 1)
+
+    def test_atomic_block_exception(self):
+        with self.assertRaises(IntegrityError):
+            with self.database.atomic():
+                KX.create(key='k2', value=2)
+                KX.create(key='k1', value=10)
+
+        self.assertEqual(KX.select().count(), 1)
+
+
+# ===========================================================================
+# Lock type and isolation level
+# ===========================================================================
+
+@skip_unless(IS_SQLITE, 'requires sqlite for transaction lock type')
+class TestTransactionLockType(BaseTransactionTestCase):
+    def test_lock_type(self):
+        db2 = new_connection(timeout=0.0001)
+        db2.connect()
+
+        with self.database.atomic(lock_type='EXCLUSIVE') as txn:
+            with self.assertRaises(OperationalError):
+                with db2.atomic(lock_type='IMMEDIATE') as t2:
+                    self._save(1)
+            self._save(2)
+        self.assertRegister([2])
+
+        with self.database.atomic('IMMEDIATE') as txn:
+            with self.assertRaises(OperationalError):
+                with db2.atomic('EXCLUSIVE') as t2:
+                    self._save(3)
+            self._save(4)
+        self.assertRegister([2, 4])
+
+        with self.database.transaction(lock_type='DEFERRED') as txn:
+            self._save(5)  # Deferred -> Exclusive after our write.
+            with self.assertRaises(OperationalError):
+                with db2.transaction(lock_type='IMMEDIATE') as t2:
+                    self._save(6)
+        self.assertRegister([2, 4, 5])
+
+    def test_default_lock_type(self):
+        db = new_connection(lock_type='EXCLUSIVE')
+        db2 = new_connection(timeout=0.0001)
+        db2.connect()
+
+        with db.atomic():  # Uses the database default.
+            with self.assertRaises(OperationalError):
+                with db2.atomic('IMMEDIATE'):
+                    pass
+
+        with db.atomic('DEFERRED'):  # Explicit arg wins over the default.
+            with db2.atomic('IMMEDIATE'):
+                pass
+
+        db.close()
+        db2.close()
+
+
+class TestTransactionIsolationLevel(BaseTransactionTestCase):
+    @skip_unless(IS_POSTGRESQL, 'requires postgresql')
+    def test_isolation_level_pg(self):
+        db2 = new_connection()
+        db2.connect()
+
+        with db2.atomic(isolation_level='SERIALIZABLE'):
+            with db.atomic(isolation_level='SERIALIZABLE'):
+                self._save(1)
+                self.assertDB2(db2, [])
+            self.assertDB2(db2, [])
+        self.assertDB2(db2, [1])
+
+        with db2.atomic(isolation_level='READ COMMITTED'):
+            with db.atomic():
+                self._save(2)
+                self.assertDB2(db2, [1])
+            self.assertDB2(db2, [1, 2])
+        self.assertDB2(db2, [1, 2])
+
+        # NB: Read Uncommitted is treated as Read Committed by PG, so we don't
+        # test it here.
+
+        with db2.atomic(isolation_level='REPEATABLE READ'):
+            with db.atomic(isolation_level='REPEATABLE READ'):
+                self._save(3)
+                self.assertDB2(db2, [1, 2])
+            self.assertDB2(db2, [1, 2])
+        self.assertDB2(db2, [1, 2, 3])
+
+    @skip_unless(IS_MYSQL, 'requires mysql')
+    def test_isolation_level_mysql(self):
+        db2 = new_connection()
+        db2.connect()
+
+        with db2.atomic():
+            with db.atomic(isolation_level='SERIALIZABLE'):
+                self._save(1)
+                self.assertDB2(db2, [])
+            self.assertDB2(db2, [])
+        self.assertDB2(db2, [1])
+
+        with db2.atomic(isolation_level='READ COMMITTED'):
+            with db.atomic():
+                self._save(2)
+                self.assertDB2(db2, [1])
+            self.assertDB2(db2, [1, 2])
+        self.assertDB2(db2, [1, 2])
+
+        with db2.atomic(isolation_level='READ UNCOMMITTED'):
+            with db.atomic():
+                self._save(3)
+                self.assertDB2(db2, [1, 2, 3])
+            self.assertDB2(db2, [1, 2, 3])
+        self.assertDB2(db2, [1, 2, 3])
+
+        with db2.atomic(isolation_level='REPEATABLE READ'):
+            with db.atomic(isolation_level='REPEATABLE READ'):
+                self._save(4)
+                self.assertDB2(db2, [1, 2, 3])
+            self.assertDB2(db2, [1, 2, 3])
+        self.assertDB2(db2, [1, 2, 3, 4])
+
+    def assertDB2(self, db2, vals):
+        with Register.bind_ctx(db2):
+            q = Register.select().order_by(Register.value)
+            self.assertEqual([r.value for r in q], vals)
+
+
+@requires_postgresql
+class TestPostgresIsolationLevel(DatabaseTestCase):
+    # The integer constants differ between psycopg2 and psycopg3, so specify
+    # the level as a string and resolve via the adapter.
+    database = db_loader('postgres', isolation_level='SERIALIZABLE')
+
+    def test_isolation_level(self):
+        serializable = self.database._isolation_level
+        conn = self.database.connection()
+        self.assertEqual(conn.isolation_level, serializable)
+
+        with self.database.atomic():
+            curs = self.database.execute_sql(
+                'show transaction isolation level')
+            self.assertEqual(curs.fetchone()[0], 'serializable')
+
+        conn.set_isolation_level(2)
+        self.assertEqual(conn.isolation_level, 2)
+        self.database.close()
+
+        conn = self.database.connection()
+        self.assertEqual(conn.isolation_level, serializable)
+        self.database.close()
+
+        self.database.set_isolation_level(2)
+        for _ in range(2):
+            conn = self.database.connection()
+            self.assertEqual(conn.isolation_level, 2)
+            self.database.close()
+
+    def test_isolation_level_str(self):
+        db = db_loader('postgres', isolation_level='SERIALIZABLE')
+        conn = db.connection()
+        self.assertEqual(conn.isolation_level,
+                         db._adapter.isolation_levels_inv['SERIALIZABLE'])
+        db.close()
+
+        db.set_isolation_level('READ COMMITTED')
+        conn = db.connection()
+        self.assertEqual(conn.isolation_level,
+                         db._adapter.isolation_levels_inv['READ COMMITTED'])
+        db.close()
+
+    def test_isolation_level_mixed(self):
+        db = db_loader('postgres', isolation_level='SERIALIZABLE')
+        conn = db.connection()
+        self.assertEqual(conn.isolation_level,
+                         db._adapter.isolation_levels_inv['SERIALIZABLE'])
+        db.close()
+
+        rc = db._adapter.isolation_levels_inv['READ COMMITTED']
+        db.set_isolation_level(rc)
+        conn = db.connection()
+        self.assertEqual(conn.isolation_level, rc)
+        db.close()

@@ -1,0 +1,1971 @@
+"""
+Database connection, pragmas, introspection, threading, and utility tests.
+"""
+from itertools import permutations
+from queue import Queue
+from unittest import mock
+import gc
+import os
+import platform
+import re
+import threading
+import time
+import warnings
+
+from peewee import *
+from peewee import Database
+from peewee import FIELD
+from peewee import attrdict
+from peewee import sort_models
+
+
+from .base import BaseTestCase
+from .base import DatabaseTestCase
+from .base import IS_CRDB
+from .base import IS_MYSQL
+from .base import IS_ORACLE_MYSQL
+from .base import IS_POSTGRESQL
+from .base import IS_SQLITE
+from .base import ModelTestCase
+from .base import skip_unless
+from .base import HAS_WINDOW_FUNCTION
+from .base import TestModel
+from .base import db
+from .base import get_in_memory_db
+from .base import get_sqlite_db
+from .base import new_connection
+from .base import requires_models
+from .base import requires_mysql
+from .base import requires_postgresql
+from .base import requires_sqlite
+from .base import skip_if
+from .base import IS_MYSQL_C_DRIVER
+from .base_models import Category
+from .base_models import Person
+from .base_models import Tweet
+from .base_models import User
+
+
+# ===========================================================================
+# Core database features and connection semantics
+# ===========================================================================
+
+class TestDatabase(DatabaseTestCase):
+    def test_context_settings(self):
+        class TestDatabase(Database):
+            field_types = {'BIGINT': 'TEST_BIGINT', 'TEXT': 'TEST_TEXT'}
+            operations = {'LIKE': '~', 'NEW': '->>'}
+            param = '$'
+
+        test_db = TestDatabase(None)
+        state = test_db.get_sql_context().state
+
+        self.assertEqual(state.field_types['BIGINT'], 'TEST_BIGINT')
+        self.assertEqual(state.field_types['TEXT'], 'TEST_TEXT')
+        self.assertEqual(state.field_types['INT'], FIELD.INT)
+        self.assertEqual(state.field_types['VARCHAR'], FIELD.VARCHAR)
+
+        self.assertEqual(state.operations['LIKE'], '~')
+        self.assertEqual(state.operations['NEW'], '->>')
+        self.assertEqual(state.operations['ILIKE'], 'ILIKE')
+
+        self.assertEqual(state.param, '$')
+        self.assertEqual(state.quote, '""')
+
+        test_db2 = TestDatabase(None, field_types={'BIGINT': 'XXX_BIGINT',
+                                                   'INT': 'XXX_INT'})
+        state = test_db2.get_sql_context().state
+        self.assertEqual(state.field_types['BIGINT'], 'XXX_BIGINT')
+        self.assertEqual(state.field_types['TEXT'], 'TEST_TEXT')
+        self.assertEqual(state.field_types['INT'], 'XXX_INT')
+        self.assertEqual(state.field_types['VARCHAR'], FIELD.VARCHAR)
+
+    def test_connection_state(self):
+        conn = self.database.connection()
+        self.assertFalse(self.database.is_closed())
+        self.database.close()
+        self.assertTrue(self.database.is_closed())
+        conn = self.database.connection()
+        self.assertFalse(self.database.is_closed())
+
+    def test_db_context_manager(self):
+        self.database.close()
+        self.assertTrue(self.database.is_closed())
+
+        with self.database:
+            self.assertFalse(self.database.is_closed())
+
+        self.assertTrue(self.database.is_closed())
+        self.database.connect()
+        self.assertFalse(self.database.is_closed())
+
+        # Enter context with an already-open db.
+        with self.database:
+            self.assertFalse(self.database.is_closed())
+
+        # Closed after exit.
+        self.assertTrue(self.database.is_closed())
+
+    def test_db_context_manager_nesting(self):
+        self.database.close()
+        self.assertTrue(self.database.is_closed())
+
+        with self.database:
+            self.assertFalse(self.database.is_closed())
+            self.assertEqual(self.database.transaction_depth(), 1)
+            with self.database:
+                self.assertFalse(self.database.is_closed())
+                # Inner atomic becomes savepoint (doesn't increase txn depth)
+                # but the ctx stack grows.
+                self.assertEqual(len(self.database._state.ctx), 2)
+
+            # Inner exited but outer still open.
+            self.assertFalse(self.database.is_closed())
+            self.assertEqual(len(self.database._state.ctx), 1)
+
+        self.assertTrue(self.database.is_closed())
+
+    def test_context_managers(self):
+        @self.database.connection_context()
+        def with_ctx():
+            self.assertFalse(self.database.is_closed())
+
+        with self.database.connection_context():
+            with_ctx()
+            self.assertFalse(self.database.is_closed())
+            with self.database.atomic():
+                with self.database.atomic():
+                    with_ctx()
+                    with self.database:
+                        pass
+                    self.assertTrue(self.database.in_transaction())
+                self.assertTrue(self.database.in_transaction())
+
+            self.assertFalse(self.database.is_closed())
+        self.assertTrue(self.database.is_closed())
+
+    def test_connection_initialization(self):
+        state = {'count': 0}
+        class TestDatabase(SqliteDatabase):
+            def _initialize_connection(self, conn):
+                state['count'] += 1
+        db = TestDatabase(':memory:')
+        self.assertEqual(state['count'], 0)
+
+        conn = db.connection()
+        self.assertEqual(state['count'], 1)
+
+        # Since already connected, nothing happens here.
+        conn = db.connection()
+        self.assertEqual(state['count'], 1)
+
+    def test_connect_semantics(self):
+        state = {'count': 0}
+        class TestDatabase(SqliteDatabase):
+            def _initialize_connection(self, conn):
+                state['count'] += 1
+        db = TestDatabase(':memory:')
+
+        db.connect()
+        self.assertEqual(state['count'], 1)
+        self.assertRaises(OperationalError, db.connect)
+        self.assertEqual(state['count'], 1)
+
+        self.assertFalse(db.connect(reuse_if_open=True))
+        self.assertEqual(state['count'], 1)
+
+        with db:
+            self.assertEqual(state['count'], 1)
+            self.assertFalse(db.is_closed())
+
+        self.assertTrue(db.is_closed())
+        with db:
+            self.assertEqual(state['count'], 2)
+
+    def test_execute_sql(self):
+        p = self.database.param
+        self.database.execute_sql('DROP TABLE IF EXISTS register')
+        self.database.execute_sql('CREATE TABLE register (val INTEGER)')
+        self.database.execute_sql(
+            'INSERT INTO register (val) VALUES (%s), (%s)' % (p, p),
+            (1337, 31337))
+        cursor = self.database.execute_sql(
+            'SELECT val FROM register ORDER BY val')
+        self.assertEqual(list(cursor.fetchall()), [(1337,), (31337,)])
+        self.database.execute_sql('DROP TABLE register')
+
+    @requires_models(User)
+    def test_execute_query(self):
+        for username in ('huey', 'zaizee'):
+            User.create(username=username)
+
+        query = User.select().order_by(User.username.desc())
+        cursor = self.database.execute(query)
+        self.assertEqual([row[1] for row in cursor], ['zaizee', 'huey'])
+
+    def test_bind_helpers(self):
+        db = get_in_memory_db()
+        alt_db = get_in_memory_db()
+
+        class Base(Model):
+            class Meta:
+                database = db
+
+        class A(Base):
+            a = TextField()
+        class B(Base):
+            b = TextField()
+
+        db.create_tables([A, B])
+
+        # Temporarily bind A to alt_db.
+        with alt_db.bind_ctx([A]):
+            self.assertFalse(A.table_exists())
+            self.assertTrue(B.table_exists())
+
+        self.assertTrue(A.table_exists())
+        self.assertTrue(B.table_exists())
+
+        alt_db.bind([A])
+        self.assertFalse(A.table_exists())
+        self.assertTrue(B.table_exists())
+        db.close()
+        alt_db.close()
+
+    def test_bind_ctx_decorator(self):
+        db = get_in_memory_db()
+        alt_db = get_in_memory_db()
+
+        class A(Model):
+            class Meta:
+                database = db
+        class B(Model):
+            a = ForeignKeyField(A)
+            class Meta:
+                database = db
+
+        @alt_db.bind_ctx([A, B])
+        def with_db():
+            return (A._meta.database, B._meta.database)
+
+        @A.bind_ctx(alt_db)
+        def with_model():
+            return (A._meta.database, B._meta.database)
+
+        for fn in (with_db, with_model):
+            # The context is rebuilt per-call, so it can be re-entered.
+            for _ in range(2):
+                self.assertEqual(fn(), (alt_db, alt_db))
+                self.assertEqual(A._meta.database, db)
+                self.assertEqual(B._meta.database, db)
+
+        @A.bind_ctx(alt_db, bind_refs=False, bind_backrefs=False)
+        def recurse(n):
+            if n:
+                self.assertEqual(recurse(n - 1), alt_db)
+            self.assertEqual(B._meta.database, db)
+            return A._meta.database
+
+        self.assertEqual(recurse(2), alt_db)
+        self.assertEqual(A._meta.database, db)
+
+    def test_bind_regression(self):
+        class Base(Model):
+            class Meta:
+                database = None
+
+        class A(Base): pass
+        class B(Base): pass
+        class AB(Base):
+            a = ForeignKeyField(A)
+            b = ForeignKeyField(B)
+
+        self.assertTrue(A._meta.database is None)
+
+        db = get_in_memory_db()
+        with db.bind_ctx([A, B]):
+            self.assertEqual(A._meta.database, db)
+            self.assertEqual(B._meta.database, db)
+            self.assertEqual(AB._meta.database, db)
+
+        self.assertTrue(A._meta.database is None)
+        self.assertTrue(B._meta.database is None)
+        self.assertTrue(AB._meta.database is None)
+
+        class C(Base):
+            a = ForeignKeyField(A)
+
+        with db.bind_ctx([C], bind_refs=False):
+            self.assertEqual(C._meta.database, db)
+            self.assertTrue(A._meta.database is None)
+
+        self.assertTrue(C._meta.database is None)
+        self.assertTrue(A._meta.database is None)
+
+    def test_batch_commit(self):
+        class PatchCommitDatabase(SqliteDatabase):
+            commits = 0
+            def begin(self): pass
+            def commit(self):
+                self.commits += 1
+
+        db = PatchCommitDatabase(':memory:')
+
+        def assertBatches(n_objs, batch_size, n_commits):
+            accum = []
+            source = range(n_objs)
+            db.commits = 0
+            for item in db.batch_commit(source, batch_size):
+                accum.append(item)
+
+            self.assertEqual(accum, list(range(n_objs)))
+            self.assertEqual(db.commits, n_commits)
+
+        assertBatches(12, 1, 12)
+        assertBatches(12, 2, 6)
+        assertBatches(12, 3, 4)
+        assertBatches(12, 4, 3)
+        assertBatches(12, 5, 3)
+        assertBatches(12, 6, 2)
+        assertBatches(12, 7, 2)
+        assertBatches(12, 11, 2)
+        assertBatches(12, 12, 1)
+        assertBatches(12, 13, 1)
+
+    @requires_models(User)
+    def test_batch_commit_calls(self):
+        commit_method = self.database.commit
+
+        def assertBatch(n_rows, batch_size, n_commits):
+            User.delete().execute()
+            user_data = [{'username': 'u%s' % i} for i in range(n_rows)]
+            with mock.patch.object(self.database, 'commit') as mock_commit:
+                mock_commit.side_effect = commit_method
+                for row in self.database.batch_commit(user_data, batch_size):
+                    User.create(**row)
+
+                self.assertEqual(mock_commit.call_count, n_commits)
+                self.assertEqual(User.select().count(), n_rows)
+
+        assertBatch(6, 1, 6)
+        assertBatch(6, 2, 3)
+        assertBatch(6, 3, 2)
+        assertBatch(6, 4, 2)
+        assertBatch(6, 6, 1)
+        assertBatch(6, 7, 1)
+
+    def test_server_version(self):
+        class FakeDatabase(Database):
+            server_version = None
+            def _connect(self):
+                return 1
+            def _close(self, conn):
+                pass
+            def _set_server_version(self, conn):
+                self.server_version = (1, 33, 7)
+
+        db = FakeDatabase(':memory:')
+        self.assertTrue(db.server_version is None)
+        db.connect()
+        self.assertEqual(db.server_version, (1, 33, 7))
+        db.close()
+        self.assertEqual(db.server_version, (1, 33, 7))
+
+        db.server_version = (1, 2, 3)
+        db.connect()
+        self.assertEqual(db.server_version, (1, 2, 3))
+        db.close()
+
+    def test_explicit_connect(self):
+        db = get_in_memory_db(autoconnect=False)
+        self.assertRaises(InterfaceError, db.execute_sql, 'pragma cache_size')
+        with db:
+            db.execute_sql('pragma cache_size')
+        self.assertRaises(InterfaceError, db.cursor)
+
+    @skip_if(IS_CRDB, 'atomic() connects to read the server version')
+    def test_begin_autoconnect_false(self):
+        db = new_connection(autoconnect=False)
+        with self.assertRaises(InterfaceError):
+            with db.atomic():
+                pass
+        self.assertTrue(db.is_closed())
+        db.connect()
+        with db.atomic():
+            pass
+        db.close()
+
+    def test_connection_context_as_decorator(self):
+        db2 = new_connection()
+
+        @db2.connection_context()
+        def do_work():
+            self.assertFalse(db2.is_closed())
+            return db2.execute_sql('SELECT 1').fetchone()
+
+        self.assertTrue(db2.is_closed())
+        result = do_work()
+        self.assertEqual(result, (1,))
+        self.assertTrue(db2.is_closed())
+
+
+class TestQueryHooks(ModelTestCase):
+    # event.sql text and the error class both differ per backend.
+    database = get_in_memory_db()
+    requires = [User]
+
+    def setUp(self):
+        super(TestQueryHooks, self).setUp()
+        self.events = []
+        self.database.query_hooks.append(self.events.append)
+
+    def tearDown(self):
+        del self.database.query_hooks[:]
+        super(TestQueryHooks, self).tearDown()
+
+    def test_query_hooks(self):
+        User.create(username='u1')
+        event = self.events[-1]
+        self.assertEqual(event.sql,
+                         'INSERT INTO "users" ("username") VALUES (?)')
+        self.assertEqual(event.params, ['u1'])
+        self.assertTrue(event.duration >= 0.)
+        self.assertIsNone(event.exception)
+
+        n = len(self.events)
+        self.assertEqual(User.select().count(), 1)
+        self.assertEqual(len(self.events), n + 1)
+        self.assertEqual(self.events[-1].sql, (
+            'SELECT COUNT(1) FROM '
+            '(SELECT 1 FROM "users" AS "t1") AS "_wrapped" LIMIT ?'))
+        self.assertEqual(self.events[-1].params, [1])
+
+    def test_query_hooks_transaction(self):
+        # BEGIN / COMMIT are not queries and do not reach the hooks.
+        with self.database.atomic():
+            User.create(username='u1')
+        self.assertEqual([e.sql.split()[0] for e in self.events], ['INSERT'])
+
+    def test_query_hooks_error(self):
+        with self.assertRaises(OperationalError):
+            self.database.execute_sql('select * from missing_tbl')
+        event = self.events[-1]
+        self.assertEqual(event.sql, 'select * from missing_tbl')
+        self.assertIsInstance(event.exception, OperationalError)
+
+    def test_query_hooks_propagate_errors(self):
+        def bad_hook(event):
+            raise ValueError('nope')
+        self.database.query_hooks.append(bad_hook)
+        self.assertRaises(ValueError, self.database.execute_sql, 'select 1')
+
+    def test_query_hooks_per_instance(self):
+        self.assertEqual(get_in_memory_db().query_hooks, [])
+
+
+class TestDatabaseConnection(DatabaseTestCase):
+    def test_is_connection_usable(self):
+        # Ensure a connection is open.
+        conn = self.database.connection()
+        self.assertTrue(self.database.is_connection_usable())
+
+        self.database.close()
+        self.assertFalse(self.database.is_connection_usable())
+        self.database.connect()
+        self.assertTrue(self.database.is_connection_usable())
+
+    @requires_postgresql
+    def test_is_connection_usable_pg(self):
+        self.database.execute_sql('drop table if exists foo')
+        self.database.execute_sql('create table foo (data text not null)')
+        self.assertTrue(self.database.is_connection_usable())
+
+        with self.database.atomic() as txn:
+            with self.assertRaises(IntegrityError):
+                self.database.execute_sql('insert into foo (data) values (NULL)')
+
+            self.assertFalse(self.database.is_closed())
+            self.assertFalse(self.database.is_connection_usable())
+            txn.rollback()
+            self.assertTrue(self.database.is_connection_usable())
+
+            curs = self.database.execute_sql('select * from foo')
+            self.assertEqual(list(curs), [])
+            self.database.execute_sql('drop table foo')
+
+    @skip_if(IS_MYSQL_C_DRIVER, 'C connections do not survive fork')
+    @skip_unless(hasattr(os, 'fork'), 'requires fork')
+    def test_dispose_after_fork(self):
+        self.database.execute_sql('drop table if exists foo')
+        self.database.execute_sql('create table foo (data text not null)')
+        conn = self.database.connection()
+
+        pid = os.fork()
+        if pid == 0:
+            # Child. The exit code reports the result, os._exit skips the
+            # runner's teardown.
+            try:
+                self.database.dispose()
+                if not self.database.is_closed():
+                    os._exit(1)
+                del conn  # Let the parent's connection object be collected.
+                gc.collect()
+                self.database.execute_sql("insert into foo (data) values ('c')")
+                self.database.close()
+            except BaseException:
+                os._exit(2)
+            os._exit(0)
+
+        _, status = os.waitpid(pid, 0)
+        self.assertEqual(status, 0)
+
+        # The parent's connection survived the child's dispose, gc and close.
+        self.assertTrue(self.database.connection() is conn)
+        self.database.execute_sql("insert into foo (data) values ('p')")
+        curs = self.database.execute_sql('select data from foo order by data')
+        self.assertEqual([row[0] for row in curs], ['c', 'p'])
+        self.database.execute_sql('drop table foo')
+
+
+# ===========================================================================
+# Introspection.
+# ===========================================================================
+
+class UniqueModel(TestModel):
+    name = CharField(unique=True)
+
+
+class IndexedModel(TestModel):
+    first = CharField()
+    last = CharField()
+    dob = DateField()
+
+    class Meta:
+        indexes = (
+            (('first', 'last', 'dob'), True),
+            (('first', 'last'), False),
+        )
+
+
+class ViewTest(TestModel):
+    content = TextField()
+    ts = DateTimeField()
+    status = IntegerField()
+
+    class Meta:
+        table_name = 'viewtest'
+
+
+class QT(TestModel):
+    data = TextField(column_name='da"ta', index=True)
+    class Meta:
+        table_name = 'q"""t'
+
+class ColMeta(TestModel):
+    name = CharField(max_length=50)
+    value = DecimalField(max_digits=10, decimal_places=2, null=True)
+    active = BooleanField(default=True)
+    notes = TextField(null=True)
+    created = DateTimeField(constraints=[SQL('DEFAULT CURRENT_TIMESTAMP')])
+
+class FKParent(TestModel):
+    name = CharField(default='')
+
+class FKChild(TestModel):
+    parent = ForeignKeyField(FKParent, backref='children',
+                             on_delete='CASCADE', on_update='CASCADE')
+    parent2 = ForeignKeyField(FKParent, backref='children2', null=True)
+
+
+class TestIntrospection(ModelTestCase):
+    requires = [Category, User, UniqueModel, IndexedModel, Person]
+
+    def test_table_exists(self):
+        self.assertTrue(self.database.table_exists(User._meta.table_name))
+        self.assertFalse(self.database.table_exists('nuggies'))
+
+        self.assertTrue(self.database.table_exists(User))
+        class X(TestModel): pass
+        self.assertFalse(self.database.table_exists(X))
+
+    def test_get_tables(self):
+        tables = self.database.get_tables()
+        required = set(m._meta.table_name for m in self.requires)
+        self.assertTrue(required.issubset(set(tables)))
+
+        UniqueModel._schema.drop_all()
+        tables = self.database.get_tables()
+        self.assertFalse(UniqueModel._meta.table_name in tables)
+
+    def test_get_indexes(self):
+        indexes = self.database.get_indexes('unique_model')
+        data = [(index.name, index.columns, index.unique, index.table)
+                for index in indexes
+                if index.name not in ('unique_model_pkey', 'PRIMARY')]
+        self.assertEqual(data, [
+            ('unique_model_name', ['name'], True, 'unique_model')])
+
+        indexes = self.database.get_indexes('indexed_model')
+        data = [(index.name, index.columns, index.unique, index.table)
+                for index in indexes
+                if index.name not in ('indexed_model_pkey', 'PRIMARY')]
+        self.assertEqual(sorted(data), [
+            ('indexed_model_first_last', ['first', 'last'], False,
+             'indexed_model'),
+            ('indexed_model_first_last_dob', ['first', 'last', 'dob'], True,
+             'indexed_model')])
+
+        # Multi-column index where columns are in different order than declared
+        # on the table.
+        indexes = self.database.get_indexes('person')
+        data = sorted([(index.name, index.columns, index.unique)
+                       for index in indexes
+                       if index.name not in ('person_pkey', 'PRIMARY')])
+        self.assertEqual(data, [
+            ('person_dob', ['dob'], False),
+            ('person_first_last', ['first', 'last'], True)])
+
+    @requires_postgresql
+    def test_get_indexes_expression(self):
+        self.database.execute_sql('DROP TABLE IF EXISTS idx_expr')
+        self.database.execute_sql('CREATE TABLE idx_expr (a INTEGER, b INTEGER)')
+        try:
+            # A functional-index key whose expression contains a comma must not
+            # be split into bogus columns.
+            self.database.execute_sql(
+                'CREATE INDEX idx_expr_ce ON idx_expr (COALESCE(a, 0), b)')
+            idx, = [i for i in self.database.get_indexes('idx_expr')
+                    if i.name == 'idx_expr_ce']
+            self.assertEqual(len(idx.columns), 2)
+            self.assertIn('b', idx.columns)
+            expr, = [c for c in idx.columns if c != 'b']
+            self.assertIn(',', expr)
+            self.assertIn('COALESCE', expr.upper())
+        finally:
+            self.database.execute_sql('DROP TABLE idx_expr')
+
+    def test_get_columns(self):
+        columns = self.database.get_columns('indexed_model')
+        data = [(c.name, c.null, c.primary_key, c.table)
+                for c in columns]
+        self.assertEqual(data, [
+            ('id', False, True, 'indexed_model'),
+            ('first', False, False, 'indexed_model'),
+            ('last', False, False, 'indexed_model'),
+            ('dob', False, False, 'indexed_model')])
+
+        columns = self.database.get_columns('category')
+        data = [(c.name, c.null, c.primary_key, c.table)
+                for c in columns]
+        self.assertEqual(data, [
+            ('name', False, True, 'category'),
+            ('parent_id', True, False, 'category')])
+
+    def test_get_primary_keys(self):
+        primary_keys = self.database.get_primary_keys('users')
+        self.assertEqual(primary_keys, ['id'])
+
+        primary_keys = self.database.get_primary_keys('category')
+        self.assertEqual(primary_keys, ['name'])
+
+    @requires_models(ViewTest)
+    def test_get_views(self):
+        def normalize_view_meta(view_meta):
+            sql_ws_norm = re.sub(r'[\n\s]+', ' ', view_meta.sql.strip('; '))
+            if IS_ORACLE_MYSQL:
+                # MySQL 8 parenthesizes the where clause when it rewrites the
+                # view sql. MariaDB does not.
+                sql_ws_norm = sql_ws_norm.replace('(', '').replace(')', '')
+            return view_meta.name, (sql_ws_norm
+                                    .replace('`peewee_test`.', '')
+                                    .replace('`viewtest`.', '')
+                                    .replace('viewtest.', '')
+                                    .replace('`', ''))
+
+        def assertViews(expected):
+            # Create two sample views.
+            self.database.execute_sql('CREATE VIEW viewtest_public AS '
+                                      'SELECT content, ts FROM viewtest '
+                                      'WHERE status = 1 ORDER BY ts DESC')
+            self.database.execute_sql('CREATE VIEW viewtest_deleted AS '
+                                      'SELECT content FROM viewtest '
+                                      'WHERE status = 9 ORDER BY id DESC')
+            try:
+                views = self.database.get_views()
+                normalized = sorted([normalize_view_meta(v) for v in views])
+                self.assertEqual(normalized, expected)
+
+                # Ensure that we can use get_columns to introspect views.
+                columns = self.database.get_columns('viewtest_deleted')
+                self.assertEqual([c.name for c in columns], ['content'])
+
+                columns = self.database.get_columns('viewtest_public')
+                self.assertEqual([c.name for c in columns], ['content', 'ts'])
+            finally:
+                self.database.execute_sql('DROP VIEW viewtest_public;')
+                self.database.execute_sql('DROP VIEW viewtest_deleted;')
+
+        # Unfortunately, all databases seem to represent VIEW definitions
+        # differently internally.
+        if IS_SQLITE:
+            assertViews([
+                ('viewtest_deleted', ('CREATE VIEW viewtest_deleted AS '
+                                      'SELECT content FROM viewtest '
+                                      'WHERE status = 9 ORDER BY id DESC')),
+                ('viewtest_public', ('CREATE VIEW viewtest_public AS '
+                                     'SELECT content, ts FROM viewtest '
+                                     'WHERE status = 1 ORDER BY ts DESC'))])
+        elif IS_MYSQL:
+            assertViews([
+                ('viewtest_deleted',
+                 ('select content AS content from viewtest '
+                  'where status = 9 order by id desc')),
+                ('viewtest_public',
+                 ('select content AS content,ts AS ts from viewtest '
+                  'where status = 1 order by ts desc'))])
+        elif IS_POSTGRESQL:
+            assertViews([
+                ('viewtest_deleted',
+                 ('SELECT content FROM viewtest '
+                  'WHERE (status = 9) ORDER BY id DESC')),
+                ('viewtest_public',
+                 ('SELECT content, ts FROM viewtest '
+                  'WHERE (status = 1) ORDER BY ts DESC'))])
+        elif IS_CRDB:
+            assertViews([
+                ('viewtest_deleted',
+                 ('SELECT content FROM peewee_test.public.viewtest '
+                  'WHERE status = 9 ORDER BY id DESC')),
+                ('viewtest_public',
+                 ('SELECT content, ts FROM peewee_test.public.viewtest '
+                  'WHERE status = 1 ORDER BY ts DESC'))])
+
+    @requires_models(User, Tweet, Category)
+    def test_get_foreign_keys(self):
+        foreign_keys = self.database.get_foreign_keys('tweet')
+        data = [(fk.column, fk.dest_table, fk.dest_column, fk.table)
+                for fk in foreign_keys]
+        self.assertEqual(data, [
+            ('user_id', 'users', 'id', 'tweet')])
+
+        foreign_keys = self.database.get_foreign_keys('category')
+        data = [(fk.column, fk.dest_table, fk.dest_column, fk.table)
+                for fk in foreign_keys]
+        self.assertEqual(data, [
+            ('parent_id', 'category', 'name', 'category')])
+
+    @skip_if(IS_CRDB, 'crdb reflection extensions verified separately')
+    @requires_models(ColMeta)
+    def test_get_columns_full_type(self):
+        cols = {c.name: c for c in self.database.get_columns('col_meta')}
+        self.assertTrue(cols['id'].identity)
+        for name in ('name', 'value', 'active', 'notes', 'created'):
+            self.assertFalse(cols[name].identity)
+
+        if IS_SQLITE:
+            expected = {'name': 'VARCHAR(50)', 'value': 'DECIMAL(10, 2)',
+                        'active': 'INTEGER', 'notes': 'TEXT'}
+        elif IS_MYSQL:
+            expected = {'name': 'varchar(50)', 'value': 'decimal(10,2)',
+                        'active': 'tinyint(1)', 'notes': 'text'}
+        else:
+            expected = {'name': 'character varying(50)',
+                        'value': 'numeric(10,2)', 'active': 'boolean',
+                        'notes': 'text'}
+        for name, full_type in expected.items():
+            self.assertEqual(cols[name].full_type, full_type)
+
+        # The data_type vocabulary is unchanged.
+        if IS_SQLITE:
+            self.assertEqual(cols['name'].data_type, 'VARCHAR(50)')
+        elif IS_MYSQL:
+            self.assertEqual(cols['name'].data_type, 'varchar')
+        else:
+            self.assertEqual(cols['name'].data_type, 'character varying')
+
+    @skip_if(IS_CRDB, 'crdb reflection extensions verified separately')
+    @requires_models(ColMeta)
+    def test_get_columns_defaults(self):
+        cols = {c.name: c for c in self.database.get_columns('col_meta')}
+        self.assertIsNone(cols['name'].default)
+        self.assertIsNone(cols['notes'].default)
+        created = cols['created'].default
+        if IS_SQLITE:
+            self.assertEqual(created, 'CURRENT_TIMESTAMP')
+        else:
+            # MariaDB reports current_timestamp(), pg CURRENT_TIMESTAMP.
+            self.assertTrue(created.lower().startswith('current_timestamp'))
+
+    @skip_if(IS_CRDB, 'crdb reflection extensions verified separately')
+    @requires_models(FKParent, FKChild)
+    def test_get_foreign_keys_extended(self):
+        table = FKChild._meta.table_name
+        fks = {fk.column: fk for fk in self.database.get_foreign_keys(table)}
+        self.assertEqual(sorted(fks), ['parent2_id', 'parent_id'])
+
+        fk = fks['parent_id']
+        self.assertEqual(fk.dest_table, FKParent._meta.table_name)
+        self.assertEqual(fk.dest_column, 'id')
+        self.assertEqual(fk.on_delete, 'CASCADE')
+        self.assertEqual(fk.on_update, 'CASCADE')
+
+        # Undeclared actions surface as the backend's no-op default.
+        fk2 = fks['parent2_id']
+        self.assertIn(fk2.on_delete, ('NO ACTION', 'RESTRICT'))
+        self.assertIn(fk2.on_update, ('NO ACTION', 'RESTRICT'))
+
+        if IS_SQLITE:
+            self.assertIsNone(fk.name)
+        else:
+            self.assertTrue(fk.name)
+
+    @requires_sqlite
+    def test_get_foreign_keys_implicit(self):
+        # Omitted columns resolve to the parent's pk, in key order.
+        self.execute('CREATE TABLE ip (a TEXT, b TEXT, PRIMARY KEY (b, a))')
+        self.execute('CREATE TABLE ic (id INTEGER PRIMARY KEY, x TEXT, '
+                     'y TEXT, p INTEGER REFERENCES ic, '
+                     'FOREIGN KEY (x, y) REFERENCES ip)')
+        try:
+            self.assertEqual(self.database.get_primary_keys('ip'), ['b', 'a'])
+            fks = self.database.get_foreign_keys('ic')
+            self.assertEqual(sorted((fk.column, fk.dest_table, fk.dest_column)
+                                    for fk in fks),
+                             [('p', 'ic', 'id'), ('x', 'ip', 'b'),
+                              ('y', 'ip', 'a')])
+        finally:
+            self.execute('DROP TABLE ic')
+            self.execute('DROP TABLE ip')
+
+    def test_get_indexes_sql(self):
+        indexes = {i.name: i
+                   for i in self.database.get_indexes('unique_model')}
+        idx = indexes['unique_model_name']
+        if IS_SQLITE:
+            self.assertEqual(idx.sql, (
+                'CREATE UNIQUE INDEX "unique_model_name" '
+                'ON "unique_model" ("name")'))
+        elif IS_MYSQL:
+            self.assertIsNone(idx.sql)
+        else:
+            # Pg DDL is schema-qualified with USING btree, crdb differs again.
+            self.assertTrue('unique_model' in idx.sql.lower())
+
+    @requires_mysql
+    def test_schema_argument_honored(self):
+        tables = self.database.get_tables(schema='peewee_test')
+        self.assertEqual(tables, self.database.get_tables())
+        self.assertEqual(self.database.get_tables(schema='fake_schema_z'), [])
+
+        table = UniqueModel._meta.table_name
+        names = [c.name for c in self.database.get_columns(table)]
+        names2 = [c.name for c in
+                  self.database.get_columns(table, schema='peewee_test')]
+        self.assertEqual(names, names2)
+
+    @requires_sqlite
+    @requires_models(QT)
+    def test_quoted_name(self):
+        cols = self.database.get_columns('q"""t')
+        self.assertEqual([c.name for c in cols], ['id', 'da"ta'])
+        self.assertEqual([c.table for c in cols], ['q"""t', 'q"""t'])
+
+        self.assertEqual(self.database.get_primary_keys('q"""t'), ['id'])
+        self.assertEqual(self.database.get_foreign_keys('q"""t'), [])
+
+        idx, = self.database.get_indexes('q"""t')
+        self.assertEqual(idx.name, 'q"""t_data')
+        self.assertEqual(idx.columns, ['da"ta'])
+
+
+@requires_postgresql
+class TestIntrospectionSearchPath(DatabaseTestCase):
+    """With no schema given, introspection follows the search path."""
+    schema = 'ispath'
+
+    def setUp(self):
+        super(TestIntrospectionSearchPath, self).setUp()
+        self.execute('DROP SCHEMA IF EXISTS %s CASCADE' % self.schema)
+        self.execute('CREATE SCHEMA %s' % self.schema)
+        self.execute('CREATE TABLE %s.parent (id SERIAL PRIMARY KEY)'
+                     % self.schema)
+        self.execute('CREATE TABLE %s.child (id SERIAL PRIMARY KEY, '
+                     'parent_id INTEGER REFERENCES %s.parent (id), '
+                     'name TEXT)' % (self.schema, self.schema))
+        self.execute('CREATE INDEX child_name ON %s.child (name)'
+                     % self.schema)
+        self.execute('CREATE VIEW %s.child_names AS SELECT name FROM '
+                     '%s.child' % (self.schema, self.schema))
+        self.execute('SET search_path TO %s' % self.schema)
+
+    def tearDown(self):
+        try:
+            self.execute('DROP SCHEMA IF EXISTS %s CASCADE' % self.schema)
+        finally:
+            super(TestIntrospectionSearchPath, self).tearDown()
+
+    def test_search_path(self):
+        db = self.database
+        self.assertEqual(db.get_tables(), ['child', 'parent'])
+        self.assertEqual([v.name for v in db.get_views()], ['child_names'])
+        self.assertEqual([c.name for c in db.get_columns('child')],
+                         ['id', 'parent_id', 'name'])
+        self.assertEqual(db.get_primary_keys('child'), ['id'])
+        self.assertEqual([(fk.column, fk.dest_table)
+                          for fk in db.get_foreign_keys('child')],
+                         [('parent_id', 'parent')])
+        self.assertTrue('child_name' in
+                        [i.name for i in db.get_indexes('child')])
+
+
+# ===========================================================================
+# Thread safety
+# ===========================================================================
+
+class TestThreadSafety(ModelTestCase):
+    # HACK: This workaround increases the Sqlite busy timeout when tests are
+    # being run on certain architectures.
+    if IS_SQLITE and platform.machine() not in ('i386', 'i686', 'x86_64'):
+        database = new_connection(timeout=60)
+    nthreads = 4
+    nrows = 10
+    requires = [User]
+
+    def test_thread_safe_false_uses_noop_lock(self):
+        from peewee import _NoopLock, _ConnectionState
+        db = SqliteDatabase(':memory:', thread_safe=False)
+        self.assertIsInstance(db._lock, _NoopLock)
+        self.assertIsInstance(db._state, _ConnectionState)
+
+        db.connect()
+        self.assertFalse(db.is_closed())
+        db.close()
+        self.assertTrue(db.is_closed())
+
+    def test_multiple_writers(self):
+        def create_users(idx):
+            for i in range(idx * self.nrows, (idx + 1) * self.nrows):
+                User.create(username='u%d' % i)
+
+        threads = []
+        for i in range(self.nthreads):
+            threads.append(threading.Thread(target=create_users, args=(i,)))
+
+        for t in threads: t.start()
+        for t in threads: t.join()
+
+        self.assertEqual(User.select().count(), self.nrows * self.nthreads)
+
+    def test_multiple_readers(self):
+        data = Queue()
+        def read_user_count(n):
+            for i in range(n):
+                data.put(User.select().count())
+
+        threads = []
+        for i in range(self.nthreads):
+            threads.append(threading.Thread(target=read_user_count,
+                                            args=(self.nrows,)))
+
+        for t in threads: t.start()
+        for t in threads: t.join()
+        self.assertEqual(data.qsize(), self.nrows * self.nthreads)
+
+    def test_mt_general(self):
+        errors = []
+        def connect_close():
+            try:
+                for _ in range(self.nrows):
+                    self.database.connect()
+                    with self.database.atomic() as txn:
+                        self.database.execute_sql('select 1').fetchone()
+                    self.database.close()
+            except Exception as exc:
+                errors.append(exc)
+
+        threads = []
+        for i in range(self.nthreads):
+            threads.append(threading.Thread(target=connect_close))
+
+        for t in threads: t.start()
+        for t in threads: t.join()
+        self.assertEqual(errors, [])
+
+    def test_thread_safety_atomic(self):
+        @self.database.atomic()
+        def get_one(n):
+            time.sleep(n)
+            return User.select().first()
+        errors = []
+        def run(n):
+            try:
+                with self.database.atomic():
+                    self.assertEqual(get_one(n).username, 'u')
+            except Exception as exc:
+                errors.append(exc)
+        User.create(username='u')
+        threads = [threading.Thread(target=run, args=(i,))
+                   for i in (0.01, 0.03, 0.05, 0.07, 0.09, 0.02, 0.04, 0.06)]
+        for t in threads: t.start()
+        for t in threads: t.join()
+        self.assertEqual(errors, [])
+
+
+# ===========================================================================
+# Deferred database, proxy, and schema namespace
+# ===========================================================================
+
+class TestDeferredDatabase(BaseTestCase):
+    def test_deferred_database(self):
+        deferred_db = SqliteDatabase(None)
+        self.assertTrue(deferred_db.deferred)
+
+        class DeferredModel(Model):
+            class Meta:
+                database = deferred_db
+
+        self.assertRaises(Exception, deferred_db.connect)
+        query = DeferredModel.select()
+        self.assertRaises(Exception, query.execute)
+
+        deferred_db.init(':memory:')
+        self.assertFalse(deferred_db.deferred)
+
+        conn = deferred_db.connect()
+        self.assertFalse(deferred_db.is_closed())
+        DeferredModel._schema.create_all()
+        self.assertEqual(list(DeferredModel.select()), [])
+
+        deferred_db.init(None)
+        self.assertTrue(deferred_db.deferred)
+
+        # The connection was automatically closed.
+        self.assertTrue(deferred_db.is_closed())
+
+    def test_init_closes_open_connection(self):
+        db = get_in_memory_db()
+        db.connect()
+        self.assertFalse(db.is_closed())
+        db.init(':memory:')
+        self.assertTrue(db.is_closed())
+
+        # Can reconnect after re-init.
+        db.connect()
+        self.assertFalse(db.is_closed())
+        db.close()
+
+
+class TestDBProxy(BaseTestCase):
+    def test_proxy_context_manager(self):
+        db = Proxy()
+        class User(Model):
+            username = TextField()
+
+            class Meta:
+                database = db
+
+        self.assertRaises(AttributeError, User.create_table)
+
+        sqlite_db = SqliteDatabase(':memory:')
+        db.initialize(sqlite_db)
+        User.create_table()
+        with db:
+            self.assertFalse(db.is_closed())
+        self.assertTrue(db.is_closed())
+
+    def test_db_proxy(self):
+        db = Proxy()
+        class BaseModel(Model):
+            class Meta:
+                database = db
+
+        class User(BaseModel):
+            username = TextField()
+
+        class Tweet(BaseModel):
+            user = ForeignKeyField(User, backref='tweets')
+            message = TextField()
+
+        sqlite_db = SqliteDatabase(':memory:')
+        db.initialize(sqlite_db)
+
+        self.assertEqual(User._meta.database.database, ':memory:')
+        self.assertEqual(Tweet._meta.database.database, ':memory:')
+
+        self.assertTrue(User._meta.database.is_closed())
+        self.assertTrue(Tweet._meta.database.is_closed())
+        sqlite_db.connect()
+        self.assertFalse(User._meta.database.is_closed())
+        self.assertFalse(Tweet._meta.database.is_closed())
+        sqlite_db.close()
+
+    def test_proxy_decorator(self):
+        db = DatabaseProxy()
+
+        @db.connection_context()
+        def with_connection():
+            self.assertFalse(db.is_closed())
+
+        @db.atomic()
+        def with_transaction():
+            self.assertTrue(db.in_transaction())
+
+        @db.manual_commit()
+        def with_manual_commit():
+            self.assertTrue(db.in_transaction())
+
+        db.initialize(SqliteDatabase(':memory:'))
+        with_connection()
+        self.assertTrue(db.is_closed())
+        with_transaction()
+        self.assertFalse(db.in_transaction())
+        with_manual_commit()
+        self.assertFalse(db.in_transaction())
+
+    def test_proxy_bind_ctx_callbacks(self):
+        db = Proxy()
+        class BaseModel(Model):
+            class Meta:
+                database = db
+
+        class Hook(BaseModel):
+            data = BlobField()  # Attaches hook to configure blob-type.
+
+        self.assertTrue(Hook.data._constructor is bytearray)
+
+        class CustomSqliteDB(SqliteDatabase):
+            sentinel = object()
+            def get_binary_type(self):
+                return self.sentinel
+
+        custom_db = CustomSqliteDB(':memory:')
+
+        with custom_db.bind_ctx([Hook]):
+            self.assertTrue(Hook.data._constructor is custom_db.sentinel)
+
+        self.assertTrue(Hook.data._constructor is bytearray)
+
+        custom_db.bind([Hook])
+        self.assertTrue(Hook.data._constructor is custom_db.sentinel)
+
+    def test_proxy_uninitialized_getattr(self):
+        p = Proxy()
+        self.assertRaises(AttributeError, lambda: p.some_method)
+
+        with self.assertRaises(AttributeError):
+            with p:
+                pass
+
+    def test_proxy_setattr_error(self):
+        p = Proxy()
+        with self.assertRaises(AttributeError):
+            p.custom_attr = 42
+
+
+class CatToy(TestModel):
+    description = TextField()
+
+    class Meta:
+        schema = 'huey'
+
+
+@requires_postgresql
+class TestSchemaNamespace(ModelTestCase):
+    requires = [CatToy]
+
+    def setUp(self):
+        with self.database:
+            self.execute('CREATE SCHEMA huey;')
+        super(TestSchemaNamespace, self).setUp()
+
+    def tearDown(self):
+        super(TestSchemaNamespace, self).tearDown()
+        with self.database:
+            self.execute('DROP SCHEMA huey;')
+
+    def test_schema(self):
+        toy = CatToy.create(description='fur mouse')
+        toy_db = CatToy.select().where(CatToy.id == toy.id).get()
+        self.assertEqual(toy.id, toy_db.id)
+        self.assertEqual(toy.description, toy_db.description)
+
+
+# ===========================================================================
+# SQLite pragmas, isolation, ATTACH, and user-defined callbacks
+# ===========================================================================
+
+class TestSqliteDatabaseFeatures(DatabaseTestCase):
+    database = get_sqlite_db()
+
+    def test_pragmas(self):
+        self.database.cache_size = -2048
+        self.assertEqual(self.database.cache_size, -2048)
+        self.database.cache_size = -4096
+        self.assertEqual(self.database.cache_size, -4096)
+
+        self.database.foreign_keys = 'on'
+        self.assertEqual(self.database.foreign_keys, 1)
+        self.database.foreign_keys = 'off'
+        self.assertEqual(self.database.foreign_keys, 0)
+
+    def test_appid_user_version(self):
+        self.assertEqual(self.database.application_id, 0)
+        self.assertEqual(self.database.user_version, 0)
+        self.database.application_id = 1
+        self.database.user_version = 2
+        self.assertEqual(self.database.application_id, 1)
+        self.assertEqual(self.database.user_version, 2)
+        self.assertTrue(self.database.close())
+        self.assertTrue(self.database.connect())
+        self.assertEqual(self.database.application_id, 1)
+        self.assertEqual(self.database.user_version, 2)
+
+    def test_timeout_semantics(self):
+        self.assertEqual(self.database.timeout, 5)
+        self.assertEqual(self.database.pragma('busy_timeout'), 5000)
+
+        self.database.timeout = 2.5
+        self.assertEqual(self.database.timeout, 2.5)
+        self.assertEqual(self.database.pragma('busy_timeout'), 2500)
+
+        self.database.close()
+        self.database.connect()
+
+        self.assertEqual(self.database.timeout, 2.5)
+        self.assertEqual(self.database.pragma('busy_timeout'), 2500)
+
+    def test_pragmas_deferred(self):
+        pragmas = (('journal_mode', 'wal'),)
+        db = SqliteDatabase(None, pragmas=pragmas)
+        self.assertEqual(db._pragmas, pragmas)
+
+        # Test pragmas preserved after initializing.
+        db.init(':memory:')
+        self.assertEqual(db._pragmas, pragmas)
+
+        db = SqliteDatabase(None)
+        self.assertEqual(db._pragmas, ())
+
+        # Test pragmas are set and subsequently overwritten.
+        db.init(':memory:', pragmas=pragmas)
+        self.assertEqual(db._pragmas, pragmas)
+
+        db.init(':memory:', pragmas=())
+        self.assertEqual(db._pragmas, ())
+
+        # Test when specified twice, the previous value is overwritten.
+        db = SqliteDatabase(None, pragmas=pragmas)
+        db.init(':memory:', pragmas=(('cache_size', -8000),))
+        self.assertEqual(db._pragmas, (('cache_size', -8000),))
+
+    def test_pragmas_as_dict(self):
+        pragmas = {'journal_mode': 'wal'}
+        pragma_list = [('journal_mode', 'wal')]
+
+        db = SqliteDatabase(':memory:', pragmas=pragmas)
+        self.assertEqual(db._pragmas, pragma_list)
+
+        # Test deferred databases correctly handle pragma dicts.
+        db = SqliteDatabase(None, pragmas=pragmas)
+        self.assertEqual(db._pragmas, pragma_list)
+
+        db.init(':memory:')
+        self.assertEqual(db._pragmas, pragma_list)
+
+        db.init(':memory:', pragmas={})
+        self.assertEqual(db._pragmas, [])
+
+    def test_pragmas_permanent(self):
+        db = SqliteDatabase(':memory:')
+        db.execute_sql('pragma foreign_keys=0')
+        self.assertEqual(db.foreign_keys, 0)
+
+        db.pragma('foreign_keys', 1, True)
+        self.assertEqual(db.foreign_keys, 1)
+
+        db.close()
+        db.connect()
+        self.assertEqual(db.foreign_keys, 1)
+
+
+class TestSqliteIsolation(ModelTestCase):
+    database = get_sqlite_db()
+    requires = [User]
+
+    def test_sqlite_isolation(self):
+        for username in ('u1', 'u2', 'u3'): User.create(username=username)
+
+        new_db = get_sqlite_db()
+        curs = new_db.execute_sql('SELECT COUNT(*) FROM users')
+        self.assertEqual(curs.fetchone()[0], 3)
+
+        self.assertEqual(User.select().count(), 3)
+        self.assertEqual(User.delete().execute(), 3)
+
+        with self.database.atomic():
+            User.create(username='u4')
+            User.create(username='u5')
+
+            # Second conn does not see the changes.
+            curs = new_db.execute_sql('SELECT COUNT(*) FROM users')
+            self.assertEqual(curs.fetchone()[0], 0)
+
+            # Third conn does not see the changes.
+            new_db2 = get_sqlite_db()
+            curs = new_db2.execute_sql('SELECT COUNT(*) FROM users')
+            self.assertEqual(curs.fetchone()[0], 0)
+
+            # Original connection sees its own changes.
+            self.assertEqual(User.select().count(), 2)
+
+        curs = new_db.execute_sql('SELECT COUNT(*) FROM users')
+        self.assertEqual(curs.fetchone()[0], 2)
+
+
+class Data(TestModel):
+    key = TextField()
+    value = TextField()
+
+    class Meta:
+        schema = 'main'
+
+
+class TestAttachDatabase(ModelTestCase):
+    # ATTACH is sqlite-only.
+    database = get_sqlite_db()
+    requires = [Data]
+
+    def test_attach(self):
+        database = self.database
+        Data.create(key='k1', value='v1')
+        Data.create(key='k2', value='v2')
+
+        # Attach an in-memory cache database.
+        database.attach(':memory:', 'cache')
+
+        # Clone data into the in-memory cache.
+        class CacheData(Data):
+            class Meta:
+                schema = 'cache'
+
+        self.assertFalse(CacheData.table_exists())
+        CacheData.create_table(safe=False)
+        self.assertTrue(CacheData.table_exists())
+
+        (CacheData
+         .insert_from(Data.select(), fields=[Data.id, Data.key, Data.value])
+         .execute())
+
+        # Update the source data.
+        query = Data.update({Data.value: Data.value + '-x'})
+        self.assertEqual(query.execute(), 2)
+
+        # Verify the source data was updated.
+        query = Data.select(Data.key, Data.value).order_by(Data.key)
+        self.assertSQL(query, (
+            'SELECT "t1"."key", "t1"."value" '
+            'FROM "main"."data" AS "t1" '
+            'ORDER BY "t1"."key"'), [])
+        self.assertEqual([v for k, v in query.tuples()], ['v1-x', 'v2-x'])
+
+        # Verify the cached data reflects the original data, pre-update.
+        query = (CacheData
+                 .select(CacheData.key, CacheData.value)
+                 .order_by(CacheData.key))
+        self.assertSQL(query, (
+            'SELECT "t1"."key", "t1"."value" '
+            'FROM "cache"."cache_data" AS "t1" '
+            'ORDER BY "t1"."key"'), [])
+        self.assertEqual([v for k, v in query.tuples()], ['v1', 'v2'])
+
+        database.close()
+
+        # On re-connecting, the in-memory database will re-attached.
+        database.connect()
+
+        # Cache-Data table does not exist.
+        self.assertFalse(CacheData.table_exists())
+
+        # Double-check the sqlite master table.
+        curs = database.execute_sql('select * from cache.sqlite_master;')
+        self.assertEqual(curs.fetchall(), [])
+
+        # Because it's in-memory, the table needs to be re-created.
+        CacheData.create_table(safe=False)
+        self.assertEqual(CacheData.select().count(), 0)
+
+        # Original data is still there.
+        self.assertEqual(Data.select().count(), 2)
+
+    def test_attach_detach(self):
+        database = self.database
+        Data.create(key='k1', value='v1')
+        Data.create(key='k2', value='v2')
+
+        # Attach an in-memory cache database.
+        database.attach(':memory:', 'cache')
+        curs = database.execute_sql('select * from cache.sqlite_master')
+        self.assertEqual(curs.fetchall(), [])
+
+        self.assertFalse(database.attach(':memory:', 'cache'))
+        self.assertRaises(OperationalError, database.attach, 'foo.db', 'cache')
+
+        self.assertTrue(database.detach('cache'))
+        self.assertFalse(database.detach('cache'))
+        self.assertRaises(OperationalError, database.execute_sql,
+                          'select * from cache.sqlite_master')
+
+    def test_sqlite_schema_support(self):
+        class CacheData(Data):
+            class Meta:
+                schema = 'cache'
+
+        # Attach an in-memory cache database and create the cache table.
+        self.database.attach(':memory:', 'cache')
+        CacheData.create_table()
+
+        tables = self.database.get_tables()
+        self.assertEqual(tables, ['data'])
+
+        tables = self.database.get_tables(schema='cache')
+        self.assertEqual(tables, ['cache_data'])
+
+
+class WeightedAverage(object):
+    def __init__(self):
+        self.total = 0.
+        self.count = 0.
+
+    def step(self, value, weight=None):
+        weight = weight or 1.
+        self.total += weight
+        self.count += (weight * value)
+
+    def finalize(self):
+        if self.total != 0.:
+            return self.count / self.total
+        return 0.
+
+class RunningTotal(object):
+    def __init__(self):
+        self.total = 0.
+
+    def step(self, value):
+        self.total += value
+
+    def inverse(self, value):
+        self.total -= value
+
+    def value(self):
+        return self.total
+
+    def finalize(self):
+        return self.total
+
+
+def _cmp(l, r):
+    if l < r:
+        return -1
+    return 1 if r < l else 0
+
+def collate_reverse(s1, s2):
+    return -_cmp(s1, s2)
+
+callback_db = get_in_memory_db()
+
+@callback_db.collation()
+def collate_case_insensitive(s1, s2):
+    return _cmp(s1.lower(), s2.lower())
+
+def title_case(s): return s.title()
+
+@callback_db.func()
+def rstrip(s, n):
+    return s.rstrip(n)
+
+callback_db.register_aggregate(WeightedAverage, 'weighted_avg', 1)
+callback_db.register_aggregate(WeightedAverage, 'weighted_avg2', 2)
+callback_db.register_collation(collate_reverse)
+callback_db.register_function(title_case)
+
+
+class Post(TestModel):
+    message = TextField()
+
+class Values(TestModel):
+    klass = IntegerField()
+    value = FloatField()
+    weight = FloatField()
+
+
+class TestUserDefinedCallbacks(ModelTestCase):
+    database = callback_db
+    requires = [Post, Values]
+
+    def test_custom_agg(self):
+        data = (
+            (1, 3.4, 1.0),
+            (1, 6.4, 2.3),
+            (1, 4.3, 0.9),
+            (2, 3.4, 1.4),
+            (3, 2.7, 1.1),
+            (3, 2.5, 1.1),
+        )
+        for klass, value, wt in data:
+            Values.create(klass=klass, value=value, weight=wt)
+
+        vq = (Values
+              .select(
+                  Values.klass,
+                  fn.weighted_avg(Values.value).alias('wtavg'),
+                  fn.avg(Values.value).alias('avg'))
+              .group_by(Values.klass))
+        q_data = [(v.klass, v.wtavg, v.avg) for v in vq]
+        self.assertEqual(q_data, [
+            (1, 4.7, 4.7),
+            (2, 3.4, 3.4),
+            (3, 2.6, 2.6)])
+
+        vq = (Values
+              .select(
+                  Values.klass,
+                  fn.weighted_avg2(Values.value, Values.weight).alias('wtavg'),
+                  fn.avg(Values.value).alias('avg'))
+              .group_by(Values.klass))
+        q_data = [(v.klass, str(v.wtavg)[:4], v.avg) for v in vq]
+        self.assertEqual(q_data, [
+            (1, '5.23', 4.7),
+            (2, '3.4', 3.4),
+            (3, '2.6', 2.6)])
+
+    def test_custom_collation(self):
+        for i in [1, 4, 3, 5, 2]:
+            Post.create(message='p%d' % i)
+
+        pq = Post.select().order_by(Post.message.collate('collate_reverse'))
+        self.assertEqual([p.message for p in pq],
+                         ['p5', 'p4', 'p3', 'p2', 'p1'])
+
+        pq = Post.select().order_by(
+            Post.message.asc(collation='collate_reverse'))
+        self.assertEqual([p.message for p in pq],
+                         ['p5', 'p4', 'p3', 'p2', 'p1'])
+
+        pq = Post.select().order_by(
+            Post.message.desc(collation='collate_reverse'))
+        self.assertEqual([p.message for p in pq],
+                         ['p1', 'p2', 'p3', 'p4', 'p5'])
+
+    def test_collation_decorator(self):
+        posts = [Post.create(message=m)
+                 for m in ['aaa', 'Aab', 'ccc', 'Bba', 'BbB']]
+        exprs = (
+            Post.message.collate('collate_case_insensitive'),
+            Post.message.asc(collation='collate_case_insensitive'))
+        for expr in exprs:
+            pq = Post.select().order_by(expr)
+            self.assertEqual([p.message for p in pq], [
+                'aaa',
+                'Aab',
+                'Bba',
+                'BbB',
+                'ccc'])
+
+    def test_custom_function(self):
+        p1 = Post.create(message='this is a test')
+        p2 = Post.create(message='another TEST')
+
+        sq = Post.select().where(
+            fn.title_case(Post.message) == 'This Is A Test')
+        self.assertEqual(list(sq), [p1])
+
+        sq = Post.select(fn.title_case(Post.message)).tuples()
+        self.assertEqual([x[0] for x in sq], [
+            'This Is A Test',
+            'Another Test',
+        ])
+
+    def test_function_decorator(self):
+        [Post.create(message=m) for m in ['testing', 'chatting  ', '  foo']]
+        pq = Post.select(fn.rstrip(Post.message, 'ing')).order_by(Post.id)
+        self.assertEqual([x[0] for x in pq.tuples()], [
+            'test', 'chatting  ', '  foo'])
+
+        pq = Post.select(fn.rstrip(Post.message, ' ')).order_by(Post.id)
+        self.assertEqual([x[0] for x in pq.tuples()], [
+            'testing', 'chatting', '  foo'])
+
+    @skip_unless(HAS_WINDOW_FUNCTION)
+    def test_custom_window_function(self):
+        # Registering against a live connection applies to it immediately.
+        self.database.register_window_function(RunningTotal, 'running_total',
+                                               1)
+        for value in (1., 2., 3., 4.):
+            Values.create(klass=1, value=value, weight=1.)
+
+        vq = (Values
+              .select(Values.value,
+                      fn.running_total(Values.value)
+                      .over(order_by=[Values.id])
+                      .alias('rt'))
+              .order_by(Values.id))
+        self.assertEqual([(v.value, v.rt) for v in vq],
+                         [(1., 1.), (2., 3.), (3., 6.), (4., 10.)])
+        self.database.unregister_window_function('running_total')
+
+    @skip_unless(HAS_WINDOW_FUNCTION)
+    def test_window_function_decorator(self):
+        db = get_in_memory_db()
+
+        @db.window_function('wsum')
+        class WSum(RunningTotal):
+            pass
+
+        sql = ('select wsum(c) over (order by c) from '
+               '(select 1 as c union all select 2)')
+        db.connect()
+        self.assertEqual(db.execute_sql(sql).fetchall(), [(1.,), (3.,)])
+
+        # Unregistering takes effect on the next connection.
+        db.unregister_window_function('wsum')
+        self.assertEqual(db.execute_sql(sql).fetchall(), [(1.,), (3.,)])
+        db.close()
+        db.connect()
+        self.assertRaises(OperationalError, db.execute_sql, sql)
+        db.close()
+
+    def test_use_across_connections(self):
+        db = get_in_memory_db()
+        @db.func()
+        def rev(s):
+            return s[::-1]
+
+        db.connect(); db.close(); db.connect()
+        curs = db.execute_sql('select rev(?)', ('hello',))
+        self.assertEqual(curs.fetchone(), ('olleh',))
+
+
+class TestReadOnly(ModelTestCase):
+    # uri mode=ro is sqlite-only.
+    database = get_sqlite_db()
+
+    @requires_models(User)
+    def test_read_only(self):
+        User.create(username='foo')
+
+        db_filename = self.database.database
+        db = SqliteDatabase('file:%s?mode=ro' % db_filename, uri=True)
+        cursor = db.execute_sql('select username from users')
+        self.assertEqual(cursor.fetchone(), ('foo',))
+
+        self.assertRaises(OperationalError, db.execute_sql,
+                          'insert into users (username) values (?)', ('huey',))
+
+        # We cannot create a database if in read-only mode.
+        db = SqliteDatabase('file:xx_not_exists.db?mode=ro', uri=True)
+        self.assertRaises(OperationalError, db.connect)
+
+
+class TestDeterministicFunction(ModelTestCase):
+    # register_function(deterministic=True) is sqlite-only.
+    database = get_in_memory_db()
+
+    def test_deterministic(self):
+        db = self.database
+        @db.func(deterministic=True)
+        def pylower(s):
+            if s is not None:
+                return s.lower()
+
+        class Reg(db.Model):
+            key = TextField()
+            class Meta:
+                indexes = [
+                    SQL('create unique index "reg_pylower_key" '
+                        'on "reg" (pylower("key"))')]
+
+        db.drop_tables([Reg])
+        db.create_tables([Reg])
+        Reg.create(key='k1')
+        with self.assertRaises(IntegrityError):
+            with db.atomic():
+                Reg.create(key='K1')
+
+
+# ===========================================================================
+# Exception handling and utilities
+# ===========================================================================
+
+class TestExceptionWrapper(ModelTestCase):
+    requires = [User]
+
+    def test_exception_wrapper(self):
+        exc = None
+        try:
+            User.create(username=None)
+        except IntegrityError as e:
+            exc = e
+
+        if exc is None: raise Exception('expected integrity error not raised')
+        self.assertTrue(exc.orig.__module__ != 'peewee')
+
+    @requires_postgresql
+    def test_statement_timeout(self):
+        self.database.execute_sql('SET statement_timeout = 10')
+        try:
+            with self.assertRaises(OperationalError):
+                self.database.execute_sql('SELECT pg_sleep(1)')
+        finally:
+            self.database.execute_sql('SET statement_timeout = 0')
+
+
+class TestModelPropertyHelper(BaseTestCase):
+    def test_model_property(self):
+        database = get_in_memory_db()
+        class M1(database.Model): pass
+        class M2(database.Model): pass
+        class CM1(M1): pass
+        for M in (M1, M2, CM1):
+            self.assertTrue(M._meta.database is database)
+
+    def test_model_property_on_proxy(self):
+        db = DatabaseProxy()
+        class M1(db.Model): pass
+        class M2(db.Model): pass
+        class CM1(M1): pass
+
+        test_db = get_in_memory_db()
+        db.initialize(test_db)
+        for M in (M1, M2, CM1):
+            self.assertEqual(M._meta.database.database, ':memory:')
+
+
+class TestSortModels(BaseTestCase):
+    def test_sort_models(self):
+        class A(Model):
+            pass
+        class B(Model):
+            a = ForeignKeyField(A)
+        class C(Model):
+            b = ForeignKeyField(B)
+        class D(Model):
+            c = ForeignKeyField(C)
+        class E(Model):
+            pass
+
+        models = [A, B, C, D, E]
+        for list_of_models in permutations(models):
+            sorted_models = sort_models(list_of_models)
+            self.assertEqual(sorted_models, models)
+
+    def test_sort_models_multi_fk(self):
+        class Inventory(Model):
+            pass
+        class Sheet(Model):
+            inventory = ForeignKeyField(Inventory)
+        class Program(Model):
+            inventory = ForeignKeyField(Inventory)
+        class ProgramSheet(Model):
+            program = ForeignKeyField(Program)
+            sheet = ForeignKeyField(Sheet)
+        class ProgramPart(Model):
+            program_sheet = ForeignKeyField(ProgramSheet)
+        class Offal(Model):
+            program_sheet = ForeignKeyField(ProgramSheet)
+            sheet = ForeignKeyField(Sheet)
+
+        M = [Inventory, Sheet, Program, ProgramSheet, ProgramPart, Offal]
+        sorted_models = sort_models(M)
+        self.assertEqual(sorted_models, [
+            Inventory,
+            Program,
+            Sheet,
+            ProgramSheet,
+            Offal,
+            ProgramPart,
+        ])
+        for list_of_models in permutations(M):
+            self.assertEqual(sort_models(list_of_models), sorted_models)
+
+    def test_deferred_fk_dependency_graph(self):
+        class AUser(TestModel):
+            foo = DeferredForeignKey('Tweet')
+        class ZTweet(TestModel):
+            user = ForeignKeyField(AUser, backref='ztweets')
+
+        self.assertEqual(sort_models([AUser, ZTweet]), [AUser, ZTweet])
+
+
+class TestChunkedUtility(BaseTestCase):
+    def test_chunked_exact_divisor(self):
+        result = list(chunked(range(6), 3))
+        self.assertEqual(result, [[0, 1, 2], [3, 4, 5]])
+
+    def test_chunked_with_remainder(self):
+        result = list(chunked(range(7), 3))
+        self.assertEqual(result, [[0, 1, 2], [3, 4, 5], [6]])
+
+    def test_chunked_single_element(self):
+        result = list(chunked([42], 5))
+        self.assertEqual(result, [[42]])
+
+    def test_chunked_empty(self):
+        result = list(chunked([], 5))
+        self.assertEqual(result, [])
+
+    def test_chunked_size_one(self):
+        result = list(chunked(range(3), 1))
+        self.assertEqual(result, [[0], [1], [2]])
+
+    def test_chunked_generator_input(self):
+        gen = (x * 2 for x in range(5))
+        result = list(chunked(gen, 2))
+        self.assertEqual(result, [[0, 2], [4, 6], [8]])
+
+
+class TestUtilityFunctions(BaseTestCase):
+    def test_make_snake_case(self):
+        from peewee import make_snake_case
+        self.assertEqual(make_snake_case('SomeModel'), 'some_model')
+        self.assertEqual(make_snake_case('APIResponse'), 'api_response')
+        self.assertEqual(make_snake_case('fooBar'), 'foo_bar')
+        self.assertEqual(make_snake_case('MyHTTPClient'), 'my_http_client')
+        self.assertEqual(make_snake_case('Simple'), 'simple')
+        self.assertEqual(make_snake_case('A'), 'a')
+
+    def test_make_identifier(self):
+        from peewee import make_identifier
+        self.assertEqual(make_identifier('name'), 'name')
+        self.assertEqual(make_identifier('"t1"."name"'), 'name')
+        self.assertEqual(make_identifier('SUM("t1"."price")'), 'price')
+        self.assertEqual(make_identifier('"foo"()'), 'foo')
+        self.assertEqual(make_identifier('col name'), 'col')
+        self.assertEqual(make_identifier('θ_col'), 'θ_col')
+        self.assertEqual(make_identifier('SUM("t1"."θ_col")'), 'θ_col')
+        self.assertEqual(make_identifier('col$name'), 'col')
+
+    def test_ensure_tuple(self):
+        from peewee import ensure_tuple
+        self.assertEqual(ensure_tuple(None), None)
+        self.assertEqual(ensure_tuple(1), (1,))
+        self.assertEqual(ensure_tuple('a'), ('a',))
+        self.assertEqual(ensure_tuple((1, 2)), (1, 2))
+        self.assertEqual(ensure_tuple([1, 2]), [1, 2])
+
+    def test_ensure_entity(self):
+        from peewee import ensure_entity, Entity
+        self.assertIsNone(ensure_entity(None))
+        e = ensure_entity('col_name')
+        self.assertIsInstance(e, Entity)
+        # Passing a Node returns it as-is.
+        existing = Entity('x')
+        self.assertIs(ensure_entity(existing), existing)
+
+    def test_merge_dict(self):
+        from peewee import merge_dict
+        base = {'a': 1, 'b': 2}
+        result = merge_dict(base, {'b': 3, 'c': 4})
+        self.assertEqual(result, {'a': 1, 'b': 3, 'c': 4})
+        # Original unchanged.
+        self.assertEqual(base, {'a': 1, 'b': 2})
+        # None/empty overrides.
+        self.assertEqual(merge_dict(base, None), {'a': 1, 'b': 2})
+        self.assertEqual(merge_dict(base, {}), {'a': 1, 'b': 2})
+
+    def test_quote(self):
+        from peewee import quote
+        self.assertEqual(quote(['table'], '""'), '"table"')
+        self.assertEqual(quote(['schema', 'table'], '""'),
+                         '"schema"."table"')
+        self.assertEqual(quote(['table'], '``'), '`table`')
+
+    def test_attrdict_operators(self):
+        d1 = attrdict(a=1, b=2)
+        d2 = attrdict(b=3, c=4)
+        # __add__ produces new merged dict.
+        d3 = d1 + d2
+        self.assertEqual(d3, {'a': 1, 'b': 3, 'c': 4})
+        self.assertIsInstance(d3, attrdict)
+        # Original unchanged.
+        self.assertEqual(d1, {'a': 1, 'b': 2})
+        # __iadd__ mutates in place.
+        d1 += d2
+        self.assertEqual(d1, {'a': 1, 'b': 3, 'c': 4})
+
+        d = attrdict(a=1)
+        self.assertEqual(d.a, 1)
+        self.assertRaises(AttributeError, lambda: d.missing)
+
+    def test_query_val_transform(self):
+        import datetime
+        from peewee import _query_val_transform
+        self.assertEqual(_query_val_transform('hello'), "'hello'")
+        self.assertEqual(_query_val_transform("it's"), "'it''s'")
+        self.assertEqual(_query_val_transform(42), '42')
+        self.assertEqual(_query_val_transform(True), 'TRUE')
+        self.assertEqual(_query_val_transform(False), 'FALSE')
+        self.assertEqual(_query_val_transform(None), 'NULL')
+        dt = datetime.datetime(2023, 1, 15, 10, 30)
+        self.assertEqual(_query_val_transform(dt), "'2023-01-15 10:30:00'")
+        d = datetime.date(2023, 1, 15)
+        self.assertEqual(_query_val_transform(d), "'2023-01-15'")
+        b = b'hello'
+        result = _query_val_transform(b)
+        self.assertEqual(result, "'hello'")
+
+    def test_deprecated_emits_warning(self):
+        from peewee import __deprecated__
+        with warnings.catch_warnings(record=True) as w:
+            warnings.simplefilter('always')
+            __deprecated__('test message')
+            self.assertEqual(len(w), 1)
+            self.assertTrue(issubclass(w[0].category, DeprecationWarning))
+            self.assertIn('test message', str(w[0].message))
+
+
+# ===========================================================================
+# Cross-database helpers
+# ===========================================================================
+
+class TestDatabaseSQLHelpers(BaseTestCase):
+    def test_random(self):
+        db = SqliteDatabase(':memory:')
+        self.assertSQL(db.random(), 'random()')
+
+        db = MySQLDatabase.__new__(MySQLDatabase)
+        self.assertSQL(db.random(), 'rand()')
+
+        db = PostgresqlDatabase.__new__(PostgresqlDatabase)
+        self.assertSQL(db.random(), 'random()')
+
+    def test_get_noop_select(self):
+        db = SqliteDatabase(':memory:')
+        ctx = db.get_noop_select(Context())
+        self.assertSQL(ctx, 'SELECT 0 WHERE 0')
+
+        db = MySQLDatabase.__new__(MySQLDatabase)
+        ctx = db.get_noop_select(Context())
+        self.assertSQL(ctx, 'SELECT 0 WHERE 0=1')
+
+        db = PostgresqlDatabase.__new__(PostgresqlDatabase)
+        ctx = db.get_noop_select(Context())
+        self.assertSQL(ctx, 'SELECT 0 WHERE false')
+
+    def test_extract_server_version(self):
+        db = MySQLDatabase.__new__(MySQLDatabase)
+        version = db._extract_server_version('8.0.31')
+        self.assertEqual(version, (8, 0, 31))
+
+        version = db._extract_server_version('5.5.5-10.6.12-MariaDB')
+        self.assertEqual(version, (10, 6, 12))
+
+        db = MySQLDatabase.__new__(MySQLDatabase)
+        with warnings.catch_warnings(record=True) as w:
+            warnings.simplefilter('always')
+            version = db._extract_server_version('unknown')
+            self.assertEqual(version, (0, 0, 0))
+            self.assertTrue(len(w) > 0)
+
+        db = MySQLDatabase.__new__(MySQLDatabase)
+        version = db._extract_server_version((8, 0, 31))
+        self.assertEqual(version, (8, 0, 31))

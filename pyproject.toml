@@ -1,0 +1,53 @@
+[build-system]
+build-backend="setuptools.build_meta"
+requires = [
+    "setuptools",
+    "cython>=3; platform_python_implementation == 'CPython'",
+]
+
+[project]
+name = "peewee"
+dynamic = ["version"]
+description = "a little orm"
+readme = "README.rst"
+authors = [
+    { name = "Charles Leifer", email = "coleifer@gmail.com" }
+]
+classifiers = [
+    "Development Status :: 5 - Production/Stable",
+    "Intended Audience :: Developers",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: Implementation :: CPython",
+    "Programming Language :: Python :: Implementation :: PyPy",
+    "Topic :: Database",
+    "Topic :: Database :: Front-Ends",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+]
+requires-python = ">=3.8"
+
+[project.scripts]
+pwiz = "pwiz:main"
+pwmigrate = "playhouse.migrations:main"
+
+[project.urls]
+Repository = "https://github.com/coleifer/peewee"
+Documentation = "https://docs.peewee-orm.com/"
+Changelog = "https://github.com/coleifer/peewee/blob/master/CHANGELOG.md"
+
+[project.optional-dependencies]
+mysql = ["pymysql"]
+postgres = ["psycopg2-binary"]
+psycopg3 = ["psycopg[binary]"]
+cysqlite = ["cysqlite>=0.3.5"]
+aiosqlite = ["aiosqlite ", "greenlet"]
+aiomysql = ["aiomysql", "greenlet"]
+asyncpg = ["asyncpg ", "greenlet"]
+
+[tool.setuptools]
+# packages declared in setup.py: the -stubs dir names have hyphens, rejected here.
+py-modules = ["peewee", "pwiz"]
+exclude-package-data = {"playhouse" = ["*.pyx"]}
+
+[tool.setuptools.dynamic]
+version = { attr = "peewee.__version__" }
