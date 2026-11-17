@@ -1259,6 +1259,152 @@ class TestCollectorRegistry(unittest.TestCase):
         for _ in registry.restricted_registry(['target_info', 's_sum']).collect():
             self.assertFalse(registry._lock.locked())
 
+    def test_replace_collectors_swaps_group_atomically(self):
+        registry = CollectorRegistry()
+        old_a = Counter('old_a_total', 'help', registry=registry)
+        old_b = Gauge('old_b', 'help', registry=registry)
+        keeper = Gauge('keeper', 'help', registry=registry)
+        keeper.inc()
+
+        new_a = Counter('new_a_total', 'help', registry=None)
+        new_b = Summary('new_b', 'help', registry=None)
+        registry.replace_collectors([old_a, old_b], [new_a, new_b])
+
+        self.assertEqual(1, registry.get_sample_value('keeper'))
+        self.assertIsNone(registry.get_sample_value('old_a_total'))
+        self.assertIsNone(registry.get_sample_value('old_b'))
+        new_a.inc()
+        new_b.observe(7)
+        self.assertEqual(1, registry.get_sample_value('new_a_total'))
+        self.assertEqual(1, registry.get_sample_value('new_b_count'))
+        self.assertEqual(7, registry.get_sample_value('new_b_sum'))
+        # The new names are now owned by the new collectors.
+        self.assertRaises(DuplicateTimeseries, Gauge, 'new_a_total', 'help', registry=registry)
+        self.assertRaises(DuplicateTimeseries, Gauge, 'new_b_sum', 'help', registry=registry)
+        # The old names are free again.
+        Gauge('old_b', 'help', registry=registry)
+
+    def test_replace_collectors_allows_name_reuse_within_group(self):
+        registry = CollectorRegistry()
+        old = Counter('c_total', 'help', registry=registry)
+        new = Counter('c_total', 'help', registry=None)
+        registry.replace_collectors([old], [new])
+        new.inc()
+        self.assertEqual(1, registry.get_sample_value('c_total'))
+
+    def test_replace_collectors_conflict_keeps_old_group(self):
+        registry = CollectorRegistry()
+        old = Gauge('old', 'help', registry=registry)
+        old.inc()
+        other = Gauge('other', 'help', registry=registry)
+        other.inc()
+        new = Gauge('other', 'help', registry=None)
+
+        self.assertRaises(DuplicateTimeseries, registry.replace_collectors, [old], [new])
+        # Nothing changed: old group still registered, new one is not.
+        self.assertEqual(1, registry.get_sample_value('old'))
+        self.assertEqual(1, registry.get_sample_value('other'))
+        self.assertRaises(DuplicateTimeseries, Gauge, 'old', 'help', registry=registry)
+        registry.unregister(other)
+        # The conflicting new collector was not partially registered.
+        registry.register(Gauge('other', 'help', registry=None))
+
+    def test_replace_collectors_describe_failure_keeps_old_group(self):
+        registry = CollectorRegistry()
+        old = Gauge('old', 'help', registry=registry)
+        old.inc()
+
+        class BrokenCollector:
+            def describe(self):
+                raise RuntimeError('boom')
+
+            def collect(self):
+                return []
+
+        self.assertRaises(RuntimeError, registry.replace_collectors, [old], [BrokenCollector()])
+        self.assertEqual(1, registry.get_sample_value('old'))
+
+    def test_replace_collectors_reentrant_describe_does_not_deadlock(self):
+        registry = CollectorRegistry()
+        old = Gauge('old', 'help', registry=registry)
+        old.inc()
+
+        class ReentrantCollector:
+            def describe(self):
+                # Re-enter the registry while replacement is being prepared.
+                registry.get_sample_value('old')
+                return [Metric('reentrant', 'help', 'gauge')]
+
+            def collect(self):
+                m = Metric('reentrant', 'help', 'gauge')
+                m.add_sample('reentrant', {}, 5)
+                return [m]
+
+        registry.replace_collectors([old], [ReentrantCollector()])
+        self.assertIsNone(registry.get_sample_value('old'))
+        self.assertEqual(5, registry.get_sample_value('reentrant'))
+
+    def test_replace_collectors_unregistered_old_raises_and_keeps_state(self):
+        registry = CollectorRegistry()
+        old = Gauge('old', 'help', registry=registry)
+        old.inc()
+        stranger = Gauge('stranger', 'help', registry=None)
+        new = Gauge('new', 'help', registry=None)
+
+        self.assertRaises(ValueError, registry.replace_collectors, [old, stranger], [new])
+        self.assertEqual(1, registry.get_sample_value('old'))
+        self.assertIsNone(registry.get_sample_value('new'))
+
+    def test_replace_collectors_duplicate_names_within_new_group(self):
+        registry = CollectorRegistry()
+        old = Gauge('old', 'help', registry=registry)
+        old.inc()
+        new_a = Gauge('dup', 'help', registry=None)
+        new_b = Counter('dup_total', 'help', registry=None)
+
+        self.assertRaises(DuplicateTimeseries, registry.replace_collectors, [old], [new_a, new_b])
+        self.assertEqual(1, registry.get_sample_value('old'))
+        self.assertIsNone(registry.get_sample_value('dup'))
+
+    def test_replace_collectors_already_registered_new_collector(self):
+        registry = CollectorRegistry()
+        old = Gauge('old', 'help', registry=registry)
+        old.inc()
+        existing = Gauge('existing', 'help', registry=registry)
+        existing.inc()
+
+        self.assertRaises(ValueError, registry.replace_collectors, [old], [existing])
+        self.assertEqual(1, registry.get_sample_value('old'))
+        self.assertEqual(1, registry.get_sample_value('existing'))
+
+    def test_replace_collectors_nameless_collectors(self):
+        registry = CollectorRegistry(support_collectors_without_names=True)
+
+        class NamelessCollector:
+            def __init__(self, value):
+                self.value = value
+
+            def collect(self):
+                return [GaugeMetricFamily('nameless', 'help', value=self.value)]
+
+        old = NamelessCollector(1)
+        new = NamelessCollector(2)
+        registry.register(old)
+        registry.replace_collectors([old], [new])
+        self.assertEqual(2, registry.get_sample_value('nameless'))
+        # The old nameless collector must not linger in the
+        # collectors-without-names list.
+        registry.unregister(new)
+        self.assertEqual([], list(registry.restricted_registry(['nameless']).collect()))
+
+    def test_replace_collectors_empty_groups(self):
+        registry = CollectorRegistry()
+        registry.replace_collectors([], [])
+        g = Gauge('g', 'help', registry=registry)
+        registry.replace_collectors([g], [])
+        self.assertEqual({}, registry._collector_to_names)
+
+
 
 class LegacyValidationContextManager:
     def __enter__(self):

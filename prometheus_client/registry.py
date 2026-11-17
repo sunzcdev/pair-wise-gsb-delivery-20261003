@@ -64,6 +64,73 @@ class CollectorRegistry:
             if collector in self._collectors_without_names:
                 self._collectors_without_names.remove(collector)
 
+    def replace_collectors(self, old_collectors: Iterable[Collector],
+                           new_collectors: Iterable[Collector]) -> None:
+        """Atomically replace a group of collectors with a new group.
+
+        Intended for hot-reloading exporters: the metric catalog switches from
+        the old group to the new group in one step, so a scrape never observes
+        a half-swapped set of names. A collect() that already started keeps
+        using its snapshot of the old collectors; later collects see the new
+        group.
+
+        The new collectors are prepared (their declared metric names and
+        derived suffixes are collected via describe/collect) before anything
+        is changed. Preparation happens without holding the registry lock, so
+        a describe/collect implementation may raise or re-enter the registry
+        without deadlocking. If preparation fails, if any new name conflicts
+        with a collector outside the old group, or if any old collector is no
+        longer registered, the registry is left untouched and an exception is
+        raised.
+        """
+        old_collectors = list(dict.fromkeys(old_collectors))
+        new_collectors = list(dict.fromkeys(new_collectors))
+
+        # Phase 1: prepare without holding the lock. _get_names may call
+        # arbitrary user code (describe, or collect with auto_describe) which
+        # may raise or re-enter the registry.
+        names_per_collector: List[List[str]] = []
+        all_new_names: Set[str] = set()
+        for collector in new_collectors:
+            names = self._get_names(collector)
+            duplicates = all_new_names.intersection(names)
+            if duplicates or len(names) != len(set(names)):
+                duplicates |= {n for n in names if names.count(n) > 1}
+                raise DuplicateTimeseries(duplicates)
+            all_new_names.update(names)
+            names_per_collector.append(names)
+
+        # Phase 2: validate and swap atomically under the lock. No user code
+        # is called here, and on any failure nothing has been modified yet.
+        with self._lock:
+            old_name_set: Set[str] = set()
+            for collector in old_collectors:
+                if collector not in self._collector_to_names:
+                    raise ValueError('Collector is not registered: {}'.format(collector))
+                old_name_set.update(self._collector_to_names[collector])
+
+            for collector in new_collectors:
+                if collector in self._collector_to_names and collector not in old_collectors:
+                    raise ValueError('Collector is already registered: {}'.format(collector))
+
+            conflicts = all_new_names.intersection(self._names_to_collectors) - old_name_set
+            if conflicts:
+                raise DuplicateTimeseries(conflicts)
+
+            for collector in old_collectors:
+                for name in self._collector_to_names[collector]:
+                    del self._names_to_collectors[name]
+                del self._collector_to_names[collector]
+                if collector in self._collectors_without_names:
+                    self._collectors_without_names.remove(collector)
+
+            for collector, names in zip(new_collectors, names_per_collector):
+                for name in names:
+                    self._names_to_collectors[name] = collector
+                self._collector_to_names[collector] = names
+                if self._support_collectors_without_names and not names:
+                    self._collectors_without_names.append(collector)
+
     def _get_names(self, collector):
         """Get names of timeseries the collector produces and clashes with."""
         desc_func = None
