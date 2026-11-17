@@ -1,0 +1,309 @@
+import asyncio
+import gzip
+import inspect
+from unittest import skipUnless, TestCase
+
+from asgiref.testing import ApplicationCommunicator
+
+from prometheus_client import CollectorRegistry, Counter, make_asgi_app
+from prometheus_client.exposition import CONTENT_TYPE_PLAIN_0_0_4
+
+try:
+    from starlette.applications import Starlette  # type: ignore[import]
+
+    HAVE_STARLETTE = True
+except ImportError:
+    HAVE_STARLETTE = False
+
+
+def setup_testing_defaults(scope):
+    scope.update(
+        {
+            "client": ("127.0.0.1", 32767),
+            "headers": [],
+            "http_version": "1.0",
+            "method": "GET",
+            "path": "/",
+            "query_string": b"",
+            "scheme": "http",
+            "server": ("127.0.0.1", 80),
+            "type": "http",
+        }
+    )
+
+
+class ASGITest(TestCase):
+    def setUp(self):
+        self.registry = CollectorRegistry()
+        self.captured_status = None
+        self.captured_headers = None
+        # Setup ASGI scope
+        self.scope = {}
+        setup_testing_defaults(self.scope)
+        self.loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(self.loop)
+        self.communicator = None
+
+    def tearDown(self):
+        if self.communicator:
+            self.loop.run_until_complete(
+                self.communicator.wait()
+            )
+        self.loop.close()
+            
+    def seed_app(self, app):
+        async def _init():
+            self.communicator = ApplicationCommunicator(app, self.scope)
+        self.loop.run_until_complete(_init())
+
+    def send_input(self, payload):
+        self.loop.run_until_complete(
+            self.communicator.send_input(payload)
+        )
+
+    def send_default_request(self):
+        self.send_input({"type": "http.request", "body": b""})
+
+    def get_output(self):
+        output = self.loop.run_until_complete(
+            self.communicator.receive_output(0)
+        )
+        return output
+
+    def get_all_output(self):
+        outputs = []
+        while True:
+            try:
+                outputs.append(self.get_output())
+            except asyncio.TimeoutError:
+                break
+        return outputs
+
+    def get_all_response_headers(self):
+        outputs = self.get_all_output()
+        response_start = next(o for o in outputs if o["type"] == "http.response.start")
+        return response_start["headers"]
+
+    def get_response_header_value(self, header_name):
+        response_headers = self.get_all_response_headers()
+        return next(
+            value.decode("utf-8")
+            for name, value in response_headers
+            if name.decode("utf-8") == header_name
+        )
+
+    def increment_metrics(self, metric_name, help_text, increments):
+        c = Counter(metric_name, help_text, registry=self.registry)
+        for _ in range(increments):
+            c.inc()
+
+    def assert_metrics(self, output, metric_name, help_text, increments):
+        self.assertIn("# HELP " + metric_name + "_total " + help_text + "\n", output)
+        self.assertIn("# TYPE " + metric_name + "_total counter\n", output)
+        self.assertIn(metric_name + "_total " + str(increments) + ".0\n", output)
+
+    def assert_not_metrics(self, output, metric_name, help_text, increments):
+        self.assertNotIn("# HELP " + metric_name + "_total " + help_text + "\n", output)
+        self.assertNotIn("# TYPE " + metric_name + "_total counter\n", output)
+        self.assertNotIn(metric_name + "_total " + str(increments) + ".0\n", output)
+
+    def assert_outputs(self, outputs, metric_name, help_text, increments, compressed):
+        self.assertEqual(len(outputs), 2)
+        response_start = outputs[0]
+        self.assertEqual(response_start['type'], 'http.response.start')
+        response_body = outputs[1]
+        self.assertEqual(response_body['type'], 'http.response.body')
+        # Status code
+        self.assertEqual(response_start['status'], 200)
+        # Headers
+        num_of_headers = 2 if compressed else 1
+        self.assertEqual(len(response_start['headers']), num_of_headers)
+        self.assertIn((b"Content-Type", CONTENT_TYPE_PLAIN_0_0_4.encode('utf8')), response_start['headers'])
+        if compressed:
+            self.assertIn((b"Content-Encoding", b"gzip"), response_start['headers'])
+        # Body
+        if compressed:
+            output = gzip.decompress(response_body['body']).decode('utf8')
+        else:
+            output = response_body['body'].decode('utf8')
+
+        self.assert_metrics(output, metric_name, help_text, increments)
+
+    def validate_metrics(self, metric_name, help_text, increments):
+        """
+        ASGI app serves the metrics from the provided registry.
+        """
+        self.increment_metrics(metric_name, help_text, increments)
+        # Create and run ASGI app
+        app = make_asgi_app(self.registry)
+        self.seed_app(app)
+        self.send_default_request()
+        # Assert outputs
+        outputs = self.get_all_output()
+        self.assert_outputs(outputs, metric_name, help_text, increments, compressed=False)
+
+    def test_report_metrics_1(self):
+        self.validate_metrics("counter", "A counter", 2)
+
+    def test_report_metrics_2(self):
+        self.validate_metrics("counter", "Another counter", 3)
+
+    def test_report_metrics_3(self):
+        self.validate_metrics("requests", "Number of requests", 5)
+
+    def test_report_metrics_4(self):
+        self.validate_metrics("failed_requests", "Number of failed requests", 7)
+
+    def test_gzip(self):
+        # Increment a metric.
+        metric_name = "counter"
+        help_text = "A counter"
+        increments = 2
+        self.increment_metrics(metric_name, help_text, increments)
+        app = make_asgi_app(self.registry)
+        # Send input with gzip header.
+        self.scope["headers"] = [(b"accept-encoding", b"gzip")]
+        self.seed_app(app)
+        self.send_input({"type": "http.request", "body": b""})
+        # Assert outputs are compressed.
+        outputs = self.get_all_output()
+        self.assert_outputs(outputs, metric_name, help_text, increments, compressed=True)
+
+    def test_gzip_disabled(self):
+        # Increment a metric.
+        metric_name = "counter"
+        help_text = "A counter"
+        increments = 2
+        self.increment_metrics(metric_name, help_text, increments)
+        # Disable compression explicitly.
+        app = make_asgi_app(self.registry, disable_compression=True)
+        # Send input with gzip header.
+        self.scope["headers"] = [(b"accept-encoding", b"gzip")]
+        self.seed_app(app)
+        self.send_input({"type": "http.request", "body": b""})
+        # Assert outputs are not compressed.
+        outputs = self.get_all_output()
+        self.assert_outputs(outputs, metric_name, help_text, increments, compressed=False)
+
+    def test_openmetrics_encoding(self):
+        """Response content type is application/openmetrics-text when appropriate Accept header is in request"""
+        app = make_asgi_app(self.registry)
+        self.scope["headers"] = [(b"Accept", b"application/openmetrics-text; version=1.0.0")]
+        self.seed_app(app)
+        self.send_input({"type": "http.request", "body": b""})
+
+        content_type = self.get_response_header_value('Content-Type').split(";")[0]
+        assert content_type == "application/openmetrics-text"
+
+    def test_plaintext_encoding(self):
+        """Response content type is text/plain when Accept header is missing in request"""
+        app = make_asgi_app(self.registry)
+        self.seed_app(app)
+        self.send_input({"type": "http.request", "body": b""})
+
+        content_type = self.get_response_header_value('Content-Type').split(";")[0]
+        assert content_type == "text/plain"
+
+    def test_qs_parsing(self):
+        """Only metrics that match the 'name[]' query string param appear"""
+
+        app = make_asgi_app(self.registry)
+        metrics = [
+            ("asdf", "first test metric", 1),
+            ("bsdf", "second test metric", 2)
+        ]
+
+        for m in metrics:
+            self.increment_metrics(*m)
+
+        for i_1 in range(len(metrics)):
+            self.scope['query_string'] = f"name[]={metrics[i_1][0]}_total".encode("utf-8")
+            self.seed_app(app)
+            self.send_default_request()
+
+            outputs = self.get_all_output()
+            response_body = outputs[1]
+            output = response_body['body'].decode('utf8')
+
+            self.assert_metrics(output, *metrics[i_1])
+
+            for i_2 in range(len(metrics)):
+                if i_1 == i_2:
+                    continue
+
+                self.assert_not_metrics(output, *metrics[i_2])
+
+            self.loop.run_until_complete(
+                self.communicator.wait()
+            )
+
+    def test_qs_parsing_multi(self):
+        """Only metrics that match the 'name[]' query string param appear"""
+
+        app = make_asgi_app(self.registry)
+        metrics = [
+            ("asdf", "first test metric", 1),
+            ("bsdf", "second test metric", 2),
+            ("csdf", "third test metric", 3)
+        ]
+
+        for m in metrics:
+            self.increment_metrics(*m)
+
+        self.scope['query_string'] = "&".join([f"name[]={m[0]}_total" for m in metrics[0:2]]).encode("utf-8")
+        self.seed_app(app)
+        self.send_default_request()
+
+        outputs = self.get_all_output()
+        response_body = outputs[1]
+        output = response_body['body'].decode('utf8')
+
+        self.assert_metrics(output, *metrics[0])
+        self.assert_metrics(output, *metrics[1])
+        self.assert_not_metrics(output, *metrics[2])
+
+        self.loop.run_until_complete(
+            self.communicator.wait()
+        )
+
+    def test_app_is_asgi_application_object(self):
+        """make_asgi_app returns a callable object rather than a plain function.
+
+        Frameworks such as Starlette treat plain functions passed to add_route
+        as request/response endpoints, and any other callable as an ASGI app.
+        """
+        app = make_asgi_app(self.registry)
+        self.assertFalse(inspect.isfunction(app))
+        self.assertFalse(inspect.ismethod(app))
+        self.assertTrue(inspect.iscoroutinefunction(app.__call__))
+        # It is still a valid ASGI application when called directly.
+        self.increment_metrics("counter", "A counter", 2)
+        self.seed_app(app)
+        self.send_default_request()
+        outputs = self.get_all_output()
+        self.assert_outputs(outputs, "counter", "A counter", 2, compressed=False)
+
+    def _run_starlette(self, starlette_app, path):
+        self.scope["path"] = path
+        self.scope["raw_path"] = path.encode("utf-8")
+        self.seed_app(starlette_app)
+        self.send_default_request()
+        return self.get_all_output()
+
+    @skipUnless(HAVE_STARLETTE, "Don't have starlette installed.")
+    def test_starlette_add_route(self):
+        """add_route serves metrics at the exact path, without a redirect."""
+        self.increment_metrics("counter", "A counter", 2)
+        starlette_app = Starlette()
+        starlette_app.add_route("/metrics", make_asgi_app(self.registry))
+        outputs = self._run_starlette(starlette_app, "/metrics")
+        self.assert_outputs(outputs, "counter", "A counter", 2, compressed=False)
+
+    @skipUnless(HAVE_STARLETTE, "Don't have starlette installed.")
+    def test_starlette_mount(self):
+        """Mounting the app as a path prefix keeps working."""
+        self.increment_metrics("counter", "A counter", 2)
+        starlette_app = Starlette()
+        starlette_app.mount("/metrics", make_asgi_app(self.registry))
+        outputs = self._run_starlette(starlette_app, "/metrics/")
+        self.assert_outputs(outputs, "counter", "A counter", 2, compressed=False)

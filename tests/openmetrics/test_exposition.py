@@ -1,0 +1,763 @@
+import time
+from typing import Any
+import unittest
+
+import pytest
+
+from prometheus_client import (
+    CollectorRegistry, Counter, Enum, Gauge, Histogram, Info, Metric, Summary,
+)
+from prometheus_client.core import (
+    BucketSpan, Exemplar, GaugeHistogramMetricFamily, GaugeMetricFamily,
+    HistogramMetricFamily, NativeHistogram, Timestamp,
+)
+from prometheus_client.openmetrics.exposition import (
+    ALLOWUTF8, DOTS, escape_label_name, escape_metric_name, generate_latest,
+    UNDERSCORES, VALUES,
+)
+from prometheus_client.openmetrics.parser import text_string_to_metric_families
+
+
+@pytest.mark.parametrize(('kind', 'version'), [
+    ('counter', '1.0.0'), ('counter', '2.0.0'),
+    ('histogram', '1.0.0'), ('histogram', '2.0.0'),
+    ('native_histogram', '2.0.0'),
+])
+@pytest.mark.parametrize(('escaping', 'label_name', 'expected_name'), [
+    (UNDERSCORES, 'trace.id', 'trace_id'),
+    (DOTS, 'trace.id', 'trace_dot_id'),
+    (VALUES, 'trace.id', 'U__trace_2e_id'),
+    (ALLOWUTF8, 'trace.id', '"trace.id"'),
+    (ALLOWUTF8, '花火', '"花火"'),
+    (DOTS, 'trace_id', 'trace__id'),
+    (VALUES, '花火', 'U___82b1__706b_'),
+    (ALLOWUTF8, 'trace"id\n\\', '"trace\\"id\\n\\\\"'),
+    (UNDERSCORES, 'trace_id', 'trace_id'),
+])
+def test_exemplar_label_name_escaping(kind, version, escaping, label_name, expected_name):
+    registry = CollectorRegistry()
+    labels = {label_name: 'abc'}
+    if kind == 'counter':
+        Counter('requests', 'Requests', registry=registry).inc(exemplar=labels)
+    elif kind == 'histogram':
+        Histogram('latency', 'Latency', registry=registry).observe(0.5, exemplar=labels)
+    else:
+        metric = HistogramMetricFamily('latency', 'Latency')
+        metric.add_sample('latency', {}, None, native_histogram=NativeHistogram(
+            1, 0.5, 0, 0.001, 0,
+            (BucketSpan(0, 1),), None, (1,), None,
+            [Exemplar(labels, 0.5)],
+        ))
+
+        class Collector:
+            def collect(self):
+                return [metric]
+
+        registry.register(Collector())
+
+    output = generate_latest(registry, escaping=escaping, version=version).decode('utf-8')
+    exemplar_value = '1.0' if kind == 'counter' else '0.5'
+    assert '# {{{}="abc"}} {}'.format(expected_name, exemplar_value) in output
+
+
+class TestGenerateText(unittest.TestCase):
+    def setUp(self):
+        self.registry = CollectorRegistry()
+
+        # Mock time so _created values are fixed.
+        self.old_time = time.time
+        time.time = lambda: 123.456
+
+    def tearDown(self):
+        time.time = self.old_time
+
+    def custom_collector(self, metric_family: Any) -> None:
+        class CustomCollector:
+            def collect(self):
+                return [metric_family]
+
+        self.registry.register(CustomCollector())
+
+    def test_counter(self) -> None:
+        c = Counter('cc', 'A counter', registry=self.registry)
+        c.inc()
+        self.assertEqual(b'# HELP cc A counter\n# TYPE cc counter\ncc_total 1.0\ncc_created 123.456\n# EOF\n',
+                         generate_latest(self.registry))
+        
+    def test_counter_utf8(self) -> None:
+        c = Counter('cc.with.dots', 'A counter', registry=self.registry)
+        c.inc()
+        self.assertEqual(b'# HELP "cc.with.dots" A counter\n# TYPE "cc.with.dots" counter\n{"cc.with.dots_total"} 1.0\n{"cc.with.dots_created"} 123.456\n# EOF\n',
+                         generate_latest(self.registry, ALLOWUTF8))
+
+    def test_counter_utf8_escaped_underscores(self):
+        c = Counter('utf8.cc', 'A counter', registry=self.registry)
+        c.inc()
+        assert b"""# HELP utf8_cc A counter
+# TYPE utf8_cc counter
+utf8_cc_total 1.0
+utf8_cc_created 123.456
+# EOF
+""" == generate_latest(self.registry, UNDERSCORES)
+
+    def test_metric_name_with_colon_consistent_across_metadata_and_samples(self) -> None:
+        # Regression test for
+        # https://github.com/prometheus/client_python/issues/1177
+        # A colon is a valid metric-name character, so it must be escaped
+        # identically in the HELP/TYPE metadata lines and in the sample line.
+        # Previously the sample line escaped the name with label-name rules
+        # (turning the colon into an underscore) while the metadata lines kept
+        # it, producing exposition that strict OpenMetrics parsers reject.
+        self.custom_collector(
+            GaugeMetricFamily("sglang:token_usage", "Total token usage.", value=42.0)
+        )
+
+        self.assertEqual(
+            b"""# HELP sglang:token_usage Total token usage.
+# TYPE sglang:token_usage gauge
+sglang:token_usage 42.0
+# EOF
+""",
+            generate_latest(self.registry, UNDERSCORES),
+        )
+
+        # For every negotiated escaping scheme, the metric-name identifier in
+        # HELP, TYPE and the sample line must be identical.
+        for escaping in (UNDERSCORES, DOTS, VALUES, ALLOWUTF8):
+            lines = generate_latest(self.registry, escaping).decode("utf-8").splitlines()
+            help_name = next(l for l in lines if l.startswith("# HELP")).split(" ")[2]
+            type_name = next(l for l in lines if l.startswith("# TYPE")).split(" ")[2]
+            sample_name = next(
+                l for l in lines if l and not l.startswith("#")
+            ).split(" ")[0].split("{")[0]
+            self.assertEqual(
+                help_name, type_name, f"HELP/TYPE name mismatch for escaping={escaping}"
+            )
+            self.assertEqual(
+                help_name,
+                sample_name,
+                f"metadata/sample name mismatch for escaping={escaping}",
+            )
+
+    def test_counter_total(self) -> None:
+        c = Counter('cc_total', 'A counter', registry=self.registry)
+        c.inc()
+        self.assertEqual(b'# HELP cc A counter\n# TYPE cc counter\ncc_total 1.0\ncc_created 123.456\n# EOF\n',
+                         generate_latest(self.registry))
+
+    def test_counter_unit(self) -> None:
+        c = Counter('cc_seconds', 'A counter', registry=self.registry, unit="seconds")
+        c.inc()
+        self.assertEqual(b'# HELP cc_seconds A counter\n# TYPE cc_seconds counter\n# UNIT cc_seconds seconds\ncc_seconds_total 1.0\ncc_seconds_created 123.456\n# EOF\n',
+                         generate_latest(self.registry))
+
+    def test_gauge(self) -> None:
+        g = Gauge('gg', 'A gauge', registry=self.registry)
+        g.set(17)
+        self.assertEqual(b'# HELP gg A gauge\n# TYPE gg gauge\ngg 17.0\n# EOF\n', generate_latest(self.registry))
+
+    def test_summary(self) -> None:
+        s = Summary('ss', 'A summary', ['a', 'b'], registry=self.registry)
+        s.labels('c', 'd').observe(17)
+        self.assertEqual(b"""# HELP ss A summary
+# TYPE ss summary
+ss_count{a="c",b="d"} 1.0
+ss_sum{a="c",b="d"} 17.0
+ss_created{a="c",b="d"} 123.456
+# EOF
+""", generate_latest(self.registry, version="1.0.0"))
+
+    def test_histogram(self) -> None:
+        s = Histogram('hh', 'A histogram', registry=self.registry)
+        s.observe(0.05)
+        self.assertEqual(b"""# HELP hh A histogram
+# TYPE hh histogram
+hh_bucket{le="0.005"} 0.0
+hh_bucket{le="0.01"} 0.0
+hh_bucket{le="0.025"} 0.0
+hh_bucket{le="0.05"} 1.0
+hh_bucket{le="0.075"} 1.0
+hh_bucket{le="0.1"} 1.0
+hh_bucket{le="0.25"} 1.0
+hh_bucket{le="0.5"} 1.0
+hh_bucket{le="0.75"} 1.0
+hh_bucket{le="1.0"} 1.0
+hh_bucket{le="2.5"} 1.0
+hh_bucket{le="5.0"} 1.0
+hh_bucket{le="7.5"} 1.0
+hh_bucket{le="10.0"} 1.0
+hh_bucket{le="+Inf"} 1.0
+hh_count 1.0
+hh_sum 0.05
+hh_created 123.456
+# EOF
+""", generate_latest(self.registry, version="1.0.0"))
+
+
+    def test_native_histogram(self) -> None:
+        hfm = HistogramMetricFamily("nh", "nh")
+        hfm.add_sample("nh", {}, 0, None, None, NativeHistogram(24, 100, 0, 0.001, 4, (BucketSpan(0, 2), BucketSpan(1, 2)), (BucketSpan(0, 2), BucketSpan(1, 2)), (2, 1, -3, 3), (2, 1, -2, 3)))
+        self.custom_collector(hfm)
+        self.assertEqual(b"""# HELP nh nh
+# TYPE nh histogram
+nh {count:24,sum:100,schema:0,zero_threshold:0.001,zero_count:4,negative_spans:[0:2,1:2],negative_deltas:[2,1,-2,3],positive_spans:[0:2,1:2],positive_deltas:[2,1,-3,3]}
+# EOF
+""", generate_latest(self.registry, version="2.0.0"))
+    
+    def test_nh_histogram_with_exemplars(self) -> None:
+        hfm = HistogramMetricFamily("nh", "nh")
+        hfm.add_sample("nh", {}, 0, None, None, NativeHistogram(24, 100, 0, 0.001, 4, (BucketSpan(0, 2), BucketSpan(1, 2)), (BucketSpan(0, 2), BucketSpan(1, 2)), (2, 1, -3, 3), (2, 1, -2, 3), (Exemplar({"trace_id": "KOO5S4vxi0o"}, 0.67), Exemplar({"trace_id": "oHg5SJYRHA0"}, 9.8, float(Timestamp(1520879607, 0.789 * 1e9))))))
+        self.custom_collector(hfm)
+        self.assertEqual(b"""# HELP nh nh
+# TYPE nh histogram
+nh {count:24,sum:100,schema:0,zero_threshold:0.001,zero_count:4,negative_spans:[0:2,1:2],negative_deltas:[2,1,-2,3],positive_spans:[0:2,1:2],positive_deltas:[2,1,-3,3]} # {trace_id="KOO5S4vxi0o"} 0.67 # {trace_id="oHg5SJYRHA0"} 9.8 1520879607.789
+# EOF
+""", generate_latest(self.registry, version="2.0.0"))
+
+    def test_nh_no_observation(self) -> None:
+        hfm = HistogramMetricFamily("nhnoobs", "nhnoobs")
+        hfm.add_sample("nhnoobs", {}, 0, None, None, NativeHistogram(0, 0, 3, 2.938735877055719e-39, 0))
+        self.custom_collector(hfm)
+        self.assertEqual(b"""# HELP nhnoobs nhnoobs
+# TYPE nhnoobs histogram
+nhnoobs {count:0,sum:0,schema:3,zero_threshold:2.938735877055719e-39,zero_count:0}
+# EOF
+""", generate_latest(self.registry, version="2.0.0"))
+
+
+    def test_nh_longer_spans(self) -> None:
+        hfm = HistogramMetricFamily("nhsp", "Is a basic example of a native histogram with three spans")
+        hfm.add_sample("nhsp", {}, 0, None, None, NativeHistogram(4, 6, 3, 2.938735877055719e-39, 1, (BucketSpan(0, 1), BucketSpan(7, 1), BucketSpan(4, 1)), None, (1, 0, 0), None))
+        self.custom_collector(hfm)
+        self.assertEqual(b"""# HELP nhsp Is a basic example of a native histogram with three spans
+# TYPE nhsp histogram
+nhsp {count:4,sum:6,schema:3,zero_threshold:2.938735877055719e-39,zero_count:1,positive_spans:[0:1,7:1,4:1],positive_deltas:[1,0,0]}
+# EOF
+""", generate_latest(self.registry, version="2.0.0"))
+   
+    def test_native_histogram_utf8(self) -> None:
+        hfm = HistogramMetricFamily("native{histogram", "Is a basic example of a native histogram")
+        hfm.add_sample("native{histogram", {}, 0, None, None, NativeHistogram(24, 100, 0, 0.001, 4, (BucketSpan(0, 2), BucketSpan(1, 2)), (BucketSpan(0, 2), BucketSpan(1, 2)), (2, 1, -3, 3), (2, 1, -2, 3)))
+        self.custom_collector(hfm)
+        self.assertEqual(b"""# HELP "native{histogram" Is a basic example of a native histogram
+# TYPE "native{histogram" histogram
+{"native{histogram"} {count:24,sum:100,schema:0,zero_threshold:0.001,zero_count:4,negative_spans:[0:2,1:2],negative_deltas:[2,1,-2,3],positive_spans:[0:2,1:2],positive_deltas:[2,1,-3,3]}
+# EOF
+""", generate_latest(self.registry, ALLOWUTF8, version="2.0.0"))
+    
+    def test_native_histogram_utf8_stress(self) -> None:
+        hfm = HistogramMetricFamily("native{histogram", "Is a basic example of a native histogram")
+        hfm.add_sample("native{histogram", {'xx{} # {}': ' EOF # {}}}'}, 0, None, None, NativeHistogram(24, 100, 0, 0.001, 4, (BucketSpan(0, 2), BucketSpan(1, 2)), (BucketSpan(0, 2), BucketSpan(1, 2)), (2, 1, -3, 3), (2, 1, -2, 3)))
+        self.custom_collector(hfm)
+        self.assertEqual(b"""# HELP "native{histogram" Is a basic example of a native histogram
+# TYPE "native{histogram" histogram
+{"native{histogram","xx{} # {}"=" EOF # {}}}"} {count:24,sum:100,schema:0,zero_threshold:0.001,zero_count:4,negative_spans:[0:2,1:2],negative_deltas:[2,1,-2,3],positive_spans:[0:2,1:2],positive_deltas:[2,1,-3,3]}
+# EOF
+""", generate_latest(self.registry, ALLOWUTF8, version="2.0.0"))
+
+    def test_native_histogram_with_labels(self) -> None:
+        hfm = HistogramMetricFamily("hist_w_labels", "Is a basic example of a native histogram with labels")
+        hfm.add_sample("hist_w_labels", {"foo": "bar", "baz": "qux"}, 0, None, None, NativeHistogram(24, 100, 0, 0.001, 4, (BucketSpan(0, 2), BucketSpan(1, 2)), (BucketSpan(0, 2), BucketSpan(1, 2)), (2, 1, -3, 3), (2, 1, -2, 3)))
+        self.custom_collector(hfm)
+        self.assertEqual(b"""# HELP hist_w_labels Is a basic example of a native histogram with labels
+# TYPE hist_w_labels histogram
+hist_w_labels{baz="qux",foo="bar"} {count:24,sum:100,schema:0,zero_threshold:0.001,zero_count:4,negative_spans:[0:2,1:2],negative_deltas:[2,1,-2,3],positive_spans:[0:2,1:2],positive_deltas:[2,1,-3,3]}
+# EOF
+""", generate_latest(self.registry, version="2.0.0"))
+    
+    def test_native_histogram_with_labels_utf8(self) -> None:
+        hfm = HistogramMetricFamily("hist.w.labels", "Is a basic example of a native histogram with labels")
+        hfm.add_sample("hist.w.labels", {"foo": "bar", "baz": "qux"}, 0, None, None, NativeHistogram(24, 100, 0, 0.001, 4, (BucketSpan(0, 2), BucketSpan(1, 2)), (BucketSpan(0, 2), BucketSpan(1, 2)), (2, 1, -3, 3), (2, 1, -2, 3)))
+        self.custom_collector(hfm)
+        self.assertEqual(b"""# HELP "hist.w.labels" Is a basic example of a native histogram with labels
+# TYPE "hist.w.labels" histogram
+{"hist.w.labels",baz="qux",foo="bar"} {count:24,sum:100,schema:0,zero_threshold:0.001,zero_count:4,negative_spans:[0:2,1:2],negative_deltas:[2,1,-2,3],positive_spans:[0:2,1:2],positive_deltas:[2,1,-3,3]}
+# EOF
+""", generate_latest(self.registry, ALLOWUTF8, version="2.0.0"))
+
+    def test_native_histogram_with_classic_histogram(self) -> None:
+        hfm = HistogramMetricFamily("hist_w_classic", "Is a basic example of a native histogram coexisting with a classic histogram")
+        hfm.add_sample("hist_w_classic", {"foo": "bar"}, 0, None, None, NativeHistogram(24, 100, 0, 0.001, 4, (BucketSpan(0, 2), BucketSpan(1, 2)), (BucketSpan(0, 2), BucketSpan(1, 2)), (2, 1, -3, 3), (2, 1, -2, 3)))
+        hfm.add_sample("hist_w_classic_bucket", {"foo": "bar", "le": "0.001"}, 4.0, None, None, None)
+        hfm.add_sample("hist_w_classic_bucket", {"foo": "bar", "le": "+Inf"}, 24.0, None, None, None)
+        hfm.add_sample("hist_w_classic_count", {"foo": "bar"}, 24.0, None, None, None)
+        hfm.add_sample("hist_w_classic_sum", {"foo": "bar"}, 100.0, None, None, None)
+        self.custom_collector(hfm)
+        self.assertEqual(b"""# HELP hist_w_classic Is a basic example of a native histogram coexisting with a classic histogram
+# TYPE hist_w_classic histogram
+hist_w_classic{foo="bar"} {count:24,sum:100,schema:0,zero_threshold:0.001,zero_count:4,negative_spans:[0:2,1:2],negative_deltas:[2,1,-2,3],positive_spans:[0:2,1:2],positive_deltas:[2,1,-3,3]}
+hist_w_classic_bucket{foo="bar",le="0.001"} 4.0
+hist_w_classic_bucket{foo="bar",le="+Inf"} 24.0
+hist_w_classic_count{foo="bar"} 24.0
+hist_w_classic_sum{foo="bar"} 100.0
+# EOF
+""", generate_latest(self.registry, version="2.0.0"))
+
+    def test_native_plus_classic_histogram_two_labelsets(self) -> None:
+        hfm = HistogramMetricFamily("hist_w_classic_two_sets", "Is an example of a native histogram plus a classic histogram with two label sets")
+        hfm.add_sample("hist_w_classic_two_sets", {"foo": "bar"}, 0, None, None, NativeHistogram(24, 100, 0, 0.001, 4, (BucketSpan(0, 2), BucketSpan(1, 2)), (BucketSpan(0, 2), BucketSpan(1, 2)), (2, 1, -3, 3), (2, 1, -2, 3)))
+        hfm.add_sample("hist_w_classic_two_sets_bucket", {"foo": "bar", "le": "0.001"}, 4.0, None, None, None)
+        hfm.add_sample("hist_w_classic_two_sets_bucket", {"foo": "bar", "le": "+Inf"}, 24.0, None, None, None)
+        hfm.add_sample("hist_w_classic_two_sets_count", {"foo": "bar"}, 24.0, None, None, None)
+        hfm.add_sample("hist_w_classic_two_sets_sum", {"foo": "bar"}, 100.0, None, None, None)
+        hfm.add_sample("hist_w_classic_two_sets", {"foo": "baz"}, 0, None, None, NativeHistogram(24, 100, 0, 0.001, 4, (BucketSpan(0, 2), BucketSpan(1, 2)), (BucketSpan(0, 2), BucketSpan(1, 2)), (2, 1, -3, 3), (2, 1, -2, 3)))
+        hfm.add_sample("hist_w_classic_two_sets_bucket", {"foo": "baz", "le": "0.001"}, 4.0, None, None, None)
+        hfm.add_sample("hist_w_classic_two_sets_bucket", {"foo": "baz", "le": "+Inf"}, 24.0, None, None, None)
+        hfm.add_sample("hist_w_classic_two_sets_count", {"foo": "baz"}, 24.0, None, None, None)
+        hfm.add_sample("hist_w_classic_two_sets_sum", {"foo": "baz"}, 100.0, None, None, None)
+        self.custom_collector(hfm)
+        self.assertEqual(b"""# HELP hist_w_classic_two_sets Is an example of a native histogram plus a classic histogram with two label sets
+# TYPE hist_w_classic_two_sets histogram
+hist_w_classic_two_sets{foo="bar"} {count:24,sum:100,schema:0,zero_threshold:0.001,zero_count:4,negative_spans:[0:2,1:2],negative_deltas:[2,1,-2,3],positive_spans:[0:2,1:2],positive_deltas:[2,1,-3,3]}
+hist_w_classic_two_sets_bucket{foo="bar",le="0.001"} 4.0
+hist_w_classic_two_sets_bucket{foo="bar",le="+Inf"} 24.0
+hist_w_classic_two_sets_count{foo="bar"} 24.0
+hist_w_classic_two_sets_sum{foo="bar"} 100.0
+hist_w_classic_two_sets{foo="baz"} {count:24,sum:100,schema:0,zero_threshold:0.001,zero_count:4,negative_spans:[0:2,1:2],negative_deltas:[2,1,-2,3],positive_spans:[0:2,1:2],positive_deltas:[2,1,-3,3]}
+hist_w_classic_two_sets_bucket{foo="baz",le="0.001"} 4.0
+hist_w_classic_two_sets_bucket{foo="baz",le="+Inf"} 24.0
+hist_w_classic_two_sets_count{foo="baz"} 24.0
+hist_w_classic_two_sets_sum{foo="baz"} 100.0
+# EOF
+""", generate_latest(self.registry, version="2.0.0"))
+
+    def test_native_plus_classic_histogram_two_labelsets_OM_1(self) -> None:
+        hfm = HistogramMetricFamily("hist_w_classic_two_sets", "Is an example of a native histogram plus a classic histogram with two label sets in OM 1.0.0")
+        hfm.add_sample("hist_w_classic_two_sets", {"foo": "bar"}, 0, None, None, NativeHistogram(24, 100, 0, 0.001, 4, (BucketSpan(0, 2), BucketSpan(1, 2)), (BucketSpan(0, 2), BucketSpan(1, 2)), (2, 1, -3, 3), (2, 1, -2, 3)))
+        hfm.add_sample("hist_w_classic_two_sets_bucket", {"foo": "bar", "le": "0.001"}, 4.0, None, None, None)
+        hfm.add_sample("hist_w_classic_two_sets_bucket", {"foo": "bar", "le": "+Inf"}, 24.0, None, None, None)
+        hfm.add_sample("hist_w_classic_two_sets_count", {"foo": "bar"}, 24.0, None, None, None)
+        hfm.add_sample("hist_w_classic_two_sets_sum", {"foo": "bar"}, 100.0, None, None, None)
+        hfm.add_sample("hist_w_classic_two_sets", {"foo": "baz"}, 0, None, None, NativeHistogram(24, 100, 0, 0.001, 4, (BucketSpan(0, 2), BucketSpan(1, 2)), (BucketSpan(0, 2), BucketSpan(1, 2)), (2, 1, -3, 3), (2, 1, -2, 3)))
+        hfm.add_sample("hist_w_classic_two_sets_bucket", {"foo": "baz", "le": "0.001"}, 4.0, None, None, None)
+        hfm.add_sample("hist_w_classic_two_sets_bucket", {"foo": "baz", "le": "+Inf"}, 24.0, None, None, None)
+        hfm.add_sample("hist_w_classic_two_sets_count", {"foo": "baz"}, 24.0, None, None, None)
+        hfm.add_sample("hist_w_classic_two_sets_sum", {"foo": "baz"}, 100.0, None, None, None)
+        self.custom_collector(hfm)
+        self.assertEqual(b"""# HELP hist_w_classic_two_sets Is an example of a native histogram plus a classic histogram with two label sets in OM 1.0.0
+# TYPE hist_w_classic_two_sets histogram
+hist_w_classic_two_sets_bucket{foo="bar",le="0.001"} 4.0
+hist_w_classic_two_sets_bucket{foo="bar",le="+Inf"} 24.0
+hist_w_classic_two_sets_count{foo="bar"} 24.0
+hist_w_classic_two_sets_sum{foo="bar"} 100.0
+hist_w_classic_two_sets_bucket{foo="baz",le="0.001"} 4.0
+hist_w_classic_two_sets_bucket{foo="baz",le="+Inf"} 24.0
+hist_w_classic_two_sets_count{foo="baz"} 24.0
+hist_w_classic_two_sets_sum{foo="baz"} 100.0
+# EOF
+""", generate_latest(self.registry, version="1.0.0"))
+
+    def test_histogram_negative_buckets(self) -> None:
+        s = Histogram('hh', 'A histogram', buckets=[-1, -0.5, 0, 0.5, 1], registry=self.registry)
+        s.observe(-0.5)
+        self.assertEqual(b"""# HELP hh A histogram
+# TYPE hh histogram
+hh_bucket{le="-1.0"} 0.0
+hh_bucket{le="-0.5"} 1.0
+hh_bucket{le="0.0"} 1.0
+hh_bucket{le="0.5"} 1.0
+hh_bucket{le="1.0"} 1.0
+hh_bucket{le="+Inf"} 1.0
+hh_created 123.456
+# EOF
+""", generate_latest(self.registry, version="1.0.0"))
+        # The OpenMetrics 1.0 parser accepts it.
+        list(text_string_to_metric_families(generate_latest(self.registry, version="1.0.0").decode()))
+        self.assertEqual(b"""# HELP hh A histogram
+# TYPE hh histogram
+hh_bucket{le="-1.0"} 0.0
+hh_bucket{le="-0.5"} 1.0
+hh_bucket{le="0.0"} 1.0
+hh_bucket{le="0.5"} 1.0
+hh_bucket{le="1.0"} 1.0
+hh_bucket{le="+Inf"} 1.0
+hh_count 1.0
+hh_sum -0.5
+hh_created 123.456
+# EOF
+""", generate_latest(self.registry, version="2.0.0"))
+
+    def test_histogram_negative_buckets_one_labelset(self) -> None:
+        hfm = HistogramMetricFamily("hh", "A histogram")
+        hfm.add_sample("hh_bucket", {"l": "neg", "le": "-1.0"}, 0.0, None, None, None)
+        hfm.add_sample("hh_bucket", {"l": "neg", "le": "+Inf"}, 1.0, None, None, None)
+        hfm.add_sample("hh_count", {"l": "neg"}, 1.0, None, None, None)
+        hfm.add_sample("hh_sum", {"l": "neg"}, -0.5, None, None, None)
+        hfm.add_sample("hh_bucket", {"l": "pos", "le": "0.0"}, 0.0, None, None, None)
+        hfm.add_sample("hh_bucket", {"l": "pos", "le": "1.0"}, 1.0, None, None, None)
+        hfm.add_sample("hh_bucket", {"l": "pos", "le": "+Inf"}, 1.0, None, None, None)
+        hfm.add_sample("hh_count", {"l": "pos"}, 1.0, None, None, None)
+        hfm.add_sample("hh_sum", {"l": "pos"}, 0.5, None, None, None)
+        self.custom_collector(hfm)
+        self.assertEqual(b"""# HELP hh A histogram
+# TYPE hh histogram
+hh_bucket{l="neg",le="-1.0"} 0.0
+hh_bucket{l="neg",le="+Inf"} 1.0
+hh_bucket{l="pos",le="0.0"} 0.0
+hh_bucket{l="pos",le="1.0"} 1.0
+hh_bucket{l="pos",le="+Inf"} 1.0
+hh_count{l="pos"} 1.0
+hh_sum{l="pos"} 0.5
+# EOF
+""", generate_latest(self.registry, version="1.0.0"))
+
+    def test_histogram_malformed_bucket_bound(self) -> None:
+        hfm = HistogramMetricFamily("hh", "A histogram")
+        hfm.add_sample("hh_bucket", {"le": "1s"}, 1.0, None, None, None)
+        hfm.add_sample("hh_count", {}, 1.0, None, None, None)
+        self.custom_collector(hfm)
+        self.assertIn(b'hh_bucket{le="1s"} 1.0\nhh_count 1.0\n', generate_latest(self.registry, version="1.0.0"))
+
+    def test_histogram_exemplar(self) -> None:
+        s = Histogram('hh', 'A histogram', buckets=[1, 2, 3, 4], registry=self.registry)
+        s.observe(0.5, {'a': 'b'})
+        s.observe(1.5, {'le': '7'})
+        s.observe(2.5, {'a': 'b'})
+        s.observe(3.5, {'a': '\n"\\'})
+        print(generate_latest(self.registry))
+        self.assertEqual(b"""# HELP hh A histogram
+# TYPE hh histogram
+hh_bucket{le="1.0"} 1.0 # {a="b"} 0.5 123.456
+hh_bucket{le="2.0"} 2.0 # {le="7"} 1.5 123.456
+hh_bucket{le="3.0"} 3.0 # {a="b"} 2.5 123.456
+hh_bucket{le="4.0"} 4.0 # {a="\\n\\"\\\\"} 3.5 123.456
+hh_bucket{le="+Inf"} 4.0
+hh_count 4.0
+hh_sum 8.0
+hh_created 123.456
+# EOF
+""", generate_latest(self.registry, version="1.0.0"))
+
+    def test_counter_exemplar(self) -> None:
+        c = Counter('cc', 'A counter', registry=self.registry)
+        c.inc(exemplar={'a': 'b'})
+        self.assertEqual(b"""# HELP cc A counter
+# TYPE cc counter
+cc_total 1.0 # {a="b"} 1.0 123.456
+cc_created 123.456
+# EOF
+""", generate_latest(self.registry, version="1.0.0"))
+
+    def test_untyped_exemplar(self) -> None:
+        class MyCollector:
+            def collect(self):
+                metric = Metric("hh", "help", 'untyped')
+                # This is not sane, but it covers all the cases.
+                metric.add_sample("hh_bucket", {}, 0, None, Exemplar({'a': 'b'}, 0.5))
+                yield metric
+
+        self.registry.register(MyCollector())
+        with self.assertRaises(ValueError):
+            generate_latest(self.registry)
+
+    def test_histogram_non_bucket_exemplar(self) -> None:
+        class MyCollector:
+            def collect(self):
+                metric = Metric("hh", "help", 'histogram')
+                # This is not sane, but it covers all the cases.
+                metric.add_sample("hh_count", {}, 0, None, Exemplar({'a': 'b'}, 0.5))
+                yield metric
+
+        self.registry.register(MyCollector())
+        with self.assertRaises(ValueError):
+            generate_latest(self.registry)
+
+    def test_counter_non_total_exemplar(self) -> None:
+        class MyCollector:
+            def collect(self):
+                metric = Metric("cc", "A counter", 'counter')
+                metric.add_sample("cc_total", {}, 1, None, None)
+                metric.add_sample("cc_created", {}, 123.456, None, Exemplar({'a': 'b'}, 1.0, 123.456))
+                yield metric
+
+        self.registry.register(MyCollector())
+        with self.assertRaises(ValueError):
+            generate_latest(self.registry)
+
+    def test_gauge_exemplar(self) -> None:
+        class MyCollector:
+            def collect(self):
+                metric = Metric("gg", "A gauge", 'gauge')
+                # A sample whose name equals the metric name must not be
+                # treated as exemplar-eligible just because it matches;
+                # only histogram/gaugehistogram buckets, counter _total, and
+                # native histograms may carry exemplars.
+                metric.add_sample("gg", {}, 1, None, Exemplar({'a': 'b'}, 0.5))
+                yield metric
+
+        self.registry.register(MyCollector())
+        with self.assertRaises(ValueError):
+            generate_latest(self.registry)
+
+    def test_gaugehistogram(self) -> None:
+        self.custom_collector(
+            GaugeHistogramMetricFamily('gh', 'help', buckets=[('1.0', 4), ('+Inf', (5))], gsum_value=7))
+        self.assertEqual(b"""# HELP gh help
+# TYPE gh gaugehistogram
+gh_bucket{le="1.0"} 4.0
+gh_bucket{le="+Inf"} 5.0
+gh_gcount 5.0
+gh_gsum 7.0
+# EOF
+""", generate_latest(self.registry, version="1.0.0"))
+
+    def test_gaugehistogram_negative_buckets(self) -> None:
+        self.custom_collector(
+            GaugeHistogramMetricFamily('gh', 'help', buckets=[('-1.0', 4), ('+Inf', (5))], gsum_value=-7))
+        self.assertEqual(b"""# HELP gh help
+# TYPE gh gaugehistogram
+gh_bucket{le="-1.0"} 4.0
+gh_bucket{le="+Inf"} 5.0
+gh_gcount 5.0
+gh_gsum -7.0
+# EOF
+""", generate_latest(self.registry, version="1.0.0"))
+
+    def test_info(self) -> None:
+        i = Info('ii', 'A info', ['a', 'b'], registry=self.registry)
+        i.labels('c', 'd').info({'foo': 'bar'})
+        self.assertEqual(b"""# HELP ii A info
+# TYPE ii info
+ii_info{a="c",b="d",foo="bar"} 1.0
+# EOF
+""", generate_latest(self.registry, version="2.0.0"))
+
+    def test_enum(self) -> None:
+        i = Enum('ee', 'An enum', ['a', 'b'], registry=self.registry, states=['foo', 'bar'])
+        i.labels('c', 'd').state('bar')
+        self.assertEqual(b"""# HELP ee An enum
+# TYPE ee stateset
+ee{a="c",b="d",ee="foo"} 0.0
+ee{a="c",b="d",ee="bar"} 1.0
+# EOF
+""", generate_latest(self.registry, version="2.0.0"))
+
+    def test_unicode(self) -> None:
+        c = Counter('cc', '\u4500', ['l'], registry=self.registry)
+        c.labels('\u4500').inc()
+        self.assertEqual(b"""# HELP cc \xe4\x94\x80
+# TYPE cc counter
+cc_total{l="\xe4\x94\x80"} 1.0
+cc_created{l="\xe4\x94\x80"} 123.456
+# EOF
+""", generate_latest(self.registry, version="2.0.0"))
+
+    def test_escaping(self) -> None:
+        c = Counter('cc', 'A\ncount\\er\"', ['a'], registry=self.registry)
+        c.labels('\\x\n"').inc(1)
+        self.assertEqual(b"""# HELP cc A\\ncount\\\\er\\"
+# TYPE cc counter
+cc_total{a="\\\\x\\n\\""} 1.0
+cc_created{a="\\\\x\\n\\""} 123.456
+# EOF
+""", generate_latest(self.registry, version="2.0.0"))
+
+    def test_nonnumber(self) -> None:
+        class MyNumber:
+            def __repr__(self):
+                return "MyNumber(123)"
+
+            def __float__(self):
+                return 123.0
+
+        class MyCollector:
+            def collect(self):
+                metric = Metric("nonnumber", "Non number", 'untyped')
+                metric.add_sample("nonnumber", {}, MyNumber())
+                yield metric
+
+        self.registry.register(MyCollector())
+        self.assertEqual(b'# HELP nonnumber Non number\n# TYPE nonnumber unknown\nnonnumber 123.0\n# EOF\n',
+                         generate_latest(self.registry))
+
+    def test_timestamp(self) -> None:
+        class MyCollector:
+            def collect(self):
+                metric = Metric("ts", "help", 'unknown')
+                metric.add_sample("ts", {"foo": "a"}, 0, 123.456)
+                metric.add_sample("ts", {"foo": "b"}, 0, -123.456)
+                metric.add_sample("ts", {"foo": "c"}, 0, 123)
+                metric.add_sample("ts", {"foo": "d"}, 0, Timestamp(123, 456000000))
+                metric.add_sample("ts", {"foo": "e"}, 0, Timestamp(123, 456000))
+                metric.add_sample("ts", {"foo": "f"}, 0, Timestamp(123, 456))
+                metric.add_sample("ts", {"foo": "g"}, 0, Timestamp(-123, 456000000))
+                metric.add_sample("ts", {"foo": "h"}, 0, Timestamp(-123, 456))
+                yield metric
+
+        self.registry.register(MyCollector())
+        self.assertEqual(b"""# HELP ts help
+# TYPE ts unknown
+ts{foo="a"} 0.0 123.456
+ts{foo="b"} 0.0 -123.456
+ts{foo="c"} 0.0 123
+ts{foo="d"} 0.0 123.456000000
+ts{foo="e"} 0.0 123.000456000
+ts{foo="f"} 0.0 123.000000456
+ts{foo="g"} 0.0 -123.456000000
+ts{foo="h"} 0.0 -123.000000456
+# EOF
+""", generate_latest(self.registry, version="1.0.0"))
+
+    def test_native_histogram_version_comparison(self) -> None:
+        hfm = HistogramMetricFamily("nh_version", "nh version test")
+        hfm.add_sample("nh_version", {}, 0, None, None, NativeHistogram(5, 10, 0, 0.01, 2, (BucketSpan(0, 1),), (BucketSpan(0, 1),), (3,), (4,)))
+        self.custom_collector(hfm)
+        
+        # Version 1.0.0 should omit native histogram samples entirely
+        self.assertEqual(b"""# HELP nh_version nh version test
+# TYPE nh_version histogram
+# EOF
+""", generate_latest(self.registry, version="1.0.0"))
+        
+        # Version 2.0.0 should emit native histogram format
+        self.assertEqual(b"""# HELP nh_version nh version test
+# TYPE nh_version histogram
+nh_version {count:5,sum:10,schema:0,zero_threshold:0.01,zero_count:2,negative_spans:[0:1],negative_deltas:[4],positive_spans:[0:1],positive_deltas:[3]}
+# EOF
+""", generate_latest(self.registry, version="2.0.0"))
+
+
+@pytest.mark.parametrize("scenario", [
+    {
+        "name": "empty string",
+        "input": "",
+        "expectedUnderscores": "",
+        "expectedDots": "",
+        "expectedValue": "",
+    },
+    {
+        "name": "legacy valid metric name",
+        "input": "no:escaping_required",
+        "expectedUnderscores": "no:escaping_required",
+        "expectedDots": "no:escaping__required",
+        "expectedValue": "no:escaping_required",
+    },
+    {
+        "name": "metric name with dots",
+        "input": "mysystem.prod.west.cpu.load",
+        "expectedUnderscores": "mysystem_prod_west_cpu_load",
+        "expectedDots": "mysystem_dot_prod_dot_west_dot_cpu_dot_load",
+        "expectedValue": "U__mysystem_2e_prod_2e_west_2e_cpu_2e_load",
+    },
+    {
+        "name": "metric name with dots and underscore",
+        "input": "mysystem.prod.west.cpu.load_total",
+        "expectedUnderscores": "mysystem_prod_west_cpu_load_total",
+        "expectedDots": "mysystem_dot_prod_dot_west_dot_cpu_dot_load__total",
+        "expectedValue": "U__mysystem_2e_prod_2e_west_2e_cpu_2e_load__total",
+    },
+    {
+        "name": "metric name with dots and colon",
+        "input": "http.status:sum",
+        "expectedUnderscores": "http_status:sum",
+        "expectedDots": "http_dot_status:sum",
+        "expectedValue": "U__http_2e_status:sum",
+    },
+    {
+        "name": "metric name with spaces and emoji",
+        "input": "label with 😱",
+        "expectedUnderscores": "label_with__",
+        "expectedDots": "label__with____",
+        "expectedValue": "U__label_20_with_20__1f631_",
+    },
+    {
+        "name": "metric name with unicode characters > 0x100",
+        "input": "花火",
+        "expectedUnderscores": "__",
+        "expectedDots": "____",
+        "expectedValue": "U___82b1__706b_",
+    },
+    {
+        "name": "metric name with spaces and edge-case value",
+        "input": "label with \u0100",
+        "expectedUnderscores": "label_with__",
+        "expectedDots": "label__with____",
+        "expectedValue": "U__label_20_with_20__100_",
+    },
+])
+def test_escape_metric_name(scenario):
+    input = scenario["input"]
+
+    got = escape_metric_name(input, UNDERSCORES)
+    assert got == scenario["expectedUnderscores"], f"[{scenario['name']}] Underscore escaping failed"
+
+    got = escape_metric_name(input, DOTS)
+    assert got == scenario["expectedDots"], f"[{scenario['name']}] Dots escaping failed"
+
+    got = escape_metric_name(input, VALUES)
+    assert got == scenario["expectedValue"], f"[{scenario['name']}] Value encoding failed"
+
+
+@pytest.mark.parametrize("scenario", [
+    {
+        "name": "empty string",
+        "input": "",
+        "expectedUnderscores": "",
+        "expectedDots": "",
+        "expectedValue": "",
+    },
+    {
+        "name": "legacy valid label name",
+        "input": "no_escaping_required",
+        "expectedUnderscores": "no_escaping_required",
+        "expectedDots": "no__escaping__required",
+        "expectedValue": "no_escaping_required",
+    },
+    {
+        "name": "label name with dots",
+        "input": "mysystem.prod.west.cpu.load",
+        "expectedUnderscores": "mysystem_prod_west_cpu_load",
+        "expectedDots": "mysystem_dot_prod_dot_west_dot_cpu_dot_load",
+        "expectedValue": "U__mysystem_2e_prod_2e_west_2e_cpu_2e_load",
+    },
+    {
+        "name": "label name with dots and underscore",
+        "input": "mysystem.prod.west.cpu.load_total",
+        "expectedUnderscores": "mysystem_prod_west_cpu_load_total",
+        "expectedDots": "mysystem_dot_prod_dot_west_dot_cpu_dot_load__total",
+        "expectedValue": "U__mysystem_2e_prod_2e_west_2e_cpu_2e_load__total",
+    },
+    {
+        "name": "label name with dots and colon",
+        "input": "http.status:sum",
+        "expectedUnderscores": "http_status_sum",
+        "expectedDots": "http_dot_status__sum",
+        "expectedValue": "U__http_2e_status_3a_sum",
+    },
+    {
+        "name": "label name with spaces and emoji",
+        "input": "label with 😱",
+        "expectedUnderscores": "label_with__",
+        "expectedDots": "label__with____",
+        "expectedValue": "U__label_20_with_20__1f631_",
+    },
+    {
+        "name": "label name with unicode characters > 0x100",
+        "input": "花火",
+        "expectedUnderscores": "__",
+        "expectedDots": "____",
+        "expectedValue": "U___82b1__706b_",
+    },
+    {
+        "name": "label name with spaces and edge-case value",
+        "input": "label with \u0100",
+        "expectedUnderscores": "label_with__",
+        "expectedDots": "label__with____",
+        "expectedValue": "U__label_20_with_20__100_",
+    },
+])
+def test_escape_label_name(scenario):
+    input = scenario["input"]
+
+    got = escape_label_name(input, UNDERSCORES)
+    assert got == scenario["expectedUnderscores"], f"[{scenario['name']}] Underscore escaping failed"
+
+    got = escape_label_name(input, DOTS)
+    assert got == scenario["expectedDots"], f"[{scenario['name']}] Dots escaping failed"
+
+    got = escape_label_name(input, VALUES)
+    assert got == scenario["expectedValue"], f"[{scenario['name']}] Value encoding failed"
+
+
+if __name__ == '__main__':
+    unittest.main()
