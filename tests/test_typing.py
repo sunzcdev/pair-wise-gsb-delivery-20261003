@@ -78,6 +78,8 @@ def something_with_open() -> None:
         mode="r",
         loads=json.loads,
     )
+    reader = jsonlines.open(name, mode="r", backend="json")
+    reader = jsonlines.open(name, mode="r", backend=jsonlines.Backend.JSON)
 
     writer: jsonlines.Writer
     writer = jsonlines.open(name, "w")
@@ -91,5 +93,34 @@ def something_with_open() -> None:
         sort_keys=True,
         flush=True,
     )
+    writer = jsonlines.open(name, mode="w", backend="json")
+    writer = jsonlines.open(name, mode="w", backend=jsonlines.Backend.JSON)
+
+    locals()  # Silence flake8 F841
+
+
+def something_with_codec_config() -> None:
+    reader = jsonlines.Reader(io.StringIO(), backend="json")
+    reader = jsonlines.Reader(io.StringIO(), backend=jsonlines.Backend.JSON)
+    reader = jsonlines.Reader(io.StringIO(), loads=json.loads)
+
+    config: jsonlines.CodecConfig = reader.codec_config
+    backend: jsonlines.Backend = config.backend
+    capabilities: jsonlines.CodecCapabilities = config.capabilities
+    custom: bool = config.is_custom
+    result_type: Optional[str] = capabilities.result_type
+    nan_handling: str = capabilities.nan
+    supports_sort_keys: Optional[bool] = capabilities.supports_sort_keys
+
+    writer = jsonlines.Writer(io.StringIO(), backend="json")
+    writer_config: jsonlines.CodecConfig = writer.codec_config
+    compact: Optional[bool] = writer_config.compact
+    sort_keys: Optional[bool] = writer_config.sort_keys
+
+    jsonlines.set_default_backend("json")
+    jsonlines.set_default_backend(jsonlines.Backend.UJSON)
+    jsonlines.set_default_backend(None)
+    default: jsonlines.Backend = jsonlines.get_default_backend()
+    default_dumps: jsonlines.Backend = jsonlines.get_default_backend("dumps")
 
     locals()  # Silence flake8 F841

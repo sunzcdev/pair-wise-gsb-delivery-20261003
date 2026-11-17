@@ -26,6 +26,8 @@ Features
 
   * transparently handles ``str`` and ``bytes``, both for input and output
   * supports multiple JSON libraries, e.g. ``json`` (standard library), ``orjson``, ``ujson``
+  * freezes the selected JSON backend per reader/writer, and exposes it
+    for inspection
   * transparently handles UTF-8 BOM (if present)
   * useful error messages
   * prevents gotchas, e.g. uses standard-compliant line breaking, unlike `str.splitlines`_
@@ -158,10 +160,79 @@ This should be enough to get started. See the API docs below for
 more details.
 
 
+JSON backends
+=============
+
+The library can decode using the standard library ``json`` module, or the
+optional ``orjson`` and ``ujson`` accelerators. Encoding always defaults to
+the standard library, because the accelerators produce different output
+(whitespace, ``NaN`` handling, …).
+
+Backend selection is frozen per reader/writer
+---------------------------------------------
+
+The backend for a reader or writer is chosen when that object is created and
+never changes afterwards, even if optional libraries become available later
+or the process-wide default is changed::
+
+  reader = jsonlines.Reader(fp)
+  config = reader.codec_config
+  config.backend      # e.g. <Backend.JSON: 'json'>
+
+  jsonlines.set_default_backend('json')  # affects new objects only
+  assert reader.codec_config.backend is config.backend
+
+By default, readers use the fastest available decoder (``orjson``, then
+``ujson``, then ``json``), and writers use the standard library. A different
+default can be pinned for objects created from now on::
+
+  jsonlines.set_default_backend('json')  # pin explicitly
+  jsonlines.set_default_backend(None)    # back to automatic selection
+  jsonlines.get_default_backend()        # backend new readers would use
+  jsonlines.get_default_backend('dumps') # backend new writers would use
+
+A specific backend can also be requested per object, or through
+:py:func:`jsonlines.open()`. This cannot be combined with a custom
+``loads``/``dumps`` callable, since the custom callable wins::
+
+  jsonlines.Reader(fp, backend='orjson')
+  jsonlines.Writer(fp, backend='orjson', sort_keys=True)
+  jsonlines.open('data.jsonl', mode='r', backend='ujson')
+
+Invalid configurations, such as an unknown or unavailable backend, are
+reported as :py:class:`jsonlines.CodecConfigError` while the reader/writer is
+being created, i.e. before the source is read or the destination is opened.
+
+Inspecting capabilities
+-----------------------
+
+:py:attr:`Reader.codec_config` and :py:attr:`Writer.codec_config` return an
+immutable :py:class:`jsonlines.CodecConfig` snapshot. Its ``capabilities``
+attribute reports what the selected backend really does, so callers can
+decide for themselves whether to accept those differences::
+
+  config.capabilities.result_type          # 'str' or 'bytes'
+  config.capabilities.nan                  # 'supported', 'rejected', ...
+  config.capabilities.big_integers         # 'supported', 'lossy', ...
+  config.capabilities.supports_sort_keys   # True/False/None
+
+These values are descriptive only: the library never silently rewrites a
+record to hide a backend difference. For example, ``orjson`` serializes
+``NaN`` as ``null`` and raises ``TypeError`` for integers outside the 64-bit
+range; both facts are visible in the snapshot, and the resulting output (or
+error) is the backend's own. Capabilities of a caller-supplied
+``loads``/``dumps`` callable are reported as ``'unknown'`` instead of being
+guessed, and such a callable is never invoked with synthetic data to probe it.
+
+
 API
 ===
 
 .. autofunction:: jsonlines.open
+
+.. autofunction:: jsonlines.set_default_backend
+
+.. autofunction:: jsonlines.get_default_backend
 
 .. autoclass:: jsonlines.Reader
    :members:
@@ -171,10 +242,22 @@ API
    :members:
    :inherited-members:
 
+.. autoclass:: jsonlines.CodecConfig
+   :members:
+
+.. autoclass:: jsonlines.CodecCapabilities
+   :members:
+
+.. autoclass:: jsonlines.Backend
+   :members:
+
 .. autoclass:: jsonlines.Error
    :members:
 
 .. autoclass:: jsonlines.InvalidLineError
+   :members:
+
+.. autoclass:: jsonlines.CodecConfigError
    :members:
 
 
@@ -188,6 +271,21 @@ The source code and issue tracker for this package can be found on GitHub:
 
 Version history
 ===============
+
+* Unreleased
+
+  * freeze the JSON backend per reader/writer, expose it through
+    :py:attr:`Reader.codec_config` / :py:attr:`Writer.codec_config`, and allow
+    explicit selection with the new ``backend`` argument
+  * add :py:func:`jsonlines.set_default_backend()` and
+    :py:func:`jsonlines.get_default_backend()`; existing objects keep their
+    original backend when the default changes
+  * add :py:class:`jsonlines.CodecConfig`,
+    :py:class:`jsonlines.CodecCapabilities`, and
+    :py:class:`jsonlines.CodecConfigError`; capabilities report backend
+    differences without rewriting records
+  * validate the codec configuration before the source is read or the
+    destination is opened
 
 * 4.0.0, released at 2023-09-01
 

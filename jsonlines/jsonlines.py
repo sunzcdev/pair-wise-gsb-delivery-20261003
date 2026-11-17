@@ -5,6 +5,7 @@ jsonlines implementation
 import builtins
 import codecs
 import enum
+import functools
 import io
 import json
 import os
@@ -29,6 +30,11 @@ from typing import (
 
 import attr
 
+# The optional accelerator modules are imported once, at import time, so the
+# set of available backends is a property of the process and cannot change
+# halfway through a reader/writer's lifetime. Which one is *used* is decided
+# per reader/writer instance, and frozen on that instance (see
+# ``CodecConfig``).
 orjson: Optional[types.ModuleType]
 try:
     import orjson
@@ -66,7 +72,7 @@ class DumpsResultConversion(enum.Enum):
 
 
 # https://docs.python.org/3/library/functions.html#open
-Openable = Union[str, bytes, int, os.PathLike]
+Openable = Union[str, bytes, int, "os.PathLike[Any]"]
 
 LoadsCallable = Callable[[Union[str, bytes]], Any]
 DumpsCallable = Callable[[Any], Union[str, bytes]]
@@ -81,24 +87,29 @@ TJSONValue = TypeVar("TJSONValue", bound=JSONValue)
 
 TRW = TypeVar("TRW", bound="ReaderWriterBase")
 
-# Default to using the fastest JSON library for reading, falling back to the
-# standard library (always available) if none are installed.
-if orjson is not None:
-    default_loads = orjson.loads
-elif ujson is not None:
-    default_loads = ujson.loads
-else:
-    default_loads = json.loads
+
+# Marker callables used as defaults, so that an explicitly provided
+# ``loads``/``dumps`` callable can be distinguished from "no choice made by the
+# caller". Resolving the marker happens once, when a reader/writer instance is
+# created, and the resulting configuration is frozen on that instance.
+def default_loads(data: Union[str, bytes]) -> Any:
+    """
+    Fake ``loads()`` function to use as a default marker.
+    """
+    raise NotImplementedError  # pragma: no cover
 
 
-# For writing, use the stdlib. Other packages may be faster but their behaviour
-# (supported types etc.) and output (whitespace etc.) are not the same as the
-# stdlib json module, so this should be opt-in via the ‘dumps=’ arg.
 def default_dumps(obj: Any) -> str:
     """
     Fake ``dumps()`` function to use as a default marker.
     """
     raise NotImplementedError  # pragma: no cover
+
+
+# Bound once, so that default detection is unaffected by later rebinding of the
+# module-level names above.
+_DEFAULT_LOADS_MARKER = default_loads
+_DEFAULT_DUMPS_MARKER = default_dumps
 
 
 @attr.s(auto_exc=True, auto_attribs=True)
@@ -138,6 +149,182 @@ class InvalidLineError(Error, ValueError):
         super().__init__(f"{message} (line {lineno})")
 
 
+@attr.s(auto_exc=True, auto_attribs=True)
+class CodecConfigError(Error, ValueError):
+    """
+    Error raised when the requested codec configuration cannot be honoured.
+
+    This is raised while a reader or writer is being created, i.e. before any
+    data is read from the source or written to the destination. Examples are
+    an unknown backend name, a backend that is not installed, or asking for
+    both an explicit backend and a custom ``loads``/``dumps`` callable.
+
+    Like :py:class:`jsonlines.InvalidLineError`, this class subclasses both
+    :py:class:`jsonlines.Error` and the built-in ``ValueError``.
+    """
+
+
+class Backend(str, enum.Enum):
+    """
+    Names of the JSON codec backends that can be selected explicitly.
+
+    The ``CUSTOM`` member is reported by :py:class:`CodecConfig` when the
+    caller supplied their own ``loads``/``dumps`` callable; it cannot be
+    selected by name.
+    """
+
+    JSON = "json"
+    ORJSON = "orjson"
+    UJSON = "ujson"
+
+    #: Reported for caller-supplied ``loads``/``dumps`` callables.
+    CUSTOM = "custom"
+
+
+#: Values describing how a backend deals with a particular kind of value.
+#:
+#: ``"supported"`` means the value round-trips unchanged, ``"rejected"`` means
+#: the backend raises an error, ``"substituted"`` means the backend silently
+#: produces a different value (e.g. ``null`` for ``NaN``), ``"lossy"`` means a
+#: value of a different type/precision is produced, and ``"unknown"`` means no
+#: claim is made (typically for custom callables).
+ValueHandling = Literal["supported", "rejected", "substituted", "lossy", "unknown"]
+
+
+@attr.s(auto_attribs=True, frozen=True)
+class CodecCapabilities:
+    """
+    Snapshot of what the selected codec backend actually does.
+
+    The values are descriptive only: they report observed backend behaviour,
+    they do not cause records to be rewritten. Attributes that do not apply to
+    the direction of a codec are ``None``; attributes that cannot be verified
+    (custom callables) are ``None`` or ``"unknown"``.
+    """
+
+    #: Type returned by ``dumps()``, or ``None`` when not known in advance.
+    result_type: Optional[Literal["str", "bytes"]] = None
+
+    #: How ``NaN`` values are handled.
+    nan: ValueHandling = "unknown"
+
+    #: How (positive or negative) infinity values are handled.
+    infinity: ValueHandling = "unknown"
+
+    #: How integers outside the backend's native range are handled.
+    big_integers: ValueHandling = "unknown"
+
+    #: Whether the backend can sort object keys, or ``None`` when not applicable.
+    supports_sort_keys: Optional[bool] = None
+
+    #: Whether the backend can produce both compact and non-compact output.
+    #: ``False`` means output is always compact.
+    supports_compact_output: Optional[bool] = None
+
+    #: Additional human readable notes about observable backend differences.
+    notes: Tuple[str, ...] = ()
+
+
+# Capability snapshots for the known backends. These are deliberately static
+# (verified against the upstream projects) so that inspecting a configuration
+# never runs extra encode/decode work on caller data.
+_LOAD_CAPABILITIES: Dict[Backend, CodecCapabilities] = {
+    Backend.JSON: CodecCapabilities(
+        nan="supported",
+        infinity="supported",
+        big_integers="supported",
+        notes=("NaN and Infinity are accepted although they are not valid JSON",),
+    ),
+    Backend.ORJSON: CodecCapabilities(
+        nan="rejected",
+        infinity="rejected",
+        big_integers="lossy",
+        notes=(
+            "NaN and Infinity literals are rejected",
+            "integers outside the 64-bit range are decoded as floats",
+        ),
+    ),
+    Backend.UJSON: CodecCapabilities(
+        nan="supported",
+        infinity="supported",
+        big_integers="supported",
+        notes=("NaN and Infinity are accepted although they are not valid JSON",),
+    ),
+}
+
+_DUMPS_CAPABILITIES: Dict[Backend, CodecCapabilities] = {
+    Backend.JSON: CodecCapabilities(
+        result_type="str",
+        nan="supported",
+        infinity="supported",
+        big_integers="supported",
+        supports_sort_keys=True,
+        supports_compact_output=True,
+        notes=("NaN and Infinity are written as non-standard JSON literals",),
+    ),
+    Backend.ORJSON: CodecCapabilities(
+        result_type="bytes",
+        nan="substituted",
+        infinity="substituted",
+        big_integers="rejected",
+        supports_sort_keys=True,
+        supports_compact_output=False,
+        notes=(
+            "output is always compact; 'compact=False' cannot be honoured",
+            "NaN and Infinity are serialized as null",
+            "integers outside the 64-bit range raise TypeError",
+        ),
+    ),
+    Backend.UJSON: CodecCapabilities(
+        result_type="str",
+        nan="supported",
+        infinity="supported",
+        big_integers="supported",
+        supports_sort_keys=True,
+        supports_compact_output=True,
+        notes=("NaN and Infinity are written as non-standard JSON literals",),
+    ),
+}
+
+
+@attr.s(auto_attribs=True, frozen=True)
+class CodecConfig:
+    """
+    Immutable snapshot of the codec configuration of a reader or writer.
+
+    A snapshot is created when the reader/writer is created and is not
+    affected by later changes to the process-wide default backend, nor by
+    later changes to the module-level references to optional JSON libraries.
+    This makes it possible to inspect what a long-lived reader/writer is
+    actually using.
+
+    Snapshots compare equal when they describe the same configuration; the
+    identity of the underlying callable is not part of the comparison.
+    """
+
+    #: Direction of the codec: ``"loads"`` for readers, ``"dumps"`` for writers.
+    direction: Literal["loads", "dumps"]
+
+    #: The backend that is actually used.
+    backend: Backend
+
+    #: Whether the callable was supplied by the caller instead of selected.
+    is_custom: bool
+
+    #: Capabilities of the selected backend.
+    capabilities: CodecCapabilities
+
+    #: The effective encoding/decoding callable. Not part of equality/hash,
+    #: and omitted from the repr to keep snapshots readable.
+    func: Callable[..., Any] = attr.ib(eq=False, hash=False, repr=False)
+
+    #: Whether compact output was requested (writers only).
+    compact: Optional[bool] = None
+
+    #: Whether key sorting was requested (writers only).
+    sort_keys: Optional[bool] = None
+
+
 @attr.s(auto_attribs=True, repr=False)
 class ReaderWriterBase:
     """
@@ -149,6 +336,19 @@ class ReaderWriterBase:
     )
     _closed: bool = attr.ib(default=False, init=False)
     _should_close_fp: bool = attr.ib(default=False, init=False)
+    _codec_config: CodecConfig = attr.ib(init=False)
+
+    @property
+    def codec_config(self) -> CodecConfig:
+        """
+        The frozen codec configuration of this reader/writer.
+
+        The snapshot reports the backend that is actually used and the
+        capabilities of that backend. It does not change when the
+        process-wide default backend changes, and it never causes records to
+        be rewritten to paper over backend differences.
+        """
+        return self._codec_config
 
     def close(self) -> None:
         """
@@ -184,6 +384,272 @@ class ReaderWriterBase:
         self.close()
 
 
+# Module-level pinned default backend. ``None`` means "automatic": readers use
+# the fastest available backend, writers use the standard library.
+_DEFAULT_BACKEND: Optional[Backend] = None
+
+
+def _backend_module(backend: Backend) -> Optional[types.ModuleType]:
+    """
+    Return the module object for `backend`, or ``None`` if it is unavailable.
+
+    Availability is decided once, at import time, so the set of usable
+    backends cannot change while a reader or writer is alive.
+    """
+    if backend is Backend.JSON:
+        return json
+    if backend is Backend.ORJSON:
+        return orjson
+    if backend is Backend.UJSON:
+        return ujson
+    return None  # pragma: no cover - Backend.CUSTOM has no module
+
+
+def _parse_backend(value: Any) -> Backend:
+    """
+    Convert a user supplied backend name to a :py:class:`Backend` member.
+
+    The special ``"custom"`` value is rejected here: it is only ever reported,
+    never selected.
+    """
+    if isinstance(value, Backend):
+        backend = value
+    elif isinstance(value, str):
+        try:
+            backend = Backend(value)
+        except ValueError:
+            valid = ", ".join(
+                repr(member.value) for member in Backend if member is not Backend.CUSTOM
+            )
+            raise CodecConfigError(
+                f"unknown json backend {value!r}; supported backends are {valid}"
+            ) from None
+    else:
+        raise CodecConfigError(
+            "json backend must be a string or a jsonlines.Backend member, "
+            f"not {type(value).__name__}"
+        )
+
+    if backend is Backend.CUSTOM:
+        raise CodecConfigError(
+            "'custom' is reported for caller supplied loads/dumps callables "
+            "and cannot be selected explicitly"
+        )
+
+    if _backend_module(backend) is None:
+        raise CodecConfigError(
+            f"json backend {backend.value!r} is not available; "
+            f"install the {backend.value!r} package or select another backend"
+        )
+    return backend
+
+
+def _detect_default_backend() -> Backend:
+    """
+    Pick the fastest available backend, falling back to the stdlib.
+    """
+    for candidate in (Backend.ORJSON, Backend.UJSON):
+        if _backend_module(candidate) is not None:
+            return candidate
+    return Backend.JSON
+
+
+def get_default_backend(
+    direction: Literal["loads", "dumps"] = "loads",
+) -> Backend:
+    """
+    Return the backend that a new reader or writer would select.
+
+    When no default has been pinned with :py:func:`set_default_backend`, this
+    reports the automatic choice for `direction`: the fastest available
+    decoder for readers and the standard library for writers.
+
+    :param direction: ``"loads"`` (readers) or ``"dumps"`` (writers)
+    """
+    if direction not in ("loads", "dumps"):
+        raise ValueError("'direction' must be either 'loads' or 'dumps'")
+    if _DEFAULT_BACKEND is not None:
+        # An explicitly pinned default applies to both directions; only an
+        # installed backend can have been pinned, so this is always usable.
+        return _DEFAULT_BACKEND
+    if direction == "dumps":
+        return Backend.JSON
+    return _detect_default_backend()
+
+
+def set_default_backend(backend: Optional[Union[Backend, str]]) -> None:
+    """
+    Pin the backend used by readers and writers created from now on.
+
+    Passing ``None`` restores automatic selection. Existing reader/writer
+    instances are never affected; each instance keeps the backend that was
+    selected when it was created.
+
+    :param backend: backend name (``"json"``, ``"orjson"``, ``"ujson"``), a
+        :py:class:`Backend` member, or ``None`` for automatic selection
+    """
+    global _DEFAULT_BACKEND
+    if backend is None:
+        _DEFAULT_BACKEND = None
+    else:
+        _DEFAULT_BACKEND = _parse_backend(backend)
+
+
+def _custom_capabilities() -> CodecCapabilities:
+    """
+    Capabilities for a caller supplied callable.
+
+    Nothing is assumed: all value handling and the return type are reported as
+    unknown rather than guessed from the environment.
+    """
+    return CodecCapabilities(
+        notes=("capabilities are unknown for caller supplied callables",),
+    )
+
+
+def _check_custom_callable(name: str, value: Any) -> None:
+    if not callable(value):
+        raise CodecConfigError(
+            f"'{name}' must be a callable, not {type(value).__name__}"
+        )
+
+
+def _resolve_loads_config(
+    loads: LoadsCallable, backend: Optional[Union[Backend, str]]
+) -> CodecConfig:
+    """
+    Determine the decoding configuration for a new reader.
+
+    Raises :py:class:`CodecConfigError` for invalid combinations, before any
+    data is read from the source.
+    """
+    if loads is not _DEFAULT_LOADS_MARKER:
+        if backend is not None:
+            raise CodecConfigError(
+                "'backend' cannot be combined with a custom 'loads' callable; "
+                "the custom callable would be ignored"
+            )
+        _check_custom_callable("loads", loads)
+        return CodecConfig(
+            direction="loads",
+            backend=Backend.CUSTOM,
+            is_custom=True,
+            func=loads,
+            capabilities=_custom_capabilities(),
+        )
+
+    if backend is not None:
+        selected = _parse_backend(backend)
+    elif _DEFAULT_BACKEND is not None:
+        selected = _DEFAULT_BACKEND
+    else:
+        selected = _detect_default_backend()
+
+    module = _backend_module(selected)
+    if module is None:  # pragma: no cover - defensive, _parse_backend already checks
+        raise CodecConfigError(f"json backend {selected.value!r} is not available")
+
+    return CodecConfig(
+        direction="loads",
+        backend=selected,
+        is_custom=False,
+        func=cast(LoadsCallable, module.loads),
+        capabilities=_LOAD_CAPABILITIES[selected],
+    )
+
+
+def _json_dumps(compact: Optional[bool], sort_keys: Optional[bool]) -> DumpsCallable:
+    return json.JSONEncoder(
+        ensure_ascii=False,
+        separators=(",", ":") if compact else (", ", ": "),
+        sort_keys=bool(sort_keys),
+    ).encode
+
+
+def _build_dumps(
+    backend: Backend, compact: Optional[bool], sort_keys: Optional[bool]
+) -> DumpsCallable:
+    module = _backend_module(backend)
+    if module is None:  # pragma: no cover - defensive, _parse_backend already checks
+        raise CodecConfigError(f"json backend {backend.value!r} is not available")
+
+    if backend is Backend.JSON:
+        return _json_dumps(compact, sort_keys)
+
+    if backend is Backend.ORJSON:
+        # orjson output is always compact; a request for non-compact output
+        # cannot be honoured, which is reported through the capability
+        # snapshot rather than silently changing the record contents.
+        option = 0
+        if sort_keys:
+            option |= cast(int, module.OPT_SORT_KEYS)
+        if option:
+            return cast(DumpsCallable, functools.partial(module.dumps, option=option))
+        return cast(DumpsCallable, module.dumps)
+
+    # ujson
+    return cast(
+        DumpsCallable,
+        functools.partial(
+            module.dumps,
+            ensure_ascii=False,
+            separators=(",", ":") if compact else (", ", ": "),
+            sort_keys=bool(sort_keys),
+        ),
+    )
+
+
+def _resolve_dumps_config(
+    dumps: DumpsCallable,
+    backend: Optional[Union[Backend, str]],
+    compact: Optional[bool],
+    sort_keys: Optional[bool],
+) -> CodecConfig:
+    """
+    Determine the encoding configuration for a new writer.
+
+    Raises :py:class:`CodecConfigError` for invalid combinations, before the
+    destination is touched.
+    """
+    if dumps is not _DEFAULT_DUMPS_MARKER:
+        if backend is not None:
+            raise CodecConfigError(
+                "'backend' cannot be combined with a custom 'dumps' callable; "
+                "the custom callable would be ignored"
+            )
+        _check_custom_callable("dumps", dumps)
+        return CodecConfig(
+            direction="dumps",
+            backend=Backend.CUSTOM,
+            is_custom=True,
+            func=dumps,
+            capabilities=_custom_capabilities(),
+            compact=compact,
+            sort_keys=sort_keys,
+        )
+
+    if backend is not None:
+        selected = _parse_backend(backend)
+    elif _DEFAULT_BACKEND is not None:
+        selected = _DEFAULT_BACKEND
+    else:
+        # Writing defaults to the stdlib: accelerator libraries produce
+        # different output (whitespace, NaN handling, ...) and must be opted
+        # into explicitly.
+        selected = Backend.JSON
+
+    capabilities = _DUMPS_CAPABILITIES[selected]
+    return CodecConfig(
+        direction="dumps",
+        backend=selected,
+        is_custom=False,
+        func=_build_dumps(selected, compact, sort_keys),
+        capabilities=capabilities,
+        compact=compact,
+        sort_keys=sort_keys,
+    )
+
+
 @attr.s(auto_attribs=True, repr=False)
 class Reader(ReaderWriterBase):
     """
@@ -200,9 +666,17 @@ class Reader(ReaderWriterBase):
     decoder. If specified, it must be a callable that accepts a
     (unicode) string and returns the decoded object.
 
+    By default the fastest available backend is used, which is frozen when the
+    reader is created. The `backend` argument can be used to force a specific
+    backend for this reader; it cannot be combined with `loads`. The result is
+    available as an immutable :py:class:`CodecConfig` snapshot on the
+    :py:attr:`codec_config` attribute.
+
     :param file_or_iterable: file-like object or iterable yielding lines as
         strings
     :param loads: custom json decoder callable
+    :param backend: explicit json backend (``"json"``, ``"orjson"``,
+        ``"ujson"``); by default the process-wide default backend is used
     """
 
     _file_or_iterable: Union[
@@ -210,8 +684,14 @@ class Reader(ReaderWriterBase):
     ]
     _line_iter: Iterator[Tuple[int, Union[bytes, str]]] = attr.ib(init=False)
     _loads: LoadsCallable = attr.ib(default=default_loads, kw_only=True)
+    _backend: Optional[Union[Backend, str]] = attr.ib(default=None, kw_only=True)
 
     def __attrs_post_init__(self) -> None:
+        # Resolve the codec first: an invalid configuration must be reported
+        # before the source is touched in any way.
+        self._codec_config = _resolve_loads_config(self._loads, self._backend)
+        self._loads = self._codec_config.func
+
         if isinstance(self._file_or_iterable, io.IOBase):
             self._fp = cast(
                 Union[typing.IO[str], typing.IO[bytes]],
@@ -472,6 +952,14 @@ class Writer(ReaderWriterBase):
     `dumps` argument. The callable must produce (unicode) string output.
     If specified, the `compact` and `sort` arguments will be ignored.
 
+    By default the standard library is used for encoding. The `backend`
+    argument can be used to select another backend for this writer; the
+    selection is frozen for the lifetime of the writer and cannot be combined
+    with `dumps`. The resulting configuration, including the capabilities of
+    the actual backend, is available as an immutable
+    :py:class:`CodecConfig` snapshot on the :py:attr:`codec_config`
+    attribute.
+
     When the `flush` argument is set to ``True``, the writer will call
     ``fp.flush()`` after each written line.
 
@@ -480,6 +968,8 @@ class Writer(ReaderWriterBase):
     :param sort_keys: whether to sort object keys
     :param dumps: custom encoder callable
     :param flush: whether to flush the file-like object after writing each line
+    :param backend: explicit json backend (``"json"``, ``"orjson"``,
+        ``"ujson"``); by default the process-wide default backend is used
     """
 
     _fp: Union[typing.IO[str], typing.IO[bytes]] = attr.ib(default=None)
@@ -488,11 +978,24 @@ class Writer(ReaderWriterBase):
     _sort_keys: bool = attr.ib(default=False, kw_only=True)
     _flush: bool = attr.ib(default=False, kw_only=True)
     _dumps: DumpsCallable = attr.ib(default=default_dumps, kw_only=True)
+    _backend: Optional[Union[Backend, str]] = attr.ib(default=None, kw_only=True)
     _dumps_result_conversion: DumpsResultConversion = attr.ib(
         default=DumpsResultConversion.LeaveAsIs, init=False
     )
+    # Whether the return type of the dumps callable is known up front. It is
+    # for the built-in backends (from the capability snapshot); for custom
+    # callables it is observed on the first write, so that the callable is
+    # never invoked with synthetic data.
+    _dumps_result_type_known: bool = attr.ib(default=True, init=False)
 
     def __attrs_post_init__(self) -> None:
+        # Resolve the codec first: an invalid configuration must be reported
+        # before the destination is touched in any way.
+        self._codec_config = _resolve_dumps_config(
+            self._dumps, self._backend, self._compact, self._sort_keys
+        )
+        self._dumps = self._codec_config.func
+
         if isinstance(self._fp, io.TextIOBase):
             self._fp_is_binary = False
         elif isinstance(self._fp, io.IOBase):
@@ -505,23 +1008,27 @@ class Writer(ReaderWriterBase):
             else:
                 self._fp_is_binary = False
 
-        if self._dumps is default_dumps:
-            self._dumps = json.JSONEncoder(
-                ensure_ascii=False,
-                separators=(",", ":") if self._compact else (", ", ": "),
-                sort_keys=self._sort_keys,
-            ).encode
+        # Determine if str-to-bytes conversion (or vice versa) is needed for
+        # the combination of this file-like object and the used dumps()
+        # callable. This avoids checking this for each .write(). For known
+        # backends the return type comes from the frozen capability snapshot;
+        # for custom callables it is observed on the first write. Note that
+        # this deliberately does not support ‘dynamic’ return types that
+        # depend on input and dump options, like simplejson on Python 2 in
+        # some cases.
+        result_type = self._codec_config.capabilities.result_type
+        if result_type is None:
+            self._dumps_result_type_known = False
+        else:
+            self._set_dumps_result_conversion(result_type)
 
-        # Detect if str-to-bytes conversion (or vice versa) is needed for the
-        # combination of this file-like object and the used dumps() callable.
-        # This avoids checking this for each .write(). Note that this
-        # deliberately does not support ‘dynamic’ return types that depend on
-        # input and dump options, like simplejson on Python 2 in some cases.
-        sample_dumps_result = self._dumps({})
-        if isinstance(sample_dumps_result, str) and self._fp_is_binary:
+    def _set_dumps_result_conversion(self, result_type: str) -> None:
+        if result_type == "str" and self._fp_is_binary:
             self._dumps_result_conversion = DumpsResultConversion.EncodeToBytes
-        elif isinstance(sample_dumps_result, bytes) and not self._fp_is_binary:
+        elif result_type == "bytes" and not self._fp_is_binary:
             self._dumps_result_conversion = DumpsResultConversion.DecodeToString
+        else:
+            self._dumps_result_conversion = DumpsResultConversion.LeaveAsIs
 
     def write(self, obj: Any) -> int:
         """
@@ -535,6 +1042,16 @@ class Writer(ReaderWriterBase):
 
         line = self._dumps(obj)
 
+        if not self._dumps_result_type_known:
+            # Custom callable: observe the return type on real output rather
+            # than invoking it with a synthetic record.
+            if isinstance(line, str):
+                self._dumps_result_type_known = True
+                self._set_dumps_result_conversion("str")
+            elif isinstance(line, bytes):
+                self._dumps_result_type_known = True
+                self._set_dumps_result_conversion("bytes")
+
         # This handles either str or bytes, but the type checker does not know
         # that this code always passes the right type of arguments.
         if self._dumps_result_conversion == DumpsResultConversion.EncodeToBytes:
@@ -542,12 +1059,19 @@ class Writer(ReaderWriterBase):
         elif self._dumps_result_conversion == DumpsResultConversion.DecodeToString:
             line = line.decode()  # type: ignore[union-attr]
 
-        fp = self._fp
-        fp.write(line)  # type: ignore[arg-type]
-        fp.write(b"\n" if self._fp_is_binary else "\n")  # type: ignore[call-overload]
+        # The conversion above guarantees the type matches the stream, but that
+        # invariant is not visible to the type checker.
+        if self._fp_is_binary:
+            binary_fp = cast(typing.IO[bytes], self._fp)
+            binary_fp.write(cast(bytes, line))
+            binary_fp.write(b"\n")
+        else:
+            text_fp = cast(typing.IO[str], self._fp)
+            text_fp.write(cast(str, line))
+            text_fp.write("\n")
 
         if self._flush:
-            fp.flush()
+            self._fp.flush()
 
         return len(line) + 1  # including newline
 
@@ -564,12 +1088,29 @@ class Writer(ReaderWriterBase):
         return repr_for_fp(self._fp)
 
 
+def _reject_inapplicable_options(cls_name: str, **options: Any) -> None:
+    """
+    Mirror the strict signatures of :py:class:`Reader` and
+    :py:class:`Writer` for the keyword arguments of :py:func:`open`.
+
+    Options that only apply to the other direction are rejected instead of
+    being silently ignored.
+    """
+    for name, value in options.items():
+        if value is not None:
+            raise TypeError(
+                f"{cls_name}.__init__() got an unexpected keyword argument "
+                + repr(name)
+            )
+
+
 @overload
 def open(
     file: Openable,
     mode: Literal["r"] = ...,
     *,
     loads: Optional[LoadsCallable] = ...,
+    backend: Optional[Union[Backend, str]] = ...,
 ) -> Reader:
     ...  # pragma: no cover
 
@@ -583,6 +1124,7 @@ def open(
     compact: Optional[bool] = ...,
     sort_keys: Optional[bool] = ...,
     flush: Optional[bool] = ...,
+    backend: Optional[Union[Backend, str]] = ...,
 ) -> Writer:
     ...  # pragma: no cover
 
@@ -597,6 +1139,7 @@ def open(
     compact: Optional[bool] = ...,
     sort_keys: Optional[bool] = ...,
     flush: Optional[bool] = ...,
+    backend: Optional[Union[Backend, str]] = ...,
 ) -> Union[Reader, Writer]:
     ...  # pragma: no cover
 
@@ -610,6 +1153,7 @@ def open(
     compact: Optional[bool] = None,
     sort_keys: Optional[bool] = None,
     flush: Optional[bool] = None,
+    backend: Optional[Union[Backend, str]] = None,
 ) -> Union[Reader, Writer]:
     """
     Open a jsonlines file for reading or writing.
@@ -634,22 +1178,58 @@ def open(
     :param file: name or ‘path-like object’ of the file to open
     :param mode: whether to open the file for reading (``r``),
         writing (``w``), appending (``a``), or exclusive creation (``x``).
+    :param backend: explicit json backend (``"json"``, ``"orjson"``,
+        ``"ujson"``); by default the process-wide default backend is used
     """
     if mode not in {"r", "w", "a", "x"}:
         raise ValueError("'mode' must be either 'r', 'w', 'a', or 'x'")
 
     cls = Reader if mode == "r" else Writer
+
+    # Keep the historical strictness: options that do not apply to the chosen
+    # direction are rejected instead of silently ignored.
+    if mode == "r":
+        _reject_inapplicable_options(
+            "Reader",
+            dumps=dumps,
+            compact=compact,
+            sort_keys=sort_keys,
+            flush=flush,
+        )
+    else:
+        _reject_inapplicable_options("Writer", loads=loads)
+
+    # Validate the codec configuration before the file is opened, so that an
+    # invalid backend or an invalid combination of options cannot create or
+    # truncate the destination.
+    if cls is Reader:
+        _resolve_loads_config(loads if loads is not None else default_loads, backend)
+    else:
+        _resolve_dumps_config(
+            dumps if dumps is not None else default_dumps,
+            backend,
+            bool(compact),
+            bool(sort_keys),
+        )
+
     encoding = "utf-8-sig" if mode == "r" else "utf-8"
     fp = builtins.open(file, mode=mode + "t", encoding=encoding)
-    kwargs = dict(
-        loads=loads,
-        dumps=dumps,
-        compact=compact,
-        sort_keys=sort_keys,
-        flush=flush,
-    )
-    kwargs = {key: value for key, value in kwargs.items() if value is not None}
-    instance: Union[Reader, Writer] = cls(fp, **kwargs)
+    instance: Union[Reader, Writer]
+    if mode == "r":
+        instance = Reader(
+            fp,
+            loads=loads if loads is not None else _DEFAULT_LOADS_MARKER,
+            backend=backend,
+        )
+    else:
+        instance = Writer(
+            fp,
+            dumps=dumps if dumps is not None else _DEFAULT_DUMPS_MARKER,
+            compact=bool(compact),
+            sort_keys=bool(sort_keys),
+            flush=bool(flush),
+            backend=backend,
+        )
     instance._should_close_fp = True
     return instance
 
