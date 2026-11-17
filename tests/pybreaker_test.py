@@ -976,7 +976,7 @@ class CircuitBreakerRedisTestCase(unittest.TestCase, CircuitBreakerStorageBasedT
         with pytest.raises(NotImplementedError):
             self.breaker.call(func)
         keys = self.redis.keys()
-        assert len(keys) == 3  # fail_counter, success_counter, state
+        assert len(keys) == 5  # fail_counter, success_counter, slow_counter, call_counter, state
         assert keys[0].decode("utf-8").startswith("my_app")
         assert keys[1].decode("utf-8").startswith("my_app")
         assert keys[2].decode("utf-8").startswith("my_app")
@@ -1350,6 +1350,469 @@ class CircuitBreakerContextManagerTestCase(unittest.TestCase):
         mock_fn.assert_called_once()
         assert breaker.fail_counter == 0
         assert breaker.current_state == "closed"
+
+
+class FakeClock:
+    """Deterministic monotonic clock used to simulate call durations without
+    relying on real-time sleeps.
+    """
+
+    def __init__(self):
+        self.now = 0.0
+        self.calls = 0
+
+    def time(self):
+        self.calls += 1
+        return self.now
+
+    def advance(self, seconds):
+        self.now += seconds
+
+
+class CircuitBreakerSlowCallTestCase(unittest.TestCase):
+    """Tests for slow-call based protection, driven by an injected clock."""
+
+    def test_default_time_func_is_monotonic(self):
+        """CircuitBreaker: it should use time.monotonic by default."""
+        from time import monotonic
+
+        breaker = CircuitBreaker()
+        assert breaker.time_func is monotonic
+
+    def test_default_config_does_not_measure_slow_calls(self):
+        """CircuitBreaker: without slow-call settings, no call is ever slow."""
+        clock = FakeClock()
+        breaker = CircuitBreaker(time_func=clock.time)
+
+        def slow_func():
+            clock.advance(1000)
+            return True
+
+        assert breaker.call(slow_func)
+        assert breaker.slow_counter == 0
+        assert breaker.call_counter == 1
+        assert breaker.current_state == "closed"
+
+    def test_fast_and_slow_success_counted_separately(self):
+        """CircuitBreaker: fast and slow successes must be distinguishable."""
+        clock = FakeClock()
+        breaker = CircuitBreaker(slow_call_duration_threshold=1.0, time_func=clock.time)
+
+        def fast_func():
+            clock.advance(0.1)
+            return True
+
+        def slow_func():
+            clock.advance(2.0)
+            return True
+
+        assert breaker.call(fast_func)
+        assert breaker.call(slow_func)
+        assert breaker.call(slow_func)
+        assert breaker.call_counter == 3
+        assert breaker.slow_counter == 2
+        assert breaker.fail_counter == 0
+        assert breaker.current_state == "closed"
+
+    def test_duration_threshold_is_inclusive(self):
+        """CircuitBreaker: a call whose elapsed time equals the threshold is slow."""
+        clock = FakeClock()
+        breaker = CircuitBreaker(slow_call_duration_threshold=1.0, time_func=clock.time)
+
+        def func():
+            clock.advance(1.0)
+            return True
+
+        assert breaker.call(func)
+        assert breaker.slow_counter == 1
+
+    def test_exception_failures_count_independently_from_slow_successes(self):
+        """CircuitBreaker: exception failures and slow successes use separate counters."""
+        clock = FakeClock()
+        breaker = CircuitBreaker(
+            fail_max=3,
+            slow_call_duration_threshold=1.0,
+            slow_call_max=2,
+            time_func=clock.time,
+        )
+
+        def err():
+            clock.advance(0.1)
+            raise NotImplementedError
+
+        def slow_suc():
+            clock.advance(2.0)
+            return True
+
+        with pytest.raises(NotImplementedError):
+            breaker.call(err)
+        assert breaker.fail_counter == 1
+
+        # A slow success is counted as a slow call, not as a failure
+        assert breaker.call(slow_suc)
+        assert breaker.slow_counter == 1
+        assert breaker.fail_counter == 0  # consecutive-failure counter resets on success
+
+        with pytest.raises(NotImplementedError):
+            breaker.call(err)
+        assert breaker.fail_counter == 1
+        assert breaker.slow_counter == 1  # the slow counter is unaffected by failures
+        assert breaker.call_counter == 3
+        assert breaker.current_state == "closed"
+
+    def test_slow_call_max_opens_circuit_without_raising_on_successful_call(self):
+        """CircuitBreaker: slow_call_max opens the circuit, but the successful
+        call still returns its result.
+        """
+        clock = FakeClock()
+        breaker = CircuitBreaker(
+            slow_call_duration_threshold=1.0,
+            slow_call_max=3,
+            time_func=clock.time,
+        )
+
+        def fast_func():
+            clock.advance(0.1)
+            return "fast"
+
+        def slow_func():
+            clock.advance(2.0)
+            return "slow"
+
+        assert breaker.call(slow_func) == "slow"
+        assert breaker.call(fast_func) == "fast"
+        assert breaker.call(slow_func) == "slow"
+        assert breaker.current_state == "closed"
+
+        # Third slow call reaches the threshold: circuit opens, result preserved
+        assert breaker.call(slow_func) == "slow"
+        assert breaker.slow_counter == 3
+        assert breaker.current_state == "open"
+
+        # Subsequent calls are short-circuited without touching the clock
+        clock_calls_before = clock.calls
+        with pytest.raises(CircuitBreakerError):
+            breaker.call(slow_func)
+        assert clock.calls == clock_calls_before
+
+    def test_slow_rate_threshold_respects_min_calls(self):
+        """CircuitBreaker: the rate rule only applies after min_calls samples."""
+        clock = FakeClock()
+        breaker = CircuitBreaker(
+            slow_call_duration_threshold=1.0,
+            slow_call_rate_threshold=50,
+            slow_call_min_calls=4,
+            time_func=clock.time,
+        )
+
+        def fast_func():
+            clock.advance(0.1)
+            return True
+
+        def slow_func():
+            clock.advance(2.0)
+            return True
+
+        assert breaker.call(slow_func)
+        # 1/1 = 100% slow, but the minimum sample size has not been reached
+        assert breaker.current_state == "closed"
+
+        assert breaker.call(fast_func)
+        # 1/2 = 50% slow, still below minimum sample size
+        assert breaker.current_state == "closed"
+
+        assert breaker.call(fast_func)
+        assert breaker.call(slow_func)
+        # 2/4 = 50% slow with enough samples: circuit opens
+        assert breaker.current_state == "open"
+        assert breaker.slow_counter == 2
+        assert breaker.call_counter == 4
+
+    def test_slow_rate_threshold_exact_percentage(self):
+        """CircuitBreaker: equality with the rate percentage trips the circuit."""
+        clock = FakeClock()
+        breaker = CircuitBreaker(
+            slow_call_duration_threshold=1.0,
+            slow_call_rate_threshold=25,
+            slow_call_min_calls=4,
+            time_func=clock.time,
+        )
+
+        def fast_func():
+            clock.advance(0.1)
+            return True
+
+        def slow_func():
+            clock.advance(2.0)
+            return True
+
+        for _ in range(3):
+            assert breaker.call(fast_func)
+        assert breaker.current_state == "closed"
+
+        assert breaker.call(slow_func)
+        # 1/4 = 25% slow, equal to the threshold
+        assert breaker.current_state == "open"
+
+    def test_counters_reset_when_circuit_closes_again(self):
+        """CircuitBreaker: closing the circuit resets slow-call statistics."""
+        clock = FakeClock()
+        breaker = CircuitBreaker(
+            fail_max=1,
+            reset_timeout=0,
+            slow_call_duration_threshold=1.0,
+            slow_call_max=1,
+            time_func=clock.time,
+        )
+
+        def slow_func():
+            clock.advance(2.0)
+            return True
+
+        assert breaker.call(slow_func)
+        assert breaker.current_state == "open"
+        assert breaker.slow_counter == 1
+        assert breaker.call_counter == 1
+
+        # reset_timeout=0 means the next call moves the breaker to half-open
+        def fast_func():
+            clock.advance(0.1)
+            return True
+
+        assert breaker.call(fast_func)
+        assert breaker.current_state == "closed"
+        assert breaker.slow_counter == 0
+        assert breaker.call_counter == 0
+        assert breaker.fail_counter == 0
+
+    def test_invalid_duration_threshold_rejected(self):
+        """CircuitBreaker: non-positive duration thresholds are rejected."""
+        with pytest.raises(ValueError):
+            CircuitBreaker(slow_call_duration_threshold=0)
+
+    def test_slow_rules_require_duration_threshold(self):
+        """CircuitBreaker: count/rate rules require a duration threshold."""
+        with pytest.raises(ValueError):
+            CircuitBreaker(slow_call_max=3)
+        with pytest.raises(ValueError):
+            CircuitBreaker(slow_call_rate_threshold=50)
+
+    def test_invalid_slow_call_max_rejected(self):
+        """CircuitBreaker: slow_call_max must be positive."""
+        with pytest.raises(ValueError):
+            CircuitBreaker(slow_call_duration_threshold=1.0, slow_call_max=0)
+
+    def test_invalid_rate_threshold_rejected(self):
+        """CircuitBreaker: rate threshold must be within (0, 100]."""
+        with pytest.raises(ValueError):
+            CircuitBreaker(slow_call_duration_threshold=1.0, slow_call_rate_threshold=0)
+        with pytest.raises(ValueError):
+            CircuitBreaker(slow_call_duration_threshold=1.0, slow_call_rate_threshold=101)
+
+    def test_invalid_min_calls_rejected(self):
+        """CircuitBreaker: slow_call_min_calls must be positive."""
+        with pytest.raises(ValueError):
+            CircuitBreaker(slow_call_duration_threshold=1.0, slow_call_min_calls=0)
+
+    def test_half_open_slow_success_does_not_count_toward_recovery_by_default(self):
+        """CircuitBreaker: in half-open state, a slow success does not satisfy
+        the recovery threshold unless explicitly enabled.
+        """
+        clock = FakeClock()
+        breaker = CircuitBreaker(
+            success_threshold=2,
+            slow_call_duration_threshold=1.0,
+            time_func=clock.time,
+        )
+        breaker.half_open()
+
+        def slow_func():
+            clock.advance(2.0)
+            return True
+
+        assert breaker.call(slow_func)
+        assert breaker.current_state == "half-open"
+        assert breaker.success_counter == 0
+        assert breaker.slow_counter == 1
+
+        # Another slow success must not close the circuit either
+        assert breaker.call(slow_func)
+        assert breaker.current_state == "half-open"
+        assert breaker.success_counter == 0
+
+    def test_half_open_fast_success_still_counts_toward_recovery(self):
+        """CircuitBreaker: fast successes keep counting towards recovery."""
+        clock = FakeClock()
+        breaker = CircuitBreaker(
+            success_threshold=2,
+            slow_call_duration_threshold=1.0,
+            time_func=clock.time,
+        )
+        breaker.half_open()
+
+        def fast_func():
+            clock.advance(0.1)
+            return True
+
+        def slow_func():
+            clock.advance(2.0)
+            return True
+
+        assert breaker.call(slow_func)
+        assert breaker.success_counter == 0
+        assert breaker.call(fast_func)
+        assert breaker.success_counter == 1
+        assert breaker.current_state == "half-open"
+        assert breaker.call(fast_func)
+        assert breaker.current_state == "closed"
+
+    def test_half_open_slow_success_counts_when_enabled(self):
+        """CircuitBreaker: the slow-success recovery rule is configurable."""
+        clock = FakeClock()
+        breaker = CircuitBreaker(
+            success_threshold=2,
+            slow_call_duration_threshold=1.0,
+            slow_success_counts_toward_recovery=True,
+            time_func=clock.time,
+        )
+        breaker.half_open()
+
+        def slow_func():
+            clock.advance(2.0)
+            return True
+
+        assert breaker.call(slow_func)
+        assert breaker.current_state == "half-open"
+        assert breaker.success_counter == 1
+        assert breaker.call(slow_func)
+        assert breaker.current_state == "closed"
+        assert breaker.success_counter == 0
+
+    def test_broken_clock_before_call_does_not_mask_user_exception(self):
+        """CircuitBreaker: a failing clock must never hide the user function's error."""
+
+        class BrokenClock:
+            def time(self):
+                raise RuntimeError("clock exploded")
+
+        breaker = CircuitBreaker(time_func=BrokenClock().time)
+
+        def err():
+            raise NotImplementedError
+
+        with pytest.raises(NotImplementedError):
+            breaker.call(err)
+        assert breaker.fail_counter == 1
+        assert breaker.slow_counter == 0
+
+    def test_broken_clock_never_marks_calls_as_slow(self):
+        """CircuitBreaker: timing failures make slowness unknowable, not slow."""
+
+        class BrokenClock:
+            def time(self):
+                raise RuntimeError("clock exploded")
+
+        breaker = CircuitBreaker(
+            slow_call_duration_threshold=0.001,
+            slow_call_max=1,
+            time_func=BrokenClock().time,
+        )
+
+        def func():
+            return True
+
+        assert breaker.call(func)
+        assert breaker.call(func)
+        assert breaker.slow_counter == 0
+        assert breaker.current_state == "closed"
+
+    def test_short_circuited_calls_are_never_timed_or_counted(self):
+        """CircuitBreaker: open-state calls skip timing entirely instead of
+        being registered as zero-duration successes.
+        """
+        clock = FakeClock()
+        breaker = CircuitBreaker(
+            fail_max=1,
+            slow_call_duration_threshold=1.0,
+            slow_call_max=1,
+            time_func=clock.time,
+        )
+        guarded = mock.MagicMock(return_value=True)
+        breaker.open()
+
+        clock_calls_before = clock.calls
+        with pytest.raises(CircuitBreakerError):
+            breaker.call(guarded)
+        guarded.assert_not_called()
+        assert clock.calls == clock_calls_before
+        assert breaker.call_counter == 0
+        assert breaker.slow_counter == 0
+
+    def test_injected_clock_measures_elapsed_time(self):
+        """CircuitBreaker: the injected clock determines measured durations."""
+        clock = FakeClock()
+        breaker = CircuitBreaker(slow_call_duration_threshold=5.0, time_func=clock.time)
+
+        def func():
+            clock.advance(5.0)
+            return True
+
+        assert breaker.call(func)
+        assert breaker.slow_counter == 1
+
+
+class CircuitBreakerSlowCallRedisTestCase(unittest.TestCase):
+    """Slow-call protection backed by Redis storage, driven by an injected clock."""
+
+    def setUp(self):
+        self.redis = fakeredis.FakeStrictRedis()
+        self.clock = FakeClock()
+        self.breaker_kwargs = {
+            "state_storage": CircuitRedisStorage("closed", self.redis),
+            "time_func": self.clock.time,
+        }
+
+    def tearDown(self):
+        self.redis.flushall()
+
+    def test_slow_counters_persisted_in_redis(self):
+        """CircuitBreaker: slow and call counters are stored independently."""
+        breaker = CircuitBreaker(
+            slow_call_duration_threshold=1.0,
+            **self.breaker_kwargs,
+        )
+
+        def fast_func():
+            self.clock.advance(0.1)
+            return True
+
+        def slow_func():
+            self.clock.advance(2.0)
+            return True
+
+        assert breaker.call(fast_func)
+        assert breaker.call(slow_func)
+        assert breaker.call(slow_func)
+        assert breaker.call_counter == 3
+        assert breaker.slow_counter == 2
+        assert breaker.fail_counter == 0
+
+    def test_slow_call_max_opens_circuit_with_redis_storage(self):
+        """CircuitBreaker: the slow-call count rule works with Redis storage."""
+        breaker = CircuitBreaker(
+            slow_call_duration_threshold=1.0,
+            slow_call_max=2,
+            **self.breaker_kwargs,
+        )
+
+        def slow_func():
+            self.clock.advance(2.0)
+            return True
+
+        assert breaker.call(slow_func)
+        assert breaker.current_state == "closed"
+        assert breaker.call(slow_func)
+        assert breaker.current_state == "open"
 
 
 if __name__ == "__main__":

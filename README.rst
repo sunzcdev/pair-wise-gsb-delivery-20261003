@@ -16,6 +16,8 @@ Features
 
 * Configurable list of excluded exceptions (e.g. business exceptions)
 * Configurable failure threshold and reset timeout
+* Protection against slow calls through configurable duration, count and rate thresholds
+* Injectable monotonic clock for deterministic timing
 * Support for several event listeners per circuit breaker
 * Can guard generator functions
 * Functions and properties for easy monitoring and management
@@ -72,6 +74,63 @@ requests before closing the circuit breaker:
 
     # Require 3 successful requests before closing
     db_breaker = pybreaker.CircuitBreaker(fail_max=5, reset_timeout=60, success_threshold=3)
+
+
+Protecting Against Slow Calls
+`````````````````````````````
+
+A dependency that never raises an error but answers very slowly can exhaust a
+caller's resources just as well as one that fails. A circuit breaker can
+therefore also open itself based on call duration, measured with an injectable
+monotonic clock (``time.monotonic`` by default):
+
+.. code:: python
+
+    db_breaker = pybreaker.CircuitBreaker(
+        # A successful call taking this many seconds or longer is "slow"
+        slow_call_duration_threshold=2.0,
+        # Open after 5 slow calls, ...
+        slow_call_max=5,
+        # ... or when at least 50% of the last 10 calls were slow
+        slow_call_rate_threshold=50,
+        slow_call_min_calls=10,
+        # Custom clock, e.g. for deterministic tests without real sleeps
+        time_func=my_monotonic_clock,
+    )
+
+Exception failures and slow successes are counted separately: the failure
+counter (``fail_counter``) tracks exception failures, while the slow-call
+counter (``slow_counter``) tracks slow successes, and ``call_counter`` tracks
+every call actually executed. The rules are explicit:
+
+* ``fail_max`` opens the circuit when the exception failure counter reaches it.
+* ``slow_call_max`` opens the circuit when the slow-call counter reaches it.
+* ``slow_call_rate_threshold`` (a percentage) opens the circuit once at least
+  ``slow_call_min_calls`` calls have been executed and the share of slow calls
+  is at or above the threshold.
+
+Each slow-call rule is only active when its parameter is provided, so existing
+breakers keep their original behavior. When a slow successful call trips the
+circuit, the call itself still returns its result; subsequent calls are then
+short-circuited as usual and are never timed or counted.
+
+Whether a slow success in the half-open state counts towards recovery is
+controlled separately by ``slow_success_counts_toward_recovery`` (default
+``False``):
+
+.. code:: python
+
+    # Slow trial calls don't count: only fast (or explicitly accepted) calls
+    # help satisfy `success_threshold`.
+    strict_breaker = pybreaker.CircuitBreaker(
+        success_threshold=3,
+        slow_call_duration_threshold=2.0,
+        slow_success_counts_toward_recovery=False,
+    )
+
+If the injected clock itself raises an error, timing is treated as unavailable
+and the call is never marked slow; this also ensures a timing error can never
+mask an exception raised by the guarded function.
 
 .. note::
 
@@ -305,6 +364,10 @@ change its current state:
 
     # Get the current number of consecutive successes
     print(db_breaker.success_counter)
+
+    # Get the number of slow calls and executed calls (slow-call protection)
+    print(db_breaker.slow_counter)
+    print(db_breaker.call_counter)
 
     # Get/set the maximum number of consecutive failures
     print(db_breaker.fail_max)

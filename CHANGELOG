@@ -1,6 +1,17 @@
 Changelog
 =========
 
+Version 1.5.0 (November 18, 2026)
+
+* Open the circuit on slow calls: configurable duration threshold, slow-call
+  count threshold and slow-call rate threshold with minimum sample size
+* Count exception failures and slow successes separately
+* Injectable monotonic clock for call timing; clock failures never mask user
+  function exceptions and never mark calls as slow
+* Separate half-open recovery rule for slow successes
+  (`slow_success_counts_toward_recovery`)
+* Short-circuited calls are never timed or counted as zero-duration successes
+
 Version 1.4.0 (July 6, 2025)
 
 * Add success_threshold parameter (Thanks @sideshowbandana)

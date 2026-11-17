@@ -72,6 +72,9 @@ STATE_OPEN = "open"
 STATE_CLOSED = "closed"
 STATE_HALF_OPEN = "half-open"
 
+# Maximum valid value for the slow-call rate threshold, expressed as a percentage.
+MAX_PERCENTAGE = 100
+
 T = TypeVar("T")
 ExceptionType = TypeVar("ExceptionType", bound=BaseException)
 CBListenerType = TypeVar("CBListenerType", bound="CircuitBreakerListener")
@@ -98,8 +101,31 @@ class CircuitBreaker:
         state_storage: CircuitBreakerStorage | None = None,
         name: str | None = None,
         throw_new_error_on_trip: bool = True,
+        slow_call_duration_threshold: float | None = None,
+        slow_call_max: int | None = None,
+        slow_call_rate_threshold: float | None = None,
+        slow_call_min_calls: int = 1,
+        slow_success_counts_toward_recovery: bool = False,
+        time_func: Callable[[], float] | None = None,
     ) -> None:
-        """Create a new circuit breaker with the given parameters."""
+        """Create a new circuit breaker with the given parameters.
+
+        A successful call is considered *slow* when its elapsed time, measured
+        with `time_func`, is greater than or equal to
+        `slow_call_duration_threshold` seconds. Slow successes and exception
+        failures are counted separately. The circuit may be opened either by
+        the failure rule (`fail_max`), by the slow-call count rule
+        (`slow_call_max`) or by the slow-call rate rule
+        (`slow_call_rate_threshold`); each rule is only active when its
+        configuration is provided.
+        """
+        self._validate_slow_call_config(
+            slow_call_duration_threshold,
+            slow_call_max,
+            slow_call_rate_threshold,
+            slow_call_min_calls,
+        )
+
         self._lock = threading.RLock()
         self._state_storage = state_storage or CircuitMemoryStorage(STATE_CLOSED)
         self._state = self._create_new_state(self.current_state)
@@ -113,6 +139,43 @@ class CircuitBreaker:
         self._name = name
 
         self._throw_new_error_on_trip = throw_new_error_on_trip
+
+        self._slow_call_duration_threshold = slow_call_duration_threshold
+        self._slow_call_max = slow_call_max
+        self._slow_call_rate_threshold = slow_call_rate_threshold
+        self._slow_call_min_calls = slow_call_min_calls
+        self._slow_success_counts_toward_recovery = slow_success_counts_toward_recovery
+        self._time_func = time_func or time.monotonic
+
+    @staticmethod
+    def _validate_slow_call_config(
+        slow_call_duration_threshold: float | None,
+        slow_call_max: int | None,
+        slow_call_rate_threshold: float | None,
+        slow_call_min_calls: int,
+    ) -> None:
+        """Validate the parameters that govern slow-call based protection."""
+        if slow_call_duration_threshold is not None and slow_call_duration_threshold <= 0:
+            msg = "slow_call_duration_threshold must be greater than zero"
+            raise ValueError(msg)
+
+        if (slow_call_max is not None or slow_call_rate_threshold is not None) and (
+            slow_call_duration_threshold is None
+        ):
+            msg = "slow_call_duration_threshold is required to enable slow-call based protection"
+            raise ValueError(msg)
+
+        if slow_call_max is not None and slow_call_max < 1:
+            msg = "slow_call_max must be greater than zero"
+            raise ValueError(msg)
+
+        if slow_call_rate_threshold is not None and not 0 < slow_call_rate_threshold <= MAX_PERCENTAGE:
+            msg = "slow_call_rate_threshold must be a percentage between 0 and 100"
+            raise ValueError(msg)
+
+        if slow_call_min_calls < 1:
+            msg = "slow_call_min_calls must be greater than zero"
+            raise ValueError(msg)
 
     @property
     def fail_counter(self) -> int:
@@ -155,6 +218,46 @@ class CircuitBreaker:
     def success_threshold(self, threshold: int) -> None:
         """Set the number of successful requests required before transitioning from half-open to closed state."""
         self._success_threshold = threshold
+
+    @property
+    def slow_call_duration_threshold(self) -> float | None:
+        """Return the elapsed time, in seconds, from which a successful call is considered slow."""
+        return self._slow_call_duration_threshold
+
+    @property
+    def slow_call_max(self) -> int | None:
+        """Return the maximum number of slow calls tolerated before the circuit is opened."""
+        return self._slow_call_max
+
+    @property
+    def slow_call_rate_threshold(self) -> float | None:
+        """Return the slow-call rate threshold, as a percentage, that opens the circuit."""
+        return self._slow_call_rate_threshold
+
+    @property
+    def slow_call_min_calls(self) -> int:
+        """Return the minimum number of calls required before the slow-call rate rule is evaluated."""
+        return self._slow_call_min_calls
+
+    @property
+    def slow_success_counts_toward_recovery(self) -> bool:
+        """Return whether a slow success in half-open state counts towards the recovery threshold."""
+        return self._slow_success_counts_toward_recovery
+
+    @property
+    def time_func(self) -> Callable[[], float]:
+        """Return the monotonic clock function used to measure call elapsed time."""
+        return self._time_func
+
+    @property
+    def slow_counter(self) -> int:
+        """Return the current number of slow calls recorded in closed state."""
+        return self._state_storage.slow_counter
+
+    @property
+    def call_counter(self) -> int:
+        """Return the current number of executed calls recorded in closed state."""
+        return self._state_storage.call_counter
 
     def _create_new_state(
         self,
@@ -243,6 +346,22 @@ class CircuitBreaker:
                     return False
         return True
 
+    def slow_call_threshold_reached(self) -> bool:
+        """Return whether the configured slow-call count or rate rule is
+        currently satisfied, based on the counters in state storage.
+
+        Rules that were not configured (i.e. their parameters are None) are
+        simply not evaluated.
+        """
+        storage = self._state_storage
+        count_rule_triggered = self._slow_call_max is not None and storage.slow_counter >= self._slow_call_max
+        rate_rule_triggered = (
+            self._slow_call_rate_threshold is not None
+            and storage.call_counter >= self._slow_call_min_calls
+            and (storage.slow_counter / storage.call_counter) * MAX_PERCENTAGE >= self._slow_call_rate_threshold
+        )
+        return count_rule_triggered or rate_rule_triggered
+
     def call(self, func: Callable[..., T], *args: Any, **kwargs: Any) -> T:
         """Call `func` with the given `args` and `kwargs` according to the rules
         implemented by the current state of this circuit breaker.
@@ -298,6 +417,8 @@ class CircuitBreaker:
         """Close the circuit, e.g. lets the following calls execute as usual."""
         with self._lock:
             self._state_storage.reset_success_counter()  # Reset success counter when closing
+            self._state_storage.reset_slow_counter()
+            self._state_storage.reset_call_counter()
             self.state = self._state_storage.state = STATE_CLOSED  # type: ignore[assignment]
 
     def __call__(self, *call_args: Any, **call_kwargs: bool) -> Callable:
@@ -393,6 +514,18 @@ class CircuitBreakerStorage:
     def reset_success_counter(self) -> None:
         """Override this method to set the success counter to zero."""
 
+    def increment_slow_counter(self) -> None:
+        """Override this method to increase the slow-call counter by one."""
+
+    def reset_slow_counter(self) -> None:
+        """Override this method to set the slow-call counter to zero."""
+
+    def increment_call_counter(self) -> None:
+        """Override this method to increase the executed-call counter by one."""
+
+    def reset_call_counter(self) -> None:
+        """Override this method to set the executed-call counter to zero."""
+
     @property
     @abstractmethod
     def counter(self) -> int:
@@ -402,6 +535,16 @@ class CircuitBreakerStorage:
     @abstractmethod
     def success_counter(self) -> int:
         """Override this method to retrieve the current value of the success counter."""
+
+    @property
+    @abstractmethod
+    def slow_counter(self) -> int:
+        """Override this method to retrieve the current value of the slow-call counter."""
+
+    @property
+    @abstractmethod
+    def call_counter(self) -> int:
+        """Override this method to retrieve the current value of the executed-call counter."""
 
     @property
     @abstractmethod
@@ -421,6 +564,8 @@ class CircuitMemoryStorage(CircuitBreakerStorage):
         super().__init__("memory")
         self._fail_counter = 0
         self._success_counter = 0
+        self._slow_counter = 0
+        self._call_counter = 0
         self._opened_at: datetime | None = None
         self._state = state
 
@@ -450,6 +595,22 @@ class CircuitMemoryStorage(CircuitBreakerStorage):
         """Set the success counter to zero."""
         self._success_counter = 0
 
+    def increment_slow_counter(self) -> None:
+        """Increase the slow-call counter by one."""
+        self._slow_counter += 1
+
+    def reset_slow_counter(self) -> None:
+        """Set the slow-call counter to zero."""
+        self._slow_counter = 0
+
+    def increment_call_counter(self) -> None:
+        """Increase the executed-call counter by one."""
+        self._call_counter += 1
+
+    def reset_call_counter(self) -> None:
+        """Set the executed-call counter to zero."""
+        self._call_counter = 0
+
     @property
     def counter(self) -> int:
         """Return the current value of the failure counter."""
@@ -459,6 +620,16 @@ class CircuitMemoryStorage(CircuitBreakerStorage):
     def success_counter(self) -> int:
         """Return the current value of the success counter."""
         return self._success_counter
+
+    @property
+    def slow_counter(self) -> int:
+        """Return the current value of the slow-call counter."""
+        return self._slow_counter
+
+    @property
+    def call_counter(self) -> int:
+        """Return the current value of the executed-call counter."""
+        return self._call_counter
 
     @property
     def opened_at(self) -> datetime | None:
@@ -509,6 +680,8 @@ class CircuitRedisStorage(CircuitBreakerStorage):
     def _initialize_redis_state(self, state: str) -> None:
         self._redis.setnx(self._namespace("fail_counter"), 0)
         self._redis.setnx(self._namespace("success_counter"), 0)
+        self._redis.setnx(self._namespace("slow_counter"), 0)
+        self._redis.setnx(self._namespace("call_counter"), 0)
         self._redis.setnx(self._namespace("state"), state)
 
     @property
@@ -570,6 +743,34 @@ class CircuitRedisStorage(CircuitBreakerStorage):
         except RedisError:
             self.logger.exception("RedisError")
 
+    def increment_slow_counter(self) -> None:
+        """Increase the slow-call counter by one."""
+        try:
+            self._redis.incr(self._namespace("slow_counter"))
+        except RedisError:
+            self.logger.exception("RedisError")
+
+    def reset_slow_counter(self) -> None:
+        """Set the slow-call counter to zero."""
+        try:
+            self._redis.set(self._namespace("slow_counter"), 0)
+        except RedisError:
+            self.logger.exception("RedisError")
+
+    def increment_call_counter(self) -> None:
+        """Increase the executed-call counter by one."""
+        try:
+            self._redis.incr(self._namespace("call_counter"))
+        except RedisError:
+            self.logger.exception("RedisError")
+
+    def reset_call_counter(self) -> None:
+        """Set the executed-call counter to zero."""
+        try:
+            self._redis.set(self._namespace("call_counter"), 0)
+        except RedisError:
+            self.logger.exception("RedisError")
+
     @property
     def counter(self) -> int:
         """Return the current value of the failure counter."""
@@ -592,6 +793,30 @@ class CircuitRedisStorage(CircuitBreakerStorage):
             return 0
         except RedisError:
             self.logger.exception("RedisError: Assuming no successes")
+            return 0
+
+    @property
+    def slow_counter(self) -> int:
+        """Return the current value of the slow-call counter."""
+        try:
+            value = self._redis.get(self._namespace("slow_counter"))
+            if value:
+                return int(value)
+            return 0
+        except RedisError:
+            self.logger.exception("RedisError: Assuming no slow calls")
+            return 0
+
+    @property
+    def call_counter(self) -> int:
+        """Return the current value of the executed-call counter."""
+        try:
+            value = self._redis.get(self._namespace("call_counter"))
+            if value:
+                return int(value)
+            return 0
+        except RedisError:
+            self.logger.exception("RedisError: Assuming no calls")
             return 0
 
     @property
@@ -690,6 +915,7 @@ class CircuitBreakerState:
         """Handle a failed call to the guarded operation."""
         if self._breaker.is_system_error(exc):
             self._breaker._inc_counter()
+            self._breaker._state_storage.increment_call_counter()
             for listener in self._breaker.listeners:
                 listener.failure(self._breaker, exc)
             self.on_failure(exc)
@@ -699,12 +925,60 @@ class CircuitBreakerState:
         if reraise:
             raise exc
 
-    def _handle_success(self) -> None:
-        """Handle a successful call to the guarded operation."""
-        self._breaker._state_storage.reset_counter()
-        self.on_success()
+    def _handle_success(self, slow: bool = False) -> None:
+        """Handle a successful call to the guarded operation.
+
+        Slow successes are counted separately from exception failures. The
+        slow-call and executed-call counters accumulate while the circuit is
+        closed and are only reset when the circuit returns to the closed
+        state, so that the slow-call rate can be evaluated over the whole
+        observation window.
+        """
+        storage = self._breaker._state_storage
+        storage.increment_call_counter()
+        storage.reset_counter()
+        if slow:
+            storage.increment_slow_counter()
+        self.on_success(slow)
         for listener in self._breaker.listeners:
             listener.success(self._breaker)
+
+    def _start_timer(self) -> float | None:
+        """Read the injected monotonic clock before the guarded call.
+
+        Any error raised by the clock itself is swallowed so that a broken
+        clock can never mask an exception raised by the user function.
+        """
+        try:
+            return self._breaker.time_func()
+        except Exception:
+            return None
+
+    def _elapsed(self, started_at: float | None) -> float | None:
+        """Return the elapsed time since `started_at`, or None when timing is
+        unavailable or unreliable (e.g. the clock itself failed).
+        """
+        if started_at is None:
+            return None
+        try:
+            elapsed = self._breaker.time_func() - started_at
+        except Exception:
+            return None
+        if elapsed < 0:
+            return None
+        return elapsed
+
+    def _is_slow(self, started_at: float | None) -> bool:
+        """Return whether the call elapsed at or beyond the configured slow-call
+        duration threshold. Calls that cannot be timed are never considered slow.
+        """
+        threshold = self._breaker.slow_call_duration_threshold
+        if threshold is None:
+            return False
+        elapsed = self._elapsed(started_at)
+        if elapsed is None:
+            return False
+        return elapsed >= threshold
 
     def call(self, func: Callable[..., T], *args: Any, **kwargs: Any) -> T:
         """Calls `func` with the given `args` and `kwargs`, and updates the
@@ -716,6 +990,7 @@ class CircuitBreakerState:
         for listener in self._breaker.listeners:
             listener.before_call(self._breaker, func, *args, **kwargs)
 
+        started_at = self._start_timer()
         try:
             ret = func(*args, **kwargs)
             if isinstance(ret, types.GeneratorType):
@@ -724,7 +999,7 @@ class CircuitBreakerState:
         except BaseException as e:
             self._handle_error(e)
         else:
-            self._handle_success()
+            self._handle_success(self._is_slow(started_at))
         return ret
 
     def call_async(self, func, *args: Any, **kwargs: Any):  # type: ignore[no-untyped-def]
@@ -770,7 +1045,7 @@ class CircuitBreakerState:
     def before_call(self, func: Callable[..., Any], *args: Any, **kwargs: Any) -> None:
         """Override this method to be notified before a call to the guarded operation is attempted."""
 
-    def on_success(self) -> None:
+    def on_success(self, slow: bool = False) -> None:
         """Override this method to be notified when a call to the guarded operation succeeds."""
 
     def on_failure(self, exc: BaseException) -> None:
@@ -813,6 +1088,14 @@ class CircuitClosedState(CircuitBreakerState):
                 error_msg = "Failures threshold reached, circuit breaker opened"
                 raise CircuitBreakerError(error_msg).with_traceback(sys.exc_info()[2])
             raise exc
+
+    def on_success(self, slow: bool = False) -> None:
+        """Open the circuit breaker when a slow success reaches any of the
+        configured slow-call count or rate thresholds. The call itself still
+        returns its result successfully.
+        """
+        if slow and self._breaker.slow_call_threshold_reached():
+            self._breaker.open()
 
 
 class CircuitOpenState(CircuitBreakerState):
@@ -889,8 +1172,17 @@ class CircuitHalfOpenState(CircuitBreakerState):
             raise CircuitBreakerError(error_msg).with_traceback(sys.exc_info()[2])
         raise exc
 
-    def on_success(self) -> None:
-        """Increment success counter and close the circuit breaker if threshold is reached."""
+    def on_success(self, slow: bool = False) -> None:
+        """Increment the success counter and close the circuit breaker once the
+        recovery threshold is reached.
+
+        A slow success only counts towards recovery when the explicit
+        `slow_success_counts_toward_recovery` setting is enabled; otherwise,
+        the circuit stays half-open so that another trial call is required.
+        """
+        if slow and not self._breaker.slow_success_counts_toward_recovery:
+            return
+
         self._breaker._state_storage.increment_success_counter()
 
         if self._breaker._state_storage.success_counter >= self._breaker.success_threshold:

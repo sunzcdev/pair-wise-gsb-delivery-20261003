@@ -1,6 +1,6 @@
 [project]
 name = "pybreaker"
-version = "1.4.1"
+version = "1.5.0"
 description = "Python implementation of the Circuit Breaker pattern"
 authors = [
     { name = "Daniel Fernandes Martins", email = "daniel.tritone@gmail.com" },
@@ -62,4 +62,4 @@ select = ["ALL"]
 fixable = ["ALL"]
 ignore = ["ISC001", "ANN", "FA", "FBT", "D100", "D102", "D205", "D103", "D104", "D105", "D213", "D203", "T201", "TRY003", "EM102", "COM812", "S602", "S603", "S604", "S605", "S607", "S324"]
 [tool.ruff.lint.per-file-ignores]
-"src/*" = ["PLR0913", "TCH002", "D401", "D404", "SLF001", "BLE001", "TRY301", "DTZ001", "DTZ003", "SIM102", "TRY300"]
+"src/*" = ["PLR0913", "PLR0917", "TCH002", "D401", "D404", "SLF001", "BLE001", "TRY301", "DTZ001", "DTZ003", "SIM102", "TRY300"]
