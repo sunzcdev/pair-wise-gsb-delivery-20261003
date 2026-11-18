@@ -959,6 +959,220 @@ class TestLogDevice < Test::Unit::TestCase
     end
   end if env_tz_works
 
+  def test_shifting_daily_with_time_zone
+    # The calendar zone is explicit, so the host TZ is irrelevant and
+    # this test does not depend on env_tz_works.
+    Dir.mktmpdir do |tmpdir|
+      assert_in_out_err([{"TZ"=>"UTC"}, *%W"-I#{@top_dir} -rlogger -C#{tmpdir} -"], "#{<<-"begin;"}\n#{<<-'end;'}")
+      begin;
+        begin
+          module FakeTime
+            attr_accessor :now
+          end
+
+          class << Time
+            prepend FakeTime
+          end
+
+          log = "log"
+          File.open(log, "w") {}
+          Time.now = Time.utc(2015, 12, 14, 0, 1, 1)
+          File.utime(Time.now, Time.now, log)
+
+          dev = Logger::LogDevice.new(log, shift_age: 'daily', shift_time_zone: '+09:00')
+
+          # 2015-12-14 23:59:59 in +09:00: same calendar day, no rotation.
+          Time.now = Time.utc(2015, 12, 14, 14, 59, 59)
+          dev.write("#{Time.now} hello-1\n")
+          File.utime(Time.now, Time.now, log)
+
+          # 2015-12-15 00:00:01 in +09:00, but still 2015-12-14 in UTC:
+          # rotation must happen here, and only because of the zone.
+          Time.now = Time.utc(2015, 12, 14, 15, 0, 1)
+          dev.write("#{Time.now} hello-2\n")
+          File.utime(Time.now, Time.now, log)
+        ensure
+          dev.close if dev
+        end
+      end;
+      log = File.join(tmpdir, "log")
+      cont = File.read(log)
+      assert_match(/hello-2/, cont)
+      assert_not_match(/hello-1/, cont)
+      # The suffix follows the same +09:00 calendar as the boundary:
+      # the archived period ended at 2015-12-14 23:59:59 +09:00.
+      # (The host-local UTC rule would have produced "20151213".)
+      logs = Dir.glob(log + ".*")
+      assert_equal([log + ".20151214"], logs)
+      assert_match(/hello-1/, File.read(log + ".20151214"))
+    end
+  end
+
+  def test_shifting_weekly_with_time_zone
+    Dir.mktmpdir do |tmpdir|
+      assert_in_out_err([{"TZ"=>"UTC"}, *%W"-I#{@top_dir} -rlogger -C#{tmpdir} -"], "#{<<-"begin;"}\n#{<<-'end;'}")
+      begin;
+        begin
+          module FakeTime
+            attr_accessor :now
+          end
+
+          class << Time
+            prepend FakeTime
+          end
+
+          log = "log"
+          File.open(log, "w") {}
+          Time.now = Time.utc(2015, 12, 14, 0, 1, 1)
+          File.utime(Time.now, Time.now, log)
+
+          dev = Logger::LogDevice.new(log, shift_age: 'weekly', shift_time_zone: '+09:00')
+
+          # 2015-12-19 23:59:59 +09:00 (Saturday): same week, no rotation.
+          Time.now = Time.utc(2015, 12, 19, 14, 59, 59)
+          dev.write("#{Time.now} hello-1\n")
+          File.utime(Time.now, Time.now, log)
+
+          # 2015-12-20 00:00:01 +09:00 (Sunday), still Saturday in UTC.
+          Time.now = Time.utc(2015, 12, 19, 15, 0, 1)
+          dev.write("#{Time.now} hello-2\n")
+          File.utime(Time.now, Time.now, log)
+        ensure
+          dev.close if dev
+        end
+      end;
+      log = File.join(tmpdir, "log")
+      cont = File.read(log)
+      assert_match(/hello-2/, cont)
+      assert_not_match(/hello-1/, cont)
+      # The archived week ended 2015-12-19 23:59:59 +09:00.
+      # (The host-local UTC rule would have produced "20151212".)
+      logs = Dir.glob(log + ".*")
+      assert_equal([log + ".20151219"], logs)
+      assert_match(/hello-1/, File.read(log + ".20151219"))
+    end
+  end
+
+  def test_shifting_with_time_zone_clock_rollback
+    # A system clock rollback must not rotate the same period twice.
+    Dir.mktmpdir do |tmpdir|
+      assert_in_out_err([{"TZ"=>"UTC"}, *%W"-I#{@top_dir} -rlogger -C#{tmpdir} -"], "#{<<-"begin;"}\n#{<<-'end;'}")
+      begin;
+        begin
+          module FakeTime
+            attr_accessor :now
+          end
+
+          class << Time
+            prepend FakeTime
+          end
+
+          log = "log"
+          File.open(log, "w") {}
+          Time.now = Time.utc(2015, 12, 14, 0, 1, 1)
+          File.utime(Time.now, Time.now, log)
+
+          dev = Logger::LogDevice.new(log, shift_age: 'daily', shift_time_zone: '+09:00')
+
+          Time.now = Time.utc(2015, 12, 14, 14, 59, 59)
+          dev.write("#{Time.now} hello-1\n")
+          File.utime(Time.now, Time.now, log)
+
+          # Cross the +09:00 midnight: rotates once.
+          Time.now = Time.utc(2015, 12, 14, 15, 0, 1)
+          dev.write("#{Time.now} hello-2\n")
+          File.utime(Time.now, Time.now, log)
+
+          # Clock rolls back before the boundary: no rotation.
+          Time.now = Time.utc(2015, 12, 14, 14, 30, 0)
+          dev.write("#{Time.now} hello-3\n")
+          File.utime(Time.now, Time.now, log)
+
+          # Forward again, still before the next boundary
+          # (2015-12-15 15:00:00 UTC): no rotation either.
+          Time.now = Time.utc(2015, 12, 14, 16, 0, 0)
+          dev.write("#{Time.now} hello-4\n")
+          File.utime(Time.now, Time.now, log)
+        ensure
+          dev.close if dev
+        end
+      end;
+      log = File.join(tmpdir, "log")
+      cont = File.read(log)
+      assert_match(/hello-2/, cont)
+      assert_match(/hello-3/, cont)
+      assert_match(/hello-4/, cont)
+      assert_not_match(/hello-1/, cont)
+      logs = Dir.glob(log + ".*")
+      assert_equal([log + ".20151214"], logs)
+      assert_match(/hello-1/, File.read(log + ".20151214"))
+    end
+  end
+
+  def test_shifting_period_not_overwrite_existing_archive
+    # If the computed archive name already exists (e.g. DST repeated
+    # the local date, or a restart re-archived the same period), the
+    # existing archive is kept and a numeric suffix is appended.
+    Dir.mktmpdir do |tmpdir|
+      assert_in_out_err([{"TZ"=>"UTC"}, *%W"-I#{@top_dir} -rlogger -C#{tmpdir} -"], "#{<<-"begin;"}\n#{<<-'end;'}")
+      begin;
+        begin
+          module FakeTime
+            attr_accessor :now
+          end
+
+          class << Time
+            prepend FakeTime
+          end
+
+          log = "log"
+          File.open(log, "w") {}
+          File.write("log.20151214", "pre-existing archive\n")
+          Time.now = Time.utc(2015, 12, 14, 0, 1, 1)
+          File.utime(Time.now, Time.now, log)
+
+          dev = Logger::LogDevice.new(log, shift_age: 'daily', shift_time_zone: '+09:00')
+
+          Time.now = Time.utc(2015, 12, 14, 14, 0, 0)
+          dev.write("#{Time.now} hello-1\n")
+          File.utime(Time.now, Time.now, log)
+
+          Time.now = Time.utc(2015, 12, 14, 15, 0, 1)
+          dev.write("#{Time.now} hello-2\n")
+          File.utime(Time.now, Time.now, log)
+        ensure
+          dev.close if dev
+        end
+      end;
+      log = File.join(tmpdir, "log")
+      assert_equal("pre-existing archive\n", File.read(log + ".20151214"))
+      assert_match(/hello-1/, File.read(log + ".20151214.1"))
+      assert_match(/hello-2/, File.read(log))
+    end
+  end
+
+  def test_shifting_size_with_time_zone
+    # Size-based rotation is not affected by the calendar setting.
+    logdev = d(@filename, shift_age: 1, shift_size: 0, shift_time_zone: '+09:00')
+    logdev.write("hello-1\n")
+    logdev.write("hello-2\n")
+    assert_file.exist?("#{@filename}.0")
+    assert_match(/hello-1/, File.read("#{@filename}.0"))
+  ensure
+    logdev.close if logdev
+  end
+
+  def test_logger_new_and_reopen_with_shift_time_zone
+    logger = Logger.new(@filename, 'daily', shift_time_zone: '+09:00')
+    logger.info('hello')
+    logger.reopen(nil, 'daily', shift_time_zone: 'UTC')
+    logger.info('world')
+    logger.close
+    cont = File.read(@filename)
+    assert_match(/hello/, cont)
+    assert_match(/world/, cont)
+  end
+
   private
 
   def run_children(n, args, src)

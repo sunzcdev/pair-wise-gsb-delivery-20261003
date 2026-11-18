@@ -13,15 +13,17 @@ class Logger
 
     def initialize(
       log = nil, shift_age: nil, shift_size: nil, shift_period_suffix: nil,
-      binmode: false, reraise_write_errors: [], skip_header: false
+      binmode: false, reraise_write_errors: [], skip_header: false,
+      shift_time_zone: nil
     )
       @dev = @filename = @shift_age = @shift_size = @shift_period_suffix = nil
+      @shift_time_zone = nil
       @binmode = binmode
       @reraise_write_errors = reraise_write_errors
       @skip_header = skip_header
       mon_initialize
       set_dev(log)
-      set_file(shift_age, shift_size, shift_period_suffix) if @filename
+      set_file(shift_age, shift_size, shift_period_suffix, shift_time_zone) if @filename
     end
 
     def write(message)
@@ -45,7 +47,7 @@ class Logger
       end
     end
 
-    def reopen(log = nil, shift_age: nil, shift_size: nil, shift_period_suffix: nil, binmode: nil)
+    def reopen(log = nil, shift_age: nil, shift_size: nil, shift_period_suffix: nil, binmode: nil, shift_time_zone: nil)
       # reopen the same filename if no argument, do nothing for IO
       log ||= @filename if @filename
       @binmode = binmode unless binmode.nil?
@@ -56,7 +58,7 @@ class Logger
             @filename = nil
           end
           set_dev(log)
-          set_file(shift_age, shift_size, shift_period_suffix) if @filename
+          set_file(shift_age, shift_size, shift_period_suffix, shift_time_zone) if @filename
         end
       end
       self
@@ -89,14 +91,20 @@ class Logger
       end
     end
 
-    def set_file(shift_age, shift_size, shift_period_suffix)
+    def set_file(shift_age, shift_size, shift_period_suffix, shift_time_zone = nil)
       @shift_age = shift_age || @shift_age || 7
       @shift_size = shift_size || @shift_size || 1048576
       @shift_period_suffix = shift_period_suffix || @shift_period_suffix || '%Y%m%d'
+      @shift_time_zone = shift_time_zone || @shift_time_zone
 
       unless @shift_age.is_a?(Integer)
+        # The file's mtime is consulted only here, to seed the first
+        # rotation deadline when the device is opened: the file may be
+        # a leftover from a previous period.  After this, only the
+        # current time (Time.now at each write) drives rotation; see
+        # check_shift_log.  Size-based rotation never consults either.
         base_time = @dev.respond_to?(:stat) ? @dev.stat.mtime : Time.now
-        @next_rotate_time = next_rotate_time(base_time, @shift_age)
+        @next_rotate_time = next_rotate_time(base_time, @shift_age, @shift_time_zone)
       end
     end
 
@@ -161,6 +169,8 @@ class Logger
 
     def check_shift_log
       if @shift_age.is_a?(Integer)
+        # Size-based rotation: purely size-driven, never affected by
+        # the calendar settings (@shift_time_zone, mtime, or Time.now).
         # Note: always returns false if '0'.
         if @filename && (@shift_age > 0) && (@dev.stat.size > @shift_size)
           lock_shift_log { shift_log_age }
@@ -168,8 +178,13 @@ class Logger
       else
         now = Time.now
         if now >= @next_rotate_time
-          @next_rotate_time = next_rotate_time(now, @shift_age)
-          lock_shift_log { shift_log_period(previous_period_end(now, @shift_age)) }
+          # @next_rotate_time only moves forward, so a system clock
+          # rollback cannot trigger a second rotation for the same
+          # period.  If the computed archive name already exists (e.g.
+          # after a DST transition or a restart), shift_log_period
+          # appends a numeric suffix instead of overwriting it.
+          @next_rotate_time = next_rotate_time(now, @shift_age, @shift_time_zone)
+          lock_shift_log { shift_log_period(previous_period_end(now, @shift_age, @shift_time_zone)) }
         end
       end
     end

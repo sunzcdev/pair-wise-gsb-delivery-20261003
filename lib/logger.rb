@@ -367,6 +367,23 @@ require_relative 'logger/errors'
 # see details and suggestions at
 # {Time#strftime}[https://docs.ruby-lang.org/en/master/Time.html#method-i-strftime].
 #
+# By default, period boundaries are computed in the host's local time
+# zone.  Use create-time option +shift_time_zone+ to pin rotation to
+# an explicit, fixed offset instead, so that rotation does not depend
+# on the host configuration:
+#
+#   logger = Logger.new('t.log', 'daily', shift_time_zone: '+09:00')
+#
+# The same zone determines both the rotation instant and the date used
+# for the filename suffix.  The current log file's mtime is consulted
+# only once, when the device is opened, to seed the first rotation
+# deadline; afterwards only the current time at each write decides
+# rotation, and the deadline only moves forward, so a system clock
+# rollback cannot rotate the same period twice.  If an archive file
+# with the computed suffix already exists (for example after a DST
+# transition or a restart), a numeric suffix is appended instead of
+# overwriting it.
+#
 class Logger
   _, name, rev = %w$Id$
   if name
@@ -589,6 +606,16 @@ class Logger
   #   for periodic log file rotation; default is <tt>'%Y%m%d'</tt>.
   #   See {Periodic Rotation}[rdoc-ref:Logger@Periodic+Rotation].
   #
+  # - +shift_time_zone+: sets the time zone used to compute calendar
+  #   boundaries for periodic log file rotation; default is +nil+,
+  #   meaning the host's local time zone.  The value may be a UTC
+  #   offset string such as <tt>'+09:00'</tt> or <tt>'UTC'</tt>, or an
+  #   Integer number of seconds (anything accepted by Time#getlocal).
+  #   Both the rotation instant and the filename suffix (see
+  #   +shift_period_suffix+) are computed in this zone.  Size-based
+  #   rotation is not affected.
+  #   See {Periodic Rotation}[rdoc-ref:Logger@Periodic+Rotation].
+  #
   # - +reraise_write_errors+: An array of exception classes, which will
   #   be reraised if there is an error when writing to the log device.
   #   The default is to swallow all exceptions raised.
@@ -599,7 +626,8 @@ class Logger
   def initialize(logdev, shift_age = 0, shift_size = 1048576, level: DEBUG,
                  progname: nil, formatter: nil, datetime_format: nil,
                  binmode: false, shift_period_suffix: '%Y%m%d',
-                 reraise_write_errors: [], skip_header: false)
+                 reraise_write_errors: [], skip_header: false,
+                 shift_time_zone: nil)
     self.level = level
     self.progname = progname
     @default_formatter = Formatter.new
@@ -619,7 +647,8 @@ class Logger
         shift_period_suffix: shift_period_suffix,
         binmode: binmode,
         reraise_write_errors: reraise_write_errors,
-        skip_header: skip_header)
+        skip_header: skip_header,
+        shift_time_zone: shift_time_zone)
     end
   end
 
@@ -652,9 +681,10 @@ class Logger
   #   #  "E, [2022-05-12T14:21:27.596726 #22428] ERROR -- : one\n",
   #   #  "E, [2022-05-12T14:23:05.847241 #22428] ERROR -- : three\n"]
   #
-  def reopen(logdev = nil, shift_age = nil, shift_size = nil, shift_period_suffix: nil, binmode: nil)
+  def reopen(logdev = nil, shift_age = nil, shift_size = nil, shift_period_suffix: nil, binmode: nil, shift_time_zone: nil)
     @logdev&.reopen(logdev, shift_age: shift_age, shift_size: shift_size,
-                    shift_period_suffix: shift_period_suffix, binmode: binmode)
+                    shift_period_suffix: shift_period_suffix, binmode: binmode,
+                    shift_time_zone: shift_time_zone)
     self
   end
 
