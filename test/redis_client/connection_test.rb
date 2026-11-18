@@ -177,6 +177,50 @@ class RedisClient
       end
     end
 
+    def test_transaction_report_does_not_retry_on_network_errors
+      client = new_client(reconnect_attempts: 3)
+
+      block_calls = 0
+      report = nil
+      simulate_network_errors(client, ["EXEC"]) do
+        report = client.multi(report: true) do |transaction|
+          block_calls += 1
+          transaction.call("SET", "foo", "1")
+          transaction.call("INCR", "counter")
+        end
+      end
+
+      assert_equal 1, block_calls
+      assert_predicate report, :interrupted?
+      assert_predicate report, :failure?
+      assert report.entries.all?(&:unknown?)
+      assert_equal [RedisClient::TransactionReport::UNKNOWN] * 2, report.results
+      assert_instance_of RedisClient::ConnectionError, report.interruption_error
+      # Neither SET nor INCR may have been replayed.
+      assert_nil client.call("GET", "foo")
+      assert_nil client.call("GET", "counter")
+    end
+
+    def test_transaction_report_never_replays_a_written_transaction
+      client = new_client(reconnect_attempts: 1)
+
+      block_calls = 0
+      report = nil
+      simulate_network_errors(client, ["PING"]) do
+        report = client.multi(report: true) do |transaction|
+          block_calls += 1
+          transaction.call("PING")
+        end
+      end
+
+      # `reconnect_attempts` must not cause the transaction to be replayed: the
+      # PING may already have been executed.
+      assert_equal 1, block_calls
+      assert_predicate report, :interrupted?
+      assert_equal [RedisClient::TransactionReport::UNKNOWN], report.results
+      assert_instance_of RedisClient::ConnectionError, report.interruption_error
+    end
+
     def test_reconnect_with_non_idempotent_commands
       client = new_client(reconnect_attempts: 1)
 

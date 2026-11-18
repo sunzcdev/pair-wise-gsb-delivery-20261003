@@ -46,6 +46,12 @@ class RedisClient
       end
     end
 
+    # Write all `commands`, then read one reply per command.
+    #
+    # When a block is given, it is called as `block.call(index, result)` as soon
+    # as each reply is read. That allows callers that need to keep partial facts
+    # (e.g. `RedisClient::TransactionReport`) to know exactly which commands
+    # were answered before a connection error interrupted the reads.
     def call_pipelined(commands, timeouts, exception: true)
       first_error = last_error = nil
 
@@ -76,6 +82,7 @@ class RedisClient
         end
 
         results[index] = result
+        yield(index, result) if block_given?
       end
 
       if first_error && exception

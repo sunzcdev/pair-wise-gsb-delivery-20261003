@@ -414,6 +414,54 @@ If the transaction wasn't successful, `#multi` will return `nil`.
 
 Note that transactions using optimistic locking aren't automatically retried upon connection errors.
 
+#### Detailed transaction reports
+
+`#multi` collapses every outcome (empty, aborted, rejected, partially failed) to
+either an array of results or `nil`. When you need to tell those cases apart, pass
+`report: true`. A `RedisClient::TransactionReport` is returned instead of the
+results:
+
+```ruby
+report = redis.multi(report: true) do |transaction|
+  transaction.call("SET", "foo", "bar")
+  transaction.call("INCR", "foo") # WRONGTYPE at execution time
+end
+
+report.executed?   # => true, EXEC did run
+report.success?    # => false, one command failed
+report.results     # => ["OK", #<RedisClient::WrongTypeError...>]
+report.errors      # => { 1 => #<RedisClient::WrongTypeError...> }
+report.failed_entries.map(&:position) # => [2]
+```
+
+Each command keeps its position, and every stage gets its own predicate:
+
+| Report                 | Meaning                                                    |
+| ---------------------- | ---------------------------------------------------------- |
+| `empty?`               | No command was written, nothing was sent                    |
+| `not_entered?`         | The `MULTI` envelope was never established                  |
+| `untransacted?`        | `MULTI` was refused, the commands ran on their own          |
+| `rejected?`            | A command was refused while queueing, nothing ran           |
+| `aborted?`             | `EXEC` refused to run because a `WATCH`ed key changed       |
+| `executed?`            | `EXEC` ran; check `failed_entries` for per-command failures |
+| `interrupted?`         | The connection was lost and some outcomes are unknown       |
+
+Per command, `RedisClient::TransactionReport::Entry` exposes the same distinction
+through `executed?`, `failed?`, `rejected?`, `not_queued?`, `aborted?` and
+`unknown?`, plus the original `command`, the `position` and the `error`.
+
+A `nil` reply inside a successful `EXEC` (for example a `SET ... NX` that didn't
+set anything) is a real value attached to its command; it's never used to mean an
+unexecuted command. For commands that didn't run, or whose outcome is unknown,
+`#results` contains the `RedisClient::TransactionReport::UNKNOWN` sentinel instead
+of `nil`, so an aborted or interrupted transaction can't be mistaken for an empty
+successful one.
+
+When the connection is lost mid-transaction, the report records what was actually
+observed and marks the rest as unknown. `#multi(report: true)` never retries the
+transaction, even with `reconnect_attempts` configured, because the commands may
+already have been executed.
+
 ### Publish / Subscribe
 
 Pub/Sub related commands must be called on a dedicated `PubSub` object:

@@ -7,6 +7,7 @@ require "redis_client/config"
 require "redis_client/pid_cache"
 require "redis_client/sentinel_config"
 require "redis_client/middlewares"
+require "redis_client/transaction_report"
 
 class RedisClient
   @driver_definitions = {}
@@ -525,9 +526,10 @@ class RedisClient
     end
   end
 
-  def multi(watch: nil, &block)
-    transaction = nil
+  def multi(watch: nil, report: false, &block)
+    return multi_report(watch: watch, &block) if report
 
+    transaction = nil
     results = if watch
       # WATCH is stateful, so we can't reconnect if it's used, the whole transaction
       # has to be redone.
@@ -731,6 +733,99 @@ class RedisClient
   end
 
   private
+
+  # Implements `multi(report: true)`.
+  #
+  # Unlike the regular transaction, this never retries on the caller's behalf:
+  # once anything was written, a connection error leaves an unknown outcome
+  # rather than replaying commands that may already have been executed. The
+  # caller's block is executed at most once, and an exception it raises
+  # propagates unchanged.
+  def multi_report(watch: nil)
+    report = TransactionReport.new(watch: watch)
+    transaction = nil
+    progress = {}
+    in_callback = false
+
+    begin
+      if watch
+        # WATCH is stateful, so the connection can't simply be replaced, and the
+        # block runs on it so that reads observe the watched snapshot.
+        ensure_connected(retryable: false) do |connection|
+          call("WATCH", *watch)
+          begin
+            in_callback = true
+            transaction = build_transaction { |t| yield t }
+            in_callback = false
+
+            report._attach!(report_commands(transaction))
+            if transaction._empty?
+              call("UNWATCH")
+              report._empty!
+            else
+              execute_report_pipeline(report, connection, transaction, progress)
+            end
+          rescue StandardError
+            # Don't leave the connection in a watched state.
+            begin
+              call("UNWATCH") if connected?
+            rescue ConnectionError, ProtocolError
+              # The connection is gone, and so is the WATCH state.
+            end
+            raise
+          end
+        end
+      else
+        in_callback = true
+        transaction = build_transaction { |t| yield t }
+        in_callback = false
+
+        report._attach!(report_commands(transaction))
+        if transaction._empty?
+          report._empty!
+        else
+          ensure_connected(retryable: false) do |connection|
+            execute_report_pipeline(report, connection, transaction, progress)
+          end
+        end
+      end
+    rescue ConnectionError, ProtocolError => error
+      # Errors raised by the caller's block aren't the transaction's own fate.
+      raise error if in_callback
+
+      # Without a transaction envelope there are no commands to report, so an
+      # error raised before the block ran is reported as such.
+      report._interruption!(error, progress)
+    end
+
+    report._apply_blocks!(transaction&._blocks)
+    report
+  end
+
+  def execute_report_pipeline(report, connection, transaction, progress)
+    commands = transaction._commands
+
+    results = @middlewares.call_pipelined(commands, config) do
+      # Reaching this point means the commands are about to be written, so from
+      # now on no outcome can be assumed.
+      report._started!
+
+      # `exception: false` so every reply, including errors, is returned in
+      # place: the report needs to see the queue-stage rejections.
+      connection.call_pipelined(commands, nil, exception: false) do |index, result|
+        # Remember every reply actually observed, so an interruption in the
+        # middle of the pipeline can still report the known prefix.
+        progress[index] = result
+      end
+    end
+
+    report._ingest!(results)
+  end
+
+  def report_commands(transaction)
+    # Drop the `MULTI` and `EXEC` envelope, they aren't caller commands.
+    transaction._commands[1...-1]
+  end
 
   def build_transaction
     transaction = Multi.new(@command_builder)

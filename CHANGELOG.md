@@ -1,5 +1,15 @@
 # Unreleased
 
+- Added `RedisClient#multi(report: true)`, which returns a `RedisClient::TransactionReport`
+  instead of the results. It distinguishes a transaction that was never entered, a
+  command refused while queueing, a transaction aborted by `WATCH`, and a transaction
+  that ran with per-command failures, and keeps server errors attached to the original
+  command position. Commands not executed or with an unknown outcome are reported as
+  `RedisClient::TransactionReport::UNKNOWN` rather than `nil`, and the transaction is
+  never replayed on connection errors.
+- `RedisClient::ConnectionMixin#call_pipelined` can now yield each reply as soon as it
+  is read, so callers can keep the facts observed before a connection error.
+
 # 0.31.0
 
 - Improved the Ruby driver buffering logic, should trigger GC less, particularly for large response and when using SSL.

@@ -433,6 +433,100 @@ module RedisClientTests
     assert_equal ["OK", 1], result
   end
 
+  def test_transaction_report_success
+    report = @redis.multi(report: true) do |transaction|
+      transaction.call("SET", "foo", "1")
+      transaction.call("EXPIRE", "foo", "42")
+    end
+
+    assert_predicate report, :executed?
+    assert_predicate report, :success?
+    assert_equal ["OK", 1], report.results
+    assert_equal [1, 2], report.entries.map(&:position)
+    assert_equal [["SET", "foo", "1"], ["EXPIRE", "foo", "42"]], report.commands
+    assert_empty report.errors
+  end
+
+  def test_transaction_report_queue_rejection
+    report = @redis.multi(report: true) do |transaction|
+      transaction.call("DOESNOTEXIST", 12)
+      transaction.call("SET", "foo", "42")
+    end
+
+    assert_predicate report, :rejected?
+    refute_predicate report, :executed?
+    refute_predicate report, :success?
+    assert_predicate report.entries[0], :rejected?
+    assert_predicate report.entries[1], :not_queued?
+    assert_equal ["DOESNOTEXIST", "12"], report.entries[0].error.command
+    assert_nil @redis.call("GET", "foo")
+  end
+
+  def test_transaction_report_execution_error_keeps_position
+    @redis.call("SET", "str", "hello")
+
+    report = @redis.multi(report: true) do |transaction|
+      transaction.call("SET", "foo", "1")
+      transaction.call("SISMEMBER", "str", "member")
+      transaction.call("INCR", "counter")
+    end
+
+    assert_predicate report, :executed?
+    refute_predicate report, :success?
+    assert_equal [2], report.failed_entries.map(&:position)
+    assert_instance_of RedisClient::WrongTypeError, report.entries[1].error
+    assert_equal ["SISMEMBER", "str", "member"], report.entries[1].error.command
+    assert_equal "1", @redis.call("GET", "foo")
+    assert_equal "1", @redis.call("GET", "counter")
+  end
+
+  def test_transaction_report_watch_abort
+    other_client = new_client
+
+    @redis.call("SET", "foo", "1")
+
+    report = @redis.multi(report: true, watch: ["foo"]) do |transaction|
+      other_client.call("SET", "foo", "2")
+      transaction.call("SET", "foo", "3")
+    end
+
+    assert_predicate report, :aborted?
+    refute_predicate report, :success?
+    refute_predicate report, :empty?
+    assert_predicate report.entries[0], :aborted?
+    assert_same RedisClient::TransactionReport::UNKNOWN, report.results[0]
+    assert_equal "2", @redis.call("GET", "foo")
+  end
+
+  def test_transaction_report_nil_reply_is_executed
+    @redis.call("SET", "foo", "1")
+
+    report = @redis.multi(report: true) do |transaction|
+      transaction.call("SET", "foo", "2", "NX")
+    end
+
+    assert_predicate report, :executed?
+    assert_predicate report, :success?
+    assert_nil report.results[0]
+    refute RedisClient::TransactionReport.unknown?(report.results[0])
+  end
+
+  def test_transaction_report_empty
+    report = @redis.multi(report: true) { |_transaction| }
+
+    assert_predicate report, :empty?
+    assert_predicate report, :success?
+    assert_equal [], report.results
+  end
+
+  def test_transaction_report_blocks
+    report = @redis.multi(report: true) do |transaction|
+      transaction.call("INCR", "counter") { |value| value * 10 }
+    end
+
+    assert_equal [10], report.results
+  end
+
   def test_empty_transaction
     result = @redis.multi do |_transaction|
     end
