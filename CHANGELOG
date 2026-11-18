@@ -1,6 +1,23 @@
 Changelog
 =========
 
+Unreleased
+
+* Limit how many calls may probe the guarded operation at once while the
+  circuit is half-open (`half_open_max_calls`, default 1). Calls above the limit
+  are rejected with `CircuitBreakerError`, or wait up to `half_open_wait_timeout`
+  seconds for a trial slot. Waiting calls never hold a slot.
+* Late outcomes from a round superseded by a state change are reported to
+  listeners but no longer affect the state, the failure counter or the success
+  counter of the new round, so a late success cannot close a circuit that was
+  reopened in the meantime. `success_threshold` only counts the trials of the
+  round in progress.
+* The circuit breaker lock is no longer held while the guarded operation runs,
+  only while admitting calls and recording their outcomes.
+* Cancelled or abandoned calls (asynchronous cancellations, generators closed
+  early or never started) return their half-open slot without being counted as
+  a success or a failure.
+
 Version 1.4.0 (July 6, 2025)
 
 * Add success_threshold parameter (Thanks @sideshowbandana)

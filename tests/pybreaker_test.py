@@ -8,6 +8,14 @@ import pytest
 from pybreaker import *
 from tornado import gen, testing
 
+import asyncio
+import gc
+import threading
+import time
+from types import MethodType
+
+from tornado import locks
+
 
 class CircuitBreakerStorageBasedTestCase:
     """Mix in to test against different storage backings. Depends on
@@ -1349,6 +1357,651 @@ class CircuitBreakerContextManagerTestCase(unittest.TestCase):
         _do_succeed()
         mock_fn.assert_called_once()
         assert breaker.fail_counter == 0
+        assert breaker.current_state == "closed"
+
+
+def _wait_until(predicate, timeout=2.0):
+    """Wait until `predicate` returns a true value, or `timeout` seconds elapsed."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if predicate():
+            return True
+        sleep(0.005)
+    return bool(predicate())
+
+
+class CircuitBreakerHalfOpenConcurrencyTestCase(unittest.TestCase):
+    """Tests for the half-open probe budget and round isolation."""
+
+    def _opened_breaker(self, **kwargs):
+        """Return a breaker that is open and whose reset timeout already elapsed."""
+        breaker = CircuitBreaker(fail_max=1, reset_timeout=0.01, **kwargs)
+        breaker.open()
+        sleep(0.02)
+        return breaker
+
+    def test_half_open_probe_limit_rejects_extra_calls(self):
+        """CircuitBreaker: it should admit at most `half_open_max_calls` probes
+        and reject the remaining calls instead of letting them all through.
+        """
+        breaker = self._opened_breaker(half_open_max_calls=2)
+
+        state_lock = threading.Lock()
+        all_probes_started = threading.Event()
+        release_probes = threading.Event()
+        counters = {"active": 0, "peak": 0}
+        outcomes = []
+
+        def probe():
+            with state_lock:
+                counters["active"] += 1
+                counters["peak"] = max(counters["peak"], counters["active"])
+                if counters["active"] == 2:
+                    all_probes_started.set()
+            release_probes.wait(5)
+            with state_lock:
+                counters["active"] -= 1
+            return True
+
+        def worker():
+            try:
+                breaker.call(probe)
+                outcomes.append("success")
+            except CircuitBreakerError:
+                outcomes.append("rejected")
+
+        threads = [threading.Thread(target=worker) for _ in range(6)]
+        [t.start() for t in threads]
+
+        assert all_probes_started.wait(5)
+        assert _wait_until(lambda: outcomes.count("rejected") == 4)
+        # The two probes hold the budget; the other four calls were rejected
+        # without ever reaching the guarded operation.
+        assert counters["peak"] == 2
+        assert breaker._probes_in_flight == 2
+
+        release_probes.set()
+        [t.join(5) for t in threads]
+        assert not any(t.is_alive() for t in threads)
+
+        assert outcomes.count("rejected") == 4
+        assert counters["peak"] == 2
+        assert breaker.current_state == "closed"
+        assert breaker._probes_in_flight == 0
+
+    def test_half_open_probe_limit_counts_only_successful_round(self):
+        """CircuitBreaker: a late success from a superseded round must not close
+        the circuit, and `success_threshold` must only count probes of the
+        current round.
+        """
+        breaker = self._opened_breaker(success_threshold=2, half_open_max_calls=2)
+
+        late_probe_running = threading.Event()
+        release_late_probe = threading.Event()
+        outcomes = {}
+
+        def late_probe():
+            late_probe_running.set()
+            release_late_probe.wait(5)
+            return True
+
+        def failing_probe():
+            raise RuntimeError("probe failed")
+
+        def call(func, name):
+            try:
+                outcomes[name] = breaker.call(func)
+            except CircuitBreakerError as exc:
+                outcomes[name] = exc
+
+        late_thread = threading.Thread(target=call, args=(late_probe, "late"))
+        late_thread.start()
+        assert late_probe_running.wait(5)
+
+        # The failing probe reopens the circuit, starting a new round.
+        failing_thread = threading.Thread(target=call, args=(failing_probe, "failing"))
+        failing_thread.start()
+        failing_thread.join(5)
+        assert not failing_thread.is_alive()
+
+        assert breaker.current_state == "open"
+        assert breaker.fail_counter == 1
+        assert breaker.success_counter == 0
+        assert isinstance(outcomes["failing"], CircuitBreakerError)
+
+        # Releasing the probe admitted in the previous round yields a late
+        # success, which must not close the circuit reopened in the meantime.
+        release_late_probe.set()
+        late_thread.join(5)
+        assert not late_thread.is_alive()
+
+        assert outcomes["late"] is True
+        assert breaker.current_state == "open"
+        assert breaker.fail_counter == 1
+        assert breaker.success_counter == 0
+        assert breaker._probes_in_flight == 0
+
+        # Only the probes of the new round count towards the success threshold.
+        sleep(0.02)
+        assert breaker.call(lambda: True)
+        assert breaker.current_state == "half-open"
+        assert breaker.success_counter == 1
+
+        assert breaker.call(lambda: True)
+        assert breaker.current_state == "closed"
+        assert breaker.success_counter == 0
+
+    def test_interleaved_rounds_keep_state_and_counters_consistent(self):
+        """CircuitBreaker: two rounds of probes interleaved with barriers must
+        not share probe slots, state or counters.
+        """
+        breaker = self._opened_breaker(success_threshold=2, half_open_max_calls=2)
+
+        # Both probes of the first round are genuinely admitted at once.
+        first_round_admitted = threading.Barrier(2)
+        release_stale_probe = threading.Event()
+        second_round_running = threading.Event()
+        release_second_round = threading.Event()
+        outcomes = {}
+
+        def first_round_success():
+            first_round_admitted.wait(5)
+            release_stale_probe.wait(5)
+            return "first-round"
+
+        def first_round_failure():
+            first_round_admitted.wait(5)
+            raise RuntimeError("probe failed")
+
+        def second_round_success():
+            second_round_running.set()
+            release_second_round.wait(5)
+            return "second-round"
+
+        def call(func, name):
+            try:
+                outcomes[name] = breaker.call(func)
+            except CircuitBreakerError as exc:
+                outcomes[name] = exc
+
+        stale_thread = threading.Thread(target=call, args=(first_round_success, "stale"))
+        failing_thread = threading.Thread(target=call, args=(first_round_failure, "failing"))
+        stale_thread.start()
+        failing_thread.start()
+
+        failing_thread.join(5)
+        assert not failing_thread.is_alive()
+        # The barrier proves both first-round probes were admitted concurrently.
+        assert isinstance(outcomes["failing"], CircuitBreakerError)
+        assert breaker.current_state == "open"
+        assert breaker.fail_counter == 1
+        assert breaker.success_counter == 0
+        assert breaker._probes_in_flight == 0
+
+        # Wait for the reset timeout and start the new round while the stale
+        # probe is still blocked inside the guarded operation.
+        sleep(0.02)
+        current_thread = threading.Thread(target=call, args=(second_round_success, "current"))
+        current_thread.start()
+        assert second_round_running.wait(5)
+
+        assert breaker.current_state == "half-open"
+        assert breaker.success_counter == 0
+        assert breaker._probes_in_flight == 1
+
+        # The stale probe now succeeds while the new round is in flight: its
+        # outcome must not close the circuit nor count as a round success.
+        release_stale_probe.set()
+        stale_thread.join(5)
+        assert not stale_thread.is_alive()
+
+        assert outcomes["stale"] == "first-round"
+        assert breaker.current_state == "half-open"
+        assert breaker.success_counter == 0
+        assert breaker.fail_counter == 1
+        assert breaker._probes_in_flight == 1
+
+        # The current round keeps its own budget and success counter.
+        release_second_round.set()
+        current_thread.join(5)
+        assert not current_thread.is_alive()
+        assert outcomes["current"] == "second-round"
+        assert breaker.current_state == "half-open"
+        assert breaker.success_counter == 1
+        assert breaker._probes_in_flight == 0
+
+        # A second current-round success reaches the threshold and closes it.
+        assert breaker.call(lambda: True)
+        assert breaker.current_state == "closed"
+        assert breaker.success_counter == 0
+        assert breaker.fail_counter == 0
+
+    def test_late_failure_does_not_affect_the_new_round(self):
+        """CircuitBreaker: a late failure from a superseded round must neither
+        count nor reopen the circuit of a newer round.
+        """
+        breaker = self._opened_breaker(success_threshold=1, half_open_max_calls=2)
+
+        stale_probe_running = threading.Event()
+        release_stale_probe = threading.Event()
+        outcomes = {}
+
+        def stale_probe():
+            stale_probe_running.set()
+            release_stale_probe.wait(5)
+            raise RuntimeError("late failure")
+
+        def call(func, name):
+            try:
+                outcomes[name] = breaker.call(func)
+            except BaseException as exc:
+                outcomes[name] = exc
+
+        stale_thread = threading.Thread(target=call, args=(stale_probe, "stale"))
+        stale_thread.start()
+        assert stale_probe_running.wait(5)
+
+        # A successful probe of the same round closes the circuit, starting a
+        # new round while the first probe is still running.
+        assert breaker.call(lambda: True) is True
+        assert breaker.current_state == "closed"
+        assert breaker.fail_counter == 0
+
+        release_stale_probe.set()
+        stale_thread.join(5)
+        assert not stale_thread.is_alive()
+
+        assert isinstance(outcomes["stale"], RuntimeError)
+        # The stale failure was reported but must not reopen or count.
+        assert breaker.current_state == "closed"
+        assert breaker.fail_counter == 0
+        assert breaker._probes_in_flight == 0
+
+    def test_half_open_waiter_does_not_hold_probe_permit(self):
+        """CircuitBreaker: a call waiting for a probe slot must not consume one,
+        and must run once the slot is released.
+        """
+        breaker = self._opened_breaker(half_open_max_calls=1, half_open_wait_timeout=2)
+
+        probe_running = threading.Event()
+        release_probe = threading.Event()
+        waiter_done = threading.Event()
+        outcomes = {}
+
+        def blocking_probe():
+            probe_running.set()
+            release_probe.wait(5)
+            return "probe"
+
+        probe_thread = threading.Thread(target=lambda: outcomes.__setitem__("probe", breaker.call(blocking_probe)))
+        probe_thread.start()
+        assert probe_running.wait(5)
+        assert breaker._probes_in_flight == 1
+
+        def waiting_call():
+            try:
+                outcomes["waiter"] = breaker.call(lambda: "waiter")
+            except CircuitBreakerError as exc:
+                outcomes["waiter"] = exc
+            finally:
+                waiter_done.set()
+
+        waiter_thread = threading.Thread(target=waiting_call)
+        waiter_thread.start()
+
+        # The waiter is blocked, but the single probe slot is still held only
+        # by the running probe.
+        sleep(0.1)
+        assert not waiter_done.is_set()
+        assert breaker._probes_in_flight == 1
+
+        release_probe.set()
+        probe_thread.join(5)
+        waiter_thread.join(5)
+        assert not probe_thread.is_alive()
+        assert not waiter_thread.is_alive()
+
+        assert outcomes["probe"] == "probe"
+        assert outcomes["waiter"] == "waiter"
+        assert breaker.current_state == "closed"
+        assert breaker._probes_in_flight == 0
+
+    def test_half_open_waiter_times_out_without_leaking_permit(self):
+        """CircuitBreaker: a call that gives up waiting must not keep a probe
+        slot, and the slot must be reusable afterwards.
+        """
+        breaker = self._opened_breaker(half_open_max_calls=1, half_open_wait_timeout=0.1)
+
+        probe_running = threading.Event()
+        release_probe = threading.Event()
+        outcomes = {}
+
+        def blocking_probe():
+            probe_running.set()
+            release_probe.wait(5)
+            return "probe"
+
+        probe_thread = threading.Thread(target=lambda: outcomes.__setitem__("probe", breaker.call(blocking_probe)))
+        probe_thread.start()
+        assert probe_running.wait(5)
+
+        started_at = time.monotonic()
+        with pytest.raises(CircuitBreakerError):
+            breaker.call(lambda: "waiter")
+        assert time.monotonic() - started_at >= 0.1
+        # Giving up waiting never takes the slot owned by the running probe.
+        assert breaker._probes_in_flight == 1
+
+        release_probe.set()
+        probe_thread.join(5)
+        assert not probe_thread.is_alive()
+        assert outcomes["probe"] == "probe"
+        assert breaker._probes_in_flight == 0
+
+        # The single slot is available again.
+        assert breaker.call(lambda: "after") == "after"
+        assert breaker._probes_in_flight == 0
+
+    def test_half_open_max_calls_validation(self):
+        """CircuitBreaker: it should reject invalid half-open probe settings."""
+        with pytest.raises(ValueError):
+            CircuitBreaker(half_open_max_calls=0)
+        with pytest.raises(ValueError):
+            CircuitBreaker(half_open_wait_timeout=-1)
+
+        breaker = CircuitBreaker()
+        assert breaker.half_open_max_calls == 1
+        assert breaker.half_open_wait_timeout is None
+
+        breaker.half_open_max_calls = 3
+        assert breaker.half_open_max_calls == 3
+        with pytest.raises(ValueError):
+            breaker.half_open_max_calls = 0
+
+        breaker.half_open_wait_timeout = 1.5
+        assert breaker.half_open_wait_timeout == 1.5
+        breaker.half_open_wait_timeout = None
+        assert breaker.half_open_wait_timeout is None
+        with pytest.raises(ValueError):
+            breaker.half_open_wait_timeout = -1
+
+
+class CircuitBreakerLockScopeTestCase(unittest.TestCase):
+    """Tests confirming the breaker lock is not held while user code runs."""
+
+    def test_guarded_calls_run_concurrently(self):
+        """CircuitBreaker: two guarded calls in the closed state must overlap
+        instead of being serialized by the breaker lock.
+        """
+        breaker = CircuitBreaker()
+
+        both_running = threading.Barrier(2, timeout=5)
+        results = []
+
+        def overlap():
+            # Both threads must reach the barrier; a global lock around the
+            # guarded operation would deadlock here.
+            both_running.wait()
+            return True
+
+        threads = [
+            threading.Thread(target=lambda: results.append(breaker.call(overlap))),
+            threading.Thread(target=lambda: results.append(breaker.call(overlap))),
+        ]
+        [t.start() for t in threads]
+        [t.join(5) for t in threads]
+
+        assert not any(t.is_alive() for t in threads)
+        assert results == [True, True]
+        assert breaker.fail_counter == 0
+
+    def test_guarded_call_does_not_hold_breaker_lock(self):
+        """CircuitBreaker: another thread must be able to manage the breaker
+        while a guarded call is executing.
+        """
+        breaker = CircuitBreaker(fail_max=1, reset_timeout=60)
+
+        call_running = threading.Event()
+        release_call = threading.Event()
+        results = []
+
+        def blocking():
+            call_running.set()
+            release_call.wait(5)
+            return True
+
+        call_thread = threading.Thread(target=lambda: results.append(breaker.call(blocking)))
+        call_thread.start()
+        assert call_running.wait(5)
+
+        opener = threading.Thread(target=breaker.open)
+        opener.start()
+        opener.join(1)
+        assert not opener.is_alive()
+        assert breaker.current_state == "open"
+
+        closer = threading.Thread(target=breaker.close)
+        closer.start()
+        closer.join(1)
+        assert not closer.is_alive()
+        assert breaker.current_state == "closed"
+
+        # Let the blocked call finish: its outcome is late and must be ignored.
+        breaker.open()
+        release_call.set()
+        call_thread.join(5)
+        assert not call_thread.is_alive()
+        assert results == [True]
+        assert breaker.current_state == "open"
+        # A late success from a superseded round must not reset the failure counter.
+        assert breaker.fail_counter == 0
+        assert breaker.success_counter == 0
+
+    def test_abandoned_generator_returns_probe_permit(self):
+        """CircuitBreaker: closing a guarded generator early must give its
+        half-open probe slot back.
+        """
+        breaker = CircuitBreaker(fail_max=1, reset_timeout=0.01, half_open_max_calls=1)
+        breaker.open()
+        sleep(0.02)
+
+        @breaker
+        def guarded():
+            yield 1
+            yield 2
+
+        generator = guarded()
+        assert next(generator) == 1
+        assert breaker._probes_in_flight == 1
+
+        generator.close()
+        assert breaker._probes_in_flight == 0
+
+        # The slot is free again, so a fresh probe is admitted.
+        assert breaker.call(lambda: "after") == "after"
+        assert breaker.current_state == "closed"
+
+
+class CircuitBreakerAsyncHalfOpenTestCase(testing.AsyncTestCase):
+    """Tests for the half-open probe budget on the Tornado call path."""
+
+    @testing.gen_test
+    def test_async_call_rejected_when_probe_budget_is_taken(self):
+        """CircuitBreaker: asynchronous calls must not block the IOLoop waiting
+        for a probe slot; they are rejected while another probe is in flight.
+        """
+        breaker = CircuitBreaker(fail_max=1, reset_timeout=0.01, half_open_max_calls=1)
+        breaker.open()
+        sleep(0.02)
+
+        probe_running = threading.Event()
+        release_probe = threading.Event()
+        calls = []
+
+        def blocking_probe():
+            probe_running.set()
+            release_probe.wait(5)
+            return "probe"
+
+        probe_thread = threading.Thread(target=lambda: calls.append(breaker.call(blocking_probe)))
+        probe_thread.start()
+        assert probe_running.wait(5)
+        assert breaker._probes_in_flight == 1
+
+        @gen.coroutine
+        def succeeding_async_call():
+            raise gen.Return("async")
+
+        with pytest.raises(CircuitBreakerError):
+            yield breaker.call_async(succeeding_async_call)
+
+        release_probe.set()
+        probe_thread.join(5)
+        assert not probe_thread.is_alive()
+        assert calls == ["probe"]
+        assert breaker.current_state == "closed"
+        assert breaker._probes_in_flight == 0
+
+    @testing.gen_test
+    def test_async_recovery_probe_runs_once(self):
+        """CircuitBreaker: a Tornado trial call must run the guarded operation
+        once, and only its completed outcome may change the state.
+        """
+        breaker = CircuitBreaker(fail_max=1, reset_timeout=0.01)
+        breaker.open()
+        sleep(0.02)
+
+        calls = []
+
+        @gen.coroutine
+        def trial():
+            calls.append("trial")
+            yield gen.sleep(0.01)
+            raise gen.Return("ok")
+
+        assert (yield breaker.call_async(trial)) == "ok"
+        assert calls == ["trial"]
+        assert breaker.current_state == "closed"
+
+    @testing.gen_test
+    def test_async_trial_failure_reopens_breaker_once(self):
+        """CircuitBreaker: a failing asynchronous trial opens the circuit and
+        reports ``CircuitBreakerError``, executing the operation only once.
+        """
+        breaker = CircuitBreaker(fail_max=1, reset_timeout=0.01)
+        breaker.open()
+        sleep(0.02)
+
+        calls = []
+
+        @gen.coroutine
+        def trial():
+            calls.append("trial")
+            yield gen.sleep(0.01)
+            raise RuntimeError("trial failed")
+
+        with pytest.raises(CircuitBreakerError):
+            yield breaker.call_async(trial)
+
+        assert calls == ["trial"]
+        assert breaker.current_state == "open"
+        assert breaker.fail_counter == 1
+        assert breaker._probes_in_flight == 0
+
+    @testing.gen_test
+    def test_async_cancellation_keeps_permit_until_operation_stops(self):
+        """CircuitBreaker: cancelling a call must not free the probe slot while
+        the guarded operation is still running, so the probe budget keeps
+        reflecting the work in flight, and must not leak the slot afterwards.
+        """
+        breaker = CircuitBreaker(fail_max=1, reset_timeout=0.01)
+        breaker.open()
+        sleep(0.02)
+
+        started = locks.Event()
+        finished = locks.Event()
+
+        @gen.coroutine
+        def slow_trial():
+            started.set()
+            try:
+                yield gen.sleep(0.2)
+            finally:
+                finished.set()
+            raise gen.Return(True)
+
+        trial = breaker.call_async(slow_trial)
+        yield started.wait()
+        assert breaker._probes_in_flight == 1
+
+        @gen.coroutine
+        def quick_trial():
+            raise gen.Return(True)
+
+        trial.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            yield trial
+
+        # The operation is still running: its slot must stay taken so no other
+        # call believes the service is ready for a second probe.
+        assert not finished.is_set()
+        assert breaker._probes_in_flight == 1
+
+        with pytest.raises(CircuitBreakerError):
+            yield breaker.call_async(quick_trial)
+
+        while not finished.is_set():
+            yield gen.sleep(0.01)
+        yield gen.sleep(0.01)
+
+        # The slot is returned once the operation stops, so it cannot leak.
+        assert breaker._probes_in_flight == 0
+
+        # The permit is free, so a trial call is admitted again.
+        yield breaker.call_async(quick_trial)
+        assert breaker._probes_in_flight == 0
+
+    def test_async_success_counter_is_shared_with_async_round(self):
+        """CircuitBreaker: asynchronous trials use the same round and success
+        counter as synchronous ones.
+        """
+        breaker = CircuitBreaker(fail_max=1, reset_timeout=0.01, success_threshold=2)
+        breaker.open()
+        sleep(0.02)
+
+        assert breaker.call(lambda: True)
+        assert breaker.current_state == "half-open"
+        assert breaker.success_counter == 1
+
+        assert breaker.call(lambda: True)
+        assert breaker.current_state == "closed"
+        assert breaker.success_counter == 0
+
+    def test_unstarted_generator_returns_probe_permit(self):
+        """CircuitBreaker: a guarded generator that is created but never
+        iterated must give its half-open probe slot back when collected.
+        """
+        breaker = CircuitBreaker(fail_max=1, reset_timeout=0.01, half_open_max_calls=1)
+        breaker.open()
+        sleep(0.02)
+
+        @breaker
+        def guarded():
+            yield 1
+
+        generator = guarded()
+        # Calling the guarded generator admitted a probe even before its body
+        # started running.
+        assert breaker._probes_in_flight == 1
+
+        del generator
+        gc.collect()
+
+        assert breaker._probes_in_flight == 0
+        assert breaker.fail_counter == 0
+        assert breaker.success_counter == 0
+
+        assert breaker.call(lambda: "after") == "after"
         assert breaker.current_state == "closed"
 
 

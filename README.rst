@@ -79,6 +79,48 @@ requests before closing the circuit breaker:
   more likely to fail, so make sure to always use timeouts when accessing such
   services if there's support at the API level.
 
+Half-open probes
+````````````````
+
+When the reset timeout elapses, the circuit becomes half-open and lets trial
+calls probe the guarded operation again. Only ``half_open_max_calls`` trial
+calls (default: ``1``) may run at the same time, so that a burst of concurrent
+requests cannot all hit a service that is still failing:
+
+.. code:: python
+
+    db_breaker = pybreaker.CircuitBreaker(
+        fail_max=5,
+        reset_timeout=60,
+        success_threshold=3,
+        half_open_max_calls=2,
+    )
+
+Calls made when every trial slot is taken are rejected immediately with
+``CircuitBreakerError``. Set ``half_open_wait_timeout`` to make those calls wait
+for a slot for at most that many seconds instead (they are given the slot only
+once a trial call finishes, and waiting never occupies a slot itself):
+
+.. code:: python
+
+    db_breaker = pybreaker.CircuitBreaker(
+        fail_max=5,
+        reset_timeout=60,
+        half_open_max_calls=1,
+        half_open_wait_timeout=1.0,
+    )
+
+Only the trials of the round in progress count towards ``success_threshold``.
+If the circuit reopens because a trial failed or timed out, a late success from
+an earlier round does not close the new one: its outcome is reported to the
+listeners but ignored by the state machine.
+
+.. note::
+
+  Asynchronous calls (``call_async``) never wait for a trial slot: blocking the
+  IOLoop would stall every other coroutine, so they are rejected like any other
+  call above the limit.
+
 If you'd like to use the Redis backing, initialize the ``CircuitBreaker`` with
 a ``CircuitRedisStorage``:
 
@@ -313,6 +355,14 @@ change its current state:
     # Get/set the success threshold
     print(db_breaker.success_threshold)
     db_breaker.success_threshold = 3
+
+    # Get/set how many trial calls may probe the service concurrently
+    print(db_breaker.half_open_max_calls)
+    db_breaker.half_open_max_calls = 2
+
+    # Get/set how long calls wait for a trial slot (None = reject immediately)
+    print(db_breaker.half_open_wait_timeout)
+    db_breaker.half_open_wait_timeout = 1.0
 
     # Get/set the current reset timeout period (in seconds)
     print(db_breaker.reset_timeout)
