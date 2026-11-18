@@ -164,6 +164,11 @@ class RedisClient
   ProtocolError = Class.new(Error)
   UnsupportedServer = Class.new(Error)
 
+  # Raised when a server reply exceeds the client-side decode budget
+  # (see RedisClient::RESP3::Budget). Unlike ProtocolError proper, the
+  # reply may be well formed, it was simply too large to accept.
+  BudgetExceededError = Class.new(ProtocolError)
+
   ConnectionError = Class.new(Error)
   CannotConnectError = Class.new(ConnectionError)
 

@@ -87,6 +87,10 @@ redis.call("GET", "mykey")
 - `reconnect_attempts`: Specify how many times the client should retry to send queries. Defaults to `0`. Makes sure to read the [reconnection section](#reconnection) before enabling it.
 - `circuit_breaker`: A Hash with circuit breaker configuration. Defaults to `nil`. See the [circuit breaker section](#circuit-breaker) for details.
 - `protocol:` The version of the RESP protocol to use. Default to `3`.
+- `response_budget`: Decode budget for a single reply, as a `RedisClient::RESP3::Budget` or a Hash of its attributes
+  (`max_string_bytes`, `max_aggregate_elements`, `max_depth`, `max_total_bytes`). Replies exceeding the budget are
+  rejected with `RedisClient::BudgetExceededError` before any large allocation happens, and the connection is discarded.
+  Individual limits can be disabled by setting them to `nil`. Only honored by the pure Ruby driver.
 - `custom`: A user-owned value ignored by `redis-client` but available as `Config#custom`. This can be used to hold middleware configurations and other user-specific metadata.
 
 ### Sentinel support

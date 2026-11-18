@@ -100,6 +100,12 @@ class RedisClient
       error
     end
 
+    def budget_error(message)
+      error = BudgetExceededError.with_config(message, config)
+      error._set_retry_attempt(@retry_attempt)
+      error
+    end
+
     def connection_error(message)
       error = ConnectionError.with_config(message, config)
       error._set_retry_attempt(@retry_attempt)

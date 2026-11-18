@@ -23,13 +23,17 @@ class RedisClient
           @blocking_reads = false
         end
 
-        def gets_chomp
+        def gets_chomp(limit = nil)
           fill_buffer(false) if @offset >= @buffer.bytesize
           until eol_index = @buffer.byteindex(EOL, @offset)
+            check_line_limit(limit)
             fill_buffer(false)
           end
 
           line = @buffer.byteslice(@offset, eol_index - @offset)
+          if limit && line.bytesize > limit
+            raise RESP3::BudgetExceeded, "RESP3 line of #{line.bytesize} bytes exceeds the limit of #{limit} bytes"
+          end
           @offset = eol_index + EOL_SIZE
           line
         end
@@ -37,6 +41,7 @@ class RedisClient
         def read_chomp(bytes)
           ensure_remaining(bytes + EOL_SIZE)
           str = @buffer.byteslice(@offset, bytes)
+          verify_eol(@offset + bytes)
           @offset += bytes + EOL_SIZE
           str
         end
@@ -60,13 +65,17 @@ class RedisClient
           @blocking_reads = false
         end
 
-        def gets_chomp
+        def gets_chomp(limit = nil)
           fill_buffer(false) if @offset >= @buffer.bytesize
           until eol_index = @buffer.index(EOL, @offset)
+            check_line_limit(limit)
             fill_buffer(false)
           end
 
           line = @buffer.byteslice(@offset, eol_index - @offset)
+          if limit && line.bytesize > limit
+            raise RESP3::BudgetExceeded, "RESP3 line of #{line.bytesize} bytes exceeds the limit of #{limit} bytes"
+          end
           @offset = eol_index + EOL_SIZE
           line
         end
@@ -74,6 +83,7 @@ class RedisClient
         def read_chomp(bytes)
           ensure_remaining(bytes + EOL_SIZE)
           str = @buffer.byteslice(@offset, bytes)
+          verify_eol(@offset + bytes)
           @offset += bytes + EOL_SIZE
           str.force_encoding(Encoding::UTF_8)
         end
@@ -156,30 +166,69 @@ class RedisClient
         byte
       end
 
+      # Strictly parses a (possibly negative) integer terminated by CRLF.
+      # Length headers larger than 64 bits are rejected up front, as they
+      # could never be allocated anyway.
+      #
+      # RESP3 error classes are referenced here even though this file
+      # doesn't require `resp3.rb`; both files are always loaded together
+      # through `redis_client/ruby_connection`.
       def gets_integer
         int = 0
+        digits = 0
+        negative = false
         offset = @offset
         while true
           chr = @buffer.getbyte(offset)
 
-          if chr
-            if chr == 13 # "\r".ord
-              @offset = offset + 2
-              break
-            else
-              int = (int * 10) + chr - 48
-            end
-            offset += 1
-          else
+          if chr.nil?
             ensure_line
             return gets_integer
+          elsif chr == 13 # "\r".ord
+            if digits == 0
+              raise RESP3::SyntaxError, "Expected an integer, got an empty value"
+            end
+
+            nxt = @buffer.getbyte(offset + 1)
+            if nxt.nil?
+              ensure_line
+              return gets_integer
+            elsif nxt != 10 # "\n".ord
+              raise RESP3::SyntaxError, "Expected CRLF after integer"
+            end
+
+            @offset = offset + 2
+            break
+          elsif chr == 45 && offset == @offset # "-".ord, only allowed as the first character
+            negative = true
+          elsif chr >= 48 && chr <= 57 # between "0".ord and "9".ord
+            if digits >= 20
+              raise RESP3::BudgetExceeded, "RESP3 integer exceeds the 64-bit range"
+            end
+            int = (int * 10) + chr - 48
+            digits += 1
+          else
+            raise RESP3::SyntaxError, "Unexpected byte in integer: #{chr.chr.inspect}"
           end
+          offset += 1
         end
 
-        int
+        negative ? -int : int
       end
 
       private
+
+      def check_line_limit(limit)
+        if limit && @buffer.bytesize - @offset > limit
+          raise RESP3::BudgetExceeded, "RESP3 line exceeds the limit of #{limit} bytes"
+        end
+      end
+
+      def verify_eol(offset)
+        unless @buffer.getbyte(offset) == 13 && @buffer.getbyte(offset + 1) == 10 # "\r\n"
+          raise RESP3::SyntaxError, "Expected CRLF after blob string"
+        end
+      end
 
       def ensure_remaining(bytes)
         needed = bytes - (@buffer.bytesize - @offset)

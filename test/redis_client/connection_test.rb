@@ -351,11 +351,81 @@ class RedisClient
         session.close
       end
 
+      client = new_client(host: "127.0.0.1", port: port)
       error = assert_raises RedisClient::ProtocolError do
-        new_client(host: "127.0.0.1", port: port).call("PING")
+        client.call("PING")
       end
 
       assert_match(%r{ \(rediss?://127.0.0.1:#{port}\)$}, error.message)
+      refute_predicate client, :connected?
+    ensure
+      server_thread&.kill
+    end
+
+    def test_response_budget_exceeded
+      tcp_server = TCPServer.new("127.0.0.1", 0)
+      tcp_server.setsockopt(Socket::SOL_SOCKET, Socket::SO_REUSEADDR, true)
+      port = tcp_server.addr[1]
+
+      server_thread = Thread.new do
+        loop do
+          session = tcp_server.accept
+          begin
+            io = RubyConnection::BufferedIO.new(session, read_timeout: 1, write_timeout: 1)
+            while (command = RESP3.load(io))
+              case command.first
+              when "HELLO"
+                session.write("_\r\n")
+              else
+                session.write("$5\r\nhello\r\n")
+              end
+            end
+          rescue RESP3::Error, EOFError, SystemCallError
+            # Client went away, accept the next connection.
+          ensure
+            session.close
+          end
+        end
+      end
+
+      client = new_client(host: "127.0.0.1", port: port, response_budget: { max_string_bytes: 4 })
+      error = assert_raises RedisClient::BudgetExceededError do
+        client.call("PING")
+      end
+      assert_match(%r{ \(rediss?://127.0.0.1:#{port}\)$}, error.message)
+      # The message boundary is lost, so the connection must not be reused.
+      refute_predicate client, :connected?
+
+      client = new_client(host: "127.0.0.1", port: port, response_budget: { max_string_bytes: 5 })
+      assert_equal "hello", client.call("PING")
+    ensure
+      server_thread&.kill
+    end
+
+    def test_default_response_budget_rejects_huge_replies
+      tcp_server = TCPServer.new("127.0.0.1", 0)
+      tcp_server.setsockopt(Socket::SOL_SOCKET, Socket::SO_REUSEADDR, true)
+      port = tcp_server.addr[1]
+
+      server_thread = Thread.new do
+        session = tcp_server.accept
+        io = RubyConnection::BufferedIO.new(session, read_timeout: 1, write_timeout: 1)
+        while (command = RESP3.load(io))
+          case command.first
+          when "HELLO"
+            session.write("_\r\n")
+          else
+            session.write("*999999999999999\r\n")
+          end
+        end
+        session.close
+      end
+
+      client = new_client(host: "127.0.0.1", port: port)
+      assert_raises RedisClient::BudgetExceededError do
+        client.call("PING")
+      end
+      refute_predicate client, :connected?
     ensure
       server_thread&.kill
     end

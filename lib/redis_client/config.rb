@@ -15,7 +15,8 @@ class RedisClient
     module Common
       attr_reader :db, :id, :ssl, :ssl_params, :command_builder, :inherit_socket,
         :connect_timeout, :read_timeout, :write_timeout, :driver, :protocol,
-        :middlewares_stack, :custom, :circuit_breaker, :driver_info, :idle_timeout
+        :middlewares_stack, :custom, :circuit_breaker, :driver_info, :idle_timeout,
+        :response_budget
 
       alias_method :ssl?, :ssl
 
@@ -40,7 +41,8 @@ class RedisClient
         reconnect_attempts: false,
         middlewares: false,
         circuit_breaker: nil,
-        driver_info: nil
+        driver_info: nil,
+        response_budget: nil
       )
         @username = username
         @password = password && !password.respond_to?(:call) ? ->(_) { password } : password
@@ -90,6 +92,11 @@ class RedisClient
         @middlewares_stack = middlewares_stack
 
         @driver_info = driver_info
+
+        # Decode budget for a single reply, as a RedisClient::RESP3::Budget,
+        # a Hash of budget attributes, or nil for the default budget.
+        # Only honored by the pure Ruby driver.
+        @response_budget = response_budget
       end
 
       def connection_prelude

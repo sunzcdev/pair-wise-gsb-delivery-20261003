@@ -39,6 +39,7 @@ class RedisClient
       @connect_timeout = connect_timeout
       @read_timeout = read_timeout
       @write_timeout = write_timeout
+      @response_budget = RESP3::Budget.wrap(config.response_budget)
       connect
     end
 
@@ -47,7 +48,7 @@ class RedisClient
     end
 
     def close
-      @io.close
+      @io.close unless @io.closed?
       super
     end
 
@@ -88,13 +89,24 @@ class RedisClient
 
     def read(timeout = nil)
       if timeout.nil?
-        RESP3.load(@io)
+        RESP3.load(@io, budget: @response_budget)
       else
-        @io.with_timeout(timeout) { RESP3.load(@io) }
+        @io.with_timeout(timeout) { RESP3.load(@io, budget: @response_budget) }
       end
+    rescue RedisClient::RESP3::BudgetExceeded => error
+      # The reply couldn't be fully consumed, so the message boundary is
+      # lost: this connection can't be reused.
+      close
+      raise budget_error(error.message)
     rescue RedisClient::RESP3::Error => error
+      # Corrupt frames desynchronize the stream, so the message boundary
+      # is lost: this connection can't be reused.
+      close
       raise protocol_error(error.message)
     rescue SystemCallError, IOError, OpenSSL::SSL::SSLError => error
+      # A truncated reply must never be delivered as a valid response,
+      # and the stream can't be resynchronized either.
+      close
       raise connection_error(error.message)
     end
 

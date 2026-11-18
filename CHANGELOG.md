@@ -1,5 +1,15 @@
 # Unreleased
 
+- Added a decode budget to the pure Ruby RESP3 parser (`RedisClient::RESP3::Budget`). String lengths, aggregate
+  member counts, nesting depth and total accepted bytes are now checked *before* allocating, so malicious or broken
+  servers can't trigger huge allocations with forged length headers. Replies exceeding the budget are rejected with
+  `RedisClient::BudgetExceededError` (a `ProtocolError` subclass). Configurable through `RedisClient.config(response_budget: ...)`.
+- Negative length headers are now only accepted as nulls where the protocol allows them (`$-1` and `*-1`); any other
+  negative size is a `RedisClient::ProtocolError`.
+- Corrupt frames (malformed integers, missing CRLF after a blob string, etc.) now raise `RedisClient::ProtocolError`
+  instead of being silently mis-parsed, and connections are closed when the message boundary can't be recovered so a
+  truncated or desynchronized reply is never delivered as a valid response.
+
 # 0.31.0
 
 - Improved the Ruby driver buffering logic, should trigger GC less, particularly for large response and when using SSL.

@@ -154,12 +154,140 @@ class RedisClient
       assert_parses "Some string", "=15\r\ntxt:Some string\r\n"
     end
 
+    def test_load_resp2_nulls
+      assert_parses nil, "$-1\r\n"
+      assert_parses nil, "*-1\r\n"
+    end
+
+    def test_load_negative_size_outside_null_positions
+      assert_syntax_error "$-2\r\n"
+      assert_syntax_error "*-2\r\n"
+      assert_syntax_error "~-1\r\n" # sets have no null form
+      assert_syntax_error "%-1\r\n" # maps have no null form
+      assert_syntax_error "$--1\r\n"
+    end
+
+    def test_load_malformed_length_header
+      assert_syntax_error "*x\r\n"
+      assert_syntax_error "*\r\n"
+      assert_syntax_error "$1x\r\n"
+    end
+
+    def test_load_malformed_scalars
+      assert_syntax_error ":12x\r\n"
+      assert_syntax_error ",not-a-double\r\n"
+      assert_syntax_error "#yes\r\n"
+      assert_syntax_error "_XX"
+    end
+
+    def test_load_blob_with_invalid_trailer
+      assert_syntax_error "$3\r\nabcXX"
+    end
+
+    def test_load_invalid_verbatim_string
+      assert_syntax_error "=2\r\nab\r\n"
+    end
+
+    def test_load_truncated_reply
+      assert_raises EOFError do
+        load_payload("$10\r\nabc")
+      end
+      assert_raises EOFError do
+        load_payload("*2\r\n:1\r\n")
+      end
+    end
+
+    def test_budget_string_bytes
+      error = assert_budget_exceeded("$5\r\nhello\r\n", max_string_bytes: 4)
+      assert_includes error.message, "string"
+      assert_parses "hello", "$5\r\nhello\r\n", budget: { max_string_bytes: 5 }
+    end
+
+    def test_budget_aggregate_elements
+      error = assert_budget_exceeded("*3\r\n:1\r\n:2\r\n:3\r\n", max_aggregate_elements: 2)
+      assert_includes error.message, "aggregate"
+      assert_budget_exceeded("%2\r\n+a\r\n:1\r\n+b\r\n:2\r\n", max_aggregate_elements: 1)
+      assert_parses [1, 2, 3], "*3\r\n:1\r\n:2\r\n:3\r\n", budget: { max_aggregate_elements: 3 }
+    end
+
+    def test_budget_depth
+      payload = "*1\r\n" * 5 + ":1\r\n"
+      error = assert_budget_exceeded(payload, max_depth: 3)
+      assert_includes error.message, "depth"
+      assert_parses [[[[[1]]]]], payload, budget: { max_depth: 5 }
+    end
+
+    def test_budget_total_bytes
+      payload = "*2\r\n$5\r\nhello\r\n$5\r\nworld\r\n"
+      error = assert_budget_exceeded(payload, max_total_bytes: 12)
+      assert_includes error.message, "total"
+      assert_parses ["hello", "world"], payload, budget: { max_total_bytes: 1024 }
+    end
+
+    def test_budget_many_tiny_elements
+      payload = "*1000\r\n" + ("_\r\n" * 1000)
+      assert_budget_exceeded(payload, max_total_bytes: 100)
+    end
+
+    def test_budget_huge_length_header_rejected_before_allocation
+      # No payload needed: the header alone is enough to reject the reply.
+      assert_raises RESP3::BudgetExceeded do
+        load_payload("*999999999999999\r\n")
+      end
+      assert_raises RESP3::BudgetExceeded do
+        load_payload("$999999999999999\r\n")
+      end
+    end
+
+    def test_budget_long_simple_string
+      assert_budget_exceeded("+#{'a' * 1000}\r\n", max_string_bytes: 10)
+      # The limit is enforced while buffering, even if no EOL ever comes.
+      assert_budget_exceeded("+#{'a' * 1000}", max_string_bytes: 10)
+    end
+
+    def test_budget_limits_can_be_disabled
+      budget = RESP3::Budget.new(
+        max_string_bytes: nil,
+        max_aggregate_elements: nil,
+        max_depth: nil,
+        max_total_bytes: nil,
+      )
+      assert_parses [1, 2, 3], "*3\r\n:1\r\n:2\r\n:3\r\n", budget: budget
+    end
+
+    def test_budget_validation
+      assert_raises ArgumentError do
+        RESP3::Budget.new(max_depth: -1)
+      end
+      assert_raises ArgumentError do
+        load_payload("+OK\r\n", budget: 42)
+      end
+    end
+
     private
 
-    def assert_parses(expected, payload, io_class: StringIO)
+    def load_payload(payload, budget: nil, io_class: StringIO)
       raw_io = io_class.new(payload.b)
       io = RedisClient::RubyConnection::BufferedIO.new(raw_io, read_timeout: 1, write_timeout: 1)
-      actual = RESP3.load(io)
+      RESP3.load(io, budget: budget)
+    end
+
+    def assert_syntax_error(payload)
+      assert_raises RESP3::SyntaxError do
+        load_payload(payload)
+      end
+    end
+
+    def assert_budget_exceeded(payload, **budget)
+      assert_raises RESP3::BudgetExceeded do
+        load_payload(payload, budget: budget)
+      end
+    end
+
+    def assert_parses(expected, payload, budget: nil, io_class: StringIO)
+      raw_io = io_class.new(payload.b)
+      io = RedisClient::RubyConnection::BufferedIO.new(raw_io, read_timeout: 1, write_timeout: 1)
+      actual = RESP3.load(io, budget: budget)
       if block_given?
         yield actual
       elsif expected.nil?
