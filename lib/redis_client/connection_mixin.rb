@@ -2,6 +2,18 @@
 
 class RedisClient
   module ConnectionMixin
+    # Mixed into connection errors raised after some command bytes were already
+    # written to the socket. It lets the diagnostics layer distinguish "never
+    # sent" from "sent but the outcome is unknown" without re-executing the
+    # command.
+    module SentButUnknown
+      attr_accessor :sent_commands, :acknowledged_commands
+
+      def unknown_outcome?
+        sent_commands && sent_commands > (acknowledged_commands || 0)
+      end
+    end
+
     attr_accessor :retry_attempt
     attr_reader :config
 
@@ -10,7 +22,12 @@ class RedisClient
       @retry_attempt = nil
       @config = config
       @server_key = nil
+      @observing_context = nil
     end
+
+    # The client sets the current Observability::AttemptContext here while a
+    # logical command is in flight, so the connection can report partial sends.
+    attr_accessor :observing_context
 
     def reconnect
       close
@@ -34,6 +51,9 @@ class RedisClient
     def call(command, timeout)
       @pending_reads += 1
       write(command)
+      # The command is now on the wire: if reading fails below the server may
+      # already have executed it.
+      mark_command_sent!(1)
       result = read(connection_timeout(timeout))
       @pending_reads -= 1
       if result.is_a?(Error)
@@ -44,6 +64,9 @@ class RedisClient
       else
         result
       end
+    rescue ConnectionError, ProtocolError => error
+      annotate_unknown_outcome!(error, 1)
+      raise
     end
 
     def call_pipelined(commands, timeouts, exception: true)
@@ -54,10 +77,16 @@ class RedisClient
       @pending_reads += size
       write_multi(commands)
 
+      # The whole batch is buffered in one write. Once it succeeds every command
+      # is potentially in flight; track how many replies we did manage to read.
+      mark_command_sent!(size)
+      acknowledged = 0
+
       size.times do |index|
         timeout = timeouts && timeouts[index]
         result = read(connection_timeout(timeout))
         @pending_reads -= 1
+        acknowledged += 1
 
         # A multi/exec command can return an array of results.
         # An error from a multi/exec command is handled in Multi#_coerce!.
@@ -83,6 +112,9 @@ class RedisClient
       else
         results
       end
+    rescue ConnectionError, ProtocolError => error
+      annotate_unknown_outcome!(error, size, acknowledged)
+      raise
     end
 
     def connection_timeout(timeout)
@@ -103,6 +135,29 @@ class RedisClient
     def connection_error(message)
       error = ConnectionError.with_config(message, config)
       error._set_retry_attempt(@retry_attempt)
+      error
+    end
+
+    private
+
+    def mark_command_sent!(count)
+      @observing_context&.mark_sent!(count)
+    end
+
+    # Record on +error+ that up to +sent+ commands were written but only
+    # +acknowledged+ replies were received, and mirror that into the active
+    # diagnostics context. This metadata never triggers a retry by itself; the
+    # client's existing reconnection policy remains the sole decision maker.
+    def annotate_unknown_outcome!(error, sent, acknowledged = 0)
+      error.extend(SentButUnknown) unless error.is_a?(SentButUnknown)
+      error.sent_commands = sent
+      error.acknowledged_commands = acknowledged
+      context = @observing_context
+      if context
+        context.mark_sent!(sent)
+        context.mark_acknowledged!(acknowledged)
+        context.last_error = error
+      end
       error
     end
   end

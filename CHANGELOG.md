@@ -1,5 +1,11 @@
 # Unreleased
 
+- Add an optional, opt-in observability layer (`observer:` config) that emits layered events distinguishing a logical
+  command (stable `call_id`) from its individual reconnection attempts (per-attempt `attempt_id`, `attempt` number,
+  `phase` and real terminal `status`). It is independent from the middleware stack, never re-invokes middlewares or
+  re-executes commands, redacts command arguments by default, marks the authentication prelude separately, and isolates
+  observer failures from real replies.
+
 # 0.31.0
 
 - Improved the Ruby driver buffering logic, should trigger GC less, particularly for large response and when using SSL.

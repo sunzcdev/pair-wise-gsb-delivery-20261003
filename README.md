@@ -512,6 +512,64 @@ module MyGlobalRedisInstrumentation
 end
 ```
 
+### Layered observability (command vs. attempts)
+
+Middlewares wrap each *physical* execution, so a transparently retried command invokes them once per attempt and they
+cannot tell the attempts of one logical command apart. For diagnostics that need that distinction, `redis-client`
+provides an optional, separate **observer** layer. It is opt-in (no overhead when not configured), independent from the
+middleware stack, and purely observational:
+
+- it never wraps or re-invokes a business middleware to simulate a retry;
+- it never executes Redis commands, so a write that was sent but whose result is unknown is never re-issued;
+- exceptions raised by an observer are swallowed (and optionally reported) and cannot alter the real reply or error.
+
+Configure it with `observer:` (an object responding to the `RedisClient::Observability::Observer` callbacks):
+
+```ruby
+class MyObserver < RedisClient::Observability::Observer
+  def command_started(event)
+    # One logical command (or pipeline). event.call_id is stable across retries.
+  end
+
+  def attempt_finished(event)
+    # One concrete try: event.attempt_id, event.attempt (0-based), event.status
+  end
+end
+
+RedisClient.config(observer: MyObserver.new)
+```
+
+#### Event hierarchy and correlation
+
+Events (`RedisClient::Observability::Event`) come in three kinds, correlated by stable identifiers:
+
+| Kind      | Identity                                                                 | Meaning |
+| --------- | ------------------------------------------------------------------------ | ------- |
+| `command` | `call_id` (and `pipeline_id` for batches)                                | One logical command. A retried command still emits exactly one `start`/`finish` pair sharing the `call_id`. |
+| `attempt` | own `attempt_id`, parent `call_id`, `attempt` number, `phase`            | One physical try. Reconnecting produces one attempt per try, each with a distinct `attempt_id`. |
+| `connect` | reuses the surrounding `attempt_id`/`call_id`, `phase: :connect`         | A connection (re)establishment, nested under the attempt that needed it. |
+
+Each attempt finishes with an actual terminal `status`:
+
+- `:success` – a reply was obtained;
+- `:error` – a terminal failure (the raised error is on `event.error`);
+- `:retry` – the attempt failed but another physical try is scheduled;
+- `:unknown` – a (non-read-only) command was already written to the socket when the connection was lost, so the server
+  may have applied it. The diagnostics layer records this rather than re-executing the command.
+
+#### Pipelines and the authentication prelude
+
+Pipelined (and `MULTI`) commands carry a batch `pipeline_id`, a `size`, and per-item positions. When a connection is
+established, the authentication/selection prelude (`HELLO`/`AUTH`/`SELECT`/`CLIENT SETINFO`, …) is reported as separate
+attempt events flagged `event.prelude?` with `phase: :connect`, so it is never confused with user traffic.
+
+#### Argument redaction
+
+By default events never contain raw argument values. A single command is recorded as
+`{ command: "SET", arguments: 2 }`, and a batch as an array of such hashes; this keeps passwords (including the
+authentication prelude) and payloads out of logs. Pass `log_arguments: true` to opt into recording the actual command
+arrays. An optional `observer_error_handler:` callable receives `(error, callback, event)` if an observer raises.
+
 ### Timeouts
 
 The client allows you to configure connect, read, and write timeouts.

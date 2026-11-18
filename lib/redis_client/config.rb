@@ -15,7 +15,8 @@ class RedisClient
     module Common
       attr_reader :db, :id, :ssl, :ssl_params, :command_builder, :inherit_socket,
         :connect_timeout, :read_timeout, :write_timeout, :driver, :protocol,
-        :middlewares_stack, :custom, :circuit_breaker, :driver_info, :idle_timeout
+        :middlewares_stack, :custom, :circuit_breaker, :driver_info, :idle_timeout,
+        :observer, :log_arguments
 
       alias_method :ssl?, :ssl
 
@@ -40,7 +41,10 @@ class RedisClient
         reconnect_attempts: false,
         middlewares: false,
         circuit_breaker: nil,
-        driver_info: nil
+        driver_info: nil,
+        observer: nil,
+        log_arguments: false,
+        observer_error_handler: nil
       )
         @username = username
         @password = password && !password.respond_to?(:call) ? ->(_) { password } : password
@@ -88,6 +92,20 @@ class RedisClient
           end
         end
         @middlewares_stack = middlewares_stack
+
+        # The observer is a separate, side-channel diagnostics layer. It is
+        # wrapped so that a faulty observer can never alter a real reply, and
+        # stays independent from the business middleware stack.
+        if observer
+          unless observer.is_a?(Observability::Observer)
+            raise ArgumentError, "observer: must be a RedisClient::Observability::Observer, got #{observer.class}"
+          end
+
+          @observer = Observability::SafeObserver.new(observer, on_error: observer_error_handler)
+        else
+          @observer = nil
+        end
+        @log_arguments = log_arguments == true
 
         @driver_info = driver_info
       end

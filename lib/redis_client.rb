@@ -7,6 +7,7 @@ require "redis_client/config"
 require "redis_client/pid_cache"
 require "redis_client/sentinel_config"
 require "redis_client/middlewares"
+require "redis_client/observability"
 
 class RedisClient
   @driver_definitions = {}
@@ -269,9 +270,11 @@ class RedisClient
   def initialize(config, **)
     super
     @middlewares = config.middlewares_stack.new(self)
+    @instrumenter = config.observer ? Observability::Instrumenter.new(config) : nil
     @raw_connection = nil
     @disable_reconnection = false
     @retry_attempt = nil
+    @attempt_span_suppressed = false
   end
 
   def inspect
@@ -360,9 +363,11 @@ class RedisClient
 
   def call(*command, **kwargs)
     command = @command_builder.generate(command, kwargs)
-    result = ensure_connected do |connection|
-      @middlewares.call(command, config) do
-        connection.call(command, nil)
+    result = observe_command(:call, command) do
+      ensure_connected do |connection|
+        @middlewares.call(command, config) do
+          connection.call(command, nil)
+        end
       end
     end
 
@@ -375,9 +380,11 @@ class RedisClient
 
   def call_v(command)
     command = @command_builder.generate(command)
-    result = ensure_connected do |connection|
-      @middlewares.call(command, config) do
-        connection.call(command, nil)
+    result = observe_command(:call, command) do
+      ensure_connected do |connection|
+        @middlewares.call(command, config) do
+          connection.call(command, nil)
+        end
       end
     end
 
@@ -390,9 +397,11 @@ class RedisClient
 
   def call_once(*command, **kwargs)
     command = @command_builder.generate(command, kwargs)
-    result = ensure_connected(retryable: false) do |connection|
-      @middlewares.call(command, config) do
-        connection.call(command, nil)
+    result = observe_command(:call, command, retryable: false) do
+      ensure_connected(retryable: false) do |connection|
+        @middlewares.call(command, config) do
+          connection.call(command, nil)
+        end
       end
     end
 
@@ -405,9 +414,11 @@ class RedisClient
 
   def call_once_v(command)
     command = @command_builder.generate(command)
-    result = ensure_connected(retryable: false) do |connection|
-      @middlewares.call(command, config) do
-        connection.call(command, nil)
+    result = observe_command(:call, command, retryable: false) do
+      ensure_connected(retryable: false) do |connection|
+        @middlewares.call(command, config) do
+          connection.call(command, nil)
+        end
       end
     end
 
@@ -421,12 +432,14 @@ class RedisClient
   def blocking_call(timeout, *command, **kwargs)
     command = @command_builder.generate(command, kwargs)
     error = nil
-    result = ensure_connected do |connection|
-      @middlewares.call(command, config) do
-        connection.call(command, timeout)
+    result = observe_command(:blocking_call, command) do
+      ensure_connected do |connection|
+        @middlewares.call(command, config) do
+          connection.call(command, timeout)
+        end
+      rescue ReadTimeoutError => error
+        break
       end
-    rescue ReadTimeoutError => error
-      break
     end
 
     if error
@@ -441,12 +454,14 @@ class RedisClient
   def blocking_call_v(timeout, command)
     command = @command_builder.generate(command)
     error = nil
-    result = ensure_connected do |connection|
-      @middlewares.call(command, config) do
-        connection.call(command, timeout)
+    result = observe_command(:blocking_call, command) do
+      ensure_connected do |connection|
+        @middlewares.call(command, config) do
+          connection.call(command, timeout)
+        end
+      rescue ReadTimeoutError => error
+        break
       end
-    rescue ReadTimeoutError => error
-      break
     end
 
     if error
@@ -514,10 +529,13 @@ class RedisClient
     if pipeline._size == 0
       []
     else
-      results = ensure_connected(retryable: pipeline._retryable?) do |connection|
-        commands = pipeline._commands
-        @middlewares.call_pipelined(commands, config) do
-          connection.call_pipelined(commands, pipeline._timeouts, exception: exception)
+      results = observe_command(:pipelined, nil, commands: pipeline._commands,
+                                               retryable: pipeline._retryable?) do
+        ensure_connected(retryable: pipeline._retryable?) do |connection|
+          commands = pipeline._commands
+          @middlewares.call_pipelined(commands, config) do
+            connection.call_pipelined(commands, pipeline._timeouts, exception: exception)
+          end
         end
       end
 
@@ -553,11 +571,14 @@ class RedisClient
       if transaction._empty?
         []
       else
-        ensure_connected(retryable: transaction._retryable?) do |connection|
-          commands = transaction._commands
-          @middlewares.call_pipelined(commands, config) do
-            connection.call_pipelined(commands, nil)
-          end.last
+        observe_command(:multi, nil, commands: transaction._commands,
+                                    retryable: transaction._retryable?) do
+          ensure_connected(retryable: transaction._retryable?) do |connection|
+            commands = transaction._commands
+            @middlewares.call_pipelined(commands, config) do
+              connection.call_pipelined(commands, nil)
+            end.last
+          end
         end
       end
     end
@@ -732,6 +753,86 @@ class RedisClient
 
   private
 
+  # Fiber-local key used to stash the active observation context. Using the
+  # current thread/fiber keeps concurrent commands on a shared client isolated
+  # while remaining invisible to the rest of the object's state. The key is a
+  # frozen shared symbol rather than an object-id-derived string, so it does not
+  # accumulate entries in Thread.current across client instances.
+  OBSERVATION_STORAGE_KEY = :redis_client_observation_context
+
+  # Wrap a logical command (single or pipelined) with the diagnostics layer.
+  # Business middlewares are invoked exactly as before, once per physical try
+  # inside the block; the observer instead sees one stable command pair and one
+  # attempt pair per try. When no observer is configured this is a plain yield.
+  #
+  # The context is kept in thread/fiber-local storage rather than an instance
+  # variable, because a single client may be shared by concurrent threads and
+  # each logical command needs its own independent correlation state.
+  def observe_command(name, command, commands: nil, retryable: true)
+    instrumenter = @instrumenter
+    return yield unless instrumenter
+
+    call_id = instrumenter.new_id
+    pipeline_id = commands ? instrumenter.new_id : nil
+    context = instrumenter.new_context(
+      call_id, pipeline_id, name: name, command: command, commands: commands
+    )
+    context.retryable = retryable
+    if retryable
+      # Pure query (no sleep), mirroring the scheduling done by
+      # Config#retry_connecting? inside the retry loop.
+      context.retry_policy = ->(attempt) { !!config.retriable?(attempt) }
+    end
+
+    set_observation_context(context)
+    begin
+      instrumenter.instrument(
+        name, command: command, commands: commands, context: context
+      ) { yield }
+    ensure
+      set_observation_context(nil)
+    end
+  end
+
+  def observation_context
+    Thread.current[OBSERVATION_STORAGE_KEY]
+  end
+
+  def set_observation_context(context)
+    Thread.current[OBSERVATION_STORAGE_KEY] = context
+  end
+
+  # Emit the attempt events around one full physical try of the retry loop,
+  # including connection acquisition and the prelude. A fresh attempt_id is
+  # allocated per try; the parent call_id/pipeline_id stay stable so every try
+  # can be correlated back to the single logical command.
+  def observe_attempt_body(number)
+    context = observation_context
+    return yield unless context
+    return yield unless @instrumenter
+    # The non-retryable branch acquires its connection recursively; suppress
+    # that nested span so a call_once command reports exactly one attempt.
+    return yield if @attempt_span_suppressed
+
+    context.attempt = number
+    context.attempt_id = @instrumenter.new_id
+    context.begin_attempt!
+
+    # Bind the context before the block runs: raw_connection/connect inside the
+    # block may create a brand new connection, which must already know which
+    # observation context its prelude and writes belong to.
+    @raw_connection&.observing_context = context
+
+    @instrumenter.instrument_attempt(
+      context.name, command: context.command, commands: context.commands,
+                    context: context
+    ) do
+      yield
+    end
+  ensure
+    @raw_connection&.observing_context = nil
+  end
+
   def build_transaction
     transaction = Multi.new(@command_builder)
     transaction.call("MULTI")
@@ -782,13 +883,23 @@ class RedisClient
       preferred_error = nil
       begin
         @retry_attempt = config.retriable?(tries) ? tries : nil
-        connection = raw_connection
-        if block_given?
-          result = yield connection
-          @last_used_at = RedisClient.now
-          result
-        else
-          connection
+        # The whole physical attempt - including establishing the connection
+        # and running its prelude - lives inside the attempt event boundary, so
+        # failures during connect are attributed to the correct attempt.
+        observe_attempt_body(tries) do
+          # tries > 0 means a previous physical attempt failed and the loop is
+          # reconnecting; connect() reads this (via the context) to tag its
+          # events accurately. Kept off instance state for thread safety.
+          context = observation_context
+          context.reconnecting = tries > 0 if context
+          connection = raw_connection
+          if block_given?
+            result = yield connection
+            @last_used_at = RedisClient.now
+            result
+          else
+            connection
+          end
         end
       rescue ConnectionError, ProtocolError => error
         preferred_error ||= error
@@ -809,13 +920,20 @@ class RedisClient
       end
     else
       previous_disable_reconnection = @disable_reconnection
-      connection = ensure_connected
+      # Suppress the attempt span that the recursive (retryable) connection
+      # acquisition would otherwise open: the single physical execution below
+      # is the only business attempt we report for call_once-style calls. The
+      # connection itself is still established exactly as before, so error
+      # semantics are unchanged.
+      connection = with_attempt_span_suppressed { ensure_connected }
       begin
         @disable_reconnection = true
         @raw_connection.retry_attempt = nil
-        result = yield connection
-        @last_used_at = RedisClient.now
-        result
+        observe_attempt_body(0) do
+          result = yield connection
+          @last_used_at = RedisClient.now
+          result
+        end
       rescue ConnectionError, ProtocolError
         close
         raise
@@ -823,6 +941,17 @@ class RedisClient
         @disable_reconnection = previous_disable_reconnection
       end
     end
+  end
+
+  # When active, observe_attempt_body becomes a plain yield instead of opening
+  # an attempt span. Used only while the non-retryable branch acquires its
+  # connection, to avoid attributing an extra attempt to a call_once command.
+  def with_attempt_span_suppressed
+    previous = @attempt_span_suppressed
+    @attempt_span_suppressed = true
+    yield
+  ensure
+    @attempt_span_suppressed = previous
   end
 
   def raw_connection
@@ -840,24 +969,78 @@ class RedisClient
     end
 
     @raw_connection.retry_attempt = @retry_attempt
+    @raw_connection.observing_context = observation_context
     @raw_connection
+  end
+
+  # Observe a (re)connection. connect() always runs from raw_connection, which
+  # itself runs inside an attempt block, so the active observation context is
+  # the current attempt's context and must be reused as-is (same call_id and
+  # attempt_id). The fallback only covers exotic out-of-band connections.
+  def instrument_connect(reconnecting)
+    instrumenter = @instrumenter
+    return yield unless instrumenter
+
+    context = observation_context
+    unless context
+      context = instrumenter.new_context(instrumenter.new_id, nil, name: :connect)
+      context.attempt_id = instrumenter.new_id
+    end
+    if @raw_connection
+      @raw_connection.observing_context = context
+    end
+
+    instrumenter.instrument_connect(context: context, reconnect: reconnecting) { yield }
+  end
+
+  def observe_prelude(commands, results)
+    return unless @instrumenter
+
+    context = observation_context
+    unless context
+      context = @instrumenter.new_context(@instrumenter.new_id, nil, name: :connect)
+      context.attempt_id = @instrumenter.new_id
+    end
+    @instrumenter.observe_prelude(commands, results, context: context)
+  end
+
+  # Mirror partial-send evidence from a connection error into the active
+  # diagnostics context. Connect errors can be raised after a prelude write, so
+  # this keeps the unknown-outcome bookkeeping accurate across reconnections.
+  def remember_unknown_outcome(error)
+    context = observation_context
+    return unless context
+    return unless error.is_a?(ConnectionMixin::SentButUnknown)
+
+    context.mark_sent!(error.sent_commands.to_i)
+    context.mark_acknowledged!(error.acknowledged_commands.to_i)
+    context.last_error = error
   end
 
   def connect
     @pid = PIDCache.pid
 
-    if @raw_connection&.revalidate
-      @middlewares.connect(config) do
-        @raw_connection.reconnect
-      end
-    else
-      @raw_connection = @middlewares.connect(config) do
-        config.driver.new(
-          config,
-          connect_timeout: connect_timeout,
-          read_timeout: read_timeout,
-          write_timeout: write_timeout,
-        )
+    existing_connection = @raw_connection&.revalidate
+    # Prefer the retry-loop flag carried on the observation context (accurate
+    # after close and thread-local); fall back to whether a live connection
+    # object is being reused.
+    context = observation_context
+    flagged_reconnect = context ? context.reconnecting? : false
+    reconnecting = flagged_reconnect || existing_connection ? true : false
+    instrument_connect(reconnecting) do
+      if existing_connection
+        @middlewares.connect(config) do
+          @raw_connection.reconnect
+        end
+      else
+        @raw_connection = @middlewares.connect(config) do
+          config.driver.new(
+            config,
+            connect_timeout: connect_timeout,
+            read_timeout: read_timeout,
+            write_timeout: write_timeout,
+          )
+        end
       end
     end
     @last_used_at = RedisClient.now
@@ -877,6 +1060,7 @@ class RedisClient
       results = @middlewares.call_pipelined(prelude, config) do
         @raw_connection.call_pipelined(prelude, nil, exception: false)
       end
+      observe_prelude(prelude, results)
 
       results.each do |result|
         # CLIENT SETINFO is unsupported on Redis < 7.2. The pipeline drained all responses before raising,
@@ -893,11 +1077,21 @@ class RedisClient
   rescue FailoverError, CannotConnectError => error
     @raw_connection&.close
     error._set_config(config)
+    remember_unknown_outcome(error)
     raise error
   rescue ConnectionError => error
     @raw_connection&.close
+    remember_unknown_outcome(error)
     connect_error = CannotConnectError.with_config(error.message, config)
     connect_error.set_backtrace(error.backtrace)
+    # Preserve the "bytes were already in flight" evidence on the wrapped
+    # error so observers and callers can still tell an unknown-outcome failure
+    # from a never-sent one.
+    if error.is_a?(ConnectionMixin::SentButUnknown)
+      connect_error.extend(ConnectionMixin::SentButUnknown)
+      connect_error.sent_commands = error.sent_commands
+      connect_error.acknowledged_commands = error.acknowledged_commands
+    end
     raise connect_error
   rescue CommandError => error
     @raw_connection&.close
@@ -907,6 +1101,10 @@ class RedisClient
         "redis-client requires Redis 6+ with HELLO command available (#{config.server_url})", cause: error
     else
       raise
+    end
+  ensure
+    if @raw_connection && observation_context.nil?
+      @raw_connection.observing_context = nil
     end
   end
 end
