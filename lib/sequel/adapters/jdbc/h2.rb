@@ -240,7 +240,13 @@ module Sequel
         # H2 doesn't support multiple columns in IN/NOT IN
         def supports_multiple_column_in?
           false
-        end 
+        end
+
+        # H2 doesn't support row value comparison syntax such as
+        # (a, b) = (1, 2), so it is emulated with scalar comparisons.
+        def supports_row_value?
+          false
+        end
 
         private
 

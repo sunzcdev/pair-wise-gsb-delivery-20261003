@@ -217,6 +217,12 @@ module Sequel
         false
       end
 
+      # Access does not support row value comparison syntax such as
+      # (a, b) = (1, 2), so it is emulated with scalar comparisons.
+      def supports_row_value?
+        false
+      end
+
       # Access doesn't support truncate, so do a delete instead.
       def truncate
         delete

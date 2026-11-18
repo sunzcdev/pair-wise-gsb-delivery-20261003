@@ -860,6 +860,12 @@ module Sequel
       def supports_multiple_column_in?
         false
       end
+
+      # SQLite does not support row value comparison syntax such as
+      # (a, b) = (1, 2), so it is emulated with scalar comparisons.
+      def supports_row_value?
+        false
+      end
       
       # SQLite 3.35.0 supports RETURNING on INSERT/UPDATE/DELETE.
       def supports_returning?(_)

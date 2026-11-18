@@ -46,6 +46,28 @@ Similarly, you can also supply a set:
   items.where(id: Set[1, 38, 47, 99]).sql
   # "SELECT * FROM items WHERE (id IN (1, 38, 47, 99))"
 
+== Filtering on row values
+
+You can compare or match several columns at once by using arrays on both
+sides of a condition.  On databases that support row value expressions this
+uses the native syntax:
+
+  items.where(Sequel.expr { [a, b] > [1, 2] }).sql
+  # "SELECT * FROM items WHERE ((a, b) > (1, 2))"
+  items.where([:a, :b] => [[1, 2], [3, 4]]).sql
+  # "SELECT * FROM items WHERE ((a, b) IN ((1, 2), (3, 4)))"
+
+On databases without row value support (such as SQLite, Microsoft SQL Server,
+DB2, Access, SQLAnywhere, H2, and Derby), Sequel emulates the condition with
+ordinary scalar column comparisons.  The emulation covers equality (=, !=),
+the lexicographic inequalities (<, <=, >, >=), and finite IN/NOT IN lists.
+It preserves SQL NULL three-valued logic, so an unknown comparison is never
+silently turned into an ordinary true or false, and NOT IN is kept as the
+negation of the whole IN predicate.  Candidate rows are checked for the
+correct number of values before the SQL is compiled, empty collections keep
+their usual always-false/always-true rules, and the order of parameters and
+duplicate values is preserved.
+
 == Filtering using expressions
 
 You can pass a block to where (referred to as a virtual row block), which is evaluated in a special context:

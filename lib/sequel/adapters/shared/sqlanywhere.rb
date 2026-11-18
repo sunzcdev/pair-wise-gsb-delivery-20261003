@@ -269,6 +269,12 @@ module Sequel
         false
       end
 
+      # SQLAnywhere does not support row value comparison syntax such as
+      # (a, b) = (1, 2), so it is emulated with scalar comparisons.
+      def supports_row_value?
+        false
+      end
+
       def supports_where_true?
         false
       end

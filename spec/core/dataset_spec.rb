@@ -550,15 +550,17 @@ describe "Dataset#where" do
   it "should handle IN/NOT IN queries with multiple columns and an array where the database doesn't support it" do
     @dataset = @dataset.with_extend{def supports_multiple_column_in?; false end}
     @dataset.filter([:id1, :id2] => [[1, 2], [3,4]]).sql.must_equal "SELECT * FROM test WHERE (((id1 = 1) AND (id2 = 2)) OR ((id1 = 3) AND (id2 = 4)))"
-    @dataset.exclude([:id1, :id2] => [[1, 2], [3,4]]).sql.must_equal "SELECT * FROM test WHERE (((id1 != 1) OR (id2 != 2)) AND ((id1 != 3) OR (id2 != 4)))"
+    # NOT IN wraps the whole IN emulation in NOT so SQL NULL three-valued
+    # logic is preserved instead of inverting the AND/OR tree.
+    @dataset.exclude([:id1, :id2] => [[1, 2], [3,4]]).sql.must_equal "SELECT * FROM test WHERE NOT (((id1 = 1) AND (id2 = 2)) OR ((id1 = 3) AND (id2 = 4)))"
     @dataset.filter([:id1, :id2] => Sequel.value_list([[1, 2], [3,4]])).sql.must_equal "SELECT * FROM test WHERE (((id1 = 1) AND (id2 = 2)) OR ((id1 = 3) AND (id2 = 4)))"
-    @dataset.exclude([:id1, :id2] => Sequel.value_list([[1, 2], [3,4]])).sql.must_equal "SELECT * FROM test WHERE (((id1 != 1) OR (id2 != 2)) AND ((id1 != 3) OR (id2 != 4)))"
+    @dataset.exclude([:id1, :id2] => Sequel.value_list([[1, 2], [3,4]])).sql.must_equal "SELECT * FROM test WHERE NOT (((id1 = 1) AND (id2 = 2)) OR ((id1 = 3) AND (id2 = 4)))"
   end
 
   it "should handle IN/NOT IN queries with multiple columns and a set where the database doesn't support it" do
     @dataset = @dataset.with_extend{def supports_multiple_column_in?; false end}
     @dataset.filter([:id1, :id2] => Set[[1, 2], [3,4]]).sql.must_equal "SELECT * FROM test WHERE (((id1 = 1) AND (id2 = 2)) OR ((id1 = 3) AND (id2 = 4)))"
-    @dataset.exclude([:id1, :id2] => Set[[1, 2], [3,4]]).sql.must_equal "SELECT * FROM test WHERE (((id1 != 1) OR (id2 != 2)) AND ((id1 != 3) OR (id2 != 4)))"
+    @dataset.exclude([:id1, :id2] => Set[[1, 2], [3,4]]).sql.must_equal "SELECT * FROM test WHERE NOT (((id1 = 1) AND (id2 = 2)) OR ((id1 = 3) AND (id2 = 4)))"
   end
 
   it "should handle IN/NOT IN queries with multiple columns and a dataset where the database doesn't support it" do
@@ -567,7 +569,7 @@ describe "Dataset#where" do
     d1 = db[:test].select(:id1, :id2).filter(:region=>'Asia').columns(:id1, :id2)
     @dataset.filter([:id1, :id2] => d1).sql.must_equal "SELECT * FROM test WHERE (((id1 = 1) AND (id2 = 2)) OR ((id1 = 3) AND (id2 = 4)))"
     db.sqls.must_equal ["SELECT id1, id2 FROM test WHERE (region = 'Asia')"]
-    @dataset.exclude([:id1, :id2] => d1).sql.must_equal "SELECT * FROM test WHERE (((id1 != 1) OR (id2 != 2)) AND ((id1 != 3) OR (id2 != 4)))"
+    @dataset.exclude([:id1, :id2] => d1).sql.must_equal "SELECT * FROM test WHERE NOT (((id1 = 1) AND (id2 = 2)) OR ((id1 = 3) AND (id2 = 4)))"
     db.sqls.must_equal ["SELECT id1, id2 FROM test WHERE (region = 'Asia')"]
   end
 
@@ -598,7 +600,7 @@ describe "Dataset#where" do
     d1 = db[:test].select(:id1, :id2).filter(:region=>'Asia').columns(:id1, :id2).with_row_proc(proc{|h| Object.new})
     @dataset.filter([:id1, :id2] => d1).sql.must_equal "SELECT * FROM test WHERE (((id1 = 1) AND (id2 = 2)) OR ((id1 = 3) AND (id2 = 4)))"
     db.sqls.must_equal ["SELECT id1, id2 FROM test WHERE (region = 'Asia')"]
-    @dataset.exclude([:id1, :id2] => d1).sql.must_equal "SELECT * FROM test WHERE (((id1 != 1) OR (id2 != 2)) AND ((id1 != 3) OR (id2 != 4)))"
+    @dataset.exclude([:id1, :id2] => d1).sql.must_equal "SELECT * FROM test WHERE NOT (((id1 = 1) AND (id2 = 2)) OR ((id1 = 3) AND (id2 = 4)))"
     db.sqls.must_equal ["SELECT id1, id2 FROM test WHERE (region = 'Asia')"]
   end
   

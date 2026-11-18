@@ -146,6 +146,16 @@ module Sequel
       true
     end
 
+    # Whether row value expressions, such as +(a, b) = (1, 2)+ and
+    # +(a, b) > (1, 2)+, are supported natively, true by default.  When
+    # false, row value comparisons are emulated using only scalar column
+    # comparisons, while preserving SQL NULL three-valued logic.  Databases
+    # that do not support multiple columns in IN generally do not support
+    # row value expressions either, so they should override both methods.
+    def supports_row_value?
+      true
+    end
+
     # Whether offsets are supported in correlated subqueries, true by default.
     def supports_offsets_in_correlated_subqueries?
       true

@@ -386,8 +386,17 @@ module Sequel
         elsif col_array
           if !supports_multiple_column_in?
             if val_array
-              expr = SQL::BooleanExpression.new(:OR, *vals.to_a.map{|vs| SQL::BooleanExpression.from_value_pairs(cols.to_a.zip(vs).map{|c, v| [c, v]})})
-              literal_append(sql, op == :IN ? expr : ~expr)
+              # Emulate the row value IN/NOT IN with scalar comparisons only.
+              # The arity is checked before compilation so the error is raised
+              # deterministically, and the NULL aware expansion keeps the SQL
+              # NULL three-valued logic instead of collapsing unknown results
+              # to plain false/true.  NOT IN is compiled as the negation of the
+              # whole IN predicate rather than an inverted boolean tree, so an
+              # unknown IN result stays unknown instead of becoming true.
+              rows = vals.to_a
+              check_row_value_arity!(cols, rows)
+              expr = row_value_in_expression(cols, rows)
+              literal_append(sql, op == :IN ? expr : SQL::BooleanExpression.new(:NOT, expr))
             else
               old_vals = vals
               vals = vals.naked if vals.is_a?(Sequel::Dataset)
@@ -434,11 +443,15 @@ module Sequel
         if REGEXP_OPERATORS.include?(op) && !supports_regexp?
           raise InvalidOperation, "Pattern matching via regular expressions is not supported on #{db.database_type}"
         end
-        sql << '('
-        literal_append(sql, args[0])
-        sql << ' ' << op.to_s << ' '
-        literal_append(sql, args[1])
-        sql << ')'
+        if args[0].is_a?(Array) && args[1].is_a?(Array) && !supports_row_value?
+          literal_append(sql, emulated_row_value_expression(op, args[0], args[1]))
+        else
+          sql << '('
+          literal_append(sql, args[0])
+          sql << ' ' << op.to_s << ' '
+          literal_append(sql, args[1])
+          sql << ')'
+        end
       when *N_ARITY_OPERATORS
         sql << '('
         c = false
@@ -1231,6 +1244,114 @@ module Sequel
     def empty_array_value(op, cols)
       {1 => ((op == :IN) ? 0 : 1)}
     end
+
+    # Operators that compare two row values (arrays) and can be emulated
+    # with scalar column comparisons on databases without row value support.
+    EMULATED_ROW_VALUE_OPERATORS = (SQL::ComplexExpression::EQUALITY_OPERATORS + SQL::ComplexExpression::INEQUALITY_OPERATORS).freeze
+
+    # Raise an Error unless every candidate row has the same number of
+    # elements as the column list.  This is checked before any SQL is
+    # compiled so that an invalid query fails deterministically.
+    def check_row_value_arity!(cols, rows)
+      n = cols.length
+      rows.each_with_index do |row, i|
+        unless row.is_a?(Array) && row.length == n
+          raise Error, "number of values in row #{i} (#{row.is_a?(Array) ? row.length : 0}) differs from number of columns (#{n})"
+        end
+      end
+    end
+    private :check_row_value_arity!
+
+    # Return an emulated scalar comparison expression for a row value
+    # comparison of the two arrays.  Only equality and inequality operators
+    # are emulated; the NULL three-valued logic of the row value comparison
+    # is preserved by the expansion.
+    def emulated_row_value_expression(op, lhs, rhs)
+      unless EMULATED_ROW_VALUE_OPERATORS.include?(op)
+        raise InvalidOperation, "invalid row value operator #{op.inspect} on #{db.database_type}"
+      end
+      unless lhs.length == rhs.length
+        raise Error, "number of columns (#{lhs.length}) differs from number of values (#{rhs.length}) in row value comparison"
+      end
+
+      case op
+      when :"="
+        row_value_equality_expression(lhs, rhs)
+      when :"!="
+        # The negation of the emulated equality keeps NULL comparisons
+        # unknown instead of turning them into ordinary false/true results.
+        ~row_value_equality_expression(lhs, rhs)
+      else
+        row_value_inequality_expression(op, lhs, rhs)
+      end
+    end
+    private :emulated_row_value_expression
+
+    # Emulate +(lhs) = (rhs)+ for row values.  Each column pair uses plain
+    # SQL equality, including when a value is NULL: a NULL comparison yields
+    # NULL and propagates through the AND chain, so the whole row stays
+    # unknown under three-valued logic instead of being treated as a match.
+    def row_value_equality_expression(lhs, rhs)
+      pairs = lhs.zip(rhs).map! { |l, r| SQL::BooleanExpression.new(:"=", l, r) }
+      pairs.length == 1 ? pairs[0] : SQL::BooleanExpression.new(:AND, *pairs)
+    end
+    private :row_value_equality_expression
+
+    # Emulate a lexicographic row value inequality (<, >, <=, >=) using the
+    # standard prefix expansion.  NULL comparisons stay NULL and propagate
+    # through the AND/OR chain, so unknown results are never silently turned
+    # into ordinary boolean values.  For the inclusive <= and >= operators,
+    # only the last prefix, which compares every column, uses the inclusive
+    # comparison; the earlier prefixes keep the corresponding strict
+    # operator so a NULL final column never becomes a positive match.
+    def row_value_inequality_expression(op, lhs, rhs)
+      inclusive = (op == :"<=" || op == :">=")
+      strict_op = inclusive ? (op == :"<=" ? :< : :>) : op
+      n = lhs.length
+      or_args = (0...n).map do |i|
+        and_args = (0...i).map do |j|
+          SQL::BooleanExpression.new(:"=", lhs[j], rhs[j])
+        end
+        column_op = (inclusive && i == n - 1) ? op : strict_op
+        and_args << SQL::BooleanExpression.new(column_op, lhs[i], rhs[i])
+        and_args.length == 1 ? and_args[0] : SQL::BooleanExpression.new(:AND, *and_args)
+      end
+      or_args.length == 1 ? or_args[0] : SQL::BooleanExpression.new(:OR, *or_args)
+    end
+    private :row_value_inequality_expression
+
+    # Emulate +(cols) IN (rows)+ for databases without multiple column IN
+    # support.  Each candidate row is expanded into a scalar match
+    # expression and the rows are OR-ed together, keeping both the row order
+    # and the order of the values within each row.
+    def row_value_in_expression(cols, rows)
+      SQL::BooleanExpression.new(:OR, *rows.map{|row| row_value_match_expression(cols, row)})
+    end
+    private :row_value_in_expression
+
+    # Scalar expression for matching a single candidate row inside an
+    # emulated row value IN predicate.  Every non-NULL candidate value must
+    # compare equal to its column.  A NULL candidate value is represented by
+    # a marker that is NULL when the column is NULL and FALSE otherwise:
+    #
+    #   (CASE WHEN col IS NULL THEN 1 ELSE 0 END) = NULL
+    #
+    # AND-ed together with the other comparisons, the marker keeps the row
+    # unknown when a NULL cannot be positively matched instead of collapsing
+    # it to an ordinary false, and the NULL operand preserves the unknown
+    # result when the whole predicate is negated for NOT IN.
+    def row_value_match_expression(cols, row)
+      pairs = cols.zip(row).map do |col, val|
+        if val.nil?
+          marker = Sequel.case({SQL::BooleanExpression.new(:IS, col, nil) => 1}, 0)
+          SQL::BooleanExpression.new(:"=", marker, nil)
+        else
+          SQL::BooleanExpression.new(:"=", col, val)
+        end
+      end
+      pairs.length == 1 ? pairs[0] : SQL::BooleanExpression.new(:AND, *pairs)
+    end
+    private :row_value_match_expression
     
     # Format the timestamp based on the default_timestamp_format.
     def format_timestamp(v)

@@ -1,5 +1,9 @@
 === master
 
+* Emulate row value comparison conditions (=, !=, <, <=, >, >=) via Dataset#supports_row_value?, preserving SQL NULL three-valued logic on databases without row value support (jeremyevans)
+
+* Make multiple column IN/NOT IN emulation preserve SQL NULL three-valued logic, including for NOT IN and candidates containing NULL, on databases without multiple column IN support (jeremyevans)
+
 * Avoid duplicating table when adding/dropping CHECK or NOT NULL constraints on SQLite 3.53+ (jeremyevans)
 
 * Add Database#wait_for_lsn on PostgreSQL 19+ to support WAIT FOR LSN (jeremyevans)

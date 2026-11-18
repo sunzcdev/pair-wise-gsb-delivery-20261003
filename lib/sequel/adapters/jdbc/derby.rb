@@ -247,6 +247,12 @@ module Sequel
           false
         end
 
+        # Derby does not support row value comparison syntax such as
+        # (a, b) = (1, 2), so it is emulated with scalar comparisons.
+        def supports_row_value?
+          false
+        end
+
         private
 
         def empty_from_sql
