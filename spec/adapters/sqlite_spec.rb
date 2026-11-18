@@ -1095,6 +1095,114 @@ describe 'SQLite Database' do
   end
 end if DB.sqlite_version >= 33800
 
+describe "SQLite CTE materialization" do
+  before do
+    @db = DB
+    @db.drop_table?(:cm_cte_items)
+    @db.create_table(:cm_cte_items){Integer :a}
+    @db[:cm_cte_items].multi_insert([{:a=>1}, {:a=>2}, {:a=>3}])
+  end
+  after do
+    @db.drop_table?(:cm_cte_items)
+  end
+
+  it "should only support materialization hints on SQLite 3.35+" do
+    @db.dataset.supports_cte_materialization?.must_equal(DB.sqlite_version >= 33500)
+    @db.dataset.supports_cte_materialization?(:inline).must_equal(DB.sqlite_version >= 33500)
+  end
+
+  it "should verify the generated syntax against the SQLite version by executing it" do
+    [:materialize, :inline].each do |form|
+      ds = @db[:x].with(:x, @db[:cm_cte_items], :materialized=>form)
+      # This would raise a Sequel::DatabaseError on a version that did not
+      # accept the syntax, so executing it verifies the generated syntax
+      # against the version the database supports.
+      ds.select_order_map(:a).must_equal [1, 2, 3]
+    end
+  end
+
+  it "should generate valid SQL and honor a MATERIALIZED hint" do
+    ds = @db[:x].with(:x, @db[:cm_cte_items], :materialized=>true)
+    ds.sql.must_include 'AS MATERIALIZED'
+    ds.select_order_map(:a).must_equal [1, 2, 3]
+    plan = ds.cte_materialization_plan.first
+    plan[:supported].must_equal true
+    plan[:form].must_equal :materialize
+    plan[:reason].must_equal :honored
+  end
+
+  it "should generate valid SQL and honor a NOT MATERIALIZED hint with a single reference" do
+    ds = @db[:x].with(:x, @db[:cm_cte_items], :materialized=>false)
+    ds.sql.must_include 'AS NOT MATERIALIZED'
+    ds.select_order_map(:a).must_equal [1, 2, 3]
+    plan = ds.cte_materialization_plan.first
+    plan[:supported].must_equal true
+    plan[:form].must_equal :inline
+    plan[:reason].must_equal :honored
+  end
+
+  it "should generate valid SQL even when SQLite will ignore a NOT MATERIALIZED hint" do
+    ds = @db[:x].cross_join(Sequel[:x].as(:q)).with(:x, @db[:cm_cte_items], :materialized=>false)
+    ds.sql.must_include 'AS NOT MATERIALIZED'
+    ds.count.must_equal 9
+    plan = ds.cte_materialization_plan.first
+    plan[:references].must_equal 2
+    plan[:supported].must_equal false
+    plan[:form].must_equal :materialize
+    plan[:reason].must_equal :ignored_by_backend
+  end
+
+  it "should reject a hard NOT MATERIALIZED requirement that SQLite would ignore" do
+    ds = @db[:x].cross_join(Sequel[:x].as(:q)).with(:x, @db[:cm_cte_items], :materialized=>false, :materialized_requirement=>:require)
+    proc{ds.count}.must_raise Sequel::UnsupportedCTEMaterialization
+  end
+
+  it "should accept a hard MATERIALIZED requirement" do
+    ds = @db[:x].cross_join(Sequel[:x].as(:q)).with(:x, @db[:cm_cte_items], :materialized=>true, :materialized_requirement=>:require)
+    ds.cte_materialization_violations.must_equal []
+    ds.count.must_equal 9
+  end
+
+  it "should generate valid SQL for a NOT MATERIALIZED recursive CTE" do
+    ds = @db[:t].
+      with_recursive(:t, @db[:cm_cte_items].where(:a=>1).select(Sequel.as(1, :a)),
+        @db[:t].where{Sequel[:t][:a] < 3}.select(Sequel.as(Sequel[:t][:a] + 1, :a)),
+        :args=>[:a], :materialized=>false)
+    ds.sql.must_include 'AS NOT MATERIALIZED'
+    ds.select_order_map(:a).must_equal [1, 2, 3]
+  end
+
+  it "should generate valid SQL for a MATERIALIZED recursive CTE with multiple references" do
+    ds = @db[:t].
+      with_recursive(:t, @db[:cm_cte_items].where(:a=>1).select(Sequel.as(1, :a)),
+        @db[:t].where{Sequel[:t][:a] < 3}.select(Sequel.as(Sequel[:t][:a] + 1, :a)),
+        :args=>[:a], :materialized=>true)
+    ds.sql.must_include 'AS MATERIALIZED'
+    ds.cross_join(Sequel[:t].as(:q)).count.must_equal 9
+  end
+
+  it "should generate valid SQL for a CTE body with side effects" do
+    ds = @db[:x].with(:x, @db.select(Sequel.function(:abs, -1).as(:a)), :materialized=>true)
+    ds.sql.must_include 'AS MATERIALIZED'
+    ds.get(:a).must_equal 1
+    ds.cte_materialization_plan.first[:side_effects].must_equal false
+    ds2 = @db[:x].with(:x, @db.select(Sequel.function(:random).as(:a)), :materialized=>true)
+    ds2.cte_materialization_plan.first[:side_effects].must_equal true
+    ds2.get(:a).must_be_kind_of Integer
+  end
+
+  it "should not leak a hint to a shadowing inner CTE with the same name" do
+    inner = @db[:cm_cte_items].with(:x, @db[:cm_cte_items], :materialized=>true)
+    ds = @db[:x].with(:x, inner, :materialized=>false)
+    ds.sql.scan('AS NOT MATERIALIZED').length.must_equal 1
+    ds.sql.scan('AS MATERIALIZED').length.must_equal 1
+    ds.all.length.must_equal 3
+    ds.cte_materialization_plan.length.must_equal 1
+    ds.cte_materialization_plan.first[:name].must_equal :x
+    ds.cte_materialization_plan.first[:hint].must_equal true
+  end
+end if DB.sqlite_version >= 30803
+
 # Force a separate Database object for these tests, so SQLite regexp support is always
 # tested if testing the sqlite adapter.
 describe 'Regexp support' do

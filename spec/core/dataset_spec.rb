@@ -4870,6 +4870,311 @@ describe "Dataset#with and #with_recursive" do
   end
 end
 
+describe "Dataset#cte_materialization_plan" do
+  before do
+    @db = Sequel.mock(:host=>'sqlite')
+    @db.instance_variable_set(:@sqlite_version, 33500)
+  end
+
+  it "should support CTE materialization hints by default" do
+    Sequel::Dataset.new(@db).supports_cte_materialization?.must_equal true
+    Sequel::Dataset.new(@db).supports_cte_materialization?(:inline).must_equal true
+  end
+
+  it "should be true on PostgreSQL 12+ and SQLite 3.35+" do
+    Sequel.mock(:host=>'postgres').dataset.supports_cte_materialization?.must_equal true
+    @db.dataset.supports_cte_materialization?.must_equal true
+    @db.instance_variable_set(:@sqlite_version, 33400)
+    @db.dataset.supports_cte_materialization?.must_equal false
+  end
+
+  it "should return an empty array if there are no CTEs" do
+    @db[:t].cte_materialization_plan.must_equal []
+    @db[:t].cte_materialization_violations.must_equal []
+  end
+
+  it "should list each CTE's intent, support, and final form" do
+    ds = @db[:t].with(:a, @db[:x]).with(:b, @db[:x], :materialized=>true).with(:c, @db[:x], :materialized=>false)
+    plan = ds.cte_materialization_plan
+    plan.map{|h| h[:name]}.must_equal [:a, :b, :c]
+    plan.map{|h| h[:intent]}.must_equal [:default, :materialize, :inline]
+    plan.map{|h| h[:form]}.must_equal [:default, :materialize, :inline]
+    plan.map{|h| h[:supported]}.must_equal [true, true, true]
+    plan.map{|h| h[:hint]}.must_equal [false, true, true]
+    plan.map{|h| h[:reason]}.must_equal [:default, :honored, :honored]
+    plan.map{|h| h[:requirement]}.must_equal [:prefer, :prefer, :prefer]
+    plan.each{|h| h[:violates_requirement].must_equal false}
+    plan.map{|h| h[:recursive]}.must_equal [false, false, false]
+  end
+
+  it "should not emit hints when the backend does not support them" do
+    @db.instance_variable_set(:@sqlite_version, 33400)
+    ds = @db[:t].with(:a, @db[:x], :materialized=>true)
+    plan = ds.cte_materialization_plan
+    plan.length.must_equal 1
+    plan.first[:supported].must_equal false
+    plan.first[:form].must_equal :default
+    plan.first[:hint].must_equal false
+    plan.first[:reason].must_equal :backend_unsupported
+    ds.sql.must_equal 'WITH `a` AS (SELECT * FROM `x`) SELECT * FROM `t`'
+  end
+
+  it "should treat :materialize and :inline symbols as aliases for true and false" do
+    @db[:t].with(:a, @db[:x], :materialized=>:materialize).cte_materialization_plan.first[:intent].must_equal :materialize
+    @db[:t].with(:a, @db[:x], :materialized=>:inline).cte_materialization_plan.first[:intent].must_equal :inline
+    @db[:t].with(:a, @db[:x], :materialized=>:materialize).sql.must_equal 'WITH `a` AS MATERIALIZED (SELECT * FROM `x`) SELECT * FROM `t`'
+    @db[:t].with(:a, @db[:x], :materialized=>:inline).sql.must_equal 'WITH `a` AS NOT MATERIALIZED (SELECT * FROM `x`) SELECT * FROM `t`'
+  end
+
+  it "should raise an error for invalid :materialized and :materialized_requirement options" do
+    proc{@db[:t].with(:a, @db[:x], :materialized=>:maybe)}.must_raise Sequel::Error
+    proc{@db[:t].with(:a, @db[:x], :materialized_requirement=>:always)}.must_raise Sequel::Error
+    proc{@db[:t].with_recursive(:a, @db[:x], @db[:x], :materialized_requirement=>:always)}.must_raise Sequel::Error
+  end
+
+  it "should distinguish hard requirements from advisory requests" do
+    advisory = @db[:t].with(:a, @db[:x], :materialized=>false)
+    required = @db[:t].with(:a, @db[:x], :materialized=>false, :materialized_requirement=>:require)
+    advisory.cte_materialization_plan.first[:requirement].must_equal :prefer
+    required.cte_materialization_plan.first[:requirement].must_equal :require
+    advisory.cte_materialization_violations.must_equal []
+    required.cte_materialization_violations.must_equal []
+  end
+
+  it "should count only FROM and JOIN references to the CTE name" do
+    ds = @db[:x].cross_join(Sequel[:x].as(:q)).with(:x, @db[:y])
+    ds.cte_materialization_plan.first[:references].must_equal 2
+    @db[:t].with(:x, @db[:y]).cte_materialization_plan.first[:references].must_equal 0
+    @db[:x].with(:x, @db[:y]).cte_materialization_plan.first[:references].must_equal 1
+    @db[:t].join(:x, :a=>:b).with(:x, @db[:y]).cte_materialization_plan.first[:references].must_equal 1
+  end
+
+  it "should count references by other CTEs declared at the same level" do
+    ds = @db[:t].with(:x, @db[:y]).with(:z, @db[:w].from(:x))
+    ds.cte_materialization_plan.find{|h| h[:name] == :x}[:references].must_equal 1
+    ds = @db[:t].with(:x, @db[:y]).with(:z, @db[:w].from(:x)).from(:x)
+    ds.cte_materialization_plan.find{|h| h[:name] == :x}[:references].must_equal 2
+  end
+
+  it "should count references in subqueries that can see the CTE" do
+    ds = @db[:t].where(:id=>@db[:x].select(:id)).with(:x, @db[:y])
+    ds.cte_materialization_plan.first[:references].must_equal 1
+  end
+
+  it "should not count self-references in a recursive CTE's own definition" do
+    ds = @db[:t].with_recursive(:t, @db[:i1], @db[:i1].join(:t, :id=>:parent_id))
+    plan = ds.cte_materialization_plan.first
+    plan[:recursive].must_equal true
+    plan[:references].must_equal 1
+  end
+
+  it "should not leak refences from a shadowing inner CTE with the same name" do
+    inner = @db[:z].with(:x, @db[:w])
+    ds = @db[:t].from(:x).with(:x, inner)
+    plan = ds.cte_materialization_plan
+    plan.length.must_equal 1
+    plan.first[:references].must_equal 1
+    # The inner CTE is not part of the outer plan
+    plan.map{|h| h[:name]}.wont_include :w
+  end
+
+  it "should detect side effects in the CTE body" do
+    @db[:t].with(:a, @db[Sequel.function(:random).as(:r)]).cte_materialization_plan.first[:side_effects].must_equal true
+    @db[:t].with(:a, @db[:x].where(Sequel.function(:nextval, 's')=>1)).cte_materialization_plan.first[:side_effects].must_equal true
+    @db[:t].with(:a, @db[:x]).cte_materialization_plan.first[:side_effects].must_equal false
+    @db[:t].with(:a, @db[:x].select(Sequel.function(:abs, :a))).cte_materialization_plan.first[:side_effects].must_equal false
+  end
+
+  it "should mark a NOT MATERIALIZED hint as ignored by SQLite when there are multiple references" do
+    ds = @db[:x].cross_join(Sequel[:x].as(:q)).with(:x, @db[:y], :materialized=>false)
+    plan = ds.cte_materialization_plan.first
+    plan[:supported].must_equal false
+    plan[:form].must_equal :materialize
+    plan[:hint].must_equal true
+    plan[:reason].must_equal :ignored_by_backend
+    # Hint is still emitted, matching what the backend accepts syntactically
+    ds.sql.must_include 'AS NOT MATERIALIZED'
+  end
+
+  it "should honor a NOT MATERIALIZED hint for a single reference on SQLite" do
+    plan = @db[:x].with(:x, @db[:y], :materialized=>false).cte_materialization_plan.first
+    plan[:supported].must_equal true
+    plan[:form].must_equal :inline
+    plan[:reason].must_equal :honored
+  end
+
+  it "should always honor a MATERIALIZED hint on SQLite" do
+    ds = @db[:x].cross_join(Sequel[:x].as(:q)).with(:x, @db[:y], :materialized=>true)
+    plan = ds.cte_materialization_plan.first
+    plan[:supported].must_equal true
+    plan[:form].must_equal :materialize
+    plan[:reason].must_equal :honored
+  end
+
+  it "should not emit hints backed by a database that does not support them, even for CTE bodies with side effects" do
+    db = Sequel.mock(:host=>'postgres')
+    db.server_version = 110000
+    ds = db[:t].with(:a, db.select(Sequel.function(:random).as(:r)), :materialized=>true)
+    plan = ds.cte_materialization_plan.first
+    plan[:side_effects].must_equal true
+    plan[:supported].must_equal false
+    plan[:reason].must_equal :backend_unsupported
+    ds.sql.must_equal 'WITH "a" AS (SELECT random() AS "r") SELECT * FROM "t"'
+  end
+
+  it "should mark a NOT MATERIALIZED hint as ignored by PostgreSQL for recursive CTEs and CTE bodies with side effects" do
+    db = Sequel.mock(:host=>'postgres')
+    db.server_version = 120000
+    rec = db[:t].with_recursive(:t, db[:i1], db[:i1].join(:t, :id=>:parent_id), :materialized=>false)
+    rec_plan = rec.cte_materialization_plan.first
+    rec_plan[:supported].must_equal false
+    rec_plan[:reason].must_equal :ignored_by_backend
+    rec_plan[:form].must_equal :materialize
+    rec_plan[:hint].must_equal true
+
+    sfx = db[:t].with(:a, db.select(Sequel.function(:random).as(:r)), :materialized=>false)
+    sfx_plan = sfx.cte_materialization_plan.first
+    sfx_plan[:side_effects].must_equal true
+    sfx_plan[:supported].must_equal false
+    sfx_plan[:reason].must_equal :ignored_by_backend
+
+    proc{db[:t].with_recursive(:t, db[:i1], db[:i1].join(:t, :id=>:parent_id), :materialized=>false, :materialized_requirement=>:require).all}.must_raise Sequel::UnsupportedCTEMaterialization
+  end
+
+  it "should honor a NOT MATERIALIZED hint on PostgreSQL for a side-effect free, non-recursive CTE" do
+    db = Sequel.mock(:host=>'postgres')
+    db.server_version = 120000
+    plan = db[:t].with(:a, db[:y], :materialized=>false).cte_materialization_plan.first
+    plan[:supported].must_equal true
+    plan[:reason].must_equal :honored
+  end
+
+  it "should reject a hard requirement before executing when the backend cannot honor it" do
+    @db.instance_variable_set(:@sqlite_version, 33400)
+    ds = @db[:t].with(:a, @db[:x], :materialized=>true, :materialized_requirement=>:require)
+    e = proc{ds.all}.must_raise Sequel::UnsupportedCTEMaterialization
+    e.dataset.must_be_same_as ds
+    e.violations.length.must_equal 1
+    e.violations.first[:name].must_equal :a
+    e.violations.first[:reason].must_equal :backend_unsupported
+    @db.sqls.must_equal []
+  end
+
+  it "should reject a hard NOT MATERIALIZED requirement with multiple references on SQLite before executing" do
+    ds = @db[:x].cross_join(Sequel[:x].as(:q)).with(:x, @db[:y], :materialized=>false, :materialized_requirement=>:require)
+    proc{ds.all}.must_raise Sequel::UnsupportedCTEMaterialization
+    @db.sqls.must_equal []
+  end
+
+  it "should reject a hard requirement declared by a nested dataset's CTE before executing" do
+    inner = @db[:z].with(:x, @db[:w], :materialized=>true, :materialized_requirement=>:require)
+    outer = @db[:t].where(:id=>inner.select(:id))
+    inner.instance_variable_get(:@db)
+    outer_db = @db
+    outer_db.instance_variable_set(:@sqlite_version, 33400)
+    proc{outer.all}.must_raise Sequel::UnsupportedCTEMaterialization
+    outer_db.sqls.must_equal []
+  end
+
+  it "should not raise for advisory requests the backend cannot honor" do
+    @db.instance_variable_set(:@sqlite_version, 33400)
+    ds = @db[:t].with(:a, @db[:x], :materialized=>true)
+    ds.cte_materialization_violations.must_equal []
+    ds.all.must_equal []
+    @db.sqls.length.must_equal 1
+  end
+
+  it "should allow a hard requirement that the backend can honor" do
+    ds = @db[:t].with(:a, @db[:x], :materialized=>true, :materialized_requirement=>:require)
+    ds.cte_materialization_violations.must_equal []
+    ds.all.must_equal []
+    @db.sqls.must_equal ['WITH `a` AS MATERIALIZED (SELECT * FROM `x`) SELECT * FROM `t`']
+  end
+
+  it "should expose the plan without modifying the dataset or executing SQL" do
+    ds = @db[:t].with(:a, @db[:x], :materialized=>true)
+    ds.cte_materialization_plan
+    @db.sqls.must_equal []
+    ds.sql.must_equal 'WITH `a` AS MATERIALIZED (SELECT * FROM `x`) SELECT * FROM `t`'
+  end
+
+  it "should support plan entries for recursive CTEs with a materialization request" do
+    ds = @db[:t].with_recursive(:t, @db[:i1], @db[:i1].join(:t, :id=>:parent_id), :materialized=>true)
+    plan = ds.cte_materialization_plan.first
+    plan[:recursive].must_equal true
+    plan[:intent].must_equal :materialize
+    plan[:supported].must_equal true
+    ds.sql.must_include 'AS MATERIALIZED'
+  end
+
+  it "should treat :materialized on with_recursive the same as with" do
+    plan = @db[:t].with_recursive(:t, @db[:i1], @db[:i1].join(:t, :id=>:parent_id), :materialized=>false, :materialized_requirement=>:require).cte_materialization_plan.first
+    plan[:requirement].must_equal :require
+    plan[:recursive].must_equal true
+    plan[:supported].must_equal true
+  end
+
+  it "should handle non-symbol CTE names and identifier sources" do
+    ds = @db.from(Sequel.identifier(:x)).with('x', @db[:y])
+    plan = ds.cte_materialization_plan.first
+    plan[:name].must_equal 'x'
+    plan[:references].must_equal 1
+  end
+
+  it "should support adapter specific hint ignoring rules" do
+    db = Sequel.mock(:host=>'sqlite')
+    db.instance_variable_set(:@sqlite_version, 33500)
+    db.extend_datasets do
+      def ignores_cte_materialization_hint?(intent, _)
+        intent == :materialize
+      end
+    end
+    plan = db[:t].with(:a, db[:y], :materialized=>true, :materialized_requirement=>:require).cte_materialization_plan.first
+    plan[:supported].must_equal false
+    plan[:form].must_equal :default
+    plan[:reason].must_equal :ignored_by_backend
+    proc{db[:t].with(:a, db[:y], :materialized=>true, :materialized_requirement=>:require).all}.must_raise Sequel::UnsupportedCTEMaterialization
+  end
+
+  it "should find nested datasets in hash and array option values" do
+    db = Sequel.mock(:host=>'postgres')
+    db.server_version = 110000
+    nested = db[:z].with(:x, db[:w], :materialized=>true, :materialized_requirement=>:require)
+    ds = db[:t].where([[:id, [1, 2]], [:id, nested.select(:id)]])
+    ds.send(:_cte_nested_required_requirement?).must_equal true
+    proc{ds.all}.must_raise Sequel::UnsupportedCTEMaterialization
+  end
+
+  it "should not count references from nested dataset scopes shadowed by a different declared CTE" do
+    inner = @db.from(:x).with(:x, @db[:w])
+    ds = @db[:t].from(inner, :x).with(:x, @db[:y])
+    ds.cte_materialization_plan.first[:references].must_equal 1
+  end
+
+  it "should expose the plan while remaining compatible with dataset freezing" do
+    ds = @db[:t].with(:a, @db[:x], :materialized=>true, :materialized_requirement=>:require)
+    ds.freeze
+    ds.cte_materialization_plan.first[:supported].must_equal true
+    ds.cte_materialization_violations.must_equal []
+  end
+
+  it "should allow customizing the side effect function list per dataset" do
+    db = Sequel.mock(:host=>'postgres')
+    db.server_version = 120000
+    db.extend_datasets do
+      def cte_side_effect_functions
+        super + [:my_volatile_fn]
+      end
+    end
+    plan = db[:t].with(:a, db.select(Sequel.function(:my_volatile_fn).as(:r)), :materialized=>false).cte_materialization_plan.first
+    plan[:side_effects].must_equal true
+    plan[:supported].must_equal false
+    plan[:reason].must_equal :ignored_by_backend
+    # Functions not in the list are not considered side-effecting
+    db[:t].with(:a, db[:x], :materialized=>false).cte_materialization_plan.first[:side_effects].must_equal false
+  end
+end
+
 describe "Dataset#window" do
   before do
     @db = Sequel.mock

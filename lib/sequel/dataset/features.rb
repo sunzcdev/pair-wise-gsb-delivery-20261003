@@ -56,6 +56,48 @@ module Sequel
       false
     end
 
+    # Whether the dataset supports CTE materialization hints in the generated
+    # SQL, true by default (for backwards compatibility with adapters that
+    # do not override this method).  +form+ can be :materialize for
+    # <tt>WITH cte AS MATERIALIZED (...)</tt>, or :inline for
+    # <tt>WITH cte AS NOT MATERIALIZED (...)</tt>.  Both forms are supported by
+    # the same databases (PostgreSQL 12+, SQLite 3.35+), so adapters generally
+    # only need to override this method if the database supports one form but
+    # not the other.  This controls both whether the hint is emitted and
+    # whether Dataset#cte_materialization_plan considers the hint supported.
+    # Built-in adapters whose databases do not support the hints override this
+    # to return false.
+    def supports_cte_materialization?(form=:materialize)
+      true
+    end
+
+    # Whether the database ignores the given CTE materialization hint for a
+    # CTE with the given details, even though the hint is syntactically
+    # supported.  +intent+ is :materialize or :inline, and +details+ is a hash
+    # with the :recursive, :references, and :side_effects keys described in
+    # Dataset#cte_materialization_plan.  False by default.
+    def ignores_cte_materialization_hint?(intent, details)
+      false
+    end
+
+    # The form the database effectively uses when it ignores the given CTE
+    # materialization hint (see #ignores_cte_materialization_hint?).  This is
+    # used for the :form entry in Dataset#cte_materialization_plan.  :default
+    # by default, meaning the backend falls back to its normal decision.
+    def cte_materialization_ignored_hint_form(intent, details)
+      :default
+    end
+
+    # The SQL function names that are considered to have side effects for the
+    # purpose of Dataset#cte_materialization_plan.  If a CTE body calls one of
+    # these functions, it is flagged as having side effects, since inlining an
+    # expression with side effects can change how many times it is evaluated.
+    # This is a conservative, name based list and is not exhaustive; adapters
+    # or applications can override it.
+    def cte_side_effect_functions
+      CTE_SIDE_EFFECT_FUNCTIONS
+    end
+
     # Whether deleting from joined datasets is supported, false by default.
     def supports_deleting_joins?
       supports_modifying_joins?

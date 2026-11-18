@@ -88,6 +88,30 @@ module Sequel
   ).name
 
   (
+  # Error raised before executing a query when a common table expression has
+  # a hard materialization requirement (via the :materialized_requirement=>:require
+  # CTE option) that the database cannot honor.  The +dataset+ attribute is the
+  # dataset whose query was rejected, and the +violations+ attribute is the
+  # subset of entries from Dataset#cte_materialization_plan that could not be
+  # honored.
+  class UnsupportedCTEMaterialization < Error
+    # The dataset whose query was rejected.
+    attr_reader :dataset
+
+    # The entries (hashes) from Dataset#cte_materialization_plan that
+    # represent hard requirements that could not be honored.
+    attr_reader :violations
+
+    def initialize(dataset, violations)
+      @dataset = dataset
+      @violations = violations
+      details = violations.map{|v| "#{v[:name].inspect} requested #{v[:intent].inspect} (#{v[:reason]})"}.join(', ')
+      super("Cannot honor required CTE materialization for #{details}")
+    end
+  end
+  ).name
+
+  (
   # Error raised on an invalid operation, such as trying to update or delete
   # a joined or grouped dataset when the database does not support that.
   InvalidOperation = Class.new(Error)

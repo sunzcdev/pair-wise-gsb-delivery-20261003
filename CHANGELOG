@@ -1,5 +1,7 @@
 === master
 
+* Add Dataset#cte_materialization_plan and #cte_materialization_violations, for inspecting how CTE materialization requests are handled, and add a :materialized_requirement=>:require CTE option to reject unsupported hard requirements before executing the query (jeremyevans)
+
 * Avoid duplicating table when adding/dropping CHECK or NOT NULL constraints on SQLite 3.53+ (jeremyevans)
 
 * Add Database#wait_for_lsn on PostgreSQL 19+ to support WAIT FOR LSN (jeremyevans)

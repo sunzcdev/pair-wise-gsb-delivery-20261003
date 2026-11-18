@@ -260,6 +260,11 @@ module Sequel
         type == :select
       end
 
+      # SQLAnywhere does not support CTE materialization hints.
+      def supports_cte_materialization?(form=:materialize)
+        false
+      end
+
       # SQLAnywhere supports GROUPING SETS
       def supports_grouping_sets?
         true

@@ -1254,6 +1254,7 @@ module Sequel
     # Execute the given select SQL on the database using execute. Use the
     # :read_only server unless a specific server is set.
     def execute(sql, opts=OPTS, &block)
+      _check_cte_materialization_requirements!
       db = @db
       if db.sharded? && !opts.has_key?(:server)
         opts = Hash[opts]
@@ -1271,11 +1272,13 @@ module Sequel
     
     # Execute the given SQL on the database using execute_dui.
     def execute_dui(sql, opts=OPTS, &block)
+      _check_cte_materialization_requirements!
       @db.execute_dui(sql, default_server_opts(opts), &block)
     end
     
     # Execute the given SQL on the database using execute_insert.
     def execute_insert(sql, opts=OPTS, &block)
+      _check_cte_materialization_requirements!
       @db.execute_insert(sql, default_server_opts(opts), &block)
     end
     

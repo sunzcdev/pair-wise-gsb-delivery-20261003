@@ -498,6 +498,74 @@ describe "Sequel Mock Adapter" do
     Sequel.mock(:host=>'mysql', :fetch=>{:Field=>'a'}).schema(:a).first.first.must_equal :a
   end
 
+  describe "CTE materialization hints" do
+    def sql_for(host, extra_opts={})
+      db = Sequel.mock(:host=>host)
+      db[:t].with(:x, db[:y], extra_opts).sql
+    end
+
+    it "should be accepted and emitted on PostgreSQL 12+" do
+      sql_for('postgres', :materialized=>true).must_equal 'WITH "x" AS MATERIALIZED (SELECT * FROM "y") SELECT * FROM "t"'
+      sql_for('postgres', :materialized=>false).must_equal 'WITH "x" AS NOT MATERIALIZED (SELECT * FROM "y") SELECT * FROM "t"'
+      db = Sequel.mock(:host=>'postgres')
+      db[:t].with(:x, db[:y]).cte_materialization_plan.first[:reason].must_equal :default
+    end
+
+    it "should be rejected (omitted) on PostgreSQL before 12" do
+      db = Sequel.mock(:host=>'postgres')
+      db.server_version = 110000
+      ds = db[:t].with(:x, db[:y], :materialized=>true)
+      ds.sql.must_equal 'WITH "x" AS (SELECT * FROM "y") SELECT * FROM "t"'
+      plan = ds.cte_materialization_plan.first
+      plan[:supported].must_equal false
+      plan[:reason].must_equal :backend_unsupported
+      plan[:hint].must_equal false
+      plan[:form].must_equal :default
+      proc{ds.with(:x, db[:y], :materialized=>true, :materialized_requirement=>:require).all}.must_raise Sequel::UnsupportedCTEMaterialization
+    end
+
+    it "should be accepted and emitted on SQLite 3.35+" do
+      db = Sequel.mock(:host=>'sqlite')
+      db.instance_variable_set(:@sqlite_version, 33500)
+      db[:t].with(:x, db[:y], :materialized=>true).sql.must_equal 'WITH `x` AS MATERIALIZED (SELECT * FROM `y`) SELECT * FROM `t`'
+      db[:t].with(:x, db[:y], :materialized=>false).sql.must_equal 'WITH `x` AS NOT MATERIALIZED (SELECT * FROM `y`) SELECT * FROM `t`'
+    end
+
+    it "should be rejected (omitted) on SQLite before 3.35" do
+      db = Sequel.mock(:host=>'sqlite')
+      db.instance_variable_set(:@sqlite_version, 33400)
+      ds = db[:t].with(:x, db[:y], :materialized=>true)
+      ds.sql.must_equal 'WITH `x` AS (SELECT * FROM `y`) SELECT * FROM `t`'
+      ds.cte_materialization_plan.first[:reason].must_equal :backend_unsupported
+      proc{db[:t].with(:x, db[:y], :materialized=>true, :materialized_requirement=>:require).all}.must_raise Sequel::UnsupportedCTEMaterialization
+    end
+
+    it "should be rejected (omitted) on MySQL 8+ and MariaDB 10.2+" do
+      db = Sequel.mock(:host=>'mysql')
+      db.server_version = 80000
+      ds = db[:t].with(:x, db[:y], :materialized=>true)
+      ds.supports_cte?.must_equal true
+      ds.supports_cte_materialization?.must_equal false
+      ds.sql.must_equal 'WITH `x` AS (SELECT * FROM `y`) SELECT * FROM `t`'
+      ds.cte_materialization_plan.first[:reason].must_equal :backend_unsupported
+      proc{db[:t].with(:x, db[:y], :materialized=>true, :materialized_requirement=>:require).all}.must_raise Sequel::UnsupportedCTEMaterialization
+    end
+
+    it "should be rejected (omitted) on other built-in dialects that do not support them" do
+      {'mssql'=>'WITH [X] AS (SELECT * FROM [Y]) SELECT * FROM [T]',
+       'db2'=>'WITH X AS (SELECT * FROM Y) SELECT * FROM T',
+       'oracle'=>'WITH "X" AS (SELECT * FROM "Y") SELECT * FROM "T"',
+       'sqlanywhere'=>'WITH "X" AS (SELECT * FROM "Y") SELECT * FROM "T"'}.each do |host, expected_sql|
+        db = Sequel.mock(:host=>host)
+        ds = db[:t].with(:x, db[:y], :materialized=>true)
+        ds.supports_cte_materialization?.must_equal false
+        ds.sql.must_equal expected_sql
+        ds.cte_materialization_plan.first[:reason].must_equal :backend_unsupported
+        proc{db[:t].with(:x, db[:y], :materialized=>true, :materialized_requirement=>:require).all}.must_raise Sequel::UnsupportedCTEMaterialization
+      end
+    end
+  end
+
   it "should automatically set version for adapters needing versions" do
     Sequel.mock(:host=>'postgres').server_version.must_be :>=, 90400
     Sequel.mock(:host=>'mssql').server_version.must_be :>=, 11000000

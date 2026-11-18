@@ -831,6 +831,23 @@ module Sequel
         supports_cte?
       end
 
+      # SQLite 3.35+ supports the MATERIALIZED and NOT MATERIALIZED CTE hints.
+      def supports_cte_materialization?(form=:materialize)
+        db.sqlite_version >= 33500
+      end
+
+      # SQLite ignores the NOT MATERIALIZED hint if the CTE is used more than
+      # once in the query, and materializes it instead.  It honors the hint for
+      # CTEs used exactly once, even if the CTE body has side effects.
+      def ignores_cte_materialization_hint?(intent, details)
+        intent == :inline && details[:references] > 1
+      end
+
+      # SQLite materializes a CTE when it ignores a NOT MATERIALIZED hint.
+      def cte_materialization_ignored_hint_form(intent, details)
+        intent == :inline ? :materialize : :default
+      end
+
       # SQLite does not support table aliases with column aliases
       def supports_derived_column_lists?
         false

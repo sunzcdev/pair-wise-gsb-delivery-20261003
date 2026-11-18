@@ -904,6 +904,32 @@ if DB.dataset.supports_cte?
       @db[:t].with(:t, @ds, :materialized=>true).order(:id).map(:id).must_equal [1, 2, 3, 4, 5, 6]
       @db[:t].with(:t, @ds, :materialized=>false).order(:id).map(:id).must_equal [1, 2, 3, 4, 5, 6]
     end if (DB.database_type == :postgres && DB.server_version >= 120000) || (DB.database_type == :sqlite && DB.sqlite_version > 33500)
+
+    it "should have a materialization plan that reflects the backend" do
+      plan = @db[:t].with(:t, @ds, :materialized=>true).cte_materialization_plan
+      plan.length.must_equal 1
+      plan.first[:name].must_equal :t
+      plan.first[:intent].must_equal :materialize
+      plan.first[:supported].must_equal @db[:t].supports_cte_materialization?(:materialize)
+
+      if @db[:t].supports_cte_materialization?(:materialize)
+        plan.first[:form].must_equal :materialize
+        plan.first[:reason].must_equal :honored
+        @db[:t].with(:t, @ds, :materialized=>true).order(:id).map(:id).must_equal [1, 2, 3, 4, 5, 6]
+      else
+        plan.first[:form].must_equal :default
+        plan.first[:reason].must_equal :backend_unsupported
+      end
+    end
+
+    it "should reject a hard materialization requirement the backend cannot honor" do
+      ds = @db[:t].with(:t, @ds, :materialized=>true, :materialized_requirement=>:require)
+      if @db[:t].supports_cte_materialization?(:materialize)
+        ds.order(:id).map(:id).must_equal [1, 2, 3, 4, 5, 6]
+      else
+        proc{ds.all}.must_raise Sequel::UnsupportedCTEMaterialization
+      end
+    end
   end
 end
 

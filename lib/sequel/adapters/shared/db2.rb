@@ -333,6 +333,11 @@ module Sequel
         type == :select
       end
 
+      # DB2 does not support CTE materialization hints.
+      def supports_cte_materialization?(form=:materialize)
+        false
+      end
+
       # DB2 supports GROUP BY CUBE
       def supports_group_cube?
         true

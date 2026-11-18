@@ -1739,10 +1739,10 @@ module Sequel
       sql << ' AS '
 
       case w[:materialized]
-      when true
-        sql << "MATERIALIZED "
-      when false
-        sql << "NOT MATERIALIZED "
+      when true, :materialize
+        sql << "MATERIALIZED " if supports_cte_materialization?(:materialize)
+      when false, :inline
+        sql << "NOT MATERIALIZED " if supports_cte_materialization?(:inline)
       end
     end
 

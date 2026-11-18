@@ -879,6 +879,11 @@ module Sequel
         end
       end
 
+      # MySQL and MariaDB do not support CTE materialization hints.
+      def supports_cte_materialization?(form=:materialize)
+        false
+      end
+
       # MySQL does not support derived column lists
       def supports_derived_column_lists?
         false

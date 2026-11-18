@@ -460,6 +460,11 @@ module Sequel
         type == :select
       end
 
+      # Oracle does not support CTE materialization hints.
+      def supports_cte_materialization?(form=:materialize)
+        false
+      end
+
       # Oracle does not support derived column lists
       def supports_derived_column_lists?
         false

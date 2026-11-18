@@ -781,6 +781,12 @@ module Sequel
         is_2005_or_later?
       end
 
+      # Microsoft SQL Server does not support CTE materialization hints, so
+      # they are omitted from the generated SQL.
+      def supports_cte_materialization?(form=:materialize)
+        false
+      end
+
       # MSSQL 2005+ supports GROUP BY CUBE.
       def supports_group_cube?
         is_2005_or_later?

@@ -78,6 +78,43 @@ locking:: for_update, lock_style
 common table expressions:: with, with_recursive
 other:: distinct, naked, qualify, server, with_sql
 
+=== CTE materialization requirements
+
+When adding a common table expression with +with+ or +with_recursive+, you can
+request a materialization form using the +:materialized+ option (true or
++:materialize+ for <tt>AS MATERIALIZED</tt>, false or +:inline+ for
+<tt>AS NOT MATERIALIZED</tt>).  By default this is only a request, and the hint
+is omitted from the generated SQL if the database does not support it:
+
+  DB[:t].with(:x, DB[:y], materialized: true)
+  # WITH x AS MATERIALIZED (SELECT * FROM y) SELECT * FROM t
+
+Use +Dataset#cte_materialization_plan+ to inspect, without executing any SQL,
+how the requests for each CTE declared on the dataset are handled.  Each entry
+lists the requested +:intent+, whether it is a hard +:requirement+ or only
+advisory (+:prefer+), whether the backend +:supported+ it, and the final
++:form+ and +:reason+.  Only CTEs declared on the receiving dataset are
+reported, so a hint never leaks to a shadowing inner definition with the same
+name.
+
+If a requirement must be honored, pass
+<tt>:materialized_requirement=>:require</tt>.  When the database cannot honor
+it, executing the dataset raises Sequel::UnsupportedCTEMaterialization before
+any SQL is sent to the database.  The exception exposes the +dataset+ and the
+offending +violations+.
+
+  ds = DB[:t].with(:x, DB[:y], materialized: true, materialized_requirement: :require)
+  ds.cte_materialization_plan
+  # [{name: :x, intent: :materialize, requirement: :require, supported: true, ...}]
+
+The support scope covers recursive CTEs, CTEs with multiple references, and
+CTE bodies containing functions with side effects.  SQLite 3.35+ honors
+MATERIALIZED always, and NOT MATERIALIZED only when the CTE is referenced
+exactly once.  PostgreSQL 12+ honors MATERIALIZED always, and NOT MATERIALIZED
+except for recursive CTEs or CTE bodies with side effects.  Other dialects,
+and older versions of these dialects, do not support the hints, so advisory
+requests are omitted and hard requirements are rejected.
+
 === Methods that execute code on the database
 
 Most other dataset methods commonly used will execute the dataset's SQL on the database:

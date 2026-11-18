@@ -24,6 +24,15 @@ module Sequel
     # Which options don't affect the SQL generation.  Used by simple_select_all?
     # to determine if this is a simple SELECT * FROM table.
     NON_SQL_OPTIONS = [:server, :graph, :row_proc, :quote_identifiers, :skip_symbol_cache].freeze
+
+    # SQL function names that are conservatively considered to have side effects
+    # when used in a CTE body.  See Dataset#cte_side_effect_functions.
+    CTE_SIDE_EFFECT_FUNCTIONS = [:random, :rand, :uuid, :gen_random_uuid, :nextval, :currval, :setval,
+      :lastval, :setseed, :clock_timestamp, :timeofday, :pg_sleep, :sleep, :last_insert_rowid,
+      :last_insert_id, :unixepoch].each(&:freeze).freeze
+
+    # Valid values for the :materialized_requirement CTE option.
+    CTE_MATERIALIZATION_REQUIREMENTS = [:require, :prefer].freeze
     
     # These symbols have _join methods created (e.g. inner_join) that
     # call join_table with the symbol, passing along the arguments and
@@ -1143,12 +1152,24 @@ module Sequel
     # :args :: Specify the arguments/columns for the CTE, should be an array of symbols.
     # :recursive :: Specify that this is a recursive CTE
     # :materialized :: Set to false to force inlining of the CTE, or true to force not inlining
-    #                  the CTE (PostgreSQL 12+/SQLite 3.35+).
+    #                  the CTE (PostgreSQL 12+/SQLite 3.35+).  The :materialize and :inline
+    #                  symbols are also accepted as aliases for true and false.  This is
+    #                  only a request unless :materialized_requirement is set to :require.
+    # :materialized_requirement :: Set to :require to make the :materialized option a hard
+    #                              requirement.  If the database cannot honor the requirement,
+    #                              execution of the dataset raises UnsupportedCTEMaterialization
+    #                              before any SQL is sent to the database.  The default is
+    #                              :prefer, where the materialization hint is advisory and is
+    #                              omitted from the generated SQL if it cannot be honored.
     #
     #   DB[:items].with(:items, DB[:syx].where(Sequel[:name].like('A%')))
     #   # WITH items AS (SELECT * FROM syx WHERE (name LIKE 'A%' ESCAPE '\')) SELECT * FROM items
+    #
+    # See #cte_materialization_plan for a way to inspect how the materialization
+    # requests are handled for each CTE.
     def with(name, dataset, opts=OPTS)
       raise(Error, 'This dataset does not support common table expressions') unless supports_cte?
+      _validate_cte_materialization_options!(name, opts)
       if hoist_cte?(dataset)
         s, ds = hoist_cte(dataset)
         s.with(name, ds, opts)
@@ -1164,6 +1185,11 @@ module Sequel
     # Options:
     # :args :: Specify the arguments/columns for the CTE, should be an array of symbols.
     # :union_all :: Set to false to use UNION instead of UNION ALL combining the nonrecursive and recursive parts.
+    # :materialized :: Set to false to force inlining of the CTE, or true to force not inlining
+    #                  the CTE.  The :materialize and :inline symbols are also accepted as
+    #                  aliases for true and false.
+    # :materialized_requirement :: Set to :require to make the :materialized option a hard
+    #                              requirement, see #with for details.
     #
     # PostgreSQL 14+ Options:
     # :cycle :: Stop recursive searching when a cycle is detected. Includes two columns in the
@@ -1215,6 +1241,7 @@ module Sequel
     #   # SELECT * FROM t
     def with_recursive(name, nonrecursive, recursive, opts=OPTS)
       raise(Error, 'This dataset does not support common table expressions') unless supports_cte?
+      _validate_cte_materialization_options!(name, opts)
       if hoist_cte?(nonrecursive)
         s, ds = hoist_cte(nonrecursive)
         s.with_recursive(name, ds, recursive, opts)
@@ -1224,6 +1251,115 @@ module Sequel
       else
         clone(:with=>((@opts[:with]||EMPTY_ARRAY) + [Hash[opts].merge!(:recursive=>true, :name=>name, :dataset=>nonrecursive.union(recursive, {:all=>opts[:union_all] != false, :from_self=>false}))]).freeze)
       end
+    end
+
+    # Return the list of materialization requirements for the common table
+    # expressions declared directly on this dataset (via #with or
+    # #with_recursive), in the order they were declared.  This is an
+    # inspection entry point, and does not modify the dataset or execute any
+    # SQL.
+    #
+    # Each entry is a hash with the following keys:
+    #
+    # :name :: The CTE name, as declared.
+    # :intent :: The requested form, :materialize (for <tt>:materialized=>true</tt>
+    #            or <tt>:materialized=>:materialize</tt>), :inline (for
+    #            <tt>:materialized=>false</tt> or <tt>:materialized=>:inline</tt>),
+    #            or :default if no materialization was requested.
+    # :requirement :: :require if the request is a hard requirement
+    #                 (<tt>:materialized_requirement=>:require</tt>), :prefer if
+    #                 it is only advisory (the default).
+    # :recursive :: Whether the CTE is recursive.
+    # :references :: The number of times the CTE is used as a table source in
+    #                the query (including by other CTEs declared at the same level).
+    # :side_effects :: Whether the CTE body contains a function known to be
+    #                  volatile (for example random or nextval).
+    # :supported :: Whether the database can honor the requested :intent.  Always
+    #               true for the :default intent, since there is nothing to honor.
+    # :form :: The form finally adopted: :materialize, :inline, or :default when
+    #          no materialization hint is used.  If the backend silently ignores
+    #          a hint, this is the form the backend will effectively use.
+    # :hint :: Whether a MATERIALIZED/NOT MATERIALIZED hint is present in the
+    #          generated SQL.
+    # :reason :: Why the final form was adopted.  One of :default (no request),
+    #            :honored (the backend honors the request), :ignored_by_backend
+    #            (the hint is emitted but the backend ignores it for this CTE), or
+    #            :backend_unsupported (the backend does not support the hint).
+    # :message :: A human readable explanation of the outcome.
+    # :violates_requirement :: Whether this entry is a hard requirement that the
+    #                          backend cannot honor.  If any entry is true, running
+    #                          the query raises UnsupportedCTEMaterialization
+    #                          before any SQL is sent to the database.
+    #
+    # Only CTEs declared on this dataset are considered, matching the scope of
+    # the generated WITH clause.  CTEs declared by nested datasets, including
+    # nested datasets that reuse the same CTE name, are not reported and do not
+    # influence the entries for this dataset.
+    def cte_materialization_plan
+      ctes = @opts[:with]
+      return EMPTY_ARRAY unless ctes && !ctes.empty?
+
+      ctes.map do |cte|
+        name = _cte_normalize_name(cte[:name])
+        intent = _cte_materialization_intent(cte[:materialized])
+        requirement = cte[:materialized_requirement] == :require ? :require : :prefer
+        recursive = !!cte[:recursive]
+        references = _cte_reference_count(name, ctes)
+        side_effects = _cte_side_effects?(cte[:dataset])
+        details = {:recursive=>recursive, :references=>references, :side_effects=>side_effects}
+
+        if intent == :default
+          supported = true
+          form = :default
+          hint = false
+          reason = :default
+          message = "No materialization was requested for CTE #{name.inspect}; the database decides."
+        elsif supports_cte_materialization?(intent)
+          hint = true
+          if ignores_cte_materialization_hint?(intent, details)
+            supported = false
+            form = cte_materialization_ignored_hint_form(intent, details)
+            reason = :ignored_by_backend
+            message = "The #{intent.inspect} hint for CTE #{name.inspect} is ignored by #{db.database_type} for #{_cte_ignored_hint_context(details)}."
+          else
+            supported = true
+            form = intent
+            reason = :honored
+            message = "#{db.database_type} honors the #{intent.inspect} hint for CTE #{name.inspect}."
+          end
+        else
+          supported = false
+          form = :default
+          hint = false
+          reason = :backend_unsupported
+          message = "#{db.database_type} does not support the #{intent.inspect} CTE materialization hint, so it is omitted from the generated SQL."
+        end
+
+        {
+          :name=>cte[:name],
+          :intent=>intent,
+          :requirement=>requirement,
+          :recursive=>recursive,
+          :references=>references,
+          :side_effects=>side_effects,
+          :supported=>supported,
+          :form=>form,
+          :hint=>hint,
+          :reason=>reason,
+          :message=>message,
+          :violates_requirement=>(requirement == :require && !supported),
+        }.freeze
+      end.freeze
+    end
+
+    # Return the entries from #cte_materialization_plan that are hard
+    # requirements (<tt>:materialized_requirement=>:require</tt>) the database
+    # cannot honor.  Running a query on a dataset with any violations raises
+    # UnsupportedCTEMaterialization before executing it.
+    def cte_materialization_violations
+      plan = cte_materialization_plan
+      return EMPTY_ARRAY if plan.empty?
+      plan.select{|entry| entry[:violates_requirement]}.freeze
     end
     
     if TRUE_FREEZE
@@ -1528,6 +1664,328 @@ module Sequel
     # Whether CTEs need to be hoisted from the given ds into the current ds.
     def hoist_cte?(ds)
       ds.is_a?(Dataset) && ds.opts[:with] && !supports_cte_in_subqueries?
+    end
+
+    # Validate the materialization related options passed to #with/#with_recursive,
+    # raising an Error for unsupported values.
+    def _validate_cte_materialization_options!(name, opts)
+      if opts.has_key?(:materialized)
+        _cte_materialization_intent(opts[:materialized], name)
+      end
+      if opts.has_key?(:materialized_requirement) && !CTE_MATERIALIZATION_REQUIREMENTS.include?(opts[:materialized_requirement])
+        raise Error, "invalid CTE :materialized_requirement option for #{name.inspect}: #{opts[:materialized_requirement].inspect} (valid values: #{CTE_MATERIALIZATION_REQUIREMENTS.map(&:inspect).join(', ')})"
+      end
+    end
+
+    # Convert a :materialized option value into the materialization intent,
+    # :materialize, :inline, or :default.  Raise an Error for unsupported values.
+    def _cte_materialization_intent(value, name=nil)
+      case value
+      when true, :materialize
+        :materialize
+      when false, :inline
+        :inline
+      when nil
+        :default
+      else
+        raise Error, "invalid CTE :materialized option#{name ? " for #{name.inspect}" : ''}: #{value.inspect} (valid values: true, false, :materialize, :inline, nil)"
+      end
+    end
+
+    # Normalize the CTE name to a symbol for comparison purposes.  Keeps SQL
+    # expression names (which cannot be referenced by name in the same way)
+    # unchanged so they only match themselves.
+    def _cte_normalize_name(name)
+      case name
+      when Symbol, String
+        name.to_sym
+      else
+        name
+      end
+    end
+
+    # The number of times the CTE with the given normalized name is used as a
+    # table source in the query defined by this dataset, including uses by
+    # other CTEs declared at the same level and uses in subqueries that can see
+    # the CTE.
+    #
+    # A nested scope that declares its own CTE of the same name shadows the
+    # declared CTE, so it is not traversed and does not contribute to the
+    # reference count for the declared CTE.
+    def _cte_reference_count(name, ctes)
+      count = _cte_references_in_dataset(self, name, [], true)
+      ctes.each do |cte|
+        # Skip the CTE's own definition, so references inside its body (such as
+        # the self-reference in a recursive CTE) are not counted as uses of the
+        # materialized result.
+        next if _cte_normalize_name(cte[:name]) == name
+        ds = cte[:dataset]
+        count += _cte_references_in_dataset(ds, name, [], false) if ds.is_a?(Dataset)
+      end
+      count
+    end
+
+    # Count references to the CTE name in the query defined by the given
+    # dataset.  If +root+ is true, the dataset is the one declaring the CTE, so
+    # its own WITH clause is not traversed (those CTEs are handled separately)
+    # and it does not shadow itself.  Nested scopes that declare their own CTE
+    # of the same name are treated as shadowing the declared CTE and are not
+    # traversed.
+    def _cte_references_in_dataset(ds, name, seen, root)
+      return 0 if seen.include?(ds.object_id)
+      seen << ds.object_id
+
+      opts = ds.opts
+      return 0 if !root && _cte_shadowed?(opts, name)
+
+      count = _cte_source_reference_count(opts, name)
+
+      opts.each do |k, v|
+        next if k == :with || NON_SQL_OPTIONS.include?(k)
+        count += _cte_value_reference_count(v, name, seen)
+      end
+      count
+    end
+
+    # Whether the given dataset declares a CTE shadowing the CTE with the given
+    # name, meaning that references inside the dataset refer to the shadowing
+    # CTE and not the declared CTE.
+    def _cte_shadowed?(opts, name)
+      Array(opts[:with]).any?{|cte| _cte_normalize_name(cte[:name]) == name}
+    end
+
+    # Count references to the CTE name in the given SQL value, descending into
+    # nested datasets that do not shadow the CTE.
+    def _cte_value_reference_count(v, name, seen)
+      case v
+      when Dataset
+        _cte_references_in_dataset(v, name, seen, false)
+      when SQL::Expression
+        v.class.comparison_attrs.inject(0){|sum, a| sum + _cte_value_reference_count(v.public_send(a), name, seen)}
+      when Array
+        return 0 if seen.include?(v.object_id)
+        seen << v.object_id
+        v.inject(0){|sum, x| sum + _cte_value_reference_count(x, name, seen)}
+      when Hash
+        return 0 if seen.include?(v.object_id)
+        seen << v.object_id
+        v.inject(0){|sum, (key, x)| sum + _cte_value_reference_count(key, name, seen) + _cte_value_reference_count(x, name, seen)}
+      else
+        0
+      end
+    end
+
+    # Count references to the CTE name in the FROM/JOIN sources and embedded
+    # datasets at the current level of the given dataset options.  Will not
+    # descend into nested datasets that declare their own CTE of the same name.
+    def _cte_source_reference_count(opts, name)
+      count = 0
+      Array(opts[:from]).each do |source|
+        count += _cte_source_matches?(source, name) ? 1 : 0
+      end
+      Array(opts[:join]).each do |join|
+        count += _cte_source_matches?(join.table, name) ? 1 : 0
+      end
+      count
+    end
+
+    # Whether the given table source refers to the CTE with the given name.
+    def _cte_source_matches?(source, name)
+      case source
+      when Symbol
+        _, table, _ = split_symbol(source)
+        table.to_sym == name
+      when SQL::QualifiedIdentifier
+        _cte_identifier_matches?(source.column, name)
+      when SQL::Identifier
+        _cte_identifier_matches?(source.value, name)
+      when SQL::AliasedExpression
+        _cte_source_matches?(source.expression, name)
+      else
+        false
+      end
+    end
+
+    # Whether the given identifier value matches the CTE name.
+    def _cte_identifier_matches?(value, name)
+      value.is_a?(Symbol) || value.is_a?(String) ? value.to_sym == name : false
+    end
+
+    # Whether the dataset defining a CTE body contains an expression that
+    # is conservatively considered to have side effects (a call to one of
+    # Dataset#cte_side_effect_functions).
+    def _cte_side_effects?(ds)
+      return false unless ds.is_a?(Dataset)
+      _cte_expression_has_side_effects?(ds.opts, [])
+    end
+
+    # Recursively check the values in the dataset options for function calls
+    # with side effects.
+    def _cte_expression_has_side_effects?(opts, seen)
+      return false if seen.include?(opts.object_id)
+      seen << opts.object_id
+      opts.any? do |k, v|
+        !NON_SQL_OPTIONS.include?(k) && _cte_value_has_side_effects?(v, seen)
+      end
+    end
+
+    # Recursively check an arbitrary SQL value for function calls with side effects.
+    def _cte_value_has_side_effects?(v, seen)
+      case v
+      when SQL::Function
+        _cte_side_effect_function?(v.name) || v.args.any?{|a| _cte_value_has_side_effects?(a, seen)}
+      when SQL::Expression
+        v.class.comparison_attrs.any?{|a| _cte_value_has_side_effects?(v.public_send(a), seen)}
+      when Array
+        _cte_container_has_side_effects?(v, seen){|x| _cte_value_has_side_effects?(x, seen)}
+      when Hash
+        _cte_container_has_side_effects?(v, seen){|k, x| _cte_value_has_side_effects?(k, seen) || _cte_value_has_side_effects?(x, seen)}
+      when Dataset
+        _cte_expression_has_side_effects?(v.opts, seen)
+      else
+        false
+      end
+    end
+
+    # Yield for each element of an Array or Hash, guarding against recursive
+    # data structures so this doesn't recurse infinitely.
+    def _cte_container_has_side_effects?(container, seen)
+      return false if seen.include?(container.object_id)
+      seen << container.object_id
+      if container.is_a?(Hash)
+        container.any?{|k, v| yield(k, v)}
+      else
+        container.any?{|v| yield(v)}
+      end
+    end
+
+    # Whether the given SQL function name is considered to have side effects.
+    def _cte_side_effect_function?(name)
+      cte_side_effect_functions.include?(name.to_sym)
+    end
+
+    # Human readable description of the context in which the backend ignores
+    # a CTE materialization hint.
+    def _cte_ignored_hint_context(details)
+      if details[:recursive]
+        "recursive CTEs used as a table source once"
+      elsif details[:references] > 1
+        "#{details[:references]} references to the CTE"
+      elsif details[:side_effects]
+        "this CTE body with side effects"
+      else
+        "this CTE"
+      end
+    end
+
+    # Raise UnsupportedCTEMaterialization if any CTE in the query represented
+    # by this dataset (including CTEs declared by datasets nested inside the
+    # query) has a hard materialization requirement that cannot be honored.
+    # Called before executing SQL for the dataset, so unsupported hard
+    # requirements are rejected before the query reaches the database.
+    def _check_cte_materialization_requirements!
+      ctes = @opts[:with]
+      if ctes && !ctes.empty?
+        return unless ctes.any?{|cte| cte[:materialized_requirement] == :require} || _cte_nested_required_requirement?
+      else
+        return unless _cte_nested_required_requirement?
+      end
+      violations = cache_get(:_cte_materialization_violations)
+      unless violations
+        violations = _cte_materialization_violations_in_query(self, [])
+        cache_set(:_cte_materialization_violations, violations)
+      end
+      unless violations.empty?
+        raise UnsupportedCTEMaterialization.new(self, violations)
+      end
+    end
+
+    # Whether any dataset nested in this dataset's query declares a CTE with
+    # a hard materialization requirement.  This allows skipping the full
+    # recursive check (and its allocations) for the common case where no hard
+    # requirements are used at all.
+    def _cte_nested_required_requirement?
+      cached = cache_get(:_cte_nested_required_requirement)
+      return cached unless cached.nil?
+      result = @opts.any? do |k, v|
+        next false if NON_SQL_OPTIONS.include?(k)
+        _cte_value_has_required_requirement?(v, [])
+      end
+      cache_set(:_cte_nested_required_requirement, result)
+      result
+    end
+
+    # Whether the given SQL value contains a dataset that declares a CTE with
+    # a hard materialization requirement.
+    def _cte_value_has_required_requirement?(v, seen)
+      case v
+      when Dataset
+        _cte_dataset_has_required_requirement?(v, seen)
+      when SQL::Expression
+        v.class.comparison_attrs.any?{|a| _cte_value_has_required_requirement?(v.public_send(a), seen)}
+      when Array, Hash
+        return false if seen.include?(v.object_id)
+        seen << v.object_id
+        if v.is_a?(Hash)
+          v.any?{|k, x| _cte_value_has_required_requirement?(k, seen) || _cte_value_has_required_requirement?(x, seen)}
+        else
+          v.any?{|x| _cte_value_has_required_requirement?(x, seen)}
+        end
+      else
+        false
+      end
+    end
+
+    # Whether the given dataset or any dataset nested in its query declares a
+    # CTE with a hard materialization requirement.
+    def _cte_dataset_has_required_requirement?(ds, seen)
+      return false if seen.include?(ds.object_id)
+      seen << ds.object_id
+      if (ctes = ds.opts[:with]) && ctes.any?{|cte| cte[:materialized_requirement] == :require}
+        return true
+      end
+      ds.opts.any? do |k, v|
+        next false if NON_SQL_OPTIONS.include?(k)
+        _cte_value_has_required_requirement?(v, seen)
+      end
+    end
+
+    # Return all hard materialization requirement violations for this dataset
+    # and any datasets nested inside its query, avoiding infinite recursion.
+    def _cte_materialization_violations_in_query(ds, seen)
+      return EMPTY_ARRAY if seen.include?(ds.object_id)
+      seen << ds.object_id
+      violations = ds.cte_materialization_violations.dup
+      ds.opts.each do |k, v|
+        next if NON_SQL_OPTIONS.include?(k)
+        _cte_collect_nested_datasets(v, seen) do |nested|
+          violations.concat(_cte_materialization_violations_in_query(nested, seen))
+        end
+      end
+      violations.empty? ? EMPTY_ARRAY : violations.freeze
+    end
+
+    # Yield each Dataset found in the given SQL value.
+    def _cte_collect_nested_datasets(v, seen)
+      case v
+      when Dataset
+        yield v
+      when SQL::Expression
+        v.class.comparison_attrs.each do |a|
+          _cte_collect_nested_datasets(v.public_send(a), seen){|nested| yield nested}
+        end
+      when Array
+        return if seen.include?(v.object_id)
+        seen << v.object_id
+        v.each{|x| _cte_collect_nested_datasets(x, seen){|nested| yield nested}}
+      when Hash
+        return if seen.include?(v.object_id)
+        seen << v.object_id
+        v.each do |key, x|
+          _cte_collect_nested_datasets(key, seen){|nested| yield nested}
+          _cte_collect_nested_datasets(x, seen){|nested| yield nested}
+        end
+      end
     end
 
     # Inverts the given order by breaking it into a list of column references

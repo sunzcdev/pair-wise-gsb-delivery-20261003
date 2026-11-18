@@ -171,6 +171,11 @@ module Sequel
           false
         end
 
+        # HSQLDB does not support CTE materialization hints.
+        def supports_cte_materialization?(form=:materialize)
+          false
+        end
+
         # HSQLDB does not support IS TRUE.
         def supports_is_true?
           false

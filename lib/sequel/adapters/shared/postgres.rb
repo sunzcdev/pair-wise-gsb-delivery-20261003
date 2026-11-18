@@ -2570,6 +2570,23 @@ module Sequel
         supports_cte?
       end
 
+      # PostgreSQL 12+ supports the MATERIALIZED and NOT MATERIALIZED CTE hints.
+      def supports_cte_materialization?(form=:materialize)
+        server_version >= 120000
+      end
+
+      # PostgreSQL always honors MATERIALIZED, but ignores NOT MATERIALIZED if
+      # the CTE is recursive or is not side-effect free, since merging such a
+      # CTE into the parent query would change its semantics.
+      def ignores_cte_materialization_hint?(intent, details)
+        intent == :inline && (details[:recursive] || details[:side_effects])
+      end
+
+      # PostgreSQL materializes a CTE when it ignores a NOT MATERIALIZED hint.
+      def cte_materialization_ignored_hint_form(intent, details)
+        intent == :inline ? :materialize : :default
+      end
+
       # DISTINCT ON is a PostgreSQL extension
       def supports_distinct_on?
         true
