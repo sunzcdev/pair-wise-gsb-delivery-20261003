@@ -61,7 +61,11 @@ from .exceptions import (
 )
 from .frame_buffer import FrameBuffer
 from .settings import ChangedSetting, SettingCodes, Settings
-from .stream import H2Stream, StreamClosedBy
+from .stream import (
+    ClosedStreamSummary,
+    H2Stream,
+    StreamClosedBy,
+)
 from .utilities import SizeLimitDict, guard_increment_window
 from .windows import WindowManager
 
@@ -319,7 +323,13 @@ class H2Connection:
     # The initial default value of SETTINGS_MAX_HEADER_LIST_SIZE.
     DEFAULT_MAX_HEADER_LIST_SIZE = 2**16
 
-    # Keep in memory limited amount of results for streams closes
+    # The default maximum number of closed-stream summaries kept in memory.
+    #
+    # A connection that processes very many short streams would otherwise
+    # accumulate per-stream bookkeeping for every stream that has ever
+    # closed. This value bounds that auxiliary state. It is a *default*: the
+    # effective limit comes from the ``max_closed_streams`` configuration
+    # option when one is set, and subclasses may still override this attribute.
     MAX_CLOSED_STREAMS = 2**16
 
     def __init__(self, config: H2Configuration | None = None) -> None:
@@ -392,9 +402,41 @@ class H2Connection:
         # Also used to determine whether we should consider a frame received
         # while a stream is closed as either a stream error or a connection
         # error.
-        self._closed_streams: dict[int, StreamClosedBy | None] = SizeLimitDict(
-            size_limit=self.MAX_CLOSED_STREAMS,
+        #
+        # Entries are compact, fixed-size ClosedStreamSummary objects: the full
+        # H2Stream (including any body data and decoded headers it referenced)
+        # is dropped as soon as the stream is retired. The dictionary is bounded
+        # by the ``max_closed_streams`` configuration option, falling back to
+        # this class's MAX_CLOSED_STREAMS value when the option is unset.
+        closed_streams_limit = self.config.max_closed_streams
+        if closed_streams_limit is None:
+            closed_streams_limit = self.MAX_CLOSED_STREAMS
+        self._closed_streams: dict[int, ClosedStreamSummary] = SizeLimitDict(
+            size_limit=closed_streams_limit,
+            eviction_callback=self._closed_stream_evicted,
         )
+
+        # A fixed, O(1) amount of state survives eviction so late frames are
+        # still handled correctly and a forgotten stream is never treated as
+        # fresh. Both values are indexed by stream-ID direction (0 = inbound,
+        # 1 = outbound):
+        #
+        # * ``_evicted_closed_stream_high`` is the highest ID whose closed-stream
+        #   summary has been evicted. Because high-water is only advanced by the
+        #   eviction of a real summary, an ID at or below it was definitely used.
+        # * ``_first_skipped_stream_id`` is the lowest ID this peer skipped when
+        #   opening streams (``None`` if it never skipped one). Every ID below
+        #   it in the same direction was actually opened, so an old ID below it
+        #   is known to be a genuine closed stream rather than a skipped ID that
+        #   was never used.
+        #
+        # Together these let the connection distinguish "late frame on a closed
+        # stream" from "illegal reuse of a never-used ID" even after the summary
+        # is gone, without keeping anything per stream. Additional retained
+        # summaries still carry the exact closure cause; once those are gone the
+        # frame is treated as a late frame on a closed stream (never re-accepted).
+        self._evicted_closed_stream_high = [0, 0]
+        self._first_skipped_stream_id: list[int | None] = [None, None]
 
         # The flow control window manager for the connection.
         self._inbound_flow_control_window_manager = WindowManager(
@@ -440,9 +482,37 @@ class H2Connection:
 
         for stream_id in to_delete:
             stream = self.streams.pop(stream_id)
-            self._closed_streams[stream_id] = stream.closed_by
+            # Retire the full stream object. Only a compact summary is kept,
+            # and inserting it may evict an older summary, which folds that
+            # stream ID into the eviction high-water mark.
+            self._retire_stream(stream)
 
         return count
+
+    def _retire_stream(self, stream: H2Stream) -> None:
+        """
+        Drop a closed stream's full object and retain only a compact summary.
+
+        The summary is inserted into the bounded ``_closed_streams`` mapping.
+        If the mapping is full, the oldest summary is evicted; its stream ID then
+        remains known as used-and-closed via the eviction high-water mark.
+        """
+        self._closed_streams[stream.stream_id] = (
+            ClosedStreamSummary.from_stream(stream)
+        )
+
+    def _closed_stream_evicted(
+        self, stream_id: int, summary: ClosedStreamSummary,
+    ) -> None:
+        """
+        Called when a closed-stream summary is evicted to bound memory.
+
+        The detail is gone, but the stream ID is folded into the per-direction
+        eviction high-water mark so the ID remains known to have been used.
+        """
+        index = int(self._stream_id_is_outbound(stream_id))
+        if stream_id > self._evicted_closed_stream_high[index]:
+            self._evicted_closed_stream_high[index] = stream_id
 
     @property
     def open_outbound_streams(self) -> int:
@@ -495,6 +565,17 @@ class H2Connection:
         if (stream_id % 2) != int(allowed_ids):
             msg = "Invalid stream ID for peer."
             raise ProtocolError(msg)
+
+        # Record the lowest stream ID in this direction that was skipped by the
+        # peer opening a higher one. Any lower ID in the same direction is then
+        # known to have been opened, not skipped.
+        direction = int(outbound)
+        first_allowed = 1 if outbound == self.config.client_side else 2
+        expected = highest_stream_id + 2 if highest_stream_id else first_allowed
+        if stream_id != expected:
+            first_skipped = self._first_skipped_stream_id[direction]
+            if first_skipped is None or expected < first_skipped:
+                self._first_skipped_stream_id[direction] = expected
 
         s = H2Stream(
             stream_id,
@@ -1572,9 +1653,32 @@ class H2Connection:
             elif self._stream_is_closed_by_end(e.stream_id):
                 # Closed by END_STREAM is a connection error.
                 raise StreamClosedError(e.stream_id) from e
+            elif self._stream_id_was_used_and_closed(e.stream_id):
+                # The stream genuinely existed and has closed, but its compact
+                # summary was reclaimed to bound memory, so we can no longer tell
+                # whether it closed by RST_STREAM or by END_STREAM.
+                #
+                # We must never accept the ID again as a new stream: that is
+                # already guaranteed by the never-trimmed high-water marks, so we
+                # only reach here for an ID at or below the high-water mark we
+                # have seen. Because the stream *did* exist, this is not the
+                # never-used-ID case below.
+                #
+                # Answer with RST_STREAM(STREAM_CLOSED). This is a stream error,
+                # which keeps a long-lived connection usable when an in-flight
+                # frame arrives for a long-forgotten stream, rather than tearing
+                # the whole connection down. Only HEADERS and PUSH_PROMISE reach
+                # here: DATA, WINDOW_UPDATE and RST_STREAM on a closed stream are
+                # handled by their own frame handlers, which already ignore or
+                # acknowledge them as the RFC requires even when the stream is
+                # gone.
+                f = RstStreamFrame(e.stream_id)
+                f.error_code = ErrorCodes.STREAM_CLOSED
+                self._prepare_for_sending([f])
+                events = []
             else:
-                # Closed implicitly, also a connection error, but of type
-                # PROTOCOL_ERROR.
+                # Never used, or closed implicitly when a higher stream ID was
+                # opened. Both are connection errors of type PROTOCOL_ERROR.
                 raise
         else:
             self._prepare_for_sending(frames)
@@ -2026,13 +2130,34 @@ class H2Connection:
         The return value will be either a member of
         ``h2.stream.StreamClosedBy`` or ``None``. If ``None``, the stream was
         closed implicitly by the peer opening a stream with a higher stream ID
-        before opening this one.
+        before opening this one, it was never seen, or its summary was reclaimed
+        to keep bookkeeping bounded (see ``_stream_id_was_used_and_closed``).
         """
         if stream_id in self.streams:
             return self.streams[stream_id].closed_by
         if stream_id in self._closed_streams:
-            return self._closed_streams[stream_id]
+            return self._closed_streams[stream_id].closed_by
         return None
+
+    def _stream_id_was_used_and_closed(self, stream_id: int) -> bool:
+        """
+        Returns ``True`` if ``stream_id`` identifies a stream that really
+        existed on this connection and has since been reclaimed: it is neither a
+        live stream, nor a retained summary, but it is at or below the eviction
+        high-water mark for its direction and below the first ID this peer
+        skipped when opening streams.
+
+        Such IDs must never be accepted as new streams, and frames arriving on
+        them are late frames on a closed stream, not evidence of an illegal new
+        stream.
+        """
+        if stream_id in self.streams or stream_id in self._closed_streams:
+            return False
+        index = int(self._stream_id_is_outbound(stream_id))
+        if not 0 < stream_id <= self._evicted_closed_stream_high[index]:
+            return False
+        first_skipped = self._first_skipped_stream_id[index]
+        return first_skipped is None or stream_id < first_skipped
 
     def _stream_is_closed_by_reset(self, stream_id: int) -> bool:
         """

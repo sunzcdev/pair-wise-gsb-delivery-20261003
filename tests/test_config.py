@@ -141,3 +141,65 @@ class TestH2Config:
             assert "h2 (trace): This is a trace message 123.\n" in captured.err
         else:
             assert "h2 (trace): This is a trace message 123.\n" not in captured.err
+
+    @pytest.mark.parametrize("max_closed_streams", [0, 1, 2**16, None])
+    def test_max_closed_streams_is_reflected_init(self, max_closed_streams) -> None:
+        """
+        The value of ``max_closed_streams``, when set, is reflected in the value
+        via the initializer.
+        """
+        config = h2.config.H2Configuration(
+            max_closed_streams=max_closed_streams,
+        )
+        assert config.max_closed_streams == max_closed_streams
+
+    @pytest.mark.parametrize("max_closed_streams", [0, 1, 2**16, None])
+    def test_max_closed_streams_is_reflected_attr(self, max_closed_streams) -> None:
+        """
+        The value of ``max_closed_streams``, when set, is reflected in the value
+        via the attribute setter.
+        """
+        config = h2.config.H2Configuration()
+        config.max_closed_streams = max_closed_streams
+        assert config.max_closed_streams == max_closed_streams
+
+    def test_max_closed_streams_defaults_to_none(self) -> None:
+        """
+        ``max_closed_streams`` defaults to ``None``, meaning "use the connection
+        default".
+        """
+        assert h2.config.H2Configuration().max_closed_streams is None
+
+    @pytest.mark.parametrize("value", [-1, -100])
+    def test_max_closed_streams_rejects_negative_init(self, value) -> None:
+        """
+        A negative ``max_closed_streams`` is rejected via the initializer.
+        """
+        with pytest.raises(ValueError):
+            h2.config.H2Configuration(max_closed_streams=value)
+
+    @pytest.mark.parametrize("value", [-1, -100])
+    def test_max_closed_streams_rejects_negative_attr(self, value) -> None:
+        """
+        A negative ``max_closed_streams`` is rejected via the attribute setter.
+        """
+        config = h2.config.H2Configuration()
+        with pytest.raises(ValueError):
+            config.max_closed_streams = value
+
+    @pytest.mark.parametrize("value", [True, False, "10", 1.0, object()])
+    def test_max_closed_streams_rejects_non_int_init(self, value) -> None:
+        """
+        Only ``int`` (not ``bool``) or ``None`` is accepted via the initializer.
+        """
+        with pytest.raises(ValueError):
+            h2.config.H2Configuration(max_closed_streams=value)
+
+    @pytest.mark.parametrize("value", [True, False, "10", 1.0, object()])
+    def test_max_closed_streams_rejects_non_int_attr(self, value) -> None:
+        """
+        Only ``int`` (not ``bool``) or ``None`` is accepted via the setter.
+        """
+        config = h2.config.H2Configuration()
+        with pytest.raises(ValueError):
+            config.max_closed_streams = value

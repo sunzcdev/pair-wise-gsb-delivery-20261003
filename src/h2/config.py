@@ -149,6 +149,31 @@ class H2Configuration:
         .. versionadded:: 2.6.0
 
     :type logger: ``logging.Logger``
+
+    :param max_closed_streams: The maximum number of closed streams for which
+        compact, fixed-size summaries are retained after the full stream
+        objects have been reclaimed. This bounds the auxiliary bookkeeping a
+        long-lived connection accumulates while handling many short streams.
+        The summaries contain only scalar bookkeeping; they never retain
+        bodies or complete header blocks.
+
+        The stream ID high-water marks are retained regardless of this value,
+        so a forgotten stream ID can never be re-accepted, and late frames for
+        reclaimed streams are still handled according to RFC 9113 § 5.1:
+        ``RST_STREAM`` and ``WINDOW_UPDATE`` are ignored where the RFC says to
+        ignore them, ``DATA`` still contributes to the connection flow control
+        window, and ``CONTINUATION`` (which is always a connection error)
+        remains one.
+
+        A non-negative integer sets an explicit limit; ``0`` retains no
+        summaries at all, leaving only the stream ID high-water marks.
+        ``None`` (the default) uses the connection's
+        :attr:`~h2.connection.H2Connection.MAX_CLOSED_STREAMS` value, which is
+        ``2**16`` unless overridden.
+
+        .. versionadded:: 4.5.0
+
+    :type max_closed_streams: ``int`` or ``None``
     """
 
     client_side = _BooleanConfigOption("client_side")
@@ -176,7 +201,8 @@ class H2Configuration:
                  split_outbound_cookies: bool = False,
                  validate_inbound_headers: bool = True,
                  normalize_inbound_headers: bool = True,
-                 logger: DummyLogger | OutputLogger | None = None) -> None:
+                 logger: DummyLogger | OutputLogger | None = None,
+                 max_closed_streams: int | None = None) -> None:
         self.client_side = client_side
         self.header_encoding = header_encoding
         self.validate_outbound_headers = validate_outbound_headers
@@ -185,6 +211,28 @@ class H2Configuration:
         self.validate_inbound_headers = validate_inbound_headers
         self.normalize_inbound_headers = normalize_inbound_headers
         self.logger = logger or DummyLogger(__name__)
+        self.max_closed_streams = max_closed_streams
+
+    @property
+    def max_closed_streams(self) -> int | None:
+        """
+        The maximum number of closed-stream summaries retained after the full
+        stream objects have been reclaimed. ``None`` means "use the connection
+        default"; ``0`` means no summaries are retained. Stream ID high-water
+        marks are always kept, separately from these summaries.
+        """
+        return self._max_closed_streams
+
+    @max_closed_streams.setter
+    def max_closed_streams(self, value: int | None) -> None:
+        # ``bool`` is a subclass of ``int`` but is not a meaningful limit.
+        if isinstance(value, bool) or not isinstance(value, (int, type(None))):
+            msg = "max_closed_streams must be a non-negative int or None"
+            raise ValueError(msg)  # noqa: TRY004
+        if value is not None and value < 0:
+            msg = "max_closed_streams must be a non-negative int or None"
+            raise ValueError(msg)
+        self._max_closed_streams = value
 
     @property
     def header_encoding(self) -> bool | str | None:

@@ -11,6 +11,16 @@ dev
 **API Changes (Backward Compatible)**
 
 - Support for Python 3.15 has been added.
+- The bookkeeping a connection keeps for closed streams is now configurable
+  via ``H2Configuration(max_closed_streams=...)`` and is bounded by default.
+  Closed streams are remembered as compact, fixed-size summaries that never
+  retain request/response bodies or decoded header blocks, so a long-lived
+  connection handling many short streams no longer accumulates memory. The
+  stream-ID high-water marks are always retained, so a forgotten stream ID is
+  never re-accepted and late frames on reclaimed streams are still handled per
+  RFC 9113 § 5.1 (stream-level ``WINDOW_UPDATE``/``RST_STREAM`` are ignored,
+  ``DATA`` still counts against the connection flow-control window, and a bare
+  ``CONTINUATION`` remains a connection error).
 
 **Bugfixes**
 

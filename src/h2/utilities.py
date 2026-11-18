@@ -14,7 +14,7 @@ from hpack.struct import HeaderTuple, NeverIndexedHeaderTuple
 from .exceptions import FlowControlError, ProtocolError
 
 if TYPE_CHECKING:  # pragma: no cover
-    from collections.abc import Generator, Iterable
+    from collections.abc import Callable, Generator, Iterable
 
     from hpack.struct import Header, HeaderWeaklyTyped
 
@@ -707,9 +707,24 @@ def validate_outbound_headers(headers: Iterable[Header],
 
 
 class SizeLimitDict(collections.OrderedDict[int, Any]):
+    """
+    An ordered dictionary that holds at most ``size_limit`` entries. When the
+    limit is exceeded, the oldest entries are evicted in insertion order (FIFO).
 
-    def __init__(self, *args: dict[int, int], **kwargs: Any) -> None:
-        self._size_limit = kwargs.pop("size_limit", None)
+    An optional ``eviction_callback`` is invoked with each evicted key and value
+    as it is dropped. This lets callers derive a compact summary (for example a
+    high-water mark of evicted keys) without retaining the evicted entries.
+    """
+
+    def __init__(
+        self,
+        *args: dict[int, int],
+        size_limit: int | None = None,
+        eviction_callback: Callable[[int, Any], None] | None = None,
+        **kwargs: Any,
+    ) -> None:
+        self._size_limit = size_limit
+        self._eviction_callback = eviction_callback
         super().__init__(*args, **kwargs)
 
         self._check_size_limit()
@@ -722,5 +737,6 @@ class SizeLimitDict(collections.OrderedDict[int, Any]):
     def _check_size_limit(self) -> None:
         if self._size_limit is not None:
             while len(self) > self._size_limit:
-                self.popitem(last=False)
-
+                evicted_key, evicted_value = self.popitem(last=False)
+                if self._eviction_callback is not None:
+                    self._eviction_callback(evicted_key, evicted_value)

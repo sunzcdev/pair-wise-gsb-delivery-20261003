@@ -6,6 +6,7 @@ An implementation of a HTTP/2 stream.
 """
 from __future__ import annotations
 
+from dataclasses import dataclass
 from enum import Enum, IntEnum
 from typing import TYPE_CHECKING, Any, cast
 
@@ -91,6 +92,49 @@ class StreamClosedBy(Enum):
     RECV_END_STREAM = 1
     SEND_RST_STREAM = 2
     RECV_RST_STREAM = 3
+
+
+@dataclass(frozen=True, slots=True)
+class ClosedStreamSummary:
+    """
+    A compact, fixed-size summary of a stream that has closed and been removed
+    from the connection's set of live streams.
+
+    Only cheap scalar bookkeeping is retained so that a long-lived connection
+    that processes very many short-lived streams does not accumulate memory.
+    The summary intentionally does **not** reference the original
+    :class:`H2Stream`, and therefore cannot hold on to received or sent body
+    data or decoded header blocks: those are released as soon as the stream
+    object is dropped.
+
+    .. versionadded:: 4.5.0
+
+    :param stream_id: The ID of the stream that closed.
+    :param closed_by: How the stream closed, as a member of
+        :class:`StreamClosedBy`, or ``None`` if it closed implicitly.
+    :param inbound_data_length: The number of body bytes received on the
+        stream before it closed.
+    :param expected_content_length: The ``content-length`` advertised on the
+        stream, if any, or ``None``.
+    """
+
+    stream_id: int
+    closed_by: StreamClosedBy | None
+    inbound_data_length: int
+    expected_content_length: int | None
+
+    @classmethod
+    def from_stream(cls, stream: H2Stream) -> ClosedStreamSummary:
+        """
+        Build a summary from a live stream object. Only scalar values are
+        copied; nothing that could reference body data or headers is retained.
+        """
+        return cls(
+            stream_id=stream.stream_id,
+            closed_by=stream.closed_by,
+            inbound_data_length=stream._actual_content_length,
+            expected_content_length=stream._expected_content_length,
+        )
 
 
 # This array is initialized once, and is indexed by the stream states above.

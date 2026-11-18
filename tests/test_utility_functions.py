@@ -223,3 +223,39 @@ def test_size_limit_dict_no_limit() -> None:
     assert dct[1] == 1
     assert dct[2] == 2
     assert dct[3] == 3
+
+
+def test_size_limit_dict_eviction_callback() -> None:
+    """
+    The eviction callback is invoked with each evicted key and value.
+    """
+    evicted = []
+    dct = SizeLimitDict(
+        size_limit=2,
+        eviction_callback=lambda key, value: evicted.append((key, value)),
+    )
+
+    dct[1] = "one"
+    dct[2] = "two"
+    dct[3] = "three"
+
+    assert evicted == [(1, "one")]
+    assert 1 not in dct
+    assert dct[2] == "two"
+    assert dct[3] == "three"
+
+
+def test_size_limit_dict_eviction_callback_ignores_cleared_entries() -> None:
+    """
+    The eviction callback is only invoked for entries actually evicted to
+    enforce the size limit, not for entries removed in other ways.
+    """
+    evicted = []
+    dct = SizeLimitDict(
+        size_limit=2,
+        eviction_callback=lambda key, value: evicted.append((key, value)),
+    )
+    dct[1] = 1
+    dct[2] = 2
+    assert evicted == []
+
