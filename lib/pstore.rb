@@ -340,6 +340,18 @@ class PStore
   class Error < StandardError
   end
 
+  # The error type raised when the instance mutex or the store file lock
+  # could not be acquired within the configured lock timeout.
+  # See PStore.new and PStore#transaction.
+  class LockTimeoutError < Error
+  end
+
+  # The error type raised when waiting for the instance mutex or the
+  # store file lock was cancelled through the configured cancel check.
+  # See PStore.new and PStore#transaction.
+  class CancelledError < Error
+  end
+
   # Whether \PStore should do its best to prevent file corruptions,
   # even when an unlikely error (such as memory-error or filesystem error) occurs:
   #
@@ -386,8 +398,29 @@ class PStore
   #
   #   store = PStore.new(path, follow_symlink: false)
   #
+  # If keyword argument +lock_timeout+ is given as a non-negative number,
+  # a transaction waits at most that many seconds (in total) to acquire both
+  # the instance mutex and the store file lock, and raises
+  # PStore::LockTimeoutError when the deadline passes;
+  # +nil+ (the default) means waiting without a deadline:
+  #
+  #   store = PStore.new(path, lock_timeout: 5)
+  #
+  # If keyword argument +cancel_check+ is given as a callable object,
+  # it is called periodically while a transaction waits for the locks;
+  # when it returns a truthy value, the wait is aborted with
+  # PStore::CancelledError:
+  #
+  #   store = PStore.new(path, cancel_check: -> { shut_down_requested? })
+  #
+  # Both options can be overridden per transaction; see PStore#transaction.
+  # A failed wait never starts loading or modifying the store data,
+  # closes the file handle opened for the attempt, and never releases
+  # a lock held by another thread or process.
+  #
   def initialize(file, _thread_safe = false, thread_safe: _thread_safe,
-                 ultra_safe: false, follow_symlink: true)
+                 ultra_safe: false, follow_symlink: true,
+                 lock_timeout: nil, cancel_check: nil)
     dir = File::dirname(file)
     unless File::directory? dir
       raise PStore::Error, format("directory %s does not exist", dir)
@@ -395,11 +428,15 @@ class PStore
     if File::exist? file and not File::readable? file
       raise PStore::Error, format("file %s not readable", file)
     end
+    validate_lock_timeout(lock_timeout)
     @filename = File.path(file)
     @abort = false
+    @rdonly = false
     @ultra_safe = ultra_safe
     @thread_safe = thread_safe
     @nofollow = follow_symlink ? 0 : NOFOLLOW
+    @lock_timeout = lock_timeout
+    @cancel_check = cancel_check
     @lock = Thread::Mutex.new
   end
 
@@ -566,22 +603,27 @@ class PStore
   # With argument +read_only+ as +true+, the block may not include calls
   # to #transaction, #[]=, or #delete.
   #
+  # Keyword arguments +lock_timeout+ and +cancel_check+ override the
+  # defaults given to PStore.new for this transaction only; they bound
+  # the total time spent waiting for the instance mutex and the store
+  # file lock, and allow the wait to be cancelled.  The store data is
+  # not loaded or modified before both locks are held.  A wait that
+  # times out raises PStore::LockTimeoutError, a cancelled wait raises
+  # PStore::CancelledError, and a corrupted store file raises PStore::Error;
+  # the three conditions are reported separately.
+  #
   # Raises an exception if called within a transaction block.
-  def transaction(read_only = false)  # :yields:  pstore
+  def transaction(read_only = false, lock_timeout: @lock_timeout,
+                  cancel_check: @cancel_check)  # :yields:  pstore
     value = nil
-    if !@thread_safe
-      raise PStore::Error, "nested transaction" unless @lock.try_lock
-    else
-      begin
-        @lock.lock
-      rescue ThreadError
-        raise PStore::Error, "nested transaction"
-      end
-    end
+    deadline = lock_wait_deadline(lock_timeout)
+    acquire_instance_lock(deadline, cancel_check)
     begin
+      file = open_and_lock_file(@filename, read_only, deadline, cancel_check)
+      # Both locks are held at this point; only now may the transaction
+      # flags be set and the store data be loaded or modified.
       @rdonly = read_only
       @abort = false
-      file = open_and_lock_file(@filename, read_only)
       if file
         begin
           @table, checksum, original_data_size = load_data(file, read_only)
@@ -627,6 +669,75 @@ class PStore
   EMPTY_MARSHAL_CHECKSUM.freeze
   private_constant :CHECKSUM_ALGO, :EMPTY_STRING, :EMPTY_MARSHAL_DATA, :EMPTY_MARSHAL_CHECKSUM
 
+  # Interval between attempts while polling for the instance mutex or
+  # the store file lock.
+  LOCK_WAIT_POLL_INTERVAL = 0.05
+  private_constant :LOCK_WAIT_POLL_INTERVAL
+
+  def validate_lock_timeout(lock_timeout) # :nodoc:
+    return if lock_timeout.nil?
+    unless lock_timeout.is_a?(Numeric) && lock_timeout >= 0
+      raise ArgumentError, "lock_timeout must be a non-negative number or nil"
+    end
+  end
+
+  # Returns the monotonic-clock deadline for a lock wait, or nil when
+  # the wait has no deadline.
+  def lock_wait_deadline(lock_timeout)
+    validate_lock_timeout(lock_timeout)
+    return nil if lock_timeout.nil?
+    monotonic_clock + lock_timeout
+  end
+
+  def monotonic_clock
+    Process.clock_gettime(Process::CLOCK_MONOTONIC)
+  end
+
+  def check_lock_wait_cancelled(cancel_check)
+    if cancel_check && cancel_check.call
+      raise CancelledError, format("cancelled while waiting for the lock on %s", @filename)
+    end
+  end
+
+  def check_lock_wait_timeout(deadline)
+    if deadline && monotonic_clock >= deadline
+      raise LockTimeoutError, format("timed out waiting for the lock on %s", @filename)
+    end
+  end
+
+  def lock_wait_pause(deadline)
+    if deadline
+      remaining = deadline - monotonic_clock
+      check_lock_wait_timeout(deadline) if remaining <= 0
+      sleep(remaining < LOCK_WAIT_POLL_INTERVAL ? remaining : LOCK_WAIT_POLL_INTERVAL)
+    else
+      sleep(LOCK_WAIT_POLL_INTERVAL)
+    end
+  end
+
+  #
+  # Acquire the instance mutex, waiting at most until _deadline_
+  # (a monotonic-clock value, or nil for no deadline) and honouring
+  # _cancel_check_.  A nested transaction is still reported immediately.
+  #
+  def acquire_instance_lock(deadline, cancel_check)
+    raise PStore::Error, "nested transaction" if @lock.owned?
+    if deadline.nil? && cancel_check.nil?
+      if @thread_safe
+        @lock.lock
+      else
+        raise PStore::Error, "nested transaction" unless @lock.try_lock
+      end
+      return
+    end
+    loop do
+      check_lock_wait_cancelled(cancel_check)
+      return if @lock.try_lock
+      check_lock_wait_timeout(deadline)
+      lock_wait_pause(deadline)
+    end
+  end
+
   #
   # Open the specified filename (either in read-only mode or in
   # read-write mode) and lock it for reading or writing.
@@ -634,11 +745,18 @@ class PStore
   # The opened File object will be returned. If _read_only_ is true,
   # and the file does not exist, then nil will be returned.
   #
-  # All exceptions are propagated.
+  # Waiting for the file lock is bounded by _deadline_ (a monotonic-clock
+  # value, or nil for no deadline) and can be aborted via _cancel_check_.
+  # A failed wait closes the file handle opened here; a lock held by
+  # another thread or process is never unlocked.
   #
-  def open_and_lock_file(filename, read_only)
+  # All other exceptions are propagated.
+  #
+  def open_and_lock_file(filename, read_only, deadline = nil, cancel_check = nil)
     filename = File.path(filename)
     loop do
+      check_lock_wait_cancelled(cancel_check)
+      check_lock_wait_timeout(deadline)
       if read_only
         begin
           file = File.new(filename, mode: RD_ACCESS | @nofollow, encoding: Encoding::ASCII_8BIT)
@@ -650,13 +768,33 @@ class PStore
       end
       current = false
       begin
-        file.flock(read_only ? File::LOCK_SH : File::LOCK_EX)
+        lock_file(file, read_only, deadline, cancel_check)
         # An atomic save may have replaced the file while this lock was pending.
         current = File.identical?(file, filename)
         return file if current
       ensure
         file.close unless current
       end
+    end
+  end
+
+  #
+  # Lock the opened store file, waiting at most until _deadline_ and
+  # honouring _cancel_check_.  Uses non-blocking flock attempts so the
+  # wait stays interruptible; the lock is never released here.
+  #
+  def lock_file(file, read_only, deadline, cancel_check)
+    mode = read_only ? File::LOCK_SH : File::LOCK_EX
+    if deadline.nil? && cancel_check.nil?
+      file.flock(mode)
+      return
+    end
+    mode |= File::LOCK_NB
+    loop do
+      check_lock_wait_cancelled(cancel_check)
+      return if file.flock(mode)
+      check_lock_wait_timeout(deadline)
+      lock_wait_pause(deadline)
     end
   end
 

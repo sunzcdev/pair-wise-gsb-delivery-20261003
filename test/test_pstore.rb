@@ -387,4 +387,199 @@ class PStoreTest < Test::Unit::TestCase
     assert_equal(@pstore_file, store.path)
     assert_equal("bar", store.transaction(true) { store[:foo] })
   end
+
+  def monotonic
+    Process.clock_gettime(Process::CLOCK_MONOTONIC)
+  end
+
+  def test_lock_wait_arguments
+    store = PStore.new(@pstore_file)
+    assert_nil store.instance_variable_get(:@lock_timeout)
+    assert_nil store.instance_variable_get(:@cancel_check)
+
+    cancel = -> { false }
+    store = PStore.new(@pstore_file, lock_timeout: 1.5, cancel_check: cancel)
+    assert_equal 1.5, store.instance_variable_get(:@lock_timeout)
+    assert_same cancel, store.instance_variable_get(:@cancel_check)
+
+    assert_raise(ArgumentError) { PStore.new(@pstore_file, lock_timeout: -1) }
+    assert_raise(ArgumentError) { PStore.new(@pstore_file, lock_timeout: "1") }
+    assert_raise(ArgumentError) { store.transaction(lock_timeout: -1) {} }
+  end
+
+  def test_lock_timeout_error_is_a_pstore_error
+    assert_operator PStore::LockTimeoutError, :<, PStore::Error
+    assert_operator PStore::CancelledError, :<, PStore::Error
+  end
+
+  def test_transaction_times_out_waiting_for_instance_mutex
+    pstore = PStore.new(second_file, true, lock_timeout: 0.2)
+    entered = Thread::Queue.new
+    release = Thread::Queue.new
+    holder = Thread.new do
+      pstore.transaction do
+        entered.push true
+        release.pop
+      end
+    end
+    entered.pop
+    started = monotonic
+    assert_raise(PStore::LockTimeoutError) { pstore.transaction {} }
+    assert_operator monotonic - started, :<, 5
+    # The failed wait released neither the mutex nor the transaction flags.
+    release.push true
+    holder.join
+    assert_equal(:ok, pstore.transaction { :ok })
+  ensure
+    release.push true if release && holder&.alive?
+    holder&.join
+    File.unlink(second_file) rescue nil
+  end
+
+  def test_transaction_wait_can_be_cancelled
+    pstore = PStore.new(second_file, true)
+    entered = Thread::Queue.new
+    release = Thread::Queue.new
+    holder = Thread.new do
+      pstore.transaction do
+        entered.push true
+        release.pop
+      end
+    end
+    entered.pop
+    started = monotonic
+    cancel = -> { monotonic - started > 0.1 }
+    assert_raise(PStore::CancelledError) do
+      pstore.transaction(cancel_check: cancel) {}
+    end
+    assert_operator monotonic - started, :<, 5
+    release.push true
+    holder.join
+    # The store is still fully usable after a cancelled wait.
+    assert_equal(:ok, pstore.transaction { :ok })
+  ensure
+    release.push true if release && holder&.alive?
+    holder&.join
+    File.unlink(second_file) rescue nil
+  end
+
+  def test_transaction_times_out_waiting_for_file_lock
+    # Two native PStore instances contending for the same store file.
+    holder = PStore.new(second_file)
+    waiter = PStore.new(second_file, lock_timeout: 0.2)
+    entered = Thread::Queue.new
+    release = Thread::Queue.new
+    thread = Thread.new do
+      holder.transaction do
+        holder[:foo] = "held"
+        entered.push true
+        release.pop
+      end
+    end
+    entered.pop
+    started = monotonic
+    assert_raise(PStore::LockTimeoutError) { waiter.transaction {} }
+    assert_operator monotonic - started, :<, 5
+    # The holder's lock and transaction were not disturbed by the wait.
+    release.push true
+    thread.join
+    assert_equal("held", waiter.transaction(true) { waiter[:foo] })
+  ensure
+    release.push true if release && thread&.alive?
+    thread&.join
+    File.unlink(second_file) rescue nil
+  end
+
+  def test_file_lock_wait_uses_nonblocking_flock_and_closes_handle_on_timeout
+    fake_file = Struct.new(:closed, :flock_modes) do
+      def flock(mode)
+        (self.flock_modes ||= []) << mode
+        false
+      end
+
+      def close
+        self.closed = true
+      end
+    end
+    file = fake_file.new(false)
+    original_new = File.method(:new)
+    EnvUtil.suppress_warning do
+      File.define_singleton_method(:new) { |*_args, **_kwargs| file }
+    end
+    deadline = monotonic + 0.2
+
+    assert_raise(PStore::LockTimeoutError) do
+      @pstore.send(:open_and_lock_file, @pstore_file, false, deadline, nil)
+    end
+
+    assert_equal(true, file.closed)
+    assert_not_empty(file.flock_modes)
+    file.flock_modes.each do |mode|
+      assert_equal(File::LOCK_EX, mode & File::LOCK_EX)
+      assert_equal(File::LOCK_NB, mode & File::LOCK_NB)
+    end
+  ensure
+    EnvUtil.suppress_warning do
+      File.define_singleton_method(:new, original_new) if original_new
+    end
+  end
+
+  def test_file_lock_wait_can_be_cancelled
+    fake_file = Struct.new(:closed) do
+      def flock(_mode)
+        false
+      end
+
+      def close
+        self.closed = true
+      end
+    end
+    file = fake_file.new(false)
+    original_new = File.method(:new)
+    EnvUtil.suppress_warning do
+      File.define_singleton_method(:new) { |*_args, **_kwargs| file }
+    end
+    checks = 0
+    cancel = -> { (checks += 1) > 2 }
+
+    assert_raise(PStore::CancelledError) do
+      @pstore.send(:open_and_lock_file, @pstore_file, false, nil, cancel)
+    end
+
+    assert_equal(true, file.closed)
+  ensure
+    EnvUtil.suppress_warning do
+      File.define_singleton_method(:new, original_new) if original_new
+    end
+  end
+
+  def test_failed_lock_wait_does_not_leave_transaction_flags
+    pstore = PStore.new(second_file, lock_timeout: 0.1)
+    entered = Thread::Queue.new
+    release = Thread::Queue.new
+    thread = Thread.new do
+      pstore.transaction do
+        entered.push true
+        release.pop
+      end
+    end
+    entered.pop
+    assert_raise(PStore::LockTimeoutError) { pstore.transaction {} }
+    assert_equal(false, pstore.instance_variable_get(:@abort))
+    assert_equal(false, pstore.instance_variable_get(:@rdonly))
+    assert_raise(PStore::Error) { pstore[:foo] }
+  ensure
+    release.push true if release && thread&.alive?
+    thread&.join
+    File.unlink(second_file) rescue nil
+  end
+
+  def test_corrupted_store_is_reported_separately_from_lock_wait_errors
+    File.binwrite(@pstore_file, Marshal.dump("not a hash"))
+    store = PStore.new(@pstore_file, lock_timeout: 5, cancel_check: -> { false })
+    error = assert_raise(PStore::Error) { store.transaction {} }
+    assert_not_kind_of(PStore::LockTimeoutError, error)
+    assert_not_kind_of(PStore::CancelledError, error)
+    assert_match(/corrupted/, error.message)
+  end
 end
