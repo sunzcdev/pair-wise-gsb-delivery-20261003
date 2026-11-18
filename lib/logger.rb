@@ -367,6 +367,32 @@ require_relative 'logger/errors'
 # see details and suggestions at
 # {Time#strftime}[https://docs.ruby-lang.org/en/master/Time.html#method-i-strftime].
 #
+# == Re-entrancy Protection
+#
+# Formatting a message can run arbitrary code: a custom formatter proc,
+# a block passed to an entry method, or Object#to_s / Object#inspect
+# on the message object.  If that code calls back into the same logger,
+# the call is re-entrant and would normally recurse until the stack is
+# exhausted (SystemStackError).
+#
+# A logger therefore guards its entry path with a per-logger,
+# per-execution-context (Fiber or Thread) nesting limit.  When the limit
+# is reached, the re-entrant call is refused and a single bounded
+# emergency diagnostic is written directly to the log device:
+#
+#   log emergency: INFO: re-entrant logging call ignored
+#
+# The emergency line does not pass through the configured formatter, so
+# it cannot recurse itself and cannot mask an exception raised by the
+# original formatting.  If formatting raises, the original exception is
+# reported through an emergency line and then re-raised unchanged.  The
+# guard state is always restored after each entry, so the next ordinary
+# log entry is written normally.
+#
+# The limit is scoped to the logger instance and the current execution
+# context: nesting a call on a *different* logger, or on the same logger
+# from another Fiber or Thread, is always allowed.
+#
 class Logger
   _, name, rev = %w$Id$
   if name
@@ -693,16 +719,18 @@ class Logger
     if progname.nil?
       progname = @progname
     end
-    if message.nil?
-      if block_given?
-        message = yield
-      else
-        message = progname
-        progname = @progname
+    with_reentrancy_guard(severity) do
+      if message.nil?
+        if block_given?
+          message = yield
+        else
+          message = progname
+          progname = @progname
+        end
       end
+      @logdev.write(
+        format_message(format_severity(severity), Time.now, progname, message))
     end
-    @logdev.write(
-      format_message(format_severity(severity), Time.now, progname, message))
     true
   end
   alias log add
@@ -774,6 +802,16 @@ private
   # \Severity label for logging (max 5 chars).
   SEV_LABEL = %w(DEBUG INFO WARN ERROR FATAL ANY).freeze
 
+  # Maximum nesting depth of Logger#add calls against the same logger
+  # instance within one execution context (Fiber/Thread).  The outermost
+  # call counts as depth 1, so any re-entrant call made while the
+  # outermost entry is still being formatted reaches the limit and is
+  # handled instead of recursing until the stack is exhausted.
+  #
+  # The limit is tracked per logger and per execution context: a nested
+  # call on a different Logger instance is never affected.
+  REENTRANCY_LIMIT = 1
+
   def format_severity(severity)
     SEV_LABEL[severity] || 'ANY'
   end
@@ -798,5 +836,60 @@ private
 
   def format_message(severity, datetime, progname, msg)
     (@formatter || @default_formatter).call(severity, datetime, progname, msg)
+  end
+
+  # Per-execution-context nesting depths of #add calls in progress.
+  # Keyed by Fiber.current (Fibers are thread-bound in Ruby), so the
+  # guard is isolated per logger instance and per execution context:
+  # another logger, another thread, or another Fiber keeps its own depth.
+  def reentrancy_depth
+    @reentrancy_depth ||= Hash.new(0)
+  end
+
+  # Runs the supplied block while guarding against re-entrant #add calls
+  # on this logger from the same execution context.  When the declared
+  # nesting limit (REENTRANCY_LIMIT) is reached the re-entrant call is
+  # refused and a single bounded emergency diagnostic is written directly
+  # to the log device without invoking the configured formatter, so the
+  # failure can neither recurse forever nor mask the original exception.
+  # The guard state is always restored afterwards, so the next ordinary
+  # log entry is written normally.
+  def with_reentrancy_guard(severity)
+    key = Fiber.current
+    depth = reentrancy_depth[key]
+    if depth >= REENTRANCY_LIMIT
+      emergency_write(format_severity(severity), "re-entrant logging call ignored")
+      return
+    end
+
+    reentrancy_depth[key] = depth + 1
+    begin
+      yield
+    rescue Exception => error
+      # Do not hand the exception back to the (possibly failing)
+      # formatter; emit a bounded emergency diagnostic instead and
+      # re-raise the original exception unchanged.
+      emergency_write(format_severity(severity),
+                      "logging failed: #{error.class}: #{error.message}")
+      raise
+    ensure
+      reentrancy_depth[key] = depth
+    end
+  end
+
+  # Writes a single fixed emergency line straight to the log device.
+  # The line is built from static strings and simple scalar values only,
+  # and bypasses the configured formatter, so this path can never itself
+  # trigger re-entrant logging or user-supplied #to_s calls.  Any failure
+  # while writing the emergency line is swallowed to avoid masking the
+  # original business exception or growing the recursion further.
+  def emergency_write(severity_label, reason)
+    return if @logdev.nil?
+    line = "log emergency: #{severity_label}: #{reason}\n"
+    begin
+      @logdev.write(line)
+    rescue Exception
+      nil
+    end
   end
 end

@@ -2,6 +2,7 @@
 # frozen_string_literal: false
 require 'logger'
 require 'tempfile'
+require 'stringio'
 
 class TestLogger < Test::Unit::TestCase
   include Logger::Severity
@@ -423,5 +424,152 @@ class TestLogger < Test::Unit::TestCase
     assert_warning('') do
       good_logger.level
     end
+  end
+
+  def stringio_logger
+    io = StringIO.new
+    [io, Logger.new(io)]
+  end
+
+  def test_reentrant_formatter_call_is_bounded
+    io, logger = stringio_logger
+    calls = 0
+    logger.formatter = proc do |severity, time, progname, msg|
+      calls += 1
+      # Always re-enters: must be stopped by the guard instead of
+      # recursing until the stack is exhausted.
+      logger.info("reentrant-#{calls}")
+      "FORMATTED: #{msg}\n"
+    end
+
+    assert_nothing_raised do
+      logger.info("outer")
+    end
+    assert_equal(1, calls)
+    lines = io.string.lines
+    assert_equal(2, lines.size)
+    assert_match(/\Alog emergency: INFO: re-entrant logging call ignored\n\z/, lines[0])
+    assert_equal("FORMATTED: outer\n", lines[1])
+  end
+
+  def test_reentrant_call_from_message_to_s
+    io, logger = stringio_logger
+    message = Object.new
+    message.define_singleton_method(:inspect) do
+      logger.info("re-entrant from inspect")
+      "message-representation"
+    end
+
+    assert_nothing_raised do
+      logger.info(message)
+    end
+    lines = io.string.lines
+    assert_equal(2, lines.size)
+    assert_match(/\Alog emergency: INFO: re-entrant logging call ignored\n\z/, lines[0])
+    # The outer entry is still produced by the ordinary formatter.
+    assert_match(/INFO -- : message-representation\n\z/, lines[1])
+    assert_no_match(/re-entrant from inspect/, io.string)
+  end
+
+  def test_reentrant_call_from_message_block
+    io, logger = stringio_logger
+    assert_nothing_raised do
+      logger.info do
+        logger.info("inner")
+        "outer"
+      end
+    end
+    lines = io.string.lines
+    assert_equal(2, lines.size)
+    assert_match(/\Alog emergency: INFO: re-entrant logging call ignored\n\z/, lines[0])
+    assert_match(/INFO -- : outer\n\z/, lines[1])
+  end
+
+  def test_nested_call_on_another_logger_still_works
+    outer_io, outer_logger = stringio_logger
+    inner_io, inner_logger = stringio_logger
+    outer_logger.formatter = proc do |severity, time, progname, msg|
+      inner_logger.info("legal nested call")
+      "OUTER: #{msg}\n"
+    end
+
+    outer_logger.info("hello")
+
+    assert_equal("OUTER: hello\n", outer_io.string)
+    assert_match(/INFO -- : legal nested call\n\z/, inner_io.string)
+    assert_no_match(/log emergency/, inner_io.string)
+  end
+
+  def test_reentrancy_guard_is_isolated_per_fiber
+    io, logger = stringio_logger
+    fiber = Fiber.new do
+      logger.info("fiber first")
+      Fiber.yield
+      logger.info("fiber resumed")
+    end
+
+    fiber.resume
+    # The depth held by the suspended Fiber must not affect the main Fiber.
+    assert_nothing_raised { logger.info("main while fiber suspended") }
+    fiber.resume
+
+    lines = io.string.lines
+    assert_equal(3, lines.size)
+    assert_match(/fiber first/, lines[0])
+    assert_match(/main while fiber suspended/, lines[1])
+    assert_match(/fiber resumed/, lines[2])
+    assert_no_match(/log emergency/, io.string)
+  end
+
+  def test_reentrancy_guard_is_isolated_per_thread
+    io, logger = stringio_logger
+    logger.formatter = proc do |severity, time, progname, msg|
+      if msg == "outer"
+        thread = Thread.new { logger.info("other thread") }
+        thread.join
+      end
+      "F: #{msg}\n"
+    end
+
+    assert_nothing_raised { logger.info("outer") }
+    lines = io.string.lines
+    assert_equal(2, lines.size)
+    assert_equal("F: other thread\n", lines[0])
+    assert_equal("F: outer\n", lines[1])
+    assert_no_match(/log emergency/, io.string)
+  end
+
+  def test_formatter_exception_emergency_output_and_recovery
+    io, logger = stringio_logger
+    error_class = Class.new(StandardError)
+    logger.formatter = proc do |severity, time, progname, msg|
+      raise error_class, "formatter exploded"
+    end
+
+    error = assert_raise(error_class) do
+      logger.info("boom")
+    end
+    assert_equal("formatter exploded", error.message)
+    # The emergency line bypasses the failing formatter and never
+    # re-enters it; the original exception class/message are preserved.
+    assert_equal(1, io.string.lines.size)
+    assert_match(
+      /\Alog emergency: INFO: logging failed: .*: formatter exploded\n\z/,
+      io.string)
+
+    # Guard state is restored: the next ordinary entry is written normally.
+    logger.formatter = nil
+    logger.info("recovered")
+    assert_match(/INFO -- : recovered\n\z/, io.string.lines.last)
+  end
+
+  def test_reentrancy_guard_state_is_restored_after_each_entry
+    io, logger = stringio_logger
+    logger.info("one")
+    logger.info("two")
+    logger.info("three")
+    assert_equal(3, io.string.lines.size)
+    assert_no_match(/log emergency/, io.string)
+    assert_equal(0, logger.instance_variable_get(:@reentrancy_depth)[Fiber.current])
   end
 end
