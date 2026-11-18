@@ -33,6 +33,58 @@ class WindowManager:
         self.current_window_size = max_window_size
         self._bytes_processed = 0
 
+        # Lifetime counters used to keep the flow control accounting honest.
+        #
+        # ``_bytes_consumed`` counts every flow-controlled byte that has been
+        # charged against this window (i.e. the ``flow_controlled_length`` of
+        # every DATA frame, including any padding). On a stream window these
+        # bytes have all been handed to the application in a
+        # :class:`DataReceived <h2.events.DataReceived>` event.
+        #
+        # ``_bytes_acknowledged`` counts every flow-controlled byte the
+        # application has told us it has processed through
+        # :meth:`process_bytes`. The difference between the two is the number
+        # of received-but-not-yet-acknowledged bytes: this is the credit that
+        # must be handed back to the *connection* window when a stream is
+        # terminated with RST_STREAM, otherwise that credit would be lost
+        # forever (or, if acknowledged again later, returned twice).
+        self._bytes_consumed = 0
+        self._bytes_acknowledged = 0
+
+        # Once a stream has been abandoned (reset), its window is taken out of
+        # service. The unacknowledged bytes are settled once, and any further
+        # acknowledgement must be a no-op rather than a second refund.
+        self._settled = False
+
+    @property
+    def bytes_consumed(self) -> int:
+        """
+        The total number of flow-controlled bytes ever charged against this
+        window. On a stream window these are the bytes that have been handed
+        to the application (plus padding), whether or not the application has
+        acknowledged them yet.
+        """
+        return self._bytes_consumed
+
+    @property
+    def bytes_acknowledged(self) -> int:
+        """
+        The total number of flow-controlled bytes that the application has
+        acknowledged as processed.
+        """
+        return self._bytes_acknowledged
+
+    @property
+    def unacknowledged_bytes(self) -> int:
+        """
+        The number of flow-controlled bytes that have been charged against
+        this window but which the application has not yet acknowledged as
+        processed. On a stream window this is the amount of connection-level
+        credit that is still "in flight" for the stream and that must be
+        returned when the stream is abandoned.
+        """
+        return self._bytes_consumed - self._bytes_acknowledged
+
     def window_consumed(self, size: int) -> None:
         """
         We have received a certain number of bytes from the remote peer. This
@@ -48,6 +100,10 @@ class WindowManager:
         if self.current_window_size < 0:
             msg = "Flow control window shrunk below 0"
             raise FlowControlError(msg)
+        # ``size`` counts the full ``flow_controlled_length`` of the DATA
+        # frame, so padding (and the one-byte padding length field) is
+        # accounted for exactly like application data.
+        self._bytes_consumed += size
 
     def window_opened(self, size: int) -> None:
         """
@@ -86,8 +142,50 @@ class WindowManager:
             or ``None``.
         :rtype: ``int`` or ``None``
         """
+        # A stream that has been reset has already had all of its outstanding
+        # credit returned to the connection window. A late acknowledgement must
+        # not move any window again: doing so would hand the same bytes back
+        # twice.
+        if self._settled:
+            return None
+
+        self._bytes_acknowledged += size
         self._bytes_processed += size
         return self._maybe_update_window()
+
+    def settle(self) -> int:
+        """
+        Settle the flow control accounting for an abandoned stream.
+
+        When a stream is terminated with RST_STREAM there may be flow
+        controlled bytes that were already delivered to the application but
+        never acknowledged. The corresponding *connection*-level credit cannot
+        stay reserved forever (it would eventually stall every other stream),
+        but it also cannot be returned a second time if the application later
+        acknowledges the data.
+
+        This method therefore returns the number of received-but-unacknowledged
+        flow controlled bytes exactly once, and takes the window out of
+        service so that subsequent calls to :meth:`process_bytes` become
+        no-ops.
+
+        The returned bytes must be handed back to the **connection** flow
+        control window (a ``WINDOW_UPDATE`` frame on stream ``0``); no stream
+        level ``WINDOW_UPDATE`` is ever emitted for a closed stream.
+
+        :returns: The number of flow controlled bytes to return to the
+            connection window (may be zero).
+        :rtype: ``int``
+        """
+        if self._settled:
+            return 0
+
+        self._settled = True
+        # Anything the application had already acknowledged was accounted for
+        # through ``process_bytes``; only the outstanding balance remains.
+        unacknowledged = self.unacknowledged_bytes
+        self._bytes_processed = 0
+        return unacknowledged
 
     def _maybe_update_window(self) -> int | None:
         """

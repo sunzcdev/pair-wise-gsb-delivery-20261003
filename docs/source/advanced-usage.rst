@@ -323,3 +323,38 @@ a certain number of bytes have been freed up.
 
 For most applications, this method should be preferred to the manual flow
 control mechanism.
+
+Abandoning a stream: what happens on RST_STREAM
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+When a stream is terminated with a ``RST_STREAM`` frame (whether you send it
+through :meth:`reset_stream <h2.connection.H2Connection.reset_stream>` or
+receive it from the peer), there may be flow controlled bytes that were
+already handed to your application in :class:`DataReceived
+<h2.events.DataReceived>` events but which you never got around to
+acknowledging. That data occupies credit on the **connection** flow control
+window, which is shared by every stream. If that credit were simply dropped
+the connection window would shrink permanently and could eventually stall all
+of the other streams.
+
+h2 therefore settles the abandoned stream's account for you: the number of
+received-but-unacknowledged flow controlled bytes is returned to the
+connection flow control window (a ``WINDOW_UPDATE`` frame on stream ``0``),
+subject to the same coalescing logic as
+:meth:`acknowledge_received_data
+<h2.connection.H2Connection.acknowledge_received_data>`. The amount is always
+the :data:`flow_controlled_length
+<h2.events.DataReceived.flow_controlled_length>` of the data, so any padding
+is included.
+
+Two guarantees follow from this:
+
+- No ``WINDOW_UPDATE`` is ever emitted on the closed stream itself: a stream
+  level window update is meaningless once the stream is gone. Only the
+  connection window (stream ``0``) is adjusted.
+- The credit is returned **exactly once**. After the reset, a late call to
+  :meth:`acknowledge_received_data
+  <h2.connection.H2Connection.acknowledge_received_data>` for that stream is a
+  no-op and will never add the same bytes to the connection window a second
+  time. This remains true even after h2 has cleaned up its internal state for
+  the closed stream.

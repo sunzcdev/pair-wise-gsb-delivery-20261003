@@ -1061,6 +1061,15 @@ class H2Connection:
         stream, try the :meth:`end_stream
         <h2.connection.H2Connection.end_stream>` method.
 
+        Any flow controlled bytes that had been delivered to the application
+        on this stream but were never acknowledged are returned to the
+        **connection** flow control window at this point, via a
+        ``WINDOW_UPDATE`` frame on stream ``0`` (when the automatic flow
+        control strategy decides to emit one). This ensures that abandoning a
+        stream cannot permanently leak connection-level credit and stall the
+        other streams, while a late acknowledgement of the reset data will not
+        return those bytes a second time.
+
         :param stream_id: The ID of the stream to reset.
         :type stream_id: ``int``
         :param error_code: (optional) The error code to use to reset the
@@ -1072,8 +1081,42 @@ class H2Connection:
         self.config.logger.debug("Reset stream ID %d", stream_id)
         self.state_machine.process_input(ConnectionInputs.SEND_RST_STREAM)
         stream = self._get_stream_by_id(stream_id)
-        frames = stream.reset_stream(error_code)
+
+        # Hand any unconsumed flow controlled bytes back to the connection
+        # window before the stream disappears. No stream level WINDOW_UPDATE
+        # is ever emitted for a closed stream.
+        frames = self._settle_reset_stream_flow_control(stream)
+        frames.extend(stream.reset_stream(error_code))
         self._prepare_for_sending(frames)
+
+    def _settle_reset_stream_flow_control(self, stream: H2Stream) -> list[Frame]:
+        """
+        Settle the inbound flow control credit for a stream that is being
+        terminated with RST_STREAM.
+
+        Bytes that were already given to the application but never
+        acknowledged must be returned to the *connection* flow control
+        window. The connection window manager's normal coalescing logic
+        decides whether a ``WINDOW_UPDATE`` frame (on stream ``0``) is emitted
+        immediately; the bookkeeping is updated regardless, so the credit can
+        never be lost or refunded twice.
+        """
+        unacknowledged = stream.settle_abandoned_data()
+        if not unacknowledged:
+            return []
+
+        conn_manager = self._inbound_flow_control_window_manager
+        conn_increment = conn_manager.process_bytes(unacknowledged)
+        if not conn_increment:
+            return []
+
+        self.config.logger.debug(
+            "Stream %d reset: returning %d flow controlled bytes to the "
+            "connection window", stream.stream_id, unacknowledged,
+        )
+        f = WindowUpdateFrame(0)
+        f.window_increment = conn_increment
+        return [f]
 
     def close_connection(self,
                          error_code: ErrorCodes | int = 0,
@@ -1351,6 +1394,14 @@ class H2Connection:
 
         .. versionadded:: 2.5.0
 
+        .. versionchanged:: dev
+           If the stream was terminated with RST_STREAM, any flow controlled
+           bytes still outstanding were already returned to the *connection*
+           window when the reset happened. A late acknowledgement of such a
+           stream is therefore a no-op: it neither adds connection window
+           credit again nor emits a meaningless stream level
+           ``WINDOW_UPDATE``.
+
         :param acknowledged_size: The total *flow-controlled size* of the data
             that has been processed. Note that this must include the amount of
             padding that was sent with that data.
@@ -1373,6 +1424,20 @@ class H2Connection:
 
         frames: list[Frame] = []
 
+        # Streams abandoned through RST_STREAM have already had all of their
+        # outstanding flow controlled bytes settled back into the connection
+        # window. Acknowledging them again would refund the same connection
+        # credit twice, so the acknowledgement is ignored entirely. This
+        # applies whether the stream object is still around or has already
+        # been cleaned up.
+        if self._stream_is_closed_by_reset(stream_id):
+            self.config.logger.debug(
+                "Ignoring acknowledgement of %d bytes on reset stream %d",
+                acknowledged_size, stream_id,
+            )
+            self._prepare_for_sending(frames)
+            return
+
         conn_manager = self._inbound_flow_control_window_manager
         conn_increment = conn_manager.process_bytes(acknowledged_size)
         if conn_increment:
@@ -1387,7 +1452,10 @@ class H2Connection:
             # the window in this case.
             pass
         else:
-            # No point incrementing the windows of closed streams.
+            # No point incrementing the windows of closed streams. A stream
+            # closed by RST_STREAM was handled (and skipped) above; streams
+            # closed cleanly with END_STREAM may still legitimately return
+            # connection-level credit here.
             if stream.open:
                 frames.extend(
                     stream.acknowledge_received_data(acknowledged_size),
@@ -1710,6 +1778,18 @@ class H2Connection:
         # the inbound flow window being 0.
         frames: list[Frame] = []
         conn_manager = self._inbound_flow_control_window_manager
+
+        # If the stream object still exists, the state machine just forcibly
+        # reset it (for example because DATA arrived after END_STREAM). Any
+        # data it had previously handed to the application but that was never
+        # acknowledged is still holding connection credit, so settle it now
+        # alongside the frame that triggered the reset. This is a no-op for
+        # streams already settled by an explicit RST_STREAM, so the credit can
+        # never be returned twice.
+        stream = self.streams.get(exc.stream_id)
+        if stream is not None:
+            frames.extend(self._settle_reset_stream_flow_control(stream))
+
         conn_increment = conn_manager.process_bytes(
             frame.flow_controlled_length,
         )
@@ -1808,6 +1888,11 @@ class H2Connection:
                 )
             except StreamClosedError:
                 return [], events
+            # An overlarge stream window increment forces a local reset. Make
+            # sure any inbound flow control credit still held by the dying
+            # stream is returned to the connection window as well.
+            if stream.closed_by == StreamClosedBy.SEND_RST_STREAM:
+                frames = self._settle_reset_stream_flow_control(stream) + frames
         else:
             # Increment our local flow control window.
             self.outbound_flow_control_window = guard_increment_window(
@@ -1854,16 +1939,24 @@ class H2Connection:
         events = self.state_machine.process_input(
             ConnectionInputs.RECV_RST_STREAM,
         )
+        frames: list[Frame] = []
         try:
             stream = self._get_stream_by_id(frame.stream_id)
         except NoSuchStreamError:
             # The stream is missing. That's ok, we just do nothing here.
-            stream_frames: list[Frame] = []
             stream_events: list[Event] = []
         else:
+            # The remote peer is abandoning the stream. Any flow controlled
+            # bytes it had already sent us that we never acknowledged have to
+            # be returned to the connection window now, otherwise the
+            # connection-level credit is lost and every other stream can
+            # stall. We emit a connection-level WINDOW_UPDATE only: a stream
+            # level WINDOW_UPDATE is meaningless once the stream is closed.
+            frames.extend(self._settle_reset_stream_flow_control(stream))
             stream_frames, stream_events = stream.stream_reset(frame)
+            frames.extend(stream_frames)
 
-        return stream_frames, events + stream_events
+        return frames, events + stream_events
 
     def _receive_priority_frame(self, frame: HeadersFrame | PriorityFrame) -> tuple[list[Frame], list[Event]]:
         """

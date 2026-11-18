@@ -9,6 +9,7 @@ from __future__ import annotations
 import pytest
 from hypothesis import HealthCheck, given, settings
 from hypothesis.strategies import integers
+from hyperframe.frame import Frame, WindowUpdateFrame
 
 import h2.config
 import h2.connection
@@ -813,8 +814,12 @@ class TestAutomaticFlowControl:
                                                  frame_factory,
                                                  force_cleanup) -> None:
         """
-        When acknowledging data on a stream that has just been closed, no
-        acknowledgement is given for that stream, only for the connection.
+        When a stream is terminated with RST_STREAM the unacknowledged data is
+        settled back into the connection flow control window at reset time.
+        A late acknowledgement of that data then does nothing: the credit
+        must not be added to the connection window a second time, and no
+        meaningless stream level WINDOW_UPDATE is emitted for a closed
+        stream.
         """
         c = self._setup_connection_and_send_headers(frame_factory)
 
@@ -826,6 +831,18 @@ class TestAutomaticFlowControl:
             stream_id=1,
         )
         c.receive_data(rst_frame.serialize())
+
+        # The whole stream was still unacknowledged, so the reset settles all
+        # 65535 bytes back into the connection window. The window had been
+        # fully consumed, so a connection level WINDOW_UPDATE is emitted
+        # immediately. A received RST_STREAM does not itself trigger a reply
+        # RST_STREAM.
+        expected_reset = frame_factory.build_window_update_frame(
+            stream_id=0, increment=self.DEFAULT_FLOW_WINDOW,
+        ).serialize()
+        assert c.data_to_send() == expected_reset
+        assert c.inbound_flow_control_window == self.DEFAULT_FLOW_WINDOW
+
         c.clear_outbound_data_buffer()
 
         if force_cleanup:
@@ -833,12 +850,15 @@ class TestAutomaticFlowControl:
             # cleaned up.
             assert c.open_outbound_streams == 0
 
+        # A late acknowledgement must be a complete no-op: the bytes were
+        # returned already, so crediting them again would be a double refund.
         c.acknowledge_received_data(2048, stream_id=1)
+        assert not c.data_to_send()
+        assert c.inbound_flow_control_window == self.DEFAULT_FLOW_WINDOW
 
-        expected = frame_factory.build_window_update_frame(
-            stream_id=0, increment=2048,
-        )
-        assert c.data_to_send() == expected.serialize()
+        # Repeated late acknowledgements are equally inert.
+        c.acknowledge_received_data(2048, stream_id=1)
+        assert not c.data_to_send()
 
     def test_acknowledging_streams_we_never_saw(self, frame_factory) -> None:
         """
@@ -968,3 +988,444 @@ class TestAutomaticFlowControl:
             stream_id=1, increment=increment,
         ).serialize()
         assert c.data_to_send() == expected_data
+
+
+class TestResetFlowControlSettlement:
+    """
+    Tests that terminating a stream with RST_STREAM settles its inbound flow
+    control accounting correctly: unconsumed connection-level credit is
+    returned exactly once, bytes already acknowledged are not returned again,
+    no stream level WINDOW_UPDATE is emitted for a closed stream, and
+    abandoning one stream can never permanently stall another stream.
+    """
+
+    example_request_headers = [
+        (":authority", "example.com"),
+        (":path", "/"),
+        (":scheme", "https"),
+        (":method", "GET"),
+    ]
+    server_config = h2.config.H2Configuration(client_side=False)
+
+    DEFAULT_FLOW_WINDOW = 65535
+
+    def _server_with_stream(self, frame_factory, stream_id=1):
+        c = h2.connection.H2Connection(config=self.server_config)
+        c.initiate_connection()
+        c.receive_data(frame_factory.preamble())
+        # Allow full-window DATA frames in a single frame.
+        c.update_settings(
+            {h2.settings.SettingCodes.MAX_FRAME_SIZE: self.DEFAULT_FLOW_WINDOW},
+        )
+        c.receive_data(frame_factory.build_settings_frame({}, ack=True).serialize())
+        c.clear_outbound_data_buffer()
+        headers = frame_factory.build_headers_frame(
+            self.example_request_headers, stream_id=stream_id,
+        )
+        c.receive_data(headers.serialize())
+        c.clear_outbound_data_buffer()
+        return c
+
+    def test_local_reset_returns_unacknowledged_connection_credit(
+        self, frame_factory,
+    ) -> None:
+        """
+        Resetting a stream locally hands the unacknowledged bytes back to the
+        connection flow control window (via a stream-0 WINDOW_UPDATE), never
+        to a stream level WINDOW_UPDATE.
+        """
+        c = self._server_with_stream(frame_factory)
+
+        data = b"\x00" * self.DEFAULT_FLOW_WINDOW
+        c.receive_data(
+            frame_factory.build_data_frame(data, stream_id=1).serialize(),
+        )
+        assert c.inbound_flow_control_window == 0
+        c.clear_outbound_data_buffer()
+
+        c.reset_stream(1)
+
+        # A connection-level WINDOW_UPDATE followed by the RST_STREAM, and
+        # nothing on stream 1.
+        expected = (
+            frame_factory.build_window_update_frame(
+                stream_id=0, increment=self.DEFAULT_FLOW_WINDOW,
+            ).serialize()
+            + frame_factory.build_rst_stream_frame(stream_id=1).serialize()
+        )
+        assert c.data_to_send() == expected
+        assert c.inbound_flow_control_window == self.DEFAULT_FLOW_WINDOW
+
+    def test_local_reset_only_returns_unacknowledged_balance(
+        self, frame_factory,
+    ) -> None:
+        """
+        Bytes the application already acknowledged must not be returned a
+        second time when the stream is reset: only the outstanding balance is
+        settled.
+        """
+        c = self._server_with_stream(frame_factory)
+
+        chunk = self.DEFAULT_FLOW_WINDOW // 2
+        c.receive_data(
+            frame_factory.build_data_frame(
+                b"\x00" * chunk, stream_id=1,
+            ).serialize(),
+        )
+        # Acknowledge the whole chunk. The connection window was half full, so
+        # this reaches the half-window threshold and emits a connection level
+        # WINDOW_UPDATE for the full chunk.
+        c.acknowledge_received_data(chunk, stream_id=1)
+        c.clear_outbound_data_buffer()
+
+        # A second, unacknowledged chunk fills the window again.
+        c.receive_data(
+            frame_factory.build_data_frame(
+                b"\x00" * chunk, stream_id=1,
+            ).serialize(),
+        )
+        assert c.inbound_flow_control_window == self.DEFAULT_FLOW_WINDOW - chunk
+        c.clear_outbound_data_buffer()
+
+        c.reset_stream(1)
+
+        # Only the second, unacknowledged chunk is settled: the already
+        # acknowledged first chunk is never returned again. The connection
+        # window happened to be below the half-window threshold, so the
+        # coalescing strategy emits a connection WINDOW_UPDATE for exactly the
+        # outstanding balance, followed by the RST_STREAM.
+        expected = (
+            frame_factory.build_window_update_frame(
+                stream_id=0, increment=chunk,
+            ).serialize()
+            + frame_factory.build_rst_stream_frame(stream_id=1).serialize()
+        )
+        assert c.data_to_send() == expected
+        assert c.inbound_flow_control_window == self.DEFAULT_FLOW_WINDOW
+
+        # The credit cannot be refunded twice: a late acknowledgement of the
+        # reset stream is a no-op.
+        c.acknowledge_received_data(chunk, stream_id=1)
+        assert not c.data_to_send()
+        assert c.inbound_flow_control_window == self.DEFAULT_FLOW_WINDOW
+
+    def test_late_acknowledgement_after_local_reset_is_a_noop(
+        self, frame_factory,
+    ) -> None:
+        """
+        An acknowledgement arriving after a local reset must not add any
+        credit: the bytes were already settled, so a second refund would
+        corrupt the connection window.
+        """
+        c = self._server_with_stream(frame_factory)
+
+        c.receive_data(
+            frame_factory.build_data_frame(
+                b"\x00" * self.DEFAULT_FLOW_WINDOW, stream_id=1,
+            ).serialize(),
+        )
+        c.reset_stream(1)
+        assert c.inbound_flow_control_window == self.DEFAULT_FLOW_WINDOW
+        c.clear_outbound_data_buffer()
+
+        c.acknowledge_received_data(4096, stream_id=1)
+        c.acknowledge_received_data(self.DEFAULT_FLOW_WINDOW, stream_id=1)
+
+        assert not c.data_to_send()
+        assert c.inbound_flow_control_window == self.DEFAULT_FLOW_WINDOW
+
+    def test_late_acknowledgement_after_remote_reset_is_a_noop(
+        self, frame_factory,
+    ) -> None:
+        """
+        The same protection applies when the peer resets the stream, including
+        after the stream object has been cleaned up.
+        """
+        c = self._server_with_stream(frame_factory)
+
+        c.receive_data(
+            frame_factory.build_data_frame(
+                b"\x00" * self.DEFAULT_FLOW_WINDOW, stream_id=1,
+            ).serialize(),
+        )
+        c.receive_data(
+            frame_factory.build_rst_stream_frame(stream_id=1).serialize(),
+        )
+        assert c.inbound_flow_control_window == self.DEFAULT_FLOW_WINDOW
+        c.clear_outbound_data_buffer()
+
+        # Force cleanup of the stream object.
+        assert c.open_inbound_streams == 0
+        assert 1 not in c.streams
+
+        c.acknowledge_received_data(4096, stream_id=1)
+        assert not c.data_to_send()
+        assert c.inbound_flow_control_window == self.DEFAULT_FLOW_WINDOW
+
+    def test_cancelling_one_stream_does_not_stall_another(
+        self, frame_factory,
+    ) -> None:
+        """
+        With two concurrent streams, filling the connection window on one
+        stream and then resetting it must restore the full connection window
+        so the other stream can keep receiving data.
+        """
+        c = self._server_with_stream(frame_factory, stream_id=1)
+        c.receive_data(
+            frame_factory.build_headers_frame(
+                self.example_request_headers, stream_id=3,
+            ).serialize(),
+        )
+        c.clear_outbound_data_buffer()
+
+        # Exhaust the whole connection window on stream 1.
+        c.receive_data(
+            frame_factory.build_data_frame(
+                b"\x00" * self.DEFAULT_FLOW_WINDOW, stream_id=1,
+            ).serialize(),
+        )
+        assert c.remote_flow_control_window(3) == 0
+        c.clear_outbound_data_buffer()
+
+        # The application gives up on stream 1.
+        c.reset_stream(1)
+
+        # The connection credit is fully restored.
+        assert c.inbound_flow_control_window == self.DEFAULT_FLOW_WINDOW
+        assert c.remote_flow_control_window(3) == self.DEFAULT_FLOW_WINDOW
+
+        # Stream 3 is therefore still able to receive a full window of data,
+        # which would have raised FlowControlError before the fix.
+        c.receive_data(
+            frame_factory.build_data_frame(
+                b"\x01" * self.DEFAULT_FLOW_WINDOW, stream_id=3,
+            ).serialize(),
+        )
+        assert c.remote_flow_control_window(3) == 0
+
+    def test_padding_counts_in_reset_settlement(self, frame_factory) -> None:
+        """
+        Padding is flow controlled: the settlement uses
+        ``flow_controlled_length`` (data + padding + padding-length field),
+        not the length of the application data.
+        """
+        c = self._server_with_stream(frame_factory)
+
+        payload = b"some data"
+        padding = 10
+        flow_controlled = len(payload) + padding + 1
+        frame = frame_factory.build_data_frame(
+            payload, stream_id=1, padding_len=padding,
+        )
+        events = c.receive_data(frame.serialize())
+        data_event = next(
+            e for e in events if isinstance(e, h2.events.DataReceived)
+        )
+        assert data_event.flow_controlled_length == flow_controlled
+        c.clear_outbound_data_buffer()
+
+        c.reset_stream(1)
+
+        # The amount is below the automatic WINDOW_UPDATE thresholds, so the
+        # credit is coalesced and only the RST_STREAM goes on the wire, but
+        # the inbound window bookkeeping reflects the full flow controlled
+        # length.
+        assert c.data_to_send() == (
+            frame_factory.build_rst_stream_frame(stream_id=1).serialize()
+        )
+        assert c.inbound_flow_control_window == (
+            self.DEFAULT_FLOW_WINDOW - flow_controlled
+        )
+
+    def test_reset_with_no_data_emits_no_window_update(
+        self, frame_factory,
+    ) -> None:
+        """
+        Resetting a stream that never received flow controlled data has
+        nothing to settle: only the RST_STREAM frame is emitted.
+        """
+        c = self._server_with_stream(frame_factory)
+        c.clear_outbound_data_buffer()
+
+        c.reset_stream(1)
+
+        assert c.data_to_send() == (
+            frame_factory.build_rst_stream_frame(stream_id=1).serialize()
+        )
+        assert c.inbound_flow_control_window == self.DEFAULT_FLOW_WINDOW
+
+    def test_acknowledgement_on_cleanly_closed_stream_still_opens_window(
+        self, frame_factory,
+    ) -> None:
+        """
+        A late acknowledgement on a stream closed cleanly with END_STREAM
+        (not RST_STREAM) still returns connection level credit as before: the
+        no-op behaviour is strictly scoped to reset streams.
+        """
+        c = self._server_with_stream(frame_factory)
+
+        data_frame = frame_factory.build_data_frame(
+            b"\x00" * self.DEFAULT_FLOW_WINDOW,
+            stream_id=1,
+            flags=["END_STREAM"],
+        )
+        c.receive_data(data_frame.serialize())
+        c.clear_outbound_data_buffer()
+
+        c.acknowledge_received_data(self.DEFAULT_FLOW_WINDOW, stream_id=1)
+
+        # A stream closed cleanly with END_STREAM is not a reset: the normal
+        # acknowledgement path runs, opening both the connection window and
+        # (while the stream object is still present) the stream window.
+        expected = (
+            frame_factory.build_window_update_frame(
+                stream_id=0, increment=self.DEFAULT_FLOW_WINDOW,
+            ).serialize()
+            + frame_factory.build_window_update_frame(
+                stream_id=1, increment=self.DEFAULT_FLOW_WINDOW,
+            ).serialize()
+        )
+        assert c.data_to_send() == expected
+        assert c.inbound_flow_control_window == self.DEFAULT_FLOW_WINDOW
+
+    def test_remote_reset_emits_no_stream_level_window_update(
+        self, frame_factory,
+    ) -> None:
+        """
+        Handling a received RST_STREAM never emits a stream level
+        WINDOW_UPDATE: only stream 0 may be updated, and only when there is
+        unacknowledged credit to settle.
+        """
+        c = self._server_with_stream(frame_factory)
+
+        c.receive_data(
+            frame_factory.build_data_frame(
+                b"\x00" * self.DEFAULT_FLOW_WINDOW, stream_id=1,
+            ).serialize(),
+        )
+        c.clear_outbound_data_buffer()
+
+        c.receive_data(
+            frame_factory.build_rst_stream_frame(stream_id=1).serialize(),
+        )
+
+        wire = c.data_to_send()
+        assert wire == frame_factory.build_window_update_frame(
+            stream_id=0, increment=self.DEFAULT_FLOW_WINDOW,
+        ).serialize()
+
+    def test_flow_control_error_auto_reset_settles_inbound_credit(
+        self, frame_factory,
+    ) -> None:
+        """
+        When an overlarge stream WINDOW_UPDATE forces h2 to reset the stream
+        locally, inbound flow controlled bytes already held by the dying
+        stream are still returned to the connection window.
+        """
+        c = self._server_with_stream(frame_factory)
+
+        c.receive_data(
+            frame_factory.build_data_frame(
+                b"\x00" * self.DEFAULT_FLOW_WINDOW, stream_id=1,
+            ).serialize(),
+        )
+        assert c.inbound_flow_control_window == 0
+        c.clear_outbound_data_buffer()
+
+        # An increment that would push the outbound stream window past the
+        # legal maximum triggers a local FLOW_CONTROL_ERROR reset.
+        stream = c._get_stream_by_id(1)
+        increment = 2**31 - stream.outbound_flow_control_window
+        bad_update = frame_factory.build_window_update_frame(
+            stream_id=1, increment=increment,
+        )
+        events = c.receive_data(bad_update.serialize())
+
+        assert len(events) == 1
+        assert isinstance(events[0], h2.events.StreamReset)
+
+        # The unacknowledged inbound data is returned to the connection
+        # window and a RST_STREAM is emitted, but no stream level
+        # WINDOW_UPDATE.
+        expected = (
+            frame_factory.build_window_update_frame(
+                stream_id=0, increment=self.DEFAULT_FLOW_WINDOW,
+            ).serialize()
+            + frame_factory.build_rst_stream_frame(
+                stream_id=1,
+                error_code=h2.errors.ErrorCodes.FLOW_CONTROL_ERROR,
+            ).serialize()
+        )
+        assert c.data_to_send() == expected
+        assert c.inbound_flow_control_window == self.DEFAULT_FLOW_WINDOW
+
+    def test_auto_reset_on_data_after_end_stream_settles_prior_data(
+        self, frame_factory,
+    ) -> None:
+        """
+        If the state machine forcibly resets a stream because DATA arrives
+        after END_STREAM, data that had legitimately been delivered on the
+        stream earlier but never acknowledged is still settled back into the
+        connection window.
+        """
+        c = self._server_with_stream(frame_factory)
+
+        # A legitimate DATA frame (ending the stream) that consumes most, but
+        # not all, of the connection window and is never acknowledged. Leaving
+        # head room ensures the stray frame below is still inside the
+        # connection window so it reaches the stream state machine.
+        first_chunk = self.DEFAULT_FLOW_WINDOW - 64
+        c.receive_data(
+            frame_factory.build_data_frame(
+                b"\x00" * first_chunk,
+                stream_id=1,
+                flags=["END_STREAM"],
+            ).serialize(),
+        )
+        c.clear_outbound_data_buffer()
+
+        # More DATA on the now half-closed (remote) stream forces a local
+        # reset.
+        stray = frame_factory.build_data_frame(b"extra", stream_id=1)
+        events = c.receive_data(stray.serialize())
+
+        assert any(
+            isinstance(e, h2.events.StreamReset) for e in events
+        )
+        total_owed = first_chunk + len(b"extra")
+        conn_manager = c._inbound_flow_control_window_manager
+
+        wire = c.data_to_send()
+        # A stream-0 WINDOW_UPDATE may be emitted, but never a WINDOW_UPDATE
+        # on the closed stream 1.
+        stream_zero_updates = 0
+        stream_one_updates = 0
+        while wire:
+            f, fl = Frame.parse_frame_header(memoryview(wire[:9]))
+            f.parse_body(memoryview(wire[9:9 + fl]))
+            if isinstance(f, WindowUpdateFrame):
+                if f.stream_id == 0:
+                    stream_zero_updates += f.window_increment
+                elif f.stream_id == 1:
+                    stream_one_updates += 1
+            wire = wire[9 + fl:]
+        assert stream_one_updates == 0
+
+        # No credit is lost and none is double counted. Before the reset the
+        # connection window had been reduced by ``total_owed`` bytes. Every one
+        # of those bytes is either already reflected in an enlarged connection
+        # window or held in the connection window manager's coalescing counter
+        # to be emitted by a later acknowledgement.
+        window_growth = c.inbound_flow_control_window - (
+            self.DEFAULT_FLOW_WINDOW - total_owed
+        )
+        assert window_growth + conn_manager._bytes_processed == total_owed
+        # The emitted stream-0 updates exactly match the window growth.
+        assert stream_zero_updates == window_growth
+
+        # A late acknowledgement of the reset stream is a no-op, proving the
+        # credit cannot be returned a second time.
+        before = c.inbound_flow_control_window
+        c.acknowledge_received_data(first_chunk, stream_id=1)
+        assert c.inbound_flow_control_window == before
+        assert not c.data_to_send()

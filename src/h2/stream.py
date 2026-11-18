@@ -1255,6 +1255,26 @@ class H2Stream:
 
         return []
 
+    def settle_abandoned_data(self) -> int:
+        """
+        Settle the inbound flow control accounting when this stream is
+        abandoned through RST_STREAM.
+
+        Returns the number of flow controlled bytes (padding included) that
+        had already been handed to the application in
+        :class:`DataReceived <h2.events.DataReceived>` events but which were
+        never acknowledged. The caller is responsible for returning those
+        bytes to the **connection** flow control window. No stream level
+        ``WINDOW_UPDATE`` is emitted: the stream is closed and such a frame
+        would be meaningless.
+
+        This is idempotent: after the first settlement any further call
+        returns zero, and a late :meth:`acknowledge_received_data` on the
+        stream becomes a no-op rather than a second refund.
+        """
+        self.config.logger.debug("Settle abandoned flow control data for %r", self)
+        return self._inbound_window_manager.settle()
+
     def _build_hdr_validation_flags(self, events: Any) -> HeaderValidationFlags:
         """
         Constructs a set of header validation flags for use when normalizing

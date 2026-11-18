@@ -14,7 +14,15 @@ dev
 
 **Bugfixes**
 
--
+- Settle inbound flow control when a stream is terminated with RST_STREAM:
+  flow controlled bytes that had been delivered to the application but were
+  never acknowledged are now returned to the *connection* flow control window
+  exactly once, so abandoning a stream can no longer permanently leak
+  connection-level credit and stall the other streams. The settlement uses
+  ``flow_controlled_length`` (so padding is included), never emits a stream
+  level ``WINDOW_UPDATE`` for the closed stream, and makes a late
+  ``acknowledge_received_data`` on the reset stream a no-op so the same bytes
+  are never refunded twice.
 
 4.4.1 (2026-08-03)
 ------------------
