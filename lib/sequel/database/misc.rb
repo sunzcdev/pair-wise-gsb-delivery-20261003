@@ -146,6 +146,8 @@ module Sequel
     # :preconnect_extensions :: Similar to the :extensions option, but loads the extensions before the
     #                           connections are made by the :preconnect option.
     # :quote_identifiers :: Whether to quote identifiers.
+    # :read_only_sql_policy :: How to route SQL that cannot be confirmed to be read-only when a
+    #                          :read_only server is configured.  See Database#read_only_sql_policy.
     # :servers :: A hash specifying a server/shard specific options, keyed by shard symbol.
     # :single_threaded :: Whether to use a single-threaded connection pool.
     # :sql_log_level :: Method to use to log SQL to a logger, :info by default.
@@ -170,7 +172,9 @@ module Sequel
       @prepared_statements = {}
       @transactions = {}
       @transactions.compare_by_identity if typecast_value_boolean(@opts.fetch(:compare_connections_by_identity, true))
+      @transaction_connections = {}
       @symbol_literal_cache = {}
+      @read_only_sql_policy = typecast_read_only_sql_policy(@opts[:read_only_sql_policy])
 
       @timezone = nil
 

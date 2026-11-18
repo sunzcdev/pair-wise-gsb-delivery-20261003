@@ -178,6 +178,17 @@ module Sequel
     #                 and :remote_write (9.2+).
     def transaction(opts=OPTS, &block)
       opts = Hash[opts]
+
+      # A savepoint has to be created on the connection running the
+      # transaction it is a savepoint for.  If a read/write server is
+      # configured and a transaction is active in the current thread, do not
+      # create a (nested) transaction or savepoint on the :read_only server.
+      # Pin it to the connection and server actually running the active
+      # transaction instead.
+      if @sharded && opts[:server] == :read_only && (entry = current_transaction_connection_entry)
+        opts[:server] = entry[1]
+      end
+
       if retry_on = opts[:retry_on]
         tot_retries = opts.fetch(:num_retries, 5)
         num_retries = 0
@@ -249,8 +260,11 @@ module Sequel
     # inside the block, the transaction is committed.
     def _transaction(conn, opts=OPTS)
       rollback = opts[:rollback]
+      began = false
       begin
         add_transaction(conn, opts)
+        push_transaction_connection(conn, opts)
+        began = true
         begin_transaction(conn, opts)
         if rollback == :always
           begin
@@ -285,7 +299,11 @@ module Sequel
             end
           end
         ensure
-          remove_transaction(conn, committed)
+          begin
+            remove_transaction(conn, committed)
+          ensure
+            pop_transaction_connection(conn) if began
+          end
         end
       end
     end
@@ -294,6 +312,18 @@ module Sequel
     # of options for the current transaction (if any)
     def _trans(conn)
       Sequel.synchronize{@transactions[conn]}
+    end
+
+    # The innermost active transaction connection and server for the current
+    # thread, as an array of [connection, server], or nil if this thread is
+    # not inside a transaction.  The server is the server the transaction was
+    # started with (nil meaning the :default server).  This is used to pin
+    # reads and savepoints inside the transaction to the connection actually
+    # running the transaction.
+    def current_transaction_connection_entry
+      if a = Sequel.synchronize{@transaction_connections[Sequel.current]}
+        a[-1]
+      end
     end
 
     # Add the current thread to the list of active transactions
@@ -315,7 +345,33 @@ module Sequel
       end
 
       Sequel.synchronize{@transactions[conn] = hash}
-    end    
+    end
+
+    # Record that the current thread is using the given connection for a
+    # transaction on the given server, so that reads and savepoints inside
+    # the transaction are pinned to the connection instead of being routed
+    # to another server (such as the :read_only server).
+    def push_transaction_connection(conn, opts)
+      t = Sequel.current
+      server = opts[:server] || :default
+      Sequel.synchronize{(@transaction_connections[t] ||= []) << [conn, server]}
+      nil
+    end
+
+    # Remove the current thread's innermost transaction connection entry.
+    # If a connection is given, only remove the entry if it is for that
+    # connection, so that a failure before the entry was added does not
+    # remove an enclosing transaction's entry.
+    def pop_transaction_connection(conn=nil)
+      t = Sequel.current
+      Sequel.synchronize do
+        if (a = @transaction_connections[t]) && !a.empty? && (!conn || a[-1][0].equal?(conn))
+          a.pop
+          @transaction_connections.delete(t) if a.empty?
+        end
+      end
+      nil
+    end
 
     # Set the given callable as a hook to be called. Type should be either
     # :after_commit or :after_rollback.

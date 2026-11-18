@@ -1,5 +1,7 @@
 === master
 
+* Make reads and savepoints inside a transaction use the connection running the transaction instead of the :read_only server when using primary/replica configurations, and add Database#{read_only_sql?,read_sql_server,read_only_sql_policy} for routing raw SQL based on a conservative classification of the entire statement (jeremyevans)
+
 * Avoid duplicating table when adding/dropping CHECK or NOT NULL constraints on SQLite 3.53+ (jeremyevans)
 
 * Add Database#wait_for_lsn on PostgreSQL 19+ to support WAIT FOR LSN (jeremyevans)

@@ -44,7 +44,7 @@ it sets the default database for Dataset methods that use SELECT queries
 (which are generally read queries that do not modify the database).
 
 If you want to ensure your queries are going to a specific database, you
-can force this for a given query by using the .server method and passing 
+can force this for a given query by using the .server method and passing
 the symbol name defined in the connect options. For example:
 
   # Force the SELECT to run on the primary server
@@ -52,6 +52,68 @@ the symbol name defined in the connect options. For example:
 
   # Force the DELETE to run on the read-only replica
   DB[:users].server(:read_only).delete
+
+=== Transaction Affinity
+
+Reads issued inside a transaction always run on the connection running the
+transaction, so they are never sent to a replica.  This includes reads that
+would normally use the :read_only server, such as SELECT queries and
+<tt>DB.synchronize(:read_only)</tt> blocks.  The transaction's connection
+(and server) is remembered when the transaction starts, so any savepoint
+started inside the transaction is also created on the transaction's
+connection, never on the replica.  A nested
+<tt>DB.synchronize(:read_only)</tt> inside a transaction therefore yields
+the transaction's own connection, not one borrowed from the replica:
+
+  DB.transaction do
+    DB[:users].all                       # primary (transaction connection)
+    DB.synchronize(:read_only){|conn| }  # yields the transaction connection
+    DB.transaction(savepoint: true, server: :read_only){}
+                                         # savepoint on the primary
+  end
+
+This pinning only applies to the :read_only server.  An explicit request for
+another server (such as another shard) still checks out a connection for
+that server, so you can run a separate transaction on another shard inside
+an outer transaction.
+
+=== Raw SQL Routing Policy
+
+Sequel-generated SELECT queries are assumed to be read-only and use the
+:read_only server when outside a transaction.  Raw SQL that you supply
+directly (via <tt>Dataset#with_sql</tt> or <tt>Database#fetch</tt>) cannot
+be assumed to be read-only.  Sequel classifies the entire statement, not
+just the first word, ignoring contents of comments, string literals, and
+quoted identifiers.  A statement is only sent to the :read_only server if
+it can be confirmed to be read-only.  Statements that contain data or schema
+modification keywords anywhere (including inside a CTE), locking clauses,
+sequence advancement, or multiple statements are never sent to the replica.
+
+Statements that cannot be safely classified are routed according to the
+declared <tt>:read_only_sql_policy</tt>.  The default is <tt>:conservative</tt>,
+which sends them to the primary (:default) server:
+
+  DB=Sequel.connect('postgres://primary_server/database',
+    servers: {read_only: {host: 'replica_server'}})
+  DB.read_only_sql?('SELECT * FROM users')             # => true
+  DB.read_only_sql?('SELECT * FROM users FOR UPDATE')  # => false
+  DB[:users].with_sql('SELECT * FROM users').all       # replica
+  DB[:users].with_sql('CALL refresh_stats()').all      # primary
+  DB.fetch('EXPLAIN ANALYZE DELETE FROM users').all    # primary
+
+If all of your unclassifiable SQL is known to be read-only, you can
+explicitly declare that so it uses the replica:
+
+  DB.read_only_sql_policy = :read_only # or the :read_only_sql_policy option
+
+You can also supply a callable that receives each unclassifiable SQL string
+and returns the server to use (or nil/`:default` for the primary):
+
+  DB.read_only_sql_policy = proc{|sql| sql =~ /\AEXPLAIN/ ? :read_only : :default}
+
+Note that an explicit <tt>Dataset#server</tt> call is always honored, even
+if the statement would otherwise be routed differently.  For example,
+<tt>DB[:users].server(:read_only).all</tt> always uses the :read_only server.
 
 === Single Primary, Multiple Replicas
 
