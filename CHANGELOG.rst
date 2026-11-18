@@ -11,6 +11,16 @@ dev
 **API Changes (Backward Compatible)**
 
 - Support for Python 3.15 has been added.
+- Added ``H2Connection.peek_data_to_send`` and ``H2Connection.commit_sent_data``,
+  a non-destructive view/commit interface to the outbound data buffer for
+  non-blocking network layers. Only byte prefixes confirmed as accepted by the
+  transport are removed from the buffer. Committing against a stale view (the
+  buffer changed since the peek) raises the new
+  ``h2.exceptions.StaleOutboundViewError``; committing an invalid length raises
+  the new ``h2.exceptions.InvalidCommitLengthError``. The existing
+  ``data_to_send`` remains available and may be mixed with the new interface,
+  with the checkable rule that any buffer mutation invalidates an outstanding
+  peeked view.
 
 **Bugfixes**
 

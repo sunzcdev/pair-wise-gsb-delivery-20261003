@@ -148,6 +148,14 @@ Protocol Errors
    :show-inheritance:
    :members:
 
+.. autoclass:: h2.exceptions.StaleOutboundViewError
+   :show-inheritance:
+   :members:
+
+.. autoclass:: h2.exceptions.InvalidCommitLengthError
+   :show-inheritance:
+   :members:
+
 
 HTTP/2 Error Codes
 ------------------

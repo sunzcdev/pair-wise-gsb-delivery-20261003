@@ -51,10 +51,12 @@ from .exceptions import (
     DenialOfServiceError,
     FlowControlError,
     FrameTooLargeError,
+    InvalidCommitLengthError,
     NoAvailableStreamIDError,
     NoSuchStreamError,
     ProtocolError,
     RFC1122Error,
+    StaleOutboundViewError,
     StreamClosedError,
     StreamIDTooLowError,
     TooManyStreamsError,
@@ -386,6 +388,19 @@ class H2Connection:
         # Data that needs to be sent.
         self._data_to_send = bytearray()
 
+        # Monotonic version of the outbound data buffer. This is bumped
+        # every time the buffer is mutated (frames are appended, data is
+        # consumed, or the buffer is cleared), so that consumers using the
+        # peek/commit interface can detect that a previously obtained view
+        # has gone stale.
+        self._outbound_buffer_version = 0
+
+        # State captured by the most recent call to ``peek_data_to_send``:
+        # a tuple of the buffer version and the number of bytes covered by
+        # that view. ``None`` when there is no outstanding view to commit
+        # against.
+        self._peeked_buffer_state: tuple[int, int] | None = None
+
         # Keeps track of how streams are closed.
         # Used to ensure that we don't blow up in the face of frames that were
         # in flight when a RST_STREAM was sent.
@@ -421,7 +436,16 @@ class H2Connection:
         if not frames:
             return
         self._data_to_send += b"".join(f.serialize() for f in frames)
+        self._note_outbound_buffer_mutation()
         assert all(f.body_len <= self.max_outbound_frame_size for f in frames)
+
+    def _note_outbound_buffer_mutation(self) -> None:
+        """
+        Record that the outbound data buffer has changed, invalidating any
+        outstanding view obtained via :meth:`peek_data_to_send
+        <h2.connection.H2Connection.peek_data_to_send>`.
+        """
+        self._outbound_buffer_version += 1
 
     def _open_streams(self, remainder: int) -> int:
         """
@@ -535,6 +559,7 @@ class H2Connection:
         )
 
         self._data_to_send += preamble + f.serialize()
+        self._note_outbound_buffer_mutation()
 
     def initiate_upgrade_connection(self, settings_header: bytes | None = None) -> bytes | None:
         """
@@ -1404,6 +1429,18 @@ class H2Connection:
         or less if that much data is not available. It does not perform any
         I/O, and so uses a different name.
 
+        This method consumes the data it returns. If the transport may only
+        write part of the data, consider using :meth:`peek_data_to_send
+        <h2.connection.H2Connection.peek_data_to_send>` and
+        :meth:`commit_sent_data
+        <h2.connection.H2Connection.commit_sent_data>` instead. The two
+        consumption styles may be mixed freely, but note that calling this
+        method mutates the outbound buffer and therefore invalidates any
+        outstanding view obtained from ``peek_data_to_send``: a subsequent
+        ``commit_sent_data`` call will raise :class:`StaleOutboundViewError
+        <h2.exceptions.StaleOutboundViewError>` until a fresh view is
+        obtained.
+
         :param amount: (optional) The maximum amount of data to return. If not
             set, or set to ``None``, will return as much data as possible.
         :type amount: ``int``
@@ -1413,10 +1450,104 @@ class H2Connection:
         if amount is None:
             data = bytes(self._data_to_send)
             self._data_to_send = bytearray()
-            return data
-        data = bytes(self._data_to_send[:amount])
-        self._data_to_send = self._data_to_send[amount:]
+        else:
+            data = bytes(self._data_to_send[:amount])
+            self._data_to_send = self._data_to_send[amount:]
+        self._note_outbound_buffer_mutation()
         return data
+
+    def peek_data_to_send(self, amount: int | None = None) -> bytes:
+        """
+        Returns a view of the data currently queued for sending, without
+        removing it from the internal data buffer.
+
+        This is a non-destructive counterpart to :meth:`data_to_send
+        <h2.connection.H2Connection.data_to_send>`, intended for
+        non-blocking network layers that may only be able to write part of
+        the pending data. The caller can attempt to write the returned bytes
+        and then remove exactly the prefix that was accepted by the
+        transport via :meth:`commit_sent_data
+        <h2.connection.H2Connection.commit_sent_data>`.
+
+        Peeking performs no I/O and does not change any connection or
+        stream state: no frames are generated and flow control is
+        unaffected. Any frames generated after this call (for example
+        control frames triggered by ``receive_data``) are appended to the
+        buffer and will be visible to a subsequent peek: they are never
+        lost, but they do invalidate this view.
+
+        The returned view remains committable until the next mutation of
+        the outbound buffer (new frames being queued, ``data_to_send``,
+        ``commit_sent_data``, or ``clear_outbound_data_buffer``). Committing
+        against a stale view raises :class:`StaleOutboundViewError
+        <h2.exceptions.StaleOutboundViewError>`.
+
+        .. versionadded:: 4.5.0
+
+        :param amount: (optional) The maximum amount of data to return. If
+            not set, or set to ``None``, will return as much data as
+            possible. Only the returned prefix may later be committed.
+        :type amount: ``int``
+        :returns: A bytestring containing the data to send on the wire.
+        :rtype: ``bytes``
+        """
+        if amount is not None and amount < 0:
+            msg = f"Cannot peek a negative amount of data: {amount}"
+            raise ValueError(msg)
+        if amount is None:
+            data = bytes(self._data_to_send)
+        else:
+            data = bytes(self._data_to_send[:amount])
+        self._peeked_buffer_state = (self._outbound_buffer_version, len(data))
+        return data
+
+    def commit_sent_data(self, amount: int) -> None:
+        """
+        Removes a prefix of the outbound data buffer that the transport has
+        confirmed accepting, as previously obtained via
+        :meth:`peek_data_to_send
+        <h2.connection.H2Connection.peek_data_to_send>`.
+
+        This method only deletes bytes from the buffer: it performs no I/O,
+        does not generate any frames, and does not change any connection or
+        stream state. Only a byte prefix covered by the most recent peek
+        may be committed, and only if the outbound buffer has not changed
+        since that peek. After a successful commit the view is consumed, so
+        a fresh peek is required before committing again.
+
+        .. versionadded:: 4.5.0
+
+        :param amount: The number of bytes, counted from the start of the
+            last peeked view, that the transport has accepted.
+        :type amount: ``int``
+        :raises StaleOutboundViewError: if there is no outstanding peek, or
+            if the outbound buffer changed since the last peek.
+        :raises InvalidCommitLengthError: if ``amount`` is negative or
+            exceeds the number of bytes covered by the last peek.
+        """
+        if self._peeked_buffer_state is None:
+            msg = (
+                "commit_sent_data requires an outstanding view from "
+                "peek_data_to_send"
+            )
+            raise StaleOutboundViewError(msg)
+        peeked_version, peeked_length = self._peeked_buffer_state
+        if peeked_version != self._outbound_buffer_version:
+            msg = (
+                "The outbound data buffer changed since the last "
+                "peek_data_to_send call: the view is stale. Peek again "
+                "before committing."
+            )
+            raise StaleOutboundViewError(msg)
+        if amount < 0 or amount > peeked_length:
+            msg = (
+                f"Cannot commit {amount} bytes: only {peeked_length} bytes "
+                f"were covered by the last peek_data_to_send call"
+            )
+            raise InvalidCommitLengthError(msg)
+        del self._data_to_send[:amount]
+        self._peeked_buffer_state = None
+        self._note_outbound_buffer_mutation()
 
     def clear_outbound_data_buffer(self) -> None:
         """
@@ -1429,6 +1560,7 @@ class H2Connection:
         exposing implementation details.
         """
         self._data_to_send = bytearray()
+        self._note_outbound_buffer_mutation()
 
     def _acknowledge_settings(self) -> list[Frame]:
         """

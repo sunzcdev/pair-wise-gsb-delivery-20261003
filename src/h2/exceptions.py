@@ -179,6 +179,31 @@ class RFC1122Error(H2Error):
     # turns out to be true, TELL HIM NOTHING.
 
 
+class StaleOutboundViewError(H2Error):
+    """
+    An attempt was made to commit outbound data against a view of the
+    outbound data buffer that is no longer current: either no view was
+    obtained via :meth:`peek_data_to_send
+    <h2.connection.H2Connection.peek_data_to_send>`, or the buffer was
+    mutated (frames were generated, data was consumed, or the buffer was
+    cleared) after the view was taken.
+
+    .. versionadded:: 4.5.0
+    """
+
+
+class InvalidCommitLengthError(H2Error, ValueError):
+    """
+    An attempt was made to commit a number of outbound bytes that was not
+    covered by the outstanding view of the outbound data buffer (for
+    example, a negative amount, or more bytes than were returned by the
+    last call to :meth:`peek_data_to_send
+    <h2.connection.H2Connection.peek_data_to_send>`).
+
+    .. versionadded:: 4.5.0
+    """
+
+
 class DenialOfServiceError(ProtocolError):
     """
     Emitted when the remote peer exhibits a behaviour that is likely to be an
