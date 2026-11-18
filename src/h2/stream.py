@@ -838,19 +838,30 @@ class H2Stream:
         """
         return self.state_machine.stream_closed_by
 
-    def upgrade(self, client_side: bool) -> None:
+    def upgrade(self, client_side: bool, request_complete: bool = True) -> None:
         """
         Called by the connection to indicate that this stream is the initial
         request/response of an upgraded connection. Places the stream into an
         appropriate state.
+
+        When the original request was already complete, the side that sent it
+        starts half-closed in that direction: half-closed(local) for a client,
+        half-closed(remote) for a server. If it was not complete, the stream
+        opens in both directions and the body continues normally.
         """
         self.config.logger.debug("Upgrading %r", self)
 
         assert self.stream_id == 1
-        input_ = (
-            StreamInputs.UPGRADE_CLIENT if client_side
-            else StreamInputs.UPGRADE_SERVER
-        )
+        if request_complete:
+            input_ = (
+                StreamInputs.UPGRADE_CLIENT if client_side
+                else StreamInputs.UPGRADE_SERVER
+            )
+        else:
+            input_ = (
+                StreamInputs.SEND_HEADERS if client_side
+                else StreamInputs.RECV_HEADERS
+            )
 
         # This may return events, we deliberately don't want them.
         self.state_machine.process_input(input_)

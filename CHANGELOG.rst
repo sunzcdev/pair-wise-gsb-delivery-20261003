@@ -11,6 +11,21 @@ dev
 **API Changes (Backward Compatible)**
 
 - Support for Python 3.15 has been added.
+- ``H2Connection.initiate_upgrade_connection`` accepts ``strict=True`` to validate an
+  ``Upgrade: h2c`` exchange before touching any connection state. The
+  ``HTTP2-Settings`` value is checked as unpadded base64url of whole SETTINGS entries,
+  duplicate settings are rejected, and every value is validated against the role of the
+  peer that sent it. A bad payload raises the new ``InvalidUpgradeSettingsError`` and
+  leaves the connection untouched.
+- Strict upgrades record an inspectable ``H2Connection.upgrade_state`` (an
+  ``UpgradeState``), including the role, the mapped stream (always 1) and whether the
+  original request was complete. ``request_complete=False`` keeps stream 1 open in both
+  directions instead of starting it half-closed.
+- Strict upgrades no longer apply the upgrade settings twice: the client's connection
+  preface carries an empty SETTINGS frame, and the server ignores restated values in the
+  peer's preface while still applying genuine changes.
+- ``HTTP2-Settings`` values are now emitted without base64 padding, as RFC 9113
+  requires.
 
 **Bugfixes**
 

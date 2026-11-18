@@ -91,6 +91,36 @@ The code below demonstrates how to handle a plaintext upgrade from the perspecti
    :encoding: utf-8
 
 
+Strict upgrades
+~~~~~~~~~~~~~~~
+
+The plain ``initiate_upgrade_connection`` call above trusts the ``HTTP2-Settings`` value and commits the connection immediately. If you would rather validate first — for example, because the header value came off the wire from an untrusted client and you still want the option of answering with a ``101`` or falling back to HTTP/1.1 — pass ``strict=True``.
+
+In strict mode the value is decoded and validated *before* any connection state changes. The payload must be unpadded base64url of a whole number of SETTINGS entries and it must not list the same setting twice. Every setting is then validated against the role of the peer that sent it. If anything is wrong, :class:`InvalidUpgradeSettingsError <h2.exceptions.InvalidUpgradeSettingsError>` is raised and the :class:`H2Connection <h2.connection.H2Connection>` is left untouched, so you can keep speaking HTTP/1.1:
+
+.. code-block:: python
+
+   connection = h2.connection.H2Connection(config=server_config)
+
+   try:
+       connection.initiate_upgrade_connection(
+           settings_header,
+           strict=True,
+           role=h2.connection.UpgradeRole.SERVER,
+       )
+   except h2.exceptions.InvalidUpgradeSettingsError:
+       # Reject the upgrade; the connection object has not been modified.
+       send_http1_1_response()
+
+On success, the exchange is recorded in :attr:`H2Connection.upgrade_state <h2.connection.H2Connection.upgrade_state>`: an :class:`UpgradeState <h2.connection.UpgradeState>` describing which side of the upgrade this is, the stream the original request was mapped to (always stream 1), whether that request was already complete, and the settings that were applied.
+
+Because the original request already exists, stream 1 starts half-closed in the direction the request travelled: half-closed (local) on the client and half-closed (remote) on the server. If the request was not complete — for example a body still in flight — pass ``request_complete=False`` and the stream opens in both directions so the body can continue.
+
+The settings carried in ``HTTP2-Settings`` are also not repeated in the connection preface. A strict client sends an empty SETTINGS frame in its preface, because its settings have already been sent in the header; a strict server treats the first SETTINGS frame of the peer's preface as the same payload it has already applied, so a repeated value does not move flow-control windows twice. Any value in that preface that genuinely differs is still applied, once.
+
+Connections that do not upgrade — ALPN and prior knowledge — are unaffected: they keep using :meth:`H2Connection.initiate_connection <h2.connection.H2Connection.initiate_connection>` and have ``upgrade_state`` set to ``None``.
+
+
 Prior Knowledge
 ---------------
 

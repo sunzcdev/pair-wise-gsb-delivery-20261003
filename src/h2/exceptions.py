@@ -134,6 +134,23 @@ class InvalidSettingsValueError(ProtocolError, ValueError):
         self.error_code = error_code
 
 
+class InvalidUpgradeSettingsError(ProtocolError, ValueError):
+    """
+    The value of an ``HTTP2-Settings`` header field cannot be used to set up
+    an ``Upgrade: h2c`` connection.
+
+    This is raised before any connection state is modified: a failed strict
+    upgrade leaves the :class:`H2Connection
+    <h2.connection.H2Connection>` exactly as it was.
+
+    .. versionadded:: 4.5.0
+    """
+
+    def __init__(self, msg: str, error_code: ErrorCodes = ErrorCodes.PROTOCOL_ERROR) -> None:
+        super().__init__(msg)
+        self.error_code = error_code
+
+
 class InvalidBodyLengthError(ProtocolError):
     """
     The remote peer sent more or less data that the Content-Length header

@@ -7,6 +7,9 @@ An implementation of a HTTP/2 connection.
 from __future__ import annotations
 
 import base64
+import binascii
+import struct
+from dataclasses import dataclass, field
 from enum import Enum, IntEnum
 from typing import TYPE_CHECKING, Any
 
@@ -51,6 +54,8 @@ from .exceptions import (
     DenialOfServiceError,
     FlowControlError,
     FrameTooLargeError,
+    InvalidSettingsValueError,
+    InvalidUpgradeSettingsError,
     NoAvailableStreamIDError,
     NoSuchStreamError,
     ProtocolError,
@@ -60,7 +65,7 @@ from .exceptions import (
     TooManyStreamsError,
 )
 from .frame_buffer import FrameBuffer
-from .settings import ChangedSetting, SettingCodes, Settings
+from .settings import ChangedSetting, SettingCodes, Settings, _setting_code_from_int
 from .stream import H2Stream, StreamClosedBy
 from .utilities import SizeLimitDict, guard_increment_window
 from .windows import WindowManager
@@ -273,6 +278,140 @@ class H2ConnectionStateMachine:
             return []
 
 
+class UpgradeRole(Enum):
+    """
+    Which side of an ``Upgrade: h2c`` exchange a connection represents.
+
+    .. versionadded:: 4.5.0
+    """
+
+    #: The side that sent the HTTP/1.1 request and the ``Upgrade`` header.
+    CLIENT = 0
+    #: The side that received the request and answered with ``101``.
+    SERVER = 1
+
+
+@dataclass(frozen=True)
+class UpgradeState:
+    """
+    An inspectable record of how a connection was established by an
+    ``Upgrade: h2c`` exchange.
+
+    :class:`H2Connection.initiate_upgrade_connection
+    <h2.connection.H2Connection.initiate_upgrade_connection>` in strict mode
+    records one of these on :attr:`H2Connection.upgrade_state
+    <h2.connection.H2Connection.upgrade_state>`. Connections that use ALPN or
+    prior knowledge have a ``None`` upgrade state: their behaviour is
+    unchanged.
+
+    .. versionadded:: 4.5.0
+
+    :param role: The side of the upgrade this connection is on.
+    :param stream_id: The stream the upgraded request was mapped to. Always
+        ``1``: RFC 9113 § 3.2 assigns the original request to stream 1.
+    :param request_complete: Whether the HTTP/1.1 request had already been
+        fully sent/received when the upgrade happened. When true, stream 1
+        starts half-closed towards the peer that sent the request.
+    :param settings: The settings carried in the ``HTTP2-Settings`` field, as
+        validated at upgrade time.
+    :param settings_header: The raw ``HTTP2-Settings`` value, when this side
+        received one. ``None`` on the client, which generated it.
+    """
+
+    role: UpgradeRole
+    stream_id: int
+    request_complete: bool
+    settings: dict[SettingCodes | int, int] = field(default_factory=dict)
+    settings_header: bytes | None = None
+
+    @property
+    def client_side(self) -> bool:
+        """
+        Whether this connection is on the client side of the upgrade.
+        """
+        return self.role is UpgradeRole.CLIENT
+
+    @property
+    def consumed_settings_header(self) -> bool:
+        """
+        Whether the ``HTTP2-Settings`` payload has already been applied to
+        :attr:`H2Connection.remote_settings
+        <h2.connection.H2Connection.remote_settings>`.
+        """
+        return self.settings_header is not None
+
+
+# The ``HTTP2-Settings`` field is a SETTINGS frame payload, so it uses the
+# same six-byte entries.
+_UPGRADE_SETTING_ENTRY_SIZE = 6
+
+# base64url without padding, as required for a transferable field value.
+_UPGRADE_BASE64_ALPHABET = frozenset(b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_")
+
+
+def _decode_upgrade_settings_header(settings_header: bytes) -> dict[SettingCodes | int, int]:
+    """
+    Decode and validate the value of an ``HTTP2-Settings`` header field.
+
+    This performs no connection mutation: it either returns a fully validated
+    settings mapping, or raises :class:`InvalidUpgradeSettingsError
+    <h2.exceptions.InvalidUpgradeSettingsError>`. Callers may therefore reject
+    a bad payload without having touched any connection state.
+
+    :param settings_header: The raw header value, as bytes.
+    :returns: The decoded settings.
+    """
+    if not isinstance(settings_header, (bytes, bytearray, memoryview)):
+        msg = "HTTP2-Settings header field value must be bytes."
+        raise InvalidUpgradeSettingsError(msg)
+
+    header = bytes(settings_header)
+    if not header:
+        return {}
+
+    # The field is base64url without padding (RFC 9113 § 3.2.1). Reject
+    # padding and any character outside the URL-safe alphabet explicitly:
+    # ``urlsafe_b64decode`` silently drops characters it does not recognise.
+    if b"=" in header:
+        msg = "HTTP2-Settings must not be padded."
+        raise InvalidUpgradeSettingsError(msg)
+    if not set(header) <= _UPGRADE_BASE64_ALPHABET:
+        msg = "HTTP2-Settings is not valid base64url."
+        raise InvalidUpgradeSettingsError(msg)
+    # A single leftover character cannot encode a whole byte.
+    if len(header) % 4 == 1:
+        msg = "HTTP2-Settings has an invalid base64url length."
+        raise InvalidUpgradeSettingsError(msg)
+
+    try:
+        body = base64.urlsafe_b64decode(header + b"=" * (-len(header) % 4))
+    except binascii.Error as e:  # pragma: no cover - excluded by the checks above
+        msg = "HTTP2-Settings is not valid base64url."
+        raise InvalidUpgradeSettingsError(msg) from e
+
+    if len(body) % _UPGRADE_SETTING_ENTRY_SIZE:
+        msg = "HTTP2-Settings payload is not a whole number of settings."
+        raise InvalidUpgradeSettingsError(msg)
+
+    settings: dict[SettingCodes | int, int] = {}
+    for offset in range(0, len(body), _UPGRADE_SETTING_ENTRY_SIZE):
+        identifier, value = struct.unpack(">HI", body[offset:offset + _UPGRADE_SETTING_ENTRY_SIZE])
+        code = _setting_code_from_int(identifier)
+
+        # An upgrade payload cannot carry a setting twice: the header is a
+        # single SETTINGS frame, and a duplicate has no unambiguous value.
+        if code in settings:
+            msg = f"Setting {identifier} appears more than once in HTTP2-Settings."
+            raise InvalidUpgradeSettingsError(msg)
+
+        # Settings this implementation does not know are kept as integers and
+        # validated by the caller, exactly as they would be in a SETTINGS
+        # frame; rejecting them would break peers using a newer extension.
+        settings[code] = value
+
+    return settings
+
+
 class H2Connection:
     """
     A low-level HTTP/2 connection object. This handles building and receiving
@@ -327,6 +466,24 @@ class H2Connection:
         self.streams: dict[int, H2Stream] = {}
         self.highest_inbound_stream_id = 0
         self.highest_outbound_stream_id = 0
+
+        #: How this connection was established by an ``Upgrade: h2c``
+        #: exchange, or ``None`` for a prior-knowledge or ALPN connection.
+        #: Set by :meth:`initiate_upgrade_connection
+        #: <h2.connection.H2Connection.initiate_upgrade_connection>`.
+        #:
+        #: .. versionadded:: 4.5.0
+        self.upgrade_state: UpgradeState | None = None
+
+        # Whether the peer's connection preface SETTINGS frame is still
+        # expected to arrive. Set by the strict server upgrade path, which has
+        # already applied that frame's contents from HTTP2-Settings.
+        self._awaiting_upgrade_preface_settings = False
+
+        # Whether this connection has already emitted its opening
+        # SETTINGS/preface. A strict upgrade must not stack a second one on top.
+        self._connection_initiated = False
+
         self.encoder = Encoder()
         self.decoder = Decoder()
 
@@ -535,8 +692,14 @@ class H2Connection:
         )
 
         self._data_to_send += preamble + f.serialize()
+        self._connection_initiated = True
 
-    def initiate_upgrade_connection(self, settings_header: bytes | None = None) -> bytes | None:
+    def initiate_upgrade_connection(self,
+                                    settings_header: bytes | None = None,
+                                    *,
+                                    strict: bool = False,
+                                    role: UpgradeRole | None = None,
+                                    request_complete: bool = True) -> bytes | None:
         """
         Call to initialise the connection object for use with an upgraded
         HTTP/2 connection (i.e. a connection negotiated using the
@@ -559,11 +722,42 @@ class H2Connection:
         Finally, this method also prepares the appropriate preamble to be sent
         after the upgrade.
 
+        When ``strict`` is set the upgrade is validated before *any* connection
+        state is changed, and an inspectable :class:`UpgradeState
+        <h2.connection.UpgradeState>` is recorded on :attr:`upgrade_state
+        <h2.connection.H2Connection.upgrade_state>`. In that mode:
+
+        * the ``HTTP2-Settings`` value must be unpadded base64url of a whole
+          number of settings (RFC 9113 § 3.2.1) and must not list any setting
+          twice;
+        * the settings are checked against the role of the peer that sent
+          them, and the caller's declared ``role`` must match the connection's
+          own side;
+        * a rejected payload raises :class:`InvalidUpgradeSettingsError
+          <h2.exceptions.InvalidUpgradeSettingsError>` and leaves the
+          connection untouched, so the caller can fall back to HTTP/1.1;
+        * the client's connection preface carries an *empty* SETTINGS frame,
+          because its settings were already sent in ``HTTP2-Settings``; a
+          server likewise ignores an identical restatement in the peer's
+          preface rather than applying the same values twice.
+
         .. versionadded:: 2.3.0
+
+        .. versionchanged:: 4.5.0
+           Added the ``strict``, ``role`` and ``request_complete`` keyword
+           arguments and the :attr:`upgrade_state` attribute.
 
         :param settings_header: (optional, server-only): The value of the
              ``HTTP2-Settings`` header field received from the client.
         :type settings_header: ``bytes``
+        :param strict: Whether to validate the upgrade payload and record an
+            :class:`UpgradeState <h2.connection.UpgradeState>`.
+        :param role: (optional, strict-only): The declared role for this side
+            of the upgrade. Must match the connection's configuration.
+        :param request_complete: (optional, strict-only): Whether the original
+            request was already complete when the upgrade happened. When
+            false, stream 1 remains open in both directions instead of starting
+            half-closed.
 
         :returns: For clients, a bytestring to put in the ``HTTP2-Settings``.
             For servers, returns nothing.
@@ -572,6 +766,17 @@ class H2Connection:
         self.config.logger.debug(
             "Upgrade connection. Current settings: %s", self.local_settings,
         )
+
+        if strict:
+            return self._initiate_strict_upgrade_connection(
+                settings_header=settings_header,
+                role=role,
+                request_complete=request_complete,
+            )
+
+        if role is not None or not request_complete:
+            msg = "role and request_complete require strict=True."
+            raise ValueError(msg)
 
         frame_data = None
         # Begin by getting the preamble in place.
@@ -583,7 +788,7 @@ class H2Connection:
                 f.settings[setting] = value
 
             frame_data = f.serialize_body()
-            frame_data = base64.urlsafe_b64encode(frame_data)
+            frame_data = base64.urlsafe_b64encode(frame_data).rstrip(b"=")
         elif settings_header:
             # We have a settings header from the client. This needs to be
             # applied, but we want to throw away the ACK. We do this by
@@ -608,6 +813,124 @@ class H2Connection:
         self._begin_new_stream(stream_id=1, allowed_ids=AllowedStreamIDs.ODD)
         self.streams[1].upgrade(self.config.client_side)
         return frame_data
+
+    def _initiate_strict_upgrade_connection(self,
+                                            *,
+                                            settings_header: bytes | None,
+                                            role: UpgradeRole | None,
+                                            request_complete: bool) -> bytes | None:
+        """
+        Validate an ``Upgrade: h2c`` exchange and only then commit it.
+
+        The first half of this method performs no mutation at all: a bad
+        payload or a mismatched role raises before any buffer, stream, setting
+        or state-machine change, which is what lets a server reject the upgrade
+        and continue with HTTP/1.1.
+        """
+        expected_role = (
+            UpgradeRole.CLIENT if self.config.client_side
+            else UpgradeRole.SERVER
+        )
+        if role is not None and role is not expected_role:
+            msg = f"Declared role {role!s} does not match this {expected_role!s} connection."
+            raise ValueError(msg)
+        if self.upgrade_state is not None or self.state_machine.state is not ConnectionState.IDLE:
+            msg = "Connection has already been initialised."
+            raise ValueError(msg)
+        if self._connection_initiated:
+            msg = "initiate_connection has already been called on this connection."
+            raise ValueError(msg)
+
+        settings: dict[SettingCodes | int, int]
+        if expected_role is UpgradeRole.CLIENT:
+            if settings_header is not None:
+                msg = "A client connection generates HTTP2-Settings and must not be given one."
+                raise ValueError(msg)
+            settings = {
+                setting: self.local_settings[setting]
+                for setting in self.local_settings
+            }
+        else:
+            if settings_header is None:
+                msg = "A server connection must be given the HTTP2-Settings header field value."
+                raise ValueError(msg)
+            settings = _decode_upgrade_settings_header(settings_header)
+            # Validate against the role of the peer that sent them. This reads
+            # the settings object without changing it.
+            for setting, value in settings.items():
+                try:
+                    self.remote_settings.validate_received_setting(setting, value)
+                except InvalidSettingsValueError as e:
+                    msg = f"HTTP2-Settings contains an invalid setting: {e}"
+                    raise InvalidUpgradeSettingsError(msg, error_code=e.error_code) from e
+
+        # From here on the upgrade is accepted and the connection is mutated.
+        self.state_machine.process_input(ConnectionInputs.SEND_SETTINGS)
+        preamble = (
+            b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n"
+            if expected_role is UpgradeRole.CLIENT else b""
+        )
+        preface_settings = SettingsFrame(0)
+        if expected_role is UpgradeRole.SERVER:
+            for setting, value in self.local_settings.items():
+                preface_settings.settings[setting] = value
+        # A strict client sends an empty SETTINGS frame here: its settings
+        # already travelled in HTTP2-Settings, and repeating them would make
+        # the server apply the same values twice.
+        self._data_to_send += preamble + preface_settings.serialize()
+        self._connection_initiated = True
+
+        if expected_role is UpgradeRole.SERVER:
+            self._apply_upgrade_settings(settings)
+
+        connection_input = (
+            ConnectionInputs.SEND_HEADERS if expected_role is UpgradeRole.CLIENT
+            else ConnectionInputs.RECV_HEADERS
+        )
+        self.config.logger.debug("Process input %s", connection_input)
+        self.state_machine.process_input(connection_input)
+
+        # The original request lives on stream 1. Its direction follows the
+        # side that sent it, and it is only half-closed if it was complete.
+        stream = self._begin_new_stream(stream_id=1, allowed_ids=AllowedStreamIDs.ODD)
+        stream.upgrade(self.config.client_side, request_complete=request_complete)
+
+        self.upgrade_state = UpgradeState(
+            role=expected_role,
+            stream_id=1,
+            request_complete=request_complete,
+            settings=dict(settings),
+            settings_header=(
+                bytes(settings_header) if settings_header is not None else None
+            ),
+        )
+
+        if expected_role is UpgradeRole.CLIENT:
+            f = SettingsFrame(0)
+            for setting, value in settings.items():
+                f.settings[setting] = value
+            # RFC 9113 § 3.2.1 carries the payload as base64url *without*
+            # padding, which is also what the strict server side requires.
+            return base64.urlsafe_b64encode(f.serialize_body()).rstrip(b"=")
+        return None
+
+    def _apply_upgrade_settings(self, settings: dict[SettingCodes | int, int]) -> None:
+        """
+        Commit the settings carried in ``HTTP2-Settings`` without an ACK.
+
+        The ``101`` response is the implicit acknowledgement (RFC 9113
+        § 3.2.1), so the values are applied immediately rather than left
+        pending for an ACK that will never be sent.
+        """
+        if not settings:
+            return
+
+        self.remote_settings.update(settings)
+        self._apply_remote_setting_changes(self.remote_settings.acknowledge())
+
+        # The peer's connection preface is still to come, and it may restate
+        # the same settings. Mark it so those values are not applied twice.
+        self._awaiting_upgrade_preface_settings = True
 
     def _get_or_create_stream(self, stream_id: int, allowed_ids: AllowedStreamIDs) -> H2Stream:
         """
@@ -1443,7 +1766,21 @@ class H2Connection:
         self.state_machine.process_input(ConnectionInputs.SEND_SETTINGS)
 
         changes = self.remote_settings.acknowledge()
+        self._apply_remote_setting_changes(changes)
 
+        f = SettingsFrame(0)
+        f.flags.add("ACK")
+        return [f]
+
+    def _apply_remote_setting_changes(self, changes: dict[SettingCodes | int, ChangedSetting]) -> None:
+        """
+        Apply the connection-level effects of newly acknowledged remote
+        settings, without emitting the SETTINGS ACK frame itself.
+
+        This is shared by the normal SETTINGS acknowledgement path and the
+        strict upgrade path, which applies ``HTTP2-Settings`` immediately
+        because the ``101`` response is its acknowledgement.
+        """
         if SettingCodes.INITIAL_WINDOW_SIZE in changes:
             setting = changes[SettingCodes.INITIAL_WINDOW_SIZE]
             self._flow_control_change_from_settings(
@@ -1462,10 +1799,6 @@ class H2Connection:
             self.max_outbound_frame_size = setting.new_value
             for stream in self.streams.values():
                 stream.max_outbound_frame_size = setting.new_value
-
-        f = SettingsFrame(0)
-        f.flags.add("ACK")
-        return [f]
 
     def _flow_control_change_from_settings(self, old_value: int | None, new_value: int) -> None:
         """
@@ -1779,6 +2112,32 @@ class H2Connection:
         # Add the new settings.
         for setting, value in frame.settings.items():
             self.remote_settings.validate_received_setting(setting, value)
+
+        if self._awaiting_upgrade_preface_settings:
+            # The first SETTINGS frame after a strict upgrade is the peer's
+            # connection preface. The upgrade settings it restates were
+            # already applied from HTTP2-Settings, and re-applying them would
+            # move flow-control windows twice, so only settings that really
+            # differ from what is already in force are committed here.
+            self._awaiting_upgrade_preface_settings = False
+            new_settings = {
+                setting: value
+                for setting, value in frame.settings.items()
+                if self.remote_settings.get(setting) != value
+            }
+            # The event still reports the whole frame, exactly as it would for
+            # a SETTINGS frame received on any other connection; entries whose
+            # value is unchanged simply show the same original and new value.
+            events.append(
+                RemoteSettingsChanged.from_settings(
+                    self.remote_settings, frame.settings,
+                ),
+            )
+            if new_settings:
+                self.remote_settings.update(new_settings)
+            frames = self._acknowledge_settings()
+            return frames, events
+
         self.remote_settings.update(frame.settings)
         events.append(
             RemoteSettingsChanged.from_settings(

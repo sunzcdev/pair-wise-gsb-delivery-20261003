@@ -19,6 +19,12 @@ Connection
    :members:
    :exclude-members: inbound_flow_control_window
 
+.. autoclass:: h2.connection.UpgradeState
+   :members:
+
+.. autoclass:: h2.connection.UpgradeRole
+   :members:
+
 
 Configuration
 -------------
@@ -138,6 +144,10 @@ Protocol Errors
    :members:
 
 .. autoclass:: h2.exceptions.InvalidBodyLengthError
+   :show-inheritance:
+   :members:
+
+.. autoclass:: h2.exceptions.InvalidUpgradeSettingsError
    :show-inheritance:
    :members:
 
