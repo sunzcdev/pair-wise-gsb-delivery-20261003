@@ -149,6 +149,16 @@ inside labels distinct from the dots that separate labels.
   UDP still requires a matching question. Queries requiring local DNSSEC
   validation keep EDNS enabled. Setting DO on an existing OPT preserves its
   payload size, options and other flags.
+* A truncated UDP answer is replaced by one TCP attempt that keeps the original
+  question, transaction ID, upstream server, source binding and validation
+  policy, even if the Resolver is reconfigured during the exchange. The partial
+  UDP answer is never delivered. A TCP answer that is still truncated, or that
+  answers a different question after the fallback, raises
+  `Dnsruby::TruncatedResponseError` or `Dnsruby::MismatchedResponseError` rather
+  than being returned as a complete result, and a dropped TCP connection during
+  the fallback is reported as an `IOError`. Each transaction has at most one
+  fallback, so a peer that keeps setting TC cannot make a lookup cycle between
+  transports.
 * Hostname nameservers no longer cause recursive configuration hangs. Existing
   queries continue while replacement nameservers are resolved, and concurrent
   configuration changes are preserved. IPv6 link-local nameservers accept

@@ -338,7 +338,7 @@ module Dnsruby
 
     # Asynchronously send a Message to the server. The send can be done using just
     # Dnsruby. Support for EventMachine has been deprecated.
-    # 
+    #
     # == Dnsruby pure Ruby event loop :
     # 
     # A client_queue is supplied by the client,
@@ -411,9 +411,20 @@ module Dnsruby
       end
       response_settings = response_query_settings(client_query_id)
       disable_edns = args[4] || (response_settings && response_settings.disable_edns)
+      # A truncated UDP answer is replaced by TCP using the settings this
+      # transaction started with. Read nothing from the sender here, so a
+      # concurrent reconfiguration cannot move the exchange to another
+      # nameserver, another query's options or another transport policy.
+      escalating = !!(response_settings && response_settings.truncation_escalation)
+      attempt_configuration = escalating ? response_settings.transport_configuration : nil
+      use_tcp = true if escalating
 
       begin
-        query_packet = make_query_packet(msg, use_tcp, disable_edns)
+        query_packet = if attempt_configuration
+          make_query_packet(msg, use_tcp, disable_edns, attempt_configuration)
+        else
+          make_query_packet(msg, use_tcp, disable_edns)
+        end
         check_message_size(query_packet)
       rescue EncodeError => err
         Dnsruby.log.error { "#{err}" }
@@ -426,7 +437,7 @@ module Dnsruby
         return
       end
 
-      if (msg.do_caching && !msg.send_raw && (msg.class != Update) && !@tsig && !msg.tsig && !msg.signed?)
+      if (!escalating && msg.do_caching && !msg.send_raw && (msg.class != Update) && !@tsig && !msg.tsig && !msg.signed?)
         #  Check the cache!!
         cachedanswer = nil
         if (msg.header.rd)
@@ -452,7 +463,7 @@ module Dnsruby
         end
       end
       #  Otherwise, run the query
-      if (udp_packet_size < query_packet.length)
+      if (!escalating && udp_packet_size < query_packet.length)
         if (@no_tcp)
           #  Can't send the message - abort!
           err=IOError.new("Can't send message - too big for UDP and no_tcp=true")
@@ -471,6 +482,23 @@ module Dnsruby
       send_dnsruby(query_packet, msg, client_query_id, client_queue, use_tcp, disable_edns)
       return client_query_id
       #       end
+    end
+
+    # Replace a truncated UDP answer with one TCP attempt that keeps this
+    # transaction's endpoint, source binding, deadline, cancellation token and
+    # response policy. The half answer is discarded and never delivered; the
+    # attempt records its escalation so a second TC cannot start another
+    # transport. Used by check_response and by the selector when a truncated
+    # answer can only be identified from its partially decoded header.
+    def retry_truncated_answer(settings, query, client_queue, client_query_id) #:nodoc:
+      settings.begin_truncation_fallback! if settings
+      send_async(query, client_queue, client_query_id, true)
+    rescue QueryControl::Stopped
+      # The caller cancelled this lookup. Its control already fails the owned
+      # attempt; do not turn the cancellation into a retry error.
+      nil
+    rescue StandardError => error
+      SelectThread.instance.fail_query_if_current(client_query_id, client_queue, settings, error)
     end
 
     #  This method returns the current tcp socket for pipelining
@@ -554,8 +582,13 @@ module Dnsruby
       ensure_current_process
       st = @selector = SelectThread.instance
       response_settings = response_query_settings(client_query_id)
-      # A configuration change applies to the next attempt, never half of this one.
-      configuration = transport_configuration
+      escalating = !!(response_settings && response_settings.truncation_escalation)
+      # A truncation fallback keeps this transaction's endpoint, source binding,
+      # deadline policy and validation settings. Re-reading the sender here would
+      # let a concurrent reconfiguration move the retry to another nameserver,
+      # another source port or another query's options.
+      configuration = (escalating && response_settings.transport_configuration) || transport_configuration
+      use_tcp = true if escalating
       pipeline_mode = use_tcp && configuration[:tcp_pipelining]
       begin
         check_message_size(query_bytes)
@@ -579,6 +612,12 @@ module Dnsruby
         endtime, udp_receive_size(query, configuration), self)
       pending.transport_configuration = configuration
       pending.send_token = previous_settings.send_token if previous_settings
+      if response_settings
+        # The fallback budget and the discarded half answer travel with this
+        # transaction; nothing is read back from the sender.
+        pending.fallback_count = response_settings.fallback_count
+        pending.truncation_escalation = response_settings.truncation_escalation
+      end
       # Carry the controlling lookup through selector retries and workers, whose
       # thread-local control may differ from the thread which admitted it.
       endtime = pending.endtime = [endtime, pending.send_token.control&.deadline].compact.min
@@ -861,6 +900,10 @@ module Dnsruby
         query_settings.send_token = previous_settings.send_token
         query_settings.disable_edns = previous_settings.disable_edns
         query_settings.cache_scope = previous_settings.cache_scope
+        # The fallback budget follows the transaction onto its new socket, so a
+        # later truncated answer cannot start another transport.
+        query_settings.fallback_count = previous_settings.fallback_count
+        query_settings.truncation_escalation = previous_settings.truncation_escalation
         query_settings.is_persistent_socket = pipeline
         query_settings.tcp_pipelining_max_queries = (@pipeline_socket_max_queries || configuration[:tcp_pipelining_max_queries]) if pipeline
         if use_tcp
@@ -1031,7 +1074,7 @@ module Dnsruby
         ipv6: server.include?(':'), packet_timeout: @packet_timeout, udp_size: udp_packet_size,
         tcp_pipelining: @tcp_pipelining, tcp_pipelining_max_queries: @tcp_pipelining_max_queries,
         tcp_idle_timeout: tcp_idle_timeout, ignore_truncation: @ignore_truncation,
-        no_tcp: @no_tcp, dnssec: @dnssec}.freeze
+        no_tcp: @no_tcp, dnssec: @dnssec, recurse: @recurse}.freeze
     end
     private :transport_configuration
 
@@ -1099,18 +1142,34 @@ module Dnsruby
         if (response.header.tc && !tcp && !ignore_truncation)
           if (no_tcp)
             Dnsruby.log.debug { "Truncated response - not resending over TCP as no_tcp==true" }
+          elsif settings && settings.truncation_fallbacks_exhausted?
+            # The bound belongs to this transaction. A peer that keeps setting
+            # TC must not start another transport, and the half-finished UDP
+            # answer is never reported as a complete result.
+            return TruncatedResponseError.new("Truncated UDP response and TCP fallback limit reached")
           else
-            #  Try to resend over tcp
+            #  Replace the half answer with exactly one TCP attempt. The
+            #  question, transaction ID and validation settings stay those of
+            #  this transaction; the sender's current configuration applies to
+            #  later, independent queries.
             Dnsruby.log.debug { "Truncated - resending over TCP" }
-            #  @TODO@ Are the query options used correctly here? DNSSEC in particular...
-            #         query.send_raw = true # Make sure that the packet is not messed with.
-            send_async(query, client_queue, client_query_id, true)
+            retry_truncated_answer(settings, query, client_queue, client_query_id)
             return false
           end
         end
+        if (response.header.tc && tcp && !ignore_truncation)
+          # A TCP answer must be complete. Reporting it as a delivered result
+          # would hand the caller an unfinished answer.
+          return TruncatedResponseError.new("TCP response was still truncated")
+        end
       end
       settings = response_query_settings(client_query_id)
-      if settings && settings.cache_scope && settings.cache_scope == positive_cache_scope(query, settings.query_bytes)
+      route = settings&.transport_configuration
+      scope = if settings && settings.cache_scope
+        route ? positive_cache_scope(query, settings.query_bytes, route) :
+          positive_cache_scope(query, settings.query_bytes)
+      end
+      if settings && settings.cache_scope && settings.cache_scope == scope
         response.instance_variable_set(:@dnsruby_cache_scope, settings.cache_scope)
       else
         # Configuration changed during this exchange, or this response has no
@@ -1157,20 +1216,26 @@ module Dnsruby
     end
 
     #  Prepare the packet for sending
-    def make_query_packet(packet, use_tcp = @use_tcp, disable_edns = false) #:nodoc: all
+    def make_query_packet(packet, use_tcp = @use_tcp, disable_edns = false, attempt = nil) #:nodoc: all
       packet.tsig.warn_if_legacy_algorithm if packet.tsig
+      # A truncation fallback signs and adds EDNS using the settings this
+      # transaction started with, so a concurrent reconfiguration cannot change
+      # the request that reaches the peer.
+      dnssec = attempt ? attempt[:dnssec] : @dnssec
+      recurse = attempt ? attempt[:recurse] : @recurse
+      udp_size = attempt ? attempt[:udp_size] : udp_packet_size
       # TSIG signs the header and every section, so leave signed messages intact.
       # Decoded messages may have a TSIG without a signing state.
       prepared = packet.signed? || packet.tsig
       if !packet.send_raw && !prepared
-        if (packet.header.opcode == OpCode.QUERY || @recurse)
-          packet.header.rd=@recurse
+        if (packet.header.opcode == OpCode.QUERY || recurse)
+          packet.header.rd=recurse
         end
 
-        if @dnssec && !disable_edns
-          prepare_for_dnssec(packet)
-        elsif !disable_edns && (udp_packet_size > 512) && !use_tcp
-          add_opt_rr(packet)
+        if dnssec && !disable_edns
+          prepare_for_dnssec(packet, udp_size)
+        elsif !disable_edns && (udp_size > 512) && !use_tcp
+          add_opt_rr(packet, udp_size)
         end
       end
 
@@ -1184,18 +1249,18 @@ module Dnsruby
       encoded
     end
 
-    def add_opt_rr(packet)
-      Dnsruby.log.debug { ";; Adding EDNS extension with UDP packetsize  #{udp_packet_size}.\n" }
+    def add_opt_rr(packet, size = udp_packet_size)
+      Dnsruby.log.debug { ";; Adding EDNS extension with UDP packetsize  #{size}.\n" }
       # Find OPT by type: its class field stores the payload size. Reuse it and
       # its options, since only one OPT is allowed (RFC 6891 section 6.1.1).
-      packet.add_additional(RR::OPT.new(udp_packet_size)) unless packet.get_opt
+      packet.add_additional(RR::OPT.new(size)) unless packet.get_opt
       packet.get_opt
     end
 
-    def prepare_for_dnssec(packet)
+    def prepare_for_dnssec(packet, size = udp_packet_size)
       # Request DNSSEC records with DO (RFC 4035 section 4.1).
-      Dnsruby.log.debug { ";; Adding EDNS extension with UDP packetsize #{udp_packet_size} and DNS OK bit set\n" }
-      optrr = add_opt_rr(packet)
+      Dnsruby.log.debug { ";; Adding EDNS extension with UDP packetsize #{size} and DNS OK bit set\n" }
+      optrr = add_opt_rr(packet, size)
       optrr.dnssec_ok=true
 
       # We use DO to request DNSSEC records and leave AD clear

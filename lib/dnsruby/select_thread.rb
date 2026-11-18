@@ -152,12 +152,15 @@ module Dnsruby
     end
 
     class QuerySettings
+      # A UDP truncation replaces the half answer with one TCP attempt. The
+      # limit is a transaction property: it never depends on the sender's
+      # current configuration or on another query sharing the sender.
+      MAX_TRUNCATION_FALLBACKS = 1
       attr_accessor :query_bytes, :query, :ignore_truncation, :client_queue,
         :client_query_id, :socket, :dest_server, :dest_port, :endtime, :udp_packet_size,
         :single_resolver, :is_persistent_socket, :tcp_pipelining_max_queries, :send_token,
-        :retire_connection, :disable_edns, :authentication_error, :cache_scope, :transport_configuration
-      #  new(query_bytes, query, ignore_truncation, client_queue, client_query_id,
-      #      socket, dest_server, dest_port, endtime, , udp_packet_size, single_resolver)
+        :retire_connection, :disable_edns, :authentication_error, :cache_scope, :transport_configuration,
+        :fallback_count, :truncation_escalation
       def initialize(*args)
         @query_bytes = args[0]
         @query = args[1]
@@ -175,6 +178,19 @@ module Dnsruby
         @send_token = SendToken.new
         @retire_connection = false
         @disable_edns = false
+        @fallback_count = 0
+        @truncation_escalation = false
+      end
+
+      # Record that this transaction replaced a truncated UDP answer with TCP.
+      # The discarded half answer is never reported as a complete result.
+      def begin_truncation_fallback!
+        @fallback_count += 1
+        @truncation_escalation = true
+      end
+
+      def truncation_fallbacks_exhausted?
+        @truncation_escalation && @fallback_count >= MAX_TRUNCATION_FALLBACKS
       end
 
       def no_tcp
@@ -783,6 +799,7 @@ module Dnsruby
       state_mutex.synchronize{
         client_ids = socket_ids_for_header(socket, msg.header.id)
       }
+      question_mismatch = nil
       #  get the queries associated with them
       client_ids.each do |id|
         settings = state_mutex.synchronize { @@query_hash[id] }
@@ -794,7 +811,11 @@ module Dnsruby
           # Preserve raw/update responses and questionless FORMERR handling.
           query = settings.query
           unless query.send_raw || query.kind_of?(Update) || msg.question.empty?
-            next unless matching_questions?(msg, query)
+            unless matching_questions?(msg, query)
+              question_mismatch = settings if question_mismatch.nil?
+              question_mismatch = :ambiguous if question_mismatch != settings
+              next
+            end
           end
           #  process the response
           client_queue = settings.client_queue
@@ -821,17 +842,36 @@ module Dnsruby
             # check_response runs. Only one path may claim this attempt.
             return unless claim_query(settings, true)
             exception = msg.get_exception
-            if (ret.kind_of?TsigError)
-              exception = ret
+            # TSIG and transport failures belong to this transaction rather
+            # than to the status code in the packet.
+            exception = ret if ret.kind_of?(ResolvError)
+            # A truncated or mismatched reply is not an answer. Deliver the
+            # error without presenting the half packet as a response.
+            response = msg
+            if ret.kind_of?(TruncatedResponseError) || ret.kind_of?(MismatchedResponseError)
+              response = nil
             end
             Dnsruby.log.debug{"Pushing response to client queue"}
-            push_to_client(id, client_queue, msg, exception, query, res,
+            push_to_client(id, client_queue, response, exception, query, res,
               settings.send_token&.transmission_budget)
             #             client_queue.push([id, msg, exception])
             #             notify_queue_observers(client_queue, id)
           else
             #  Sending query again - don't return response
           end
+          return
+        end
+      end
+      if question_mismatch && question_mismatch != :ambiguous
+        # A truncated answer was replaced by one TCP attempt, and the peer
+        # answered a different question on that attempt. The half answer is
+        # already discarded, so end this transaction with a distinct error
+        # instead of waiting for its deadline. An ambiguous pipeline frame is
+        # left to its real owner.
+        if question_mismatch.truncation_escalation
+          send_exception_to_client(
+            MismatchedResponseError.new("TCP fallback answered a different question"),
+            socket, question_mismatch.client_query_id)
           return
         end
       end
@@ -1112,14 +1152,17 @@ module Dnsruby
           end
         end
         return if unauthenticated
-        # Truncation permits a UDP-to-TCP fallback, never another TCP attempt.
-        # Repeating malformed TCP replies must not renew the packet deadline.
+        # Truncation permits a single UDP-to-TCP fallback, never another TCP
+        # attempt. Repeating malformed TCP replies must not renew the packet
+        # deadline. The fallback budget belongs to this transaction, so a peer
+        # that keeps setting TC cannot keep a lookup cycling between transports.
         settings = nil
+        exhausted = nil
         if !is_tcp && (DecodeError === e) && e.partial_message && e.partial_message.header.tc
-          settings = state_mutex.synchronize do
+          settings, exhausted = state_mutex.synchronize do
             current = @@query_hash[client_id]
             if current && current.socket == socket && !current.ignore_truncation && !current.no_tcp
-              current
+              current.truncation_fallbacks_exhausted? ? [nil, current] : [current, nil]
             end
           end
         end
@@ -1128,10 +1171,29 @@ module Dnsruby
           previous_context = Thread.current[:dnsruby_response_query]
           begin
             Thread.current[:dnsruby_response_query] = settings
-            settings.single_resolver.send_async(settings.query, settings.client_queue, client_id, true)
+            sender = settings.single_resolver
+            if sender.respond_to?(:retry_truncated_answer)
+              # Marks the escalation before re-sending, so the replacement keeps
+              # this transaction's configuration and cannot return to UDP.
+              sender.retry_truncated_answer(settings, settings.query, settings.client_queue, client_id)
+            else
+              settings.begin_truncation_fallback!
+              sender.send_async(settings.query, settings.client_queue, client_id, true)
+            end
           ensure
             Thread.current[:dnsruby_response_query] = previous_context
           end
+        elsif exhausted
+          # The truncated answer is not a complete result, and this transaction
+          # has already used its one transport fallback.
+          send_exception_to_client(
+            TruncatedResponseError.new('Truncated UDP response and TCP fallback limit reached'),
+            socket, client_id)
+        elsif is_tcp && (DecodeError === e) && e.partial_message && e.partial_message.header.tc
+          # A TCP answer must be complete. Never report this partial packet as
+          # the delivered result.
+          send_exception_to_client(
+            TruncatedResponseError.new('TCP response was still truncated'), socket, client_id)
         else
           send_exception_to_client(e, socket, client_id)
         end

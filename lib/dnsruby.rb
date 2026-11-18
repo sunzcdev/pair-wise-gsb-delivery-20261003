@@ -228,6 +228,18 @@ module Dnsruby
     attr_accessor :partial_message
   end
 
+  # A UDP answer was truncated and its TCP replacement was also unusable
+  # (still truncated or itself undecodable). A half-completed answer never
+  # becomes a successful result. It remains a DecodeError so callers that
+  # already treat a malformed truncated reply as such keep working.
+  class TruncatedResponseError < DecodeError
+  end
+
+  # A TCP reply carried the expected transaction ID but answered a different
+  # question than the one this attempt sent.
+  class MismatchedResponseError < ResolvError
+  end
+
   # Indicates an error encoding a DNS message for transmission
   class EncodeError < ResolvError
   end

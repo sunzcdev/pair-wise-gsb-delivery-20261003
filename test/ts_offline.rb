@@ -39,6 +39,7 @@ TESTS = %w(
     pipeline_send
     pipeline_retirement
     pipeline_retry
+    truncation_fallback
     resolver_concurrency
     resolver_validation
     release_transport

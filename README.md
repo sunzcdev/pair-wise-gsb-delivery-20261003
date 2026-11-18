@@ -258,6 +258,19 @@ Each send attempt uses one snapshot of its transport configuration; subsequent
 attempts can use newer settings. Adding an explicit source port replaces the
 default `[0]` pool (random source ports). A pool cannot mix zero and explicit ports.
 
+A UDP answer with the TC bit set is only a partial answer. Dnsruby replaces it
+with one TCP attempt that keeps the original question, transaction ID, upstream
+server, source binding and validation policy, even if the Resolver is
+reconfigured while that exchange is in progress. The partial UDP answer is never
+delivered; a TCP answer that is still truncated, or one that answers a different
+question after the fallback, is reported as `Dnsruby::TruncatedResponseError` or
+`Dnsruby::MismatchedResponseError` instead of as a complete result. Each
+transaction has at most one such fallback, so a peer that keeps setting TC
+cannot make a lookup cycle between transports. `no_tcp` and `ignore_truncation`
+still suppress the fallback, and closing or cancelling the lookup removes both
+attempts. A dropped TCP connection during the fallback is reported as an
+`IOError`, not as the discarded UDP half answer.
+
 For each question, Dnsruby makes at most **three attempts per server address per
 transport**, including retries without optional EDNS support. UDP and TCP have
 separate limits. Setting `retry_times` above three is still accepted, but does
