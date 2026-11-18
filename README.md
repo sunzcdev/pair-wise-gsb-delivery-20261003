@@ -43,6 +43,32 @@ error_log = Logger.new(STDERR)
 error_log = error_log.error("fatal error")
 ```
 
+### Compressing rotated log files
+
+Rotated archives can optionally be gzip-compressed. The logger never starts a
+compression thread itself; the caller schedules the work:
+
+```ruby
+require 'logger'
+
+compressor = Logger::LogDevice::ArchiveCompressor.new
+logger = Logger.new('app.log', 3, 10 * 1024 * 1024, archive_compressor: compressor)
+
+# Rotation records the detached archive (never the active file):
+logger.archived_logs # => ["app.log.0"]
+
+# Compress on your own schedule, on the calling thread:
+logger.compress_archived_logs
+# "app.log.0" is replaced by a verified "app.log.0.gz"
+```
+
+The gzip archive is written to a temporary file and fully verified before it
+is atomically renamed into place, so an interrupted compression never leaves a
+truncated `.gz` and always keeps the original file. If the source path is
+replaced during compression, the new object at that path is not deleted, and
+submitting the same archive twice never compresses it concurrently.
+Compression failures are reported separately from log writing failures.
+
 ## Development
 
 After checking out the repo, run the following to install dependencies.

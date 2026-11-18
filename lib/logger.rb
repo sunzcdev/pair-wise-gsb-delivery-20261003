@@ -367,6 +367,37 @@ require_relative 'logger/errors'
 # see details and suggestions at
 # {Time#strftime}[https://docs.ruby-lang.org/en/master/Time.html#method-i-strftime].
 #
+# === Post-Rotation Compression
+#
+# Rotated archives can optionally be compressed into gzip files without the
+# logger starting any background work. Pass an
+# Logger::LogDevice::ArchiveCompressor as +archive_compressor+:
+#
+#   compressor = Logger::LogDevice::ArchiveCompressor.new
+#   logger = Logger.new('t.log', 3, 10485760, archive_compressor: compressor)
+#
+# Each rotation records the already-detached archive; it never records the
+# file currently open for writing. The caller decides when compression runs,
+# typically from its own scheduler or timer:
+#
+#   logger.archived_logs        # => ["t.log.0"] waiting to be compressed
+#   logger.compress_archived_logs
+#   # "t.log.0" is replaced by a verified "t.log.0.gz"
+#
+# A single archive may also be submitted with Logger#compress_archive.
+# Compression runs synchronously on the calling thread: the logger starts no
+# threads. The gzip output is fully written and verified under a temporary
+# name before it is atomically published, so an interrupted compression never
+# leaves a correctly-named but truncated archive, and the original file is
+# kept. If the source path is replaced while compression is in progress, the
+# new object at that path is not deleted. Submitting the same archive more
+# than once never compresses it twice concurrently.
+#
+# Compression failures are reported independently of log writing failures:
+# they warn as <tt>log archive compression failed</tt> (or raise the exception
+# classes listed in +reraise_compression_errors+), while ordinary writing
+# problems still use +reraise_write_errors+.
+#
 class Logger
   _, name, rev = %w$Id$
   if name
@@ -592,14 +623,25 @@ class Logger
   # - +reraise_write_errors+: An array of exception classes, which will
   #   be reraised if there is an error when writing to the log device.
   #   The default is to swallow all exceptions raised.
+  #
   # - +skip_header+: If +true+, prevents the logger from writing a header
   #   when creating a new log file. The default is +false+, meaning
   #   the header will be written as usual.
   #
+  # - +archive_compressor+: An optional Logger::LogDevice::ArchiveCompressor
+  #   used to gzip rotated archives. When set, each rotation records the
+  #   detached archive for later compression, which the caller schedules via
+  #   #compress_archived_logs. The logger itself starts no compression thread.
+  #
+  # - +reraise_compression_errors+: An array of exception classes, which will
+  #   be reraised if compressing a rotated archive fails. Compression errors
+  #   are handled independently of +reraise_write_errors+.
+  #
   def initialize(logdev, shift_age = 0, shift_size = 1048576, level: DEBUG,
                  progname: nil, formatter: nil, datetime_format: nil,
                  binmode: false, shift_period_suffix: '%Y%m%d',
-                 reraise_write_errors: [], skip_header: false)
+                 reraise_write_errors: [], skip_header: false,
+                 archive_compressor: nil, reraise_compression_errors: [])
     self.level = level
     self.progname = progname
     @default_formatter = Formatter.new
@@ -619,7 +661,9 @@ class Logger
         shift_period_suffix: shift_period_suffix,
         binmode: binmode,
         reraise_write_errors: reraise_write_errors,
-        skip_header: skip_header)
+        skip_header: skip_header,
+        archive_compressor: archive_compressor,
+        reraise_compression_errors: reraise_compression_errors)
     end
   end
 
@@ -652,10 +696,30 @@ class Logger
   #   #  "E, [2022-05-12T14:21:27.596726 #22428] ERROR -- : one\n",
   #   #  "E, [2022-05-12T14:23:05.847241 #22428] ERROR -- : three\n"]
   #
-  def reopen(logdev = nil, shift_age = nil, shift_size = nil, shift_period_suffix: nil, binmode: nil)
+  def reopen(logdev = nil, shift_age = nil, shift_size = nil, shift_period_suffix: nil, binmode: nil,
+             archive_compressor: nil, reraise_compression_errors: nil)
     @logdev&.reopen(logdev, shift_age: shift_age, shift_size: shift_size,
-                    shift_period_suffix: shift_period_suffix, binmode: binmode)
+                    shift_period_suffix: shift_period_suffix, binmode: binmode,
+                    archive_compressor: archive_compressor,
+                    reraise_compression_errors: reraise_compression_errors)
     self
+  end
+
+  # Paths of rotated archives waiting to be compressed; see
+  # Logger::LogDevice#archived_logs.
+  def archived_logs
+    @logdev&.archived_logs || []
+  end
+
+  # Compresses all rotated archives queued so far, on the calling thread.
+  # The logger starts no background thread for compression.
+  def compress_archived_logs
+    @logdev&.compress_archived_logs || []
+  end
+
+  # Compresses a single rotated +archive+ on the calling thread.
+  def compress_archive(archive)
+    @logdev&.compress_archive(archive)
   end
 
   # Creates a log entry, which may or may not be written to the log,

@@ -1,6 +1,7 @@
 # frozen_string_literal: true
 
 require_relative 'period'
+require_relative 'log_device/archive_compressor'
 
 class Logger
   # Device used for logging messages.
@@ -13,11 +14,15 @@ class Logger
 
     def initialize(
       log = nil, shift_age: nil, shift_size: nil, shift_period_suffix: nil,
-      binmode: false, reraise_write_errors: [], skip_header: false
+      binmode: false, reraise_write_errors: [], skip_header: false,
+      archive_compressor: nil, reraise_compression_errors: []
     )
       @dev = @filename = @shift_age = @shift_size = @shift_period_suffix = nil
       @binmode = binmode
       @reraise_write_errors = reraise_write_errors
+      @reraise_compression_errors = reraise_compression_errors
+      @archive_compressor = archive_compressor
+      @archived_logs = []
       @skip_header = skip_header
       mon_initialize
       set_dev(log)
@@ -45,10 +50,15 @@ class Logger
       end
     end
 
-    def reopen(log = nil, shift_age: nil, shift_size: nil, shift_period_suffix: nil, binmode: nil)
+    def reopen(log = nil, shift_age: nil, shift_size: nil, shift_period_suffix: nil, binmode: nil,
+              archive_compressor: nil, reraise_compression_errors: nil)
       # reopen the same filename if no argument, do nothing for IO
       log ||= @filename if @filename
       @binmode = binmode unless binmode.nil?
+      @archive_compressor = archive_compressor unless archive_compressor.nil?
+      unless reraise_compression_errors.nil?
+        @reraise_compression_errors = reraise_compression_errors
+      end
       if log
         synchronize do
           if @filename and @dev
@@ -60,6 +70,57 @@ class Logger
         end
       end
       self
+    end
+
+    # The compressor used for rotated archives, or +nil+ when post-rotation
+    # compression is disabled.
+    attr_reader :archive_compressor
+
+    # Paths of rotated archives that have not been handed to the compressor
+    # yet. Only files that have already been detached from the active writing
+    # device are recorded here.
+    def archived_logs
+      synchronize { @archived_logs.dup }
+    end
+
+    # Compresses every archive currently queued by rotation, on the calling
+    # thread. No background thread is started.
+    #
+    # Returns the ArchiveCompressor::Result objects in queue order. Missing
+    # sources (for example an archive removed externally) are skipped and
+    # produce +nil+ entries. Raises ArgumentError when no archive_compressor
+    # is configured.
+    def compress_archived_logs
+      raise ArgumentError, 'no archive_compressor is configured' unless @archive_compressor
+      results = []
+      # Each shift is locked; compression itself runs without holding the
+      # monitor so log writing is never blocked by it. The compressor
+      # additionally guarantees a given archive is never compressed twice,
+      # even if two callers happen to drain the same path.
+      while (path = synchronize { @archived_logs.shift })
+        results << compress_archive(path)
+      end
+      results
+    end
+
+    # Compresses a single rotated +archive+ on the calling thread.
+    #
+    # The active log file can never be compressed through this method.
+    # Compression failures are reported separately from log writing failures:
+    # they warn with a distinct message (or raise the exception when it is
+    # listed in +reraise_compression_errors+), while log writing continues.
+    # Returns the ArchiveCompressor::Result, or +nil+ when the archive no
+    # longer exists.
+    def compress_archive(archive)
+      raise ArgumentError, 'no archive_compressor is configured' unless @archive_compressor
+      archive = File.expand_path(archive)
+      return nil unless File.file?(archive)
+      if active_log_path?(archive)
+        raise ArgumentError, "refusing to compress the active log file: #{archive}"
+      end
+      handle_compression_errors do
+        @archive_compressor.compress(archive)
+      end
     end
 
   private
@@ -151,6 +212,36 @@ class Logger
       raise
     rescue
       warn("log #{mesg} failed. #{$!}")
+    end
+
+    def handle_compression_errors
+      yield
+    rescue *@reraise_compression_errors
+      raise
+    rescue
+      warn("log archive compression failed. #{$!}")
+    end
+
+    def active_log_path?(path)
+      return false unless @filename
+      expanded = File.expand_path(@filename)
+      return false unless expanded == path
+      return true unless @dev.respond_to?(:stat)
+      File.identical?(@dev, path)
+    rescue SystemCallError
+      true
+    end
+
+    # Records an archive produced by rotation. At this point +shifted+ has
+    # been renamed away from the active file and a new device was opened, so
+    # only detached archives are ever queued.
+    def remember_archived_log(shifted)
+      return unless @archive_compressor
+      path = File.expand_path(shifted)
+      synchronize do
+        return if active_log_path?(path)
+        @archived_logs << path unless @archived_logs.include?(path)
+      end
     end
 
     def add_log_header(file)
@@ -247,6 +338,7 @@ class Logger
           retry # to change gid only
         end
       end
+      remember_archived_log(shifted)
       return true
     end
   end
