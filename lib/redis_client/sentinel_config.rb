@@ -74,6 +74,9 @@ class RedisClient
       # Only remove SSL from sentinel config if it was derived from URL,
       # not if explicitly set by user.
       @sentinel_client_config.delete(:ssl) unless ssl_explicitly_set
+      # Client-side caching only makes sense on the actual Redis nodes,
+      # not on the sentinel connections.
+      @sentinel_client_config.delete(:cache)
       super(**client_config)
       @sentinel_configs = sentinels_to_configs(sentinels)
     end

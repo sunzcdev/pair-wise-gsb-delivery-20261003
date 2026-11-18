@@ -15,7 +15,8 @@ class RedisClient
     module Common
       attr_reader :db, :id, :ssl, :ssl_params, :command_builder, :inherit_socket,
         :connect_timeout, :read_timeout, :write_timeout, :driver, :protocol,
-        :middlewares_stack, :custom, :circuit_breaker, :driver_info, :idle_timeout
+        :middlewares_stack, :custom, :circuit_breaker, :driver_info, :idle_timeout,
+        :cache
 
       alias_method :ssl?, :ssl
 
@@ -40,7 +41,8 @@ class RedisClient
         reconnect_attempts: false,
         middlewares: false,
         circuit_breaker: nil,
-        driver_info: nil
+        driver_info: nil,
+        cache: nil
       )
         @username = username
         @password = password && !password.respond_to?(:call) ? ->(_) { password } : password
@@ -67,6 +69,25 @@ class RedisClient
         @protocol = protocol
         unless protocol == 2 || protocol == 3
           raise ArgumentError, "Unknown protocol version #{protocol.inspect}, expected 2 or 3"
+        end
+
+        @cache = case cache
+        when nil, false
+          nil
+        when true
+          Cache.new
+        when Hash
+          Cache.new(**cache)
+        when Cache
+          cache
+        else
+          raise ArgumentError,
+            "cache: must be `true`, `false`, a Hash of RedisClient::Cache options, " \
+              "or a RedisClient::Cache, got: #{cache.inspect}"
+        end
+
+        if @cache && @protocol != 3
+          raise ArgumentError, "Client-side caching (`cache:`) requires the RESP3 protocol (`protocol: 3`)"
         end
 
         @command_builder = command_builder
@@ -111,6 +132,10 @@ class RedisClient
 
         if @db && @db != 0
           prelude << ["SELECT", @db.to_s]
+        end
+
+        if @cache
+          prelude << ["CLIENT", "TRACKING", "ON"]
         end
 
         # Add CLIENT SETINFO commands for lib-name and lib-ver

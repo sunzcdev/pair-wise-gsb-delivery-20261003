@@ -8,6 +8,13 @@ class RedisClient
     UnknownType = Class.new(Error)
     SyntaxError = Class.new(Error)
 
+    # An out-of-band RESP3 push message (`>` type), e.g. a client tracking
+    # `invalidate` notification or a pubsub message. It's a regular Array
+    # of the message elements, but with a distinct type so connection
+    # code can tell it apart from a command reply.
+    class Push < Array
+    end
+
     EOL = "\r\n".b.freeze
     EOL_SIZE = EOL.bytesize
     DUMP_TYPES = {
@@ -104,7 +111,7 @@ class RedisClient
       elsif type == 126 # '~'.ord
         parse_set(io)
       elsif type == 62 # '>'.ord
-        parse_array(io)
+        parse_push(io)
       elsif type.nil?
         raise SyntaxError, "Unexpected end of stream"
       else
@@ -135,6 +142,10 @@ class RedisClient
 
     def parse_array(io)
       parse_sequence(io, io.gets_integer)
+    end
+
+    def parse_push(io)
+      Push.new(parse_sequence(io, io.gets_integer))
     end
 
     def parse_set(io)

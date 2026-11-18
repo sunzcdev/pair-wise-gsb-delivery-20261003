@@ -1,5 +1,11 @@
 # Unreleased
 
+- Added opt-in client-side caching via the `cache:` configuration option. When enabled, the client issues
+  `CLIENT TRACKING ON` and caches the replies of explicitly declared read-only commands (`RedisClient::Cache`),
+  evicting entries as server invalidation pushes are processed. Cached values are deeply frozen and shared.
+- RESP3 push messages (`>` type) are now parsed as `RedisClient::RESP3::Push` (an `Array` subclass) and are
+  transparently processed when interleaved with command replies instead of desynchronizing the connection.
+
 # 0.31.0
 
 - Improved the Ruby driver buffering logic, should trigger GC less, particularly for large response and when using SSL.

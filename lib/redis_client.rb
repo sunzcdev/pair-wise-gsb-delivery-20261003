@@ -1,6 +1,7 @@
 # frozen_string_literal: true
 
 require "redis_client/version"
+require "redis_client/cache"
 require "redis_client/command_builder"
 require "redis_client/url_config"
 require "redis_client/config"
@@ -360,11 +361,7 @@ class RedisClient
 
   def call(*command, **kwargs)
     command = @command_builder.generate(command, kwargs)
-    result = ensure_connected do |connection|
-      @middlewares.call(command, config) do
-        connection.call(command, nil)
-      end
-    end
+    result = execute_command(command, retryable: true)
 
     if block_given?
       yield result
@@ -375,11 +372,7 @@ class RedisClient
 
   def call_v(command)
     command = @command_builder.generate(command)
-    result = ensure_connected do |connection|
-      @middlewares.call(command, config) do
-        connection.call(command, nil)
-      end
-    end
+    result = execute_command(command, retryable: true)
 
     if block_given?
       yield result
@@ -390,11 +383,7 @@ class RedisClient
 
   def call_once(*command, **kwargs)
     command = @command_builder.generate(command, kwargs)
-    result = ensure_connected(retryable: false) do |connection|
-      @middlewares.call(command, config) do
-        connection.call(command, nil)
-      end
-    end
+    result = execute_command(command, retryable: false)
 
     if block_given?
       yield result
@@ -405,11 +394,7 @@ class RedisClient
 
   def call_once_v(command)
     command = @command_builder.generate(command)
-    result = ensure_connected(retryable: false) do |connection|
-      @middlewares.call(command, config) do
-        connection.call(command, nil)
-      end
-    end
+    result = execute_command(command, retryable: false)
 
     if block_given?
       yield result
@@ -500,6 +485,9 @@ class RedisClient
 
   def close
     @raw_connection&.close
+    # The connection was lost: invalidations may have been missed, so the
+    # cached data can't be trusted anymore.
+    config.cache&.reset!
     self
   end
 
@@ -732,6 +720,44 @@ class RedisClient
 
   private
 
+  def execute_command(command, retryable:)
+    if (cache = config.cache) && (redis_key = cache.cacheable_key(command))
+      cached_command(cache, redis_key, command, retryable: retryable)
+    else
+      ensure_connected(retryable: retryable) do |connection|
+        @middlewares.call(command, config) do
+          connection.call(command, nil)
+        end
+      end
+    end
+  end
+
+  def cached_command(cache, redis_key, command, retryable:)
+    cached = cache.lookup(redis_key, command)
+    return cached unless cached.equal?(Cache::UNDEFINED)
+
+    token = nil
+    begin
+      result = ensure_connected(retryable: retryable) do |connection|
+        token = cache.begin_read(redis_key)
+        begin
+          @middlewares.call(command, config) do
+            connection.call(command, nil)
+          end
+        rescue
+          # The attempt failed and may be retried with a new connection:
+          # discard its token so in-flight reads stay balanced.
+          cache.end_read(redis_key)
+          token = nil
+          raise
+        end
+      end
+      cache.store(redis_key, command, token, result)
+    ensure
+      cache.end_read(redis_key) if token
+    end
+  end
+
   def build_transaction
     transaction = Multi.new(@command_builder)
     transaction.call("MULTI")
@@ -889,6 +915,12 @@ class RedisClient
       if config.sentinel?
         config.check_role!(results.last.first)
       end
+    end
+
+    if (cache = config.cache)
+      # Tracking was (re)established on this connection: invalidations may
+      # have been missed while it was down, so advance the cache generation.
+      cache.reset!
     end
   rescue FailoverError, CannotConnectError => error
     @raw_connection&.close

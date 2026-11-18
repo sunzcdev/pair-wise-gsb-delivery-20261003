@@ -1,5 +1,7 @@
 # frozen_string_literal: true
 
+require "redis_client/ruby_connection/resp3"
+
 class RedisClient
   module ConnectionMixin
     attr_accessor :retry_attempt
@@ -34,7 +36,7 @@ class RedisClient
     def call(command, timeout)
       @pending_reads += 1
       write(command)
-      result = read(connection_timeout(timeout))
+      result = read_reply(connection_timeout(timeout))
       @pending_reads -= 1
       if result.is_a?(Error)
         result._set_command(command)
@@ -56,7 +58,7 @@ class RedisClient
 
       size.times do |index|
         timeout = timeouts && timeouts[index]
-        result = read(connection_timeout(timeout))
+        result = read_reply(connection_timeout(timeout))
         @pending_reads -= 1
 
         # A multi/exec command can return an array of results.
@@ -92,6 +94,24 @@ class RedisClient
       # otherwise it would be very racy. So we add the regular read_timeout on top
       # to account for the network delay.
       timeout + config.read_timeout
+    end
+
+    # Reads the next command reply, transparently processing any interleaved
+    # RESP3 push messages (e.g. client tracking invalidations) as they arrive.
+    def read_reply(timeout)
+      reply = read(timeout)
+      while reply.is_a?(RESP3::Push)
+        handle_push(reply)
+        reply = read(timeout)
+      end
+      reply
+    end
+
+    def handle_push(push)
+      if push.first == "invalidate" && (cache = @config.cache)
+        cache.invalidate(push[1])
+      end
+      nil
     end
 
     def protocol_error(message)

@@ -64,6 +64,7 @@ static void redis_set_error(redisContext *c, int type, const char *str) {
 
 static VALUE rb_eRedisClientCommandError, rb_eRedisClientConnectionError, rb_eRedisClientCannotConnectError, rb_eRedisClientProtocolError;
 static VALUE rb_eRedisClientReadTimeoutError, rb_eRedisClientWriteTimeoutError;
+static VALUE rb_cRedisClientRESP3Push;
 static VALUE Redis_Qfalse;
 static ID id_parse;
 
@@ -199,6 +200,8 @@ static void *reply_create_array(const redisReadTask *task, size_t elements) {
     VALUE value = Qnil;
     switch (task->type) {
         case REDIS_REPLY_PUSH:
+            value = rb_obj_alloc(rb_cRedisClientRESP3Push);
+            break;
         case REDIS_REPLY_ARRAY:
         case REDIS_REPLY_SET:
             value = rb_ary_new_capa(elements);
@@ -927,6 +930,10 @@ RUBY_FUNC_EXPORTED void Init_hiredis_connection(void) {
 
     rb_eRedisClientWriteTimeoutError = rb_const_get(rb_cRedisClient, rb_intern("WriteTimeoutError"));
     rb_global_variable(&rb_eRedisClientWriteTimeoutError);
+
+    VALUE rb_mRedisClientRESP3 = rb_const_get(rb_cRedisClient, rb_intern("RESP3"));
+    rb_cRedisClientRESP3Push = rb_const_get(rb_mRedisClientRESP3, rb_intern("Push"));
+    rb_global_variable(&rb_cRedisClientRESP3Push);
 
     VALUE rb_cHiredisConnection = rb_define_class_under(rb_cRedisClient, "HiredisConnection", rb_cObject);
     rb_define_alloc_func(rb_cHiredisConnection, hiredis_alloc);

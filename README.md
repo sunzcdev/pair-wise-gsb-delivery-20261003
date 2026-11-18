@@ -87,6 +87,9 @@ redis.call("GET", "mykey")
 - `reconnect_attempts`: Specify how many times the client should retry to send queries. Defaults to `0`. Makes sure to read the [reconnection section](#reconnection) before enabling it.
 - `circuit_breaker`: A Hash with circuit breaker configuration. Defaults to `nil`. See the [circuit breaker section](#circuit-breaker) for details.
 - `protocol:` The version of the RESP protocol to use. Default to `3`.
+- `cache`: Enable client-side caching for explicitly declared read-only commands. Either `true`, a `RedisClient::Cache`
+  instance, or a Hash of options for `RedisClient::Cache.new`. Defaults to `nil` (disabled). Requires `protocol: 3`.
+  See the [client-side caching section](#client-side-caching) for details.
 - `custom`: A user-owned value ignored by `redis-client` but available as `Config#custom`. This can be used to hold middleware configurations and other user-specific metadata.
 
 ### Sentinel support
@@ -414,10 +417,49 @@ If the transaction wasn't successful, `#multi` will return `nil`.
 
 Note that transactions using optimistic locking aren't automatically retried upon connection errors.
 
+### Client-side caching
+
+When the `cache:` option is set, the client enables [RESP3 client tracking](https://redis.io/docs/manual/client-side-caching/)
+(`CLIENT TRACKING ON`) and caches the replies of explicitly declared, read-only commands
+(`GET`, `HGETALL`, `LRANGE`, ... — see `RedisClient::Cache::CACHEABLE_COMMANDS`):
+
+```ruby
+redis = RedisClient.config(cache: true).new_client
+redis.call("GET", "mykey") # => fetched from the server
+redis.call("GET", "mykey") # => served from the local cache
+```
+
+Commands that aren't explicitly declared as cacheable (including all writes, pipelines and
+transactions) always go through the regular code path; the client never guesses the
+read/write nature of a command.
+
+The server notifies the client of key modifications with `invalidate` push messages, which
+evict the matching entries as they are read from the connection. The whole cache is also
+invalidated whenever the connection is lost and when tracking is (re)established, as
+invalidations may have been missed in between.
+
+Cached values are deeply frozen and shared between callers: the cache retains ownership of
+the returned objects. Callers must not mutate them; `dup` them first if needed.
+
+The cache can be tuned or introspected by passing a `RedisClient::Cache` instance:
+
+```ruby
+cache = RedisClient::Cache.new(max_size: 1_000)
+redis = RedisClient.config(cache: cache).new_client
+```
+
+A custom set of cacheable commands can be declared with the `commands:` option, mapping
+command names to the position of the key argument (or a callable returning the key, or `nil`
+when the command shape isn't supported). Only declare genuinely read-only, deterministic,
+single-key commands:
+
+```ruby
+cache = RedisClient::Cache.new(commands: { "GET" => 1, "MGET" => 1 })
+```
+
 ### Publish / Subscribe
 
 Pub/Sub related commands must be called on a dedicated `PubSub` object:
-
 ```ruby
 redis = RedisClient.new
 pubsub = redis.pubsub

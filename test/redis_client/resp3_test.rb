@@ -114,6 +114,18 @@ class RedisClient
       assert_parses [1, 2, 3], "*3\r\n:1\r\n:2\r\n:3\r\n"
     end
 
+    def test_load_push
+      assert_parses ["invalidate", ["foo"]], ">2\r\n$10\r\ninvalidate\r\n*1\r\n$3\r\nfoo\r\n" do |actual|
+        assert_instance_of RESP3::Push, actual
+        assert_equal ["invalidate", ["foo"]], actual
+      end
+
+      assert_parses ["invalidate", nil], ">2\r\n$10\r\ninvalidate\r\n_\r\n" do |actual|
+        assert_instance_of RESP3::Push, actual
+        assert_equal ["invalidate", nil], actual
+      end
+    end
+
     def test_load_multibyte_chars
       # Check that the buffer is properly operating over bytes and not characters
       assert_parses ["€™€™", 2], "*2\r\n$12\r\n€™€™\r\n:2\r\n"
