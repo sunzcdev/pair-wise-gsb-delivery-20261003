@@ -51,6 +51,8 @@ Sequel calls hooks in the following order when saving an existing object:
 
 Note that all of the hook calls are the same, except that +around_create+, +before_create+ and +after_create+ are used for a new object, and +around_update+, +before_update+ and +after_update+ are used for an existing object.  Note that +around_save+, +before_save+, and +after_save+ are called in both cases.
 
+If you use the <tt>:backfill</tt> option to +save+ (see the "Backfilling Database-Generated Values" section in the +Model#save+ documentation), the +before_create+/+before_update+ hooks run before the INSERT/UPDATE query and see any SQL expressions assigned to columns.  Backfilling the database-generated values also happens before +after_create+/+after_update+, so those hooks (and +after_save+) see the backfilled values for columns the database returned.  Hooks are not run again for the backfilling, and the write query is not run more than once.
+
 Note that the validation hooks are still called if <tt>validate: false</tt> option is passed to save.  If you call <tt>Model#valid?</tt> manually, then only the validation hooks are called:
 
 * +around_validation+

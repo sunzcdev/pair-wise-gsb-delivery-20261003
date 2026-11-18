@@ -2182,3 +2182,154 @@ describe "Model#schema_type_class" do
     @c.new.send(:schema_type_class, :bar).must_be_nil
   end
 end
+
+describe "Model#save backfill option" do
+  before do
+    @db = Sequel.mock(:fetch=>{:id=>1, :s=>'DB', :n=>7}, :autoid=>1, :numrows=>1)
+    @db.extend_datasets do
+      def supports_returning?(_) true end
+      def supports_insert_select?; true end
+      def insert_sql(*v); sql = super; insert_returning_sql(sql) if opts[:returning]; sql end
+      def update_sql(*v); sql = super; update_returning_sql(sql) if opts[:returning]; sql end
+      def insert_select(v); with_sql_first(insert_sql(v)) end
+    end
+    @c = Class.new(Sequel::Model(@db[:items]))
+    @c.columns :id, :s, :n
+    @db.sqls
+  end
+
+  it "should not backfill an update unless the :backfill option is used" do
+    o = @c.load(:id=>1, :s=>'x', :n=>1)
+    o.s = Sequel.function(:lower, 'ABC')
+    o.save(:changed=>true)
+    o.s.must_be_kind_of Sequel::SQL::Function
+    @db.sqls.must_equal ["UPDATE items SET s = lower('ABC') WHERE (id = 1)"]
+  end
+
+  it "should use the normal insert path when no assigned column holds an expression" do
+    o = @c.new(:s=>'a')
+    o.save(:backfill=>true)
+    o.values.must_equal(:id=>1, :s=>'DB', :n=>7)
+    @db.sqls.must_equal ["INSERT INTO items (s) VALUES ('a')"]
+  end
+
+  it "should use RETURNING by default when inserting, replacing expression values with database values" do
+    o = @c.new(:s=>Sequel.function(:upper, 'a'))
+    o.save(:backfill=>true)
+    @db.sqls.must_equal ["INSERT INTO items (s) VALUES (upper('a')) RETURNING *"]
+    o.values.must_equal(:id=>1, :s=>'DB', :n=>7)
+    o.changed_columns.must_equal []
+  end
+
+  it "should use a single additional SELECT when RETURNING is not supported" do
+    @db.extend_datasets{def supports_returning?(_) false end}
+    o = @c.new(:s=>Sequel.function(:upper, 'a'))
+    o.save(:backfill=>true)
+    @db.sqls.must_equal ["INSERT INTO items (s) VALUES (upper('a'))", 'SELECT * FROM items WHERE (id = 1) LIMIT 1']
+    o.values.must_equal(:id=>1, :s=>'DB', :n=>7)
+  end
+
+  it "should support the :select strategy to force the additional SELECT" do
+    o = @c.new(:s=>Sequel.function(:upper, 'a'))
+    o.save(:backfill=>:select)
+    @db.sqls.must_equal ["INSERT INTO items (s) VALUES (upper('a'))", 'SELECT * FROM items WHERE (id = 1) LIMIT 1']
+  end
+
+  it "should raise before writing when the :returning strategy is used and RETURNING is unsupported" do
+    @db.extend_datasets{def supports_returning?(_) false end}
+    o = @c.new(:s=>Sequel.function(:upper, 'a'))
+    proc{o.save(:backfill=>:returning)}.must_raise Sequel::Error
+    @db.sqls.must_equal []
+  end
+
+  it "should accept an array of columns and a hash of options" do
+    o = @c.new(:s=>Sequel.function(:upper, 'a'), :n=>Sequel.lit('1+1'))
+    o.save(:backfill=>[:s, :n])
+    o.s.must_equal 'DB'
+
+    o = @c.new(:s=>Sequel.function(:upper, 'a'))
+    o.save(:backfill=>{:strategy=>:auto, :columns=>[:s]})
+    o.s.must_equal 'DB'
+  end
+
+  it "should raise an Error for invalid :backfill values" do
+    proc{@c.new.save(:backfill=>'bogus')}.must_raise Sequel::Error
+    proc{@c.new.save(:backfill=>{:strategy=>:bogus})}.must_raise Sequel::Error
+  end
+
+  it "should distinguish a returned NULL from a column that was not returned" do
+    @db.fetch = {:id=>1, :s=>nil}
+    o = @c.load(:id=>1, :s=>'x', :n=>1)
+    o.s = Sequel.lit('NULL')
+    o.n = Sequel.lit('NULL')
+    o.save(:changed=>true, :backfill=>{:strategy=>:returning, :columns=>[:s]})
+    o.s.must_be_nil
+    o.n.must_be_kind_of Sequel::LiteralString
+    o.changed_columns.must_include :n
+  end
+
+  it "should show assigned expressions in before hooks and database values in after hooks" do
+    seen = {}
+    @c.class_eval do
+      define_method(:before_save){seen[:before] = self[:s]}
+      define_method(:after_save){seen[:after] = self[:s]}
+    end
+    o = @c.new(:s=>Sequel.function(:upper, 'a'))
+    o.save(:backfill=>true)
+    seen[:before].must_be_kind_of Sequel::SQL::Function
+    seen[:after].must_equal 'DB'
+  end
+
+  it "should run the INSERT only once when backfilling" do
+    o = @c.new(:s=>Sequel.function(:upper, 'a'))
+    o.save(:backfill=>true)
+    @db.sqls.length.must_equal 1
+  end
+
+  it "should use RETURNING to backfill an update, only clearing returned columns" do
+    o = @c.load(:id=>1, :s=>'x', :n=>1)
+    o.s = Sequel.function(:lower, 'ABC')
+    o.save(:changed=>true, :backfill=>true)
+    @db.sqls.must_equal ["UPDATE items SET s = lower('ABC') WHERE (id = 1) RETURNING s"]
+    o.s.must_equal 'DB'
+    o.changed_columns.must_equal []
+  end
+
+  it "should leave expression columns not requested for backfilling changed on update" do
+    @db.fetch = {:id=>1, :s=>'DB'}
+    o = @c.load(:id=>1, :s=>'x', :n=>1)
+    o.s = Sequel.function(:lower, 'ABC')
+    o.n = Sequel.lit('n + 1')
+    o.save(:changed=>true, :backfill=>{:strategy=>:returning, :columns=>[:s]})
+    o.s.must_equal 'DB'
+    o.n.must_be_kind_of Sequel::LiteralString
+    o.changed_columns.must_equal [:n]
+  end
+
+  it "should use a single additional SELECT to backfill an update when RETURNING is unsupported" do
+    @db.extend_datasets{def supports_returning?(_) false end}
+    o = @c.load(:id=>1, :s=>'x', :n=>1)
+    o.s = Sequel.function(:lower, 'ABC')
+    o.save(:changed=>true, :backfill=>true)
+    @db.sqls.must_equal ["UPDATE items SET s = lower('ABC') WHERE (id = 1)", 'SELECT * FROM items WHERE (id = 1) LIMIT 1']
+    o.s.must_equal 'DB'
+  end
+
+  it "should raise BackfillFailed after the write if the row cannot be selected for backfilling" do
+    @db.extend_datasets{def supports_returning?(_) false end}
+    @db.fetch = []
+    o = @c.load(:id=>1, :s=>'x', :n=>1)
+    o.s = Sequel.function(:lower, 'ABC')
+    e = proc{o.save(:changed=>true, :backfill=>:select)}.must_raise Sequel::BackfillFailed
+    e.written?.must_equal true
+    e.columns.must_equal [:s]
+    o.s.must_be_kind_of Sequel::SQL::Function
+  end
+
+  it "should raise BackfillFailed when an UPDATE with RETURNING modifies multiple rows" do
+    @db.fetch = [{:id=>1, :s=>'A'}, {:id=>1, :s=>'B'}]
+    o = @c.load(:id=>1, :s=>'x', :n=>1)
+    o.s = Sequel.function(:lower, 'ABC')
+    proc{o.save(:changed=>true, :backfill=>true)}.must_raise Sequel::BackfillFailed
+  end
+end

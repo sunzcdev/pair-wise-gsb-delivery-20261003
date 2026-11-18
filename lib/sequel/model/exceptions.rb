@@ -13,6 +13,31 @@ module Sequel
     end
   end
 
+  # Exception class raised when backfilling database-generated column values
+  # during Model#save fails.  This is raised after the INSERT or UPDATE
+  # statement has been issued, so the database may already contain the
+  # modified row.
+  class BackfillFailed < Error
+    # The model instance related to this error.
+    attr_reader :model
+
+    # The columns that could not be backfilled.  Columns that were
+    # successfully backfilled before the failure are not included.
+    attr_reader :columns
+
+    def initialize(message=nil, model=nil, columns=nil)
+      @model = model
+      @columns = columns && columns.dup.freeze
+      super(message)
+    end
+
+    # Whether the database write may have already occurred.  This is always
+    # true, because backfill failures are raised after the write statement.
+    def written?
+      true
+    end
+  end
+
   (
   # Exception class raised when +require_modification+ is set and an UPDATE or DELETE statement to modify the dataset doesn't
   # modify a single row.

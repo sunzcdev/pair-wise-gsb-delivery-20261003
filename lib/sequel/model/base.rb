@@ -873,6 +873,10 @@ END
       # use by def_initialize_nil_instance_variables.
       def each_model_instance_variable
         [
+          :@_backfill,
+          :@_backfill_expr_columns,
+          :@_backfill_targets,
+          :@_backfill_update_rows,
           :@changed_columns,
           :@errors,
           :@raise_on_save_failure,
@@ -1158,6 +1162,10 @@ END
     module InstanceMethods
       HOOKS.each{|h| class_eval("def #{h}; end", __FILE__, __LINE__)}
       [:around_create, :around_update, :around_save, :around_destroy, :around_validation].each{|h| class_eval("def #{h}; yield end", __FILE__, __LINE__)}
+
+      # Valid values for the :strategy option of the :backfill option to #save.
+      BACKFILL_STRATEGIES = [:auto, :returning, :select].freeze
+      private_constant :BACKFILL_STRATEGIES
 
       # Define instance method(s) that calls class method(s) of the
       # same name. Replaces the construct:
@@ -1617,6 +1625,9 @@ END
       #
       # Takes the following options:
       #
+      # :backfill :: explicitly backfill database-generated values for columns
+      #              assigned SQL expressions before/during the save.  See
+      #              "Backfilling Database-Generated Values" below.
       # :changed :: save all changed columns, instead of all columns or the columns given
       # :columns :: array of specific columns that should be saved.
       # :raise_on_failure :: set to true or false to override the current
@@ -1626,12 +1637,80 @@ END
       # :transaction :: set to true or false to override the current
       #                 +use_transactions+ setting
       # :validate :: set to false to skip validation
+      #
+      # == Backfilling Database-Generated Values
+      #
+      # If a column is assigned an SQL expression (a <tt>SQL::Expression</tt>
+      # instance such as a function, constant, or <tt>Sequel.lit</tt> value),
+      # Sequel sends the expression to the database instead of a literal value,
+      # and keeps the expression object in the model's values.  That means the
+      # attribute may not reflect what the database actually stored (for
+      # example, a database default, trigger, or <tt>upper(...)</tt> function).
+      #
+      # The +:backfill+ option opts in to replacing such expression values with
+      # the values the database actually stored.  It accepts:
+      #
+      # true, :auto :: backfill every column being written that currently holds
+      #                an SQL expression.  Uses RETURNING if the dataset
+      #                supports it for the write, so the values are returned by
+      #                the same INSERT/UPDATE statement.  If RETURNING is not
+      #                available, or the write path cannot use it (for example,
+      #                a prepared statement), a single additional SELECT is
+      #                issued after the write.
+      # :returning :: only use RETURNING.  If the dataset does not support
+      #               RETURNING for the write, raises a Sequel::Error before
+      #               the INSERT/UPDATE is executed.  Columns not included in an
+      #               already existing RETURNING clause are left as expressions.
+      # :select :: never use RETURNING.  Always issue a single additional SELECT
+      #            after the write to retrieve the columns.
+      # Array of symbols :: same as true, but backfill only the given columns.
+      # Hash :: supports the :strategy (+:auto+, +:returning+, or +:select+)
+      #         and :columns (array of symbols) keys, combining the above.
+      # false, nil, :none :: do not backfill (the default).
+      #
+      # Example:
+      #
+      #   a = Album.new(name: Sequel.function(:upper, 'a'))
+      #   a.save(backfill: true)
+      #   # Uses RETURNING if available: INSERT ... RETURNING name
+      #   # Otherwise: INSERT ...; SELECT name FROM albums WHERE (id = 1) LIMIT 1
+      #   a.name # => 'A' (the value stored by the database)
+      #
+      # Backfilling has the following guarantees:
+      #
+      # * The INSERT/UPDATE is executed exactly once.  RETURNING is part of that
+      #   same statement; the fallback path only runs one additional SELECT.
+      #   Neither path re-executes the write or evaluates database defaults in
+      #   Ruby.
+      # * Only columns actually present in the returned row are replaced.  A
+      #   returned NULL sets the column to +nil+.  A column that was not
+      #   returned keeps its current value (typically the expression) and stays
+      #   in +changed_columns+, so a returned NULL is distinct from a column
+      #   that was never returned.
+      # * Before hooks (+before_save+, +before_create+, +before_update+) see the
+      #   assigned expression values.  Backfilling happens after the write and
+      #   before +after_create+/+after_update+/+after_save+, so after hooks see
+      #   the database values for the columns that were returned.  Hooks are not
+      #   re-run.
+      # * If the database write succeeds but the values cannot be retrieved (for
+      #   example, the fallback SELECT returns no row, the record has no primary
+      #   key, or the UPDATE matched multiple rows), a
+      #   <tt>Sequel::BackfillFailed</tt> exception is raised.  It exposes the
+      #   +model+ and the still-unbackfilled +columns+, and its +written?+
+      #   method returns true, because the INSERT/UPDATE may already have been
+      #   applied (especially if no transaction is used).
       def save(opts=OPTS)
         raise Sequel::Error, "can't save frozen object" if frozen?
-        set_server(opts[:server]) if opts[:server] 
+        set_server(opts[:server]) if opts[:server]
         raise_on_failure = opts[:raise_on_failure]
         return unless validate!(validate: opts[:validate], raise_on_failure: raise_on_failure)
-        checked_save_failure(raise_on_failure: raise_on_failure){checked_transaction(opts){_save(opts)}}
+        @_backfill = _backfill_state(opts[:backfill])
+        @_backfill_targets = @_backfill_update_rows = @_backfill_expr_columns = nil
+        begin
+          checked_save_failure(raise_on_failure: raise_on_failure){checked_transaction(opts){_save(opts)}}
+        ensure
+          @_backfill = @_backfill_targets = @_backfill_update_rows = @_backfill_expr_columns = nil
+        end
       end
 
       # Saves only changed columns if the object has been modified.
@@ -1868,6 +1947,8 @@ END
       # the record should be refreshed from the database.
       def _insert
         ds = _insert_dataset
+        return _backfill_insert(ds) if @_backfill_targets
+
         if _use_insert_select?(ds) && !(h = _insert_select_raw(ds)).nil?
           _save_set_values(h) if h
           nil
@@ -1901,6 +1982,261 @@ END
       # The values hash to use when inserting a new record.
       alias _insert_values values
       private :_insert_values
+
+      # Convert the :backfill option given to #save into normalized backfill
+      # state (a hash with :strategy and :columns entries), or nil if
+      # backfilling is disabled.
+      def _backfill_state(opt)
+        case opt
+        when nil, false, :none
+          nil
+        when true, :auto
+          {:strategy=>:auto, :columns=>nil}.freeze
+        when :returning, :select
+          {:strategy=>opt, :columns=>nil}.freeze
+        when Array
+          {:strategy=>:auto, :columns=>opt.map(&:to_sym).freeze}.freeze
+        when Hash
+          strategy = opt.fetch(:strategy, :auto)
+          strategy = :auto if strategy == true
+          unless BACKFILL_STRATEGIES.include?(strategy)
+            raise Error, "invalid value for :backfill :strategy option: #{strategy.inspect}, should be one of :auto, :returning, or :select"
+          end
+          columns = opt[:columns] && Array(opt[:columns]).map(&:to_sym).freeze
+          {:strategy=>strategy, :columns=>columns}.freeze
+        else
+          raise Error, "invalid value for :backfill option: #{opt.inspect}, should be true, false, :auto, :returning, :select, an array of columns, or a hash"
+        end
+      end
+
+      # Determine the columns to backfill for the given action.  The columns that
+      # were written and currently hold SQL expression values are recorded in
+      # @_backfill_expr_columns; those are the columns that must remain changed
+      # unless the database actually returns their new values.  The subset
+      # explicitly requested (or all of them, if none were given) becomes
+      # @_backfill_targets.  Returns the targets.
+      def _backfill_prepare(action, columns=nil)
+        return [] unless @_backfill
+
+        values = @values
+        columns ||= action == :create ? _insert_values.keys : values.keys
+        expr_columns = columns.select{|c| values.has_key?(c) && _sql_expression_value?(values[c])}
+        @_backfill_expr_columns = expr_columns
+        targets = expr_columns
+        if explicit = @_backfill[:columns]
+          targets = expr_columns & explicit
+        end
+        @_backfill_targets = targets
+        targets
+      end
+
+      # Whether RETURNING can be used to retrieve values for the given action.
+      def _backfill_returning?(ds, type)
+        return false if @_backfill[:strategy] == :select
+        ds.supports_returning?(type) && (type != :insert || ds.supports_insert_select?)
+      end
+
+      # Raise before the write if the :returning strategy was requested but
+      # RETURNING cannot be used for the given action.
+      def _backfill_check_strategy!(ds, type)
+        if @_backfill[:strategy] == :returning && !_backfill_returning?(ds, type)
+          raise Error, "RETURNING is not supported for #{type} on this dataset, cannot use the :returning backfill strategy"
+        end
+      end
+
+      # Perform the INSERT with backfilling, returning the primary key if the
+      # record still needs a separate refresh, or nil if backfilling already set
+      # all of the values (including the primary key).
+      def _backfill_insert(ds)
+        targets = @_backfill_targets
+        return _insert_with_refresh(ds) if targets.empty?
+
+        _backfill_check_strategy!(ds, :insert)
+
+        if _backfill_returning?(ds, :insert)
+          _backfill_insert_returning(ds, targets)
+        else
+          _backfill_insert_select(ds, targets)
+        end
+
+        nil
+      end
+
+      # The standard INSERT path used when there is nothing to backfill.
+      def _insert_with_refresh(ds)
+        if _use_insert_select?(ds) && !(h = _insert_select_raw(ds)).nil?
+          _save_set_values(h) if h
+          nil
+        else
+          iid = _insert_raw(ds)
+          if (pk = autoincrementing_primary_key) && pk.is_a?(Symbol) && !(vals = @values)[pk]
+            vals[pk] = iid
+          end
+          pk
+        end
+      end
+
+      # Insert using RETURNING, applying the returned values.
+      def _backfill_insert_returning(ds, targets)
+        preexisting = ds.opts[:returning]
+        # A full RETURNING * (when not restricted to specific columns) lets us
+        # treat the returned row like a normal post-insert refresh.
+        full = !preexisting && !@_backfill[:columns]
+        rds = if preexisting
+          ds
+        elsif full
+          ds.returning
+        else
+          # Include the primary key so the model can identify the row (and a
+          # later save can update it) even when only specific columns were
+          # requested for backfilling.
+          ds.returning(*(targets + Array(autoincrementing_primary_key)).uniq)
+        end
+
+        row = _insert_select_raw(rds)
+        if row.nil? || row == false
+          raise BackfillFailed.new("Unable to backfill #{targets.inspect} for #{inspect_prefix}: INSERT did not return a row", self, targets)
+        end
+
+        if full
+          _save_set_values(row)
+          _clear_changed_columns(:create)
+        else
+          # Merge every returned column (including the primary key), then, as
+          # with a normal create, clear the changed columns.  Any column that
+          # still holds an expression because the database did not return a
+          # backfilled value for it is left changed.
+          _backfill_merge_values(row)
+          _clear_changed_columns(:create)
+          missing = @_backfill_targets - row.keys
+          unless missing.empty?
+            if @_backfill[:strategy] == :returning
+              raise BackfillFailed.new("Unable to backfill #{missing.inspect} for #{inspect_prefix}: columns not returned by the database", self, missing)
+            end
+            # Fall back to a separate SELECT, which returns the full row.
+            _backfill_select_full(@_backfill_targets, missing, :insert)
+          end
+          _backfill_mark_unbackfilled_changed(row.keys)
+        end
+        nil
+      end
+
+      # Insert without RETURNING, then run one additional SELECT to retrieve the
+      # target columns.
+      def _backfill_insert_select(ds, targets)
+        iid = _insert_raw(ds)
+        if (pk = autoincrementing_primary_key) && pk.is_a?(Symbol) && !(vals = @values)[pk]
+          vals[pk] = iid
+        end
+
+        _backfill_select_full(targets, targets, :insert)
+        nil
+      end
+
+      # Run a single additional SELECT after a write and use the full returned
+      # row as the object's values (equivalent to a normal post-save refresh).
+      # Raises BackfillFailed if the record cannot be found, since the write may
+      # already have been applied.
+      def _backfill_select_full(targets, missing, action)
+        verb = action == :insert ? "INSERT" : "UPDATE"
+        unless model.primary_key
+          raise BackfillFailed.new("Unable to backfill #{missing.inspect} for #{inspect_prefix}: record has no primary key to select by after #{verb}", self, missing)
+        end
+
+        row = _refresh_get(this.server?(:default))
+        unless row
+          raise BackfillFailed.new("Unable to backfill #{missing.inspect} for #{inspect_prefix}: record not found after #{verb}", self, missing)
+        end
+
+        _save_set_values(row)
+        _clear_changed_columns(action)
+        still_missing = targets - row.keys
+        unless still_missing.empty?
+          raise BackfillFailed.new("Unable to backfill #{still_missing.inspect} for #{inspect_prefix}: columns not returned by the database", self, still_missing)
+        end
+        nil
+      end
+
+      # Merge all columns present in the row into the object's values.  Used for
+      # INSERT backfilling with a restricted set of target columns, where the
+      # database may return just the requested columns plus the primary key.
+      def _backfill_merge_values(row)
+        values = @values
+        cols = model.columns
+        row.each do |c, v|
+          next if cols && !cols.include?(c) && !values.has_key?(c)
+          values[c] = v
+        end
+        nil
+      end
+
+      # Mark expression columns that still hold their SQL expression (because the
+      # database did not return a value for them) as changed, so they are
+      # distinguishable from columns the database returned as NULL.
+      def _backfill_mark_unbackfilled_changed(returned)
+        (@_backfill_expr_columns - returned).each{|c| _add_changed_column(c)}
+        nil
+      end
+
+      # Merge only the target columns present in the returned row into the
+      # object's values.  Columns actually returned become clean; any expression
+      # column that was not returned (whether or not it was a target) keeps its
+      # current value and remains changed.  Returns the missing target columns.
+      def _backfill_apply_restricted(row, targets)
+        values = @values
+        cols = model.columns
+        returned = []
+        targets.each do |c|
+          next if !row.has_key?(c) || (cols && !cols.include?(c))
+          values[c] = row[c]
+          _changed_columns.delete(c)
+          returned << c
+        end
+
+        # Expression columns the database did not return still hold their
+        # expression, so keep them marked as changed (distinct from a NULL the
+        # database actually returned).
+        (@_backfill_expr_columns - row.keys).each{|c| _add_changed_column(c)}
+        targets - returned
+      end
+
+      # After an UPDATE with backfilling enabled, apply the returned values (from
+      # RETURNING), or fall back to a single additional SELECT.  Only columns that
+      # were actually returned are removed from changed_columns; target columns
+      # that were not returned remain changed.
+      def _backfill_finish_update(n)
+        targets = @_backfill_targets
+        return if targets.nil? || targets.empty?
+
+        if rows = @_backfill_update_rows
+          if rows.length != 1
+            raise BackfillFailed.new("Unable to backfill #{targets.inspect} for #{inspect_prefix}: UPDATE did not return a single row", self, targets)
+          end
+
+          missing = _backfill_apply_restricted(rows.first, targets)
+          unless missing.empty?
+            if @_backfill[:strategy] == :returning
+              raise BackfillFailed.new("Unable to backfill #{missing.inspect} for #{inspect_prefix}: columns not returned by the database", self, missing)
+            end
+            _backfill_select_full(targets, missing, :update)
+          end
+        else
+          return if n.nil? || n == 0
+
+          if n != 1
+            raise BackfillFailed.new("Unable to backfill #{targets.inspect} for #{inspect_prefix}: UPDATE modified #{n} rows", self, targets)
+          end
+
+          _backfill_select_full(targets, targets, :update)
+        end
+        nil
+      end
+
+      # Whether the given value is an SQL expression that will be sent to the
+      # database, and so would benefit from backfilling.
+      def _sql_expression_value?(value)
+        value.is_a?(SQL::Expression) || value.is_a?(LiteralString)
+      end
       
       # Refresh using a particular dataset, used inside save to make sure the same server
       # is used for reading newly inserted values from the database
@@ -1940,11 +2276,17 @@ END
             around_create do
               called_cu = true
               before_create
+              _backfill_prepare(:create)
               pk = _insert
               @this = nil
               @new = false
               @modified = false
-              pk ? _save_refresh : _clear_changed_columns(:create)
+              # When actual columns were backfilled, _insert already updated the
+              # values and changed columns.  Otherwise _insert behaves like the
+              # default insert path and the standard handling below applies.
+              if @_backfill_targets.nil? || @_backfill_targets.empty?
+                pk ? _save_refresh : _clear_changed_columns(:create)
+              end
               after_create
               true
             end
@@ -1966,7 +2308,9 @@ END
                 columns_updated = @values.reject{|k, v| !columns.include?(k)}
                 _changed_columns.reject!{|c| columns.include?(c)}
               end
-              _update_columns(columns_updated)
+              _backfill_prepare(:update, columns_updated.keys)
+              n = _update_columns(columns_updated)
+              _backfill_finish_update(n)
               @this = nil
               @modified = false
               after_update
@@ -2048,6 +2392,14 @@ END
       # checking that only a single row was modified.
       def _update(columns)
         n = _update_without_checking(columns)
+        if @_backfill_targets && n.is_a?(Array)
+          # A backfill UPDATE with RETURNING returns the affected rows.  The
+          # row count check is deferred to _backfill_finish_update, which
+          # raises BackfillFailed (indicating the write already happened) when
+          # it cannot identify a single row.
+          @_backfill_update_rows = n
+          return n.length
+        end
         raise(NoExistingObject, "Attempt to update object did not result in a single row modification (SQL: #{_update_dataset.update_sql(columns)})") if require_modification && n != 1
         n
       end
@@ -2060,7 +2412,15 @@ END
 
       # Update this instances dataset with the supplied column hash.
       def _update_without_checking(columns)
-        _update_dataset.update(columns)
+        ds = _update_dataset
+        if @_backfill_targets && !@_backfill_targets.empty?
+          _backfill_check_strategy!(ds, :update)
+          if _backfill_returning?(ds, :update)
+            rds = ds.opts[:returning] ? ds : ds.returning(*@_backfill_targets)
+            return rds.update(columns)
+          end
+        end
+        ds.update(columns)
       end
 
       # Whether to use insert_select when inserting a new row.
@@ -2256,8 +2616,13 @@ END
       # Typecast the value to the column's type if typecasting.  Calls the database's
       # typecast_value method, so database adapters can override/augment the handling
       # for database specific column types.
+      #
+      # SQL expression values (including <tt>Sequel::LiteralString</tt>) are not
+      # typecast, since they represent SQL to send to the database and their ruby
+      # representation is not the value the database will store.
       def typecast_value(column, value)
         return value unless typecast_on_assignment && db_schema && (col_schema = db_schema[column])
+        return value if _sql_expression_value?(value)
         value = nil if '' == value and typecast_empty_string_to_nil and col_schema[:type] and ![:string, :blob].include?(col_schema[:type])
         raise(InvalidValue, "nil/NULL is not allowed for the #{column} column") if raise_on_typecast_failure && value.nil? && (col_schema[:allow_null] == false)
         begin
