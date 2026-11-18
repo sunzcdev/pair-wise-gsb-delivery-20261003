@@ -87,10 +87,13 @@ class RedisClient
     end
 
     def read(timeout = nil)
+      # Attribute frames (`|`) are protocol metadata for the reply that follows,
+      # they are never replies of their own. The client returns the business
+      # value only, so a reply with attributes still occupies a single slot.
       if timeout.nil?
-        RESP3.load(@io)
+        RESP3.load(@io, with_attributes: false)
       else
-        @io.with_timeout(timeout) { RESP3.load(@io) }
+        @io.with_timeout(timeout) { RESP3.load(@io, with_attributes: false) }
       end
     rescue RedisClient::RESP3::Error => error
       raise protocol_error(error.message)

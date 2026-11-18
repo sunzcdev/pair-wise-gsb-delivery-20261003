@@ -8,8 +8,51 @@ class RedisClient
     UnknownType = Class.new(Error)
     SyntaxError = Class.new(Error)
 
+    # Holds a decoded reply together with the RESP3 attributes (`|` frame) that
+    # were sent right before it.
+    #
+    # Attribute frames are metadata for the reply that follows, so they are
+    # never returned as standalone replies. This wrapper makes the metadata
+    # available without being confused with a regular RESP3 map (which decodes
+    # to a Ruby Hash).
+    class Attribute
+      attr_reader :value, :attributes
+
+      def initialize(value, attributes)
+        @value = value
+        @attributes = attributes.freeze
+      end
+
+      def deconstruct
+        [value, attributes]
+      end
+
+      def deconstruct_keys(_keys)
+        { value: value, attributes: attributes }
+      end
+
+      def ==(other)
+        other.is_a?(Attribute) && value == other.value && attributes == other.attributes
+      end
+      alias_method :eql?, :==
+
+      def hash
+        [Attribute, value, attributes].hash
+      end
+
+      # Returns the business value, with any nested attribute wrappers removed.
+      def unwrap
+        RESP3.unwrap(value)
+      end
+
+      def inspect
+        "#<#{self.class.name} value=#{value.inspect} attributes=#{attributes.inspect}>"
+      end
+    end
+
     EOL = "\r\n".b.freeze
     EOL_SIZE = EOL.bytesize
+    ATTRIBUTE_TYPE = 124 # '|'.ord
     DUMP_TYPES = {
       String => :dump_string,
       Symbol => :dump_symbol,
@@ -31,8 +74,27 @@ class RedisClient
       dump_array(command, buffer)
     end
 
-    def load(io)
-      parse(io)
+    def load(io, with_attributes: true)
+      parse(io, with_attributes)
+    end
+
+    # Returns `value` with every attribute wrapper removed, recursively.
+    #
+    # Plain replies are returned untouched; only `RESP3::Attribute` wrappers,
+    # including the ones nested inside aggregates, are stripped.
+    def unwrap(value)
+      case value
+      when Attribute
+        unwrap(value.value)
+      when Array
+        value.map { |element| unwrap(element) }
+      when Hash
+        value.each_with_object({}) do |(key, element), hash|
+          hash[unwrap(key)] = unwrap(element)
+        end
+      else
+        value
+      end
     end
 
     def new_buffer
@@ -77,9 +139,29 @@ class RedisClient
       end
     end
 
-    def parse(io)
+    def parse(io, with_attributes = true)
       type = io.getbyte
-      if type == 35 # '#'.ord
+
+      # Attribute frames are metadata for the reply that follows, so they are
+      # never returned as standalone replies: consuming one still leaves the
+      # caller with exactly one reply, which keeps pipelined replies aligned.
+      # A truncated frame raises like any incomplete reply, it is never dropped
+      # to pretend the reply was complete.
+      attributes = nil
+      if type == ATTRIBUTE_TYPE
+        # Frame contents are decoded as plain protocol values: keys keep their
+        # protocol type (integer, boolean, blob, ...) and unknown attributes are
+        # preserved as-is. A frame nested inside another frame is not meaningful
+        # metadata, so it is consumed and dropped like when it is skipped.
+        attributes = parse_map(io, false)
+        while (type = io.getbyte) == ATTRIBUTE_TYPE
+          # Consecutive frames are merged in arrival order, so the frame
+          # closest to the reply wins on duplicate keys.
+          attributes.merge!(parse_map(io, false))
+        end
+      end
+
+      value = if type == 35 # '#'.ord
         parse_boolean(io)
       elsif type == 36 # '$'.ord
         parse_blob(io)
@@ -98,17 +180,32 @@ class RedisClient
       elsif type == 95 # '_'.ord
         parse_null(io)
       elsif type == 42 # '*'.ord
-        parse_array(io)
+        parse_array(io, with_attributes)
       elsif type == 37 # '%'.ord
-        parse_map(io)
+        parse_map(io, with_attributes)
       elsif type == 126 # '~'.ord
-        parse_set(io)
+        parse_set(io, with_attributes)
       elsif type == 62 # '>'.ord
-        parse_array(io)
+        parse_array(io, with_attributes)
       elsif type.nil?
         raise SyntaxError, "Unexpected end of stream"
       else
         raise UnknownType, "Unknown sigil type: #{type.chr.inspect}"
+      end
+
+      if attributes.nil?
+        value
+      elsif value.is_a?(CommandError)
+        # Errors are raised rather than returned, so their attributes ride on
+        # the error object instead of hiding it behind a wrapper. This is done
+        # even when the caller skips attribute wrappers: it doesn't add a reply
+        # slot, it only enriches the raised error.
+        value.attributes = attributes.freeze
+        value
+      elsif with_attributes
+        Attribute.new(value, attributes)
+      else
+        value
       end
     end
 
@@ -133,28 +230,28 @@ class RedisClient
       end
     end
 
-    def parse_array(io)
-      parse_sequence(io, io.gets_integer)
+    def parse_array(io, with_attributes = true)
+      parse_sequence(io, io.gets_integer, with_attributes)
     end
 
-    def parse_set(io)
-      parse_sequence(io, io.gets_integer)
+    def parse_set(io, with_attributes = true)
+      parse_sequence(io, io.gets_integer, with_attributes)
     end
 
-    def parse_map(io)
+    def parse_map(io, with_attributes = true)
       hash = {}
       io.gets_integer.times do
-        hash[parse(io).freeze] = parse(io)
+        hash[parse(io, with_attributes).freeze] = parse(io, with_attributes)
       end
       hash
     end
 
-    def parse_sequence(io, size)
+    def parse_sequence(io, size, with_attributes = true)
       return if size < 0 # RESP2 nil
 
       array = Array.new(size)
       size.times do |index|
-        array[index] = parse(io)
+        array[index] = parse(io, with_attributes)
       end
       array
     end

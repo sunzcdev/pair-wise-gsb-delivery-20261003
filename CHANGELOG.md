@@ -1,5 +1,7 @@
 # Unreleased
 
+- Decode RESP3 attribute frames (`|`). Attributes belong to the reply that follows them and are exposed through `RedisClient::RESP3::Attribute`, so they never take an extra pipeline slot. Regular replies still return the bare business value, and `RESP3.load(io, with_attributes: false)` skips the wrappers.
+
 # 0.31.0
 
 - Improved the Ruby driver buffering logic, should trigger GC less, particularly for large response and when using SSL.

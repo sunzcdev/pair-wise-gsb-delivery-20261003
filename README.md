@@ -287,6 +287,31 @@ redis.call("EXISTS", "counter") # => 1
 redis.call("EXISTS", "counter") { |c| c > 0 } # => true
 ```
 
+### RESP3 attributes
+
+RESP3 lets the server attach attributes (a `|` frame) to the reply that follows them, e.g. for client side caching:
+
+```
+|1
+$3
+ttl
+:10
+$5
+value
+```
+
+Attributes are metadata for that reply, not replies of their own. `redis-client` therefore keeps returning only the business value, and an attributed reply still occupies a single slot in pipelines and transactions.
+
+If you need the attributes, decode with `RedisClient::RESP3.load(io)` (as opposed to `RedisClient::RubyConnection`, which skips them): the reply is wrapped in a `RedisClient::RESP3::Attribute`, distinct from a regular RESP3 map (which decodes to a `Hash`):
+
+```ruby
+reply = RedisClient::RESP3.load(io)
+reply.value      # => "value"
+reply.attributes # => {"ttl" => 10}
+```
+
+Attribute keys keep their protocol type, and unknown attributes are preserved as-is. Consecutive attribute frames are merged in arrival order (the frame closest to the reply wins on duplicate keys), attributes of nested containers stay attached to their own element, and an attribute preceding a push is attached to that push. A truncated attribute frame raises rather than being silently dropped, so a partial reply is never reported as complete.
+
 ### `*_v` methods
 
 In some it's more convenient to pass commands as arrays, for that `_v` versions of `call` methods are available.

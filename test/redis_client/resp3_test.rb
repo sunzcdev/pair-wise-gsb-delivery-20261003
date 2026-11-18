@@ -154,11 +154,190 @@ class RedisClient
       assert_parses "Some string", "=15\r\ntxt:Some string\r\n"
     end
 
+    def test_load_attribute_is_attached_to_the_following_value
+      assert_parses(
+        RESP3::Attribute.new("value", { "key" => "attr" }),
+        "|1\r\n+key\r\n+attr\r\n+value\r\n"
+      )
+    end
+
+    def test_load_attribute_does_not_shadow_plain_map
+      # A regular RESP3 map decodes to a Hash, while an attribute frame must
+      # remain distinguishable from the value it decorates.
+      assert_parses({ "key" => "attr" }, "%1\r\n+key\r\n+attr\r\n")
+
+      raw_io = StringIO.new("|1\r\n+key\r\n+attr\r\n%1\r\n+k\r\n:1\r\n".b)
+      io = build_io(raw_io)
+      actual = RESP3.load(io)
+      assert_instance_of RESP3::Attribute, actual
+      assert_equal({ "key" => "attr" }, actual.attributes)
+      assert_equal({ "k" => 1 }, actual.value)
+      assert io.eof?, "Expected IO to be fully consumed: #{raw_io.read.inspect}"
+    end
+
+    def test_load_attribute_can_be_skipped
+      payload = "|1\r\n+key\r\n+attr\r\n+value\r\n"
+      raw_io = StringIO.new(payload.b)
+      io = build_io(raw_io)
+
+      assert_equal "value", RESP3.load(io, with_attributes: false)
+      assert io.eof?, "Expected IO to be fully consumed: #{raw_io.read.inspect}"
+    end
+
+    def test_load_attribute_skip_is_recursive
+      payload = "*2\r\n|1\r\n+first\r\n+a\r\n+one\r\n" \
+        "%1\r\n+k\r\n|1\r\n+second\r\n+b\r\n:2\r\n"
+      raw_io = StringIO.new(payload.b)
+      io = build_io(raw_io)
+
+      assert_equal ["one", { "k" => 2 }], RESP3.load(io, with_attributes: false)
+      assert io.eof?, "Expected IO to be fully consumed: #{raw_io.read.inspect}"
+    end
+
+    def test_load_attribute_keys_keep_protocol_types
+      assert_parses(
+        RESP3::Attribute.new("value", { 42 => "integer", true => true, "blob" => 1 }),
+        "|3\r\n:42\r\n+integer\r\n#t\r\n#t\r\n$4\r\nblob\r\n:1\r\n+value\r\n"
+      )
+    end
+
+    def test_load_unknown_attribute_is_preserved_as_is
+      assert_parses(
+        RESP3::Attribute.new("value", { "unknown" => { "nested" => [1, 2] } }),
+        "|1\r\n+unknown\r\n%1\r\n+nested\r\n*2\r\n:1\r\n:2\r\n+value\r\n"
+      )
+    end
+
+    def test_load_attribute_on_nested_container
+      assert_parses(
+        [RESP3::Attribute.new("one", { "first" => "a" }), "two"],
+        "*2\r\n|1\r\n+first\r\n+a\r\n+one\r\n+two\r\n"
+      )
+      assert_parses(
+        { "k" => RESP3::Attribute.new(2, { "second" => "b" }) },
+        "%1\r\n+k\r\n|1\r\n+second\r\n+b\r\n:2\r\n"
+      )
+      assert_parses(
+        [RESP3::Attribute.new("x", { "in" => "set" })],
+        "~1\r\n|1\r\n+in\r\n+set\r\n+x\r\n"
+      )
+    end
+
+    def test_load_consecutive_attribute_blocks_are_merged
+      assert_parses(
+        RESP3::Attribute.new("value", { "a" => 1, "b" => 2 }),
+        "|1\r\n+a\r\n:1\r\n|1\r\n+b\r\n:2\r\n+value\r\n"
+      )
+    end
+
+    def test_load_consecutive_attribute_blocks_closest_to_value_wins
+      assert_parses(
+        RESP3::Attribute.new("value", { "a" => 2 }),
+        "|1\r\n+a\r\n:1\r\n|1\r\n+a\r\n:2\r\n+value\r\n"
+      )
+    end
+
+    def test_load_attribute_preceding_push
+      assert_parses(
+        RESP3::Attribute.new(["message", "hello"], { "a" => 1 }),
+        "|1\r\n+a\r\n:1\r\n>2\r\n+message\r\n+hello\r\n"
+      )
+    end
+
+    def test_load_attribute_preceding_push_in_middle_of_stream
+      # The frame before the push belongs to the push, the frame after it
+      # belongs to the next reply. Neither frame is a reply of its own.
+      payload = "|1\r\n+push_tag\r\n:1\r\n" \
+        ">2\r\n+message\r\n+hello\r\n" \
+        "|1\r\n+value_tag\r\n:2\r\n" \
+        "+value\r\n"
+      raw_io = StringIO.new(payload.b)
+      io = build_io(raw_io)
+
+      push = RESP3.load(io)
+      assert_equal RESP3::Attribute.new(["message", "hello"], { "push_tag" => 1 }), push
+      assert_equal RESP3::Attribute.new("value", { "value_tag" => 2 }), RESP3.load(io)
+      assert io.eof?, "Expected IO to be fully consumed: #{raw_io.read.inspect}"
+    end
+
+    def test_load_attribute_inside_push_element
+      assert_parses(
+        [RESP3::Attribute.new("message", { "a" => 1 }), "hello"],
+        ">2\r\n|1\r\n+a\r\n:1\r\n+message\r\n+hello\r\n"
+      )
+    end
+
+    def test_load_error_reply_with_attribute
+      raw_io = StringIO.new("|1\r\n+key\r\n+value\r\n-ERR boom\r\n".b)
+      io = build_io(raw_io)
+
+      error = RESP3.load(io)
+      assert_instance_of RedisClient::CommandError, error
+      assert_equal({ "key" => "value" }, error.attributes)
+      assert io.eof?, "Expected IO to be fully consumed: #{raw_io.read.inspect}"
+    end
+
+    def test_load_error_reply_attributes_are_kept_when_skipping
+      raw_io = StringIO.new("|1\r\n+key\r\n+value\r\n-ERR boom\r\n".b)
+      io = build_io(raw_io)
+
+      error = RESP3.load(io, with_attributes: false)
+      assert_instance_of RedisClient::CommandError, error
+      assert_equal({ "key" => "value" }, error.attributes)
+      assert io.eof?, "Expected IO to be fully consumed: #{raw_io.read.inspect}"
+    end
+
+    def test_load_sequential_replies_stay_aligned
+      # One reply per `load` call, attributes never taking an extra slot.
+      payload = "|1\r\n+ttl\r\n:10\r\n+one\r\n" \
+        "|1\r\n+ttl\r\n:20\r\n+two\r\n" \
+        "+three\r\n"
+      raw_io = StringIO.new(payload.b)
+      io = build_io(raw_io)
+
+      assert_equal RESP3::Attribute.new("one", { "ttl" => 10 }), RESP3.load(io)
+      assert_equal RESP3::Attribute.new("two", { "ttl" => 20 }), RESP3.load(io)
+      assert_equal "three", RESP3.load(io)
+      assert io.eof?, "Expected IO to be fully consumed: #{raw_io.read.inspect}"
+    end
+
+    def test_load_truncated_attribute_frame_is_not_dropped
+      # Truncated frame: the attribute key is cut short.
+      assert_raises EOFError do
+        RESP3.load(build_io(StringIO.new("|1\r\n+key".b)))
+      end
+
+      # Truncated frame: the declared pair count is not reached.
+      assert_raises EOFError do
+        RESP3.load(build_io(StringIO.new("|2\r\n+key\r\n:1\r\n".b)))
+      end
+
+      # Complete frame but the decorated value never arrives: the reply is
+      # incomplete, so it must not be reported as a complete reply.
+      assert_raises EOFError do
+        RESP3.load(build_io(StringIO.new("|1\r\n+key\r\n:1\r\n".b)))
+      end
+    end
+
+    def test_unwrap_removes_nested_attributes
+      value = RESP3::Attribute.new(
+        [RESP3::Attribute.new("one", { "a" => 1 }), { "k" => RESP3::Attribute.new(2, { "b" => 2 }) }],
+        { "top" => true }
+      )
+
+      assert_equal ["one", { "k" => 2 }], RESP3.unwrap(value)
+      assert_equal ["one", { "k" => 2 }], value.unwrap
+    end
+
     private
+
+    def build_io(raw_io)
+      RedisClient::RubyConnection::BufferedIO.new(raw_io, read_timeout: 1, write_timeout: 1)
+    end
 
     def assert_parses(expected, payload, io_class: StringIO)
       raw_io = io_class.new(payload.b)
-      io = RedisClient::RubyConnection::BufferedIO.new(raw_io, read_timeout: 1, write_timeout: 1)
+      io = build_io(raw_io)
       actual = RESP3.load(io)
       if block_given?
         yield actual

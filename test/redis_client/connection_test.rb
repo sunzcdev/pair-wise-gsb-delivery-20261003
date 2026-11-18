@@ -393,6 +393,53 @@ class RedisClient
       server_thread&.kill
     end
 
+    def test_attribute_replies_do_not_add_pipeline_slots
+      # RESP3 attributes decorate the reply that follows. On the client side
+      # they must not be returned as replies of their own, or every pipelined
+      # command after one would receive the previous command's reply.
+      tcp_server = TCPServer.new("127.0.0.1", 0)
+      tcp_server.setsockopt(Socket::SOL_SOCKET, Socket::SO_REUSEADDR, true)
+      port = tcp_server.addr[1]
+
+      server_thread = Thread.new do
+        session = tcp_server.accept
+        io = RubyConnection::BufferedIO.new(session, read_timeout: 1, write_timeout: 1)
+        in_multi = false
+        while command = RESP3.load(io, with_attributes: false)
+          case command.first
+          when "HELLO"
+            session.write("_\r\n")
+          when "MULTI"
+            in_multi = true
+            session.write("+OK\r\n")
+          when "EXEC"
+            in_multi = false
+            # Attributes on nested `EXEC` elements must not leak outside them.
+            session.write("*2\r\n|1\r\n+ttl\r\n:10\r\n$5\r\nvalue\r\n:1\r\n")
+          when "GET", "INCR"
+            if in_multi
+              session.write("+QUEUED\r\n")
+            else
+              session.write("|1\r\n+ttl\r\n:10\r\n" + (command.first == "GET" ? "$5\r\nvalue\r\n" : ":1\r\n"))
+            end
+          when "PING"
+            session.write("+PONG\r\n")
+          else
+            session.write("-ERR Unknown command #{command.first}\r\n")
+          end
+        end
+        session.close
+      end
+
+      client = new_client(host: "127.0.0.1", port: port)
+      assert_equal ["value", 1], client.pipelined { |p| p.call("GET", "foo"); p.call("INCR", "foo") }
+      assert_equal "value", client.call("GET", "foo")
+      assert_equal ["value", 1], client.multi { |t| t.call("GET", "foo"); t.call("INCR", "foo") }
+      assert_equal "PONG", client.call("PING")
+    ensure
+      server_thread&.kill
+    end
+
     def test_reconnect_on_readonly
       tcp_server = TCPServer.new("127.0.0.1", 0)
       tcp_server.setsockopt(Socket::SOL_SOCKET, Socket::SO_REUSEADDR, true)

@@ -149,6 +149,9 @@ class RedisClient
     include Retriable
 
     attr_reader :next_error
+    # Attributes sent by the server along with the error reply, if any.
+    # See `RedisClient::RESP3::Attribute`.
+    attr_accessor :attributes
 
     def self.with_config(message, config = nil)
       error = new(message)
