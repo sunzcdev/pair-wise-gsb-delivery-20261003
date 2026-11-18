@@ -1,5 +1,7 @@
 # Unreleased
 
+- Added `RedisClient::RedirectionCoordinator`, an optional, bounded coordinator for Redis Cluster `MOVED`/`ASK` redirections. Target connections are obtained through a caller-supplied client factory; `ASKING` is issued on the same pooled session as the redirected command, loops and a configurable hop limit are detected, and IPv6 targets are supported. Pipelines and `MULTI`/`EXEC` transactions are explicitly refused rather than replayed.
+
 # 0.31.0
 
 - Improved the Ruby driver buffering logic, should trigger GC less, particularly for large response and when using SSL.

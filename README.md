@@ -192,6 +192,50 @@ end
 
 Note that regular clients do respond to `node_for`, `nodes_for` and `nodes`, so that code that support `RedisClient.ring` is also usable with a single server.
 
+### Cluster redirection
+
+For applications talking to a Redis Cluster (or a cluster-aware proxy) through their own node/slot management, an optional
+`RedisClient::RedirectionCoordinator` handles `MOVED` and `ASK` redirections for single commands.
+
+It is deliberately transport agnostic: the coordinator never opens a connection and keeps no slot map. Instead you provide
+a **client factory**, a callable invoked for every redirection. It receives a parsed `Redirection` and must return a client
+(a raw `RedisClient`, a `RedisClient::Pooled`, or any object responding to `#call_v`, `#with` and `#close`) connected to
+the target node. The factory is also where you maintain your routing cache.
+
+```ruby
+# A minimal per-node client cache keyed by "host:port".
+node_cache = {}
+client_factory = lambda do |redirection|
+  # MOVED is authoritative: the slot now permanently lives on the target node,
+  # so the routing table must be updated. ASK is ephemeral and must NOT be cached.
+  node_cache[redirection.address] ||=
+    RedisClient.config(host: redirection.host, port: redirection.port).new_client
+end
+
+coordinator = RedisClient::RedirectionCoordinator.new(client_factory, max_hops: 8)
+
+origin = RedisClient.new(host: "10.0.0.1", port: 6379)
+coordinator.call(origin, ["GET", "mykey"])
+```
+
+`Redirection` exposes the parsed slot, target host/port and the semantics of the redirect:
+
+- `MOVED` (`redirection.moved?` / `redirection.cacheable?`): the slot has definitively moved; update your slot map.
+- `ASK` (`redirection.ask?`): valid only for the current command, typically during a slot migration; never cached.
+
+On an `ASK` redirect the coordinator sends `ASKING` and the command **inside a single `#with` checkout**, so both run on the
+same connection and the one-shot `ASKING` flag is consumed before that connection is returned to any pool user. IPv6
+targets, both bracketed (`[2001:db8::1]:6381`) and bare, are parsed correctly and re-bracketed by `Redirection#address`.
+
+Redirections are bounded: a chain that loops back to an already-seen target raises
+`RedisClient::RedirectionCoordinator::RedirectionLoopError`, and exceeding `max_hops` raises
+`RedisClient::RedirectionCoordinator::RedirectionLimitError`.
+
+Pipelines and `MULTI`/`EXEC` transactions are **not** followed automatically: calling `#pipelined` or `#multi` on the
+coordinator raises `RedisClient::RedirectionCoordinator::BatchNotSupportedError`. A batch may already have been partially
+executed by the time the redirection is returned, so it can never be split and re-sent safely; handle redirections per
+command instead.
+
 ### Type support
 
 Only a select few Ruby types are supported as arguments beside strings.

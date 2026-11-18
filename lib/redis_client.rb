@@ -913,5 +913,6 @@ end
 
 require "redis_client/pooled"
 require "redis_client/circuit_breaker"
+require "redis_client/redirection_coordinator"
 
 RedisClient.default_driver
