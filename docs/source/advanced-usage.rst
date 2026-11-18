@@ -323,3 +323,73 @@ a certain number of bytes have been freed up.
 
 For most applications, this method should be preferred to the manual flow
 control mechanism.
+
+Sending Bodies Without Manual Chunking
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+.. versionadded:: 4.5.0
+
+:meth:`send_data <h2.connection.H2Connection.send_data>` deliberately does not
+slice data up for you: it raises
+:class:`FlowControlError <h2.exceptions.FlowControlError>` or
+:class:`FrameTooLargeError <h2.exceptions.FrameTooLargeError>` if the chunk
+does not fit in the current flow control window or in the peer's maximum frame
+size. Normally callers handle this themselves: they buffer their body, send as
+much as :meth:`local_flow_control_window
+<h2.connection.H2Connection.local_flow_control_window>` allows, watch for
+:class:`WindowUpdated <h2.events.WindowUpdated>` events, and try again.
+
+If that bookkeeping is unwelcome, h2 provides an optional queued body
+interface instead:
+
+- :meth:`queue_data <h2.connection.H2Connection.queue_data>` accepts a body
+  chunk of any size, as long as the total buffered body stays below
+  :data:`max_queued_body_size
+  <h2.connection.H2Connection.max_queued_body_size>` (a bound shared across
+  all streams). Passing ``end_stream=True`` marks the stream to be ended once
+  every queued byte has gone out.
+- The queued bytes are sliced according to the connection window, the stream
+  window and :data:`max_outbound_frame_size
+  <h2.connection.H2Connection.max_outbound_frame_size>`. They are sent as soon
+  as there is room, and again whenever new room appears.
+  :meth:`flush_queued_data <h2.connection.H2Connection.flush_queued_data>`
+  does this explicitly, and :meth:`receive_data
+  <h2.connection.H2Connection.receive_data>` calls it automatically, so
+  ``WINDOW_UPDATE`` frames arriving from the peer are enough to make a stalled
+  body resume.
+- Streams are advanced in round-robin order. A stream whose window is
+  exhausted does not prevent other streams from sending their queued bodies.
+
+The ``END_STREAM`` flag is only ever set on the final frame emitted for a
+stream. Because of that, h2 refuses to mix the two interfaces on one stream:
+while body data is queued, :meth:`send_data
+<h2.connection.H2Connection.send_data>`, :meth:`end_stream
+<h2.connection.H2Connection.end_stream>` and
+``send_headers(..., end_stream=True)`` all raise ``ProtocolError`` for that
+stream.
+
+The queue is bounded, and a call that would overflow it queues nothing at all:
+
+.. code-block:: python
+
+    try:
+        conn.queue_data(stream_id, chunk, end_stream=last_chunk)
+    except h2.exceptions.QueueFullError:
+        # Send what has already been queued, wait for window updates, and
+        # retry the *whole* chunk later.
+        sock.sendall(conn.data_to_send())
+
+Resetting a stream (either locally with :meth:`reset_stream
+<h2.connection.H2Connection.reset_stream>` or by receiving a ``RST_STREAM``)
+discards any body still queued for it. Those bytes were never sent, so they
+never consumed flow control window, and h2 does not hand any window back to the
+peer on their behalf. The same is true when a connection is closed or a
+``GOAWAY`` is received.
+
+:data:`queued_body_size <h2.connection.H2Connection.queued_body_size>` reports
+how many body bytes are currently buffered.
+
+The queued interface does not support padding: the frames it emits never carry
+the ``PADDED`` flag. Use :meth:`send_data <h2.connection.H2Connection.send_data>`
+directly if you need to send padded frames.
+

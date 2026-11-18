@@ -11,6 +11,16 @@ dev
 **API Changes (Backward Compatible)**
 
 - Support for Python 3.15 has been added.
+- Added an optional queued body interface to ``H2Connection``:
+  ``queue_data()`` buffers body data of any size and ``flush_queued_data()``
+  (also called automatically from ``receive_data()``) emits it sliced by the
+  connection window, the stream window and the peer's maximum frame size.
+  Streams are advanced round-robin, so a stream blocked on its window does not
+  stall others, and ``END_STREAM`` is attached only to the stream's final
+  frame. The queue is bounded by ``max_queued_body_size`` and a rejected
+  ``queue_data()`` call buffers nothing. Queued-but-unsent body is discarded on
+  reset/GOAWAY without returning flow control window that was never consumed.
+  New exception: ``QueueFullError``.
 
 **Bugfixes**
 

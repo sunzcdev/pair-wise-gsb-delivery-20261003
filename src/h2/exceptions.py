@@ -122,6 +122,19 @@ class StreamClosedError(NoSuchStreamError):
         self._events = []  # type: ignore
 
 
+class QueueFullError(H2Error):
+    """
+    An attempt was made to queue more body data than the connection is
+    configured to buffer.
+
+    This is a local resource limit, not a protocol violation: nothing was
+    queued by the failing call, and the caller may retry once some of the
+    previously queued data has been sent.
+
+    .. versionadded:: 4.5.0
+    """
+
+
 class InvalidSettingsValueError(ProtocolError, ValueError):
     """
     An attempt was made to set an invalid Settings value.

@@ -838,6 +838,23 @@ class H2Stream:
         """
         return self.state_machine.stream_closed_by
 
+    @property
+    def can_send_data(self) -> bool:
+        """
+        Whether this stream is currently in a state where this peer may send
+        DATA frames on it.
+
+        That is the case in the OPEN and HALF_CLOSED_REMOTE states. It is not
+        the case for the reserved states (where headers must be sent first),
+        for HALF_CLOSED_LOCAL (where we have already sent END_STREAM) or for
+        CLOSED.
+
+        .. versionadded:: 4.5.0
+        """
+        return self.state_machine.state in (
+            StreamState.OPEN, StreamState.HALF_CLOSED_REMOTE,
+        )
+
     def upgrade(self, client_side: bool) -> None:
         """
         Called by the connection to indicate that this stream is the initial
