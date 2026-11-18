@@ -436,6 +436,66 @@ end
 The caller is responsible for reconnecting if the connection is lost and to resubscribe to
 all channels.
 
+#### Subscription tracking
+
+A `PubSub` object keeps two separate sets: the subscriptions you asked for (the *desired*
+set) and the subscriptions the server has acknowledged on the current connection (the
+*confirmed* set). Writing a command only records intent; a channel is never reported as
+active until its acknowledgement is read, so a command that was sent but not answered is
+not mistaken for an effective subscription.
+
+```ruby
+pubsub = redis.pubsub
+pubsub.subscribe("channel-1")
+
+pubsub.desired_channels    # => ["channel-1"]
+pubsub.confirmed_channels  # => []  (nothing acknowledged yet)
+pubsub.pending_channels    # => ["channel-1"]
+pubsub.subscription_count  # => 0
+
+pubsub.next_event # => ["subscribe", "channel-1", 1]
+pubsub.confirmed_channels  # => ["channel-1"]
+pubsub.subscription_count  # => 1
+pubsub.settled?            # => true
+```
+
+Duplicate acknowledgements never inflate the count: confirming an already confirmed
+channel is a no-op. Back-to-back `subscribe` / `unsubscribe` calls are fine, and the
+confirmed set only moves forward when the matching acknowledgements arrive.
+
+`PubSub#state` returns a frozen snapshot with the desired and confirmed sets, the pending
+and stale entries, and the gap information described below.
+
+#### Reconnecting and delivery gaps
+
+`PubSub#reconnect` preserves the desired set, discards the confirmed set (it belonged to
+the old connection), starts a new connection generation and re-sends the desired
+subscriptions. Pass `reconnect: true` to `RedisClient#pubsub` to let the client open a
+fresh connection from its config, or call `reconnect(connection)` with your own.
+
+```ruby
+pubsub = redis.pubsub(reconnect: true)
+pubsub.subscribe("channel-1")
+pubsub.next_event # => ["subscribe", "channel-1", 1]
+
+pubsub.reconnect
+pubsub.state.gap?      # => true, the client is resubscribing
+pubsub.gaps.last.open? # => true
+```
+
+A gap is recorded whenever the connection is lost or replaced. It stays open until the new
+connection has acknowledged every desired subscription. Messages published during the gap
+are *not* recovered — Pub/Sub has no backlog and this client never replays messages, it
+only restores the subscriptions. `Gap#replayable?` and `Gap#replayed?` are always `false`,
+and `Gap#may_have_missed_messages?` is always `true`.
+
+Events attributed to a superseded connection generation are dropped and never update the
+new connection state; they are counted in `PubSub#state.dropped_events`.
+
+`PubSub#close` ends only the subscriptions owned by that instance: it unsubscribes the
+channels and patterns that instance wants or has confirmed (explicitly, never with a bare
+`UNSUBSCRIBE`), closes its own connection, and leaves other `PubSub` objects untouched.
+
 ## Production
 
 ### Instrumentation and Middlewares

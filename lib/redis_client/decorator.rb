@@ -64,12 +64,20 @@ class RedisClient
         RUBY
       end
 
-      %i(id config size connect_timeout read_timeout write_timeout pubsub).each do |reader|
+      %i(id config size connect_timeout read_timeout write_timeout).each do |reader|
         class_eval(<<~RUBY, __FILE__, __LINE__ + 1)
           def #{reader}
             @client.#{reader}
           end
         RUBY
+      end
+
+      def pubsub(**kwargs)
+        if kwargs.empty?
+          @client.pubsub
+        else
+          @client.pubsub(**kwargs)
+        end
       end
 
       %i(timeout connect_timeout read_timeout write_timeout).each do |writer|

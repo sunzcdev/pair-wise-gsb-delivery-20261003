@@ -1,5 +1,10 @@
 # Unreleased
 
+- `RedisClient::PubSub` now tracks the desired and server confirmed subscriptions separately. Acknowledgements update the confirmed set; duplicate acknowledgements don't change the count, and events from a superseded connection generation are dropped.
+- Added `PubSub#reconnect` / `RedisClient#pubsub(reconnect: true)` to restore subscriptions on a new connection, with an observable delivery gap. Messages published while disconnected are not replayed.
+- Added `PubSub#state`, `#desired_subscriptions`, `#confirmed_subscriptions` and friends for inspecting subscription status.
+- `PubSub#close` only unsubscribes the channels and patterns owned by that instance.
+
 # 0.31.0
 
 - Improved the Ruby driver buffering logic, should trigger GC less, particularly for large response and when using SSL.

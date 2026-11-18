@@ -7,6 +7,7 @@ require "redis_client/config"
 require "redis_client/pid_cache"
 require "redis_client/sentinel_config"
 require "redis_client/middlewares"
+require "redis_client/pub_sub"
 
 class RedisClient
   @driver_definitions = {}
@@ -344,10 +345,17 @@ class RedisClient
     @raw_connection&.write_timeout = timeout
   end
 
-  def pubsub
-    sub = PubSub.new(ensure_connected, @command_builder)
+  # Returns a dedicated Pub/Sub connection.
+  #
+  # The returned {PubSub} tracks the subscriptions the caller wants and the
+  # subscriptions the server has acknowledged separately, and can be
+  # reconnected explicitly with {PubSub#reconnect}. Pass `reconnect: true` to
+  # let it open a fresh connection from this client's config when needed.
+  def pubsub(reconnect: false)
+    connection = ensure_connected
     @raw_connection = nil
-    sub
+    factory = reconnect ? method(:pubsub_connection) : nil
+    PubSub.new(connection, @command_builder, reconnect: factory)
   end
 
   def measure_round_trip_delay
@@ -567,43 +575,6 @@ class RedisClient
     else
       results
     end
-  end
-
-  class PubSub
-    def initialize(raw_connection, command_builder)
-      @raw_connection = raw_connection
-      @command_builder = command_builder
-    end
-
-    def call(*command, **kwargs)
-      raw_connection.write(@command_builder.generate(command, kwargs))
-      nil
-    end
-
-    def call_v(command)
-      raw_connection.write(@command_builder.generate(command))
-      nil
-    end
-
-    def close
-      @raw_connection&.close
-      @raw_connection = nil # PubSub can't just reconnect
-      self
-    end
-
-    def next_event(timeout = nil)
-      unless raw_connection
-        raise ConnectionError, "Connection was closed or lost"
-      end
-
-      raw_connection.read(timeout)
-    rescue ReadTimeoutError
-      nil
-    end
-
-    private
-
-    attr_reader :raw_connection
   end
 
   class Multi
@@ -862,34 +833,7 @@ class RedisClient
     end
     @last_used_at = RedisClient.now
     @raw_connection.retry_attempt = @retry_attempt
-
-    prelude = config.connection_prelude.dup
-
-    if id
-      prelude << ["CLIENT", "SETNAME", id]
-    end
-
-    if config.sentinel?
-      prelude << ["ROLE"]
-    end
-
-    unless prelude.empty?
-      results = @middlewares.call_pipelined(prelude, config) do
-        @raw_connection.call_pipelined(prelude, nil, exception: false)
-      end
-
-      results.each do |result|
-        # CLIENT SETINFO is unsupported on Redis < 7.2. The pipeline drained all responses before raising,
-        # so if that's the only error, the socket is healthy: keep it.
-        if result.is_a?(CommandError) && !(result.command[0] == "CLIENT" && result.command[1] == "SETINFO")
-          raise result
-        end
-      end
-
-      if config.sentinel?
-        config.check_role!(results.last.first)
-      end
-    end
+    apply_connection_prelude(@raw_connection)
   rescue FailoverError, CannotConnectError => error
     @raw_connection&.close
     error._set_config(config)
@@ -908,6 +852,59 @@ class RedisClient
     else
       raise
     end
+  end
+
+  # Establish a fresh connection for a {PubSub} client, without tying it to
+  # this client's `@raw_connection`.
+  def pubsub_connection
+    connection = @middlewares.connect(config) do
+      config.driver.new(
+        config,
+        connect_timeout: connect_timeout,
+        read_timeout: read_timeout,
+        write_timeout: write_timeout,
+      )
+    end
+    apply_connection_prelude(connection)
+    connection
+  rescue ConnectionError
+    connection&.close
+    raise
+  rescue CommandError
+    connection&.close
+    raise
+  end
+
+  def apply_connection_prelude(connection)
+    prelude = config.connection_prelude.dup
+
+    if id
+      prelude << ["CLIENT", "SETNAME", id]
+    end
+
+    if config.sentinel?
+      prelude << ["ROLE"]
+    end
+
+    return connection if prelude.empty?
+
+    results = @middlewares.call_pipelined(prelude, config) do
+      connection.call_pipelined(prelude, nil, exception: false)
+    end
+
+    results.each do |result|
+      # CLIENT SETINFO is unsupported on Redis < 7.2. The pipeline drained all responses before raising,
+      # so if that's the only error, the socket is healthy: keep it.
+      if result.is_a?(CommandError) && !(result.command[0] == "CLIENT" && result.command[1] == "SETINFO")
+        raise result
+      end
+    end
+
+    if config.sentinel?
+      config.check_role!(results.last.first)
+    end
+
+    connection
   end
 end
 
