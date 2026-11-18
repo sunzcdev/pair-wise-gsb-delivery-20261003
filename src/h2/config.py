@@ -7,7 +7,10 @@ Objects for controlling the configuration of the HTTP/2 stack.
 from __future__ import annotations
 
 import sys
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:  # pragma: no cover
+    from .events import StreamLifecycleObserver
 
 
 class _BooleanConfigOption:
@@ -149,6 +152,19 @@ class H2Configuration:
         .. versionadded:: 2.6.0
 
     :type logger: ``logging.Logger``
+
+    :param stream_lifecycle_observer: An optional
+        :class:`StreamLifecycleObserver <h2.events.StreamLifecycleObserver>`
+        that records per-stream lifecycle events (initiation, received
+        response headers, first body chunk, clean completion and reset). When
+        set, the connection feeds the events it produces into the observer.
+        Defaults to ``None``, which disables observation entirely.
+
+        .. versionadded:: 4.5.0
+
+    :type stream_lifecycle_observer:
+        :class:`StreamLifecycleObserver <h2.events.StreamLifecycleObserver>`
+        or ``None``
     """
 
     client_side = _BooleanConfigOption("client_side")
@@ -176,7 +192,8 @@ class H2Configuration:
                  split_outbound_cookies: bool = False,
                  validate_inbound_headers: bool = True,
                  normalize_inbound_headers: bool = True,
-                 logger: DummyLogger | OutputLogger | None = None) -> None:
+                 logger: DummyLogger | OutputLogger | None = None,
+                 stream_lifecycle_observer: StreamLifecycleObserver | None = None) -> None:
         self.client_side = client_side
         self.header_encoding = header_encoding
         self.validate_outbound_headers = validate_outbound_headers
@@ -185,6 +202,7 @@ class H2Configuration:
         self.validate_inbound_headers = validate_inbound_headers
         self.normalize_inbound_headers = normalize_inbound_headers
         self.logger = logger or DummyLogger(__name__)
+        self.stream_lifecycle_observer = stream_lifecycle_observer
 
     @property
     def header_encoding(self) -> bool | str | None:

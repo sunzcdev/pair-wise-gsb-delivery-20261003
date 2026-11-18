@@ -84,6 +84,26 @@ Events
    :members:
 
 
+.. _h2-lifecycle-api:
+
+Stream Lifecycle Observation
+----------------------------
+
+.. versionadded:: 4.5.0
+
+.. autoclass:: h2.events.StreamLifecycleObserver
+   :members:
+
+.. autoclass:: h2.events.StreamLifecycleRecord
+   :members:
+
+.. autoclass:: h2.events.StreamOrigin
+   :members:
+
+.. autoclass:: h2.events.StreamOutcome
+   :members:
+
+
 Exceptions
 ----------
 

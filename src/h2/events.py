@@ -11,7 +11,11 @@ H2 state machine it processes the data and returns a list of Event objects.
 from __future__ import annotations
 
 import binascii
-from dataclasses import dataclass
+import contextlib
+import enum
+import time
+from collections.abc import Callable
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
 from .settings import ChangedSetting, SettingCodes, Settings, _setting_code_from_int
@@ -658,6 +662,487 @@ class UnknownFrameReceived(Event):
 
     def __repr__(self) -> str:
         return "<UnknownFrameReceived>"
+
+
+class StreamOrigin(enum.Enum):
+    """
+    Which endpoint initiated an observed HTTP/2 stream.
+
+    This is used to keep server push streams and locally initiated streams
+    distinct, and to flag records whose origin is unknown because the observer
+    attached part-way through.
+
+    .. versionadded:: 4.5.0
+    """
+
+    #: The stream was initiated by this endpoint.
+    LOCAL = "local"
+
+    #: The stream was initiated by the peer.
+    REMOTE = "remote"
+
+
+class StreamOutcome(enum.Enum):
+    """
+    The settlement state of an observed HTTP/2 stream.
+
+    The value tracks *both* directions of a stream: HTTP/2 streams are
+    half-closed, so a cleanly finished stream is only ``COMPLETED`` once the
+    local and the remote direction have both ended. A stream that was reset is
+    always ``RESET``, regardless of how far it had progressed.
+
+    .. versionadded:: 4.5.0
+    """
+
+    #: The stream is still open in both directions.
+    OPEN = "open"
+
+    #: This endpoint has finished sending, but the peer has not.
+    HALF_CLOSED_LOCAL = "half_closed_local"
+
+    #: The peer has finished sending, but this endpoint has not.
+    HALF_CLOSED_REMOTE = "half_closed_remote"
+
+    #: Both directions ended cleanly.
+    COMPLETED = "completed"
+
+    #: The stream was reset, locally or by the peer.
+    RESET = "reset"
+
+
+@dataclass
+class StreamLifecycleRecord:
+    """
+    A snapshot of the lifecycle of a single HTTP/2 stream.
+
+    Records are created and maintained by
+    :class:`StreamLifecycleObserver`. They never hold header fields or body
+    bytes: only timestamps and byte counts are retained.
+
+    .. note:: Timestamps are values returned by the observer's clock callable.
+       They are only meaningful relative to other timestamps taken by the same
+       observer. A value of ``None`` means the event was not observed, either
+       because the observer only started watching the stream part-way through
+       its life, or because the clock callable raised.
+
+    .. versionadded:: 4.5.0
+    """
+
+    stream_id: int
+    """The stream ID this record describes."""
+
+    origin: StreamOrigin | None = None
+    """
+    Whether this endpoint or the peer initiated the stream, or ``None`` if the
+    observer could not tell (for example because it was attached after the
+    stream was opened).
+    """
+
+    is_push: bool = False
+    """
+    Whether this stream is a server push stream. Push streams are kept
+    distinct from ordinary locally-initiated streams.
+    """
+
+    initiated_at: float | None = None
+    """Timestamp taken when the stream was observed to open."""
+
+    response_headers_at: float | None = None
+    """
+    Timestamp taken when the first *final* response header block was observed.
+    Informational (1XX) responses are counted separately and do not fill this
+    field in.
+    """
+
+    first_body_at: float | None = None
+    """
+    Timestamp taken when the first non-empty received body chunk was observed.
+    """
+
+    local_closed_at: float | None = None
+    """Timestamp taken when this endpoint finished sending on the stream."""
+
+    remote_closed_at: float | None = None
+    """Timestamp taken when the peer finished sending on the stream."""
+
+    settled_at: float | None = None
+    """Timestamp taken when the stream was settled, exactly once."""
+
+    reset_at: float | None = None
+    """Timestamp taken when the stream was reset."""
+
+    reset_error_code: int | None = None
+    """The HTTP/2 error code carried by the reset, if any."""
+
+    reset_by_remote: bool | None = None
+    """Whether the peer reset the stream. ``False`` means this endpoint did."""
+
+    informational_responses: int = 0
+    """How many informational (1XX) responses were observed."""
+
+    response_headers_count: int = 0
+    """How many final response header blocks were observed."""
+
+    body_chunks: int = 0
+    """How many non-empty body chunks were observed."""
+
+    body_bytes: int = 0
+    """The total number of body bytes received, excluding padding."""
+
+    flow_controlled_bytes: int = 0
+    """
+    The total flow-controlled length of all received DATA frames, including
+    padding. This is a count only: no body content is retained.
+    """
+
+    clock_failed: bool = False
+    """
+    Whether any clock call for this stream raised. If so, the timing data is
+    incomplete, but no protocol state was affected.
+    """
+
+    # These flags record *whether* a transition happened, independently of
+    # whether a timestamp could be taken for it. A failing clock must not make
+    # the record forget that a direction closed, or the observer could settle a
+    # stream twice.
+    _opened: bool = field(default=False, repr=False)
+    _local_closed: bool = field(default=False, repr=False)
+    _remote_closed: bool = field(default=False, repr=False)
+    _settled: bool = field(default=False, repr=False)
+    _reset: bool = field(default=False, repr=False)
+
+    @property
+    def outcome(self) -> StreamOutcome:
+        """
+        The current settlement state of the stream.
+        """
+        if self._reset:
+            return StreamOutcome.RESET
+        if self._local_closed and self._remote_closed:
+            return StreamOutcome.COMPLETED
+        if self._local_closed:
+            return StreamOutcome.HALF_CLOSED_LOCAL
+        if self._remote_closed:
+            return StreamOutcome.HALF_CLOSED_REMOTE
+        return StreamOutcome.OPEN
+
+    @property
+    def settled(self) -> bool:
+        """
+        Whether this record has been fully settled. Settling happens exactly
+        once per stream: either cleanly once both directions ended, or as soon
+        as the stream is reset.
+        """
+        return self._settled
+
+    @property
+    def local_ended(self) -> bool:
+        """Whether this endpoint has finished sending on the stream."""
+        return self._local_closed
+
+    @property
+    def remote_ended(self) -> bool:
+        """Whether the peer has finished sending on the stream."""
+        return self._remote_closed
+
+    @property
+    def timings_complete(self) -> bool:
+        """
+        Whether the timings can be trusted as a complete picture of the
+        stream. This is ``False`` when the observer attached part-way through
+        the stream or when a clock call raised.
+        """
+        return self._opened and self.initiated_at is not None and not self.clock_failed
+
+    @property
+    def time_to_response_headers(self) -> float | None:
+        """Time between stream initiation and final response headers."""
+        return _elapsed(self.initiated_at, self.response_headers_at)
+
+    @property
+    def time_to_first_body(self) -> float | None:
+        """Time between stream initiation and the first body chunk."""
+        return _elapsed(self.initiated_at, self.first_body_at)
+
+    @property
+    def total_duration(self) -> float | None:
+        """
+        Time between stream initiation and settlement.
+
+        This is a per-stream measurement: it is never derived from how long the
+        connection as a whole has been alive.
+        """
+        return _elapsed(self.initiated_at, self.settled_at)
+
+    def __repr__(self) -> str:
+        return (
+            f"<StreamLifecycleRecord stream_id:{self.stream_id}, "
+            f"origin:{self.origin}, is_push:{self.is_push}, "
+            f"outcome:{self.outcome}>"
+        )
+
+
+class StreamLifecycleObserver:
+    """
+    An optional observer that records the lifecycle of individual HTTP/2
+    streams from the events h2 actually produces.
+
+    A gateway can attach one of these (through
+    :attr:`H2Configuration.stream_lifecycle_observer
+    <h2.config.H2Configuration.stream_lifecycle_observer>`) and then query
+    per-stream outcomes and timings without inferring anything from the total
+    time spent on the connection.
+
+    The observer follows these rules:
+
+    - Stream initiation, final response headers, first body chunk, clean
+      completion and reset are recorded as they happen.
+    - Informational (1XX) responses are counted, but are never treated as the
+      final response.
+    - Server push streams are kept distinct from ordinary locally initiated
+      streams (see :attr:`StreamLifecycleRecord.is_push`).
+    - Half-close only settles the direction it describes. A stream is only
+      ``COMPLETED`` once both directions have ended.
+    - If the observer is attached part-way through a stream, or a clock call
+      raises, the affected timestamps stay ``None`` and
+      :attr:`StreamLifecycleRecord.timings_complete` becomes ``False``. Clock
+      failures never propagate into the protocol state machine.
+    - No header fields or body content are retained: only byte counts.
+
+    An observer belongs to a single connection: attach a *separate* observer to
+    each :class:`H2Connection <h2.connection.H2Connection>` you want to watch.
+    Sharing one observer between both ends of a connection would conflate their
+    independent views of the same stream IDs.
+
+    The observer is not thread-safe. ``H2Connection`` is not thread-safe
+    either, so callers should keep both under the same lock.
+
+    :param clock: A zero-argument callable returning a numeric timestamp.
+        Defaults to :func:`time.monotonic`. Exceptions raised by the callable
+        are swallowed and recorded on the affected stream.
+    :param on_settled: An optional callable invoked exactly once when a stream
+        settles (completes or is reset). Exceptions raised by it are swallowed
+        so that observation can never disturb the protocol state machine.
+    :param max_records: An optional upper bound on retained records. When
+        exceeded, the oldest settled records are discarded first. Unsettled
+        records are never discarded.
+
+    .. versionadded:: 4.5.0
+    """
+
+    def __init__(self,
+                 clock: Callable[[], float] | None = None,
+                 on_settled: Callable[[StreamLifecycleRecord], None] | None = None,
+                 max_records: int | None = None) -> None:
+        if max_records is not None and max_records <= 0:
+            msg = "max_records must be a positive integer or None"
+            raise ValueError(msg)
+        self._clock = clock or time.monotonic
+        self._on_settled = on_settled
+        self._max_records = max_records
+        self._records: dict[int, StreamLifecycleRecord] = {}
+
+    @property
+    def records(self) -> dict[int, StreamLifecycleRecord]:
+        """
+        A shallow copy of the currently retained records, keyed by stream ID.
+        """
+        return dict(self._records)
+
+    def get(self, stream_id: int) -> StreamLifecycleRecord | None:
+        """
+        Return the record for ``stream_id``, or ``None`` if it is unknown.
+        """
+        return self._records.get(stream_id)
+
+    def stream_opened(self,
+                      stream_id: int,
+                      *,
+                      origin: StreamOrigin | None = None,
+                      is_push: bool = False,
+                      local_closed: bool = False,
+                      remote_closed: bool = False) -> StreamLifecycleRecord:
+        """
+        Record that a stream has been opened.
+
+        :param stream_id: The stream that was opened.
+        :param origin: Whether this endpoint or the peer initiated the stream.
+            ``None`` means unknown.
+        :param is_push: Whether this is a server push stream.
+        :param local_closed: Whether the local direction is already closed when
+            the stream opens (for example a client request sent with
+            ``END_STREAM``).
+        :param remote_closed: Whether the remote direction is already closed
+            when the stream opens (for example the response side of a locally
+            pushed stream).
+        """
+        record = self._records.get(stream_id)
+        if record is None:
+            record = StreamLifecycleRecord(stream_id=stream_id)
+            self._records[stream_id] = record
+        record.origin = origin if record.origin is None else record.origin
+        record.is_push = record.is_push or is_push
+        record._opened = True
+        if record.initiated_at is None:
+            record.initiated_at = self._timestamp(record)
+        if local_closed:
+            self._close_local(record)
+        if remote_closed:
+            self._close_remote(record)
+        self._trim()
+        return record
+
+    def stream_closed_locally(self, stream_id: int) -> None:
+        """
+        Record that this endpoint has finished sending on ``stream_id``.
+
+        Only the local direction is settled: the stream is not complete until
+        the peer also finishes. An unknown stream gets an incomplete record so
+        that late observers still see the direction change.
+        """
+        self._close_local(self._ensure(stream_id))
+
+    def stream_closed_remotely(self, stream_id: int) -> None:
+        """
+        Record that the peer has finished sending on ``stream_id``.
+
+        Only the remote direction is settled: the stream is not complete until
+        this endpoint also finishes.
+        """
+        self._close_remote(self._ensure(stream_id))
+
+    def stream_reset(self,
+                     stream_id: int,
+                     *,
+                     error_code: int | None = None,
+                     remote_reset: bool = False) -> None:
+        """
+        Record that ``stream_id`` was reset.
+
+        Reset settles a stream exactly once. Further lifecycle events for an
+        already-settled stream are ignored, so a late frame cannot flip a
+        completed stream into a reset (or vice versa).
+        """
+        record = self._ensure(stream_id)
+        if record.settled:
+            return
+        record._reset = True
+        record.reset_error_code = error_code
+        record.reset_by_remote = remote_reset
+        record.reset_at = self._timestamp(record)
+        self._settle(record)
+
+    def process_event(self, event: Event) -> None:
+        """
+        Update the observer from an event produced by
+        :meth:`H2Connection.receive_data
+        <h2.connection.H2Connection.receive_data>`.
+
+        This is only needed when driving the observer manually. When the
+        observer is attached through
+        :class:`H2Configuration <h2.config.H2Configuration>` the connection
+        feeds received events to it automatically.
+        """
+        if isinstance(event, InformationalResponseReceived):
+            record = self._ensure(event.stream_id)
+            record.informational_responses += 1
+        elif isinstance(event, ResponseReceived):
+            record = self._ensure(event.stream_id)
+            record.response_headers_count += 1
+            if record.response_headers_at is None:
+                record.response_headers_at = self._timestamp(record)
+        elif isinstance(event, DataReceived):
+            record = self._ensure(event.stream_id)
+            record.flow_controlled_bytes += event.flow_controlled_length
+            if event.data:
+                record.body_chunks += 1
+                record.body_bytes += len(event.data)
+                if record.first_body_at is None:
+                    record.first_body_at = self._timestamp(record)
+        elif isinstance(event, StreamEnded):
+            self._close_remote(self._ensure(event.stream_id))
+        elif isinstance(event, StreamReset):
+            self.stream_reset(
+                event.stream_id,
+                error_code=event.error_code,
+                remote_reset=event.remote_reset,
+            )
+        elif isinstance(event, RequestReceived):
+            # A request can only be received by the server, so a stream that
+            # was not seen opening is still known to be remote-initiated. Its
+            # initiation timestamp remains unknown.
+            record = self._ensure(event.stream_id)
+            if record.origin is None:
+                record.origin = StreamOrigin.REMOTE
+
+    def clear(self) -> None:
+        """
+        Discard every retained record.
+        """
+        self._records.clear()
+
+    def _ensure(self, stream_id: int) -> StreamLifecycleRecord:
+        record = self._records.get(stream_id)
+        if record is None:
+            record = StreamLifecycleRecord(stream_id=stream_id)
+            self._records[stream_id] = record
+            self._trim()
+        return record
+
+    def _close_local(self, record: StreamLifecycleRecord) -> None:
+        if record.settled or record._local_closed:
+            return
+        record._local_closed = True
+        record.local_closed_at = self._timestamp(record)
+        self._maybe_complete(record)
+
+    def _close_remote(self, record: StreamLifecycleRecord) -> None:
+        if record.settled or record._remote_closed:
+            return
+        record._remote_closed = True
+        record.remote_closed_at = self._timestamp(record)
+        self._maybe_complete(record)
+
+    def _maybe_complete(self, record: StreamLifecycleRecord) -> None:
+        if record._local_closed and record._remote_closed:
+            self._settle(record)
+
+    def _settle(self, record: StreamLifecycleRecord) -> None:
+        # Callers guarantee this runs at most once per stream: the *_closed
+        # helpers guard against re-closing, and stream_reset guards on
+        # ``record.settled``.
+        record._settled = True
+        record.settled_at = self._timestamp(record)
+        if self._on_settled is not None:
+            # Observation must never change protocol behaviour, so a failing
+            # listener is deliberately swallowed.
+            with contextlib.suppress(Exception):
+                self._on_settled(record)
+
+    def _timestamp(self, record: StreamLifecycleRecord) -> float | None:
+        with contextlib.suppress(Exception):
+            return float(self._clock())
+        record.clock_failed = True
+        return None
+
+    def _trim(self) -> None:
+        if self._max_records is None:
+            return
+        while len(self._records) > self._max_records:
+            victim = next(
+                (sid for sid, record in self._records.items() if record.settled),
+                None,
+            )
+            if victim is None:
+                # Only unsettled records are left; never evict them.
+                return
+            del self._records[victim]
+
+
+def _elapsed(start: float | None, end: float | None) -> float | None:
+    if start is None or end is None:
+        return None
+    return end - start
 
 
 def _bytes_representation(data: bytes | None) -> str | None:

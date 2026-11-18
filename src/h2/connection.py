@@ -43,6 +43,7 @@ from .events import (
     RequestReceived,
     ResponseReceived,
     SettingsAcknowledged,
+    StreamOrigin,
     TrailersReceived,
     UnknownFrameReceived,
     WindowUpdated,
@@ -513,6 +514,12 @@ class H2Connection:
         else:
             self.highest_inbound_stream_id = stream_id
 
+        # A newly created stream is an initiation event for any attached
+        # lifecycle observer. Push streams refine this record right after
+        # creation; a stream created by an inbound HEADERS frame also has its
+        # initiation timestamp taken here, which is accurate for normal peers.
+        self._observe_stream_opened(stream_id, outbound=outbound)
+
         return s
 
     def initiate_connection(self) -> None:
@@ -607,6 +614,15 @@ class H2Connection:
         # Set up stream 1.
         self._begin_new_stream(stream_id=1, allowed_ids=AllowedStreamIDs.ODD)
         self.streams[1].upgrade(self.config.client_side)
+        # Upgraded connections start with stream 1 already half-closed: the
+        # client's request is complete, and the server has nothing to send yet
+        # but the request direction is settled.
+        observer = self.config.stream_lifecycle_observer
+        if observer is not None:
+            if self.config.client_side:
+                observer.stream_closed_locally(1)
+            else:
+                observer.stream_closed_remotely(1)
         return frame_data
 
     def _get_or_create_stream(self, stream_id: int, allowed_ids: AllowedStreamIDs) -> H2Stream:
@@ -835,6 +851,9 @@ class H2Connection:
 
         self._prepare_for_sending(frames)
 
+        if end_stream:
+            self._observe_local_closed(stream_id)
+
     def send_data(self,
                   stream_id: int,
                   data: bytes | memoryview,
@@ -911,6 +930,9 @@ class H2Connection:
         )
         assert self.outbound_flow_control_window >= 0 or frame_size == 0
 
+        if end_stream:
+            self._observe_local_closed(stream_id)
+
     def end_stream(self, stream_id: int) -> None:
         """
         Cleanly end a given stream.
@@ -930,6 +952,7 @@ class H2Connection:
         self.state_machine.process_input(ConnectionInputs.SEND_DATA)
         frames = self._get_stream_by_id(stream_id).end_stream()
         self._prepare_for_sending(frames)
+        self._observe_local_closed(stream_id)
 
     def increment_flow_control_window(self, increment: int, stream_id: int | None = None) -> None:
         """
@@ -1033,6 +1056,18 @@ class H2Connection:
         new_frames = new_stream.locally_pushed()
         self._prepare_for_sending(frames + new_frames)
 
+        # The pushed stream is a stream initiated by *this* endpoint, but it
+        # must stay distinct from ordinary locally-initiated streams. The peer
+        # never sends on it, so the remote direction is already settled.
+        observer = self.config.stream_lifecycle_observer
+        if observer is not None:
+            observer.stream_opened(
+                promised_stream_id,
+                origin=StreamOrigin.LOCAL,
+                is_push=True,
+                remote_closed=True,
+            )
+
     def ping(self, opaque_data: bytes | str) -> None:
         """
         Send a PING frame.
@@ -1074,6 +1109,14 @@ class H2Connection:
         stream = self._get_stream_by_id(stream_id)
         frames = stream.reset_stream(error_code)
         self._prepare_for_sending(frames)
+
+        observer = self.config.stream_lifecycle_observer
+        if observer is not None:
+            observer.stream_reset(
+                stream_id,
+                error_code=int(error_code),
+                remote_reset=False,
+            )
 
     def close_connection(self,
                          error_code: ErrorCodes | int = 0,
@@ -1517,7 +1560,12 @@ class H2Connection:
 
         try:
             for frame in self.incoming_buffer:
-                events.extend(self._receive_frame(frame))
+                frame_events = self._receive_frame(frame)
+                # Observe each frame's events as they complete, so that a
+                # later fatal frame cannot erase observations already made for
+                # earlier, fully processed frames in the same batch.
+                self._observe_events(frame_events)
+                events.extend(frame_events)
         except InvalidPaddingError as e:
             self._terminate_connection(ErrorCodes.PROTOCOL_ERROR)
             msg = "Received frame with invalid padding."
@@ -1696,6 +1744,18 @@ class H2Connection:
         )
         self.streams[frame.promised_stream_id] = new_stream
         new_stream.remotely_pushed(pushed_headers)
+
+        # A remotely pushed stream is kept distinct from ordinary streams the
+        # peer initiated. This endpoint never sends on it, so its local
+        # direction is settled as soon as the push is accepted.
+        observer = self.config.stream_lifecycle_observer
+        if observer is not None:
+            observer.stream_opened(
+                frame.promised_stream_id,
+                origin=StreamOrigin.REMOTE,
+                is_push=True,
+                local_closed=True,
+            )
 
         return frames, events + stream_events
 
@@ -2052,6 +2112,51 @@ class H2Connection:
         return self._stream_closed_by(stream_id) in (
             StreamClosedBy.RECV_END_STREAM, StreamClosedBy.SEND_END_STREAM,
         )
+
+    # ------------------------------------------------------------------
+    # Optional stream lifecycle observation.
+    #
+    # The observer is purely advisory: every hook below must be safe to run
+    # even if the observer misbehaves. It never changes protocol state, and it
+    # never retains header fields or body content.
+    # ------------------------------------------------------------------
+
+    def _observe_stream_opened(self, stream_id: int, *, outbound: bool) -> None:
+        """
+        Tell an attached lifecycle observer that a stream has been opened.
+        """
+        observer = self.config.stream_lifecycle_observer
+        if observer is None:
+            return
+        observer.stream_opened(
+            stream_id,
+            origin=StreamOrigin.LOCAL if outbound else StreamOrigin.REMOTE,
+        )
+
+    def _observe_local_closed(self, stream_id: int) -> None:
+        """
+        Tell an attached lifecycle observer that this endpoint finished
+        sending on ``stream_id``.
+        """
+        observer = self.config.stream_lifecycle_observer
+        if observer is None:
+            return
+        observer.stream_closed_locally(stream_id)
+
+    def _observe_events(self, events: list[Event]) -> None:
+        """
+        Feed received events into an attached lifecycle observer.
+
+        Only the top-level events are inspected: related events (such as the
+        ``stream_ended`` attribute on a :class:`DataReceived
+        <h2.events.DataReceived>`) are always emitted separately as well, so
+        iterating the list once avoids double counting.
+        """
+        observer = self.config.stream_lifecycle_observer
+        if observer is None:
+            return
+        for event in events:
+            observer.process_event(event)
 
 
 def _add_frame_priority(frame: PriorityFrame | HeadersFrame,

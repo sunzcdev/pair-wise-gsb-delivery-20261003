@@ -8,6 +8,7 @@ import logging
 import pytest
 
 import h2.config
+import h2.events
 
 
 class TestH2Config:
@@ -22,7 +23,16 @@ class TestH2Config:
         config = h2.config.H2Configuration()
         assert config.client_side
         assert config.header_encoding is None
+        assert config.stream_lifecycle_observer is None
         assert isinstance(config.logger, h2.config.DummyLogger)
+
+    def test_lifecycle_observer_is_reflected(self) -> None:
+        """
+        The lifecycle observer, when supplied, is exposed on the config.
+        """
+        observer = h2.events.StreamLifecycleObserver()
+        config = h2.config.H2Configuration(stream_lifecycle_observer=observer)
+        assert config.stream_lifecycle_observer is observer
 
     boolean_config_options = [
         "client_side",

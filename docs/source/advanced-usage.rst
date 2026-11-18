@@ -102,11 +102,78 @@ is emitted by h2. The following objects have "related events":
              the "related events" event pattern, you will want to be careful to
              avoid double-processing related events.
 
+Stream Lifecycle Observation
+----------------------------
+
+.. versionadded:: 4.5.0
+
+A gateway often wants per-stream outcomes and timings: how long until a
+response arrived, how long until the first body byte, and whether a stream
+completed cleanly or was reset. Inferring this from the total time spent on the
+connection is wrong, because streams overlap and the connection outlives any
+single stream.
+
+To measure it directly, h2 can feed the events it already produces into an
+optional :class:`StreamLifecycleObserver <h2.events.StreamLifecycleObserver>`.
+Attach one to the connection through the configuration:
+
+.. code-block:: python
+
+    import h2.config
+    import h2.connection
+    import h2.events
+
+    observer = h2.events.StreamLifecycleObserver()
+    config = h2.config.H2Configuration(stream_lifecycle_observer=observer)
+    conn = h2.connection.H2Connection(config=config)
+
+The connection then records the actual protocol events for each stream. The
+observer makes the following guarantees:
+
+- Initiation, the first *final* response header block, the first body chunk,
+  clean completion, and reset are recorded as they happen. A stream's
+  ``total_duration`` is measured between its own initiation and settlement,
+  never against the connection's lifetime.
+
+- Informational (1XX) responses are counted, but are never treated as the final
+  response. A stream that only saw a ``100``/``103`` response has no
+  ``response_headers_at`` yet.
+
+- Server push streams are kept distinct from ordinary locally-initiated streams
+  through :attr:`StreamLifecycleRecord.is_push
+  <h2.events.StreamLifecycleRecord.is_push>` and
+  :attr:`StreamLifecycleRecord.origin <h2.events.StreamLifecycleRecord.origin>`.
+
+- Half-close only settles the direction it describes. A stream is only
+  ``COMPLETED`` once both directions have ended; ending one side leaves it
+  ``HALF_CLOSED_LOCAL`` or ``HALF_CLOSED_REMOTE``.
+
+- If the observer is attached part-way through a stream, or a clock call
+  raises, the affected timestamps stay ``None`` and
+  :attr:`StreamLifecycleRecord.timings_complete
+  <h2.events.StreamLifecycleRecord.timings_complete>` is ``False``. A failing
+  clock or settlement callback never propagates into the protocol state machine.
+
+- No header fields or body content are retained: only byte counts and
+  timestamps.
+
+Records are queried with :meth:`StreamLifecycleObserver.get
+<h2.events.StreamLifecycleObserver.get>` or
+:attr:`StreamLifecycleObserver.records
+<h2.events.StreamLifecycleObserver.records>`. Use ``max_records`` to bound
+retention and an ``on_settled`` callback to be notified exactly once when a
+stream settles.
+
+.. note:: An observer belongs to a single connection. Attach a separate
+          observer to each :class:`H2Connection
+          <h2.connection.H2Connection>`; sharing one between both ends of a
+          connection would conflate their independent views of the same stream
+          IDs.
+
 .. _h2-connection-advanced:
 
 Connections: Advanced
 ---------------------
-
 Thread Safety
 ~~~~~~~~~~~~~
 

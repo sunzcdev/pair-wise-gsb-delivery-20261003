@@ -11,6 +11,14 @@ dev
 **API Changes (Backward Compatible)**
 
 - Support for Python 3.15 has been added.
+- Added an optional :class:`StreamLifecycleObserver
+  <h2.events.StreamLifecycleObserver>` (configured through
+  ``H2Configuration(stream_lifecycle_observer=...)``) that records per-stream
+  lifecycle events: initiation, first final response headers, first body chunk,
+  clean completion, and reset. Informational responses are never treated as the
+  final response, server push streams are kept distinct from locally initiated
+  streams, half-close only settles the corresponding direction, and no body
+  content is retained.
 
 **Bugfixes**
 
