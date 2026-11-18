@@ -179,6 +179,18 @@ class RFC1122Error(H2Error):
     # turns out to be true, TELL HIM NOTHING.
 
 
+class StaleDataPlanError(H2Error):
+    """
+    A :class:`DataFramePlan <h2.plan.DataFramePlan>` was committed after one
+    of the values it was computed from (the connection-level or stream-level
+    outbound flow control window, or the peer's maximum frame size) changed.
+    The plan must be recomputed with :meth:`H2Connection.plan_data
+    <h2.connection.H2Connection.plan_data>` before sending.
+
+    .. versionadded:: 4.5.0
+    """
+
+
 class DenialOfServiceError(ProtocolError):
     """
     Emitted when the remote peer exhibits a behaviour that is likely to be an

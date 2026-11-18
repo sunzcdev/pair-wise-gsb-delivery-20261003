@@ -11,6 +11,14 @@ dev
 **API Changes (Backward Compatible)**
 
 - Support for Python 3.15 has been added.
+- Added read-only DATA frame planning: ``H2Connection.plan_data`` estimates how a
+  body would be split into DATA frames given the current connection-level and
+  stream-level outbound flow control windows, the peer's maximum frame size, and
+  optional padding, without consuming flow control credit or emitting
+  ``END_STREAM``. ``H2Connection.send_planned_data`` commits a plan, rejecting
+  stale plans with the new ``h2.exceptions.StaleDataPlanError`` when the windows
+  or maximum frame size changed since the plan was computed. See the new
+  ``h2.plan`` module.
 
 **Bugfixes**
 

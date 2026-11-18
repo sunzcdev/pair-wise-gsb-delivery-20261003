@@ -55,13 +55,15 @@ from .exceptions import (
     NoSuchStreamError,
     ProtocolError,
     RFC1122Error,
+    StaleDataPlanError,
     StreamClosedError,
     StreamIDTooLowError,
     TooManyStreamsError,
 )
 from .frame_buffer import FrameBuffer
+from .plan import DataFramePlan, _plan_frames
 from .settings import ChangedSetting, SettingCodes, Settings
-from .stream import H2Stream, StreamClosedBy
+from .stream import H2Stream, StreamClosedBy, StreamState
 from .utilities import SizeLimitDict, guard_increment_window
 from .windows import WindowManager
 
@@ -910,6 +912,156 @@ class H2Connection:
             self.outbound_flow_control_window,
         )
         assert self.outbound_flow_control_window >= 0 or frame_size == 0
+
+    def plan_data(self,
+                  stream_id: int,
+                  data: bytes | memoryview | int,
+                  pad_length: Any = None) -> DataFramePlan:
+        """
+        Estimate how a body would be split into DATA frames, without sending
+        anything.
+
+        This method is strictly read-only: it consumes no flow control
+        credit, processes no state machine input, emits no frames, and never
+        sets ``END_STREAM``. It takes the current connection-level and
+        stream-level outbound flow control windows, the peer's maximum frame
+        size, and the optional padding into account, and returns a
+        :class:`DataFramePlan <h2.plan.DataFramePlan>` describing the
+        sendable prefix of the body and, if the whole body does not fit, the
+        reason the remainder cannot be sent right now.
+
+        Because the plan is a snapshot, it becomes stale as soon as a
+        WINDOW_UPDATE frame or a SETTINGS frame from the peer changes any of
+        those inputs. Commit a plan promptly with :meth:`send_planned_data`,
+        which refuses stale plans, or simply recompute it.
+
+        .. versionadded:: 4.5.0
+
+        :param stream_id: The ID of the stream the data would be sent on.
+        :type stream_id: ``int``
+        :param data: The body to plan for, or its length in bytes as an
+            ``int`` if the body has not been materialized yet.
+        :type data: ``bytes`` or ``int``
+        :param pad_length: (optional) Length of the padding that would be
+            applied to each frame. Defaults to ``None`` for no padding.
+        :type pad_length: ``int``
+        :returns: A :class:`DataFramePlan <h2.plan.DataFramePlan>`.
+        :raises StreamClosedError: If the stream is not in a state where
+            data can be sent.
+        """
+        if isinstance(data, int):
+            total_length = data
+            if total_length < 0:
+                msg = f"data length must be non-negative, got {total_length}"
+                raise ValueError(msg)
+        else:
+            total_length = len(data)
+
+        if pad_length is not None:
+            if not isinstance(pad_length, int):
+                msg = "pad_length must be an int"
+                raise TypeError(msg)
+            if pad_length < 0 or pad_length > 255:
+                msg = "pad_length must be within range: [0, 255]"
+                raise ValueError(msg)
+
+        self.config.logger.debug(
+            "Plan data on stream ID %d with len %d", stream_id, total_length,
+        )
+
+        stream = self._get_stream_by_id(stream_id)
+        # Read-only equivalent of the state machine checks send_data would
+        # perform: planning must not process any state machine input.
+        if stream.state_machine.state not in (
+            StreamState.OPEN,
+            StreamState.HALF_CLOSED_REMOTE,
+        ):
+            raise StreamClosedError(stream_id)
+
+        frames, blocked_reason = _plan_frames(
+            stream_id,
+            total_length,
+            pad_length,
+            self.outbound_flow_control_window,
+            stream.outbound_flow_control_window,
+            self.max_outbound_frame_size,
+        )
+
+        plan = DataFramePlan(
+            stream_id=stream_id,
+            total_length=total_length,
+            pad_length=pad_length,
+            frames=frames,
+            blocked_reason=blocked_reason,
+            end_stream_sendable=True,
+            _connection_window=self.outbound_flow_control_window,
+            _stream_window=stream.outbound_flow_control_window,
+            _max_frame_size=self.max_outbound_frame_size,
+        )
+        self.config.logger.debug(
+            "Planned %d frame(s) on stream ID %d (%d of %d bytes, blocked: %s)",
+            len(plan.frames), stream_id, plan.planned_length, total_length,
+            blocked_reason,
+        )
+        return plan
+
+    def send_planned_data(self,
+                          plan: DataFramePlan,
+                          data: bytes | memoryview) -> None:
+        """
+        Send a body according to a previously computed :class:`DataFramePlan
+        <h2.plan.DataFramePlan>`.
+
+        The plan is revalidated before anything is sent: if the
+        connection-level or stream-level outbound flow control window or the
+        peer's maximum frame size has changed since the plan was computed,
+        the plan is stale and a :class:`StaleDataPlanError
+        <h2.exceptions.StaleDataPlanError>` is raised without consuming any
+        flow control credit. In that case, recompute the plan with
+        :meth:`plan_data` and retry.
+
+        Only the planned prefix of ``data`` is sent; the caller is
+        responsible for re-planning and sending the remainder once more
+        flow control credit arrives. Plans never set ``END_STREAM``: call
+        :meth:`end_stream` afterwards to end the stream, which is always
+        possible because an empty ``END_STREAM`` frame consumes no flow
+        control credit.
+
+        .. versionadded:: 4.5.0
+
+        :param plan: A plan returned by :meth:`plan_data`.
+        :type plan: :class:`DataFramePlan <h2.plan.DataFramePlan>`
+        :param data: The body the plan was computed for. Its length must
+            equal the plan's ``total_length``.
+        :type data: ``bytes``
+        :returns: Nothing
+        :raises StaleDataPlanError: If the plan no longer matches the
+            current windows or maximum frame size.
+        """
+        if len(data) != plan.total_length:
+            msg = f"data length {len(data)} does not match planned length {plan.total_length}"
+            raise ValueError(msg)
+
+        stream = self._get_stream_by_id(plan.stream_id)
+        if (self.outbound_flow_control_window != plan._connection_window
+                or stream.outbound_flow_control_window != plan._stream_window
+                or self.max_outbound_frame_size != plan._max_frame_size):
+            msg = (
+                "Plan is stale: flow control windows or maximum frame size "
+                "changed since it was computed; recompute it with plan_data"
+            )
+            raise StaleDataPlanError(msg)
+
+        offset = 0
+        for planned_frame in plan.frames:
+            chunk = data[offset:offset + planned_frame.data_length]
+            self.send_data(
+                plan.stream_id,
+                chunk,
+                end_stream=False,
+                pad_length=planned_frame.pad_length,
+            )
+            offset += planned_frame.data_length
 
     def end_stream(self, stream_id: int) -> None:
         """

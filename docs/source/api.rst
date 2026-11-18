@@ -27,6 +27,19 @@ Configuration
    :members:
 
 
+Data Frame Planning
+-------------------
+
+.. autoclass:: h2.plan.DataFramePlan
+   :members:
+
+.. autoclass:: h2.plan.PlannedDataFrame
+   :members:
+
+.. autoclass:: h2.plan.DataPlanBlockedReason
+   :members:
+
+
 .. _h2-events-api:
 
 Events
@@ -99,6 +112,10 @@ Exceptions
    :members:
 
 .. autoclass:: h2.exceptions.RFC1122Error
+   :show-inheritance:
+   :members:
+
+.. autoclass:: h2.exceptions.StaleDataPlanError
    :show-inheritance:
    :members:
 
