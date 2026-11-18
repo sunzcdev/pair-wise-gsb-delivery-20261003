@@ -176,6 +176,24 @@ require "digest"
 #     # Calls to #transaction, #[]=, and #delete are not allowed here.
 #   end
 #
+# === Read-Only Snapshots
+#
+# A read-only transaction keeps the store lock for the whole block.
+# When the data must be traversed slowly, or outside the transaction,
+# #snapshot returns a PStore::Snapshot instead:
+#
+#   snapshot = store.snapshot
+#   snapshot.each do |key, value|
+#     # No store lock is held here; other threads and processes may
+#     # run write transactions while the snapshot is traversed.
+#   end
+#
+# The snapshot is fixed while the locks are held, then both locks are
+# released.  It owns a deep Marshal copy of the data, so mutating its
+# objects never reaches the store, aliasing and cyclic references are
+# preserved, and later updates are not reflected.  A failed read raises
+# rather than returning a half-built snapshot.
+#
 # == Hierarchical Values
 #
 # The value for an entry may be a simple object (as seen above).
@@ -327,7 +345,7 @@ require "digest"
 #
 class PStore
   # :stopdoc:
-  VERSION = "0.3.0"
+  VERSION = "0.4.0"
 
   RDWR_ACCESS = IO::RDWR | IO::CREAT | IO::BINARY
   RD_ACCESS = IO::RDONLY | IO::BINARY
@@ -338,6 +356,95 @@ class PStore
 
   # The error type thrown by all PStore methods.
   class Error < StandardError
+  end
+
+  # A read-only view of a \PStore's contents at a single point in time.
+  #
+  # Instances are returned by PStore#snapshot.  A snapshot is built while
+  # the store lock and a shared file lock are held, but both locks are
+  # released before the snapshot is returned, so holding a snapshot never
+  # blocks later transactions, including write transactions.
+  #
+  # The snapshot owns a deep copy of the store data:
+  #
+  # - Mutable objects in the snapshot are not shared with any transaction.
+  # - Object aliasing and cyclic references are preserved in the form
+  #   that Marshal can express.
+  # - The snapshot is not updated when the store changes afterwards;
+  #   call PStore#snapshot again to observe newer data.
+  #
+  # Only reading methods are exposed.  The snapshot object itself is
+  # frozen, though the nested data objects remain ordinary (mutable)
+  # copies that no other code can reach.
+  class Snapshot
+    include Enumerable
+
+    # :stopdoc:
+    def initialize(table, path)
+      @table = table
+      @path = path
+      freeze
+    end
+    # :startdoc:
+
+    # The path of the store file from which this snapshot was taken;
+    # see PStore#path.
+    attr_reader :path
+
+    # Returns the value associated with +key+, or +nil+ if there is none;
+    # see PStore#[].
+    def [](key)
+      @table[key]
+    end
+
+    # Like #[], except that it accepts a default value; see PStore#fetch.
+    def fetch(key, default = PStore::Error)
+      unless @table.key?(key)
+        if PStore::Error.equal?(default)
+          raise PStore::Error, format("undefined key '%s'", key)
+        else
+          return default
+        end
+      end
+      @table[key]
+    end
+
+    # Returns +true+ if +key+ exists in the snapshot; see PStore#key?.
+    def key?(key)
+      @table.key?(key)
+    end
+    alias root? key?
+
+    # Returns an array of the snapshot's root keys; see PStore#keys.
+    def keys
+      @table.keys
+    end
+    alias roots keys
+
+    # Yields each key/value pair in the snapshot.
+    # Returns an Enumerator if no block is given.
+    def each(&block)
+      return enum_for(:each) unless block_given?
+      @table.each_pair(&block)
+    end
+
+    # Extracts the nested value specified by the sequence of +key+
+    # objects; see Hash#dig.
+    def dig(key, *rest)
+      @table.dig(key, *rest)
+    end
+
+    # Returns the number of root entries in the snapshot.
+    def size
+      @table.size
+    end
+    alias length size
+
+    # Returns a shallow copy of the snapshot's root Hash.
+    # Mutating the returned Hash does not affect the snapshot.
+    def to_h
+      @table.dup
+    end
   end
 
   # Whether \PStore should do its best to prevent file corruptions,
@@ -569,15 +676,7 @@ class PStore
   # Raises an exception if called within a transaction block.
   def transaction(read_only = false)  # :yields:  pstore
     value = nil
-    if !@thread_safe
-      raise PStore::Error, "nested transaction" unless @lock.try_lock
-    else
-      begin
-        @lock.lock
-      rescue ThreadError
-        raise PStore::Error, "nested transaction"
-      end
-    end
+    lock_store
     begin
       @rdonly = read_only
       @abort = false
@@ -609,8 +708,78 @@ class PStore
     value
   end
 
+  # Returns a read-only PStore::Snapshot of the store's current contents.
+  #
+  # The store lock and a shared file lock are held only while the data is
+  # read and copied; both are released before the snapshot is returned.
+  # The caller can therefore traverse the snapshot outside every lock,
+  # and subsequent read or write transactions on the same store are not
+  # blocked:
+  #
+  #   snapshot = store.snapshot
+  #   snapshot.each do |key, value|
+  #     # Slow traversal; no PStore lock is held here.
+  #   end
+  #   store.transaction { store[:new_entry] = true } # not blocked
+  #
+  # The snapshot contains a deep copy of the store contents, produced via
+  # Marshal, so:
+  #
+  # - Mutable objects in the snapshot are never shared with a transaction;
+  #   mutating them affects neither the store nor a later snapshot.
+  # - Object aliasing and cyclic references are retained in the form
+  #   that Marshal can express.
+  # - The snapshot is fixed to the state at call time and does not reflect
+  #   later updates to the store.
+  #
+  # If the store file does not exist, an empty snapshot is returned.
+  #
+  # If reading or copying fails (for example because the store file is
+  # corrupted), the exception is propagated and no half-built snapshot is
+  # returned; all locks are released.
+  #
+  # Raises an exception if called within a transaction block.
+  def snapshot
+    lock_store
+    begin
+      file = open_and_lock_file(@filename, true)
+      begin
+        if file
+          table = load_data(file, true)
+        else
+          # The store file does not exist.
+          table = {}
+        end
+        # An independent deep copy: no mutable object is shared with a
+        # later transaction, and aliasing/cycles survive as Marshal
+        # represents them.  A failure here raises before the snapshot is
+        # built, so a partial view is never returned.
+        table = Marshal.load(Marshal.dump(table))
+      ensure
+        file.close if file
+      end
+      Snapshot.new(table, @filename)
+    ensure
+      @lock.unlock
+    end
+  end
+
   private
   # :stopdoc:
+
+  # Acquire the per-instance lock, rejecting nested transactions with the
+  # same PStore::Error regardless of the +thread_safe+ setting.
+  def lock_store
+    if !@thread_safe
+      raise PStore::Error, "nested transaction" unless @lock.try_lock
+    else
+      begin
+        @lock.lock
+      rescue ThreadError
+        raise PStore::Error, "nested transaction"
+      end
+    end
+  end
 
   # Constant for relieving Ruby's garbage collector.
   CHECKSUM_ALGO = %w[SHA512 SHA384 SHA256 SHA1 RMD160 MD5].each do |algo|

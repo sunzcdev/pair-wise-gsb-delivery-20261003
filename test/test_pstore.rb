@@ -387,4 +387,296 @@ class PStoreTest < Test::Unit::TestCase
     assert_equal(@pstore_file, store.path)
     assert_equal("bar", store.transaction(true) { store[:foo] })
   end
+
+  def test_snapshot_returns_a_frozen_read_only_view_of_the_contents
+    @pstore.transaction do
+      @pstore[:foo] = "bar"
+      @pstore[:nested] = {a: [1, 2, 3]}
+    end
+
+    snapshot = @pstore.snapshot
+
+    assert_instance_of(PStore::Snapshot, snapshot)
+    assert_equal(true, snapshot.frozen?)
+    assert_equal(@pstore_file, snapshot.path)
+    assert_equal("bar", snapshot[:foo])
+    assert_nil(snapshot[:missing])
+    assert_equal({a: [1, 2, 3]}, snapshot[:nested])
+    assert_equal([:foo, :nested], snapshot.keys)
+    assert_equal([:foo, :nested], snapshot.roots)
+    assert_equal(true, snapshot.key?(:foo))
+    assert_equal(true, snapshot.root?(:foo))
+    assert_equal(false, snapshot.key?(:missing))
+    assert_equal(2, snapshot.size)
+    assert_equal(2, snapshot.length)
+    assert_equal([1, 2, 3], snapshot.dig(:nested, :a))
+    assert_equal("default", snapshot.fetch(:missing, "default"))
+    assert_raise(PStore::Error) { snapshot.fetch(:missing) }
+    assert_equal({foo: "bar", nested: {a: [1, 2, 3]}}, snapshot.to_h)
+    assert_equal([[:foo, "bar"], [:nested, {a: [1, 2, 3]}]],
+                 snapshot.map { |key, value| [key, value] })
+    assert_equal([:foo, :nested], snapshot.each.map { |key, _value| key })
+    assert_not_respond_to(snapshot, :[]=)
+    assert_not_respond_to(snapshot, :delete)
+    assert_raise(FrozenError) { snapshot.instance_variable_set(:@table, {}) }
+  end
+
+  def test_snapshot_of_a_missing_file_is_empty
+    missing = File.join(Dir.tmpdir, "pstore.missing.#{Process.pid}.#{object_id}")
+    snapshot = PStore.new(missing).snapshot
+
+    assert_instance_of(PStore::Snapshot, snapshot)
+    assert_equal([], snapshot.keys)
+    assert_equal(0, snapshot.size)
+    assert_nil(snapshot[:anything])
+  ensure
+    File.unlink(missing) rescue nil
+  end
+
+  def test_snapshot_does_not_share_mutable_objects_with_transactions
+    @pstore.transaction do
+      @pstore[:list] = [1, 2]
+      @pstore[:text] = "value"
+    end
+
+    snapshot = @pstore.snapshot
+    snapshot[:list] << 3
+    snapshot[:text].upcase!
+
+    @pstore.transaction(true) do
+      assert_equal([1, 2], @pstore[:list])
+      assert_equal("value", @pstore[:text])
+    end
+
+    @pstore.transaction do
+      @pstore[:list] << 99
+      @pstore[:text] << "!"
+    end
+
+    assert_equal([1, 2, 3], snapshot[:list])
+    assert_equal("VALUE", snapshot[:text])
+  end
+
+  def test_snapshot_preserves_aliasing_between_entries
+    shared = ["shared"]
+    @pstore.transaction do
+      @pstore[:one] = shared
+      @pstore[:two] = {inner: shared}
+    end
+
+    snapshot = @pstore.snapshot
+
+    assert_same(snapshot[:one], snapshot[:two][:inner])
+    snapshot[:one] << "changed"
+    assert_equal(["shared", "changed"], snapshot[:two][:inner])
+    @pstore.transaction(true) do
+      assert_equal(["shared"], @pstore[:one])
+    end
+  end
+
+  def test_snapshot_preserves_cyclic_structures
+    cyclic = {name: "root"}
+    cyclic[:self] = cyclic
+    nested = [cyclic]
+    cyclic[:list] = nested
+    @pstore.transaction { @pstore[:cycle] = cyclic }
+
+    snapshot = @pstore.snapshot
+    snap_cycle = snapshot[:cycle]
+
+    assert_same(snap_cycle, snap_cycle[:self])
+    assert_same(snap_cycle, snap_cycle[:list][0])
+    assert_equal("root", snap_cycle[:name])
+    @pstore.transaction(true) do
+      assert_not_same(snap_cycle, @pstore[:cycle])
+      assert_same(@pstore[:cycle], @pstore[:cycle][:self])
+    end
+  end
+
+  def test_snapshot_is_fixed_and_does_not_reflect_later_updates
+    @pstore.transaction { @pstore[:foo] = "old" }
+    snapshot = @pstore.snapshot
+
+    @pstore.transaction do
+      @pstore[:foo] = "new"
+      @pstore[:bar] = "added"
+    end
+
+    assert_equal("old", snapshot[:foo])
+    assert_nil(snapshot[:bar])
+    assert_equal([:foo], snapshot.keys)
+
+    later = @pstore.snapshot
+    assert_equal("new", later[:foo])
+    assert_equal("added", later[:bar])
+    assert_equal([:foo, :bar], later.keys)
+  end
+
+  def test_snapshot_releases_the_store_lock_before_returning
+    @pstore.transaction { @pstore[:foo] = "bar" }
+
+    @pstore.snapshot
+
+    # A following write transaction must be able to acquire every lock.
+    @pstore.transaction do
+      @pstore[:foo] = "baz"
+    end
+    assert_equal("baz", @pstore.transaction(true) { @pstore[:foo] })
+  end
+
+  def test_snapshot_does_not_block_write_transactions_on_another_instance
+    @pstore.transaction { @pstore[:foo] = "bar" }
+    snapshot = @pstore.snapshot
+    other = PStore.new(@pstore_file, true)
+    writer_done = Thread::Queue.new
+
+    writer = Thread.new do
+      other.transaction do
+        other[:foo] = "written while snapshot is held"
+        writer_done << true
+      end
+    end
+
+    assert(writer.join(10), "write transaction blocked while snapshot was held")
+    assert_equal(true, writer_done.pop)
+    assert_equal("written while snapshot is held",
+                 @pstore.transaction(true) { @pstore[:foo] })
+    assert_equal("bar", snapshot[:foo])
+  ensure
+    writer&.join
+  end
+
+  def test_snapshot_traversal_can_run_while_a_write_transaction_holds_the_lock
+    @pstore.transaction do
+      @pstore[:items] = (1..100).to_a
+      @pstore[:label] = "before"
+    end
+    other = PStore.new(@pstore_file, true)
+    entered = Thread::Queue.new
+    release = Thread::Queue.new
+    # The snapshot is fully built and detached before any lock is held
+    # by the writer below.
+    snapshot = @pstore.snapshot
+
+    holder = Thread.new do
+      other.transaction do
+        other[:label] = "after"
+        entered << true
+        release.pop
+      end
+    end
+
+    entered.pop
+    assert_equal(true, holder.alive?)
+    # Neither the store mutex nor the file lock may be needed here.
+    traversed = []
+    snapshot.each { |key, value| traversed << [key, value] }
+    assert_equal([[:items, (1..100).to_a], [:label, "before"]].sort, traversed.sort)
+    assert_equal(true, holder.alive?)
+    assert_equal("before", snapshot[:label])
+  ensure
+    release << true if release
+    holder&.join
+  end
+
+  def test_two_instances_interleave_snapshot_reads_and_writes
+    writer = PStore.new(@pstore_file, true)
+    reader = PStore.new(@pstore_file, true)
+
+    writer.transaction { writer[:counter] = 0 }
+    snapshots = []
+
+    5.times do |i|
+      writer.transaction do
+        writer[:counter] = i + 1
+        writer[:history] ||= []
+        writer[:history] << i
+      end
+      snapshots << reader.snapshot
+    end
+
+    snapshots.each_with_index do |snapshot, i|
+      assert_equal(i + 1, snapshot[:counter])
+      assert_equal((0..i).to_a, snapshot[:history])
+    end
+    assert_equal(5, writer.transaction(true) { writer[:counter] })
+    # Each snapshot is still its own fixed copy.
+    assert_equal(1, snapshots.first[:counter])
+    assert_not_same(snapshots.first, snapshots.last)
+  end
+
+  def test_read_only_transaction_keeps_holding_the_lock_for_its_block
+    # The file must exist so that the read-only transaction actually
+    # acquires a shared file lock.
+    @pstore.transaction { @pstore[:seed] = true }
+    pstore = PStore.new(@pstore_file, true)
+    other = PStore.new(@pstore_file, true)
+    entered = Thread::Queue.new
+    release = Thread::Queue.new
+
+    reader = Thread.new do
+      pstore.transaction(true) do
+        entered << true
+        release.pop
+      end
+    end
+
+    entered.pop
+    writer = Thread.new do
+      other.transaction { other[:foo] = "bar" }
+    end
+
+    assert_nil(writer.join(0.5))
+  ensure
+    release << true if release
+    reader&.join
+    assert(writer&.join(10))
+  end
+
+  def test_snapshot_raises_inside_a_transaction
+    @pstore.transaction do
+      assert_raise(PStore::Error) { @pstore.snapshot }
+    end
+
+    thread_safe = PStore.new(second_file, true)
+    begin
+      thread_safe.transaction do
+        assert_raise(PStore::Error) { thread_safe.snapshot }
+      end
+    ensure
+      File.unlink(second_file) rescue nil
+    end
+  end
+
+  def test_failed_snapshot_does_not_return_a_partial_view_and_releases_locks
+    @pstore.transaction { @pstore[:foo] = "bar" }
+    data = File.binread(@pstore_file)
+    File.binwrite(@pstore_file, data.byteslice(0, data.bytesize - 1))
+
+    result = nil
+    assert_raise(EOFError) { result = @pstore.snapshot }
+    assert_nil(result)
+
+    # Restore valid data.  If the store mutex were still held, this
+    # transaction would raise PStore::Error ("nested transaction").
+    File.binwrite(@pstore_file, data)
+    @pstore.transaction do
+      @pstore[:foo] = "rewritten"
+    end
+    assert_equal("rewritten", @pstore.snapshot[:foo])
+  ensure
+    File.binwrite(@pstore_file, data) if defined?(data) && data
+  end
+
+  def test_snapshot_to_h_is_a_disconnected_shallow_copy
+    @pstore.transaction { @pstore[:foo] = [1] }
+    snapshot = @pstore.snapshot
+
+    copy = snapshot.to_h
+    copy[:extra] = true
+
+    assert_not_same(copy, snapshot.to_h)
+    assert_nil(snapshot[:extra])
+    assert_equal([:foo], snapshot.keys)
+  end
 end
