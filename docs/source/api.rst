@@ -65,6 +65,9 @@ Events
 .. autoclass:: h2.events.StreamReset
    :members:
 
+.. autoclass:: h2.events.StreamHeadersRejected
+   :members:
+
 .. autoclass:: h2.events.PushedStreamReceived
    :members:
 
@@ -145,6 +148,10 @@ Protocol Errors
    :members:
 
 .. autoclass:: h2.exceptions.DenialOfServiceError
+   :show-inheritance:
+   :members:
+
+.. autoclass:: h2.exceptions.CompressionError
    :show-inheritance:
    :members:
 

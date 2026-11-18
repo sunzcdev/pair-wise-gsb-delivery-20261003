@@ -263,6 +263,28 @@ class TestEventReprs:
                 "error_code:ErrorCodes.ENHANCE_YOUR_CALM, remote_reset:False>"
             )
 
+    def test_streamheadersrejected_repr(self) -> None:
+        """
+        StreamHeadersRejected has a useful debug representation.
+        """
+        e = h2.events.StreamHeadersRejected(
+            stream_id=71,
+            error_code=h2.errors.ErrorCodes.ENHANCE_YOUR_CALM,
+            reason="header list too large",
+        )
+
+        if sys.version_info >= (3, 11):
+            assert repr(e) == (
+                "<StreamHeadersRejected stream_id:71, "
+                "error_code:11, reason:'header list too large'>"
+            )
+        else:
+            assert repr(e) == (
+                "<StreamHeadersRejected stream_id:71, "
+                "error_code:ErrorCodes.ENHANCE_YOUR_CALM, "
+                "reason:'header list too large'>"
+            )
+
     def test_pushedstreamreceived_repr(self) -> None:
         """
         PushedStreamReceived has a useful debug representation.

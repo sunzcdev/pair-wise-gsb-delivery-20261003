@@ -482,6 +482,43 @@ class StreamReset(Event):
         return f"<StreamReset stream_id:{self.stream_id}, error_code:{self.error_code!s}, remote_reset:{self.remote_reset}>"
 
 
+@dataclass(**kw_only)
+class StreamHeadersRejected(Event):
+    """
+    The StreamHeadersRejected event is fired when a header block received on
+    a stream could not be accepted because its decompressed size exceeded the
+    locally advertised maximum header list size
+    (``SETTINGS_MAX_HEADER_LIST_SIZE``).
+
+    This is a stream-level rejection, not a connection error. The complete
+    header block (including any CONTINUATION frames) has been run through the
+    HPACK decoder, so the compression context remains synchronised with the
+    remote peer and subsequent header blocks on other streams still decode
+    correctly. The oversized headers themselves have been discarded: they are
+    not retained, and they are not delivered to the user. h2 has reset the
+    stream with a RST_STREAM frame.
+
+    The connection remains usable after this event.
+
+    .. versionadded:: 4.5.0
+    """
+
+    stream_id: int
+    """The Stream ID of the stream whose headers were rejected."""
+
+    error_code: ErrorCodes | int
+    """The error code used in the RST_STREAM frame sent to the peer."""
+
+    reason: str
+    """A human-readable explanation of why the header block was rejected."""
+
+    def __repr__(self) -> str:
+        return (
+            f"<StreamHeadersRejected stream_id:{self.stream_id}, "
+            f"error_code:{self.error_code!s}, reason:{self.reason!r}>"
+        )
+
+
 class PushedStreamReceived(Event):
     """
     The PushedStreamReceived event is fired whenever a pushed stream has been

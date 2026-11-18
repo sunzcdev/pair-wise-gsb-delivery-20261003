@@ -179,6 +179,26 @@ class RFC1122Error(H2Error):
     # turns out to be true, TELL HIM NOTHING.
 
 
+class CompressionError(ProtocolError):
+    """
+    Emitted when the remote peer sends a header block that cannot be decoded
+    because the HPACK compression context has been violated. This is a
+    connection-level error: the compression state is no longer synchronised
+    with the remote peer, so the connection cannot continue.
+
+    This is deliberately distinct from a single stream exceeding the locally
+    advertised header list size limit: that condition is handled by rejecting
+    only the offending stream, keeping the connection (and the HPACK dynamic
+    table) usable.
+
+    .. versionadded:: 4.5.0
+    """
+
+    #: The error code corresponds to this kind of
+    #: :class:`ProtocolError <h2.exceptions.ProtocolError>`
+    error_code = ErrorCodes.COMPRESSION_ERROR
+
+
 class DenialOfServiceError(ProtocolError):
     """
     Emitted when the remote peer exhibits a behaviour that is likely to be an

@@ -12,6 +12,7 @@ from typing import TYPE_CHECKING, Any
 
 from hpack.exceptions import HPACKError, OversizedHeaderListError
 from hpack.hpack import Decoder, Encoder
+from hpack.table import table_entry_size
 from hyperframe.exceptions import InvalidPaddingError
 from hyperframe.frame import (
     AltSvcFrame,
@@ -43,14 +44,17 @@ from .events import (
     RequestReceived,
     ResponseReceived,
     SettingsAcknowledged,
+    StreamHeadersRejected,
     TrailersReceived,
     UnknownFrameReceived,
     WindowUpdated,
 )
 from .exceptions import (
+    CompressionError,
     DenialOfServiceError,
     FlowControlError,
     FrameTooLargeError,
+    H2Error,
     NoAvailableStreamIDError,
     NoSuchStreamError,
     ProtocolError,
@@ -106,6 +110,28 @@ class ConnectionInputs(Enum):
 class AllowedStreamIDs(IntEnum):
     EVEN = 0
     ODD = 1
+
+
+#: When a received header list exceeds the locally advertised
+#: SETTINGS_MAX_HEADER_LIST_SIZE, the stream is rejected rather than the
+#: connection being torn down. To keep the HPACK dynamic table synchronised
+#: with the remote peer, such header blocks are still decoded in full. The
+#: memory this "rejection path" may consume is bounded: decoding is abandoned
+#: once the decompressed size exceeds the configured limit multiplied by this
+#: value (or the default limit, whichever is larger). Header blocks larger
+#: than that are treated as HPACK bomb attacks and terminate the connection.
+_REJECTED_HEADER_LIST_SIZE_MULTIPLIER = 4
+
+
+class _HeaderListTooLargeError(H2Error):
+    """
+    An internal control-flow exception signalling that a fully decoded header
+    list exceeded the locally advertised maximum header list size.
+
+    This never escapes the connection object: it is always translated into a
+    stream-level rejection (RST_STREAM plus a
+    :class:`StreamHeadersRejected <h2.events.StreamHeadersRejected>` event).
+    """
 
 
 class H2ConnectionStateMachine:
@@ -1608,7 +1634,14 @@ class H2Connection:
         # Let's decode the headers. We handle headers as bytes internally up
         # until we hang them off the event, at which point we may optionally
         # convert them to unicode.
-        headers = _decode_headers(self.decoder, frame.data)
+        try:
+            headers = _decode_headers(self.decoder, frame.data)
+        except _HeaderListTooLargeError as e:
+            # The header block exceeded our locally advertised maximum header
+            # list size. It has still been fully decoded, so the HPACK
+            # dynamic table remains synchronised with the remote peer: reject
+            # only this stream and keep the connection alive.
+            return self._reject_oversized_headers(frame, e)
 
         events = self.state_machine.process_input(
             ConnectionInputs.RECV_HEADERS,
@@ -1633,6 +1666,34 @@ class H2Connection:
 
         return frames, events + stream_events
 
+    def _reject_oversized_headers(self, frame: HeadersFrame, reason: _HeaderListTooLargeError) -> tuple[list[Frame], list[Event]]:
+        """
+        Reject a stream whose header block exceeded the locally advertised
+        maximum header list size.
+
+        The header block (including all of its CONTINUATION frames) has
+        already been decoded in full, so the HPACK dynamic table is still
+        synchronised with the remote peer. The decoded headers are discarded:
+        they are neither retained nor delivered to the user. The stream is
+        reset with ENHANCE_YOUR_CALM and the connection remains usable.
+        """
+        events = self.state_machine.process_input(
+            ConnectionInputs.RECV_HEADERS,
+        )
+        stream = self._get_or_create_stream(
+            frame.stream_id, AllowedStreamIDs(not self.config.client_side),
+        )
+        frames = stream.reject_headers(ErrorCodes.ENHANCE_YOUR_CALM)
+
+        event = StreamHeadersRejected(
+            stream_id=frame.stream_id,
+            error_code=ErrorCodes.ENHANCE_YOUR_CALM,
+            reason=str(reason),
+        )
+        events.append(event)
+
+        return frames, events
+
     def _receive_push_promise_frame(self, frame: PushPromiseFrame) -> tuple[list[Frame], list[Event]]:
         """
         Receive a push-promise frame on the connection.
@@ -1641,7 +1702,25 @@ class H2Connection:
             msg = "Received pushed stream"
             raise ProtocolError(msg)
 
-        pushed_headers = _decode_headers(self.decoder, frame.data)
+        try:
+            pushed_headers = _decode_headers(self.decoder, frame.data)
+        except _HeaderListTooLargeError as e:
+            # The pushed header block exceeded our locally advertised maximum
+            # header list size. It has still been fully decoded, so the HPACK
+            # dynamic table remains synchronised with the remote peer: reject
+            # only the promised stream and keep the connection alive.
+            events = self.state_machine.process_input(
+                ConnectionInputs.RECV_PUSH_PROMISE,
+            )
+            f = RstStreamFrame(frame.promised_stream_id)
+            f.error_code = ErrorCodes.ENHANCE_YOUR_CALM
+            event = StreamHeadersRejected(
+                stream_id=frame.promised_stream_id,
+                error_code=ErrorCodes.ENHANCE_YOUR_CALM,
+                reason=str(e),
+            )
+            events.append(event)
+            return [f], events
 
         events = self.state_machine.process_input(
             ConnectionInputs.RECV_PUSH_PROMISE,
@@ -2100,18 +2179,63 @@ def _decode_headers(decoder: Decoder, encoded_header_block: bytes) -> Iterable[H
 
     This only ever returns bytestring headers: h2 may emit them as
     unicode later, but internally it processes them as bytestrings only.
+
+    Header blocks whose decompressed size exceeds the locally advertised
+    maximum header list size are still decoded in full: this keeps the HPACK
+    dynamic table synchronised with the remote peer, which allows the
+    offending stream to be rejected without tearing down the connection. To
+    stop this "rejection path" from being abused as a HPACK bomb, the
+    decompressed size that will be decoded is bounded: blocks that exceed the
+    bound are treated as attacks.
     """
+    max_header_list_size = decoder.max_header_list_size
+
+    if max_header_list_size is None:
+        # No locally advertised limit: nothing can be rejected, so there is
+        # no need to decode past any bound.
+        decode_bound = None
+    else:
+        # Temporarily allow decoding past the acceptance limit, up to a hard
+        # bound, so that oversized blocks still synchronise the dynamic
+        # table. The bound is a multiple of the configured limit, but never
+        # lower than the default limit.
+        decode_bound = max(
+            _REJECTED_HEADER_LIST_SIZE_MULTIPLIER * max_header_list_size,
+            H2Connection.DEFAULT_MAX_HEADER_LIST_SIZE,
+        )
+        decoder.max_header_list_size = decode_bound
+
     try:
-        return decoder.decode(encoded_header_block, raw=True)
+        headers = decoder.decode(encoded_header_block, raw=True)
     except OversizedHeaderListError as e:
-        # This is a symptom of a HPACK bomb attack: the user has
-        # disregarded our requirements on how large a header block we'll
-        # accept.
+        # The header block decompressed to more than the hard bound. This is
+        # a symptom of a HPACK bomb attack: the user has disregarded our
+        # requirements on how large a header block we'll accept, and the
+        # decoder state can no longer be trusted to be synchronised.
         msg = f"Oversized header block: {e}"
         raise DenialOfServiceError(msg) from e
     except (HPACKError, IndexError, TypeError, UnicodeDecodeError) as e:
         # We should only need HPACKError here, but versions of HPACK older
         # than 2.1.0 throw all three others as well. For maximum
         # compatibility, catch all of them.
+        #
+        # A failure to decode the header block means the compression context
+        # is broken: per RFC 7540 § 4.3 this is a connection error of type
+        # COMPRESSION_ERROR, distinct from a single stream exceeding the
+        # header list size limit.
         msg = f"Error decoding header block: {e}"
-        raise ProtocolError(msg) from e
+        raise CompressionError(msg) from e
+    finally:
+        if decode_bound is not None:
+            decoder.max_header_list_size = max_header_list_size
+
+    if max_header_list_size is not None:
+        header_list_size = sum(table_entry_size(h[0], h[1]) for h in headers)
+        if header_list_size > max_header_list_size:
+            msg = (
+                f"Received header list of size {header_list_size} exceeds "
+                f"the maximum allowed size {max_header_list_size}"
+            )
+            raise _HeaderListTooLargeError(msg)
+
+    return headers

@@ -849,8 +849,10 @@ class TestOversizedHeaders:
 
     def test_reject_headers_when_list_size_shrunk(self, frame_factory) -> None:
         """
-        When we've shrunk the header list size, we reject new header blocks
-        that violate the new size.
+        When we've shrunk the header list size, new header blocks that violate
+        the new size are rejected at the stream level: the offending stream is
+        reset with ENHANCE_YOUR_CALM, but the connection stays up and the
+        HPACK dynamic table remains synchronised.
         """
         c = h2.connection.H2Connection(config=self.server_config)
         c.receive_data(frame_factory.preamble())
@@ -880,20 +882,59 @@ class TestOversizedHeaders:
         data = f.serialize()
         c.receive_data(data)
 
-        # Now a third request comes in. This explodes.
+        # Now a third request comes in. It exceeds the shrunk limit, so the
+        # stream is rejected: no exception, no GOAWAY, just a rejection event
+        # and a RST_STREAM. The extra custom header is added to the HPACK
+        # dynamic table by the peer's encoder, so its presence in the
+        # rejected block must still update our decoder.
+        oversized_headers = [
+            *self.request_header_block,
+            (b"x-custom-header", b"some-value"),
+        ]
         f = frame_factory.build_headers_frame(
             stream_id=5,
-            headers=self.request_header_block,
+            headers=oversized_headers,
         )
         data = f.serialize()
 
-        with pytest.raises(h2.exceptions.DenialOfServiceError):
-            c.receive_data(data)
+        events = c.receive_data(data)
 
-        expected_frame = frame_factory.build_goaway_frame(
-            last_stream_id=3, error_code=h2.errors.ErrorCodes.ENHANCE_YOUR_CALM,
+        assert len(events) == 1
+        event = events[0]
+        assert isinstance(event, h2.events.StreamHeadersRejected)
+        assert event.stream_id == 5
+        assert event.error_code == h2.errors.ErrorCodes.ENHANCE_YOUR_CALM
+        assert event.reason
+
+        expected_frame = frame_factory.build_rst_stream_frame(
+            5, h2.errors.ErrorCodes.ENHANCE_YOUR_CALM,
         )
         assert c.data_to_send() == expected_frame.serialize()
+
+        # Restore a generous limit.
+        c.update_settings(
+            {h2.settings.SettingCodes.MAX_HEADER_LIST_SIZE: 2**16},
+        )
+        c.clear_outbound_data_buffer()
+        f = frame_factory.build_settings_frame({}, ack=True)
+        c.receive_data(f.serialize())
+
+        # The connection is still usable: a further request that references
+        # the dynamic table entry established by the rejected header block
+        # decodes normally.
+        f = frame_factory.build_headers_frame(
+            stream_id=7,
+            headers=oversized_headers,
+        )
+        data = f.serialize()
+
+        events = c.receive_data(data)
+
+        assert len(events) == 1
+        event = events[0]
+        assert isinstance(event, h2.events.RequestReceived)
+        assert event.stream_id == 7
+        assert event.headers == oversized_headers
 
     def test_reject_headers_when_table_size_shrunk(self, frame_factory) -> None:
         """
@@ -929,18 +970,19 @@ class TestOversizedHeaders:
         c.receive_data(data)
 
         # Now a third request comes in. This explodes, as it does not contain
-        # a dynamic table size update.
+        # a dynamic table size update: a compression error, which is a
+        # connection error of type COMPRESSION_ERROR.
         f = frame_factory.build_headers_frame(
             stream_id=5,
             headers=self.request_header_block,
         )
         data = f.serialize()
 
-        with pytest.raises(h2.exceptions.ProtocolError):
+        with pytest.raises(h2.exceptions.CompressionError):
             c.receive_data(data)
 
         expected_frame = frame_factory.build_goaway_frame(
-            last_stream_id=3, error_code=h2.errors.ErrorCodes.PROTOCOL_ERROR,
+            last_stream_id=3, error_code=h2.errors.ErrorCodes.COMPRESSION_ERROR,
         )
         assert c.data_to_send() == expected_frame.serialize()
 
@@ -962,7 +1004,8 @@ class TestOversizedHeaders:
         c.receive_data(data)
 
         # Now a second request comes in that sets the table size too high.
-        # This explodes.
+        # This explodes: a compression error, which is a connection error of
+        # type COMPRESSION_ERROR.
         frame_factory.change_table_size(c.local_settings.header_table_size + 1)
         f = frame_factory.build_headers_frame(
             stream_id=5,
@@ -970,10 +1013,292 @@ class TestOversizedHeaders:
         )
         data = f.serialize()
 
-        with pytest.raises(h2.exceptions.ProtocolError):
+        with pytest.raises(h2.exceptions.CompressionError):
             c.receive_data(data)
 
         expected_frame = frame_factory.build_goaway_frame(
-            last_stream_id=1, error_code=h2.errors.ErrorCodes.PROTOCOL_ERROR,
+            last_stream_id=1, error_code=h2.errors.ErrorCodes.COMPRESSION_ERROR,
+        )
+        assert c.data_to_send() == expected_frame.serialize()
+
+
+class TestBoundedHeaderListRejection:
+    """
+    Tests for the bounded acceptance path for oversized header lists.
+
+    A single stream whose decompressed header list exceeds the locally
+    advertised SETTINGS_MAX_HEADER_LIST_SIZE is rejected at the stream level:
+    the header block is still fully decoded (keeping the HPACK dynamic table
+    synchronised with the peer), the stream is reset, and the connection
+    remains usable. This is distinct from a HPACK compression error, which
+    remains a connection error.
+    """
+
+    request_header_block = [
+        (b":method", b"GET"),
+        (b":authority", b"example.com"),
+        (b":scheme", b"https"),
+        (b":path", b"/"),
+    ]
+
+    response_header_block = [
+        (b":status", b"200"),
+    ]
+
+    server_config = h2.config.H2Configuration(client_side=False)
+
+    # A header block that inflates past the default limit of 2**16, but stays
+    # well below the hard bound applied to the rejection path.
+    oversized_header_block = request_header_block + [
+        (b"x-padding", b"x" * 2**16),
+    ]
+
+    @staticmethod
+    def _serialize_split(first_frame, encoded, frame_factory, chunk_size=2**13):
+        """
+        Serialize an encoded header block as a leading HEADERS or
+        PUSH_PROMISE frame followed by as many CONTINUATION frames as needed
+        to respect the maximum frame size.
+        """
+        first_frame.data = encoded[:chunk_size]
+        rest = encoded[chunk_size:]
+        frames = [first_frame]
+        while len(rest) > chunk_size:
+            frames.append(
+                frame_factory.build_continuation_frame(
+                    rest[:chunk_size], stream_id=first_frame.stream_id,
+                ),
+            )
+            rest = rest[chunk_size:]
+        frames.append(
+            frame_factory.build_continuation_frame(
+                rest, flags=["END_HEADERS"], stream_id=first_frame.stream_id,
+            ),
+        )
+        return b"".join(f.serialize() for f in frames)
+
+    def build_split_headers(self, frame_factory, headers, stream_id):
+        """
+        Build a HEADERS + CONTINUATION chain for a header block whose encoded
+        form exceeds the maximum frame size.
+        """
+        encoded = frame_factory.encoder.encode(headers)
+        return self._serialize_split(
+            hyperframe.frame.HeadersFrame(stream_id), encoded, frame_factory,
+        )
+
+    def test_oversized_request_rejected_at_stream_level(self, frame_factory) -> None:
+        """
+        An oversized request header block rejects only its stream: a
+        StreamHeadersRejected event is emitted, the stream is reset with
+        ENHANCE_YOUR_CALM, and no exception or GOAWAY occurs.
+        """
+        c = h2.connection.H2Connection(config=self.server_config)
+        c.receive_data(frame_factory.preamble())
+        c.clear_outbound_data_buffer()
+
+        data = self.build_split_headers(
+            frame_factory, self.oversized_header_block, stream_id=1,
+        )
+        events = c.receive_data(data)
+
+        assert len(events) == 1
+        event = events[0]
+        assert isinstance(event, h2.events.StreamHeadersRejected)
+        assert event.stream_id == 1
+        assert event.error_code == h2.errors.ErrorCodes.ENHANCE_YOUR_CALM
+        assert event.reason
+
+        expected_frame = frame_factory.build_rst_stream_frame(
+            1, h2.errors.ErrorCodes.ENHANCE_YOUR_CALM,
+        )
+        assert c.data_to_send() == expected_frame.serialize()
+
+        # The connection remains usable for subsequent streams.
+        f = frame_factory.build_headers_frame(
+            stream_id=3,
+            headers=self.request_header_block,
+        )
+        events = c.receive_data(f.serialize())
+
+        assert len(events) == 1
+        event = events[0]
+        assert isinstance(event, h2.events.RequestReceived)
+        assert event.stream_id == 3
+        assert event.headers == self.request_header_block
+
+    def test_oversized_headers_split_across_continuations(self, frame_factory) -> None:
+        """
+        An oversized header block split across a HEADERS frame and a chain of
+        CONTINUATION frames is processed to its protocol boundary before
+        being rejected: the whole chain is decoded, keeping the dynamic table
+        synchronised, and only the stream is reset.
+        """
+        c = h2.connection.H2Connection(config=self.server_config)
+        c.receive_data(frame_factory.preamble())
+        c.clear_outbound_data_buffer()
+
+        # The custom header is added to the dynamic table by the encoder, so
+        # the rejected block establishes state that a later block references.
+        headers = [
+            *self.request_header_block,
+            (b"x-custom-header", b"some-value"),
+            (b"x-padding", b"x" * 2**16),
+        ]
+        data = self.build_split_headers(frame_factory, headers, stream_id=1)
+
+        events = c.receive_data(data)
+
+        assert len(events) == 1
+        event = events[0]
+        assert isinstance(event, h2.events.StreamHeadersRejected)
+        assert event.stream_id == 1
+        assert event.error_code == h2.errors.ErrorCodes.ENHANCE_YOUR_CALM
+
+        expected_frame = frame_factory.build_rst_stream_frame(
+            1, h2.errors.ErrorCodes.ENHANCE_YOUR_CALM,
+        )
+        assert c.data_to_send() == expected_frame.serialize()
+
+        # A subsequent header block that references the dynamic table entry
+        # established by the rejected block still decodes.
+        f = frame_factory.build_headers_frame(
+            stream_id=3,
+            headers=[*self.request_header_block, (b"x-custom-header", b"some-value")],
+        )
+        events = c.receive_data(f.serialize())
+
+        assert len(events) == 1
+        event = events[0]
+        assert isinstance(event, h2.events.RequestReceived)
+        assert event.stream_id == 3
+        assert event.headers == [
+            *self.request_header_block,
+            (b"x-custom-header", b"some-value"),
+        ]
+
+    def test_oversized_response_rejected_at_stream_level(self, frame_factory) -> None:
+        """
+        An oversized response header block rejects only its stream on the
+        client side.
+        """
+        c = h2.connection.H2Connection()
+        c.initiate_connection()
+        c.send_headers(stream_id=1, headers=self.request_header_block)
+        c.send_headers(stream_id=3, headers=self.request_header_block)
+        c.clear_outbound_data_buffer()
+
+        oversized_response = [
+            (b":status", b"200"),
+            (b"x-padding", b"x" * 2**16),
+        ]
+        data = self.build_split_headers(
+            frame_factory, oversized_response, stream_id=1,
+        )
+        events = c.receive_data(data)
+
+        assert len(events) == 1
+        event = events[0]
+        assert isinstance(event, h2.events.StreamHeadersRejected)
+        assert event.stream_id == 1
+        assert event.error_code == h2.errors.ErrorCodes.ENHANCE_YOUR_CALM
+        assert event.reason
+
+        expected_frame = frame_factory.build_rst_stream_frame(
+            1, h2.errors.ErrorCodes.ENHANCE_YOUR_CALM,
+        )
+        assert c.data_to_send() == expected_frame.serialize()
+
+        # The connection remains usable: a response on another stream, which
+        # the encoder emits using the dynamic table, decodes normally.
+        f = frame_factory.build_headers_frame(
+            stream_id=3,
+            headers=self.response_header_block,
+        )
+        events = c.receive_data(f.serialize())
+
+        assert len(events) == 1
+        event = events[0]
+        assert isinstance(event, h2.events.ResponseReceived)
+        assert event.stream_id == 3
+        assert event.headers == self.response_header_block
+
+    def test_oversized_push_promise_rejected_at_stream_level(self, frame_factory) -> None:
+        """
+        An oversized PUSH_PROMISE header block rejects only the promised
+        stream: the promised stream is reset, and subsequent header blocks
+        still decode.
+        """
+        c = h2.connection.H2Connection()
+        c.initiate_connection()
+        c.send_headers(stream_id=1, headers=self.request_header_block)
+        c.clear_outbound_data_buffer()
+
+        oversized_promise = [
+            *self.request_header_block,
+            (b"x-custom-header", b"some-value"),
+            (b"x-padding", b"x" * 2**16),
+        ]
+        encoded = frame_factory.encoder.encode(oversized_promise)
+        promise_frame = hyperframe.frame.PushPromiseFrame(stream_id=1)
+        promise_frame.promised_stream_id = 2
+        data = self._serialize_split(promise_frame, encoded, frame_factory)
+        events = c.receive_data(data)
+
+        assert len(events) == 1
+        event = events[0]
+        assert isinstance(event, h2.events.StreamHeadersRejected)
+        assert event.stream_id == 2
+        assert event.error_code == h2.errors.ErrorCodes.ENHANCE_YOUR_CALM
+        assert event.reason
+
+        expected_frame = frame_factory.build_rst_stream_frame(
+            2, h2.errors.ErrorCodes.ENHANCE_YOUR_CALM,
+        )
+        assert c.data_to_send() == expected_frame.serialize()
+
+        # A subsequent push promise that references dynamic table entries
+        # established by the rejected block still decodes.
+        pushed_headers = [
+            *self.request_header_block,
+            (b"x-custom-header", b"some-value"),
+        ]
+        f = frame_factory.build_push_promise_frame(
+            stream_id=1,
+            promised_stream_id=4,
+            headers=pushed_headers,
+        )
+        events = c.receive_data(f.serialize())
+
+        assert len(events) == 1
+        event = events[0]
+        assert isinstance(event, h2.events.PushedStreamReceived)
+        assert event.pushed_stream_id == 4
+        assert event.headers == pushed_headers
+
+    def test_compression_error_remains_connection_error(self, frame_factory) -> None:
+        """
+        A header block that cannot be decoded at all is a compression error:
+        a connection error of type COMPRESSION_ERROR, distinct from the
+        stream-level rejection of oversized header lists.
+        """
+        c = h2.connection.H2Connection(config=self.server_config)
+        c.receive_data(frame_factory.preamble())
+        c.clear_outbound_data_buffer()
+
+        # An indexed header field referring to a dynamic table entry that
+        # does not exist cannot be decoded.
+        f = hyperframe.frame.HeadersFrame(stream_id=1)
+        f.data = b"\xbe"
+        f.flags.add("END_HEADERS")
+
+        with pytest.raises(h2.exceptions.CompressionError) as exc_info:
+            c.receive_data(f.serialize())
+
+        assert isinstance(exc_info.value, h2.exceptions.ProtocolError)
+        assert exc_info.value.error_code == h2.errors.ErrorCodes.COMPRESSION_ERROR
+
+        expected_frame = frame_factory.build_goaway_frame(
+            last_stream_id=0, error_code=h2.errors.ErrorCodes.COMPRESSION_ERROR,
         )
         assert c.data_to_send() == expected_frame.serialize()

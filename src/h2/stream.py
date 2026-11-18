@@ -1106,6 +1106,26 @@ class H2Stream:
         )
         return [], events
 
+    def reject_headers(self, error_code: ErrorCodes | int) -> list[Frame]:
+        """
+        Reject a received header block without delivering it to the user.
+
+        Used when the header block cannot be accepted (for example, because
+        its decompressed size exceeds the local maximum header list size) but
+        the connection should remain usable. The stream state machine is
+        advanced exactly as though the headers had been received, keeping the
+        stream bookkeeping correct, and the stream is then immediately reset.
+        """
+        self.config.logger.debug(
+            "Reject received headers on %r with error code: %d",
+            self, error_code,
+        )
+        # Advance the state machine as though the headers had been received.
+        # The emitted event is deliberately discarded: the headers are not
+        # delivered to the user.
+        self.state_machine.process_input(StreamInputs.RECV_HEADERS)
+        return self.reset_stream(error_code)
+
     def receive_data(self, data: bytes, end_stream: bool, flow_control_len: int) -> tuple[list[Frame], list[Event]]:
         """
         Receive some data.

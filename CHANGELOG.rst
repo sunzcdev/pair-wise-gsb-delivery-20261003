@@ -7,10 +7,31 @@ dev
 **API Changes (Backward Incompatible)**
 
 - Support for Python 3.10 has been removed.
+- A received header block whose decompressed size exceeds the locally
+  advertised ``SETTINGS_MAX_HEADER_LIST_SIZE`` no longer tears down the
+  connection with a ``DenialOfServiceError``. Instead, the header block is
+  still fully decoded (keeping the HPACK dynamic table synchronised with the
+  remote peer), the offending stream is reset with ``ENHANCE_YOUR_CALM``, and
+  a new ``StreamHeadersRejected`` event is emitted. The connection remains
+  usable, and subsequent header blocks that reference dynamic table entries
+  established by the rejected block still decode. Header blocks that inflate
+  beyond a hard bound (a multiple of the configured limit) are still treated
+  as HPACK bomb attacks and continue to raise ``DenialOfServiceError``.
+- Failures to decode a HPACK header block now raise the new
+  ``CompressionError`` exception (a subclass of ``ProtocolError``) and
+  terminate the connection with the ``COMPRESSION_ERROR`` error code, as
+  required by RFC 7540 § 4.3, instead of ``PROTOCOL_ERROR``.
 
 **API Changes (Backward Compatible)**
 
 - Support for Python 3.15 has been added.
+- Added the ``h2.events.StreamHeadersRejected`` event, fired when a stream is
+  rejected because its header list exceeded the local maximum header list
+  size. The event carries the stream ID, the error code used in the
+  RST_STREAM frame, and a human-readable rejection reason.
+- Added the ``h2.exceptions.CompressionError`` exception, distinguishing
+  connection-level HPACK compression errors from stream-level header list
+  size rejections.
 
 **Bugfixes**
 
