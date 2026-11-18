@@ -89,6 +89,7 @@ TESTS = %w(
     query_control
     res_config
     res_file
+    hosts
     res_opt
     scoped_ipv6
     scoped_ipv6_select
