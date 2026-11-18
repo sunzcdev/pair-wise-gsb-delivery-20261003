@@ -81,6 +81,7 @@ module Dnsruby
       @configured = false
       @do_caching = true
       @config = Config.new
+      @configuration_generation = 0
 
       if (arg==nil)
         #  Get default config
@@ -130,6 +131,7 @@ module Dnsruby
       @server = isr.server
       @config.nameserver = [@server]
       @configured = true
+      @configuration_snapshot = build_configuration_snapshot(@single_resolvers)
 
       #       ResolverRegister::register_single_resolver(self)
     end
@@ -156,6 +158,7 @@ module Dnsruby
         @configured = true
         @single_resolvers.compact.each(&:close)
         @single_resolvers = [isr]
+        @configuration_snapshot = build_configuration_snapshot(@single_resolvers)
       }
     end
 

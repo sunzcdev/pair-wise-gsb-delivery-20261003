@@ -41,6 +41,8 @@ TESTS = %w(
     pipeline_retry
     resolver_concurrency
     resolver_validation
+    resolver_configuration_contracts
+    resolver_configuration_snapshot
     release_transport
     release_transport_fixes
     v2_release_transport
@@ -53,7 +55,6 @@ TESTS = %w(
     release_auxiliary_fixes
     recursor_address_fallback
     recursor_limits
-    resolver_configuration_contracts
     release_review_transport
     release_review_transport_native
     review_transport_fixes

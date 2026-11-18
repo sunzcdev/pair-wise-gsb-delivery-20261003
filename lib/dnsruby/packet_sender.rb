@@ -23,6 +23,12 @@ module Dnsruby
 
     include Socket::Constants
 
+    # The ResolverConfiguration snapshot admitted for the request which owns
+    # this sender's current attempt. DNSSEC validation subqueries inherit it.
+    # It is plain-value configuration metadata; the sender never stores an
+    # open connection or SSL object here.
+    attr_accessor :active_configuration_snapshot
+
     @@authoritative_cache = Cache.new
     @@recursive_cache = Cache.new
     PIPELINE_MUTEX_CREATION = Mutex.new
@@ -318,6 +324,10 @@ module Dnsruby
       selector = @selector = SelectThread.instance
       pending = SelectThread::QuerySettings.new(nil, message, @ignore_truncation,
         queue, id, nil, @server, @port, TransportClock.now + @packet_timeout, udp_packet_size, self)
+      # Bind the selector's bookkeeping to the request snapshot which admitted
+      # this attempt, so a later UDP->TCP fallback inherits the same settings.
+      snapshot = Dnsruby::Resolver::ConfigurationSnapshotContext.current
+      pending.configuration_snapshot = snapshot
       pending.send_token = SelectThread::SendToken.new(control, transmission_budget)
       pending.endtime = [pending.endtime, control&.deadline].compact.min
       pending.retire_connection = retire_connection
@@ -578,6 +588,7 @@ module Dnsruby
         configuration[:server], configuration[:port],
         endtime, udp_receive_size(query, configuration), self)
       pending.transport_configuration = configuration
+      pending.configuration_snapshot = Dnsruby::Resolver::ConfigurationSnapshotContext.current
       pending.send_token = previous_settings.send_token if previous_settings
       # Carry the controlling lookup through selector retries and workers, whose
       # thread-local control may differ from the thread which admitted it.
@@ -730,6 +741,21 @@ module Dnsruby
         settings.single_resolver.equal?(self)
     end
 
+    # Run a protocol-driven retry (FORMERR EDNS negotiation or UDP->TCP
+    # fallback) in the snapshot admitted for this request. The selector thread
+    # otherwise serves many resolvers and has no request-specific context.
+    def with_response_snapshot(client_query_id)
+      settings = response_query_settings(client_query_id)
+      snapshot = settings&.configuration_snapshot ||
+        Dnsruby::Resolver::ConfigurationSnapshotContext.current
+      previous = Thread.current[Dnsruby::Resolver::ConfigurationSnapshotContext::THREAD_KEY]
+      Thread.current[Dnsruby::Resolver::ConfigurationSnapshotContext::THREAD_KEY] = snapshot if snapshot
+      yield
+    ensure
+      Thread.current[Dnsruby::Resolver::ConfigurationSnapshotContext::THREAD_KEY] = previous
+    end
+    private :with_response_snapshot
+
     def send_dnsruby_with_socket(query_bytes, query, client_query_id, client_queue,
         use_tcp, endtime, previous_settings, pipeline_mode = use_tcp && @tcp_pipelining)
       #  First send the query (synchronously)
@@ -858,6 +884,7 @@ module Dnsruby
         query_settings = SelectThread::QuerySettings.new(query_bytes, query, previous_settings.ignore_truncation,
           client_queue, client_query_id, socket, server, port, endtime, previous_settings.udp_packet_size, self)
         query_settings.transport_configuration = configuration
+        query_settings.configuration_snapshot = previous_settings.configuration_snapshot
         query_settings.send_token = previous_settings.send_token
         query_settings.disable_edns = previous_settings.disable_edns
         query_settings.cache_scope = previous_settings.cache_scope
@@ -1093,7 +1120,9 @@ module Dnsruby
             retry_query.tsigstate = :Unsigned
             retry_query.set_tsig(query.tsig.dup)
           end
-          send_async(retry_query, client_queue, client_query_id, tcp, true)
+          with_response_snapshot(client_query_id) do
+            send_async(retry_query, client_queue, client_query_id, tcp, true)
+          end
           return false
         end
         if (response.header.tc && !tcp && !ignore_truncation)
@@ -1104,7 +1133,9 @@ module Dnsruby
             Dnsruby.log.debug { "Truncated - resending over TCP" }
             #  @TODO@ Are the query options used correctly here? DNSSEC in particular...
             #         query.send_raw = true # Make sure that the packet is not messed with.
-            send_async(query, client_queue, client_query_id, true)
+            with_response_snapshot(client_query_id) do
+              send_async(query, client_queue, client_query_id, true)
+            end
             return false
           end
         end

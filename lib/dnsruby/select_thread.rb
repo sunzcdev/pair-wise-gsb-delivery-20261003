@@ -155,7 +155,8 @@ module Dnsruby
       attr_accessor :query_bytes, :query, :ignore_truncation, :client_queue,
         :client_query_id, :socket, :dest_server, :dest_port, :endtime, :udp_packet_size,
         :single_resolver, :is_persistent_socket, :tcp_pipelining_max_queries, :send_token,
-        :retire_connection, :disable_edns, :authentication_error, :cache_scope, :transport_configuration
+        :retire_connection, :disable_edns, :authentication_error, :cache_scope,
+        :transport_configuration, :configuration_snapshot
       #  new(query_bytes, query, ignore_truncation, client_queue, client_query_id,
       #      socket, dest_server, dest_port, endtime, , udp_packet_size, single_resolver)
       def initialize(*args)
@@ -1126,11 +1127,17 @@ module Dnsruby
         if settings
           Dnsruby.log.error{"Decode error (from #{answerip})! Header shows truncation, so trying again over TCP"}
           previous_context = Thread.current[:dnsruby_response_query]
+          previous_snapshot = Thread.current[Dnsruby::Resolver::ConfigurationSnapshotContext::THREAD_KEY]
           begin
             Thread.current[:dnsruby_response_query] = settings
+            # The UDP->TCP fallback belongs to the same admitted request and
+            # must keep its snapshot, not read a partially updated Resolver.
+            Thread.current[Dnsruby::Resolver::ConfigurationSnapshotContext::THREAD_KEY] =
+              settings.configuration_snapshot if settings.configuration_snapshot
             settings.single_resolver.send_async(settings.query, settings.client_queue, client_id, true)
           ensure
             Thread.current[:dnsruby_response_query] = previous_context
+            Thread.current[Dnsruby::Resolver::ConfigurationSnapshotContext::THREAD_KEY] = previous_snapshot
           end
         else
           send_exception_to_client(e, socket, client_id)
@@ -1298,6 +1305,7 @@ module Dnsruby
         if (((msg.security_level == Message::SecurityLevel.UNCHECKED) ||
                 (msg.security_level == Message::SecurityLevel.INDETERMINATE)) &&
               (ValidatorThread.requires_validation?(query, msg, err, res)))
+          attach_validation_snapshot(res, client_id)
           validator = ValidatorThread.new(client_id, client_queue, msg, err, query, self, res, transmission_budget)
           validator.run
         else
@@ -1327,10 +1335,22 @@ module Dnsruby
       return unless deliver_queue_event(client_queue, [client_id, Resolver::EventType::RECEIVED, msg, err])
 
       if (!err || (err.instance_of?(NXDomain)))
-        # The validator owns delivery of the validation result.
+        # The validator owns delivery of the validation result. Bind the sender
+        # to the admitted snapshot so validation subqueries inherit it.
+        attach_validation_snapshot(res, client_id)
         validator = ValidatorThread.new(client_id, client_queue, msg, err, query, self, res, transmission_budget)
         validator.run
       end
+    end
+
+    # Find the snapshot captured for this request's attempt and publish it on
+    # the PacketSender which the validator will use for discovery subqueries.
+    def attach_validation_snapshot(sender, client_id)
+      return unless sender.respond_to?(:active_configuration_snapshot=)
+      settings = query_settings_for_id(client_id)
+      snapshot = settings&.configuration_snapshot ||
+        Thread.current[Dnsruby::Resolver::ConfigurationSnapshotContext::THREAD_KEY]
+      sender.active_configuration_snapshot = snapshot
     end
 
     def add_observer(client_queue, observer)

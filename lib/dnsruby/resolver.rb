@@ -17,8 +17,10 @@
 
 require 'dnsruby/packet_sender'
 require 'dnsruby/recursor'
+require 'dnsruby/resolver_configuration'
 
 module Dnsruby
+
   #  == Description
   #  Dnsruby::Resolver is a DNS stub resolver.
   #  This class performs queries with retries across multiple nameservers.
@@ -71,6 +73,34 @@ module Dnsruby
   class Resolver
     CONFIGURATION_MUTEX_CREATION = Mutex.new
     private_constant :CONFIGURATION_MUTEX_CREATION
+
+    # Carries one published ResolverConfiguration through nested work. TCP
+    # fallback, discovery and DNSSEC validation subqueries inherit the snapshot
+    # admitted for their owning request instead of re-reading global
+    # attributes, which another thread may be halfway through updating.
+    class ConfigurationSnapshotContext
+      THREAD_KEY = :dnsruby_resolver_configuration
+
+      def self.current
+        Thread.current[THREAD_KEY]
+      end
+
+      def self.with(snapshot)
+        previous = Thread.current[THREAD_KEY]
+        Thread.current[THREAD_KEY] = snapshot
+        yield
+      ensure
+        Thread.current[THREAD_KEY] = previous
+      end
+
+      # A snapshot only applies to the Resolver that published it. Nested work
+      # on a different Resolver (for example an explicit
+      # Dnssec.default_resolver) keeps that resolver's own configuration.
+      def self.snapshot_for(resolver)
+        snapshot = current
+        snapshot if snapshot && snapshot.publisher.equal?(resolver)
+      end
+    end
 
     def ensure_current_process
       return if @process_pid == Process.pid
@@ -154,6 +184,13 @@ module Dnsruby
     #  The current Config
     attr_reader :config
 
+    # The configuration most recently published to new queries. A query keeps
+    # the snapshot it captured at admission for its whole lifetime, including
+    # TCP fallback and validation subqueries.
+    def current_configuration
+      @single_res_mutex.synchronize { @configuration_snapshot }
+    end
+
     #  Defines whether we will cache responses, or pass every request to the
     #  upstream resolver.  This is only really useful when querying authoritative
     #  servers (as the upstream recursive resolver is likely to cache)
@@ -168,6 +205,8 @@ module Dnsruby
           @single_resolvers = s
           @configuration_error = nil
           @configured = true
+          @configuration_snapshot = build_configuration_snapshot(
+            @single_resolvers, allow_empty: @single_resolvers.empty?)
         end
       end
     end
@@ -186,13 +225,25 @@ module Dnsruby
     #  This is distinct from the SingleResolver per-packet timeout
     #  The query_timeout is not required - it will default to 0, which means "do not use query_timeout".
     #  If this is the case then the timeout will be dictated by the retry_times and retry_delay attributes
-    attr_accessor :query_timeout
+    attr_reader :query_timeout
+
+    def query_timeout=(timeout)
+      with_validated_configuration { @query_timeout = timeout }
+    end
 
     #  The query will be tried across nameservers retry_times times, with a delay of retry_delay seconds
     #  between each retry. The first time round, retry_delay will be divided by the number of nameservers
     #  being targetted, and a new nameserver will be queried with the resultant delay.
     #  RFC 9520 caps attempts at three per server address and transport, including protocol retries.
-    attr_accessor :retry_times, :retry_delay
+    attr_reader :retry_times, :retry_delay
+
+    def retry_times=(times)
+      with_validated_configuration { @retry_times = times }
+    end
+
+    def retry_delay=(delay)
+      with_validated_configuration { @retry_delay = delay }
+    end
 
     #  Use DNSSEC for this Resolver
     attr_reader :dnssec
@@ -202,7 +253,11 @@ module Dnsruby
     #  Note that send_message and send_async expect a
     #  Message object to be passed in, which is already configured to the callers
     #  requirements.
-    attr_accessor :do_validation
+    attr_reader :do_validation
+
+    def do_validation=(on)
+      with_validated_configuration { @do_validation = on }
+    end
 
     #  --
     #  @TODO@ add load_balance? i.e. Target nameservers in a random, rather than pre-determined, order?
@@ -220,15 +275,21 @@ module Dnsruby
     #    response = res.query('208.77.188.166') # IPv4 address so PTR query will be made
     #    response = res.query('208.77.188.166', Types.PTR)
     def query(name, type=Types.A, klass=Classes.IN, set_cd=@dnssec)
-      msg = Message.new
-      msg.do_caching = @do_caching
-      msg.header.rd = 1
-      msg.add_question(name, type, klass)
-      msg.do_validation = @do_validation
-      if @dnssec
-        msg.header.cd = set_cd # We do our own validation by default
+      # Build the Message against one published snapshot. The snapshot stays on
+      # this thread through send_message, so admission and all subqueries use
+      # the same nameserver, retry and validation settings.
+      snapshot = current_configuration
+      Resolver::ConfigurationSnapshotContext.with(snapshot) do
+        msg = Message.new
+        msg.do_caching = snapshot.do_caching
+        msg.header.rd = 1
+        msg.add_question(name, type, klass)
+        msg.do_validation = snapshot.do_validation
+        if snapshot.dnssec
+          msg.header.cd = set_cd # We do our own validation by default
+        end
+        send_message(msg)
       end
-      send_message(msg)
     end
 
     #  Like query, but does not raise an error when an error occurs.
@@ -245,15 +306,18 @@ module Dnsruby
     end
 
     def query_no_validation_or_recursion(name, type=Types.A, klass=Classes.IN) # :nodoc: all
-      msg = Message.new
-      msg.do_caching = @do_caching
-      msg.header.rd = false
-      msg.do_validation = false
-      msg.add_question(name, type, klass)
-      if @dnssec
-        msg.header.cd = true # We do our own validation by default
+      snapshot = current_configuration
+      Resolver::ConfigurationSnapshotContext.with(snapshot) do
+        msg = Message.new
+        msg.do_caching = snapshot.do_caching
+        msg.header.rd = false
+        msg.do_validation = false
+        msg.add_question(name, type, klass)
+        if snapshot.dnssec
+          msg.header.cd = true # We do our own validation by default
+        end
+        send_message(msg)
       end
-      send_message(msg)
     end
 
     #  Send a message, and wait for the response. If a valid Message is received, then it is returned
@@ -582,7 +646,11 @@ module Dnsruby
           raise ArgumentError, "No valid nameservers found" if complete.empty?
           @config.nameserver = nameservers if replace
           (@single_resolvers - complete).compact.each(&:close)
+          # One atomic publication swaps both the sender list and the plain
+          # value snapshot new queries capture. Existing queries keep theirs.
+          snapshot = build_configuration_snapshot(complete)
           @single_resolvers = complete
+          @configuration_snapshot = snapshot
           published = true
           @configuration_error = nil
           @configured = true
@@ -648,16 +716,136 @@ module Dnsruby
       }
       @configured = false
       @configuration_error = nil
+      @configuration_generation = 0
+      @configuration_snapshot = build_configuration_snapshot(allow_empty: true)
+    end
+
+    # Plain values which define one published configuration. Only these are
+    # copied into a snapshot; live senders, sockets, mutexes and TSIG objects
+    # stay outside it.
+    CONFIGURATION_ATTRIBUTES = ResolverConfiguration::ATTRIBUTES
+    private_constant :CONFIGURATION_ATTRIBUTES
+
+    def configuration_attribute_values
+      CONFIGURATION_ATTRIBUTES.each_with_object({}) do |attribute, values|
+        values[attribute] = instance_variable_get("@#{attribute}")
+      end
+    end
+    private :configuration_attribute_values
+
+    def tsig_snapshot_value(tsig = @tsig)
+      return nil if tsig.nil?
+      # Accept the same call shapes as tsig=: an RR::TSIG or a
+      # [name, key, algorithm] array which resolves to one.
+      tsig = Resolver.get_tsig([tsig]) unless tsig.is_a?(RR::TSIG)
+      {name: tsig.name.to_s, key: tsig.key&.dup, algorithm: tsig.algorithm.to_s}
+    end
+    private :tsig_snapshot_value
+
+    # Build a plain-value snapshot from the current attributes and the senders
+    # given (the published senders by default). An empty list is allowed only
+    # for the pre-configuration snapshot; real publication requires senders.
+    def build_configuration_snapshot(senders = @single_resolvers, allow_empty: false)
+      # Test doubles and not-yet-wired internal senders may expose just a
+      # server. Fall back to the configured port rather than requiring every
+      # injected object to implement the full PacketSender surface.
+      servers = senders.map do |sender|
+        port = sender.respond_to?(:port) ? Integer(sender.port) : Integer(@port)
+        {server: sender.server.to_s, port: port}
+      end
+      raise ArgumentError, 'No valid nameservers found' if servers.empty? && !allow_empty
+      @configuration_generation += 1
+      ResolverConfiguration.new(configuration_attribute_values,
+        servers: servers, tsig: tsig_snapshot_value,
+        generation: @configuration_generation, publisher: self)
+    end
+    private :build_configuration_snapshot
+
+    # Explicit publication entry point. Pending changes held back from the
+    # current configuration (for example after a rejected validation or a
+    # nameserver replacement still being built) become visible to new queries
+    # only here. Re-raises the configuration error which prevented publication;
+    # a healthy Resolver always has a published snapshot to return.
+    def publish_configuration!
+      ensure_current_process
+      add_config_nameservers
+      raise @configuration_error if @configuration_error
+      current_configuration
     end
 
     def update # :nodoc: all
       ensure_current_process
-      #  Update any resolvers we have with the latest config
+      # Push current attributes onto existing senders and republish one
+      # snapshot atomically. No configuration mutex is taken, so an in-flight
+      # query completing concurrently never blocks behind a slow setter.
       @single_res_mutex.synchronize do
         @single_resolvers.delete(nil) # Just in case...
         @single_resolvers.each { |res| update_internal_res(res) }
+        # A not-yet-configured or explicitly empty Resolver keeps an empty
+        # snapshot; nameserver publication supplies the first real sender set.
+        @configuration_snapshot = build_configuration_snapshot(
+          @single_resolvers, allow_empty: @single_resolvers.empty?)
       end
     end
+
+    # Validate a complete attribute replacement before mutating anything.
+    # Invalid arguments leave both the live attributes, sender settings and the
+    # published snapshot intact. Snapshot rebuild itself only reads validated
+    # plain values, so it cannot fail after attributes have changed.
+    # Reentrant on the same thread: a callback fired during admission (a test
+    # producer, a nameserver bootstrap, or a nested setter such as dnssec=) may
+    # publish another change without a recursive mutex deadlock.
+    def with_validated_configuration # :nodoc: all
+      raise ArgumentError, 'block required' unless block_given?
+      # Reachable both from an ordinary setter and from a callback during an
+      # admission (which already holds the query lock). Publish against the
+      # current attributes either way; the outer admission keeps the same lock
+      # for its whole bookkeeping section.
+      if @single_res_mutex.owned?
+        previous = configuration_attribute_values
+        previous_snapshot = @configuration_snapshot
+        begin
+          yield
+          @single_resolvers.each { |res| update_internal_res(res) }
+          @configuration_snapshot = build_configuration_snapshot(
+            @single_resolvers, allow_empty: @single_resolvers.empty?)
+        rescue Exception => error
+          previous.each { |attribute, value| instance_variable_set("@#{attribute}", value) }
+          @single_resolvers.each { |res| update_internal_res(res) }
+          @configuration_snapshot = previous_snapshot
+          raise error
+        end
+        return @configuration_snapshot
+      end
+      synchronize_query_state do
+        previous = configuration_attribute_values
+        previous_snapshot = @configuration_snapshot
+        begin
+          yield
+          @single_resolvers.each { |res| update_internal_res(res) }
+          @configuration_snapshot = build_configuration_snapshot(
+            @single_resolvers, allow_empty: @single_resolvers.empty?)
+        rescue Exception => error
+          previous.each { |attribute, value| instance_variable_set("@#{attribute}", value) }
+          @single_resolvers.each { |res| update_internal_res(res) }
+          @configuration_snapshot = previous_snapshot
+          raise error
+        end
+      end
+    end
+    private :with_validated_configuration
+
+    # Run a block holding the query-state lock. Reentrant on the current
+    # thread, so configuration publication reached through an admission callback
+    # cannot deadlock against the lock already taken by that admission.
+    def synchronize_query_state
+      if @single_res_mutex.owned?
+        yield
+      else
+        @single_res_mutex.synchronize { yield }
+      end
+    end
+    private :synchronize_query_state
 
     #     # Add a new SingleResolver to the list of resolvers this Resolver object will
     #     # query.
@@ -675,6 +863,7 @@ module Dnsruby
           @single_resolvers.push(res)
           @configuration_error = nil
           @configured = true
+          @configuration_snapshot = build_configuration_snapshot(@single_resolvers)
         end
       end
     end
@@ -702,8 +891,7 @@ module Dnsruby
     #  ++
 
     def packet_timeout=(t)
-      @packet_timeout = t
-      update
+      with_validated_configuration { @packet_timeout = t }
     end
 
     #  The source port to send queries from
@@ -726,9 +914,9 @@ module Dnsruby
     def src_port=(p)
       ports = Resolver.get_ports_from(p)
       raise ArgumentError, 'Source port pool must not be empty' if ports.empty?
-      if Resolver.check_port(ports)
+      with_validated_configuration do
+        raise ArgumentError, 'Illegal source port' unless Resolver.check_port(ports)
         @src_port = ports
-        update
       end
     end
 
@@ -747,10 +935,10 @@ module Dnsruby
     def add_src_port(p)
       additions = Resolver.get_ports_from(p)
       ports = @src_port == [0] && !additions.empty? && !additions.include?(0) ? [] : @src_port
-      if Resolver.check_port(additions, ports)
+      with_validated_configuration do
+        raise ArgumentError, 'Illegal source port' unless Resolver.check_port(additions, ports)
         @src_port = ports + additions
       end
-      update
     end
 
     def Resolver.check_port(p, src_port=[])
@@ -792,31 +980,28 @@ module Dnsruby
     end
 
     def tcp_pipelining=(on)
-      @tcp_pipelining = on
-      update
+      with_validated_configuration { @tcp_pipelining = on }
     end
 
     def tcp_pipelining_max_queries=(max)
-      @tcp_pipelining_max_queries = max
-      update
+      with_validated_configuration { @tcp_pipelining_max_queries = max }
     end
 
     def tcp_idle_timeout=(seconds)
-      unless seconds.is_a?(Numeric) && seconds.finite? && seconds > 0
-        raise ArgumentError, 'TCP idle timeout must be a positive finite number'
+      with_validated_configuration do
+        unless seconds.is_a?(Numeric) && seconds.finite? && seconds > 0
+          raise ArgumentError, 'TCP idle timeout must be a positive finite number'
+        end
+        @tcp_idle_timeout = seconds
       end
-      @tcp_idle_timeout = seconds
-      update
     end
 
     def use_tcp=(on)
-      @use_tcp = on
-      update
+      with_validated_configuration { @use_tcp = on }
     end
 
     def no_tcp=(on)
-      @no_tcp=on
-      update
+      with_validated_configuration { @no_tcp = on }
     end
 
     #  Sets the TSIG to sign outgoing messages with.
@@ -829,9 +1014,10 @@ module Dnsruby
     #  * res.tsig = key_name, key, algorithm # must match the server's key
     #  * res.tsig=nil # Stop the resolver from signing
     def tsig=(t)
-      Resolver.get_tsig([t]) unless t.nil?
-      @tsig = t
-      update
+      with_validated_configuration do
+        Resolver.get_tsig([t]) unless t.nil?
+        @tsig = t
+      end
     end
 
 
@@ -875,59 +1061,49 @@ module Dnsruby
 
 
     def ignore_truncation=(on)
-      @ignore_truncation = on
-      update
+      with_validated_configuration { @ignore_truncation = on }
     end
 
     def src_address=(a)
-      @src_address = a
-      update
+      with_validated_configuration { @src_address = a }
     end
 
     def src_address6=(a)
-      @src_address6 = a
-      update
+      with_validated_configuration { @src_address6 = a }
     end
 
     def port=(a)
-      @port = a
-      update
+      with_validated_configuration { @port = a }
     end
 
     def persistent_tcp=(on)
-      @persistent_tcp = on
-      update
+      with_validated_configuration { @persistent_tcp = on }
     end
 
     def persistent_udp=(on)
-      @persistent_udp = on
-      update
+      with_validated_configuration { @persistent_udp = on }
     end
 
     def do_caching=(on)
-      @do_caching=on
-      update
+      with_validated_configuration { @do_caching = on }
     end
 
     def recurse=(a)
-      @recurse = a
-      update
+      with_validated_configuration { @recurse = a }
     end
 
     def dnssec=(d)
-      @dnssec = d
-      if d
-        #  Set the UDP size (RFC 4035 section 4.1)
-        if @udp_size < AbsoluteMinDnssecUdpSize
-          self.udp_size = AbsoluteMinDnssecUdpSize
+      with_validated_configuration do
+        @dnssec = d
+        if d && @udp_size < AbsoluteMinDnssecUdpSize
+          # Same publication; do not re-enter the configuration lock.
+          @udp_size = AbsoluteMinDnssecUdpSize
         end
       end
-      update
     end
 
     def udp_size=(s)
-      @udp_size = s
-      update
+      with_validated_configuration { @udp_size = s }
     end
 
     def single_res_mutex # :nodoc: all
@@ -936,13 +1112,26 @@ module Dnsruby
     end
 
     def generate_timeouts(base=0) # :nodoc: all
+      snapshot = current_configuration
+      generate_timeouts_for_snapshot(snapshot, base)
+    end
+
+    # Build the finite retry plan from one immutable snapshot. The plan retains
+    # the senders captured at admission, even if the nameserver list is later
+    # replaced; those senders stay open until this query completes.
+    def generate_timeouts_for_snapshot(snapshot, base = 0) # :nodoc: all
+      generate_timeouts_locked(snapshot, base)
+    end
+
+    # Same planner for callers already holding @single_res_mutex.
+    def generate_timeouts_locked(snapshot, base)
       timeouts = {}
-      retry_delay = @retry_delay
-      @single_resolvers.delete(nil)
-      [@retry_times, 3].min.times do |retry_count|
+      senders = admission_senders_locked(snapshot)
+      retry_delay = snapshot.retry_delay
+      [snapshot.retry_times, 3].min.times do |retry_count|
         retry_delay *= 2 if retry_count > 0
-        @single_resolvers.each_with_index do |res, i|
-          offset = i * @retry_delay.to_f / @single_resolvers.length
+        senders.each_with_index do |res, i|
+          offset = i * snapshot.retry_delay.to_f / senders.length
           deadline = base + offset + (retry_count == 0 ? 0 : retry_delay)
           attempt = [res, retry_count]
           if (existing = timeouts[deadline])
@@ -957,6 +1146,24 @@ module Dnsruby
       end
       timeouts
     end
+
+    # Senders implementing a captured snapshot, matched by the plain-value
+    # server/port pairs stored in the snapshot rather than object identity.
+    # New queries always find their senders; an empty pre-configuration
+    # snapshot admits through the ordinary no-nameserver timeout path.
+    def admission_senders(snapshot)
+      @single_res_mutex.synchronize { admission_senders_locked(snapshot) }
+    end
+
+    def admission_senders_locked(snapshot)
+      snapshot.servers.map do |server|
+        @single_resolvers.find do |sender|
+          port = sender.respond_to?(:port) ? Integer(sender.port) : Integer(@port)
+          sender.server.to_s == server.server && port == server.port
+        end
+      end.compact
+    end
+    # :nodoc: all
 
   end
 
@@ -979,16 +1186,27 @@ module Dnsruby
       @response_cache = Cache::ResolutionCache.new
       @query_cache_scopes = {}
     end
+
+    # Reentrant query-state locking for a real Resolver; test doubles which only
+    # expose a mutex fall back to locking it directly.
+    def lock_query_state
+      if @parent.private_methods.include?(:synchronize_query_state)
+        @parent.send(:synchronize_query_state) { yield }
+      else
+        @parent.single_res_mutex.synchronize { yield }
+      end
+    end
+    private :lock_query_state
     # Completed failures belong to one resolver configuration and validation
     # policy. Snapshot them at admission, and decline insertion if it changes.
-    def response_cache_scope(query)
-      return unless query.do_caching && @parent.do_caching && !query.send_raw &&
+    def response_cache_scope(query, snapshot = @parent.current_configuration)
+      return unless query.do_caching && snapshot.do_caching && !query.send_raw &&
         query.header.opcode == OpCode.QUERY && !query.is_a?(Update) &&
-        !query.tsig && !query.signed? && !@parent.tsig && query.question.length == 1 &&
+        !query.tsig && !query.signed? && snapshot.tsig.nil? && query.question.length == 1 &&
         query.answer.empty? && query.authority.empty? &&
         query.additional.all? { |rr| rr.type == Types::OPT }
       return if [Types::AXFR, Types::IXFR].include?(query.question.first.qtype)
-      senders = @parent.single_resolvers
+      senders = @parent.admission_senders_locked(snapshot)
       return if senders.empty? || senders.any?(&:tsig)
       settings = senders.map do |sender|
         [sender.server.to_s.dup, sender.port, sender.use_tcp, sender.no_tcp,
@@ -1000,7 +1218,7 @@ module Dnsruby
         query.additional.map { |rr|
           encoded = MessageEncoder.new { |encoder| rr.encode_rdata(encoder) }.to_s
           [rr.payloadsize, rr.ttl, encoded]
-        }, settings, @parent.query_timeout, @parent.retry_times, @parent.retry_delay,
+        }, settings, snapshot.query_timeout, snapshot.retry_times, snapshot.retry_delay,
         Cache.validation_scope]
     end
 
@@ -1011,7 +1229,12 @@ module Dnsruby
     def cache_completion(client_query_id, response, error)
       current = @query_list[client_query_id]
       scope = @query_cache_scopes.delete(client_query_id)
-      return unless current && scope && scope == response_cache_scope(current[0])
+      return unless current && scope
+      # Recompute against the live published snapshot. If a setter changed the
+      # configuration while this query was in flight, the scope captured at
+      # admission no longer matches and the ambiguous exchange is not cached.
+      live_snapshot = @parent.instance_variable_get(:@configuration_snapshot)
+      return unless scope == response_cache_scope(current[0], live_snapshot)
       @response_cache.add(current[0], scope, response, error, control: current[4])
     end
     private :response_cache_scope, :cached_completion, :cache_completion
@@ -1045,17 +1268,23 @@ module Dnsruby
         return
       end
 
+      # Snapshot the published EDNS and sender set before any I/O. Inherited
+      # subqueries keep their owning request's snapshot instead of re-reading
+      # globals, which may be halfway through an update on another thread.
+      snapshot = Resolver::ConfigurationSnapshotContext.snapshot_for(@parent) ||
+        @parent.current_configuration
       # According to RFC 6891, a UDP payload size >512 bytes requires an
       # EDNS OPT RR in the message.
-      if @parent.udp_size > 512 && !msg.get_opt && !msg.send_raw && !msg.signed? && !msg.tsig
-        TheLog.debug("Automatically adding EDNS OPT RR for udp_size=#{ @parent.udp_size }")
-        msg.add_additional(Dnsruby::RR::OPT.new(@parent.udp_size))
+      if snapshot.udp_size > 512 && !msg.get_opt && !msg.send_raw && !msg.signed? && !msg.tsig
+        TheLog.debug("Automatically adding EDNS OPT RR for udp_size=#{snapshot.udp_size}")
+        msg.add_additional(Dnsruby::RR::OPT.new(snapshot.udp_size))
       end
 
       begin
         # Encoding may sign the Message, even for this size check. Set the
         # header and EDNS options first so the signature covers the final query.
-        sender = @parent.single_resolvers.first
+        # Use a sender from the captured nameserver set, not the live list.
+        sender = @parent.admission_senders(snapshot).first
         wire = sender ? sender.make_query_packet(msg) : msg.encode
         if wire.bytesize > 65_535
           raise EncodeError, 'DNS message exceeds the 65535-byte wire limit'
@@ -1067,36 +1296,41 @@ module Dnsruby
       end
 
       st = SelectThread.instance
-      #  add to our data structures
-      #       @mutex.synchronize{
-      @parent.single_res_mutex.synchronize {
+      # Capture the published configuration once, under the query lock. Every
+      # deadline, retry and EDNS decision below uses this snapshot, so a
+      # concurrent setter can only affect later admissions.
+      lock_query_state {
         if @query_list.has_key?(client_query_id)
           Dnsruby.log.error("Duplicate query id requested (#{client_query_id}")
           #  @TODO@ Handle different queue tuples - push this to generic send_error method
           client_queue.push([client_query_id, nil, ArgumentError.new('Client query ID already in use')])
           return
         end
-        scope = response_cache_scope(msg)
+        # Re-read under the lock: publication between the EDNS check and
+        # admission must not split one query across two configurations.
+        inherited = Resolver::ConfigurationSnapshotContext.snapshot_for(@parent)
+        snapshot = inherited || @parent.instance_variable_get(:@configuration_snapshot)
+        scope = response_cache_scope(msg, snapshot)
         control = QueryControl.current
         control&.check!
-        if (cached = cached_completion(msg, scope))
+        if scope && (cached = cached_completion(msg, scope))
           client_queue.push([client_query_id, *cached])
           return client_query_id
         end
         @query_cache_scopes[client_query_id] = scope
         outstanding = []
-        @query_list[client_query_id]=[msg, client_queue, q, outstanding, control]
+        @query_list[client_query_id]=[msg, client_queue, q, outstanding, control, snapshot]
         @transmission_budgets[client_query_id] = SelectThread::TransmissionBudget.current || SelectThread::TransmissionBudget.new
 
-        query_timeout = TransportClock.now + @parent.query_timeout
-        if @parent.query_timeout == 0
+        query_timeout = TransportClock.now + snapshot.query_timeout
+        if snapshot.query_timeout == 0
           query_timeout = TransportClock.now + 31536000 # a year from now
         end
-        retries = generate_timeouts
+        retries = @parent.generate_timeouts_locked(snapshot, TransportClock.now).sort.to_h
         # An explicitly empty nameserver list uses the ordinary query deadline
         # and completion path. No independent timer can publish a second result.
-        no_nameservers = @parent.single_resolvers.empty?
-        if no_nameservers && @parent.query_timeout == 0
+        no_nameservers = snapshot.servers.empty?
+        if no_nameservers && snapshot.query_timeout == 0
           query_timeout = TransportClock.now + 1
         elsif retries.empty? && !no_nameservers
           # A caller may disable all attempts with retry_times=0. Complete
@@ -1114,23 +1348,25 @@ module Dnsruby
       # Dispatch this query immediately, even while earlier queries are pending.
       # The same locked retry bookkeeping lets a concurrent selector tick win
       # safely, while socket I/O still happens after releasing the query lock.
-      tick(client_query_id)
+      # TCP fallback and validation subqueries inherit this snapshot through the
+      # thread-local context while the admission runs.
+      snapshot = @query_list[client_query_id]&.last
+      Resolver::ConfigurationSnapshotContext.with(snapshot) do
+        tick(client_query_id)
+      end
       client_query_id
     end
 
     def generate_timeouts # :nodoc: all
-      #  Create the timeouts for the query from the retry_times and retry_delay attributes.
-      #  These are created at the same time in case the parameters change during the life of the query.
-      #
-      #  These should be absolute, rather than relative
-      #  All retry and query deadlines use the same monotonic clock.
+      # Retry plans are created at admission from the captured snapshot. This
+      # entry remains for callers which exercise timeout generation directly.
       @parent.generate_timeouts(TransportClock.now).sort.to_h
     end
 
     #  Close the Resolver. Unfinished queries are terminated with OtherResolvError.
     def close
       #       @mutex.synchronize {
-      @parent.single_res_mutex.synchronize {
+      lock_query_state {
         @query_list.each do |client_query_id, values|
          _msg, client_queue, q, _outstanding = values
           send_result_and_stop_querying(client_queue, client_query_id, q, nil,
@@ -1143,7 +1379,7 @@ module Dnsruby
     # Cancel only the nested discovery query owned by this synchronous waiter;
     # never close a shared resolver or disturb unrelated callers.
     def cancel_query(client_query_id, client_queue)
-      @parent.single_res_mutex.synchronize do
+      lock_query_state do
         current = @query_list[client_query_id]
         if current && current[1].equal?(client_queue)
           stop_querying(client_query_id)
@@ -1188,7 +1424,7 @@ module Dnsruby
     # cannot start validation, and validation keeps the original query deadline.
     def validation_deadline(select_queue, query_id)
       client_query_id = query_id[2]
-      @parent.single_res_mutex.synchronize do
+      lock_query_state do
         current = @query_list[client_query_id]
         if current && current[2].equal?(select_queue) && @validation_queries[client_query_id] == query_id
           @timeouts[client_query_id][0]
@@ -1198,7 +1434,7 @@ module Dnsruby
 
     def validation_transmission_budget(select_queue, query_id)
       client_query_id = query_id[2]
-      @parent.single_res_mutex.synchronize do
+      lock_query_state do
         current = @query_list[client_query_id]
         if current && current[2].equal?(select_queue) && @validation_queries[client_query_id] == query_id
           @transmission_budgets[client_query_id]
@@ -1231,7 +1467,7 @@ module Dnsruby
     # Earliest retry or total query deadline, using the same lock as admission.
     # The selector must call this outside its own lock.
     def next_tick_at # :nodoc: all
-      @parent.single_res_mutex.synchronize { @tick_deadlines.first_deadline }
+      lock_query_state { @tick_deadlines.first_deadline }
     end
 
     # Only a changed query's finite retry plan needs inspection. The selector
@@ -1253,7 +1489,7 @@ module Dnsruby
       #  Do we have any retries due to be sent yet?
       #       @mutex.synchronize{
       sends = []
-      @parent.single_res_mutex.synchronize {
+      lock_query_state {
         time_now = TransportClock.now
         query_ids = client_query_id.nil? ? [] : [client_query_id]
         if client_query_id.nil?
@@ -1264,7 +1500,11 @@ module Dnsruby
         end
         query_ids.each do |client_query_id|
           next unless @timeouts.key?(client_query_id)
-          msg, client_queue, select_queue, outstanding, control = @query_list[client_query_id]
+          entry = @query_list[client_query_id]
+          msg, client_queue, select_queue, outstanding, control = entry
+          # Tests and internal callers may build the legacy five-element
+          # tuple directly; a missing snapshot means no context wrapping.
+          snapshot = entry[5]
           query_timeout, timeouts, no_nameservers = @timeouts[client_query_id]
           if query_timeout <= time_now
             #  Time the query out through the same exactly-once completion path.
@@ -1287,7 +1527,14 @@ module Dnsruby
               retired = !@parent.single_resolvers.include?(res)
               operation = res.prepare_send_async(msg, select_queue, id, retired, control,
                 (@transmission_budgets[client_query_id] ||= SelectThread::TransmissionBudget.new))
-              sends << operation if operation
+              # Carry the admitted snapshot into the actual I/O so TCP fallback
+              # inside PacketSender/SelectThread cannot read a half-updated set
+              # of global attributes.
+              if operation
+                sends << -> do
+                  Resolver::ConfigurationSnapshotContext.with(snapshot) { operation.call }
+                end
+              end
             end
           end
           update_tick_deadline(client_query_id)
@@ -1336,7 +1583,7 @@ module Dnsruby
         Dnsruby.log_and_raise("Serious internal error!! #{id} expected, #{event_id} received")
       end
       #       @mutex.synchronize{
-      @parent.single_res_mutex.synchronize {
+      lock_query_state {
         current = @query_list[client_query_id]
         # An observer selected before completion can arrive after the caller
         # reuses its ID. Only the original logical query owns this queue.
@@ -1344,20 +1591,25 @@ module Dnsruby
           Dnsruby.log.debug{'Ignoring response for completed query'}
           return
         end
+        snapshot = current[5]
+        # Handle the response (including DNSSEC validation dispatch) in the
+        # admitted snapshot so every subquery inherits it, even on the shared
+        # selector thread which serves many resolvers concurrently.
+        Resolver::ConfigurationSnapshotContext.with(snapshot) do
         deadline, _retries, no_nameservers = @timeouts[client_query_id]
         if deadline && deadline <= TransportClock.now
           reason = no_nameservers ? 'Query timed out - no valid nameservers configured' : 'Query timed out'
           send_result_and_stop_querying(current[1], client_query_id, queue, nil,
             ResolvTimeout.new(reason))
-          return
+          next
         end
         validation_query = @validation_queries[client_query_id]
         if validation_query
           # A response already accepted for validation owns completion. Errors
           # and already-queued answers from competing attempts cannot replace it.
-          return unless event_type == Resolver::EventType::VALIDATED && validation_query == event_id
+          next unless event_type == Resolver::EventType::VALIDATED && validation_query == event_id
         elsif event_type == Resolver::EventType::VALIDATED
-          return
+          next
         end
         _msg, _client_queue, _select_queue, outstanding = current
         if event_type == Resolver::EventType::RECEIVED ||
@@ -1388,6 +1640,7 @@ module Dnsruby
         else
           #           print "ERROR - UNKNOWN EVENT TYPE IN RESOLVER : #{event_type}\n"
           TheLog.error("ERROR - UNKNOWN EVENT TYPE IN RESOLVER : #{event_type}")
+        end
         end
       }
     end
@@ -1470,7 +1723,7 @@ module Dnsruby
     #  TO BE CALLED IN A SYNCHRONIZED BLOCK
     def increment_resolver_priority(res)
       TheLog.debug("Incrementing resolver priority for #{res.server}\n")
-      #       @parent.single_res_mutex.synchronize {
+      #       lock_query_state {
       index = @parent.single_resolvers.index(res)
       if index && index > 0
         @parent.single_resolvers.delete(res)
@@ -1482,7 +1735,7 @@ module Dnsruby
     #  TO BE CALLED IN A SYNCHRONIZED BLOCK
     def decrement_resolver_priority(res)
       TheLog.debug("Decrementing resolver priority for #{res.server}\n")
-      #       @parent.single_res_mutex.synchronize {
+      #       lock_query_state {
       index = @parent.single_resolvers.index(res)
       if index && index < @parent.single_resolvers.length - 1
         @parent.single_resolvers.delete(res)
@@ -1494,7 +1747,7 @@ module Dnsruby
     #  TO BE CALLED IN A SYNCHRONIZED BLOCK
     def demote_resolver(res)
       TheLog.debug("Demoting resolver priority for #{res.server} to bottom\n")
-      #       @parent.single_res_mutex.synchronize {
+      #       lock_query_state {
       if @parent.single_resolvers.delete(res)
         @parent.single_resolvers.push(res)
       end

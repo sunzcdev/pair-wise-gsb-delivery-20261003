@@ -74,6 +74,11 @@ module Dnsruby
 
     def initialize(*args)
       @client_id, @client_queue, @response, @error, @query, @st, @res, @transmission_budget = args
+      # Validation is part of one admitted request. Its discovery and
+      # verification subqueries must use that request's configuration snapshot,
+      # not global attributes which may be half-updated by another thread.
+      @configuration_snapshot =
+        @res.respond_to?(:active_configuration_snapshot) ? @res.active_configuration_snapshot : nil
       @registered = false
       prepare_budget if should_validate
     end
@@ -112,6 +117,7 @@ module Dnsruby
     def do_validate
       needs_validation = should_validate
       return if needs_validation && !register
+      run_validation do
       validated_ok = if needs_validation
         SelectThread::TransmissionBudget.with(@transmission_budget) do
           ValidationBudget.with(@budget) { validate(@query, @response, @res) }
@@ -128,6 +134,7 @@ module Dnsruby
       cache_if_valid(@query, @response) if validated_ok
       @st.push_validation_response_to_select(@client_id, @client_queue, @response,
         validated_ok ? nil : @response.security_error, @query, @res)
+      end
     rescue StandardError => error
       # Resolver observers ignore late completions; direct PacketSender callers
       # still need a terminal error after cancellation or their sender closing.
@@ -138,6 +145,19 @@ module Dnsruby
     ensure
       unregister
     end
+
+    # Keep every validation query on the owning request's snapshot, including
+    # work moved onto a worker thread whose thread-local context would otherwise
+    # be empty. No snapshot means a direct PacketSender caller; behavior is
+    # unchanged for those callers.
+    def run_validation
+      if @configuration_snapshot
+        Dnsruby::Resolver::ConfigurationSnapshotContext.with(@configuration_snapshot) { yield }
+      else
+        yield
+      end
+    end
+    private :run_validation
 
     def finish_error(error)
       @response.security_error = error

@@ -121,6 +121,17 @@ inside labels distinct from the dots that separate labels.
 
 ### More reliable queries and transfers
 
+* Each Resolver now publishes an immutable configuration snapshot
+  (`Resolver#current_configuration`) when nameserver, retry/timeout or
+  validation settings change. A query captures the snapshot admitted at entry
+  and keeps its nameservers, retry plan, `query_timeout` and `do_validation`
+  policy for its whole lifetime; settings changed while it is in flight apply
+  only to later queries. UDP-to-TCP fallback, EDNS negotiation and DNSSEC
+  validation subqueries inherit the owning request's snapshot and cannot read a
+  half-updated global configuration. Snapshots contain plain values only (no
+  sockets, mutexes or TSIG/SSL objects), invalid setters no longer publish and
+  leave the previous configuration intact, and `publish_configuration!` exposes
+  an explicit publication/inspection point.
 * TCP pipelining handles concurrent sends, immediate replies, partial writes
   and disconnected servers. Connection setup, writes and waiting for a pipeline
   slot all respect the controlling query's deadline and cancellation. Malformed

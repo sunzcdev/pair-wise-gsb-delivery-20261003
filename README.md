@@ -258,6 +258,30 @@ Each send attempt uses one snapshot of its transport configuration; subsequent
 attempts can use newer settings. Adding an explicit source port replaces the
 default `[0]` pool (random source ports). A pool cannot mix zero and explicit ports.
 
+### Configuration snapshots
+
+A Resolver publishes an immutable configuration snapshot (`resolver.current_configuration`)
+every time a nameserver, retry/timeout or validation setting changes. A query
+captures the snapshot published when it is admitted and keeps that exact
+configuration for its whole lifetime. Replacing `nameserver`, `retry_times`,
+`retry_delay`, `query_timeout`, `do_validation` or any transport setting while a
+request is in flight therefore cannot change the nameservers it still contacts,
+its retry plan or its validation policy; only queries admitted afterwards use
+the new settings. UDP-to-TCP fallback, EDNS negotiation and DNSSEC validation
+subqueries inherit the owning request's snapshot through a request-scoped
+thread context, so they never observe a half-updated global configuration.
+
+Snapshots hold plain values only — strings, numbers, booleans, arrays and hashes
+for the nameservers, TSIG policy (name/key/algorithm), timeouts, retry and
+validation flags. Open sockets, mutexes, `PacketSender` and TSIG/SSL objects are
+never part of a snapshot, so `current_configuration.to_h` remains safe to inspect
+or serialize; the live senders needed to dispatch an admitted query are tracked
+separately and stay open only until that query finishes. Invalid arguments (for
+example an empty source-port pool or a non-positive `tcp_idle_timeout`) are
+rejected before publication and leave both the live attributes and the previous
+snapshot intact. Use `resolver.publish_configuration!` to explicitly complete a
+pending nameserver publication (or re-raise the error which prevented it).
+
 For each question, Dnsruby makes at most **three attempts per server address per
 transport**, including retries without optional EDNS support. UDP and TCP have
 separate limits. Setting `retry_times` above three is still accepted, but does
