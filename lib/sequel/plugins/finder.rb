@@ -139,7 +139,12 @@ module Sequel
               else
                 model_name = model_name.gsub(/\W/, '_')
               end
-              ds.prepare(type, :"#{model_name}_#{meth_name}")
+              # A prepared finder is identified by name, but the underlying
+              # dataset can change (e.g. Model.set_dataset), producing a
+              # different preparation identity.  Explicitly replace the
+              # statement with the current declaration instead of reusing the
+              # stale one.
+              ds.prepare(type, :"#{model_name}_#{meth_name}", :replace=>true)
             end
           else
             proc do |model|

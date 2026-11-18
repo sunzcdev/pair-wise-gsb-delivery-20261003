@@ -1139,3 +1139,15 @@ describe "Oracle support" do
     proc{@db.transaction{@db.transaction(:savepoint=>true){}}}.must_raise Sequel::InvalidOperation
   end
 end
+
+describe "Prepared statement structure invalidation capability" do
+  it "should be reported as supported on postgres" do
+    Sequel.mock(:host=>'postgres').prepared_statement_schema_invalidation_supported?.must_equal true
+  end
+
+  it "should be reported as unsupported on generic backends" do
+    Sequel.mock.prepared_statement_schema_invalidation_supported?.must_equal false
+    Sequel.mock(:host=>'mysql').prepared_statement_schema_invalidation_supported?.must_equal false
+    Sequel.mock(:host=>'sqlite').prepared_statement_schema_invalidation_supported?.must_equal false
+  end
+end

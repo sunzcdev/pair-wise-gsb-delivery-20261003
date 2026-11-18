@@ -13,8 +13,8 @@ module Sequel
     DEFAULT_PREPARED_STATEMENT_MODULE_METHODS = %w'execute execute_dui execute_insert'.freeze.each(&:freeze)
     PREPARED_STATEMENT_MODULE_CODE = {
       :bind => "opts = Hash[opts]; opts[:arguments] = bind_arguments".freeze,
-      :prepare => "sql = prepared_statement_name".freeze,
-      :prepare_bind => "sql = prepared_statement_name; opts = Hash[opts]; opts[:arguments] = bind_arguments".freeze
+      :prepare => "sql = prepared_statement_name; opts = Hash[opts]; opts[:prepared_statement] = self".freeze,
+      :prepare_bind => "sql = prepared_statement_name; opts = Hash[opts]; opts[:arguments] = bind_arguments; opts[:prepared_statement] = self".freeze
     }.freeze
 
     def self.prepared_statements_module(code, mods, meths=DEFAULT_PREPARED_STATEMENT_MODULE_METHODS, &block)
@@ -119,6 +119,26 @@ module Sequel
         @opts[:prepared_modify_values]
       end
 
+      # The explicit preparation identity of the prepared statement.  Two
+      # prepared statements with the same contract are interchangeable: they
+      # have the same SQL text, the same ordered list of bind variable
+      # placeholders (which determines the bind types/positions), and the same
+      # statement type.  A reused name with a different contract is not
+      # compatible and must not silently run the old statement.
+      def prepared_statement_contract
+        [prepared_sql, prepared_args.dup, prepared_type].freeze
+      end
+
+      # The structure version of the database (see
+      # Database#prepared_statement_schema_version) at the time the statement
+      # was prepared.  Adapters with native prepared statement support compare
+      # this against the database's current version to decide whether a
+      # connection's server side statement must be re-prepared after a
+      # structural change.
+      def prepared_statement_schema_version
+        @opts[:prepared_statement_schema_version]
+      end
+
       # Sets the prepared_args to the given hash and runs the
       # prepared statement.
       def call(bind_vars=OPTS, &block)
@@ -218,7 +238,7 @@ module Sequel
       end
       
       private
-      
+
       # If the prepared_sql_type does not match the prepared statement, return a clone that
       # with the prepared SQL, to ensure the prepared_sql_type is respected.
       def force_prepared_sql
@@ -227,6 +247,12 @@ module Sequel
         else
           self
         end
+      end
+
+      # Record the database structure version the statement was prepared
+      # against, returning a clone of the statement carrying the version.
+      def set_prepared_statement_schema_version(version)
+        clone(:prepared_statement_schema_version=>version)
       end
       
       # Returns the value of the prepared_args hash for the given key.
@@ -405,7 +431,31 @@ module Sequel
     #   ps.call(i: 1, n: 'Blah')
     #   # UPDATE table WHERE id = ? SET name = ? -- (1, 'Blah')
     #   # => 1
+    #
+    # The prepared statement is registered under +name+ with an explicit
+    # preparation identity (its SQL text, ordered bind variable placeholders,
+    # and statement type).  If the name is already registered for a statement
+    # with a different identity, a Sequel::PreparedStatementMismatch is raised
+    # instead of silently executing the old statement.  To deliberately replace
+    # the existing statement, pass <tt>:replace=>true</tt> as the last
+    # argument:
+    #
+    #   DB[:table].prepare(:select, :by_name, :replace=>true)
+    #
+    # Re-preparing with the same name and an identical identity keeps the
+    # already registered statement.
     def prepare(type, name, *values)
+      if values.last.is_a?(Hash) && values.last.key?(:replace)
+        options = values.last.dup
+        replace = options.delete(:replace)
+        # Keep the remaining entries (if any) as the insert/update values,
+        # since the options hash can double as the values hash.
+        values[-1] = options unless options.empty?
+        values.pop if options.empty?
+      else
+        replace = false
+      end
+
       ps = to_prepared_statement(type, values, :name=>name, :extend=>prepared_statement_modules, :no_delayed_evaluations=>true)
 
       ps = if ps.send(:emulate_prepared_statements?)
@@ -417,8 +467,11 @@ module Sequel
         ps.clone(:prepared_sql=>sql, :sql=>sql)
       end
 
-      db.set_prepared_statement(name, ps)
-      ps
+      ps = ps.send(:set_prepared_statement_schema_version, db.prepared_statement_schema_version)
+      # set_prepared_statement returns the already registered statement when
+      # the preparation identity is identical, so re-preparing with the same
+      # name and contract is idempotent.
+      db.set_prepared_statement(name, ps, :replace=>replace)
     end
     
     # Set the type of SQL to use for prepared statements based on this

@@ -185,19 +185,19 @@ describe "Prepared Statements and Bound Arguments" do
   it "should support prepared statements when selecting" do
     @ds.filter(:numb=>:$n).prepare(:each, :select_n)
     @db.call(:select_n, :n=>10){|h| h.must_equal(:id=>1, :numb=>10)}
-    @ds.filter(:numb=>:$n).prepare(:select, :select_n)
+    @ds.filter(:numb=>:$n).prepare(:select, :select_n, :replace=>true)
     @db.call(:select_n, :n=>10).must_equal [{:id=>1, :numb=>10}]
-    @ds.filter(:numb=>:$n).prepare(:all, :select_n)
+    @ds.filter(:numb=>:$n).prepare(:all, :select_n, :replace=>true)
     @db.call(:select_n, :n=>10).must_equal [{:id=>1, :numb=>10}]
-    @ds.filter(:numb=>:$n).prepare(:first, :select_n)
+    @ds.filter(:numb=>:$n).prepare(:first, :select_n, :replace=>true)
     @db.call(:select_n, :n=>10).must_equal(:id=>1, :numb=>10)
-    @ds.select(:numb).filter(:numb=>:$n).prepare(:single_value, :select_n)
+    @ds.select(:numb).filter(:numb=>:$n).prepare(:single_value, :select_n, :replace=>true)
     @db.call(:select_n, :n=>10).must_equal(10)
-    @ds.filter(:numb=>:$n).prepare([:map, :numb], :select_n)
+    @ds.filter(:numb=>:$n).prepare([:map, :numb], :select_n, :replace=>true)
     @db.call(:select_n, :n=>10).must_equal [10]
-    @ds.filter(:numb=>:$n).prepare([:as_hash, :id, :numb], :select_n)
+    @ds.filter(:numb=>:$n).prepare([:as_hash, :id, :numb], :select_n, :replace=>true)
     @db.call(:select_n, :n=>10).must_equal(1=>10)
-    @ds.filter(:numb=>:$n).prepare([:to_hash, :id, :numb], :select_n)
+    @ds.filter(:numb=>:$n).prepare([:to_hash, :id, :numb], :select_n, :replace=>true)
     @db.call(:select_n, :n=>10).must_equal(1=>10)
   end
 
@@ -206,11 +206,11 @@ describe "Prepared Statements and Bound Arguments" do
     @ds.filter(:numb=>:$n).prepare(:each, :select_n).call(:n=>10){|r| r[:numb] *= 2; a << r}; a.must_equal [{:id=>1, :numb=>20}]
     a = []
     @db.call(:select_n, :n=>10){|r| r[:numb] *= 2; a << r}; a.must_equal [{:id=>1, :numb=>20}]
-    @ds.filter(:numb=>:$n).prepare(:select, :select_n).call(:n=>10){|r| r[:numb] *= 2}.must_equal [{:id=>1, :numb=>20}]
+    @ds.filter(:numb=>:$n).prepare(:select, :select_n, :replace=>true).call(:n=>10){|r| r[:numb] *= 2}.must_equal [{:id=>1, :numb=>20}]
     @db.call(:select_n, :n=>10){|r| r[:numb] *= 2}.must_equal [{:id=>1, :numb=>20}]
-    @ds.filter(:numb=>:$n).prepare(:all, :select_n).call(:n=>10){|r| r[:numb] *= 2}.must_equal [{:id=>1, :numb=>20}]
+    @ds.filter(:numb=>:$n).prepare(:all, :select_n, :replace=>true).call(:n=>10){|r| r[:numb] *= 2}.must_equal [{:id=>1, :numb=>20}]
     @db.call(:select_n, :n=>10){|r| r[:numb] *= 2}.must_equal [{:id=>1, :numb=>20}]
-    @ds.filter(:numb=>:$n).prepare([:map], :select_n).call(:n=>10){|r| r[:numb] *= 2}.must_equal [20]
+    @ds.filter(:numb=>:$n).prepare([:map], :select_n, :replace=>true).call(:n=>10){|r| r[:numb] *= 2}.must_equal [20]
     @db.call(:select_n, :n=>10){|r| r[:numb] *= 2}.must_equal [20]
   end
     
@@ -229,7 +229,7 @@ describe "Prepared Statements and Bound Arguments" do
     @ds.filter(Sequel.lit("numb = :n", :n=>:$n)).prepare(:select, :seq_select).call(:n=>10).must_equal [{:id=>1, :numb=>10}]
     @ds.insert(:numb=>20)
     @ds.insert(:numb=>30)
-    @ds.filter(Sequel.lit("numb > :n1 AND numb < :n2 AND numb = :n3", :n3=>:$n3, :n2=>:$n2, :n1=>:$n1)).prepare(:select, :seq_select).call(:n3=>20, :n2=>30, :n1=>10).must_equal [{:id=>2, :numb=>20}]
+    @ds.filter(Sequel.lit("numb > :n1 AND numb < :n2 AND numb = :n3", :n3=>:$n3, :n2=>:$n2, :n1=>:$n1)).prepare(:select, :seq_select, :replace=>true).call(:n3=>20, :n2=>30, :n1=>10).must_equal [{:id=>2, :numb=>20}]
   end
 
   it "should support prepare_sql_type for setting SQL type to use with prepare" do
@@ -240,26 +240,26 @@ describe "Prepared Statements and Bound Arguments" do
   it "should support prepare_sql_type for setting SQL type to use with call for select statements" do
     @ds.insert(:numb=>20)
     @ds.order(:numb).prepare_sql_type(:first).prepare(:select, :seq_select).call.must_equal [{:id=>1, :numb=>10}]
-    @ds.order(:numb).prepare_sql_type(:single_value).prepare(:select, :seq_select).call.must_equal [{:id=>1, :numb=>10}]
+    @ds.order(:numb).prepare_sql_type(:single_value).prepare(:select, :seq_select, :replace=>true).call.must_equal [{:id=>1, :numb=>10}]
     a = []
-    @ds.order(:numb).prepare_sql_type(:single_value).prepare(:each, :seq_select).call{|v| a << v}
+    @ds.order(:numb).prepare_sql_type(:single_value).prepare(:each, :seq_select, :replace=>true).call{|v| a << v}
     a.must_equal [{:id=>1, :numb=>10}]
-    @ds.order(:numb).prepare_sql_type(:select).prepare(:first, :seq_select).call.must_equal(:id=>1, :numb=>10)
-    @ds.order(:numb).select(:id).prepare_sql_type(:select).prepare(:single_value, :seq_select).call.must_equal(1)
+    @ds.order(:numb).prepare_sql_type(:select).prepare(:first, :seq_select, :replace=>true).call.must_equal(:id=>1, :numb=>10)
+    @ds.order(:numb).select(:id).prepare_sql_type(:select).prepare(:single_value, :seq_select, :replace=>true).call.must_equal(1)
   end
 
   it "should support prepare_sql_type for setting SQL type to use with insert statements" do
     ds = @ds.returning(:numb)
     ds.prepare_sql_type(:insert).prepare(:select, :seq_select, :numb=>:$n).call(:n=>20).must_equal [{:numb=>20}]
-    ds.prepare_sql_type(:insert).prepare(:first, :seq_select, :numb=>:$n).call(:n=>21).must_equal(:numb=>21)
-    ds.prepare_sql_type(:insert).prepare(:single_value, :seq_select, :numb=>:$n).call(:n=>22).must_equal 22
+    ds.prepare_sql_type(:insert).prepare(:first, :seq_select, :numb=>:$n, :replace=>true).call(:n=>21).must_equal(:numb=>21)
+    ds.prepare_sql_type(:insert).prepare(:single_value, :seq_select, :numb=>:$n, :replace=>true).call(:n=>22).must_equal 22
     a = []
-    ds.prepare_sql_type(:insert).prepare(:each, :seq_select, :numb=>:$n).call(:n=>23){|v| a << v}
+    ds.prepare_sql_type(:insert).prepare(:each, :seq_select, :numb=>:$n, :replace=>true).call(:n=>23){|v| a << v}
     a.must_equal [{:numb=>23}]
-    ds.prepare_sql_type(:insert).prepare([:map, :numb], :seq_select, :numb=>:$n).call(:n=>24).must_equal [24]
-    ds.prepare_sql_type(:insert).prepare([:as_hash, :numb, :numb], :seq_select, :numb=>:$n).call(:n=>25).must_equal(25=>25)
-    ds.prepare_sql_type(:insert).prepare([:to_hash, :numb, [:numb]], :seq_select, :numb=>:$n).call(:n=>26).must_equal(26=>[26])
-    ds.prepare_sql_type(:insert).prepare([:to_hash_groups, [:numb], :numb], :seq_select, :numb=>:$n).call(:n=>27).must_equal([27]=>[27])
+    ds.prepare_sql_type(:insert).prepare([:map, :numb], :seq_select, :numb=>:$n, :replace=>true).call(:n=>24).must_equal [24]
+    ds.prepare_sql_type(:insert).prepare([:as_hash, :numb, :numb], :seq_select, :numb=>:$n, :replace=>true).call(:n=>25).must_equal(25=>25)
+    ds.prepare_sql_type(:insert).prepare([:to_hash, :numb, [:numb]], :seq_select, :numb=>:$n, :replace=>true).call(:n=>26).must_equal(26=>[26])
+    ds.prepare_sql_type(:insert).prepare([:to_hash_groups, [:numb], :numb], :seq_select, :numb=>:$n, :replace=>true).call(:n=>27).must_equal([27]=>[27])
   end if DB.dataset.supports_returning?(:insert)
 
   it "should support datasets with static sql and placeholders with prepare" do
@@ -361,9 +361,9 @@ describe "Prepared Statements and Bound Arguments" do
   it "model datasets should return model instances when using select, all, and first with prepared statements" do
     @c.filter(:numb=>:$n).prepare(:select, :select_n1)
     @db.call(:select_n1, :n=>10).must_equal [@c.load(:id=>1, :numb=>10)]
-    @c.filter(:numb=>:$n).prepare(:all, :select_n1)
+    @c.filter(:numb=>:$n).prepare(:all, :select_n1, :replace=>true)
     @db.call(:select_n1, :n=>10).must_equal [@c.load(:id=>1, :numb=>10)]
-    @c.filter(:numb=>:$n).prepare(:first, :select_n1)
+    @c.filter(:numb=>:$n).prepare(:first, :select_n1, :replace=>true)
     @db.call(:select_n1, :n=>10).must_equal @c.load(:id=>1, :numb=>10)
   end
 
@@ -475,6 +475,69 @@ describe "Bound Argument Types" do
   end
 
   cspecify "should handle boolean type", [:jdbc, :sqlite], [:jdbc, :db2], :oracle do
-    @ds.filter(:b=>:$x).prepare(:first, :ps_string).call(:x=>@vs[:b])[:b].must_equal @vs[:b]
+    @ds.filter(:b=>:$x).prepare(:first, :ps_boolean).call(:x=>@vs[:b])[:b].must_equal @vs[:b]
+  end
+end
+
+describe "Prepared statement preparation identity and structure invalidation" do
+  before do
+    @db = DB
+    @db.create_table!(:id_items) do
+      primary_key :id
+      Integer :numb
+    end
+    @ds = @db[:id_items]
+    @ds.insert(:numb=>10)
+    @ds.insert(:numb=>20)
+  end
+  after do
+    @db.drop_table?(:id_items)
+  end
+
+  it "should keep the same statement object when re-preparing an identical contract" do
+    ps = @ds.filter(:numb=>:$n).prepare(:select, :identity_idem)
+    @ds.filter(:numb=>:$n).prepare(:select, :identity_idem).must_be_same_as(ps)
+  end
+
+  it "should raise when reusing a name with a different SQL contract and keep the old statement" do
+    ps = @ds.filter(:numb=>:$n).prepare(:select, :identity_conflict)
+    proc{@ds.filter(:numb=>:$other).prepare(:select, :identity_conflict)}.must_raise Sequel::PreparedStatementMismatch
+    @db.prepared_statement(:identity_conflict).must_be_same_as(ps)
+  end
+
+  it "should replace the statement when :replace is declared" do
+    old = @ds.filter(:numb=>:$n).prepare(:select, :identity_replace)
+    new = @ds.filter(:numb=>:$n).prepare(:first, :identity_replace, :replace=>true)
+    new.wont_be_same_as(old)
+    @db.prepared_statement(:identity_replace).must_be_same_as(new)
+    new.call(:n=>10).must_equal(:id=>1, :numb=>10)
+  end
+
+  it "should bump the structure version and invalidate cached statements on structural change" do
+    @ds.prepare(:select, :identity_ddl)
+    version = @db.prepared_statement_schema_version
+    @db.alter_table(:id_items){add_column :extra, String}
+    @db.prepared_statement_schema_version.must_be :>, version
+    @db.prepared_statement(:identity_ddl).must_be_nil
+    proc{@db.call(:identity_ddl)}.must_raise Sequel::Error
+  end
+
+  it "should re-prepare and execute correctly against the new structure after invalidation" do
+    ps = @ds.filter(:numb=>:$n).prepare(:select, :identity_after)
+    ps.call(:n=>20).must_equal [{:id=>2, :numb=>20}]
+    @db.alter_table(:id_items){add_column :extra, String}
+    ps2 = @ds.filter(:numb=>:$n).prepare(:select, :identity_after, :replace=>true)
+    ps2.prepared_statement_schema_version.must_equal @db.prepared_statement_schema_version
+    ps2.call(:n=>20).must_equal [{:id=>2, :numb=>20, :extra=>nil}]
+  end
+
+  it "should re-prepare a statement still held by a caller after the registry was invalidated" do
+    ps = @ds.filter(:numb=>:$n).prepare(:select, :identity_held)
+    ps.call(:n=>10)
+    @db.alter_table(:id_items){add_column :extra, String}
+    # The registry no longer holds the name, but the caller still has the
+    # statement object; executing it must re-prepare instead of failing.
+    @db.prepared_statement(:identity_held).must_be_nil
+    ps.call(:n=>10).must_equal [{:id=>1, :numb=>10, :extra=>nil}]
   end
 end

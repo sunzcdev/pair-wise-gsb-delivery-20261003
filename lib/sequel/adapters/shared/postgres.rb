@@ -885,6 +885,15 @@ module Sequel
         true
       end
 
+      # The PostgreSQL adapter tracks the database structure version and
+      # re-prepares a connection's server side prepared statement when it was
+      # prepared against an older version, so prepared statements do not keep
+      # referencing the old structure after a structural change made through
+      # this database object.
+      def prepared_statement_schema_invalidation_supported?
+        true
+      end
+
       # Array of symbols specifying table names in the current database.
       # The dataset used is yielded to the block if one is provided,
       # otherwise, an array of symbols of table names is returned.

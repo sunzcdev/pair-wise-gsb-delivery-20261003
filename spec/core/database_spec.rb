@@ -2128,6 +2128,79 @@ describe "Database#call" do
     db.call(:select_n, :n=>1).must_equal [{:id => 1, :x => 1}]
     db.sqls.must_equal ['SELECT * FROM items', 'SELECT * FROM items WHERE (n = 1)']
   end
+
+  it "should raise an Error if no prepared statement is registered with the name" do
+    db = Sequel.mock
+    proc{db.call(:missing)}.must_raise Sequel::Error
+  end
+end
+
+describe "Database prepared statement registry" do
+  before do
+    @db = Sequel.mock
+    @ds = @db[:items]
+  end
+
+  it "should start with structure version 0 and report no automatic invalidation guarantee on generic backends" do
+    @db.prepared_statement_schema_version.must_equal 0
+    @db.prepared_statement_schema_invalidation_supported?.must_equal false
+  end
+
+  it "should remove a prepared statement by name with remove_prepared_statement" do
+    ps = @ds.prepare(:select, :removable)
+    @db.remove_prepared_statement(:removable).must_be_same_as(ps)
+    @db.prepared_statement(:removable).must_be_nil
+    @db.prepared_statements.wont_include(:removable)
+    proc{@db.call(:removable)}.must_raise Sequel::Error
+    @db.remove_prepared_statement(:never_registered).must_be_nil
+  end
+
+  it "should bump the structure version and invalidate prepared statements when a table is created" do
+    @ds.prepare(:select, :before_ddl)
+    @db.prepared_statement(:before_ddl).wont_be_nil
+    version = @db.prepared_statement_schema_version
+    @db.create_table(:other){Integer :x}
+    @db.prepared_statement_schema_version.must_be :>, version
+    @db.prepared_statement(:before_ddl).must_be_nil
+  end
+
+  it "should invalidate prepared statements when a table is altered" do
+    @db.create_table(:things){Integer :a}
+    @db[:things].prepare(:select, :altered)
+    @db.alter_table(:things){add_column :b, Integer}
+    @db.prepared_statement(:altered).must_be_nil
+  end
+
+  it "should invalidate prepared statements when a table is dropped" do
+    @db.create_table(:droppable){Integer :a}
+    @db[:droppable].prepare(:select, :dropped)
+    @db.drop_table(:droppable)
+    @db.prepared_statement(:dropped).must_be_nil
+  end
+
+  it "should prepare new statements against the current structure version after invalidation" do
+    @db.create_table(:things){Integer :a}
+    version = @db.prepared_statement_schema_version
+    ps = @db[:things].prepare(:select, :fresh)
+    ps.prepared_statement_schema_version.must_equal version
+  end
+
+  it "should clear cached prepared statements on disconnect while keeping the structure version" do
+    @db.create_table(:things){Integer :a}
+    @db[:things].prepare(:select, :disc)
+    version = @db.prepared_statement_schema_version
+    @db.disconnect
+    @db.prepared_statement(:disc).must_be_nil
+    @db.prepared_statement_schema_version.must_equal version
+  end
+
+  it "should not mutate caches when invalidating on a frozen database" do
+    @db.create_table(:things){Integer :a}
+    @db[:things].prepare(:select, :frozen_ps)
+    @db.freeze
+    @db.send(:remove_cached_schema, :things)
+    @db.prepared_statement_schema_version.must_equal 1
+  end
 end
 
 describe "Database#server_opts" do

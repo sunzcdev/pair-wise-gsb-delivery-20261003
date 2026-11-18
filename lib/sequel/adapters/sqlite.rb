@@ -264,7 +264,7 @@ module Sequel
       # any SQLite3::Exceptions and turn them into DatabaseErrors.
       def _execute(type, sql, opts, &block)
         synchronize(opts[:server]) do |conn|
-          return execute_prepared_statement(conn, type, sql, opts, &block) if sql.is_a?(Symbol)
+          return execute_prepared_statement(conn, type, sql, opts, &block) if sql.is_a?(Symbol) || sql.is_a?(Sequel::Dataset)
           log_args = opts[:arguments]
           args = {}
           opts.fetch(:arguments, OPTS).each{|k, v| args[k] = prepared_statement_argument(v)}
@@ -312,22 +312,29 @@ module Sequel
       end
 
       # Execute a prepared statement on the database using the given name.
+      # If the name is no longer registered on the database (for example
+      # because the registry was invalidated by a structural change or a
+      # disconnect), the statement dataset carried in the options is used to
+      # prepare the statement again instead of failing with a missing entry.
       def execute_prepared_statement(conn, type, name, opts, &block)
-        ps = prepared_statement(name)
+        ps = resolve_prepared_statement(name, opts)
+        raise(Sequel::Error, "no prepared statement registered with name #{name.inspect}") unless ps
+        name = ps.prepared_statement_name if name.is_a?(Sequel::Dataset)
         sql = ps.prepared_sql
+        schema_version = ps.prepared_statement_schema_version
         args = opts[:arguments]
         ps_args = {}
         args.each{|k, v| ps_args[k] = prepared_statement_argument(v)}
         if cpsa = conn.prepared_statements[name]
-          cps, cps_sql = cpsa
-          if cps_sql != sql
+          cps, cps_sql, cps_version = cpsa
+          if cps_sql != sql || cps_version != schema_version
             cps.close
             cps = nil
           end
         end
         unless cps
           cps = log_connection_yield("PREPARE #{name}: #{sql}", conn){conn.prepare(sql)}
-          conn.prepared_statements[name] = [cps, sql]
+          conn.prepared_statements[name] = [cps, sql, schema_version]
         end
         log_sql = String.new
         log_sql << "EXECUTE #{name}"

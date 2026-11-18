@@ -1,5 +1,11 @@
 === master
 
+* Track an explicit preparation identity (SQL text, bind variable contract, and statement type) for named prepared statements, raising Sequel::PreparedStatementMismatch when a name is reused with a different contract, and support Dataset#prepare with :replace=>true to replace a statement by declaration (jeremyevans)
+
+* Invalidate cached prepared statements and bump a database structure version on structural changes, re-preparing native per-connection statements instead of reusing stale handles, and clear the cache on disconnect (jeremyevans)
+
+* Add Database#remove_prepared_statement, Database#prepared_statement_schema_version, and Database#prepared_statement_schema_invalidation_supported? (jeremyevans)
+
 * Avoid duplicating table when adding/dropping CHECK or NOT NULL constraints on SQLite 3.53+ (jeremyevans)
 
 * Add Database#wait_for_lsn on PostgreSQL 19+ to support WAIT FOR LSN (jeremyevans)

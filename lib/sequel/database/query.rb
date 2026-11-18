@@ -32,8 +32,15 @@ module Sequel
     #
     #   DB[:items].where(id: 1).prepare(:first, :sa)
     #   DB.call(:sa) # SELECT * FROM items WHERE id = 1
+    #
+    # Raises a Sequel::Error if no prepared statement is registered with
+    # the given name, for example because it was removed or invalidated by a
+    # structural change (or a disconnect) and not prepared again.
     def call(ps_name, hash=OPTS, &block)
-      prepared_statement(ps_name).call(hash, &block)
+      unless ps = prepared_statement(ps_name)
+        raise Error, "no prepared statement registered with name #{ps_name.inspect}; it may not have been prepared, or it may have been invalidated by a schema change or disconnect"
+      end
+      ps.call(hash, &block)
     end
     
     # Method that should be used when submitting any DDL (Data Definition
@@ -377,12 +384,19 @@ module Sequel
       (ds || dataset).method(:output_identifier)
     end
 
-    # Remove the cached schema for the given schema name
+    # Remove the cached schema for the given schema name.  Also invalidates
+    # prepared statements cached on this database, since a structural change
+    # that drops the cached schema (creating, altering, dropping, or renaming
+    # a table or view) can change the structure a prepared statement was built
+    # against.  The structure version is bumped so adapters with native
+    # prepared statement support re-prepare their server side statements on
+    # the connections instead of reusing stale handles.
     def remove_cached_schema(table)
       cache = @default_dataset.send(:cache)
       Sequel.synchronize{cache.clear}
       k = quote_schema_table(table)
       Sequel.synchronize{@schemas.delete(k)}
+      invalidate_prepared_statements
     end
     
     # Match the database's column type to a ruby type via a

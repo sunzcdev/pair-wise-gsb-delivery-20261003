@@ -4468,33 +4468,33 @@ describe "Dataset prepared statements and bound variables " do
     ds = @ds.prepare_sql_type(:update)
     ds.prepare(:select, :s, :col=>:$c).call(:c=>1).must_equal([{:id=>1}])
     @db.sqls.must_equal ["UPDATE items SET col = 1"]
-    ds.prepare(:all, :s, :col=>:$c).call(:c=>1).must_equal([{:id=>1}])
+    ds.prepare(:all, :s, :col=>:$c, :replace=>true).call(:c=>1).must_equal([{:id=>1}])
     @db.sqls.must_equal ["UPDATE items SET col = 1"]
     a  = []
-    ds.prepare(:each, :s, :col=>:$c).call(:c=>1){|v| a << v}
+    ds.prepare(:each, :s, :col=>:$c, :replace=>true).call(:c=>1){|v| a << v}
     a.must_equal([{:id=>1}])
     @db.sqls.must_equal ["UPDATE items SET col = 1"]
-    ds.prepare(:first, :s, :col=>:$c).call(:c=>1).must_equal(:id=>1)
+    ds.prepare(:first, :s, :col=>:$c, :replace=>true).call(:c=>1).must_equal(:id=>1)
     @db.sqls.must_equal ["UPDATE items SET col = 1"]
-    ds.prepare(:single_value, :s, :col=>:$c).call(:c=>1).must_equal(1)
+    ds.prepare(:single_value, :s, :col=>:$c, :replace=>true).call(:c=>1).must_equal(1)
     @db.sqls.must_equal ["UPDATE items SET col = 1"]
-    ds.prepare(:insert, :s, :col=>:$c).call(:c=>1).must_equal(3)
+    ds.prepare(:insert, :s, :col=>:$c, :replace=>true).call(:c=>1).must_equal(3)
     @db.sqls.must_equal ["UPDATE items SET col = 1"]
-    ds.prepare(:insert_pk, :s, :col=>:$c).call(:c=>1).must_equal(1)
+    ds.prepare(:insert_pk, :s, :col=>:$c, :replace=>true).call(:c=>1).must_equal(1)
     @db.sqls.must_equal ["UPDATE items SET col = 1"]
-    ds.prepare(:insert_select, :s, :col=>:$c).call(:c=>1).must_equal({:id=>1})
+    ds.prepare(:insert_select, :s, :col=>:$c, :replace=>true).call(:c=>1).must_equal({:id=>1})
     @db.sqls.must_equal ["UPDATE items SET col = 1"]
-    ds.prepare(:update, :s, :col=>:$c).call(:c=>1).must_equal(2)
+    ds.prepare(:update, :s, :col=>:$c, :replace=>true).call(:c=>1).must_equal(2)
     @db.sqls.must_equal ["UPDATE items SET col = 1"]
-    ds.prepare(:delete, :s, :col=>:$c).call(:c=>1).must_equal(2)
+    ds.prepare(:delete, :s, :col=>:$c, :replace=>true).call(:c=>1).must_equal(2)
     @db.sqls.must_equal ["UPDATE items SET col = 1"]
-    ds.prepare([:map, :id], :s, :col=>:$c).call(:c=>1).must_equal([1])
+    ds.prepare([:map, :id], :s, :col=>:$c, :replace=>true).call(:c=>1).must_equal([1])
     @db.sqls.must_equal ["UPDATE items SET col = 1"]
-    ds.prepare([:as_hash, :id, :id], :s, :col=>:$c).call(:c=>1).must_equal(1=>1)
+    ds.prepare([:as_hash, :id, :id], :s, :col=>:$c, :replace=>true).call(:c=>1).must_equal(1=>1)
     @db.sqls.must_equal ["UPDATE items SET col = 1"]
-    ds.prepare([:to_hash, :id, [:id]], :s, :col=>:$c).call(:c=>1).must_equal(1=>[1])
+    ds.prepare([:to_hash, :id, [:id]], :s, :col=>:$c, :replace=>true).call(:c=>1).must_equal(1=>[1])
     @db.sqls.must_equal ["UPDATE items SET col = 1"]
-    ds.prepare([:to_hash_groups, :id, :id], :s, :col=>:$c).call(:c=>1).must_equal(1=>[1])
+    ds.prepare([:to_hash_groups, :id, :id], :s, :col=>:$c, :replace=>true).call(:c=>1).must_equal(1=>[1])
     @db.sqls.must_equal ["UPDATE items SET col = 1"]
   end
 
@@ -4520,6 +4520,60 @@ describe "Dataset prepared statements and bound variables " do
   it "PreparedStatement#prepare should raise an error" do
     ps = @ds.prepare(:select, :select_n)
     proc{ps.prepare(:select, :select_n2)}.must_raise Sequel::Error
+  end
+
+  it "should expose an explicit preparation identity (contract) covering SQL text, bind placeholders, and type" do
+    ps = @ds.filter(:num=>:$n).prepare(:select, :contract)
+    ps.prepared_statement_contract.must_equal [ps.prepared_sql, [:n], :select]
+    ps.prepared_statement_contract.frozen?.must_equal true
+
+    different_sql = @ds.filter(:num=>:$n, :other=>:$o).prepare(:select, :other_contract)
+    different_sql.prepared_statement_contract.wont_equal ps.prepared_statement_contract
+
+    different_type = @ds.filter(:num=>:$n).prepare(:first, :type_contract)
+    different_type.prepared_statement_contract.wont_equal ps.prepared_statement_contract
+  end
+
+  it "should be idempotent when re-preparing with the same name and an identical contract" do
+    ps = @ds.filter(:num=>:$n).prepare(:select, :idem)
+    again = @ds.filter(:num=>:$n).prepare(:select, :idem)
+    again.must_be_same_as(ps)
+    @db.prepared_statement(:idem).must_be_same_as(ps)
+  end
+
+  it "should raise PreparedStatementMismatch when reusing a name with a different statement type" do
+    @ds.filter(:num=>:$n).prepare(:select, :reuse)
+    proc{@ds.filter(:num=>:$n).prepare(:first, :reuse)}.must_raise Sequel::PreparedStatementMismatch
+    # The old statement must still be registered and executable.
+    @db.prepared_statement(:reuse).prepared_type.must_equal :select
+  end
+
+  it "should raise PreparedStatementMismatch when reusing a name with different SQL" do
+    @ds.filter(:num=>:$n).prepare(:select, :reuse_sql)
+    proc{@ds.filter(:num=>:$other).prepare(:select, :reuse_sql)}.must_raise Sequel::PreparedStatementMismatch
+  end
+
+  it "should raise PreparedStatementMismatch when reusing a name with a different bind variable contract" do
+    @ds.filter(:num=>:$n).prepare(:select, :reuse_bind)
+    proc{@ds.filter(:num=>:$n, :other=>:$o).prepare(:select, :reuse_bind)}.must_raise Sequel::PreparedStatementMismatch
+  end
+
+  it "should replace the existing statement when :replace=>true is given with a different contract" do
+    old = @ds.filter(:num=>:$n).prepare(:select, :replacable)
+    new = @ds.filter(:num=>:$n).prepare(:first, :replacable, :replace=>true)
+    new.prepared_type.must_equal :first
+    @db.prepared_statement(:replacable).must_be_same_as(new)
+    @db.prepared_statement(:replacable).wont_be_same_as(old)
+  end
+
+  it "should keep the existing statement when :replace=>true is given with an identical contract" do
+    old = @ds.filter(:num=>:$n).prepare(:select, :replacable_idem)
+    again = @ds.filter(:num=>:$n).prepare(:select, :replacable_idem, :replace=>true)
+    again.must_be_same_as(old)
+  end
+
+  it "should record the database structure version the statement was prepared against" do
+    @ds.prepare(:select, :versioned).prepared_statement_schema_version.must_equal @db.prepared_statement_schema_version
   end
 
   it "PreparedStatement#prepare should not raise an error if preparing prepared statements is allowed" do
@@ -4591,7 +4645,7 @@ describe "Dataset prepared statements and bound variables " do
 
   it "should support log_sql option" do
     @ds.prepare(:select, :foo).log_sql.must_be_nil
-    @ds.clone(:log_sql=>true).prepare(:select, :foo).log_sql.must_equal true
+    @ds.clone(:log_sql=>true).prepare(:select, :foo_logged).log_sql.must_equal true
   end
 end
 
@@ -4638,7 +4692,7 @@ describe Sequel::Dataset::UnnumberedArgumentMapper do
   end
 
   it "should raise Error for unrecognized statement types" do
-    ps = @ds.prepare(:select_all, :s)
+    ps = @ds.prepare(:select_all, :s, :replace=>true)
     ps = ps.with_extend(Sequel::Dataset::UnnumberedArgumentMapper)
     sql = ps.prepared_sql
     ps.prepared_sql.must_be_same_as(sql)

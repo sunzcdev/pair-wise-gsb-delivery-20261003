@@ -450,8 +450,9 @@ module Sequel
           ps = name
           name = ps.prepared_statement_name
         else
-          ps = prepared_statement(name)
+          ps = resolve_prepared_statement(name, opts)
         end
+        raise(Sequel::Error, "no prepared statement registered with name #{name.inspect}") unless ps
         sql = ps.prepared_sql
         synchronize(opts[:server]) do |conn|
           if name and cps = cps_sync(conn){|cpsh| cpsh[name]} and cps[0] == sql

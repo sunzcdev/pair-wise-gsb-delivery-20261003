@@ -81,7 +81,8 @@ module Sequel
       if USES_PG
         # Hash of prepared statements for this connection.  Keys are
         # string names of the server side prepared statement, and values
-        # are SQL strings.
+        # are two element arrays with the SQL string and the database
+        # structure version the statement was prepared against.
         attr_reader :prepared_statements
 
       # simplecov:disable
@@ -530,7 +531,7 @@ module Sequel
 
       # Execute the given SQL string or prepared statement on the connection object.
       def _execute(conn, sql, opts, &block)
-        if sql.is_a?(Symbol)
+        if sql.is_a?(Symbol) || sql.is_a?(Dataset)
           execute_prepared_statement(conn, sql, opts, &block)
         else
           conn.execute(sql, opts[:arguments], &block)
@@ -603,23 +604,31 @@ module Sequel
       # Execute the prepared statement with the given name on an available
       # connection, using the given args.  If the connection has not prepared
       # a statement with the given name yet, prepare it.  If the connection
-      # has prepared a statement with the same name and different SQL,
-      # deallocate that statement first and then prepare this statement.
+      # has prepared a statement with the same name and different SQL, or the
+      # statement was prepared against an older database structure version
+      # (because the structure changed after it was prepared), deallocate
+      # that statement first and then prepare this statement.  If the name is
+      # no longer registered on the database (the registry was invalidated by
+      # a structural change or disconnect), the statement dataset carried in
+      # the options is used to prepare it again instead of failing.
       # If a block is given, yield the result, otherwise, return the number
       # of rows changed.
       def execute_prepared_statement(conn, name, opts=OPTS, &block)
-        ps = prepared_statement(name)
+        ps = resolve_prepared_statement(name, opts)
+        raise(Sequel::Error, "no prepared statement registered with name #{name.inspect}") unless ps
+        name = ps.prepared_statement_name if name.is_a?(Dataset)
         sql = ps.prepared_sql
         ps_name = name.to_s
+        schema_version = ps.prepared_statement_schema_version
 
         if args = opts[:arguments]
           args = args.map{|arg| bound_variable_arg(arg, conn)}
         end
 
-        unless conn.prepared_statements[ps_name] == sql
+        unless (cached = conn.prepared_statements[ps_name]) && cached[0] == sql && cached[1] == schema_version
           conn.execute("DEALLOCATE #{ps_name}") if conn.prepared_statements.include?(ps_name)
           conn.check_disconnect_errors{log_connection_yield("PREPARE #{ps_name} AS #{sql}", conn){conn.prepare(ps_name, sql)}}
-          conn.prepared_statements[ps_name] = sql
+          conn.prepared_statements[ps_name] = [sql, schema_version]
         end
 
         log_sql = "EXECUTE #{ps_name}"

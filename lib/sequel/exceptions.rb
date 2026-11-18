@@ -94,6 +94,14 @@ module Sequel
   ).name
 
   (
+  # Error raised when a prepared statement name is reused for a statement
+  # with a different preparation identity (different SQL text, bind variable
+  # contract, or statement type).  The existing statement is not silently
+  # reused; it must be explicitly replaced or removed first.
+  PreparedStatementMismatch = Class.new(Error)
+  ).name
+
+  (
   # Error raised when attempting an invalid type conversion.
   InvalidValue = Class.new(Error)
   ).name

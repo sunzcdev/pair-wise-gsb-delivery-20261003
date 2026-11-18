@@ -197,11 +197,21 @@ module Sequel
     #
     # Example:
     #
-    #   DB.disconnect # All servers
     #   DB.disconnect(server: :server1) # Single server
     #   DB.disconnect(server: [:server1, :server2]) # Multiple servers
-    def disconnect(opts = OPTS)
-      pool.disconnect(opts)
+    #
+    # Cached prepared statements are discarded when disconnecting, since the
+    # underlying server side statement handles are tied to the connections
+    # being closed.  After reconnecting, the statements are prepared again on
+    # the new connections when they are next called, instead of attempting to
+    # reuse handles that no longer exist.
+    def disconnect(opts = Sequel::OPTS)
+      retval = pool.disconnect(opts)
+      Sequel.synchronize do
+        prepared_statements.clear
+        @prepared_statement_contracts.clear
+      end
+      retval
     end
 
     # Should only be called by the connection pool code to disconnect a connection.

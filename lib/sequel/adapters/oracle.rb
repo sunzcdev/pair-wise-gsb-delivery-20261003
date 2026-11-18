@@ -83,7 +83,7 @@ module Sequel
       def _execute(type, sql, opts=OPTS, &block)
         synchronize(opts[:server]) do |conn|
           begin
-            return execute_prepared_statement(conn, type, sql, opts, &block) if sql.is_a?(Symbol)
+            return execute_prepared_statement(conn, type, sql, opts, &block) if sql.is_a?(Symbol) || sql.is_a?(Sequel::Dataset)
             if args = opts[:arguments]
               r = conn.parse(sql)
               args = cursor_bind_params(conn, r, args)
@@ -171,8 +171,10 @@ module Sequel
       end
 
       def execute_prepared_statement(conn, type, name, opts)
-        ps = prepared_statement(name)
+        ps = resolve_prepared_statement(name, opts)
+        raise(Sequel::Error, "no prepared statement registered with name #{name.inspect}") unless ps
         sql = ps.prepared_sql
+        name = ps.prepared_statement_name if name.is_a?(Sequel::Dataset)
         if cursora = conn.prepared_statements[name]
           cursor, cursor_sql = cursora
           if cursor_sql != sql

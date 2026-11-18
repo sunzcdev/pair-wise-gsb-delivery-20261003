@@ -85,6 +85,71 @@ and update queries, the hash to insert/update is passed to +prepare+:
   ps2.call(n: 'Jim', new_n: 'Bob')
   DB.call(:update_name, n: 'Jim', new_n: 'Bob') # same
 
+== Preparation Identity and Name Reuse
+
+A prepared statement name alone does not make two statements compatible.
+Sequel gives every prepared statement an explicit preparation identity
+(its contract), which is the combination of:
+
+* the prepared SQL text,
+* the ordered list of bind variable placeholders (which fixes the bind
+  types and positions), and
+* the statement type (e.g. <tt>:select</tt>, <tt>:first</tt>, <tt>:insert</tt>).
+
+If you prepare a statement with a name that is already registered for a
+statement with a different contract, Sequel raises
+<tt>Sequel::PreparedStatementMismatch</tt> instead of silently keeping and
+executing the old statement:
+
+  DB[:items].where(id: :$id).prepare(:select, :by_id)
+  DB[:items].where(name: :$name).prepare(:select, :by_id)
+  # => raises Sequel::PreparedStatementMismatch
+
+Re-preparing with the same name and an identical contract is idempotent and
+returns the already registered statement.  To deliberately replace an
+existing statement, declare it explicitly with <tt>:replace=>true</tt>:
+
+  DB[:items].where(name: :$name).prepare(:select, :by_id, replace: true)
+
+You can also remove a registered statement explicitly with
+<tt>Database#remove_prepared_statement</tt>.
+
+The unnamed (bound variable) style, <tt>Dataset#call</tt>, is unaffected by
+these rules, since it does not register a reusable named statement.
+
+== Structural Changes and Invalidation
+
+Sequel keeps a structure version for the database.  Every structural change
+made through the database object (creating, altering, dropping, or renaming
+a table or view) bumps the version and invalidates the cached named
+prepared statements, because they may reference the old structure:
+
+  ps = DB[:items].prepare(:select, :all_items)
+  DB.alter_table(:items) { add_column :extra, String }
+  DB.prepared_statement(:all_items) # => nil
+
+Each prepared statement records the structure version it was prepared
+against (<tt>prepared_statement_schema_version</tt>).  On adapters with
+native, per-connection prepared statements (such as PostgreSQL and SQLite),
+a connection compares that version with the database's current version and
+re-prepares the statement on its next use, so a stale server side handle is
+never executed.  Prepared statement handles are cached per connection, so
+other connections in the pool cannot reuse a handle that belongs to a
+rebuilt connection.
+
+Disconnecting also discards the cached prepared statements; after a
+reconnect the statements are prepared again on the new connections when
+they are next called.
+
+Sequel can only observe structural changes made through the same database
+object.  Changes made directly on the database server (or through another
+connection or database object) cannot be detected generically.  Use
+<tt>Database#prepared_statement_schema_invalidation_supported?</tt> to check
+what the adapter guarantees: it is +true+ on adapters that track the
+structure themselves (such as PostgreSQL), and +false+ otherwise, in which
+case Sequel does not pretend that external changes are automatically
+detected.
+
 == Implementation Issues
 
 Currently, creating a prepared statement uses Object#extend, which can hurt

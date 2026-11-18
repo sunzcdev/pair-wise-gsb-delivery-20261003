@@ -168,6 +168,15 @@ module Sequel
 
       @schemas = {}
       @prepared_statements = {}
+      # Contracts (prepared statement identities) keyed by name, used to
+      # detect attempts to reuse a prepared statement name with an
+      # incompatible SQL text, bind variable contract, or statement type.
+      @prepared_statement_contracts = {}
+      # Monotonically increasing version of the database's structure as
+      # observable through Sequel's schema methods.  Every structural
+      # change made through this Database object bumps the version, and
+      # prepared statements are invalidated when it changes.
+      @prepared_statement_schema_version = 0
       @transactions = {}
       @transactions.compare_by_identity if typecast_value_boolean(@opts.fetch(:compare_connections_by_identity, true))
       @symbol_literal_cache = {}
@@ -317,6 +326,41 @@ module Sequel
       Sequel.synchronize{prepared_statements[name]}
     end
 
+    # The structure version against which the currently cached prepared
+    # statements were prepared.  This is bumped whenever the database
+    # structure is changed through this object (e.g. via #create_table or
+    # #alter_table), which also invalidates the cached prepared statements.
+    # Prepared statements record the version they were prepared with, so
+    # adapters with native prepared statement support can tell that a
+    # connection's server side statement is stale and re-prepare it.
+    attr_reader :prepared_statement_schema_version
+
+    # Whether prepared statements cached by this database are automatically
+    # invalidated and re-prepared when the database structure changes.
+    # By default, this is false, because Sequel cannot observe structural
+    # changes made directly on the database server (or through another
+    # connection/database object); only structural changes made through this
+    # object can be tracked.  Adapters that can detect server side structural
+    # changes themselves should override this to return true.
+    #
+    # When this is false and the structure changes outside of Sequel's
+    # knowledge, prepared statements may reference the old structure and the
+    # database server may raise an error when they are called.
+    def prepared_statement_schema_invalidation_supported?
+      false
+    end
+
+    # Remove the prepared statement with the given name from the cache, so
+    # that a later call with the same name does not use the old statement.
+    # Returns the removed prepared statement, or nil if none was stored with
+    # that name.
+    def remove_prepared_statement(name)
+      Sequel.synchronize do
+        @prepared_statement_contracts.delete(name)
+        prepared_statements.delete(name)
+      end
+    end
+
     # Proxy the quote_identifier method to the dataset,
     # useful for quoting unqualified identifiers for use
     # outside of datasets.
@@ -328,15 +372,45 @@ module Sequel
     def schema_type_class(type)
       @schema_type_classes[type]
     end
-    
+
     # Default serial primary key options, used by the table creation code.
     def serial_primary_key_options
       {:primary_key => true, :type => Integer, :auto_increment => true}
     end
 
     # Cache the prepared statement object at the given name.
-    def set_prepared_statement(name, ps)
-      Sequel.synchronize{prepared_statements[name] = ps}
+    #
+    # The prepared statement's contract (its SQL text, ordered bind variable
+    # placeholders, and statement type) is stored alongside the statement as
+    # its explicit preparation identity.  If a statement with the same name is
+    # already cached with a different contract, a Sequel::PreparedStatementMismatch
+    # is raised instead of silently keeping the old statement, unless
+    # <tt>:replace</tt> is given, in which case the old statement is replaced
+    # by the new one.  Re-preparing with an identical contract is a no-op that
+    # keeps the existing statement.
+    def set_prepared_statement(name, ps, opts=Sequel::OPTS)
+      contract = ps.prepared_statement_contract
+      replace = opts[:replace]
+
+      Sequel.synchronize do
+        if existing_contract = @prepared_statement_contracts[name]
+          if existing_contract != contract
+            unless replace
+              raise PreparedStatementMismatch,
+                "prepared statement #{name.inspect} is already registered with a different SQL text, bind variable contract, or statement type; use Dataset#prepare with :replace=>true to replace it, or Database#remove_prepared_statement to remove it first"
+            end
+          else
+            # Identical preparation identity: keep the existing statement and
+            # do not reset the recorded schema version.
+            return prepared_statements[name]
+          end
+        end
+
+        @prepared_statement_contracts[name] = contract.freeze
+        prepared_statements[name] = ps
+      end
+
+      ps
     end
 
     # Whether this database instance uses multiple servers, either for sharding
@@ -385,9 +459,46 @@ module Sequel
     end
     
     private
-    
+
     # Per adapter initialization method, empty by default.
     def adapter_initialize
+    end
+
+    # Bump the structure version and invalidate all prepared statements cached
+    # on this database, because a structural change (DDL) was made through this
+    # database object.  Statements remain prepared on individual connections
+    # until those connections are used again, at which point adapters compare
+    # the connection's prepared version with the current version and
+    # re-prepare the statement.  Other connections in the pool are not touched
+    # and cannot mistake the stale server side handle for a current one.
+    def invalidate_prepared_statements
+      # A frozen database cannot have its caches mutated (this can happen when
+      # DDL is still issued through a frozen database); the per-connection SQL
+      # checks in the adapters still protect against stale handles.
+      return if frozen?
+
+      Sequel.synchronize do
+        @prepared_statement_schema_version += 1
+        prepared_statements.clear
+        @prepared_statement_contracts.clear
+      end
+    end
+
+    # Resolve the prepared statement to execute from the +sql+ and +opts+
+    # passed to an adapter's execute method.  Adapters receive either the
+    # registered statement name (a Symbol) or the prepared statement dataset
+    # itself.  When a name is given but no statement is currently registered
+    # (for example because the registry was invalidated by a structural change
+    # or a disconnect while a model still holds the prepared statement
+    # object), the dataset carried in the options is used so the statement is
+    # prepared again instead of raising a NoMethodError.  Returns the prepared
+    # statement dataset, or nil if none can be resolved.
+    def resolve_prepared_statement(sql, opts=Sequel::OPTS)
+      if sql.is_a?(Dataset)
+        sql
+      else
+        prepared_statement(sql) || opts[:prepared_statement]
+      end
     end
 
     # Returns true when the object is considered blank.

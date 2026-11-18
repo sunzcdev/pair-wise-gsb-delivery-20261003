@@ -13,7 +13,9 @@ module Sequel
         # execute the query with the arguments.
         def execute_prepared_statement(ps_name, opts, &block)
           args = opts[:arguments]
-          ps = prepared_statement(ps_name)
+          ps = resolve_prepared_statement(ps_name, opts)
+          raise(Sequel::Error, "no prepared statement registered with name #{ps_name.inspect}") unless ps
+          ps_name = ps.prepared_statement_name if ps_name.is_a?(Sequel::Dataset)
           sql = ps.prepared_sql
           synchronize(opts[:server]) do |conn|
             unless conn.prepared_statements[ps_name] == sql

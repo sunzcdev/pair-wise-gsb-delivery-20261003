@@ -207,7 +207,7 @@ module Sequel
       end
 
       def execute(sql, opts=OPTS, &block)
-        if sql.is_a?(Symbol)
+        if sql.is_a?(Symbol) || sql.is_a?(Sequel::Dataset)
           execute_prepared_statement(sql, opts, &block)
         else
           synchronize(opts[:server]){|c| _execute(c, sql, opts, &block)}
@@ -218,7 +218,7 @@ module Sequel
 
       def execute_insert(sql, opts=OPTS)
         synchronize(opts[:server]) do |c|
-          if sql.is_a?(Symbol)
+          if sql.is_a?(Symbol) || sql.is_a?(Sequel::Dataset)
             execute_prepared_statement(sql, opts)
           else
             _execute(c, sql, opts)
@@ -232,7 +232,9 @@ module Sequel
       # Execute a prepared statement named by name on the database.
       def execute_prepared_statement(ps_name, opts)
         args = opts[:arguments]
-        ps = prepared_statement(ps_name)
+        ps = resolve_prepared_statement(ps_name, opts)
+        raise(Sequel::Error, "no prepared statement registered with name #{ps_name.inspect}") unless ps
+        ps_name = ps.prepared_statement_name if ps_name.is_a?(Sequel::Dataset)
         sql = ps.prepared_sql
         synchronize(opts[:server]) do |conn|
           unless conn.prepared_statements.fetch(ps_name, []).first == sql
