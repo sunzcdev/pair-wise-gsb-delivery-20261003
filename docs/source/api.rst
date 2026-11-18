@@ -27,6 +27,17 @@ Configuration
    :members:
 
 
+Extended CONNECT (RFC 8441)
+---------------------------
+
+.. autoclass:: h2.connect.ExtendedConnectState
+   :members:
+   :undoc-members:
+
+.. autoclass:: h2.connect.ExtendedConnectHelper
+   :members:
+
+
 .. _h2-events-api:
 
 Events

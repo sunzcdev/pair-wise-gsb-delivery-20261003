@@ -94,7 +94,7 @@ def _secure_headers(headers: Iterable[Header],
             yield header
 
 
-def extract_method_header(headers: Iterable[Header]) -> bytes | None:
+def extract_method_header(headers: Iterable[HeaderWeaklyTyped]) -> bytes | None:
     """
     Extracts the request method from the headers list.
     """

@@ -11,6 +11,17 @@ dev
 **API Changes (Backward Compatible)**
 
 - Support for Python 3.15 has been added.
+- Added an explicit extended CONNECT (RFC 8441) handshake helper,
+  ``h2.connect.ExtendedConnectHelper``. It tracks whether an extended CONNECT
+  stream can be initiated (capability negotiation plus the correct
+  ``:protocol`` pseudo-header combination), whether a response accepted the
+  tunnel, and independently records which endpoint has finished sending or
+  reset the stream. It consumes real h2 events and never performs WebSocket
+  framing or bypasses header validation.
+- ``H2Connection.send_headers`` now refuses to open an extended CONNECT
+  request (a ``CONNECT`` carrying ``:protocol``) unless the remote peer
+  advertised ``SETTINGS_ENABLE_CONNECT_PROTOCOL = 1``, per RFC 8441 §3.
+  Ordinary CONNECT requests are unaffected.
 
 **Bugfixes**
 

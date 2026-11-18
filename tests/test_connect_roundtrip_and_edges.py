@@ -2,14 +2,13 @@
 
 from __future__ import annotations
 
-
 import pytest
 
 from h2.config import H2Configuration
 from h2.connection import H2Connection
 from h2.events import RequestReceived
+from h2.settings import SettingCodes
 from h2.utilities import HeaderValidationFlags, validate_outbound_headers
-
 
 
 def _new_conn(client_side: bool) -> H2Connection:
@@ -31,6 +30,11 @@ def _xfer_once(a: H2Connection, b: H2Connection):
 def _shake(client: H2Connection, server: H2Connection) -> None:
     client.initiate_connection()
     server.initiate_connection()
+    # Advertise the extended CONNECT capability from the server side so that
+    # extended CONNECT requests in these tests are legal (RFC 8441 s3).
+    server.update_settings({SettingCodes.ENABLE_CONNECT_PROTOCOL: 1})
+    _xfer_once(server, client)
+    _xfer_once(client, server)
     _xfer_once(client, server)
     _xfer_once(server, client)
 

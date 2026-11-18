@@ -30,6 +30,7 @@ from hyperframe.frame import (
 )
 
 from .config import H2Configuration
+from .connect import ExtendedConnectHelper
 from .errors import ErrorCodes, _error_code_from_int
 from .events import (
     AlternativeServiceAvailable,
@@ -684,6 +685,25 @@ class H2Connection:
 
         return next_stream_id
 
+    def _guard_extended_connect_capability(self, headers: Iterable[HeaderWeaklyTyped]) -> None:
+        """
+        Refuse to *open* a stream with an extended CONNECT request when the
+        remote peer did not negotiate ``SETTINGS_ENABLE_CONNECT_PROTOCOL``.
+
+        Only a brand-new outbound request is inspected: trailers and
+        non-CONNECT traffic are unaffected, and an ordinary CONNECT (one
+        without ``:protocol``) is never blocked by this rule. Header validity
+        itself remains the responsibility of the regular validation pipeline.
+        """
+        if not ExtendedConnectHelper.is_extended_connect_request(headers):
+            return
+        if self.remote_settings.get(SettingCodes.ENABLE_CONNECT_PROTOCOL, 0) != 1:
+            msg = (
+                "Cannot send an extended CONNECT request: the remote peer did "
+                "not advertise SETTINGS_ENABLE_CONNECT_PROTOCOL = 1."
+            )
+            raise ProtocolError(msg)
+
     def send_headers(self,
                      stream_id: int,
                      headers: Iterable[HeaderWeaklyTyped],
@@ -791,6 +811,13 @@ class H2Connection:
         self.config.logger.debug(
             "Send headers on stream ID %d", stream_id,
         )
+
+        # RFC 8441 s3/s5: an extended CONNECT (a CONNECT carrying the
+        # :protocol pseudo-header) may only be sent by a client when the
+        # remote server advertised SETTINGS_ENABLE_CONNECT_PROTOCOL = 1.
+        # Ordinary CONNECT requests are intentionally left untouched.
+        if self.config.client_side and stream_id not in self.streams:
+            self._guard_extended_connect_capability(headers)
 
         # Check we can open the stream.
         if stream_id not in self.streams:

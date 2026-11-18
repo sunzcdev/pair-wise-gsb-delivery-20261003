@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import pytest
+from hyperframe.frame import SettingsFrame
 
 from h2.config import H2Configuration
 from h2.connection import H2Connection
+from h2.settings import SettingCodes
 from h2.utilities import HeaderValidationFlags, validate_outbound_headers
 
 
@@ -16,6 +18,13 @@ def _new_conn() -> H2Connection:
     c.initiate_connection()
     # settings ack frame: length=0, type=4, flags=1(ACK), stream=0
     c.receive_data(b"\x00\x00\x00\x04\x01\x00\x00\x00\x00")
+    # Negotiate the extended CONNECT capability (RFC 8441 s3) so that the
+    # extended CONNECT send_headers call below is permitted.
+    settings_frame = SettingsFrame(0)
+    settings_frame.settings = {SettingCodes.ENABLE_CONNECT_PROTOCOL: 1}
+    c.receive_data(settings_frame.serialize())
+    c.data_to_send()  # consume the automatic SETTINGS acknowledgement
+    assert c.remote_settings.enable_connect_protocol == 1
     return c
 
 
