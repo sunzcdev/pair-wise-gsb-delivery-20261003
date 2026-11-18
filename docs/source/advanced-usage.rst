@@ -323,3 +323,62 @@ a certain number of bytes have been freed up.
 
 For most applications, this method should be preferred to the manual flow
 control mechanism.
+
+Draining a connection after GOAWAY
+-----------------------------------
+
+When the remote peer sends a GOAWAY frame, RFC 7540 requires that no new
+streams are created on the connection, while streams that were already in
+flight are allowed to finish. The application is also responsible for
+deciding what to do with requests whose fate is unclear: h2 never retries a
+request on its own.
+
+The :attr:`H2Connection.goaway_drain_view
+<h2.connection.H2Connection.goaway_drain_view>` attribute exposes an
+inspectable, live :class:`~h2.events.GoAwayDrainView` for exactly this
+purpose. Before any GOAWAY frame has been received the view is empty; once a
+GOAWAY frame arrives, every stream known to the connection is classified
+relative to the GOAWAY ``last_stream_id``, the stream direction and the
+response state observed so far:
+
+* :data:`~h2.events.GoAwayStreamState.RESUBMITTABLE` streams are outbound
+  streams whose identifier is strictly greater than the GOAWAY
+  ``last_stream_id``. The remote peer explicitly signalled that it did not
+  process them, so their requests may safely be re-submitted, typically on a
+  brand new connection.
+* :data:`~h2.events.GoAwayStreamState.PROCESSED` streams are known to have
+  been dealt with: a final response has been received, the remote peer sent
+  a RST_STREAM frame, or the stream is inbound and therefore cannot be
+  re-submitted by this endpoint.
+* :data:`~h2.events.GoAwayStreamState.UNKNOWN` streams are outbound streams
+  at or below ``last_stream_id`` for which no final response has been seen.
+  It is impossible to tell whether the remote peer processed them, so they
+  must not be blindly re-submitted.
+
+The classification is deliberately *not* based solely on whether a stream
+is currently closed. A stream can be closed locally (for example because we
+sent a RST_STREAM) while still being resubmittable or unknown.
+
+A peer is allowed to send several GOAWAY frames while shutting down, each
+potentially carrying a smaller ``last_stream_id`` as in-flight streams
+complete. The view always uses the smallest value received and updates live:
+a stream that was previously unknown can become resubmittable, but h2 never
+silently marks an unknown stream as processed. Frames belonging to
+pre-existing streams continue to be processed normally after the GOAWAY, so
+the view also reflects responses that arrive during the drain.
+
+A typical client-side drain looks like this::
+
+    view = connection.goaway_drain_view
+    for stream_id in view.resubmittable_streams:
+        # The peer never saw this request: replay it on a fresh connection.
+        resubmit(request_for(stream_id))
+
+    for stream_id in view.unknown_streams:
+        # The peer may have processed this request. Use an idempotency key,
+        # a status check, or application-specific logic rather than blindly
+        # replaying the request.
+        handle_ambiguous(request_for(stream_id))
+
+    # Processed streams need no action; keep reading data until the
+    # connection actually closes so their outstanding frames are handled.

@@ -84,6 +84,31 @@ Events
    :members:
 
 
+GOAWAY Drain View
+-----------------
+
+When the remote peer sends a GOAWAY frame, applications need to know which
+of their in-flight requests may never have been processed. The
+:attr:`~h2.connection.H2Connection.goaway_drain_view` property on
+:class:`H2Connection <h2.connection.H2Connection>` provides an inspectable,
+live view that classifies every known stream. h2 itself never retries a
+request: the view only reports what can safely be concluded from the GOAWAY
+``last_stream_id``, the stream direction and the response state observed so
+far.
+
+.. autoclass:: h2.events.GoAwayDrainView
+   :members:
+
+.. autoclass:: h2.events.GoAwayStreamEntry
+   :members:
+
+.. autoclass:: h2.events.GoAwayStreamState
+   :members:
+
+.. autoclass:: h2.events.StreamDirection
+   :members:
+
+
 Exceptions
 ----------
 

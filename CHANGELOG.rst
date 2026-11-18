@@ -11,6 +11,16 @@ dev
 **API Changes (Backward Compatible)**
 
 - Support for Python 3.15 has been added.
+- Added ``H2Connection.goaway_drain_view``, an inspectable live view that
+  classifies every known stream after a GOAWAY frame is received as
+  resubmittable, processed, or unknown. The classification is based on the
+  smallest GOAWAY ``last_stream_id`` seen, the stream direction, and whether a
+  final response has been observed; it is not based solely on whether a stream
+  is closed, and h2 does not retry requests automatically.
+- After a GOAWAY frame is received, existing in-flight streams may now finish
+  draining: frames that complete those streams (including HEADERS, DATA,
+  RST_STREAM and WINDOW_UPDATE) remain allowed, while opening or pushing new
+  streams is still rejected.
 
 **Bugfixes**
 

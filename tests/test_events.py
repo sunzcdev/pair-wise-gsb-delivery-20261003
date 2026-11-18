@@ -369,6 +369,9 @@ class TestEventReprs:
 def all_events():
     """
     Generates all the classes (i.e., events) defined in h2.events.
+
+    Non-event public types (enums and the GOAWAY drain view helpers) also
+    live in h2.events, so only actual Event subclasses are yielded.
     """
     for _, obj in inspect.getmembers(sys.modules["h2.events"]):
 
@@ -377,7 +380,7 @@ def all_events():
         if hasattr(obj, "__module__") and (obj.__module__ != "h2.events"):
             continue
 
-        if inspect.isclass(obj):
+        if inspect.isclass(obj) and issubclass(obj, h2.events.Event):
             yield obj
 
 

@@ -7,6 +7,7 @@ An implementation of a HTTP/2 connection.
 from __future__ import annotations
 
 import base64
+from dataclasses import dataclass
 from enum import Enum, IntEnum
 from typing import TYPE_CHECKING, Any
 
@@ -35,6 +36,9 @@ from .events import (
     AlternativeServiceAvailable,
     ConnectionTerminated,
     Event,
+    GoAwayDrainView,
+    GoAwayStreamEntry,
+    GoAwayStreamState,
     InformationalResponseReceived,
     PingAckReceived,
     PingReceived,
@@ -43,6 +47,7 @@ from .events import (
     RequestReceived,
     ResponseReceived,
     SettingsAcknowledged,
+    StreamDirection,
     TrailersReceived,
     UnknownFrameReceived,
     WindowUpdated,
@@ -106,6 +111,23 @@ class ConnectionInputs(Enum):
 class AllowedStreamIDs(IntEnum):
     EVEN = 0
     ODD = 1
+
+
+@dataclass
+class _DrainStreamRecord:
+    """
+    Internal per-stream bookkeeping used to construct the GOAWAY drain
+    view. Unlike :class:`h2.events.GoAwayStreamEntry`, this record is not part
+    of the public API and is not classified against any GOAWAY frame: the
+    classification is recomputed whenever the view is inspected.
+    """
+
+    stream_id: int
+    outbound: bool
+    response_received: bool = False
+    reset_by_local: bool = False
+    reset_by_remote: bool = False
+    closed: bool = False
 
 
 class H2ConnectionStateMachine:
@@ -240,10 +262,41 @@ class H2ConnectionStateMachine:
             ConnectionInputs.RECV_ALTERNATIVE_SERVICE):
                 (None, ConnectionState.SERVER_OPEN),
 
-        # State: closed
+        # State: closed.
+        #
+        # RFC 7540 section 6.8: after sending or receiving a GOAWAY frame the
+        # connection is closed, but streams with identifiers at or below the
+        # GOAWAY last_stream_id that were already in flight can still be
+        # drained. We therefore keep accepting the frames needed to finish
+        # those streams (their own stream state machines still reject
+        # anything invalid), while refusing to open or push new streams.
         (ConnectionState.CLOSED, ConnectionInputs.SEND_GOAWAY):
             (None, ConnectionState.CLOSED),
         (ConnectionState.CLOSED, ConnectionInputs.RECV_GOAWAY):
+            (None, ConnectionState.CLOSED),
+        (ConnectionState.CLOSED, ConnectionInputs.SEND_RST_STREAM):
+            (None, ConnectionState.CLOSED),
+        (ConnectionState.CLOSED, ConnectionInputs.SEND_WINDOW_UPDATE):
+            (None, ConnectionState.CLOSED),
+        (ConnectionState.CLOSED, ConnectionInputs.SEND_PING):
+            (None, ConnectionState.CLOSED),
+        (ConnectionState.CLOSED, ConnectionInputs.SEND_SETTINGS):
+            (None, ConnectionState.CLOSED),
+        (ConnectionState.CLOSED, ConnectionInputs.SEND_PRIORITY):
+            (None, ConnectionState.CLOSED),
+        (ConnectionState.CLOSED, ConnectionInputs.RECV_HEADERS):
+            (None, ConnectionState.CLOSED),
+        (ConnectionState.CLOSED, ConnectionInputs.RECV_DATA):
+            (None, ConnectionState.CLOSED),
+        (ConnectionState.CLOSED, ConnectionInputs.RECV_WINDOW_UPDATE):
+            (None, ConnectionState.CLOSED),
+        (ConnectionState.CLOSED, ConnectionInputs.RECV_RST_STREAM):
+            (None, ConnectionState.CLOSED),
+        (ConnectionState.CLOSED, ConnectionInputs.RECV_PRIORITY):
+            (None, ConnectionState.CLOSED),
+        (ConnectionState.CLOSED, ConnectionInputs.RECV_SETTINGS):
+            (None, ConnectionState.CLOSED),
+        (ConnectionState.CLOSED, ConnectionInputs.RECV_PING):
             (None, ConnectionState.CLOSED),
     }
 
@@ -322,6 +375,11 @@ class H2Connection:
     # Keep in memory limited amount of results for streams closes
     MAX_CLOSED_STREAMS = 2**16
 
+    # Keep in memory limited amount of per-stream bookkeeping used to build
+    # the GOAWAY drain view. This deliberately mirrors MAX_CLOSED_STREAMS so
+    # that the view keeps as much history as the rest of the connection.
+    MAX_DRAIN_STREAMS = 2**16
+
     def __init__(self, config: H2Configuration | None = None) -> None:
         self.state_machine = H2ConnectionStateMachine()
         self.streams: dict[int, H2Stream] = {}
@@ -396,6 +454,27 @@ class H2Connection:
             size_limit=self.MAX_CLOSED_STREAMS,
         )
 
+        # The smallest last_stream_id received in any GOAWAY frame, or None
+        # if no GOAWAY frame has been received yet. RFC 7540 section 6.8
+        # allows multiple GOAWAY frames with progressively smaller values, so
+        # the minimum (not the most recent) value is the authoritative
+        # boundary for deciding what the remote peer may not have processed.
+        self._remote_goaway_last_stream_id: int | None = None
+
+        # Per-stream bookkeeping for the GOAWAY drain view. The records live
+        # for the lifetime of the stream and are retained, with a bounded
+        # size, after the stream object itself is cleaned up, so that the
+        # drain view can still classify completed streams.
+        self._drain_stream_records: dict[int, _DrainStreamRecord] = SizeLimitDict(
+            size_limit=self.MAX_DRAIN_STREAMS,
+        )
+
+        # The inspectable GOAWAY drain view handed to users.
+        self._goaway_drain_view = GoAwayDrainView(
+            last_stream_id_getter=lambda: self._remote_goaway_last_stream_id,
+            entries_getter=self._build_goaway_drain_entries,
+        )
+
         # The flow control window manager for the connection.
         self._inbound_flow_control_window_manager = WindowManager(
             max_window_size=self.local_settings.initial_window_size,
@@ -441,6 +520,7 @@ class H2Connection:
         for stream_id in to_delete:
             stream = self.streams.pop(stream_id)
             self._closed_streams[stream_id] = stream.closed_by
+            self._record_stream_cleanup(stream_id, stream)
 
         return count
 
@@ -507,6 +587,13 @@ class H2Connection:
 
         self.streams[stream_id] = s
         self.config.logger.debug("Current streams: %s", self.streams.keys())
+
+        # Record the stream for the GOAWAY drain view. A fresh stream cannot
+        # have received a response or been reset yet.
+        self._drain_stream_records[stream_id] = _DrainStreamRecord(
+            stream_id=stream_id,
+            outbound=outbound,
+        )
 
         if outbound:
             self.highest_outbound_stream_id = stream_id
@@ -683,6 +770,41 @@ class H2Connection:
             raise NoAvailableStreamIDError(msg)
 
         return next_stream_id
+
+    @property
+    def goaway_drain_view(self) -> GoAwayDrainView:
+        """
+        An inspectable, live view of how the streams on this connection are
+        affected by GOAWAY frames received from the remote peer.
+
+        Before any GOAWAY frame has been received the view is empty. Once a
+        GOAWAY frame arrives, each stream known to this connection is
+        classified, using the smallest ``last_stream_id`` received so far,
+        the stream direction and the response state observed so far, as:
+
+        * :data:`GoAwayStreamState.RESUBMITTABLE
+          <h2.events.GoAwayStreamState.RESUBMITTABLE>`: an outbound stream
+          whose ID is greater than the GOAWAY ``last_stream_id``, so the
+          remote peer signalled it was never processed and the request may be
+          re-submitted by the application;
+        * :data:`GoAwayStreamState.PROCESSED
+          <h2.events.GoAwayStreamState.PROCESSED>`: a stream known to have
+          been dealt with (a final response received, a reset, or an inbound
+          stream);
+        * :data:`GoAwayStreamState.UNKNOWN
+          <h2.events.GoAwayStreamState.UNKNOWN>`: an outbound stream at or
+          below ``last_stream_id`` with no final response, whose fate cannot
+          be determined.
+
+        The classification is not based solely on whether a stream is closed,
+        and h2 never retries requests automatically. The view updates live
+        when further GOAWAY frames (including ones with a smaller
+        ``last_stream_id``) arrive or existing streams finish receiving
+        their outstanding frames.
+
+        .. versionadded:: 4.5.0
+        """
+        return self._goaway_drain_view
 
     def send_headers(self,
                      stream_id: int,
@@ -1074,6 +1196,7 @@ class H2Connection:
         stream = self._get_stream_by_id(stream_id)
         frames = stream.reset_stream(error_code)
         self._prepare_for_sending(frames)
+        self._record_stream_reset(stream_id, by_remote=False)
 
     def close_connection(self,
                          error_code: ErrorCodes | int = 0,
@@ -1596,6 +1719,20 @@ class H2Connection:
         """
         Receive a headers frame on the connection.
         """
+        # If the connection is already closed by a GOAWAY frame, only
+        # streams that already exist may finish draining. A HEADERS frame on
+        # an unknown stream would implicitly open a brand new inbound stream,
+        # which RFC 7540 section 6.8 forbids once a GOAWAY has been received.
+        if (
+            self.state_machine.state == ConnectionState.CLOSED
+            and frame.stream_id not in self.streams
+        ):
+            msg = (
+                "Cannot open new stream ID "
+                f"{frame.stream_id} after GOAWAY was received"
+            )
+            raise ProtocolError(msg)
+
         # If necessary, check we can open the stream. Also validate that the
         # stream ID is valid.
         if frame.stream_id not in self.streams:
@@ -1621,6 +1758,13 @@ class H2Connection:
             "END_STREAM" in frame.flags,
             self.config.header_encoding,
         )
+
+        # A final (non-informational) response header block is evidence that
+        # the remote peer has processed an outbound request. Informational
+        # responses do not count: the stream state machine leaves
+        # headers_received unset until the final response arrives.
+        if stream.final_response_received:
+            self._record_response_received(frame.stream_id)
 
         if "PRIORITY" in frame.flags:
             p_frames, p_events = self._receive_priority_frame(frame)
@@ -1862,6 +2006,7 @@ class H2Connection:
             stream_events: list[Event] = []
         else:
             stream_frames, stream_events = stream.stream_reset(frame)
+            self._record_stream_reset(frame.stream_id, by_remote=True)
 
         return stream_frames, events + stream_events
 
@@ -1897,6 +2042,19 @@ class H2Connection:
         events = self.state_machine.process_input(
             ConnectionInputs.RECV_GOAWAY,
         )
+
+        # Multiple GOAWAY frames are permitted (RFC 7540 section 6.8). A
+        # later frame may carry a smaller last_stream_id as in-flight streams
+        # finish draining. Keep the smallest value seen, since that is the
+        # authoritative boundary for what the remote peer may not have
+        # processed.
+        if self._remote_goaway_last_stream_id is None:
+            self._remote_goaway_last_stream_id = frame.last_stream_id
+        else:
+            self._remote_goaway_last_stream_id = min(
+                self._remote_goaway_last_stream_id,
+                frame.last_stream_id,
+            )
 
         # Clear the outbound data buffer: we cannot send further data now.
         self.clear_outbound_data_buffer()
@@ -2018,6 +2176,130 @@ class H2Connection:
         (one initiated by this peer), returns ``False`` otherwise.
         """
         return (stream_id % 2 == int(self.config.client_side))
+
+    def _record_response_received(self, stream_id: int) -> None:
+        """
+        Record that a final (non-informational) response header block has
+        been received on the given stream.
+        """
+        record = self._drain_stream_records.get(stream_id)
+        if record is not None:
+            record.response_received = True
+
+    def _record_stream_reset(self, stream_id: int, *, by_remote: bool) -> None:
+        """
+        Record that the given stream has been reset.
+
+        A RST_STREAM sent by the remote peer is evidence that the remote peer
+        reached and handled the stream. A locally initiated reset provides no
+        such evidence: the local endpoint gave up before any response arrived.
+        """
+        record = self._drain_stream_records.get(stream_id)
+        if record is None:
+            return
+        if by_remote:
+            record.reset_by_remote = True
+        else:
+            record.reset_by_local = True
+        record.closed = True
+
+    def _record_stream_cleanup(self, stream_id: int, stream: H2Stream) -> None:
+        """
+        Fold the live state of a stream object that is being removed from
+        ``self.streams`` into its drain record, so that the GOAWAY drain view
+        keeps working after the stream object itself is gone.
+        """
+        record = self._drain_stream_records.get(stream_id)
+        if record is None:
+            return
+
+        if stream.final_response_received:
+            record.response_received = True
+        if stream.closed_by == StreamClosedBy.SEND_RST_STREAM:
+            record.reset_by_local = True
+        elif stream.closed_by == StreamClosedBy.RECV_RST_STREAM:
+            record.reset_by_remote = True
+        # This helper only runs when the stream is being removed for being
+        # closed, so the retained record is marked closed unconditionally.
+        record.closed = True
+
+    def _classify_drain_stream(
+        self,
+        record: _DrainStreamRecord,
+        last_stream_id: int,
+    ) -> GoAwayStreamState:
+        """
+        Classify a single stream record against the smallest GOAWAY
+        last_stream_id received so far.
+
+        The decision deliberately does not depend on whether the stream is
+        currently closed. Inbound streams cannot be re-submitted by this
+        endpoint at all. For outbound streams, concrete evidence that the
+        remote peer handled the stream (a final response or a reset) takes
+        precedence: RFC 7540 section 6.8 notes that re-submitting an
+        already-completed request is pointless. Only streams without such
+        evidence are compared against the GOAWAY boundary: IDs strictly
+        greater than last_stream_id were not processed and may be
+        re-submitted, while the rest remain unknown.
+        """
+        if not record.outbound:
+            return GoAwayStreamState.PROCESSED
+
+        # Evidence that the remote peer itself reached the stream: a final
+        # response or a RST_STREAM sent by the remote peer. A locally
+        # initiated reset does not prove the remote peer processed anything.
+        if record.response_received or record.reset_by_remote:
+            return GoAwayStreamState.PROCESSED
+
+        if record.stream_id > last_stream_id:
+            return GoAwayStreamState.RESUBMITTABLE
+
+        return GoAwayStreamState.UNKNOWN
+
+    def _build_goaway_drain_entries(self) -> dict[int, GoAwayStreamEntry]:
+        """
+        Build the current, fully classified drain entries from the live
+        stream objects and the retained per-stream records.
+
+        Entries are returned in a plain dict keyed by stream ID so that
+        :class:`GoAwayDrainView` can offer both ordering (via ``sorted``)
+        and direct lookup.
+        """
+        last_stream_id = self._remote_goaway_last_stream_id
+        if last_stream_id is None:
+            return {}
+
+        # Fold in the up-to-date state of any streams still resident. Live
+        # streams take precedence over the retained record because their
+        # state (response received, closed) can have advanced since the last
+        # cleanup.
+        for stream_id, stream in self.streams.items():
+            record = self._drain_stream_records.get(stream_id)
+            if record is None:
+                continue
+            if stream.final_response_received:
+                record.response_received = True
+            if stream.closed_by == StreamClosedBy.SEND_RST_STREAM:
+                record.reset_by_local = True
+            elif stream.closed_by == StreamClosedBy.RECV_RST_STREAM:
+                record.reset_by_remote = True
+            record.closed = stream.closed
+
+        entries: dict[int, GoAwayStreamEntry] = {}
+        for stream_id in sorted(self._drain_stream_records):
+            record = self._drain_stream_records[stream_id]
+            entries[stream_id] = GoAwayStreamEntry(
+                stream_id=stream_id,
+                direction=(
+                    StreamDirection.OUTBOUND if record.outbound
+                    else StreamDirection.INBOUND
+                ),
+                state=self._classify_drain_stream(record, last_stream_id),
+                response_received=record.response_received,
+                closed=record.closed,
+            )
+
+        return entries
 
     def _stream_closed_by(self, stream_id: int) -> StreamClosedBy | None:
         """

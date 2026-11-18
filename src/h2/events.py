@@ -12,11 +12,14 @@ from __future__ import annotations
 
 import binascii
 from dataclasses import dataclass
+from enum import Enum
 from typing import TYPE_CHECKING, Any
 
 from .settings import ChangedSetting, SettingCodes, Settings, _setting_code_from_int
 
 if TYPE_CHECKING:  # pragma: no cover
+    from collections.abc import Callable, Iterator, Mapping
+
     from hpack.struct import Header
     from hyperframe.frame import Frame
 
@@ -590,6 +593,245 @@ class ConnectionTerminated(Event):
                     self.additional_data[:20]
                     if self.additional_data else None),
             )
+        )
+
+
+class StreamDirection(Enum):
+    """
+    Indicates which endpoint initiated a stream, relative to the local
+    connection object.
+
+    .. versionadded:: 4.5.0
+    """
+
+    OUTBOUND = "outbound"
+    """
+    The stream was initiated by the local endpoint. On a client connection
+    these are request streams (odd stream IDs); on a server connection these
+    are pushed streams (even stream IDs).
+    """
+
+    INBOUND = "inbound"
+    """
+    The stream was initiated by the remote peer.
+    """
+
+
+class GoAwayStreamState(Enum):
+    """
+    The drainage classification of a stream once a GOAWAY frame has been
+    received.
+
+    The classification is computed live from the smallest
+    ``last_stream_id`` received in any GOAWAY frame so far, the direction of
+    the stream, and the response state observed so far. It deliberately does
+    *not* depend only on whether the stream is currently closed, and h2 never
+    retries or re-submits requests on the application's behalf.
+
+    .. versionadded:: 4.5.0
+    """
+
+    RESUBMITTABLE = "resubmittable"
+    """
+    An outbound stream whose identifier is strictly greater than the
+    ``last_stream_id`` of the most recently received GOAWAY frame. The remote
+    peer explicitly signalled that it did not process this stream, so the
+    request may safely be re-submitted (for example, on a new connection) by
+    the application.
+    """
+
+    PROCESSED = "processed"
+    """
+    A stream that is known to have been dealt with by the remote peer, or
+    that otherwise does not require re-submission:
+
+    * an outbound stream at or below ``last_stream_id`` on which a final
+      (non-informational) response has already been received;
+    * an outbound stream that the remote peer reset with a RST_STREAM frame,
+      which proves the remote peer reached it;
+    * an inbound stream, which the local endpoint did not initiate and which
+      therefore cannot be re-submitted.
+
+    A RST_STREAM sent by the local endpoint is not evidence of remote
+    processing, so such a stream is classified using the normal
+    ``last_stream_id`` boundary instead.
+    """
+
+    UNKNOWN = "unknown"
+    """
+    An outbound stream at or below ``last_stream_id`` for which no final
+    response has been received and that the remote peer has not reset. The
+    remote peer may or may not have processed the request, so it must not be
+    blindly re-submitted. Receiving a further GOAWAY frame with a smaller
+    ``last_stream_id`` can move such a stream to :data:`RESUBMITTABLE`, but a
+    stream that is still unknown is never marked as processed solely because
+    of a new GOAWAY frame.
+    """
+
+
+@dataclass(frozen=True, **kw_only)
+class GoAwayStreamEntry:
+    """
+    A single stream in the :class:`GoAwayDrainView`, describing what the
+    application can conclude about the stream after a GOAWAY frame has been
+    received.
+
+    .. versionadded:: 4.5.0
+    """
+
+    stream_id: int
+    """The identifier of the stream."""
+
+    direction: StreamDirection
+    """Whether the stream was initiated locally or by the remote peer."""
+
+    state: GoAwayStreamState
+    """
+    The drainage classification of the stream relative to the smallest
+    GOAWAY ``last_stream_id`` received so far.
+    """
+
+    response_received: bool
+    """
+    Whether a final (non-informational) response header block has been
+    received on this stream. Informational (1xx) responses alone leave this
+    set to ``False``.
+    """
+
+    closed: bool
+    """
+    Whether the stream has reached the CLOSED state. Note that this is
+    informational only: the drainage :attr:`state` is not derived from this
+    field, and a closed outbound stream without a response can still be
+    :data:`GoAwayStreamState.RESUBMITTABLE`.
+    """
+
+    def __repr__(self) -> str:
+        return (
+            f"<GoAwayStreamEntry stream_id:{self.stream_id}, "
+            f"direction:{self.direction.value}, state:{self.state.value}, "
+            f"response_received:{self.response_received}, "
+            f"closed:{self.closed}>"
+        )
+
+
+class GoAwayDrainView:
+    """
+    An inspectable, live view of how the streams on this connection are
+    affected by a GOAWAY frame received from the remote peer.
+
+    The view is obtained from
+    :attr:`H2Connection.goaway_drain_view
+    <h2.connection.H2Connection.goaway_drain_view>`. Before any GOAWAY frame
+    has been received, :attr:`received` is ``False`` and the view contains no
+    entries. Once at least one GOAWAY frame has been received, every stream
+    known to this connection is classified using the smallest
+    ``last_stream_id`` received so far, the stream direction, and whether a
+    final response has been observed.
+
+    The view reflects further GOAWAY frames (including ones carrying a
+    smaller ``last_stream_id``) and frames that finish off existing streams
+    automatically: it never caches a stale classification, never assumes an
+    unknown stream succeeded, and never re-submits or retries a request
+    itself.
+
+    .. versionadded:: 4.5.0
+    """
+
+    def __init__(
+        self,
+        *,
+        last_stream_id_getter: Callable[[], int | None],
+        entries_getter: Callable[[], Mapping[int, GoAwayStreamEntry]],
+    ) -> None:
+        self._last_stream_id_getter = last_stream_id_getter
+        self._entries_getter = entries_getter
+
+    @property
+    def received(self) -> bool:
+        """
+        Whether at least one GOAWAY frame has been received from the remote
+        peer on this connection.
+        """
+        return self._last_stream_id_getter() is not None
+
+    @property
+    def last_stream_id(self) -> int | None:
+        """
+        The smallest ``last_stream_id`` advertised in any GOAWAY frame
+        received so far, or ``None`` if no GOAWAY frame has been received.
+
+        RFC 7540 allows a peer to send multiple GOAWAY frames while shutting
+        down, each potentially carrying a smaller ``last_stream_id`` as
+        in-flight streams complete. The smallest value is the authoritative
+        boundary for deciding which requests may never have been processed.
+        """
+        return self._last_stream_id_getter()
+
+    def entries(self) -> tuple[GoAwayStreamEntry, ...]:
+        """
+        Return all classified streams, ordered by stream ID.
+
+        :rtype: ``tuple`` of :class:`GoAwayStreamEntry`
+        """
+        return tuple(self._entries_getter().values())
+
+    def streams(self, state: GoAwayStreamState) -> tuple[int, ...]:
+        """
+        Return the IDs of the streams currently in the given
+        :class:`GoAwayStreamState`, ordered by stream ID.
+        """
+        return tuple(
+            entry.stream_id
+            for entry in self.entries()
+            if entry.state == state
+        )
+
+    @property
+    def resubmittable_streams(self) -> tuple[int, ...]:
+        """
+        Stream IDs that the remote peer signalled it did not process and that
+        the application may therefore re-submit (typically on a new
+        connection).
+        """
+        return self.streams(GoAwayStreamState.RESUBMITTABLE)
+
+    @property
+    def processed_streams(self) -> tuple[int, ...]:
+        """
+        Stream IDs known to have been processed by the remote peer or that
+        otherwise need no re-submission.
+        """
+        return self.streams(GoAwayStreamState.PROCESSED)
+
+    @property
+    def unknown_streams(self) -> tuple[int, ...]:
+        """
+        Stream IDs for which it cannot be determined whether the remote peer
+        processed the request.
+        """
+        return self.streams(GoAwayStreamState.UNKNOWN)
+
+    def get(self, stream_id: int) -> GoAwayStreamEntry | None:
+        """
+        Return the :class:`GoAwayStreamEntry` for a specific stream, or
+        ``None`` if the stream is unknown to this connection.
+        """
+        return self._entries_getter().get(stream_id)
+
+    def __iter__(self) -> Iterator[GoAwayStreamEntry]:
+        return iter(self.entries())
+
+    def __len__(self) -> int:
+        return len(self._entries_getter())
+
+    def __repr__(self) -> str:
+        return (
+            f"<GoAwayDrainView received:{self.received}, "
+            f"last_stream_id:{self.last_stream_id}, "
+            f"resubmittable:{list(self.resubmittable_streams)}, "
+            f"processed:{list(self.processed_streams)}, "
+            f"unknown:{list(self.unknown_streams)}>"
         )
 
 

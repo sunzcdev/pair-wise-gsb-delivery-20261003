@@ -838,6 +838,27 @@ class H2Stream:
         """
         return self.state_machine.stream_closed_by
 
+    @property
+    def final_response_received(self) -> bool:
+        """
+        Whether a final (non-informational) response header block has been
+        received on this stream from the remote peer.
+
+        Informational (1xx) responses do not count: a request for which only
+        1xx responses have been seen may still be unprocessed from the
+        remote peer's point of view when a GOAWAY frame arrives.
+
+        On a stream that this endpoint did not initiate as a client (for
+        example, an inbound request on a server), no remote response is
+        expected at all, so this always returns ``False``: the stream state
+        machine's ``headers_received`` flag instead records the inbound
+        request in that case.
+        """
+        return (
+            self.state_machine.client is True
+            and bool(self.state_machine.headers_received)
+        )
+
     def upgrade(self, client_side: bool) -> None:
         """
         Called by the connection to indicate that this stream is the initial
