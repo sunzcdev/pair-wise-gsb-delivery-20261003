@@ -60,7 +60,7 @@ from .exceptions import (
     TooManyStreamsError,
 )
 from .frame_buffer import FrameBuffer
-from .settings import ChangedSetting, SettingCodes, Settings
+from .settings import SettingCodes, Settings, SettingsAckResult
 from .stream import H2Stream, StreamClosedBy
 from .utilities import SizeLimitDict, guard_increment_window
 from .windows import WindowManager
@@ -1096,6 +1096,10 @@ class H2Connection:
         self.config.logger.debug("Close connection")
         self.state_machine.process_input(ConnectionInputs.SEND_GOAWAY)
 
+        # The connection is closing: no outstanding local SETTINGS batch can
+        # still be acknowledged, so settle the ledger accordingly.
+        self.local_settings.close_ledger()
+
         # Additional_data must be bytes
         if additional_data is not None:
             assert isinstance(additional_data, bytes)
@@ -1116,13 +1120,31 @@ class H2Connection:
         Update the local settings. This will prepare and emit the appropriate
         SETTINGS frame.
 
+        Every call records one batch in the local settings ledger
+        (:attr:`local_settings.ledger <h2.settings.Settings.ledger>`). The batch
+        keeps its own identity and the exact values sent, so successive batches
+        can be matched to their acknowledgements one by one.
+
+        If any value is invalid the whole update is rejected before anything is
+        staged or recorded.
+
+        .. versionchanged:: 5.0.0
+           The update is now recorded in the local settings ledger, and an
+           invalid batch is rejected atomically.
+
         :param new_settings: A dictionary of {setting: new value}
         """
         self.config.logger.debug(
             "Update connection settings to %s", new_settings,
         )
         self.state_machine.process_input(ConnectionInputs.SEND_SETTINGS)
+
+        # Reject an invalid batch as a whole, rather than staging a prefix of
+        # it and leaving the settings stack half-updated.
+        self.local_settings.validate_local_settings(new_settings)
+
         self.local_settings.update(new_settings)
+        self.local_settings.record_batch(new_settings)
         s = SettingsFrame(0)
         s.settings = new_settings
         self._prepare_for_sending([s])
@@ -1590,6 +1612,7 @@ class H2Connection:
         f.last_stream_id = self.highest_inbound_stream_id
         f.error_code = error_code
         self.state_machine.process_input(ConnectionInputs.SEND_GOAWAY)
+        self.local_settings.close_ledger()
         self._prepare_for_sending([f])
 
     def _receive_headers_frame(self, frame: HeadersFrame) -> tuple[list[Frame], list[Event]]:
@@ -1770,9 +1793,14 @@ class H2Connection:
 
         # This is an ack of the local settings.
         if "ACK" in frame.flags:
-            changed_settings = self._local_settings_acked()
+            ack_result = self._local_settings_acked()
             ack_event = SettingsAcknowledged()
-            ack_event.changed_settings = changed_settings
+            ack_event.changed_settings = ack_result.changed_settings
+            ack_event.batch_id = (
+                ack_result.batch.batch_id if ack_result.batch is not None else None
+            )
+            ack_event.ack_id = ack_result.ack_id
+            ack_event.anomalous = ack_result.anomalous
             events.append(ack_event)
             return [], events
 
@@ -1901,6 +1929,11 @@ class H2Connection:
         # Clear the outbound data buffer: we cannot send further data now.
         self.clear_outbound_data_buffer()
 
+        # No further local SETTINGS batch can be acknowledged on this
+        # connection, so settle the ledger with the outstanding batches
+        # abandoned.
+        self.local_settings.close_ledger()
+
         # Fire an appropriate ConnectionTerminated event.
         new_event = ConnectionTerminated()
         new_event.error_code = _error_code_from_int(frame.error_code)
@@ -1983,11 +2016,16 @@ class H2Connection:
         event = UnknownFrameReceived(frame=frame)
         return [], [event]
 
-    def _local_settings_acked(self) -> dict[SettingCodes | int, ChangedSetting]:
+    def _local_settings_acked(self) -> SettingsAckResult:
         """
         Handle the local settings being ACKed, update internal state.
+
+        Exactly one local update batch is settled. An ACK that cannot be
+        matched to a pending batch is recorded on the ledger as an anomaly and
+        is not allowed to advance any other batch.
         """
-        changes = self.local_settings.acknowledge()
+        result = self.local_settings.acknowledge_local()
+        changes = result.changed_settings
 
         if SettingCodes.INITIAL_WINDOW_SIZE in changes:
             setting = changes[SettingCodes.INITIAL_WINDOW_SIZE]
@@ -2010,7 +2048,7 @@ class H2Connection:
             # respect it.
             self.decoder.max_allowed_table_size = setting.new_value
 
-        return changes
+        return result
 
     def _stream_id_is_outbound(self, stream_id: int) -> bool:
         """

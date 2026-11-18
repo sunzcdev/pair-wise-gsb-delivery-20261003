@@ -11,6 +11,16 @@ dev
 **API Changes (Backward Compatible)**
 
 - Support for Python 3.15 has been added.
+- Added a read-only ledger of local SETTINGS batches, available as
+  ``H2Connection.local_settings.ledger``. Each ``update_settings`` call records one
+  ``SettingsBatch`` with its own identity and the values that were sent, and each
+  SETTINGS acknowledgement settles exactly one batch. ``SettingsBatch.ack_id`` and
+  ``SettingsAcknowledged.batch_id`` make the batch/ACK correspondence observable.
+- Added ``Settings.desired_values`` and ``Settings.effective_values``, which expose the
+  staged and currently effective local values respectively without applying any change
+  early.
+- ``update_settings`` now rejects an invalid batch atomically, before staging any value
+  or recording a ledger entry.
 
 **Bugfixes**
 

@@ -167,3 +167,15 @@ Settings
 
 .. autoclass:: h2.settings.ChangedSetting
    :members:
+
+.. autoclass:: h2.settings.SettingsLedger
+   :members:
+
+.. autoclass:: h2.settings.SettingsBatch
+   :members:
+
+.. autoclass:: h2.settings.SettingsBatchState
+   :members:
+
+.. autoclass:: h2.settings.SettingsAckResult
+   :members:

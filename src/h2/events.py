@@ -512,6 +512,10 @@ class SettingsAcknowledged(Event):
     from the remote peer. The event carries on it the settings that were
     acknowledged, in the same format as
     :class:`h2.events.RemoteSettingsChanged`.
+
+    .. versionchanged:: 5.0.0
+       Added :attr:`batch_id` and :attr:`anomalous` so callers can tell which
+       locally sent SETTINGS batch this acknowledgement settled.
     """
 
     def __init__(self) -> None:
@@ -519,6 +523,27 @@ class SettingsAcknowledged(Event):
         #: :class:`ChangedSetting <h2.settings.ChangedSetting>`, representing
         #: the changed settings.
         self.changed_settings: dict[SettingCodes | int, ChangedSetting] = {}
+
+        #: The identity of the local SETTINGS batch this acknowledgement
+        #: settled, or ``None`` if it could not be matched to an outstanding
+        #: batch.
+        #:
+        #: .. versionadded:: 5.0.0
+        self.batch_id: int | None = None
+
+        #: The ledger-wide identity assigned to this acknowledgement. Every
+        #: acknowledgement received consumes one identity, so batches and
+        #: acks can be correlated even when an ack is anomalous.
+        #:
+        #: .. versionadded:: 5.0.0
+        self.ack_id: int | None = None
+
+        #: Whether this acknowledgement could not be matched to an outstanding
+        #: local SETTINGS batch. Such an acknowledgement never advances a later
+        #: batch.
+        #:
+        #: .. versionadded:: 5.0.0
+        self.anomalous: bool = False
 
     def __repr__(self) -> str:
         s = ", ".join(repr(cs) for cs in self.changed_settings.values())
