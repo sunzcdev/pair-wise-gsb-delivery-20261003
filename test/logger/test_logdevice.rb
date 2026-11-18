@@ -4,8 +4,39 @@ require 'logger'
 require 'tempfile'
 require 'tmpdir'
 require 'pathname'
+require 'stringio'
 
 class TestLogDevice < Test::Unit::TestCase
+  # Runs the block with one of the file operations used by rotation replaced by
+  # a failure, without touching anything else.  +logdev+ is the device to
+  # affect, +method_name+ the private LogDevice method to make fail and +times+
+  # how many calls fail (default: the first one).
+  #
+  # The fault is installed on the single device, so no other test and no other
+  # log device is affected, and it disappears with the device.
+  def with_io_failure(logdev, method_name, error = Errno::EIO.new("injected failure"), times: 1)
+    original = logdev.method(method_name)
+    calls = 0
+    logdev.define_singleton_method(method_name) do |*args, **kwargs|
+      if (calls += 1) <= times
+        raise error
+      end
+      original.call(*args, **kwargs)
+    end
+    yield
+    logdev.singleton_class.send(:remove_method, method_name)
+  end
+
+  # Captures what the log device writes to $stderr while the block runs.
+  def capture_shift_warnings
+    original = $stderr
+    $stderr = StringIO.new
+    yield
+    $stderr.string
+  ensure
+    $stderr = original
+  end
+
   class LogExcnRaiser
     def write(*arg)
       raise 'disk is full'
@@ -958,6 +989,281 @@ class TestLogDevice < Test::Unit::TestCase
       assert_equal("20151231", log[/\d+\z/])
     end
   end if env_tz_works
+
+  # --- rotation failure handling -------------------------------------------
+
+  def test_shift_failure_keeps_device_writable
+    Dir.mktmpdir do |tmpdir|
+      log = File.join(tmpdir, "log")
+      logdev = d(log, shift_age: 2, shift_size: 0, skip_header: true)
+      begin
+        logdev.write("before\n")
+        # Make the slot the live file has to move onto unusable.
+        Dir.mkdir(log + ".0")
+        warning = capture_shift_warnings { logdev.write("during\n") }
+
+        assert_not_predicate(logdev.dev, :closed?,
+                             "the device must stay open after a failed rotation")
+        assert_match(/log shifting failed/, warning)
+        # The pending message was still written, to the original device.
+        assert_equal("before\nduring\n", File.binread(log).gsub("\r\n", "\n"))
+      ensure
+        logdev.close
+      end
+    end
+  end
+
+  def test_shift_failure_reports_stage
+    Dir.mktmpdir do |tmpdir|
+      log = File.join(tmpdir, "log")
+      logdev = d(log, shift_age: 2, shift_size: 0, skip_header: true)
+      begin
+        logdev.write("before\n")
+        Dir.mkdir(log + ".0")
+
+        warning = capture_shift_warnings { logdev.write("during\n") }
+        assert_match(/log shifting failed\. .*moving the current log file aside/,
+                     warning)
+      ensure
+        logdev.close
+      end
+    end
+  end
+
+  def test_shift_failure_stage_is_reported_on_the_exception
+    Dir.mktmpdir do |tmpdir|
+      log = File.join(tmpdir, "log")
+      logdev = d(log, shift_age: 2, shift_size: 0, skip_header: true)
+      begin
+        logdev.write("before\n")
+        Dir.mkdir(log + ".0")
+
+        # #shift_log_age is called directly here, so the failure escapes;
+        # through #write it is reported and the message is still written.
+        failure = nil
+        capture_shift_warnings do
+          failure = assert_raise(Logger::LogDevice::ShiftFailure) do
+            logdev.send(:shift_log_age)
+          end
+        end
+        assert_match(/moving the current log file aside/, failure.message)
+        assert_equal(:rotate, failure.stage)
+      ensure
+        logdev.close
+      end
+    end
+  end
+
+  def test_shift_create_failure_keeps_previous_device
+    Dir.mktmpdir do |tmpdir|
+      log = File.join(tmpdir, "log")
+      logdev = d(log, shift_age: 2, shift_size: 0, skip_header: true)
+      begin
+        logdev.write("before\n")
+        old_dev = logdev.dev
+
+        warning = capture_shift_warnings do
+          with_io_failure(logdev, :create_replacement, Errno::ENOSPC.new("disk full")) do
+            logdev.write("during\n")
+          end
+        end
+
+        assert_match(/log shifting failed/, warning)
+        assert_match(/creating the replacement log file/, warning)
+        assert_same(old_dev, logdev.dev)
+        assert_not_predicate(logdev.dev, :closed?)
+        assert_equal("before\nduring\n", File.binread(log).gsub("\r\n", "\n"))
+        # No half-created replacement is left behind.
+        assert_empty(Dir.glob(log + ".*tmp"))
+      ensure
+        logdev.close
+      end
+    end
+  end
+
+  def test_shift_install_failure_restores_writable_log
+    Dir.mktmpdir do |tmpdir|
+      log = File.join(tmpdir, "log")
+      logdev = d(log, shift_age: 2, shift_size: 0, skip_header: true)
+      begin
+        logdev.write("before\n")
+
+        warning = capture_shift_warnings do
+          with_io_failure(logdev, :install_replacement, Errno::ENOSPC.new("disk full")) do
+            logdev.write("during\n")
+          end
+        end
+
+        assert_match(/log shifting failed/, warning)
+        assert_match(/installing the replacement log file/, warning)
+        assert_not_predicate(logdev.dev, :closed?)
+        # The failed rotation left the previous content recoverable and the
+        # live file still at its own name; the message is written there.
+        assert_file.exist?(log)
+        assert_match(/during/, File.binread(log))
+
+        logdev.write("after\n")
+        assert_match(/after/, File.binread(log))
+      ensure
+        logdev.close
+      end
+    end
+  end
+
+  def test_shift_happens_once_when_failure_is_recovered
+    Dir.mktmpdir do |tmpdir|
+      log = File.join(tmpdir, "log")
+      logdev = d(log, shift_age: 2, shift_size: 0, skip_header: true)
+      begin
+        logdev.write("one\n")
+        with_io_failure(logdev, :install_replacement, Errno::ENOSPC.new("disk full")) do
+          capture_shift_warnings { logdev.write("two\n") }
+        end
+        logdev.write("three\n")
+      ensure
+        logdev.close
+      end
+
+      rotated = File.binread(log + ".0").gsub("\r\n", "\n")
+      live = File.binread(log).gsub("\r\n", "\n")
+      # Each message is written exactly once across both files.
+      assert_equal(["one", "two", "three"].sort, (rotated + live).lines.map(&:chomp).sort)
+      assert_equal(1, (rotated + live).scan(/^one$/).size)
+      assert_equal(1, (rotated + live).scan(/^two$/).size)
+      assert_equal(1, (rotated + live).scan(/^three$/).size)
+    end
+  end
+
+  def test_shift_does_not_replace_foreign_history_file
+    Dir.mktmpdir do |tmpdir|
+      log = File.join(tmpdir, "log")
+      suffix = Time.now.strftime("%Y%m%d")
+      foreign = "#{log}.#{suffix}"
+      File.write(foreign, "FOREIGN\n")
+
+      logdev = d(log, shift_age: 'now', skip_header: true)
+      begin
+        # 'now' rotates before each write, so the second write puts the first
+        # message into the history.
+        logdev.write("mine\n")
+        logdev.write("latest\n")
+      ensure
+        logdev.close
+      end
+
+      # 'now' rotates before every write, so each write leaves the previous
+      # content in a history file.  The foreign file keeps its name and its
+      # content; the rotation moves on to the next free name instead.
+      assert_equal("FOREIGN\n", File.binread(foreign).gsub("\r\n", "\n"))
+      assert_equal("latest\n", File.binread(log).gsub("\r\n", "\n"))
+      history = Dir.glob("#{foreign}.*").sort.map do |file|
+        File.binread(file).gsub("\r\n", "\n")
+      end
+      assert_includes(history, "mine\n")
+    end
+  end
+
+  def test_shift_aborts_before_touching_live_file_when_name_is_taken
+    Dir.mktmpdir do |tmpdir|
+      log = File.join(tmpdir, "log")
+      suffix = Time.now.strftime("%Y%m%d")
+      # Exhaust every candidate name so the reservation stage has to fail.
+      File.write("#{log}.#{suffix}", "taken\n")
+      1.upto(Logger::LogDevice::SHIFT_NAME_LIMIT) do |index|
+        File.write("#{log}.#{suffix}.#{index}", "taken\n")
+      end
+
+      logdev = d(log, shift_age: 'now', skip_header: true)
+      begin
+        warning = capture_shift_warnings { logdev.write("survives\n") }
+        assert_match(/log shifting failed/, warning)
+        assert_match(/reserving a name/, warning)
+        assert_not_predicate(logdev.dev, :closed?)
+        assert_equal("survives\n", File.binread(log).gsub("\r\n", "\n"))
+      ensure
+        logdev.close
+      end
+    end
+  end
+
+  def test_shift_keeps_bounded_number_of_files
+    Dir.mktmpdir do |tmpdir|
+      log = File.join(tmpdir, "log")
+      logdev = d(log, shift_age: 3, shift_size: 0, skip_header: true)
+      begin
+        %w[a b c d e].each {|message| logdev.write(message + "\n")}
+      ensure
+        logdev.close
+      end
+
+      files = Dir.glob(log + "*")
+      assert_equal(3, files.size)
+      assert_file.exist?(log)
+      assert_file.exist?(log + ".0")
+      assert_file.exist?(log + ".1")
+      assert_file.not_exist?(log + ".2")
+    end
+  end
+
+  # The close-and-rename strategy is used where an open file cannot be
+  # unlinked or renamed (for example Windows without SHARE_DELETE).  The same
+  # guarantees must hold there, so the platform answer is stubbed off on a
+  # single device, leaving the class and other devices untouched.
+  def without_open_file_operations(logdev)
+    logdev.define_singleton_method(:unlink_open_file?) { false }
+    logdev.define_singleton_method(:rename_open_file?) { false }
+    yield
+  end
+
+  def test_close_and_rename_strategy_rotates_without_duplicates
+    Dir.mktmpdir do |tmpdir|
+      log = File.join(tmpdir, "log")
+      logdev = d(log, shift_age: 3, shift_size: 0, skip_header: true)
+      begin
+        without_open_file_operations(logdev) do
+          logdev.write("one\n")
+          with_io_failure(logdev, :install_replacement, Errno::ENOSPC.new("disk full")) do
+            capture_shift_warnings { logdev.write("two\n") }
+          end
+          logdev.write("three\n")
+          assert_not_predicate(logdev.dev, :closed?)
+        end
+      ensure
+        logdev.close
+      end
+
+      body = Dir.glob(log + "*").sort.map do |file|
+        File.binread(file).gsub("\r\n", "\n")
+      end.join
+      assert_equal(["one", "three", "two"], body.lines.map(&:chomp).sort)
+    end
+  end
+
+  def test_close_and_rename_strategy_keeps_foreign_history_file
+    Dir.mktmpdir do |tmpdir|
+      log = File.join(tmpdir, "log")
+      suffix = Time.now.strftime("%Y%m%d")
+      foreign = "#{log}.#{suffix}"
+      File.write(foreign, "FOREIGN\n")
+
+      logdev = d(log, shift_age: 'now', skip_header: true)
+      begin
+        without_open_file_operations(logdev) do
+          logdev.write("mine\n")
+          logdev.write("latest\n")
+        end
+      ensure
+        logdev.close
+      end
+
+      assert_equal("FOREIGN\n", File.binread(foreign).gsub("\r\n", "\n"))
+      assert_equal("latest\n", File.binread(log).gsub("\r\n", "\n"))
+      history = Dir.glob("#{foreign}.*").map do |file|
+        File.binread(file).gsub("\r\n", "\n")
+      end
+      assert_includes(history, "mine\n")
+    end
+  end
 
   private
 
