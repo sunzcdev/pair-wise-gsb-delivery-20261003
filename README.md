@@ -192,6 +192,72 @@ end
 
 Note that regular clients do respond to `node_for`, `nodes_for` and `nodes`, so that code that support `RedisClient.ring` is also usable with a single server.
 
+#### Node weights
+
+Nodes can be given an explicit weight. A node with weight `N` gets `N` times
+as many virtual points as a node with weight `1`, so it owns roughly `N` times
+as much of the keyspace. Without an explicit weight every node defaults to
+weight `1`, which is the historical equal-weight layout.
+
+```ruby
+ring = RedisClient.ring(
+  RedisClient.config(host: "10.0.1.1", port: 6380).new_pool,
+  RedisClient.config(host: "10.0.1.2", port: 6380).new_pool,
+  weights: { "redis://10.0.1.1:6380" => 3, "redis://10.0.1.2:6380" => 1 },
+)
+
+ring.weights # => {"redis://10.0.1.1:6380"=>3, "redis://10.0.1.2:6380"=>1}
+```
+
+Weights may be keyed by node identity (the client `id`, falling back to the
+server URL), by a `String`/`Symbol` id, or by the node object itself, and a
+node may also expose its own `#weight`. Weights must be positive integers:
+duplicate node ids and zero, negative or non-integer weights raise
+`ArgumentError` while the ring is being built, before it is used.
+
+#### Deterministic layout
+
+The layout is a pure function of the node identities, their weights,
+`replicas`, the `digest` and an optional `seed`. Ruby's process randomized
+`Hash` is never used, so a given configuration produces the same layout in
+every process and after every restart. Supplying the same nodes in a different
+order produces an identical layout:
+
+```ruby
+a = RedisClient.ring(node_a, node_b, seed: "shard-2026")
+b = RedisClient.ring(node_b, node_a, seed: "shard-2026")
+
+a.layout_fingerprint == b.layout_fingerprint # => true
+```
+
+The `seed` is optional; when omitted the historical layout is preserved, so
+existing rings keep their distribution.
+
+#### Comparing two layouts
+
+`migration_plan` compares two rings without modifying either of them and
+without reading or moving any keys. It returns a `RedisClient::HashRing::MigrationPlan`
+describing the keyspace intervals whose owning node changes:
+
+```ruby
+before = RedisClient.ring(node_a, node_b, node_c)
+after  = RedisClient.ring(node_a, node_b)
+
+plan = before.migration_plan(after)
+plan.changed_fraction # => 0.333... (the removed node's share of the keyspace)
+plan.removed_nodes    # => ["cache-3"]
+plan.successors       # => {"cache-3"=>["cache-1", "cache-2"]}
+
+plan.each do |interval|
+  # interval.start is inclusive, interval.finish is exclusive; both are raw
+  # 32-bit keyspace positions, and interval.to is the deterministic successor.
+  puts "#{interval.from} -> #{interval.to}: [#{interval.start}, #{interval.finish})"
+end
+```
+
+The report intentionally describes **keyspace ranges**, not keys: it is a plan
+of which ranges change owner, not evidence that any data was migrated.
+
 ### Type support
 
 Only a select few Ruby types are supported as arguments beside strings.

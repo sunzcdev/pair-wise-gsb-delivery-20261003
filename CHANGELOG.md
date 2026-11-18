@@ -1,5 +1,7 @@
 # Unreleased
 
+- `RedisClient::HashRing` now supports explicit per-node weights (`weights:` or a node `#weight`), an optional `seed`, and a read-only `migration_plan` that reports the keyspace intervals whose owner changes between two layouts. The layout is deterministic across restarts and independent of the input node order, and duplicate nodes or invalid weights are rejected up front. The existing equal-weight interface is unchanged.
+
 # 0.31.0
 
 - Improved the Ruby driver buffering logic, should trigger GC less, particularly for large response and when using SSL.
