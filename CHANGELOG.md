@@ -1,5 +1,24 @@
 ## Current
 
+concurrent-ruby:
+
+* Queue unanswered `Concurrent::Semaphore` requests instead of waking them
+  opportunistically from a shared condition variable. A request for several
+  permits is now granted as one batch, and admission order follows an explicit
+  policy chosen with the new `:queue_mode` constructor option: `:fifo`
+  (default, strict arrival order) or `:bounded_bypass`, which lets a request
+  smaller than the current queue head overtake it at most `:bypass_limit`
+  times. Requests which time out are removed from the queue and return any
+  permits reserved for them, and block forms release only the permits that
+  were actually granted.
+* Add `Semaphore#reserved_permits`, `#waiting_count` (alias `#queue_length`),
+  `#queued_permits`, `#queue_mode` and `#bypass_limit`. `#available_permits`
+  now excludes permits set aside for the queue head, so the two counters
+  together describe the semaphore without ever reporting a negative count for
+  acquisition or release.
+* Use the queueing implementation on JRuby as well, so admission semantics
+  are identical on every supported engine.
+
 ## Release v1.3.8 (19 July 2026)
 
 concurrent-ruby:
