@@ -109,6 +109,71 @@ module Dnsruby
       ERROR = 2
     end
 
+    #  The outcome of a Resolver#cancel_async call. The status distinguishes :
+    #
+    #  * NOT_STARTED - the query was admitted, but no packet attempt was in
+    #    flight (it was waiting for a retry timer or its first dispatch)
+    #  * IN_FLIGHT - at least one packet attempt (or a DNSSEC validation of a
+    #    received response) was still in flight when the query was cancelled
+    #  * COMPLETED - a terminal result had already been delivered to the
+    #    response queue; cancellation could not prevent it
+    #  * CANCELLED - an earlier cancellation already claimed the query
+    #  * UNKNOWN - this resolver never saw the query id
+    #
+    #  A successful cancellation publishes nothing to the response queue, so
+    #  the queue still carries at most one terminal state for the query.
+    class CancelReceipt
+      NOT_STARTED = :not_started
+      IN_FLIGHT = :in_flight
+      COMPLETED = :completed
+      CANCELLED = :cancelled
+      UNKNOWN = :unknown
+
+      #  The query id passed to cancel_async
+      attr_reader :query_id
+
+      #  One of NOT_STARTED, IN_FLIGHT, COMPLETED, CANCELLED or UNKNOWN
+      attr_reader :status
+
+      def initialize(query_id, status)
+        @query_id = query_id
+        @status = status
+      end
+
+      def not_started?
+        @status == NOT_STARTED
+      end
+
+      def in_flight?
+        @status == IN_FLIGHT
+      end
+
+      def completed?
+        @status == COMPLETED
+      end
+
+      def already_cancelled?
+        @status == CANCELLED
+      end
+
+      def unknown?
+        @status == UNKNOWN
+      end
+
+      #  True when the response queue cannot still receive a terminal result
+      #  for this query, because this or an earlier cancellation stopped
+      #  delivery. False when the result was already delivered (COMPLETED) or
+      #  the query was never known to this resolver (UNKNOWN).
+      def delivery_prevented?
+        not_started? || in_flight? || already_cancelled?
+      end
+
+      def to_s
+        "#<Dnsruby::Resolver::CancelReceipt #{@query_id.inspect}: #{@status}>"
+      end
+      alias inspect to_s
+    end
+
     #  The port to send queries to on the resolver
     attr_reader :port
 
@@ -436,6 +501,35 @@ module Dnsruby
       end
       engine = @single_res_mutex.synchronize { @resolver_ruby ||= ResolverRuby.new(self) }
       engine.send_async(msg, client_queue, client_query_id)
+    end
+
+    #  Cancel an asynchronous query started with send_async. Returns a
+    #  CancelReceipt telling the caller what the cancellation found :
+    #
+    #  * not_started - no packet attempt was in flight; delivery is prevented
+    #  * in_flight - a transmission (or validation) was in flight; delivery is
+    #    prevented, and any late packets are still handled per connection
+    #    protocol (a shared TCP stream drains) but are never delivered to this
+    #    or any other query
+    #  * completed - a terminal result was already delivered to the response
+    #    queue; the cancellation changed nothing
+    #  * already_cancelled - an earlier cancel_async claimed the query
+    #
+    #  A successful cancellation never pushes to the response queue, so the
+    #  queue carries at most one terminal state for the query. Timers, retry
+    #  plans and selector registrations for the query are released, and the
+    #  shared select thread is left running for other queries.
+    #
+    #    id = res.send_async(msg, queue)
+    #    receipt = res.cancel_async(id)
+    #    if receipt.delivery_prevented?
+    #      # queue will never receive a result for id
+    #    end
+    def cancel_async(client_query_id)
+      ensure_current_process
+      engine = @single_res_mutex.synchronize { @resolver_ruby }
+      return CancelReceipt.new(client_query_id, CancelReceipt::UNKNOWN) unless engine
+      engine.cancel_async(client_query_id)
     end
 
     #  Close the Resolver. Unfinished queries are terminated with OtherResolvError.
@@ -964,6 +1058,11 @@ module Dnsruby
   #  This class implements the I/O using pure Ruby, with no dependencies.
   #  Support for EventMachine has been deprecated.
   class ResolverRuby # :nodoc: all
+    # Bounded memory of recent terminal outcomes, so a late cancel_async can
+    # still distinguish completed from cancelled queries without retaining
+    # the queries themselves.
+    TERMINAL_RECEIPT_LIMIT = 512
+
     def initialize(parent)
       reset_attributes
       @parent=parent
@@ -978,6 +1077,7 @@ module Dnsruby
       @transmission_budgets = {}
       @response_cache = Cache::ResolutionCache.new
       @query_cache_scopes = {}
+      @terminal_states = {}
     end
     # Completed failures belong to one resolver configuration and validation
     # policy. Snapshot them at admission, and decline insertion if it changes.
@@ -1145,15 +1245,55 @@ module Dnsruby
     def cancel_query(client_query_id, client_queue)
       @parent.single_res_mutex.synchronize do
         current = @query_list[client_query_id]
-        if current && current[1].equal?(client_queue)
-          stop_querying(client_query_id)
-          @validation_queries.delete(client_query_id)
-          @query_cache_scopes.delete(client_query_id)
-          SelectThread.instance.remove_observer(current[2], self)
-          @query_list.delete(client_query_id)
-        end
+        teardown_cancelled_query(client_query_id, current) if current && current[1].equal?(client_queue)
       end
     end
+
+    # Cancel an asynchronous query and report the outcome to the caller. The
+    # response queue is left untouched: it keeps its single terminal state if
+    # the query already completed, and receives nothing when cancellation
+    # wins. The shared select thread and unrelated queries are not disturbed.
+    def cancel_async(client_query_id)
+      @parent.single_res_mutex.synchronize do
+        current = @query_list[client_query_id]
+        unless current
+          status = @terminal_states[client_query_id] || Resolver::CancelReceipt::UNKNOWN
+          return Resolver::CancelReceipt.new(client_query_id, status)
+        end
+        # A response accepted for validation is still in flight: its terminal
+        # result has not been delivered, and this cancellation prevents it.
+        in_flight = !current[3].empty? || @validation_queries.key?(client_query_id)
+        teardown_cancelled_query(client_query_id, current)
+        Resolver::CancelReceipt.new(client_query_id,
+          in_flight ? Resolver::CancelReceipt::IN_FLIGHT : Resolver::CancelReceipt::NOT_STARTED)
+      end
+    end
+
+    # MUST BE CALLED IN A SYNCHRONIZED BLOCK!
+    #
+    # Release every timer, retry plan and attempt record so nothing keeps the
+    # cancelled query alive. Removing the observer drops the selector's half
+    # of the query (settings, packet deadlines and send tokens); in-flight
+    # sends then stop at their next cancellation check, and late packets are
+    # drained per connection protocol without matching any query.
+    def teardown_cancelled_query(client_query_id, current)
+      stop_querying(client_query_id)
+      @validation_queries.delete(client_query_id)
+      @query_cache_scopes.delete(client_query_id)
+      current[3].clear
+      SelectThread.instance.remove_observer(current[2], self)
+      @query_list.delete(client_query_id)
+      record_terminal_state(client_query_id, Resolver::CancelReceipt::CANCELLED)
+    end
+    private :teardown_cancelled_query
+
+    # MUST BE CALLED IN A SYNCHRONIZED BLOCK!
+    def record_terminal_state(client_query_id, status)
+      @terminal_states.delete(client_query_id)
+      @terminal_states[client_query_id] = status
+      @terminal_states.shift while @terminal_states.size > TERMINAL_RECEIPT_LIMIT
+    end
+    private :record_terminal_state
 
     #  MUST BE CALLED IN A SYNCHRONIZED BLOCK!
     #
@@ -1213,6 +1353,9 @@ module Dnsruby
       cache_completion(client_query_id, msg, error)
       stop_querying(client_query_id)
       @validation_queries.delete(client_query_id)
+      # The terminal state is declared exactly once, here, before the query
+      # records are dropped; a later cancel_async reports it as completed.
+      record_terminal_state(client_query_id, Resolver::CancelReceipt::COMPLETED)
       #  We might still get some callbacks, which we should ignore
       st = SelectThread.instance
       st.remove_observer(select_queue, self)

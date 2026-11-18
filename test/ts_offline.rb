@@ -67,6 +67,7 @@ TESTS = %w(
     rrset_review_fixes
     dnssec_recursor_review_fixes
     cancelled_send_capacity
+    cancel_receipt
     review_code_mapper
     review_presentation
     record_regressions
