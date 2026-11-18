@@ -30,7 +30,33 @@ module Concurrent
   #   running, a new thread will be created only if the queue is full.
   #
   #   Threads that are idle for too long will be garbage collected, down to the
-  #   configured minimum options. Should a thread crash it, too, will be garbage collected.
+  #   configured minimum options.
+  #
+  #   **Worker termination and replacement**
+  #
+  #   A worker thread can end in three different ways, and the pool treats them
+  #   differently:
+  #
+  #   * *Orderly termination*: the pool pruned an idle worker, completed an
+  #     orderly shutdown, or the pool was killed. The worker is removed and no
+  #     replacement is started.
+  #   * *Task failure*: the task raised a `StandardError`. The task fails (it is
+  #     not retried) but the worker stays in the pool.
+  #   * *Unexpected death*: the task raised a non-`StandardError` exception, or
+  #     terminated its thread outright (for example by calling `Thread.exit`).
+  #     The worker is removed and, while the pool is running, immediately
+  #     replaced so that tasks already in the queue are not left waiting for a
+  #     worker which no longer exists. The loss and its cause are reported
+  #     through `Concurrent.global_logger`.
+  #
+  #   A task that already started is never silently re-run: replaying it could
+  #   duplicate side effects. If a worker dies while running a task, that task
+  #   is abandoned and the pool logs this explicitly. Statistics
+  #   (`#length`, `#active_count`) and `#wait_for_termination` reflect the live
+  #   threads only; a worker whose thread is gone is never counted as part of
+  #   the pool. If a replacement thread cannot be created (for example because
+  #   the operating system refuses it), the failure is logged and counted in
+  #   `#worker_spawn_failures` rather than being silently swallowed.
   #
   #   `ThreadPoolExecutor` is based on the Java class of the same name. From
   #   the official Java documentation;

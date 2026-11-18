@@ -1,5 +1,24 @@
 ## Current
 
+concurrent-ruby:
+
+* Give thread pool workers explicit terminal states and well-defined replacement
+  rules. A task which calls `Thread.exit`, or raises an exception which is not a
+  `StandardError`, now kills its worker instead of leaving a "zombie" worker
+  behind: previously the dead thread stayed registered, `#length`/`#active_count`
+  kept reporting it, queued tasks waited forever and `#wait_for_termination`
+  never returned. Such a worker is now dropped and, while the pool is running,
+  replaced so pending tasks still run.
+* A task which already started is never silently re-run after its worker dies;
+  the abandoned task and the cause of death are reported through
+  `Concurrent.global_logger`.
+* `#length`, `#active_count` and `#wait_for_termination` now reflect live threads
+  only. Orderly shutdown still drains accepted work; if no live worker is left and
+  no replacement can be started, the remaining tasks are dropped with an error
+  log instead of blocking termination forever.
+* Add `ThreadPoolExecutor#worker_spawn_failures` so a replacement thread which the
+  runtime refuses to create is observable rather than silently swallowed.
+
 ## Release v1.3.8 (19 July 2026)
 
 concurrent-ruby:

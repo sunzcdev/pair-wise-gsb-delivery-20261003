@@ -16,10 +16,13 @@ module Concurrent
   # operation is post to the pool the first available idle thread will be tasked
   # with the new operation.
   #
-  # Should a thread crash for any reason the thread will immediately be removed
-  # from the pool. Similarly, threads which remain idle for an extended period
-  # of time will be killed and reclaimed. Thus these thread pools are very
-  # efficient at reclaiming unused resources.
+  # Should a thread die unexpectedly (for example because a task raised a
+  # non-`StandardError` exception or called `Thread.exit`) it is immediately
+  # removed from the pool and, while the pool is running, replaced so queued
+  # tasks are not stranded. A task which already started is never re-run.
+  # Similarly, threads which remain idle for an extended period of time will be
+  # killed and reclaimed. Thus these thread pools are very efficient at
+  # reclaiming unused resources.
   #
   # The API and behavior of this class are based on Java's `CachedThreadPool`
   #

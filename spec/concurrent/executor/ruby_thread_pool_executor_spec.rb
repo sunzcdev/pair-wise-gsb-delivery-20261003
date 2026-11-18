@@ -24,6 +24,157 @@ module Concurrent
 
     it_should_behave_like :thread_pool_executor
 
+    context 'worker lifecycle' do
+
+      let(:pool) do
+        RubyThreadPoolExecutor.new(min_threads: 1, max_threads: 1, max_queue: 10, fallback_policy: :discard)
+      end
+
+      after(:each) do
+        pool.shutdown
+        pool.wait_for_termination(pool_termination_timeout)
+      end
+
+      def eventually(timeout: 5, &block)
+        deadline = Concurrent.monotonic_time + timeout
+        begin
+          return yield
+        rescue RSpec::Expectations::ExpectationNotMetError, RuntimeError
+          raise if Concurrent.monotonic_time > deadline
+          sleep 0.01
+          retry
+        end
+      end
+
+      context 'when a task calls Thread.exit' do
+
+        it 'does not keep reporting the dead worker as a live thread' do
+          exited = Queue.new
+          pool.post { exited << Thread.current; Thread.exit }
+          dead = exited.pop
+
+          eventually { expect(dead.alive?).to be false }
+          eventually { expect(pool.length).to eq 1 } # the replacement
+          expect(pool.active_count).to eq 0
+        end
+
+        it 'replaces the worker so queued tasks still run' do
+          pool.post { Thread.exit }
+          done = Concurrent::CountDownLatch.new(3)
+          3.times { pool.post { done.count_down } }
+          expect(done.wait(5)).to be true
+        end
+
+        it 'does not re-run the task which called Thread.exit' do
+          executions = Concurrent::AtomicFixnum.new(0)
+          pool.post { executions.increment; Thread.exit }
+          sleep 0.2
+          # started exactly once; the pool must not replay it
+          expect(executions.value).to eq 1
+        end
+      end
+
+      context 'when a task raises a non-StandardError' do
+
+        it 'does not re-run the already started task' do
+          executions = Concurrent::AtomicFixnum.new(0)
+          pool.post { executions.increment; raise Exception, 'fatal' }
+          sleep 0.2
+          expect(executions.value).to eq 1
+        end
+
+        it 'replaces the worker so queued tasks still run' do
+          pool.post { raise Exception, 'fatal' }
+          done = Concurrent::CountDownLatch.new(3)
+          3.times { pool.post { done.count_down } }
+          expect(done.wait(5)).to be true
+        end
+
+        it 'keeps a StandardError from killing the worker' do
+          pool.post { raise StandardError, 'ordinary failure' }
+          done = Concurrent::CountDownLatch.new(1)
+          pool.post { done.count_down }
+          expect(done.wait(5)).to be true
+          expect(pool.length).to eq 1
+        end
+      end
+
+      context 'when a worker dies while the pool is shutting down' do
+
+        it 'still terminates instead of waiting for the vanished worker' do
+          gate = Concurrent::Event.new
+          started = Concurrent::CountDownLatch.new(1)
+          pool.post { started.count_down; gate.wait; Thread.exit }
+          expect(started.wait(5)).to be true
+
+          done = Concurrent::CountDownLatch.new(1)
+          pool.post { done.count_down }
+          pool.shutdown
+          gate.set
+
+          expect(done.wait(5)).to be true
+          expect(pool.wait_for_termination(pool_termination_timeout)).to be true
+        end
+      end
+
+      context 'when a replacement worker cannot be started' do
+
+        it 'counts and reports the failure instead of pretending success' do
+          worker_class = RubyThreadPoolExecutor.const_get(:Worker)
+          allow(worker_class).to receive(:new).and_raise(ThreadError, 'cannot create Thread')
+
+          pool.post { Thread.exit }
+          eventually { expect(pool.worker_spawn_failures).to be > 0 }
+          expect(pool.length).to eq 0
+
+          # A stranded queue must not hang an orderly shutdown.
+          pool.post { nil }
+          pool.shutdown
+          expect(pool.wait_for_termination(pool_termination_timeout)).to be true
+        end
+      end
+    end
+
+    context 'worker terminal states' do
+
+      let(:worker_class) { RubyThreadPoolExecutor.const_get(:Worker) }
+
+      it 'exposes starting, idle, busy and terminal states' do
+        expect(worker_class::STATES).to include(:starting, :idle, :busy, :stopped, :killed, :died)
+        expect(worker_class::TERMINAL_STATES).to contain_exactly(:stopped, :killed, :died)
+      end
+
+      it 'makes a worker no longer busy once it is terminal' do
+        worker = worker_class.allocate
+        worker.instance_variable_set(:@id, 1)
+        worker.instance_variable_set(:@state, :starting)
+
+        expect(worker.terminal?).to be false
+        expect(worker.terminate!(:stopped)).to be true
+        expect(worker.state).to eq :stopped
+        expect(worker.terminal?).to be true
+        expect(worker.busy?).to be false
+      end
+
+      it 'only leaves a terminal state once' do
+        worker = worker_class.allocate
+        worker.instance_variable_set(:@id, 1)
+        worker.instance_variable_set(:@state, :starting)
+
+        expect(worker.die!).to be true
+        expect(worker.die!).to be false
+        expect(worker.state).to eq :died
+      end
+
+      it 'rejects non-terminal states' do
+        worker = worker_class.allocate
+        worker.instance_variable_set(:@id, 1)
+        worker.instance_variable_set(:@state, :starting)
+
+        expect { worker.terminate!(:busy) }.to raise_error(ArgumentError)
+      end
+    end
+
     context :prune, if: !Concurrent.on_jruby? do # pruning is flaky on JRuby
       subject do
         RubyThreadPoolExecutor.new(idletime: 5, min_threads: 2, max_threads: 10)

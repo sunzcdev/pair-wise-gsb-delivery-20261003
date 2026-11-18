@@ -94,6 +94,27 @@ pool = Concurrent::ThreadPoolExecutor.new(
 
 ThreadPoolExecutors with `min_threads` and `max_threads` set to different values will ordinarily reclaim idle threads.  You can supply an `idletime` argument, number of seconds that a thread may be idle before being reclaimed. The default is 60 seconds.
 
+### Workers dying and being replaced
+
+A worker thread can end in three ways, and a `ThreadPoolExecutor` handles each differently:
+
+* **Orderly termination.** The pool pruned an idle worker, an orderly shutdown finished, or the pool was killed. The worker is dropped and no replacement is started.
+* **Task failure.** The task raised a `StandardError`. That task fails and is not retried, but the worker stays in the pool and picks up the next task. The error is logged at the debug level only.
+* **Unexpected death.** The task raised something which is not a `StandardError` (for example `NoMemoryError`, `SignalException`, or a task calling `raise Exception`), or it ended the thread outright, for example with `Thread.exit`. The worker is dropped and, while the pool is running, replaced immediately. This is reported at the error level together with the exception that killed the worker.
+
+A task which already started is never silently re-run, because replaying it could duplicate side effects. If a worker dies while running a task, that task is abandoned and the pool logs that explicitly. Statistics such as `length` and `active_count`, and `wait_for_termination`, only reflect threads which are actually alive, so a pool is never reported as busy because of a worker which has already disappeared.
+
+If the runtime refuses to create the replacement thread, the failure is logged and counted in `worker_spawn_failures`. The pool does not silently pretend to be healthy: if it is shutting down and no live worker is left to drain the queue, the remaining tasks are discarded with an error log and `wait_for_termination` completes rather than waiting forever.
+
+~~~ruby
+pool = Concurrent::ThreadPoolExecutor.new(min_threads: 2, max_threads: 2, max_queue: 100)
+
+pool.post { Thread.exit }   # kills the worker; pool starts a replacement
+pool.post { do_work }       # still runs on the replacement
+
+pool.worker_spawn_failures  # => 0 while replacements keep succeeding
+~~~
+
 `concurrent-ruby` thread pools are based on designs from `java.util.concurrent` --  a well-designed, stable, scalable, and battle-tested concurrency library. The `ThreadPoolExecutor` is based on Java [java.util.concurrent.ThreadPoolExecutor](https://docs.oracle.com/javase/7/docs/api/java/util/concurrent/ThreadPoolExecutor.html), and is in fact implemented with a Java ThreadPoolExecutor when running under JRuby. For more information on the design and concepts, you may find the Java documentation helpful:
 
 * http://docs.oracle.com/javase/tutorial/essential/concurrency/pools.html

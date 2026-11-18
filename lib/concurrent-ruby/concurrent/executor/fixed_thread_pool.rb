@@ -190,8 +190,10 @@ module Concurrent
   #   A thread pool that reuses a fixed number of threads operating off an unbounded queue.
   #   At any point, at most `num_threads` will be active processing tasks. When all threads are busy new
   #   tasks `#post` to the thread pool are enqueued until a thread becomes available.
-  #   Should a thread crash for any reason the thread will immediately be removed
-  #   from the pool and replaced.
+  #   Should a thread die unexpectedly (for example because a task raised a
+  #   non-`StandardError` exception or called `Thread.exit`) the thread will
+  #   immediately be removed from the pool and replaced, so the pool keeps
+  #   serving queued tasks. A task which already started is never re-run.
   #
   #   The API and behavior of this class are based on Java's `FixedThreadPool`
   #
