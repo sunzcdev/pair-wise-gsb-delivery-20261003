@@ -191,6 +191,58 @@ taking any other active, unprompted action on the connection. In this instance,
 you'll want to make all the relevant ``send_*`` calls, and *then* call
 :meth:`data_to_send <h2.connection.H2Connection.data_to_send>`.
 
+.. _keepalive-ping-probes:
+
+Keepalive PING Probes
+---------------------
+
+PING frames are the only in-band way an HTTP/2 endpoint can confirm that its
+peer is still responsive. A plain :meth:`ping
+<h2.connection.H2Connection.ping>` sends a PING whose eight bytes of "opaque
+data" are chosen by the caller, but h2 keeps no record of it. That means a
+later :class:`PingAckReceived <h2.events.PingAckReceived>` event cannot be
+attributed to a particular PING: any acknowledgment, including one for a PING
+the peer never answered, looks the same.
+
+Keepalive logic needs more than that. It needs a distinct identity per probe,
+the moment each probe was sent, and a definite terminal state for every probe -
+acknowledged, timed out, or abandoned because the connection closed. h2 offers
+this as opt-in bookkeeping:
+
+.. code-block:: python
+
+    conn.enable_ping_probes(default_timeout=30.0)
+    identity = conn.send_ping_probe()
+
+    # ... later, after receive_data() has delivered the events ...
+    for probe in conn.poll_ping_probes():
+        if probe.state is h2.ping.PingProbeState.TIMED_OUT:
+            conn.close_connection(error_code=h2.errors.ErrorCodes.PROTOCOL_ERROR)
+
+:meth:`send_ping_probe <h2.connection.H2Connection.send_ping_probe>` chooses an
+unused eight-byte identity (or validates one you supply), records the probe,
+and only then writes the PING frame. An acknowledgement settles exactly the
+probe whose identity it echoes: acknowledgements for unknown identities are
+ignored and never settle a different probe. Once acknowledged, a probe reports
+its round-trip time through :attr:`PingProbe.rtt <h2.ping.PingProbe.rtt>`.
+
+There are three deliberate constraints:
+
+- An identity that is still outstanding cannot be registered again, and the
+  number of outstanding probes is bounded. Both failures raise before any
+  frame reaches the send buffer.
+- Closing the connection - locally, by receiving GOAWAY, or because of an
+  error - settles every outstanding probe as ``ABANDONED``.
+- h2 starts no threads and no timers. Deadlines are evaluated against
+  :func:`time.monotonic` only when you call :meth:`poll_ping_probes
+  <h2.connection.H2Connection.poll_ping_probes>`. You can inject a clock with
+  ``enable_ping_probes(monotonic=...)`` or pass ``now`` explicitly, which makes
+  timeout behaviour straightforward to test.
+
+A timed out probe is bookkeeping only: h2 does not fabricate a PING
+acknowledgement, and does not automatically close the connection. Deciding that
+a timeout means the peer is gone, and acting on it, is left to the caller.
+
 Headers
 -------
 

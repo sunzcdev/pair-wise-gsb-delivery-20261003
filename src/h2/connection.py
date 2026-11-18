@@ -60,6 +60,7 @@ from .exceptions import (
     TooManyStreamsError,
 )
 from .frame_buffer import FrameBuffer
+from .ping import PingProbeManager
 from .settings import ChangedSetting, SettingCodes, Settings
 from .stream import H2Stream, StreamClosedBy
 from .utilities import SizeLimitDict, guard_increment_window
@@ -71,6 +72,7 @@ if TYPE_CHECKING:  # pragma: no cover
     from hpack.struct import Header, HeaderWeaklyTyped
 
     from ._typing import Buffer
+    from .ping import PingProbe
 
 
 class ConnectionState(Enum):
@@ -400,6 +402,11 @@ class H2Connection:
         self._inbound_flow_control_window_manager = WindowManager(
             max_window_size=self.local_settings.initial_window_size,
         )
+
+        # Optional bookkeeping for outstanding PING probes. It is only created
+        # when the caller asks for it, and it never emits frames or timers of
+        # its own: see h2.ping.PingProbeManager.
+        self._ping_probes: PingProbeManager | None = None
 
         # When in doubt use dict-dispatch.
         self._frame_dispatch_table: dict[type[Frame], Callable] = {  # type: ignore
@@ -1037,6 +1044,12 @@ class H2Connection:
         """
         Send a PING frame.
 
+        This is the raw, stateless PING API: h2 does not remember that the
+        PING was sent, so a later :class:`PingAckReceived
+        <h2.events.PingAckReceived>` event cannot be attributed to it. Use
+        :meth:`send_ping_probe` to get probe identity and round-trip time
+        bookkeeping.
+
         :param opaque_data: A bytestring of length 8 that will be sent in the
                             PING frame.
         :returns: Nothing
@@ -1051,6 +1064,131 @@ class H2Connection:
         f = PingFrame(0)
         f.opaque_data = opaque_data
         self._prepare_for_sending([f])
+
+    def enable_ping_probes(self, *,
+                           max_outstanding: int = 64,
+                           default_timeout: float | None = None,
+                           max_resolved: int = 64,
+                           monotonic: Callable[[], float] | None = None) -> PingProbeManager:
+        """
+        Enable PING probe bookkeeping on this connection.
+
+        Enabling probes makes h2 remember which PINGs this endpoint sent, so
+        that :class:`PingAckReceived <h2.events.PingAckReceived>` events can be
+        attributed to the specific probe that they answer instead of being
+        treated as an anonymous acknowledgment.
+
+        Calling this method replaces any previous manager, discarding whatever
+        probes it was tracking. The manager is entirely passive: it starts no
+        timers and performs no I/O. The caller is responsible for calling
+        :meth:`poll_ping_probes` with the current monotonic time.
+
+        :param max_outstanding: The maximum number of probes that may await an
+            acknowledgment at once. Defaults to ``64``.
+        :param default_timeout: The default lifetime of a probe in seconds, or
+            ``None`` for no timeout. Defaults to ``None``.
+        :param max_resolved: The number of settled probe snapshots to retain
+            for later inspection. Defaults to ``64``.
+        :param monotonic: A zero-argument callable returning monotonically
+            increasing seconds. Defaults to :func:`time.monotonic`. Injecting a
+            clock lets callers advance time explicitly.
+        :returns: The newly created :class:`PingProbeManager
+            <h2.ping.PingProbeManager>`.
+
+        .. versionadded:: 4.5.0
+        """
+        self._ping_probes = PingProbeManager(
+            max_outstanding=max_outstanding,
+            default_timeout=default_timeout,
+            max_resolved=max_resolved,
+            monotonic=monotonic,
+        )
+        return self._ping_probes
+
+    @property
+    def ping_probes(self) -> PingProbeManager | None:
+        """
+        The active PING probe manager, or ``None`` if PING probe bookkeeping
+        has not been enabled with :meth:`enable_ping_probes`.
+
+        .. versionadded:: 4.5.0
+        """
+        return self._ping_probes
+
+    def send_ping_probe(self,
+                        opaque_data: bytes | None = None, *,
+                        timeout: float | None = None) -> bytes:
+        """
+        Send a PING frame and track it as an outstanding probe.
+
+        The identity is registered before the frame is written to the send
+        buffer, so a duplicate or over-limit registration raises without
+        emitting a frame. When ``opaque_data`` is ``None`` an unused eight-byte
+        identity is allocated.
+
+        PING probe bookkeeping must have been enabled with
+        :meth:`enable_ping_probes` first.
+
+        :param opaque_data: The eight-byte identity to use, or ``None`` to
+            allocate one.
+        :param timeout: The lifetime of this probe in seconds, overriding the
+            manager default. ``None`` falls back to the default.
+        :returns: The identity carried in the PING frame.
+
+        .. versionadded:: 4.5.0
+        """
+        manager = self._require_ping_probes()
+
+        if opaque_data is not None and (
+            not isinstance(opaque_data, bytes) or len(opaque_data) != 8
+        ):
+            msg = f"Invalid value for ping data: {opaque_data!r}"
+            raise ValueError(msg)
+
+        # Validate the connection state and the identity before touching the
+        # send buffer: a rejected registration must not emit a frame, and a
+        # frame that never hits the wire must not leave an outstanding probe.
+        self.state_machine.process_input(ConnectionInputs.SEND_PING)
+        identity = manager.register(opaque_data, timeout=timeout)
+
+        f = PingFrame(0)
+        f.opaque_data = identity
+        self._prepare_for_sending([f])
+
+        self.config.logger.debug("Send Ping probe %r", identity)
+        return identity
+
+    def poll_ping_probes(self, now: float | None = None) -> list[PingProbe]:
+        """
+        Advance PING probe bookkeeping to ``now`` and report expired probes.
+
+        Each probe whose deadline has passed is settled exactly once in the
+        ``TIMED_OUT`` state. No frame is emitted and no acknowledgment is
+        fabricated: what a timeout means to the connection is up to the caller.
+
+        This method does not depend on wall-clock time if a clock was injected
+        with :meth:`enable_ping_probes`; callers can also pass ``now``
+        explicitly to drive time forward deterministically.
+
+        :param now: The current monotonic timestamp, or ``None`` to read the
+            manager's clock.
+        :returns: Snapshots of the probes that expired during this call.
+
+        .. versionadded:: 4.5.0
+        """
+        return self._require_ping_probes().poll(now)
+
+    def _require_ping_probes(self) -> PingProbeManager:
+        """
+        Return the active probe manager, or raise if probes are not enabled.
+        """
+        if self._ping_probes is None:
+            msg = (
+                "PING probe bookkeeping is not enabled: call "
+                "enable_ping_probes() first"
+            )
+            raise RuntimeError(msg)
+        return self._ping_probes
 
     def reset_stream(self, stream_id: int, error_code: ErrorCodes | int = 0) -> None:
         """
@@ -1110,6 +1248,10 @@ class H2Connection:
             additional_data=(additional_data or b""),
         )
         self._prepare_for_sending([f])
+
+        # Once we have sent GOAWAY no further acknowledgments are expected, so
+        # every outstanding probe is given its terminal state.
+        self._abandon_all_ping_probes()
 
     def update_settings(self, new_settings: dict[SettingCodes | int, int]) -> None:
         """
@@ -1592,6 +1734,20 @@ class H2Connection:
         self.state_machine.process_input(ConnectionInputs.SEND_GOAWAY)
         self._prepare_for_sending([f])
 
+        # A connection terminated by an error will not see acknowledgments for
+        # probes that are still in flight.
+        self._abandon_all_ping_probes()
+
+    def _abandon_all_ping_probes(self) -> None:
+        """
+        Give every outstanding PING probe its terminal state.
+
+        Called when the connection closes, whether by a local GOAWAY, a remote
+        GOAWAY, or an error. No frames are emitted.
+        """
+        if self._ping_probes is not None:
+            self._ping_probes.close()
+
     def _receive_headers_frame(self, frame: HeadersFrame) -> tuple[list[Frame], list[Event]]:
         """
         Receive a headers frame on the connection.
@@ -1833,7 +1989,13 @@ class H2Connection:
 
         evt: PingReceived | PingAckReceived
         if "ACK" in frame.flags:
-            evt = PingAckReceived(ping_data=frame.opaque_data)
+            # Settle only the probe this acknowledgment answers. Unknown
+            # identities (or probes that were already settled) resolve to
+            # None and leave every other probe untouched.
+            probe: PingProbe | None = None
+            if self._ping_probes is not None:
+                probe = self._ping_probes.acknowledge(frame.opaque_data)
+            evt = PingAckReceived(ping_data=frame.opaque_data, probe=probe)
         else:
             evt = PingReceived(ping_data=frame.opaque_data)
 
@@ -1907,6 +2069,9 @@ class H2Connection:
         new_event.last_stream_id = frame.last_stream_id
         new_event.additional_data = frame.additional_data or None
         events.append(new_event)
+
+        # The peer is going away: nothing can acknowledge our probes any more.
+        self._abandon_all_ping_probes()
 
         return [], events
 

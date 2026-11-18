@@ -11,6 +11,18 @@ dev
 **API Changes (Backward Compatible)**
 
 - Support for Python 3.15 has been added.
+- Added optional PING probe bookkeeping. ``H2Connection.enable_ping_probes``,
+  ``send_ping_probe`` and ``poll_ping_probes`` record which PINGs this endpoint
+  sent, so that a ``PingAckReceived`` event settles the specific probe it
+  answers instead of being treated as an anonymous acknowledgment. Probes
+  record their send time, deadline, and a terminal state of ``ACKED``,
+  ``TIMED_OUT`` or ``ABANDONED``. Duplicate outstanding identities and probe
+  counts over the configured limit are rejected before a frame is emitted, and
+  unknown acknowledgments never settle another probe. Probe deadlines are
+  driven by a monotonic clock that the caller advances: timeout handling
+  fabricates no PING acknowledgment, and h2 starts no background timer thread.
+  The new exceptions ``DuplicatePingProbeError`` and ``TooManyPingProbesError``
+  report the local bookkeeping failures.
 
 **Bugfixes**
 

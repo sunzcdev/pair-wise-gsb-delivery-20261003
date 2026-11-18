@@ -84,6 +84,21 @@ Events
    :members:
 
 
+.. _h2-ping-probes-api:
+
+PING Probes
+-----------
+
+.. autoclass:: h2.ping.PingProbeManager
+   :members:
+
+.. autoclass:: h2.ping.PingProbe
+   :members:
+
+.. autoclass:: h2.ping.PingProbeState
+   :members:
+
+
 Exceptions
 ----------
 
@@ -99,6 +114,14 @@ Exceptions
    :members:
 
 .. autoclass:: h2.exceptions.RFC1122Error
+   :show-inheritance:
+   :members:
+
+.. autoclass:: h2.exceptions.DuplicatePingProbeError
+   :show-inheritance:
+   :members:
+
+.. autoclass:: h2.exceptions.TooManyPingProbesError
    :show-inheritance:
    :members:
 

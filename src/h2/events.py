@@ -21,6 +21,7 @@ if TYPE_CHECKING:  # pragma: no cover
     from hyperframe.frame import Frame
 
     from .errors import ErrorCodes
+    from .ping import PingProbe
 
 
 kw_only = {"kw_only": True}
@@ -423,14 +424,31 @@ class PingAckReceived(Event):
     received. It contains the 'opaque data' of the PING+ACK frame, allowing the
     user to correlate PINGs and calculate RTT.
 
+    When PING probe bookkeeping is enabled (see :meth:`enable_ping_probes
+    <h2.connection.H2Connection.enable_ping_probes>`), ``probe`` identifies the
+    specific probe this acknowledgment settled. It is ``None`` when no
+    outstanding probe matches, for example for an unsolicited acknowledgment or
+    when bookkeeping is disabled.
+
     .. versionadded:: 3.1.0
 
     .. versionchanged:: 4.0.0
        Removed deprecated but equivalent ``PingAcknowledged``.
+
+    .. versionchanged:: 4.5.0
+       Added the ``probe`` attribute.
     """
 
     ping_data: bytes
     """The data included on the ping."""
+
+    probe: PingProbe | None = None
+    """
+    The probe settled by this acknowledgment, or ``None`` if no outstanding
+    probe matched.
+
+    .. versionadded:: 4.5.0
+    """
 
     def __repr__(self) -> str:
         return f"<PingAckReceived ping_data:{_bytes_representation(self.ping_data)}>"

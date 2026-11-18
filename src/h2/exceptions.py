@@ -192,3 +192,27 @@ class DenialOfServiceError(ProtocolError):
     #: The error code corresponds to this kind of
     #: :class:`ProtocolError <h2.exceptions.ProtocolError>`
     error_code = ErrorCodes.ENHANCE_YOUR_CALM
+
+
+class DuplicatePingProbeError(H2Error):
+    """
+    An attempt was made to register a PING probe whose identity is already
+    outstanding.
+
+    This is a local bookkeeping error: no frame was emitted and no connection
+    state changed, so it does not carry an HTTP/2 error code.
+
+    .. versionadded:: 4.5.0
+    """
+
+
+class TooManyPingProbesError(H2Error):
+    """
+    An attempt was made to register more PING probes than the configured
+    maximum number of outstanding probes.
+
+    This is a local bookkeeping error: no frame was emitted and no connection
+    state changed, so it does not carry an HTTP/2 error code.
+
+    .. versionadded:: 4.5.0
+    """
