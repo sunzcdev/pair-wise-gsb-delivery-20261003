@@ -104,7 +104,7 @@ class RedisClient
       elsif type == 126 # '~'.ord
         parse_set(io)
       elsif type == 62 # '>'.ord
-        parse_array(io)
+        parse_push(io)
       elsif type.nil?
         raise SyntaxError, "Unexpected end of stream"
       else
@@ -139,6 +139,17 @@ class RedisClient
 
     def parse_set(io)
       parse_sequence(io, io.gets_integer)
+    end
+
+    def parse_push(io)
+      size = io.gets_integer
+      return Push.new if size < 0
+
+      push = Push.new(size)
+      size.times do |index|
+        push[index] = parse(io)
+      end
+      push
     end
 
     def parse_map(io)

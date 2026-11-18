@@ -1,5 +1,11 @@
 # Unreleased
 
+- Added an explicit RESP3 push channel (`RedisClient::PushChannel`). Push frames (`>` type) are now parsed as `RedisClient::Push` and delivered in arrival order to subscribers instead of being mistaken for replies to pending commands; regular calls and pipelines still return results in command order.
+- Push callbacks are invoked outside the protocol read lock, so they can issue their own commands (on another connection). Re-entering the connection that is dispatching the push raises `RedisClient::PushChannel::ReentrantDispatchError` rather than deadlocking.
+- Callback exceptions follow a configurable policy: `:isolate` (default, forwarded to an optional `on_error`) or `:raise` (wrapped in `RedisClient::PushChannel::CallbackError`). Normal replies are never silently dropped.
+- Pushes arriving without a subscriber are buffered up to a configurable capacity with `:reject` (default, raises `BufferOverflowError`) or `:drop_oldest` policies. Closing a client closes its owned channel and wakes any thread waiting on `PushChannel#pop`.
+- Added a per-connection protocol read lock so concurrent reads cannot interleave frames.
+
 # 0.31.0
 
 - Improved the Ruby driver buffering logic, should trigger GC less, particularly for large response and when using SSL.

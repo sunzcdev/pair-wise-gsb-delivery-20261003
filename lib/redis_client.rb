@@ -236,6 +236,8 @@ class RedisClient
     "NOSCRIPT" => NoScriptError,
   }.freeze
 
+  require "redis_client/push_channel"
+
   class << self
     def config(**kwargs)
       Config.new(client_implementation: self, **kwargs)
@@ -266,12 +268,20 @@ class RedisClient
 
   include Common
 
+  attr_reader :push_channel
+
   def initialize(config, **)
     super
     @middlewares = config.middlewares_stack.new(self)
     @raw_connection = nil
     @disable_reconnection = false
     @retry_attempt = nil
+    # A single channel is shared across (re)connections so pushes that arrived
+    # while no subscriber was attached are not lost on reconnect. A channel
+    # supplied through the config is owned by the caller and must outlive this
+    # client; an internally created one is closed with it.
+    @owns_push_channel = config.push_channel.nil?
+    @push_channel = config.push_channel || PushChannel.new
   end
 
   def inspect
@@ -500,6 +510,7 @@ class RedisClient
 
   def close
     @raw_connection&.close
+    @push_channel.close if @owns_push_channel && @push_channel && !@push_channel.closed?
     self
   end
 
@@ -596,6 +607,8 @@ class RedisClient
         raise ConnectionError, "Connection was closed or lost"
       end
 
+      # Pub/Sub consumes the whole stream (including push frames) directly;
+      # it deliberately bypasses the command reply/push split.
       raw_connection.read(timeout)
     rescue ReadTimeoutError
       nil
@@ -862,6 +875,7 @@ class RedisClient
     end
     @last_used_at = RedisClient.now
     @raw_connection.retry_attempt = @retry_attempt
+    @raw_connection.push_channel = @push_channel
 
     prelude = config.connection_prelude.dup
 
