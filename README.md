@@ -272,6 +272,60 @@ arguments. To avoid such problem, make sure to enclose hash literals:
 redis.call("HMSET", "hash", { "foo" => "bar" })
 ```
 
+#### Structured arguments
+
+For callers that want explicit, unambiguous argument semantics, `RedisClient::CommandBuilder` exposes a structured
+entry point. Arguments are declared by their shape instead of being inferred from an arbitrary object's `to_s`:
+
+```ruby
+builder = RedisClient::CommandBuilder
+
+# A scalar token (String, Symbol, Integer or Float only)
+builder.scalar(42)
+
+# An order preserving option pair
+builder.option(:withscores, true)
+
+# A list expanded in place
+builder.list([1, 2, 3])
+
+# A verbatim binary body
+builder.binary("\x00\xFF".b)
+```
+
+`CommandBuilder.build` turns a structured command into the flat Array of Strings that the drivers send, and
+`CommandBuilder.dump` performs the RESP encoding on top of it. The two steps can also be inspected separately through
+`build` and `RESP3.dump`:
+
+```ruby
+tokens = RedisClient::CommandBuilder.build([
+  "ZADD", "myzset",
+  RedisClient::CommandBuilder.option("NX", true),
+  RedisClient::CommandBuilder.option("CH", false),   # false is omitted
+  RedisClient::CommandBuilder.option("GT", nil),     # nil is omitted
+  RedisClient::CommandBuilder.list([1.0, "a", 2, "b"]),
+  RedisClient::CommandBuilder.binary("\x00\x01".b),
+])
+# => ["ZADD", "myzset", "NX", "1.0", "a", "2", "b", "\x00\x01"]
+
+RedisClient::RESP3.dump(tokens)        # the RESP encoded command
+RedisClient::CommandBuilder.dump([...]) # build and RESP encode in one step
+```
+
+The declaration rules are intentionally strict:
+
+- `nil`, `true` and `false` are not valid scalars. Their meaning must be declared with `option`: `nil` and `false`
+  emit nothing, while `true` emits only the option name (a flag).
+- An empty list emits no token, which is distinct from an empty string scalar that emits one empty token.
+- Nested lists and option values are expanded recursively, up to a fixed nesting limit
+  (`CommandBuilder::MAX_DEPTH`); self-referential structures are rejected rather than crashing.
+- Errors are raised before anything is sent and point at the offending argument path, e.g.
+  `Unsupported command argument type: TrueClass at [2][1]`.
+- The input Array and every nested Array/Hash are walked without being modified, and frozen inputs are accepted.
+
+The legacy `call`/`call_v` argument style (one level of Array/Hash flattening and keyword flags through
+`CommandBuilder.generate`) continues to work unchanged.
+
 ### Commands return values
 
 Contrary to the `redis` gem, `redis-client` doesn't do any type casting on the return value of commands.

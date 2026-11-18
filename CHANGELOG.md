@@ -1,5 +1,11 @@
 # Unreleased
 
+- Added a structured `RedisClient::CommandBuilder.build` entry point with explicit `scalar`, `option`, `list` and
+  `binary` argument nodes. `nil`/boolean flags follow declared omission rules, empty lists are distinct from empty
+  strings, recursion is depth limited with argument paths in error messages, inputs are never modified, and token
+  generation is separable from RESP encoding via `CommandBuilder.dump`. The legacy `CommandBuilder.generate`
+  argument style is preserved unchanged.
+
 # 0.31.0
 
 - Improved the Ruby driver buffering logic, should trigger GC less, particularly for large response and when using SSL.
