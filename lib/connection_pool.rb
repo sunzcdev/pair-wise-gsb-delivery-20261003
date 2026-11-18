@@ -182,6 +182,21 @@ class ConnectionPool
     @available.reap(idle_seconds:, &block)
   end
 
+  ##
+  # Preloads connections into the pool, up to +count+ (the pool size by
+  # default). Connections are created outside the pool lock and counted
+  # exactly like connections created on demand, so preloading never creates
+  # more connections than the pool size, even when checkouts race with it.
+  #
+  # Returns the number of connections created and made available. Raises
+  # ConnectionPool::PoolShuttingDownError if the pool is shut down.
+  #
+  #    pool = ConnectionPool.new(size: 5) { Redis.new }
+  #    pool.preload
+  def preload(count: size)
+    @available.preload(count:)
+  end
+
   # Number of pool entries available for checkout at this instant.
   def available
     @available.length

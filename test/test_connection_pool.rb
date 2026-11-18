@@ -834,4 +834,120 @@ class TestConnectionPool < Minitest::Test
       refute_equal obj.object_id, result.object_id # was copied across Ractor boundary
     end
   end
+
+  # Deterministic gate: threads inside the creation block signal when they
+  # arrived and wait until the test explicitly lets them continue. No sleeps
+  # are used to assume that a thread is blocked.
+  class CreationGate
+    def initialize
+      @mutex = Thread::Mutex.new
+      @arrived = Thread::ConditionVariable.new
+      @continue = Thread::ConditionVariable.new
+      @waiting = 0
+      @open = false
+    end
+
+    def enter
+      @mutex.synchronize do
+        @waiting += 1
+        @arrived.broadcast
+        @continue.wait(@mutex) until @open
+        @waiting -= 1
+      end
+    end
+
+    def wait_for_arrivals(count = 1)
+      @mutex.synchronize do
+        @arrived.wait(@mutex) until @waiting >= count
+      end
+    end
+
+    def open
+      @mutex.synchronize do
+        @open = true
+        @continue.broadcast
+      end
+    end
+  end
+
+  def test_slow_connection_creation_does_not_block_checkin
+    gate = CreationGate.new
+    block_factory = false
+    arrived = Thread::Queue.new
+    pool = ConnectionPool.new(size: 2, timeout: 5) do
+      if block_factory
+        arrived << true
+        gate.enter
+      end
+      Object.new
+    end
+
+    # The main thread holds the only connection before the gate is armed.
+    idle = pool.checkout
+    block_factory = true
+
+    # No idle connection is left, so this checkout has to create one and is
+    # blocked inside the factory.
+    creator = Thread.new do
+      conn = pool.checkout
+      pool.checkin
+      conn
+    end
+    arrived.pop
+
+    # Checking the existing connection in must not block on the factory, and a
+    # third thread can immediately check it out.
+    pool.checkin
+    assert_equal 1, pool.idle
+
+    reused = Thread.new do
+      conn = pool.checkout
+      pool.checkin
+      conn
+    end
+    assert_same idle, reused.value
+
+    gate.open
+    created = creator.value
+    refute_same idle, created
+
+    assert_equal 2, pool.idle
+    assert_equal 2, pool.available
+  end
+
+  def test_preload
+    pool = ConnectionPool.new(size: 3) { Object.new }
+
+    assert_equal 0, pool.idle
+    assert_equal 3, pool.preload
+    assert_equal 3, pool.idle
+    assert_equal 3, pool.available
+  end
+
+  def test_preload_does_not_exceed_the_pool_size
+    created = 0
+    pool = ConnectionPool.new(size: 2) do
+      created += 1
+      Object.new
+    end
+
+    assert_equal 2, pool.preload(count: 10)
+    assert_equal 2, created
+    assert_equal 2, pool.idle
+  end
+
+  def test_preload_accepts_a_smaller_count
+    pool = ConnectionPool.new(size: 5) { Object.new }
+
+    assert_equal 2, pool.preload(count: 2)
+    assert_equal 2, pool.idle
+    assert_equal 5, pool.available
+  end
+
+  def test_preload_raises_after_shutdown
+    pool = ConnectionPool.new(size: 1) { Object.new }
+    pool.shutdown {}
+
+    assert_raises(ConnectionPool::PoolShuttingDownError) { pool.preload }
+  end
 end

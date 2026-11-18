@@ -1,5 +1,22 @@
 # connection_pool Changelog
 
+Unreleased
+----------
+
+- Creating a connection no longer holds the pool lock. Capacity for a new
+  connection is reserved under the lock, the connection is created outside of
+  it and is admitted to the stack once it exists, so other threads keep
+  checking connections in and out and can use idle connections while a slow
+  factory runs. A reservation is settled exactly once: a factory error or a
+  cancelled caller releases it, a connection created after its caller was
+  cancelled stays on the stack, and a connection that finishes creating after
+  `shutdown` is passed to the shutdown block. The pool still never creates more
+  connections than its size.
+- Add `ConnectionPool#preload` (and `TimedStack#preload`) to create
+  connections up front. Preloading uses the same capacity reservations and
+  counting rules as lazy creation, so it can race with checkouts without
+  exceeding the pool size.
+
 3.0.3
 ------
 

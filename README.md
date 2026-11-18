@@ -100,8 +100,41 @@ cp.with { |conn| conn.get('some-count') }
 
 Like `shutdown`, `reload` will block until all connections are checked in and closed.
 
-## Reap
+## Preload
 
+Connections are created lazily by default, but you can create them up front
+with `preload`. This is useful after forking a server or when the first few
+requests must not pay the cost of establishing a connection.
+
+```ruby
+cp = ConnectionPool.new(size: 5) { Redis.new }
+cp.preload        # create all 5 connections
+cp.preload(count: 2) # or only the first two
+```
+
+Preloading uses the same capacity accounting as lazy creation, so it never
+creates more connections than the pool size, even when it runs while other
+threads are checking connections out.
+
+## Slow connection creation
+
+Creating a connection can be slow: opening a socket, performing a TLS
+handshake and authenticating may take a while. The pool does not hold its lock
+while your block runs. Capacity for a new connection is reserved under the
+lock, the connection is created outside of it and is admitted to the pool when
+it is ready. Other threads keep checking connections in and out, and can use
+connections that are already idle, while a slow connection is being created.
+
+A reserved slot is always settled:
+
+* if the block raises, or the creating thread is cancelled before a connection
+  exists, the slot is released for another thread;
+* if the creating thread is cancelled after the connection exists, the
+  connection is still added to the pool;
+* if the pool is shut down while a connection is being created, the late
+  connection is passed to the shutdown block instead of being added.
+
+## Reap
 You can call `reap` periodically on the ConnectionPool instance to close connections that were created but have not been used for a certain amount of time. This can be useful in environments where connections are expensive.
 
 You can specify how many seconds the connections have to be idle for them to be reaped, defaulting to 60 seconds.
