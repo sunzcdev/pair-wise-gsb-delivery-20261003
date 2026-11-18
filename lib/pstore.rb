@@ -120,7 +120,9 @@ require "digest"
 #
 # The transaction block:
 #
-# - May not contain a nested call to #transaction.
+# - By default may not contain a nested call to #transaction; see
+#   {Nested Transactions}[rdoc-ref:PStore@Nested+Transactions] for the
+#   explicitly enabled nested-transaction mode.
 # - Is the only context where methods that read from or write to
 #   the store are allowed.
 #
@@ -173,8 +175,51 @@ require "digest"
 #
 #   store.transaction(true) do
 #     # Read-only transaction:
-#     # Calls to #transaction, #[]=, and #delete are not allowed here.
+#     # Calls to #[]= and #delete are not allowed here.
 #   end
+#
+# === Nested Transactions
+#
+# Nested transactions are disabled by default: calling #transaction while a
+# transaction is already active raises PStore::Error.  They can be enabled
+# explicitly when the store is created:
+#
+#   store = PStore.new('t.store', nested_transactions: true)
+#
+# When enabled, a #transaction call inside an active transaction opens a new
+# level with savepoint semantics:
+#
+# - Each level starts from a deep copy (via Marshal) of the current table,
+#   which acts as its savepoint.
+# - A level that finishes normally, or that calls #commit, merges its changes
+#   into the surrounding level's table and merely exits its own block.
+# - A level that calls #abort, or whose block raises an exception, restores
+#   its own savepoint, discarding only the changes made at that level;
+#   the surrounding level keeps running with its earlier data.
+# - #commit and #abort are scoped to the level that calls them: they only
+#   exit that level's block and never touch an outer or an inner level.
+# - Only the outermost level opens, locks, and writes the file, and only when
+#   it finishes without being aborted or raising.  Inner levels never perform
+#   any file I/O.
+#
+#   store.transaction do
+#     store[:a] = 1
+#     store.transaction do           # inner level
+#       store[:b] = 2
+#       store.abort                  # discard only :b
+#     end
+#     store[:c] = 3
+#   end
+#   # Persisted data: {a: 1, c: 3}
+#
+# A read-only outer transaction can never be upgraded to a writable one:
+# an inner call with +read_only+ as +false+ raises PStore::Error, and writes
+# remain forbidden at every level.
+#
+# Restoring a savepoint rebuilds the store's table through Marshal, so the
+# sharing relationships documented for the persisted data are restored.
+# Objects the calling code already holds references to are not copied back,
+# and arbitrary external side effects performed on them are not undone.
 #
 # == Hierarchical Values
 #
@@ -385,9 +430,18 @@ class PStore
   # not affected.
   #
   #   store = PStore.new(path, follow_symlink: false)
+#
+# If keyword argument +nested_transactions+ is given as +true+,
+# #transaction may be called again inside an active transaction block.
+# Each nested call creates a savepoint-scoped level; see
+# {Nested Transactions}[rdoc-ref:PStore@Nested+Transactions].
+# By default (when +false+), a nested call raises PStore::Error.
+#
+#   store = PStore.new(path, nested_transactions: true)
   #
   def initialize(file, _thread_safe = false, thread_safe: _thread_safe,
-                 ultra_safe: false, follow_symlink: true)
+                 ultra_safe: false, follow_symlink: true,
+                 nested_transactions: false)
     dir = File::dirname(file)
     unless File::directory? dir
       raise PStore::Error, format("directory %s does not exist", dir)
@@ -396,12 +450,29 @@ class PStore
       raise PStore::Error, format("file %s not readable", file)
     end
     @filename = File.path(file)
-    @abort = false
     @ultra_safe = ultra_safe
     @thread_safe = thread_safe
     @nofollow = follow_symlink ? 0 : NOFOLLOW
+    @nested_transactions = nested_transactions
     @lock = Thread::Mutex.new
+    # Stack of per-level TransactionState objects; empty outside a transaction.
+    @transactions = []
   end
+
+  # Per-transaction-level state.  Each nested transaction pushes one of these,
+  # so #commit/#abort and read-only checks are scoped to their own level
+  # instead of sharing a single global flag.
+  class TransactionState # :nodoc:
+    attr_accessor :read_only, :savepoint, :abort, :tag
+
+    def initialize(read_only, savepoint)
+      @read_only = read_only
+      @savepoint = savepoint
+      @abort = false
+      @tag = Object.new
+    end
+  end
+  private_constant :TransactionState
 
   # Raises PStore::Error if the calling code is not in a PStore#transaction.
   def in_transaction
@@ -413,7 +484,7 @@ class PStore
   #
   def in_transaction_wr
     in_transaction
-    raise PStore::Error, "in read-only transaction" if @rdonly
+    raise PStore::Error, "in read-only transaction" if @transactions.last.read_only
   end
   private :in_transaction, :in_transaction_wr
 
@@ -535,26 +606,36 @@ class PStore
     @filename
   end
 
-  # Exits the current transaction block, committing any changes
+  # Exits the current transaction level, keeping any changes
   # specified in the
   # {transaction block}[rdoc-ref:PStore@The+Transaction+Block].
+  #
+  # In nested-transaction mode (see
+  # {Nested Transactions}[rdoc-ref:PStore@Nested+Transactions])
+  # this affects only the calling level: its changes are merged into the
+  # surrounding level and only that level's block is exited.
   #
   # Raises an exception if called outside a transaction block.
   def commit
-    in_transaction
-    @abort = false
-    throw self
+    state = current_transaction_state
+    state.abort = false
+    throw state.tag
   end
 
-  # Exits the current transaction block, discarding any changes
+  # Exits the current transaction level, discarding any changes
   # specified in the
   # {transaction block}[rdoc-ref:PStore@The+Transaction+Block].
   #
+  # In nested-transaction mode (see
+  # {Nested Transactions}[rdoc-ref:PStore@Nested+Transactions])
+  # this affects only the calling level: that level's savepoint is restored
+  # and only that level's block is exited, leaving surrounding levels intact.
+  #
   # Raises an exception if called outside a transaction block.
   def abort
-    in_transaction
-    @abort = true
-    throw self
+    state = current_transaction_state
+    state.abort = true
+    throw state.tag
   end
 
   # Opens a transaction block for the store.
@@ -564,11 +645,37 @@ class PStore
   # and write to the store.
   #
   # With argument +read_only+ as +true+, the block may not include calls
-  # to #transaction, #[]=, or #delete.
+  # to #[]= or #delete.
   #
-  # Raises an exception if called within a transaction block.
+  # By default, calling this method inside an active transaction block
+  # raises PStore::Error.  A store created with +nested_transactions: true+
+  # allows nested calls, each with its own savepoint scope; see
+  # {Nested Transactions}[rdoc-ref:PStore@Nested+Transactions].
+  #
+  # Raises an exception if called within a transaction block when nested
+  # transactions are not enabled.
   def transaction(read_only = false)  # :yields:  pstore
-    value = nil
+    # Mutex ownership is per-thread: a different thread blocked on the lock
+    # is starting its own outermost transaction, while the owning thread
+    # re-entering here is opening a nested level.
+    if @lock.owned?
+      begin_nested_transaction(read_only) { yield(self) }
+    else
+      begin_outermost_transaction(read_only) { yield(self) }
+    end
+  end
+
+  private
+
+  # State of the innermost active transaction level.
+  def current_transaction_state
+    raise PStore::Error, "not in transaction" if @transactions.empty?
+    @transactions.last
+  end
+
+  # Acquire the store-wide lock, honoring the original distinction between
+  # the thread-safe and non-thread-safe lock strategies.
+  def acquire_transaction_lock
     if !@thread_safe
       raise PStore::Error, "nested transaction" unless @lock.try_lock
     else
@@ -578,19 +685,25 @@ class PStore
         raise PStore::Error, "nested transaction"
       end
     end
+  end
+
+  # Outermost level: owns the file handle, the lock, and the only file write.
+  def begin_outermost_transaction(read_only)
+    value = nil
+    acquire_transaction_lock
     begin
-      @rdonly = read_only
-      @abort = false
+      @transactions.push(TransactionState.new(read_only, nil))
       file = open_and_lock_file(@filename, read_only)
       if file
         begin
           @table, checksum, original_data_size = load_data(file, read_only)
 
-          catch(self) do
-            value = yield(self)
+          catch(@transactions.last.tag) do
+            value = yield
           end
 
-          if !@abort && !read_only
+          state = @transactions.last
+          if !state.abort && !read_only
             save_data(checksum, original_data_size, file)
           end
         ensure
@@ -599,17 +712,54 @@ class PStore
       else
         # This can only occur if read_only == true.
         @table = {}
-        catch(self) do
-          value = yield(self)
+        catch(@transactions.last.tag) do
+          value = yield
         end
       end
     ensure
+      @transactions.pop
       @lock.unlock
     end
     value
   end
 
-  private
+  # Nested level: works only on the in-memory table through a savepoint.
+  # It never opens, locks, or writes the store file.
+  def begin_nested_transaction(read_only)
+    unless @nested_transactions
+      raise PStore::Error, "nested transaction"
+    end
+    outer_state = @transactions.last
+    if read_only == false && outer_state.read_only
+      raise PStore::Error,
+            "cannot upgrade a read-only transaction to a read-write transaction"
+    end
+
+    # A deep copy isolates this level's mutations from the outer savepoint.
+    savepoint = load(dump(@table))
+    state = TransactionState.new(outer_state.read_only || read_only, savepoint)
+    @transactions.push(state)
+    value = nil
+    begin
+      catch(state.tag) do
+        value = yield
+      end
+    rescue Exception
+      # An exception crossing this level rolls this level back first,
+      # then propagates toward the surrounding levels.
+      @table = state.savepoint
+      raise
+    ensure
+      @transactions.delete(state)
+    end
+    if state.abort
+      # Restore only this level's savepoint; the outer level keeps running.
+      @table = state.savepoint
+    end
+    # On a normal exit or #commit, @table already holds the merged changes.
+    value
+  end
+
   # :stopdoc:
 
   # Constant for relieving Ruby's garbage collector.

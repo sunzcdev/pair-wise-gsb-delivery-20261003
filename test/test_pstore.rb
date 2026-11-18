@@ -195,6 +195,266 @@ class PStoreTest < Test::Unit::TestCase
     File.unlink(second_file) rescue nil
   end
 
+  def test_nested_transactions_argument
+    assert_equal false, PStore.new(@pstore_file).instance_variable_get(:@nested_transactions)
+    assert_equal true, PStore.new(@pstore_file, nested_transactions: true).instance_variable_get(:@nested_transactions)
+    assert_equal false, PStore.new(@pstore_file, nested_transactions: false).instance_variable_get(:@nested_transactions)
+  end
+
+  def test_nested_transactions_merge_on_success
+    store = PStore.new(@pstore_file, nested_transactions: true)
+    store.transaction do
+      store[:outer] = 1
+      store.transaction do
+        store[:inner] = 2
+      end
+      assert_equal 1, store[:outer]
+      assert_equal 2, store[:inner]
+    end
+
+    # Reopen the file to verify the outermost commit persisted the merge.
+    reopened = PStore.new(@pstore_file)
+    reopened.transaction(true) do
+      assert_equal 1, reopened[:outer]
+      assert_equal 2, reopened[:inner]
+    end
+  end
+
+  def test_inner_abort_restores_only_its_savepoint
+    store = PStore.new(@pstore_file, nested_transactions: true)
+    store.transaction do
+      store[:outer] = "kept"
+      store.transaction do
+        store[:inner] = "discarded"
+        store.abort
+      end
+      assert_equal "kept", store[:outer]
+      assert_nil store[:inner]
+      store[:after] = "also kept"
+    end
+
+    reopened = PStore.new(@pstore_file)
+    reopened.transaction(true) do
+      assert_equal "kept", reopened[:outer]
+      assert_equal "also kept", reopened[:after]
+      assert_nil reopened[:inner]
+    end
+  end
+
+  def test_inner_commit_exits_only_inner_level
+    store = PStore.new(@pstore_file, nested_transactions: true)
+    reached_after_inner = false
+    store.transaction do
+      store[:outer] = 1
+      store.transaction do
+        store[:inner] = 2
+        store.commit
+        flunk("inner commit must exit the inner block")
+      end
+      reached_after_inner = true
+      assert_equal 2, store[:inner]
+    end
+    assert reached_after_inner
+  end
+
+  def test_outer_abort_discards_merged_inner_changes
+    store = PStore.new(@pstore_file, nested_transactions: true)
+    store.transaction do
+      store[:outer] = 1
+      store.transaction { store[:inner] = 2 }
+      store.abort
+    end
+
+    reopened = PStore.new(@pstore_file)
+    reopened.transaction(true) do
+      assert_nil reopened[:outer]
+      assert_nil reopened[:inner]
+    end
+  end
+
+  def test_only_outermost_transaction_writes_the_file
+    store = Class.new(PStore) do
+      attr_reader :save_count
+      def initialize(...)
+        super
+        @save_count = 0
+      end
+
+      private
+
+      def save_data(*)
+        @save_count += 1
+        super
+      end
+    end.new(@pstore_file, thread_safe: false, nested_transactions: true)
+
+    store.transaction do
+      store[:a] = 1
+      store.transaction do
+        store[:b] = 2
+        store.transaction { store[:c] = 3 }
+      end
+    end
+    assert_equal 1, store.save_count
+  end
+
+  def test_read_only_outer_cannot_be_upgraded_by_inner
+    store = PStore.new(@pstore_file, nested_transactions: true)
+    assert_raise(PStore::Error) do
+      store.transaction(true) do
+        store.transaction(false) { store[:x] = 1 }
+      end
+    end
+  end
+
+  def test_read_only_level_forbids_writes_even_when_nested
+    store = PStore.new(@pstore_file, nested_transactions: true)
+    assert_raise(PStore::Error) do
+      store.transaction do
+        store.transaction(true) { store[:x] = 1 }
+      end
+    end
+  end
+
+  def test_read_only_nested_levels_are_allowed
+    store = PStore.new(@pstore_file, nested_transactions: true)
+    store.transaction { store[:k] = "v" }
+    assert_nothing_raised do
+      store.transaction(true) do
+        store.transaction(true) do
+          assert_equal "v", store[:k]
+        end
+      end
+    end
+  end
+
+  def test_exception_rolls_back_each_crossed_level
+    store = PStore.new(@pstore_file, nested_transactions: true)
+    store.transaction do
+      store[:level1] = 1
+      begin
+        store.transaction do
+          store[:level2] = 2
+          begin
+            store.transaction do
+              store[:level3] = 3
+              raise "boom level 3"
+            end
+          rescue RuntimeError
+            assert_nil store[:level3]
+            assert_equal 2, store[:level2]
+          end
+          raise "boom level 2"
+        end
+      rescue RuntimeError
+        assert_nil store[:level2]
+        assert_nil store[:level3]
+        assert_equal 1, store[:level1]
+      end
+    end
+
+    reopened = PStore.new(@pstore_file)
+    reopened.transaction(true) do
+      assert_equal 1, reopened[:level1]
+      assert_nil reopened[:level2]
+      assert_nil reopened[:level3]
+    end
+  end
+
+  def test_uncaught_exception_aborts_whole_outermost_transaction
+    store = PStore.new(@pstore_file, nested_transactions: true)
+    assert_raise(RuntimeError) do
+      store.transaction do
+        store[:outer] = 1
+        store.transaction { store[:inner] = 2 }
+        raise "outer boom"
+      end
+    end
+
+    reopened = PStore.new(@pstore_file)
+    reopened.transaction(true) do
+      assert_nil reopened[:outer]
+      assert_nil reopened[:inner]
+    end
+  end
+
+  def test_commit_and_abort_are_scoped_per_level
+    store = PStore.new(@pstore_file, nested_transactions: true)
+    store.transaction do
+      store[:outer] = 1
+      store.transaction do
+        store[:committed] = 2
+        store.commit
+      end
+      store.transaction do
+        store[:aborted] = 3
+        store.abort
+      end
+      assert_equal 2, store[:committed]
+      assert_nil store[:aborted]
+    end
+  end
+
+  def test_rollback_restores_shared_references_under_marshal_rules
+    store = PStore.new(@pstore_file, nested_transactions: true)
+    store.transaction do
+      shared = ["root"]
+      store[:a] = shared
+      store[:b] = shared
+      store.transaction do
+        store[:a] << "inner"
+        store[:b] << "other"
+        store.abort
+      end
+      # Marshal round-trip restores the in-store sharing relationship.
+      assert_same(store[:a], store[:b])
+      assert_equal ["root"], store[:a]
+    end
+  end
+
+  def test_rollback_does_not_undo_external_side_effects
+    store = PStore.new(@pstore_file, nested_transactions: true)
+    held = ["before"]
+    store.transaction do
+      store[:held] = held
+      store.transaction do
+        held << "external side effect"
+        store.abort
+      end
+      # The store entry is rolled back, but the caller's own object is not.
+      assert_equal ["before", "external side effect"], held
+    end
+  end
+
+  def test_nested_transactions_work_in_thread_safe_mode
+    store = PStore.new(@pstore_file, true, nested_transactions: true)
+    store.transaction do
+      store[:outer] = 1
+      store.transaction do
+        store[:inner] = 2
+        store.abort
+      end
+      assert_nil store[:inner]
+    end
+
+    reopened = PStore.new(@pstore_file)
+    reopened.transaction(true) do
+      assert_equal 1, reopened[:outer]
+      assert_nil reopened[:inner]
+    end
+  end
+
+  def test_nested_transaction_returns_block_value
+    store = PStore.new(@pstore_file, nested_transactions: true)
+    inner_result = nil
+    outer_result = store.transaction do
+      inner_result = store.transaction { :inner }
+      :outer
+    end
+    assert_equal :inner, inner_result
+    assert_equal :outer, outer_result
+  end
+
   # Test that PStore's file operations do not blow up when default encodings are set
   def test_pstore_files_are_accessed_as_binary_files
     bug5311 = '[ruby-core:39503]'

@@ -84,6 +84,36 @@ wiki.transaction(true) do  # begin read-only transaction, no changes allowed
 end
 ```
 
+### Nested transactions
+
+Nested transactions are opt-in. By default, calling `transaction` inside an
+active transaction raises `PStore::Error`. Pass `nested_transactions: true`
+to `PStore.new` to enable savepoint-scoped nesting:
+
+```ruby
+store = PStore.new("nested.pstore", nested_transactions: true)
+store.transaction do              # outermost level owns the file write
+  store[:a] = 1
+  store.transaction do            # inner level gets its own savepoint
+    store[:b] = 2
+    store.abort                   # discards only :b, outer level keeps going
+  end
+  store[:c] = 3
+end
+# Persisted data: {a: 1, c: 3}
+```
+
+- An inner level that finishes normally (or calls `commit`) merges its
+  changes into the surrounding level and only exits its own block.
+- An inner `abort`, or an exception raised inside an inner level, restores
+  that level's savepoint, discarding only its own changes; exceptions then
+  continue to unwind, rolling back each level they cross.
+- `commit`/`abort` are scoped to the level that calls them.
+- A read-only outer transaction cannot be upgraded to a read-write one;
+  an inner writable transaction raises `PStore::Error`.
+- Only the outermost level opens, locks, and writes the file, and only when
+  it completes without being aborted or raising.
+
 ## Development
 
 After checking out the repo, run `bin/setup` to install dependencies. Then, run `rake test` to run the tests. You can also run `bin/console` for an interactive prompt that will allow you to experiment.
