@@ -20,6 +20,13 @@ Connection
    :exclude-members: inbound_flow_control_window
 
 
+Batch Receive Results
+---------------------
+
+.. autoclass:: h2.connection.ReceiveDataResult
+   :members:
+
+
 Configuration
 -------------
 

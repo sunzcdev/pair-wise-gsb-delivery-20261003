@@ -11,6 +11,12 @@ dev
 **API Changes (Backward Compatible)**
 
 - Support for Python 3.15 has been added.
+- Added ``H2Connection.receive_data_batch``, an alternative to
+  ``receive_data`` that returns an explicit ``ReceiveDataResult`` instead of
+  raising ``ProtocolError``. The result separates the events and outbound
+  control frames produced by the valid prefix of the input from the error
+  that ended the batch, and records the error offset (relative to the input
+  of that call) and the terminal state of the connection.
 
 **Bugfixes**
 

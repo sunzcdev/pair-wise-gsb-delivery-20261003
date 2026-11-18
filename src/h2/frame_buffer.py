@@ -41,6 +41,33 @@ class FrameBuffer:
         self._preamble_len = len(self._preamble)
         self._headers_buffer: list[HeadersFrame | ContinuationFrame | PushPromiseFrame] = []
 
+    def __len__(self) -> int:
+        """
+        The number of received bytes that have not yet been consumed as
+        complete frames.
+        """
+        return len(self._data)
+
+    @property
+    def pending_preamble_length(self) -> int:
+        """
+        The number of client connection preface bytes still expected
+        before frame parsing can begin.
+        """
+        return self._preamble_len
+
+    def discard(self) -> None:
+        """
+        Drop all buffered, unprocessed bytes, including any partially
+        accumulated header block.
+
+        This is used after a fatal error to ensure that the bytes
+        following the error are not later parsed as though they belonged
+        to a fresh connection.
+        """
+        self._data.clear()
+        self._headers_buffer = []
+
     def add_data(self, data: Buffer) -> None:
         """
         Add more data to the frame buffer.
