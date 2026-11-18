@@ -959,7 +959,307 @@ class TestLogDevice < Test::Unit::TestCase
     end
   end if env_tz_works
 
+  def test_cooperative_option_default_and_reader
+    logdev = d(@filename)
+    assert_equal false, logdev.cooperative
+    assert_equal Process.pid, logdev.pid
+    assert_nil logdev.reopen_error
+    assert_not_nil logdev.file_identity
+    logdev.close
+
+    logdev = d(@filename, cooperative: true)
+    assert_equal true, logdev.cooperative
+    assert_equal Process.pid, logdev.pid
+    assert_not_nil logdev.file_identity
+    logdev.close
+  ensure
+    logdev&.close
+  end
+
+  def test_cooperative_identity_separate_from_pid
+    logdev = d(@filename, cooperative: true, skip_header: true)
+    pid = logdev.pid
+    identity = logdev.file_identity
+    assert_equal Process.pid, pid
+    # Simulate what fork does: keep the inherited handle but change owner pid.
+    logdev.instance_variable_set(:@pid, pid + 1)
+    assert_equal pid + 1, logdev.pid
+    assert_equal identity, logdev.file_identity
+    logdev.close
+  end
+
+  def test_cooperative_rebinds_after_external_rotation
+    Dir.mktmpdir do |tmpdir|
+      log = File.join(tmpdir, "coop.log")
+      archived = log + ".0"
+      logdev = d(log, shift_age: 1, shift_size: 1_000_000,
+                      cooperative: true, skip_header: true)
+      begin
+        logdev.write("before-rotation\n")
+        original_identity = logdev.file_identity
+        assert_file.identical?(log, logdev.dev)
+
+        # Another process/tool rotates the file out from under us while our
+        # handle stays open (logger opens with share-delete semantics).
+        File.rename(log, archived)
+        File.write(log, "")
+        assert_file.exist?(archived)
+        assert_file.exist?(log)
+        refute(File.identical?(log, archived))
+
+        # The next write must rebound to the new file by real identity,
+        # never keep appending to the archived history file.
+        logdev.write("after-rotation\n")
+        assert_file.identical?(log, logdev.dev)
+        assert_not_equal original_identity, logdev.file_identity
+        assert_match(/after-rotation/, File.read(log))
+        assert_equal "before-rotation\n", File.read(archived)
+        assert_nil logdev.reopen_error
+      ensure
+        logdev.close
+      end
+    end
+  end
+
+  def test_cooperative_rebinds_after_fork
+    Dir.mktmpdir do |tmpdir|
+      log = File.join(tmpdir, "fork.log")
+      logdev = d(log, cooperative: true, skip_header: true)
+      begin
+        logdev.write("parent\n")
+        old_dev = logdev.dev
+        old_identity = logdev.file_identity
+
+        # Emulate a forked child precisely: the handle is inherited and
+        # still open, but the owning process identity changes.
+        logdev.instance_variable_set(:@pid, Process.pid + 1)
+        assert_equal Process.pid + 1, logdev.pid
+        assert_equal old_identity, logdev.file_identity
+
+        logdev.write("child-like\n")
+        # The first write in the "child" reopened the path and rebound to
+        # the current file identity rather than reusing the inherited one.
+        assert_equal Process.pid, logdev.pid
+        refute_same old_dev, logdev.dev
+        assert_file.identical?(log, logdev.dev)
+        assert_equal old_identity, logdev.file_identity
+        assert_match(/child-like/, File.read(log))
+        assert_nil logdev.reopen_error
+      ensure
+        logdev.close
+      end
+    end
+  end
+
+  def test_cooperative_reopen_failure_keeps_result
+    Dir.mktmpdir do |tmpdir|
+      log = File.join(tmpdir, "present.log")
+      missing = File.join(tmpdir, "missing", "absent.log")
+      logdev = d(log, cooperative: true, skip_header: true)
+      begin
+        good_dev = logdev.dev
+        assert_nil logdev.reopen_error
+        assert_raise(Errno::ENOENT) do
+          logdev.reopen(missing)
+        end
+        # The previously working device is retained and inspectable.
+        assert_equal good_dev, logdev.dev
+        assert_kind_of Errno::ENOENT, logdev.reopen_error
+        assert_equal log, logdev.filename
+
+        # A successful reopen clears the recorded failure.
+        target = File.join(tmpdir, "target.log")
+        logdev.reopen(target)
+        assert_nil logdev.reopen_error
+        assert_equal target, logdev.filename
+      ensure
+        logdev.close
+      end
+    end
+  end
+
+  def test_cooperative_rebind_failure_keeps_old_device
+    Dir.mktmpdir do |tmpdir|
+      log = File.join(tmpdir, "coop.log")
+      # A device whose reopen fails after construction, to make the rebind
+      # error deterministically reproducible without a mocking library.
+      logdev = Class.new(Logger::LogDevice) do
+        def initialize(...)
+          @fail_reopen = false
+          super
+        end
+
+        def fail_reopen!
+          @fail_reopen = true
+        end
+
+        def open_logfile(_)
+          raise Errno::EACCES, "denied" if @fail_reopen
+          super
+        end
+      end.new(log, cooperative: true, skip_header: true)
+      begin
+        good_dev = logdev.dev
+        logdev.write("ok\n")
+
+        # Make the identity check fail (path gone); the subsequent rebind
+        # then fails via the overridden #open_logfile.  At write time the
+        # error is swallowed but stays inspectable, and the old device stays.
+        logdev.fail_reopen!
+        File.rename(log, log + ".gone")
+        assert_nothing_raised do
+          logdev.write("retry\n")
+        end
+        assert_kind_of Errno::EACCES, logdev.reopen_error
+        assert_equal good_dev, logdev.dev
+      ensure
+        logdev.close
+        File.rename(log + ".gone", log) if File.exist?(log + ".gone")
+      end
+    end
+  end
+
+  def test_cooperative_does_not_write_to_archive_in_multiprocess
+    Dir.mktmpdir do |tmpdir|
+      # shift_age of 1 keeps a single archive slot, so rotation never has to
+      # rename an already-open older archive.
+      logfile = File.join(tmpdir, "coop.log")
+      stderr = run_cooperative_children(tmpdir, logfile, 2, 1, 12)
+
+      # The cooperative feature itself must never fail to rebind a handle:
+      # a "log reopening failed." warning would mean a stale handle was not
+      # recovered.  Plain rename/write denials on filesystems that disallow
+      # renaming or deleting open files (e.g. Windows) are platform limits
+      # outside the scope of this coordination, not cooperative-rotation
+      # failures; their warnings ("log writing failed.",
+      # "log rotation inter-process lock failed.", "log shifting failed.")
+      # use distinct wording and are not matched here.  The trailing
+      # whitespace requirement keeps the literal period from acting as a
+      # regex wildcard that could match the other "...failed." warnings.
+      assert_no_match(/log reopening failed\.\s/, stderr)
+
+      # The active log must be a distinct file identity from every archived
+      # slot; a stale handle left writing into an archive would make the two
+      # paths share one identity.
+      assert_file.exist?(logfile)
+      active_identity = File.stat(logfile).then { |s| [s.dev, s.rdev, s.ino] }
+      slots = Dir.glob("#{logfile}.*")
+      assert(slots.size >= 1, "expected rotations, got #{slots.inspect}")
+      slots.each do |slot|
+        slot_identity = File.stat(slot).then { |s| [s.dev, s.rdev, s.ino] }
+        refute_equal active_identity, slot_identity
+      end
+    end
+  end
+
+  def test_cooperative_archive_slot_not_overwritten_in_multiprocess
+    Dir.mktmpdir do |tmpdir|
+      logfile = File.join(tmpdir, "slot.log")
+      stderr = run_cooperative_children(tmpdir, logfile, 2, 1, 12)
+      # Handle rebinding must always succeed; see the platform caveat in the
+      # test above for why the other rename/write warnings are tolerated.
+      assert_no_match(/log reopening failed\.\s/, stderr)
+
+      # No two distinct paths may refer to the same file identity, which is
+      # what happens when a process keeps writing through a rotated handle.
+      paths = Dir.glob("#{logfile}*")
+      assert(paths.size >= 2, "expected rotations, got #{paths.inspect}")
+      identities = paths.map do |path|
+        stat = File.stat(path)
+        [stat.dev, stat.rdev, stat.ino]
+      end
+      assert_equal identities.size, identities.uniq.size
+    end
+  end
+
+  def test_cooperative_mode_is_opt_in
+    Dir.mktmpdir do |tmpdir|
+      log = File.join(tmpdir, "legacy.log")
+      logdev = d(log, shift_age: 1, shift_size: 10, skip_header: true)
+      assert_equal false, logdev.cooperative
+      # Legacy behavior is unchanged and still performs size rotation.
+      assert_nothing_raised { logdev.write("legacy\n") }
+      logdev.close
+    end
+  end
+
+  def test_logger_passes_cooperative_option_through
+    Dir.mktmpdir do |tmpdir|
+      log = File.join(tmpdir, "e2e.log")
+      logger = Logger.new(log, 1, 10, cooperative: true)
+      begin
+        assert_equal true, logger.logdev.cooperative
+        assert_equal Process.pid, logger.logdev.pid
+        assert_not_nil logger.logdev.file_identity
+        3.times { logger.info("x" * 20) }
+        assert_nil logger.logdev.reopen_error
+      ensure
+        logger.close
+      end
+
+      logger = Logger.new(log)
+      begin
+        assert_equal false, logger.logdev.cooperative
+      ensure
+        logger.close
+      end
+    end
+  end
+
+  def test_cooperative_with_io_device
+    Dir.mktmpdir do |tmpdir|
+      log = File.join(tmpdir, "io.log")
+      File.write(log, "")
+      io = File.open(log, File::WRONLY | File::APPEND)
+      logdev = d(io, cooperative: true)
+      begin
+        assert_equal log, logdev.filename
+        assert_nothing_raised { logdev.write("via-io\n") }
+        assert_nil logdev.reopen_error
+      ensure
+        logdev.close
+      end
+      assert_match(/via-io/, File.read(log))
+    end
+  end
+
   private
+
+  # Spawns +n+ child processes that cooperatively write to +logfile+.  Each
+  # child runs in the dedicated temporary directory +tmpdir+ (its own unique
+  # paths, never a shared global temp slot) and only requires logger itself,
+  # so it works even with RubyGems disabled in the child.
+  def run_cooperative_children(tmpdir, logfile, n, shift_age, iterations)
+    src = <<~'CHILD'
+      logfile, shift_age, iterations = ARGV
+      logger = Logger.new(logfile, Integer(shift_age), 10, cooperative: true)
+      Integer(iterations).times do
+        logger.info('0' * 15)
+      end
+      logger.close
+    CHILD
+    r, w = IO.pipe
+    children = (1..n).map do
+      # The parent test runner is invoked with RUBYOPT="-rhelper" (and a
+      # RUBYLIB that points at the test helpers).  A child started with
+      # --disable=gems would then fail to require test/unit through that
+      # inherited hook, so unset the test harness variables in the child.
+      # Explicit nil values are used (rather than deleting the keys) because
+      # some platforms do not treat an env hash embedded in the popen command
+      # array as a full environment replacement.
+      env = ENV.to_h.merge("RUBYOPT" => nil, "RUBYLIB" => nil)
+      IO.popen(
+        [env, EnvUtil.rubybin, *%w[--disable=gems -I], @top_dir, *%w[-rlogger -C], tmpdir,
+         '-e', src, logfile, shift_age.to_s, iterations.to_s],
+        err: w
+      )
+    end
+    w.close
+    children.each { |f| Process.wait(f.pid) }
+    stderr = r.read
+    r.close
+    stderr
+  end
 
   def run_children(n, args, src)
     r, w = IO.pipe
