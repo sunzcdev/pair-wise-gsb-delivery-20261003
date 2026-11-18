@@ -360,6 +360,59 @@ class RedisClient
       server_thread&.kill
     end
 
+    def test_connection_is_closed_after_protocol_error
+      tcp_server = TCPServer.new("127.0.0.1", 0)
+      tcp_server.setsockopt(Socket::SOL_SOCKET, Socket::SO_REUSEADDR, true)
+      port = tcp_server.addr[1]
+
+      server_thread = Thread.new do
+        session = tcp_server.accept
+        # A malformed streamed string: the reply boundary can't be recovered,
+        # so the connection must not be reused for further parsing.
+        session.write("$?\r\n+5\r\nHello\r\n")
+        session.close
+      end
+
+      client = new_client(host: "127.0.0.1", port: port)
+      error = assert_raises RedisClient::ProtocolError do
+        client.call("PING")
+      end
+      assert_includes error.message, "Expected streamed string chunk"
+      refute_predicate client, :connected?
+    ensure
+      server_thread&.kill
+    end
+
+    def test_streamed_string_reply
+      tcp_server = TCPServer.new("127.0.0.1", 0)
+      tcp_server.setsockopt(Socket::SOL_SOCKET, Socket::SO_REUSEADDR, true)
+      port = tcp_server.addr[1]
+
+      server_thread = Thread.new do
+        session = tcp_server.accept
+        io = RubyConnection::BufferedIO.new(session, read_timeout: 1, write_timeout: 1)
+        while command = RESP3.load(io)
+          case command.first
+          when "HELLO"
+            session.write("_\r\n")
+          when "GET"
+            session.write("$?\r\n;5\r\nHello\r\n;6\r\n World\r\n;0\r\n")
+          else
+            session.write("-ERR Unknown command #{command.first}\r\n")
+          end
+        end
+        session.close
+      end
+
+      client = new_client(host: "127.0.0.1", port: port)
+      assert_equal "Hello World", client.call("GET", "key")
+      # The terminator was fully consumed, the connection is still usable.
+      assert_equal "Hello World", client.call("GET", "key")
+      assert_predicate client, :connected?
+    ensure
+      server_thread&.kill
+    end
+
     def test_boolean_replies
       # The RESP3 protocol allows for boolean replies, but I'm not aware of
       # any commands doing so. So to test for potential future commands returning

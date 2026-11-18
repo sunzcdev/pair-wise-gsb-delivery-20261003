@@ -159,6 +159,7 @@ class RedisClient
       def gets_integer
         int = 0
         offset = @offset
+        streamed = false
         while true
           chr = @buffer.getbyte(offset)
 
@@ -166,6 +167,10 @@ class RedisClient
             if chr == 13 # "\r".ord
               @offset = offset + 2
               break
+            elsif chr == 63 && offset == @offset # '?'.ord
+              # Streamed string or aggregate marker, e.g. `$?\r\n` or `*?\r\n`.
+              # The value is delimited by a protocol terminator, not a length.
+              streamed = true
             else
               int = (int * 10) + chr - 48
             end
@@ -176,7 +181,7 @@ class RedisClient
           end
         end
 
-        int
+        streamed ? RESP3::STREAMED : int
       end
 
       private

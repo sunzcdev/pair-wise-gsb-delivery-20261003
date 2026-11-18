@@ -8,6 +8,10 @@ class RedisClient
     UnknownType = Class.new(Error)
     SyntaxError = Class.new(Error)
 
+    # Returned by the IO layer when the streamed (unknown length) marker `?`
+    # is read instead of an integer, e.g. `$?\r\n` or `*?\r\n`.
+    STREAMED = :streamed
+
     EOL = "\r\n".b.freeze
     EOL_SIZE = EOL.bytesize
     DUMP_TYPES = {
@@ -31,8 +35,8 @@ class RedisClient
       dump_array(command, buffer)
     end
 
-    def load(io)
-      parse(io)
+    def load(io, &block)
+      parse(io, &block)
     end
 
     def new_buffer
@@ -77,12 +81,20 @@ class RedisClient
       end
     end
 
-    def parse(io)
+    def parse(io, &block)
       type = io.getbyte
+      if type.nil?
+        raise SyntaxError, "Unexpected end of stream"
+      end
+
+      parse_type(io, type, &block)
+    end
+
+    def parse_type(io, type, &block)
       if type == 35 # '#'.ord
         parse_boolean(io)
       elsif type == 36 # '$'.ord
-        parse_blob(io)
+        parse_blob(io, &block)
       elsif type == 43 # '+'.ord
         parse_string(io)
       elsif type == 61 # '='.ord
@@ -98,15 +110,13 @@ class RedisClient
       elsif type == 95 # '_'.ord
         parse_null(io)
       elsif type == 42 # '*'.ord
-        parse_array(io)
+        parse_array(io, &block)
       elsif type == 37 # '%'.ord
-        parse_map(io)
+        parse_map(io, &block)
       elsif type == 126 # '~'.ord
-        parse_set(io)
+        parse_set(io, &block)
       elsif type == 62 # '>'.ord
-        parse_array(io)
-      elsif type.nil?
-        raise SyntaxError, "Unexpected end of stream"
+        parse_array(io, &block)
       else
         raise UnknownType, "Unknown sigil type: #{type.chr.inspect}"
       end
@@ -133,30 +143,80 @@ class RedisClient
       end
     end
 
-    def parse_array(io)
-      parse_sequence(io, io.gets_integer)
+    def parse_array(io, &block)
+      parse_sequence(io, io.gets_integer, &block)
     end
 
-    def parse_set(io)
-      parse_sequence(io, io.gets_integer)
+    def parse_set(io, &block)
+      parse_sequence(io, io.gets_integer, &block)
     end
 
-    def parse_map(io)
+    def parse_map(io, &block)
+      size = io.gets_integer
+      if STREAMED == size
+        return parse_streamed_map(io, &block)
+      end
+
       hash = {}
-      io.gets_integer.times do
-        hash[parse(io).freeze] = parse(io)
+      size.times do
+        hash[parse(io, &block).freeze] = parse(io, &block)
       end
       hash
     end
 
-    def parse_sequence(io, size)
+    def parse_sequence(io, size, &block)
+      if STREAMED == size
+        return parse_streamed_sequence(io, &block)
+      end
       return if size < 0 # RESP2 nil
 
       array = Array.new(size)
       size.times do |index|
-        array[index] = parse(io)
+        array[index] = parse(io, &block)
       end
       array
+    end
+
+    # Parses a streamed aggregate (`*?`, `~?`, `>?`), i.e. a sequence of
+    # replies terminated by a `.\r\n` marker rather than a declared length.
+    def parse_streamed_sequence(io, &block)
+      array = []
+      while type = parse_streamed_element_type(io)
+        array << parse_type(io, type, &block)
+      end
+      array
+    end
+
+    # Parses a streamed map (`%?`): alternating keys and values until the
+    # `.\r\n` terminator.
+    def parse_streamed_map(io, &block)
+      hash = {}
+      while type = parse_streamed_element_type(io)
+        hash[parse_type(io, type, &block).freeze] = parse(io, &block)
+      end
+      hash
+    end
+
+    # Reads the sigil of the next element inside a streamed aggregate.
+    # Returns nil once the `.` terminator has been fully consumed, so not
+    # a single byte of the next reply is swallowed.
+    def parse_streamed_element_type(io)
+      type = io.getbyte
+      if type.nil?
+        raise SyntaxError, "Unexpected end of stream inside streamed aggregate"
+      elsif type == 46 # '.'.ord
+        expect_eol(io)
+        nil
+      else
+        type
+      end
+    end
+
+    def expect_eol(io)
+      unless io.getbyte == 13 && io.getbyte == 10 # "\r\n"
+        raise SyntaxError, "Expected CRLF after streamed aggregate terminator"
+      end
+      nil
     end
 
     def parse_integer(io)
@@ -181,13 +241,57 @@ class RedisClient
       nil
     end
 
-    def parse_blob(io)
+    def parse_blob(io, &block)
       bytesize = io.gets_integer
+      if STREAMED == bytesize
+        return parse_streamed_string(io, &block)
+      end
       return if bytesize < 0 # RESP2 nil type
 
       str = io.read_chomp(bytesize)
       str.force_encoding(Encoding::BINARY) unless str.valid_encoding?
       str
+    end
+
+    # Parses a streamed string (`$?`): a succession of `;<bytesize>\r\n<chunk>\r\n`
+    # chunks terminated by a zero-length chunk (`;0\r\n`). The total size is never
+    # known in advance, parsing solely relies on the protocol terminator.
+    #
+    # When a block is given, each chunk is yielded as a binary string as soon as
+    # it is received and the whole string is never buffered, in which case this
+    # method returns nil. Otherwise chunks are concatenated and returned like a
+    # regular blob string.
+    def parse_streamed_string(io)
+      buffer = new_buffer unless block_given?
+      loop do
+        type = io.getbyte
+        unless type == 59 # ';'.ord
+          raise SyntaxError, "Expected streamed string chunk, got: #{type.nil? ? "end of stream" : type.chr.inspect}"
+        end
+
+        chunk_size = io.gets_integer
+        break if chunk_size == 0 # `;0\r\n` terminates the streamed string
+
+        unless chunk_size.is_a?(Integer) && chunk_size > 0
+          raise SyntaxError, "Invalid streamed string chunk size: #{chunk_size.inspect}"
+        end
+
+        # Chunk boundaries may split multi-byte characters, hence chunks are
+        # always binary. The encoding of the reassembled string is fixed up below.
+        chunk = io.read_chomp(chunk_size)
+        chunk.force_encoding(Encoding::BINARY)
+        if block_given?
+          yield chunk
+        else
+          buffer << chunk
+        end
+      end
+
+      if buffer
+        buffer.force_encoding(Encoding::UTF_8)
+        buffer.force_encoding(Encoding::BINARY) unless buffer.valid_encoding?
+        buffer
+      end
     end
 
     def parse_verbatim_string(io)

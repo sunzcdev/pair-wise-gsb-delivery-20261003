@@ -154,7 +154,127 @@ class RedisClient
       assert_parses "Some string", "=15\r\ntxt:Some string\r\n"
     end
 
+    def test_load_streamed_blob_string
+      assert_parses "Hello World!", "$?\r\n;5\r\nHello\r\n;7\r\n World!\r\n;0\r\n"
+    end
+
+    def test_load_streamed_blob_string_empty
+      assert_parses "", "$?\r\n;0\r\n"
+    end
+
+    def test_load_streamed_blob_string_across_multiple_reads
+      assert_parses "Hello World!", "$?\r\n;5\r\nHello\r\n;7\r\n World!\r\n;0\r\n", io_class: ChunkedStringIO
+    end
+
+    def test_load_streamed_blob_string_multibyte_split_across_chunks
+      # The UTF-8 encoding of € is E2 82 AC, split here across two chunks
+      assert_parses "a€b", "$?\r\n;2\r\na\xE2\r\n;3\r\n\x82\xACb\r\n;0\r\n".b
+    end
+
+    def test_load_streamed_blob_string_invalid_encoding
+      assert_parses "\xFF\xFE".b, "$?\r\n;1\r\n\xFF\r\n;1\r\n\xFE\r\n;0\r\n".b do |actual|
+        assert_equal Encoding::BINARY, actual.encoding
+      end
+    end
+
+    def test_load_streamed_blob_string_with_block
+      chunks = []
+      raw_io = StringIO.new("$?\r\n;5\r\nHello\r\n;7\r\n World!\r\n;0\r\n".b)
+      io = RedisClient::RubyConnection::BufferedIO.new(raw_io, read_timeout: 1, write_timeout: 1)
+      result = RESP3.load(io) { |chunk| chunks << chunk }
+
+      assert_nil result
+      assert_equal ["Hello", " World!"], chunks
+      assert_equal [Encoding::BINARY, Encoding::BINARY], chunks.map(&:encoding)
+      assert io.eof?, "Expected IO to be fully consumed: #{raw_io.read.inspect}"
+    end
+
+    def test_load_streamed_blob_string_inside_aggregate
+      assert_parses ["ab", 1], "*2\r\n$?\r\n;2\r\nab\r\n;0\r\n:1\r\n"
+    end
+
+    def test_load_streamed_blob_string_terminator_does_not_swallow_next_reply
+      raw_io = StringIO.new("$?\r\n;1\r\na\r\n;0\r\n+OK\r\n".b)
+      io = RedisClient::RubyConnection::BufferedIO.new(raw_io, read_timeout: 1, write_timeout: 1)
+      assert_equal "a", RESP3.load(io)
+      assert_equal "OK", RESP3.load(io)
+      assert io.eof?, "Expected IO to be fully consumed: #{raw_io.read.inspect}"
+    end
+
+    def test_load_streamed_blob_string_truncated
+      error = assert_raises EOFError do
+        RESP3.load(buffered_io("$?\r\n;5\r\nHel"))
+      end
+      assert_equal "EOFError", error.message
+    end
+
+    def test_load_streamed_blob_string_truncated_before_terminator
+      assert_raises EOFError do
+        RESP3.load(buffered_io("$?\r\n;5\r\nHello\r\n"))
+      end
+    end
+
+    def test_load_streamed_blob_string_invalid_chunk_type
+      error = assert_raises RESP3::SyntaxError do
+        RESP3.load(buffered_io("$?\r\n+5\r\nHello\r\n;0\r\n"))
+      end
+      assert_includes error.message, "Expected streamed string chunk"
+    end
+
+    def test_load_streamed_blob_string_invalid_chunk_size
+      error = assert_raises RESP3::SyntaxError do
+        RESP3.load(buffered_io("$?\r\n;-1\r\n"))
+      end
+      assert_includes error.message, "Invalid streamed string chunk size"
+    end
+
+    def test_load_streamed_array
+      assert_parses [1, 2, 3], "*?\r\n:1\r\n:2\r\n:3\r\n.\r\n"
+    end
+
+    def test_load_streamed_array_empty
+      assert_parses [], "*?\r\n.\r\n"
+    end
+
+    def test_load_streamed_set
+      assert_parses ["a", "b"], "~?\r\n+a\r\n+b\r\n.\r\n"
+    end
+
+    def test_load_streamed_map
+      assert_parses({ "a" => 1, "b" => 2 }, "%?\r\n+a\r\n:1\r\n+b\r\n:2\r\n.\r\n")
+    end
+
+    def test_load_streamed_nested_aggregates
+      assert_parses [[1], "x", { "k" => 9 }],
+        "*?\r\n*?\r\n:1\r\n.\r\n$?\r\n;1\r\nx\r\n;0\r\n%?\r\n+k\r\n:9\r\n.\r\n.\r\n"
+    end
+
+    def test_load_streamed_aggregate_terminator_does_not_swallow_next_reply
+      raw_io = StringIO.new("*?\r\n:1\r\n.\r\n:2\r\n".b)
+      io = RedisClient::RubyConnection::BufferedIO.new(raw_io, read_timeout: 1, write_timeout: 1)
+      assert_equal [1], RESP3.load(io)
+      assert_equal 2, RESP3.load(io)
+      assert io.eof?, "Expected IO to be fully consumed: #{raw_io.read.inspect}"
+    end
+
+    def test_load_streamed_aggregate_truncated
+      assert_raises EOFError do
+        RESP3.load(buffered_io("*?\r\n:1\r\n"))
+      end
+    end
+
+    def test_load_streamed_aggregate_invalid_terminator
+      error = assert_raises RESP3::SyntaxError do
+        RESP3.load(buffered_io("*?\r\n:1\r\n.X\r\n"))
+      end
+      assert_includes error.message, "Expected CRLF"
+    end
+
     private
+
+    def buffered_io(payload, io_class: StringIO)
+      RedisClient::RubyConnection::BufferedIO.new(io_class.new(payload.b), read_timeout: 1, write_timeout: 1)
+    end
 
     def assert_parses(expected, payload, io_class: StringIO)
       raw_io = io_class.new(payload.b)

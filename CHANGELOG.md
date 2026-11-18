@@ -1,5 +1,8 @@
 # Unreleased
 
+- The pure Ruby RESP3 decoder now supports streamed strings (`$?`) and streamed aggregates (`*?`, `%?`, `~?`, `>?`), which are delimited by protocol terminators rather than a declared length. `RESP3.load` and `RubyConnection#read` accept an optional block to consume streamed string chunks as they arrive, without buffering the whole value.
+- The Ruby driver now explicitly closes the connection when a reply can't be fully parsed (protocol error or truncated reply), as the boundary with the next reply can no longer be recovered.
+
 # 0.31.0
 
 - Improved the Ruby driver buffering logic, should trigger GC less, particularly for large response and when using SSL.

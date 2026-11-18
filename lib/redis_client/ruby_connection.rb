@@ -86,14 +86,21 @@ class RedisClient
       end
     end
 
-    def read(timeout = nil)
+    def read(timeout = nil, &block)
       if timeout.nil?
-        RESP3.load(@io)
+        RESP3.load(@io, &block)
       else
-        @io.with_timeout(timeout) { RESP3.load(@io) }
+        @io.with_timeout(timeout) { RESP3.load(@io, &block) }
       end
     rescue RedisClient::RESP3::Error => error
+      # The reply boundary couldn't be recovered, so the connection can no
+      # longer be parsed from and must not be reused.
+      close
       raise protocol_error(error.message)
+    rescue EOFError => error
+      # The stream ended in the middle of a reply, the connection is unusable.
+      close
+      raise connection_error(error.message)
     rescue SystemCallError, IOError, OpenSSL::SSL::SSLError => error
       raise connection_error(error.message)
     end
