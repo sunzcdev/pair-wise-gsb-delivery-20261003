@@ -275,6 +275,30 @@ require "digest"
 # Needless to say, if you're storing valuable data with \PStore, then you should
 # backup the \PStore file from time to time.
 #
+# == File Format and Integrity
+#
+# By default, a store file carries an explicit integrity header recording
+# the format version, the payload length, and a digest of the payload.
+# When a file is opened, the header is checked before the payload is
+# handed to Marshal:
+#
+# - An unknown format version raises PStore::UnsupportedVersionError.
+# - A file that ends before the declared payload length raises
+#   PStore::TruncatedFileError.
+# - Extra bytes after the payload raise PStore::TrailingDataError.
+# - A payload that does not match its recorded digest raises
+#   PStore::ChecksumMismatchError.
+#
+# \PStore never guesses at the format of a file: files written by older
+# versions (raw Marshal data without a header) are rejected unless the
+# store is opened with <tt>format: :legacy</tt> (read/write the old
+# format) or <tt>format: :upgrade</tt> (read the old format, then write
+# the file back in the current format).  See PStore.new.
+#
+# Note that the digest is a corruption-detection device only; it is not
+# a message authentication code and provides no protection against
+# deliberate tampering.
+#
 # == An Example Store
 #
 #  require "pstore"
@@ -340,6 +364,30 @@ class PStore
   class Error < StandardError
   end
 
+  # Raised when a store file carries an integrity header whose format
+  # version is not understood by this library.
+  class UnsupportedVersionError < Error
+  end
+
+  # Raised when a store file ends before the payload length declared
+  # in its integrity header.
+  class TruncatedFileError < Error
+  end
+
+  # Raised when a store file contains extra bytes after the payload
+  # declared in its integrity header.
+  class TrailingDataError < Error
+  end
+
+  # Raised when the payload digest recorded in the integrity header
+  # does not match the actual payload.
+  #
+  # Note: the digest is a corruption-detection device only.
+  # It is *not* a message authentication code and must not be relied
+  # upon to detect deliberate tampering.
+  class ChecksumMismatchError < Error
+  end
+
   # Whether \PStore should do its best to prevent file corruptions,
   # even when an unlikely error (such as memory-error or filesystem error) occurs:
   #
@@ -386,8 +434,23 @@ class PStore
   #
   #   store = PStore.new(path, follow_symlink: false)
   #
+  # Keyword argument +format+ selects how the on-disk file format is handled:
+  #
+  # - +:v1+ (the default): files carry an explicit integrity header
+  #   (format version, payload length, and a payload digest) which is
+  #   verified before the payload is handed to Marshal.  A file without
+  #   the header (written by an older \PStore) is rejected with
+  #   PStore::Error; \PStore never guesses at a file's format.
+  # - +:legacy+: read and write the historical raw-Marshal format with
+  #   no integrity header.
+  # - +:upgrade+: read a legacy file, then write it back in the +:v1+
+  #   format.  The original file is left untouched until the upgraded
+  #   content has been written successfully.
+  #
+  #   store = PStore.new(path, format: :upgrade)
+  #
   def initialize(file, _thread_safe = false, thread_safe: _thread_safe,
-                 ultra_safe: false, follow_symlink: true)
+                 ultra_safe: false, follow_symlink: true, format: :v1)
     dir = File::dirname(file)
     unless File::directory? dir
       raise PStore::Error, format("directory %s does not exist", dir)
@@ -395,11 +458,15 @@ class PStore
     if File::exist? file and not File::readable? file
       raise PStore::Error, format("file %s not readable", file)
     end
+    unless [:v1, :legacy, :upgrade].include?(format)
+      raise ArgumentError, format("unknown PStore file format: %s", format.inspect)
+    end
     @filename = File.path(file)
     @abort = false
     @ultra_safe = ultra_safe
     @thread_safe = thread_safe
     @nofollow = follow_symlink ? 0 : NOFOLLOW
+    @format = format
     @lock = Thread::Mutex.new
   end
 
@@ -584,14 +651,14 @@ class PStore
       file = open_and_lock_file(@filename, read_only)
       if file
         begin
-          @table, checksum, original_data_size = load_data(file, read_only)
+          @table, checksum, original_data_size, upgrade = load_data(file, read_only)
 
           catch(self) do
             value = yield(self)
           end
 
           if !@abort && !read_only
-            save_data(checksum, original_data_size, file)
+            save_data(checksum, original_data_size, upgrade, file)
           end
         ensure
           file.close
@@ -622,10 +689,27 @@ class PStore
   EMPTY_STRING = ""
   EMPTY_MARSHAL_DATA = Marshal.dump({})
   EMPTY_MARSHAL_CHECKSUM = CHECKSUM_ALGO.digest(EMPTY_MARSHAL_DATA)
+  DIGEST_LENGTH = CHECKSUM_ALGO.digest(EMPTY_STRING).bytesize
 
   EMPTY_MARSHAL_DATA.freeze
   EMPTY_MARSHAL_CHECKSUM.freeze
-  private_constant :CHECKSUM_ALGO, :EMPTY_STRING, :EMPTY_MARSHAL_DATA, :EMPTY_MARSHAL_CHECKSUM
+  private_constant :CHECKSUM_ALGO, :EMPTY_STRING, :EMPTY_MARSHAL_DATA, :EMPTY_MARSHAL_CHECKSUM, :DIGEST_LENGTH
+
+  # Integrity header layout (all integers big-endian):
+  #
+  #   magic          6 bytes  "PSTORE"
+  #   version        1 byte   unsigned, currently FORMAT_VERSION
+  #   payload_size   8 bytes  unsigned, byte length of the payload
+  #   digest_size    1 byte   unsigned, byte length of the digest
+  #   digest         digest_size bytes, CHECKSUM_ALGO.digest(payload)
+  #   payload        payload_size bytes, the Marshal data
+  #
+  # The digest detects accidental corruption only; it is not a message
+  # authentication code and provides no protection against tampering.
+  FORMAT_MAGIC = "PSTORE".b
+  FORMAT_VERSION = 1
+  FORMAT_HEADER_SIZE = FORMAT_MAGIC.bytesize + 1 + 8 + 1
+  private_constant :FORMAT_MAGIC, :FORMAT_VERSION, :FORMAT_HEADER_SIZE
 
   #
   # Open the specified filename (either in read-only mode or in
@@ -661,51 +745,115 @@ class PStore
   end
 
   # Load the given PStore file.
-  # If +read_only+ is true, the unmarshalled Hash will be returned.
-  # If +read_only+ is false, a 3-tuple will be returned: the unmarshalled
-  # Hash, a checksum of the data, and the size of the data.
+  # Returns a 4-tuple: the unmarshalled Hash, a checksum of the payload,
+  # the size of the payload, and whether the file must be rewritten in
+  # the current format (a pending upgrade from the legacy format).
   def load_data(file, read_only)
-    if read_only
-      begin
-        table = load(file)
-        raise Error, "PStore file seems to be corrupted." unless table.is_a?(Hash)
-      rescue EOFError
-        raise unless file.size == 0
-        # This seems to be a newly-created file.
-        table = {}
-      end
-      table
+    data = file.read
+    if data.empty?
+      # This seems to be a newly-created file.
+      table = {}
+      checksum = empty_marshal_checksum
+      size = empty_marshal_data.bytesize
+      upgrade = false
+    elsif data.start_with?(FORMAT_MAGIC)
+      payload = unwrap_payload(data)
+      table = load(payload)
+      raise Error, "PStore file seems to be corrupted." unless table.is_a?(Hash)
+      checksum = CHECKSUM_ALGO.digest(payload)
+      size = payload.bytesize
+      upgrade = false
     else
-      data = file.read
-      if data.empty?
-        # This seems to be a newly-created file.
-        table = {}
-        checksum = empty_marshal_checksum
-        size = empty_marshal_data.bytesize
-      else
+      # A file without the integrity header is in the legacy raw-Marshal
+      # format.  Never guess: only read it when explicitly requested.
+      case @format
+      when :legacy, :upgrade
         table = load(data)
+        raise Error, "PStore file seems to be corrupted." unless table.is_a?(Hash)
         checksum = CHECKSUM_ALGO.digest(data)
         size = data.bytesize
-        raise Error, "PStore file seems to be corrupted." unless table.is_a?(Hash)
+        upgrade = (@format == :upgrade)
+      else
+        raise Error, format(
+          "PStore file %s uses the legacy format without an integrity header; " \
+          "reopen it with format: :legacy to read it as-is or format: :upgrade to convert it",
+          @filename.inspect
+        )
       end
-      data.replace(EMPTY_STRING)
-      [table, checksum, size]
     end
+    data.replace(EMPTY_STRING)
+    [table, checksum, size, upgrade]
+  end
+
+  # Wrap a Marshal payload in the integrity header.
+  def wrap_payload(payload)
+    digest = CHECKSUM_ALGO.digest(payload)
+    FORMAT_MAGIC.dup <<
+      [FORMAT_VERSION, payload.bytesize, digest.bytesize].pack("CQ>C") <<
+      digest << payload
+  end
+
+  # Verify the integrity header of +data+ (which is known to start with
+  # FORMAT_MAGIC) and return the payload.  Raises a distinct PStore::Error
+  # subclass for each kind of integrity failure; never returns a guess.
+  def unwrap_payload(data)
+    if data.bytesize < FORMAT_HEADER_SIZE
+      raise TruncatedFileError, format(
+        "PStore file %s is truncated: incomplete integrity header", @filename.inspect)
+    end
+    version, payload_size, digest_size =
+      data.byteslice(FORMAT_MAGIC.bytesize, 10).unpack("CQ>C")
+    unless version == FORMAT_VERSION
+      raise UnsupportedVersionError, format(
+        "PStore file %s has unsupported format version %d", @filename.inspect, version)
+    end
+    unless digest_size == DIGEST_LENGTH
+      raise Error, format(
+        "PStore file %s uses an unsupported digest", @filename.inspect)
+    end
+    digest_offset = FORMAT_MAGIC.bytesize + 10
+    payload_offset = digest_offset + digest_size
+    expected_size = payload_offset + payload_size
+    if data.bytesize < expected_size
+      raise TruncatedFileError, format(
+        "PStore file %s is truncated: expected %d bytes, got %d",
+        @filename.inspect, expected_size, data.bytesize)
+    elsif data.bytesize > expected_size
+      raise TrailingDataError, format(
+        "PStore file %s has %d bytes of trailing garbage after the payload",
+        @filename.inspect, data.bytesize - expected_size)
+    end
+    digest = data.byteslice(digest_offset, digest_size)
+    payload = data.byteslice(payload_offset, payload_size)
+    unless CHECKSUM_ALGO.digest(payload) == digest
+      raise ChecksumMismatchError, format(
+        "PStore file %s payload does not match its recorded digest", @filename.inspect)
+    end
+    payload
   end
 
   ON_WINDOWS = true & (/mswin|mingw|bccwin|wince/ =~ RUBY_PLATFORM) # :nodoc:
   private_constant :ON_WINDOWS
 
-  def save_data(original_checksum, original_file_size, file)
+  def save_data(original_checksum, original_file_size, upgrade, file)
     new_data = dump(@table)
 
-    if new_data.bytesize != original_file_size || CHECKSUM_ALGO.digest(new_data) != original_checksum
-      if @ultra_safe && !ON_WINDOWS
+    # An unmodified transaction does not rewrite the file, except once
+    # when a legacy file is being upgraded to the current format.
+    if upgrade ||
+        new_data.bytesize != original_file_size ||
+        CHECKSUM_ALGO.digest(new_data) != original_checksum
+      content = (@format == :legacy) ? new_data : wrap_payload(new_data)
+      if (@ultra_safe || upgrade) && !ON_WINDOWS
         # Once a file is locked, Windows does not guarantee that the
         # lock will be released until the file is closed.
-        save_data_with_atomic_file_rename_strategy(new_data, file)
+        #
+        # An upgrade is always written with the atomic rename strategy
+        # so that the original legacy file survives until the upgraded
+        # content is safely in place.
+        save_data_with_atomic_file_rename_strategy(content, file)
       else
-        save_data_with_fast_strategy(new_data, file)
+        save_data_with_fast_strategy(content, file)
       end
     end
 

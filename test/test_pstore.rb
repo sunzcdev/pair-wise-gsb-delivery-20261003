@@ -269,7 +269,124 @@ class PStoreTest < Test::Unit::TestCase
     data = File.binread(@pstore_file)
     File.binwrite(@pstore_file, data.byteslice(0, data.bytesize - 1))
 
-    assert_raise(EOFError) { @pstore.transaction(true) { @pstore[:foo] } }
+    assert_raise(PStore::TruncatedFileError) { @pstore.transaction(true) { @pstore[:foo] } }
+  end
+
+  def test_new_files_use_the_integrity_format
+    @pstore.transaction { @pstore[:foo] = "bar" }
+    assert_equal "PSTORE", File.binread(@pstore_file, 6)
+  end
+
+  def test_unmodified_transaction_does_not_rewrite_file
+    @pstore.transaction { @pstore[:foo] = "bar" }
+    content = File.binread(@pstore_file)
+    @pstore.transaction { @pstore[:foo] }
+    @pstore.transaction(true) { @pstore[:foo] }
+    assert_equal content, File.binread(@pstore_file)
+  end
+
+  def test_unknown_format_version_raises
+    @pstore.transaction { @pstore[:foo] = "bar" }
+    data = File.binread(@pstore_file)
+    data.setbyte(6, 255) # version byte follows the 6-byte magic
+    File.binwrite(@pstore_file, data)
+
+    assert_raise(PStore::UnsupportedVersionError) do
+      @pstore.transaction(true) { @pstore[:foo] }
+    end
+  end
+
+  def test_trailing_garbage_raises
+    @pstore.transaction { @pstore[:foo] = "bar" }
+    File.open(@pstore_file, "ab") { |f| f.write("junk") }
+
+    assert_raise(PStore::TrailingDataError) do
+      @pstore.transaction(true) { @pstore[:foo] }
+    end
+  end
+
+  def test_checksum_mismatch_raises
+    @pstore.transaction { @pstore[:foo] = "bar" }
+    data = File.binread(@pstore_file)
+    # Flip a payload byte without changing the file size.
+    data.setbyte(data.bytesize - 1, data.getbyte(data.bytesize - 1) ^ 0xFF)
+    File.binwrite(@pstore_file, data)
+
+    assert_raise(PStore::ChecksumMismatchError) do
+      @pstore.transaction(true) { @pstore[:foo] }
+    end
+  end
+
+  def test_truncated_header_raises
+    @pstore.transaction { @pstore[:foo] = "bar" }
+    File.binwrite(@pstore_file, File.binread(@pstore_file, 8))
+
+    assert_raise(PStore::TruncatedFileError) do
+      @pstore.transaction(true) { @pstore[:foo] }
+    end
+  end
+
+  def write_legacy_file(table = {foo: "bar"})
+    File.binwrite(@pstore_file, Marshal.dump(table))
+  end
+
+  def test_legacy_file_is_rejected_by_default
+    write_legacy_file
+
+    error = assert_raise(PStore::Error) do
+      @pstore.transaction(true) { @pstore[:foo] }
+    end
+    assert_match(/legacy/, error.message)
+  end
+
+  def test_legacy_file_can_be_read_in_legacy_mode
+    write_legacy_file
+
+    pstore = PStore.new(@pstore_file, format: :legacy)
+    assert_equal "bar", pstore.transaction(true) { pstore[:foo] }
+    # Legacy mode keeps writing the legacy format.
+    pstore.transaction { pstore[:baz] = 1 }
+    assert_equal Marshal.dump({foo: "bar", baz: 1}), File.binread(@pstore_file)
+  end
+
+  def test_legacy_file_can_be_upgraded
+    write_legacy_file
+
+    pstore = PStore.new(@pstore_file, format: :upgrade)
+    pstore.transaction { assert_equal "bar", pstore[:foo] }
+
+    # The file is now in the integrity format and readable by default.
+    assert_equal "PSTORE", File.binread(@pstore_file, 6)
+    assert_equal "bar", @pstore.transaction(true) { @pstore[:foo] }
+
+    # Once upgraded, unmodified transactions do not rewrite the file.
+    content = File.binread(@pstore_file)
+    @pstore.transaction { @pstore[:foo] }
+    assert_equal content, File.binread(@pstore_file)
+  end
+
+  def test_upgrade_preserves_original_file_until_success
+    omit("atomic rename strategy is not used on Windows") if Gem.win_platform?
+
+    write_legacy_file
+    legacy_content = File.binread(@pstore_file)
+
+    pstore = PStore.new(@pstore_file, format: :upgrade)
+    original_rename = File.method(:rename)
+    EnvUtil.suppress_warning do
+      File.define_singleton_method(:rename) { |*_args| raise Errno::EIO }
+    end
+
+    assert_raise(Errno::EIO) { pstore.transaction { pstore[:foo] } }
+    assert_equal legacy_content, File.binread(@pstore_file)
+  ensure
+    EnvUtil.suppress_warning do
+      File.define_singleton_method(:rename, original_rename) if original_rename
+    end
+  end
+
+  def test_invalid_format_option_raises
+    assert_raise(ArgumentError) { PStore.new(@pstore_file, format: :bogus) }
   end
 
   def test_store_operations_require_transaction_owner
