@@ -12,6 +12,7 @@ from typing import TYPE_CHECKING, Any, cast
 from hpack import HeaderTuple
 from hyperframe.frame import AltSvcFrame, ContinuationFrame, DataFrame, Frame, HeadersFrame, PushPromiseFrame, RstStreamFrame, WindowUpdateFrame
 
+from .alternative_service import AlternativeServiceScope, OriginSource
 from .errors import ErrorCodes, _error_code_from_int
 from .events import (
     AlternativeServiceAvailable,
@@ -1184,12 +1185,18 @@ class H2Stream:
         """
         An Alternative Service frame was received on the stream. This frame
         inherits the origin associated with this stream.
+
+        The resulting event records that the advertisement is bound to this
+        stream and where its origin came from, so that a gateway can tell it
+        apart from a connection-level advertisement.
         """
         self.config.logger.debug(
             "Receive Alternative Service frame on stream %r", self,
         )
 
-        # If the origin is present, RFC 7838 says we have to ignore it.
+        # RFC 7838 gives no meaning to an origin on a stream-level
+        # advertisement: the origin is the stream's own. Our caller validates
+        # this, but be defensive in case the stream is driven directly.
         if frame.origin:
             return [], []
 
@@ -1201,9 +1208,13 @@ class H2Stream:
         # frame. If we need to pay attention, we'll have an event and should
         # fill it out.
         if events:
-            assert isinstance(events[0], AlternativeServiceAvailable)
-            events[0].origin = self._authority
-            events[0].field_value = frame.field
+            event = events[0]
+            assert isinstance(event, AlternativeServiceAvailable)
+            event.stream_id = frame.stream_id
+            event.scope = AlternativeServiceScope.STREAM
+            event.origin = self._authority
+            event.origin_source = OriginSource.AUTHORITY
+            event.field_value = frame.field
 
         return [], events
 

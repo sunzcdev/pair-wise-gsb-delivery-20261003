@@ -84,6 +84,38 @@ Events
    :members:
 
 
+Alternative Services
+--------------------
+
+The ALTSVC field value carried by an :class:`h2.events.AlternativeServiceAvailable`
+event is parsed by :func:`h2.alternative_service.parse_alternative_service_field`.
+The result is descriptive only: it never establishes a connection and never
+decides that an advertised origin or address is trusted.
+
+.. automodule:: h2.alternative_service
+   :members: parse_alternative_service_field, parse_origin, service_is_cross_origin,
+             validate_advertisement_scope, validate_connection_level_advertisement,
+             validate_stream_level_advertisement
+
+.. autoclass:: h2.alternative_service.AlternativeServiceField
+   :members:
+
+.. autoclass:: h2.alternative_service.AlternativeService
+   :members:
+
+.. autoclass:: h2.alternative_service.AlternativeServiceScope
+   :members:
+
+.. autoclass:: h2.alternative_service.OriginSource
+   :members:
+
+.. autoclass:: h2.alternative_service.MaxAgeStatus
+   :members:
+
+.. autoclass:: h2.alternative_service.InvalidAlternativeServiceAdvertisement
+   :show-inheritance:
+
+
 Exceptions
 ----------
 

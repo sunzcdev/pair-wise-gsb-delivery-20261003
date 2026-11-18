@@ -29,6 +29,13 @@ from hyperframe.frame import (
     WindowUpdateFrame,
 )
 
+from .alternative_service import (
+    AlternativeServiceScope,
+    InvalidAlternativeServiceAdvertisement,
+    MaxAgeStatus,
+    OriginSource,
+    validate_advertisement_scope,
+)
 from .config import H2Configuration
 from .errors import ErrorCodes, _error_code_from_int
 from .events import (
@@ -322,6 +329,13 @@ class H2Connection:
     # Keep in memory limited amount of results for streams closes
     MAX_CLOSED_STREAMS = 2**16
 
+    # The number of distinct (scope, origin) alternative service advertisements
+    # that are remembered, so repeats and clears can be reported.
+    MAX_ALTERNATIVE_SERVICE_ORIGINS = 2**10
+
+    # The number of alternative services remembered for a single origin.
+    MAX_ALTERNATIVE_SERVICES_PER_ORIGIN = 2**6
+
     def __init__(self, config: H2Configuration | None = None) -> None:
         self.state_machine = H2ConnectionStateMachine()
         self.streams: dict[int, H2Stream] = {}
@@ -400,6 +414,14 @@ class H2Connection:
         self._inbound_flow_control_window_manager = WindowManager(
             max_window_size=self.local_settings.initial_window_size,
         )
+
+        # The alternative services most recently advertised by the peer, keyed
+        # by (scope, origin). Only used to recognise repeated and clearing
+        # advertisements: h2 never acts on them.
+        self._alternative_services: dict[
+            tuple[AlternativeServiceScope, bytes | None],
+            dict[tuple[bytes, bytes | None, int | None], None],
+        ] = {}
 
         # When in doubt use dict-dispatch.
         self._frame_dispatch_table: dict[type[Frame], Callable] = {  # type: ignore
@@ -1929,14 +1951,31 @@ class H2Connection:
         reached.
 
         This frame can optionally be received either on a stream or on stream
-        0, and its semantics are different in each case.
+        0, and its semantics are different in each case. The two forms are
+        validated separately: a connection-level advertisement must name the
+        origin it applies to, while a stream-level advertisement must not (it
+        inherits the origin of the stream it was carried on). A frame that
+        combines the two illegally is ignored, as RFC 7838 requires.
+
+        Any resulting event records where the advertisement was carried and
+        which origin it is bound to. Nothing here establishes a connection,
+        resolves a name, or treats an advertised cross-origin address as
+        trusted.
         """
         events = self.state_machine.process_input(
             ConnectionInputs.RECV_ALTERNATIVE_SERVICE,
         )
         frames = []
 
-        if frame.stream_id:
+        try:
+            scope = validate_advertisement_scope(frame.stream_id, frame.origin)
+        except InvalidAlternativeServiceAdvertisement as err:
+            self.config.logger.debug(
+                "Ignoring ALTSVC frame on stream %d: %s", frame.stream_id, err,
+            )
+            return frames, events
+
+        if scope is AlternativeServiceScope.STREAM:
             # Given that it makes no sense to receive ALTSVC on a stream
             # before that stream has been opened with a HEADERS frame, the
             # ALTSVC frame cannot create a stream. If the stream is not
@@ -1948,24 +1987,79 @@ class H2Connection:
             else:
                 stream_frames, stream_events = stream.receive_alt_svc(frame)
                 frames.extend(stream_frames)
+                for event in stream_events:
+                    if isinstance(event, AlternativeServiceAvailable):
+                        self._record_alternative_service(event)
                 events.extend(stream_events)
         else:
-            # This frame is sent on stream 0. The origin field on the frame
-            # must be present, though if it isn't it's not a ProtocolError
-            # (annoyingly), we just need to ignore it.
-            if not frame.origin:
-                return frames, events
-
             # If we're a server, we want to ignore this (RFC 7838 says so).
             if not self.config.client_side:
                 return frames, events
 
             event = AlternativeServiceAvailable()
+            event.stream_id = frame.stream_id
+            event.scope = AlternativeServiceScope.CONNECTION
             event.origin = frame.origin
+            event.origin_source = OriginSource.FRAME
             event.field_value = frame.field
+            self._record_alternative_service(event)
             events.append(event)
 
         return frames, events
+
+    def _record_alternative_service(self, event: AlternativeServiceAvailable) -> None:
+        """
+        Record an advertisement so repeats and clears can be described.
+
+        The recorded state is only used to populate
+        :attr:`~h2.events.AlternativeServiceAvailable.repeated_services` and to
+        keep clearing advertisements meaningful. h2 never dials an advertised
+        address or trusts it, so this state is purely bookkeeping.
+
+        Only entries that h2 could fully interpret take part: an entry without a
+        protocol identifier or without a usable port has no reliable identity,
+        so it is reported in the event but never treated as a repeat or a
+        clear.
+        """
+        key = (event.scope, event.origin)
+        previous = self._alternative_services.pop(key, {})
+
+        advertisement = event.advertisement
+        identifiable = tuple(
+            service for service in advertisement.services
+            if service.protocol_id and service.port is not None
+        )
+
+        repeated = tuple(
+            service for service in identifiable
+            if not service.is_clearing and service.identity in previous
+        )
+        event.repeated_services = repeated
+
+        if advertisement.is_clear:
+            # The advertisement withdraws everything previously advertised for
+            # this origin, so there is nothing left to compare against later.
+            return
+
+        current = dict(previous)
+        for service in identifiable:
+            if service.is_clearing:
+                current.pop(service.identity, None)
+            elif service.max_age_status is not MaxAgeStatus.INVALID:
+                current[service.identity] = None
+
+        while len(current) > self.MAX_ALTERNATIVE_SERVICES_PER_ORIGIN:
+            current.pop(next(iter(current)))
+
+        if not current:
+            return
+
+        # Re-insert last so the most recently used origin is kept when the cache
+        # is trimmed below.
+        self._alternative_services[key] = current
+
+        while len(self._alternative_services) > self.MAX_ALTERNATIVE_SERVICE_ORIGINS:
+            del self._alternative_services[next(iter(self._alternative_services))]
 
     def _receive_unknown_frame(self, frame: ExtensionFrame) -> tuple[list[Frame], list[Event]]:
         """

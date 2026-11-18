@@ -14,6 +14,15 @@ import binascii
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
+from .alternative_service import (
+    AlternativeService,
+    AlternativeServiceField,
+    AlternativeServiceScope,
+    MaxAgeStatus,
+    OriginSource,
+    parse_alternative_service_field,
+    service_is_cross_origin,
+)
 from .settings import ChangedSetting, SettingCodes, Settings, _setting_code_from_int
 
 if TYPE_CHECKING:  # pragma: no cover
@@ -606,15 +615,42 @@ class AlternativeServiceAvailable(Event):
 
     This event also carries what RFC 7838 calls the "Alternative Service Field
     Value", which is formatted like a HTTP header field and contains the
-    relevant alternative service information. h2 does not parse or in any
-    way modify that information: the user is required to do that.
+    relevant alternative service information.
+
+    Because an ALTSVC frame can be carried either on stream 0 (where it applies
+    to the origin named in the frame) or on a regular stream (where it applies
+    to that stream's origin), the event distinguishes the two. :attr:`scope`
+    and :attr:`stream_id` record where the advertisement was carried, while
+    :attr:`origin` and :attr:`origin_source` record which origin it is bound
+    to. A stream-level advertisement is never applied to the whole connection.
+
+    The event is purely advisory. Receiving it does not establish a connection,
+    does not resolve names, and does not mark a cross-origin address as
+    trusted. :attr:`advertisement` is a parsed, reviewable description of the
+    field value that preserves unknown protocol identifiers and the raw bytes
+    of every alternative service. Repeated advertisements are reported through
+    :attr:`repeated_services`, and clearing advertisements through
+    :attr:`is_clearing` and :attr:`clears_all`.
 
     This event can only be fired on the client end of a connection.
 
     .. versionadded:: 2.3.0
+
+    .. versionchanged:: 4.5.0
+       Added :attr:`stream_id`, :attr:`scope`, :attr:`origin_source`,
+       :attr:`advertisement` and :attr:`repeated_services`. ``field_value``
+       remains the raw field value exactly as sent.
     """
 
     def __init__(self) -> None:
+        #: The ID of the stream the ALTSVC frame was carried on. ``0`` means
+        #: the frame was carried on the connection.
+        self.stream_id: int | None = None
+
+        #: Whether this advertisement applies to the whole connection or to a
+        #: single stream's origin.
+        self.scope: AlternativeServiceScope | None = None
+
         #: The origin to which the alternative service field value applies.
         #: This field is either supplied by the server directly, or inferred by
         #: h2 from the ``:authority`` pseudo-header field that was sent
@@ -622,12 +658,113 @@ class AlternativeServiceAvailable(Event):
         #: received.
         self.origin: bytes | None = None
 
+        #: Where :attr:`origin` came from. ``None`` while the event is being
+        #: constructed by h2.
+        self.origin_source: OriginSource | None = None
+
         #: The ALTSVC field value. This contains information about the HTTP
-        #: alternative service being advertised by the server. h2 does
-        #: not parse this field: it is left exactly as sent by the server. The
-        #: structure of the data in this field is given by `RFC 7838 Section 3
-        #: <https://tools.ietf.org/html/rfc7838#section-3>`_.
+        #: alternative service being advertised by the server. h2
+        #: leaves this field exactly as sent by the server; the structure of
+        #: the data in this field is given by `RFC 7838 Section 3
+        #: <https://tools.ietf.org/html/rfc7838#section-3>`_. Use
+        #: :attr:`advertisement` for a parsed view of the same bytes.
         self.field_value: bytes | None = None
+
+        #: Services in this advertisement that h2 has already seen advertised
+        #: by the peer for the same origin, scope and protocol/host/port triple.
+        self.repeated_services: tuple[AlternativeService, ...] = ()
+
+        self._advertisement: AlternativeServiceField | None = None
+
+    @property
+    def advertisement(self) -> AlternativeServiceField:
+        """
+        A parsed, reviewable description of :attr:`field_value`.
+
+        Parsing problems are reported through
+        :attr:`AlternativeServiceField.errors` rather than raised, and
+        :attr:`AlternativeServiceField.raw` always holds the original bytes.
+        """
+        if self._advertisement is None:
+            self._advertisement = parse_alternative_service_field(self.field_value or b"")
+        return self._advertisement
+
+    @property
+    def raw_field_value(self) -> bytes | None:
+        """The field value exactly as sent, or ``None`` if it was not recorded."""
+        return self.field_value
+
+    @property
+    def services(self) -> tuple[AlternativeService, ...]:
+        """The advertised alternative services, in the order they were sent."""
+        return self.advertisement.services
+
+    @property
+    def protocol_ids(self) -> tuple[bytes, ...]:
+        """
+        The advertised protocol identifiers, in order and exactly as sent.
+
+        Identifiers h2 does not recognise are preserved as opaque values.
+        """
+        return self.advertisement.protocol_ids
+
+    @property
+    def duplicates(self) -> tuple[AlternativeService, ...]:
+        """Services repeated within this single field value."""
+        return self.advertisement.duplicates
+
+    @property
+    def cross_origin_services(self) -> tuple[AlternativeService, ...]:
+        """
+        Services that name a host or port other than the bound origin's.
+
+        This is a description for review only: h2 neither resolves nor trusts
+        these addresses, and reporting one does not authorise connecting to it.
+        """
+        return tuple(
+            service for service in self.advertisement.services
+            if service_is_cross_origin(service, self.origin)
+        )
+
+    @property
+    def max_age(self) -> int | None:
+        """
+        The advertised maximum age in seconds, when unambiguous.
+
+        ``None`` when no ``ma`` parameter was present, when it was malformed,
+        or when the advertised services disagreed.
+        """
+        return self.advertisement.max_age
+
+    @property
+    def max_age_status(self) -> MaxAgeStatus:
+        """How the ``ma`` parameters of this advertisement were parsed."""
+        return self.advertisement.max_age_status
+
+    @property
+    def is_clearing(self) -> bool:
+        """Whether this advertisement withdraws alternative services."""
+        return self.advertisement.is_clear
+
+    @property
+    def clears_all(self) -> bool:
+        """Whether this advertisement is the RFC 7838 ``clear`` directive."""
+        return self.advertisement.clears_all
+
+    @property
+    def is_duplicate(self) -> bool:
+        """
+        Whether this advertisement repeats anything h2 has already seen.
+
+        This covers entries repeated inside one field value as well as services
+        re-advertised by the peer for the same origin and scope.
+        """
+        return bool(self.duplicates or self.repeated_services)
+
+    @property
+    def is_connection_level(self) -> bool:
+        """Whether the advertisement was carried on stream 0."""
+        return self.scope is AlternativeServiceScope.CONNECTION
 
     def __repr__(self) -> str:
         return (

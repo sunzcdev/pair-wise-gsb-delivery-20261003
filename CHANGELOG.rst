@@ -11,6 +11,14 @@ dev
 **API Changes (Backward Compatible)**
 
 - Support for Python 3.15 has been added.
+- ``AlternativeServiceAvailable`` now records where an ALTSVC advertisement was
+  carried (``stream_id`` and ``scope``), where its ``origin`` came from
+  (``origin_source``), and a parsed, reviewable description of the field value
+  (``advertisement``). Repeated and clearing advertisements are reported through
+  ``repeated_services``, ``duplicates``, ``is_duplicate`` and ``is_clearing``.
+  The raw ``field_value`` is unchanged. Connection-level and stream-level
+  advertisements are validated separately, and unknown protocol identifiers are
+  preserved as opaque values.
 
 **Bugfixes**
 
