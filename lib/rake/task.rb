@@ -38,6 +38,19 @@ module Rake
     # will be skipped unless you reenable them.
     attr_reader :already_invoked
 
+    # Exception raised by the most recent failed invocation of this
+    # task, or nil if the last invocation succeeded (or the task has
+    # not been invoked yet).
+    attr_reader :invocation_exception
+
+    # Historical trace of every exception this task has failed with.
+    # Failures are preserved here even when the task is reenabled,
+    # so retrying a task never erases its failure history.
+    attr_reader :failure_history
+
+    # Reason given when this task was declared non-retryable, or nil.
+    attr_reader :non_retryable_reason
+
     # Return task name
     def to_s
       name
@@ -108,6 +121,9 @@ module Rake
       @arg_names       = nil
       @locations       = []
       @invocation_exception = nil
+      @failure_history = []
+      @retryable       = nil
+      @non_retryable_reason = nil
       @order_only_prerequisites = []
     end
 
@@ -143,10 +159,50 @@ module Rake
     end
 
     # Reenable the task, allowing its tasks to be executed if the task
-    # is invoked again.
+    # is invoked again.  The historical failure trace
+    # (+failure_history+) is preserved.
     def reenable
       @already_invoked = false
       @invocation_exception = nil
+    end
+
+    # True if the last invocation of this task failed.  Failed tasks
+    # are the nodes a Rake::RetryPlan will consider for re-admission.
+    def failed?
+      @already_invoked && !@invocation_exception.nil?
+    end
+
+    # Declare that this task may be safely re-run after a failure.
+    # Returns self.
+    def retryable!(value=true)
+      @retryable = value
+      @non_retryable_reason = nil if value
+      self
+    end
+
+    # Declare that this task must not be retried after a failure.
+    # The optional +reason+ is reported back to the user when a
+    # Rake::RetryPlan rejects this node.  Returns self.
+    def non_retryable!(reason=nil)
+      @retryable = false
+      @non_retryable_reason = reason || "declared non-retryable"
+      self
+    end
+
+    # May this task be re-run after a failure?  Tasks with actions
+    # are assumed to have side effects and are *not* retryable by
+    # default; declare them with +retryable!+ if re-running them is
+    # known to be safe.  Tasks without actions are pure aggregation
+    # nodes and are always retryable.
+    def retryable?
+      return @retryable unless @retryable.nil?
+      default_retryable?
+    end
+
+    # Reason a Rake::RetryPlan would refuse to retry this task.
+    def rejection_reason
+      @non_retryable_reason ||
+        "task has side effects and is not declared retryable"
     end
 
     # Clear the existing prerequisites, actions, comments, and arguments of a rake task.
@@ -219,6 +275,10 @@ module Rake
           execute(task_args) if needed?
         rescue Exception => ex
           add_chain_to(ex, new_chain)
+          # Preserve the historical failure trace, but do not record
+          # the same cached exception twice when it is re-raised for
+          # a dependent task.
+          @failure_history << ex unless @invocation_exception.equal?(ex)
           @invocation_exception = ex
           raise ex
         end
@@ -286,6 +346,15 @@ module Rake
     def needed?
       true
     end
+
+    # Default retryability when the user has not declared anything:
+    # only tasks without actions (no side effects) are safe to
+    # re-run.  FileTask overrides this since its output can be
+    # rebuilt.
+    def default_retryable? # :nodoc:
+      @actions.empty?
+    end
+    private :default_retryable?
 
     # Timestamp for this task.  Basic tasks return the current time for their
     # time stamp.  Other tasks can be more sophisticated.

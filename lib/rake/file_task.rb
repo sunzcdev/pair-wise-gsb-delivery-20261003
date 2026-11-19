@@ -32,6 +32,14 @@ module Rake
 
     private
 
+    # File tasks produce rebuildable outputs, so they are considered
+    # safe to retry by default.  Note that a file task whose output
+    # is still valid will not be re-executed anyway, because
+    # +needed?+ is false for it.
+    def default_retryable?
+      true
+    end
+
     # Are there any prerequisites with a later time than the given time stamp?
     def out_of_date?(stamp)
       all_prerequisite_tasks.any? { |prereq|

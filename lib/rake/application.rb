@@ -183,6 +183,31 @@ module Rake
       t.invoke(*args)
     end
 
+    # Build an explicit Rake::RetryPlan for the given targets
+    # (defaults to the top level tasks).  The plan lists the failed
+    # nodes that must be re-admitted and the targets affected by
+    # those failures; nodes that already succeeded are left alone.
+    #
+    # Building a new plan invalidates any previously built plan:
+    # only the most recent plan version can be executed.
+    def retry_plan(*targets)
+      targets = top_level_tasks if targets.empty?
+      names = targets.flatten.map { |t| parse_task_string(t).first }
+      @retry_plan_version = retry_plan_version + 1
+      RetryPlan.new(self, names, @retry_plan_version)
+    end
+
+    # Version of the most recently built retry plan (0 if none).
+    def retry_plan_version # :nodoc:
+      @retry_plan_version ||= 0
+    end
+
+    # Invalidate all outstanding retry plans.  Called by
+    # Rake::RetryPlan#execute after a plan has been carried out.
+    def invalidate_retry_plans! # :nodoc:
+      @retry_plan_version = retry_plan_version + 1
+    end
+
     def parse_task_string(string) # :nodoc:
       /^([^\[]+)(?:\[(.*)\])$/ =~ string.to_s
 

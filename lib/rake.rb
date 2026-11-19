@@ -58,6 +58,7 @@ require_relative "rake/early_time"
 require_relative "rake/late_time"
 require_relative "rake/name_space"
 require_relative "rake/task_manager"
+require_relative "rake/retry_plan"
 require_relative "rake/application"
 require_relative "rake/backtrace"
 
