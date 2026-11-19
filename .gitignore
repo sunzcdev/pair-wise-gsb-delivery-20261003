@@ -1,0 +1,27 @@
+**/Gemfile.lock
+**/.yardoc
+**/doc
+**/docs
+**/coverage
+**/pkg
+**/*.gem
+**/.bundle
+**/.DS_Store
+**/.byebug_history
+
+
+# Appraisals
+**/*/gemfiles
+
+# Vendored gems
+**/vendor/**/*
+
+# IDE Settings
+/.idea/
+
+# rbenv configuration
+.ruby-version
+
+tags
+
+!docs

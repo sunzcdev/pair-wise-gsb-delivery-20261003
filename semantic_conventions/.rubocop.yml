@@ -1,0 +1,12 @@
+inherit_from: ../contrib/rubocop.yml
+
+AllCops:
+  Exclude:
+    - 'tmp/semconvrepo/**/*'
+    - 'vendor/**/*'
+
+Metrics/ModuleLength:
+  Enabled: false
+
+Naming/ClassAndModuleCamelCase: # because the source for generating module names isn't Rubyish enough
+  Enabled: false

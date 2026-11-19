@@ -1,0 +1,43 @@
+# frozen_string_literal: true
+
+# Copyright The OpenTelemetry Authors
+#
+# SPDX-License-Identifier: Apache-2.0
+
+require 'bundler/gem_tasks'
+require 'rake/testtask'
+require 'yard'
+
+require 'rubocop/rake_task'
+RuboCop::RakeTask.new
+YARD::Rake::YardocTask.new
+
+Rake::TestTask.new :test do |t|
+  t.libs << 'test'
+  t.libs << 'lib'
+  t.test_files = FileList['test/**/*_test.rb']
+end
+
+default_tasks =
+  if RUBY_ENGINE == 'truffleruby'
+    %i[test]
+  else
+    %i[test rubocop yard]
+  end
+
+task default: default_tasks
+
+namespace :bench do
+  bench_files = FileList['benchmarks/*_bench.rb']
+
+  bench_files.each do |file|
+    name = File.basename(file, '_bench.rb')
+    desc "Run #{name} benchmarks"
+    task name do
+      sh "bundle exec ruby #{file}"
+    end
+  end
+
+  desc 'Run all benchmarks'
+  task all: bench_files.map { |f| File.basename(f, '_bench.rb') }
+end

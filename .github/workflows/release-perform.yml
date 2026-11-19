@@ -1,0 +1,53 @@
+name: Force release
+
+on:
+  workflow_dispatch:
+    inputs:
+      name:
+        description: Component to release
+        required: true
+      version:
+        description: Version to release
+        required: true
+      flags:
+        description: Extra flags to pass to the release script
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+
+jobs:
+  release-perform:
+    if: ${{ github.repository == 'open-telemetry/opentelemetry-ruby' }}
+    permissions:
+      contents: write # required for creating releases
+      pull-requests: write # required for updating label on PR, posting comments
+      issues: write # required for creating new issues on failed releases
+    runs-on: ubuntu-26.04
+    env:
+      BUNDLE_GEMFILE: ${{ github.workspace }}/.toys/release/Gemfile
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # zizmor: ignore[artipacked] Credentials are required to push release tags and gh-pages
+          persist-credentials: true
+      - name: Install Ruby
+        uses: ruby/setup-ruby@7f797815d8adceb1c412e7abefdd1ab4abc47a5f # v1.335.0
+        with:
+          ruby-version: "4.0.9"
+          bundler-cache: true
+      - name: Perform release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GEM_HOST_API_KEY: ${{ secrets.RUBYGEMS_API_KEY }}
+          RELEASE_FLAGS: ${{ github.event.inputs.flags }}
+          RELEASE_NAME: ${{ github.event.inputs.name }}
+          RELEASE_VERSION: ${{ github.event.inputs.version }}
+        run: |
+          bundle exec toys release perform --yes --verbose \
+            "--release-ref=${{ github.sha }}" \
+            $RELEASE_FLAGS \
+            "$RELEASE_NAME=$RELEASE_VERSION" \
+            < /dev/null

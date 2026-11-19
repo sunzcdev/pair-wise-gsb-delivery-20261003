@@ -1,0 +1,24 @@
+version: "3.5"
+
+x-shared-config:
+  base: &base
+    command: /bin/bash
+    image: opentelemetry/opentelemetry-ruby
+    stdin_open: true
+    tmpfs:
+      - /tmp
+    tty: true
+    user: "1000:1000"
+    volumes:
+      - .:/app:cached
+      - bundle:/bundle
+
+services:
+  app:
+    <<: *base
+    build:
+      context: .
+    working_dir: /app
+
+volumes:
+  bundle:

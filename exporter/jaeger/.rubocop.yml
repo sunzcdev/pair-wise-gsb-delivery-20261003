@@ -1,0 +1,7 @@
+AllCops:
+  DisabledByDefault: true
+  Exclude:
+    - "**/*"
+
+Gemspec/RequiredRubyVersion:
+  Severity: info

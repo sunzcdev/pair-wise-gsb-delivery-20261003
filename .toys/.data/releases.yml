@@ -1,0 +1,93 @@
+# This file controls the toys-release gem.
+
+# The repo organization and name.
+repo: open-telemetry/opentelemetry-ruby
+
+# Disable pre-release GitHub check requirements.
+required_checks: false
+
+# If commits are added when release pull requests are open, update those pull
+# requests to reflect the new commits.
+update_existing_requests: true
+
+# Git user attached to commits for release pull requests.
+git_user_name: otelbot
+git_user_email: 197425009+otelbot@users.noreply.github.com
+
+# List of all releasable gems. Each gem should include:
+#  *  name: The name of the gem. (Required.)
+#  *  directory: Gem directory relative to the repo root.
+#     (Required unless the gem name matches the directory name exactly. This
+#     means it's always required in this repo because all the gem names include
+#     the word "opentelemetry" whereas the directory names do not.)
+#  *  version_rb_path: Path to version.rb relative to the gem directory.
+#     (Required only if it does not match the gem name. e.g. The gem
+#     "opentelemetry-sdk" would default to "lib/opentelemetry/sdk/version.rb",
+#     so this field is required only if the actual path is different.)
+#  *  changelog_path: Path to CHANGELOG.md relative to the gem directory.
+#     (Required only if it is not in the expected location, which is the file
+#     "CHANGELOG.md" at the root of the gem directory.)
+gems:
+  - name: opentelemetry-api
+    directory: api
+    version_rb_path: lib/opentelemetry/version.rb
+
+  - name: opentelemetry-registry
+    directory: registry
+    version_rb_path: lib/opentelemetry/instrumentation/registry/version.rb
+
+  - name: opentelemetry-sdk
+    directory: sdk
+
+  - name: opentelemetry-sdk-experimental
+    directory: sdk_experimental
+
+  - name: opentelemetry-common
+    directory: common
+
+  - name: opentelemetry-exporter-otlp
+    directory: exporter/otlp
+
+  - name: opentelemetry-exporter-otlp-common
+    directory: exporter/otlp-common
+
+  - name: opentelemetry-exporter-otlp-logs
+    directory: exporter/otlp-logs
+
+  - name: opentelemetry-exporter-otlp-metrics
+    directory: exporter/otlp-metrics
+
+  - name: opentelemetry-exporter-zipkin
+    directory: exporter/zipkin
+
+  - name: opentelemetry-propagator-b3
+    directory: propagator/b3
+
+  - name: opentelemetry-propagator-jaeger
+    directory: propagator/jaeger
+
+  - name: opentelemetry-semantic_conventions
+    directory: semantic_conventions
+  
+  - name: opentelemetry-config
+    directory: config
+
+  - name: opentelemetry-test-helpers
+    directory: test_helpers
+    version_rb_path: lib/opentelemetry/test_helpers/version.rb
+
+  - name: opentelemetry-metrics-api
+    directory: metrics_api
+    version_rb_path: lib/opentelemetry/metrics/version.rb
+
+  - name: opentelemetry-metrics-sdk
+    directory: metrics_sdk
+    version_rb_path: lib/opentelemetry/sdk/metrics/version.rb
+
+  - name: opentelemetry-logs-api
+    directory: logs_api
+    version_rb_path: lib/opentelemetry/logs/version.rb
+
+  - name: opentelemetry-logs-sdk
+    directory: logs_sdk
+    version_rb_path: lib/opentelemetry/sdk/logs/version.rb

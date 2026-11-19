@@ -1,0 +1,141 @@
+name: Test Gem
+description: Tests a specific Gem
+inputs:
+  gem:
+    description: Gem to test
+    required: true
+    type: string
+  ruby:
+    description: Ruby version to use
+    required: true
+    type: string
+  yard:
+    description: Run YARD documentation
+    required: false
+    type: boolean
+    default: false
+  rubocop:
+    description: Run Rubocop
+    required: false
+    type: boolean
+    default: false
+  build:
+    description: Build gem
+    required: false
+    type: boolean
+    default: false
+
+runs:
+  using: composite
+  steps:
+    - name: Setup
+      id: setup
+      shell: bash
+      env:
+        GEM: ${{ inputs.gem }}
+        RUBY_VERSION: ${{ inputs.ruby }}
+      run: |
+        # 🛠️ Setup 🛠️
+        dir=$(find . -iname "${GEM}.gemspec" -exec dirname {} \;)
+        echo "gem_dir=${dir}" >> $GITHUB_OUTPUT
+
+        # We install multiple ruby versions here, and that makes for some
+        # annoying bundler conflicts when we get to the JRuby step. Removing
+        # the lockfile slows things down a bit, but we should still get most
+        # of the benefits of bundler caching.
+        rm -f "${dir}/Gemfile.lock"
+
+        echo "cache_key=mri" >> $GITHUB_OUTPUT
+        if [[ "$RUBY_VERSION" == "jruby" ]]; then
+          echo "cache_key=jruby" >> $GITHUB_OUTPUT
+        elif [[ "$RUBY_VERSION" == "truffleruby" ]]; then
+          echo "cache_key=truffleruby" >> $GITHUB_OUTPUT
+        fi
+
+        echo "appraisals=false" >> $GITHUB_OUTPUT
+        if [[ -f "${dir}/Appraisals" ]]; then
+          echo "appraisals=true" >> $GITHUB_OUTPUT
+        fi
+
+    # Install ruby and bundle dependencies and cache!
+    # ...but not for appraisals, sadly.
+    - name: Install Ruby ${{ inputs.ruby }} with dependencies
+      if: "${{ steps.setup.outputs.appraisals == 'false' }}"
+      uses: ruby/setup-ruby@7f797815d8adceb1c412e7abefdd1ab4abc47a5f # v1.335.0
+      with:
+        ruby-version: "${{ inputs.ruby }}"
+        working-directory: "${{ steps.setup.outputs.gem_dir }}"
+        bundler: "latest"
+        bundler-cache: true
+        cache-version: "v1-${{ steps.setup.outputs.cache_key }}"
+
+    # If we're using appraisals, do it all manually.
+    - name: Install Ruby ${{ inputs.ruby }} without dependencies
+      if: "${{ steps.setup.outputs.appraisals == 'true' }}"
+      uses: ruby/setup-ruby@7f797815d8adceb1c412e7abefdd1ab4abc47a5f # v1.335.0
+      with:
+        ruby-version: "${{ inputs.ruby }}"
+        bundler: "latest"
+        working-directory: "${{ steps.setup.outputs.gem_dir }}"
+    - name: Install dependencies and generate appraisals
+      if: "${{ steps.setup.outputs.appraisals == 'true' }}"
+      shell: bash
+      run: |
+        # 💎 Install dependencies and generate appraisals 💎
+        bundle install --quiet --jobs=3 --retry=4
+        bundle exec appraisal generate
+      working-directory: "${{ steps.setup.outputs.gem_dir }}"
+
+    - name: Test Gem
+      shell: bash
+      env:
+        SIMPLECOV_FINALIZE_MERGE: false
+      run: |
+        # 🍿 Test Gem 🍿
+        if [[ -f "Appraisals" ]]; then
+          for i in `bundle exec appraisal list | sed 's/-/_/g' `; do
+            echo "::group::🔎 Appraising ${i}"
+            BUNDLE_GEMFILE=gemfiles/${i}.gemfile bundle install --quiet --jobs=3 --retry=4 && \
+            BUNDLE_GEMFILE=gemfiles/${i}.gemfile bundle show && \
+            BUNDLE_GEMFILE=gemfiles/${i}.gemfile bundle exec rake test
+            echo "::endgroup::"
+          done
+        else
+          bundle exec rake test
+        fi
+      working-directory: "${{ steps.setup.outputs.gem_dir }}"
+
+    - name: YARD
+      shell: bash
+      if: "${{ inputs.yard == 'true' }}"
+      run: |
+        # 📄 Yard Docs 📄
+        bundle exec rake yard
+      working-directory: "${{ steps.setup.outputs.gem_dir }}"
+
+    - name: Coverage
+      shell: bash
+      env:
+        GEM_DIR: "${{ steps.setup.outputs.gem_dir }}"
+      # This merges with the existing coverage reports generated during testing into 1 report.
+      run: |
+        bundle install --quiet --jobs=3 --retry=4
+        bundle exec rake collate_simplecov["${GEM_DIR}"]
+
+    - name: Rubocop
+      shell: bash
+      if: "${{ inputs.rubocop == 'true' }}"
+      run: |
+        # 🤖 Rubocop 🤖
+        bundle exec rake rubocop
+      working-directory: "${{ steps.setup.outputs.gem_dir }}"
+
+    - name: Build Gem
+      shell: bash
+      if: "${{ inputs.build == 'true' }}"
+      env:
+        GEM: ${{ inputs.gem }}
+      run: |
+        # 📦 Build Gem 📦
+        gem build "${GEM}.gemspec"
+      working-directory: "${{ steps.setup.outputs.gem_dir }}"
