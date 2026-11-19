@@ -18,6 +18,7 @@
 """DNS Zones."""
 
 import dataclasses
+import enum
 import io
 import os
 import struct
@@ -72,6 +73,157 @@ class NoDigest(dns.exception.DNSException):
 
 class DigestVerificationFailure(dns.exception.DNSException):
     """The ZONEMD digest failed to verify."""
+
+
+class DigestStatus(enum.Enum):
+    """The verification status of a single ZONEMD record.
+
+    The status distinguishes records that actually verified the zone from
+    records that could not do so, and keeps the reasons the RFC 8976
+    verification procedure treats as disqualifiers (a duplicate
+    scheme/hash-algorithm tuple, a serial mismatch) separate from records
+    that were never usable (an unsupported scheme or hash algorithm).
+    """
+
+    #: The record's digest matched a digest computed over the zone.
+    VALID = "valid"
+    #: The record's digest did not match the digest of the zone contents.
+    INVALID = "invalid"
+    #: The record's serial did not match the zone's SOA serial (RFC 8976
+    #: section 4 step 5.1).
+    SERIAL_MISMATCH = "serial mismatch"
+    #: Another ZONEMD record had the same scheme and hash algorithm, which
+    #: disqualifies every record sharing the tuple (RFC 8976 section 4
+    #: step 4).
+    DUPLICATE = "duplicate"
+    #: The record's scheme is not supported, so no digest could be computed.
+    UNSUPPORTED_SCHEME = "unsupported scheme"
+    #: The record's hash algorithm is not supported, so no digest could be
+    #: computed.
+    UNSUPPORTED_HASH_ALGORITHM = "unsupported hash algorithm"
+    #: Computing the digest over the zone failed for another reason, e.g. an
+    #: rdata that could not be converted to canonical form.  The record is not
+    #: dropped and the zone is not modified; the digest simply cannot verify.
+    COMPUTATION_ERROR = "digest computation error"
+
+
+class DigestExclusionReason(enum.Enum):
+    """Why an RRset was not covered by the ZONEMD digest.
+
+    RFC 8976 section 2.3 excludes the apex ZONEMD RRset, as well as any
+    RRSIG RRset that covers it, from the digested zone data.  Everything
+    else in the zone is covered.
+    """
+
+    #: The apex ZONEMD RRset (RFC 8976 section 2.3).
+    APEX_ZONEMD = "apex ZONEMD RRset"
+    #: An RRSIG RRset covering the apex ZONEMD RRset (RFC 8976 section 2.3).
+    APEX_ZONEMD_RRSIG = "RRSIG RRset covering the apex ZONEMD RRset"
+
+
+@dataclasses.dataclass(frozen=True)
+class ExcludedRRset:
+    """An RRset that is present in the zone but not covered by the digest.
+
+    :param reason: Why the RRset is excluded.
+    :type reason: :py:class:`DigestExclusionReason`
+    :param rdtype: The RRset's rdata type.
+    :type rdtype: :py:class:`dns.rdatatype.RdataType`
+    :param covers: The rdata type covered by the RRset; this is
+        :py:data:`dns.rdatatype.NONE` except for RRSIG RRsets.
+    :type covers: :py:class:`dns.rdatatype.RdataType`
+    :param rr_count: The number of resource records (rdata items) in the
+        RRset.
+    :type rr_count: int
+    """
+
+    reason: DigestExclusionReason
+    rdtype: dns.rdatatype.RdataType
+    covers: dns.rdatatype.RdataType
+    rr_count: int
+
+
+@dataclasses.dataclass(frozen=True)
+class DigestRecordResult:
+    """The verification result for a single ZONEMD record.
+
+    :param zonemd: The ZONEMD record that was checked.
+    :type zonemd: :py:class:`dns.rdtypes.ANY.ZONEMD.ZONEMD`
+    :param status: What happened when the record was checked.
+    :type status: :py:class:`DigestStatus`
+    :param computed_digest: The digest computed over the zone for the
+        record's scheme and hash algorithm, or ``None`` if no digest could
+        be computed (e.g. because the scheme or hash algorithm is
+        unsupported, or the tuple was disqualified before digesting).
+    :type computed_digest: bytes or None
+    """
+
+    zonemd: dns.rdtypes.ANY.ZONEMD.ZONEMD
+    status: DigestStatus
+    computed_digest: bytes | None = None
+
+    @property
+    def valid(self) -> bool:
+        """Whether this record verified the zone.
+
+        :rtype: bool
+        """
+
+        return self.status == DigestStatus.VALID
+
+
+@dataclasses.dataclass(frozen=True)
+class DigestVerificationResult:
+    """A reviewable summary of a ZONEMD verification.
+
+    Every ZONEMD record at the zone apex gets its own
+    :py:class:`DigestRecordResult`, including records whose scheme or hash
+    algorithm is unsupported.  The summary also reports how many resource
+    records the digest actually covered and which RRsets were deliberately
+    excluded.
+
+    :param serial: The SOA serial of the zone, or ``None`` if the zone has
+        no SOA.
+    :type serial: int or None
+    :param records: The per-ZONEMD-record results, in apex RRset order.
+    :type records: list of :py:class:`DigestRecordResult`
+    :param covered_rr_count: The number of resource records fed to the
+        digest hash.
+    :type covered_rr_count: int
+    :param covered_rdataset_count: The number of RRsets fed to the digest
+        hash.
+    :type covered_rdataset_count: int
+    :param excluded_rrsets: The RRsets present in the zone but not covered
+        by the digest, with the reason for each exclusion.
+    :type excluded_rrsets: list of :py:class:`ExcludedRRset`
+    """
+
+    serial: int | None
+    records: list[DigestRecordResult]
+    covered_rr_count: int
+    covered_rdataset_count: int
+    excluded_rrsets: list[ExcludedRRset]
+
+    @property
+    def valid(self) -> bool:
+        """Whether at least one ZONEMD record verified the zone.
+
+        Unsupported, duplicate, mismatched, and non-matching records never
+        make a result valid; a valid record does.
+
+        :rtype: bool
+        """
+
+        return any(record.valid for record in self.records)
+
+    @property
+    def excluded_rr_count(self) -> int:
+        """The number of resource records not covered by the digest.
+
+        :rtype: int
+        """
+
+        return sum(rrset.rr_count for rrset in self.excluded_rrsets)
 
 
 def _validate_name(
@@ -833,6 +985,52 @@ class Zone(dns.transaction.TransactionManager):
             soa = cast(dns.rdtypes.ANY.SOA.SOA, soa_rds[0])
             return soa
 
+    def _apex_name(self) -> dns.name.Name:
+        if self.relativize:
+            return dns.name.empty
+        assert self.origin is not None
+        return self.origin
+
+    def _is_excluded_apex_zonemd(
+        self, name: dns.name.Name, rdataset: dns.rdataset.Rdataset
+    ) -> bool:
+        # RFC 8976 section 2.3: the apex ZONEMD RRset, and any RRSIG RRset
+        # covering it, are not part of the digested zone data.
+        return name == self._apex_name() and dns.rdatatype.ZONEMD in (
+            rdataset.rdtype,
+            rdataset.covers,
+        )
+
+    def _digest_coverage(
+        self,
+    ) -> tuple[int, int, list[ExcludedRRset]]:
+        """Walk the zone in the same order the digest does, counting the
+        resource records that are actually covered and collecting the RRsets
+        that RFC 8976 excludes from the digest.
+        """
+        covered_rr_count = 0
+        covered_rdataset_count = 0
+        excluded: list[ExcludedRRset] = []
+        for name, node in sorted(self.items()):
+            for rdataset in sorted(node, key=lambda rds: (rds.rdtype, rds.covers)):
+                if self._is_excluded_apex_zonemd(name, rdataset):
+                    if rdataset.rdtype == dns.rdatatype.RRSIG:
+                        reason = DigestExclusionReason.APEX_ZONEMD_RRSIG
+                    else:
+                        reason = DigestExclusionReason.APEX_ZONEMD
+                    excluded.append(
+                        ExcludedRRset(
+                            reason,
+                            rdataset.rdtype,
+                            rdataset.covers,
+                            len(rdataset),
+                        )
+                    )
+                    continue
+                covered_rdataset_count += 1
+                covered_rr_count += len(rdataset)
+        return covered_rr_count, covered_rdataset_count, excluded
+
     def _compute_digest(
         self,
         hash_algorithm: DigestHashAlgorithm,
@@ -844,19 +1042,11 @@ class Zone(dns.transaction.TransactionManager):
         if scheme != DigestScheme.SIMPLE:
             raise UnsupportedDigestScheme
 
-        if self.relativize:
-            origin_name = dns.name.empty
-        else:
-            assert self.origin is not None
-            origin_name = self.origin
         hasher = hashinfo()
         for name, node in sorted(self.items()):
             rrnamebuf = name.to_digestable(self.origin)
             for rdataset in sorted(node, key=lambda rds: (rds.rdtype, rds.covers)):
-                if name == origin_name and dns.rdatatype.ZONEMD in (
-                    rdataset.rdtype,
-                    rdataset.covers,
-                ):
+                if self._is_excluded_apex_zonemd(name, rdataset):
                     continue
                 rrfixed = struct.pack(
                     "!HHI", rdataset.rdtype, rdataset.rdclass, rdataset.ttl
@@ -878,9 +1068,27 @@ class Zone(dns.transaction.TransactionManager):
             self.rdclass, dns.rdatatype.ZONEMD, serial, scheme, hash_algorithm, digest
         )
 
-    def verify_digest(
+    def check_digest(
         self, zonemd: dns.rdtypes.ANY.ZONEMD.ZONEMD | None = None
-    ) -> None:
+    ) -> DigestVerificationResult:
+        """Check the zone's ZONEMD records and return a reviewable summary.
+
+        Unlike :py:meth:`verify_digest`, this never raises on a failed
+        verification; the outcome of every ZONEMD record is reported in the
+        returned :py:class:`DigestVerificationResult`, including records with
+        an unsupported scheme or hash algorithm, which get a status of their
+        own rather than being silently skipped.
+
+        The zone is only read; no record is added, removed, or modified, and
+        no record is dropped from the digest in order to force a match.
+
+        :param zonemd: A specific ZONEMD record to check.  If ``None``, every
+            ZONEMD record at the zone apex is checked.
+        :type zonemd: :py:class:`dns.rdtypes.ANY.ZONEMD.ZONEMD` or None
+        :rtype: :py:class:`DigestVerificationResult`
+        :raises dns.zone.NoDigest: if *zonemd* is ``None`` and the zone apex
+            has no ZONEMD RRset.
+        """
         digests: dns.rdataset.Rdataset | list[dns.rdtypes.ANY.ZONEMD.ZONEMD]
         if zonemd:
             digests = [zonemd]
@@ -891,12 +1099,17 @@ class Zone(dns.transaction.TransactionManager):
                 raise NoDigest
             digests = rds
         try:
-            serial = self.get_soa().serial
+            serial: int | None = self.get_soa().serial
         except NoSOA:
-            # Without an SOA there is no serial for the ZONEMD serial to match.
-            raise DigestVerificationFailure
-        # RFC 8976 section 4 step 4: a (scheme, hash algorithm) tuple that occurs
-        # more than once disqualifies every ZONEMD RR that has it.
+            # Without an SOA there is no serial for a ZONEMD serial to match.
+            serial = None
+        (
+            covered_rr_count,
+            covered_rdataset_count,
+            excluded,
+        ) = self._digest_coverage()
+        # RFC 8976 section 4 step 4: a (scheme, hash algorithm) tuple that
+        # occurs more than once disqualifies every ZONEMD RR that has it.
         duplicated: set[tuple[int, int]] = set()
         seen: set[tuple[int, int]] = set()
         for digest in digests:
@@ -904,20 +1117,54 @@ class Zone(dns.transaction.TransactionManager):
             if key in seen:
                 duplicated.add(key)
             seen.add(key)
+
+        def get_status(
+            record: dns.rdtypes.ANY.ZONEMD.ZONEMD,
+        ) -> tuple[DigestStatus, bytes | None]:
+            try:
+                computed = self._compute_digest(record.hash_algorithm, record.scheme)
+            except UnsupportedDigestScheme:
+                return DigestStatus.UNSUPPORTED_SCHEME, None
+            except UnsupportedDigestHashAlgorithm:
+                return DigestStatus.UNSUPPORTED_HASH_ALGORITHM, None
+            except Exception:
+                # Any other failure while digesting the zone (for example an
+                # rdata that cannot be canonicalized) is reported rather than
+                # silently swallowed.  The offending record is not dropped and
+                # the zone is not modified, so the digest cannot verify.
+                return DigestStatus.COMPUTATION_ERROR, None
+            if computed == record.digest:
+                return DigestStatus.VALID, computed
+            return DigestStatus.INVALID, computed
+
+        records: list[DigestRecordResult] = []
         for digest in digests:
             if (digest.scheme, digest.hash_algorithm) in duplicated:
-                continue
-            # RFC 8976 section 4 step 5.1.  The apex ZONEMD RRset is not part of
-            # what the digest covers, so its serial is not tied to the zone's by
-            # the digest comparison below.
-            if digest.serial != serial:
-                continue
-            try:
-                computed = self._compute_digest(digest.hash_algorithm, digest.scheme)
-                if computed == digest.digest:
-                    return
-            except Exception:
-                pass
+                status = DigestStatus.DUPLICATE
+                computed: bytes | None = None
+            elif serial is not None and digest.serial != serial:
+                # RFC 8976 section 4 step 5.1.  The apex ZONEMD RRset is not
+                # part of what the digest covers, so its serial is only tied
+                # to the zone's by this explicit comparison.
+                status = DigestStatus.SERIAL_MISMATCH
+                computed = None
+            else:
+                status, computed = get_status(digest)
+            records.append(DigestRecordResult(digest, status, computed))
+        return DigestVerificationResult(
+            serial,
+            records,
+            covered_rr_count,
+            covered_rdataset_count,
+            excluded,
+        )
+
+    def verify_digest(
+        self, zonemd: dns.rdtypes.ANY.ZONEMD.ZONEMD | None = None
+    ) -> None:
+        result = self.check_digest(zonemd)
+        if result.valid:
+            return
         raise DigestVerificationFailure
 
     # TransactionManager methods

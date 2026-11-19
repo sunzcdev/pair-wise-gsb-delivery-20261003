@@ -6,6 +6,18 @@ What's New in dnspython
 2.10.0 (in development)
 -----------------------
 
+* ZONEMD (RFC 8976) verification now has a reviewable form.
+  ``dns.zone.Zone.check_digest()`` returns a
+  ``dns.zone.DigestVerificationResult`` describing every ZONEMD record at the
+  zone apex, including its scheme and hash algorithm, its serial, and its own
+  ``dns.zone.DigestStatus``.  Records with an unsupported scheme or hash
+  algorithm are reported with a status of their own rather than being skipped,
+  and the summary reports the number of resource records the digest actually
+  covered together with the RRsets excluded from it (the apex ZONEMD RRset and
+  any RRSIG RRset covering it).  The existing
+  ``dns.zone.Zone.verify_digest()`` continues to raise on failure and is now
+  implemented on top of ``check_digest()``; neither method modifies the zone.
+
 * The text form of an IPSECKEY record may now omit the public key, which RFC
   4025 section 3.1 makes optional, e.g. ``10 1 0 192.0.2.38`` with algorithm
   0, which means that no key is present.  Such a record could not be read from

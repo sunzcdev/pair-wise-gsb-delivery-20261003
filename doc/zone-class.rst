@@ -45,6 +45,40 @@ desired.  The node factory is a class or callable that returns a subclass of
    :members:
    :inherited-members:
 
+ZONEMD Digest Verification
+~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+In addition to :py:meth:`dns.zone.Zone.verify_digest`, which raises an
+exception when verification fails, :py:meth:`dns.zone.Zone.check_digest`
+returns a reviewable summary of the verification.  Every ZONEMD record at the
+zone apex is reported separately, including records whose scheme or hash
+algorithm is unsupported, and the summary records how many resource records
+the digest actually covered and which RRsets (the apex ZONEMD RRset and any
+RRSIG covering it) are excluded per RFC 8976.
+
+.. autoclass:: dns.zone.DigestVerificationResult
+   :members:
+
+.. autoclass:: dns.zone.DigestRecordResult
+   :members:
+
+.. autoclass:: dns.zone.ExcludedRRset
+   :members:
+
+.. autoclass:: dns.zone.DigestStatus
+   :members:
+
+.. autoclass:: dns.zone.DigestExclusionReason
+   :members:
+
+.. autoexception:: dns.zone.NoDigest
+
+.. autoexception:: dns.zone.DigestVerificationFailure
+
+.. autoexception:: dns.zone.UnsupportedDigestScheme
+
+.. autoexception:: dns.zone.UnsupportedDigestHashAlgorithm
+
 The dns.versioned.Zone Class
 ----------------------------
 
