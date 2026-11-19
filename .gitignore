@@ -1,0 +1,32 @@
+## PROJECT::GENERAL
+coverage
+rdoc
+doc
+log
+pkg/*
+tmp
+.rvmrc
+.ruby-version
+.yardoc
+.DS_Store
+
+## BUNDLER
+*.gem
+.bundle
+Gemfile.lock
+!/release/Gemfile.lock
+vendor/bundle
+external
+
+## NPM
+node_modules
+
+## PROJECT::SPECIFIC
+.rbx
+
+## IDEs
+.idea/
+.yardoc/
+
+## AI Planning
+.ai/PLAN.md

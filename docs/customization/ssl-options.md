@@ -1,0 +1,38 @@
+# SSL Options
+
+Faraday supports a number of SSL options, which can be provided while initializing the connection.
+Not every adapter supports all of them: check your adapter's documentation (e.g. [Net::HTTP][net_http]).
+
+| Option             | Type                                   | Default | Description                                                                                                                        |
+|--------------------|----------------------------------------|---------|------------------------------------------------------------------------------------------------------------------------------------|
+| `:verify`          | Boolean                                | true    | Verify SSL certificate. Defaults to `true`.                                                                                        |
+| `:verify_hostname` | Boolean                                | true    | Verify SSL certificate hostname. Defaults to `true`.                                                                               |
+| `:hostname`        | String                                 | nil     | Server hostname for SNI (see [SSL docs](https://ruby-doc.org/3.2.2/exts/openssl/OpenSSL/SSL/SSLSocket.html#method-i-hostname-3D)). |
+| `:ca_file`         | String                                 | nil     | Path to a CA file in PEM format.                                                                                                   |
+| `:ca_path`         | String                                 | nil     | Path to a CA directory.                                                                                                            |
+| `:verify_mode`     | Integer                                | nil     | Any `OpenSSL::SSL::` constant (see [SSL docs](https://ruby-doc.org/3.2.2/exts/openssl/OpenSSL/SSL.html)).                          |
+| `:cert_store`      | OpenSSL::X509::Store                   | nil     | OpenSSL certificate store.                                                                                                         |
+| `:client_cert`     | OpenSSL::X509::Certificate             | nil     | Client certificate.                                                                                                                |
+| `:client_key`      | OpenSSL::PKey::RSA, OpenSSL::PKey::DSA | nil     | Client private key.                                                                                                                |
+| `:certificate`     | OpenSSL::X509::Certificate             | nil     | Certificate (Excon only).                                                                                                          |
+| `:private_key`     | OpenSSL::PKey::RSA                     | nil     | Private key (Excon only).                                                                                                          |
+| `:verify_depth`    | Integer                                | nil     | Maximum depth for the certificate chain verification.                                                                              |
+| `:version`         | Integer                                | nil     | SSL version (see [SSL docs](https://ruby-doc.org/3.2.2/exts/openssl/OpenSSL/SSL/SSLContext.html#method-i-ssl_version-3D)).         |
+| `:min_version`     | Integer                                | nil     | Minimum SSL version (see [SSL docs](https://ruby-doc.org/3.2.2/exts/openssl/OpenSSL/SSL/SSLContext.html#method-i-min_version-3D)). |
+| `:max_version`     | Integer                                | nil     | Maximum SSL version (see [SSL docs](https://ruby-doc.org/3.2.2/exts/openssl/OpenSSL/SSL/SSLContext.html#method-i-max_version-3D)). |
+| `:ciphers`         | String                                 | nil     | Ciphers supported (see [SSL docs](https://ruby-doc.org/3.2.2/exts/openssl/OpenSSL/SSL/SSLContext.html#method-i-ciphers-3D)).       |
+
+## Example
+
+```ruby
+ssl_options = {
+  ca_file: '/path/to/ca_file',
+  min_version: :TLS1_2
+}
+
+conn = Faraday.new(ssl: ssl_options) do |faraday|
+  # ...
+end
+```
+
+[net_http]: /adapters/net-http.md

@@ -1,0 +1,39 @@
+inherit_from: .rubocop_todo.yml
+
+plugins:
+  - rubocop-packaging
+  - rubocop-performance
+  - rubocop-rake
+
+AllCops:
+  DisplayCopNames: true
+  DisplayStyleGuide: true
+  TargetRubyVersion: 3.0
+  NewCops: enable
+
+# Custom config
+Gemspec/RequireMFA: # we don't know if this works with auto-deployments yet
+  Enabled: false
+Layout/LineLength:
+  Exclude:
+    - spec/**/*.rb
+    - examples/**/*.rb
+Metrics/BlockLength:
+  Exclude:
+    - lib/faraday/options/env.rb
+    - spec/**/*.rb
+    - examples/**/*.rb
+Metrics/ModuleLength:
+  Exclude:
+    - lib/faraday/options/env.rb
+Performance/RedundantMerge: # false positives: BaseOptions#merge! is not Hash#merge!
+  Exclude:
+    - spec/faraday/options/base_options_spec.rb
+Style/Documentation:
+  Exclude:
+    - 'spec/**/*'
+    - 'examples/**/*'
+Style/DoubleNegation:
+  Enabled: false
+Style/IfUnlessModifier:
+  Enabled: false
