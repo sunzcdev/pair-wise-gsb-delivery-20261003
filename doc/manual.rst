@@ -8,6 +8,7 @@ Dnspython Manual
    name
    rdata
    message
+   tsig
    query
    resolver
    zone

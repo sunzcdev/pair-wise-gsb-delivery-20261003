@@ -1,12 +1,14 @@
 # Copyright (C) Dnspython Contributors, see LICENSE for text of ISC license
 
 import base64
+import struct
 import time
 import unittest
 from unittest.mock import Mock, patch
 
 import dns.exception
 import dns.message
+import dns.name
 import dns.rcode
 import dns.rdtypes.ANY.TKEY
 import dns.rdtypes.ANY.TSIG
@@ -531,3 +533,293 @@ example. 300 IN SOA . . 1 2 3 4 5
         q4 = dns.message.from_wire(wire, keyring=keyring)
         q4.use_tsig(dns.tsig.Key(keyname, "abcd"))
         self.assertNotEqual(q4.to_wire(), wire)
+
+
+# Fixed timestamps so the tests never depend on the wall clock.
+SIGN_NOW = 1700000000
+VERIFY_NOW = 1700000010
+
+
+class TSIGChainVerifierTestCase(unittest.TestCase):
+    """Tests for the explicit multi-message TSIG chain verifier.
+
+    All messages are produced locally with a local key and a patched,
+    deterministic clock; nothing here uses the network or real credentials.
+    """
+
+    def _make_transfer(self, signed=True, unsigned_middle=False, sign_time=SIGN_NOW):
+        """Build the signed request and a three-message AXFR-style transfer.
+
+        Returns a dict with the request wire/MAC and the three response
+        wires, all signed (or not) at *sign_time*.  When *unsigned_middle*
+        is set, the middle message carries no TSIG and is instead digested
+        into the chain covered by the final TSIG.  When *signed* is false,
+        the final message has no TSIG (and the chain therefore cannot be
+        fully verified).
+        """
+        tm0 = """id 1
+;QUESTION
+example. IN AXFR
+"""
+        tm1 = """id 1
+flags QR
+;QUESTION
+example. IN AXFR
+;ANSWER
+example. 300 IN SOA . . 1 2 3 4 5
+example. 300 IN NS ns1.tld.
+example. 300 IN NS ns2.tld.
+"""
+        tmm = """id 1
+flags QR
+;ANSWER
+example. 300 IN A 192.0.2.1
+example. 300 IN A 192.0.2.2
+"""
+        tm2 = """id 1
+flags QR
+;ANSWER
+example. 300 IN MX 10 mail.tld.
+example. 300 IN SOA . . 1 2 3 4 5
+"""
+        with patch("time.time", return_value=sign_time):
+            m0 = dns.message.from_text(tm0)
+            m0.use_tsig(keyring)
+            m0.to_wire()  # to set m0.mac
+
+            # First response: signed, starts the multi-message digest chain.
+            m1 = dns.message.from_text(tm1)
+            m1.use_tsig(keyring)
+            m1.request_mac = m0.mac
+            w1 = m1.to_wire(multi=True)
+            chain_ctx = m1.tsig_ctx
+
+            # Middle response.
+            if unsigned_middle:
+                # A middle message without a TSIG.  In multi mode the receiver
+                # digests its whole wire into the ongoing context, so the
+                # following signed message must do the same when signing.
+                mm = dns.message.from_text(tmm)
+                w_mid = mm.to_wire()
+                chain_ctx = dns.tsig.get_context(m1.keyring)
+                chain_ctx.update(struct.pack("!H", len(m1.mac)))
+                chain_ctx.update(m1.mac)
+                chain_ctx.update(w_mid)
+            else:
+                mm = dns.message.from_text(tmm)
+                mm.use_tsig(keyring)
+                w_mid = mm.to_wire(multi=True, tsig_ctx=chain_ctx)
+                chain_ctx = mm.tsig_ctx
+
+            # Final response.
+            m2 = dns.message.from_text(tm2)
+            if signed:
+                m2.use_tsig(keyring)
+                w2 = m2.to_wire(multi=True, tsig_ctx=chain_ctx)
+            else:
+                w2 = m2.to_wire()
+
+        return {
+            "request_mac": m0.mac,
+            "first": w1,
+            "middle": w_mid,
+            "final": w2,
+        }
+
+    def test_successful_chain_verification(self):
+        transfer = self._make_transfer()
+        verifier = dns.tsig.TSIGChainVerifier(
+            keyring, request_mac=transfer["request_mac"], now=VERIFY_NOW
+        )
+        self.assertIs(verifier.state, dns.tsig.TSIGChainState.NEW)
+        self.assertFalse(verifier.verified)
+        self.assertIsNone(verifier.result)
+
+        first_message = verifier.verify_message(transfer["first"])
+        self.assertIs(verifier.state, dns.tsig.TSIGChainState.IN_PROGRESS)
+        # An intermediate signature passing must not make the transfer trusted.
+        self.assertFalse(verifier.verified)
+        expected_first_mac = first_message.tsig[0].mac
+
+        verifier.verify_message(transfer["middle"])
+        verifier.verify_message(transfer["final"])
+        self.assertFalse(verifier.verified)
+
+        result = verifier.finish()
+        self.assertIs(verifier.state, dns.tsig.TSIGChainState.FINISHED)
+        self.assertTrue(verifier.verified)
+        self.assertIs(verifier.result, result)
+        self.assertEqual(result.message_count, 3)
+        self.assertEqual(result.signed_count, 3)
+        self.assertEqual(result.first_mac, expected_first_mac)
+        self.assertEqual(result.last_mac, verifier.last_mac)
+
+    def test_unsigned_intermediate_message_is_covered_by_chain(self):
+        transfer = self._make_transfer(unsigned_middle=True)
+        verifier = dns.tsig.TSIGChainVerifier(
+            keyring, request_mac=transfer["request_mac"], now=VERIFY_NOW
+        )
+        verifier.verify_message(transfer["first"])
+        verifier.verify_message(transfer["middle"])
+        verifier.verify_message(transfer["final"])
+        result = verifier.finish()
+        self.assertTrue(verifier.verified)
+        self.assertEqual(result.message_count, 3)
+        # First and final are signed; the middle is not.
+        self.assertEqual(result.signed_count, 2)
+
+    def test_missing_final_signature(self):
+        transfer = self._make_transfer(signed=False)
+        verifier = dns.tsig.TSIGChainVerifier(
+            keyring, request_mac=transfer["request_mac"], now=VERIFY_NOW
+        )
+        verifier.verify_message(transfer["first"])
+        verifier.verify_message(transfer["middle"])
+        verifier.verify_message(transfer["final"])
+        with self.assertRaises(dns.tsig.MissingFinalSignature):
+            verifier.finish()
+        self.assertIs(verifier.state, dns.tsig.TSIGChainState.FAILED)
+        self.assertFalse(verifier.verified)
+
+    def test_missing_first_message(self):
+        transfer = self._make_transfer()
+        verifier = dns.tsig.TSIGChainVerifier(
+            keyring, request_mac=transfer["request_mac"], now=VERIFY_NOW
+        )
+        # A truncated / empty envelope cannot establish the signed first
+        # message of the transfer, so the required chain data is missing.
+        with self.assertRaises(dns.tsig.MissingIntermediateData):
+            verifier.verify_message(b"\x00\x01")
+        self.assertIs(verifier.state, dns.tsig.TSIGChainState.FAILED)
+        self.assertFalse(verifier.verified)
+
+    def test_malformed_first_message_poisons_context(self):
+        transfer = self._make_transfer()
+        # A structurally complete header followed by trailing junk is not a
+        # valid transfer message; it must be reported as missing chain data
+        # and poison the verifier.
+        malformed = b"\x00\x01\x80\x00\x00\x00\x00\x00\x00\x00\x00\x00junk"
+        verifier = dns.tsig.TSIGChainVerifier(
+            keyring, request_mac=transfer["request_mac"], now=VERIFY_NOW
+        )
+        with self.assertRaises(dns.tsig.MissingIntermediateData):
+            verifier.verify_message(malformed)
+        self.assertIs(verifier.state, dns.tsig.TSIGChainState.FAILED)
+        # A poisoned context cannot be revived even by a good message.
+        with self.assertRaises(dns.tsig.ChainVerificationError):
+            verifier.verify_message(transfer["first"])
+
+    def test_finish_without_any_message(self):
+        verifier = dns.tsig.TSIGChainVerifier(keyring, now=VERIFY_NOW)
+        with self.assertRaises(dns.tsig.MissingIntermediateData):
+            verifier.finish()
+        self.assertIs(verifier.state, dns.tsig.TSIGChainState.FAILED)
+
+    def test_bad_key_id(self):
+        transfer = self._make_transfer()
+        # A keyring that does not contain the key name used in the messages.
+        other_name = dns.name.from_text("other-key")
+        other_keyring = dns.tsigkeyring.from_text({str(other_name): "abcd"})
+        verifier = dns.tsig.TSIGChainVerifier(
+            other_keyring, request_mac=transfer["request_mac"], now=VERIFY_NOW
+        )
+        with self.assertRaises(dns.message.UnknownTSIGKey):
+            verifier.verify_message(transfer["first"])
+        self.assertIs(verifier.state, dns.tsig.TSIGChainState.FAILED)
+
+    def test_bad_time_outside_fudge(self):
+        # Sign far in the past relative to the verification instant.
+        transfer = self._make_transfer(sign_time=SIGN_NOW - 10000)
+        verifier = dns.tsig.TSIGChainVerifier(
+            keyring, request_mac=transfer["request_mac"], now=VERIFY_NOW
+        )
+        with self.assertRaises(dns.tsig.BadTime):
+            verifier.verify_message(transfer["first"])
+        self.assertIs(verifier.state, dns.tsig.TSIGChainState.FAILED)
+
+    def test_bad_signature_poisons_context(self):
+        transfer = self._make_transfer()
+        wrong_key = dns.tsig.Key(keyname, "abcd", dns.tsig.HMAC_SHA256)
+        verifier = dns.tsig.TSIGChainVerifier(
+            wrong_key, request_mac=transfer["request_mac"], now=VERIFY_NOW
+        )
+        with self.assertRaises(dns.tsig.BadSignature):
+            verifier.verify_message(transfer["first"])
+        self.assertIs(verifier.state, dns.tsig.TSIGChainState.FAILED)
+        # The failed context cannot be reused for a new transfer.
+        with self.assertRaises(dns.tsig.ChainVerificationError):
+            verifier.verify_message(transfer["first"])
+        with self.assertRaises(dns.tsig.ChainVerificationError):
+            verifier.finish()
+
+    def test_finished_context_cannot_be_reused(self):
+        transfer = self._make_transfer()
+        verifier = dns.tsig.TSIGChainVerifier(
+            keyring, request_mac=transfer["request_mac"], now=VERIFY_NOW
+        )
+        verifier.verify_message(transfer["first"])
+        verifier.verify_message(transfer["middle"])
+        verifier.verify_message(transfer["final"])
+        verifier.finish()
+        self.assertTrue(verifier.verified)
+        with self.assertRaises(dns.tsig.ChainVerificationError):
+            verifier.verify_message(transfer["first"])
+        with self.assertRaises(dns.tsig.ChainVerificationError):
+            verifier.finish()
+
+    def test_retry_uses_a_new_instance(self):
+        transfer = self._make_transfer(sign_time=SIGN_NOW - 10000)
+        verifier = dns.tsig.TSIGChainVerifier(
+            keyring, request_mac=transfer["request_mac"], now=VERIFY_NOW
+        )
+        with self.assertRaises(dns.tsig.BadTime):
+            verifier.verify_message(transfer["first"])
+        self.assertIs(verifier.state, dns.tsig.TSIGChainState.FAILED)
+
+        # A fresh instance with an appropriate (deterministic) time succeeds.
+        retry = dns.tsig.TSIGChainVerifier(
+            keyring, request_mac=transfer["request_mac"], now=SIGN_NOW - 10000
+        )
+        # Rebuild a correctly-timed transfer for the retry rather than trust
+        # the stale one; here the same wires verify because we pass a "now"
+        # within the fudge window of their signing time.
+        retry.verify_message(transfer["first"])
+        retry.verify_message(transfer["middle"])
+        retry.verify_message(transfer["final"])
+        result = retry.finish()
+        self.assertTrue(retry.verified)
+        self.assertEqual(result.message_count, 3)
+
+    def test_now_can_be_overridden_per_message(self):
+        transfer = self._make_transfer()
+        verifier = dns.tsig.TSIGChainVerifier(
+            keyring, request_mac=transfer["request_mac"]
+        )
+        verifier.verify_message(transfer["first"], now=VERIFY_NOW)
+        verifier.verify_message(transfer["middle"], now=VERIFY_NOW)
+        verifier.verify_message(transfer["final"], now=VERIFY_NOW)
+        result = verifier.finish()
+        self.assertTrue(verifier.verified)
+        self.assertEqual(result.signed_count, 3)
+
+    def test_from_wire_now_parameter_is_deterministic(self):
+        # The now= parameter of dns.message.from_wire drives the TSIG time
+        # check without reading the wall clock.
+        transfer = self._make_transfer(sign_time=SIGN_NOW - 10000)
+        with self.assertRaises(dns.tsig.BadTime):
+            dns.message.from_wire(
+                transfer["first"],
+                keyring=keyring,
+                request_mac=transfer["request_mac"],
+                multi=True,
+                now=VERIFY_NOW,
+            )
+        # The same wire verifies when "now" is within the fudge window.
+        m = dns.message.from_wire(
+            transfer["first"],
+            keyring=keyring,
+            request_mac=transfer["request_mac"],
+            multi=True,
+            now=SIGN_NOW - 10000,
+        )
+        self.assertTrue(m.had_tsig)

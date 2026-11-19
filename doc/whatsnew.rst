@@ -38,6 +38,20 @@ What's New in dnspython
   attribute of the result, may now need an ``isinstance()`` check or a cast to
   satisfy a type checker.
 
+* A new ``dns.tsig.TSIGChainVerifier`` provides an explicit, single-use
+  verification context for multi-message TSIG-signed transfers such as TCP
+  AXFR/IXFR.  It maintains the running TSIG digest across messages, records
+  the first packet and chain state, and only treats the whole transfer as
+  verified after the final message's signature is confirmed by ``finish()``.
+  Missing chain data, a bad key id, a timestamp outside the fudge window, and
+  a missing final signature are each reported distinctly.  A failed verifier
+  is poisoned and cannot be reused; callers create a new instance to retry.
+
+* ``dns.message.from_wire()`` now accepts an optional ``now`` parameter giving
+  the time (seconds since the epoch) to use for the TSIG time-skew check.
+  It defaults to the wall-clock time, but a fixed value makes verification
+  deterministic and testable.
+
 2.9.2
 -----
 

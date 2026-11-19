@@ -1248,6 +1248,7 @@ class _WireReader:
         keyring=None,
         multi=False,
         continue_on_error=False,
+        now=None,
     ):
         self.parser = dns.wire.Parser(wire)
         self.message = None
@@ -1259,6 +1260,9 @@ class _WireReader:
         self.multi = multi
         self.continue_on_error = continue_on_error
         self.errors = []
+        if now is None:
+            now = time.time()
+        self.now = int(now)
 
     def _get_question(self, section_number, qcount):
         """Read the next *qcount* records from the wire data and add them to
@@ -1356,7 +1360,7 @@ class _WireReader:
                             key,
                             absolute_name,
                             rd,
-                            int(time.time()),
+                            self.now,
                             self.message.request_mac,
                             rr_start,
                             self.message.tsig_ctx,
@@ -1446,6 +1450,7 @@ def from_wire(
     ignore_trailing: bool = False,
     raise_on_truncation: bool = False,
     continue_on_error: bool = False,
+    now: float | int | None = None,
 ) -> Message:
     """Convert a DNS wire format message into a message object.
 
@@ -1481,6 +1486,10 @@ def from_wire(
     :param continue_on_error: If ``True``, try to continue parsing on errors
         and accumulate them in the message's ``errors`` attribute.
     :type continue_on_error: bool
+    :param now: The current time in seconds since the epoch, used for the
+        TSIG time-skew check.  Defaults to the wall-clock time; passing a
+        fixed value makes verification deterministic and testable.
+    :type now: float or int or None
     :raises dns.message.ShortHeader: If the message is less than 12 octets.
     :raises dns.message.TrailingJunk: If trailing octets are present and
         *ignore_trailing* is ``False``.
@@ -1514,6 +1523,7 @@ def from_wire(
         keyring,
         multi,
         continue_on_error,
+        now,
     )
     try:
         m = reader.read()

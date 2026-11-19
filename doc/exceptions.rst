@@ -62,7 +62,7 @@ dns.rcode Exceptions
 
 dns.rdataset Exceptions
 -----------------------
-                   
+
 .. autoexception:: dns.rdataset.DifferingCovers
 .. autoexception:: dns.rdataset.IncompatibleTypes
 
@@ -82,6 +82,22 @@ dns.tokenizer Exceptions
 ------------------------
 
 .. autoexception:: dns.tokenizer.UngetBufferFull
+
+dns.tsig Exceptions
+-------------------
+
+.. autoexception:: dns.tsig.BadAlgorithm
+.. autoexception:: dns.tsig.BadKey
+.. autoexception:: dns.tsig.BadSignature
+.. autoexception:: dns.tsig.BadTime
+.. autoexception:: dns.tsig.ChainVerificationError
+.. autoexception:: dns.tsig.MissingFinalSignature
+.. autoexception:: dns.tsig.MissingIntermediateData
+.. autoexception:: dns.tsig.PeerError
+.. autoexception:: dns.tsig.PeerBadKey
+.. autoexception:: dns.tsig.PeerBadSignature
+.. autoexception:: dns.tsig.PeerBadTime
+.. autoexception:: dns.tsig.PeerBadTruncation
 
 dns.ttl Exceptions
 ------------------

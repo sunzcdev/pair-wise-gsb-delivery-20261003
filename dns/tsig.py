@@ -18,15 +18,23 @@
 """DNS TSIG support."""
 
 import base64
+import dataclasses
+import enum
 import hashlib
 import hmac
 import struct
+import time
+from typing import TYPE_CHECKING, cast
 
 import dns.exception
 import dns.name
 import dns.rcode
 import dns.rdataclass
 import dns.rdatatype
+
+if TYPE_CHECKING:
+    import dns.message
+    import dns.rdtypes.ANY.TSIG
 
 
 class BadTime(dns.exception.DNSException):
@@ -63,6 +71,33 @@ class PeerBadTime(PeerError):
 
 class PeerBadTruncation(PeerError):
     """The peer didn't like amount of truncation in the TSIG we sent"""
+
+
+class ChainVerificationError(dns.exception.DNSException):
+    """Base class for errors reported by a TSIG chain verifier.
+
+    Once a chain verifier has raised any error, its verification context is
+    poisoned and cannot be used again; create a new verifier instance to retry
+    a transfer.
+    """
+
+
+class MissingIntermediateData(ChainVerificationError):
+    """A multi-message TSIG transfer is missing required message data.
+
+    This is raised when no first message has been presented before chain
+    messages, when a first message has no TSIG record, or when the transfer is
+    ended without any message having been verified.
+    """
+
+
+class MissingFinalSignature(ChainVerificationError):
+    """The last message of a multi-message TSIG transfer has no TSIG
+    signature.
+
+    RFC 8945 requires the final message of a signed transfer to carry a TSIG
+    record so the whole transfer can be authenticated as a unit.
+    """
 
 
 # TSIG Algorithms
@@ -358,3 +393,258 @@ class Key:
             r += f", secret='{base64.b64encode(self.secret).decode()}'"
         r += ">"
         return r
+
+
+class TSIGChainState(enum.Enum):
+    """The state of a multi-message TSIG verification chain.
+
+    * ``NEW`` is the initial state, before any message has been verified.
+    * ``IN_PROGRESS`` means the first message has been verified and further
+      messages of the same transfer may be fed in.
+    * ``FINISHED`` means the transfer completed with a valid final signature,
+      and the verifier has produced its complete verification conclusion.
+    * ``FAILED`` means verification failed; the context must not be used for
+      any further transfer.  Create a new verifier instance to retry.
+    """
+
+    NEW = enum.auto()
+    IN_PROGRESS = enum.auto()
+    FINISHED = enum.auto()
+    FAILED = enum.auto()
+
+
+@dataclasses.dataclass(frozen=True)
+class TSIGChainResult:
+    """The complete verification conclusion for a multi-message transfer.
+
+    A result is only returned when every message in the chain was verified and
+    the final message carried a valid TSIG signature; merely observing a valid
+    signature on some intermediate packet never produces a result.
+
+    :ivar message_count: The number of messages that made up the transfer.
+    :type message_count: int
+    :ivar signed_count: The number of messages carrying a TSIG record.
+    :type signed_count: int
+    :ivar first_mac: The MAC from the TSIG record on the first message.
+    :type first_mac: bytes
+    :ivar last_mac: The MAC from the TSIG record on the final message.
+    :type last_mac: bytes
+    :ivar key: The key used to verify the chain.
+    :type key: object
+    """
+
+    message_count: int
+    signed_count: int
+    first_mac: bytes
+    last_mac: bytes
+    key: object
+
+
+class TSIGChainVerifier:
+    """An explicit, single-use verification context for a multi-message
+    TSIG-signed transfer such as a TCP AXFR/IXFR.
+
+    Each wire-format response of the transfer is passed to
+    :py:meth:`verify_message` in order.  The verifier maintains the running
+    TSIG digest context across messages, records the first packet and the
+    chain state, and only confirms the final signature in :py:meth:`finish`.
+    A transfer is considered fully verified only when :py:meth:`finish`
+    returns a :py:class:`TSIGChainResult`; a signature that validates on an
+    individual intermediate packet does not make the whole transfer trusted.
+
+    The verifier is a single-use object.  Any verification failure puts it in
+    the terminal :py:attr:`TSIGChainState.FAILED` state and it then refuses
+    further use; callers must construct a new instance to retry a transfer.
+    A successfully finished verifier is likewise terminal
+    (:py:attr:`TSIGChainState.FINISHED`).
+
+    :param keyring: The TSIG key, keyring dict, or keyring callable used to
+        verify the messages.
+    :param request_mac: The MAC of the TSIG-signed request that initiated the
+        transfer, or ``b""`` if there was none.
+    :type request_mac: bytes
+    :param now: The current time in seconds since the epoch, used for the
+        TSIG time-skew check.  Defaults to the wall-clock time; tests can
+        pass a fixed value for deterministic behavior.
+    :type now: float or int or None
+    """
+
+    def __init__(
+        self, keyring: object, request_mac: bytes = b"", now: float | int | None = None
+    ):
+        self.keyring = keyring
+        self.request_mac = request_mac
+        self._now = now
+        self.state = TSIGChainState.NEW
+        self.message_count = 0
+        self.signed_count = 0
+        self.first_mac: bytes | None = None
+        self.last_mac: bytes | None = None
+        self._last_had_tsig = False
+        self._tsig_ctx: HMACTSig | GSSTSig | None = None
+        self._result: TSIGChainResult | None = None
+
+    @property
+    def verified(self) -> bool:
+        """Whether the whole transfer has been fully verified.
+
+        This is only ``True`` after :py:meth:`finish` has successfully
+        confirmed the final signature.
+        """
+        return self.state is TSIGChainState.FINISHED
+
+    @property
+    def result(self) -> TSIGChainResult | None:
+        """The complete verification conclusion, or ``None`` if the chain
+        has not been successfully finished."""
+        return self._result
+
+    def _now_value(self, now: float | int | None) -> int:
+        if now is None:
+            now = self._now
+        if now is None:
+            now = time.time()
+        return int(now)
+
+    def _fail(self) -> None:
+        # A failed context is poisoned and may never verify another message.
+        self.state = TSIGChainState.FAILED
+        self._tsig_ctx = None
+
+    def _require_open(self) -> None:
+        if self.state is TSIGChainState.FAILED:
+            raise ChainVerificationError(
+                "this TSIG chain verifier has failed; create a new instance "
+                "to retry the transfer"
+            )
+        if self.state is TSIGChainState.FINISHED:
+            raise ChainVerificationError(
+                "this TSIG chain verifier has already finished a transfer; "
+                "create a new instance for a new transfer"
+            )
+
+    def verify_message(
+        self, wire: bytes, now: float | int | None = None
+    ) -> "dns.message.Message":
+        """Verify the next wire-format message of the transfer.
+
+        The first call verifies the first message of the transfer, which must
+        carry a TSIG record; later calls continue the digest chain.  Messages
+        without a TSIG are accepted on subsequent messages (per the obsolete
+        multi-message mode of RFC 8945) and are covered by the next TSIG, but
+        the final message must still be signed and is checked by
+        :py:meth:`finish`.
+
+        :param wire: The raw DNS wire message.
+        :type wire: bytes
+        :param now: Optional override of the current time (seconds since the
+            epoch) for the time-skew check.
+        :type now: float or int or None
+        :returns: The parsed :py:class:`dns.message.Message`.
+        :raises dns.tsig.MissingIntermediateData: No valid first message with
+            a TSIG has been established.
+        :raises dns.message.UnknownTSIGKey: The TSIG key name is not known to
+            the keyring (a bad key id).
+        :raises dns.tsig.BadTime: The TSIG time is outside the fudge window.
+        :raises dns.tsig.BadSignature: A TSIG MAC does not verify.
+        :raises dns.tsig.ChainVerificationError: The verifier is no longer
+            usable.
+        """
+        self._require_open()
+        # Imported lazily to avoid a circular import between dns.message and
+        # dns.tsig.
+        import dns.message as _message
+
+        check_now = self._now_value(now)
+        is_first = self.state is TSIGChainState.NEW
+        try:
+            message = _message.from_wire(
+                wire,
+                keyring=self.keyring,
+                request_mac=self.request_mac,
+                multi=True,
+                tsig_ctx=self._tsig_ctx,
+                now=check_now,
+            )
+        except _message.UnknownTSIGKey:
+            self._fail()
+            raise
+        except BadTime:
+            self._fail()
+            raise
+        except BadSignature:
+            self._fail()
+            raise
+        except dns.exception.DNSException:
+            # Any other structural/parsing problem (e.g. an unsigned first
+            # message, a truncated envelope, or trailing junk) means the
+            # required signed chain data could not be established.
+            self._fail()
+            raise MissingIntermediateData(
+                "the first message of a TSIG transfer must carry a TSIG signature"
+            )
+        if is_first and not message.had_tsig:
+            # Defensive: from_wire in multi mode normally raises a FormError
+            # for an unsigned signed response, but make the requirement
+            # explicit regardless of keyring configuration.
+            self._fail()
+            raise MissingIntermediateData(
+                "the first message of a TSIG transfer must carry a TSIG signature"
+            )
+
+        assert message.tsig_ctx is not None
+        self._tsig_ctx = message.tsig_ctx
+        self.message_count += 1
+        self._last_had_tsig = message.had_tsig
+        if message.had_tsig:
+            tsig = message.tsig
+            assert tsig is not None
+            rdata = cast("dns.rdtypes.ANY.TSIG.TSIG", tsig[0])
+            mac = rdata.mac
+            assert isinstance(mac, bytes)
+            self.signed_count += 1
+            self.last_mac = mac
+            if self.first_mac is None:
+                self.first_mac = mac
+        self.state = TSIGChainState.IN_PROGRESS
+        return message
+
+    def finish(self) -> TSIGChainResult:
+        """Confirm the end of the transfer and return the complete
+        verification conclusion.
+
+        This must be called after every response of the transfer has been
+        passed to :py:meth:`verify_message`.  It verifies that at least one
+        message was seen and that the final message carried a valid TSIG
+        signature; only then is the whole transfer considered trusted.
+
+        :returns: A :py:class:`TSIGChainResult` describing the verified
+            transfer.
+        :raises dns.tsig.MissingIntermediateData: No message was verified.
+        :raises dns.tsig.MissingFinalSignature: The final message had no TSIG
+            signature.
+        :raises dns.tsig.ChainVerificationError: The verifier has already
+            failed or finished.
+        """
+        self._require_open()
+        if self.message_count == 0 or self.first_mac is None:
+            self._fail()
+            raise MissingIntermediateData(
+                "cannot finish a TSIG transfer before any signed message was "
+                "verified"
+            )
+        if not self._last_had_tsig or self.last_mac is None:
+            self._fail()
+            raise MissingFinalSignature(
+                "the final message of a TSIG transfer must carry a TSIG " "signature"
+            )
+        result = TSIGChainResult(
+            message_count=self.message_count,
+            signed_count=self.signed_count,
+            first_mac=self.first_mac,
+            last_mac=self.last_mac,
+            key=self.keyring,
+        )
+        self._result = result
+        self.state = TSIGChainState.FINISHED
+        return result
