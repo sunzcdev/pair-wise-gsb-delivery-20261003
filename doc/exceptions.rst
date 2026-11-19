@@ -66,6 +66,17 @@ dns.rdataset Exceptions
 .. autoexception:: dns.rdataset.DifferingCovers
 .. autoexception:: dns.rdataset.IncompatibleTypes
 
+dns.serial Exceptions
+---------------------
+
+.. autoexception:: dns.serial.SerialError
+.. autoexception:: dns.serial.BadSerial
+.. autoexception:: dns.serial.BadSerialPolicy
+.. autoexception:: dns.serial.SerialNotUpdated
+.. autoexception:: dns.serial.SerialComparisonUndefined
+.. autoexception:: dns.serial.SerialExhausted
+.. autoexception:: dns.serial.SerialChanged
+
 dns.resolver Exceptions
 -----------------------
 

@@ -6,6 +6,21 @@ What's New in dnspython
 2.10.0 (in development)
 -----------------------
 
+* ``dns.serial`` can now plan the next SOA serial number for a zone, as well
+  as doing RFC 1982 arithmetic.  ``dns.serial.compare()`` and
+  ``dns.serial.is_update()`` compare serials in the circular serial number
+  space, and report the undefined result of RFC 1982 section 3.2 when the
+  values are exactly half the space apart.  ``dns.serial.plan_serial()`` and
+  the ``SerialPolicy`` classes plan a new serial with either a fixed increment
+  or a date-style ("YYYYMMDDnn") policy; planning only computes a value and
+  never touches a zone.  The resulting ``SerialPlan`` is applied to a
+  transaction with ``SerialPlan.apply()``, which writes nothing unless the
+  zone's SOA serial is still the one the plan was based on.  Planned values
+  are always checked with serial number arithmetic, so a value which a
+  secondary would not see as an update is never produced; a date-style
+  counter which would run past 99 raises ``SerialExhausted`` instead of
+  producing an eleven-digit number which only looks like a date-style serial.
+
 * The text form of an IPSECKEY record may now omit the public key, which RFC
   4025 section 3.1 makes optional, e.g. ``10 1 0 192.0.2.38`` with algorithm
   0, which means that no key is present.  Such a record could not be read from
