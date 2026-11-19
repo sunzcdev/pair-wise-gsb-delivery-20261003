@@ -1337,6 +1337,18 @@ module Net
 
     SSL_ATTRIBUTES: Array[Symbol]
 
+    SSL_IDENTITY_ATTRIBUTES: Array[Symbol]
+
+    class SSLSessionCache
+      def initialize: () -> void
+
+      def lookup: (untyped server_key, untyped tls_identity, Float now) -> [untyped, Symbol?]
+
+      def store: (untyped server_key, untyped tls_identity, untyped session) -> void
+
+      def invalidate: (untyped server_key) -> void
+    end
+
     # <!-- rdoc-file=lib/net/http.rb -->
     # Sets or returns the path to a CA certification file in PEM format.
     #
@@ -1437,6 +1449,23 @@ module Net
     # socket peer, or `nil` if none.
     #
     def peer_cert: () -> (nil | untyped)
+
+    # <!--
+    #   rdoc-file=lib/net/http.rb
+    #   - ssl_session_reused?()
+    # -->
+    # Returns whether the most recent TLS handshake reused a cached session.
+    #
+    def ssl_session_reused?: () -> (nil | bool)
+
+    # <!--
+    #   rdoc-file=lib/net/http.rb
+    #   - ssl_session_invalidation_reason()
+    # -->
+    # Returns the reason the most recent TLS handshake did not reuse a cached
+    # session, or `nil` when a session was reused or no lookup was performed.
+    #
+    def ssl_session_invalidation_reason: () -> (nil | Symbol)
 
     # <!--
     #   rdoc-file=lib/net/http.rb

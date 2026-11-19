@@ -1194,7 +1194,12 @@ module Net   #:nodoc:
 
       @use_ssl = false
       @ssl_context = nil
-      @ssl_session = nil
+      @ssl_sessions = SSLSessionCache.new
+      @ssl_session_reused = nil
+      @ssl_session_invalidation_reason = nil
+      @ssl_handshake_succeeded = false
+      @ssl_session_server_key = nil
+      @ssl_session_tls_identity = nil
       @sspi_enabled = false
       SSL_IVNAMES.each do |ivname|
         instance_variable_set ivname, nil
@@ -1561,6 +1566,73 @@ module Net   #:nodoc:
 
     private_constant :IPV4_ADDRESS, :IPV6_ADDRESS
 
+    # SSL attributes that carry secret key material or a callback closure.
+    # They are compared by object identity in the TLS session cache key so
+    # that changing them invalidates reused sessions, while their contents
+    # (in particular private keys) are never rendered into the key or logs.
+    SSL_IDENTITY_ATTRIBUTES = [:cert, :extra_chain_cert, :key, :verify_callback].freeze # :nodoc:
+
+    private_constant :SSL_IDENTITY_ATTRIBUTES
+
+    # Cache of negotiated OpenSSL::SSL::Session objects keyed by the actual
+    # server (origin) and the TLS configuration that influenced the handshake.
+    #
+    # A session negotiated through one proxy or for one origin is never offered
+    # to another one, and a change in the verification policy, client
+    # certificate or any other handshake-affecting parameter makes the cached
+    # session ineligible for reuse.
+    class SSLSessionCache # :nodoc:
+      def initialize
+        @sessions = {}
+      end
+
+      # Returns [session_or_nil, reason_symbol].
+      #
+      # reason is nil when a still-valid session is found.  Otherwise it is
+      # one of:
+      #   :no_session            nothing was ever cached for this identity
+      #   :identity_changed      a session exists, but the server or the
+      #                          handshake-affecting TLS configuration changed
+      #   :session_expired      the cached session passed its lifetime
+      def lookup(server_key, tls_identity, now)
+        entry = @sessions[server_key]
+        return [nil, :no_session] unless entry
+
+        unless entry[:tls_identity] == tls_identity
+          return [nil, :identity_changed]
+        end
+
+        session = entry[:session]
+        if now >= session.time.to_f + session.timeout
+          return [nil, :session_expired]
+        end
+
+        [session, nil]
+      end
+
+      # Publishes a session only after the handshake (including certificate
+      # verification) has completed successfully.  A failed handshake must
+      # call #invalidate instead so that no half-established session is
+      # observable through the cache.
+      def store(server_key, tls_identity, session)
+        return unless session
+        @sessions[server_key] = {
+          tls_identity: tls_identity,
+          session: session,
+        }
+        nil
+      end
+
+      # Drops any session cached for this server identity.  Used when a
+      # handshake fails so a broken session is never reused later.
+      def invalidate(server_key)
+        @sessions.delete(server_key)
+        nil
+      end
+    end
+
+    private_constant :SSLSessionCache
+
     # Sets or returns the path to a CA certification file in PEM format.
     attr_accessor :ca_file
 
@@ -1625,6 +1697,38 @@ module Net   #:nodoc:
         return nil
       end
       @socket.io.peer_cert
+    end
+
+    # Returns whether the most recent TLS handshake reused a session from the
+    # client-side session cache:
+    #
+    # - +true+ if a cached session was offered and accepted by the server.
+    # - +false+ if a full handshake was performed.
+    # - +nil+ before the first handshake, or when the runtime cannot report
+    #   session reuse (for example JRuby).
+    #
+    # The decision is made per server origin and per handshake-affecting TLS
+    # configuration; see #ssl_session_invalidation_reason for why a cached
+    # session was not reused.
+    def ssl_session_reused?
+      @ssl_session_reused
+    end
+
+    # Returns the reason the most recent TLS handshake did not reuse a cached
+    # session, or +nil+ when a session was reused or no lookup was performed:
+    #
+    # - +:no_session+ -- no session had been cached for this server yet.
+    # - +:identity_changed+ -- the target server (including its proxy) or the
+    #   handshake-affecting TLS configuration changed, for example
+    #   #verify_mode, #verify_callback, #cert or #key was modified.
+    # - +:session_expired+ -- the cached session exceeded its lifetime.
+    # - +:handshake_failed+ -- the previous handshake failed, so the partial
+    #   session was discarded rather than cached.
+    #
+    # The symbol only describes cache bookkeeping; it never contains key
+    # material or other sensitive configuration contents.
+    def ssl_session_invalidation_reason
+      @ssl_session_invalidation_reason
     end
 
     # Starts an \HTTP session.
@@ -1713,7 +1817,7 @@ module Net   #:nodoc:
       if use_ssl?
         if proxy?
           if @proxy_use_ssl
-            proxy_sock = OpenSSL::SSL::SSLSocket.new(s)
+            proxy_sock = new_ssl_socket(s, OpenSSL::SSL::SSLContext.new)
             ssl_socket_connect(proxy_sock, @open_timeout)
           else
             proxy_sock = s
@@ -1756,9 +1860,6 @@ module Net   #:nodoc:
               OpenSSL::SSL::SSLContext::SESSION_CACHE_CLIENT |
                   OpenSSL::SSL::SSLContext::SESSION_CACHE_NO_INTERNAL_STORE
         end
-        if @ssl_context.respond_to?(:session_new_cb) # not implemented under JRuby
-          @ssl_context.session_new_cb = proc {|sock, sess| @ssl_session = sess }
-        end
 
         # Still do the post_connection_check below even if connecting
         # to IP address
@@ -1776,19 +1877,77 @@ module Net   #:nodoc:
           ssl_host_address = @address
         end
 
+        server_key = ssl_session_server_key(ssl_host_address)
+        tls_identity = build_ssl_session_identity
+        # Remember the current connection so session_new_cb (which may fire
+        # during later I/O under TLS 1.3) always publishes against the
+        # identity of the most recent successful handshake.
+        @ssl_session_server_key = server_key
+        @ssl_session_tls_identity = tls_identity
+        cached_session, invalidation_reason =
+          @ssl_sessions.lookup(server_key, tls_identity,
+                               Process.clock_gettime(Process::CLOCK_REALTIME))
+        @ssl_session_invalidation_reason = invalidation_reason
+
+        # Gate publication through the handshake state so that a failed or
+        # unverified handshake can never publish a (possibly half-negotiated)
+        # session.  Under TLS 1.3 the new-session ticket arrives after the
+        # handshake, during later I/O, which is why the callback is kept.
+        @ssl_handshake_succeeded = false
+        if @ssl_context.respond_to?(:session_new_cb) # not implemented under JRuby
+          @ssl_context.session_new_cb = proc do |sock, sess|
+            if @ssl_handshake_succeeded && @ssl_session_server_key
+              @ssl_sessions.store(@ssl_session_server_key,
+                                  @ssl_session_tls_identity, sess)
+            end
+          end
+        end
+
         debug "starting SSL for #{conn_addr}:#{conn_port}..."
-        s = OpenSSL::SSL::SSLSocket.new(s, @ssl_context)
+        s = new_ssl_socket(s, @ssl_context)
         s.sync_close = true
         s.hostname = ssl_host_address if s.respond_to?(:hostname=) && ssl_host_address
 
-        if @ssl_session and
-           Process.clock_gettime(Process::CLOCK_REALTIME) < @ssl_session.time.to_f + @ssl_session.timeout
-          s.session = @ssl_session
+        if cached_session
+          debug "TLS session reuse candidate for #{@address}:#{@port}"
+          s.session = cached_session
+        else
+          debug "TLS session not reused for #{@address}:#{@port}: #{invalidation_reason}"
         end
-        ssl_socket_connect(s, @open_timeout)
-        if (@ssl_context.verify_mode != OpenSSL::SSL::VERIFY_NONE) && verify_hostname
-          s.post_connection_check(@address)
+
+        begin
+          ssl_socket_connect(s, @open_timeout)
+          if (@ssl_context.verify_mode != OpenSSL::SSL::VERIFY_NONE) && verify_hostname
+            s.post_connection_check(@address)
+          end
+        rescue => exception
+          # Never publish a session produced by a failed or unverified
+          # handshake; drop anything cached for this identity as well.
+          @ssl_handshake_succeeded = false
+          @ssl_sessions.invalidate(server_key)
+          @ssl_session_reused = false
+          @ssl_session_invalidation_reason = :handshake_failed
+          raise exception
         end
+        @ssl_handshake_succeeded = true
+
+        @ssl_session_reused =
+          if s.respond_to?(:session_reused?)
+            s.session_reused?
+          else
+            # runtimes without session_reused? (e.g. JRuby): offering a
+            # still-valid cached session is the best available signal
+            !cached_session.nil?
+          end
+        @ssl_session_invalidation_reason = nil if @ssl_session_reused
+
+        # Store the negotiated session only after the handshake and all
+        # verification steps have succeeded.  No key material is read here;
+        # the session_new_cb callback may later refresh this entry once the
+        # TLS 1.3 new-session ticket is received.
+        negotiated_session = s.session if s.respond_to?(:session)
+        @ssl_sessions.store(server_key, tls_identity, negotiated_session)
+
         debug "SSL established, protocol: #{s.ssl_version}, cipher: #{s.cipher[0]}"
       end
       @socket = BufferedIO.new(s, read_timeout: @read_timeout,
@@ -1805,6 +1964,50 @@ module Net   #:nodoc:
       raise
     end
     private :connect
+
+    # Factory for the origin (and proxy) SSL socket.  Kept as a separate
+    # method so tests can substitute a recording socket and assert on the
+    # handshake parameters without performing real TLS.
+    def new_ssl_socket(io, context)
+      OpenSSL::SSL::SSLSocket.new(io, context)
+    end
+    private :new_ssl_socket
+
+    # Identity of the remote TLS endpoint, kept separate from the TLS
+    # configuration.  The proxy is part of the endpoint identity: a session
+    # negotiated through one proxy must never be offered through another one,
+    # and direct connections never inherit a proxied session (and vice
+    # versa).  The SNI hostname is included in addition to the address and
+    # port because it is the actual server name sent in the handshake.
+    def ssl_session_server_key(sni_hostname)
+      proxy_key = if proxy?
+        [proxy_address, proxy_port, proxy_user, @proxy_use_ssl ? true : false]
+      else
+        nil
+      end
+      [@address, @port, sni_hostname, proxy_key]
+    end
+    private :ssl_session_server_key
+
+    # Fingerprint of the TLS configuration that influences the handshake.
+    #
+    # Ordinary parameters are compared by value.  The client certificate,
+    # extra chain, private key and verification callback are compared by
+    # object identity on purpose: only replacing the object (not mutating its
+    # contents) invalidates reuse, and secret contents such as the private
+    # key are never embedded in the key or written to the debug output.
+    def build_ssl_session_identity
+      values = SSL_ATTRIBUTES.map do |attribute|
+        value = instance_variable_get("@#{attribute}")
+        if SSL_IDENTITY_ATTRIBUTES.include?(attribute)
+          [true, value.nil? ? nil : value.object_id]
+        else
+          [false, value]
+        end
+      end
+      values
+    end
+    private :build_ssl_session_identity
 
     tcp_socket_parameters = TCPSocket.instance_method(:initialize).parameters
     TCP_SOCKET_NEW_HAS_OPEN_TIMEOUT = if tcp_socket_parameters != [[:rest]]
