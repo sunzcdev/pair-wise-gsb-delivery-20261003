@@ -266,6 +266,46 @@ successfully like this, it must look for exactly those named arguments. Implemen
 require access to the target path of their nested targets should inherit from ``ChainedFileSystem``,
 which will trigger pass-through of the nested path automatically.
 
+Structured chains and escaping
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Since the chain separator is a literal ``"::"``, a chained URL string is ambiguous when one of
+the object names itself contains ``::`` (or characters that a backend treats specially, such as
+``?`` or ``#``). Two mechanisms remove the ambiguity, and each layer of the chain only ever
+interprets its own path and parameters.
+
+*Escaping*: within one segment of a chained URL, ``:`` may be written as ``%3A`` and ``%`` as
+``%25`` - see :func:`fsspec.core.escape_chain_part`. The chain parser splits on the remaining
+literal ``::`` and then decodes exactly these two sequences, exactly once per segment, before
+handing the segment to its filesystem implementation. All other percent-sequences are left
+untouched, so an inner path (e.g., within a zip archive) is never decoded by an outer layer
+(e.g., HTTP), and no path is decoded twice.
+
+*Structured chains*: instead of a URL string, ``fsspec.open``, ``fsspec.open_files``,
+``fsspec.core.url_to_fs`` and ``fsspec.core.get_fs_token_paths`` also accept a list of
+segments. Each segment is a mapping ``{"protocol": ..., "path": ..., "kwargs": {...}}``
+(``"kwargs"`` optional) or a ``(protocol, path[, kwargs])`` tuple; a single mapping is a
+chain of one segment. Segment paths are used verbatim - they are never split or unescaped -
+and a segment's ``kwargs`` apply only to that layer, so options cannot leak to adjacent
+layers. The two forms are exactly equivalent:
+
+.. code-block:: python
+
+    # string form
+    of = fsspec.open("zip://inner::memory://my%3A%3Aarchive.zip")
+    # structured form, opens the same in-memory archive
+    of = fsspec.open([
+        {"protocol": "zip", "path": "inner"},
+        {"protocol": "memory", "path": "my::archive.zip"},
+    ])
+
+Chained implementations hand their target path to the next layer with an explicit
+``protocol=``; such paths are used as-is and never re-split, even if they contain ``"::"``.
+All chain parsing and validation happens before any filesystem instance is created, so a
+malformed chain raises immediately, before any backend connection is established. URL
+strings without escape sequences behave exactly as they always have; note that the
+sequences ``%3A`` and ``%25`` inside a *chained* URL are now interpreted as escapes.
+
 Caching Files Locally
 ---------------------
 

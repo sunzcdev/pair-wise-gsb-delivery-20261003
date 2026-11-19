@@ -45,7 +45,9 @@ Base Classes
    core.BaseCache
    core.OpenFile
    core.OpenFiles
+   core.escape_chain_part
    core.get_fs_token_paths
+   core.un_chain
    core.url_to_fs
    dircache.DirCache
    FSMap
@@ -79,6 +81,10 @@ Base Classes
 .. autoclass:: fsspec.core.OpenFiles
 
 .. autofunction:: fsspec.core.get_fs_token_paths
+
+.. autofunction:: fsspec.core.escape_chain_part
+
+.. autofunction:: fsspec.core.un_chain
 
 .. autofunction:: fsspec.core.url_to_fs
 

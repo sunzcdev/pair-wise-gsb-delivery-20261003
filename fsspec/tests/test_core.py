@@ -12,12 +12,32 @@ from fsspec.core import (
     OpenFile,
     OpenFiles,
     _expand_paths,
+    _unescape_chain_bit,
+    escape_chain_part,
     expand_paths_if_needed,
     get_compression,
     get_fs_token_paths,
     open_files,
     open_local,
+    un_chain,
 )
+
+
+@contextmanager
+def memory_zip(data=None, name="archive.zip"):
+    """A zip archive stored on the shared in-memory filesystem."""
+    data = data or {"inner": b"hello"}
+    fs = fsspec.filesystem("memory")
+    with fs.open(name, "wb") as f:
+        with zipfile.ZipFile(f, "w") as z:
+            for k, v in data.items():
+                z.writestr(k, v)
+    try:
+        yield fs, name
+    finally:
+        # remove the file directly from the store: names may contain
+        # characters (e.g. "?") that glob-based removal would misread
+        fs.store.pop(fs._strip_protocol(name), None)
 
 
 @contextmanager
@@ -670,3 +690,166 @@ def test_repeated_argument():
             anon=False,
             account_name="OTHER",
         )
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "simple",
+        "my::archive.zip",
+        "a:b:c",
+        "100%",
+        "a%3Ab",
+        "%25",
+        "weird?x=1&y=2#frag",
+        "dir/",
+        "::",
+        ":::a:::",
+    ],
+)
+def test_chain_escape_roundtrip(text):
+    assert _unescape_chain_bit(escape_chain_part(text)) == text
+
+
+def test_chain_unescape_only_interprets_chain_escapes():
+    # other percent-sequences belong to the layer owning the segment and
+    # must pass through untouched
+    assert _unescape_chain_bit("a%20b") == "a%20b"
+    assert _unescape_chain_bit("a%3Ab") == "a:b"
+    assert _unescape_chain_bit("a%3ab") == "a:b"
+    assert _unescape_chain_bit("a%25b") == "a%b"
+    # single left-to-right pass: %253A is the literal text "%3A"
+    assert _unescape_chain_bit("a%253Ab") == "a%3Ab"
+    # a bare % is not an escape
+    assert _unescape_chain_bit("100%") == "100%"
+    assert _unescape_chain_bit("100%3") == "100%3"
+
+
+def test_un_chain_legacy_string():
+    # old-style unambiguous chained URLs parse exactly as before
+    assert un_chain("memory://a/b") == [("/a/b", "memory", {})]
+    assert un_chain("simplecache::memory://a/b") == [
+        ("/a/b", "simplecache", {}),
+        ("/a/b", "memory", {}),
+    ]
+    out = un_chain("zip://inner::memory://archive.zip", {"memory": {"token": 1}})
+    assert out == [("inner", "zip", {}), ("/archive.zip", "memory", {"token": 1})]
+
+
+def test_inner_segment_not_double_decoded():
+    # the chain parser decodes its own escapes (%25 -> %) exactly once; the
+    # remaining %3A belongs to the memory layer and is left for it
+    out = un_chain("simplecache::memory://a%253Ab")
+    assert out[-1][0] == "/a%3Ab"
+
+
+def test_structured_chain_equivalent_to_string():
+    with memory_zip() as (_, name):
+        string_url = f"zip://inner::memory://{name}"
+        chains = [
+            [
+                {"protocol": "zip", "path": "inner"},
+                {"protocol": "memory", "path": name},
+            ],
+            [("zip", "inner"), ("memory", name)],
+        ]
+        with fsspec.open(string_url, "rb") as f:
+            expected = f.read()
+        assert expected == b"hello"
+        for chain in chains:
+            with fsspec.open(chain, "rb") as f:
+                assert f.read() == expected
+            assert un_chain(chain) == un_chain(string_url)
+        fs1, path1 = fsspec.core.url_to_fs(string_url)
+        fs2, path2 = fsspec.core.url_to_fs(chains[0])
+        assert path1 == path2 == "inner"
+        assert fs1.protocol == fs2.protocol == "zip"
+
+
+@pytest.mark.parametrize(
+    "name",
+    ["my::archive.zip", "archive.zip?x=1&y=2", "a::b#frag.zip", "100%.zip"],
+)
+def test_chained_url_with_escaped_names(name):
+    # object names containing "::" or query-like text: the escaped string
+    # form and the structured form open the same in-memory archive
+    with memory_zip(name=name):
+        url = "zip://inner::memory://" + escape_chain_part(name)
+        chain = [
+            {"protocol": "zip", "path": "inner"},
+            {"protocol": "memory", "path": name},
+        ]
+        assert un_chain(url) == un_chain(chain)
+        for spec in (url, chain):
+            with fsspec.open(spec, "rb") as f:
+                assert f.read() == b"hello"
+
+
+def test_structured_chain_single_segment():
+    with memory_zip():
+        with fsspec.open({"protocol": "memory", "path": "archive.zip"}, "rb") as f:
+            assert f.read(2) == b"PK"
+        fs, path = fsspec.core.url_to_fs([("memory", "archive.zip", {"token": 1})])
+        assert path == "/archive.zip"
+        assert fs.storage_options["token"] == 1
+
+
+def test_explicit_protocol_path_not_chain_split():
+    # chained implementations hand their target path down with an explicit
+    # protocol=; such paths must not be reinterpreted as a chain
+    name = "my::archive.zip"
+    with memory_zip(name=name):
+        with fsspec.open("zip://inner", "rb", fo=name, target_protocol="memory") as f:
+            assert f.read() == b"hello"
+
+
+def test_structured_chain_option_scoping():
+    chain = [
+        {"protocol": "zip", "path": "inner"},
+        {"protocol": "memory", "path": "archive.zip", "kwargs": {"token": "seg"}},
+    ]
+    # segment kwargs stay on their own layer; protocol-keyed top-level
+    # options merge into the matching layer; leftovers go to the outermost
+    assert un_chain(chain, {"memory": {"other": 1}, "cache_check": 10}) == [
+        ("inner", "zip", {"cache_check": 10}),
+        ("/archive.zip", "memory", {"token": "seg", "other": 1}),
+    ]
+    with memory_zip():
+        fs, path = fsspec.core.url_to_fs(chain)
+        assert path == "inner"
+        assert "token" not in fs.storage_options  # nothing leaked to zip
+        assert fs.of.fs.storage_options["token"] == "seg"  # memory got it
+
+
+def test_mixed_structured_and_plain_paths_raise():
+    with pytest.raises(ValueError, match="[Mm]ix"):
+        get_fs_token_paths([{"protocol": "memory", "path": "a"}, "memory://b"])
+    with pytest.raises(ValueError, match="[Mm]ix"):
+        fsspec.core.url_to_fs([("memory", "a"), "memory://b"])
+
+
+def test_chain_parse_errors_before_backend_connection(monkeypatch):
+    def fail(*args, **kwargs):
+        raise AssertionError("filesystem() must not be called for invalid chains")
+
+    monkeypatch.setattr(fsspec.core, "filesystem", fail)
+
+    for url in ["zip::::memory://x", "zip://inner::memory://x::", "::memory://x"]:
+        with pytest.raises(ValueError, match="[Ee]mpty segment"):
+            fsspec.core.url_to_fs(url)
+
+    bad_chains = [
+        [],
+        [{"protocol": "zip"}],  # missing path
+        [{"path": "inner"}],  # missing protocol
+        [{"protocol": "zip", "path": "inner", "bogus": 1}],  # unknown key
+        [{"protocol": "zip://x", "path": "inner"}],  # bad protocol
+        [{"protocol": "zip", "path": "inner", "kwargs": [1]}],  # kwargs not mapping
+        [("zip",)],  # tuple too short
+        [("zip", "inner", "not-a-mapping")],
+        [42],  # not a segment at all
+        [{"protocol": "no-such-protocol", "path": "x"}],  # unknown protocol
+    ]
+    for chain in bad_chains:
+        with pytest.raises((TypeError, ValueError)):
+            fsspec.core.url_to_fs(chain)

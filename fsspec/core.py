@@ -4,6 +4,7 @@ import io
 import logging
 import posixpath
 import re
+from collections.abc import Mapping
 from contextlib import ExitStack
 from glob import has_magic
 from pathlib import Path
@@ -260,7 +261,10 @@ def open_files(
         Absolute or relative filepath(s). Prefix with a protocol like ``s3://``
         to read from alternative filesystems. To read from multiple files you
         can pass a globstring or a list of paths, with the caveat that they
-        must all have the same protocol.
+        must all have the same protocol. A single file may also be given as a
+        structured chain specification (a list of ``{"protocol", "path",
+        ["kwargs"]}`` mappings or ``(protocol, path[, kwargs])`` tuples);
+        see :func:`un_chain`.
     mode: 'rb', 'wt', etc.
     compression: string or None
         If given, open file using compression codec. Can either be a compression
@@ -348,25 +352,231 @@ def open_files(
     )
 
 
+def escape_chain_part(text):
+    """Escape a path or name for inclusion as one segment of a chained URL.
+
+    In a chained URL, segments are separated by a literal ``"::"``, so a name
+    which itself contains a colon could produce a spurious separator. To
+    embed such a name, every ``":"`` is replaced by ``"%3A"`` and every
+    ``"%"`` by ``"%25"``, so the result round-trips exactly. Other
+    characters - including query-like characters such as ``?``, ``#``, ``&``
+    and ``=`` - are left alone: they are only meaningful to the layer which
+    owns the segment, and each layer only ever interprets its own path and
+    parameters.
+
+    The inverse transformation is applied by the chain parser exactly once
+    per segment, before the segment is handed to its filesystem
+    implementation; inner segments are never decoded by outer layers.
+
+    Parameters
+    ----------
+    text: str
+        A path or name belonging to a single layer of the chain. This is
+        *not* a URL: do not include a protocol prefix.
+
+    Returns
+    -------
+    str
+        ``text``, safe to embed in one segment of a chained URL.
+
+    Examples
+    --------
+    >>> escape_chain_part("my::archive.zip")
+    'my%3A%3Aarchive.zip'
+    >>> "zip://inner::memory://" + escape_chain_part("my::archive.zip")
+    'zip://inner::memory://my%3A%3Aarchive.zip'
+    """
+    return stringify_path(text).replace("%", "%25").replace(":", "%3A")
+
+
+def _unescape_chain_bit(bit):
+    """Reverse chain-level escaping in one segment of a chained URL.
+
+    Only ``%3A`` (``:``) and ``%25`` (``%``) are interpreted, in a single
+    left-to-right pass (so ``%253A`` decodes to the literal text ``%3A``).
+    Any other ``%`` sequence is left untouched for the layer that owns the
+    segment, ensuring no path is ever decoded twice.
+    """
+    if "%" not in bit:
+        return bit
+    out = []
+    i = 0
+    while i < len(bit):
+        code = bit[i + 1 : i + 3].lower() if bit[i] == "%" else ""
+        if code in ("3a", "25"):
+            out.append(":" if code == "3a" else "%")
+            i += 3
+        else:
+            out.append(bit[i])
+            i += 1
+    return "".join(out)
+
+
+def _is_chain_segment(item):
+    """Does *item* look like one structured chain segment?
+
+    A segment is a mapping like ``{"protocol": ..., "path": ...}`` or a
+    ``(protocol, path[, kwargs])`` tuple. Plain strings and path-likes are
+    never segments.
+    """
+    if isinstance(item, Mapping):
+        return True
+    return (
+        isinstance(item, tuple)
+        and 2 <= len(item) <= 3
+        and isinstance(item[0], str)
+        and "://" not in item[0]
+        and "::" not in item[0]
+    )
+
+
+def _is_structured_chain(path):
+    """Is *path* a structured chain specification rather than a URL string?"""
+    if isinstance(path, Mapping):
+        return True
+    return (
+        isinstance(path, list)
+        and bool(path)
+        and all(_is_chain_segment(item) for item in path)
+    )
+
+
+def _parse_chain_segment(segment):
+    """Validate one structured chain segment.
+
+    Returns a ``(protocol, path, kwargs)`` triple. Raises before any
+    filesystem is instantiated if the segment is malformed.
+    """
+    if isinstance(segment, Mapping):
+        unknown = set(segment) - {"protocol", "path", "kwargs"}
+        if unknown:
+            raise ValueError(
+                f"Unknown keys {sorted(unknown)} in chain segment; allowed keys "
+                "are 'protocol', 'path' and 'kwargs'"
+            )
+        if "protocol" not in segment or "path" not in segment:
+            raise ValueError(
+                "Chain segment mappings require 'protocol' and 'path' keys; "
+                f"got {sorted(segment)}"
+            )
+        protocol, path = segment["protocol"], segment["path"]
+        kwargs = segment.get("kwargs") or {}
+    elif isinstance(segment, tuple) and 2 <= len(segment) <= 3:
+        protocol, path = segment[0], segment[1]
+        kwargs = segment[2] if len(segment) == 3 else {}
+        if kwargs is None:
+            kwargs = {}
+    else:
+        raise TypeError(
+            "Chain segments must be mappings {'protocol', 'path', ['kwargs']} "
+            f"or (protocol, path[, kwargs]) tuples; got {segment!r}"
+        )
+    if (
+        not isinstance(protocol, str)
+        or not protocol
+        or "://" in protocol
+        or "::" in protocol
+    ):
+        raise ValueError(f"Invalid protocol in chain segment: {protocol!r}")
+    path = stringify_path(path)
+    if not isinstance(path, str):
+        raise TypeError(f"Chain segment path must be a string, got {path!r}")
+    if not isinstance(kwargs, Mapping):
+        raise TypeError(f"Chain segment kwargs must be a mapping, got {kwargs!r}")
+    return protocol, path, dict(kwargs)
+
+
+def _un_chain_structured(chain, kwargs):
+    """Turn a structured chain specification into the internal chain list.
+
+    Each layer's path and options are used exactly as given: paths are never
+    split on ``"::"`` or unescaped, and a segment's ``kwargs`` apply only to
+    that segment's layer - nothing leaks to adjacent layers. As with the
+    string form, top-level ``kwargs`` values keyed by a protocol name are
+    merged into the matching layer, and any remaining top-level ``kwargs``
+    go to the outermost (first) layer.
+    """
+    # Avoid a circular import
+    from fsspec.implementations.chained import ChainedFileSystem
+
+    if isinstance(chain, Mapping):
+        chain = [chain]
+    segments = [_parse_chain_segment(segment) for segment in chain]
+    if not segments:
+        raise ValueError("A structured chain must contain at least one segment")
+
+    kwargs = kwargs.copy()
+    # explicit segments override a top-level ``protocol=``
+    kwargs.pop("protocol", None)
+
+    # [[url, protocol, kwargs], ...]
+    out = []
+    previous_bit = None
+
+    for i, (protocol, bit, segment_kwargs) in enumerate(reversed(segments)):
+        cls = get_filesystem_class(protocol)
+        kws = kwargs.pop(protocol, {}).copy()
+        kws.update(segment_kwargs)
+
+        if i == len(segments) - 1:
+            # the outermost layer collects any leftover top-level options
+            kws.update(kwargs)
+
+        bit = cls._strip_protocol(bit)
+
+        if (
+            "target_protocol" not in kws
+            and issubclass(cls, ChainedFileSystem)
+            and not bit
+        ):
+            # replace bit if we are chaining and no path given
+            bit = previous_bit
+
+        out.append((bit, protocol, kws))
+        previous_bit = bit
+
+    out.reverse()
+    return out
+
+
 def _un_chain(path, kwargs):
     # Avoid a circular import
     from fsspec.implementations.chained import ChainedFileSystem
 
-    if "::" in path:
+    if _is_structured_chain(path):
+        return _un_chain_structured(path, kwargs)
+
+    path = stringify_path(path)
+    if not isinstance(path, str):
+        if isinstance(path, (list, tuple)) and any(map(_is_chain_segment, path)):
+            raise ValueError(
+                "Cannot mix structured chain segments and plain paths in one list"
+            )
+        raise TypeError(f"Cannot parse a chained URL from {path!r}")
+
+    if kwargs.get("protocol") or "::" not in path:
+        # An explicit protocol means the path belongs to exactly one layer:
+        # it is used as-is and never chain-split. This is how chained
+        # implementations hand their own path to the next layer without it
+        # being reinterpreted as another chain.
+        bits = [path]
+    else:
+        bits = [_unescape_chain_bit(bit) for bit in path.split("::")]
+        if any(not bit for bit in bits):
+            raise ValueError(f"Empty segment in chained URL {path!r}")
         x = re.compile(".*[^a-z]+.*")  # test for non protocol-like single word
         known_protocols = set(available_protocols())
-        bits = []
+        classified = []
 
         # split on '::', then ensure each bit has a protocol
-        for p in path.split("::"):
+        for p in bits:
             if p in known_protocols:
-                bits.append(p + "://")
+                classified.append(p + "://")
             elif "://" in p or x.match(p):
-                bits.append(p)
+                classified.append(p)
             else:
-                bits.append(p + "://")
-    else:
-        bits = [path]
+                classified.append(p + "://")
+        bits = classified
 
     # [[url, protocol, kwargs], ...]
     out = []
@@ -403,14 +613,54 @@ def _un_chain(path, kwargs):
     return out
 
 
+def un_chain(path, storage_options=None):
+    """Parse a (possibly chained) URL into per-layer components.
+
+    Parameters
+    ----------
+    path: str or sequence
+        Either a (possibly chained) URL string, or a structured chain: a
+        sequence of segments, where each segment is a mapping like
+        ``{"protocol": "zip", "path": "inner", "kwargs": {...}}``
+        (``"kwargs"`` is optional) or a ``(protocol, path[, kwargs])``
+        tuple. A single mapping is treated as a chain of one segment.
+    storage_options: dict, optional
+        Top-level options, interpreted exactly as for the string form:
+        values keyed by a protocol name apply to that layer, and any
+        remaining options go to the outermost (first) layer.
+
+    Returns
+    -------
+    list of (path, protocol, kwargs)
+        One tuple per layer, outermost first. ``path`` belongs to the layer
+        named by ``protocol``, and ``kwargs`` are the options for that layer
+        only.
+
+    Notes
+    -----
+    In the string form, layers are separated by a literal ``"::"``. A name
+    that itself contains a colon can be embedded with
+    :func:`escape_chain_part`; the parser decodes ``%3A`` (``:``) and
+    ``%25`` (``%``) exactly once per segment, so no layer ever decodes
+    another layer's path. All parsing and validation happens before any
+    filesystem instance is created, so malformed chains raise immediately
+    rather than after a backend connection has been established.
+    """
+    return _un_chain(path, storage_options or {})
+
+
 def url_to_fs(url, **kwargs):
     """
     Turn fully-qualified and potentially chained URL into filesystem instance
 
     Parameters
     ----------
-    url : str
-        The fsspec-compatible URL
+    url : str or sequence
+        The fsspec-compatible URL. May also be a structured chain: a
+        sequence of ``{"protocol": ..., "path": ..., "kwargs": {...}}``
+        mappings or ``(protocol, path[, kwargs])`` tuples, one per layer
+        (see :func:`un_chain`). Segment paths are then used verbatim and
+        segment kwargs apply only to their own layer.
     **kwargs: dict
         Extra options that make sense to a particular storage connection, e.g.
         host, port, username, password, etc.
@@ -474,7 +724,9 @@ def open(
     urlpath: string or list
         Absolute or relative filepath. Prefix with a protocol like ``s3://``
         to read from alternative filesystems. Should not include glob
-        character(s).
+        character(s). May also be a structured chain specification (a list
+        of ``{"protocol", "path", ["kwargs"]}`` mappings or
+        ``(protocol, path[, kwargs])`` tuples); see :func:`un_chain`.
     mode: 'rb', 'wt', etc.
     compression: string or None
         If given, open file using compression codec. Can either be a compression
@@ -526,7 +778,7 @@ def open(
     """
     expand = DEFAULT_EXPAND if expand is None else expand
     out = open_files(
-        urlpath=[urlpath],
+        urlpath=urlpath if _is_structured_chain(urlpath) else [urlpath],
         mode=mode,
         compression=compression,
         encoding=encoding,
@@ -664,7 +916,10 @@ def get_fs_token_paths(
     ----------
     urlpath: string or iterable
         Absolute or relative filepath, URL (may include protocols like
-        ``s3://``), or globstring pointing to data.
+        ``s3://``), or globstring pointing to data. May also be a structured
+        chain specification (a list of ``{"protocol", "path", ["kwargs"]}``
+        mappings or ``(protocol, path[, kwargs])`` tuples); see
+        :func:`un_chain`.
     mode: str, optional
         Mode in which to open files.
     num: int, optional
@@ -680,9 +935,16 @@ def get_fs_token_paths(
     expand: bool
         Expand string paths for writing, assuming the path is a directory
     """
-    if isinstance(urlpath, (list, tuple, set)):
+    structured = _is_structured_chain(urlpath)
+    if structured:
+        urlpath0 = urlpath
+    elif isinstance(urlpath, (list, tuple, set)):
         if not urlpath:
             raise ValueError("empty urlpath sequence")
+        if any(map(_is_chain_segment, urlpath)):
+            raise ValueError(
+                "Cannot mix structured chain segments and plain paths in one list"
+            )
         urlpath0 = stringify_path(next(iter(urlpath)))
     else:
         urlpath0 = stringify_path(urlpath)
@@ -702,7 +964,7 @@ def get_fs_token_paths(
         inkwargs["fo"] = urls
     paths, protocol, _ = chain[0]
     fs = filesystem(protocol, **inkwargs)
-    if isinstance(urlpath, (list, tuple, set)):
+    if isinstance(urlpath, (list, tuple, set)) and not structured:
         pchains = [
             _un_chain(stringify_path(u), storage_options or {})[0] for u in urlpath
         ]
