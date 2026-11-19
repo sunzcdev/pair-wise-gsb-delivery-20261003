@@ -47,6 +47,38 @@ module AMQ
       end
     end
 
+    class UnexpectedFrameError < Protocol::Error
+      DEFAULT_MESSAGE = "Frame received out of sequence.".freeze
+    end
+
+    class DuplicateHeaderError < Protocol::Error
+      DEFAULT_MESSAGE = "Content header has already been received for the message being assembled.".freeze
+    end
+
+    class BodySizeExceededError < Protocol::Error
+      DEFAULT_MESSAGE = "Content body exceeds the size declared in the content header.".freeze
+
+      def initialize(remaining = nil, received = nil)
+        if remaining && received
+          super("Content body exceeds the declared size: #{received} more bytes arrived while only #{remaining} bytes remain.")
+        else
+          super()
+        end
+      end
+    end
+
+    class ContentClassMismatchError < Protocol::Error
+      DEFAULT_MESSAGE = "Content header class does not match the class of the method being assembled.".freeze
+
+      def initialize(expected = nil, actual = nil)
+        if expected && actual
+          super("Content header class #{actual} does not match method class #{expected}.")
+        else
+          super()
+        end
+      end
+    end
+
     class SoftError < Protocol::Error
       def self.inherited(subclass)
         Error.inherited(subclass)
