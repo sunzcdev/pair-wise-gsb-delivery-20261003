@@ -27,6 +27,18 @@ class UnknownParamKey(dns.exception.DNSException):
     """Unknown SVCB ParamKey"""
 
 
+class InvalidSVCBRecord(dns.exception.DNSException):
+    """A semantically invalid SVCB/HTTPS record.
+
+    Raised by :meth:`SVCBBase.validate` when a parsed record violates one of
+    the rules of RFC 9460 that concern how parameters relate to each other
+    and to the record's mode, rather than the low-level wire or presentation
+    syntax.  Parsing itself never raises this exception, so records that fail
+    semantic validation can still be inspected with :meth:`to_text` and
+    :meth:`to_wire`.
+    """
+
+
 class ParamKey(dns.enum.IntEnum):
     """SVCB ParamKey"""
 
@@ -552,19 +564,88 @@ class SVCBBase(dns.rdata.Rdata):
                 if pcls.emptiness() == Emptiness.NEVER:
                     raise ValueError(f"key {k:d} cannot be empty")
         self.params: dns.immutable.Dict = dns.immutable.Dict(params)
-        # Make sure any parameter listed as mandatory is present in the
-        # record.
-        mandatory = params.get(ParamKey.MANDATORY)
+        # Note that the RFC 9460 self-consistency rules (e.g. mandatory keys
+        # being present and supported, no-default-alpn requiring alpn, and the
+        # wire ordering rules) are deliberately not enforced here; they are
+        # checked by validate(), which is also the only place that raises
+        # InvalidSVCBRecord.  Keeping parsing free of semantic checks lets
+        # operational tools inspect non-compliant records verbatim.
+
+    def validate(self) -> None:
+        """Validate the semantic rules of RFC 9460 for this record.
+
+        This is a local, read-only check: it does not perform any DNS
+        resolution or attempt to contact the service, and it does not alter
+        the record.  Low-level presentation and wire-format syntax is already
+        enforced by the parsers; this method covers the mode distinction and
+        how the parameters relate to each other.
+
+        For an AliasMode record (SvcPriority 0), SvcParams are not defined
+        (RFC 9460 section 2.4.2).
+
+        For a ServiceMode record, the following are checked:
+
+        * Every key listed in ``mandatory`` must be present (RFC 9460
+          section 8, self-consistency), and every such key must be one this
+          implementation understands.  An unsupported mandatory key makes the
+          RR incompatible, so it must be treated as unusable rather than
+          silently ignored (RFC 9460 section 8).
+
+        * The ``no-default-alpn`` parameter requires the ``alpn`` parameter
+          (RFC 9460 section 6.1).
+
+        The wire ordering rules (strictly increasing, unique SvcParamKeys)
+        and the presentation "no repeated keys" rule of RFC 9460 section 2.2
+        are enforced by the parsers rather than here, since presentation
+        format allows parameters in any order and records are stored in a
+        keyed dictionary.
+
+        Unrecognized parameters that are not mandatory are left untouched,
+        retaining their original values, as RFC 9460 requires them to be
+        ignored.
+
+        Raises :class:`InvalidSVCBRecord` if any rule is violated.
+        """
+        if self.priority == 0:
+            # AliasMode.  SvcParams are not defined, and the wire and text
+            # parsers already reject records that carry any, but records can
+            # also be built directly through the Python API.  A TargetName of
+            # "." is valid (RFC 9460 section 2.5.1), so it is not checked.
+            if len(self.params) != 0:
+                raise InvalidSVCBRecord("parameters are not allowed in AliasMode")
+            return
+        # ServiceMode.
+        # The SvcParamKey ordering and duplication rules of RFC 9460
+        # section 2.2 are enforced by the parsers: the presentation parser
+        # rejects a repeated key, and the wire parser rejects keys that are
+        # not in strictly increasing numeric order (which also excludes
+        # duplicates).  A record built directly through the Python API stores
+        # its parameters in a dict, so it cannot contain a duplicate, and
+        # to_wire() emits the keys in sorted order regardless of insertion
+        # order; presentation format explicitly allows any order.  Nothing
+        # further is required here.
+        # The no-default-alpn parameter requires the alpn parameter
+        # (RFC 9460 section 6.1).
+        if ParamKey.NO_DEFAULT_ALPN in self.params:
+            if ParamKey.ALPN not in self.params:
+                raise InvalidSVCBRecord(
+                    "no-default-alpn is present but alpn is missing"
+                )
+        mandatory = self.params.get(ParamKey.MANDATORY)
         if mandatory is not None:
             for key in mandatory.keys:
-                # Note we have to say "not in" as we have None as a value
-                # so a get() and a not None test would be wrong.
-                if key not in params:
-                    raise ValueError(f"key {key:d} declared mandatory but not present")
-        # The no-default-alpn parameter requires the alpn parameter.
-        if ParamKey.NO_DEFAULT_ALPN in params:
-            if ParamKey.ALPN not in params:
-                raise ValueError("no-default-alpn present, but alpn missing")
+                # Note we have to say "not in" as the value may be None, so a
+                # get() and a not-None test would be wrong.
+                if key not in self.params:
+                    raise InvalidSVCBRecord(
+                        f"key {key:d} is declared mandatory but is not present"
+                    )
+                if key not in _class_for_key:
+                    # The mandatory key is not understood by this
+                    # implementation.  Per RFC 9460 section 8 the RR is
+                    # incompatible and must not be used; ignoring the key and
+                    # continuing (e.g. to the default port) would be wrong.
+                    raise InvalidSVCBRecord(f"mandatory key {key:d} is not supported")
 
     def to_styled_text(self, style: dns.rdata.RdataStyle) -> str:
         target = self.target.to_styled_text(style)

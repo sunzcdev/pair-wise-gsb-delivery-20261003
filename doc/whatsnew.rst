@@ -38,6 +38,20 @@ What's New in dnspython
   attribute of the result, may now need an ``isinstance()`` check or a cast to
   satisfy a type checker.
 
+* SVCB and HTTPS records now have a separately callable ``validate()``
+  method that checks the semantic rules of RFC 9460: it distinguishes
+  AliasMode from ServiceMode, ensures that every key listed in
+  ``mandatory`` is present and supported, and enforces that
+  ``no-default-alpn`` is only used together with ``alpn``.  It raises the
+  new ``dns.rdtypes.svcbbase.InvalidSVCBRecord`` exception on failure.  The
+  check is purely local; it does no DNS resolution and does not connect to
+  the service.  An unsupported mandatory key makes the record unusable
+  instead of being ignored, while unrecognized non-mandatory parameters keep
+  their original values.  Parsing no longer enforces these rules itself, so
+  non-compliant records can still be read and inspected with ``to_text()``
+  and ``to_wire()``; the existing parser checks for duplicate parameters and
+  the strictly increasing wire order are unchanged.
+
 2.9.2
 -----
 

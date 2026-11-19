@@ -73,8 +73,6 @@ class SVCBTestCase(unittest.TestCase):
             # key 0
             "1 . mandatory=key0",
             "1 . mandatory=key0,alpn",
-            # missing key
-            "1 . mandatory=alpn",
             # duplicate
             "1 . mandatory=alpn,alpn alpn=h2",
             # invalid escaping
@@ -96,6 +94,29 @@ class SVCBTestCase(unittest.TestCase):
             "1 . mandatory=key1,key002 alpn=h2 no-default-alpn",
         )
         self.check_invalid_inputs(invalid_inputs)
+
+        # A mandatory key that is listed but not present is a semantic
+        # (self-consistency) failure, not a syntax one: the record still
+        # parses and can be inspected, but validate() rejects it.
+        rr = dns.rdata.from_text("IN", "SVCB", "1 . mandatory=alpn")
+        with self.assertRaisesRegex(
+            dns.rdtypes.svcbbase.InvalidSVCBRecord, "mandatory but is not present"
+        ):
+            rr.validate()
+        # The raw record is still available to operational tooling.
+        self.assertEqual(rr.to_text(), '1 . mandatory="alpn"')
+
+        # An unsupported key that is marked mandatory makes the record
+        # unusable: it must not be ignored so that a client would fall back
+        # to the default port.
+        rr = dns.rdata.from_text("IN", "SVCB", "1 . mandatory=key9999 key9999=abc")
+        with self.assertRaisesRegex(
+            dns.rdtypes.svcbbase.InvalidSVCBRecord, "not supported"
+        ):
+            rr.validate()
+        # The unknown parameter keeps its original value.
+        unknown = rr.params[dns.rdtypes.svcbbase.ParamKey.make("key9999")]
+        self.assertEqual(unknown.value, b"abc")
 
     def test_svcb_alpn(self):
         valid_inputs_two_items = (
@@ -195,16 +216,28 @@ class SVCBTestCase(unittest.TestCase):
         self.check_valid_inputs(valid_inputs)
 
         invalid_inputs = (
-            "1 . no-default-alpn",
-            '1 . no-default-alpn=""',
-            "1 . key2",
-            '1 . key2=""',
             "1 . alpn=h2 no-default-alpn=foo",
             "1 . alpn=h2 no-default-alpn=",
             "1 . alpn=h2 key2=foo",
             "1 . alpn=h2 key2=",
         )
         self.check_invalid_inputs(invalid_inputs)
+
+        # no-default-alpn without alpn is a semantic (self-consistency)
+        # failure per RFC 9460 section 6.1: the records still parse for
+        # inspection, but validate() rejects them.
+        for text in (
+            "1 . no-default-alpn",
+            '1 . no-default-alpn=""',
+            "1 . key2",
+            '1 . key2=""',
+        ):
+            rr = dns.rdata.from_text("IN", "SVCB", text)
+            with self.assertRaisesRegex(
+                dns.rdtypes.svcbbase.InvalidSVCBRecord,
+                "no-default-alpn is present but alpn is missing",
+            ):
+                rr.validate()
 
     def test_svcb_port(self):
         valid_inputs = (
@@ -430,15 +463,27 @@ class SVCBTestCase(unittest.TestCase):
         invalid_inputs = (
             # As above, but the keys are out of order.
             "\\# 24 0001 00 0000000400010003 000300020101 00010003026832",
-            # As above, but the mandatory keys don't match
-            "\\# 24 0001 00 0000000400010002 00010003026832 000300020101",
-            "\\# 24 0001 00 0000000400010004 00010003026832 000300020101",
             # Alias form shouldn't have parameters.
             "\\# 08 0000 000300020101",
+        )
+        self.check_invalid_inputs(invalid_inputs)
+
+        # Mandatory keys that are not present, and no-default-alpn without
+        # alpn, are semantic failures: the wire still parses so the record
+        # can be inspected, but validate() rejects it.
+        semantic_failures = (
+            # mandatory lists key 2 (no-default-alpn), which is absent
+            "\\# 24 0001 00 0000000400010002 00010003026832 000300020101",
+            # mandatory lists key 4 (ipv4hint), which is absent
+            "\\# 24 0001 00 0000000400010004 00010003026832 000300020101",
             # no-default-alpn requires alpn
             "\\# 07 0001 00 00020000",
         )
-        self.check_invalid_inputs(invalid_inputs)
+        for wire_hex in semantic_failures:
+            wire = bytes.fromhex(wire_hex.split(" ", 2)[2].replace(" ", ""))
+            rr = dns.rdata.from_wire("IN", "SVCB", wire, 0, len(wire))
+            with self.assertRaises(dns.rdtypes.svcbbase.InvalidSVCBRecord):
+                rr.validate()
 
     def test_svcb_empty_value(self):
         # Keys whose value must not be empty, as zero-length wire values.
@@ -564,8 +609,6 @@ class SVCBTestCase(unittest.TestCase):
             "1 foo.example.com. ipv6hint",
             # The "no-default-alpn" SvcParamKey value MUST be empty (Section 6.1).
             "1 foo.example.com. no-default-alpn=abc",
-            # In this record a mandatory SvcParam is missing (Section 7).
-            "1 foo.example.com. mandatory=key123",
             # The "mandatory" SvcParamKey MUST not be included in mandatory list
             # (Section 7).
             "1 foo.example.com. mandatory=mandatory",
@@ -574,6 +617,14 @@ class SVCBTestCase(unittest.TestCase):
             "1 foo.example.com. mandatory=key123,key123 key123=abc",
         )
         self.check_invalid_inputs(failure_cases)
+
+        # A mandatory SvcParam that is missing is a semantic failure
+        # (Section 7/8), so the record parses but validate() rejects it.
+        rr = dns.rdata.from_text("IN", "SVCB", "1 foo.example.com. mandatory=key123")
+        with self.assertRaisesRegex(
+            dns.rdtypes.svcbbase.InvalidSVCBRecord, "mandatory but is not present"
+        ):
+            rr.validate()
 
     def test_alias_mode(self):
         rd = dns.rdata.from_text("in", "svcb", "0 .")
@@ -612,3 +663,107 @@ class SVCBTestCase(unittest.TestCase):
         # the bug we're checking is fixed.
         assert not wire.endswith(b"\xc0\x00")
         assert wire.endswith(b"\x09elseWhere\x00")
+
+    def test_svcb_validate(self):
+        svcbbase = dns.rdtypes.svcbbase
+        InvalidSVCBRecord = svcbbase.InvalidSVCBRecord
+        ParamKey = svcbbase.ParamKey
+
+        # A simple, valid ServiceMode record validates cleanly.
+        rr = dns.rdata.from_text("IN", "SVCB", "1 . alpn=h2 port=53")
+        self.assertIsNone(rr.validate())
+        # Validation is read-only and does not mutate the record.
+        self.assertEqual(rr.to_text(), '1 . alpn="h2" port="53"')
+
+        # A record with every supported parameter validates.
+        rr = dns.rdata.from_text(
+            "IN",
+            "SVCB",
+            '100 foo.com. mandatory="alpn,port" alpn="h2,h3" '
+            'no-default-alpn port="12345" ech="AAT+DQAA" '
+            "ipv4hint=1.2.3.4 ipv6hint=1::2",
+        )
+        self.assertIsNone(rr.validate())
+
+        # Unknown, non-mandatory parameters are tolerated and retain their
+        # original value.
+        rr = dns.rdata.from_text("IN", "SVCB", '1 . key12345="foo"')
+        self.assertIsNone(rr.validate())
+        self.assertEqual(rr.params[ParamKey.make("key12345")].value, b"foo")
+
+        # An unsupported mandatory key makes the record unusable, even though
+        # the key itself is present; it must not be ignored.
+        rr = dns.rdata.from_text("IN", "SVCB", "1 . mandatory=key12345 key12345=foo")
+        with self.assertRaisesRegex(InvalidSVCBRecord, "not supported"):
+            rr.validate()
+        # ... but the raw record remains inspectable.
+        self.assertEqual(rr.to_text(), '1 . mandatory="key12345" key12345="foo"')
+
+        # A mandatory key that is absent is a self-consistency failure.
+        rr = dns.rdata.from_text("IN", "SVCB", "1 . mandatory=port")
+        with self.assertRaisesRegex(InvalidSVCBRecord, "mandatory but is not present"):
+            rr.validate()
+
+        # Supported, present mandatory keys are fine, in any presentation
+        # order.
+        rr = dns.rdata.from_text(
+            "IN",
+            "SVCB",
+            "1 . no-default-alpn mandatory=alpn,no-default-alpn alpn=h2",
+        )
+        self.assertIsNone(rr.validate())
+
+        # no-default-alpn without alpn is rejected.
+        rr = dns.rdata.from_text("IN", "SVCB", "1 . no-default-alpn")
+        with self.assertRaisesRegex(
+            InvalidSVCBRecord, "no-default-alpn is present but alpn is missing"
+        ):
+            rr.validate()
+
+        # Records built directly through the Python API with the parameters
+        # out of presentation order are still valid: presentation format
+        # allows any order, and to_wire() emits keys in sorted order.
+        rr = dns.rdata.from_text("IN", "SVCB", "1 . alpn=h2 port=53").replace(
+            params={
+                ParamKey.PORT: svcbbase.PortParam(53),
+                ParamKey.ALPN: svcbbase.ALPNParam(["h2"]),
+            }
+        )
+        self.assertIsNone(rr.validate())
+        # The wire form is sorted even though the dict is not.
+        wire = rr.to_wire()
+        alpn_encoding = bytes.fromhex("00010003026832")
+        port_encoding = bytes.fromhex("000300020035")
+        self.assertIn(alpn_encoding, wire)
+        self.assertIn(port_encoding, wire)
+        self.assertLess(wire.index(alpn_encoding), wire.index(port_encoding))
+
+        # AliasMode records have no parameters when parsed, and validate()
+        # accepts them (including TargetName ".").
+        for text in ("0 .", "0 elsewhere."):
+            rr = dns.rdata.from_text("IN", "SVCB", text)
+            self.assertIsNone(rr.validate())
+
+        # An AliasMode record carrying parameters cannot be produced by the
+        # parsers, but one built through the Python API is rejected by
+        # validate() rather than silently accepted.
+        rr = dns.rdata.from_text("IN", "SVCB", "0 .").replace(
+            params={ParamKey.ALPN: svcbbase.ALPNParam(["h2"])}
+        )
+        with self.assertRaisesRegex(InvalidSVCBRecord, "AliasMode"):
+            rr.validate()
+
+        # A wire record that parses but is semantically invalid keeps its
+        # exact wire form, so operational tooling can still examine it.
+        wire = bytes.fromhex("0001 00 00020000")
+        rr = dns.rdata.from_wire("IN", "SVCB", wire, 0, len(wire))
+        with self.assertRaises(InvalidSVCBRecord):
+            rr.validate()
+        self.assertEqual(rr.to_wire(), wire)
+
+        # The HTTPS RR type shares the same validation behavior.
+        rr = dns.rdata.from_text("IN", "HTTPS", "1 . mandatory=key12345 key12345=x")
+        with self.assertRaises(InvalidSVCBRecord):
+            rr.validate()
+        rr = dns.rdata.from_text("IN", "HTTPS", '1 . alpn="h2"')
+        self.assertIsNone(rr.validate())

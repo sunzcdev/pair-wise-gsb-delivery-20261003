@@ -883,6 +883,21 @@ Types specific to class IN
 SVCB and HTTPS Parameter Classes
 --------------------------------
 
+The SVCB and HTTPS rdata classes parse records permissively: parsing only
+enforces the low-level presentation and wire-format syntax of RFC 9460, so
+that operational tools can inspect even non-compliant records with
+``to_text()`` and ``to_wire()``.  Semantic rules that concern the record
+mode and how its parameters relate to each other are checked separately by
+the rdata's :py:meth:`dns.rdtypes.svcbbase.SVCBBase.validate` method, which
+raises :py:class:`dns.rdtypes.svcbbase.InvalidSVCBRecord` on failure.  The
+check is local and never performs DNS resolution or connects to the
+service.  In particular, an unrecognized parameter that is listed as
+mandatory makes the record unusable, while an unrecognized non-mandatory
+parameter is retained with its original value.
+
+.. autoclass:: dns.rdtypes.svcbbase.InvalidSVCBRecord
+   :members:
+
 .. autoclass:: dns.rdtypes.svcbbase.ParamKey
    :members:
 
