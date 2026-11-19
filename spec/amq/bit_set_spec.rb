@@ -231,6 +231,62 @@ RSpec.describe AMQ::BitSet do
     end
   end # describe
 
+  describe "#next_clear_bit_from" do
+    subject do
+      described_class.new(300)
+    end
+
+    it "returns the given position when that bit is clear" do
+      expect(subject.next_clear_bit_from(0)).to eq(0)
+      expect(subject.next_clear_bit_from(127)).to eq(127)
+      expect(subject.next_clear_bit_from(299)).to eq(299)
+    end # it
+
+    it "does not look before the given position" do
+      expect(subject.next_clear_bit_from(5)).to eq(5)
+      expect(subject.next_clear_bit_from(0)).to eq(0)
+    end # it
+
+    it "skips set bits and full words" do
+      0.upto(199) { |i| subject.set(i) }
+
+      expect(subject.next_clear_bit_from(0)).to eq(200)
+      expect(subject.next_clear_bit_from(64)).to eq(200)
+      expect(subject.next_clear_bit_from(130)).to eq(200)
+    end # it
+
+    it "resumes on the next bit when the start is inside a set run" do
+      0.upto(9) { |i| subject.set(i) }
+
+      expect(subject.next_clear_bit_from(3)).to eq(10)
+      subject.unset(6)
+      expect(subject.next_clear_bit_from(3)).to eq(6)
+      expect(subject.next_clear_bit_from(7)).to eq(10)
+    end # it
+
+    it "returns -1 when there is nothing at or after the position" do
+      subject.set(299)
+      subject.set(298)
+
+      expect(subject.next_clear_bit_from(298)).to eq(-1)
+      expect(subject.next_clear_bit_from(300)).to eq(-1)
+    end # it
+
+    it "ignores trailing bits beyond the number of bits" do
+      bs = described_class.new(4)
+      0.upto(3) { |i| bs.set(i) }
+
+      expect(bs.next_clear_bit_from(0)).to eq(-1)
+      expect(bs.next_clear_bit_from(3)).to eq(-1)
+    end # it
+
+    it "rejects positions outside the set" do
+      expect { subject.next_clear_bit_from(-1) }.to raise_error(IndexError)
+      expect { subject.next_clear_bit_from(301) }.to raise_error(IndexError)
+      expect { subject.next_clear_bit_from(nil) }.to raise_error(IndexError)
+    end # it
+  end # describe
+
   describe "#to_s" do
     it "returns a string representation of the bit set" do
       bs = described_class.new(64)

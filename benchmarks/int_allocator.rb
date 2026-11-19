@@ -31,4 +31,13 @@ Benchmark.bm do |x|
     end
   end
 
+  x.report("batch") do
+    allocator = AMQ::IntAllocator.inclusive(1,65535)
+    1.upto(63) do
+      ids = allocator.allocate_batch(1024)
+      raise 'it be broke' unless ids.length == 1024
+      allocator.release_batch(ids)
+    end
+  end
+
 end

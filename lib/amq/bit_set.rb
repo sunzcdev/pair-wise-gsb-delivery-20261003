@@ -78,6 +78,34 @@ module AMQ
       -1
     end # next_clear_bit
 
+    # Same as #next_clear_bit, but looks for the first clear bit at or after
+    # the given position only. Whole words that are full are skipped, so
+    # repeated calls from a moving position do not rescan the beginning.
+    #
+    # @param [Integer] Position to start the search at, may be equal to the number of bits
+    # @return [Integer] Index of the first clear bit at or after the position, -1 if there is none
+    # @api public
+    def next_clear_bit_from(start)
+      unless start.is_a?(Integer) && start >= 0 && start <= @nbits
+        raise IndexError, "Cannot start at bit #{start.inspect} from a BitSet with #{@nbits} bits"
+      end
+      return -1 if start == @nbits
+
+      w    = word_index(start)
+      word = @words[w] | ((1 << (start % BITS_PER_WORD)) - 1)
+
+      while true
+        unless word == WORD_MASK
+          i = w * BITS_PER_WORD + BitSet.number_of_trailing_ones(word)
+          return i < @nbits ? i : -1
+        end
+
+        w += 1
+        return -1 if w >= @words.size
+        word = @words[w]
+      end
+    end # next_clear_bit_from
+
     def to_s
       result = ""
       @words.each do |w|

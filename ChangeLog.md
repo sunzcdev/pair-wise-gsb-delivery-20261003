@@ -1,6 +1,28 @@
 ## Changes between 2.10.0 and 2.11.0 (unreleased)
 
-No changes yet.
+### IntAllocator Supports Closed Intervals and Batch Reservations
+
+`AMQ::IntAllocator` gained an opt-in closed interval mode,
+`AMQ::IntAllocator.inclusive(lo, hi)`, which allocates every value of
+`lo..hi`. Unlike the historical mode, any lower boundary works and a single
+value range such as `inclusive(7, 7)` is valid. The historical
+`IntAllocator.new(lo, hi)` conventions are unchanged and `#allocate` keeps
+returning `-1` on exhaustion in that mode; the closed interval mode returns
+`nil`, so `-1` can be a real value.
+
+`#allocate_batch` (also `#allocate_many` and `#reserve_batch`) reserves several
+distinct values at once and is all or nothing: when the remaining capacity is
+too small nothing is allocated and `nil` is returned.
+
+Allocated values are now `AMQ::IntAllocator::Reservation` instances, which
+compare, hash, sort, format and coerce like the Integer they stand for.
+Releasing an out of range or already released value no longer touches the
+bitmap, and a reservation obtained before `#reset` cannot release an
+identically numbered reservation of the next generation.
+
+Allocation no longer restarts its scan at the first bit: it resumes after the
+previous allocation and skips full words, which keeps dense allocate/free
+workloads cheap.
 
 
 ## Changes between 2.9.0 and 2.10.0 (Nov 2, 2026)
