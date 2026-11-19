@@ -282,6 +282,16 @@ module AMQ
           expect(Table.decode(Table.encode(input3))["timely"]["now"].to_i).to eq(now.to_i)
         end
 
+        it "does not drop the last table field when it ends exactly on the declared length" do
+          input = { "first" => "value", "last" => nil }
+          expect(Table.decode(Table.encode(input))).to eq(input)
+        end
+
+        it "does not drop the last element of an array ending in a void value" do
+          input = { "list" => ["one", "two", nil] }
+          expect(Table.decode(Table.encode(input))).to eq(input)
+        end
+
       end # describe
 
       describe ".length" do

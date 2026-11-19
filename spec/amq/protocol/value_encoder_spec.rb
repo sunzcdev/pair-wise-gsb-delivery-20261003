@@ -140,6 +140,33 @@ module AMQ
         expect(encoded).to include("test_symbol")
       end
 
+      it "calculates the size of symbols consistently with their encoding" do
+        expect(described_class.field_value_size(:test_symbol)).to eq(described_class.encode(:test_symbol).bytesize)
+      end
+
+      it "calculates the size of DateTime values consistently with their encoding" do
+        date_time = DateTime.parse("2011-07-14T01:17:46+04:00")
+
+        expect(described_class.field_value_size(date_time)).to eq(9)
+        expect(described_class.field_value_size(date_time)).to eq(described_class.encode(date_time).bytesize)
+      end
+
+      it "uses the same type tag for planning and encoding" do
+        values = [
+          "str", :sym, 1, 1.0, AMQ::Protocol::Float32Bit.new(1.0),
+          true, false, nil, Time.now, DateTime.now, BigDecimal("1"),
+          [], [1], {}, { "k" => 1 }
+        ]
+
+        values.each do |value|
+          expect(described_class.type_tag(value)).to eq(described_class.encode(value).byteslice(0, 1))
+        end
+      end
+
+      it "returns nil type tag for unsupported values" do
+        expect(described_class.type_tag(Object.new)).to be_nil
+      end
+
       it "encodes BigDecimal values" do
         bd = BigDecimal("123.45")
         encoded = described_class.encode(bd)
@@ -154,6 +181,10 @@ module AMQ
 
       it "raises ArgumentError for unsupported types" do
         expect { described_class.encode(Object.new) }.to raise_error(ArgumentError)
+      end
+
+      it "raises instead of returning a bogus size for unsupported types" do
+        expect { described_class.field_value_size(Object.new) }.to raise_error(Table::UnsupportedValueError)
       end
 
     end # TableValueEncoder

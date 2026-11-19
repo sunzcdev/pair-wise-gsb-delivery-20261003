@@ -33,8 +33,9 @@ module AMQ
 
         ary    = []
         offset = initial_offset + 4
+        boundary = initial_offset + 4 + array_length
 
-        while offset <= (initial_offset + array_length)
+        while offset < boundary
           type, offset = decode_value_type(data, offset)
 
           i = case type

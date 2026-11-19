@@ -2,6 +2,7 @@
 # frozen_string_literal: true
 
 require "amq/protocol/type_constants"
+require "amq/protocol/encoding_plan"
 require "amq/protocol/table_value_encoder"
 require "amq/protocol/table_value_decoder"
 
@@ -18,6 +19,17 @@ module AMQ
       # Pack format string
       PACK_UINT32_BE = 'N'.freeze
 
+      # AMQP 0-9-1 field names are prefixed with a single unsigned octet,
+      # so a name can be at most 255 bytes long
+      MAX_KEY_BYTE_SIZE = 255
+
+      # What to do when two keys of the same hash map to the same field
+      # name after Symbol/String conversion
+      DUPLICATE_KEY_POLICIES = [:raise, :first, :last].freeze
+
+      OPTION_KEYS     = [:on_duplicate_key, :fallback].freeze
+      DEFAULT_OPTIONS = { on_duplicate_key: :raise, fallback: nil }.freeze
+
       #
       # API
       #
@@ -29,28 +41,30 @@ module AMQ
       end
 
 
-      def self.encode(table)
-        buffer = +''
+      # Builds the read-only encoding plan for a table without serializing
+      # it. Raises before any concatenation would happen on unsupported
+      # values, overlong keys, duplicate keys or circular structures.
+      def self.encoding_plan(table = nil, **options)
+        table, options = resolve_table_and_options(table, options)
 
-        table ||= {}
-
-        table.each do |key, value|
-          key = key.to_s # it can be a symbol as well
-          buffer << key.bytesize.chr << key
-
-          case value
-          when Hash
-            buffer << TYPE_HASH
-            buffer << self.encode(value)
-          else
-            buffer << TableValueEncoder.encode(value).force_encoding(buffer.encoding)
-          end
-        end
-
-        [buffer.bytesize].pack(PACK_UINT32_BE) << buffer
+        EncodingPlanner.plan_table(table, on_duplicate_key: options[:on_duplicate_key], fallback: options[:fallback])
       end
 
 
+      def self.encode(table = nil, **options)
+        table, options = resolve_table_and_options(table, options)
+
+        plan = EncodingPlanner.plan_table(table, on_duplicate_key: options[:on_duplicate_key], fallback: options[:fallback])
+
+        [plan.content_size].pack(PACK_UINT32_BE) << write_entries(plan.entries)
+      end
+
+
+      # Entry point used by TableValueEncoder.size helpers so they share
+      # the planner's type selection
+      def self.plan_value_public(value)
+        EncodingPlanner.plan_value(value, PlannerPath.root, :raise, nil, [])
+      end
 
 
       def self.decode(data)
@@ -60,7 +74,7 @@ module AMQ
         return table if table_length.zero?
 
         offset       = 4
-        while offset <= table_length
+        while offset < (4 + table_length)
           key, offset  = decode_table_key(data, offset)
           type, offset = TableValueDecoder.decode_value_type(data, offset)
 
@@ -144,6 +158,64 @@ module AMQ
       end
 
 
+      #
+      # Implementation
+      #
+
+      # Ruby 3 keeps positional hashes and keyword arguments apart. The
+      # historical API accepted symbol keyed tables positionally, so a bare
+      # Table.encode(test: true) now arrives as keywords. When the keyword
+      # hash contains a key that is not one of our options it is treated as
+      # the table itself; pure option hashes configure an empty table.
+      def self.resolve_table_and_options(table, options)
+        if table.nil? && !(options.keys - OPTION_KEYS).empty?
+          table   = options
+          options = {}
+        elsif !(unknown = options.keys - OPTION_KEYS).empty?
+          raise ArgumentError, "unknown option(s): #{unknown.map(&:inspect).join(', ')}"
+        end
+
+        options = DEFAULT_OPTIONS.merge(options)
+        unless DUPLICATE_KEY_POLICIES.include?(options[:on_duplicate_key])
+          raise ArgumentError, "unknown on_duplicate_key policy #{options[:on_duplicate_key].inspect}, expected one of #{DUPLICATE_KEY_POLICIES.map(&:inspect).join(', ')}"
+        end
+
+        [table || {}, options]
+      end
+      private_class_method :resolve_table_and_options
+
+      def self.write_entries(entries)
+        buffer = String.new
+
+        entries.each do |entry|
+          buffer << entry.key.bytesize.chr
+          buffer << entry.key
+          buffer << write_value_plan(entry.value_plan)
+        end
+
+        buffer
+      end
+      private_class_method :write_entries
+
+      def self.write_value_plan(plan)
+        if plan.custom?
+          # produced once during planning, reused as-is here
+          return plan.encoded.dup
+        end
+
+        if plan.hash?
+          return plan.type + [plan.table.content_size].pack(PACK_UINT32_BE) + write_entries(plan.table.entries)
+        end
+
+        if plan.array?
+          payload = String.new
+          plan.array.each { |element| payload << write_value_plan(element) }
+          return plan.type + [payload.bytesize].pack(PACK_UINT32_BE) + payload
+        end
+
+        plan.type + TableValueEncoder.encode_payload(plan.value)
+      end
+      private_class_method :write_value_plan
 
     end # Table
   end # Protocol

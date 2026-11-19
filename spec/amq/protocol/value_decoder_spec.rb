@@ -249,6 +249,26 @@ module AMQ
             .to raise_error(ArgumentError, /unsupported type/)
         end
       end
+
+      context "array boundary handling" do
+        it "does not drop a void element ending exactly at the declared length" do
+          input = ["v", nil]
+          value, _offset = described_class.decode_array(TableValueEncoder.encode(input), 1)
+          expect(value).to eq(input)
+        end
+
+        it "decodes every element when the last one fills the array exactly" do
+          input = ["one", 2, true, nil, 9.0]
+          value, _offset = described_class.decode_array(TableValueEncoder.encode(input), 1)
+          expect(value).to eq(input)
+        end
+
+        it "decodes nested arrays whose last element lands on the boundary" do
+          input = [["inner", nil], "outer"]
+          value, _offset = described_class.decode_array(TableValueEncoder.encode(input), 1)
+          expect(value).to eq(input)
+        end
+      end
     end
   end
 end
