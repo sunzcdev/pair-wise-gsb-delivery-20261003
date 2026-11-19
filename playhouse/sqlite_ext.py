@@ -68,50 +68,304 @@ class ISODateTimeField(DateTimeField):
         return value
 
 
+class JSONPathSegment(object):
+    """
+    Base-class for the structural components of a SQLite JSON path.
+
+    A path is a sequence of segments: object keys, array indexes and the
+    tail-append marker. Path strings are generated from the segments, never
+    by string-concatenation at the call-site, so keys containing dots,
+    quotes, backslashes or control characters are escaped correctly and
+    cannot be confused with path syntax.
+    """
+    __slots__ = ()
+
+    def json_path(self):
+        """Return this segment's path fragment, e.g. ``."key"``."""
+        raise NotImplementedError
+
+    @classmethod
+    def coerce(cls, segment):
+        # Shorthand used by ``__getitem__`` / ``path()``: strings are object
+        # keys, integers are array indexes.
+        if isinstance(segment, JSONPathSegment):
+            return segment
+        if isinstance(segment, bool):
+            raise TypeError('JSON path segments cannot be booleans: %r.' %
+                            (segment,))
+        if isinstance(segment, str):
+            return JSONPathKey(segment)
+        if isinstance(segment, int):
+            return JSONPathIndex(segment)
+        raise TypeError('Unsupported JSON path segment: %r.' % (segment,))
+
+class JSONPathKey(JSONPathSegment):
+    """
+    An object key. Rendered as a quoted JSON string, so keys holding dots,
+    quotes, backslashes and other characters are unambiguous.
+    """
+    __slots__ = ('key',)
+
+    def __init__(self, key):
+        if not isinstance(key, str):
+            raise TypeError('JSON object keys must be strings, got %r.' %
+                            (key,))
+        self.key = key
+
+    def json_path(self):
+        # json.dumps() applies the same escaping rules SQLite uses when
+        # parsing a quoted path key (quotes, backslashes, control chars),
+        # and escapes non-ASCII characters as \uXXXX.
+        return '.%s' % json.dumps(self.key)
+
+    def __eq__(self, other):
+        return type(other) is JSONPathKey and other.key == self.key
+
+    def __ne__(self, other):
+        return not (self == other)
+
+    def __hash__(self):
+        return hash((JSONPathKey, self.key))
+
+    def __repr__(self):
+        return 'JSONPathKey(%r)' % (self.key,)
+
+class JSONPathIndex(JSONPathSegment):
+    """An array index. Negative indexes count from the end of the array."""
+    __slots__ = ('index',)
+
+    def __init__(self, index):
+        if isinstance(index, bool) or not isinstance(index, int):
+            raise TypeError('JSON array indexes must be integers, got %r.' %
+                            (index,))
+        self.index = index
+
+    def json_path(self):
+        if self.index < 0:
+            # SQLite spells negative indexes relative to the array length.
+            return '[#%d]' % self.index
+        return '[%d]' % self.index
+
+    def __eq__(self, other):
+        return type(other) is JSONPathIndex and other.index == self.index
+
+    def __ne__(self, other):
+        return not (self == other)
+
+    def __hash__(self):
+        return hash((JSONPathIndex, self.index))
+
+    def __repr__(self):
+        return 'JSONPathIndex(%r)' % (self.index,)
+
+class JSONPathAppend(JSONPathSegment):
+    """
+    The tail-append marker, addressing the position after the last element
+    of an array.
+    """
+    __slots__ = ()
+
+    def json_path(self):
+        return '[#]'
+
+    def __eq__(self, other):
+        return type(other) is JSONPathAppend
+
+    def __ne__(self, other):
+        return not (self == other)
+
+    def __hash__(self):
+        return hash(JSONPathAppend)
+
+    def __repr__(self):
+        return 'JSONPathAppend()'
+
+class JSONPathRaw(JSONPathSegment):
+    """
+    An already-formed JSON path, e.g. ``$.k1``. Retained for backwards
+    compatibility with the legacy ``remove(*paths)`` API -- prefer the
+    structured segments, which quote keys for you.
+    """
+    __slots__ = ('path',)
+
+    def __init__(self, path):
+        if not isinstance(path, str):
+            raise TypeError('Raw JSON paths must be strings, got %r.' %
+                            (path,))
+        if not path.startswith('$'):
+            raise ValueError('Raw JSON paths must begin with "$", got %r.' %
+                             (path,))
+        self.path = path
+
+    def json_path(self):
+        return self.path
+
+    def __eq__(self, other):
+        return type(other) is JSONPathRaw and other.path == self.path
+
+    def __ne__(self, other):
+        return not (self == other)
+
+    def __hash__(self):
+        return hash((JSONPathRaw, self.path))
+
+    def __repr__(self):
+        return 'JSONPathRaw(%r)' % (self.path,)
+
+
+def _json_path_string(segments):
+    # A raw path already carries the leading "$", so it has to stand alone:
+    # it is absolute and cannot be prefixed or extended.
+    if len(segments) == 1 and isinstance(segments[0], JSONPathRaw):
+        return segments[0].json_path()
+    for segment in segments:
+        if isinstance(segment, JSONPathRaw):
+            raise ValueError('A raw JSON path cannot be combined with other '
+                             'path segments.')
+    return '$' + ''.join([s.json_path() for s in segments])
+
+def _json_path_value(segments):
+    # Paths are always passed to the JSON1 functions as bound parameters, so
+    # they are never interpreted as (or spliced into) the SQL statement.
+    return Value(_json_path_string(segments), converter=False)
+
+
 class JSONPath(ColumnBase):
-    def __init__(self, field, path=None):
+    # Mutation hooks, overridden by JSONBPath to use the jsonb() functions.
+    _json_wrap = staticmethod(fn.json)
+    _json_set = staticmethod(fn.json_set)
+    _json_insert = staticmethod(fn.json_insert)
+    _json_replace = staticmethod(fn.json_replace)
+    _json_remove = staticmethod(fn.json_remove)
+    _json_patch = staticmethod(fn.json_patch)
+
+    def __init__(self, field, segments=None):
         super(JSONPath, self).__init__()
         self._field = field
-        self._path = path or ()
+        self._segments = tuple(
+            [JSONPathSegment.coerce(s) for s in (segments or ())])
 
     def _converter(self, value):
         return self._field.python_value(value)
 
     @property
+    def segments(self):
+        return self._segments
+
+    @property
     def path(self):
-        return Value('$%s' % ''.join(self._path))
+        return _json_path_value(self._segments)
 
-    def __getitem__(self, idx):
-        if isinstance(idx, int) or idx == '#':
-            item = '[%s]' % idx
-        else:
-            item = '."%s"' % idx.replace('"', '""')
-        return type(self)(self._field, self._path + (item,))
+    def __getitem__(self, item):
+        if isinstance(item, str) and item == '#':
+            # Backwards-compatible shorthand for the tail-append marker. Use
+            # key('#') to address an object key literally named "#".
+            item = JSONPathAppend()
+        return type(self)(self._field, self._segments + (item,))
 
-    def append(self, value, as_json=None):
-        if as_json or isinstance(value, (list, dict)):
-            value = fn.json(self._field._json_dumps(value))
-        return fn.json_set(self._field, self['#'].path, value)
+    def extend(self, *segments):
+        """Extend the path with one or more path segments."""
+        return type(self)(self._field, self._segments + segments)
 
-    def _json_operation(self, func, value, as_json=None):
-        if as_json or isinstance(value, (list, dict)):
-            value = fn.json(self._field._json_dumps(value))
-        return func(self._field, self.path, value)
+    def key(self, key):
+        """Extend the path with an object-key segment."""
+        return self.extend(JSONPathKey(key))
 
-    def insert(self, value, as_json=None):
-        return self._json_operation(fn.json_insert, value, as_json)
+    def at(self, index):
+        """Extend the path with an array-index segment."""
+        return self.extend(JSONPathIndex(index))
+
+    def tail(self):
+        """Extend the path with a tail-append segment (``[#]``)."""
+        return self.extend(JSONPathAppend())
+
+    def _json_value(self, value, as_json=None):
+        # Explicit JSON null (None), containers and booleans are serialized
+        # and marked as JSON, so an explicit null is stored as JSON null
+        # rather than nulling the column (or being read as SQL NULL), and
+        # booleans are stored as true/false rather than the driver's 0/1.
+        if isinstance(value, Node):
+            return value
+        if as_json or value is None or isinstance(value, (list, dict, bool)):
+            return self._json_wrap(self._field._json_dumps(value))
+        return value
+
+    @staticmethod
+    def _coerce_segments(path):
+        if isinstance(path, JSONPath):
+            return path.segments
+        if isinstance(path, JSONPathSegment):
+            return (path,)
+        if isinstance(path, bool):
+            raise TypeError('JSON path segments cannot be booleans: %r.' %
+                            (path,))
+        if isinstance(path, (str, int)):
+            return (JSONPathSegment.coerce(path),)
+        return tuple([JSONPathSegment.coerce(s) for s in path])
+
+    def _path_value(self, path):
+        return _json_path_value(
+            self._segments + self._coerce_segments(path))
 
     def set(self, value, as_json=None):
-        return self._json_operation(fn.json_set, value, as_json)
+        return self._json_set(self._field, self.path,
+                              self._json_value(value, as_json))
+
+    def insert(self, value, as_json=None):
+        return self._json_insert(self._field, self.path,
+                                 self._json_value(value, as_json))
 
     def replace(self, value, as_json=None):
-        return self._json_operation(fn.json_replace, value, as_json)
+        return self._json_replace(self._field, self.path,
+                                  self._json_value(value, as_json))
 
     def update(self, value):
-        return self.set(fn.json_patch(self, self._field._json_dumps(value)))
+        return self.set(self._json_patch(self, self._field._json_dumps(value)))
 
     def remove(self):
-        return fn.json_remove(self._field, self.path)
+        return self._json_remove(self._field, self.path)
+
+    def append(self, value, as_json=None):
+        return self._json_set(self._field, self.tail().path,
+                              self._json_value(value, as_json))
+
+    # Batch operations. Every path/value pair is handed to a single JSON1
+    # function call, so the updates are applied in the order given, with each
+    # update observing the result of the preceding one.
+    def _many(self, func, updates, as_json=None):
+        args = [self._field]
+        for path, value in updates:
+            args.append(self._path_value(path))
+            args.append(self._json_value(value, as_json))
+        return func(*args)
+
+    def set_many(self, updates, as_json=None):
+        """
+        Apply multiple ``(path, value)`` updates with a single ``json_set()``.
+        Pairs are applied in order and missing parents are created as needed.
+        """
+        return self._many(self._json_set, updates, as_json)
+
+    def insert_many(self, updates, as_json=None):
+        """Multiple path updates via a single ``json_insert()``. Paths that
+        already exist are left untouched."""
+        return self._many(self._json_insert, updates, as_json)
+
+    def replace_many(self, updates, as_json=None):
+        """Multiple path updates via a single ``json_replace()``. Paths that
+        do not exist are left untouched."""
+        return self._many(self._json_replace, updates, as_json)
+
+    def remove_many(self, paths):
+        """
+        Remove multiple paths with a single ``json_remove()``. Removal is
+        applied in order, so removing an array element shifts the indexes
+        used by subsequent paths.
+        """
+        args = [self._field]
+        for path in paths:
+            args.append(self._path_value(path))
+        return self._json_remove(*args)
 
     def json_type(self):
         return fn.json_type(self._field, self.path)
@@ -127,37 +381,19 @@ class JSONPath(ColumnBase):
 
     def __sql__(self, ctx):
         return ctx.sql(fn.json_extract(self._field, self.path)
-                       if self._path else self._field)
+                       if self._segments else self._field)
 
 class JSONBPath(JSONPath):
-    def append(self, value, as_json=None):
-        if as_json or isinstance(value, (list, dict)):
-            value = fn.jsonb(self._field._json_dumps(value))
-        return fn.jsonb_set(self._field, self['#'].path, value)
-
-    def _json_operation(self, func, value, as_json=None):
-        if as_json or isinstance(value, (list, dict)):
-            value = fn.jsonb(self._field._json_dumps(value))
-        return func(self._field, self.path, value)
-
-    def insert(self, value, as_json=None):
-        return self._json_operation(fn.jsonb_insert, value, as_json)
-
-    def set(self, value, as_json=None):
-        return self._json_operation(fn.jsonb_set, value, as_json)
-
-    def replace(self, value, as_json=None):
-        return self._json_operation(fn.jsonb_replace, value, as_json)
-
-    def update(self, value):
-        return self.set(fn.jsonb_patch(self, self._field._json_dumps(value)))
-
-    def remove(self):
-        return fn.jsonb_remove(self._field, self.path)
+    _json_wrap = staticmethod(fn.jsonb)
+    _json_set = staticmethod(fn.jsonb_set)
+    _json_insert = staticmethod(fn.jsonb_insert)
+    _json_replace = staticmethod(fn.jsonb_replace)
+    _json_remove = staticmethod(fn.jsonb_remove)
+    _json_patch = staticmethod(fn.jsonb_patch)
 
     def __sql__(self, ctx):
         return ctx.sql(fn.jsonb_extract(self._field, self.path)
-                       if self._path else self._field)
+                       if self._segments else self._field)
 
 
 class JSONField(TextField):
@@ -199,6 +435,35 @@ class JSONField(TextField):
     def __getitem__(self, item):
         return self.Path(self)[item]
 
+    def path(self, *segments):
+        """
+        Return a :class:`JSONPath` built from structured segments. Strings
+        are object keys, integers are array indexes, and
+        :class:`JSONPathSegment` instances are used as-is. A single tuple or
+        list argument is expanded, so a stored path can be passed through.
+
+        .. code-block:: python
+
+           Config.data.path('a.b', 0)                      # $."a.b"[0]
+           Config.data.path(('a.b', 0))                    # same
+           Config.data.path(JSONPathKey('a.b'), 0)         # same
+        """
+        if len(segments) == 1 and isinstance(segments[0], (list, tuple)):
+            segments = tuple(segments[0])
+        return self.Path(self, segments)
+
+    def key(self, key):
+        """Return a path rooted at an object key (however it is spelled)."""
+        return self.Path(self).key(key)
+
+    def at(self, index):
+        """Return a path rooted at an array index."""
+        return self.Path(self).at(index)
+
+    def tail(self):
+        """Return the tail-append path (``$[#]``)."""
+        return self.Path(self).tail()
+
     def extract(self, *paths):
         paths = [Value(p, converter=False) for p in paths]
         return fn.json_extract(self, *paths)
@@ -223,9 +488,47 @@ class JSONField(TextField):
         return self.Path(self).update(data)
 
     def remove(self, *paths):
+        """
+        Remove the paths from the document. Deletion is applied in order, so
+        removing an array element shifts the indexes of later paths.
+
+        Each path is a :class:`JSONPathSegment`, a :class:`JSONPath`, a tuple
+        of segments, or the ``str`` / ``int`` shorthand (object key / array
+        index). For backwards compatibility a string beginning with ``$`` is
+        treated as an already-formed JSON path; use :class:`JSONPathKey` to
+        address an object key that begins with ``$``.
+        """
+        path = self.Path(self)
         if not paths:
-            return self.Path(self).remove()
-        return fn.json_remove(self, *paths)
+            return path.remove()
+        return path.remove_many([self._remove_path(p) for p in paths])
+
+    @staticmethod
+    def _remove_path(path):
+        if isinstance(path, str) and path.startswith('$'):
+            return JSONPathRaw(path)
+        return path
+
+    def set_many(self, updates, as_json=None):
+        """Apply multiple ``(path, value)`` updates in a single ``json_set()``.
+        Updates are applied in the order given."""
+        return self.Path(self).set_many(updates, as_json)
+
+    def insert_many(self, updates, as_json=None):
+        """Multiple ``(path, value)`` pairs via a single ``json_insert()``.
+        Existing paths are not overwritten."""
+        return self.Path(self).insert_many(updates, as_json)
+
+    def replace_many(self, updates, as_json=None):
+        """Multiple ``(path, value)`` pairs via a single ``json_replace()``.
+        Non-existent paths are not created."""
+        return self.Path(self).replace_many(updates, as_json)
+
+    def remove_many(self, paths):
+        """Remove multiple paths in a single ``json_remove()`` call. Unlike
+        :meth:`remove`, every path is interpreted structurally (a string is an
+        object key, even if it begins with ``$``)."""
+        return self.Path(self).remove_many(paths)
 
     def json_type(self):
         return fn.json_type(self)
@@ -271,11 +574,6 @@ class JSONBField(JSONField):
     def extract(self, *paths):
         paths = [Value(p, converter=False) for p in paths]
         return fn.jsonb_extract(self, *paths)
-
-    def remove(self, *paths):
-        if not paths:
-            return self.Path(self).remove()
-        return fn.jsonb_remove(self, *paths)
 
 
 class SearchField(Field):

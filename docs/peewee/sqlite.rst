@@ -1066,6 +1066,87 @@ in SQLite using the `SQLite json functions <https://sqlite.org/json1.html>`_.
        .where(Config.id == 2)
        .execute())
 
+   Structured paths
+   ^^^^^^^^^^^^^^^^
+
+   Item-access (`data['key']`, `data[0]`) builds the path from Python values,
+   but the shorthand cannot express a key that is spelled like path syntax
+   (e.g. it contains a dot) unambiguously alongside the structured segments,
+   and it offers no way to address the tail of an array explicitly. Use the
+   path-builder methods to construct a path from *structured segments*
+   instead:
+
+   .. code-block:: python
+
+      Config.data.key('a.b')             # key with a literal dot.
+      Config.data.at(0)                  # array index.
+      Config.data.key('tags').tail()     # append position, $."tags"[#]
+      Config.data.path('a.b', 0)         # key then index.
+      Config.data.path(('a.b', 0))       # same, from a stored path tuple.
+
+   ``key()`` adds an object-key segment, ``at()`` an array-index segment
+   (negative indexes count from the end) and ``tail()`` the tail-append
+   marker. ``path()`` accepts any mix of the ``str`` / ``int`` shorthand and
+   :class:`JSONPathSegment` instances. The segments can be inspected via the
+   :attr:`JSONPath.segments` property.
+
+   Path strings are generated from the segments, never concatenated by the
+   caller, so keys containing dots, quotes, backslashes, newlines or unicode
+   are escaped as JSON string literals. The resulting path is always passed
+   to the JSON functions as a **bound parameter**, never spliced into the SQL:
+
+   .. code-block:: python
+
+      # data.key('a.b').set(1) compiles to:
+      #   UPDATE ... SET "data" = json_set("data", ?, ?)
+      # with parameters ['$."a.b"', 1].
+
+   The same interface is available on a :class:`JSONPath`, so it can be
+   chained onto an existing path:
+
+   .. code-block:: python
+
+      Config.data['retry'].key('a.b').set(1)
+
+   Batch updates
+   ^^^^^^^^^^^^^
+
+   ``set_many()``, ``insert_many()``, ``replace_many()`` and ``remove_many()``
+   apply several path operations with a single JSON1 call, in the order given.
+   Each operation observes the result of the one before it, so a parent object
+   created by an earlier pair is visible to a later child path:
+
+   .. code-block:: python
+
+      (Config
+       .update(data=Config.data.set_many([
+           (('retry',), {}),
+           (('retry', 'max'), 5)]))
+       .execute())
+      # data becomes {"retry": {"max": 5}}.
+
+   ``set_many``/``insert_many``/``replace_many`` take a list of
+   ``(path, value)`` pairs; ``remove_many`` takes a list of paths. Removal is
+   applied left-to-right, so removing an array element shifts the indexes used
+   by subsequent paths (matching ``json_remove()``).
+
+   Existence semantics and NULLs
+   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+   Each mutator keeps its own existence semantics on the addressed path:
+
+   * ``set()`` creates the path if missing, otherwise replaces it.
+   * ``insert()`` creates the path only if absent; an existing value -- even
+     an explicit JSON ``null`` -- is left untouched.
+   * ``replace()`` updates only an existing path.
+   * ``remove()`` deletes an existing path.
+
+   Passing ``None`` to ``set()``, ``insert()`` or ``replace()`` stores an
+   explicit JSON ``null`` at the path. It never sets the whole column to SQL
+   ``NULL``, and the JSON ``null`` is distinct from a missing key
+   (``json_type()`` reports ``'null'`` vs. SQL ``NULL``). ``True`` and
+   ``False`` are likewise stored as JSON ``true``/``false``.
+
    Helpers for other JSON scenarios:
 
    .. code-block:: python
@@ -1136,6 +1217,34 @@ in SQLite using the `SQLite json functions <https://sqlite.org/json1.html>`_.
 
       For more examples see the :class:`JSONPath` API documentation.
 
+   .. method:: path(*segments)
+
+      :param segments: ``str`` object keys, ``int`` array indexes, or
+          :class:`JSONPathSegment` instances. A single tuple or list is
+          expanded.
+      :rtype: JSONPath
+
+      Build a path from structured segments:
+
+      .. code-block:: python
+
+         Config.data.path('a.b', 0)              # $."a.b"[0]
+         Config.data.path(('a.b', 0))            # same
+         Config.data.path(JSONPathKey('a.b'))    # explicit key segment
+
+   .. method:: key(key)
+               at(index)
+               tail()
+
+      Convenience wrappers returning a :class:`JSONPath` extended with a
+      single object-key, array-index or tail-append segment respectively:
+
+      .. code-block:: python
+
+         Config.data.key('a.b')          # object key containing a dot.
+         Config.data.at(-1)              # last array element.
+         Config.data.key('xs').tail()    # $."xs"[#], the append position.
+
    .. method:: extract(*paths)
 
       :param paths: One or more JSON paths to extract.
@@ -1162,21 +1271,22 @@ in SQLite using the `SQLite json functions <https://sqlite.org/json1.html>`_.
       :param value: a scalar value, list, or dictionary.
       :param bool as_json: force the value to be treated as JSON, in which
           case it will be serialized as JSON in Python beforehand. By
-          default, lists and dictionaries are treated as JSON to be
-          serialized, while strings and integers are passed as-is.
+          default, lists, dictionaries, booleans and ``None`` are treated as
+          JSON to be serialized, while strings and integers are passed as-is.
 
       Set the value stored in a :class:`JSONField`.
 
       Uses the `json_set() <http://sqlite.org/json1.html#jset>`_ function
-      from the json1 extension.
+      from the json1 extension. ``value=None`` stores an explicit JSON
+      ``null`` at the path (the column is **not** set to SQL ``NULL``).
 
    .. method:: replace(value, as_json=None)
 
       :param value: a scalar value, list, or dictionary.
       :param bool as_json: force the value to be treated as JSON, in which
           case it will be serialized as JSON in Python beforehand. By
-          default, lists and dictionaries are treated as JSON to be
-          serialized, while strings and integers are passed as-is.
+          default, lists, dictionaries, booleans and ``None`` are treated as
+          JSON to be serialized, while strings and integers are passed as-is.
 
       Replace the existing value stored in a :class:`JSONField`. Will not
       create the path if it does not exist.
@@ -1189,11 +1299,11 @@ in SQLite using the `SQLite json functions <https://sqlite.org/json1.html>`_.
       :param value: a scalar value, list, or dictionary.
       :param bool as_json: force the value to be treated as JSON, in which
           case it will be serialized as JSON in Python beforehand. By
-          default, lists and dictionaries are treated as JSON to be
-          serialized, while strings and integers are passed as-is.
+          default, lists, dictionaries, booleans and ``None`` are treated as
+          JSON to be serialized, while strings and integers are passed as-is.
 
       Insert value into :class:`JSONField`. Will not overwrite an existing
-      value.
+      value, including an existing explicit JSON ``null``.
 
       Uses the `json_insert() <http://sqlite.org/json1.html#jset>`_ function
       from the json1 extension.
@@ -1203,13 +1313,14 @@ in SQLite using the `SQLite json functions <https://sqlite.org/json1.html>`_.
       :param value: a scalar value, list, or dictionary.
       :param bool as_json: force the value to be treated as JSON, in which
           case it will be serialized as JSON in Python beforehand. By
-          default, lists and dictionaries are treated as JSON to be
-          serialized, while strings and integers are passed as-is.
+          default, lists, dictionaries, booleans and ``None`` are treated as
+          JSON to be serialized, while strings and integers are passed as-is.
 
-      Append to the array stored in a :class:`JSONField`.
+      Append to the array stored in a :class:`JSONField`. Equivalent to a
+      ``set()`` addressed at the tail-append segment (``$...[#]``).
 
       Uses the `json_set() <http://sqlite.org/json1.html#jset>`_ function
-      from the json1 extension.
+      from the json1 extension (``jsonb_set()`` for :class:`JSONBField`).
 
    .. method:: update(data)
 
@@ -1230,10 +1341,39 @@ in SQLite using the `SQLite json functions <https://sqlite.org/json1.html>`_.
 
    .. method:: remove(*paths)
 
-      Remove the data stored in the :class:`JSONField`.
+      Remove the data stored in the :class:`JSONField`. Deletion is applied
+      in the order given, so removing an array element shifts the indexes
+      used by later paths.
+
+      Each path may be a :class:`JSONPathSegment`, a :class:`JSONPath`, a
+      tuple of segments, or the ``str`` / ``int`` shorthand (object key /
+      array index). For backwards compatibility a string beginning with
+      ``$`` is treated as an already-formed JSON path; use
+      :class:`JSONPathKey` to address an object key that begins with ``$``.
 
       Uses the `json_remove <https://www.sqlite.org/json1.html#jrm>`_ function
       from the json1 extension.
+
+   .. method:: set_many(updates, as_json=None)
+               insert_many(updates, as_json=None)
+               replace_many(updates, as_json=None)
+
+      Apply multiple ``(path, value)`` updates with a single ``json_set()`` /
+      ``json_insert()`` / ``json_replace()`` call, in the order given. Each
+      update observes the result of the preceding one, so a parent object
+      created by an earlier pair is visible to a later child path. Existence
+      semantics match the corresponding single-path method.
+
+      .. code-block:: python
+
+         Config.data.set_many([(('retry',), {}),
+                               (('retry', 'max'), 5)])
+
+   .. method:: remove_many(paths)
+
+      Remove multiple paths with a single ``json_remove()`` call. Every path
+      is interpreted structurally (a string is an object key even if it begins
+      with ``$``). Removal is left-to-right, so array indexes shift.
 
    .. method:: json_type()
 
@@ -1354,10 +1494,10 @@ in SQLite using the `SQLite json functions <https://sqlite.org/json1.html>`_.
            ('b',  'y2',  'z2',                           '$.x1.y2')]
 
 
-.. class:: JSONPath(field, path=None)
+.. class:: JSONPath(field, segments=None)
 
    :param JSONField field: the field object we intend to access.
-   :param tuple path: Components comprising the JSON path.
+   :param tuple segments: Path segments comprising the JSON path.
 
    A Pythonic way of representing JSON paths for use with
    :class:`JSONField`. Implements the same methods as :class:`JSONField` but
@@ -1372,6 +1512,51 @@ in SQLite using the `SQLite json functions <https://sqlite.org/json1.html>`_.
       query = (Config
                .select(Config.data['timeout'])
                .where(Config.data['retries']['max'] < 10))
+
+   .. attribute:: segments
+
+      The tuple of :class:`JSONPathSegment` instances for this path.
+
+   .. method:: key(key)
+               at(index)
+               tail()
+               extend(*segments)
+
+      Return a new :class:`JSONPath` extended with an object-key, array-index,
+      tail-append (or arbitrary) segment. See the matching
+      :class:`JSONField` methods.
+
+   Path segments
+   ^^^^^^^^^^^^^
+
+   .. class:: JSONPathSegment
+
+      Base-class for structured path components. Subclasses:
+
+      .. class:: JSONPathKey(key)
+
+         An object key, rendered as a quoted JSON string. Quotes, backslashes,
+         control characters and non-ASCII characters are escaped, so a key is
+         never confused with path syntax.
+
+      .. class:: JSONPathIndex(index)
+
+         An array index. A negative index counts from the end of the array and
+         is rendered as ``[#-n]``.
+
+      .. class:: JSONPathAppend
+
+         The tail-append marker, ``[#]``, addressing the position after the
+         last element of an array.
+
+      .. class:: JSONPathRaw(path)
+
+         An already-formed path (must begin with ``$``). Retained for
+         backwards compatibility with ``remove()``; cannot be combined with
+         other segments.
+
+      ``JSONPathSegment.coerce(value)`` maps a ``str`` to a
+      :class:`JSONPathKey` and an ``int`` to a :class:`JSONPathIndex`.
 
 .. class:: JSONBField(json_dumps=None, json_loads=None, **kwargs)
 

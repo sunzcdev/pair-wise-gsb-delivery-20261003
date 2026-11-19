@@ -9,6 +9,7 @@ from .base import BaseTestCase
 from .base import IS_CYSQLITE
 from .base import ModelTestCase
 from .base import TestModel
+from .base import __sql__
 from .base import get_in_memory_db
 from .base import requires_models
 from .base import skip_unless
@@ -683,6 +684,500 @@ class TestJSONBFieldFunctions(TestJSONFieldFunctions):
             ('c', ['v1', 'v2']),
             ('d', [None, None]),
             ('e', [None, None])])
+
+
+class TestJSONPathSegments(ModelTestCase):
+    database = ext_database
+    requires = [KeyData]
+    M = KeyData
+    func_prefix = 'json_'
+
+    def setUp(self):
+        super(TestJSONPathSegments, self).setUp()
+        self.M.delete().execute()
+
+    def document(self):
+        # Read the document back, decoding jsonb columns when necessary.
+        return self.M.select(fn.json(self.M.data)).scalar()
+
+    def json_type(self, path):
+        # json_type() returns SQL text; read the raw cursor value so the
+        # JSONField converter does not try to deserialize it.
+        return self.M.select(
+            fn.json_type(self.M.data, path.path).coerce(False).alias('t')
+        ).scalar()
+
+    def test_key_segments_quoted(self):
+        D = self.M.data
+        cases = (
+            ('plain', '$."plain"'),
+            ('a.b', '$."a.b"'),
+            ('a"b', '$."a\\"b"'),
+            ('a\\b', '$."a\\\\b"'),
+            ('', '$.""'),
+            ('[0]', '$."[0]"'),
+            ('#', '$."#"'),
+            ('$', '$."$"'),
+            ('line\nbreak', '$."line\\nbreak"'),
+            ('tab\there', '$."tab\\there"'),
+            ('ctrl\x01x', '$."ctrl\\u0001x"'),
+            ('line\x7fbreak', '$."line\\u007fbreak"'),
+        )
+        for key, expected in cases:
+            with self.subTest(key=key):
+                self.assertEqual(D.key(key).segments, (JSONPathKey(key),))
+                self.assertEqual(D.key(key).path.value, expected)
+        # Non-ASCII keys use JSON \uXXXX escapes.
+        self.assertEqual(D.key('漢字').path.value,
+                         '$."\\u6f22\\u5b57"')
+
+    def test_index_and_tail_segments(self):
+        D = self.M.data
+        self.assertEqual(D.key('xs').at(2).path.value, '$."xs"[2]')
+        self.assertEqual(D.key('xs').at(-1).path.value, '$."xs"[#-1]')
+        self.assertEqual(D.key('xs').tail().path.value, '$."xs"[#]')
+        self.assertEqual(D.tail().path.value, '$[#]')
+        self.assertEqual(D.at(0).path.value, '$[0]')
+        self.assertEqual(D.key('xs').at(0).segments,
+                         (JSONPathKey('xs'), JSONPathIndex(0)))
+
+    def test_getitem_shorthand(self):
+        D = self.M.data
+        # __getitem__ keeps the str / int shorthand but stores segments.
+        path = D['a.b']['xs'][1]
+        self.assertEqual(path.segments,
+                         (JSONPathKey('a.b'), JSONPathKey('xs'),
+                          JSONPathIndex(1)))
+        self.assertEqual(path.path.value, '$."a.b"."xs"[1]')
+        self.assertEqual(D['a.b'].segments, (JSONPathKey('a.b'),))
+        self.assertEqual(D.path('a.b', 1).path.value, '$."a.b"[1]')
+        self.assertEqual(D.path().segments, ())
+        # A single tuple or list argument is expanded, so a stored path can
+        # be passed through directly.
+        self.assertEqual(D.path(('a.b', 1)).segments,
+                         (JSONPathKey('a.b'), JSONPathIndex(1)))
+        self.assertEqual(D.path(['a.b', 1]).path.value, '$."a.b"[1]')
+
+    def test_getitem_hash_shorthand(self):
+        D = self.M.data
+        # '#' is the legacy tail-append shorthand.
+        self.assertEqual(D['tags']['#'].segments,
+                         (JSONPathKey('tags'), JSONPathAppend()))
+        self.assertEqual(D['tags']['#'].path.value, '$."tags"[#]')
+        # An object key literally named '#' must use key().
+        self.assertEqual(D.key('#').path.value, '$."#"')
+
+    def test_path_raw(self):
+        D = self.M.data
+        path = D.Path(D, (JSONPathRaw('$.a.b'),))
+        self.assertEqual(path.path.value, '$.a.b')
+        self.assertRaises(ValueError, JSONPathRaw, 'a.b')
+        # A raw path cannot be combined with structured segments.
+        with self.assertRaises(ValueError):
+            D.Path(D, (JSONPathRaw('$.a'), JSONPathKey('b'))).path.value
+
+    def test_segment_validation(self):
+        D = self.M.data
+        self.assertRaises(TypeError, D.key, 1)
+        self.assertRaises(TypeError, D.at, 'a')
+        self.assertRaises(TypeError, D.at, True)
+        self.assertRaises(TypeError, D.path, 1.5)
+        self.assertRaises(TypeError, D.path, True)
+        self.assertRaises(TypeError, JSONPathKey, 1)
+        self.assertRaises(TypeError, JSONPathIndex, '1')
+        self.assertRaises(TypeError, JSONPathIndex, False)
+        self.assertRaises(TypeError, JSONPathRaw, 1)
+
+    def test_path_bound_not_inlined(self):
+        D = self.M.data
+        table = self.M._meta.table_name
+        sql, params = __sql__(self.M.update(data=D.key('a.b').set(1)))
+        self.assertEqual(sql, (
+            'UPDATE "%s" SET "data" = %s("%s"."data", ?, ?)' %
+            (table, self.func_prefix + 'set', table)))
+        self.assertEqual(params, ['$."a.b"', 1])
+        self.assertNotIn('$', sql)
+        self.assertNotIn('a.b', sql)
+
+    def test_tricky_keys_roundtrip(self):
+        keys = ('a.b', 'a"b', 'a\\b', 'k"q\\x', '', '#', '[0]',
+                'line\nbreak', 'line\x7fbreak', '漢字',
+                'x"); DROP TABLE key_data; --')
+        for i, key in enumerate(keys):
+            with self.subTest(key=key):
+                self.M.delete().execute()
+                self.M.create(key='k%s' % i, data={})
+                D = self.M.data
+                query = self.M.update(data=D.key(key).set(i))
+                self.assertEqual(query.execute(), 1)
+                self.assertEqual(self.document(), {key: i})
+                self.assertEqual(self.M.select(D.key(key)).scalar(), i)
+
+    def test_tricky_keys_do_not_leak_into_sql(self):
+        D = self.M.data
+        key = 'x"); DROP TABLE key_data; --'
+        sql, params = __sql__(self.M.update(data=D.key(key).set(1)))
+        self.assertNotIn('DROP', sql)
+        self.assertEqual(params, ['$."x\\"); DROP TABLE key_data; --"', 1])
+
+    def test_nested_tricky_keys_roundtrip(self):
+        D = self.M.data
+        self.M.create(key='k1', data={})
+        path = D.key('a.b').key('c"d').key('e\\f')
+        self.assertEqual(self.M.update(data=path.set(7)).execute(), 1)
+        self.assertEqual(self.document(), {'a.b': {'c"d': {'e\\f': 7}}})
+        self.assertEqual(self.M.select(path).scalar(), 7)
+
+    def test_array_index_and_tail(self):
+        D = self.M.data
+        self.M.create(key='k1', data={'xs': [1, 2]})
+        self.assertEqual(
+            self.M.update(data=D.key('xs').tail().set(3)).execute(), 1)
+        self.assertEqual(self.document(), {'xs': [1, 2, 3]})
+        self.assertEqual(
+            self.M.update(data=D.key('xs').at(0).set(9)).execute(), 1)
+        self.assertEqual(self.document(), {'xs': [9, 2, 3]})
+        self.assertEqual(
+            self.M.update(data=D.key('xs').at(-1).set(8)).execute(), 1)
+        self.assertEqual(self.document(), {'xs': [9, 2, 8]})
+
+    def test_root_array_append(self):
+        D = self.M.data
+        self.M.create(key='k1', data=[1, 2])
+        self.assertEqual(self.M.update(data=D.tail().set(3)).execute(), 1)
+        self.assertEqual(self.document(), [1, 2, 3])
+
+    def test_set_json_null_vs_sql_null(self):
+        D = self.M.data
+        self.M.create(key='k1', data={'k': 1})
+        # set(None) writes JSON null at the path; the column stays non-null.
+        self.assertEqual(self.M.update(data=D.key('k').set(None)).execute(), 1)
+        self.assertEqual(self.document(), {'k': None})
+        self.assertEqual(self.json_type(D.key('k')), 'null')
+        # The column itself is not SQL NULL.
+        self.assertEqual(
+            self.M.select().where(self.M.data.is_null()).count(), 0)
+        self.assertIsNotNone(self.M.select(self.M.data).scalar())
+
+    def test_set_bool_and_container_values(self):
+        D = self.M.data
+        self.M.create(key='k1', data={})
+        self.M.update(data=D.key('b').set(True)).execute()
+        self.M.update(data=D.key('o').set({'x': 1})).execute()
+        self.M.update(data=D.key('a').set([1, 2])).execute()
+        self.assertEqual(self.document(),
+                         {'b': True, 'o': {'x': 1}, 'a': [1, 2]})
+        self.assertEqual(self.json_type(D.key('b')), 'true')
+
+    def test_insert_preserves_existing_json_null(self):
+        D = self.M.data
+        self.M.create(key='k1', data={'k': None})
+        self.M.update(data=D.key('k').insert(99)).execute()
+        # A stored JSON null occupies the slot: insert is a no-op.
+        self.assertEqual(self.document(), {'k': None})
+        # A missing key is created.
+        self.M.update(data=D.key('new').insert(99)).execute()
+        self.assertEqual(self.document(), {'k': None, 'new': 99})
+
+    def test_replace_requires_existing(self):
+        D = self.M.data
+        self.M.create(key='k1', data={'k': 1})
+        self.M.update(data=D.key('absent').replace(99)).execute()
+        self.assertEqual(self.document(), {'k': 1})
+        self.M.update(data=D.key('k').replace(None)).execute()
+        self.assertEqual(self.document(), {'k': None})
+        self.assertEqual(self.json_type(D.key('k')), 'null')
+
+    def test_remove_keys_are_not_paths(self):
+        D = self.M.data
+        self.M.create(key='k1', data={'a.b': 1, 'plain': 2, '$.c': 3})
+        # A dotted key is one segment, not a path.
+        self.M.update(data=D.remove('a.b')).execute()
+        self.assertEqual(self.document(), {'plain': 2, '$.c': 3})
+        # A leading "$" means an already-formed path (legacy behavior).
+        self.M.update(data=D.remove('$.plain')).execute()
+        self.assertEqual(self.document(), {'$.c': 3})
+        # Wrap it to address a literal "$..." key.
+        self.M.update(data=D.remove(JSONPathKey('$.c'))).execute()
+        self.assertEqual(self.document(), {})
+
+    def test_remove_array_index_order(self):
+        D = self.M.data
+        self.M.create(key='k1', data={'xs': [0, 1, 2, 3]})
+        self.M.update(data=D.remove_many([D.key('xs').at(0),
+                                          D.key('xs').at(0)])).execute()
+        # json_remove() applies the paths left-to-right.
+        self.assertEqual(self.document(), {'xs': [2, 3]})
+
+    def test_set_many_applied_in_order(self):
+        D = self.M.data
+        self.M.create(key='k1', data={})
+        # Parent created first, then the child: both are applied.
+        self.M.update(data=D.set_many([(('x',), {}),
+                                       (('x', 'y'), 7)])).execute()
+        self.assertEqual(self.document(), {'x': {'y': 7}})
+
+        self.M.update(data={}).execute()
+        # Child first (missing parent -> no-op), then the parent overwrites.
+        self.M.update(data=D.set_many([(('x', 'y'), 7),
+                                       (('x',), {})])).execute()
+        self.assertEqual(self.document(), {'x': {}})
+
+    def test_set_many_same_path_last_wins(self):
+        D = self.M.data
+        self.M.create(key='k1', data={})
+        self.M.update(
+            data=D.set_many([('a', 1), ('a', 2), ('a', 3)])).execute()
+        self.assertEqual(self.document(), {'a': 3})
+
+    def test_many_operations(self):
+        D = self.M.data
+        self.M.create(key='k1', data={'a': 1})
+        self.M.update(data=D.insert_many([('a', 2), ('b', 3)])).execute()
+        self.assertEqual(self.document(), {'a': 1, 'b': 3})
+
+        self.M.update(data={'a': 1}).execute()
+        self.M.update(data=D.replace_many([('a', 2), ('b', 3)])).execute()
+        self.assertEqual(self.document(), {'a': 2})
+
+        self.M.update(data={'a': 1, 'b': 2}).execute()
+        self.M.update(data=D.remove_many(['a', 'b'])).execute()
+        self.assertEqual(self.document(), {})
+
+    def test_many_ops_json_null(self):
+        D = self.M.data
+        self.M.create(key='k1', data={})
+        self.M.update(data=D.set_many([('a', None), ('b', 2)])).execute()
+        self.assertEqual(self.document(), {'a': None, 'b': 2})
+        self.assertEqual(self.json_type(D.key('a')), 'null')
+
+    def test_many_paths_are_bound_parameters(self):
+        D = self.M.data
+        table = self.M._meta.table_name
+        sql, params = __sql__(self.M.update(data=D.set_many([
+            ('a.b', 1), (('c', 0), 2)])))
+        self.assertEqual(sql, (
+            'UPDATE "%s" SET "data" = %s("%s"."data", ?, ?, ?, ?)' %
+            (table, self.func_prefix + 'set', table)))
+        self.assertEqual(params, ['$."a.b"', 1, '$."c"[0]', 2])
+        self.assertNotIn('a.b', sql)
+        self.assertNotIn('$', sql)
+
+    def test_path_from_other_path(self):
+        D = self.M.data
+        self.M.create(key='k1', data={'a': {'b': 1}})
+        # A JSONPath is accepted as a structured path argument.
+        self.M.update(data=D.remove_many([D.key('a').key('b')])).execute()
+        self.assertEqual(self.document(), {'a': {}})
+
+    def test_empty_path_targets_root(self):
+        D = self.M.data
+        self.M.create(key='k1', data={'a': 1})
+        self.assertEqual(
+            self.M.update(data=D.set_many([((), {'b': 2})])).execute(), 1)
+        self.assertEqual(self.document(), {'b': 2})
+
+    def test_set_many_nested_chain(self):
+        # A chain of missing parents created front-to-back in one call.
+        D = self.M.data
+        self.M.create(key='k1', data={})
+        self.M.update(data=D.set_many([
+            (('a',), {}),
+            (('a', 'b'), {}),
+            (('a', 'b', 'c'), 1),
+        ])).execute()
+        self.assertEqual(self.document(), {'a': {'b': {'c': 1}}})
+
+    def test_set_many_matches_chained_calls(self):
+        # A single multi-pair call yields the same document as applying the
+        # same updates one at a time, in order, on real SQLite.
+        D = self.M.data
+        cases = (
+            [(('a',), {}), (('a', 'b'), 1)],
+            [(('a', 'b'), 1), (('a',), {})],
+            [('x', 1), ('x', 2), ('x', 3)],
+        )
+        for pairs in cases:
+            with self.subTest(pairs=pairs):
+                self.M.delete().execute()
+                self.M.create(key='k1', data={})
+                self.M.update(data=D.set_many(pairs)).execute()
+                batched = self.document()
+
+                self.M.update(data={}).execute()
+                for p, v in pairs:
+                    self.M.update(data=D.path(p).set(v)).execute()
+                self.assertEqual(self.document(), batched)
+
+    def test_remove_many_after_shift(self):
+        # Removal is left-to-right, so a repeated index addresses the
+        # *shifted* array. Verify against real json_remove() semantics.
+        D = self.M.data
+        self.M.create(key='k1', data={'xs': [0, 1, 2, 3]})
+        self.M.update(data=D.remove_many([])).execute()
+        self.assertEqual(self.document(), {'xs': [0, 1, 2, 3]})
+        self.M.update(data=D.remove_many([D.key('xs').at(1),
+                                          D.key('xs').at(1)])).execute()
+        self.assertEqual(self.document(), {'xs': [0, 3]})
+
+    def test_keys_that_look_like_path_fragments(self):
+        # Keys resembling path syntax are all single segments.
+        D = self.M.data
+        keys = ('a[0]', 'a[#]', '$a', 'a.b.c', 'a"b.c')
+        self.M.create(key='k1', data={})
+        self.M.update(data=D.set_many(
+            [(k, i) for i, k in enumerate(keys)])).execute()
+        self.assertEqual(self.document(),
+                         dict((k, i) for i, k in enumerate(keys)))
+        for i, k in enumerate(keys):
+            self.assertEqual(self.M.select(D.key(k)).scalar(), i)
+
+    def test_existence_semantics_with_tricky_keys(self):
+        # set/replace/insert keep their own existence semantics even when the
+        # key needs quoting.
+        D = self.M.data
+        self.M.create(key='k1', data={'a.b': 1})
+        key = D.key('a.b')
+
+        # insert: existing key untouched, missing key created.
+        self.M.update(data=key.insert(99)).execute()
+        self.assertEqual(self.document(), {'a.b': 1})
+        self.M.update(data=D.key('c.d').insert(2)).execute()
+        self.assertEqual(self.document(), {'a.b': 1, 'c.d': 2})
+
+        # replace: existing key updated, missing key untouched.
+        self.M.update(data=key.replace(9)).execute()
+        self.assertEqual(self.document(), {'a.b': 9, 'c.d': 2})
+        self.M.update(data=D.key('nope').replace(5)).execute()
+        self.assertEqual(self.document(), {'a.b': 9, 'c.d': 2})
+
+        # set: always creates or replaces.
+        self.M.update(data=D.key('c.d').set(3)).execute()
+        self.assertEqual(self.document(), {'a.b': 9, 'c.d': 3})
+        self.M.update(data=D.key('e.f').set(4)).execute()
+        self.assertEqual(self.document(), {'a.b': 9, 'c.d': 3, 'e.f': 4})
+
+        # remove: deletes only the addressed key.
+        self.M.update(data=D.remove('c.d')).execute()
+        self.assertEqual(self.document(), {'a.b': 9, 'e.f': 4})
+
+    def test_null_values_are_json_null(self):
+        # set/insert/replace of None all write JSON null; none of them replace
+        # the column with SQL NULL.
+        D = self.M.data
+        self.M.create(key='k1', data={'a': 1})
+        self.M.update(data=D.key('b').insert(None)).execute()
+        self.M.update(data=D.key('a').replace(None)).execute()
+        self.M.create(key='k2', data={'a': 1})
+        self.M.update(data=D.key('c').set(None)).execute()
+
+        self.assertEqual(self.document(), {'a': None, 'b': None, 'c': None})
+        for name in ('a', 'b', 'c'):
+            self.assertEqual(self.json_type(D.key(name)), 'null')
+        self.assertEqual(
+            self.M.select().where(self.M.data.is_null()).count(), 0)
+
+    def test_array_index_existence_semantics(self):
+        D = self.M.data
+        self.M.create(key='k1', data={'xs': [0, 1]})
+        key = D.key('xs')
+
+        # Insert at the tail index appends; replace at the tail is a no-op.
+        self.M.update(data=key.at(2).insert(2)).execute()
+        self.assertEqual(self.document(), {'xs': [0, 1, 2]})
+        self.M.update(data=key.at(3).replace(9)).execute()
+        self.assertEqual(self.document(), {'xs': [0, 1, 2]})
+        # Insert at an existing index leaves the element alone.
+        self.M.update(data=key.at(0).insert(9)).execute()
+        self.assertEqual(self.document(), {'xs': [0, 1, 2]})
+        # Replace an existing index overwrites it.
+        self.M.update(data=key.at(0).replace(9)).execute()
+        self.assertEqual(self.document(), {'xs': [9, 1, 2]})
+
+    def test_update_on_tricky_key(self):
+        # JSONPath.update() merges into the sub-document at a quoted key.
+        D = self.M.data
+        self.M.create(key='k1', data={'a.b': {'x': 1, 'y': 2}})
+        self.M.update(data=D.key('a.b').update({'y': 9})).execute()
+        self.assertEqual(self.document(), {'a.b': {'x': 1, 'y': 9}})
+
+    def test_many_ops_match_chained_calls(self):
+        # A single multi-pair call matches applying each pair in turn, on real
+        # SQLite, for insert/replace as well as set.
+        D = self.M.data
+        for name in ('insert', 'replace'):
+            with self.subTest(op=name):
+                self.M.delete().execute()
+                self.M.create(key='k1', data={'a.b': 1})
+                pairs = [('a.b', 9), ('c.d', 2)]
+                self.M.update(data=getattr(D, name + '_many')(pairs)) \
+                    .execute()
+                batched = self.document()
+
+                self.M.update(data={'a.b': 1}).execute()
+                for p, v in pairs:
+                    self.M.update(
+                        data=getattr(D.key(p), name)(v)).execute()
+                self.assertEqual(self.document(), batched)
+
+    def test_deep_set_many_ordering_on_sqlite(self):
+        # Ordering is checked against real SQLite JSON1: creating a chain of
+        # parents then overwriting a nested sibling in one call must match
+        # applying each update individually.
+        D = self.M.data
+        pairs = [
+            (('a',), {'x': 1}),
+            (('a', 'b'), {'y': 2}),
+            (('a', 'b', 'c'), 3),
+            (('a', 'x'), 9),
+        ]
+        self.M.create(key='k1', data={})
+        self.M.update(data=D.set_many(pairs)).execute()
+        batched = self.document()
+
+        self.M.update(data={}).execute()
+        for p, v in pairs:
+            self.M.update(data=D.path(p).set(v)).execute()
+        self.assertEqual(self.document(), batched)
+        self.assertEqual(batched,
+                         {'a': {'x': 9, 'b': {'y': 2, 'c': 3}}})
+
+    def test_set_then_remove_in_order(self):
+        # Mixed set/remove ordering on the same document, checked by applying
+        # the operations one at a time.
+        D = self.M.data
+        self.M.create(key='k1', data={'xs': [0, 1, 2, 3]})
+        self.M.update(data=D.set_many([
+            (('xs', 0), 9),
+            (('meta',), {'n': 1}),
+        ])).execute()
+        self.M.update(data=D.remove_many([D.key('xs').at(1)])).execute()
+        self.assertEqual(self.document(),
+                         {'xs': [9, 2, 3], 'meta': {'n': 1}})
+
+
+@skip_unless(jsonb_installed(), 'requires sqlite jsonb support')
+class TestJSONBPathSegments(TestJSONPathSegments):
+    requires = [JBData]
+    M = JBData
+    func_prefix = 'jsonb_'
+
+    def test_jsonb_functions_used(self):
+        D = self.M.data
+        table = self.M._meta.table_name
+        sql, params = __sql__(self.M.update(data=D.key('a.b').set(None)))
+        self.assertEqual(sql, (
+            'UPDATE "%s" SET "data" = jsonb_set("%s"."data", ?, jsonb(?))' %
+            (table, table)))
+        self.assertEqual(params, ['$."a.b"', 'null'])
+
+    def test_jsonb_append_and_remove(self):
+        D = self.M.data
+        self.M.create(key='k1', data={'xs': [1]})
+        self.M.update(data=D.key('xs').tail().set(2)).execute()
+        self.assertEqual(self.document(), {'xs': [1, 2]})
+        self.M.update(data=D.key('xs').at(0).remove()).execute()
+        self.assertEqual(self.document(), {'xs': [2]})
 
 
 class TestSqliteExtensions(BaseTestCase):

@@ -7,6 +7,24 @@ https://github.com/coleifer/peewee/releases
 
 ## master
 
+* `playhouse.sqlite_ext.JSONField` / `JSONBField` gain a structured path
+  interface (`JSONField.key()`, `.at()`, `.tail()`, `.path(*segments)` and
+  the matching `JSONPath` methods). Paths are built from typed segments
+  (`JSONPathKey`, `JSONPathIndex`, `JSONPathAppend`) rather than concatenated
+  strings, so object keys containing dots, quotes, backslashes, control
+  characters or unicode are quoted and escaped correctly and never confused
+  with path syntax or with array indexes.
+* The structured paths are always passed to the JSON functions as **bound
+  parameters**; they are never spliced into the SQL statement.
+* `set()`, `insert()`, `replace()` and `remove()` keep their existence
+  semantics on structured paths, and `set(None)` / `insert(None)` /
+  `replace(None)` store an explicit JSON `null` at the path rather than
+  setting the column to SQL `NULL` (booleans likewise store as `true`/
+  `false` instead of `0`/`1`).
+* Add `set_many()`, `insert_many()`, `replace_many()` and `remove_many()`
+  to apply several path updates in a single JSON1 call; updates apply
+  left-to-right and each observes the result of the previous one, verified
+  against real SQLite JSON1.
 * Clear `after_commit` callbacks registered on a savepoint if that savepoint is
   then rolled-back.
 * Re-create triggers during sqlite migrator table rebuilds.
