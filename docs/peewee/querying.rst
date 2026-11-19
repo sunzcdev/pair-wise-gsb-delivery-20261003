@@ -442,6 +442,55 @@ reconstruct the model graph from joined data, assigning all columns directly
 onto the primary model. This avoids the overhead of graph reconstruction when
 you have joined data and don't need nested model instances.
 
+.. _result-mapping:
+
+Result column mapping
+---------------------
+
+Join queries frequently return same-named columns (most obviously ``id``).
+Peewee binds each cursor column to its destination using an explicit
+result-mapping contract rather than matching on column names:
+
+* Columns are associated with model fields by **projection identity** -- the
+  node at the corresponding position in the ``SELECT`` list determines which
+  model (and attribute) receives the value.
+* A column with an explicit ``.alias()`` (or ``bind_to()``) is
+  **controlled** -- the alias is used as the destination attribute name.
+* When two *distinct*, unaliased projections would be materialized to the
+  same attribute on the same object, the mapping is ambiguous and peewee
+  raises ``AmbiguousColumnError`` instead of silently overwriting one
+  source's value with another's. Give one of the projections an explicit
+  alias to disambiguate:
+
+.. code-block:: python
+
+   # Ambiguous: the unaliased COUNT() column collides with User.id on
+   # some databases, raising AmbiguousColumnError.
+   User.select(User, fn.COUNT(Tweet.id)).join(Tweet, JOIN.LEFT_OUTER)
+
+   # Controlled alias: works everywhere, count available as "ct".
+   User.select(User, fn.COUNT(Tweet.id).alias('ct')).join(
+       Tweet, JOIN.LEFT_OUTER)
+
+For raw SQL queries no projection metadata is available, so
+columns are mapped by name alone and no source is fabricated:
+
+* Model results map columns onto model fields by name. Columns that do not
+  correspond to a field are exposed as plain attributes under their real
+  cursor names. When a name occurs multiple times the first occurrence wins;
+  duplicates are *not* materialized under synthetic ``name_N`` attributes.
+* ``dicts()`` (and ``namedtuples()``) preserve every column value, assigning
+  controlled ``name_2``, ``name_3``, ... suffixes to duplicate names.
+
+A ``LEFT OUTER JOIN`` row in which every column of the joined table is
+``NULL`` does not produce a "ghost" instance: the corresponding attribute is
+``None`` (and the foreign-key id, if any, is left intact). This also holds
+for multi-hop join chains and for joins that select only a subset of the
+joined model's columns.
+
+The mapping itself can be inspected after iterating a query, via the
+``mapping`` attribute of the cursor wrapper returned by ``query.execute()``.
+
 .. _large-results:
 
 Iterating Over Large Result Sets

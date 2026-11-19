@@ -70,6 +70,7 @@ except ImportError:
 
 __version__ = '4.5.3'
 __all__ = [
+    'AmbiguousColumnError',
     'AnyField',
     'AsIs',
     'AutoField',
@@ -8341,7 +8342,11 @@ class _ModelQueryHelper(object):
             raise ValueError('Unrecognized row type: "%s".' % row_type)
 
     def _get_model_cursor_wrapper(self, cursor):
-        return ModelObjectCursorWrapper(cursor, self.model, [], self.model)
+        # Pass along whatever projection metadata we have (e.g. a
+        # RETURNING clause). Raw queries have none, in which case the
+        # wrapper maps columns by name without fabricating sources.
+        return ModelObjectCursorWrapper(cursor, self.model,
+                                        self._returning or [], self.model)
 
 
 class ModelRaw(_ModelQueryHelper, RawQuery):
@@ -8928,11 +8933,124 @@ def safe_python_value(conv_func):
     return validate
 
 
+class AmbiguousColumnError(ValueError):
+    """Raised when two or more columns in a query's result row cannot be
+    unambiguously mapped onto the destination model(s)."""
+    pass
+
+
+class ResultMapping(object):
+    """Explicit contract binding each cursor column to a destination.
+
+    A column is associated with a model field by *projection identity*
+    (the node at the corresponding position in the SELECT list) or by a
+    *controlled alias* (an explicit, user-supplied ``.alias()`` or
+    ``bind_to()``). When no projection metadata is available -- e.g. raw
+    SQL queries -- columns are mapped by name alone and no source is
+    fabricated: the first occurrence of a given name wins and duplicates
+    are not materialized under synthetic names.
+
+    Attributes exposed for inspection:
+
+    * ``columns``: cleaned destination attribute name per cursor column.
+    * ``fields``: the model ``Field`` resolved for each column (or None).
+    * ``converters``: per-column value converter (or None).
+    * ``nodes``: the projection node each column was resolved from.
+    * ``controlled``: per-column flag indicating an explicit alias or
+      bind-to, i.e. the user controls the destination name.
+    """
+    __slots__ = ('model', 'select', 'columns', 'fields', 'converters',
+                 'nodes', 'controlled', 'no_convert', 'convert')
+
+    def __init__(self, model, select, columns, fields, converters, nodes,
+                 controlled):
+        self.model = model
+        self.select = select
+        self.columns = columns
+        self.fields = fields
+        self.converters = converters
+        self.nodes = nodes
+        self.controlled = controlled
+        self.no_convert = []
+        self.convert = []
+        for i, converter in enumerate(converters):
+            if converter is None:
+                self.no_convert.append(i)
+            else:
+                self.convert.append(i)
+
+    @property
+    def has_projection(self):
+        # Whether projection metadata (the SELECT list) was available to
+        # bind columns by identity. Raw queries have no projection.
+        return bool(self.select)
+
+    def identities(self):
+        # Per-column projection identity: the resolved field when known,
+        # otherwise the projection node itself.
+        return [field if field is not None else node
+                for field, node in zip(self.fields, self.nodes)]
+
+    def destination_keys(self):
+        # Per-column destination source: the model (or alias / table) the
+        # column's projection belongs to. Columns whose source cannot be
+        # determined are associated with the query's own model.
+        keys = []
+        for idx, node in enumerate(self.nodes):
+            field = self.fields[idx]
+            if field is not None:
+                if isinstance(field, FieldAlias):
+                    keys.append(field.source)
+                else:
+                    keys.append(field.model)
+            elif isinstance(node, Column):
+                keys.append(node.source)
+            else:
+                keys.append(self.model)
+        return keys
+
+    def check_ambiguous(self, columns=None, keys=None):
+        """Verify that no two cursor columns coming from *distinct*
+        projections are materialized to the same destination attribute.
+
+        Columns carrying a controlled alias (or bind-to) are exempt, as
+        the user has explicitly named their destination. When two
+        uncontrolled, distinct projections collide, an
+        :class:`AmbiguousColumnError` is raised describing the conflict,
+        rather than silently overwriting one source's value with
+        another's.
+        """
+        columns = self.columns if columns is None else columns
+        identities = self.identities()
+        seen = {}
+        for idx, column in enumerate(columns):
+            if self.controlled[idx]:
+                continue
+            identity = identities[idx]
+            if identity is None:
+                continue
+            key = keys[idx] if keys is not None else self.model
+            target = (key, column)
+            if target in seen:
+                prev_idx, prev_identity = seen[target]
+                if prev_identity is not identity:
+                    raise AmbiguousColumnError(
+                        'Ambiguous column "%s" in SELECT result: columns '
+                        '%d and %d both map to attribute "%s" on %r. Give '
+                        'one of the projections an explicit alias, e.g. '
+                        '.alias("..."), to disambiguate.'
+                        % (column, prev_idx + 1, idx + 1, column, key))
+            else:
+                seen[target] = (idx, identity)
+
+
 def _resolve_model_columns(cursor, model, select):
-    # Resolve cursor columns against a model's selected nodes. Returns
-    # (columns, fields, converters, no_convert, convert). The first three are
-    # per-column lists (a converter is a python_value callable or None), and
-    # no_convert/convert partition the column indexes by converter.
+    # Resolve cursor columns against a model's selected nodes, producing
+    # the explicit ResultMapping contract for the query. Columns are
+    # associated with model fields by projection identity (position in
+    # the SELECT list) or controlled alias; when the projection is not
+    # known (raw queries) columns fall back to name-based resolution
+    # against the model itself and no source is invented.
     combined = model._meta.combined
     table = model._meta.table
     description = cursor.description
@@ -8941,6 +9059,8 @@ def _resolve_model_columns(cursor, model, select):
     columns = []
     converters = [None] * ncols
     fields = [None] * ncols
+    nodes = [None] * ncols
+    controlled = [False] * ncols
 
     for idx, description_item in enumerate(description):
         column = orig_column = description_item[0]
@@ -8966,6 +9086,12 @@ def _resolve_model_columns(cursor, model, select):
                 continue
         else:
             node = raw_node.unwrap()
+
+        # Record the projection this column was resolved from, and whether
+        # the user explicitly controls its destination name.
+        nodes[idx] = node
+        controlled[idx] = (raw_node.is_alias() or
+                           isinstance(raw_node, BindTo))
 
         # If this column was given an alias, then we will use whatever
         # alias was returned by the cursor.
@@ -9007,15 +9133,8 @@ def _resolve_model_columns(cursor, model, select):
             if isinstance(node, Column) and node.source == table:
                 fields[idx] = combined[column]
 
-    no_convert = []
-    convert = []
-    for i in range(ncols):
-        if converters[i] is not None:
-            convert.append(i)
-        else:
-            no_convert.append(i)
-
-    return columns, fields, converters, no_convert, convert
+    return ResultMapping(model, select, columns, fields, converters,
+                         nodes, controlled)
 
 
 class BaseModelCursorWrapper(DictCursorWrapper):
@@ -9025,9 +9144,13 @@ class BaseModelCursorWrapper(DictCursorWrapper):
         self.select = columns or []
 
     def initialize(self):
-        (self.columns, self.fields, self.converters,
-         self.no_convert, self.convert) = _resolve_model_columns(
+        self.mapping = _resolve_model_columns(
             self.cursor, self.model, self.select)
+        self.columns = self.mapping.columns
+        self.fields = self.mapping.fields
+        self.converters = self.mapping.converters
+        self.no_convert = self.mapping.no_convert
+        self.convert = self.mapping.convert
         self.ncols = len(self.columns)
 
     def process_row(self, row):
@@ -9079,8 +9202,45 @@ class ModelObjectCursorWrapper(ModelDictCursorWrapper):
         self.is_model = is_model(constructor)
         super(ModelObjectCursorWrapper, self).__init__(cursor, model, select)
 
+    def initialize(self):
+        BaseModelCursorWrapper.initialize(self)
+        mapping = self.mapping
+        if mapping.has_projection:
+            # The projection is known, so columns are bound by projection
+            # identity or controlled alias. Report ambiguous bindings
+            # before materializing anything, then assign controlled names
+            # to any remaining (explicitly-aliased) duplicates.
+            columns = [make_identifier(c) for c in self.columns]
+            mapping.check_ambiguous(columns, mapping.destination_keys())
+            self.unique_columns = self.dedupe_columns(
+                self.columns,
+                valid_identifiers=self.valid_identifiers)
+            self._row_spec = [
+                (i, self.unique_columns[i], self.converters[i])
+                for i in range(self.ncols)]
+        else:
+            # No projection metadata (raw query): bind columns by their
+            # real names only. The first occurrence of a name wins and
+            # duplicates are dropped -- no synthetic "name_N" attributes
+            # are fabricated on the resulting objects.
+            row_spec = []
+            seen = set()
+            for i, column in enumerate(self.columns):
+                if self.valid_identifiers:
+                    column = make_identifier(column)
+                if column in seen:
+                    continue
+                seen.add(column)
+                row_spec.append((i, column, self.converters[i]))
+            self._row_spec = row_spec
+
     def process_row(self, row):
-        result = super(ModelObjectCursorWrapper, self).process_row(row)
+        result = {}
+        for i, column, converter in self._row_spec:
+            value = row[i]
+            if converter is not None:
+                value = converter(value)
+            result[column] = value
         if self.is_model:
             # Clear out any dirty fields before returning to the user.
             obj = self.constructor(__no_default__=1, **result)
@@ -9168,6 +9328,12 @@ class ModelCursorWrapper(BaseModelCursorWrapper):
                     key = node.source
 
             self.column_keys.append(key)
+
+        # Enforce the explicit mapping contract: two columns coming from
+        # distinct projections may not write the same attribute on the
+        # same destination object. Ambiguity is reported, never resolved
+        # by silently overwriting one source's value with another's.
+        self.mapping.check_ambiguous(columns, self.column_keys)
 
         # Pre-compute flat list of key/col/converter for each column index.
         self._row_spec = tuple(

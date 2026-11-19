@@ -673,3 +673,252 @@ class TestDedupeColumns(BaseTestCase):
             ['name', 'value', 'name'], valid_identifiers=False)
         self.assertEqual(result, ['name', 'value', 'name_2'])
 
+
+# ===========================================================================
+# Explicit result-mapping contract
+# ===========================================================================
+
+class TestResultMappingContract(ModelTestCase):
+    requires = [User, Tweet, Account, Favorite]
+
+    def setUp(self):
+        super(TestResultMappingContract, self).setUp()
+        self.u1 = User.create(username='u1')
+        self.u2 = User.create(username='u2')
+        self.t1 = Tweet.create(
+            user=self.u1, content='t1',
+            timestamp=datetime.datetime(2026, 1, 1))
+        self.t2 = Tweet.create(
+            user=self.u2, content='t2',
+            timestamp=datetime.datetime(2026, 1, 2))
+
+    def test_join_same_named_columns_model_results(self):
+        # Both Tweet and User have an "id" column. Each model instance must
+        # be materialized from its own columns, never overwritten by name.
+        query = (Tweet
+                 .select(Tweet, User)
+                 .join(User)
+                 .order_by(Tweet.id))
+        with self.assertQueryCount(1):
+            results = [(t.id, t.content, t.user_id,
+                        t.user.id, t.user.username) for t in query]
+        self.assertEqual(results, [
+            (self.t1.id, 't1', self.u1.id, self.u1.id, 'u1'),
+            (self.t2.id, 't2', self.u2.id, self.u2.id, 'u2')])
+
+    def test_join_ambiguous_projection_reported(self):
+        # An unaliased expression whose cursor column cleans to "id" cannot
+        # be distinguished from User.id -- this is reported, not silently
+        # overwritten.
+        query = (User
+                 .select(User, fn.COUNT(Tweet.id))
+                 .join(Tweet, JOIN.LEFT_OUTER)
+                 .group_by(User.id))
+        self.assertRaises(AmbiguousColumnError, list, query)
+
+        # Same for an unaliased SQL fragment colliding with a field.
+        query = (User
+                 .select(User.username, SQL('username'))
+                 .join(Tweet, JOIN.LEFT_OUTER))
+        self.assertRaises(AmbiguousColumnError, list, query)
+
+    def test_flat_ambiguous_projection_reported(self):
+        query = User.select(User.username, SQL('username'))
+        self.assertRaises(AmbiguousColumnError, list, query)
+
+        query = User.select(User.id, fn.MAX(User.id))
+        self.assertRaises(AmbiguousColumnError, list, query)
+
+    def test_controlled_alias_disambiguates(self):
+        # Giving the expression an explicit alias is the supported way to
+        # select same-named columns: the model's own values are intact.
+        query = (User
+                 .select(User, fn.COUNT(Tweet.id).alias('ct'))
+                 .join(Tweet, JOIN.LEFT_OUTER)
+                 .group_by(User.id)
+                 .order_by(User.id))
+        results = [(u.id, u.username, u.ct) for u in query]
+        self.assertEqual(results, [
+            (self.u1.id, 'u1', 1),
+            (self.u2.id, 'u2', 1)])
+
+    def test_aliased_duplicates_get_controlled_names(self):
+        # Explicitly-aliased duplicates are the user taking control of the
+        # destination names; flat row types assign controlled suffixes.
+        query = (User
+                 .select(User.username, Value('v0').alias('username'))
+                 .order_by(User.username))
+        rows = list(query.dicts())
+        self.assertEqual(rows, [
+            {'username': 'u1', 'username_2': 'v0'},
+            {'username': 'u2', 'username_2': 'v0'}])
+
+        rows = list(query.objects())
+        self.assertEqual(
+            [(row.username, row.username_2) for row in rows],
+            [('u1', 'v0'), ('u2', 'v0')])
+
+    def test_same_projection_twice_is_not_ambiguous(self):
+        # Selecting the identical field twice is not ambiguous -- both
+        # columns carry the same projection identity.
+        query = User.select(User.username, User.username)
+        self.assertEqual([row.username for row in query], ['u1', 'u2'])
+
+    def test_raw_model_results_do_not_fabricate_sources(self):
+        # Raw queries have no projection metadata. Columns are mapped by
+        # their real names; duplicates are not materialized under invented
+        # "name_N" attributes.
+        query = User.raw(
+            'SELECT t1.*, t2.* FROM users AS t1 '
+            'INNER JOIN tweet AS t2 ON (t2.user_id = t1.id) '
+            'ORDER BY t1.id')
+        results = list(query)
+        self.assertEqual(len(results), 2)
+        for user, tweet in zip(results, (self.t1, self.t2)):
+            self.assertEqual(user.__data__, {
+                'id': tweet.user_id, 'username': 'u%d' % tweet.user_id})
+            # The joined table's columns are exposed under their real
+            # names, and no synthetic "id_2" attribute is fabricated.
+            self.assertFalse(hasattr(user, 'id_2'))
+            self.assertEqual(user.content, tweet.content)
+            self.assertEqual(user.user_id, tweet.user_id)
+
+    def test_raw_dicts_preserve_all_column_values(self):
+        # The dict strategy for raw queries keeps every column value,
+        # disambiguating duplicate names with controlled suffixes.
+        query = User.raw(
+            'SELECT t1.*, t2.* FROM users AS t1 '
+            'INNER JOIN tweet AS t2 ON (t2.user_id = t1.id) '
+            'ORDER BY t1.id')
+        rows = list(query.dicts())
+        self.assertEqual(len(rows), 2)
+        for row, tweet in zip(rows, (self.t1, self.t2)):
+            self.assertEqual(row['id'], tweet.user_id)
+            self.assertEqual(row['username'], 'u%d' % tweet.user_id)
+            self.assertEqual(row['id_2'], tweet.id)
+            self.assertEqual(row['user_id'], tweet.user_id)
+            self.assertEqual(row['content'], tweet.content)
+
+    def test_raw_tuples_and_namedtuples_preserve_values(self):
+        sql = ('SELECT t1.id, t2.id FROM users AS t1 '
+               'INNER JOIN tweet AS t2 ON (t2.user_id = t1.id) '
+               'ORDER BY t1.id')
+        self.assertEqual(list(User.raw(sql).tuples()), [
+            (self.u1.id, self.t1.id),
+            (self.u2.id, self.t2.id)])
+
+        rows = list(User.raw(sql).namedtuples())
+        self.assertEqual(
+            [(row.id, row.id_2) for row in rows],
+            [(self.u1.id, self.t1.id), (self.u2.id, self.t2.id)])
+
+    def test_left_outer_join_null_row_no_ghost(self):
+        u3 = User.create(username='u3')
+        query = (User
+                 .select(User, Tweet)
+                 .join(Tweet, JOIN.LEFT_OUTER)
+                 .order_by(User.id))
+        results = {u.username: u for u in query}
+        # Users with tweets get real instances; the user without gets None
+        # rather than a ghost object.
+        self.assertEqual(results['u1'].tweet.content, 't1')
+        self.assertEqual(results['u2'].tweet.content, 't2')
+        self.assertIsNone(results['u3'].tweet)
+
+    def test_left_outer_join_partial_columns_no_ghost(self):
+        u3 = User.create(username='u3')
+        query = (User
+                 .select(User.id, User.username, Tweet.content)
+                 .join(Tweet, JOIN.LEFT_OUTER)
+                 .order_by(User.id))
+        results = {u.username: u for u in query}
+        # Only the selected columns are populated on the joined instance.
+        self.assertEqual(results['u1'].tweet.__data__, {'content': 't1'})
+        # A NULL outer-join row produces None, not an empty instance.
+        self.assertIsNone(results['u3'].tweet)
+
+    def test_fk_direction_null_outer_join(self):
+        a1 = Account.create(email='a1@example.com', user=self.u1)
+        a2 = Account.create(email='a2@example.com', user=None)
+        query = (Account
+                 .select(Account, User)
+                 .join(User, JOIN.LEFT_OUTER)
+                 .order_by(Account.id))
+        a1_db, a2_db = list(query)
+        self.assertEqual(a1_db.user.username, 'u1')
+        self.assertEqual(a1_db.user_id, self.u1.id)
+        # The NULL outer-join row does not manufacture a ghost user, and
+        # the foreign-key id is left intact.
+        self.assertIsNone(a2_db.user)
+        self.assertIsNone(a2_db.user_id)
+        self.assertEqual(a2_db.__rel__, {'user': None})
+
+    def test_multi_hop_outer_join_null_rows(self):
+        # User -> Tweet -> Favorite, all LEFT OUTER. u1 has a tweet with a
+        # favorite, u2 has a tweet without one, u3 has no tweet at all.
+        u3 = User.create(username='u3')
+        fav = Favorite.create(user=self.u2, tweet=self.t1)
+        query = (User
+                 .select(User, Tweet, Favorite)
+                 .join(Tweet, JOIN.LEFT_OUTER)
+                 .join(Favorite, JOIN.LEFT_OUTER, src=Tweet)
+                 .order_by(User.id))
+        results = {u.username: u for u in query}
+        self.assertEqual(results['u1'].tweet.favorite.id, fav.id)
+        self.assertIsNone(results['u2'].tweet.favorite)
+        self.assertIsNone(results['u3'].tweet)
+
+    def test_result_mapping_is_inspectable(self):
+        # The mapping contract can be inspected after materialization.
+        query = Tweet.select(Tweet, User).join(User)
+        cursor = query.execute()
+        list(cursor)
+        mapping = cursor.mapping
+        self.assertTrue(mapping.has_projection)
+        self.assertEqual(mapping.columns,
+                         ['id', 'user', 'content', 'timestamp',
+                          'id', 'username'])
+        self.assertEqual(mapping.fields,
+                         [Tweet.id, Tweet.user, Tweet.content,
+                          Tweet.timestamp, User.id, User.username])
+        self.assertEqual(mapping.controlled, [False] * 6)
+
+        # Aliased columns are marked as controlled.
+        query = User.select(User.username, fn.COUNT(Tweet.id).alias('ct'))
+        cursor = query.join(Tweet, JOIN.LEFT_OUTER).group_by(User.id).execute()
+        list(cursor)
+        self.assertEqual(cursor.mapping.controlled, [False, True])
+
+        # Raw queries have no projection metadata.
+        cursor = User.raw('SELECT * FROM users').execute()
+        list(cursor)
+        self.assertFalse(cursor.mapping.has_projection)
+
+    def test_real_query_restores_each_column_value(self):
+        # Every column of the real query result is recoverable, regardless
+        # of row type.
+        query = (Tweet
+                 .select(Tweet, User)
+                 .join(User)
+                 .order_by(Tweet.id))
+
+        rows = list(query.tuples())
+        self.assertEqual(rows, [
+            (self.t1.id, self.u1.id, 't1',
+             datetime.datetime(2026, 1, 1), self.u1.id, 'u1'),
+            (self.t2.id, self.u2.id, 't2',
+             datetime.datetime(2026, 1, 2), self.u2.id, 'u2')])
+
+        rows = list(query.dicts())
+        self.assertEqual(
+            [(r['id'], r['user'], r['content'], r['id_2'], r['username'])
+             for r in rows],
+            [(self.t1.id, self.u1.id, 't1', self.u1.id, 'u1'),
+             (self.t2.id, self.u2.id, 't2', self.u2.id, 'u2')])
+
+        rows = list(query.namedtuples())
+        self.assertEqual(
+            [(r.id, r.content, r.id_2, r.username) for r in rows],
+            [(self.t1.id, 't1', self.u1.id, 'u1'),
+             (self.t2.id, 't2', self.u2.id, 'u2')])
+

@@ -7,6 +7,19 @@ https://github.com/coleifer/peewee/releases
 
 ## master
 
+* Add an explicit result-mapping contract for materializing query results.
+  Cursor columns are bound to model fields by projection identity or by
+  controlled (user-supplied) aliases. When two distinct, unaliased
+  projections would be materialized to the same attribute on the same
+  object, an `AmbiguousColumnError` is raised instead of silently
+  overwriting one source's value with another's (e.g. an unaliased
+  `COUNT(t.id)` clobbering a joined model's `id`). The mapping is
+  inspectable via the cursor wrapper's `mapping` attribute.
+* Raw queries (no projection metadata) no longer fabricate sources: model
+  results map columns by their real names and the first occurrence of a
+  duplicate name wins, instead of inventing `name_N` attributes. `dicts()`
+  and `namedtuples()` continue to preserve every column value using
+  controlled `name_2`, `name_3`, ... suffixes.
 * Clear `after_commit` callbacks registered on a savepoint if that savepoint is
   then rolled-back.
 * Re-create triggers during sqlite migrator table rebuilds.
