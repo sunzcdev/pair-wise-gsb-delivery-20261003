@@ -49,7 +49,9 @@ from ._structures import Schedule as Schedule
 from ._structures import ScheduleResult as ScheduleResult
 from ._structures import Task as Task
 from ._structures import TaskDefaults as TaskDefaults
+from ._utils import InheritDefault as InheritDefault
 from ._utils import UnsetValue as UnsetValue
+from ._utils import inherit_default as inherit_default
 
 # Re-export imports, so they look like they live directly in this package
 value: Any

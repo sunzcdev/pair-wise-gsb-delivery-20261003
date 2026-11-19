@@ -352,6 +352,51 @@ The resulting task will have the following parameters:
 * ``misfire_grace_time``: 15 (from the scheduler-level default)
 * ``metadata``: ``{"global": 3, "foo": ["taskfunc"], "direct": True}``
 
+Updating a task, and the three states of each option
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+A task can be configured more than once. Every option of
+:meth:`~AsyncScheduler.configure_task` (``job_executor``, ``max_running_jobs``,
+``misfire_grace_time`` and ``metadata``) can be in one of three states:
+
+#. **Not passed** – the option keeps the value already stored on the task. When a task
+   is being created, the value is instead looked up from the :func:`@task <task>`
+   parameters and, failing that, from the scheduler's ``task_defaults``. This means
+   that changing just one field never resets the other fields.
+#. **An explicit value** – any concrete value, including ``None`` where the option
+   accepts it, overrides earlier settings and is stored on the task as-is. Passing
+   ``None`` explicitly therefore always results in ``None`` being stored, rather than
+   a default being looked up.
+#. **:data:`~apscheduler.inherit_default`** – revokes the explicit override for that
+   single option, after which it is resolved again from the :func:`@task <task>`
+   parameters (if the callable has any) and then the scheduler's ``task_defaults``.
+   For ``metadata``, this discards the keys stored on the task and rebuilds the
+   metadata from the remaining configuration levels.
+
+This example demonstrates the difference between leaving an option out, passing
+``None`` and resetting it::
+
+    from apscheduler import inherit_default
+
+    with Scheduler() as scheduler:
+        # max_running_jobs is explicitly set to 5
+        scheduler.configure_task("mytask", func=mytaskfunc, max_running_jobs=5)
+
+        # Only misfire_grace_time is touched; max_running_jobs stays at 5.
+        # misfire_grace_time=None is stored as None.
+        scheduler.configure_task("mytask", misfire_grace_time=None)
+
+        # max_running_jobs goes back to being inherited (from the decorator or the
+        # scheduler level task defaults)
+        scheduler.configure_task(
+            "mytask", max_running_jobs=inherit_default
+        )
+
+Note that jobs and schedules keep their own copy of the settings they were created
+with. Reconfiguring a task therefore never changes a job that has already been queued,
+or an existing schedule; only jobs and schedules created afterwards pick up the new
+settings.
+
 Scheduling tasks
 ================
 

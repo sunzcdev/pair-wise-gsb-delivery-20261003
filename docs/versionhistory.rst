@@ -46,6 +46,13 @@ APScheduler, see the :doc:`migration section <migration>`.
 - Fixed ``configure_task()`` dropping the callable reference when passed a ``Task``
   object, causing the configured task to be stored with ``func=None``
   (`#1001 <https://github.com/agronholm/apscheduler/issues/1001>`_)
+- Clarified the update semantics of ``configure_task()``: options not passed to a
+  later call now always keep the values stored on the task, an explicitly passed
+  ``None`` is stored as ``None``, and the new ``inherit_default`` sentinel revokes an
+  individual explicit override so the option is inherited again from the ``@task``
+  parameters and the scheduler's task defaults. Reconfiguring a decorated callable no
+  longer discards values that were stored by earlier calls, and other ``metadata``
+  keys are preserved when updating a task
 - Fixed ``MemoryDataStore`` and ``MongoDBDataStore`` returning the fire time of a paused
   or already acquired schedule from ``get_next_schedule_run_time()``, which made the
   scheduler wake up past a deadline that had already passed and process schedules in a

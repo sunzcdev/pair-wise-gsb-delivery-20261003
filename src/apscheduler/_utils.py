@@ -42,6 +42,29 @@ class UnsetValue:
 unset = UnsetValue()
 
 
+class InheritDefault:
+    """The type of :data:`inherit_default`."""
+
+    __slots__ = ()
+
+    def __new__(cls) -> InheritDefault:
+        try:
+            return inherit_default
+        except NameError:
+            return super().__new__(cls)
+
+    def __getstate__(self) -> NoReturn:
+        raise RuntimeError(
+            "Internal error: attempted to serialize an inherit-default value"
+        )
+
+    def __repr__(self) -> str:
+        return "<inherit default>"
+
+
+inherit_default = InheritDefault()
+
+
 def timezone_repr(timezone: tzinfo) -> str:
     if isinstance(timezone, ZoneInfo):
         return timezone.key

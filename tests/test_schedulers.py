@@ -55,6 +55,7 @@ from apscheduler import (
     TaskUpdated,
     current_async_scheduler,
     current_job,
+    inherit_default,
     task,
 )
 from apscheduler.abc import DataStore
@@ -268,6 +269,275 @@ class TestAsyncScheduler:
             assert tasks[0].misfire_grace_time == timedelta(seconds=6)
             assert tasks[0].job_executor == "threadpool"
             assert tasks[0].metadata == {"global": "foo", "local": 6, "direct": [1, 9]}
+
+    async def test_configure_task_partial_update_keeps_other_fields(self) -> None:
+        """
+        Fields not passed to a later ``configure_task()`` call must keep the values
+        already stored on the task, instead of being recomputed from the scheduler
+        defaults or the @task parameters.
+
+        """
+        task_defaults = TaskDefaults(
+            job_executor="async",
+            max_running_jobs=1,
+            misfire_grace_time=None,
+        )
+        async with AsyncScheduler(task_defaults=task_defaults) as scheduler:
+            await scheduler.configure_task(
+                "mytask",
+                func=dummy_async_job,
+                job_executor="processpool",
+                max_running_jobs=5,
+                misfire_grace_time=timedelta(seconds=30),
+                metadata={"stored_key": "kept"},
+            )
+
+            # Change just one field; every other field must be left untouched.
+            updated = await scheduler.configure_task(
+                "mytask", max_running_jobs=9
+            )
+            assert updated.job_executor == "processpool"
+            assert updated.max_running_jobs == 9
+            assert updated.misfire_grace_time == timedelta(seconds=30)
+            assert updated.metadata == {"stored_key": "kept"}
+
+    async def test_configure_task_explicit_none_is_stored(self) -> None:
+        """An explicitly passed ``None`` must be stored as ``None``, never inherited."""
+        task_defaults = TaskDefaults(misfire_grace_time=timedelta(seconds=15))
+        async with AsyncScheduler(task_defaults=task_defaults) as scheduler:
+            await scheduler.configure_task(
+                "mytask",
+                func=dummy_async_job,
+                misfire_grace_time=timedelta(seconds=5),
+                max_running_jobs=4,
+            )
+
+            updated = await scheduler.configure_task(
+                "mytask", misfire_grace_time=None, max_running_jobs=None
+            )
+            assert updated.misfire_grace_time is None
+            assert updated.max_running_jobs is None
+
+            # A later partial update must keep the explicit None values.
+            again = await scheduler.configure_task(
+                "mytask", job_executor="threadpool"
+            )
+            assert again.misfire_grace_time is None
+            assert again.max_running_jobs is None
+            assert again.job_executor == "threadpool"
+
+    async def test_configure_task_inherit_default_revokes_override(self) -> None:
+        """
+        ``inherit_default`` revokes a single explicit override and resolves the value
+        again from the lower priority levels (@task parameters, then scheduler
+        defaults), without touching the other fields.
+
+        """
+        @task(
+            id="decorated",
+            job_executor="threadpool",
+            max_running_jobs=3,
+            misfire_grace_time=timedelta(seconds=6),
+            metadata={"decorator_key": "d"},
+        )
+        def decorated() -> None:
+            pass
+
+        task_defaults = TaskDefaults(
+            job_executor="async",
+            max_running_jobs=1,
+            misfire_grace_time=timedelta(seconds=15),
+            metadata={"global_key": "g"},
+        )
+        async with AsyncScheduler(task_defaults=task_defaults) as scheduler:
+            await scheduler.configure_task(
+                decorated,
+                job_executor="processpool",
+                max_running_jobs=8,
+                misfire_grace_time=timedelta(seconds=30),
+                metadata={"explicit_key": "e"},
+            )
+
+            # Resetting one field falls back to the @task parameter first.
+            updated = await scheduler.configure_task(
+                decorated, job_executor=inherit_default
+            )
+            assert updated.job_executor == "threadpool"
+            assert updated.max_running_jobs == 8
+            assert updated.misfire_grace_time == timedelta(seconds=30)
+
+            updated = await scheduler.configure_task(
+                decorated,
+                max_running_jobs=inherit_default,
+                misfire_grace_time=inherit_default,
+            )
+            assert updated.max_running_jobs == 3
+            assert updated.misfire_grace_time == timedelta(seconds=6)
+            assert updated.job_executor == "threadpool"
+
+    async def test_configure_task_inherit_default_without_decorator(self) -> None:
+        """Without a decorated callable, ``inherit_default`` uses task_defaults."""
+        task_defaults = TaskDefaults(
+            job_executor="threadpool",
+            max_running_jobs=7,
+            misfire_grace_time=timedelta(seconds=99),
+        )
+        async with AsyncScheduler(task_defaults=task_defaults) as scheduler:
+            await scheduler.configure_task(
+                "plain",
+                func=dummy_async_job,
+                job_executor="processpool",
+                max_running_jobs=2,
+                misfire_grace_time=timedelta(seconds=1),
+            )
+
+            updated = await scheduler.configure_task(
+                "plain",
+                job_executor=inherit_default,
+                max_running_jobs=inherit_default,
+                misfire_grace_time=inherit_default,
+            )
+            assert updated.job_executor == "threadpool"
+            assert updated.max_running_jobs == 7
+            assert updated.misfire_grace_time == timedelta(seconds=99)
+
+    async def test_configure_task_metadata_keys_are_preserved(self) -> None:
+        """Updating other fields must not drop any metadata keys already stored."""
+        async with AsyncScheduler() as scheduler:
+            await scheduler.configure_task(
+                "mytask", func=dummy_async_job, metadata={"a": 1, "b": 2}
+            )
+            updated = await scheduler.configure_task(
+                "mytask", max_running_jobs=2, metadata={"b": 3, "c": 4}
+            )
+            assert updated.metadata == {"a": 1, "b": 3, "c": 4}
+
+            # A field-only update leaves the metadata completely untouched.
+            again = await scheduler.configure_task("mytask", max_running_jobs=6)
+            assert again.metadata == {"a": 1, "b": 3, "c": 4}
+
+    async def test_configure_task_inherit_default_resets_metadata(self) -> None:
+        """
+        ``inherit_default`` for metadata discards the keys stored on the task and
+        rebuilds the metadata from the scheduler defaults and the @task parameters.
+
+        """
+        @task(id="decorated", metadata={"decorator_key": "d"})
+        def decorated() -> None:
+            pass
+
+        task_defaults = TaskDefaults(metadata={"global_key": "g"})
+        async with AsyncScheduler(task_defaults=task_defaults) as scheduler:
+            await scheduler.configure_task(
+                decorated, metadata={"stored_key": "s"}
+            )
+            updated = await scheduler.configure_task(
+                decorated, metadata=inherit_default
+            )
+            assert updated.metadata == {"global_key": "g", "decorator_key": "d"}
+
+    async def test_configure_task_shared_between_two_schedulers(self) -> None:
+        """
+        Two schedulers with different task defaults read the same stored task.
+        Reading it never re-applies the reader's defaults, and an update that omits
+        fields keeps the stored values.
+
+        """
+        shared_store = MemoryDataStore()
+        defaults_a = TaskDefaults(
+            job_executor="async",
+            max_running_jobs=1,
+            misfire_grace_time=None,
+            metadata={"origin": "A"},
+        )
+        defaults_b = TaskDefaults(
+            job_executor="threadpool",
+            max_running_jobs=7,
+            misfire_grace_time=timedelta(seconds=99),
+            metadata={"origin": "B"},
+        )
+
+        async with AsyncScheduler(
+            data_store=shared_store, task_defaults=defaults_a
+        ) as scheduler_a:
+            task_a = await scheduler_a.configure_task(
+                "shared",
+                func=dummy_async_job,
+                job_executor="processpool",
+                max_running_jobs=4,
+                misfire_grace_time=timedelta(seconds=12),
+                metadata={"configured_by": "A"},
+            )
+            assert task_a.job_executor == "processpool"
+            assert task_a.metadata == {"origin": "A", "configured_by": "A"}
+
+        async with AsyncScheduler(
+            data_store=shared_store, task_defaults=defaults_b
+        ) as scheduler_b:
+            # Simply reading the task must not rewrite it with B's defaults.
+            task_b = await scheduler_b.data_store.get_task("shared")
+            assert task_b.job_executor == "processpool"
+            assert task_b.max_running_jobs == 4
+            assert task_b.misfire_grace_time == timedelta(seconds=12)
+            assert task_b.metadata == {"origin": "A", "configured_by": "A"}
+
+            # An update passing only one field keeps the rest of the stored values.
+            updated = await scheduler_b.configure_task(
+                "shared", max_running_jobs=9
+            )
+            assert updated.max_running_jobs == 9
+            assert updated.job_executor == "processpool"
+            assert updated.misfire_grace_time == timedelta(seconds=12)
+            assert updated.metadata == {"origin": "A", "configured_by": "A"}
+
+            # Resetting a field resolves it from B's own scheduler defaults.
+            reset = await scheduler_b.configure_task(
+                "shared",
+                job_executor=inherit_default,
+                misfire_grace_time=inherit_default,
+            )
+            assert reset.job_executor == "threadpool"
+            assert reset.misfire_grace_time == timedelta(seconds=99)
+
+    async def test_reconfiguring_task_does_not_rewrite_queued_job(self) -> None:
+        """
+        A job already queued before its task is reconfigured keeps the parameters
+        that were settled when the job was created; the task update is not applied
+        retroactively.
+
+        """
+        async with AsyncScheduler() as scheduler:
+            await scheduler.configure_task(
+                "mytask",
+                func=dummy_async_job,
+                job_executor="threadpool",
+                metadata={"version": 1},
+            )
+            job_id = await scheduler.add_job(
+                "mytask", metadata={"job_key": "original"}
+            )
+            jobs_before = await scheduler.get_jobs()
+            assert len(jobs_before) == 1
+            queued_job = jobs_before[0]
+            assert queued_job.id == job_id
+            assert queued_job.executor == "threadpool"
+            assert queued_job.metadata == {"version": 1, "job_key": "original"}
+
+            # Reconfigure the task after the job has already been queued.
+            await scheduler.configure_task(
+                "mytask",
+                job_executor="processpool",
+                metadata={"version": 2, "new_key": True},
+            )
+
+            jobs_after = await scheduler.get_jobs()
+            assert len(jobs_after) == 1
+            assert jobs_after[0].id == job_id
+            assert jobs_after[0].executor == "threadpool"
+            assert jobs_after[0].metadata == {
+                "version": 1,
+                "job_key": "original",
+            }
 
     async def test_add_pause_unpause_remove_schedule(
         self, raw_datastore: DataStore, timezone: ZoneInfo
@@ -1448,6 +1718,45 @@ class TestSyncScheduler:
         event = queue.get(timeout=1)
         assert isinstance(event, TaskUpdated)
         assert event.task_id == "mytask"
+
+    def test_configure_task_three_state_semantics(self) -> None:
+        task_defaults = TaskDefaults(
+            job_executor="threadpool",
+            max_running_jobs=7,
+            misfire_grace_time=timedelta(seconds=99),
+        )
+        with Scheduler(task_defaults=task_defaults) as scheduler:
+            scheduler.configure_task(
+                "mytask",
+                func=dummy_sync_job,
+                job_executor="async",
+                max_running_jobs=2,
+                misfire_grace_time=timedelta(seconds=1),
+                metadata={"a": 1},
+            )
+
+            # Omitting a field keeps the stored value; an explicit None is stored.
+            updated = scheduler.configure_task(
+                "mytask", max_running_jobs=None
+            )
+            assert updated.job_executor == "async"
+            assert updated.max_running_jobs is None
+            assert updated.misfire_grace_time == timedelta(seconds=1)
+            assert updated.metadata == {"a": 1}
+
+            # inherit_default revokes an override and falls back to task_defaults.
+            reset = scheduler.configure_task(
+                "mytask",
+                job_executor=inherit_default,
+                max_running_jobs=inherit_default,
+                misfire_grace_time=inherit_default,
+            )
+            assert reset.job_executor == "threadpool"
+            assert reset.max_running_jobs == 7
+            assert reset.misfire_grace_time == timedelta(seconds=99)
+
+            # Other metadata keys survive a field-only reconfiguration.
+            assert reset.metadata == {"a": 1}
 
     def test_add_remove_schedule(self, timezone: ZoneInfo) -> None:
         queue: Queue[Event] = Queue()

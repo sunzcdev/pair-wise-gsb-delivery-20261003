@@ -159,3 +159,12 @@ Support classes for unset options
     Sentinel value for unset option values.
 
 .. autoclass:: apscheduler.UnsetValue
+
+.. data:: apscheduler.inherit_default
+
+    Sentinel value that causes an explicitly overridden task option to be reset, so
+    that it is inherited again from the :func:`@task <apscheduler.task>` parameters
+    and then the scheduler's task defaults. Used with
+    :meth:`~apscheduler.AsyncScheduler.configure_task`.
+
+.. autoclass:: apscheduler.InheritDefault

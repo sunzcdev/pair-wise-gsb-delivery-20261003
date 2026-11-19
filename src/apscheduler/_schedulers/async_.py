@@ -58,7 +58,13 @@ from .._structures import (
     Task,
     TaskDefaults,
 )
-from .._utils import UnsetValue, create_repr, merge_metadata, unset
+from .._utils import (
+    InheritDefault,
+    UnsetValue,
+    create_repr,
+    merge_metadata,
+    unset,
+)
 from .._validators import non_negative_number
 from ..abc import DataStore, EventBroker, JobExecutor, Subscription, Trigger
 from ..datastores.memory import MemoryDataStore
@@ -308,22 +314,43 @@ class AsyncScheduler:
         func_or_task_id: TaskType,
         *,
         func: Callable[..., Any] | UnsetValue = unset,
-        job_executor: str | UnsetValue = unset,
-        misfire_grace_time: float | timedelta | None | UnsetValue = unset,
-        max_running_jobs: int | None | UnsetValue = unset,
-        metadata: MetadataType | UnsetValue = unset,
+        job_executor: str | InheritDefault | UnsetValue = unset,
+        misfire_grace_time: (
+            float | timedelta | None | InheritDefault | UnsetValue
+        ) = unset,
+        max_running_jobs: int | None | InheritDefault | UnsetValue = unset,
+        metadata: MetadataType | InheritDefault | UnsetValue = unset,
     ) -> Task:
         """
         Add or update a :ref:`task <task>` definition.
 
-        Any options not explicitly passed to this method will use their default values
-        (from ``task_defaults``) when a new task is created:
+        Each configuration option has three possible states:
 
-        * ``job_executor``: the value of ``default_job_executor`` scheduler attribute
+        * **not passed** (left at :data:`~apscheduler.unset`): when a new task is
+          created, the value is resolved from the target function's
+          :func:`@task <task>` parameters, and if that is unset too, from the
+          scheduler's ``task_defaults``. When an existing task is updated, the value
+          already stored in the task is left untouched.
+        * **an explicit value** (including ``None``, where allowed): overrides any
+          earlier setting and is stored on the task as-is. An explicit ``None`` is
+          therefore always stored as ``None`` and never falls back to a default.
+        * **:data:`~apscheduler.inherit_default`**: revokes any explicit override for
+          this option, so it is resolved again from the :func:`@task <task>`
+          parameters (if any) and then from the scheduler's ``task_defaults``.
+
+        The scheduler-level defaults applied when creating a new task are:
+
+        * ``job_executor``: the value of the ``default_job_executor`` scheduler
+          attribute
         * ``misfire_grace_time``: ``None``
         * ``max_running_jobs``: 1
 
-        When updating a task, any options not explicitly passed will remain the same.
+        For ``metadata``, top level keys from the scheduler defaults, the
+        :func:`@task <task>` parameters and the explicitly passed metadata are merged,
+        with the more explicit levels winning. When updating an existing task, keys
+        stored on the task are preserved unless they are overwritten by an explicitly
+        passed value; passing :data:`~apscheduler.inherit_default` discards the keys
+        stored on the task and rebuilds the metadata from the remaining levels.
 
         If a callable is passed as the first argument, its fully qualified name will be
         used as the task ID.
@@ -344,79 +371,171 @@ class AsyncScheduler:
         """
         func_ref: str | None = None
         task: Task | None = None
+        decorator_params: TaskParameters | None = None
         if callable(func_or_task_id):
-            task_params = get_task_params(func_or_task_id)
-            if task_params.id is unset:
-                task_params.id = callable_to_ref(func_or_task_id)
+            # Work on a copy so that resolving defaults or applying overrides here
+            # never mutates the parameters permanently bound to the callable by the
+            # @task decorator. Otherwise a later call could no longer fall back to
+            # the decorator level (e.g. via the ``inherit_default`` sentinel).
+            decorator_params = attrs.evolve(get_task_params(func_or_task_id))
+            if decorator_params.id is unset:
+                decorator_params.id = callable_to_ref(func_or_task_id)
 
             if func is unset:
                 func = func_or_task_id
         elif isinstance(func_or_task_id, Task):
+            # Treat the passed in task object like a task already stored in the data
+            # store: its values become the baseline that subsequent calls can update
+            # or reset one field at a time.
+            task = func_or_task_id
             func_ref = func_or_task_id.func
-            task_params = TaskParameters(
-                id=func_or_task_id.id,
-                job_executor=func_or_task_id.job_executor,
-                max_running_jobs=func_or_task_id.max_running_jobs,
-                misfire_grace_time=func_or_task_id.misfire_grace_time,
-                metadata=func_or_task_id.metadata,
-            )
         elif isinstance(func_or_task_id, str) and func_or_task_id:
-            try:
-                task = await self.data_store.get_task(func_or_task_id)
-                task_params = TaskParameters(
-                    id=task.id,
-                    job_executor=task.job_executor,
-                    max_running_jobs=task.max_running_jobs,
-                    misfire_grace_time=task.misfire_grace_time,
-                    metadata=task.metadata,
-                )
-            except TaskLookupError:
-                task_params = (
-                    get_task_params(func) if callable(func) else TaskParameters()
-                )
-                task_params.id = func_or_task_id
+            if callable(func):
+                # Work on a copy so that resolving defaults or applying overrides
+                # here never mutates the parameters bound to the callable by the
+                # @task decorator.
+                decorator_params = attrs.evolve(get_task_params(func))
         else:
             raise TypeError(
                 "func_or_task_id must be either a task, its identifier or a callable"
             )
 
-        assert task_params.id
+        # The explicitly given task ID (string argument, or the ID of a passed in
+        # task object) always wins. Otherwise, the ID comes from the @task
+        # parameters, or the callable's reference.
+        task_id: str
+        if isinstance(func_or_task_id, str) and func_or_task_id:
+            task_id = func_or_task_id
+        elif task is not None:
+            task_id = task.id
+        elif (
+            decorator_params is not None
+            and not isinstance(decorator_params.id, UnsetValue)
+        ):
+            task_id = decorator_params.id
+        else:
+            assert isinstance(func_or_task_id, str)
+            task_id = func_or_task_id
 
-        # Apply any settings passed directly to this function as arguments
-        if job_executor is not unset:
-            task_params.job_executor = job_executor
-        if max_running_jobs is not unset:
-            task_params.max_running_jobs = max_running_jobs
-        if misfire_grace_time is not unset:
-            task_params.misfire_grace_time = misfire_grace_time
+        # If the task already exists in the data store, its stored values are the
+        # baseline for this update. Fields not explicitly passed stay untouched, and
+        # the @task parameters only serve as a lower priority fallback (through the
+        # ``inherit_default`` sentinel) together with the scheduler level defaults.
+        # A task object passed in directly serves as that baseline itself.
+        task_from_datastore = task is None
+        if task_from_datastore:
+            try:
+                task = await self.data_store.get_task(task_id)
+            except TaskLookupError:
+                task = None
 
-        # Fill in unset values with the defaults
-        if task_params.job_executor is unset:
+        task_params: TaskParameters
+        if task is not None:
+            task_params = TaskParameters(
+                id=task.id,
+                job_executor=task.job_executor,
+                max_running_jobs=task.max_running_jobs,
+                misfire_grace_time=task.misfire_grace_time,
+                metadata=unset,
+            )
+        elif decorator_params is not None:
+            task_params = decorator_params
+        else:
+            task_params = TaskParameters()
+
+        task_params.id = task_id
+
+        # Apply any settings passed directly to this function as arguments. The
+        # ``inherit_default`` sentinel revokes an explicit override by clearing the
+        # value back to the corresponding @task parameter (if the callable has one)
+        # or to ``unset``, so that it gets resolved from the lower priority levels
+        # (the @task parameters and then the scheduler's task defaults) below.
+        def fallback(field_name: str) -> Any:
+            if decorator_params is not None:
+                return getattr(decorator_params, field_name)
+
+            return unset
+
+        job_executor_: str | UnsetValue
+        if isinstance(job_executor, InheritDefault):
+            job_executor_ = fallback("job_executor")
+        elif isinstance(job_executor, UnsetValue):
+            job_executor_ = task_params.job_executor
+        else:
+            job_executor_ = job_executor
+        task_params.job_executor = job_executor_
+
+        max_running_jobs_: int | None | UnsetValue
+        if isinstance(max_running_jobs, InheritDefault):
+            max_running_jobs_ = fallback("max_running_jobs")
+        elif isinstance(max_running_jobs, UnsetValue):
+            max_running_jobs_ = task_params.max_running_jobs
+        else:
+            max_running_jobs_ = max_running_jobs
+        task_params.max_running_jobs = max_running_jobs_
+
+        misfire_grace_time_: timedelta | None | UnsetValue
+        if isinstance(misfire_grace_time, InheritDefault):
+            misfire_grace_time_ = fallback("misfire_grace_time")
+        elif isinstance(misfire_grace_time, UnsetValue):
+            misfire_grace_time_ = task_params.misfire_grace_time
+        elif misfire_grace_time is None:
+            misfire_grace_time_ = None
+        elif isinstance(misfire_grace_time, timedelta):
+            misfire_grace_time_ = misfire_grace_time
+        else:
+            misfire_grace_time_ = timedelta(seconds=misfire_grace_time)
+        task_params.misfire_grace_time = misfire_grace_time_
+
+        # Fill in unset values with the scheduler level defaults
+        if isinstance(task_params.job_executor, UnsetValue):
             task_params.job_executor = self.task_defaults.job_executor
-        if task_params.max_running_jobs is unset:
+        if isinstance(task_params.max_running_jobs, UnsetValue):
             task_params.max_running_jobs = self.task_defaults.max_running_jobs
-        if task_params.misfire_grace_time is unset:
+        if isinstance(task_params.misfire_grace_time, UnsetValue):
             task_params.misfire_grace_time = self.task_defaults.misfire_grace_time
 
-        # Merge the metadata from the defaults, task definition and explicitly passed
-        # metadata
+        # Resolve the metadata. The overlays are merged in ascending order of
+        # priority, so keys from a more explicit level overwrite those from a more
+        # generic one while all other keys are preserved. The layers are:
+        #   1. the scheduler level task defaults
+        #   2. the metadata bound to the callable with the @task decorator (if any)
+        #   3. the metadata already stored on the task (if it is being updated)
+        #   4. the metadata explicitly passed to this call
+        # The ``inherit_default`` sentinel discards both the metadata stored on the
+        # task and any explicitly passed metadata, rebuilding the result from the
+        # lower priority layers only.
+        decorator_metadata: MetadataType | UnsetValue = (
+            decorator_params.metadata if decorator_params is not None else unset
+        )
+        stored_metadata: MetadataType | UnsetValue = (
+            task.metadata
+            if task is not None and not isinstance(metadata, InheritDefault)
+            else unset
+        )
+        explicit_metadata: MetadataType | UnsetValue = (
+            unset if isinstance(metadata, InheritDefault) else metadata
+        )
         task_params.metadata = merge_metadata(
-            self.task_defaults.metadata, task_params.metadata, metadata
+            self.task_defaults.metadata,
+            decorator_metadata,
+            stored_metadata,
+            explicit_metadata,
         )
 
         if callable(func):
-            self._task_callables[task_params.id] = func
+            self._task_callables[task_id] = func
             try:
                 func_ref = callable_to_ref(func)
             except SerializationError:
                 pass
 
-        modified = False
-        try:
-            task = task or await self.data_store.get_task(cast(str, task_params.id))
-        except TaskLookupError:
+        if task is None:
+            assert not isinstance(task_params.job_executor, UnsetValue)
+            assert not isinstance(task_params.max_running_jobs, UnsetValue)
+            assert not isinstance(task_params.misfire_grace_time, UnsetValue)
             task = Task(
-                id=task_params.id,
+                id=task_id,
                 func=func_ref,
                 job_executor=task_params.job_executor,
                 max_running_jobs=task_params.max_running_jobs,
@@ -444,6 +563,10 @@ class AsyncScheduler:
             if changes:
                 task = attrs.evolve(task, **changes)
                 modified = True
+            else:
+                # A task object passed in directly is not present in the data store
+                # yet, so it has to be added even when no field was changed.
+                modified = not task_from_datastore
 
         if modified:
             await self.data_store.add_task(task)

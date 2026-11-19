@@ -19,7 +19,7 @@ from .. import current_scheduler
 from .._enums import CoalescePolicy, ConflictPolicy, RunState, SchedulerRole
 from .._events import Event, T_Event
 from .._structures import Job, JobResult, MetadataType, Schedule, Task, TaskDefaults
-from .._utils import UnsetValue, create_repr, unset
+from .._utils import InheritDefault, UnsetValue, create_repr, unset
 from ..abc import DataStore, EventBroker, JobExecutor, Subscription, Trigger
 from .async_ import AsyncScheduler, TaskType
 
@@ -236,10 +236,12 @@ class Scheduler:
         func_or_task_id: TaskType,
         *,
         func: Callable[..., Any] | UnsetValue = unset,
-        job_executor: str | UnsetValue = unset,
-        misfire_grace_time: float | timedelta | None | UnsetValue = unset,
-        max_running_jobs: int | None | UnsetValue = unset,
-        metadata: MetadataType | UnsetValue = unset,
+        job_executor: str | InheritDefault | UnsetValue = unset,
+        misfire_grace_time: (
+            float | timedelta | None | InheritDefault | UnsetValue
+        ) = unset,
+        max_running_jobs: int | None | InheritDefault | UnsetValue = unset,
+        metadata: MetadataType | InheritDefault | UnsetValue = unset,
     ) -> Task:
         portal = self._ensure_services_ready()
         return portal.call(
