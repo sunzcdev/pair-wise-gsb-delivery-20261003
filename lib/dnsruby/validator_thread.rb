@@ -15,6 +15,7 @@
 # ++
 
 module Dnsruby
+  require 'dnsruby/diagnostics'
   # Runs local DNSSEC validation outside SelectThread, using a bounded pool.
   # Nested trust discovery shares the original validation budget.
   class ValidatorThread # :nodoc: all
@@ -114,7 +115,16 @@ module Dnsruby
       return if needs_validation && !register
       validated_ok = if needs_validation
         SelectThread::TransmissionBudget.with(@transmission_budget) do
-          ValidationBudget.with(@budget) { validate(@query, @response, @res) }
+          ValidationBudget.with(@budget) do
+            # Measure only validation that really runs, on the query's chain so
+            # the span sits with the attempts that led to it.
+            chain = Dnsruby::Diagnostics.chain_for(@query)
+            if chain
+              chain.measure_validation { validate(@query, @response, @res) }
+            else
+              validate(@query, @response, @res)
+            end
+          end
         end
       else
         validate(@query, @response, @res)

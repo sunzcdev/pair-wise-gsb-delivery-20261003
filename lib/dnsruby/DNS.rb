@@ -80,6 +80,18 @@ module Dnsruby
 
     attr_accessor :do_caching
 
+    # Install a diagnostics recorder for queries made through this DNS object.
+    # The hosts stage is recorded by Dnsruby::Hosts when a Resolv lookup probes
+    # it first.
+    def diagnostics=(recorder)
+      @diagnostics = recorder
+      @resolver.diagnostics = recorder if @resolver
+    end
+
+    def diagnostics
+      @diagnostics
+    end
+
     # Creates a new DNS resolver. See Resolv::DNS.new for argument details.
     # 
     # Yields the created DNS resolver to the block, if given, otherwise returns it.

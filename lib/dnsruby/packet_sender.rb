@@ -14,6 +14,7 @@
 # limitations under the License.
 # ++
 require 'dnsruby/select_thread'
+require 'dnsruby/diagnostics'
 require 'ipaddr'
 require 'securerandom'
 # require 'dnsruby/iana_ports'
@@ -411,6 +412,9 @@ module Dnsruby
       end
       response_settings = response_query_settings(client_query_id)
       disable_edns = args[4] || (response_settings && response_settings.disable_edns)
+      # A direct PacketSender call has no Resolver to attach the chain, so do it
+      # here. It is idempotent for messages already carrying a chain.
+      Dnsruby::Diagnostics.attach(msg)
 
       begin
         query_packet = make_query_packet(msg, use_tcp, disable_edns)
@@ -418,6 +422,7 @@ module Dnsruby
       rescue EncodeError => err
         Dnsruby.log.error { "#{err}" }
         st = SelectThread.instance
+        Dnsruby::Diagnostics.finish(msg, nil, err)
         if response_settings
           st.fail_query_if_current(client_query_id, client_queue, response_settings, err)
         else
@@ -428,6 +433,7 @@ module Dnsruby
 
       if (msg.do_caching && !msg.send_raw && (msg.class != Update) && !@tsig && !msg.tsig && !msg.signed?)
         #  Check the cache!!
+        chain = Dnsruby::Diagnostics.chain_for(msg)
         cachedanswer = nil
         if (msg.header.rd)
           cachedanswer = @@recursive_cache.find(msg.question()[0].qname, msg.question()[0].type, msg.question()[0].qclass,
@@ -438,6 +444,7 @@ module Dnsruby
         end
         if (cachedanswer)
           TheLog.debug("Sending cached answer to client\n")
+          Dnsruby::Diagnostics.record_cache(chain, :hit)
           #  @TODO@ Fix up the header - ID and flags
           cachedanswer.header.id = msg.header.id
           #  If we can find the answer, send it to the client straight away
@@ -450,6 +457,7 @@ module Dnsruby
           end
           return client_query_id
         end
+        Dnsruby::Diagnostics.record_cache(chain, :miss)
       end
       #  Otherwise, run the query
       if (udp_packet_size < query_packet.length)
@@ -584,6 +592,11 @@ module Dnsruby
       endtime = pending.endtime = [endtime, pending.send_token.control&.deadline].compact.min
       pending.disable_edns = disable_edns || (previous_settings && previous_settings.disable_edns)
       pending.cache_scope = positive_cache_scope(query, query_bytes, configuration)
+      # Every dispatch with bytes is a distinct attempt belonging to the same
+      # logical query. Open it before the reservation so a very fast response
+      # always finds it; an attempt that is never admitted simply emits nothing.
+      pending.diagnostics_attempt = Dnsruby::Diagnostics.begin_attempt(query,
+        transport: use_tcp ? :tcp : :udp, server: configuration[:server], port: configuration[:port])
       # A protocol retry starts its own packet deadline at dispatch, including
       # time queued for a worker. Retire the old socket membership atomically.
       return unless st.reserve_send(pending, previous_settings)
@@ -1093,6 +1106,8 @@ module Dnsruby
             retry_query.tsigstate = :Unsigned
             retry_query.set_tsig(query.tsig.dup)
           end
+          # This UDP attempt ends on the FORMERR and the retry is a new attempt.
+          settings&.diagnostics_finish(:formerr)
           send_async(retry_query, client_queue, client_query_id, tcp, true)
           return false
         end
@@ -1104,6 +1119,8 @@ module Dnsruby
             Dnsruby.log.debug { "Truncated - resending over TCP" }
             #  @TODO@ Are the query options used correctly here? DNSSEC in particular...
             #         query.send_raw = true # Make sure that the packet is not messed with.
+            # The truncated UDP attempt ends here; the TCP retry is its own attempt.
+            settings&.diagnostics_finish(:truncated)
             send_async(query, client_queue, client_query_id, true)
             return false
           end

@@ -25,6 +25,7 @@ require 'singleton'
 require 'dnsruby/validator_thread.rb'
 require 'dnsruby/transport_clock'
 require 'dnsruby/query_control'
+require 'dnsruby/diagnostics'
 require 'dnsruby/deadline_queue'
 module Dnsruby
   class SelectThread #:nodoc: all
@@ -155,7 +156,8 @@ module Dnsruby
       attr_accessor :query_bytes, :query, :ignore_truncation, :client_queue,
         :client_query_id, :socket, :dest_server, :dest_port, :endtime, :udp_packet_size,
         :single_resolver, :is_persistent_socket, :tcp_pipelining_max_queries, :send_token,
-        :retire_connection, :disable_edns, :authentication_error, :cache_scope, :transport_configuration
+        :retire_connection, :disable_edns, :authentication_error, :cache_scope, :transport_configuration,
+        :diagnostics_attempt
       #  new(query_bytes, query, ignore_truncation, client_queue, client_query_id,
       #      socket, dest_server, dest_port, endtime, , udp_packet_size, single_resolver)
       def initialize(*args)
@@ -183,6 +185,14 @@ module Dnsruby
 
       def tcp_idle_timeout
         transport_configuration ? transport_configuration[:tcp_idle_timeout] : single_resolver.tcp_idle_timeout
+      end
+
+      # Finish this attempt's diagnostic span once, if it has one. The event is
+      # emitted here regardless of who claims the packet, so a replaced attempt
+      # does not look like it kept running.
+      def diagnostics_finish(outcome, transport: nil)
+        attempt = @diagnostics_attempt
+        attempt&.finish(outcome, transport: transport)
       end
     end
 
@@ -447,6 +457,14 @@ module Dnsruby
     # socket membership, so stale EOF/timeout work cannot consume the retry.
     def add_query_from_mutex_synchronized_block(settings)
       id = settings.client_query_id
+      # Registration replaces a bare reservation for the same attempt. Adopt its
+      # diagnostic span instead of reporting the attempt as replaced, so the one
+      # attempt is measured once and survives until the socket response arrives.
+      previous = @@query_hash[id]
+      if previous && settings.diagnostics_attempt.nil?
+        settings.diagnostics_attempt = previous.diagnostics_attempt
+        previous.diagnostics_attempt = nil
+      end
       remove_id_from_mutex_synchronized_block(id, settings.send_token) if @@query_hash[id]
       if settings.socket.closed?
         @@queued_exceptions << [id, settings.client_queue,
@@ -557,7 +575,7 @@ module Dnsruby
         exceptions.each do |eof, socket, id|
           current = @@query_hash[id]
           next unless current && current.socket == socket
-          remove_id_from_mutex_synchronized_block(id)
+          remove_id_from_mutex_synchronized_block(id, nil, false, :error)
           @@queued_exceptions << [id, current.client_queue,
             current.equal?(settings) ? error : eof, nil]
         end
@@ -571,7 +589,7 @@ module Dnsruby
     def fail_query_if_current(id, queue, previous_settings, error)
       state_mutex.synchronize do
         return unless @@query_hash[id].equal?(previous_settings)
-        remove_id_from_mutex_synchronized_block(id) if previous_settings
+        remove_id_from_mutex_synchronized_block(id, nil, false, :error) if previous_settings
         @@queued_exceptions << [id, queue, error, nil]
         check_select_thread_synchronized
       end
@@ -581,15 +599,17 @@ module Dnsruby
     # Cache lookup can satisfy a protocol retry before it reaches the sender.
     # Claim that exact attempt before publishing a result, just like a wire reply.
     def push_response_for_query(settings, msg, query, resolver)
-      return unless claim_query(settings)
+      return unless claim_query(settings, false, :cache)
       push_response_to_select(settings.client_query_id, settings.client_queue, msg, query, resolver,
         settings.send_token&.transmission_budget)
     end
 
-    def claim_query(settings, response_received = false)
+    def claim_query(settings, response_received = false, attempt_outcome = :response)
       state_mutex.synchronize do
         return false unless @@query_hash[settings.client_query_id].equal?(settings)
-        remove_id_from_mutex_synchronized_block(settings.client_query_id, nil, response_received)
+        settings.diagnostics_finish(attempt_outcome)
+        remove_id_from_mutex_synchronized_block(settings.client_query_id, nil, response_received,
+          attempt_outcome)
         true
       end
     end
@@ -850,9 +870,13 @@ module Dnsruby
     end
 
     # THIS MUST BE CALLED FROM INSIDE A @@mutex SYNCHRONISED BLOCK!
-    def remove_id_from_mutex_synchronized_block(id, preserved_token = nil, response_received = false)
+    # +attempt_outcome+ closes this attempt's diagnostic span once. Callers that
+    # already finished it (for example a wire response) are idempotent no-ops.
+    def remove_id_from_mutex_synchronized_block(id, preserved_token = nil, response_received = false,
+        attempt_outcome = :replaced)
       settings = @@query_hash.delete(id)
       return unless settings
+      settings.diagnostics_finish(attempt_outcome)
       ids = @@queries_by_queue[settings.client_queue]
       if ids
         ids.delete(id)
@@ -934,7 +958,7 @@ module Dnsruby
         due
       end
       settings_due.each do |settings|
-        if claim_query(settings)
+        if claim_query(settings, false, :timeout)
           deliver_queue_event(settings.client_queue, [settings.client_query_id, Resolver::EventType::ERROR,
             nil, settings.authentication_error || ResolvTimeout.new("Query timed out")])
         end
@@ -1226,7 +1250,7 @@ module Dnsruby
         settings = @@query_hash[client_id]
         return unless settings && (!socket || settings.socket == socket)
         client_queue = settings.client_queue
-        remove_id_from_mutex_synchronized_block(client_id)
+        remove_id_from_mutex_synchronized_block(client_id, nil, false, :error)
       }
       #       push_to_client(client_id, client_queue, msg, err)
       deliver_queue_event(client_queue, [client_id, Resolver::EventType::ERROR, msg, err])
@@ -1422,7 +1446,9 @@ module Dnsruby
 
     def cancel_queries_for_queue_synchronized(client_queue)
       ids = @@queries_by_queue[client_queue]
-      ids.to_a.each { |id| remove_id_from_mutex_synchronized_block(id) } if ids
+      # These attempts are stopped because another answer won or the lookup
+      # finished, so record them as superseded rather than failed.
+      ids.to_a.each { |id| remove_id_from_mutex_synchronized_block(id, nil, false, :superseded) } if ids
     end
     private :cancel_queries_for_queue_synchronized
 

@@ -87,6 +87,7 @@ TESTS = %w(
     ptrin
     question
     query_control
+    query_diagnostics
     res_config
     res_file
     res_opt

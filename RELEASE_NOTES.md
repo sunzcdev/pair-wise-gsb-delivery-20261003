@@ -173,6 +173,16 @@ inside labels distinct from the dots that separate labels.
   sequence, permit up to 99 unsigned messages between signatures and reject
   decreasing signed timestamps. Reusing a ZoneTransfer gives each request a
   fresh signing time unless one was set explicitly.
+* Optional query diagnostics archive one lookup's stages so troubleshooting can
+  tell whether a local hosts file, a cache, a UDP/TCP attempt or local DNSSEC
+  validation produced the result. `Dnsruby::Diagnostics.capture` (or a
+  `Resolver#diagnostics=` recorder) emits payload-free events with only the
+  question identity, a result category and, for spans that really ran, a
+  measured duration. Stages can be selected, events are capped with a truncation
+  marker, and a raising listener never changes how the query is processed.
+  Retries share the original `query_id` but receive their own `attempt_id`, and
+  synchronous and asynchronous callers classify completions the same way. See
+  [query diagnostics](README.md#query-diagnostics).
 
 ### Authentication, DNSSEC and caching
 

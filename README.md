@@ -90,6 +90,7 @@ Dnsruby::IPv6.create('2001:DB8::1').to_s_canonical # => '2001:db8::1'
 ## Features
 
 - DNSSEC validation.
+- Opt-in, bounded query diagnostics (hosts, cache, UDP/TCP attempts and validation).
 - Zone transfers (AXFR and IXFR), including TSIG-signed transfers.
 - Dynamic updates, including TSIG-signed updates.
 - Unknown record types through the generic record API (RFC 3597).
@@ -351,6 +352,51 @@ records = transfer.transfer('example.org')
 Transfers handle partial reads and writes, check that replies match the request,
 and require matching opening and closing SOA records. Multi-message TSIG
 verification remains supported.
+
+### Query diagnostics
+
+Troubleshooting a lookup often needs to know **which layer answered**: a local
+hosts file, a response cache, a UDP or TCP attempt, or local DNSSEC validation.
+Dnsruby can record a bounded, payload-free trace of those stages:
+
+```ruby
+recorder = Dnsruby::Diagnostics::Recorder.new(
+  stages: [:hosts, :cache, :attempt, :validation, :terminal],
+  max_events: 64,
+  listener: ->(event) { warn "#{event.stage}/#{event.outcome}" }
+)
+
+resolver = Dnsruby::Resolver.new
+resolver.diagnostics = recorder
+Dnsruby::Diagnostics.capture(recorder: recorder) do
+  resolver.query('example.com')
+end
+
+recorder.events.each { |e| puts [e.stage, e.outcome, e.transport, e.elapsed].inspect }
+```
+
+Each `Event` carries only the question identity (`qname`, `qtype`, `qclass`), a
+result category (`outcome`), an optional `server`/`port`/`transport`, and an
+`elapsed` duration for a span that actually ran. Wire bytes, TSIG material and
+answer payloads are never recorded. Stages that did not run emit nothing, so no
+duration is invented for them.
+
+A retry, whether scheduled or triggered by truncation or a FORMERR, belongs to
+the original logical query: retries share `query_id` but each receives its own
+`attempt_id`. A UDP attempt made truncated is reported as `:truncated` and the
+TCP retry that follows as a new attempt.
+
+`stages:` selects the stages of interest. Events are capped by `max_events`;
+beyond the cap they are dropped and a single `:truncated` event reports how many
+were lost. The terminal event is always retained. A `listener:` that raises is
+logged and ignored, and never changes how the query is processed. Terminal
+outcomes come from one classifier, so synchronous (`query`, `send_message`) and
+asynchronous (`send_async`) callers report the same category for the same
+completion.
+
+`Dnsruby::DNS#diagnostics=` and `Dnsruby::Resolv#diagnostics=` install the same
+recorder, letting a hosts miss and the DNS query it falls through to appear on
+one lookup chain.
 
 ## Unit tests
 

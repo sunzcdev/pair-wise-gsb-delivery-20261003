@@ -14,6 +14,7 @@
 # limitations under the License.
 # ++
 module Dnsruby
+require 'dnsruby/diagnostics'
 # == Dnsruby::Hosts class
 # Dnsruby::Hosts is a hostname resolver that uses the system hosts file
 # 
@@ -94,7 +95,9 @@ module Dnsruby
     # Iterates over all IP addresses for +name+ retrieved from the hosts file
     def each_address(name, &proc)
       lazy_initialize
-      if @name2addr.include?(name)
+      found = @name2addr.include?(name)
+      Dnsruby::Diagnostics.record_hosts(name, found)
+      if found
         @name2addr[name].each(&proc)
       end
     end

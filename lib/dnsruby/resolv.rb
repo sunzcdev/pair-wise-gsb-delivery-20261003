@@ -62,6 +62,15 @@ class Resolv
     @resolvers = resolvers
   end
 
+  # Install a diagnostics recorder on every DNS resolver this object uses. A
+  # hosts miss and the DNS query that follows it then report on one chain.
+  def diagnostics=(recorder)
+    @resolvers.each do |resolver|
+      resolver.diagnostics = recorder if resolver.respond_to?(:diagnostics=)
+    end
+    recorder
+  end
+
   # Looks up the first IP address for +name+
   def getaddress(name)
     addresses = getaddresses(name)
@@ -75,10 +84,14 @@ class Resolv
   # Looks up all IP addresses for +name+
   def getaddresses(name)
     return [name] if ADDRESS_REGEX.match(name)
-    @resolvers.each do |resolver|
-      addresses = []
-      resolver.each_address(name) { |address| addresses << address }
-      return addresses unless addresses.empty?
+    # A hosts probe and the DNS query it falls through to belong to one lookup.
+    # The diagnostics lookup scope is inert unless a recorder is active.
+    Dnsruby::Diagnostics.lookup do
+      @resolvers.each do |resolver|
+        addresses = []
+        resolver.each_address(name) { |address| addresses << address }
+        return addresses unless addresses.empty?
+      end
     end
     []
   end
@@ -117,6 +130,7 @@ class Resolv
   require 'dnsruby/cache'
   require 'dnsruby/DNS'
   require 'dnsruby/hosts'
+  require 'dnsruby/diagnostics'
   require 'dnsruby/message/message'
   require 'dnsruby/update'
   require 'dnsruby/zone_transfer'

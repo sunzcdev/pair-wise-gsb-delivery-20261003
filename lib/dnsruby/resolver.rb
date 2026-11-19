@@ -17,6 +17,7 @@
 
 require 'dnsruby/packet_sender'
 require 'dnsruby/recursor'
+require 'dnsruby/diagnostics'
 
 module Dnsruby
   #  == Description
@@ -203,6 +204,17 @@ module Dnsruby
     #  Message object to be passed in, which is already configured to the callers
     #  requirements.
     attr_accessor :do_validation
+
+    # An optional Dnsruby::Diagnostics::Recorder (or any compatible listener
+    # holder) for queries made through this Resolver. When nil, the recorder
+    # installed in the calling thread via Diagnostics.capture is used instead.
+    def diagnostics=(recorder)
+      @diagnostics = recorder
+    end
+
+    def diagnostics
+      @diagnostics
+    end
 
     #  --
     #  @TODO@ add load_balance? i.e. Target nameservers in a random, rather than pre-determined, order?
@@ -619,6 +631,7 @@ module Dnsruby
 
       #  Attributes
 
+      @diagnostics = nil
       #  do_validation tells the Resolver whether to try to validate the response
       #  with DNSSEC, including NSEC and NSEC3 proofs. Local validation defaults
       #  to false and is separate from requesting DNSSEC records.
@@ -1045,6 +1058,10 @@ module Dnsruby
         return
       end
 
+      # Attach the diagnostic chain before encoding and cache consultation so
+      # encode failures, cache hits and network attempts share one logical query.
+      chain = Dnsruby::Diagnostics.attach(msg, recorder: @parent.diagnostics)
+
       # According to RFC 6891, a UDP payload size >512 bytes requires an
       # EDNS OPT RR in the message.
       if @parent.udp_size > 512 && !msg.get_opt && !msg.send_raw && !msg.signed? && !msg.tsig
@@ -1062,6 +1079,7 @@ module Dnsruby
         end
       rescue EncodeError => err
         Dnsruby.log.error { "Can't encode " + msg.to_s + " : #{err}" }
+        Dnsruby::Diagnostics.finish(msg, nil, err)
         client_queue.push([client_query_id, nil, err])
         return
       end
@@ -1076,10 +1094,15 @@ module Dnsruby
           client_queue.push([client_query_id, nil, ArgumentError.new('Client query ID already in use')])
           return
         end
+        # Attach the diagnostic chain before cache consultation so a cache hit
+        # and a network attempt report on the same logical query.
         scope = response_cache_scope(msg)
         control = QueryControl.current
         control&.check!
+        chain = Dnsruby::Diagnostics.chain_for(msg)
         if (cached = cached_completion(msg, scope))
+          Dnsruby::Diagnostics.record_cache(chain, :hit)
+          Dnsruby::Diagnostics.finish(msg, cached[0], cached[1])
           client_queue.push([client_query_id, *cached])
           return client_query_id
         end
@@ -1210,6 +1233,7 @@ module Dnsruby
     #
     #  Sends the result to the client's queue, and removes the queue observer from the select thread
     def send_result(client_queue, client_query_id, select_queue, msg, error) # :nodoc: all
+      _query = @query_list[client_query_id]
       cache_completion(client_query_id, msg, error)
       stop_querying(client_query_id)
       @validation_queries.delete(client_query_id)
@@ -1220,7 +1244,9 @@ module Dnsruby
       #  Remove the query from all of the data structures
       @query_list.delete(client_query_id)
       #       }
-      #  Return the response to the client
+      #  Return the response to the client. The terminal diagnostic category is
+      #  emitted here so synchronous and asynchronous callers share one path.
+      Dnsruby::Diagnostics.finish(_query && _query[0], msg, error)
       client_queue.push([client_query_id, msg, error])
     rescue ClosedQueueError
       # The query and its observers are already removed. A closed client queue
