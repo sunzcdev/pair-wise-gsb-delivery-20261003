@@ -34,6 +34,9 @@ import dns.rdtypes.ANY.RRSIG
 import dns.rdtypes.IN.A
 import dns.rdtypes.IN.AAAA
 import dns.rdtypes.IN.APL
+import dns.rdtypes.mxbase
+import dns.rdtypes.nsbase
+import dns.rdtypes.txtbase
 import dns.rdtypes.util
 import dns.tokenizer
 import dns.ttl
@@ -1331,6 +1334,157 @@ class RdataTestCase(unittest.TestCase):
         base = rrsig.to_text()
         text = rrsig.to_styled_text(style)
         assert f'{base} ; alg = RSASHA256' == text
+
+
+class RdataUpgradeTestCase(unittest.TestCase):
+    def test_upgrade_registered_type(self):
+        # A private type is read as generic rdata; after a handler is
+        # registered, it can be explicitly upgraded.
+        UTXT = 64201
+
+        class UTXTImp(dns.rdtypes.txtbase.TXTBase):
+            """Test TXT-like record"""
+
+        wire = b"\x05hello\x05world"
+        generic = dns.rdata.from_wire(dns.rdataclass.IN, UTXT, wire, 0, len(wire))
+        self.assertIsInstance(generic, dns.rdata.GenericRdata)
+        self.assertEqual(generic.data, wire)
+        # There is no handler yet, so upgrading fails.
+        with self.assertRaises(dns.rdata.NoRdataClass):
+            dns.rdata.upgrade(generic)
+        # Snapshot the stable properties of the generic form.
+        text = generic.to_text()
+        digest = hash(generic)
+        dns.rdata.register_type(UTXTImp, UTXT, "UTXT")
+        upgraded = dns.rdata.upgrade(generic)
+        self.assertIsInstance(upgraded, UTXTImp)
+        self.assertEqual(upgraded.strings, (b"hello", b"world"))
+        self.assertEqual(upgraded.to_wire(), wire)
+        # The original object is not modified and remains stable.
+        self.assertIsInstance(generic, dns.rdata.GenericRdata)
+        self.assertEqual(generic.data, wire)
+        self.assertEqual(generic.to_text(), text)
+        self.assertEqual(hash(generic), digest)
+        # Upgrading preserves equality, hashing, and text round-trip.
+        self.assertEqual(generic, upgraded)
+        self.assertEqual(hash(generic), hash(upgraded))
+        again = dns.rdata.from_text(dns.rdataclass.IN, UTXT, text)
+        self.assertEqual(again, generic)
+        self.assertEqual(again.to_wire(), wire)
+        # Normal wire decoding is unaffected; it now uses the registered
+        # class directly.
+        direct = dns.rdata.from_wire(dns.rdataclass.IN, UTXT, wire, 0, len(wire))
+        self.assertIsInstance(direct, UTXTImp)
+        self.assertEqual(direct, upgraded)
+
+    def test_upgrade_non_generic_is_unchanged(self):
+        rdata = dns.rdata.from_text(dns.rdataclass.IN, dns.rdatatype.A, "1.2.3.4")
+        self.assertIs(dns.rdata.upgrade(rdata), rdata)
+
+    def test_upgrade_no_handler(self):
+        # 64999 is never registered.
+        generic = dns.rdata.GenericRdata(dns.rdataclass.IN, 64999, b"\x01\x02")
+        with self.assertRaises(dns.rdata.NoRdataClass):
+            dns.rdata.upgrade(generic)
+        self.assertEqual(generic.data, b"\x01\x02")
+
+    def test_upgrade_wrong_class(self):
+        # The handler is registered for class IN, so a class CH rdata of
+        # the same type cannot be upgraded.
+        UCLS = 64202
+
+        class UCLSImp(dns.rdtypes.txtbase.TXTBase):
+            """Test TXT-like record"""
+
+        dns.rdata.register_type(UCLSImp, UCLS, "UCLS")
+        generic = dns.rdata.GenericRdata(dns.rdataclass.CH, UCLS, b"\x05hello")
+        with self.assertRaises(dns.rdata.NoRdataClass):
+            dns.rdata.upgrade(generic)
+        self.assertEqual(generic.data, b"\x05hello")
+
+    def test_upgrade_malformed(self):
+        UA = 64203
+        dns.rdata.register_type(dns.rdtypes.IN.A.A, UA, "UA")
+        # Too short.
+        generic = dns.rdata.GenericRdata(dns.rdataclass.IN, UA, b"\x01\x02\x03")
+        with self.assertRaises(dns.exception.FormError):
+            dns.rdata.upgrade(generic)
+        # Too long; the trailing byte is not consumed.
+        generic = dns.rdata.GenericRdata(dns.rdataclass.IN, UA, b"\x01\x02\x03\x04\x05")
+        with self.assertRaises(dns.exception.FormError):
+            dns.rdata.upgrade(generic)
+        # The original opaque data is preserved.
+        self.assertEqual(generic.data, b"\x01\x02\x03\x04\x05")
+
+    def test_upgrade_compressed_name_refused(self):
+        UMX = 64204
+
+        class UMXImp(dns.rdtypes.mxbase.MXBase):
+            """Test MX-like record"""
+
+        dns.rdata.register_type(UMXImp, UMX, "UMX")
+        # The preference bytes happen to look like a root name, so the
+        # pointer would "decompress" against the wrong context.  The
+        # round-trip check detects this and refuses.
+        generic = dns.rdata.GenericRdata(dns.rdataclass.IN, UMX, b"\x00\x00\xc0\x00")
+        with self.assertRaises(dns.rdata.MessageContextRequired):
+            dns.rdata.upgrade(generic)
+        self.assertEqual(generic.data, b"\x00\x00\xc0\x00")
+        # A pointer that does not point backwards is also refused.
+        generic = dns.rdata.GenericRdata(dns.rdataclass.IN, UMX, b"\x00\x0a\xc0\x02")
+        with self.assertRaises(dns.rdata.MessageContextRequired):
+            dns.rdata.upgrade(generic)
+        self.assertEqual(generic.data, b"\x00\x0a\xc0\x02")
+
+    def test_upgrade_decompression_forbidden_refused(self):
+        UNS = 64205
+
+        class UNSImp(dns.rdtypes.nsbase.UncompressedNS):
+            """Test NS-like record"""
+
+        dns.rdata.register_type(UNSImp, UNS, "UNS")
+        generic = dns.rdata.GenericRdata(dns.rdataclass.IN, UNS, b"\xc0\x00")
+        with self.assertRaises(dns.rdata.MessageContextRequired):
+            dns.rdata.upgrade(generic)
+        self.assertEqual(generic.data, b"\xc0\x00")
+
+    def test_upgrade_with_origin(self):
+        UREL = 64206
+
+        class URELImp(dns.rdtypes.nsbase.UncompressedNS):
+            """Test NS-like record"""
+
+        dns.rdata.register_type(URELImp, UREL, "UREL")
+        wire = b"\x02ns\x07example\x03com\x00"
+        generic = dns.rdata.GenericRdata(dns.rdataclass.IN, UREL, wire)
+        origin = dns.name.from_text("example.com.")
+        upgraded = dns.rdata.upgrade(generic, origin=origin)
+        self.assertIsInstance(upgraded, URELImp)
+        self.assertEqual(upgraded.target, dns.name.from_text("ns", None))
+        self.assertEqual(upgraded.to_wire(origin=origin), wire)
+        self.assertEqual(upgraded.to_text(origin=origin), "ns")
+        # Without the origin, the name is absolute.
+        upgraded = dns.rdata.upgrade(generic)
+        self.assertEqual(upgraded.target, dns.name.from_text("ns.example.com."))
+
+    def test_upgrade_bad_origin(self):
+        generic = dns.rdata.GenericRdata(dns.rdataclass.IN, 64998, b"\x00")
+        with self.assertRaises(ValueError):
+            dns.rdata.upgrade(generic, origin="example.com")
+
+    def test_upgrade_rdcomment_preserved(self):
+        UCMT = 64207
+
+        class UCMTImp(dns.rdtypes.txtbase.TXTBase):
+            """Test TXT-like record"""
+
+        generic = dns.rdata.from_text(dns.rdataclass.IN, UCMT, r"\# 2 0102 ; hello")
+        self.assertIsInstance(generic, dns.rdata.GenericRdata)
+        self.assertIsNotNone(generic.rdcomment)
+        dns.rdata.register_type(UCMTImp, UCMT, "UCMT")
+        upgraded = dns.rdata.upgrade(generic)
+        self.assertIsInstance(upgraded, UCMTImp)
+        self.assertEqual(upgraded.rdcomment, generic.rdcomment)
 
 
 class UtilTestCase(unittest.TestCase):

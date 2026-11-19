@@ -12,3 +12,4 @@ Miscellaneous Rdata Functions
 
 .. autofunction:: dns.rdata.register_type
 .. autofunction:: dns.rdata.load_all_types
+.. autofunction:: dns.rdata.upgrade

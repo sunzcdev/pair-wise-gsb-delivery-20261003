@@ -54,6 +54,14 @@ dns.query Exceptions
 .. autoexception:: dns.query.UnexpectedSource
 .. autoexception:: dns.query.TransferError
 
+dns.rdata Exceptions
+--------------------
+
+.. autoexception:: dns.rdata.MessageContextRequired
+.. autoexception:: dns.rdata.NoRdataClass
+.. autoexception:: dns.rdata.NoRelativeRdataOrdering
+.. autoexception:: dns.rdata.RdatatypeExists
+
 
 dns.rcode Exceptions
 --------------------

@@ -1072,3 +1072,99 @@ def register_type(
         impclass = getattr(implementation, rdtype_text.replace("-", "_"))
     _rdata_classes[(rdclass, rdtype)] = impclass
     dns.rdatatype.register_type(rdtype, rdtype_text, is_singleton)
+
+
+class NoRdataClass(dns.exception.DNSException):
+    """An rdata upgrade was attempted, but no type-specific rdata class
+    is registered for the rdata's class and type."""
+
+
+class MessageContextRequired(dns.exception.DNSException):
+    """An rdata upgrade was attempted, but the rdata cannot be faithfully
+    interpreted without the context of the message it was originally read
+    from, e.g. because it contains compressed names."""
+
+
+def upgrade(rdata: Rdata, origin: dns.name.Name | None = None) -> Rdata:
+    """Upgrade a generic rdata to a type-specific rdata, if possible.
+
+    When dnspython reads an rdata for which it has no type-specific
+    implementation, it uses :py:class:`dns.rdata.GenericRdata`, which treats
+    the rdata as opaque bytes.  If a type-specific implementation is
+    subsequently registered, e.g. with :py:func:`dns.rdata.register_type`,
+    this function may be used to explicitly re-parse the opaque data,
+    returning a new, type-specific rdata object.  The original rdata is
+    never modified, so its hash, equality relationships, and text and wire
+    forms remain stable.
+
+    The upgrade is checked strictly: a type-specific implementation must
+    be registered for the rdata's class and type, the opaque data must be
+    well-formed and consumed exactly and in full, and the type-specific
+    form must re-serialize to exactly the original opaque bytes (using
+    *origin*, if specified).  If any check fails, an exception is raised
+    and the original opaque data is left untouched; a truncated or altered
+    value is never returned.
+
+    Opaque data that appears to contain compressed names is not
+    interpreted on its own, as decompression requires the context of the
+    message the rdata was originally read from.  If such data is
+    encountered, :py:exc:`dns.rdata.MessageContextRequired` is raised.
+
+    :param rdata: The rdata to upgrade.  If it is not a
+        :py:class:`dns.rdata.GenericRdata`, it is already as specific as
+        possible and is returned unchanged.
+    :type rdata: :py:class:`dns.rdata.Rdata`
+    :param origin: The origin to use for relativizing names when
+        re-parsing, and for derelativizing them when checking the
+        re-serialized form.
+    :type origin: :py:class:`dns.name.Name` or ``None``
+    :raises dns.rdata.NoRdataClass: No type-specific implementation is
+        registered for the rdata's class and type.
+    :raises dns.rdata.MessageContextRequired: The opaque data cannot be
+        faithfully interpreted without the original message context.
+    :raises dns.exception.FormError: The opaque data is not well-formed
+        for the registered type.
+    :returns: The upgraded rdata.
+    :rtype: :py:class:`dns.rdata.Rdata`
+    """
+    if not isinstance(rdata, GenericRdata):
+        # The rdata is already as specific as we can make it.
+        return rdata
+    if origin is not None and not isinstance(origin, dns.name.Name):
+        raise ValueError("origin must be a dns.name.Name or None")
+    cls = get_rdata_class(rdata.rdclass, rdata.rdtype, False)
+    if cls is None or cls is GenericRdata:
+        raise NoRdataClass(
+            "no type-specific rdata class is registered for class "
+            + dns.rdataclass.to_text(rdata.rdclass)
+            + " type "
+            + dns.rdatatype.to_text(rdata.rdtype)
+        )
+    parser = dns.wire.Parser(rdata.data)
+    try:
+        with dns.exception.ExceptionWrapper(dns.exception.FormError):
+            with parser.restrict_to(len(rdata.data)):
+                upgraded = cls.from_wire_parser(
+                    rdata.rdclass, rdata.rdtype, parser, origin
+                )
+    except (dns.name.BadPointer, dns.name.DecompressionForbidden) as e:
+        # The data appears to contain compressed names, which cannot be
+        # interpreted without the message the rdata was read from.
+        raise MessageContextRequired(
+            "the rdata contains compressed names and cannot be "
+            "interpreted without the original message context"
+        ) from e
+    # Verify that the type-specific form re-serializes to exactly the
+    # original opaque bytes.  This catches data we cannot faithfully
+    # represent, e.g. compressed names that decompressed "successfully"
+    # against the wrong context, or non-canonical encodings that would
+    # otherwise be silently altered or truncated.
+    rewired = upgraded.to_wire(origin=origin)
+    if rewired != rdata.data:
+        raise MessageContextRequired(
+            "the rdata does not re-serialize to its original form and "
+            "cannot be interpreted without the original message context"
+        )
+    if rdata.rdcomment is not None:
+        object.__setattr__(upgraded, "rdcomment", rdata.rdcomment)
+    return upgraded
