@@ -239,6 +239,41 @@ class Server:
                 extra={"color_message": color_message},
             )
 
+    def reload_ssl_context(self) -> None:
+        """Reload the TLS certificate chain without restarting the server.
+
+        The SSL configuration is fully re-read and validated first; if it is
+        invalid (for example the certificate and private key do not match), an
+        exception is raised and the previously loaded certificate keeps being
+        served. Existing connections are unaffected — only new TLS handshakes
+        use the reloaded certificate. ALPN and client-certificate verification
+        settings are preserved.
+
+        Update `config.ssl_certfile`/`config.ssl_keyfile` (or replace the files
+        they point to) before calling this method.
+        """
+        config = self.config
+        live_context = getattr(config, "ssl", None)  # `config.ssl` is set by `config.load()`.
+        if not config.is_ssl or live_context is None:
+            raise RuntimeError("Cannot reload the TLS certificate: SSL is not configured on this server.")
+        if config.ssl_certfile is None:
+            raise RuntimeError(
+                "Cannot reload the TLS certificate: `ssl_certfile` is not set on the config. "
+                "Reloading is only supported when the certificate chain is provided via `ssl_certfile`."
+            )
+        # Fully build and validate a fresh context from the current
+        # configuration. This re-reads the certificate and key files and
+        # verifies that they match, so an invalid update is reported here and
+        # the live context is left untouched.
+        config.build_ssl_context()
+        # Apply the validated certificate chain to the live context in place.
+        # The listening sockets hold a reference to this exact context object, so
+        # new handshakes pick up the new certificate while connections that
+        # already completed their handshake keep their negotiated state.
+        get_password = (lambda: config.ssl_keyfile_password) if config.ssl_keyfile_password else None
+        live_context.load_cert_chain(config.ssl_certfile, config.ssl_keyfile, get_password)
+        logger.info("Reloaded TLS certificate from '%s'.", config.ssl_certfile)
+
     async def main_loop(self) -> None:
         counter = 0
         should_exit = await self.on_tick(counter)

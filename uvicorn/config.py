@@ -435,23 +435,16 @@ class Config:
             logger.error("Error loading ASGI app. %s" % exc)
             sys.exit(STARTUP_FAILURE)
 
-    def load(self) -> None:
-        assert not self.loaded
+    def build_ssl_context(self) -> ssl.SSLContext:
+        """Build and validate a new ``SSLContext`` from the current SSL settings.
 
-        if self.http2:
-            if self.http != "zttp":
-                raise ValueError(
-                    "HTTP/2 requires the `zttp` HTTP protocol. Install it with `pip install zttp`, then select it "
-                    "with `http='zttp'`. See https://uvicorn.dev/concepts/http2/ for more information."
-                )
-            http_protocol_class = import_from_string("uvicorn.protocols.http.auto_zttp_impl:AutoZttpProtocol")
-            self.http_protocol_class: type[asyncio.Protocol] = http_protocol_class
-        elif isinstance(self.http, str):
-            self.http_protocol_class = import_from_string(HTTP_PROTOCOLS.get(self.http, self.http))
-        else:
-            self.http_protocol_class = self.http
-
-        alpn_protocols: list[str] | None = getattr(self.http_protocol_class, "alpn_protocols", None)
+        The certificate and key files are fully read and checked (e.g. that the
+        certificate matches the private key), so any problem is raised here,
+        before the context is put to use.
+        """
+        alpn_protocols: list[str] | None = getattr(
+            getattr(self, "http_protocol_class", None), "alpn_protocols", None
+        )
 
         if self.ssl_context_factory is not None:
 
@@ -476,19 +469,38 @@ class Config:
             context = self.ssl_context_factory(self, default_factory)
             if not isinstance(context, ssl.SSLContext):
                 raise TypeError(f"`ssl_context_factory` must return an `ssl.SSLContext`, got {type(context).__name__}")
-            self.ssl: ssl.SSLContext | None = context
-        elif self.is_ssl:
-            assert self.ssl_certfile
-            self.ssl = create_ssl_context(
-                keyfile=self.ssl_keyfile,
-                certfile=self.ssl_certfile,
-                password=self.ssl_keyfile_password,
-                ssl_version=self.ssl_version,
-                cert_reqs=self.ssl_cert_reqs,
-                ca_certs=self.ssl_ca_certs,
-                ciphers=self.ssl_ciphers,
-                alpn_protocols=alpn_protocols,
-            )
+            return context
+
+        assert self.ssl_certfile
+        return create_ssl_context(
+            keyfile=self.ssl_keyfile,
+            certfile=self.ssl_certfile,
+            password=self.ssl_keyfile_password,
+            ssl_version=self.ssl_version,
+            cert_reqs=self.ssl_cert_reqs,
+            ca_certs=self.ssl_ca_certs,
+            ciphers=self.ssl_ciphers,
+            alpn_protocols=alpn_protocols,
+        )
+
+    def load(self) -> None:
+        assert not self.loaded
+
+        if self.http2:
+            if self.http != "zttp":
+                raise ValueError(
+                    "HTTP/2 requires the `zttp` HTTP protocol. Install it with `pip install zttp`, then select it "
+                    "with `http='zttp'`. See https://uvicorn.dev/concepts/http2/ for more information."
+                )
+            http_protocol_class = import_from_string("uvicorn.protocols.http.auto_zttp_impl:AutoZttpProtocol")
+            self.http_protocol_class: type[asyncio.Protocol] = http_protocol_class
+        elif isinstance(self.http, str):
+            self.http_protocol_class = import_from_string(HTTP_PROTOCOLS.get(self.http, self.http))
+        else:
+            self.http_protocol_class = self.http
+
+        if self.is_ssl:
+            self.ssl: ssl.SSLContext | None = self.build_ssl_context()
         else:
             self.ssl = None
 
