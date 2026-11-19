@@ -1429,6 +1429,123 @@ module Net
     #
     attr_accessor verify_hostname: untyped
 
+    # <!-- rdoc-file=lib/net/http.rb -->
+    # Sets whether the proxy uses SSL; see [Layered TLS Through a
+    # Proxy](rdoc-ref:Net::HTTP@Layered+TLS+Through+a+Proxy).
+    #
+    attr_writer proxy_use_ssl: untyped
+
+    # <!--
+    #   rdoc-file=lib/net/http.rb
+    #   - proxy_use_ssl?()
+    # -->
+    # Returns `true` if the connection to the proxy itself uses TLS, `false`
+    # otherwise; see [Layered TLS Through a
+    # Proxy](rdoc-ref:Net::HTTP@Layered+TLS+Through+a+Proxy).
+    #
+    def proxy_use_ssl?: () -> bool
+
+    # <!-- rdoc-file=lib/net/http.rb -->
+    # Sets or returns the `OpenSSL::SSL::SSLContext` used for the TLS connection to
+    # the proxy.
+    #
+    # It is completely separate from the context used for the target connection,
+    # which is built from #ca_file, #cert, #verify_mode and the other target
+    # options. The proxy hop has its own CA, client certificate and session cache.
+    #
+    # A context assigned here is used as-is (for example its `session_new_cb`,
+    # `ca_file` and `cert`), so configure it before starting the connection;
+    # `Net::HTTP` never merges the target options into it. While it is `nil` (the
+    # default), a fresh context is derived for each connection from the `proxy_*`
+    # options below, starting from `OpenSSL::SSL::SSLContext.new` rather than from
+    # target settings.
+    #
+    attr_accessor proxy_ssl_context: untyped
+
+    # <!-- rdoc-file=lib/net/http.rb -->
+    # Sets or returns the server name (SNI) sent to the proxy during the proxy TLS
+    # handshake.
+    #
+    # It defaults to the proxy host. It is never reused as the server name of the
+    # target handshake, and the target #address is never sent to the proxy.
+    #
+    attr_accessor proxy_ssl_server_name: String?
+
+    # <!-- rdoc-file=lib/net/http.rb -->
+    # Sets or returns whether the proxy certificate is checked against
+    # #proxy_ssl_server_name.
+    #
+    # It defaults to the `OpenSSL::SSL::SSLContext` default for the proxy context
+    # and is never taken from the target's #verify_hostname. It has no effect
+    # unless the proxy certificate is verified.
+    #
+    attr_accessor proxy_verify_hostname: untyped
+
+    # <!-- rdoc-file=lib/net/http.rb -->
+    # Sets or returns the number of seconds to wait for the proxy TLS handshake;
+    # defaults to #open_timeout.
+    #
+    # It is separate from #open_timeout so that a slow proxy does not consume the
+    # budget meant for the target handshake, and it applies only to the proxy hop.
+    #
+    attr_accessor proxy_open_timeout: Float | Integer | nil
+
+    # <!-- rdoc-file=lib/net/http.rb -->
+    # Sets the TLS parameters used for the connection to the proxy.
+    #
+    # Each `proxy_XXX` attribute behaves like the same-named target accessor
+    # (#ca_file, #ca_path, #cert, #cert_store, #ciphers, #extra_chain_cert, #key,
+    # #ssl_timeout, #ssl_version, #min_version, #max_version, #verify_callback,
+    # #verify_depth, #verify_mode), but applies to the proxy hop only. Attributes
+    # left `nil` keep the proxy context's own value, independently of the target
+    # configuration.
+    #
+    # Note that the proxy hop does not go through
+    # `OpenSSL::SSL::SSLContext#set_params`, so it does not inherit the target's
+    # defaults: an unconfigured proxy hop behaves exactly as before (no
+    # verification), while #proxy_verify_mode = VERIFY_PEER enables it.
+    #
+    attr_accessor proxy_ca_file: untyped
+
+    attr_accessor proxy_ca_path: untyped
+
+    attr_accessor proxy_cert: untyped
+
+    attr_accessor proxy_cert_store: untyped
+
+    attr_accessor proxy_ciphers: untyped
+
+    attr_accessor proxy_extra_chain_cert: untyped
+
+    attr_accessor proxy_key: untyped
+
+    attr_accessor proxy_ssl_timeout: untyped
+
+    attr_accessor proxy_ssl_version: untyped
+
+    attr_accessor proxy_min_version: untyped
+
+    attr_accessor proxy_max_version: untyped
+
+    attr_accessor proxy_verify_callback: untyped
+
+    attr_accessor proxy_verify_depth: untyped
+
+    attr_accessor proxy_verify_mode: untyped
+
+    # <!--
+    #   rdoc-file=lib/net/http.rb
+    #   - last_connect_stage()
+    # -->
+    # Returns the layer whose establishment failed in the most recent connection
+    # attempt, or `nil` if the attempt succeeded.
+    #
+    # The value is one of `:transport`, `:proxy_tls`, `:proxy_connect` or
+    # `:target_tls`; see [Layered TLS Through a
+    # Proxy](rdoc-ref:Net::HTTP@Layered+TLS+Through+a+Proxy).
+    #
+    def last_connect_stage: () -> Symbol?
+
     # <!--
     #   rdoc-file=lib/net/http.rb
     #   - peer_cert()
@@ -1491,7 +1608,7 @@ module Net
     # This class is obsolete.  You may pass these same parameters directly to
     # Net::HTTP.new.  See Net::HTTP.new for details of the arguments.
     #
-    def self.Proxy: (?interned p_addr, ?Integer? p_port, ?String? p_user, ?String? p_pass) -> untyped
+    def self.Proxy: (?interned p_addr, ?Integer? p_port, ?String? p_user, ?String? p_pass, ?bool p_use_ssl) -> untyped
 
     # <!--
     #   rdoc-file=lib/net/http.rb

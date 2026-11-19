@@ -29,6 +29,20 @@ module Net
     include HTTPExceptions
   end
 
+  # :stopdoc:
+  # Mixed into exceptions raised while a connection is being established, so
+  # that the failing layer can be attributed: +:transport+, +:proxy_tls+,
+  # +:proxy_connect+ or +:target_tls+.
+  #
+  # The exception object keeps its original class (and, for an HTTP error,
+  # its +response+), so existing rescue clauses keep working; only this
+  # diagnostic is added.  The same value is available from
+  # Net::HTTP#last_connect_stage.
+  module HTTPConnectStage
+    attr_reader :stage
+  end
+  # :startdoc:
+
   # We cannot use the name "HTTPServerError", it is the name of the response.
   HTTPServerException = HTTPClientException # :nodoc:
   deprecate_constant(:HTTPServerException)

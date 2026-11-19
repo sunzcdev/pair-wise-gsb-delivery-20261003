@@ -431,6 +431,61 @@ module Net   #:nodoc:
   #     http = Net::HTTP.new('example.com', nil, 'my.proxy', 8000, 'pname', 'ppass', 'my.proxy,proxy.example:8000')
   #     http.proxy_address # => nil
   #
+  # == Layered TLS Through a Proxy
+  #
+  # An HTTPS request made through an HTTPS proxy carries two independent
+  # TLS sessions on a single connection.  \Net::HTTP configures them as two
+  # separate layers, each with its own options, and reports which layer
+  # failed:
+  #
+  #   http = Net::HTTP.new('target.example', 443, 'proxy.example', 8443, 'pname', 'ppass')
+  #   http.use_ssl = true
+  #   http.cert_store = target_store        # verifies target.example
+  #   http.proxy_use_ssl = true
+  #   http.proxy_cert_store = proxy_store   # verifies proxy.example only
+  #   http.proxy_cert = proxy_client_cert   # sent to the proxy only
+  #   http.proxy_ssl_server_name = 'proxy.example'
+  #   http.start
+  #
+  # The order of operations is fixed:
+  #
+  # 1. <tt>:transport</tt>: the TCP connection to the proxy.
+  # 2. <tt>:proxy_tls</tt>: the TLS handshake with the proxy, using the
+  #    +proxy_ssl_*+ options (or #proxy_ssl_context).
+  # 3. <tt>:proxy_connect</tt>: the +CONNECT+ request.  Its response is read
+  #    as \HTTP; a non-success response raises Net::HTTPClientException (or
+  #    another HTTP error) carrying the proxy response, and no target TLS
+  #    byte is produced: the proxy reply body is never read as a handshake.
+  # 4. <tt>:target_tls</tt>: the TLS handshake with the target through the
+  #    tunnel, using the target options (#ca_file, #cert, #verify_mode, ...)
+  #    and the target server name.
+  #
+  # Each layer owns its CA store, client certificate, ciphers and session
+  # cache; a proxy session is never resumed for the target and a target
+  # session is never sent to the proxy.  The proxy server name
+  # (#proxy_ssl_server_name, by default the proxy host) is used for the proxy
+  # SNI and for #proxy_verify_hostname; the target certificate is checked
+  # against the target #address only.  Neither layer's name is used for the
+  # other's certificate verification.
+  #
+  # A target TLS session inside a proxy TLS session cannot be nested in
+  # OpenSSL, so \Net::HTTP runs it against one end of a local socket pair and
+  # copies bytes both ways.  That relay is created for this connection only
+  # and is closed with it.
+  #
+  # If connecting fails, the original exception class is raised, extended
+  # with Net::HTTPConnectStage so that its +stage+ reports which layer failed;
+  # the same value is available afterwards from #last_connect_stage.  Only the
+  # resources acquired by that attempt are released, in reverse order: the TCP
+  # connection, the proxy TLS session, the relay, and the target TLS session.
+  # The previous connection (if any) and any resource the attempt did not
+  # create are left untouched, and a half-built socket is never published as
+  # the connection.
+  #
+  # The proxy credentials are used for the +CONNECT+ request only.  They are
+  # never added to a request sent through the tunnel, and the +CONNECT+
+  # exchange is not echoed into the debug output.
+  #
   # == Compression and Decompression
   #
   # \Net::HTTP does not compress the body of a request before sending.
@@ -622,6 +677,36 @@ module Net   #:nodoc:
   #   Returns the proxy user name.
   # - {:proxy_user=}[rdoc-ref:Net::HTTP#proxy_user=]:
   #   Sets the proxy user.
+  #
+  # === Layered TLS
+  #
+  # These apply only to the connection to the proxy itself; see
+  # {Layered TLS Through a Proxy}[rdoc-ref:Net::HTTP@Layered+TLS+Through+a+Proxy].
+  #
+  # - {#proxy_use_ssl?}[rdoc-ref:Net::HTTP#proxy_use_ssl?]:
+  #   Returns whether the connection to the proxy itself uses TLS.
+  # - {:proxy_use_ssl=}[rdoc-ref:Net::HTTP#proxy_use_ssl=]:
+  #   Sets whether the connection to the proxy itself uses TLS.
+  # - {:proxy_ssl_context}[rdoc-ref:Net::HTTP#proxy_ssl_context]:
+  #   Returns the TLS context used for the proxy hop only.
+  # - {:proxy_ssl_context=}[rdoc-ref:Net::HTTP#proxy_ssl_context=]:
+  #   Sets the TLS context used for the proxy hop only.
+  # - {:proxy_ssl_server_name}[rdoc-ref:Net::HTTP#proxy_ssl_server_name]:
+  #   Returns the server name sent to the proxy.
+  # - {:proxy_ssl_server_name=}[rdoc-ref:Net::HTTP#proxy_ssl_server_name=]:
+  #   Sets the server name sent to the proxy.
+  # - {:proxy_verify_hostname}[rdoc-ref:Net::HTTP#proxy_verify_hostname]:
+  #   Returns whether the proxy certificate name is checked.
+  # - {:proxy_verify_hostname=}[rdoc-ref:Net::HTTP#proxy_verify_hostname=]:
+  #   Sets whether the proxy certificate name is checked.
+  # - {:proxy_ca_file}[rdoc-ref:Net::HTTP#proxy_ca_file],
+  #   {:proxy_cert}[rdoc-ref:Net::HTTP#proxy_cert],
+  #   {:proxy_key}[rdoc-ref:Net::HTTP#proxy_key],
+  #   {:proxy_verify_mode}[rdoc-ref:Net::HTTP#proxy_verify_mode],
+  #   and the other +proxy_*+ TLS options mirror the target ones for the
+  #   proxy hop only.
+  # - {#last_connect_stage}[rdoc-ref:Net::HTTP#last_connect_stage]:
+  #   Returns the layer in which the last connection attempt failed.
   #
   # === Security
   #
@@ -1098,7 +1183,9 @@ module Net   #:nodoc:
     #   http.port # => 8000
     #
     # For proxy-defining arguments +p_addr+ through +p_no_proxy+,
-    # see {Proxy Server}[rdoc-ref:Net::HTTP@Proxy+Server].
+    # see {Proxy Server}[rdoc-ref:Net::HTTP@Proxy+Server]; +p_use_ssl+ makes
+    # the connection to the proxy itself use TLS, see
+    # {Layered TLS Through a Proxy}[rdoc-ref:Net::HTTP@Layered+TLS+Through+a+Proxy].
     #
     def HTTP.new(address, port = nil, p_addr = :ENV, p_port = nil, p_user = nil, p_pass = nil, p_no_proxy = nil, p_use_ssl = nil)
       http = super address, port
@@ -1191,12 +1278,21 @@ module Net   #:nodoc:
       @proxy_user     = nil
       @proxy_pass     = nil
       @proxy_use_ssl  = nil
+      @proxy_ssl_context       = nil
+      @proxy_ssl_server_name   = nil
+      @proxy_ssl_session       = nil
 
       @use_ssl = false
       @ssl_context = nil
       @ssl_session = nil
       @sspi_enabled = false
+      @last_connect_stage = nil
+      @connection_chain = nil
+      @connect_peer_addr = nil
       SSL_IVNAMES.each do |ivname|
+        instance_variable_set ivname, nil
+      end
+      PROXY_SSL_IVNAMES.each do |ivname|
         instance_variable_set ivname, nil
       end
     end
@@ -1327,8 +1423,122 @@ module Net   #:nodoc:
     attr_writer :proxy_pass
 
     # Sets whether the proxy uses SSL;
-    # see {Proxy Server}[rdoc-ref:Net::HTTP@Proxy+Server].
+    # see {Layered TLS Through a Proxy}[rdoc-ref:Net::HTTP@Layered+TLS+Through+a+Proxy].
     attr_writer :proxy_use_ssl
+
+    # Returns +true+ if the connection to the proxy itself uses TLS,
+    # +false+ otherwise;
+    # see {Layered TLS Through a Proxy}[rdoc-ref:Net::HTTP@Layered+TLS+Through+a+Proxy].
+    def proxy_use_ssl?
+      !!@proxy_use_ssl
+    end
+
+    # Sets or returns the +OpenSSL::SSL::SSLContext+ used for the TLS
+    # connection to the proxy.
+    #
+    # It is completely separate from the context used for the target
+    # connection, which is built from #ca_file, #cert, #verify_mode and the
+    # other target options.  The proxy hop has its own CA, client certificate
+    # and session cache.
+    #
+    # A context assigned here is used as-is (for example its
+    # +session_new_cb+, +ca_file+ and +cert+), so configure it before
+    # starting the connection; \Net::HTTP never merges the target options into
+    # it.  While it is +nil+ (the default), a fresh context is derived for
+    # each connection from the +proxy_*+ options below, starting from
+    # +OpenSSL::SSL::SSLContext.new+ rather than from target settings.
+    attr_accessor :proxy_ssl_context
+
+    # Sets or returns the server name (SNI) sent to the proxy during the
+    # proxy TLS handshake.
+    #
+    # It defaults to the proxy host.  It is never reused as the server name
+    # of the target handshake, and the target #address is never sent to the
+    # proxy.
+    attr_reader :proxy_ssl_server_name
+
+    def proxy_ssl_server_name=(server_name)
+      @proxy_ssl_server_name = server_name
+    end
+
+    # Sets or returns whether the proxy certificate is checked against
+    # #proxy_ssl_server_name.
+    #
+    # It defaults to the +OpenSSL::SSL::SSLContext+ default for the proxy
+    # context and is never taken from the target's #verify_hostname.  It has
+    # no effect unless the proxy certificate is verified.
+    attr_accessor :proxy_verify_hostname
+
+    # Sets or returns the number of seconds to wait for the proxy TLS
+    # handshake; defaults to #open_timeout.
+    #
+    # It is separate from #open_timeout so that a slow proxy does not consume
+    # the budget meant for the target handshake, and it applies only to the
+    # proxy hop.
+    attr_accessor :proxy_open_timeout
+
+    # Sets the TLS parameters used for the connection to the proxy.
+    #
+    # Each +proxy_XXX+ attribute behaves like the same-named target accessor
+    # (#ca_file, #ca_path, #cert, #cert_store, #ciphers, #extra_chain_cert,
+    # #key, #ssl_timeout, #ssl_version, #min_version, #max_version,
+    # #verify_callback, #verify_depth, #verify_mode), but applies to the
+    # proxy hop only.  Attributes left +nil+ keep the proxy context's own
+    # value, independently of the target configuration.
+    #
+    # Note that the proxy hop does not go through
+    # +OpenSSL::SSL::SSLContext#set_params+, so it does not inherit the
+    # target's defaults: an unconfigured proxy hop behaves exactly as before
+    # (no verification), while #proxy_verify_mode = VERIFY_PEER enables it.
+    attr_accessor :proxy_ca_file
+    attr_accessor :proxy_ca_path
+    attr_accessor :proxy_cert
+    attr_accessor :proxy_cert_store
+    attr_accessor :proxy_ciphers
+    attr_accessor :proxy_extra_chain_cert
+    attr_accessor :proxy_key
+    attr_accessor :proxy_ssl_timeout
+    attr_accessor :proxy_ssl_version
+    attr_accessor :proxy_min_version
+    attr_accessor :proxy_max_version
+    attr_accessor :proxy_verify_callback
+    attr_accessor :proxy_verify_depth
+    attr_accessor :proxy_verify_mode
+
+    # The TLS options that exist on both layers; the +proxy_*+ accessors above
+    # apply them to the proxy hop only.
+    PROXY_SSL_ATTRIBUTES = [
+      :ca_file,
+      :ca_path,
+      :cert,
+      :cert_store,
+      :ciphers,
+      :extra_chain_cert,
+      :key,
+      :ssl_timeout,
+      :ssl_version,
+      :min_version,
+      :max_version,
+      :verify_callback,
+      :verify_depth,
+      :verify_mode,
+    ].freeze # :nodoc:
+
+    PROXY_SSL_IVNAMES = PROXY_SSL_ATTRIBUTES.map { |attr| :"@proxy_#{attr}" }.freeze # :nodoc:
+
+    # The layers of a connection, in order.  See
+    # {Layered TLS Through a Proxy}[rdoc-ref:Net::HTTP@Layered+TLS+Through+a+Proxy].
+    CONNECT_STAGES = [:transport, :proxy_tls, :proxy_connect, :target_tls].freeze # :nodoc:
+
+    # Returns the layer whose establishment failed in the most recent
+    # connection attempt, or +nil+ if the attempt succeeded.
+    #
+    # The value is one of +:transport+, +:proxy_tls+, +:proxy_connect+ or
+    # +:target_tls+; see
+    # {Layered TLS Through a Proxy}[rdoc-ref:Net::HTTP@Layered+TLS+Through+a+Proxy].
+    def last_connect_stage
+      @last_connect_stage
+    end
 
     # Returns the IP address for the connection.
     #
@@ -1350,7 +1560,22 @@ module Net   #:nodoc:
     #   http.finish
     #
     def ipaddr
-      started? ?  @socket.io.peeraddr[3] : @ipaddr
+      if started?
+        io = @socket.io
+        # A tunnel relay endpoint is a local socket pair end and has no peer
+        # of its own; the TCP peer seen at connect time is reported instead.
+        if io.respond_to?(:peeraddr)
+          begin
+            io.peeraddr[3]
+          rescue IOError, SystemCallError, NotImplementedError
+            @connect_peer_addr
+          end
+        else
+          @connect_peer_addr
+        end
+      else
+        @ipaddr
+      end
     end
 
     # Sets the IP address for the connection:
@@ -1688,6 +1913,10 @@ module Net   #:nodoc:
         # reference early to load OpenSSL before connecting,
         # as OpenSSL may take time to load.
         @ssl_context = OpenSSL::SSL::SSLContext.new
+        if proxy? and @proxy_use_ssl and @proxy_ssl_context.nil?
+          # reference early as well, for the same reason.
+          OpenSSL::SSL::SSLContext.new
+        end
       end
 
       if proxy? then
@@ -1698,113 +1927,387 @@ module Net   #:nodoc:
         conn_port = port
       end
 
+      # Everything this attempt owns, in the order it is acquired.  A failure
+      # closes exactly these resources, newest first, and never the previous
+      # connection.
+      owned = []
+      previous_socket = @socket
+      previous_chain = @connection_chain
+      @last_connect_stage = nil
+
       debug "opening connection to #{conn_addr}:#{conn_port}..."
-      begin
-        s = timeouted_connect(conn_addr, conn_port)
+      tcp_socket = begin
+        # Stage :transport -- the TCP connection.
+        timeouted_connect(conn_addr, conn_port)
       rescue => e
         if (defined?(IO::TimeoutError) && e.is_a?(IO::TimeoutError)) || e.is_a?(Errno::ETIMEDOUT)  # for compatibility with previous versions
           e = Net::OpenTimeout.new(e)
         end
-        raise e, "Failed to open TCP connection to " +
+        raise tag_connect_error(e, :transport), "Failed to open TCP connection to " +
           "#{conn_addr}:#{conn_port} (#{e.message})"
       end
-      s.setsockopt(Socket::IPPROTO_TCP, Socket::TCP_NODELAY, 1)
+      owned << tcp_socket
+      tcp_socket.setsockopt(Socket::IPPROTO_TCP, Socket::TCP_NODELAY, 1)
       debug "opened"
-      if use_ssl?
-        if proxy?
-          if @proxy_use_ssl
-            proxy_sock = OpenSSL::SSL::SSLSocket.new(s)
-            ssl_socket_connect(proxy_sock, @open_timeout)
-          else
-            proxy_sock = s
-          end
-          proxy_sock = BufferedIO.new(proxy_sock, read_timeout: @read_timeout,
-                                      write_timeout: @write_timeout,
-                                      continue_timeout: @continue_timeout,
-                                      debug_output: @debug_output)
-          if /[\r\n]/.match?("#{conn_address}:#{@port}")
-            raise ArgumentError, "address and port cannot include CR/LF"
-          end
-          if /[\r\n]/.match?(@address)
-            raise ArgumentError, "address cannot include CR/LF"
-          end
-          buf = +"CONNECT #{conn_address}:#{@port} HTTP/#{HTTPVersion}\r\n" \
-            "Host: #{@address}:#{@port}\r\n"
-          if proxy_user
-            credential = ["#{proxy_user}:#{proxy_pass}"].pack('m0')
-            buf << "Proxy-Authorization: Basic #{credential}\r\n"
-          end
-          buf << "\r\n"
-          proxy_sock.write(buf)
-          HTTPResponse.read_new(proxy_sock).value
-          # assuming nothing left in buffers after successful CONNECT response
-        end
-
-        ssl_parameters = Hash.new
-        iv_list = instance_variables
-        SSL_IVNAMES.each_with_index do |ivname, i|
-          if iv_list.include?(ivname)
-            value = instance_variable_get(ivname)
-            unless value.nil?
-              ssl_parameters[SSL_ATTRIBUTES[i]] = value
-            end
-          end
-        end
-        @ssl_context.set_params(ssl_parameters)
-        unless @ssl_context.session_cache_mode.nil? # a dummy method on JRuby
-          @ssl_context.session_cache_mode =
-              OpenSSL::SSL::SSLContext::SESSION_CACHE_CLIENT |
-                  OpenSSL::SSL::SSLContext::SESSION_CACHE_NO_INTERNAL_STORE
-        end
-        if @ssl_context.respond_to?(:session_new_cb) # not implemented under JRuby
-          @ssl_context.session_new_cb = proc {|sock, sess| @ssl_session = sess }
-        end
-
-        # Still do the post_connection_check below even if connecting
-        # to IP address
-        verify_hostname = @ssl_context.verify_hostname
-
-        # Server Name Indication (SNI) RFC 3546/6066
-        case @address
-        when IPV4_ADDRESS, IPV6_ADDRESS
-          # don't set SNI, as IP addresses in SNI is not valid
-          # per RFC 6066, section 3.
-
-          # Avoid openssl warning
-          @ssl_context.verify_hostname = false
-        else
-          ssl_host_address = @address
-        end
-
-        debug "starting SSL for #{conn_addr}:#{conn_port}..."
-        s = OpenSSL::SSL::SSLSocket.new(s, @ssl_context)
-        s.sync_close = true
-        s.hostname = ssl_host_address if s.respond_to?(:hostname=) && ssl_host_address
-
-        if @ssl_session and
-           Process.clock_gettime(Process::CLOCK_REALTIME) < @ssl_session.time.to_f + @ssl_session.timeout
-          s.session = @ssl_session
-        end
-        ssl_socket_connect(s, @open_timeout)
-        if (@ssl_context.verify_mode != OpenSSL::SSL::VERIFY_NONE) && verify_hostname
-          s.post_connection_check(@address)
-        end
-        debug "SSL established, protocol: #{s.ssl_version}, cipher: #{s.cipher[0]}"
+      proxy_peer_addr = begin
+        tcp_socket.peeraddr[3]
+      rescue IOError, SystemCallError, NotImplementedError
+        nil
       end
+
+      proxy_ssl_socket = nil
+      if use_ssl? and proxy? and @proxy_use_ssl
+        # Stage :proxy_tls -- the TLS handshake with the proxy, configured and
+        # verified with the proxy layer only.
+        proxy_ssl_socket = new_proxy_ssl_socket(tcp_socket)
+        owned << proxy_ssl_socket
+        debug "starting SSL for proxy #{conn_addr}:#{conn_port}..."
+        begin
+          ssl_socket_connect(proxy_ssl_socket, proxy_handshake_timeout)
+          proxy_check_name = proxy_hostname_check_name
+          if proxy_check_name
+            proxy_ssl_socket.post_connection_check(proxy_check_name)
+          end
+          debug "proxy SSL established, protocol: #{proxy_ssl_socket.ssl_version}, cipher: #{proxy_ssl_socket.cipher[0]}"
+        rescue => e
+          raise tag_connect_error(e, :proxy_tls),
+            "proxy TLS handshake with #{conn_addr}:#{conn_port} failed (#{e.message})"
+        end
+      end
+
+      tunnel_prefix = "".b
+      connect_response = nil
+      if use_ssl? and proxy?
+        # Stage :proxy_connect -- the CONNECT request, answered as plain HTTP
+        # on the transport (or on the proxy TLS session, if any).
+        proxy_io = proxy_ssl_socket || tcp_socket
+        begin
+          connect_response, tunnel_prefix = send_connect_request(proxy_io)
+        rescue Net::HTTPExceptions => e
+          # The proxy answered with a non-success status.  Its body is a proxy
+          # reply, never the beginning of a target TLS handshake, so nothing
+          # more is read and no target TLS byte is produced.
+          debug "proxy CONNECT refused: #{e.response.code} #{e.response.message}"
+          raise tag_connect_error(e, :proxy_connect),
+            "CONNECT to #{conn_address}:#{@port} through proxy " \
+            "#{conn_addr}:#{conn_port} failed: #{e.message}"
+        rescue => e
+          raise tag_connect_error(e, :proxy_connect),
+            "CONNECT to #{conn_address}:#{@port} through proxy " \
+            "#{conn_addr}:#{conn_port} failed (#{e.message})"
+        end
+        debug "proxy CONNECT succeeded: #{connect_response.code}"
+      end
+
+      if use_ssl?
+        target_io = tcp_socket
+        if proxy_ssl_socket
+          # OpenSSL cannot nest an SSLSocket in another SSLSocket.  Run the
+          # target TLS session against one end of a local socket pair and
+          # copy bytes both ways; the relay belongs to this connection only.
+          relay = TunnelRelay.new(proxy_ssl_socket, tunnel_prefix)
+          owned << relay
+          target_io = relay.io
+        elsif not tunnel_prefix.empty?
+          # A plain proxy transport: the TCP socket itself carries the
+          # tunnel, but bytes already read past the CONNECT response must be
+          # replayed before the target's own bytes.
+          relay = TunnelRelay.new(tcp_socket, tunnel_prefix)
+          owned << relay
+          target_io = relay.io
+        end
+
+        # Stage :target_tls -- the TLS handshake with the target, configured
+        # and verified with the target layer only.
+        s, target_verify_hostname = new_target_ssl_socket(target_io)
+        owned << s
+        begin
+          debug "starting SSL for #{conn_addr}:#{conn_port}..."
+          ssl_socket_connect(s, @open_timeout)
+          if (@ssl_context.verify_mode != OpenSSL::SSL::VERIFY_NONE) && target_verify_hostname
+            s.post_connection_check(@address)
+          end
+          debug "SSL established, protocol: #{s.ssl_version}, cipher: #{s.cipher[0]}"
+        rescue => e
+          raise tag_connect_error(e, :target_tls),
+            "target TLS handshake with #{@address}:#{@port} failed (#{e.message})"
+        end
+      else
+        s = tcp_socket
+      end
+
       @socket = BufferedIO.new(s, read_timeout: @read_timeout,
                                write_timeout: @write_timeout,
                                continue_timeout: @continue_timeout,
                                debug_output: @debug_output)
+      @connection_chain = owned.freeze
+      # The peer of the TCP connection (the proxy when there is one), as
+      # #ipaddr reported before; it is kept because the tunnel relay endpoint
+      # has no peer of its own.
+      @connect_peer_addr = proxy_peer_addr
       @last_communicated = nil
       on_connect
     rescue => exception
-      if s
-        debug "Conn close because of connect error #{exception}"
-        s.close
+      debug "Conn close because of connect error #{exception}"
+      # Only the resources this attempt owns; the previous connection (if
+      # any) is left untouched, and a half-built socket is never published.
+      # The socket published just before a later failure (for example in
+      # on_connect) wraps the newest resource here, so the chain covers it.
+      owned&.reverse_each do |resource|
+        close_quietly(resource)
       end
+      @socket = previous_socket
+      @connection_chain = previous_chain
       raise
     end
     private :connect
+    private :connect
+
+    # Builds the TLS socket of the proxy layer from the proxy options only.
+    #
+    # The target options and the target server name are never consulted: a
+    # proxy certificate is never checked against the target name, and the
+    # proxy SNI never carries the target name.
+    def new_proxy_ssl_socket(io)
+      context = @proxy_ssl_context
+      unless context
+        # A fresh context per connection, from a fresh SSLContext.new base.
+        # OpenSSL freezes a context once a socket has used it, so a stored one
+        # could not be reconfigured for a later connection.
+        context = OpenSSL::SSL::SSLContext.new
+        apply_proxy_ssl_parameters(context)
+      end
+      configure_proxy_session_cache(context)
+
+      server_name = proxy_server_name
+      socket = OpenSSL::SSL::SSLSocket.new(io, context)
+      socket.sync_close = true
+      if server_name and not ip_literal?(server_name)
+        socket.hostname = server_name if socket.respond_to?(:hostname=)
+      end
+
+      if @proxy_ssl_session and
+         Process.clock_gettime(Process::CLOCK_REALTIME) < @proxy_ssl_session.time.to_f + @proxy_ssl_session.timeout
+        socket.session = @proxy_ssl_session
+      end
+      socket
+    end
+    private :new_proxy_ssl_socket
+
+    # Gives the proxy context its own client session cache and remembers the
+    # sessions it negotiates, so the proxy layer can resume its own session
+    # (and never the target one).
+    #
+    # A caller-supplied context is used as-is; it may already be frozen by
+    # its first use, in which case its session handling is left untouched.
+    def configure_proxy_session_cache(context)
+      return context if context.frozen?
+      unless context.session_cache_mode.nil? # a dummy method on JRuby
+        context.session_cache_mode =
+            OpenSSL::SSL::SSLContext::SESSION_CACHE_CLIENT |
+                OpenSSL::SSL::SSLContext::SESSION_CACHE_NO_INTERNAL_STORE
+      end
+      if context.respond_to?(:session_new_cb) # not implemented under JRuby
+        context.session_new_cb = proc {|sock, sess| @proxy_ssl_session = sess }
+      end
+      context
+    rescue FrozenError
+      context
+    end
+    private :configure_proxy_session_cache
+
+    # Applies the proxy-only TLS options to +context+.
+    #
+    # It does not go through OpenSSL::SSL::SSLContext#set_params: that would
+    # merge the library defaults (including VERIFY_PEER and the system CA
+    # store) and silently change the historical behaviour of the proxy hop.
+    # Only options explicitly set for the proxy are applied, so an
+    # unconfigured proxy hop keeps the SSLContext.new defaults.
+    def apply_proxy_ssl_parameters(context)
+      PROXY_SSL_ATTRIBUTES.each do |attr|
+        value = instance_variable_get(:"@proxy_#{attr}")
+        next if value.nil?
+        context.__send__(:"#{attr}=", value)
+      end
+      context
+    end
+    private :apply_proxy_ssl_parameters
+
+    # Returns the name to check the proxy certificate against, or +nil+ when
+    # no hostname check applies to the proxy hop.
+    def proxy_hostname_check_name
+      return nil unless proxy_verify_hostname?
+      server_name = proxy_server_name
+      return nil if server_name.nil? or server_name.empty? or ip_literal?(server_name)
+      server_name
+    end
+    private :proxy_hostname_check_name
+
+    # Returns whether the proxy certificate name is checked.
+    #
+    # Defaults to checking it exactly when the proxy certificate is verified;
+    # it never falls back to the target's #verify_hostname.
+    def proxy_verify_hostname?
+      return @proxy_verify_hostname unless @proxy_verify_hostname.nil?
+      context = @proxy_ssl_context
+      if context
+        context.verify_mode != OpenSSL::SSL::VERIFY_NONE
+      else
+        proxy_verify_mode = @proxy_verify_mode
+        proxy_verify_mode ? proxy_verify_mode != OpenSSL::SSL::VERIFY_NONE : false
+      end
+    end
+    private :proxy_verify_hostname?
+
+    # Returns the server name (SNI) of the proxy hop.
+    def proxy_server_name
+      @proxy_ssl_server_name || proxy_address
+    end
+    private :proxy_server_name
+
+    # Returns the timeout of the proxy TLS handshake: #proxy_open_timeout,
+    # or #open_timeout when that is not set.
+    def proxy_handshake_timeout
+      @proxy_open_timeout || @open_timeout
+    end
+    private :proxy_handshake_timeout
+
+    # Builds the TLS socket of the target layer from the target options,
+    # through +io+ (the TCP connection or the tunnel relay).  The proxy
+    # options and the proxy server name are never consulted.
+    #
+    # Returns the socket and whether its certificate name is to be checked.
+    def new_target_ssl_socket(io)
+      ssl_parameters = Hash.new
+      iv_list = instance_variables
+      SSL_IVNAMES.each_with_index do |ivname, i|
+        if iv_list.include?(ivname)
+          value = instance_variable_get(ivname)
+          unless value.nil?
+            ssl_parameters[SSL_ATTRIBUTES[i]] = value
+          end
+        end
+      end
+      @ssl_context.set_params(ssl_parameters)
+      unless @ssl_context.session_cache_mode.nil? # a dummy method on JRuby
+        @ssl_context.session_cache_mode =
+            OpenSSL::SSL::SSLContext::SESSION_CACHE_CLIENT |
+                OpenSSL::SSL::SSLContext::SESSION_CACHE_NO_INTERNAL_STORE
+      end
+      if @ssl_context.respond_to?(:session_new_cb) # not implemented under JRuby
+        @ssl_context.session_new_cb = proc {|sock, sess| @ssl_session = sess }
+      end
+
+      # Still do the post_connection_check below even if connecting
+      # to IP address
+      verify_hostname = @ssl_context.verify_hostname
+
+      # Server Name Indication (SNI) RFC 3546/6066
+      case @address
+      when IPV4_ADDRESS, IPV6_ADDRESS
+        # don't set SNI, as IP addresses in SNI is not valid
+        # per RFC 6066, section 3.
+
+        # Avoid openssl warning
+        @ssl_context.verify_hostname = false
+      else
+        ssl_host_address = @address
+      end
+
+      socket = OpenSSL::SSL::SSLSocket.new(io, @ssl_context)
+      socket.sync_close = true
+      socket.hostname = ssl_host_address if socket.respond_to?(:hostname=) && ssl_host_address
+
+      if @ssl_session and
+         Process.clock_gettime(Process::CLOCK_REALTIME) < @ssl_session.time.to_f + @ssl_session.timeout
+        socket.session = @ssl_session
+      end
+      # The hostname check is decided here, before the IP address turns it
+      # off in the context; the caller runs it after the handshake.
+      [socket, verify_hostname]
+    end
+    private :new_target_ssl_socket
+
+    # Sends the CONNECT request over +io+ (the transport or the proxy TLS
+    # session) and reads the proxy response as HTTP.
+    #
+    # Returns the response and any byte already read past its header.  Those
+    # bytes belong to the tunnel and are replayed to the target layer.  A
+    # non-success response raises the usual HTTP exception, carrying the
+    # response, without reading anything more from the proxy.
+    #
+    # The proxy credentials are used for this request only, and the request
+    # is written on a buffer without debug output, so the
+    # Proxy-Authorization header never reaches the debug log.
+    def send_connect_request(io)
+      if /[\r\n]/.match?("#{conn_address}:#{@port}")
+        raise ArgumentError, "address and port cannot include CR/LF"
+      end
+      if /[\r\n]/.match?(@address)
+        raise ArgumentError, "address cannot include CR/LF"
+      end
+
+      buf = +"CONNECT #{conn_address}:#{@port} HTTP/#{HTTPVersion}\r\n" \
+        "Host: #{@address}:#{@port}\r\n"
+      if proxy_user
+        credential = ["#{proxy_user}:#{proxy_pass}"].pack('m0')
+        buf << "Proxy-Authorization: Basic #{credential}\r\n"
+      end
+      buf << "\r\n"
+
+      debug "sending CONNECT #{conn_address}:#{@port} through the proxy"
+      connect_io = BufferedIO.new(io, read_timeout: @read_timeout,
+                                  write_timeout: @write_timeout,
+                                  continue_timeout: @continue_timeout)
+      connect_io.write(buf)
+      response = HTTPResponse.read_new(connect_io)
+      response.value
+      [response, take_buffered_bytes(connect_io)]
+    end
+    private :send_connect_request
+
+    # Returns and clears the bytes already buffered in +buffered_io+.
+    #
+    # After a successful CONNECT any such bytes belong to the tunnel, not to
+    # a proxy reply; they are handed to the target layer instead of being
+    # discarded.
+    def take_buffered_bytes(buffered_io)
+      size = buffered_io.__send__(:rbuf_size)
+      return "".b if size.nil? or size <= 0
+      buffered_io.__send__(:rbuf_consume_all) || "".b
+    end
+    private :take_buffered_bytes
+
+    def ip_literal?(host)
+      case host.to_s
+      when IPV4_ADDRESS, IPV6_ADDRESS then true
+      else false
+      end
+    end
+    private :ip_literal?
+
+    # Attaches the failing layer to +error+ without changing its class, so
+    # existing rescue clauses keep working.
+    def tag_connect_error(error, stage)
+      @last_connect_stage = stage
+      begin
+        error.extend(Net::HTTPConnectStage) unless error.is_a?(Net::HTTPConnectStage)
+        error.instance_variable_set(:@stage, stage)
+      rescue FrozenError, TypeError
+        # A frozen exception cannot carry the diagnostic; its class, message
+        # and response are still the originals, and #last_connect_stage still
+        # reports the stage.
+      end
+      error
+    end
+    private :tag_connect_error
+
+    def close_quietly(resource)
+      resource.close
+    rescue IOError, SystemCallError, OpenSSL::SSL::SSLError
+      # already closed or unusable: nothing left to release
+    end
+    private :close_quietly
 
     tcp_socket_parameters = TCPSocket.instance_method(:initialize).parameters
     TCP_SOCKET_NEW_HAS_OPEN_TIMEOUT = if tcp_socket_parameters != [[:rest]]
@@ -1831,12 +2334,129 @@ module Net   #:nodoc:
     end
     private :on_connect
 
+    # Local duplex relay used to run a target TLS session inside a proxy TLS
+    # session, since OpenSSL cannot nest SSLSocket objects.
+    #
+    # The relay owns exactly one end of a local socket pair and the two copy
+    # threads it starts.  It never closes the upstream socket it reads from:
+    # that socket belongs to the connection chain and is closed there.
+    # Closing the relay is idempotent.
+    class TunnelRelay # :nodoc:
+      # The endpoint handed to the target SSLSocket.
+      attr_reader :io
+
+      # +upstream+ is the established proxy TLS socket (or the plain TCP
+      # socket).  +prefix+ is any tunnel byte already read from it while
+      # reading the CONNECT response; it is replayed first.
+      def initialize(upstream, prefix = nil)
+        @upstream = upstream
+        @io, @peer = Socket.pair(:INET, :STREAM)
+        @closed = false
+        begin
+          if prefix and not prefix.empty?
+            @peer.write(prefix)
+            @peer.flush
+          end
+        rescue IOError, SystemCallError
+          close
+          raise
+        end
+        @threads = [
+          Thread.new { relay_loop(@upstream, @peer) },
+          Thread.new { relay_loop(@peer, @upstream) },
+        ]
+        @threads.each {|t| t.report_on_exception = false }
+      end
+
+      def closed?
+        @closed
+      end
+
+      # Releases this relay's own resources: the local socket pair and the
+      # copy threads.  The upstream socket belongs to the connection chain
+      # and is not touched, so a late close cannot shut down another layer.
+      def close
+        return if @closed
+        @closed = true
+        close_quietly(@io)
+        close_quietly(@peer)
+        @threads.each do |t|
+          t.kill unless t.join(0.5)
+        end
+        nil
+      end
+
+      private
+
+      def close_quietly(sock)
+        sock.close
+      rescue IOError, SystemCallError
+        # already closed
+      end
+
+      def relay_loop(from, to)
+        loop do
+          # The proxy TLS socket has OpenSSL's own buffer: take whatever it
+          # already holds, then wait for more.
+          case data = relay_read(from)
+          when String
+            to.write(data)
+            to.flush
+          when :wait_writable
+            from.to_io.wait_writable
+          when :wait_readable
+            from.to_io.wait_readable
+          end
+        end
+      rescue EOFError
+        # Propagate the half-close so the peer sees a real EOF instead of
+        # waiting for a reply that will never come.
+        close_write_quietly(to)
+      rescue IOError, SystemCallError, OpenSSL::SSL::SSLError
+        # the connection is gone; both ends are released by #close
+      end
+
+      def relay_read(from)
+        if from.respond_to?(:read_nonblock)
+          rv = from.read_nonblock(16 * 1024, exception: false)
+          rv.nil? ? raise(EOFError) : rv
+        else
+          from.readpartial(16 * 1024)
+        end
+      end
+
+      def close_write_quietly(sock)
+        return unless sock.respond_to?(:close_write)
+        sock.close_write
+      rescue IOError, SystemCallError, OpenSSL::SSL::SSLError
+        # already shut down
+      end
+    end
+    private_constant :TunnelRelay
+
     def do_finish
       @started = false
-      @socket.close if @socket
+      close_connection_chain
       @socket = nil
     end
     private :do_finish
+
+    # Closes the current socket and every resource this connection owns
+    # underneath it (tunnel relay, target TLS session, proxy TLS session),
+    # then forgets the chain.  Resources owned by anything else are untouched.
+    def close_connection_chain
+      chain = @connection_chain
+      @connection_chain = nil
+      begin
+        @socket.close if @socket
+      ensure
+        chain&.reverse_each do |resource|
+          close_quietly(resource)
+        end
+      end
+      nil
+    end
+    private :close_connection_chain
 
     #
     # proxy
@@ -2557,12 +3177,12 @@ module Net   #:nodoc:
              Timeout::Error => exception
         if count < max_retries && IDEMPOTENT_METHODS_.include?(req.method)
           count += 1
-          @socket.close if @socket
+          close_connection_chain
           debug "Conn close because of error #{exception}, and retry"
           retry
         end
         debug "Conn close because of error #{exception}"
-        @socket.close if @socket
+        close_connection_chain
         raise
       end
 
@@ -2570,21 +3190,25 @@ module Net   #:nodoc:
       res
     rescue => exception
       debug "Conn close because of error #{exception}"
-      @socket.close if @socket
+      close_connection_chain
       raise exception
     end
 
     def begin_transport(req)
       if @socket.closed?
+        # The connection died underneath; release everything else it owned
+        # before reconnecting, so a stale proxy session or relay is not
+        # leaked.
+        close_connection_chain
         connect
       elsif @last_communicated
         if @last_communicated + @keep_alive_timeout < Process.clock_gettime(Process::CLOCK_MONOTONIC)
           debug 'Conn close because of keep_alive_timeout'
-          @socket.close
+          close_connection_chain
           connect
         elsif @socket.io.to_io.wait_readable(0) && @socket.eof?
           debug "Conn close because of EOF"
-          @socket.close
+          close_connection_chain
           connect
         end
       end
@@ -2602,15 +3226,17 @@ module Net   #:nodoc:
       @last_communicated = nil
       if @socket.closed?
         debug 'Conn socket closed'
+        # The socket died underneath us; release the rest of the chain too.
+        close_connection_chain
       elsif not res.body and @close_on_empty_response
         debug 'Conn close'
-        @socket.close
+        close_connection_chain
       elsif keep_alive?(req, res)
         debug 'Conn keep-alive'
         @last_communicated = Process.clock_gettime(Process::CLOCK_MONOTONIC)
       else
         debug 'Conn close'
-        @socket.close
+        close_connection_chain
       end
     end
 
