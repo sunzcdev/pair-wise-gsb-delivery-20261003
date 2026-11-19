@@ -119,6 +119,76 @@ complex.
    * Use ``==`` and ``!=`` for comparing against ``True`` and ``False``, or
      you may use the implicit value of the expression.
 
+For example, the following looks reasonable but is actually a bug. Python's
+``and`` operator evaluates its operands as booleans and returns one of them
+unchanged, so the ``User.is_active`` predicate is silently dropped and the
+generated ``WHERE`` clause only contains the second expression:
+
+.. code-block:: python
+
+   # BUG: only "is_admin" ends up in the WHERE clause.
+   User.select().where(User.is_active and User.is_admin)
+
+   # Correct: bitwise operators build a combined database condition.
+   User.select().where((User.is_active == True) & (User.is_admin == True))
+
+Strict expression mode
+~~~~~~~~~~~~~~~~~~~~~~~
+
+To make these mistakes fail loudly instead of silently producing different
+SQL, peewee provides an opt-in *strict expression mode*. When enabled,
+supported query nodes (fields, expressions, function calls, raw SQL, and so
+on) raise a :class:`StrictExpressionError` whenever Python tries to evaluate
+them as a plain boolean -- which is exactly what happens with the ``and``,
+``or`` and ``not`` keywords, a ternary ``x if cond else y`` expression, or an
+explicit ``bool()`` call:
+
+.. code-block:: python
+
+    from peewee import strict_expressions
+
+    with strict_expressions():
+        # Raises StrictExpressionError: the "and" branch would be discarded
+        # and no database condition would be produced.
+        User.select().where(User.is_active and User.is_admin)
+
+The legitimate bitwise operators are unaffected, since they build new
+expression nodes instead of testing truthiness:
+
+.. code-block:: python
+
+    with strict_expressions():
+        query = User.select().where(
+            (User.is_active == True) | (User.is_admin == True))
+        query = query.where(~(User.username == 'removed'))
+
+Two kinds of nodes keep deterministic, well-defined boolean semantics:
+
+* Explicit constant nodes created with :class:`Value` report the truthiness
+  of the constant they wrap, e.g. ``bool(Value(0))`` is ``False`` and
+  ``bool(Value('x'))`` is ``True``.
+* Empty expressions (an empty :class:`NodeList`) are always falsy, since they
+  represent the absence of a condition.
+
+The mode is scoped to a :class:`~contextlib.contextmanager` (it can also be
+used as a decorator), is stored per-thread, and never modifies any classes
+globally, so other code running in the same process is unaffected. State is
+restored when the block exits, even if an exception is raised. The legacy
+permissive behavior remains available for old code and can be re-enabled
+inside a strict block:
+
+.. code-block:: python
+
+    @strict_expressions()
+    def build_query():
+        # Strict mode is active for the whole function.
+        return User.select().where((User.is_active == True)
+                                   & (User.is_admin == True))
+
+    with strict_expressions():
+        with strict_expressions(False):
+            legacy = User.is_active or User.is_admin  # permissive again
+
 For more examples, see the :ref:`expressions` section.
 
 .. note::

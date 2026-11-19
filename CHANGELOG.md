@@ -7,6 +7,15 @@ https://github.com/coleifer/peewee/releases
 
 ## master
 
+* Add an opt-in strict expression mode (`strict_expressions()` context
+  manager / decorator) that raises `StrictExpressionError` when a supported
+  query node is evaluated as a plain Python boolean (e.g. via `and`, `or`,
+  `not` or a conditional expression), which otherwise silently drops a branch
+  and generates different SQL. Bitwise `&`, `|` and `~` combinations are
+  unaffected; explicit `Value` nodes keep the truthiness of their wrapped
+  constant and empty `NodeList` expressions are falsy. State is thread-local
+  and the legacy permissive behavior remains available via
+  `strict_expressions(False)`.
 * Clear `after_commit` callbacks registered on a savepoint if that savepoint is
   then rolled-back.
 * Re-create triggers during sqlite migrator table rebuilds.

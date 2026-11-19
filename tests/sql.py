@@ -20,9 +20,12 @@ from peewee import Negated
 from peewee import NodeList
 from peewee import Ordering
 from peewee import QualifiedNames
+from peewee import strict_expressions
+from peewee import StrictExpressionError
 from peewee import Value
 from peewee import ValueLiterals
 from peewee import Window
+from peewee import is_strict_expressions
 from peewee import query_to_string
 
 from .base import BaseTestCase
@@ -3824,3 +3827,172 @@ class TestContextAndAliasManager(BaseTestCase):
         # An explicit alias is content-based, so it survives cloning.
         aliased = User.select(User.c.id).alias('u')
         self.assertEqual(hash(aliased), hash(aliased.where(User.c.id > 1)))
+
+
+# ===========================================================================
+# Strict expression mode: query nodes must not be silently coerced to booleans
+# ===========================================================================
+
+class TestStrictExpressions(BaseTestCase):
+    def setUp(self):
+        super(TestStrictExpressions, self).setUp()
+        # Start from a known state regardless of any enclosing context, while
+        # remembering the outer state so it can be restored on tearDown.
+        self._outer_state = is_strict_expressions()
+        self._strict_context = strict_expressions(False)
+        self._strict_context.__enter__()
+
+    def tearDown(self):
+        self._strict_context.__exit__(None, None, None)
+        self.assertEqual(is_strict_expressions(), self._outer_state)
+        super(TestStrictExpressions, self).tearDown()
+
+    def test_legacy_mode_truthy_by_default(self):
+        field = User.c.id
+        expr = User.c.id == 1
+
+        # Compatibility behavior: nodes behave as ordinary truthy objects, so
+        # legacy code that (incorrectly) uses "and"/"or" keeps working.
+        self.assertTrue(bool(field))
+        self.assertTrue(bool(expr))
+        self.assertIs(field and expr, expr)
+        self.assertIs(expr or field, expr)
+        self.assertFalse(not expr)
+        self.assertEqual(1 if expr else 2, 1)
+
+    def test_strict_mode_blocks_bool(self):
+        nodes = (
+            User.c.id,                                  # Field / Column
+            User.c.id == 1,                             # Expression
+            ~(User.c.id == 1),                          # Negated
+            (User.c.id == 1) & (User.c.id == 2),        # combined expression
+            (User.c.id == 1) | (User.c.id == 2),
+            SQL('1'),                                   # raw SQL fragment
+            NodeList([User.c.id == 1]),                 # non-empty node list
+        )
+        with strict_expressions():
+            for node in nodes:
+                self.assertRaises(StrictExpressionError, bool, node)
+
+    def test_strict_mode_blocks_python_boolean_operators(self):
+        a = User.c.id == 1
+        b = User.c.username == 'charlie'
+        with strict_expressions():
+            # Every construct that implicitly calls __bool__() must raise
+            # rather than quietly selecting one branch.
+            self.assertRaises(StrictExpressionError, lambda: a and b)
+            self.assertRaises(StrictExpressionError, lambda: a or b)
+            self.assertRaises(StrictExpressionError, lambda: not a)
+            self.assertRaises(StrictExpressionError, lambda: 1 if a else 2)
+
+    def test_error_is_typeerror_and_explains_no_condition(self):
+        with strict_expressions():
+            try:
+                bool(User.c.id)
+            except TypeError as exc:
+                message = str(exc)
+            else:
+                self.fail('StrictExpressionError must also be a TypeError')
+        self.assertIn('boolean', message)
+        # The message must make clear that no database condition is produced
+        # and point at the correct operators.
+        self.assertIn('SQL', message)
+        self.assertIn('&', message)
+        self.assertIn('|', message)
+        self.assertIn('~', message)
+
+    def test_bitwise_combination_unaffected(self):
+        a = User.c.id == 1
+        b = User.c.username == 'charlie'
+        with strict_expressions():
+            combined = a & b
+            self.assertSQL(combined,
+                           '(("t1"."id" = ?) AND ("t1"."username" = ?))',
+                           [1, 'charlie'])
+            self.assertSQL(a | b,
+                           '(("t1"."id" = ?) OR ("t1"."username" = ?))',
+                           [1, 'charlie'])
+            self.assertSQL(~a, 'NOT ("t1"."id" = ?)', [1])
+            # The resulting nodes still refuse boolean evaluation.
+            self.assertRaises(StrictExpressionError, bool, combined)
+
+    def test_explicit_value_node_truthiness(self):
+        with strict_expressions():
+            # Explicit constants defer to the truthiness of the wrapped value.
+            self.assertTrue(bool(Value(True)))
+            self.assertTrue(bool(Value(1)))
+            self.assertTrue(bool(Value('x')))
+            self.assertTrue(bool(Value([1])))
+            self.assertFalse(bool(Value(False)))
+            self.assertFalse(bool(Value(0)))
+            self.assertFalse(bool(Value('')))
+            self.assertFalse(bool(Value(None)))
+            self.assertFalse(bool(Value([])))
+
+    def test_empty_nodelist_is_falsy(self):
+        with strict_expressions():
+            self.assertFalse(bool(NodeList([])))
+            self.assertFalse(bool(NodeList([], parens=True)))
+            # A populated list is an SQL fragment and still refuses.
+            self.assertRaises(
+                StrictExpressionError,
+                bool,
+                NodeList([User.c.id == 1]))
+
+    def test_context_restores_state(self):
+        self.assertFalse(is_strict_expressions())
+        with strict_expressions():
+            self.assertTrue(is_strict_expressions())
+        self.assertFalse(is_strict_expressions())
+
+        # State is restored even when an exception propagates.
+        with self.assertRaises(RuntimeError):
+            with strict_expressions():
+                raise RuntimeError('boom')
+        self.assertFalse(is_strict_expressions())
+
+    def test_nested_and_explicit_disable(self):
+        with strict_expressions():
+            self.assertTrue(is_strict_expressions())
+            with strict_expressions(False):
+                # Legacy compatibility mode remains available inside a strict
+                # block for old code that needs the permissive behavior.
+                self.assertFalse(is_strict_expressions())
+                self.assertTrue(bool(User.c.id))
+            self.assertTrue(is_strict_expressions())
+        self.assertFalse(is_strict_expressions())
+
+    def test_decorator_usage(self):
+        @strict_expressions()
+        def build():
+            return bool(User.c.id)
+
+        self.assertRaises(StrictExpressionError, build)
+        self.assertFalse(is_strict_expressions())
+
+    def test_thread_isolation(self):
+        import threading
+        observed = []
+
+        def worker():
+            observed.append(is_strict_expressions())
+
+        thread = threading.Thread(target=worker)
+        with strict_expressions():
+            thread.start()
+            thread.join()
+        self.assertEqual(observed, [False])
+
+    def test_strict_mode_does_not_change_generated_sql(self):
+        # Building and rendering a normal query must be unaffected; only
+        # implicit truthiness is intercepted.
+        query = (User
+                 .select(User.c.id)
+                 .where((User.c.id > 1) & (User.c.username == 'huey')))
+        with strict_expressions():
+            sql, params = __sql__(query)
+        self.assertEqual(
+            sql,
+            'SELECT "t1"."id" FROM "users" AS "t1" WHERE '
+            '(("t1"."id" > ?) AND ("t1"."username" = ?))')
+        self.assertEqual(params, [1, 'huey'])

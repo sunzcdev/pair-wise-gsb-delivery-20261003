@@ -65,7 +65,8 @@ class Model(_Model):
         pre_init.send(self)
 
     def save(self, force_insert=False, only=None):
-        pk_value = self._pk if self._meta.primary_key else True
+        pk_value = (self._pk
+                    if self._meta.primary_key is not None else True)
         created = force_insert or not bool(pk_value)
         pre_save.send(self, created=created)
         ret = super(Model, self).save(force_insert, only)

@@ -141,6 +141,8 @@ __all__ = [
     'Select',
     'SQL',
     'SqliteDatabase',
+    'strict_expressions',
+    'StrictExpressionError',
     'Table',
     'TextField',
     'TimeField',
@@ -796,6 +798,76 @@ def _query_val_transform(v):
 # AST.
 
 
+class _StrictExpressionLocal(threading.local):
+    def __init__(self):
+        self.enabled = False
+
+
+_strict_expression_state = _StrictExpressionLocal()
+
+
+def is_strict_expressions():
+    """Return whether strict expression mode is enabled for the current
+    thread."""
+    return _strict_expression_state.enabled
+
+
+def _raise_strict_expression_error(node):
+    raise StrictExpressionError(
+        'Cannot evaluate %s as a plain Python boolean value. Python\'s "and", '
+        '"or", "not" and conditional ("if") expressions coerce their operands '
+        'to booleans and cannot produce a database condition, so the other '
+        'branch is silently discarded and no SQL clause is generated. Combine '
+        'query expressions with the bitwise "&" (AND), "|" (OR) and "~" (NOT) '
+        'operators instead, or use the strict_expressions(False) context '
+        'manager to restore the legacy behavior.' % node.__class__.__name__)
+
+
+class strict_expressions(_callable_context_manager):
+    """Context manager enabling (or disabling) strict expression mode.
+
+    When strict expression mode is enabled, supported query :class:`Node`
+    instances raise :class:`StrictExpressionError` when Python tries to
+    evaluate them as booleans -- which happens whenever they are used with
+    the ``and``, ``or``, ``not`` keywords or in a conditional expression such
+    as ``x if cond else y``. The legitimate bitwise operators ``&``, ``|``
+    and ``~`` are unaffected, since they build new expression nodes instead
+    of testing truthiness.
+
+    The state is stored in :class:`threading.local`, so enabling the mode only
+    affects the current thread and does not modify any classes globally.
+
+    Explicit constant nodes (:class:`Value`) and empty expressions (an empty
+    :class:`NodeList`) keep deterministic boolean semantics: ``Value`` reports
+    the truthiness of its wrapped constant, while an empty ``NodeList`` is
+    always falsy.
+
+    Usage::
+
+        with strict_expressions():
+            # Raises StrictExpressionError instead of silently dropping a
+            # branch -- use (User.active == True) & (User.admin == True).
+            User.select().where(User.active and User.admin)
+
+        # The legacy permissive behavior remains available for old code.
+        with strict_expressions(False):
+            cond = expr1 or expr2
+    """
+    def __init__(self, enabled=True):
+        self.enabled = enabled
+
+    def _build_ctx(self):
+        return type(self)(self.enabled)
+
+    def __enter__(self):
+        self._previous = _strict_expression_state.enabled
+        _strict_expression_state.enabled = self.enabled
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        _strict_expression_state.enabled = self._previous
+
+
 class Node(object):
     _coerce = True
     __isabstractmethod__ = False  # Avoid issue w/abc and __getattr__, eg fn.X
@@ -828,6 +900,19 @@ class Node(object):
 
     def unwrap(self):
         return self
+
+    def _strict_boolean(self):
+        # Hook used by __bool__() when strict expression mode is active.
+        # Query nodes represent SQL fragments rather than Python values, so
+        # by default they refuse to be treated as a plain boolean. Subclasses
+        # with deterministic boolean semantics (explicit constant nodes and
+        # empty expressions) override this method.
+        _raise_strict_expression_error(self)
+
+    def __bool__(self):
+        if _strict_expression_state.enabled:
+            return self._strict_boolean()
+        return True
 
 
 class ColumnFactory(object):
@@ -1525,6 +1610,11 @@ class Value(ColumnBase):
         else:
             self.values = None
 
+    def _strict_boolean(self):
+        # An explicit constant node stands in for a known Python value, so
+        # its truthiness is well-defined: defer to the wrapped constant.
+        return bool(self.value)
+
     def __sql__(self, ctx):
         if self.multi:
             # For multi-part values (e.g. lists of IDs).
@@ -1978,6 +2068,14 @@ class NodeList(ColumnBase):
         self.nodes = nodes
         self.glue = glue
         self.parens = parens
+
+    def _strict_boolean(self):
+        # An empty expression carries no condition and is always falsy; a
+        # non-empty list is an arbitrary SQL fragment with no Python boolean
+        # meaning, so it refuses evaluation.
+        if not self.nodes:
+            return False
+        _raise_strict_expression_error(self)
 
     def __sql__(self, ctx):
         n_nodes = len(self.nodes)
@@ -2995,7 +3093,7 @@ class Insert(_WriteQuery):
                 stmt = self._on_conflict.get_conflict_statement(ctx, self)
 
             (ctx
-             .sql(stmt or SQL('INSERT'))
+             .sql(stmt if stmt is not None else SQL('INSERT'))
              .literal(' INTO ')
              .sql(self.table)
              .literal(' '))
@@ -3583,6 +3681,22 @@ class InternalError(DatabaseError): pass
 class NotSupportedError(DatabaseError): pass
 class OperationalError(DatabaseError): pass
 class ProgrammingError(DatabaseError): pass
+
+
+class StrictExpressionError(PeeweeException, TypeError):
+    """Raised when a query node is evaluated for truthiness while strict
+    expression mode is enabled.
+
+    Python's ``and``, ``or``, ``not`` and conditional (``if``) expressions
+    coerce their operands using :py:meth:`object.__bool__` and cannot be
+    overloaded to produce a database condition. Combining them silently picks
+    one branch instead of generating an ``AND`` / ``OR`` clause, so in strict
+    mode this mistake raises rather than producing unexpected SQL.
+
+    Because this represents an invalid use of a value as a plain boolean, it
+    subclasses :class:`TypeError` as well as :class:`PeeweeException`.
+    """
+    pass
 
 
 class ExceptionWrapper(object):
@@ -5717,7 +5831,7 @@ class Field(ColumnBase):
     def ddl(self, ctx):
         accum = [Entity(self.column_name)]
         data_type = self.ddl_datatype(ctx)
-        if data_type:
+        if data_type is not None:
             accum.append(data_type)
         if self.unindexed:
             accum.append(SQL('UNINDEXED'))
@@ -7757,6 +7871,13 @@ class Model(Node, metaclass=ModelBase):
     def __str__(self):
         return str(self._pk) if self._meta.primary_key is not False else 'n/a'
 
+    def __bool__(self):
+        # A model instance is a populated data-row rather than a query
+        # expression fragment, so it keeps deterministic truthiness and is
+        # exempt from strict expression mode (which targets query nodes used
+        # as boolean predicates).
+        return True
+
     @classmethod
     def validate_model(cls):
         pass
@@ -8533,7 +8654,7 @@ class ModelSelect(BaseModelSelect, Select):
         dest_model, dest_is_model = self._get_model(dest)
 
         join_ctx = self._join_ctx
-        if src_model and dest_model:
+        if src_model is not None and dest_model is not None:
             join_ctx = dest
             constructor = dest_model
 

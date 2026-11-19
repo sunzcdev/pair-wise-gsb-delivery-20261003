@@ -2952,6 +2952,15 @@ Model
    Exception wrappers for DB-API errors raised by the driver. Allows users to
    catch the Peewee exception wrappers rather than the driver-specific types.
 
+.. class:: StrictExpressionError
+
+   Raised when a supported query node is evaluated as a plain Python boolean
+   while strict expression mode is enabled (see
+   :class:`strict_expressions` and the *Strict expression mode* section of
+   :doc:`query_operators`). Subclasses both :class:`PeeweeException` and
+   :class:`TypeError`, since it indicates an invalid use of a query
+   expression as a boolean value.
+
 
 .. _fields-api:
 
@@ -6997,6 +7006,30 @@ Constants and Helpers
       # 0, 1, 2, 3
       # 4, 5, 6, 7
       # 8, 9
+
+
+.. class:: strict_expressions(enabled=True)
+
+   Context manager (and decorator) that enables strict expression mode for
+   the current thread.
+
+   :param bool enabled: set to ``False`` to explicitly restore the legacy
+      permissive behavior, including inside an already-strict block.
+
+   While enabled, supported query :class:`Node` instances raise
+   :class:`StrictExpressionError` when Python evaluates them as booleans
+   (``and``, ``or``, ``not``, ternary conditionals or an explicit
+   ``bool()``), which otherwise silently discards a branch instead of
+   producing a database condition. The bitwise ``&``, ``|`` and ``~``
+   operators are unaffected. Explicit :class:`Value` nodes keep the
+   truthiness of their wrapped constant and an empty :class:`NodeList` is
+   falsy. The state is thread-local and is restored when the block exits,
+   even if an exception is raised. See :doc:`query_operators` for details.
+
+.. function:: is_strict_expressions()
+
+   :return: whether strict expression mode is enabled for the current thread.
+   :rtype: bool
 
 
 .. class:: IndexMetadata
