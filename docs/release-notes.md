@@ -2,6 +2,12 @@
 toc_depth: 2
 ---
 
+## Unreleased
+
+#### Fixed
+
+* Close the temporary files of the uploads parsed so far when multipart parsing fails, including a client disconnect, an invalid part, a failed write to disk and a cancelled task, without masking the original exception. A successful parse hands the uploads over to the returned `FormData`, and `FormData.close()` is now idempotent so `Request.close()` can be called repeatedly.
+
 ## 1.10.0 (October 24, 2026)
 
 #### Changed

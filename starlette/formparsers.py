@@ -232,6 +232,23 @@ class MultiPartParser:
     def on_end(self) -> None:
         pass
 
+    def _close_files(self) -> None:
+        """Close every file opened so far, without masking the original error.
+
+        Cleanup runs while an exception is already in flight (a malformed part, a
+        failing write to disk, a client disconnect or a cancelled task), so a failure
+        while closing a file must not replace the exception that stopped parsing.
+        Each file is untracked before it is closed, so an interrupted cleanup leaves
+        the remaining files tracked and a repeated cleanup only handles what is left.
+        """
+        while self._files_to_close_on_error:
+            file = self._files_to_close_on_error.pop()
+            try:
+                file.close()
+            except BaseException:
+                # The parse error is the one worth reporting.
+                pass
+
     async def parse(self) -> FormData:
         # Parse the Content-Type header to get the multipart boundary.
         _, params = parse_options_header(self.headers["Content-Type"])
@@ -278,12 +295,19 @@ class MultiPartParser:
                 self._file_parts_to_write.clear()
                 self._file_parts_to_finish.clear()
             parser.finalize()
+            # Build the `FormData` inside the `try`, so that a failure here also
+            # releases the files the parser opened.
+            form = FormData(self.items)
         except BaseException as exc:
-            # Close all the files if parsing or reading the request stream fails.
-            for file in self._files_to_close_on_error:
-                file.close()
+            # Parsing failed, writing a part to disk failed, the client disconnected or
+            # the task was cancelled: the caller never receives the `FormData`, so the
+            # files opened so far are still owned by the parser and get released here.
+            self._close_files()
             if isinstance(exc, FormParserError):
                 raise MultiPartException("Invalid multipart data.") from exc
             raise
 
-        return FormData(self.items)
+        # Ownership of the uploads moves to the returned `FormData`, which is in charge
+        # of closing them from now on.
+        self._files_to_close_on_error.clear()
+        return form

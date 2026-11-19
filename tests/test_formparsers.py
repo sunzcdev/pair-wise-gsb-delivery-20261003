@@ -4,23 +4,24 @@ import codecs
 import os
 import threading
 from collections.abc import AsyncGenerator, Generator
-from contextlib import AbstractContextManager, nullcontext as does_not_raise
+from contextlib import AbstractContextManager, aclosing, nullcontext as does_not_raise
 from io import BytesIO
 from pathlib import Path
 from tempfile import SpooledTemporaryFile
 from typing import Any, ClassVar
 from unittest import mock
 
+import anyio
 import pytest
 
 from starlette.applications import Starlette
 from starlette.datastructures import FormData, Headers, UploadFile
 from starlette.exceptions import StarletteDeprecationWarning
 from starlette.formparsers import FormMessage, FormParser, MultiPartException, MultiPartParser
-from starlette.requests import Request
+from starlette.requests import ClientDisconnect, Request
 from starlette.responses import JSONResponse
 from starlette.routing import Mount
-from starlette.types import ASGIApp, Receive, Scope, Send
+from starlette.types import ASGIApp, Message, Receive, Scope, Send
 from tests.types import TestClientFactory
 
 
@@ -1106,6 +1107,250 @@ def test_multipart_closes_tempfile_on_oserror(
         client.post("/", content=content, headers=headers)
 
     assert close_called
+
+
+class CloseTrackingSpooledTemporaryFile(SpooledTemporaryFile[bytes]):
+    """A temporary file that records how many times `close()` was called."""
+
+    instances: ClassVar[list[CloseTrackingSpooledTemporaryFile]] = []
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self.close_calls = 0
+        CloseTrackingSpooledTemporaryFile.instances.append(self)
+
+    def close(self) -> None:
+        self.close_calls += 1
+        super().close()
+
+
+@pytest.fixture
+def tracked_spooled_temporary_file() -> Generator[None]:
+    try:
+        with mock.patch("starlette.formparsers.SpooledTemporaryFile", CloseTrackingSpooledTemporaryFile):
+            yield
+    finally:
+        CloseTrackingSpooledTemporaryFile.instances.clear()
+
+
+BOUNDARY = "a7f7ac8d4e2e437c877bb7b8d7cc549c"
+
+MULTIPART_HEADERS = {
+    "Content-Type": f"multipart/form-data; boundary={BOUNDARY}",
+}
+
+
+def multipart_file_part(name: str, content: bytes, *, terminated: bool = True) -> bytes:
+    """Build a single file part, optionally leaving out the closing delimiter."""
+    part = (
+        f"--{BOUNDARY}\r\n"
+        f'Content-Disposition: form-data; name="{name}"; filename="{name}.txt"\r\n'
+        f"Content-Type: text/plain\r\n\r\n"
+    ).encode() + content
+    return part + b"\r\n" if terminated else part
+
+
+def make_request(*messages: Message) -> Request:
+    """Build a `Request` that replays `messages` on `receive`, then disconnects."""
+    scope: Scope = {
+        "type": "http",
+        "method": "POST",
+        "path": "/",
+        "headers": [(key.lower().encode(), value.encode()) for key, value in MULTIPART_HEADERS.items()],
+    }
+    pending = list(messages)
+
+    async def receive() -> Message:
+        if pending:
+            return pending.pop(0)
+        return {"type": "http.disconnect"}
+
+    return Request(scope, receive)
+
+
+@pytest.mark.anyio
+async def test_multipart_closes_open_files_when_client_disconnects(
+    tracked_spooled_temporary_file: None,
+) -> None:
+    """A disconnect mid-upload must release every file opened so far."""
+    body = (
+        multipart_file_part("first", b"<first content>")
+        + multipart_file_part("second", b"<second content>", terminated=False)[: -len(b"<second content>")]
+    )
+
+    async def stream() -> AsyncGenerator[bytes, None]:
+        yield body
+        raise ClientDisconnect()
+
+    parser = MultiPartParser(Headers(MULTIPART_HEADERS), stream())
+
+    with pytest.raises(ClientDisconnect):
+        await parser.parse()
+
+    files = CloseTrackingSpooledTemporaryFile.instances
+    assert len(files) == 2
+    assert [file.closed for file in files] == [True, True]
+    assert [file.close_calls for file in files] == [1, 1]
+    assert parser._files_to_close_on_error == []
+
+
+@pytest.mark.anyio
+async def test_multipart_invalid_data_closes_open_files_and_keeps_exception(
+    tracked_spooled_temporary_file: None,
+) -> None:
+    """A malformed part must release the files opened before it and keep the parse error."""
+    body = (
+        multipart_file_part("first", b"<first content>")
+        + (f'--{BOUNDARY}\r\nContent-Disposition: form-data; name="second"; filename="second.txt"\r\n').encode()
+        + b"".join(b"X-Extra-%d: value\r\n" % index for index in range(8))
+        + (f"\r\nvalue\r\n--{BOUNDARY}--\r\n").encode()
+    )
+
+    async def stream() -> AsyncGenerator[bytes, None]:
+        yield body
+
+    async with aclosing(stream()) as closed_stream:
+        parser = MultiPartParser(Headers(MULTIPART_HEADERS), closed_stream)
+
+        with pytest.raises(MultiPartException, match="Invalid multipart data."):
+            await parser.parse()
+
+    files = CloseTrackingSpooledTemporaryFile.instances
+    assert len(files) == 1
+    assert files[0].closed
+    assert files[0].close_calls == 1
+
+
+@pytest.mark.anyio
+async def test_multipart_disk_full_closes_every_open_file() -> None:
+    """A write failure on a later part must still release the parts opened before it."""
+
+    class DiskFullSpooledTemporaryFile(CloseTrackingSpooledTemporaryFile):
+        def write(self, s: Any) -> int:
+            if self is CloseTrackingSpooledTemporaryFile.instances[1]:
+                raise OSError("disk full")
+            return super().write(s)
+
+    body = multipart_file_part("first", b"<first content>") + multipart_file_part("second", b"<second content>")
+    body += f"--{BOUNDARY}--\r\n".encode()
+
+    async def stream() -> AsyncGenerator[bytes, None]:
+        yield body
+
+    async with aclosing(stream()) as closed_stream:
+        parser = MultiPartParser(Headers(MULTIPART_HEADERS), closed_stream)
+
+        with (
+            mock.patch("starlette.formparsers.SpooledTemporaryFile", DiskFullSpooledTemporaryFile),
+            pytest.raises(OSError, match="disk full"),
+        ):
+            await parser.parse()
+
+    try:
+        files = CloseTrackingSpooledTemporaryFile.instances
+        assert len(files) == 2
+        assert [file.closed for file in files] == [True, True]
+        assert [file.close_calls for file in files] == [1, 1]
+    finally:
+        CloseTrackingSpooledTemporaryFile.instances.clear()
+
+
+@pytest.mark.anyio
+async def test_multipart_close_error_does_not_mask_parse_error() -> None:
+    """Failing to release a file must not replace the error that stopped parsing."""
+
+    class UnclosableSpooledTemporaryFile(SpooledTemporaryFile[bytes]):
+        def close(self) -> None:
+            super().close()
+            raise OSError("cannot close")
+
+    async def stream() -> AsyncGenerator[bytes, None]:
+        yield multipart_file_part("first", b"<first content>", terminated=False)
+        raise RuntimeError("stream failed")
+
+    parser = MultiPartParser(Headers(MULTIPART_HEADERS), stream())
+    tempfile = UnclosableSpooledTemporaryFile()
+
+    with (
+        mock.patch("starlette.formparsers.SpooledTemporaryFile", return_value=tempfile),
+        pytest.raises(RuntimeError, match="stream failed"),
+    ):
+        await parser.parse()
+
+    assert tempfile.closed
+
+
+@pytest.mark.anyio
+async def test_multipart_closes_open_files_on_cancellation(
+    tracked_spooled_temporary_file: None,
+) -> None:
+    """Cancelling the parsing task must release every file opened so far."""
+
+    async def stream() -> AsyncGenerator[bytes, None]:
+        yield multipart_file_part("first", b"<first content>", terminated=False)
+        await anyio.sleep_forever()
+
+    parser = MultiPartParser(Headers(MULTIPART_HEADERS), stream())
+
+    with anyio.move_on_after(0.1) as cancel_scope:
+        await parser.parse()
+
+    assert cancel_scope.cancelled_caught
+    files = CloseTrackingSpooledTemporaryFile.instances
+    assert len(files) == 1
+    assert files[0].closed
+
+
+@pytest.mark.anyio
+async def test_multipart_hands_file_ownership_to_form_data(
+    tracked_spooled_temporary_file: None,
+) -> None:
+    """A successful parse leaves the files open and `Request.close()` releases them."""
+    body = multipart_file_part("first", b"<first content>") + multipart_file_part("second", b"<second content>")
+    body += f"--{BOUNDARY}--\r\n".encode()
+
+    request = make_request({"type": "http.request", "body": body, "more_body": False})
+    form = await request.form()
+
+    files = CloseTrackingSpooledTemporaryFile.instances
+    assert len(files) == 2
+    assert [file.closed for file in files] == [False, False]
+    assert [file.close_calls for file in files] == [0, 0]
+    assert await form["first"].read() == b"<first content>"
+
+    await request.close()
+
+    assert [file.closed for file in files] == [True, True]
+    assert [file.close_calls for file in files] == [1, 1]
+
+    # `Request.close()` may be called more than once.
+    await request.close()
+
+    assert [file.close_calls for file in files] == [1, 1]
+
+
+@pytest.mark.anyio
+async def test_request_close_is_repeatable_when_form_parsing_fails(
+    tracked_spooled_temporary_file: None,
+) -> None:
+    """`Request.form()` releases the files it opened before failing, and `close()` stays safe."""
+    body = multipart_file_part("first", b"<first content>", terminated=False)
+
+    request = make_request({"type": "http.request", "body": body, "more_body": True})
+
+    with pytest.raises(ClientDisconnect):
+        await request.form()
+
+    files = CloseTrackingSpooledTemporaryFile.instances
+    assert len(files) == 1
+    assert files[0].closed
+    assert request._form is None
+
+    # Nothing is left for `Request.close()` to release, and it can be called repeatedly.
+    await request.close()
+    await request.close()
+
+    assert files[0].close_calls == 1
 
 
 def test_form_message_is_deprecated() -> None:

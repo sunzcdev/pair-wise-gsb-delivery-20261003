@@ -187,6 +187,19 @@ async with request.form() as form:
     contents = await form["upload_file"].read()
 ```
 
+#### Upload lifetime
+
+Partial uploads are released by Starlette if parsing does not complete, for example
+when the client disconnects, a part is malformed, writing an upload to disk fails,
+or the task is cancelled. In those cases `request.form()` raises, so there is no
+`FormData` to close, and the temporary files opened so far are closed before the
+original exception is re-raised.
+
+Once parsing succeeds, the returned `FormData` owns the uploads: whoever receives
+it is responsible for closing them, either with `async with request.form() as form`
+or by calling `await request.close()`. Closing is idempotent, so `request.close()`
+may be called more than once.
+
 !!! info
     As settled in [RFC-7578: 4.2](https://www.ietf.org/rfc/rfc7578.txt), form-data content part that contains file
     assumed to have `name` and `filename` fields in `Content-Disposition` header: `Content-Disposition: form-data;

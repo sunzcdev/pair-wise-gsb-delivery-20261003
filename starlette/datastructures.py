@@ -514,8 +514,14 @@ class FormData(ImmutableMultiDict[str, UploadFile | str]):
         **kwargs: str | UploadFile,
     ) -> None:
         super().__init__(*args, **kwargs)
+        self._closed = False
 
     async def close(self) -> None:
+        # The holder of the `FormData` owns the uploads, so it closes them. Closing is
+        # idempotent, because `Request.close()` may be called more than once.
+        if self._closed:
+            return
+        self._closed = True
         for key, value in self.multi_items():
             if isinstance(value, UploadFile):
                 await value.close()
