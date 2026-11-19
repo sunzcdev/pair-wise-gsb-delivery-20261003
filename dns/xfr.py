@@ -15,6 +15,7 @@
 # ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT
 # OF OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
 
+import enum
 from collections.abc import Callable
 from typing import Any, cast
 
@@ -51,6 +52,58 @@ class UseTCP(dns.exception.DNSException):
     """This IXFR cannot be completed with UDP."""
 
 
+class IXFRFormError(dns.exception.FormError):
+    """An IXFR response was malformed.
+
+    All IXFR structure and content diagnostic errors derive from this class,
+    and are also :class:`dns.exception.FormError` instances so existing code
+    catching ``FormError`` keeps working.  Nothing is committed when one of
+    these is raised; the transfer's writer transaction is rolled back and the
+    zone is left in its prior state.
+    """
+
+
+class IXFRSerialError(IXFRFormError):
+    """The SOA serial numbers of an IXFR response did not connect properly.
+
+    RFC 1995 requires the deletion set of each difference to start with the
+    serial already known to the receiver, and each following addition set to
+    introduce a newer serial.  The first and the final SOA must carry the
+    newest serial and be identical.
+    """
+
+
+class IXFRDeleteNotExact(IXFRFormError):
+    """An IXFR deletion set removed an RR that was not present.
+
+    A well-formed IXFR only deletes records currently in the zone, so a delete
+    of a missing RR indicates a corrupt or out-of-sync transfer rather than a
+    harmless no-op.
+    """
+
+
+class IXFRDuplicateAdd(IXFRFormError):
+    """An IXFR addition set added an RR that was already present.
+
+    A well-formed IXFR only adds records that are not already in the zone.
+    Duplicate additions are merged harmlessly by a plain add(), but reporting
+    them makes a corrupt transfer diagnosable.
+    """
+
+
+class _Mode(enum.Enum):
+    # We are still consuming the RFC 1995 incremental difference sequence.
+    IXFR = enum.auto()
+    # A non-SOA RR arrived where the second SOA of an IXFR was required, so
+    # the server answered an IXFR query with an AXFR-style full zone; the
+    # original (empty) incremental transaction has been rolled back and a
+    # replacement writer is consuming the full zone.
+    AXFR_FALLBACK = enum.auto()
+    # A genuine AXFR transfer (either requested directly or after the mode
+    # above has been entered).
+    AXFR = enum.auto()
+
+
 class Inbound:
     """
     State machine for zone transfers.
@@ -64,6 +117,8 @@ class Inbound:
         is_udp: bool = False,
         raise_on_serial_went_backwards: bool = True,
         transaction_setup: Callable[[dns.transaction.Transaction], None] | None = None,
+        raise_on_delete_missing: bool = True,
+        raise_on_duplicate_add: bool = True,
     ):
         """Initialize an inbound zone transfer.
 
@@ -82,6 +137,23 @@ class Inbound:
             alter the transaction's configuration before it is used, for example adding
             checking policies.
         :type transaction_setup: None or dns.transaction.TransactionSetup
+
+        :param raise_on_delete_missing: If ``True`` (the default), an IXFR
+            deletion set that removes an RR which is not present in the zone
+            raises :class:`dns.xfr.IXFRDeleteNotExact` instead of silently
+            ignoring the missing data.  Set to ``False`` to treat such deletes
+            as permissive no-ops.  This only affects genuine IXFR difference
+            sequences; an AXFR (including an AXFR returned in answer to an
+            IXFR query) replaces the whole zone and never deletes individual
+            RRs.
+        :type raise_on_delete_missing: bool
+
+        :param raise_on_duplicate_add: If ``True`` (the default), an IXFR
+            addition set that adds an RR which is already present in the zone
+            raises :class:`dns.xfr.IXFRDuplicateAdd`.  Set to ``False`` to
+            keep the traditional set-semantics behavior where the duplicate is
+            merged silently.
+        :type raise_on_duplicate_add: bool
         """
         self.txn_manager = txn_manager
         self.txn: dns.transaction.Transaction | None = None
@@ -106,8 +178,19 @@ class Inbound:
         self.done = False
         self.expecting_SOA = False
         self.delete_mode = False
+        # Whether the transfer is currently consuming an RFC 1995 incremental
+        # difference sequence.  It flips to False exactly once, when (and if)
+        # the server answers an IXFR query with an AXFR-style full zone.
+        self.mode = _Mode.IXFR if self.incremental else _Mode.AXFR
         self.raise_on_serial_went_backwards = raise_on_serial_went_backwards
+        self.raise_on_delete_missing = raise_on_delete_missing
+        self.raise_on_duplicate_add = raise_on_duplicate_add
         self.transaction_setup = transaction_setup
+        # Diagnostics counters; they survive commit and make malformed but
+        # tolerated transfers observable when the corresponding raise flags
+        # are disabled.
+        self.missing_deletes = 0
+        self.duplicate_adds = 0
 
     def _check_tsig(self, message: dns.message.Message) -> None:
         # RFC 8945 section 5.3.1 lets the messages in the middle of a signed
@@ -117,12 +200,189 @@ class Inbound:
         if message.request_mac and not message.had_tsig:
             raise dns.exception.FormError("missing TSIG")
 
+    def _start_writer(self, replacement: bool) -> dns.transaction.Transaction:
+        txn = self.txn_manager.writer(replacement)
+        if self.transaction_setup is not None:
+            self.transaction_setup(txn)
+        return txn
+
+    def _switch_to_axfr(self) -> None:
+        # An IXFR query was answered with an AXFR-style full zone (RFC 1995
+        # section 2: the first record after the leading SOA is not an SOA).
+        # Nothing from the incremental phase may leak into the full zone: the
+        # incremental writer is discarded before any of its changes could be
+        # committed, and a fresh replacement writer owns the whole transfer.
+        # The switch happens at most once, and never again once in AXFR mode.
+        assert self.txn is not None
+        self.txn.rollback()
+        self.txn = self._start_writer(True)
+        self.incremental = False
+        self.mode = _Mode.AXFR_FALLBACK
+        self.expecting_SOA = False
+        self.delete_mode = False
+
+    def _serial_value(self, rdataset: dns.rdataset.Rdataset) -> int:
+        soa = cast(dns.rdtypes.ANY.SOA.SOA, rdataset[0])
+        return soa.serial
+
+    def _check_ixfr_soa(
+        self, rdataset: dns.rdataset.Rdataset, entering_delete_mode: bool
+    ) -> None:
+        """Validate the serial continuity of a non-final origin SOA in an IXFR.
+
+        *entering_delete_mode* is ``True`` when this SOA opens a deletion set
+        (the zone serial being removed) and ``False`` when it opens an
+        addition set (the zone serial being introduced).
+        """
+        # This helper only runs inside a genuine IXFR difference sequence, for
+        # which a base serial is mandatory.
+        assert self.serial is not None
+        base_serial = self.serial
+        serial = self._serial_value(rdataset)
+        if entering_delete_mode:
+            # RFC 1995: a deletion set starts with the SOA of the version the
+            # receiver is expected to already have, so its serial must be the
+            # one we have built up to so far (the requested base for the first
+            # difference, the previous addition serial thereafter).
+            if serial != base_serial:
+                raise IXFRSerialError(
+                    f"IXFR base serial mismatch: expected {base_serial}, "
+                    f"got {serial}"
+                )
+        else:
+            # The addition set must move the serial strictly forward in
+            # RFC 1982 serial arithmetic.  Equality means an empty/no-op
+            # difference and a backwards value means a corrupt stream; both
+            # break the required serial chain.
+            if not (dns.serial.Serial(serial) > dns.serial.Serial(base_serial)):
+                raise IXFRSerialError(
+                    f"IXFR addition serial {serial} did not advance from "
+                    f"{base_serial}"
+                )
+
+    def _handle_origin_soa(
+        self,
+        name: dns.name.Name,
+        rdataset: dns.rdataset.Rdataset,
+        message: dns.message.Message,
+    ) -> None:
+        assert self.txn is not None
+        if self.incremental:
+            # Every origin SOA in an IXFR alternates between opening a
+            # deletion set and an addition set.
+            self.delete_mode = not self.delete_mode
+        #
+        # If this SOA rdataset is equal to the first one we saw then the
+        # transfer is finished.  In an IXFR the closing SOA is always the one
+        # that opens a deletion set, so we additionally require delete mode.
+        #
+        if rdataset == self.soa_rdataset and (
+            (not self.incremental) or self.delete_mode
+        ):
+            # This is the final SOA.
+            if self.expecting_SOA:
+                # We got an empty IXFR sequence!
+                raise IXFRFormError("empty IXFR sequence")
+            if self.incremental:
+                # The closing SOA must carry exactly the serial the addition
+                # sets have built up to; otherwise the differences do not end
+                # at the advertised newest serial.
+                if self.serial != self._serial_value(rdataset):
+                    raise IXFRSerialError("unexpected end of IXFR sequence")
+            # The last message must be TSIG-signed when the request was; this
+            # has to happen before the commit below.  The check is driven by
+            # the final SOA rrset, not a message boundary, so it holds however
+            # the response is split into messages.
+            self._check_tsig(message)
+            self.txn.replace(name, rdataset)
+            self.txn.commit()
+            self.txn = None
+            self.done = True
+            return
+        #
+        # This is not the final SOA.
+        #
+        self.expecting_SOA = False
+        if self.incremental:
+            entering_delete_mode = self.delete_mode
+            self._check_ixfr_soa(rdataset, entering_delete_mode)
+            if not entering_delete_mode:
+                # This is the start of an IXFR addition set.  Track the new
+                # serial and install the new SOA as zone content.
+                self.serial = self._serial_value(rdataset)
+                self.txn.replace(name, rdataset)
+        else:
+            # We saw a non-final SOA for the origin in an AXFR.
+            raise dns.exception.FormError("unexpected origin SOA in AXFR")
+
+    def _rrset_exists(
+        self, name: dns.name.Name, rdataset: dns.rdataset.Rdataset
+    ) -> bool:
+        assert self.txn is not None
+        existing = self.txn.get(name, rdataset.rdtype, rdataset.covers)
+        if existing is None:
+            return False
+        return bool(existing.intersection(rdataset))
+
+    def _handle_rrset(
+        self, name: dns.name.Name, rdataset: dns.rdataset.Rdataset
+    ) -> None:
+        assert self.txn is not None
+        if self.expecting_SOA:
+            #
+            # We made an IXFR request and were expecting the second SOA RR,
+            # but saw something else, so this is an AXFR-style response.  The
+            # (still empty) incremental transaction is discarded and a
+            # replacement writer takes over before this rrset is written, so
+            # no incremental delete/add is ever applied to the full zone.
+            #
+            self._switch_to_axfr()
+        # Ignore glue that is not a subdomain of the origin.  For pathological
+        # cases it would be good if we could keep it in some side location, but
+        # dnspython zones don't have a place or an API for that, so we just ignore
+        # it at this time.
+        if not name.is_subdomain(self.origin):
+            return
+        exists = self._rrset_exists(name, rdataset)
+        if self.delete_mode:
+            # RFC 1995 deletion sets only remove records that are present.
+            if not exists:
+                if self.raise_on_delete_missing:
+                    raise IXFRDeleteNotExact(
+                        f"IXFR deletion set removes a missing RR: {name} "
+                        f"{dns.rdatatype.to_text(rdataset.rdtype)}"
+                    )
+                self.missing_deletes += 1
+            # delete() is permissive when an RR is absent; delete_exact()
+            # would raise the transaction layer's own DeleteNotExact.
+            if self.raise_on_delete_missing:
+                self.txn.delete_exact(name, rdataset)
+            else:
+                self.txn.delete(name, rdataset)
+        else:
+            # Duplicate additions are set-semantics no-ops at the transaction
+            # layer, but a well-formed IXFR does not repeat records, so make
+            # the condition diagnosable when requested.
+            if self.incremental and exists:
+                if self.raise_on_duplicate_add:
+                    raise IXFRDuplicateAdd(
+                        f"IXFR addition set adds an existing RR: {name} "
+                        f"{dns.rdatatype.to_text(rdataset.rdtype)}"
+                    )
+                self.duplicate_adds += 1
+            self.txn.add(name, rdataset)
+
     def process_message(self, message: dns.message.Message) -> bool:
         """Process one message in the transfer.
 
         The message should have the same relativization as was specified when
         the `dns.xfr.Inbound` was created.  The message should also have been
         created with `one_rr_per_rrset=True` because order matters.
+
+        The state machine is driven purely by the ordered RRsets across all
+        messages, never by message boundaries, so splitting or joining the
+        response into different numbers of messages yields the same final
+        zone state.
 
         If the request was TSIG-signed, i.e. the message was parsed with a
         nonempty *request_mac*, then the first and the last message of the
@@ -131,9 +391,10 @@ class Inbound:
         Returns `True` if the transfer is complete, and `False` otherwise.
         """
         if self.txn is None:
-            self.txn = self.txn_manager.writer(not self.incremental)
-            if self.transaction_setup is not None:
-                self.transaction_setup(self.txn)
+            # An IXFR starts with an incremental writer; an AXFR starts with a
+            # replacement writer.  If an IXFR turns out to be an AXFR-style
+            # response, the transaction is swapped once in _switch_to_axfr().
+            self.txn = self._start_writer(not self.incremental)
         rcode = message.rcode()
         if rcode != dns.rcode.NOERROR:
             raise TransferError(rcode)
@@ -195,85 +456,10 @@ class Inbound:
             rdataset = rrset
             if self.done:
                 raise dns.exception.FormError("answers after final SOA")
-            assert self.txn is not None  # for mypy
             if rdataset.rdtype == dns.rdatatype.SOA and name == self.origin:
-                #
-                # Every time we see an origin SOA delete_mode inverts
-                #
-                if self.incremental:
-                    self.delete_mode = not self.delete_mode
-                #
-                # If this SOA Rdataset is equal to the first we saw
-                # then we're finished. If this is an IXFR we also
-                # check that we're seeing the record in the expected
-                # part of the response.
-                #
-                if rdataset == self.soa_rdataset and (
-                    (not self.incremental) or self.delete_mode
-                ):
-                    #
-                    # This is the final SOA
-                    #
-                    soa = cast(dns.rdtypes.ANY.SOA.SOA, rdataset[0])
-                    if self.expecting_SOA:
-                        # We got an empty IXFR sequence!
-                        raise dns.exception.FormError("empty IXFR sequence")
-                    if self.incremental and self.serial != soa.serial:
-                        raise dns.exception.FormError("unexpected end of IXFR sequence")
-                    self._check_tsig(message)
-                    self.txn.replace(name, rdataset)
-                    self.txn.commit()
-                    self.txn = None
-                    self.done = True
-                else:
-                    #
-                    # This is not the final SOA
-                    #
-                    self.expecting_SOA = False
-                    soa = cast(dns.rdtypes.ANY.SOA.SOA, rdataset[0])
-                    if self.incremental:
-                        if self.delete_mode:
-                            # This is the start of an IXFR deletion set
-                            if soa.serial != self.serial:
-                                raise dns.exception.FormError(
-                                    "IXFR base serial mismatch"
-                                )
-                        else:
-                            # This is the start of an IXFR addition set
-                            self.serial = soa.serial
-                            self.txn.replace(name, rdataset)
-                    else:
-                        # We saw a non-final SOA for the origin in an AXFR.
-                        raise dns.exception.FormError("unexpected origin SOA in AXFR")
-                continue
-            if self.expecting_SOA:
-                #
-                # We made an IXFR request and are expecting another
-                # SOA RR, but saw something else, so this must be an
-                # AXFR response.
-                #
-                self.incremental = False
-                self.expecting_SOA = False
-                self.delete_mode = False
-                self.txn.rollback()
-                self.txn = self.txn_manager.writer(True)
-                if self.transaction_setup is not None:
-                    self.transaction_setup(self.txn)
-                #
-                # Note we are falling through into the code below
-                # so whatever rdataset this was gets written.
-                #
-            # Ignore glue that is not a subdomain of the origin.  For pathological
-            # cases it would be good if we could keep it in some side location, but
-            # dnspython zones don't have a place or an API for that, so we just ignore
-            # it at this time.
-            if not name.is_subdomain(self.origin):
-                continue
-            # Add or remove the data
-            if self.delete_mode:
-                self.txn.delete_exact(name, rdataset)
+                self._handle_origin_soa(name, rdataset, message)
             else:
-                self.txn.add(name, rdataset)
+                self._handle_rrset(name, rdataset)
         if self.is_udp and not self.done:
             #
             # This is a UDP IXFR and we didn't get to done, and we didn't

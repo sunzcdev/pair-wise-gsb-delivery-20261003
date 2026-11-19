@@ -1,6 +1,7 @@
 # Copyright (C) Dnspython Contributors, see LICENSE for text of ISC license
 
 import asyncio
+import itertools
 import sys
 
 import pytest
@@ -9,11 +10,15 @@ import dns.asyncbackend
 import dns.asyncquery
 import dns.flags
 import dns.message
+import dns.name
 import dns.opcode
 import dns.query
+import dns.rcode
+import dns.rdatatype
 import dns.tsigkeyring
 import dns.versioned
 import dns.xfr
+import dns.zone
 
 # Some tests use a "nano nameserver" for testing.  It requires trio
 # and threading, so try to import it and if it doesn't work, skip
@@ -495,6 +500,287 @@ def test_ixfr_bad_serial():
     with dns.xfr.Inbound(z, dns.rdatatype.IXFR, serial=1) as xfr:
         with pytest.raises(dns.exception.FormError):
             xfr.process_message(m)
+
+
+#
+# An IXFR deletion set must only remove records that are present; an addition
+# set must only add records that are absent.  Both conditions are diagnosable,
+# and a failure must leave the pre-transfer zone untouched because the writer
+# transaction is rolled back.
+#
+ixfr_missing_delete = """id 1
+opcode QUERY
+rcode NOERROR
+flags QR AA
+;QUESTION
+example. IN IXFR
+;ANSWER
+@ 3600 IN SOA foo bar 2 2 3 4 5
+@ 3600 IN SOA foo bar 1 2 3 4 5
+ns9 3600 IN A 10.0.0.9
+@ 3600 IN SOA foo bar 2 2 3 4 5
+@ 3600 IN SOA foo bar 2 2 3 4 5
+"""
+
+ixfr_duplicate_add = """id 1
+opcode QUERY
+rcode NOERROR
+flags QR AA
+;QUESTION
+example. IN IXFR
+;ANSWER
+@ 3600 IN SOA foo bar 2 2 3 4 5
+@ 3600 IN SOA foo bar 1 2 3 4 5
+@ 3600 IN SOA foo bar 2 2 3 4 5
+ns1 3600 IN A 10.0.0.1
+@ 3600 IN SOA foo bar 2 2 3 4 5
+"""
+
+
+def test_ixfr_missing_delete_raises_and_rolls_back():
+    z = dns.zone.from_text(base, "example.", zone_factory=dns.versioned.Zone)
+    m = dns.message.from_text(
+        ixfr_missing_delete, origin=z.origin, one_rr_per_rrset=True
+    )
+    with dns.xfr.Inbound(z, dns.rdatatype.IXFR, serial=1) as xfr:
+        with pytest.raises(dns.xfr.IXFRDeleteNotExact):
+            xfr.process_message(m)
+    # The whole transfer was rolled back; the old zone is intact.
+    assert z == dns.zone.from_text(base, "example.")
+
+
+def test_ixfr_missing_delete_permissive():
+    z = dns.zone.from_text(base, "example.", zone_factory=dns.versioned.Zone)
+    m = dns.message.from_text(
+        ixfr_missing_delete, origin=z.origin, one_rr_per_rrset=True
+    )
+    with dns.xfr.Inbound(
+        z, dns.rdatatype.IXFR, serial=1, raise_on_delete_missing=False
+    ) as xfr:
+        assert xfr.process_message(m)
+        assert xfr.missing_deletes == 1
+    assert z.find_rdataset(dns.name.empty, dns.rdatatype.SOA)[0].serial == 2
+
+
+def test_ixfr_duplicate_add_raises_and_rolls_back():
+    z = dns.zone.from_text(base, "example.", zone_factory=dns.versioned.Zone)
+    m = dns.message.from_text(
+        ixfr_duplicate_add, origin=z.origin, one_rr_per_rrset=True
+    )
+    with dns.xfr.Inbound(z, dns.rdatatype.IXFR, serial=1) as xfr:
+        with pytest.raises(dns.xfr.IXFRDuplicateAdd):
+            xfr.process_message(m)
+    assert z == dns.zone.from_text(base, "example.")
+
+
+def test_ixfr_duplicate_add_permissive():
+    z = dns.zone.from_text(base, "example.", zone_factory=dns.versioned.Zone)
+    m = dns.message.from_text(
+        ixfr_duplicate_add, origin=z.origin, one_rr_per_rrset=True
+    )
+    with dns.xfr.Inbound(
+        z, dns.rdatatype.IXFR, serial=1, raise_on_duplicate_add=False
+    ) as xfr:
+        assert xfr.process_message(m)
+        assert xfr.duplicate_adds == 1
+
+
+def test_ixfr_diagnostic_errors_are_form_errors():
+    # Backwards compatibility: every IXFR content diagnostic remains a
+    # FormError, so existing callers catching FormError keep working.
+    assert issubclass(dns.xfr.IXFRDeleteNotExact, dns.exception.FormError)
+    assert issubclass(dns.xfr.IXFRDuplicateAdd, dns.exception.FormError)
+    assert issubclass(dns.xfr.IXFRSerialError, dns.exception.FormError)
+    assert issubclass(dns.xfr.IXFRFormError, dns.exception.FormError)
+
+
+#
+# SOA serial continuity: each addition set must advance the serial (RFC 1982
+# arithmetic) and each deletion set must reopen the serial built up so far.
+#
+ixfr_addition_serial_not_advancing = """id 1
+opcode QUERY
+rcode NOERROR
+flags QR AA
+;QUESTION
+example. IN IXFR
+;ANSWER
+@ 3600 IN SOA foo bar 2 2 3 4 5
+@ 3600 IN SOA foo bar 1 2 3 4 5
+ns2 3600 IN A 10.0.0.2
+@ 3600 IN SOA foo bar 1 2 3 4 5
+ns3 3600 IN A 10.0.0.3
+@ 3600 IN SOA foo bar 1 2 3 4 5
+@ 3600 IN SOA foo bar 2 2 3 4 5
+"""
+
+ixfr_second_delta_base_mismatch = """id 1
+opcode QUERY
+rcode NOERROR
+flags QR AA
+;QUESTION
+example. IN IXFR
+;ANSWER
+@ 3600 IN SOA foo bar 5 2 3 4 5
+@ 3600 IN SOA foo bar 1 2 3 4 5
+ns2 3600 IN A 10.0.0.2
+@ 3600 IN SOA foo bar 4 2 3 4 5
+ns3 3600 IN A 10.0.0.3
+@ 3600 IN SOA foo bar 4 2 3 4 5
+@ 3600 IN SOA foo bar 3 2 3 4 5
+"""
+
+
+def test_ixfr_addition_serial_must_advance():
+    z = dns.zone.from_text(base, "example.", zone_factory=dns.versioned.Zone)
+    m = dns.message.from_text(
+        ixfr_addition_serial_not_advancing,
+        origin=z.origin,
+        one_rr_per_rrset=True,
+    )
+    with dns.xfr.Inbound(z, dns.rdatatype.IXFR, serial=1) as xfr:
+        with pytest.raises(dns.xfr.IXFRSerialError):
+            xfr.process_message(m)
+    assert z == dns.zone.from_text(base, "example.")
+
+
+def test_ixfr_second_delta_serial_chain():
+    z = dns.zone.from_text(base, "example.", zone_factory=dns.versioned.Zone)
+    m = dns.message.from_text(
+        ixfr_second_delta_base_mismatch,
+        origin=z.origin,
+        one_rr_per_rrset=True,
+    )
+    with dns.xfr.Inbound(z, dns.rdatatype.IXFR, serial=1) as xfr:
+        with pytest.raises(dns.xfr.IXFRSerialError):
+            xfr.process_message(m)
+    assert z == dns.zone.from_text(base, "example.")
+
+
+def test_ixfr_serial_wraparound_advances():
+    # RFC 1982 serial arithmetic: going from 2^32-1 to 1 is an advance.
+    wrap_base = """@ 3600 IN SOA foo bar 4294967295 2 3 4 5
+@ 3600 IN NS ns1
+ns2 3600 IN A 10.0.0.2
+"""
+    wrap_ixfr = """id 1
+opcode QUERY
+rcode NOERROR
+flags QR AA
+;QUESTION
+example. IN IXFR
+;ANSWER
+@ 3600 IN SOA foo bar 1 2 3 4 5
+@ 3600 IN SOA foo bar 4294967295 2 3 4 5
+ns2 3600 IN A 10.0.0.2
+@ 3600 IN SOA foo bar 1 2 3 4 5
+ns3 3600 IN A 10.0.0.3
+@ 3600 IN SOA foo bar 1 2 3 4 5
+"""
+    z = dns.zone.from_text(wrap_base, "example.", zone_factory=dns.versioned.Zone)
+    m = dns.message.from_text(wrap_ixfr, origin=z.origin, one_rr_per_rrset=True)
+    with dns.xfr.Inbound(z, dns.rdatatype.IXFR, serial=0xFFFFFFFF) as xfr:
+        assert xfr.process_message(m)
+    assert z.find_rdataset(dns.name.empty, dns.rdatatype.SOA)[0].serial == 1
+
+
+#
+# An IXFR query answered with an AXFR-style full zone must be detected before
+# any incremental delete/add is applied, and the detection must not depend on
+# where message boundaries happen to fall.
+#
+def test_ixfr_axfr_fallback_switch_state():
+    z = dns.versioned.Zone("example.")
+    m = dns.message.from_text(ixfr_axfr, origin=z.origin, one_rr_per_rrset=True)
+    with dns.xfr.Inbound(z, dns.rdatatype.IXFR, serial=0xFFFFFFFF) as xfr:
+        assert xfr.mode == dns.xfr._Mode.IXFR
+        assert xfr.incremental
+        assert xfr.process_message(m)
+        assert xfr.mode == dns.xfr._Mode.AXFR_FALLBACK
+        assert not xfr.incremental
+    assert z == dns.zone.from_text(base, "example.")
+
+
+def test_ixfr_axfr_fallback_tolerates_full_zone_duplicates():
+    # The replacement full zone legitimately contains RRs also present in the
+    # old zone; those must not be misread as IXFR duplicate additions once the
+    # mode has switched to AXFR.
+    z = dns.zone.from_text(base, "example.", zone_factory=dns.versioned.Zone)
+    m = dns.message.from_text(ixfr_axfr, origin=z.origin, one_rr_per_rrset=True)
+    with dns.xfr.Inbound(z, dns.rdatatype.IXFR, serial=0xFFFFFFFF) as xfr:
+        assert xfr.process_message(m)
+        assert xfr.duplicate_adds == 0
+        assert xfr.missing_deletes == 0
+    assert z == dns.zone.from_text(base, "example.")
+
+
+def _message_from_rrsets(rrsets):
+    m = dns.message.Message()
+    m.flags = dns.flags.QR | dns.flags.AA
+    m.set_rcode(dns.rcode.NOERROR)
+    m.answer = list(rrsets)
+    return m
+
+
+def _run_with_splits(text, serial, split_points, zone_factory=dns.versioned.Zone):
+    template = dns.zone.from_text(base, "example.", zone_factory=zone_factory)
+    whole = dns.message.from_text(text, origin=template.origin, one_rr_per_rrset=True)
+    rrsets = whole.answer
+    n = len(rrsets)
+    bounds = sorted(set([0] + list(split_points) + [n]))
+    z = dns.zone.from_text(base, "example.", zone_factory=zone_factory)
+    with dns.xfr.Inbound(z, dns.rdatatype.IXFR, serial=serial) as xfr:
+        done = False
+        for i in range(len(bounds) - 1):
+            part = rrsets[bounds[i] : bounds[i + 1]]
+            done = xfr.process_message(_message_from_rrsets(part))
+    return done, z
+
+
+@pytest.mark.parametrize("text,serial", [(ixfr, 1), (compressed_ixfr, 1)])
+def test_ixfr_chunk_independence(text, serial):
+    # Every possible way of splitting the ordered RR stream into messages
+    # must reach the same terminal state as processing it as one message.
+    whole = dns.message.from_text(
+        text,
+        origin=dns.name.from_text("example."),
+        one_rr_per_rrset=True,
+    )
+    n = len(whole.answer)
+    _, reference = _run_with_splits(text, serial, [n])
+    for r in range(1, n):
+        for splits in itertools.combinations(range(1, n), r):
+            done, z = _run_with_splits(text, serial, list(splits))
+            assert done
+            assert z == reference
+
+
+def test_ixfr_axfr_fallback_chunk_independence():
+    whole = dns.message.from_text(
+        ixfr_axfr,
+        origin=dns.name.from_text("example."),
+        one_rr_per_rrset=True,
+    )
+    n = len(whole.answer)
+    _, reference = _run_with_splits(ixfr_axfr, 0xFFFFFFFF, [n])
+    for r in range(1, n):
+        for splits in itertools.combinations(range(1, n), r):
+            done, z = _run_with_splits(ixfr_axfr, 0xFFFFFFFF, list(splits))
+            assert done
+            assert z == reference
+
+
+def test_ixfr_chunk_independence_unversioned():
+    # The plain (non-versioned) Zone must reach the same state too.
+    whole = dns.message.from_text(
+        ixfr, origin=dns.name.from_text("example."), one_rr_per_rrset=True
+    )
+    n = len(whole.answer)
+    _, reference = _run_with_splits(ixfr, 1, [n], zone_factory=dns.zone.Zone)
+    for splits in ([1], [n // 2], [1, n // 2], list(range(1, n))):
+        done, z = _run_with_splits(ixfr, 1, list(splits), zone_factory=dns.zone.Zone)
+        assert done
+        assert z == reference
 
 
 def test_no_udp_with_axfr():
