@@ -530,6 +530,58 @@ def test_cat_ranges_on_error_raise_propagates():
         fs.cat_ranges(["ok", "missing"], [0, 0], [4, 4], on_error="raise")
 
 
+class _RecordingCatRangesFS(fsspec.asyn.AsyncFileSystem):
+    cachable = False
+    store = {"ok": b"0123456789"}
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.reads = []
+
+    async def _cat_file(self, path, start=None, end=None, **kwargs):
+        self.reads.append((path, start, end))
+        if path not in self.store:
+            raise FileNotFoundError(path)
+        return self.store[path][start:end]
+
+
+@pytest.mark.asyncio
+async def test_async_cat_ranges_merges_and_restores_order():
+    fs = _RecordingCatRangesFS()
+    out = await fs._cat_ranges(
+        ["ok", "ok", "ok", "ok"], [0, 4, 5, 8], [6, 9, 7, 10]
+    )
+
+    assert fs.reads == [("ok", 0, 10)]
+    assert out == [b"012345", b"45678", b"56", b"89"]
+
+    # duplicates come back separately from a single read
+    fs.reads.clear()
+    out = await fs._cat_ranges(["ok"] * 3, [3, 3, 3], [7, 7, 7])
+    assert fs.reads == [("ok", 3, 7)]
+    assert out == [b"3456"] * 3
+
+    # a failure attaches to the original requests, not the merged read
+    out = await fs._cat_ranges(["ok", "missing", "missing"], [0, 0, 5], [4, 4, 9])
+    assert out[0] == b"0123"
+    assert isinstance(out[1], FileNotFoundError)
+    assert isinstance(out[2], FileNotFoundError)
+
+    with pytest.raises(FileNotFoundError):
+        await fs._cat_ranges(["ok", "missing"], [0, 0], [4, 4], on_error="raise")
+
+
+@pytest.mark.asyncio
+async def test_async_cat_ranges_plan_makes_no_io():
+    fs = _RecordingCatRangesFS()
+    plan = fs.cat_ranges_plan(["ok", "ok"], [0, 4], [4, 8])
+    assert fs.reads == []
+    assert plan.read_count == 1
+
+    await fs._cat_ranges(["ok", "ok"], [0, 4], [4, 8])
+    assert fs.reads == [("ok", 0, 8)]
+
+
 # ---------------------------------------------------------------------------
 # Tests for the prefix= hint that _glob passes to _find
 # ---------------------------------------------------------------------------

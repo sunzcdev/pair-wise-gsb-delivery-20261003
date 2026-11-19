@@ -521,6 +521,8 @@ class CachingFileSystem(ChainedFileSystem):
             "_cat_file",
             "cat_ranges",
             "_cat_ranges",
+            # inherited, but planning must not be delegated to the target FS
+            "cat_ranges_plan",
             "_local_paths_for_ranges",
             "get",
             "read_block",
@@ -916,7 +918,15 @@ class WholeFileCacheFileSystem(CachingFileSystem):
         return lpaths, rpaths, download
 
     async def _cat_ranges(
-        self, paths, starts, ends, max_gap=None, on_error="return", **kwargs
+        self,
+        paths,
+        starts,
+        ends,
+        max_gap=None,
+        on_error="return",
+        max_span=None,
+        max_amplification=None,
+        **kwargs,
     ):
         logger.debug("async cat ranges %s", paths)
         # _local_paths_for_ranges, but the validity check is a coroutine here
@@ -944,7 +954,14 @@ class WholeFileCacheFileSystem(CachingFileSystem):
                 raise next(iter(errors.values()))
 
         out = LocalFileSystem().cat_ranges(
-            lpaths, starts, ends, max_gap=max_gap, on_error=on_error, **kwargs
+            lpaths,
+            starts,
+            ends,
+            max_gap=max_gap,
+            max_span=max_span,
+            max_amplification=max_amplification,
+            on_error=on_error,
+            **kwargs,
         )
         if on_error == "return":
             # report the download error, not the missing local copy
@@ -1097,14 +1114,29 @@ class SimpleCacheFileSystem(WholeFileCacheFileSystem):
             raise ValueError("path must be str or dict")
 
     def cat_ranges(
-        self, paths, starts, ends, max_gap=None, on_error="return", **kwargs
+        self,
+        paths,
+        starts,
+        ends,
+        max_gap=None,
+        on_error="return",
+        max_span=None,
+        max_amplification=None,
+        **kwargs,
     ):
         logger.debug("cat ranges %s", paths)
         lpaths, rpaths, download = self._local_paths_for_ranges(paths)
         if download:
             _atomic_get(self.fs, rpaths, download, callback=self.callback)
         return LocalFileSystem().cat_ranges(
-            lpaths, starts, ends, max_gap=max_gap, on_error=on_error, **kwargs
+            lpaths,
+            starts,
+            ends,
+            max_gap=max_gap,
+            max_span=max_span,
+            max_amplification=max_amplification,
+            on_error=on_error,
+            **kwargs,
         )
 
     def _get_cached_file_before_open(self, path, **kwargs):

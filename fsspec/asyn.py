@@ -11,7 +11,6 @@ import os
 import re
 import sys
 import threading
-from collections.abc import Iterable
 from glob import has_magic
 from typing import TYPE_CHECKING
 
@@ -672,6 +671,8 @@ class AsyncFileSystem(AbstractFileSystem):
         max_gap=None,
         batch_size=None,
         on_error="return",
+        max_span=None,
+        max_amplification=None,
         **kwargs,
     ):
         """Get the contents of byte ranges from one or more files
@@ -683,30 +684,32 @@ class AsyncFileSystem(AbstractFileSystem):
         starts, ends: int or list
             Bytes limits of the read. If using a single int, the same value will be
             used to read all the specified files.
+        max_gap, max_span, max_amplification:
+            Limits for merging overlapping or adjacent ranges, see
+            ``AbstractFileSystem.cat_ranges``.
         on_error: "return" or "raise"
             If "return" (default), any per-range exception is placed in the output
-            list at the corresponding position. Otherwise the first such exception
-            is raised. Matches ``AbstractFileSystem.cat_ranges``.
+            list at the corresponding position. Otherwise the exception for the
+            earliest original request is raised. Matches
+            ``AbstractFileSystem.cat_ranges``.
         """
-        if max_gap is not None:
-            # use utils.merge_offset_ranges
-            raise NotImplementedError
-        if not isinstance(paths, list):
-            raise TypeError
-        if not isinstance(starts, Iterable):
-            starts = [starts] * len(paths)
-        if not isinstance(ends, Iterable):
-            ends = [ends] * len(paths)
-        if len(starts) != len(paths) or len(ends) != len(paths):
-            raise ValueError
+        plan = self.cat_ranges_plan(
+            paths,
+            starts,
+            ends,
+            max_gap=max_gap,
+            max_span=max_span,
+            max_amplification=max_amplification,
+        )
         coros = [
-            self._cat_file(p, start=s, end=e, **kwargs)
-            for p, s, e in zip(paths, starts, ends)
+            self._cat_file(read.path, start=read.start, end=read.end, **kwargs)
+            for read in plan.reads
         ]
         batch_size = batch_size or self.batch_size
-        out = await _run_coros_in_chunks(
+        results = await _run_coros_in_chunks(
             coros, batch_size=batch_size, nofiles=True, return_exceptions=True
         )
+        out = plan.apply(results)
         if on_error != "return":
             ex = next(filter(is_exception, out), None)
             if ex is not None:

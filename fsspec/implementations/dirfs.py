@@ -235,6 +235,10 @@ class DirFileSystem(AsyncFileSystem, ChainedFileSystem):
     def cat_ranges(self, paths, starts, ends, *args, **kwargs):
         return self.fs.cat_ranges(self._join(paths), starts, ends, *args, **kwargs)
 
+    def cat_ranges_plan(self, paths, starts, ends, *args, **kwargs):
+        # join the paths so the plan shows the same reads cat_ranges issues
+        return self.fs.cat_ranges_plan(self._join(paths), starts, ends, *args, **kwargs)
+
     async def _put_file(self, lpath, rpath, **kwargs):
         return await self.fs._put_file(lpath, self._join(rpath), **kwargs)
 

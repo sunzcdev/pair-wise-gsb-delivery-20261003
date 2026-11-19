@@ -4,11 +4,13 @@ import contextlib
 import ctypes
 import logging
 import math
+import numbers
 import os
 import re
 import sys
 import tempfile
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
+from dataclasses import dataclass
 from functools import partial
 from hashlib import md5
 from importlib.metadata import version
@@ -745,6 +747,383 @@ def merge_offset_ranges(
             new_ends[-1] = end
 
     return new_paths, new_starts, new_ends
+
+
+@dataclass(frozen=True)
+class RangeRequest:
+    """One caller-supplied byte range, kept at its original position."""
+
+    index: int
+    path: str
+    start: int | None
+    end: int | None
+
+    @property
+    def empty(self) -> bool:
+        """Whether the range is known to be empty without any I/O.
+
+        Only ranges with non-negative bounds can be decided up front; the
+        others keep their ``cat_file`` slice semantics and are never treated
+        as empty.
+        """
+        return (
+            self.start is not None
+            and self.end is not None
+            and self.start >= 0
+            and self.end >= 0
+            and self.end <= self.start
+        )
+
+    @property
+    def length(self) -> int | None:
+        """Requested length, or ``None`` when it depends on the file size."""
+        if self.start is None or self.end is None:
+            return None
+        if self.start < 0 or self.end < 0:
+            return None
+        return max(0, self.end - self.start)
+
+
+@dataclass(frozen=True)
+class PlannedRead:
+    """One backend read, covering one or more original requests."""
+
+    index: int
+    path: str
+    start: int | None
+    end: int | None
+    requests: tuple[int, ...]
+
+    @property
+    def length(self) -> int | None:
+        if self.start is None or self.end is None:
+            return None
+        if self.start < 0 or self.end < 0:
+            return None
+        return max(0, self.end - self.start)
+
+
+@dataclass(frozen=True)
+class RangePlan:
+    """An auditable mapping from requested ranges to backend reads.
+
+    The plan is created without touching the filesystem: it only describes
+    which reads a ``cat_ranges`` call would issue, which original requests
+    each read covers, and the byte totals implied by the merge limits.
+    """
+
+    requests: tuple[RangeRequest, ...]
+    reads: tuple[PlannedRead, ...]
+    #: read index serving each request, in the original request order
+    request_to_read: tuple[int, ...]
+    max_gap: int = 0
+    max_span: int | None = None
+    max_amplification: int | None = None
+
+    @property
+    def read_count(self) -> int:
+        """Number of backend reads the plan would issue."""
+        return len(self.reads)
+
+    @property
+    def requested_bytes(self) -> int | None:
+        """Bytes explicitly requested, or ``None`` if a bound is unknown."""
+        lengths = [r.length for r in self.requests]
+        if any(length is None for length in lengths):
+            return None
+        return sum(lengths)
+
+    @property
+    def planned_bytes(self) -> int | None:
+        """Bytes the plan would read, or ``None`` if a read is open-ended."""
+        lengths = [r.length for r in self.reads]
+        if any(length is None for length in lengths):
+            return None
+        return sum(lengths)
+
+    @property
+    def amplification_bytes(self) -> int | None:
+        """Planned bytes minus requested bytes.
+
+        Equals the extra bytes read to bridge gaps, minus the bytes shared by
+        overlapping or repeated requests (which are read once but counted
+        once per request). It may therefore be negative, and it is the figure
+        capped by ``max_amplification`` only when there are no overlaps.
+        """
+        requested = self.requested_bytes
+        planned = self.planned_bytes
+        if requested is None or planned is None:
+            return None
+        return planned - requested
+
+    def audit(self, results: Sequence[bytes | Exception]) -> dict[str, Any]:
+        """Check what was actually read against this plan.
+
+        ``results`` are one item per planned read, as collected by
+        ``cat_ranges``. The returned mapping reports the actual read count,
+        the bytes fetched, and the bytes handed back in request order, next
+        to the planned figures, so a caller can verify the merge did what the
+        plan promised.
+        """
+        output = self.apply(results)
+        failed = sum(1 for result in results if isinstance(result, Exception))
+        bytes_read = sum(
+            len(result) for result in results if not isinstance(result, Exception)
+        )
+        output_bytes = sum(
+            len(value) for value in output if not isinstance(value, Exception)
+        )
+        sizes_match = (
+            failed > 0
+            or self.planned_bytes is None
+            or bytes_read == self.planned_bytes
+        )
+        return {
+            "read_count": len(results),
+            "planned_read_count": self.read_count,
+            "bytes_read": bytes_read,
+            "planned_bytes": self.planned_bytes,
+            "requested_bytes": self.requested_bytes,
+            "output_bytes": output_bytes,
+            "amplification_bytes": bytes_read - output_bytes,
+            "failed_reads": failed,
+            # a failed read has no length to compare, so only its presence
+            # and the read count are checked
+            "matches_plan": len(results) == self.read_count and sizes_match,
+        }
+
+    def to_dict(self) -> dict[str, Any]:
+        """A JSON-friendly description suitable for review or logging."""
+
+        def bound(value):
+            return None if value is None else int(value)
+
+        return {
+            "max_gap": self.max_gap,
+            "max_span": self.max_span,
+            "max_amplification": self.max_amplification,
+            "read_count": self.read_count,
+            "requested_bytes": self.requested_bytes,
+            "planned_bytes": self.planned_bytes,
+            "amplification_bytes": self.amplification_bytes,
+            "requests": [
+                {
+                    "index": r.index,
+                    "path": r.path,
+                    "start": bound(r.start),
+                    "end": bound(r.end),
+                    "read": self.request_to_read[r.index],
+                }
+                for r in self.requests
+            ],
+            "reads": [
+                {
+                    "index": read.index,
+                    "path": read.path,
+                    "start": bound(read.start),
+                    "end": bound(read.end),
+                    "requests": list(read.requests),
+                }
+                for read in self.reads
+            ],
+        }
+
+    def apply(self, results: Sequence[bytes | Exception]) -> list:
+        """Map one result per planned read back to the original request order.
+
+        Short reads and ranges past the end of a file fall out of the same
+        slicing rule as ``cat_file``. An exception is attached to every
+        original request the failed read covered, never to its merged
+        position.
+        """
+        if len(results) != len(self.reads):
+            raise ValueError(
+                f"expected {len(self.reads)} read results, got {len(results)}"
+            )
+        out: list = []
+        for request, read_index in zip(self.requests, self.request_to_read):
+            read = self.reads[read_index]
+            result = results[read_index]
+            if isinstance(result, Exception):
+                out.append(result)
+            elif (request.start, request.end) == (read.start, read.end):
+                # A request served by a read of exactly its own bounds keeps
+                # the result untouched, including negative/open bounds that
+                # cat_file resolved against the file size.
+                out.append(result)
+            else:
+                # Only non-negative bounded ranges are merged, so the request
+                # is a window into the merged block. A block shorter than
+                # requested (EOF) slices short, as cat_file does.
+                lo = request.start - read.start
+                hi = None if request.end is None else request.end - read.start
+                out.append(result[lo:hi])
+        return out
+
+
+def _normalize_bounds(paths, starts, ends):
+    if not isinstance(paths, list):
+        raise TypeError("paths must be a list")
+    n = len(paths)
+    if not isinstance(starts, Iterable) or isinstance(starts, (str, bytes)):
+        starts = [starts] * n
+    else:
+        starts = list(starts)
+    if not isinstance(ends, Iterable) or isinstance(ends, (str, bytes)):
+        ends = [ends] * n
+    else:
+        ends = list(ends)
+    if len(starts) != n or len(ends) != n:
+        raise ValueError("paths, starts and ends must have the same length")
+    return list(paths), starts, ends
+
+
+def _as_bound(value):
+    # numpy integers are numbers.Integral too; normalise for stable auditing
+    if isinstance(value, numbers.Integral):
+        return int(value)
+    return value
+
+
+def plan_cat_ranges(
+    paths,
+    starts,
+    ends,
+    max_gap: int | None = None,
+    max_span: int | None = None,
+    max_amplification: int | None = None,
+) -> RangePlan:
+    """Plan the backend reads a ``cat_ranges`` call would issue. No I/O.
+
+    Overlapping and adjacent ranges on the same path are merged. Merging is
+    bounded so that two small ranges far apart are never coalesced into a
+    large (or whole-file) read:
+
+    max_gap:
+        Largest gap, in bytes, that may be skipped to join two ranges.
+        ``None`` and ``0`` both mean only overlapping or exactly adjacent
+        ranges are merged.
+    max_span:
+        Largest length of one merged read. A single request longer than
+        ``max_span`` is still returned whole, as its own read.
+    max_amplification:
+        Largest total number of bytes the plan may read only to bridge gaps
+        between ranges. Overlaps and duplicates add nothing to this total, so
+        they never consume the budget. ``0`` therefore permits merging
+        overlapping or adjacent ranges but no gap filling.
+
+    Ranges with a negative or missing bound keep their exact ``cat_file``
+    semantics and are not merged. Empty ranges (``end <= start``) keep their
+    own read, so a missing path still fails exactly as it does for any other
+    request. Repeated ranges do not cause repeated reads, but are still
+    returned separately by :meth:`RangePlan.apply`.
+    """
+    paths, starts, ends = _normalize_bounds(paths, starts, ends)
+    if max_gap is None:
+        max_gap = 0
+    if max_gap < 0:
+        raise ValueError("max_gap must be non-negative")
+    if max_span is not None and max_span < 1:
+        raise ValueError("max_span must be a positive integer or None")
+    if max_amplification is not None and max_amplification < 0:
+        raise ValueError("max_amplification must be non-negative or None")
+
+    requests = tuple(
+        RangeRequest(i, path, _as_bound(start), _as_bound(end))
+        for i, (path, start, end) in enumerate(zip(paths, starts, ends))
+    )
+
+    # Internal mutable blocks; converted to immutable PlannedRead below
+    blocks: list[dict[str, Any]] = []
+    mergeable: dict[str, list[RangeRequest]] = {}
+    standalone: dict[tuple, int] = {}  # (path, start, end) -> block index
+
+    def new_block(request: RangeRequest) -> None:
+        blocks.append(
+            {
+                "path": request.path,
+                "start": request.start,
+                "end": request.end,
+                "requests": [request.index],
+            }
+        )
+
+    for request in requests:
+        if (
+            not request.empty
+            and request.start is not None
+            and request.start >= 0
+            and request.end is not None
+            and request.end >= 0
+        ):
+            mergeable.setdefault(request.path, []).append(request)
+        else:
+            # Empty ranges, whole-file requests and negative bounds keep their
+            # exact ``cat_file`` semantics (including its error for a missing
+            # path), so they are shared only when truly identical. Merging an
+            # empty range into a neighbour would instead add amplification.
+            key = (request.path, request.start, request.end)
+            if key not in standalone:
+                standalone[key] = len(blocks)
+                new_block(request)
+            else:
+                blocks[standalone[key]]["requests"].append(request.index)
+
+    gap_bytes = 0  # bytes fetched only to bridge gaps, for the budget
+    for group in mergeable.values():
+        group.sort(key=lambda r: (r.start, r.end, r.index))
+        current = None
+        for request in group:
+            if current is not None and request.start <= current["end"] + max_gap:
+                if request.end <= current["end"]:
+                    # Nested inside the open block: no extra bytes to read,
+                    # and no gap credit either
+                    current["requests"].append(request.index)
+                    continue
+                gap = request.start - current["end"]
+                span = request.end - current["start"]
+                if (max_span is not None and span > max_span) or (
+                    max_amplification is not None
+                    and gap_bytes + gap > max_amplification
+                ):
+                    # Limits reached: this request starts its own read
+                    current = None
+                else:
+                    current["end"] = request.end
+                    current["requests"].append(request.index)
+                    gap_bytes += gap
+                    continue
+            new_block(request)
+            current = blocks[-1]
+
+    # Give reads a stable, review-friendly order: by first original request
+    order = sorted(range(len(blocks)), key=lambda i: min(blocks[i]["requests"]))
+    renumbered = {old: new for new, old in enumerate(order)}
+    reads = []
+    request_to_read = [-1] * len(requests)
+    for old in order:
+        block = blocks[old]
+        read_index = renumbered[old]
+        for request_index in block["requests"]:
+            request_to_read[request_index] = read_index
+        reads.append(
+            PlannedRead(
+                index=read_index,
+                path=block["path"],
+                start=block["start"],
+                end=block["end"],
+                requests=tuple(block["requests"]),
+            )
+        )
+
+    return RangePlan(
+        requests=requests,
+        reads=tuple(reads),
+        request_to_read=tuple(request_to_read),
+        max_gap=max_gap,
+        max_span=max_span,
+        max_amplification=max_amplification,
+    )
 
 
 def file_size(filelike: IO[bytes]) -> int:

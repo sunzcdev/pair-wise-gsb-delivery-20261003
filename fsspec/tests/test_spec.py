@@ -2076,6 +2076,120 @@ def test_cat_ranges_forwards_kwargs():
     assert received == [{"block_size": 42}, {"block_size": 42}]
 
 
+class _RangeRecordingFS(AbstractFileSystem):
+    """In-memory FS that records every backend read it performs."""
+
+    cachable = False
+    protocol = "rangerecording"
+
+    def __init__(self, files, **kwargs):
+        super().__init__(**kwargs)
+        self.files = files
+        self.reads = []
+
+    def cat_file(self, path, start=None, end=None, **kwargs):
+        self.reads.append((path, start, end))
+        if path not in self.files:
+            raise FileNotFoundError(path)
+        return self.files[path][start:end]
+
+
+def test_cat_ranges_merges_overlapping_reads_and_restores_order():
+    fs = _RangeRecordingFS({"/f": b"0123456789"})
+    paths = ["/f", "/f", "/f", "/f"]
+    starts = [0, 4, 5, 8]
+    ends = [6, 9, 7, 10]
+
+    out = fs.cat_ranges(paths, starts, ends)
+
+    # a single read covers the whole overlapping/adjacent span
+    assert fs.reads == [("/f", 0, 10)]
+    assert out == [b"012345", b"45678", b"56", b"89"]
+
+
+def test_cat_ranges_returns_duplicates_separately():
+    fs = _RangeRecordingFS({"/f": b"0123456789"})
+    out = fs.cat_ranges(["/f", "/f", "/f"], [3, 3, 3], [7, 7, 7])
+
+    assert fs.reads == [("/f", 3, 7)]
+    assert out == [b"3456", b"3456", b"3456"]
+
+
+def test_cat_ranges_does_not_merge_distant_ranges():
+    content = b"0123456789" * 100
+    fs = _RangeRecordingFS({"/f": content})
+    out = fs.cat_ranges(["/f", "/f"], [0, 900], [1, 901])
+
+    # without a gap budget each small range is its own read
+    assert fs.reads == [("/f", 0, 1), ("/f", 900, 901)]
+    assert out == [content[0:1], content[900:901]]
+
+
+def test_cat_ranges_gap_and_budget_are_honoured():
+    fs = _RangeRecordingFS({"/f": b"x" * 1000})
+
+    # max_gap alone merges across the gap
+    fs.reads.clear()
+    fs.cat_ranges(["/f", "/f"], [0, 10], [1, 11], max_gap=10)
+    assert fs.reads == [("/f", 0, 11)]
+
+    # a max_span smaller than the merged span keeps them apart
+    fs.reads.clear()
+    fs.cat_ranges(["/f", "/f"], [0, 10], [10, 20], max_span=15)
+    assert fs.reads == [("/f", 0, 10), ("/f", 10, 20)]
+
+    # an amplification budget of 0 permits adjacency but no gap filling
+    fs.reads.clear()
+    fs.cat_ranges(["/f", "/f"], [0, 11], [10, 20], max_gap=10, max_amplification=0)
+    assert fs.reads == [("/f", 0, 10), ("/f", 11, 20)]
+
+
+def test_cat_ranges_empty_and_past_tail_reads():
+    fs = _RangeRecordingFS({"/f": b"0123456789"})
+
+    fs.reads.clear()
+    out = fs.cat_ranges(["/f", "/f"], [3, 20], [0, 30])
+    assert out == [b"", b""]
+    # empty and past-tail ranges keep cat_file's slice semantics
+    assert fs.reads == [("/f", 3, 0), ("/f", 20, 30)]
+
+    # a short read is sliced out of the merged block
+    fs.reads.clear()
+    out = fs.cat_ranges(["/f", "/f"], [8, 0], [20, 10])
+    assert fs.reads == [("/f", 0, 20)]
+    assert out == [b"89", b"0123456789"]
+
+
+def test_cat_ranges_error_maps_to_original_requests():
+    fs = _RangeRecordingFS({"/f": b"0123456789"})
+
+    out = fs.cat_ranges(["/f", "/missing", "/missing"], [0, 0, 5], [4, 4, 9])
+    assert out[0] == b"0123"
+    assert isinstance(out[1], FileNotFoundError)
+    assert isinstance(out[2], FileNotFoundError)
+
+    with pytest.raises(FileNotFoundError):
+        fs.cat_ranges(["/f", "/missing"], [0, 0], [4, 4], on_error="raise")
+
+
+def test_cat_ranges_plan_makes_no_io():
+    fs = _RangeRecordingFS({"/f": b"0123456789"})
+    plan = fs.cat_ranges_plan(["/f", "/f"], [0, 4], [4, 8])
+
+    assert fs.reads == []
+    assert plan.read_count == 1
+    assert plan.requested_bytes == 8
+    assert plan.planned_bytes == 8
+    assert plan.to_dict()["reads"] == [
+        {"index": 0, "path": "/f", "start": 0, "end": 8, "requests": [0, 1]}
+    ]
+
+    # executing the same inputs reads what the plan described
+    out = fs.cat_ranges(["/f", "/f"], [0, 4], [4, 8])
+    assert fs.reads == [("/f", 0, 8)]
+    assert out == [b"0123", b"4567"]
+
+
 class UnreadableSubdirFS(AbstractFileSystem):
     """A tree in which the ``locked`` subdirectory cannot be listed."""
 

@@ -24,6 +24,7 @@ from fsspec.utils import (
     mirror_from,
     other_paths,
     parse_content_range_header,
+    plan_cat_ranges,
     range_response_window,
     read_block,
     seek_delimiter,
@@ -844,6 +845,193 @@ def test_merge_offset_ranges_many_sequential_is_fast():
     assert result_paths == ["file"]
     assert result_starts == [0]
     assert result_ends == [expected_end]
+
+
+def test_plan_cat_ranges_merges_overlap_and_adjacent():
+    plan = plan_cat_ranges(["/f"] * 5, [0, 4, 5, 20, 2], [6, 9, 7, 25, 3])
+
+    # 0-6, 4-9 and 5-7 overlap; 2-3 is nested. 20-25 stays separate.
+    assert [(r.start, r.end) for r in plan.reads] == [(0, 9), (20, 25)]
+    assert plan.read_count == 2
+    # original order is preserved and every request keeps its own result
+    assert plan.request_to_read == (0, 0, 0, 1, 0)
+    assert [r.index for r in plan.requests] == [0, 1, 2, 3, 4]
+
+
+def test_plan_cat_ranges_keeps_far_apart_ranges_separate():
+    # Two tiny ranges far apart must not become one whole-file read.
+    plan = plan_cat_ranges(["/f", "/f"], [0, 10_000_000], [1, 10_000_001])
+
+    assert [(r.start, r.end) for r in plan.reads] == [(0, 1), (10_000_000, 10_000_001)]
+    assert plan.read_count == 2
+    assert plan.requested_bytes == 2
+    assert plan.planned_bytes == 2
+    assert plan.amplification_bytes == 0
+
+
+def test_plan_cat_ranges_gap_filling_is_bounded():
+    # A huge max_gap alone would merge across the whole gap: the amplification
+    # budget stops it, and only gap bytes count against that budget.
+    huge = 10**12
+    unbounded = plan_cat_ranges(["/f", "/f"], [0, 100], [1, 101], max_gap=huge)
+    assert (unbounded.reads[0].start, unbounded.reads[0].end) == (0, 101)
+    assert unbounded.amplification_bytes == 99
+
+    bounded = plan_cat_ranges(
+        ["/f", "/f"], [0, 100], [1, 101], max_gap=huge, max_amplification=10
+    )
+    assert [(r.start, r.end) for r in bounded.reads] == [(0, 1), (100, 101)]
+    assert bounded.amplification_bytes == 0
+
+    # exactly at the budget still merges
+    at_budget = plan_cat_ranges(
+        ["/f", "/f"], [0, 100], [1, 101], max_gap=huge, max_amplification=99
+    )
+    assert at_budget.read_count == 1
+
+    # overlaps and duplicates read no extra bytes, so they never use budget
+    overlapping = plan_cat_ranges(
+        ["/f"] * 4,
+        [0, 0, 100, 100],
+        [1000, 1000, 1001, 1001],
+        max_gap=huge,
+        max_amplification=2,
+    )
+    # 0-1000 and 1000-1001 are adjacent, so a budget of 2 is plenty
+    assert overlapping.read_count == 1
+    # requested 1000+1000+901+901 bytes, but only the 1001 once
+    assert overlapping.requested_bytes == 3802
+    assert overlapping.planned_bytes == 1001
+    assert overlapping.amplification_bytes == -2801
+
+
+def test_plan_cat_ranges_max_span_bounds_each_read():
+    plan = plan_cat_ranges(
+        ["/f"] * 3, [0, 10, 20], [10, 20, 30], max_gap=0, max_span=25
+    )
+    # 0-20 fits within max_span, adding 20-30 would not be
+    assert [(r.start, r.end) for r in plan.reads] == [(0, 20), (20, 30)]
+
+    # a single request longer than max_span is still read whole
+    long = plan_cat_ranges(["/f"], [0], [100], max_span=10)
+    assert [(r.start, r.end) for r in long.reads] == [(0, 100)]
+
+
+def test_plan_cat_ranges_gap_limit():
+    # gap of exactly max_gap merges, one byte more does not
+    merged = plan_cat_ranges(["/f", "/f"], [0, 6], [4, 10], max_gap=2)
+    assert merged.read_count == 1
+    split = plan_cat_ranges(["/f", "/f"], [0, 7], [4, 10], max_gap=2)
+    assert split.read_count == 2
+
+    # max_gap None behaves like 0: only overlaps/adjacency merge
+    adjacent = plan_cat_ranges(["/f", "/f"], [0, 4], [4, 8], max_gap=None)
+    assert adjacent.read_count == 1
+
+
+def test_plan_cat_ranges_duplicates_are_one_read():
+    plan = plan_cat_ranges(["/f", "/f", "/f"], [3, 3, 3], [7, 7, 7])
+
+    assert [(r.start, r.end) for r in plan.reads] == [(3, 7)]
+    assert plan.request_to_read == (0, 0, 0)
+    assert plan.apply([b"3456"]) == [b"3456", b"3456", b"3456"]
+
+
+def test_plan_cat_ranges_makes_no_io(monkeypatch):
+    from fsspec.implementations.memory import MemoryFileSystem
+
+    def boom(*args, **kwargs):
+        raise AssertionError("the plan must not read")
+
+    monkeypatch.setattr(MemoryFileSystem, "cat_file", boom)
+    monkeypatch.setattr(MemoryFileSystem, "info", boom)
+    monkeypatch.setattr(MemoryFileSystem, "exists", boom)
+
+    fs = MemoryFileSystem(skip_instance_cache=True)
+    plan = fs.cat_ranges_plan(["/missing", "/missing"], [0, 100], [1, 101])
+    assert plan.read_count == 2
+    assert plan.to_dict()["read_count"] == 2
+
+
+def test_plan_cat_ranges_validates_inputs():
+    with pytest.raises(TypeError):
+        plan_cat_ranges("f", 0, 1)
+    with pytest.raises(ValueError):
+        plan_cat_ranges(["f", "g"], [0], [1, 2])
+    with pytest.raises(ValueError):
+        plan_cat_ranges(["f"], [0], [1], max_gap=-1)
+    with pytest.raises(ValueError):
+        plan_cat_ranges(["f"], [0], [1], max_span=0)
+    with pytest.raises(ValueError):
+        plan_cat_ranges(["f"], [0], [1], max_amplification=-1)
+
+
+def test_plan_cat_ranges_scalar_and_numpy_bounds():
+    np = pytest.importorskip("numpy")
+    plan = plan_cat_ranges(["f", "f"], np.array([0, 4]), np.int64(8))
+    assert [(r.start, r.end) for r in plan.reads] == [(0, 8)]
+    assert plan.request_to_read == (0, 0)
+
+
+def test_plan_cat_ranges_apply_handles_short_reads_and_exceptions():
+    plan = plan_cat_ranges(["/f", "/f"], [0, 8], [4, 20])
+    # the second read runs past EOF: the slice rule yields a short result
+    assert plan.apply([b"0123", b"89"]) == [b"0123", b"89"]
+
+    # ranges past the tail read as empty, exactly like cat_file
+    assert plan.apply([b"0123", b""]) == [b"0123", b""]
+
+    err = FileNotFoundError("/missing")
+    plan = plan_cat_ranges(["/a", "/b", "/b"], [0, 2, 0], [1, 4, 2])
+    out = plan.apply([b"a", err])
+    # the failure is tied to the original requests, not the merged read index
+    assert out == [b"a", err, err]
+
+
+def test_plan_cat_ranges_open_ended_and_negative_bounds_not_merged():
+    plan = plan_cat_ranges(
+        ["/f", "/f", "/f", "/f"], [0, -3, None, 0], [None, -1, None, 5]
+    )
+    # (0, None) and (0, 5) do not merge: an open end keeps its own read
+    assert [(r.start, r.end) for r in plan.reads] == [
+        (0, None),
+        (-3, -1),
+        (None, None),
+        (0, 5),
+    ]
+    assert plan.planned_bytes is None
+    assert plan.to_dict()["reads"][0] == {
+        "index": 0,
+        "path": "/f",
+        "start": 0,
+        "end": None,
+        "requests": [0],
+    }
+
+
+def test_plan_cat_ranges_audit_actual_reads():
+    plan = plan_cat_ranges(["/f", "/f", "/f"], [0, 4, 8], [4, 8, 12], max_gap=0)
+    assert plan.read_count == 1
+
+    audit = plan.audit([b"0123456789"])
+    assert audit == {
+        "read_count": 1,
+        "planned_read_count": 1,
+        "bytes_read": 10,
+        "planned_bytes": 12,
+        "requested_bytes": 12,
+        "output_bytes": 10,
+        "amplification_bytes": 0,
+        "failed_reads": 0,
+        "matches_plan": False,
+    }
+
+    # a failed read is counted, not sized
+    failed = plan_cat_ranges(["/f"], [0], [4])
+    audit = failed.audit([FileNotFoundError("/f")])
+    assert audit["bytes_read"] == 0
+    assert audit["failed_reads"] == 1
+    assert audit["matches_plan"] is True
 
 
 def test_size():

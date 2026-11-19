@@ -15,6 +15,12 @@ Enhancements
   operations that fill the cache on a miss, so ``filecache``/``simplecache``
   opens can report download progress (#1623)
 
+- Merge overlapping and adjacent ranges in ``cat_ranges`` into one backend
+  read, split the result back into the original request order (repeated
+  ranges included), and add ``cat_ranges_plan`` for an auditable, I/O-free
+  plan with ``max_gap``/``max_span``/``max_amplification`` limits so distant
+  small ranges are never coalesced into a whole-file read.
+
 Fixes
 
 - Avoid empty backend range requests at EOF with the first-chunk cache.

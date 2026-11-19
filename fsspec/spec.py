@@ -22,6 +22,7 @@ from .utils import (
     glob_translate,
     isfilelike,
     other_paths,
+    plan_cat_ranges,
     read_block,
     stringify_path,
     tokenize,
@@ -966,9 +967,21 @@ class AbstractFileSystem(metaclass=_Cached):
             raise ValueError("path must be str or dict")
 
     def cat_ranges(
-        self, paths, starts, ends, max_gap=None, on_error="return", **kwargs
+        self,
+        paths,
+        starts,
+        ends,
+        max_gap=None,
+        on_error="return",
+        max_span=None,
+        max_amplification=None,
+        **kwargs,
     ):
         """Get the contents of byte ranges from one or more files
+
+        Overlapping and adjacent ranges on the same path are read once and
+        then split back apart, so the result list always follows the original
+        request order, including repeated requests.
 
         Parameters
         ----------
@@ -977,27 +990,73 @@ class AbstractFileSystem(metaclass=_Cached):
         starts, ends: int or list
             Bytes limits of the read. If using a single int, the same value will be
             used to read all the specified files.
+        max_gap: int or None
+            Largest gap between ranges that may still be merged into one read.
+            ``None`` and ``0`` merge only overlapping or adjacent ranges.
+        on_error: "return" or "raise"
+            With "return" (default), a failed read is placed in the output at
+            every original request position it covered. Otherwise the
+            exception for the earliest original request is raised.
+        max_span: int or None
+            Largest length of any one merged read. A single request longer
+            than this is still read whole, on its own.
+        max_amplification: int or None
+            Largest total number of bytes the merged reads may fetch only to
+            bridge gaps. Overlaps and repeated requests add nothing to this
+            total, so they never consume the budget. ``0`` merges
+            overlaps/adjacency but never fills a gap.
+        kwargs: passed to ``cat_file``.
+
+        See Also
+        --------
+        cat_ranges_plan
+            The same plan, returned without performing any I/O.
         """
-        if max_gap is not None:
-            raise NotImplementedError
-        if not isinstance(paths, list):
-            raise TypeError
-        if not isinstance(starts, list):
-            starts = [starts] * len(paths)
-        if not isinstance(ends, list):
-            ends = [ends] * len(paths)
-        if len(starts) != len(paths) or len(ends) != len(paths):
-            raise ValueError
-        out = []
-        for p, s, e in zip(paths, starts, ends):
+        plan = self.cat_ranges_plan(
+            paths,
+            starts,
+            ends,
+            max_gap=max_gap,
+            max_span=max_span,
+            max_amplification=max_amplification,
+        )
+        results = []
+        for read in plan.reads:
             try:
-                out.append(self.cat_file(p, s, e, **kwargs))
+                results.append(self.cat_file(read.path, read.start, read.end, **kwargs))
             except Exception as e:
                 if on_error == "return":
-                    out.append(e)
+                    results.append(e)
                 else:
+                    # reads are ordered by their earliest request, so this is
+                    # the error of the earliest original request
                     raise
-        return out
+        return plan.apply(results)
+
+    def cat_ranges_plan(
+        self,
+        paths,
+        starts,
+        ends,
+        max_gap=None,
+        max_span=None,
+        max_amplification=None,
+    ):
+        """Describe the reads ``cat_ranges`` would issue, without any I/O.
+
+        The returned :class:`fsspec.utils.RangePlan` maps every original
+        request to the read that serves it, and reports the read count and
+        the requested, planned and amplified byte totals. Paths are not
+        resolved or checked, so an audit never touches the backend.
+        """
+        return plan_cat_ranges(
+            paths,
+            starts,
+            ends,
+            max_gap=max_gap,
+            max_span=max_span,
+            max_amplification=max_amplification,
+        )
 
     def cat(self, path, recursive=False, on_error="raise", **kwargs):
         """Fetch (potentially multiple) paths' contents

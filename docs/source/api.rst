@@ -338,7 +338,16 @@ Utilities
 
 .. autosummary::
 
+   utils.merge_offset_ranges
+   utils.plan_cat_ranges
    utils.read_block
+
+.. autofunction:: fsspec.utils.merge_offset_ranges
+
+.. autofunction:: fsspec.utils.plan_cat_ranges
+
+.. autoclass:: fsspec.utils.RangePlan
+   :members:
 
 .. autofunction:: fsspec.utils.read_block
 

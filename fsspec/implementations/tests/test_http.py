@@ -725,6 +725,47 @@ def test_cat_file_range_numpy(server):
     assert out == [data[1:10], data[5:15]]
 
 
+def test_cat_ranges_plan_matches_backend_requests(server, reset_faults):
+    url = server.realfile
+    fs = fsspec.filesystem("http", skip_instance_cache=True)
+    paths = [url, url, url]
+    starts = [0, 4, 20]
+    ends = [6, 10, 30]
+
+    plan = fs.cat_ranges_plan(paths, starts, ends)
+    assert plan.read_count == 2
+    # describe the plan without any request reaching the server
+    assert _gets() == 0
+
+    out = fs.cat_ranges(paths, starts, ends)
+    assert out == [data[0:6], data[4:10], data[20:30]]
+    # the actual number of backend range reads equals the planned count
+    assert _gets() == plan.read_count
+
+    # repeated ranges come back separately, from the single planned read
+    _rearm()
+    plan = fs.cat_ranges_plan([url, url], [3, 3], [7, 7])
+    assert plan.read_count == 1
+    out = fs.cat_ranges([url, url], [3, 3], [7, 7])
+    assert out == [data[3:7], data[3:7]]
+    assert _gets() == 1
+
+
+def test_cat_ranges_plan_avoids_whole_file_read(server, reset_faults):
+    # Two tiny ranges near either end must not become one whole-file read.
+    url = server.realfile
+    fs = fsspec.filesystem("http", skip_instance_cache=True)
+    plan = fs.cat_ranges_plan([url, url], [0, len(data) - 1], [1, len(data)])
+
+    assert plan.read_count == 2
+    assert plan.amplification_bytes == 0
+    assert plan.planned_bytes == 2
+
+    out = fs.cat_ranges([url, url], [0, len(data) - 1], [1, len(data)])
+    assert out == [data[:1], data[-1:]]
+    assert _gets() == 2
+
+
 def test_mcat_cache(server):
     urla = server.realfile
     urlb = server.address + "/index/otherfile"
