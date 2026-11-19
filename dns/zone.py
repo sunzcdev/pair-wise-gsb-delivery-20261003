@@ -22,7 +22,7 @@ import io
 import os
 import struct
 from collections.abc import Callable, Iterable, Iterator, MutableMapping
-from typing import Any, BinaryIO, TextIO, cast
+from typing import TYPE_CHECKING, Any, BinaryIO, TextIO, cast
 
 import dns._file_util
 import dns.exception
@@ -40,6 +40,9 @@ import dns.tokenizer
 import dns.transaction
 import dns.zonefile
 from dns.zonetypes import DigestHashAlgorithm, DigestScheme, _digest_hashers
+
+if TYPE_CHECKING:
+    import dns.zonediff
 
 
 class BadZone(dns.exception.DNSException):
@@ -919,6 +922,36 @@ class Zone(dns.transaction.TransactionManager):
             except Exception:
                 pass
         raise DigestVerificationFailure
+
+    def diff(self, target: "Zone") -> "dns.zonediff.ZoneDiffPlan":
+        """Compute a plan that transforms this zone into *target*.
+
+        The returned :py:class:`dns.zonediff.ZoneDiffPlan` records this
+        zone's origin, class, and SOA serial number, along with the old
+        value of every changed RRset as a precondition.  The plan can be
+        applied to a matching zone within a transaction; if any
+        precondition fails, the whole plan is rejected.
+
+        :param target: The desired contents of the zone.
+        :type target: :py:class:`dns.zone.Zone`
+        :rtype: :py:class:`dns.zonediff.ZoneDiffPlan`
+        """
+        import dns.zonediff
+
+        return dns.zonediff.diff(self, target)
+
+    def apply_diff(self, plan: "dns.zonediff.ZoneDiffPlan") -> None:
+        """Apply a diff plan to this zone in a single transaction.
+
+        If any of the plan's preconditions (origin, class, SOA serial
+        number, or the old value of any changed RRset) does not match the
+        current zone contents, :py:exc:`dns.zonediff.PreconditionFailed` is
+        raised and the zone is left unchanged.
+
+        :param plan: The plan to apply.
+        :type plan: :py:class:`dns.zonediff.ZoneDiffPlan`
+        """
+        plan.apply_to(self)
 
     # TransactionManager methods
 

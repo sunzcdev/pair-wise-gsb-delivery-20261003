@@ -160,6 +160,34 @@ The Transaction Class
 .. autoexception:: dns.transaction.ReadOnly
 
 
+Zone Diff Plans
+---------------
+
+A zone diff plan captures the difference between two zones as an applicable
+plan rather than as textual addition and deletion lines.  A plan records the
+identity of the zone it was computed from (its origin, class, and SOA serial
+number) and the old value of every changed RRset as a precondition.  Plans
+are applied inside a transaction; all preconditions are checked before any
+change is made, and if any of them fails the whole plan is rejected and the
+zone is left unchanged.
+
+::
+
+   plan = current_zone.diff(desired_zone)
+   # ... later, perhaps on another copy of the zone ...
+   plan.apply_to(current_zone)   # or plan.apply(txn) within a transaction
+
+.. autofunction:: dns.zonediff.diff
+
+.. autoclass:: dns.zonediff.ZoneDiffPlan
+   :members:
+
+.. autoclass:: dns.zonediff.RrsetChange
+   :members:
+
+.. autoexception:: dns.zonediff.PreconditionFailed
+
+
 The dns.btreezone.Zone Class
 ----------------------------
 
