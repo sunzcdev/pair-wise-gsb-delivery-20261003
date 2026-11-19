@@ -1,0 +1,88 @@
+# Because this library provides extension modules for macOS, but not for other
+# platforms, we want to provide built distributions for each macOS platform, but we
+# explicitly DON'T want to provide a cross-platform pure-Python wheel to fall back on.
+#
+# This is because in the event that a new Python version is released or a new
+# macOS platform is released, macOS users won't be able to install the built
+# distributions we've provided and should fall back to the source distribution,
+# but pip's behavior is to prefer a pure-Python wheel first, which will be
+# missing the extension modules.
+#
+# However, to provide built distributions for Linux and Windows (which don't
+# have extension modules) we can just build a pure-Python wheel on that
+# platform and override the platform name manually via wheel's --plat-name
+# feature, to provide a platform-specific wheel for all platforms.
+
+name: Build & Publish
+
+# Dedicated release and distribution pipeline
+# Builds full release wheels and sdist, then publishes to PyPI on release tags or manual dispatch
+on:
+  push:
+    tags:
+      - "v*"
+    branches:
+      - master
+
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: "Publish to PyPI (leave unchecked for dry-run build)"
+        required: false
+        type: boolean
+        default: false
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  # Build macOS binary wheels in parallel across architectures (arm64, x86_64, universal2)
+  macos-built-distributions:
+    name: 🍏 macOS (${{ matrix.arch }})
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [arm64, x86_64, universal2]
+    uses: ./.github/workflows/wheel-builder.yml
+    with:
+      archs: ${{ matrix.arch }}
+      build: "cp* pp311-* pp312-*"
+      upload_artifacts: true
+
+  # Build platform-specific pure wheels and source distribution (.tar.gz)
+  pure-built-distributions:
+    name: 📦 Package Distributions
+    uses: ./.github/workflows/dist-builder.yml
+    with:
+      upload_artifacts: true
+
+  # Publish to PyPI on release tags (v*) or confirmed manual dispatch
+  publish:
+    name: 🚀 Publish to PyPI
+    needs:
+      - macos-built-distributions
+      - pure-built-distributions
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    if: startsWith(github.ref, 'refs/tags/v') || inputs.publish == true
+    steps:
+      - name: Download all the dists
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
+        with:
+          pattern: python-package-distributions-*
+          merge-multiple: true
+          path: dist/
+
+      - name: What will we publish?
+        run: ls -l dist
+
+      - name: Publish to PyPI
+        uses: pypa/gh-action-pypi-publish@7245906fb61fa33a13554f9d5fb856fe61758086 # v1.14.3
+        with:
+          user: __token__
+          password: ${{ secrets.PYPI_API_TOKEN }}
+          skip-existing: true
