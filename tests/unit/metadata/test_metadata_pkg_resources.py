@@ -1,0 +1,147 @@
+import email.message
+import itertools
+import logging
+import os
+from pathlib import Path
+
+import pytest
+
+from pip._vendor.packaging.requirements import Requirement
+from pip._vendor.packaging.specifiers import SpecifierSet
+from pip._vendor.packaging.utils import canonicalize_name
+from pip._vendor.packaging.version import parse as parse_version
+from pip._vendor.pkg_resources import WorkingSet
+
+from pip._internal.exceptions import InstallationError, UnsupportedWheel
+from pip._internal.metadata.pkg_resources import (
+    Distribution,
+    Environment,
+    InMemoryMetadata,
+)
+
+pkg_resources = pytest.importorskip("pip._vendor.pkg_resources")
+
+
+def _working_set(names: list[str]) -> WorkingSet:
+    """Build an isolated working set without scanning installed packages."""
+    ws = WorkingSet([])
+    for name in names:
+        ws.add(
+            pkg_resources.Distribution(
+                location="<in-memory>", project_name=name, version="1.0"
+            )
+        )
+    return ws
+
+
+workingset = _working_set(["global", "editable", "normal", "user"])
+workingset_stdlib = _working_set(["argparse", "wsgiref"])
+
+
+@pytest.mark.parametrize(
+    "ws, req_name",
+    [
+        *itertools.product(
+            [workingset],
+            (d.project_name for d in workingset),
+        ),
+        *itertools.product(
+            [workingset_stdlib],
+            (d.project_name for d in workingset_stdlib),
+        ),
+    ],
+)
+def test_get_distribution(ws: WorkingSet, req_name: str) -> None:
+    """Ensure get_distribution() finds all kinds of distributions."""
+    dist = Environment(ws).get_distribution(req_name)
+    assert dist is not None
+    assert dist.canonical_name == canonicalize_name(req_name)
+
+
+def test_get_distribution_nonexist() -> None:
+    dist = Environment(workingset).get_distribution("non-exist")
+    assert dist is None
+
+
+def test_wheel_metadata_works() -> None:
+    name = "simple"
+    version = "0.1.0"
+    require_a = "a==1.0"
+    require_b = 'b==1.1; extra == "also_b"'
+    requires = [require_a, require_b, 'c==1.2; extra == "also_c"']
+    extras = ["also_b", "also_c"]
+    requires_python = ">=3"
+
+    metadata = email.message.Message()
+    metadata["Name"] = name
+    metadata["Version"] = version
+    for require in requires:
+        metadata["Requires-Dist"] = require
+    for extra in extras:
+        metadata["Provides-Extra"] = extra
+    metadata["Requires-Python"] = requires_python
+
+    dist = Distribution(
+        pkg_resources.DistInfoDistribution(
+            location="<in-memory>",
+            metadata=InMemoryMetadata({"METADATA": metadata.as_bytes()}, "<in-memory>"),
+            project_name=name,
+        ),
+    )
+
+    assert name == dist.canonical_name == dist.raw_name
+    assert parse_version(version) == dist.version
+    assert {canonicalize_name(e) for e in extras} == set(dist.iter_provided_extras())
+    assert [require_a] == [str(r) for r in dist.iter_dependencies()]
+    assert [Requirement(require_a), Requirement(require_b)] == [
+        Requirement(str(r)) for r in dist.iter_dependencies(["also_b"])
+    ]
+    assert metadata.as_string() == dist.metadata.as_string()
+    assert SpecifierSet(requires_python) == dist.requires_python
+
+
+def test_wheel_metadata_throws_on_bad_unicode() -> None:
+    metadata = InMemoryMetadata({"METADATA": b"\xff"}, "<in-memory>")
+
+    with pytest.raises(UnsupportedWheel) as e:
+        metadata.get_metadata("METADATA")
+    assert "METADATA" in str(e.value)
+
+
+def test_iter_all_distributions_warns_on_incomplete_removal(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    leftover_info = tmp_path / "~eftover-1.0.dist-info"
+    leftover_info.mkdir()
+    leftover_info.joinpath("METADATA").write_text(
+        "Metadata-Version: 1.0\nName: leftover\n"
+    )
+
+    env = Environment.from_paths([os.fspath(tmp_path)])
+    with caplog.at_level(logging.WARNING):
+        dists = list(env.iter_all_distributions())
+
+    assert dists == []
+    assert len(caplog.records) == 1
+    message = caplog.records[0].getMessage()
+    assert message.startswith(
+        "Ignoring incompletely removed distribution ~eftover-1.0.dist-info ("
+    )
+    assert "previous incomplete installation, and can be deleted" in message
+
+
+def test_iter_entry_points_throws_on_invalid_entry_point() -> None:
+    dist = Distribution(
+        pkg_resources.DistInfoDistribution(
+            location="<in-memory>",
+            metadata=InMemoryMetadata(
+                {"entry_points.txt": b"[console_scripts]\nhello = hello:\n"},
+                "<in-memory>",
+            ),
+            project_name="simple",
+        ),
+    )
+
+    with pytest.raises(InstallationError) as e:
+        list(dist.iter_entry_points())
+    assert "hello = hello:" in str(e.value)
