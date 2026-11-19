@@ -1,0 +1,425 @@
+from sqlalchemy import exc as sqla_exc
+from sqlalchemy import Index
+from sqlalchemy import text
+
+from alembic.testing import exclusions
+from alembic.testing.requirements import SuiteRequirements
+from alembic.util import compat
+from alembic.util import sqla_compat
+
+
+class DefaultRequirements(SuiteRequirements):
+    @property
+    def unicode_string(self):
+        return exclusions.skip_if(["oracle"])
+
+    @property
+    def alter_column(self):
+        return exclusions.skip_if(["sqlite"], "no ALTER COLUMN support")
+
+    @property
+    def schemas(self):
+        """Target database must support external schemas, and have one
+        named 'test_schema'."""
+
+        return exclusions.skip_if(["sqlite", "firebird"], "no schema support")
+
+    @property
+    def no_referential_integrity(self):
+        """test will fail if referential integrity is enforced"""
+
+        return exclusions.fails_on_everything_except("sqlite")
+
+    @property
+    def non_native_boolean(self):
+        """test will fail if native boolean is provided"""
+
+        return exclusions.fails_if(
+            exclusions.LambdaPredicate(
+                lambda config: config.db.dialect.supports_native_boolean
+            )
+        )
+
+    @property
+    def non_native_boolean_check_constraint(self):
+        """backend creates a check constraint for booleans if enabled"""
+
+        return exclusions.only_on(
+            exclusions.LambdaPredicate(
+                lambda config: not config.db.dialect.supports_native_boolean
+                and config.db.dialect.non_native_boolean_check_constraint
+            )
+        )
+
+    @property
+    def check_constraints_w_enforcement(self):
+        return exclusions.fails_on(["mysql", "mariadb"])
+
+    @property
+    def unnamed_constraints(self):
+        """constraints without names are supported."""
+        return exclusions.only_on(["sqlite"])
+
+    @property
+    def foreign_key_name_reflection(self):
+        """backend can reflect foreign key names"""
+
+        # issue here was fixed in SQLAlchemy #12954 for sqlite, 2.0
+        # release
+        return exclusions.skip_if(
+            lambda config: not sqla_compat.sqla_2_0_25
+            and exclusions.against(config, "sqlite")
+        )
+
+    @property
+    def reflects_fk_options(self):
+        return exclusions.open()
+
+    @property
+    def fk_initially(self):
+        """backend supports INITIALLY option in foreign keys"""
+        return exclusions.only_on(["postgresql"])
+
+    @property
+    def fk_deferrable(self):
+        """backend supports DEFERRABLE option in foreign keys"""
+        return exclusions.only_on(["postgresql", "oracle"])
+
+    @property
+    def fk_deferrable_is_reflected(self):
+        return self.fk_deferrable + exclusions.fails_on("oracle")
+
+    @property
+    def fk_ondelete_restrict(self):
+        return exclusions.only_on(["postgresql", "sqlite", "mysql"])
+
+    @property
+    def fk_onupdate_restrict(self):
+        return self.fk_onupdate + exclusions.fails_on(["mssql"])
+
+    @property
+    def fk_ondelete_noaction(self):
+        return exclusions.only_on(
+            ["postgresql", "mysql", "mariadb", "sqlite", "mssql"]
+        )
+
+    @property
+    def fk_ondelete_is_reflected(self):
+        return exclusions.open()
+
+    @property
+    def fk_onupdate_is_reflected(self):
+        return self.fk_onupdate
+
+    @property
+    def fk_onupdate(self):
+        return exclusions.only_on(
+            ["postgresql", "mysql", "mariadb", "sqlite", "mssql"]
+        )
+
+    @property
+    def reflects_unique_constraints_unambiguously(self):
+        return exclusions.fails_on(["mysql", "mariadb", "oracle", "mssql"])
+
+    @property
+    def reports_unique_constraints_as_indexes(self):
+        return exclusions.only_on(["mysql", "mariadb", "oracle"])
+
+    @property
+    def reports_unnamed_constraints(self):
+        return exclusions.skip_if(["sqlite"])
+
+    @property
+    def reflects_indexes_w_sorting(self):
+        # TODO: figure out what's happening on the SQLAlchemy side
+        # when we reflect an index that has asc() / desc() on the column
+        # Tracked by https://github.com/sqlalchemy/sqlalchemy/issues/9597
+        return exclusions.fails_on(["oracle"])
+
+    @property
+    def reflects_indexes_column_sorting(self):
+        "Actually reflect column_sorting on the indexes"
+        return exclusions.only_on(["postgresql"])
+
+    @property
+    def long_names(self):
+        return exclusions.skip_if("oracle<18")
+
+    @property
+    def reflects_pk_names(self):
+        """Target driver reflects the name of primary key constraints."""
+
+        return exclusions.fails_on_everything_except(
+            "postgresql", "oracle", "mssql", "sybase", "sqlite"
+        )
+
+    @property
+    def datetime_timezone(self):
+        """target dialect supports timezone with datetime types."""
+
+        return exclusions.only_on(["postgresql"])
+
+    @property
+    def postgresql(self):
+        return exclusions.only_on(["postgresql"])
+
+    @property
+    def mysql(self):
+        return exclusions.only_on(["mysql", "mariadb"])
+
+    @property
+    def oracle(self):
+        return exclusions.only_on(["oracle"])
+
+    @property
+    def mssql(self):
+        return exclusions.only_on(["mssql"])
+
+    @property
+    def covering_indexes(self):
+        return exclusions.only_on(["postgresql >= 11", "mssql"])
+
+    @property
+    def postgresql_uuid_ossp(self):
+        def check_uuid_ossp(config):
+            if not exclusions.against(config, "postgresql"):
+                return False
+            try:
+                config.db.execute("SELECT uuid_generate_v4()")
+                return True
+            except:
+                return False
+
+        return exclusions.only_if(check_uuid_ossp)
+
+    def _has_pg_extension(self, name):
+        def check(config):
+            if not exclusions.against(config, "postgresql"):
+                return False
+            with config.db.connect() as conn:
+                count = conn.scalar(
+                    text(
+                        "SELECT count(*) FROM pg_extension "
+                        "WHERE extname='%s'" % name
+                    )
+                )
+            return bool(count)
+
+        return exclusions.only_if(check, "needs %s extension" % name)
+
+    @property
+    def hstore(self):
+        return self._has_pg_extension("hstore")
+
+    @property
+    def btree_gist(self):
+        return self._has_pg_extension("btree_gist")
+
+    @property
+    def autoincrement_on_composite_pk(self):
+        return exclusions.skip_if(["sqlite"], "not supported by database")
+
+    @property
+    def integer_subtype_comparisons(self):
+        """if a compare of Integer and BigInteger is supported yet."""
+        return exclusions.skip_if(["oracle"], "not supported by alembic impl")
+
+    @property
+    def autocommit_isolation(self):
+        """target database should support 'AUTOCOMMIT' isolation level"""
+
+        return exclusions.only_on(["postgresql", "mysql", "mariadb"])
+
+    @property
+    def computed_columns(self):
+        # TODO: in theory if these could come from SQLAlchemy dialects
+        # that would be helpful
+        return exclusions.skip_if(
+            ["postgresql < 12", "sqlite < 3.31", "mysql < 5.7"]
+        )
+
+    @property
+    def check_constraint_reflection(self):
+        return exclusions.fails_on_everything_except(
+            "postgresql",
+            "sqlite",
+            "oracle",
+            self._mysql_and_check_constraints_exist,
+        )
+
+    @property
+    def inline_check_constraint_reflection(self):
+        return exclusions.only_on(
+            [
+                "postgresql",
+                "sqlite",
+                "oracle",
+            ]
+        )
+
+    def mysql_check_col_name_change(self, config):
+        # MySQL has check constraints that enforce an reflect, however
+        # they prevent a column's name from being changed due to a bug in
+        # MariaDB 10.2 as well as MySQL 8.0.16
+        if exclusions.against(config, ["mysql", "mariadb"]):
+            if config.db.dialect.is_mariadb:
+                norm_version_info = (
+                    config.db.dialect._mariadb_normalized_version_info
+                )
+                return norm_version_info >= (10, 2) and norm_version_info < (
+                    10,
+                    2,
+                    22,
+                )
+            else:
+                norm_version_info = config.db.dialect.server_version_info
+                return norm_version_info >= (8, 0, 16)
+
+        else:
+            return True
+
+    def _mysql_and_check_constraints_exist(self, config):
+        # 1. we have mysql / mariadb and
+        # 2. it enforces check constraints
+        if exclusions.against(config, ["mysql", "mariadb"]):
+            if config.db.dialect.is_mariadb:
+                norm_version_info = (
+                    config.db.dialect._mariadb_normalized_version_info
+                )
+                return norm_version_info >= (10, 2)
+            else:
+                norm_version_info = config.db.dialect.server_version_info
+                return norm_version_info >= (8, 0, 16)
+        else:
+            return False
+
+    @property
+    def json_type(self):
+        return exclusions.only_on(
+            [
+                lambda config: exclusions.against(config, "mysql")
+                and (
+                    (
+                        not config.db.dialect.is_mariadb
+                        and exclusions.against(config, "mysql >= 5.7")
+                    )
+                    or (
+                        config.db.dialect._mariadb_normalized_version_info
+                        >= (10, 2, 7)
+                    )
+                ),
+                "mariadb>=10.2.7",
+                "postgresql >= 9.3",
+                self._sqlite_json,
+                self._mssql_json,
+            ]
+        )
+
+    def _mssql_json(self, config):
+        return exclusions.against(config, "mssql")
+
+    def _sqlite_json(self, config):
+        if not exclusions.against(config, "sqlite >= 3.9"):
+            return False
+        else:
+            with config.db.connect() as conn:
+                try:
+                    return (
+                        conn.execute(
+                            text(
+                                """select json_extract('{"foo": "bar"}', """
+                                """'$."foo"')"""
+                            )
+                        ).scalar()
+                        == "bar"
+                    )
+                except sqla_exc.DBAPIError:
+                    return False
+
+    @property
+    def identity_columns(self):
+        # TODO: in theory if these could come from SQLAlchemy dialects
+        # that would be helpful
+        return exclusions.only_on(
+            ["postgresql >= 10", "oracle >= 12", "mssql"]
+        )
+
+    @property
+    def identity_columns_alter(self):
+        # TODO: in theory if these could come from SQLAlchemy dialects
+        # that would be helpful
+        return exclusions.only_on(["postgresql >= 10", "oracle >= 12"])
+
+    @property
+    def legacy_engine(self):
+        return exclusions.only_if(
+            lambda config: not getattr(config.db, "_is_future", False)
+        )
+
+    @property
+    def stubs_test(self):
+        def requirements():
+            import warnings
+
+            try:
+                with warnings.catch_warnings(action="ignore"):
+                    import black  # noqa
+                    import zimports  # noqa
+
+                return False
+            except Exception:
+                return True
+
+        imports = exclusions.skip_if(
+            requirements, "black and zimports are required for this test"
+        )
+        version_low = exclusions.only_if(
+            lambda _: compat.py314, "python 3.14 is required"
+        )
+
+        return imports + version_low
+
+    @property
+    def reflect_indexes_with_expressions(self):
+        return exclusions.only_on(["postgresql"])
+
+    @property
+    def indexes_with_expressions(self):
+        return exclusions.only_on(["postgresql", "sqlite>=3.9.0"])
+
+    @property
+    def expression_server_defaults(self):
+        """target database supports a server default that is a SQL
+        expression, such as ``DEFAULT (rand())``.
+
+        Mirrors the requirement of the same name in SQLAlchemy's own test
+        suite, deferring to the MySQL dialect's own notion of which
+        server versions render an expression default at all.
+
+        """
+
+        return exclusions.skip_if(
+            lambda config: exclusions.against(config, "mysql", "mariadb")
+            and not config.db.dialect._support_default_function,
+            "backend has no expression server defaults",
+        )
+
+    @property
+    def nulls_not_distinct_sa(self):
+        def _has_nulls_not_distinct():
+            try:
+                Index("foo", "bar", postgresql_nulls_not_distinct=True)
+                return True
+            except sqla_exc.ArgumentError:
+                return False
+
+        return exclusions.only_if(
+            _has_nulls_not_distinct,
+            "sqlalchemy with nulls not distinct support needed",
+        )
+
+    @property
+    def nulls_not_distinct_db(self):
+        return self.nulls_not_distinct_sa + exclusions.only_on(
+            ["postgresql>=15"]
+        )
