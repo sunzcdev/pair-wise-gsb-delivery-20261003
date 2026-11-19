@@ -1,6 +1,36 @@
 ## Changes between 2.10.0 and 2.11.0 (unreleased)
 
-No changes yet.
+### Versioned Protocol Descriptions
+
+Protocol descriptions can now be loaded as independent namespaces, so two
+versions of the protocol can be compared, or spoken on different connections,
+in one process:
+
+``` ruby
+v091 = AMQ::Protocol::Registry.load("0.9.1", paths: ["amqp-rabbitmq-0.9.1.json"])
+v091.method(60, 40).argument_names
+v091.namespace::Basic::Publish.decode(payload)
+```
+
+Class/method ID lookup, argument and property metadata, and encode/decode all
+come from the description a namespace was generated from. Versions no longer
+need to be switched by redefining `AMQ::Protocol` constants, so loading one
+version cannot change another. The `AMQ::Protocol` namespace keeps the default
+0.9.1 classes unchanged.
+
+ * Declared field, method and property order is preserved: it is wire semantics
+   and is never sorted or otherwise rearranged
+ * Generating from the same description is byte-for-byte stable; `rake
+   verify_descriptions` asserts this for the bundled documents
+ * Conflicting declarations are reported before anything is generated
+   (`AMQ::Protocol::Spec::ConflictError`, `AMQ::Protocol::Registry::ConflictError`)
+ * Descriptions and namespaces hold no IO; files are read once during loading
+ * Upstream rabbitmq-codegen documents for 0.8 and 0.9.1 ship in
+   `lib/amq/protocol/spec/data`, and small in-memory descriptions can be used in
+   tests via `AMQ::Protocol::Spec::Builtin.demo`
+
+`./generate.rb --versioned` emits a version namespace, and `./generate.rb
+--describe PATH` prints a description manifest.
 
 
 ## Changes between 2.9.0 and 2.10.0 (Nov 2, 2026)

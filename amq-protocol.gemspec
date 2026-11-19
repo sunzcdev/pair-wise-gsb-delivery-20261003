@@ -18,7 +18,8 @@ Gem::Specification.new do |s|
   s.required_ruby_version = ">= 3.2"
 
   # files
-  s.files = Dir.glob("lib/**/*.rb") + %w[LICENSE README.md ChangeLog.md]
+  s.files = Dir.glob("lib/**/*.rb") + Dir.glob("lib/amq/protocol/spec/data/*.json") +
+            %w[LICENSE README.md ChangeLog.md]
   s.require_paths = ["lib"]
 
   s.extra_rdoc_files = ["README.md"]

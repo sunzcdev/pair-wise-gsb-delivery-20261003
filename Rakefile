@@ -33,6 +33,22 @@ task :compile do
   compile!
 end
 
+desc "Verify that every bundled protocol description generates stable output"
+task :verify_descriptions do
+  require "amq/protocol"
+
+  files = Dir.glob(File.expand_path("lib/amq/protocol/spec/data/*.json", __dir__))
+  raise "no bundled protocol descriptions found" if files.empty?
+
+  files.each do |path|
+    first = AMQ::Protocol::Generator.manifest(AMQ::Protocol::Spec::Loader.load_file(path))
+    second = AMQ::Protocol::Generator.manifest(AMQ::Protocol::Spec::Loader.load_file(path))
+    raise "#{path} does not generate a stable manifest" unless first == second
+
+    puts "#{File.basename(path)}: #{first.lines.first.strip}"
+  end
+end
+
 task :clean do
   puts "Cleaning out native extensions..."
   begin

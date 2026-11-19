@@ -44,6 +44,54 @@ To run tests, use
     ./bin/rspec -c spec spec
 
 
+## Working With Several Protocol Versions
+
+`AMQ::Protocol` keeps the default 0.9.1 namespace this gem has always provided, so
+existing code keeps working. Descriptions of a protocol version can also be loaded
+as independent namespaces, which lets one process compare versions or speak
+different versions on different connections:
+
+``` ruby
+v091 = AMQ::Protocol::Registry.load("0.9.1", paths: ["amqp-rabbitmq-0.9.1.json"])
+v10  = AMQ::Protocol::Registry.load("1.0.0", paths: ["amqp-1.0.json"])
+
+v091.method(60, 40).argument_names   # => [:ticket, :exchange, :routing_key, :mandatory, :immediate]
+v10.method(60, 40).argument_names    # whatever that version declares
+
+v091.namespace::Basic::Publish.decode(payload)
+```
+
+Each namespace holds its own generated classes, so class/method ID lookup, argument
+metadata and encoding/decoding all belong to the version they were loaded from.
+Versions do not redefine `AMQ::Protocol` constants, and therefore do not overwrite
+each other.
+
+ * Declared field and property order is preserved: it is wire semantics and is never
+   sorted or otherwise rearranged
+ * Loading the same description twice reuses one namespace; loading a different
+   description under an already-loaded label raises `AMQ::Protocol::Registry::ConflictError`
+ * Merging several documents for one version reports conflicting declarations
+   (`AMQ::Protocol::Spec::ConflictError`) before anything is generated
+ * Descriptions and namespaces hold no IO objects; files are read once while the
+   description is built
+
+The `amqp-protocol` bundle ships the upstream rabbitmq-codegen documents in
+`lib/amq/protocol/spec/data`, including 0.8 and 0.9.1, so `AMQ::Protocol.descriptions.amqp_0_9_1`
+and `AMQ::Protocol.descriptions.amqp_0_8` need no download. Small descriptions can be
+built entirely in memory for tests:
+
+``` ruby
+description = AMQ::Protocol::Spec::Builtin.demo(version: "1.0.0")
+```
+
+Generating a version namespace from a description is deterministic:
+
+    ./generate.rb --versioned                                  # emit a version namespace
+    ./generate.rb --describe lib/amq/protocol/spec/data/amqp-rabbitmq-0.9.1.json
+
+    rake verify_descriptions                                    # assert stable manifests
+
+
 ## Maintainer Information
 
 amq-protocol is maintained by [Michael Klishin](https://github.com/michaelklishin).

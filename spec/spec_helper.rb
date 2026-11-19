@@ -1,7 +1,18 @@
 # encoding: binary
 
-require 'bundler/setup'
-Bundler.require(:test)
+begin
+  require 'bundler/setup'
+  Bundler.require(:test)
+rescue LoadError => e
+  # No bundle configured: fall back to RSpec from the ambient gem environment.
+  warn "spec_helper: no test bundle (#{e.message}); using ambient rspec"
+  require 'rspec/its'
+rescue StandardError => e
+  raise unless defined?(Bundler::GemNotFound) && e.is_a?(Bundler::GemNotFound)
+
+  warn "spec_helper: bundle is missing gems (#{e.message}); using ambient rspec"
+  require 'rspec/its'
+end
 
 begin
   require 'simplecov'
