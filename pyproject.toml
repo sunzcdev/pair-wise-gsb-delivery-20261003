@@ -1,0 +1,441 @@
+[build-system]
+build-backend = "hatchling.build"
+requires = [
+  "hatch-fancy-pypi-readme>=25.1",
+  "hatch-vcs>=0.5",
+  "hatchling<1.28,>=1.27; python_version<'3.10'",
+  "hatchling>=1.28; python_version>='3.10'",
+  "python-sbom[hatch]>=0.1.2; python_version>='3.11'",
+]
+
+[project]
+name = "virtualenv"
+import-names = [ "virtualenv" ]
+description = "Virtual Python Environment builder"
+keywords = [
+  "environments",
+  "isolated",
+  "virtual",
+]
+license = "MIT"
+license-files = [
+  "LICENSE",
+  "THIRD-PARTY-NOTICES.md",
+]
+maintainers = [
+  { name = "Bernat Gabor", email = "gaborjbernat@gmail.com" },
+  { name = "Rahul Devikar", email = "rahuldevikar5512@gmail.com" },
+]
+requires-python = ">=3.9"
+classifiers = [
+  "Development Status :: 5 - Production/Stable",
+  "Intended Audience :: Developers",
+  "Operating System :: MacOS :: MacOS X",
+  "Operating System :: Microsoft :: Windows",
+  "Operating System :: POSIX",
+  "Programming Language :: Python :: 3 :: Only",
+  "Programming Language :: Python :: 3.9",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Programming Language :: Python :: 3.14",
+  "Programming Language :: Python :: 3.15",
+  "Programming Language :: Python :: Implementation :: CPython",
+  "Programming Language :: Python :: Implementation :: PyPy",
+  "Topic :: Software Development :: Libraries",
+  "Topic :: Software Development :: Testing",
+  "Topic :: Utilities",
+]
+dynamic = [
+  "readme",
+  "version",
+]
+dependencies = [
+  "distlib<1,>=0.4.3",
+  "filelock<=3.19.1,>=3.19.1; python_version<'3.10'",
+  "filelock>=3.24.2,<5; python_version>='3.10'",
+  "packaging>=26.3",
+  "platformdirs<5,>=4.4",
+  "python-discovery>=1.6.1",
+  "typing-extensions>=4.16; python_version<'3.11'",
+]
+urls."thanks.dev" = "https://thanks.dev/u/gh/gaborbernat"
+urls.Changelog = "https://virtualenv.pypa.io/en/latest/changelog.html"
+urls.Documentation = "https://virtualenv.pypa.io"
+urls.Funding = "https://github.com/sponsors/gaborbernat"
+urls.Homepage = "https://github.com/pypa/virtualenv"
+urls.Source = "https://github.com/pypa/virtualenv"
+urls.Tidelift = "https://tidelift.com/funding/github/pypi/virtualenv"
+urls.Tracker = "https://github.com/pypa/virtualenv/issues"
+scripts.virtualenv = "virtualenv.__main__:run_with_catch"
+entry-points."virtualenv.activate".bash = "virtualenv.activation.bash:BashActivator"
+entry-points."virtualenv.activate".batch = "virtualenv.activation.batch:BatchActivator"
+entry-points."virtualenv.activate".cshell = "virtualenv.activation.cshell:CShellActivator"
+entry-points."virtualenv.activate".fish = "virtualenv.activation.fish:FishActivator"
+entry-points."virtualenv.activate".nushell = "virtualenv.activation.nushell:NushellActivator"
+entry-points."virtualenv.activate".powershell = "virtualenv.activation.powershell:PowerShellActivator"
+entry-points."virtualenv.activate".python = "virtualenv.activation.python:PythonActivator"
+entry-points."virtualenv.activate".xonsh = "virtualenv.activation.xonsh:XonshActivator"
+entry-points."virtualenv.create".cpython3-mac-brew = """\
+  virtualenv.create.via_global_ref.builtin.cpython.mac_os:CPython3macOsBrew\
+  """
+entry-points."virtualenv.create".cpython3-mac-framework = """\
+  virtualenv.create.via_global_ref.builtin.cpython.mac_os:CPython3macOsFramework\
+  """
+entry-points."virtualenv.create".cpython3-posix = """\
+  virtualenv.create.via_global_ref.builtin.cpython.cpython3:CPython3Posix\
+  """
+entry-points."virtualenv.create".cpython3-win = """\
+  virtualenv.create.via_global_ref.builtin.cpython.cpython3:CPython3Windows\
+  """
+entry-points."virtualenv.create".graalpy-posix = "virtualenv.create.via_global_ref.builtin.graalpy:GraalPyPosix"
+entry-points."virtualenv.create".graalpy-win = "virtualenv.create.via_global_ref.builtin.graalpy:GraalPyWindows"
+entry-points."virtualenv.create".pypy3-posix = "virtualenv.create.via_global_ref.builtin.pypy.pypy3:PyPy3Posix"
+entry-points."virtualenv.create".pypy3-win = "virtualenv.create.via_global_ref.builtin.pypy.pypy3:Pypy3Windows"
+entry-points."virtualenv.create".rustpython-posix = """\
+  virtualenv.create.via_global_ref.builtin.rustpython:RustPythonPosix\
+  """
+entry-points."virtualenv.create".rustpython-win = """\
+  virtualenv.create.via_global_ref.builtin.rustpython:RustPythonWindows\
+  """
+entry-points."virtualenv.create".venv = "virtualenv.create.via_global_ref.venv:Venv"
+entry-points."virtualenv.discovery".builtin = "virtualenv.discovery.builtin:Builtin"
+entry-points."virtualenv.seed".app-data = "virtualenv.seed.embed.via_app_data.via_app_data:FromAppData"
+entry-points."virtualenv.seed".pip = "virtualenv.seed.embed.pip_invoke:PipInvoke"
+
+[dependency-groups]
+dev = [
+  { include-group = "docs" },
+  { include-group = "lint" },
+  { include-group = "pkg-meta" },
+  { include-group = "tasks" },
+  { include-group = "type" },
+]
+test = [
+  "coverage-enable-subprocess>=1",
+  { include-group = "coverage" },
+  "packaging>=26.3",
+  "pytest>=8.4.2",
+  "pytest-env>=1.1.5",
+  """\
+  pytest-freezer>=0.4.8; platform_python_implementation=='PyPy' or platform_python_implementation=='GraalVM' or \
+  platform_python_implementation=='RustPython' or (platform_python_implementation=='CPython' and sys_platform=='win32' \
+  and python_version>='3.13')\
+  """,
+  "pytest-mock!=3.16.1,>=3.15.1",
+  "pytest-randomly>=4.0.1",
+  "pytest-timeout>=2.4",
+  "pytest-xdist>=3.8",
+  "setuptools>=82.0.1",
+  "time-machine>=2.19; platform_python_implementation=='CPython'",
+  "tomli>=2.4.1; python_version<'3.11'",
+]
+type = [
+  "ty>=0.0.84",
+  { include-group = "test" },
+]
+docs = [
+  "furo>=2025.12.19",
+  "pre-commit-uv>=4.2",
+  "sphinx!=7.3,>=7.4.7",
+  "sphinx-argparse>=0.4",
+  "sphinx-autodoc-typehints>=3.6.2",
+  "sphinx-copybutton>=0.5.2",
+  "sphinx-inline-tabs>=2025.12.21.14",
+  "sphinx-llm!=1.1,>=1",
+  "sphinxcontrib-mermaid>=2",
+  "sphinxcontrib-towncrier>=0.2.1a0",
+  "towncrier>=26.9",
+  "uv>=0.13.5",
+  { include-group = "release" },
+]
+build = [
+  "cython>=3",
+  "hatch-fancy-pypi-readme>=25.1",
+  "hatch-vcs>=0.5",
+  "hatchling<1.28,>=1.27; python_version<'3.10'",
+  "hatchling>=1.28; python_version>='3.10'",
+  "python-sbom[hatch]>=0.1.2; python_version>='3.11'",
+  "setuptools>=80",
+]
+coverage = [
+  "covdefaults>=2.3",
+  "coverage>=7.10.7",
+]
+fuzz = [
+  # atheris only ships prebuilt Linux wheels for these CPython versions; everywhere else it needs a
+  # custom clang+libFuzzer build, so skip it there rather than triggering a doomed source build.
+  "atheris>=3.1; sys_platform=='linux' and python_version>='3.12' and python_version<'3.15'",
+]
+lint = [
+  "pre-commit-uv>=4.2",
+]
+pkg-meta = [
+  "check-sdist>=1.6",
+  "check-wheel-contents>=0.6.3",
+  "twine>=6.2",
+  "uv>=0.13.5",
+  { include-group = "sbom" },
+]
+property = [
+  "hypothesis>=6.141.1",
+  "xonsh>=0.23.8",
+  { include-group = "test" },
+]
+release = [
+  "docstrfmt>=2.2.1",
+  "gitpython>=3.2",
+  "hatch-fancy-pypi-readme>=25.1",
+  "hatch-vcs>=0.5",
+  "hatchling>=1.28",
+  "packaging>=26.3",
+  "prek>=0.5",
+  "pypi-attestations>=0.0.28",
+  "python-sbom>=0.1.2",
+  "release-creator>=4.4",
+  "towncrier>=26.9",
+  "tox>=4.45",
+  "tox-uv>=1.28.1",
+  "uv>=0.13.5",
+  { include-group = "sbom" },
+]
+release-build = [
+  "release-creator>=4.4",
+  "tox>=4.45",
+  "tox-uv>=1.28.1",
+]
+release-news = [
+  "release-creator>=4.4",
+  "towncrier>=26.9",
+]
+release-notes = [
+  "release-creator>=4.4",
+]
+release-prepare = [
+  "prek>=0.5",
+  "release-creator>=4.4",
+  "towncrier>=26.9",
+]
+release-spdx = [ { include-group = "sbom" } ]
+release-verify = [
+  "pypi-attestations>=0.0.28",
+]
+release-zipapp = [
+  "hatchling>=1.28",
+  "packaging>=26.3",
+  "python-sbom>=0.1.2",
+  "release-creator>=4.4",
+  { include-group = "sbom" },
+]
+sbom = [
+  # spdx-tools, which python-sbom[validate] and the SPDX check need, imports beartype, whose releases before 0.23 import
+  # a removed typing API: https://github.com/beartype/beartype/issues/618
+  "beartype>=0.23.0rc2; python_version>='3.15'",
+  "python-sbom[validate]>=0.1.2",
+  "spdx-tools>=0.8.5",
+]
+tasks = [
+  "docstrfmt>=2.2.1",
+  "gitpython>=3.2",
+  "hatchling>=1.28",
+  "pre-commit-uv>=4.2",
+  "prek>=0.5",
+  "python-sbom[validate]>=0.1.2",
+  "ruff>=0.16.10",
+  "towncrier>=26.9",
+  { include-group = "test" },
+]
+
+[tool.hatch]
+version.source = "vcs"
+metadata.hooks.fancy-pypi-readme.content-type = "text/markdown"
+metadata.hooks.fancy-pypi-readme.fragments = [ { path = "README.md" } ]
+build.hooks.vcs.version-file = "src/virtualenv/version.py"
+build.hooks.custom.path = "hatch_build.py"
+build.targets.sdist.include = [
+  "/.pre-commit-config.yaml",
+  "/pylock.zipapp.toml",
+  "/README.md",
+  "/src",
+  "/tasks",
+  "/tests",
+  "/tox.toml",
+  "/hatch_build.py",
+]
+
+[tool.uv]
+dependency-groups.dev = { requires-python = ">=3.15" }
+dependency-groups.docs = { requires-python = ">=3.15" }
+dependency-groups.lint = { requires-python = ">=3.11" }
+dependency-groups.pkg-meta = { requires-python = ">=3.10" }
+dependency-groups.release = { requires-python = ">=3.15" }
+dependency-groups.release-build = { requires-python = ">=3.15" }
+dependency-groups.release-news = { requires-python = ">=3.15" }
+dependency-groups.release-notes = { requires-python = ">=3.15" }
+dependency-groups.release-prepare = { requires-python = ">=3.15" }
+dependency-groups.release-verify = { requires-python = ">=3.15" }
+dependency-groups.release-zipapp = { requires-python = ">=3.15" }
+dependency-groups.sbom = { requires-python = ">=3.10" }
+dependency-groups.tasks = { requires-python = ">=3.10" }
+
+[tool.ruff]
+line-length = 120
+format.preview = true
+format.docstring-code-line-length = 100
+format.docstring-code-format = true
+lint.select = [
+  "ALL",
+]
+lint.ignore = [
+  "boolean-type-hint-positional-argument", # boolean positional args - pre-existing signatures, changing would break public API
+  "CPY",                                   # No copyright header
+  "D10",                                   # no docstrings
+  "D40",                                   # no imperative mode for docstrings
+  "DOC",                                   # no restructuredtext support
+  "implicit-namespace-package",            # ignore implicit namespace packages
+  "incorrect-blank-line-before-class",     # `incorrect-blank-line-before-class` and `no-blank-line-before-class` are incompatible
+  "line-too-long",                         # line too long - handled by ruff format and docstrfmt
+  "missing-trailing-comma",                # conflict with formatter
+  "multi-line-summary-second-line",        # multi-line-summary-second-line - conflicts with docstrfmt
+  "no-self-use",                           # Method could be a function, class method, or static method
+  "non-empty-init-module",                 # `__init__` module should only contain docstrings and re-exports
+  "PTH",                                   # no pathlib, <=39 has problems on Windows with absolute/resolve, can revisit once we no longer need 39
+  "subprocess-run-without-check",          # no need for check for subprocess
+  "subprocess-without-shell-equals-true",  # subprocess calls are fine
+  "suspicious-subprocess-import",          # Using subprocess is alright
+  "too-many-locals",                       # Too many local variables
+  "too-many-positional-arguments",         # Too many positional arguments
+]
+lint.per-file-ignores."docs/**/*.py" = [
+  "ANN", # don't require type annotations in docs scripts
+]
+lint.per-file-ignores."src/virtualenv/activation/python/activate_this.py" = [
+  "undefined-name", # ignore undefined template string placeholders
+]
+lint.per-file-ignores."tests/**/*.py" = [
+  "ANN",                             # don't require type annotations in tests (pytest fixtures make this impractical)
+  "assert",                          # asserts allowed in tests
+  "D",                               # don't care about documentation in tests
+  "FBT",                             # don't care about booleans as positional arguments in tests
+  "magic-value-comparison",          # Magic value used in comparison, consider replacing with a constant variable
+  "pytest-fixture-autouse",          # shared setup fixtures are meant to apply to every test
+  "start-process-with-partial-path", # partial executable path is fine in tests
+]
+lint.isort = { known-first-party = [
+  "virtualenv",
+], required-imports = [
+  "from __future__ import annotations",
+] }
+lint.preview = true
+
+[tool.codespell]
+builtin = "clear,usage,en-GB_to_en-US"
+# mitre: the CWE catalog lives at cwe.mitre.org, which codespell would rewrite to "miter"
+ignore-words-list = "acknowledgement,intoto,mitre"
+count = true
+
+[tool.check-sdist]
+default-ignore = false
+git-only = [
+  ".dockerignore",
+  ".gitattributes",
+  ".github/",
+  ".markdownlint.yaml",
+  ".oss-scanner/",
+  ".readthedocs.yml",
+  "_typos.toml",
+  "docs/",
+  "pylock.toml",
+  "scorecard.yml",
+]
+sdist-only = [ ".python-sbom-revision", "src/virtualenv/version.py" ]
+
+[tool.pyproject-fmt]
+max_supported_python = "3.15"
+
+[tool.ty]
+rules.unused-ignore-comment = "ignore"  # some ignores are platform/version-specific (e.g., ctypes.windll on Linux)
+
+[tool.pytest]
+ini_options.addopts = "--showlocals -m 'not property'"
+ini_options.markers = [
+  "graalpy: minimal test suite for GraalPy validation",
+  "property: hypothesis property tests, run by their own tox environment",
+  "slow",
+]
+ini_options.env = [
+  "PYTHONIOENCODING=utf-8",
+]
+ini_options.timeout = 120
+
+[tool.coverage]
+run.source = [
+  "${_COVERAGE_SRC}",
+  "tests",
+]
+run.dynamic_context = "test_function"
+run.parallel = true
+run.relative_files = true
+run.plugins = [
+  "covdefaults",
+]
+paths.source = [
+  "src",
+  "**/site-packages",
+]
+report.fail_under = 76
+report.omit = [
+  "**/src/virtualenv/activation/python/activate_this.py",
+  "**/src/virtualenv/create/via_global_ref/_virtualenv.py",
+  # site.py is run before the coverage can be enabled, no way to measure coverage on this
+  "**/src/virtualenv/create/via_global_ref/builtin/python2/site.py",
+  "**/src/virtualenv/seed/wheels/embed/pip-*.whl/pip/**",
+  # hatch-vcs writes version.py at build time, so the checkout that combines every run has no source for it
+  "**/virtualenv/version.py",
+]
+html.show_contexts = true
+html.skip_covered = false
+
+[tool.towncrier]
+name = "virtualenv"
+directory = "docs/changelog"
+filename = "docs/changelog.rst"
+template = "release_creator.fragments:template.rst.jinja2"
+title_format = false
+issue_format = ":pr:`{issue}`"
+underlines = [ "*", "-", "~" ]
+ignore = [ "examples.rst" ]
+type = [
+  # listing the types explicitly drops towncrier's "misc" default and makes a misspelt suffix fail
+  # instead of being silently skipped, as .bufix.rst and .docs.rst were
+  { directory = "feature", name = "Added", showcontent = true },
+  { directory = "change", name = "Changes", showcontent = true },
+  { directory = "bugfix", name = "Fixed", showcontent = true },
+  { directory = "doc", name = "Documentation", showcontent = true },
+  { directory = "breaking", name = "Breaking changes", showcontent = true },
+  { directory = "security", name = "Security", showcontent = true },
+  { directory = "performance", name = "Performance", showcontent = true },
+  { directory = "deprecation", name = "Deprecated", showcontent = true },
+  { directory = "removal", name = "Removed", showcontent = true },
+  { directory = "packaging", name = "Packaging", showcontent = true },
+]
+
+[tool.python-sbom]
+supplier = { name = "Python Packaging Authority", url = [ "https://www.pypa.io" ] }
+bundled-wheels = [ "src/virtualenv/seed/wheels/embed/*.whl" ]
+content-provider = "tasks.sbom_content:VirtualenvContent"
+
+[tool.nab]
+mode = "universal"
+base-group = "project-runtime"
+default-groups = []
+uploaded-prior-to = "P7D"
+decision-order = "stable"
+matrix.python = ">=3.15,<3.16"
+matrix.platforms = [ "linux_x86_64", "windows_amd64" ]
+
+[tool.simplint]
+docstring-style = "rst"
+# the CodeQL samples are deliberately bad code that the queries must flag, and they stay byte-identical to upstream
+per-file-ignores = { ".github/codeql/tests/*" = [ "SMP" ] }

@@ -1,0 +1,39 @@
+# packaging
+*.egg-info
+build
+dist
+*.egg
+.eggs
+
+# python
+*.py[codz]
+*$py.class
+
+# tools
+.tox
+.venv
+.*_cache
+.DS_Store
+
+# IDE
+.idea
+.vscode
+
+/docs/_draft.rst
+/pip-wheel-metadata
+/src/virtualenv/version.py
+/src/virtualenv/out
+.python-version
+
+*wheel-store*
+
+Dockerfile*
+!.oss-scanner/Dockerfile
+.dockerignore
+/uv.lock
+
+# CodeQL pack installs write lock files next to each qlpack
+.github/codeql/**/codeql-pack.lock.yml
+
+# the redirect virtualenv writes when tox creates .tox/dev inside the project
+.venv

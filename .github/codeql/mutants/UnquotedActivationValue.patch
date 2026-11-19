@@ -1,0 +1,12 @@
+diff --git a/src/virtualenv/activation/via_template.py b/src/virtualenv/activation/via_template.py
+--- a/src/virtualenv/activation/via_template.py
++++ b/src/virtualenv/activation/via_template.py
+@@ -88,7 +88,7 @@
+         :returns: the placeholder to substituted text mapping
+
+         """
+-        return {key: self.quote(self._repr_unicode(creator, value)) for key, value in replacements.items()}
++        return {key: self._repr_unicode(creator, value) for key, value in replacements.items()}
+
+     @staticmethod
+     def quote(string: str) -> str:

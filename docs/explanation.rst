@@ -1,0 +1,728 @@
+#############
+ Explanation
+#############
+
+This page explains the design decisions and concepts behind virtualenv. It focuses on understanding why things work the
+way they do.
+
+**************************
+ virtualenv vs venv vs uv
+**************************
+
+Since Python 3.3, the standard library includes the ``venv`` module, which provides basic virtual environment creation
+following `PEP 405 <https://www.python.org/dev/peps/pep-0405/>`_. `uv <https://docs.astral.sh/uv/pip/environments/>`_ is
+a newer, Rust-based tool that also creates virtual environments via ``uv venv``.
+
+virtualenv occupies a middle ground: faster and more featureful than ``venv``, while remaining a pure Python solution
+with a plugin system for extensibility.
+
+.. list-table::
+    :header-rows: 1
+    :widths: 20 27 27 26
+
+    - -
+      - ``venv``
+      - ``virtualenv``
+      - `uv <https://docs.astral.sh/uv/>`_
+    - - Performance
+      - Slowest (60s+); spawns `pip <https://pip.pypa.io>`_ as a subprocess to seed.
+      - Fast; caches pre-built install images, subsequent creation < 1 second.
+      - Fastest; Rust implementation, milliseconds. Does not seed pip/setuptools by default.
+    - - Extensibility
+      - No plugin system.
+      - Plugin system for discovery, creation, seeding, and activation.
+      - No plugin system.
+    - - Cross-version
+      - Only the Python version it runs under.
+      - Any installed Python via auto-discovery (registry, uv-managed, PATH).
+      - Any installed or uv-managed Python.
+    - - Upgradeability
+      - Tied to Python releases.
+      - Independent via `PyPI <https://pypi.org/project/virtualenv/>`_.
+      - Independent via its own release cycle.
+    - - Programmatic API
+      - Basic ``create()`` function only.
+      - Full Python API; can describe environments without creating them. Used by `tox <https://tox.readthedocs.io>`_,
+        `poetry <https://python-poetry.org/>`_, `pipx <https://pipx.pypa.io>`_, etc.
+      - Command line only.
+    - - Type annotations
+      - No ``py.typed`` marker; limited annotations.
+      - Fully typed with :PEP:`561` ``py.typed`` marker; checked by `ty <https://docs.astral.sh/ty/>`_.
+      - Not applicable (Rust binary).
+    - - Best for
+      - Zero dependencies, basic needs.
+      - Plugin extensibility, programmatic API, tool compatibility (`tox <https://tox.readthedocs.io>`_,
+        `virtualenvwrapper <https://virtualenvwrapper.readthedocs.io>`_).
+      - Maximum speed, already using ``uv`` for package management.
+
+.. mermaid::
+
+    flowchart TD
+        A{Need plugins or programmatic API?} -->|Yes| V[virtualenv]
+        A -->|No| B{Already using uv?}
+        B -->|Yes| U[uv venv]
+        B -->|No| C{Can install external tools?}
+        C -->|Yes| D{Speed matters?}
+        C -->|No| VENV[venv]
+        D -->|Yes| U
+        D -->|No| V
+
+        style A fill:#d97706,stroke:#b45309,color:#fff
+        style B fill:#d97706,stroke:#b45309,color:#fff
+        style C fill:#d97706,stroke:#b45309,color:#fff
+        style D fill:#d97706,stroke:#b45309,color:#fff
+        style V fill:#16a34a,stroke:#15803d,color:#fff
+        style U fill:#2563eb,stroke:#1d4ed8,color:#fff
+        style VENV fill:#7c3aed,stroke:#6d28d9,color:#fff
+
+***************************
+ Supported Python versions
+***************************
+
+virtualenv distinguishes between the **host** interpreter (the Python running virtualenv itself) and the **target**
+interpreter (the Python for which the virtual environment is created). When ``--python`` is not specified, the host and
+target are the same interpreter.
+
+Host interpreter
+================
+
+virtualenv requires CPython or PyPy **3.9 or later** as the host interpreter. This is enforced by ``requires-python >=
+3.9`` in the package metadata.
+
+Target interpreter
+==================
+
+The target interpreter can differ from the host. virtualenv can create virtual environments for any Python interpreter
+it can discover on the system, provided a matching creator exists.
+
+.. list-table::
+    :header-rows: 1
+    :widths: 20 15 65
+
+    - - Implementation
+      - Platforms
+      - Notes
+    - - CPython
+      - Linux, macOS, Windows
+      - 3.9+. Free-threaded builds supported on 3.13+. Includes macOS framework, Homebrew, Microsoft Store, and Windows
+        debug build support.
+    - - PyPy
+      - Linux, macOS, Windows
+      - 3.9+.
+    - - GraalPy
+      - Linux, macOS, Windows
+      - 24.1+. Minimal test coverage, marked experimental.
+    - - RustPython
+      - Linux, macOS, Windows
+      - Minimal test coverage, marked experimental.
+
+Seed packages (``pip``, ``setuptools``) are bundled for CPython 3.9 through 3.16. A target newer than the highest
+bundled version reuses the newest bundle. A target older than the oldest bundled version has no compatible bundled
+wheel, so the bundled seeders refuse it before the environment is created; pass ``--no-seed`` for an empty environment,
+or select a seeder that ships wheels for that version.
+
+**********************
+ How virtualenv works
+**********************
+
+Python packaging often faces a fundamental problem: different applications require different versions of the same
+library. If Application A needs ``requests==2.25.1`` but Application B needs ``requests==2.28.0``, installing both into
+the global site-packages directory creates a conflict. Only one version can exist in a given location.
+
+virtualenv solves this by creating isolated Python environments. Each environment has its own installation directories
+and can maintain its own set of installed packages, independent of other environments and the system Python.
+
+virtualenv operates in two distinct phases:
+
+.. mermaid::
+
+    flowchart TD
+        Start([virtualenv command]) --> Phase1[Phase 1: Python Discovery]
+        Phase1 --> Discover{Find Python interpreter}
+        Discover -->|Default| SameVersion[Use virtualenv's own Python]
+        Discover -->|--python flag| CustomVersion[Use specified Python]
+        CustomVersion --> Phase2[Phase 2: Environment Creation]
+        SameVersion --> Phase2
+        Phase2 --> CreatePython[Create Python matching target interpreter]
+        CreatePython --> SeedPackages[Install seed packages: pip, setuptools, wheel]
+        SeedPackages --> ActivationScripts[Install activation scripts]
+        ActivationScripts --> VCSIgnore[Create VCS ignore files]
+        VCSIgnore --> Record[Point .venv redirect at it]
+        Record --> Complete([Virtual environment ready])
+
+        style Start fill:#2563eb,stroke:#1d4ed8,color:#fff
+        style Phase1 fill:#6366f1,stroke:#4f46e5,color:#fff
+        style Phase2 fill:#6366f1,stroke:#4f46e5,color:#fff
+        style Complete fill:#16a34a,stroke:#15803d,color:#fff
+        style Discover fill:#d97706,stroke:#b45309,color:#fff
+
+**Phase 1: Discover a Python interpreter**
+    virtualenv first identifies which Python interpreter to use as the template for the virtual environment. By default,
+    it uses the same Python version that virtualenv itself is running on. You can override this with the ``--python``
+    flag to specify a different interpreter.
+
+**Phase 2: Create the virtual environment**
+    Once the target interpreter is identified, virtualenv creates the environment in five steps:
+
+    1. Create a Python executable matching the target interpreter
+    2. Install seed packages (pip, setuptools, wheel) to enable package installation
+    3. Install activation scripts for various shells
+    4. Create VCS ignore files (currently Git's ``.gitignore``, skip with ``--no-vcs-ignore``)
+    5. In a project folder, point a ``.venv`` redirect file beside the environment at it so editors and type checkers
+       can find it (`PEP 832 <https://peps.python.org/pep-0832/>`_, provisional; force with ``--venv-redirect``, skip
+       with ``--no-venv-redirect``)
+
+An important design principle: virtual environments are not self-contained. A complete Python installation consists of
+thousands of files, and copying all of them into every virtual environment would be wasteful. Instead, virtual
+environments are lightweight shells that borrow most content from the system Python. They contain only what's needed to
+redirect Python's behavior.
+
+``pyvenv.cfg`` is what makes that redirection work. The interpreter reads it at startup to find its base installation,
+so the file is the environment rather than a description of it. That also makes it the cheapest place for other tools to
+learn about the environment, which is why it accumulated three keys carrying the same version at different precisions.
+`PEP 838 <https://peps.python.org/pep-0838/>`_ settles which one to read by requiring ``python-version``, holding the
+feature release and nothing more, since a wheel tag and a type-checker target both stop at the minor version.
+``version`` and ``version_info`` stay for the callers that need a patch level or a release level, and
+:doc:`reference/files` sets out the difference.
+
+This design has two implications:
+
+- Environment creation is fast because only a small number of files need to be created.
+- Upgrading the system Python might affect existing virtual environments, since they reference the system Python's
+  standard library and binary extensions.
+
+The Python executable in a virtual environment is effectively isolated from the one used to create it, but the
+supporting files are shared.
+
+.. warning::
+
+    If you upgrade your system Python, existing virtual environments will still report the old version (the version
+    number is embedded in the Python executable itself), but they will use the new version's standard library and binary
+    extensions. This normally works without issues, but be aware that the environment is effectively running a hybrid of
+    old and new Python versions.
+
+******************
+ Python discovery
+******************
+
+Before creating a virtual environment, virtualenv must locate a Python interpreter. The interpreter determines the
+virtual environment's Python version, implementation (CPython, PyPy, etc.), and architecture (32-bit or 64-bit).
+
+The ``--python`` flag accepts several specifier formats:
+
+**Path specifier**
+    An absolute or relative path to a Python executable, such as ``/usr/bin/python3.14`` or ``./python``.
+
+**Version specifier**
+    A string following the format ``{implementation}{version}{architecture}{machine}`` where:
+
+    - Implementation is alphabetic characters (``python`` means any implementation; if omitted, defaults to ``python``).
+    - Version is dot-separated numbers, optionally followed by ``t`` for free-threading builds.
+    - Architecture is ``-64`` or ``-32`` (if omitted, means any architecture).
+    - Machine is the CPU instruction set architecture, e.g. ``-arm64``, ``-x86_64``, ``-aarch64`` (if omitted, means any
+      machine). Cross-platform aliases are normalized automatically (``amd64`` ↔ ``x86_64``, ``aarch64`` ↔ ``arm64``).
+
+    Examples:
+
+    - ``python3.14.1`` - Any Python implementation with version 3.14.1
+    - ``3`` - Any Python implementation with major version 3
+    - ``3.13t`` - Any Python implementation version 3.13 with free-threading enabled
+    - ``cpython3`` - CPython implementation with major version 3
+    - ``pypy2`` - PyPy implementation with major version 2
+    - ``cpython3.12-64-arm64`` - CPython 3.12, 64-bit, ARM64 architecture
+    - ``3.11-64-x86_64`` - Any implementation, version 3.11, 64-bit, x86_64 architecture
+    - ``rustpython`` - RustPython implementation
+
+**PEP 440 version specifier**
+    Version constraints using PEP 440 operators:
+
+    - ``>=3.12`` - Any Python 3.12 or later
+    - ``~=3.11.0`` - Compatible with Python 3.11.0
+    - ``cpython>=3.10`` - CPython 3.10 or later
+
+When you provide a specifier, virtualenv searches for matching interpreters using this strategy:
+
+.. mermaid::
+
+    flowchart TD
+        Start([Python specifier provided]) --> Windows{Running on Windows?}
+        Windows -->|Yes| Registry[Check Windows Registry per PEP-514]
+        Windows -->|No| UVManaged
+        Registry --> RegistryMatch{Match found?}
+        RegistryMatch -->|Yes| Found([Use matched Python])
+        RegistryMatch -->|No| UVManaged[Check uv-managed Python installations]
+        UVManaged --> UVMatch{Match found?}
+        UVMatch -->|Yes| Found
+        UVMatch -->|No| PATH[Search PATH for matching executable]
+        PATH --> PATHMatch{Match found?}
+        PATHMatch -->|Yes| Found
+        PATHMatch -->|No| NotFound([Discovery fails])
+
+        style Start fill:#2563eb,stroke:#1d4ed8,color:#fff
+        style Found fill:#16a34a,stroke:#15803d,color:#fff
+        style NotFound fill:#dc2626,stroke:#b91c1c,color:#fff
+        style Windows fill:#d97706,stroke:#b45309,color:#fff
+        style RegistryMatch fill:#d97706,stroke:#b45309,color:#fff
+        style UVMatch fill:#d97706,stroke:#b45309,color:#fff
+        style PATHMatch fill:#d97706,stroke:#b45309,color:#fff
+
+1. **Windows Registry** (Windows only): Check registered Python installations per `PEP 514
+   <https://www.python.org/dev/peps/pep-0514/>`_.
+2. **uv-managed installations**: Check the ``UV_PYTHON_INSTALL_DIR`` environment variable or platform-specific uv Python
+   directories for managed Python installations.
+3. **PATH search**: Search for executables on the ``PATH`` environment variable with names matching the specification.
+
+Version manager shim resolution
+===============================
+
+Version managers like `pyenv <https://github.com/pyenv/pyenv>`_, `mise <https://mise.jdx.dev/>`_, and `asdf
+<https://asdf-vm.com/>`_ place lightweight shim scripts on ``PATH`` that delegate to the real Python binary. When
+virtualenv discovers a Python interpreter by running it as a subprocess, shims may resolve to the wrong Python version
+(typically the system Python) because the shim's resolution logic depends on shell environment state that doesn't fully
+propagate to child processes.
+
+virtualenv detects shims by checking whether the candidate executable lives in a known shim directory
+(``$PYENV_ROOT/shims``, ``$MISE_DATA_DIR/shims``, or ``$ASDF_DATA_DIR/shims``). When a shim is detected, virtualenv
+bypasses it and locates the real binary directly under the version manager's ``versions`` directory, using the active
+version from:
+
+1. The ``PYENV_VERSION`` environment variable (colon-separated for multiple versions).
+2. A ``.python-version`` file in the current directory or any parent directory.
+3. The global version file at ``$PYENV_ROOT/version``.
+
+This convention is shared across pyenv, mise, and asdf, so the same resolution logic works for all three.
+
+.. warning::
+
+    Virtual environments typically reference the system Python's standard library. If you upgrade the system Python, the
+    virtual environment will report the old version (embedded in its Python executable) but will actually use the new
+    version's standard library content. This can cause confusion when debugging version-specific behavior.
+
+    If you use a virtual environment's Python as the target for creating another virtual environment, virtualenv will
+    detect the system Python version and create an environment matching the actual (upgraded) version, not the version
+    reported by the virtual environment.
+
+**********
+ Creators
+**********
+
+Creators are responsible for constructing the virtual environment structure. virtualenv supports two types of creators:
+
+**venv creator**
+    This creator delegates the entire creation process to the standard library's ``venv`` module, following `PEP 405
+    <https://www.python.org/dev/peps/pep-0405/>`_. The venv creator requires spawning a subprocess to invoke the venv
+    module, unless virtualenv is installed in the system Python.
+
+    The subprocess overhead can be significant, especially on Windows where process creation is expensive.
+
+**builtin creator**
+    This creator means virtualenv performs the creation itself by knowing exactly which files to create and which system
+    files to reference. The builtin creator is actually a family of specialized creators for different combinations of
+    Python implementation (CPython, PyPy, GraalPy, RustPython) and platform (Windows, POSIX). The name ``builtin`` is an
+    alias that selects the first available builtin creator for the target environment.
+
+    Because builtin creators don't require subprocess invocation, they're generally faster than the venv creator.
+
+.. mermaid::
+
+    flowchart TD
+        Start([Select creator]) --> Builtin{Builtin creator available?}
+        Builtin -->|Yes| UseBuiltin([Use builtin creator - faster, no subprocess])
+        Builtin -->|No| UseVenv([Use venv creator - delegates to stdlib])
+
+        style Start fill:#2563eb,stroke:#1d4ed8,color:#fff
+        style UseBuiltin fill:#16a34a,stroke:#15803d,color:#fff
+        style UseVenv fill:#7c3aed,stroke:#6d28d9,color:#fff
+        style Builtin fill:#d97706,stroke:#b45309,color:#fff
+
+virtualenv defaults to using the builtin creator if one is available for the target environment, falling back to the
+venv creator otherwise.
+
+Whichever creator runs, the interpreter ends up reachable under several names, listed in
+:doc:`reference/environment-layout`. Tools reach for different ones - a shebang may say ``python``, a CI job may call
+the versioned name - and an environment offering only one of them would break the others. The builtin creators take the
+version-bearing names from the target interpreter and add the host executable's own file name, so a host called
+``pypy3.11`` or ``python_d.exe`` stays reachable under the name its callers already use.
+
+Windows copies rather than symlinks, because symlinking the interpreter there is unreliable (`bpo-42013
+<https://bugs.python.org/issue42013>`_). From CPython 3.13 the file copied is the ``venvlauncher.exe`` redirector out of
+the host's standard library rather than the interpreter itself. The redirector reads ``pyvenv.cfg`` and hands off to the
+base prefix, which saves copying the DLLs and the standard library zip into every environment. Which name a copy carries
+makes no difference to where it lands, since the redirector resolves its target from a value compiled into it rather
+than from its own file name.
+
+*********
+ Seeders
+*********
+
+After creating the virtual environment structure, virtualenv installs seed packages that enable package management
+within the environment. The seed packages are:
+
+- ``pip`` - The package installer for Python (always installed).
+- ``setuptools`` - Package development and installation library (disabled by default on Python 3.12+).
+
+virtualenv supports two seeding methods with dramatically different performance characteristics:
+
+**pip seeder**
+    This method uses the bundled pip wheel to install seed packages by spawning a child pip process. The subprocess
+    performs a full installation, including unpacking wheels and generating metadata. This method is reliable but slow,
+    typically consuming 98% of the total virtual environment creation time.
+
+**app-data seeder**
+    This method creates reusable install images in a user application data directory. The first time you create an
+    environment with specific seed package versions, the app-data seeder builds complete install images and stores them
+    in the cache. Subsequent environment creations simply link or copy these pre-built images into the virtual
+    environment's ``site-packages`` directory.
+
+    Performance comparison for creating virtual environments:
+
+    .. mermaid::
+
+        xychart-beta horizontal
+            title "Seeding time (seconds, lower is better)"
+            x-axis ["pip seeder (70s)", "app-data copy Win (8s)", "app-data symlink Win (0.8s)", "app-data symlink Linux/macOS (0.1s)"]
+            y-axis "Seconds" 0 --> 80
+            bar [70, 8, 0.8, 0.1]
+
+    On platforms that support symlinks efficiently (Linux, macOS), the app-data seeder provides nearly instant seeding.
+
+    You can override the cache location using the ``VIRTUALENV_OVERRIDE_APP_DATA`` environment variable.
+
+.. _wheels:
+
+Wheel acquisition
+=================
+
+Both seeding methods require wheel files for the seed packages. virtualenv acquires wheels using a priority system:
+
+.. mermaid::
+
+    flowchart TD
+        Start([Need wheel file]) --> Embedded{Found in embedded wheels?}
+        Embedded -->|Yes| UseEmbedded([Use embedded wheel])
+        Embedded -->|No| Upgraded{Found in upgraded wheels?}
+        Upgraded -->|Yes| UseUpgraded([Use upgraded wheel])
+        Upgraded -->|No| Extra{Found in extra-search-dir?}
+        Extra -->|Yes| UseExtra([Use extra wheel])
+        Extra -->|No| Download{Download enabled?}
+        Download -->|Yes| DownloadPyPI([Download from PyPI])
+        Download -->|No| Fail([Seeding fails])
+
+        style Start fill:#2563eb,stroke:#1d4ed8,color:#fff
+        style UseEmbedded fill:#16a34a,stroke:#15803d,color:#fff
+        style UseUpgraded fill:#16a34a,stroke:#15803d,color:#fff
+        style UseExtra fill:#16a34a,stroke:#15803d,color:#fff
+        style DownloadPyPI fill:#16a34a,stroke:#15803d,color:#fff
+        style Fail fill:#dc2626,stroke:#b91c1c,color:#fff
+        style Embedded fill:#d97706,stroke:#b45309,color:#fff
+        style Upgraded fill:#d97706,stroke:#b45309,color:#fff
+        style Extra fill:#d97706,stroke:#b45309,color:#fff
+        style Download fill:#d97706,stroke:#b45309,color:#fff
+
+**Embedded wheels**
+    virtualenv ships with a set of wheels bundled directly into the package. These are tested with the virtualenv
+    release and provide a baseline set of seed packages. Different Python versions require different package versions,
+    so virtualenv bundles multiple wheels to support its wide Python version range.
+
+**Upgraded embedded wheels**
+    Users can manually upgrade the embedded wheels by running virtualenv with the ``--upgrade-embed-wheels`` flag. This
+    fetches newer versions of seed packages from PyPI and stores them in the user application data directory. Subsequent
+    virtualenv invocations will use these upgraded wheels instead of the embedded ones.
+
+    virtualenv can also perform periodic automatic upgrades (see below).
+
+**Extra search directories**
+    Users can specify additional directories containing wheels using the ``--extra-search-dir`` flag. This is useful in
+    air-gapped environments or when using custom package builds.
+
+**PyPI download**
+    If no suitable wheel is found in the above locations, or if the ``--download`` flag is set, virtualenv will use pip
+    to download the latest compatible version from PyPI.
+
+Pinned versions use `PEP 440 equality
+<https://packaging.python.org/en/latest/specifications/version-specifiers/#version-matching>`_ when selecting bundled,
+cached or extra search directory wheels. For example, a request for ``26.3.0`` can use a wheel named
+``pip-26.3-py3-none-any.whl``. This avoids downloading a release already available locally under an equivalent version
+spelling.
+
+Periodic update mechanism
+=========================
+
+To keep the seed packages reasonably current without requiring users to manually upgrade virtualenv or run
+``--upgrade-embed-wheels``, virtualenv implements a periodic automatic update system:
+
+.. mermaid::
+
+    timeline
+        title Periodic update safety gates
+        section PyPI release
+            Package published : New wheel available on PyPI
+        section 28-day wait
+            Day 1-28 : Wheel is too new, ignored by virtualenv
+        section Check interval
+            Every 14 days : virtualenv checks for eligible wheels
+        section 1-hour hold
+            After download : Wheel downloaded but not yet used
+            +1 hour : Wheel becomes active for new environments
+
+The 28-day waiting period protects users from automatically adopting newly released packages that might contain bugs.
+The 1-hour delay after download ensures continuous integration systems don't start using different package versions
+mid-run, which could cause confusing test failures.
+
+virtualenv stops using a logged release once the package index yanks it, at the next update that finds a newer release
+or no longer sees a logged one. It reads the yank flags from the simple API of the index ``pip`` is configured with
+(``PIP_INDEX_URL``, ``PIP_EXTRA_INDEX_URL`` or ``pip.conf``, with credentials from the URL or ``.netrc``, ``cert`` and
+``proxy``) without running ``pip``. If an index cannot be read, for example because it needs keyring credentials or a
+client certificate, the logged releases stay.
+
+You can disable the periodic update mechanism with the ``--no-periodic-update`` flag.
+
+.. _distribution_wheels:
+
+Distribution maintainer patching
+================================
+
+Operating system distributions and package managers sometimes need to customize which seed package versions virtualenv
+uses. They want to align virtualenv's bundled packages with system package versions.
+
+Distributions can patch the ``virtualenv.seed.wheels.embed`` module, replacing the ``get_embed_wheel`` function with
+their own implementation that returns distribution-provided wheels. If they want to use virtualenv's test suite for
+validation, they should also provide the ``BUNDLE_FOLDER``, ``BUNDLE_SUPPORT``, ``MIN``, ``MAX``, and
+``OLDEST_SUPPORTED`` variables. ``OLDEST_SUPPORTED`` (the parsed form of ``MIN``) sets the floor below which the bundled
+seeders refuse to seed, so a distribution that bundles wheels for an older Python must lower it to match.
+
+Distributions should also consider patching ``virtualenv.seed.embed.base_embed.PERIODIC_UPDATE_ON_BY_DEFAULT`` to
+``False``, allowing the system package manager to control seed package updates rather than virtualenv's periodic update
+mechanism. Users can still manually request upgrades via ``--upgrade-embed-wheels``, but automatic updates won't
+interfere with system-managed packages.
+
+************
+ Activators
+************
+
+Activation scripts modify the current shell environment to prioritize the virtual environment's executables. This is
+purely a convenience mechanism - you can always use absolute paths to virtual environment executables without
+activating.
+
+What activation does:
+
+.. mermaid::
+
+    flowchart TD
+        Before([Before activation]) --> ModifyPATH[Prepend venv/bin to PATH]
+        ModifyPATH --> SetVENV[Set VIRTUAL_ENV variable]
+        SetVENV --> SetPROMPT[Set VIRTUAL_ENV_PROMPT variable]
+        SetPROMPT --> SetPKG[Set PKG_CONFIG_PATH]
+        SetPKG --> ModifyPrompt[Modify shell prompt]
+        ModifyPrompt --> After([After activation])
+
+        style Before fill:#2563eb,stroke:#1d4ed8,color:#fff
+        style After fill:#16a34a,stroke:#15803d,color:#fff
+        style ModifyPATH fill:#6366f1,stroke:#4f46e5,color:#fff
+        style SetVENV fill:#6366f1,stroke:#4f46e5,color:#fff
+        style SetPROMPT fill:#6366f1,stroke:#4f46e5,color:#fff
+        style SetPKG fill:#6366f1,stroke:#4f46e5,color:#fff
+        style ModifyPrompt fill:#6366f1,stroke:#4f46e5,color:#fff
+
+**PATH modification**
+    The activation script prepends the virtual environment's ``bin`` directory (``Scripts`` on Windows) to the ``PATH``
+    environment variable. This ensures that when you run ``python``, ``pip``, or other executables, the shell finds the
+    virtual environment's versions first. For programmatic activation with ``activate_this.py``, empty ``PATH`` entries
+    are removed before the environment directory is prepended.
+
+**Environment variables**
+    Activation sets several environment variables:
+
+    - ``VIRTUAL_ENV`` - Absolute path to the virtual environment directory.
+    - ``VIRTUAL_ENV_PROMPT`` - The prompt prefix (the environment name or custom value from ``--prompt``).
+    - ``PKG_CONFIG_PATH`` - Modified to include the virtual environment's ``lib/pkgconfig`` directory.
+
+    Activation also clears an inherited ``PYTHONHOME`` so it cannot redirect standard-library lookup outside the
+    environment. Shells that clear it restore the original value on deactivation.
+
+**Prompt modification**
+    By default, activation prepends the environment name to your shell prompt, typically shown as ``(venv)`` before the
+    regular prompt. This visual indicator helps you remember which environment is active. You can customize this with
+    the ``--prompt`` flag when creating the environment, or disable it entirely by setting the
+    ``VIRTUAL_ENV_DISABLE_PROMPT`` environment variable.
+
+**Deactivation**
+    Activation scripts also provide a ``deactivate`` command that reverses the changes, restoring your original PATH and
+    removing the environment variables and prompt modifications.
+
+virtualenv provides activation scripts for multiple shells:
+
+- `Bash <https://www.gnu.org/software/bash/>`_ (``activate``)
+- `Fish <https://fishshell.com/>`_ (``activate.fish``)
+- `Csh/Tcsh <https://www.tcsh.org/>`_ (``activate.csh``)
+- `PowerShell <https://learn.microsoft.com/en-us/powershell/>`_ (``activate.ps1``)
+- `Windows Batch <https://learn.microsoft.com/en-us/windows-server/administration/windows-commands/cmd>`_
+  (``activate.bat``)
+- `Nushell <https://www.nushell.sh/>`_ (``activate.nu``)
+- Python (``activate_this.py``) -- for programmatic activation from within a running Python process, see
+  :ref:`programmatic-activation`
+
+.. note::
+
+    On Windows 7 and later, PowerShell's default execution policy is ``Restricted``, which prevents running the
+    ``activate.ps1`` script. You can allow locally-generated scripts to run by changing the execution policy:
+
+    .. code-block:: powershell
+
+        Set-ExecutionPolicy RemoteSigned
+
+    Since virtualenv generates ``activate.ps1`` locally for each environment, PowerShell considers it a local script
+    rather than a remote one and allows execution under the ``RemoteSigned`` policy.
+
+Remember: activation is optional. The following commands are equivalent:
+
+.. code-block:: console
+
+    # With activation
+    source venv/bin/activate
+    python script.py
+    deactivate
+
+    # Without activation
+    venv/bin/python script.py
+
+For a deeper dive into how activation works under the hood, see Allison Kaptur's blog post `There's no magic: virtualenv
+edition <https://www.recurse.com/blog/14-there-is-no-magic-virtualenv-edition>`_, which explains how virtualenv uses
+``PATH`` and ``PYTHONHOME`` to isolate virtual environments.
+
+.. _release-integrity:
+
+*******************
+ Release integrity
+*******************
+
+virtualenv installs the ``pip`` and ``setuptools`` wheels it bundles into every environment it creates, so a tampered
+release would reach all of them. Each release lets you check where its files came from without trusting the maintainers'
+machines. :doc:`how-to/verify-release` walks through the checks and :doc:`reference/release-artifacts` lists the files
+involved.
+
+**Trusted publishing**
+    The release workflow holds no PyPI API token. Its publish job exchanges a short-lived GitHub OIDC token for upload
+    rights through PyPI's `trusted publishing <https://docs.pypi.org/trusted-publishers/>`_, and the publish attestation
+    PyPI keeps for each file names that publisher: the ``release.yaml`` workflow of ``pypa/virtualenv`` in the
+    ``release`` environment.
+
+**Provenance**
+    For each file, the workflow signs a statement that binds the file's SHA-256 to the workflow identity: repository,
+    workflow file, tag and commit. `Sigstore <https://www.sigstore.dev>`_ issues the signing certificate and records it
+    in a public transparency log. PyPI stores the statements for the wheel and sdist; GitHub stores the one for the
+    zipapp and the SBOM attestations. Verifying a file recomputes its digest and checks it against a signed statement
+    whose identity you name.
+
+**Immutable releases**
+    From 21.11.0 on, once the workflow publishes a GitHub release, GitHub refuses changes to its tag and assets and
+    signs a release attestation over the tag's commit and each asset's SHA-256. A stolen maintainer token cannot swap
+    the zipapp or an SBOM on a published release. The release attestation names no workflow, so pair it with the
+    provenance check.
+
+**Reproducible builds**
+    Provenance tells you which workflow run built a file, but you still trust that run. The release pins every timestamp
+    to ``SOURCE_DATE_EPOCH``, the commit time of the tag, so you can rebuild the sdist, the wheel and the zipapp from
+    the tag yourself and compare the bytes. The SBOMs record the Python version and build tools the release used, which
+    a rebuild must match, and a lock file pins the distributions the zipapp bundles. The SBOMs leave out the machine
+    that ran the build, which the provenance attestation already names.
+
+**The SBOMs**
+    Dependency scanners find the packages a project declares, and virtualenv declares neither ``pip`` nor
+    ``setuptools``: it ships them as data files. The CycloneDX SBOM in the wheel names each bundled wheel with its hash,
+    license and vendored packages, so a scanner can match them against vulnerability databases. The release also
+    publishes it as SPDX for tools that read only that format. The zipapp gets its own SBOM because it bundles more: the
+    runtime dependencies for every supported Python, each in the version that Python loads.
+
+What a successful check proves:
+
+- The file is byte-identical to one that ``release.yaml`` in ``pypa/virtualenv`` built and signed.
+- With ``--source-ref`` or ``--signer-workflow``, the run came from that tag and workflow file.
+
+What it does not prove:
+
+- That the source at that tag is free of bugs or malicious code. Provenance ties a file to a commit; review of the
+  commit is a separate matter.
+- That the actions and build dependencies the workflow pulled in were not compromised. The SBOM records the build
+  environment so you can audit it after the fact.
+- That the bundled ``pip`` and ``setuptools`` have no known vulnerabilities. The SBOM lets you look them up.
+- Anything about wheels virtualenv fetches at run time. ``--download``, ``--upgrade-embed-wheels`` and the periodic
+  update take ``pip`` and ``setuptools`` from PyPI, outside virtualenv's attestations.
+- That you have the latest release. The bootstrap zipapp in particular can trail it.
+
+***********************
+ Environment discovery
+***********************
+
+Editors, type checkers and task runners need to find a project's environment, and they cannot count on an activated
+shell to tell them where it is. Launching an editor on a fresh checkout leaves it guessing. Each tool has answered that
+by hard-coding a search per environment manager it wants to support, which is why editor support for any new tool lags
+behind the tool itself.
+
+`PEP 832 <https://peps.python.org/pep-0832/>`_ gives the guess a fixed place to look: ``.venv`` in the project root,
+either the environment itself or a redirect file holding a single line with the path of one. virtualenv creates
+environments, so it writes the redirect; reading it belongs to the tools consuming it.
+
+virtualenv is a low-level tool, and most environments it builds are not a project's default, such as scratch
+environments or the ones tox and nox create for their own use. By default it writes the redirect when the environment
+lands in a project folder, one holding a ``pyproject.toml``, and that folder has no ``.venv`` yet:
+
+.. code-block:: console
+
+    $ ls
+    pyproject.toml  src
+    $ virtualenv env
+    $ virtualenv scratch
+    $ cat .venv
+    env
+
+**The first environment in a project claims the default**
+    Later environments leave the redirect alone, so a throwaway environment next to your working one does not move your
+    editor to it. Pass ``--venv-redirect`` to point the redirect at the new environment.
+
+**Outside a project folder, virtualenv writes nothing**
+    ``virtualenv foo`` in a folder without a ``pyproject.toml`` leaves the folder as it was. ``--venv-redirect`` writes
+    the redirect there anyway.
+
+**A ``.venv`` folder stays**
+    Creating ``.venv`` itself writes nothing, and where a ``.venv`` folder or symlink exists virtualenv leaves it alone,
+    since it already is the default.
+
+    Special files such as FIFOs, sockets and devices are also left alone. Reading a FIFO would wait for a writer, so
+    virtualenv only reads regular files when deciding whether to replace a redirect.
+
+**Other tools' redirects stay**
+    Even with ``--venv-redirect``, virtualenv honors the PEP's request not to overwrite a redirect another tool wrote.
+    The file carries no marker of who wrote it, so virtualenv judges by the target: it takes over the redirect only when
+    the ``pyvenv.cfg`` there carries the ``virtualenv`` key. A redirect written by uv, ``venv`` or you stays, and so
+    does one whose target is gone, since it may still resolve inside a container or on another machine.
+
+**The command line wins**
+    ``--venv-redirect`` and ``--no-venv-redirect`` set one choice, and a flag on the command line beats the environment
+    variable and the configuration file, so a single run can override a standing setting in either direction.
+
+**A failed write keeps the environment**
+    A write failure logs a warning and leaves you with a working environment. Discovery is a convenience for other
+    tools, so it does not get to fail the job you asked for.
+
+Why not a list
+==============
+
+An earlier draft of the PEP listed every environment in a ``.python-envs`` file. The PEP went back to a single redirect
+after workflow tool authors warned that tools sharing one list would overwrite each other's entries and change the
+default under the user. virtualenv follows the PEP, so it writes one line.
+
+Provisional status
+==================
+
+The feature is provisional. PEP 832 is still a draft whose format changed twice during review, and virtualenv tracks the
+PEP rather than its own earlier behavior, so a minor or patch release may change what virtualenv writes in backward
+incompatible ways. Pass ``--no-venv-redirect`` if you need a stable project folder until the Steering Council accepts
+the PEP.
+
+**********
+ See also
+**********
+
+- :doc:`how-to/usage` - Practical guides for common virtualenv tasks.
+- :doc:`reference/cli` - Complete CLI reference documentation.

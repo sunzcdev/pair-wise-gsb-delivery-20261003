@@ -1,0 +1,24 @@
+name: 🛡️ dependency review
+on:
+  pull_request:
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+permissions: {}
+jobs:
+  review:
+    name: 🛡️ Dependency review
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read # read the dependency graph diff between the base and head commits
+    steps:
+      - name: 🛡️ Review dependency changes
+        uses: actions/dependency-review-action@v5.0.0
+        with:
+          # an advisory of any severity in any manifest blocks the change: runtime dependencies run on every install,
+          # and the release tooling lock runs in jobs that hold publish and attestation permissions
+          fail-on-severity: low
+          fail-on-scopes: runtime, development, unknown
+          # the dependency graph files requirements lock files under runtime scope whatever they pin, so the license
+          # policy runs on the built wheel and zipapp SBOMs instead; see tasks/license_policy.py
+          license-check: false

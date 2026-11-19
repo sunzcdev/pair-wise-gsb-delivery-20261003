@@ -1,0 +1,178 @@
+from __future__ import annotations
+
+import hashlib
+import json
+import os
+import re
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+from typing import TYPE_CHECKING, Final
+from urllib.request import Request, urlopen
+
+if TYPE_CHECKING:
+    from typing import NotRequired, TypedDict
+
+    class _Pin(TypedDict):
+        tag: NotRequired[str]
+        assets: NotRequired[dict[str, dict[str, str]]]
+        version: NotRequired[str]
+
+    class _Release(TypedDict):
+        tagName: str
+
+    class _Releases(TypedDict):
+        nodes: list[_Release]
+
+    class _Repository(TypedDict):
+        latestRelease: _Release
+        releases: _Releases
+
+    class _Asset(TypedDict):
+        name: str
+        id: int
+        digest: NotRequired[str | None]
+
+    class _NpmVersion(TypedDict):
+        deprecated: NotRequired[str]
+
+    class _NpmPackage(TypedDict):
+        time: dict[str, str]
+        versions: dict[str, _NpmVersion]
+
+
+_PINS: Final[Path] = Path("tasks/ci-tools.json")
+# the docs load Mermaid from jsDelivr into every reader's browser, so give npm a week to pull a hijacked release
+_NPM_COOLDOWN: Final[timedelta] = timedelta(days=7)
+
+
+def _main() -> None:
+    if not (token := os.environ.get("GH_TOKEN")):
+        msg = "GH_TOKEN is required to query GitHub releases"
+        raise SystemExit(msg)
+    pins: Final[dict[str, _Pin]] = json.loads(_PINS.read_text(encoding="utf-8"))
+    tools: dict[str, tuple[str, bool, dict[str, str]]] = {
+        "fish": (
+            "fish-shell/fish-shell",
+            False,
+            {"Linux": "fish-{version}-linux-x86_64.tar.xz", "macOS": "fish-{version}.pkg"},
+        ),
+        "nushell": (
+            "nushell/nushell",
+            False,
+            {
+                "Linux": "nu-{version}-x86_64-unknown-linux-gnu.tar.gz",
+                "macOS": "nu-{version}-aarch64-apple-darwin.tar.gz",
+                "Windows": "nu-{version}-x86_64-pc-windows-msvc.zip",
+            },
+        ),
+        "rustpython": (
+            "RustPython/RustPython",
+            True,
+            {
+                "Linux": "rustpython-release-Linux-x86_64-unknown-linux-gnu",
+                "macOS": "rustpython-release-macOS-aarch64-apple-darwin",
+                "Windows": "rustpython-release-Windows-x86_64-pc-windows-msvc.exe",
+            },
+        ),
+    }
+    for tool, (repository, prerelease, patterns) in tools.items():
+        # an unchanged tag keeps its recorded hashes, so an asset replaced under the same tag fails CI instead
+        if (tag := _newest_tag(token, repository, prerelease=prerelease)) != pins[tool]["tag"]:
+            pins[tool] = {"tag": tag, "assets": _pin_assets(token, repository, tag, patterns)}
+    pins["mermaid"]["version"] = _newest_npm_version("mermaid", pins["mermaid"]["version"])
+    _PINS.write_text(f"{json.dumps(pins, indent=2, sort_keys=True)}\n", encoding="utf-8")
+
+
+def _newest_tag(token: str, repository: str, *, prerelease: bool) -> str:
+    owner, name = repository.split("/")
+    # the REST release listing of RustPython/RustPython comes back empty, so query GraphQL, which sees its releases
+    query: Final = """
+query($owner: String!, $name: String!) {
+  repository(owner: $owner, name: $name) {
+    latestRelease { tagName }
+    releases(first: 1, orderBy: {field: CREATED_AT, direction: DESC}) { nodes { tagName } }
+  }
+}
+"""
+    with urlopen(
+        Request(
+            "https://api.github.com/graphql",
+            data=json.dumps({"query": query, "variables": {"owner": owner, "name": name}}).encode(),
+            headers={"Authorization": f"Bearer {token}"},
+        ),
+        timeout=30,
+    ) as response:
+        found: Final[_Repository] = json.load(response)["data"]["repository"]
+    return found["releases"]["nodes"][0]["tagName"] if prerelease else found["latestRelease"]["tagName"]
+
+
+def _pin_assets(token: str, repository: str, tag: str, patterns: dict[str, str]) -> dict[str, dict[str, str]]:
+    with urlopen(
+        Request(
+            f"https://api.github.com/repos/{repository}/releases/tags/{tag}",
+            headers={"Authorization": f"Bearer {token}"},
+        ),
+        timeout=30,
+    ) as response:
+        published: Final[dict[str, _Asset]] = {asset["name"]: asset for asset in json.load(response)["assets"]}
+    pins: Final[dict[str, dict[str, str]]] = {}
+    for runner_os, pattern in patterns.items():
+        if (asset := published.get(name := pattern.format(version=tag.removeprefix("v")))) is None:
+            msg = f"{repository} {tag} has no asset {name}"
+            raise SystemExit(msg)
+        sha256 = _sha256(repository, asset["id"])
+        if (digest := asset.get("digest")) and digest != f"sha256:{sha256}":
+            msg = f"{name} hashes to {sha256} but GitHub reports {digest}"
+            raise SystemExit(msg)
+        pins[runner_os] = {"name": name, "sha256": sha256}
+    return pins
+
+
+def _sha256(repository: str, asset_id: int) -> str:
+    digest: Final = hashlib.sha256()
+    # no token: the API redirects to a signed storage URL, and urllib would forward the Authorization header there
+    with urlopen(
+        Request(
+            f"https://api.github.com/repos/{repository}/releases/assets/{asset_id}",
+            headers={"Accept": "application/octet-stream"},
+        ),
+        timeout=300,
+    ) as response:
+        for chunk in iter(lambda: response.read(1 << 20), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+_NEWEST_NPM_VERSION_PATTERN: Final[re.Pattern[str]] = re.compile(r"\d+\.\d+\.\d+")
+
+
+def _newest_npm_version(package: str, pinned: str) -> str:
+    with urlopen(Request(f"https://registry.npmjs.org/{package}"), timeout=30) as response:
+        metadata: Final[_NpmPackage] = json.load(response)
+    cutoff: Final[datetime] = datetime.now(tz=timezone.utc) - _NPM_COOLDOWN
+    # npm keeps the publish time of unpublished versions, so check each one still exists before taking it
+    return max(
+        (
+            pinned,
+            *(
+                version
+                for version, published in metadata["time"].items()
+                if _NEWEST_NPM_VERSION_PATTERN.fullmatch(version)
+                and datetime.strptime(published, "%Y-%m-%dT%H:%M:%S.%f%z") <= cutoff
+                and version in metadata["versions"]
+                and not metadata["versions"][version].get("deprecated")
+            ),
+        ),
+        key=_release_key,
+    )
+
+
+def _release_key(version: str) -> tuple[int, ...]:
+    return tuple(map(int, version.split(".")))
+
+
+__all__ = []
+
+
+if __name__ == "__main__":
+    _main()

@@ -1,0 +1,107 @@
+name: 📦 Upgrade embedded dependencies
+on:
+  schedule:
+    - cron: "0 11 * * 1"
+  workflow_dispatch:
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+permissions:
+  contents: read
+jobs:
+  generate:
+    name: 📦 Upgrade embedded pip/setuptools/wheel
+    if: github.repository_owner == 'pypa'
+    runs-on: ubuntu-24.04
+    outputs:
+      publish: ${{ steps.upgrade.outputs.changed == 'true' && steps.age-check.outputs.skip == 'false' }}
+      patch-artifact-id: ${{ steps.upload-patch.outputs.artifact-id }}
+    steps:
+      - name: 🛡️ Block outbound traffic outside the allowlist
+        uses: step-security/harden-runner@v2.22.4
+        with:
+          egress-policy: block
+          disable-sudo-and-containers: true
+          allowed-endpoints: >-
+            api.github.com:443 files.pythonhosted.org:443 github.com:443 pypi.org:443 raw.githubusercontent.com:443 registry.npmjs.org:443 release-assets.githubusercontent.com:443 releases.astral.sh:443
+      - name: 📥 Check out code
+        uses: actions/checkout@v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: 🐍 Install uv
+        uses: astral-sh/setup-uv@v10.3.3
+        with:
+          version: latest-known
+          python-version: "3.15"
+          enable-cache: false # the egress allowlist above blocks the cache service
+      - name: 📦 Install tox
+        run: uv tool install --python-preference only-managed --python 3.15 "tox>=4.32" --with tox-uv
+      - name: 🏷️ Fetch upstream tags for versioning
+        run: git fetch --force --tags https://github.com/pypa/virtualenv.git
+      - name: 📦 Pin the newest CI test tools
+        id: ci-tools
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: uv run --no-project --python 3.15 python tasks/upgrade_ci_tools.py
+      - name: 📦 Run upgrade
+        id: upgrade
+        env:
+          UPGRADE_ADVISORY: "1"
+          CI_TOOLS_OUTCOME: ${{ steps.ci-tools.outcome }}
+        run: |
+          tox run -e upgrade
+          git add -- src/virtualenv/seed/wheels/embed THIRD-PARTY-NOTICES.md docs/changelog
+          if [ "$CI_TOOLS_OUTCOME" = "success" ]; then
+            git add -- tasks/ci-tools.json
+          fi
+          if ! git diff --cached --quiet; then
+            echo "changed=true" >>"$GITHUB_OUTPUT"
+            echo "### Embedded dependency changes" >>"$GITHUB_STEP_SUMMARY"
+            git diff --cached --stat >>"$GITHUB_STEP_SUMMARY"
+          else
+            echo "changed=false" >>"$GITHUB_OUTPUT"
+            echo "### All embedded dependencies are up to date" >>"$GITHUB_STEP_SUMMARY"
+          fi
+      - name: 🔍 Check PyPI release age
+        if: steps.upgrade.outputs.changed == 'true'
+        id: age-check
+        run: |
+          uv run --no-project --python 3.15 python tasks/check_wheel_age.py >> "$GITHUB_OUTPUT"
+      - name: ⚙️ Prepare upgrade patch
+        if: steps.upgrade.outputs.changed == 'true' && steps.age-check.outputs.skip == 'false'
+        run: git diff --cached --binary --no-ext-diff --no-textconv > "$RUNNER_TEMP/maintenance.patch"
+      - name: 📤 Store upgrade patch
+        if: steps.upgrade.outputs.changed == 'true' && steps.age-check.outputs.skip == 'false'
+        id: upload-patch
+        uses: actions/upload-artifact@v7.0.2
+        with:
+          name: maintenance-patch
+          path: ${{ runner.temp }}/maintenance.patch
+          if-no-files-found: error
+          retention-days: 1
+  open:
+    name: 🔀 Open upgrade PR
+    needs: generate
+    if: needs.generate.outputs.publish == 'true'
+    permissions:
+      contents: read
+    uses: tox-dev/github-workflows/.github/workflows/open-maintenance-pr.yaml@ef0cd88bef592260a48345753b8b509b209ab189 # 6.8.3
+    with:
+      artifact-id: ${{ needs.generate.outputs.patch-artifact-id }}
+      allowed-paths: |
+        THIRD-PARTY-NOTICES.md
+        docs/changelog/embedded-wheels.bugfix.rst
+        pylock.zipapp.toml
+        tasks/ci-tools.json
+        src/virtualenv/seed/wheels/embed/catalog.py
+        src/virtualenv/seed/wheels/embed/*.whl
+      branch: auto/upgrade-embedded-deps
+      title: Upgrade embedded pip/setuptools/wheel and CI test tools
+      body: |
+        Automated upgrade of embedded pip, setuptools, and wheel dependencies, of the GraalPy, RustPython and Nushell releases CI tests against, and of the Mermaid version the documentation loads.
+
+        This PR was created automatically by the [upgrade workflow](https://github.com/${{ github.repository }}/actions/workflows/upgrade.yaml).
+      labels: dependencies
+    secrets:
+      RELEASE_APP_PRIVATE_KEY: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}

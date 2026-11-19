@@ -1,0 +1,52 @@
+{
+  "fish": {
+    "assets": {
+      "Linux": {
+        "name": "fish-4.9.3-linux-x86_64.tar.xz",
+        "sha256": "8f643d10ad1abb0ef7072764c01ceb5cf61b2d373fda400cf60f0bad69b7e095"
+      },
+      "macOS": {
+        "name": "fish-4.9.3.pkg",
+        "sha256": "fb489929e25e66b8c026a1da8935f68f828134e115a1706f360ed73149b843a9"
+      }
+    },
+    "tag": "4.9.3"
+  },
+  "mermaid": {
+    "version": "12.3.0"
+  },
+  "nushell": {
+    "assets": {
+      "Linux": {
+        "name": "nu-0.117.0-x86_64-unknown-linux-gnu.tar.gz",
+        "sha256": "33b907da92b0e80bd10fea9fa0e8a1624cabfebd89ee2568e365da3c492ffc68"
+      },
+      "Windows": {
+        "name": "nu-0.117.0-x86_64-pc-windows-msvc.zip",
+        "sha256": "8a135f25d3f22f1542107eb117e94628af35ce65402cbc098bfb26914227d3b2"
+      },
+      "macOS": {
+        "name": "nu-0.117.0-aarch64-apple-darwin.tar.gz",
+        "sha256": "1d0e642ef3bff22113a82749a0fa24a0126f4fea0db46a5909e56e94a4b57527"
+      }
+    },
+    "tag": "0.117.0"
+  },
+  "rustpython": {
+    "assets": {
+      "Linux": {
+        "name": "rustpython-release-Linux-x86_64-unknown-linux-gnu",
+        "sha256": "96b9bf688fde0feb3f392e39e5421382cb7e9c0641d7010c51ced871414b45c6"
+      },
+      "Windows": {
+        "name": "rustpython-release-Windows-x86_64-pc-windows-msvc.exe",
+        "sha256": "94a8e11df016e5002b4e4346064813981b50a822a61efe6e6d9310762c46b257"
+      },
+      "macOS": {
+        "name": "rustpython-release-macOS-aarch64-apple-darwin",
+        "sha256": "f0376723cdc222dc428df0c1ea771ed638f5c4e9fc6adacf5509fadfb9273bb6"
+      }
+    },
+    "tag": "2025-03-05-upd-webpack-19"
+  }
+}

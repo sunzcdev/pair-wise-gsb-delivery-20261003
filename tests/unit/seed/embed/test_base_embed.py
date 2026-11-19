@@ -1,0 +1,287 @@
+from __future__ import annotations
+
+import os
+import sys
+from typing import TYPE_CHECKING, Final, NamedTuple
+
+import pytest
+from python_discovery import PythonInfo
+
+from virtualenv.config.cli.parser import VirtualEnvOptions
+from virtualenv.run import session_via_cli
+from virtualenv.seed.embed.pip_invoke import PipInvoke
+from virtualenv.seed.embed.via_app_data.via_app_data import FromAppData
+from virtualenv.seed.seeder import Seeder
+from virtualenv.seed.wheels.embed import MIN, OLDEST_SUPPORTED
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
+    from pathlib import Path
+
+    from pytest_mock import MockerFixture
+
+    from virtualenv.run.session import Session
+    from virtualenv.seed.embed.base_embed import BaseEmbed
+
+
+@pytest.mark.parametrize(
+    ("args", "download"),
+    [
+        pytest.param([], False, id="default"),
+        pytest.param(["--no-download"], False, id="no-download"),
+        pytest.param(["--never-download"], False, id="never-download"),
+        pytest.param(["--download"], True, id="download"),
+    ],
+)
+def test_download_cli_flag(args, download, tmp_path) -> None:
+    session = session_via_cli([*args, str(tmp_path)])
+    assert session.seeder.download is download
+
+
+@pytest.mark.parametrize(
+    ("ini", "env_vars", "download", "source"),
+    [
+        pytest.param("", {}, False, "default", id="unset"),
+        pytest.param("", {"VIRTUALENV_NO_DOWNLOAD": "1"}, False, "env var", id="env-off"),
+        pytest.param("", {"VIRTUALENV_NEVER_DOWNLOAD": "1"}, False, "env var", id="never-env-off"),
+        pytest.param("", {"VIRTUALENV_DOWNLOAD": "1"}, True, "env var", id="env-on"),
+        pytest.param("no_download = true", {}, False, "file", id="ini-off"),
+        pytest.param("no_download = false", {}, False, "default", id="ini-negative-false-stays-unset"),
+        pytest.param("download = true", {}, True, "file", id="ini-on"),
+        pytest.param("download = true", {"VIRTUALENV_NO_DOWNLOAD": "1"}, False, "env var", id="env-off-beats-ini-on"),
+        pytest.param("no_download = true", {"VIRTUALENV_DOWNLOAD": "1"}, True, "env var", id="env-on-beats-ini-off"),
+        pytest.param(
+            "", {"VIRTUALENV_DOWNLOAD": "1", "VIRTUALENV_NO_DOWNLOAD": "1"}, False, "env var", id="both-env-opt-out"
+        ),
+        pytest.param("download = true\nno_download = true", {}, False, "file", id="both-ini-opt-out"),
+    ],
+)
+def test_download_ini_and_env_var(
+    tmp_path: Path, ini: str, env_vars: dict[str, str], download: bool, source: str
+) -> None:
+    config: Final[Path] = tmp_path / "virtualenv.ini"
+    config.write_text(f"[virtualenv]\n{ini}\n", encoding="utf-8")
+    # the test suite sets VIRTUALENV_NO_DOWNLOAD for every test, so start from an environment without it
+    env: Final = {key: value for key, value in os.environ.items() if key != "VIRTUALENV_NO_DOWNLOAD"}
+    options: Final = VirtualEnvOptions()
+
+    session: Final = session_via_cli(
+        [str(tmp_path / "env")],
+        options=options,
+        setup_logging=False,
+        env={**env, "VIRTUALENV_CONFIG_FILE": str(config), **env_vars},
+    )
+
+    assert (session.seeder.download, options.get_source("download")) == (download, source)
+
+
+@pytest.mark.parametrize(
+    "groups",
+    [
+        pytest.param((("first",),), id="single"),
+        pytest.param((("first", "second"),), id="multiple-values"),
+        pytest.param((("first",), ("second",)), id="repeated"),
+        pytest.param((("first", "second"), ("third",)), id="mixed"),
+    ],
+)
+def test_extra_search_dir_cli(tmp_path: Path, groups: tuple[tuple[str, ...], ...]) -> None:
+    args = [str(tmp_path / "env"), "--no-seed"]
+    expected = []
+    for group in groups:
+        args.append("--extra-search-dir")
+        for name in group:
+            path = tmp_path / name
+            path.mkdir()
+            expected.append(path)
+            args.append(str(path))
+    options = VirtualEnvOptions()
+
+    session = session_via_cli(args, options=options)
+
+    assert options.extra_search_dir == expected
+    assert session.seeder.extra_search_dir == expected
+
+
+_CLI_SEARCH_DIRS: Final[list[pytest.ParameterSet]] = [
+    pytest.param((), id="none"),
+    pytest.param(("first",), id="first"),
+    pytest.param(("first", "second"), id="both"),
+]
+
+
+@pytest.mark.parametrize("cli_dirs", _CLI_SEARCH_DIRS)
+def test_extra_search_dir_cli_overrides_env_var(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, cli_dirs: tuple[str, ...]
+) -> None:
+    configured = tmp_path / "configured"
+    configured.mkdir()
+    monkeypatch.setenv("VIRTUALENV_EXTRA_SEARCH_DIR", str(configured))
+    args, expected = _cli_search_dir_args(tmp_path, cli_dirs)
+
+    session = session_via_cli(args)
+
+    assert session.seeder.extra_search_dir == (expected or [configured])
+
+
+def _cli_search_dir_args(tmp_path: Path, cli_dirs: tuple[str, ...]) -> tuple[list[str], list[Path]]:
+    args = [str(tmp_path / "env"), "--no-seed"]
+    expected = []
+    for name in cli_dirs:
+        path = tmp_path / name
+        path.mkdir()
+        args.extend(["--extra-search-dir", str(path)])
+        expected.append(path)
+    return args, expected
+
+
+@pytest.mark.parametrize("cli_dirs", _CLI_SEARCH_DIRS)
+def test_extra_search_dir_cli_overrides_config_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, cli_dirs: tuple[str, ...]
+) -> None:
+    configured = tmp_path / "configured"
+    configured.mkdir()
+    config = tmp_path / "virtualenv.ini"
+    config.write_text(f"[virtualenv]\nextra_search_dir = {configured}\n", encoding="utf-8")
+    monkeypatch.setenv("VIRTUALENV_CONFIG_FILE", str(config))
+    args, expected = _cli_search_dir_args(tmp_path, cli_dirs)
+
+    session = session_via_cli(args)
+
+    assert session.seeder.extra_search_dir == (expected or [configured])
+
+
+_BUNDLED_VERSIONS: Final[dict[str, str]] = (
+    {"pip": "bundle"} if sys.version_info[:2] >= (3, 12) else {"pip": "bundle", "setuptools": "bundle"}
+)
+
+
+@pytest.mark.parametrize(
+    ("flags", "warns"),
+    [
+        pytest.param([], False, id="no-flag"),
+        pytest.param(["--no-wheel"], True, id="no-wheel"),
+        pytest.param(["--wheel=none"], True, id="wheel-none"),
+        pytest.param(["--wheel=embed"], True, id="wheel-embed"),
+        pytest.param(["--wheel=bundle"], True, id="wheel-bundle"),
+    ],
+)
+def test_wheel_cli_flags_do_nothing(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], flags: list[str], warns: bool
+) -> None:
+    session = session_via_cli([*flags, str(tmp_path)])
+    out, err = capsys.readouterr()
+    assert (
+        session.seeder.distribution_to_versions(),
+        "the --wheel and --no-wheel options do nothing" in out + err,
+    ) == (_BUNDLED_VERSIONS, warns)
+
+
+_BUNDLED_SEEDERS: Final[list[pytest.ParameterSet]] = [
+    pytest.param(FromAppData, id="app-data"),
+    pytest.param(PipInvoke, id="pip"),
+]
+
+
+@pytest.mark.parametrize("seeder", _BUNDLED_SEEDERS)
+def test_bundled_seeder_reports_reason_below_floor(
+    seeder: type[BaseEmbed], at_version: Callable[[int, int], PythonInfo]
+) -> None:
+    reason = seeder.cannot_seed(at_version(3, 8))
+    assert reason is not None
+    assert "Python 3.8" in reason
+    assert f"Python {MIN}" in reason
+    assert "--no-seed" in reason
+
+
+@pytest.mark.parametrize("seeder", _BUNDLED_SEEDERS)
+def test_bundled_seeder_has_no_reason_on_oldest_supported(
+    seeder: type[BaseEmbed], at_version: Callable[[int, int], PythonInfo]
+) -> None:
+    assert seeder.cannot_seed(at_version(*OLDEST_SUPPORTED)) is None
+
+
+def test_base_seeder_never_blocks(at_version: Callable[[int, int], PythonInfo]) -> None:
+    assert Seeder.cannot_seed(at_version(3, 8)) is None
+
+
+def test_selection_surfaces_the_seeder_reason(tmp_path: Path, mocker: MockerFixture) -> None:
+    mocker.patch.object(
+        FromAppData, "cannot_seed", new=classmethod(lambda _cls, _interpreter: "seeder said no for a specific reason")
+    )
+    with pytest.raises(RuntimeError, match="seeder said no for a specific reason"):
+        session_via_cli([str(tmp_path)])
+
+
+def test_no_seed_bypasses_capability_check(tmp_path: Path, mocker: MockerFixture) -> None:
+    mocker.patch.object(FromAppData, "cannot_seed", new=classmethod(lambda _cls, _interpreter: "seeder said no"))
+    assert session_via_cli(["--no-seed", str(tmp_path)]).seeder.enabled is False
+
+
+@pytest.fixture
+def at_version(mocker: MockerFixture) -> Callable[[int, int], PythonInfo]:
+    def build(major: int, minor: int) -> PythonInfo:
+        return mocker.create_autospec(PythonInfo, instance=True, version_info=_VersionInfo(major, minor))
+
+    return build
+
+
+class _VersionInfo(NamedTuple):
+    major: int
+    minor: int
+
+
+@pytest.mark.parametrize("seeder", [pytest.param("pip", id="pip"), pytest.param("app-data", id="app-data")])
+@pytest.mark.parametrize(
+    ("version", "reason"),
+    [
+        pytest.param("1.zip", "invalid", id="zip"),
+        pytest.param("1+local.zip", "archive-like", id="local-zip"),
+        pytest.param("1+local.zip ", "archive-like", id="local-zip-space"),
+        pytest.param("20.0.0.tar.gz", "invalid", id="tar-gz"),
+        pytest.param("./pip.whl", "invalid", id="path"),
+        pytest.param("invalid", "invalid", id="word"),
+    ],
+)
+def test_seed_version_rejected_before_creation(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], seeder: str, version: str, reason: str
+) -> None:
+    with pytest.raises(SystemExit) as context:
+        session_via_cli([str(tmp_path / "env"), "--seeder", seeder, "--pip", version])
+    assert (context.value.code, (tmp_path / "env").exists()) == (2, False)
+    assert f"argument --pip: {reason} seed version: {version!r}" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("seeder", [pytest.param("pip", id="pip"), pytest.param("app-data", id="app-data")])
+@pytest.mark.parametrize(
+    ("spelling", "expected"),
+    [
+        pytest.param("{}\r", "{}", id="version-carriage-return"),
+        pytest.param("{} ", "{}", id="version-trailing-space"),
+        pytest.param("v{}", "{}", id="version-v-prefix"),
+        pytest.param("none\r", "none", id="none-carriage-return"),
+        pytest.param("embed\r", "embed", id="embed-carriage-return"),
+        pytest.param("bundle\r", "bundle", id="bundle-carriage-return"),
+    ],
+)
+def test_seed_version_env_normalized(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, seeder: str, spelling: str, expected: str
+) -> None:
+    monkeypatch.setenv("VIRTUALENV_PIP", spelling.format("26.3"))
+    session: Final[Session] = session_via_cli([str(tmp_path / "env"), "--seeder", seeder])
+    assert session.seeder.pip_version == expected.format("26.3")
+
+
+@pytest.mark.parametrize(
+    ("on_by_default", "args", "periodic_update"),
+    [
+        pytest.param(True, [], True, id="on"),
+        pytest.param(True, ["--no-periodic-update"], False, id="on-flag"),
+        pytest.param(False, [], False, id="patched-off"),
+    ],
+)
+def test_periodic_update_default_follows_module_switch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, on_by_default: bool, args: list[str], periodic_update: bool
+) -> None:
+    monkeypatch.delenv("VIRTUALENV_NO_PERIODIC_UPDATE")  # conftest turns periodic updates off for every test
+    monkeypatch.setattr("virtualenv.seed.embed.base_embed.PERIODIC_UPDATE_ON_BY_DEFAULT", on_by_default)
+    assert session_via_cli([*args, str(tmp_path / "env")]).seeder.periodic_update is periodic_update

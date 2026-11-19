@@ -1,0 +1,512 @@
+################
+ Use virtualenv
+################
+
+*************************
+ Select a Python version
+*************************
+
+By default, virtualenv uses the same Python version it runs under. Override this with ``--python`` or ``-p``.
+
+Using version specifiers
+========================
+
+Specify a Python version by name or version number:
+
+.. code-block:: console
+
+    $ virtualenv -p python3.14 venv
+    $ virtualenv -p 3.10 venv
+    $ virtualenv -p pypy3 venv
+    $ virtualenv -p rustpython venv
+
+Using PEP 440 specifiers
+========================
+
+Use `PEP 440 <https://peps.python.org/pep-0440/#version-specifiers>`_ version specifiers to match Python versions:
+
+.. code-block:: console
+
+    $ virtualenv --python ">=3.12" venv
+    $ virtualenv --python "~=3.11.0" venv
+    $ virtualenv --python "cpython>=3.10" venv
+
+- ``>=3.12`` -- any Python 3.12 or later.
+- ``~=3.11.0`` -- compatible release, equivalent to ``>=3.11.0, <3.12.0`` (any 3.11.x patch).
+- ``cpython>=3.10`` -- restrict to CPython implementation, 3.10 or later.
+
+Using free-threading Python
+===========================
+
+Create an environment with `free-threading Python <https://docs.python.org/3/howto/free-threading-python.html>`_:
+
+.. code-block:: console
+
+    $ virtualenv -p 3.13t venv
+
+Targeting a specific CPU architecture
+=====================================
+
+On machines that support multiple architectures — such as Apple Silicon (arm64 + x86_64 via Rosetta) or Windows on ARM —
+you can request a specific CPU architecture by appending it to the spec string:
+
+.. code-block:: console
+
+    $ virtualenv -p cpython3.12-64-arm64 venv
+    $ virtualenv -p 3.11-64-x86_64 venv
+
+Cross-platform aliases are normalized automatically, so ``amd64`` and ``x86_64`` are treated as equivalent, as are
+``aarch64`` and ``arm64``. If omitted, any architecture matches (preserving existing behavior).
+
+Using absolute paths
+====================
+
+Specify the full path to a Python interpreter:
+
+.. code-block:: console
+
+    $ virtualenv -p /usr/bin/python3.9 venv
+
+Using ``--try-first-with``
+==========================
+
+Use ``--try-first-with`` to provide a hint about which Python to check first. Unlike ``--python``, this is a hint rather
+than a rule. The interpreter at this path is checked first, but only used if it matches the ``--python`` constraint.
+
+.. code-block:: console
+
+    $ virtualenv --python ">=3.10" --try-first-with /usr/bin/python3.9 venv
+
+In this example, /usr/bin/python3.9 is checked first but rejected because it does not satisfy the >=3.10 constraint.
+
+Using version managers (pyenv, mise, asdf)
+==========================================
+
+virtualenv automatically resolves shims from `pyenv <https://github.com/pyenv/pyenv>`_, `mise <https://mise.jdx.dev/>`_,
+and `asdf <https://asdf-vm.com/>`_ to the real Python binary. Set the active Python version using any of the standard
+mechanisms and virtualenv will discover it:
+
+.. code-block:: console
+
+    $ pyenv local 3.12.0
+    $ virtualenv venv  # uses pyenv's 3.12.0, not the system Python
+
+    $ PYENV_VERSION=3.11.0 virtualenv venv  # uses 3.11.0
+
+This also works with mise and asdf:
+
+.. code-block:: console
+
+    $ mise use python@3.12
+    $ virtualenv venv
+
+No additional configuration is required. See :doc:`../explanation` for details on how shim resolution works.
+
+********************************
+ Activate a virtual environment
+********************************
+
+Activate the environment to modify your shell's PATH and environment variables.
+
+.. tab:: Bash/Zsh
+
+    .. code-block:: console
+
+       $ source venv/bin/activate
+
+.. tab:: Fish
+
+    .. code-block:: console
+
+       $ source venv/bin/activate.fish
+
+.. tab:: PowerShell
+
+    .. code-block:: console
+
+       PS> .\venv\Scripts\Activate.ps1
+
+    .. note::
+
+       If you encounter an execution policy error, run ``Set-ExecutionPolicy RemoteSigned`` to allow local scripts.
+
+.. tab:: CMD
+
+    .. code-block:: console
+
+       > .\venv\Scripts\activate.bat
+
+.. tab:: Nushell
+
+    .. code-block:: console
+
+       $ overlay use venv/bin/activate.nu
+
+.. tab:: Xonsh
+
+    .. code-block:: console
+
+       @ source venv/bin/activate.xsh
+
+Deactivate the environment
+==========================
+
+Exit the virtual environment:
+
+.. code-block:: console
+
+    $ deactivate
+
+Use without activation
+======================
+
+Use the environment without activating it by calling executables with their full paths:
+
+.. code-block:: console
+
+    $ venv/bin/python script.py
+    $ venv/bin/pip install package
+
+``python``, ``python3`` and the versioned name reach the same interpreter, and on Windows the executables live in
+``venv\Scripts`` under ``.exe`` names. Reach for ``pythonw.exe`` there when you want a process without a console window.
+:doc:`../reference/environment-layout` lists every name.
+
+Customize prompt
+================
+
+Set a custom prompt prefix:
+
+.. code-block:: console
+
+    $ virtualenv --prompt myproject venv
+
+Disable the prompt modification by setting the ``VIRTUAL_ENV_DISABLE_PROMPT`` environment variable.
+
+Access the prompt string via the ``VIRTUAL_ENV_PROMPT`` environment variable.
+
+With ``promptvars`` off, bash shows a backslash doubled and a backtick with a leading backslash, because virtualenv
+escapes the prompt for a later ``shopt -s promptvars``. In posix mode bash shows ``!!`` as ``!``, and under root it
+shows ``#`` for a dollar sign. Zsh shows the prompt as typed under every prompt option.
+
+.. _programmatic-activation:
+
+Programmatic activation
+=======================
+
+Activate the environment from within a running Python process using ``activate_this.py``. This modifies ``sys.path`` and
+environment variables in the current process so that subsequent imports resolve from the virtual environment.
+
+The script removes empty ``PATH`` entries before prepending the environment's executable directory. On POSIX, an empty
+entry searches the current directory.
+
+It also removes an inherited ``PYTHONHOME`` from the current process so child Python interpreters use the environment's
+standard library.
+
+It points ``sys.prefix`` and ``sys.exec_prefix`` at the environment, so ``sysconfig`` reports the environment's install
+paths. CPython before 3.12.8, CPython 3.13.0 and PyPy before 3.12 read both prefixes once, when ``sysconfig`` is first
+imported, so there this only holds when the activation runs before that import.
+
+.. code-block:: python
+
+    import runpy
+
+    runpy.run_path("venv/bin/activate_this.py")
+
+A common use case is web applications served by a system-wide WSGI server (such as mod_wsgi or uWSGI) that need to load
+packages from a virtual environment:
+
+.. code-block:: python
+
+    import runpy
+    from pathlib import Path
+
+    runpy.run_path(str(Path("/var/www/myapp/venv/bin/activate_this.py")))
+
+    from myapp import create_app  # noqa: E402
+
+    application = create_app()
+
+********************
+ Configure defaults
+********************
+
+Use a configuration file to set default options for virtualenv.
+
+Configuration file location
+===========================
+
+The configuration file is named ``virtualenv.ini`` and located in the platformdirs app config directory. Run
+``virtualenv --help`` to see the exact location for your system.
+
+Override the location with the ``VIRTUALENV_CONFIG_FILE`` environment variable. An empty value counts as unset.
+
+Configuration format
+====================
+
+Derive configuration keys from command-line options by stripping leading ``-`` and replacing remaining ``-`` with ``_``:
+
+.. code-block:: ini
+
+    [virtualenv]
+    python = /opt/python-3.14/bin/python
+
+Values are not interpolated, so a ``%`` needs no escaping and references such as ``%APPDATA%`` or ``%(name)s`` are kept
+as written.
+
+Multi-value options
+===================
+
+Specify multiple values on separate lines:
+
+.. code-block:: ini
+
+    [virtualenv]
+    extra_search_dir =
+        /path/to/dists
+        /path/to/other/dists
+
+A value given on the command line replaces the configured list instead of adding to it. Repeat the option to pass
+several, for example ``-p 3.14 -p 3.13``.
+
+Environment variables
+=====================
+
+Set options using environment variables with the ``VIRTUALENV_`` prefix and uppercase key names:
+
+.. code-block:: console
+
+    $ export VIRTUALENV_PYTHON=/opt/python-3.14/bin/python
+
+For multi-value options, separate values with commas or newlines. The commas inside one version specifier, such as
+``>=3.9,<3.10``, do not split it; to pass two specifiers as separate values, put each on its own line.
+
+Override app-data location
+==========================
+
+Set the ``VIRTUALENV_OVERRIDE_APP_DATA`` environment variable to override the default app-data cache directory location.
+
+Use ``--app-data`` for an explicit cache location:
+
+.. code-block:: console
+
+    $ virtualenv --app-data /path/to/cache venv
+
+An empty or whitespace-only ``--app-data`` value is an error, as is a whitespace-only ``VIRTUALENV_APP_DATA``. Check
+shell variables before using ``--app-data "$CACHE"``, especially with ``--reset-app-data``, which deletes the selected
+cache. An empty ``VIRTUALENV_APP_DATA`` or a blank ``VIRTUALENV_OVERRIDE_APP_DATA`` is treated as unset.
+
+Allow unverified HTTPS for periodic updates
+===========================================
+
+The periodic update checks for newer seed wheels by fetching ``https://pypi.org/pypi/<distribution>/json``. The request
+is made with full TLS verification and, if the verified request fails, virtualenv now skips the update rather than
+downgrading the connection. Set ``VIRTUALENV_PERIODIC_UPDATE_INSECURE=1`` to restore the previous behavior and retry
+with an unverified SSL context. This is an escape hatch for hosts with broken trust stores; do not set it on hosts you
+do not control. The variable accepts the standard boolean values: ``1``, ``true``, ``yes``, and ``on`` enable the
+fallback; ``0``, ``false``, ``no``, and ``off`` disable it. Values are case-insensitive. This setting is read from the
+environment, not the ini configuration file.
+
+Configuration priority
+======================
+
+Options are resolved in this order (highest to lowest priority):
+
+.. mermaid::
+
+    block-beta
+        columns 1
+        A["Command-line arguments (highest)"]
+        B["Environment variables"]
+        C["Configuration file"]
+        D["Default values (lowest)"]
+
+        style A fill:#16a34a,stroke:#15803d,color:#fff
+        style B fill:#2563eb,stroke:#1d4ed8,color:#fff
+        style C fill:#d97706,stroke:#b45309,color:#fff
+        style D fill:#6366f1,stroke:#4f46e5,color:#fff
+
+********************************
+ Make environments discoverable
+********************************
+
+In a project folder, one holding a ``pyproject.toml``, virtualenv points a ``.venv`` redirect file at the first
+environment you create there, so editors and type checkers can find it without an activated shell. See `PEP 832
+<https://peps.python.org/pep-0832/>`_ for the format and :ref:`explanation:Environment discovery` for the reasoning. The
+feature is provisional while the PEP is a draft, so a minor or patch release may change it in backward incompatible
+ways.
+
+Point a tool at the right environment
+=====================================
+
+The redirect names the first environment you created in the project:
+
+.. code-block:: console
+
+    $ virtualenv py313 --python 3.13
+    $ virtualenv py314 --python 3.14
+    $ cat .venv
+    py313
+
+Pass ``--venv-redirect`` to make another environment the default, or to write the redirect outside a project folder:
+
+.. code-block:: console
+
+    $ virtualenv py314 --python 3.14 --venv-redirect
+    $ cat .venv
+    py314
+
+virtualenv leaves a ``.venv`` folder, symlink or special file such as a FIFO alone, and a redirect pointing at an
+environment it did not create. Delete the ``.venv`` if you want virtualenv to take it over.
+
+Choose once for every environment
+=================================
+
+Set the choice in the configuration file or an environment variable. ``no_venv_redirect = true`` stops the redirect:
+
+.. code-block:: ini
+
+    [virtualenv]
+    no_venv_redirect = true
+
+.. code-block:: console
+
+    $ export VIRTUALENV_NO_VENV_REDIRECT=1
+
+``venv_redirect = true`` or ``VIRTUALENV_VENV_REDIRECT=1`` writes it for every environment, as ``--venv-redirect`` does.
+Environment variables override either configuration file key: ``VIRTUALENV_VENV_REDIRECT=1`` also overrides
+``no_venv_redirect = true``. If both environment variables are true, ``VIRTUALENV_NO_VENV_REDIRECT`` wins. A flag on the
+command line beats both, so ``virtualenv env --venv-redirect`` writes the file for one run even with ``no_venv_redirect
+= true`` set.
+
+Commit the file or ignore it
+============================
+
+The redirect holds a path relative to its own folder, so you can commit it when the environment location is the same for
+everyone on the project, such as a containerized setup. Leave ``.venv`` in ``.gitignore`` when developers pick their own
+paths.
+
+***********************
+ Control seed packages
+***********************
+
+Pin a seed version
+==================
+
+Pass an exact version to ``--pip`` or ``--setuptools``:
+
+.. code-block:: console
+
+    $ virtualenv venv --pip 26.3.0
+
+Equivalent spellings such as ``26.3``, ``26.3.0`` and ``v26.3`` select the same release from bundled wheels, the cache
+or extra search directories. If that release is unavailable locally, virtualenv attempts a download even with
+``--no-download``. Surrounding whitespace is ignored for versions and the ``embed``, ``bundle`` and ``none`` keywords.
+
+Upgrade embedded wheels
+=======================
+
+Update the embedded wheel files to the latest versions:
+
+.. code-block:: console
+
+    $ virtualenv --upgrade-embed-wheels
+
+Provide custom wheels
+=====================
+
+Use custom wheel files from a local directory:
+
+.. code-block:: console
+
+    $ virtualenv venv --extra-search-dir /path/to/wheels
+
+Repeat the option to search more than one directory, in the given order:
+
+.. code-block:: console
+
+    $ virtualenv venv --extra-search-dir /path/to/wheels --extra-search-dir /path/to/other/wheels
+
+Download latest from PyPI
+=========================
+
+Download the latest versions of seed packages from PyPI:
+
+.. code-block:: console
+
+    $ virtualenv --download venv
+
+Set ``download = true`` in the configuration file or ``VIRTUALENV_DOWNLOAD=1`` to do so for every environment;
+``no_download = true`` or ``VIRTUALENV_NO_DOWNLOAD=1`` turns it off again. Environment variables override either
+configuration file key, and if both environment variables are true, ``VIRTUALENV_NO_DOWNLOAD`` wins. A flag on the
+command line beats both.
+
+Disable periodic updates
+========================
+
+Disable automatic periodic updates of seed packages:
+
+.. code-block:: console
+
+    $ virtualenv --no-periodic-update venv
+
+For distribution maintainers
+============================
+
+Patch the ``virtualenv.seed.embed.base_embed`` module and set ``PERIODIC_UPDATE_ON_BY_DEFAULT`` to ``False`` to disable
+periodic updates by default. See :doc:`../explanation` for implementation details.
+
+*******************************************
+ Find out which Python an environment uses
+*******************************************
+
+Read ``python-version`` out of ``pyvenv.cfg`` rather than running the environment's interpreter, which costs a
+subprocess and fails when the base Python has been removed:
+
+.. code-block:: python
+
+    from configparser import ConfigParser
+    from pathlib import Path
+
+    parser = ConfigParser()
+    parser.read_string("[cfg]\n" + Path("env/pyvenv.cfg").read_text(encoding="utf-8"))
+    parser["cfg"]["python-version"]  # '3.14'
+
+``pyvenv.cfg`` has no section header, hence the prefix. The key holds the feature release only; reach for ``version``
+when you need the patch level too.
+
+**********************
+ Use from Python code
+**********************
+
+Call virtualenv from Python code using the ``cli_run`` function:
+
+.. code-block:: python
+
+    from virtualenv import cli_run
+
+    cli_run(["venv"])
+
+Pass options as list elements:
+
+.. code-block:: python
+
+    cli_run(["-p", "python3.14", "--without-pip", "myenv"])
+
+Use the returned session object to access environment details:
+
+.. code-block:: python
+
+    result = cli_run(["venv"])
+    print(result.creator.dest)  # path to created environment
+    print(result.creator.exe)  # path to python executable
+
+Use ``session_via_cli`` to describe the environment without creating it:
+
+.. code-block:: python
+
+    from virtualenv import session_via_cli
+
+    session = session_via_cli(["venv"])
+    # inspect session.creator, session.seeder, session.activators
+
+See :doc:`../reference/api` for complete API documentation.

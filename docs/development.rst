@@ -1,0 +1,522 @@
+#############
+ Development
+#############
+
+*****************
+ Getting started
+*****************
+
+``virtualenv`` is a volunteer maintained open source project and we welcome contributions of all forms. The sections
+below will help you get started with development, testing, and documentation. We’re pleased that you are interested in
+working on virtualenv. This document is meant to get you setup to work on virtualenv and to act as a guide and reference
+to the development setup. If you face any issues during this process, please `open an issue
+<https://github.com/pypa/virtualenv/issues/new?title=Trouble+with+development+environment>`_ about it on the issue
+tracker.
+
+Setup
+=====
+
+virtualenv is a command line application written in Python. To work on it, you'll need:
+
+- **Source code**: available on `GitHub <https://github.com/pypa/virtualenv>`_. You can use ``git`` to clone the
+      repository:
+
+  .. code-block:: console
+
+      git clone https://github.com/pypa/virtualenv
+      cd virtualenv
+
+- **Python interpreter**: We recommend using ``CPython``. You can use `this guide
+  <https://realpython.com/installing-python/>`_ to set it up.
+- :pypi:`tox`: to automatically get the projects development dependencies and run the test suite. We recommend
+  installing it using `pipx <https://pipxproject.github.io/pipx/>`_.
+
+Running from source tree
+========================
+
+The easiest way to do this is to generate the development tox environment, and then invoke virtualenv from under the
+``.tox/dev`` folder
+
+.. code-block:: console
+
+    tox -e dev
+    .tox/dev/bin/virtualenv  # on Linux
+    .tox/dev/Scripts/virtualenv  # on Windows
+
+Running tests
+=============
+
+virtualenv's tests are written using the :pypi:`pytest` test framework. :pypi:`tox` is used to automate the setup and
+execution of virtualenv's tests.
+
+To run tests locally execute:
+
+.. code-block:: console
+
+    tox -e py
+
+This runs the test suite on Python 3.15. Select another supported interpreter with its environment name, such as
+``3.9``, ``3.14`` or ``pypy3.11``.
+
+``tox`` has been configured to forward any additional arguments it is given to ``pytest``. This enables the use of
+pytest's `rich CLI <https://docs.pytest.org/en/latest/usage.html#specifying-tests-selecting-tests>`_. As an example, you
+can select tests using the various ways that pytest provides:
+
+.. code-block:: console
+
+    # Using markers
+    tox -e py -- -m "not slow"
+    # Using keywords
+    tox -e py -- -k "test_extra"
+
+Some tests require additional dependencies to be run, such is the various shell activators (``bash``, ``fish``,
+``powershell``, etc). These tests will automatically be skipped if these are not present, note however that in CI all
+tests are run; so even if all tests succeed locally for you, they may still fail in the CI.
+
+The tests under ``tests/tasks`` cover the build and CI tooling, ``hatch_build.py`` and the scripts in ``tasks/``. Their
+outcome does not depend on the interpreter, so the interpreter environments skip them and one environment runs them on
+CPython 3.15:
+
+.. code-block:: console
+
+    tox -e tasks
+
+.. _running-linters:
+
+Running linters
+===============
+
+virtualenv uses :pypi:`pre-commit` for managing linting of the codebase. ``pre-commit`` performs various checks on all
+files in virtualenv and uses tools that help follow a consistent code style within the codebase. To use linters locally,
+run:
+
+.. code-block:: console
+
+    tox -e fix
+
+.. note::
+
+    Avoid using ``# noqa`` comments to suppress linter warnings - wherever possible, warnings should be fixed instead.
+    ``# noqa`` comments are reserved for rare cases where the recommended style causes severe readability problems.
+
+Type checking
+=============
+
+virtualenv ships a :PEP:`561` ``py.typed`` marker and has comprehensive type annotations across the entire codebase.
+This means downstream consumers and type checkers automatically recognize virtualenv as an inline-typed package.
+
+All new code **must** include complete type annotations for function parameters and return types. To verify annotations
+locally, run:
+
+.. code-block:: console
+
+    tox -e type
+
+This uses `ty <https://docs.astral.sh/ty/>`_ (Astral's Rust-based type checker) to validate annotations against Python
+3.15. A second environment checks compatibility with the minimum supported version:
+
+.. code-block:: console
+
+    tox -e type-3.9
+
+Both environments validate that annotations are consistent and correct.
+
+Annotation guidelines
+---------------------
+
+- Use ``from __future__ import annotations`` at the top of every module (enforced by ruff's ``required-imports``
+  setting).
+- Place imports that are only needed for type checking inside an ``if TYPE_CHECKING:`` block to avoid runtime overhead.
+- Ruff's ``ANN`` rules are enabled. ``ANN401`` (``typing.Any``) is suppressed on a case-by-case basis with inline ``#
+  noqa: ANN401`` comments where ``Any`` is genuinely required (e.g. serialization, dynamic dispatch).
+- Prefer concrete types over ``Any``. Use ``Union`` / ``|`` for nullable or multi-type parameters.
+- When a type error is genuinely unfixable (e.g. third-party library limitations), suppress it with an inline ``# ty:
+  ignore[rule-name]`` comment and a brief justification.
+
+Building documentation
+======================
+
+virtualenv's documentation is built using :pypi:`Sphinx`. The documentation is written in reStructuredText. To build it
+locally, run:
+
+.. code-block:: console
+
+    tox -e docs
+
+The built documentation can be found in the ``.tox/docs_out`` folder and may be viewed by opening ``index.html`` within
+that folder.
+
+Logo and branding
+=================
+
+Two logo files live in ``docs/_static`` and serve different roles, so both are kept on purpose:
+
+- ``virtualenv.png`` is the official logo — the snakes wrapped around a terminal, with the wordmark. It is the site logo
+  (``light_logo``/``dark_logo`` in ``docs/conf.py``) and the one to use wherever a virtualenv logo is needed.
+- ``virtualenv.svg`` is a simplified mark used only as the browser favicon (``html_favicon``), where the detailed PNG
+  would be illegible at 16×16. It is not a vector copy of the PNG.
+
+.. _release:
+
+Release
+=======
+
+virtualenv's release schedule is tied to ``pip`` and ``setuptools``. We bundle the latest version of these libraries so
+each time there's a new version of any of these, there will be a new virtualenv release shortly afterwards (we usually
+wait just a few days to avoid pulling in any broken releases).
+
+Performing a release
+--------------------
+
+A full release publishes to `PyPI <https://pypi.org/project/virtualenv/>`_, creates a `GitHub Release
+<https://github.com/pypa/virtualenv/releases>`_ with the zipapp and SBOMs attached, and updates `get-virtualenv
+<https://github.com/pypa/get-virtualenv>`_ so that ``https://bootstrap.pypa.io/virtualenv.pyz`` serves the new version.
+
+Version bumping
+^^^^^^^^^^^^^^^
+
+The release tool reads the latest numeric tag and the pending news fragments. ``auto`` selects a major version for a
+``breaking`` fragment, a minor version for a ``feature`` fragment, and a patch version otherwise. Adding or removing
+Python version support is a feature. The maintainer can choose ``major``, ``minor``, or ``patch`` explicitly, but cannot
+type an arbitrary release version.
+
+Both methods produce identical results: a release commit and tag on ``main``. Pushing the tag triggers the `Release
+workflow <https://github.com/pypa/virtualenv/actions/workflows/release.yaml>`_ which builds the sdist, wheel, and
+zipapp, publishes to PyPI via trusted publisher, creates a `GitHub Release
+<https://github.com/pypa/virtualenv/releases>`_ with the zipapp and SBOMs attached, and updates `get-virtualenv
+<https://github.com/pypa/get-virtualenv>`_. A failed publish needs the recovery procedure below.
+
+**Via GitHub Actions (recommended)**
+
+1. Go to the `Pre-release workflow <https://github.com/pypa/virtualenv/actions/workflows/pre-release.yaml>`_ on GitHub.
+2. Click **Run workflow** and select ``auto`` or an explicit bump type.
+
+**Locally**
+
+.. code-block:: console
+
+    tox r -e release -- --bump auto --no-push
+
+Run that command in a temporary clone to inspect the generated changelog and tag without pushing. Then run it in a clean
+checkout without ``--no-push`` to publish the release commit and tag atomically. Both paths link merged fragments to
+their squash pull requests, credit the human commit authors and co-authors, run ``release-creator contributors`` to add
+a New Contributors subsection, format the changelog with ``prek``, and run all hooks.
+
+News fragments
+^^^^^^^^^^^^^^
+
+Add ``docs/changelog/+short-description.<type>.rst`` for each user-facing change. A squash merge supplies the pull
+request number; release preparation adds its link and credits the commit's human authors and co-authors, so a fragment
+carries no hand-written credit. Link a separate issue with ``:issue:`` when the text refers to one. Use ``feature`` for
+adding or removing Python version support, ``bugfix`` for fixes, and ``packaging`` for installation or shipped
+dependency changes. Use ``change`` for modified behavior, ``doc`` for user guidance, ``security`` for security fixes,
+``performance`` for speed or resource improvements, ``breaking`` for incompatible behavior, ``deprecation`` for
+announced removals, and ``removal`` for removed features. Each fragment describes a user-visible effect in
+reStructuredText. A pull request can add several fragments when its changes belong in different categories.
+
+Changes confined to CI or maintenance need no news. Apply ``skip news`` to a human pull request without a fragment; the
+label can be added after the pull request opens. Bot pull requests without fragments receive that label automatically. A
+bot pull request with a fragment is still checked and its bot account is not credited as an author.
+
+Recovering a partial publication
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+A failure can leave a GitHub Release draft, a partial PyPI upload, or an unfinished bootstrap update. Keep the release
+commit and tag: users may have installed that version, and PyPI `does not allow filename reuse
+<https://pypi.org/help/#file-name-reuse>`_. Resetting the tip of ``main`` can also remove an unrelated commit that a
+maintainer merged during publication.
+
+Before retrying, inspect the failed job, the files on PyPI, the GitHub release assets and
+``get-virtualenv/public/version.txt``. Compare their hashes with the artifacts from the failed workflow run. Preserve
+those artifacts and logs. A timeout does not prove that an upload failed.
+
+When the failed run's artifacts match the published files, use **Re-run failed jobs** on that run, so the retry
+publishes the same built files. It verifies the complete PyPI file set, resumes a matching GitHub Release draft, and
+skips a matching ``get-virtualenv`` update. A mismatched PyPI file or GitHub Release asset stops the run for inspection.
+If the artifacts need a change, publish a new version and consider yanking the broken release. Use a normal reviewed
+commit for any bootstrap correction, without force-pushing either repository. Follow ``.github/INCIDENT_RESPONSE.md`` if
+there is evidence of tampering or compromised credentials.
+
+The release workflow verifies the published wheel, sdist and zipapp after publication. It checks the PyPI attestations
+and compares the distributions with the build artifacts, verifies the zipapp's release workflow, tag and commit, checks
+that the ``virtualenv.cdx.json`` and ``virtualenv.spdx.json`` release assets match the wheel and the attested SBOMs,
+then creates an environment from each distribution. This job has no publishing credentials. A verification failure does
+not undo publication: inspect the mismatch or creation failure before retrying only the verification job. Do not rerun
+publication to repair a verification failure.
+
+**************
+ Contributing
+**************
+
+Submitting pull requests
+========================
+
+Submit pull requests against the ``main`` branch, providing a good description of what you're doing and why. You must
+have legal permission to distribute any code you contribute to virtualenv and it must be available under the MIT
+License. Provide tests that cover your changes and run the tests locally first. virtualenv :ref:`supports
+<compatibility-requirements>` multiple Python versions and operating systems. Any pull request must consider and work on
+all these platforms.
+
+Pull Requests should be small to facilitate review. Keep them self-contained, and limited in scope. `Studies have shown
+<https://smartbear.com/learn/code-review/best-practices-for-peer-code-review/>`_ that review quality falls off as patch
+size grows. Sometimes this will result in many small PRs to land a single large feature. In particular, pull requests
+must not be treated as "feature branches", with ongoing development work happening within the PR. Instead, the feature
+should be broken up into smaller, independent parts which can be reviewed and merged individually.
+
+Additionally, avoid including "cosmetic" changes to code that is unrelated to your change, as these make reviewing the
+PR more difficult. Examples include re-flowing text in comments or documentation, or addition or removal of blank lines
+or whitespace within lines. Such changes can be made separately, as a "formatting cleanup" PR, if needed.
+
+Code review
+===========
+
+A maintainer reviews each pull request before it merges into ``main`` and checks that:
+
+- the change does what its description says, and a test covers it;
+- the change works on each Python version and operating system that :ref:`compatibility-requirements` lists;
+- a news fragment describes each user-facing change, and the documentation matches the new behavior;
+- the command line, the Python API and the plugin API stay compatible, or a deprecation or removal fragment announces
+  the break;
+- a change to activation scripts, ``pyvenv.cfg``, wheel downloads, app-data or the release workflows names in its
+  description the outside input it handles, and updates the `threat model
+  <https://github.com/pypa/virtualenv/blob/main/.github/THREAT_MODEL.md#update-triggers>`_ when it hits an update
+  trigger;
+- a new or bumped dependency meets the :ref:`licensing policy <licensing-policy>`.
+
+The ``main`` ruleset enforces the rest. A pull request merges only after four checks pass: ``🚦 All checks pass``, which
+gathers the test matrix, the type checks, the docs build, the zipapp and SBOM checks and the CodeQL query tests from
+``check.yaml``; ``🛡️ Dependency review``; ``pre-commit.ci - pr``; and the Read the Docs build. The ruleset also blocks a
+merge while CodeQL reports an error, or a security alert of high severity or above.
+
+The ruleset requires no approval, so a maintainer can merge after the required checks pass. Repository admins can bypass
+the ruleset. The `threat model
+<https://github.com/pypa/virtualenv/blob/main/.github/THREAT_MODEL.md#library-and-supply-chain-threats>`_ records the
+risk of a single reviewer.
+
+AI-assisted contributions
+=========================
+
+You may use AI tools (code assistants, chat models, agents) to help write a contribution, under these conditions:
+
+- You are the author. Read, understand and test everything you submit; you are responsible for it as if you had typed it
+  yourself, including its licensing.
+- Keep a human in the loop. Do not open pull requests or issues, or post review comments, that you have not read. Fully
+  automated submissions are closed without review.
+- Do not paste in code whose license is unknown or incompatible with the MIT License, whatever produced it.
+
+Maintainers may use AI tools to help triage and review. A review comment posted under a maintainer's name has been read
+and endorsed by that maintainer.
+
+Dependency policy
+=================
+
+virtualenv lists its runtime dependencies under ``[project.dependencies]`` in ``pyproject.toml``, and its development
+and release tools in dependency groups and ``tox.toml``. Adding a runtime dependency is a maintainer decision under the
+`Licensing policy`_ below.
+
+The project obtains and updates each kind of dependency this way:
+
+- Installers fetch runtime dependencies from PyPI within the ranges ``pyproject.toml`` allows.
+- The daily ``upgrade.yaml`` workflow runs ``tox r -e upgrade``, which downloads new ``pip`` and ``setuptools`` wheels
+  from PyPI into ``src/virtualenv/seed/wheels/embed`` and records their SHA-256 in ``BUNDLE_SHA256``. The same workflow
+  recompiles ``pylock.zipapp.toml``, which pins each distribution the zipapp bundles by version and hash. It leaves out
+  releases younger than seven days and opens a pull request with the result.
+- The weekly ``upgrade-release-tools.yaml`` workflow refreshes ``pylock.toml`` across every dependency group for the
+  Python version and platforms that CI installs it on. Release builds take their exact tool versions and backend hashes
+  from it.
+- Dependabot bumps the GitHub Actions, which the repository requires to be pinned to a commit SHA, and the pre-commit
+  hooks, which ``.pre-commit-config.yaml`` freezes to commit SHAs, every week after a seven-day cooldown. pre-commit.ci
+  also bumps the hooks once a quarter. ``upgrade.yaml`` bumps the CI test tools every Monday.
+
+We track dependencies through the CycloneDX SBOM in every wheel and the SBOMs attached to each release, which
+:doc:`reference/release-artifacts` describes, and through Dependabot alerts, which cover the pip and GitHub Actions
+manifests.
+
+Software composition analysis findings follow these thresholds:
+
+- ``dependency-review.yaml`` fails a pull request that adds a dependency with a known advisory of any severity, in
+  runtime or development scope. The ``main`` ruleset requires that check.
+- A shipped package whose license falls outside ``ALLOWED_LICENSES`` fails the SBOM check in ``tox r -e readme`` and
+  ``tox r -e zipapp``, which the required ``🚦 All checks pass`` check runs. We accept no exceptions.
+- An open Dependabot alert blocks the next release. The maintainer who cuts the release fixes it first, or dismisses it
+  with the reason virtualenv does not reach the vulnerable code.
+- An embedded wheel with no fixed version for a supported Python version stays, and
+  :ref:`reference/release-artifacts:Embedded wheel advisories` lists its advisories and the way around them.
+
+.. _licensing-policy:
+
+Licensing policy
+================
+
+virtualenv is distributed under the MIT License, and everything in the repository must be compatible with it:
+
+- Contributions are accepted under the MIT License only; you must have the right to license what you submit.
+- What virtualenv ships must use a permissive license from ``ALLOWED_LICENSES`` in ``tasks/license_policy.py``. That
+  covers virtualenv itself, every distribution the zipapp bundles, and the embedded ``pip`` and ``setuptools`` wheels
+  under ``src/virtualenv/seed/wheels/embed``, which keep their own MIT licenses and ship unchanged. The packages those
+  wheels vendor follow the terms of their wheel. The Unlicense entry covers ``filelock`` 3.19.1 and older, which
+  virtualenv installs on Python 3.9 and bundles in the zipapp. Copyleft licenses (GPL, LGPL, AGPL, MPL) stay out.
+  Development and release tools carry no such restriction.
+- ``tasks/validate_sbom.py`` enforces the policy on the SBOMs of the built wheel and zipapp, in ``tox r -e readme`` and
+  ``tox r -e zipapp``. An SPDX expression passes when each ``OR`` offers an allowed license and every ``AND`` operand is
+  allowed; a ``WITH`` exception leaves the verdict to the license it modifies. A package that declares its license by
+  name alone fails the check until `python-sbom <https://github.com/tox-dev/python-sbom>`_ maps the name to an SPDX id.
+- ``.github/workflows/dependency-review.yaml`` fails a pull request that adds a dependency with a known vulnerability to
+  any manifest, release tooling lock files included.
+- Adding a runtime dependency or bumping an embedded wheel is a maintainer decision; checking the license of the new
+  version is part of that review.
+- The ``python-sbom`` build hook writes a `CycloneDX <https://cyclonedx.org/>`_ SBOM into every wheel at
+  ``.dist-info/sboms/virtualenv.cdx.json``. Its options live under ``[tool.python-sbom]`` in ``pyproject.toml``, where
+  ``content-provider`` names ``tasks/sbom_content.py``: it adds the ``BUNDLE_SUPPORT`` table that backs the embedded
+  wheels above, so a wheel bump updates the SBOM with no extra step. ``hatch_build.py`` only loads the hook on Python
+  versions python-sbom supports. ``python-sbom spdx`` renders that document as SPDX 2.3. ``tox r -e readme`` builds a
+  wheel and validates its SBOM and the SPDX rendering; the release workflow runs ``tox r -e spdx`` to write
+  ``virtualenv.spdx.json`` from ``virtualenv.cdx.json`` and check it with ``pyspdxtools``. Both environments run on
+  Python 3.15 with a Beartype prerelease that fixes its `removed typing API import
+  <https://github.com/beartype/beartype/issues/618>`_.
+- ``python-sbom archive`` describes a built ``virtualenv.pyz`` the way the hook describes the wheel: virtualenv, the
+  embedded wheels with the same identities as in the wheel's SBOM, and each bundled dependency with the Python versions
+  that load it, down to a SHA-256 per file. ``tox r -e zipapp`` builds the zipapp, writes ``virtualenv.pyz.cdx.json``
+  next to it and into its root, and has ``tasks/validate_sbom.py`` check that the SBOM lists every file in the archive
+  with its hash.
+
+:doc:`reference/release-artifacts` describes every file, SBOM and attestation a release publishes, and
+:doc:`how-to/verify-release` shows users how to check them.
+
+Automated testing
+=================
+
+All pull requests and merges to 'main' branch are tested using `GitHub Actions <https://docs.github.com/en/actions>`_
+(configured by ``.github/workflows/check.yaml`` file at the root of the repository). You can find the status and results
+to the CI runs for your PR on GitHub's Web UI for the pull request. You can also find links to the CI services' pages
+for the specific builds in the form of "Details" links, in case the CI run fails and you wish to view the output.
+
+To trigger CI to run again for a pull request, you can close and open the pull request or submit another change to the
+pull request. If needed, project maintainers can manually trigger a restart of a job/build.
+
+Code scanning policy
+====================
+
+Static analysis runs on every pull request and every push to ``main``:
+
+- pre-commit.ci runs ruff with every rule selected, the ``flake8-bandit`` security rules included, and `zizmor
+  <https://docs.zizmor.sh>`_ on the workflows. The ``type`` and ``type-3.9`` tox environments run ty.
+- ``codeql.yaml`` runs CodeQL with the ``security-extended`` suite and the project queries under
+  ``.github/codeql/queries`` on the Python code, and the Actions analysis on the workflows. It also runs every Tuesday.
+
+Each project query comes with a patch under ``.github/codeql/mutants`` that brings back the bug the query guards
+against. The CodeQL query job in ``check.yaml`` fails when a query reports nothing on ``src/virtualenv`` with its patch
+applied, or reports anything without it, so a refactor that moves the code out from under a query fails CI instead of
+leaving the query matching nothing. A patch that no longer applies fails the job too; regenerate it with ``git diff``
+after reintroducing the bug by hand.
+
+A finding blocks a merge at these thresholds:
+
+- Any ruff, zizmor or ty finding fails a required check.
+- The ``main`` ruleset blocks a merge while CodeQL reports an alert of severity ``error``, or a security alert of
+  severity ``high`` or ``critical``.
+- Each other open CodeQL alert blocks the next release. The maintainer who cuts the release fixes it first, or dismisses
+  it as a false positive or as not exploitable.
+
+A CodeQL dismissal carries a comment that says who controls the flagged input and why it cannot cross a trust boundary
+that the `threat model <https://github.com/pypa/virtualenv/blob/main/.github/THREAT_MODEL.md>`_ lists. An inline
+suppression names the rule it silences, and :ref:`running-linters` says when a ``# noqa`` fits.
+
+Becoming a maintainer
+=====================
+
+If you want to become an official maintainer, start by helping out. As a first step, we welcome you to triage issues on
+virtualenv's issue tracker. virtualenv maintainers provide triage abilities to contributors once they have been around
+for some time and contributed positively to the project. This is optional and highly recommended for becoming a
+virtualenv maintainer. Later, when you think you're ready, get in touch with one of the maintainers and they will
+initiate a vote among the existing maintainers.
+
+.. note::
+
+    Upon becoming a maintainer, a person should be given access to various virtualenv-related tooling across multiple
+    platforms. These are noted here for future reference by the maintainers:
+
+    - GitHub Push Access
+    - PyPI Publishing Access
+    - CI Administration capabilities
+    - ReadTheDocs Administration capabilities
+
+Maintainer access
+-----------------
+
+Current and backup maintainers turn on two-factor authentication for GitHub and PyPI, with a security key or passkey
+where the service supports one. We review access once a year and whenever a maintainer steps back. When someone steps
+back, we remove their GitHub push access, PyPI publishing access, CI administration and ReadTheDocs administration, and
+rotate every secret they could read. New commit access still goes through the maintainer vote described above.
+
+Secrets and credentials
+-----------------------
+
+The project stores two secrets, the client ID and the private key of the `virtualenv-release
+<https://github.com/apps/virtualenv-release>`_ GitHub App, as ``RELEASE_APP_CLIENT_ID`` and ``RELEASE_APP_PRIVATE_KEY``
+in the ``release`` deployment environment. The push job of ``pre-release.yaml`` and the publish job of ``release.yaml``
+name that environment, and no other job can read them. Each of the two jobs trades the key for an App token that expires
+within an hour and can write the contents of one repository, ``virtualenv`` or ``get-virtualenv``.
+
+The rest of the release needs no stored secret. PyPI accepts uploads through `trusted publishing
+<https://docs.pypi.org/trusted-publishers/>`_, Sigstore signs the attestations with the workflow's OIDC identity, and
+the other jobs use their own ``GITHUB_TOKEN``, which the repository makes read-only unless the job asks for more. Do not
+create a PyPI API token or a personal access token for the project.
+
+We follow these rules for the two secrets:
+
+- Keep them in the ``release`` environment, and out of the repository, workflow files, logs and repository-wide secrets.
+  Secret scanning with push protection rejects pushes that contain a known token format.
+- Repository admins manage the environment secrets, and the App's owner manages its keys.
+- Generate a new private key, store it in ``RELEASE_APP_PRIVATE_KEY`` and delete the old key from the App settings at
+  the yearly access review, when a maintainer steps back, and after a suspected leak, following the `incident response
+  plan <https://github.com/pypa/virtualenv/blob/main/.github/INCIDENT_RESPONSE.md#response>`_.
+
+.. _current-maintainers:
+
+Current maintainers
+-------------------
+
+- :user:`Bernát Gábor <gaborbernat>`
+- :user:`Rahul Devikar <rahuldevikar>`, who covers when Bernát is unavailable
+
+Backup maintainer
+-----------------
+
+- :user:`Paul Moore <pfmoore>`, who steps in if both current maintainers are away
+
+Previous maintainers
+--------------------
+
+- :user:`Ian Bicking <ianb>`
+- :user:`Donald Stufft <dstufft>`
+
+*********
+ Roadmap
+*********
+
+This roadmap covers October 2026 to September 2027; Bernát Gábor last updated it on 2026-09-26. It lists work that
+follows from a published policy or waits on an outside decision, and it gives no release dates. We leave out work that
+an open pull request delivers without waiting on anyone else.
+
+What we plan to do
+==================
+
+- Add CPython 3.16 and drop CPython 3.9 under the :ref:`support policy <compatibility-requirements>`. CPython 3.9
+  reached end of life in October 2025, so the drop can happen from May 2027; it also retires the ``_virtualenv.pth``
+  distutils hook, which only 3.9 environments still receive (:issue:`3181`).
+- Keep releasing on the pip and setuptools cadence that :ref:`release` describes.
+- Record ``python-version`` in ``pyvenv.cfg`` (:PEP:`838`) once the PEP reaches Accepted status, restarting from the
+  closed :pull:`3193`. :PEP:`832` support shipped in :pull:`3204`.
+
+What we do not plan to do
+=========================
+
+- Backport fixes to older release lines; see `supported versions
+  <https://github.com/pypa/virtualenv/blob/main/.github/SECURITY.md#supported-versions>`_.
+- Break the command line, the Python API or the plugin API, per the backwards-compatible release policy in the same
+  section.
+- Bring back Python versions that the :ref:`support policy <compatibility-requirements>` has dropped.
+- Write files outside the environment it creates, such as a project-level ``.gitignore`` (:issue:`3237`).
+- Install, resolve or lock project dependencies. virtualenv creates and seeds the environment; pip, uv and similar tools
+  manage what goes into it.

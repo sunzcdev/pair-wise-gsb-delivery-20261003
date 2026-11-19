@@ -1,0 +1,242 @@
+from __future__ import annotations
+
+import functools
+from argparse import SUPPRESS
+from contextlib import contextmanager
+from types import MappingProxyType
+from typing import TYPE_CHECKING, ClassVar, Final, NamedTuple
+
+from docutils import nodes
+from docutils.parsers.rst.directives import unchanged_required
+from sphinx.util.docutils import SphinxDirective
+from sphinxarg.parser import parse_parser
+
+from virtualenv.run.plugin.base import ComponentBuilder
+
+if TYPE_CHECKING:
+    from collections import OrderedDict
+    from collections.abc import Callable
+
+_CUSTOM: Final[MappingProxyType[str, OrderedDict[str, type]]] = MappingProxyType({
+    "discovery": ComponentBuilder.entry_points_for("virtualenv.discovery"),
+    "creator": ComponentBuilder.entry_points_for("virtualenv.create"),
+    "seeder": ComponentBuilder.entry_points_for("virtualenv.seed"),
+    "activators": ComponentBuilder.entry_points_for("virtualenv.activate"),
+})
+
+
+class CliTable(SphinxDirective):
+    name: ClassVar[str] = "table_cli"
+    option_spec: ClassVar[dict[str, Callable[[str | None], str]]] = {
+        "module": unchanged_required,
+        "func": unchanged_required,
+    }
+
+    def run(self):
+        module_name, attr_name = self.options["module"], self.options["func"]
+        parser_creator = getattr(__import__(module_name, fromlist=[attr_name]), attr_name)
+        core_result = parse_parser(parser_creator())
+        core_result["action_groups"] = [i for i in core_result["action_groups"] if i["title"] not in _CUSTOM]
+
+        content = [self._build_table(i["options"], i["title"], i["description"]) for i in core_result["action_groups"]]
+        for key, name_to_class in _CUSTOM.items():
+            section = nodes.section("", ids=[f"section-{key}"])
+            title = nodes.title("", key)
+            section += title
+            self.state.document.note_implicit_target(title)
+            content.append(section)
+            results = {}
+
+            for name, class_n in name_to_class.items():
+                with self._run_parser(class_n, key, name):
+                    parser_result = parse_parser(parser_creator([f"--{key}", name]))
+                    results[name] = next(i["options"] for i in parser_result["action_groups"] if i["title"] == key)
+            core_names = set.intersection(*[{tuple(i["name"]) for i in v} for v in results.values()])
+            if core_names:
+                rows = [i for i in next(iter(results.values())) if tuple(i["name"]) in core_names]
+                content.append(
+                    self._build_table(rows, title="core", description=f"options shared across all {key}"),
+                )
+            for name, group in results.items():
+                rows = [i for i in group if tuple(i["name"]) not in core_names]
+                if rows:
+                    content.append(
+                        self._build_table(rows, title=name, description=f"options specific to {key} {name}"),
+                    )
+        return content
+
+    def _build_table(self, options, title, description):
+        table = nodes.table()
+        table["classes"] += ["colwidths-auto"]
+
+        options_group = nodes.tgroup(cols=3)
+        table += options_group
+        for _ in range(3):
+            options_group += nodes.colspec()
+        options_group += self._make_table_body(self.build_rows(options), title, description)
+        return table
+
+    def _make_table_body(self, rows, title, description):
+        t_body = nodes.tbody()
+        header_row = nodes.paragraph()
+        header_row += nodes.strong(text=title)
+        if description:
+            header_row += nodes.Text(" ⇒ ")
+            header_row += nodes.Text(description)
+        t_body += nodes.row("", nodes.entry("", header_row, morecols=2))
+        for row in rows:
+            name_list = self._get_targeted_names(row)
+            default = CliTable._get_default(row)
+            t_body += nodes.row(
+                "", nodes.entry("", name_list), nodes.entry("", default), nodes.entry("", CliTable._get_help_text(row))
+            )
+        return t_body
+
+    def _get_targeted_names(self, row):
+        names = [name.lstrip("-") for name in row.names]
+        target = nodes.target("", "", ids=names, names=names)
+        self.register_target_option(target)
+        first = True
+        for name, orig in zip(names, row.names):
+            if first:
+                first = False
+            else:
+                target += nodes.Text(", ")
+            self_ref = nodes.reference(refid=name)
+            self_ref += nodes.literal(text=orig)
+            target += self_ref
+        para = nodes.paragraph(text="")
+        para += target
+        return para
+
+    def register_target_option(self, target) -> None:
+        domain = self.env.get_domain("std")
+        self.state.document.note_explicit_target(target)
+        for key in target["ids"]:
+            domain.add_program_option(None, key, self.env.docname, key)
+
+    @staticmethod
+    def _get_default(row):
+        default = row.default
+        if (name := row.names[0]) == "-p":
+            default_body = nodes.Text("the python executable virtualenv is installed into")
+        elif name == "--app-data":
+            default_body = nodes.Text("platform specific application data folder")
+        elif name == "--activators":
+            default_body = nodes.Text("comma separated list of activators supported")
+        elif name == "--creator":
+            default_body = nodes.paragraph("")
+            default_body += nodes.literal(text="builtin")
+            default_body += nodes.Text(" if exist, else ")
+            default_body += nodes.literal(text="venv")
+        elif default is None:
+            default_body = nodes.paragraph("", text="")
+        else:
+            default_body = nodes.literal(text=default if isinstance(default, str) else str(default))
+        return default_body
+
+    @staticmethod
+    def _get_help_text(row):
+        content = row.help[: row.help.index("(") - 1] if row.names[0] == "--creator" else row.help
+        help_body = nodes.paragraph("", "", nodes.Text(content))
+        if row.choices is not None:
+            help_body += nodes.Text("; choice of: ")
+            first = True
+            for choice in row.choices:
+                if first:
+                    first = False
+                else:
+                    help_body += nodes.Text(", ")
+                help_body += nodes.literal(text=choice)
+        return help_body
+
+    @staticmethod
+    def build_rows(options):
+        result = []
+        for option in options:
+            names = option["name"]
+            default = option["default"]
+            if (
+                default is not None
+                and isinstance(default, str)
+                and default
+                and default[0] == default[-1]
+                and default[0] == '"'
+            ):
+                default = default[1:-1]
+                if default == SUPPRESS:
+                    default = None
+            choices = option.get("choices")
+            if (key := names[0].strip("-")) in CliTable.plugins:
+                choices = list(ComponentBuilder.entry_points_for(CliTable.plugins[key]).keys())
+            result.append(_TableRow(names, default, choices, option["help"]))
+        return result
+
+    @contextmanager
+    def _run_parser(self, class_n, key, name):
+        func_name = {"creator": "can_create", "activators": "supports"}.get(key)
+        prev = getattr(class_n, func_name) if func_name is not None else None
+        if func_name is not None:
+            setattr(class_n, func_name, self._make_patch_func(prev, key, name))
+        try:
+            yield
+        finally:
+            if func_name is not None:
+                setattr(class_n, func_name, prev)
+
+    @staticmethod
+    def _make_patch_func(prev, key, name):
+        @functools.wraps(prev)
+        def patched(*args, **kwargs):
+            prev(*args, **kwargs)
+            if key == "activators":
+                return True
+            if key == "creator":
+                if name == "venv":
+                    # the creator is imported only when this patch runs, keeping the docs import light
+                    from virtualenv.create.via_global_ref.venv import (  # ruff:ignore[import-outside-top-level]
+                        ViaGlobalRefMeta,
+                    )
+
+                    meta = ViaGlobalRefMeta()
+                    meta.symlink_error = None
+                    return meta
+                # the creator is imported only when this patch runs, keeping the docs import light
+                from virtualenv.create.via_global_ref.builtin.via_global_self_do import (  # ruff:ignore[import-outside-top-level]
+                    BuiltinViaGlobalRefMeta,
+                )
+
+                meta = BuiltinViaGlobalRefMeta()
+                meta.symlink_error = None
+                return meta
+            raise RuntimeError
+
+        return patched
+
+    plugins: ClassVar[dict[str, str]] = {
+        "creator": "virtualenv.create",
+        "seed": "virtualenv.seed",
+        "activators": "virtualenv.activate",
+        "discovery": "virtualenv.discovery",
+    }
+
+
+class _TableRow(NamedTuple):
+    names: list[str]
+    default: str
+    choices: set[str]
+    help: str
+
+
+# the Sphinx role callback signature, this role uses only the raw text
+def literal_data(rawtext, app, of_type, slug, options):  # ruff:ignore[unused-function-argument]
+    # Create a link to a BitBucket resource.
+    of_class = of_type.split(".")
+    data = getattr(__import__(".".join(of_class[:-1]), fromlist=[of_class[-1]]), of_class[-1])
+    return [nodes.literal("", text=",".join(data))], []
+
+
+__all__ = [
+    "CliTable",
+    "literal_data",
+]
