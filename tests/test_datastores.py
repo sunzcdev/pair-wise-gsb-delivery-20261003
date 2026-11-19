@@ -21,6 +21,7 @@ from apscheduler import (
     DeserializationError,
     Event,
     Job,
+    JobAdded,
     JobOutcome,
     JobResult,
     Schedule,
@@ -303,6 +304,121 @@ async def test_acquire_release_schedules(
     assert received_event.next_fire_time == datetime(2020, 9, 15, tzinfo=UTC)
 
     assert not events
+
+
+async def test_release_schedules_stores_jobs_with_schedule(
+    datastore: DataStore, schedules: list[Schedule]
+) -> None:
+    """
+    Test that the jobs created during a schedule processing round are stored together
+    with the schedule's new trigger position, and that their events are only published
+    once the change has been committed.
+
+    """
+    schedule = schedules[0]
+    await datastore.add_schedule(schedule, ConflictPolicy.exception)
+    acquired = await datastore.acquire_schedules("dummy-id1", timedelta(seconds=30), 1)
+    assert [s.id for s in acquired] == [schedule.id]
+
+    jobs = [
+        Job(
+            task_id=schedule.task_id,
+            executor="async",
+            schedule_id=schedule.id,
+            scheduled_fire_time=datetime(2020, 9, 13, minute, tzinfo=UTC),
+        )
+        for minute in range(3)
+    ]
+    next_fire_time = datetime(2020, 9, 13, 3, tzinfo=UTC)
+    results = [
+        ScheduleResult(
+            schedule_id=schedule.id,
+            task_id=schedule.task_id,
+            trigger=schedule.trigger,
+            last_fire_time=jobs[-1].scheduled_fire_time,
+            next_fire_time=next_fire_time,
+            jobs=tuple(jobs),
+        )
+    ]
+
+    # Verify that each job is already queryable by the time its event is published
+    original_publish = datastore._event_broker.publish
+
+    async def publish(event: Event) -> None:
+        if isinstance(event, JobAdded):
+            assert await datastore.get_jobs({event.job_id})
+
+        await original_publish(event)
+
+    datastore._event_broker.publish = publish  # type: ignore[method-assign]
+
+    async with capture_events(
+        datastore, 4, {JobAdded, ScheduleUpdated}
+    ) as events:
+        await datastore.release_schedules("dummy-id1", results)
+
+    assert len(events) == 4
+    job_added_events = [event for event in events if isinstance(event, JobAdded)]
+    assert {event.job_id for event in job_added_events} == {job.id for job in jobs}
+    schedule_updated_events = [
+        event for event in events if isinstance(event, ScheduleUpdated)
+    ]
+    assert len(schedule_updated_events) == 1
+    assert schedule_updated_events[0].next_fire_time == next_fire_time
+
+    # All the jobs must be present, and the schedule must have been advanced
+    stored_jobs = await datastore.get_jobs()
+    assert {job.id for job in stored_jobs} == {job.id for job in jobs}
+    stored_schedules = await datastore.get_schedules({schedule.id})
+    assert stored_schedules[0].next_fire_time == next_fire_time
+    assert stored_schedules[0].last_fire_time == jobs[-1].scheduled_fire_time
+    assert stored_schedules[0].acquired_by is None
+
+
+async def test_release_schedules_ignores_results_for_lost_leases(
+    datastore: DataStore, schedules: list[Schedule]
+) -> None:
+    """
+    Test that jobs belonging to a schedule whose lease was taken over by another
+    scheduler are not stored, so the job queue can't disagree with the trigger position
+    stored by the new owner.
+
+    """
+    schedule = schedules[0]
+    await datastore.add_schedule(schedule, ConflictPolicy.exception)
+    short_lease = timedelta(milliseconds=50)
+    acquired = await datastore.acquire_schedules("dummy-id1", short_lease, 1)
+    assert [s.id for s in acquired] == [schedule.id]
+
+    # Let the first scheduler's lease expire, and let another scheduler take over
+    await anyio.sleep(short_lease.total_seconds())
+    acquired = await datastore.acquire_schedules("dummy-id2", timedelta(seconds=30), 1)
+    assert [s.id for s in acquired] == [schedule.id]
+
+    jobs = [
+        Job(
+            task_id=schedule.task_id,
+            executor="async",
+            schedule_id=schedule.id,
+            scheduled_fire_time=datetime(2020, 9, 13, tzinfo=UTC),
+        )
+    ]
+    results = [
+        ScheduleResult(
+            schedule_id=schedule.id,
+            task_id=schedule.task_id,
+            trigger=schedule.trigger,
+            last_fire_time=jobs[0].scheduled_fire_time,
+            next_fire_time=None,
+            jobs=tuple(jobs),
+        )
+    ]
+
+    # Releasing a schedule that this scheduler no longer holds must have no effect
+    await datastore.release_schedules("dummy-id1", results)
+    assert await datastore.get_jobs() == []
+    stored_schedules = await datastore.get_schedules({schedule.id})
+    assert stored_schedules[0].next_fire_time == schedule.next_fire_time
 
 
 async def test_release_schedule_two_identical_fire_times(datastore: DataStore) -> None:

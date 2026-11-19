@@ -249,6 +249,7 @@ class ScheduleResult:
     :ivar trigger: the schedule's trigger
     :ivar last_fire_time: the schedule's trigger
     :ivar next_fire_time: the next
+    :ivar jobs: the jobs created from the schedule during this processing round
     """
 
     schedule_id: str
@@ -256,6 +257,7 @@ class ScheduleResult:
     trigger: Trigger
     last_fire_time: datetime
     next_fire_time: datetime | None
+    jobs: tuple[Job, ...] = attrs.field(converter=tuple, factory=tuple)
 
 
 @attrs.define(kw_only=True, order=False)

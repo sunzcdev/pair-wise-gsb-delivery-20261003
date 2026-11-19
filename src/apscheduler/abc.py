@@ -280,6 +280,16 @@ class DataStore(metaclass=ABCMeta):
         * ``acquired_by`` (must beset to ``None``)
         * ``acquired_until`` (must be set to ``None``)
 
+        Any jobs created from the schedule during this processing round (carried in
+        :attr:`~ScheduleResult.jobs`) must be stored **in the same transaction** as the
+        schedule update, so that either both the jobs and the advanced trigger position
+        become visible, or neither does. This makes a retried processing round produce
+        exactly one complete set of jobs instead of a partial one. Jobs belonging to a
+        schedule whose lease is no longer held by ``scheduler_id`` must not be stored.
+
+        :class:`~JobAdded` events for those jobs must only be published after the
+        transaction has been successfully committed.
+
         :param scheduler_id: unique identifier of the scheduler
         :param results: list of schedule processing results
         """

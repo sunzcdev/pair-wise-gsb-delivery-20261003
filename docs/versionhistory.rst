@@ -46,6 +46,10 @@ APScheduler, see the :doc:`migration section <migration>`.
 - Fixed ``configure_task()`` dropping the callable reference when passed a ``Task``
   object, causing the configured task to be stored with ``func=None``
   (`#1001 <https://github.com/agronholm/apscheduler/issues/1001>`_)
+- Changed the scheduled jobs created during a processing round to be stored in the same
+  transaction as the schedule's new trigger position, so a crash while adding them can
+  no longer leave a partial set of jobs in the queue, and their
+  :class:`~JobAdded` events are only published after the transaction is committed
 - Fixed ``MemoryDataStore`` and ``MongoDBDataStore`` returning the fire time of a paused
   or already acquired schedule from ``get_next_schedule_run_time()``, which made the
   scheduler wake up past a deadline that had already passed and process schedules in a

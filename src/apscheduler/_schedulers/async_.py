@@ -994,7 +994,11 @@ class AsyncScheduler:
                             elif schedule.coalesce is CoalescePolicy.latest:
                                 fire_times[0] = fire_time
 
-                        # Add one or more jobs to the job queue
+                        # Build the jobs to be added for this schedule. They are not
+                        # submitted one by one – they are handed over to the data store
+                        # together with the new trigger position so that both become
+                        # visible atomically.
+                        jobs: list[Job] = []
                         max_jitter = (
                             schedule.max_jitter.total_seconds()
                             if schedule.max_jitter
@@ -1033,19 +1037,22 @@ class AsyncScheduler:
                             else:
                                 start_deadline = fire_time + schedule.misfire_grace_time
 
-                            job = Job(
-                                task_id=schedule.task_id,
-                                args=schedule.args,
-                                kwargs=schedule.kwargs,
-                                schedule_id=schedule.id,
-                                scheduled_fire_time=fire_time,
-                                jitter=jitter,
-                                start_deadline=start_deadline,
-                                executor=schedule.job_executor,
-                                result_expiration_time=schedule.job_result_expiration_time,
-                                metadata=schedule.metadata.copy(),
+                            jobs.append(
+                                Job(
+                                    task_id=schedule.task_id,
+                                    args=schedule.args,
+                                    kwargs=schedule.kwargs,
+                                    schedule_id=schedule.id,
+                                    scheduled_fire_time=fire_time,
+                                    jitter=jitter,
+                                    start_deadline=start_deadline,
+                                    executor=schedule.job_executor,
+                                    result_expiration_time=(
+                                        schedule.job_result_expiration_time
+                                    ),
+                                    metadata=schedule.metadata.copy(),
+                                )
                             )
-                            await self.data_store.add_job(job)
 
                         results.append(
                             ScheduleResult(
@@ -1054,10 +1061,12 @@ class AsyncScheduler:
                                 trigger=schedule.trigger,
                                 last_fire_time=fire_times[-1],
                                 next_fire_time=next_fire_time,
+                                jobs=tuple(jobs),
                             )
                         )
 
-                # Update the schedules (and release the scheduler's claim on them)
+                # Update the schedules (and release the scheduler's claim on them),
+                # storing the jobs created above in the same operation
                 await self.data_store.release_schedules(self.identity, results)
 
                 # If we received fewer schedules than the maximum amount, sleep

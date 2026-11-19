@@ -708,9 +708,11 @@ class SQLAlchemyDataStore(BaseExternalDataStore):
         async for attempt in self._retry():
             with attempt:
                 async with self._begin_transaction() as conn:
+                    job_added_events: list[JobAdded] = []
                     update_events: list[ScheduleUpdated] = []
                     finished_schedule_ids: list[str] = []
                     update_args: list[dict[str, Any]] = []
+                    jobs_by_schedule_id: dict[str, list[Job]] = defaultdict(list)
                     for result in results:
                         try:
                             serialized_trigger = self.serializer.serialize(
@@ -725,6 +727,7 @@ class SQLAlchemyDataStore(BaseExternalDataStore):
                             finished_schedule_ids.append(result.schedule_id)
                             continue
 
+                        jobs_by_schedule_id[result.schedule_id].extend(result.jobs)
                         if self._supports_tzaware_timestamps:
                             update_args.append(
                                 {
@@ -748,7 +751,11 @@ class SQLAlchemyDataStore(BaseExternalDataStore):
                                 }
                             )
 
-                    # Update schedules
+                    # Update schedules, but only those still held by this scheduler.
+                    # If the lease on a schedule was lost in the meantime, its jobs must
+                    # not be added either, or the queue would contain jobs that don't
+                    # agree with the trigger's stored position.
+                    updated_ids: list[str] = []
                     if update_args:
                         extra_values: dict[str, BindParameter] = {}
                         p_id: BindParameter = bindparam("p_id")
@@ -780,9 +787,47 @@ class SQLAlchemyDataStore(BaseExternalDataStore):
                                 **extra_values,
                             )
                         )
-                        # TODO: actually check which rows were updated?
-                        await self._execute(conn, update, update_args)
-                        updated_ids = list(next_fire_times)
+                        # Find out which of the schedules are still held by this
+                        # scheduler. The jobs are only added for those, so the job queue
+                        # can never contain a set of jobs that doesn't match the stored
+                        # trigger position.
+                        if self._supports_update_returning:
+                            returning_update = update.returning(self._t_schedules.c.id)
+                            result = await self._execute(
+                                conn, returning_update, update_args
+                            )
+                            updated_ids = [row[0] for row in result]
+                        else:
+                            claimed_query = (
+                                select(self._t_schedules.c.id)
+                                .where(
+                                    and_(
+                                        self._t_schedules.c.id.in_(
+                                            [args["p_id"] for args in update_args]
+                                        ),
+                                        self._t_schedules.c.acquired_by
+                                        == scheduler_id,
+                                    )
+                                )
+                                .with_for_update()
+                            )
+                            claimed = {
+                                row[0]
+                                for row in await self._execute(conn, claimed_query)
+                            }
+                            claimed_args = [
+                                args
+                                for args in update_args
+                                if args["p_id"] in claimed
+                            ]
+                            if claimed_args:
+                                await self._execute(conn, update, claimed_args)
+
+                            updated_ids = [
+                                schedule_id
+                                for schedule_id in next_fire_times
+                                if schedule_id in claimed
+                            ]
 
                         for schedule_id in updated_ids:
                             event = ScheduleUpdated(
@@ -792,12 +837,32 @@ class SQLAlchemyDataStore(BaseExternalDataStore):
                             )
                             update_events.append(event)
 
+                    # Marshal the jobs created during this processing round, so they can
+                    # be inserted in the same transaction as the schedule updates
+                    insert = self._t_jobs.insert()
+                    for schedule_id in updated_ids:
+                        for job in jobs_by_schedule_id.get(schedule_id, ()):
+                            marshalled = job.marshal(self.serializer)
+                            await self._execute(conn, insert, marshalled)
+                            job_added_events.append(
+                                JobAdded(
+                                    job_id=job.id,
+                                    task_id=job.task_id,
+                                    schedule_id=job.schedule_id,
+                                )
+                            )
+
                     # Remove schedules that failed to serialize
                     if finished_schedule_ids:
                         delete = self._t_schedules.delete().where(
                             self._t_schedules.c.id.in_(finished_schedule_ids)
                         )
                         await self._execute(conn, delete)
+
+        # The transaction has been committed, so it's now safe to announce the new
+        # jobs and the schedule updates
+        for event in job_added_events:
+            await self._event_broker.publish(event)
 
         for event in update_events:
             await self._event_broker.publish(event)

@@ -175,10 +175,20 @@ class MemoryDataStore(BaseDataStore):
     async def release_schedules(
         self, scheduler_id: str, results: Sequence[ScheduleResult]
     ) -> None:
-        # Send update events for schedules
+        job_events: list[JobAdded] = []
+        schedule_events: list[ScheduleUpdated] = []
+
+        # Apply all the changes first so that the jobs and the advanced trigger
+        # positions become visible to other schedulers together
         for result in results:
+            schedule = self._schedules_by_id.get(result.schedule_id)
+            if schedule is None or schedule.acquired_by != scheduler_id:
+                # The schedule is gone, or its lease was taken over by another
+                # scheduler – this processing round must not touch it, nor add any jobs
+                # for it
+                continue
+
             # Remove the schedule
-            schedule = self._schedules_by_id[result.schedule_id]
             index = self._find_schedule_index(schedule)
             del self._schedules[index]
 
@@ -188,11 +198,34 @@ class MemoryDataStore(BaseDataStore):
             schedule.acquired_by = None
             schedule.acquired_until = None
             insort_right(self._schedules, schedule)
-            event = ScheduleUpdated(
-                schedule_id=result.schedule_id,
-                task_id=schedule.task_id,
-                next_fire_time=result.next_fire_time,
+            schedule_events.append(
+                ScheduleUpdated(
+                    schedule_id=result.schedule_id,
+                    task_id=schedule.task_id,
+                    next_fire_time=result.next_fire_time,
+                )
             )
+
+            # Add the jobs created during this processing round
+            for job in result.jobs:
+                self._jobs_by_id[job.id] = job
+                self._jobs_by_task_id[job.task_id].add(job)
+                if job.schedule_id is not None:
+                    self._jobs_by_schedule_id[job.schedule_id].add(job)
+
+                job_events.append(
+                    JobAdded(
+                        job_id=job.id,
+                        task_id=job.task_id,
+                        schedule_id=job.schedule_id,
+                    )
+                )
+
+        # Only announce the jobs after all of them have been stored
+        for event in job_events:
+            await self._event_broker.publish(event)
+
+        for event in schedule_events:
             await self._event_broker.publish(event)
 
     async def get_next_schedule_run_time(self) -> datetime | None:

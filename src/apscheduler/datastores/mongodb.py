@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import operator
+from collections import defaultdict
 from collections.abc import (
     Callable,
     Iterable,
@@ -18,11 +19,16 @@ import pymongo
 from attrs.validators import instance_of
 from bson import CodecOptions, UuidRepresentation
 from bson.codec_options import TypeEncoder, TypeRegistry
-from pymongo import ASCENDING, DeleteOne, UpdateOne
+from pymongo import ASCENDING, InsertOne
 from pymongo.asynchronous.client_session import AsyncClientSession
 from pymongo.asynchronous.collection import AsyncCollection
 from pymongo.asynchronous.mongo_client import AsyncMongoClient
-from pymongo.errors import ConnectionFailure, DuplicateKeyError
+from pymongo.errors import (
+    ConnectionFailure,
+    DuplicateKeyError,
+    InvalidOperation,
+    OperationFailure,
+)
 
 from .._enums import CoalescePolicy, ConflictPolicy, JobOutcome
 from .._events import (
@@ -421,13 +427,12 @@ class MongoDBDataStore(BaseExternalDataStore):
     async def release_schedules(
         self, scheduler_id: str, results: Sequence[ScheduleResult]
     ) -> None:
-        updated_schedules: list[tuple[str, datetime | None]] = []
-        finished_schedule_ids: list[str] = []
         task_ids = {result.schedule_id: result.task_id for result in results}
+        finished_schedule_ids: list[str] = []
+        job_documents: dict[str, list[dict[str, Any]]] = defaultdict(list)
+        schedule_updates: dict[str, dict[str, Any]] = {}
 
-        requests: list[UpdateOne | DeleteOne] = []
         for result in results:
-            filters = {"_id": result.schedule_id, "acquired_by": scheduler_id}
             try:
                 serialized_trigger = self.serializer.serialize(result.trigger)
             except SerializationError:
@@ -435,11 +440,10 @@ class MongoDBDataStore(BaseExternalDataStore):
                     "Error serializing schedule %r – removing from data store",
                     result.schedule_id,
                 )
-                requests.append(DeleteOne(filters))
                 finished_schedule_ids.append(result.schedule_id)
                 continue
 
-            update = {
+            schedule_updates[result.schedule_id] = {
                 "$unset": {
                     "acquired_by": True,
                     "acquired_until": True,
@@ -451,22 +455,88 @@ class MongoDBDataStore(BaseExternalDataStore):
                     **marshal_timestamp(result.next_fire_time, "next_fire_time"),
                 },
             }
-            requests.append(UpdateOne(filters, update))
-            updated_schedules.append((result.schedule_id, result.next_fire_time))
+            for job in result.jobs:
+                document = job.marshal(self.serializer)
+                marshal_document(document)
+                job_documents[result.schedule_id].append(document)
 
-        if requests:
+        async def release(
+            session: AsyncClientSession,
+        ) -> tuple[set[str], list[JobAdded]]:
+            """Apply the schedule updates and the new jobs as a unit."""
+            updated_ids: set[str] = set()
+            job_requests: list[InsertOne] = []
+            for schedule_id, update in schedule_updates.items():
+                # A schedule whose lease was lost in the meantime is left untouched, and
+                # its jobs are not inserted either, so the job queue can never disagree
+                # with the stored trigger positions
+                if await self._schedules.find_one_and_update(
+                    {"_id": schedule_id, "acquired_by": scheduler_id},
+                    update,
+                    projection=["_id"],
+                    session=session,
+                ):
+                    updated_ids.add(schedule_id)
+                    job_requests.extend(
+                        InsertOne(document) for document in job_documents[schedule_id]
+                    )
+
+            # The jobs are inserted only after the corresponding schedule update has
+            # succeeded, so a failure here leaves no jobs for an unadvanced schedule
+            if job_requests:
+                await self._jobs.bulk_write(
+                    job_requests, ordered=True, session=session
+                )
+
+            for schedule_id in finished_schedule_ids:
+                await self._schedules.delete_one(
+                    {"_id": schedule_id, "acquired_by": scheduler_id},
+                    session=session,
+                )
+
+            job_events = [
+                JobAdded(
+                    job_id=job.id,
+                    task_id=job.task_id,
+                    schedule_id=job.schedule_id,
+                )
+                for result in results
+                if result.schedule_id in updated_ids
+                for job in result.jobs
+            ]
+            return updated_ids, job_events
+
+        updated_ids: set[str] = set()
+        job_added_events: list[JobAdded] = []
+        if schedule_updates or finished_schedule_ids:
             async for attempt in self._retry():
                 with attempt:
                     async with self._client.start_session() as session:
-                        await self._schedules.bulk_write(
-                            requests, ordered=False, session=session
-                        )
+                        try:
+                            updated_ids, job_added_events = (
+                                await session.with_transaction(release)
+                            )
+                        except InvalidOperation:
+                            # The server does not support transactions at all
+                            updated_ids, job_added_events = await release(session)
+                        except OperationFailure as exc:
+                            if exc.code != 20:  # IllegalOperation (standalone server)
+                                raise
 
-        for schedule_id, next_fire_time in updated_schedules:
+                            updated_ids, job_added_events = await release(session)
+
+        # The writes have completed, so it's now safe to announce the changes
+        for event in job_added_events:
+            await self._event_broker.publish(event)
+
+        for result in results:
+            if result.schedule_id not in updated_ids:
+                continue
+
             event = ScheduleUpdated(
-                schedule_id=schedule_id,
-                task_id=task_ids[schedule_id],
-                next_fire_time=next_fire_time,
+                schedule_id=result.schedule_id,
+                task_id=result.task_id,
+                next_fire_time=result.next_fire_time,
             )
             await self._event_broker.publish(event)
 

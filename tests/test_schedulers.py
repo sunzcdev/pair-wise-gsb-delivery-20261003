@@ -11,6 +11,7 @@ from datetime import UTC, datetime, timedelta
 from functools import partial
 from inspect import signature
 from queue import Queue
+from pathlib import Path
 from types import ModuleType
 from typing import Any, cast
 from unittest.mock import patch
@@ -1086,6 +1087,137 @@ class TestAsyncScheduler:
 
                 assert isinstance(job_added_event, JobAdded)
                 assert job_added_event.schedule_id == schedule_id
+
+    async def test_scheduled_jobs_committed_atomically_with_schedule_update(
+        self, tmp_path: Path
+    ) -> None:
+        """
+        Test that the jobs created from a schedule are committed together with the
+        schedule's new trigger position, and that a failure while inserting them leaves
+        neither a partial set of jobs nor an advanced trigger position behind.
+
+        """
+        from sqlalchemy import Insert
+        from sqlalchemy.ext.asyncio import create_async_engine
+
+        from apscheduler.datastores.sqlalchemy import SQLAlchemyDataStore
+
+        engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path}/test.db")
+        store = SQLAlchemyDataStore(engine, start_from_scratch=True)
+        try:
+            now = datetime.now(UTC)
+            first_fire_time = now - timedelta(minutes=3, seconds=5)
+
+            # Make the data store fail when inserting the second job of the batch
+            original_execute = store._execute
+            job_insert_count = 0
+
+            async def failing_execute(conn, statement, parameters=None):
+                nonlocal job_insert_count
+                if isinstance(statement, Insert) and statement.table.name == "jobs":
+                    job_insert_count += 1
+                    if job_insert_count == 2:
+                        raise RuntimeError("Fake failure")
+
+                return await original_execute(conn, statement, parameters)
+
+            store._execute = failing_execute  # type: ignore[method-assign]
+
+            # The first scheduler acquires the schedule, starts building the jobs and
+            # crashes halfway through inserting them
+            lease_duration = timedelta(milliseconds=200)
+            scheduler1 = AsyncScheduler(
+                data_store=store,
+                identity="crasher",
+                role=SchedulerRole.scheduler,
+                lease_duration=lease_duration,
+                cleanup_interval=None,
+            )
+            with pytest.raises(ExceptionGroup) as exc_info:
+                async with scheduler1:
+                    await scheduler1.add_schedule(
+                        dummy_async_job,
+                        IntervalTrigger(minutes=1, start_time=first_fire_time),
+                        id="foo",
+                        coalesce=CoalescePolicy.all,
+                    )
+                    with move_on_after(5):
+                        await scheduler1.run_until_stopped()
+
+                    pytest.fail("The scheduler did not crash")
+
+            exc = exc_info.value
+            while isinstance(exc, ExceptionGroup) and len(exc.exceptions) == 1:
+                exc = exc.exceptions[0]
+
+            assert isinstance(exc, RuntimeError)
+            assert exc.args == ("Fake failure",)
+
+            # The failed round must not have left any job behind, nor advanced the
+            # schedule's trigger
+            assert await store.get_jobs() == []
+            schedules = await store.get_schedules()
+            assert len(schedules) == 1
+            assert schedules[0].next_fire_time == first_fire_time
+            assert schedules[0].last_fire_time is None
+
+            # Let another scheduler pick up the schedule again once the crashed
+            # scheduler's lease has expired. Its clean-up loop releases the expired
+            # lease and announces the schedule, waking up the scheduler.
+            store._execute = original_execute  # type: ignore[method-assign]
+            store.start_from_scratch = False
+            send, receive = create_memory_object_stream[Event](10)
+            with send, receive:
+                scheduler2 = AsyncScheduler(
+                    data_store=store,
+                    identity="recoverer",
+                    role=SchedulerRole.scheduler,
+                    cleanup_interval=timedelta(milliseconds=50),
+                )
+                async with scheduler2:
+                    scheduler2.subscribe(send.send, {JobAdded, ScheduleUpdated})
+                    await scheduler2.start_in_background()
+
+                    expected_next_fire_time = first_fire_time + timedelta(minutes=4)
+                    job_added_events: list[JobAdded] = []
+                    schedule_updated_event: ScheduleUpdated | None = None
+                    with fail_after(5):
+                        while len(job_added_events) < 4 or not schedule_updated_event:
+                            event = await receive.receive()
+                            if isinstance(event, JobAdded):
+                                job_added_events.append(event)
+
+                                # The event is only published after the transaction
+                                # has been committed, so the job must be queryable
+                                assert await store.get_jobs({event.job_id})
+                            elif (
+                                isinstance(event, ScheduleUpdated)
+                                and event.next_fire_time == expected_next_fire_time
+                            ):
+                                schedule_updated_event = event
+
+            # The queue must now contain exactly one complete set of jobs, matching the
+            # fire times of the schedule
+            jobs = await store.get_jobs()
+            assert len(jobs) == 4
+            assert {job.id for job in jobs} == {
+                event.job_id for event in job_added_events
+            }
+            assert {job.schedule_id for job in jobs} == {"foo"}
+            fire_times = sorted(cast(datetime, job.scheduled_fire_time) for job in jobs)
+            assert fire_times == [
+                first_fire_time + timedelta(minutes=i) for i in range(4)
+            ]
+
+            # The trigger's stored position must agree with the jobs that were queued
+            schedules = await store.get_schedules()
+            assert len(schedules) == 1
+            assert schedules[0].last_fire_time == fire_times[-1]
+            assert schedules[0].next_fire_time == expected_next_fire_time
+            assert schedules[0].acquired_by is None
+            assert schedule_updated_event
+        finally:
+            await engine.dispose()
 
     async def test_schedule_job_result_expiration_time(
         self, raw_datastore: DataStore, timezone: ZoneInfo
