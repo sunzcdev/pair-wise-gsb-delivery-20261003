@@ -2232,6 +2232,58 @@ module Net
     #     req.body_stream                         # => #<StringIO:0x0000027d1e5affa8>
     #
     attr_accessor body_stream: untyped
+
+    # <!-- rdoc-file=lib/net/http/generic_request.rb -->
+    # Returns the BodyAdmission object for the most recent transmission of this
+    # request, or `nil` if the request has not been transmitted yet.
+    #
+    # The admission records whether the upload body was allowed onto the wire, and
+    # it explains why:
+    #
+    #     http.request(req) {|res| ... }
+    #     admission = req.body_admission
+    #     admission.state        # => :continue
+    #     admission.admitted?    # => true
+    #     admission.body_sent?   # => true
+    #
+    # See [BodyAdmission](../classes/Net/HTTPGenericRequest/BodyAdmission.html) for
+    # the possible states.
+    attr_reader body_admission: BodyAdmission?
+
+    # The inspectable record of a single body admission decision.
+    #
+    # When a request asks the server to accept the body first (through the `Expect:
+    # 100-continue` header), the body source must not be read until either a real
+    # `100 Continue` admits the body, or the continue timeout expires and the
+    # wait-expiry policy explicitly allows sending anyway. Informational responses
+    # other than `100 Continue` keep the client waiting; a final response received
+    # while waiting declines the upload and leaves the source untouched.
+    class BodyAdmission
+      # The admission decision: `:pending`, `:not_requested`, `:waiting`,
+      # `:continue`, `:timeout` or `:declined`.
+      attr_reader state: Symbol
+
+      # The response that decided the admission, or `nil`.
+      attr_reader response: Net::HTTPResponse?
+
+      # The number of informational responses other than `100 Continue` seen while
+      # waiting.
+      attr_reader informational_responses: Integer
+
+      # The number of bytes the connection accepted for the body.
+      attr_reader body_bytes: Integer
+
+      # A short human-readable explanation of the admission decision, if any.
+      attr_reader reason: String?
+
+      def initialize: () -> void
+      def continue_requested?: () -> bool
+      def admitted?: () -> bool
+      def body_sent?: () -> bool
+      def body_finished?: () -> bool
+      def waiting?: () -> bool
+      def declined?: () -> bool
+    end
   end
 
   # <!-- rdoc-file=lib/net/http/header.rb -->

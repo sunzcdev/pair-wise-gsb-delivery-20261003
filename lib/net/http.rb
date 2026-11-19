@@ -1455,6 +1455,14 @@ module Net   #:nodoc:
     # which is the number of seconds to wait for an expected 100 Continue response.
     # If the \HTTP object does not receive a response in this many seconds
     # it sends the request body.
+    #
+    # While waiting, the request body source is not read. A positive
+    # <tt>100 Continue</tt> admits the body; any other informational response
+    # (such as <tt>103 Early Hints</tt>) does not, so the wait continues. If a
+    # final response arrives instead, the upload is declined and the body
+    # source is left untouched. When the timeout expires, the wait-expiry
+    # policy sends the body without a <tt>100 Continue</tt>. The decision is
+    # recorded in Net::HTTPGenericRequest#body_admission.
     def continue_timeout=(sec)
       @socket.continue_timeout = sec if @socket
       @continue_timeout = sec
@@ -2528,9 +2536,7 @@ module Net   #:nodoc:
           informational_count = 0
           begin
             res = HTTPResponse.read_new(@socket)
-            res.decode_content = req.decode_content
-            res.body_encoding = @response_body_encoding
-            res.ignore_eof = @ignore_eof
+            decorate_response(req, res)
             if res.kind_of?(HTTPInformation)
               informational_count += 1
               raise HTTPBadResponse, 'too many informational responses' if
@@ -2542,6 +2548,10 @@ module Net   #:nodoc:
 
           res
         }
+        # A final response that arrives while waiting for 100 Continue is
+        # thrown from #exec, so it skips the decoration above; apply the same
+        # response settings here so callers cannot tell the two paths apart.
+        decorate_response(req, res)
         res.reading_body(@socket, req.response_body_permitted?) {
           if block_given?
             count = max_retries # Don't restart in the middle of a download
@@ -2555,7 +2565,8 @@ module Net   #:nodoc:
              # avoid a dependency on OpenSSL
              defined?(OpenSSL::SSL) ? OpenSSL::SSL::SSLError : IOError,
              Timeout::Error => exception
-        if count < max_retries && IDEMPOTENT_METHODS_.include?(req.method)
+        if count < max_retries && IDEMPOTENT_METHODS_.include?(req.method) &&
+            req.retriable_body?
           count += 1
           @socket.close if @socket
           debug "Conn close because of error #{exception}, and retry"
@@ -2597,11 +2608,28 @@ module Net   #:nodoc:
       req['host'] ||= addr_port()
     end
 
+    # Applies the session's response settings to +res+. This is shared by the
+    # normal read path and the path where a final response arrives while the
+    # request is waiting for 100 Continue, so both produce equivalent objects.
+    def decorate_response(req, res)
+      res.decode_content = req.decode_content
+      res.body_encoding = @response_body_encoding
+      res.ignore_eof = @ignore_eof
+      res.uri = req.uri
+      res
+    end
+
     def end_transport(req, res)
       @curr_http_version = res.http_version
       @last_communicated = nil
       if @socket.closed?
         debug 'Conn socket closed'
+      elsif req.upload_incomplete?
+        # Either the server answered before the upload was admitted, so the
+        # peer still expects the announced body bytes, or the upload was cut
+        # short. Reusing this connection would corrupt the next request.
+        debug 'Conn close (request body was not completely sent)'
+        @socket.close
       elsif not res.body and @close_on_empty_response
         debug 'Conn close'
         @socket.close

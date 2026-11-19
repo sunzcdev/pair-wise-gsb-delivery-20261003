@@ -213,11 +213,224 @@ class Net::HTTPGenericRequest
     end
   end
 
+  # Returns the BodyAdmission object for the most recent transmission of this
+  # request, or +nil+ if the request has not been transmitted yet.
+  #
+  # The admission records whether the upload body was allowed onto the wire,
+  # and it explains why:
+  #
+  #   http.request(req) {|res| ... }
+  #   admission = req.body_admission
+  #   admission.state        # => :continue
+  #   admission.admitted?    # => true
+  #   admission.body_sent?   # => true
+  #
+  # See BodyAdmission for the possible states.
+  attr_reader :body_admission
+
+  # Returns whether an automatic retry may send this request's body again.
+  #
+  # A string body can always be sent again. A body stream, or form data that
+  # may hold IO values, is consumed as it is sent, so once any of it has
+  # reached the connection a retry would read the source a second time and
+  # upload the wrong bytes. In that case the failure is reported based on the
+  # bytes that were actually sent, rather than silently re-reading the source.
+  def retriable_body? # :nodoc:
+    return true if @body
+    return true unless @body_stream || @body_data
+    admission = @body_admission
+    admission.nil? || !admission.body_sent?
+  end
+
+  # Returns whether this request announced a body on the wire, through
+  # <tt>Content-Length</tt> or <tt>Transfer-Encoding</tt>. When such a request
+  # is answered before the body is admitted, the connection still expects the
+  # announced bytes and cannot carry another request.
+  def body_declared? # :nodoc:
+    !!content_length || chunked?
+  end
+
+  # Returns +true+ if the connection was left in the middle of this request's
+  # body, so it cannot be reused for another request:
+  #
+  # - A body was announced but declined, so the peer still waits for it.
+  # - Writing the body started but did not finish.
+  #
+  # This is derived from what actually happened, not from what was intended.
+  def upload_incomplete? # :nodoc:
+    return false unless body_declared?
+    admission = @body_admission
+    return false if admission.nil?
+    admission.declined? || (admission.body_sent? && !admission.body_finished?)
+  end
+
+  # The inspectable record of a single body admission decision.
+  #
+  # When a request asks the server to accept the body first (through the
+  # <tt>Expect: 100-continue</tt> header), the body source must not be read
+  # until one of these happens:
+  #
+  # - The server sends an actual <tt>100 Continue</tt> response.
+  # - The continue timeout expires, which explicitly adopts the wait-expiry
+  #   policy and allows the body to be sent anyway.
+  #
+  # Informational responses other than <tt>100 Continue</tt> (for example
+  # <tt>103 Early Hints</tt>) neither admit nor refuse the body; the client
+  # keeps waiting. Any final response received while waiting (for example
+  # <tt>417 Expectation Failed</tt>) means the server declined the upload, so
+  # the body source is left untouched.
+  #
+  # The admission decision (#state) and the sending facts (#body_bytes,
+  # #body_sent?) are recorded separately: a <tt>:continue</tt> decision stays
+  # readable after the body has been written. A response that arrives after
+  # the body started is handled according to those facts, not as if the body
+  # had never been sent.
+  class BodyAdmission
+    # The admission decision (#state):
+    #
+    # <tt>:pending</tt> :: Created, but no decision has been made yet.
+    # <tt>:not_requested</tt> :: No applicable <tt>Expect: 100-continue</tt>;
+    #                            the body may be sent immediately.
+    # <tt>:waiting</tt> :: Waiting for <tt>100 Continue</tt> or a final response.
+    # <tt>:continue</tt> :: A real <tt>100 Continue</tt> admitted the body.
+    # <tt>:timeout</tt> :: The continue timeout expired; the wait-expiry policy
+    #                      admitted the body.
+    # <tt>:declined</tt> :: A final response arrived before the body was
+    #                       admitted; the source was not read.
+    attr_reader :state
+
+    # The response that decided the admission: the <tt>100 Continue</tt> that
+    # admitted the body, or the final response that declined it. For an
+    # informational response seen while waiting, this is the most recent one.
+    # +nil+ while no such response has been seen.
+    attr_reader :response
+
+    # The number of informational responses other than <tt>100 Continue</tt>
+    # (such as <tt>103 Early Hints</tt>) seen while waiting.
+    attr_reader :informational_responses
+
+    # The number of bytes the connection accepted for the body. For a chunked
+    # upload this includes the chunk framing written around the payload.
+    attr_reader :body_bytes
+
+    # A short human-readable explanation of the admission decision, if any.
+    attr_reader :reason
+
+    def initialize # :nodoc:
+      @state = :pending
+      @continue_requested = false
+      @response = nil
+      @informational_responses = 0
+      @body_bytes = 0
+      @body_started = false
+      @body_finished = false
+      @reason = nil
+    end
+
+    # Returns whether the request asked for a <tt>100 Continue</tt> exchange.
+    def continue_requested?
+      @continue_requested
+    end
+
+    # Returns +true+ if the body was, or may be, transmitted.
+    #
+    # This is +false+ when a final response declined the upload before the
+    # body started, in which case the source was never read.
+    def admitted?
+      case @state
+      when :not_requested, :continue, :timeout
+        true
+      else
+        false
+      end
+    end
+
+    # Returns +true+ if the body has started to be written.
+    def body_sent?
+      @body_started
+    end
+
+    # Returns +true+ if the body was written completely.
+    def body_finished?
+      @body_finished
+    end
+
+    # Returns +true+ while waiting for the server's decision.
+    def waiting?
+      @state == :waiting
+    end
+
+    # Returns +true+ if a final response declined the upload.
+    def declined?
+      @state == :declined
+    end
+
+    def inspect # :nodoc:
+      "\#<#{self.class} state=#{@state} admitted=#{admitted?} " \
+        "body_sent=#{body_sent?} body_finished=#{body_finished?} " \
+        "body_bytes=#{@body_bytes} " \
+        "informational_responses=#{@informational_responses}>"
+    end
+
+    # Records that no wait was needed, so the body may be sent immediately.
+    def adopt_no_wait(reason) # :nodoc:
+      @state = :not_requested
+      @reason = reason
+      self
+    end
+
+    # Records that the request asked for a <tt>100 Continue</tt> and is now
+    # waiting for the server's decision.
+    def wait! # :nodoc:
+      @continue_requested = true
+      @state = :waiting
+    end
+
+    def admit_continue!(res) # :nodoc:
+      @response = res
+      @state = :continue
+    end
+
+    # Records an explicit decision to send the body after the continue timeout
+    # expired without a 100 Continue.
+    def adopt_timeout! # :nodoc:
+      @state = :timeout
+      @reason = "continue timeout expired"
+      self
+    end
+
+    def observe_informational!(res) # :nodoc:
+      @informational_responses += 1
+      @response = res
+    end
+
+    def decline!(res) # :nodoc:
+      @response = res
+      @state = :declined
+      @reason = "final response #{res.code} received before the body"
+      self
+    end
+
+    def start_body! # :nodoc:
+      @body_started = true
+    end
+
+    def finish_body!(bytes) # :nodoc:
+      @body_bytes += bytes
+      @body_finished = true
+    end
+
+    def abort_body!(bytes) # :nodoc:
+      @body_bytes += bytes
+    end
+  end
+
   #
   # write
   #
 
   def exec(sock, ver, path)   #:nodoc: internal use only
+    @body_admission = BodyAdmission.new
     if @body
       send_request_with_body sock, ver, path, @body
     elsif @body_stream
@@ -281,12 +494,39 @@ class Net::HTTPGenericRequest
     end
   end
 
+  # Wraps the socket used for a body upload so the number of bytes that
+  # actually reached it can be reported, even when writing fails part way
+  # through. The count is what the socket accepted, so for a chunked upload it
+  # includes the chunk framing the client wrote around the payload.
+  class BodyWriter #:nodoc:
+    def initialize(sock)
+      @sock = sock
+      @bytes = 0
+    end
+
+    attr_reader :bytes
+
+    def write(*strs)
+      written = @sock.write(*strs)
+      @bytes += written if Integer === written
+      written
+    end
+
+    def <<(str)
+      write(str)
+      self
+    end
+  end
+
   def send_request_with_body(sock, ver, path, body)
     self.content_length = body.bytesize
     delete 'Transfer-Encoding'
     write_header sock, ver, path
-    wait_for_continue sock, ver if sock.continue_timeout
-    sock.write body
+    return unless wait_for_continue sock, ver
+    writer = BodyWriter.new(sock)
+    send_upload(sock, "request body (#{body.bytesize} bytes)", writer) {
+      writer.write body
+    }
   end
 
   def send_request_with_body_stream(sock, ver, path, f)
@@ -295,13 +535,21 @@ class Net::HTTPGenericRequest
           "Content-Length not given and Transfer-Encoding is not `chunked'"
     end
     write_header sock, ver, path
-    wait_for_continue sock, ver if sock.continue_timeout
+    # The upload source is not touched until the server has admitted the
+    # body: either a real 100 Continue arrived, or the continue timeout
+    # expired and the wait-expiry policy allowed sending anyway.
+    return unless wait_for_continue sock, ver
+    writer = BodyWriter.new(sock)
     if chunked?
-      chunker = Chunker.new(sock)
-      IO.copy_stream(f, chunker)
-      chunker.finish
+      chunker = Chunker.new(writer)
+      send_upload(sock, "chunked body stream", writer) {
+        IO.copy_stream(f, chunker)
+        chunker.finish
+      }
     else
-      IO.copy_stream(f, sock)
+      send_upload(sock, "body stream", writer) {
+        IO.copy_stream(f, writer)
+      }
     end
   end
 
@@ -317,17 +565,32 @@ class Net::HTTPGenericRequest
     self.set_content_type(self.content_type, boundary: opt[:boundary])
     if chunked?
       write_header sock, ver, path
-      encode_multipart_form_data(sock, params, opt)
+      return unless wait_for_continue sock, ver
+      writer = BodyWriter.new(sock)
+      send_upload(sock, "chunked multipart body", writer) {
+        encode_multipart_form_data(writer, params, opt)
+      }
     else
       require 'tempfile'
+      # The multipart body is spooled to a temporary file before the wait, so
+      # the request header can go out with the exact Content-Length while the
+      # upload source has not been sent. The file is only read into the
+      # connection once the body is admitted.
       file = Tempfile.new('multipart')
-      file.binmode
-      encode_multipart_form_data(file, params, opt)
-      file.rewind
-      self.content_length = file.size
-      write_header sock, ver, path
-      IO.copy_stream(file, sock)
-      file.close(true)
+      begin
+        file.binmode
+        encode_multipart_form_data(file, params, opt)
+        file.rewind
+        self.content_length = file.size
+        write_header sock, ver, path
+        return unless wait_for_continue sock, ver
+        writer = BodyWriter.new(sock)
+        send_upload(sock, "multipart body", writer) {
+          IO.copy_stream(file, writer)
+        }
+      ensure
+        file.close(true)
+      end
     end
   end
 
@@ -405,20 +668,128 @@ class Net::HTTPGenericRequest
   end
 
   ##
-  # Waits up to the continue timeout for a response from the server provided
-  # we're speaking HTTP 1.1 and are expecting a 100-continue response.
+  # Decides whether the upload body may be sent, and records the decision in
+  # the request's BodyAdmission.
+  #
+  # When the request is speaking HTTP/1.1 and carries <tt>Expect:
+  # 100-continue</tt>, the server gets the first word: a real <tt>100
+  # Continue</tt> admits the body, while a final response declines it and is
+  # thrown to the request loop so the body source is never read.
+  #
+  # Other informational responses (such as <tt>103 Early Hints</tt>) are not a
+  # <tt>100 Continue</tt>; they say nothing about whether the body may be sent,
+  # so the client keeps waiting.
+  #
+  # If nothing arrives within the continue timeout, the wait-expiry policy is
+  # adopted explicitly and the body is sent anyway. With no continue timeout
+  # configured, the established default policy applies and the body is sent
+  # without waiting.
+  #
+  # Returns +true+ if the body may be sent; otherwise throws +:response+ with
+  # the server's final response.
 
   def wait_for_continue(sock, ver)
-    if ver >= '1.1' and @header['expect'] and
-        @header['expect'].include?('100-continue')
-      if sock.io.to_io.wait_readable(sock.continue_timeout)
-        res = Net::HTTPResponse.read_new(sock)
-        unless res.kind_of?(Net::HTTPContinue)
-          res.decode_content = @decode_content
-          throw :response, res
-        end
-      end
+    admission = current_admission
+    unless continue_expected?(ver)
+      admission.adopt_no_wait("no Expect: 100-continue header")
+      return true
     end
+    if sock.continue_timeout.nil?
+      admission.adopt_no_wait("continue_timeout is not set")
+      return true
+    end
+
+    admission.wait!
+    timeout = sock.continue_timeout
+    deadline = Process.clock_gettime(Process::CLOCK_MONOTONIC) + timeout
+    debug_upload(sock, "waiting up to #{timeout.inspect}s for 100 Continue")
+    loop do
+      unless buffered_response?(sock) || wait_for_more(sock, deadline)
+        admission.adopt_timeout!
+        debug_upload(sock, "continue timeout expired; adopting wait-expiry policy and sending body")
+        return true
+      end
+      res = Net::HTTPResponse.read_new(sock)
+
+      if res.kind_of?(Net::HTTPContinue)
+        admission.admit_continue!(res)
+        debug_upload(sock, "received 100 Continue; body admitted")
+        return true
+      end
+      # Any other 1xx is informational only: it does not mean the server
+      # accepted the upload, so keep waiting for the real decision.
+      if res.kind_of?(Net::HTTPInformation)
+        admission.observe_informational!(res)
+        if admission.informational_responses > Net::HTTPResponse::MAX_INFORMATIONAL_RESPONSES
+          raise Net::HTTPBadResponse, 'too many informational responses'
+        end
+        debug_upload(sock, "received informational #{res.code}; still waiting for 100 Continue")
+        next
+      end
+      # A final response before the body started: the server refused the
+      # upload, so the source must stay untouched.
+      admission.decline!(res)
+      debug_upload(sock, "received final response #{res.code} before body; upload declined")
+      throw :response, res
+    end
+  end
+
+  def continue_expected?(ver)   # :nodoc:
+    ver >= '1.1' and @header['expect'] and
+      @header['expect'].include?('100-continue')
+  end
+
+  # Waits until the deadline for the underlying IO to become readable. Once the
+  # deadline passes, a zero-timeout poll still picks up a response that is
+  # already waiting, and otherwise returns +false+.
+  def wait_for_more(sock, deadline)   # :nodoc:
+    remaining = deadline - Process.clock_gettime(Process::CLOCK_MONOTONIC)
+    io = sock.io
+    io = io.to_io if io.respond_to?(:to_io)
+    io.wait_readable(remaining > 0 ? remaining : 0) ? true : false
+  end
+
+  # Returns +true+ if the buffered reader already holds bytes from an earlier
+  # read, for example when the server sent <tt>103 Early Hints</tt> and the
+  # <tt>100 Continue</tt> in a single segment. In that case there is no need to
+  # wait on the socket before parsing the next response.
+  def buffered_response?(sock)   # :nodoc:
+    if sock.respond_to?(:rbuf_size, true)
+      sock.send(:rbuf_size) > 0
+    else
+      false
+    end
+  end
+
+  # Runs the block that writes the body, recording the admission state and the
+  # actual number of bytes written. Diagnostics distinguish this sending phase
+  # from the waiting phase above.
+
+  def send_upload(sock, description, writer)   # :nodoc:
+    admission = current_admission
+    admission.start_body!
+    debug_upload(sock, "sending #{description}")
+    begin
+      yield
+    rescue => exception
+      # The source may have been read partly; record what actually went out so
+      # callers can tell how much of the upload happened.
+      admission.abort_body!(writer.bytes)
+      debug_upload(sock, "body send failed (#{exception.class}) after #{writer.bytes} bytes; sending aborted")
+      raise
+    end
+    admission.finish_body!(writer.bytes)
+    debug_upload(sock, "sent #{writer.bytes} body bytes")
+    writer.bytes
+  end
+
+  def current_admission   # :nodoc:
+    @body_admission ||= BodyAdmission.new
+  end
+
+  def debug_upload(sock, message)   # :nodoc:
+    output = sock.respond_to?(:debug_output) ? sock.debug_output : nil
+    output << "expect-continue: #{message}\n" if output
   end
 
   def write_header(sock, ver, path)
