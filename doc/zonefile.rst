@@ -57,3 +57,33 @@ to process the zonefile format.
 .. autoclass:: dns.zonefile.Reader
    :members:
 
+Reading Budgets
+===============
+
+A short zone file can expand into a very large zone through ``$GENERATE``
+directives.  The :py:class:`dns.zonefile.Reader` and the
+:py:func:`dns.zone.from_text` and :py:func:`dns.zone.from_file` convenience
+functions therefore accept two optional budgets:
+
+* ``rr_budget`` limits the total number of RRs that may be read.  Ordinary
+  records, every RR produced by a ``$GENERATE`` range, and records read from
+  ``$INCLUDE`` files all count against it.  The number of iterations of a
+  ``$GENERATE`` range is fixed by its start, stop, and step values, so the
+  exact number of RRs the range will produce is checked before the range is
+  expanded; an over-large directive fails outright instead of generating as
+  many records as fit and silently dropping the rest.
+
+* ``name_budget`` limits the number of distinct owner names that may be read.
+  The same owner name used more than once only counts once.  Distinct names
+  cannot be predicted from a ``$GENERATE`` range without expanding its
+  templates, so this budget is enforced as names are actually encountered,
+  record by record.
+
+When either budget is exceeded, :py:exc:`dns.zonefile.BudgetExceeded` is
+raised.  The read runs inside a transaction, so on any failure the
+transaction is rolled back: a partially built zone is never returned, and if
+the target was an existing zone, its original content is preserved.
+
+.. autoexception:: dns.zonefile.BudgetExceeded
+   :members:
+

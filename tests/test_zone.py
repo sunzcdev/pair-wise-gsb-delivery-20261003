@@ -20,6 +20,7 @@ import difflib
 import os
 import pathlib
 import sys
+import tempfile
 import unittest
 from io import BytesIO, StringIO
 from typing import cast
@@ -34,9 +35,11 @@ import dns.rdataclass
 import dns.rdataset
 import dns.rdatatype
 import dns.rrset
+import dns.tokenizer
 import dns.transaction
 import dns.versioned
 import dns.zone
+import dns.zonefile
 from tests.util import here
 
 example_text = """$TTL 3600
@@ -1690,6 +1693,98 @@ $ORIGIN example.
     def testFromFileLimitOk(self):
         limiter = dns.transaction.TransactionLimiter(1000)
         z = dns.zone.from_file(here("example"), "example", transaction_setup=limiter)
+
+    def testRRBudgetOnOrdinaryRecords(self):
+        z = dns.zone.from_text(example_text, "example.", rr_budget=6)
+        # example_text has six RRs (the apex NS rdataset holds two of them).
+        self.assertEqual(sum(len(rds) for n in z.nodes.values() for rds in n), 6)
+        with self.assertRaises(dns.zone.BudgetExceeded):
+            dns.zone.from_text(example_text, "example.", rr_budget=5)
+
+    def testNameBudgetOnOrdinaryRecords(self):
+        # example_text has four distinct owner names.
+        z = dns.zone.from_text(example_text, "example.", name_budget=4)
+        self.assertEqual(len(z.nodes), 4)
+        with self.assertRaises(dns.zone.BudgetExceeded):
+            dns.zone.from_text(example_text, "example.", name_budget=3)
+
+    def testNameBudgetCountsDistinctOwnerNames(self):
+        text = (
+            "$ORIGIN example.\n"
+            "@ 3600 IN SOA foo bar 1 2 3 4 5\n"
+            "@ 3600 IN NS ns1\n"
+            "host 3600 IN A 10.0.0.1\n"
+            "host 3600 IN AAAA ::1\n"
+        )
+        # Four RRs but only two distinct owner names (the apex and "host").
+        z = dns.zone.from_text(text, "example.", rr_budget=4, name_budget=2)
+        self.assertEqual(len(z.nodes), 2)
+        with self.assertRaises(dns.zone.BudgetExceeded):
+            dns.zone.from_text(text, "example.", name_budget=1)
+
+    def testRRBudgetPreflightsGenerateRange(self):
+        text = (
+            "@ 3600 IN SOA foo bar 1 2 3 4 5\n"
+            "@ 3600 IN NS ns1\n"
+            "$GENERATE 1-100 host$ 3600 A 10.0.0.$\n"
+        )
+        with self.assertRaises(dns.zone.BudgetExceeded):
+            dns.zone.from_text(text, "example.", rr_budget=50)
+        # A budget that fits the two ordinary RRs but not the whole range
+        # must not leave a partially expanded zone behind.
+        try:
+            dns.zone.from_text(text, "example.", rr_budget=50)
+        except dns.zone.BudgetExceeded:
+            pass
+
+    def testBudgetCoversInclude(self):
+        with tempfile.TemporaryDirectory() as directory:
+            included = os.path.join(directory, "included.zone")
+            with open(included, "w", encoding="utf-8") as f:
+                f.write("$GENERATE 1-5 inc$ 3600 A 10.0.1.$\n")
+            text = (
+                "@ 3600 IN SOA foo bar 1 2 3 4 5\n"
+                "@ 3600 IN NS ns1\n"
+                "$GENERATE 1-3 main$ 3600 A 10.0.0.$\n"
+                f'$INCLUDE "{included}"\n'
+            )
+            # Two apex RRs, three outer generated RRs, five included ones:
+            # ten RRs across nine distinct owner names.
+            z = dns.zone.from_text(
+                text, "example.", allow_include=True, rr_budget=10, name_budget=9
+            )
+            self.assertEqual(sum(len(rds) for n in z.nodes.values() for rds in n), 10)
+            self.assertEqual(len(z.nodes), 9)
+            with self.assertRaises(dns.zone.BudgetExceeded):
+                dns.zone.from_text(text, "example.", allow_include=True, rr_budget=9)
+            with self.assertRaises(dns.zone.BudgetExceeded):
+                dns.zone.from_text(text, "example.", allow_include=True, name_budget=8)
+
+    def testBudgetFailureRollsBackExistingZone(self):
+        zone = dns.zone.from_text(example_text, "example.")
+        snapshot = zone.to_text()
+        replacement = (
+            "@ 3600 IN SOA foo bar 1 2 3 4 5\n"
+            "@ 3600 IN NS ns1\n"
+            "$GENERATE 1-1000 host$ 3600 A 10.0.0.$\n"
+        )
+        with self.assertRaises(dns.zone.BudgetExceeded):
+            dns.zone.from_text(replacement, "example.", rr_budget=10)
+        # The high level API builds a fresh zone object, but a manual
+        # replacement writer on the existing zone must roll back to its
+        # original content.
+        with self.assertRaises(dns.zone.BudgetExceeded):
+            with zone.writer(True) as txn:
+                tok = dns.tokenizer.Tokenizer(replacement, "<input>")
+                reader = dns.zonefile.Reader(tok, dns.rdataclass.IN, txn, rr_budget=10)
+                reader.read()
+        self.assertEqual(zone.to_text(), snapshot)
+
+    def testNegativeBudgetRejected(self):
+        with self.assertRaises(ValueError):
+            dns.zone.from_text(example_text, "example.", rr_budget=-1)
+        with self.assertRaises(ValueError):
+            dns.zone.from_text(example_text, "example.", name_budget=-1)
 
 
 class VersionedZoneTestCase(unittest.TestCase):

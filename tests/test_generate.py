@@ -26,7 +26,9 @@ import dns.rdata
 import dns.rdataclass
 import dns.rdatatype
 import dns.rrset
+import dns.tokenizer
 import dns.zone
+import dns.zonefile
 
 example_text = """$TTL 1h
 $ORIGIN 0.0.192.IN-ADDR.ARPA.
@@ -758,6 +760,116 @@ class GenerateTestCase(unittest.TestCase):
                 dns.zone.from_text(
                     zone_text + f"$GENERATE 7-7 x 3600 TXT {modifier}\n", "example."
                 )
+
+    def testGenerateBadTemplateOnDeclarationLine(self):
+        zone_text = "@ 3600 IN SOA foo bar 1 2 3 4 5\n@ 3600 IN NS ns1\n"
+        # The directive is line 3; the tokenizer has consumed its newline by
+        # the time the directive is processed, so problems are attributed to
+        # line 4, i.e. the line immediately following the declaration and
+        # before any other input.  What matters is that the whole directive is
+        # rejected (rather than generating a prefix of the range) and that no
+        # iteration-specific line is invented.
+        for lhs in ["x${bogus}", "x${1,}", "x${1,2,q}", "x${1,2,d", "x${-1,0,n}"]:
+            with self.assertRaises(dns.exception.SyntaxError) as cm:
+                dns.zone.from_text(
+                    zone_text + f"$GENERATE 0-10 {lhs} 3600 A 10.0.0.1\n",
+                    "example.",
+                )
+            self.assertTrue(str(cm.exception).startswith("<string>:4:"))
+        for rhs in ["${0,128,d}", "${-1,0,n}"]:
+            with self.assertRaises(dns.exception.SyntaxError) as cm:
+                dns.zone.from_text(
+                    zone_text + f"$GENERATE 0-10 x 3600 TXT {rhs}\n",
+                    "example.",
+                )
+            self.assertTrue(str(cm.exception).startswith("<string>:4:"))
+
+    def testGenerateBadRangeOnDeclarationLine(self):
+        zone_text = "@ 3600 IN SOA foo bar 1 2 3 4 5\n@ 3600 IN NS ns1\n"
+        # Range problems are detected while the declaration tokens are still
+        # being read, so they are reported on the declaration line itself.
+        for rng, message in [
+            ("1-2/0", "step must be a positive number"),
+            ("1-", "missing $GENERATE range value"),
+            ("5-1", "start must be <= stop"),
+        ]:
+            with self.assertRaises(dns.exception.SyntaxError) as cm:
+                dns.zone.from_text(
+                    zone_text + f"$GENERATE {rng} x$ 3600 A 10.0.0.$\n",
+                    "example.",
+                )
+            self.assertTrue(str(cm.exception).startswith("<string>:3:"))
+            self.assertIn(message, str(cm.exception))
+
+    def testGenerateRRBudgetPreflight(self):
+        zone_text = (
+            "@ 3600 IN SOA foo bar 1 2 3 4 5\n"
+            "@ 3600 IN NS ns1\n"
+            "$GENERATE 1-10 host$ 3600 A 10.0.0.$\n"
+        )
+        # The range would add ten RRs on top of the two ordinary ones.
+        with self.assertRaises(dns.zone.BudgetExceeded) as cm:
+            dns.zone.from_text(zone_text, "example.", rr_budget=5)
+        # The failure is detected from the declaration (line 3), and no
+        # iteration has run yet.
+        self.assertTrue(str(cm.exception).startswith("the RR budget of 5"))
+        # The exact total fits.
+        z = dns.zone.from_text(zone_text, "example.", rr_budget=12)
+        self.assertEqual(len(z.find_rdataset("host10", "A")), 1)
+
+    def testGenerateNameBudget(self):
+        zone_text = (
+            "@ 3600 IN SOA foo bar 1 2 3 4 5\n"
+            "@ 3600 IN NS ns1\n"
+            "$GENERATE 1-10 host$ 3600 A 10.0.0.$\n"
+        )
+        # The apex is one name and the expansion contributes ten more.
+        z = dns.zone.from_text(zone_text, "example.", name_budget=11)
+        self.assertEqual(len(z.nodes), 11)
+        with self.assertRaises(dns.zone.BudgetExceeded):
+            dns.zone.from_text(zone_text, "example.", name_budget=10)
+
+    def testGenerateNameBudgetCountsDistinctNames(self):
+        # Every iteration writes to the same owner name, so there is only one
+        # distinct generated name even though there are three RRs.
+        zone_text = (
+            "@ 3600 IN SOA foo bar 1 2 3 4 5\n"
+            "@ 3600 IN NS ns1\n"
+            "$GENERATE 1-3 same 3600 A 10.0.0.$\n"
+        )
+        z = dns.zone.from_text(zone_text, "example.", rr_budget=5, name_budget=2)
+        self.assertEqual(len(z.nodes), 2)
+        self.assertEqual(len(z.find_rdataset("same", "A")), 3)
+
+    def testGenerateBudgetRollbackLeavesZoneUntouched(self):
+        original = (
+            "@ 3600 IN SOA foo bar 1 2 3 4 5\n"
+            "@ 3600 IN NS ns1\n"
+            "original 3600 A 10.0.0.9\n"
+        )
+        zone = dns.zone.from_text(original, "example.")
+        snapshot = zone.to_text()
+        replacement = (
+            "@ 3600 IN SOA foo bar 1 2 3 4 5\n"
+            "@ 3600 IN NS ns1\n"
+            "$GENERATE 1-100 host$ 3600 A 10.0.0.$\n"
+        )
+        with self.assertRaises(dns.zone.BudgetExceeded):
+            with zone.writer(True) as txn:
+                tok = dns.tokenizer.Tokenizer(replacement, "<input>")
+                reader = dns.zonefile.Reader(tok, dns.rdataclass.IN, txn, rr_budget=10)
+                reader.read()
+        # The failed replacement transaction was rolled back.
+        self.assertEqual(zone.to_text(), snapshot)
+        self.assertIsNotNone(zone.get_rdataset("original", "A"))
+        self.assertIsNone(zone.get_rdataset("host1", "A"))
+
+    def testNegativeBudgetsRejected(self):
+        zone_text = "@ 3600 IN SOA foo bar 1 2 3 4 5\n@ 3600 IN NS ns1\n"
+        with self.assertRaises(ValueError):
+            dns.zone.from_text(zone_text, "example.", rr_budget=-1)
+        with self.assertRaises(ValueError):
+            dns.zone.from_text(zone_text, "example.", name_budget=-1)
 
     def testNoOrigin(self):
         def bad():

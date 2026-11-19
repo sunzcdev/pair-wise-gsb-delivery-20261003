@@ -88,6 +88,25 @@ class GRangeTestCase(unittest.TestCase):
         with self.assertRaises(dns.exception.SyntaxError):
             dns.grange.from_text("1")
 
+    def testFailFromTextZeroStep(self):
+        with self.assertRaises(dns.exception.SyntaxError):
+            dns.grange.from_text("1-4/0")
+
+    def testFailFromTextEmptyRangeValues(self):
+        for text in ["1-", "1-/2", "1-4/"]:
+            with self.assertRaises(dns.exception.SyntaxError):
+                dns.grange.from_text(text)
+
+    def testCount(self):
+        self.assertEqual(dns.grange.count(1, 1, 1), 1)
+        self.assertEqual(dns.grange.count(1, 10, 1), 10)
+        self.assertEqual(dns.grange.count(4, 255, 77), 4)
+        self.assertEqual(dns.grange.count(80, 253, 173), 2)
+        # An empty range has no iterations.
+        self.assertEqual(dns.grange.count(5, 4, 1), 0)
+        with self.assertRaises(dns.exception.SyntaxError):
+            dns.grange.count(1, 4, 0)
+
 
 if __name__ == "__main__":
     unittest.main()

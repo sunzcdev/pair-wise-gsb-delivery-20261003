@@ -58,6 +58,11 @@ class UnknownOrigin(BadZone):
     """The DNS zone's origin is unknown."""
 
 
+# Re-exported so callers of dns.zone.from_text() and dns.zone.from_file() do
+# not have to import dns.zonefile to catch a budget failure.
+BudgetExceeded = dns.zonefile.BudgetExceeded
+
+
 class UnsupportedDigestScheme(dns.exception.DNSException):
     """The zone digest's scheme is unsupported."""
 
@@ -1290,6 +1295,8 @@ def _from_text(
     allow_directives: bool | Iterable[str] = True,
     transaction_setup: Callable[[dns.transaction.Transaction], None] | None = None,
     rfc2308_ttl: bool = True,
+    rr_budget: int | None = None,
+    name_budget: int | None = None,
 ) -> Zone:
     # See the comments for the public APIs from_text() and from_file() for
     # details.
@@ -1312,6 +1319,8 @@ def _from_text(
             allow_include=allow_include,
             allow_directives=allow_directives,
             rfc2308_ttl=rfc2308_ttl,
+            rr_budget=rr_budget,
+            name_budget=name_budget,
         )
         try:
             reader.read()
@@ -1338,6 +1347,8 @@ def from_text(
     allow_directives: bool | Iterable[str] = True,
     transaction_setup: Callable[[dns.transaction.Transaction], None] | None = None,
     rfc2308_ttl: bool = True,
+    rr_budget: int | None = None,
+    name_budget: int | None = None,
 ) -> Zone:
     """Build a zone object from a zone file format string.
 
@@ -1381,6 +1392,20 @@ def from_text(
         last resort if no TTL has been stated at all.  If ``False``, then a master
         file with no ``$TTL`` directive gets its default TTL from the SOA MINIMUM
         field, which is the pre-RFC 2308 behavior.
+    :param rr_budget: If not ``None``, the maximum number of RRs that may be
+        read.  RRs in ``$GENERATE`` expansions and in ``$INCLUDE`` files count
+        against the budget; the exact size of a ``$GENERATE`` range is checked
+        before it is expanded.  If the budget would be exceeded,
+        :py:exc:`dns.zonefile.BudgetExceeded` is raised and the transaction is
+        rolled back, leaving any existing zone content unchanged.
+    :type rr_budget: int or ``None``
+    :param name_budget: If not ``None``, the maximum number of distinct owner
+        names that may be read.  Names in ``$GENERATE`` expansions and in
+        ``$INCLUDE`` files count against the budget; repeated use of the same
+        owner name only counts once.  If the budget would be exceeded,
+        :py:exc:`dns.zonefile.BudgetExceeded` is raised and the transaction is
+        rolled back, leaving any existing zone content unchanged.
+    :type name_budget: int or ``None``
     :raises dns.zone.NoSOA: if there is no SOA RRset.
     :raises dns.zone.NoNS: if there is no NS RRset.
     :raises KeyError: if there is no origin node.
@@ -1399,6 +1424,8 @@ def from_text(
         allow_directives,
         transaction_setup,
         rfc2308_ttl,
+        rr_budget,
+        name_budget,
     )
 
 
@@ -1415,6 +1442,8 @@ def from_file(
     allow_directives: bool | Iterable[str] = True,
     transaction_setup: Callable[[dns.transaction.Transaction], None] | None = None,
     rfc2308_ttl: bool = True,
+    rr_budget: int | None = None,
+    name_budget: int | None = None,
 ) -> Zone:
     """Read a zone file and build a zone object.
 
@@ -1459,6 +1488,20 @@ def from_file(
         last resort if no TTL has been stated at all.  If ``False``, then a master
         file with no ``$TTL`` directive gets its default TTL from the SOA MINIMUM
         field, which is the pre-RFC 2308 behavior.
+    :param rr_budget: If not ``None``, the maximum number of RRs that may be
+        read.  RRs in ``$GENERATE`` expansions and in ``$INCLUDE`` files count
+        against the budget; the exact size of a ``$GENERATE`` range is checked
+        before it is expanded.  If the budget would be exceeded,
+        :py:exc:`dns.zonefile.BudgetExceeded` is raised and the transaction is
+        rolled back, leaving any existing zone content unchanged.
+    :type rr_budget: int or ``None``
+    :param name_budget: If not ``None``, the maximum number of distinct owner
+        names that may be read.  Names in ``$GENERATE`` expansions and in
+        ``$INCLUDE`` files count against the budget; repeated use of the same
+        owner name only counts once.  If the budget would be exceeded,
+        :py:exc:`dns.zonefile.BudgetExceeded` is raised and the transaction is
+        rolled back, leaving any existing zone content unchanged.
+    :type name_budget: int or ``None``
     :raises dns.zone.NoSOA: if there is no SOA RRset.
     :raises dns.zone.NoNS: if there is no NS RRset.
     :raises KeyError: if there is no origin node.
@@ -1481,6 +1524,8 @@ def from_file(
             allow_directives,
             transaction_setup,
             rfc2308_ttl,
+            rr_budget,
+            name_budget,
         )
     assert False  # make mypy happy  lgtm[py/unreachable-statement]
 

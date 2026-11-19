@@ -44,6 +44,17 @@ class CNAMEAndOtherData(dns.exception.DNSException):
     """A node has a CNAME and other data"""
 
 
+class BudgetExceeded(dns.exception.DNSException):
+    """A zone reading budget was exceeded.
+
+    The number of RRs or distinct owner names read from a zone file exceeded
+    the corresponding budget given to the :py:class:`Reader`.
+    """
+
+    supp_kwargs = {"budget", "used", "kind"}
+    fmt = "the {kind} budget of {budget} was exceeded ({used} already used)"
+
+
 def _check_cname_and_other_data(txn, name, rdataset):
     rdataset_kind = dns.node.NodeKind.classify_rdataset(rdataset)
     node = txn.get_node(name)
@@ -116,6 +127,57 @@ def _generate_nibbles(value: int, width: int, base: str) -> str:
             return text
 
 
+def _generate_modifiers(template: str) -> list[tuple[int, int, str]]:
+    """Return the ``(offset, width, base)`` triple of every ``$GENERATE``
+    modifier in *template*, in order.
+
+    A plain ``$`` with no braces contributes the default ``(0, 0, 'd')``
+    triple.  Literal ``$$`` and backslash escapes are skipped.
+    """
+    modifiers: list[tuple[int, int, str]] = []
+    i = 0
+    while i < len(template):
+        c = template[i]
+        if c == "\\":
+            i += 2
+        elif c != "$":
+            i += 1
+        elif template.startswith("$", i + 1):
+            i += 2
+        else:
+            i += 1
+            offset = 0
+            width = 0
+            base = "d"
+            if template.startswith("{", i):
+                match = _generate_modifier.match(template, i)
+                if match is None:
+                    raise dns.exception.SyntaxError("invalid $GENERATE modifier")
+                offset = int(match.group(1))
+                if match.group(2) is not None:
+                    width = int(match.group(2))
+                if match.group(3) is not None:
+                    base = match.group(3)
+                i = match.end()
+            modifiers.append((offset, width, base))
+    return modifiers
+
+
+def _check_generate_template(template: str) -> None:
+    """Validate all the ``$GENERATE`` modifiers in *template*.
+
+    Checking the template while the ``$GENERATE`` directive is still being
+    parsed means that a bad width, offset, or base is reported on the
+    directive line rather than on the first iteration of the range, and the
+    whole directive is rejected instead of generating a truncated range.
+    """
+    for offset, width, base in _generate_modifiers(template):
+        if width > _MAX_GENERATE_WIDTH:
+            raise dns.exception.SyntaxError("$GENERATE width is too large")
+        if base in "nN" and offset < 0:
+            raise dns.exception.SyntaxError("negative $GENERATE value in nibble mode")
+
+
 def _generate_text(template: str, counter: int) -> str:
     """Substitute the $GENERATE iterator *counter* into *template*.
 
@@ -166,7 +228,23 @@ def _generate_text(template: str, counter: int) -> str:
 
 
 class Reader:
-    """Read a DNS zone file into a transaction."""
+    """Read a DNS zone file into a transaction.
+
+    :param rr_budget: If not ``None``, the maximum number of RRs that may be
+        read.  Ordinary RRs, the RRs produced by ``$GENERATE`` directives, and
+        RRs read via ``$INCLUDE`` all count against the budget.  The exact
+        number of RRs that a ``$GENERATE`` range will produce is checked
+        before the range is expanded, so an over-large range never produces a
+        partially built zone.  Exceeding the budget raises
+        :py:class:`BudgetExceeded`.
+    :type rr_budget: int or ``None``
+    :param name_budget: If not ``None``, the maximum number of distinct owner
+        names that may be read, including names from ``$GENERATE`` and
+        ``$INCLUDE``.  Repeated use of an owner name only counts once, so this
+        budget is enforced as names are actually encountered.  Exceeding the
+        budget raises :py:class:`BudgetExceeded`.
+    :type name_budget: int or ``None``
+    """
 
     def __init__(
         self,
@@ -181,6 +259,8 @@ class Reader:
         force_rdtype: dns.rdatatype.RdataType | None = None,
         default_ttl: int | None = None,
         rfc2308_ttl: bool = True,
+        rr_budget: int | None = None,
+        name_budget: int | None = None,
     ):
         self.tok = tok
         self.zone_origin, self.relativize, _ = txn.manager.origin_information()
@@ -220,12 +300,48 @@ class Reader:
         self.force_rdclass = force_rdclass
         self.force_rdtype = force_rdtype
         self.txn.check_put_rdataset(_check_cname_and_other_data)
+        if rr_budget is not None and rr_budget < 0:
+            raise ValueError("rr_budget must not be negative")
+        if name_budget is not None and name_budget < 0:
+            raise ValueError("name_budget must not be negative")
+        # ``None`` means there is no budget.  Otherwise these are the maximum
+        # numbers of RRs and distinct owner names that may be read, and the
+        # running counts are kept alongside them.  They cover ordinary records
+        # as well as ``$GENERATE`` output and anything read via ``$INCLUDE``,
+        # since an include simply continues reading with the same Reader.
+        self.rr_budget = rr_budget
+        self.name_budget = name_budget
+        self.rr_count = 0
+        self.name_count = 0
+        self.budget_names: set[dns.name.Name] = set()
 
     def _eat_line(self):
         while 1:
             token = self.tok.get()
             if token.is_eol_or_eof():
                 break
+
+    def _reserve_rr(self, count: int = 1) -> None:
+        """Charge *count* RRs against the RR budget, if one is set."""
+        if self.rr_budget is not None:
+            if self.rr_count + count > self.rr_budget:
+                raise BudgetExceeded(
+                    budget=self.rr_budget, used=self.rr_count, kind="RR"
+                )
+            self.rr_count += count
+
+    def _reserve_name(self, name: dns.name.Name) -> None:
+        """Charge the owner *name* against the name budget, if one is set.
+
+        Only distinct names count; a name that has already been read is free.
+        """
+        if self.name_budget is not None and name not in self.budget_names:
+            if self.name_count + 1 > self.name_budget:
+                raise BudgetExceeded(
+                    budget=self.name_budget, used=self.name_count, kind="name"
+                )
+            self.budget_names.add(name)
+            self.name_count += 1
 
     def _get_identifier(self):
         token = self.tok.get()
@@ -372,6 +488,8 @@ class Reader:
         if ttl is None:
             raise dns.exception.SyntaxError("Missing default TTL value")
 
+        self._reserve_rr()
+        self._reserve_name(name)
         self.txn.add(name, ttl, rd)
 
     def _generate_line(self):
@@ -388,8 +506,13 @@ class Reader:
             token = self.tok.get()
             if not token.is_identifier():
                 raise dns.exception.SyntaxError
-        except Exception:
-            raise dns.exception.SyntaxError
+        except dns.exception.SyntaxError as e:
+            # Re-raise with the original message so that a bad step or range
+            # is reported on the $GENERATE line with useful detail instead of
+            # the generic syntax-error text.
+            if e.args and e.args[0]:
+                raise
+            raise dns.exception.SyntaxError("bad $GENERATE range")
 
         # lhs (required)
         try:
@@ -440,6 +563,23 @@ class Reader:
         # rhs (required)
         rhs = token.value
 
+        # Validate the templates while the $GENERATE directive is being parsed
+        # so that width, offset, and base mistakes are attributed to the
+        # directive itself instead of to the first expanded record, and so the
+        # whole directive is rejected rather than partially generated.
+        _check_generate_template(lhs)
+        _check_generate_template(rhs)
+
+        # The number of iterations is fixed by the range, so the exact number
+        # of RRs the expansion will add is known and checked against the RR
+        # budget before any work is done, rather than after building most of
+        # the records.  Distinct owner names cannot be counted without
+        # expanding the templates (names may repeat within a range and across
+        # statements), so the name budget is enforced record by record below;
+        # the range is never truncated to make it fit.
+        iterations = dns.grange.count(start, stop, step)
+        self._reserve_rr(iterations)
+
         for i in range(start, stop + 1, step):
             # +1 because bind is inclusive and python is exclusive
 
@@ -480,6 +620,9 @@ class Reader:
                     f"caught exception {str(ty)}: {str(va)}"
                 )
 
+            # The RR budget was reserved for the whole expansion up front;
+            # the name budget is exact and so is charged as names appear.
+            self._reserve_name(name)
             self.txn.add(name, ttl, rd)
 
     def read(self) -> None:

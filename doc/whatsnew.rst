@@ -6,6 +6,23 @@ What's New in dnspython
 2.10.0 (in development)
 -----------------------
 
+* Reading a zone file now accepts optional ``rr_budget`` and
+  ``name_budget`` parameters on :py:func:`dns.zone.from_text`,
+  :py:func:`dns.zone.from_file`, and :py:class:`dns.zonefile.Reader`.  They
+  bound the number of RRs and distinct owner names that may be read, including
+  the output of ``$GENERATE`` directives and the contents of ``$INCLUDE``
+  files.  The exact size of a ``$GENERATE`` range is checked against the RR
+  budget before anything is generated, while names are counted as they are
+  actually produced.  Exceeding either budget raises
+  :py:exc:`dns.zonefile.BudgetExceeded`; the reading transaction is rolled
+  back, so a failed read never leaves a partially built zone and an existing
+  target zone keeps its original content.
+
+* ``$GENERATE`` parsing now reports bad range steps (including a zero step),
+  missing range values, over-wide modifiers, and invalid nibble offsets as
+  syntax errors on the directive itself, rather than asserting, failing with a
+  generic message, or silently generating a truncated range.
+
 * The text form of an IPSECKEY record may now omit the public key, which RFC
   4025 section 3.1 makes optional, e.g. ``10 1 0 192.0.2.38`` with algorithm
   0, which means that no key is present.  Such a record could not be read from

@@ -41,13 +41,21 @@ def from_text(text: str) -> tuple[int, int, int]:
     if text and text[0] == "-":
         raise dns.exception.SyntaxError("Start cannot be a negative number")
 
+    def as_int() -> int:
+        if cur == "":
+            raise dns.exception.SyntaxError("missing $GENERATE range value")
+        try:
+            return int(cur)
+        except ValueError:
+            raise dns.exception.SyntaxError(f"invalid $GENERATE range value {cur!r}")
+
     for c in text:
         if c == "-" and state == 0:
-            start = int(cur)
+            start = as_int()
             cur = ""
             state = 1
         elif c == "/":
-            stop = int(cur)
+            stop = as_int()
             cur = ""
             state = 2
         elif dns._text_util.is_ascii_digit(c):
@@ -58,14 +66,37 @@ def from_text(text: str) -> tuple[int, int, int]:
     if state == 0:
         raise dns.exception.SyntaxError("no stop value specified")
     elif state == 1:
-        stop = int(cur)
+        stop = as_int()
     else:
         assert state == 2
-        step = int(cur)
+        step = as_int()
 
-    assert step >= 1
-    assert start >= 0
+    if step < 1:
+        raise dns.exception.SyntaxError("$GENERATE step must be a positive number")
+    if start < 0:
+        raise dns.exception.SyntaxError("Start cannot be a negative number")
     if start > stop:
         raise dns.exception.SyntaxError("start must be <= stop")
 
     return (start, stop, step)
+
+
+def count(start: int, stop: int, step: int) -> int:
+    """Return the number of iterations a ``$GENERATE`` range will perform.
+
+    The range is inclusive of *stop*, as it is in BIND and in
+    :py:func:`dns.grange.from_text`.
+
+    :param start: The first value of the range.
+    :type start: int
+    :param stop: The inclusive last value of the range.
+    :type stop: int
+    :param step: The increment between values; must be positive.
+    :type step: int
+    :rtype: int
+    """
+    if step < 1:
+        raise dns.exception.SyntaxError("$GENERATE step must be a positive number")
+    if stop < start:
+        return 0
+    return (stop - start) // step + 1
