@@ -8,4 +8,5 @@ DNS Zones
 
    zone-class
    zone-make
+   zonecheck
    inbound-xfr-class

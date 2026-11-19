@@ -99,6 +99,7 @@ CheckDeleteRdatasetType = Callable[
     None,
 ]
 CheckDeleteNameType = Callable[["Transaction", dns.name.Name], None]
+CheckCommitType = Callable[["Transaction"], None]
 
 
 class Transaction:
@@ -116,6 +117,7 @@ class Transaction:
         self._check_put_rdataset: list[CheckPutRdatasetType] = []
         self._check_delete_rdataset: list[CheckDeleteRdatasetType] = []
         self._check_delete_name: list[CheckDeleteNameType] = []
+        self._check_commit: list[CheckCommitType] = []
 
     #
     # This is the high level API
@@ -360,6 +362,22 @@ class Transaction:
         """
         self._check_delete_name.append(check)
 
+    def check_commit(self, check: CheckCommitType) -> None:
+        """Call *check* before committing the transaction.
+
+        The function is called with the transaction, after all edits have
+        been applied but before the transaction's content is committed.  It
+        may inspect the complete current transaction view, including data the
+        transaction did not touch; this is the right place for whole-zone
+        structural validation (see :py:mod:`dns.zonecheck`).
+
+        The check function should raise an exception if it objects to the
+        commit, and otherwise should return ``None``.  If any check raises,
+        the transaction is rolled back rather than committed, so no invalid
+        version is published.
+        """
+        self._check_commit.append(check)
+
     def iterate_rdatasets(
         self,
     ) -> Iterator[tuple[dns.name.Name, dns.rdataset.Rdataset]]:
@@ -535,7 +553,25 @@ class Transaction:
     def _end(self, commit):
         self._check_ended()
         try:
+            if commit:
+                # Run every commit check against the complete current view
+                # before publishing anything.  A failure rolls the transaction
+                # back instead of committing, so an invalid version can never
+                # be published.
+                for check in self._check_commit:
+                    check(self)
             self._end_transaction(commit)
+        except BaseException:
+            # The checks (or the commit itself) rejected the transaction; end
+            # it as a rollback so the manager releases any write state.  The
+            # original exception is the one that propagates.
+            if not self._ended:
+                try:
+                    self._end_transaction(False)
+                except Exception:
+                    # A broken rollback must not mask the original failure.
+                    pass
+            raise
         finally:
             self._ended = True
 

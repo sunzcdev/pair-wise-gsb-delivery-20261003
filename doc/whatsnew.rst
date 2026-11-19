@@ -6,6 +6,18 @@ What's New in dnspython
 2.10.0 (in development)
 -----------------------
 
+* A new ``dns.zonecheck`` module provides an explicit commit-time structural
+  validator for zone transactions.  A ``dns.zonecheck.CommitValidator``
+  inspects the complete current transaction view (not just the names the
+  transaction touched) and can enforce opt-in rules for the apex SOA and NS
+  RRsets, CNAME exclusivity, and delegation boundaries including the
+  distinction between in-bailiwick glue and authoritative data.  Unknown
+  rules are rejected when the validator is constructed, violations are
+  reported with their owner name and RRset rather than repaired by deleting
+  records, and a failed check rolls the transaction back so that no invalid
+  version is published.  Transactions now also support ``check_commit()``
+  hooks, which run before a transaction commits.
+
 * The text form of an IPSECKEY record may now omit the public key, which RFC
   4025 section 3.1 makes optional, e.g. ``10 1 0 192.0.2.38`` with algorithm
   0, which means that no key is present.  Such a record could not be read from
