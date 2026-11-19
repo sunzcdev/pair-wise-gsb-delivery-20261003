@@ -322,6 +322,49 @@ url = request.url_for("sub:users:user_detail", username=..., subdomain=...)
 url = request.url_for("sub:users:user_list", subdomain=...)
 ```
 
+### Same-named params across layers
+
+A host layer and a route layer can declare the same parameter name, for example
+a tenant `id` in the host and a resource `id` in the path. A single flat keyword
+cannot carry two different values, so the flat call raises
+`AmbiguousPathParams` (a subclass of `NoMatchFound`) and names the conflicting
+layers:
+
+```python
+routes = [
+    Host("{id}.example.org", name="tenant", app=Router(routes=[
+        Route("/resources/{id}", resource, name="resource")
+    ]))
+]
+
+# Raises AmbiguousPathParams: parameter 'id' is used by layers [tenant, resource].
+request.url_for("tenant:resource", id=...)
+```
+
+Pass `layer_params` instead, a mapping keyed by the route name of each layer in
+the `name` chain. Every layer then receives its own value, and the result still
+carries the host and protocol:
+
+```python
+url_path = app.url_path_for(
+    "tenant:resource",
+    layer_params={"tenant": {"id": "acme"}, "resource": {"id": "42"}},
+)
+# URLPath('/resources/42', host='acme.example.org', protocol='http')
+url = url_path.make_absolute_url("https://example.org")
+# 'https://acme.example.org/resources/42'
+```
+
+Flat keywords and `layer_params` can be mixed. A layer that gets the conflicting
+parameter explicitly no longer claims the flat value, so this resolves the host
+while the flat `id` flows to the route:
+
+```python
+url = request.url_for(
+    "tenant:resource", id="42", layer_params={"tenant": {"id": "acme"}}
+)
+```
+
 ## Route priority
 
 Incoming paths are matched against each `Route` in order.

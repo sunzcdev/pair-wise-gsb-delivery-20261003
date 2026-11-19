@@ -7,7 +7,7 @@ import re
 import traceback
 import types
 import warnings
-from collections.abc import Awaitable, Callable, Collection, Generator, Sequence
+from collections.abc import Awaitable, Callable, Collection, Generator, Mapping, Sequence
 from contextlib import AbstractAsyncContextManager, AbstractContextManager, asynccontextmanager
 from enum import Enum
 from re import Pattern
@@ -36,6 +36,36 @@ class NoMatchFound(Exception):
     def __init__(self, name: str, path_params: dict[str, Any]) -> None:
         params = ", ".join(list(path_params.keys()))
         super().__init__(f'No route exists for name "{name}" and params "{params}".')
+
+
+class AmbiguousPathParams(NoMatchFound):
+    """
+    Raised by `.url_path_for(name, **path_params)` when a flat path parameter is
+    consumed by more than one layer of a named route chain (e.g. a `Host` and the
+    nested `Route` both declare a parameter called `id`).
+
+    The flat call style cannot express which value belongs to which layer. Resolve
+    the ambiguity by passing `layer_params=...`, keyed by the route names of the
+    affected layers.
+    """
+
+    def __init__(
+        self,
+        name: str,
+        path_params: dict[str, Any],
+        conflicts: dict[str, list[str]],
+    ) -> None:
+        self.name = name
+        self.path_params = path_params
+        self.conflicts = conflicts
+        details = "; ".join(
+            f"parameter '{param}' is used by layers [{', '.join(layers)}]"
+            for param, layers in conflicts.items()
+        )
+        super(NoMatchFound, self).__init__(
+            f'Ambiguous path params for route name "{name}": {details}. '
+            "Pass 'layer_params' keyed by route name to provide a value for each layer explicitly."
+        )
 
 
 class Match(Enum):
@@ -173,11 +203,169 @@ def compile_path(
     return re.compile(path_regex, flags), path_format, param_convertors
 
 
+class _LayerPathParams:
+    """
+    Carries reverse-lookup path params through a named route chain.
+
+    ``flat`` holds the keyword params passed to ``url_path_for`` and is consumed
+    layer by layer (each layer pops the params it uses). ``layer_params`` maps a
+    route name to the params explicitly reserved for that layer, which lets
+    different layers receive different values for same-named params.
+
+    Every candidate route gets its own copy, so a failed candidate can never
+    mutate the params handed to the next one.
+    """
+
+    def __init__(
+        self,
+        flat: dict[str, Any] | None = None,
+        layer_params: Mapping[str, Mapping[str, Any]] | None = None,
+    ) -> None:
+        self.flat = dict(flat or {})
+        self.layer_params = {name: dict(params) for name, params in (layer_params or {}).items()}
+        self.consumed_layers: set[str] = set()
+
+    def copy(self) -> _LayerPathParams:
+        clone = _LayerPathParams.__new__(_LayerPathParams)
+        clone.flat = dict(self.flat)
+        clone.layer_params = {name: dict(params) for name, params in self.layer_params.items()}
+        clone.consumed_layers = set(self.consumed_layers)
+        return clone
+
+    def merge_from(self, other: _LayerPathParams) -> None:
+        """Propagate the consumption recorded inside a successful child candidate."""
+        self.consumed_layers.update(other.consumed_layers)
+
+    def params_for(self, layer_name: str | None, expected: Collection[str]) -> dict[str, Any]:
+        """
+        Return the params this layer should use. Explicit ``layer_params`` for the
+        layer win; remaining flat params fill in anything else the layer expects.
+        """
+        params: dict[str, Any] = {}
+        if layer_name is not None:
+            params.update(self.layer_params.get(layer_name, {}))
+        for key in expected:
+            if key not in params and key in self.flat:
+                params[key] = self.flat[key]
+        return params
+
+    def is_exact_match_for(self, layer_name: str | None, expected: Collection[str]) -> bool:
+        """
+        A leaf route only matches when it receives exactly the params it declares:
+        nothing missing, nothing left over from either the flat pool or the
+        explicit params reserved for this layer.
+        """
+        provided = set(self.params_for(layer_name, expected))
+        if provided != set(expected):
+            return False
+        explicit = set(self.layer_params.get(layer_name, {})) if layer_name is not None else set()
+        return explicit <= set(expected)
+
+    def consume(self, layer_name: str | None, used: Collection[str]) -> None:
+        """Drop the params that a layer took from the shared flat pool."""
+        for key in used:
+            self.flat.pop(key, None)
+        if layer_name is not None and layer_name in self.layer_params:
+            self.consumed_layers.add(layer_name)
+
+
+# Keyword used to pass per-layer params through the public ``url_path_for`` API.
+LAYER_PARAMS_KWARG = "layer_params"
+
+
+def _layer_label(route: BaseRoute, index: int) -> str:
+    """Human-readable name of a layer, used in ambiguity error messages."""
+    if getattr(route, "name", None):
+        return str(route.name)
+    if isinstance(route, Mount):
+        kind, target = "Mount", route.path
+    elif isinstance(route, Host):
+        kind, target = "Host", route.host
+    else:
+        kind, target = type(route).__name__, getattr(route, "path", "")
+    return f"{index}:{kind}({target})"
+
+
+def _find_named_route_chain(
+    routes: Sequence[BaseRoute],
+    name: str,
+    chain: Sequence[BaseRoute] = (),
+) -> list[BaseRoute] | None:
+    """
+    Walk the route tree following the dotted route-name chain (e.g.
+    ``"api:users:detail"``) and return the layers that would build the URL.
+
+    Unnamed ``Host`` and ``Mount`` layers are transparent: a lookup descends
+    through them even though they contribute no segment to the route name.
+    """
+    head, separator, tail = name.partition(":")
+    for route in routes:
+        route_name = getattr(route, "name", None)
+        if route_name == head:
+            if not separator:
+                return [*chain, route]
+            nested = getattr(route, "routes", None)
+            if nested:
+                found = _find_named_route_chain(nested, tail, [*chain, route])
+                if found is not None:
+                    return found
+        elif route_name is None and hasattr(route, "routes"):
+            # Unnamed container layer: keep looking for the same name below it.
+            found = _find_named_route_chain(route.routes, name, [*chain, route])  # type: ignore[arg-type]
+            if found is not None:
+                return found
+    return None
+
+
+def _check_ambiguous_flat_params(
+    routes: Sequence[BaseRoute],
+    name: str,
+    flat: dict[str, Any],
+    layer_params: Mapping[str, Mapping[str, Any]],
+) -> None:
+    """
+    A flat keyword cannot be assigned to a value when two layers of the target
+    route chain both consume it, unless one of the layers is given an explicit
+    value through ``layer_params``.
+    """
+    chain = _find_named_route_chain(routes, name)
+    if chain is None:
+        # Let the regular lookup raise ``NoMatchFound`` with its usual message.
+        return
+
+    param_layers: dict[str, list[str]] = {}
+    for index, route in enumerate(chain):
+        label = _layer_label(route, index)
+        for key in getattr(route, "param_convertors", {}):
+            if key in flat:
+                param_layers.setdefault(key, []).append(label)
+
+    conflicts: dict[str, list[str]] = {}
+    for key, labels in param_layers.items():
+        # "path" is the Mount catch-all and intentionally flows through several
+        # mount layers, so sharing it across layers is never ambiguous.
+        if key == "path":
+            continue
+        # A layer that was given the conflicting key explicitly via
+        # ``layer_params`` no longer claims the flat value for itself.
+        unresolved = [label for label in labels if label not in layer_params or key not in layer_params[label]]
+        if len(unresolved) > 1:
+            conflicts[key] = unresolved
+    if conflicts:
+        raise AmbiguousPathParams(name, flat, conflicts)
+
+
 class BaseRoute:
     def matches(self, scope: Scope) -> tuple[Match, Scope]:
         raise NotImplementedError()  # pragma: no cover
 
-    def url_path_for(self, name: str, /, **path_params: Any) -> URLPath:
+    def url_path_for(
+        self,
+        name: str,
+        /,
+        _layer_ctx: _LayerPathParams | None = None,
+        **path_params: Any,
+    ) -> URLPath:
         raise NotImplementedError()  # pragma: no cover
 
     async def handle(self, scope: Scope, receive: Receive, send: Send) -> None:
@@ -266,15 +454,30 @@ class Route(BaseRoute):
                     return Match.FULL, child_scope
         return Match.NONE, {}
 
-    def url_path_for(self, name: str, /, **path_params: Any) -> URLPath:
+    def url_path_for(
+        self,
+        name: str,
+        /,
+        _layer_ctx: _LayerPathParams | None = None,
+        **path_params: Any,
+    ) -> URLPath:
+        if _layer_ctx is None:
+            _layer_ctx = _LayerPathParams(
+                flat=path_params, layer_params=path_params.pop(LAYER_PARAMS_KWARG, None)
+            )
+            _check_ambiguous_flat_params([self], name, _layer_ctx.flat, _layer_ctx.layer_params)
+        if name != self.name or not _layer_ctx.is_exact_match_for(self.name, self.param_convertors):
+            raise NoMatchFound(name, path_params)
+        path_params = _layer_ctx.params_for(self.name, self.param_convertors)
         seen_params = set(path_params.keys())
         expected_params = set(self.param_convertors.keys())
 
         if name != self.name or seen_params != expected_params:
             raise NoMatchFound(name, path_params)
 
-        path, remaining_params = replace_params(self.path_format, self.param_convertors, path_params)
+        path, remaining_params = replace_params(self.path_format, self.param_convertors, dict(path_params))
         assert not remaining_params
+        _layer_ctx.consume(self.name, expected_params)
         return URLPath(path=path, protocol="http")
 
     async def handle(self, scope: Scope, receive: Receive, send: Send) -> None:
@@ -348,15 +551,30 @@ class WebSocketRoute(BaseRoute):
                 return Match.FULL, child_scope
         return Match.NONE, {}
 
-    def url_path_for(self, name: str, /, **path_params: Any) -> URLPath:
+    def url_path_for(
+        self,
+        name: str,
+        /,
+        _layer_ctx: _LayerPathParams | None = None,
+        **path_params: Any,
+    ) -> URLPath:
+        if _layer_ctx is None:
+            _layer_ctx = _LayerPathParams(
+                flat=path_params, layer_params=path_params.pop(LAYER_PARAMS_KWARG, None)
+            )
+            _check_ambiguous_flat_params([self], name, _layer_ctx.flat, _layer_ctx.layer_params)
+        if name != self.name or not _layer_ctx.is_exact_match_for(self.name, self.param_convertors):
+            raise NoMatchFound(name, path_params)
+        path_params = _layer_ctx.params_for(self.name, self.param_convertors)
         seen_params = set(path_params.keys())
         expected_params = set(self.param_convertors.keys())
 
         if name != self.name or seen_params != expected_params:
             raise NoMatchFound(name, path_params)
 
-        path, remaining_params = replace_params(self.path_format, self.param_convertors, path_params)
+        path, remaining_params = replace_params(self.path_format, self.param_convertors, dict(path_params))
         assert not remaining_params
+        _layer_ctx.consume(self.name, expected_params)
         return URLPath(path=path, protocol="websocket")
 
     async def handle(self, scope: Scope, receive: Receive, send: Send) -> None:
@@ -433,13 +651,32 @@ class Mount(BaseRoute):
                 return Match.FULL, child_scope
         return Match.NONE, {}
 
-    def url_path_for(self, name: str, /, **path_params: Any) -> URLPath:
-        if self.name is not None and name == self.name and "path" in path_params:
+    def url_path_for(
+        self,
+        name: str,
+        /,
+        _layer_ctx: _LayerPathParams | None = None,
+        **path_params: Any,
+    ) -> URLPath:
+        if _layer_ctx is None:
+            _layer_ctx = _LayerPathParams(flat=path_params, layer_params=path_params.pop(LAYER_PARAMS_KWARG, None))
+            _check_ambiguous_flat_params([self], name, _layer_ctx.flat, _layer_ctx.layer_params)
+
+        if self.name is not None and name == self.name and "path" in _layer_ctx.flat:
             # 'name' matches "<mount_name>".
-            path_params["path"] = path_params["path"].lstrip("/")
-            path, remaining_params = replace_params(self.path_format, self.param_convertors, path_params)
-            if not remaining_params:
-                return URLPath(path=path)
+            # Every flat param must be consumable by this mount; the special
+            # "path" param is part of its path convertors.
+            if set(_layer_ctx.flat) - set(self.param_convertors):
+                raise NoMatchFound(name, path_params)
+            explicit = _layer_ctx.layer_params.get(self.name, {}) if self.name is not None else {}
+            if any(key not in self.param_convertors for key in explicit):
+                raise NoMatchFound(name, path_params)
+            mount_params = _layer_ctx.params_for(self.name, self.param_convertors)
+            mount_params["path"] = _layer_ctx.flat["path"].lstrip("/")
+            path, remaining_params = replace_params(self.path_format, self.param_convertors, mount_params)
+            assert not remaining_params
+            _layer_ctx.consume(self.name, self.param_convertors)
+            return URLPath(path=path)
         elif self.name is None or name.startswith(self.name + ":"):
             if self.name is None:
                 # No mount name.
@@ -447,17 +684,29 @@ class Mount(BaseRoute):
             else:
                 # 'name' matches "<mount_name>:<child_name>".
                 remaining_name = name[len(self.name) + 1 :]
-            path_kwarg = path_params.get("path")
-            path_params["path"] = ""
-            path_prefix, remaining_params = replace_params(self.path_format, self.param_convertors, path_params)
+            path_kwarg = _layer_ctx.flat.get("path")
+            mount_params = _layer_ctx.params_for(self.name, self.param_convertors)
+            mount_params["path"] = ""
+            path_prefix, remaining_params = replace_params(
+                self.path_format, self.param_convertors, mount_params
+            )
+            mount_used = [
+                key for key in self.param_convertors if key in mount_params and key not in remaining_params
+            ]
             if path_kwarg is not None:
                 remaining_params["path"] = path_kwarg
             for route in self.routes or []:
+                # Each candidate gets its own copy: a failed attempt must not
+                # mutate the params seen by the next candidate.
+                candidate_ctx = _layer_ctx.copy()
+                candidate_ctx.flat.update(remaining_params)
                 try:
-                    url = route.url_path_for(remaining_name, **remaining_params)
-                    return URLPath(path=path_prefix.rstrip("/") + str(url), protocol=url.protocol)
+                    url = route.url_path_for(remaining_name, _layer_ctx=candidate_ctx)
                 except NoMatchFound:
-                    pass
+                    continue
+                candidate_ctx.consume(self.name, mount_used)
+                _layer_ctx.merge_from(candidate_ctx)
+                return URLPath(path=path_prefix.rstrip("/") + str(url), protocol=url.protocol)
         raise NoMatchFound(name, path_params)
 
     async def handle(self, scope: Scope, receive: Receive, send: Send) -> None:
@@ -503,27 +752,56 @@ class Host(BaseRoute):
                 return Match.FULL, child_scope
         return Match.NONE, {}
 
-    def url_path_for(self, name: str, /, **path_params: Any) -> URLPath:
-        if self.name is not None and name == self.name and "path" in path_params:
-            # 'name' matches "<mount_name>".
-            path = path_params.pop("path")
-            host, remaining_params = replace_params(self.host_format, self.param_convertors, path_params)
+    def url_path_for(
+        self,
+        name: str,
+        /,
+        _layer_ctx: _LayerPathParams | None = None,
+        **path_params: Any,
+    ) -> URLPath:
+        if _layer_ctx is None:
+            _layer_ctx = _LayerPathParams(flat=path_params, layer_params=path_params.pop(LAYER_PARAMS_KWARG, None))
+            _check_ambiguous_flat_params([self], name, _layer_ctx.flat, _layer_ctx.layer_params)
+
+        if self.name is not None and name == self.name and "path" in _layer_ctx.flat:
+            # 'name' matches "<host_name>".
+            # Every flat param must be consumable by this host; "path" is
+            # forwarded as the URL path rather than part of the host.
+            if set(_layer_ctx.flat) - set(self.param_convertors) - {"path"}:
+                raise NoMatchFound(name, path_params)
+            explicit = _layer_ctx.layer_params.get(self.name, {}) if self.name is not None else {}
+            if any(key not in self.param_convertors for key in explicit):
+                raise NoMatchFound(name, path_params)
+            path = _layer_ctx.flat["path"]
+            host_params = _layer_ctx.params_for(self.name, self.param_convertors)
+            host, remaining_params = replace_params(self.host_format, self.param_convertors, host_params)
             if not remaining_params:
+                _layer_ctx.consume(self.name, self.param_convertors)
                 return URLPath(path=path, host=host)
         elif self.name is None or name.startswith(self.name + ":"):
             if self.name is None:
-                # No mount name.
+                # No host name.
                 remaining_name = name
             else:
-                # 'name' matches "<mount_name>:<child_name>".
+                # 'name' matches "<host_name>:<child_name>".
                 remaining_name = name[len(self.name) + 1 :]
-            host, remaining_params = replace_params(self.host_format, self.param_convertors, path_params)
+            host_params = _layer_ctx.params_for(self.name, self.param_convertors)
+            host, remaining_params = replace_params(self.host_format, self.param_convertors, host_params)
+            host_used = [
+                key for key in self.param_convertors if key in host_params and key not in remaining_params
+            ]
             for route in self.routes or []:
+                # Each candidate gets its own copy: a failed attempt must not
+                # mutate the params seen by the next candidate.
+                candidate_ctx = _layer_ctx.copy()
+                candidate_ctx.flat.update(remaining_params)
                 try:
-                    url = route.url_path_for(remaining_name, **remaining_params)
-                    return URLPath(path=str(url), protocol=url.protocol, host=host)
+                    url = route.url_path_for(remaining_name, _layer_ctx=candidate_ctx)
                 except NoMatchFound:
-                    pass
+                    continue
+                candidate_ctx.consume(self.name, host_used)
+                _layer_ctx.merge_from(candidate_ctx)
+                return URLPath(path=str(url), protocol=url.protocol, host=host)
         raise NoMatchFound(name, path_params)
 
     async def handle(self, scope: Scope, receive: Receive, send: Send) -> None:
@@ -642,11 +920,25 @@ class Router:
         await response(scope, receive, send)
 
     def url_path_for(self, name: str, /, **path_params: Any) -> URLPath:
+        layer_params = path_params.pop(LAYER_PARAMS_KWARG, None)
+        if layer_params is not None and not isinstance(layer_params, Mapping):
+            raise TypeError(
+                f"'{LAYER_PARAMS_KWARG}' must be a mapping of route name to path params, "
+                f"got {type(layer_params).__name__!r}."
+            )
+        _check_ambiguous_flat_params(self.routes, name, path_params, layer_params or {})
+        base_ctx = _LayerPathParams(flat=path_params, layer_params=layer_params)
         for route in self.routes:
+            candidate_ctx = base_ctx.copy()
             try:
-                return route.url_path_for(name, **path_params)
+                url = route.url_path_for(name, _layer_ctx=candidate_ctx)
             except NoMatchFound:
-                pass
+                continue
+            # Every explicitly named layer must have been part of the match;
+            # an unused layer name means the caller targeted a non-existent layer.
+            if set(candidate_ctx.layer_params) - candidate_ctx.consumed_layers:
+                raise NoMatchFound(name, path_params)
+            return url
         raise NoMatchFound(name, path_params)
 
     async def lifespan(self, scope: Scope, receive: Receive, send: Send) -> None:

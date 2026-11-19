@@ -14,7 +14,7 @@ from starlette.exceptions import HTTPException
 from starlette.middleware import Middleware
 from starlette.requests import Request
 from starlette.responses import JSONResponse, PlainTextResponse, Response
-from starlette.routing import Host, Mount, NoMatchFound, Route, Router, WebSocketRoute
+from starlette.routing import AmbiguousPathParams, Host, Mount, NoMatchFound, Route, Router, WebSocketRoute
 from starlette.testclient import TestClient
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 from starlette.websockets import WebSocket, WebSocketDisconnect
@@ -1264,3 +1264,300 @@ def test_host_routing_is_case_insensitive(test_client_factory: TestClientFactory
     response = test_client_factory(router).get("/", headers={"host": "Sub.example.ORG"})
     assert response.status_code == 200
     assert response.text == "sub"
+
+
+# The host layer and the mounted resource layer both declare a parameter called
+# "id". Flat kwargs cannot tell the two apart, so the caller can pass per-layer
+# params explicitly through "layer_params".
+async def echo_path_params(request: Request) -> JSONResponse:
+    return JSONResponse({key: str(value) for key, value in request.path_params.items()})
+
+
+layered_id_router = Router(
+    routes=[
+        Host(
+            "{id}.example.org",
+            name="tenant",
+            app=Router(
+                routes=[
+                    Route("/resources/{id}", echo_path_params, name="resource"),
+                ]
+            ),
+        )
+    ]
+)
+
+
+def test_layer_params_resolves_same_named_host_and_route_params() -> None:
+    url_path = layered_id_router.url_path_for(
+        "tenant:resource",
+        layer_params={"tenant": {"id": "acme"}, "resource": {"id": "42"}},
+    )
+    assert url_path == "/resources/42"
+    assert url_path.host == "acme.example.org"
+    assert url_path.protocol == "http"
+    assert url_path.make_absolute_url("https://whatever") == "https://acme.example.org/resources/42"
+
+
+def test_layer_params_mixed_with_flat_params() -> None:
+    # The host layer is resolved explicitly; the flat value is left for the route.
+    url_path = layered_id_router.url_path_for(
+        "tenant:resource",
+        id="42",
+        layer_params={"tenant": {"id": "acme"}},
+    )
+    assert url_path.make_absolute_url("https://whatever") == "https://acme.example.org/resources/42"
+
+
+def test_flat_params_raise_ambiguous_with_conflicting_layer_names() -> None:
+    with pytest.raises(AmbiguousPathParams) as exc_info:
+        layered_id_router.url_path_for("tenant:resource", id="shared")
+    assert exc_info.value.conflicts == {"id": ["tenant", "resource"]}
+    message = str(exc_info.value)
+    assert "tenant" in message and "resource" in message and "layer_params" in message
+    # The dedicated exception stays compatible with existing NoMatchFound handling.
+    assert isinstance(exc_info.value, NoMatchFound)
+
+
+def test_layer_params_partial_resolution_keeps_reporting_remaining_conflict() -> None:
+    router = Router(
+        routes=[
+            Host(
+                "{id}.example.org",
+                name="tenant",
+                app=Router(
+                    routes=[
+                        Mount(
+                            "/orgs/{id}",
+                            name="org",
+                            routes=[Route("/items/{id}", echo_path_params, name="item")],
+                        )
+                    ]
+                ),
+            )
+        ]
+    )
+    # "org" is resolved explicitly; the host and the leaf route still both want
+    # the single flat "id".
+    with pytest.raises(AmbiguousPathParams) as exc_info:
+        router.url_path_for("tenant:org:item", id="5", layer_params={"org": {"id": "org7"}})
+    assert exc_info.value.conflicts == {"id": ["tenant", "item"]}
+
+    url_path = router.url_path_for(
+        "tenant:org:item",
+        id="5",
+        layer_params={"org": {"id": "org7"}, "tenant": {"id": "acme"}},
+    )
+    assert url_path.make_absolute_url("https://whatever") == "https://acme.example.org/orgs/org7/items/5"
+
+
+def test_layer_params_three_layers_each_get_their_own_value() -> None:
+    router = Router(
+        routes=[
+            Host(
+                "{id}.example.org",
+                name="tenant",
+                app=Router(
+                    routes=[
+                        Mount(
+                            "/orgs/{id}",
+                            name="org",
+                            routes=[Route("/items/{id}", echo_path_params, name="item")],
+                        )
+                    ]
+                ),
+            )
+        ]
+    )
+    url_path = router.url_path_for(
+        "tenant:org:item",
+        layer_params={"tenant": {"id": "acme"}, "org": {"id": "org7"}, "item": {"id": "99"}},
+    )
+    assert str(url_path) == "/orgs/org7/items/99"
+    assert url_path.host == "acme.example.org"
+
+
+def test_layer_params_unknown_layer_name_matches_nothing() -> None:
+    with pytest.raises(NoMatchFound):
+        layered_id_router.url_path_for(
+            "tenant:resource",
+            layer_params={"nope": {"id": "acme"}, "resource": {"id": "42"}},
+        )
+
+
+def test_layer_params_must_be_a_mapping() -> None:
+    with pytest.raises(TypeError, match="layer_params"):
+        layered_id_router.url_path_for("tenant:resource", layer_params=[("id", "acme")])  # type: ignore[arg-type]
+
+
+def test_layer_params_extra_param_for_layer_matches_nothing() -> None:
+    with pytest.raises(NoMatchFound):
+        layered_id_router.url_path_for(
+            "tenant:resource",
+            layer_params={"tenant": {"id": "acme"}, "resource": {"id": "42", "unexpected": "x"}},
+        )
+
+
+def test_layer_params_websocket_route_keeps_protocol_and_host() -> None:
+    router = Router(
+        routes=[
+            Host(
+                "{id}.example.org",
+                name="tenant",
+                app=Router(
+                    routes=[WebSocketRoute("/ws/{id}", echo_path_params, name="socket")]
+                ),
+            )
+        ]
+    )
+    url_path = router.url_path_for(
+        "tenant:socket",
+        layer_params={"tenant": {"id": "acme"}, "socket": {"id": "7"}},
+    )
+    assert url_path.protocol == "websocket"
+    assert url_path.host == "acme.example.org"
+    assert str(url_path) == "/ws/7"
+    assert url_path.make_absolute_url("https://whatever") == "wss://acme.example.org/ws/7"
+
+
+def test_failed_candidate_does_not_poison_next_candidate() -> None:
+    # The first sibling expects a different param name; its failure must leave
+    # the shared layer params untouched for the second sibling of the same name.
+    inner = Router(
+        routes=[
+            Route("/first/{other}", echo_path_params, name="same"),
+            Route("/second/{id}", echo_path_params, name="same"),
+        ]
+    )
+    router = Router(
+        routes=[Host("{id}.example.org", name="tenant", app=inner)]
+    )
+    url_path = router.url_path_for(
+        "tenant:same",
+        layer_params={"tenant": {"id": "host9"}, "same": {"id": "item3"}},
+    )
+    assert url_path.make_absolute_url("https://whatever") == "https://host9.example.org/second/item3"
+
+
+def test_generated_layered_url_round_trips_through_routing(test_client_factory: TestClientFactory) -> None:
+    # Build the URL with layer_params, then send a request to it and confirm the
+    # host layer and the route layer each received their own "id" value.
+    captured: dict[str, object] = {}
+
+    async def host_layer_endpoint(request: Request) -> JSONResponse:
+        # This endpoint lives directly under the Host; the only "id" in scope is
+        # the one extracted from the host header.
+        captured["host_layer_id"] = request.path_params["id"]
+        captured["host_header"] = request.headers["host"]
+        return JSONResponse({})
+
+    async def route_layer_endpoint(request: Request) -> JSONResponse:
+        # The leaf route's "id" overwrites the host's "id" in path_params, so the
+        # value seen here must be the route-layer value from the generated path.
+        captured["route_layer_id"] = request.path_params["id"]
+        captured["path"] = request.url.path
+        return JSONResponse({})
+
+    router = Router(
+        routes=[
+            Host(
+                "{id}.example.org",
+                name="tenant",
+                app=Router(
+                    routes=[
+                        Route("/host", host_layer_endpoint, name="host_only"),
+                        Route("/resources/{id}", route_layer_endpoint, name="resource"),
+                    ]
+                ),
+            )
+        ]
+    )
+
+    host_url = router.url_path_for(
+        "tenant:host_only", layer_params={"tenant": {"id": "acme"}, "host_only": {}}
+    )
+    resource_url = router.url_path_for(
+        "tenant:resource", layer_params={"tenant": {"id": "acme"}, "resource": {"id": "42"}}
+    )
+    assert host_url.make_absolute_url("https://whatever") == "https://acme.example.org/host"
+    assert resource_url.make_absolute_url("https://whatever") == "https://acme.example.org/resources/42"
+
+    client = test_client_factory(router, base_url="https://acme.example.org/")
+    response = client.get(str(host_url))
+    assert response.status_code == 200
+    response = client.get(str(resource_url))
+    assert response.status_code == 200
+
+    # Each layer received the value that was explicitly reserved for it.
+    assert captured == {
+        "host_layer_id": "acme",
+        "host_header": "acme.example.org",
+        "route_layer_id": "42",
+        "path": "/resources/42",
+    }
+
+
+def test_layer_params_work_with_mount_and_host_combined(test_client_factory: TestClientFactory) -> None:
+    router = Router(
+        routes=[
+            Host(
+                "{id}.example.org",
+                name="tenant",
+                app=Router(
+                    routes=[
+                        Mount(
+                            "/orgs/{id}",
+                            name="org",
+                            routes=[Route("/items/{id}", echo_path_params, name="item")],
+                        )
+                    ]
+                ),
+            )
+        ]
+    )
+    url_path = router.url_path_for(
+        "tenant:org:item",
+        layer_params={"tenant": {"id": "acme"}, "org": {"id": "org7"}, "item": {"id": "99"}},
+    )
+    assert str(url_path) == "/orgs/org7/items/99"
+    client = test_client_factory(router, base_url="https://acme.example.org/")
+    response = client.get(str(url_path))
+    assert response.status_code == 200
+    # The leaf route's "id" wins in the merged path_params, while the host and
+    # mount matched their own values to make the request reach this endpoint.
+    assert response.json() == {"id": "99"}
+
+
+def test_flat_url_path_for_remains_backward_compatible() -> None:
+    # Distinct, unambiguously named params keep working with flat kwargs.
+    router = Router(
+        routes=[
+            Host(
+                "{tenant}.example.org",
+                name="site",
+                app=Router(
+                    routes=[Route("/users/{username}", echo_path_params, name="user")]
+                ),
+            )
+        ]
+    )
+    url_path = router.url_path_for("site:user", tenant="acme", username="tom")
+    assert url_path.make_absolute_url("https://whatever") == "https://acme.example.org/users/tom"
+
+
+def test_ambiguity_message_names_unnamed_container_layers() -> None:
+    # The Host layer has no route name, so it cannot be targeted with
+    # layer_params; the error message still identifies it by position and type.
+    router = Router(
+        routes=[
+            Host(
+                "{id}.example.org",
+                app=Router(routes=[Route("/r/{id}", echo_path_params, name="leaf")]),
+            )
+        ]
+    )
+    with pytest.raises(AmbiguousPathParams) as exc_info:
+        router.url_path_for("leaf", id="x")
+    labels = exc_info.value.conflicts["id"]
+    assert labels == ["0:Host({id}.example.org)", "leaf"]
+
