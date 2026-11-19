@@ -445,18 +445,181 @@ def test_mv_batch_keeps_unchanged_source(m, same_source):
     assert not m.exists("/batch/b")
 
 
-def test_mv_recursive_propagates_cp_file_errors(m, monkeypatch):
+def test_mv_recursive_failure_leaves_store_untouched(m):
+    # a rejected move is validated before anything is renamed, so neither
+    # the source subtree nor the target namespace may change
     m.mkdir("src")
     m.touch("src/file.txt")
+    m.touch("blocker")
 
-    def failing_cp_file(path1, path2, **kwargs):
-        raise FileNotFoundError(path1)
+    with pytest.raises(FileExistsError):
+        m.mv("/src", "/blocker/dst", recursive=True)
 
-    monkeypatch.setattr(m, "cp_file", failing_cp_file)
+    assert m.cat("/src/file.txt") == b""
+    assert m.isdir("/src")
+    assert not m.exists("/blocker/dst")
+    assert not m.exists("/dst")
 
+
+def test_mv_directory_updates_store_and_pseudo_dirs(m):
+    m.makedirs("/src/empty/sub")
+    m.touch("/src/file.txt")
+    m.mv("/src", "/dst", recursive=True)
+
+    assert m.cat("/dst/file.txt") == b""
+    assert m.isdir("/dst/empty/sub")
+    # no shadow of the old namespace is left behind
+    assert not m.exists("/src")
+    assert "/src" not in m.pseudo_dirs
+    assert not any(p.startswith("/src/") for p in m.pseudo_dirs)
     with pytest.raises(FileNotFoundError):
-        m.mv("/src", "/dst", recursive=True)
+        m.ls("/src")
+
+
+def test_mv_empty_directory(m):
+    m.mkdir("/empty")
+    m.mv("/empty", "/moved", recursive=True)
+    assert m.isdir("/moved")
+    assert not m.exists("/empty")
+    assert m.pseudo_dirs == ["", "/moved"]
+
+
+def test_mv_directory_into_own_descendant_rejected(m):
+    m.makedirs("/a/b")
+    m.touch("/a/b/file.txt")
+    for target in ["/a/b", "/a/b/c", "/a/b/c/d"]:
+        with pytest.raises(ValueError, match="into itself"):
+            m.mv("/a", target, recursive=True)
+    # the failed attempts changed nothing
+    assert m.cat("/a/b/file.txt") == b""
+    assert m.isdir("/a/b")
+    assert not m.exists("/a/b/c")
+
+
+def test_mv_directory_requires_recursive(m):
+    m.mkdir("/src")
+    m.touch("/src/file.txt")
+    with pytest.raises(IsADirectoryError):
+        m.mv("/src", "/dst")
     assert m.exists("/src/file.txt")
+    assert not m.exists("/dst")
+
+
+def test_mv_directory_into_existing_directory(m):
+    m.mkdir("/target")
+    m.touch("/src/file.txt")
+    m.mv("/src", "/target", recursive=True)
+    assert m.cat("/target/src/file.txt") == b""
+    assert not m.exists("/src")
+
+
+def test_mv_directory_onto_existing_directory_rejected(m):
+    m.makedirs("/src/sub")
+    m.makedirs("/dst/src")
+    with pytest.raises(FileExistsError):
+        m.mv("/src", "/dst", recursive=True)
+    assert m.isdir("/src/sub")
+    assert m.isdir("/dst/src")
+
+
+def test_mv_directory_onto_file_rejected(m):
+    m.mkdir("/src")
+    m.touch("/dst")
+    with pytest.raises(FileExistsError):
+        m.mv("/src", "/dst", recursive=True)
+    assert m.isdir("/src")
+    assert m.isfile("/dst")
+
+
+def test_mv_file_overwrites_existing_file(m):
+    m.pipe({"/src": b"new", "/dst": b"old"})
+    m.mv("/src", "/dst")
+    assert m.cat("/dst") == b"new"
+    assert not m.exists("/src")
+
+
+def test_mv_file_into_existing_directory(m):
+    m.touch("/src")
+    m.mkdir("/dst")
+    # an existing directory target means "move into it", like copy()
+    m.mv("/src", "/dst")
+    assert m.isfile("/dst/src")
+    assert not m.exists("/src")
+
+
+def test_mv_into_trailing_slash_directory(m):
+    m.touch("/src")
+    m.mv("/src", "/newdir/")
+    assert m.isfile("/newdir/src")
+    assert not m.exists("/src")
+
+
+def test_mv_adjacent_prefixes_do_not_interfere(m):
+    m.pipe({"/a/file.txt": b"a", "/ab/file.txt": b"ab"})
+    m.mv("/a", "/c", recursive=True)
+    assert m.cat("/c/file.txt") == b"a"
+    # the adjacent prefix is untouched
+    assert m.cat("/ab/file.txt") == b"ab"
+    assert not m.exists("/a")
+
+
+def test_mv_root_stays_valid(m):
+    m.touch("/a/file.txt")
+    with pytest.raises(ValueError, match="root"):
+        m.mv("/", "/b", recursive=True)
+    # moving "/a" to the root is a no-op: it already is directly under it
+    m.mv("/a", "", recursive=True)
+    assert m.ls("/")  # root still lists fine
+    assert "" in m.pseudo_dirs
+    assert m.cat("/a/file.txt") == b""
+
+
+def test_mv_into_root_directory(m):
+    m.touch("/a/b/file.txt")
+    m.mv("/a/b", "/", recursive=True)
+    assert m.cat("/b/file.txt") == b""
+    assert not m.exists("/a/b")
+    assert "" in m.pseudo_dirs
+
+
+def test_mv_into_own_parent_is_noop(m):
+    m.touch("/a/file.txt")
+    m.mv("/a/file.txt", "/a")
+    assert m.cat("/a/file.txt") == b""
+
+
+def test_mv_keeps_open_handle_pointing_at_same_object(m):
+    m.pipe_file("/src/file.txt", b"data")
+    handle = m.open("/src/file.txt", "rb")
+    m.mv("/src", "/dst", recursive=True)
+    # the already-open handle still reads the same bytes
+    assert handle.read() == b"data"
+    # and it is the very object now stored at the new path
+    assert m.store["/dst/file.txt"] is handle
+    assert handle.path == "/dst/file.txt"
+
+
+def test_mv_open_handle_commits_to_new_path(m):
+    m.touch("/src/file.txt")
+    handle = m.open("/src/file.txt", "ab")
+    m.mv("/src", "/dst", recursive=True)
+    handle.write(b"appended")
+    handle.commit()
+    assert m.cat("/dst/file.txt") == b"appended"
+    assert not m.exists("/src/file.txt")
+
+
+def test_mv_batch_validates_all_targets_first(m):
+    m.pipe({"/batch/a": b"alpha", "/batch/b": b"beta"})
+    m.touch("/blocker")
+    with pytest.raises(FileExistsError):
+        m.mv(["/batch/a", "/batch/b"], ["/out/a", "/blocker/b"])
+    # nothing moved at all
+    assert m.cat(["/batch/a", "/batch/b"]) == {
+        "/batch/a": b"alpha",
+        "/batch/b": b"beta",
+    }
+    assert not m.exists("/out/a")
 
 
 def test_rm_no_pseudo_dir(m):

@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 from datetime import UTC, datetime
 from errno import ENOTEMPTY
+from glob import has_magic
 from io import BytesIO
 from pathlib import PurePath, PureWindowsPath
 from typing import Any
@@ -376,6 +377,149 @@ class MemoryFileSystem(AbstractFileSystem):
                 raise FileExistsError(path2)
             if path2 not in self.pseudo_dirs:
                 self.pseudo_dirs.append(path2)
+
+    def mv(self, path1, path2, recursive=False, maxdepth=None, **kwargs):
+        """Move file(s) from one location to another
+
+        A move renames entries of ``store`` and ``pseudo_dirs`` in place
+        rather than copying and deleting: every target is validated before
+        any key changes, so a rejected move leaves the filesystem untouched
+        and a directory move never leaves a shadow of the old namespace
+        behind. Moved files keep their ``MemoryFile`` object, so handles
+        that are already open keep referring to the same bytes and commit
+        to the new path.
+
+        A directory moves its whole subtree and therefore requires
+        ``recursive=True``. Moves limited by ``maxdepth`` or using glob
+        patterns fall back to the generic copy-and-delete implementation,
+        which is partial by definition.
+        """
+        if isinstance(path1, list) and isinstance(path2, list):
+            pairs = [
+                (self._strip_protocol(p1), self._strip_protocol(p2))
+                for p1, p2 in zip(path1, path2, strict=True)
+            ]
+            # omit no-op pairs, like the generic implementation does
+            pairs = [(p1, p2) for p1, p2 in pairs if p1 != p2]
+            if not pairs:
+                return
+            if maxdepth is None and not any(
+                has_magic(p1) or has_magic(p2) for p1, p2 in pairs
+            ):
+                # validate every pair before changing anything
+                plans = [self._plan_move(p1, p2, recursive) for p1, p2 in pairs]
+                for file_moves, dir_moves in plans:
+                    self._apply_move(file_moves, dir_moves)
+                return
+        elif isinstance(path1, str) and isinstance(path2, str):
+            p1 = self._strip_protocol(path1)
+            p2 = self._strip_protocol(path2)
+            if p1 == p2:
+                logger.debug(
+                    "%s mv: The paths are the same, so no files were moved.", self
+                )
+                return
+            if maxdepth is None and not has_magic(p1) and not has_magic(p2):
+                # a trailing separator marks the target as a directory to
+                # move into, mirroring the generic copy() path handling
+                into_dir = path2.endswith("/")
+                file_moves, dir_moves = self._plan_move(
+                    p1, p2, recursive, into_dir=into_dir
+                )
+                self._apply_move(file_moves, dir_moves)
+                return
+        return super().mv(
+            path1, path2, recursive=recursive, maxdepth=maxdepth, **kwargs
+        )
+
+    def _plan_move(self, src, dst, recursive, into_dir=False):
+        """Compute the renames for moving ``src`` to ``dst``.
+
+        Returns ``(file_moves, dir_moves)`` lists of ``(old, new)`` keys for
+        ``store`` and ``pseudo_dirs``. Raises before anything is changed if
+        the move is not allowed, so a failed move cannot leave a half-moved
+        subtree behind.
+        """
+        if not src:
+            # the root directory always stays valid and cannot be moved
+            raise ValueError("cannot move the root directory")
+        # an existing (or explicitly marked) directory target means the
+        # source keeps its name and lands inside it; the root ("") is a
+        # directory too, so moving to "/" lands directly under the root
+        if into_dir or self.isdir(dst):
+            name = src.rsplit("/", 1)[-1]
+            dst = dst + "/" + name if dst else "/" + name
+        if not dst:
+            raise ValueError("cannot move a path onto the root directory")
+        if dst == src:
+            # e.g. moving a path into its own parent directory
+            return [], []
+        if self.isfile(src):
+            self._check_move_target_parent(dst)
+            if self.isdir(dst):
+                raise IsADirectoryError(dst)
+            # an existing file at the target is replaced, like cp_file does
+            return [(src, dst)], []
+        if not self.isdir(src):
+            raise FileNotFoundError(src)
+        if dst == src or dst.startswith(src + "/"):
+            raise ValueError(f"cannot move a directory {src!r} into itself")
+        if not recursive:
+            raise IsADirectoryError(
+                f"{src!r} is a directory; use recursive=True to move it"
+            )
+        self._check_move_target_parent(dst)
+        if self.isfile(dst):
+            # a directory cannot replace a file
+            raise FileExistsError(dst)
+        if self.isdir(dst):
+            raise FileExistsError(dst)
+        # collect the subtree using a trailing-slash prefix, so adjacent
+        # names like "/a" and "/ab" never affect each other
+        prefix = src + "/"
+        file_moves = [
+            (name, dst + name[len(src) :])
+            for name in list(self.store)
+            if name.startswith(prefix)
+        ]
+        dir_moves = [
+            (pdir, dst + pdir[len(src) :])
+            for pdir in self.pseudo_dirs
+            if pdir and (pdir == src or pdir.startswith(prefix))
+        ]
+        # no target may collide with an entry that is not itself moving
+        moving_files = {old for old, _ in file_moves}
+        moving_dirs = {old for old, _ in dir_moves}
+        for _, new in file_moves:
+            if new in self.store and new not in moving_files:
+                raise FileExistsError(new)
+        for _, new in dir_moves:
+            if new in self.pseudo_dirs and new not in moving_dirs:
+                raise FileExistsError(new)
+        return file_moves, dir_moves
+
+    def _check_move_target_parent(self, path):
+        parent = path
+        while len(parent) > 1:
+            parent = self._parent(parent)
+            if self.isfile(parent):
+                raise FileExistsError(parent)
+
+    def _apply_move(self, file_moves, dir_moves):
+        # only called after full validation, so these renames cannot fail
+        # partway and never leave a half-moved subtree
+        for old, new in file_moves:
+            filelike = self.store.pop(old)
+            # keep the same object: open handles stay valid and a later
+            # commit lands at the new path
+            filelike.path = new
+            self.store[new] = filelike
+        if dir_moves:
+            renamed = dict(dir_moves)
+            # "" (the root) is never a key of ``renamed`` and stays valid
+            self.pseudo_dirs[:] = [
+                renamed.get(pdir, pdir) for pdir in self.pseudo_dirs
+            ]
 
     def cat_file(self, path, start=None, end=None, **kwargs):
         logger.debug("cat: %s", path)
