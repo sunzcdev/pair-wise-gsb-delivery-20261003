@@ -1,0 +1,14 @@
+= New Features
+
+* An hsts plugin has been added to easily add an appropriate 
+  Strict-Transport-Security header:
+
+    plugin :hsts
+    # Strict-Transport-Security: max-age=63072000; includeSubDomains
+
+    plugin :hsts, preload: true
+    # Strict-Transport-Security: max-age=63072000; includeSubDomains; preload
+
+= Other Improvements
+
+* The gem size has been reduced 25% by removing documentation.

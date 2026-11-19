@@ -1,0 +1,24 @@
+= Improvements
+
+* The render/view methods in the render plugin, when called with
+  a single string/symbol argument (the most common case), are now
+  up to 2.5x/4x faster by directly calling compiled template methods.
+  This works by extracting the UnboundMethod objects that Tilt
+  creates, and defining real methods for them, then calling those
+  methods using send. This avoids most of the overhead of the render
+  and view methods.  The compiled template methods are defined inside
+  a module included in the Roda app's class, so this support works
+  even if the Roda app itself is frozen.
+
+  Some plugins, such as render_locals, do not work with this
+  optimization, and disable the use of it.  The view_options plugin
+  does work with this optimization if you are using set_view_subdir or
+  append_view_subdir, but not if using set_view_options or
+  set_layout_options.
+
+  This optimization depends on Ruby 2.3+ and Tilt 1.2+, and will not
+  be used on earlier versions, or if an API change in Tilt is
+  detected.
+
+* Session deserialization is now slightly faster in the sessions
+  plugin.

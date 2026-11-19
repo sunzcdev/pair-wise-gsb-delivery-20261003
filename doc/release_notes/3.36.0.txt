@@ -1,0 +1,17 @@
+= New Features
+
+* A multi_public plugin has been added, which allows serving static
+  files from multiple separate directories.  This is especially
+  useful when there are different access control requirements per
+  directory.
+  
+* The content_security_policy now supports a
+  content_security_policy.report_to method to set the
+  report-to directive.
+
+= Other Improvements
+
+* When using the type_routing plugin and performing type routing
+  using the Accept request header, the Vary response header will be
+  added or updated so that http caches do not cache a response for one
+  type and serve it for a different type.

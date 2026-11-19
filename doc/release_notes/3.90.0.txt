@@ -1,0 +1,11 @@
+= Improvements
+
+* The send_file method in the sinatra_helpers plugin now returns
+  a response body that implements to_path.
+
+* Roda now sets a temporary name for the remaining anonymous
+  modules and classes on Ruby 3.3+.
+
+* The common_logger plugin now escapes embedded newlines.  These
+  should only be present if the server is broken and including
+  newlines in things it shouldn't.

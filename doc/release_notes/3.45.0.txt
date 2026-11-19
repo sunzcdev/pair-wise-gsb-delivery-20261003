@@ -1,0 +1,22 @@
+= Improvements
+
+* The typecast_params plugin checks now checks for null bytes by
+  default before typecasting.  If null bytes are present, it raises
+  an error.  Most applications do not require null bytes in
+  parameters, and in some cases allowing them can lead to security
+  issues, especially when parameters are passed to C extensions.
+  In general, the benefit of forbidding null bytes in parameters is
+  greater than the cost.
+  
+  If you would like to continue allowing null bytes, use the
+  :allow_null_bytes option when loading the plugin.
+
+  Note that this change does not affect uploaded files, since those
+  are expected to contain null bytes.
+
+= Backwards Compatibility
+
+* The change to the typecast_params plugin to raise an error for
+  null bytes can break applications that are expecting null bytes
+  to be passed in parameters.  Such applications should use the
+  :allow_null_bytes option when loading the plugin.

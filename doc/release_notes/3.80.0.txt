@@ -1,0 +1,31 @@
+= New Features
+
+* The hmac_paths plugin now supports a :namespace option for both hmac_path and
+  r.hmac_path.  The :namespace option makes the generated HMAC values unique
+  per namespace, allowing easy use of per user/group HMAC paths. This can
+  be useful if the same path will show different information to different
+  users/groups, and you want to prevent path enumeration for each user/group
+  (not allow paths enumerated by one user/group to be valid for a different
+  user/group). Example:
+
+    hmac_path('/widget/1', namespace: '1')
+    # => "/3793ac2a72ea399c40cbd63f154d19f0fe34cdf8d347772134c506a0b756d590/n/widget/1"
+
+    hmac_path('/widget/1', namespace: '2')
+    # => "/0e1e748860d4fd17fe9b7c8259b1e26996502c38e465f802c2c9a0a13000087c/n/widget/1"
+  
+  The HMAC path created with namespace: '1' will only be valid when calling
+  r.hmac_path with namespace: '1' (similar for namespace: '2').
+
+  It is expected that the most common use of the :namespace option is to
+  reference session values, so the value of each path depends on the logged in
+  user.  You can use the :namespace_session_key plugin option to set the
+  default namespace for both hmac_path and r.hmac_path:
+
+    plugin :hmac_paths, secret: 'some-secret-value-with-at-least-32-bytes',
+           namespace_session_key: 'account_id'
+
+  This will use <tt>session['account_id']</tt> (converted to a string) as the namespace
+  for both hmac_path and r.hmac_path, unless a specific :namespace option is
+  given, making it simple to implement per user/group HMAC paths across an
+  application.

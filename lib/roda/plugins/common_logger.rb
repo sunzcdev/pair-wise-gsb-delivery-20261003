@@ -1,0 +1,104 @@
+# frozen-string-literal: true
+
+#
+class Roda
+  module RodaPlugins
+    # The common_logger plugin adds common logger support to Roda
+    # applications, similar to Rack::CommonLogger, with the following
+    # differences:
+    #
+    # * Better performance
+    # * Doesn't include middleware timing
+    # * Doesn't proxy the body
+    # * Doesn't support different capitalization of the Content-Length response header
+    # * Logs to +$stderr+ instead of <tt>env['rack.errors']</tt> if explicit logger not passed
+    #
+    # Example:
+    #
+    #   plugin :common_logger
+    #   plugin :common_logger, $stdout
+    #   plugin :common_logger, Logger.new('filename')
+    #   plugin :common_logger, Logger.new('filename'), method: :debug
+    #   plugin :common_logger, use_request_ip: true
+    #
+    # Keyword Arguments:
+    # +method+ :: Specifies the method to call on the logger object when logging.
+    # +use_request_ip+ :: Use +request.ip+ to get the IP address, instead of the default
+    #                     of checking +HTTP_X_FORWARDED_FOR+ and then +REMOTE_ADDR+. This
+    #                     will become the default behavior starting in Roda 4.
+    module CommonLogger
+      SCOPE_INSTANCE_VARIABLES = [:@_request_timer].freeze
+
+      MUTATE_LINE = RUBY_VERSION < '2.3' || RUBY_VERSION >= '3'
+      private_constant :MUTATE_LINE
+
+      def self.configure(app, logger=nil, opts=(no_positional_opts = true; OPTS), method: opts[:method], use_request_ip: false, **kw)
+        RodaPlugins.check_keywords("the common_logger plugin", no_positional_opts, opts, kw)
+
+        common_logger = app.opts[:common_logger] = logger || app.opts[:common_logger] || $stderr # RODA4: drop setting of option, no longer used
+        app.opts[:common_logger_meth] = common_logger.method(method || (common_logger.respond_to?(:write) ? :write : :<<))
+        app.opts[:common_logger_use_request_ip] = use_request_ip # RODA4: Deefault to true
+      end
+
+      if RUBY_VERSION >= '2.1'
+        # A timer object for calculating elapsed time.
+        def self.start_timer
+          # RODA4.1: Remove
+          Process.clock_gettime(Process::CLOCK_MONOTONIC)
+        end
+      else
+        # simplecov:disable
+        def self.start_timer # :nodoc:
+          Time.now
+        end
+        # simplecov:enable
+      end
+
+      module ClassMethods
+        RodaPlugins.opt_attr_reader(self, :common_logger_meth)
+        RodaPlugins.opt_attr_reader(self, :common_logger_use_request_ip, name: :common_logger_use_request_ip?)
+      end
+
+      module InstanceMethods
+        private
+
+        # Log request/response information in common log format to logger.
+        def _roda_after_90__common_logger(result)
+          return unless result && (status = result[0]) && (headers = result[1])
+
+          elapsed_time = if timer = @_request_timer
+            '%0.4f' % (CommonLogger.start_timer - timer)
+          else 
+            '-'
+          end
+
+          env = @_request.env
+
+          ip = if self.class.common_logger_use_request_ip?
+            @_request.ip
+          else
+            env['HTTP_X_FORWARDED_FOR'] || env["REMOTE_ADDR"]
+          end
+
+          line = "#{ip || "-"} - #{env["REMOTE_USER"] || "-"} [#{Time.now.strftime("%d/%b/%Y:%H:%M:%S %z")}] \"#{env["REQUEST_METHOD"]} #{env["SCRIPT_NAME"]}#{env["PATH_INFO"]}#{"?#{env["QUERY_STRING"]}" if ((qs = env["QUERY_STRING"]) && !qs.empty?)} #{@_request.http_version}\" #{status} #{((length = headers[RodaResponseHeaders::CONTENT_LENGTH]) && (length unless length == '0')) || '-'} #{elapsed_time} "
+          if MUTATE_LINE
+            line.gsub!(/[^[:print:]]/){|c| sprintf("\\x%x", c.ord)}
+          # simplecov:disable
+          else
+            line = line.gsub(/[^[:print:]]/){|c| sprintf("\\x%x", c.ord)}
+          # simplecov:enable
+          end
+          line[-1] = "\n"
+          self.class.common_logger_meth.call(line)
+        end
+
+        # Create timer instance used for timing
+        def _roda_before_05__common_logger
+          @_request_timer = CommonLogger.start_timer
+        end
+      end
+    end
+
+    register_plugin(:common_logger, CommonLogger)
+  end
+end

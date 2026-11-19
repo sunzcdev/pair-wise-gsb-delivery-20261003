@@ -1,0 +1,26 @@
+= New Features
+
+* An erb_h plugin has been added for faster HTML escaping using
+  erb/escape.  erb 4 added erb/escape and it is included in Ruby 3.2.
+
+  The erb_h plugin is added as a separate plugin because it changes
+  the behavior of the h method. The h method added by the h plugin
+  will always return a new string, but the h method added by the
+  erb_h plugin will return the argument if the argument is a
+  string that does not need escaping.  By avoiding unnecessary
+  string allocations, use of the erb_h plugin can speed up HTML
+  escaping.
+
+= Other Improvements
+
+* The autoload_hash_branches plugin added in Roda 3.63.0 will now
+  eagerly load the hash branches when freezing the application,
+  allowing the application to continue to work after being frozen.
+  Additionally, file paths for the hash branches will now be
+  automatically expanded, allowing the use of relative file paths.
+
+= Backwards Compatibility
+
+* The expanding of file paths in the autoload_hash_branches plugin
+  can break applications that were providing relative paths and
+  expecting them to be looked up using the Ruby load path.

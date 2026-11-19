@@ -1,0 +1,34 @@
+= New Features
+
+* hash_branches and hash_paths plugins have been split off from the
+  hash_routes plugin, allowing you to use only those parts instead
+  of all of hash_routes.
+
+  The hash_branches plugin supports the hash_branch class method
+  and r.hash_branches routing method.
+
+  The hash_paths plugin supports the hash_path class method and
+  r.hash_paths routing method.
+  
+  The hash_routes plugin functions as it did previously by
+  requiring the hash_branches and hash_paths plugins. It adds
+  the hash_routes DSL and r.hash_routes routing method.
+
+* A hash_branch_view_subdir has been added.  It builds on the
+  view_options plugin and new hash_branches plugin, automatically
+  appending a view subdirectory for each successful hash branch.
+  This can DRY up code that uses a separate view subdirectory for
+  each branch.
+
+= Other Improvements
+
+* Unprintable characters are now hex escaped in the output of the
+  common_logger plugin.  This can protect users who use software
+  that respects shell escape sequences to view the logs.
+
+= Backwards Compatibility
+
+* The static_routing plugin now depends on the hash_paths plugin
+  instead of the hash_routes plugin, so you will need to update
+  your application to explicitly load the hash_routes plugin if
+  you were relying on static_routing to implicitly load it.

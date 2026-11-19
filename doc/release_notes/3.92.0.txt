@@ -1,0 +1,20 @@
+= New Features
+
+* An each_part plugin has been added, offering a simpler method for
+  using render_each with locals:
+
+    # With render_each:
+    render_each(array_of_foos, :foo, locals: {bar: 1})
+
+    # With each_part:
+    each_part(array_of_foos, :foo, bar: 1)
+
+  The each_part provides similar benefits to the render_each plugin
+  that the part plugin provides to the render plugin.  The each_part
+  method has been optimized to work with the render plugin's
+  :assume_fixed_locals option.
+
+= Other Improvements
+
+* The render_each plugin has been optimized to work with the render
+  plugin's :assume_fixed_locals option.

@@ -1,0 +1,15 @@
+= New Features
+
+* Asynchronous streaming is now supported in the streaming plugin,
+  using the :async option.  When using this option, streaming
+  responses are temporarily buffered in a queue.  By default, the
+  queue is a sized queue with a maximum of 10 elements, but the
+  queue can be specified manually via the :queue option, which
+  can be used with async libraries that support non-blocking
+  queues.  This option is currently only supported on Ruby 2.3+.
+
+= Other Improvements
+
+* When combining multiple compiled assets into a single file, the
+  files are now separated by a newline, fixing issues when a
+  single line comment is used as the last line of a file.

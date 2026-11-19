@@ -1,0 +1,37 @@
+= New Features
+
+* The render plugin now supports an :assume_fixed_locals option,
+  which allows for better caching when all templates use fixed
+  locals, by using a simplified cache key, and avoiding duplicate
+  cache entries for templates rendered both with and without locals.
+
+  Additionally, when this plugin option is set, calling template
+  methods is now faster if the following are true:
+
+  * The application is frozen
+  * Template caching is enabled
+  * Ruby version is 3+
+
+* A part plugin has been added, which simplifies rendering a template
+  with locals:
+
+    # render plugin
+    render(:template, locals: {foo: 'bar'})
+
+    # part plugin
+    part(:template, foo: 'bar')
+
+  In addition to offering a nicer API if you only need to provide
+  locals, the part method can also be faster if all of the
+  following are true:
+
+  * The application is frozen
+  * The :assume_fixed_locals render plugin option is set
+  * Template caching is enabled
+  * Ruby version is 3+ (even faster on Ruby 3.4+)
+  
+= Other Improvements
+
+* The mailer plugin's mail and sendmail class methods now support
+  keyword arguments and pass them as keywords to the r.mail blocks
+  in the routing tree.

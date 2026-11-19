@@ -1,0 +1,48 @@
+= New Features
+
+* You can now override the type attribute for script tags produced
+  by the assets plugin, by providing a :type attribute when calling
+  the assets method.
+
+= Other Improvements
+
+* Reloading the render plugin after the additional_view_directories
+  plugin no longer removes the additional view directories from
+  the allowed paths for templates.
+
+* When using Rack 3, Roda will now use an instance of Rack::Headers
+  instead of a plain hash for the headers, allowing for compliance
+  with the Rack 3 SPEC (which will require lowercase header keys).
+
+* The public, multi_public, and sinatra_helpers plugin now use
+  Rack::Files instead of Rack::File if available, as Rack::File will
+  be deprecated in Rack 3.0.
+
+* The json_parser plugin no longer rewinds the request body before
+  and after reading it when used with Rack 3.0, as Rack 3.0 has
+  dropped the requirement for rewindable input.
+
+* The run_handler plugin now closes bodies for upstream 404 responses
+  when using the not_found: :pass option.
+
+* The chunked plugin no longer uses Transfer-Encoding: chunked by
+  default.  Requiring the use of Transfer-Encoding: chunked made the
+  plugin only work on HTTP 1.1, and not older or newer versions. The
+  plugin still allows for streaming template bodies as they are being
+  rendered.  To get the previous behavior of forcing the use of
+  Transfer-Encoding: chunked, you can use the :force_chunked_encoding
+  plugin option
+
+* Roda now supports testing with Rack::Lint.  This found multiple
+  violations of the Rack SPEC which are fixed in this version, and
+  should ensure that Roda stays in compliance with the Rack SPEC going
+  forward.
+
+= Backwards Compatibility
+
+* Roda will no longer set the Content-Length header for 205 responses
+  when using Rack <2.0.2, as doing so violates the Rack SPEC for those
+  Rack versions.
+
+* The drop_body plugin now drops response bodies for all 1xx responses,
+  not just for 100 and 101 responses, in compliance with the Rack SPEC.

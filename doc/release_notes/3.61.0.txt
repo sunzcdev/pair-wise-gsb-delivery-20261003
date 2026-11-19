@@ -1,0 +1,24 @@
+= Improvements
+
+* The typecast_params plugin now limits input bytesize for integer,
+  float, and date/time typecasts.  If the input is over the allowed
+  bytesize, typecasting will fail.  This prevents issues with trying
+  to typecast arbitrarily large input.
+
+* The default Integer class matcher now limits integer segments to
+  100 characters by default, also to prevent issues with typecasting
+  arbitrarily large input.  Segments larger than 100 characters will
+  no longer be matched by the Integer class matcher.
+
+= Backwards Compatibility
+
+* If the input bytesize limits in the typecast_params plugin cause
+  issues in your application, you can use the :skip_bytesize_checking
+  option when loading the plugin to disable the checks.
+
+* If the default Integer class matcher limit causes problems in your
+  application, you can use the class_matchers plugin to override the
+  matcher to not use a limit:
+
+    plugin :class_matchers
+    class_matcher(Integer, /(\d+)/){|a| [a.to_i]}

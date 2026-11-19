@@ -1,0 +1,42 @@
+= New Features
+
+* render_each in the render_each plugin now automatically handles
+  template names with subdirectories and extensions.  Previously, these
+  caused issues unless the :local option was provided.  So now you
+  can use:
+
+    render_each(foos, "items/foo")
+
+  instead of:
+
+    render_each(foos, "items/foo", :local=>:foo)
+
+* each_partial has been added to the partials plugin.  It operates
+  similarly to render_each, but uses the convention for partial
+  template naming.  So this:
+
+    each_partial(foos, "items/foo")
+
+  is the same as:
+
+    render_each(foos, "items/_foo", :local=>:foo)
+
+= Other Improvements
+
+* The :dependencies option in the assets plugin now works correctly
+  with compiled templates in the render plugin in uncached mode
+  (the default in development).  Previously, modifying a dependency
+  file would not result in recompiling the asset template when
+  requesting the main file.
+
+* Method visibility issues in the following plugins have been fixed:
+
+  * content_security_policy
+  * default_headers
+  * indifferent_params
+  * placeholder_string_matchers
+  * symbol_matchers
+
+  Previously, these plugins made private methods public by mistake
+  when overriding them.  Additionally, Roda.freeze no longer changes
+  the visibility of the set_default_headers private method.

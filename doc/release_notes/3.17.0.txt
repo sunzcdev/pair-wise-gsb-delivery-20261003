@@ -1,0 +1,62 @@
+= New Features
+
+* A route_block_args plugin has been added, allowing you to customize
+  which objects are yielded to the the route block. You call the
+  plugin with a block, which is evaluated in the context of the
+  instance and should return an array of arguments for the instance
+  to yield to the route block.
+  
+  To yield both the request and response objects, you can do:
+
+    plugin :route_block_args do |r|
+      [r, response]
+    end
+
+    route do |r, response|
+      # ...
+    end
+
+  In addition to the main route block, using this plugin also affects
+  the arguments passed to routing blocks in the following plugins:
+
+  * class_level_routing
+  * mailer
+  * mail_processor
+  * multi_route
+  * static_routing
+
+= Other Improvements
+
+* The set_layout_opts method in the view_options plugin can now
+  override the layout template even if the render plugin :layout
+  option is given.
+
+* The mailer and mail_processor plugin now integrate with the hooks
+  plugin to support before/after hooks.
+
+* Dispatching to the route block and RodaResponse#finish are both
+  slightly faster.
+
+* Internal before hook handling has been moved from an internal
+  plugin into the core, and modified so that if you are not using
+  the internal before hook in any plugin, there is no runtime cost.
+
+* The core now recognizes when plugins are using the internal after
+  hook, and automatically loads the internal plugin supporting the
+  after hook.
+
+= Backwards Compatibility
+
+* When using the render plugin with a :layout option, the render_opts
+  :layout option will be set to true if the layout is enabled.
+  Previously, the render_opts :layout option would retain the value
+  given as the plugin option.  Options for the layout (including the
+  template) are still available in the render_opts :layout_opts
+  option.  This change was made to fix the set_layout_opts bug in the
+  view_options plugin.
+
+* RodaResponse#initialize no longer sets the response status to nil
+  if it was already set.
+
+* RodaResponse#finish no longer sets the status on the receiver, it
+  just uses the receiver's status to set the rack response status.

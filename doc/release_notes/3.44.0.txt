@@ -1,0 +1,23 @@
+= New Features
+
+* An optimized_segment_matchers plugin has been added that offers
+  very fast matchers for arbitrary segments (the same segments
+  that would be matched by the String class matcher).  The
+  on_segment method it offers accepts no arguments and yields
+  the next segment if there is a segment.  The is_segment method
+  is similar, but only yields if the next segment is the final
+  segment.
+
+= Other Improvements
+
+* The send_file and attachment methods in the sinatra_helpers plugin
+  now support RFC 5987 UTF-8 and ISO-8859-1 encoded filenames,
+  allowing modern browsers to save files with encoded chracters. For
+  older browsers that do not support RFC 5987, unsupported characters
+  in filenames are replaced with dashes.  This is considered to be an
+  improvement over the previous behavior of using Ruby's inspect
+  output for the filename, which could contain backslashes (backslash
+  is not an allowed chracter in Windows filenames).
+
+* The performance of the String class matcher has been slightly
+  improved.

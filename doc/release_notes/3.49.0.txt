@@ -1,0 +1,18 @@
+= Improvements
+
+* The r.is optimization added in 3.46.0 has been extended to optimize
+  all single argument calls. This results in the following speedups
+  based on argument type:
+
+  * Hash/Class matching: 20%
+  * Symbol matching: 25%
+  * Array matching: 35%
+  * Proc matching: 50%
+  * false/nil matching: 65%
+
+* Roda now uses defined?(yield) instead of block_given? internally
+  for better performance on CRuby.  defined?(yield) is faster as it is
+  built into the VM, while block_given? is a regular method and has
+  the overhead of calling a regular method.  Note that defined?(yield)
+  is not implemented correctly on JRuby before 9.0.0.0, so this
+  release of Roda drops support for JRuby versions before 9.0.0.0.

@@ -1,0 +1,52 @@
+= New Features
+
+* A host_routing plugin has been added, for easier routing based on
+  the request host.  Example:
+
+    plugin :host_routing do |hosts|
+      hosts.to :api, "api.example.com", "api2.example.com"
+      hosts.default :www
+    end
+
+    route do |r|
+      r.api do
+        # requests to api.example.com or api2.example.com
+      end
+
+      r.www do
+        # requests to other domains
+      end
+    end
+
+  The plugin also adds request predicate methods:
+
+    route do |r|
+      r.api? # true if the request is to api.example.com or api2.example.com
+      r.www? # true for request for other domains
+    end
+
+  If the :scope_predicates plugin option is given, these predicate
+  methods are also supported directly in block scope (no "r.").
+
+  For more advanced cases, such as prefix matches on the host, the
+  hosts.default method accepts a block.  In this case, you should
+  also call hosts.register to notify the plugin about what hosts
+  the block could return:
+
+    plugin :host_routing do |hosts|
+      hosts.register :api
+      hosts.default :www do |host|
+        :api if host.end_with?(".api.example.com")
+      end
+    end
+
+= Other Improvements
+
+* In the custom_block_results plugin, if the block passed to
+  handle_block_result returns an object that is not a String,
+  nil, or false, Roda no longer attempts to write it to the response
+  body.  Doing so is undesirable and would be a violation of the rack
+  spec.
+
+* Minor performance improvements have been made to the header_matchers
+  plugin.

@@ -1,0 +1,34 @@
+= New Features
+
+* A host_authorization plugin has been added to verify the requested
+  Host header is authorized.  Using it can prevent DNS rebinding
+  attacks in cases where the application can receive requests for
+  arbitrary hosts.
+
+  To check for authorized hosts in your routing tree, you call the
+  check_host_authorization! method.  For example, if you want to
+  check for authorized hosts after serving requests for public
+  files, you could do:
+
+    plugin :public
+    plugin :host_authorization, 'my-domain-name.example.com'
+
+    route do |r|
+      r.public
+      check_host_authorization!
+
+      # ... rest of routing tree
+    end
+
+  In addition to handling single domain names via a string, you can
+  provide an array of domain names, a regexp to match again, or a
+  proc.
+  
+  By default, requests using unauthorized hosts receive an empty 403
+  response.  If you would like to customize the response, you can
+  pass a block when loading the plugin:
+
+    plugin :host_authorization, 'my-domain-name.example.com' do |r|
+      response.status = 403
+      "Response Body Here"
+    end

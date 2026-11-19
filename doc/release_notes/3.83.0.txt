@@ -1,0 +1,6 @@
+= New Features
+
+* An assume_ssl plugin has been added.  This plugin is designed for
+  cases where the application is being fronted by an SSL-terminating
+  reverse proxy that does not set the X-Forwarded-Proto or similar
+  header to indicate it is forwarding an SSL request.

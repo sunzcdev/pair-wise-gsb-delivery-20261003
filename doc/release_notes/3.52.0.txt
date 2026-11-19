@@ -1,0 +1,20 @@
+= New Features
+
+* The typecast_params plugin now supports a :date_parse_input_handler
+  option that will be called with all input that will be passed to
+  the date parsing methods.  You can use this option to automatically
+  truncate input, if that is perferable to raising an error (which is
+  how recent versions of Ruby handle too-long input).
+
+= Other Improvements
+
+* The path helper methods added by the path plugin now support
+  blocks that use keyword arguments on Ruby 3+.
+
+* The assets plugin now uses OpenSSL::Digest instead of Digest (if
+  available) for calculating SRI digests.  This is faster on Ruby 3+,
+  where Digest no longer uses the faster OpenSSL::Digest automatically
+  if available.
+
+* Roda.freeze now returns self when the multi_route plugin is used.
+  This was broken (not returning self) starting in 3.48.0.

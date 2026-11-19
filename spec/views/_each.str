@@ -1,0 +1,1 @@
+x-#{each if local_variables.include?(:each)}-#{foo if local_variables.include?(:foo)}

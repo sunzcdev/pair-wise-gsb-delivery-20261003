@@ -1,0 +1,16 @@
+= Improvements
+
+* The relative_path plugin is now faster if you are calling
+  relative_path or relative_prefix more than once when handling a
+  request.
+
+* The typecast_params.convert! method in the typecast_params plugin
+  now handles explicit nil values the same as missing values.
+  Explicit nil values do not generally occur in normal Rack parameter
+  parsing, but they can occur when using the json_parser plugin to
+  parse JSON requests.
+
+* Roda now avoids method redefinition warnings in verbose mode by
+  using a self alias.  As Ruby 3 is dropping uninitialized instance
+  variable warnings, Roda will be verbose warning free if you are
+  using Ruby 3.

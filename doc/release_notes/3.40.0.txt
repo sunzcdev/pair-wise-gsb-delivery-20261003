@@ -1,0 +1,24 @@
+= New Features
+
+* A precompile_views method has been added to the
+  precompile_templates plugin.  This method works with Roda's
+  optimized compiled view methods, allowing additional memory
+  sharing between parent and child processes.
+
+* A freeze_template_caches! method has been added to the
+  precompile_templates plugin.  This freezes the template caches,
+  preventing the compilation of additional templates, useful for
+  enforcing that only precompiled templates are used.  Additionally,
+  this speeds up access to the template caches.
+
+* RodaCache#freeze now returns the frozen internal hash, which can
+  then be accessed without a mutex. Previously, freeze only froze
+  the receiver and not the internal hash, so it didn't have the
+  expected effect.
+
+= Other Improvements
+
+* The view method in the render plugin is now faster in most cases
+  when a single argument is used.  When freezing the application,
+  an additional optimization is performed to increase the
+  performance of the view method even further.

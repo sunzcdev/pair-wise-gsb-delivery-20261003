@@ -1,0 +1,18 @@
+= New Features
+
+* A break plugin has been added, allowing you to use break from
+  inside a routing block and continue routing after the block.  This
+  offers the same feature as the pass plugin, but using the standard
+  break keyword instead of the r.pass method.
+
+* The error_mail and error_email features now both accept a :filter
+  plugin option.  The value should respond to call with two arguments.
+  The first arguments is the key, and the second is the value, and
+  should return a truthy value if the value should be filtered.  This
+  will be used for filtering parameter values, ENV values, and session
+  values in the generated emails.
+
+= Other Improvements
+
+* On Ruby 3.3+, the middleware plugin sets a temporary class name for
+  the created middleware, based on the class name of the Roda app.

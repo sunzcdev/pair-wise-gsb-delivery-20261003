@@ -1,0 +1,17 @@
+= Improvements
+
+* Multiple unneeded conditionals have been removed.
+
+* pre_content and post_context sections in backtraces are no longer
+  included in the exception_page plugin output if they would be
+  empty.
+
+* The match_affix plugin can be loaded again with a single argument.
+  It was originally designed to accept a single argument, but a bug
+  introduced in 2.29.0 made it require two arguments.
+
+* Core Roda and all plugins that ship with Roda now have 100% branch
+  coverage.
+
+* The sinatra_helpers plugin no longer emits statement not reached
+  warnings in verbose mode.

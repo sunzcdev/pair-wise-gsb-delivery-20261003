@@ -1,0 +1,12 @@
+= New Features
+
+* A :forward_response_headers option has been added to the middleware
+  plugin, which uses the response headers added by the middleware
+  as default response headers even if the middleware does not handle
+  the response. Response headers set by the underlying application
+  take precedence over response headers set by the middleware.
+
+* The render plugin view method now accepts a block and will pass the
+  block to the underlying render method call.  This is useful for
+  rendering a template that yields inside of an existing layout.
+  Previously, you had to nest render calls to do that.

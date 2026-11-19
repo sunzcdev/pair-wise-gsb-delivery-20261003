@@ -1,0 +1,23 @@
+= New Features
+
+* A render_coverage plugin has been added, which will cause compiled
+  template code to be saved to a folder and loaded using load instead
+  of eval. This allows for coverage to work for the compiled template
+  code in Ruby versions before 3.2.  It can also allow for verbose
+  syntax warnings in compiled template code (ignored by eval), and
+  can also be useful for static analysis of compiled template code.
+  This plugin requires tilt 2.1+.
+
+* The exception_page plugin now supports exception_page_{css,js}
+  instance methods for overriding the CSS and JavaScript on the
+  generated exception page.
+
+= Other Improvements
+
+* Using inline templates (render/view :inline option) no longer keeps
+  a reference to the Roda instance that caches the template.
+
+= Backwards Compatibility
+
+* The Render::TemplateMtimeWrapper API has changed.  Any external
+  use of this class needs to be updated.

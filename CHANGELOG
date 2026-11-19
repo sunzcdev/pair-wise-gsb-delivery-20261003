@@ -1,0 +1,1017 @@
+=== master
+
+* Add keyword arguments and deprecate positional hash for json_parser plugin (jeremyevans)
+
+* Deprecate the indifferent_params plugin, switch to typecast_params instead (jeremyevans)
+
+* Add keyword arguments and deprecate positional hash for hsts plugin (jeremyevans)
+
+* Add keyword arguments and deprecate positional hash for host_routing plugin (jeremyevans)
+
+* Add keyword arguments and deprecate positional hash for host_authorization plugin (jeremyevans)
+
+* Add content_security_policy_nonce plugin, for easier use of nonces with content_security_policy plugin (jeremyevans, HoneyryderChuck) (#436, #438)
+
+* Add hmac_path valid_until keyword argument, to replace :until option (jeremyevans)
+
+* Deprecate hmac_path_namespace method in hmac_paths plugin (jeremyevans)
+
+* Add keyword arguments and deprecate positional hash for hmac_path, hmac_path_hmac, and r.hmac_path methods in hmac_paths plugin (jeremyevans)
+
+* Add keyword arguments and deprecate positional hash for hmac_paths plugin (jeremyevans)
+
+* Add keyword arguments and deprecate positional hash for heartbeat plugin (jeremyevans)
+
+* Respect public plugin default_mime argument when serving compressed files (jeremyevans)
+
+* Deprecate public constants in public and multi_public plugins (jeremyevans)
+
+* Add keyword arguments and deprecate positional hash for public, hash_public, and timestamp_public plugins (jeremyevans)
+
+=== 3.110.0 (2026-11-13)
+
+* Add keyword arguments and deprecate positional hash for exception_page method in exception_page plugin (jeremyevans)
+
+* Add keyword arguments and deprecate positional hash for error_handler plugin (jeremyevans)
+
+* Deprecate class-level error method in error_handler plugin, switch to passing plugin a block (jeremyevans)
+
+* Improve error_mail plugin performance by storing configuration in struct instead of hash (jeremyevans)
+
+* Check supported options passed to sessions, assets, cookie_flags, error_email, and error_mail plugins (jeremyevans)
+
+* Improve cookie_flags plugin performance by storing configuration in struct instead of hash (jeremyevans)
+
+* Deprecate the csrf plugin, switch to route_csrf or sec_fetch_site_csrf (jeremyevans)
+
+* Add keyword arguments and deprecate positional hash for permissions_policy plugin (jeremyevans)
+
+* Add keyword arguments and deprecate positional hash for content_for plugin (jeremyevans)
+
+* Make recheck_precompiled_assets work with freeze_request_response plugin (jeremyevans)
+
+* Improve assets plugin performance by storing configuration in struct instead of hash (jeremyevans)
+
+* Deprecate passing invalid type to assets_paths in assets plugin (jeremyevans)
+
+* Deprecate public constants in assets plugin (jeremyevans)
+
+* Improve sessions plugin performance by storing configuration in struct instead of hash (jeremyevans)
+
+* Deprecate public constants in sessions plugin (jeremyevans)
+
+* Deprecate :per_cookie_cipher_secret option for sessions plugin (jeremyevans)
+
+* Support use_request_ip keyword argument to common_logger plugin (jeremyevans)
+
+* Add keyword arguments and deprecate positional hash for commom_logger plugin (jeremyevans)
+
+* Add keyword arguments and deprecate positional hash for class_matcher and symbol_matcher methods (jeremyevans)
+
+* Support query method in class_level_routing plugin on Rack 3.3+ (jeremyevans)
+
+* Add keyword arguments and deprecate positional hash for chunked plugin (jeremyevans)
+
+* Add keyword arguments and deprecate positional hash for capture_erb plugin and method (jeremyevans)
+
+* Add keyword arguments and deprecate positional hash for etag method in caching plugin (jeremyevans)
+
+* Replace Hash[hash1].merge!(hash2) with hash1.merge(hash2), as the later is faster since Ruby 2.5 (jeremyevans)
+
+* Make assets and freeze_request_response plugins work together (jeremyevans)
+
+* Avoid unnecessary allocations in assets_preloading plugin (jeremyevans)
+
+* Do not decode + as a space in the unescape_path plugin (wleeaf, jeremyevans) (#434)
+
+* Use weak etag comparison in caching plugin etag method (wleeaf) (#433)
+
+* Have public plugin add Vary Accept-Encoding header when using encodings (wleeaf) (#432)
+
+* Add freeze_request_response plugin for freezing RodaRequest and RodaResponse (jeremyevans)
+
+* In the render plugin, have each subclass use a separate RodaCompiledTemplates module (jeremyevans)
+
+* Add query method to hash_routes DSL, requires Rack::Request#query? to be defined (jeremyevans)
+
+=== 3.109.0 (2026-10-09)
+
+* Persist symbol keys set in Roda.opts to class instance variables, add attr_reader methods for much faster access (jeremyevans)
+
+* Add rescue_classes keyword argument to invalid_request_body plugin (jeremyevans)
+
+* Drop support for Ruby 1.9 (jeremyevans)
+
+=== 3.108.0 (2026-09-14)
+
+* Make invalid_request_body r.POST exception handling reraise RodaErrors (jeremyevans)
+
+* Make host_routing plugin downcase hostnames before storage and comparison (jeremyevans)
+
+* Make :extension hash matcher in path_matchers plugin require . before extension (jeremyevans)
+
+* Add params_capturing_restore plugin to have params_capturing work with pass and break plugins (jeremyevans)
+
+* Always set Vary response header if considering Accept request header in type_routing plugin (jeremyevans)
+
+* Have r.last_modified in caching plugin check If-Unmodified-Since before If-None-Match and If-Modified-Since (jeremyevans)
+
+* Do not have r.on_segment in optimized_segment_matchers match empty segment (jeremyevans)
+
+* Do not have r.on with String class matcher and default symbol matcher match empty segment (jeremyevans)
+
+* Make pass plugin work with hash_branches and hash_paths plugins (jeremyevans)
+
+* Make params_capturing plugin override a provided parameter named captures (jeremyevans)
+
+* Deprecate the :clear_session csrf_failure option value in the route_csrf and sec_fetch_site_csrf plugins (jeremyevans)
+
+* Make segment matching with convertor not consume remaining_path if convertor returns false/nil (jeremyevans)
+
+* Make etag in the caching plugin return a 412 response if an If-Match header is submitted and weak option is used (jeremyevans)
+
+* Make r.redirect without arguments use / if path starts with // (jeremyevans)
+
+* Make run_append_slash with :use_redirects option not redirect if path starts with // (jeremyevans)
+
+* Make hash matcher reset remaining path and captures on failure (jeremyevans)
+
+* Make pass and break plugins work with optimized_{string,segment}_matchers plugins (jeremyevans)
+
+* Make render method options have greater priority than options set via set_view_options (jeremyevans)
+
+* Do not allow rendering templates outside an allowed_paths directory but having an allowed path as a prefix (jeremyevans)
+
+* Do not add the :views directory as an allowed path if it isn't a directory (jeremyevans)
+
+* Support json_parser :content_type_regexp plugin option, warn if not provided (jeremyevans)
+
+* Add r.query to all_verbs plugin on Rack 3.3+ (jeremyevans)
+
+* Support :exempt_request_methods option for route_csrf plugin, to use an allow list approach (jeremyevans)
+
+* Add csrf_request_method to route_csrf plugin, to handle case where REQUEST_METHOD has been modified (jeremyevans)
+
+=== 3.107.0 (2026-08-13)
+
+* Deprecate upgrading rack sessions and compressed sessions in the sessions plugin (jeremyevans)
+
+* Deprecate the delay_build plugin (jeremyevans)
+
+* Deprecate automatic compression using common libraries in the assets plugin (jeremyevans)
+
+* Support using a proc or method for the :css_compressor and :js_compressor assets plugin options (jeremyevans)
+
+* Document that the route_block_args plugin will be removed in Roda 4 (jeremyevans)
+
+* Document that the csrf plugin will be removed in Roda 4 (jeremyevans)
+
+* Document that the static plugin will be removed in Roda 4 (jeremyevans)
+
+* Warn by default if dynamically defining a method using a block with an unexpected arity (jeremyevans)
+
+* Add url_escape plugin for Roda#url_{,un}escape methods (jeremyevans)
+
+=== 3.106.0 (2026-07-13)
+
+* Add shape_friendly plugin to make scope, request, and response objects shape-friendly (jeremyevans)
+
+* Add Roda.plugins for checking the loaded plugins (jeremyevans)
+
+=== 3.105.0 (2026-06-12)
+
+* Support segment: true for class and symbol matchers to improve performance (jeremyevans)
+
+* Improve performance of :d and :w symbol matchers by 2x (jeremyevans)
+
+* Improve performance of Integer matcher by 2-3x (jeremyevans)
+
+=== 3.104.0 (2026-05-13)
+
+* Add hash_public_cache plugin for caching digests for files served by the hash_public plugin (jeremyevans)
+
+* Use faster OpenSSL::Digest if available in hash_public plugin (jeremyevans)
+
+=== 3.103.0 (2026-04-13)
+
+* Add hash_public plugin for serving static files with paths that change based on content (yykamei, jeremyevans) (#417, #418)
+
+* Add ip_from_header plugin, getting request IP address from specified header (jeremyevans)
+
+=== 3.102.0 (2026-03-13)
+
+* Extract send_file plugin from sinatra_helpers plugin (jeremyevans) (#412)
+
+* Extract response_attachment plugin from sinatra_helpers plugin (jeremyevans)
+
+=== 3.101.0 (2026-02-13)
+
+* Add bearer_token plugin for retrieving bearer token from HTTP Authorization header (jeremyevans)
+
+=== 3.100.0 (2026-01-12)
+
+* Add sec_fetch_site_csrf plugin, for CSRF protection using Sec-Fetch-Site header (jeremyevans)
+
+=== 3.99.0 (2025-12-12)
+
+* Add support for set matchers by default, as Set will be a core class in Ruby 4 (jeremyevans)
+
+=== 3.98.0 (2025-11-13)
+
+* Add support for the :env_key option to the sessions plugin (jeremyevans) (#403)
+
+=== 3.97.0 (2025-10-13)
+
+* Add map_matcher plugin, for matching next segment in request path to a hash key, yielding hash value (jeremyevans)
+
+=== 3.96.0 (2025-09-12)
+
+* Add redirect_path plugin, for automatically calling path with the redirect argument if not given a string (jeremyevans)
+
+=== 3.95.0 (2025-08-12)
+
+* Support typecast_query_params and typecast_body_params in typecast_params plugin (jeremyevans)
+
+* Raise Roda::RodaPlugins::Sessions::CookieTooLarge for cookies where total cookie size is over 4K (not just cookie value) (jeremyevans)
+
+* Add response_content_type plugin for more easily setting content-type for responses (jeremyevans)
+
+=== 3.94.0 (2025-07-14)
+
+* Add view_subdir_leading_slash plugin for using view subdirectory unless template name starts with slash (jeremyevans) (#395)
+
+* Optimize render_each and each_part default local selection on Ruby 3+/!Windows (jeremyevans)
+
+* Optimize render_each and each_part template selection when freezing app with :assume_fixed_locals render plugin option (jeremyevans)
+
+=== 3.93.0 (2025-06-12)
+
+* Numerous minor performance improvements, mostly from rubocop-performance (jeremyevans)
+
+* Support invalid_value_message for custom invalid value messages per-type in typecast_params plugin (jeremyevans)
+
+=== 3.92.0 (2025-05-13)
+
+* Add each_part plugin, with a simpler method for using render_each with locals (jeremyevans)
+
+* Support :assume_fixed_locals render option in render_each plugin (jeremyevans)
+
+=== 3.91.0 (2025-04-11)
+
+* Support returns: :buffer method and plugin option in capture_erb plugin (jeremyevans)
+
+* Allow render_each to accept a block and yield renderings, instead of returning a concatenation of the renderings (jeremyevans)
+
+=== 3.90.0 (2025-03-11)
+
+* Set temporary name on Ruby 3.3+ for remaining anonymous modules and classes (jeremyevans)
+
+* Make send_file in sinatra_helpers use a response body that implements to_path (jeremyevans) (#379)
+
+* Escape newlines in common logger lines (jeremyevans)
+
+=== 3.89.0 (2025-02-12)
+
+* Support passing keyword arguments to mailer plugin mail/sendmail class methods (jeremyevans)
+
+* Improve performance when using :assume_fixed_locals render plugin option, when using compiled methods and freezing the app (jeremyevans)
+
+* Add part plugin, with a simpler (and better performing when using :assume_fixed_locals) method for rendering with locals (jeremyevans)
+
+* Support :assume_fixed_locals render plugin option for better caching when all templates use fixed locals (jeremyevans)
+
+=== 3.88.0 (2025-01-14)
+
+* Support fixed locals in templates when using Tilt 2.6+ (jeremyevans)
+
+* Make default_headers plugin correctly handle mixed/upper case content-type header on Rack 3 (jeremyevans) (#373)
+
+* Make json_parser plugin handle case where Rack::Request#POST is called previously for env on Rack 3 (jeremyevans) (#372)
+
+* Fix strict_unused_block warnings when running specs on Ruby 3.4 (jeremyevans)
+
+= 3.87.0 (2024-12-17)
+
+* Add host_routing plugin for routing based on request host header (jeremyevans)
+
+* Do not write non-String to response body when using custom_block_results plugin (jeremyevans)
+
+= 3.86.0 (2024-11-12)
+
+* Add conditional_sessions plugin, for using the sessions plugin for only a subset of requests (jeremyevans)
+
+* In permissions_policy plugin, add response.skip_permissions_policy! to avoid setting header (jeremyevans)
+
+* Make Roda.freeze work if already frozen when using the autoload_{hash_branches,named_routes} plugins (jeremyevans)
+
+* In content_security_policy plugin, add response.skip_content_security_policy! to avoid setting header (jeremyevans)
+
+= 3.85.0 (2024-10-11)
+
+* Avoid deprecation warning in public plugin when using Ruby 3.4.0-preview2 (jeremyevans)
+
+* Evaluate class_matcher and symbol_matcher blocks in route-block context (jeremyevans)
+
+* Allow class_matcher and symbol_matcher blocks to return non-arrays (jeremyevans)
+
+* Make class_matcher and symbol_matcher plugin be able to build on top of existing registered matchers (jeremyevans)
+
+* Make capture_erb plugin not break if String#capture is defined (jeremyevans)
+
+= 3.84.0 (2024-09-12)
+
+* Add hsts plugin for setting Strict-Transport-Security header (jeremyevans)
+
+* Remove documentation from the gem to reduce gem size by 25% (jeremyevans)
+
+= 3.83.0 (2024-08-12)
+
+* Add assume_ssl plugin for making request ssl? method always return true (jeremyevans)
+
+= 3.82.0 (2024-07-12)
+
+* Add :encodings option to public plugin to support configurable encoding order (jeremyevans)
+
+* Add :zstd option to public plugin to supplement it to serve zstd-compressed files with .zst extension (jeremyevans)
+
+* Make capture_erb plugin call integrate better with erubi/capture_block (jeremyevans)
+
+= 3.81.0 (2024-06-12)
+
+* Make assets plugin :early_hints option follow Rack 3 SPEC if using Rack 3 (jeremyevans)
+
+* Correctly parse Ruby 3.4 backtraces in exception_page plugin (jeremyevans)
+
+* Support :until and :seconds option in hmac_paths plugin, for paths valid only until a specific time (jeremyevans)
+
+= 3.80.0 (2024-05-10)
+
+* Support :namespace option in hmac_paths plugin, allowing for easy per-user/per-group HMAC paths (jeremyevans)
+
+= 3.79.0 (2024-04-12)
+
+* Do not update template mtime when there is an error reloading templates in the render plugin (jeremyevans)
+
+* Add hmac_paths plugin for preventing path enumeration and supporting access control (jeremyevans)
+
+= 3.78.0 (2024-03-13)
+
+* Add permissions_policy plugin for setting Permissions-Policy header (jeremyevans)
+
+= 3.77.0 (2024-02-12)
+
+* Support formaction/formmethod attributes in forms in route_csrf plugin (jeremyevans)
+
+= 3.76.0 (2024-01-12)
+
+* Support :filter plugin option in error_mail and error_email for filtering parameters, environment variables, and session values (jeremyevans) (#346)
+
+* Set temporary name on Ruby 3.3 in middleware plugin for middleware class created (janko) (#344)
+
+* Add break plugin, for using break inside a routing block to return from the block and keep routing (jeremyevans)
+
+= 3.75.0 (2023-12-14)
+
+* Add cookie_flags plugin, for overriding, warning, or raising for incorrect cookie flags (jeremyevans)
+
+= 3.74.0 (2023-11-13)
+
+* Add redirect_http_to_https plugin, helping to ensure future requests from the browser are submitted via HTTPS (jeremyevans)
+
+= 3.73.0 (2023-10-13)
+
+* Support :next_if_not_found option for middleware plugin (jeremyevans) (#334)
+
+* Remove dependency on base64 library from sessions and route_csrf plugin, as it will not be part of the standard library in Ruby 3.4+ (jeremyevans)
+
+= 3.72.0 (2023-09-12)
+
+* Add invalid_request_body plugin for custom handling of invalid request bodies (jeremyevans)
+
+* Warn when defining method that expects 1 argument when block requires multiple arguments when :check_arity option is set to :warn (jeremyevans)
+
+* Implement the match_hooks plugin using the match_hook_args plugin (jeremyevans)
+
+= 3.71.0 (2023-08-14)
+
+* Add match_hook_args plugin, similar to match_hooks but support matchers and block args as hook arguments (jeremyevans)
+
+= 3.70.0 (2023-07-12)
+
+* Add plain_hash_response_headers plugin, using a plain hash for response headers on Rack 3 for much better performance (jeremyevans)
+
+* Use lower case response header keys by default on Rack 3, instead of relying on Rack::Headers conversion (jeremyevans)
+
+= 3.69.0 (2023-06-13)
+
+* Allow symbol_matcher in symbol_matchers plugin to take a block to allow type conversion (jeremyevans)
+
+= 3.68.0 (2023-05-11)
+
+* Make Roda.run in multi_run plugin accept blocks to allow autoloading the apps to dispatch to (jeremyevans)
+
+= 3.67.0 (2023-04-12)
+
+* Add custom_block_results plugin for registering custom block result handlers (jeremyevans)
+
+= 3.66.0 (2023-03-13)
+
+* Support overriding exception page assets via exception_page_{css,js} instance methods (jeremyevans) (#306)
+
+* Avoid keeping reference to Roda instance that caches an inline template (jeremyevans)
+
+* Add render_coverage plugin, using tilt 2.1 features to allow for compiled templates in Ruby <3.2 (jeremyevans)
+
+= 3.65.0 (2023-02-13)
+
+* Make indifferent_params plugin work with changes in rack main branch (jeremyevans)
+
+* Add autoload_named_routes plugin for autoloading file for a named route when there is a request for that route (jeremyevans)
+
+* Make path method in path plugin accept class name string/symbol with :class_name option to register classes without forcing autoloads (jeremyevans)
+
+= 3.64.0 (2023-01-12)
+
+* Automatically expand paths for autoload_hash_branches files, so that relative paths work (jeremyevans)
+
+* Make autoload_hash_branches plugin eagerly load the branches when freezing the application (jeremyevans)
+
+* Add erb_h plugin for faster (if slightly less safe) html escaping using erb/escape (jeremyevans)
+
+= 3.63.0 (2022-12-16)
+
+* Make mailer plugin set configured content type for body part for emails with attachments when using mail 2.8+ (jeremyevans)
+
+* Add autoload_hash_branches plugin for autoloading file for a hash branch when there is a request for that branch (jeremyevans)
+
+* Add mailer plugin :terminal option to make r.mail use a terminal match when provided arguments (jeremyevans)
+
+= 3.62.0 (2022-11-14)
+
+* Add typecast_params_sized_integers plugin for converting parameters to sized integers (jeremyevans)
+
+* Add Integer_matcher_max plugin for setting maximum integer value matched by the Integer matcher (jeremyevans)
+
+* Allow class matchers in the class_matchers plugin to skip matching based on regexp match values (jeremyevans)
+
+* Fix RodaRequest#matched_path when using unescape_path plugin (jeremyevans) (#286)
+
+= 3.61.0 (2022-10-12)
+
+* Make Integer matcher limit integer segments to 100 characters by default (jeremyevans)
+
+* Limit input bytesize by default for integer, float, and date/time typecasts in typecast_params (jeremyevans)
+
+= 3.60.0 (2022-09-13)
+
+* Add link_to plugin with link_to method for creating HTML links (jeremyevans)
+
+= 3.59.0 (2022-08-12)
+
+* Add additional_render_engines plugin, for considering multiple render engines for templates (jeremyevans)
+
+* Fix typo in private method name in delete_empty_headers plugin (mculpt) (#279)
+
+= 3.58.0 (2022-07-13)
+
+* Add filter_common_logger plugin for skipping the logging of certain requests when using the common_logger plugin (jeremyevans)
+
+* Make exception_page plugin use Exception#detailed_message on Ruby 3.2+ (jeremyevans)
+
+* Make heartbeat plugin compatible with recent changes in the rack master branch (jeremyevans)
+
+= 3.57.0 (2022-06-14)
+
+* Make static_routing plugin depend on the hash_paths instead of the hash_routes plugin (jeremyevans)
+
+* Split hash_branches and hash_paths plugins from hash_routes plugin (jeremyevans)
+
+* Hex escape unprintable characters in common_logger plugin output (jeremyevans)
+
+* Add hash_branch_view_subdir plugin for automatically appending a view subdirectory on a successful hash branch (jeremyevans)
+
+= 3.56.0 (2022-05-13)
+
+* Make status_303 plugin use 303 responses for HTTP/2 and higher versions (jeremyevans)
+
+* Add RodaRequest#http_version for determining the HTTP version in use (jeremyevans)
+
+* Do not set a body for 405 responses when using the verb methods in the not_allowed plugin (jeremyevans) (#267)
+
+* Support status_handler method :keep_headers option in status_handler plugin (jeremyevans) (#267)
+
+* Make not_allowed plugin have r.root return 405 responses for non-GET requests (jeremyevans) (#266)
+
+* In Rack 3, only require the parts of rack used by Roda, instead of requiring rack itself and relying on autoload (jeremyevans)
+ 
+* Add run_require_slash plugin, for skipping application dispatch for remaining paths that would violate Rack SPEC (jeremyevans)
+
+= 3.55.0 (2022-04-12)
+
+* Allow passing blocks to the view method in the render plugin (jeremyevans) (#262)
+
+* Add :forward_response_headers middleware plugin option to use app headers as default for response (janko) (#259)
+
+= 3.54.0 (2022-03-14)
+
+* Make chunked plugin not use Transfer-Encoding: chunked by default (jeremyevans)
+
+* Make run_handler plugin close bodies for upstream 404 responses when using not_found: :pass (jeremyevans)
+
+* Drop all 1xx bodies in the drop body plugin (jeremyevans)
+
+* Do not set a Content-Length header for 205 responses on Rack <2.0.2 (jeremyevans)
+
+* Use Rack::Files instead of Rack::File if available, to avoid deprecation warnings (jeremyevans)
+
+* Work with Rack 3 SPEC, using Rack::Headers to handle lowercasing header keys on Rack 3 (jeremyevans)
+
+* Allow overriding script tag type attribute returned by assets method in assets plugin (pusewicz) (#250)
+
+* Make reloading render plugin after additional_view_directories plugin retain :allowed_paths (jeremyevans)
+
+= 3.53.0 (2022-02-14)
+
+* Make indifferent_params plugin support rack main branch (jeremyevans)
+
+* Add additional_view_directories plugin, for checking multiple view directories for templates (jeremyevans) (#229)
+
+= 3.52.0 (2022-01-14)
+
+* Fix return value of Roda.freeze when multi_route plugin is used (jeremyevans) (#240)
+
+* Use faster OpenSSL::Digest instead of Digest for assets plugin SRI support (jeremyevans)
+
+* Drop development dependency on haml (jeremyevans)
+
+* Make the path method in the path plugin handle blocks that accept keyword arguments in Ruby 3+ (adam12) (#227)
+
+* Support typecast_params :date_parse_input_handler plugin option for handling input to date parsing methods (jeremyevans)
+
+= 3.51.0 (2021-12-15)
+
+* Avoid method redefinition warning in error_handler plugin in verbose warning mode (jeremyevans)
+
+* Allow run in multi_run plugin to be called without an app to remove existing handler (jeremyevans)
+
+* Allow route in named_routes plugin to be called without a block to remove existing handler (jeremyevans)
+
+= 3.50.0 (2021-11-12)
+
+* Add capture_erb plugin for capturing ERB template blocks, instead of injecting them into the template output (jeremyevans)
+
+* Add inject_erb plugin for injecting content directly into ERB template output (jeremyevans)
+
+* Allow hash_branch and hash_path in hash_routes plugin to be called without a block to remove existing handler (jeremyevans)
+
+= 3.49.0 (2021-10-13)
+
+* Switch block_given? to defined?(yield) (jeremyevans)
+
+* Automatically optimize remaining r.is/r.get/r.post calls with a single argument (jeremyevans)
+
+= 3.48.0 (2021-09-13)
+
+* Extract named_routes plugin from multi_route plugin (jeremyevans)
+
+= 3.47.0 (2021-08-13)
+
+* Automatically optimize remaining r.on calls with a single argument (jeremyevans)
+
+= 3.46.0 (2021-07-12)
+
+* Automatically optimize r.on/r.is/r.get/r.post methods with a single string, String, Integer, or regexp argument (jeremyevans)
+
+= 3.45.0 (2021-06-14)
+
+* Make typecast_params plugin check for null bytes in strings by default, with :allow_null_bytes option for previous behavior (jeremyevans)
+
+= 3.44.0 (2021-05-12)
+
+* Add optimized_segment_matchers plugin for optimized matchers for a single String class argument (jeremyevans)
+
+* Use RFC 5987 UTF-8 and ISO-8859-1 encoded filenames when using send_file and attachment in the sinatra_helpers plugin (jeremyevans)
+
+= 3.43.1 (2021-04-13)
+
+* [SECURITY] Fix issue where loading content_security_policy plugin after default_headers plugin had no effect (jeremyevans)
+
+= 3.43.0 (2021-04-12)
+
+* Add host_authorization plugin, for checking that requests are submitted using an approved host (jeremyevans)
+
+= 3.42.0 (2021-03-12)
+
+* Make Roda.plugin support plugins using keyword arguments in Ruby 3 (jeremyevans)
+
+* Make Roda.use support middleware using keyword arguments in Ruby 3 (pat) (#207)
+
+* Support common_logger plugin :method option for specifying the method to call on the logger (fnordfish, jeremyevans) (#206)
+
+* Add recheck_precompiled_assets plugin for checking for updates to the precompiled asset metadata file (jeremyevans)
+
+* Make compile_assets class method in assets plugin use an atomic approach to writing precompiled metadata file (jeremyevans)
+
+= 3.41.0 (2021-02-17)
+
+* Improve view performance with :content option up to 3x by calling compiled template methods directly (jeremyevans)
+
+= 3.40.0 (2021-01-14)
+
+* Add freeze_template_caches! to the precompile_templates plugin, which ensures all templates are precompiled, and speeds up template access (jeremyevans)
+
+* Add precompile_views to the precompile_templates plugin, which precompiles the optimized render methods (jeremyevans)
+
+* Have RodaCache#freeze return the frozen internal hash (which no longer needs a mutex for thread-safety) (jeremyevans)
+
+* Speed up the view method in the render plugin even more when freezing the application (jeremyevans)
+
+* Speed up the view method in the render plugin when called with a single argument (jeremyevans)
+
+= 3.39.0 (2020-12-15)
+
+* Speed up relative_path plugin if relative_path or relative_prefix is called more than once (jeremyevans)
+
+* Avoid method redefinition warnings in verbose warning mode (jeremyevans)
+
+* Make typecast_params.convert! handle explicit nil values the same as missing values (jeremyevans)
+
+= 3.38.0 (2020-11-16)
+
+* Make error_email and error_mail plugins rescue invalid parameter errors when preparing the email body (jeremyevans)
+
+= 3.37.0 (2020-10-16)
+
+* Add custom_matchers plugin, for supporting arbitrary objects as matchers (jeremyevans)
+
+= 3.36.0 (2020-09-14)
+
+* Add multi_public plugin, for serving files from multiple public directories (jeremyevans)
+
+* Support report-to directive in the content_security_policy plugin (jeremyevans)
+
+* Add Vary response header when using type_routing plugin with Accept request header to prevent caching issues (jeremyevans)
+
+= 3.35.0 (2020-08-14)
+
+* Add r plugin for r method for accessing request, useful when r local variable is not in scope (jeremyevans)
+
+* Warn when loading a plugin with arguments or a block if the plugin does not accept arguments or block (jeremyevans)
+
+= 3.34.0 (2020-07-14)
+
+* Remove unnecessary conditionals (jeremyevans)
+
+* Allow loading the match_affix plugin with a single argument (jeremyevans)
+
+* Do not include pre/post context sections if empty in the exception_page plugin (jeremyevans)
+
+= 3.33.0 (2020-06-16)
+
+* Add :brotli option to public plugin to supplement it to serve brotli-compressed files like :gzip does for gzipped files (hmdne) (#194)
+
+* Add url method to path plugin, similar to path but returning the entire URL (jeremyevans)
+
+= 3.32.0 (2020-05-15)
+
+* Make :dependencies option in assets plugin work correctly with render plugin template caching (jeremyevans) (#191)
+
+* Support render method :dependencies option for specifying which files to check for modification (jgarth, jeremyevans) (#192)
+
+* Add each_partial to the partials plugin for rendering a partial for each element in an enumerable (jeremyevans)
+
+* Make render_each in render_each plugin handle template names with directories and extensions (jeremyevans)
+
+= 3.31.0 (2020-04-15)
+
+* Add :relative option to path method in path plugin, for generating a method returning relative paths (jeremyevans)
+
+* Add relative_path plugin, for turning absolute paths to paths relative to the current request (jeremyevans)
+
+= 3.30.0 (2020-03-13)
+
+* Support :relative_paths assets plugin option to use relative paths for the assets (jeremyevans)
+
+* Make run_append_slash and run_handler plugins work when used together (janko) (#185)
+
+* Make :header matcher in header_matchers plugin work for Content-Type and Content-Length (jeremyevans) (#184)
+
+= 3.29.0 (2020-02-14)
+
+* Remove specs and old release notes from the gem to reduce gem size by over 35% (jeremyevans)
+
+* Raise RodaError if trying to load a plugin that is not a module (jeremyevans)
+
+* Include SCRIPT_NAME when logging in common logger plugin (jeremyevans)
+
+* Handle invalid POST data when using the exception_page plugin (jeremyevans)
+
+= 3.28.0 (2020-01-15)
+
+* Add session_created_at and session_updated_at methods to the sessions plugin (jeremyevans)
+
+* Make upgrading from rack session cookie in sessions plugin work with rack 2.0.8 (jeremyevans)
+
+* Make json_parser parse request body as json even if request body has already been read (jeremyevans)
+
+= 3.27.0 (2019-12-13)
+
+* Allow json_parser return correct result for invalid JSON if the params_capturing plugin is used (jeremyevans) (#180)
+
+* Add multibyte_string_matcher plugin for matching multibyte characters (jeremyevans)
+
+* Split roda.rb into separate files (janko) (#177)
+
+= 3.26.0 (2019-11-18)
+
+* Combine multiple asset files with a newline when compiling them, avoiding corner cases with comments (ameuret) (#176)
+
+* Add asychronous streaming support to the streaming plugin (janko) (#175)
+
+= 3.25.0 (2019-10-15)
+
+* Support change in tilt 2.0.10 private API to continue to support compiled templates, with up to 33% performance improvement (jeremyevans)
+
+* Improve render performance with :locals option up to 75% by calling compiled template methods directly (jeremyevans)
+
+= 3.24.0 (2019-09-13)
+
+* Fix Proc.new warning in module_include plugin on Ruby 2.7+ (jeremyevans)
+
+* Improve render_each performance by calling compiled template methods directly (jeremyevans)
+
+= 3.23.0 (2019-08-13)
+
+* Make roda/session_middleware work if type_routing plugin is loaded into Roda itself (jeremyevans) (#169)
+
+* Handle requests with nothing before extension in the path in the type_routing plugin (jeremyevans) (#168)
+
+* Always show line number in exception_page output in exception_page plugin (jeremyevans)
+
+* Improve render/view performance up to 2x in development mode in the default case by calling compiled template methods directly (jeremyevans)
+
+= 3.22.0 (2019-07-12)
+
+* Improve render performance up to 4x in the default case by calling compiled template methods directly (jeremyevans)
+
+= 3.21.0 (2019-06-14)
+
+* Cache compiled templates in development mode, until the template files are modified (jeremyevans)
+
+= 3.20.0 (2019-05-16)
+
+* Set Content-Length header to 0 for empty 205 responses (jeremyevans)
+
+= 3.19.0 (2019-04-12)
+
+* Allow assets plugin :timestamp_paths option to be a string to specify a custom separator (jeremyevans)
+
+* Fix handling for blocks with arity > 1 where expected arity is 1 (jeremyevans)
+
+* Improve performance for handling blocks with arity 0 where expected arity is 1 by avoiding instance_exec (jeremyevans)
+
+* Improve terminal maching by around 4x (jeremyevans)
+
+* Improve symbol matching by 10-20% (jeremyevans)
+
+* Improve string matching by 10-20% (jeremyevans)
+
+* Automatically load the direct_call plugin when freezing if no middleware is used for better performance (jeremyevans)
+
+* Delay building rack app until Roda.app is called (jeremyevans)
+
+* Add hash_routes plugin for O(1) route dispatching at any level in the routing tree (jeremyevans)
+
+* Add support for per-cookie cipher secrets in the sessions plugin, and enable them by default (jeremyevans)
+
+* Add match_hook plugin for calling hooks when there is a successful match block (adam12) (#164)
+
+= 3.18.0 (2019-03-15)
+
+* Add direct_call plugin for making Roda.call skip middleware, allowing more optimization when dispatching routes (jeremyevans)
+
+* Improve performance of default_headers plugin by directly defining set_default_headers (jeremyevans)
+
+* Improve performance when freezing app if certain methods have not been overridden (jeremyevans)
+
+* Support :check_arity and :check_dynamic_arity app options for whether/how to check arity for blocks used to define methods (jeremyevans)
+
+* Improve performance of the status_handler plugin by using methods instead of instance_exec (jeremyevans)
+
+* Remove r.static_route method from the static_routing plugin (jeremyevans)
+
+* Improve performance of the static_routing plugin by using methods instead of instance_exec (jeremyevans)
+
+* Add support for the route_block_args plugin to the route_csrf plugin (jeremyevans)
+
+* Improve performance of the route_csrf plugin by using a method instead of instance_exec (jeremyevans)
+
+* Improve performance of the route_block_args plugin by using a method instead of instance_exec (jeremyevans)
+
+* Improve performance of the path plugin by using methods instead of instance_exec (jeremyevans)
+
+* Improve performance of the named_templates plugin by using methods instead of instance_exec (jeremyevans)
+
+* Improve performance of the multi_route plugin by using methods instead of instance_exec (jeremyevans)
+
+* Improve performance of the hooks plugin by using methods instead of instance_exec (jeremyevans)
+
+* Improve performance of the mail_processor plugin by using methods instead of instance_exec (jeremyevans)
+
+* Improve performance of the default_status plugin by directly defining the default_status method (jeremyevans)
+
+* Improve performance of class_level_routing plugin using methods instead of instance_exec (jeremyevans)
+
+* Do not have route_block_args plugin affect class_level_routes plugin (jeremyevans)
+
+* Integrate internal after hook with error_handler plugin (jeremyevans)
+
+* Improve performance of internal before and after hooks (jeremyevans)
+
+* Improve performance by using method instead of instance_exec for main route block (jeremyevans)
+
+* Add Roda.define_roda_method for defining instance methods instead of using instance_exec (jeremyevans)
+
+* Include cookie_options when clearing the cookie (#162, #163) (eiko, jeremyevans)
+
+= 3.17.0 (2019-02-15)
+
+* Improve performance in the common case for RodaResponse#finish (jeremyevans)
+
+* Support before hooks in the hooks plugin in the mailer and mail_processor plugins (jeremyevans)
+
+* Allow set_layout_opts in view_options plugin to override layout if render plugin :layout option is given (jeremyevans)
+
+* Add route_block_args plugin to control which arguments are yielded to the route block (jeremyevans, chrisfrank) (#159)
+
+= 3.16.0 (2019-01-18)
+
+* Add mail_processor plugin for processing mail using a routing tree (jeremyevans)
+
+= 3.15.0 (2018-12-14)
+
+* Support render plugin :escape option to be a string or array of strings and only add :escape option for those template engines (jeremyevans) (#158)
+
+* Add :skip_missing option to convert!/convert_each! in the typecast_params plugin to support not storing keys not present in params (jeremyevans)
+
+= 3.14.1 (2018-11-29)
+
+* SECURITY: content_for plugin no longer post-processes block result with template engine (jeremyevans)
+
+= 3.14.0 (2018-11-16)
+
+* Add :raise option to convert!/convert_each! in the typecast_params plugin to support not raising for missing keys (celsworth) (#153)
+
+* Do not persist convert!/convert_each! :symbolize setting in the typecast_params plugin (jeremyevans)
+
+= 3.13.0 (2018-10-12)
+
+* Make Stream#write in streaming plugin return number of bytes written instead of self, so it works with IO.copy_stream (jeremyevans)
+
+* Add exception_page plugin for showing a page with debugging information for a given exception (jeremyevans)
+
+* Make common_logger plugin handle raised errors (jeremyevans)
+
+= 3.12.0 (2018-09-14)
+
+* Add common_logger plugin for common log support (jeremyevans)
+
+= 3.11.0 (2018-08-15)
+
+* Disable default compression of sessions over 128 bytes in the sessions plugin (jeremyevans)
+
+* Log but otherwise ignore exceptions raised by after processing of error handler response (jeremyevans)
+
+* Modify internal before/after processing to avoid plugin load order issues (jeremyevans)
+
+= 3.10.0 (2018-07-18)
+
+* Remove flash key from session if new flash is empty when rotating flash (jeremyevans)
+
+* Speed up RodaRequest initialization by avoiding 1-2 method calls (jeremyevans)
+
+* Add roda/session_middleware (RodaSessionMiddleware), usable as a middleware by any Rack app to use Roda's session support (jeremyevans)
+
+* Add sessions plugin for more secure (encrypted+signed) sessions (jeremyevans)
+
+* Support :json_parser and :json_serializer application options as default implementations for parsing/serializing JSON (jeremyevans)
+
+* Add :handle_result option to middleware plugin for modifying rack result before returning it (jeremyevans)
+
+* Make the flash plugin work correctly when sessions are serialized with JSON (jeremyevans)
+
+* Make Integer in typecast_params handle Numeric input, and require that Numeric input not have fractional parts (jeremyevans) (#146)
+
+= 3.9.0 (2018-06-11)
+
+* Add route_csrf plugin for CSRF protection, offering more control, better security, and request-specific tokens compared to rack_csrf (jeremyevans)
+
+= 3.8.0 (2018-05-17)
+
+* Accept convert_each! :keys option that is Proc or Method in typecast_params plugin (jeremyevans)
+
+* Make convert_each! in typecast_params plugin handle hashes with '0'..'N' keys without :keys option (jeremyevans)
+
+= 3.7.0 (2018-04-20)
+
+* Make response_request plugin work with error_handler and class_level_routing plugins (jeremyevans)
+
+* Add content_security_policy plugin for setting an appropriate Content-Security-Policy header (jeremyevans)
+
+= 3.6.0 (2018-03-26)
+
+* Add :wrap option to json_parser plugin, for whether/how to wrap the uploaded JSON object (jeremyevans) (#142)
+
+* Add :early_hints option to the assets plugin, for supporting sending early hints for calls to assets (jeremyevans)
+
+* Add early_hints plugin for sending 103 Early Hint responses, currently only working on puma (jeremyevans)
+
+= 3.5.0 (2018-02-14)
+
+* Add request_aref plugin for configuring behavior of request [] and []= methods (jeremyevans)
+
+* Make public plugin not add Content-Type header when serving 304 response for gzipped file (jeremyevans)
+
+* Make content_for call with block convert block result to string before passing to tilt (jeremyevans) (#135)
+
+= 3.4.0 (2018-01-12)
+
+* Add middleware_stack plugin for removing middleware and inserting middleware before the end of the stack (jeremyevans)
+
+* Make head plugin handle closing existing response bodies if the body responds to close (Eric Wong)
+
+= 3.3.0 (2017-12-14)
+
+* Add typecast_params plugin for converting param values to explicit types (jeremyevans)
+
+= 3.2.0 (2017-11-16)
+
+* Use microseconds in assets plugin :timestamp_paths timestamps (jeremyevans)
+
+* Add timestamp_public plugin for serving static files with paths that change based on modify timestamp (jeremyevans)
+
+= 3.1.0 (2017-10-13)
+
+* Make set_layout_locals and set_view_locals in branch_locals plugin work when the other is not called (jeremyevans)
+
+* Add :timestamp_paths option to assets plugin to include timestamps in paths in non-compiled mode (jeremyevans)
+
+* Handle ExecJS::RuntimeUnavailable when testing for javascript compression support using uglifier (jeremyevans)
+
+* Remove deprecated Roda.thread_safe_cache and RodaRequest#placeholder_string_matcher? methods (jeremyevans)
+
+= 3.0.0 (2017-09-15)
+
+* Make defined symbol_matcher and hash_matcher match methods private (jeremyevans)
+
+* Use public_send instead of send unless calling private methods is expected (jeremyevans)
+
+* Compute multi_run regexp when freezing app to avoid thread safety issues at runtime (jeremyevans)
+
+* Remove deprecated support for using undefined multi_route namespaces when routing (jeremyevans)
+
+* Make it possible to reset :include_request options to false for json and json_parser plugins (jeremyevans)
+
+* Deprecate RodaRequest#placeholder_string_matcher? private method (jeremyevans)
+
+* Deprecate Roda.thread_safe_cache, use RodaCache directly (jeremyevans)
+
+* Make using an app as middleware always create a subclass of the app (jeremyevans)
+
+* Enable SHA256 subresource integrity by default in assets plugin (jeremyevans)
+
+* Make subclassing a roda app always inherit the render cache (jeremyevans)
+
+* Make :cache=>nil render plugin option still allow caching via :cache render method option (jeremyevans)
+
+* Make content_for plugin append to existing content by default (jeremyevans)
+
+* Make :host matcher in the header_matchers plugin always yield captures if given a regexp (jeremyevans)
+
+* Make :header matcher in the header_matchers plugin now always prefix header with HTTP_ (jeremyevans)
+
+* Remove deprecated support for locals handling at the plugin level in the render plugin (jeremyevans)
+
+* Remove deprecated support for handling locals in the view_options plugin (jeremyevans)
+
+* Remove deprecated support for :ext option in render plugin (jeremyevans)
+
+* Remove deprecated view_subdirs alias for view_options plugin (jeremyevans)
+
+* Remove deprecated support for EventMachine and Stream#callback method in the streaming plugin (jeremyevans)
+
+* Drop support for ruby 1.8.7 (jeremyevans)
+
+* Make using an unsupported matcher raise error by default (jeremyevans)
+
+* Make having a match/route block return an unsupported value raise error by default (jeremyevans)
+
+* Remove deprecated :format, :opt, and :optd symbol matchers in symbol_matchers plugin (jeremyevans)
+
+* Remove deprecated support for placeholders in string matchers (jeremyevans)
+
+* Remove deprecated constants and plugins (jeremyevans)
+
+=== Older
+
+See doc/CHANGELOG.old

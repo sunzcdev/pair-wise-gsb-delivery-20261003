@@ -1,0 +1,15 @@
+= Improvements
+
+* The common_logger plugin now includes the SCRIPT_NAME when
+  logging, for greater compatibility with typical web server
+  logs.
+
+* The exception_page plugin now handles invalid POST data.
+  Previously, invalid POST data would cause the exception page
+  display to raise an exception.
+
+* An error is now raised if trying to load a plugin that is not a
+  module or a recognized plugin symbol.
+
+* Specs and older release notes are no longer shipped in the
+  gem, reducing gem size by over 35%.

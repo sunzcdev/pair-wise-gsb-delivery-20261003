@@ -1,0 +1,229 @@
+= New Features
+
+* A hash_routes plugin has been added for O(1) route dispatching at
+  any level of the routing tree.  By default, Roda uses a linear
+  search of possible branches at each level of the routing tree,
+  which results in roughly O(log(n)) routing behavior in most
+  applications (where n is the total number of routes in the
+  application).
+  
+  Assume you have the following routing tree:
+
+    route do |r|
+      r.on "a" do
+        # ...
+      end
+
+      r.on "b" do
+        # ...
+      end
+
+      r.is "c" do
+        # ...
+      end
+
+      # ...
+    end
+
+  With this routing tree, a request for /c will first check /a and
+  /b.  This is not normally a performance issue, but if you have a
+  large number of routes at a particular level, it can be.
+
+  The hash_routes plugin allows you to convert this routing tree to:
+
+    plugin :hash_routes
+
+    hash_routes do
+      on "a" do |r|
+        # ...
+      end
+
+      on "b" do |r|
+        # ...
+      end
+
+      is "c" do |r|
+        # ...
+      end
+
+      # ...
+    end
+
+    route do |r|
+      r.hash_routes
+    end
+
+  This routing tree looks similar to Roda's standard routing tree, and
+  will have the same behavior as the previous example, but dispatching
+  to the routes inside the hash_routes block by the r.hash_routes
+  method will be an O(1) operation, instead of a linear search.  This
+  can significantly improve performance in cases where you have a large
+  number of branches at any point in the routing tree.
+
+  In order to support O(1) route dispatching at any level of the
+  tree, the hash_routes plugin supports namespaces.  You can use this
+  namespace support to keep the primary advantage of Roda when using
+  the hash_routes plugin, which is the ability to operate on a request
+  at any point during routing.  Assume you have this routing tree:
+
+    hash_routes :root do
+      on "foo" do |r|
+        r.on Integer do |foo_id|
+          next unless @foo = Foo[foo_id]
+          r.hash_routes(:foo)
+        end
+      end
+
+      on "bar" do |r|
+        r.on Integer do |bar_id|
+          next unless @bar = Bar[bar_id]
+          r.hash_routes(:bar)
+        end
+      end
+
+      # ...
+    end
+
+    hash_routes :foo do
+      get "show" do
+        @page_title = @foo.name
+        view('foo/show')
+      end
+
+      # ...
+    end
+
+    hash_routes :bar do
+      post "edit" do
+        @bar.update(:name=>request.params['name'])
+        r.redirect "/"
+      end
+
+      # ...
+    end
+
+    route do |r|
+      r.hash_routes(:root)
+    end
+
+  With this routing tree, a GET /foo/123/show request will first get
+  dispatched to the on "foo" block in the :root namespace.  That will
+  extract the 123 segment from the path, and use it to find the Foo
+  object with id 123 and set that to the instance variable @foo.
+  If there is no matching foo, the rest of the block will be skipped,
+  which will result in a 404 response.  If there is a matching foo,
+  after setting the instance variable, it will dispatch to routes in
+  the :foo namespace, one of which is show, which will be able to use
+  the @foo variable, both in the route and in the view.
+  
+  Similarly, a POST /bar/321/edit request would dispatch to the on
+  "bar" block in the :root namespace, will look up the matching bar,
+  then will dispatch to the edit route in the :bar namespace.
+
+  The hash_routes plugin can be used as a faster version of the
+  multi_route plugin's r.multi_route method.  It can also be used as
+  a faster replacement for the multi_view plugin.
+  
+  Please see the hash_routes plugin documentation for additional
+  methods and configuration styles supported by the plugin.
+
+* A match_hook plugin has been added, which is called for each
+  successful match, before yielding to the match block.  For example,
+  with the following routing tree:
+
+    plugin :match_hook
+
+    match_hook do
+      puts "#{r.matched_path}|#{r.remaining_path}"
+    end
+
+    route do |r|
+      r.on "a" do
+        r.is "b" do
+          r.get do
+          end
+
+          r.post do
+          end
+        end
+      end
+    end
+
+  A GET request for /a/b would call the match hook three times, and
+  output the following:
+
+    /a|/b # When the r.on block matches
+    /a/b| # When the r.is block matches
+    /a/b| # When the r.get block matches
+
+  A GET request for /a/c would call the match hook once, and output
+  the following:
+
+    /a|/b # When the r.on block matches
+
+  This plugin can be used to make debugging easier, as well as for
+  metrics.
+
+= Other Improvements
+
+* Per-cookie cipher secrets are now supported and used automatically
+  by default in the sessions plugin.  This can prevent issues where
+  the cipher secret can be leaked if the random initialization vector
+  turns out not to be so random and ends up being reused.  This
+  makes the session cookies slightly larger and about 10-20% slower.
+
+  Note that because of the way the sessions plugin is designed,
+  even if the cipher secret was leaked and you are not using
+  per-cookie cipher secrets, it would not allow an attacker to
+  forge a session, it would only allow them to read the contents of
+  an existing session.
+
+  If you are currently using the sessions plugin, and performing
+  rolling restarts, you should temporarily disable per-cookie session
+  secrets until all processes have been restarted and are able to
+  support per-cookie session secrets.  You can do so by setting the
+  :per_cookie_cipher_secret sessions plugin option to false
+  temporarily until all processes have restarted and are running Roda
+  3.19.0+.
+
+* When passing route blocks to Roda that have 0 arity instead of the
+  expected arity of 1, emulate an arity of 1 using an approach that is
+  about 2.75-8x faster.  This emulation is still about 20% slower than
+  using the expected arity.
+
+* Fix emulation of route blocks that have >1 arity but where the
+  expected arity is 1.  Such blocks were not handled correctly in
+  Roda 3.18.0.
+
+* String matching performance has been improved by 10-20%.
+
+* Symbol and String class matching performance has improved by 10-20%.
+
+* Terminal matching performance has improved by about 4x.
+
+* Roda will now automatically load the direct_call plugin when
+  freezing the application if there is no middleware used and the
+  application has not been subclassed, for improved performance.
+
+* Roda no longer builds the rack application until the app class
+  method is called.  This can fix O(n^2) issues when building
+  applications with a lot of middleware.  One consequence of
+  this is that a Roda.route block is no longer required. If
+  Roda.route is not called, then the default routing tree will
+  return a 404 response for all requests.
+
+  The delay_build plugin used to support delaying building the rack
+  application until a build! method is called.  Now that Roda delays
+  building the rack application until the app method is called, there
+  is no reason to use this plugin, and it is now a no-op.
+
+* The assets plugin :timestamp_paths option now supports a string
+  value to use a custom separator. A slash separator is still used
+  by default.
+
+= Backwards Compatibility
+
+* The static_routing plugin internals have changed, as the
+  static_routing is now implemented via the hash_routes plugin.  If
+  you were depending on the internals, you will need to update your
+  code.

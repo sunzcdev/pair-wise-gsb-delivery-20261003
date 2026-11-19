@@ -1,0 +1,52 @@
+= New Features
+
+* Fixed locals are now supported in templates when using Tilt 2.6+.
+  Without fixed locals, templates that support local variables can
+  be called with any locals, and a separate template method is
+  compiled for each combination of local variable names.  This
+  causes multiple issues:
+
+  * It is inefficient, especially for large templates that are called with
+    many combinations of locals.
+  * It hides issues if unused local variable names are passed to the template
+  * It does not support default values for local variables
+  * It does not support required local variables
+  * It does not support cases where you want to pass values via a keyword splat
+  * It does not support named blocks
+    
+  Fixed locals solve these problems by having the compiled methods
+  use keyword arguments instead of a single positional hash
+  argument.  This allows you to use required keyword arguments,
+  provide default values for optional keyword arguments, and use keyword
+  splats and named blocks. See https://github.com/jeremyevans/tilt#fixed-locals
+  for details.
+
+  You can enable embedded fixed locals in templates using the `:extract_fixed_locals`
+  template option.  The recommended template options when creating new Roda
+  applications that use the render plugin are now:
+
+    plugin :render, template_opts: {
+        scope_class: self,          # Always uses current class as scope class for compiled templates
+        freeze: true,               # Freeze string literals in templates
+        extract_fixed_locals: true, # Support embedded fixed locals in templates
+        default_fixed_locals: '()', # Default to templates not supporting local variables
+        escape: true,               # For Erubi templates, escapes <%= by default (use <%== for unescaped
+        chain_appends: true,        # For Erubi templates, improves performance
+        skip_compiled_encoding_detection: true, # Unless you need encodings explicitly specified
+      }
+
+= Other Improvements
+
+* The json_parser plugin now handles the case where
+  Rack::Request#POST has already been called on the env hash,
+  when using Rack 3+.
+
+* The default_headers plugin now handles a mixed/upper case
+  Content-Type header, when using Rack 3+ (which requires
+  lower case headers).
+
+* The render_coverage plugin now handles the case where both
+  :scope_class template option and fixed locals are used.
+
+* Roda now avoids warnings when the -W:strict_unused_block Ruby
+  option is used.

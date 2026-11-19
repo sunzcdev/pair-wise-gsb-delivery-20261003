@@ -1,0 +1,19 @@
+= New Features
+
+* A common_logger plugin has been added for common log support. This
+  offers about 30% better performance than Rack::CommonLogger, with
+  the following differences:
+
+  * When timing requests, doesn't consider middleware or proxy the
+    body, so timing information is just the time that Roda takes
+    to process the request.
+  * Only looks for "Content-Length" as a header, not different
+    capitalizations (Roda only uses "Content-Length" internally).
+  * Logs to $stderr instead of rack.errors in request environment
+    if a logger object is not explicitly passed.
+
+= Other Improvements
+
+* Internal before/after hook methods now use more descriptive names
+  for easier debugging, with a naming format designed to not
+  conflict with hook methods in external plugins.

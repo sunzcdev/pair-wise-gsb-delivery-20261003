@@ -1,0 +1,16 @@
+= New Features
+
+* A filter_common_logger plugin has been added, allowing you to skip
+  logging of certain requests in the common_logger plugin. This
+  allows you to only log requests for certain paths, or only log
+  requests for certain types of responses.
+
+= Other Improvements
+
+* The heartbeat plugin is now compatible with recent changes in the
+  rack master branch (what will be rack 3).
+
+* The exception_page plugin will now use Exception#detailed_message
+  on Ruby 3.2+, preserving the did_you_mean and error_highlight
+  information.  Additionally, the display of exception messages
+  has been improved.

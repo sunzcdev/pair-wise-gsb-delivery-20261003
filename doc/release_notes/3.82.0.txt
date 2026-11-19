@@ -1,0 +1,43 @@
+= New Features
+
+* A :zstd option has been added to the public and multi_public
+  plugins to support serving zstd-compressed files with a .zst
+  extension. This option is similar to the existing :gzip and
+  :brotli plugin options.  Chrome started supporting zstd encoding
+  in March.
+
+* An :encodings option has been added to the public and multi_public
+  plugins, for more control over how encodings are handled.  This
+  allows for changing the order in which encodings are attempted, the
+  use of custom encodings, and the use of different file extensions
+  for encodings.  Example:
+
+    plugin :public, encodings: {'zstd'=>'.zst', 'deflate'=>'.deflate'}
+
+  If the :encodings option is not provided, the :zstd, :brotli, and
+  :gzip options are used to build an equivalent :encodings option.
+
+= Other Improvements
+
+* The capture_erb plugin now integrates better when using
+  erubi/capture_block for <%= method do %> support in ERB templates,
+  using the native capture method provided by the buffer object.
+
+* Encoding handling has been more optimized in the public plugin.
+  Regexps for the encodings are precomputed, avoiding a regexp
+  allocation per request per encoding attempted. On Ruby 2.4+
+  Regexp#match? is used for better performance.  If the
+  Accept-Encoding header is not present, no encoding matching
+  is attemped.
+
+= Backwards Compatibility
+
+* The private public_serve_compressed request method in the public
+  plugin now assumes it is called after the encoding is already
+  valid. If you are calling this method in your own code, you now
+  need to perform checks to make sure the client can accept the
+  encoding before calling this method.
+
+* The :public_gzip and :public_brotli application options are no
+  longer set by the public plugin.  The :public_encodings option
+  is now set.

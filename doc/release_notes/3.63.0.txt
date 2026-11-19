@@ -1,0 +1,36 @@
+= New Features
+
+* An autoload_hash_branches plugin has been added for autoloading
+  route files for each hash branch, instead of requiring the route
+  files be loaded up front.  For example, to automatically load a
+  route file for a hash branch on the first request to that branch:
+
+    plugin :autoload_hash_branches
+    autoload_hash_branch('branch_name', '/path/to/file')
+    autoload_hash_branch('namespace', 'branch_name', '/path/to/file')
+
+  The route file loaded should define the expected hash branch.
+
+  It is common to have route files stored in a directory, with the
+  file name matching the branch name.  In that case, you can set
+  autoloading for all route files in a given directory:
+
+    plugin :autoload_hash_branches
+    autoload_hash_branch_dir('/path/to/dir')
+    autoload_hash_branch_dir('namespace', '/path/to/dir')
+
+  Note that autoloading hash branches does not work if the application
+  is frozen.  This plugin should only be used in development mode for
+  faster startup, or when running tests on a subset of the application
+  in order to avoid loading parts of the application unrelated to what
+  is being tested.
+
+* The mailer plugin now supports a :terminal plugin option to make
+  the r.mail method force a terminal match, similar to how r.get
+  and other HTTP verb methods work in standard Roda.  This behavior
+  will become the default in Roda 4.
+
+= Other Improvements
+
+* The mailer plugin now correctly sets the content_type of the body
+  for emails with attachments when using mail 2.8.0+.

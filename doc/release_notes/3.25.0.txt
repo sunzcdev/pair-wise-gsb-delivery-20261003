@@ -1,0 +1,12 @@
+= Improvements
+
+* The new tilt 2.0.10 private API is now supported when using
+  compiled template methods, with up to a 33% performance increase.
+  The older tilt private API (back to tilt 1.2) is still supported.
+
+* The performance of the render and view methods in the render plugin
+  when called with only the :locals option are now about 75% faster
+  by calling compiled template methods directly.
+
+* Keyword argument separation issues are now handled on Ruby 2.7+
+  when defining methods with blocks that accept keyword arguments.

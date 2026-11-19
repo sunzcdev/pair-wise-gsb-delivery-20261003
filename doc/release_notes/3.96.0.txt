@@ -1,0 +1,24 @@
+= New Features
+
+* A redirect_path plugin has been added, which integrates the path
+  plugin with r.redirect:
+
+    Foo = Struct.new(:id)
+    foo = Foo.new(1)
+
+    plugin :redirect_path
+    path Foo do |foo|
+      "/foo/#{foo.id}"
+    end
+
+    route do |r|
+      r.get "example" do
+        # redirects to /foo/1
+        r.redirect(foo)
+      end
+    
+      r.get "suffix-example" do
+        # redirects to /foo/1/status
+        r.redirect(foo, "/status")
+      end
+    end

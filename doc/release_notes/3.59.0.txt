@@ -1,0 +1,17 @@
+= New Features
+
+* An additional_render_engines plugin has been added, for considering
+  multiple render engines for templates. If the template path does not
+  exist for the default render engine, then each additional render
+  engine will be checked, returning the first path that exists:
+
+    plugin :additional_render_engines, ['haml', 'str']
+
+  This is similar to the additional_view_directories plugin added in
+  3.53.0.  Both plugins can be used if you want to consider multiple
+  view directories and multiple render engines.
+
+= Other Improvements
+
+* A typo in a private method name in the delete_empty_headers plugin
+  has been fixed.

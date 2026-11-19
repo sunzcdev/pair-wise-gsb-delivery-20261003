@@ -1,0 +1,41 @@
+= New Features
+
+* An Integer_matcher_max plugin has been added for setting the
+  maximum value matched by the Integer matcher (the minimum is
+  always 0, since the Integer matcher does not match negative
+  integers).  The default maximum value when using the plugin
+  is 2**63-1, the maximum value for a signed 64-bit integer.
+  You can specify a different maximum value by passing an argument
+  when loading the plugin.
+
+* A typecast_params_sized_integers plugin has been added for
+  converting parameters to integers only if the integer is within a
+  specific size.  By default, the plugin supports 8-bit, 16-bit,
+  32-bit, and 64-bit signed and unsigned integer types, with the
+  following typecast_params methods added by the plugin:
+
+    * int8, uint8, pos_int8, pos_uint8, Integer8, Integeru8
+    * int16, uint16, pos_int16, pos_uint16, Integer16, Integeru16
+    * int32, uint32, pos_int32, pos_uint32, Integer32, Integeru32
+    * int64, uint64, pos_int64, pos_uint64, Integer64, Integeru64
+
+  You can override what sizes are added by default by using the
+  :sizes option.  You can also specify a :default_size option,
+  in which case the default int, pos_int, and Integer conversions
+  will use the given size.  So if you want to change the default
+  typecast_params integer conversion behavior to only support
+  integer values that can fit in 64-bit signed integers, you can
+  use:
+
+    plugin :typecast_params_sized_integers, sizes: [64],
+      default_size: 64
+
+= Other Improvements
+
+* The block passed to the class_matcher method in the class_matchers
+  plugin can now return nil/false to signal that it should not match.
+  This is useful when the regexp argument provided matches segments
+  not valid for the class.
+
+* RodaRequest#matched_path now works correctly when using the
+  unescape_path plugin.

@@ -1,0 +1,12 @@
+= New Features
+
+* An r plugin has been added.  This plugin adds an r method for the
+  request, useful for allowing the use of r.halt and r.redirect even
+  in methods where the r local variable is not in scope.
+
+= Other Improvements
+
+* Attempting to load a plugin with an argument or block when the plugin
+  does not accept arguments or a block now warns.  This is because a
+  future update to support a block or an optional argument could break
+  the call.

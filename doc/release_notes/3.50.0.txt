@@ -1,0 +1,21 @@
+= New Features
+
+* An inject_erb plugin has been added, adding an inject_erb method
+  that allows for injecting content directly into the template output
+  for the template currently being rendered.  This allows you to more
+  easily wrap blocks in templates, by calling methods that accept
+  template blocks and injecting content before and after the block.
+
+* A capture_erb plugin has been added, adding a capture_erb method
+  for capturing a template block in an erb template and returning
+  the content appended during the block as a string, instead of
+  having the content of the template block be included directly into
+  the template output.  This can be combined with the inject_erb
+  plugin to inject modified versions of captured blocks into template
+  output.
+
+* The hash_routes plugin now allows calling hash_branch and hash_path
+  without a block in order to remove the existing route handler. This
+  is designed to be used with code reloading libraries, so that if a
+  route file is deleted, the related hash branches/paths are also
+  removed, without having to reload all route files.

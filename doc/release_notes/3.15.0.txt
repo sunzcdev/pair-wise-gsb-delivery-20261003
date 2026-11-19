@@ -1,0 +1,21 @@
+= New Features
+
+* The render plugin :escape option value can now be a string or an
+  array of strings, and then the plugin will will only add the
+  :escape template option for those specific template engines given.
+  By default, the :escape plugin option adds the :escape template
+  option for all engines, which breaks the usage with some engines
+  (such as the rcsv engine).
+
+* The convert! and convert_each! methods in the typecast_params plugin
+  now support a :skip_missing option to support not storing missing
+  parameters:
+
+    typecast_params.convert! do |tp|
+      tp.int('missing')
+    end
+    # => {'missing'=>nil}
+    typecast_params.convert!(skip_missing: false) do |tp|
+      tp.int('missing')
+    end
+    # => {}

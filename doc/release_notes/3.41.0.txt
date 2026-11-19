@@ -1,0 +1,9 @@
+= Improvements
+
+* The performance of the render plugin's view method when passed the
+  :content option and no other options or arguments has been improved
+  by about 3x, by calling compiled template methods directly.
+
+* The compiled template method for the layout is cleared when the
+  render plugin is loaded again, which can fix issues when it is
+  loaded with different options that affect the layout.

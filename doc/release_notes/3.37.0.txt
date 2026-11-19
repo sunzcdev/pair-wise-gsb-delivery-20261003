@@ -1,0 +1,42 @@
+= New Features
+
+* A custom_matchers plugin has been added, which allows using
+  arbitrary objects as matchers, as long as the matcher has been
+  registered.  You can register matchers using the custom_matcher
+  class method, which takes the class of the matcher, and a block
+  which is yielded the matcher object.  The block should return
+  nil or false if the matcher doesn't match, and any other value
+  if the matcher does match.  Example:
+
+    plugin :custom_matchers
+    method_segment = Struct.new(:request_method, :next_segment)
+    custom_matcher(method_segment) do |matcher|
+      # self is the request instance ("r" yielded in the route block below)
+      if matcher.request_method == self.request_method
+        match(matcher.next_segment)
+      end
+    end
+ 
+    get_foo = method_segment.new('GET', 'foo')
+    post_any = method_segment.new('POST', String)
+    route do |r|
+      r.on('baz') do
+        r.on(get_foo) do
+          # GET method, /baz/foo prefix
+        end
+ 
+        r.is(post_any) do |seg|
+          # for POST /baz/bar, seg is "bar"
+        end
+      end
+ 
+      r.on('quux') do
+        r.is(get_foo) do
+          # GET method, /quux/foo route
+        end
+ 
+        r.on(post_any) do |seg|
+          # for POST /quux/xyz, seg is "xyz"
+        end
+      end
+    end

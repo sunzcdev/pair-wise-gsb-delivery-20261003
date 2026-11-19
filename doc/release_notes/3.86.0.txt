@@ -1,0 +1,38 @@
+= New Features
+
+* A conditional_sessions plugin has been added.  This allows you to
+  only support sessions for a subset of the application's requests.
+  You pass a block when loading the plugin, and sessions are only
+  supported if the block returns truthy.  The block is evaluated
+  in request scope.
+
+  As an example, if you do not want to support sessions for request
+  paths starting with /static, you could use:
+
+    plugin :conditional_sessions, secret: ENV["SECRET"] do
+      !path_info.start_with?('/static')
+    end
+
+  With this example, if the request path starts with /static:
+
+  * The request methods +session+, +session_created_at+, and
+    +session_updated_at+ all raise an exception.
+  * The request +persist_session+ and route scope +clear_session+
+    methods do nothing and return nil.
+
+  Options passed when loading the plugin are passed to the sessions
+  plugin.
+
+* In the content_security_policy plugin, you can now call
+  response.skip_content_security_policy! to skip the setting of the
+  response header.
+
+* In the permissions_policy plugin, you can now call
+  response.skip_permissions_policy! to skip the setting of the
+  response header.
+
+= Other Improvements
+
+* When using the autoload_hash_branches and/or autoload_named_routes
+  plugins, Roda.freeze now works correctly if the Roda class is
+  already frozen.

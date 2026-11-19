@@ -1,0 +1,20 @@
+= New Features
+
+* The named_routes plugin now allows calling route without a block
+  to remove the existing route handler.  The multi_run plugin
+  now allows calling run without an app to remove an existing handler.
+  These changes are designed to better support code reloading
+  libraries, so that if the related file is deleted, the related
+  handlers are also removed, without having to reload the entire
+  application.
+
+= Other Improvements
+
+* The error_handler plugin now avoids a method redefinition warning
+  in verbose warning mode.
+
+= Other
+
+* Roda's primary discussion forum is now GitHub Discussions. The
+  ruby-roda Google Group is still available for users who would
+  prefer to use that instead.

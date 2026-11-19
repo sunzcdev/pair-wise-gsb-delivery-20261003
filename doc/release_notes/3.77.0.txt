@@ -1,0 +1,8 @@
+= New Features
+
+* The route_csrf plugin now supports formaction/formmethod attributes
+  in forms. A csrf_formaction_tag method has been added for creating
+  a hidden input for a particular path and method.  When a form is
+  submitted, the check_csrf! method will fix check for a path-specific
+  csrf token (set by the hidden tag added by the csrf_formaction_tag
+  method), before checking for the default csrf token.

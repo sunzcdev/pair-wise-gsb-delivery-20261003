@@ -1,0 +1,13 @@
+= Improvements
+
+* The r.on optimization added in 3.46.0 has been extended to optimize
+  all single argument calls. This results in the following speedups
+  based on argument type:
+
+  * Hash matching: 10%
+  * Array/Symbol/Class matching: 15%
+  * Proc matching: 25%
+  * true matching: 45%
+  * false/nil matching: 65%
+
+* Other minor performance improvements have been made.

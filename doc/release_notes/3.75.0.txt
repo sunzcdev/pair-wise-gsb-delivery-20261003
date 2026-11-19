@@ -1,0 +1,19 @@
+= New Features
+
+* A cookie_flags plugin has been added, for overriding, warning, or
+  raising for incorrect cookie flags. The plugin by default checks
+  whether the secure, httponly, and samesite=strict flags are set.
+  The default behavior is to add the appropriate flags if they are
+  not set, and change the samesite flag to strict if it is set to
+  something else.  You can configure the flag checking behavior
+  via the :httponly, :same_site, and :secure options.
+
+  You can configure the action the plugin takes via the :action option.
+  The default action is to modify the flags, but the :action option can
+  be set to :raise, :warn, or :warn_and_modify to override the behavior.
+
+  The recommended way to use the plugin is to use it during testing,
+  and specify action: :raise, so you can catch places where cookies
+  are set with the wrong flags.  Then you can fix those places to
+  use the correct flags, which is better than relying on the plugin
+  at runtime in production to fix incorrect flags.

@@ -1,0 +1,5 @@
+= Improvements
+
+* The error_email and error_mail plugins now rescue invalid parameter
+  errors when preparing the email body, because you generally don't
+  want your error handler to raise an exception.

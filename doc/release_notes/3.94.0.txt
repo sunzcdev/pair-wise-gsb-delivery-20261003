@@ -1,0 +1,18 @@
+= New Features
+
+* A view_subdir_leading_slash plugin has been added, for using the
+  current view subdirectory for all templates that do not start with
+  a slash.  The default behavior when using view subdirectories
+  remains to use the current view subdirectory unless the template
+  name includes a slash.  This makes it easier to use nested view
+  subdirectories, at the expense of making it slightly more difficult
+  to use templates outside the current view subdirectory.
+
+= Other Improvements
+
+* The render_each and each_part plugin template selection code is
+  now more optimized when the application is frozen and using the
+  :assume_fixed_locals render plugin option.
+
+* The render_each and each_part plugin default local generation
+  is now more optimized on Ruby 3+.

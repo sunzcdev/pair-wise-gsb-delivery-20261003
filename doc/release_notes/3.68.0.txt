@@ -1,0 +1,21 @@
+= New Feature
+
+* Roda.run in the multi_run plugin now accepts blocks, to allow
+  autoloading of apps to dispatch to:
+
+    class App < Roda
+      plugin :multi_run
+
+      run("other_app"){OtherApp}
+
+      route do |r|
+        r.multi_run
+      end
+    end
+
+  With the above example, the block is not evaluated until a
+  request for the /other_app branch is received.  If OtherApp is
+  autoloaded, this can speed up application startup and partial
+  testing. When freezing the application (for production use),
+  the block is eagerly loaded, so that requests to the
+  /other_app branch do not call the block on every request.

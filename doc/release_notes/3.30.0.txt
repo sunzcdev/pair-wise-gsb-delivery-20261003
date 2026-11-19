@@ -1,0 +1,14 @@
+= New Features
+
+* A :relative_paths plugin option has been added to the assets
+  plugin.  This option makes the paths to the asset files in the
+  link and script tags relative paths instead of absolute paths.
+
+= Other Improvements
+
+* The :header matcher in the header_matchers plugin now works
+  correctly for the Content-Type and Content-Length headers, which
+  are not prefixed with HTTP_ in the rack environment.
+
+* The run_append_slash and run_handler plugins now work correctly
+  when used together.

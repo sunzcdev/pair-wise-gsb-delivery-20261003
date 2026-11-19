@@ -1,0 +1,8 @@
+= New Features
+
+* The path plugin now supports a url method, allowing for returning
+  the entire URL instead of just the path for class-based paths.
+
+* The public plugin now supports a :brotli option that will directly
+  serve brotli-compressed files (with .br extension) similar to how the
+  :gzip option directly serves gzipped files (with the .gz extension).

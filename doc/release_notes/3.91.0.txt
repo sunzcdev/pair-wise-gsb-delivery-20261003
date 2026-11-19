@@ -1,0 +1,36 @@
+= New Features
+
+* The render_each method in the render_each plugin now accepts a
+  block.  If passed a block, instead of returning a concatenation
+  of the rendered template output, it yields each rendered template
+  output, and returns nil.  This allows for use in the case where you
+  want to wrap the template output:
+
+    <% render_each([1,2,3], :foo) do |text| %>
+      <p><%= text %></p>
+    <% end %>
+
+  If can also be used to reduce memory usage even in the case where
+  you are not wrapping template output.  Instead of:
+
+    <%= render_each([1,2,3], :foo) %>
+
+  You can do:
+
+    <% render_each([1,2,3], :foo) %><%= body %><% end %>
+
+  This will avoid building a potentially large unnecessary intermediate
+  string.
+
+* The capture_erb plugin now supports a returns: :buffer method and
+  plugin option.  When this option is provided, the capture_erb method
+  returns the buffer instead of the return value of the block passed
+  to it.  This better handles cases where the template ends in a
+  conditional:
+
+    <% value = capture_erb do %>
+      Some content here.
+      <% if something %>
+        Some more content here.
+      <% end %>
+    <% end %>

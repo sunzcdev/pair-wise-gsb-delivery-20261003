@@ -1,0 +1,50 @@
+= New Features
+
+* The typecast_params plugin handle_type method now supports an
+  :invalid_value_message option, for a custom error message for the
+  type, explaining why the input is invalid.  This error message is
+  used when there is a parameter given, but it cannot be converted to
+  the desired type:
+
+    plugin :typecast_params do
+      handle_type(:single_char, invalid_value_message: \
+          "value not a single character") do |v|
+        v if v.is_a?(String) && v.length == 1
+      end
+    end
+    
+  Previously, the error message in this case was the same as when no
+  parameter was provided, which was misleading.
+
+  The types natively supported by the typecast_params and
+  typecast_params_sized_integers plugins now use
+  :invalid_value_message for better error reporting. You can override
+  the invalid value messages for these types using the
+  invalid_value_message method:
+
+    plugin :typecast_params do
+      invalid_value_message(:pos_int,
+        "value must be greater than 0 for parameter")
+    end
+
+= Other Improvements
+
+* Many minor performance improvements, mostly from rubocop-performance:
+
+  * flat_map instead of map.flatten(1)
+  * tr/delete instead of gsub
+  * symbol instead of string argument to method_defined?
+  * hoist literal arrays outside blocks
+  * end_with?/include? instead of =~
+
+= Backwards Compatibility
+
+* The fourth parameter in the process and process_arg private methods
+  in the typecast_params plugin has changed from being the max input
+  bytesize of the type, to the type symbol, and is now a required
+  parameter. External callers of these private methods will need to be
+  updated.
+
+* Code rescuing Roda::RodaPlugins::TypecastParams::Error and handling
+  the reason may need to adjust to handling :invalid_value in cases
+  where it was handling :missing.

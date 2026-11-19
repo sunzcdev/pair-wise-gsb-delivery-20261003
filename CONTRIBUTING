@@ -1,0 +1,51 @@
+Issue Guidelines
+----------------
+
+1) Issues should only be created for things that are definitely bugs.
+   If you are not sure that the behavior is a bug, ask about it on
+   GitHub Discussions or the ruby-roda Google Group.  GitHub Issues
+   should not be used as a help forum.
+
+2) If you are sure it is a bug, then post a complete description of
+   the issue, the simplest possible self-contained example showing
+   the problem, and the full backtrace of any exception.
+
+Pull Request Guidelines
+-----------------------
+
+1) Try to include tests for all new features and substantial bug
+   fixes.
+
+2) Try to include documentation for all new features.  In most cases
+   this should include RDoc method documentation, but updates to the
+   README is also appropriate in some cases.
+
+3) Follow the style conventions of the surrounding code.  In most
+   cases, this is standard ruby style.
+
+4) Do not submit whitespace changes with code changes.  Roda is not
+   pedantic about trailing whitespace, so if you have an editor that
+   automatically strips trailing whitespace, you may want to turn
+   that feature off.
+   
+5) All code in pull requests is assummed to be MIT licensed.  Do not
+   submit a pull request if that isn't the case.
+
+Code of Conduct
+---------------
+
+This code of conduct applies to all of the project's "collaborative
+space", which is defined as community communications channels,
+including the Google Group, GitHub project, and source code repository.
+
+1) Participants must ensure that their language and actions are free
+   of personal attacks and remarks disparaging to people or groups.
+
+2) Behaviour which can be reasonably considered harassment will not
+   be tolerated.
+
+3) Discussion should be limited to the project and related
+   technologies.
+
+You can report a violation of this code of conduct to the project
+maintainer, who will take appropriate action.

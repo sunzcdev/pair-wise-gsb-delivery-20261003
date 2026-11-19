@@ -1,0 +1,36 @@
+= New Features
+
+* The convert! and convert_each! methods in the typecast_params plugin
+  now support a :raise option for handling missing parameters specified
+  as arguments to the methods.
+  
+  If the :raise option is set to false for convert! and the parameter
+  argument is missing, then no conversion is done and an empty hash
+  is returned:
+
+    typecast_params.convert!('missing', raise: false) do |tp|
+      # ...
+    end
+    # => {}
+
+  If the :raise option is set to false for convert_each! and a :keys
+  option is given, any key not present is ignored and nil will be
+  returned for the converted value
+
+    typecast_params.convert_each!(:keys=>['present', 'missing'], raise: false) do |tp|
+      tp.int('b')
+    end
+    # => [{'b'=>1}, nil]
+
+= Other Improvements
+
+* The :symbolize setting to the convert! and convert_each! methods in
+  the typecast_params plugin is no longer persisted beyond the call
+  to the method.  This fixes unexpected behavior if you do:
+
+    typecast_params.convert!(:symbolize=>true) do |tp|
+      # ...
+    end
+    typecast_params.convert! do |tp|
+      # ...
+    end

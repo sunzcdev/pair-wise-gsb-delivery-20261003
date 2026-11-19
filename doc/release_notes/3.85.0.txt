@@ -1,0 +1,102 @@
+= New Features
+
+* The class_matchers and symbol_matchers plugins now allow building on
+  top of existing class and symbol matchers.  This allows you to
+  simplify code such as:
+
+    r.on "employee", Integer do |emp_id|
+      next unless employee = Employee[emp_id]
+      # ...
+    end
+
+  by defining an appropriate class matcher:
+
+    class_matcher Employee, Integer do |emp_id|
+      Employee[emp_id]
+    end
+
+  and then changing the matcher in the route code:
+
+    r.on "employee", Employee do |employee|
+      # ...
+    end
+
+  This avoids the need to check for a valid employee in each route, by
+  having the check in the class_matcher block.  If a request comes in
+  with a valid integer segment, but there is no employee assigned with
+  that integer, then the Employee matcher will not match.
+
+  Symbol matchers can build upon class matchers (and vice-versa):
+
+    symbol_matcher :ActiveEmployee, Employee do |employee|
+      employee if employee.active?
+    end
+
+  With the above :ActiveEmployee matcher, segments will only
+  match if they are an integer that is related to an employee,
+  and that employee is active.
+
+= Other Improvements
+
+* As shown in the above examples, class_matcher and symbol_matcher
+  blocks can now return non-arrays.  This can reduce the number
+  of unnecessary allocations, and result in simpler code.
+
+* The blocks passed to class_matcher and symbol_matcher are now
+  evaluated in route block context.  That allows you to have
+  the matchers depend on request or session specific state. For
+  example, a Post class matcher such as:
+
+    class_matcher Post, Integer do |id|
+      Post.where(user_id: session['user_id']).with_pk(id)
+    end
+
+  will only match if the user for the related Post matches the
+  logged in user.
+
+* Symbol matchers based on regexps are now faster by caching the
+  regexp at a higher level, avoiding the need to look up the
+  cached regexp for every request.
+
+* The public plugin now avoids a deprecation warning when using
+  Ruby 3.4.0-preview2.
+
+* The capture_erb plugin no longer breaks if ActiveSupport 4 is
+  loaded.  ActiveSupport 4 defines Kernel#capture, which broke
+  the capture_erb plugin's assumption that calling capture was
+  safe if the method was defined. capture_erb does not call
+  capture on the buffer object if the buffer object is a String
+  instance. The use of capture is designed for usage with
+  erubi/capture_block, which does not use a String instance as
+  a buffer object.
+
+= Backwards Compatibility
+
+* Changing the class_matcher and symbol_matcher blocks to be
+  evaluated in route block context can break code that assumes
+  they were evaluated in the context in which they were called.
+  Generally, that context is application class context. For example,
+  the following type of code would break:
+
+    class App < Roda
+      plugin :class_matchers
+
+      def self.get_class(klass)
+        const_get(klass)
+      end
+
+      class_matcher Employee, Integer do |emp_id|
+        get_class(:Employee)[emp_id]
+      end
+    end
+
+  This worked previously, because get_class was defined as a
+  class method, and the block was evaluated in class context,
+  as that is the context in which it was defined. You would
+  have to define a get_class instance method to allow the
+  example to continue to work.
+
+* The internals of the Integer_matcher_max plugin have been
+  updated, to integrate with the class_matchers and symbol_matchers
+  changes.  The _match_class_convert_Integer and
+  _match_class_max_Integer private request methods have been removed.

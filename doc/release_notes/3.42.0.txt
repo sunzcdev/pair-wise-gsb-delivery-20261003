@@ -1,0 +1,21 @@
+= New Features
+
+* A recheck_precompiled_assets plugin has been added, which allows
+  for checking for updates to the precompiled asset metadata file,
+  and automatically using the updated data.
+
+* The common_logger plugin now supports a :method plugin option to
+  specify the method to call on the logger.
+
+= Other Improvements
+
+* Plugins and middleware that use keyword arguments are now supported
+  in Ruby 3.
+
+* The compile_assets class method in the assets plugin now uses an
+  atomic approach to writing the precompiled asset metadata file.
+
+* Minor method visibility issues have been fixed.  The custom_matchers
+  plugin no longer makes the unsupported_matcher request method
+  public, and the render plugin no longer makes the _layout_method
+  public when the application is frozen.

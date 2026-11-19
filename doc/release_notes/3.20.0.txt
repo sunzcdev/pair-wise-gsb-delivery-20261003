@@ -1,0 +1,7 @@
+= Improvements
+
+* For empty responses with status code 205, a Content-Length header
+  is now added with a value of 0, for better conformance to RFC 7232.
+
+  Similarly, when using the drop_body plugin, responses with status
+  code 205 now have a Content-Length header added with a value of 0.

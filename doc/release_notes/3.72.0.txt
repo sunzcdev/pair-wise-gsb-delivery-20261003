@@ -1,0 +1,48 @@
+= New Features
+
+* An invalid_request_body plugin has been added for allowing custom
+  handling of invalid request bodies.  Roda uses Rack's request body
+  parsing, and by default invalid request bodies can result in
+  different exceptions based on how the body is invalid and which
+  version of Rack is in use.
+
+  If you want to treat an invalid request body as the submission of
+  no parameters, you can use the :empty_hash argument when loading
+  the plugin:
+
+    plugin :invalid_request_body, :empty_hash
+
+  If you want to return a empty 400 (Bad Request) response if an
+  invalid request body is submitted, you can use the :empty_400
+  argument when loading the plugin:
+
+    plugin :invalid_request_body, :empty_400
+
+  If you want to raise a Roda::RodaPlugins::InvalidRequestBody::Error
+  exception if an invalid request body is submitted (which makes it
+  easier to handle these exceptions when using the error_handler
+  plugin), you can use the :raise argument when loading the plugin:
+
+    plugin :invalid_request_body, :raise
+
+  For custom behavior, you can pass a block when loading the plugin
+  The block is called with the exception Rack raised when parsing the
+  body. The block will be used to define a method in the application's
+  RodaRequest class.  It can either return a hash of parameters, or
+  you can raise a different exception, or you can halt processing and
+  return a response:
+
+    plugin :invalid_request_body do |exception|
+      # To treat the exception raised as a submitted parameter
+      {body_error: exception}
+    end
+
+= Other Improvements
+
+* When using the check_arity: :warn Roda option, Roda now correctly
+  warns when defining a method that expects a single argument when
+  the provided block requires multiple arguments.
+
+* The match_hooks plugin is now implemented using the match_hook_args
+  plugin, simplifying the implementation.  This change should be
+  transparent unless you were reaching into the internals.

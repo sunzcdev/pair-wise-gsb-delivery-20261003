@@ -1,0 +1,13 @@
+= New Features
+
+* The sessions plugin now supports RodaRequest#session_created_at
+  and RodaRequest#session_updated_at for the times of session
+  creation and last update.
+
+= Other Improvements
+
+* The json_parser plugin now correctly parses the request body even
+  if the request body has already been read.
+
+* The sessions plugin now correctly handles upgrading rack cookie
+  sessions when using rack 2.0.8+.

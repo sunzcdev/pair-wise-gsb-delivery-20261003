@@ -1,0 +1,19 @@
+= New Features
+
+* A plain_hash_response_headers plugin has been added.  On Rack 3,
+  this changes Roda to use a plain hash for response headers (as it
+  does on Rack 2), instead of using Rack::Headers (the default on
+  Rack 3).  For a minimal app, using this plugin can almost double
+  the performance on Rack 3.  Before using this plugin, you should
+  make sure that all response headers set explictly in your
+  application are already lower-case.
+
+= Improvements
+
+* Roda now natively uses lower-case for all response headers set
+  implicitly when using Rack 3.  Previously, Roda used mixed-case
+  response headers and had Rack::Headers handle the conversion to
+  lower-case (Rack 3 requires lower-case response headers). Note
+  that Rack::Headers is still used for response headers by default
+  on Rack 3, as applications may not have converted to using
+  lower-case response headers.

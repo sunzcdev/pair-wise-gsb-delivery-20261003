@@ -1,0 +1,25 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta http-equiv="X-UA-Compatible" content="IE=edge">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title><%= "#{current_page.capitalize} | " unless current_page == 'index' %>Roda: Routing Tree Web Toolkit</title>
+    <meta name="description" content="<%= description %>">
+    <link rel="stylesheet" href="css/roda.css">
+    <script src="js/roda.js" defer></script>
+  </head>
+  <body class="<%= current_page %>">
+    <% unless current_page == 'index' %>  
+      <nav class='main'>
+        <div class="contain">
+          <a class="<%= 'active ' if current_page == 'index' %>index" href="index.html"><img src="images/roda-logo.svg" alt="Roda" /></a>
+          <a class="<%= 'active ' if current_page == 'documentation' %>documentation" href="documentation.html">Docs</a>
+          <a class="<%= 'active ' if current_page == 'development' %>development" href="development.html">Development</a>
+          <a class="github" href="https://github.com/jeremyevans/roda">Github</a>
+        </div>
+      </nav>
+    <% end %>
+    <div class="content"><%= content %></div>
+  </body>
+</html>

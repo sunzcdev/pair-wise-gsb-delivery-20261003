@@ -1,0 +1,33 @@
+= New Feature
+
+* The symbol_matcher method in the symbol_matchers plugin now
+  supports a block to allow for type conversion of matched
+  segments:
+
+    symbol_matcher(:date, /(\d\d\d\d)-(\d\d)-(\d\d)/) do |y, m, d|
+      [Date.new(y.to_i, m.to_i, d.to_i)]
+    end
+  
+    route do |r|
+      r.on :date do |date|
+        # date is an instance of Date
+      end
+    end
+
+  As shown above, the block should return an array of objects to yield
+  to the match block.
+ 
+  If you have a segment match the passed regexp, but decide during block
+  processing that you do not want to treat it as a match, you can have the
+  block return nil or false.  This is useful if you want to make sure you
+  are using valid data:
+  
+    symbol_matcher(:date, /(\d\d\d\d)-(\d\d)-(\d\d)/) do |y, m, d|
+      y = y.to_i
+      m = m.to_i
+      d = d.to_i
+      [Date.new(y, m, d)] if Date.valid_date?(y, m, d)
+    end
+  
+  When providing a block when using the symbol_matchers method, that
+  symbol may not work with the params_capturing plugin.

@@ -1,0 +1,12 @@
+= New Features
+
+* An autoload_named_routes plugin has been added for autoloading files
+  for a named route setup by the named_routes plugin when there is a
+  request for that route.
+
+= Other Improvements
+
+* The path method in the path plugin now supports a :class_name option.
+  You can set this option to true and use a class name String/Symbol
+  to register paths for classes without referencing the related class,
+  useful when autoloading the class.

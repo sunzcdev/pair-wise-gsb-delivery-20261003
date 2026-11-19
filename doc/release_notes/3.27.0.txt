@@ -1,0 +1,15 @@
+= New Features
+
+* A multibyte_string_matcher plugin has been added that supports
+  multibyte characters in strings used as matchers.  It uses a slower
+  string matching implementation that supports multibyte characters.
+  As multibyte strings in paths must be escaped, this also loads the
+  unescape_path plugin.
+
+= Other Improvements
+
+* The json_parser plugin now returns expected results for invalid JSON
+  if the params_capturing plugin is used.
+
+* lib/roda.rb has been split into multiple files for easier code
+  navigation.

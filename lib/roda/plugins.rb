@@ -1,0 +1,102 @@
+# frozen-string-literal: true
+
+require_relative "cache"
+
+class Roda
+  # Module in which all Roda plugins should be stored. Also contains logic for
+  # registering and loading plugins.
+  module RodaPlugins
+    OPTS = {}.freeze
+    EMPTY_ARRAY = [].freeze
+
+    # Stores registered plugins
+    @plugins = RodaCache.new
+
+    class << self
+      # Make warn a public method, as it is used for deprecation warnings.
+      # Roda::RodaPlugins.warn can be overridden for custom handling of
+      # deprecation warnings.
+      public :warn
+    end
+
+    # If the registered plugin already exists, use it.  Otherwise,
+    # require it and return it.  This raises a LoadError if such a
+    # plugin doesn't exist, or a RodaError if it exists but it does
+    # not register itself correctly.
+    def self.load_plugin(name)
+      h = @plugins
+      unless plugin = h[name]
+        require "roda/plugins/#{name}"
+        raise RodaError, "Plugin #{name} did not register itself correctly in Roda::RodaPlugins" unless plugin = h[name]
+      end
+      plugin
+    end
+
+    # Define an attr_reader method for name that uses the instance variable
+    # <tt>@opt_*</tt>. Designed to be used with instance variables set via RodaOpts#[]=.
+    def self.opt_attr_reader(mod, key, name: key)
+      opt_name = :"opt_#{key}"
+      mod.send(:attr_reader, opt_name)
+      mod.send(:alias_method, name, opt_name)
+      mod.send(:remove_method, opt_name)
+      nil
+    end
+
+    # Warn if the opts given contain unsupported keys.
+    def self.check_supported_opts(desc, opts, supported_keys)
+      extra_keys = opts.keys - supported_keys
+
+      unless extra_keys.empty?
+        warn("Unsupported options given to #{desc}: #{extra_keys.map(&:inspect).join(", ")}", uplevel: 2)
+      end
+
+      nil
+    end
+
+    # Handle positional argument to keyword argument conversion warnings in plugins.
+    def self.check_keywords(method, no_positional_opts, opts, kw)
+      unless no_positional_opts
+        warn("A positional options hash is now deprecated for #{method}. Support for this will be removed in Roda 4. Switch to passing keywords arguments. Keys given in positional options hash: #{opts.keys.map(&:inspect).join(", ")}", uplevel: 2)
+      end
+
+      unless kw.empty?
+        warn("Unrecognized keywords given to #{method}: #{kw.keys.join(", ")}. Backwards compatibility for this will be removed in Roda 4.", uplevel: 2)
+      end
+
+      nil
+    end
+
+    # Register the given plugin with Roda, so that it can be loaded using #plugin
+    # with a symbol.  Should be used by plugin files. Example:
+    #
+    #   Roda::RodaPlugins.register_plugin(:plugin_name, PluginModule)
+    def self.register_plugin(name, mod)
+      @plugins[name] = mod
+    end
+
+    # Deprecate the constant with the given name in the given module,
+    # if the ruby version supports it.
+    def self.deprecate_constant(mod, name)
+      # simplecov:disable
+      if RUBY_VERSION >= '2.3'
+        mod.deprecate_constant(name)
+      end
+      # simplecov:enable
+    end
+
+    if RUBY_VERSION >= '3.3'
+      # Create a new module using the block, and set the temporary name
+      # on it using the given a containing module and name.
+      def self.set_temp_name(mod)
+        mod.set_temporary_name(yield)
+        mod
+      end
+    # simplecov:disable
+    else
+      def self.set_temp_name(mod)
+        mod
+      end
+    end
+    # simplecov:enable
+  end
+end

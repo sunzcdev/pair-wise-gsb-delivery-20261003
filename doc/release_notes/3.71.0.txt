@@ -1,0 +1,33 @@
+= New Feature
+
+* A match_hook_args plugin has been added.  This is similar to the
+  existing match_hook plugin, but passes through the matchers and
+  block arguments (values yielded to the match block). Example:
+
+    plugin :match_hook_args
+ 
+    add_match_hook do |matchers, block_args|
+      logger.debug("matchers: #{matchers.inspect}. #{block_args.inspect} yielded.")
+    end
+
+    # Term is an implicit matcher used for terminating matches, and
+    # will be included in the array of matchers yielded to the match hook
+    # if a terminating match is used.
+    term = self.class::RodaRequest::TERM
+
+    route do |r|
+      r.root do
+        # for a request for /
+        # matchers: nil, block_args: nil
+      end
+
+      r.on 'a', ['b', 'c'], Integer do |segment, id|
+        # for a request for /a/b/1
+        # matchers: ["a", ["b", "c"], Integer], block_args: ["b", 1]
+      end
+
+      r.get 'd' do
+        # for a request for /d
+        # matchers: ["d", term], block_args: []
+      end
+    end

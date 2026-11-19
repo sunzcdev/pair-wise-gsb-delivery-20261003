@@ -1,0 +1,19 @@
+= Improvements
+
+* The r.on, r.is, r.get and r.post methods (and other verb methods
+  if using the all_verbs plugin) have now been optimized when using
+  a single string or regexp matcher, or the String or Integer class
+  matcher.  Since those four matchers are the most common types of
+  matchers passed to the methods, this can significantly improve
+  routing performance (about 50% in the r10k benchmark).
+
+  This optimization is automatically applied when freezing
+  applications, if the related methods have not been modified by
+  plugins.
+
+  This optimization does come at the expense of a small decrease
+  in routing performance (3-4%) for unoptimized cases, but the
+  majority of applications will see a overall performance benefit
+  from this change.
+
+* Other minor performance improvements have been made.

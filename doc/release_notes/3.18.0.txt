@@ -1,0 +1,170 @@
+= New Features
+
+* A direct_call plugin has been added.  This plugin makes Roda.call
+  call the app directly, skipping any middleware.  This plugin
+  can be used for performance reasons, as the class itself can be
+  used as the base rack app, instead of using a lambda as the base
+  rack app.  Roda.app.call will still call all middleware when
+  using this plugin.
+
+= Other Improvements
+
+* Blocks that are given during application configuration, and
+  previously executed with instance_exec, instead now define methods,
+  and Roda now calls these methods. This is a much faster approach.
+  This new approach, combined with the direct_call plugin and the
+  Roda.freeze optimizations, can be over 80% faster for trivial
+  applications, with measureable improvements in most applications.
+
+  As methods are strict in regards to arity and instance_exec is
+  not, Roda now checks all such blocks for arity mismatches, and
+  attempts to compensate for arity mismatches.  In case of an arity
+  mismatch, Roda will define a method that will call instance_exec,
+  in which case there will not be a performance improvement.
+
+  For some methods, Roda may not know the expected arity until
+  runtime.  In that case, Roda will check the arity at runtime and
+  try to call the method with the arity that it supports if there is
+  an arity mismatch.
+
+  You can control the checking of arity via two options:
+
+  :check_arity :: Set to false to turn off all arity checking. Set to
+                  :warn to issue a warning when defining the method if
+                  there is an arity mismatch (for methods where the
+                  expected arity is known in advance).
+  :check_dynamic_arity :: Set to false to turn off arity checking for
+                          methods defined where the arity is not known
+                          at compile time.  Set to :warn to issue a
+                          warning at runtime every time the method is
+                          called and there is an arity mismatch (for
+                          methods where the expected arity is not
+                          known in advance).  Note that checking the
+                          arity at runtime has a performance cost,
+                          so for maximum performance this should be
+                          set to false.
+
+  Note that this arity checking is only done to keep backwards
+  compatibility.  Since lambdas already used strict arity, no arity
+  checking is done if the block is a lambda and not a regular proc.
+
+  Roda has a new dispatch API that works with these defined methods.
+  The new dispatch API uses the following methods:
+
+  * _roda_handle_main_route: Entry point for normal request dispatch.
+  * _roda_handle_route: Yields to the routing block, catching any
+    halts inside the block, treating the block as a routing block.
+  * _roda_main_route: Roda.route defines this method using the
+    block provided, it accepts the request as an argument.
+  * _roda_run_main_route: Calls _roda_main_route with the request,
+    allowing for plugins to execute code around the main routing,
+    while still being able to throw :halt to return a response.
+
+  All instance methods defined by Roda use the _roda_ prefix.
+
+* When deleting the session cookie in the sessions plugin, the
+  Set-Cookie response header now uses the same path and domain 
+  that was originally used to set the cookie.  This can fix cases
+  where the cookie was not being cleared as expected.
+
+* Freezing a Roda app now can add performance improvements in
+  addition to reliability improvements. When freezing the class,
+  if certain methods in the class have not been overridden, Roda
+  now defines aliases or more optimized methods to improve
+  performance.
+
+* Roda now warns if the Roda#call method is overridden in a module,
+  without the module also overridding _roda_handle_main_route or
+  _roda_run_main_route.  This indicates that the module needs
+  to be updated to use Roda's new dispatch API.  Roda will continue
+  to work in this case, but it will be slower than the Roda's now
+  default behavior, as it will force usage of the old dispatch API.
+  This check will be removed in Roda 4, which will remove support
+  for Roda#call (and Roda#_call).
+
+* When there is only a single internal before or after hook defined,
+  the hook is now faster by using a method alias.
+
+* The route_csrf plugin block or :csrf_failure option proc now
+  integrates with the route_block_args plugin.
+
+* The default_status plugin is now faster by defining the
+  default_status method directly.
+
+* The default_headers plugin is now faster by defining an optimized
+  set_default_headers method directly.
+
+* The hooks plugin is now faster by defining methods for each
+  hook block, with a main hook method that dispatches to each
+  of the hook block methods.  If only a single hook block is
+  used, the main hook method is an alias to the hook block
+  method to avoid an extra method call.
+
+* The following plugins now use define_method instead of
+  instance_exec for better performance:
+
+  * defaults_setter
+  * mail_processor
+  * multi_route
+  * named_templates
+  * path
+  * route_block_args
+  * route_csrf
+  * static_routing
+  * status_handler
+
+* The internal after hook implementation has now been merged into
+  the error_handler plugin. This is faster in cases where the
+  error_handler plugin is used, and slower in cases where the
+  internal after hook plugin was used without the error_handler
+  plugin.
+
+* The route_block_args plugin now handles cases where
+  Roda.convert_route_block has already been overridden.
+
+* Performance of routing methods that can yield captures has been
+  improved.
+
+* Hash#merge is now used in preference to Hash[].merge! in cases
+  where the receiver of Hash#merge would not be provided by the
+  user.  This is because Hash#merge is faster than Hash[].merge!
+  in recent ruby versions.  If the receiver of #merge is provided
+  by the user, then Hash[].merge! is still used to ensure that the
+  resulting value is plain hash.
+
+* The static_routing plugin no longer removes existing static
+  routes if loaded more than once.
+
+* Roda now warns when calling Roda.route without a block.
+
+= Backwards Compatibility
+
+* The route_block_args plugin no longer affects the
+  class_level_routing plugin.  Support for this was added in Roda
+  3.17.0 when the route_block_args plugin was added, but this was a
+  mistake as class_level_routing blocks should be called with the
+  captures for their matchers, not with the route block args.
+
+* Some of the internal state was changed in the following plugins:
+
+  * class_level_routing
+  * mail_processor
+  * multi_route
+  * named_templates
+  * static_routing
+  * status_handler
+
+  This only affects you if you were accessing the internal state
+  via the opts hash.
+
+* The static_routing plugin no longer defines the r.static_route
+  method.
+
+* The mailer plugin was switched to use the new dispatch API, and
+  will no longer handle cases where the old dispatch API (Roda#call)
+  was overrridden.
+
+* The static_route method in the static_routing plugin must
+  now be called with a block.  Previously, that would not
+  cause a failure until runtime, where it would fail when
+  you tried to execute the route.

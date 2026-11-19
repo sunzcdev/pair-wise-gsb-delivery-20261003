@@ -1,0 +1,14 @@
+= New Features
+
+* An additional_view_directories plugin has been added, which allows
+  you to specify additional directories to look in for templates.
+  If the template path does not exist when using the default view
+  directory, then each additional view directory will be checked,
+  returning the first path that exists:
+
+    plugin :additional_view_directories, ['admin_views', 'public_views']
+
+= Other Improvements
+
+* The indifferent_params plugin now avoids a deprecation warning when
+  using the rack main branch, which will become Rack 3.

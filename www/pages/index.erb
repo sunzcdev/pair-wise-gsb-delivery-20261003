@@ -1,0 +1,142 @@
+<section id="intro" class="row bg-graydark">
+  <div id="intro-top" class="contain row">
+    <aside>
+      <a id="logo" href="/"><img src="images/roda-logo.svg" alt="Roda"></a>
+      <small class='gray'>The Routing Tree Web Toolkit</small>
+      <nav>
+        <a href="documentation.html">Docs</a>
+        <a href="development.html">Development</a>
+        <a href="https://github.com/jeremyevans/roda">Github</a>
+      </nav>
+
+      <h2 class='aqua'>Simplicity</h2>
+      <p>Roda is designed to be simple, both internally and externally, reducing cognitive overhead.</p>
+
+      <h2 class='aqua'>Understandability</h2>
+      <p>Roda avoids hidden control flow, allowing you to easily see how requests are handled.</p>
+
+      <h2 class='aqua'>Performance</h2>
+      <p>Roda is significantly faster than other popular ruby web frameworks.</p>
+
+      <h2 class='aqua'>Extensibility</h2>
+      <p>Roda is built completely out of plugins.</p>
+
+      <h2 class='aqua'>Reliability</h2>
+      <p>Roda supports and encourages immutability, and limits namespace pollution for instance variables, constants, and methods.</p>
+    </aside>
+    <div>
+      <pre>
+        <code class="language-ruby">
+# cat config.ru
+require "roda"
+
+class App &lt; Roda
+  route do |r|
+    # GET / request
+    r.root do
+      r.redirect "/hello"
+    end
+
+    # /hello branch
+    r.on "hello" do
+      # Set variable for all routes in /hello branch
+      @greeting = 'Hello'
+
+      # GET /hello/world request
+      r.get "world" do
+        "#{@greeting} world!"
+      end
+
+      # /hello request
+      r.is do
+        # GET /hello request
+        r.get do
+          "#{@greeting}!"
+        end
+
+        # POST /hello request
+        r.post do
+          puts "Someone said #{@greeting}!"
+          r.redirect
+        end
+      end
+    end
+  end
+end
+
+run App.freeze.app
+        </code>
+      </pre>
+    </div>
+  </div>
+</section>
+
+<section id="features" class="bg-white">
+  <div class="contain">
+    <h1 class="red center">A Modular, Scalable Ruby Framework</h1>
+    <ul class="plain row">
+      <% (<<END).split("\n").each_slice(2) do |name, info|
+Built on Rack
+Ruby's de facto webserver interface.
+Flexible Architecture
+Any design pattern for any application.
+Rich Set of Included Plugins
+Tools for every aspect of web development.
+Simple, Reliable API
+Currently at version #{Roda::RodaVersion}
+Security Focused
+Encrypted sessions, per-form CSRF tokens.
+Streaming Views &amp; Assets
+Mailers, JSON APIs, and more...
+END
+%>
+        <li>
+          <svg class="feature" viewBox="0 0 41 41"><circle cx="20.5" cy="20.5" r="19.5"/><polyline points="10.88 22.78 15.31 27.21 28.93 13.59"/></svg>
+          <strong><%= name %></strong>
+          <p class="graylight"><%= info %></p>
+        </li>
+      <% end %>
+    </ul>
+  </div>
+</section>
+
+<section id="videos" class="bg-cream">
+  <div class="contain">
+    <h2 class="aqua center">Stable for 10+ years, and constantly improving!</h2>   
+    <div class="video row">
+      <div class="col 40">
+        <iframe src='https://www.youtube.com/embed/W8zglFFFRMM?showinfo=0"' frameborder='0' allow='autoplay;encrypted-media' allowfullscreen></iframe>
+      </div>
+      <div class="col 60">
+        <h3><a href="https://www.youtube.com/watch?v=GrYlZjbXeP8" target="_blank">RubyConf 2024 - 10 Years of Roda</a></h3>
+        <p>Watch Roda's lead developer discuss the history of Roda, and the improvements made in Roda's first 10 years.</p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section id="performance" class="bg-aqua">
+  <h2 class="white center">Comparison to Popular Ruby Web Frameworks</h2>
+
+  <p class="benchmark-data benchmark-info white center">Compared to other popular Ruby web frameworks, Roda has the highest performance (note log10 scale in request per second graph) and uses the least memory.</p>
+
+  <div class="benchmark-images">
+    <img src="images/popular/rps.png">
+    <img src="images/popular/memory.png">
+  </div>
+
+  <p class="benchmark-data white center">Data:
+    <a class="white" href="data/popular/rps.txt">Requests/Second</a> |
+    <a class="white" href="data/popular/memory.txt">Initial Memory Usage</a>
+  </p>
+</section>
+
+<section id="compare" class="bg-gray white">
+  <div class="contain">
+    <div class="compare sinatra">
+      <h2>Compare to Sinatra</h2>
+      <p>Roda aims to take the ease of development and understanding that Sinatra brings, and enable it to scale to support the development of large web applications.</p>
+      <a href="compare_to_sinatra.html" class="btn continue">Continue Reading</a>
+    </div>
+  </div>
+</section>

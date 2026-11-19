@@ -1,0 +1,33 @@
+= New Features
+
+* The middleware plugin now accepts a :next_if_not_found option.
+  This allows the middleware plugin to pass the request to the next
+  application if the current application handles the request but
+  ends up calling the not_found handler.  With the following
+  middleware:
+
+    class Mid < Roda
+      plugin :middleware
+
+      route do |r|
+        r.on "foo" do
+          r.get "bar" do
+            'bar'
+          end
+        end
+      end
+    end
+
+  Requests for /x would be forwarded to the next application, since
+  the application doesn't handle the request, but requests for /foo/x
+  would not be, because the middleware is partially handling the
+  request in the r.on "foo" block.  With the :next_if_not_found
+  option, only requests for /foo/bar would be handled by the
+  middleware, and all other requests would be forwarded to the next
+  application.
+
+= Other Improvements
+
+* The sessions and route_csrf plugins no longer depend on the base64
+  library. base64 will be removed from Ruby's standard library
+  starting in Ruby 3.4.

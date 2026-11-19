@@ -1,0 +1,51 @@
+= New Features
+
+* A response_content_type plugin has been added for more easily
+  setting the content type of responses:
+
+  When setting the content-type, you can pass either a string, which
+  is used directly:
+ 
+    response.content_type = "text/html"
+  
+  Or, if you have registered mime types when loading the plugin:
+ 
+    plugin :response_content_type, mime_types: {
+      plain: "text/plain",
+      html: "text/html",
+      pdf: "application/pdf"
+    }
+ 
+  You can use a symbol:
+ 
+    response.content_type = :html
+ 
+  If you would like to load all mime types supported by rack/mime,
+  you can use the <tt>mime_types: :from_rack_mime</tt> option:
+ 
+    plugin :response_content_type, mime_types: :from_rack_mime
+ 
+  Note that you are unlikely to be using all of these mime types,
+  so doing this will likely result in unnecessary memory usage. It
+  is recommended to use a hash with only the mime types your
+  application actually uses.
+ 
+  To prevent silent failures, if you attempt to set the response
+  type with a symbol, and the symbol is not recognized, a KeyError
+  is raised.
+
+* The typecast_params plugin now includes typecast_query_params and
+  typecast_body_params methods in addition to typecast_params.
+  typecast_query_params deals with query string parameters (r.GET),
+  and typecast_body_params deals with request body parameters
+  (r.POST).
+
+= Other Improvements
+
+* The sessions plugin now raises
+  Roda::RodaPlugins::Sessions::CookieTooLarge if the total cookie
+  size is over 4K. Previously, it only raised the exception if the
+  cookie value was over 4K. Browsers enforce the limit on the total
+  cookie size, not just the value, so this change prevents Roda
+  from setting a cookie that a browser would ignore due to size
+  restrictions.

@@ -1,0 +1,25 @@
+= New Feature
+
+* A custom_block_results plugin has been added for custom handling
+  of block results.  This allows routing blocks to return
+  arbitrary objects instead of just String, nil, and false, and
+  to have custom handling for them. For example, if you want to
+  be able to have your routing blocks return the status code to use,
+  you could do:
+
+    plugin :custom_block_results
+
+    handle_block_result Integer do |result|
+      response.status_code = result
+    end
+
+    route do |r|
+      200
+    end
+
+  While the expected use of the handle_block_result method is with
+  class arguments, you can use any argument that implements an
+  appropriate === method.
+
+  The symbol_views and json plugins, which support additional block
+  results, now use the custom_block_results plugin internally.

@@ -1,0 +1,8 @@
+/roda-*.gem
+/rdoc/
+/coverage/
+/www/public/*.html
+/www/public/rdoc/
+/spec/iv-*.erb
+/spec/pid-*
+/spec/render_coverage-*
