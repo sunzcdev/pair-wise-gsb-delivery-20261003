@@ -47,9 +47,16 @@ module Rake
 
     # Specify a hash of default values for task arguments. Use the
     # defaults only if there is no specific value for the given
-    # argument.
+    # argument.  Defaults are bound to the real formal parameters only:
+    # entries whose key is not a declared argument name are ignored.
     def with_defaults(defaults)
-      @hash = defaults.merge(@hash)
+      return if defaults.nil? || defaults.empty?
+      known = @names.map(&:to_sym)
+      defaults.each do |key, value|
+        next unless key.respond_to?(:to_sym)
+        key = key.to_sym
+        @hash[key] = value if known.include?(key) && !@hash.has_key?(key)
+      end
     end
 
     # Enumerates the arguments and their values

@@ -1,5 +1,6 @@
 # frozen_string_literal: true
 require_relative "invocation_exception_mixin"
+require_relative "invocation_identity"
 
 module Rake
 
@@ -37,6 +38,31 @@ module Rake
     # Has this task already been invoked?  Already invoked tasks
     # will be skipped unless you reenable them.
     attr_reader :already_invoked
+
+    # How multiple invocations of this task are instantiated:
+    #
+    # :single:: (default) the task is built at most once.  A later
+    #           invocation carrying a different invocation identity is a
+    #           conflict, resolved according to #conflict_policy.
+    # :multi::  the task is declared multi-instantiable: each distinct
+    #           invocation identity is an independent instance with its
+    #           own invoked state and is built once per identity.
+    attr_reader :invocation_policy
+
+    # What a :single instance task does when it is invoked with an
+    # invocation identity that conflicts with an earlier invocation:
+    #
+    # :warn::  (default) warn about the conflicting arguments and reuse
+    #          the first instance.
+    # :error:: raise a Rake::TaskArgumentError before anything runs.
+    # :reuse:: silently reuse the first instance (legacy behavior).
+    attr_reader :conflict_policy
+
+    # Declared default values for this task's formal parameters
+    # (a hash of Symbol => value, possibly empty).
+    def arg_defaults
+      @arg_defaults ||= {}
+    end
 
     # Return task name
     def to_s
@@ -106,8 +132,11 @@ module Rake
       @application     = app
       @scope           = app.current_scope
       @arg_names       = nil
+      @arg_defaults    = nil
       @locations       = []
-      @invocation_exception = nil
+      @invocation_policy = :single
+      @conflict_policy   = :warn
+      @invocations     = {}
       @order_only_prerequisites = []
     end
 
@@ -142,11 +171,74 @@ module Rake
       @arg_names || []
     end
 
+    # Set the invocation policy (+:single+ or +:multi+).  See
+    # #invocation_policy.
+    def invocation_policy=(policy)
+      policy = policy.to_sym
+      unless [:single, :multi].include?(policy)
+        fail TaskArgumentError,
+          "unknown invocation policy #{policy.inspect} for task '#{name}' " \
+          "(expected :single or :multi)"
+      end
+      @invocation_policy = policy
+    end
+
+    # Set the conflict policy (+:warn+, +:error+ or +:reuse+).  See
+    # #conflict_policy.
+    def conflict_policy=(policy)
+      policy = policy.to_sym
+      unless [:warn, :error, :reuse].include?(policy)
+        fail TaskArgumentError,
+          "unknown conflict policy #{policy.inspect} for task '#{name}' " \
+          "(expected :warn, :error or :reuse)"
+      end
+      @conflict_policy = policy
+    end
+
+    # Declare this task multi-instantiable: each distinct invocation
+    # identity is built as an independent instance.  Returns self.
+    def multi_instance!
+      self.invocation_policy = :multi
+      self
+    end
+
+    # Is this task declared multi-instantiable?
+    def multi_instance?
+      @invocation_policy == :multi
+    end
+
+    # The invocation identities recorded for this task so far, in
+    # invocation order.  A single-instance task records at most one.
+    def invocation_identities
+      @invocations.keys
+    end
+
+    # The canonical invocation identity that a call with the given
+    # arguments would have, with declared defaults applied and named
+    # arguments bound to the real formal parameters.  Unknown named
+    # arguments are reported (Rake::TaskArgumentError) just as they would
+    # be by #invoke.
+    def identity_for(*args)
+      task_args = bind_invocation_arguments(args)
+      task_args.with_defaults(arg_defaults)
+      invocation_identity_for(task_args)
+    end
+
+    # Would two invocations with the given argument lists be the same
+    # build instance of this task?  For a multi-instance task this is
+    # true exactly when both argument lists produce the same invocation
+    # identity; for a single-instance task the first invocation wins and
+    # any later invocation reuses (or conflicts with) that one instance.
+    def same_invocation_instance?(args_a, args_b)
+      !multi_instance? ||
+        identity_for(*args_a) == identity_for(*args_b)
+    end
+
     # Reenable the task, allowing its tasks to be executed if the task
-    # is invoked again.
+    # is invoked again.  All recorded invocation identities are forgotten.
     def reenable
       @already_invoked = false
-      @invocation_exception = nil
+      @invocations.clear
     end
 
     # Clear the existing prerequisites, actions, comments, and arguments of a rake task.
@@ -179,14 +271,63 @@ module Rake
     # Clear the existing arguments on a rake task.
     def clear_args
       @arg_names = nil
+      @arg_defaults = nil
       self
     end
 
     # Invoke the task if it is needed.  Prerequisites are invoked first.
+    #
+    # Arguments are bound to the task's declared formal parameters.
+    # Positional values bind in declaration order; a trailing hash of
+    # Symbol keys is treated as named arguments and binds by parameter
+    # name.  Named arguments that do not match a declared formal
+    # parameter are reported (Rake::TaskArgumentError) before any action
+    # runs.
     def invoke(*args)
-      task_args = TaskArguments.new(arg_names, args)
+      task_args = bind_invocation_arguments(args)
       invoke_with_call_chain(task_args, InvocationChain::EMPTY)
     end
+
+    # Build the TaskArguments for a top-level invocation, binding
+    # positional and named arguments to the declared formal parameters.
+    def bind_invocation_arguments(args) # :nodoc:
+      args = args.dup
+      named = {}
+      if args.last.is_a?(Hash) &&
+         args.last.keys.all? { |key| key.respond_to?(:to_sym) }
+        named = args.pop
+      end
+
+      unknown = named.keys.map(&:to_sym) - arg_names
+      unless unknown.empty?
+        fail TaskArgumentError,
+          "unknown argument#{unknown.size == 1 ? '' : 's'} " \
+          "#{unknown.map { |name| ":#{name}" }.join(', ')} " \
+          "for task '#{name}' " \
+          "(declared arguments: #{arg_names.map { |n| ":#{n}" }.join(', ')})"
+      end
+
+      values = args
+      positional_count = args.length
+      named.each do |key, value|
+        index = arg_names.index(key.to_sym)
+        if index < positional_count
+          fail TaskArgumentError,
+            "argument :#{key} for task '#{name}' was given both " \
+            "positionally and by name"
+        end
+        values[index] = value
+      end
+      TaskArguments.new(arg_names, values)
+    end
+    private :bind_invocation_arguments
+
+    # The canonical invocation identity of this task for the given
+    # (already bound) task arguments.
+    def invocation_identity_for(task_args)
+      InvocationIdentity.for_task(self, task_args)
+    end
+    private :invocation_identity_for
 
     # Same as invoke, but explicitly pass a call chain to detect
     # circular dependencies.
@@ -197,34 +338,69 @@ module Rake
     def invoke_with_call_chain(task_args, invocation_chain)
       new_chain = Rake::InvocationChain.append(self, invocation_chain)
       @lock.synchronize do
-        begin
-          if application.options.trace
-            application.trace "** Invoke #{name} #{format_trace_flags}"
-          end
+        task_args.with_defaults(arg_defaults)
+        identity = invocation_identity_for(task_args)
 
-          if @already_invoked
-            if @invocation_exception
-              if application.options.trace
-                application.trace "** Previous invocation of #{name} failed #{format_trace_flags}"
-              end
-              raise @invocation_exception
-            else
-              return
+        if application.options.trace
+          application.trace "** Invoke #{identity} #{format_trace_flags(identity)}"
+        end
+
+        if @invocations.has_key?(identity)
+          # This exact instance was already invoked: replay its outcome.
+          if exception = @invocations[identity]
+            if application.options.trace
+              application.trace "** Previous invocation of #{identity} failed #{format_trace_flags(identity)}"
             end
+            raise exception
           end
+          return
+        end
 
+        if @already_invoked && !multi_instance?
+          # A single-instance task invoked with a conflicting identity:
+          # never silently pass the first call's TaskArguments to this
+          # call.  Resolve according to the conflict policy.
+          first_identity, first_exception = @invocations.first
+          handle_conflicting_invocation(identity, first_identity)
+          raise first_exception if first_exception
+          return
+        end
+
+        begin
           @already_invoked = true
+          @invocations[identity] = nil
 
           invoke_prerequisites(task_args, new_chain)
           execute(task_args) if needed?
         rescue Exception => ex
           add_chain_to(ex, new_chain)
-          @invocation_exception = ex
+          @invocations[identity] = ex
           raise ex
         end
       end
     end
     protected :invoke_with_call_chain
+
+    # Resolve an invocation whose identity conflicts with the identity of
+    # the single instance that has already been invoked.  Raises
+    # TaskArgumentError for the :error policy, warns for the :warn policy
+    # and stays silent for the :reuse (legacy) policy.
+    def handle_conflicting_invocation(identity, first_identity) # :nodoc:
+      case conflict_policy
+      when :error
+        fail TaskArgumentError,
+          "task '#{name}' was already invoked as #{first_identity} and " \
+          "cannot also be invoked as #{identity}; declare the task " \
+          "multi-instance (invocation_policy = :multi) or reenable it " \
+          "to build it once per argument set"
+      when :warn
+        warn "Rake: task '#{name}' was already invoked as #{first_identity}; " \
+             "reusing that instance and ignoring the conflicting " \
+             "invocation #{identity}"
+      end
+      nil
+    end
+    private :handle_conflicting_invocation
 
     def add_chain_to(exception, new_chain) # :nodoc:
       exception.extend(InvocationExceptionMixin) unless
@@ -257,10 +433,21 @@ module Rake
       futures.reverse_each(&:value)
     end
 
-    # Format the trace flags for display.
-    def format_trace_flags
+    # Format the trace flags for display.  The flags state whether this
+    # invocation is the first one, a repeat of an already seen instance,
+    # a new instance of a multi-instance task, or a conflicting argument
+    # set for a single-instance task.
+    def format_trace_flags(identity=nil)
       flags = []
-      flags << "first_time" unless @already_invoked
+      if identity && @invocations.has_key?(identity)
+        flags << "same_instance"
+      elsif @already_invoked && !multi_instance?
+        flags << "conflicting_instance"
+      elsif @already_invoked
+        flags << "new_instance"
+      else
+        flags << "first_time"
+      end
       flags << "not_needed" unless needed?
       flags.empty? ? "" : "(" + flags.join(", ") + ")"
     end
@@ -344,8 +531,19 @@ module Rake
     private :first_sentence
 
     # Set the names of the arguments for this task. +args+ should be
-    # an array of symbols, one for each argument name.
+    # an array of symbols, one for each argument name.  A trailing hash
+    # declares additional formal parameters together with their default
+    # values, e.g. `set_arg_names([:a, { b: 2 }])` declares parameter
+    # +:a+ and parameter +:b+ defaulting to 2.
     def set_arg_names(args)
+      args = args.dup
+      if args.last.is_a?(Hash)
+        defaults = args.pop
+        @arg_defaults = defaults.each_with_object({}) do |(key, value), hash|
+          hash[key.to_sym] = value
+        end
+        args += @arg_defaults.keys
+      end
       @arg_names = args.map(&:to_sym)
     end
 
@@ -365,6 +563,16 @@ module Rake
       end
       latest_prereq = prerequisite_tasks.map(&:timestamp).max
       result <<  "latest-prerequisite time: #{latest_prereq}\n"
+      result <<  "invocation policy: #{invocation_policy}" \
+                 " (conflict policy: #{conflict_policy})\n"
+      if @invocations.empty?
+        result << "invocations: none\n"
+      else
+        result << "invocations:\n"
+        @invocations.each_key do |identity|
+          result << "--#{identity}\n"
+        end
+      end
       result << "................................\n\n"
       return result
     end
