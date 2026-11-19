@@ -1,0 +1,22 @@
+HTTP/1.1 200 OK
+connection: keep-alive
+content-length: 85
+last-modified: Fri, 24 Nov 2023 16:19:44 GMT
+etag: "69edc1c17a302c40bb3de97084c31619"
+cache-control: max-age=60, public
+content-type: text/plain; charset=utf-8
+digest: sha-256="GzkArpMU/5IZWWSHE5b69D6a+6uc8HB2W0y4K+Jfuqs="
+repr-digest: sha-256="GzkArpMU/5IZWWSHE5b69D6a+6uc8HB2W0y4K+Jfuqs="
+via: 1.1 varnish, 1.1 varnish
+x-backend: fastlyshield--shield_ssl_cache_bfi_krnt7300061_BFI 167.82.143.61:443
+accept-ranges: bytes
+date: Mon, 05 Jan 2026 06:53:48 GMT
+age: 3101
+x-served-by: cache-bfi-krnt7300061-BFI, cache-tyo11933-TYO
+x-cache: HIT, HIT
+x-cache-hits: 103426, 4
+x-timer: S1767596028.377831,VS0,VE0
+server: RubyGems.org
+
+---
+1.1.3 |checksum:9f0c746f68a25b5e1d4abce94e2442419a56933ec8e73f808d403c9e7e136e94

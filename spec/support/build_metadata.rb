@@ -1,0 +1,55 @@
+# frozen_string_literal: true
+
+require_relative "path"
+require_relative "helpers"
+
+module Spec
+  module BuildMetadata
+    include Spec::Path
+    include Spec::Helpers
+
+    def write_build_metadata(dir: source_root, built_at: release_date)
+      build_metadata = {
+        git_commit_sha: git_commit_sha,
+        built_at: built_at,
+      }
+
+      replace_build_metadata(build_metadata, dir: dir)
+    end
+
+    def reset_build_metadata(dir: source_root)
+      build_metadata = {
+        built_at: nil,
+      }
+
+      replace_build_metadata(build_metadata, dir: dir)
+    end
+
+    private
+
+    def replace_build_metadata(build_metadata, dir:)
+      build_metadata_file = File.expand_path("lib/bundler/build_metadata.rb", dir)
+
+      ivars = build_metadata.sort.map do |k, v|
+        "    @#{k} = #{loaded_gemspec.send(:ruby_code, v)}"
+      end.join("\n")
+
+      contents = File.read(build_metadata_file)
+      contents.sub!(/^(\s+# begin ivars).+(^\s+# end ivars)/m, "\\1\n#{ivars}\n\\2")
+      File.open(build_metadata_file, "w") {|f| f << contents }
+    end
+
+    def git_commit_sha
+      git_repository? ? git("rev-parse --short HEAD", source_root).strip : "unknown"
+    end
+
+    # Required lazily because ruby/ruby ships this helper without tool/changelog.rb.
+    def release_date
+      require source_root.join("tool/changelog").to_s
+
+      ChangelogHeader.from_config.release_date
+    end
+
+    extend self
+  end
+end

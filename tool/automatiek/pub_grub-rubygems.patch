@@ -1,0 +1,69 @@
+diff --git a/lib/rubygems/vendor/pub_grub/lib/pub_grub.rb b/lib/rubygems/vendor/pub_grub/lib/pub_grub.rb
+--- a/lib/rubygems/vendor/pub_grub/lib/pub_grub.rb
++++ b/lib/rubygems/vendor/pub_grub/lib/pub_grub.rb
+@@ -1,3 +1,7 @@
++# Skip reloading when an identical copy (e.g. the one shipped inside the Bundler
++# gem) was already required from a different path, to avoid redefinition warnings.
++return if defined?(Gem::PubGrub::VERSION)
++
+ require_relative "pub_grub/package"
+ require_relative "pub_grub/static_package_source"
+ require_relative "pub_grub/term"
+@@ -11,6 +15,32 @@
+ require_relative 'pub_grub/version'
+
+ module Gem::PubGrub
++  # Minimal logger that doesn't require the 'logger' gem
++  class NullLogger
++    def info(&block); end
++    def debug(&block); end
++    def warn(&block); end
++    def error(&block); end
++  end
++
++  class StderrLogger
++    def info(&block)
++      $stderr.puts "INFO: #{block.call}" if block
++    end
++
++    def debug(&block)
++      $stderr.puts "DEBUG: #{block.call}" if block
++    end
++
++    def warn(&block)
++      $stderr.puts "WARN: #{block.call}" if block
++    end
++
++    def error(&block)
++      $stderr.puts "ERROR: #{block.call}" if block
++    end
++  end
++
+   class << self
+     attr_writer :logger
+
+@@ -21,11 +47,7 @@
+     private
+
+     def default_logger
+-      require "logger"
+-
+-      logger = ::Logger.new(STDERR)
+-      logger.level = $DEBUG ? ::Logger::DEBUG : ::Logger::WARN
+-      @logger = logger
++      @logger = $DEBUG ? StderrLogger.new : NullLogger.new
+     end
+   end
+ end
+diff --git a/lib/rubygems/vendor/pub_grub/lib/pub_grub/strategy.rb b/lib/rubygems/vendor/pub_grub/lib/pub_grub/strategy.rb
+--- a/lib/rubygems/vendor/pub_grub/lib/pub_grub/strategy.rb
++++ b/lib/rubygems/vendor/pub_grub/lib/pub_grub/strategy.rb
+@@ -27,7 +27,7 @@
+       versions = @source.versions_for(package, range)
+
+       indexes = @version_indexes[package]
+-      versions.min_by { |version| indexes[version] }
++      versions.min_by { |version| indexes[version] || Float::INFINITY }
+     end
+
+     def next_term_to_try_from(unsatisfied)

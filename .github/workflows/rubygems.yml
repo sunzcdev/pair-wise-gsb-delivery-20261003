@@ -1,0 +1,171 @@
+name: rubygems
+
+on:
+  pull_request:
+
+  push:
+    branches:
+      - master
+
+concurrency:
+  group: ci-${{ github.ref }}-${{ github.workflow }}
+  cancel-in-progress: true
+
+permissions:  # added using https://github.com/step-security/secure-workflows
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  rubygems:
+    name: Rubygems on ${{ matrix.os.name }} (${{ matrix.ruby.name }})
+    runs-on: ${{ matrix.os.value }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - { name: Ubuntu, value: ubuntu-24.04 }
+          - { name: macOS, value: macos-26 }
+          - { name: Windows, value: windows-2025 }
+
+        ruby:
+          - { name: "3.2", value: 3.2.11 }
+          - { name: "3.3", value: 3.3.11 }
+          - { name: "3.4", value: 3.4.9 }
+          - { name: "4.0", value: 4.0.5 }
+
+        include:
+          # Regression coverage for the Intel architecture with the latest Ruby only
+          - ruby: { name: "4.0", value: 4.0.5 }
+            os: { name: macOS-intel, value: macos-15-intel }
+
+          - ruby: { name: jruby, value: jruby-10.1.2.0 }
+            os: { name: Ubuntu, value: ubuntu-24.04 }
+
+          - ruby: { name: jruby, value: jruby-10.1.2.0 }
+            os: { name: macOS, value: macos-26 }
+
+          - ruby: { name: jruby, value: jruby-10.1.2.0 }
+            os: { name: Windows, value: windows-2025 }
+
+          - ruby: { name: truffleruby, value: truffleruby-34.0.1 }
+            os: { name: Ubuntu, value: ubuntu-24.04 }
+
+          - ruby: { name: 4.0 (psych), value: 4.0.5 }
+            os: { name: Ubuntu, value: ubuntu-24.04 }
+            use_psych: true
+
+          - ruby: { name: no symlinks, value: 4.0.5 }
+            os: { name: Windows, value: windows-2025 }
+            symlink: off
+    env:
+      RUBYGEMS_USE_PSYCH: ${{ matrix.use_psych || 'false' }}
+
+    steps:
+      - name: disable development mode on Windows
+        run: powershell -c "Set-ItemProperty -Path HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\AppModelUnlock -Name AllowDevelopmentWithoutDevLicense -Value 0"
+        if: matrix.symlink == 'off'
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Setup ruby
+        uses: ruby/setup-ruby@14594264cd68ce8a2345dd349bc3d138a4ef85c8 # v1.327.0
+        with:
+          ruby-version: ${{ matrix.ruby.value }}
+          bundler: none
+      - name: Install Dependencies
+        run: bin/rake setup
+      - name: Run Test
+        run: bin/rake test
+        if: matrix.ruby.name != 'truffleruby' && matrix.ruby.name != 'jruby' && matrix.symlink != 'off'
+      - name: Run Test isolatedly
+        run: bin/rake test:isolated
+        if: matrix.ruby.name == '3.4' && matrix.os.name != 'Windows'
+      - name: Run Test (JRuby)
+        run: JRUBY_OPTS=--debug bin/rake test
+        if: startsWith(matrix.ruby.name, 'jruby')
+      - name: Run Test (Truffleruby)
+        run: TRUFFLERUBYOPT="--experimental-options --testing-rubygems" bin/rake test
+        if: matrix.ruby.name == 'truffleruby'
+      - name: Run Test with non-Admin user
+        run: |
+          gem inst win32-process --no-doc --conservative
+          ruby bin/windows_run_as_user ruby -S rake test
+        if: matrix.symlink == 'off'
+
+    timeout-minutes: 60
+
+  rubygems-openssl:
+    name: RubyGems with AWS-LC
+    runs-on: ubuntu-24.04
+    env:
+      # The last release whose ML-DSA long names are MLDSAxx rather than
+      # ML-DSA-xx, so Gem::Security.ml_dsa_key? has to match by OID here.
+      AWS_LC_VERSION: v5.8.0
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Restore AWS-LC cache
+        id: cache-aws-lc
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/openssl
+          key: aws-lc-${{ env.AWS_LC_VERSION }}-${{ runner.os }}-${{ runner.arch }}
+
+      - name: Compile AWS-LC
+        if: steps.cache-aws-lc.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p tmp/build-aws-lc
+          cd tmp/build-aws-lc
+          git clone --depth 1 --branch "$AWS_LC_VERSION" https://github.com/aws/aws-lc.git .
+          cmake -DCMAKE_INSTALL_PREFIX="$HOME/openssl" -DCMAKE_INSTALL_LIBDIR=lib
+          make -j4
+          make install
+
+      - name: Setup ruby
+        uses: ruby/setup-ruby@14594264cd68ce8a2345dd349bc3d138a4ef85c8 # v1.327.0
+        with:
+          ruby-version: 4.0.5
+          bundler: none
+
+      - name: Install Ruby OpenSSL against AWS-LC
+        run: |
+          gem install openssl --no-document -- --with-openssl-dir="$HOME/openssl"
+          ruby -e 'spec = Gem::Specification.find_by_name("openssl"); puts "RUBYLIB=#{spec.full_require_paths.join(File::PATH_SEPARATOR)}"' >> "$GITHUB_ENV"
+
+      - name: Verify AWS-LC
+        run: |
+          ruby -ropenssl -e '
+            abort "Ruby OpenSSL did not load AWS-LC" unless OpenSSL::OPENSSL_VERSION.include?("AWS-LC")
+            puts "Ruby OpenSSL #{OpenSSL::VERSION}: #{OpenSSL::OPENSSL_VERSION}"
+          '
+
+      - name: Install Dependencies
+        run: bin/rake setup
+
+      - name: Run Test
+        run: bin/rake test
+
+    timeout-minutes: 60
+
+  all-pass:
+    name: All rubygems jobs pass
+
+    if: always()
+
+    needs:
+      - rubygems
+      - rubygems-openssl
+
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: check dependent jobs
+        uses: re-actors/alls-green@b5b5b37504aa4183270bd3d855c52a67f212be35 # v1.3.0
+        with:
+          jobs: ${{ toJSON(needs) }}

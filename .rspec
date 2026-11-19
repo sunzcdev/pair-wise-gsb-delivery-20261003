@@ -1,0 +1,6 @@
+--color
+--warnings
+--backtrace
+-I lib
+--require spec_helper
+--order random

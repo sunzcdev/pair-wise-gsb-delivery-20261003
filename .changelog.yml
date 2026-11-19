@@ -1,0 +1,82 @@
+---
+
+header_template: "## %new_version / %release_date"
+
+entry_template: "* %title. Pull request [#%pull_request_number](%pull_request_url) by %pull_request_authors"
+
+extra_entry:
+  template: "* %title."
+  label: "rubygems: enhancement"
+
+already_released_template: Changes already released in %released_in are not repeated here.
+
+release_date_format: "%Y-%m-%d"
+
+# Commit authors that are tooling rather than people to credit. GitHub app
+# accounts, whose login ends in `[bot]`, are dropped without being listed.
+excluded_credit_logins:
+  - claude
+  - Copilot
+
+# The accounts of one person: the account they are credited as, followed by
+# the ones they have also committed under, so that one person is not listed
+# twice.
+credit_aliases:
+  byroot:
+    - casperisfine
+  the-spectator:
+    - akshay-birajdar-zendesk
+
+library_headings:
+  rubygems: RubyGems
+  bundler: Bundler
+
+changelog_label_mapping:
+  "rubygems: feature": "Features:"
+  "bundler: feature": "Features:"
+  "rubygems: performance": "Performance:"
+  "bundler: performance": "Performance:"
+  "rubygems: enhancement": "Enhancements:"
+  "bundler: enhancement": "Enhancements:"
+  "rubygems: bug fix": "Bug fixes:"
+  "bundler: bug fix": "Bug fixes:"
+  "rubygems: security": "Security:"
+  "bundler: security": "Security:"
+  "rubygems: breaking change": "Breaking changes:"
+  "bundler: breaking change": "Breaking changes:"
+  "rubygems: deprecation": "Deprecations:"
+  "bundler: deprecation": "Deprecations:"
+  "rubygems: documentation": "Documentation:"
+  "bundler: documentation": "Documentation:"
+  "rubygems: skip changelog": null
+  "bundler: skip changelog": null
+
+patch_level_labels:
+  - "rubygems: enhancement"
+  - "bundler: enhancement"
+  - "rubygems: bug fix"
+  - "bundler: bug fix"
+  - "rubygems: security"
+  - "bundler: security"
+  - "rubygems: documentation"
+  - "bundler: documentation"
+  - "rubygems: skip changelog"
+  - "bundler: skip changelog"
+
+# The line before the stable one. Its patch releases, and those of any older
+# line, take only the labels below, and leave out a pull request labelled with
+# skip_old_stable_label, which still goes into the stable line. Move it to the
+# outgoing stable line when a minor version is released. It is not the
+# previous stable branch that tool/release.rb derives, which is the line a
+# minor release follows.
+old_stable_branch: "4.0"
+
+old_stable_labels:
+  - "rubygems: bug fix"
+  - "bundler: bug fix"
+  - "rubygems: security"
+  - "bundler: security"
+  - "rubygems: documentation"
+  - "bundler: documentation"
+
+skip_old_stable_label: skip old stable

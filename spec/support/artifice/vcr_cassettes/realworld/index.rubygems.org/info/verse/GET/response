@@ -1,0 +1,40 @@
+HTTP/1.1 200 OK
+connection: keep-alive
+content-length: 712
+content-type: text/plain; charset=utf-8
+x-frame-options: SAMEORIGIN
+x-xss-protection: 0
+x-content-type-options: nosniff
+x-permitted-cross-domain-policies: none
+referrer-policy: strict-origin-when-cross-origin
+cross-origin-opener-policy: same-origin
+etag: "e884589a7e62dc8c76dcc1e3c0a1e4b3"
+last-modified: Sat, 30 Sep 2023 00:47:53 GMT
+digest: sha-256=Yz4Ezghwc1Wt2OcHtG/dj8t5aLdhSjWe+Kw66JrgVKk=
+repr-digest: sha-256=:Yz4Ezghwc1Wt2OcHtG/dj8t5aLdhSjWe+Kw66JrgVKk=:
+cache-control: max-age=60, public
+content-security-policy: default-src 'self'; font-src 'self' https://fonts.gstatic.com; img-src 'self' data: https://secure.gaug.es https://gravatar.com https://www.gravatar.com https://secure.gravatar.com https://*.fastly-insights.com https://avatars.githubusercontent.com; object-src 'none'; script-src 'self' 'sha256-azSWmMHKuxlIULceWMzTCcGRpzgQb+ekrQnQm8duQMU=' https://secure.gaug.es https://www.fastly-insights.com 'nonce-e5ea1370ee99bfb24d22e4a106356fd1'; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; connect-src 'self' https://s3-us-west-2.amazonaws.com/rubygems-dumps/ https://*.fastly-insights.com https://fastly-insights.com https://api.github.com http://localhost:*; form-action 'self' https://github.com/login/oauth/authorize; frame-ancestors 'self'; base-uri 'self'; report-uri https://csp-report.browser-intake-datadoghq.com/api/v2/logs?dd-api-key=pub852fa3e2312391fafa5640b60784e660&dd-evp-origin=content-security-policy&ddsource=csp-report&ddtags=service%3Arubygems.org%2Cversion%3Aac9955d21ea46bab8d3c128de6e4eb36715798e0%2Cenv%3Aproduction%2Ctrace_id%3A69452799000000001cbcda8644cd88bc
+x-request-id: 9eb7f236-d31b-45df-b254-bca9945feb9f
+x-runtime: 0.005891
+strict-transport-security: max-age=31536000; includeSubDomains
+fastly-restarts: 1
+via: 1.1 varnish, 1.1 varnish
+x-backend: F_Rails 16.146.221.17:443, fastlyshield--shield_ssl_cache_bfi_kbfi7400056_BFI 167.82.142.56:443
+accept-ranges: bytes
+date: Mon, 05 Jan 2026 06:54:06 GMT
+age: 1481
+x-served-by: cache-bfi-kbfi7400056-BFI, cache-tyo11956-TYO
+x-cache: HIT, HIT
+x-cache-hits: 112229, 5
+x-timer: S1767596046.242231,VS0,VE0
+vary: Accept,Accept-Encoding
+server: RubyGems.org
+
+---
+0.1.0 |checksum:9b7fe268f31ba247bd9b916ced2c022fa7d780b05c866ab5ae717b058b4c4373
+0.1.1 |checksum:920dd386ee9e0d6b6b1e5a285378b29926152ce22a341c29c4cf6fd2b9d4855c
+0.2.0 unicode_utils:~> 1.4.0|checksum:884236c5b87d712420786d11fa1f79ce91e9c5be5ebf770448f0ece65cfa11e8
+0.2.1 unicode_utils:~> 1.4.0|checksum:8a259dffc7234f5e9920d8d500324c3006a045c4dd8c6ba57ededd79ecb11a92
+0.3.0 unicode_utils:~> 1.4.0|checksum:afe5ca20b3527c6fc4889d9ad822fbc86a83fe28dcd6bff52c4193f5e7c1263d
+0.4.0 unicode_utils:~> 1.4.0|checksum:e02110665cbfdf3ff61cbe523977d1a253539108f41547577e4f7221cc0d9f37
+0.5.0 unicode-display_width:~> 1.1.0,unicode_utils:~> 1.4.0|checksum:4c8af6322b91e115a772af1acdf99952e391ad14890577674e11e52d474af2e0

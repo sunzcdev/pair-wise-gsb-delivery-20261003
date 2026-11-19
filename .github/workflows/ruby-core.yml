@@ -1,0 +1,180 @@
+name: ruby-core
+
+on:
+  pull_request:
+
+  push:
+    branches:
+      - master
+
+concurrency:
+  group: ci-${{ github.ref }}-${{ github.workflow }}
+  cancel-in-progress: true
+
+permissions:  # added using https://github.com/step-security/secure-workflows
+  contents: read
+
+jobs:
+  ruby_core:
+    name: ${{matrix.target}} under a ruby-core / ${{matrix.branch}}
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [Rubygems, Bundler]
+        branch: [ruby_3_4, ruby_4_0, master]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ruby/ruby
+          path: ruby/ruby
+          ref: ${{ matrix.branch }}
+          persist-credentials: false
+      - uses: ruby/setup-ruby@14594264cd68ce8a2345dd349bc3d138a4ef85c8 # v1.327.0
+        with:
+          ruby-version: 3.4
+          bundler: none
+      - name: Install libraries
+        run: |
+          set -x
+          sudo apt-get update -q || :
+          sudo apt-get install --no-install-recommends -q -y build-essential libssl-dev libyaml-dev libreadline6-dev zlib1g-dev libncurses5-dev libffi-dev libgdbm-dev bison autoconf
+      - name: Build Ruby
+        id: build
+        run: |
+          export GNUMAKEFLAGS="-j$((1 + $(nproc)))"
+          ./autogen.sh
+          ./configure -C --disable-install-doc
+          make
+        working-directory: ruby/ruby
+        continue-on-error: true
+      - name: Skip tests when ruby/ruby does not build
+        run: echo "::warning::ruby/ruby ${BRANCH} failed to build, so the tests were skipped"
+        env:
+          BRANCH: ${{ matrix.branch }}
+        if: steps.build.outcome == 'failure'
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: rubygems/rubygems
+          persist-credentials: false
+        if: matrix.branch == 'ruby_3_4'
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: ruby/rubygems
+          persist-credentials: false
+        if: matrix.branch != 'ruby_3_4'
+      - name: Adjust sync tool for the legacy Bundler layout (ruby_3_4)
+        run: |
+          sed -i 's|/bundler/spec"|/spec"|g' tool/sync_default_gems.rb
+          sed -i 's|/bundler/bin/|/bin/|g' tool/sync_default_gems.rb
+          sed -i 's|upstream}/bundler/lib/|upstream}/lib/|g' tool/sync_default_gems.rb
+          sed -i 's|upstream}/bundler/exe/|upstream}/exe/|g' tool/sync_default_gems.rb
+          sed -i 's|upstream}/bundler/bundler.gemspec|upstream}/bundler.gemspec|g' tool/sync_default_gems.rb
+        working-directory: ruby/ruby
+        if: matrix.branch == 'ruby_3_4'
+      - name: Adjust sync tool for the legacy Bundler layout (ruby_4_0)
+        run: |
+          sed -i 's|\["bundler/spec", "spec/bundler"\]|["spec", "spec/bundler"]|' tool/sync_default_gems.rb
+          sed -i 's|\["bundler/bin/#{binstub}", "spec/bin/#{binstub}"\]|["bin/#{binstub}", "spec/bin/#{binstub}"]|' tool/sync_default_gems.rb
+          sed -i 's|\["bundler/lib/bundler.rb", "lib/bundler.rb"\]|["lib/bundler.rb", "lib/bundler.rb"]|' tool/sync_default_gems.rb
+          sed -i 's|\["bundler/lib/bundler", "lib/bundler"\]|["lib/bundler", "lib/bundler"]|' tool/sync_default_gems.rb
+          sed -i 's|\["bundler/exe/bundle", "libexec/bundle"\]|["exe/bundle", "libexec/bundle"]|' tool/sync_default_gems.rb
+          sed -i 's|\["bundler/exe/bundler", "libexec/bundler"\]|["exe/bundler", "libexec/bundler"]|' tool/sync_default_gems.rb
+          sed -i 's|\["bundler/bundler.gemspec", "lib/bundler/bundler.gemspec"\]|["bundler.gemspec", "lib/bundler/bundler.gemspec"]|' tool/sync_default_gems.rb
+        working-directory: ruby/ruby
+        if: matrix.branch == 'ruby_4_0'
+      - name: Sync tools
+        run: |
+          ruby tool/sync_default_gems.rb rubygems
+          mv spec/bundler/support/bundle spec/bin/bundle 2>/dev/null || true
+        working-directory: ruby/ruby
+      - name: Test RubyGems
+        run: make -s test-all TESTS="--no-retry -j$((1 + $(nproc)))"
+        working-directory: ruby/ruby
+        if: steps.build.outcome == 'success' && matrix.target == 'Rubygems'
+      - name: Test Bundler
+        run: |
+          git add .
+          make test-bundler-parallel
+        working-directory: ruby/ruby
+        if: steps.build.outcome == 'success' && matrix.target == 'Bundler'
+
+  ruby_core_master:
+    name: ${{ matrix.suite.name }} on a ruby-core master build${{ matrix.box && ' (RUBY_BOX=1)' || '' }}
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        suite:
+          - { name: Rubygems, deps: setup, task: test:parallel }
+          - { name: Bundler, deps: spec:deps, task: spec:regular, rubyopt: --disable-gems }
+        box: [false, true]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ruby/ruby
+          path: ruby/ruby
+          ref: master
+          persist-credentials: false
+      - uses: ruby/setup-ruby@14594264cd68ce8a2345dd349bc3d138a4ef85c8 # v1.327.0
+        with:
+          ruby-version: 3.4
+          bundler: none
+      - name: Install libraries
+        run: |
+          set -x
+          sudo apt-get update -q || :
+          sudo apt-get install --no-install-recommends -q -y build-essential libssl-dev libyaml-dev libreadline6-dev zlib1g-dev libncurses5-dev libffi-dev libgdbm-dev bison autoconf
+      - name: Build and install Ruby
+        id: build
+        run: |
+          export GNUMAKEFLAGS="-j$((1 + $(nproc)))"
+          ./autogen.sh
+          # libruby-static.a bundles the JIT's Rust std with its symbols localized, so the Rust newgem's `cargo test` cannot link against it.
+          ./configure -C --disable-install-doc --enable-shared --prefix="$RUNNER_TEMP/ruby"
+          make
+          make install
+          echo "$RUNNER_TEMP/ruby/bin" >> "$GITHUB_PATH"
+        working-directory: ruby/ruby
+        continue-on-error: true
+      - name: Skip tests when ruby/ruby does not build
+        run: echo "::warning::ruby/ruby master failed to build, so the tests were skipped"
+        if: steps.build.outcome == 'failure'
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: rubygems
+          persist-credentials: false
+      - name: Install dependencies
+        run: |
+          ruby -v
+          bin/rake ${{ matrix.suite.deps }}
+        env:
+          RUBYOPT: ${{ matrix.suite.rubyopt }}
+        working-directory: rubygems
+        if: steps.build.outcome == 'success'
+      - name: Run Test
+        run: bin/rake ${{ matrix.suite.task }}
+        env:
+          RUBYOPT: ${{ matrix.suite.rubyopt }}
+          RUBY_BOX: ${{ matrix.box && '1' || '' }}
+        working-directory: rubygems
+        if: steps.build.outcome == 'success'
+
+    timeout-minutes: 90
+
+  all-pass:
+    name: All ruby-core jobs pass
+
+    if: always()
+
+    needs:
+      - ruby_core
+      - ruby_core_master
+
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: check dependent jobs
+        uses: re-actors/alls-green@b5b5b37504aa4183270bd3d855c52a67f212be35 # v1.3.0
+        with:
+          jobs: ${{ toJSON(needs) }}

@@ -1,0 +1,49 @@
+HTTP/1.1 200 OK
+connection: keep-alive
+content-length: 2198
+content-type: text/plain; charset=utf-8
+x-frame-options: SAMEORIGIN
+x-xss-protection: 0
+x-content-type-options: nosniff
+x-permitted-cross-domain-policies: none
+referrer-policy: strict-origin-when-cross-origin
+cross-origin-opener-policy: same-origin
+etag: "5a7104af187e09f99679b18bb4fa298b"
+last-modified: Sat, 30 Sep 2023 08:40:15 GMT
+digest: sha-256=CvmyQnzpLg8cxv3zSTkAnNSnjAGIVY0aV2oCTRzWgFc=
+repr-digest: sha-256=:CvmyQnzpLg8cxv3zSTkAnNSnjAGIVY0aV2oCTRzWgFc=:
+cache-control: max-age=60, public
+content-security-policy: default-src 'self'; font-src 'self' https://fonts.gstatic.com; img-src 'self' data: https://secure.gaug.es https://gravatar.com https://www.gravatar.com https://secure.gravatar.com https://*.fastly-insights.com https://avatars.githubusercontent.com; object-src 'none'; script-src 'self' 'sha256-azSWmMHKuxlIULceWMzTCcGRpzgQb+ekrQnQm8duQMU=' https://secure.gaug.es https://www.fastly-insights.com 'nonce-9be0f8032959747a5bb1020c252853c4'; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; connect-src 'self' https://s3-us-west-2.amazonaws.com/rubygems-dumps/ https://*.fastly-insights.com https://fastly-insights.com https://api.github.com http://localhost:*; form-action 'self' https://github.com/login/oauth/authorize; frame-ancestors 'self'; base-uri 'self'; report-uri https://csp-report.browser-intake-datadoghq.com/api/v2/logs?dd-api-key=pub852fa3e2312391fafa5640b60784e660&dd-evp-origin=content-security-policy&ddsource=csp-report&ddtags=service%3Arubygems.org%2Cversion%3Aac9955d21ea46bab8d3c128de6e4eb36715798e0%2Cenv%3Aproduction%2Ctrace_id%3A6953c22e000000003ec358784cdfba69
+x-request-id: cbd905cb-3417-4fb7-bd00-dbf1feb4335e
+x-runtime: 0.006919
+strict-transport-security: max-age=31536000; includeSubDomains
+fastly-restarts: 1
+via: 1.1 varnish, 1.1 varnish
+x-backend: F_Rails 16.144.125.99:443, fastlyshield--shield_ssl_cache_bfi_krnt7300058_BFI 167.82.143.58:443
+accept-ranges: bytes
+age: 2240
+date: Mon, 05 Jan 2026 06:54:06 GMT
+x-served-by: cache-bfi-krnt7300058-BFI, cache-tyo11947-TYO
+x-cache: HIT, HIT
+x-cache-hits: 37328, 0
+x-timer: S1767596046.188661,VS0,VE2
+vary: Accept,Accept-Encoding
+server: RubyGems.org
+
+---
+0.1.0 tty-screen:~> 0.2.0,tty-which:~> 0.1.0,verse:~> 0.4.0|checksum:96a70dee8cacb6524570e344ce40f3bdfe4e2e1ff4906d2e2449588ace3a388e
+0.2.0 tty-screen:~> 0.2.0,tty-which:~> 0.1.0,verse:~> 0.4.0|checksum:67b91fab26b9fc02b0beca4458504a984543a2540e2ccfd7b9844725c3e7f31d
+0.3.0 tty-screen:~> 0.4.0,tty-which:~> 0.1.0,verse:~> 0.4.0|checksum:1d1c82346097ca09900f329c22cacbbfd4dc660a7623cc53134ba2f665bd8fca
+0.4.0 tty-screen:~> 0.5.0,tty-which:~> 0.1.0,verse:~> 0.4.0|checksum:ef5bcdf33441afd30a4356683b6935b782479a146ecf34b4ddbbe7cc100143a0
+0.5.0 tty-screen:~> 0.5.0,tty-which:~> 0.2.0,verse:~> 0.5.0|checksum:a7a7d05c931708c35953beb73e0dd5ef0486c85296739bfccf7cfde03e45bc80
+0.6.0 tty-screen:~> 0.5.0,tty-which:~> 0.2.0,verse:~> 0.5.0|checksum:8368100fc4b87320c913e869efa463ce9f24ffe9d0f0cdf4ec27ee4dc6e94763
+0.7.0 tty-screen:~> 0.5.0,tty-which:~> 0.3.0,verse:~> 0.5.0|checksum:01141a37b127c3f91d6a95ee48e74340f89ca42678a9f5a31a4c41392f08942b
+0.7.1 tty-screen:~> 0.5.0,tty-which:~> 0.3.0,verse:~> 0.5.0|checksum:24c77c961222fd285ff30ba4d7b84c52f39ef4df70e260b422872fa6bf8584d0
+0.8.0 tty-screen:~> 0.5.0,tty-which:~> 0.3.0,verse:~> 0.5.0|checksum:daa5147c3c2d92365aac440c182e929f42e339ff9ace4c0ac88dc2c44b0d4fd8
+0.9.0 tty-screen:~> 0.5.0,tty-which:~> 0.3.0,verse:~> 0.5.0|checksum:ba5b42805139be2e4b5c6530cc0a5d67ae1ccd053f161631f0a35b4b21d84ac9
+0.10.0 tty-screen:~> 0.6.0,tty-which:~> 0.3.0,verse:~> 0.5.0|checksum:14df3f0ea86558df3886669db374132ae6ea4eab7b993c1fa5494be0704cc371,ruby:>= 2.0.0
+0.11.0 strings:~> 0.1.0,tty-screen:~> 0.6.4,tty-which:~> 0.3.0|checksum:a9baca909c3f5cbe151cb576783eca3ebab84034781a0e5e0817e563f3619177,ruby:>= 2.0.0
+0.12.0 strings:~> 0.1.4,tty-screen:~> 0.6,tty-which:~> 0.4|checksum:92111a5009c0c1992ec00236ecdd8edd1c173628e330d451897d831288280f90,ruby:>= 2.0.0
+0.12.1 strings:~> 0.1.4,tty-screen:~> 0.6,tty-which:~> 0.4|checksum:42b9dd3fc2db6dd247a0057743d06fb0b570b58be08dae832ce21aa59813f619,ruby:>= 2.0.0
+0.13.0 strings:~> 0.1.8,tty-screen:~> 0.8|checksum:0132ef99617110b7a699c5b0d481c4786c6326bab380e48fc40afe0c0b6103b7,ruby:>= 2.0.0
+0.14.0 strings:~> 0.2.0,tty-screen:~> 0.8|checksum:9f90e63d45433e37f3096c666820f1b6634bcc876924c8479b3dfd2f5df6e033,ruby:>= 2.0.0

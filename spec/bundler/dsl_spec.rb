@@ -1,0 +1,712 @@
+# frozen_string_literal: true
+
+RSpec.describe Bundler::Dsl do
+  before do
+    @rubygems = double("rubygems")
+    allow(Bundler::Source::Rubygems).to receive(:new) { @rubygems }
+  end
+
+  describe "#git_source" do
+    it "registers custom hosts" do
+      subject.git_source(:example) {|repo_name| "git@git.example.com:#{repo_name}.git" }
+      subject.git_source(:foobar) {|repo_name| "git@foobar.com:#{repo_name}.git" }
+      subject.gem("dobry-pies", example: "strzalek/dobry-pies")
+      example_uri = "git@git.example.com:strzalek/dobry-pies.git"
+      expect(subject.dependencies.first.source.uri).to eq(example_uri)
+    end
+
+    it "raises exception on invalid hostname" do
+      expect do
+        subject.git_source(:group) {|repo_name| "git@git.example.com:#{repo_name}.git" }
+      end.to raise_error(Bundler::InvalidOption)
+    end
+
+    it "expects block passed" do
+      expect { subject.git_source(:example) }.to raise_error(Bundler::InvalidOption)
+    end
+
+    it "converts :github PR to URI using https" do
+      subject.gem("sparks", github: "https://github.com/indirect/sparks/pull/5")
+      github_uri = "https://github.com/indirect/sparks.git"
+      expect(subject.dependencies.first.source.uri).to eq(github_uri)
+      expect(subject.dependencies.first.source.ref).to eq("refs/pull/5/head")
+    end
+
+    it "converts :gitlab PR to URI using https" do
+      subject.gem("sparks", gitlab: "https://gitlab.com/indirect/sparks/-/merge_requests/5")
+      gitlab_uri = "https://gitlab.com/indirect/sparks.git"
+      expect(subject.dependencies.first.source.uri).to eq(gitlab_uri)
+      expect(subject.dependencies.first.source.ref).to eq("refs/merge-requests/5/head")
+    end
+
+    it "rejects :github PR URI with a branch, ref or tag" do
+      expect do
+        subject.gem("sparks", github: "https://github.com/indirect/sparks/pull/5", branch: "foo")
+      end.to raise_error(
+        Bundler::GemfileError,
+        %(The :branch option can't be used with `github: "https://github.com/indirect/sparks/pull/5"`),
+      )
+
+      expect do
+        subject.gem("sparks", github: "https://github.com/indirect/sparks/pull/5", ref: "foo")
+      end.to raise_error(
+        Bundler::GemfileError,
+        %(The :ref option can't be used with `github: "https://github.com/indirect/sparks/pull/5"`),
+      )
+
+      expect do
+        subject.gem("sparks", github: "https://github.com/indirect/sparks/pull/5", tag: "foo")
+      end.to raise_error(
+        Bundler::GemfileError,
+        %(The :tag option can't be used with `github: "https://github.com/indirect/sparks/pull/5"`),
+      )
+    end
+
+    it "rejects :gitlab PR URI with a branch, ref or tag" do
+      expect do
+        subject.gem("sparks", gitlab: "https://gitlab.com/indirect/sparks/-/merge_requests/5", branch: "foo")
+      end.to raise_error(
+        Bundler::GemfileError,
+        %(The :branch option can't be used with `gitlab: "https://gitlab.com/indirect/sparks/-/merge_requests/5"`),
+      )
+
+      expect do
+        subject.gem("sparks", gitlab: "https://gitlab.com/indirect/sparks/-/merge_requests/5", ref: "foo")
+      end.to raise_error(
+        Bundler::GemfileError,
+        %(The :ref option can't be used with `gitlab: "https://gitlab.com/indirect/sparks/-/merge_requests/5"`),
+      )
+
+      expect do
+        subject.gem("sparks", gitlab: "https://gitlab.com/indirect/sparks/-/merge_requests/5", tag: "foo")
+      end.to raise_error(
+        Bundler::GemfileError,
+        %(The :tag option can't be used with `gitlab: "https://gitlab.com/indirect/sparks/-/merge_requests/5"`),
+      )
+    end
+
+    it "rejects :github with :git" do
+      expect do
+        subject.gem("sparks", github: "indirect/sparks", git: "https://github.com/indirect/sparks.git")
+      end.to raise_error(
+        Bundler::GemfileError,
+        %(The :git option can't be used with `github: "indirect/sparks"`),
+      )
+    end
+
+    it "rejects :gitlab with :git" do
+      expect do
+        subject.gem("sparks", gitlab: "indirect/sparks", git: "https://gitlab.com/indirect/sparks.git")
+      end.to raise_error(
+        Bundler::GemfileError,
+        %(The :git option can't be used with `gitlab: "indirect/sparks"`),
+      )
+    end
+
+    context "default hosts" do
+      it "converts :github to URI using https" do
+        subject.gem("sparks", github: "indirect/sparks")
+        github_uri = "https://github.com/indirect/sparks.git"
+        expect(subject.dependencies.first.source.uri).to eq(github_uri)
+      end
+
+      it "converts :github shortcut to URI using https" do
+        subject.gem("sparks", github: "rails")
+        github_uri = "https://github.com/rails/rails.git"
+        expect(subject.dependencies.first.source.uri).to eq(github_uri)
+      end
+
+      it "converts :gitlab to URI using https" do
+        subject.gem("sparks", gitlab: "indirect/sparks")
+        gitlab_uri = "https://gitlab.com/indirect/sparks.git"
+        expect(subject.dependencies.first.source.uri).to eq(gitlab_uri)
+      end
+
+      it "converts :gitlab shortcut to URI using https" do
+        subject.gem("sparks", gitlab: "rails")
+        gitlab_uri = "https://gitlab.com/rails/rails.git"
+        expect(subject.dependencies.first.source.uri).to eq(gitlab_uri)
+      end
+
+      it "converts numeric :gist to :git" do
+        subject.gem("not-really-a-gem", gist: 2_859_988)
+        github_uri = "https://gist.github.com/2859988.git"
+        expect(subject.dependencies.first.source.uri).to eq(github_uri)
+      end
+
+      it "converts :gist to :git" do
+        subject.gem("not-really-a-gem", gist: "2859988")
+        github_uri = "https://gist.github.com/2859988.git"
+        expect(subject.dependencies.first.source.uri).to eq(github_uri)
+      end
+
+      it "converts :bitbucket to :git" do
+        subject.gem("not-really-a-gem", bitbucket: "mcorp/flatlab-rails")
+        bitbucket_uri = "https://mcorp@bitbucket.org/mcorp/flatlab-rails.git"
+        expect(subject.dependencies.first.source.uri).to eq(bitbucket_uri)
+      end
+
+      it "converts 'mcorp' to 'mcorp/mcorp'" do
+        subject.gem("not-really-a-gem", bitbucket: "mcorp")
+        bitbucket_uri = "https://mcorp@bitbucket.org/mcorp/mcorp.git"
+        expect(subject.dependencies.first.source.uri).to eq(bitbucket_uri)
+      end
+    end
+
+    context "default git sources" do
+      it "has bitbucket, gist, github, and gitlab" do
+        expect(subject.instance_variable_get(:@git_sources).keys.sort).to eq(%w[bitbucket gist github gitlab])
+      end
+    end
+  end
+
+  describe "#method_missing" do
+    it "raises an error for unknown DSL methods" do
+      expect(Bundler).to receive(:read_file).with(git_root.join("Gemfile").to_s).
+        and_return("unknown")
+
+      error_msg = "There was an error parsing `Gemfile`: Undefined local variable or method `unknown' for Gemfile. Bundler cannot continue."
+      expect { subject.eval_gemfile("Gemfile") }.
+        to raise_error(Bundler::GemfileError, Regexp.new(error_msg))
+    end
+  end
+
+  describe "#eval_gemfile" do
+    it "handles syntax errors with a useful message" do
+      expect(Bundler).to receive(:read_file).with(git_root.join("Gemfile").to_s).and_return("}")
+      expect { subject.eval_gemfile("Gemfile") }.
+        to raise_error(Bundler::GemfileError, /There was an error parsing `Gemfile`: (syntax error, unexpected tSTRING_DEND|(compile error - )?syntax error, unexpected '\}'|.+?unexpected '}', ignoring it\n). Bundler cannot continue./m)
+    end
+
+    it "distinguishes syntax errors from evaluation errors" do
+      expect(Bundler).to receive(:read_file).with(git_root.join("Gemfile").to_s).and_return(
+        "ruby '2.1.5', :engine => 'ruby', :engine_version => '1.2.4'"
+      )
+      expect { subject.eval_gemfile("Gemfile") }.
+        to raise_error(Bundler::GemfileError, /There was an error evaluating `Gemfile`: ruby_version must match the :engine_version for MRI/)
+    end
+
+    it "populates __dir__ and __FILE__ correctly" do
+      abs_path = git_root.join("../fragment.rb").to_s
+      expect(Bundler).to receive(:read_file).with(abs_path).and_return(<<~RUBY)
+        @fragment_dir = __dir__
+        @fragment_file = __FILE__
+      RUBY
+      subject.eval_gemfile("../fragment.rb")
+      expect(subject.instance_variable_get(:@fragment_dir)).to eq(git_root.dirname.to_s)
+      expect(subject.instance_variable_get(:@fragment_file)).to eq(abs_path)
+    end
+  end
+
+  describe "#gem" do
+    # rubocop:disable Naming/VariableNumber
+    [:ruby, :ruby_18, :ruby_19, :ruby_20, :ruby_21, :ruby_22, :ruby_23, :ruby_24, :ruby_25, :ruby_26, :ruby_27,
+     :ruby_30, :ruby_31, :ruby_32, :ruby_33, :ruby_34, :ruby_40, :mri, :mri_18, :mri_19, :mri_20, :mri_21, :mri_22, :mri_23, :mri_24,
+     :mri_25, :mri_26, :mri_27, :mri_30, :mri_31, :mri_32, :mri_33, :mri_34, :mri_40, :jruby, :rbx, :truffleruby].each do |platform|
+      it "allows #{platform} as a valid platform" do
+        subject.gem("foo", platform: platform)
+      end
+    end
+    # rubocop:enable Naming/VariableNumber
+
+    it "allows platforms matching the running Ruby version" do
+      platform = "ruby_#{RbConfig::CONFIG["MAJOR"]}#{RbConfig::CONFIG["MINOR"]}"
+
+      expect { subject.gem("foo", platform: platform) }.not_to raise_error
+      expect(Bundler.current_ruby.respond_to?("#{platform}?")).to be_truthy
+    end
+
+    it "rejects invalid platforms" do
+      expect { subject.gem("foo", platform: :bogus) }.
+        to raise_error(Bundler::GemfileError, /is not a valid platform/)
+    end
+
+    it "warn for legacy windows platforms" do
+      expect(Bundler::SharedHelpers).to receive(:feature_deprecated!).with(/\APlatform :mswin, :x64_mingw will be removed in the future./)
+      subject.gem("foo", platforms: [:mswin, :jruby, :x64_mingw])
+    end
+
+    it "rejects empty gem name" do
+      expect { subject.gem("") }.
+        to raise_error(Bundler::GemfileError, /an empty gem name is not valid/)
+    end
+
+    it "rejects with a leading space in the name" do
+      expect { subject.gem(" foo") }.
+        to raise_error(Bundler::GemfileError, /' foo' is not a valid gem name because it contains whitespace/)
+    end
+
+    it "rejects with a trailing space in the name" do
+      expect { subject.gem("foo ") }.
+        to raise_error(Bundler::GemfileError, /'foo ' is not a valid gem name because it contains whitespace/)
+    end
+
+    it "rejects with a space in the gem name" do
+      expect { subject.gem("fo o") }.
+        to raise_error(Bundler::GemfileError, /'fo o' is not a valid gem name because it contains whitespace/)
+    end
+
+    it "rejects with a tab in the gem name" do
+      expect { subject.gem("fo\to") }.
+        to raise_error(Bundler::GemfileError, /'fo\to' is not a valid gem name because it contains whitespace/)
+    end
+
+    it "rejects with a newline in the gem name" do
+      expect { subject.gem("fo\no") }.
+        to raise_error(Bundler::GemfileError, /'fo\no' is not a valid gem name because it contains whitespace/)
+    end
+
+    it "rejects with a carriage return in the gem name" do
+      expect { subject.gem("fo\ro") }.
+        to raise_error(Bundler::GemfileError, /'fo\ro' is not a valid gem name because it contains whitespace/)
+    end
+
+    it "rejects with a form feed in the gem name" do
+      expect { subject.gem("fo\fo") }.
+        to raise_error(Bundler::GemfileError, /'fo\fo' is not a valid gem name because it contains whitespace/)
+    end
+
+    it "rejects symbols as gem name" do
+      expect { subject.gem(:foo) }.
+        to raise_error(Bundler::GemfileError, /You need to specify gem names as Strings. Use 'gem "foo"' instead/)
+    end
+
+    it "rejects branch option on non-git gems" do
+      expect { subject.gem("foo", branch: "test") }.
+        to raise_error(Bundler::GemfileError, /The `branch` option for `gem 'foo'` is not allowed. Only gems with a git source can specify a branch/)
+    end
+
+    it "allows specifying a branch on git gems" do
+      subject.gem("foo", branch: "test", git: "http://mytestrepo")
+      dep = subject.dependencies.last
+      expect(dep.name).to eq "foo"
+    end
+
+    it "allows specifying a branch on git gems with a git_source" do
+      subject.git_source(:test_source) {|n| "https://github.com/#{n}" }
+      subject.gem("foo", branch: "test", test_source: "bundler/bundler")
+      dep = subject.dependencies.last
+      expect(dep.name).to eq "foo"
+    end
+  end
+
+  describe "#platforms" do
+    it "warn for legacy windows platforms" do
+      expect(Bundler::SharedHelpers).to receive(:feature_deprecated!).with(/\APlatform :mswin64, :mingw will be removed in the future./)
+      subject.platforms(:mswin64, :jruby, :mingw) do
+        subject.gem("foo")
+      end
+    end
+  end
+
+  context "can bundle groups of gems with" do
+    # git "https://github.com/rails/rails.git" do
+    #   gem "railties"
+    #   gem "action_pack"
+    #   gem "active_model"
+    # end
+    describe "#git" do
+      it "from a single repo" do
+        rails_gems = %w[railties action_pack active_model]
+        subject.git "https://github.com/rails/rails.git" do
+          rails_gems.each {|rails_gem| subject.send :gem, rails_gem }
+        end
+        expect(subject.dependencies.map(&:name)).to match_array rails_gems
+      end
+    end
+
+    # github 'spree' do
+    #   gem 'spree_core'
+    #   gem 'spree_api'
+    #   gem 'spree_backend'
+    # end
+    describe "#github" do
+      it "from github" do
+        spree_gems = %w[spree_core spree_api spree_backend]
+        subject.github "spree" do
+          spree_gems.each {|spree_gem| subject.send :gem, spree_gem }
+        end
+
+        subject.dependencies.each do |d|
+          expect(d.source.uri).to eq("https://github.com/spree/spree.git")
+        end
+      end
+    end
+  end
+
+  describe "syntax errors" do
+    it "will raise a Bundler::GemfileError" do
+      gemfile "gem 'foo', :path => /unquoted/string/syntax/error"
+      expect { Bundler::Dsl.evaluate(bundled_app_gemfile, nil, true) }.
+        to raise_error(Bundler::GemfileError, /There was an error parsing `Gemfile`:( compile error -)?.+?unknown regexp options - trg.+ Bundler cannot continue./m)
+    end
+  end
+
+  describe "Runtime errors" do
+    it "will raise a Bundler::GemfileError" do
+      gemfile "raise RuntimeError, 'foo'"
+      expect { Bundler::Dsl.evaluate(bundled_app_gemfile, nil, true) }.
+        to raise_error(Bundler::GemfileError, /There was an error parsing `Gemfile`: foo. Bundler cannot continue./i)
+    end
+  end
+
+  describe "#with_source" do
+    context "if there was a rubygem source already defined" do
+      it "restores it after it's done" do
+        other_source = double("other-source")
+        allow(Bundler::Source::Rubygems).to receive(:new).and_return(other_source)
+        allow(Bundler).to receive(:default_gemfile).and_return(Pathname.new("./Gemfile"))
+
+        subject.source("https://other-source.org") do
+          subject.gem("dobry-pies", path: "foo")
+          subject.gem("foo")
+        end
+
+        expect(subject.dependencies.last.source).to eq(other_source)
+      end
+    end
+  end
+
+  describe "#source with cooldown" do
+    before do
+      allow(@rubygems).to receive(:add_remote)
+      allow(@rubygems).to receive(:remote_cooldowns).and_return({})
+    end
+
+    it "accepts a non-negative integer" do
+      expect do
+        subject.source("https://rubygems.org", cooldown: 7)
+      end.not_to raise_error
+    end
+
+    it "accepts 0 as an explicit disable" do
+      expect do
+        subject.source("https://rubygems.org", cooldown: 0)
+      end.not_to raise_error
+    end
+
+    it "rejects a string" do
+      expect do
+        subject.source("https://rubygems.org", cooldown: "7")
+      end.to raise_error(Bundler::InvalidOption, /non-negative integer/)
+    end
+
+    it "rejects a float" do
+      expect do
+        subject.source("https://rubygems.org", cooldown: 7.5)
+      end.to raise_error(Bundler::InvalidOption, /non-negative integer/)
+    end
+
+    it "rejects a negative integer" do
+      expect do
+        subject.source("https://rubygems.org", cooldown: -7)
+      end.to raise_error(Bundler::InvalidOption, /non-negative integer/)
+    end
+
+    it "rejects an array" do
+      expect do
+        subject.source("https://rubygems.org", cooldown: [7])
+      end.to raise_error(Bundler::InvalidOption, /non-negative integer/)
+    end
+  end
+
+  describe "#override" do
+    it "stores an Override for a gem with a version: operation" do
+      subject.override("rails", version: ">= 8.0")
+
+      expect(subject.overrides.size).to eq(1)
+      override = subject.overrides.first
+      expect(override.target).to eq("rails")
+      expect(override.field).to eq(:version)
+      expect(override.operation).to eq(">= 8.0")
+    end
+
+    it "accepts :ignore_upper as the operation" do
+      subject.override("nokogiri", version: :ignore_upper)
+      expect(subject.overrides.first.operation).to eq(:ignore_upper)
+    end
+
+    it "accepts nil as the operation" do
+      subject.override("legacy", version: nil)
+      expect(subject.overrides.first.operation).to be_nil
+    end
+
+    it "appends to overrides across multiple statements" do
+      subject.override("rails", version: ">= 8.0")
+      subject.override("nokogiri", version: :ignore_upper)
+      expect(subject.overrides.map(&:target)).to eq(["rails", "nokogiri"])
+    end
+
+    it "is empty by default" do
+      expect(subject.overrides).to eq([])
+    end
+
+    it "raises ArgumentError when target is :all and version: is given" do
+      expect do
+        subject.override(:all, version: ">= 8.0")
+      end.to raise_error(ArgumentError, /`override :all, version:` is not allowed/)
+    end
+
+    it "rejects :all + version: even when other fields are also given" do
+      expect do
+        subject.override(:all, required_ruby_version: :ignore_upper, version: ">= 8.0")
+      end.to raise_error(ArgumentError, /`override :all, version:` is not allowed/)
+    end
+
+    it "does not record any override when :all + version: is rejected" do
+      expect do
+        subject.override(:all, version: ">= 8.0")
+      end.to raise_error(ArgumentError)
+      expect(subject.overrides).to eq([])
+    end
+
+    it "raises ArgumentError when target is neither :all nor a string" do
+      expect do
+        subject.override(:rails, version: ">= 8.0")
+      end.to raise_error(ArgumentError, /target must be :all or a gem name string/)
+    end
+
+    it "raises ArgumentError for an unsupported field" do
+      expect do
+        subject.override("rails", as: "y")
+      end.to raise_error(ArgumentError, /unsupported override field `as:`/)
+    end
+
+    it "stores an Override for a gem with a required_ruby_version: operation" do
+      subject.override("rails", required_ruby_version: :ignore_upper)
+      override = subject.overrides.first
+      expect(override.target).to eq("rails")
+      expect(override.field).to eq(:required_ruby_version)
+      expect(override.operation).to eq(:ignore_upper)
+    end
+
+    it "stores an Override for a gem with a required_rubygems_version: operation" do
+      subject.override("rails", required_rubygems_version: nil)
+      override = subject.overrides.first
+      expect(override.field).to eq(:required_rubygems_version)
+      expect(override.operation).to be_nil
+    end
+
+    it "stores an Override targeting :all with a metadata field" do
+      subject.override(:all, required_ruby_version: :ignore_upper)
+      override = subject.overrides.first
+      expect(override.target).to eq(:all)
+      expect(override.field).to eq(:required_ruby_version)
+      expect(override.operation).to eq(:ignore_upper)
+    end
+
+    it "stores an Override targeting :all with required_rubygems_version" do
+      subject.override(:all, required_rubygems_version: nil)
+      override = subject.overrides.first
+      expect(override.target).to eq(:all)
+      expect(override.field).to eq(:required_rubygems_version)
+    end
+
+    it "raises ArgumentError for a non-string, non-symbol, non-nil operation" do
+      expect do
+        subject.override("rails", version: 42)
+      end.to raise_error(ArgumentError, /override operation must be a String, Symbol, or nil/)
+    end
+
+    it "raises ArgumentError for an unsupported symbol operation" do
+      expect do
+        subject.override("rails", version: :explode)
+      end.to raise_error(ArgumentError, /unsupported override operation/)
+    end
+
+    it "raises ArgumentError for an unparsable version string" do
+      expect do
+        subject.override("rails", version: "not a version")
+      end.to raise_error(ArgumentError, /invalid override version requirement/)
+    end
+
+    it "does not record an override when the version string is invalid" do
+      expect do
+        subject.override("rails", version: "not a version")
+      end.to raise_error(ArgumentError)
+      expect(subject.overrides).to eq([])
+    end
+
+    it "rejects atomically when one field in a multi-field call is invalid" do
+      expect do
+        subject.override("rails", version: ">= 8.0", as: "y")
+      end.to raise_error(ArgumentError, /unsupported override field/)
+      expect(subject.overrides).to eq([])
+    end
+
+    it "raises ArgumentError when the same target and field are overridden twice" do
+      subject.override("rails", version: ">= 8.0")
+      expect do
+        subject.override("rails", version: :ignore_upper)
+      end.to raise_error(ArgumentError, /duplicate override for "rails" `version:`/)
+    end
+
+    it "keeps the original override when a duplicate is rejected" do
+      subject.override("rails", version: ">= 8.0")
+      expect do
+        subject.override("rails", version: :ignore_upper)
+      end.to raise_error(ArgumentError)
+      expect(subject.overrides.size).to eq(1)
+      expect(subject.overrides.first.operation).to eq(">= 8.0")
+    end
+
+    it "allows different targets with the same field" do
+      subject.override("rails", version: ">= 8.0")
+      subject.override("nokogiri", version: :ignore_upper)
+      expect(subject.overrides.size).to eq(2)
+    end
+
+    it "stores a with:/in: override that drops a dependency" do
+      subject.override("em-websocket", with: nil, in: "jekyll")
+      override = subject.overrides.first
+      expect(override.target).to eq("em-websocket")
+      expect(override.from).to eq("jekyll")
+      expect(override.field).to eq(:with)
+      expect(override.operation).to be_nil
+      expect(override.requirement).to be_nil
+    end
+
+    it "stores a with:/in: override that replaces a dependency" do
+      subject.override("grpc", with: "grpc-lite", in: "google-cloud-pubsub", version: ">= 2")
+      override = subject.overrides.first
+      expect(override.operation).to eq("grpc-lite")
+      expect(override.requirement).to eq(">= 2")
+    end
+
+    it "allows overriding the same target from different gems" do
+      subject.override("grpc", with: "grpc-lite", in: "a")
+      subject.override("grpc", with: "grpc-lite", in: "b")
+      expect(subject.overrides.size).to eq(2)
+    end
+
+    it "allows a with:/in: override next to a version: override on the same target" do
+      subject.override("grpc", version: ">= 1")
+      subject.override("grpc", with: nil, in: "a")
+      expect(subject.overrides.size).to eq(2)
+    end
+
+    it "rejects with: without in:" do
+      expect do
+        subject.override("grpc", with: "grpc-lite")
+      end.to raise_error(ArgumentError, /`override "grpc", with:` requires `in:`/)
+    end
+
+    it "rejects in: without with:" do
+      expect do
+        subject.override("grpc", in: "a", version: ">= 2")
+      end.to raise_error(ArgumentError, /`override "grpc", in:` requires `with:`/)
+    end
+
+    it "rejects to:, which with: replaced" do
+      expect do
+        subject.override("grpc", in: "a", to: nil)
+      end.to raise_error(ArgumentError, /`override "grpc", in:` requires `with:`/)
+    end
+
+    it "points the from: and to: of 4.1.0.beta2 at with: and in:" do
+      expect do
+        subject.override("grpc", from: "a", to: "grpc-lite")
+      end.to raise_error(ArgumentError, /write `override "grpc", with: "grpc-lite", in: "a"`/)
+    end
+
+    it "points from: without to: at with: and in:" do
+      expect do
+        subject.override("grpc", from: "a")
+      end.to raise_error(ArgumentError, /write `override "grpc", with: "<gem>", in: "a"`/)
+    end
+
+    it "rejects to: next to with:" do
+      expect do
+        subject.override("grpc", with: nil, in: "a", to: nil)
+      end.to raise_error(ArgumentError, /unsupported override field `to:` with `in:`/)
+    end
+
+    it "rejects to: without in:" do
+      expect do
+        subject.override("grpc", to: "grpc-lite")
+      end.to raise_error(ArgumentError, /unsupported override field `to:`;/)
+    end
+
+    it "rejects in: on an :all target" do
+      expect do
+        subject.override(:all, with: nil, in: "a")
+      end.to raise_error(ArgumentError, /`override :all` does not accept `in:`/)
+    end
+
+    it "rejects an in: that is not a string" do
+      expect do
+        subject.override("grpc", with: nil, in: :a)
+      end.to raise_error(ArgumentError, /`in:` must be a gem name string/)
+    end
+
+    it "rejects a with: that is neither a string nor nil" do
+      expect do
+        subject.override("grpc", with: :grpc_lite, in: "a")
+      end.to raise_error(ArgumentError, /`with:` must be a gem name string or nil/)
+    end
+
+    it "rejects a with: naming the target itself" do
+      expect do
+        subject.override("grpc", with: "grpc", in: "a")
+      end.to raise_error(ArgumentError, /`with:` must name a gem other than "grpc" and "a"/)
+    end
+
+    it "rejects a with: naming the in: gem" do
+      expect do
+        subject.override("grpc", with: "a", in: "a")
+      end.to raise_error(ArgumentError, /`with:` must name a gem other than "grpc" and "a"/)
+    end
+
+    it "rejects an empty with:" do
+      expect do
+        subject.override("grpc", with: "", in: "a")
+      end.to raise_error(Bundler::GemfileError, /an empty gem name is not valid/)
+    end
+
+    ["foo bar", ":all", "rails\nbad", "rails@1"].each do |name|
+      it "rejects the target #{name.inspect}" do
+        expect { subject.override(name, version: ">= 1") }.to raise_error(Bundler::GemfileError, /not a valid gem name/)
+      end
+
+      it "rejects the in: #{name.inspect}" do
+        expect { subject.override("grpc", with: nil, in: name) }.to raise_error(Bundler::GemfileError, /not a valid gem name/)
+      end
+
+      it "rejects the with: #{name.inspect}" do
+        expect { subject.override("grpc", with: name, in: "a") }.to raise_error(Bundler::GemfileError, /not a valid gem name/)
+      end
+    end
+
+    it "rejects an in: containing whitespace" do
+      expect do
+        subject.override("grpc", with: nil, in: "google cloud")
+      end.to raise_error(Bundler::GemfileError, /'google cloud' is not a valid gem name because it contains whitespace/)
+    end
+
+    it "rejects version: when with: drops the dependency" do
+      expect do
+        subject.override("grpc", with: nil, in: "a", version: ">= 2")
+      end.to raise_error(ArgumentError, /requires `with:` to name a replacement gem/)
+    end
+
+    it "rejects a version: with in: that is not a requirement string" do
+      expect do
+        subject.override("grpc", with: "grpc-lite", in: "a", version: :ignore_upper)
+      end.to raise_error(ArgumentError, /must be a version requirement string/)
+    end
+
+    it "rejects fields other than version: with in:" do
+      expect do
+        subject.override("grpc", with: "grpc-lite", in: "a", required_ruby_version: nil)
+      end.to raise_error(ArgumentError, /unsupported override field `required_ruby_version:` with `in:`/)
+    end
+
+    it "rejects a duplicate target and in:" do
+      subject.override("grpc", with: nil, in: "a")
+      expect do
+        subject.override("grpc", with: "grpc-lite", in: "a")
+      end.to raise_error(ArgumentError, /duplicate override for "grpc" `in: "a"`/)
+      expect(subject.overrides.size).to eq(1)
+    end
+  end
+end

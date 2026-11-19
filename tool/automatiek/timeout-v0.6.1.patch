@@ -1,0 +1,19 @@
+diff --git a/lib/rubygems/vendor/timeout/lib/timeout.rb b/lib/rubygems/vendor/timeout/lib/timeout.rb
+--- a/lib/rubygems/vendor/timeout/lib/timeout.rb
++++ b/lib/rubygems/vendor/timeout/lib/timeout.rb
+@@ -1,5 +1,5 @@
+ # frozen_string_literal: true
+-# Gem::Timeout long-running blocks
++# Timeout long-running blocks
+ #
+ # == Synopsis
+ #
+@@ -277,7 +277,7 @@
+   # the block will not be interrupted.
+   def self.timeout(sec, klass = nil, message = nil, &block)   #:yield: +sec+
+     return yield(sec) if sec == nil or sec.zero?
+-    raise ArgumentError, "Gem::Timeout sec must be a non-negative number" if 0 > sec
++    raise ArgumentError, "Timeout sec must be a non-negative number" if 0 > sec
+ 
+     message ||= "execution expired"
+ 

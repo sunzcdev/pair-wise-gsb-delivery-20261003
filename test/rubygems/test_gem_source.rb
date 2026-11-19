@@ -1,0 +1,500 @@
+# frozen_string_literal: true
+
+require_relative "helper"
+require "rubygems/source"
+
+class TestGemSource < Gem::TestCase
+  def tuple(*args)
+    Gem::NameTuple.new(*args)
+  end
+
+  def setup
+    super
+
+    @specs = spec_fetcher do |fetcher|
+      fetcher.spec "a", "1.a"
+      fetcher.gem  "a", 1
+      fetcher.spec "a", 2
+      fetcher.spec "b", 2
+    end
+
+    @source = Gem::Source.new(@gem_repo)
+  end
+
+  def test_initialize_invalid_uri
+    assert_raise Gem::URI::InvalidURIError do
+      Gem::Source.new "git@example:a.git"
+    end
+  end
+
+  def test_initialize_git
+    repository = "git@example:a.git"
+
+    source = Gem::Source::Git.new "a", repository, nil, false
+
+    assert_equal repository, source.uri
+  end
+
+  def test_cache_dir_escapes_windows_paths
+    uri = Gem::URI.parse("file:///C:/WINDOWS/Temp/gem_repo")
+    root = Gem.spec_cache_dir
+    cache_dir = @source.cache_dir(uri).gsub(root, "")
+    assert !cache_dir.include?(":"), "#{cache_dir} should not contain a :"
+  end
+
+  def test_dependency_resolver_set_bundler_api
+    response = Gem::Net::HTTPResponse.new "1.1", 200, "OK"
+    response.uri = Gem::URI("http://example")
+
+    @fetcher.data["#{@gem_repo}versions"] = response
+
+    set = @source.dependency_resolver_set
+
+    assert_kind_of Gem::Resolver::APISet, set
+  end
+
+  def test_dependency_resolver_set_file_uri
+    empty_dump = Gem::Util.gzip("\x04\x08[\x05".b)
+    File.binwrite(File.join(@tempdir, "prerelease_specs.4.8.gz"), empty_dump)
+    File.binwrite(File.join(@tempdir, "specs.4.8.gz"), empty_dump)
+
+    source = Gem::Source.new "file://#{@tempdir}/"
+
+    set = source.dependency_resolver_set
+
+    assert_kind_of Gem::Resolver::IndexSet, set
+  end
+
+  def test_dependency_resolver_set_marshal_api
+    set = @source.dependency_resolver_set
+
+    assert_kind_of Gem::Resolver::IndexSet, set
+  end
+
+  def test_fetch_spec
+    a1 = @specs["a-1"]
+
+    spec_uri = "#{@gem_repo}#{Gem::MARSHAL_SPEC_DIR}#{a1.spec_name}"
+
+    spec = @source.fetch_spec tuple("a", Gem::Version.new(1), "ruby")
+    assert_equal a1.full_name, spec.full_name
+
+    cache_dir = @source.cache_dir Gem::URI.parse(spec_uri)
+
+    cache_file = File.join cache_dir, a1.spec_name
+
+    assert File.exist?(cache_file)
+  end
+
+  def test_fetch_spec_cached
+    a1 = @specs["a-1"]
+
+    spec_uri = "#{@gem_repo}/#{Gem::MARSHAL_SPEC_DIR}#{a1.spec_name}"
+    @fetcher.data["#{spec_uri}.rz"] = nil
+
+    cache_dir = @source.cache_dir Gem::URI.parse(spec_uri)
+    FileUtils.mkdir_p cache_dir
+
+    cache_file = File.join cache_dir, a1.spec_name
+
+    File.open cache_file, "wb" do |io|
+      Marshal.dump a1, io
+    end
+
+    spec = @source.fetch_spec tuple("a", Gem::Version.new(1), "ruby")
+    assert_equal a1.full_name, spec.full_name
+  end
+
+  def test_fetch_spec_platform
+    specs = spec_fetcher(&:legacy_platform)
+
+    spec = @source.fetch_spec tuple("pl", Gem::Version.new(1), "i386-linux")
+
+    assert_equal specs["pl-1-x86-linux"].full_name, spec.full_name
+  end
+
+  def test_fetch_spec_platform_ruby
+    spec = @source.fetch_spec tuple("a", Gem::Version.new(1), nil)
+    assert_equal @specs["a-1"].full_name, spec.full_name
+
+    spec = @source.fetch_spec tuple("a", Gem::Version.new(1), "")
+    assert_equal @specs["a-1"].full_name, spec.full_name
+  end
+
+  def test_fetch_spec_path_traversal
+    escape = File.expand_path(File.join(Gem.spec_cache_dir, "..", "owned.gemspec"))
+
+    name_tuple = tuple("../owned", Gem::Version.new(1), "ruby")
+
+    e = assert_raise Gem::Exception do
+      @source.fetch_spec name_tuple
+    end
+
+    assert_includes e.message, "malformed spec name"
+    refute File.exist?(escape), "spec must not be written outside the spec cache"
+  end
+
+  def test_load_specs
+    released = @source.load_specs(:released).map(&:full_name)
+    assert_equal %W[a-2 a-1 b-2], released
+
+    cache_dir = File.join Gem.spec_cache_dir, "gems.example.com%80"
+    assert File.exist?(cache_dir), "#{cache_dir} does not exist"
+
+    cache_file = File.join cache_dir, "specs.#{Gem.marshal_version}"
+    assert File.exist?(cache_file)
+  end
+
+  def test_load_specs_compact_index
+    a1 = util_spec "a", "1"
+    a2 = util_spec "a", "2"
+    a3_pre = util_spec "a", "3.a"
+    b2_java = util_spec "b", "2" do |s|
+      s.platform = "java"
+    end
+
+    util_setup_compact_index a1, a2, a3_pre, b2_java
+
+    released = @source.load_specs(:released).map(&:full_name)
+    assert_equal %w[a-1 a-2 b-2-java], released
+
+    latest = @source.load_specs(:latest).map(&:full_name)
+    assert_equal %w[a-2 b-2-java], latest
+
+    prerelease = @source.load_specs(:prerelease).map(&:full_name)
+    assert_equal %w[a-3.a], prerelease
+
+    cache_dir = File.join Gem.spec_cache_dir, "compact_index", "gems.example.com%80"
+    assert File.exist?(File.join(cache_dir, "versions")), "versions cache file does not exist"
+  end
+
+  def test_load_specs_compact_index_content_addressable_metadata
+    spec = util_ca_spec("a", "1", "abcdef12", ruby_abi: "3.3", platform: "x86_64-linux")
+    util_setup_compact_index(spec)
+
+    specs = @source.load_specs(:released)
+    refute @fetcher.requests.any? {|req| req.path.end_with?("/info/a") }
+
+    spec = @source.decode_content_addressable_tuples(specs).first
+
+    assert_equal "a-1-abcdef12", spec.full_name
+    assert_equal "x86_64-linux", spec.platform
+    assert_equal "abcdef12", spec.content_address
+    assert_equal "3.3", spec.ruby_abi
+  end
+
+  def test_load_specs_compact_index_skips_content_addressable_rows_without_metadata
+    versions_body = +"created_at: 2026-01-01T00:00:00Z\n---\na 1-abcdef12 0000\n"
+    versions_response = util_compact_index_response(versions_body)
+    versions_response.uri = Gem::URI("#{@gem_repo}versions")
+    @fetcher.data["#{@gem_repo}versions"] = versions_response
+    @fetcher.data["#{@gem_repo}info/a"] = util_compact_index_response("---\n")
+
+    specs = @source.load_specs(:released)
+
+    assert_empty @source.decode_content_addressable_tuples(specs)
+  end
+
+  def test_load_specs_compact_index_skips_content_addressable_rows_without_required_platform
+    versions_body = +"created_at: 2026-01-01T00:00:00Z\n---\na 1-abcdef12 0000\n"
+    versions_response = util_compact_index_response(versions_body)
+    versions_response.uri = Gem::URI("#{@gem_repo}versions")
+    @fetcher.data["#{@gem_repo}versions"] = versions_response
+    @fetcher.data["#{@gem_repo}info/a"] = util_compact_index_response("---\n1-abcdef12 |checksum:123,ruby:~> 3.3.0\n")
+
+    specs = @source.load_specs(:released)
+
+    assert_empty @source.decode_content_addressable_tuples(specs)
+  end
+
+  def test_load_specs_compact_index_does_not_infer_ruby_abi_from_broad_ruby_requirement
+    spec = util_ca_spec("a", "1", "abcdef12", required_ruby_version: ">= 3.3", platform: "x86_64-linux")
+    util_setup_compact_index(spec)
+
+    spec = @source.decode_content_addressable_tuples(@source.load_specs(:released)).first
+
+    assert_equal "x86_64-linux", spec.platform
+    assert_equal "abcdef12", spec.content_address
+    assert_nil spec.ruby_abi
+  end
+
+  def test_load_specs_compact_index_latest_keeps_content_addressable_ruby_abi_variants
+    a1 = util_ca_spec("a", "1", "abcdef12", ruby_abi: "3.3", platform: "x86_64-linux")
+    a2 = util_ca_spec("a", "1", "fedcba98", ruby_abi: "3.4", platform: "x86_64-linux")
+    util_setup_compact_index(a1, a2)
+
+    specs = @source.decode_content_addressable_tuples(@source.load_specs(:latest))
+
+    assert_equal %w[a-1-abcdef12 a-1-fedcba98], specs.map(&:full_name).sort
+    assert_equal %w[3.3 3.4], specs.map(&:ruby_abi).sort
+  end
+
+  def test_decode_content_addressable_tuples_latest_groups_by_gem_name_before_platform
+    aa = util_ca_spec("aa", "7.1", "aaaa1111", ruby_abi: "3.3", platform: "x86_64-linux")
+    ab = util_ca_spec("ab", "1.5", "bbbb2222", ruby_abi: "3.3", platform: "x86_64-linux")
+    ac = util_ca_spec("ac", "6.4", "cccc3333", ruby_abi: "3.3", platform: "x86_64-linux")
+    ad = util_ca_spec("ad", "1.16", "dddd4444", ruby_abi: "3.3", platform: "x86_64-linux")
+    util_setup_compact_index(aa, ab, ac, ad)
+
+    specs = @source.decode_content_addressable_tuples(@source.load_specs(:released), latest: true)
+
+    assert_equal %w[aa-7.1-aaaa1111 ab-1.5-bbbb2222 ac-6.4-cccc3333 ad-1.16-dddd4444], specs.map(&:full_name).sort
+  end
+
+  def test_load_specs_compact_index_decodes_mixed_content_addressable_and_platform_entries
+    a1_ca = util_ca_spec("a", "1", "abcdef12", ruby_abi: "3.3", platform: "x86_64-linux")
+    a1_platform = util_spec("a", "1") {|s| s.platform = Gem::Platform.new("x86_64-linux") }
+    util_setup_compact_index(a1_ca, a1_platform)
+
+    specs = @source.load_specs(:released)
+    decoded = @source.decode_content_addressable_tuples(specs)
+
+    assert_equal 2, decoded.size
+    ca_spec = decoded.find {|s| s.content_address == "abcdef12" }
+    platform_spec = decoded.find {|s| s.content_address.nil? }
+    assert_equal "a-1-abcdef12", ca_spec.full_name
+    assert_equal "x86_64-linux", ca_spec.platform
+    assert_equal "3.3", ca_spec.ruby_abi
+    assert_equal "a-1-x86_64-linux", platform_spec.full_name
+    assert_nil platform_spec.ruby_abi
+  end
+
+  def test_load_specs_compact_index_skips_content_addressable_rows_without_ruby_field
+    versions_body = +"created_at: 2026-01-01T00:00:00Z\n---\na 1-abcdef12 0000\n"
+    versions_response = util_compact_index_response(versions_body)
+    versions_response.uri = Gem::URI("#{@gem_repo}versions")
+    @fetcher.data["#{@gem_repo}versions"] = versions_response
+    @fetcher.data["#{@gem_repo}info/a"] = util_compact_index_response("---\n1-abcdef12 |checksum:123,platform:x86_64-linux\n")
+
+    specs = @source.decode_content_addressable_tuples(@source.load_specs(:released))
+
+    assert_empty specs
+  end
+
+  def test_load_specs_compact_index_latest_per_platform
+    a1 = util_spec "a", "1"
+    a2_java = util_spec "a", "2" do |s|
+      s.platform = "java"
+    end
+
+    util_setup_compact_index a1, a2_java
+
+    latest = @source.load_specs(:latest).map(&:full_name)
+    assert_equal %w[a-1 a-2-java], latest
+  end
+
+  def test_load_specs_compact_index_fetched_once
+    a1 = util_spec "a", "1"
+
+    util_setup_compact_index a1
+
+    @source.load_specs :released
+    @source.load_specs :prerelease
+
+    versions_requests = @fetcher.requests.count {|req| req.path.end_with?("/versions") }
+    assert_equal 1, versions_requests
+  end
+
+  def test_load_specs_compact_index_skips_invalid_version
+    a1 = util_spec "a", "1"
+
+    util_setup_compact_index a1
+
+    # A single malformed version must not discard the whole compact index
+    # and fall back to the Marshal indexes; only the bad row is skipped.
+    versions_body = +"created_at: 2026-01-01T00:00:00Z\n---\na 1,not-a-version 0000\n"
+    versions_response = util_compact_index_response(versions_body)
+    versions_response.uri = Gem::URI("#{@gem_repo}versions")
+    @fetcher.data["#{@gem_repo}versions"] = versions_response
+
+    released = @source.load_specs(:released).map(&:full_name)
+    assert_equal %w[a-1], released
+  end
+
+  def test_created_at
+    a1 = util_spec "a", "1"
+    a2 = util_spec "a", "2"
+    b2_java = util_spec "b", "2" do |s|
+      s.platform = "java"
+    end
+
+    util_setup_compact_index a1, a2, b2_java, created_at: {
+      "a-2" => "2026-06-05T10:30:45Z",
+      "b-2-java" => "2026-06-06T00:00:00Z",
+    }
+
+    assert_equal Time.utc(2026, 6, 5, 10, 30, 45), @source.created_at("a", v(2))
+    assert_equal Time.utc(2026, 6, 6), @source.created_at("b", v(2), "java")
+
+    # no created_at metadata for this version
+    assert_nil @source.created_at("a", v(1))
+
+    # unknown version and unknown gem
+    assert_nil @source.created_at("a", v(9))
+    assert_nil @source.created_at("c", v(1))
+  end
+
+  def test_created_at_for_tuple_uses_content_address
+    ca_spec = util_ca_spec "a", "1", "abcdef12", ruby_abi: "3.3"
+    util_setup_compact_index ca_spec, created_at: {
+      ca_spec.original_name => "2026-06-05T10:30:45Z",
+    }
+
+    assert_nil @source.created_at("a", v(1), "x86_64-linux")
+    assert_equal Time.utc(2026, 6, 5, 10, 30, 45), @source.created_at_for_tuple(ca_spec.name_tuple)
+  end
+
+  def test_created_at_file_uri
+    source = Gem::Source.new "file:///tmp/gems"
+
+    assert_nil source.created_at("a", v(1))
+  end
+
+  def test_created_at_fetch_error
+    assert_nil @source.created_at("a", v(1))
+  end
+
+  def test_compact_index_cache_dir_removes_tmpdir_at_exit
+    source = Gem::Source.new @gem_repo
+    def source.update_cache?
+      false
+    end
+
+    cleanup = nil
+    source.define_singleton_method(:at_exit) {|&block| cleanup = block }
+
+    dir = source.send(:compact_index_cache_dir, Gem::URI(@gem_repo))
+
+    assert_path_exist dir
+    refute_nil cleanup, "expected a cleanup hook to be registered"
+
+    cleanup.call
+    assert_path_not_exist dir
+  end
+
+  def test_load_specs_falls_back_to_marshal_index
+    # no compact index data set up, only the Marshal indexes from setup
+    released = @source.load_specs(:released).map(&:full_name)
+
+    assert_equal %W[a-2 a-1 b-2], released
+  end
+
+  def test_load_specs_cached
+    latest_specs = @source.load_specs :latest
+
+    # Make sure the cached version is actually different:
+    latest_specs << Gem::NameTuple.new("cached", Gem::Version.new("1.0.0"), "ruby")
+
+    @fetcher.data["#{@gem_repo}latest_specs.#{Gem.marshal_version}.gz"] = nil
+    @fetcher.data["#{@gem_repo}latest_specs.#{Gem.marshal_version}"] =
+      " " * Marshal.dump(latest_specs).length
+
+    cache_dir = File.join Gem.spec_cache_dir, "gems.example.com%80"
+
+    FileUtils.mkdir_p cache_dir
+
+    cache_file = File.join cache_dir, "latest_specs.#{Gem.marshal_version}"
+
+    File.open cache_file, "wb" do |io|
+      Marshal.dump latest_specs, io
+    end
+
+    cached_specs = @source.load_specs :latest
+
+    assert_equal latest_specs, cached_specs
+  end
+
+  def test_load_specs_cached_empty
+    latest_specs = @source.load_specs :latest
+
+    # Make sure the cached version is actually different:
+    latest_specs << Gem::NameTuple.new("fixed", Gem::Version.new("1.0.0"), "ruby")
+    # Setup valid data on the 'remote'
+    @fetcher.data["#{@gem_repo}latest_specs.#{Gem.marshal_version}.gz"] =
+      util_gzip(Marshal.dump(latest_specs))
+
+    cache_dir = File.join Gem.spec_cache_dir, "gems.example.com%80"
+
+    FileUtils.mkdir_p cache_dir
+
+    cache_file = File.join cache_dir, "latest_specs.#{Gem.marshal_version}"
+
+    File.open cache_file, "wb" do |io|
+      # Setup invalid data in the cache:
+      io.write Marshal.dump(latest_specs)[0, 10]
+    end
+
+    fixed_specs = @source.load_specs :latest
+
+    assert_equal latest_specs, fixed_specs
+  end
+
+  def test_load_specs_from_unavailable_uri
+    src = Gem::Source.new("http://not-there.nothing")
+
+    assert_raise Gem::RemoteFetcher::FetchError do
+      src.load_specs :latest
+    end
+  end
+
+  def test_spaceship
+    remote    = @source
+    specific  = Gem::Source::SpecificFile.new @specs["a-1"].cache_file
+    installed = Gem::Source::Installed.new
+    local     = Gem::Source::Local.new
+
+    assert_equal(0, remote.<=>(remote), "remote <=> remote") # rubocop:disable Lint/BinaryOperatorWithIdenticalOperands
+
+    assert_equal(-1, remote.<=>(specific), "remote <=> specific")
+    assert_equal(1, specific.<=>(remote), "specific <=> remote")
+
+    assert_equal(-1, remote.<=>(local), "remote <=> local")
+    assert_equal(1, local.<=>(remote), "local <=> remote")
+
+    assert_equal(-1, remote.<=>(installed), "remote <=> installed")
+    assert_equal(1, installed.<=>(remote), "installed <=> remote")
+
+    no_uri = @source.dup
+    no_uri.instance_variable_set :@uri, nil
+
+    assert_equal(-1, remote.<=>(no_uri), "remote <=> no_uri")
+  end
+
+  def test_spaceship_order_is_preserved_when_uri_differs
+    source_a = Gem::Source.new "http://example.com/a"
+    source_b = Gem::Source.new "http://example.com/b"
+
+    assert_equal(0, source_a.<=>(source_a), "source_a <=> source_a") # rubocop:disable Lint/BinaryOperatorWithIdenticalOperands
+    assert_equal(1, source_a.<=>(source_b), "source_a <=> source_b")
+    assert_equal(1, source_b.<=>(source_a), "source_b <=> source_a")
+  end
+
+  def test_update_cache_eh
+    assert @source.update_cache?
+  end
+
+  def test_update_cache_eh_home_nonexistent
+    FileUtils.rmdir Gem.user_home
+
+    refute @source.update_cache?
+  end
+
+  def test_typo_squatting
+    rubygems_source = Gem::Source.new("https://rubgems.org")
+    assert rubygems_source.typo_squatting?("rubygems.org")
+    assert rubygems_source.typo_squatting?("rubyagems.org")
+    assert rubygems_source.typo_squatting?("rubyasgems.org")
+    refute rubygems_source.typo_squatting?("rubysertgems.org")
+  end
+
+  def test_typo_squatting_false_positive
+    rubygems_source = Gem::Source.new("https://rubygems.org")
+    refute rubygems_source.typo_squatting?("rubygems.org")
+  end
+
+  def test_typo_squatting_custom_distance_threshold
+    rubygems_source = Gem::Source.new("https://rubgems.org")
+    distance_threshold = 5
+    assert rubygems_source.typo_squatting?("rubysertgems.org", distance_threshold)
+  end
+end

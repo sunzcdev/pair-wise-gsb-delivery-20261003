@@ -1,0 +1,164 @@
+name: ubuntu-lint
+
+on:
+  pull_request:
+
+  push:
+    branches:
+      - master
+
+concurrency:
+  group: ci-${{ github.ref }}-${{ github.workflow }}
+  cancel-in-progress: true
+
+permissions: # added using https://github.com/step-security/secure-workflows
+  contents: read
+
+jobs:
+  python_linters:
+    name: Python linter ${{ matrix.command }}
+    runs-on: ubuntu-24.04
+    permissions:
+      # Needed to upload the results to code-scanning dashboard.
+      security-events: write
+    strategy:
+      fail-fast: false
+      matrix:
+        command:
+          - codespell
+          - yamllint
+          - zizmor
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        with:
+          python-version: "3.13"
+          activate-environment: true
+      - name: Install Dependencies
+        run: uv pip install -r .github/workflows/lint/pylock.toml
+
+      - name: Run codespell
+        run: codespell
+        if: matrix.command == 'codespell'
+      - name: Run YAMLlint
+        run: yamllint .
+        if: matrix.command == 'yamllint'
+      - name: Run zizmor 🌈
+        run: zizmor --format=sarif . > results.sarif
+        if: matrix.command == 'zizmor'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Upload SARIF file
+        uses: github/codeql-action/upload-sarif@9b3254085494b55a0f7c4c2b3d2d52cc712ce370 # v4.39.1
+        if: matrix.command == 'zizmor'
+        with:
+          sarif_file: results.sarif
+          category: zizmor
+
+  ruby_linters:
+    name: Ruby linters
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+    env:
+      RUBYOPT: -Ilib
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Setup ruby
+        uses: ruby/setup-ruby@14594264cd68ce8a2345dd349bc3d138a4ef85c8 # v1.327.0
+        with:
+          ruby-version: ruby
+          bundler: none
+      - name: Install Dependencies
+        run: bin/rake setup
+      - name: Run Ruby Lint
+        run: bin/rake rubocop
+      - name: Check expired deprecations
+        run: bin/rake check_deprecations
+      - name: Run Markdown Lint
+        run: bin/mdl -g . -r MD001,MD025
+      - name: Generate docs
+        run: bin/rake docs
+
+  check_misc:
+    name: Check misc on ${{ matrix.ruby.name }}
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        ruby:
+          - { name: ruby, value: 3.4.9 }
+          - { name: jruby, value: jruby-10.1.2.0 }
+          - { name: truffleruby, value: truffleruby-34.0.1 }
+    env:
+      RUBYOPT: -Ilib
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Setup ruby
+        uses: ruby/setup-ruby@14594264cd68ce8a2345dd349bc3d138a4ef85c8 # v1.327.0
+        with:
+          ruby-version: ${{ matrix.ruby.value }}
+          bundler: none
+      - name: Install & Check Dependencies
+        run: bin/rake dev:frozen_deps
+      - name: Misc checks
+        run: bin/rake quality:check man:check vendor:check version:check check_rubygems_integration
+        if: matrix.ruby.name != 'jruby'
+    timeout-minutes: 15
+
+  release_version:
+    name: Check release version simulation
+    runs-on: ubuntu-24.04
+    env:
+      RUBYOPT: -Ilib
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Setup ruby
+        uses: ruby/setup-ruby@14594264cd68ce8a2345dd349bc3d138a4ef85c8 # v1.327.0
+        with:
+          ruby-version: ruby
+          bundler: none
+      - name: Simulate a release version by stripping .dev
+        run: |
+          ruby -i -pe 'sub(/^(\s*VERSION = ")(\d+\.\d+\.\d+)\.dev/, "\\1\\2")' lib/rubygems.rb lib/bundler/version.rb
+          bin/rake dev:deps version:update_locked_bundler
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          # On release branches the version constants already have no .dev suffix,
+          # so there is nothing to simulate and nothing to commit.
+          git diff --quiet || git commit -am "Simulate release version"
+      - name: Check lockfiles do not depend on the local gem cache
+        run: |
+          version=$(ruby -Ilib -rbundler/version -e 'puts Bundler::VERSION')
+          mkdir -p cache
+          gem build bundler.gemspec --output "cache/bundler-${version}.gem"
+          echo "cache/" >> .git/info/exclude
+          bin/rake version:check dev:frozen_deps
+    timeout-minutes: 15
+
+  all-pass:
+    name: All ubuntu-lint jobs pass
+
+    if: always()
+
+    needs:
+      - python_linters
+      - ruby_linters
+      - check_misc
+      - release_version
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: check dependent jobs
+        uses: re-actors/alls-green@b5b5b37504aa4183270bd3d855c52a67f212be35 # v1.3.0
+        with:
+          jobs: ${{ toJSON(needs) }}
