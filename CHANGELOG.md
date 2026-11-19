@@ -1,5 +1,7 @@
 # Unreleased
 
+- Added `protocol_fallback:` option to explicitly allow downgrading to RESP2 when the server refuses `HELLO` as an unknown command. The downgrade is only triggered by this capability refusal — authentication failures, permission errors, network errors and malformed replies never fall back — and only the connection prelude is re-negotiated, never business commands. The outcome is inspectable via `RedisClient#negotiated_protocol`, cached per server identity, and re-negotiated when the client connects to a different node. Without this option the client remains RESP3-only and raises `RedisClient::UnsupportedServer`.
+
 # 0.31.0
 
 - Improved the Ruby driver buffering logic, should trigger GC less, particularly for large response and when using SSL.

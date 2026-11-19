@@ -15,9 +15,11 @@ class RedisClient
     module Common
       attr_reader :db, :id, :ssl, :ssl_params, :command_builder, :inherit_socket,
         :connect_timeout, :read_timeout, :write_timeout, :driver, :protocol,
-        :middlewares_stack, :custom, :circuit_breaker, :driver_info, :idle_timeout
+        :middlewares_stack, :custom, :circuit_breaker, :driver_info, :idle_timeout,
+        :protocol_fallback
 
       alias_method :ssl?, :ssl
+      alias_method :protocol_fallback?, :protocol_fallback
 
       def initialize(
         username: nil,
@@ -34,6 +36,7 @@ class RedisClient
         ssl_params: nil,
         driver: nil,
         protocol: 3,
+        protocol_fallback: false,
         client_implementation: RedisClient,
         command_builder: CommandBuilder,
         inherit_socket: false,
@@ -69,6 +72,8 @@ class RedisClient
           raise ArgumentError, "Unknown protocol version #{protocol.inspect}, expected 2 or 3"
         end
 
+        @protocol_fallback = protocol_fallback ? true : false
+
         @command_builder = command_builder
         @inherit_socket = inherit_socket
 
@@ -92,7 +97,13 @@ class RedisClient
         @driver_info = driver_info
       end
 
-      def connection_prelude
+      # Build the connection prelude for the given RESP protocol version.
+      #
+      # @param protocol [Integer] the protocol version to negotiate, defaults
+      #   to the configured protocol. Callers negotiating a fallback (e.g.
+      #   RESP2 after the server refused HELLO) pass it explicitly so the
+      #   AUTH/SELECT prelude matches the protocol actually in use.
+      def connection_prelude(protocol = @protocol)
         prelude = []
         pass = password
         if protocol == 3

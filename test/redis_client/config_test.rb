@@ -135,6 +135,27 @@ class RedisClient
       end
     end
 
+    def test_protocol_fallback_is_disabled_by_default
+      config = Config.new
+      assert_equal 3, config.protocol
+      refute_predicate config, :protocol_fallback?
+    end
+
+    def test_protocol_fallback_opt_in
+      config = Config.new(protocol_fallback: true)
+      assert_predicate config, :protocol_fallback?
+    end
+
+    def test_connection_prelude_protocol_override
+      config = Config.new(url: "redis://username:password@example.com")
+      assert_equal [%w[HELLO 3 AUTH username password]], config.connection_prelude
+      assert_equal [%w[AUTH username password]], config.connection_prelude(2)
+      # The configured protocol is unchanged, the override only affects the
+      # prelude being built for negotiation.
+      assert_equal 3, config.protocol
+      assert_equal [%w[HELLO 3 AUTH username password]], config.connection_prelude
+    end
+
     def test_resp2_simple_password_uri
       config = Config.new(protocol: 2, url: "redis://password@example.com")
       assert_equal "example.com", config.host

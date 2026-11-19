@@ -272,6 +272,8 @@ class RedisClient
     @raw_connection = nil
     @disable_reconnection = false
     @retry_attempt = nil
+    @negotiated_protocol = nil
+    @negotiated_server_key = nil
   end
 
   def inspect
@@ -297,6 +299,18 @@ class RedisClient
 
   def db
     config.db
+  end
+
+  # The RESP protocol version negotiated with the server the client is
+  # currently connected to (`2` or `3`), or `nil` if no connection has been
+  # established yet.
+  #
+  # The negotiated protocol is bound to the identity of the current server:
+  # if the client is reconfigured to talk to a different node (e.g. after a
+  # sentinel failover), the negotiation is performed again on the next
+  # connection and this reflects the new outcome once connected.
+  def negotiated_protocol
+    @negotiated_protocol if @negotiated_protocol && @negotiated_server_key == config.server_key
   end
 
   def host
@@ -845,7 +859,53 @@ class RedisClient
 
   def connect
     @pid = PIDCache.pid
+    establish_connection
 
+    # Reuse the protocol previously negotiated with this exact server, or
+    # start from the configured protocol when connecting to a new node.
+    protocol = negotiated_protocol || config.protocol
+    begin
+      execute_prelude(protocol)
+    rescue CommandError => error
+      raise unless resp2_fallback?(error, protocol)
+
+      # The server explicitly refused HELLO as an unknown command, and the
+      # client opted in to RESP2 fallback. Reconnect on a fresh socket and
+      # negotiate again with a RESP2 prelude. Only the connection prelude is
+      # replayed here, never business commands.
+      @raw_connection&.close
+      establish_connection
+      protocol = 2
+      execute_prelude(protocol)
+    end
+
+    @negotiated_protocol = protocol
+    @negotiated_server_key = config.server_key
+  rescue FailoverError, CannotConnectError => error
+    @raw_connection&.close
+    error._set_config(config)
+    raise error
+  rescue ConnectionError => error
+    @raw_connection&.close
+    connect_error = CannotConnectError.with_config(error.message, config)
+    connect_error.set_backtrace(error.backtrace)
+    raise connect_error
+  rescue CommandError => error
+    @raw_connection&.close
+
+    if error.command&.first == "HELLO" && HELLO_UNSUPPORTED_ERROR.match?(error.message)
+      raise UnsupportedServer,
+        "redis-client requires Redis 6+ with HELLO command available (#{config.server_url}). " \
+        "Set `protocol_fallback: true` to explicitly allow downgrading to RESP2", cause: error
+    else
+      raise
+    end
+  end
+
+  HELLO_UNSUPPORTED_ERROR = /unknown command/i
+  private_constant :HELLO_UNSUPPORTED_ERROR
+
+  def establish_connection
     if @raw_connection&.revalidate
       @middlewares.connect(config) do
         @raw_connection.reconnect
@@ -862,8 +922,10 @@ class RedisClient
     end
     @last_used_at = RedisClient.now
     @raw_connection.retry_attempt = @retry_attempt
+  end
 
-    prelude = config.connection_prelude.dup
+  def execute_prelude(protocol)
+    prelude = config.connection_prelude(protocol).dup
 
     if id
       prelude << ["CLIENT", "SETNAME", id]
@@ -873,41 +935,37 @@ class RedisClient
       prelude << ["ROLE"]
     end
 
-    unless prelude.empty?
-      results = @middlewares.call_pipelined(prelude, config) do
-        @raw_connection.call_pipelined(prelude, nil, exception: false)
-      end
+    return if prelude.empty?
 
-      results.each do |result|
-        # CLIENT SETINFO is unsupported on Redis < 7.2. The pipeline drained all responses before raising,
-        # so if that's the only error, the socket is healthy: keep it.
-        if result.is_a?(CommandError) && !(result.command[0] == "CLIENT" && result.command[1] == "SETINFO")
-          raise result
-        end
-      end
+    results = @middlewares.call_pipelined(prelude, config) do
+      @raw_connection.call_pipelined(prelude, nil, exception: false)
+    end
 
-      if config.sentinel?
-        config.check_role!(results.last.first)
+    results.each do |result|
+      # CLIENT SETINFO is unsupported on Redis < 7.2. The pipeline drained all responses before raising,
+      # so if that's the only error, the socket is healthy: keep it.
+      if result.is_a?(CommandError) && !(result.command[0] == "CLIENT" && result.command[1] == "SETINFO")
+        raise result
       end
     end
-  rescue FailoverError, CannotConnectError => error
-    @raw_connection&.close
-    error._set_config(config)
-    raise error
-  rescue ConnectionError => error
-    @raw_connection&.close
-    connect_error = CannotConnectError.with_config(error.message, config)
-    connect_error.set_backtrace(error.backtrace)
-    raise connect_error
-  rescue CommandError => error
-    @raw_connection&.close
 
-    if error.command&.first == "HELLO" && error.message.match?(/ERR unknown command/)
-      raise UnsupportedServer,
-        "redis-client requires Redis 6+ with HELLO command available (#{config.server_url})", cause: error
-    else
-      raise
+    if config.sentinel?
+      config.check_role!(results.last.first)
     end
+  end
+
+  # Whether a failed HELLO may be retried as RESP2. Only an explicit
+  # capability refusal (the server doesn't know the HELLO command) allows
+  # downgrading, and only when the client explicitly opted in with
+  # `protocol_fallback: true`. Authentication failures, permission errors,
+  # network errors and malformed replies are never interpreted as a
+  # legacy server.
+  def resp2_fallback?(error, protocol)
+    protocol == 3 &&
+      config.protocol_fallback? &&
+      error.instance_of?(CommandError) &&
+      error.command&.first == "HELLO" &&
+      HELLO_UNSUPPORTED_ERROR.match?(error.message)
   end
 end
 
