@@ -1,0 +1,196 @@
+= Controlled Artifacts for File Tasks
+
+A file task normally trusts its actions to write the target file.  That trust
+is misplaced whenever an action can fail after creating the target: a crashed
+compiler, an interrupted download, a half-flushed writer or a rejected payload
+all leave a file behind.  Because the file exists, the next FileTask
+invocation treats it as an up to date output even though its contents are
+incomplete.  Rake never notices, and the build keeps reusing the broken
+artifact.
+
+The controlled artifact interface moves the successful-completion boundary
+inside Rake.  The action writes a <b>staging file</b>; Rake validates that
+staging file and only then renames it onto the final output name.  Until that
+rename the previous output (if any) is left untouched, and no file appears at
+the output name while the build is still in progress.
+
+== Declaring Controlled Artifacts
+
+Call +artifacts+ on the file task, from the Rakefile or from inside the
+action:
+
+  file "build/report.json" => ["src/report.json"] do |t|
+    art = t.artifacts(validate: { "build/report.json" => ->(path) {
+      JSON.parse(File.read(path))["complete"]
+    } })
+
+    art.write("build/report.json") do |io|
+      io.write(build_report)
+    end
+  end
+
+With no argument, +artifacts+ declares the task's own name as its only
+output, so <tt>t.artifacts</tt> is enough for a single-file task.  Passing
+output names declares several files at once:
+
+  art = t.artifacts("report.json", "report.json.sig")
+
+The outputs must include the task name, because that name is what Rake
+compares against prerequisites and timestamps.  Each output name is normalized
+like any other file task name, so a +Pathname+ is accepted.
+
+The returned Rake::ArtifactSet is the only sanctioned way to produce the
+outputs.  Its useful methods are:
+
++stage_path(output = nil)+:: The staging path for one output.  The parent
+  directory is created; the output name itself is not.  With a single output
+  the name may be omitted.  Aliased as +path+ and +[]+.
++open(output = nil, mode = "wb") { |io| ... }+:: Open the staging file and
+  yield the IO.  The file is closed before the method returns, so the later
+  rename cannot be blocked by an open handle.
++write(output = nil) { |io| ... }+:: Shorthand for binary +open+.
++each { |output, staging| ... }+:: Iterate every declared output with its
+  staging path.
++validate(output = nil, callable = nil) { |path| ... }+:: Add a check (see
+  below).
++publish!(*outputs)+:: Validate and publish, defaulting to every output.
++published+:: The outputs published so far.
+
+Writing through +write+ or +open+ is strongly preferred because the file is
+closed for you, but an action may also write the staging path with any other
+API.  What matters is that the final output name is never written by the
+action itself.
+
+== Validation
+
+A validation is a check over the already written staging file.  Declare it
+either up front or at the call site:
+
+  t.artifacts(validate: ->(path) { File.size(path) > 0 })
+  t.artifacts(validate: { "a.txt" => ->(path) { ... },
+                          "b.txt" => ->(path) { ... } })
+
+  art.validate("a.txt") { |path| File.size(path) == expected }
+  art.validate { |output, path| check(output, path) }
+
+A check accepts its artifact by returning a truthy value and rejects it by
+returning +false+, +nil+ or raising.  The block may take zero arguments, the
+staging path, or the output name and the staging path.
+
+Three rules keep validation honest:
+
+* A validator <b>is not a build</b>.  It may inspect or read back the staged
+  file, but it must not run build work and must not invoke the task again.
+  Rake fails the artifact if a validator re-enters the task, and it never
+  re-runs the action to "confirm" a check.
+* Rake runs each check <b>exactly once</b> per publication attempt.  Calling
+  +publish!+ again does not re-run checks for outputs that are already
+  published.
+* A validator never writes a final output.  Publication is the only step that
+  creates the output name.
+
+If an output has no validator, the only implicit check is that its staging
+file exists.  A missing staging file is itself a validation failure: the
+action declared an output but never produced it.
+
+== Publication Is Per Output
+
+Each declared output is validated and renamed on its own, in declaration
+order.  Rake performs these steps for the first output, then for the second,
+and so on:
+
+  1. check that the staging file exists,
+  2. run that output's validator once,
+  3. rename the staging file onto the output name.
+
+If output <i>n</i> is rejected, the outputs before it are already published
+and stay in place.  They are not rolled back.  The exception carries the
+partial result:
+
+  begin
+    art.publish!
+  rescue Rake::ArtifactValidationError => e
+    e.output    # the rejected output
+    e.published # ["a.txt", ...] already published
+  end
+
+That is a <b>per-output publication guarantee</b>: every output that appears
+under its final name has passed its own validation.
+
+It is <b>not</b> a multi-file transaction.  Rake does not offer two-phase
+commit, does not coordinate renames across files, and does not roll back an
+earlier publication when a later one fails.  If a set of files must appear
+together, build them into a private directory and publish that directory
+yourself (for example by renaming the directory into place), or have the task
+publish a single manifest file last and treat that manifest as the commit
+point.  Keeping the declaration honest about which files are independent is
+usually the better answer.
+
++publish!+ also accepts an explicit list, which lets an action publish one
+output at a time:
+
+  art.publish!("report.json")
+  art.publish!("report.json.sig")
+
+Outputs are still published in declaration order and an already published
+output is skipped, so the two forms are equivalent in effect.  Use the
+explicit form when the action wants to publish as soon as each artifact is
+ready.
+
+Publication renames the staging file onto the output.  If that rename fails
+(for example because the output name is an existing directory), Rake raises
+Rake::ArtifactPublishError with the same +output+ and +published+ attributes.
+
+== What Happens When a Build Fails
+
+Rake publishes only after all actions return.  If an action raises, or if a
+validator rejects an artifact, the task fails and Rake cleans up:
+
+* the <b>previous output is preserved</b>, bytes and timestamp alike.  A
+  failed rebuild therefore leaves the last known good artifact in place.
+* <b>staging files are deleted</b>.  They are named
+  <tt>.<output>.rake-artifact-<pid>-<serial></tt>, so a surviving staging file
+  can never be mistaken for the output.
+* a <b>new output</b> that did not exist before the build is deleted if it is
+  still unpublished.  This catches an action that ignored the interface and
+  wrote the final name directly before failing.  An output that existed
+  before the build is never touched.
+
+Rake never fakes success by touching timestamps.  It does not backdate or
+forward-date an output, and it does not create the output name to make a task
+look complete.  An output exists only because a validated staging file was
+renamed onto it.
+
+If cleanup itself fails, Rake does not hide it.  The task raises
+Rake::ArtifactCleanupError, which lists the paths it could not remove in
++leftovers+ and keeps the original failure as +cause+ (also exposed as
++original_error+):
+
+  rescue Rake::ArtifactCleanupError => e
+    warn e.original_error.message
+    warn "left behind: #{e.leftovers.join(', ')}"
+
+Leftover staging files are harmless as long as their names keep the marker.
+Rake::ArtifactSet.sweep!(dir) removes stale staging files from an earlier,
+interrupted process; it only touches names matching the staging pattern and
+returns the paths it could not delete.
+
+== Up-To-Date Checks
+
+A task that declares artifacts is needed when its own file is missing or out
+of date, exactly like any other file task.  In addition it is needed when
+<i>any</i> declared output is missing, so a task that published only some of
+its outputs is rebuilt.  Only real files count: a directory left at an output
+name does not satisfy the task.
+
+Staging files are ignored by the up-to-date check.  They never make a task
+look complete, and they never make a task look incomplete either; they are
+invisible to the timestamp logic.
+
+== Relation to Plain File Tasks
+
+Controlled artifacts are opt-in.  A file task that never calls +artifacts+
+behaves exactly as before, including the historical behaviour of trusting its
+actions to write the target.  The interface only changes where the action
+writes and when the output name appears; it does not change prerequisites,
+timestamps, rules or the task graph.

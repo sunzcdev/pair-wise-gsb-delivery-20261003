@@ -73,6 +73,17 @@ module Rake
     #     end
     #  end
     #
+    # When the action can fail after creating the target, declare the output
+    # as a controlled artifact instead of writing it directly.  The action
+    # writes a staging file and rake publishes it only after validation:
+    #
+    #   file "report.json" => ["report.in"] do |t|
+    #     art = t.artifacts(validate: ->(path) { File.size(path) > 0 })
+    #     art.write { |io| io.write(build_report) }
+    #   end
+    #
+    # See Rake::FileTask#artifacts and doc/artifacts.rdoc.
+    #
     def file(*args, &block) # :doc:
       Rake::FileTask.define_task(*args, &block)
     end

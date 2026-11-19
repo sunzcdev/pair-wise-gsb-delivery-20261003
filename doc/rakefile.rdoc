@@ -483,6 +483,13 @@ it makes little sense to include file task names in name space.
 Directory tasks (created by the +directory+ command) are a type of
 file task and are also not affected by namespaces.
 
+A file task decides whether it must run by comparing timestamps.  If its
+action can fail after creating the target, the leftover file would make
+later invocations look up to date.  Declaring the output as a controlled
+artifact moves the successful-completion boundary into rake: the action
+writes a staging file, rake validates it and only then renames it onto the
+output.  See {Controlled Artifacts}[rdoc-ref:doc/artifacts.rdoc].
+
 === Name Resolution
 
 When looking up a task name, rake will start with the current

@@ -1,3 +1,18 @@
+=== Unreleased
+
+* Add a controlled artifact interface for Rake::FileTask.  A task declares
+  its outputs through FileTask#artifacts and receives a Rake::ArtifactSet;
+  the action writes staging files, declares validators and Rake renames each
+  validated staging file onto its final output.  A failed action or a
+  rejected validator leaves the previous output (bytes and timestamp)
+  untouched, removes the staging files and removes any new output written
+  directly, so a later FileTask can no longer mistake a partial file for a
+  finished one.  Publication is per output, not a multi-file transaction.
+  Cleanup failures are reported through Rake::ArtifactCleanupError with the
+  leftover paths and the original failure, validators never rebuild the
+  artifact, and timestamps are never adjusted to fake success.  See
+  doc/artifacts.rdoc.
+
 === 13.2.1
 
 * Suppressed "internal:array:52:in 'Array#each'" from backtrace by @hsbt in #554
